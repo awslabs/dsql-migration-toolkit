@@ -5,6 +5,35 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.431
+
+### Fixed
+
+- **MySQL-source introspection edge cases** (the same review, applied to the MySQL path —
+  which was already robust; these residual issues are fixed):
+  - **A composite index mixing a plain column with an expression key-part** (MySQL 8.0.13+,
+    e.g. `UNIQUE KEY (tenant_id, (lower(email)))`) **was silently emitted as a narrower
+    index over the plain columns only** — for a UNIQUE index that changes the uniqueness
+    semantics (and can fail the async build). SQLAlchemy drops the expression key-part on
+    reflection; `enrich_index_types` now compares the reflected column count against the
+    true key-part count from `information_schema.STATISTICS` and flags such an index as an
+    expression index (warned, and NOT emitted as a wrong narrower constraint).
+  - **A table-/database-scoped SELECT grant now raises a non-blocking notice.** The
+    privilege check passed on any `SELECT` token, but `SHOW FULL TABLES` / `SHOW SCHEMAS`
+    are privilege-filtered, so tables/databases outside a scoped grant were silently
+    absent from the inventory. A new non-blocking `SELECT_GRANT_SCOPE` check warns when
+    SELECT is scoped (not `*.*`), asking the operator to confirm the user can see every
+    object to migrate.
+  - **SELECT granted only via a MySQL 8.0 role no longer hard-blocks Full Load** — the
+    privilege check downgrades to a non-blocking warning (plain `SHOW GRANTS` cannot expand
+    a role's privileges) instead of a false "SELECT missing" failure.
+  - **A single view that cannot be `SHOW CREATE`'d no longer aborts the whole
+    introspection** — the failing view is skipped (best-effort) so the rest of the
+    inventory still assembles.
+  - **The 63-byte identifier-length warning now also checks the table and schema name**
+    (not just column/index names), since Aurora DSQL / PostgreSQL truncates any identifier
+    over 63 bytes (a possible silent collision).
+
 ## v0.1.430
 
 ### Fixed

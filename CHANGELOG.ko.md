@@ -5,6 +5,30 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.431
+
+### 수정 (Fixed)
+
+- **MySQL 소스 introspection 엣지 케이스** (PG에 적용한 같은 리뷰를 MySQL 경로에도 — MySQL
+  경로는 이미 견고했고, 남은 잔여 이슈만 수정):
+  - **일반 컬럼 + 표현식 key-part 혼합 복합 인덱스**(MySQL 8.0.13+, 예:
+    `UNIQUE KEY (tenant_id, (lower(email)))`)**가 조용히 일반 컬럼만의 더 좁은 인덱스로
+    방출**되던 문제 — UNIQUE면 유일성 의미가 바뀜(async 빌드 실패 가능). SQLAlchemy가 반영 시
+    표현식 key-part를 버리므로, `enrich_index_types`가 이제 반영된 컬럼 수와
+    `information_schema.STATISTICS`의 실제 key-part 수를 비교해 그런 인덱스를 expression
+    인덱스로 표시(경고, 잘못된 좁은 제약으로 방출 안 함).
+  - **테이블/DB 스코프 SELECT 권한 시 비차단 알림.** 권한 체크가 'SELECT' 토큰만 있으면
+    통과했지만 `SHOW FULL TABLES`/`SHOW SCHEMAS`는 권한 필터링되므로, 스코프 밖 테이블/DB가
+    인벤토리에서 조용히 빠졌습니다. 새 비차단 `SELECT_GRANT_SCOPE` 체크가 SELECT가 스코프
+    한정(`*.*` 아님)일 때 경고해, 마이그레이션 대상 전부를 볼 수 있는지 확인하도록 안내합니다.
+  - **MySQL 8.0 role로만 부여된 SELECT가 더 이상 Full Load를 하드 차단하지 않음** — plain
+    `SHOW GRANTS`가 role 권한을 확장하지 못하므로, 거짓 "SELECT 없음" 실패 대신 비차단 경고로
+    다운그레이드.
+  - **`SHOW CREATE` 불가한 뷰 하나가 전체 introspection을 중단시키던 문제** — 실패한 뷰는
+    스킵(best-effort)하고 나머지 인벤토리는 정상 조립.
+  - **63바이트 식별자 길이 경고가 이제 테이블·스키마명도 검사**(컬럼/인덱스명뿐 아니라) —
+    Aurora DSQL/PostgreSQL은 63바이트 초과 식별자를 잘라내므로(조용한 충돌 가능).
+
 ## v0.1.430
 
 ### 수정 (Fixed)

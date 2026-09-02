@@ -136,6 +136,74 @@ def check_source_reachable(result: ConnectionResult) -> PrerequisiteResult:
     )
 
 
+def _parse_privilege_grant(line: str) -> Optional[tuple[str, str]]:
+    """Parse a ``GRANT <privs> ON <scope> TO ...`` line into ``(privs, scope)``.
+
+    ``privs`` is the upper-cased privilege list text (e.g. ``SELECT, INSERT``);
+    ``scope`` is the object scope with quoting/whitespace stripped (``*.*`` for a
+    global grant, ``app.*`` / ``app.orders`` for a scoped one). Returns ``None`` for
+    a line that is not a privilege grant -- notably a ROLE-membership grant
+    (``GRANT `role`@`host` TO `user`@`host```, which has no ``ON`` clause).
+    """
+    stripped = line.strip()
+    upper = stripped.upper()
+    if not upper.startswith("GRANT ") or " ON " not in upper:
+        return None
+    on_index = upper.index(" ON ")
+    privs = stripped[len("GRANT ") : on_index].upper()
+    rest = stripped[on_index + len(" ON ") :]
+    to_index = rest.upper().find(" TO ")
+    scope_text = rest[:to_index] if to_index != -1 else rest
+    scope = (
+        scope_text.strip()
+        .replace("`", "")
+        .replace("'", "")
+        .replace('"', "")
+        .replace(" ", "")
+    )
+    return privs, scope
+
+
+def _confers_select(privs_upper: str) -> bool:
+    """True when a grant's privilege list confers ``SELECT`` (directly or via ALL)."""
+    return (
+        "SELECT" in privs_upper
+        or "ALL PRIVILEGES" in privs_upper
+        or privs_upper.strip() == "ALL"
+    )
+
+
+def _select_grant_scope_state(grants: list[str]) -> str:
+    """Classify the SELECT grant scope as ``global`` / ``scoped`` / ``none``.
+
+    ``global`` = SELECT (or ALL) granted on ``*.*``; ``scoped`` = SELECT (or ALL)
+    granted only on specific databases/tables; ``none`` = no SELECT-conferring grant
+    is visible at all (that is REPLICATION_GRANTS' FAIL to own).
+    """
+    seen_scoped = False
+    for line in grants:
+        parsed = _parse_privilege_grant(line)
+        if parsed is None:
+            continue
+        privs_upper, scope = parsed
+        if not _confers_select(privs_upper):
+            continue
+        if scope == "*.*":
+            return "global"
+        seen_scoped = True
+    return "scoped" if seen_scoped else "none"
+
+
+def _is_role_grant(line: str) -> bool:
+    """True when a ``SHOW GRANTS`` line grants a ROLE (no ``ON`` clause).
+
+    A role-membership line is ``GRANT `role`@`host` TO `user`@`host``` -- a ``GRANT
+    ... TO ...`` with no ``ON`` scope, distinct from a privilege grant.
+    """
+    upper = line.strip().upper()
+    return upper.startswith("GRANT ") and " TO " in upper and " ON " not in upper
+
+
 def check_replication_grants(
     grants: list[str],
     mode: MigrationMode,
@@ -153,6 +221,15 @@ def check_replication_grants(
     attribute / ``rds_replication`` membership), checked separately, so a
     PostgreSQL source is only asked for the ``SELECT`` Full Load grant here
     regardless of ``mode`` -- never MySQL's replication privileges.
+
+    Role-granted SELECT (MySQL 8.0+): plain ``SHOW GRANTS`` lists a granted role as a
+    ``GRANT `role`@... TO ...`` membership line but does NOT expand that role's
+    privileges (only ``SHOW GRANTS ... USING <role>`` does). A user who holds SELECT
+    solely through a role would therefore look like it is missing SELECT. Fully
+    resolving roles is disproportionate here, so when the ONLY missing required
+    privilege is SELECT and the user holds at least one role, the result is DOWNGRADED
+    from a hard, blocking FAIL to a non-blocking WARN -- the false "SELECT missing"
+    no longer blocks a role-privileged user, while still prompting them to confirm.
     """
     cdc_mysql = mode == MigrationMode.CDC and source_type is SourceType.MYSQL
     required = _CDC_GRANTS if cdc_mysql else _FULL_LOAD_GRANTS
@@ -162,6 +239,32 @@ def check_replication_grants(
         priv for priv in required if not has_all and priv.upper() not in blob
     ]
     ok = not missing
+
+    # Role-granted SELECT: the only missing privilege is SELECT and the user holds a
+    # role whose (unexpanded) privileges plain SHOW GRANTS cannot see -> WARN, not FAIL.
+    if (
+        not ok
+        and source_type is SourceType.MYSQL
+        and missing == ["SELECT"]
+        and any(_is_role_grant(line) for line in grants)
+    ):
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.REPLICATION_GRANTS,
+            title="Source user has the required privileges",
+            status=PrerequisiteStatus.WARN,
+            required=False,
+            detail=(
+                "SELECT was not found in the source user's direct grants, but the user "
+                "holds one or more roles. Plain SHOW GRANTS does not expand a role's "
+                "privileges, so SELECT may already be available through a role."
+            ),
+            remediation=(
+                "Confirm the migration user's active roles grant SELECT "
+                "(SHOW GRANTS FOR CURRENT_USER() USING <role>), or grant SELECT "
+                "directly to the user to remove any doubt before loading."
+            ),
+        )
+
     return PrerequisiteResult(
         check_id=PrerequisiteCheckId.REPLICATION_GRANTS,
         title="Source user has the required privileges",
@@ -178,6 +281,48 @@ def check_replication_grants(
             "snapshot) rather than an admin account."
             if cdc_mysql
             else "Grant SELECT to a dedicated migration user (avoid an admin account)."
+        ),
+    )
+
+
+def check_select_grant_scope(
+    grants: list[str],
+    *,
+    source_type: SourceType = SourceType.MYSQL,
+) -> Optional[PrerequisiteResult]:
+    """Non-blocking WARN when the source SELECT grant is scoped, not global.
+
+    REPLICATION_GRANTS passes as long as ``SELECT`` appears ANYWHERE in the grants,
+    ignoring its scope. But a db-/table-scoped SELECT (``GRANT SELECT ON `app`.* ...``)
+    means introspection's ``SHOW FULL TABLES`` / ``SHOW SCHEMAS`` are privilege-filtered:
+    any table or whole database the user lacks a grant on is silently absent from the
+    inventory and would be omitted from the migration. The tool cannot enumerate objects
+    it cannot see, so this does not (and cannot) block -- it surfaces a non-blocking WARN
+    asking the operator to confirm the migration user can see every object to migrate.
+
+    Returns ``None`` (no notice) when the grant is global (``SELECT``/``ALL`` on ``*.*``)
+    or when no SELECT grant is present at all (REPLICATION_GRANTS owns that FAIL). Scoped
+    to a MySQL source -- PostgreSQL introspection does not use MySQL's ``SHOW`` statements.
+    """
+    if source_type is not SourceType.MYSQL:
+        return None
+    if _select_grant_scope_state(grants) != "scoped":
+        return None
+    return PrerequisiteResult(
+        check_id=PrerequisiteCheckId.SELECT_GRANT_SCOPE,
+        title="Source SELECT grant covers every object to migrate",
+        status=PrerequisiteStatus.WARN,
+        required=False,
+        detail=(
+            "The source user's SELECT privilege is scoped to specific databases/tables, "
+            "not global (*.*). Introspection lists objects with SHOW FULL TABLES / "
+            "SHOW SCHEMAS, which are privilege-filtered, so any table or database the "
+            "user cannot SELECT is silently omitted from the inventory."
+        ),
+        remediation=(
+            "Confirm the migration user can SELECT every table and database you intend "
+            "to migrate, or grant broader SELECT (e.g. SELECT ON *.*) so nothing is "
+            "silently left out of the assessment and load."
         ),
     )
 
@@ -605,13 +750,22 @@ class PrerequisiteChecker:
 
         # Source-side checks
         results.append(check_source_reachable(self._source.reachable()))
+        grants = self._source.grants()
         results.append(
             check_replication_grants(
-                self._source.grants(),
+                grants,
                 request.mode,
                 source_type=request.source_type,
             )
         )
+        # Non-blocking notice: a db-/table-scoped SELECT grant means introspection's
+        # privilege-filtered object listing may silently omit objects the user cannot
+        # see. Only added when the grant is actually scoped (None otherwise).
+        scope_notice = check_select_grant_scope(
+            grants, source_type=request.source_type
+        )
+        if scope_notice is not None:
+            results.append(scope_notice)
 
         # Per-table checks. Filter each table through the migration-wide LOB
         # exclusion so the pre-load gate sees the columns the load will actually
@@ -738,6 +892,7 @@ __all__ = [
     "PrerequisiteChecker",
     "check_source_reachable",
     "check_replication_grants",
+    "check_select_grant_scope",
     "check_table_primary_key",
     "check_target_dsql_reachable",
     "check_target_iam_auth",

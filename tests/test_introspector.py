@@ -552,6 +552,44 @@ def test_enrich_index_types_records_index_type() -> None:
     assert by_name["ix_name"].index_type == "BTREE"
 
 
+def test_enrich_index_types_flags_mixed_expression_index() -> None:
+    """A composite index mixing a plain column with an EXPRESSION key-part reflects
+    with only its plain column(s) (SQLAlchemy drops the expression part). Emitting that
+    narrower index would be WRONG -- for a UNIQUE index it changes uniqueness semantics.
+    ``enrich_index_types`` catches it by comparing the reflected column count to the true
+    key-part count from information_schema.STATISTICS and flags it like an all-expression
+    index. A normal single-/multi-column index must NOT be falsely flagged.
+    """
+    tables = [
+        TableDef(
+            name="accounts",
+            columns=[ColumnDef(name="id", mysql_type="INT")],
+            indexes=[
+                # KEY (tenant_id, (lower(email))) reflects with just ['tenant_id'];
+                # STATISTICS still has 2 key-part rows for it.
+                IndexDef(
+                    name="uq_tenant_email", columns=["tenant_id"], unique=True
+                ),
+                # A plain single-column index: 1 reflected column, 1 STATISTICS row.
+                IndexDef(name="ix_name", columns=["name"]),
+            ],
+        )
+    ]
+    rows = [
+        # (TABLE_NAME, INDEX_NAME, INDEX_TYPE) -- one row per key-part on 8.0.13+.
+        ("accounts", "uq_tenant_email", "BTREE"),  # key-part 1: tenant_id
+        ("accounts", "uq_tenant_email", "BTREE"),  # key-part 2: (lower(email)) expr
+        ("accounts", "ix_name", "BTREE"),
+    ]
+    enrich_index_types(_FakeConnection(rows), "app", tables)
+
+    table = tables[0]
+    # The mixed index is flagged (treated like an all-expression index)...
+    assert "uq_tenant_email" in table.expression_indexes
+    # ...and the plain index is NOT falsely flagged (its counts match).
+    assert "ix_name" not in table.expression_indexes
+
+
 def test_enrich_partitions_marks_partitioned_tables() -> None:
     tables = [
         TableDef(name="metrics", columns=[ColumnDef(name="id", mysql_type="INT")]),
@@ -752,6 +790,50 @@ def test_single_database_introspection_keeps_unqualified_names() -> None:
     )
 
     assert {table.name for table in inventory.tables} == {"orders", "customers"}
+
+
+# ---------------------------------------------------------------------------
+# View reflection is best-effort (one broken view must not abort the inventory)
+# ---------------------------------------------------------------------------
+
+
+class _BrokenViewInspector:
+    """Inspector where one view's ``get_view_definition`` raises (a broken view)."""
+
+    def get_view_names(self, schema=None):  # noqa: ANN001, ANN201
+        return ["good_view", "broken_view"]
+
+    def get_view_definition(self, view_name, schema=None):  # noqa: ANN001, ANN201
+        if view_name == "broken_view":
+            # A view whose underlying table was dropped, or a per-view privilege error.
+            raise RuntimeError("View 'app.broken_view' references an invalid table")
+        return "SELECT id FROM orders"
+
+
+def test_reflect_views_skips_a_view_that_cannot_be_shown() -> None:
+    # One un-SHOW-CREATE-able view must be SKIPPED (empty definition, name kept), not
+    # abort reflection of the other views.
+    from dsql_migrator.core.introspector import _reflect_views
+
+    views = _reflect_views(_BrokenViewInspector())
+    by_name = {v.name: v.definition for v in views}
+    assert by_name["good_view"] == "SELECT id FROM orders"
+    assert by_name["broken_view"] == ""  # skipped, not fatal
+
+
+def test_reflect_views_does_not_swallow_read_only_guard() -> None:
+    # The read-only guard sentinel must never be masked as a "bad view" (Property 1).
+    from dsql_migrator.core.introspector import _reflect_views
+
+    class _GuardTrippingInspector:
+        def get_view_names(self, schema=None):  # noqa: ANN001, ANN201
+            return ["v"]
+
+        def get_view_definition(self, view_name, schema=None):  # noqa: ANN001, ANN201
+            raise ReadOnlySourceError("refused non-read statement on read-only source")
+
+    with pytest.raises(ReadOnlySourceError):
+        _reflect_views(_GuardTrippingInspector())
 
 
 # ---------------------------------------------------------------------------

@@ -1003,6 +1003,7 @@ _PREREQ_CATEGORY_BY_CHECK: dict[PrerequisiteCheckId, PrereqCategory] = {
     PrerequisiteCheckId.TARGET_DSQL_REACHABLE: PrereqCategory.CONNECTIVITY,
     PrerequisiteCheckId.TARGET_IAM_AUTH: PrereqCategory.CONNECTIVITY,
     PrerequisiteCheckId.REPLICATION_GRANTS: PrereqCategory.SOURCE_CONFIG,
+    PrerequisiteCheckId.SELECT_GRANT_SCOPE: PrereqCategory.SOURCE_CONFIG,
     PrerequisiteCheckId.BINLOG_ROW_FORMAT: PrereqCategory.SOURCE_CONFIG,
     PrerequisiteCheckId.BINLOG_RETENTION: PrereqCategory.SOURCE_CONFIG,
     PrerequisiteCheckId.GTID_MODE: PrereqCategory.SOURCE_CONFIG,

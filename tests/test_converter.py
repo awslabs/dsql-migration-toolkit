@@ -2149,6 +2149,57 @@ def test_expression_index_drop_is_reported() -> None:
     assert notes
 
 
+def test_mixed_expression_index_is_flagged_and_not_emitted_narrower() -> None:
+    """A mixed (plain-column + expression) index reflects with only its plain column.
+
+    ``enrich_index_types`` flags it via ``expression_indexes``. The converter must NOT
+    emit it as the narrower index that reflection produced -- for a UNIQUE index a
+    narrower ``UNIQUE (tenant_id)`` silently changes the uniqueness semantics.
+    """
+    table = _mk(
+        "t.mixed",
+        [{"name": "id", "mysql_type": "bigint", "nullable": False},
+         {"name": "tenant_id", "mysql_type": "int", "nullable": False},
+         {"name": "email", "mysql_type": "varchar(255)", "nullable": True}],
+        ["id"],
+        indexes=[IndexDef(name="uq_tenant_email", columns=["tenant_id"], unique=True)],
+        expression_indexes=["uq_tenant_email"],
+    )
+    result = SchemaConverter().convert_table(table, SchemaConvertOptions())
+    # Never emitted as the wrong, narrower (UNIQUE) index.
+    assert all("uq_tenant_email" not in ddl for ddl in result.index_ddls)
+    assert not any(
+        "UNIQUE" in ddl and "tenant_id" in ddl for ddl in result.index_ddls
+    )
+    # Surfaced as an expression-index warning instead of vanishing silently.
+    notes = [w for w in result.warnings
+             if "uq_tenant_email" in w.message and "expression" in w.message.lower()]
+    assert notes
+
+
+def test_over_long_table_and_schema_names_are_reported() -> None:
+    """The 63-byte identifier warning also covers the table and schema segments."""
+    from dsql_migrator.core.converter import (
+        ConversionNoteKind, SchemaConverter, SchemaConvertOptions,
+    )
+    from dsql_migrator.core.models import Classification
+
+    # Schema-qualified name whose BOTH segments exceed 63 bytes.
+    table = _mk(
+        ("s" * 64) + "." + ("t" * 64),
+        [{"name": "id", "mysql_type": "bigint", "nullable": False}],
+        ["id"],
+    )
+    result = SchemaConverter().convert_table(table, SchemaConvertOptions())
+    notes = [w for w in result.warnings if "63 bytes" in w.message]
+    assert notes
+    assert "table name" in notes[0].message
+    assert "schema name" in notes[0].message
+    # A truncation risk, not a guaranteed CREATE failure -> RECOMMENDATION (non-blocking).
+    assert notes[0].classification is Classification.MANUAL
+    assert notes[0].kind is ConversionNoteKind.RECOMMENDATION
+
+
 def test_dropped_comments_are_reported_and_absence_is_silent() -> None:
     """Dropped table/column COMMENTs warn (RECOMMENDATION); a plain table does not."""
     from dsql_migrator.core.converter import (

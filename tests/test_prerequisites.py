@@ -29,6 +29,7 @@ from dsql_migrator.core.prerequisites import (
     check_binlog_row_format,
     check_gtid_mode,
     check_replication_grants,
+    check_select_grant_scope,
     check_table_primary_key,
     check_target_columns_loadable,
 )
@@ -244,6 +245,61 @@ def test_replication_grants_cdc_needs_replication_privs() -> None:
     )
     assert res.status == PrerequisiteStatus.FAIL
     assert "REPLICATION CLIENT" in res.detail and "REPLICATION SLAVE" in res.detail
+
+
+def test_select_grant_scope_notice_only_when_scoped() -> None:
+    # Global SELECT (*.*) or ALL PRIVILEGES on *.* -> no scope notice: introspection
+    # can see every object.
+    assert check_select_grant_scope(["GRANT SELECT ON *.* TO `u`@`%`"]) is None
+    assert (
+        check_select_grant_scope(["GRANT ALL PRIVILEGES ON *.* TO `u`@`%`"]) is None
+    )
+    # No SELECT at all -> REPLICATION_GRANTS owns the FAIL; no scope notice here.
+    assert check_select_grant_scope(["GRANT INSERT ON `app`.* TO `u`@`%`"]) is None
+
+    # A db-scoped SELECT -> a non-blocking WARN (objects outside the grant are invisible).
+    scoped = check_select_grant_scope(["GRANT SELECT ON `app`.* TO `u`@`%`"])
+    assert scoped is not None
+    assert scoped.check_id is PrerequisiteCheckId.SELECT_GRANT_SCOPE
+    assert scoped.status is PrerequisiteStatus.WARN
+    assert scoped.required is False  # never blocks
+
+    # A table-scoped SELECT is likewise scoped -> a notice.
+    tbl = check_select_grant_scope(["GRANT SELECT ON `app`.`orders` TO `u`@`%`"])
+    assert tbl is not None and tbl.status is PrerequisiteStatus.WARN
+
+    # PostgreSQL source: introspection does not use MySQL SHOW statements, so no notice.
+    assert (
+        check_select_grant_scope(
+            ["GRANT SELECT ON `app`.* TO `u`@`%`"], source_type=SourceType.POSTGRES
+        )
+        is None
+    )
+
+
+def test_replication_grants_role_granted_select_downgrades_to_warn() -> None:
+    # SELECT is absent from the DIRECT grants but the user holds a role, whose privileges
+    # plain SHOW GRANTS does not expand. The false "SELECT missing" must not hard-block.
+    role_grants = [
+        "GRANT USAGE ON *.* TO `mig`@`%`",
+        "GRANT `app_read`@`%` TO `mig`@`%`",  # a role-membership line (no ON clause)
+    ]
+    res = check_replication_grants(role_grants, MigrationMode.FULL_LOAD)
+    assert res.status is PrerequisiteStatus.WARN
+    assert res.required is False  # non-blocking, so a role-privileged user can proceed
+
+    # Without any role, the same missing SELECT stays a real, blocking FAIL.
+    no_role = check_replication_grants(
+        ["GRANT USAGE ON *.* TO `mig`@`%`"], MigrationMode.FULL_LOAD
+    )
+    assert no_role.status is PrerequisiteStatus.FAIL
+
+    # CDC with the replication privileges ALSO missing is not downgraded (the missing
+    # set is more than just SELECT), so it remains a blocking FAIL.
+    cdc = check_replication_grants(
+        ["GRANT `app_read`@`%` TO `mig`@`%`"], MigrationMode.CDC
+    )
+    assert cdc.status is PrerequisiteStatus.FAIL
 
 
 def test_table_primary_key_check_targets_the_table() -> None:

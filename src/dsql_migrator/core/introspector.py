@@ -598,12 +598,25 @@ def _reflect_tables(inspector: object, schema: Optional[str] = None) -> list[Tab
 
 
 def _reflect_views(inspector: object, schema: Optional[str] = None) -> list[ViewDef]:
-    """Collect view names and definitions via SQLAlchemy reflection."""
+    """Collect view names and definitions via SQLAlchemy reflection.
+
+    The per-view ``get_view_definition`` is best-effort: a single view that cannot
+    be ``SHOW CREATE``'d (an invalid/broken view whose underlying table was dropped,
+    or a privilege error on that one view) must NOT abort the entire inventory. Such
+    a view is SKIPPED with an empty definition -- its name is still carried so the
+    operator can see it exists -- mirroring the best-effort try/except used for
+    CHECK-constraint and table-comment reflection above. The read-only guard sentinel
+    is never masked (Property 1): a ``ReadOnlySourceError`` is re-raised.
+    """
     views: list[ViewDef] = []
     for view_name in inspector.get_view_names(schema=schema):  # type: ignore[attr-defined]
         try:
             definition = inspector.get_view_definition(view_name, schema=schema) or ""  # type: ignore[attr-defined]
-        except NotImplementedError:
+        except ReadOnlySourceError:
+            # Never swallow the read-only guard sentinel -- it means a write/DDL was
+            # attempted on the source, which must surface, not be silently skipped.
+            raise
+        except Exception:  # noqa: BLE001 - one bad/broken view must not abort the inventory
             definition = ""
         views.append(ViewDef(name=view_name, definition=definition))
     return views
@@ -791,6 +804,22 @@ def enrich_index_types(
     ``BTREE``, ``FULLTEXT``, ``SPATIAL``) so the assessor can flag index types
     that Aurora DSQL does not support. ``STATISTICS`` has one row per indexed
     column; the index type is constant per index, so the last value wins.
+
+    ``STATISTICS`` also has one row per *key-part*, and on MySQL 8.0.13+ a
+    functional/expression key-part is its own row (``EXPRESSION`` set,
+    ``COLUMN_NAME`` NULL). SQLAlchemy's ``get_indexes`` reflects only the plain
+    column key-parts (an expression part parses to nothing and is DROPPED), so a
+    MIXED index like ``KEY (tenant_id, (lower(email)))`` reflects with just
+    ``columns=['tenant_id']`` -- narrower than reality. Emitting that as-is would
+    produce a WRONG index (for a UNIQUE index it silently changes the uniqueness
+    semantics). The all-expression case reflects with NO columns and is already
+    flagged at reflection time; the mixed case is caught HERE by comparing the
+    reflected column count against the true key-part count: when the reflected
+    index has fewer columns than STATISTICS rows for that index, an expression
+    key-part was dropped, so it is treated exactly like an all-expression index --
+    added to ``expression_indexes`` (so ``_expression_index_warning`` fires) and
+    thereby NOT emitted as a narrower constraint by the converter. On 5.7 there are
+    no functional key-parts, so the counts always match and behavior is unchanged.
     """
     rows = connection.execute(
         text(
@@ -800,14 +829,31 @@ def enrich_index_types(
         {"db": database},
     )
     type_by_index: dict[tuple[str, str], Optional[str]] = {}
+    keypart_count_by_index: dict[tuple[str, str], int] = {}
     for table_name, index_name, index_type in rows:
-        type_by_index[(table_name, index_name)] = index_type
+        key = (table_name, index_name)
+        type_by_index[key] = index_type
+        # Each STATISTICS row is one key-part (a plain column OR a functional
+        # expression part on 8.0.13+), so counting rows gives the true key-part count.
+        keypart_count_by_index[key] = keypart_count_by_index.get(key, 0) + 1
 
     for table in tables:
         for index in table.indexes:
-            index_type = type_by_index.get((table.name, index.name))
+            key = (table.name, index.name)
+            index_type = type_by_index.get(key)
             if index_type is not None:
                 index.index_type = str(index_type)
+            # A reflected index with fewer columns than its true key-part count lost
+            # an expression key-part (SQLAlchemy dropped it). Treat it like an
+            # all-expression index: flag it and let the converter skip emitting the
+            # narrower (possibly UNIQUE) index that would change the semantics.
+            true_keyparts = keypart_count_by_index.get(key)
+            if (
+                true_keyparts is not None
+                and len(index.columns) < true_keyparts
+                and index.name not in table.expression_indexes
+            ):
+                table.expression_indexes.append(index.name)
 
 
 def enrich_partitions(

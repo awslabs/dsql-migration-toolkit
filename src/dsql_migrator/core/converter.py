@@ -1671,8 +1671,16 @@ def _build_index_ddls(table: TableDef, *, is_postgres: bool = False) -> list[str
     # that cannot be a valid column, let alone indexed -- skip an index over them too.
     if is_postgres:
         skip_columns |= _pg_unsupported_key_columns(table)
+    # An index flagged as an expression index reflected with an incomplete column set
+    # (SQLAlchemy dropped its expression key-part): a MIXED column+expression index
+    # keeps only its plain columns, so emitting it would create a WRONG, narrower index
+    # -- for a UNIQUE index that even changes the uniqueness semantics. Skip it entirely
+    # (reported by _expression_index_warning) rather than emit a doomed/incorrect index.
+    expression_index_names = set(table.expression_indexes)
     statements: list[str] = []
     for index in table.indexes:
+        if index.name in expression_index_names:
+            continue
         if len(index.columns) > _DSQL_MAX_PK_COLUMNS:
             continue
         if any(column in skip_columns for column in index.columns):
@@ -2877,6 +2885,9 @@ def _identifier_length_warning(table: TableDef) -> Optional[ConversionWarning]:
     silently truncate to 63 BYTES (NAMEDATALEN). Two column names that share the first 63
     bytes collide after truncation, and the CREATE TABLE is REJECTED ("column specified
     more than once") — a hard failure the conversion screen otherwise gave no hint of.
+    The TABLE name and (when the source qualified name carries one) the SCHEMA segment are
+    checked too: a table/schema identifier over 63 bytes is likewise truncated by DSQL,
+    which can silently collide with another table/schema sharing the first 63 bytes.
     """
     over_columns: list[str] = []
     collisions: list[str] = []
@@ -2895,7 +2906,23 @@ def _identifier_length_warning(table: TableDef) -> Optional[ConversionWarning]:
         for index in table.indexes
         if len(index.name.encode("utf-8")) > _PG_NAMEDATALEN
     ]
-    if not over_columns and not collisions and not over_indexes:
+    # The table name (and its schema segment in a ``schema.table`` qualified name) are
+    # identifiers subject to the same 63-byte truncation as columns/indexes.
+    name_parts = table.name.split(".")
+    schema_segment = name_parts[0] if len(name_parts) == 2 else None
+    table_segment = name_parts[-1]
+    over_table = len(table_segment.encode("utf-8")) > _PG_NAMEDATALEN
+    over_schema = (
+        schema_segment is not None
+        and len(schema_segment.encode("utf-8")) > _PG_NAMEDATALEN
+    )
+    if (
+        not over_columns
+        and not collisions
+        and not over_indexes
+        and not over_table
+        and not over_schema
+    ):
         return None
     parts: list[str] = []
     if collisions:
@@ -2903,6 +2930,16 @@ def _identifier_length_warning(table: TableDef) -> Optional[ConversionWarning]:
             "column names that collide after truncation to 63 bytes ("
             + "; ".join(collisions)
             + ') — the CREATE TABLE is REJECTED ("column specified more than once")'
+        )
+    if over_table:
+        parts.append(
+            "a table name over 63 bytes (" + table_segment
+            + ") that DSQL silently truncates"
+        )
+    if over_schema:
+        parts.append(
+            "a schema name over 63 bytes (" + str(schema_segment)
+            + ") that DSQL silently truncates"
         )
     if over_columns:
         parts.append(
