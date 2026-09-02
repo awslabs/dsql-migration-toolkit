@@ -19,7 +19,7 @@ from typing import Optional
 from sqlalchemy import text
 
 from dsql_migrator.core.introspector import SOURCE_CONNECT_TIMEOUT_SECONDS
-from dsql_migrator.core.models import SourceType
+from dsql_migrator.core.models import ObjectRef, ObjectType, SourceType, ViewDef
 from dsql_migrator.core.source_dialect.base import (
     SourceDialect,
     SourceVersions,
@@ -27,7 +27,8 @@ from dsql_migrator.core.source_dialect.base import (
     probe_scalar,
 )
 
-# System schemas excluded when resolving a bare (unqualified) table name to its columns.
+# User schemas to restrict to when resolving a bare (unqualified) table's columns and no
+# reflected schema is available -- the fallback path in _pg_enrich_columns.
 _PG_SYSTEM_SCHEMAS_SQL = "('pg_catalog', 'information_schema', 'pg_toast')"
 
 # PostgreSQL SQLSTATEs (beyond connection class ``08``) that a fresh connection +
@@ -94,6 +95,168 @@ _PG_INTEGER_PK_TYPES = frozenset(
         "bigserial",
     }
 )
+
+
+def _pg_apply_partitioning(connection: object, nsp: str, tables: list) -> None:
+    """Mark partitioned parents and DROP partition children from ``tables`` in place.
+
+    ``get_table_names`` returns both the partitioned parent (relkind 'p') and every
+    declarative partition child (``relispartition``) as independent tables. The parent's
+    ``SELECT *`` already returns all partitions' rows, so keeping the children would
+    migrate their data twice. Reads only ``pg_class`` for the reflected schema: a
+    parent -> ``partitioned=True`` (PartitionedTableRule fires); a child (leaf or
+    intermediate) -> removed. ``relispartition`` is precise for DECLARATIVE partitioning
+    (never true for classic INHERITS children), so ordinary inherited tables are kept.
+    """
+    rows = connection.execute(  # type: ignore[attr-defined]
+        text(
+            "SELECT c.relname AS relname, c.relkind AS relkind, "
+            "c.relispartition AS is_partition "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = :nsp AND c.relkind IN ('r', 'p')"
+        ),
+        {"nsp": nsp},
+    ).mappings()
+    parents: set[str] = set()
+    children: set[str] = set()
+    for row in rows:
+        name = row["relname"]
+        if str(row.get("relkind")) == "p":
+            parents.add(name)
+        if row.get("is_partition"):
+            children.add(name)
+    kept = []
+    for table in tables:
+        if table.name in children:
+            continue  # migrated as part of its partitioned parent
+        if table.name in parents:
+            table.partitioned = True
+        kept.append(table)
+    tables[:] = kept
+
+
+def _pg_enrich_columns(connection: object, enrich_db: str, tables: list) -> None:
+    """Overwrite each column's type with the EXACT ``format_type`` string + generated flag.
+
+    Scoped to the reflected schema (``enrich_db``) so a same-named table in another schema
+    cannot bleed its column types/flags in (the last-wins bug). A name-embedded schema is
+    used only as a FALLBACK when ``enrich_db`` is falsy; if neither is available (a bare
+    name with no schema at all) it restricts to user schemas. A column absent from the
+    catalog result is left unchanged.
+    """
+    for table in tables:
+        schema, _, bare = table.name.rpartition(".")
+        nsp = enrich_db or schema
+        params: dict[str, object] = {"rel": bare}
+        if nsp:
+            schema_filter = "AND n.nspname = :nsp"
+            params["nsp"] = nsp
+        else:
+            schema_filter = f"AND n.nspname NOT IN {_PG_SYSTEM_SCHEMAS_SQL}"
+        rows = connection.execute(  # type: ignore[attr-defined]
+            text(
+                "SELECT a.attname AS col, "
+                "format_type(a.atttypid, a.atttypmod) AS typ, "
+                # attgenerated: 's' = STORED generated column, 'v' = VIRTUAL generated
+                # column (new in PG18, its DEFAULT kind for a keyword-less GENERATED
+                # ALWAYS AS (expr)), '' = ordinary. DSQL has neither, so the converter
+                # warns and creates it ordinary -- see _pg_generated_column_warning.
+                "a.attgenerated AS gen "
+                "FROM pg_attribute a "
+                "JOIN pg_class c ON c.oid = a.attrelid "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE c.relname = :rel AND a.attnum > 0 "
+                f"AND NOT a.attisdropped {schema_filter}"
+            ),
+            params,
+        ).mappings()
+        exact = {row["col"]: (row["typ"], row.get("gen")) for row in rows}
+        for column in table.columns:
+            resolved = exact.get(column.name)
+            if resolved:
+                column.mysql_type = resolved[0]
+                if resolved[1] in ("s", "v"):  # 's'=STORED, 'v'=VIRTUAL (PG18+)
+                    column.generated = True
+
+
+def _pg_correct_fk_schemas(connection: object, nsp: str, tables: list) -> None:
+    """Fix each FK's referenced-table qualification using the catalog (confrelid).
+
+    SQLAlchemy returns ``referred_schema=None`` when the parent is visible via the
+    search_path (commonly ``public``), and ``_reflect_tables`` then defaults that to the
+    CHILD's schema -- so a cross-schema FK points at the wrong (child) schema. Resolve the
+    real referenced schema+table from ``pg_constraint`` (search_path-independent) and
+    rewrite ``referenced_table`` in place. Skipped entirely when no table has a foreign
+    key, so it adds no query to the common case.
+    """
+    if not any(table.foreign_keys for table in tables):
+        return
+    rows = connection.execute(  # type: ignore[attr-defined]
+        text(
+            "SELECT c.relname AS child, con.conname AS conname, "
+            "refn.nspname AS ref_schema, refc.relname AS ref_table "
+            "FROM pg_constraint con "
+            "JOIN pg_class c ON c.oid = con.conrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "JOIN pg_class refc ON refc.oid = con.confrelid "
+            "JOIN pg_namespace refn ON refn.oid = refc.relnamespace "
+            "WHERE con.contype = 'f' AND n.nspname = :nsp"
+        ),
+        {"nsp": nsp},
+    ).mappings()
+    target: dict[tuple[str, str], str] = {}
+    for row in rows:
+        target[(row["child"], row["conname"])] = f"{row['ref_schema']}.{row['ref_table']}"
+    for table in tables:
+        _schema, _, bare = table.name.rpartition(".")
+        for fk in table.foreign_keys:
+            resolved = target.get((bare, fk.name))
+            if resolved:
+                fk.referenced_table = resolved
+
+
+def _pg_collect_triggers(connection: object, nsp: str) -> list:
+    """Read user trigger names for the schema (mirrors MySQL ``collect_triggers`` shape).
+
+    Excludes internal triggers (``tgisinternal``, e.g. FK-enforcement triggers) and
+    returns bare ``ObjectRef``s of type TRIGGER; the caller qualifies the names. Aurora
+    DSQL has no trigger object, so TriggerRule flags each UNSUPPORTED.
+    """
+    rows = connection.execute(  # type: ignore[attr-defined]
+        text(
+            "SELECT t.tgname AS name FROM pg_trigger t "
+            "JOIN pg_class c ON c.oid = t.tgrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE NOT t.tgisinternal AND n.nspname = :nsp "
+            "ORDER BY t.tgname"
+        ),
+        {"nsp": nsp},
+    ).mappings()
+    return [ObjectRef(name=row["name"], object_type=ObjectType.TRIGGER) for row in rows]
+
+
+def _pg_collect_routines(connection: object, nsp: str) -> list:
+    """Read stored functions/procedures for the schema (mirrors ``collect_routines``).
+
+    ``prokind`` distinguishes a procedure ('p') from a function ('f'); an aggregate ('a')
+    or window ('w') routine is reported as a FUNCTION (DSQL supports none of them). Bare
+    ObjectRefs; the caller qualifies. ProcedureRule flags each UNSUPPORTED.
+    """
+    rows = connection.execute(  # type: ignore[attr-defined]
+        text(
+            "SELECT p.proname AS name, p.prokind AS kind FROM pg_proc p "
+            "JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE n.nspname = :nsp ORDER BY p.proname"
+        ),
+        {"nsp": nsp},
+    ).mappings()
+    out: list[ObjectRef] = []
+    for row in rows:
+        object_type = (
+            ObjectType.PROCEDURE if str(row.get("kind")) == "p" else ObjectType.FUNCTION
+        )
+        out.append(ObjectRef(name=row["name"], object_type=object_type))
+    return out
 
 
 class PostgresSourceDialect(SourceDialect):
@@ -169,52 +332,83 @@ class PostgresSourceDialect(SourceDialect):
     def enrich(
         self, connection: object, enrich_db: str, tables: list
     ) -> tuple[list, list, list]:
-        # Capture EXACT PostgreSQL type strings via format_type(atttypid, atttypmod):
-        # generic SQLAlchemy reflection loses array element types (text[] -> "ARRAY"),
-        # timestamptz -> "TIMESTAMP", precision, etc. This overwrites each column's
-        # reflected type string in place so the converter/assessor see the true PG type.
-        # A non-PostgreSQL connection (e.g. the SQLite test double) no-ops (mirrors the
-        # MySQL dialect's runtime guard). Stored trigger/function/event collection from
-        # pg_catalog is a later refinement, so triggers/routines/events stay empty.
+        # PostgreSQL catalog enrichment for ONE reflected schema (``enrich_db``): at this
+        # point every ``table.name`` is still BARE (the caller qualifies with the schema
+        # AFTER enrich), so the schema to scope every catalog read to is ``enrich_db``, not
+        # a name-embedded prefix. A non-PostgreSQL connection (e.g. the SQLite test double)
+        # no-ops (mirrors the MySQL dialect's runtime guard).
         dialect_name = getattr(getattr(connection, "dialect", None), "name", None)
         if dialect_name != "postgresql":
             return ([], [], [])
 
-        for table in tables:
-            schema, _, bare = table.name.rpartition(".")
-            params: dict[str, object] = {"rel": bare}
-            if schema:
-                schema_filter = "AND n.nspname = :nsp"
-                params["nsp"] = schema
-            else:
-                # Bare name (single-schema reflection): restrict to a user schema.
-                schema_filter = f"AND n.nspname NOT IN {_PG_SYSTEM_SCHEMAS_SQL}"
-            rows = connection.execute(  # type: ignore[attr-defined]
-                text(
-                    "SELECT a.attname AS col, "
-                    "format_type(a.atttypid, a.atttypmod) AS typ, "
-                    # attgenerated: 's' = STORED generated column, 'v' = VIRTUAL generated
-                    # column (new in PG18, where it is the DEFAULT kind for a keyword-less
-                    # GENERATED ALWAYS AS (expr)), '' = ordinary. DSQL has no generated
-                    # columns of either kind, so the converter warns and creates it as
-                    # ordinary -- see _pg_generated_column_warning.
-                    "a.attgenerated AS gen "
-                    "FROM pg_attribute a "
-                    "JOIN pg_class c ON c.oid = a.attrelid "
-                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
-                    "WHERE c.relname = :rel AND a.attnum > 0 "
-                    f"AND NOT a.attisdropped {schema_filter}"
-                ),
-                params,
-            ).mappings()
-            exact = {row["col"]: (row["typ"], row.get("gen")) for row in rows}
-            for column in table.columns:
-                resolved = exact.get(column.name)
-                if resolved:
-                    column.mysql_type = resolved[0]
-                    if resolved[1] in ("s", "v"):  # 's'=STORED, 'v'=VIRTUAL (PG18+)
-                        column.generated = True
-        return ([], [], [])
+        # (1) Partitioning: get_table_names returns the partitioned PARENT (relkind 'p')
+        # AND each declarative partition child (relispartition) as independent tables.
+        # Migrating both double-represents the data (the parent's SELECT * already returns
+        # every partition's rows), so mark the parent ``partitioned`` (PartitionedTableRule)
+        # and REMOVE the children from ``tables`` IN PLACE (the caller holds the same list).
+        _pg_apply_partitioning(connection, enrich_db, tables)
+
+        # (2) Exact column types + generated flag, scoped to THIS schema (``enrich_db``).
+        # format_type keeps array element types (text[], not the lossy "ARRAY"),
+        # timestamptz, precision, etc.; attgenerated flags a STORED ('s') / VIRTUAL ('v',
+        # PG18+) generated column. Scoping to :nsp is what stops a multi-schema source with
+        # same-named tables from bleeding another schema's column types/flags in (last-wins).
+        _pg_enrich_columns(connection, enrich_db, tables)
+
+        # (3) Correct each foreign key's REFERENCED schema from the catalog (confrelid):
+        # SQLAlchemy reports referred_schema=None when the parent is search_path-visible
+        # (commonly public), which _reflect_tables then mis-qualifies to the CHILD's schema.
+        _pg_correct_fk_schemas(connection, enrich_db, tables)
+
+        # (4) Stored triggers + routines (functions/procedures) for the schema, returned as
+        # the ObjectRef shape the MySQL path uses so TriggerRule/ProcedureRule flag them
+        # (DSQL has neither). Events stay empty -- PostgreSQL has no scheduled events.
+        triggers = _pg_collect_triggers(connection, enrich_db)
+        routines = _pg_collect_routines(connection, enrich_db)
+        return (triggers, routines, [])
+
+    def extra_relations(self, connection: object, enrich_db: str) -> list:
+        # Materialized views (relkind 'm') and foreign tables (relkind 'f') for the schema.
+        # Neither is returned by get_view_names / get_table_names, and Aurora DSQL supports
+        # neither, so surface each as a flagged ViewDef (Evaluation reports it UNSUPPORTED)
+        # rather than silently omitting it. PG-only (guarded); names are bare (qualified by
+        # the caller). MySQL's Inspector.get_materialized_view_names raises, so this seam --
+        # not a shared inspector call -- is why it must be gated to the PG dialect.
+        dialect_name = getattr(getattr(connection, "dialect", None), "name", None)
+        if dialect_name != "postgresql":
+            return []
+        rows = connection.execute(  # type: ignore[attr-defined]
+            text(
+                "SELECT c.relname AS name, c.relkind AS relkind "
+                "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = :nsp AND c.relkind IN ('m', 'f') "
+                "ORDER BY c.relname"
+            ),
+            {"nsp": enrich_db},
+        ).mappings()
+        label = {"m": "materialized view", "f": "foreign table"}
+        out: list[ViewDef] = []
+        for row in rows:
+            kind = label.get(str(row.get("relkind")))
+            if kind is None:
+                continue
+            out.append(ViewDef(name=row["name"], unsupported_kind=kind))
+        return out
+
+    def list_schemas(self, connection: object) -> Optional[list[str]]:
+        # SQLAlchemy's PG get_schema_names() filters `nspname NOT LIKE 'pg_%'` with an
+        # UNESCAPED underscore, so `_` matches ANY single char and it wrongly drops user
+        # schemas like `pgapp`/`pgdata`/`pghero` (they migrate silently to nothing).
+        # Enumerate directly and ESCAPE the underscore so ONLY real system/temp schemas
+        # (pg_catalog, pg_toast, pg_temp_*, pg_toast_temp_*) are excluded; the caller
+        # then subtracts system_schemas (drops information_schema). Keeps `pgapp`.
+        rows = connection.execute(  # type: ignore[attr-defined]
+            text(
+                r"SELECT nspname FROM pg_catalog.pg_namespace "
+                r"WHERE nspname NOT LIKE 'pg\_%' ESCAPE '\' ORDER BY nspname"
+            )
+        ).mappings()
+        return [row["nspname"] for row in rows]
 
     def quote_identifier(self, name: str) -> str:
         # PostgreSQL: double quotes, embedded double-quotes doubled.
@@ -319,11 +513,16 @@ class PostgresSourceDialect(SourceDialect):
         # PostgreSQL has NO ``SHOW GRANTS`` (running MySQL's statement here errors ->
         # empty -> a FALSE "SELECT missing" FAIL that blocks the Full Load). Instead:
         # a superuser bypasses every privilege check, so report ALL PRIVILEGES; a
-        # non-superuser's table privileges come from information_schema.role_table_grants
-        # (privileges granted to the current role or PUBLIC). If SELECT is among them the
-        # Full Load privilege check passes. Coarse by design -- grant presence, not
-        # per-migrated-table -- which matches MySQL's SHOW GRANTS. Best effort: any error
-        # yields [] (the check FAILs with remediation).
+        # non-superuser's table privileges come from information_schema.role_table_grants.
+        # The grantee filter uses ``pg_has_role(current_user, grantee, 'USAGE')`` (plus
+        # 'PUBLIC'), NOT ``grantee = current_user``: the Full Load connects as current_user
+        # WITH inheritance, so a SELECT granted to a group role the user is a member of is
+        # EFFECTIVE for it. The old current_user-only filter missed that and reported a
+        # FALSE "SELECT missing" that blocked the load for a perfectly-privileged
+        # role-based setup. pg_has_role(..., 'USAGE') also matches current_user itself, so
+        # direct grants are still included. Scan-free (catalog metadata only). Coarse by
+        # design -- grant presence, not per-migrated-table -- matching MySQL's SHOW GRANTS.
+        # Best effort: any error yields [] (the check FAILs with remediation).
         try:
             is_super = connection.execute(  # type: ignore[attr-defined]
                 text("SELECT current_setting('is_superuser')")
@@ -337,7 +536,8 @@ class PostgresSourceDialect(SourceDialect):
                 text(
                     "SELECT DISTINCT privilege_type "
                     "FROM information_schema.role_table_grants "
-                    "WHERE grantee IN (current_user, 'PUBLIC')"
+                    "WHERE grantee = 'PUBLIC' "
+                    "OR pg_has_role(current_user, grantee, 'USAGE')"
                 )
             ).fetchall()
         except Exception:  # noqa: BLE001 - treated as "no grants visible"

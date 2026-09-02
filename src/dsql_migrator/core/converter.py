@@ -2642,6 +2642,62 @@ def _prefix_index_warning(table: TableDef) -> Optional[ConversionWarning]:
     )
 
 
+def _pg_partial_or_nonbtree_index_warning(
+    table: TableDef,
+) -> Optional[ConversionWarning]:
+    """Warn that a PostgreSQL PARTIAL index / non-btree method is not preserved on DSQL.
+
+    Aurora DSQL builds only btree secondary indexes and has no partial (predicate) index,
+    yet ``_build_index_ddls`` emits every index as a plain ``CREATE INDEX ASYNC`` -- so
+    without this note the metadata is dropped silently:
+
+    - a PARTIAL index's ``WHERE`` predicate is dropped, turning it into a FULL index. For a
+      partial UNIQUE index this ENFORCES uniqueness over ALL rows (a semantics change), and
+      CREATE INDEX ASYNC even fails if the previously-excluded rows held duplicates;
+    - a GIN/GiST/BRIN/hash index is emitted as a plain btree, which does not serve the
+      operators/queries the specialized access method existed for.
+
+    The index is still emitted (never silently dropped), but it is NOT equivalent -- a
+    LOSS the operator must see before a multi-hour load. PostgreSQL-source only: the
+    ``where``/``method`` fields are ``None`` on every MySQL index.
+    """
+    partial = [index.name for index in table.indexes if (index.where or "").strip()]
+    nonbtree = [
+        (index.name, index.method)
+        for index in table.indexes
+        if index.method and index.method.strip().lower() not in ("", "btree")
+    ]
+    if not partial and not nonbtree:
+        return None
+    parts: list[str] = []
+    if partial:
+        parts.append(
+            f"partial index(es) {', '.join(partial)} carry a WHERE predicate DSQL cannot "
+            "express, so the predicate is dropped and a FULL index is created (a partial "
+            "UNIQUE index then enforces uniqueness over ALL rows -- a semantics change, "
+            "and CREATE INDEX ASYNC fails if the previously-excluded rows held duplicates)"
+        )
+    if nonbtree:
+        listed = ", ".join(f"{name} ({method})" for name, method in nonbtree)
+        parts.append(
+            f"index(es) {listed} use a non-btree access method DSQL does not provide, so "
+            "a plain btree index is created instead and the operators/queries that method "
+            "served will not use it"
+        )
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.LOSS,
+        message=(
+            "Aurora DSQL secondary indexes are btree-only and cannot be partial: "
+            + "; ".join(parts)
+            + ". Move the affected search outside the database (e.g. a full-text or "
+            "geospatial service) or redesign the query, and re-check uniqueness for any "
+            "partial UNIQUE index before loading."
+        ),
+    )
+
+
 def _partitioned_table_warning(table: TableDef) -> Optional[ConversionWarning]:
     """Return a warning that the source table's native partitioning was dropped.
 
@@ -3308,6 +3364,10 @@ class SchemaConverter:
             _partitioned_table_warning(table),
             (_unsupported_index_type_warning(table) if not is_postgres else None),
             (_prefix_index_warning(table) if not is_postgres else None),
+            # PostgreSQL partial / non-btree indexes lose their predicate / access method
+            # on DSQL (btree-only, no partial index); the MySQL FULLTEXT/SPATIAL and
+            # prefix-index notes above are the MySQL analogs of this.
+            (_pg_partial_or_nonbtree_index_warning(table) if is_postgres else None),
             _too_many_columns_warning(table),
             _too_many_indexes_warning(table, len(extra_index_ddls)),
             _too_many_key_columns_warning(table),
@@ -3379,6 +3439,35 @@ class SchemaConverter:
             if schema_name is not None
             else []
         )
+        # A PostgreSQL materialized view / foreign table is NOT a plain view and has NO
+        # Aurora DSQL equivalent: do NOT transpile it into a CREATE VIEW (that would
+        # silently downgrade a materialized view to a plain view, or invent DDL for a
+        # foreign table). Surface it for manual reimplementation, UNSUPPORTED (Property 6).
+        unsupported_kind = getattr(view, "unsupported_kind", None)
+        if unsupported_kind:
+            return ViewConversion(
+                view=view.name,
+                target_ddl=(
+                    f"-- {view.name} is a PostgreSQL {unsupported_kind}, which Aurora "
+                    "DSQL does not support; reimplement it manually (a materialized view "
+                    "as a table refreshed by the application; a foreign table via the "
+                    "owning service)."
+                ),
+                schema_ddls=schema_ddls,
+                auto_converted=False,
+                warnings=[
+                    ConversionWarning(
+                        object_name=view.name,
+                        classification=Classification.UNSUPPORTED,
+                        message=(
+                            f"'{view.name}' is a PostgreSQL {unsupported_kind}. Aurora "
+                            "DSQL has no materialized views or foreign tables, so there "
+                            "is no target to convert it into -- reimplement it manually "
+                            "(e.g. a materialized view as an application-refreshed table)."
+                        ),
+                    )
+                ],
+            )
         definition = (view.definition or "").strip()
         if not definition:
             return ViewConversion(

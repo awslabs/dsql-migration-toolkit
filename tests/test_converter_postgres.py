@@ -680,3 +680,76 @@ def test_pg_geometric_key_column_is_not_mislabeled_as_bytea() -> None:
         w.column_name == "loc" and w.classification is Classification.UNSUPPORTED
         for w in r.warnings
     )
+
+
+# --- Tier-4 PG index metadata + relation surfacing ---------------------------
+
+
+def test_pg_partial_and_nonbtree_indexes_warn_but_still_emit() -> None:
+    # A PostgreSQL PARTIAL index (WHERE predicate) and a non-btree method (GIN/GiST/...) have
+    # no Aurora DSQL equivalent (btree-only, no partial index). The converter still emits a
+    # plain btree/full CREATE INDEX ASYNC (never silently dropped), but MUST warn MANUAL/LOSS
+    # -- a partial UNIQUE becoming a FULL unique changes semantics, and a GIN becomes a plain
+    # btree that the operators it served cannot use.
+    from dsql_migrator.core.models import ConversionNoteKind, IndexDef
+
+    table = TableDef(
+        name="public.docs",
+        columns=[_col("id", "bigint", False), _col("body", "tsvector"), _col("active", "boolean")],
+        primary_key=["id"],
+        indexes=[
+            IndexDef(name="ix_active", columns=["active"], unique=True, where="active IS true"),
+            IndexDef(name="ix_body", columns=["body"], method="gin"),
+        ],
+    )
+    r = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    index_warnings = [
+        w for w in r.warnings
+        if w.classification is Classification.MANUAL
+        and w.kind is ConversionNoteKind.LOSS
+        and ("partial" in w.message.lower() or "btree" in w.message.lower())
+    ]
+    assert index_warnings, "expected a partial/non-btree index warning"
+    msg = index_warnings[0].message
+    assert "ix_active" in msg and "ix_body" in msg and "gin" in msg.lower()
+
+
+def test_pg_plain_btree_index_produces_no_index_metadata_warning() -> None:
+    # A plain (non-partial, btree) index must NOT trigger the partial/non-btree warning.
+    from dsql_migrator.core.converter import _pg_partial_or_nonbtree_index_warning
+    from dsql_migrator.core.models import IndexDef
+
+    table = TableDef(
+        name="public.orders",
+        columns=[_col("id", "bigint", False), _col("email", "text")],
+        primary_key=["id"],
+        indexes=[
+            IndexDef(name="ix_email", columns=["email"]),
+            IndexDef(name="ix_email2", columns=["email"], method="btree"),  # explicit btree, no predicate
+        ],
+    )
+    assert _pg_partial_or_nonbtree_index_warning(table) is None
+    r = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    assert not any(
+        "partial" in w.message.lower() or "non-btree" in w.message.lower() for w in r.warnings
+    )
+
+
+def test_convert_view_surfaces_matview_unsupported_without_downgrading() -> None:
+    # A PostgreSQL materialized view (carried as a ViewDef flagged unsupported_kind) must NOT
+    # be transpiled into a plain CREATE VIEW (a silent downgrade); it is surfaced UNSUPPORTED
+    # for manual reimplementation.
+    from dsql_migrator.core.models import ViewDef
+
+    view = ViewDef(
+        name="analytics.daily_totals",
+        definition="SELECT count(*) FROM orders",  # a real SELECT, but it is a MATVIEW
+        unsupported_kind="materialized view",
+    )
+    conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_view(view)
+    assert conv.auto_converted is False
+    assert "CREATE VIEW" not in conv.target_ddl.upper()
+    assert any(
+        w.classification is Classification.UNSUPPORTED and "materialized view" in w.message
+        for w in conv.warnings
+    )

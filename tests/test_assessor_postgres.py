@@ -19,6 +19,7 @@ from dsql_migrator.core.models import (
 
 _EXPECTED_PG_RULE_IDS = {
     "PG_UNSUPPORTED_TYPE",  # PG-specific: DSQL-unsupported column types
+    "PG_UNSUPPORTED_RELATION",  # PG-specific: materialized views / foreign tables
     "FK_PRESERVED",
     "CHECK_CONSTRAINT_DROPPED",
     "TRIGGER_UNSUPPORTED",
@@ -159,6 +160,56 @@ def test_multi_schema_pg_source_is_not_flagged_as_multiple_databases() -> None:
     # A MySQL source with the same two-schema shape DOES still get the finding.
     mysql_report = CompatibilityAssessor().assess(inventory)
     assert "MULTIPLE_DATABASES" in {item.rule_id for item in mysql_report.items}
+
+
+def test_pg_evaluation_flags_collected_triggers_and_routines() -> None:
+    # Fix #2: once enrich populates inventory.triggers/routines for a PG source, the PG
+    # rule set (which wires TriggerRule/ProcedureRule) must flag them UNSUPPORTED -- they
+    # were always empty before, so these rules never fired for PostgreSQL.
+    from dsql_migrator.core.models import Classification, ObjectRef, ObjectType
+
+    inventory = SourceInventory(
+        tables=[
+            TableDef(name="shop.orders", columns=[ColumnDef(name="id", mysql_type="bigint")], primary_key=["id"])
+        ],
+        triggers=[ObjectRef(name="shop.audit_ins", object_type=ObjectType.TRIGGER)],
+        routines=[
+            ObjectRef(name="shop.calc_total", object_type=ObjectType.FUNCTION),
+            ObjectRef(name="shop.do_thing", object_type=ObjectType.PROCEDURE),
+        ],
+    )
+    report = CompatibilityAssessor(source_type=SourceType.POSTGRES).assess(inventory)
+    by_name = {item.object_name: item for item in report.items}
+    assert by_name["shop.audit_ins"].rule_id == "TRIGGER_UNSUPPORTED"
+    assert by_name["shop.audit_ins"].classification is Classification.UNSUPPORTED
+    assert by_name["shop.calc_total"].rule_id == "PROC_PLPGSQL"
+    assert by_name["shop.calc_total"].classification is Classification.UNSUPPORTED
+    assert by_name["shop.do_thing"].classification is Classification.UNSUPPORTED
+
+
+def test_pg_evaluation_flags_materialized_views_and_foreign_tables() -> None:
+    # Fix #4: matviews / foreign tables are carried as ViewDefs flagged unsupported_kind.
+    # The PG rule set must flag them UNSUPPORTED (DSQL has neither) while leaving a plain
+    # view unflagged (AUTO for the PG rule set, which has no view-content rule).
+    from dsql_migrator.core.models import Classification, ViewDef
+
+    inventory = SourceInventory(
+        tables=[
+            TableDef(name="shop.orders", columns=[ColumnDef(name="id", mysql_type="bigint")], primary_key=["id"])
+        ],
+        views=[
+            ViewDef(name="shop.daily_totals", unsupported_kind="materialized view"),
+            ViewDef(name="shop.ext_orders", unsupported_kind="foreign table"),
+            ViewDef(name="shop.plain", definition="SELECT 1"),
+        ],
+    )
+    report = CompatibilityAssessor(source_type=SourceType.POSTGRES).assess(inventory)
+    by_name = {item.object_name: item for item in report.items}
+    assert by_name["shop.daily_totals"].rule_id == "PG_UNSUPPORTED_RELATION"
+    assert by_name["shop.daily_totals"].classification is Classification.UNSUPPORTED
+    assert by_name["shop.ext_orders"].rule_id == "PG_UNSUPPORTED_RELATION"
+    assert by_name["shop.ext_orders"].classification is Classification.UNSUPPORTED
+    assert by_name["shop.plain"].classification is Classification.AUTO
 
 
 def test_html_report_title_reflects_the_postgres_source_engine() -> None:

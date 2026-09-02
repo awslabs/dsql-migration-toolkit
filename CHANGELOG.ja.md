@@ -5,6 +5,42 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.430
+
+### 修正 (Fixed)
+
+- **PostgreSQL のイントロスペクションがスキーマオブジェクトを暗黙のうちに欠落/誤読しなくなりました。**
+  PostgreSQL 17/18 の検証を機に行ったレビューで、PG ソースのイントロスペクションの欠陥群(いずれも
+  以前は **サイレント** — エラーも警告もなく誤った/不完全な `SourceInventory`)を発見し修正しました:
+  - **`pgapp`/`pgdata` のような user スキーマが暗黙的にスキップされていた問題。** `_user_schemas` が
+    SQLAlchemy の `get_schema_names()`(フィルタ `nspname NOT LIKE 'pg_%'`、`_` が **エスケープされず**
+    任意の1文字にマッチ)に依存し、`pg`+1文字で始まるスキーマがすべて欠落してそのテーブルが
+    イントロスペクション/移行から漏れていました。新しい `SourceDialect.list_schemas` フックで PG
+    ダイアレクトが `pg_namespace` を **エスケープした** アンダースコアで直接列挙し、真のシステム/temp
+    スキーマのみ除外します。
+  - **`enrich` が対象スキーマを無視 → スキーマ間の列汚染。** `pg_attribute` 読み取りが反映中のスキーマに
+    スコープされておらず、同名テーブルを持つ複数スキーマのソースで **別スキーマの** 列型/生成列フラグを
+    取り込むことがありました(last-wins)。反映スキーマにスコープするよう修正。
+  - **トリガー/関数/プロシージャが一切収集されない**(PG `enrich` が常に空を返す)→ ソースに存在しても
+    Evaluation が「トリガー 0 / ルーチン 0」と報告。`pg_trigger` / `pg_proc` から読み取り、
+    TriggerRule/ProcedureRule が表示するようになりました。
+  - **宣言的パーティションテーブルの二重移行** — `get_table_names` が親 **と** 全パーティション子を独立
+    テーブルとして返す。親を partitioned とフラグ付け(PartitionedTableRule 発火)し、子は除去(親の
+    スキャンが既にその行を返す)して、パーティションデータが二重表現されないようにしました。
+  - **マテリアライズドビュー・外部テーブルが暗黙的に欠落**(relkind `m`/`f`、`get_table_names`・
+    `get_view_names` のいずれにも無し)。`ViewDef.unsupported_kind` + 新 `UnsupportedRelationRule` で
+    **UNSUPPORTED** として表面化(DSQL にはどちらも無い)し、インベントリから消えないようにしました。
+    `convert_view` もマテリアライズドビューを通常ビューへ格下げしません。
+  - **部分(partial)・非btreeインデックスの暗黙的な劣化** — partial UNIQUE が **FULL** unique になり
+    (正当なデータを拒否/async ビルド失敗の可能性)、GIN/GiST/BRIN/hash が btree として出力。`IndexDef`
+    が述語(`where`)とアクセスメソッド(`method`)を保持し、Schema Conversion が暗黙変更ではなく
+    MANUAL/LOSS 警告を出します。
+  - **スキーマ間 FK が子スキーマへ誤って修飾** — 親が search_path 上で可視だと SQLAlchemy が
+    `referred_schema=None` を返す。`pg_constraint.confrelid` から参照スキーマを解決(search_path 非依存)
+    するようにしました。
+  - **`probe_grants` が role メンバーシップ経由の SELECT を見落とし** → 誤った「SELECT なし」で
+    Full Load をブロック。`pg_has_role` で実効権限を確認するようにしました。
+
 ## v0.1.429
 
 ### 修正 (Fixed)

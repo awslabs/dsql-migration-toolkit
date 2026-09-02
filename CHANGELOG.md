@@ -5,6 +5,47 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.430
+
+### Fixed
+
+- **PostgreSQL introspection no longer silently drops or mis-reads schema objects.** A
+  review (prompted by the PostgreSQL 17/18 verification) found a cluster of PG-source
+  introspection defects, all previously **silent** — a wrong/incomplete `SourceInventory`
+  with no error or warning — now fixed:
+  - **User schemas named like `pgapp`/`pgdata` were silently skipped.** `_user_schemas`
+    relied on SQLAlchemy's `get_schema_names()`, which filters `nspname NOT LIKE 'pg_%'`
+    with an **unescaped** `_` (matches any single char), so any schema starting with `pg`
+    + a character was dropped — its tables never introspected or migrated. A new
+    `SourceDialect.list_schemas` hook has the PostgreSQL dialect enumerate `pg_namespace`
+    with an **escaped** underscore, excluding only real system/temp schemas.
+  - **`enrich` ignored the reflected schema → cross-schema column bleed.** The
+    `pg_attribute` read was not scoped to the schema being reflected, so in a multi-schema
+    source with same-named tables a table could pick up **another schema's** column types /
+    generated-column flags (last-wins). Now scoped to the reflected schema.
+  - **Triggers, functions and procedures were never collected** (PG `enrich` always
+    returned empty) → Evaluation reported "0 triggers / 0 routines" even when the source
+    had them. Now read from `pg_trigger` / `pg_proc` so TriggerRule/ProcedureRule flag them.
+  - **Declarative partitioned tables were double-migrated** — `get_table_names` returns the
+    partitioned parent **and** every partition child as independent tables. The parent is
+    now flagged partitioned (PartitionedTableRule fires) and the children are removed (the
+    parent's scan already returns their rows), so partition data is not represented twice.
+  - **Materialized views and foreign tables were silently omitted** (relkinds `m`/`f`, in
+    neither `get_table_names` nor `get_view_names`). They are now surfaced (via
+    `ViewDef.unsupported_kind` + a new `UnsupportedRelationRule`) as **UNSUPPORTED** —
+    Aurora DSQL has neither — instead of vanishing from the inventory; `convert_view` no
+    longer downgrades a materialized view to a plain view.
+  - **Partial and non-btree indexes were silently degraded** — a partial UNIQUE index
+    became a **FULL** unique index (can reject valid data / fail the async build) and a
+    GIN/GiST/BRIN/hash index was emitted as plain btree. `IndexDef` now carries the
+    predicate (`where`) and access method (`method`), and Schema Conversion emits a
+    MANUAL/LOSS warning rather than silently changing the index.
+  - **Cross-schema foreign keys were mis-qualified to the child's schema** when the parent
+    was search-path-visible (SQLAlchemy returns `referred_schema=None`). The referenced
+    schema is now resolved from `pg_constraint.confrelid` (search-path-independent).
+  - **`probe_grants` missed SELECT granted via role membership** → a false "SELECT missing"
+    that blocked Full Load. It now checks effective privilege via `pg_has_role`.
+
 ## v0.1.429
 
 ### Fixed

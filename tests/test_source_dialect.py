@@ -130,7 +130,15 @@ class _FakePgMappings:
 
 
 class _FakePgConnection:
-    """A connection whose dialect is PostgreSQL, returning canned format_type rows."""
+    """A connection whose dialect is PostgreSQL, returning canned rows for ONE query kind.
+
+    ``enrich`` now issues several catalog reads (columns, partitioning, FK schemas,
+    triggers, routines) and ``list_schemas`` one more; this single-purpose double answers
+    only the column (``pg_attribute``) enrich query and the ``list_schemas`` (``NOT LIKE``)
+    query with its canned rows, and every OTHER catalog query with an empty result -- so a
+    test that supplies only column rows (or only schema rows) is unaffected by the extra
+    reads. Tests that need several catalog answers use :class:`_DispatchPgConnection`.
+    """
 
     class _Dialect:
         name = "postgresql"
@@ -141,7 +149,35 @@ class _FakePgConnection:
         self._rows = rows
 
     def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
-        return _FakePgMappings(self._rows)
+        sql = str(statement)
+        if "pg_attribute" in sql or "NOT LIKE" in sql:
+            return _FakePgMappings(self._rows)
+        return _FakePgMappings([])
+
+
+class _DispatchPgConnection:
+    """A PostgreSQL-typed connection that routes each catalog query to a canned answer.
+
+    ``handlers`` maps an SQL substring -> ``callable(params) -> list[dict]`` (rows for
+    ``.mappings()``); the first substring found in the statement wins and an unmatched
+    query returns ``[]``. This lets one fake answer ``enrich``'s several reads (and
+    ``extra_relations``) independently and honor the ``:nsp`` bind parameter.
+    """
+
+    class _Dialect:
+        name = "postgresql"
+
+    dialect = _Dialect()
+
+    def __init__(self, handlers: dict) -> None:
+        self._handlers = handlers
+
+    def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+        sql = str(statement)
+        for needle, fn in self._handlers.items():
+            if needle in sql:
+                return _FakePgMappings(fn(parameters or {}))
+        return _FakePgMappings([])
 
 
 def test_postgres_dialect_enrich_captures_exact_pg_types() -> None:
@@ -197,6 +233,174 @@ def test_postgres_dialect_enrich_flags_stored_and_virtual_generated_columns() ->
     assert table.columns[1].generated is True  # STORED generated column
     assert table.columns[1].mysql_type == "text"
     assert table.columns[2].generated is True  # VIRTUAL generated column (PG18+)
+
+
+def test_postgres_enrich_scopes_columns_to_the_reflected_schema() -> None:
+    # HIGH/silent: two schemas each hold a table named "orders" with DIFFERENT column
+    # types/generated flags. enrich must scope its pg_attribute read to enrich_db (the
+    # schema being reflected) via :nsp -- else it returns EVERY schema's columns and
+    # last-wins bleeds another schema's types/flags in.
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    by_schema = {
+        "shop": [
+            {"col": "amount", "typ": "numeric(12,2)", "gen": ""},
+            {"col": "note", "typ": "text", "gen": "s"},
+        ],
+        "archive": [
+            {"col": "amount", "typ": "bigint", "gen": ""},
+            {"col": "note", "typ": "jsonb", "gen": ""},
+        ],
+    }
+    conn = _DispatchPgConnection({"pg_attribute": lambda p: by_schema[p["nsp"]]})
+    d = dialect_for(SourceType.POSTGRES)
+
+    def _orders():
+        return TableDef(
+            name="orders",  # BARE at enrich time (caller qualifies afterwards)
+            columns=[ColumnDef(name="amount", mysql_type="?"), ColumnDef(name="note", mysql_type="?")],
+            primary_key=[],
+        )
+
+    shop = _orders()
+    d.enrich(conn, "shop", [shop])
+    assert [(c.mysql_type, c.generated) for c in shop.columns] == [
+        ("numeric(12,2)", False),
+        ("text", True),
+    ]
+    archive = _orders()
+    d.enrich(conn, "archive", [archive])
+    assert [(c.mysql_type, c.generated) for c in archive.columns] == [
+        ("bigint", False),
+        ("jsonb", False),
+    ]
+
+
+def test_postgres_enrich_collects_triggers_and_routines() -> None:
+    # HIGH/silent: enrich must collect stored triggers (pg_trigger) and routines (pg_proc,
+    # prokind -> FUNCTION/PROCEDURE) as ObjectRefs so TriggerRule/ProcedureRule flag them;
+    # events stay empty (PostgreSQL has no scheduled events).
+    from dsql_migrator.core.models import ObjectType
+
+    conn = _DispatchPgConnection(
+        {
+            "pg_trigger": lambda p: [{"name": "audit_ins"}, {"name": "audit_upd"}],
+            "pg_proc": lambda p: [
+                {"name": "calc_total", "kind": "f"},
+                {"name": "do_thing", "kind": "p"},
+                {"name": "agg_stats", "kind": "a"},  # aggregate -> reported as a function
+            ],
+        }
+    )
+    triggers, routines, events = dialect_for(SourceType.POSTGRES).enrich(conn, "shop", [])
+    assert [t.name for t in triggers] == ["audit_ins", "audit_upd"]
+    assert all(t.object_type is ObjectType.TRIGGER for t in triggers)
+    by = {r.name: r.object_type for r in routines}
+    assert by["calc_total"] is ObjectType.FUNCTION
+    assert by["do_thing"] is ObjectType.PROCEDURE
+    assert by["agg_stats"] is ObjectType.FUNCTION
+    assert events == []
+
+
+def test_postgres_enrich_removes_partition_children_and_flags_parent() -> None:
+    # HIGH/silent: get_table_names returns the partitioned PARENT (relkind 'p') AND each
+    # declarative partition child (relispartition) -- migrating both double-represents the
+    # data. enrich marks the parent partitioned (PartitionedTableRule) and REMOVES the
+    # children from the tables list in place; an ordinary sibling is untouched.
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    def _parts(_p):
+        return [
+            {"relname": "events", "relkind": "p", "is_partition": False},
+            {"relname": "events_2023", "relkind": "r", "is_partition": True},
+            {"relname": "events_2024", "relkind": "r", "is_partition": True},
+            {"relname": "customers", "relkind": "r", "is_partition": False},
+        ]
+
+    conn = _DispatchPgConnection({"relispartition": _parts})
+    tables = [
+        TableDef(name=n, columns=[ColumnDef(name="id", mysql_type="bigint")], primary_key=["id"])
+        for n in ("events", "events_2023", "events_2024", "customers")
+    ]
+    dialect_for(SourceType.POSTGRES).enrich(conn, "shop", tables)
+    assert [t.name for t in tables] == ["events", "customers"]  # children removed in place
+    assert next(t for t in tables if t.name == "events").partitioned is True
+    assert next(t for t in tables if t.name == "customers").partitioned is False
+
+
+def test_postgres_enrich_corrects_cross_schema_fk_referenced_schema() -> None:
+    # MEDIUM/silent: SQLAlchemy returns referred_schema=None when the parent is
+    # search_path-visible, so _reflect_tables mis-qualifies the FK target to the CHILD's
+    # schema (shop). enrich resolves the REAL parent schema (billing) from pg_constraint's
+    # confrelid, search_path-independent.
+    from dsql_migrator.core.models import ColumnDef, ForeignKeyDef, TableDef
+
+    def _fk_rows(_p):
+        return [
+            {"child": "orders", "conname": "fk_cust", "ref_schema": "billing", "ref_table": "customers"}
+        ]
+
+    conn = _DispatchPgConnection({"pg_constraint": _fk_rows})
+    orders = TableDef(
+        name="orders",  # BARE at enrich time
+        columns=[ColumnDef(name="id", mysql_type="bigint")],
+        primary_key=["id"],
+        foreign_keys=[
+            ForeignKeyDef(
+                name="fk_cust",
+                columns=["customer_id"],
+                referenced_table="shop.customers",  # wrongly qualified to the CHILD schema
+                referenced_columns=["id"],
+            )
+        ],
+    )
+    dialect_for(SourceType.POSTGRES).enrich(conn, "shop", [orders])
+    assert orders.foreign_keys[0].referenced_table == "billing.customers"
+
+
+def test_postgres_extra_relations_surfaces_matviews_and_foreign_tables() -> None:
+    # HIGH/MEDIUM silent: matviews (relkind 'm') and foreign tables ('f') are returned by
+    # neither get_view_names nor get_table_names, so the extra_relations seam enumerates
+    # them and flags each ViewDef.unsupported_kind so Evaluation surfaces it.
+    def _rels(_p):
+        return [{"name": "daily_totals", "relkind": "m"}, {"name": "ext_orders", "relkind": "f"}]
+
+    conn = _DispatchPgConnection({"relkind IN ('m', 'f')": _rels})
+    relations = dialect_for(SourceType.POSTGRES).extra_relations(conn, "shop")
+    assert {r.name: r.unsupported_kind for r in relations} == {
+        "daily_totals": "materialized view",
+        "ext_orders": "foreign table",
+    }
+
+
+def test_extra_relations_empty_for_mysql_and_non_pg_connections() -> None:
+    # MySQL has neither matviews nor foreign tables (and Inspector.get_materialized_view_names
+    # raises), so the seam is gated to the PG dialect on a genuine PG connection.
+    assert dialect_for(SourceType.MYSQL).extra_relations(object(), "app") == []
+    assert dialect_for(SourceType.POSTGRES).extra_relations(object(), "app") == []
+
+
+def test_postgres_dialect_list_schemas_keeps_pg_prefixed_user_schemas() -> None:
+    # SQLAlchemy's PG get_schema_names() filters `nspname NOT LIKE 'pg_%'` UNESCAPED, so a
+    # user schema like `pgapp`/`pgdata` (pg + any char) is silently dropped. The dialect's
+    # own list_schemas escapes the underscore, so such schemas are RETURNED (and only real
+    # pg_* system/temp schemas are excluded). _user_schemas then removes system_schemas.
+    from dsql_migrator.core.introspector import _user_schemas
+
+    conn = _FakePgConnection(
+        [
+            {"nspname": "information_schema"},
+            {"nspname": "pgapp"},  # pg + 'a' -> matches unescaped 'pg_%' but is a USER schema
+            {"nspname": "public"},
+        ]
+    )
+    dialect = dialect_for(SourceType.POSTGRES)
+    # The dialect returns every non-pg_ schema, including the pg-prefixed user schema.
+    assert dialect.list_schemas(conn) == ["information_schema", "pgapp", "public"]
+    # _user_schemas then drops the engine system schemas (information_schema), keeping pgapp.
+    kept = _user_schemas(None, dialect.system_schemas, connection=conn, dialect=dialect)
+    assert "pgapp" in kept and "public" in kept
+    assert "information_schema" not in kept
 
 
 def test_postgres_dialect_supports_shared_snapshot_and_renders_export_import_sql() -> None:
@@ -503,6 +707,32 @@ def test_postgres_probe_grants_non_superuser_lists_table_privileges() -> None:
 def test_postgres_probe_grants_empty_when_no_grants_and_not_super() -> None:
     conn = _FakeGrantsConnection(super="off", pg_rows=[])
     assert dialect_for(SourceType.POSTGRES).probe_grants(conn) == []
+
+
+def test_postgres_probe_grants_includes_role_inherited_select() -> None:
+    # MEDIUM/loud-but-wrong: the migrator user holds SELECT only via membership in a group
+    # role. probe_grants must check EFFECTIVE privilege (pg_has_role, honoring inheritance),
+    # NOT grantee = current_user -- else it FALSELY reports "SELECT missing" and blocks Full
+    # Load for a perfectly-privileged role-based grant.
+    class _RoleGrantsConn:
+        class _Dialect:
+            name = "postgresql"
+
+        dialect = _Dialect()
+
+        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+            sql = str(statement).upper()
+            if "IS_SUPERUSER" in sql:
+                return _GrantsResult(scalar_value="off")
+            if "ROLE_TABLE_GRANTS" in sql:
+                # The role-inherited grant is visible ONLY when the query accounts for role
+                # membership; the old current_user-only filter (no pg_has_role) would miss it.
+                assert "PG_HAS_ROLE" in sql
+                return _GrantsResult(rows=[("SELECT",)])
+            raise RuntimeError(f"unexpected grant probe SQL: {sql!r}")
+
+    grants = dialect_for(SourceType.POSTGRES).probe_grants(_RoleGrantsConn())
+    assert "SELECT" in grants
 
 
 # ---------------------------------------------------------------------------

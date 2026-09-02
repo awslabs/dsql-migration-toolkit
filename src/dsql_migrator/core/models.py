@@ -207,6 +207,27 @@ class IndexDef(BaseModel):
             "after the load. Empty for a normal (non-prefix) index."
         ),
     )
+    where: Optional[str] = Field(
+        default=None,
+        description=(
+            "PostgreSQL PARTIAL-index predicate (the reflected ``postgresql_where`` "
+            "clause, e.g. ``active IS true``), if any. Aurora DSQL has no partial index, "
+            "so the converter emits the index WITHOUT the predicate (a FULL index) and "
+            "warns -- for a UNIQUE partial index this changes uniqueness semantics "
+            "(uniqueness would then be enforced over ALL rows). None for a normal "
+            "(non-partial) index and for every MySQL index."
+        ),
+    )
+    method: Optional[str] = Field(
+        default=None,
+        description=(
+            "PostgreSQL index access METHOD (the reflected ``postgresql_using``, e.g. "
+            "``gin``/``gist``/``brin``/``hash``/``btree``), if known. Aurora DSQL builds "
+            "only btree secondary indexes, so a non-btree method is emitted as a plain "
+            "btree index and warned about (the specialized access method is lost). None "
+            "when unknown and for every MySQL index."
+        ),
+    )
 
 
 class ForeignKeyDef(BaseModel):
@@ -327,12 +348,30 @@ def apply_lob_exclusions(
 
 
 class ViewDef(BaseModel):
-    """A source view definition."""
+    """A source view definition.
+
+    Also carries the two PostgreSQL relation kinds that are NOT plain views yet have
+    NO Aurora DSQL target -- a materialized view and a foreign table -- via
+    :attr:`unsupported_kind`. Neither is returned by ``get_view_names`` /
+    ``get_table_names`` (relkinds 'm'/'f'), so without capturing them here they would be
+    silently absent from the migration. They are represented as views (they must not
+    enter Full Load) but flagged so Evaluation surfaces them UNSUPPORTED and Schema
+    Conversion does not downgrade a materialized view to a plain view (Property 6).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(min_length=1)
     definition: str = ""
+    unsupported_kind: Optional[str] = Field(
+        default=None,
+        description=(
+            "Set when this relation is a PostgreSQL kind Aurora DSQL cannot host: the "
+            "human label ``materialized view`` or ``foreign table``. None for an "
+            "ordinary view. Drives the UNSUPPORTED Evaluation finding and keeps Schema "
+            "Conversion from silently converting it to a plain view."
+        ),
+    )
 
 
 class ObjectType(str, Enum):

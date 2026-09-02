@@ -484,13 +484,19 @@ def _reflect_tables(inspector: object, schema: Optional[str] = None) -> list[Tab
             # MySQL prefix-index lengths (``KEY (col(N))``) live under the reflected
             # index's dialect_options["mysql_length"] = {column: N}. Carry them so the
             # converter can warn that DSQL indexes the FULL column (no prefix support).
+            dialect_options = index.get("dialect_options") or {}
             prefix_lengths = {
                 str(col): int(length)
-                for col, length in (
-                    (index.get("dialect_options") or {}).get("mysql_length") or {}
-                ).items()
+                for col, length in (dialect_options.get("mysql_length") or {}).items()
                 if col in index_columns
             }
+            # PostgreSQL partial-index predicate and access method (SQLAlchemy exposes
+            # both under dialect_options): a PARTIAL index (postgresql_where) and a
+            # non-btree method (postgresql_using) have no Aurora DSQL equivalent, so they
+            # must be carried so the converter can warn rather than emit a plain
+            # btree/full index silently. Absent (None) on a MySQL index / a normal index.
+            pg_where = dialect_options.get("postgresql_where")
+            pg_using = dialect_options.get("postgresql_using")
             if index_name and index_columns:
                 indexes.append(
                     IndexDef(
@@ -498,6 +504,8 @@ def _reflect_tables(inspector: object, schema: Optional[str] = None) -> list[Tab
                         columns=index_columns,
                         unique=bool(index.get("unique")),
                         prefix_lengths=prefix_lengths,
+                        where=str(pg_where) if pg_where else None,
+                        method=str(pg_using) if pg_using else None,
                     )
                 )
 
@@ -823,12 +831,25 @@ def enrich_partitions(
             table.partitioned = True
 
 
-def _user_schemas(inspector: object, system_schemas: frozenset[str]) -> list[str]:
+def _user_schemas(
+    inspector: object,
+    system_schemas: frozenset[str],
+    *,
+    connection: object = None,
+    dialect: "Optional[SourceDialect]" = None,
+) -> list[str]:
     """Return non-system schema names on the cluster, in catalog order.
 
     ``system_schemas`` (the source dialect's engine-internal schemas) are excluded.
+    The dialect may supply its own listing via ``list_schemas`` (PostgreSQL does, because
+    SQLAlchemy's ``get_schema_names()`` drops user schemas named like ``pgapp``); when it
+    returns ``None`` we fall back to the SQLAlchemy inspector.
     """
-    names = inspector.get_schema_names()  # type: ignore[attr-defined]
+    names = None
+    if dialect is not None and connection is not None:
+        names = dialect.list_schemas(connection)
+    if names is None:
+        names = inspector.get_schema_names()  # type: ignore[attr-defined]
     return [name for name in names if name not in system_schemas]
 
 
@@ -867,7 +888,9 @@ def _assemble_inventory(
         # database holds many schemas -- public, app, ... -- all of which must migrate).
         plans = [
             (schema, schema, True)
-            for schema in _user_schemas(inspector, dialect.system_schemas)
+            for schema in _user_schemas(
+                inspector, dialect.system_schemas, connection=connection, dialect=dialect
+            )
         ]
 
     all_tables: list[TableDef] = []
@@ -882,6 +905,11 @@ def _assemble_inventory(
         # Engine-specific enrichment (columns/indexes/partitions in place + stored
         # triggers/routines/events). No-ops for a dialect/connection without it.
         triggers, routines, events = dialect.enrich(connection, enrich_db, tables)
+        # Relations with no plain-table/plain-view migration target that structural
+        # reflection misses entirely (PostgreSQL materialized views + foreign tables,
+        # relkinds 'm'/'f'). Carried as flagged views so Evaluation surfaces them
+        # instead of dropping them; empty for engines/connections without them.
+        views.extend(dialect.extra_relations(connection, enrich_db))
 
         if qualify:
             _qualify(enrich_db, tables, views, triggers, routines, events)

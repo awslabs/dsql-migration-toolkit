@@ -165,6 +165,18 @@ class SourceDialect(ABC):
     def system_schemas(self) -> frozenset[str]:
         """Schemas never part of a user's migratable inventory (engine internals)."""
 
+    def list_schemas(self, connection: object) -> Optional[list[str]]:
+        """All schema names for cluster-wide reflection, or ``None`` to fall back to
+        the SQLAlchemy inspector's ``get_schema_names()``.
+
+        The caller subtracts :attr:`system_schemas`. Default is ``None`` (use the
+        inspector); a dialect overrides this only when the inspector's default listing
+        is wrong for it (e.g. PostgreSQL, whose ``get_schema_names()`` filters
+        ``nspname NOT LIKE 'pg_%'`` with an UNESCAPED ``_`` and so silently drops user
+        schemas named like ``pgapp``/``pgdata``).
+        """
+        return None
+
     @abstractmethod
     def engine_kwargs(
         self, *, read_timeout_seconds: Optional[int] = None
@@ -183,6 +195,18 @@ class SourceDialect(ABC):
         engine-specific enrichment returns three empty lists. Structural reflection
         (tables/columns/views) is dialect-agnostic and done by the caller.
         """
+
+    def extra_relations(self, connection: object, enrich_db: str) -> "list":
+        """Relations with NO Aurora DSQL target that structural reflection MISSES.
+
+        Returned as :class:`~dsql_migrator.core.models.ViewDef` entries flagged via
+        ``unsupported_kind`` so Evaluation surfaces them (rather than the migration
+        silently omitting them). Default is none; PostgreSQL overrides this to enumerate
+        materialized views and foreign tables (relkinds 'm'/'f'), which
+        ``get_view_names``/``get_table_names`` do not return. MySQL has neither, so it
+        keeps the empty default. Names are bare (the caller qualifies them).
+        """
+        return []
 
     @abstractmethod
     def quote_identifier(self, name: str) -> str:

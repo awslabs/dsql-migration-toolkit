@@ -5,6 +5,41 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.430
+
+### 수정 (Fixed)
+
+- **PostgreSQL introspection이 스키마 객체를 더 이상 조용히 누락/오독하지 않습니다.** PostgreSQL
+  17/18 검증을 계기로 진행한 리뷰에서 PG 소스 introspection 결함 묶음(모두 이전엔 **silent** —
+  오류·경고 없이 잘못되거나 불완전한 `SourceInventory`)을 발견해 수정했습니다:
+  - **`pgapp`/`pgdata` 같은 사용자 스키마가 조용히 제외되던 문제.** `_user_schemas`가 SQLAlchemy의
+    `get_schema_names()`(필터 `nspname NOT LIKE 'pg_%'`, `_`가 **언이스케이프**라 임의의 한 글자
+    매치)에 의존해, `pg`+한 글자로 시작하는 스키마가 전부 누락되어 그 테이블들이 introspection·
+    마이그레이션에서 빠졌습니다. 새 `SourceDialect.list_schemas` 훅으로 PG 다이얼렉트가 `pg_namespace`를
+    **이스케이프된** 언더스코어로 직접 열거해 진짜 시스템/temp 스키마만 제외합니다.
+  - **`enrich`가 대상 스키마를 무시 → 교차 스키마 컬럼 오염.** `pg_attribute` 조회가 반영 중인
+    스키마로 스코핑되지 않아, 동명 테이블이 있는 다중 스키마 소스에서 **다른 스키마의** 컬럼
+    타입/생성컬럼 플래그를 가져올 수 있었습니다(last-wins). 이제 반영 스키마로 스코핑합니다.
+  - **트리거/함수/프로시저 미수집**(PG `enrich`가 항상 빈 값 반환) → 소스에 있어도 Evaluation이
+    "트리거 0 / 루틴 0"으로 보고. 이제 `pg_trigger`/`pg_proc`에서 읽어 TriggerRule/ProcedureRule이
+    표시합니다.
+  - **선언적 파티션 테이블 이중 마이그레이션** — `get_table_names`가 부모 **및** 모든 파티션 자식을
+    독립 테이블로 반환. 이제 부모를 partitioned로 표시(PartitionedTableRule 발동)하고 자식은
+    제거(부모 스캔이 이미 그 행들을 반환)해 파티션 데이터가 이중 표현되지 않습니다.
+  - **Materialized view·foreign table 조용히 누락**(relkind `m`/`f`, `get_table_names`·
+    `get_view_names` 어디에도 없음). 이제 `ViewDef.unsupported_kind` + 새 `UnsupportedRelationRule`로
+    **UNSUPPORTED** 표면화(DSQL엔 둘 다 없음), 인벤토리에서 사라지지 않습니다. `convert_view`도 matview를
+    일반 view로 강등하지 않습니다.
+  - **부분(partial)·비-btree 인덱스 조용한 강등** — partial UNIQUE가 **FULL** unique가 되고(정상
+    데이터 거부/async 빌드 실패 가능), GIN/GiST/BRIN/hash가 btree로 방출. `IndexDef`가 이제 술어
+    (`where`)와 access method(`method`)를 담고, Schema Conversion이 조용히 바꾸는 대신 MANUAL/LOSS
+    경고를 냅니다.
+  - **교차 스키마 FK가 자식 스키마로 오귀속** — 부모가 search_path에 보이면 SQLAlchemy가
+    `referred_schema=None` 반환. 이제 `pg_constraint.confrelid`에서 참조 스키마를 해석(search_path
+    무관)합니다.
+  - **`probe_grants`가 role 멤버십으로 부여된 SELECT 누락** → 거짓 "SELECT 없음"으로 Full Load
+    차단. 이제 `pg_has_role`로 유효 권한을 확인합니다.
+
 ## v0.1.429
 
 ### 수정 (Fixed)

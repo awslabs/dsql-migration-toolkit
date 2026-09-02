@@ -610,12 +610,29 @@ class _FakeInspector:
 
 
 class _NonMysqlConnection:
-    """A connection whose dialect is not MySQL (skips information_schema enrich)."""
+    """A connection whose dialect is not MySQL (skips information_schema enrich).
+
+    ``schemas`` (optional) is what the PostgreSQL dialect's ``list_schemas`` catalog
+    query returns via ``execute(...).mappings()`` -- so the PG reflection path (which no
+    longer trusts SQLAlchemy's over-filtering ``get_schema_names()``) can be exercised.
+    """
 
     class _Dialect:
         name = "sqlite"
 
     dialect = _Dialect()
+
+    def __init__(self, schemas=None) -> None:  # noqa: ANN001
+        self._schemas = schemas
+
+    def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+        rows = [{"nspname": s} for s in (self._schemas or [])]
+
+        class _R:
+            def mappings(self_):  # noqa: ANN001, ANN202, N805
+                return rows
+
+        return _R()
 
 
 def test_cluster_wide_introspection_qualifies_names_across_schemas() -> None:
@@ -656,7 +673,8 @@ def test_postgres_reflects_all_schemas_even_with_database_set() -> None:
     }
     inventory = _assemble_inventory(
         _FakeInspector(catalog),
-        _NonMysqlConnection(),
+        # PG lists schemas from the connection (pg_namespace), not the inspector.
+        _NonMysqlConnection(schemas=list(catalog.keys())),
         "mydb",  # database SET -- for PG this is the connection, not a single schema
         dialect=dialect_for(SourceType.POSTGRES),
     )

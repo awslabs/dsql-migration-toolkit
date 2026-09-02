@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from dsql_migrator.core.assessor import KIND_TABLE, Finding, ObjectKey, Rule
+from dsql_migrator.core.assessor import KIND_TABLE, KIND_VIEW, Finding, ObjectKey, Rule
 from dsql_migrator.core.models import Classification, EffortLevel
 
 if TYPE_CHECKING:
@@ -85,6 +85,51 @@ class UnsupportedPostgresTypeRule(Rule):
         return findings
 
 
+class UnsupportedRelationRule(Rule):
+    """Flag PostgreSQL materialized views and foreign tables (no Aurora DSQL equivalent).
+
+    Introspection carries these (relkinds 'm'/'f') as :class:`ViewDef`s flagged via
+    ``unsupported_kind`` -- ``get_view_names`` / ``get_table_names`` return neither, so
+    without capturing them they would be silently absent from the migration. Aurora DSQL
+    supports neither a materialized view nor a foreign table, so each is UNSUPPORTED (a
+    target has to be built by hand). PostgreSQL-source only; a plain view (unsupported_kind
+    None) is untouched.
+    """
+
+    rule_id = "PG_UNSUPPORTED_RELATION"
+
+    def evaluate(self, inventory: "SourceInventory") -> "list[Finding]":
+        findings: list[Finding] = []
+        for view in inventory.views:
+            kind = getattr(view, "unsupported_kind", None)
+            if not kind:
+                continue
+            if kind == "materialized view":
+                recommendation = (
+                    "Reimplement it as a plain table that the application (or a scheduled "
+                    "job) refreshes, since Aurora DSQL has no REFRESH MATERIALIZED VIEW."
+                )
+            else:
+                recommendation = (
+                    "Access the external data from the application or land it into a "
+                    "regular DSQL table, since Aurora DSQL has no foreign-data wrapper."
+                )
+            findings.append(
+                Finding(
+                    object=ObjectKey(KIND_VIEW, view.name),
+                    rule_id=self.rule_id,
+                    classification=Classification.UNSUPPORTED,
+                    risk=(
+                        f"'{view.name}' is a PostgreSQL {kind}, which Aurora DSQL does "
+                        "not support; there is no target object to migrate it into."
+                    ),
+                    recommendation=recommendation,
+                    effort=EffortLevel.SIGNIFICANT,
+                )
+            )
+        return findings
+
+
 def default_rules() -> "list[Rule]":
     """Ordered PostgreSQL-source compatibility rules (v1: structural, source-neutral).
 
@@ -110,6 +155,8 @@ def default_rules() -> "list[Rule]":
         # PG-specific: DSQL-unsupported column types (the only UNSUPPORTED-level rule here;
         # first so it is prominent, though severity ordering already makes it win ties).
         UnsupportedPostgresTypeRule(),
+        # PG-specific: materialized views / foreign tables (no DSQL equivalent).
+        UnsupportedRelationRule(),
         ForeignKeyRule(),
         CheckConstraintRule(),
         TriggerRule(),
