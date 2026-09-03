@@ -41,16 +41,37 @@ import sys
 # Reuse the proven connection + schema-resolution helpers from compare_rows.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import validate_identifier  # noqa: E402
+from _e2e_tables import tables_for  # noqa: E402
 from compare_rows import source_connect, target_connect, source_stats, target_stats  # noqa: E402
 
 DEFAULT_SCHEMA = os.environ.get("CDC_WORKLOAD_SCHEMA", "customers_sample_new")
 
-# The 11 customers_sample_new tables (each has a single integer PK).
-DEFAULT_TABLES = [
+# Fallback table set (the 11 customers_sample_new tables, each a single integer PK)
+# used only when the schema is not registered in _e2e_tables and no --tables is given.
+FALLBACK_TABLES = [
     "categories", "countries", "regions", "suppliers", "products",
     "customers", "customer_addresses", "orders", "order_items",
     "payments", "product_reviews",
 ]
+
+
+def _default_tables_for(schema: str) -> list[str]:
+    """Resolve the table set for ``schema`` from the harness's single source of truth.
+
+    ``_e2e_tables.tables_for`` is what run_full_load_harness / run_e2e_migration use, so
+    the consistency check always reconciles the SAME tables that were loaded -- for ANY
+    registered schema, not just customers_sample_new. (E.g. run_e2e's stage_cdc_check
+    invokes this with no --tables; previously it always fell back to the hardcoded 11,
+    so a run with CDC_WORKLOAD_SCHEMA=migration_schema reconciled 11 nonexistent tables
+    and printed a spurious "DATA LOSS / DRIFT".) Falls back to the fixed list only for a
+    schema that isn't registered.
+    """
+    try:
+        return tables_for(schema)
+    except KeyError:
+        print(f"note: schema {schema!r} not in _e2e_tables; using the fallback "
+              f"table set ({len(FALLBACK_TABLES)} tables).", file=sys.stderr)
+        return list(FALLBACK_TABLES)
 
 
 def _src_pk_set(conn, schema, table, pk) -> set:
@@ -217,16 +238,19 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--schema", default=DEFAULT_SCHEMA)
-    ap.add_argument("--tables", nargs="*", default=DEFAULT_TABLES,
-                    help="table names (unqualified); default = the 11 tables")
+    ap.add_argument("--tables", nargs="*", default=None,
+                    help="table names (unqualified); default = the schema's registered "
+                         "table set from _e2e_tables (fallback: the 11 sample tables)")
     ap.add_argument("--op-log", default="", help="cross-check this workload op-log")
     ap.add_argument("--json", action="store_true", help="emit JSON only")
     args = ap.parse_args()
 
-    rep = reconcile(args.schema, args.tables)
+    tables = args.tables if args.tables is not None else _default_tables_for(args.schema)
+
+    rep = reconcile(args.schema, tables)
     cross = None
     if args.op_log:
-        cross = crosscheck_op_log(args.op_log, args.schema, args.tables)
+        cross = crosscheck_op_log(args.op_log, args.schema, tables)
 
     if args.json:
         print(json.dumps({"reconcile": rep, "op_log_crosscheck": cross}, indent=2))
