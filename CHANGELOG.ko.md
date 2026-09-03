@@ -5,6 +5,35 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.433
+
+### 수정 (Fixed)
+
+- **Schema Conversion: MySQL·PostgreSQL 소스의 생성 DDL / DEFAULT 값 결함** (컨버터를 실제로
+  돌려 생성 DDL을 sqlglot·Aurora DSQL `dsql_lint`·라이브 PostgreSQL 16으로 검증한 리뷰에서 발견).
+  타입 *스펠링*은 이미 정확했고, 아래 DEFAULT/identity/interval 이슈 — 대부분 **apply 시 거부**
+  또는 **조용한 손실**이며 Schema Conversion 경고 없음 — 을 수정:
+  - **PostgreSQL `interval(N)`** 이 파싱 불가한 `INTERVAL 6`으로 방출(DSQL apply 거부)되던 문제 —
+    이제 fields-qualified뿐 아니라 모든 interval에서 precision 수식어를 제거 → `INTERVAL`.
+  - **MySQL `BIT` 컬럼의 `b'…'`/`x'…'`/`0x…` DEFAULT** 가 정수 컬럼에 비트-문자열 리터럴로 방출돼
+    DSQL이 거부 — 이제 리터럴을 정수값으로 파싱(`b'101'`→`5`, `0xff`→`255`).
+  - **PostgreSQL `serial`/`IDENTITY` 기본키**의 자동생성이 조용히 소실되던 문제(PG 경로가 identity
+    컬럼을 설정 안 해 PK 전략 미적용) — 이제 `enrich`가 `nextval(…)`/`attidentity` PK 컬럼을 표시해
+    IDENTITY/UUID/KEEP 전략(및 핫파티션 권고)이 MySQL처럼 적용됨.
+  - **MySQL 제로/정수 시간 default** (`'0000-00-00'`, `'0000-00-00 00:00:00'`, date/timestamp
+    컬럼의 `DEFAULT 0`)가 DSQL 거부 DDL을 방출 — 이제 MANUAL 경고와 함께 드롭.
+  - **MySQL `BINARY`/`VARBINARY` hex default** (`0x…`)가 `bytea` default로 거부 — 이제 바이트
+    동일한 `'\x…'` 리터럴로 방출(bytea의 bit-string은 경고와 함께 드롭).
+  - **PostgreSQL 소스가 컬럼 DEFAULT를 전부 드롭**(MySQL은 보존)하던 불일치+조용한 손실 —
+    `build_pg_source_ddl`이 이제 소스 default를 담음(`read="postgres"` 재파싱이 DSQL 유효 SQL로
+    정규화, 예: `now()`→`CURRENT_TIMESTAMP`), 생성 컬럼·identity `nextval`은 제외.
+  - **인덱스 24개 초과** 시 전부 방출돼 24번째+ `CREATE INDEX ASYNC`가 apply에서 실패(54000)하던
+    문제 — 이제 초과분을 **omit**하고 경고에 이름 나열(>8 key-column omit 정책과 일관).
+  - **생성된 `COMPOSITE_KEY` 유니크 인덱스명 63바이트 초과**(DSQL이 조용히 잘라냄)를 이제 식별자
+    길이 경고에 포함.
+  - **MySQL `UTC_DATE()` default** 가 세션 TZ 의존 식으로 매핑(비-UTC 세션에서 off-by-one)되던
+    것 — 이제 instant 기반(`(now() AT TIME ZONE 'UTC')::date`).
+
 ## v0.1.432
 
 ### 수정 (Fixed)

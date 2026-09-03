@@ -1343,6 +1343,83 @@ def test_timestamp_default_on_timestamptz_target_keeps_the_instant(tmp_path=None
     assert "CURRENT_TIMESTAMP" in ddl or "now()" in ddl
 
 
+def test_bit_column_bit_and_hex_defaults_become_integer_values() -> None:
+    # FIX 2: a MySQL BIT column maps to an integer target, but a bit/hex literal DEFAULT
+    # (b'101', x'05', 0xff) is rejected by DSQL for it ("default expression is of type
+    # bit"). It must be re-expressed as the literal's INTEGER value, bare, BEFORE the
+    # MySQL->PG transpile (which would otherwise rewrite 0x.. into a PG bit-string). The
+    # emitted DDL parses as postgres.
+    import sqlglot
+
+    for lit, expected in (("b'101'", "DEFAULT 5"), ("x'05'", "DEFAULT 5"),
+                          ("0x05", "DEFAULT 5"), ("0xff", "DEFAULT 255")):
+        ddl = _convert_table(
+            _single_column_table("t", "BIT(8)", nullable=False, default=lit)
+        ).target_ddl
+        assert expected in ddl, (lit, ddl)
+        assert "b'" not in ddl and "x'" not in ddl, (lit, ddl)  # no bare bit/hex literal
+        sqlglot.parse_one(ddl, read="postgres")  # must parse
+
+
+def test_binary_hex_default_becomes_a_byte_identical_bytea_literal() -> None:
+    # FIX 5: a MySQL BINARY/VARBINARY column maps to bytea; a hex literal DEFAULT
+    # (0x00000000 / x'..') must become a byte-identical PG bytea hex literal '\x..' (the
+    # bare bit-string is rejected: "default expression is of type bit"). All leading zero
+    # bytes are preserved (NOT routed through the integer value, which would lose them).
+    import sqlglot
+
+    ddl = _convert_table(
+        _single_column_table("t", "BINARY(4)", default="0x00000000")
+    ).target_ddl
+    assert r"DEFAULT '\x00000000'" in ddl, ddl  # all 4 zero bytes kept
+    sqlglot.parse_one(ddl, read="postgres")
+    # the x'..' form is equivalent
+    assert r"DEFAULT '\xdeadbeef'" in _convert_table(
+        _single_column_table("t", "VARBINARY(8)", default="x'deadbeef'")
+    ).target_ddl
+    # a b'..' bit-string on bytea has no byte-aligned form -> dropped with a warning
+    result = _convert_table(_single_column_table("t", "BINARY(1)", default="b'101'"))
+    assert "DEFAULT" not in result.target_ddl
+    assert any("bytea" in w.message.lower() for w in result.warnings), result.warnings
+
+
+def test_zero_and_integer_temporal_defaults_are_dropped_with_a_warning() -> None:
+    # FIX 4: MySQL zero temporal defaults ('0000-00-00', '0000-00-00 00:00:00') and a bare
+    # integer (DEFAULT 0) on a DATE/TIMESTAMP target are rejected by DSQL/PostgreSQL at
+    # CREATE TABLE, so they are dropped with a MANUAL warning (mirroring the boolean/ENUM
+    # out-of-range branch). A valid date default is unchanged.
+    for mtype, default in (("DATE", "0000-00-00"),
+                           ("DATETIME", "0000-00-00 00:00:00"),
+                           ("TIMESTAMP", "0")):
+        result = _convert_table(
+            _single_column_table("t", mtype, nullable=False, default=default)
+        )
+        assert "DEFAULT" not in result.target_ddl, (mtype, default, result.target_ddl)
+        assert any("temporal" in w.message.lower() for w in result.warnings), (mtype, default)
+    # A valid date/datetime literal is preserved untouched.
+    assert "DEFAULT '2020-01-15'" in _convert_table(
+        _single_column_table("t", "DATE", default="2020-01-15")
+    ).target_ddl
+
+
+def test_utc_date_default_maps_to_instant_based_utc_date() -> None:
+    # FIX 9: UTC_DATE() must map to an INSTANT-based UTC date ((now() AT TIME ZONE
+    # 'UTC')::date), NOT (CURRENT_DATE AT TIME ZONE 'UTC') which is off-by-one under a
+    # non-UTC session TimeZone (CURRENT_DATE is already a bare session-local date). The
+    # emitted default parses as postgres.
+    import sqlglot
+
+    ddl = _convert_table(
+        _single_column_table(
+            "t", "DATE", nullable=False, default="UTC_DATE()", default_is_expression=True
+        )
+    ).target_ddl
+    up = ddl.upper()
+    assert "NOW() AT TIME ZONE 'UTC'" in up and "AS DATE" in up  # instant -> UTC -> date
+    assert "CURRENT_DATE AT TIME ZONE" not in up  # the old, off-by-one form is gone
+    sqlglot.parse_one(ddl, read="postgres")
+
+
 def test_tinyint_one_unsigned_is_not_flagged_as_boolean_by_assessor() -> None:
     # Audit U1: the assessor must agree with the converter -- tinyint(1) unsigned maps to
     # smallint (UTINYINT), not boolean, so it must NOT be flagged as a boolean column.
@@ -1476,6 +1553,70 @@ def test_index_budget_ignores_indexes_the_converter_skips() -> None:
     )
     assert len(table.indexes) == 25  # over the budget by raw count
     assert _too_many_indexes_warning(table) is None  # but only 23 are emitted
+
+
+def test_over_budget_secondary_indexes_are_capped_and_named() -> None:
+    # FIX 7: DSQL allows 24 indexes per table INCLUDING the PK, so at most 23 secondary
+    # indexes; the 24th+ CREATE INDEX ASYNC fails 54000 after the load. The excess is now
+    # OMITTED (keeping the applied script runnable) and the omitted names are listed in the
+    # MANUAL/LOSS budget warning (consistent with the >8-column omit policy).
+    from dsql_migrator.core.converter import _too_many_indexes_warning
+
+    table = TableDef(
+        name="wide",
+        columns=[ColumnDef(name="id", mysql_type="INT", nullable=False)]
+        + [ColumnDef(name=f"c{i}", mysql_type="INT") for i in range(30)],
+        primary_key=["id"],
+        indexes=[IndexDef(name=f"ix{i:02d}", columns=[f"c{i}"]) for i in range(30)],
+    )
+    conversion = _convert_table(table)
+    assert len(conversion.index_ddls) == 23  # capped at the 23-secondary budget
+    emitted = " ".join(conversion.index_ddls)
+    assert "ix22" in emitted and "ix23" not in emitted  # first 23 kept, rest omitted
+    warning = _too_many_indexes_warning(table)
+    assert warning is not None and warning.kind is ConversionNoteKind.LOSS
+    assert "30 secondary indexes" in warning.message
+    assert "ix23" in warning.message and "ix29" in warning.message  # omitted named
+
+
+def test_composite_unique_index_over_length_name_is_flagged() -> None:
+    # FIX 8: the generated COMPOSITE_KEY uniqueness index name ux_<table>_<pk cols> can
+    # exceed PostgreSQL/DSQL's 63-byte identifier limit and be silently truncated (a
+    # possible collision). The identifier-length warning surfaces it -- but only when
+    # COMPOSITE_KEY actually generates it (no false alarm otherwise).
+    from dsql_migrator.core.converter import (
+        PrimaryKeyStrategy,
+        SchemaConvertOptions,
+        _composite_unique_index_name,
+    )
+
+    table = TableDef(
+        name="orders_history_archive_partition",
+        columns=[
+            ColumnDef(name="lead", mysql_type="INT", nullable=False),
+            ColumnDef(name="customer_account_identifier", mysql_type="INT", nullable=False),
+            ColumnDef(name="order_line_sequence_number", mysql_type="INT", nullable=False),
+        ],
+        primary_key=["customer_account_identifier", "order_line_sequence_number"],
+    )
+    generated = _composite_unique_index_name(table)
+    assert len(generated.encode("utf-8")) > 63  # the synthesised name is over-length
+
+    composite = SchemaConverter().convert_table(
+        table,
+        SchemaConvertOptions(
+            primary_key_strategy=PrimaryKeyStrategy.COMPOSITE_KEY,
+            composite_leading_column="lead",
+        ),
+    )
+    over_length = [w for w in composite.warnings if "63 bytes" in w.message]
+    assert over_length and any(generated in w.message for w in over_length)
+
+    # Without COMPOSITE_KEY the index is never generated, so it must NOT be flagged.
+    plain = SchemaConverter().convert_table(table)
+    assert not any(
+        "63 bytes" in w.message and generated in w.message for w in plain.warnings
+    )
 
 
 # ---------------------------------------------------------------------------

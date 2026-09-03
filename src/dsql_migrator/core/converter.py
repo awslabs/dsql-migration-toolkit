@@ -66,6 +66,7 @@ data migrator, keeping the DDL/DML separation rule intact (Property 2).
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -78,6 +79,7 @@ from dsql_migrator.core.models import (
     Classification,
     ConversionNoteKind,
     ForeignKeyDef,
+    IndexDef,
     SourceInventory,
     SourceType,
     TableDef,
@@ -1072,7 +1074,10 @@ _TRANSLATED_EXPRESSION_DEFAULTS: dict[str, str] = {
     "CURDATE()": "CURRENT_DATE",
     "CURTIME()": "CURRENT_TIME",
     "UTC_TIMESTAMP()": "(now() AT TIME ZONE 'UTC')",
-    "UTC_DATE()": "(CURRENT_DATE AT TIME ZONE 'UTC')",
+    # UTC_DATE() is the current date in UTC. CURRENT_DATE AT TIME ZONE 'UTC' is wrong --
+    # CURRENT_DATE is already a bare date (session-local), so the UTC shift is off-by-one
+    # under a non-UTC session TimeZone. Take the UTC date of the current INSTANT instead.
+    "UTC_DATE()": "((now() AT TIME ZONE 'UTC')::date)",
 }
 
 def _strip_on_update(default: str) -> str:
@@ -1117,6 +1122,63 @@ def _unwrap_expression_default(default: str) -> str:
 # map to ``text``).
 _TEXTUAL_TARGET_PREFIXES = ("char", "varchar", "text", "character", "bpchar", "citext")
 
+# Integer-family DSQL target base types. A MySQL BIT(n) column maps to one of these
+# (BIT(8) -> smallint, BIT(16) -> int, BIT(32) -> bigint, BIT(64) -> numeric), so a
+# bit/hex literal DEFAULT on such a column must be emitted as its INTEGER value -- the
+# bare MySQL bit-string literal is rejected by DSQL ("default expression is of type bit").
+_INTEGER_TARGET_BASES = frozenset(
+    {"smallint", "int", "integer", "int2", "int4", "int8", "bigint",
+     "numeric", "decimal", "dec"}
+)
+
+# A MySQL bit/hex literal default: b'1010' (binary), x'0a' / 0x0a (hex). The digits are
+# captured so the value can be re-expressed for the mapped target (integer or bytea).
+_BIT_HEX_LITERAL_RE = re.compile(r"(?i)^(?:b'([01]*)'|x'([0-9a-f]*)'|0x([0-9a-f]+))$")
+
+
+def _parse_bit_hex_literal(literal: str) -> "Optional[tuple[int, Optional[str]]]":
+    """Return ``(int_value, hex_digits)`` for a MySQL bit/hex literal, else ``None``.
+
+    ``b'101'`` -> ``(5, None)``; ``x'ff'`` / ``0xff`` -> ``(255, 'ff')``;
+    ``0x00000000`` -> ``(0, '00000000')``. For a HEX literal ``hex_digits`` preserves the
+    source's exact byte width (padded to an even length) so a bytea target can emit a
+    byte-identical ``'\\x..'`` literal -- NOT routed through the integer, which would drop
+    leading zero bytes. For a ``b'..'`` bit-string ``hex_digits`` is ``None`` (no faithful
+    fixed-width bytea form); such a value is only meaningful on an integer target.
+    """
+    match = _BIT_HEX_LITERAL_RE.match(literal.strip())
+    if match is None:
+        return None
+    bits, hex_x, hex_0x = match.groups()
+    if bits is not None:
+        return (int(bits, 2) if bits else 0), None
+    digits = (hex_x if hex_x is not None else hex_0x or "").lower()
+    value = int(digits, 16) if digits else 0
+    if len(digits) % 2:  # byte-align (0x0a -> '\x0a', 0x00000000 -> '\x00000000')
+        digits = "0" + digits
+    return value, (digits or "00")
+
+
+# Temporal DSQL target base types (date / time / timestamp / timestamptz). A MySQL "zero"
+# temporal default ('0000-00-00', '0000-00-00 00:00:00') or a bare integer (DEFAULT 0) is
+# rejected by DSQL/PostgreSQL, so it is dropped with a warning rather than emitted.
+_TEMPORAL_TARGET_PREFIXES = ("date", "time", "timestamp")
+_ZERO_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})")
+
+
+def _is_zero_temporal_literal(value: str) -> bool:
+    """True for a MySQL zero/invalid date-or-datetime literal (a 0 year/month/day part).
+
+    ``'0000-00-00'`` / ``'0000-00-00 00:00:00'`` (and partial forms like ``'2020-00-00'``)
+    have a zero date component PostgreSQL/DSQL reject; a real date (``'2020-01-15'``) does
+    not match.
+    """
+    match = _ZERO_DATE_RE.match(value.strip())
+    if match is None:
+        return False
+    year, month, day = (int(part) for part in match.groups())
+    return year == 0 or month == 0 or day == 0
+
 
 def _quote_default_literal(literal: str, *, is_string_target: bool = False) -> str:
     """Render a literal default as a safely quoted MySQL string literal.
@@ -1145,9 +1207,10 @@ def _quote_default_literal(literal: str, *, is_string_target: bool = False) -> s
             return stripped
         if stripped.upper() in ("TRUE", "FALSE", "NULL"):
             return stripped.upper()
-        # MySQL bit/hex literals carry their own syntax and are handled by the caller.
-        if re.fullmatch(r"(?i)(b|x)'[0-9a-f]*'", stripped) or stripped.lower().startswith("0x"):
-            return stripped
+        # MySQL bit/hex literals (b'..' / x'..' / 0x..) are NOT emitted bare: the bare
+        # bit-string is invalid for the DSQL integer/bytea target it maps to. They are
+        # re-expressed by _column_default_sql BEFORE this point (integer value / bytea
+        # '\x..' literal); anything reaching here falls through to safe string-quoting.
     # Everything else -- and every default on a textual target -- is a string: single-quote
     # it, doubling any embedded backslash AND quote. The literal is re-embedded into a MySQL
     # CREATE TABLE that sqlglot re-parses with the MySQL dialect, where backslash is an escape
@@ -1197,12 +1260,18 @@ def _column_default_sql(
     * **ENUM mapped to text + CHECK** -> a default outside the enum members is dropped,
       because it would apply cleanly and then fail the CHECK on every defaulted INSERT.
 
-    Rarer literal/target mismatches (a bit-string default on an integer target, a binary
-    default on ``bytea``, MySQL's ``0000-00-00`` zero date) deliberately have NO dedicated
-    branch: none occurs in practice, and each would add a code path plus tests for a case
-    nobody hits. They fall through to the general rule -- the literal is emitted, and if
-    the target rejects it the failure is loud at Schema Conversion time rather than
-    silent. Add a branch only when a real schema produces one.
+    Literal/target mismatches that DSQL rejects at CREATE TABLE are re-expressed or
+    dropped rather than emitted verbatim (each was reproduced against a live DSQL cluster
+    and a local PostgreSQL 16):
+
+    * **bit/hex literal on an integer target** (a ``BIT`` column -> smallint/int/bigint/
+      numeric) -> the literal's INTEGER value, bare (``b'101'`` -> ``5``, ``0xff`` ->
+      ``255``); the bare bit-string is rejected ("default expression is of type bit").
+    * **hex literal on a ``bytea`` target** (``BINARY``/``VARBINARY``) -> a byte-identical
+      PG bytea hex literal (``0x00000000`` -> ``'\\x00000000'``); a ``b'..'`` bit-string on
+      bytea has no faithful fixed-width form and is dropped with a warning.
+    * **zero/invalid temporal default** on a date/time/timestamp target (``'0000-00-00'``,
+      ``'0000-00-00 00:00:00'``, a bare ``0``) -> dropped with a warning (DSQL rejects it).
     """
     raw = (column.default or "").strip()
     if not raw:
@@ -1281,6 +1350,42 @@ def _column_default_sql(
             "generated CHECK constraint on every defaulted INSERT; the column is created "
             "without a default."
         )
+
+    target_base = target.split("(", 1)[0].strip()
+
+    # A MySQL bit/hex literal default (b'101', x'0a', 0x0a) keyed on the MAPPED target.
+    # The bare literal is rejected by DSQL for the integer/bytea column it maps to
+    # ("default expression is of type bit"), so re-express it here, BEFORE the MySQL->PG
+    # transpile (which would otherwise rewrite 0x.. into a PG bit-string):
+    #   * integer target (BIT -> smallint/int/bigint/numeric) -> the INTEGER value, bare
+    #     (b'101' -> 5, 0xff -> 255);
+    #   * bytea target (BINARY/VARBINARY -> bytea) + a HEX literal -> a byte-identical PG
+    #     bytea hex literal ('\xHEXDIGITS'); a b'..' bit-string on bytea has no faithful
+    #     fixed-width bytea form, so it is dropped with a warning.
+    bit_hex = _parse_bit_hex_literal(raw)
+    if bit_hex is not None:
+        int_value, hex_digits = bit_hex
+        if target_base in _INTEGER_TARGET_BASES:
+            return str(int_value), None
+        if target_base == "bytea":
+            if hex_digits is not None:
+                return _quote_default_literal("\\x" + hex_digits, is_string_target=True), None
+            return None, (
+                f"binary default {raw} is a bit-string with no byte-aligned bytea form, "
+                "so the column is created without a default; set it explicitly if needed."
+            )
+
+    # A MySQL zero/invalid temporal default on a date/time/timestamp target: '0000-00-00',
+    # '0000-00-00 00:00:00', or a bare integer (DEFAULT 0). DSQL/PostgreSQL reject all of
+    # these at CREATE TABLE, so drop the default with a warning (mirrors the boolean/ENUM
+    # out-of-range branches); a valid date/timestamp literal is unaffected.
+    if target_base.startswith(_TEMPORAL_TARGET_PREFIXES):
+        if _is_zero_temporal_literal(unquoted) or re.fullmatch(r"[+-]?\d+", unquoted):
+            return None, (
+                f"{target_base} default {raw} is a zero/invalid temporal value that Aurora "
+                "DSQL (PostgreSQL) rejects at CREATE TABLE, so the column is created without "
+                "a default; set a valid default in the application or with ALTER TABLE."
+            )
 
     # A textual target must quote the literal even when it looks numeric/boolean/null:
     # the value is a string that arrives unquoted, so emitting it bare would silently
@@ -1645,7 +1750,51 @@ def _pg_unsupported_key_columns(table: TableDef) -> set[str]:
     }
 
 
-def _build_index_ddls(table: TableDef, *, is_postgres: bool = False) -> list[str]:
+def _emittable_secondary_indexes(
+    table: TableDef, *, is_postgres: bool = False
+) -> list[IndexDef]:
+    """The secondary indexes that survive DSQL's per-index skip filters, in order.
+
+    Excludes the indexes :func:`_build_index_ddls` would never emit -- an expression
+    index with an incomplete reflected column set, an index over DSQL's 8-column key
+    limit, and an index over a bytea (BINARY/VARBINARY/BLOB/spatial) or, for a PG source,
+    a DSQL-unsupported column type. Shared by :func:`_build_index_ddls` (which emits them,
+    capped) and :func:`_too_many_indexes_warning` (which counts/lists the over-budget
+    excess) so the emitted DDL and the note can never disagree about which indexes count.
+    """
+    # DSQL cannot index a bytea column ("datatype bytea is not supported in a key"), so an
+    # index over a BINARY/VARBINARY/BLOB/spatial column is skipped (reported by
+    # _bytea_key_warning / _unsupported_index_type_warning).
+    skip_columns = {column.name for column in table.columns if _maps_to_bytea(column)}
+    # A PG source also has DSQL-unsupported COLUMN types (varbit, arrays, geometric, ...)
+    # that cannot be a valid column, let alone indexed -- skip an index over them too.
+    if is_postgres:
+        skip_columns |= _pg_unsupported_key_columns(table)
+    # An expression index reflected with an incomplete column set (SQLAlchemy dropped its
+    # expression key-part) would create a WRONG, narrower index, so it is skipped entirely
+    # (reported by _expression_index_warning).
+    expression_index_names = set(table.expression_indexes)
+    kept: list[IndexDef] = []
+    for index in table.indexes:
+        if index.name in expression_index_names:
+            continue
+        if len(index.columns) > _DSQL_MAX_PK_COLUMNS:
+            continue
+        if any(column in skip_columns for column in index.columns):
+            continue
+        kept.append(index)
+    return kept
+
+
+def _secondary_index_budget(reserved_secondary: int = 0) -> int:
+    """How many source secondary indexes may be emitted, given ``reserved_secondary``
+    slots the conversion itself consumes (e.g. the COMPOSITE_KEY uniqueness index)."""
+    return max(0, _MAX_SECONDARY_INDEXES_PER_TABLE - max(0, reserved_secondary))
+
+
+def _build_index_ddls(
+    table: TableDef, *, is_postgres: bool = False, reserved_secondary: int = 0
+) -> list[str]:
     """Render the table's secondary indexes as ``CREATE INDEX ASYNC`` statements.
 
     DSQL builds secondary indexes asynchronously, so each index is emitted as a
@@ -1654,37 +1803,22 @@ def _build_index_ddls(table: TableDef, *, is_postgres: bool = False) -> list[str
     unqualified (created in the table's schema); the table reference is
     schema-qualified when the table name is.
 
-    An index over DSQL's 8-column key limit is SKIPPED rather than emitted: MySQL
-    allows 16 columns per index, and DSQL rejects a 9+-column key with error 54011.
-    Because secondary indexes are built AFTER the data loads, emitting it anyway put
-    the guaranteed failure at the very end of a multi-hour Full Load. Skipping keeps
-    the applied script one that can actually succeed; the operator is told which
-    indexes were left out (and why) by :func:`_too_many_key_columns_warning`.
+    An index over DSQL's 8-column key limit (or over a bytea/unsupported column) is
+    SKIPPED rather than emitted: MySQL allows 16 columns per index, and DSQL rejects a
+    9+-column key with error 54011. Because secondary indexes are built AFTER the data
+    loads, emitting a doomed one put the guaranteed failure at the very end of a
+    multi-hour Full Load. Likewise, only the first ``23 - reserved_secondary`` emittable
+    indexes are kept: DSQL allows 24 indexes per table INCLUDING the primary key (error
+    54000 past that), so the excess is OMITTED to keep the applied script one that can
+    actually succeed. The operator is told which indexes were left out (and why) by
+    :func:`_too_many_key_columns_warning` (wide) and :func:`_too_many_indexes_warning`
+    (over the per-table budget).
     """
     table_identifier = _quote_pg_qualified(table.name)
-    # DSQL cannot index a bytea column ("datatype bytea is not supported in a key"),
-    # so an index over a BINARY/VARBINARY/BLOB/spatial column is SKIPPED rather than
-    # emitted as a doomed post-load CREATE INDEX ASYNC. Reported by
-    # _bytea_key_warning (plain index) / _unsupported_index_type_warning (spatial).
-    skip_columns = {column.name for column in table.columns if _maps_to_bytea(column)}
-    # A PG source also has DSQL-unsupported COLUMN types (varbit, arrays, geometric, ...)
-    # that cannot be a valid column, let alone indexed -- skip an index over them too.
-    if is_postgres:
-        skip_columns |= _pg_unsupported_key_columns(table)
-    # An index flagged as an expression index reflected with an incomplete column set
-    # (SQLAlchemy dropped its expression key-part): a MIXED column+expression index
-    # keeps only its plain columns, so emitting it would create a WRONG, narrower index
-    # -- for a UNIQUE index that even changes the uniqueness semantics. Skip it entirely
-    # (reported by _expression_index_warning) rather than emit a doomed/incorrect index.
-    expression_index_names = set(table.expression_indexes)
+    emittable = _emittable_secondary_indexes(table, is_postgres=is_postgres)
+    budget = _secondary_index_budget(reserved_secondary)
     statements: list[str] = []
-    for index in table.indexes:
-        if index.name in expression_index_names:
-            continue
-        if len(index.columns) > _DSQL_MAX_PK_COLUMNS:
-            continue
-        if any(column in skip_columns for column in index.columns):
-            continue
+    for index in emittable[:budget]:
         unique = "UNIQUE " if index.unique else ""
         columns = ", ".join(_quote_pg_identifier(column) for column in index.columns)
         statements.append(
@@ -2015,6 +2149,18 @@ def _apply_composite_key(
     )
 
 
+def _composite_unique_index_name(table: TableDef) -> str:
+    """The generated name for the COMPOSITE_KEY uniqueness-preservation index.
+
+    ``ux_<table>_<pk cols>`` -- deterministic from the (unqualified) table name and the
+    original primary-key columns. Can exceed PostgreSQL/DSQL's 63-byte identifier limit
+    for a long table+PK combination, which DSQL then silently truncates (a possible
+    collision), so :func:`_identifier_length_warning` surfaces it when it is over-length.
+    """
+    _, obj = _split_qualified(table.name)
+    return "ux_" + "_".join([obj, *table.primary_key])
+
+
 def _composite_unique_index_ddl(table: TableDef) -> str:
     """A ``CREATE UNIQUE INDEX ASYNC`` preserving the original PK's uniqueness.
 
@@ -2024,8 +2170,7 @@ def _composite_unique_index_ddl(table: TableDef) -> str:
     keep that guarantee. Identifiers are quoted via ``sqlglot`` (Requirement 9.4);
     the index name is unqualified (created in the table's schema).
     """
-    _, obj = _split_qualified(table.name)
-    index_name = "ux_" + "_".join([obj, *table.primary_key])
+    index_name = _composite_unique_index_name(table)
     columns = ", ".join(_quote_pg_identifier(c) for c in table.primary_key)
     return (
         f"CREATE UNIQUE INDEX ASYNC {_quote_pg_identifier(index_name)} "
@@ -2379,32 +2524,40 @@ def _too_many_columns_warning(table: TableDef) -> Optional[ConversionWarning]:
 
 
 def _too_many_indexes_warning(
-    table: TableDef, extra_secondary_indexes: int = 0
+    table: TableDef, extra_secondary_indexes: int = 0, *, is_postgres: bool = False
 ) -> Optional[ConversionWarning]:
     """Warn when the table's secondary indexes exceed DSQL's per-table budget.
 
     DSQL allows 24 indexes per table and the PRIMARY KEY counts toward that budget
     (verified on a live cluster), so a migrated table can carry at most 23 secondary
-    indexes. Past that the ``CREATE INDEX ASYNC`` statements fail with error 54000 -- and
-    because indexes are applied AFTER the table, the table itself succeeds first, leaving a
-    partially-indexed target. Nothing on the conversion screen said so.
+    indexes. Past that a ``CREATE INDEX ASYNC`` fails with error 54000, so
+    :func:`_build_index_ddls` now OMITS the over-budget indexes (keeping the applied
+    script one that succeeds); this note names the omitted ones so the loss is not silent
+    (consistent with the >8-column omit policy).
 
     ``extra_secondary_indexes`` counts index(es) the CONVERSION adds beyond the source's
     own -- notably the 1 UNIQUE index the COMPOSITE_KEY strategy emits to preserve the
     original key's uniqueness. Omitting it undercounted by one, so a table with exactly
     23 source indexes converted with COMPOSITE_KEY produced 25 total (> 24) yet passed
-    this gate silently and failed the extra CREATE INDEX ASYNC after the load.
+    this gate silently.
 
-    Counts only the indexes actually EMITTED: one over DSQL's 8-column key limit is
-    skipped by :func:`_build_index_ddls` (and reported by
-    :func:`_too_many_key_columns_warning`), so counting it here would claim a budget
-    overflow the applied script cannot hit.
+    Counts only the indexes actually EMITTABLE (via :func:`_emittable_secondary_indexes`):
+    one over DSQL's 8-column key limit, or over a bytea/unsupported column, is already
+    skipped by :func:`_build_index_ddls` (reported elsewhere), so counting it here would
+    claim a budget overflow the applied script cannot hit.
     """
-    count = (
-        len(table.indexes) - len(_wide_indexes(table)) + extra_secondary_indexes
-    )
+    emittable = _emittable_secondary_indexes(table, is_postgres=is_postgres)
+    count = len(emittable) + extra_secondary_indexes
     if count <= _MAX_SECONDARY_INDEXES_PER_TABLE:
         return None
+    budget = _secondary_index_budget(extra_secondary_indexes)
+    omitted = [index.name for index in emittable[budget:]]
+    omitted_clause = (
+        " The following were NOT emitted (kept the applied script runnable): "
+        + ", ".join(omitted) + "."
+        if omitted
+        else ""
+    )
     return ConversionWarning(
         object_name=table.name,
         classification=Classification.MANUAL,
@@ -2413,10 +2566,11 @@ def _too_many_indexes_warning(
             f"This table has {count} secondary indexes; with the required primary key "
             f"that is {count + 1} against Aurora DSQL's limit of "
             f"{_MAX_INDEXES_PER_TABLE} per table, so at most "
-            f"{_MAX_SECONDARY_INDEXES_PER_TABLE} can be created. The extra CREATE INDEX "
-            "ASYNC statements will fail (error 54000) after the table itself is created, "
-            "leaving the target partially indexed — drop the indexes you no longer need "
-            "before applying, keeping the ones your queries actually use."
+            f"{_MAX_SECONDARY_INDEXES_PER_TABLE} can be created. The over-budget indexes "
+            "are omitted from the applied script (emitting them would fail with error "
+            "54000 after the table is created, leaving a partially-indexed target)."
+            f"{omitted_clause} Drop the indexes you no longer need and re-add the ones "
+            "your queries actually use after applying."
         ),
     )
 
@@ -2896,7 +3050,9 @@ def _check_constraint_warning(table: TableDef) -> Optional[ConversionWarning]:
     )
 
 
-def _identifier_length_warning(table: TableDef) -> Optional[ConversionWarning]:
+def _identifier_length_warning(
+    table: TableDef, *, generated_index_names: "Sequence[str]" = ()
+) -> Optional[ConversionWarning]:
     """Warn about identifiers over 63 bytes, and column names that collide after truncation.
 
     MySQL allows 64-character identifiers (more bytes in UTF-8); PostgreSQL/Aurora DSQL
@@ -2906,6 +3062,12 @@ def _identifier_length_warning(table: TableDef) -> Optional[ConversionWarning]:
     The TABLE name and (when the source qualified name carries one) the SCHEMA segment are
     checked too: a table/schema identifier over 63 bytes is likewise truncated by DSQL,
     which can silently collide with another table/schema sharing the first 63 bytes.
+
+    ``generated_index_names`` are index names the CONVERSION itself synthesises (the
+    COMPOSITE_KEY uniqueness index, ``ux_<table>_<pk cols>``, which concatenates the table
+    and every PK column and so is prone to exceeding 63 bytes). They are checked alongside
+    the source index names so an over-length GENERATED identifier -- which DSQL would
+    silently truncate, risking a collision -- is surfaced rather than emitted blindly.
     """
     over_columns: list[str] = []
     collisions: list[str] = []
@@ -2920,9 +3082,11 @@ def _identifier_length_warning(table: TableDef) -> Optional[ConversionWarning]:
         else:
             groups.setdefault(truncated, name)
     over_indexes = [
-        index.name
-        for index in table.indexes
-        if len(index.name.encode("utf-8")) > _PG_NAMEDATALEN
+        name
+        for name in (
+            [index.name for index in table.indexes] + list(generated_index_names)
+        )
+        if len(name.encode("utf-8")) > _PG_NAMEDATALEN
     ]
     # The table name (and its schema segment in a ``schema.table`` qualified name) are
     # identifiers subject to the same 63-byte truncation as columns/indexes.
@@ -3284,6 +3448,7 @@ class SchemaConverter:
         if is_postgres:
             from dsql_migrator.core.converter_postgres import (
                 clamp_pg_numeric,
+                pg_column_default_sql,
                 unconstrained_numeric_note,
                 unsupported_dsql_reason,
             )
@@ -3338,25 +3503,21 @@ class SchemaConverter:
                         )
                     )
 
-            # PostgreSQL column DEFAULTs are not re-emitted on the target in v1
-            # (build_pg_source_ddl emits name + exact type + NOT NULL + PK only).
-            # Dropping one silently would hide a post-cut-over change in INSERT
-            # behavior, so warn per column (Property 6, no silent loss) -- mirroring the
-            # MySQL default-loss loop above. A serial/identity default (nextval) is the
-            # identity mechanism, governed by the primary-key strategy and advanced by
-            # 'Sync identity sequences' at cut over, so it is skipped exactly as the
-            # MySQL auto_increment column's default is; every OTHER default is called out.
+            # PostgreSQL column DEFAULTs ARE carried to the target (build_pg_source_ddl
+            # emits them; the read="postgres" re-parse normalizes each to DSQL-valid SQL).
+            # Warn ONLY for a default that genuinely could not be carried -- one that does
+            # not parse as a PostgreSQL expression -- so dropping it is never silent
+            # (Property 6). A serial/identity nextval and a generated column are the
+            # identity mechanism / computed value, governed elsewhere; pg_column_default_sql
+            # returns no drop reason for them (mirrors the MySQL default-loss loop, which
+            # skips the auto_increment column and reports only the genuinely-dropped ones).
             for column in table.columns:
-                default = (column.default or "").strip()
-                if not default or column.generated:
+                if column.name == table.auto_increment_column:
                     continue
-                if "nextval(" in default.lower():
+                _emitted, drop_reason = pg_column_default_sql(column)
+                if drop_reason is None:
                     continue
-                message = (
-                    f"Column '{column.name}' has a source default ({default}) that is "
-                    "not carried to the Aurora DSQL table; set it in the application or "
-                    "add it with ALTER TABLE after apply."
-                )
+                message = f"Column '{column.name}' " + drop_reason
                 if not column.nullable:
                     message += (
                         " This column is NOT NULL, so an INSERT that omits it succeeds "
@@ -3385,6 +3546,9 @@ class SchemaConverter:
         # Schema Conversion step, so an invalid choice is isolated as UNSUPPORTED
         # (mirrors the unparsable-table fallback), never raised.
         extra_index_ddls: list[str] = []
+        # Index names the conversion itself synthesises (the COMPOSITE_KEY uniqueness
+        # index), checked for the 63-byte identifier limit alongside the source names.
+        generated_index_names: list[str] = []
         pk_strategy_warnings: list[ConversionWarning] = []
         if options.primary_key_strategy is PrimaryKeyStrategy.COMPOSITE_KEY:
             leading = options.composite_leading_column or ""
@@ -3396,6 +3560,7 @@ class SchemaConverter:
                 pk_strategy_warnings.append(composite_warning)
             # Preserve the original key's uniqueness, which a composite key drops.
             extra_index_ddls.append(_composite_unique_index_ddl(table))
+            generated_index_names.append(_composite_unique_index_name(table))
         else:
             # _apply_pk_strategy returns 0..2 warnings: the throughput RECOMMENDATION
             # and (for an identity widening that narrows the range) a LOSS warning.
@@ -3413,7 +3578,9 @@ class SchemaConverter:
             (_pg_bytea_key_warning(table) if is_postgres else None),
             _foreign_key_warning(table, preserve=options.preserve_foreign_keys),
             _check_constraint_warning(table),
-            _identifier_length_warning(table),
+            _identifier_length_warning(
+                table, generated_index_names=generated_index_names
+            ),
             _expression_index_warning(table),
             _comment_warning(table),
             _partitioned_table_warning(table),
@@ -3424,7 +3591,9 @@ class SchemaConverter:
             # prefix-index notes above are the MySQL analogs of this.
             (_pg_partial_or_nonbtree_index_warning(table) if is_postgres else None),
             _too_many_columns_warning(table),
-            _too_many_indexes_warning(table, len(extra_index_ddls)),
+            _too_many_indexes_warning(
+                table, len(extra_index_ddls), is_postgres=is_postgres
+            ),
             _too_many_key_columns_warning(table),
             # Reads the post-conversion types off `create`, so it must run AFTER the
             # PK strategy has rewritten the key (a UUID/identity conversion changes
@@ -3450,7 +3619,10 @@ class SchemaConverter:
             table=table.name,
             target_ddl=target_ddl,
             schema_ddls=schema_ddls,
-            index_ddls=_build_index_ddls(table, is_postgres=is_postgres) + extra_index_ddls,
+            index_ddls=_build_index_ddls(
+                table, is_postgres=is_postgres, reserved_secondary=len(extra_index_ddls)
+            )
+            + extra_index_ddls,
             foreign_key_ddls=_build_foreign_key_ddls(
                 table, preserve=options.preserve_foreign_keys
             ),

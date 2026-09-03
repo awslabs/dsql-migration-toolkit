@@ -5,6 +5,43 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.433
+
+### Fixed
+
+- **Schema Conversion: generated-DDL / DEFAULT-value defects for MySQL and PostgreSQL
+  sources** (found by a review that ran the converter and validated every emitted DDL with
+  sqlglot, Aurora DSQL `dsql_lint`, and a live PostgreSQL 16). Type *spellings* were already
+  correct; these DEFAULT / identity / interval issues — most **rejected at apply** or
+  **silently lossy**, with no Schema-Conversion warning — are fixed:
+  - **PostgreSQL `interval(N)`** was emitted as the unparsable `INTERVAL 6` (DSQL rejects at
+    apply). The precision modifier is now stripped for *all* interval spellings, not only
+    fields-qualified ones → `INTERVAL`.
+  - **MySQL `BIT` column with a `b'…'`/`x'…'`/`0x…` DEFAULT** emitted an integer column with
+    a bit-string-literal default DSQL rejects. The literal is now parsed to its integer
+    value (`b'101'` → `5`, `0xff` → `255`).
+  - **PostgreSQL `serial` / `IDENTITY` primary key** silently lost its auto-generation — the
+    primary-key strategy never applied because the PG path never set the identity column.
+    `enrich` now flags a `nextval(…)` / `attidentity` PK column, so IDENTITY/UUID/KEEP
+    strategies (and the hot-partition recommendation) apply as they do for MySQL.
+  - **MySQL zero/integer temporal defaults** (`'0000-00-00'`, `'0000-00-00 00:00:00'`,
+    `DEFAULT 0` on a date/timestamp column) emitted DDL DSQL rejects — now dropped with a
+    MANUAL warning.
+  - **MySQL `BINARY`/`VARBINARY` hex defaults** (`0x…`) emitted a `bytea` default DSQL
+    rejects — now emitted as a byte-identical `'\x…'` literal (a bit-string on `bytea` is
+    dropped with a warning).
+  - **PostgreSQL source dropped ALL column DEFAULTs** while MySQL preserved them (divergent
+    DDL + silent loss). `build_pg_source_ddl` now carries the source default (the
+    `read="postgres"` re-parse normalizes it to DSQL-valid SQL, e.g. `now()` →
+    `CURRENT_TIMESTAMP`), excluding generated columns and the identity `nextval`.
+  - **> 24 secondary indexes** were all emitted (the 24th+ `CREATE INDEX ASYNC` then failed
+    at apply, error 54000). The excess is now **omitted** and named in the warning (matching
+    the > 8-key-column omit policy), so the applied script completes.
+  - **A generated `COMPOSITE_KEY` unique-index name over 63 bytes** (silently truncated by
+    DSQL) is now included in the identifier-length warning.
+  - **MySQL `UTC_DATE()` default** mapped to a session-timezone-dependent expression
+    (off-by-one under a non-UTC session) — now instant-based (`(now() AT TIME ZONE 'UTC')::date`).
+
 ## v0.1.432
 
 ### Fixed

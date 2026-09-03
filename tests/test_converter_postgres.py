@@ -186,10 +186,10 @@ def test_convert_table_warns_on_array_column_for_pg_source() -> None:
     assert not any(w.column_name == "id" for w in conv.warnings)
 
 
-def test_convert_table_warns_when_a_pg_default_is_dropped() -> None:
-    # v1 does not re-emit PG column DEFAULTs; dropping one silently would hide a
-    # post-cut-over INSERT change (Property 6), so a MANUAL warning must name it. A
-    # NOT NULL column escalates (an omitted INSERT is rejected on the target).
+def test_convert_table_carries_a_simple_pg_default() -> None:
+    # FIX 6: PG column DEFAULTs ARE now carried to the target (like the MySQL path). A
+    # simple literal default parses fine, so it is emitted -- NOT dropped -- and no
+    # default-loss warning fires (Property 6: only a genuinely-undroppable default warns).
     table = TableDef(
         name="events",
         columns=[
@@ -199,12 +199,11 @@ def test_convert_table_warns_when_a_pg_default_is_dropped() -> None:
         primary_key=["id"],
     )
     conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
-    default_warnings = [
+    assert "DEFAULT 'new'" in conv.target_ddl
+    assert not [
         w for w in conv.warnings
         if w.column_name == "status" and "default" in w.message.lower()
     ]
-    assert len(default_warnings) == 1
-    assert "NOT NULL" in default_warnings[0].message
 
 
 def test_convert_table_does_not_warn_on_a_serial_identity_default() -> None:
@@ -222,6 +221,111 @@ def test_convert_table_does_not_warn_on_a_serial_identity_default() -> None:
     )
     conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
     assert not any("default" in w.message.lower() for w in conv.warnings)
+
+
+@pytest.mark.parametrize("interval_type", ["interval(6)", "interval(3)"])
+def test_precision_only_interval_emits_parseable_interval(interval_type: str) -> None:
+    # FIX 1: a precision-only interval (interval(6)) used to render as the UNPARSABLE
+    # "INTERVAL 6" (the (N) modifier becomes a bare integer argument) that DSQL/PostgreSQL
+    # reject with a syntax error. Dropping the (N) precision emits a plain INTERVAL: the
+    # DDL parses as postgres and carries no "INTERVAL <n>" token.
+    from dsql_migrator.core.converter_postgres import _ddl_column_type
+
+    assert _ddl_column_type(interval_type) == "interval"  # (N) stripped
+    table = TableDef(
+        name="public.durations",
+        columns=[_col("id", "bigint", nullable=False), _col("span", interval_type)],
+        primary_key=["id"],
+    )
+    conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    up = conv.target_ddl.upper()
+    assert "INTERVAL" in up
+    assert "INTERVAL 6" not in up and "INTERVAL 3" not in up  # the unparsable form is gone
+    assert sqlglot.parse_one(conv.target_ddl, read="postgres") is not None  # must parse
+
+
+def test_pg_source_carries_column_defaults() -> None:
+    # FIX 6: PG column DEFAULTs are carried to the target (like the MySQL path); the
+    # read="postgres" re-parse normalizes each to DSQL-valid SQL. A serial (nextval)
+    # default is NOT emitted (governed by the PK strategy), and the carried columns get no
+    # default-loss warning.
+    table = TableDef(
+        name="public.acct",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="status", mysql_type="character varying(20)",
+                      nullable=False, default="'active'::character varying"),
+            ColumnDef(name="created_at", mysql_type="timestamp without time zone",
+                      nullable=False, default="now()"),
+            ColumnDef(name="cnt", mysql_type="integer", nullable=False, default="0"),
+            ColumnDef(name="seqcol", mysql_type="integer", nullable=False,
+                      default="nextval('acct_seqcol_seq'::regclass)"),
+        ],
+        primary_key=["id"],
+    )
+    conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    up = conv.target_ddl.upper()
+    assert "DEFAULT CAST('ACTIVE' AS VARCHAR)" in up  # 'active'::character varying carried
+    assert "DEFAULT CURRENT_TIMESTAMP" in up          # now() carried + normalized
+    assert "DEFAULT 0" in up
+    assert "NEXTVAL" not in up                         # serial default NOT emitted
+    assert sqlglot.parse_one(conv.target_ddl, read="postgres") is not None
+    assert not [
+        w for w in conv.warnings
+        if w.column_name in {"status", "created_at", "cnt"} and "default" in w.message.lower()
+    ]
+
+
+def test_pg_source_unparseable_default_is_dropped_with_a_warning() -> None:
+    # FIX 6: a default that does NOT parse as a PostgreSQL expression is dropped (with a
+    # MANUAL warning) rather than aborting the whole-table parse; a NOT NULL column
+    # escalates (an omitted INSERT is rejected on the target).
+    table = TableDef(
+        name="public.t",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="c", mysql_type="text", nullable=False, default="((("),
+        ],
+        primary_key=["id"],
+    )
+    conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    assert "could not auto-convert" not in conv.target_ddl.lower()  # table NOT aborted
+    assert sqlglot.parse_one(conv.target_ddl, read="postgres") is not None
+    warns = [
+        w for w in conv.warnings if w.column_name == "c" and "default" in w.message.lower()
+    ]
+    assert warns and "NOT NULL" in warns[0].message
+
+
+def test_pg_identity_pk_strategy_applies_when_auto_increment_is_set() -> None:
+    # FIX 3: once enrich flags a serial/identity PK (auto_increment_column set), the
+    # primary-key strategy governs it -- IDENTITY_WITH_CACHE emits GENERATED ... AS
+    # IDENTITY (widened to bigint) and does NOT re-emit the nextval default; KEEP_INTEGER
+    # emits the loud "DSQL will NOT auto-generate" RECOMMENDATION and keeps a plain integer.
+    from dsql_migrator.core.converter import PrimaryKeyStrategy, SchemaConvertOptions
+
+    table = TableDef(
+        name="public.users",
+        columns=[
+            ColumnDef(name="id", mysql_type="integer", nullable=False,
+                      default="nextval('users_id_seq'::regclass)"),
+            ColumnDef(name="email", mysql_type="text", nullable=False),
+        ],
+        primary_key=["id"],
+        auto_increment_column="id",  # set by _pg_enrich_columns (see test_source_dialect)
+    )
+    identity = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(
+        table, SchemaConvertOptions(primary_key_strategy=PrimaryKeyStrategy.IDENTITY_WITH_CACHE)
+    )
+    up = identity.target_ddl.upper()
+    assert "GENERATED BY DEFAULT AS IDENTITY" in up and "BIGINT" in up
+    assert "NEXTVAL" not in up  # governed by the strategy, not emitted as a DEFAULT
+
+    keep = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(
+        table, SchemaConvertOptions(primary_key_strategy=PrimaryKeyStrategy.KEEP_INTEGER)
+    )
+    assert any("will NOT auto-generate" in w.message for w in keep.warnings)
+    assert "GENERATED" not in keep.target_ddl.upper()
 
 
 def test_convert_view_reads_pg_dialect_for_a_pg_source() -> None:
@@ -397,11 +501,12 @@ def test_timetz_and_interval_pk_do_not_trigger_key_size_warning() -> None:
 
 
 def test_pg_source_pk_strategy_is_inert_without_auto_increment() -> None:
-    # Tier-3 #9 (documented deferral tripwire): PG enrich never sets auto_increment_column,
-    # so IDENTITY_WITH_CACHE / CONVERT_TO_UUID PK strategies are no-ops for a PG serial/
-    # identity PK (and the monotonic hot-partition RECOMMENDATION never fires). This pins
-    # that inert behavior so it fails loudly when the deferred serial/identity refinement
-    # lands (introspector setting auto_increment_column for PG).
+    # FIX 3: enrich sets auto_increment_column ONLY for a detected serial/identity PK. A
+    # PLAIN integer PK (no nextval default, no attidentity) is NOT an identity column, so
+    # auto_increment_column stays unset and the IDENTITY_WITH_CACHE / CONVERT_TO_UUID PK
+    # strategies remain no-ops for it (and the monotonic hot-partition RECOMMENDATION never
+    # fires). Pins that a non-identity key is left alone; the identity case is covered by
+    # test_pg_identity_pk_strategy_* below.
     from dsql_migrator.core.converter import PrimaryKeyStrategy, SchemaConvertOptions
     from dsql_migrator.core.models import ConversionNoteKind
 

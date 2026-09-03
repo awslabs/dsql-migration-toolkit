@@ -5,6 +5,36 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.433
+
+### 修正 (Fixed)
+
+- **Schema Conversion: MySQL・PostgreSQL ソースの生成 DDL / DEFAULT 値の不具合**(コンバータを
+  実際に実行し、生成 DDL を sqlglot・Aurora DSQL `dsql_lint`・稼働中の PostgreSQL 16 で検証した
+  レビューで発見)。型の*スペル*は既に正しく、以下の DEFAULT / identity / interval の問題 — 多くは
+  **適用時に拒否**または**サイレントな損失**で、Schema Conversion の警告なし — を修正:
+  - **PostgreSQL `interval(N)`** が解析不能な `INTERVAL 6` として出力(DSQL が適用時に拒否)されて
+    いた問題 — fields 修飾だけでなくすべての interval で精度修飾子を除去するよう変更 → `INTERVAL`。
+  - **MySQL `BIT` 列の `b'…'`/`x'…'`/`0x…` DEFAULT** が整数列にビット文字列リテラルとして出力され
+    DSQL が拒否 — リテラルを整数値に解析(`b'101'`→`5`、`0xff`→`255`)。
+  - **PostgreSQL `serial`/`IDENTITY` 主キー**の自動生成がサイレントに失われていた問題(PG パスが
+    identity 列を設定せず PK 戦略が未適用)— `enrich` が `nextval(…)`/`attidentity` の PK 列を
+    フラグするようになり、IDENTITY/UUID/KEEP 戦略(およびホットパーティション推奨)が MySQL 同様に
+    適用されます。
+  - **MySQL のゼロ/整数の時刻デフォルト**(`'0000-00-00'`、`'0000-00-00 00:00:00'`、date/timestamp
+    列の `DEFAULT 0`)が DSQL 拒否 DDL を出力 — MANUAL 警告とともにドロップ。
+  - **MySQL `BINARY`/`VARBINARY` の hex デフォルト**(`0x…`)が `bytea` デフォルトとして拒否 —
+    バイト同一の `'\x…'` リテラルとして出力(bytea 上のビット文字列は警告付きでドロップ)。
+  - **PostgreSQL ソースが列 DEFAULT をすべてドロップ**(MySQL は保持)していた不整合+サイレント損失 —
+    `build_pg_source_ddl` がソースのデフォルトを保持(`read="postgres"` 再解析が DSQL 有効 SQL に
+    正規化、例:`now()`→`CURRENT_TIMESTAMP`)、生成列と identity `nextval` は除外。
+  - **セカンダリインデックス 24 個超**で全て出力され、24 個目以降の `CREATE INDEX ASYNC` が適用時に
+    失敗(54000)していた問題 — 超過分を**省略**し警告に名前を列挙(>8 キー列の省略ポリシーと一貫)。
+  - **生成された `COMPOSITE_KEY` ユニークインデックス名の 63 バイト超**(DSQL がサイレントに切り詰め)を
+    識別子長警告に含めるようにしました。
+  - **MySQL `UTC_DATE()` デフォルト**がセッションタイムゾーン依存の式にマップ(非 UTC セッションで
+    off-by-one)されていた問題 — instant ベース(`(now() AT TIME ZONE 'UTC')::date`)に変更。
+
 ## v0.1.432
 
 ### 修正 (Fixed)

@@ -12,10 +12,13 @@ strings captured by ``PostgresSourceDialect.enrich`` via ``format_type`` -- e.g.
 converter parses this with ``read="postgres"`` and re-enters the shared DSQL-constraint
 phase (FK removal, primary-key strategy, ``CREATE INDEX ASYNC``) unchanged.
 
-v1 emits columns (name + exact type + NOT NULL) and the primary key. Column DEFAULTs
-(incl. ``serial``/identity ``nextval`` and generated columns) are a refinement -- the
-primary-key strategy already governs identity on the target -- so they are not emitted
-here yet.
+It emits columns (name + exact type + NOT NULL + carried-over DEFAULT) and the primary
+key. Column DEFAULTs ARE carried across (like the MySQL path): the source default is
+emitted verbatim and the ``read="postgres"`` re-parse normalizes it to DSQL-valid SQL
+(``'active'::character varying`` -> ``CAST('active' AS VARCHAR)``, ``now()`` ->
+``CURRENT_TIMESTAMP``). A generated column's computed value and a ``serial``/identity
+``nextval`` are the exclusions -- ``nextval`` is the identity mechanism the primary-key
+strategy governs, not a literal default (see :func:`pg_column_default_sql`).
 """
 
 from __future__ import annotations
@@ -23,10 +26,54 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from dsql_migrator.core.models import TableDef
+import sqlglot
+
+from dsql_migrator.core.models import ColumnDef, TableDef
 from dsql_migrator.core.source_dialect import PostgresSourceDialect
 
 _PG = PostgresSourceDialect()
+
+# A serial/identity column's DEFAULT is ``nextval('<seq>'::regclass)`` -- the identity
+# mechanism, governed by the primary-key strategy (and advanced by 'Sync identity
+# sequences' at cut over), NOT a value to re-emit as a literal DEFAULT.
+_PG_NEXTVAL_DEFAULT_RE = re.compile(r"nextval\s*\(", re.IGNORECASE)
+
+
+def pg_column_default_sql(column: ColumnDef) -> "tuple[Optional[str], Optional[str]]":
+    """Return ``(default_sql, drop_reason)`` for a PostgreSQL source column's DEFAULT.
+
+    ``default_sql`` is the text to place after ``DEFAULT`` in the rebuilt PostgreSQL
+    ``CREATE TABLE`` (the source default verbatim; the converter re-parses the DDL with
+    ``read="postgres"`` and re-renders it, which normalizes the default to DSQL-valid SQL
+    -- e.g. ``'active'::character varying`` -> ``CAST('active' AS VARCHAR)``, ``now()`` ->
+    ``CURRENT_TIMESTAMP``). ``None`` means emit no default. ``drop_reason`` is set ONLY
+    when a PRESENT default could not be carried (so the caller warns, Property 6); it is
+    ``None`` both when there is nothing to carry (no default / generated / serial-identity
+    ``nextval``) and when the default IS carried.
+
+    PostgreSQL -> DSQL is near-identity, so a source default is carried by default (MySQL
+    carries them too). The two exclusions -- a generated column's computed value and a
+    serial/identity ``nextval`` -- match the MySQL path; a ``nextval`` is the identity
+    mechanism the primary-key strategy governs, never a literal default. A default that
+    does not parse as a PostgreSQL expression is dropped (with a reason) rather than
+    emitted, so one odd default cannot abort the whole-table parse.
+    """
+    raw = (column.default or "").strip()
+    if not raw or column.generated:
+        return None, None
+    if _PG_NEXTVAL_DEFAULT_RE.search(raw):
+        return None, None
+    # Validate the default parses as a PostgreSQL expression in isolation, so a malformed
+    # one is dropped with a warning instead of aborting the entire CREATE TABLE parse.
+    try:
+        sqlglot.parse_one(f"SELECT {raw}", read="postgres")
+    except sqlglot.errors.SqlglotError:
+        return None, (
+            f"source default ({raw}) is not a PostgreSQL expression the converter can "
+            "carry, so the column is created without a default; set it in the application "
+            "or add it with ALTER TABLE after apply."
+        )
+    return raw, None
 
 # PostgreSQL base types Aurora DSQL supports AS COLUMN TYPES, normalized (lower-case,
 # type modifiers + whitespace collapsed). Source of truth: the Aurora DSQL User Guide
@@ -159,16 +206,23 @@ def _ddl_column_type(pg_type: str) -> str:
     """The type string to emit in the rebuilt ``CREATE TABLE`` (usually verbatim).
 
     PostgreSQL -> DSQL is near-identity, so types are emitted as-is. The one exception is
-    a fields-qualified interval carrying a precision (e.g. ``interval second(3)``,
-    ``interval day to second(6)``): sqlglot's ``postgres`` reader -- which the converter
-    uses to re-parse this DDL -- cannot parse the fields + precision combination, so it
-    would abort the whole table. Drop the ``(N)`` fractional-seconds precision (keeping
-    the fields qualifier); DSQL accepts the result and the data is preserved (source
-    values are already rounded). Plain ``interval``/``interval(6)`` (no fields) parse
-    fine and are left untouched.
+    an ``interval`` carrying a ``(N)`` precision, in either shape:
+
+    - fields-qualified with a precision (``interval second(3)``, ``interval day to
+      second(6)``): sqlglot's ``postgres`` reader -- which the converter uses to re-parse
+      this DDL -- cannot parse the fields + precision combination at all, so it would
+      abort the whole table; and
+    - precision-only (``interval(6)`` / ``interval(3)``): sqlglot DOES parse it, but its
+      ``postgres`` renderer emits the UNPARSABLE ``INTERVAL 6`` (the ``(N)`` becomes a
+      bare integer argument), which DSQL/PostgreSQL then reject with a syntax error.
+
+    Both are fixed by dropping the ``(N)`` fractional-seconds precision (keeping any
+    fields qualifier): the renderer emits a plain ``INTERVAL`` (or ``INTERVAL SECOND``),
+    which DSQL accepts, and the data is preserved (source values are already rounded to
+    the declared precision). Plain ``interval`` (no modifier) is unaffected.
     """
     lowered = pg_type.lower()
-    if lowered.startswith("interval") and " " in lowered:
+    if lowered.startswith("interval"):
         return _TYPE_MODIFIER_RE.sub("", pg_type).rstrip()
     if lowered.startswith("bit varying"):
         # sqlglot's postgres reader cannot parse the two-word "bit varying"[(n)]
@@ -307,6 +361,13 @@ def build_pg_source_ddl(table: TableDef) -> str:
         clause = f"{_PG.quote_identifier(column.name)} {_ddl_column_type(column.mysql_type)}"
         if not column.nullable:
             clause += " NOT NULL"
+        # Carry the source column DEFAULT across (MySQL does too). Skipped for a generated
+        # column, a serial/identity nextval, and the identity primary-key column (which the
+        # PK strategy turns into GENERATED ... AS IDENTITY -- a DEFAULT there is rejected).
+        if column.name != table.auto_increment_column:
+            default_sql, _drop_reason = pg_column_default_sql(column)
+            if default_sql is not None:
+                clause += f" DEFAULT {default_sql}"
         column_clauses.append(clause)
 
     if table.primary_key:
@@ -323,5 +384,6 @@ __all__ = [
     "build_pg_source_ddl",
     "clamp_pg_numeric",
     "normalize_pg_base_type",
+    "pg_column_default_sql",
     "unsupported_dsql_reason",
 ]
