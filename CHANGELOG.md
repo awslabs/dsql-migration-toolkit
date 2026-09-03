@@ -5,6 +5,34 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.439
+
+### Changed
+
+- **Source-neutral CDC stack naming (`dsql-cdc-`), backward-compatible.** The CDC
+  CloudFormation stack prefix was `mysql-dsql-cdc-`, which is misleading now that the tool
+  migrates from PostgreSQL sources too. The canonical prefix is now `dsql-cdc-` (default
+  stack name `dsql-cdc-stack`), and the legacy `mysql-dsql-cdc-` prefix is still fully
+  accepted so **existing deployments keep working**: stack-name validation accepts either
+  prefix, account-wide CDC-stack discovery matches both (so an already-deployed
+  `mysql-dsql-cdc-*` stack is still found and offered for adoption rather than orphaned), a
+  persisted session name is restored as-is, and both app-stack and EC2-host `CdcDeployRole`
+  IAM policies scope every resource ARN to *both* families. New stacks are minted with the
+  neutral prefix; the suffix-only UI field now shows `dsql-cdc-`.
+
+### Fixed
+
+- **Dev/E2E harness: `scripts/compare_rows.py` now supports a PostgreSQL source** (via
+  `SOURCE_TYPE=postgres`) — it was MySQL-only (PyMySQL + `constraint_name='PRIMARY'` PK
+  detection + backtick quoting), so a PG-source cut-over check misreported "SOURCE MISSING".
+  It now connects with psycopg, detects the PK via portable standard SQL
+  (`constraint_type='PRIMARY KEY'`, correct on both engines), and quotes identifiers per
+  engine. Also fixed two latent bugs surfaced by this: `.env` values overrode explicit
+  environment variables (now os.environ wins, matching the other harnesses) and the source
+  password bypassed that precedence. `scripts/cdc_consistency_check.py` inherits the fix and
+  no longer backtick-quotes against a PG source. (Harness only — the shipped, dialect-aware
+  Validation was always the authoritative PG cut-over verdict and is unaffected.)
+
 ## v0.1.438
 
 ### Fixed

@@ -24,7 +24,7 @@ Format (Debezium MySQL connector 2.7.4.Final; validated for that connector)
 Version note: the MSK Connect *runtime* is Kafka Connect 3.7.x, but the offset
 record format is dictated by the **Debezium MySQL connector** plugin version,
 which is **2.7.4.Final** here (deployed custom plugin
-``mysql-dsql-cdc-stack-debezium-mysql-v4``, built from
+``dsql-cdc-stack-debezium-mysql-v4``, built from
 ``debezium-connector-mysql-2.7.4.Final``). The Connect 3.7.x runtime does not
 change the connector's offset schema. (The read-modify-write mode below further
 insulates against any version drift by mirroring the live connector's record.)

@@ -1448,11 +1448,12 @@ def connector_role_label(name: str) -> str:
     so a name containing "source"/"debezium" is the source and one containing
     "sink" is the sink. The explicit "source"/"sink" tokens are checked first
     because the source connector name also contains "dsql" (e.g.
-    ``mysql-dsql-cdc-spike-debezium-source``), which would otherwise misclassify it.
-    The label stays engine-neutral (the connector name follows the tool's
-    ``mysql-dsql-*`` convention regardless of the actual source engine, so it can't
-    be used to name MySQL vs. PostgreSQL). Falls back to the raw name when the role
-    can't be inferred, so an unexpected connector is never hidden.
+    ``dsql-cdc-spike-debezium-source``), which would otherwise misclassify it.
+    The label stays engine-neutral (the connector name follows the tool's cdc-stack
+    ``dsql-cdc-*`` / legacy ``mysql-dsql-cdc-*`` convention regardless of the actual
+    source engine, so it can't be used to name MySQL vs. PostgreSQL). Falls back to
+    the raw name when the role can't be inferred, so an unexpected connector is never
+    hidden.
     """
     lowered = name.lower()
     if "source" in lowered or "debezium" in lowered:

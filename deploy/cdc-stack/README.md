@@ -66,10 +66,13 @@ setup that wires this up.
 
 ## Naming (multi-DB)
 
-Every cdc-stack name must start with `mysql-dsql-cdc-` (default `mysql-dsql-cdc-stack`); the
-CdcDeployRole's IAM is scoped to the `mysql-dsql-cdc-*` family, so one app can manage
-several concurrent cdc-stacks — one per source database (e.g. `mysql-dsql-cdc-orders`,
-`mysql-dsql-cdc-billing`). Set a per-DB name in the deploy form's Advanced field.
+Every cdc-stack name must start with the canonical, source-neutral prefix `dsql-cdc-`
+(default `dsql-cdc-stack`); the legacy prefix `mysql-dsql-cdc-` is **still accepted** so
+existing deployments keep working (their stacks stay discoverable, adoptable, and
+manageable). The CdcDeployRole's IAM is scoped to **both** the `dsql-cdc-*` and
+`mysql-dsql-cdc-*` families, so one app can manage several concurrent cdc-stacks — one
+per source database (e.g. `dsql-cdc-orders`, `dsql-cdc-billing`). New stacks always take
+the canonical prefix. Set a per-DB name (suffix only) in the deploy form's Advanced field.
 
 ## Manual deploy (inspection / break-glass only)
 
@@ -77,7 +80,7 @@ several concurrent cdc-stacks — one per source database (e.g. `mysql-dsql-cdc-
 aws cloudformation validate-template --template-body file://deploy/cdc-stack/cdc-stack.yaml
 
 aws cloudformation deploy --template-file deploy/cdc-stack/cdc-stack.yaml \
-  --stack-name mysql-dsql-cdc-stack --capabilities CAPABILITY_NAMED_IAM \
+  --stack-name dsql-cdc-stack --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides ...   # see the template's Parameters section
 ```
 

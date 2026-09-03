@@ -315,8 +315,9 @@ class DataMigrationState:
         # ``_status.cdc_has_committed_offset``. False until probed, so an unread stack
         # falls back to requiring a start point rather than claiming a resume point.
         self.cdc_has_committed_offset: bool = False
-        # Other ``mysql-dsql-cdc-*`` stacks discovered in the account that the
-        # current session does NOT target (name != ``cdc_stack_name``). Populated
+        # Other cdc-stacks (canonical ``dsql-cdc-*`` or legacy ``mysql-dsql-cdc-*``)
+        # discovered in the account that the current session does NOT target
+        # (name != ``cdc_stack_name``). Populated
         # best-effort by the render-time probe so the CDC screen can offer to ADOPT
         # an existing pipeline instead of showing a fresh deploy -- and never
         # silently create a second, costly MSK stack. List of (name, StackStatus).
@@ -581,11 +582,13 @@ class DataMigrationState:
     def set_cdc_stack_name(self, name: str) -> bool:
         """Set the cdc-stack name when valid; return True if accepted.
 
-        The name must be inside the ``mysql-dsql-cdc-*`` family the deploy role grants
+        The name must be inside the ``dsql-cdc-*`` (canonical) or ``mysql-dsql-cdc-*``
+        (legacy, still accepted) family the deploy role grants
         (see :func:`cdc_stack_name_is_valid`). An invalid name is rejected and the
         current name is kept, so a typo never makes the tool deploy resources the
-        deploy role cannot manage. One cdc-stack per source DB lets several
-        migrations run concurrently in one account/region.
+        deploy role cannot manage. A previously-persisted legacy name stays valid and
+        is reused as-is. One cdc-stack per source DB lets several migrations run
+        concurrently in one account/region.
         """
         from dsql_migrator.core.cdc import cdc_stack_name_is_valid
 
@@ -626,9 +629,10 @@ class DataMigrationState:
             self.cdc_has_committed_offset = bool(value)
 
     def set_cdc_other_stacks(self, stacks: list[tuple[str, str]]) -> None:
-        """Cache other ``mysql-dsql-cdc-*`` stacks found in the account whose name is
-        NOT the one this session targets, so the CDC screen can offer to adopt an
-        existing pipeline instead of deploying a duplicate."""
+        """Cache other cdc-stacks (canonical ``dsql-cdc-*`` or legacy
+        ``mysql-dsql-cdc-*``) found in the account whose name is NOT the one this
+        session targets, so the CDC screen can offer to adopt an existing pipeline
+        instead of deploying a duplicate."""
         with self._lock:
             self.cdc_other_stacks = list(stacks)
 

@@ -9057,9 +9057,11 @@ def test_cdc_infra_form_stack_name_field_uses_fixed_prefix_prop() -> None:
             pass
 
     _render_cdc_infra_form(_Ui(), _MS(), session=None)
-    # The fixed prefix is applied as a Quasar prop, not a floating separate label.
-    assert any('prefix="mysql-dsql-cdc-"' in p for p in props_seen)
-    # The field prefills the SUFFIX only ("stack"), never the whole name.
+    # The fixed CANONICAL prefix is applied as a Quasar prop, not a floating separate
+    # label. (A legacy mysql-dsql-cdc-* name still resolves its suffix below.)
+    assert any('prefix="dsql-cdc-"' in p for p in props_seen)
+    # The field prefills the SUFFIX only ("stack"), never the whole name -- the legacy
+    # prefix is stripped just like the canonical one.
     assert "stack" in input_values
     assert "mysql-dsql-cdc-stack" not in input_values
 

@@ -915,10 +915,12 @@ def _probe_cdc_stack_phase(migration_state, session) -> None:
         )
         mine = getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
         discovery = deployer.describe_stack_or_none(mine)
-        # Account-scoped discovery: OTHER mysql-dsql-cdc-* stacks this session does
-        # not target. Lets the card offer to ADOPT an existing pipeline instead of
-        # deploying a duplicate (a reset single-task session forgets which stack it
-        # deployed). Best-effort (list_cdc_stacks returns [] on any read error).
+        # Account-scoped discovery: OTHER cdc-stacks (canonical dsql-cdc-* OR legacy
+        # mysql-dsql-cdc-*) this session does not target. Lets the card offer to ADOPT
+        # an existing pipeline instead of deploying a duplicate (a reset single-task
+        # session forgets which stack it deployed; a pre-existing legacy-named stack is
+        # found here so it is never orphaned by the new default name).
+        # Best-effort (list_cdc_stacks returns [] on any read error).
         others = [(n, s) for (n, s) in deployer.list_cdc_stacks() if n != mine]
     except Exception as exc:  # noqa: BLE001 - leave unprobed, but RECORD why
         # The read-only describe_stacks failed (bad/expired creds, missing

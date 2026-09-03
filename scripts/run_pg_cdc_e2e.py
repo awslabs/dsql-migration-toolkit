@@ -56,7 +56,8 @@ Source PG : DB_HOST / DB_PORT=5432 / DB_USER / DB_PASSWORD / DB_NAME (connect db
             ``postgres``); schema to migrate via CDC_WORKLOAD_SCHEMA.
 Target DSQL: TARGET_ENDPOINT / TARGET_REGION=ap-northeast-2 / TARGET_DATABASE /
             TARGET_USERNAME (IAM auth).
-CDC       : CDC_STACK_NAME (distinct per source version, e.g. pg17-dsql-cdc),
+CDC       : CDC_STACK_NAME (must start with a CdcDeployRole-scoped prefix — canonical
+            "dsql-cdc-" or legacy "mysql-dsql-cdc-"; vary the suffix, e.g. dsql-cdc-pg17),
             CDC_TABLES (default t_orders,t_gen_stored,t_iv), CDC_VPC_ID (required at
             deploy-infra), CDC_CONNECTOR_SUBNET_IDS (required at deploy-infra,
             comma-separated), CDC_SOURCE_DB_SECURITY_GROUP_ID (optional),
@@ -130,7 +131,13 @@ def cfg(key: str, default: str = "") -> str:
 # "unacceptable schema name"), and the tool's own introspection filters "pg\_%" schemas,
 # so the default must NOT start with "pg_".
 SCHEMA = cfg("CDC_WORKLOAD_SCHEMA", "cdc_e2e")
-STACK_NAME = cfg("CDC_STACK_NAME", "pg-dsql-cdc-stack")
+# The cdc-stack name must start with a CdcDeployRole-scoped prefix — the canonical
+# source-neutral "dsql-cdc-" (preferred) or the legacy "mysql-dsql-cdc-". The role
+# (deploy/cloudformation-ec2.yaml) scopes CFN/kafka/cloudwatch/iam to those families
+# BY DESIGN; a name outside them (e.g. "pg16-dsql-cdc") hits iterative AccessDenied
+# (kafka:GetBootstrapBrokers, cloudwatch:PutMetricAlarm, iam:GetRole on the
+# connector-execution-role). Keep a scoped prefix; vary only the suffix (dsql-cdc-pg17…).
+STACK_NAME = cfg("CDC_STACK_NAME", "dsql-cdc-pg")
 # The ordered table set for the run (comma-separated in CDC_TABLES). Single source of
 # truth; the same order the converter/sink/validator/compare walk them.
 TABLES = [t.strip() for t in cfg("CDC_TABLES", "t_orders,t_gen_stored,t_iv").split(",")
@@ -705,7 +712,11 @@ def _compare_rows():
     targets = []
     for t in TABLES:
         targets += ["-t", f"{SCHEMA}.{t}"]
-    proc = subprocess.run([sys.executable, cmp_script, *targets], env={**os.environ})
+    # This is a PG-source run: tell compare_rows.py to use its PostgreSQL source path
+    # (psycopg + PG PK detection + double-quote quoting), else it defaults to MySQL and
+    # mis-reports "SOURCE MISSING" against a PG source.
+    env = {**os.environ, "SOURCE_TYPE": "postgres", "DB_PORT": cfg("DB_PORT", "5432")}
+    proc = subprocess.run([sys.executable, cmp_script, *targets], env=env)
     return proc.returncode
 
 

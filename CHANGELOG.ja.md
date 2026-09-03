@@ -5,6 +5,31 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.439
+
+### 変更 (Changed)
+
+- **CDC スタック命名をソース中立(`dsql-cdc-`)に、後方互換を維持。** CDC CloudFormation スタックの
+  接頭辞が `mysql-dsql-cdc-` でしたが、PostgreSQL ソースも移行する now では誤解を招きます。正規の
+  接頭辞を `dsql-cdc-`(既定スタック名 `dsql-cdc-stack`)にし、レガシーの `mysql-dsql-cdc-` 接頭辞も
+  引き続き完全に受け入れるため **既存デプロイはそのまま動作**します:スタック名検証が両方の接頭辞を
+  受理、アカウント全体の CDC スタック discovery が両方に一致(デプロイ済みの `mysql-dsql-cdc-*`
+  スタックを引き続き検出し adopt を提案 — 孤立しない)、保存済みセッション名はそのまま復元、アプリ
+  スタックと EC2 ホストの `CdcDeployRole` IAM ポリシーが全リソース ARN を両系統でスコープ。新規
+  スタックは中立の接頭辞で作成され、suffix のみの UI フィールドも `dsql-cdc-` を表示します。
+
+### 修正 (Fixed)
+
+- **開発/E2E ハーネス:`scripts/compare_rows.py` が PostgreSQL ソースに対応**(`SOURCE_TYPE=postgres`)
+  — 従来は MySQL 専用(PyMySQL + `constraint_name='PRIMARY'` の PK 検出 + バッククォート引用)で、
+  PG ソースのカットオーバー確認が "SOURCE MISSING" を誤報していました。今は psycopg で接続し、PK を
+  移植性のある標準 SQL(`constraint_type='PRIMARY KEY'`、両エンジンで正しい)で検出し、識別子を
+  エンジン別に引用します。この過程で判明した潜在バグ 2 件も修正:`.env` の値が明示的な環境変数を
+  上書きしていた問題(今は os.environ 優先、他のハーネスと一致)と、ソースパスワードがその優先順位を
+  迂回していた問題。`scripts/cdc_consistency_check.py` も修正を継承し、PG ソースにバッククォート引用を
+  行いません。(ハーネス限定 — 出荷される dialect-aware Validation が常に権威ある PG カットオーバー
+  判定であり、影響なし。)
+
 ## v0.1.438
 
 ### 修正 (Fixed)

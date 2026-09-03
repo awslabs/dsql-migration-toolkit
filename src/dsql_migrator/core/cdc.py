@@ -521,7 +521,7 @@ ErrorSource = Callable[[], Sequence[CdcConnectorError]]
 # connectors are named ``${AWS::StackName}-debezium-source`` / ``-dsql-sink`` and
 # per-table topics are ``<TopicPrefix>.<db>.<table>`` (TopicPrefix default
 # ``dsqlcdc``). Defining them once keeps "which connectors are mine" deterministic.
-CDC_DEFAULT_STACK_NAME = "mysql-dsql-cdc-stack"
+CDC_DEFAULT_STACK_NAME = "dsql-cdc-stack"
 CDC_DEFAULT_TOPIC_PREFIX = "dsqlcdc"
 CDC_DEFAULT_DLQ_TOPIC = "dsql-sink-dlq"
 CDC_SOURCE_SUFFIX = "-debezium-source"
@@ -774,12 +774,18 @@ def compute_cdc_partition_plan(
     )
 
 
-# Every cdc-stack name MUST start with this prefix. The deploy role's IAM scopes
-# the whole "mysql-dsql-cdc-*" naming family (see deploy/cloudformation.yaml CdcDeployRole)
-# so one app can run many cdc-stacks concurrently (one per source DB) -- but only
-# within that family. Enforcing the prefix here keeps the tool's stack names inside
-# the role's authority and out of the parent app stack's namespace.
-CDC_STACK_NAME_PREFIX = "mysql-dsql-cdc-"
+# Every cdc-stack name MUST start with one of two accepted prefixes. The CANONICAL,
+# source-neutral prefix is "dsql-cdc-" (the tool now migrates MySQL AND PostgreSQL
+# sources, so a "mysql-" name is misleading); NEW stacks are always built with it.
+# The LEGACY prefix "mysql-dsql-cdc-" is STILL accepted so existing deployments keep
+# working (their stacks were created under the old name and must remain discoverable
+# / adoptable / manageable). The deploy role's IAM scopes BOTH families
+# (see deploy/cloudformation.yaml CdcDeployRole) so one app can run many cdc-stacks
+# concurrently (one per source DB) -- but only within these two families. Enforcing a
+# prefix here keeps the tool's stack names inside the role's authority and out of the
+# parent app stack's namespace.
+CDC_STACK_NAME_PREFIX = "dsql-cdc-"
+CDC_STACK_NAME_LEGACY_PREFIX = "mysql-dsql-cdc-"
 # CloudFormation stack names: letters/digits/hyphens, start with a letter, <=128.
 _CDC_STACK_NAME_RE = re.compile(r"^[a-zA-Z][-a-zA-Z0-9]*$")
 CDC_STACK_NAME_MAX_LEN = 128
@@ -788,44 +794,58 @@ CDC_STACK_NAME_MAX_LEN = 128
 def cdc_stack_name_is_valid(name: str) -> bool:
     """True when ``name`` is a usable cdc-stack name within the deploy role's scope.
 
-    A name is valid when it starts with :data:`CDC_STACK_NAME_PREFIX`, has at least
-    one character after the prefix, uses only the CloudFormation stack charset
+    A name is valid when it starts with EITHER the canonical
+    :data:`CDC_STACK_NAME_PREFIX` (``dsql-cdc-``) OR the legacy
+    :data:`CDC_STACK_NAME_LEGACY_PREFIX` (``mysql-dsql-cdc-``), has at least one
+    character after that prefix, uses only the CloudFormation stack charset
     (letters, digits, hyphens; leading letter), and is at most
     :data:`CDC_STACK_NAME_MAX_LEN` characters. The prefix requirement is what keeps
-    a user-chosen name inside the ``mysql-dsql-cdc-*`` IAM family the deploy role grants;
-    a name outside it would deploy resources the role cannot manage (AccessDenied).
+    a name inside the ``dsql-cdc-*`` / ``mysql-dsql-cdc-*`` IAM families the deploy
+    role grants; a name outside both would deploy resources the role cannot manage
+    (AccessDenied). Accepting the legacy prefix keeps a previously-persisted
+    ``mysql-dsql-cdc-*`` name (and existing deployments) valid.
     """
     if not name or len(name) > CDC_STACK_NAME_MAX_LEN:
         return False
-    if not name.startswith(CDC_STACK_NAME_PREFIX):
+    prefix = next(
+        (p for p in (CDC_STACK_NAME_PREFIX, CDC_STACK_NAME_LEGACY_PREFIX)
+         if name.startswith(p)),
+        None,
+    )
+    if prefix is None:
         return False
-    if len(name) <= len(CDC_STACK_NAME_PREFIX):
+    if len(name) <= len(prefix):
         return False  # prefix only, no distinguishing suffix
     return bool(_CDC_STACK_NAME_RE.match(name))
 
 
 def cdc_stack_name_suffix(name: Optional[str]) -> str:
-    """Return the part of a cdc-stack name AFTER the mandatory prefix.
+    """Return the part of a cdc-stack name AFTER whichever prefix it carries.
 
     The UI edits only this suffix (the prefix is shown fixed), so a user can never
-    type a name outside the ``mysql-dsql-cdc-*`` family. ``mysql-dsql-cdc-orders``
-    -> ``orders``; the default ``mysql-dsql-cdc-stack`` -> ``stack``. A name without
-    the prefix (shouldn't happen) yields the whole name; ``None`` yields the default
-    suffix. Pure.
+    type a name outside the ``dsql-cdc-*`` / ``mysql-dsql-cdc-*`` families. Strips
+    whichever of the two prefixes matches: ``dsql-cdc-orders`` -> ``orders``, the
+    default ``dsql-cdc-stack`` -> ``stack``, and a legacy ``mysql-dsql-cdc-orders``
+    -> ``orders``. A name without either prefix (shouldn't happen) yields the whole
+    name; ``None`` yields the default suffix. Pure.
     """
     full = (name or CDC_DEFAULT_STACK_NAME)
-    if full.startswith(CDC_STACK_NAME_PREFIX):
-        return full[len(CDC_STACK_NAME_PREFIX):]
+    for prefix in (CDC_STACK_NAME_PREFIX, CDC_STACK_NAME_LEGACY_PREFIX):
+        if full.startswith(prefix):
+            return full[len(prefix):]
     return full
 
 
 def build_cdc_stack_name(suffix: str) -> Optional[str]:
     """Build a full cdc-stack name from a user-entered suffix, or None if invalid.
 
-    Prepends the mandatory prefix and validates the whole name, so the UI can offer
-    a suffix-only field: ``orders`` -> ``mysql-dsql-cdc-orders``. Returns ``None``
-    when the resulting name is invalid (e.g. the suffix has illegal characters or is
-    empty), so the caller can keep the current name and explain the rule. Pure.
+    Prepends the CANONICAL (source-neutral) prefix :data:`CDC_STACK_NAME_PREFIX`
+    (``dsql-cdc-``) and validates the whole name, so the UI can offer a suffix-only
+    field: ``orders`` -> ``dsql-cdc-orders``. NEW stacks are always built with the
+    canonical prefix (the legacy ``mysql-dsql-cdc-`` is only ACCEPTED, never minted).
+    Returns ``None`` when the resulting name is invalid (e.g. the suffix has illegal
+    characters or is empty), so the caller can keep the current name and explain the
+    rule. Pure.
     """
     candidate = CDC_STACK_NAME_PREFIX + (suffix or "").strip()
     return candidate if cdc_stack_name_is_valid(candidate) else None
@@ -1666,6 +1686,7 @@ __all__ = [
     "CDC_SOURCE_SUFFIX",
     "CDC_SINK_SUFFIX",
     "CDC_STACK_NAME_PREFIX",
+    "CDC_STACK_NAME_LEGACY_PREFIX",
     "CDC_STACK_NAME_MAX_LEN",
     "cdc_stack_name_is_valid",
     "CdcCostEstimate",

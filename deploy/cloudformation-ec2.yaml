@@ -11,8 +11,9 @@ AWSTemplateFormatVersion: "2010-09-09"
 #     the host must reach MSK Serverless on 9098 -- deploy into a NAT-egress subnet
 #     co-located with the connectors and pass THIS host's subnet CIDR to the
 #     cdc-stack HostSubnetCidr parameter so MSK admits it on 9098.
-#   * The stack name MUST NOT start with "mysql-dsql-cdc-", or this stack's own
-#     resources fall inside the CdcDeployRole's "mysql-dsql-cdc-*" scope.
+#   * The stack name MUST NOT start with "dsql-cdc-" or "mysql-dsql-cdc-", or this
+#     stack's own resources fall inside the CdcDeployRole's cdc-stack scope
+#     (canonical "dsql-cdc-*" + legacy "mysql-dsql-cdc-*").
 Description: >
   Lambda-free "EC2 + MSK only" deployment of the MySQL -> Aurora DSQL migration
   tool (Option 3), for customers who cannot use AWS Lambda. Runs the same
@@ -21,7 +22,7 @@ Description: >
   an SSM port-forward (no inbound rule, no public IP). State lives on a retained
   EBS volume. Must run in the same VPC as the CDC MSK and be admitted on 9098 (pass
   this host's subnet CIDR to the cdc-stack HostSubnetCidr param). Stack name must
-  NOT start with "mysql-dsql-cdc-". See deploy/DEPLOYMENT.md for details.
+  NOT start with "dsql-cdc-" or "mysql-dsql-cdc-". See deploy/DEPLOYMENT.md for details.
 
 # Console UX: group + label the parameters so uploading this template in the AWS
 # CloudFormation console renders an ordered, sectioned "Specify stack details"
@@ -549,7 +550,8 @@ Resources:
                 Effect: Allow
                 Action: kafkaconnect:DescribeConnector
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:connector/mysql-dsql-cdc-*/*
+                  - Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:connector/dsql-cdc-*/*
+                  - Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:connector/mysql-dsql-cdc-*/*
               # Read the pipeline's CloudWatch metrics for the live health panel:
               # the built-in AWS/KafkaConnect throughput/task metrics
               # (SinkRecordSendRate, SourceRecordPollRate, Running/ErroredTaskCount)
@@ -578,7 +580,8 @@ Resources:
                   - logs:GetLogEvents
                   - logs:FilterLogEvents
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/msk-connect/mysql-dsql-cdc-*:*
+                  - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/msk-connect/dsql-cdc-*:*
+                  - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/msk-connect/mysql-dsql-cdc-*:*
               # The tool manages a single per-account/region plugin bucket
               # (mysql-dsql-migrator-plugins-<account>-<region>). It holds the two
               # bundled connector artifacts, the durable per-session resume snapshots
@@ -625,7 +628,8 @@ Resources:
         # are all chosen at CDC-deploy time and are UNKNOWN when this app stack is
         # deployed, so the resource ARNs cannot be pinned to a specific cluster/topic
         # here. They are instead bounded to the tool's cdc-stack family
-        # ("mysql-dsql-cdc-*-msk"), which is exactly the family the CdcDeployRole may
+        # ("dsql-cdc-*-msk" + legacy "mysql-dsql-cdc-*-msk"), which is exactly the
+        # family the CdcDeployRole may
         # create -- so the seed can reach whatever cdc-stack this app later stands up,
         # and nothing outside that family. No kafka-cluster group action is granted:
         # the in-process seed uses consumer.assign() (manual partition assignment),
@@ -645,7 +649,8 @@ Resources:
                   # action is cluster-scoped (not topic-scoped).
                   - kafka-cluster:WriteDataIdempotently
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:cluster/mysql-dsql-cdc-*-msk/*
+                  - Fn::Sub: arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:cluster/dsql-cdc-*-msk/*
+                  - Fn::Sub: arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:cluster/mysql-dsql-cdc-*-msk/*
               - Sid: MskSeedTopic
                 Effect: Allow
                 Action:
@@ -656,7 +661,8 @@ Resources:
                   - kafka-cluster:DescribeTopicDynamicConfiguration
                   - kafka-cluster:AlterTopicDynamicConfiguration
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/mysql-dsql-cdc-*-msk/*/*
+                  - Fn::Sub: arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/dsql-cdc-*-msk/*/*
+                  - Fn::Sub: arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/mysql-dsql-cdc-*-msk/*/*
         # NEW for the EC2 mode: user-data reads the auto-generated cookie-signing
         # secret at boot to inject it into the app's runtime env (read by the systemd
         # unit) as DSQL_MIGRATOR_STORAGE_SECRET. On Fargate this was the EXECUTION role's job
@@ -721,9 +727,11 @@ Resources:
   # Dedicated privileged role the app assumes ONLY for cdc-stack lifecycle (keeps
   # CFN/MSK/iam:CreateRole/PassRole off the long-running host role). Explicit
   # RoleName breaks the trust-policy cycle with HostRole. IAM is scoped to the
-  # "mysql-dsql-cdc-*" stack-name family so one role manages all cdc-stacks (names
-  # are validated to start with that prefix; see core/cdc.py). NOTE: the parent app
-  # stack must NOT use a "mysql-dsql-cdc-" name or its resources fall in scope.
+  # cdc-stack name family -- BOTH the canonical "dsql-cdc-*" and the legacy
+  # "mysql-dsql-cdc-*" (kept so existing deployments stay manageable) -- so one role
+  # manages all cdc-stacks (names are validated to start with either prefix; see
+  # core/cdc.py). NOTE: the parent app stack must NOT use a "dsql-cdc-" or
+  # "mysql-dsql-cdc-" name or its resources fall in scope.
   # (Copied verbatim from the Fargate app-stack, except the trust principal is the
   # HostRole instead of the ECS TaskRole.)
   CdcDeployRole:
@@ -762,13 +770,16 @@ Resources:
                   - cloudformation:DescribeStackResources
                   - cloudformation:GetTemplate
                 Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/dsql-cdc-*/*
+                  - Fn::Sub: arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/dsql-cdc-*
                   - Fn::Sub: arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/mysql-dsql-cdc-*/*
                   - Fn::Sub: arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/mysql-dsql-cdc-*
               # ValidateTemplate + ListStacks have no stack ARN (they are account/
               # region-wide); read-only. ListStacks lets the CDC screen discover an
-              # existing mysql-dsql-cdc-* stack that a reset session no longer
-              # remembers, so it can adopt it instead of silently creating a second
-              # (costly) MSK stack. Names are filtered to the cdc family client-side.
+              # existing cdc-stack (dsql-cdc-* or legacy mysql-dsql-cdc-*) that a reset
+              # session no longer remembers, so it can adopt it instead of silently
+              # creating a second (costly) MSK stack. Names are filtered to the cdc
+              # family client-side.
               - Sid: CloudFormationAccountReads
                 Effect: Allow
                 Action:
@@ -797,7 +808,8 @@ Resources:
                   - kafka:UntagResource
                   - kafka:ListTagsForResource
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:cluster/mysql-dsql-cdc-*-msk/*
+                  - Fn::Sub: arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:cluster/dsql-cdc-*-msk/*
+                  - Fn::Sub: arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:cluster/mysql-dsql-cdc-*-msk/*
               # MSK Connect connector CREATE has NO resource-level support: at
               # create time the connector ARN does not exist yet, so IAM evaluates
               # kafkaconnect:CreateConnector against "*" -- a scoped connector ARN
@@ -833,7 +845,8 @@ Resources:
                   - kafkaconnect:UntagResource
                   - kafkaconnect:ListTagsForResource
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:connector/mysql-dsql-cdc-*/*
+                  - Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:connector/dsql-cdc-*/*
+                  - Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:connector/mysql-dsql-cdc-*/*
               # UpdateConnector is asynchronous: it returns a connector-operation id
               # that the CFN handler polls with DescribeConnectorOperation. AWS
               # authorizes that poll against BOTH ARN shapes depending on the call
@@ -848,6 +861,8 @@ Resources:
                   - kafkaconnect:DescribeConnectorOperation
                   - kafkaconnect:ListConnectorOperations
                 Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:connector/dsql-cdc-*/*
+                  - Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:connector-operation/dsql-cdc-*/*
                   - Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:connector/mysql-dsql-cdc-*/*
                   - Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:connector-operation/mysql-dsql-cdc-*/*
               # CustomPlugin + WorkerConfiguration, split by what IAM can scope.
@@ -871,22 +886,25 @@ Resources:
               # Everything that runs AFTER the resource exists takes an ARN, so it is
               # scoped to the cdc family -- the same pattern as KafkaConnectConnector
               # above. Confirmed with iam:SimulateCustomPolicy: allowed for
-              # custom-plugin/mysql-dsql-cdc-<stack>-…/<uuid>, implicitDeny for a
-              # plugin belonging to anything else in the account.
+              # custom-plugin/<cdc-stack>-…/<uuid> (dsql-cdc-* or legacy
+              # mysql-dsql-cdc-*), implicitDeny for a plugin belonging to anything
+              # else in the account.
               - Sid: KafkaConnectPluginOps
                 Effect: Allow
                 Action:
                   - kafkaconnect:DeleteCustomPlugin
                   - kafkaconnect:DescribeCustomPlugin
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:custom-plugin/mysql-dsql-cdc-*/*
+                  - Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:custom-plugin/dsql-cdc-*/*
+                  - Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:custom-plugin/mysql-dsql-cdc-*/*
               - Sid: KafkaConnectWorkerConfigOps
                 Effect: Allow
                 Action:
                   - kafkaconnect:DeleteWorkerConfiguration
                   - kafkaconnect:DescribeWorkerConfiguration
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:worker-configuration/mysql-dsql-cdc-*/*
+                  - Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:worker-configuration/dsql-cdc-*/*
+                  - Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:worker-configuration/mysql-dsql-cdc-*/*
               # EC2 networking the cdc-stack creates (SG, and when ConnectorSubnetIds
               # is empty its own subnets/NAT/route table).
               #
@@ -1007,7 +1025,8 @@ Resources:
                   - logs:TagLogGroup
                   - logs:TagResource
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/msk-connect/mysql-dsql-cdc-*-cdc:*
+                  - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/msk-connect/dsql-cdc-*-cdc:*
+                  - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/msk-connect/mysql-dsql-cdc-*-cdc:*
               # logs:DescribeLogGroups has no resource-level support; CFN calls it to
               # resolve the LogGroup Arn for !GetAtt. Scope to account/region log groups.
               - Sid: LogGroupDescribe
@@ -1052,26 +1071,30 @@ Resources:
                   - cloudwatch:UntagResource
                   - cloudwatch:ListTagsForResource
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:mysql-dsql-cdc-*
+                  - Fn::Sub: arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:dsql-cdc-*
+                  - Fn::Sub: arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:mysql-dsql-cdc-*
               # cloudwatch:DescribeAlarms DOES take an alarm ARN (AWS service
               # reference), contrary to the earlier note here, so it is scoped to the
               # same cdc alarm family as the writes above. CFN calls it to read the
               # alarm state on create/update. Confirmed with iam:SimulateCustomPolicy:
-              # allowed for alarm:mysql-dsql-cdc-…, implicitDeny for any other alarm.
+              # allowed for alarm:dsql-cdc-… / alarm:mysql-dsql-cdc-…, implicitDeny for
+              # any other alarm.
               - Sid: CdcConnectorAlarmsDescribe
                 Effect: Allow
                 Action: cloudwatch:DescribeAlarms
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:mysql-dsql-cdc-*
+                  - Fn::Sub: arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:dsql-cdc-*
+                  - Fn::Sub: arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:mysql-dsql-cdc-*
               # IAM roles the cdc-stack auto-names (connector exec role + seeder role).
               # NOTE the deliberate absence of iam:AttachRolePolicy here -- see the next
               # statement. Together with iam:PassRole below and lambda:CreateFunction /
               # InvokeFunction further down, an unrestricted AttachRolePolicy on this role
               # family was a privilege-escalation path to account administrator: create
-              # mysql-dsql-cdc-<anything>, attach AdministratorAccess, pass the role to a
-              # Lambda this role may also create, invoke it. Nothing in the product needs
-              # that, and no scanner rule flags it now that the wildcards are scoped, so it
-              # is closed here explicitly rather than left to be re-derived.
+              # a dsql-cdc-*/mysql-dsql-cdc-* role, attach AdministratorAccess, pass the
+              # role to a Lambda this role may also create, invoke it. Nothing in the
+              # product needs that, and no scanner rule flags it now that the wildcards
+              # are scoped, so it is closed here explicitly rather than left to be
+              # re-derived.
               - Sid: IamCdcStackRoles
                 Effect: Allow
                 Action:
@@ -1086,7 +1109,8 @@ Resources:
                   - iam:UntagRole
                   - iam:ListAttachedRolePolicies
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/mysql-dsql-cdc-*
+                  - Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/dsql-cdc-*
+                  - Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/mysql-dsql-cdc-*
               # The cdc-stack attaches exactly ONE managed policy: the seeder Lambda's
               # AWSLambdaVPCAccessExecutionRole (deploy/cdc-stack/cdc-stack.yaml, the only
               # ManagedPolicyArns in the template). So Attach/DetachRolePolicy is granted
@@ -1095,8 +1119,9 @@ Resources:
               # PowerUserAccess -> implicitDeny. iam:PolicyARN is a documented condition key
               # for both actions (AWS service reference).
               # RESIDUAL, knowingly accepted for now: iam:PutRolePolicy above can still
-              # write an inline policy of any content onto a mysql-dsql-cdc-* role, and IAM
-              # offers no policy-content condition for it -- only iam:PermissionsBoundary.
+              # write an inline policy of any content onto a dsql-cdc-*/mysql-dsql-cdc-*
+              # role, and IAM offers no policy-content condition for it -- only
+              # iam:PermissionsBoundary.
               # Closing that means giving the cdc-stack roles a boundary policy and
               # conditioning CreateRole/PutRolePolicy on it, which spans both stacks; it is
               # tracked separately rather than bolted on here.
@@ -1106,7 +1131,8 @@ Resources:
                   - iam:AttachRolePolicy
                   - iam:DetachRolePolicy
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/mysql-dsql-cdc-*
+                  - Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/dsql-cdc-*
+                  - Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/mysql-dsql-cdc-*
                 Condition:
                   ArnEquals:
                     iam:PolicyARN:
@@ -1116,7 +1142,8 @@ Resources:
                 Effect: Allow
                 Action: iam:PassRole
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/mysql-dsql-cdc-*
+                  - Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/dsql-cdc-*
+                  - Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/mysql-dsql-cdc-*
                 Condition:
                   StringEquals:
                     iam:PassedToService:
@@ -1138,7 +1165,8 @@ Resources:
                   - lambda:UntagResource
                   - lambda:ListTags
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:mysql-dsql-cdc-*
+                  - Fn::Sub: arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:dsql-cdc-*
+                  - Fn::Sub: arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:mysql-dsql-cdc-*
               # CustomPlugin reads the plugin artifact from the managed bucket.
               - Sid: ReadPluginArtifacts
                 Effect: Allow

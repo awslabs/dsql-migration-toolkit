@@ -2601,13 +2601,15 @@ def _render_cdc_infra_form(
             if key == "vpc_id":
                 field.on_value_change(_save)
 
-        # Advanced: the cdc-stack name. The mandatory "mysql-dsql-cdc-" prefix is
+        # Advanced: the cdc-stack name. The mandatory canonical "dsql-cdc-" prefix is
         # rendered INSIDE the field via Quasar's built-in `prefix` prop (baseline-
         # aligned with the typed text, like a "$" before an amount), and the user
-        # types only the SUFFIX (e.g. "orders" -> mysql-dsql-cdc-orders) to run a
+        # types only the SUFFIX (e.g. "orders" -> dsql-cdc-orders) to run a
         # SECOND migration's CDC alongside an existing one. Editing only the suffix
-        # makes it impossible to leave the mysql-dsql-cdc-* family the deploy role
-        # authorizes, so a bare "abcde" becomes the valid "mysql-dsql-cdc-abcde".
+        # makes it impossible to leave the cdc-stack family the deploy role
+        # authorizes, so a bare "abcde" becomes the valid "dsql-cdc-abcde". (New
+        # stacks always take the canonical prefix; a legacy "mysql-dsql-cdc-*" name is
+        # still accepted for existing deployments -- see cdc_stack_name_is_valid.)
         name_field = ui.input(  # type: ignore[attr-defined]
             label="Advanced — CDC stack name (one per source DB)",
             value=cdc_stack_name_suffix(
@@ -2617,7 +2619,7 @@ def _render_cdc_infra_form(
         ).props(f'prefix="{CDC_STACK_NAME_PREFIX}"').classes("w-full text-sm")
         ui.label(  # type: ignore[attr-defined]
             "Full stack name = the fixed prefix + your suffix "
-            "(e.g. mysql-dsql-cdc-orders). One stack per source DB."
+            "(e.g. dsql-cdc-orders). One stack per source DB."
         ).classes("w-full text-xs text-gray-500")
 
         def _current_suffix() -> str:
@@ -2640,7 +2642,7 @@ def _render_cdc_infra_form(
             f.value = _current_suffix()
             ui.notify(  # type: ignore[attr-defined]
                 "CDC stack name suffix may use only letters, digits and hyphens "
-                "(e.g. 'orders' -> mysql-dsql-cdc-orders).",
+                "(e.g. 'orders' -> dsql-cdc-orders).",
                 type="warning", position="top",
             )
 

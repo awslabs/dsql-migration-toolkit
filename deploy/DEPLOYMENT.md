@@ -749,12 +749,14 @@ confirm reachability.
 >    (Amazon MSK / MSK Connect / NAT). Remove it **while the app is still up**, from
 >    the UI: **Start over (top right) → "Delete all CDC infrastructure"** (the app
 >    drives the `cdc-stack` deletion, ~15–25 min). If the app is already gone, delete it
->    manually: `aws cloudformation delete-stack --stack-name mysql-dsql-cdc-stack --region "$AWS_REGION"`.
+>    manually: `aws cloudformation delete-stack --stack-name dsql-cdc-stack --region "$AWS_REGION"`
+>    (use your actual cdc-stack name — the default is `dsql-cdc-stack`; a legacy
+>    deployment may be named `mysql-dsql-cdc-stack`).
 >    (CDC is the separate `cdc-stack`; see the CDC docs.)
 > 2. **app-stack** — `deploy/teardown.sh` (below).
 > 3. **build-stack** — only if you used Option B (CodeBuild) (below).
-> 4. **Verify nothing is left** — no `mysql-dsql-*` CloudFormation stacks remain
->    (`aws cloudformation list-stacks --query "StackSummaries[?starts_with(StackName,\`mysql-dsql\`) && StackStatus!=\`DELETE_COMPLETE\`].StackName"`),
+> 4. **Verify nothing is left** — no `mysql-dsql-*` or `dsql-cdc-*` CloudFormation stacks remain
+>    (`aws cloudformation list-stacks --query "StackSummaries[?(starts_with(StackName,\`mysql-dsql\`) || starts_with(StackName,\`dsql-cdc-\`)) && StackStatus!=\`DELETE_COMPLETE\`].StackName"`),
 >    plus any **Route 53** records and the **CodeBuild source S3 bucket** you created.
 
 Use the helper script (deletes the stack and waits; keeps the ECR repo by
@@ -929,8 +931,10 @@ Template: **`deploy/cloudformation-ec2.yaml`**.
 | `KeyName` | no | `""` | Optional SSH key; SSM is the primary access path, so usually left empty (the host has no inbound rule at all). |
 
 > [!WARNING]
-> The stack name **must not start with `mysql-dsql-cdc-`** (that prefix falls inside
-> the CDC deploy role's scope). `mysql-dsql-migrator-ec2` is a good choice.
+> The stack name **must not start with `dsql-cdc-` or `mysql-dsql-cdc-`** (either
+> prefix falls inside the CDC deploy role's scope — `dsql-cdc-*` is the canonical
+> cdc-stack family and `mysql-dsql-cdc-*` is the still-accepted legacy family).
+> `mysql-dsql-migrator-ec2` is a good choice.
 
 <hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 
@@ -977,7 +981,8 @@ Steps:
    to enable AI assist (Amazon Bedrock).
 4. On my OK, deploy — stage the template with --s3-bucket (it exceeds CloudFormation's
    51,200-byte inline limit); use --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM;
-   name the stack mysql-dsql-migrator-ec2 (it must NOT start with mysql-dsql-cdc-). Wait
+   name the stack mysql-dsql-migrator-ec2 (it must NOT start with dsql-cdc- or
+   mysql-dsql-cdc-). Wait
    for CREATE_COMPLETE, then tell me how to reach the UI over an SSM port-forward.
 
 Guardrails: single region only (the DSQL cluster's); read/describe before you create;

@@ -25,7 +25,11 @@ from dsql_migrator.core.aws_session import (
     build_assumed_role_session,
     build_session,
 )
-from dsql_migrator.core.cdc import CDC_PLACEHOLDER_PREFIX, CDC_STACK_NAME_PREFIX
+from dsql_migrator.core.cdc import (
+    CDC_PLACEHOLDER_PREFIX,
+    CDC_STACK_NAME_LEGACY_PREFIX,
+    CDC_STACK_NAME_PREFIX,
+)
 
 # Stack statuses from which an UpdateStack can safely start. Anything in an
 # *_IN_PROGRESS / ROLLBACK / FAILED state means a deploy is unsafe right now.
@@ -637,9 +641,9 @@ class CdcStackDeployer:
         )
 
     def list_cdc_stacks(self) -> list[tuple[str, str]]:
-        """List every CloudFormation stack in this region in the
-        ``mysql-dsql-cdc-*`` family (excluding ``DELETE_COMPLETE``), as
-        ``(stack_name, stack_status)`` pairs.
+        """List every CloudFormation stack in this region in the cdc-stack family
+        (canonical ``dsql-cdc-*`` OR legacy ``mysql-dsql-cdc-*``, excluding
+        ``DELETE_COMPLETE``), as ``(stack_name, stack_status)`` pairs.
 
         Account-scoped discovery so the CDC screen can find infrastructure a prior
         or other session already deployed under a name the current session no
@@ -647,7 +651,11 @@ class CdcStackDeployer:
         loses in-memory state on an ECS task replacement) shows a fresh "deploy"
         flow and can silently create a SECOND, costly MSK stack. ``ListStacks`` has
         no server-side name filter, so names are filtered client-side by
-        :data:`~dsql_migrator.core.cdc.CDC_STACK_NAME_PREFIX`.
+        :data:`~dsql_migrator.core.cdc.CDC_STACK_NAME_PREFIX` and
+        :data:`~dsql_migrator.core.cdc.CDC_STACK_NAME_LEGACY_PREFIX`. Matching BOTH
+        prefixes is what keeps a pre-existing ``mysql-dsql-cdc-*`` deployment
+        discoverable (and therefore adoptable) after the canonical prefix changed to
+        ``dsql-cdc-``, so a legacy stack is never orphaned in favor of a new one.
 
         Best-effort: returns ``[]`` on any read error (e.g. the deploy role lacks
         ``cloudformation:ListStacks``), so this discovery is purely additive and
@@ -666,7 +674,10 @@ class CdcStackDeployer:
                 for summary in resp.get("StackSummaries", []) or []:
                     name = str(summary.get("StackName", ""))
                     status = str(summary.get("StackStatus", ""))
-                    if name.startswith(CDC_STACK_NAME_PREFIX) and status != "DELETE_COMPLETE":
+                    in_family = name.startswith(
+                        (CDC_STACK_NAME_PREFIX, CDC_STACK_NAME_LEGACY_PREFIX)
+                    )
+                    if in_family and status != "DELETE_COMPLETE":
                         found.append((name, status))
                 token = resp.get("NextToken")
                 if not token:

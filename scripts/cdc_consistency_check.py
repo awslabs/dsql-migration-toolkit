@@ -42,7 +42,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import validate_identifier  # noqa: E402
 from _e2e_tables import tables_for  # noqa: E402
-from compare_rows import source_connect, target_connect, source_stats, target_stats  # noqa: E402
+from compare_rows import (  # noqa: E402
+    quote_ident, source_connect, target_connect, source_stats, target_stats,
+)
 
 DEFAULT_SCHEMA = os.environ.get("CDC_WORKLOAD_SCHEMA", "customers_sample_new")
 
@@ -75,12 +77,14 @@ def _default_tables_for(schema: str) -> list[str]:
 
 
 def _src_pk_set(conn, schema, table, pk) -> set:
-    # Identifiers are interpolated (they cannot be bound), so validate first.
+    # Identifiers are interpolated (they cannot be bound), so validate first. Quote
+    # per source engine (quote_ident: MySQL backticks / PostgreSQL double quotes) so
+    # the read is valid on both — a backtick-quoted SELECT is a syntax error on PG.
     validate_identifier(schema, "schema")
     validate_identifier(table, "table")
     validate_identifier(pk, "pk column")
     with conn.cursor() as cur:
-        cur.execute(f"SELECT `{pk}` FROM `{schema}`.`{table}`")
+        cur.execute(f"SELECT {quote_ident(pk)} FROM {quote_ident(schema)}.{quote_ident(table)}")
         return {r[0] for r in cur.fetchall()}
 
 

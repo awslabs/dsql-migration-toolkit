@@ -5,6 +5,31 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.439
+
+### 변경 (Changed)
+
+- **CDC 스택 이름을 source-neutral(`dsql-cdc-`)로, 하위호환 유지.** CDC CloudFormation 스택
+  접두사가 `mysql-dsql-cdc-`였는데, 이제 PostgreSQL 소스도 마이그레이션하므로 오해의 소지가
+  있었습니다. 정규 접두사를 `dsql-cdc-`(기본 스택명 `dsql-cdc-stack`)로 바꾸고, 레거시
+  `mysql-dsql-cdc-` 접두사도 계속 완전히 허용해 **기존 배포가 그대로 동작**합니다: 스택명 검증이
+  두 접두사 모두 수용, 계정 전역 CDC 스택 discovery가 둘 다 매칭(이미 배포된 `mysql-dsql-cdc-*`
+  스택을 여전히 찾아 adopt 제안 — 고아화 안 됨), 저장된 세션 이름은 그대로 복원, 앱 스택과
+  EC2 호스트의 `CdcDeployRole` IAM 정책이 모든 리소스 ARN을 두 계열 모두로 스코프. 신규 스택은
+  중립 접두사로 생성되며, suffix-only UI 필드도 `dsql-cdc-`를 표시합니다.
+
+### 수정 (Fixed)
+
+- **개발/E2E 하니스: `scripts/compare_rows.py`가 PostgreSQL 소스 지원**(`SOURCE_TYPE=postgres`) —
+  기존엔 MySQL 전용(PyMySQL + `constraint_name='PRIMARY'` PK 탐지 + backtick 인용)이라 PG 소스
+  컷오버 체크가 "SOURCE MISSING" 오탐을 냈습니다. 이제 psycopg로 연결, PK를 이식성 있는 표준
+  SQL(`constraint_type='PRIMARY KEY'`, 양 엔진에서 정확)로 탐지, 식별자를 엔진별로 인용합니다.
+  이 과정에서 드러난 잠복 버그 2건도 수정: `.env` 값이 명시적 환경변수를 덮어썼던 문제(이제
+  os.environ 우선, 다른 하니스와 일치)와 소스 비밀번호가 그 우선순위를 우회하던 문제.
+  `scripts/cdc_consistency_check.py`도 수정을 상속받아 PG 소스에 backtick 인용을 하지 않습니다.
+  (하니스 한정 — shipped된 dialect-aware Validation이 항상 권위 있는 PG 컷오버 판정이며 영향
+  없음.)
+
 ## v0.1.438
 
 ### 수정 (Fixed)

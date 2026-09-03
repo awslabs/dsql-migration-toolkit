@@ -24,6 +24,7 @@ from dsql_migrator.core.cdc import (
     CDC_ENV_TOPIC_PARTITIONS,
     CDC_MAX_SINK_PARALLELISM,
     CDC_PLACEHOLDER_PREFIX,
+    CDC_STACK_NAME_LEGACY_PREFIX,
     CDC_STACK_NAME_MAX_LEN,
     CDC_STACK_NAME_PREFIX,
     CDC_WATERMARK_PARAM_KEYS,
@@ -73,8 +74,8 @@ def _params(tables=("app.orders", "app.customers"), **kw):
 
 def test_expected_connector_names_default() -> None:
     assert cdc_expected_connector_names() == (
-        "mysql-dsql-cdc-stack-debezium-source",
-        "mysql-dsql-cdc-stack-dsql-sink",
+        "dsql-cdc-stack-debezium-source",
+        "dsql-cdc-stack-dsql-sink",
     )
 
 
@@ -447,19 +448,38 @@ def test_watermark_params_no_binlog_coords_all_empty() -> None:
 
 
 # ---------------------------------------------------------------------------
-# cdc_stack_name_is_valid — the mysql-dsql-cdc-* family gate (multi-DB support)
+# cdc_stack_name_is_valid — the cdc-stack family gate: canonical dsql-cdc-* plus the
+# still-accepted legacy mysql-dsql-cdc-* (source-neutral rename, backward-compatible)
 # ---------------------------------------------------------------------------
 
 
-def test_default_stack_name_is_valid_and_in_family() -> None:
+def test_canonical_prefix_is_source_neutral() -> None:
+    # The canonical prefix dropped the misleading "mysql-" (the tool now migrates
+    # MySQL AND PostgreSQL sources); the legacy prefix is retained for existing stacks.
+    assert CDC_STACK_NAME_PREFIX == "dsql-cdc-"
+    assert CDC_STACK_NAME_LEGACY_PREFIX == "mysql-dsql-cdc-"
+
+
+def test_default_stack_name_is_canonical_and_valid() -> None:
+    assert CDC_DEFAULT_STACK_NAME == "dsql-cdc-stack"
     assert CDC_DEFAULT_STACK_NAME.startswith(CDC_STACK_NAME_PREFIX)
     assert cdc_stack_name_is_valid(CDC_DEFAULT_STACK_NAME)
 
 
 def test_per_db_stack_names_are_valid() -> None:
-    # The whole point: several cdc-stacks (one per source DB) in one account.
+    # The whole point: several cdc-stacks (one per source DB) in one account. Both
+    # the canonical dsql-cdc-* and the legacy mysql-dsql-cdc-* families are accepted.
+    for name in ("dsql-cdc-orders", "dsql-cdc-billing-prod", "dsql-cdc-a1"):
+        assert cdc_stack_name_is_valid(name), name
     for name in ("mysql-dsql-cdc-orders", "mysql-dsql-cdc-billing-prod", "mysql-dsql-cdc-a1"):
         assert cdc_stack_name_is_valid(name), name
+
+
+def test_both_prefixes_accepted_backward_compat() -> None:
+    # A pre-existing (legacy-named) stack stays valid so it is never orphaned; a new
+    # canonical name is valid too.
+    assert cdc_stack_name_is_valid("dsql-cdc-x")
+    assert cdc_stack_name_is_valid("mysql-dsql-cdc-x")
 
 
 def test_stack_name_must_carry_the_family_prefix() -> None:
@@ -468,8 +488,9 @@ def test_stack_name_must_carry_the_family_prefix() -> None:
 
 
 def test_stack_name_prefix_alone_is_rejected() -> None:
-    # Needs a distinguishing suffix after the prefix.
+    # Needs a distinguishing suffix after the prefix (either family).
     assert not cdc_stack_name_is_valid(CDC_STACK_NAME_PREFIX)
+    assert not cdc_stack_name_is_valid(CDC_STACK_NAME_LEGACY_PREFIX)
 
 
 def test_stack_name_rejects_cfn_charset_violations() -> None:
@@ -496,29 +517,32 @@ def test_stack_name_empty_or_blank_rejected() -> None:
 
 # build_cdc_stack_name / cdc_stack_name_suffix — the suffix-only UI field. The user
 # edits only the part after the fixed prefix, so a bare word can never escape the
-# mysql-dsql-cdc-* family (the old post-hoc reject-and-revert UX is gone).
+# cdc-stack family (the old post-hoc reject-and-revert UX is gone). New names are
+# always built with the canonical dsql-cdc- prefix.
 
 
-def test_build_cdc_stack_name_prepends_prefix_and_validates() -> None:
+def test_build_cdc_stack_name_prepends_canonical_prefix_and_validates() -> None:
     from dsql_migrator.core.cdc import build_cdc_stack_name
 
-    # A bare suffix (the reported "abcde" case) becomes a VALID full name.
-    assert build_cdc_stack_name("abcde") == "mysql-dsql-cdc-abcde"
-    assert build_cdc_stack_name("orders") == "mysql-dsql-cdc-orders"
-    assert build_cdc_stack_name(" orders ") == "mysql-dsql-cdc-orders"  # trimmed
+    # A bare suffix becomes a VALID full name under the CANONICAL prefix.
+    assert build_cdc_stack_name("abcde") == "dsql-cdc-abcde"
+    assert build_cdc_stack_name("orders") == "dsql-cdc-orders"
+    assert build_cdc_stack_name(" orders ") == "dsql-cdc-orders"  # trimmed
     # Empty / illegal-charset suffix -> None (caller keeps the current name).
     assert build_cdc_stack_name("") is None
     assert build_cdc_stack_name("a b") is None  # space is not allowed
     assert build_cdc_stack_name("a/b") is None
 
 
-def test_cdc_stack_name_suffix_round_trips_with_build() -> None:
+def test_cdc_stack_name_suffix_strips_both_prefixes() -> None:
     from dsql_migrator.core.cdc import (
         build_cdc_stack_name,
         cdc_stack_name_suffix,
     )
 
     assert cdc_stack_name_suffix(CDC_DEFAULT_STACK_NAME) == "stack"
+    # Canonical AND legacy prefixes are both stripped to the bare suffix.
+    assert cdc_stack_name_suffix("dsql-cdc-orders") == "orders"
     assert cdc_stack_name_suffix("mysql-dsql-cdc-orders") == "orders"
     assert cdc_stack_name_suffix(None) == "stack"  # default
     # suffix(build(x)) == x for a valid suffix (what the field relies on).
