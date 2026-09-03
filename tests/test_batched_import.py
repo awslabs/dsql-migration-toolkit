@@ -931,6 +931,50 @@ def test_import_with_job_records_compact_resume_high_water() -> None:
     assert job.chunks == []
 
 
+def test_source_read_raise_persists_completed_prefix_and_resume_skips_it() -> None:
+    # FIX 4: when the SOURCE READ raises mid-load, the completed contiguous prefix must
+    # still be persisted onto the (ephemeral) job so a same-process retry does not
+    # re-WRITE the already-committed batches. Previously the resume tracker was owned
+    # inside _run_data_batches and returned only on a clean return, so a raising source
+    # read discarded the prefix -> the retry re-ran from batch 0.
+    table = _table()
+    options = BatchedImportOptions(batch_size=2, parallelism=1)  # deterministic batches
+
+    def _raising_rows():
+        # Batches 0,1,2 = rows 0..5 (each committed as it drains at parallelism=1),
+        # then the source read drops before batch 3's rows arrive.
+        for i in range(6):
+            yield {"id": i, "name": f"name-{i}"}
+        raise RuntimeError("simulated source read drop")
+
+    store = _FakeStore()
+    job = MigrationJob(job_id="job-drop")
+    importer = _importer(store, ["id", "name"], ["id"], options=options)
+
+    # The source-read error propagates (fails SAFE -- the re-read is intentional).
+    with pytest.raises(RuntimeError, match="simulated source read drop"):
+        importer.import_rows(_raising_rows(), table, job=job)
+
+    # The 3 committed batches (indices 0,1,2) are on the target AND recorded as the
+    # contiguous high-water 2 -- NOT lost / reset to 0.
+    assert job.resume_batch_watermark == {"": 2}
+    assert len(store.rows) == 6
+    inserts_after_drop = len(store.executed_inserts)
+    assert inserts_after_drop == 3
+
+    # Resume on the SAME target with the persisted watermark and the full 8 rows: the
+    # committed prefix (batches 0,1,2) is SKIPPED (no re-write), only batch 3 loads, and
+    # no row is duplicated.
+    result = importer.import_rows(_rows(8), table, job=job)
+    assert result.batches_skipped == 3
+    assert result.batches_completed == 1
+    assert result.rows_loaded == 2
+    # Exactly one new insert (batch 3) -- the already-committed prefix was not re-written.
+    assert len(store.executed_inserts) == inserts_after_drop + 1
+    assert set(store.rows) == {(i,) for i in range(8)}  # 8 rows, each exactly once
+    assert job.resume_batch_watermark == {"": 3}
+
+
 # ---------------------------------------------------------------------------
 # _BatchResumeTracker: compact, memory-bounded per-shard resume high-water
 # ---------------------------------------------------------------------------
@@ -1077,6 +1121,49 @@ def test_indexes_are_skipped_when_a_data_batch_fails() -> None:
     assert result.failures == 1
     assert result.indexes_created == 0
     assert store.executed_ddls == []  # no DDL issued after a failed load
+
+
+def test_create_indexes_public_entry_runs_the_same_post_load_pass() -> None:
+    # FIX 3: the public create_indexes() (used by the multiprocess sharded-REPLACE path,
+    # where shard workers load slices with no index_ddls) opens its OWN bounded pool and
+    # runs the IDENTICAL CREATE INDEX ASYNC / per-DDL pass as import_rows.
+    store = _FakeStore()
+    importer = _importer(
+        store, ["id", "name"], ["id"],
+        options=BatchedImportOptions(batch_size=2, parallelism=1),
+    )
+
+    created, failures = importer.create_indexes(_index_ddls())
+
+    assert created == 2
+    assert failures == []
+    assert store.executed_ddls == _index_ddls()  # each its own DDL statement
+    assert store.connections_created >= 1  # it opened its own pool
+
+
+def test_create_indexes_isolates_a_failing_index() -> None:
+    # A failing index is ISOLATED and returned (never raised), exactly like the
+    # non-sharded pass: one bad index does not stop the others.
+    store = _FakeStore()
+    store.failing_index_names = {"ix_email"}
+    importer = _importer(
+        store, ["id", "name"], ["id"],
+        options=BatchedImportOptions(batch_size=2, parallelism=1),
+    )
+
+    created, failures = importer.create_indexes(_index_ddls())
+
+    assert created == 1
+    assert len(failures) == 1 and "ix_email" in failures[0]
+
+
+def test_create_indexes_with_no_ddls_opens_no_connection() -> None:
+    # No index DDLs -> a no-op that opens no connection (a base table with only its PK).
+    store = _FakeStore()
+    importer = _importer(store, ["id", "name"], ["id"])
+
+    assert importer.create_indexes([]) == (0, [])
+    assert store.connections_created == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1338,6 +1425,39 @@ def test_iter_batches_byte_cap_holds_when_first_row_is_tiny(monkeypatch) -> None
     # And it actually split (the row-count cap of 100 was never the reason).
     assert len(batches) > 1
     # No row was lost or duplicated.
+    assert sum(len(b) for b in batches) == len(rows)
+
+
+def test_estimate_row_bytes_counts_utf8_bytes_for_multibyte_text() -> None:
+    # FIX 2: DSQL's per-transaction cap is on WIRE bytes, so a str must be counted by
+    # its ENCODED (UTF-8) size, not its character count. CJK is 3 bytes/char and most
+    # emoji 4, so the character count badly UNDER-estimates a multi-byte row.
+    from dsql_migrator.core import batched_import as bi
+
+    text = "가나다😀"  # 3 CJK chars (3 bytes each) + 1 emoji (4 bytes) = 13 bytes
+    expected = len(text.encode("utf-8"))
+    assert expected == 13
+    est = bi._estimate_row_bytes({"v": text})
+    assert est == expected  # exact wire size, ...
+    assert est > len(text)  # ... NOT the character count (which under-counted).
+
+
+def test_iter_batches_splits_multibyte_rows_by_actual_wire_bytes() -> None:
+    # FIX 2: a CJK-heavy page must split on ACTUAL UTF-8 bytes so no batch exceeds the
+    # DSQL 10 MiB/txn cap (MAX_BATCH_BYTES leaves headroom). With the old char-count
+    # estimate these ~1200-byte rows counted as only ~400 "bytes", so ~6 packed into a
+    # single batch of ~7200 real bytes -- over any budget. Demonstrated with a small cap.
+    from dsql_migrator.core import batched_import as bi
+
+    max_bytes = 2500
+    rows = [{"v": "가" * 400} for _ in range(6)]  # 400 chars -> 1200 UTF-8 bytes each
+    batches = list(bi._iter_batches(rows, batch_size=100, max_bytes=max_bytes))
+
+    for b in batches:
+        actual = sum(len(r["v"].encode("utf-8")) for r in b)
+        assert actual <= max_bytes, f"batch of {len(b)} rows = {actual} wire bytes"
+    # It split on bytes (row-count cap of 100 was never hit) and lost/duplicated nothing.
+    assert len(batches) > 1
     assert sum(len(b) for b in batches) == len(rows)
 
 

@@ -11816,9 +11816,37 @@ def test_multiprocess_planner_shards_only_cdc_coexisting_and_honors_reader_shard
     assert "table_parallelism - non_shardable_count" not in process_path
 
 
-# ---------------------------------------------------------------------------
-# CDC prerequisite gate — must not punish the normal Full-load-+-CDC flow
-# ---------------------------------------------------------------------------
+def test_multiprocess_sharded_replace_creates_indexes_only_on_success() -> None:
+    # FIX 3: a sharded REPLACE table is recreated EMPTY (no secondary indexes) and its
+    # shard workers load slices with NO index_ddls, so the parent must build the indexes
+    # itself. The serial pre-pass captures the recreator's index DDLs, and the parent
+    # creates them ONCE in the shard-SUCCESS branch (never on FAILED/STOPPED) via the
+    # public BatchedImporter.create_indexes -- identical CREATE INDEX ASYNC / OCC behavior.
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    src = inspect.getsource(_engine._migrate_tables_in_parallel)
+    process_path = src[src.index("# Unified process-parallel path"):]
+
+    # Pre-pass captures the recreator return (the table's index DDLs) instead of
+    # discarding it, using the migrator's (injectable) recreator.
+    assert "table_recreator = migrator._table_recreator" in process_path
+    assert "replace_index_ddls[tbl.name] = table_recreator(tbl)" in process_path
+
+    # The indexes are built exactly once (one call site), guarded by the captured DDLs,
+    # and any failure is surfaced through the shared _record_index_failures path.
+    assert process_path.count(".create_indexes(") == 1
+    assert "replace_index_ddls.get(name)" in process_path
+    assert "_record_index_failures(" in process_path
+
+    # It sits in the SUCCESS branch: after the pre-pass capture, after the FAILED/STOPPED
+    # branches' _fail_chunk handling, and after the success _complete_chunk update.
+    i_prepass = process_path.index("replace_index_ddls[tbl.name] = table_recreator(tbl)")
+    i_fail = process_path.index("_fail_chunk(job, n)")  # the any_failed branch
+    i_complete = process_path.index("_complete_chunk(job, n, r, s, q)")
+    i_create = process_path.index(".create_indexes(")
+    assert i_prepass < i_fail < i_complete < i_create
 
 
 def _passing_cdc_report():

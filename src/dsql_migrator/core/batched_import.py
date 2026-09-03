@@ -859,18 +859,27 @@ class BatchedImporter:
         with self._quarantine_lock:
             self._quarantine = []
             self._quarantine_total = 0
+        # OWN the resume high-water HERE (seeded from the prior attempt's watermark) rather
+        # than inside _run_data_batches, so the completed contiguous prefix survives even
+        # when the SOURCE READ raises mid-load: _run_data_batches records into THIS tracker,
+        # and the finally below persists it onto the (ephemeral) job BEFORE the exception
+        # propagates. When the tracker was owned inside _run_data_batches (returned only on a
+        # clean return), a raising source read discarded the prefix and a same-process retry
+        # re-WROTE every already-committed batch from batch 0 (needless OCC round-trips). The
+        # source RE-READ is intentional and fails SAFE; only the redundant re-write is spared.
+        resume_tracker = _BatchResumeTracker(skip_watermark)
+        indexes_created = 0
+        index_failures: list[str] = []
         try:
             # Outcomes are folded into `agg` as they resolve and the resume point is
             # tracked as a compact per-shard high-water -- no per-batch list is ever
             # retained, so a billion-row table's memory stays bounded whether or not a
             # (resume) job is present. The tracker is seeded from the prior watermark.
-            agg, resume_tracker, stopped_early = self._run_data_batches(
+            agg, stopped_early = self._run_data_batches(
                 work_iters, pool, on_batch_loaded, should_cancel,
-                resume_watermark=skip_watermark,
+                resume_tracker=resume_tracker,
             )
             failures = agg.failures
-            indexes_created = 0
-            index_failures: list[str] = []
             # Skip post-load indexing when the table is incomplete (a stop) or
             # any batch failed -- indexing only makes sense for a full table.
             if failures == 0 and not stopped_early and index_ddls:
@@ -879,11 +888,11 @@ class BatchedImporter:
                 )
         finally:
             pool.close_all()
-
-        # Persist the advanced resume high-water back onto the (ephemeral) job so a
-        # same-process source-drop retry skips the keyset ranges already committed.
-        if job is not None:
-            job.resume_batch_watermark = resume_tracker.watermark()
+            # Persist the advanced resume high-water back onto the (ephemeral) job so a
+            # same-process source-drop retry skips the keyset ranges already committed. In
+            # the finally so it survives a raising source read (see the tracker comment).
+            if job is not None:
+                job.resume_batch_watermark = resume_tracker.watermark()
 
         result = _aggregate_result(
             agg, skip_counter.value, indexes_created, cancelled=stopped_early
@@ -1099,8 +1108,8 @@ class BatchedImporter:
         on_batch_loaded: Optional[Callable[[int, int], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
         *,
-        resume_watermark: Optional[Mapping[str, int]] = None,
-    ) -> "tuple[_RunAggregate, _BatchResumeTracker, bool]":
+        resume_tracker: "_BatchResumeTracker",
+    ) -> "tuple[_RunAggregate, bool]":
         """Execute batches concurrently with at most ``parallelism`` in flight.
 
         Submissions are throttled so no more than ``parallelism`` batches are
@@ -1117,13 +1126,13 @@ class BatchedImporter:
         table. Returns the batch outcomes and whether the load stopped early
         (left unsubmitted work).
         """
-        # Fold each outcome into a running aggregate as it resolves and advance a
-        # compact per-shard resume high-water -- NO per-batch list is ever retained, so
-        # a billion-row load stays bounded regardless of whether a (resume) job is
-        # present. The tracker is seeded from the prior attempt's watermark so this
-        # run's completions extend, not restart, the contiguous prefix.
+        # Fold each outcome into a running aggregate as it resolves and advance the
+        # caller-owned per-shard resume high-water (``resume_tracker``) -- NO per-batch
+        # list is ever retained, so a billion-row load stays bounded regardless of whether
+        # a (resume) job is present. The caller owns the tracker (seeded from the prior
+        # attempt's watermark) so the completed prefix survives even if the source read
+        # raises here; this method only RECORDS into it.
         agg = _RunAggregate()
-        resume_tracker = _BatchResumeTracker(resume_watermark)
         parallelism = self._options.parallelism
         # future -> (chunk_id, shard_id, batch_index): the shard/index feed the resume
         # high-water; only ~parallelism entries are ever live (bounded).
@@ -1175,23 +1184,38 @@ class BatchedImporter:
             prefetched = work_iters[0]
         with ThreadPoolExecutor(max_workers=parallelism) as executor:
             try:
-                for work in prefetched:
-                    if should_cancel is not None and should_cancel():
-                        # Stop pulling new batches; remaining rows stay unloaded so
-                        # the table is reported incomplete (retryable, idempotent).
-                        stopped_early = True
-                        break
-                    future = executor.submit(self._load_batch, work, pool)
-                    in_flight[future] = (work.chunk_id, work.shard_id, work.batch_index)
-                    if len(in_flight) >= parallelism:
-                        drain_one()
+                try:
+                    for work in prefetched:
+                        if should_cancel is not None and should_cancel():
+                            # Stop pulling new batches; remaining rows stay unloaded so
+                            # the table is reported incomplete (retryable, idempotent).
+                            stopped_early = True
+                            break
+                        future = executor.submit(self._load_batch, work, pool)
+                        in_flight[future] = (work.chunk_id, work.shard_id, work.batch_index)
+                        if len(in_flight) >= parallelism:
+                            drain_one()
+                finally:
+                    # Stop + join the reader thread promptly on cancel/early-exit
+                    # (also runs on the normal exhausted path -- a no-op there).
+                    prefetched.close()
+                # Normal / cancel exit: drain the in-flight tail (surfaces a callback
+                # error exactly as before).
+                while in_flight:
+                    drain_one()
             finally:
-                # Stop + join the reader thread promptly on cancel/early-exit
-                # (also runs on the normal exhausted path -- a no-op there).
-                prefetched.close()
-            while in_flight:
-                drain_one()
-        return agg, resume_tracker, stopped_early
+                # If the SOURCE READ (or the tail drain) raised above, the tail loop did
+                # not run, yet the batches already submitted still COMMITTED. Drain those
+                # completed futures into the caller's resume tracker anyway so the persisted
+                # prefix is MAXIMAL and a retry does not re-write committed keyset ranges.
+                # Best-effort only: never let a drained callback error mask the exception
+                # currently unwinding (which the retry path classifies to decide re-read).
+                while in_flight:
+                    try:
+                        drain_one()
+                    except Exception:  # noqa: BLE001 - unwinding; keep the original error
+                        break
+        return agg, stopped_early
 
     def _load_batch(
         self, work: _BatchWork, pool: _ConnectionPool
@@ -1604,6 +1628,27 @@ class BatchedImporter:
                 created += 1
         return created, failures
 
+    def create_indexes(self, index_ddls: list[str]) -> "tuple[int, list[str]]":
+        """Public post-load index pass on a fresh bounded pool (``(created, failures)``).
+
+        A regular :meth:`import_rows` runs the post-load ``CREATE INDEX ASYNC`` pass
+        itself, so the ONLY caller is the MULTIPROCESS sharded-REPLACE path: there each
+        shard is a separate process that loads a PK slice with NO ``index_ddls``, so no
+        single ``import_rows`` owns the whole table to run the post-load pass. The parent
+        recreates the empty target once and, after every shard succeeds, calls this ONCE
+        to build the secondary indexes. It opens its own bounded :class:`_ConnectionPool`
+        and delegates to :meth:`_create_indexes`, so the ``CREATE INDEX ASYNC`` / OCC-retry
+        / per-DDL isolation behavior is IDENTICAL to the non-sharded path. A no-op (and no
+        connection opened) when there are no index DDLs.
+        """
+        if not index_ddls:
+            return 0, []
+        pool = _ConnectionPool(self._connection_factory, self._options.parallelism)
+        try:
+            return self._create_indexes(pool, index_ddls)
+        finally:
+            pool.close_all()
+
 
 def _default_connection_factory(target: TargetConnectionConfig) -> ConnectionFactory:
     """Build a connection factory backed by :class:`DsqlConnector`.
@@ -1664,10 +1709,18 @@ def _execute_ddl(connection: Any, ddl: str) -> None:
 def _estimate_row_bytes(row: Mapping[str, object]) -> int:
     """Cheaply estimate a row's payload size in bytes (for the batch byte cap).
 
-    A heuristic sum over the row's values -- ``bytes`` by length, ``str`` by
-    character count, everything else by its ``str`` length, ``None`` ~1. It need
+    A heuristic sum over the row's values -- ``bytes`` by length, ``str`` by its
+    UTF-8 byte length, everything else by its ``str`` length, ``None`` ~1. It need
     not be exact: it only has to keep a batch comfortably under the DSQL 10 MiB
     per-write-transaction limit, for which ``MAX_BATCH_BYTES`` leaves headroom.
+
+    A ``str`` is counted by its ENCODED (UTF-8) byte length, not its character
+    count: DSQL's per-transaction cap is on WIRE bytes, and a multi-byte string
+    (CJK is 3 bytes/char, most emoji 4) is far larger on the wire than its length.
+    Counting characters under-estimated such a batch, so a CJK/emoji-heavy page
+    could pass the row-count/byte gate here yet exceed 10 MiB on the wire and be
+    rejected. This is the EXACT wire size (not a ``*4`` worst-case bound, which
+    would needlessly over-split plain-ASCII batches).
     """
     total = 0
     for value in row.values():
@@ -1676,7 +1729,7 @@ def _estimate_row_bytes(row: Mapping[str, object]) -> int:
         elif isinstance(value, (bytes, bytearray, memoryview)):
             total += len(value)
         elif isinstance(value, str):
-            total += len(value)
+            total += len(value.encode("utf-8"))
         else:
             total += len(str(value))
     return total

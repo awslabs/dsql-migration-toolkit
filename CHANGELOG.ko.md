@@ -5,6 +5,30 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.434
+
+### 수정 (Fixed)
+
+- **Full Load 데이터 경로 수정 (MySQL·PostgreSQL 소스)** (keyset 리더 + 배치 로더를 실제로 돌린
+  리뷰에서 발견 — 핵심 keyset·배치 적재 계층은 이미 견고·엔진 일관, 아래는 잔여 이슈):
+  - **PostgreSQL `interval`/`jsonb` 기본키: keyset 페이지네이션이 행을 조용히 누락/중복.** keyset
+    `ORDER BY`가 같은 이름의 text-cast SELECT alias(텍스트 순서)로 해석되는데 `WHERE` 경계는
+    네이티브 타입으로 비교 → 순서 불일치로 페이지가 어긋남. 이제 `ORDER BY`가 각 기본키 참조를
+    테이블 정규화해 네이티브 컬럼으로 강제(경계와 일치). 라이브 PostgreSQL 16으로 입증: 구 코드는
+    interval-PK 4행 중 2행만 반환, 수정 후 4행 전부를 정확히 한 번씩 반환.
+  - **PostgreSQL 샤드 "Drop & reload"(REPLACE) 로드가 secondary 인덱스를 전혀 생성 안 함.**
+    멀티프로세스 샤드 경로(PG shared-snapshot)가 빈 타깃을 재생성하면서 인덱스 DDL을 버렸고, 샤드
+    로드는 로드-후 인덱스 패스를 안 돌려서 리더 샤드로 재적재된 대형 PG 테이블이 조용히 인덱스
+    없이 끝났습니다. 이제 테이블의 모든 샤드가 성공한 뒤 bounded `create_indexes` 패스로 1회 생성
+    (비샤드 경로와 동일한 `CREATE INDEX ASYNC`/retry).
+  - **배치 바이트 캡이 멀티바이트 텍스트 과소계산** (CJK/이모지): 배치 크기를 코드포인트 수로
+    추정(UTF-8 바이트 아님)해 텍스트 다량 배치가 DSQL 10 MiB/txn 한도를 초과할 수 있었습니다. 이제
+    UTF-8 바이트로 계산해 한도 아래에서 flush.
+  - **인프로세스 source-drop 재시도가 처음부터 재적재.** 소스 읽기가 raise될 때(로드 중 Aurora
+    페일오버 등) resume watermark가 저장되지 않아 재시도가 이미-커밋된 배치를 다시 씀. 이제 raise
+    경로에서도 완료-프리픽스 watermark를 저장 — 소스 재읽기는 여전히 fail-safe, 중복 재쓰기
+    (OCC/왕복)만 절약.
+
 ## v0.1.433
 
 ### 수정 (Fixed)

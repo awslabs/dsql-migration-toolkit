@@ -5,6 +5,37 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.434
+
+### Fixed
+
+- **Full Load data-path fixes for MySQL and PostgreSQL sources** (found by a review that
+  ran the keyset reader + batched loader; the core keyset + batched-load layers were
+  already sound and engine-consistent — these are residual issues):
+  - **PostgreSQL `interval`/`jsonb` PRIMARY KEY: keyset pagination silently SKIPPED or
+    DUPLICATED rows.** The keyset `ORDER BY` resolved to the same-name text-cast SELECT
+    alias (text order) while the `WHERE` keyset boundary compared the native type — the two
+    orderings disagreed, so pages were mis-ordered. `ORDER BY` now table-qualifies each
+    primary-key reference to force the native column, matching the boundary (proven on a
+    live PostgreSQL 16: the old code returned only 2 of 4 interval-PK rows; the fix returns
+    all, exactly once).
+  - **PostgreSQL sharded "Drop & reload" (REPLACE) loads created NO secondary indexes.**
+    The multiprocess sharded path (PostgreSQL shared-snapshot) recreated the empty target
+    but discarded the index DDLs, and the sharded load never ran the post-load index pass —
+    so a large PG table reloaded across reader shards silently ended up with no secondary
+    indexes. They are now created once, after all of a table's shards succeed, via a bounded
+    `create_indexes` pass (identical `CREATE INDEX ASYNC` / retry behavior to the
+    non-sharded path).
+  - **Batch byte cap under-counted multi-byte text** (CJK / emoji): batch size was estimated
+    in code points, not UTF-8 bytes, so a text-heavy batch could exceed Aurora DSQL's
+    10 MiB/transaction limit. It is now counted as UTF-8 bytes so the batch flushes below the
+    cap.
+  - **In-process source-drop retry re-wrote from the start.** The resume watermark was never
+    persisted when the source read raised (e.g. an Aurora failover mid-load), so a retry
+    re-wrote already-committed batches. The completed-prefix watermark is now persisted even
+    on the raising path — the source re-read still fails safe; only the redundant re-writes
+    (OCC / round-trips) are spared.
+
 ## v0.1.433
 
 ### Fixed

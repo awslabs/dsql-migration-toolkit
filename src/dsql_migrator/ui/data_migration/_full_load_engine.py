@@ -1926,8 +1926,17 @@ def _migrate_tables_in_parallel(
         # empty target WITHOUT re-running the DDL (they derive the same post-load
         # secondary-index DDLs from the applied conversion) -- the same way sharded
         # tables have always been pre-recreated here.
-        table_recreator = _default_table_recreator(migrator._inputs)
+        table_recreator = migrator._table_recreator
         recreated_names: set[str] = set()
+        # A REPLACE table recreated here is EMPTY with NO secondary indexes yet
+        # (recreate_table builds only the base table; indexes are a post-load pass). The
+        # single-process / unsharded paths run that pass inside import_rows, but the
+        # multiprocess SHARDED path loads PK slices across separate processes with NO
+        # index_ddls, so no import_rows call owns the whole table to index it. Capture each
+        # recreated table's secondary-index DDLs here and build them ONCE in the parent after
+        # all of that table's shards succeed (see the shard-success branch below). Without
+        # this, a sharded REPLACE load silently created NO secondary indexes.
+        replace_index_ddls: dict[str, list[str]] = {}
         for wu in work_units:
             tbl = wu[1]
             if tbl.name in recreated_names:
@@ -1937,7 +1946,7 @@ def _migrate_tables_in_parallel(
                 and tbl.name in migrator._inputs.replace_tables
             )
             if is_replace:
-                table_recreator(tbl)
+                replace_index_ddls[tbl.name] = table_recreator(tbl)
                 recreated_names.add(tbl.name)
 
         ctx = multiprocessing.get_context("spawn")
@@ -2124,6 +2133,21 @@ def _migrate_tables_in_parallel(
                             handle.update(lambda job, n=name, r=total_loaded, s=total_skipped,
                                 q=len(all_quarantine):
                                 _complete_chunk(job, n, r, s, q))
+                            # SUCCESS branch ONLY (no shard FAILED/STOPPED): build the
+                            # recreated REPLACE table's secondary indexes ONCE now that every
+                            # shard finished. The shard workers loaded slices with no
+                            # index_ddls, so this is where a sharded REPLACE table gets its
+                            # indexes -- via BatchedImporter.create_indexes, IDENTICAL CREATE
+                            # INDEX ASYNC / OCC / isolation behavior to the non-sharded path.
+                            _shard_index_ddls = replace_index_ddls.get(name)
+                            if _shard_index_ddls:
+                                _idx_importer = migrator._importer_factory(migrator._inputs)
+                                _idx_created, _idx_failures = _idx_importer.create_indexes(
+                                    _shard_index_ddls
+                                )
+                                _record_index_failures(
+                                    error_log, job_id, name, _idx_failures
+                                )
                             _tally(_TableLoadOutcome.QUARANTINED if had_q else _TableLoadOutcome.LOADED)
                     else:
                         # Single-table worker result (same as before).

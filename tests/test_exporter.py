@@ -287,6 +287,93 @@ def test_keyset_stream_paginates_and_advances_until_exhausted() -> None:
     assert page_params[1]["last"] == 4
 
 
+def _interval_pk_table() -> TableDef:
+    # An interval PRIMARY KEY: PostgresSourceDialect reads it via a same-name text
+    # CAST (``CAST("dur" AS text) AS "dur"``), which is exactly the shape that made a
+    # BARE ``ORDER BY "dur"`` resolve to the TEXT output alias (text order) while the
+    # keyset WHERE boundary compared the native interval -> silent skip/dup.
+    return TableDef(
+        name="events",
+        columns=[
+            ColumnDef(name="dur", mysql_type="interval"),
+            ColumnDef(name="label", mysql_type="text"),
+        ],
+        primary_key=["dur"],
+    )
+
+
+def test_keyset_order_by_is_native_table_qualified_for_text_cast_pk() -> None:
+    # FIX 1: the keyset ORDER BY must reference the NATIVE input column (table-qualified
+    # to the FROM item), NOT the same-name text-cast output alias, so it agrees with the
+    # WHERE boundary. A bare ``ORDER BY "dur"`` would bind to the ``CAST(... AS text) AS
+    # "dur"`` output (text order) while WHERE (``"dur" > :last``) compares native interval.
+    from dsql_migrator.core.source_dialect.postgres import PostgresSourceDialect
+
+    rows = [{"dur": i, "label": f"n{i}"} for i in range(1, 4)]
+    connection = _FakeConnection(rows, pk="dur")
+
+    list(keyset_stream(
+        connection, _interval_pk_table(), batch_size=2, dialect=PostgresSourceDialect()
+    ))
+
+    selects = [
+        sql for sql, _ in connection.executed if sql.strip().upper().startswith("SELECT")
+    ]
+    assert selects
+    for sql in selects:
+        # PK is read via the text cast (unchanged), ...
+        assert 'CAST("dur" AS text) AS "dur"' in sql
+        # ... but ORDER BY is table-qualified to the FROM item (native column), ...
+        assert 'ORDER BY "events"."dur"' in sql
+        # ... and the misleading BARE alias form is gone (the regression this locks).
+        assert 'ORDER BY "dur"' not in sql
+    # WHERE still compares the bare (native) column, matching the qualified ORDER BY.
+    assert any('"dur" > :last' in sql for sql in selects)
+
+
+def test_keyset_walk_over_interval_pk_returns_every_row_exactly_once() -> None:
+    # FIX 1 (behavioral): a keyset walk over a text-cast (interval) PRIMARY KEY visits
+    # every row EXACTLY once with no skip/dup across pages/resume. (The exact native-vs-
+    # text ORDER BY divergence is proven live against PostgreSQL 16; here the fake serves
+    # native-ordered pages, so this guards the streaming mechanics for a text-cast PK.)
+    from datetime import timedelta
+
+    from dsql_migrator.core.source_dialect.postgres import PostgresSourceDialect
+
+    # Durations whose native order differs from their text order.
+    durations = [
+        timedelta(minutes=1),
+        timedelta(hours=25),
+        timedelta(days=2),
+        timedelta(days=10),
+    ]
+    rows = [{"dur": d, "label": f"n{i}"} for i, d in enumerate(durations)]
+    connection = _FakeConnection(rows, pk="dur")
+
+    yielded = list(keyset_stream(
+        connection, _interval_pk_table(), batch_size=2, dialect=PostgresSourceDialect()
+    ))
+
+    got = [r["dur"] for r in yielded]
+    assert got == sorted(durations)  # native order, ...
+    assert len(got) == len(set(got)) == len(durations)  # ... every row exactly once.
+
+
+def test_keyset_order_by_is_table_qualified_on_mysql_and_still_walks() -> None:
+    # FIX 1: table-qualifying the ORDER BY is harmless on MySQL -- the emitted SQL uses
+    # ``ORDER BY `customers`.`id``` (still the base column) and the walk is unchanged.
+    rows = [{"id": i, "name": f"n{i}"} for i in range(1, 6)]
+    connection = _FakeConnection(rows)
+
+    yielded = list(keyset_stream(connection, _simple_table(), batch_size=2))
+
+    assert [row["id"] for row in yielded] == [1, 2, 3, 4, 5]
+    selects = [
+        sql for sql, _ in connection.executed if sql.strip().upper().startswith("SELECT")
+    ]
+    assert all("ORDER BY `customers`.`id`" in sql for sql in selects)
+
+
 def test_keyset_stream_logs_pk_range_per_page_at_debug(caplog) -> None:
     import logging
 

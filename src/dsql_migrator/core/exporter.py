@@ -755,7 +755,20 @@ def keyset_stream(
         dialect.select_column_sql(column) for column in table.columns
     )
     table_sql = dialect.quote_table(table.name)
-    order_by_sql = ", ".join(dialect.quote_identifier(c) for c in pk_columns)
+    # Table-QUALIFY each PK reference in ORDER BY so it resolves to the NATIVE input
+    # column, never a same-name SELECT output alias. PostgreSQL resolves a bare
+    # ``ORDER BY "col"`` to the matching OUTPUT column, so a text-cast PK (json/jsonb/
+    # interval are read as ``CAST("col" AS text) AS "col"``) would sort by TEXT order
+    # while the keyset WHERE boundary (``"col" > :last``) compares the NATIVE type -- the
+    # two orderings disagree and gapless pagination then SILENTLY skips or duplicates rows
+    # across pages/resume (e.g. an interval PK where text order != interval order).
+    # Qualifying with the FROM item (``<table>."col"``, matching ``table_sql`` above)
+    # forces the base column, matching WHERE. Harmless for non-cast columns and valid on
+    # MySQL (``ORDER BY `t`.`col```), which likewise then sorts by the base column rather
+    # than any output alias.
+    order_by_sql = ", ".join(
+        f"{table_sql}.{dialect.quote_identifier(c)}" for c in pk_columns
+    )
 
     # Optional range bound on the LEADING PK column (reader sharding). Applies to a
     # single OR composite key: for a composite key it bands the leading (index-prefix)

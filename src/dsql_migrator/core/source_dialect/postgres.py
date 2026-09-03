@@ -459,8 +459,13 @@ class PostgresSourceDialect(SourceDialect):
         # Full Load streams their EXACT text and binds it back to the identical target
         # column as an unknown-typed literal (oid 0), which the server re-parses --
         # faithful AND fast (see _reads_as_text for why the native psycopg round trip is
-        # lossy/parse-heavy for these). json/jsonb can't be a PK and an interval PK still
-        # paginates correctly (the text boundary is cast back to interval for `> :last`).
+        # lossy/parse-heavy for these). json/jsonb can't be a PK; an interval PK reads as
+        # this same-name text CAST, and the keyset WHERE boundary rebinds fine (``"col" >
+        # :last`` coerces the text `:last` back to interval), but gapless pagination ALSO
+        # requires the exporter's ORDER BY to reference the NATIVE column -- a bare
+        # ``ORDER BY "col"`` would resolve to THIS text-cast output alias and sort by text
+        # order while WHERE advances by native interval, so the exporter table-qualifies
+        # the PK in ORDER BY (see keyset_stream) to keep both orderings native and gapless.
         # PostGIS geometry is out of scope (no ST_AsBinary-style case) for a first release.
         quoted = self.quote_identifier(column.name)  # type: ignore[attr-defined]
         if _reads_as_text(column.mysql_type):  # type: ignore[attr-defined]
