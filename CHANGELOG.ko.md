@@ -5,6 +5,21 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.438
+
+### 수정 (Fixed)
+
+- **회귀: DSQL 타깃 연결이 아예 실패 (`lc_numeric` 미지원).** v0.1.435에서 Validation 체크섬의
+  소수점을 로케일 독립적으로 만들기 위해 Aurora DSQL 연결의 startup 옵션에 `-c lc_numeric=C`를
+  추가했으나, **DSQL은 `lc_numeric`을 startup/세션 파라미터로 거부**합니다
+  (`FATAL: setting configuration parameter "lc_numeric" not supported`). 그래서 라이브
+  클러스터에 대해 도구의 *모든* DSQL 연결이 실패했습니다 — Test target connection, Full Load,
+  Validation, Cut over 전부. 유닛 스위트는 인메모리 DSQL 더블이 연결 옵션을 검증하지 않아 놓쳤고,
+  라이브 연결 E2E 프로브로 발견했습니다. 이제 해당 옵션을 제거했습니다(TimeZone / DateStyle /
+  IntervalStyle은 유지 — DSQL이 수용, 라이브 검증). 또한 불필요했습니다: 체크섬의 숫자 마스크가 이미
+  리터럴 `.`을 사용(`to_char`의 로케일 인식 `D`가 아님)하므로 소스와 타깃이 소수점에서 일치합니다.
+  PostgreSQL *소스* 연결은 계속 `lc_numeric=C`를 고정합니다(실제 PostgreSQL은 지원).
+
 ## v0.1.437
 
 ### 수정 (Fixed)

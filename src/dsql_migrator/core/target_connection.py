@@ -298,24 +298,24 @@ class DsqlConnector:
             password=token.reveal(),
             sslmode="require",
             autocommit=True,
-            # Pin the four output-formatting GUCs that Validation's checksum render
-            # depends on, so a byte-identical value renders identically regardless of any
-            # role/cluster default: TimeZone (to_char(... AT TIME ZONE 'UTC') / to_char(...)
-            # for DATETIME->timestamp), DateStyle + IntervalStyle (DATE / INTERVAL via
-            # col::text), and lc_numeric (the numeric to_char decimal point). The PostgreSQL
-            # SOURCE pins exactly these (source_dialect/postgres.py), and the DSQL target's
-            # documented defaults ARE these -- but relying on an unpinned default is fragile
-            # (a de_DE lc_numeric would render '3,14' vs the source's '3.14' -> a false
-            # checksum MISMATCH), so pin them explicitly. These are the SINGLE shared DSQL
-            # connection (loader + DDL apply + validator + query playground + prereq probe),
-            # and pinning is zero-risk to the load/apply paths: INSERTs bind typed psycopg
-            # params (not locale-formatted text) and DDL is not locale-sensitive -- these
-            # GUCs only affect OUTPUT text formatting. (The checksum's numeric mask now uses
-            # a literal '.' too, so lc_numeric is belt-and-suspenders there.)
-            options=(
-                "-c TimeZone=UTC -c DateStyle=ISO -c IntervalStyle=postgres "
-                "-c lc_numeric=C"
-            ),
+            # Pin the output-formatting GUCs that Validation's checksum render depends on,
+            # so a byte-identical value renders identically regardless of any role/cluster
+            # default: TimeZone (to_char(... AT TIME ZONE 'UTC') / to_char(...) for
+            # DATETIME->timestamp), DateStyle + IntervalStyle (DATE / INTERVAL via col::text).
+            # The PostgreSQL SOURCE pins exactly these (source_dialect/postgres.py), and the
+            # DSQL target's documented defaults ARE these -- but relying on an unpinned default
+            # is fragile, so pin them explicitly. These are the SINGLE shared DSQL connection
+            # (loader + DDL apply + validator + query playground + prereq probe), and pinning is
+            # zero-risk to the load/apply paths: INSERTs bind typed psycopg params (not
+            # locale-formatted text) and DDL is not locale-sensitive -- these GUCs only affect
+            # OUTPUT text formatting.
+            #
+            # NOTE: we deliberately do NOT pin lc_numeric here. Aurora DSQL REJECTS it as a
+            # startup/session GUC ("FATAL: setting configuration parameter \"lc_numeric\" not
+            # supported"), so passing it makes EVERY DSQL connection fail (live-verified). It is
+            # also unnecessary: the checksum's numeric mask uses a literal '.' (not to_char's
+            # locale-aware 'D'), so source and target agree on the decimal point without it.
+            options="-c TimeZone=UTC -c DateStyle=ISO -c IntervalStyle=postgres",
             # Bound the TCP connect so an unreachable endpoint (wrong host, VPC the
             # tool can't egress to, security-group filtered) fails fast instead of
             # blocking the UI "Test connection" / prerequisite probe indefinitely on

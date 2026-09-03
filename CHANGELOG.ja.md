@@ -5,6 +5,22 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.438
+
+### 修正 (Fixed)
+
+- **リグレッション:DSQL ターゲット接続が完全に失敗(`lc_numeric` 非対応)。** v0.1.435 で
+  Validation チェックサムの小数点をロケール非依存にするため、Aurora DSQL 接続の startup
+  オプションに `-c lc_numeric=C` を追加しましたが、**DSQL は `lc_numeric` を startup/セッション
+  パラメータとして拒否します**(`FATAL: setting configuration parameter "lc_numeric" not
+  supported`)。そのため稼働中クラスタに対しツールの*すべての* DSQL 接続が失敗しました — Test
+  target connection、Full Load、Validation、Cut over すべて。ユニットスイートはインメモリの DSQL
+  ダブルが接続オプションを検証しないため見逃し、ライブ接続 E2E プローブで発見しました。当該
+  オプションを削除しました(TimeZone / DateStyle / IntervalStyle は維持 — DSQL は受け入れ、ライブ
+  検証済み)。また不要でもありました:チェックサムの数値マスクは既にリテラル `.` を使用(`to_char`
+  のロケール依存 `D` ではない)しており、ソースとターゲットは小数点で一致します。PostgreSQL
+  *ソース*接続は引き続き `lc_numeric=C` を固定します(実際の PostgreSQL は対応)。
+
 ## v0.1.437
 
 ### 修正 (Fixed)

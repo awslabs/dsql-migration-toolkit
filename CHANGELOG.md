@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.438
+
+### Fixed
+
+- **Regression: the DSQL target connection failed outright (`lc_numeric` not supported).**
+  v0.1.435 added `-c lc_numeric=C` to the Aurora DSQL connection's startup options to make
+  the Validation checksum's decimal point locale-independent. But **DSQL rejects `lc_numeric`
+  as a startup/session parameter** (`FATAL: setting configuration parameter "lc_numeric" not
+  supported`), so *every* DSQL connection through the tool failed — Test target connection,
+  Full Load, Validation, and Cut over all broke against a live cluster. The unit suite missed
+  it because those tests use an in-memory DSQL double that doesn't validate connection
+  options; caught by a live-connectivity E2E probe. The option is now removed (TimeZone /
+  DateStyle / IntervalStyle are still pinned — DSQL accepts those, live-verified). It was also
+  unnecessary: the checksum's numeric mask already uses a literal `.` (not `to_char`'s
+  locale-aware `D`), so source and target agree on the decimal point without it. The
+  PostgreSQL *source* connection still pins `lc_numeric=C` (real PostgreSQL supports it).
+
 ## v0.1.437
 
 ### Fixed
