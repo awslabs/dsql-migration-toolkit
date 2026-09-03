@@ -298,14 +298,24 @@ class DsqlConnector:
             password=token.reveal(),
             sslmode="require",
             autocommit=True,
-            # Pin the session TimeZone to UTC. Validation renders a DATETIME->timestamp
-            # column with to_char(... AT TIME ZONE 'UTC') / to_char(...), both of which
-            # depend on the session TimeZone; the source side is TZ-independent, so an
-            # unpinned non-UTC default here would make EVERY datetime column false-
-            # mismatch. DSQL's default happens to be UTC, but relying on an undocumented
-            # default is fragile -- pin it (mirrors the source introspector's
-            # SET time_zone='+00:00').
-            options="-c TimeZone=UTC",
+            # Pin the four output-formatting GUCs that Validation's checksum render
+            # depends on, so a byte-identical value renders identically regardless of any
+            # role/cluster default: TimeZone (to_char(... AT TIME ZONE 'UTC') / to_char(...)
+            # for DATETIME->timestamp), DateStyle + IntervalStyle (DATE / INTERVAL via
+            # col::text), and lc_numeric (the numeric to_char decimal point). The PostgreSQL
+            # SOURCE pins exactly these (source_dialect/postgres.py), and the DSQL target's
+            # documented defaults ARE these -- but relying on an unpinned default is fragile
+            # (a de_DE lc_numeric would render '3,14' vs the source's '3.14' -> a false
+            # checksum MISMATCH), so pin them explicitly. These are the SINGLE shared DSQL
+            # connection (loader + DDL apply + validator + query playground + prereq probe),
+            # and pinning is zero-risk to the load/apply paths: INSERTs bind typed psycopg
+            # params (not locale-formatted text) and DDL is not locale-sensitive -- these
+            # GUCs only affect OUTPUT text formatting. (The checksum's numeric mask now uses
+            # a literal '.' too, so lc_numeric is belt-and-suspenders there.)
+            options=(
+                "-c TimeZone=UTC -c DateStyle=ISO -c IntervalStyle=postgres "
+                "-c lc_numeric=C"
+            ),
             # Bound the TCP connect so an unreachable endpoint (wrong host, VPC the
             # tool can't egress to, security-group filtered) fails fast instead of
             # blocking the UI "Test connection" / prerequisite probe indefinitely on

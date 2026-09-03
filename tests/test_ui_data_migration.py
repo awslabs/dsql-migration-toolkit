@@ -2526,11 +2526,24 @@ def _fk_conv(*, foreign_key_ddls: list[str]):
 class _FkProbeCursor:
     def __init__(self, orphans: int) -> None:
         self.orphans = orphans
+        self._statement = None
 
-    def execute(self, statement) -> None:  # noqa: ANN001 - fake
+    def execute(self, statement, parameters=None) -> None:  # noqa: ANN001 - fake
         self._statement = statement
 
     def fetchone(self):
+        text = (
+            self._statement
+            if isinstance(self._statement, str)
+            else self._statement.as_string(None)
+            if self._statement is not None
+            else ""
+        )
+        # The keyset-PAGED orphan count returns (orphan_sub_count, last_pk, row_count):
+        # put the whole count on the FIRST page and signal "last page" with row_count 0
+        # (< page size) so the pager stops. The single-scan orphan count returns a scalar.
+        if "array_agg" in text:
+            return (self.orphans, None, 0)
         return (self.orphans,)
 
     def close(self) -> None:

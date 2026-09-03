@@ -5,6 +5,40 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.435
+
+### Fixed
+
+- **Validation (Step 4) fixes for MySQL and PostgreSQL sources** (found by a review that
+  reproduced the checksum/count/reconcile/orphan SQL on live PostgreSQL 16; the checksum
+  value-rendering parity and orphan MATCH-SIMPLE semantics were already sound and
+  engine-consistent):
+  - **A row-count-only run where record reconciliation was requested but applied to NO
+    table no longer reads as a clean, record-verified pass.** Reconciliation only runs on a
+    single-column integer PK; an all-UUID / all-composite-PK schema (common on PostgreSQL)
+    skipped it for every table, yet the report said "reconciliation was turned off" and the
+    cut-over verdict stayed green — so in the default row-count mode a
+    same-count-but-different-rows divergence was a **silent false match** that could release
+    cut over. The run now distinguishes "off" / "ran" / "requested but inapplicable for
+    all", and in row-count mode the last case downgrades the verdict to a warning ("row
+    counts match, but records are unverified — re-run in CHECKSUM mode"). CHECKSUM mode
+    stays green (it value-compares every row) with an honest caveat.
+  - **The orphan / FK-integrity pre-gate is now keyset-paged** for a single-column-PK child
+    (like COUNT/checksum), so a billion-row child no longer risks the ~300s single-
+    transaction limit; the unbounded single scan remains only as the composite/missing-PK
+    fallback. The paged count filters the orphan predicate while paging over the full PK
+    window, so the boundary advances over non-orphan rows too (verified on live PG16).
+  - **The downloadable text report no longer over-claims "Data identical" in row-count
+    mode** (the default) — it says "Row counts match" and reserves "Data identical" for
+    CHECKSUM mode, matching the UI; it also footnotes tables that ran but could not be
+    reconciled.
+  - **Checksum numeric rendering is now locale-independent** — the `to_char` mask used a
+    locale-sensitive decimal point (`D`), a latent false-mismatch if the DSQL connection's
+    `lc_numeric` ever differed from the source; it now uses a literal `.`. The DSQL target
+    connection also pins `DateStyle`/`IntervalStyle`/`lc_numeric` (not just `TimeZone`),
+    matching the source, so DATE/INTERVAL/NUMERIC checksum text renders identically
+    regardless of any role/engine default.
+
 ## v0.1.434
 
 ### Fixed

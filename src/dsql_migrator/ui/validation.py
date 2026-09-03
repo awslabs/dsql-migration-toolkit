@@ -502,6 +502,28 @@ class ValidationSummary:
     # as "every column EXCEPT these", not "every column verified" (a non-key value diff
     # confined to such a column is undetected by any mode). Empty outside CHECKSUM mode.
     checksum_excluded_columns: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # Whether the run REQUESTED record-level reconciliation (regardless of eligibility).
+    # Distinguishes "turned off" from "requested but no eligible table" so the latter is
+    # never presented as a clean pass -- in the DEFAULT ROW_COUNT mode a same-count-but-
+    # different-rows divergence would otherwise release cut over as a silent false MATCH.
+    reconcile_requested: bool = False
+    # Tables reconciliation was REQUESTED for but could NOT cover (composite/non-integer
+    # PK), compared by count/checksum only (== ``reconcile_skipped_tables(report)``).
+    reconcile_inapplicable_tables: tuple[str, ...] = ()
+
+    @property
+    def reconcile_inapplicable_for_all(self) -> bool:
+        """Reconciliation was requested but NO table was eligible (all inapplicable).
+
+        The dangerous state: record-level verification could not run for a single table,
+        so a row-count match does NOT prove the record sets match. Callers use this to
+        keep such a run from reading as a clean, record-verified pass.
+        """
+        return (
+            self.reconcile_requested
+            and self.reconciled_tables == 0
+            and bool(self.reconcile_inapplicable_tables)
+        )
 
     @property
     def unexplained_mismatched_tables(self) -> int:
@@ -606,6 +628,8 @@ def summarize_validation(report: ValidationReport) -> ValidationSummary:
             for item in report.items
             if item.checksum_excluded_columns
         },
+        reconcile_requested=_reconcile_was_requested(report),
+        reconcile_inapplicable_tables=reconcile_skipped_tables(report),
     )
 
 
@@ -643,19 +667,33 @@ def failed_table_names(report: ValidationReport) -> tuple[str, ...]:
     )
 
 
-def reconcile_skipped_tables(report: ValidationReport) -> tuple[str, ...]:
-    """Return tables that were NOT record-reconciled while reconciliation ran.
+def _reconcile_was_requested(report: ValidationReport) -> bool:
+    """Whether the run asked for record-level reconciliation.
 
-    When the reconciliation pass ran, a table with no :class:`ReconcileResult`
-    (and no error) was skipped because its primary key is composite/non-integer,
-    so it was compared by count/checksum only. Fast-sweep "verified by count"
-    tables are EXCLUDED here (they have their own honest label via
-    :func:`count_verified_tables`) so the composite-PK footnote stays accurate.
-    Empty when reconciliation was off (then no per-table reconcile is expected) --
-    the UI explains the global off state separately.
+    Prefers the explicit ``reconcile_requested`` flag (set by the validator), falling
+    back to "at least one table reconciled" for a legacy report written before the flag
+    existed. The fallback matters because ``report_run_options`` / a re-hydrated snapshot
+    must still recover the right answer.
     """
-    any_reconciled = any(item.reconcile is not None for item in report.items)
-    if not any_reconciled:
+    return report.reconcile_requested or any(
+        item.reconcile is not None for item in report.items
+    )
+
+
+def reconcile_skipped_tables(report: ValidationReport) -> tuple[str, ...]:
+    """Return tables that reconciliation was REQUESTED for but could not cover.
+
+    When reconciliation was requested, a table with no :class:`ReconcileResult` (and no
+    error, not a fast-sweep count-verified skip) was skipped because its primary key is
+    composite/non-integer, so it was compared by count/checksum only. This now fires even
+    when ZERO tables reconciled (e.g. an all-UUID/composite-PK schema): the earlier
+    ``if not any_reconciled: return ()`` short-circuit hid exactly that case, so an
+    all-inapplicable run was misreported as "reconciliation turned off". Fast-sweep
+    "verified by count" tables are EXCLUDED here (they have their own honest label via
+    :func:`count_verified_tables`). Empty when reconciliation was not requested -- the UI
+    explains the global off state separately.
+    """
+    if not _reconcile_was_requested(report):
         return ()
     return tuple(
         item.table
@@ -778,6 +816,9 @@ def merge_revalidated(
         orphan_check_performed=report.orphan_check_performed,
         drift=report.drift,
         snapshot_timestamp=report.snapshot_timestamp,
+        # Carry the run's reconcile-requested state so the merged report keeps
+        # distinguishing "requested but no eligible table" from "turned off".
+        reconcile_requested=report.reconcile_requested,
     )
 
 
@@ -805,14 +846,15 @@ def report_run_options(report: ValidationReport) -> RunOptions:
     - a restored report (re-hydrated from a session snapshot) has no remembered
       options at all, yet must still be re-checkable.
 
-    ``reconcile`` is taken as "at least one item carries a reconciliation result",
-    which is exactly the ``reconcile_performed`` claim :func:`summarize_validation`
-    already makes about the report -- so a re-check reproduces the checks the UI
-    says the report contains, keeping the merged report self-consistent.
+    ``reconcile`` is taken from the report's ``reconcile_requested`` flag (falling back to
+    "at least one item carries a reconciliation result" for a legacy report) -- so a
+    re-check reproduces the checks the run requested, even when zero tables were eligible
+    (an all-composite/UUID-PK run requested reconciliation but reconciled nothing, and a
+    re-check must still request it to stay self-consistent).
     """
     return RunOptions(
         mode=report.mode,
-        reconcile=any(item.reconcile is not None for item in report.items),
+        reconcile=_reconcile_was_requested(report),
         check_orphans=report.orphan_check_performed,
     )
 
@@ -2641,6 +2683,7 @@ def _run_cutover_foreign_keys(
         from dsql_migrator.core.target_connection import DsqlConnector
         from dsql_migrator.ui.data_migration._full_load_engine import (
             apply_preserved_foreign_keys,
+            child_pk_columns_for,
         )
         from dsql_migrator.ui.schema_conversion import applied_table_conversions
 
@@ -2655,7 +2698,9 @@ def _run_cutover_foreign_keys(
             preserve_foreign_keys=conv_state.preserve_foreign_keys,
         )
         connect = DsqlConnector(target_config, aws_profile=aws_profile).connect
-        result = apply_preserved_foreign_keys(applied, connect)
+        result = apply_preserved_foreign_keys(
+            applied, connect, child_pk_columns=child_pk_columns_for(inventory)
+        )
         validation_state.set_cutover_fk_apply(result)
         if refresh is not None:
             refresh()
@@ -3795,12 +3840,44 @@ def _render_verdict(
     (:func:`_render_recovery_section`), not part of the verdict.
     """
     if summary.ready_for_cutover:
+        _is_checksum = str(summary.mode).upper().endswith("CHECKSUM")
+        # Reconciliation was REQUESTED but no table was eligible (all composite/non-integer
+        # PK). In ROW_COUNT mode the record sets are UNVERIFIED -- a same-count-but-
+        # different-rows divergence is undetected -- so this must NOT read as a clean green
+        # "Ready" pass that releases cut over. CHECKSUM mode is safe (it value-compared
+        # every row, catching missing/extra), so it stays green with an honest caveat.
+        if summary.reconcile_inapplicable_for_all and not _is_checksum:
+            render_notice(
+                ui,
+                tone="warning",
+                header="Row counts match, but records are unverified",
+                body=(
+                    f"All {summary.total_tables} table(s) have matching row counts as-of "
+                    f"{summary.as_of}, but record-level reconciliation could not run for "
+                    "any table (none has a single-column integer primary key). A row-count "
+                    "match does NOT prove the record sets match -- a same-count-but-"
+                    "different-rows divergence would go undetected. Re-run in CHECKSUM mode "
+                    "(it value-compares every row) or verify the records another way before "
+                    "cutting over. Reconcile inapplicable for all "
+                    f"{len(summary.reconcile_inapplicable_tables)} table(s): "
+                    f"{', '.join(summary.reconcile_inapplicable_tables)}."
+                ),
+            )
+            return
         body = (
             f"All {summary.total_tables} table(s) match and no issues were found. "
             f"Source and target are consistent as-of {summary.as_of}."
         )
         caveats: list[str] = []
-        if not summary.reconcile_performed:
+        if summary.reconcile_inapplicable_for_all:
+            # CHECKSUM mode reached here: the checksum value-compared every row (so
+            # missing/extra rows change the sum and are caught), but PK-set reconciliation
+            # itself could not run. Say so plainly rather than claiming it was "off".
+            caveats.append(
+                "record-level PK reconciliation could not run (no single integer "
+                "primary key), but CHECKSUM mode value-compared every row"
+            )
+        elif not summary.reconcile_performed:
             caveats.append(
                 "record-level reconciliation was off, so this is a "
                 "count/checksum match only"
@@ -4377,7 +4454,15 @@ def _render_readiness_checks(
         warn_on_fail=fully_explained,
     )
 
-    # Check 2: no mismatched records (only meaningful when reconciliation ran).
+    # Check 2: no mismatched records. Four distinct states:
+    #   * reconciliation RAN (>=1 table) -> the real missing/extra verdict;
+    #   * REQUESTED but NO table eligible, ROW_COUNT mode -> a warning, NOT a clean pass:
+    #     a same-count-but-different-rows divergence is undetected, so a row-count match
+    #     does not prove the record sets match (never say "turned off");
+    #   * REQUESTED but NO table eligible, CHECKSUM mode -> a neutral note: PK-set
+    #     reconciliation itself did not run, but the checksum value-compared every row (so
+    #     a missing/extra row changes the sum and IS caught) -> the records are covered;
+    #   * genuinely OFF (not requested) -> the quiet "turned off" note.
     if summary.reconcile_performed:
         _render_check_row(
             ui,
@@ -4390,6 +4475,33 @@ def _render_readiness_checks(
                 + explained_note
             ),
             warn_on_fail=fully_explained,
+        )
+    elif summary.reconcile_inapplicable_for_all and not _is_checksum_mode:
+        _render_check_row(
+            ui,
+            passed=False,
+            label="No missing or extra records",
+            detail=(
+                "Record-level reconciliation could not run for any table: none has a "
+                "single-column integer primary key, so a row-count match does NOT prove "
+                "the record sets match. Re-run in CHECKSUM mode (it value-compares every "
+                "row) or verify these tables' records another way before cut-over. "
+                f"Reconcile inapplicable for all {len(summary.reconcile_inapplicable_tables)} "
+                f"table(s): {', '.join(summary.reconcile_inapplicable_tables)}."
+            ),
+            warn_on_fail=True,
+        )
+    elif summary.reconcile_inapplicable_for_all:
+        _render_check_row(
+            ui,
+            passed=True,
+            label="No missing or extra records",
+            detail=(
+                "Record-level PK reconciliation could not run (no single integer primary "
+                "key), but CHECKSUM mode value-compared every row, so a missing or extra "
+                "record would change the checksum and be caught."
+            ),
+            neutral=True,
         )
     else:
         _render_check_row(

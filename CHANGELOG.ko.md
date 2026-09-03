@@ -5,6 +5,33 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.435
+
+### 수정 (Fixed)
+
+- **Validation(Step 4) 수정 (MySQL·PostgreSQL 소스)** (체크섬/count/reconcile/orphan SQL을 라이브
+  PostgreSQL 16에서 재현한 리뷰에서 발견 — 체크섬 값 렌더링 패리티와 orphan MATCH-SIMPLE 시맨틱은
+  이미 견고·엔진 일관):
+  - **record reconcile가 요청됐지만 어느 테이블에도 적용되지 못한 row-count 런이 더 이상 "레코드
+    검증된 clean pass"로 오보되지 않음.** reconcile은 단일-정수 PK에서만 실행되는데, all-UUID/
+    all-복합-PK 스키마(PG에서 흔함)는 모든 테이블에서 스킵되면서도 리포트가 "reconciliation turned
+    off"로 표기하고 cut-over 판정이 초록이라, 기본 row-count 모드에서 count 같고 행 다른 발산이
+    **조용한 false match**로 컷오버를 허용할 수 있었습니다. 이제 "off"/"실행됨"/"요청됐으나 전부
+    부적격"을 구분하고, row-count 모드에서 마지막 경우는 판정을 경고로 강등("row count는 맞지만
+    레코드 미검증 — CHECKSUM 모드로 재실행"). CHECKSUM 모드는 매 행을 값 비교하므로 정직한 caveat와
+    함께 초록 유지.
+  - **orphan/FK 프리게이트가 이제 단일-정수-PK 자식에 대해 keyset 페이징**(COUNT/checksum처럼) →
+    대규모 자식에서 ~300s 단일 트랜잭션 한도 위험 제거; 무경계 단일 스캔은 복합/누락 PK fallback으로만
+    유지. 페이지 카운트는 전체 PK 윈도우를 돌면서 orphan 술어를 FILTER로 적용해 경계가 non-orphan
+    행 위로도 전진(라이브 PG16 검증).
+  - **다운로드 텍스트 리포트가 row-count 모드(기본)에서 "Data identical" 과잉 주장 안 함** — "Row
+    counts match"로 표기하고 "Data identical"은 CHECKSUM 모드 전용(UI와 일치); reconcile 못 한
+    테이블도 각주로 공개.
+  - **체크섬 numeric 렌더링이 locale 독립** — `to_char` 마스크가 locale 민감한 소수점(`D`)을 써서
+    DSQL 연결의 `lc_numeric`이 소스와 다르면 잠재 false-mismatch였는데, 이제 리터럴 `.` 사용. DSQL
+    타깃 연결도 `DateStyle`/`IntervalStyle`/`lc_numeric`을 (TimeZone뿐 아니라) 소스와 동일하게 pin해
+    DATE/INTERVAL/NUMERIC 체크섬 텍스트가 role/엔진 기본값과 무관하게 동일 렌더.
+
 ## v0.1.434
 
 ### 수정 (Fixed)

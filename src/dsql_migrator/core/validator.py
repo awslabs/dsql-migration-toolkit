@@ -136,6 +136,8 @@ from dsql_migrator.core.validation_sql import (  # noqa: F401
     build_mysql_pk_token_sql,
     build_orphan_count_sql,
     build_pg_checksum_sql,
+    build_pg_orphan_page_first_sql,
+    build_pg_orphan_page_next_sql,
     build_pg_page_checksum_first_sql,
     build_pg_page_checksum_next_sql,
     build_pg_pk_first_page_sql,
@@ -873,10 +875,66 @@ def reconcile_pk_streams(
     )
 
 
-def _target_orphan_count(connection: Any, child_table: str, fk: ForeignKeyDef) -> int:
-    """Return the number of orphan child rows for ``fk`` on the target."""
-    value = _target_scalar(connection, build_orphan_count_sql(child_table, fk))
+def _target_orphan_count(
+    connection: Any, table: TableDef, fk: ForeignKeyDef, page_size: int
+) -> int:
+    """Return the number of orphan child rows for ``fk`` on the target.
+
+    For a single-column-PK child the count is accumulated over BOUNDED keyset pages
+    (:func:`_target_orphan_count_keyset`) so a billion-row child never runs the orphan
+    scan in one transaction -- a single unbounded ``COUNT(*) ... NOT EXISTS`` would exceed
+    Aurora DSQL's hard 300s transaction limit, exactly the failure mode the count/checksum
+    keyset pagers already avoid. A composite/missing PK falls back to the single scan
+    (:func:`build_orphan_count_sql`), a documented residual like :func:`_target_count`.
+    """
+    pk_column = single_pk_column(table)
+    if pk_column is not None:
+        return _target_orphan_count_keyset(
+            connection, table.name, fk, pk_column, page_size
+        )
+    value = _target_scalar(connection, build_orphan_count_sql(table.name, fk))
     return int(value) if value is not None else 0
+
+
+def _target_orphan_count_keyset(
+    connection: Any,
+    child_table: str,
+    fk: ForeignKeyDef,
+    pk_column: str,
+    page_size: int,
+) -> int:
+    """Accumulate the orphan count over bounded keyset pages (single-column PK).
+
+    The orphan counterpart of :func:`_target_count_keyset` / :func:`_target_checksum_keyset`:
+    each ``page_size``-row page reports ``(orphan_sub_count, last_pk, row_count)`` where
+    the sub-count is a ``COUNT(*) FILTER`` over the orphan predicate but the page window
+    itself is UNFILTERED, so ``last_pk`` (the window's max PK) advances the keyset over
+    non-orphan rows too and no PK range is skipped. Sub-counts fold into a Python integer;
+    the loop stops when a page returns fewer than ``page_size`` rows. Bounded per page, so
+    it stays well under DSQL's 300s limit; a connection aged out at ~1h is handled by the
+    reconnecting proxy wrapping ``connection`` (the page replays from ``WHERE pk > :last``).
+    """
+    first_sql = build_pg_orphan_page_first_sql(child_table, fk, pk_column, page_size)
+    next_sql = build_pg_orphan_page_next_sql(child_table, fk, pk_column, page_size)
+    total = 0
+    last: object = None
+    while True:
+        cursor = connection.cursor()
+        try:
+            if last is None:
+                cursor.execute(first_sql)
+            else:
+                cursor.execute(next_sql, {"last": last})
+            row = cursor.fetchone()
+        finally:
+            _safe_close(cursor)
+        if row is None:
+            return total
+        sub_count, last_pk, count = row[0], row[1], row[2]
+        total += int(sub_count) if sub_count is not None else 0
+        if count is None or int(count) < page_size:
+            return total
+        last = last_pk
 
 
 # ---------------------------------------------------------------------------
@@ -1124,6 +1182,7 @@ class Validator:
                 orphan_check_performed=check_orphans,
                 drift=drift,
                 snapshot_timestamp=snapshot_timestamp,
+                reconcile_requested=reconcile,
             ),
             quarantined_by_table,
         )
@@ -1216,6 +1275,7 @@ class Validator:
             orphan_check_performed=check_orphans,
             drift=drift,
             snapshot_timestamp=snapshot_timestamp,
+            reconcile_requested=reconcile,
         )
 
     def _validate_one_table_isolated(
@@ -1488,6 +1548,11 @@ class Validator:
             matched=matched,
             row_diff_sample=row_diff_sample,
             reconcile=reconcile_result,
+            # Record whether record-level reconciliation COULD run for this table (a
+            # single integer PK), independent of whether it actually did. When
+            # reconciliation was requested but this is False for every table, a
+            # row-count match must not be released as a clean, record-verified pass.
+            reconcile_applicable=integer_pk_column(table) is not None,
             deep_checks_skipped=not run_deep,
         )
 
@@ -1518,18 +1583,21 @@ class Validator:
             source_dialect, source_connection, table, page_size
         )
 
-    @staticmethod
     def _check_orphans(
-        target_connection: Any, table: TableDef
+        self, target_connection: Any, table: TableDef
     ) -> list[OrphanFinding]:
         """Check each preserved foreign key on ``table`` for orphan child rows.
 
         Returns one :class:`OrphanFinding` per foreign key that has at least one
-        orphan on the target (clean keys produce no finding).
+        orphan on the target (clean keys produce no finding). Each FK is counted over
+        the SAME bounded keyset paging the count/checksum use (single-column-PK child),
+        so a large child never runs the orphan scan past DSQL's 300s transaction limit.
         """
         findings: list[OrphanFinding] = []
         for fk in table.foreign_keys:
-            orphan_count = _target_orphan_count(target_connection, table.name, fk)
+            orphan_count = _target_orphan_count(
+                target_connection, table, fk, self._reconcile_page_size
+            )
             if orphan_count > 0:
                 findings.append(
                     OrphanFinding(
@@ -1823,8 +1891,15 @@ def render_text_report(report: ValidationReport) -> str:
     reconciled = [item for item in report.items if item.reconcile is not None]
     inconsistent = [item for item in reconciled if not item.reconcile.consistent]  # type: ignore[union-attr]
     lines.append("Cut-over readiness:")
+    # The data-match LABEL is mode-aware: ROW_COUNT mode never reads non-PK column
+    # VALUES, so "Data identical" would overstate what was verified -- it is "Row counts
+    # match". Only CHECKSUM mode value-compares, so only it earns "Data identical". (The
+    # NiceGUI readiness panel already draws this distinction; the downloadable text report
+    # used to print "Data identical" unconditionally.)
+    is_checksum = report.mode is ValidationMode.CHECKSUM
+    match_label = "Data identical" if is_checksum else "Row counts match"
     lines.append(
-        f"- Data identical: {'yes' if report.is_match else 'NO'} "
+        f"- {match_label}: {'yes' if report.is_match else 'NO'} "
         f"({sum(1 for i in report.items if i.matched)}/{len(report.items)} tables matched)"
     )
     # Honesty caveat (Property 9): FLOAT/DOUBLE and JSON columns have no byte-identical
@@ -1844,12 +1919,47 @@ def render_text_report(report: ValidationReport) -> str:
             "- Columns NOT value-compared (FLOAT/DOUBLE/JSON -- no cross-engine form, "
             f"a non-key value diff there is undetected): {detail}"
         )
+    # Tables that reconciliation was REQUESTED for but could not cover (composite /
+    # non-integer PK, not errored, not fast-sweep-skipped): compared by count/checksum
+    # only. Computed INLINE here -- core must not import the UI's ``reconcile_skipped_
+    # tables`` helper (that would invert the ui->core dependency); this mirrors its logic.
+    reconcile_requested = report.reconcile_requested or bool(reconciled)
+    reconcile_skipped = (
+        [
+            item.table
+            for item in report.items
+            if item.reconcile is None
+            and item.error is None
+            and not item.deep_checks_skipped
+        ]
+        if reconcile_requested
+        else []
+    )
+    compared_by = "count and checksum" if is_checksum else "row count only"
     if reconciled:
         total_missing = sum(i.reconcile.missing_on_target for i in reconciled)  # type: ignore[union-attr]
         total_extra = sum(i.reconcile.extra_on_target for i in reconciled)  # type: ignore[union-attr]
         lines.append(
             f"- No missing or extra records: {'yes' if not inconsistent else 'NO'} "
             f"({total_missing} missing on target, {total_extra} extra on target)"
+        )
+        # Footnote the composite/non-integer-PK tables that ran but were NOT reconciled,
+        # so "no missing or extra records" is not read as covering every table.
+        if reconcile_skipped:
+            lines.append(
+                f"    note: {len(reconcile_skipped)} table(s) not record-reconciled "
+                f"(composite/non-integer primary key), compared by {compared_by}: "
+                f"{', '.join(reconcile_skipped)}"
+            )
+    elif reconcile_requested:
+        # Reconciliation was requested but NO table was eligible (every PK is
+        # composite/non-integer). A row-count/checksum match does NOT prove the record
+        # sets match, so this must not read as a clean pass.
+        lines.append(
+            "- No missing or extra records: NOT verified -- record-level "
+            "reconciliation was requested but could not run for any table "
+            "(no single integer primary key); tables compared by "
+            f"{compared_by}: {', '.join(reconcile_skipped)}"
         )
     else:
         lines.append(

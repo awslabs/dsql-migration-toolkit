@@ -189,6 +189,21 @@ def test_connect_passes_a_bounded_connect_timeout() -> None:
     assert isinstance(kwargs["connect_timeout"], int) and kwargs["connect_timeout"] > 0
 
 
+def test_connect_pins_output_formatting_gucs_matching_source() -> None:
+    # FIX 4b: the DSQL target connection must pin the four output-formatting GUCs the
+    # checksum render depends on (TimeZone / DateStyle / IntervalStyle / lc_numeric),
+    # matching the PostgreSQL SOURCE's pins, so a byte-identical value renders identically
+    # regardless of any role/cluster default (e.g. a de_DE lc_numeric would otherwise
+    # render '3,14' vs the source's '3.14' -> a false checksum MISMATCH).
+    connect = _ConnectRecorder()
+    _connector(connect=connect).connect()
+    options = connect.connections[0].kwargs["options"]
+    assert "-c TimeZone=UTC" in options
+    assert "-c DateStyle=ISO" in options
+    assert "-c IntervalStyle=postgres" in options
+    assert "-c lc_numeric=C" in options
+
+
 def test_admin_username_selects_admin_token_api() -> None:
     captured: dict[str, Any] = {}
 

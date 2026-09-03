@@ -66,7 +66,12 @@ from dsql_migrator.core.converter import (
 from dsql_migrator.core.schema_applier import (
     apply_foreign_key, recreate_table, validate_foreign_key,
 )
-from dsql_migrator.core.validation_sql import build_orphan_count_sql
+from dsql_migrator.core.validation_sql import (
+    build_orphan_count_sql,
+    build_pg_orphan_page_first_sql,
+    build_pg_orphan_page_next_sql,
+    single_pk_column,
+)
 from dsql_migrator.core.models import (
     ChunkState,
     DataErrorRecord,
@@ -3647,7 +3652,9 @@ class BatchedTableMigrator:
         ):
             return (0, 0, 0)
         return apply_preserved_foreign_keys(
-            self._inputs.table_conversions, self._view_connection_factory()
+            self._inputs.table_conversions,
+            self._view_connection_factory(),
+            child_pk_columns=child_pk_columns_for(self._inputs.inventory),
         )
 
     def _view_connection_factory(self):
@@ -3658,9 +3665,24 @@ class BatchedTableMigrator:
         return connector.connect
 
 
+def child_pk_columns_for(
+    inventory: Optional[SourceInventory],
+) -> dict[str, Optional[str]]:
+    """Map each table name -> its single-column PK (or ``None``) from ``inventory``.
+
+    Feeds :func:`apply_preserved_foreign_keys`' orphan pre-gate so a single-column-PK
+    child is orphan-counted over bounded keyset pages. A composite/missing-PK table maps
+    to ``None`` (single-scan fallback). Empty when there is no inventory.
+    """
+    if inventory is None:
+        return {}
+    return {table.name: single_pk_column(table) for table in inventory.tables}
+
+
 def apply_preserved_foreign_keys(
     table_conversions: Mapping[str, TableConversion],
     connection_factory: Callable[[], Any],
+    child_pk_columns: Optional[Mapping[str, Optional[str]]] = None,
 ) -> tuple[int, int, int]:
     """Re-create preserved foreign keys as post-load ``ADD CONSTRAINT``, orphan-gated.
 
@@ -3672,6 +3694,12 @@ def apply_preserved_foreign_keys(
     an enforced ``ADD CONSTRAINT`` would fail on any orphan, so that FK is skipped with
     an actionable activity-log entry (table / FK / count) instead of an opaque ALTER
     failure. Best-effort per FK: a failure is logged and skipped, never raised.
+
+    ``child_pk_columns`` maps a child table name -> its single-column PK (or ``None``),
+    so a large child's orphan pre-gate is counted over BOUNDED keyset pages rather than
+    one unbounded scan that could exceed DSQL's ~300s transaction limit. Callers build it
+    from the source inventory (:func:`child_pk_columns_for`); omitting it (or a table not
+    in it) falls back to the single-scan count, so existing callers are unaffected.
 
     Returns ``(applied, skipped, failed)`` counts.
     """
@@ -3699,6 +3727,10 @@ def apply_preserved_foreign_keys(
     try:
         for table_name, constraint_name, fk, add_ddl in pending:
             target = f"{table_name}.{constraint_name or '?'}"
+            # The child's single-column PK (when known) selects the bounded keyset-paged
+            # orphan count; None (composite/missing PK, or no metadata supplied) uses the
+            # single scan. Keeps the pre-gate from timing out on a very large child.
+            pk_col = (child_pk_columns or {}).get(table_name)
             try:
                 if fk is None:
                     # No metadata to key the orphan query on (an edited/renamed FK the
@@ -3708,7 +3740,7 @@ def apply_preserved_foreign_keys(
                     orphans = 0
                     _LOGGER.debug("No FK metadata for %s; skipping orphan pre-gate", target)
                 else:
-                    orphans = _count_orphans(probe, table_name, fk)
+                    orphans = _count_orphans(probe, table_name, fk, pk_col)
             except Exception as exc:  # noqa: BLE001 - cannot verify -> do not risk a bad ADD
                 if is_transient_connection_error(exc):
                     # The shared probe died mid-pass (class 08 / expired IAM token /
@@ -3721,7 +3753,7 @@ def apply_preserved_foreign_keys(
                         pass
                     try:
                         probe = connection_factory()
-                        orphans = _count_orphans(probe, table_name, fk)
+                        orphans = _count_orphans(probe, table_name, fk, pk_col)
                     except Exception:  # noqa: BLE001 - reconnect/re-check still failing
                         failed += 1
                         _LOGGER.warning(
@@ -3842,18 +3874,37 @@ def _constraint_name_from_ddl(add_ddl: object) -> Optional[str]:
     return token
 
 
-def _count_orphans(connection: Any, child_table: str, fk: ForeignKeyDef) -> int:
+# Rows scanned per keyset page in the orphan pre-gate's paged path. Bounded so a
+# billion-row child never runs one orphan scan past DSQL's ~300s transaction limit.
+_ORPHAN_PAGE_SIZE = 5000
+
+
+def _count_orphans(
+    connection: Any,
+    child_table: str,
+    fk: ForeignKeyDef,
+    pk_column: Optional[str] = None,
+    page_size: int = _ORPHAN_PAGE_SIZE,
+) -> int:
     """Count child rows whose foreign key points to a missing parent (target).
 
     Read-only pre-gate for the post-load ``ADD CONSTRAINT``: an enforced foreign key
     cannot be created while orphan rows exist, so this turns an opaque ALTER failure
-    into an actionable per-FK count. Reuses the Validation orphan query
+    into an actionable per-FK count. Reuses the Validation orphan queries
+    (:mod:`~dsql_migrator.core.validation_sql`).
+
+    For a single-column-PK child (``pk_column`` given) the count is accumulated over
+    BOUNDED keyset pages so a very large child never runs the orphan scan in one
+    transaction (a single ``COUNT(*) ... NOT EXISTS`` would exceed DSQL's ~300s
+    transaction limit) -- exactly as the count/checksum keyset pagers do. When
+    ``pk_column`` is ``None`` (composite/missing PK) it falls back to the single scan
     (:func:`~dsql_migrator.core.validation_sql.build_orphan_count_sql`).
 
     The count is wrapped in OCC retry: on Aurora DSQL even a read can raise a
     serialization failure (OC001/40001) when the target is being written concurrently
     (e.g. a live CDC sink at cut over), and a transient conflict must not be mistaken
-    for "orphan pre-check failed" and skip an otherwise-applicable foreign key.
+    for "orphan pre-check failed" and skip an otherwise-applicable foreign key. On a
+    conflict the whole (idempotent, read-only) count re-runs from the first page.
     """
     from dsql_migrator.core.occ import with_occ_retry
 
@@ -3864,6 +3915,10 @@ def _count_orphans(connection: Any, child_table: str, fk: ForeignKeyDef) -> int:
             connection.rollback()
         except Exception:  # noqa: BLE001 - best-effort
             pass
+        if pk_column is not None:
+            return _count_orphans_keyset(
+                connection, child_table, fk, pk_column, page_size
+            )
         cursor = connection.cursor()
         try:
             cursor.execute(build_orphan_count_sql(child_table, fk))
@@ -3876,6 +3931,46 @@ def _count_orphans(connection: Any, child_table: str, fk: ForeignKeyDef) -> int:
         return int(row[0]) if row and row[0] is not None else 0
 
     return with_occ_retry()(_run)()
+
+
+def _count_orphans_keyset(
+    connection: Any,
+    child_table: str,
+    fk: ForeignKeyDef,
+    pk_column: str,
+    page_size: int,
+) -> int:
+    """Accumulate the orphan count over bounded keyset pages (single-column-PK child).
+
+    Each page reports ``(orphan_sub_count, last_pk, row_count)`` over an UNFILTERED PK
+    window (the orphan predicate is a ``COUNT(*) FILTER``), so ``last_pk`` advances the
+    keyset over non-orphan rows too and no PK range is skipped. Sub-counts fold into a
+    Python integer; the loop stops when a page returns fewer than ``page_size`` rows.
+    """
+    first_sql = build_pg_orphan_page_first_sql(child_table, fk, pk_column, page_size)
+    next_sql = build_pg_orphan_page_next_sql(child_table, fk, pk_column, page_size)
+    total = 0
+    last: object = None
+    while True:
+        cursor = connection.cursor()
+        try:
+            if last is None:
+                cursor.execute(first_sql)
+            else:
+                cursor.execute(next_sql, {"last": last})
+            row = cursor.fetchone()
+        finally:
+            try:
+                cursor.close()
+            except Exception:  # noqa: BLE001 - best-effort close
+                pass
+        if row is None:
+            return total
+        sub_count, last_pk, count = row[0], row[1], row[2]
+        total += int(sub_count) if sub_count is not None else 0
+        if count is None or int(count) < page_size:
+            return total
+        last = last_pk
 
 
 def default_migrator_factory(inputs: DataMigrationInputs) -> DataMigrator:

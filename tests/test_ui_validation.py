@@ -551,6 +551,149 @@ def test_count_verified_and_reconcile_skipped_are_distinct() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Reconcile REQUESTED but no table eligible (all composite/UUID PK) -- must NOT
+# be misreported as "turned off" nor released as a clean cut-over pass (FIX 1).
+# ---------------------------------------------------------------------------
+
+
+def _all_inapplicable_report(
+    *, mode: ValidationMode = ValidationMode.ROW_COUNT, requested: bool = True
+) -> ValidationReport:
+    """A report where reconciliation was REQUESTED but NO table was eligible.
+
+    Every table has a composite/UUID PK (``reconcile_applicable=False``, ``reconcile``
+    None), yet the row counts match (so ``is_match`` is True) -- the false-match trap:
+    a row-count match does NOT prove the record sets match.
+    """
+    items = [
+        TableValidationResult(
+            table="events",
+            source_row_count=5,
+            target_row_count=5,
+            row_count_match=True,
+            matched=True,
+            reconcile_applicable=False,
+        ),
+        TableValidationResult(
+            table="audit_log",
+            source_row_count=3,
+            target_row_count=3,
+            row_count_match=True,
+            matched=True,
+            reconcile_applicable=False,
+        ),
+    ]
+    return ValidationReport.build(
+        mode=mode, items=items, reconcile_requested=requested
+    )
+
+
+def test_reconcile_skipped_tables_fires_when_zero_reconciled_but_requested() -> None:
+    # FIX 1(b): the old `if not any_reconciled: return ()` short-circuit hid an
+    # all-composite/UUID-PK run (reconciliation requested, zero tables eligible). It must
+    # now list every requested-but-inapplicable table even though NOTHING reconciled.
+    assert reconcile_skipped_tables(_all_inapplicable_report()) == ("events", "audit_log")
+    # Not requested -> still empty (the UI explains the global "off" state separately).
+    assert reconcile_skipped_tables(_all_inapplicable_report(requested=False)) == ()
+
+
+def test_reconcile_requested_but_no_table_eligible_is_not_a_clean_pass() -> None:
+    # FIX 1(c) (i): reconciliation requested + an all-UUID/composite-PK schema must
+    # surface "reconcile inapplicable for all tables" -- NOT "turned off", NOT a clean
+    # green pass that releases cut over.
+    from dsql_migrator.ui.validation import (
+        _render_readiness_checks,
+        _render_verdict,
+        summarize_validation,
+    )
+
+    summary = summarize_validation(_all_inapplicable_report())
+    # The summary distinguishes this state from both "ran" and "turned off".
+    assert summary.reconcile_requested is True
+    assert summary.reconcile_performed is False
+    assert summary.reconcile_inapplicable_tables == ("events", "audit_log")
+    assert summary.reconcile_inapplicable_for_all is True
+
+    # Readiness Check 2: a WARNING that reconciliation could not run for any table, NOT
+    # the quiet "turned off" neutral pass.
+    rc = _CopyUi()
+    _render_readiness_checks(rc, summary, _drift_na())
+    body = rc.body()
+    assert "could not run for any table" in body
+    assert "Reconcile inapplicable for all" in body
+    assert "turned off" not in body
+    assert "Heads-up" in body  # amber warning chip, not a green "Passed"
+
+    # Verdict: NOT the clean green "Ready for cut-over" pass -- a warning that the record
+    # sets are unverified, so cut over is not released as a clean match.
+    v = _CopyUi()
+    _render_verdict(v, summary, _drift_na())
+    vbody = v.body()
+    assert "Ready for cut-over" not in vbody
+    assert "records are unverified" in vbody
+    assert "does NOT prove the record sets match" in vbody
+
+
+def test_reconcile_genuinely_off_still_says_turned_off() -> None:
+    # FIX 1(c) (ii): when reconciliation was NOT requested, the readiness panel still says
+    # "turned off" and the verdict stays a clean "Ready" (count/checksum-only) pass.
+    from dsql_migrator.ui.validation import (
+        _render_readiness_checks,
+        _render_verdict,
+        summarize_validation,
+    )
+
+    summary = summarize_validation(_all_inapplicable_report(requested=False))
+    assert summary.reconcile_requested is False
+    assert summary.reconcile_inapplicable_for_all is False
+    assert summary.reconcile_inapplicable_tables == ()
+
+    rc = _CopyUi()
+    _render_readiness_checks(rc, summary, _drift_na())
+    assert "turned off" in rc.body()
+
+    v = _CopyUi()
+    _render_verdict(v, summary, _drift_na())
+    assert "Ready for cut-over" in v.body()
+
+
+def test_reconcile_ran_on_a_table_is_unchanged() -> None:
+    # FIX 1(c) (iii): a run that reconciled >=1 table is unaffected -- the readiness panel
+    # shows the real reconciliation verdict, not the "inapplicable" warning.
+    from dsql_migrator.ui.validation import (
+        _render_readiness_checks,
+        summarize_validation,
+    )
+
+    summary = summarize_validation(_reconciled_report())
+    assert summary.reconcile_performed is True
+    assert summary.reconcile_inapplicable_for_all is False
+
+    rc = _CopyUi()
+    _render_readiness_checks(rc, summary, _drift_na())
+    body = rc.body()
+    assert "table(s) reconciled" in body
+    assert "could not run for any table" not in body
+
+
+def test_reconcile_inapplicable_for_all_stays_green_in_checksum_mode() -> None:
+    # In CHECKSUM mode the checksum value-compared every row (so a missing/extra row
+    # changes the sum and IS caught), so an all-inapplicable run is safe: the verdict
+    # stays green but says PK reconciliation could not run (never "off").
+    from dsql_migrator.ui.validation import _render_verdict, summarize_validation
+
+    summary = summarize_validation(
+        _all_inapplicable_report(mode=ValidationMode.CHECKSUM)
+    )
+    assert summary.reconcile_inapplicable_for_all is True
+    v = _CopyUi()
+    _render_verdict(v, summary, _drift_na())
+    vbody = v.body()
+    assert "Ready for cut-over" in vbody  # checksum covered it -> still ready
+    assert "could not run" in vbody  # but honestly notes PK reconciliation didn't run
+
+
+# ---------------------------------------------------------------------------
 # Validation scope: WHAT is validated (tables + identity context card)
 # ---------------------------------------------------------------------------
 
@@ -2423,8 +2566,9 @@ def test_run_cutover_foreign_keys_applies_and_records(monkeypatch) -> None:
 
     captured: dict = {}
 
-    def _fake_apply(conversions, connection_factory):
+    def _fake_apply(conversions, connection_factory, child_pk_columns=None):
         captured["tables"] = sorted(conversions)
+        captured["child_pk_columns"] = child_pk_columns
         return (1, 0, 0)
 
     monkeypatch.setattr(engine, "apply_preserved_foreign_keys", _fake_apply)

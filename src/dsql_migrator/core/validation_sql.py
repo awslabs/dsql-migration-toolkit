@@ -193,13 +193,22 @@ def _pg_numeric_mask(scale: int) -> str:
     ``9`` positions is safe: under ``FM`` the extra positions render nothing for
     smaller magnitudes (``9`` suppresses non-significant leading digits), so the
     output is identical to a tighter mask for every value that fits.
+
+    The fractional separator is a LITERAL ``'.'`` -- NOT ``to_char``'s locale-aware
+    ``'D'`` template. ``'D'`` renders whatever ``lc_numeric`` designates as the decimal
+    point (``','`` under e.g. ``de_DE``), and the DSQL TARGET connection does not pin
+    ``lc_numeric``; a role/cluster default other than ``C`` would then render a
+    byte-identical value as ``3,1400`` on the target vs ``3.1400`` on the (GUC-pinned)
+    source -- a FALSE checksum MISMATCH. ``'.'`` is invariant across every locale and the
+    MySQL side (``CAST ... DECIMAL``) always emits ``'.'``, so both engines agree without
+    depending on any session GUC.
     """
     # 64 nines + a trailing zero = 65 integer digit positions, covering the full
     # DECIMAL(65, 0) integer range (and thus BIGINT UNSIGNED's 20-digit max).
     integer_part = "FM" + ("9" * 64) + "0"
     if scale <= 0:
         return integer_part
-    return integer_part + "D" + ("0" * scale)
+    return integer_part + "." + ("0" * scale)
 
 
 def _checksum_kind(column: "ColumnDef") -> str:
@@ -743,6 +752,32 @@ def single_pk_column(table: TableDef) -> Optional[str]:
     return pk if any(c.name == pk for c in table.columns) else None
 
 
+def _orphan_predicates(
+    fk: ForeignKeyDef, child_alias: str
+) -> "tuple[sql.Composed, sql.Composed]":
+    """Return ``(not_null, join_predicate)`` for one FK, qualified by ``child_alias``.
+
+    ``not_null`` is ``<alias>.<col> IS NOT NULL AND ...`` over the FK columns (a null key
+    is not a referential violation), and ``join_predicate`` is ``p.<ref> = <alias>.<col>
+    AND ...`` matching parent to child. Shared by the single-scan and keyset-paged orphan
+    builders so their orphan semantics can never drift. Identifiers are composed with
+    :class:`psycopg.sql.Identifier` (Requirement 9.4).
+    """
+    not_null = sql.SQL(" AND ").join(
+        sql.SQL("{alias}.{column} IS NOT NULL").format(
+            alias=sql.SQL(child_alias), column=sql.Identifier(column)
+        )
+        for column in fk.columns
+    )
+    join_predicate = sql.SQL(" AND ").join(
+        sql.SQL("p.{ref} = {alias}.{col}").format(
+            ref=sql.Identifier(ref), alias=sql.SQL(child_alias), col=sql.Identifier(col)
+        )
+        for col, ref in zip(fk.columns, fk.referenced_columns)
+    )
+    return not_null, join_predicate
+
+
 def build_orphan_count_sql(child_table: str, fk: ForeignKeyDef) -> sql.Composed:
     """Build a target query counting orphan child rows for one foreign key.
 
@@ -751,23 +786,18 @@ def build_orphan_count_sql(child_table: str, fk: ForeignKeyDef) -> sql.Composed:
     referenced columns. Identifiers are composed with
     :class:`psycopg.sql.Identifier` (Requirement 9.4) and the statement is a
     single read-only ``SELECT``.
+
+    A single unbounded scan: used ONLY for a composite/missing-PK child; a
+    single-column-PK child is orphan-counted over BOUNDED keyset pages
+    (:func:`build_pg_orphan_page_first_sql`) so a billion-row child never runs one
+    transaction past DSQL's ~300s limit -- exactly as count/checksum do.
     """
     # Split a schema-qualified name into "schema"."table" (NOT one quoted
     # "schema.table" identifier, which would reference a table that doesn't exist):
     # the same composition the COUNT/checksum/reconcile queries use.
     child = _pg_table_identifier(child_table)
     parent = _pg_table_identifier(fk.referenced_table)
-
-    not_null = sql.SQL(" AND ").join(
-        sql.SQL("c.{column} IS NOT NULL").format(column=sql.Identifier(column))
-        for column in fk.columns
-    )
-    join_predicate = sql.SQL(" AND ").join(
-        sql.SQL("p.{ref} = c.{col}").format(
-            ref=sql.Identifier(ref), col=sql.Identifier(col)
-        )
-        for col, ref in zip(fk.columns, fk.referenced_columns)
-    )
+    not_null, join_predicate = _orphan_predicates(fk, "c")
     return sql.SQL(
         "SELECT COUNT(*) FROM {child} AS c WHERE {not_null} AND NOT EXISTS ("
         "SELECT 1 FROM {parent} AS p WHERE {join_predicate})"
@@ -776,4 +806,70 @@ def build_orphan_count_sql(child_table: str, fk: ForeignKeyDef) -> sql.Composed:
         not_null=not_null,
         parent=parent,
         join_predicate=join_predicate,
+    )
+
+
+def _build_pg_orphan_page_sql(
+    child_table: str, fk: ForeignKeyDef, pk_column: str, page_size: int, *, first: bool
+) -> sql.Composed:
+    """One keyset page of the orphan count for ``fk``: ``(orphan_sub_count, last_pk, count)``.
+
+    The child's PK window is paged UNCONDITIONALLY (``WHERE pk > :last ORDER BY pk LIMIT
+    N`` -- the same keyset stream the count/checksum use) and the orphan predicate is
+    folded into a ``COUNT(*) FILTER`` so the keyset boundary advances over NON-orphan rows
+    too. If the ``WHERE`` had dropped non-orphans, the ``MAX(pk)`` of a page could skip a
+    PK range and under-count; selecting every row in the window and FILTERing the count
+    keeps the boundary exact. The caller accumulates ``orphan_sub_count`` in Python,
+    advances ``:last`` from ``array_agg`` (the last/max PK of the ascending window, which
+    works for any orderable PK type -- ``uuid`` has no ``max()`` aggregate), and stops when
+    ``count < page_size``. Identifiers/bounds compose safely (Requirement 9.4).
+    """
+    child = _pg_table_identifier(child_table)
+    parent = _pg_table_identifier(fk.referenced_table)
+    # The orphan predicate is applied to the paged subquery (alias ``pg``).
+    not_null, join_predicate = _orphan_predicates(fk, "pg")
+    # The FK columns are selected in the window so the FILTER can read them; the PK is
+    # aliased ``page_pk`` for the keyset advance. A FK column that IS the PK is harmless
+    # here -- it is selected under both ``page_pk`` and its own name.
+    fk_cols = sql.SQL(", ").join(sql.Identifier(col) for col in fk.columns)
+    where_clause = (
+        sql.SQL("")
+        if first
+        else sql.SQL("WHERE {pk} > {last} ").format(
+            pk=sql.Identifier(pk_column), last=sql.Placeholder("last")
+        )
+    )
+    return sql.SQL(
+        "SELECT COUNT(*) FILTER (WHERE {not_null} AND NOT EXISTS ("
+        "SELECT 1 FROM {parent} AS p WHERE {join_predicate})), "
+        "(array_agg(page_pk ORDER BY page_pk))[COUNT(*)], COUNT(*) FROM ("
+        "SELECT {pk} AS page_pk, {fk_cols} FROM {child} {where}"
+        "ORDER BY {pk} LIMIT {limit}) pg"
+    ).format(
+        not_null=not_null,
+        parent=parent,
+        join_predicate=join_predicate,
+        pk=sql.Identifier(pk_column),
+        fk_cols=fk_cols,
+        child=child,
+        where=where_clause,
+        limit=sql.Literal(page_size),
+    )
+
+
+def build_pg_orphan_page_first_sql(
+    child_table: str, fk: ForeignKeyDef, pk_column: str, page_size: int
+) -> sql.Composed:
+    """First keyset page of the orphan count for ``fk`` (see :func:`_build_pg_orphan_page_sql`)."""
+    return _build_pg_orphan_page_sql(
+        child_table, fk, pk_column, page_size, first=True
+    )
+
+
+def build_pg_orphan_page_next_sql(
+    child_table: str, fk: ForeignKeyDef, pk_column: str, page_size: int
+) -> sql.Composed:
+    """Subsequent keyset page of the orphan count after the ``last`` placeholder."""
+    return _build_pg_orphan_page_sql(
+        child_table, fk, pk_column, page_size, first=False
     )

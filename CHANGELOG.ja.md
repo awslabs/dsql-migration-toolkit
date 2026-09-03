@@ -5,6 +5,34 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.435
+
+### 修正 (Fixed)
+
+- **Validation(Step 4)の修正(MySQL・PostgreSQL ソース)**(チェックサム/count/reconcile/orphan
+  SQL を稼働中の PostgreSQL 16 で再現したレビューで発見 — チェックサムの値レンダリング整合と orphan
+  MATCH-SIMPLE の意味論は既に堅牢でエンジン間一貫):
+  - **レコード reconcile が要求されたがどのテーブルにも適用されなかった row-count 実行が、"レコード
+    検証済みのクリーンパス"として誤報されなくなりました。** reconcile は単一整数 PK でのみ実行され、
+    all-UUID / all-複合 PK スキーマ(PG で一般的)は全テーブルでスキップされるのに、レポートは
+    "reconciliation turned off" と表示し cut-over 判定が緑のままで、既定の row-count モードでは
+    件数一致・行内容相違の乖離が **サイレントな false match** としてカットオーバーを許可し得ました。
+    今は "off" / "実行済み" / "要求されたが全件不適格" を区別し、row-count モードの最後のケースは判定を
+    警告に格下げ("件数は一致するがレコード未検証 — CHECKSUM モードで再実行")。CHECKSUM モードは全行を
+    値比較するため、正直な注記付きで緑を維持。
+  - **orphan/FK プリゲートが単一整数 PK の子に対して keyset ページング**(COUNT/checksum と同様)に
+    なり、大規模な子で ~300s の単一トランザクション上限リスクを解消。無制限の単一スキャンは複合/欠落
+    PK のフォールバックとしてのみ残ります。ページ集計は PK ウィンドウ全体を走査しつつ orphan 述語を
+    FILTER で適用するため、境界が非 orphan 行の上でも前進します(稼働中の PG16 で検証)。
+  - **ダウンロード用テキストレポートが row-count モード(既定)で "Data identical" を過大主張しなく
+    なりました** — "Row counts match" と表示し、"Data identical" は CHECKSUM モード専用(UI と一致)。
+    reconcile できなかったテーブルも脚注で開示。
+  - **チェックサムの numeric レンダリングが locale 非依存に** — `to_char` マスクが locale 依存の
+    小数点(`D`)を使っており、DSQL 接続の `lc_numeric` がソースと異なると潜在的 false-mismatch でした
+    が、リテラル `.` を使用。DSQL ターゲット接続も `DateStyle`/`IntervalStyle`/`lc_numeric` を
+    (TimeZone だけでなく)ソースと同様に固定し、DATE/INTERVAL/NUMERIC のチェックサムテキストが
+    role/エンジンの既定値に関係なく同一にレンダリングされます。
+
 ## v0.1.434
 
 ### 修正 (Fixed)

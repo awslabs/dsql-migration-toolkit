@@ -1508,6 +1508,14 @@ class TableValidationResult(BaseModel):
     # Full PK-set reconciliation for this table (record-level missing/extra), when
     # the reconciliation pass ran and the table's PK is eligible. None otherwise.
     reconcile: Optional["ReconcileResult"] = None
+    # True when this table's primary key is a SINGLE INTEGER column, i.e. record-level
+    # reconciliation COULD run for it (see ``integer_pk_column``). Independent of
+    # whether it actually ran: a fast-sweep count-verified table is still applicable.
+    # Lets the report distinguish "reconciliation was requested but no table was
+    # eligible" (a false-match risk: a row-count match does NOT prove the record sets
+    # match) from "reconciliation was turned off", so the former is never presented as a
+    # clean pass. Defaults False so an errored/legacy result reads as not-applicable.
+    reconcile_applicable: bool = False
     # Per-table error message: set when THIS table's comparison failed (e.g. it is
     # absent on the target, or a query errored), so one bad table is isolated and
     # reported instead of aborting the whole validation run. None on success.
@@ -1618,6 +1626,13 @@ class ValidationReport(BaseModel):
     drift: Optional[DriftReport] = None
     snapshot_timestamp: Optional[datetime] = None
     is_match: bool = False
+    # True when the run REQUESTED record-level reconciliation, regardless of whether any
+    # table was eligible for it. Distinct from "at least one table reconciled": an
+    # all-UUID/composite-PK schema requests reconciliation yet reconciles zero tables, and
+    # without this flag that state was misreported as "reconciliation turned off" and
+    # released cut over on a bare row-count match. Defaults False so a legacy report (or a
+    # run that did not request it) reads as not-requested.
+    reconcile_requested: bool = False
 
     @classmethod
     def build(
@@ -1629,12 +1644,17 @@ class ValidationReport(BaseModel):
         orphan_check_performed: bool = False,
         drift: Optional["DriftReport"] = None,
         snapshot_timestamp: Optional[datetime] = None,
+        reconcile_requested: bool = False,
     ) -> "ValidationReport":
         """Build a report and compute the sound overall ``is_match`` verdict.
 
         ``is_match`` is ``True`` only when every table matched and no orphan
         findings were reported, so it never claims a match while a row
         count/checksum differs or an orphan exists (Property 9).
+
+        ``reconcile_requested`` records whether the run asked for record-level
+        reconciliation (carried as-is), so the report can tell "requested but no table
+        was eligible" apart from "turned off" without inspecting per-table results.
         """
         findings = list(orphan_findings or [])
         items = list(items)
@@ -1647,6 +1667,7 @@ class ValidationReport(BaseModel):
             drift=drift,
             snapshot_timestamp=snapshot_timestamp,
             is_match=is_match,
+            reconcile_requested=reconcile_requested,
         )
 
 

@@ -278,6 +278,24 @@ class _FakeTargetConnection:
         table = _last_double_quoted_table(text)
         if table in self._missing_tables:
             raise RuntimeError(f'relation "{table}" does not exist')
+        # The keyset-PAGED orphan count (single-column-PK child): returns ONE
+        # (orphan_sub_count, last_pk, page_row_count) ROW via fetchone. Matched BEFORE the
+        # single-scan orphan branch below (it also contains NOT EXISTS) and before the
+        # keyset PK-page branch (it also has AS page_pk). The whole orphan count lands on
+        # the FIRST page (later pages contribute 0), and the window is drawn from the
+        # child's pk_set so the keyset advance/termination is exercised end-to-end.
+        if "NOT EXISTS" in text and "FILTER" in text:
+            # The child is the LAST ``FROM "..."`` (the parent appears first, inside the
+            # NOT EXISTS), which ``_last_double_quoted_table`` already resolved as ``table``.
+            child = table
+            window = _keyset_page(
+                self._pk_sets.get(child, []),
+                last=params.get("last"),
+                page=_limit_in(text),
+            )
+            last_pk = window[-1][0] if window else None
+            sub_count = self._orphans.get(child, 0) if params.get("last") is None else 0
+            return (sub_count, last_pk, len(window))
         if "NOT EXISTS" in text:
             child = _orphan_child_table(text)
             return self._orphans.get(child, 0)
@@ -1228,6 +1246,89 @@ def test_orphans_not_checked_when_flag_is_off() -> None:
     assert all("NOT EXISTS" not in text for text in target.executed)
 
 
+def test_orphan_count_single_int_pk_child_is_keyset_paged() -> None:
+    # FIX 2: a single-column-integer-PK child is orphan-counted over BOUNDED keyset pages
+    # (multi-page here via a tiny page size), not one unbounded scan -- and the accumulated
+    # total equals the single-scan orphan count.
+    source = _FakeSourceConnection(counts={"orders": 5})
+    target = _FakeTargetConnection(counts={"orders": 5}, orphans={"orders": 2})
+    validator = Validator(
+        source_engine_factory=lambda _c: _FakeSourceEngine(source),
+        target_connection_factory=lambda _t: target,
+        reconcile_page_size=2,  # 5 PKs / page 2 -> forces multiple orphan pages
+    )
+    report = validator.validate(
+        _SOURCE_CONFIG, _TARGET_CONFIG, [_orders_with_fk()], check_orphans=True
+    )
+    assert report.orphan_findings[0].orphan_count == 2  # same total as the single scan
+    orphan_sql = [t for t in target.executed if "NOT EXISTS" in t]
+    assert orphan_sql, "no orphan query ran"
+    # The PAGED form: a keyset window folded into COUNT(*) FILTER + array_agg, NOT the
+    # single unbounded "... AS c WHERE ..." scan.
+    assert all("FILTER" in t and "array_agg" in t for t in orphan_sql)
+    assert all(" AS c WHERE" not in t for t in orphan_sql)
+    # Multi-page: page size 2 over 5 PKs -> 3 orphan pages ran.
+    assert len(orphan_sql) >= 2
+
+
+def test_orphan_count_composite_pk_child_uses_single_scan() -> None:
+    # FIX 2: a composite-PK child has no single keyset column, so the orphan pre-gate
+    # falls back to the single unbounded scan (exactly as count/checksum do).
+    child = _table(
+        "order_items",
+        columns=("order_id", "line_no", "sku_id"),
+        primary_key=("order_id", "line_no"),  # composite PK
+        foreign_keys=[
+            ForeignKeyDef(
+                name="fk_sku",
+                columns=["sku_id"],
+                referenced_table="skus",
+                referenced_columns=["id"],
+            )
+        ],
+    )
+    source = _FakeSourceConnection(counts={"order_items": 4})
+    target = _FakeTargetConnection(counts={"order_items": 4}, orphans={"order_items": 1})
+    report = _validator(source, target).validate(
+        _SOURCE_CONFIG, _TARGET_CONFIG, [child], check_orphans=True
+    )
+    assert report.orphan_findings[0].orphan_count == 1
+    orphan_sql = [t for t in target.executed if "NOT EXISTS" in t]
+    assert orphan_sql, "no orphan query ran"
+    # The single-scan form: "... AS c WHERE ...", NOT the paged FILTER/array_agg.
+    assert all("array_agg" not in t and "FILTER" not in t for t in orphan_sql)
+    assert all(" AS c WHERE" in t for t in orphan_sql)
+
+
+def test_orphan_page_sql_pages_the_window_unconditionally() -> None:
+    # FIX 2 correctness: the paged orphan SQL selects the FULL PK window (so the keyset
+    # boundary advances over NON-orphan rows too) and folds the orphan predicate into a
+    # COUNT(*) FILTER -- if the WHERE dropped non-orphans, a page's max PK could skip a
+    # PK range and under-count.
+    from dsql_migrator.core.validation_sql import (
+        build_pg_orphan_page_first_sql,
+        build_pg_orphan_page_next_sql,
+    )
+
+    fk = ForeignKeyDef(
+        name="fk", columns=["customer_id"],
+        referenced_table="customers", referenced_columns=["id"],
+    )
+    first = build_pg_orphan_page_first_sql("orders", fk, "id", 5000).as_string(None)
+    nxt = build_pg_orphan_page_next_sql("orders", fk, "id", 5000).as_string(None)
+    # The orphan predicate is a FILTER on the count, not a WHERE on the window.
+    assert "COUNT(*) FILTER (WHERE" in first
+    assert 'pg."customer_id" IS NOT NULL' in first
+    assert 'NOT EXISTS' in first and '"customers" AS p' in first
+    # The window itself is unfiltered by the orphan predicate; the keyset advances by the
+    # window's max PK via array_agg (works for any orderable PK type).
+    assert '(array_agg(page_pk ORDER BY page_pk))[COUNT(*)]' in first
+    assert 'FROM "orders" ORDER BY "id" LIMIT 5000' in first
+    # The next page carries the keyset bound; the first page does not.
+    assert '"id" > %(last)s' in nxt
+    assert '"id" > ' not in first
+
+
 # ---------------------------------------------------------------------------
 # As-of-watermark validation + drift (Requirement 6.5 / Property 11)
 # ---------------------------------------------------------------------------
@@ -1597,9 +1698,11 @@ def test_numeric_mask_covers_full_decimal65_range() -> None:
     assert integer_positions >= len("18446744073709551615")
 
     scaled = _pg_numeric_mask(4)
-    # Fixed 4-digit fraction preserved, integer run unchanged.
-    assert scaled.endswith("D0000")
-    assert sum(ch == "9" for ch in scaled.split("D")[0]) >= 64
+    # Fixed 4-digit fraction preserved, integer run unchanged. The separator is a
+    # LITERAL '.' (not the locale-aware 'D'), so the numeric facet is GUC-independent.
+    assert scaled.endswith(".0000")
+    assert "D" not in scaled  # no locale-aware decimal-point template
+    assert sum(ch == "9" for ch in scaled.split(".")[0]) >= 64
 
 
 def test_checksum_float_columns_excluded() -> None:
@@ -1727,6 +1830,88 @@ def test_orphan_count_sql_splits_schema_qualified_names() -> None:
     # The buggy single-identifier form must NOT appear.
     assert '"customers_sample_new.products"' not in rendered
     assert '"customers_sample_new.categories"' not in rendered
+
+
+def test_render_text_report_match_label_is_mode_aware() -> None:
+    # FIX 3(1): the downloadable text report used to print "Data identical" in EVERY mode.
+    # ROW_COUNT never reads non-PK column VALUES, so it must say "Row counts match"; only
+    # CHECKSUM (which value-compares) earns "Data identical".
+    from dsql_migrator.core.validator import render_text_report
+
+    rc = _validator(
+        _FakeSourceConnection(counts={"orders": 2}),
+        _FakeTargetConnection(counts={"orders": 2}),
+    ).validate(_SOURCE_CONFIG, _TARGET_CONFIG, [_table("orders")], ValidationMode.ROW_COUNT)
+    rc_text = render_text_report(rc)
+    assert "Row counts match: yes" in rc_text
+    assert "Data identical" not in rc_text
+
+    cs = _validator(
+        _FakeSourceConnection(counts={"orders": 2}, checksums={"orders": "9"}),
+        _FakeTargetConnection(counts={"orders": 2}, checksums={"orders": "9"}),
+    ).validate(_SOURCE_CONFIG, _TARGET_CONFIG, [_table("orders")], ValidationMode.CHECKSUM)
+    cs_text = render_text_report(cs)
+    assert "Data identical: yes" in cs_text
+    assert "Row counts match" not in cs_text
+
+
+def test_render_text_report_footnotes_reconcile_skipped_and_inapplicable() -> None:
+    # FIX 3(2): footnote the composite/non-integer-PK tables that ran but were not
+    # reconciled, and -- when reconciliation was requested yet NO table was eligible --
+    # do not present "no missing or extra records" as a clean pass.
+    from dsql_migrator.core.models import (
+        ReconcileResult,
+        TableValidationResult,
+        ValidationReport,
+    )
+    from dsql_migrator.core.validator import render_text_report
+
+    reconciled = TableValidationResult(
+        table="orders", source_row_count=2, target_row_count=2,
+        row_count_match=True, matched=True, reconcile_applicable=True,
+        reconcile=ReconcileResult(
+            pk_column="id", source_count=2, target_count=2, consistent=True
+        ),
+    )
+    skipped = TableValidationResult(
+        table="audit_log", source_row_count=1, target_row_count=1,
+        row_count_match=True, matched=True, reconcile_applicable=False,
+    )
+    mixed = ValidationReport.build(
+        mode=ValidationMode.ROW_COUNT, items=[reconciled, skipped],
+        reconcile_requested=True,
+    )
+    mixed_text = render_text_report(mixed)
+    assert "No missing or extra records: yes" in mixed_text
+    assert "not record-reconciled" in mixed_text
+    assert "audit_log" in mixed_text
+
+    # Requested but NO table eligible -> not a clean pass.
+    none_eligible = ValidationReport.build(
+        mode=ValidationMode.ROW_COUNT,
+        items=[
+            TableValidationResult(
+                table="t1", source_row_count=1, target_row_count=1,
+                row_count_match=True, matched=True, reconcile_applicable=False,
+            )
+        ],
+        reconcile_requested=True,
+    )
+    txt = render_text_report(none_eligible)
+    assert "NOT verified" in txt
+    assert "could not run for any table" in txt
+
+    # Reconciliation genuinely off -> the plain "not checked (reconciliation off)" line.
+    off = ValidationReport.build(
+        mode=ValidationMode.ROW_COUNT,
+        items=[
+            TableValidationResult(
+                table="t1", source_row_count=1, target_row_count=1,
+                row_count_match=True, matched=True,
+            )
+        ],
+    )
+    assert "not checked (reconciliation off)" in render_text_report(off)
 
 
 # ---------------------------------------------------------------------------
