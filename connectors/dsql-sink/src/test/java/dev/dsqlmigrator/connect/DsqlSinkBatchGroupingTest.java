@@ -12,6 +12,7 @@
 package dev.dsqlmigrator.connect;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -150,5 +151,64 @@ class DsqlSinkBatchGroupingTest {
     assertEquals(1, out.size());
     assertEquals(List.of(2), pkOf(out.get(0)));
     assertEquals(25, out.get(0).event().values().get(1));
+  }
+
+  // --- byte-budget chunking (estimateModifiedBytes) ---------------------------
+
+  /** An upsert of one wide row: pk + a body string of {@code bodyBytes} ASCII chars. */
+  private static DsqlSinkTask.Applicable wideUpsert(int pk, int bodyBytes) {
+    String body = "x".repeat(bodyBytes);
+    return new DsqlSinkTask.Applicable(
+        null,
+        ChangeEvent.upsert(
+            "docs", List.of("id", "body"), List.of(pk, body), List.of("id"), List.of(pk), 0L));
+  }
+
+  @Test
+  void estimateModifiedBytesCountsUpsertAfterImageAndDeletePkOnly() {
+    // Upsert modifies the after-image (pk scalar ~16 + a 100-byte string).
+    DsqlSinkTask.Applicable up = wideUpsert(1, 100);
+    long upBytes = DsqlSinkTask.estimateModifiedBytes(up.event());
+    assertTrue(upBytes >= 100 && upBytes < 200, "upsert bytes ~= scalar + string body");
+    // Delete modifies only the PK, so it is tiny regardless of the row's width.
+    DsqlSinkTask.Applicable del = delete("docs");
+    assertTrue(DsqlSinkTask.estimateModifiedBytes(del.event()) < 64, "delete sizes PK only");
+  }
+
+  @Test
+  void wideRowsSplitIntoMultipleChunksBelowByteBudget() {
+    // Six rows of ~1 MiB each with a 3 MiB budget and a high row cap: byte-bounding must
+    // split them into several chunks (never one 6 MiB transaction that DSQL would reject).
+    int oneMiB = 1024 * 1024;
+    long budget = 3L * 1024 * 1024;
+    List<DsqlSinkTask.Applicable> batch =
+        List.of(
+            wideUpsert(1, oneMiB), wideUpsert(2, oneMiB), wideUpsert(3, oneMiB),
+            wideUpsert(4, oneMiB), wideUpsert(5, oneMiB), wideUpsert(6, oneMiB));
+    List<List<DsqlSinkTask.Applicable>> chunks =
+        Batches.partition(batch, 3000, budget, a -> DsqlSinkTask.estimateModifiedBytes(a.event()));
+    assertTrue(chunks.size() > 1, "wide rows must split under the byte budget");
+    for (List<DsqlSinkTask.Applicable> chunk : chunks) {
+      long bytes = 0;
+      for (DsqlSinkTask.Applicable a : chunk) {
+        bytes += DsqlSinkTask.estimateModifiedBytes(a.event());
+      }
+      assertTrue(bytes <= budget, "chunk exceeds byte budget: " + bytes);
+    }
+  }
+
+  @Test
+  void tinyRowsStillChunkByRowCount() {
+    // Narrow rows never approach the byte budget, so a small row cap still governs: 5 rows,
+    // cap 2 -> chunks of 2,2,1 (byte-bounding is inert here).
+    List<DsqlSinkTask.Applicable> batch =
+        List.of(upsertPk(1, 10), upsertPk(2, 20), upsertPk(3, 30), upsertPk(4, 40), upsertPk(5, 50));
+    List<List<DsqlSinkTask.Applicable>> chunks =
+        Batches.partition(
+            batch, 2, DsqlSinkTask.MAX_BATCH_BYTES, a -> DsqlSinkTask.estimateModifiedBytes(a.event()));
+    assertEquals(3, chunks.size());
+    assertEquals(2, chunks.get(0).size());
+    assertEquals(2, chunks.get(1).size());
+    assertEquals(1, chunks.get(2).size());
   }
 }

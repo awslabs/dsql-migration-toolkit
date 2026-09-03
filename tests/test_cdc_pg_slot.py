@@ -26,6 +26,8 @@ from dsql_migrator.core.cdc_pg_slot import (
     pg_publication_name,
     pg_slot_name,
     provision_pg_replication,
+    rekeyed_tables_needing_full_identity,
+    set_replica_identity_full,
 )
 from dsql_migrator.core.models import SourceConnectionConfig, SourceType
 
@@ -142,6 +144,94 @@ def test_allowlist_rejects_arbitrary_sql() -> None:
         _assert_allowed("UPDATE orders SET x = 1")
     with pytest.raises(PgReplicationError):
         _assert_allowed("SELECT * FROM orders")  # a plain read is not a sanctioned write
+
+
+def test_allowlist_permits_replica_identity_full_only_for_alter_table() -> None:
+    # The re-keyed-table before-image widening is the ONLY ALTER TABLE allowed...
+    _assert_allowed('ALTER TABLE "app"."orders" REPLICA IDENTITY FULL')
+    # ...any other ALTER TABLE (drop/rename/type change) is refused so the broad prefix
+    # never becomes an arbitrary-DDL surface.
+    with pytest.raises(PgReplicationError):
+        _assert_allowed('ALTER TABLE "app"."orders" DROP COLUMN secret')
+    with pytest.raises(PgReplicationError):
+        _assert_allowed('ALTER TABLE "app"."orders" REPLICA IDENTITY NOTHING')
+
+
+# ---------------------------------------------------------------------------
+# FIX 1: re-keyed (composite-PK) tables need REPLICA IDENTITY FULL
+# ---------------------------------------------------------------------------
+
+
+def test_rekeyed_tables_needing_full_identity_flags_added_leading_column_only() -> None:
+    # orders: re-key (tenant_id, id) adds tenant_id OUTSIDE the source PK [id] -> needs FULL.
+    # events: re-key just REORDERS the composite source PK [a, b] -> DEFAULT identity covers it.
+    # items: not re-keyed at all (absent from the key map) -> not returned.
+    message_key_columns = {
+        "app.orders": ["tenant_id", "id"],
+        "app.events": ["b", "a"],
+    }
+    table_pks = {
+        "app.orders": ["id"],
+        "app.events": ["a", "b"],
+        "app.items": ["id"],
+    }
+    assert rekeyed_tables_needing_full_identity(message_key_columns, table_pks) == [
+        "app.orders"
+    ]
+    # A normal (non-re-keyed) selection needs nothing.
+    assert rekeyed_tables_needing_full_identity({}, table_pks) == []
+
+
+def test_set_replica_identity_full_issues_alter_per_table() -> None:
+    conn = _FakeConn()
+    logs: list[str] = []
+    set_replica_identity_full(conn, ["app.orders", "app.customers"], on_log=logs.append)
+    alters = [
+        sql for sql, _ in conn.statements if sql.upper().startswith("ALTER TABLE")
+    ]
+    assert len(alters) == 2
+    assert all(a.upper().endswith("REPLICA IDENTITY FULL") for a in alters)
+    assert '"app"."orders"' in alters[0]
+    assert any("REPLICA IDENTITY FULL" in m for m in logs)
+    # Empty input is a no-op (no writes).
+    conn2 = _FakeConn()
+    set_replica_identity_full(conn2, [])
+    assert conn2.statements == []
+
+
+def test_provision_sets_replica_identity_full_before_slot_for_rekeyed_tables() -> None:
+    conn = _FakeConn(lsn="7/CAFE")
+    provision_pg_replication(
+        conn,
+        slot_name="dsqlmig_s",
+        publication_name="dsqlmig_pub_s",
+        tables=["app.orders", "app.items"],
+        full_identity_tables=["app.orders"],
+    )
+    ops = [" ".join(sql.upper().split()) for sql, _ in conn.statements]
+    alter_idx = next(
+        i for i, s in enumerate(ops)
+        if s.startswith("ALTER TABLE") and s.endswith("REPLICA IDENTITY FULL")
+    )
+    slot_idx = next(
+        i for i, s in enumerate(ops) if "PG_CREATE_LOGICAL_REPLICATION_SLOT" in s
+    )
+    # FULL identity is set BEFORE the slot's LSN so the streamed before-image is wide.
+    assert alter_idx < slot_idx
+    # Only the re-keyed table is altered (app.items is not).
+    alters = [s for s in ops if s.startswith("ALTER TABLE")]
+    assert len(alters) == 1
+    assert '"APP"."ORDERS"' in alters[0]
+
+
+def test_provision_without_rekeyed_tables_issues_no_alter() -> None:
+    # A normal (non-re-keyed) migration never touches REPLICA IDENTITY on the source.
+    conn = _FakeConn()
+    provision_pg_replication(
+        conn, slot_name="dsqlmig_s", publication_name="dsqlmig_pub_s",
+        tables=["app.orders"],
+    )
+    assert not any(sql.upper().startswith("ALTER TABLE") for sql, _ in conn.statements)
 
 
 # ---------------------------------------------------------------------------

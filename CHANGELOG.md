@@ -5,6 +5,41 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.436
+
+### Fixed
+
+- **CDC pipeline fixes for MySQL and PostgreSQL sources** (found by a review of the Debezium
+  source configs, the custom Java DSQL sink, and the control-plane; the pipeline core —
+  idempotent upsert, per-type conversion, transient/DLQ classification, delete/tombstone,
+  gapless handoff — was already sound and engine-consistent):
+  - **PostgreSQL CDC start no longer silently skips its topic/offset setup on a
+    non-in-VPC host.** A PostgreSQL cdc-stack is always created `SeedMode=External`, but
+    Start passed the host's seed-mode config — so on a host not configured External the
+    in-process topic/offset prep was skipped and PostgreSQL CDC never streamed. Start now
+    derives `SeedMode` from the source engine (PostgreSQL ⇒ External) to match the infra,
+    and warns loudly when the host cannot reach MSK.
+  - **PostgreSQL re-keyed tables (a `COMPOSITE_KEY` conversion) no longer silently lose
+    DELETEs.** When the CDC re-key prepends a non-PK column, PostgreSQL `REPLICA IDENTITY
+    DEFAULT` publishes only the source PK in the DELETE before-image, so the sink could not
+    build the re-keyed delete and it was dropped. Those specific tables now get `REPLICA
+    IDENTITY FULL` at publication creation (tightly allow-listed to exactly that statement),
+    with a pre-start heads-up. MySQL is immune (its binlog before-image is the full row).
+  - **PostgreSQL UPDATE of an unchanged TOASTed non-string value (e.g. `numeric`) no longer
+    overwrites the target with the unavailable-value placeholder.** Debezium's
+    `ReselectColumnsPostProcessor` is enabled on the PostgreSQL source connector to re-query
+    an unavailable value by primary key before emitting the after-image (a genuine
+    `SET col = NULL` is preserved; the sink is unchanged).
+  - **The DSQL sink now caps a write transaction by BYTES, not just row count.** A wide /
+    JSON-heavy 3000-row chunk could exceed Aurora DSQL's 10 MiB/transaction limit and
+    collapse to a slow one-row-per-transaction fallback; the sink now also splits a chunk
+    when it would cross ~8 MiB, mirroring Full Load. (Requires a **cdc-stack Delete + Deploy**
+    to take effect — MSK Connect custom plugins are immutable; the bundled sink plugin is
+    rebuilt and `PLUGIN_VERSION` is bumped to v38.)
+  - **The MySQL "Start CDC" button in automatic mode now requires a seedable binlog
+    file:position** (not just any coordinates), so a GTID-only watermark steers the user to
+    Manual / granting `REPLICATION CLIENT` rather than enabling a start that cannot seed.
+
 ## v0.1.435
 
 ### Fixed

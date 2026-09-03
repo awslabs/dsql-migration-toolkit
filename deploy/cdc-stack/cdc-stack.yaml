@@ -2131,6 +2131,24 @@ Resources:
           Fn::Sub: "${SourceMaxBatchSize}"
         max.queue.size:
           Fn::Sub: "${SourceMaxQueueSize}"
+        # ReselectColumnsPostProcessor (PostgreSQL-only). On an UPDATE of an UNCHANGED
+        # TOASTed value, PostgreSQL emits an "unavailable value" placeholder for that
+        # column rather than the value. The DSQL sink can only detect that placeholder
+        # for string/bytea (DebeziumEvents.isToastPlaceholder), so an unchanged TOASTed
+        # NON-string value (numeric, arrays, geometry) would be applied AS the placeholder
+        # -- silently overwriting the real DSQL value. This post-processor re-queries the
+        # unavailable column BY PRIMARY KEY before the after-image is emitted, so the sink
+        # always receives the true value (the fix is on the SOURCE, not a sink NULL-drop
+        # heuristic that would also discard a legitimate SET col=NULL). Scoped to
+        # unavailable (toasted) values only: reselect.unavailable.values=true triggers the
+        # re-query ONLY for placeholder columns, and reselect.null.values=false leaves a
+        # genuine NULL untouched. The re-select is a read (SELECT by PK) -- the source stays
+        # read-only. MySQL carries the full before/after image in the binlog, so its source
+        # connector deliberately omits this.
+        post.processors: reselector
+        reselector.type: io.debezium.processors.reselect.ReselectColumnsPostProcessor
+        reselector.reselect.unavailable.values: "true"
+        reselector.reselect.null.values: "false"
         # key.converter/value.converter come from WorkerConfiguration (single
         # canonical source), exactly as the MySQL source connector.
 

@@ -5,6 +5,37 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.436
+
+### 修正 (Fixed)
+
+- **CDC パイプラインの修正(MySQL・PostgreSQL ソース)**(Debezium ソース設定 + カスタム Java DSQL
+  シンク + コントロールプレーンのレビューで発見 — パイプラインの中核(冪等 upsert・型変換・
+  transient/DLQ 分類・delete/tombstone・gapless ハンドオフ)は既に堅牢でエンジン間一貫):
+  - **PostgreSQL の CDC start が非 in-VPC ホストでトピック/オフセット設定を暗黙にスキップ**して
+    いた問題。PG cdc-stack は常に `SeedMode=External` で作成されるのに Start はホストの seed-mode
+    設定を渡していたため、External でないホストでは in-process のトピック/オフセット準備がスキップ
+    され PG CDC がストリーミングされませんでした。Start が SeedMode を**ソースエンジン**
+    (PostgreSQL ⇒ External)から導出(インフラと一致)し、ホストが MSK に到達できない場合は明示的に
+    警告します。
+  - **PostgreSQL の再キー付けテーブル(`COMPOSITE_KEY` 変換)が DELETE を暗黙に失う**問題。再キーが
+    非 PK 列を先頭に付加すると、PG `REPLICA IDENTITY DEFAULT` は DELETE の before-image にソース PK
+    のみを載せるため、シンクが再キーの delete を構築できず失われていました。該当テーブルのみ
+    publication 作成時に `REPLICA IDENTITY FULL` を設定(その文のみを厳密に allowlist)し、事前に
+    通知します。MySQL は binlog の before-image が全行なので影響なし。
+  - **PostgreSQL の未変更 TOAST 非文字列値(例:`numeric`)の UPDATE がターゲットを placeholder で
+    上書き**していた問題。PG ソースコネクタで Debezium `ReselectColumnsPostProcessor` を有効化し、
+    unavailable な値を PK で再取得してから after-image を発行します(本物の `SET col = NULL` は保持;
+    シンクは変更なし)。
+  - **DSQL シンクが行数だけでなくバイトで書き込みトランザクションを制限**するように。幅広/JSON 主体の
+    3000 行チャンクが DSQL の 10 MiB/トランザクション上限を超えて遅い 1 行/トランザクションの
+    フォールバックに崩れる可能性がありましたが、~8 MiB 超過時にもチャンクを分割(Full Load と同様)。
+    (適用には **cdc-stack の Delete + Deploy** が必要 — MSK Connect のカスタムプラグインは不変。
+    同梱シンクプラグインを再ビルドし `PLUGIN_VERSION` を v38 に更新。)
+  - **MySQL の "Start CDC" ボタン(automatic モード)が seedable な binlog file:position を要求**
+    するように(任意の座標ではなく)。GTID のみの watermark は Manual/`REPLICATION CLIENT` 付与へ
+    誘導し、seed できない start を防ぎます。
+
 ## v0.1.435
 
 ### 修正 (Fixed)

@@ -114,6 +114,36 @@ def test_postgres_source_connector_uses_logical_replication() -> None:
     assert cfg["binary.handling.mode"] == "bytes"
 
 
+def test_postgres_source_connector_enables_reselect_post_processor() -> None:
+    # A PG UPDATE of an UNCHANGED TOASTed NON-string value emits the unavailable-value
+    # placeholder the sink can only detect for string/bytea, so it would silently overwrite
+    # the real value. The reselect post-processor re-queries the toasted column by PK on the
+    # SOURCE before emitting the after-image, scoped to unavailable values only (never a
+    # legitimate SET col=NULL).
+    cfg = _load_template()["Resources"]["PostgresSourceConnector"][
+        "Properties"
+    ]["ConnectorConfiguration"]
+    assert cfg["post.processors"] == "reselector"
+    assert (
+        cfg["reselector.type"]
+        == "io.debezium.processors.reselect.ReselectColumnsPostProcessor"
+    )
+    # Trigger on toasted (unavailable) values; do NOT reselect genuine NULLs (that would
+    # discard a real SET col=NULL).
+    assert cfg["reselector.reselect.unavailable.values"] == "true"
+    assert cfg["reselector.reselect.null.values"] == "false"
+
+
+def test_mysql_source_connector_has_no_reselect_post_processor() -> None:
+    # MySQL's binlog carries the full before/after image, so it needs no reselect; the
+    # post-processor is a PostgreSQL-only addition and must NOT leak into the MySQL source.
+    cfg = _load_template()["Resources"]["DebeziumSourceConnector"][
+        "Properties"
+    ]["ConnectorConfiguration"]
+    assert "post.processors" not in cfg
+    assert not any(k.startswith("reselector.") for k in cfg)
+
+
 def test_postgres_source_connector_omits_mysql_only_keys() -> None:
     cfg = _load_template()["Resources"]["PostgresSourceConnector"][
         "Properties"

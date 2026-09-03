@@ -162,6 +162,25 @@ def _cdc_source_database(session) -> str:
     return getattr(getattr(session, "source_config", None), "database", "") or ""
 
 
+def _cdc_start_seed_mode(source_type: SourceType, host_seed_mode: str) -> str:
+    """Engine-aware CDC-Start SeedMode -- ONE source of truth shared with the infra build.
+
+    A PostgreSQL cdc-stack is ALWAYS created ``SeedMode=External`` (no in-VPC offset-seeder
+    Lambda; it resumes from a logical replication slot, and ``build_pg_cdc_infra_params``
+    hard-codes ``seed_mode="external"``). The External path does its Kafka prep -- creating
+    the pinned offset / DLQ / per-table data topics + seeding the offset -- **in-process at
+    Start** (``run_cdc_start``'s ``if seed_mode == "external"`` branch). So Start MUST also
+    use ``"external"`` for a PostgreSQL source, derived from the SOURCE ENGINE and NOT from
+    the host's ``cdc_seed_mode``: on a host whose ``cdc_seed_mode`` is the default (not
+    external) that branch would be skipped, the topics never created, and PG CDC never
+    streams. MySQL keeps deriving from the host config (the in-VPC EC2 host sets
+    ``external``; Fargate/local -> ``lambda``), so MySQL behavior is unchanged.
+    """
+    if source_type is SourceType.POSTGRES:
+        return "external"
+    return host_seed_mode
+
+
 def _cdc_resume_signal(migration_state, session):
     """Resolve the engine-appropriate CDC start signal for the config builders.
 
@@ -1820,15 +1839,19 @@ def _render_cdc_start_button(
     ready = (
         resumes_from_offset
         or (override is not None and override.has_coordinates())
-        # MySQL resumes from a binlog/GTID coordinate (has_coordinates); PostgreSQL
-        # resumes from the logical-replication slot's WAL LSN (can_resume_from_lsn).
-        # Accept EITHER so a PostgreSQL Full Load watermark (a WAL LSN, no binlog/GTID)
-        # enables Start CDC -- keying on has_coordinates() alone left it disabled for PG
-        # with "Set the CDC start point above first" while the start-point card showed
-        # the LSN as set.
+        # The AUTOMATIC gapless handoff resumes from the Full Load watermark. MySQL seeds
+        # the connect-offset from a binlog file:position (can_seed_offset); PostgreSQL
+        # resumes from the logical-replication slot's WAL LSN (can_resume_from_lsn). Accept
+        # EITHER so a PostgreSQL Full Load watermark (a WAL LSN, no binlog/GTID) enables
+        # Start CDC. Gate MySQL on can_seed_offset() -- NOT has_coordinates() -- because a
+        # GTID-only watermark (SHOW MASTER STATUS needs REPLICATION CLIENT, commonly
+        # restricted on RDS, while @@GLOBAL.gtid_executed is a plain read) has no file:pos
+        # to seed: auto mode would then silently resume from the CURRENT binlog and lose
+        # every change made during the load. Such a watermark must steer the operator to
+        # Manual (or grant REPLICATION CLIENT), so it must NOT enable auto Start.
         or (
             wm_resume is not None
-            and (wm_resume.has_coordinates() or wm_resume.can_resume_from_lsn())
+            and (wm_resume.can_seed_offset() or wm_resume.can_resume_from_lsn())
         )
         or (is_pg and mode == "manual")
     )
@@ -3149,6 +3172,61 @@ def _start_cdc_deploy(
             ),
         )
         return
+    # FIX 1 (PostgreSQL): a COMPOSITE_KEY re-key prepends a non-PK "leading" column to the
+    # CDC record key. Under REPLICA IDENTITY DEFAULT the UPDATE/DELETE before-image carries
+    # only the source PK, so the sink cannot build the re-keyed DELETE and the delete is
+    # silently lost. The tool sets REPLICA IDENTITY FULL on exactly those tables during Full
+    # Load provisioning (cdc_pg_slot); surface the requirement here so a CDC-only start
+    # (no Full Load in this session) knows it must be set on the source first. MySQL is
+    # immune (its binlog before-image is the full row), so this is PostgreSQL-only.
+    if _cdc_source_type(session) is SourceType.POSTGRES:
+        from dsql_migrator.core import cdc_pg_slot as _pg_slot
+
+        _rekeyed_full = _pg_slot.rekeyed_tables_needing_full_identity(
+            message_key_columns,
+            {t.name: list(t.primary_key) for t in tables_for_config},
+        )
+        if _rekeyed_full:
+            render_notice(
+                ui,
+                tone="info",
+                header="Re-keyed tables need REPLICA IDENTITY FULL",
+                body=(
+                    "These tables use a composite (re-keyed) primary key, so their "
+                    "UPDATE/DELETE before-image must carry the added leading key column "
+                    "for deletes to replicate: " + ", ".join(_rekeyed_full) + ". The tool "
+                    "sets REPLICA IDENTITY FULL on them during Full Load. If you did not "
+                    "run Full Load in this session, run ALTER TABLE … REPLICA IDENTITY FULL "
+                    "on the source for these tables before starting CDC, or their deletes "
+                    "will be lost."
+                ),
+            )
+    # FIX 4: SeedMode is engine-aware -- the SINGLE source of truth shared with the infra
+    # build. A PostgreSQL stack is always created SeedMode=External, so Start must run the
+    # in-process External Kafka prep regardless of the host's cdc_seed_mode; MySQL keeps
+    # deriving from the host config (unchanged).
+    from dsql_migrator.config import load_config as _load_config
+
+    _host_cfg = _load_config()
+    seed_mode = _cdc_start_seed_mode(_cdc_source_type(session), _host_cfg.cdc_seed_mode)
+    # The External prep runs IN-PROCESS over the MSK IAM bootstrap, so it needs the app to
+    # be inside the cdc-stack VPC (the in-VPC host sets cdc_seed_mode=external). Warn loudly
+    # when a PostgreSQL Start is attempted from a host that is not in-VPC: the in-process
+    # seed cannot reach MSK there (run_cdc_start also fails loudly mid-deploy), so this is a
+    # pre-flight heads-up rather than silently proceeding.
+    if seed_mode == "external" and _host_cfg.cdc_seed_mode != "external":
+        render_notice(
+            ui,
+            tone="warning",
+            header="Start PostgreSQL CDC from inside the VPC",
+            body=(
+                "PostgreSQL CDC prepares its Kafka topics and start offset in-process over "
+                "the MSK IAM endpoint, which requires running inside the cdc-stack VPC "
+                "(admitted on port 9098). This host does not appear to be in-VPC, so the "
+                "start may fail to reach MSK. Start CDC from the in-VPC host that deployed "
+                "the CDC infrastructure."
+            ),
+        )
     source_config = dispatch_source_config(
         _cdc_source_type(session),
         tables_for_config,
@@ -3199,11 +3277,10 @@ def _start_cdc_deploy(
         except Exception:  # noqa: BLE001 — best-effort; a later step fails with a clear message
             pass
         template_body = _read_cdc_template_body()
-        # "Host is the mode": the in-VPC EC2 host sets DSQL_MIGRATOR_CDC_SEED_MODE=external
-        # so the app does the CDC Kafka prep in-process (Lambda-free); Fargate/local leave
-        # it unset -> "lambda" (the in-VPC seeder Lambda does the prep, unchanged).
-        from dsql_migrator.config import load_config as _load_config
-
+        # SeedMode is derived ENGINE-AWARE above (FIX 4): a PostgreSQL source forces
+        # "external" (its stack is always SeedMode=External) so the in-process Kafka prep
+        # runs; MySQL keeps the host config ("Host is the mode": the in-VPC EC2 host sets
+        # DSQL_MIGRATOR_CDC_SEED_MODE=external, Fargate/local leave it -> "lambda").
         run_cdc_start(
             handle,
             stack_name=stack_name,
@@ -3215,7 +3292,7 @@ def _start_cdc_deploy(
             # deployed and the source connector starts from the current binlog.
             watermark=watermark,
             template_body=template_body,
-            seed_mode=_load_config().cdc_seed_mode,
+            seed_mode=seed_mode,
         )
 
     _action = "start CDC connectors"

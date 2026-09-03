@@ -108,6 +108,22 @@ public class DsqlSinkTask extends SinkTask {
    */
   static final int DSQL_MAX_VALUE_BYTES = 1024 * 1024; // 1 MiB
 
+  /**
+   * Per-transaction byte budget for chunking, with headroom under DSQL's 10 MiB
+   * "data modified in one write transaction" limit. A chunk flushes when it reaches
+   * {@link DsqlSinkConnectorConfig#batchSize()} rows OR when adding the next event would
+   * push its estimated modified bytes past this budget (see {@link #put(Collection)} /
+   * {@link Batches#partition(List, int, long, java.util.function.ToLongFunction)}). This
+   * mirrors the Full Load loader's {@code MAX_BATCH_BYTES} (core/batched_import.py): without
+   * it a wide / JSON-heavy 3,000-row chunk exceeds 10 MiB and collapses to the slow
+   * one-row-per-transaction fallback (or errors). 8 MiB leaves ~2 MiB of headroom for
+   * statement overhead + the conservative estimate.
+   */
+  static final long MAX_BATCH_BYTES = 8L * 1024 * 1024; // 8 MiB
+
+  /** Fixed per-value estimate for a non-string/non-bytea scalar (number/bool/timestamp). */
+  private static final long SCALAR_VALUE_BYTES = 16L;
+
   private DsqlSinkConnectorConfig config;
   private DsqlIamTokenProvider tokenProvider;
   private Connection connection;
@@ -275,9 +291,51 @@ public class DsqlSinkTask extends SinkTask {
     if (batch.isEmpty()) {
       return;
     }
-    for (List<Applicable> chunk : Batches.partition(batch, config.batchSize())) {
+    // Chunk on BOTH DSQL transaction limits: <= batchSize rows AND <= MAX_BATCH_BYTES of
+    // modified data (headroom under the 10 MiB/txn cap). Byte-bounding is estimated on the
+    // pre-dedupe event set, so it is a safe over-estimate -- applyChunkBatched's per-PK
+    // dedupe can only shrink a chunk's real modified bytes, never grow them.
+    for (List<Applicable> chunk :
+        Batches.partition(
+            batch,
+            config.batchSize(),
+            MAX_BATCH_BYTES,
+            a -> estimateModifiedBytes(a.event()))) {
       applyBatch(chunk);
     }
+  }
+
+  /**
+   * Cheaply estimate the bytes an event MODIFIES in DSQL, for the per-transaction byte
+   * budget ({@link #MAX_BATCH_BYTES}). An upsert modifies its after-image (all column
+   * values); a delete modifies only the PK it matches on. Mirrors
+   * {@code _estimate_row_bytes} in core/batched_import.py: a string counts its UTF-8
+   * encoded byte length (DSQL's cap is on WIRE bytes, and CJK/emoji are multi-byte), a
+   * {@code byte[]} its length, and any other scalar a small fixed estimate. It need not be
+   * exact -- only keep a chunk comfortably under the 10 MiB limit. Package-private + static
+   * so a unit test can assert the split without a live pipeline.
+   */
+  static long estimateModifiedBytes(ChangeEvent event) {
+    List<Object> values = event.isDelete() ? event.pkValues() : event.values();
+    long total = 0L;
+    for (Object v : values) {
+      total += estimateValueBytes(v);
+    }
+    return total;
+  }
+
+  /** Estimated wire bytes of one value (UTF-8 for strings, length for bytea, else fixed). */
+  private static long estimateValueBytes(Object v) {
+    if (v == null) {
+      return 1L;
+    }
+    if (v instanceof String s) {
+      return s.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+    }
+    if (v instanceof byte[] b) {
+      return b.length;
+    }
+    return SCALAR_VALUE_BYTES;
   }
 
   /**

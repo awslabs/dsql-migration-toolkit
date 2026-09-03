@@ -3580,6 +3580,129 @@ def test_start_cdc_deploy_defers_blocking_setup_to_the_job_body(monkeypatch) -> 
     assert state2.cdc_teardown_ctx["cleanup_secret"] is False  # stop never cleans the secret
 
 
+def test_cdc_start_seed_mode_is_engine_aware() -> None:
+    # FIX 4: a PostgreSQL source ALWAYS uses SeedMode=External (its stack is created that
+    # way and the in-process External Kafka prep must run), regardless of the host config;
+    # MySQL keeps deriving SeedMode from the host config.
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration._cdc_ui import _cdc_start_seed_mode
+
+    assert _cdc_start_seed_mode(SourceType.POSTGRES, "lambda") == "external"
+    assert _cdc_start_seed_mode(SourceType.POSTGRES, "external") == "external"
+    assert _cdc_start_seed_mode(SourceType.MYSQL, "lambda") == "lambda"
+    assert _cdc_start_seed_mode(SourceType.MYSQL, "external") == "external"
+
+
+def _run_start_cdc_capture_seed_mode(monkeypatch, *, source_type, host_seed_mode):
+    """Drive _start_cdc_deploy for a source engine + host seed_mode; return the seed_mode
+    kwarg run_cdc_start was invoked with (running the submitted job body)."""
+    from types import SimpleNamespace
+
+    import dsql_migrator.config as _config
+    import dsql_migrator.core.cdc_deployer as _dep
+    import dsql_migrator.ui.data_migration._cdc_ui as _cdcui
+    from dsql_migrator.core.models import SourceType
+
+    captured = {}
+
+    class _Deployer:
+        template_s3_bucket = ""
+
+        def _client(self, _svc):
+            return SimpleNamespace(
+                get_caller_identity=lambda: {"Account": "111122223333"}
+            )
+
+    def _run(*_a, **kw):
+        captured["seed_mode"] = kw.get("seed_mode")
+
+    monkeypatch.setattr(_dep, "build_cdc_stack_deployer", lambda *a, **k: _Deployer())
+    monkeypatch.setattr(_dep, "run_cdc_start", _run)
+    monkeypatch.setattr(_cdcui, "_read_cdc_template_body", lambda: "TEMPLATE-BODY")
+    monkeypatch.setattr(_cdcui, "_log_cdc_event", lambda *a, **k: None)
+    # A host config with the given seed mode (patched so the test is env-independent).
+    monkeypatch.setattr(
+        _config,
+        "load_config",
+        lambda *a, **k: SimpleNamespace(
+            cdc_seed_mode=host_seed_mode,
+            cdc_host_subnet_cidr="",
+            cdc_sink_mcu_count=1,
+        ),
+    )
+    # Record notices instead of rendering into a real NiceGUI tree.
+    notices = []
+    monkeypatch.setattr(
+        _cdcui, "render_notice", lambda ui, **kw: notices.append(kw)
+    )
+
+    class _SubmitOnlyJM:
+        def __init__(self) -> None:
+            self.work = None
+
+        def submit(self, work):
+            self.work = work
+            return "job-1"
+
+    class _Ui:
+        def notify(self, *_a, **_k):
+            return None
+
+    source_config = (
+        SimpleNamespace(source_type=source_type, database="app")
+        if source_type is SourceType.POSTGRES
+        else SimpleNamespace(source_type=source_type, database="app", port=3306)
+    )
+    session = SimpleNamespace(
+        target_config=SimpleNamespace(
+            region="us-east-1",
+            cluster_endpoint="ep.dsql.amazonaws.com",
+            database="postgres",
+            username="admin",
+        ),
+        aws_profile=None,
+        source_password=None,
+        source_config=source_config,
+        source_secret_id=None,
+    )
+    state = DataMigrationState()
+    state.set_selection(TableSelection(selected_tables=["orders"]))
+
+    jm = _SubmitOnlyJM()
+    _cdcui._start_cdc_deploy(
+        _Ui(), state, jm, lambda: None, inventory=_inventory(), session=session
+    )
+    assert jm.work is not None
+    jm.work(SimpleNamespace())
+    return captured.get("seed_mode"), notices
+
+
+def test_start_cdc_deploy_forces_external_seed_mode_for_postgres(monkeypatch) -> None:
+    # FIX 4: even on a host whose cdc_seed_mode is the (non-external) default, a PostgreSQL
+    # Start must invoke run_cdc_start with seed_mode="external" -- otherwise the in-process
+    # External Kafka prep is skipped and PG CDC never streams. A loud pre-flight warning is
+    # surfaced because that prep needs the app to run in-VPC.
+    from dsql_migrator.core.models import SourceType
+
+    seed_mode, notices = _run_start_cdc_capture_seed_mode(
+        monkeypatch, source_type=SourceType.POSTGRES, host_seed_mode="lambda"
+    )
+    assert seed_mode == "external"
+    assert any("VPC" in (n.get("header", "") + n.get("body", "")) for n in notices)
+
+
+def test_start_cdc_deploy_keeps_host_seed_mode_for_mysql(monkeypatch) -> None:
+    # MySQL is unchanged: SeedMode still derives from the host config (here "lambda"), and
+    # no in-VPC warning is surfaced.
+    from dsql_migrator.core.models import SourceType
+
+    seed_mode, notices = _run_start_cdc_capture_seed_mode(
+        monkeypatch, source_type=SourceType.MYSQL, host_seed_mode="lambda"
+    )
+    assert seed_mode == "lambda"
+    assert not any("VPC" in (n.get("header", "") + n.get("body", "")) for n in notices)
+
+
 # ---------------------------------------------------------------------------
 # run_full_load: per-table error recording to the error log (Property 15)
 # ---------------------------------------------------------------------------
@@ -14866,6 +14989,111 @@ def test_cdc_start_button_ready_accepts_postgres_lsn_resume() -> None:
         "Start CDC readiness must accept a PostgreSQL WAL-LSN resume "
         "(can_resume_from_lsn), not only MySQL has_coordinates()"
     )
+    # FIX LOW: the AUTOMATIC watermark clause must gate on can_seed_offset() (a seedable
+    # binlog file:position), NOT the broad wm_resume.has_coordinates() (which a GTID-only
+    # watermark satisfies but the seeder cannot use). The manual `override.has_coordinates()`
+    # clause is unrelated and may remain.
+    assert "wm_resume.can_seed_offset()" in joined
+    assert "wm_resume.has_coordinates()" not in joined, (
+        "auto-mode Start must not enable on a GTID-only watermark (no seedable file:pos)"
+    )
+
+
+class _StartButtonUi:
+    """A NiceGUI double that records the Start CDC button's disabled state + rendered text."""
+
+    class _El:
+        def __init__(self, ui, label=""):
+            self._ui = ui
+            self._label = label
+
+        def props(self, value="", *_a, **_k):
+            if self._label == "Start CDC" and "disable" in str(value):
+                self._ui.start_disabled = True
+            return self
+
+        def __getattr__(self, _name):
+            return lambda *_a, **_k: self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    def __init__(self):
+        self.texts: list[str] = []
+        self.start_disabled = False
+
+    def button(self, text="", *_a, **_k):
+        self.texts.append(str(text))
+        return _StartButtonUi._El(self, str(text))
+
+    def label(self, text="", *_a, **_k):
+        self.texts.append(str(text))
+        return _StartButtonUi._El(self)
+
+    def badge(self, text="", *_a, **_k):
+        self.texts.append(str(text))
+        return _StartButtonUi._El(self)
+
+    def notify(self, *_a, **_k):
+        return None
+
+    def refreshable(self, fn):
+        def _w(*a, **k):
+            return fn(*a, **k)
+
+        _w.refresh = lambda *a, **k: None
+        return _w
+
+    def __getattr__(self, _name):
+        return lambda *_a, **_k: _StartButtonUi._El(self)
+
+
+def test_start_cdc_auto_mode_disabled_for_gtid_only_watermark() -> None:
+    """FIX LOW: a GTID-only Full Load watermark must NOT enable auto-mode Start CDC.
+
+    The automatic gapless handoff seeds the connect-offset from a binlog file:position; a
+    GTID set alone has nothing to seed (SHOW MASTER STATUS needs REPLICATION CLIENT, often
+    restricted on RDS), so auto Start would silently resume from the CURRENT binlog and lose
+    the Full Load window. Gating on ``can_seed_offset()`` (not ``has_coordinates()``) keeps
+    the button disabled so the operator is steered to Manual / to grant REPLICATION CLIENT.
+    A watermark WITH a binlog file:position still enables it.
+    """
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    class _JM:
+        def __init__(self, job):
+            self._job = job
+
+        def get_status(self, _job_id):
+            return self._job
+
+    def _render(watermark):
+        ui = _StartButtonUi()
+        state = DataMigrationState()
+        state.set_cdc_stack_phase("infra", status="UPDATE_COMPLETE")
+        state.set_prereq_gated_mode(MigrationMode.CDC)  # prereqs pass; only the start gate
+        state.set_cdc_has_committed_offset(False)  # not a resume; the wm clause decides
+        state.job_id = "job-1"
+        job = SimpleNamespace(watermark=watermark, status="SUCCEEDED")
+        _cdc_ui._render_cdc_start_button(
+            ui, state, _JM(job), lambda: None, inventory=None, session=None
+        )
+        return ui
+
+    now = datetime.now(timezone.utc)
+    gtid_only = _render(Watermark(snapshot_timestamp=now, gtid_executed="uuid:1-100"))
+    assert gtid_only.start_disabled is True
+    assert "Set the CDC start point above first." in " ".join(gtid_only.texts)
+
+    seedable = _render(
+        Watermark(snapshot_timestamp=now, binlog_file="mysql-bin.000001", binlog_position=120)
+    )
+    assert seedable.start_disabled is False
 
 
 # ---------------------------------------------------------------------------

@@ -5,6 +5,34 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.436
+
+### 수정 (Fixed)
+
+- **CDC 파이프라인 수정 (MySQL·PostgreSQL 소스)** (Debezium 소스 설정 + 커스텀 Java DSQL 싱크 +
+  컨트롤플레인 리뷰에서 발견 — 파이프라인 핵심(멱등 upsert·타입 변환·transient/DLQ 분류·delete/
+  tombstone·gapless 핸드오프)은 이미 견고·엔진 일관):
+  - **PostgreSQL CDC start가 non-in-VPC 호스트에서 토픽/오프셋 셋업을 조용히 스킵하던 문제.**
+    PG cdc-stack은 항상 `SeedMode=External`로 생성되는데 Start는 호스트 seed-mode 설정을 넘겨서,
+    External이 아닌 호스트에선 in-process 토픽/오프셋 사전준비가 스킵돼 PG CDC가 스트리밍되지
+    않았습니다. 이제 Start가 SeedMode를 **소스 엔진**(PostgreSQL ⇒ External)에서 유도(인프라와
+    일치)하고, 호스트가 MSK에 못 닿으면 크게 경고합니다.
+  - **PostgreSQL 재키 테이블(`COMPOSITE_KEY` 변환)이 DELETE를 조용히 잃던 문제.** 재키가 비-PK
+    컬럼을 앞에 붙이면 PG `REPLICA IDENTITY DEFAULT`는 DELETE before-image에 소스 PK만 실어서
+    싱크가 재키 delete를 만들 수 없어 유실됐습니다. 이제 해당 테이블만 publication 생성 시
+    `REPLICA IDENTITY FULL`로 설정(정확히 그 문장만 allowlist)하고 사전 안내. MySQL은 binlog
+    before-image가 전체 행이라 영향 없음.
+  - **PostgreSQL의 미변경 TOAST 비문자열 값(예: `numeric`) UPDATE가 placeholder로 덮어쓰던 문제.**
+    이제 PG 소스 커넥터에 Debezium `ReselectColumnsPostProcessor`를 활성화해 unavailable 값을 PK로
+    재조회 후 after-image 방출(진짜 `SET col = NULL`은 보존; 싱크 변경 없음).
+  - **DSQL 싱크가 이제 행 수뿐 아니라 바이트로 write 트랜잭션을 제한.** wide/JSON 다량 3000행 청크가
+    DSQL 10 MiB/txn을 초과해 느린 행-단위 fallback으로 붕괴할 수 있었는데, 이제 ~8 MiB 초과 시에도
+    청크를 분할(Full Load와 동일). (적용하려면 **cdc-stack Delete + Deploy** 필요 — MSK Connect
+    커스텀 플러그인은 불변; 번들 싱크 플러그인 재빌드 + `PLUGIN_VERSION` v38.)
+  - **MySQL "Start CDC" 버튼(automatic 모드)이 이제 seedable binlog file:position을 요구**(아무
+    좌표가 아니라) — GTID-only watermark는 Manual/`REPLICATION CLIENT` 부여로 유도, seed 불가한
+    start를 막음.
+
 ## v0.1.435
 
 ### 수정 (Fixed)

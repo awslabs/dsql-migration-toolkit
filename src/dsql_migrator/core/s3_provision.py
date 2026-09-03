@@ -59,6 +59,18 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v38 rebuilds the DSQL sink jar so chunking respects DSQL's per-write-transaction BYTE
+#    limit, not just the 3,000-row limit. put() previously partitioned by row count alone
+#    (Batches.partition(batch, batchSize)), so a wide / JSON-heavy 3,000-row chunk could
+#    exceed DSQL's 10 MiB "data modified in one transaction" cap and collapse to the slow
+#    one-row-per-transaction fallback (or error). v38 adds a per-transaction byte budget
+#    (MAX_BATCH_BYTES = 8 MiB, headroom under 10 MiB), mirroring the Full Load loader's
+#    MAX_BATCH_BYTES: a chunk flushes when it reaches batchSize rows OR when adding the next
+#    event would push its estimated modified bytes past the budget (>= 1 event/chunk always;
+#    a lone event is bounded by DSQL's 2 MiB row limit + the 1 MiB per-value guard). The
+#    estimate sums the after-image field sizes cheaply (UTF-8 length for strings, array
+#    length for bytea, a small fixed estimate for scalars). Sink-jar change only; a running
+#    cdc-stack keeps its current plugin until a redeploy.
 # v37 rebuilds the DSQL sink jar so a PostgreSQL-source bit/varbit column lands as its
 #    bit-STRING text ("11011011"), matching the Full Load path (psycopg returns the bit
 #    string). Before, the sink applied the MySQL-BIT rule (io.debezium.data.Bits
@@ -345,7 +357,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # existing plugin resource collides -- adding it needs no version bump and does NOT
 # force a Delete+Deploy on a live MySQL stack. Bump only when a plugin's CONTENT
 # changes.
-PLUGIN_VERSION = "v37"
+PLUGIN_VERSION = "v38"
 
 
 class S3ProvisionError(RuntimeError):

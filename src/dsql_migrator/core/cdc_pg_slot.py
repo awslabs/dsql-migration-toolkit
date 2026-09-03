@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Callable, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -58,13 +58,16 @@ _MAX_SLOT_NAME = 63
 
 # The COMPLETE set of statement shapes this module may execute against the source. Every
 # write is asserted against this before running, so the un-guarded engine can only ever
-# perform these four intended operations (create/drop slot, create/drop publication) plus
-# the read-only existence checks.
+# perform these intended operations (create/drop slot, create/drop publication, and set a
+# re-keyed table's REPLICA IDENTITY FULL) plus the read-only existence checks. The ALTER
+# TABLE prefix is additionally constrained in ``_assert_allowed`` to the exact
+# ``... REPLICA IDENTITY FULL`` tail, so it can never DROP/rename a column.
 _ALLOWED_WRITE_PREFIXES: tuple[str, ...] = (
     "CREATE PUBLICATION ",
     "DROP PUBLICATION ",
     "SELECT LSN FROM PG_CREATE_LOGICAL_REPLICATION_SLOT",
     "SELECT PG_DROP_REPLICATION_SLOT",
+    "ALTER TABLE ",
 )
 
 
@@ -133,6 +136,31 @@ def pg_publication_name(stack_name: str) -> str:
     return _derive_name(_PUBLICATION_PREFIX, stack_name)
 
 
+def rekeyed_tables_needing_full_identity(
+    message_key_columns: Mapping[str, Sequence[str]],
+    table_primary_keys: Mapping[str, Sequence[str]],
+) -> list[str]:
+    """Captured tables whose CDC re-key adds a column OUTSIDE the source PK -> need FULL identity.
+
+    A ``COMPOSITE_KEY`` schema conversion re-keys the change record on
+    ``(leading, *source_pk)`` (:func:`~dsql_migrator.core.cdc.composite_key_columns_for_cdc`).
+    Under PostgreSQL ``REPLICA IDENTITY DEFAULT`` the UPDATE/DELETE before-image carries ONLY
+    the source PRIMARY-KEY columns, so the prepended ``leading`` column is ABSENT -- and the
+    sink cannot build the re-keyed DELETE, so that delete is SILENTLY LOST. Such a table
+    needs ``REPLICA IDENTITY FULL`` (the before-image then carries every column). A re-key
+    that only REORDERS existing PK columns adds nothing outside the PK, so DEFAULT identity
+    already covers it and it is NOT returned. (MySQL is immune -- its binlog before-image is
+    always the full row -- so this is a PostgreSQL-only prerequisite.) Returns the offending
+    qualified ``db.table`` names (sorted); empty means none need FULL identity. Pure.
+    """
+    offending: list[str] = []
+    for table, key_cols in message_key_columns.items():
+        pk = set(table_primary_keys.get(table, ()))
+        if set(key_cols) - pk:
+            offending.append(table)
+    return sorted(offending)
+
+
 def build_pg_source_write_engine(
     source_config: SourceConnectionConfig, password: Optional[SecretValue]
 ) -> Engine:
@@ -170,11 +198,23 @@ def build_pg_source_write_engine(
 
 
 def _assert_allowed(statement: str) -> None:
-    """Raise unless ``statement`` is one of the fixed allowlisted source writes."""
+    """Raise unless ``statement`` is one of the fixed allowlisted source writes.
+
+    ``ALTER TABLE`` is allowlisted ONLY for the exact ``... REPLICA IDENTITY FULL`` shape
+    (a re-keyed table's before-image widening); any other ALTER (DROP/rename/type change)
+    is refused, so the broad prefix cannot become an arbitrary DDL surface.
+    """
     normalized = " ".join(statement.strip().upper().split())
     if not any(normalized.startswith(p) for p in _ALLOWED_WRITE_PREFIXES):
         raise PgReplicationError(
             f"refused non-allowlisted source write: {normalized[:60]!r}"
+        )
+    if normalized.startswith("ALTER TABLE ") and not normalized.endswith(
+        " REPLICA IDENTITY FULL"
+    ):
+        raise PgReplicationError(
+            f"refused non-allowlisted ALTER TABLE (only REPLICA IDENTITY FULL): "
+            f"{normalized[:60]!r}"
         )
 
 
@@ -371,31 +411,72 @@ def drop_publication(
     )
 
 
+def set_replica_identity_full(
+    connection: object,
+    tables: Sequence[str],
+    *,
+    on_log: Optional[Callable[[str], None]] = None,
+) -> None:
+    """``ALTER TABLE <t> REPLICA IDENTITY FULL`` for each of ``tables`` (allowlisted write).
+
+    Required for a ``COMPOSITE_KEY``-re-keyed table so its UPDATE/DELETE before-image carries
+    the prepended leading column the sink keys the re-keyed DELETE on -- see
+    :func:`rekeyed_tables_needing_full_identity`. Without it the leading column is absent
+    from the DEFAULT before-image and the re-keyed DELETE is silently lost. This is a source
+    write, so it lives on this audited path; it is idempotent (re-applying FULL is a no-op)
+    and RAISES loudly if the ALTER is refused (e.g. the source role does not own the table),
+    letting the caller surface an actionable message instead of losing deletes. ``tables``
+    are qualified ``schema.table`` names, quoted via the PG dialect.
+    """
+    if not tables:
+        return
+    dialect = dialect_for(SourceType.POSTGRES)
+    for table in tables:
+        _run_write(
+            connection,
+            f"ALTER TABLE {dialect.quote_table(table)} REPLICA IDENTITY FULL",
+            action=f"setting REPLICA IDENTITY FULL on {table} (re-keyed CDC before-image)",
+            on_log=on_log,
+        )
+
+
 def provision_pg_replication(
     connection: object,
     *,
     slot_name: str,
     publication_name: str,
     tables: Sequence[str],
+    full_identity_tables: Sequence[str] = (),
     on_log: Optional[Callable[[str], None]] = None,
 ) -> PgReplicationHandles:
     """Create the publication + a FRESH slot at the current consistency point.
 
-    Ordering: publication FIRST (defines the capture set), then the slot (whose returned
+    Ordering: set REPLICA IDENTITY FULL on the re-keyed tables FIRST (so every change WAL
+    from the slot's LSN onward carries the full before-image the re-keyed DELETE needs),
+    then the publication (defines the capture set), then the slot (whose returned
     consistent-point LSN pins WAL from here). A stale slot from a prior run is dropped
     first so the new slot's LSN matches THIS Full Load's snapshot -- safe because slot
     creation runs at Full Load time, before any CDC connector exists to hold it active.
     Returns the handles (incl. the resume LSN) to record on the watermark. Callers pass a
     connection from :func:`build_pg_source_write_engine` (the un-guarded AUTOCOMMIT path).
 
+    ``full_identity_tables`` are the captured tables whose CDC re-key adds a column outside
+    the source PK (:func:`rekeyed_tables_needing_full_identity`); each is set REPLICA
+    IDENTITY FULL. A FULL-identity ALTER that fails RAISES (before the slot is created), so
+    the handoff never silently starts without the wider before-image.
+
     Refuses upfront if any table lacks a usable REPLICA IDENTITY (a source-write outage
     guard). On AUTOCOMMIT the publication commits immediately, so if slot creation then
     fails, a publication CREATED by this call is dropped (compensating) rather than left
-    orphaned on the source.
+    orphaned on the source. (A REPLICA IDENTITY FULL set here is left in place on a later
+    failure -- it is a benign, reversible widening of the before-image, not an orphaned
+    object arming a write outage.)
     """
     # Source-safety guard (independent of the advisory prereq): never publish a table
     # whose UPDATE/DELETE would then ERROR on the source publisher.
     _verify_tables_replicable(connection, tables)
+    # Re-keyed tables need the full before-image (leading key column) BEFORE the slot's LSN.
+    set_replica_identity_full(connection, full_identity_tables, on_log=on_log)
     created_publication = create_publication(
         connection, name=publication_name, tables=tables, on_log=on_log
     )
@@ -442,6 +523,8 @@ __all__ = [
     "PgReplicationHandles",
     "pg_slot_name",
     "pg_publication_name",
+    "rekeyed_tables_needing_full_identity",
+    "set_replica_identity_full",
     "build_pg_source_write_engine",
     "publication_exists",
     "slot_exists",

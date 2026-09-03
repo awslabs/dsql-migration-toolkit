@@ -3154,9 +3154,31 @@ class BatchedTableMigrator:
         decorative LSN.
         """
         from dsql_migrator.core import cdc_pg_slot
+        from dsql_migrator.core.cdc import composite_key_columns_for_cdc
 
         slot = cdc_pg_slot.pg_slot_name(stack_name)
         publication = cdc_pg_slot.pg_publication_name(stack_name)
+
+        # A COMPOSITE_KEY-re-keyed table's CDC record key prepends a non-PK "leading"
+        # column. Under PostgreSQL REPLICA IDENTITY DEFAULT the UPDATE/DELETE before-image
+        # carries only the source PK, so that leading column is absent and the sink cannot
+        # build the re-keyed DELETE (the delete is silently lost). Set REPLICA IDENTITY FULL
+        # on exactly those tables at provision (before the slot's LSN) so the before-image
+        # carries the leading column. Scoped to the tables actually being captured.
+        _selected = set(table_names)
+        _rekey_map = {
+            t: c
+            for t, c in composite_key_columns_for_cdc(
+                self._inputs.inventory.tables, self._inputs.table_conversions
+            ).items()
+            if t in _selected
+        }
+        _table_pks = {
+            table.name: list(table.primary_key) for table in self._inputs.inventory.tables
+        }
+        full_identity_tables = cdc_pg_slot.rekeyed_tables_needing_full_identity(
+            _rekey_map, _table_pks
+        )
 
         def _audit(message: str) -> None:
             log_activity(
@@ -3176,6 +3198,7 @@ class BatchedTableMigrator:
                     slot_name=slot,
                     publication_name=publication,
                     tables=list(table_names),
+                    full_identity_tables=full_identity_tables,
                     on_log=_audit,
                 )
         finally:
