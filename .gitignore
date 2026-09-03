@@ -111,6 +111,7 @@ scripts/*
 !scripts/measure_performance.py
 !scripts/run_full_load.py
 !scripts/run_pg_cdc_e2e.py
+!scripts/release_gate.py
 !scripts/cdc_consistency_check.py
 !scripts/cdc_throughput_test.py
 !scripts/cdc_workload_customers_sample_new.py
