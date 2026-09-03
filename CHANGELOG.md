@@ -5,6 +5,40 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.437
+
+### Fixed
+
+- **Cut over: failure-surfacing and gating fixes for MySQL and PostgreSQL sources** (found by
+  a review — the identity/sequence-sync and FK-apply *mechanisms* are correct and
+  engine-consistent, verified on live PostgreSQL 16; these fixes stop the cut-over screen
+  from reading "ready / done" when it isn't):
+  - **A failed identity-sequence sync is no longer painted green "nothing to advance".** A
+    connection/token/catalog failure during the "Sync identity sequences" step was swallowed
+    to an empty result and shown as success — a false-ready that leads to a post-cut-over
+    duplicate-key collision. Such a failure now surfaces as the red "do not cut over yet"
+    notice (and an unreadable table is reported, not silently skipped).
+  - **The cut-over readiness gate now consumes the record-reconciliation warning.** A default
+    row-count run where record reconciliation was requested but ran on no table (all
+    non-integer/composite PK) presented a clean "ready to cut over"; it is now a soft-block
+    directing you to re-run in CHECKSUM (CHECKSUM mode, which value-compares every row, stays
+    clean).
+  - **"Apply foreign keys" at cut over now requires confirming CDC has drained.** For a CDC
+    migration the button is disabled until you confirm source writes are frozen and the
+    stream has drained — applying enforced FKs mid-stream would dead-letter out-of-order sink
+    writes (`SQLSTATE 23503`).
+  - **"I've cut over to DSQL" is now gated on the deferred foreign keys being applied.** For a
+    CDC migration with preserved FKs pending, the final acknowledgement is soft-blocked (with
+    a "proceed without enforced foreign keys" opt-out) so a target is not marked live with FK
+    enforcement silently missing. A Full-Load cut over also now surfaces/re-offers any FKs
+    skipped or failed during the load.
+  - Smaller fixes: a stale "identity sync failed" notice no longer persists across a fresh
+    validation run; the "Sync identity sequences" button now shows a pending count and hides
+    when nothing needs advancing (symmetric with the FK button); a failed automatic
+    identity-sync during a validation run is now surfaced on the results panel (not only the
+    activity log); and the AI-assistant cut-over facts report the real number of advanced
+    sequences (was always "0 tables").
+
 ## v0.1.436
 
 ### Fixed

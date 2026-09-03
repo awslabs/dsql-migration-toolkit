@@ -1746,13 +1746,20 @@ def test_resync_identity_sequences_partitions_advanced_failed_and_never_raises()
     assert failed == {"c": "OperationalError: OCC conflict"}
 
     # A sync that raises must NOT propagate (a completed comparison is not failed by
-    # this follow-up): it returns empty advanced + empty failed.
+    # this follow-up), but the setup/connection failure is NOT a no-op: it is surfaced
+    # as a distinct FAILED marker (never an empty failed, which would paint a connection
+    # failure green as "nothing to advance" -- audit finding D2 / FIX 1).
     def _boom(names, *, connection_factory):
         raise RuntimeError("connection refused")
 
-    assert resync_identity_sequences(target, ["a"], sync=_boom) == ({}, {})
+    boom_advanced, boom_failed = resync_identity_sequences(target, ["a"], sync=_boom)
+    assert boom_advanced == {}
+    assert list(boom_failed) == ["<connection>"]  # the connection-level failure marker
+    reason = boom_failed["<connection>"]
+    assert "RuntimeError" in reason and "connection refused" in reason
+    assert "\n" not in reason  # value-free, single line (Property 7)
 
-    # No tables -> no work, no connection attempt.
+    # No tables -> no work, no connection attempt (a genuine no-op, empty failed).
     assert resync_identity_sequences(target, [], sync=_boom) == ({}, {})
 
 
@@ -1954,8 +1961,17 @@ class _CutoverUi:
     def __init__(self):
         self.texts: list[str] = []
         self.icons: list[str] = []
+        # Records (label, on_change) for every checkbox so a test can drive a
+        # confirmation toggle (the cut-over FK-apply CDC-drained gate).
+        self.checkboxes: list[tuple[str, object]] = []
 
     def card(self, *_a, **_k):
+        return _CutoverEl()
+
+    def checkbox(self, text="", *_a, **kwargs):
+        if text:
+            self.texts.append(str(text))
+        self.checkboxes.append((str(text), kwargs.get("on_change")))
         return _CutoverEl()
 
     def row(self, *_a, **_k):
@@ -2417,6 +2433,7 @@ def test_cutover_section_renders_sync_button_and_defers_to_click() -> None:
         ui, _cutover_summary(), _no_drift(), cdc_in_use=True,
         identity_sync_provider=lambda: provider_calls.append(True),
         identity_sync_result=None,
+        identity_pending_count=1,  # >=1 identity table -> the sync block is shown
     )
     # The button is present with a real click handler...
     sync_buttons = [(t, cb) for t, cb in ui.buttons if "Sync identity sequences" in t]
@@ -2439,6 +2456,7 @@ def test_cutover_section_shows_sync_outcome_when_present() -> None:
         ui, _cutover_summary(), _no_drift(), cdc_in_use=True,
         identity_sync_provider=lambda: None,
         identity_sync_result={"order_items": 1505},
+        identity_pending_count=1,
     )
     blob = " ".join(ui.texts)
     assert "order_items" in blob and "1505" in blob
@@ -2449,6 +2467,7 @@ def test_cutover_section_shows_sync_outcome_when_present() -> None:
         ui2, _cutover_summary(), _no_drift(), cdc_in_use=True,
         identity_sync_provider=lambda: None,
         identity_sync_result={},
+        identity_pending_count=1,
     )
     assert "no server-generated key needed advancing" in " ".join(ui2.texts)
 
@@ -2485,9 +2504,13 @@ def _fk_inventory():
     )
 
 
-def test_cutover_section_apply_foreign_keys_button_defers_to_click() -> None:
-    # For a CDC migration with pending FKs, the runbook renders an "Apply foreign keys"
-    # button whose handler is the provider; rendering must not run it (no target write).
+def test_cutover_section_apply_foreign_keys_blocked_until_cdc_drained_confirmed() -> None:
+    # FIX 2: for a CDC migration the "Apply foreign keys" pass must run ONLY after CDC
+    # has drained (applying mid-stream dead-letters 23503). This screen does not poll
+    # MSK, so the apply is gated on an explicit operator confirmation: clicking WITHOUT
+    # ticking the "CDC has drained" checkbox is a no-op; ticking it then clicking applies.
+    from types import SimpleNamespace
+
     from dsql_migrator.ui.validation import _render_cutover_section
 
     provider_calls: list = []
@@ -2502,21 +2525,57 @@ def test_cutover_section_apply_foreign_keys_button_defers_to_click() -> None:
     assert len(fk_buttons) == 1
     _text, on_click = fk_buttons[0]
     assert provider_calls == []  # rendering does not apply
+
+    # A confirmation checkbox with the CDC-drained wording is rendered...
+    confirm = [
+        (t, cb) for t, cb in ui.checkboxes
+        if "CDC has drained" in t and "frozen source writes" in t
+    ]
+    assert len(confirm) == 1
+    _ctext, on_change = confirm[0]
+    assert callable(on_change)
+
+    # ...and clicking Apply BEFORE confirming does nothing (the apply is gated).
+    on_click()
+    assert provider_calls == []
+
+    # After the operator ticks the confirmation, the apply fires.
+    on_change(SimpleNamespace(value=True))
     on_click()
     assert provider_calls == [True]
 
+    # Un-ticking it re-gates the apply.
+    on_change(SimpleNamespace(value=False))
+    on_click()
+    assert provider_calls == [True]  # unchanged -- still gated
 
-def test_cutover_section_fk_block_hidden_for_full_load_only() -> None:
-    # Full Load applies FKs automatically, so the cut-over runbook shows no FK action.
+
+def test_cutover_section_full_load_reoffers_skipped_foreign_keys() -> None:
+    # FIX 9: a Full-Load-only cut-over surfaces / re-offers the foreign keys (applied at
+    # load end) so any that were skipped/failed can be completed -- the runbook must not
+    # read fully-ready while referential integrity is not enforced. No CDC-drained gate
+    # (there is no live stream), so the apply fires immediately on click.
     from dsql_migrator.ui.validation import _render_cutover_section
 
-    ui = _CutoverUi()
+    provider_calls: list = []
+    ui = _RecheckUi()
     _render_cutover_section(
         ui, _cutover_summary(), _no_drift(), cdc_in_use=False,
-        fk_apply_provider=lambda: None,
+        fk_apply_provider=lambda: provider_calls.append(True),
+        fk_apply_result=None,
         fk_pending_count=2,
     )
-    assert "apply foreign keys" not in " ".join(ui.texts).lower()
+    blob = " ".join(ui.texts)
+    # The Full-Load FK section is shown (verification / re-apply), NOT hidden.
+    assert "Verify foreign keys are enforced" in blob
+    assert "referential integrity is not fully enforced" in blob
+    fk_buttons = [(t, cb) for t, cb in ui.buttons if "Apply foreign keys" in t]
+    assert len(fk_buttons) == 1
+    # No CDC-drained confirmation checkbox for a Full-Load-only migration.
+    assert not any("CDC has drained" in t for t, _cb in ui.checkboxes)
+    # And the apply fires immediately (not gated).
+    fk_buttons[0][1]()
+    assert provider_calls == [True]
 
 
 def test_cutover_section_fk_block_warns_on_orphans() -> None:
@@ -4643,6 +4702,301 @@ def test_explained_gap_offers_a_sign_off_instead_of_a_dead_end() -> None:
         is_match=False, explained=("ecommerce.product_media",), rows=3, mismatched=2
     )
     assert cutover_release_state(worse, gap_accepted=True) == "blocked"
+
+
+def _inapplicable_summary(*, mode: str):
+    """A ready (row-counts-match) summary where reconciliation was REQUESTED but ran on
+    NO table (all composite/non-integer PK) -> ``reconcile_inapplicable_for_all``."""
+    from dsql_migrator.ui.validation import ValidationSummary
+
+    return ValidationSummary(
+        total_tables=3,
+        matched_tables=3,
+        mismatched_tables=0,
+        orphan_count=0,
+        is_match=True,
+        mode=mode,
+        as_of="just now",
+        reconcile_performed=False,
+        reconciled_tables=0,
+        inconsistent_tables=0,
+        missing_on_target=0,
+        extra_on_target=0,
+        errored_tables=0,
+        ready_for_cutover=True,
+        reconcile_requested=True,
+        reconcile_inapplicable_tables=("orders", "order_items"),
+    )
+
+
+def test_cutover_release_state_unverified_when_records_never_reconciled() -> None:
+    # FIX 3: a ROW_COUNT run where reconciliation was REQUESTED but ran on NO table must
+    # NOT release cut over as clean -- the records are unverified. CHECKSUM stays clean
+    # (it value-compares every row), and a normally-reconciled run stays clean.
+    from dsql_migrator.ui.validation import (
+        ValidationSummary,
+        cutover_release_state,
+    )
+
+    # ROW_COUNT + reconcile-inapplicable-for-all -> NOT clean (distinct "unverified").
+    row_count = _inapplicable_summary(mode="row_count")
+    assert row_count.reconcile_inapplicable_for_all is True
+    assert cutover_release_state(row_count) == "unverified"
+
+    # CHECKSUM mode with the same shape stays clean (records verified by value).
+    checksum = _inapplicable_summary(mode="checksum")
+    assert checksum.reconcile_inapplicable_for_all is True
+    assert cutover_release_state(checksum) == "clean"
+
+    # A normal reconciled ROW_COUNT run (reconciliation covered every table) stays clean.
+    reconciled = ValidationSummary(
+        total_tables=3, matched_tables=3, mismatched_tables=0, orphan_count=0,
+        is_match=True, mode="row_count", as_of="just now",
+        reconcile_performed=True, reconciled_tables=3, inconsistent_tables=0,
+        missing_on_target=0, extra_on_target=0, errored_tables=0,
+        ready_for_cutover=True, reconcile_requested=True,
+        reconcile_inapplicable_tables=(),
+    )
+    assert reconciled.reconcile_inapplicable_for_all is False
+    assert cutover_release_state(reconciled) == "clean"
+
+
+def test_cutover_finish_fk_gate_blocks_until_applied_or_opt_out() -> None:
+    # FIX 4: for a CDC migration with pending FKs, "I've cut over" is soft-blocked until
+    # the deferred FKs applied cleanly OR the operator explicitly opts to proceed without
+    # them (the FK ADD CONSTRAINTs are created only by the cut-over button for CDC).
+    from dsql_migrator.ui.validation import cutover_finish_fk_gate
+
+    # Never gated for a Full-Load-only migration (FKs applied at load; FIX 9 re-offers).
+    assert cutover_finish_fk_gate(
+        cdc_in_use=False, fk_pending_count=3, fk_apply_result=None,
+        proceed_without_fks=False,
+    ) is None
+    # Never gated when the schema has no preserved FKs.
+    assert cutover_finish_fk_gate(
+        cdc_in_use=True, fk_pending_count=0, fk_apply_result=None,
+        proceed_without_fks=False,
+    ) is None
+
+    # CDC + pending FKs, apply never run -> "pending" (blocked).
+    assert cutover_finish_fk_gate(
+        cdc_in_use=True, fk_pending_count=3, fk_apply_result=None,
+        proceed_without_fks=False,
+    ) == "pending"
+    # Applied with some skipped/failed -> "incomplete" (blocked).
+    assert cutover_finish_fk_gate(
+        cdc_in_use=True, fk_pending_count=3, fk_apply_result=(1, 2, 0),
+        proceed_without_fks=False,
+    ) == "incomplete"
+    assert cutover_finish_fk_gate(
+        cdc_in_use=True, fk_pending_count=3, fk_apply_result=(1, 0, 1),
+        proceed_without_fks=False,
+    ) == "incomplete"
+    # Every FK applied cleanly -> not gated.
+    assert cutover_finish_fk_gate(
+        cdc_in_use=True, fk_pending_count=3, fk_apply_result=(3, 0, 0),
+        proceed_without_fks=False,
+    ) is None
+    # The explicit opt-out clears the gate even when nothing was applied.
+    assert cutover_finish_fk_gate(
+        cdc_in_use=True, fk_pending_count=3, fk_apply_result=None,
+        proceed_without_fks=True,
+    ) is None
+
+
+def test_set_result_and_clear_outputs_reset_cutover_outcomes() -> None:
+    # FIX 5: a fresh verdict must start the cut-over outcomes clean -- a stale red
+    # "identity sync failed" / FK-apply result / "proceed without FKs" opt-out must not
+    # persist onto a run they do not belong to.
+    from dsql_migrator.core.models import ValidationMode, ValidationReport
+    from dsql_migrator.ui.validation import ValidationState
+
+    def _report():
+        return ValidationReport(
+            items=[
+                TableValidationResult(
+                    table="t", source_row_count=1, target_row_count=1,
+                    row_count_match=True, matched=True,
+                )
+            ],
+            mode=ValidationMode.ROW_COUNT,
+        )
+
+    state = ValidationState()
+    state.set_cutover_identity_sync({}, {"orders": "OperationalError: boom"})
+    state.set_cutover_fk_apply((1, 1, 0))
+    state.proceed_without_foreign_keys = True
+    assert state.cutover_identity_sync_failed  # populated
+
+    # A new verdict clears every cut-over outcome.
+    state.set_result(_report())
+    assert state.cutover_identity_sync_failed == {}
+    assert state.cutover_fk_apply is None
+    assert state.proceed_without_foreign_keys is False
+
+    # And so does clear_outputs (before a re-run).
+    state.set_cutover_identity_sync({}, {"orders": "boom"})
+    state.set_cutover_fk_apply((0, 0, 1))
+    state.proceed_without_foreign_keys = True
+    state.clear_outputs()
+    assert state.cutover_identity_sync_failed == {}
+    assert state.cutover_fk_apply is None
+    assert state.proceed_without_foreign_keys is False
+
+
+def test_cutover_ai_facts_reports_real_advanced_table_count() -> None:
+    # FIX 6: the AI-facts identity-sync line reports the REAL advanced-table count (the
+    # length of the {table: restart_value} map), not a non-existent "synced_tables" key
+    # that always read 0.
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.validation import cutover_ai_facts
+
+    facts = cutover_ai_facts(
+        SimpleNamespace(target_config=None),
+        validation_summary=None,
+        release="clean",
+        drift=None,
+        cdc_in_use=True,
+        identity_sync_result={"orders": 743, "order_items": 1505},
+        identity_sync_failed=None,
+    )
+    assert "succeeded on 2 table(s)" in facts
+    assert "succeeded on 0 table(s)" not in facts
+
+    # A recorded FAILURE dict takes precedence and is called out as a 23505 risk.
+    facts_failed = cutover_ai_facts(
+        SimpleNamespace(target_config=None),
+        validation_summary=None, release="clean", drift=None, cdc_in_use=True,
+        identity_sync_result={}, identity_sync_failed={"orders": "boom"},
+    )
+    assert "FAILED" in facts_failed and "23505" in facts_failed
+
+
+def test_validation_run_identity_sync_failed_stored_and_surfaced() -> None:
+    # FIX 7: a failed AUTOMATIC advance (validation-run sync) must be stored on the
+    # state (not only logged) and surfaced on the results panel as an error.
+    from dsql_migrator.ui.validation import (
+        ValidationState,
+        _render_result,
+    )
+
+    state = ValidationState()
+    # set_identity_sync now records the failed map alongside advanced.
+    state.set_identity_sync({}, {"orders": "OperationalError: OCC conflict"})
+    assert state.identity_sync_failed == {"orders": "OperationalError: OCC conflict"}
+
+    # The results panel renders the red do-not-cut-over notice when a sync failed.
+    ui = _ScreenUi()  # full double (the result page draws tables/links/etc.)
+    _render_result(
+        ui, _failing_report_for_render(),
+        identity_sync=None,
+        identity_sync_failed=state.identity_sync_failed,
+    )
+    blob = " ".join(ui.texts)
+    assert "Identity sequence sync failed — do not cut over yet" in blob
+    assert "orders" in blob
+
+
+def test_cutover_pending_identity_tables_counts_identity_strategy_tables() -> None:
+    # FIX 8: the identity-sync button is gated on a count of tables converted to a
+    # server-generated (IDENTITY) key -- computed from the applied conversions, like
+    # _cutover_pending_foreign_keys.
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.converter import (
+        PrimaryKeyStrategy,
+        SchemaConvertOptions,
+        SchemaConverter,
+    )
+    from dsql_migrator.core.models import (
+        ColumnDef, SourceInventory, SourceType, TableDef,
+    )
+    from dsql_migrator.ui.schema_conversion import applied_table_conversions
+    from dsql_migrator.ui.validation import _cutover_pending_identity_tables
+
+    # An AUTO_INCREMENT table + a plain (no auto-increment) table.
+    inv = SourceInventory(
+        tables=[
+            TableDef(
+                name="orders",
+                columns=[ColumnDef(name="id", mysql_type="int")],
+                primary_key=["id"],
+                auto_increment_column="id",
+            ),
+            TableDef(
+                name="lookup",
+                columns=[ColumnDef(name="code", mysql_type="varchar(10)")],
+                primary_key=["code"],
+            ),
+        ]
+    )
+    session = SimpleNamespace(source_config=None)  # MySQL default
+    eval_store = SimpleNamespace(
+        get_or_create=lambda sid: SimpleNamespace(
+            result=SimpleNamespace(inventory=inv)
+        )
+    )
+
+    # Default strategy (KEEP_INTEGER): no table is a server-generated identity -> 0.
+    default_store = SimpleNamespace(
+        get=lambda sid: SimpleNamespace(
+            preserve_foreign_keys=True, edited_target_ddls={}
+        )
+    )
+    assert _cutover_pending_identity_tables(
+        session, eval_store, default_store, "s"
+    ) == 0
+
+    # Bake the IDENTITY_WITH_CACHE conversion for "orders" into an edited DDL (exactly
+    # what the Schema-Conversion PK-strategy picker stores) -> counted as 1.
+    identity_conv = SchemaConverter(source_type=SourceType.MYSQL).convert(
+        inv,
+        options=SchemaConvertOptions(
+            primary_key_strategy=PrimaryKeyStrategy.IDENTITY_WITH_CACHE
+        ),
+    )
+    orders_ddl = next(
+        c.target_ddl for c in identity_conv.tables if c.table == "orders"
+    )
+    assert "IDENTITY" in orders_ddl.upper()  # sanity: the strategy rendered
+    identity_store = SimpleNamespace(
+        get=lambda sid: SimpleNamespace(
+            preserve_foreign_keys=True,
+            edited_target_ddls={"orders": orders_ddl},
+        )
+    )
+    assert _cutover_pending_identity_tables(
+        session, eval_store, identity_store, "s"
+    ) == 1
+
+    # No conversion / eval state -> 0 (guarded).
+    assert _cutover_pending_identity_tables(session, None, identity_store, "s") == 0
+    # And the applied overlay actually carries the identity clause (round-trip sanity).
+    applied = applied_table_conversions(
+        SchemaConverter(source_type=SourceType.MYSQL).convert(inv),
+        {"orders": orders_ddl},
+    )
+    assert "IDENTITY" in applied["orders"].target_ddl.upper()
+
+
+def test_cutover_section_renders_red_when_identity_sync_connection_failed() -> None:
+    # FIX 1: a connection/setup failure in the cut-over identity sync lands in the
+    # `failed` map; the runbook then renders the RED do-not-cut-over notice, NOT the
+    # green "no server-generated key needed advancing" line.
+    from dsql_migrator.ui.validation import _render_cutover_section
+
+    ui = _CutoverUi()
+    _render_cutover_section(
+        ui, _cutover_summary(), _no_drift(), cdc_in_use=True,
+        identity_sync_provider=lambda: None,
+        identity_sync_result={},  # nothing advanced...
+        identity_sync_failed={"<connection>": "RuntimeError: connection refused"},
+        identity_pending_count=1,
+    )
+    blob = " ".join(ui.texts)
+    assert "Identity sequence sync failed — do not cut over yet" in blob
+    assert "no server-generated key needed advancing" not in blob
 
 
 class _ScreenUi:

@@ -5,6 +5,33 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.437
+
+### 수정 (Fixed)
+
+- **Cut over: 실패 표면화 + 게이팅 수정 (MySQL·PostgreSQL 소스)** (리뷰에서 발견 — identity/시퀀스
+  sync와 FK 적용 *메커니즘 자체*는 정확·엔진 일관, 라이브 PostgreSQL 16 재현; 아래는 컷오버 화면이
+  실제와 달리 "준비됨/완료"로 읽히지 않게 하는 수정):
+  - **실패한 identity 시퀀스 sync가 더 이상 초록 "advance 불필요"로 표시되지 않음.** "Sync identity
+    sequences" 단계에서 연결/토큰/카탈로그 실패가 빈 결과로 삼켜져 성공처럼 표시됐고, 이는 컷오버 후
+    duplicate-key 충돌로 이어지는 false-ready였습니다. 이제 빨간 "do not cut over yet" 알림으로
+    표면화(읽을 수 없는 테이블도 조용히 스킵하지 않고 보고).
+  - **컷오버 준비 게이트가 record-reconciliation 경고를 소비.** record reconcile가 요청됐으나 어느
+    테이블에도 실행되지 못한(전부 비정수/복합 PK) 기본 row-count 런이 clean "cut over 준비됨"으로
+    표시됐는데, 이제 soft-block으로 CHECKSUM 재실행을 안내(매 행 값 비교하는 CHECKSUM 모드는 clean
+    유지).
+  - **컷오버 "Apply foreign keys"가 이제 CDC drain 확인을 요구.** CDC 마이그레이션에서는 소스 쓰기
+    freeze + 스트림 drain을 확인하기 전까지 버튼 비활성 — 스트림 중 강제 FK 적용은 out-of-order 싱크
+    쓰기를 dead-letter(`SQLSTATE 23503`).
+  - **"I've cut over to DSQL"가 이제 지연된 FK 적용에 게이트됨.** 보존 FK가 대기 중인 CDC
+    마이그레이션에서는 최종 확인이 soft-block("강제 FK 없이 진행" opt-out 제공)돼, FK 강제가 조용히
+    누락된 채 타깃이 live로 표시되지 않습니다. Full-Load 컷오버도 로드 중 skip/실패한 FK를
+    표면화/재제안합니다.
+  - 소규모: 오래된 "identity sync 실패" 알림이 새 validation 런에서 잔존하지 않음; "Sync identity
+    sequences" 버튼이 pending 카운트를 표시하고 advance 대상 없으면 숨김(FK 버튼과 대칭); validation
+    런 중 실패한 자동 identity-sync가 결과 패널에도 표면화(활동 로그뿐 아니라); AI 어시스턴트 컷오버
+    facts가 실제 advance된 시퀀스 수를 보고(기존 항상 "0 tables").
+
 ## v0.1.436
 
 ### 수정 (Fixed)

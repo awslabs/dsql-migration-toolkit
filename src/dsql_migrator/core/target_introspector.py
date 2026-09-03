@@ -699,8 +699,11 @@ def sync_identity_sequences(
 
     Per-table result value:
     - ``int`` -- the ``RESTART WITH`` value actually applied (the sequence advanced);
-    - ``None`` -- nothing to do (no identity column / empty table / catalog unreadable);
-    - ``str`` -- the ``RESTART WITH`` **FAILED**, carrying a short value-free reason.
+    - ``None`` -- nothing to do (no identity column / empty table);
+    - ``str`` -- the sync **FAILED** for this table, carrying a short value-free reason.
+      Either the identity-column catalog read errored (an unreadable table is NOT the
+      same as "no identity column" -- treating it as the latter silently skips a table
+      that may need advancing) or the ``RESTART WITH`` itself failed.
 
     The ``str`` case is why the value is not just ``Optional[int]``: a failed ALTER MUST
     be distinguishable from a no-op, or the caller paints a swallowed failure green.
@@ -761,8 +764,16 @@ def sync_identity_sequences(
                         (bare,),
                     )
                 rows = cursor.fetchall() or []
-            except Exception:  # noqa: BLE001 - unreadable catalog -> leave untouched
+            except Exception as exc:  # noqa: BLE001 - unreadable catalog is a FAILURE
                 _safe_close(cursor)
+                # A catalog read that ERRORED is not "no identity column" (a silent
+                # skip): surface it as a FAILED entry (value-free reason, Property 7)
+                # so the caller never treats an unreadable table as safely synced
+                # (audit finding D2). Distinct from the None no-op below.
+                _head = (str(exc).strip().splitlines() or [""])[0].strip()
+                out[name] = (
+                    f"{type(exc).__name__}: {_head}" if _head else type(exc).__name__
+                )
                 continue
             _safe_close(cursor)
             if not rows:

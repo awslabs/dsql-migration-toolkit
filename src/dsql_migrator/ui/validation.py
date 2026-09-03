@@ -332,11 +332,14 @@ def resync_identity_sequences(
 
     Returns ``(advanced, failed)``: ``advanced`` = ``{table: restart_value}`` for the
     identity tables actually advanced (empty when none are identity / all already
-    correct); ``failed`` = ``{table: reason}`` for tables whose ``RESTART WITH`` errored
-    (empty when none did). Never raises: this is a follow-up to a completed comparison
-    and must not turn a good report into an error -- but a FAILED sync must be surfaced
-    by the caller (a swallowed one is a silent post-cut-over duplicate-key outage, audit
-    finding D2), which the separate ``failed`` map makes possible. ``sync`` is an
+    correct); ``failed`` = ``{table: reason}`` for tables whose sync errored (empty when
+    none did). A setup/connection failure (the sync could not even run) is reported as a
+    single ``{"<connection>": reason}`` entry -- NOT an empty ``failed``, which would be
+    indistinguishable from "nothing to advance" and paint the failure green. Never
+    raises: this is a follow-up to a completed comparison and must not turn a good report
+    into an error -- but a FAILED sync must be surfaced by the caller (a swallowed one is
+    a silent post-cut-over duplicate-key outage, audit finding D2), which the separate
+    ``failed`` map makes possible. ``sync`` is an
     injectable seam (tests pass a fake; production uses the introspector over a DSQL
     connection).
     """
@@ -353,8 +356,16 @@ def resync_identity_sequences(
             return DsqlConnector(target_config, aws_profile=aws_profile).connect()
 
         result = sync(list(table_names), connection_factory=_factory) or {}
-    except Exception:  # noqa: BLE001 - never fail a completed validation on this
-        return {}, {}
+    except Exception as exc:  # noqa: BLE001 - never fail a completed validation on this
+        # A setup/connection failure is NOT a no-op. Collapsing it into an empty
+        # (advanced, failed) pair is indistinguishable from a genuine "nothing to
+        # advance", so it paints a connection failure GREEN -- and the application's
+        # first insert after cut-over then hits a duplicate key (audit finding D2).
+        # Surface it as a distinct FAILED marker (value-free reason, Property 7) so
+        # the runbook renders the red do-not-cut-over notice.
+        _head = (str(exc).strip().splitlines() or [""])[0].strip()
+        _reason = f"{type(exc).__name__}: {_head}" if _head else type(exc).__name__
+        return {}, {"<connection>": _reason}
     # Split advanced (int) from failed (str); None no-ops (no identity column / empty /
     # unreadable) belong to neither. This is the one place the raw result is classified.
     from dsql_migrator.core.target_introspector import partition_identity_sync
@@ -544,6 +555,11 @@ def cutover_release_state(
     Returns one of:
 
     * ``"clean"``     -- validation matched outright; nothing to acknowledge.
+    * ``"unverified"`` -- row counts match but record-level reconciliation was REQUESTED
+      and ran on NO table (all composite/non-integer PK), in a non-CHECKSUM mode: a
+      same-count-but-different-rows divergence is undetected, so this must NOT release
+      cut-over as clean. A soft-block: re-run in CHECKSUM (it value-compares every row)
+      to clear it. CHECKSUM mode never reaches here (it verifies the records itself).
     * ``"accepted"``  -- the only remaining differences are rows the migration already
       reported dropping, AND the operator has explicitly accepted that gap.
     * ``"acceptable"`` -- same difference profile, but not yet accepted: offer the
@@ -565,6 +581,19 @@ def cutover_release_state(
     """
     if summary is None:
         return "blocked"
+    # Row counts match but record-level reconciliation was REQUESTED and covered NO
+    # table (all composite/non-integer PK) in a non-CHECKSUM mode: the record sets are
+    # UNVERIFIED, so this must not read as a clean, record-verified pass (the v0.1.435
+    # verdict warning must reach the cut-over gate, not only the results screen).
+    # Mirrors _render_verdict's own ``reconcile_inapplicable_for_all and not
+    # _is_checksum`` guard. CHECKSUM mode value-compares every row, so it stays clean.
+    _is_checksum = str(summary.mode).upper().endswith("CHECKSUM")
+    if (
+        summary.ready_for_cutover
+        and summary.reconcile_inapplicable_for_all
+        and not _is_checksum
+    ):
+        return "unverified"
     if summary.ready_for_cutover:
         return "clean"
     # Nothing acknowledged-able: there must be a KNOWN gap to sign off on. Strictly this
@@ -577,6 +606,43 @@ def cutover_release_state(
     if summary.unexplained_mismatched_tables or summary.errored_tables:
         return "blocked"
     return "accepted" if gap_accepted else "acceptable"
+
+
+def cutover_finish_fk_gate(
+    *,
+    cdc_in_use: bool,
+    fk_pending_count: int,
+    fk_apply_result: "Optional[tuple[int, int, int]]",
+    proceed_without_fks: bool,
+) -> "Optional[str]":
+    """Whether "I've cut over" is soft-blocked on preserved foreign keys, and why. Pure.
+
+    For a CDC migration the deferred FK ``ADD CONSTRAINT``s are created ONLY by the
+    cut-over "Apply foreign keys" button -- Full Load's post-load pass is a no-op for a
+    CDC run -- so acknowledging cut over with them never applied would silently mark the
+    target live with ZERO enforced foreign keys. Returns:
+
+    * ``None``        -- not gated (Full-Load-only, no preserved FKs, every FK applied
+      cleanly, or the operator explicitly opted to proceed without them).
+    * ``"pending"``   -- preserved FKs exist but the cut-over apply has NOT been run.
+    * ``"incomplete"`` -- the apply ran but some FKs were skipped (orphans) or failed,
+      so referential integrity is not fully enforced.
+
+    ``proceed_without_fks`` is the operator's explicit "cut over without enforced FKs"
+    opt-out; when set the gate clears. Full-Load-only runs are never gated here (their
+    FKs are applied automatically at load end, and FIX 9 re-offers any that were
+    skipped/failed on the runbook itself).
+    """
+    if not cdc_in_use or fk_pending_count <= 0:
+        return None
+    if proceed_without_fks:
+        return None
+    if fk_apply_result is None:
+        return "pending"
+    _applied, skipped, failed = fk_apply_result
+    if skipped == 0 and failed == 0:
+        return None
+    return "incomplete"
 
 
 def summarize_validation(report: ValidationReport) -> ValidationSummary:
@@ -1111,7 +1177,7 @@ def cutover_ai_facts(
     drift: "Optional[DriftDisplay]",
     cdc_in_use: bool,
     identity_sync_result: "Optional[dict]",
-    identity_sync_failed: bool,
+    identity_sync_failed: "Optional[dict[str, str]]",
 ) -> str:
     """Assemble a credential-free CUT OVER facts block for the AI DBA chat.
 
@@ -1157,9 +1223,12 @@ def cutover_ai_facts(
             "repointed insert risks a 23505 duplicate-key collision."
         )
     elif identity_sync_result:
-        _synced = int(
-            (identity_sync_result or {}).get("synced_tables", 0) or 0
-        )
+        # ``identity_sync_result`` is a ``{table: restart_value}`` map (the advanced
+        # sequences), never a summary dict -- the count is its length. The enclosing
+        # ``elif`` guarantees it is non-empty, so this reports the REAL advanced-table
+        # count (the old ``.get("synced_tables")`` read a key that never existed and
+        # always said 0).
+        _synced = len(identity_sync_result or {})
         lines.append(
             f"Identity-sync (source auto-increment / identity -> DSQL sequence): "
             f"succeeded on {_synced} "
@@ -1335,6 +1404,14 @@ class ValidationState:
         # store. Only ever settable when every difference is accounted for (see
         # ``cutover_release_state``). Set on the UI thread.
         self.accept_explained_gap: bool = False
+        # Whether the operator has explicitly chosen to cut over WITHOUT the preserved
+        # foreign keys being applied. For a CDC migration the deferred FK ADD
+        # CONSTRAINTs are created only by the cut-over "Apply foreign keys" button (Full
+        # Load's post-pass is a no-op for CDC), so acknowledging cut over with them never
+        # applied would silently leave the target with zero enforced FKs. This opt-out is
+        # the deliberate "I'll enforce integrity in the app" decision that unblocks the
+        # acknowledgement. Set on the UI thread; a fresh verdict resets it.
+        self.proceed_without_foreign_keys: bool = False
         self._result: Optional[ValidationReport] = None
         self._error: Optional[str] = None
         # Per-table RE-CHECK track (the same single job slot as a full run --
@@ -1383,6 +1460,13 @@ class ValidationState:
         # not run (e.g. count-only path or a restored report). Written by the worker,
         # read by the UI poller, so lock-guarded.
         self._identity_sync: Optional[dict[str, int]] = None
+        # Tables whose RESTART WITH FAILED on the AUTO validation-run sync (table ->
+        # reason). Mirrors ``_cutover_identity_sync_failed`` for the automatic advance:
+        # the ``failed`` map from the validation-run sync used to be written ONLY to the
+        # activity log, so a failed automatic advance never showed on the results panel /
+        # readiness -- a silent post-cut-over duplicate-key risk. None until a run's sync
+        # has run; then a dict (empty == every table advanced/no-op'd). Lock-guarded.
+        self._identity_sync_failed: Optional[dict[str, str]] = None
         # Result of the operator-triggered "Sync identity sequences" action in the
         # cut-over runbook (an explicit button, NOT a render side-effect). ``None`` until
         # the operator clicks it; then a dict of {table: RESTART WITH value} (empty ==
@@ -1534,25 +1618,45 @@ class ValidationState:
             self._restored = False  # a freshly-run result, not a restored one
             self._rechecked_tables = ()
             self._rechecked_at = None
-            # A new verdict supersedes any earlier cut-over identity-sync outcome (the
-            # target may have advanced since), so the runbook button offers a fresh run.
+            # A new verdict supersedes any earlier cut-over outcome (the target may have
+            # advanced since), so the runbook offers fresh runs and starts its outcomes
+            # clean -- otherwise a stale red "identity sync failed" / an old FK-apply
+            # result / an old "proceed without FKs" opt-out would persist onto a run they
+            # do not belong to (FIX 5 / FIX 4).
             self._cutover_identity_sync = None
+            self._cutover_identity_sync_failed = None
+            self._cutover_fk_apply = None
+            self.proceed_without_foreign_keys = False
 
-    def set_identity_sync(self, advanced: "Optional[dict[str, int]]") -> None:
+    def set_identity_sync(
+        self,
+        advanced: "Optional[dict[str, int]]",
+        failed: "Optional[dict[str, str]]" = None,
+    ) -> None:
         """Record the identity-sequence re-sync outcome for the last full run.
 
         ``advanced`` maps each identity table to its new ``RESTART WITH`` value; an
         empty dict means the sync ran with nothing to advance, and ``None`` means it
-        was not run. Set by the worker after a completed comparison.
+        was not run. ``failed`` maps each table whose sync errored to a value-free
+        reason (a failed automatic advance is a post-cut-over duplicate-key risk, so it
+        must reach the results panel / readiness, not just the activity log). Set by the
+        worker after a completed comparison.
         """
         with self._lock:
             self._identity_sync = advanced
+            self._identity_sync_failed = failed
 
     @property
     def identity_sync(self) -> "Optional[dict[str, int]]":
         """The last run's identity-sequence re-sync outcome (see ``set_identity_sync``)."""
         with self._lock:
             return dict(self._identity_sync) if self._identity_sync is not None else None
+
+    @property
+    def identity_sync_failed(self) -> "dict[str, str]":
+        """Tables whose RESTART WITH failed on the last validation-run sync (empty if none)."""
+        with self._lock:
+            return dict(self._identity_sync_failed or {})
 
     def start_recheck(self, tables: "Sequence[str]") -> None:
         """Mark a per-table re-check of ``tables`` as starting (clears its error)."""
@@ -1664,7 +1768,11 @@ class ValidationState:
             self._rechecked_at = None
             self._recheck_error = None
             self._identity_sync = None
+            self._identity_sync_failed = None
             self._cutover_identity_sync = None
+            self._cutover_identity_sync_failed = None
+            self._cutover_fk_apply = None
+            self.proceed_without_foreign_keys = False
 
 
 @dataclass
@@ -2030,7 +2138,7 @@ def build_validation_screen(
                 aws_profile=session.aws_profile,
                 sync=sync_sequences,
             )
-            validation_state.set_identity_sync(advanced)
+            validation_state.set_identity_sync(advanced, failed)
             if advanced:
                 detail = ", ".join(
                     f"{name} -> RESTART WITH {value}"
@@ -2444,6 +2552,7 @@ def build_validation_screen(
                     rechecked_at=validation_state.rechecked_at,
                     cdc_in_use=_cdc_in_use(session),
                     identity_sync=validation_state.identity_sync,
+                    identity_sync_failed=validation_state.identity_sync_failed,
                 )
                 if busy:
                     _install_recheck_poll_timer(
@@ -2639,6 +2748,58 @@ def _cutover_pending_foreign_keys(
         preserve_foreign_keys=conv_state.preserve_foreign_keys,
     )
     return sum(len(conv.foreign_key_ddls) for conv in applied.values())
+
+
+def _cutover_pending_identity_tables(
+    session: object,
+    eval_store: "Optional[EvaluationStore]",
+    conversion_store: "Optional[Any]",
+    session_id: str,
+) -> int:
+    """Count tables converted to a server-generated (IDENTITY) primary key.
+
+    Zero when no schema-conversion / evaluation state exists, or no table uses the
+    IDENTITY_WITH_CACHE strategy. Used to GATE the cut-over "Sync identity sequences"
+    action symmetrically with ``_cutover_pending_foreign_keys`` -- the sync only
+    advances GENERATED-identity keys, so a schema with none has nothing to sync and the
+    button (and its outcome line) should not appear.
+
+    Rebuilds the APPLIED conversions exactly as :func:`_cutover_pending_foreign_keys`
+    does (deterministic re-conversion overlaid with the Schema-Conversion edits, where
+    the per-table PK-strategy picker bakes the ``GENERATED ... AS IDENTITY`` clause), and
+    counts the tables whose applied DDL declares the auto-increment key as an identity --
+    the same tables ``sync_identity_sequences`` reaches via ``is_identity`` in the
+    catalog. Pure and side-effect-free (no DB); cut over is not a hot path.
+    """
+    if conversion_store is None or eval_store is None:
+        return 0
+    conv_state = conversion_store.get(session_id)
+    if conv_state is None:
+        return 0
+    result = eval_store.get_or_create(session_id).result
+    inventory = result.inventory if result is not None else None
+    if inventory is None:
+        return 0
+    from dsql_migrator.core.converter import SchemaConverter
+    from dsql_migrator.ui.schema_conversion import applied_table_conversions
+    from dsql_migrator.ui.schema_conversion_apply import identity_from_ddl
+
+    stype = (
+        session.source_config.source_type  # type: ignore[attr-defined]
+        if getattr(session, "source_config", None) is not None
+        else SourceType.MYSQL
+    )
+    applied = applied_table_conversions(
+        SchemaConverter(source_type=stype).convert(inventory),
+        conv_state.edited_target_ddls,
+        preserve_foreign_keys=conv_state.preserve_foreign_keys,
+    )
+    by_name = {table.name: table for table in inventory.tables}
+    return sum(
+        1
+        for name, conv in applied.items()
+        if name in by_name and identity_from_ddl(by_name[name], conv.target_ddl)
+    )
 
 
 def _run_cutover_foreign_keys(
@@ -2893,6 +3054,9 @@ def build_cutover_screen(
         _fk_pending = _cutover_pending_foreign_keys(
             session, eval_store, conversion_store, session_id
         )
+        _identity_pending = _cutover_pending_identity_tables(
+            session, eval_store, conversion_store, session_id
+        )
 
         # Dev-only UI review: with no clean verdict, synthesize a ready summary so
         # the runbook itself can be reviewed without running the whole workflow.
@@ -2958,6 +3122,32 @@ def build_cutover_screen(
                 ).props("no-caps color=primary")
             return
 
+        # Row counts match, but record-level reconciliation ran on NO table (all
+        # composite/non-integer PK) in a non-CHECKSUM mode. A row-count match does NOT
+        # prove the record sets match, so this is a soft-block, not a go: show the
+        # runbook only once the records are actually verified (re-run in CHECKSUM).
+        if release == "unverified":
+            with _section(
+                ui, icon="fact_check", title="Verify records before cutting over"
+            ):
+                _inapplicable = summary.reconcile_inapplicable_tables  # type: ignore[union-attr]
+                render_notice(
+                    ui,
+                    tone="warning",
+                    header="Row counts match, but records were never reconciled",
+                    body=(
+                        f"All {summary.total_tables} table(s) have matching row counts, "  # type: ignore[union-attr]
+                        "but record-level reconciliation could not run for any table "
+                        "(none has a single-column integer primary key), so a "
+                        "same-count-but-different-rows divergence would go undetected. "
+                        "Re-run Validation in CHECKSUM mode (it value-compares every row) "
+                        "before cutting over — the cut-over runbook appears here once the "
+                        "records are verified. Reconcile inapplicable for "
+                        f"{len(_inapplicable)} table(s): {', '.join(_inapplicable)}."
+                    ),
+                )
+            return
+
         if release == "blocked":
             with _section(ui, icon="fact_check", title="Validate first"):
                 render_notice(
@@ -3012,6 +3202,7 @@ def build_cutover_screen(
             fk_apply_provider=_fk_apply_provider,
             fk_apply_result=validation_state.cutover_fk_apply,
             fk_pending_count=_fk_pending,
+            identity_pending_count=_identity_pending,
         )
 
         done = get_status(session.workflow, WorkflowStep.CUT_OVER) is StepStatus.DONE
@@ -3028,20 +3219,69 @@ def build_cutover_screen(
                     ),
                 )
             else:
+                # For a CDC migration the deferred foreign keys are created ONLY by the
+                # "Apply foreign keys" button above (Full Load's post-pass is a no-op for
+                # CDC), so acknowledging cut over with them never applied would silently
+                # leave the target with zero (or partial) enforced FKs. Soft-block the
+                # acknowledgement until every FK applied cleanly, or the operator opts to
+                # proceed without them (FIX 4).
+                _fk_gate = cutover_finish_fk_gate(
+                    cdc_in_use=_cdc_in_use(session),
+                    fk_pending_count=_fk_pending,
+                    fk_apply_result=validation_state.cutover_fk_apply,
+                    proceed_without_fks=validation_state.proceed_without_foreign_keys,
+                )
+                if _fk_gate is not None:
+                    _fk_noun = "foreign key" if _fk_pending == 1 else "foreign keys"
+                    render_notice(
+                        ui,
+                        tone="warning",
+                        header="Foreign keys are not applied yet",
+                        body=(
+                            (
+                                f"This schema's {_fk_pending} preserved {_fk_noun} were "
+                                "deferred during CDC and have NOT been applied to the "
+                                "target yet. "
+                                if _fk_gate == "pending"
+                                else "Some preserved foreign keys were skipped (orphan "
+                                "rows) or failed to apply, so referential integrity is "
+                                "not fully enforced. "
+                            )
+                            + "Use \"Apply foreign keys\" above before finishing, or "
+                            "explicitly choose to cut over without them below."
+                        ),
+                    )
+
+                    def _proceed_without_fks() -> None:
+                        validation_state.proceed_without_foreign_keys = True
+                        refresh()
+
+                    ui.button(  # type: ignore[attr-defined]
+                        "Cut over without enforced foreign keys",
+                        icon="link_off",
+                        on_click=_proceed_without_fks,
+                    ).props("no-caps color=warning outline")
                 ui.label(  # type: ignore[attr-defined]
                     "When your application is live on DSQL and smoke-tested, mark "
                     "the cut-over complete to finish the migration journey."
                 ).classes("text-sm text-gray-600")
                 with ui.row().classes("w-full justify-end"):  # type: ignore[attr-defined]
                     def _acknowledge() -> None:
+                        if _fk_gate is not None:
+                            return  # gated: FKs not applied and no opt-out
                         runner()
                         refresh()
 
-                    ui.button(  # type: ignore[attr-defined]
+                    _ack_btn = ui.button(  # type: ignore[attr-defined]
                         "I've cut over to DSQL",
                         icon="check_circle",
                         on_click=_acknowledge,
                     ).props("color=primary")
+                    # Disabled (not hidden) while the FK gate is active, so the operator
+                    # sees the path forward is "apply the FKs or opt out", not a missing
+                    # button. The handler is a no-op belt-and-suspenders if reached.
+                    if _fk_gate is not None:
+                        _ack_btn.props("disable")
 
     return content, runner
 
@@ -3684,6 +3924,7 @@ def _render_result(
     rechecked_at: "Optional[datetime]" = None,
     cdc_in_use: bool = False,
     identity_sync: "Optional[dict[str, int]]" = None,
+    identity_sync_failed: "Optional[dict[str, str]]" = None,
 ) -> None:
     """Render the cut-over readiness report: verdict, checks, then the details.
 
@@ -3747,6 +3988,28 @@ def _render_result(
                 "insert after cut-over will not collide with a migrated id (Full Load "
                 "and CDC insert explicit ids, which do not move a GENERATED BY DEFAULT "
                 f"sequence). New RESTART WITH: {detail}."
+            ),
+        )
+    # A FAILED automatic advance is a post-cut-over duplicate-key risk and must NOT be
+    # left only in the activity log: surface it on the results panel as an error so the
+    # verdict is not read as "ready" while a sequence still lags the migrated rows
+    # (FIX 7). The reasons are value-free (Property 7).
+    if identity_sync_failed:
+        _failed_detail = "; ".join(
+            f"{name} ({reason})"
+            for name, reason in sorted(identity_sync_failed.items())
+        )
+        render_notice(
+            ui,
+            tone="error",
+            header="Identity sequence sync failed — do not cut over yet",
+            body=(
+                f"{len(identity_sync_failed)} identity sequence(s) could NOT be "
+                "advanced past the migrated rows, so the application's first insert "
+                "after cut-over may hit a duplicate key. Re-run validation (the sync "
+                "is idempotent), or advance the sequence(s) manually with ALTER TABLE "
+                "… ALTER COLUMN … RESTART WITH before cutting over. Affected: "
+                f"{_failed_detail}."
             ),
         )
     # On a no-go, the recovery path is its own prominent section right under the
@@ -4124,6 +4387,7 @@ def _render_cutover_section(
     fk_apply_provider: "Optional[Callable[[], None]]" = None,
     fk_apply_result: "Optional[tuple[int, int, int]]" = None,
     fk_pending_count: int = 0,
+    identity_pending_count: int = 0,
 ) -> None:
     """Render the go-path cut-over runbook as its OWN titled section card.
 
@@ -4142,7 +4406,16 @@ def _render_cutover_section(
     past the current target MAX(pk) so the app's first insert after cut-over cannot
     collide. It is a deliberate operator action (a target write), never a render
     side-effect. ``identity_sync_result`` is the last outcome to display ({} == ran,
-    nothing to advance; a dict names the advanced sequences; None == not run yet).
+    nothing to advance; a dict names the advanced sequences; None == not run yet). The
+    sync block is shown only when ``identity_pending_count > 0`` (>=1 table converted to a
+    server-generated IDENTITY key), symmetric with the FK-apply block's ``fk_pending_count``
+    gate — a schema with no identity key has nothing to sync.
+
+    The FK-apply block is shown whenever ``fk_pending_count > 0`` (regardless of CDC): a
+    CDC migration applies the deferred FKs here, and a Full-Load-only migration re-offers
+    the idempotent apply to complete any FK skipped/failed at load end (FIX 9). For a CDC
+    migration the Apply button is gated behind an explicit "CDC has drained" confirmation
+    checkbox (FIX 2) — applying mid-stream would dead-letter 23503 violations.
     """
     with _section(ui, icon="rocket_launch", title="How to cut over"):  # type: ignore[misc]
         render_notice(
@@ -4217,34 +4490,88 @@ def _render_cutover_section(
                     )
                     ui.label(text).classes("text-sm text-gray-700 leading-snug")  # type: ignore[attr-defined]
 
-        # Explicit foreign-key apply: for a CDC migration the FK ADD CONSTRAINTs were
+        # Explicit foreign-key apply. For a CDC migration the FK ADD CONSTRAINTs were
         # DEFERRED during the stream (they must not exist while the sink applies rows out
-        # of parent-before-child order — an FK violation would be dead-lettered). Apply
-        # them here, AFTER the final drain and BEFORE repointing. Orphan-gated + best
-        # effort, idempotent (safe to re-click). Only shown for a CDC migration that has
-        # foreign keys to create (Full Load already applied them automatically).
-        if cdc_in_use and fk_apply_provider is not None and fk_pending_count > 0:
+        # of parent-before-child order — an FK violation would be dead-lettered), so this
+        # is the ONLY path that creates them; apply here, AFTER the final drain and BEFORE
+        # repointing. For a Full-Load-only migration they were already applied at load
+        # end, but any that were skipped (orphans) or failed are NOT enforced, so the same
+        # (idempotent) action is re-offered to complete them and surface the result
+        # (FIX 9). Orphan-gated + best effort, idempotent (safe to re-click). Shown
+        # whenever the schema has foreign keys to (re)apply.
+        if fk_apply_provider is not None and fk_pending_count > 0:
             with ui.column().classes(  # type: ignore[attr-defined]
                 "w-full gap-1 mt-1 pt-2 border-t border-gray-100"
             ):
-                ui.label(  # type: ignore[attr-defined]
-                    "Before you repoint: apply foreign keys"
-                ).classes("text-sm font-semibold text-gray-900")
                 _fk_noun = "foreign key" if fk_pending_count == 1 else "foreign keys"
-                ui.label(  # type: ignore[attr-defined]
-                    f"Aurora DSQL enforces foreign keys, but this schema's "
-                    f"{fk_pending_count} {_fk_noun} were not created during CDC (they "
-                    "must not exist while the stream applies rows out of "
-                    "parent-before-child order). Apply them now — after the final drain "
-                    "and before repointing. Each is checked for orphan rows first and "
-                    "skipped with a note if any exist. Safe to run more than once."
-                ).classes("text-xs text-gray-600 leading-snug")
+                if cdc_in_use:
+                    ui.label(  # type: ignore[attr-defined]
+                        "Before you repoint: apply foreign keys"
+                    ).classes("text-sm font-semibold text-gray-900")
+                    ui.label(  # type: ignore[attr-defined]
+                        f"Aurora DSQL enforces foreign keys, but this schema's "
+                        f"{fk_pending_count} {_fk_noun} were not created during CDC (they "
+                        "must not exist while the stream applies rows out of "
+                        "parent-before-child order). Apply them now — after the final "
+                        "drain and before repointing. Each is checked for orphan rows "
+                        "first and skipped with a note if any exist. Safe to run more "
+                        "than once."
+                    ).classes("text-xs text-gray-600 leading-snug")
+                else:
+                    ui.label(  # type: ignore[attr-defined]
+                        "Verify foreign keys are enforced"
+                    ).classes("text-sm font-semibold text-gray-900")
+                    ui.label(  # type: ignore[attr-defined]
+                        f"Aurora DSQL enforces foreign keys, and this schema's "
+                        f"{fk_pending_count} {_fk_noun} were applied automatically at the "
+                        "end of the load. If any were skipped (orphan rows) or failed, "
+                        "referential integrity is not fully enforced — re-apply here to "
+                        "complete them and see the result. Already-applied foreign keys "
+                        "are left as-is (safe to run more than once)."
+                    ).classes("text-xs text-gray-600 leading-snug")
+
+                # The ADD CONSTRAINT pass must run ONLY after CDC has drained: applying it
+                # while the sink still streams out-of-order rows dead-letters 23503
+                # violations. This screen does not poll MSK, so gate the CDC apply on an
+                # explicit operator confirmation — the Apply button stays disabled until
+                # the checkbox is ticked (FIX 2). A Full-Load-only re-apply has no live
+                # stream, so it is never gated (pre-confirmed). The button element is held
+                # in a tiny mutable box so the confirmation toggle (rendered above it) can
+                # enable/disable it without a forward reference.
+                _fk_confirmed = {"ok": not cdc_in_use}
+                _fk_btn_box: "dict[str, Any]" = {}
+
+                def _fk_apply_clicked() -> None:
+                    if not _fk_confirmed["ok"]:
+                        return  # gated: CDC has not been confirmed drained
+                    fk_apply_provider()
+
+                if cdc_in_use:
+                    def _fk_confirm_toggle(event: object) -> None:
+                        _fk_confirmed["ok"] = bool(getattr(event, "value", False))
+                        _btn = _fk_btn_box.get("btn")
+                        if _btn is None:
+                            return
+                        if _fk_confirmed["ok"]:
+                            _btn.props(remove="disable")
+                        else:
+                            _btn.props("disable")
+
+                    ui.checkbox(  # type: ignore[attr-defined]
+                        "I have frozen source writes and CDC has drained to zero lag",
+                        on_change=_fk_confirm_toggle,
+                    ).props("dense")
+
                 with ui.row().classes("items-center gap-3 mt-1"):  # type: ignore[attr-defined]
-                    ui.button(  # type: ignore[attr-defined]
+                    _fk_apply_btn = ui.button(  # type: ignore[attr-defined]
                         "Apply foreign keys",
                         icon="link",
-                        on_click=lambda: fk_apply_provider(),
+                        on_click=_fk_apply_clicked,
                     ).props("color=primary outline no-caps")
+                    if cdc_in_use:
+                        # Enabled only once the operator confirms CDC has drained.
+                        _fk_apply_btn.props("disable")
+                        _fk_btn_box["btn"] = _fk_apply_btn
                     if fk_apply_result is not None:
                         _applied, _skipped, _failed = fk_apply_result
                         if _failed == 0 and _skipped == 0:
@@ -4287,19 +4614,20 @@ def _render_cutover_section(
         # sequence must be moved past the current target MAX(pk) or the app's first insert
         # collides (23505). The button does that on demand (idempotent, safe to re-click);
         # do it after the final drain (CDC) / reload (Full Load) and before repointing.
-        if identity_sync_provider is not None:
+        if identity_sync_provider is not None and identity_pending_count > 0:
             with ui.column().classes(  # type: ignore[attr-defined]
                 "w-full gap-1 mt-1 pt-2 border-t border-gray-100"
             ):
+                _id_noun = "table" if identity_pending_count == 1 else "tables"
                 ui.label(  # type: ignore[attr-defined]
                     "Before you repoint: sync identity sequences"
                 ).classes("text-sm font-semibold text-gray-900")
                 ui.label(  # type: ignore[attr-defined]
-                    "If any table uses a server-generated (AUTO_INCREMENT / IDENTITY) "
-                    "key, advance its sequence past the migrated rows so your "
-                    "application's first insert after cut-over does not hit a duplicate "
-                    "key. Run this after the final drain/reload and before repointing. "
-                    "Safe to run more than once."
+                    f"{identity_pending_count} {_id_noun} use a server-generated "
+                    "(AUTO_INCREMENT / IDENTITY) key; advance each sequence past the "
+                    "migrated rows so your application's first insert after cut-over does "
+                    "not hit a duplicate key. Run this after the final drain/reload and "
+                    "before repointing. Safe to run more than once."
                 ).classes("text-xs text-gray-600 leading-snug")
                 with ui.row().classes("items-center gap-3 mt-1"):  # type: ignore[attr-defined]
                     ui.button(  # type: ignore[attr-defined]

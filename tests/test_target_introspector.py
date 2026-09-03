@@ -872,6 +872,50 @@ def test_sync_identity_sequences_reports_a_failed_restart_as_a_string() -> None:
     assert failed == {"ecommerce.orders": reason}
 
 
+class _CatalogFailsCursor(_SeqCursor):
+    """A cursor whose identity-column CATALOG read raises (unreadable catalog)."""
+
+    def execute(self, statement: object, parameters: object = None) -> None:
+        text = statement if isinstance(statement, str) else statement.as_string(None)
+        if "is_identity" in text:
+            raise RuntimeError("PermissionError: relation not visible")
+        super().execute(statement, parameters)
+
+
+class _CatalogFailsConnection(_SeqConnection):
+    def cursor(self) -> _CatalogFailsCursor:
+        return _CatalogFailsCursor(self)
+
+
+def test_sync_identity_sequences_reports_an_unreadable_catalog_as_failed() -> None:
+    """A catalog read that ERRORS is a FAILURE, not a silent "no identity column".
+
+    Swallowing it to None (line 764-766, FIX 1) would silently skip a table that may
+    need advancing -- treated as safely synced, a post-cut-over duplicate-key risk
+    (audit D2). It must surface as a value-free STRING reason so ``partition_identity_sync``
+    routes it into ``failed`` and the caller does not treat the table as no-op.
+    """
+    from dsql_migrator.core.target_introspector import (
+        partition_identity_sync,
+        sync_identity_sequences,
+    )
+
+    conn = _CatalogFailsConnection(identity_by_table={"orders": "id"}, max_pk=742)
+    out = sync_identity_sequences(
+        ["ecommerce.orders"], connection_factory=lambda: conn
+    )
+    reason = out["ecommerce.orders"]
+    assert isinstance(reason, str)  # NOT None -> the unreadable table is visible
+    assert "PermissionError" in reason or "RuntimeError" in reason
+    assert "\n" not in reason  # single line, value-free (Property 7)
+    # It never reached MAX(pk) / RESTART: the catalog read failed first.
+    assert conn.restarts == []
+
+    advanced, failed = partition_identity_sync(out)
+    assert advanced == {}
+    assert failed == {"ecommerce.orders": reason}
+
+
 def test_partition_identity_sync_splits_int_str_none() -> None:
     from dsql_migrator.core.target_introspector import partition_identity_sync
 
