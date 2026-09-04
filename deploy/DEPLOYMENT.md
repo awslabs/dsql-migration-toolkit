@@ -30,6 +30,43 @@ Pick one — each mode has its own section below.
 
 <br>
 
+## Estimated cost
+
+Rough, **order-of-magnitude** figures for **us-east-1** (2025) — **not a quote**. Actual cost
+varies by region and usage; price it for your account with the
+[AWS Pricing Calculator](https://calculator.aws/). Two very different pieces:
+
+**1. The control-plane app** (always running while deployed) — small:
+
+| Resource | Rough cost | Notes |
+|---|---|---|
+| ECS Fargate task | ~$0.02–0.15/hr | 0.5 vCPU/1 GB eval → 4 vCPU/8 GB for a large Full Load; the CPU/memory you pick |
+| Application Load Balancer | ~$0.0225/hr + LCU | Fargate mode only (not the EC2/SSM mode) |
+| S3 (job/session state, plugin bucket) + CloudWatch Logs | cents | tiny |
+| Cognito (optional) | free tier covers a few admins | only if you enable OIDC login |
+
+Aurora **DSQL** (the target) and cross-region **data transfer** are **usage-based** (writes,
+storage, egress) — not estimable up front; see the calculator.
+
+**2. The optional CDC pipeline** (only while a CDC migration is running) — **this dominates**:
+
+| Resource | Rough cost |
+|---|---|
+| **Amazon MSK Serverless** (1 cluster) | ~$0.75/hr base **+ partition-hours/storage** |
+| **MSK Connect** (source + sink) | ~6 MCU × $0.11 ≈ $0.66/hr |
+| NAT gateway (only if the stack creates its own) | ~$0.045/hr + per-GB data processing |
+
+→ **≈ $1.4–$2.0 / hour while deployed** (the exact range the app shows on the CDC deploy
+dialog via `estimate_cdc_hourly_cost`). The CDC pipeline is provisioned **only for the
+duration of a cut-over** and **bills continuously until you delete it** — so **run "Delete CDC
+infrastructure" as soon as the migration completes**. Full Load without CDC provisions **none**
+of this. (The app surfaces this same estimate in-context at deploy time and warns about leftover
+billing at teardown.)
+
+---
+
+<br>
+
 ## Run locally
 
 **Before you commit to an ECS Fargate deployment, try it locally first** — **one
