@@ -4,10 +4,10 @@
 AWSTemplateFormatVersion: "2010-09-09"
 
 Description: >
-  Optional streaming CDC data plane (cdc-stack) for the MySQL -> Aurora DSQL
+  Optional streaming CDC data plane (cdc-stack) for the MySQL/PostgreSQL -> Aurora DSQL
   migration tool. Provisions an MSK Serverless
   cluster (IAM auth), a Glue Schema Registry, two MSK Connect custom plugins
-  (Debezium MySQL source + our custom DSQL sink), two MSK Connect connectors,
+  (Debezium MySQL/PostgreSQL source + our custom DSQL sink), two MSK Connect connectors,
   and a least-privilege connector execution role. Runtime is managed MSK Connect
   (no EKS/compute cluster); scale via MSK partitions, MSK Connect MCU/worker
   count, and connector tasks.max. The app-stack control plane does NOT depend on
@@ -18,7 +18,7 @@ Description: >
 Parameters:
   VpcId:
     Type: AWS::EC2::VPC::Id
-    Description: VPC the CDC pipeline runs in (must reach the source MySQL and Aurora DSQL privately).
+    Description: VPC the CDC pipeline runs in (must reach the source database and Aurora DSQL privately).
 
   ConnectorSubnetIds:
     Type: CommaDelimitedList
@@ -141,7 +141,7 @@ Parameters:
     Type: String
     Default: ""
     Description: >
-      Optional security group id of the source RDS/Aurora MySQL. When set, egress
+      Optional security group id of the source RDS/Aurora (MySQL or PostgreSQL). When set, egress
       on SourceDbPort is allowed to this security group only (preferred over CIDR).
 
   SnapshotMode:
@@ -1053,7 +1053,7 @@ Resources:
         Ref: SourceDbPort
       DestinationSecurityGroupId:
         Ref: SourceDbSecurityGroupId
-      Description: Egress to the source RDS/Aurora MySQL security group (Debezium).
+      Description: Egress to the source RDS/Aurora (MySQL or PostgreSQL) security group (Debezium).
 
   # Fallback when no source-DB security group is supplied: without ANY egress on
   # the MySQL port the Debezium source task cannot open a TCP connection to the
@@ -1076,7 +1076,7 @@ Resources:
         Ref: SourceDbPort
       CidrIp: 0.0.0.0/0
       Description: >-
-        Egress to the source MySQL on SourceDbPort (no source SG supplied). Tighten
+        Egress to the source database on SourceDbPort (no source SG supplied). Tighten
         by passing SourceDbSecurityGroupId so egress targets that SG only.
 
   # --- Owned private networking (created only when ConnectorSubnetIds is empty) -

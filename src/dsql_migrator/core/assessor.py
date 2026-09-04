@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compatibility assessment rule engine for MySQL -> Aurora DSQL migration.
+"""Compatibility assessment rule engine for MySQL/PostgreSQL -> Aurora DSQL migration.
 
 The :class:`CompatibilityAssessor` evaluates a source inventory against a
 declarative, extensible list of :class:`Rule` objects and produces an

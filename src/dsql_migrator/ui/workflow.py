@@ -101,7 +101,7 @@ class WorkflowStep(str, Enum):
     FULL_LOAD = "full_load"
     CDC = "cdc"
     VALIDATION = "validation"
-    # The final step: guidance for switching the application from MySQL to DSQL.
+    # The final step: guidance for switching the application from the source database to DSQL.
     # The tool cannot run or verify a cut-over (it is an operational act the
     # operator performs), so this step has no Run action and is marked Done by
     # the user acknowledging they've cut over.
@@ -513,7 +513,7 @@ def _dsql_cluster_name(endpoint: Optional[str]) -> Optional[str]:
 # glyph on the #C925D1 tile. A 12px corner radius is added to the background tile
 # so it reads as a rounded chip in the diagram node; the size is controlled by
 # the node renderer's Tailwind classes (h-10 w-10), so no width/height here.
-# Source: Amazon RDS (covers RDS MySQL and Aurora MySQL sources).
+# Source: Amazon RDS (covers RDS/Aurora MySQL and PostgreSQL sources).
 _SOURCE_DB_SVG = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80" '
     'role="img" aria-label="Amazon RDS source database">'

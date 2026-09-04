@@ -56,7 +56,7 @@ _CDC_GRANTS = ("SELECT", "REPLICATION CLIENT", "REPLICATION SLAVE")
 
 
 class SourceProbe(Protocol):
-    """Read-only access to the source MySQL used by prerequisite checks."""
+    """Read-only access to the source database used by prerequisite checks."""
 
     def reachable(self) -> ConnectionResult:
         """Return whether the source is reachable and login succeeds."""

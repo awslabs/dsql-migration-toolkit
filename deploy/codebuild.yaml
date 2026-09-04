@@ -4,7 +4,7 @@
 AWSTemplateFormatVersion: "2010-09-09"
 
 Description: >
-  Cloud build infrastructure for the MySQL -> Aurora DSQL migration tool image
+  Cloud build infrastructure for the MySQL/PostgreSQL -> Aurora DSQL migration tool image
   (no local Docker required). Provisions an Amazon ECR repository, an S3 bucket
   for the build source, and an AWS CodeBuild project (privileged mode) with a
   least-privilege service role that builds deploy/Dockerfile and pushes the image

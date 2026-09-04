@@ -3,7 +3,7 @@
 
 """Resolve a source database credential from AWS Secrets Manager.
 
-The Connect screen lets a user authenticate the source MySQL connection either
+The Connect screen lets a user authenticate the source database connection either
 with a username and password they type, or by pointing at an AWS Secrets Manager
 secret (for example the managed secret RDS/Aurora creates). This module resolves
 such a secret into a ``(username, password)`` pair using the single shared
@@ -266,7 +266,7 @@ def ensure_source_secret(
     create_kwargs: dict = {
         "Name": name,
         "SecretString": secret_string,
-        "Description": "Source MySQL credentials for the mysql-dsql-migrator CDC pipeline.",
+        "Description": "Source database credentials for the mysql-dsql-migrator CDC pipeline.",
     }
     if kms_key_id:
         create_kwargs["KmsKeyId"] = kms_key_id

@@ -995,7 +995,7 @@ class PrereqCategory(str, Enum):
 
 
 # Which category each check belongs to. Connectivity = can we reach/authenticate
-# to both ends; Source Configuration = MySQL server settings/privileges; Schema &
+# to both ends; Source Configuration = source server settings/privileges; Schema &
 # Tables = per-table readiness on source and target; Streaming = the optional CDC
 # transport (MSK / MSK Connect).
 _PREREQ_CATEGORY_BY_CHECK: dict[PrerequisiteCheckId, PrereqCategory] = {

@@ -15,7 +15,7 @@ AWSTemplateFormatVersion: "2010-09-09"
 #     stack's own resources fall inside the CdcDeployRole's cdc-stack scope
 #     (canonical "dsql-cdc-*" + legacy "mysql-dsql-cdc-*").
 Description: >
-  Lambda-free "EC2 + MSK only" deployment of the MySQL -> Aurora DSQL migration
+  Lambda-free "EC2 + MSK only" deployment of the MySQL/PostgreSQL -> Aurora DSQL migration
   tool (Option 3), for customers who cannot use AWS Lambda. Runs the same
   control-plane app (UI + Full Load + in-process CDC offset seed) from source as a
   systemd service on a single in-VPC EC2 host -- no ALB/ACM/Cognito/ECS -- reached over
@@ -39,7 +39,7 @@ Metadata:
           - MskEgressCidr
           - HttpsEgressCidr
       - Label:
-          default: "2. Migration endpoints — DSQL target (required) + MySQL source (optional)"
+          default: "2. Migration endpoints — DSQL target (required) + source (MySQL/PostgreSQL, optional)"
         Parameters:
           - DsqlClusterArn
           - SourceSecretArn
@@ -71,7 +71,7 @@ Metadata:
           - BedrockModelId
     ParameterLabels:
       VpcId:
-        default: "VPC  [Required] — the VPC that hosts the source MySQL and the CDC MSK"
+        default: "VPC  [Required] — the VPC that hosts the source database and the CDC MSK"
       HostSubnetId:
         default: "Host subnet  [Required] — a NAT-egress subnet, co-located with the CDC MSK; reached via SSM port-forward (no public IP needed)"
       MskEgressCidr:
@@ -87,7 +87,7 @@ Metadata:
       SourceDbCidr:
         default: "Source DB CIDR  [Required — this OR 'Source DB security group'] — use when you have no source security group id"
       SourceDbPort:
-        default: "Source MySQL port  [Optional, default 3306]"
+        default: "Source DB port  [Optional, default 3306 for MySQL / 5432 for PostgreSQL]"
       InstanceType:
         default: "Instance type  [Optional, default t3.large]"
       StateVolumeSizeGiB:
@@ -146,7 +146,7 @@ Parameters:
     Type: String
     Default: ""
     Description: >
-      Security group id of the source RDS/Aurora MySQL. When set, the task's
+      Security group id of the source RDS/Aurora (MySQL or PostgreSQL). When set, the task's
       egress on the source DB port is scoped to this security group only
       (preferred). Provide this OR SourceDbCidr -- at least one is required so the
       task can reach the source; with both empty there is no DB-port egress and
@@ -165,7 +165,7 @@ Parameters:
     Default: 3306
     MinValue: 1
     MaxValue: 65535
-    Description: Source MySQL port (egress).
+    Description: Source DB port (egress).
 
   SourceMode:
     Type: String
@@ -331,7 +331,7 @@ Parameters:
 # Reject an unreachable-source deployment at create/update time (before any
 # resource is provisioned).
 Rules:
-  # The host must have an egress path to the source MySQL on SourceDbPort, or it
+  # The host must have an egress path to the source database on SourceDbPort, or it
   # can never connect (the UI's source connection times out). That path is opened
   # by EITHER SourceDbSecurityGroupId (preferred -- host egress scoped to the
   # source DB's security group) OR SourceDbCidr. If BOTH are left empty, no
@@ -347,7 +347,7 @@ Rules:
                 - Fn::Equals: [Ref: SourceDbCidr, ""]
         AssertDescription: >-
           Provide SourceDbSecurityGroupId (preferred) or SourceDbCidr so the host
-          gets egress to the source MySQL on SourceDbPort. With both empty the host
+          gets egress to the source database on SourceDbPort. With both empty the host
           has no route to the source DB and connections time out.
 
 Conditions:
@@ -1218,7 +1218,7 @@ Resources:
         Ref: SourceDbPort
       DestinationSecurityGroupId:
         Ref: SourceDbSecurityGroupId
-      Description: Egress to source RDS/Aurora MySQL security group.
+      Description: Egress to source RDS/Aurora (MySQL or PostgreSQL) security group.
 
   SourceDbEgressByCidr:
     Type: AWS::EC2::SecurityGroupEgress
@@ -1233,7 +1233,7 @@ Resources:
         Ref: SourceDbPort
       CidrIp:
         Ref: SourceDbCidr
-      Description: Egress to source RDS/Aurora MySQL CIDR.
+      Description: Egress to source RDS/Aurora (MySQL or PostgreSQL) CIDR.
 
   # The single control-plane host. Runs the app FROM SOURCE (no Docker/ECR) as a
   # systemd service; reached only via SSM port-forward. Bootstrap in UserData:
@@ -1381,7 +1381,7 @@ Resources:
             # no network/resolve; Restart=always mirrors the container's restart policy.
             cat > /etc/systemd/system/dsql-migrator.service <<'EOF'
             [Unit]
-            Description=MySQL -> Aurora DSQL migration tool (NiceGUI, run from source)
+            Description=MySQL/PostgreSQL -> Aurora DSQL migration tool (NiceGUI, run from source)
             After=network-online.target
             Wants=network-online.target
 

@@ -5,6 +5,22 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.440
+
+### 変更 (Changed)
+
+- **文言をソース中立に整理。** MySQL に加え PostgreSQL ソースも移行するようになったため、ソースが
+  MySQL 専用であるかのように読めるユーザー向け文言を中立化しました:CloudFormation パラメータの
+  ラベル/説明(例:"Source MySQL port" → "Source DB port [MySQL は 3306 / PostgreSQL は 5432]"、
+  "MySQL source (optional)" → "source (MySQL/PostgreSQL, optional)")、CLI `--help` の説明、
+  カットオーバー UI 文言("… ソースデータベースを DSQL へ")、CDC ソースシークレットの説明、各種
+  コメント/docstring。正しい MySQL 固有の記述はそのまま残します(MySQL→PostgreSQL の Query
+  Converter、binlog/GTID の CDC スタブ、MySQL-JDBC のエラーシグネチャ、MySQL の grant 名、
+  source-aware 条件分岐の MySQL ブランチ)。デプロイ済みリソース名(プラグインバケット、CDC
+  シークレット名、アプリ/ビルドの CloudFormation スタック、ECR イメージ repo)、`mysql-dsql-migrator`
+  CLI コマンド、Python 配布パッケージ名は意図的に変更していません — これらの改名は稼働中のデプロイを
+  壊す協調的な移行になるため延期します。
+
 ## v0.1.439
 
 ### 変更 (Changed)

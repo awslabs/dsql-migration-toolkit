@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.440
+
+### Changed
+
+- **Source-agnostic wording.** Now that the tool migrates from PostgreSQL sources as well as
+  MySQL, neutralized the user-facing text that still implied a MySQL-only source: CloudFormation
+  parameter labels/descriptions (e.g. "Source MySQL port" → "Source DB port [3306 for MySQL /
+  5432 for PostgreSQL]", "MySQL source (optional)" → "source (MySQL/PostgreSQL, optional)"), the
+  CLI `--help` description, cut-over UI strings ("… the source database to DSQL"), the CDC source
+  secret's description, and assorted comments/docstrings. Correct MySQL-specific references are
+  left as-is (the MySQL→PostgreSQL Query Converter, the binlog/GTID CDC stub, MySQL-JDBC error
+  signatures, MySQL grant names, the MySQL branch of source-aware conditionals). Deployed-resource
+  names (the plugin bucket, the CDC secret name, the app/build CloudFormation stacks, the ECR image
+  repo), the `mysql-dsql-migrator` CLI command, and the Python distribution name are intentionally
+  unchanged — renaming those is a coordinated migration that would disrupt live deployments, so it
+  is deferred.
+
 ## v0.1.439
 
 ### Changed

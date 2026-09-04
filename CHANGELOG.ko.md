@@ -5,6 +5,21 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.440
+
+### 변경 (Changed)
+
+- **문구를 source-agnostic하게 정리.** 이제 MySQL뿐 아니라 PostgreSQL 소스도 마이그레이션하므로,
+  소스가 MySQL 전용인 것처럼 읽히던 사용자 노출 문구를 중립화했습니다: CloudFormation 파라미터
+  라벨/설명(예: "Source MySQL port" → "Source DB port [MySQL 3306 / PostgreSQL 5432]",
+  "MySQL source (optional)" → "source (MySQL/PostgreSQL, optional)"), CLI `--help` 설명, 컷오버 UI
+  문구("… 소스 데이터베이스를 DSQL로"), CDC 소스 시크릿 설명, 각종 주석/독스트링. 실제 MySQL 전용
+  참조는 그대로 둡니다(MySQL→PostgreSQL Query Converter, binlog/GTID CDC 스텁, MySQL-JDBC 오류
+  시그니처, MySQL grant 이름, source-aware 분기의 MySQL 브랜치). 배포된 리소스 이름(플러그인 버킷,
+  CDC 시크릿 이름, 앱/빌드 CloudFormation 스택, ECR 이미지 repo), `mysql-dsql-migrator` CLI 명령,
+  Python 배포 패키지 이름은 의도적으로 그대로 둡니다 — 이들 리네이밍은 라이브 배포를 깨뜨리는 조율된
+  마이그레이션이라 보류합니다.
+
 ## v0.1.439
 
 ### 변경 (Changed)

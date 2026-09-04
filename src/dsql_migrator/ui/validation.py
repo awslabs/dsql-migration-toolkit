@@ -2889,7 +2889,7 @@ def build_cutover_screen(
     """Build the Cut over step (step 6), returning ``(content_builder, runner)``.
 
     Cut-over is the one step the tool does NOT perform: repointing the application
-    from MySQL to DSQL is an operational act only the operator can do. So this step
+    from the source database to DSQL is an operational act only the operator can do. So this step
     has no job to run — the ``runner`` simply marks the step ``DONE`` when the user
     acknowledges they have cut over (the workflow shell's Run button is hidden for
     this step; a dedicated in-content button drives the acknowledgement).

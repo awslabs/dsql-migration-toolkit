@@ -342,7 +342,7 @@ def _fetch_migration_row_counts(migration_state, session, table_names, inventory
     """Read source/target ``COUNT(*)`` and ``MAX(pk)`` per table (BLOCKING, read-only).
 
     Runs on a worker thread (the caller uses ``run.io_bound``). Source uses the
-    same read-only MySQL engine the loader uses; target uses the DSQL IAM
+    same read-only source engine the loader uses; target uses the DSQL IAM
     connector. The ``MAX(pk)`` per side is the stream high-water mark: comparing
     them tells whether CDC's leading edge has caught up (no lag) independently of
     the row COUNT, so a mid-stream gap is distinguishable from a lagging stream.

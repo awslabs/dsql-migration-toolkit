@@ -5,8 +5,8 @@
 
 The source server version is read over the SQL connection
 (:meth:`SourceIntrospector.test_connection`), but the **instance class** (e.g.
-``db.r6g.large``) is RDS control-plane metadata that is not available over a
-MySQL connection. This module derives the DB identifier and region from the
+``db.r6g.large``) is RDS control-plane metadata that is not available over the
+database connection. This module derives the DB identifier and region from the
 source endpoint and looks the instance up via the RDS ``DescribeDBInstances``
 API (``DescribeDBClusters`` membership for an Aurora cluster endpoint), sharing
 the single ``boto3`` session/credential context (Requirements 9.5/9.7).

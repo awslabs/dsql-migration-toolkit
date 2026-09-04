@@ -545,7 +545,7 @@ PROGRESS_FLUSH_ROWS = 10_000
 
 # Safety ceiling on concurrent SOURCE snapshot readers = table_parallelism x
 # reader_shards. Each holds a long-lived source connection; this caps the product
-# so a high table_parallelism x reader_shards can't exhaust the source MySQL's
+# so a high table_parallelism x reader_shards can't exhaust the source's
 # max_connections. Reader sharding is clamped down (never up) to honor it.
 _MAX_SOURCE_READERS = 32
 
@@ -815,7 +815,7 @@ def _retry_source_drops_in_process(
 
 
 def _close_row_streams(rows, shard_sources) -> None:
-    """Close source row generators so their MySQL connections are freed now.
+    """Close source row generators so their source connections are freed now.
 
     ``TableExporter.stream_converted_rows`` yields from inside a
     ``START TRANSACTION WITH CONSISTENT SNAPSHOT`` and disposes its engine in the
@@ -843,7 +843,7 @@ def _release_source_stream(release) -> None:
 
     The row streams are GENERATORS whose source engine is disposed in their own
     ``finally`` (see ``TableExporter.stream_converted_rows``), so an abandoned one
-    holds its MySQL connection open until it is closed or collected. Closing it
+    holds its source connection open until it is closed or collected. Closing it
     explicitly releases the dead snapshot connection immediately instead of leaving
     it pinned for the whole backoff.
     """
@@ -999,7 +999,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
     """Load one PK-range shard of a table in its own process (Phase 2).
 
     Same pattern as _migrate_one_table_in_process but reads only the
-    [pk_lower, pk_upper) slice. Each shard builds its own MySQL connection +
+    [pk_lower, pk_upper) slice. Each shard builds its own source connection +
     DSQL connection pool so they run on independent cores.
     """
     progress_queue = _worker_progress_queue

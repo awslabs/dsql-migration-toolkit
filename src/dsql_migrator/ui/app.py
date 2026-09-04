@@ -474,8 +474,8 @@ def build_page(
         ai_tool_execute=_ai_tool_execute,
         ai_tools=_AI_TOOL_SCHEMAS,
     )
-    # Step 6 (Cut over): guidance for switching the application from MySQL to
-    # DSQL. The tool cannot perform/verify the cut-over, so this step has no job —
+    # Step 6 (Cut over): guidance for switching the application from the source
+    # database to DSQL. The tool cannot perform/verify the cut-over, so this step has no job —
     # the runner marks it DONE on the user's acknowledgement; the content reflects
     # the last validation verdict (clean MATCH -> runbook, else "validate first").
     cutover_content, cutover_runner = build_cutover_screen(

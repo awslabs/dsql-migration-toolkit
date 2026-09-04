@@ -1,10 +1,10 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Read-only source introspection for MySQL (RDS/Aurora).
+"""Read-only source introspection for MySQL and PostgreSQL (RDS/Aurora).
 
-The :class:`SourceIntrospector` connects to a source MySQL database using
-SQLAlchemy + PyMySQL and extracts schema/object metadata into a
+The :class:`SourceIntrospector` connects to a source database (MySQL or
+PostgreSQL) via SQLAlchemy and extracts schema/object metadata into a
 :class:`~dsql_migrator.core.models.SourceInventory`. It implements two
 guarantees from the design:
 
@@ -976,7 +976,7 @@ def _assemble_inventory(
 
 
 class SourceIntrospector:
-    """Connects to a source MySQL database and extracts its inventory (read-only)."""
+    """Connects to a source database (MySQL or PostgreSQL) and extracts its inventory (read-only)."""
 
     def __init__(
         self,

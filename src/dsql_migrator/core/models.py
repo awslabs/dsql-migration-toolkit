@@ -1164,7 +1164,7 @@ class WorkflowState(BaseModel):
     cdc: StepStatus = StepStatus.NOT_STARTED
     validation: StepStatus = StepStatus.NOT_STARTED
     # Cut over: the final step guiding the operator through switching the
-    # application from MySQL to DSQL. The tool cannot run/verify it, so it is
+    # application from the source database to DSQL. The tool cannot run/verify it, so it is
     # marked DONE by the user acknowledging the cut-over. Prerequisite: Validation.
     # Defaults NOT_STARTED; older snapshots lacking it still load.
     cut_over: StepStatus = StepStatus.NOT_STARTED

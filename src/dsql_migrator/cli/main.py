@@ -23,7 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the top-level argument parser."""
     parser = argparse.ArgumentParser(
         prog="mysql-dsql-migrator",
-        description="RDS/Aurora MySQL to Amazon Aurora DSQL migration toolkit.",
+        description="RDS/Aurora MySQL or PostgreSQL to Amazon Aurora DSQL migration toolkit.",
     )
     parser.add_argument(
         "--version",
