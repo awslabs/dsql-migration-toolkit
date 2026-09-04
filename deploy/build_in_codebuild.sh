@@ -14,6 +14,7 @@
 #   AWS_REGION    AWS region (required; or configure a default region).
 #   BUILD_STACK   CodeBuild infra stack name (default: mysql-dsql-migrator-build).
 #   IMAGE_TAG     Image tag (default: arg $1, else project version, else 'latest').
+#   SKIP_RELEASE_GATE  Set to bypass the live pre-publish DSQL smoke gate (see below).
 #
 # Steps: zip the working tree -> upload to the stack's S3 source bucket ->
 # start the CodeBuild project -> wait -> print the pushed image URI to use as
@@ -50,6 +51,28 @@ if [ -z "${BUCKET}" ] || [ "${BUCKET}" = "None" ] || [ -z "${PROJECT}" ] || [ "$
 fi
 
 IMAGE_URI="${REPO_URI}:${IMAGE_TAG}"
+
+# --- Release gate (fail-closed) ----------------------------------------------
+# Run the LIVE pre-publish smoke (scripts/release_gate.py) BEFORE building/pushing an
+# image, so a connect-option / checksum regression the fake-DSQL unit suite CANNOT see
+# (the v0.1.438 lc_numeric one broke every real DSQL connect yet shipped green) blocks
+# the build instead of publishing. It connects to the .env DSQL target via the tool's
+# real DsqlConnector, runs SELECT 1 + confirms the pinned GUCs, and does a scratch
+# CREATE/INSERT/SELECT/DROP. Set SKIP_RELEASE_GATE=1 to bypass — ONLY when you have no
+# disposable DSQL target to test against (e.g. a fresh clone with no configured target).
+if [ -n "${SKIP_RELEASE_GATE:-}" ]; then
+  echo "==> Release gate SKIPPED (SKIP_RELEASE_GATE set) — no live pre-publish check ran."
+else
+  GATE_PY="${REPO_ROOT}/.venv/bin/python"
+  [ -x "${GATE_PY}" ] || GATE_PY="python3"
+  echo "==> Release gate: live DSQL smoke (scripts/release_gate.py --roundtrip --skip-source)"
+  if ! "${GATE_PY}" "${REPO_ROOT}/scripts/release_gate.py" --roundtrip --skip-source; then
+    echo "error: release gate FAILED — NOT building. Fix the DSQL connectivity/regression" >&2
+    echo "       reported above, or (only if you have no test DSQL target) re-run with" >&2
+    echo "       SKIP_RELEASE_GATE=1 to bypass." >&2
+    exit 1
+  fi
+fi
 
 echo "==> Packaging source"
 TMPZIP="$(mktemp -t mysql-dsql-migrator-source-XXXXXX).zip"
