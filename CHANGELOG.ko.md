@@ -5,6 +5,19 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.441
+
+### 추가 (Added)
+
+- **Full Load: "Reader shards per large table"를 Settings knob으로 노출 (기존 env 전용).** 대형
+  단일 정수-PK 테이블은 per-row 타입변환으로 CPU-bound인 **단일 리더**가 읽어 코어 하나에서 정체 →
+  하나의 거대 테이블이 지배하는 마이그레이션이 단일 코어 속도에 묶임. Reader 범위 샤딩(K개 리더가 겹치지
+  않는 PK 구간 병렬 읽기)은 이미 있었지만 `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` env로만 설정 가능해
+  브라우저 운영자에게 안 보였음. 이제 Settings "Full Load" 그룹에 Tables in parallel / Batches per
+  table / Rows per batch와 함께 노출(기본 `1`=off, 범위 1–8). 8M행 로드에서 **K=4일 때 ~3.8×** 실측.
+  단일 정수-PK + 샤드 최소 행수 이상 테이블에만 적용; 소스 읽기 동시성 상승(총 소스 리더 = tables-in-
+  parallel × 이 값), 소스 커넥션 상한으로 clamp; 다음 Full Load 실행부터 적용.
+
 ## v0.1.440
 
 ### 변경 (Changed)

@@ -631,6 +631,29 @@ TUNABLE_KNOBS: tuple[TunableKnob, ...] = (
         "Rows per INSERT batch (DSQL caps a transaction at 3000 rows).",
     ),
     TunableKnob(
+        "full_load_reader_shards",
+        "FULL_LOAD_READER_SHARDS",
+        "Full Load",
+        "Reader shards per large table",
+        "Concurrent readers splitting one LARGE single-integer-PK table's read (1 = off).",
+        help_text=(
+            "A big single table is otherwise read by ONE keyset reader that is CPU-bound "
+            "(per-row type conversion) and tops out near one core, so a migration dominated "
+            "by one huge table stalls near single-core speed. K readers split its primary-key "
+            "range into K disjoint slices streamed concurrently (each from its own consistent "
+            "source snapshot), letting a large table use more cores — measured ~3.8x at K=4 on "
+            "an 8M-row load.\n\n"
+            "1 = off (one reader, the previous behavior). Only applies to a table with a single "
+            "integer PK and at least 'Shard minimum rows' estimated rows; composite / "
+            "non-integer PKs and smaller tables always use one reader.\n\n"
+            "It raises SOURCE read concurrency: total source readers = Tables in parallel × "
+            "this, so keep it modest on a source still serving production traffic. The tool "
+            "clamps the product under the source's connection ceiling. Takes effect at the next "
+            "Full Load run or 'Retry failed tables' (re-read from config), so you can adjust it "
+            "without a redeploy."
+        ),
+    ),
+    TunableKnob(
         "full_load_max_source_threads_running",
         "FULL_LOAD_MAX_SOURCE_THREADS_RUNNING",
         "Full Load",

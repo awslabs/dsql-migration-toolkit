@@ -1005,10 +1005,12 @@ def test_full_load_tab_shows_ranges_and_the_connection_product_warning() -> None
     # The one way to misconfigure this panel into a failing run is called out here.
     assert "Connections ≈ tables in parallel × batches per table" in blob
     # Range-valued knobs stay numeric inputs, with their bounds shown as constraints.
-    # Four Full Load knobs: tables-in-parallel, batches-per-table, rows-per-batch, and
-    # the opt-in source-load throttle (all range-valued -> numeric inputs, no selects).
-    assert len(ui.numbers) == 4
+    # Five Full Load knobs: tables-in-parallel, batches-per-table, rows-per-batch,
+    # reader-shards-per-large-table, and the opt-in source-load throttle (all
+    # range-valued -> numeric inputs, no selects).
+    assert len(ui.numbers) == 5
     assert not ui.selects
+    assert "Reader shards per large table" in blob  # lifts a huge single table off one reader
     assert "1–3000" in blob  # rows per batch (DSQL's per-transaction cap)
     assert "Rows per batch" in blob
     # The source-load throttle is settable here (the only path on Fargate), with 0=off

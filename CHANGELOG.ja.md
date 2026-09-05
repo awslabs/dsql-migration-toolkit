@@ -5,6 +5,20 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.441
+
+### 追加 (Added)
+
+- **Full Load:「Reader shards per large table」を Settings のノブとして公開(従来は env のみ)。** 大きな
+  単一整数-PK テーブルは per-row 型変換で CPU-bound な**単一リーダー**が読み、1 コア付近で頭打ち →
+  1 つの巨大テーブルが支配する移行が単一コア速度に縛られていました。Reader レンジ・シャーディング(K 個の
+  リーダーが互いに素な PK スライスを並列読み)は既にありましたが `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS`
+  の env でしか設定できず、ブラウザの operator には見えませんでした。今は Settings の「Full Load」グループに
+  Tables in parallel / Batches per table / Rows per batch と並べて公開(既定 `1`=off、範囲 1–8)。8M 行
+  ロードで **K=4 のとき ~3.8×** を実測。単一整数-PK かつシャード最小行数以上のテーブルのみ適用;ソース読み取り
+  同時実行が増加(総ソースリーダー = tables-in-parallel × この値)、ソース接続上限で clamp;次回 Full Load
+  実行から反映。
+
 ## v0.1.440
 
 ### 変更 (Changed)

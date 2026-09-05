@@ -367,6 +367,7 @@ def test_tunable_knobs_bounds_match_appconfig_fields() -> None:
         "full_load_table_parallelism": (1, 16),
         "full_load_batch_parallelism": (1, 32),
         "full_load_batch_rows": (1, 3000),
+        "full_load_reader_shards": (1, 8),
         "full_load_max_source_threads_running": (0, 10000),
         "validate_max_workers": (1, 32),
         "cdc_sink_mcu_count": (1, 8),
@@ -375,6 +376,19 @@ def test_tunable_knobs_bounds_match_appconfig_fields() -> None:
     assert got == expected
     # Every knob's env key is DSQL_MIGRATOR_-prefixed.
     assert all(k.env_key.startswith(ENV_PREFIX) for k in TUNABLE_KNOBS)
+
+
+def test_reader_shards_is_a_full_load_ui_knob() -> None:
+    """full_load_reader_shards must be a UI-exposed "Full Load" knob (not env-only): it
+    lifts a large single-integer-PK table off the single-CPU-bound-reader ceiling
+    (~3.8x at K=4, measured), and the app is web-first so a browser operator must be
+    able to set it — the other Full Load knobs (Tables in parallel / Batches per table /
+    Rows per batch) already are."""
+    knob = next((k for k in TUNABLE_KNOBS if k.field == "full_load_reader_shards"), None)
+    assert knob is not None, "full_load_reader_shards is missing from TUNABLE_KNOBS (UI)"
+    assert knob.group == "Full Load"
+    assert knob.env_key == f"{ENV_PREFIX}FULL_LOAD_READER_SHARDS"
+    assert (knob.minimum, knob.maximum) == (1, 8)
 
 
 def test_tunable_knob_label_is_derived_from_group_and_short_label() -> None:
@@ -503,6 +517,7 @@ def test_current_tuning_values_reflect_defaults(monkeypatch: pytest.MonkeyPatch)
         "full_load_table_parallelism": 4,
         "full_load_batch_parallelism": 8,
         "full_load_batch_rows": 2000,
+        "full_load_reader_shards": 1,
         "full_load_max_source_threads_running": 0,
         "validate_max_workers": 4,
         "cdc_sink_mcu_count": 4,

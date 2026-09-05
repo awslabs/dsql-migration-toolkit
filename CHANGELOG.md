@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.441
+
+### Added
+
+- **Full Load: "Reader shards per large table" is now a Settings knob (was env-only).** A large
+  single-integer-PK table was read by ONE keyset reader that is CPU-bound (per-row type
+  conversion) and tops out near one core, so a migration dominated by one huge table stalled near
+  single-core speed. Reader range-sharding (K concurrent readers over disjoint PK slices) already
+  existed but was only settable via `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` — invisible to a
+  browser operator. It is now exposed in the Settings "Full Load" group alongside Tables in
+  parallel / Batches per table / Rows per batch (default `1` = off; range 1–8). Measured **~3.8× at
+  K=4** on an 8M-row load. Applies only to a single-integer-PK table with at least the shard
+  minimum rows; raises source read concurrency (total source readers = tables-in-parallel × this),
+  clamped under the source connection ceiling; takes effect at the next Full Load run.
+
 ## v0.1.440
 
 ### Changed
