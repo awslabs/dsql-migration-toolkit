@@ -618,7 +618,12 @@ def stage_workload(args) -> None:
                     )
                     inserted += 1
                 except Exception as e:  # noqa: BLE001
-                    log(f"  INSERT {i} skipped: {str(e).splitlines()[0]}")
+                    # Log only the exception TYPE, never str(e): this engine was built
+                    # from a URL carrying the source password, and CodeQL (correctly, as
+                    # an anti-pattern) flags logging its exception string as clear-text
+                    # logging of sensitive info — even though SQLAlchemy masks the URL
+                    # password. The type alone is enough for a best-effort workload row.
+                    log(f"  INSERT {i} skipped: {type(e).__name__}")
             conn.execute(
                 text(f"UPDATE {fq} SET {q(pk)} = {q(pk)} "
                      f"WHERE {q(pk)} = (SELECT MIN({q(pk)}) FROM {fq})")
