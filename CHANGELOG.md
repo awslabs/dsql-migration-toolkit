@@ -5,6 +5,48 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.442
+
+### Fixed
+
+- **Composite-key warning no longer claims CDC is unsupported.** Choosing "Composite key" in
+  Schema Conversion ended its warning with "Not yet supported with CDC." — true when the option
+  shipped in v0.1.64, but composite-key CDC has worked since: `composite_key_columns_for_cdc()`
+  tells Debezium to key each change record on the target composite key
+  (`message.key.columns`), so the sink's `ON CONFLICT` / `DELETE` match without any sink change.
+  The notice now states the real constraint: it works automatically as long as no key column is
+  dropped from capture by the column exclude list (the one precondition CDC start already gates).
+- **AI Assist no longer claims to be working when Amazon Bedrock is denying every request.**
+  The app modelled AI *intent* but never AI *capability*: `ai_assist.enabled` (the opt-in) was
+  persisted and restored, while the only record of a successful Bedrock preflight was a
+  page-local dict inside the Connect card. Every AI affordance and the journey-header diagram
+  read the preference alone, so a resumed session painted a green "AI assist: On" chip and live
+  AI buttons while each reply failed with "access to Amazon Bedrock InvokeModel was denied".
+  AI capability is now session state (`ai_verified`) with a single source of truth,
+  `ai_availability()`, that the whole UI consults:
+  - the header chip has three honest states -- green **"AI assist: On"** only after a clean
+    preflight, neutral **"AI assist: On (unverified)"** when enabled but never checked, and
+    amber **"AI assist: unavailable"** once a denial is observed (the same "reconnect" semantic
+    the source/target nodes use for restored-but-unverified endpoints);
+  - a real `ACCESS_DENIED` reply now **records** the failure instead of discarding it, so the
+    header and every step's AI button self-correct after the first failed call, and the per-step
+    affordances go disabled-with-a-reason rather than offering an action that can only fail.
+    Transient failures (throttle / network) deliberately do NOT latch;
+  - editing the toggle, the Bedrock model, the region, **or the AWS profile** now invalidates a
+    prior verdict, so a green "Verified" badge cannot survive switching to a profile without
+    `bedrock:InvokeModel`.
+- **A restored session no longer silently changes its AWS credential identity.** `aws_profile`
+  (a profile *name*, never a credential) was not part of the session snapshot while
+  `ai_assist.enabled=True` was, so a session whose AI worked under a named profile came back
+  invoking Bedrock through the environment credential chain -- the likeliest source of the
+  AccessDenied above. It is now persisted, restored first, and part of the dirty-check signature.
+- **Turning AI Assist off is saved immediately.** Nothing on the Connect screen invoked the
+  snapshot hook, so switching AI off and reloading before navigating re-applied the stale AI-ON
+  snapshot and silently re-enabled it.
+- **The "Verified" badge no longer disappears just because you navigated away.** The preflight
+  verdict lived in a closure that was re-created on every Connect render; it now lives on the
+  session, so leaving Connect and returning keeps a verified state.
+
 ## v0.1.441
 
 ### Added

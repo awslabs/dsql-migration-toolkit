@@ -622,3 +622,225 @@ def test_env_model_id_seeds_the_form_even_after_ai_assist_is_enabled() -> None:
     assert seed(AiAssistConfig(), region="us-west-2").region == "us-west-2"
     fixed = AiAssistConfig(region="eu-west-1")
     assert seed(fixed, region="us-west-2").region == "eu-west-1"
+
+
+# ---------------------------------------------------------------------------
+# AI availability: intent (persisted preference) vs capability (this session)
+# ---------------------------------------------------------------------------
+
+
+def test_ai_availability_separates_preference_from_verified_capability() -> None:
+    # The app used to display the PREFERENCE as if it were CAPABILITY, so a restored
+    # session painted a green "AI assist: On" chip and live AI buttons while every
+    # Bedrock InvokeModel was denied. ai_availability() is the single source of truth
+    # that keeps the two apart.
+    from dsql_migrator.ui.ai_assist import (
+        AI_AVAILABLE,
+        AI_OFF,
+        AI_UNAVAILABLE,
+        AI_UNVERIFIED,
+        ai_availability,
+        ai_is_usable,
+        build_ai_assist_config,
+    )
+    from dsql_migrator.ui.session import SessionConnectionState
+
+    state = SessionConnectionState()
+    # Opt-in default: nothing AI is offered.
+    assert ai_availability(state) == AI_OFF
+    assert ai_is_usable(state) is False
+
+    # Enabled but never preflighted: affordances stay ACTIVE (a preflight is optional
+    # and the call may well work) but no affirmative claim is made.
+    state.set_ai_assist(build_ai_assist_config(enabled=True))
+    assert ai_availability(state) == AI_UNVERIFIED
+    assert ai_is_usable(state) is True
+
+    # A clean preflight is the only thing that earns "available".
+    state.set_ai_verified(True)
+    assert ai_availability(state) == AI_AVAILABLE
+    assert ai_is_usable(state) is True
+
+    # An observed ACCESS_DENIED makes AI unusable, with an actionable reason, so
+    # affordances stop offering an action that can only fail.
+    state.set_ai_verified(False, "denied: grant bedrock:InvokeModel")
+    assert ai_availability(state) == AI_UNAVAILABLE
+    assert ai_is_usable(state) is False
+    assert state.ai_unavailable_detail == "denied: grant bedrock:InvokeModel"
+
+    # The preference still wins: turning it off reads "off", not "unavailable".
+    state.set_ai_assist(build_ai_assist_config(enabled=False))
+    assert ai_availability(state) == AI_OFF
+
+
+def test_material_config_or_profile_change_invalidates_the_ai_verdict() -> None:
+    # A verdict is about ONE (toggle, model, region, credential identity). Editing any
+    # of them must not leave the UI vouching for something never checked -- this mirrors
+    # Connect re-locking a verified connection when it is edited.
+    from dsql_migrator.ui.ai_assist import (
+        AI_AVAILABLE,
+        AI_UNVERIFIED,
+        ai_availability,
+        build_ai_assist_config,
+    )
+    from dsql_migrator.ui.session import SessionConnectionState
+
+    def verified_session() -> SessionConnectionState:
+        state = SessionConnectionState()
+        state.set_ai_assist(build_ai_assist_config(enabled=True))
+        state.set_ai_verified(True)
+        assert ai_availability(state) == AI_AVAILABLE
+        return state
+
+    # Switching the Bedrock model invalidates it.
+    state = verified_session()
+    state.set_ai_assist(
+        build_ai_assist_config(enabled=True, model_id="global.anthropic.claude-opus-5")
+    )
+    assert ai_availability(state) == AI_UNVERIFIED
+
+    # So does the region.
+    state = verified_session()
+    state.set_ai_assist(build_ai_assist_config(enabled=True, region="eu-west-1"))
+    assert ai_availability(state) == AI_UNVERIFIED
+
+    # So does the AWS profile -- it IS the credential identity Bedrock is called with,
+    # so a green badge must not survive switching to a profile without the grant.
+    state = verified_session()
+    state.set_aws_profile("no-bedrock-profile")
+    assert ai_availability(state) == AI_UNVERIFIED
+
+    # Re-writing the SAME config is not a change and keeps the verdict.
+    state = verified_session()
+    state.set_ai_assist(build_ai_assist_config(enabled=True))
+    assert ai_availability(state) == AI_AVAILABLE
+
+
+def test_only_access_denied_latches_unavailable_not_transient_failures() -> None:
+    # A throttle or network blip must never disable AI for the rest of the session;
+    # only an authorization failure does. set_ai_verified(None) is the transient reset.
+    from dsql_migrator.ui.ai_assist import (
+        AI_UNVERIFIED,
+        ai_availability,
+        ai_is_usable,
+        build_ai_assist_config,
+    )
+    from dsql_migrator.ui.session import SessionConnectionState
+
+    state = SessionConnectionState()
+    state.set_ai_assist(build_ai_assist_config(enabled=True))
+    state.set_ai_verified(None)  # what a THROTTLED / UNKNOWN verify records
+    assert ai_availability(state) == AI_UNVERIFIED
+    assert ai_is_usable(state) is True
+    assert state.ai_unavailable_detail is None
+
+
+def test_successful_reply_clears_a_stale_denial_so_unavailable_is_not_absorbing() -> None:
+    # Recovery path: the ACCESS_DENIED bucket also covers EXPIRED credentials, which are
+    # recoverable (re-authenticate). If nothing cleared the latch, one expired-token turn
+    # would kill AI for the whole session with no way back. A successful reply clears it
+    # (to unverified -- green stays something a preflight earns).
+    from dsql_migrator.ui.ai_assist import (
+        AI_UNAVAILABLE,
+        AI_UNVERIFIED,
+        ai_availability,
+        ai_is_usable,
+        build_ai_assist_config,
+    )
+    from dsql_migrator.ui.session import SessionConnectionState
+
+    state = SessionConnectionState()
+    state.set_ai_assist(build_ai_assist_config(enabled=True))
+    state.set_ai_verified(False, "expired token")
+    assert ai_availability(state) == AI_UNAVAILABLE
+
+    # Every documented exit from the latched state.
+    state.set_ai_verified(None)                      # a successful reply / retry
+    assert ai_availability(state) == AI_UNVERIFIED
+    assert ai_is_usable(state) is True
+
+    state.set_ai_verified(False, "denied again")
+    state.set_ai_verified(True)                      # a passing "Verify AI access"
+    assert ai_is_usable(state) is True
+
+    state.set_ai_verified(False, "denied again")
+    state.set_aws_profile("re-authed-profile")       # switching credential identity
+    assert ai_availability(state) == AI_UNVERIFIED
+
+
+def test_ai_unavailable_hint_explains_the_denial_instead_of_saying_enable_it() -> None:
+    # The hint must not tell a user whose AI is ALREADY ON to "enable AI Assist" -- that
+    # was the dead end. When denied it surfaces the actionable, credential-free detail.
+    from dsql_migrator.ui.ai_assist import (
+        ai_unavailable_hint,
+        build_ai_assist_config,
+    )
+    from dsql_migrator.ui.session import SessionConnectionState
+
+    state = SessionConnectionState()
+    # AI off -> the enable instruction is correct here.
+    assert "Enable AI Assist" in ai_unavailable_hint(state)
+
+    state.set_ai_assist(build_ai_assist_config(enabled=True))
+    state.set_ai_verified(False, "denied: grant bedrock:InvokeModel and retry")
+    hint = ai_unavailable_hint(state)
+    assert hint == "denied: grant bedrock:InvokeModel and retry"
+    assert "Enable AI Assist" not in hint
+
+    # Denied with no detail recorded still gives actionable recovery wording.
+    state.ai_unavailable_detail = None
+    fallback = ai_unavailable_hint(state)
+    assert "re-verify" in fallback.lower() or "re-authenticate" in fallback.lower()
+
+
+def test_no_ui_gate_reads_the_raw_ai_preference_instead_of_availability() -> None:
+    """Structural invariant: AI affordances gate on ``ai_is_usable``, never ``enabled``.
+
+    The defect this guards: ~15 sites each gated on ``session.ai_assist.enabled``, so a
+    session whose Bedrock access was denied kept offering live AI buttons. Per-site
+    source assertions cannot catch a PARTIAL revert (one site slipping back), so this
+    sweeps the whole UI package and allowlists the only legitimate readers of the raw
+    preference -- the Connect card's own controls (which configure the preference, so
+    they must follow it) and the AI panel's ``is_enabled`` (the panel deliberately opens
+    on the preference so a denied user can read WHY).
+    """
+    import pathlib
+
+    ui_dir = pathlib.Path(__file__).resolve().parents[1] / "src" / "dsql_migrator" / "ui"
+    assert ui_dir.is_dir(), ui_dir
+
+    allowed = {
+        # Connect: the switch's own initial value / the nudge notice / the Bedrock
+        # settings expansion default -- all configure the preference itself.
+        '"Enable AI Assist", value=state.ai_assist.enabled',
+        "if ai_profile_configured and not state.ai_assist.enabled:",
+        "value=state.ai_assist.enabled or ai_profile_configured,",
+        # The AI panel opens on the preference on purpose (see its docstring).
+        'return bool(getattr(state.ai_assist, "enabled", False))  # type: ignore[attr-defined]',
+        # The panel's reopen tab: a DENIED user must still be able to reopen the panel to
+        # read why it failed, so this follows the preference, not usability.
+        'enabled = bool(getattr(state.ai_assist, "enabled", False))  # type: ignore[attr-defined]',
+        # post_event only appends to the deterministic activity timeline (no Bedrock
+        # call), so a denied session should still get its timeline entries.
+        'if not bool(getattr(state.ai_assist, "enabled", False)):  # type: ignore[attr-defined]',
+        # Snapshot capture persists the raw INTENT by design (capability is not durable).
+        'ai_assist_enabled=bool(getattr(session.ai_assist, "enabled", False)),  # type: ignore[attr-defined]',
+    }
+
+    offenders = []
+    for path in sorted(ui_dir.rglob("*.py")):
+        for lineno, raw in enumerate(path.read_text().splitlines(), 1):
+            line = raw.strip()
+            if "ai_assist.enabled" not in line and 'ai_assist, "enabled"' not in line:
+                continue
+            if line.startswith("#") or line.startswith("*") or "``" in line:
+                continue  # comment / docstring prose
+            if line in allowed:
+                continue
+            offenders.append(f"{path.relative_to(ui_dir.parent)}:{lineno}: {line}")
+
+    assert not offenders, (
+        "AI affordances must gate on ai_is_usable(...) (which also respects an observed "
+        "Bedrock denial), not on the raw ai_assist.enabled preference:\n  "
+        + "\n  ".join(offenders)
+    )

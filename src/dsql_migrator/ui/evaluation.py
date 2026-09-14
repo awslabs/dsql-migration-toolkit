@@ -66,6 +66,7 @@ from dsql_migrator.core.models import (
     TargetInventory,
 )
 from dsql_migrator.core.target_introspector import TargetIntrospector
+from dsql_migrator.ui.ai_assist import ai_is_usable
 from dsql_migrator.ui.connect import make_source_engine_factory
 from dsql_migrator.ui.ai_chat_drawer import chat_turns_remaining
 from dsql_migrator.ui.design import (
@@ -1234,7 +1235,7 @@ def build_evaluation_screen(
                 # the provider is None and the renderer shows a disabled, clearly
                 # labeled affordance instead (discoverable, never silently gone).
                 guidance_provider = None
-                if session.ai_assist.enabled:
+                if ai_is_usable(session):
                     strategist = strategist_factory(
                         session.ai_assist, session.aws_profile
                     )

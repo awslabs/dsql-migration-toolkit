@@ -1062,7 +1062,7 @@ wheels = [
 
 [[package]]
 name = "mysql-dsql-migrator"
-version = "0.1.441"
+version = "0.1.442"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },

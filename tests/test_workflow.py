@@ -607,7 +607,26 @@ def test_build_migration_diagram_connectivity_and_ai_badges() -> None:
     source, tool, target = build_migration_diagram(state, WorkflowStep.EVALUATION)
     assert ("Connected", "ok") in source.badges
     assert ("Connected", "ok") in target.badges
+    # Enabled but never preflighted: the chip must NOT make an affirmative green
+    # claim, because the preference alone does not prove Bedrock is reachable.
+    assert ("AI assist: On (unverified)", "neutral") in tool.badges
+
+    # A clean preflight earns the green chip.
+    state.set_ai_verified(True)
+    _source, tool, _target = build_migration_diagram(state, WorkflowStep.EVALUATION)
     assert ("AI assist: On", "ok") in tool.badges
+
+    # An observed ACCESS_DENIED (preflight or a live reply) downgrades it to amber
+    # "unavailable" -- the header must never keep asserting AI works while every
+    # InvokeModel is denied (the restore-then-denied divergence).
+    state.set_ai_verified(False, "denied")
+    _source, tool, _target = build_migration_diagram(state, WorkflowStep.EVALUATION)
+    assert ("AI assist: unavailable", "reconnect") in tool.badges
+
+    # Turning the preference off wins over any stale verdict.
+    state.set_ai_assist(AiAssistConfig(enabled=False))
+    _source, tool, _target = build_migration_diagram(state, WorkflowStep.EVALUATION)
+    assert ("AI assist: Off", "neutral") in tool.badges
 
 
 def test_migration_type_meta_reflects_chosen_type() -> None:

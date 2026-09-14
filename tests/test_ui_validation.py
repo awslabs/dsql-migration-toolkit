@@ -2210,8 +2210,12 @@ def test_cutover_screen_offers_ai_dba_button_when_ai_is_on() -> None:
     assert 'scope_id="cutover"' in src
     assert "cutover_ai_facts" in src  # credential-free grounding
     assert "stream_cutover_chat" in src  # via the strategist
-    # Gated on AI enabled + opener wired (never renders without either).
-    assert "session.ai_assist.enabled" in src
+    # Gated on AI being USABLE (enabled and not known-denied) + opener wired, so a
+    # session whose Bedrock access was refused stops offering an action that can only
+    # fail -- never renders without either. (The behavioral guarantee that the gate
+    # actually flips lives in test_ai_availability_* / test_no_ui_gate_reads_the_raw_ai
+    # _preference; this only pins that THIS screen consults the shared helper.)
+    assert "ai_is_usable(session)" in src
     assert "open_ai_scope is not None" in src
 
 

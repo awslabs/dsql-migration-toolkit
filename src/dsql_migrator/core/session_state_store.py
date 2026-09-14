@@ -165,6 +165,13 @@ class SessionSnapshot(BaseModel):
     ai_assist_enabled: bool = False
     ai_assist_model_id: Optional[str] = None
     ai_assist_region: Optional[str] = None
+    # The optional global AWS named PROFILE (a name, never a credential -- Property 7),
+    # applied to every AWS client including Bedrock. Persisted alongside the AI
+    # preference because restoring "AI on" WITHOUT it silently changed the credential
+    # identity on resume: a session whose AI worked under a named profile came back
+    # invoking Bedrock through the environment chain and every reply failed AccessDenied.
+    # None on older snapshots (and for the env-chain default) -> unchanged behavior.
+    aws_profile: Optional[str] = None
     # The persistent AI-assistant transcript (messages + active scope + open/closed),
     # so the conversation survives an app restart / crash -- not just a browser
     # refresh. Credential-free and row-data-free (Property 7); "Start over" deletes the

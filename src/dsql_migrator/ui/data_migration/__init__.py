@@ -110,6 +110,7 @@ from dsql_migrator.core.models import (
 )
 from dsql_migrator.core.table_selection import TableSelector
 from dsql_migrator.core.watermark import WatermarkCapturer
+from dsql_migrator.ui.ai_assist import ai_is_usable
 from dsql_migrator.ui.design import NOTICE_STYLE, inline_hint, render_notice
 from dsql_migrator.ui.evaluation import EvaluationStore
 from dsql_migrator.ui.prerequisite_probes import build_prerequisite_checker
@@ -1301,7 +1302,7 @@ def build_data_migration_screen(
             # re-render must not create a new drawer each time). ``None`` when AI is
             # off -> the renderer shows a disabled affordance instead.
             ai_error_opener = None
-            if session.ai_assist.enabled and open_ai_scope is not None:
+            if ai_is_usable(session) and open_ai_scope is not None:
 
                 def ai_error_opener(
                     table_name: str,
@@ -1361,7 +1362,7 @@ def build_data_migration_screen(
             # Opener for the CDC DLQ / schema-drift diagnosis chat (revives the CDC
             # assist path). None when AI is off -> the CDC panels show no AI affordance.
             cdc_ai_opener = None
-            if session.ai_assist.enabled and open_ai_scope is not None:
+            if ai_is_usable(session) and open_ai_scope is not None:
 
                 def cdc_ai_opener(scope: str, facts: str, seed: str) -> None:
                     from dsql_migrator.core.assessment_strategist import (

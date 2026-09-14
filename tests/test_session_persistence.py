@@ -593,6 +593,60 @@ def test_ai_assist_preference_round_trips_for_reconnect() -> None:
     assert s2.ai_assist.region == "us-west-2"
 
 
+def test_restore_reasserts_ai_preference_but_never_its_verification() -> None:
+    # The bug this pins: the PREFERENCE is durable, the CAPABILITY is not. A session
+    # that had a green verified AI must come back "unverified" -- Bedrock authorization
+    # is a point-in-time fact about credentials that may have expired (or lost the
+    # bedrock:InvokeModel grant) while the snapshot sat on disk. Restoring it as
+    # verified is what made the header claim "AI assist: On" while every reply failed.
+    from dsql_migrator.ui.ai_assist import AI_UNVERIFIED, ai_availability
+    from dsql_migrator.ui.ai_assist import build_ai_assist_config
+
+    session, eval_state, conv_state, migration_state = _populated_states()
+    session.set_ai_assist(build_ai_assist_config(enabled=True))
+    session.set_ai_verified(True)  # a clean preflight passed before the restart
+
+    snapshot = capture_session_snapshot(
+        "s1", session, eval_state, conv_state, migration_state
+    )
+    # Nothing about the verdict is persisted -- there is no field for it by design.
+    assert not hasattr(snapshot, "ai_verified")
+
+    s2 = SessionConnectionState()
+    apply_session_snapshot(snapshot, s2, EvaluationState(),
+                           SchemaConversionState(), DataMigrationState())
+    assert s2.ai_assist.enabled is True          # intent survives
+    assert s2.ai_verified is None                # capability does NOT
+    assert ai_availability(s2) == AI_UNVERIFIED   # so the UI makes no green claim
+
+
+def test_aws_profile_round_trips_so_restore_keeps_the_credential_identity() -> None:
+    # The profile is the identity every AWS client (including Bedrock) is built with.
+    # Restoring "AI on" WITHOUT it silently switched a session to the environment
+    # credential chain, so AI that worked under a named profile came back denied.
+    session, eval_state, conv_state, migration_state = _populated_states()
+    session.set_aws_profile("migration-admin")
+
+    snapshot = capture_session_snapshot(
+        "s1", session, eval_state, conv_state, migration_state
+    )
+    assert snapshot.aws_profile == "migration-admin"
+
+    s2 = SessionConnectionState()
+    apply_session_snapshot(snapshot, s2, EvaluationState(),
+                           SchemaConversionState(), DataMigrationState())
+    assert s2.aws_profile == "migration-admin"
+
+
+def test_aws_profile_change_is_in_the_dirty_signature() -> None:
+    # Switching credential identity must trigger a save (it is persisted now).
+    session, eval_state, conv_state, migration_state = _populated_states()
+    before = session_signature(session, eval_state, conv_state, migration_state)
+    session.set_aws_profile("other-profile")
+    after = session_signature(session, eval_state, conv_state, migration_state)
+    assert before != after
+
+
 def test_ai_assist_off_snapshot_restores_as_off() -> None:
     # An AI-off session (the default) restores with the toggle still off.
     snapshot = SessionSnapshot(session_id="s1")

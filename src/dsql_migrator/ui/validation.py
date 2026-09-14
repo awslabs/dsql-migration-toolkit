@@ -73,6 +73,7 @@ from dsql_migrator.core.models import (
 from dsql_migrator.core.table_selection import TableSelectionError, TableSelector
 from dsql_migrator.core.validator import ValidationCancelled, Validator
 from dsql_migrator.core.validator import export_report as export_validation_report
+from dsql_migrator.ui.ai_assist import ai_is_usable
 from dsql_migrator.ui.connect import make_source_engine_factory
 from dsql_migrator.ui.data_migration import DataMigrationStore
 from dsql_migrator.ui.design import (
@@ -2487,7 +2488,7 @@ def build_validation_screen(
                 # grounding; when AI is off, no opener is passed and the renderer
                 # omits the AI buttons (the deterministic report stands on its own).
                 diagnose_provider = None
-                if session.ai_assist.enabled:
+                if ai_is_usable(session):
                     strategist = strategist_factory(
                         session.ai_assist, session.aws_profile
                     )
@@ -2978,7 +2979,7 @@ def build_cutover_screen(
         # produces a framework-tailored repoint recipe + a GO/HOLD verdict that maps
         # to the real buttons in this tool.
         if (
-            session.ai_assist.enabled  # type: ignore[attr-defined]
+            ai_is_usable(session)
             and open_ai_scope is not None
             and ai_tools is not None
             and ai_tool_execute is not None

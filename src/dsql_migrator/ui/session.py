@@ -57,6 +57,8 @@ class SessionConnectionState:
         "_workflow_unlocked",
         "workflow",
         "ai_assist",
+        "ai_verified",
+        "ai_unavailable_detail",
         "ai_conversation",
         "aws_profile",
         "active_view",
@@ -110,6 +112,20 @@ class SessionConnectionState:
         # user enables it the workflow runs the deterministic-only path
         # (Requirements 11.1, 11.2).
         self.ai_assist: AiAssistConfig = AiAssistConfig()
+        # AI CAPABILITY, kept separate from the AI PREFERENCE above. ``ai_assist``
+        # records what the user WANTS (and is persisted / restored); this records what
+        # Bedrock has actually been shown to DO this session, so the UI can stop
+        # asserting "AI assist: On" for a session whose InvokeModel is denied.
+        #   None  -- not checked yet (enabled but unverified)
+        #   True  -- a clean preflight passed
+        #   False -- a real ACCESS_DENIED was observed (preflight or a live reply)
+        # Deliberately NOT persisted: authorization is a point-in-time fact about the
+        # current credentials, exactly like source_verified / target_verified, so a
+        # restored session comes back "unverified" rather than falsely green.
+        self.ai_verified: Optional[bool] = None
+        # The actionable, credential-free explanation for a False above (Property 7:
+        # this is the fixed _UNAVAILABLE_DETAILS copy, never raw boto/exception text).
+        self.ai_unavailable_detail: Optional[str] = None
         # Persistent AI-assistant transcript + panel state for this session. The
         # panel renders FROM this object, so the conversation survives closing/
         # reopening the panel, navigating between steps, and a browser refresh (the
@@ -341,16 +357,51 @@ class SessionConnectionState:
         self.source_secret_id = (secret_id or "").strip() or None
 
     def set_ai_assist(self, config: AiAssistConfig) -> None:
-        """Replace the per-session AI-assist settings (opt-in, default off)."""
+        """Replace the per-session AI-assist settings (opt-in, default off).
+
+        Any MATERIAL change (the toggle, the Bedrock model, or the region) invalidates
+        a prior verification verdict, mirroring how editing a verified connection
+        re-locks it: the old verdict was about a different configuration, so keeping it
+        would let the UI vouch for something never checked.
+        """
+        previous = self.ai_assist
+        changed = (
+            bool(getattr(previous, "enabled", False)) != bool(config.enabled)
+            or getattr(previous, "model_id", None) != config.model_id
+            or getattr(previous, "region", None) != config.region
+        )
         self.ai_assist = config
+        if changed:
+            self.set_ai_verified(None)
+
+    def set_ai_verified(
+        self, ok: Optional[bool], detail: Optional[str] = None
+    ) -> None:
+        """Record what Bedrock has actually been shown to do (see ``ai_verified``).
+
+        ``ok=True`` after a clean preflight, ``ok=False`` with the fixed actionable
+        ``detail`` when a real ACCESS_DENIED is observed (so every AI affordance can go
+        honest instead of the app discarding the one moment it learns AI is dead), and
+        ``ok=None`` to reset to "unverified". Only latch ``False`` for an authorization
+        failure -- a transient throttle or network blip must NOT mark AI unavailable.
+        """
+        self.ai_verified = ok
+        self.ai_unavailable_detail = detail if ok is False else None
 
     def set_aws_profile(self, profile: Optional[str]) -> None:
         """Record the optional global AWS profile name (or None for env chain).
 
         Only the non-secret profile name is stored; no credential value is ever
         kept here, so it is safe to persist/log (Property 7 / Requirement 9.8).
+
+        The profile IS the credential identity every Bedrock client is built with, so
+        switching it invalidates any AI verification verdict -- a green "Verified" must
+        not survive a switch to a profile without ``bedrock:InvokeModel``.
         """
+        changed = self.aws_profile != profile
         self.aws_profile = profile
+        if changed:
+            self.set_ai_verified(None)
 
     def has_source(self) -> bool:
         """Return ``True`` once a source connection has been configured."""
@@ -376,6 +427,8 @@ class SessionConnectionState:
         self._workflow_unlocked = False
         self.workflow = WorkflowState()
         self.ai_assist = AiAssistConfig()
+        self.ai_verified = None
+        self.ai_unavailable_detail = None
         # Start over discards the AI transcript too: a fresh journey starts a fresh
         # conversation (a stale prior chat would be confusing). Reset IN PLACE (not a
         # new object): the persistent AI panel captured this AiConversation by

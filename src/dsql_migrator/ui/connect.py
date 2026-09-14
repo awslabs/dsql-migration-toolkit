@@ -66,6 +66,7 @@ from dsql_migrator.ui.design import (
 from dsql_migrator.ui.ai_assist import (
     DEFAULT_BEDROCK_MODEL_ID,
     SUPPORTED_BEDROCK_MODELS,
+    ai_is_usable,
     build_ai_assist_config,
     map_access_check_display,
     run_verify_ai_access,
@@ -400,6 +401,7 @@ def build_connect_page(
     defaults: Optional[ConnectDefaults] = None,
     open_ai_scope: Optional[Callable[..., object]] = None,
     ai_post_event: Optional[Callable[..., object]] = None,
+    on_state_change: Optional[Callable[[], None]] = None,
 ) -> None:
     """Render the Connect screen for one session.
 
@@ -455,7 +457,7 @@ def build_connect_page(
         # "Ask AI" affordance is shown. Credential-free: only the non-secret
         # coordinates + the tool's credential-free failure detail reach the model
         # (Property 7).
-        if open_ai_scope is None or not state.ai_assist.enabled:
+        if open_ai_scope is None or not ai_is_usable(state):
             return
         from dsql_migrator.core.assessment_strategist import (
             AssessmentStrategist,
@@ -516,7 +518,7 @@ def build_connect_page(
         if getattr(container, "is_deleted", False):
             return
         container.clear()  # type: ignore[attr-defined]
-        if success or open_ai_scope is None or not state.ai_assist.enabled:
+        if success or open_ai_scope is None or not ai_is_usable(state):
             return
         with container:  # type: ignore[attr-defined]
             ui.button(
@@ -738,6 +740,13 @@ def build_connect_page(
                         state.set_aws_profile(selected)
                         chosen = selected or "environment credential chain"
                         ui.notify(f"Using AWS profile: {chosen}.", type="positive")
+                        # The profile is DURABLE now, so persist immediately: a page
+                        # rebuild while the session is still "fresh" re-applies the
+                        # snapshot's profile and would silently revert this switch (the
+                        # same lost-change hazard the AI toggle has below).
+                        refresh_ai_badge()  # the switch just invalidated any verdict
+                        if on_state_change is not None:
+                            on_state_change()
 
                     ui.select(
                         profile_selector_options(profiles),
@@ -1238,17 +1247,32 @@ def build_connect_page(
             # settings. Any edit (toggle / model / region) invalidates that and reverts
             # it to the neutral "Optional" -- an unverified or changed config must never
             # read as green. In-session only (a preflight is a point-in-time check).
-            ai_verified = {"ok": False}
-
+            # The verdict lives on the SESSION (state.ai_verified), not in a local
+            # closure: it has to survive this page being rebuilt (navigating to a step
+            # and back used to silently drop a green "Verified" badge) and it has to be
+            # readable by the journey header and every step's AI affordance, which is
+            # what stops the UI claiming AI works when Bedrock denies it.
             def refresh_ai_badge() -> None:
                 if ai_badge is None:
                     return
-                if bool(ai_enabled.value) and ai_verified["ok"]:
+                if not bool(ai_enabled.value):
+                    label, color = "Optional", "grey"
+                elif state.ai_verified is True:
                     label, color = "Verified", "positive"
+                elif state.ai_verified is False:
+                    # This is the screen the user recovers on, so it must SAY that
+                    # Bedrock refused rather than reading as a neutral "Optional".
+                    label, color = "Unavailable", "warning"
                 else:
                     label, color = "Optional", "grey"
                 ai_badge.set_text(label)
                 ai_badge.props(f"color={color} outline")
+
+            # Reflect the SESSION verdict on every (re)build. Without this the badge
+            # keeps its constructor default, so returning to Connect (or resuming) drew
+            # a grey "Optional" over an already-verified session -- and a denied session
+            # showed nothing at all.
+            refresh_ai_badge()
             # When a profile is configured but AI is still off, one info notice
             # nudges -- replacing the old free-floating "lightbulb" prose row.
             if ai_profile_configured and not state.ai_assist.enabled:
@@ -1335,7 +1359,7 @@ def build_connect_page(
 
             ai_status = ui.label().classes("text-sm")
 
-            def persist_ai_settings(_event: object = None) -> None:
+            def persist_ai_settings(_event: object = None, *, save: bool = False) -> None:
                 """Persist AI settings on every change (no explicit Save).
 
                 Reads the current form values straight into the session so a
@@ -1343,7 +1367,18 @@ def build_connect_page(
                 proceeds never loses that intent. The form values are not
                 written back here, so typing in the model/region fields is
                 never disrupted.
+
+                ``save`` additionally writes the durable snapshot. It is passed only for
+                the DISCRETE controls (the switch and the model select): the region is
+                free text whose change event fires per keystroke, and a snapshot write
+                is a full serialize + store PUT, so saving per character would be a
+                write storm. The region still reaches the snapshot on the next coarse
+                event or navigation.
                 """
+                # set_ai_assist itself invalidates a prior successful verify whenever the
+                # toggle / model / region MATERIALLY changes (mirrors Connect re-locking
+                # a verified connection when it is edited), so the badge reverts to
+                # "Optional" until the user re-verifies.
                 state.set_ai_assist(
                     build_ai_assist_config(
                         enabled=bool(ai_enabled.value),
@@ -1351,14 +1386,21 @@ def build_connect_page(
                         region=ai_region.value,
                     )
                 )
-                # An edit invalidates any prior successful verify (mirrors Connect
-                # re-locking a verified connection when it is edited), so the badge
-                # reverts to "Optional" until the user re-verifies.
-                ai_verified["ok"] = False
                 refresh_ai_badge()
+                # Persist NOW. The snapshot signature already tracks the AI preference,
+                # but nothing on this screen used to invoke the save hook, so turning the
+                # switch OFF and reloading before navigating re-applied the stale AI-ON
+                # snapshot and silently re-enabled AI.
+                if save and on_state_change is not None:
+                    on_state_change()
 
-            ai_enabled.on_value_change(persist_ai_settings)
-            ai_model.on_value_change(persist_ai_settings)
+            def persist_ai_settings_and_save(_event: object = None) -> None:
+                persist_ai_settings(_event, save=True)
+
+            # Discrete controls save immediately (the toggle is the one whose loss caused
+            # the stale AI-ON resurrect); the free-text region only updates the session.
+            ai_enabled.on_value_change(persist_ai_settings_and_save)
+            ai_model.on_value_change(persist_ai_settings_and_save)
             ai_region.on_value_change(persist_ai_settings)
 
             async def on_verify_ai_access() -> None:
@@ -1403,7 +1445,22 @@ def build_connect_page(
                 ui.notify(display.message, type=display.notify_type)
                 # Turn the section badge green only on a CLEAN pass (a fallback pass is
                 # reported as a warning, not success, so it must not read as Verified).
-                ai_verified["ok"] = display.notify_type == "positive"
+                # Record the verdict on the SESSION so the journey header and every
+                # step's AI affordance agree with what the preflight just found. An
+                # explicit ACCESS_DENIED latches "unavailable" (the affordances go
+                # disabled-with-a-reason); a throttle / unknown failure only leaves it
+                # unverified, since those are transient and AI may still work.
+                if display.notify_type == "positive":
+                    state.set_ai_verified(True)
+                elif getattr(result, "reason", None) in (
+                    "ACCESS_DENIED", "MODEL_NOT_ENABLED"
+                ):
+                    # Both are hard negatives for THIS config: every call would fail the
+                    # same way, so the affordances go disabled-with-a-reason. (display
+                    # .message is the fixed, credential-free, actionable copy.)
+                    state.set_ai_verified(False, display.message)
+                else:
+                    state.set_ai_verified(None)
                 refresh_ai_badge()
 
             # Verify button + the "auto-saved" reassurance on one row, so the

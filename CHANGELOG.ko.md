@@ -5,6 +5,40 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.442
+
+### 수정 (Fixed)
+
+- **복합 키 경고의 "CDC 미지원" 문구 수정.** Schema Conversion에서 "Composite key"를 고르면 경고 마지막에
+  "Not yet supported with CDC."가 붙었습니다. v0.1.64에 이 옵션이 처음 들어갔을 때는 사실이었지만 이후 복합 키 CDC가
+  구현됐습니다 — `composite_key_columns_for_cdc()`가 Debezium에게 타깃 복합 키로 각 변경 레코드를 키잉하도록
+  지시(`message.key.columns`)하므로 싱크의 `ON CONFLICT`/`DELETE`가 싱크 수정 없이 일치합니다. 이제 실제 제약을
+  안내합니다: column exclude list로 키 컬럼을 캡처에서 빼지 않는 한 자동으로 동작합니다(CDC 시작 시 이미 게이트하는
+  유일한 전제조건).
+- **Amazon Bedrock이 모든 요청을 거부하는 상황에서 AI Assist가 정상 동작하는 것처럼 표시되던 문제 수정.**
+  앱은 AI의 *의도*만 모델링하고 *능력*은 저장하지 않았습니다. `ai_assist.enabled`(옵트인)는 세션에
+  저장·복원되지만, Bedrock 사전 점검 성공 여부는 Connect 카드 안의 페이지-로컬 dict에만 있었습니다.
+  모든 AI 어포던스와 여정 헤더 다이어그램이 선호도만 읽었기 때문에, 복원된 세션은 초록색
+  "AI assist: On" 칩과 활성 AI 버튼을 표시하면서 실제 응답은 "access to Amazon Bedrock InvokeModel
+  was denied"로 실패했습니다. 이제 AI 능력을 세션 상태(`ai_verified`)로 두고, 단일 진실 공급원
+  `ai_availability()`를 UI 전체가 참조합니다.
+  - 헤더 칩이 정직한 3가지 상태를 가집니다 — 사전 점검을 통과한 뒤에만 초록 **"AI assist: On"**,
+    활성화됐지만 미검증이면 중립 **"AI assist: On (unverified)"**, 거부가 관측되면 황색
+    **"AI assist: unavailable"** (소스/타깃 노드가 복원-미검증 엔드포인트에 쓰는 "reconnect"와 동일 의미).
+  - 실제 `ACCESS_DENIED` 응답을 폐기하지 않고 **기록**하므로, 첫 실패 직후 헤더와 각 단계의 AI 버튼이
+    스스로 교정되고, 각 단계 어포던스는 실패만 하는 동작을 제공하는 대신 이유와 함께 비활성화됩니다.
+    일시적 실패(스로틀/네트워크)는 의도적으로 래치하지 않습니다.
+  - 토글·Bedrock 모델·리전, **그리고 AWS 프로필**을 변경하면 이전 검증 결과가 무효화되므로,
+    `bedrock:InvokeModel` 권한이 없는 프로필로 바꿔도 초록 "Verified" 배지가 남지 않습니다.
+- **복원된 세션이 AWS 자격증명 신원을 조용히 바꾸지 않도록 수정.** `aws_profile`(자격증명이 아닌 프로필
+  *이름*)은 스냅샷에 없는데 `ai_assist.enabled=True`는 있었기 때문에, 명명된 프로필로 AI가 잘 동작했던
+  세션이 복원 후 환경 자격증명 체인으로 Bedrock을 호출했습니다 — 위 AccessDenied의 가장 유력한 원인.
+  이제 프로필을 저장하고 가장 먼저 복원하며, 변경 감지 서명에도 포함합니다.
+- **AI Assist를 끄면 즉시 저장됩니다.** Connect 화면의 어떤 동작도 스냅샷 훅을 호출하지 않아서,
+  AI를 끄고 화면 이동 없이 새로고침하면 예전 AI-ON 스냅샷이 다시 적용되어 조용히 재활성화됐습니다.
+- **화면을 이동했다가 돌아오면 "Verified" 배지가 사라지던 문제 수정.** 사전 점검 결과가 Connect
+  렌더마다 새로 만들어지는 클로저에 있었는데, 이제 세션에 저장되어 검증 상태가 유지됩니다.
+
 ## v0.1.441
 
 ### 추가 (Added)

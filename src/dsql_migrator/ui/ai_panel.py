@@ -42,6 +42,7 @@ from typing import Callable, Optional
 
 from dsql_migrator.core.assessment_strategist import ObjectGuidanceOutcome
 from dsql_migrator.core.models import AiScope, MigrationContext
+from dsql_migrator.ui.ai_assist import AI_UNAVAILABLE, ai_availability, ai_unavailable_hint
 from dsql_migrator.ui.ai_chat_drawer import (
     MAX_CHAT_INPUT_CHARS,
     ChatStreamer,
@@ -169,7 +170,11 @@ def build_ai_panel(
     ``state`` is the session's :class:`~dsql_migrator.ui.session.
     SessionConnectionState`; the panel reads/writes ``state.ai_conversation`` as its
     source of truth (so the transcript + open/closed state survive close/reopen,
-    navigation, and refresh) and gates itself on ``state.ai_assist.enabled``.
+    navigation, and refresh) and gates itself on ``state.ai_assist.enabled``. The panel
+    deliberately opens on the PREFERENCE alone (not on ``ai_is_usable``) so a user whose
+    Bedrock access is denied can still open it and READ why; a real ACCESS_DENIED reply
+    is recorded via ``state.set_ai_verified(False, ...)`` so the journey header and the
+    per-step affordances stop claiming AI works.
     ``get_context`` (optional) returns the current :class:`MigrationContext` for the
     baseline context chip shown when no object scope is active.
     """
@@ -508,6 +513,14 @@ def build_ai_panel(
             if not ai_on:
                 composer_hint.set_text(  # type: ignore[attr-defined]
                     "AI Assist is off — enable it on the Connect screen to use AI DBA."
+                )
+            elif ai_availability(state) == AI_UNAVAILABLE:
+                # AI is ON but Bedrock refused: say WHY and what to do. Telling this user
+                # to "enable AI Assist" (it is already on) or leaving the hint blank sent
+                # them to a dead end. The composer stays usable on purpose -- retrying
+                # after re-authenticating is how the denial gets cleared.
+                composer_hint.set_text(  # type: ignore[attr-defined]
+                    ai_unavailable_hint(state)
                 )
             elif conv["streamer"] is None:
                 composer_hint.set_text(  # type: ignore[attr-defined]
@@ -1106,6 +1119,16 @@ def build_ai_panel(
             except Exception:  # noqa: BLE001
                 pass
             if isinstance(outcome, ObjectGuidanceOutcome) and not outcome.available:
+                # This is the ONE moment the app learns AI is actually dead. Record an
+                # AUTHORIZATION failure on the session so the journey-header chip and
+                # every per-step AI affordance stop asserting "AI assist: On" (they read
+                # ai_availability(), not the persisted preference). Only ACCESS_DENIED
+                # latches: a throttle or network blip is transient and must not disable
+                # AI for the rest of the session.
+                if getattr(outcome, "reason", None) == "ACCESS_DENIED":
+                    setter = getattr(state, "set_ai_verified", None)
+                    if callable(setter):
+                        setter(False, outcome.detail)
                 bubble.clear()  # type: ignore[attr-defined]
                 with bubble:  # type: ignore[attr-defined]
                     render_notice(
@@ -1118,6 +1141,15 @@ def build_ai_panel(
                 if msgs and msgs[-1].get("role") == "user":
                     msgs.pop()
             elif isinstance(outcome, ObjectGuidanceOutcome) and outcome.available:
+                # Live evidence the other way: a reply just SUCCEEDED, so clear any stale
+                # ACCESS_DENIED latch (the grant was added, or expired credentials were
+                # renewed -- note the denied bucket also covers ExpiredToken, which is
+                # recoverable). Without this the "unavailable" state would be absorbing.
+                # Only CLEAR to unverified; green stays something a preflight earns.
+                if getattr(state, "ai_verified", None) is False:
+                    setter = getattr(state, "set_ai_verified", None)
+                    if callable(setter):
+                        setter(None)
                 if markdown_has_code_block(outcome.markdown):
                     answer_md.set_content("")  # type: ignore[attr-defined]
                     with bubble:  # type: ignore[attr-defined]

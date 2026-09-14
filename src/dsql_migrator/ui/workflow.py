@@ -35,6 +35,14 @@ from dsql_migrator.core.models import (
     StepStatus,
     WorkflowState,
 )
+from dsql_migrator.ui.ai_assist import (
+    AI_AVAILABLE,
+    AI_OFF,
+    AI_UNAVAILABLE,
+    AI_UNVERIFIED,
+    ai_availability,
+    ai_unavailable_hint,
+)
 from dsql_migrator.ui.ai_panel import AiPanelHandle, build_ai_panel
 from dsql_migrator.ui.design import (
     CODE_TEXT_CLASSES,
@@ -608,6 +616,18 @@ _DSQL_SVG = (
 )
 
 
+# The AI chip per availability state (see ai_availability). Green is an affirmative
+# health claim, so only a passed preflight earns it; a denied session is amber, matching
+# _connection_badge's "reconnect" semantic (recoverable by re-authenticating, not a
+# blocking error).
+_AI_CHIP: dict[str, tuple[str, str]] = {
+    AI_OFF: ("AI assist: Off", "neutral"),
+    AI_UNVERIFIED: ("AI assist: On (unverified)", "neutral"),
+    AI_AVAILABLE: ("AI assist: On", "ok"),
+    AI_UNAVAILABLE: ("AI assist: unavailable", "reconnect"),
+}
+
+
 def _connection_badge(verified: bool, reconnect: bool) -> tuple[str, str]:
     """Return the (text, tone) connectivity chip for a source/target node.
 
@@ -708,15 +728,18 @@ def build_migration_diagram(
 
     # Middle node: the tool's role as subtitle, with the current stage and the
     # AI-assist on/off shown as small bordered status chips.
-    ai_enabled = bool(getattr(getattr(state, "ai_assist", None), "enabled", False))
     tool_badges: tuple[tuple[str, str], ...] = ()
     if current_step is not None:
         tool_badges += (
             (f"Current stage: {step_breadcrumb(current_step)}", "active"),
         )
-    tool_badges += (
-        ("AI assist: On", "ok") if ai_enabled else ("AI assist: Off", "neutral"),
-    )
+    # The AI chip reports CAPABILITY, not just the persisted preference. A green "On"
+    # is an affirmative health claim, so it is reserved for a session whose Bedrock
+    # access actually passed a preflight; an enabled-but-unchecked session reads
+    # neutral, and a session whose InvokeModel was denied reads amber "unavailable"
+    # (the same reconnect semantic the source/target nodes use for restored-but-
+    # unverified endpoints) instead of falsely claiming AI is working.
+    tool_badges += (_AI_CHIP[ai_availability(state)],)
     tool = DiagramNode(
         title="Migration Tool",
         subtitle="Convert · Load · Validate",
@@ -1549,7 +1572,12 @@ def build_workflow_sidebar(
             else None
         )
         if streamer is None:
-            ai_panel.toggle()  # AI enabled but no streamer available; just open blank
+            # AI is enabled but no streamer is available -- most often because Bedrock
+            # denied this session (_general_ai_streamer returns None when AI is not
+            # usable). Say so instead of silently toggling a blank drawer, then open the
+            # panel so the composer's hint carries the recovery instruction.
+            ui.notify(ai_unavailable_hint(state), type="warning")
+            ai_panel.set_visible(True)
             return
         # Source-aware engine word (MySQL/PostgreSQL), derived like build_migration_diagram.
         source_type = getattr(

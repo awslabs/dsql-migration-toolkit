@@ -111,6 +111,74 @@ def build_ai_assist_config(
 
 
 # ---------------------------------------------------------------------------
+# AI availability: the ONE thing every AI affordance asks (preference + capability)
+# ---------------------------------------------------------------------------
+
+# The four states any AI affordance / status indicator can be in.
+AI_OFF = "off"
+AI_UNVERIFIED = "unverified"
+AI_AVAILABLE = "available"
+AI_UNAVAILABLE = "unavailable"
+
+
+def ai_availability(state: object) -> str:
+    """Return the session's AI state: off / unverified / available / unavailable.
+
+    The app has two independent facts and used to display only the first:
+
+    * INTENT -- ``state.ai_assist.enabled``, the user's opt-in. Persisted and
+      restored, so it comes back True after a resume.
+    * CAPABILITY -- ``state.ai_verified``, whether Bedrock has actually been shown
+      to answer with the CURRENT credentials/config. Deliberately not persisted.
+
+    Reading intent alone let a restored session paint a green "AI assist: On" chip
+    and live AI buttons while every ``InvokeModel`` was denied. Callers use this
+    helper (never ``ai_assist.enabled`` directly) so the whole UI tells one story:
+
+    * ``off``          -- the user has not enabled AI; nothing AI is offered.
+    * ``unverified``   -- enabled but never checked. Affordances stay ACTIVE (the
+      call may well work; a preflight is optional), but no affirmative "it works"
+      claim is made.
+    * ``available``    -- a clean preflight passed.
+    * ``unavailable``  -- a real ACCESS_DENIED was observed. Affordances go
+      disabled-with-a-reason instead of failing on every click.
+    """
+    enabled = bool(getattr(getattr(state, "ai_assist", None), "enabled", False))
+    if not enabled:
+        return AI_OFF
+    verified = getattr(state, "ai_verified", None)
+    if verified is False:
+        return AI_UNAVAILABLE
+    if verified is True:
+        return AI_AVAILABLE
+    return AI_UNVERIFIED
+
+
+def ai_is_usable(state: object) -> bool:
+    """Return ``True`` when an AI affordance should be live and clickable.
+
+    True for ``available`` and ``unverified`` -- an unverified config is worth
+    attempting (the preflight is optional and most sessions never run it). False for
+    ``off`` and for ``unavailable``, so a session whose Bedrock access is known to be
+    denied stops offering actions that can only fail.
+    """
+    return ai_availability(state) in (AI_AVAILABLE, AI_UNVERIFIED)
+
+
+def ai_unavailable_hint(state: object) -> str:
+    """Return the tooltip/hint text explaining why AI is not usable right now."""
+    availability = ai_availability(state)
+    if availability == AI_UNAVAILABLE:
+        return (
+            getattr(state, "ai_unavailable_detail", None)
+            or "AI Assist is unavailable: Amazon Bedrock denied the last request. "
+            "Re-authenticate (or grant bedrock:InvokeModel) and re-verify AI access "
+            "on the Connect screen."
+        )
+    return "Enable AI Assist on the Connect screen to use AI DBA."
+
+
+# ---------------------------------------------------------------------------
 # AI Conversion Assistant seam (Task 16 wires the real Bedrock-backed impl)
 # ---------------------------------------------------------------------------
 
@@ -362,6 +430,13 @@ __all__ = [
     "DEFAULT_BEDROCK_MODEL_ID",
     "SUPPORTED_BEDROCK_MODELS",
     "build_ai_assist_config",
+    "AI_OFF",
+    "AI_UNVERIFIED",
+    "AI_AVAILABLE",
+    "AI_UNAVAILABLE",
+    "ai_availability",
+    "ai_is_usable",
+    "ai_unavailable_hint",
     "AiConversionAssistant",
     "edit_suggestion",
     "approve_suggestion",

@@ -907,3 +907,114 @@ def test_general_chat_system_is_migration_scoped_and_declines_off_topic() -> Non
     assert "aurora dsql" in low and "migrat" in low  # migration-domain scoped
     assert "off-topic" in low and "decline" in low   # declines unrelated questions
     assert "Validation" in sysp                       # grounded on the current step
+
+
+def test_access_denied_reply_records_ai_unavailable_on_the_session() -> None:
+    # The bug: a denied reply was rendered as a one-off bubble and DISCARDED, so the app
+    # threw away the one moment it learns AI is dead -- the journey header kept painting
+    # a green "AI assist: On" chip and every step kept offering live AI buttons while
+    # each request failed. The denial must now latch onto the session so the whole UI
+    # goes honest.
+    from dsql_migrator.ui.ai_assist import (
+        AI_UNAVAILABLE,
+        ai_availability,
+        ai_is_usable,
+    )
+
+    state = _enabled_state()
+    ui = _Ui()
+    detail = "AI assist is unavailable: access to Amazon Bedrock InvokeModel was denied."
+
+    def denying_streamer(messages, on_delta):  # noqa: ANN001
+        return ObjectGuidanceOutcome(
+            available=False, reason="ACCESS_DENIED", detail=detail,
+            markdown="", model_id=None,
+        )
+
+    panel = build_ai_panel(ui, state=state)
+    panel.open_scope(
+        scope_id="general", title="general",
+        streamer=denying_streamer, seed_question="What should I do next?",
+    )
+    _pump(ui)
+
+    assert state.ai_verified is False
+    assert state.ai_unavailable_detail == detail
+    assert ai_availability(state) == AI_UNAVAILABLE
+    # Every per-step affordance consults this, so they now go disabled-with-a-reason.
+    assert ai_is_usable(state) is False
+
+
+def test_transient_reply_failure_does_not_mark_ai_unavailable() -> None:
+    # A throttle / network blip is recoverable: it must NOT disable AI for the rest of
+    # the session (only an authorization failure latches).
+    from dsql_migrator.ui.ai_assist import ai_is_usable
+
+    for reason in ("THROTTLED", "NETWORK", "UNAVAILABLE", "INVALID_OUTPUT"):
+        state = _enabled_state()
+        ui = _Ui()
+
+        def failing_streamer(messages, on_delta, _reason=reason):  # noqa: ANN001
+            return ObjectGuidanceOutcome(
+                available=False, reason=_reason, detail=f"{_reason} happened",
+                markdown="", model_id=None,
+            )
+
+        panel = build_ai_panel(ui, state=state)
+        panel.open_scope(
+            scope_id="general", title="general",
+            streamer=failing_streamer, seed_question="hello?",
+        )
+        _pump(ui)
+
+        assert state.ai_verified is None, f"{reason} must not latch unavailable"
+        assert ai_is_usable(state) is True
+
+
+def test_successful_reply_clears_a_latched_denial_in_the_panel() -> None:
+    # Paired with test_access_denied_reply_records_ai_unavailable_on_the_session: the
+    # latch must not be absorbing. ACCESS_DENIED also covers EXPIRED credentials, so once
+    # the user re-authenticates a working reply has to restore the affordances.
+    from dsql_migrator.ui.ai_assist import ai_is_usable
+
+    state = _enabled_state()
+    state.set_ai_verified(False, "expired token")
+    assert ai_is_usable(state) is False
+
+    def working_streamer(messages, on_delta):  # noqa: ANN001
+        on_delta("all good")
+        return ObjectGuidanceOutcome(
+            available=True, reason="OK", detail="",
+            markdown="all good", model_id="fake-model",
+        )
+
+    ui = _Ui()
+    panel = build_ai_panel(ui, state=state)
+    panel.open_scope(
+        scope_id="general", title="general",
+        streamer=working_streamer, seed_question="working now?",
+    )
+    _pump(ui)
+
+    # Cleared to UNVERIFIED (usable again), not promoted to green: a green claim stays
+    # something an explicit preflight earns.
+    assert state.ai_verified is None
+    assert ai_is_usable(state) is True
+
+
+def test_composer_hint_explains_a_denial_instead_of_saying_enable_ai() -> None:
+    # With AI ON but Bedrock denying, the composer used to show an EMPTY hint (looking
+    # perfectly functional) or the misleading "AI Assist is off - enable it on the
+    # Connect screen". It must now carry the actionable recovery text.
+    state = _enabled_state()
+    state.set_ai_verified(False, "denied: grant bedrock:InvokeModel and retry")
+
+    ui = _Ui()
+    build_ai_panel(ui, state=state)
+
+    hints = [
+        lbl.text for lbl in getattr(ui, "labels", [])
+        if isinstance(getattr(lbl, "text", None), str) and lbl.text
+    ]
+    assert any("bedrock:InvokeModel" in h for h in hints), hints
+    assert not any("AI Assist is off" in h for h in hints), hints

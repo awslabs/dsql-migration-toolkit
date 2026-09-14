@@ -40,6 +40,7 @@ from dsql_migrator.core.assessment_strategist import (
 )
 from dsql_migrator.core.job_manager import JobManager
 from dsql_migrator.core.models import MigrationContext, SourceType
+from dsql_migrator.ui.ai_assist import ai_is_usable
 from dsql_migrator.ui.connect import build_connect_page
 from dsql_migrator.ui.ai_tools import (
     AI_TOOL_SCHEMAS as _AI_TOOL_SCHEMAS,
@@ -364,7 +365,7 @@ def build_page(
         # status) on demand and answer with actual values, not generically. Carries the
         # same migration-only guardrail. None when AI is off (the panel stays inert).
         st = SESSION_STORE.get_or_create(session_id)
-        if not st.ai_assist.enabled:
+        if not ai_is_usable(st):
             return None
         engine = source_engine_word(
             getattr(getattr(st, "source_config", None), "source_type", None)
@@ -1222,6 +1223,9 @@ def build_page(
                 defaults=connect_defaults,
                 open_ai_scope=_open_ai_scope,
                 ai_post_event=_ai_post_event,
+                # So a Connect-only change (notably toggling AI Assist off) is saved
+                # immediately instead of waiting for the next navigation.
+                on_state_change=_persist_session,
             )
         ),
         step_content={

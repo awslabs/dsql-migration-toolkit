@@ -97,6 +97,7 @@ from dsql_migrator.core.activity_log import (
     ActivityStatus,
     log_activity,
 )
+from dsql_migrator.ui.ai_assist import ai_is_usable
 from dsql_migrator.ui.design import (
     CODE_HEADER_CLASSES,
     CODE_HEADER_LABEL_CLASSES,
@@ -1985,7 +1986,7 @@ def build_schema_conversion_screen(
             )
             ai_candidates = (
                 set(ai_candidate_object_names(assessment))
-                if assessment is not None and session.ai_assist.enabled
+                if assessment is not None and ai_is_usable(session)
                 else set()
             )
             async def refresh_source() -> None:
@@ -2096,7 +2097,7 @@ def build_schema_conversion_screen(
                 deterministic: str,
                 note: "Optional[ConversionWarning]" = None,
             ) -> None:
-                if open_ai_scope is None or not session.ai_assist.enabled:
+                if open_ai_scope is None or not ai_is_usable(session):
                     return
                 engine = source_engine_word(
                     getattr(session.source_config, "source_type", None)
@@ -2184,7 +2185,7 @@ def build_schema_conversion_screen(
             # counts into actionable guidance. Requires the shared tools; when AI is off
             # (or the panel is not wired) no opener is passed and the banner has no button.
             def open_reimplementation_chat() -> None:
-                if open_ai_scope is None or not session.ai_assist.enabled:
+                if open_ai_scope is None or not ai_is_usable(session):
                     return
                 engine = source_engine_word(
                     getattr(session.source_config, "source_type", None)
@@ -2233,12 +2234,12 @@ def build_schema_conversion_screen(
                     on_sync_target=lambda: refresh_target(announce=False),
                     on_ai_chat=(
                         open_conversion_chat
-                        if session.ai_assist.enabled
+                        if ai_is_usable(session)
                         else None
                     ),
                     on_reimplement_chat=(
                         open_reimplementation_chat
-                        if session.ai_assist.enabled
+                        if ai_is_usable(session)
                         else None
                     ),
                     # Freeze the source selection while an apply is in flight: the
@@ -3272,7 +3273,9 @@ def _render_pk_strategy_picker(
                     f"and '{current_leading}' must be immutable (DSQL keys cannot "
                     "change after creation). A UNIQUE index on the original key "
                     f"({', '.join(table.primary_key)}) preserves its uniqueness. "
-                    "Not yet supported with CDC."
+                    "CDC handles this automatically -- Debezium is told to key each "
+                    "change record on the composite key -- as long as no key column is "
+                    "dropped from capture by the column exclude list."
                 ),
             )
         elif is_identity:

@@ -148,6 +148,7 @@ def capture_session_snapshot(
         ai_assist_enabled=bool(getattr(session.ai_assist, "enabled", False)),  # type: ignore[attr-defined]
         ai_assist_model_id=getattr(session.ai_assist, "model_id", None),  # type: ignore[attr-defined]
         ai_assist_region=getattr(session.ai_assist, "region", None),  # type: ignore[attr-defined]
+        aws_profile=getattr(session, "aws_profile", None),
         ai_conversation=_capture_ai_conversation(session),
         workflow_unlocked=bool(session.workflow_unlocked()),  # type: ignore[attr-defined]
         active_view=getattr(session, "active_view", None),
@@ -480,6 +481,13 @@ def apply_session_snapshot(
     # it is safe to persist/restore (the credential comes from the AWS profile /
     # env chain at call time, never from here). The user still re-tests the source/
     # target connections on Connect, but the AI toggle should not flip back off.
+    # Restore the AWS profile FIRST: it is the credential identity every AWS client
+    # (including Bedrock) is built with, so restoring "AI on" without it would resume
+    # against a different identity than the one the user had working.
+    restored_profile = getattr(snapshot, "aws_profile", None)
+    if restored_profile and hasattr(session, "set_aws_profile"):
+        session.set_aws_profile(restored_profile)  # type: ignore[attr-defined]
+
     if getattr(snapshot, "ai_assist_enabled", False) and hasattr(
         session, "set_ai_assist"
     ):
@@ -492,6 +500,20 @@ def apply_session_snapshot(
                 region=snapshot.ai_assist_region,
             )
         )
+        # The PREFERENCE is restored; the CAPABILITY is not. Authorization is a
+        # point-in-time fact about the current credentials (which may have expired, or
+        # lost the bedrock:InvokeModel grant, while the snapshot sat on disk), so the
+        # session comes back "unverified" -- the header chip reads a neutral
+        # "AI assist: On (unverified)" instead of an affirmative green claim, exactly
+        # like source/target coming back needing a re-test.
+        #
+        # No explicit reset is needed (and one would be HARMFUL): ai_verified is not
+        # persisted, so a cross-process restore already lands on None, while
+        # set_ai_assist above clears it whenever the restored preference differs from
+        # what is in memory. Resetting unconditionally would instead wipe a verdict just
+        # earned IN THIS process -- restore re-runs on every page build while the session
+        # looks fresh, so verifying AI on Connect and then navigating would have dropped
+        # the green badge, which is one of the bugs this change exists to fix.
 
 
 def session_is_fresh(
@@ -602,6 +624,9 @@ def session_signature(
         bool(getattr(getattr(session, "ai_assist", None), "enabled", False)),  # type: ignore[attr-defined]
         getattr(getattr(session, "ai_assist", None), "model_id", None),  # type: ignore[attr-defined]
         getattr(getattr(session, "ai_assist", None), "region", None),  # type: ignore[attr-defined]
+        # The AWS profile, so switching credential identity triggers a save (it is now
+        # persisted, and it decides whether Bedrock/DSQL calls work on resume).
+        getattr(session, "aws_profile", None),
         # AI transcript state, so a new chat turn / activity event / open-close
         # triggers a snapshot save (else the dirty-check would skip persisting it).
         # Cheap: message count + last message length + visibility + active scope id --

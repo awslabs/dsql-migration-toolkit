@@ -58,6 +58,7 @@ from dsql_migrator.core.query_playground import (
     probe_statement,
 )
 from dsql_migrator.core.target_connection import DsqlConnector
+from dsql_migrator.ui.ai_assist import ai_is_usable
 from dsql_migrator.ui.design import badge_classes, render_notice, section_header
 from dsql_migrator.ui.session import SessionStore
 
@@ -584,7 +585,7 @@ def build_query_playground_screen(
                 "(PostgreSQL) and, for SELECT/DDL, test whether it runs on the "
                 "target."
             )
-            if session.ai_assist.enabled:
+            if ai_is_usable(session):
                 intro += (
                     " AI Assist is on: open the AI chat to review the conversion, "
                     "ask follow-ups, or have it fix a statement the target rejected."
@@ -831,7 +832,7 @@ def build_query_playground_screen(
                 # any target error captured by the probe (so the AI can fix the
                 # real failure). Advisory only -- nothing is auto-applied.
                 result = state.result
-                if result is None or open_ai_scope is None or not session.ai_assist.enabled:
+                if result is None or open_ai_scope is None or not ai_is_usable(session):
                     return
                 from dsql_migrator.core.assessment_strategist import (
                     AssessmentStrategist,
@@ -889,7 +890,7 @@ def build_query_playground_screen(
                 # assistant reports how much it actually improved. Advisory only —
                 # nothing is auto-applied; the user copies SQL back to run for real.
                 result = state.result
-                if result is None or open_ai_scope is None or not session.ai_assist.enabled:
+                if result is None or open_ai_scope is None or not ai_is_usable(session):
                     return
                 from dsql_migrator.core.assessment_strategist import (
                     AssessmentStrategist,
@@ -1151,7 +1152,7 @@ def build_query_playground_screen(
         "Test rewrite on target" action that re-probes the AI's SQL and asks the AI
         to report the before/after DPU improvement.
         """
-        if not session.ai_assist.enabled:
+        if not ai_is_usable(session):
             _render_ai_disabled_hint(ui, result)
             return
 
