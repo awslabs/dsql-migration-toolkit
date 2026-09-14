@@ -3273,9 +3273,9 @@ def _render_pk_strategy_picker(
                     f"and '{current_leading}' must be immutable (DSQL keys cannot "
                     "change after creation). A UNIQUE index on the original key "
                     f"({', '.join(table.primary_key)}) preserves its uniqueness. "
-                    "CDC handles this automatically -- Debezium is told to key each "
-                    "change record on the composite key -- as long as no key column is "
-                    "dropped from capture by the column exclude list."
+                    "If you replicate this table with CDC, keep every key column in "
+                    "capture: change records are keyed on the composite key, so "
+                    "excluding one of its columns stops replication for this table."
                 ),
             )
         elif is_identity:

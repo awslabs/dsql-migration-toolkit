@@ -5,6 +5,19 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.443
+
+### 변경 (Changed)
+
+- **복합 키 경고의 심각도를 하나로 통일.** v0.1.442에서 낡은 "Not yet supported with CDC." 문구를
+  고쳤지만 그 자리에 안심 표현("CDC handles this automatically")을 넣었는데, 헤더가 명령형인
+  ("Queries must use the new composite key after cutover") 호박색 경고 박스 안에서 어색하게 읽히고
+  사용자가 실제로 해야 할 행동을 희석했습니다. 이제 같은 사실을 그것이 함의하는 의무로 서술합니다 —
+  변경 레코드가 복합 키로 키잉되므로 키 컬럼을 하나라도 캡처에서 제외하면 해당 테이블의 복제가
+  멈춥니다. 톤은 `info`가 아니라 `warning`을 유지합니다: IDENTITY 옵션의 권고성 안내("gap과 느슨한
+  순서를 예상하라")와 달리, 복합 키 선택은 **필수** 애플리케이션 변경과 DSQL의 하드 불변성 제약을
+  발생시키고 둘 중 하나만 무시해도 cutover 후 애플리케이션이 깨집니다.
+
 ## v0.1.442
 
 ### 수정 (Fixed)

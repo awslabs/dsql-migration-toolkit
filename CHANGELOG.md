@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.443
+
+### Changed
+
+- **Composite-key warning now reads as one severity.** v0.1.442 corrected the stale "Not yet
+  supported with CDC." claim but replaced it with a reassurance ("CDC handles this
+  automatically"), which sat oddly inside an amber warning whose header is an imperative
+  ("Queries must use the new composite key after cutover") and diluted the action the user has to
+  take. The same fact is now stated as the obligation it implies -- keep every key column in
+  capture, because change records are keyed on the composite key, so excluding one stops
+  replication for that table. The notice stays `warning` (not `info`): unlike the IDENTITY
+  option's advisory "expect gaps and loose ordering", choosing a composite key creates a
+  MANDATORY application change plus a hard DSQL immutability constraint, and ignoring either
+  breaks the application after cutover.
+
 ## v0.1.442
 
 ### Fixed
