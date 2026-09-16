@@ -594,8 +594,14 @@ def target_foreign_keys(
     Accepts qualified (``schema.table``) and unqualified (``table``) names, because the
     tool spells target tables both ways -- a single-database MySQL source yields
     unqualified names, while a cluster-wide MySQL or any PostgreSQL source yields
-    ``schema.table`` (see ``core/introspector.py``). Unqualified falls back to the
-    search path via ``pg_table_is_visible``, exactly as ``target_primary_keys`` does.
+    ``schema.table`` (see ``core/introspector.py``). A bare name is resolved across every
+    USER schema, deliberately NOT via ``pg_table_is_visible`` (which the sibling readers
+    use): that depends on the connection's search_path -- the default
+    ``"$user", public`` for the tool's DSQL connections -- so a target table in any other
+    schema read back as ``[]`` and this gate opened with foreign keys still enforced.
+    Those siblings are unaffected because a miss maps them to ``None`` (unknown); only
+    here did it become a positive "there are none". If a bare name is constrained in
+    SEVERAL user schemas the answer is ``None`` (ambiguous), never a guess.
     """
     result: dict[str, Optional[list[str]]] = {}
     try:
@@ -610,31 +616,52 @@ def target_foreign_keys(
                 where_relation = "n.nspname = %(schema)s AND c.relname = %(table)s"
                 params: dict[str, object] = {"schema": schema, "table": relname}
             else:
+                # Deliberately NOT pg_table_is_visible(): that depends on the
+                # connection's search_path, which for the tool's DSQL connections is the
+                # default '"$user", public'. A target table in any other schema (the
+                # normal case for a schema-qualified conversion) then read back as [] ==
+                # "genuinely none", so the CDC gate opened with enforced foreign keys
+                # still in place -- fail OPEN, the exact opposite of its contract
+                # (live-confirmed). Resolve the bare relname across every USER schema
+                # instead, so the answer never depends on session state.
                 where_relation = (
-                    "c.relname = %(table)s AND pg_catalog.pg_table_is_visible(c.oid)"
+                    "c.relname = %(table)s AND n.nspname <> ALL(%(system)s)"
                 )
-                params = {"table": parts[0]}
+                params = {"table": parts[0], "system": list(SYSTEM_SCHEMAS)}
             # contype='f' == foreign key. conrelid is the CHILD (referencing) table, so
             # this lists the constraints that would reject an out-of-order child row.
             # NB convalidated is deliberately NOT read: it is False right after
             # ADD ... NOT VALID and True after the async VALIDATE, so it says nothing
             # about who created the constraint -- name+table matching is the only safe
             # ownership test.
+            # n.nspname is selected so an AMBIGUOUS bare name (same relname in several
+            # user schemas) can be detected rather than silently merged.
             statement = (
-                "SELECT con.conname "
+                "SELECT n.nspname, con.conname "
                 "FROM pg_catalog.pg_constraint con "
                 "JOIN pg_catalog.pg_class c ON c.oid = con.conrelid "
                 "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
                 f"WHERE con.contype = 'f' AND {where_relation} "
-                "ORDER BY con.conname"
+                "ORDER BY n.nspname, con.conname"
             )
             cursor = None
             try:
                 cursor = connection.cursor()
                 cursor.execute(statement, params)
-                result[table_name] = [
-                    str(row[0]) for row in cursor.fetchall() if row and row[0]
+                rows = [
+                    (str(row[0]), str(row[1]))
+                    for row in cursor.fetchall()
+                    if row and row[1]
                 ]
+                schemas = {schema for schema, _name in rows}
+                if len(schemas) > 1:
+                    # The bare name matched constrained tables in more than one schema,
+                    # so we cannot tell WHICH one is the migration target. Report unknown
+                    # (blocking) rather than guessing or merging: over-reporting here
+                    # costs a re-check, under-reporting costs silently dropped rows.
+                    result[table_name] = None
+                else:
+                    result[table_name] = [name for _schema, name in rows]
             except Exception:  # noqa: BLE001 - unreadable catalog -> UNKNOWN, not "none"
                 result[table_name] = None
             finally:

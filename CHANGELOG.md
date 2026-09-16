@@ -5,6 +5,33 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.445
+
+### Fixed
+
+- **The v0.1.444 CDC foreign-key gate did not fire in the flow it was built for — it
+  failed OPEN.** The bare-name branch of the target lookup filtered on
+  `pg_table_is_visible(c.oid)`, which depends on the connection's `search_path`, and the
+  tool's DSQL connections use the default `"$user", public` (only the Query Playground
+  ever sets a search_path). A target table in any other schema therefore read back as
+  `[]` — which the reader documents as "read the catalog, this table genuinely has none"
+  — so the gate saw a clean target and started streaming with the foreign keys still
+  enforced. That is the original silent-data-loss bug unchanged: out-of-order child rows
+  get `SQLSTATE 23503` and are dead-lettered permanently. Live-confirmed: the same table
+  returned `['fk_child_parent']` when asked by qualified name and `[]` when asked by bare
+  name, flipping the gate from blocking to open. A bare name is now resolved across every
+  USER schema (system schemas excluded, the idiom this module already uses elsewhere), so
+  the answer no longer depends on session state, and a name that is constrained in
+  SEVERAL user schemas reports `None` (ambiguous → blocks) instead of guessing or merging
+  results. A table that genuinely has no constraints still reports `[]`, so an ordinary
+  CDC start is not gated.
+  - The sibling readers (`target_primary_key_columns`, `target_primary_keys`,
+    `target_required_columns_without_default`) share the `pg_table_is_visible` idiom but
+    are NOT affected in the same way: a miss maps them to `None` (unknown), never to a
+    positive "there are none". They do lose information for a bare name outside the
+    search_path, which is recorded as a separate follow-up rather than changed in a fix
+    release, because their callers drive Full Load recreate/append decisions.
+
 ## v0.1.444
 
 ### Fixed

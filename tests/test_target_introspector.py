@@ -1095,7 +1095,12 @@ def test_required_columns_without_default_returns_none_on_catalog_error() -> Non
 
 
 class _FkCursor:
-    """Cursor double returning per-table FK constraint names."""
+    """Cursor double returning (schema, constraint) rows for the FK catalog query.
+
+    Models schemas because the real query resolves a BARE relname across every user
+    schema (it must NOT depend on the connection's search_path). ``by_table`` maps
+    "schema.table" -> [constraint names].
+    """
 
     def __init__(self, connection: "_FkConnection") -> None:
         self._connection = connection
@@ -1105,8 +1110,22 @@ class _FkCursor:
         self._connection.executed.append((statement, params))
         if self._connection.raises:
             raise RuntimeError("catalog unreadable")
-        table = (params or {}).get("table")
-        self._rows = [(name,) for name in self._connection.by_table.get(table, [])]
+        # A search_path-dependent lookup is the BUG this double guards against: it made
+        # a table outside the default '"$user", public' read back as "genuinely none".
+        assert "pg_table_is_visible" not in statement, (
+            "the FK lookup must not depend on search_path"
+        )
+        params = params or {}
+        wanted_schema, wanted_table = params.get("schema"), params.get("table")
+        rows = []
+        for qualified, names in self._connection.by_table.items():
+            schema, _, table = qualified.rpartition(".")
+            if table != wanted_table:
+                continue
+            if wanted_schema is not None and schema != wanted_schema:
+                continue
+            rows.extend((schema, name) for name in names)
+        self._rows = sorted(rows)
 
     def fetchall(self) -> list:
         return self._rows
@@ -1138,9 +1157,11 @@ def test_target_foreign_keys_reads_every_table_over_one_connection() -> None:
 
     connects = {"count": 0}
     connection = _FkConnection(
-        by_table={"orders": ["fk_orders_users"], "order_items": [
-            "fk_items_orders", "fk_items_products"
-        ], "products": []}
+        by_table={
+            "ecommerce.orders": ["fk_orders_users"],
+            "ecommerce.order_items": ["fk_items_orders", "fk_items_products"],
+            "ecommerce.products": [],
+        }
     )
 
     def _factory():
@@ -1165,26 +1186,72 @@ def test_target_foreign_keys_reads_every_table_over_one_connection() -> None:
     statement = connection.executed[0][0]
     assert "con.contype = 'f'" in statement
     assert "convalidated" not in statement
+    # And never search_path-dependent (that made a non-public table read as "none").
+    assert "pg_table_is_visible" not in statement
 
 
-def test_target_foreign_keys_handles_qualified_and_unqualified_names() -> None:
-    # A single-database MySQL source yields UNQUALIFIED target names, while a cluster-wide
-    # MySQL or any PostgreSQL source yields schema.table. Both must resolve, or the gate
-    # silently finds nothing in the common single-database MySQL flow -- the exact flow in
-    # the bug report.
+def test_target_foreign_keys_resolves_a_bare_name_without_search_path() -> None:
+    """A bare relname must resolve in ANY user schema, not just the search_path.
+
+    THE BUG (v0.1.444, live-confirmed): the unqualified branch filtered on
+    ``pg_table_is_visible(c.oid)``, which depends on the connection's search_path -- and
+    the tool's DSQL connections use the default '"$user", public'. A target table in any
+    other schema therefore read back as ``[]`` == "genuinely none", so the CDC gate saw a
+    clean target and started streaming with enforced foreign keys still in place: fail
+    OPEN, the exact opposite of the gate's contract, in the very flow it was built for.
+    """
     from dsql_migrator.core.target_introspector import target_foreign_keys
 
-    connection = _FkConnection(by_table={"orders": ["fk_orders_users"]})
+    # The table lives in `ecommerce`, which is NOT in the default search_path.
+    connection = _FkConnection(by_table={"ecommerce.orders": ["fk_orders_users"]})
     result = target_foreign_keys(
         ["ecommerce.orders", "orders"], connection_factory=lambda: connection
     )
-    assert result == {"ecommerce.orders": ["fk_orders_users"], "orders": ["fk_orders_users"]}
+    assert result == {
+        "ecommerce.orders": ["fk_orders_users"],
+        "orders": ["fk_orders_users"],  # was [] before the fix -> gate opened
+    }
 
     qualified, unqualified = connection.executed
     assert qualified[1] == {"schema": "ecommerce", "table": "orders"}
     assert "n.nspname = %(schema)s" in qualified[0]
-    assert unqualified[1] == {"table": "orders"}
-    assert "pg_table_is_visible" in unqualified[0]
+    # The bare lookup excludes system schemas instead of asking what is "visible".
+    assert unqualified[1]["table"] == "orders"
+    assert "schema" not in unqualified[1]
+    assert "n.nspname <> ALL(%(system)s)" in unqualified[0]
+
+
+def test_target_foreign_keys_reports_an_ambiguous_bare_name_as_unknown() -> None:
+    # If the same relname is constrained in SEVERAL user schemas we cannot tell which one
+    # is the migration target, so report unknown (which blocks) rather than guessing or
+    # merging: over-reporting costs a re-check, under-reporting costs dropped rows.
+    from dsql_migrator.core.target_introspector import target_foreign_keys
+
+    connection = _FkConnection(
+        by_table={
+            "ecommerce.orders": ["fk_orders_users"],
+            "staging.orders": ["fk_staging_orders"],
+        }
+    )
+    result = target_foreign_keys(["orders"], connection_factory=lambda: connection)
+    assert result == {"orders": None}
+
+    # A qualified ask is never ambiguous, so it still answers exactly.
+    exact = target_foreign_keys(
+        ["ecommerce.orders"], connection_factory=lambda: connection
+    )
+    assert exact == {"ecommerce.orders": ["fk_orders_users"]}
+
+
+def test_target_foreign_keys_returns_empty_for_a_table_with_no_constraints() -> None:
+    # "[] == read the catalog, genuinely none" must survive the fix -- otherwise every
+    # ordinary CDC start would be blocked as unknown.
+    from dsql_migrator.core.target_introspector import target_foreign_keys
+
+    connection = _FkConnection(by_table={"ecommerce.products": []})
+    assert target_foreign_keys(
+        ["products"], connection_factory=lambda: connection
+    ) == {"products": []}
 
 
 def test_target_foreign_keys_fails_closed_on_connect_and_query_failure() -> None:
