@@ -566,6 +566,85 @@ def target_primary_keys(
     return result
 
 
+def target_foreign_keys(
+    table_names: Sequence[str],
+    *,
+    connection_factory: Callable[[], Any],
+) -> dict[str, Optional[list[str]]]:
+    """Return each table's ENFORCED foreign-key constraint names, over ONE connection.
+
+    Aurora DSQL enforces foreign keys, and an enforced FK is incompatible with CDC: the
+    sink applies change records across several tasks with no parent-before-child
+    ordering, so a child row can arrive first and be rejected with SQLSTATE 23503 --
+    which the sink classifies as a poison row and dead-letters permanently (no retry).
+    The CDC-start precondition uses this to detect FKs left on the target (e.g. by a
+    preceding ``Full load only`` run, whose post-load pass applies and validates them)
+    BEFORE any streaming begins.
+
+    Mirrors :func:`target_primary_keys`: one reused connection (a DSQL connect mints an
+    IAM token + full TLS handshake, so N+1 handshakes would stall the confirm dialog),
+    and the SAME "``None`` == unknown / unreadable, never a guess" contract. That
+    contract is load-bearing here and the detection must FAIL CLOSED: reporting an
+    unreadable catalog as "no foreign keys" would open the gate on exactly the case the
+    gate exists for, so a connection failure maps EVERY table to ``None`` and a
+    per-table query error maps just that table to ``None`` (never to ``[]``).
+
+    ``[]`` therefore means "read the catalog, this table genuinely has none".
+
+    Accepts qualified (``schema.table``) and unqualified (``table``) names, because the
+    tool spells target tables both ways -- a single-database MySQL source yields
+    unqualified names, while a cluster-wide MySQL or any PostgreSQL source yields
+    ``schema.table`` (see ``core/introspector.py``). Unqualified falls back to the
+    search path via ``pg_table_is_visible``, exactly as ``target_primary_keys`` does.
+    """
+    result: dict[str, Optional[list[str]]] = {}
+    try:
+        connection = connection_factory()
+    except Exception:  # noqa: BLE001 - cannot connect -> every table UNKNOWN (never [])
+        return {name: None for name in table_names}
+    try:
+        for table_name in table_names:
+            parts = table_name.split(".", 1)
+            if len(parts) == 2:
+                schema, relname = parts
+                where_relation = "n.nspname = %(schema)s AND c.relname = %(table)s"
+                params: dict[str, object] = {"schema": schema, "table": relname}
+            else:
+                where_relation = (
+                    "c.relname = %(table)s AND pg_catalog.pg_table_is_visible(c.oid)"
+                )
+                params = {"table": parts[0]}
+            # contype='f' == foreign key. conrelid is the CHILD (referencing) table, so
+            # this lists the constraints that would reject an out-of-order child row.
+            # NB convalidated is deliberately NOT read: it is False right after
+            # ADD ... NOT VALID and True after the async VALIDATE, so it says nothing
+            # about who created the constraint -- name+table matching is the only safe
+            # ownership test.
+            statement = (
+                "SELECT con.conname "
+                "FROM pg_catalog.pg_constraint con "
+                "JOIN pg_catalog.pg_class c ON c.oid = con.conrelid "
+                "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                f"WHERE con.contype = 'f' AND {where_relation} "
+                "ORDER BY con.conname"
+            )
+            cursor = None
+            try:
+                cursor = connection.cursor()
+                cursor.execute(statement, params)
+                result[table_name] = [
+                    str(row[0]) for row in cursor.fetchall() if row and row[0]
+                ]
+            except Exception:  # noqa: BLE001 - unreadable catalog -> UNKNOWN, not "none"
+                result[table_name] = None
+            finally:
+                if cursor is not None:
+                    _safe_close(cursor)
+    finally:
+        _safe_close(connection)
+    return result
+
+
 def target_required_columns_without_default(
     table_name: str,
     *,
@@ -862,6 +941,7 @@ __all__ = [
     "tables_with_rows",
     "target_primary_key_columns",
     "target_primary_keys",
+    "target_foreign_keys",
     "SYSTEM_SCHEMAS",
     "RELATIONS_QUERY",
     "COLUMNS_QUERY",

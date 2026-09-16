@@ -1087,3 +1087,118 @@ def test_required_columns_without_default_returns_none_on_catalog_error() -> Non
 
     assert result is None
     assert conn.closed is True
+
+
+# ---------------------------------------------------------------------------
+# target_foreign_keys: the CDC precondition read (Full-load-only -> CDC bug)
+# ---------------------------------------------------------------------------
+
+
+class _FkCursor:
+    """Cursor double returning per-table FK constraint names."""
+
+    def __init__(self, connection: "_FkConnection") -> None:
+        self._connection = connection
+        self._rows: list = []
+
+    def execute(self, statement: str, params: dict | None = None) -> None:
+        self._connection.executed.append((statement, params))
+        if self._connection.raises:
+            raise RuntimeError("catalog unreadable")
+        table = (params or {}).get("table")
+        self._rows = [(name,) for name in self._connection.by_table.get(table, [])]
+
+    def fetchall(self) -> list:
+        return self._rows
+
+    def close(self) -> None:
+        self._connection.closed_cursors += 1
+
+
+class _FkConnection:
+    def __init__(self, *, by_table: dict, raises: bool = False) -> None:
+        self.by_table = by_table
+        self.raises = raises
+        self.executed: list[tuple] = []
+        self.closed = False
+        self.closed_cursors = 0
+
+    def cursor(self) -> _FkCursor:
+        return _FkCursor(self)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_target_foreign_keys_reads_every_table_over_one_connection() -> None:
+    # An enforced FK is what makes a post-Full-load CDC stream dead-letter out-of-order
+    # child rows (23503, permanent), so the CDC gate reads this before streaming. One
+    # connect for N tables (a DSQL connect is an IAM token + cross-region TLS handshake).
+    from dsql_migrator.core.target_introspector import target_foreign_keys
+
+    connects = {"count": 0}
+    connection = _FkConnection(
+        by_table={"orders": ["fk_orders_users"], "order_items": [
+            "fk_items_orders", "fk_items_products"
+        ], "products": []}
+    )
+
+    def _factory():
+        connects["count"] += 1
+        return connection
+
+    result = target_foreign_keys(
+        ["ecommerce.orders", "ecommerce.order_items", "ecommerce.products"],
+        connection_factory=_factory,
+    )
+
+    assert connects["count"] == 1
+    assert len(connection.executed) == 3
+    assert result == {
+        "ecommerce.orders": ["fk_orders_users"],
+        "ecommerce.order_items": ["fk_items_orders", "fk_items_products"],
+        "ecommerce.products": [],  # read the catalog, genuinely none -- NOT unknown
+    }
+    assert connection.closed is True
+    # contype='f' is the whole query; convalidated is deliberately NOT read (it cannot
+    # tell a tool-created constraint from a user-created one).
+    statement = connection.executed[0][0]
+    assert "con.contype = 'f'" in statement
+    assert "convalidated" not in statement
+
+
+def test_target_foreign_keys_handles_qualified_and_unqualified_names() -> None:
+    # A single-database MySQL source yields UNQUALIFIED target names, while a cluster-wide
+    # MySQL or any PostgreSQL source yields schema.table. Both must resolve, or the gate
+    # silently finds nothing in the common single-database MySQL flow -- the exact flow in
+    # the bug report.
+    from dsql_migrator.core.target_introspector import target_foreign_keys
+
+    connection = _FkConnection(by_table={"orders": ["fk_orders_users"]})
+    result = target_foreign_keys(
+        ["ecommerce.orders", "orders"], connection_factory=lambda: connection
+    )
+    assert result == {"ecommerce.orders": ["fk_orders_users"], "orders": ["fk_orders_users"]}
+
+    qualified, unqualified = connection.executed
+    assert qualified[1] == {"schema": "ecommerce", "table": "orders"}
+    assert "n.nspname = %(schema)s" in qualified[0]
+    assert unqualified[1] == {"table": "orders"}
+    assert "pg_table_is_visible" in unqualified[0]
+
+
+def test_target_foreign_keys_fails_closed_on_connect_and_query_failure() -> None:
+    # THE load-bearing contract: an unreadable catalog is None (unknown), never [].
+    # Reporting "no foreign keys" would open the CDC gate on the very case it exists for.
+    from dsql_migrator.core.target_introspector import target_foreign_keys
+
+    def _no_connection():
+        raise RuntimeError("connect failed")
+
+    assert target_foreign_keys(["a", "b"], connection_factory=_no_connection) == {
+        "a": None, "b": None,
+    }
+
+    broken = _FkConnection(by_table={}, raises=True)
+    assert target_foreign_keys(["a"], connection_factory=lambda: broken) == {"a": None}
+    assert broken.closed is True

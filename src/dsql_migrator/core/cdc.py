@@ -47,7 +47,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Callable, Literal, Mapping, Optional, Sequence
+from typing import Callable, Literal, Mapping, NamedTuple, Optional, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -1204,6 +1204,76 @@ def composite_cdc_excluded_key_columns(
             if qualified in excluded:
                 offending.append(qualified)
     return sorted(offending)
+
+
+class CdcBlockingForeignKeys(NamedTuple):
+    """Enforced target foreign keys that block CDC, split by whether we may drop them.
+
+    ``ours`` are ``(table, constraint)`` pairs this migration's own conversion renders,
+    so removing them is reversible -- cut over re-creates exactly these. ``foreign`` are
+    enforced FKs the target has that this migration does NOT account for (created by the
+    user, or by a migration whose conversion state we no longer hold): they block CDC
+    just the same, but the tool must never drop what it cannot put back.
+    ``unknown_tables`` are tables whose catalog could not be read, which must be treated
+    as blocking (fail closed), never as "clean".
+    """
+
+    ours: list[tuple[str, str]]
+    foreign: list[tuple[str, str]]
+    unknown_tables: list[str]
+
+    @property
+    def blocking(self) -> bool:
+        """Whether CDC must not start yet (anything enforced, or anything unreadable)."""
+        return bool(self.ours or self.foreign or self.unknown_tables)
+
+
+def cdc_blocking_foreign_keys(
+    target_foreign_keys: "Mapping[str, Optional[Sequence[str]]]",
+    preserved_foreign_keys: "Mapping[str, Sequence[str]]",
+) -> CdcBlockingForeignKeys:
+    """Classify enforced target FKs into ours / foreign / unknown for the CDC gate. Pure.
+
+    An enforced foreign key cannot coexist with a live CDC stream: the sink applies
+    change records across several tasks with no parent-before-child ordering, so a child
+    row can arrive before its parent, get SQLSTATE 23503, and be dead-lettered
+    permanently (the sink classifies 23503 as a poison row -- no retry -- so the row is
+    silently lost while offsets advance). A preceding ``Full load only`` run leaves FKs
+    applied and validated, which is exactly how a session that later switches to CDC
+    ends up here.
+
+    ``target_foreign_keys`` is what the catalog reported per table, with the
+    :func:`~dsql_migrator.core.target_introspector.target_foreign_keys` contract:
+    ``None`` == unreadable/unknown (NOT "none"), ``[]`` == genuinely none.
+    ``preserved_foreign_keys`` maps table -> the constraint names THIS migration renders.
+
+    Ownership is decided on the ``(table, constraint name)`` PAIR only. ``convalidated``
+    is deliberately not consulted: it is False right after ``ADD ... NOT VALID`` and True
+    after the async VALIDATE, so it says nothing about who created a constraint. Matching
+    is case-SENSITIVE because the converter emits quoted identifiers, so target names
+    preserve the source's case exactly.
+    """
+    ours: list[tuple[str, str]] = []
+    foreign: list[tuple[str, str]] = []
+    unknown_tables: list[str] = []
+    for table, constraints in target_foreign_keys.items():
+        if constraints is None:
+            unknown_tables.append(table)
+            continue
+        expected = set(preserved_foreign_keys.get(table) or ())
+        # PostgreSQL/DSQL truncate an identifier to 63 bytes (NAMEDATALEN), so a long
+        # source FK name is stored TRUNCATED in pg_constraint while the rendered DDL
+        # carries it in full. Without this the tool would disown its own constraint and
+        # block CDC with no way out (it refuses to drop what it does not own).
+        truncated = {name.encode()[:63].decode(errors="ignore"): name for name in expected}
+        for constraint in constraints:
+            if constraint in expected or constraint in truncated:
+                ours.append((table, constraint))
+            else:
+                foreign.append((table, constraint))
+    return CdcBlockingForeignKeys(
+        ours=sorted(ours), foreign=sorted(foreign), unknown_tables=sorted(unknown_tables)
+    )
 
 
 def build_cdc_status_view(

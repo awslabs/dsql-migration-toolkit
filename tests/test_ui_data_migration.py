@@ -3465,6 +3465,12 @@ def test_cdc_step_delete_and_stop_handlers_set_teardown_marker(monkeypatch) -> N
 
     monkeypatch.setattr(_dep, "build_cdc_stack_deployer", lambda *a, **k: object())
     monkeypatch.setattr(_cdcui, "_log_cdc_event", lambda *a, **k: None)
+    # The FK precondition is fail-closed and this fake session has no readable target
+    # catalog, so stub it "clean" -- these tests are about seed mode / job deferral, and
+    # the gate itself is covered by test_cdc_start_*_foreign_key* below.
+    monkeypatch.setattr(
+        _cdcui, "_probe_cdc_blocking_foreign_keys", lambda *a, **k: None
+    )
 
     class _SubmitOnlyJM:
         def __init__(self) -> None:
@@ -3530,6 +3536,12 @@ def test_start_cdc_deploy_defers_blocking_setup_to_the_job_body(monkeypatch) -> 
     monkeypatch.setattr(_dep, "run_cdc_start", _run)
     monkeypatch.setattr(_cdcui, "_read_cdc_template_body", _tmpl)
     monkeypatch.setattr(_cdcui, "_log_cdc_event", lambda *a, **k: None)
+    # The FK precondition is fail-closed and this fake session has no readable target
+    # catalog, so stub it "clean" -- these tests are about seed mode / job deferral, and
+    # the gate itself is covered by test_cdc_start_*_foreign_key* below.
+    monkeypatch.setattr(
+        _cdcui, "_probe_cdc_blocking_foreign_keys", lambda *a, **k: None
+    )
 
     class _SubmitOnlyJM:
         def __init__(self) -> None:
@@ -3620,6 +3632,12 @@ def _run_start_cdc_capture_seed_mode(monkeypatch, *, source_type, host_seed_mode
     monkeypatch.setattr(_dep, "run_cdc_start", _run)
     monkeypatch.setattr(_cdcui, "_read_cdc_template_body", lambda: "TEMPLATE-BODY")
     monkeypatch.setattr(_cdcui, "_log_cdc_event", lambda *a, **k: None)
+    # The FK precondition is fail-closed and this fake session has no readable target
+    # catalog, so stub it "clean" -- these tests are about seed mode / job deferral, and
+    # the gate itself is covered by test_cdc_start_*_foreign_key* below.
+    monkeypatch.setattr(
+        _cdcui, "_probe_cdc_blocking_foreign_keys", lambda *a, **k: None
+    )
     # A host config with the given seed mode (patched so the test is env-independent).
     monkeypatch.setattr(
         _config,
@@ -17918,3 +17936,402 @@ def test_read_cgroup_memory_prefers_v2_and_handles_max(monkeypatch, tmp_path) ->
     mx.write_text(str(2 * 1024 * 1024 * 1024) + "\n")
     used, limit = _engine._read_cgroup_memory()
     assert used == 123456 and limit == 2 * 1024 * 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# Full-load-only -> CDC: enforced FKs must block the stream (silent-data-loss bug)
+# ---------------------------------------------------------------------------
+
+
+def test_preserved_foreign_key_names_come_from_the_same_ddls_the_apply_uses() -> None:
+    """Ownership must be derived from foreign_key_ddls, the apply pass's own source.
+
+    If the two ever disagreed, the CDC gate would either fail to remove an FK this
+    migration created (stream dead-letters child rows) or offer to drop one it did not
+    create and cannot put back.
+    """
+    from dsql_migrator.core.converter import TableConversion
+    from dsql_migrator.ui.data_migration._full_load_engine import (
+        preserved_foreign_key_names,
+    )
+
+    conversions = {
+        "ecommerce.orders": TableConversion(
+            table="ecommerce.orders",
+            target_ddl="CREATE TABLE x (id INT)",
+            foreign_key_ddls=[
+                'ALTER TABLE "ecommerce"."orders" ADD CONSTRAINT "fk_orders_users" '
+                'FOREIGN KEY ("user_id") REFERENCES "ecommerce"."users" ("id") NOT VALID'
+            ],
+        ),
+        # FK preservation off / no FKs -> absent from the map entirely.
+        "ecommerce.products": TableConversion(
+            table="ecommerce.products",
+            target_ddl="CREATE TABLE y (id INT)",
+            foreign_key_ddls=[],
+        ),
+    }
+    assert preserved_foreign_key_names(conversions) == {
+        "ecommerce.orders": ["fk_orders_users"]
+    }
+
+
+def test_start_cdc_job_refuses_when_the_target_still_has_enforced_foreign_keys(
+    monkeypatch,
+) -> None:
+    """The backstop that closes the Full-load-only -> CDC-only hole.
+
+    A ``Full load only`` run applies AND validates the preserved FKs at the end of the
+    load (its three CDC signals are all unset, because at load time nothing knows CDC
+    will follow). If the user then switches to ``CDC only`` and streams, the sink applies
+    change records across several tasks with no parent-before-child ordering -> a child
+    row can arrive first, get SQLSTATE 23503, and be dead-lettered permanently while
+    offsets advance: silent data loss. The job body re-checks and refuses BEFORE creating
+    any connector, which also covers the dialog-less "Retry CDC" path.
+    """
+    from types import SimpleNamespace
+
+    import dsql_migrator.ui.data_migration._cdc_ui as _cdcui
+    from dsql_migrator.core.cdc import CdcBlockingForeignKeys
+
+    class _SubmitOnlyJM:
+        def __init__(self) -> None:
+            self.work = None
+
+        def submit(self, work):
+            self.work = work
+            return "job-1"
+
+    class _Ui:
+        def notify(self, *_a, **_k):
+            return None
+
+    monkeypatch.setattr(_cdcui, "_log_cdc_event", lambda *a, **k: None)
+    monkeypatch.setattr(_cdcui, "_read_cdc_template_body", lambda: "TEMPLATE-BODY")
+    monkeypatch.setattr(
+        _cdcui,
+        "_probe_cdc_blocking_foreign_keys",
+        lambda *a, **k: CdcBlockingForeignKeys(
+            ours=[("ecommerce.order_items", "fk_order_items_orders")],
+            foreign=[],
+            unknown_tables=[],
+        ),
+    )
+    built = {"deployer": 0}
+    monkeypatch.setattr(
+        "dsql_migrator.core.cdc_deployer.build_cdc_stack_deployer",
+        lambda *a, **k: built.__setitem__("deployer", built["deployer"] + 1),
+    )
+
+    session = SimpleNamespace(
+        target_config=SimpleNamespace(region="us-east-1", cluster_endpoint="c.dsql"),
+        aws_profile=None,
+        source_config=None,
+        source_secret_id=None,
+    )
+    state = DataMigrationState()
+    state.set_selection(TableSelection(selected_tables=["orders"]))
+    jm = _SubmitOnlyJM()
+    _cdcui._start_cdc_deploy(
+        _Ui(), state, jm, lambda: None, inventory=_inventory(), session=session
+    )
+    assert jm.work is not None  # submitted; the refusal happens on the worker thread
+
+    with pytest.raises(RuntimeError) as excinfo:
+        jm.work(SimpleNamespace())
+    message = str(excinfo.value)
+    assert "enforced foreign keys" in message
+    assert "fk_order_items_orders" in message      # names exactly what blocks
+    assert "23503" in message                       # and why it matters
+    assert built["deployer"] == 0                   # nothing was created
+
+
+def test_start_cdc_job_proceeds_when_the_target_has_no_enforced_foreign_keys(
+    monkeypatch,
+) -> None:
+    # The normal CDC-only case must NOT be gated: a clean probe lets the deploy run, so
+    # the fix cannot regress every ordinary CDC start.
+    from types import SimpleNamespace
+
+    import dsql_migrator.core.cdc_deployer as _dep
+    import dsql_migrator.ui.data_migration._cdc_ui as _cdcui
+
+    class _SubmitOnlyJM:
+        def __init__(self) -> None:
+            self.work = None
+
+        def submit(self, work):
+            self.work = work
+            return "job-1"
+
+    class _Ui:
+        def notify(self, *_a, **_k):
+            return None
+
+    class _Deployer:
+        template_s3_bucket = ""
+
+        def _client(self, _svc):
+            return SimpleNamespace(
+                get_caller_identity=lambda: {"Account": "123456789012"}
+            )
+
+    ran = {"start": 0}
+    monkeypatch.setattr(_cdcui, "_log_cdc_event", lambda *a, **k: None)
+    monkeypatch.setattr(_cdcui, "_read_cdc_template_body", lambda: "TEMPLATE-BODY")
+    # A genuinely CLEAN verdict (read the catalog, nothing enforced) -- not the
+    # None "no tables resolved" sentinel, so the clean path is really exercised.
+    from dsql_migrator.core.cdc import CdcBlockingForeignKeys
+
+    monkeypatch.setattr(
+        _cdcui,
+        "_probe_cdc_blocking_foreign_keys",
+        lambda *a, **k: CdcBlockingForeignKeys(ours=[], foreign=[], unknown_tables=[]),
+    )
+    monkeypatch.setattr(_dep, "build_cdc_stack_deployer", lambda *a, **k: _Deployer())
+    monkeypatch.setattr(
+        _dep, "run_cdc_start",
+        lambda *a, **k: ran.__setitem__("start", ran["start"] + 1),
+    )
+
+    session = SimpleNamespace(
+        target_config=SimpleNamespace(region="us-east-1", cluster_endpoint="c.dsql"),
+        aws_profile=None,
+        source_config=None,
+        source_secret_id=None,
+    )
+    state = DataMigrationState()
+    state.set_selection(TableSelection(selected_tables=["orders"]))
+    jm = _SubmitOnlyJM()
+    _cdcui._start_cdc_deploy(
+        _Ui(), state, jm, lambda: None, inventory=_inventory(), session=session
+    )
+    jm.work(SimpleNamespace())
+    assert ran["start"] == 1
+
+
+def test_probe_cdc_blocking_foreign_keys_covers_non_streamed_children() -> None:
+    """The probe must ask about every table this migration gives FKs to.
+
+    An FK on a NON-streamed child still blocks: a streamed DELETE on the parent is
+    rejected (23503) because the static child rows still reference it, and that DELETE is
+    dead-lettered permanently. Scoping the probe to the streamed set alone would miss it.
+    """
+    from types import SimpleNamespace
+
+    import dsql_migrator.ui.data_migration._cdc_ui as _cdcui
+
+    asked: dict = {}
+
+    def _fake_target_foreign_keys(table_names, *, connection_factory):
+        asked["names"] = list(table_names)
+        connection_factory()  # prove the real factory seam is used
+        return {name: [] for name in table_names}
+
+    state = DataMigrationState()
+    state.set_selection(TableSelection(selected_tables=["orders"]))
+    # 'archive_orders' is NOT streamed but this migration gives it an FK.
+    state.set_cdc_preserved_foreign_keys({"archive_orders": ["fk_archive_orders"]})
+
+    session = SimpleNamespace(
+        target_config=SimpleNamespace(region="us-east-1", cluster_endpoint="c.dsql"),
+        aws_profile=None,
+    )
+    import dsql_migrator.core.target_introspector as _ti
+
+    _orig = _ti.target_foreign_keys
+    _ti.target_foreign_keys = _fake_target_foreign_keys
+    _cdcui_orig = _cdcui._cdc_fk_connection_factory
+    _cdcui._cdc_fk_connection_factory = lambda _s: (lambda: object())
+    try:
+        result = _cdcui._probe_cdc_blocking_foreign_keys(
+            state, session, _inventory(), None
+        )
+    finally:
+        _ti.target_foreign_keys = _orig
+        _cdcui._cdc_fk_connection_factory = _cdcui_orig
+
+    assert "archive_orders" in asked["names"]      # the non-streamed child was checked
+    assert "orders" in asked["names"]
+    assert result is not None and result.blocking is False
+
+
+def test_probe_cdc_blocking_foreign_keys_fails_closed_without_a_target() -> None:
+    # No target configured -> every table UNKNOWN (never "clean"), so the gate holds.
+    from types import SimpleNamespace
+
+    import dsql_migrator.ui.data_migration._cdc_ui as _cdcui
+
+    state = DataMigrationState()
+    state.set_selection(TableSelection(selected_tables=["orders"]))
+    result = _cdcui._probe_cdc_blocking_foreign_keys(
+        state, SimpleNamespace(target_config=None, aws_profile=None), _inventory(), None
+    )
+    assert result is not None
+    assert result.blocking is True
+    assert result.ours == [] and result.foreign == []
+    assert result.unknown_tables  # unreadable, not "none"
+
+
+def test_drop_cdc_blocking_foreign_keys_drops_each_and_logs_it(monkeypatch) -> None:
+    # Each drop is its own single DDL and each is named in the activity log, so an
+    # operator can reconstruct exactly what was removed and when.
+    from types import SimpleNamespace
+
+    import dsql_migrator.ui.data_migration._cdc_ui as _cdcui
+
+    dropped: list[tuple] = []
+    logged: list[tuple] = []
+    monkeypatch.setattr(
+        "dsql_migrator.core.schema_applier.drop_foreign_key",
+        lambda table, name, **kw: dropped.append((table, name)),
+    )
+    monkeypatch.setattr(
+        _cdcui, "_log_cdc_event",
+        lambda action, **kw: logged.append((action, kw.get("detail", ""))),
+    )
+    monkeypatch.setattr(_cdcui, "_cdc_fk_connection_factory", lambda _s: (lambda: object()))
+
+    ok, failed = _cdcui._drop_cdc_blocking_foreign_keys(
+        [("ecommerce.orders", "fk_orders_users"),
+         ("ecommerce.order_items", "fk_items_orders")],
+        SimpleNamespace(),
+    )
+    assert (ok, failed) == (2, 0)
+    assert dropped == [
+        ("ecommerce.orders", "fk_orders_users"),
+        ("ecommerce.order_items", "fk_items_orders"),
+    ]
+    assert len(logged) == 2
+    assert all("fk_" in detail for _a, detail in logged)
+    assert all("re-created" in detail for _a, detail in logged)  # says how to get them back
+
+
+def test_drop_cdc_blocking_foreign_keys_reports_failures_without_aborting(
+    monkeypatch,
+) -> None:
+    # One bad drop must not silently stop the rest, and it must be logged as a failure --
+    # a half-removed set that reads as success would let the user start CDC into 23503.
+    from types import SimpleNamespace
+
+    import dsql_migrator.ui.data_migration._cdc_ui as _cdcui
+
+    logged: list[tuple] = []
+
+    def _drop(table, name, **kw):
+        if name == "fk_bad":
+            raise RuntimeError("permission denied")
+
+    monkeypatch.setattr("dsql_migrator.core.schema_applier.drop_foreign_key", _drop)
+    monkeypatch.setattr(
+        _cdcui, "_log_cdc_event",
+        lambda action, **kw: logged.append((action, str(kw.get("status")))),
+    )
+    monkeypatch.setattr(_cdcui, "_cdc_fk_connection_factory", lambda _s: (lambda: object()))
+
+    ok, failed = _cdcui._drop_cdc_blocking_foreign_keys(
+        [("t", "fk_bad"), ("t", "fk_good")], SimpleNamespace()
+    )
+    assert (ok, failed) == (1, 1)
+    assert any("not removed" in action for action, _s in logged)
+
+
+def test_cdc_fk_block_copy_distinguishes_found_from_unreadable() -> None:
+    """An unreadable catalog must not be reported as "enforced foreign keys exist".
+
+    That is the likeliest block in practice (a transient DSQL connect), and the wrong
+    wording sends the operator to pg_constraint to find nothing instead of to the
+    connection test. It is also the case with NO Remove button, so the copy must not
+    point at one.
+    """
+    import dsql_migrator.ui.data_migration._cdc_ui as _cdcui
+    from dsql_migrator.core.cdc import CdcBlockingForeignKeys
+
+    found = CdcBlockingForeignKeys(
+        ours=[("ecommerce.orders", "fk_orders_users")], foreign=[], unknown_tables=[]
+    )
+    clause, header = _cdcui._cdc_fk_block_reason(found)
+    assert "still has enforced foreign keys" in clause
+    assert "Remove" in header
+    assert "Remove them below" in _cdcui._cdc_fk_block_body(found)
+    # The job error has no button, so it points at where the control lives instead.
+    no_button = _cdcui._cdc_fk_block_body(found, can_remove_here=False)
+    assert "Remove them below" not in no_button
+    assert "Reopen Start CDC" in no_button
+
+    unreadable = CdcBlockingForeignKeys(
+        ours=[], foreign=[], unknown_tables=["ecommerce.orders"]
+    )
+    clause, header = _cdcui._cdc_fk_block_reason(unreadable)
+    assert "could not be verified" in clause
+    assert "Could not verify" in header
+    body = _cdcui._cdc_fk_block_body(unreadable)
+    assert "were created by this migration" not in body
+    assert "Re-test the target connection" in body
+
+
+def test_fk_ownership_is_independent_of_the_preserve_foreign_keys_toggle() -> None:
+    """Ownership must survive unticking "Preserve foreign keys" — else CDC dead-ends.
+
+    An operator blocked by the CDC foreign-key gate does the obvious thing: goes to Schema
+    Conversion and unticks "Preserve foreign keys" to get rid of them. That blanks
+    ``foreign_key_ddls``, so deriving ownership from the toggle made the tool DISOWN the
+    very constraints it had created — classifying them as the user's, hiding the Remove
+    button, and leaving CDC blocked with no in-UI way out. Ownership is a fact about what
+    this migration's conversion RENDERS; whether the user still wants them re-applied is a
+    separate choice.
+    """
+    from dsql_migrator.core.converter import SchemaConverter
+    from dsql_migrator.core.models import (
+        ColumnDef, ForeignKeyDef, SourceInventory, TableDef,
+    )
+    from dsql_migrator.ui.data_migration._full_load_engine import (
+        preserved_foreign_key_names,
+    )
+    from dsql_migrator.ui.schema_conversion_apply import applied_table_conversions
+
+    users = TableDef(
+        name="users",
+        columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+        primary_key=["id"],
+    )
+    orders = TableDef(
+        name="orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="int", nullable=False),
+            ColumnDef(name="user_id", mysql_type="int", nullable=False),
+        ],
+        primary_key=["id"],
+        foreign_keys=[
+            ForeignKeyDef(
+                name="fk_orders_users",
+                columns=["user_id"],
+                referenced_table="users",
+                referenced_columns=["id"],
+            )
+        ],
+    )
+    conversion = SchemaConverter().convert(SourceInventory(tables=[users, orders]))
+
+    owned = preserved_foreign_key_names(
+        applied_table_conversions(conversion, {}, preserve_foreign_keys=True)
+    )
+    assert owned == {"orders": ["fk_orders_users"]}
+
+    # The trap the fix avoids: the OFF toggle blanks foreign_key_ddls, so an ownership map
+    # derived from it is EMPTY -- the tool would disown its own constraint.
+    assert (
+        preserved_foreign_key_names(
+            applied_table_conversions(conversion, {}, preserve_foreign_keys=False)
+        )
+        == {}
+    )
+
+    # And the app stores the toggle-INDEPENDENT view: assert the wiring passes True.
+    import inspect
+
+    from dsql_migrator.ui import data_migration as _dm
+
+    src = inspect.getsource(_dm.build_data_migration_screen)
+    assert "set_cdc_preserved_foreign_keys" in src
+    assert "preserve_foreign_keys=True" in src

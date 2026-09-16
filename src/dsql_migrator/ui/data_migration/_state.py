@@ -156,6 +156,7 @@ class DataMigrationState:
         # record (message.key.columns) to match the target's ON CONFLICT/DELETE key
         # -- no sink change needed. Empty => every table keys on its source PK.
         self._cdc_message_key_columns: dict[str, list[str]] = {}
+        self._cdc_preserved_foreign_keys: dict[str, list[str]] = {}
         # How the operator chose the CDC start point: "auto" (gapless from the
         # Full Load watermark) or "manual" (an explicit GTID / binlog position).
         # An explicit mode (vs. inferring it from whether an override is set)
@@ -384,6 +385,30 @@ class DataMigrationState:
             return {
                 table: list(cols)
                 for table, cols in self._cdc_message_key_columns.items()
+            }
+
+    def set_cdc_preserved_foreign_keys(
+        self, preserved_foreign_keys: "dict[str, list[str]]"
+    ) -> None:
+        """Record which FK constraint names THIS migration owns (table -> names).
+
+        Replaces the whole map (recomputed from the applied Schema Conversion on each
+        render, like ``set_cdc_message_key_columns``). The CDC-start precondition needs
+        it to tell an FK this migration rendered -- safe to remove before streaming and
+        re-created at cut over -- from one the user created, which the tool must never
+        drop. Empty means this migration accounts for no foreign keys.
+        """
+        with self._lock:
+            self._cdc_preserved_foreign_keys = {
+                table: list(names) for table, names in preserved_foreign_keys.items()
+            }
+
+    def cdc_preserved_foreign_keys(self) -> "dict[str, list[str]]":
+        """Return a copy of the FK constraint names this migration owns."""
+        with self._lock:
+            return {
+                table: list(names)
+                for table, names in self._cdc_preserved_foreign_keys.items()
             }
 
     def set_cdc_start_mode(self, mode: str) -> None:

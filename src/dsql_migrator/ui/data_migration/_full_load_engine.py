@@ -3870,6 +3870,31 @@ def apply_preserved_foreign_keys(
     return (applied, skipped, failed)
 
 
+def preserved_foreign_key_names(
+    table_conversions: Mapping[str, TableConversion],
+) -> dict[str, list[str]]:
+    """Return table -> the FK constraint names THIS migration renders. Pure.
+
+    Derived from the very same ``foreign_key_ddls`` that
+    :func:`apply_preserved_foreign_keys` applies (parsed with
+    :func:`_constraint_name_from_ddl`), so the two can never disagree about which
+    constraints belong to this migration. That matters because it is the ONLY safe
+    ownership test for the CDC precondition: an enforced FK on the target has to be
+    removed before streaming (the sink dead-letters 23503 permanently), but the tool
+    must never drop a constraint the user created and it cannot put back -- and
+    ``pg_constraint.convalidated`` cannot tell them apart.
+
+    Tables with FK preservation disabled (or no FKs) simply do not appear.
+    """
+    names: dict[str, list[str]] = {}
+    for table_name, conv in table_conversions.items():
+        for add_ddl in conv.foreign_key_ddls:
+            constraint_name = _constraint_name_from_ddl(add_ddl)
+            if constraint_name:
+                names.setdefault(table_name, []).append(constraint_name)
+    return names
+
+
 # Matches ``ADD CONSTRAINT <name> FOREIGN KEY`` and captures <name>, either a
 # double-quoted identifier (as rendered) or a bare word (if a user typed it unquoted).
 _FK_CONSTRAINT_NAME_RE = re.compile(

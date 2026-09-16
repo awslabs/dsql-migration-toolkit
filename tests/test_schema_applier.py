@@ -1113,3 +1113,41 @@ def test_validate_foreign_key_runs_async_validate() -> None:
     sqltext = connection.executed[0]
     assert "ALTER TABLE ASYNC" in sqltext
     assert "VALIDATE CONSTRAINT" in sqltext and '"fk_user"' in sqltext
+
+
+def test_drop_foreign_key_is_idempotent_single_ddl() -> None:
+    """The inverse of apply_foreign_key, needed before a CDC stream can start.
+
+    An enforced FK and a live CDC stream are mutually exclusive: the sink applies change
+    records across several tasks with no parent-before-child ordering, so a child row can
+    arrive first, be rejected with SQLSTATE 23503, and be dead-lettered PERMANENTLY. IF
+    EXISTS keeps it idempotent so an OCC/reconnect replay cannot raise undefined_object.
+    """
+    from dsql_migrator.core.schema_applier import drop_foreign_key
+
+    connection = _FakeConnection()
+    drop_foreign_key(
+        "ecommerce.orders", "fk_orders_users",
+        connection_factory=lambda: connection, sleep=_no_sleep, jitter=_zero_jitter,
+    )
+    assert len(connection.executed) == 1  # one DDL per transaction (DSQL)
+    sqltext = connection.executed[0]
+    assert "ALTER TABLE" in sqltext
+    assert "DROP CONSTRAINT IF EXISTS" in sqltext
+    # Identifiers composed injection-safely (quoted), schema-qualified table split.
+    assert '"fk_orders_users"' in sqltext
+    assert '"ecommerce"."orders"' in sqltext
+
+
+def test_drop_foreign_key_retries_on_occ_conflict() -> None:
+    # Commit-time OCC (40001) is retryable for a DROP exactly as for the ADD.
+    from dsql_migrator.core.schema_applier import drop_foreign_key
+
+    connection = _FakeConnection(failures=["40001"])
+    drop_foreign_key(
+        "orders", "fk_orders_users",
+        connection_factory=lambda: connection, sleep=_no_sleep, jitter=_zero_jitter,
+    )
+    # The conflicting attempt was retried and the DROP ultimately ran once.
+    assert len(connection.executed) == 1
+    assert "DROP CONSTRAINT IF EXISTS" in connection.executed[0]

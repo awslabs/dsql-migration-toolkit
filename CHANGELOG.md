@@ -5,6 +5,36 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.444
+
+### Fixed
+
+- **A `Full load only` run no longer leaves foreign keys that make a later CDC stream
+  silently discard rows.** Full Load's post-load pass applies AND validates the preserved
+  foreign keys unless one of three CDC signals is set, and all three are unset for a
+  `Full load only` run — at load time nothing knows CDC will follow. If the user then
+  switched the same session to `CDC only` and started streaming, the sink applied change
+  records across several tasks with no parent-before-child ordering, so a child row could
+  arrive before its parent, be rejected with `SQLSTATE 23503`, and be **dead-lettered
+  permanently**: 23503 is not in the sink's transient set, so there is no retry, the task
+  keeps running and offsets advance. The rows were lost with nothing failing loudly, and
+  because it is a race the same run could pass (`Quarantined 0`) or lose rows. This also
+  contradicted the tool's own documented model ("re-created on Aurora DSQL only at cut
+  over, never during replication"). Starting CDC now checks the target first and refuses
+  while any enforced foreign key is present:
+  - the Start CDC dialog reads the target's `pg_constraint` off the event loop, names
+    exactly which constraints block, explains why, and disables Start;
+  - a **Remove foreign keys** action drops only the constraints THIS migration's own
+    conversion renders (matched on the `(table, constraint name)` pair — never a
+    constraint the user created and the tool could not put back), logging each one to the
+    activity log; cut over's existing idempotent "Apply foreign keys" step re-creates
+    them once the stream has drained;
+  - the check is repeated inside the job body immediately before anything is created, so
+    the dialog-less **Retry CDC** path is covered too;
+  - detection **fails closed**: an unreadable catalog counts as blocking, because
+    reporting "no foreign keys" for a target we could not read would open the gate on
+    exactly the case it exists for.
+
 ## v0.1.443
 
 ### Changed

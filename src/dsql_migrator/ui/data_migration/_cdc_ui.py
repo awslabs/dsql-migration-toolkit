@@ -1981,6 +1981,8 @@ def _render_cdc_start_button(
             ),
             session=session,
             job_manager=job_manager,
+            inventory=inventory,
+            refresh_after_drop=refresh,
         )
 
     # Explicit CDC-prerequisite gate, independent of the sub-step ordering: a
@@ -2863,7 +2865,8 @@ def _probe_binlog_resume_gap(migration_state, job_manager, session) -> Optional[
 
 
 async def _open_cdc_start_dialog(
-    ui, migration_state, on_confirm, *, session=None, job_manager=None
+    ui, migration_state, on_confirm, *, session=None, job_manager=None, inventory=None,
+    refresh_after_drop=None,
 ) -> None:
     """Confirm dialog before the (billable, partition-quota-using) Start.
 
@@ -2886,6 +2889,7 @@ async def _open_cdc_start_dialog(
     stack_name = getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
     conn_blocker = cdc_deploy_connection_blocker(session)
     binlog_gap: Optional[str] = None
+    fk_block = None
     if job_manager is not None:
         from nicegui import run
 
@@ -2895,6 +2899,29 @@ async def _open_cdc_start_dialog(
             )
         except Exception:  # noqa: BLE001 - advisory only; never block the dialog
             binlog_gap = None
+        # Enforced foreign keys on the target are a HARD block (unlike the binlog gap):
+        # the sink dead-letters an out-of-order child row permanently and silently, so
+        # "unknown" must block too. Blocking DSQL I/O -> run.io_bound, never on the loop.
+        if not conn_blocker:
+            _job = _current_job(job_manager, migration_state.job_id)
+            _wm = getattr(_job, "watermark", None) if _job is not None else None
+            try:
+                probed = await run.io_bound(
+                    _probe_cdc_blocking_foreign_keys,
+                    migration_state, session, inventory, _wm,
+                )
+            except Exception:  # noqa: BLE001 - probe itself failed -> cannot prove clean
+                probed = None
+                _log_cdc_event(
+                    "foreign-key precondition unknown",
+                    status=ActivityStatus.INFO,
+                    detail=(
+                        "could not read the target's foreign keys before Start CDC; "
+                        "the job re-checks before creating any connector"
+                    ),
+                )
+            if probed is not None and probed.blocking:
+                fk_block = probed
     with ui.dialog() as dialog, ui.card().classes("gap-2").style("min-width: 460px"):  # type: ignore[attr-defined]
         ui.label("Start CDC — create connectors").classes("text-lg font-semibold")  # type: ignore[attr-defined]
         ui.label(  # type: ignore[attr-defined]
@@ -2919,6 +2946,48 @@ async def _open_cdc_start_dialog(
                 header="The snapshot's binary log has been purged",
                 body=binlog_gap,
             )
+        if fk_block is not None:
+            _render_notice(
+                ui,
+                tone="error",
+                icon="link",
+                header=_cdc_fk_block_reason(fk_block)[1],
+                body=_cdc_fk_block_body(fk_block),
+            )
+            if fk_block.ours:
+
+                async def _remove_fks() -> None:
+                    from nicegui import run
+
+                    remove_btn.disable()
+                    remove_btn.set_text("Removing…")
+                    dropped, failed = await run.io_bound(
+                        _drop_cdc_blocking_foreign_keys, fk_block.ours, session
+                    )
+                    dialog.close()
+                    if failed:
+                        ui.notify(  # type: ignore[attr-defined]
+                            f"Removed {dropped} foreign key(s), {failed} failed — see "
+                            "the activity log, then reopen Start CDC.",
+                            type="warning", position="top",
+                        )
+                    else:
+                        ui.notify(  # type: ignore[attr-defined]
+                            f"Removed {dropped} foreign key(s). Reopen Start CDC to "
+                            "continue; cut over re-creates them.",
+                            type="positive", position="top",
+                        )
+                    if refresh_after_drop is not None:
+                        refresh_after_drop()
+
+                remove_btn = ui.button(  # type: ignore[attr-defined]
+                    "Remove foreign keys", on_click=_remove_fks, icon="link_off"
+                ).props("color=negative")
+                remove_btn.tooltip(
+                    "Drops exactly the "
+                    f"{len(fk_block.ours)} foreign key(s) this migration created; the "
+                    "cut-over 'Apply foreign keys' step re-creates them."
+                )
 
         def _go() -> None:
             start_btn.disable()
@@ -2935,6 +3004,18 @@ async def _open_cdc_start_dialog(
             if conn_blocker:
                 start_btn.props("disable")
                 start_btn.tooltip(conn_blocker)
+            elif fk_block is not None:
+                # Hard block: an enforced FK makes the stream discard child rows
+                # silently, so Start stays unavailable until the FKs are gone.
+                start_btn.props("disable")
+                start_btn.tooltip(
+                    "Enforced foreign keys on the target would dead-letter "
+                    "out-of-order child rows (23503). Remove them first."
+                    if (fk_block.ours or fk_block.foreign)
+                    else "The target's foreign keys could not be read. CDC stays "
+                    "blocked while this is unknown — re-test the target connection "
+                    "and retry."
+                )
     dialog.open()
 
 def _open_cdc_stop_dialog(ui, migration_state, on_confirm, *, partial: bool = False) -> None:
@@ -3106,6 +3187,169 @@ def _sink_mcu_count() -> int:
         return CDC_DEFAULT_SINK_MCU_COUNT
 
 
+def _cdc_fk_connection_factory(session):
+    """Return a fresh-DSQL-connection factory for the target, or ``None``.
+
+    Same seam the cut-over FK apply uses (``DsqlConnector(...).connect``), so the
+    precondition reads and the drop run against exactly the target that will be
+    streamed to.
+    """
+    target = getattr(session, "target_config", None)
+    if target is None:
+        return None
+    from dsql_migrator.core.target_connection import DsqlConnector
+
+    return DsqlConnector(
+        target, aws_profile=getattr(session, "aws_profile", None)
+    ).connect
+
+
+def _probe_cdc_blocking_foreign_keys(migration_state, session, inventory, watermark):
+    """Read the target's enforced FKs on the to-be-streamed tables. BLOCKING I/O.
+
+    An enforced foreign key cannot coexist with a live CDC stream: the sink applies
+    change records across several tasks with NO parent-before-child ordering, so a child
+    row can arrive before its parent, be rejected with SQLSTATE 23503, and be
+    dead-lettered PERMANENTLY (the sink treats 23503 as a poison row -- no retry -- while
+    offsets advance and the task survives, so the loss is silent). A preceding
+    ``Full load only`` run leaves FKs applied AND validated, which is exactly how a
+    session that later switches to CDC arrives here.
+
+    Returns a :class:`CdcBlockingForeignKeys`, or ``None`` when there is nothing to check
+    (no tables resolved yet -- the caller's own empty-selection guard covers that).
+
+    Opens a DSQL connection, so callers MUST run it off the NiceGUI event loop
+    (``run.io_bound`` in the dialog, or the job's worker thread).
+    """
+    from dsql_migrator.core.cdc import cdc_blocking_foreign_keys
+    from dsql_migrator.core.target_introspector import target_foreign_keys
+
+    preserved = migration_state.cdc_preserved_foreign_keys()
+    tables = _cdc_tables_for_config(migration_state, inventory, watermark)
+    streamed = [t.name for t in tables if getattr(t, "name", None)]
+    if not streamed:
+        return None
+    # Check every table this migration gives foreign keys to, not just the streamed set.
+    # An FK on a NON-streamed child still blocks: a streamed DELETE on the parent is
+    # rejected (23503) because the static child rows still reference it, and that DELETE
+    # is then dead-lettered permanently. The extra tables cost one more catalog query each
+    # on the SAME connection, and keying by child table keeps ownership matching valid.
+    table_names = sorted(set(streamed) | set(preserved))
+    connect = _cdc_fk_connection_factory(session)
+    if connect is None:
+        # No target configured: report every table UNKNOWN rather than "clean", so the
+        # gate fails closed (the connection blocker will also fire in the dialog).
+        return cdc_blocking_foreign_keys({name: None for name in table_names}, preserved)
+    return cdc_blocking_foreign_keys(
+        target_foreign_keys(table_names, connection_factory=connect), preserved
+    )
+
+
+def _drop_cdc_blocking_foreign_keys(pairs, session) -> tuple[int, int]:
+    """Drop the given ``(table, constraint)`` FKs so CDC can stream. BLOCKING I/O.
+
+    Only ever called with the ``ours`` half of :func:`cdc_blocking_foreign_keys` -- the
+    constraints THIS migration's conversion renders, which cut over re-creates with the
+    shared idempotent apply pass. Each drop is its own single autocommit DDL with OCC
+    retry (DSQL allows one DDL per transaction) and is logged individually under the CDC
+    category, so the audit trail names every constraint removed.
+
+    Returns ``(dropped, failed)``.
+    """
+    from dsql_migrator.core.schema_applier import drop_foreign_key
+
+    connect = _cdc_fk_connection_factory(session)
+    if connect is None:
+        return (0, len(list(pairs)))
+    dropped = failed = 0
+    for table_name, constraint_name in pairs:
+        target = f"{table_name}.{constraint_name}"
+        try:
+            drop_foreign_key(table_name, constraint_name, connection_factory=connect)
+            dropped += 1
+            _log_cdc_event(
+                "foreign key removed for CDC",
+                status=ActivityStatus.SUCCESS,
+                detail=(
+                    f"{target} dropped so the stream cannot dead-letter out-of-order "
+                    "child rows (23503); re-created by the cut-over 'Apply foreign "
+                    "keys' step"
+                ),
+            )
+        except Exception:  # noqa: BLE001 - report per FK; never abort the whole pass
+            failed += 1
+            _log_cdc_event(
+                "foreign key not removed",
+                status=ActivityStatus.FAILURE,
+                detail=(
+                    f"{target} could not be dropped; remove it manually before "
+                    "starting CDC or the stream will dead-letter child rows (23503)"
+                ),
+            )
+    return (dropped, failed)
+
+
+def _cdc_fk_block_reason(blocking) -> tuple[str, str]:
+    """Return the (clause, header) naming what ACTUALLY blocked. Pure.
+
+    ``blocking`` is true for an unreadable catalog too (fail closed), and that is the
+    likeliest case in practice -- a transient DSQL connect blip. Claiming "the target
+    still has enforced foreign keys" then sends the operator to ``pg_constraint`` to find
+    nothing, instead of to the connection test, which is the real remedy.
+    """
+    if blocking.ours or blocking.foreign:
+        return (
+            "the target still has enforced foreign keys",
+            "Remove the target's foreign keys before streaming",
+        )
+    return (
+        "the target's foreign keys could not be verified",
+        "Could not verify the target's foreign keys",
+    )
+
+
+def _cdc_fk_block_body(blocking, *, can_remove_here: bool = True) -> str:
+    """Compose the CDC-start FK precondition message. Pure.
+
+    ``can_remove_here`` is False for the consumers that render no Remove control (the job
+    error and the activity log), so the copy does not point at a button that is not there.
+    """
+    parts: list[str] = []
+    if blocking.ours:
+        removal = (
+            "Remove them below"
+            if can_remove_here
+            else "Reopen Start CDC and use 'Remove foreign keys'"
+        )
+        parts.append(
+            "These foreign keys are enforced on the target and were created by this "
+            "migration: "
+            + ", ".join(f"{t}.{c}" for t, c in blocking.ours)
+            + f". {removal} — cut over re-creates them once the stream has drained."
+        )
+    if blocking.foreign:
+        parts.append(
+            "These enforced foreign keys are NOT accounted for by this migration, so "
+            "the tool will not remove them (it could not put them back): "
+            + ", ".join(f"{t}.{c}" for t, c in blocking.foreign)
+            + ". Drop them yourself before starting CDC."
+        )
+    if blocking.unknown_tables:
+        parts.append(
+            "The target's constraints could not be read for: "
+            + ", ".join(blocking.unknown_tables)
+            + ". Re-test the target connection and retry — CDC is blocked while this "
+            "is unknown, because an undetected foreign key silently discards rows."
+        )
+    parts.append(
+        "Why: the sink applies change records across several tasks with no "
+        "parent-before-child ordering, so a child row can arrive first, be rejected "
+        "with SQLSTATE 23503, and be dead-lettered permanently — the task keeps "
+        "running and offsets advance, so the loss is silent."
+    )
+    return " ".join(parts)
+
+
 def _cdc_target_region(ui, session):
     """Return (target_config, region) or notify + return (None, None) if missing."""
     target = getattr(session, "target_config", None)
@@ -3266,6 +3510,26 @@ def _start_cdc_deploy(
         # job's worker thread -- NEVER on the NiceGUI event loop. On Fargate one asyncio
         # loop serves every browser session, so a blocking call on it freezes them all;
         # the sibling _start_cdc_infra_deploy offloads for exactly this reason.
+        # BACKSTOP for the foreign-key precondition, re-checked on the worker thread
+        # right before anything is created. The Start dialog already blocks on this, but
+        # "Retry CDC" (_render_cdc_partial_actions) calls this job with NO dialog, and a
+        # cached dialog verdict can be stale. An enforced FK makes the sink dead-letter
+        # out-of-order child rows PERMANENTLY and SILENTLY (23503 is not retriable), so
+        # refuse rather than stream into data loss. Fails closed: an unreadable catalog
+        # counts as blocking.
+        fk_state = _probe_cdc_blocking_foreign_keys(
+            migration_state, session, inventory, watermark
+        )
+        if fk_state is not None and fk_state.blocking:
+            _detail = _cdc_fk_block_body(fk_state, can_remove_here=False)
+            _log_cdc_event(
+                "start blocked by target foreign keys",
+                status=ActivityStatus.FAILURE,
+                detail=_detail,
+            )
+            raise RuntimeError(
+                f"Start CDC blocked: {_cdc_fk_block_reason(fk_state)[0]}. " + _detail
+            )
         deployer = build_cdc_stack_deployer(
             region, aws_profile=aws_profile, assume_role_arn=assume_role_arn
         )

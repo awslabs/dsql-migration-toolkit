@@ -128,6 +128,7 @@ from dsql_migrator.ui.workflow import WorkflowStep, get_status, with_status
 # public import surface is unchanged.
 from dsql_migrator.ui.data_migration._full_load_engine import (
     MigratorFactory,
+    preserved_foreign_key_names,
     DataMigrationInputs,
     TableLoadResult,
     _as_load_result,
@@ -594,13 +595,36 @@ def build_data_migration_screen(
                 if session.source_config is not None
                 else SourceType.MYSQL
             )
+            _conversion = SchemaConverter(source_type=_stype).convert(inventory)
             _applied = applied_table_conversions(
-                SchemaConverter(source_type=_stype).convert(inventory),
+                _conversion,
                 conv_state.edited_target_ddls,
                 preserve_foreign_keys=conv_state.preserve_foreign_keys,
             )
             migration_state.set_cdc_message_key_columns(
                 composite_key_columns_for_cdc(inventory.tables, _applied)
+            )
+            # Which FK constraints THIS migration OWNS, for the CDC-start precondition:
+            # an enforced FK on the target dead-letters out-of-order child rows (23503),
+            # so it must be removed before streaming -- but only ours, which cut over
+            # then re-creates. Recomputed here (the only place conv_state is in scope).
+            #
+            # Ownership is deliberately computed with preserve_foreign_keys=TRUE, NOT the
+            # user's current toggle. Ownership is a fact about what this migration's
+            # conversion RENDERS; whether the user still wants them re-applied is a
+            # separate choice. Deriving it from the toggle created a dead end: an operator
+            # blocked here would go to Schema Conversion and untick "Preserve foreign
+            # keys" -- which blanks foreign_key_ddls, so the tool disowned the very FKs it
+            # had created, classified them as the user's, hid the Remove button, and left
+            # CDC blocked with no in-UI way out.
+            migration_state.set_cdc_preserved_foreign_keys(
+                preserved_foreign_key_names(
+                    applied_table_conversions(
+                        _conversion,
+                        conv_state.edited_target_ddls,
+                        preserve_foreign_keys=True,
+                    )
+                )
             )
 
         async def run_checks(mode: MigrationMode) -> None:

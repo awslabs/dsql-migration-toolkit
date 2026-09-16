@@ -166,3 +166,98 @@ def test_resume_point_without_coordinates_is_not_resumable() -> None:
 def test_module_import_does_not_require_python_mysql_replication() -> None:
     # The behind-a-flag stub must never import the optional binlog package.
     assert "pymysqlreplication" not in sys.modules
+
+
+# ---------------------------------------------------------------------------
+# CDC precondition: enforced target foreign keys (Full-load-only -> CDC bug)
+# ---------------------------------------------------------------------------
+
+
+def test_cdc_blocking_foreign_keys_classifies_ours_foreign_and_unknown() -> None:
+    """A Full-load-only run leaves FKs enforced; CDC must not stream until they are gone.
+
+    The sink applies change records across several tasks with no parent-before-child
+    ordering, so a child row can arrive first, be rejected with SQLSTATE 23503, and be
+    dead-lettered PERMANENTLY (23503 is not in the sink's transient set) while the task
+    keeps running and offsets advance -- silent data loss. Ownership decides what the
+    tool may remove: only what its own conversion renders (cut over re-creates those).
+    """
+    from dsql_migrator.core.cdc import cdc_blocking_foreign_keys
+
+    result = cdc_blocking_foreign_keys(
+        {
+            "orders": ["fk_orders_users"],          # ours -> safe to drop
+            "audit": ["fk_audit_handmade"],         # the user's -> must NOT be dropped
+            "products": [],                          # genuinely clean
+            "huge": None,                            # unreadable -> unknown
+        },
+        {"orders": ["fk_orders_users"], "audit": [], "products": ["fk_never_applied"]},
+    )
+    assert result.ours == [("orders", "fk_orders_users")]
+    assert result.foreign == [("audit", "fk_audit_handmade")]
+    assert result.unknown_tables == ["huge"]
+    assert result.blocking is True
+
+
+def test_cdc_blocking_foreign_keys_is_silent_when_the_target_has_none() -> None:
+    # The normal CDC-only case (no prior Full Load): nothing enforced -> no gate, no
+    # warning. Severity calibration: do not alarm the user for the expected state.
+    from dsql_migrator.core.cdc import cdc_blocking_foreign_keys
+
+    result = cdc_blocking_foreign_keys(
+        {"orders": [], "order_items": []},
+        {"orders": ["fk_orders_users"], "order_items": ["fk_items_orders"]},
+    )
+    assert result == ([], [], [])
+    assert result.blocking is False
+
+
+def test_cdc_blocking_foreign_keys_fails_closed_on_an_unreadable_catalog() -> None:
+    # None means "could not read", NOT "none exist". Reporting it as clean would open the
+    # gate on exactly the case the gate exists for, so unknown must block.
+    from dsql_migrator.core.cdc import cdc_blocking_foreign_keys
+
+    result = cdc_blocking_foreign_keys({"orders": None}, {"orders": ["fk_orders_users"]})
+    assert result.ours == [] and result.foreign == []
+    assert result.unknown_tables == ["orders"]
+    assert result.blocking is True
+
+
+def test_cdc_blocking_foreign_keys_matches_case_sensitively_per_table() -> None:
+    # The converter emits QUOTED identifiers, so target names keep the source's case;
+    # case-folding would mis-classify. And a name is only "ours" on ITS OWN table -- a
+    # user FK sharing a name on a different table must stay foreign.
+    from dsql_migrator.core.cdc import cdc_blocking_foreign_keys
+
+    result = cdc_blocking_foreign_keys(
+        {"Orders": ["FK_Orders_Users"], "other": ["fk_orders_users"]},
+        {"Orders": ["FK_Orders_Users"], "orders": ["fk_orders_users"]},
+    )
+    assert result.ours == [("Orders", "FK_Orders_Users")]
+    assert result.foreign == [("other", "fk_orders_users")]
+
+
+def test_cdc_blocking_foreign_keys_matches_a_name_truncated_to_63_bytes() -> None:
+    """PostgreSQL/DSQL truncate identifiers to 63 bytes (NAMEDATALEN).
+
+    A long source FK name is stored TRUNCATED in pg_constraint while the rendered DDL
+    carries it in full, so a naive equality check disowns the tool's OWN constraint --
+    and because the tool refuses to drop what it does not own, CDC would be blocked with
+    no way out from the UI.
+    """
+    from dsql_migrator.core.cdc import cdc_blocking_foreign_keys
+
+    long_name = "fk_" + ("x" * 70)          # 73 chars, as rendered in the DDL
+    stored = long_name[:63]                  # what the catalog actually holds
+
+    result = cdc_blocking_foreign_keys({"orders": [stored]}, {"orders": [long_name]})
+    assert result.ours == [("orders", stored)]
+    assert result.foreign == []
+
+    # A DIFFERENT long name that merely shares the first 63 bytes is still ours only if
+    # the truncation genuinely matches -- an unrelated constraint stays foreign.
+    unrelated = cdc_blocking_foreign_keys(
+        {"orders": ["fk_someone_elses_constraint"]}, {"orders": [long_name]}
+    )
+    assert unrelated.foreign == [("orders", "fk_someone_elses_constraint")]
+    assert unrelated.ours == []

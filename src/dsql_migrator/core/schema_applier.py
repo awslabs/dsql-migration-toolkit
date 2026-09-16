@@ -799,6 +799,50 @@ def validate_foreign_key(
     )
 
 
+def drop_foreign_key(
+    table_name: str,
+    constraint_name: str,
+    *,
+    connection_factory: ConnectionFactory,
+    occ_max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    occ_base_delay: float = DEFAULT_BASE_DELAY_SECONDS,
+    sleep: SleepFunc = time.sleep,
+    jitter: JitterFunc = random.random,
+) -> None:
+    """Drop one enforced foreign key so CDC can stream without 23503 dead-letters.
+
+    The inverse of :func:`apply_foreign_key`, needed because an enforced FK and a live
+    CDC stream are mutually exclusive: the sink applies change records across several
+    tasks with NO parent-before-child ordering, so a child row can arrive first and be
+    rejected with SQLSTATE 23503 -- which the sink treats as a poison row and
+    dead-letters permanently (no retry, offsets advance, task survives => silent data
+    loss). A preceding ``Full load only`` run leaves FKs applied AND validated, so a
+    session that then switches to CDC has to remove them before streaming; cut over
+    re-creates them with :func:`apply_foreign_key` once the stream has drained.
+
+    Runs as its own single autocommit DDL (DSQL allows one DDL per transaction) with
+    OCC (40001) retry and a connection-level transient reconnect, exactly like its
+    inverse. ``IF EXISTS`` makes it idempotent, so a reconnect that replays an
+    already-committed drop does not raise ``undefined_object``. Identifiers are
+    composed injection-safely. Live-verified against Aurora DSQL, which accepts
+    ``ALTER TABLE ... DROP CONSTRAINT IF EXISTS``.
+    """
+    from dsql_migrator.core.validation_sql import _pg_table_identifier
+
+    ddl = sql.SQL("ALTER TABLE {tbl} DROP CONSTRAINT IF EXISTS {name}").format(
+        tbl=_pg_table_identifier(table_name),
+        name=sql.Identifier(constraint_name),
+    )
+    _run_ddls_reconnecting(
+        connection_factory,
+        [ddl],
+        occ_max_attempts=occ_max_attempts,
+        occ_base_delay=occ_base_delay,
+        sleep=sleep,
+        jitter=jitter,
+    )
+
+
 def _is_dependent_objects_error(exc: BaseException) -> bool:
     """Return ``True`` if a DROP failed because another object depends on the target.
 
