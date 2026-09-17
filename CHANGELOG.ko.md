@@ -5,6 +5,32 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.446
+
+### 수정 (Fixed)
+
+- **적재 후 외래 키 패스가 `CREATE INDEX ASYNC`와 경합해 복합 프라이머리 키 부모를 참조하는 외래 키를
+  조용히 놓치던 문제 수정.** Full Load가 **재생성**해야 하는 테이블(복합 PK 리키가 대표적)은 보조
+  인덱스를 적재 **후에** `CREATE INDEX ASYNC`로 만드는데, 이 문장은 DSQL이 백그라운드에서 빌드하는 동안
+  즉시 반환합니다. FK 패스는 몇 초 뒤에 실행되면서 전혀 기다리지 않았기 때문에, 부모의 단일 컬럼
+  유일성이 그 async 인덱스에만 의존하는 FK는 `SQLSTATE 42830`(*there is no unique constraint matching
+  given keys for referenced table*)으로 실패했습니다. 경합이라 같은 절차가 어떤 실행에서는 통과하고 다음
+  실행에서는 FK를 잃었습니다(관측: `6 applied, 0 failed` → `5 applied, 1 failed`, 마지막 테이블 적재와
+  실패 사이 5.3초). 데이터 손실은 없지만 참조 무결성이 빠진 채 마이그레이션이 "성공"으로 끝났습니다.
+  이제 제약을 추가하기 전에 참조 대상 UNIQUE 인덱스가 valid가 될 때까지 기다립니다.
+  - DSQL은 필요한 인덱스가 **없을 때**와 **아직 빌드 중일 때** 동일한 42830을 던지므로,
+    `pg_index.indisvalid`로 둘을 구별합니다(새 `unique_index_state()`, 라이브 검증: 빌드 중에는
+    `indisvalid=false`, 완료되면 true). **building**은 대기(테이블 크기에 비례하므로 넉넉하되 상한 있음),
+    **absent**는 대기가 무의미하므로 즉시 반환, 빌드가 멈춘 경우 상한에서 포기해 실행을 매달아 두지 않습니다.
+- **적용하지 못한 외래 키의 이유를 남깁니다.** 운영자가 내려받아 런북에 붙이는 산출물인 활동 로그에는
+  "could not be created automatically; apply it manually"라는 고정 문구만 있었고, 실제 예외는 모듈 로거로만
+  갔습니다(CloudWatch에도 경고 한 줄뿐, 드라이버 메시지 없음). 이제 SQLSTATE, 드라이버 메시지, 운영자
+  관점의 원인(인덱스 빌드 중 vs 유일 인덱스 자체가 없음), 그리고 다시 실행할 `ALTER TABLE … ADD
+  CONSTRAINT` 문장을 그대로 담습니다.
+- **외래 키가 빠졌는데 `run completed`가 깔끔한 SUCCESS로 읽히던 문제 수정.** 요약에 "N table(s) loaded"만
+  있어서 그 줄만 보는 사람은 누락을 놓쳤습니다(이 실패가 참가자 실수로 오해된 경로). 이제 실패가 있으면
+  "N foreign key(s) NOT applied"를 덧붙이고, 정상 실행의 문구는 그대로 유지합니다.
+
 ## v0.1.445
 
 ### 수정 (Fixed)

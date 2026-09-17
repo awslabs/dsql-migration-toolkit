@@ -672,6 +672,82 @@ def target_foreign_keys(
     return result
 
 
+def unique_index_state(
+    table_name: str,
+    columns: Sequence[str],
+    *,
+    connection_factory: Callable[[], Any],
+) -> Optional[str]:
+    """Return ``"valid"`` / ``"building"`` / ``"absent"`` for a unique index on ``columns``.
+
+    Why this exists: an ``ADD CONSTRAINT ... FOREIGN KEY`` needs a UNIQUE index covering
+    exactly the referenced columns, and DSQL raises the SAME error (SQLSTATE 42830,
+    ``there is no unique constraint matching given keys for referenced table``) whether
+    that index is MISSING or merely still BUILDING. The distinction decides what to do:
+
+    * ``building`` -- the post-load ``CREATE INDEX ASYNC`` has not finished, so the ADD
+      will succeed shortly. WAIT. (Live-verified on DSQL: right after
+      ``CREATE UNIQUE INDEX ASYNC`` the index row exists with ``indisvalid = false`` and
+      the ADD fails 42830; once ``indisvalid`` flips true the same ADD succeeds.)
+    * ``absent`` -- no such index at all, so waiting is pointless. Fail fast with an
+      actionable message.
+    * ``valid`` -- ready; a 42830 then means something else is wrong.
+
+    ``None`` means the catalog could not be read (unknown) -- callers must not treat that
+    as ``absent``. Column ORDER need not match: a unique index on the same SET of key
+    columns satisfies the foreign key.
+    """
+    wanted = [str(c) for c in columns]
+    if not wanted:
+        return None
+    try:
+        connection = connection_factory()
+    except Exception:  # noqa: BLE001 - cannot connect -> unknown, never "absent"
+        return None
+    parts = table_name.split(".", 1)
+    if len(parts) == 2:
+        where_relation = "n.nspname = %(schema)s AND t.relname = %(table)s"
+        params: dict[str, object] = {"schema": parts[0], "table": parts[1]}
+    else:
+        # Bare name: resolve across every USER schema rather than via the connection's
+        # search_path (the default '"$user", public', which would miss the target).
+        where_relation = "t.relname = %(table)s AND n.nspname <> ALL(%(system)s)"
+        params = {"table": parts[0], "system": list(SYSTEM_SCHEMAS)}
+    statement = (
+        "SELECT i.relname, ix.indisvalid, "
+        "  ARRAY(SELECT a.attname FROM pg_catalog.pg_attribute a "
+        "        JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) "
+        "          ON a.attnum = k.attnum "
+        "        WHERE a.attrelid = t.oid AND k.ord <= ix.indnkeyatts "
+        "        ORDER BY k.ord) AS key_columns "
+        "FROM pg_catalog.pg_index ix "
+        "JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid "
+        "JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace "
+        f"WHERE ix.indisunique AND {where_relation}"
+    )
+    cursor = None
+    try:
+        cursor = connection.cursor()
+        cursor.execute(statement, params)
+        rows = cursor.fetchall()
+    except Exception:  # noqa: BLE001 - unreadable catalog -> unknown
+        return None
+    finally:
+        if cursor is not None:
+            _safe_close(cursor)
+        _safe_close(connection)
+    building = False
+    for row in rows or ():
+        key_columns = [str(c) for c in (row[2] or ())]
+        if set(key_columns) != set(wanted):
+            continue
+        if row[1]:
+            return "valid"
+        building = True
+    return "building" if building else "absent"
+
+
 def target_required_columns_without_default(
     table_name: str,
     *,
@@ -969,6 +1045,7 @@ __all__ = [
     "target_primary_key_columns",
     "target_primary_keys",
     "target_foreign_keys",
+    "unique_index_state",
     "SYSTEM_SCHEMAS",
     "RELATIONS_QUERY",
     "COLUMNS_QUERY",

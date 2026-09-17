@@ -1269,3 +1269,102 @@ def test_target_foreign_keys_fails_closed_on_connect_and_query_failure() -> None
     broken = _FkConnection(by_table={}, raises=True)
     assert target_foreign_keys(["a"], connection_factory=lambda: broken) == {"a": None}
     assert broken.closed is True
+
+
+# ---------------------------------------------------------------------------
+# unique_index_state: "still building" vs "absent" (FK post-pass race)
+# ---------------------------------------------------------------------------
+
+
+class _IdxConnection:
+    """Connection double returning (index_name, indisvalid, key_columns) rows."""
+
+    def __init__(self, *, rows: list, raises: bool = False) -> None:
+        self.rows = rows
+        self.raises = raises
+        self.executed: list[tuple] = []
+        self.closed = False
+
+    def cursor(self) -> "_IdxCursor":
+        return _IdxCursor(self)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _IdxCursor:
+    def __init__(self, connection: _IdxConnection) -> None:
+        self._connection = connection
+
+    def execute(self, statement: str, params: dict | None = None) -> None:
+        self._connection.executed.append((statement, params))
+        if self._connection.raises:
+            raise RuntimeError("catalog unreadable")
+
+    def fetchall(self) -> list:
+        return self._connection.rows
+
+    def close(self) -> None:
+        return None
+
+
+def test_unique_index_state_distinguishes_building_from_absent() -> None:
+    """THE distinction the FK post-pass was missing.
+
+    A table Full Load RECREATED gets its secondary indexes only after the load, as
+    ``CREATE INDEX ASYNC`` (returns immediately, builds in the background). DSQL raises the
+    SAME SQLSTATE 42830 ("no unique constraint matching given keys") whether the required
+    unique index is MISSING or merely still BUILDING, so the pass could not tell "wait" from
+    "give up" -- and it waited for neither, silently dropping the FK on a composite-PK
+    parent. Live-verified: indisvalid is false while building, true once ready.
+    """
+    from dsql_migrator.core.target_introspector import unique_index_state
+
+    building = _IdxConnection(rows=[("ux_orders_id", False, ["id"])])
+    assert unique_index_state(
+        "ecommerce.orders", ["id"], connection_factory=lambda: building
+    ) == "building"
+
+    ready = _IdxConnection(rows=[("ux_orders_id", True, ["id"])])
+    assert unique_index_state(
+        "ecommerce.orders", ["id"], connection_factory=lambda: ready
+    ) == "valid"
+
+    # The composite PK exists but covers (user_id, id) -- it does NOT give `id` alone the
+    # uniqueness the child FK needs, so this is "absent", not "valid".
+    composite_only = _IdxConnection(rows=[("orders_pkey", True, ["user_id", "id"])])
+    assert unique_index_state(
+        "ecommerce.orders", ["id"], connection_factory=lambda: composite_only
+    ) == "absent"
+
+    # A valid index wins over a stale building duplicate on the same columns.
+    both = _IdxConnection(
+        rows=[("ux_old", False, ["id"]), ("ux_new", True, ["id"])]
+    )
+    assert unique_index_state(
+        "ecommerce.orders", ["id"], connection_factory=lambda: both
+    ) == "valid"
+
+
+def test_unique_index_state_is_column_order_insensitive_and_fails_soft() -> None:
+    # A unique index on the same SET of key columns satisfies the FK regardless of order.
+    from dsql_migrator.core.target_introspector import unique_index_state
+
+    conn = _IdxConnection(rows=[("orders_pkey", True, ["user_id", "id"])])
+    assert unique_index_state(
+        "ecommerce.orders", ["id", "user_id"], connection_factory=lambda: conn
+    ) == "valid"
+
+    # Unreadable catalog / no connection -> None (unknown), never "absent": callers must
+    # not conclude "there is no index" from a failed read.
+    broken = _IdxConnection(rows=[], raises=True)
+    assert unique_index_state(
+        "t", ["id"], connection_factory=lambda: broken
+    ) is None
+
+    def _no_connection():
+        raise RuntimeError("connect failed")
+
+    assert unique_index_state("t", ["id"], connection_factory=_no_connection) is None
+    # No columns to check is meaningless -> unknown, not a false "absent".
+    assert unique_index_state("t", [], connection_factory=lambda: conn) is None

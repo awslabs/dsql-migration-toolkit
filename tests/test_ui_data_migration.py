@@ -18335,3 +18335,246 @@ def test_fk_ownership_is_independent_of_the_preserve_foreign_keys_toggle() -> No
     src = inspect.getsource(_dm.build_data_migration_screen)
     assert "set_cdc_preserved_foreign_keys" in src
     assert "preserve_foreign_keys=True" in src
+
+
+# ---------------------------------------------------------------------------
+# FK post-pass vs CREATE INDEX ASYNC race (composite-PK parent)
+# ---------------------------------------------------------------------------
+
+
+def test_fk_pass_waits_while_the_referenced_unique_index_is_still_building(
+    monkeypatch,
+) -> None:
+    """The race: the FK post-pass ran seconds after CREATE INDEX ASYNC and did not wait.
+
+    A composite-PK re-key makes Full Load RECREATE the parent, so its single-column unique
+    index (the only thing giving `id` alone the uniqueness a child FK needs) is built AFTER
+    the load by `CREATE INDEX ASYNC`, which returns immediately. The FK pass then failed
+    42830 and the run still reported SUCCESS with integrity silently missing -- and being a
+    race, the same procedure passed on one run and dropped an FK on the next.
+    """
+    from dsql_migrator.core.models import ForeignKeyDef
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    states = ["building", "building", "valid"]
+    asked: list = []
+
+    def _fake_state(table_name, columns, *, connection_factory):  # noqa: ANN001
+        asked.append((table_name, list(columns)))
+        return states[min(len(asked) - 1, len(states) - 1)]
+
+    monkeypatch.setattr(
+        "dsql_migrator.core.target_introspector.unique_index_state", _fake_state
+    )
+    slept: list = []
+    fk = ForeignKeyDef(
+        name="fk_order_items_orders", columns=["order_id"],
+        referenced_table="ecommerce.orders", referenced_columns=["id"],
+    )
+
+    state = _engine._wait_for_referenced_unique_index(
+        fk, lambda: object(),
+        sleep=slept.append, monotonic=lambda: 0.0,   # budget never expires
+    )
+    assert state == "valid"
+    assert len(asked) == 3            # polled until the async build finished
+    assert len(slept) == 2            # waited between polls
+    assert asked[0] == ("ecommerce.orders", ["id"])
+
+
+def test_fk_pass_does_not_wait_when_the_unique_index_is_absent(monkeypatch) -> None:
+    # "absent" means waiting is pointless (no CREATE INDEX ASYNC is in flight), so it must
+    # return at once and let the ADD fail with an actionable reason -- not burn the budget.
+    from dsql_migrator.core.models import ForeignKeyDef
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    calls = {"n": 0}
+
+    def _absent(table_name, columns, *, connection_factory):  # noqa: ANN001
+        calls["n"] += 1
+        return "absent"
+
+    monkeypatch.setattr(
+        "dsql_migrator.core.target_introspector.unique_index_state", _absent
+    )
+    slept: list = []
+    fk = ForeignKeyDef(
+        name="fk", columns=["pid"], referenced_table="parent", referenced_columns=["id"],
+    )
+    assert _engine._wait_for_referenced_unique_index(
+        fk, lambda: object(), sleep=slept.append, monotonic=lambda: 0.0
+    ) == "absent"
+    assert calls["n"] == 1
+    assert slept == []
+
+
+def test_fk_pass_wait_is_bounded_so_a_stuck_build_cannot_hang_the_run(
+    monkeypatch,
+) -> None:
+    # Always-building must give up at the budget rather than spin forever.
+    from dsql_migrator.core.models import ForeignKeyDef
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    monkeypatch.setattr(
+        "dsql_migrator.core.target_introspector.unique_index_state",
+        lambda *a, **k: "building",
+    )
+    clock = {"t": 0.0}
+
+    def _monotonic() -> float:
+        return clock["t"]
+
+    def _sleep(seconds: float) -> None:
+        clock["t"] += seconds
+
+    fk = ForeignKeyDef(
+        name="fk", columns=["pid"], referenced_table="parent", referenced_columns=["id"],
+    )
+    state = _engine._wait_for_referenced_unique_index(
+        fk, lambda: object(), budget_seconds=10.0, poll_seconds=2.0,
+        sleep=_sleep, monotonic=_monotonic,
+    )
+    assert state == "building"          # gave up, did not hang
+    assert clock["t"] >= 10.0
+
+
+def test_fk_failure_detail_records_the_real_reason_and_the_statement() -> None:
+    """The old detail was the fixed string "could not be created automatically".
+
+    The exception went only to the module logger, so the activity log -- the artifact an
+    operator downloads and pastes into a runbook -- recorded NO reason, and there was no way
+    to know what to apply manually. CloudWatch showed only the one-line warning.
+    """
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    class _Err(Exception):
+        sqlstate = "42830"
+
+    exc = _Err("there is no unique constraint matching given keys for referenced table")
+    ddl = (
+        'ALTER TABLE "ecommerce"."order_items" ADD CONSTRAINT "fk_order_items_orders" '
+        'FOREIGN KEY ("order_id") REFERENCES "ecommerce"."orders" ("id") NOT VALID'
+    )
+
+    still_building = _engine._fk_failure_detail(exc, ddl, "building")
+    assert "42830" in still_building
+    assert "CREATE INDEX ASYNC" in still_building          # names the actual cause
+    assert "ADD CONSTRAINT" in still_building              # copy-pasteable statement
+
+    absent = _engine._fk_failure_detail(exc, ddl, "absent")
+    assert "no UNIQUE index" in absent
+    assert "create one first" in absent
+    assert "42830" in absent
+
+    other = _engine._fk_failure_detail(RuntimeError("boom"), ddl, None)
+    assert "boom" in other
+    assert "SQLSTATE=unknown" in other
+    assert "ADD CONSTRAINT" in other
+
+
+def test_apply_foreign_keys_returns_the_failed_count_for_the_run_summary(
+    monkeypatch,
+) -> None:
+    # The count has to leave this function so `run completed` can say integrity is
+    # incomplete: the pass logs its own FAILURE line, but a reader who only scans the
+    # summary saw "N table(s) loaded / SUCCESS" and missed the missing constraint.
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: None)
+
+    class _Partial:
+        def apply_foreign_keys(self):
+            return (5, 0, 1)          # the workshop's real outcome
+
+    assert engine._apply_foreign_keys(_Partial()) == 1
+
+    class _Clean:
+        def apply_foreign_keys(self):
+            return (6, 0, 0)
+
+    assert engine._apply_foreign_keys(_Clean()) == 0
+
+    # Tolerated shapes must not blow up the run, and report nothing missing.
+    class _Legacy:
+        def apply_foreign_keys(self):
+            return None
+
+    assert engine._apply_foreign_keys(_Legacy()) == 0
+    assert engine._apply_foreign_keys(object()) == 0   # no hook at all
+
+
+def test_run_completed_names_foreign_keys_that_were_not_applied(monkeypatch) -> None:
+    """`run completed` used to read SUCCESS / "7 table(s) loaded" with an FK missing.
+
+    That is how a workshop participant saw `5 applied, 1 failed` and assumed their own
+    mistake: the summary line said nothing was wrong.
+    """
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    events: list = []
+    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: events.append((a, k)))
+
+    class _Handle:
+        cancelled = False
+
+    counts = engine._RunCounts(real_failed=0, quarantined=0)
+
+    engine._finalize_run(
+        _Handle(), "job-1", ["a", "b"], counts, object(),
+        accept_quarantined_rows=False, foreign_keys_failed=1,
+    )
+    detail = [k.get("detail", "") for _a, k in events if "run completed" in str(_a)]
+    assert detail and "2 table(s) loaded" in detail[0]
+    assert "1 foreign key(s) NOT applied" in detail[0]
+
+    # A clean run keeps the original wording exactly (no noise).
+    events.clear()
+    engine._finalize_run(
+        _Handle(), "job-1", ["a", "b"], counts, object(),
+        accept_quarantined_rows=False,
+    )
+    detail = [k.get("detail", "") for _a, k in events if "run completed" in str(_a)]
+    assert detail == ["2 table(s) loaded"]
+
+
+def test_apply_preserved_fk_logs_the_real_reason_end_to_end(monkeypatch) -> None:
+    """Pins the WIRING, not just the helper: the activity log must carry the reason.
+
+    A helper-only test let a revert to the old fixed string ("could not be created
+    automatically; apply it manually") pass green, which is exactly the regression this
+    guards -- the activity log is the artifact an operator pastes into a runbook, and the
+    exception used to go only to the module logger.
+    """
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    class _NoUniqueIndex(Exception):
+        sqlstate = "42830"
+
+    def _boom(add_ddl, *, connection_factory):  # noqa: ANN001
+        raise _NoUniqueIndex(
+            "there is no unique constraint matching given keys for referenced table"
+        )
+
+    monkeypatch.setattr(engine, "apply_foreign_key", _boom)
+    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+    # The referenced unique index simply is not there -> no waiting, actionable reason.
+    monkeypatch.setattr(
+        "dsql_migrator.core.target_introspector.unique_index_state",
+        lambda *a, **k: "absent",
+    )
+    events: list = []
+    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: events.append((a, k)))
+
+    result = engine.apply_preserved_foreign_keys(
+        {"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])}, lambda: _FkProbeConnection(0)
+    )
+    assert result == (0, 0, 1)
+
+    details = [k.get("detail", "") for _a, k in events if "not applied" in str(_a)]
+    assert details, events
+    detail = details[0]
+    assert "42830" in detail                       # the SQLSTATE
+    assert "no unique constraint matching" in detail  # the driver's own message
+    assert "no UNIQUE index" in detail              # why, in operator terms
+    assert "ADD CONSTRAINT" in detail               # the statement to run
+    assert detail != "could not be created automatically; apply it manually"

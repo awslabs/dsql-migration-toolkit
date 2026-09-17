@@ -2333,6 +2333,7 @@ def _finalize_run(
     accept_quarantined_rows: bool,
     inputs: "Optional[DataMigrationInputs]" = None,
     sync_sequences: "Optional[Callable[..., dict]]" = None,
+    foreign_keys_failed: int = 0,
 ) -> None:
     """Log the run outcome and raise :class:`FullLoadIncompleteError` unless complete.
 
@@ -2352,7 +2353,18 @@ def _finalize_run(
                 ActivityCategory.FULL_LOAD,
                 "run completed",
                 status=ActivityStatus.SUCCESS,
-                detail=f"{len(table_names)} table(s) loaded",
+                detail=(
+                    f"{len(table_names)} table(s) loaded"
+                    # Referential integrity is part of the outcome: the FK pass logs its
+                    # own FAILURE line, but a reader who only scans the summary used to
+                    # see a clean SUCCESS and miss that a constraint is missing.
+                    + (
+                        f"; {foreign_keys_failed} foreign key(s) NOT applied "
+                        "(see the foreign-key entries above)"
+                        if foreign_keys_failed
+                        else ""
+                    )
+                ),
             )
             # Sync the identity sequence off the loaded MAX(pk). Safe here because the
             # load is COMPLETE: a PARTIAL load (a real failure leaves a gap that a later
@@ -2492,8 +2504,12 @@ def _recreate_dependent_views(migrator: DataMigrator) -> None:
             _LOGGER.warning("Dependent-view recreate pass failed", exc_info=True)
 
 
-def _apply_foreign_keys(migrator: DataMigrator) -> None:
-    """Call the migrator's post-load foreign-key apply, if it supports one (else no-op).
+def _apply_foreign_keys(migrator: DataMigrator) -> int:
+    """Call the migrator's post-load foreign-key apply; return how many FKs FAILED.
+
+    The count is returned (not just logged) so ``run completed`` can say that referential
+    integrity is incomplete: the pass already logs its own FAILURE line, but a reader who
+    only scans the summary saw "N table(s) loaded / SUCCESS" and missed the missing FK.
 
     Best-effort run-level post-pass, mirroring :func:`_recreate_dependent_views`:
     Aurora DSQL enforces foreign keys, but they must be added AFTER the concurrent
@@ -2505,12 +2521,12 @@ def _apply_foreign_keys(migrator: DataMigrator) -> None:
     """
     hook = getattr(migrator, "apply_foreign_keys", None)
     if not callable(hook):
-        return
+        return 0
     try:
         counts = hook()
     except Exception:  # noqa: BLE001 - optional post-pass; never fail the run
         _LOGGER.warning("Foreign-key apply pass failed", exc_info=True)
-        return
+        return 0
     # Surface the post-load FK pass as a NAMED step in the activity log (the
     # migration's visible audit trail), mirroring the CDC cut-over "Apply foreign
     # keys" action, so a Full-Load-only run shows the foreign keys being (re)created
@@ -2519,7 +2535,7 @@ def _apply_foreign_keys(migrator: DataMigrator) -> None:
     # CDC run that defers them to cut over, returns (0, 0, 0) -> no noise. A hook that
     # returns nothing (older/test double) is tolerated (no summary line).
     if not isinstance(counts, tuple) or len(counts) != 3:
-        return
+        return 0
     applied, skipped, failed = counts
     if applied or skipped or failed:
         log_activity(
@@ -2531,6 +2547,7 @@ def _apply_foreign_keys(migrator: DataMigrator) -> None:
                 f"{skipped} skipped (orphaned rows), {failed} failed."
             ),
         )
+    return int(failed or 0)
 
 
 def _log_excluded_lob_columns(
@@ -2690,13 +2707,14 @@ def run_full_load(
     _predrop_dependent_views(migrator)
     counts = _migrate_tables_in_parallel(handle, job_id, tables, migrator, error_log)
     _recreate_dependent_views(migrator)
-    _apply_foreign_keys(migrator)
+    _fk_failed = _apply_foreign_keys(migrator)
     _finalize_run(
         handle,
         job_id,
         table_names,
         counts,
         error_log,
+        foreign_keys_failed=_fk_failed,
         accept_quarantined_rows=accept_quarantined_rows,
         inputs=inputs,
     )
@@ -2779,13 +2797,14 @@ def run_full_load_retry(
         handle, job_id, tables_to_retry, migrator, error_log
     )
     _recreate_dependent_views(migrator)
-    _apply_foreign_keys(migrator)
+    _fk_failed = _apply_foreign_keys(migrator)
     _finalize_run(
         handle,
         job_id,
         list(retry_names),
         counts,
         error_log,
+        foreign_keys_failed=_fk_failed,
         accept_quarantined_rows=accept_quarantined_rows,
         inputs=inputs,
     )
@@ -3822,7 +3841,15 @@ def apply_preserved_foreign_keys(
                     ),
                 )
                 continue
+            index_state: Optional[str] = None
             try:
+                # A table Full Load RECREATED gets its secondary indexes only after the
+                # load, via CREATE INDEX ASYNC (returns immediately, builds in the
+                # background). If this FK's parent gets its uniqueness from one of those,
+                # adding the constraint now races the build and fails 42830 -- so wait for
+                # the index to become valid first. "absent" returns at once (waiting would
+                # be pointless) and the ADD then fails with an actionable reason.
+                index_state = _wait_for_referenced_unique_index(fk, connection_factory)
                 # DSQL only accepts ADD CONSTRAINT ... NOT VALID (renders that way);
                 # it enforces every NEW write immediately.
                 apply_foreign_key(add_ddl, connection_factory=connection_factory)
@@ -3843,7 +3870,7 @@ def apply_preserved_foreign_keys(
                             target, exc_info=True,
                         )
                 applied += 1
-            except Exception:  # noqa: BLE001 - non-blocking: the data is already loaded
+            except Exception as exc:  # noqa: BLE001 - non-blocking: data is already loaded
                 failed += 1
                 _LOGGER.warning("Could not apply FK %s", target, exc_info=True)
                 log_activity(
@@ -3851,7 +3878,7 @@ def apply_preserved_foreign_keys(
                     "foreign key not applied",
                     status=ActivityStatus.FAILURE,
                     target=target,
-                    detail="could not be created automatically; apply it manually",
+                    detail=_fk_failure_detail(exc, add_ddl, index_state),
                 )
     finally:
         try:
@@ -3901,6 +3928,91 @@ _FK_CONSTRAINT_NAME_RE = re.compile(
     r'ADD\s+CONSTRAINT\s+("(?:[^"]|"")+"|[^\s("]+)\s+FOREIGN\s+KEY',
     re.IGNORECASE,
 )
+
+
+# SQLSTATE 42830 (invalid_foreign_key): "there is no unique constraint matching given
+# keys for referenced table". DSQL raises the SAME code whether the required unique index
+# is MISSING or merely still BUILDING, so it is only retryable in the second case --
+# distinguished via pg_index.indisvalid (see unique_index_state).
+_NO_MATCHING_UNIQUE_SQLSTATE = "42830"
+
+# How long to wait for a post-load ``CREATE INDEX ASYNC`` to become valid before giving up
+# on the FK that needs it. Generous because the build scales with the table: a composite-PK
+# parent's single-column unique index on a large table can take a while. Bounded so a
+# genuinely broken schema cannot hang the run (and "absent" fails immediately anyway).
+_INDEX_WAIT_BUDGET_SECONDS = 300.0
+_INDEX_WAIT_POLL_SECONDS = 2.0
+
+
+def _wait_for_referenced_unique_index(
+    fk: "Optional[ForeignKeyDef]",
+    connection_factory: Callable[[], Any],
+    *,
+    budget_seconds: float = _INDEX_WAIT_BUDGET_SECONDS,
+    poll_seconds: float = _INDEX_WAIT_POLL_SECONDS,
+    sleep: Callable[[float], None] = _time.sleep,
+    monotonic: Callable[[], float] = _time.monotonic,
+) -> Optional[str]:
+    """Wait while the FK's referenced unique index is still building. Returns its state.
+
+    THE RACE this closes: a table Full Load had to RECREATE (e.g. a composite-PK re-key)
+    gets its secondary indexes only AFTER the load, as ``CREATE INDEX ASYNC`` -- which
+    returns immediately while DSQL builds in the background. The FK post-pass then runs
+    within seconds, and an FK whose parent's single-column uniqueness comes ONLY from one
+    of those async indexes fails 42830. Nothing waited for the index, so the migration
+    finished "successfully" with referential integrity silently missing -- and being a
+    race, the same procedure could pass on one run and drop an FK on the next.
+
+    Returns ``"valid"`` (safe to add), ``"absent"`` (waiting is pointless -- fail fast),
+    ``"building"`` (still not ready when the budget ran out), or ``None`` (catalog
+    unreadable). Only ``building`` consumes the budget.
+    """
+    if fk is None or not fk.referenced_columns:
+        return None
+    from dsql_migrator.core.target_introspector import unique_index_state
+
+    deadline = monotonic() + max(0.0, budget_seconds)
+    state = unique_index_state(
+        fk.referenced_table, fk.referenced_columns,
+        connection_factory=connection_factory,
+    )
+    while state == "building" and monotonic() < deadline:
+        sleep(poll_seconds)
+        state = unique_index_state(
+            fk.referenced_table, fk.referenced_columns,
+            connection_factory=connection_factory,
+        )
+    return state
+
+
+def _fk_failure_detail(exc: BaseException, add_ddl: object, index_state: Optional[str]) -> str:
+    """Compose an ACTIONABLE activity-log detail for an FK that could not be applied.
+
+    The old copy was the fixed string "could not be created automatically; apply it
+    manually", with the real exception going only to the module logger -- so the activity
+    log (the artifact an operator downloads and pastes into a runbook) recorded no reason,
+    and there was no way to know WHAT to apply manually. This records the SQLSTATE, the
+    driver's own message, why it happened when we can tell, and the exact statement to run.
+    """
+    sqlstate = _error_code(exc)
+    message = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+    if sqlstate == _NO_MATCHING_UNIQUE_SQLSTATE and index_state == "building":
+        cause = (
+            "the referenced table's UNIQUE index was still being built "
+            "(CREATE INDEX ASYNC) after the wait budget; re-run this statement once it "
+            "is valid"
+        )
+    elif sqlstate == _NO_MATCHING_UNIQUE_SQLSTATE and index_state == "absent":
+        cause = (
+            "the referenced table has no UNIQUE index on the referenced column(s), so "
+            "DSQL cannot enforce this foreign key; create one first"
+        )
+    else:
+        cause = "apply it manually"
+    statement = add_ddl if isinstance(add_ddl, str) else str(add_ddl)
+    return (
+        f"{cause}. SQLSTATE={sqlstate or 'unknown'}: {message}. Statement: {statement}"
+    )
 
 
 def _constraint_name_from_ddl(add_ddl: object) -> Optional[str]:

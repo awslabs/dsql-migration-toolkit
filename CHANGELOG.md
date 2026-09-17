@@ -5,6 +5,40 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.446
+
+### Fixed
+
+- **The post-load foreign-key pass raced `CREATE INDEX ASYNC` and silently dropped the
+  foreign key on a composite-primary-key parent.** A table Full Load has to RECREATE (a
+  composite-PK re-key is the common reason) gets its secondary indexes only AFTER the
+  load, as `CREATE INDEX ASYNC` — which returns immediately while DSQL builds in the
+  background. The FK pass ran seconds later and never waited, so an FK whose parent's
+  single-column uniqueness comes ONLY from one of those async indexes failed with
+  `SQLSTATE 42830` (*there is no unique constraint matching given keys for referenced
+  table*). Being a race the same procedure could pass on one run and lose an FK on the
+  next (observed: `6 applied, 0 failed` then `5 applied, 1 failed` with 5.3s between the
+  last table load and the failure). No data was lost, but the migration finished
+  "successfully" with referential integrity missing. The pass now waits for the referenced
+  UNIQUE index to become valid before adding the constraint.
+  - DSQL raises the SAME 42830 whether the required index is MISSING or merely still
+    BUILDING, so the fix distinguishes them via `pg_index.indisvalid` (new
+    `unique_index_state()`, live-verified: `indisvalid` is false while building and flips
+    true when ready). **building** waits (bounded, generous — the build scales with the
+    table); **absent** returns immediately because waiting is pointless; a stuck build
+    gives up at the budget rather than hanging the run.
+- **A foreign key that could not be applied now says WHY.** The activity log — the artifact
+  an operator downloads and pastes into a runbook — recorded only the fixed string "could
+  not be created automatically; apply it manually", while the real exception went solely to
+  the module logger (CloudWatch showed one bare warning line, no driver message). The entry
+  now carries the SQLSTATE, the driver's own message, the cause in operator terms (index
+  still building vs no unique index at all), and the exact `ALTER TABLE … ADD CONSTRAINT`
+  statement to re-run.
+- **`run completed` no longer reads as a clean SUCCESS when a foreign key is missing.** The
+  summary said only "N table(s) loaded", so a reader who scans just that line missed the
+  shortfall (which is how the failure got mistaken for user error). It now appends
+  "N foreign key(s) NOT applied" when any failed; a clean run's wording is unchanged.
+
 ## v0.1.445
 
 ### Fixed
