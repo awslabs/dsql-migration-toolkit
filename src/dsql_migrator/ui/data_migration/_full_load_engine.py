@@ -3842,6 +3842,7 @@ def apply_preserved_foreign_keys(
                 )
                 continue
             index_state: Optional[str] = None
+            index_waited = 0.0
             try:
                 # A table Full Load RECREATED gets its secondary indexes only after the
                 # load, via CREATE INDEX ASYNC (returns immediately, builds in the
@@ -3849,7 +3850,24 @@ def apply_preserved_foreign_keys(
                 # adding the constraint now races the build and fails 42830 -- so wait for
                 # the index to become valid first. "absent" returns at once (waiting would
                 # be pointless) and the ADD then fails with an actionable reason.
-                index_state = _wait_for_referenced_unique_index(fk, connection_factory)
+                index_state, index_waited = _wait_for_referenced_unique_index(
+                    fk, connection_factory
+                )
+                if index_waited > 0:
+                    # A wait ACTUALLY happened, so say so: this is the only evidence that
+                    # the index-build race was handled rather than merely won. Silent when
+                    # the index was already valid (the normal case) -- no noise.
+                    log_activity(
+                        ActivityCategory.FULL_LOAD,
+                        "waited for referenced unique index",
+                        status=ActivityStatus.INFO,
+                        target=target,
+                        detail=(
+                            f"the referenced table's unique index was still building "
+                            f"(CREATE INDEX ASYNC); waited {index_waited:.1f}s, then it "
+                            f"was {index_state}"
+                        ),
+                    )
                 # DSQL only accepts ADD CONSTRAINT ... NOT VALID (renders that way);
                 # it enforces every NEW write immediately.
                 apply_foreign_key(add_ddl, connection_factory=connection_factory)
@@ -3878,7 +3896,9 @@ def apply_preserved_foreign_keys(
                     "foreign key not applied",
                     status=ActivityStatus.FAILURE,
                     target=target,
-                    detail=_fk_failure_detail(exc, add_ddl, index_state),
+                    detail=_fk_failure_detail(
+                        exc, add_ddl, index_state, waited_seconds=index_waited
+                    ),
                 )
     finally:
         try:
@@ -3963,15 +3983,23 @@ def _wait_for_referenced_unique_index(
     finished "successfully" with referential integrity silently missing -- and being a
     race, the same procedure could pass on one run and drop an FK on the next.
 
-    Returns ``"valid"`` (safe to add), ``"absent"`` (waiting is pointless -- fail fast),
-    ``"building"`` (still not ready when the budget ran out), or ``None`` (catalog
-    unreadable). Only ``building`` consumes the budget.
+    Returns ``(state, waited_seconds)``: ``"valid"`` (safe to add), ``"absent"`` (waiting
+    is pointless -- fail fast), ``"building"`` (still not ready when the budget ran out),
+    or ``None`` (catalog unreadable). Only ``building`` consumes the budget.
+
+    ``waited_seconds`` exists so the wait is OBSERVABLE. Without it a successful run left
+    no trace at all, so "the wait held the FK back until the index was ready" and "the
+    race happened to be won" were indistinguishable in the field -- the gap between the
+    last table load and the FK pass was ~5.4s either way, and neither the activity log nor
+    CloudWatch had an entry. The caller logs it (only when a wait actually occurred, so a
+    normal run stays quiet) and folds it into the failure detail when the budget runs out.
     """
     if fk is None or not fk.referenced_columns:
-        return None
+        return None, 0.0
     from dsql_migrator.core.target_introspector import unique_index_state
 
-    deadline = monotonic() + max(0.0, budget_seconds)
+    started = monotonic()
+    deadline = started + max(0.0, budget_seconds)
     state = unique_index_state(
         fk.referenced_table, fk.referenced_columns,
         connection_factory=connection_factory,
@@ -3982,10 +4010,16 @@ def _wait_for_referenced_unique_index(
             fk.referenced_table, fk.referenced_columns,
             connection_factory=connection_factory,
         )
-    return state
+    return state, max(0.0, monotonic() - started)
 
 
-def _fk_failure_detail(exc: BaseException, add_ddl: object, index_state: Optional[str]) -> str:
+def _fk_failure_detail(
+    exc: BaseException,
+    add_ddl: object,
+    index_state: Optional[str],
+    *,
+    waited_seconds: float = 0.0,
+) -> str:
     """Compose an ACTIONABLE activity-log detail for an FK that could not be applied.
 
     The old copy was the fixed string "could not be created automatically; apply it
@@ -3997,10 +4031,12 @@ def _fk_failure_detail(exc: BaseException, add_ddl: object, index_state: Optiona
     sqlstate = _error_code(exc)
     message = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
     if sqlstate == _NO_MATCHING_UNIQUE_SQLSTATE and index_state == "building":
+        # Name the elapsed wait: it is what separates "the index build is slow, retry
+        # shortly" from "there is no such index" for an operator reading the log.
         cause = (
             "the referenced table's UNIQUE index was still being built "
-            "(CREATE INDEX ASYNC) after the wait budget; re-run this statement once it "
-            "is valid"
+            f"(CREATE INDEX ASYNC) after waiting {waited_seconds:.1f}s (the wait "
+            "budget); re-run this statement once it is valid"
         )
     elif sqlstate == _NO_MATCHING_UNIQUE_SQLSTATE and index_state == "absent":
         cause = (

@@ -1068,13 +1068,28 @@ def build_data_migration_screen(
                 ),
             )
             if migration_type is not MigrationType.CDC_ONLY:
+                # The LOB tick boxes are frozen by the same lock as the table picker, but
+                # they need the LOB-SPECIFIC reason: the picker's copy only talks about
+                # "a different set of tables", while a user who forgot to exclude a column
+                # is trying to change the COLUMNS -- so that sentence does not read as
+                # applying to them, and they cannot find the way out (which is the same
+                # 'Start over'). Passing lock_reason=None was worse still: the panel only
+                # renders text `if locked and lock_reason`, so the boxes were frozen with
+                # NO explanation at all -- the "silent frozen box reads as a bug" state
+                # that panel's own comment says must never happen. lob_exclusion_lock
+                # already writes the right sentence for each cause; reuse it.
+                _lob_locked, _lob_reason = lob_exclusion_lock(
+                    migration_state,
+                    job_manager,
+                    full_load_committed=(job is not None or status is StepStatus.DONE),
+                )
                 _render_cdc_lob_exclusion_panel(
                     ui,
                     migration_state,
                     inventory,
                     refresh,
-                    locked=selection_locked,
-                    lock_reason=None,
+                    locked=selection_locked or _lob_locked,
+                    lock_reason=_lob_reason,
                     migration_wide=True,
                     selected_tables=selected_names,
                     source_type=getattr(

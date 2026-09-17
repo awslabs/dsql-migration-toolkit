@@ -5,6 +5,33 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.448
+
+### Fixed
+
+- **The foreign-key index wait left no trace, so v0.1.446's fix could not be verified in
+  the field.** `_wait_for_referenced_unique_index` polled while the referenced unique index
+  was still building but logged nothing at all — no activity entry, no logger call. On a
+  successful run "the wait held the FK back until the index was ready" and "the race
+  happened to be won" were therefore indistinguishable: the gap between the last table
+  load and the FK pass measured ~5.4s either way, and the interval was empty in both the
+  activity log and CloudWatch. A wait that actually happens is now recorded as one INFO
+  entry naming the elapsed time and what it waited on; when the index was already valid
+  (the normal case) nothing is logged, so an ordinary run gains no noise. The failure
+  detail also names the elapsed wait, which is what lets an operator tell "the index build
+  is slow, retry shortly" from "there is no such index" — the two raise the same SQLSTATE.
+- **A frozen oversized-LOB tick box on the Full Load screen now explains itself.** The
+  screen passed `lock_reason=None`, and the panel only renders text `if locked and
+  lock_reason`, so the boxes were frozen with NO explanation — the "silent frozen box reads
+  as a bug" state that panel's own comment forbids. The table picker's wording does not
+  cover it either: it says to use 'Start over' "to migrate a different set of tables",
+  while a user who forgot to exclude a column is trying to change the COLUMNS, so it does
+  not read as applying to them even though the way out is the same. The screen now uses the
+  LOB-specific `lob_exclusion_lock` reason, which was already written for exactly this case
+  (it explains that the excluded columns are fixed for this migration, why changing them
+  would leave loaded rows inconsistent with what CDC captures, and that 'Start over' is the
+  way to change them).
+
 ## v0.1.447
 
 ### Changed

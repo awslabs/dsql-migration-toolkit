@@ -18372,11 +18372,14 @@ def test_fk_pass_waits_while_the_referenced_unique_index_is_still_building(
         referenced_table="ecommerce.orders", referenced_columns=["id"],
     )
 
-    state = _engine._wait_for_referenced_unique_index(
+    state, waited = _engine._wait_for_referenced_unique_index(
         fk, lambda: object(),
         sleep=slept.append, monotonic=lambda: 0.0,   # budget never expires
     )
     assert state == "valid"
+    # The elapsed wait is REPORTED, which is the only evidence in the field that the
+    # race was handled rather than merely won (a successful run used to leave no trace).
+    assert waited == 0.0   # this fake clock never advances; see the bounded test below
     assert len(asked) == 3            # polled until the async build finished
     assert len(slept) == 2            # waited between polls
     assert asked[0] == ("ecommerce.orders", ["id"])
@@ -18401,9 +18404,11 @@ def test_fk_pass_does_not_wait_when_the_unique_index_is_absent(monkeypatch) -> N
     fk = ForeignKeyDef(
         name="fk", columns=["pid"], referenced_table="parent", referenced_columns=["id"],
     )
-    assert _engine._wait_for_referenced_unique_index(
+    state, waited = _engine._wait_for_referenced_unique_index(
         fk, lambda: object(), sleep=slept.append, monotonic=lambda: 0.0
-    ) == "absent"
+    )
+    assert state == "absent"
+    assert waited == 0.0   # nothing was waited for -> the caller logs nothing
     assert calls["n"] == 1
     assert slept == []
 
@@ -18430,12 +18435,15 @@ def test_fk_pass_wait_is_bounded_so_a_stuck_build_cannot_hang_the_run(
     fk = ForeignKeyDef(
         name="fk", columns=["pid"], referenced_table="parent", referenced_columns=["id"],
     )
-    state = _engine._wait_for_referenced_unique_index(
+    state, waited = _engine._wait_for_referenced_unique_index(
         fk, lambda: object(), budget_seconds=10.0, poll_seconds=2.0,
         sleep=_sleep, monotonic=_monotonic,
     )
     assert state == "building"          # gave up, did not hang
     assert clock["t"] >= 10.0
+    # The duration is carried out so the failure detail can name it -- that is what
+    # separates "the index build is slow" from "there is no such index" for an operator.
+    assert waited >= 10.0
 
 
 def test_fk_failure_detail_records_the_real_reason_and_the_statement() -> None:
@@ -18578,3 +18586,95 @@ def test_apply_preserved_fk_logs_the_real_reason_end_to_end(monkeypatch) -> None
     assert "no UNIQUE index" in detail              # why, in operator terms
     assert "ADD CONSTRAINT" in detail               # the statement to run
     assert detail != "could not be created automatically; apply it manually"
+
+
+def test_a_real_index_wait_is_logged_and_a_normal_run_stays_quiet(monkeypatch) -> None:
+    """The wait must leave a trace, or the 0.1.446 fix cannot be verified in the field.
+
+    It previously logged nothing: on a SUCCESSFUL run "the wait held the FK back until the
+    index was ready" and "the race happened to be won" were indistinguishable -- the gap
+    between the last table load and the FK pass was ~5.4s either way, and neither the
+    activity log nor CloudWatch had an entry for the interval.
+    """
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    events: list = []
+    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: events.append((a, k)))
+    monkeypatch.setattr(engine, "apply_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+
+    # A wait really happened (2.5s), then the index became valid.
+    monkeypatch.setattr(
+        engine, "_wait_for_referenced_unique_index", lambda *a, **k: ("valid", 2.5)
+    )
+    result = engine.apply_preserved_foreign_keys(
+        {"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])}, lambda: _FkProbeConnection(0)
+    )
+    assert result == (1, 0, 0)
+    waited = [k for _a, k in events if "waited" in str(_a)]
+    assert waited, events
+    detail = waited[0].get("detail", "")
+    assert "2.5s" in detail                      # names how long
+    assert "CREATE INDEX ASYNC" in detail        # and what it waited on
+    assert waited[0].get("status") is engine.ActivityStatus.INFO   # not an alarm
+
+    # The normal case (index already valid, nothing waited) logs NO wait entry.
+    events.clear()
+    monkeypatch.setattr(
+        engine, "_wait_for_referenced_unique_index", lambda *a, **k: ("valid", 0.0)
+    )
+    engine.apply_preserved_foreign_keys(
+        {"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])}, lambda: _FkProbeConnection(0)
+    )
+    assert not [k for _a, k in events if "waited" in str(_a)], events
+
+
+def test_fk_failure_detail_names_how_long_it_waited() -> None:
+    # With the elapsed wait in the message an operator can tell "the index build is slow,
+    # retry shortly" from "there is no such index" -- the two produce the same SQLSTATE.
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    class _Err(Exception):
+        sqlstate = "42830"
+
+    exc = _Err("there is no unique constraint matching given keys for referenced table")
+    ddl = 'ALTER TABLE "e"."order_items" ADD CONSTRAINT "fk" FOREIGN KEY ("o") REFERENCES "e"."orders" ("id") NOT VALID'
+
+    detail = _engine._fk_failure_detail(exc, ddl, "building", waited_seconds=300.0)
+    assert "300.0s" in detail
+    assert "wait budget" in detail
+    assert "42830" in detail
+
+    # "absent" never waits, so it must not claim a wait happened.
+    absent = _engine._fk_failure_detail(exc, ddl, "absent", waited_seconds=0.0)
+    assert "waiting" not in absent
+    assert "no UNIQUE index" in absent
+
+
+def test_lob_card_on_the_full_load_screen_explains_its_own_lock() -> None:
+    """A frozen LOB tick box must say WHY and how to change it.
+
+    The Full Load screen passed ``lock_reason=None``, and the panel only renders text
+    ``if locked and lock_reason`` -- so the boxes were frozen with NO explanation at all,
+    the "silent frozen box reads as a bug" state that panel's own comment forbids. The
+    table picker's copy does not help either: it talks about "a different set of tables",
+    while a user who forgot to exclude a column is trying to change the COLUMNS, so that
+    sentence does not read as applying to them. The LOB-specific reason names the cause
+    AND the way out (Start over).
+    """
+    import inspect
+
+    from dsql_migrator.ui import data_migration as _dm
+    from dsql_migrator.ui.data_migration._cdc_monitoring import lob_exclusion_lock
+
+    # The screen wires the LOB-specific lock into the panel call (not a bare None).
+    src = inspect.getsource(_dm.build_data_migration_screen)
+    assert "lob_exclusion_lock(" in src
+    assert "lock_reason=_lob_reason" in src
+
+    # And that reason actually addresses a column change + names the escape hatch.
+    state = DataMigrationState()
+    locked, reason = lob_exclusion_lock(state, None, full_load_committed=True)
+    assert locked is True
+    assert "excluded columns are fixed" in reason
+    assert "Start over" in reason
