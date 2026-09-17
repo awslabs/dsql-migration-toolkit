@@ -393,7 +393,9 @@ def _run_pipeline(*, fail_first_import: bool) -> tuple[_FakeDsqlStore, int]:
     # 1. Introspection (real SQLAlchemy reflection on SQLite).
     introspector = _sqlite_introspector()
     inventory = introspector.introspect(_source_config())
-    assert {t.name for t in inventory.tables} >= {"customers", "orders"}
+    # Qualified with the source database: single-DB mode qualifies like cluster-wide,
+    # so the converted tables get a CREATE SCHEMA and do not land in the target's public.
+    assert {t.name for t in inventory.tables} >= {"app.customers", "app.orders"}
 
     # 2. Compatibility assessment (real rule engine).
     report = CompatibilityAssessor().assess(inventory)

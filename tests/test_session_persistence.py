@@ -1321,3 +1321,87 @@ def test_validation_signature_changes_when_result_recorded() -> None:
         session, eval_state, conv_state, migration_state, vstate
     )
     assert sig_before != sig_after  # recording a result triggers a save
+
+
+def test_pre_upgrade_snapshot_bare_names_are_qualified_on_restore() -> None:
+    """A snapshot written before single-DB mode qualified must still restore.
+
+    Old snapshots hold BARE names (``orders``) because that is what single-database mode
+    produced -- which is also why those tables landed in the target's ``public`` schema.
+    Restoring them unchanged would resolve the selection against nothing
+    (``TableSelectionError``), orphan the per-object conversion edits, and leave the
+    Validation report naming tables that no longer exist. They are brought to the current
+    qualified vintage instead, so the session simply continues.
+    """
+    from dsql_migrator.core.models import (
+        ColumnDef, ForeignKeyDef, SourceInventory, TableDef, ViewDef,
+    )
+    from dsql_migrator.core.table_selection import TableSelection
+    from dsql_migrator.ui.session_persistence import _qualify_restored_table_names
+
+    snapshot = SessionSnapshot(session_id="s1")
+    snapshot.source_database = "ecommerce"
+    snapshot.inventory = SourceInventory(
+        tables=[
+            TableDef(
+                name="orders",
+                columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+                primary_key=["id"],
+                foreign_keys=[
+                    ForeignKeyDef(
+                        name="fk_orders_users", columns=["user_id"],
+                        referenced_table="users", referenced_columns=["id"],
+                    )
+                ],
+            ),
+        ],
+        views=[ViewDef(name="v_orders", definition="SELECT 1")],
+    )
+    snapshot.migration_selection = TableSelection(selected_tables=["orders"])
+    snapshot.edited_target_ddls = {"orders": 'CREATE TABLE "orders" (id INT)'}
+
+    _qualify_restored_table_names(snapshot)
+
+    assert [t.name for t in snapshot.inventory.tables] == ["ecommerce.orders"]
+    assert [v.name for v in snapshot.inventory.views] == ["ecommerce.v_orders"]
+    # The FK parent moves with the child, or it resolves via the target's search_path.
+    assert snapshot.inventory.tables[0].foreign_keys[0].referenced_table == (
+        "ecommerce.users"
+    )
+    assert snapshot.migration_selection.selected_tables == ["ecommerce.orders"]
+    assert list(snapshot.edited_target_ddls) == ["ecommerce.orders"]
+
+
+def test_already_qualified_or_databaseless_snapshots_are_left_untouched() -> None:
+    # A cluster-wide snapshot (already qualified) and one written by the current build
+    # must not be double-prefixed; and with no source database recorded there is nothing
+    # to qualify WITH, so it is a no-op.
+    from dsql_migrator.core.models import ColumnDef, SourceInventory, TableDef
+    from dsql_migrator.core.table_selection import TableSelection
+    from dsql_migrator.ui.session_persistence import _qualify_restored_table_names
+
+    def _snapshot(database, table_name):
+        s = SessionSnapshot(session_id="s1")
+        s.source_database = database
+        s.inventory = SourceInventory(
+            tables=[TableDef(
+                name=table_name,
+                columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+                primary_key=["id"],
+            )]
+        )
+        s.migration_selection = TableSelection(selected_tables=[table_name])
+        return s
+
+    already = _snapshot("ecommerce", "ecommerce.orders")
+    _qualify_restored_table_names(already)
+    assert already.inventory.tables[0].name == "ecommerce.orders"   # not doubled
+    assert already.migration_selection.selected_tables == ["ecommerce.orders"]
+
+    cluster_wide = _snapshot(None, "shop.orders")
+    _qualify_restored_table_names(cluster_wide)
+    assert cluster_wide.inventory.tables[0].name == "shop.orders"
+
+    no_database = _snapshot(None, "orders")
+    _qualify_restored_table_names(no_database)
+    assert no_database.inventory.tables[0].name == "orders"          # nothing to add

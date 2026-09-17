@@ -448,7 +448,8 @@ def _reflect_tables(inspector: object, schema: Optional[str] = None) -> list[Tab
 
     ``schema`` selects the database/schema to reflect; ``None`` uses the
     connection's default schema (single-database mode). Names are returned
-    unqualified; the caller qualifies them with the schema in cluster-wide mode.
+    unqualified either way -- the caller (``_assemble_inventory`` via ``_qualify``)
+    qualifies them, in BOTH modes.
     """
     tables: list[TableDef] = []
     for table_name in inspector.get_table_names(schema=schema):  # type: ignore[attr-defined]
@@ -520,10 +521,12 @@ def _reflect_tables(inspector: object, schema: Optional[str] = None) -> list[Tab
             # Qualify the referenced table the same way the caller qualifies table
             # names in cluster-wide mode (``schema.table``): use the FK's own
             # referred_schema for a cross-schema FK, else the schema being
-            # reflected (a same-schema FK). In single-database mode (``schema`` is
-            # None) names stay unqualified, matching the child table name -- so a
-            # downstream orphan-check/DDL query resolves the parent correctly
-            # instead of hitting the search_path (or a wrong same-named table).
+            # reflected (a same-schema FK). In single-database mode ``schema`` is None
+            # here (the connection's default database is reflected), so a same-database
+            # parent stays bare at this point and ``_qualify`` prefixes it with the
+            # database afterwards -- keeping it aligned with the child's name, which is
+            # what makes the orphan-check/DDL resolve the real parent instead of falling
+            # back to the target's search_path.
             referred_schema = fk.get("referred_schema") or schema
             referenced_table = (
                 f"{referred_schema}.{referred_table}"
@@ -900,10 +903,26 @@ def _user_schemas(
 
 
 def _qualify(schema: str, *object_lists: list) -> None:
-    """Prefix each object's ``name`` with ``schema.`` in place (cluster mode)."""
+    """Prefix each object's ``name`` -- and any FK parent -- with ``schema.`` in place.
+
+    A table's ``foreign_keys[].referenced_table`` MUST be qualified together with the
+    table's own name. Qualifying only ``name`` leaves a child ``ecommerce.orders`` whose
+    FK still points at a bare ``customers``, and every consumer then resolves that parent
+    through the target's default search_path (``"$user", public``): the orphan pre-gate
+    raises 42P01 so the FK is skipped entirely, or -- worse, on a cluster still holding
+    tables from an earlier bare-name run -- it silently resolves to a STALE
+    ``public.customers`` and installs an FK enforcing integrity against dead data.
+
+    Only a bare parent is prefixed: a cross-schema FK already carries its own
+    ``referred_schema`` (see ``_reflect_tables``), so it must be left alone.
+    """
     for objects in object_lists:
         for obj in objects:
             obj.name = f"{schema}.{obj.name}"
+            for fk in getattr(obj, "foreign_keys", None) or ():
+                parent = getattr(fk, "referenced_table", None)
+                if parent and "." not in parent:
+                    fk.referenced_table = f"{schema}.{parent}"
 
 
 def _assemble_inventory(
@@ -916,18 +935,27 @@ def _assemble_inventory(
     """Assemble a :class:`SourceInventory` from one or all schemas.
 
     For an engine whose ``database`` IS a schema (MySQL, ``dialect.database_is_schema``):
-    when ``database`` is set, that single schema is reflected with unqualified names
-    (single-database mode); when empty/``None``, every non-system schema is reflected,
-    ``schema.object``-qualified (cluster-wide mode). For an engine whose schemas live
+    when ``database`` is set, that single schema is reflected and its names are qualified
+    with the database (single-database mode); when empty/``None``, every non-system schema
+    is reflected, also ``schema.object``-qualified (cluster-wide mode). Both modes qualify,
+    so the target always gets a ``CREATE SCHEMA`` and the database name survives the
+    migration (a bare name would land in DSQL's default ``public``). For an engine whose schemas live
     INSIDE the connection database (PostgreSQL, ``database_is_schema`` False), every
     non-system schema of the connected database is reflected + qualified regardless (so a
     non-``public`` schema is never silently dropped). Structural reflection is
     dialect-agnostic; the ``dialect`` supplies the system schemas + engine enrichment.
     """
     if database and dialect.database_is_schema:
-        # Single-database mode (MySQL): reflect the connection's default schema and keep
-        # names unqualified. ``enrich_db`` is the selected database.
-        plans: list[tuple[Optional[str], str, bool]] = [(None, database, False)]
+        # Single-database mode (MySQL): reflect the connection's default schema, then
+        # qualify every name with the selected database. Qualifying matters on the TARGET:
+        # a bare name has no schema, so the conversion emits no CREATE SCHEMA and the
+        # table lands in DSQL's default ``public`` -- losing the database name, colliding
+        # any two source databases that share a table name, breaking an application that
+        # queries ``ecommerce.orders``, and disagreeing with the CDC sink, which always
+        # derives its target as ``<source db>.<table>`` (DebeziumEvents.resolveTable).
+        # Cluster-wide mode has always qualified; this makes the two modes consistent.
+        # ``enrich_db`` is the selected database.
+        plans: list[tuple[Optional[str], str, bool]] = [(None, database, True)]
     else:
         # Reflect every non-system schema and qualify names. This is MySQL's cluster-wide
         # mode (blank database) AND the only mode for PostgreSQL (whose one connected
@@ -1030,11 +1058,11 @@ class SourceIntrospector:
     def introspect(self, conn: SourceConnectionConfig) -> SourceInventory:
         """Extract the source inventory (Requirements 1.2, 1.3).
 
-        When ``conn.database`` is set, only that database/schema is reflected and
-        object names are unqualified. When it is empty/``None``, the entire
-        cluster is assessed: every non-system schema is reflected and each object
-        name is qualified as ``schema.object`` so names stay unique across
-        databases. Tables/columns/PK/indexes/FK are collected via SQLAlchemy
+        When ``conn.database`` is set, only that database/schema is reflected; when it
+        is empty/``None``, the entire cluster is assessed (every non-system schema).
+        Either way each object name is qualified as ``schema.object``, so names stay
+        unique across databases AND the target keeps the source's schema layout instead
+        of collapsing into DSQL's default ``public``. Tables/columns/PK/indexes/FK are collected via SQLAlchemy
         reflection; on MySQL, ``information_schema`` is queried per schema to
         enrich triggers, routines, AUTO_INCREMENT, and collation. All access is
         read-only (Property 1).

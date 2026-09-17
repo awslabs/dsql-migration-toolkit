@@ -331,9 +331,10 @@ def test_introspect_collects_tables_columns_pk_and_fk() -> None:
     inventory = introspector.introspect(_source_config())
 
     table_names = {table.name for table in inventory.tables}
-    assert {"customers", "orders"} <= table_names
+    # Names are qualified with the source database (single-DB mode qualifies too).
+    assert {"app.customers", "app.orders"} <= table_names
 
-    orders = next(table for table in inventory.tables if table.name == "orders")
+    orders = next(table for table in inventory.tables if table.name == "app.orders")
     assert orders.primary_key == ["id"]
     column_names = {column.name for column in orders.columns}
     assert {"id", "customer_id", "total"} == column_names
@@ -341,7 +342,10 @@ def test_introspect_collects_tables_columns_pk_and_fk() -> None:
     assert len(orders.foreign_keys) == 1
     fk = orders.foreign_keys[0]
     assert fk.columns == ["customer_id"]
-    assert fk.referenced_table == "customers"
+    # The FK PARENT is qualified together with the child: a bare parent would resolve
+    # through the target's default search_path ('"$user", public') -- skipping the FK
+    # (42P01 in the orphan pre-gate) or silently binding a stale public.customers.
+    assert fk.referenced_table == "app.customers"
     assert fk.referenced_columns == ["id"]
     assert fk.name  # a name is always present (synthesized when missing)
 
@@ -350,11 +354,11 @@ def test_introspect_collects_indexes_and_views() -> None:
     introspector = SourceIntrospector(engine_factory=_sqlite_factory())
     inventory = introspector.introspect(_source_config())
 
-    orders = next(table for table in inventory.tables if table.name == "orders")
+    orders = next(table for table in inventory.tables if table.name == "app.orders")
     assert any(index.name == "idx_orders_total" for index in orders.indexes)
 
     view_names = {view.name for view in inventory.views}
-    assert "active_orders" in view_names
+    assert "app.active_orders" in view_names   # views are qualified too
 
 
 def test_introspect_result_is_serializable() -> None:
@@ -779,17 +783,24 @@ def test_cluster_wide_same_schema_fk_qualified_with_reflected_schema() -> None:
     assert orders.foreign_keys[0].referenced_table == "shop.orders"
 
 
-def test_single_database_introspection_keeps_unqualified_names() -> None:
+def test_single_database_introspection_qualifies_names_with_the_database() -> None:
+    """Single-database mode must qualify, exactly like cluster-wide mode.
+
+    A bare name has no schema, so the conversion emits no CREATE SCHEMA and the table
+    lands in the target's default ``public`` -- losing the database name, colliding any
+    two source databases that share a table name, breaking an application that queries
+    ``shop.orders``, and disagreeing with the CDC sink, which always derives its target as
+    ``<source db>.<table>``. The connection's default schema is still what gets reflected
+    (``schema=None``); only the NAMES are qualified afterwards.
+    """
     from dsql_migrator.core.introspector import _assemble_inventory
 
-    # In single-database mode the connection's default schema is reflected
-    # (schema=None) and names stay unqualified.
     catalog = {None: {"tables": {"orders": {}, "customers": {}}, "views": {}}}
     inventory = _assemble_inventory(
         _FakeInspector(catalog), _NonMysqlConnection(), "shop", dialect=dialect_for(SourceType.MYSQL)
     )
 
-    assert {table.name for table in inventory.tables} == {"orders", "customers"}
+    assert {table.name for table in inventory.tables} == {"shop.orders", "shop.customers"}
 
 
 # ---------------------------------------------------------------------------
@@ -1086,3 +1097,74 @@ def test_source_error_hint_is_worded_for_the_source_engine() -> None:
     assert SOURCE_CONNECTION_LOST_HINT.startswith("The source MySQL connection dropped")
     mysql_hint = source_error_hint(_pymysql_operational(2013, "Lost connection"))
     assert mysql_hint is not None and "MySQL" in mysql_hint and "PostgreSQL" not in mysql_hint
+
+
+def test_single_database_mode_qualifies_the_fk_parent_with_the_database() -> None:
+    """The FK PARENT must be qualified together with the child, or FKs break.
+
+    Single-DB mode reflects with ``schema=None``, and SQLAlchemy's MySQL dialect leaves
+    ``referred_schema`` empty for a same-database FK -- so the parent arrives BARE while
+    the child is qualified. Every consumer then resolves that parent through the target's
+    default search_path (``"$user", public``): the orphan pre-gate raises 42P01 and the
+    foreign key is SKIPPED, or -- on a cluster still holding tables from an earlier
+    bare-name run -- it silently binds a stale ``public.customers`` and enforces
+    referential integrity against dead data.
+    """
+    from dsql_migrator.core.introspector import _assemble_inventory
+
+    catalog = {
+        None: {
+            "tables": {
+                "orders": {
+                    "foreign_keys": [
+                        {
+                            "name": "fk_cust",
+                            "constrained_columns": ["customer_id"],
+                            # Same-database FK: MySQL reports no referred_schema.
+                            "referred_table": "customers",
+                            "referred_columns": ["id"],
+                        }
+                    ]
+                },
+                "customers": {},
+            },
+            "views": {},
+        }
+    }
+    inventory = _assemble_inventory(
+        _FakeInspector(catalog), _NonMysqlConnection(), "shop",
+        dialect=dialect_for(SourceType.MYSQL),
+    )
+    orders = next(t for t in inventory.tables if t.name == "shop.orders")
+    assert orders.foreign_keys[0].referenced_table == "shop.customers"
+
+
+def test_single_database_mode_leaves_a_cross_schema_fk_parent_alone() -> None:
+    # A parent that already carries its own schema must NOT be re-prefixed
+    # (shop.billing.customers would be nonsense).
+    from dsql_migrator.core.introspector import _assemble_inventory
+
+    catalog = {
+        None: {
+            "tables": {
+                "orders": {
+                    "foreign_keys": [
+                        {
+                            "name": "fk_cust",
+                            "constrained_columns": ["customer_id"],
+                            "referred_schema": "billing",
+                            "referred_table": "customers",
+                            "referred_columns": ["id"],
+                        }
+                    ]
+                },
+            },
+            "views": {},
+        }
+    }
+    inventory = _assemble_inventory(
+        _FakeInspector(catalog), _NonMysqlConnection(), "shop",
+        dialect=dialect_for(SourceType.MYSQL),
+    )
+    orders = next(t for t in inventory.tables if t.name == "shop.orders")
+    assert orders.foreign_keys[0].referenced_table == "billing.customers"

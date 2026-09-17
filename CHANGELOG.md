@@ -5,6 +5,46 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.447
+
+### Changed
+
+- **Scoping the source to a single MySQL database no longer loses that database name on
+  the target.** With `Database` set on Connect, inventory names stayed UNQUALIFIED
+  (`orders`), so the conversion emitted no `CREATE SCHEMA` and the table was created in
+  DSQL's default `public` schema. Cluster-wide mode (blank `Database`) has always
+  qualified (`ecommerce.orders`), so the same source produced two different target
+  layouts depending on a field whose own hint describes SCOPE, not naming — and nothing
+  disclosed the difference. Single-database mode now qualifies too, so
+  `ecommerce.orders` on MySQL becomes `ecommerce.orders` on DSQL. This fixes four
+  problems at once:
+  - an application querying `ecommerce.orders` keeps working after cut over (it had to be
+    rewritten for `public.orders`);
+  - migrating two databases no longer collides — both used to land in `public`, so any
+    shared table name overwrote the other;
+  - **CDC in single-database mode was structurally broken.** The Java sink has always
+    derived its target as `<source db>.<table>` (`DebeziumEvents.resolveTable`, whose own
+    comment warns that dropping the schema "would silently route streamed changes to
+    `public` … splitting one table across two schemas"), while the control plane fed it
+    bare names: Debezium's `table.include.list` matched nothing, `SinkTopics` named topics
+    Debezium never writes, and any record that did flow was written to `ecommerce.orders`
+    on a target that only had `public.orders`. Every existing E2E/soak ran with qualified
+    names, so this path was never covered;
+  - a foreign key's PARENT is now qualified together with its child. Qualifying only the
+    child left `ecommerce.orders` referencing a bare `customers`, which resolves through
+    the target's default `"$user", public` search_path — so the orphan pre-gate raised
+    42P01 and **every foreign key was skipped**, or, on a cluster still holding tables
+    from an earlier bare-name run, it silently bound a stale `public.customers` and
+    enforced integrity against dead data.
+- **A session saved before this change still restores.** Old snapshots hold bare names, so
+  the restored selection would have failed to resolve (`TableSelectionError`), the
+  per-object conversion edits would have orphaned, and the Validation report would have
+  named tables that no longer exist. Bare names are brought to the current qualified
+  vintage on restore (inventory + FK parents, selection, edited DDLs, validation report);
+  an already-qualified snapshot and one with no recorded source database are untouched.
+  Tables an older build put in `public` are deliberately NOT reconciled — that placement
+  was the defect, not state worth preserving.
+
 ## v0.1.446
 
 ### Fixed

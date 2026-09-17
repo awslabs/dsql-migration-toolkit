@@ -200,6 +200,60 @@ def capture_session_snapshot(
     return snapshot
 
 
+def _qualify_restored_table_names(snapshot: "SessionSnapshot") -> None:
+    """Prefix a pre-upgrade snapshot's BARE table names with its source database, in place.
+
+    Single-database mode (a ``Database`` set on Connect) used to keep inventory names
+    UNQUALIFIED, which is why the converted tables landed in the target's ``public``
+    schema. It now qualifies them (``ecommerce.orders``), so a snapshot written by an
+    older build carries names of the wrong vintage: the restored selection would resolve
+    against nothing (``TableSelectionError``), the per-object conversion edits would
+    orphan, and the Validation report would name tables that no longer exist.
+
+    Rewriting them here -- once, before any of the snapshot is applied -- means every
+    downstream restore sees one consistent naming and the session simply continues. Only
+    BARE names are touched, so a snapshot from cluster-wide mode (already qualified) and
+    one written by the current build are both left exactly as they are; and it only runs
+    when a source database is recorded, which is precisely the mode that produced bare
+    names.
+
+    Tables already loaded into ``public`` by the older build are deliberately NOT
+    reconciled: that placement was the defect, not a state worth preserving.
+    """
+    database = (getattr(snapshot, "source_database", None) or "").strip()
+    if not database:
+        return
+
+    def _q(name: object) -> object:
+        if isinstance(name, str) and name and "." not in name:
+            return f"{database}.{name}"
+        return name
+
+    inventory = getattr(snapshot, "inventory", None)
+    if inventory is not None:
+        for group in ("tables", "views", "triggers", "routines", "events"):
+            for obj in getattr(inventory, group, None) or ():
+                obj.name = _q(getattr(obj, "name", None))
+            # A table's FK parent has to move with it, or the child is qualified while
+            # the parent still resolves through the target's default search_path.
+        for table in getattr(inventory, "tables", None) or ():
+            for fk in getattr(table, "foreign_keys", None) or ():
+                fk.referenced_table = _q(getattr(fk, "referenced_table", None))
+
+    selection = getattr(snapshot, "migration_selection", None)
+    selected = getattr(selection, "selected_tables", None)
+    if selected:
+        selection.selected_tables = [_q(name) for name in selected]
+
+    edited = getattr(snapshot, "edited_target_ddls", None)
+    if edited:
+        snapshot.edited_target_ddls = {_q(k): v for k, v in edited.items()}
+
+    report = getattr(snapshot, "validation_report", None)
+    for item in getattr(report, "items", None) or ():
+        item.table = _q(getattr(item, "table", None))
+
+
 def apply_session_snapshot(
     snapshot: SessionSnapshot,
     session: object,
@@ -216,6 +270,10 @@ def apply_session_snapshot(
     so the result page reopens. Source credentials are not restored -- the user
     re-enters them on Connect to resume.
     """
+    # A pre-upgrade snapshot from single-database mode holds BARE names; bring them to the
+    # current qualified vintage before anything reads them (see the helper).
+    _qualify_restored_table_names(snapshot)
+
     from dsql_migrator.ui.data_migration import MigrationType
     from dsql_migrator.ui.evaluation import EvaluationResult
 
