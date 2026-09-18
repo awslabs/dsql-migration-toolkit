@@ -1606,6 +1606,58 @@ def _render_cdc_error_download(ui, migration_state, log_key: str) -> None:
         "editor."
     )
 
+# CDC-stack phases in which the excluded-column set has already been handed to the
+# pipeline, so changing it now would diverge what Full Load writes from what CDC captures.
+# NB "unstable" is included here even though ``lob_exclusion_lock``'s own tuple omits it:
+# ``cdc_infra_prep_state`` treats an unstable stack as ready, so leaving it out would let
+# the bundled action through on a stack that already carries the old list.
+_EXCLUSION_BAKED_PHASES = (
+    "infra",
+    "running",
+    "provisioning",
+    "partial",
+    "unstable",
+)
+
+
+def exclude_and_reload_block_reason(migration_state, job_manager) -> "Optional[str]":
+    """Why the bundled "exclude this LOB column and reload the table" action is refused.
+
+    ``None`` means it is safe to offer. This is deliberately NARROWER than
+    :func:`lob_exclusion_lock`, whose ``full_load_committed`` clause also fires here: that
+    clause exists because changing the exclusion would leave ALREADY-LOADED rows
+    inconsistent with what CDC captures -- and the bundled action DROPS and reloads the
+    affected table, so those rows cease to exist and the inconsistency cannot arise. What
+    remains genuinely unsafe is a pipeline that has already been given the old set:
+
+    * CDC is streaming -- the connectors committed offsets on MSK under the old
+      ``column.exclude.list``, so history was captured with different columns.
+    * A cdc-stack exists (or is being created) -- ``ColumnExcludeList`` is baked into the
+      stack at create time, so an exclusion added afterwards would make Full Load skip a
+      column CDC keeps capturing.
+
+    Pure apart from the job-status reads the CDC helpers already do; no AWS I/O.
+    """
+    if cdc_streaming_started(migration_state, job_manager):
+        return (
+            "CDC is streaming — stop CDC first. Its connectors already committed "
+            "offsets using the current excluded-column set, so changing it now would "
+            "make the rows already streamed inconsistent with everything after."
+        )
+    if cdc_infra_deploy_in_flight(migration_state, job_manager):
+        return (
+            "The CDC infrastructure is being created and the excluded columns were "
+            "submitted with it. Wait for it to finish, then delete it to re-scope."
+        )
+    if getattr(migration_state, "cdc_stack_phase", None) in _EXCLUSION_BAKED_PHASES:
+        return (
+            "The CDC infrastructure is deployed and its capture configuration already "
+            "carries the current excluded columns. Delete the CDC infrastructure first, "
+            "or Full Load would skip a column CDC keeps capturing."
+        )
+    return None
+
+
 def lob_exclusion_lock(
     migration_state, job_manager, *, full_load_committed: bool = False
 ) -> tuple[bool, Optional[str]]:

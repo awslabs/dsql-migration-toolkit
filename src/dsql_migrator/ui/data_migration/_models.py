@@ -1312,6 +1312,48 @@ def lob_exclusion_candidates(
     return candidates
 
 
+# MySQL LOB base types split by the DSQL type they convert to, so a quarantine reason
+# that names the DSQL type can be narrowed back to the source columns that produced it.
+# (converter: mediumblob/longblob -> bytea, mediumtext/longtext -> text.)
+_LOB_BASES_BY_TARGET_TYPE: "dict[str, frozenset[str]]" = {
+    "bytea": frozenset({"mediumblob", "longblob"}),
+    "text": frozenset({"mediumtext", "longtext"}),
+}
+
+
+def preselect_lob_columns_for_reason(
+    columns_with_types: "Sequence[tuple[str, str]]",
+    reason_text: str,
+) -> tuple[str, ...]:
+    """Return the LOB columns a quarantine reason points at, for pre-ticking a picker.
+
+    The offending COLUMN is not recoverable from the quarantine record: it carries only
+    ``table`` / ``pk`` / ``error_code`` / ``message``, and the message keeps just the first
+    line of the driver error -- which names the DSQL TYPE, not the column
+    (``datatype limit greater than 1048576 bytes not supported for bytea``).
+
+    That type token is still a real signal, because the source->DSQL mapping is
+    deterministic: ``mediumblob``/``longblob`` become ``bytea`` and
+    ``mediumtext``/``longtext`` become ``text``. So a ``bytea`` reason narrows a table with
+    both a blob and a text LOB column (``product_media`` has ``content`` and
+    ``full_description``) down to the blob one.
+
+    This only PRE-SELECTS; the caller must still show the choice, because excluding the
+    wrong column silently NULLs it for the whole table. Returns ``()`` when the reason
+    names no known type or nothing matches, which means "make the user choose".
+    """
+    lowered = (reason_text or "").lower()
+    matched: list[str] = []
+    for target_type, bases in _LOB_BASES_BY_TARGET_TYPE.items():
+        if target_type not in lowered:
+            continue
+        for column, mysql_type in columns_with_types:
+            base = str(mysql_type or "").split("(")[0].strip().lower()
+            if base in bases and column not in matched:
+                matched.append(column)
+    return tuple(matched)
+
+
 def scope_lob_candidates(
     candidates: Sequence[LobExclusionCandidate],
     *,

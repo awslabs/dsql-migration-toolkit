@@ -5,6 +5,36 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.452
+
+### Added
+
+- **Recover from an oversized-LOB quarantine without starting over: "Exclude column &
+  reload" on the quarantine card.** A value over Aurora DSQL's ~1 MiB per-value limit is
+  dead-lettered and the table finishes `DONE` with quarantined rows, but the **Oversized
+  LOB columns (optional exclusion)** tick boxes lock once a load has run — so the only way
+  to exclude the offending column was **Start over**, discarding the whole session. The
+  quarantine card now offers the recovery directly: it opens a picker listing that table's
+  LOB columns, pre-ticking the one whose source type matches the DSQL type named in the
+  quarantine reason (`bytea` -> `mediumblob`/`longblob`, `text` -> `mediumtext`/`longtext`),
+  and on confirm records the exclusion, drops and recreates just that table, and reloads
+  it. The confirmation spells out the impact: the column becomes NULL for every row, the
+  exclusion applies migration-wide (including CDC capture), and the table is dropped and
+  recreated.
+- The action is offered but **disabled with the reason as its tooltip** when the excluded-
+  column set is already baked into a CDC pipeline (a sink streaming, or a CDC stack in
+  `infra` / `running` / `provisioning` / `partial` / `unstable`) or when no connection is
+  verified — a silently missing control reads as a missing feature, and the reason is the
+  actionable part. It is not rendered at all for a table with no excludable LOB column.
+
+### Fixed
+
+- **A missing import could no longer ship as a runtime `NameError` in a rendered page.**
+  `tests/test_no_undefined_globals.py` now imports every module in the package and scans
+  each function's bytecode for `LOAD_GLOBAL` names that resolve in neither module globals
+  nor builtins. This is the class of defect that took v0.1.448 down; a successful module
+  import does not prove a call site resolves.
+
 ## v0.1.451
 
 ### Fixed

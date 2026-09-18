@@ -1328,6 +1328,71 @@ def build_data_migration_screen(
                 # previously-quarantined row now loads. Reuses the scoped retry path.
                 _run_retry_for([table_name])
 
+            def lob_candidates_for(table_name: str):
+                """Return this table's oversized-LOB columns as ``(name, mysql_type)``.
+
+                The picker needs the TYPES, not just the names: the quarantine reason
+                names the DSQL type (``bytea``/``text``) rather than the column, and the
+                source type is what maps back to it. ``LobExclusionCandidate`` carries
+                names only, so the types come from the inventory here.
+                """
+                if inventory is None:
+                    return ()
+                table = next(
+                    (t for t in inventory.tables if t.name == table_name), None
+                )
+                if table is None:
+                    return ()
+                allowed = {
+                    c.table: set(c.columns)
+                    for c in (lob_exclusion_candidates(inventory) or ())
+                }.get(table_name, set())
+                return tuple(
+                    (col.name, col.mysql_type)
+                    for col in table.columns
+                    if col.name in allowed
+                )
+
+            def exclude_lob_and_reload(table_name: str, columns: Sequence[str]) -> None:
+                """Exclude oversized-LOB column(s) AND reload the table, as ONE action.
+
+                The recovery path for a load that quarantined rows over DSQL's ~1 MiB
+                per-value limit: you cannot know WHICH column is too big until you load,
+                but the exclusion tick boxes lock once a Full Load has run, and the only
+                escape was Start over -- which discards Evaluation, Schema Conversion
+                (including edited DDL), the migration type and the CDC inputs to change
+                one checkbox. That lock exists because changing the exclusion would leave
+                already-loaded rows inconsistent with what CDC captures; bundling the
+                exclusion WITH a forced DROP+reload of that table removes those rows, so
+                the inconsistency cannot arise and the lock does not need to apply.
+
+                Refused while a CDC pipeline already owns the excluded-column set (see
+                :func:`exclude_and_reload_block_reason`).
+                """
+                blocked = exclude_and_reload_block_reason(migration_state, job_manager)
+                if blocked:
+                    ui.notify(blocked, type="warning", position="top")
+                    return
+                if not columns:
+                    return
+                for column in columns:
+                    migration_state.set_lob_exclusion(table_name, column, True)
+                # FORCE the replace for exactly this table: an append would leave the
+                # rows loaded under the old column set beside rows loaded without it.
+                migration_state.set_replace_targets(frozenset({table_name}))
+                log_activity(
+                    ActivityCategory.FULL_LOAD,
+                    "oversized-LOB column excluded",
+                    status=ActivityStatus.INFO,
+                    target=table_name,
+                    detail=(
+                        f"excluded {', '.join(sorted(columns))} and reloading this table "
+                        "(DROP + recreate), so no row keeps a value loaded under the "
+                        "previous column set"
+                    ),
+                )
+                _run_retry_for([table_name])
+
             def retry_tables(names: Sequence[str]) -> None:
                 # Retry an explicit SUBSET of tables (the failed-table checklist's
                 # ticked set). Same scoped retry path as Reload, for many tables.
@@ -1718,6 +1783,15 @@ def build_data_migration_screen(
                             retry_failed_load=retry_failed_load,
                             retry_tables=retry_tables,
                             reload_table=reload_table,
+                            # Recovery for rows quarantined over the ~1 MiB per-value
+                            # limit: exclude the column that cannot fit and reload the
+                            # table as ONE action, so the exclusion never applies to
+                            # rows that are already loaded.
+                            lob_candidates_for=lob_candidates_for,
+                            exclude_lob_and_reload=exclude_lob_and_reload,
+                            exclude_lob_block_reason=exclude_and_reload_block_reason(
+                                migration_state, job_manager
+                            ),
                             accept_quarantine_and_continue=accept_quarantine_and_continue,
                             stop_full_load=stop_full_load,
                             refresh=refresh,
@@ -3595,6 +3669,7 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     _render_cdc_least_privilege_note,
     _render_cdc_live_monitoring,
     _render_cdc_lob_exclusion_panel,
+    exclude_and_reload_block_reason,
     lob_exclusion_lock,
     _render_cdc_manual_inputs,
     _render_cdc_params_file,

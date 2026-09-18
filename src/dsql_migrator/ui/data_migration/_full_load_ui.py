@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 from dsql_migrator.core.error_log import ErrorLogStore
 from dsql_migrator.core.job_manager import JobNotFoundError
@@ -36,6 +36,7 @@ from dsql_migrator.ui.data_migration._full_load_engine import (
 )
 from dsql_migrator.ui.data_migration._models import (
     FullLoadCompleteness,
+    preselect_lob_columns_for_reason,
     FullLoadTableRow,
     _LOAD_STATE_ORDER,
     _UNAVAILABLE,
@@ -264,6 +265,13 @@ def _render_full_load_step(
     retry_tables=None,
     ai_error_opener=None,
     schema_recreate_candidates: Optional[Sequence[str]] = None,
+    # Recovery for rows quarantined over DSQL's ~1 MiB per-value limit: the offending
+    # column can only be known AFTER a load, but the exclusion tick boxes lock once a
+    # Full Load has run. These let the quarantine card offer "exclude the column and
+    # reload this table" as one bundled action. None -> the action is not offered.
+    lob_candidates_for: Optional[Callable[[str], Sequence[tuple[str, str]]]] = None,
+    exclude_lob_and_reload: Optional[Callable[[str, Sequence[str]], None]] = None,
+    exclude_lob_block_reason: Optional[str] = None,
 ) -> None:
     """Render the Full Load step: confirm the selected workloads, then run it.
 
@@ -807,6 +815,9 @@ def _render_full_load_step(
             rows,
             reload_table=reload_table,
             reload_confirm=_open_reload_confirm,
+            lob_candidates_for=lob_candidates_for,
+            exclude_lob_and_reload=exclude_lob_and_reload,
+            exclude_lob_block_reason=exclude_lob_block_reason,
             # Reload/Retry need a LIVE source+target (the source password is not restored
             # after a session restore, Property 7). connection_ready() reflects "verified
             # this session" -- unlike has_source(), which is True whenever the config is
@@ -1494,6 +1505,11 @@ def _render_full_load_progress(
     quarantine_records: "Sequence[tuple[str, str]]" = (),
     ai_error_opener=None,
     page_state=None,
+    # Bundled "exclude the oversized LOB column and reload this table" recovery (the
+    # quarantine card's action slot). None -> not offered.
+    lob_candidates_for: Optional[Callable[[str], Sequence[tuple[str, str]]]] = None,
+    exclude_lob_and_reload: Optional[Callable[[str, Sequence[str]], None]] = None,
+    exclude_lob_block_reason: Optional[str] = None,
 ) -> None:
     """Render the overall progress, a status distribution, and a live per-table
     table with colored status badges and per-row progress bars."""
@@ -1783,9 +1799,131 @@ def _render_full_load_progress(
                 ),
                 tooltip="Ask AI why these rows were dropped and what your options are.",
             )
+            _quar_exclude_reload(table_name, reason_text)()
             _quar_reload(table_name)()
 
         return _render
+
+    def _quar_exclude_reload(table_name: str, reason_text: str):
+        """The bundled "exclude the oversized column and reload this table" affordance.
+
+        Sits with Reload because it answers the same question ("these rows were dropped,
+        now what?") -- but where Reload re-reads the SAME columns (useful only if the
+        source value was shrunk), this drops the column that cannot fit and reloads, which
+        is the only in-tool way forward when the value is legitimately over 1 MiB. Without
+        it the sole escape was Start over, discarding Evaluation, Schema Conversion and
+        the CDC inputs to change one checkbox.
+        """
+        def _btn() -> None:
+            if exclude_lob_and_reload is None or not terminal:
+                return
+            columns = tuple(lob_candidates_for(table_name)) if lob_candidates_for else ()
+            if not columns:
+                return  # nothing excludable on this table -> do not offer a dead button
+            label = "Exclude column & reload"
+            props = "flat dense no-caps size=sm color=warning icon=filter_alt_off"
+            if not connections_ready:
+                ui.button(label).props(props + " disable").tooltip(
+                    "Reconnect first: re-verify the source and target on the Connect "
+                    "step (credentials are not restored after a restart)."
+                )
+                return
+            if exclude_lob_block_reason:
+                # Never hide it: a silently absent control reads as a missing feature,
+                # and the reason is the actionable part (stop CDC / delete the stack).
+                ui.button(label).props(props + " disable").tooltip(
+                    exclude_lob_block_reason
+                )
+                return
+            ui.button(
+                label,
+                on_click=lambda _e=None, n=table_name, c=columns, r=reason_text: (
+                    _open_exclude_lob_dialog(n, c, r)
+                ),
+            ).props(props).tooltip(
+                "Stop migrating the column that cannot fit, and reload this table so no "
+                "row keeps a value loaded under the old column set."
+            )
+
+        return _btn
+
+    def _open_exclude_lob_dialog(
+        table_name: str, columns: Sequence[tuple[str, str]], reason_text: str
+    ) -> None:
+        """Pick the column(s) to stop migrating, then drop & reload the table.
+
+        A PICKER, not a one-click: the quarantine record does not name the column (only
+        the DSQL type), and excluding the wrong one silently NULLs it for every row. The
+        column whose source type maps to the type in the reason is pre-ticked
+        (``preselect_lob_columns_for_reason``) so the common case is one confirm.
+        """
+        preselected = set(preselect_lob_columns_for_reason(columns, reason_text))
+        chosen: dict[str, bool] = {
+            name: (name in preselected) for name, _type in columns
+        }
+        with ui.dialog() as dialog, ui.card().classes("gap-2").style("min-width: 520px"):
+            ui.label(f"Stop migrating a column of {table_name}?").classes(
+                "text-lg font-semibold"
+            )
+            render_notice(
+                ui,
+                tone="warning",
+                header="The column's data is never migrated for this table",
+                body=(
+                    "The ticked column(s) are removed from the load, so they arrive NULL "
+                    "on the target for EVERY row of this table -- not just the rows that "
+                    "were dropped. The exclusion is migration-wide, so CDC will not "
+                    "capture them either. This table is then DROPPED and recreated from "
+                    "the applied conversion and reloaded, so no row keeps a value loaded "
+                    "under the previous column set. Rows already loaded for this table "
+                    "are replaced."
+                ),
+            )
+            ui.label("Columns that can exceed DSQL's 1 MiB per-value limit:").classes(
+                "text-sm text-gray-700"
+            )
+            for name, mysql_type in columns:
+                box = ui.checkbox(
+                    f"{name}  ({mysql_type})", value=chosen[name]
+                )
+                box.on_value_change(
+                    lambda e, n=name: chosen.__setitem__(n, bool(
+                        getattr(e, "value", False)
+                    ))
+                )
+            if preselected:
+                inline_hint(
+                    ui,
+                    "Pre-ticked from the quarantine reason ("
+                    + ", ".join(sorted(preselected))
+                    + "): its type matches the one the database reported.",
+                    tone="neutral",
+                )
+            else:
+                inline_hint(
+                    ui,
+                    "The database reported a type, not a column, so nothing is "
+                    "pre-ticked — choose the column that holds the oversized value.",
+                    tone="warning",
+                )
+
+            def _go() -> None:
+                picked = [n for n, on in chosen.items() if on]
+                if not picked:
+                    ui.notify(
+                        "Tick at least one column to exclude.",
+                        type="warning", position="top",
+                    )
+                    return
+                dialog.close()
+                exclude_lob_and_reload(table_name, picked)
+
+            with ui.row().classes("justify-end gap-2 w-full"):
+                ui.button("Cancel", on_click=dialog.close).props("flat")
+                ui.button(
+                    "Exclude and reload", on_click=_go, icon="filter_alt_off"
+                ).props("color=negative")
+        dialog.open()
 
     def _quar_reload(table_name: str):
         def _btn() -> None:

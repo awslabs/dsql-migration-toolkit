@@ -4307,5 +4307,6 @@ from dsql_migrator.ui.data_migration._cdc_monitoring import (  # noqa: E402,F401
     _render_change_flow_status,
     _render_full_load_quarantine_pointer,
     _render_migration_table_status,
+    exclude_and_reload_block_reason,
     lob_exclusion_lock,
 )

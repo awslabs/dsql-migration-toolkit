@@ -18947,3 +18947,249 @@ def test_confirm_dialog_opens_when_cdc_is_live_and_the_target_holds_rows(
     # And it must NOT offer the drop/append choice while CDC streams.
     body = " ".join(ui.texts)
     assert "Choose how to load them" not in body
+
+
+# ---------------------------------------------------------------------------
+# Exclude an oversized LOB column and reload (the post-load recovery path)
+# ---------------------------------------------------------------------------
+
+
+def test_preselect_lob_columns_narrows_by_the_dsql_type_in_the_reason() -> None:
+    """The offending COLUMN is not in the quarantine record -- only the DSQL TYPE is.
+
+    `DataErrorRecord` carries table/pk/error_code/message, and the message keeps just the
+    first line of the driver error: "datatype limit greater than 1048576 bytes not
+    supported for bytea" -- the type, never the column. But the mapping is deterministic
+    (mediumblob/longblob -> bytea, mediumtext/longtext -> text), so that token narrows a
+    table with BOTH kinds. product_media really has two candidates (content longblob,
+    full_description longtext), which is why auto-picking without this would be a coin flip.
+    """
+    from dsql_migrator.ui.data_migration._models import preselect_lob_columns_for_reason
+
+    cols = [("content", "longblob"), ("full_description", "longtext")]
+    assert preselect_lob_columns_for_reason(
+        cols, "quarantined row pk[id=3]: datatype limit greater than 1048576 bytes "
+              "not supported for bytea"
+    ) == ("content",)
+    assert preselect_lob_columns_for_reason(
+        cols, "datatype limit greater than 1048576 bytes not supported for text"
+    ) == ("full_description",)
+
+    # Type sizes/precision in the declared type must not defeat the match.
+    assert preselect_lob_columns_for_reason(
+        [("blob_col", "LONGBLOB")], "not supported for bytea"
+    ) == ("blob_col",)
+
+    # No recognisable type, or no column of that kind -> make the user choose.
+    assert preselect_lob_columns_for_reason(cols, "some other failure") == ()
+    assert preselect_lob_columns_for_reason([("t", "longtext")], "for bytea") == ()
+    assert preselect_lob_columns_for_reason([], "for bytea") == ()
+
+
+def test_exclude_and_reload_is_allowed_after_a_load_but_refused_once_cdc_owns_the_set() -> None:
+    """The bundled action is deliberately NARROWER than the tick-box lock.
+
+    `lob_exclusion_lock`'s `full_load_committed` clause fires because changing the
+    exclusion would leave ALREADY-LOADED rows inconsistent with what CDC captures -- but
+    this action DROPS and reloads the table, so those rows cease to exist and the
+    inconsistency cannot arise. What stays unsafe is a pipeline already given the old set.
+    """
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+
+    # The case the tick boxes lock but this action must allow: a finished Full Load,
+    # no CDC anywhere. (This is the dead end the feature exists to remove.)
+    clean = DataMigrationState()
+    assert cm.exclude_and_reload_block_reason(clean, None) is None
+    assert cm.lob_exclusion_lock(clean, None, full_load_committed=True)[0] is True
+
+    # A deployed cdc-stack bakes ColumnExcludeList at create time -> refuse. "unstable"
+    # is included on purpose: cdc_infra_prep_state treats it as ready, so omitting it
+    # (as lob_exclusion_lock's own tuple does) would let the action through.
+    for phase in ("infra", "running", "provisioning", "partial", "unstable"):
+        state = DataMigrationState()
+        state.cdc_stack_phase = phase
+        reason = cm.exclude_and_reload_block_reason(state, None)
+        assert reason, f"phase {phase} must block"
+        # Either clause may claim it -- "running" also reads as streaming -- but it must
+        # always name CDC as the owner of the set and give a way forward.
+        assert "CDC" in reason, phase
+
+    # A torn-down stack no longer owns the set.
+    gone = DataMigrationState()
+    gone.cdc_stack_phase = "deleted"
+    assert cm.exclude_and_reload_block_reason(gone, None) is None
+
+
+def test_exclude_and_reload_refused_while_cdc_streams(monkeypatch) -> None:
+    # Offsets are committed on MSK under the old excluded-column set, so history was
+    # captured with different columns -- a reload cannot reconcile that.
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+
+    monkeypatch.setattr(cm, "cdc_streaming_started", lambda *a, **k: True)
+    reason = cm.exclude_and_reload_block_reason(DataMigrationState(), None)
+    assert reason and "stop CDC first" in reason
+
+
+def _quar_render_ui():
+    """A NiceGUI double that records buttons AND runs checkbox/click handlers."""
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+
+    class _Ui:
+        def __init__(self):
+            self.buttons: list[tuple[str, str, str]] = []   # (text, props, tooltip)
+            self.handlers: dict[str, object] = {}           # button text -> on_click
+            self.texts: list[str] = []
+            self.checkboxes: list[str] = []
+            self.dialogs = 0
+
+        class _El:
+            def __init__(self, ui, kind, text="", on_click=None):
+                self._ui, self._kind, self._text = ui, kind, text
+                self._props = ""
+                if kind == "button" and on_click is not None:
+                    ui.handlers[text] = on_click
+            def __enter__(self): return self
+            def __exit__(self, *e): return False
+            def props(self, spec="", *a, **k):
+                if self._kind == "button":
+                    self._props = str(spec)
+                    self._ui.buttons.append((self._text, self._props, ""))
+                return self
+            def tooltip(self, text="", *a, **k):
+                if self._kind == "button":
+                    # replace the last record for this button with the tooltip filled in
+                    for i in range(len(self._ui.buttons) - 1, -1, -1):
+                        if self._ui.buttons[i][0] == self._text:
+                            self._ui.buttons[i] = (
+                                self._text, self._ui.buttons[i][1], str(text)
+                            )
+                            break
+                    else:
+                        self._ui.buttons.append((self._text, self._props, str(text)))
+                return self
+            def on_value_change(self, fn, *a, **k):
+                self._ui.handlers.setdefault("__boxes__", []).append((self._text, fn))
+                return self
+            def __getattr__(self, _n): return lambda *a, **k: self
+
+        def button(self, text="", on_click=None, *a, **k):
+            return _Ui._El(self, "button", str(text), on_click)
+
+        def checkbox(self, text="", value=False, *a, **k):
+            self.checkboxes.append(f"{text}={value}")
+            return _Ui._El(self, "checkbox", str(text))
+
+        def label(self, text="", *a, **k):
+            self.texts.append(str(text)); return _Ui._El(self, "other")
+
+        def dialog(self, *a, **k):
+            self.dialogs += 1
+            return _Ui._El(self, "other")
+
+        def notify(self, *a, **k):
+            return None
+
+        def __getattr__(self, _n):
+            return lambda *a, **k: _Ui._El(self, "other")
+
+    def _job():
+        j = MigrationJob(job_id="j1"); j.status = "DONE"; j.progress_pct = 100.0
+        j.chunks = [ChunkState(chunk_id="ecommerce.product_media", status="DONE",
+                               rows_loaded=12, rows_quarantined=3, attempts=1)]
+        return j
+
+    reason = ("quarantined row pk[id=3]: datatype limit greater than 1048576 bytes "
+              "not supported for bytea")
+    return _Ui, _job, reason
+
+
+def test_quarantine_card_offers_exclude_and_reload_and_gates_it() -> None:
+    """The recovery affordance must appear where the quarantine is reported.
+
+    Before this, an oversized-LOB quarantine was a dead end: the exclusion tick boxes lock
+    once a Full Load has run and the only escape was Start over. The action must also be
+    SHOWN-but-disabled when a CDC pipeline owns the excluded-column set (a silently absent
+    control reads as a missing feature, and the reason is the actionable part).
+    """
+    from dsql_migrator.ui.data_migration import (
+        _render_full_load_progress,
+        build_full_load_table_rows,
+    )
+
+    _Ui, _job, reason = _quar_render_ui()
+    records = [("ecommerce.product_media", reason)]
+    rows = lambda: build_full_load_table_rows(  # noqa: E731
+        _job(), None, {"ecommerce.product_media": reason}
+    )
+    cands = lambda _t: (("content", "longblob"), ("full_description", "longtext"))  # noqa: E731
+
+    # Offered, enabled.
+    ui = _Ui()
+    _render_full_load_progress(
+        ui, _job(), rows(), quarantine_only=True, quarantine_records=records,
+        connections_ready=True, lob_candidates_for=cands,
+        exclude_lob_and_reload=lambda *_a: None,
+    )
+    btns = [b for b in ui.buttons if b[0] == "Exclude column & reload"]
+    assert btns, f"action not offered; buttons={[b[0] for b in ui.buttons]}"
+    assert all("disable" not in b[1] for b in btns)
+
+    # Blocked (CDC owns the set): shown, disabled, reason as the tooltip.
+    ui2 = _Ui()
+    _render_full_load_progress(
+        ui2, _job(), rows(), quarantine_only=True, quarantine_records=records,
+        connections_ready=True, lob_candidates_for=cands,
+        exclude_lob_and_reload=lambda *_a: None,
+        exclude_lob_block_reason="CDC is streaming — stop CDC first.",
+    )
+    blocked = [b for b in ui2.buttons if b[0] == "Exclude column & reload"]
+    assert blocked and all("disable" in b[1] for b in blocked)
+    assert any("stop CDC first" in b[2] for b in blocked)
+
+    # No excludable column on the table -> no dead button at all.
+    ui3 = _Ui()
+    _render_full_load_progress(
+        ui3, _job(), rows(), quarantine_only=True, quarantine_records=records,
+        connections_ready=True, lob_candidates_for=lambda _t: (),
+        exclude_lob_and_reload=lambda *_a: None,
+    )
+    assert not [b for b in ui3.buttons if b[0] == "Exclude column & reload"]
+
+
+def test_exclude_and_reload_dialog_preticks_the_matching_column_and_confirms() -> None:
+    # The dialog must PICK (not auto-apply): product_media has two LOB candidates, and
+    # excluding the wrong one silently NULLs it for every row. The one whose source type
+    # maps to the type in the reason (bytea -> longblob) is pre-ticked.
+    from dsql_migrator.ui.data_migration import (
+        _render_full_load_progress,
+        build_full_load_table_rows,
+    )
+
+    _Ui, _job, reason = _quar_render_ui()
+    applied: list = []
+    ui = _Ui()
+    _render_full_load_progress(
+        ui, _job(),
+        build_full_load_table_rows(_job(), None, {"ecommerce.product_media": reason}),
+        quarantine_only=True,
+        quarantine_records=[("ecommerce.product_media", reason)],
+        connections_ready=True,
+        lob_candidates_for=lambda _t: (
+            ("content", "longblob"), ("full_description", "longtext")
+        ),
+        exclude_lob_and_reload=lambda table, cols: applied.append((table, list(cols))),
+    )
+
+    ui.handlers["Exclude column & reload"]()          # open the picker
+    assert ui.dialogs == 1
+    # bytea in the reason -> the longblob column is pre-ticked, the longtext one is not
+    assert "content  (longblob)=True" in ui.checkboxes, ui.checkboxes
+    assert "full_description  (longtext)=False" in ui.checkboxes, ui.checkboxes
+    # The confirm is destructive and spells out the impact.
+    confirm = [b for b in ui.buttons if b[0] == "Exclude and reload"]
+    assert confirm and any("negative" in b[1] for b in confirm)
+    body = " ".join(ui.texts)
+    assert "product_media" in body
+
+    ui.handlers["Exclude and reload"]()               # confirm
+    assert applied == [("ecommerce.product_media", ["content"])]

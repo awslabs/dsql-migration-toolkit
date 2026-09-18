@@ -5,6 +5,17 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.452
+
+### 추가 (Added)
+
+- **처음부터 다시 시작하지 않고 대용량 LOB 격리에서 복구: 격리 카드의 "Exclude column & reload".** Aurora DSQL의 값당 약 1 MiB 한도를 넘는 값은 dead-letter 처리되고 테이블은 격리 행을 남긴 채 `DONE`으로 끝나는데, **Oversized LOB columns (optional exclusion)** 체크박스는 로드가 한 번 실행되면 잠깁니다 — 그래서 문제 컬럼을 제외하려면 세션 전체를 버리는 **Start over**밖에 없었습니다. 이제 격리 카드에서 곧바로 복구할 수 있습니다: 해당 테이블의 LOB 컬럼 목록을 띄우고, 격리 사유에 적힌 DSQL 타입과 소스 타입이 일치하는 컬럼을 미리 체크해 두며(`bytea` -> `mediumblob`/`longblob`, `text` -> `mediumtext`/`longtext`), 확인하면 제외를 기록하고 그 테이블만 드롭·재생성한 뒤 다시 로드합니다. 확인 대화상자는 영향을 그대로 적어 둡니다: 해당 컬럼은 모든 행에서 NULL이 되고, 제외는 마이그레이션 전체(CDC 캡처 포함)에 적용되며, 테이블은 드롭 후 재생성됩니다.
+- 제외 컬럼 집합이 이미 CDC 파이프라인에 굳어 있거나(싱크가 스트리밍 중이거나 CDC 스택이 `infra` / `running` / `provisioning` / `partial` / `unstable`) 검증된 연결이 없을 때는 버튼을 **숨기지 않고 비활성화하며 사유를 툴팁으로** 보여 줍니다 — 컨트롤이 조용히 사라지면 기능이 없는 것으로 읽히고, 정작 필요한 정보는 그 사유이기 때문입니다. 제외 가능한 LOB 컬럼이 없는 테이블에서는 아예 렌더하지 않습니다.
+
+### 수정 (Fixed)
+
+- **누락된 import가 렌더된 화면의 런타임 `NameError`로 출시되는 일을 막았습니다.** `tests/test_no_undefined_globals.py`가 패키지의 모든 모듈을 import한 뒤 각 함수의 바이트코드에서 `LOAD_GLOBAL` 이름을 훑어, 모듈 전역에도 빌트인에도 없는 이름이 있으면 실패합니다. v0.1.448을 망가뜨린 결함 유형이며, 모듈 import가 성공한다는 것이 호출 지점의 이름이 해석된다는 뜻은 아닙니다.
+
 ## v0.1.451
 
 ### 수정 (Fixed)
