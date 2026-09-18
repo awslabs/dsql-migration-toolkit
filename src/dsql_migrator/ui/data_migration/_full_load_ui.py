@@ -607,7 +607,14 @@ def _render_full_load_step(
                         start_btn.props(
                             f"color={'negative' if drop_now else 'primary'}"
                         )
-                    if tables_with_data_now:
+                    # Guard must MATCH the radio's creation condition above
+                    # (`tables_with_data_now and not cdc_live_now`). With CDC live the
+                    # radio is never created -- replace is disabled while a sink streams --
+                    # so the looser `if tables_with_data_now` raised UnboundLocalError and
+                    # the whole confirm dialog failed to open. Reachable today from the
+                    # per-table Reload and "Retry unfinished tables" whenever CDC is
+                    # streaming and the probed table already holds target rows.
+                    if tables_with_data_now and not cdc_live_now:
                         reload_choice.on_value_change(_sync_btn)
             # Open on the NEXT tick, not this one. The dialog element was just
             # created; opening it in the same update batches "create element" and

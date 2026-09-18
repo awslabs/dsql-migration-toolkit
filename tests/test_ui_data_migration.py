@@ -18904,3 +18904,46 @@ def test_cdc_run_predrops_fks_and_deliberately_does_not_restore_them(monkeypatch
     )
     assert _LoadOnlyMigrator().apply_foreign_keys() == (1, 0, 0)
     assert applied == ["restored"]
+
+
+def test_confirm_dialog_opens_when_cdc_is_live_and_the_target_holds_rows(
+    monkeypatch,
+) -> None:
+    """Regression: the dialog raised UnboundLocalError in exactly this combination.
+
+    The append/drop radio is created only `if tables_with_data_now and not cdc_live_now`
+    (replace is disabled while a sink streams), but its change handler was attached under
+    the looser `if tables_with_data_now` -- so with CDC streaming AND the probed table
+    already holding target rows, `reload_choice` was never bound and BUILDING the dialog
+    raised, so it never opened at all. Reachable today from the per-table Reload and
+    "Retry unfinished tables".
+
+    The rows must come from the PROBE, not from pre-seeded state: the confirm handler
+    resets `tables_with_data` before probing, so a pre-seeded value is discarded.
+    """
+    from dsql_migrator.ui.data_migration import _full_load_ui as fl
+
+    monkeypatch.setattr(fl, "DsqlConnector", lambda *a, **k: _StubConnector())
+    # The probed table ALREADY HOLDS ROWS on the target ...
+    monkeypatch.setattr(
+        fl, "tables_with_rows", lambda names, **k: ["ecommerce.orders"]
+    )
+    monkeypatch.setattr(fl, "target_primary_keys", lambda names, **k: {})
+    monkeypatch.setattr(fl, "tables_present", lambda names, **k: {"ecommerce.orders"})
+    # ... while CDC is streaming, so no append/drop radio is rendered.
+    monkeypatch.setattr(fl, "cdc_streaming_started", lambda *a, **k: True)
+
+    ui = _open_full_load_confirm_dialog(
+        monkeypatch,
+        recreate_candidates=lambda: [],
+        migration_state=DataMigrationState(),
+        session=_StubSession(),
+        selected_names=["ecommerce.orders"],
+    )
+
+    # It must OPEN (building it used to raise) and offer its actions.
+    assert ui.dialogs, "the confirm dialog did not open"
+    assert "Cancel" in " ".join(ui.buttons)
+    # And it must NOT offer the drop/append choice while CDC streams.
+    body = " ".join(ui.texts)
+    assert "Choose how to load them" not in body

@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.451
+
+### Fixed
+
+- **The Full Load confirm dialog could fail to open at all (it raised
+  `UnboundLocalError`).** The append/drop radio is created only when the probed tables
+  hold rows AND CDC is not streaming — replace is disabled while a sink streams — but its
+  change handler was attached under the looser "tables hold rows" condition. So with CDC
+  streaming and the probed table already holding target rows, `reload_choice` was never
+  bound and BUILDING the dialog raised, so the dialog never appeared. Reachable from the
+  per-table **Reload** and **Retry unfinished tables**. The handler's guard now matches
+  the radio's creation condition exactly.
+
 ## v0.1.450
 
 ### Fixed
