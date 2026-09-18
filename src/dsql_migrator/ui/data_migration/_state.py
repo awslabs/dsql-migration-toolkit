@@ -193,6 +193,12 @@ class DataMigrationState:
         # Identities of dead letters already written to the DURABLE activity log, so a
         # re-surfaced record is audited once (the write is append-only and permanent).
         self.cdc_dlq_audited_keys: set = set()
+        # Outcome of the explicit "Apply foreign keys" action on this step:
+        # (applied, skipped, failed), or None while it has not been run. Foreign keys are
+        # no longer applied as part of the load (the orphan pre-check is O(child rows) and
+        # was holding the END of the load for minutes), so the step has to SHOW that they
+        # are still pending -- an unapplied constraint is invisible otherwise.
+        self.fk_apply_result: Optional[tuple] = None
         self.cdc_connector_names: list[str] = []
         # Subset of cdc_connector_names whose MSK connectorState is RUNNING (vs
         # still CREATING/UPDATING). Lets the lifecycle card distinguish "deployed
@@ -734,6 +740,11 @@ class DataMigrationState:
         """Empty the deploy step log (called when a new deploy starts)."""
         with self._lock:
             self._cdc_deploy_log = []
+
+    def set_fk_apply_result(self, result: Optional[tuple]) -> None:
+        """Record the "Apply foreign keys" outcome ``(applied, skipped, failed)``."""
+        with self._lock:
+            self.fk_apply_result = result
 
     def set_cdc_controller(
         self, controller: object, identity: Optional[tuple] = None

@@ -18573,11 +18573,12 @@ def test_run_completed_names_foreign_keys_that_were_not_applied(monkeypatch) -> 
 
     engine._finalize_run(
         _Handle(), "job-1", ["a", "b"], counts, object(),
-        accept_quarantined_rows=False, foreign_keys_failed=1,
+        accept_quarantined_rows=False, foreign_keys_pending=1,
     )
     detail = [k.get("detail", "") for _a, k in events if "run completed" in str(_a)]
     assert detail and "2 table(s) loaded" in detail[0]
-    assert "1 foreign key(s) NOT applied" in detail[0]
+    assert "1 foreign key(s) NOT YET APPLIED" in detail[0]
+    assert "Apply foreign keys" in detail[0], "the summary must name the action to take"
 
     # A clean run keeps the original wording exactly (no noise).
     events.clear()
@@ -18875,9 +18876,14 @@ def test_predrop_blocking_foreign_keys_runs_before_the_load(monkeypatch) -> None
         _Handle(), [], migrator=_Migrator(), error_log=SimpleNamespace()
     )
 
-    # The FK pre-drop must precede the load; the restore passes come after it.
+    # The FK pre-drop must precede the load.
     assert calls.index("fk-predrop") < calls.index("load"), calls
-    assert calls.index("load") < calls.index("fk-apply"), calls
+    # The load no longer APPLIES foreign keys: that is an explicit operator action on the
+    # Data Migration step now (it was holding the END of the load for many minutes -- 28.0
+    # min serial / 7.9 min at 8-way, measured -- after every row was already written). The
+    # PRE-DROP still runs before the load; that one is required, or a replaced parent table
+    # cannot be dropped.
+    assert "fk-apply" not in calls, calls
     # And it runs before the view pre-drop (a view can sit on top of the FK'd table).
     assert calls.index("fk-predrop") < calls.index("view-predrop"), calls
 
@@ -20484,6 +20490,9 @@ def test_the_orphan_pre_gates_run_concurrently_not_one_after_another() -> None:
     assert elapsed < 1.2, f"the pre-gates ran serially ({elapsed:.2f}s for 8 x 0.25s)"
     assert live["peak"] > 1, f"only {live['peak']} pre-gate ran at a time"
     assert live["peak"] <= _engine._FK_PREGATE_WORKERS, "the fan-out is unbounded"
+    # The value itself is measured (a live sweep saturated at 16), not arbitrary; the test
+    # asserts the BOUND is honoured, so it survives re-tuning.
+    assert _engine._FK_PREGATE_WORKERS >= 2
     # Each worker gets its OWN connection: one psycopg connection cannot serve concurrent
     # queries, and they are closed again.
     assert len(conns) == 8, conns
@@ -20546,3 +20555,158 @@ def test_the_pre_gate_fan_out_honours_a_stop() -> None:
         _engine._count_orphans = real
     assert out == {}, out
     assert calls["n"] == 0, "a stop did not prevent the pre-gate work"
+
+
+def test_the_load_no_longer_applies_foreign_keys_and_says_so() -> None:
+    """The load must report complete when the DATA is complete.
+
+    The orphan pre-check that gates each foreign key is O(child rows) -- measured 28.0 min
+    serial / 7.9 min at 8-way for 15 FKs over 15.5M child rows -- and it ran as the last act
+    of the load, after every row was already written. So "Full Load" stayed unfinished for
+    minutes with nothing left to load. It is an explicit action now, exactly as a CDC
+    migration has always applied them at cut over.
+
+    The risk that buys is a FORGOTTEN click, and an unapplied constraint is invisible (DSQL
+    cannot tell us later -- a failed async VALIDATE is unobservable). So the run summary MUST
+    name the outstanding count.
+    """
+    import inspect
+
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    src = inspect.getsource(engine.run_full_load)
+    assert "_apply_foreign_keys(" not in src, (
+        "the load applies foreign keys again; that holds its completion for minutes"
+    )
+    assert "pending_foreign_key_count(" in src
+
+    events: list = []
+    import pytest
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: events.append((a, k)))
+
+    class _H:
+        cancelled = False
+
+    try:
+        engine._finalize_run(
+            _H(), "j", ["a", "b"], engine._RunCounts(real_failed=0, quarantined=0),
+            object(), accept_quarantined_rows=False, foreign_keys_pending=3,
+        )
+    finally:
+        monkeypatch.undo()
+    detail = [k.get("detail", "") for _a, k in events if "run completed" in str(_a)][0]
+    assert "3 foreign key(s) NOT YET APPLIED" in detail
+    assert "Apply foreign keys" in detail, "the summary must name the action to take"
+
+
+def test_pending_foreign_key_count_is_zero_for_a_cdc_migration() -> None:
+    # A CDC migration applies them at CUT OVER, after the stream drains -- never here. If
+    # this counted them, the Data Migration step would show an action that must not run yet
+    # (an FK during the stream makes the sink dead-letter a violation, SQLSTATE 23503).
+    from dsql_migrator.ui.data_migration import pending_foreign_key_count
+
+    class _Conv:
+        foreign_key_ddls = ("ALTER TABLE a ADD CONSTRAINT x ...",)
+
+    class _Inputs:
+        is_cdc_migration = False
+        cdc_coexisting = False
+        cdc_stack_name = None
+        table_conversions = {"a": _Conv(), "b": _Conv()}
+
+    class _M:
+        def __init__(self, inputs):
+            self._inputs = inputs
+
+    plain = _Inputs()
+    assert pending_foreign_key_count(_M(plain)) == 2
+
+    for flag, value in (("is_cdc_migration", True), ("cdc_coexisting", True),
+                        ("cdc_stack_name", "dsql-cdc-x")):
+        cdc = _Inputs()
+        setattr(cdc, flag, value)
+        assert pending_foreign_key_count(_M(cdc)) == 0, flag
+
+
+def test_outstanding_foreign_keys_are_rendered_as_an_error_not_a_quiet_button() -> None:
+    """A forgotten click must not be easy: the outstanding state is loud, or it is a trap."""
+    from dsql_migrator.ui.data_migration._full_load_ui import (
+        _render_foreign_key_action,
+    )
+
+    class _Ui:
+        def __init__(self):
+            self.notices: list = []
+            self.buttons: list = []
+
+        class _El:
+            def __init__(self, ui, kind, text=""):
+                self._ui, self._kind, self._text = ui, kind, text
+            def __enter__(self): return self
+            def __exit__(self, *e): return False
+            def props(self, spec="", *a, **k):
+                if self._kind == "button":
+                    self._ui.buttons.append((self._text, str(spec)))
+                return self
+            def tooltip(self, text="", *a, **k):
+                if self._kind == "button":
+                    self._ui.buttons.append((self._text, "tooltip:" + str(text)))
+                return self
+            def __getattr__(self, _n): return lambda *a, **k: self
+
+        def button(self, text="", on_click=None, *a, **k):
+            return _Ui._El(self, "button", str(text))
+
+        def label(self, text="", *a, **k):
+            self.notices.append(str(text)); return _Ui._El(self, "o")
+
+        def __getattr__(self, _n):
+            return lambda *a, **k: _Ui._El(self, "o")
+
+    # Outstanding, connections verified -> loud notice + an enabled action.
+    ui = _Ui()
+    _render_foreign_key_action(
+        ui, terminal=True, pending=15, applied=None,
+        apply_foreign_keys=lambda: None, connections_ready=True,
+    )
+    text = " ".join(ui.notices)
+    assert "15 foreign key(s) not yet applied" in text, ui.notices
+    assert "referential integrity is NOT in place" in text.replace("  ", " ") or \
+        "NOT in place" in text, ui.notices
+    btns = [b for b in ui.buttons if b[0] == "Apply foreign keys"]
+    assert btns and all("disable" not in b[1] for b in btns)
+
+    # Unverified connection -> shown, disabled, with the reason.
+    ui2 = _Ui()
+    _render_foreign_key_action(
+        ui2, terminal=True, pending=15, applied=None,
+        apply_foreign_keys=lambda: None, connections_ready=False,
+    )
+    assert any("disable" in b[1] for b in ui2.buttons if b[0] == "Apply foreign keys")
+
+    # Already applied cleanly -> a success statement, no action.
+    ui3 = _Ui()
+    _render_foreign_key_action(
+        ui3, terminal=True, pending=0, applied=(15, 0, 0),
+        apply_foreign_keys=lambda: None, connections_ready=True,
+    )
+    assert "15 applied" in " ".join(ui3.notices)
+    assert not [b for b in ui3.buttons if b[0] == "Apply foreign keys"]
+
+    # Applied with skips -> must NOT read as a clean success.
+    ui4 = _Ui()
+    _render_foreign_key_action(
+        ui4, terminal=True, pending=0, applied=(13, 2, 0),
+        apply_foreign_keys=lambda: None, connections_ready=True,
+    )
+    joined = " ".join(ui4.notices)
+    assert "13 applied" in joined and "2 skipped" in joined
+
+    # While the load still runs -> nothing yet.
+    ui5 = _Ui()
+    _render_foreign_key_action(
+        ui5, terminal=False, pending=15, applied=None,
+        apply_foreign_keys=lambda: None, connections_ready=True,
+    )
+    assert not ui5.buttons and not ui5.notices

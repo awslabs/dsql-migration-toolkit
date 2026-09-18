@@ -2475,7 +2475,10 @@ def _finalize_run(
     accept_quarantined_rows: bool,
     inputs: "Optional[DataMigrationInputs]" = None,
     sync_sequences: "Optional[Callable[..., dict]]" = None,
-    foreign_keys_failed: int = 0,
+    # Foreign keys the run did NOT apply because they are now an explicit operator action
+    # (see run_full_load). Named in the run summary so a reader who only scans the summary
+    # cannot miss that referential integrity is still pending.
+    foreign_keys_pending: int = 0,
     # table -> owning job id for a RETRY's carried-forward error records, so the
     # quarantined-row count spans the lineage (see _count_quarantined_rows). Empty on a
     # first run, where every record is already under this job id.
@@ -2510,9 +2513,10 @@ def _finalize_run(
                     # own FAILURE line, but a reader who only scans the summary used to
                     # see a clean SUCCESS and miss that a constraint is missing.
                     + (
-                        f"; {foreign_keys_failed} foreign key(s) NOT applied "
-                        "(see the foreign-key entries above)"
-                        if foreign_keys_failed
+                        f"; {foreign_keys_pending} foreign key(s) NOT YET APPLIED -- "
+                        "use \"Apply foreign keys\" on the Data Migration step "
+                        "(referential integrity is not in place until you do)"
+                        if foreign_keys_pending
                         else ""
                     )
                 ),
@@ -2900,14 +2904,25 @@ def run_full_load(
     _predrop_dependent_views(migrator)
     counts = _migrate_tables_in_parallel(handle, job_id, tables, migrator, error_log)
     _recreate_dependent_views(migrator)
-    _fk_failed = _apply_foreign_keys(migrator, handle)
+    # Foreign keys are NOT applied here any more -- they are an explicit operator action on
+    # the Data Migration step, exactly as they already are at cut over for a CDC migration.
+    # WHY: the pass is the pre-cut-over gate and its orphan pre-check is O(child rows), so on
+    # a real schema it held the END of the load for many minutes (measured: 28.0 min serial /
+    # 7.9 min at 8-way for 15 FKs over 15.5M child rows) -- after every row was already
+    # loaded. Moving it behind a button reports the load as finished when it is finished, and
+    # makes BOTH migration types use one flow (product principle: one consistent journey).
+    # The pre-check itself is unchanged: it cannot be skipped, because a failed
+    # `ALTER TABLE ASYNC ... VALIDATE CONSTRAINT` is unobservable on DSQL (live-verified --
+    # convalidated stays false, no sys.jobs row, and a synchronous VALIDATE is
+    # FeatureNotSupported).
+    _fk_pending = pending_foreign_key_count(migrator)
     _finalize_run(
         handle,
         job_id,
         table_names,
         counts,
         error_log,
-        foreign_keys_failed=_fk_failed,
+        foreign_keys_pending=_fk_pending,
         accept_quarantined_rows=accept_quarantined_rows,
         inputs=inputs,
     )
@@ -3077,7 +3092,7 @@ def run_full_load_retry(
         handle, job_id, tables_to_retry, migrator, error_log
     )
     _recreate_dependent_views(migrator)
-    _fk_failed = _apply_foreign_keys(migrator, handle)
+    _fk_pending = pending_foreign_key_count(migrator)   # see run_full_load
     _finalize_run(
         handle,
         job_id,
@@ -3093,7 +3108,7 @@ def run_full_load_retry(
         sync_table_names=[
             chunk.chunk_id for chunk in prior_chunks
         ] or list(retry_names),
-        foreign_keys_failed=_fk_failed,
+        foreign_keys_pending=_fk_pending,
         accept_quarantined_rows=accept_quarantined_rows,
         error_job_ids=error_job_ids,
         inputs=inputs,
@@ -4363,6 +4378,29 @@ def foreign_keys_blocking_replace(
     return sorted(blocking)
 
 
+def pending_foreign_key_count(migrator: DataMigrator) -> int:
+    """How many preserved foreign keys this run still has to apply (no DB access).
+
+    Counts the SAME rendered ``foreign_key_ddls`` :func:`apply_preserved_foreign_keys`
+    would iterate, so the Data Migration step's "Apply foreign keys" action shows the same
+    number the action will work through. Zero when FK preservation is off, when the source
+    has none, or for a CDC migration (those are applied at cut over instead).
+    """
+    inputs = getattr(migrator, "_inputs", None)
+    if inputs is None:
+        return 0
+    if (
+        getattr(inputs, "is_cdc_migration", False)
+        or getattr(inputs, "cdc_coexisting", False)
+        or getattr(inputs, "cdc_stack_name", None)
+    ):
+        return 0
+    return sum(
+        len(conv.foreign_key_ddls or ())
+        for conv in (getattr(inputs, "table_conversions", None) or {}).values()
+    )
+
+
 def preserved_foreign_key_names(
     table_conversions: Mapping[str, TableConversion],
 ) -> dict[str, list[str]]:
@@ -4587,12 +4625,16 @@ _ORPHAN_PAGE_SIZE = 5000
 # and bounded rather than one connection per foreign key.
 #
 # WHY THIS EXISTS: the pass is otherwise serial over every FK, and the pre-gate is the whole
-# cost (measured live: 0.022 ms per child row after v0.1.459, ~6 min for a 15-FK / 15.5M-row
-# schema). Removing the pre-gate is NOT an option -- a failed `ALTER TABLE ASYNC ... VALIDATE
+# cost. Removing the pre-gate is NOT an option -- a failed `ALTER TABLE ASYNC ... VALIDATE
 # CONSTRAINT` is unobservable on DSQL (convalidated stays false, indistinguishable from
 # "still running"; no sys.jobs row appears; a synchronous VALIDATE is FeatureNotSupported),
 # so the tool's own count is the only reliable verdict. Concurrency is what is left.
-_FK_PREGATE_WORKERS = 8
+#
+# 16 IS MEASURED, not chosen: a live sweep over this schema's 15 FKs / 15.5M child rows gave
+#   serial 1680.5s | 8-way 461.2s (3.64x) | 16-way 414.0s (4.06x) | 24-way 415.7s (4.04x)
+# so it saturates at 16 and 24 is fractionally worse -- the cluster doing the anti-join is
+# the limit, not client concurrency. Every arm applied all 15 with zero failures.
+_FK_PREGATE_WORKERS = 16
 
 
 def _pregate_orphans(

@@ -275,6 +275,14 @@ def _render_full_load_step(
     lob_candidates_for: Optional[Callable[[str], Sequence[tuple[str, str]]]] = None,
     exclude_lob_and_reload: Optional[Callable[[str, Sequence[str]], None]] = None,
     exclude_lob_block_reason: Optional[str] = None,
+    # Foreign keys are applied by an EXPLICIT action now, not as part of the load. The
+    # orphan pre-check is O(child rows) (measured 28.0 min serial / 7.9 min at 8-way for 15
+    # FKs over 15.5M child rows) and it ran AFTER every row was already written, so it held
+    # the end of the load for minutes. A CDC migration already applies them at cut over;
+    # this makes the Full-Load-only path the same flow.
+    apply_foreign_keys: Optional[Callable[[], None]] = None,
+    foreign_keys_pending: int = 0,
+    foreign_keys_applied: Optional[tuple] = None,
 ) -> None:
     """Render the Full Load step: confirm the selected workloads, then run it.
 
@@ -872,6 +880,16 @@ def _render_full_load_step(
             terminal=current.status in ("DONE", "FAILED", "CANCELLED"),
             quarantine_accepted=migration_state.accept_quarantined_rows,
             accept_quarantine_and_continue=accept_quarantine_and_continue,
+        )
+        # Referential integrity is a SEPARATE, explicit step now -- and the load reports
+        # complete without it, so this must state plainly that it is still outstanding.
+        _render_foreign_key_action(
+            ui,
+            terminal=current.status in ("DONE", "FAILED", "CANCELLED"),
+            pending=foreign_keys_pending,
+            applied=foreign_keys_applied,
+            apply_foreign_keys=apply_foreign_keys,
+            connections_ready=session.connection_ready(),
         )
         if running:
             # Re-arm a single-shot poll: it fires once, refreshes only this live
@@ -2042,6 +2060,67 @@ def _render_full_load_progress(
                     reasons=reasons,
                     action=_quar_actions(table_name, reason_text),
                 )
+
+def _render_foreign_key_action(
+    ui,
+    *,
+    terminal: bool,
+    pending: int,
+    applied: Optional[tuple],
+    apply_foreign_keys=None,
+    connections_ready: bool = False,
+) -> None:
+    """Render the explicit "Apply foreign keys" action, and its outstanding state.
+
+    Foreign keys used to be applied as the last act of the load. The orphan pre-check that
+    gates each one is O(child rows) -- measured 28.0 min serial / 7.9 min at 8-way for 15
+    foreign keys over 15.5M child rows -- and it ran AFTER every row was already written, so
+    it held the load's completion for minutes with nothing left to load. It is an operator
+    action now, which is also how a CDC migration has always applied them (at cut over), so
+    both migration types follow one flow.
+
+    The risk that buys is a FORGOTTEN click: an unapplied constraint is invisible, and DSQL
+    cannot tell us later (a failed async VALIDATE is unobservable -- live-verified). So the
+    outstanding state is an `error`-tone notice naming the count, not a quiet button.
+    """
+    if applied is not None:
+        got_applied, got_skipped, got_failed = (list(applied) + [0, 0, 0])[:3]
+        tone = "success" if not (got_skipped or got_failed) else "warning"
+        render_notice(
+            ui, tone=tone,
+            header=f"Foreign keys: {got_applied} applied",
+            body=(
+                f"{got_skipped} skipped (orphan rows), {got_failed} failed. "
+                "See the activity log for the per-constraint detail."
+                if (got_skipped or got_failed)
+                else "Referential integrity is in place on the target."
+            ),
+        )
+        return
+    if not (terminal and pending and apply_foreign_keys is not None):
+        return
+    render_notice(
+        ui, tone="error",
+        header=f"{pending} foreign key(s) not yet applied",
+        body=(
+            "The load is complete, but referential integrity is NOT in place until you "
+            "apply them. Each one is orphan-checked first, which reads the whole child "
+            "table, so this can take a while on a large schema — it is a separate step so "
+            "it no longer holds up the load."
+        ),
+    )
+    with ui.row().classes("items-center gap-2 w-full"):
+        btn = ui.button(
+            "Apply foreign keys",
+            on_click=lambda: apply_foreign_keys(),
+        ).props("color=primary icon=link")
+        if not connections_ready:
+            btn.props("disable")
+            btn.tooltip(
+                "Verify the source and target connections first — applying a foreign key "
+                "reads the child table and issues DDL on the target."
+            )
+
 
 def _render_accept_quarantine_action(
     ui,

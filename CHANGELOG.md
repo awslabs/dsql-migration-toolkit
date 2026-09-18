@@ -5,6 +5,43 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.461
+
+### Changed
+
+- **Foreign keys are now applied by an explicit "Apply foreign keys" action on the Data
+  Migration step, instead of automatically as the last act of the load.** The orphan
+  pre-check that gates each foreign key reads the whole child table, and it ran AFTER every
+  row was already written -- so "Full Load" stayed unfinished for many minutes with nothing
+  left to load. Measured on this schema (15 foreign keys over 15.46M child rows): **28.0 min
+  serial, 6.9 min at the measured concurrency**. The load now reports complete when the DATA
+  is complete.
+  - This also makes both migration types one flow: a CDC migration has always applied its
+    foreign keys from a button at cut over (they must not exist while the sink streams
+    out-of-order rows -- it dead-letters an FK violation, SQLSTATE 23503). The Full-Load-only
+    path was the odd one out.
+  - The orphan pre-check itself is unchanged and still mandatory. It cannot be replaced by
+    DSQL's own `ALTER TABLE ASYNC ... VALIDATE CONSTRAINT`, because a FAILED validation is
+    unobservable (live-verified: `convalidated` stayed false for 240s with a real orphan --
+    indistinguishable from "still running" -- no `sys.jobs` row ever appeared, and a
+    synchronous `VALIDATE CONSTRAINT` is `FeatureNotSupported`).
+  - **A forgotten click is the risk this buys, so it is guarded three ways:** the run summary
+    names the outstanding count and the action to take; the step shows an `error`-tone notice
+    ("N foreign key(s) not yet applied — referential integrity is NOT in place until you
+    apply them"), not a quiet button; and the cut-over runbook already offers the same action
+    for any pending foreign key, whatever the migration type.
+- **The orphan pre-gate fan-out is 16, measured rather than chosen.** A live sweep over the
+  same 15 FKs: serial 1680.5s | 8-way 461.2s (3.64x) | **16-way 414.0s (4.06x)** | 24-way
+  415.7s (4.04x). It saturates at 16 and 24 is fractionally worse -- the cluster doing the
+  anti-join is the limit, not client concurrency. Every arm applied all 15 with zero failures.
+
+### Known residual
+
+Applying the foreign keys on the Data Migration step does not suppress the cut-over runbook's
+offer of the same action (the two screens keep separate state). Re-applying is safe -- a
+duplicate `ADD CONSTRAINT` is treated as success (SQLSTATE 42710) -- but it pays the orphan
+pre-check again.
+
 ## v0.1.460
 
 ### Changed

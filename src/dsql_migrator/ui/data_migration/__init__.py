@@ -153,6 +153,10 @@ from dsql_migrator.ui.data_migration._full_load_engine import (
     sync_identity_sequences_for_tables,
     _seed_retry_chunks,
     run_full_load_retry,
+    # The explicit "Apply foreign keys" action runs the SAME engine pass the load used to
+    # run automatically (aliased, since `_apply_foreign_keys` is the engine's private name).
+    _apply_foreign_keys as _apply_foreign_keys_for,
+    pending_foreign_key_count,
     run_data_migration,
     job_status_to_step_status,
     data_migration_step_after_cdc,
@@ -1509,6 +1513,69 @@ def build_data_migration_screen(
                         ),
                     )
 
+            def _fk_apply_inputs():
+                """Rebuild the load inputs so the FK action applies the SAME conversions."""
+                _src = session.source_config
+                _tgt = session.target_config
+                _inv = _inventory()
+                _conv = SchemaConverter(source_type=_src.source_type).convert(_inv)
+                return DataMigrationInputs(
+                    source_config=_src,
+                    source_password=session.source_password,
+                    target_config=_tgt,
+                    inventory=_inv,
+                    aws_profile=session.aws_profile,
+                    replace_tables=frozenset(),      # no data movement: DDL only
+                    is_cdc_migration=migration_state.migration_type
+                    is MigrationType.FULL_LOAD_AND_CDC,
+                    table_conversions=applied_table_conversions(
+                        _conv,
+                        conv_state.edited_target_ddls,
+                        preserve_foreign_keys=conv_state.preserve_foreign_keys,
+                    ),
+                    excluded_lob_columns={
+                        table: frozenset(columns)
+                        for table, columns in migration_state.lob_exclusions().items()
+                    },
+                )
+
+            def fk_pending_count() -> int:
+                """Foreign keys still to apply, for the action's label and the warning."""
+                if migration_state.fk_apply_result is not None:
+                    return 0
+                try:
+                    return pending_foreign_key_count(migrator_factory(_fk_apply_inputs()))
+                except Exception:  # noqa: BLE001 - advisory count; never break the panel
+                    return 0
+
+            def apply_foreign_keys_now() -> None:
+                """Apply the preserved foreign keys -- an explicit operator action.
+
+                Foreign keys are no longer applied as part of the load: the orphan
+                pre-check is O(child rows) and measured 28.0 min (serial) / 7.9 min
+                (8-way) for 15 FKs over 15.5M child rows, all of it AFTER every row was
+                already written. Running it behind a button reports the load as finished
+                when it is finished, and makes the Full-Load-only path use the same flow
+                a CDC migration already uses at cut over.
+
+                The orphan pre-check itself is unchanged -- it cannot be skipped, because a
+                failed `ALTER TABLE ASYNC ... VALIDATE CONSTRAINT` is unobservable on DSQL.
+                """
+                fk_inputs = _fk_apply_inputs()
+                fk_migrator = migrator_factory(fk_inputs)
+
+                def work(handle: JobHandle) -> None:
+                    result = _apply_foreign_keys_for(fk_migrator, handle)
+                    migration_state.set_fk_apply_result(result)
+
+                migration_state.job_id = job_manager.submit(work)
+                ui.notify(
+                    "Applying foreign keys — progress below. The orphan pre-check reads "
+                    "each child table, so this can take a while on a large schema.",
+                    type="positive", position="top",
+                )
+                refresh()
+
             def accept_quarantine_and_continue() -> None:
                 # Accept permanently-quarantined rows (>1 MiB values, etc.) as an
                 # acknowledged gap and unblock CDC WITHOUT re-running: the loadable
@@ -1802,6 +1869,13 @@ def build_data_migration_screen(
                                 migration_state, job_manager
                             ),
                             accept_quarantine_and_continue=accept_quarantine_and_continue,
+                            # Foreign keys are an explicit action now, not part of the
+                            # load: the orphan pre-check is O(child rows) and was holding
+                            # the END of the load for minutes. Same flow a CDC migration
+                            # already uses at cut over.
+                            apply_foreign_keys=apply_foreign_keys_now,
+                            foreign_keys_pending=fk_pending_count(),
+                            foreign_keys_applied=migration_state.fk_apply_result,
                             stop_full_load=stop_full_load,
                             refresh=refresh,
                             ai_error_opener=ai_error_opener,
