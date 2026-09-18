@@ -156,6 +156,29 @@ class JobHandle:
         """
         return self._manager.is_cancel_requested(self._job_id)
 
+    def heartbeat(self) -> None:
+        """Report "still working" WITHOUT changing any job state.
+
+        The stall watchdog (:meth:`JobManager.reap_stalled_jobs`) fails a job that has not
+        refreshed ``last_progress_at`` for its whole window, and only :meth:`update` does
+        that -- so a job whose work reports progress through UI state instead of the job
+        (Validation, Schema apply, Evaluation) or whose phase runs outside its progress
+        drain (Full Load's pre-load DDL pass and its post-load FK pass) was silent for its
+        entire duration and reaped while perfectly healthy.
+
+        Call this at a REAL unit boundary -- a completed page, object, table, foreign key,
+        or one slice of a deliberate wait. Deliberately NOT a background timer: a thread
+        ticking on its own would stamp liveness even for a genuinely wedged job, which is
+        exactly what the watchdog exists to catch. Reaching a unit boundary is the evidence
+        that the job is alive; a diagnostic read is not (see :meth:`snapshot`).
+
+        Best-effort: never raises, so liveness reporting can be dropped into a hot loop.
+        """
+        try:
+            self._manager.apply_update(self._job_id, lambda job: None)
+        except Exception:  # noqa: BLE001 - liveness only; never break the work
+            pass
+
     def snapshot(self) -> "MigrationJob":
         """Return a deep-copied read of the live job WITHOUT touching liveness.
 

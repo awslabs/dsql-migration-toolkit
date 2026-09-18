@@ -5,6 +5,79 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.456
+
+The stall watchdog fails a job that has not refreshed its liveness clock for 900 s, but
+only Full Load's progress drain ever refreshed it -- so most long-running work was silent
+for its entire duration and was reaped **while perfectly healthy**. Nine such spans are
+closed here, plus the two blocking-wait defects behind them.
+
+Design note: liveness is reported at REAL UNIT BOUNDARIES (a completed page, object,
+table, foreign key, or one slice of a deliberate wait), never from a background timer. A
+timer ticking on its own would stamp liveness for a genuinely wedged job too, which is
+exactly what the watchdog exists to catch. The mirror of this is v0.1.454's fix in the
+other direction: a purely diagnostic read must NOT stamp liveness.
+
+### Fixed
+
+- **A validation run longer than 15 minutes was reported as a stall failure.** Progress
+  went only to UI state, never to the job, so the whole run -- exact `COUNT(*)` + MD5
+  checksum per table plus the trailing identity resync -- was one silence gap. The reap
+  cannot be undone (`_mark_done` will not overwrite FAILED), so the operator saw a green
+  MATCH report under a red "Failed" badge with Cut over refusing to open. Liveness is now
+  reported per table AND per bounded page: a single 10M-row CHECKSUM table is thousands of
+  paged round trips and exceeds the window on its own, so all six paging scans (source and
+  target counts, both checksums, the PK reconcile streams, the orphan count) report each
+  page through a new optional `Validator.set_page_hook` seam.
+- **Full Load's entire post-load tail was silent** -- view recreate, the foreign-key pass
+  and the identity resync all run AFTER the progress drain is joined. That tail is
+  unbounded: up to 300 s per distinct still-building parent index (four such parents is
+  1200 s) plus an O(rows) orphan pre-gate per FK. A fully successful load was therefore
+  marked FAILED, which also gates Validation shut. The pass now reports liveness per
+  foreign key and per poll of a building index, **and honours a stop** instead of running
+  the rest of the pass after the user clicked Stop.
+- **Full Load's pre-load DDL pass was silent too** -- the serial DROP+recreate of every
+  "drop & reload" table is one fresh DSQL connect plus DDL each, and it runs BEFORE the
+  drain thread that owns liveness starts. A few hundred tables crossed the window before a
+  single row loaded. Now reports per recreated table.
+- **A deliberately throttled Full Load was reaped as "unresponsive".** The source-load
+  governor's pause reported liveness only on the pause/resume TRANSITION, so a sustained
+  pause -- the whole point of the `max_source_threads_running` guard -- looked identical to
+  a dead worker. It now reports once per wait slice, on both the in-process and sharded
+  worker paths, via a liveness-only marker that does not disturb the drain's paused-reader
+  count.
+- **Full Load liveness was row-count based, not time based.** Progress flushed only once
+  10 000 rows accumulated, on the assumption that 10 000 rows always land inside the
+  window -- false for wide/LOB-heavy rows (a batch caps at ~8 rows when values approach
+  DSQL's ~1 MiB limit), and a table with FEWER than 10 000 rows total never flushed
+  mid-table at all, making the silent span the whole table load. A 30 s time floor now
+  flushes as well.
+- **The Schema Conversion apply, Evaluation, and cut-over "Apply foreign keys" jobs never
+  reported liveness either.** Each is unbounded in its own way -- a fresh IAM-token/TLS
+  DSQL connection per DDL statement, per-table source reflection of a very large schema,
+  and the same O(rows) orphan pre-gates as the Full Load FK pass. All three now report at
+  their per-object / per-phase / per-FK boundaries.
+- **One wedged write batch could block Stop forever.** The DSQL connection set
+  `connect_timeout` only -- no socket read timeout and no keepalives -- so a socket
+  blackholed mid-statement (a NAT/ENI idle timeout, a dropped ENI) left `cursor.execute`
+  waiting on the OS default; the drain never completed and a thread pool, unlike the worker
+  processes, cannot be terminated. The connection now enables TCP keepalives and
+  `tcp_user_timeout`, mirroring what the PostgreSQL source engine already sets. Keepalives
+  rather than `statement_timeout` on purpose: they probe only when nothing is in flight, so
+  a healthy-but-slow statement (a large keyset checksum page) is never cut short while a
+  DEAD peer is detected and raised into the existing reconnect/OCC retry. **Live-verified
+  against a real DSQL cluster** -- an unsupported connection option would break every
+  connect while leaving the unit suite green (this is how v0.1.438 shipped).
+- The batch drain's `wait(FIRST_COMPLETED)` is now a series of short bounded waits instead
+  of one uninterruptible block. It still does not return until a batch completes, so the
+  bounded-parallelism guarantee is unchanged.
+
+### Tests
+
+- 3786 green. Five mutations checked, each caught: silencing the heartbeat primitive,
+  dropping validation's per-page seam, stopping a pager from calling its hook, removing the
+  FK pass's per-FK report, and disabling the governor's per-slice report.
+
 ## v0.1.455
 
 ### Fixed

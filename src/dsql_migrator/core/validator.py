@@ -192,7 +192,8 @@ def _source_count(connection: _SourceConnection, table_name: str) -> int:
 
 
 def _source_checksum(
-    connection: _SourceConnection, table: TableDef, page_size: int
+    connection: _SourceConnection, table: TableDef, page_size: int,
+    on_page: Optional[Callable[[], None]] = None,
 ) -> str:
     """Return the source checksum for ``table`` as a string (read-only).
 
@@ -203,13 +204,16 @@ def _source_checksum(
     """
     pk_column = single_pk_column(table)
     if pk_column is not None:
-        return _source_checksum_keyset(connection, table, pk_column, page_size)
+        return _source_checksum_keyset(
+            connection, table, pk_column, page_size, on_page=on_page
+        )
     value = connection.execute(text(build_mysql_checksum_sql(table))).scalar()  # type: ignore[attr-defined]
     return "0" if value is None else str(value)
 
 
 def _source_checksum_keyset(
-    connection: _SourceConnection, table: TableDef, pk_column: str, page_size: int
+    connection: _SourceConnection, table: TableDef, pk_column: str, page_size: int,
+    on_page: Optional[Callable[[], None]] = None,
 ) -> str:
     """Accumulate the source checksum over bounded keyset pages (single-column PK).
 
@@ -224,6 +228,8 @@ def _source_checksum_keyset(
     total = 0
     last: object = None
     while True:
+        if on_page is not None:
+            on_page()
         if last is None:
             result = connection.execute(first_sql, {"page": page_size})  # type: ignore[attr-defined]
         else:
@@ -455,7 +461,8 @@ def _target_count(connection: Any, table_name: str) -> int:
 
 
 def _target_count_keyset(
-    connection: Any, table: TableDef, pk_column: str, page_size: int
+    connection: Any, table: TableDef, pk_column: str, page_size: int,
+    on_page: Optional[Callable[[], None]] = None,
 ) -> int:
     """Exact target row count via BOUNDED keyset paging on a single-column PK.
 
@@ -472,6 +479,8 @@ def _target_count_keyset(
     total = 0
     last: object = None
     while True:
+        if on_page is not None:
+            on_page()
         cursor = connection.cursor()
         try:
             if last is None:
@@ -487,7 +496,10 @@ def _target_count_keyset(
         last = rows[-1][0]
 
 
-def _bounded_target_count(connection: Any, table: TableDef, page_size: int) -> int:
+def _bounded_target_count(
+    connection: Any, table: TableDef, page_size: int,
+    on_page: Optional[Callable[[], None]] = None,
+) -> int:
     """Target row count, bounded (keyset) for a single-column PK; ``COUNT(*)`` else.
 
     A composite/missing PK has no single keyset column, so it falls back to the
@@ -496,12 +508,15 @@ def _bounded_target_count(connection: Any, table: TableDef, page_size: int) -> i
     """
     pk_column = single_pk_column(table)
     if pk_column is not None:
-        return _target_count_keyset(connection, table, pk_column, page_size)
+        return _target_count_keyset(
+            connection, table, pk_column, page_size, on_page=on_page
+        )
     return _target_count(connection, table.name)
 
 
 def _target_checksum(
-    connection: Any, table: TableDef, page_size: int, source_is_postgres: bool = False
+    connection: Any, table: TableDef, page_size: int, source_is_postgres: bool = False,
+    on_page: Optional[Callable[[], None]] = None,
 ) -> str:
     """Return the target checksum for ``table`` as a string (read-only).
 
@@ -534,6 +549,7 @@ def _target_checksum_keyset(
     pk_column: str,
     page_size: int,
     source_is_postgres: bool = False,
+    on_page: Optional[Callable[[], None]] = None,
 ) -> str:
     """Accumulate the target checksum over bounded keyset pages (single-column PK).
 
@@ -554,6 +570,8 @@ def _target_checksum_keyset(
     total = 0
     last: object = None
     while True:
+        if on_page is not None:
+            on_page()
         cursor = connection.cursor()
         try:
             if last is None:
@@ -677,7 +695,8 @@ _RECONCILE_SAMPLE_CAP = 50
 
 
 def _iter_source_pks(
-    connection: _SourceConnection, table: TableDef, pk_column: str, page_size: int
+    connection: _SourceConnection, table: TableDef, pk_column: str, page_size: int,
+    on_page: Optional[Callable[[], None]] = None,
 ) -> "Iterator[int]":
     """Yield every source PK in ascending order via bounded keyset pagination.
 
@@ -689,6 +708,8 @@ def _iter_source_pks(
     next_sql = text(build_mysql_pk_next_page_sql(table, pk_column))
     last: object = None
     while True:
+        if on_page is not None:
+            on_page()
         if last is None:
             result = connection.execute(first_sql, {"page": page_size})
         else:
@@ -703,7 +724,8 @@ def _iter_source_pks(
 
 
 def _iter_target_pks(
-    connection: Any, table: TableDef, pk_column: str, page_size: int
+    connection: Any, table: TableDef, pk_column: str, page_size: int,
+    on_page: Optional[Callable[[], None]] = None,
 ) -> "Iterator[int]":
     """Yield every target PK in ascending order via bounded keyset pagination.
 
@@ -714,6 +736,8 @@ def _iter_target_pks(
     next_sql = build_pg_pk_next_page_sql(table, pk_column, page_size)
     last: object = None
     while True:
+        if on_page is not None:
+            on_page()
         cursor = connection.cursor()
         try:
             if last is None:
@@ -750,11 +774,14 @@ def _source_row_count_live(
     connection: _SourceConnection,
     table: TableDef,
     page_size: int,
+    on_page: Optional[Callable[[], None]] = None,
 ) -> int:
     """Exact live source count: PG keyset-bounds it (single PK) like the target; MySQL
     (no per-txn limit) uses a plain ``COUNT(*)`` as before."""
     if _source_is_postgres(dialect):
-        return _bounded_target_count(PgSourceConnection(connection), table, page_size)
+        return _bounded_target_count(
+            PgSourceConnection(connection), table, page_size, on_page=on_page
+        )
     return _source_count(connection, table.name)
 
 
@@ -777,12 +804,14 @@ def _iter_source_pks_for(
     table: TableDef,
     pk_column: str,
     page_size: int,
+    on_page: Optional[Callable[[], None]] = None,
 ) -> "Iterator[int]":
     if _source_is_postgres(dialect):
         return _iter_target_pks(
-            PgSourceConnection(connection), table, pk_column, page_size
+            PgSourceConnection(connection), table, pk_column, page_size,
+            on_page=on_page,
         )
-    return _iter_source_pks(connection, table, pk_column, page_size)
+    return _iter_source_pks(connection, table, pk_column, page_size, on_page=on_page)
 
 
 def _source_pk_tokens_for(
@@ -883,7 +912,8 @@ def reconcile_pk_streams(
 
 
 def _target_orphan_count(
-    connection: Any, table: TableDef, fk: ForeignKeyDef, page_size: int
+    connection: Any, table: TableDef, fk: ForeignKeyDef, page_size: int,
+    on_page: Optional[Callable[[], None]] = None,
 ) -> int:
     """Return the number of orphan child rows for ``fk`` on the target.
 
@@ -897,7 +927,7 @@ def _target_orphan_count(
     pk_column = single_pk_column(table)
     if pk_column is not None:
         return _target_orphan_count_keyset(
-            connection, table.name, fk, pk_column, page_size
+            connection, table.name, fk, pk_column, page_size, on_page=on_page
         )
     value = _target_scalar(connection, build_orphan_count_sql(table.name, fk))
     return int(value) if value is not None else 0
@@ -909,6 +939,7 @@ def _target_orphan_count_keyset(
     fk: ForeignKeyDef,
     pk_column: str,
     page_size: int,
+    on_page: Optional[Callable[[], None]] = None,
 ) -> int:
     """Accumulate the orphan count over bounded keyset pages (single-column PK).
 
@@ -926,6 +957,8 @@ def _target_orphan_count_keyset(
     total = 0
     last: object = None
     while True:
+        if on_page is not None:
+            on_page()
         cursor = connection.cursor()
         try:
             if last is None:
@@ -1017,6 +1050,30 @@ class Validator:
         )
         self._row_diff_sample_size = max(0, int(row_diff_sample_size))
         self._reconcile_page_size = max(1, int(reconcile_page_size))
+        self._page_hook: Optional[Callable[[], None]] = None
+
+    def set_page_hook(self, hook: Optional[Callable[[], None]]) -> None:
+        """Register a callback invoked once per BOUNDED PAGE of every scan.
+
+        Exists so a caller can report job liveness (and notice a stop) DURING a single
+        very large table: the per-table ``on_progress`` hook fires only between tables,
+        so one 10M-row CHECKSUM table -- thousands of paged round trips -- was a single
+        silence gap and any validation past the job watchdog's window was reaped as a
+        stall, leaving a green MATCH report under a red Failed step badge.
+
+        A page is a real unit of work, so stamping from it cannot mask a wedged scan.
+        """
+        self._page_hook = hook
+
+    def _page(self) -> None:
+        """Invoke the registered page hook, if any. Never raises."""
+        hook = self._page_hook
+        if hook is None:
+            return
+        try:
+            hook()
+        except Exception:  # noqa: BLE001 - advisory; never break a scan
+            pass
 
     def validate(
         self,
@@ -1446,6 +1503,7 @@ class Validator:
         source_row_count = self._source_row_count(
             source_connection, table, watermark, source_dialect,
             self._reconcile_page_size,
+            on_page=self._page,
         )
         # The TARGET count must be BOUNDED on Aurora DSQL: a single COUNT(*) scans the
         # whole table in one transaction and, at scale, exceeds DSQL's hard 300s limit,
@@ -1459,7 +1517,8 @@ class Validator:
         row_count_match: Optional[bool] = None
         if deep_only_on_count_mismatch:
             target_row_count = _bounded_target_count(
-                target_connection, table, self._reconcile_page_size
+                target_connection, table, self._reconcile_page_size,
+                on_page=self._page,
             )
             row_count_match = source_row_count == target_row_count
 
@@ -1480,6 +1539,7 @@ class Validator:
             target_checksum = _target_checksum(
                 target_connection, table, self._reconcile_page_size,
                 source_is_postgres=_source_is_postgres(source_dialect),
+                on_page=self._page,
             )
             checksum_match = source_checksum == target_checksum
             # Columns the checksum could not value-compare (no byte-identical
@@ -1505,10 +1565,11 @@ class Validator:
                     pk_column,
                     _iter_source_pks_for(
                         source_dialect, source_connection, table, pk_column,
-                        self._reconcile_page_size,
+                        self._reconcile_page_size, on_page=self._page,
                     ),
                     _iter_target_pks(
-                        target_connection, table, pk_column, self._reconcile_page_size
+                        target_connection, table, pk_column,
+                        self._reconcile_page_size, on_page=self._page,
                     ),
                     should_cancel=should_cancel,
                 )
@@ -1522,7 +1583,8 @@ class Validator:
                 reconcile_result.target_count
                 if reconcile_result is not None
                 else _bounded_target_count(
-                    target_connection, table, self._reconcile_page_size
+                    target_connection, table, self._reconcile_page_size,
+                    on_page=self._page,
                 )
             )
             row_count_match = source_row_count == target_row_count
@@ -1570,6 +1632,7 @@ class Validator:
         watermark: Optional[Watermark],
         source_dialect: SourceDialect,
         page_size: int,
+        on_page: Optional[Callable[[], None]] = None,
     ) -> int:
         """Return the as-of source row count for ``table``.
 
@@ -1587,7 +1650,7 @@ class Validator:
         ):
             return watermark.table_row_counts[table.name]
         return _source_row_count_live(
-            source_dialect, source_connection, table, page_size
+            source_dialect, source_connection, table, page_size, on_page=on_page,
         )
 
     def _check_orphans(
@@ -1603,7 +1666,8 @@ class Validator:
         findings: list[OrphanFinding] = []
         for fk in table.foreign_keys:
             orphan_count = _target_orphan_count(
-                target_connection, table, fk, self._reconcile_page_size
+                target_connection, table, fk, self._reconcile_page_size,
+                on_page=self._page,
             )
             if orphan_count > 0:
                 findings.append(

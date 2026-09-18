@@ -44,6 +44,14 @@ from dsql_migrator.core.aws_session import build_session
 from dsql_migrator.core.models import ConnectionResult, TargetConnectionConfig
 
 # DSQL admin database role; selects the admin token-generation API.
+# TCP keepalive / dead-peer detection for the DSQL connection. A blackholed socket is
+# otherwise indistinguishable from a slow query, and the load path has no other bound on
+# it. Detection lands at roughly idle + interval x count.
+_KEEPALIVE_IDLE_SECONDS = 60
+_KEEPALIVE_INTERVAL_SECONDS = 20
+_KEEPALIVE_COUNT = 3
+_DEAD_PEER_TIMEOUT_SECONDS = 120
+
 ADMIN_USERNAME = "admin"
 
 # DSQL IAM auth tokens are short-lived. 900s (15 min) is the DSQL default.
@@ -321,6 +329,26 @@ class DsqlConnector:
             # blocking the UI "Test connection" / prerequisite probe indefinitely on
             # the OS default. Mirrors the source introspector's connect_timeout.
             connect_timeout=self._connect_timeout,
+            # Bound a connection whose peer stops answering. connect_timeout covers only
+            # the HANDSHAKE, so a socket blackholed mid-statement (NAT/ENI idle timeout,
+            # a dropped ENI) left cursor.execute waiting on the OS default -- which is how
+            # a single wedged write batch could block Stop indefinitely: the batch never
+            # returns, so the drain never completes and the thread pool cannot be torn
+            # down (threads, unlike the worker processes, cannot be terminated).
+            #
+            # Keepalives are the right mechanism here rather than statement_timeout: they
+            # probe only when nothing is in flight, so a healthy-but-slow statement (a
+            # large keyset checksum page) is never cut short, while a DEAD peer is
+            # detected and the driver raises -- which the existing OCC/reconnect retry
+            # already handles. Mirrors what the PostgreSQL SOURCE engine already sets
+            # (source_dialect/postgres.py). tcp_user_timeout is milliseconds and is a
+            # no-op on platforms without TCP_USER_TIMEOUT (macOS dev), effective on the
+            # Linux deploy target.
+            keepalives=1,
+            keepalives_idle=_KEEPALIVE_IDLE_SECONDS,
+            keepalives_interval=_KEEPALIVE_INTERVAL_SECONDS,
+            keepalives_count=_KEEPALIVE_COUNT,
+            tcp_user_timeout=_DEAD_PEER_TIMEOUT_SECONDS * 1000,
         )
         if ipv4:
             connect_kwargs["hostaddr"] = ipv4

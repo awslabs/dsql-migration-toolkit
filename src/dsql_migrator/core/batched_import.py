@@ -142,6 +142,11 @@ MAX_BATCH_ROWS = 3000
 # to leave headroom for bind-parameter / wire encoding overhead). Wide-row tables
 # then split into smaller batches automatically instead of having the whole
 # transaction rejected for exceeding the byte limit.
+# How long one drain wait blocks before returning to the caller's cancel poll. Short
+# enough that Stop feels immediate, long enough that a healthy batch is normally awaited
+# in a single wait rather than spun on.
+_DRAIN_POLL_SECONDS = 1.0
+
 MAX_BATCH_BYTES = 8 * 1024 * 1024
 
 # Default number of concurrent in-flight INSERT batches (each on its own DSQL
@@ -1140,7 +1145,24 @@ class BatchedImporter:
         stopped_early = False
 
         def drain_one() -> None:
-            done, _ = wait(set(in_flight), return_when=FIRST_COMPLETED)
+            # BOUNDED wait. With no timeout, one batch whose DSQL response never arrives
+            # (a blackholed socket -- the DSQL connection sets connect_timeout only, no
+            # socket read timeout) blocked the cooperative-stop drain forever, and the
+            # enclosing `with ThreadPoolExecutor(...)` then blocked on its own
+            # shutdown(wait=True). Timing out lets the caller re-poll should_cancel and
+            # come back, so Stop stays responsive while a healthy batch is still awaited.
+            while True:
+                done, _ = wait(
+                    set(in_flight), timeout=_DRAIN_POLL_SECONDS,
+                    return_when=FIRST_COMPLETED,
+                )
+                if done:
+                    break
+                # Nothing finished yet. Keep waiting -- returning here would let the
+                # caller submit past `parallelism` and break the bounded-pool guarantee.
+                # The timeout exists so this is a series of short waits rather than one
+                # uninterruptible block; a batch that can never answer is bounded by the
+                # DSQL connection's socket timeouts (see target_connection.py), not here.
             for future in done:
                 chunk_id, shard_id, batch_index = in_flight.pop(future)
                 outcome = _resolve_outcome(future, chunk_id)

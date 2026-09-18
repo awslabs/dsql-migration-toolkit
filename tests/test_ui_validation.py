@@ -2629,7 +2629,7 @@ def test_run_cutover_foreign_keys_applies_and_records(monkeypatch) -> None:
 
     captured: dict = {}
 
-    def _fake_apply(conversions, connection_factory, child_pk_columns=None):
+    def _fake_apply(conversions, connection_factory, child_pk_columns=None, **_kw):
         captured["tables"] = sorted(conversions)
         captured["child_pk_columns"] = child_pk_columns
         return (1, 0, 0)
@@ -5551,3 +5551,58 @@ def test_result_badge_slot_reads_the_payload_not_the_sort_key() -> None:
     # the result slot is no longer part of that props.value loop.
     assert 'for col in ("row_count", "checksum"):' in src
     assert 'for col in ("row_count", "checksum", "result"):' not in src
+
+
+def test_the_validation_job_reports_liveness_per_table_and_per_page(monkeypatch) -> None:
+    """Validation reported progress only to the UI, never to the job.
+
+    So the ENTIRE run -- exact COUNT(*) + MD5 per table plus the trailing identity resync
+    -- was one silence gap, and any run past the stall window was reaped as FAILED with
+    the Full-Load-worded "the load appears to have stalled" text. _mark_done cannot
+    restore DONE, so the operator got a green MATCH report under a red Failed badge with
+    Cut over refusing to open.
+    """
+    import dsql_migrator.ui.validation as validation
+
+    seen: dict = {}
+
+    def _fake_run(inputs, **kwargs):
+        seen.update(kwargs)
+        cb = kwargs.get("on_progress")
+        if cb is not None:
+            cb("orders", 1, 1)
+        page = kwargs.get("on_page")
+        if page is not None:
+            page()
+            page()
+        raise validation.ValidationCancelled("stop here")
+
+    monkeypatch.setattr(validation, "run_validation", _fake_run)
+
+    # Spy on the liveness PRIMITIVE, so this asserts the value the code computes rather
+    # than one the test injected.
+    from dsql_migrator.core.job_manager import JobHandle
+
+    beats = {"n": 0}
+    real_beat = JobHandle.heartbeat
+
+    def _counting_beat(self):
+        beats["n"] += 1
+        return real_beat(self)
+
+    monkeypatch.setattr(JobHandle, "heartbeat", _counting_beat)
+
+    runner, state, manager = _build_runner_with_session(
+        source_verified=True, target_verified=True
+    )
+    runner()
+    assert state.job_id is not None
+    assert manager.wait(state.job_id, timeout=5.0) is True
+
+    assert "on_page" in seen, "the per-page liveness seam was not passed down"
+    assert callable(seen["on_page"]), seen["on_page"]
+    # 1 per-table progress callback + 2 pages, each of which must stamp liveness.
+    assert beats["n"] >= 3, (
+        f"the validation job reported liveness {beats['n']} time(s); progress went only "
+        "to the UI state, which is what got healthy runs reaped as stalled"
+    )

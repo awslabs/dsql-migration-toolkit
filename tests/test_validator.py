@@ -2480,19 +2480,19 @@ def test_source_read_dispatch_routes_by_engine(monkeypatch) -> None:
     calls: list[tuple] = []
     # PgSourceConnection -> a marker so we can assert the PG path wraps the connection.
     monkeypatch.setattr(v, "PgSourceConnection", lambda c: ("shim", c))
-    monkeypatch.setattr(v, "_source_checksum", lambda c, t, ps: calls.append(("my_ck", c)) or "my")
+    monkeypatch.setattr(v, "_source_checksum", lambda c, t, ps, **_k: calls.append(("my_ck", c)) or "my")
     # _target_checksum / _target_pk_tokens now take source_is_postgres -- the PG-source path
     # must pass True (so the DSQL renderer uses the PG numeric-scale rule on both ends).
     monkeypatch.setattr(
         v, "_target_checksum",
-        lambda c, t, ps, source_is_postgres=False: calls.append(("pg_ck", c, source_is_postgres)) or "pg",
+        lambda c, t, ps, source_is_postgres=False, **_k: calls.append(("pg_ck", c, source_is_postgres)) or "pg",
     )
     monkeypatch.setattr(v, "_source_count", lambda c, name: calls.append(("my_ct", c)) or 1)
-    monkeypatch.setattr(v, "_bounded_target_count", lambda c, t, ps: calls.append(("pg_ct", c)) or 2)
-    monkeypatch.setattr(v, "_source_pk_tokens", lambda c, t, pk, n: calls.append(("my_pk", c)) or {})
+    monkeypatch.setattr(v, "_bounded_target_count", lambda c, t, ps, **_k: calls.append(("pg_ct", c)) or 2)
+    monkeypatch.setattr(v, "_source_pk_tokens", lambda c, t, pk, n, **_k: calls.append(("my_pk", c)) or {})
     monkeypatch.setattr(
         v, "_target_pk_tokens",
-        lambda c, t, pk, n, source_is_postgres=False: calls.append(("pg_pk", c, source_is_postgres)) or {},
+        lambda c, t, pk, n, source_is_postgres=False, **_k: calls.append(("pg_pk", c, source_is_postgres)) or {},
     )
 
     tbl = TableDef(name="t", columns=[ColumnDef(name="id", mysql_type="integer")], primary_key=["id"])
@@ -2784,3 +2784,76 @@ def test_reconnect_retry_covers_the_reconnect_itself() -> None:
     assert attempts_seen["n"] == 3, "the reconnect itself must be retried, not raised"
     # And the backoff actually grows with the attempt (0.5 * 1, then 0.5 * 2).
     assert slept == [0.5, 1.0], slept
+
+
+def test_every_bounded_scan_reports_a_page_hook() -> None:
+    """One very large table must not be a single silence gap.
+
+    `on_progress` fires only BETWEEN tables, so a 10M-row CHECKSUM table -- thousands of
+    paged round trips -- reported nothing at all and any validation past the job
+    watchdog's window was reaped as a stall, leaving a green MATCH report under a red
+    Failed step badge with Cut over refusing to open. Every bounded page is a real unit
+    of work, so each paging loop now calls the hook once per page.
+    """
+    import inspect
+
+    from dsql_migrator.core import validator as _v
+
+    pagers = [
+        _v._source_checksum_keyset, _v._target_count_keyset, _v._target_checksum_keyset,
+        _v._iter_source_pks, _v._iter_target_pks, _v._target_orphan_count_keyset,
+    ]
+    for fn in pagers:
+        assert "on_page" in inspect.signature(fn).parameters, fn.__name__
+        # and it is actually CALLED inside the function, not merely accepted
+        assert "on_page" in fn.__code__.co_varnames, fn.__name__
+
+    # Behaviour: a paging loop calls the hook once per page.
+    calls: list[int] = []
+    pages = [
+        [(10, 1, 2)], [(20, 2, 2)], [(30, 3, 1)],     # 3 pages, last one short
+    ]
+    state = {"n": 0}
+
+    class _Res:
+        def __init__(self, rows): self._rows = rows
+        def __iter__(self): return iter(self._rows)
+
+    class _Conn:
+        def execute(self, _sql, _params=None):
+            rows = pages[min(state["n"], len(pages) - 1)]
+            state["n"] += 1
+            return _Res(rows)
+
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    table = TableDef(
+        name="t",
+        columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+        primary_key=["id"],
+    )
+    _v._source_checksum_keyset(
+        _Conn(), table, "id", 2, on_page=lambda: calls.append(1)
+    )
+    assert len(calls) == state["n"], (calls, state)
+    assert len(calls) >= 2, "the hook must fire per page, not once per table"
+
+
+def test_the_page_hook_is_optional_and_defaults_to_no_reporting() -> None:
+    # Injected validator doubles and the CLI path pass none; the seam must be inert then.
+    from dsql_migrator.core.validator import Validator
+
+    v = Validator.__new__(Validator)
+    v._page_hook = None
+    v._page()                       # must not raise
+
+    seen: list[int] = []
+    v.set_page_hook(lambda: seen.append(1))
+    v._page()
+    assert seen == [1]
+
+    def _boom() -> None:
+        raise RuntimeError("hook exploded")
+
+    v.set_page_hook(_boom)
+    v._page()                       # advisory: a bad hook must never break a scan

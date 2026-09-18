@@ -543,3 +543,49 @@ def test_watchdog_disabled_when_timeout_none() -> None:
     manager = JobManager(stall_timeout_seconds=None)
     assert manager.reap_stalled_jobs() == []
     manager.shutdown()
+
+
+def test_heartbeat_refreshes_liveness_without_changing_the_job() -> None:
+    """The primitive the whole liveness fix rests on.
+
+    The stall watchdog fails a job that has not refreshed ``last_progress_at`` for its
+    window, and only ``update`` did that -- so every job whose work reports progress
+    through UI state (Validation, Schema apply, Evaluation) or whose phase runs outside
+    its progress drain (Full Load's pre-load DDL pass and post-load FK pass) was silent
+    for its whole duration and reaped while healthy.
+    """
+    import threading
+
+    from dsql_migrator.core.job_manager import JobHandle, JobManager
+
+    clock = {"t": 1000.0}
+    manager = JobManager(clock=lambda: clock["t"])
+    started, release = threading.Event(), threading.Event()
+
+    def work(handle):
+        started.set()
+        release.wait(5.0)
+
+    job_id = manager.submit(work)
+    assert started.wait(5.0)
+    handle = JobHandle(manager, job_id)
+
+    before_stamp = manager._records[job_id].last_progress_at
+    before_job = manager.get_status(job_id).model_dump()
+
+    clock["t"] += 10_000.0          # far past any stall window
+    handle.heartbeat()
+
+    assert manager._records[job_id].last_progress_at > before_stamp
+    assert manager.get_status(job_id).model_dump() == before_job, (
+        "a heartbeat must not change any job state"
+    )
+    release.set()
+
+
+def test_heartbeat_never_raises_for_an_unknown_job() -> None:
+    # It is called from hot loops and from passes that may outlive their job record;
+    # raising there would turn liveness reporting into a load failure.
+    from dsql_migrator.core.job_manager import JobHandle, JobManager
+
+    JobHandle(JobManager(), "no-such-job").heartbeat()   # must not raise

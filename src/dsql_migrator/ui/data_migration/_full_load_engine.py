@@ -544,6 +544,15 @@ FULL_LOAD_SOURCE_READ_TIMEOUT_SECONDS = 300
 # on completion regardless of this threshold.
 PROGRESS_FLUSH_ROWS = 10_000
 
+# ALSO flush after this long, even if fewer than PROGRESS_FLUSH_ROWS have accumulated.
+# The row threshold alone assumed 10k rows always land faster than the job watchdog's
+# window -- false for wide/LOB-heavy rows: MAX_BATCH_BYTES caps a batch at ~8 rows when
+# values approach DSQL's ~1 MiB limit, and a table with FEWER than 10k rows total never
+# flushes mid-table at all, so the silent span is the whole table load. Well under the
+# 900 s stall window, and a completed batch is a real unit boundary, so this cannot mask
+# a wedged write.
+PROGRESS_FLUSH_SECONDS = 30.0
+
 # Safety ceiling on concurrent SOURCE snapshot readers = table_parallelism x
 # reader_shards. Each holds a long-lived source connection; this caps the product
 # so a high table_parallelism x reader_shards can't exhaust the source's
@@ -966,13 +975,20 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
         pending_loaded = 0
         pending_skipped = 0
 
+        last_flush = [_time.monotonic()]
+
         def _on_rows(loaded: int, skipped: int = 0) -> None:
             nonlocal pending_loaded, pending_skipped
             pending_loaded += loaded
             pending_skipped += skipped
-            if pending_loaded + pending_skipped >= PROGRESS_FLUSH_ROWS:
+            now = _time.monotonic()
+            if (
+                pending_loaded + pending_skipped >= PROGRESS_FLUSH_ROWS
+                or now - last_flush[0] >= PROGRESS_FLUSH_SECONDS
+            ):
                 flush_l, flush_s = pending_loaded, pending_skipped
                 pending_loaded, pending_skipped = 0, 0
+                last_flush[0] = now
                 _report_progress(progress_queue, (name, flush_l, flush_s))
 
         _is_cancelled = lambda: (  # noqa: E731 - shared by the load + its retry
@@ -997,6 +1013,11 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
         def _on_throttle(paused: bool, _running: Optional[int]) -> None:
             _report_progress(progress_queue, (_CHUNK_THROTTLED, name, paused))
 
+        def _on_pause_slice() -> None:
+            # A pure liveness marker: re-sending _CHUNK_THROTTLED would inflate the
+            # drain's per-table paused-reader count on every slice.
+            _report_progress(progress_queue, _HEARTBEAT)
+
         def _load_table():
             pre = args.pre_recreated and _attempt_state["first"]
             _attempt_state["first"] = False
@@ -1007,6 +1028,7 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
                 pre_recreated=pre,
                 resume_job=_resume_job,
                 on_throttle=_on_throttle,
+                on_pause_slice=_on_pause_slice,
             )
 
         outcome = _as_load_result(
@@ -1066,13 +1088,20 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
         pending_loaded = 0
         pending_skipped = 0
 
+        last_flush = [_time.monotonic()]
+
         def _on_rows(loaded: int, skipped: int = 0) -> None:
             nonlocal pending_loaded, pending_skipped
             pending_loaded += loaded
             pending_skipped += skipped
-            if pending_loaded + pending_skipped >= PROGRESS_FLUSH_ROWS:
+            now = _time.monotonic()
+            if (
+                pending_loaded + pending_skipped >= PROGRESS_FLUSH_ROWS
+                or now - last_flush[0] >= PROGRESS_FLUSH_SECONDS
+            ):
                 flush_l, flush_s = pending_loaded, pending_skipped
                 pending_loaded, pending_skipped = 0, 0
+                last_flush[0] = now
                 _report_progress(progress_queue, (name, flush_l, flush_s))
 
         applied = args.inputs.table_conversions.get(table.name)
@@ -1127,6 +1156,9 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
         def _on_throttle(paused: bool, _running: Optional[int]) -> None:
             _report_progress(progress_queue, (_CHUNK_THROTTLED, name, paused))
 
+        def _on_pause_slice() -> None:
+            _report_progress(progress_queue, _HEARTBEAT)   # see _on_pause_slice above
+
         def _load_shard():
             # Stream + import together so a retry re-opens the SHARD's own snapshot
             # from its pk_lower: the generator is single-use, and re-reading the
@@ -1139,6 +1171,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
                 pk_lower=args.pk_lower,
                 pk_upper=args.pk_upper,
                 on_throttle=_on_throttle,
+                on_pause_slice=_on_pause_slice,
                 shared_snapshot_id=args.shared_snapshot_id,
             )
             _live_rows[0] = rows
@@ -1634,10 +1667,17 @@ def _migrate_one_table(
     pending = [0]
     pending_skipped = [0]
 
+    _last_flush = [_time.monotonic()]
+
     def _on_rows(loaded: int, skipped: int = 0) -> None:
         pending[0] += loaded
         pending_skipped[0] += skipped
-        if pending[0] + pending_skipped[0] >= PROGRESS_FLUSH_ROWS:
+        _now = _time.monotonic()
+        if (
+            pending[0] + pending_skipped[0] >= PROGRESS_FLUSH_ROWS
+            or _now - _last_flush[0] >= PROGRESS_FLUSH_SECONDS
+        ):
+            _last_flush[0] = _now
             flush_loaded, pending[0] = pending[0], 0
             flush_skipped, pending_skipped[0] = pending_skipped[0], 0
             handle.update(
@@ -2020,6 +2060,12 @@ def _migrate_tables_in_parallel(
             if is_replace:
                 replace_index_ddls[tbl.name] = table_recreator(tbl)
                 recreated_names.add(tbl.name)
+                # The drain thread that owns liveness has not started yet, and this loop is
+                # one fresh DSQL connect + DDL per table -- a few hundred REPLACE tables
+                # therefore crossed the 900 s stall window BEFORE a single row loaded and
+                # the watchdog failed a healthy run. A recreated table is a real unit of
+                # work, so stamping here cannot mask a wedged connect.
+                handle.heartbeat()
 
         ctx = multiprocessing.get_context("spawn")
         progress_queue: multiprocessing.Queue = ctx.Queue()
@@ -2541,6 +2587,19 @@ def _finalize_run(
     )
 
 
+def _heartbeat_of(handle: "Optional[JobHandle]") -> Callable[[], None]:
+    """Return a no-arg liveness reporter for ``handle`` (a no-op when there is none).
+
+    Lets the run-level pre/post passes report liveness without each of them having to
+    know whether it was given a handle -- the cut-over entry points call the same passes
+    with no job at all.
+    """
+    beat = getattr(handle, "heartbeat", None)
+    if not callable(beat):
+        return lambda: None
+    return beat
+
+
 def _predrop_blocking_foreign_keys(migrator: DataMigrator) -> None:
     """Call the migrator's blocking-FK pre-drop, if it supports one (else no-op).
 
@@ -2588,7 +2647,9 @@ def _recreate_dependent_views(migrator: DataMigrator) -> None:
             _LOGGER.warning("Dependent-view recreate pass failed", exc_info=True)
 
 
-def _apply_foreign_keys(migrator: DataMigrator) -> int:
+def _apply_foreign_keys(
+    migrator: DataMigrator, handle: "Optional[JobHandle]" = None
+) -> int:
     """Call the migrator's post-load foreign-key apply; return how many FKs FAILED.
 
     The count is returned (not just logged) so ``run completed`` can say that referential
@@ -2606,8 +2667,21 @@ def _apply_foreign_keys(migrator: DataMigrator) -> int:
     hook = getattr(migrator, "apply_foreign_keys", None)
     if not callable(hook):
         return 0
+    _beat = _heartbeat_of(handle)
+
+    def _stopped() -> bool:
+        return bool(getattr(handle, "cancelled", False)) if handle is not None else False
+
+    def _call():
+        # Simpler migrator doubles accept no arguments; liveness/stop reporting is
+        # best-effort, so fall back rather than fail the pass.
+        try:
+            return hook(heartbeat=_beat, should_cancel=_stopped)
+        except TypeError:
+            return hook()
+
     try:
-        counts = hook()
+        counts = _call()
     except Exception:  # noqa: BLE001 - optional post-pass; never fail the run
         _LOGGER.warning("Foreign-key apply pass failed", exc_info=True)
         return 0
@@ -2792,7 +2866,7 @@ def run_full_load(
     _predrop_dependent_views(migrator)
     counts = _migrate_tables_in_parallel(handle, job_id, tables, migrator, error_log)
     _recreate_dependent_views(migrator)
-    _fk_failed = _apply_foreign_keys(migrator)
+    _fk_failed = _apply_foreign_keys(migrator, handle)
     _finalize_run(
         handle,
         job_id,
@@ -2969,7 +3043,7 @@ def run_full_load_retry(
         handle, job_id, tables_to_retry, migrator, error_log
     )
     _recreate_dependent_views(migrator)
-    _fk_failed = _apply_foreign_keys(migrator)
+    _fk_failed = _apply_foreign_keys(migrator, handle)
     _finalize_run(
         handle,
         job_id,
@@ -3405,6 +3479,9 @@ class BatchedTableMigrator:
         pre_recreated: bool = False,
         resume_job: Optional[MigrationJob] = None,
         on_throttle: Optional[Callable[[bool, Optional[int]], None]] = None,
+        # Per-wait-slice liveness while the source-load governor holds this reader paused
+        # (on_throttle fires only on the transition, so a sustained pause went silent).
+        on_pause_slice: Optional[Callable[[], None]] = None,
     ) -> TableLoadResult:
         """Stream ``table`` from the source and load it via batched INSERTs.
 
@@ -3555,6 +3632,7 @@ class BatchedTableMigrator:
                 pk_lower=lo,
                 pk_upper=hi,
                 on_throttle=on_throttle,
+                on_pause_slice=on_pause_slice,
             )
 
         sharded = len(shard_ranges) > 1
@@ -3884,7 +3962,11 @@ class BatchedTableMigrator:
             except Exception:  # noqa: BLE001 - best-effort; the tables/data are already loaded
                 _LOGGER.warning("Could not recreate dependent view", exc_info=True)
 
-    def apply_foreign_keys(self) -> tuple[int, int, int]:
+    def apply_foreign_keys(
+        self,
+        heartbeat: Optional[Callable[[], None]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
+    ) -> tuple[int, int, int]:
         """Run-level POST-PASS: re-create preserved foreign keys after the data load.
 
         Returns ``(applied, skipped, failed)`` so the caller can surface the pass as
@@ -3929,6 +4011,8 @@ class BatchedTableMigrator:
             self._inputs.table_conversions,
             self._view_connection_factory(),
             child_pk_columns=child_pk_columns_for(self._inputs.inventory),
+            heartbeat=heartbeat,
+            should_cancel=should_cancel,
         )
 
     def _view_connection_factory(self):
@@ -3957,6 +4041,16 @@ def apply_preserved_foreign_keys(
     table_conversions: Mapping[str, TableConversion],
     connection_factory: Callable[[], Any],
     child_pk_columns: Optional[Mapping[str, Optional[str]]] = None,
+    *,
+    # Liveness reporter, called at each real unit boundary (per FK, and per poll of a
+    # still-building parent index). This pass runs entirely AFTER the Full Load progress
+    # drain has been joined, so without it the whole pass is one silence gap measured
+    # against the 900 s stall window -- and it is unbounded: up to 300 s per distinct
+    # still-building parent index plus an O(rows) orphan pre-gate per FK. A fully
+    # successful load was therefore reaped as "an unresponsive source/target connection",
+    # which _mark_done cannot undo. Also called by the cut-over action, which passes none.
+    heartbeat: Optional[Callable[[], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> tuple[int, int, int]:
     """Re-create preserved foreign keys as post-load ``ADD CONSTRAINT``, orphan-gated.
 
@@ -3989,6 +4083,8 @@ def apply_preserved_foreign_keys(
     pending: list[tuple[str, Optional[str], Optional[ForeignKeyDef], str]] = []
     # One memo per PASS: the same parent index is commonly referenced by several FKs.
     index_state_cache: dict = {}
+    _beat = heartbeat if callable(heartbeat) else (lambda: None)
+    _stopped = should_cancel if callable(should_cancel) else (lambda: False)
     for table_name, conv in table_conversions.items():
         by_name = {fk.name: fk for fk in conv.preserved_foreign_keys}
         for add_ddl in conv.foreign_key_ddls:
@@ -4002,6 +4098,16 @@ def apply_preserved_foreign_keys(
     applied = skipped = failed = 0
     try:
         for table_name, constraint_name, fk, add_ddl in pending:
+            # One FK is a real unit of work: report liveness so a long pass is not reaped,
+            # and honour a stop so Stop is not held for the rest of the pass. Both are
+            # no-ops for the cut-over caller, which supplies neither.
+            _beat()
+            if _stopped():
+                _LOGGER.info(
+                    "Foreign-key pass stopped by request with %d of %d applied.",
+                    applied, len(pending),
+                )
+                break
             target = f"{table_name}.{constraint_name or '?'}"
             # The child's single-column PK (when known) selects the bounded keyset-paged
             # orphan count; None (composite/missing PK, or no metadata supplied) uses the
@@ -4085,7 +4191,10 @@ def apply_preserved_foreign_keys(
                 # the index to become valid first. "absent" returns at once (waiting would
                 # be pointless) and the ADD then fails with an actionable reason.
                 index_state, index_waited = _wait_for_referenced_unique_index(
-                    fk, connection_factory, cache=index_state_cache
+                    fk, connection_factory, cache=index_state_cache,
+                    # Up to 300 s per distinct parent index, so the poll is the only unit
+                    # boundary inside it -- four stuck parents alone is 1200 s of silence.
+                    on_poll=_beat,
                 )
                 if index_waited > 0:
                     # A wait ACTUALLY happened, so say so: this is the only evidence that
@@ -4270,6 +4379,9 @@ def _wait_for_referenced_unique_index(
     # budget (N x 300s) and each emitted a near-identical log line. Populated by this
     # function; the caller supplies one dict per pass.
     cache: Optional[dict] = None,
+    # Called once per poll of a still-building index, so the caller can report job
+    # liveness during a wait that is deliberately long (see apply_preserved_foreign_keys).
+    on_poll: Optional[Callable[[], None]] = None,
 ) -> tuple[Optional[str], float]:
     """Wait while the FK's referenced unique index is still building. Returns its state.
 
@@ -4327,6 +4439,8 @@ def _wait_for_referenced_unique_index(
     deadline = started + max(0.0, budget_seconds)
     while monotonic() < deadline:
         sleep(poll_seconds)
+        if callable(on_poll):
+            on_poll()
         fresh = _probe()
         if fresh is None:
             # UNKNOWN is not an answer. ``unique_index_state`` swallows every exception

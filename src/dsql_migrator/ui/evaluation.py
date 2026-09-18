@@ -1034,6 +1034,17 @@ def build_evaluation_screen(
         )
 
         def work(_handle: object) -> None:
+            def _progress(pct: int, message: str) -> None:
+                # Source introspection + assessment + target browse were ONE silent span,
+                # so a very large schema's evaluation was reaped by the job watchdog and
+                # rendered a red "Evaluation failed" carrying a Full-Load-worded stall
+                # message -- for a read-only step -- which then blocks the journey's
+                # step-order gate. A reported phase is a real unit boundary.
+                beat = getattr(_handle, "heartbeat", None)
+                if callable(beat):
+                    beat()
+                eval_state.set_progress(pct, message)
+
             log_activity(
                 ActivityCategory.ASSESSMENT,
                 "run assessment",
@@ -1051,7 +1062,7 @@ def build_evaluation_screen(
                     introspector_factory=introspector_factory,
                     assessor=assessor,
                     target_browser_factory=target_browser_factory,
-                    progress_cb=eval_state.set_progress,
+                    progress_cb=_progress,
                 )
             except Exception as exc:  # noqa: BLE001 - re-raised; job marks FAILED
                 log_activity(

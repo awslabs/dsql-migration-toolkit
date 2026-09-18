@@ -1346,6 +1346,16 @@ def build_schema_conversion_screen(
         )
 
         def work(_handle: object) -> None:
+            def _beat_then(fn):
+                """Wrap a per-object callback so it also reports job liveness."""
+                def _wrapped(*args, **kwargs):
+                    beat = getattr(_handle, "heartbeat", None)
+                    if callable(beat):
+                        beat()
+                    return fn(*args, **kwargs)
+
+                return _wrapped
+
             conv_state.start_apply(len(objects))
             # Bracket the per-object stream with a run-level start/summary so the
             # downloadable log has a "42 of 45 applied, 3 failed" roll-up (mirroring
@@ -1389,8 +1399,13 @@ def build_schema_conversion_screen(
                 applier=applier,
                 mode=mode,
                 confirmed=confirmed,
-                on_object_start=conv_state.begin_apply_object,
-                on_object_result=_record_and_log,
+                # Each object is several serial DDL statements, each on a fresh
+                # IAM-token/TLS DSQL connection, so a few hundred objects crossed the
+                # 900 s stall window and the healthy apply was reaped as FAILED with the
+                # Full-Load-worded stall message while it kept creating objects. One
+                # object is a real unit of work, so stamp liveness here.
+                on_object_start=_beat_then(conv_state.begin_apply_object),
+                on_object_result=_beat_then(_record_and_log),
             )
             if merge:
                 conv_state.merge_apply_results(results)

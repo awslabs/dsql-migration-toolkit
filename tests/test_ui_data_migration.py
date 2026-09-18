@@ -449,8 +449,10 @@ class _FakeExporter:
         pk_lower=None,
         pk_upper=None,
         on_throttle=None,
+        on_pause_slice=None,
         shared_snapshot_id=None,
     ) -> list[dict]:
+        self.on_pause_slice = on_pause_slice
         self.shared_snapshot_ids = getattr(self, "shared_snapshot_ids", [])
         self.shared_snapshot_ids.append(shared_snapshot_id)
         self.streamed.append(table.name)
@@ -18815,7 +18817,11 @@ def test_predrop_blocking_foreign_keys_runs_before_the_load(monkeypatch) -> None
         engine, "_recreate_dependent_views", lambda m: calls.append("view-recreate")
     )
     monkeypatch.setattr(
-        engine, "_apply_foreign_keys", lambda m: calls.append("fk-apply") or 0
+        engine, "_apply_foreign_keys",
+        # Signature-tolerant on purpose: the pass now also receives the JobHandle so it
+        # can report liveness during a wait that can legitimately exceed the 900s stall
+        # window. A fixed-arity double here would break on that (it did).
+        lambda *_a, **_k: calls.append("fk-apply") or 0,
     )
     monkeypatch.setattr(engine, "_finalize_run", lambda *a, **k: None)
     monkeypatch.setattr(engine, "log_activity", lambda *a, **k: None)
@@ -19806,63 +19812,387 @@ def test_the_drain_turns_a_heartbeat_into_liveness_only() -> None:
     assert job.model_dump() == before           # and nothing about the job changed
 
 
-def _t_monotonic() -> float:
-    import time
-    return time.monotonic()
+def _noop_worker(_arg):  # module-level: must be picklable for spawn
+    return "ok"
 
 
-def _t_sleep(seconds: float) -> None:
-    import time
-    time.sleep(seconds)
+def test_cpython_shutdown_really_nulls_processes_so_our_double_is_faithful() -> None:
+    """Prove the PREMISE the teardown fix rests on, against a real pool.
 
-
-def _wedged_worker(_arg):  # module-level: must be picklable for spawn
-    import time as _t
-    _t.sleep(120)          # never returns within the test
-    return "unreachable"
-
-
-def test_abandon_terminates_REAL_worker_processes() -> None:
-    """The same assertion, against a real ProcessPoolExecutor rather than a double.
-
-    A hand-rolled pool double hid this twice: `Executor.shutdown` ends with
-    `self._processes = None` unconditionally, so a teardown that reads `pool._processes`
-    AFTER shutdown terminates nothing -- while a double that keeps the mapping populated
-    reports success. Only real child processes can settle it.
+    `Executor.shutdown` ends with `self._processes = None` UNCONDITIONALLY, so a teardown
+    that reads `pool._processes` AFTER shutdown terminates nothing. v0.1.454 shipped
+    exactly that bug because the unit double kept the mapping populated. This asserts the
+    standard library's behaviour directly -- deterministically, with no wedged worker and
+    no wall-clock guess -- so the double in
+    `test_abandoning_the_cancel_wait_tears_the_pool_down_without_waiting` can never drift
+    back to being unfaithful without one of the two tests failing.
     """
     import multiprocessing
     from concurrent.futures import ProcessPoolExecutor
 
-    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
-
     ctx = multiprocessing.get_context("spawn")
-    pool = ProcessPoolExecutor(max_workers=2, mp_context=ctx)
+    pool = ProcessPoolExecutor(max_workers=1, mp_context=ctx)
     try:
-        futures = [pool.submit(_wedged_worker, i) for i in range(2)]
-        # Wait until the children are actually up and running the wedged task.
-        deadline = _t_monotonic() + 30.0
-        while not (pool._processes and len(pool._processes) == 2):
-            assert _t_monotonic() < deadline, "workers never started"
-            _t_sleep(0.05)
+        assert pool.submit(_noop_worker, 1).result(timeout=120) == "ok"
+        assert pool._processes, "a child should exist after a completed task"
         children = list(pool._processes.values())
-        assert all(p.is_alive() for p in children)
-
-        started = _t_monotonic()
-        _engine._abandon_pool_workers(pool)
-        elapsed = _t_monotonic() - started
-        # It must not wait for the wedged 120s task.
-        assert elapsed < 20.0, f"teardown blocked for {elapsed:.1f}s"
-
+        pool.shutdown(wait=True)
+        assert pool._processes is None, (
+            "CPython no longer nulls _processes; the teardown may read it after shutdown"
+        )
         for proc in children:
-            proc.join(15.0)
-        alive = [(p.pid, p.is_alive()) for p in children]
-        assert not any(a for _pid, a in alive), f"workers survived the teardown: {alive}"
-        assert all(p.exitcode is not None for p in children)
-        for f in futures:
-            f.cancel()
+            proc.join(60.0)
     finally:
         for proc in list((getattr(pool, "_processes", None) or {}).values()):
             try:
                 proc.kill()
             except Exception:  # noqa: BLE001
                 pass
+
+
+def test_the_memory_sampler_read_does_not_touch_the_stall_watchdog() -> None:
+    """A diagnostic sample must not look like progress.
+
+    `_loading_suffix` read the live job through `handle.update` -- the WRITE path -- and
+    `JobManager.apply_update` unconditionally refreshes `last_progress_at`, the stall
+    watchdog's liveness clock. So a wedged Full Load whose memory kept creeping was never
+    reaped: it sat in RUNNING forever with a frozen row count and no terminal affordance.
+    """
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    handle = _MemHandle(["ecommerce.product_media", "ecommerce.orders"])
+    logger = _engine._MemoryPressureLogger.__new__(_engine._MemoryPressureLogger)
+    logger._handle = handle
+    suffix = logger._loading_suffix()
+    assert "ecommerce.orders" in suffix and "ecommerce.product_media" in suffix
+    assert handle.snapshots == 1, "must read through the non-stamping snapshot path"
+    assert handle.updates == 0, "a diagnostic read must never stamp liveness"
+
+
+def test_job_handle_snapshot_reads_without_refreshing_liveness() -> None:
+    # The seam the fix above relies on, asserted against the REAL JobManager.
+    import threading
+
+    from dsql_migrator.core.job_manager import JobManager
+
+    clock = {"t": 1000.0}
+    manager = JobManager(clock=lambda: clock["t"])
+    started, release = threading.Event(), threading.Event()
+
+    def work(handle):
+        started.set()
+        release.wait(5.0)
+
+    job_id = manager.submit(work)
+    assert started.wait(5.0)
+    handle = manager.handle(job_id) if hasattr(manager, "handle") else None
+    from dsql_migrator.core.job_manager import JobHandle
+
+    handle = handle or JobHandle(manager, job_id)
+
+    before = manager._records[job_id].last_progress_at
+    clock["t"] += 10_000.0                      # a long silence
+    snap = handle.snapshot()
+    assert snap.job_id == job_id
+    assert manager._records[job_id].last_progress_at == before, (
+        "snapshot() must not refresh the watchdog clock"
+    )
+    handle.update(lambda job: None)             # the write path DOES refresh it
+    assert manager._records[job_id].last_progress_at > before
+    release.set()
+
+
+def test_source_retry_backoff_is_capped_and_heartbeats_while_it_waits() -> None:
+    """An uncapped backoff plus zero liveness = a healthy job reaped as "stalled".
+
+    `base * 2**(attempt-1)` had no clamp (unlike the house pattern in core/occ.py), and the
+    wait loop reported nothing -- so a wait longer than the 900s stall window made the
+    watchdog fail a job that was deliberately waiting, blaming "an unresponsive
+    source/target connection" for the tool's own chosen pause.
+    """
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    assert _engine._SOURCE_RETRY_MAX_DELAY_SECONDS > 0
+    # The clamp: attempt 12 with a 30s base would be 30 * 2**11 = 61440s uncapped.
+    for attempt in (1, 2, 5, 12, 30):
+        delay = min(_engine._SOURCE_RETRY_MAX_DELAY_SECONDS, 30.0 * (2 ** (attempt - 1)))
+        assert delay <= _engine._SOURCE_RETRY_MAX_DELAY_SECONDS
+    assert _engine._SOURCE_RETRY_MAX_DELAY_SECONDS < 900.0, (
+        "a single wait must stay under the JobManager stall window"
+    )
+
+    # The in-process path heartbeats through the progress queue every slice.
+    sent: list = []
+    slept: list = []
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    class _Q:
+        def put_nowait(self, msg):
+            sent.append(msg)
+
+    old_q, old_sleep = engine._worker_progress_queue, engine._time.sleep
+    engine._worker_progress_queue = _Q()
+    engine._time.sleep = slept.append
+    try:
+        ok = engine._wait_before_source_reread(
+            table_name="t", attempt=1, attempts=3, backoff=4.0,
+            cause="lost", cancelled=lambda: False,
+        )
+    finally:
+        engine._worker_progress_queue = old_q
+        engine._time.sleep = old_sleep
+    assert ok is True
+    assert len(slept) == 4                                   # 4 x 1.0s slices
+    assert sent == [engine._HEARTBEAT] * 4, sent             # one heartbeat per slice
+
+
+def test_the_drain_turns_a_heartbeat_into_liveness_only() -> None:
+    # The heartbeat must stamp the watchdog WITHOUT changing job state.
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    job = MigrationJob(job_id="j")
+    job.chunks = [ChunkState(chunk_id="t", status="PENDING")]
+    updates = {"n": 0}
+
+    class _H:
+        job_id = "j"
+        cancelled = False
+
+        def update(self, fn):
+            updates["n"] += 1
+            fn(job)
+
+    before = job.model_dump()
+    _H().update(lambda j: None)                 # what the drain does for a heartbeat
+    assert updates["n"] == 1                    # liveness stamped (via apply_update)
+    assert job.model_dump() == before           # and nothing about the job changed
+
+
+def test_the_memory_sampler_read_does_not_touch_the_stall_watchdog() -> None:
+    """A diagnostic sample must not look like progress.
+
+    `_loading_suffix` read the live job through `handle.update` -- the WRITE path -- and
+    `JobManager.apply_update` unconditionally refreshes `last_progress_at`, the stall
+    watchdog's liveness clock. So a wedged Full Load whose memory kept creeping was never
+    reaped: it sat in RUNNING forever with a frozen row count and no terminal affordance.
+    """
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    handle = _MemHandle(["ecommerce.product_media", "ecommerce.orders"])
+    logger = _engine._MemoryPressureLogger.__new__(_engine._MemoryPressureLogger)
+    logger._handle = handle
+    suffix = logger._loading_suffix()
+    assert "ecommerce.orders" in suffix and "ecommerce.product_media" in suffix
+    assert handle.snapshots == 1, "must read through the non-stamping snapshot path"
+    assert handle.updates == 0, "a diagnostic read must never stamp liveness"
+
+
+def test_job_handle_snapshot_reads_without_refreshing_liveness() -> None:
+    # The seam the fix above relies on, asserted against the REAL JobManager.
+    import threading
+
+    from dsql_migrator.core.job_manager import JobManager
+
+    clock = {"t": 1000.0}
+    manager = JobManager(clock=lambda: clock["t"])
+    started, release = threading.Event(), threading.Event()
+
+    def work(handle):
+        started.set()
+        release.wait(5.0)
+
+    job_id = manager.submit(work)
+    assert started.wait(5.0)
+    handle = manager.handle(job_id) if hasattr(manager, "handle") else None
+    from dsql_migrator.core.job_manager import JobHandle
+
+    handle = handle or JobHandle(manager, job_id)
+
+    before = manager._records[job_id].last_progress_at
+    clock["t"] += 10_000.0                      # a long silence
+    snap = handle.snapshot()
+    assert snap.job_id == job_id
+    assert manager._records[job_id].last_progress_at == before, (
+        "snapshot() must not refresh the watchdog clock"
+    )
+    handle.update(lambda job: None)             # the write path DOES refresh it
+    assert manager._records[job_id].last_progress_at > before
+    release.set()
+
+
+def test_source_retry_backoff_is_capped_and_heartbeats_while_it_waits() -> None:
+    """An uncapped backoff plus zero liveness = a healthy job reaped as "stalled".
+
+    `base * 2**(attempt-1)` had no clamp (unlike the house pattern in core/occ.py), and the
+    wait loop reported nothing -- so a wait longer than the 900s stall window made the
+    watchdog fail a job that was deliberately waiting, blaming "an unresponsive
+    source/target connection" for the tool's own chosen pause.
+    """
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    assert _engine._SOURCE_RETRY_MAX_DELAY_SECONDS > 0
+    # The clamp: attempt 12 with a 30s base would be 30 * 2**11 = 61440s uncapped.
+    for attempt in (1, 2, 5, 12, 30):
+        delay = min(_engine._SOURCE_RETRY_MAX_DELAY_SECONDS, 30.0 * (2 ** (attempt - 1)))
+        assert delay <= _engine._SOURCE_RETRY_MAX_DELAY_SECONDS
+    assert _engine._SOURCE_RETRY_MAX_DELAY_SECONDS < 900.0, (
+        "a single wait must stay under the JobManager stall window"
+    )
+
+    # The in-process path heartbeats through the progress queue every slice.
+    sent: list = []
+    slept: list = []
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    class _Q:
+        def put_nowait(self, msg):
+            sent.append(msg)
+
+    old_q, old_sleep = engine._worker_progress_queue, engine._time.sleep
+    engine._worker_progress_queue = _Q()
+    engine._time.sleep = slept.append
+    try:
+        ok = engine._wait_before_source_reread(
+            table_name="t", attempt=1, attempts=3, backoff=4.0,
+            cause="lost", cancelled=lambda: False,
+        )
+    finally:
+        engine._worker_progress_queue = old_q
+        engine._time.sleep = old_sleep
+    assert ok is True
+    assert len(slept) == 4                                   # 4 x 1.0s slices
+    assert sent == [engine._HEARTBEAT] * 4, sent             # one heartbeat per slice
+
+
+def test_the_drain_turns_a_heartbeat_into_liveness_only() -> None:
+    # The heartbeat must stamp the watchdog WITHOUT changing job state.
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    job = MigrationJob(job_id="j")
+    job.chunks = [ChunkState(chunk_id="t", status="PENDING")]
+    updates = {"n": 0}
+
+    class _H:
+        job_id = "j"
+        cancelled = False
+
+        def update(self, fn):
+            updates["n"] += 1
+            fn(job)
+
+    before = job.model_dump()
+    _H().update(lambda j: None)                 # what the drain does for a heartbeat
+    assert updates["n"] == 1                    # liveness stamped (via apply_update)
+    assert job.model_dump() == before           # and nothing about the job changed
+
+
+def test_the_fk_post_pass_reports_liveness_per_fk_and_honours_a_stop(monkeypatch) -> None:
+    """The post-load FK pass ran entirely after the progress drain was joined.
+
+    Nothing in it reported liveness, and its duration is bounded only by FK count, still
+    building parent indexes (up to 300s EACH) and child row count -- so a fully successful
+    load could be reaped as "an unresponsive source/target connection", which _mark_done
+    cannot undo, leaving the Data Migration step FAILED and Validation gated shut.
+    """
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: None)
+    monkeypatch.setattr(engine, "apply_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "dsql_migrator.core.target_introspector.unique_index_state",
+        lambda *a, **k: "valid",
+    )
+    beats: list[int] = []
+    result = engine.apply_preserved_foreign_keys(
+        {"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])},
+        lambda: _FkProbeConnection(0),
+        heartbeat=lambda: beats.append(1),
+    )
+    assert result == (1, 0, 0)
+    assert beats, "the pass reported no liveness at all"
+
+    # And a stop is honoured rather than held for the rest of the pass.
+    applied = engine.apply_preserved_foreign_keys(
+        {"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])},
+        lambda: _FkProbeConnection(0),
+        should_cancel=lambda: True,
+    )
+    assert applied == (0, 0, 0), applied
+
+
+def test_a_still_building_index_wait_reports_liveness_every_poll() -> None:
+    # 300s per parent index with a single stamp at the start is longer than the stall
+    # window on its own; four such parents is 1200s of silence.
+    from dsql_migrator.core.models import ForeignKeyDef
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    states = ["building", "building", "building", "valid"]
+    asked = {"n": 0}
+
+    def _fake(table_name, columns, *, connection_factory):  # noqa: ANN001
+        asked["n"] += 1
+        return states[min(asked["n"] - 1, len(states) - 1)]
+
+    import dsql_migrator.core.target_introspector as _ti
+    saved = _ti.unique_index_state
+    _ti.unique_index_state = _fake
+    polls: list[int] = []
+    clock = {"t": 0.0}
+    try:
+        state, _waited = _engine._wait_for_referenced_unique_index(
+            ForeignKeyDef(name="fk", columns=["pid"], referenced_table="p",
+                          referenced_columns=["id"]),
+            lambda: object(), budget_seconds=300.0, poll_seconds=2.0,
+            sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
+            monotonic=lambda: clock["t"], on_poll=lambda: polls.append(1),
+        )
+    finally:
+        _ti.unique_index_state = saved
+    assert state == "valid"
+    assert len(polls) == 3, polls        # one per poll of the still-building index
+
+
+def test_the_replace_pre_pass_reports_liveness_per_recreated_table() -> None:
+    # The DROP+recreate loop runs BEFORE the drain thread that owns liveness starts, and
+    # is one fresh DSQL connect + DDL per table -- a few hundred tables crossed the stall
+    # window before a single row loaded.
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    src = _engine._migrate_tables_in_parallel.__code__
+    consts = [c for c in src.co_consts if hasattr(c, "co_names")]
+    names = set(src.co_names)
+    for c in consts:
+        names |= set(c.co_names)
+    assert "heartbeat" in names, (
+        "the replace pre-pass no longer reports liveness before the drain starts"
+    )
+
+
+def test_a_governor_pause_reports_liveness_every_slice() -> None:
+    """A sustained pause is intentional waiting, and intentional waiting must report.
+
+    `on_state_change` fires only on the pause<->resume TRANSITION, so a pause longer than
+    the stall window looked identical to a dead worker and the healthy, deliberately
+    throttled load was reaped as "an unresponsive source/target connection".
+    """
+    from dsql_migrator.core.exporter import SourceLoadGovernor
+
+    readings = iter([50, 50, 50, 1])
+    slices: list[int] = []
+    now = {"t": 0.0}
+
+    def _sleep(seconds: float) -> None:
+        now["t"] += seconds
+
+    governor = SourceLoadGovernor(
+        object(), 10,
+        metric_reader=lambda _c: next(readings),
+        sleep=_sleep, monotonic=lambda: now["t"],
+        ttl_seconds=0.0, slice_seconds=1.0,
+        on_pause_slice=lambda: slices.append(1),
+    )
+    governor.throttle()
+    assert len(slices) == 3, slices      # one per wait slice, not one per pause

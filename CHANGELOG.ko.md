@@ -5,6 +5,27 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.456
+
+정체 워치독은 liveness 시계를 900초 동안 갱신하지 않은 job을 실패 처리하는데, 실제로 그 시계를 갱신한 것은 Full Load의 progress drain 뿐이었습니다 — 그래서 오래 걸리는 대부분의 작업이 실행 내내 침묵했고 **완전히 정상인데도** reap됐습니다. 그런 구간 9개와, 그 뒤에 있던 블로킹 대기 결함 2건을 함께 닫았습니다.
+
+설계 노트: liveness는 **실제 작업 단위 경계**(완료된 페이지·오브젝트·테이블·외래 키, 또는 의도적 대기의 한 슬라이스)에서만 보고하며, 백그라운드 타이머는 쓰지 않습니다. 타이머가 스스로 똑딱이면 정말로 멈춘 job도 liveness가 찍히는데, 그게 바로 워치독이 잡아야 하는 대상입니다. 이것의 거울상이 v0.1.454의 반대 방향 수정입니다: 순수 진단 목적의 읽기는 liveness를 찍어선 **안 됩니다**.
+
+### 수정 (Fixed)
+
+- **15분을 넘는 validation이 정체 실패로 보고되던 문제 수정.** 진행 상황이 UI 상태로만 갔고 job으로는 가지 않아서, 테이블별 정확 `COUNT(*)` + MD5 체크섬과 뒤따르는 identity resync를 포함한 실행 전체가 하나의 침묵 구간이었습니다. reap은 되돌릴 수 없으므로(`_mark_done`은 FAILED를 덮지 않습니다) 운영자는 빨간 "Failed" 배지 아래 초록 MATCH 리포트를 보면서 Cut over가 열리지 않는 상태가 됐습니다. 이제 테이블 단위와 **바운드 페이지 단위** 모두에서 보고합니다: 1000만 행 CHECKSUM 테이블 하나가 수천 번의 페이지 왕복이라 그것만으로 창을 넘기므로, 6개 페이징 스캔(소스·타깃 카운트, 양쪽 체크섬, PK reconcile 스트림, orphan 카운트)이 새로 추가한 `Validator.set_page_hook` seam으로 페이지마다 보고합니다.
+- **Full Load의 후처리 tail 전체가 침묵이던 문제 수정** — 뷰 재생성, 외래 키 패스, identity resync가 모두 progress drain이 join된 **뒤에** 실행됩니다. 이 tail은 상한이 없습니다: 아직 빌드 중인 부모 인덱스마다 최대 300초(그런 부모 4개면 1200초)에 FK마다 O(행) orphan 사전 게이트까지. 그래서 완전히 성공한 로드가 FAILED로 표시되고 Validation까지 막혔습니다. 이제 외래 키마다, 그리고 빌드 중 인덱스를 폴링할 때마다 보고하며 **정지 요청도 받습니다**(Stop을 눌러도 패스 나머지를 계속 돌던 문제).
+- **Full Load의 사전 DDL 패스도 침묵이던 문제 수정** — "drop & reload" 대상 테이블을 순차로 DROP+재생성하는데 테이블마다 새 DSQL 연결과 DDL이 필요하고, 이게 liveness를 담당하는 drain 스레드가 시작되기 **전에** 실행됩니다. 테이블 수백 개면 한 행도 로드하기 전에 창을 넘겼습니다. 이제 재생성한 테이블마다 보고합니다.
+- **의도적으로 스로틀된 Full Load가 "응답 없음"으로 reap되던 문제 수정.** 소스 부하 governor의 일시정지가 pause/resume **전환 시점에만** liveness를 보고해서, 지속적인 일시정지 — `max_source_threads_running` 가드의 존재 이유 그 자체 — 가 죽은 워커와 구별되지 않았습니다. 이제 in-process 경로와 샤드 경로 양쪽에서 대기 슬라이스마다 보고하며, drain의 일시정지 리더 카운트를 건드리지 않는 liveness 전용 마커를 씁니다.
+- **Full Load의 liveness가 시간이 아니라 행 수 기준이던 문제 수정.** 10,000행이 모여야 flush했는데, 이는 10,000행이 항상 창 안에 들어온다는 가정이었습니다 — 넓거나 LOB이 큰 행에서는 거짓이고(값이 DSQL의 약 1 MiB 한도에 가까우면 배치가 8행 정도로 제한), 총 행 수가 10,000행보다 **적은** 테이블은 테이블 중간 flush가 아예 없어서 침묵 구간이 테이블 로드 전체였습니다. 이제 30초 시간 하한으로도 flush합니다.
+- **Schema Conversion apply, Evaluation, cut-over "Apply foreign keys" job도 liveness를 보고하지 않던 문제 수정.** 각각 다른 방식으로 상한이 없습니다 — DDL 문마다 새 IAM 토큰/TLS DSQL 연결, 매우 큰 스키마의 테이블별 소스 리플렉션, Full Load FK 패스와 동일한 O(행) orphan 사전 게이트. 세 개 모두 오브젝트/단계/FK 경계에서 보고합니다.
+- **멈춘 쓰기 배치 하나가 Stop을 영구히 막을 수 있던 문제 수정.** DSQL 연결이 `connect_timeout`만 설정했고 소켓 read 타임아웃도 keepalive도 없었습니다 — 그래서 문장 실행 중 소켓이 블랙홀되면(NAT/ENI idle 타임아웃, ENI 소실) `cursor.execute`가 OS 기본값까지 기다리고, drain이 끝나지 않으며, 스레드 풀은 워커 프로세스와 달리 종료시킬 수 없습니다. 이제 PostgreSQL 소스 엔진이 이미 하고 있는 것과 동일하게 TCP keepalive와 `tcp_user_timeout`을 켭니다. `statement_timeout` 대신 keepalive를 고른 것은 의도적입니다: keepalive는 전송 중 데이터가 없을 때만 탐색하므로 정상이지만 느린 문장(큰 keyset 체크섬 페이지)을 끊지 않으면서 **죽은** 피어는 감지해 기존 재연결/OCC 재시도로 넘깁니다. **실제 DSQL 클러스터에 라이브 검증했습니다** — 지원되지 않는 연결 옵션은 유닛 스위트가 초록인 채로 모든 연결을 깨뜨립니다(v0.1.438이 그렇게 출시됐습니다).
+- 배치 drain의 `wait(FIRST_COMPLETED)`가 하나의 중단 불가능한 블록 대신 짧은 바운드 대기의 연속이 됐습니다. 배치가 완료될 때까지는 여전히 반환하지 않으므로 bounded-parallelism 보장은 그대로입니다.
+
+### 테스트
+
+- 3786 통과. 뮤테이션 5종 전부 잡힘: heartbeat 프리미티브 무력화, validation의 페이지 seam 제거, 페이저가 훅을 호출하지 않게 하기, FK 패스의 FK별 보고 제거, governor의 슬라이스별 보고 비활성화.
+
 ## v0.1.455
 
 ### 수정 (Fixed)

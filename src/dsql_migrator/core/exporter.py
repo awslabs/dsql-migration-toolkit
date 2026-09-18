@@ -615,6 +615,13 @@ class SourceLoadGovernor:
         ttl_seconds: float = _GOVERNOR_STATUS_TTL_SECONDS,
         slice_seconds: float = _GOVERNOR_WAIT_SLICE_SECONDS,
         on_state_change: Optional[Callable[[bool, Optional[int]], None]] = None,
+        # Called once per WAIT SLICE while paused. ``on_state_change`` fires only on the
+        # pause<->resume TRANSITION, so a sustained pause -- exactly what this governor is
+        # for -- reported liveness once and then went silent; a pause longer than the job
+        # watchdog's window got a healthy, deliberately-throttled load reaped as "an
+        # unresponsive source/target connection". A completed slice is a real unit boundary,
+        # so stamping here cannot mask a wedged source read.
+        on_pause_slice: Optional[Callable[[], None]] = None,
         metric_reader: Callable[[_Connection], Optional[int]] = _read_threads_running,
     ) -> None:
         self._connection = connection
@@ -639,6 +646,7 @@ class SourceLoadGovernor:
         self._ttl = ttl_seconds
         self._slice = slice_seconds
         self._on_state_change = on_state_change
+        self._on_pause_slice = on_pause_slice
         self._cached_value: Optional[int] = None
         self._cached_at: Optional[float] = None
         self._paused = False
@@ -699,6 +707,11 @@ class SourceLoadGovernor:
             if should_cancel is not None and should_cancel():
                 return  # caller re-polls should_cancel -> ExportCancelled
             (self._sleep or _wall_sleep)(self._slice)
+            if self._on_pause_slice is not None:
+                try:
+                    self._on_pause_slice()
+                except Exception:  # noqa: BLE001 - liveness only; never fail the load
+                    pass
             fresh = True  # re-read the metric each slice while paused
 
 
@@ -1007,6 +1020,8 @@ class TableExporter:
         pk_lower: Optional[int] = None,
         pk_upper: Optional[int] = None,
         on_throttle: Optional[Callable[[bool, Optional[int]], None]] = None,
+        # Per-wait-slice liveness while the source-load governor holds a reader paused.
+        on_pause_slice: Optional[Callable[[], None]] = None,
         shared_snapshot_id: Optional[str] = None,
     ) -> "Iterator[Mapping[str, object]]":
         """Yield target-ready (converted) rows from a read-only consistent snapshot.
@@ -1058,6 +1073,7 @@ class TableExporter:
                         snapshot,
                         self._max_source_threads_running,
                         on_state_change=on_throttle,
+                        on_pause_slice=on_pause_slice,
                         # Engine-correct metric: MySQL Threads_running vs PostgreSQL
                         # pg_stat_activity. Never runs MySQL SQL on a PG snapshot conn.
                         metric_reader=dialect.read_active_query_count,

@@ -265,6 +265,11 @@ def run_validation(
     validator_factory: ValidatorFactory = _default_validator_factory,
     should_cancel: Optional[Callable[[], bool]] = None,
     on_progress: Optional[Callable[[str, int, int], None]] = None,
+    # Called once per BOUNDED PAGE of a scan (count, checksum, PK reconcile, orphan
+    # count), so a caller can report job liveness and stop DURING one very large table.
+    # ``on_progress`` fires only between tables, and a single 10M-row CHECKSUM table is
+    # thousands of paged round trips -- far past the job watchdog's window on its own.
+    on_page: Optional[Callable[[], None]] = None,
     max_workers: Optional[int] = None,
     deep_only_on_count_mismatch: bool = False,
 ) -> ValidationReport:
@@ -286,6 +291,14 @@ def run_validation(
     """
     workers = max_workers if max_workers is not None else load_config().validate_max_workers
     validator = validator_factory(inputs)
+    # Set on the instance rather than threaded through validate/_validate_table/
+    # _compare_table and six paging helpers. Optional and best-effort: an injected
+    # validator double that does not know the attribute is unaffected.
+    if on_page is not None:
+        try:
+            validator.set_page_hook(on_page)
+        except AttributeError:
+            pass
     # Drop migration-excluded columns (e.g. oversized-LOB exclusion) so the checksum
     # never compares a column that was never written to the target -> no false "data
     # differs". Row counts + every other column are still validated.
@@ -2058,12 +2071,27 @@ def build_validation_screen(
                     ),
                     status="started",
                 )
+            def _progress(table_name: str, index: int, total: int) -> None:
+                # A finished table is a real unit of work, so report job liveness here
+                # too. Without it the ENTIRE validation -- exact COUNT(*) + MD5 checksum
+                # per table plus the trailing identity resync -- was one silence gap:
+                # progress went only to ValidationState (UI-side), never to the job, so
+                # any run past the 900 s stall window was reaped as FAILED with the
+                # Full-Load-worded "the load appears to have stalled" message, and
+                # _mark_done cannot restore DONE -- the operator saw a green MATCH report
+                # under a red Failed badge with Cut over refusing to open.
+                _beat = getattr(handle, "heartbeat", None)
+                if callable(_beat):
+                    _beat()
+                validation_state.set_progress(table_name, index, total)
+
             try:
                 result = run_validation(
                     inputs,
                     validator_factory=validator_factory,
                     should_cancel=lambda: bool(getattr(handle, "cancelled", False)),
-                    on_progress=validation_state.set_progress,
+                    on_progress=_progress,
+                    on_page=getattr(handle, "heartbeat", None),
                     deep_only_on_count_mismatch=inputs.deep_only_on_count_mismatch,
                 )
             except ValidationCancelled:
@@ -2861,7 +2889,13 @@ def _run_cutover_foreign_keys(
         )
         connect = DsqlConnector(target_config, aws_profile=aws_profile).connect
         result = apply_preserved_foreign_keys(
-            applied, connect, child_pk_columns=child_pk_columns_for(inventory)
+            applied, connect, child_pk_columns=child_pk_columns_for(inventory),
+            # Per FK and per poll of a still-building parent index. This pass is an
+            # O(rows) orphan pre-gate per FK plus up to 300 s per distinct parent index,
+            # so at scale it ran well past the watchdog's window with nothing reported and
+            # left a spurious FAILED job record behind (the id is not polled, so the reap
+            # was invisible while still being persisted).
+            heartbeat=getattr(_handle, "heartbeat", None),
         )
         validation_state.set_cutover_fk_apply(result)
         if refresh is not None:
