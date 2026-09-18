@@ -5,6 +5,34 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.462
+
+### Fixed
+
+- **v0.1.461's "Apply foreign keys" action stored the wrong shape, so the Data Migration step
+  raised `TypeError` on the next render after clicking it.** `_apply_foreign_keys` returned
+  only the FAILED count (an int -- all the load needed for one summary clause), while the new
+  action stored it as the `(applied, skipped, failed)` triple the step renders; the renderer
+  then called `list(<int>)`. Since v0.1.461 removed the automatic apply, that button is the
+  only path to referential integrity in Step 3 -- so this would have shipped a step that
+  breaks the moment it is used. The function now returns the full triple (the action is its
+  only caller).
+  - **Found by live verification, not by the suite.** A Fargate run against the real Seoul
+    source + DSQL target showed `result=0` while three constraints had actually appeared on
+    the target -- the contradiction that gave it away. Each piece was unit-tested; the SEAM
+    was not, so `test_the_fk_action_result_renders` now carries what the action STORES into
+    the renderer, and reverting to the int fails two tests.
+
+### Verified live (Seoul Fargate, against real Aurora MySQL + Aurora DSQL)
+
+The new v0.1.461 flow, end to end:
+
+| check | result |
+| --- | --- |
+| the load completes and creates NO constraint | PASS |
+| the step is told how many are outstanding | PASS (2 of 2) |
+| the action applies them, and they exist on the target | PASS (`(2, 0, 0)`) |
+
 ## v0.1.461
 
 ### Changed
