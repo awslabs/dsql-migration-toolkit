@@ -5,6 +5,31 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.459
+
+### Changed
+
+- **The foreign-key pass's orphan pre-gate is ~27x faster, for byte-identical results.**
+  The paged orphan count used `COUNT(*) FILTER (WHERE ... NOT EXISTS ...)`, which makes the
+  correlated subquery a per-row scalar expression -- so the planner probed the parent table
+  once per child row instead of matching the two in bulk. The page is now pinned in a
+  `MATERIALIZED` CTE and read twice: once as a `LEFT JOIN` anti-join for the count, once for
+  the keyset boundary. The window stays UNFILTERED, which is the correctness property the
+  FILTER existed to protect (a filtered window would skip PK ranges and under-count).
+  - Measured on a live ap-northeast-2 cluster over a 100k-row window of a 3M-row child:
+    **0.59 ms/row -> 0.022 ms/row**. For an 8.5M-row schema with 15 foreign keys
+    (15.5M child rows scanned in total) that is **~153 min -> ~6 min**. All three candidate
+    formulations returned exactly the same `(orphan_count, last_pk, row_count)` as the
+    shipped query.
+  - This is the pre-cut-over gate, so the cost landed where it hurts most: for a Full-Load
+    migration it blocks the end of Step 3, and for a CDC migration it runs at **cut over**,
+    after the source is already frozen. The same paged query backs Validation's optional
+    orphan check, which gets the same speedup.
+  - Ruled out by measurement first, so the change is not a guess: the page size is NOT the
+    lever (identical ms/row from 5k to 250k, and 500k exceeds DSQL's 300s transaction
+    limit), and neither is the `array_agg` keyset-boundary trick (0.21s per page on its
+    own). `max()` genuinely has no uuid overload, so `array_agg` stays.
+
 ## v0.1.458
 
 ### Fixed

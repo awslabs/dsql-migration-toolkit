@@ -284,10 +284,13 @@ class _FakeTargetConnection:
         # keyset PK-page branch (it also has AS page_pk). The whole orphan count lands on
         # the FIRST page (later pages contribute 0), and the window is drawn from the
         # child's pk_set so the keyset advance/termination is exercised end-to-end.
-        if "NOT EXISTS" in text and "FILTER" in text:
-            # The child is the LAST ``FROM "..."`` (the parent appears first, inside the
-            # NOT EXISTS), which ``_last_double_quoted_table`` already resolved as ``table``.
-            child = table
+        if "WITH pg AS MATERIALIZED" in text and "LEFT JOIN" in text:
+            # The paged orphan count is now an ANTI-JOIN over a MATERIALIZED window (a
+            # COUNT(*) FILTER made the correlated NOT EXISTS a per-row scalar expression,
+            # which cost 27x on a live cluster). That inverts the table order: the CHILD is
+            # now the FIRST quoted table (inside the CTE) and the parent the second, so the
+            # child can no longer be read off the LAST one.
+            child = _first_double_quoted_table(text)
             window = _keyset_page(
                 self._pk_sets.get(child, []),
                 last=params.get("last"),
@@ -341,6 +344,21 @@ class _FakeTargetConnection:
 def _last_backtick_table(sql_text: str) -> str:
     matches = re.findall(r"FROM `([^`]+)`", sql_text)
     return matches[-1] if matches else ""
+
+
+def _first_double_quoted_table(text: str) -> str:
+    """The FIRST ``FROM "schema"."table"`` / ``FROM "table"`` in the statement.
+
+    The paged orphan count puts the CHILD first (in the MATERIALIZED CTE) and the parent
+    second (in the LEFT JOIN), so the child is the first one -- the mirror of
+    :func:`_last_double_quoted_table`.
+    """
+    import re
+
+    matches = re.findall(r'FROM\s+("(?:[^"]+)"(?:\."(?:[^"]+)")?)', text)
+    if not matches:
+        return ""
+    return matches[0].split(".")[-1].strip('"')
 
 
 def _last_double_quoted_table(sql_text: str) -> str:
@@ -1261,11 +1279,14 @@ def test_orphan_count_single_int_pk_child_is_keyset_paged() -> None:
         _SOURCE_CONFIG, _TARGET_CONFIG, [_orders_with_fk()], check_orphans=True
     )
     assert report.orphan_findings[0].orphan_count == 2  # same total as the single scan
-    orphan_sql = [t for t in target.executed if "NOT EXISTS" in t]
+    orphan_sql = [t for t in target.executed if "LEFT JOIN" in t]
     assert orphan_sql, "no orphan query ran"
-    # The PAGED form: a keyset window folded into COUNT(*) FILTER + array_agg, NOT the
-    # single unbounded "... AS c WHERE ..." scan.
-    assert all("FILTER" in t and "array_agg" in t for t in orphan_sql)
+    # The PAGED form: a MATERIALIZED keyset window read twice -- once as an anti-join for
+    # the count, once for the boundary via array_agg -- NOT the single unbounded
+    # "... AS c WHERE ..." scan, and NOT a COUNT(*) FILTER (which forced the correlated
+    # NOT EXISTS to be evaluated per row and cost 27x on a live cluster).
+    assert all("WITH pg AS MATERIALIZED" in t and "array_agg" in t for t in orphan_sql)
+    assert all("COUNT(*) FILTER" not in t for t in orphan_sql)
     assert all(" AS c WHERE" not in t for t in orphan_sql)
     # Multi-page: page size 2 over 5 PKs -> 3 orphan pages ran.
     assert len(orphan_sql) >= 2
@@ -1301,10 +1322,11 @@ def test_orphan_count_composite_pk_child_uses_single_scan() -> None:
 
 
 def test_orphan_page_sql_pages_the_window_unconditionally() -> None:
-    # FIX 2 correctness: the paged orphan SQL selects the FULL PK window (so the keyset
-    # boundary advances over NON-orphan rows too) and folds the orphan predicate into a
-    # COUNT(*) FILTER -- if the WHERE dropped non-orphans, a page's max PK could skip a
-    # PK range and under-count.
+    # Correctness: the paged orphan SQL selects the FULL PK window (so the keyset boundary
+    # advances over NON-orphan rows too) -- if the window dropped non-orphans, a page's max
+    # PK could skip a PK range and under-count. The window is pinned in a MATERIALIZED CTE
+    # and the orphan count reads it as an ANTI-JOIN, which keeps that property while letting
+    # the planner hash the parent instead of probing it per row.
     from dsql_migrator.core.validation_sql import (
         build_pg_orphan_page_first_sql,
         build_pg_orphan_page_next_sql,
@@ -1316,14 +1338,24 @@ def test_orphan_page_sql_pages_the_window_unconditionally() -> None:
     )
     first = build_pg_orphan_page_first_sql("orders", fk, "id", 5000).as_string(None)
     nxt = build_pg_orphan_page_next_sql("orders", fk, "id", 5000).as_string(None)
-    # The orphan predicate is a FILTER on the count, not a WHERE on the window.
-    assert "COUNT(*) FILTER (WHERE" in first
+    # The WINDOW is still unfiltered by the orphan predicate -- that is the correctness
+    # property: if the window dropped non-orphans, a page's max PK could skip a PK range
+    # and under-count. It is now pinned in a MATERIALIZED CTE and scanned twice.
+    cte = first[first.index("WITH pg AS MATERIALIZED ("):first.index(") SELECT")]
+    assert 'FROM "orders" ORDER BY "id" LIMIT 5000' in cte
+    assert "IS NULL" not in cte and "customers" not in cte, (
+        f"the orphan predicate leaked into the window, which would skip PK ranges: {cte}"
+    )
+    # The orphan count is an ANTI-JOIN, not a per-row correlated subquery. COUNT(*) FILTER
+    # (WHERE ... NOT EXISTS ...) forced the planner to evaluate NOT EXISTS per row and cost
+    # 27x on a live cluster (0.59 -> 0.022 ms/row) for byte-identical results.
+    assert "COUNT(*) FILTER" not in first, "FILTER defeats the anti-join optimisation"
+    assert 'LEFT JOIN "customers" AS p ON p."id" = pg."customer_id"' in first
     assert 'pg."customer_id" IS NOT NULL' in first
-    assert 'NOT EXISTS' in first and '"customers" AS p' in first
-    # The window itself is unfiltered by the orphan predicate; the keyset advances by the
-    # window's max PK via array_agg (works for any orderable PK type).
+    assert 'p."id" IS NULL' in first
+    # The keyset boundary still comes from the FULL window via array_agg (max() has no
+    # uuid overload -- verified live).
     assert '(array_agg(page_pk ORDER BY page_pk))[COUNT(*)]' in first
-    assert 'FROM "orders" ORDER BY "id" LIMIT 5000' in first
     # The next page carries the keyset bound; the first page does not.
     assert '"id" > %(last)s' in nxt
     assert '"id" > ' not in first

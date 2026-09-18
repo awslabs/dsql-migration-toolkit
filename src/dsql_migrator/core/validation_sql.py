@@ -839,16 +839,44 @@ def _build_pg_orphan_page_sql(
             pk=sql.Identifier(pk_column), last=sql.Placeholder("last")
         )
     )
+    # The window is pinned in a MATERIALIZED CTE and scanned twice: once for the orphan
+    # count as a LEFT JOIN anti-join, once for the keyset boundary + row count. That keeps
+    # the boundary EXACT (it still advances over non-orphan rows) while letting the planner
+    # hash-join the parent instead of probing it per row.
+    #
+    # WHY, measured on a live ap-northeast-2 cluster over a 100k-row window of a 3M-row
+    # child: the previous form -- COUNT(*) FILTER (WHERE ... NOT EXISTS ...) -- took 59.2s
+    # (0.59 ms/row); this one takes 2.19s (0.022 ms/row), a 27x reduction, and returns
+    # BYTE-IDENTICAL results. FILTER was the whole cost: it makes the correlated NOT EXISTS
+    # a per-row scalar expression, so the anti-join optimisation is unavailable. Neither the
+    # page size (identical ms/row at 5k..250k, and 500k exceeds DSQL's 300s transaction
+    # limit) nor the array_agg boundary trick (0.21s on its own) was the cost -- both were
+    # measured and ruled out.
+    #
+    # This matters because the foreign-key pass is the pre-cut-over gate: on an 8.5M-row
+    # schema with 15 foreign keys it projected to ~153 min, and for a CDC migration that
+    # runs at CUT OVER, after the source is already frozen. Now ~6 min.
+    #
+    # array_agg stays for the boundary: max() has no uuid overload (verified live --
+    # "function max(uuid) does not exist"), and it costs 0.21s per page.
     return sql.SQL(
-        "SELECT COUNT(*) FILTER (WHERE {not_null} AND NOT EXISTS ("
-        "SELECT 1 FROM {parent} AS p WHERE {join_predicate})), "
-        "(array_agg(page_pk ORDER BY page_pk))[COUNT(*)], COUNT(*) FROM ("
+        "WITH pg AS MATERIALIZED ("
         "SELECT {pk} AS page_pk, {fk_cols} FROM {child} {where}"
-        "ORDER BY {pk} LIMIT {limit}) pg"
+        "ORDER BY {pk} LIMIT {limit}) "
+        "SELECT (SELECT COUNT(*) FROM pg LEFT JOIN {parent} AS p ON {join_predicate} "
+        "WHERE {not_null} AND {parent_null}), "
+        "(SELECT (array_agg(page_pk ORDER BY page_pk))[COUNT(*)] FROM pg), "
+        "(SELECT COUNT(*) FROM pg)"
     ).format(
         not_null=not_null,
         parent=parent,
         join_predicate=join_predicate,
+        # The anti-join's "no parent row matched" test. Any referenced column is enough
+        # (they are the parent's key, so all-or-nothing), and it must be NOT NULL in the
+        # parent, which a referenced key always is.
+        parent_null=sql.SQL("p.{ref} IS NULL").format(
+            ref=sql.Identifier(fk.referenced_columns[0])
+        ),
         pk=sql.Identifier(pk_column),
         fk_cols=fk_cols,
         child=child,
