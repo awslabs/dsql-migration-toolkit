@@ -19641,14 +19641,21 @@ def test_abandoning_the_cancel_wait_tears_the_pool_down_without_waiting() -> Non
 
         def shutdown(self, wait=True, cancel_futures=False):  # noqa: ANN001
             self.shutdowns.append({"wait": wait, "cancel_futures": cancel_futures})
+            # CPython does exactly this, unconditionally, at the end of shutdown -- so a
+            # double that keeps _processes populated lets a teardown that reads the
+            # attribute AFTER shutdown look like it terminated the workers when it
+            # terminated none. That is what happened here the first time.
+            self._processes = None
 
     pool = _Pool()
+    procs = list(pool._processes.values())      # hold them; shutdown() drops the mapping
     _engine._abandon_pool_workers(pool)
     # It must NOT wait, and it must drop everything still queued.
     assert pool.shutdowns == [{"wait": False, "cancel_futures": True}]
     assert not [s for s in pool.shutdowns if s["wait"]], "a waiting shutdown re-blocks Stop"
     # Running workers are terminated (cancel() cannot stop them); a dead one is left alone.
-    assert [p.terminated for p in pool._processes.values()] == [True, False, True]
+    assert [p.terminated for p in procs] == [True, False, True]
+    assert pool._processes is None          # the double matches CPython
 
 
 def test_the_cancel_abandon_path_actually_calls_the_bounded_teardown() -> None:
@@ -19797,3 +19804,65 @@ def test_the_drain_turns_a_heartbeat_into_liveness_only() -> None:
     _H().update(lambda j: None)                 # what the drain does for a heartbeat
     assert updates["n"] == 1                    # liveness stamped (via apply_update)
     assert job.model_dump() == before           # and nothing about the job changed
+
+
+def _t_monotonic() -> float:
+    import time
+    return time.monotonic()
+
+
+def _t_sleep(seconds: float) -> None:
+    import time
+    time.sleep(seconds)
+
+
+def _wedged_worker(_arg):  # module-level: must be picklable for spawn
+    import time as _t
+    _t.sleep(120)          # never returns within the test
+    return "unreachable"
+
+
+def test_abandon_terminates_REAL_worker_processes() -> None:
+    """The same assertion, against a real ProcessPoolExecutor rather than a double.
+
+    A hand-rolled pool double hid this twice: `Executor.shutdown` ends with
+    `self._processes = None` unconditionally, so a teardown that reads `pool._processes`
+    AFTER shutdown terminates nothing -- while a double that keeps the mapping populated
+    reports success. Only real child processes can settle it.
+    """
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    ctx = multiprocessing.get_context("spawn")
+    pool = ProcessPoolExecutor(max_workers=2, mp_context=ctx)
+    try:
+        futures = [pool.submit(_wedged_worker, i) for i in range(2)]
+        # Wait until the children are actually up and running the wedged task.
+        deadline = _t_monotonic() + 30.0
+        while not (pool._processes and len(pool._processes) == 2):
+            assert _t_monotonic() < deadline, "workers never started"
+            _t_sleep(0.05)
+        children = list(pool._processes.values())
+        assert all(p.is_alive() for p in children)
+
+        started = _t_monotonic()
+        _engine._abandon_pool_workers(pool)
+        elapsed = _t_monotonic() - started
+        # It must not wait for the wedged 120s task.
+        assert elapsed < 20.0, f"teardown blocked for {elapsed:.1f}s"
+
+        for proc in children:
+            proc.join(15.0)
+        alive = [(p.pid, p.is_alive()) for p in children]
+        assert not any(a for _pid, a in alive), f"workers survived the teardown: {alive}"
+        assert all(p.exitcode is not None for p in children)
+        for f in futures:
+            f.cancel()
+    finally:
+        for proc in list((getattr(pool, "_processes", None) or {}).values()):
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass

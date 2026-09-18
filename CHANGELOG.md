@@ -5,6 +5,24 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.455
+
+### Fixed
+
+- **v0.1.454's cancel teardown terminated no worker at all.** It called
+  `pool.shutdown(wait=False, cancel_futures=True)` and only then read `pool._processes` to
+  terminate the wedged children -- but CPython's `Executor.shutdown` ends with
+  `self._processes = None` **unconditionally** (both `wait` values), so the loop iterated an
+  empty mapping. Stop still returned promptly (an incidental side effect of the same
+  shutdown clearing the manager thread), but the worker processes were left running: each
+  kept its source connection and could commit its one in-flight batch after the user had
+  stopped the load. The children are now captured BEFORE shutdown.
+  - The unit test hid it: its hand-rolled pool double kept `_processes` populated after
+    `shutdown`, so a teardown that terminated nothing reported success. The double now
+    matches CPython, and a companion test drives a **real** `ProcessPoolExecutor` with
+    wedged children and asserts they are actually dead -- the third time in this file that
+    a double or a source-text assertion has covered for a live defect.
+
 ## v0.1.454
 
 Four defects found by probing test blind spots -- places where a test was structurally

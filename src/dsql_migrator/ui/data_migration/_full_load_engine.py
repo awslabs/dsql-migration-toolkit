@@ -789,11 +789,18 @@ def _abandon_pool_workers(pool) -> None:
     Best-effort throughout: this runs on the way out of a cancelled run, so nothing here
     may raise and mask the cancellation.
     """
+    # Capture the children BEFORE shutting down. ``Executor.shutdown`` ends with
+    # ``self._processes = None`` UNCONDITIONALLY (CPython 3.12, both wait values), so
+    # reading ``pool._processes`` afterwards yields None and the terminate loop below
+    # silently iterates nothing -- which is exactly how the first version of this function
+    # terminated no worker at all while its unit test (a double that kept ``_processes``
+    # populated) passed.
+    children = list((getattr(pool, "_processes", None) or {}).values())
     try:
         pool.shutdown(wait=False, cancel_futures=True)
     except Exception:  # noqa: BLE001 - teardown must not mask the cancel
         _LOGGER.debug("Full Load cancel: non-blocking shutdown failed", exc_info=True)
-    for proc in list((getattr(pool, "_processes", None) or {}).values()):
+    for proc in children:
         try:
             if proc.is_alive():
                 proc.terminate()
