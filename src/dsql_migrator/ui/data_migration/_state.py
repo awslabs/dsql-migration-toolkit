@@ -174,6 +174,25 @@ class DataMigrationState:
         # never deploys them). All transient/session-only -- not on MigrationJob.
         self.cdc_status_view: Optional[LoadStatusView] = None
         self.cdc_controller: Optional[object] = None  # MskConnectController
+        # (region, aws_profile) the cached controller was built with. Nothing invalidated
+        # the controller, so a profile/region change left CDC monitoring reading the OLD
+        # identity while the operator believed the fix had been applied.
+        self.cdc_controller_identity: Optional[tuple] = None
+        # PINNED error-log key for every CDC surface. job_id is replaced by a Full Load
+        # retry, and re-keying mid-stream made recorded dead-letters unreadable (see
+        # cdc_error_log_key).
+        self.cdc_log_key: Optional[str] = None
+        # DLQ read cursor + already-audited event ids, held on the SESSION rather than on
+        # the controller: the controller is rebuilt on any reset/new session, and its
+        # in-memory cursor was the only thing keeping the durable activity log from
+        # re-writing every dead letter in the blind 6 h look-back window each time.
+        # Both keyed BY LOG GROUP: one cursor leaked across pipelines when attaching to
+        # another CDC stack (see MskConnectController.seed_dlq_cursor).
+        self.cdc_dlq_cursor_ms: dict = {}
+        self.cdc_dlq_seen_ids: dict = {}
+        # Identities of dead letters already written to the DURABLE activity log, so a
+        # re-surfaced record is audited once (the write is append-only and permanent).
+        self.cdc_dlq_audited_keys: set = set()
         self.cdc_connector_names: list[str] = []
         # Subset of cdc_connector_names whose MSK connectorState is RUNNING (vs
         # still CREATING/UPDATING). Lets the lifecycle card distinguish "deployed
@@ -716,10 +735,17 @@ class DataMigrationState:
         with self._lock:
             self._cdc_deploy_log = []
 
-    def set_cdc_controller(self, controller: object) -> None:
-        """Inject the MSK Connect controller used to poll connector status."""
+    def set_cdc_controller(
+        self, controller: object, identity: Optional[tuple] = None
+    ) -> None:
+        """Inject the MSK Connect controller used to poll connector status.
+
+        ``identity`` is the ``(region, aws_profile)`` it was built with, so the cache can
+        be dropped when either changes instead of silently serving the old account.
+        """
         with self._lock:
             self.cdc_controller = controller
+            self.cdc_controller_identity = identity if controller is not None else None
 
     def set_cdc_connector_names(self, names: Sequence[str]) -> None:
         """Record the connector names the CDC poller should track (read-only)."""

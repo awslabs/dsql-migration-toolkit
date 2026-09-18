@@ -5,6 +5,75 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.457
+
+Completes the sweep started in v0.1.453: state keyed by an identifier that a legitimate
+user action changes underneath it. v0.1.453 fixed the Full Load half of the job-id problem;
+this fixes the CDC half and the remaining stragglers.
+
+### Fixed
+
+- **A Full Load retry made every recorded CDC dead-letter unreadable.** `cdc_error_log_key`
+  returned `migration_state.job_id` live, and a retry ("Retry unfinished tables" or the
+  per-table "Reload" -- both supported WHILE CDC streams) replaces it. So every CDC surface
+  re-keyed mid-stream: the DLQ card fell to a grey "0 quarantined / No records
+  quarantined", its Download and Ask-AI-DBA buttons disappeared, the per-table consistency
+  badges flipped to "consistent", and the schema-drift banner cleared -- for records that
+  were still there under the previous job id. The key is now PINNED for the life of the
+  migration state (Start over builds fresh state, so the pin never outlives a migration),
+  and the per-stack fallback for CDC-only sessions is unchanged.
+- **The DLQ card's "the Full Load also set N rows aside" cross-reference vanished after a
+  retry** -- it read the bare key instead of resolving the retry lineage, so the two halves
+  of the same pre-cut-over screen disagreed. It now resolves the lineage, as does the AI
+  DBA's `list_failed_full_load_tables`, which was handing the model `"error": ""` for
+  exactly the tables the retry did not re-run while the screen beside it showed the reason.
+- **CDC dead-letters were re-written to the durable activity log on every controller
+  rebuild.** The only dedup was the controller's in-memory cursor, and the controller is
+  rebuilt on Start over, on app restart and for each new browser session -- so each rebuild
+  re-read the blind 6 h look-back window and re-audited every record. N quarantines became
+  2N, 3N lines and the log could no longer answer "how many rows did the pipeline drop?".
+  The read cursor now lives on the session (a rebuilt controller resumes where the previous
+  one stopped) and the durable write is idempotent per record identity.
+- **`_CDC_ANNOUNCED` was wrong in both directions.** A retry changed its key, so every CDC
+  event was re-announced to the AI feed (a stream that appears to start twice); and the
+  stack-derived fallback key is IDENTICAL across migrations, so after Start over a fresh
+  CDC-only session inherited the old markers and announced NOTHING at all. Now keyed by the
+  migration state's identity as well as the pinned key.
+- **The cached MSK Connect controller was never invalidated when the AWS profile or target
+  region changed**, so CDC monitoring kept reading the old identity: connector health, DLQ
+  depth and the per-table CDC columns stayed stale or empty (reads fail closed) and the
+  profile fix the operator had just applied appeared to do nothing. Read-only surface only
+  -- Deploy/Start/Stop build their clients at click time -- but silently wrong. Now dropped
+  when `(region, aws_profile)` changes; a directly injected controller adopts the current
+  identity rather than being discarded.
+- **The controller's DLQ read cursor was not keyed by log group**, so attaching to another
+  CDC stack reused the previous pipeline's cursor and the adopted pipeline's earlier
+  dead-letters were never surfaced -- its DLQ card read "0 quarantined" for a pipeline that
+  had quarantined rows. Cursor and seen-id set are now per log group.
+- **After a retry completed the load, only the RETRIED tables got their identity sequence
+  advanced.** The first attempt was incomplete so it synced nothing (by design), and the
+  retry narrowed the sync to its own subset -- so every table that succeeded on the FIRST
+  attempt kept its DSQL sequence at its start value while its rows already occupied those
+  values, and the first application insert after cut over could fail with a duplicate key
+  on a table the operator had no reason to suspect. The retry now syncs every table the
+  completed run loaded.
+
+### Changed
+
+- The multiprocess sharding rule is now a pure predicate (`_sharding_is_consistent` /
+  `_table_may_shard`) asserted by BEHAVIOUR. Its previous guard asserted the source-text
+  substring `"_shardable_ok = bool(migrator._inputs.cdc_coexisting)"`, which stayed a
+  PREFIX of the widened condition (`... or _shared_snapshot`) -- so it kept passing while
+  no longer guarding anything, and the comment above it still claimed an invariant the code
+  had dropped (a PostgreSQL non-CDC REPLACE does shard now, safely, on one exported
+  snapshot). No behaviour change; the rule is unchanged and now stated once.
+
+### Tests
+
+- 3793 green. Five mutations checked, each caught. One of them initially SURVIVED -- the
+  controller-identity test only exercised a path where the mutant was equivalent -- so the
+  test was strengthened to assert the contract it documented.
+
 ## v0.1.456
 
 The stall watchdog fails a job that has not refreshed its liveness clock for 900 s, but

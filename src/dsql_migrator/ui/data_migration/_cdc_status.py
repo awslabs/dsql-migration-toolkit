@@ -1006,6 +1006,26 @@ def _ensure_cdc_controller(migration_state, session) -> None:
     # the latest state after a deploy/stop/delete completes.
     _probe_cdc_stack_phase(migration_state, session)
 
+    # The controller holds the region + AWS profile it was built with (it makes its own
+    # boto3 session per call), and nothing ever invalidated it -- so switching the AWS
+    # profile on Connect, or repointing the target region, left CDC monitoring reading the
+    # OLD identity: connector health, DLQ depth and the per-table CDC columns stayed stale
+    # or empty (reads fail closed) and the fix the operator had just applied appeared to
+    # do nothing. Read-only surface only (Deploy/Start/Stop build their clients at click
+    # time), but silently stale.
+    _identity = (
+        getattr(getattr(session, "target_config", None), "region", None),
+        getattr(session, "aws_profile", None),
+    )
+    _cached = getattr(migration_state, "cdc_controller", None)
+    if _cached is not None:
+        _known = getattr(migration_state, "cdc_controller_identity", None)
+        if _known is None:
+            # Injected directly (tests, adopt paths) -- adopt the CURRENT identity rather
+            # than discarding a working controller, so only a real later change drops it.
+            migration_state.set_cdc_controller(_cached, _identity)
+        elif _known != _identity:
+            migration_state.set_cdc_controller(None)
     if getattr(migration_state, "cdc_controller", None) is not None:
         # Controller already wired; just refresh connector detection so a Stop that
         # removed connectors flips the phase back off "running".
@@ -1046,7 +1066,20 @@ def _ensure_cdc_controller(migration_state, session) -> None:
     # Store the controller regardless (the poller needs it after a later deploy);
     # `running` is driven by whether any of MY connectors are present, not by the
     # controller existing -- so an empty match keeps the Start action visible.
-    migration_state.set_cdc_controller(controller)
+    # Record the identity so a later profile/region change drops this cache instead of
+    # serving the old account's view.
+    migration_state.set_cdc_controller(controller, _identity)
+    # Restore the DLQ read cursor from the SESSION: a rebuilt controller otherwise starts
+    # cursor-less and re-reads the blind 6h look-back window, re-writing every already
+    # audited dead letter to the durable activity log (N records became 2N, 3N lines).
+    _seed = getattr(migration_state, "cdc_dlq_cursor_ms", None)
+    if _seed:
+        try:
+            controller.seed_dlq_cursor(
+                _seed, dict(getattr(migration_state, "cdc_dlq_seen_ids", None) or {})
+            )
+        except AttributeError:
+            pass
     if not names:
         # No connectors of mine: this is also how a Stop/Delete reads once it lands,
         # so the step status must follow (see _sync_cdc_step_status).
@@ -1279,6 +1312,16 @@ def _fetch_cdc_status(migration_state, tables=None):
             dlq_errors = list(reader(f"/msk-connect/{stack_name}-cdc") or [])
         except Exception:  # noqa: BLE001 - advisory, keep status even if logs fail
             dlq_errors = []
+        else:
+            # Persist the read position on the SESSION so a rebuilt controller resumes
+            # here instead of re-reading the blind look-back window and re-auditing every
+            # dead letter it already wrote.
+            try:
+                cursor_ms, seen = controller.dlq_cursor_state()
+                migration_state.cdc_dlq_cursor_ms = cursor_ms
+                migration_state.cdc_dlq_seen_ids = seen
+            except Exception:  # noqa: BLE001 - advisory bookkeeping only
+                pass
     return statuses, health, dlq_errors, applied_ops, lag_ms, lag_series
 
 
@@ -1293,11 +1336,26 @@ def cdc_error_log_key(migration_state) -> str:
     (``"cdc:<stack>"``) so DLQ fold, depth, the record list, the activity-log
     lines, and the download all agree on one key whether or not a Full Load ran.
     """
+    # PINNED for the life of the migration state. ``migration_state.job_id`` is REPLACED
+    # by a Full Load retry ("Retry unfinished tables" / per-table "Reload", both of which
+    # are supported while CDC streams), so returning it live re-keyed every CDC surface
+    # mid-stream: the DLQ card fell to a grey "0 quarantined / No records quarantined",
+    # its download and Ask-AI-DBA buttons disappeared, the per-table consistency badges
+    # flipped to "consistent", and the drift banner cleared -- for records that were still
+    # there, under the previous job id. Pinning the FIRST key the session resolves keeps
+    # the fold, depth, record list, activity lines and download on one key for the whole
+    # run. Start over builds fresh state, so the pin does not outlive a migration.
+    pinned = getattr(migration_state, "cdc_log_key", None)
+    if pinned:
+        return pinned
     job_id = getattr(migration_state, "job_id", None)
-    if job_id:
-        return job_id
     stack = getattr(migration_state, "cdc_stack_name", None) or CDC_DEFAULT_STACK_NAME
-    return f"cdc:{stack}"
+    key = job_id if job_id else f"cdc:{stack}"
+    try:
+        migration_state.cdc_log_key = key
+    except Exception:  # noqa: BLE001 - a read-only double just gets the computed key
+        pass
+    return key
 
 
 def is_cdc_error_record(record) -> bool:
@@ -1626,7 +1684,22 @@ def _apply_cdc_status(migration_state, fetched) -> None:
             log_activity,
         )
 
+        # Belt AND braces: the cursor above is the primary dedup, but this write is
+        # DURABLE and was not idempotent, so any path that re-surfaced a record (a
+        # controller rebuilt before the cursor was restored, an app restart) turned N
+        # quarantines into 2N/3N audit lines and the log could no longer answer "how many
+        # rows did the pipeline drop?". Key on the record's own identity for the session.
+        _audited = migration_state.cdc_dlq_audited_keys
         for err in dlq_errors:
+            _key = (
+                getattr(err, "table", None),
+                getattr(err, "error_code", None),
+                getattr(err, "message", None),
+                str(getattr(err, "occurred_at", "") or ""),
+            )
+            if _key in _audited:
+                continue
+            _audited.add(_key)
             log_activity(
                 ActivityCategory.CDC,
                 "quarantine record to DLQ",

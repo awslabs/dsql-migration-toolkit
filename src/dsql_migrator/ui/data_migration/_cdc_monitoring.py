@@ -558,7 +558,7 @@ def _render_migration_table_status(
 # CDC activity events already mirrored into the AI feed, keyed by the stable CDC log
 # key, so the ~5s monitor poll announces each transition ONCE (not every tick). Resets
 # on process restart (in-memory) -- a benign re-announce, never a data risk.
-_CDC_ANNOUNCED: "dict[str, set]" = {}
+_CDC_ANNOUNCED: "dict[tuple, set]" = {}
 
 
 def _announce_cdc_events(migration_state, status_view, ai_post_event) -> None:
@@ -571,7 +571,15 @@ def _announce_cdc_events(migration_state, status_view, ai_post_event) -> None:
     if ai_post_event is None:
         return
     try:
-        seen = _CDC_ANNOUNCED.setdefault(cdc_error_log_key(migration_state), set())
+        # Keyed by the pinned CDC key AND the state object's identity. The key alone was
+        # wrong in both directions: a Full Load retry changed it, so every event was
+        # re-announced to the AI feed (a stream that appears to start twice); and the
+        # stack-derived fallback is IDENTICAL across migrations, so after Start over a
+        # fresh CDC-only session inherited the old markers and announced NOTHING at all.
+        # id() distinguishes the migration state, which Start over rebuilds.
+        seen = _CDC_ANNOUNCED.setdefault(
+            (id(migration_state), cdc_error_log_key(migration_state)), set()
+        )
         if "started" not in seen:
             seen.add("started")
             ai_post_event(text="CDC streaming started", status="started")
@@ -1436,9 +1444,18 @@ def _render_cdc_dlq_panel(
         _render_cdc_dlq_records(ui, migration_state, log_key)
         if health.depth > 0:
             _render_cdc_error_download(ui, migration_state, log_key)
-        _render_full_load_quarantine_pointer(ui, migration_state, log_key)
+        # Resolve the Full Load job here so the pointer can follow the retry lineage
+        # (a retry runs under a NEW job id -- see full_load_error_records_for).
+        from dsql_migrator.ui.data_migration._cdc_status import _current_job
 
-def _render_full_load_quarantine_pointer(ui, migration_state, log_key: str) -> None:
+        _fl_job = _current_job(job_manager, getattr(migration_state, "job_id", None))
+        _render_full_load_quarantine_pointer(
+            ui, migration_state, log_key, job=_fl_job
+        )
+
+def _render_full_load_quarantine_pointer(
+    ui, migration_state, log_key: str, job=None
+) -> None:
     """Note that the Full Load set rows aside too, and where to see them.
 
     The DLQ panel now counts CDC records only, which is correct -- but the Full Load's
@@ -1452,11 +1469,23 @@ def _render_full_load_quarantine_pointer(ui, migration_state, log_key: str) -> N
     """
     if not log_key:
         return
+    # Resolve the RETRY LINEAGE rather than reading the bare key: a Full Load retry runs
+    # under a new job id, so a bare read saw only the retry's own records and this
+    # cross-reference silently vanished for tables the retry did not re-run -- while the
+    # Full Load section on the same page still showed them. The two halves of one screen
+    # disagreed, on the screen read just before cut over.
+    from dsql_migrator.ui.data_migration._cdc_status import (
+        full_load_error_records_for,
+    )
+
     try:
-        records = migration_state.error_log.records(log_key) or []
+        if job is not None:
+            full_load = list(full_load_error_records_for(migration_state.error_log, job))
+        else:
+            records = migration_state.error_log.records(log_key) or []
+            full_load = [r for r in records if not is_cdc_error_record(r)]
     except Exception:  # noqa: BLE001 - advisory line; never break the panel
         return
-    full_load = [r for r in records if not is_cdc_error_record(r)]
     if not full_load:
         return
     noun = "row" if len(full_load) == 1 else "rows"

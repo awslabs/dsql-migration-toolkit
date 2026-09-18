@@ -11949,26 +11949,57 @@ def test_cleanup_sentinel_is_also_nonblocking() -> None:
     assert "_report_progress(progress_queue, _PROGRESS_SENTINEL)" in src
 
 
-def test_multiprocess_planner_shards_only_cdc_coexisting_and_honors_reader_shards() -> None:
-    # The production multiprocess planner must mirror the single-process sharding
-    # invariant (audit D1): shard ONLY when cdc_coexisting (never a REPLACE or a
-    # non-CDC append -> torn read with nothing to reconcile), and cap the shard count
-    # by cfg.full_load_reader_shards clamped to the source-connection ceiling -- NOT
-    # the pool budget (remaining_slots), which ignored the off-switch and the ceiling.
+def test_the_multiprocess_sharding_rule_is_asserted_by_behaviour() -> None:
+    """Shard only when a torn cross-shard read is impossible.
+
+    The previous guard asserted the SOURCE TEXT
+    `"_shardable_ok = bool(migrator._inputs.cdc_coexisting)"`, which stayed a PREFIX of the
+    widened condition (`... or _shared_snapshot`) -- so it kept passing while no longer
+    guarding anything, and its comment still claimed an invariant the code had dropped
+    (a PostgreSQL non-CDC REPLACE does shard now, safely, on one exported snapshot).
+    The rule is a pure predicate so it can be asserted directly.
+    """
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    # Neither reconciliation nor a shared snapshot -> a torn read has nothing to repair it.
+    assert not _engine._sharding_is_consistent(
+        cdc_coexisting=False, shared_snapshot=False
+    )
+    # A CDC stream reconciles post-snapshot writes.
+    assert _engine._sharding_is_consistent(cdc_coexisting=True, shared_snapshot=False)
+    # One shared point-in-time snapshot means there is nothing to tear.
+    assert _engine._sharding_is_consistent(cdc_coexisting=False, shared_snapshot=True)
+
+    # A REPLACE is a clean plain-INSERT load with nothing to reconcile it, so it may only
+    # be split when every shard reads the SAME snapshot.
+    assert not _engine._table_may_shard(
+        cdc_coexisting=True, shared_snapshot=False, table_is_replace=True
+    )
+    assert _engine._table_may_shard(
+        cdc_coexisting=False, shared_snapshot=True, table_is_replace=True
+    )
+    assert _engine._table_may_shard(
+        cdc_coexisting=True, shared_snapshot=False, table_is_replace=False
+    )
+    assert not _engine._table_may_shard(
+        cdc_coexisting=False, shared_snapshot=False, table_is_replace=False
+    )
+
+
+def test_the_shard_count_comes_from_the_clamped_reader_shard_budget() -> None:
+    # The other half of the old guard, kept: the shard count must come from
+    # full_load_reader_shards clamped by the source-connection ceiling, NOT the pool
+    # budget (which ignored the off-switch and the ceiling).
     import inspect
 
     from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     src = inspect.getsource(_engine._migrate_tables_in_parallel)
     process_path = src[src.index("# Unified process-parallel path"):]
-    # Gated on cdc_coexisting (the only safe sharding condition).
-    assert "_shardable_ok = bool(migrator._inputs.cdc_coexisting)" in process_path
-    assert "not table_is_replace" in process_path
-    # Shard count comes from the clamped reader-shards budget, not the pool slots.
     assert "effective_reader_shards" in process_path
     assert "_MAX_SOURCE_READERS // tp" in process_path
-    # The old unsafe allocation must be gone from the CODE (the word may survive only
-    # in a comment explaining why): no assignment or arithmetic on remaining_slots.
+    # The old unsafe allocation must be gone from the CODE (the word may survive only in a
+    # comment explaining why): no assignment or arithmetic on remaining_slots.
     assert "remaining_slots =" not in process_path
     assert "remaining_slots //" not in process_path
     assert "table_parallelism - non_shardable_count" not in process_path
@@ -20196,3 +20227,127 @@ def test_a_governor_pause_reports_liveness_every_slice() -> None:
     )
     governor.throttle()
     assert len(slices) == 3, slices      # one per wait slice, not one per pause
+
+
+def test_the_cdc_log_key_survives_a_full_load_retry() -> None:
+    """A retry must not make recorded dead-letters unreadable.
+
+    `cdc_error_log_key` returned `migration_state.job_id` live, and a Full Load retry
+    ("Retry unfinished tables" / per-table "Reload", both supported WHILE CDC streams)
+    replaces it -- so every CDC surface re-keyed mid-stream: the DLQ card fell to a grey
+    "0 quarantined / No records quarantined", its download and Ask-AI-DBA buttons
+    disappeared, and the per-table consistency badges flipped to "consistent", for records
+    that were still there under the previous job id.
+    """
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_error_log_key
+
+    class _S:
+        job_id = "job-A"
+        cdc_stack_name = "dsql-cdc-stack"
+        cdc_log_key = None
+
+    state = _S()
+    first = cdc_error_log_key(state)
+    assert first == "job-A"
+    state.job_id = "job-B"                        # a retry re-keys the session
+    assert cdc_error_log_key(state) == "job-A", (
+        "the CDC key followed the retry and orphaned every recorded dead-letter"
+    )
+
+
+def test_the_cdc_log_key_still_falls_back_per_stack_without_a_job() -> None:
+    # CDC-only / attach sessions have no Full Load job; keying off "" would drop every
+    # record silently.
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_error_log_key
+
+    class _S:
+        job_id = None
+        cdc_stack_name = "my-stack"
+        cdc_log_key = None
+
+    state = _S()
+    assert cdc_error_log_key(state) == "cdc:my-stack"
+    # And once pinned it stays put even if a Full Load starts later.
+    state.job_id = "job-Z"
+    assert cdc_error_log_key(state) == "cdc:my-stack"
+
+
+def test_the_dlq_audit_write_is_idempotent_per_record() -> None:
+    # The durable activity-log write had no dedup of its own -- only the controller's
+    # in-memory cursor -- so any rebuild re-wrote every dead letter in the blind 6h
+    # look-back window and N quarantines became 2N/3N audit lines.
+    from dsql_migrator.ui.data_migration._state import DataMigrationState
+
+    state = DataMigrationState()
+    assert state.cdc_dlq_audited_keys == set()
+    key = ("ecommerce.orders", "23503", "fk violation", "2026-09-18T05:00:00")
+    state.cdc_dlq_audited_keys.add(key)
+    assert key in state.cdc_dlq_audited_keys
+
+
+def test_the_cdc_controller_cache_is_dropped_when_the_identity_changes() -> None:
+    """Switching the AWS profile must not keep serving the old account's view.
+
+    Nothing invalidated the controller, and it holds the region + profile it was built
+    with (it makes its own boto3 session per call) -- so the fix the operator had just
+    applied on Connect appeared to change nothing.
+    """
+    from dsql_migrator.ui.data_migration._state import DataMigrationState
+
+    state = DataMigrationState()
+    controller = object()
+    state.set_cdc_controller(controller, ("us-east-1", "profile-a"))
+    assert state.cdc_controller is controller
+    assert state.cdc_controller_identity == ("us-east-1", "profile-a")
+
+    # Clearing must null the identity too, even if an identity is handed in: a stale
+    # identity left behind an absent controller would make the NEXT injected controller
+    # look already-verified and skip the invalidation entirely.
+    state.set_cdc_controller(None, ("us-east-1", "profile-a"))
+    assert state.cdc_controller is None
+    assert state.cdc_controller_identity is None
+
+    # A rebuild under the new identity is tracked, so a later change is caught.
+    state.set_cdc_controller(object(), ("ap-northeast-2", "profile-b"))
+    assert state.cdc_controller_identity == ("ap-northeast-2", "profile-b")
+
+
+def test_the_dlq_cursor_is_kept_per_log_group() -> None:
+    """One cursor leaked across pipelines when attaching to another CDC stack.
+
+    The adopted pipeline's earlier dead-letters -- older than the leaked cursor but inside
+    the first-read look-back -- were never surfaced, so its DLQ card read "0 quarantined"
+    for a pipeline that had quarantined rows.
+    """
+    from dsql_migrator.core.msk_connect_controller import MskConnectController
+
+    ctl = MskConnectController.__new__(MskConnectController)
+    ctl._dlq_cursor_ms = {}
+    ctl._dlq_seen_ids = {}
+    ctl.seed_dlq_cursor({"/msk-connect/a-cdc": 1000}, {"/msk-connect/a-cdc": {"e1"}})
+    cursors, seen = ctl.dlq_cursor_state()
+    assert cursors == {"/msk-connect/a-cdc": 1000}
+    assert seen == {"/msk-connect/a-cdc": {"e1"}}
+    # A different pipeline starts with NO cursor, so its look-back window applies.
+    assert cursors.get("/msk-connect/b-cdc") is None
+
+
+def test_a_retry_resyncs_the_identity_sequence_for_every_loaded_table() -> None:
+    """A recovered migration must not repair only part of the schema.
+
+    The first (incomplete) attempt syncs nothing by design, and the retry narrowed the
+    sync to the retried subset -- so every table that succeeded on the FIRST attempt kept
+    its DSQL sequence at its start value while its rows already occupied those values, and
+    the first application insert after cut over could fail with a duplicate key.
+    """
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    assert "sync_table_names" in inspect.signature(_engine._finalize_run).parameters
+    # The retry entry point must hand it the WHOLE prior chunk set, not retry_names.
+    retry_src = inspect.getsource(_engine.run_full_load_retry)
+    assert "sync_table_names=" in retry_src
+    assert "prior_chunks" in retry_src.split("sync_table_names=")[1][:200], (
+        "the retry still narrows the identity sync to the retried tables"
+    )

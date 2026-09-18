@@ -182,13 +182,43 @@ class MskConnectController:
         # Cursor + de-dup state for incremental DLQ log reads (see dlq_errors):
         # only events newer than the last seen are returned, and an eventId set
         # guards the timestamp boundary so a record is never surfaced twice.
-        self._dlq_cursor_ms: Optional[int] = None
-        self._dlq_seen_ids: set[str] = set()
+        # Keyed BY LOG GROUP. A single cursor leaked across pipelines: attaching to
+        # another CDC stack (the "Existing CDC infrastructure found" offer) reused the
+        # previous stack's cursor, so the adopted pipeline's earlier dead-letters -- older
+        # than that cursor but inside the first-read look-back -- were never surfaced and
+        # its DLQ card read "0 quarantined" for a pipeline that had quarantined rows.
+        self._dlq_cursor_ms: "dict[str, int]" = {}
+        self._dlq_seen_ids: "dict[str, set[str]]" = {}
         # Short-TTL cache for _list_metric_dimensions, keyed on (stack, metric_name):
         # {key: (expiry_monotonic, dims)}. Collapses the 5 per-poll discovery passes
         # (and cross-poll re-discovery) so ListMetrics is not paged every 5 s for data
         # that changes only when a new table starts emitting. See the TTL constant.
         self._dim_cache: dict[tuple[str, str], tuple[float, list[str]]] = {}
+
+    def seed_dlq_cursor(
+        self, cursor_ms: Optional[dict] = None, seen_ids: Optional[dict] = None
+    ) -> None:
+        """Adopt a DLQ read cursor recorded elsewhere (the UI session).
+
+        The cursor and seen-id set are what stop an already-surfaced dead letter from
+        being read -- and durably re-audited -- a second time. They lived only on this
+        instance, and the controller is rebuilt on any state reset, app restart or new
+        browser session, so each rebuild re-read the blind look-back window and wrote
+        every record to the activity log again. Seeding from session state makes a rebuild
+        continue where the previous controller left off.
+        """
+        for group, value in (cursor_ms or {}).items():
+            if value is not None:
+                self._dlq_cursor_ms[group] = int(value)
+        for group, ids in (seen_ids or {}).items():
+            self._dlq_seen_ids.setdefault(group, set()).update(ids or ())
+
+    def dlq_cursor_state(self) -> tuple:
+        """Return ``(cursor_ms_by_group, seen_ids_by_group)`` for the caller to persist."""
+        return (
+            dict(self._dlq_cursor_ms),
+            {g: set(ids) for g, ids in self._dlq_seen_ids.items()},
+        )
 
     def _client(self, service_name: str) -> object:
         session = self._session or build_session(self._aws_profile)
@@ -225,10 +255,10 @@ class MskConnectController:
         """
         now_dt = now or datetime.now(timezone.utc)
         now_ms = int(now_dt.timestamp() * 1000)
+        cursor = self._dlq_cursor_ms.get(log_group)
+        seen = self._dlq_seen_ids.setdefault(log_group, set())
         start_ms = (
-            self._dlq_cursor_ms
-            if self._dlq_cursor_ms is not None
-            else now_ms - window_seconds * 1000
+            cursor if cursor is not None else now_ms - window_seconds * 1000
         )
         try:
             logs = self._client("logs")
@@ -244,14 +274,14 @@ class MskConnectController:
         except Exception:  # noqa: BLE001 - advisory monitoring read, never crash
             return []
         errors: list[CdcConnectorError] = []
-        max_ts = self._dlq_cursor_ms or 0
+        max_ts = cursor or 0
         for event in events:
             message = str(event.get("message", ""))
             timestamp = event.get("timestamp")
             event_id = str(
                 event.get("eventId") or f"{timestamp}:{message[:48]}"
             )
-            if event_id in self._dlq_seen_ids:
+            if event_id in seen:
                 continue
             occurred_at = (
                 datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
@@ -259,16 +289,16 @@ class MskConnectController:
                 else None
             )
             record = parse_dlq_log_message(message, occurred_at=occurred_at)
-            self._dlq_seen_ids.add(event_id)
+            seen.add(event_id)
             if record is not None:
                 errors.append(record)
             if isinstance(timestamp, (int, float)) and timestamp > max_ts:
                 max_ts = int(timestamp)
         if max_ts:
-            self._dlq_cursor_ms = max_ts + 1
+            self._dlq_cursor_ms[log_group] = max_ts + 1
         # Bound the de-dup set so a long-running session never grows it unbounded.
-        if len(self._dlq_seen_ids) > 5000:
-            self._dlq_seen_ids = set(list(self._dlq_seen_ids)[-2000:])
+        if len(seen) > 5000:
+            self._dlq_seen_ids[log_group] = set(list(seen)[-2000:])
         return errors
 
     # -- read-only ----------------------------------------------------------

@@ -627,7 +627,7 @@ def build_ai_tool_executor(
             if name == "list_failed_full_load_tables":
                 from dsql_migrator.ui.data_migration import _current_job
                 from dsql_migrator.ui.data_migration._cdc_status import (
-                    full_load_latest_messages,
+                    full_load_latest_messages_for,
                 )
 
                 _dm = DATA_MIGRATION_STORE.get_or_create(session_id)
@@ -637,8 +637,11 @@ def build_ai_tool_executor(
                         {"status": "not_run", "message": "No Full Load has run yet."}
                     )
                 try:
-                    _msgs = full_load_latest_messages(
-                        getattr(_dm, "error_log", None), _job.job_id
+                    # The _for variant resolves the retry lineage. With the bare job id
+                    # the model was handed "error": "" for exactly the tables the retry
+                    # did not re-run -- while the screen beside it showed the reason.
+                    _msgs = full_load_latest_messages_for(
+                        getattr(_dm, "error_log", None), _job
                     )
                 except Exception:  # noqa: BLE001
                     _msgs = {}

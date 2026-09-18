@@ -782,6 +782,41 @@ def _report_progress(
         pass
 
 
+def _sharding_is_consistent(*, cdc_coexisting: bool, shared_snapshot: bool) -> bool:
+    """Whether a table's read may be split across several shard readers.
+
+    Each shard opens its own CONSISTENT SNAPSHOT, so a source written to DURING the load
+    can produce a cross-shard TORN READ: one row of a multi-row source transaction lands
+    in shard A's snapshot while its sibling has not yet appeared in shard B's. Splitting
+    is therefore only sound when one of two things holds:
+
+    * ``cdc_coexisting`` -- a CDC stream will reconcile every post-snapshot write, so a
+      torn read is repaired by the stream (and the load is idempotent), or
+    * ``shared_snapshot`` -- the source dialect can give EVERY shard one shared
+      point-in-time snapshot (PostgreSQL exported snapshots), so there is nothing to tear.
+
+    The second lifts the older "a REPLACE must be read by a single reader" restriction,
+    which is why that rule no longer appears here: a PostgreSQL non-CDC REPLACE does shard,
+    safely. Kept as a pure function so the invariant is asserted by BEHAVIOUR -- the
+    previous guard asserted a source-text substring that stayed a PREFIX of the widened
+    condition, so it kept passing while no longer guarding anything.
+    """
+    return bool(cdc_coexisting) or bool(shared_snapshot)
+
+
+def _table_may_shard(
+    *, cdc_coexisting: bool, shared_snapshot: bool, table_is_replace: bool
+) -> bool:
+    """Whether THIS table may be sharded, given the run-level consistency rule."""
+    if not _sharding_is_consistent(
+        cdc_coexisting=cdc_coexisting, shared_snapshot=shared_snapshot
+    ):
+        return False
+    # A REPLACE is a clean plain-INSERT load with nothing to reconcile it, so it may only
+    # be split when every shard reads ONE shared snapshot.
+    return (not table_is_replace) or bool(shared_snapshot)
+
+
 def _abandon_pool_workers(pool) -> None:
     """Tear a ``ProcessPoolExecutor`` down WITHOUT waiting for a wedged worker.
 
@@ -1967,27 +2002,16 @@ def _migrate_tables_in_parallel(
         # Small/non-shardable tables get 1 worker each; an eligible large table gets
         # K shard workers.
         #
-        # SHARDING SAFETY -- must mirror the single-process migrate_table invariant
-        # (see the "NOT sharded on the REPLACE path" block below), or the production
-        # multiprocess path silently reintroduces a torn read the single-process path
-        # forbids. Each shard opens its OWN independently-timed CONSISTENT SNAPSHOT, so
-        # a source written to DURING the load can land a cross-shard torn read (one row
-        # of a multi-row source txn in shard A's snapshot, its sibling not yet in shard
-        # B's). That is only provably safe when the load is idempotent AND a CDC stream
-        # will reconcile post-snapshot writes -- i.e. cdc_coexisting. A REPLACE (clean
-        # plain-INSERT, no CDC) or a non-CDC append has nothing to reconcile it, so such
-        # a table must be read by a SINGLE reader (one snapshot = one point-in-time cut).
-        # Resolve the SOURCE dialect so the shardability pre-gate uses the right
-        # integer-PK set (the authoritative plan_pk_shard_ranges below already does);
-        # without it this pre-gate ran under the module-default MySQL dialect.
+        # SHARDING SAFETY -- see _sharding_is_consistent for the whole rule. Resolve the
+        # SOURCE dialect first so this pre-gate uses the right integer-PK set (the
+        # authoritative plan_pk_shard_ranges below already does); without it the pre-gate
+        # ran under the module-default MySQL dialect.
         _shard_dialect = dialect_for(migrator._inputs.source_config.source_type)
-        # Sharding a table's read is consistent when EITHER a CDC stream will reconcile the
-        # shards' independently-timed snapshots (cdc_coexisting) OR the source dialect can
-        # give every shard ONE shared point-in-time snapshot (supports_shared_snapshot --
-        # PostgreSQL exported snapshots). The latter makes even a REPLACE (no-CDC) load shard
-        # SAFELY on a live source, so it lifts the "single-reader for REPLACE" restriction.
         _shared_snapshot = _shard_dialect.supports_shared_snapshot
-        _shardable_ok = bool(migrator._inputs.cdc_coexisting) or _shared_snapshot
+        _shardable_ok = _sharding_is_consistent(
+            cdc_coexisting=bool(migrator._inputs.cdc_coexisting),
+            shared_snapshot=_shared_snapshot,
+        )
 
         # Shard count is capped exactly like single-process: cfg.full_load_reader_shards
         # clamped so table_parallelism x shards stays under the source max_connections
@@ -2005,8 +2029,11 @@ def _migrate_tables_in_parallel(
                 and table.name in migrator._inputs.replace_tables
             )
             shardable = (
-                _shardable_ok
-                and (not table_is_replace or _shared_snapshot)
+                _table_may_shard(
+                    cdc_coexisting=bool(migrator._inputs.cdc_coexisting),
+                    shared_snapshot=_shared_snapshot,
+                    table_is_replace=table_is_replace,
+                )
                 and shardable_leading_int_pk(table, _shard_dialect) is not None
                 and effective_reader_shards > 1
             )
@@ -2453,6 +2480,10 @@ def _finalize_run(
     # quarantined-row count spans the lineage (see _count_quarantined_rows). Empty on a
     # first run, where every record is already under this job id.
     error_job_ids: Optional[dict] = None,
+    # Tables whose identity sequence the completed run must resync. Defaults to
+    # ``table_names`` (the tables this pass loaded); a RETRY passes the whole run's set,
+    # because the first attempt was incomplete and therefore synced nothing.
+    sync_table_names: "Optional[Sequence[str]]" = None,
 ) -> None:
     """Log the run outcome and raise :class:`FullLoadIncompleteError` unless complete.
 
@@ -2465,6 +2496,7 @@ def _finalize_run(
     raises, even with the flag set, so the override can never mask a recoverable
     failure.
     """
+    _sync_names = list(sync_table_names) if sync_table_names else list(table_names)
     incomplete = counts.real_failed + counts.quarantined
     if not incomplete or handle.cancelled:
         if not handle.cancelled:
@@ -2492,7 +2524,9 @@ def _finalize_run(
             # cancelled run is skipped for the same reason. (The accepted-quarantine
             # branch below is ALSO a completed load and syncs too -- quarantined rows are
             # permanently dropped, so MAX(pk) is final there as well.)
-            _log_identity_sequence_sync(inputs, table_names, sync=sync_sequences)
+            _log_identity_sequence_sync(
+                inputs, _sync_names, sync=sync_sequences
+            )
         return
     total = len(table_names)
     # Quarantine records are the error-log rows whose message marks an isolated
@@ -2520,7 +2554,7 @@ def _finalize_run(
         # (nextval=1) after an accepted-gap load, so the app's first insert after
         # cut-over collided with a migrated id (duplicate key 23505) -- and only if the
         # operator happened to run Validation (v0.1.266 re-sync) was it repaired.
-        _log_identity_sequence_sync(inputs, table_names, sync=sync_sequences)
+        _log_identity_sequence_sync(inputs, _sync_names, sync=sync_sequences)
         return
     # Name the affected tables and their reasons. "1 of 8 table(s) did not fully load"
     # is a count, not a diagnosis: reading it later tells you a run failed but not which
@@ -3050,6 +3084,15 @@ def run_full_load_retry(
         list(retry_names),
         counts,
         error_log,
+        # The identity-sequence sync must cover EVERY table the (now complete) run
+        # loaded, not just the retried subset. The first attempt was incomplete, so it
+        # synced nothing by design -- so narrowing the retry's sync to retry_names left
+        # every table that succeeded on the FIRST attempt with its DSQL sequence still at
+        # its start value while its rows already occupied those values, and the first
+        # application insert after cut over could fail with a duplicate key.
+        sync_table_names=[
+            chunk.chunk_id for chunk in prior_chunks
+        ] or list(retry_names),
         foreign_keys_failed=_fk_failed,
         accept_quarantined_rows=accept_quarantined_rows,
         error_job_ids=error_job_ids,

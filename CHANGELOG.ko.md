@@ -5,6 +5,28 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.457
+
+v0.1.453에서 시작한 정리를 마무리합니다: **정당한 사용자 동작이 밑에서 바꿔 버리는 식별자로 키가 잡힌 상태**. v0.1.453은 job id 문제의 Full Load 절반을 고쳤고, 이번에 CDC 절반과 남은 것들을 고칩니다.
+
+### 수정 (Fixed)
+
+- **Full Load 재시도가 기록된 모든 CDC dead-letter를 읽을 수 없게 만들던 문제 수정.** `cdc_error_log_key`가 `migration_state.job_id`를 실시간으로 반환했고, 재시도("Retry unfinished tables" 또는 테이블별 "Reload" — 둘 다 CDC 스트리밍 **중에도** 지원됩니다)가 그것을 교체합니다. 그래서 모든 CDC 화면이 스트리밍 중에 re-key 됐습니다: DLQ 카드가 회색 "0 quarantined / No records quarantined"로 떨어지고, Download와 Ask-AI-DBA 버튼이 사라지고, 테이블별 정합성 배지가 "consistent"로 뒤집히고, 스키마 드리프트 배너가 지워졌습니다 — 레코드는 이전 job id 아래 그대로 있는데도요. 이제 키를 마이그레이션 상태의 수명 동안 **고정**합니다(Start over는 새 상태를 만들므로 고정이 마이그레이션을 넘겨 살아남지 않습니다). CDC 전용 세션의 스택 기반 폴백은 그대로입니다.
+- **재시도 후 DLQ 카드의 "the Full Load also set N rows aside" 상호 참조가 사라지던 문제 수정** — 계보를 해석하지 않고 맨 키를 읽어서, cut over 직전에 보는 같은 화면의 두 절반이 서로 어긋났습니다. 이제 계보를 해석하며, AI DBA의 `list_failed_full_load_tables`도 마찬가지입니다(재시도가 다시 돌리지 않은 테이블에 대해 모델에 `"error": ""`를 넘기고 있었는데, 바로 옆 화면은 사유를 보여주고 있었습니다).
+- **CDC dead-letter가 controller 재생성마다 durable 활동 로그에 다시 기록되던 문제 수정.** 유일한 중복 제거가 controller의 인메모리 커서였고, controller는 Start over·앱 재시작·새 브라우저 세션마다 재생성됩니다 — 그래서 재생성마다 6시간 블라인드 look-back 창을 다시 읽고 모든 레코드를 다시 감사 기록했습니다. 격리 N건이 2N, 3N 줄이 되고 로그로는 "파이프라인이 몇 행을 버렸나?"에 더 이상 답할 수 없었습니다. 이제 읽기 커서가 세션에 살고(재생성된 controller가 이전 지점에서 이어감), durable 기록은 레코드 식별자 단위로 idempotent합니다.
+- **`_CDC_ANNOUNCED`가 양방향으로 틀렸던 문제 수정.** 재시도가 키를 바꿔서 모든 CDC 이벤트가 AI 피드에 다시 공지됐고(스트림이 두 번 시작한 것처럼 보임), 스택 기반 폴백 키는 마이그레이션 간에 **동일**해서 Start over 후 새 CDC 전용 세션이 옛 마커를 물려받아 **아무것도** 공지하지 않았습니다. 이제 고정된 키와 함께 마이그레이션 상태의 identity로도 키를 잡습니다.
+- **AWS 프로파일이나 타깃 리전이 바뀌어도 캐시된 MSK Connect controller가 무효화되지 않던 문제 수정.** 그래서 CDC 모니터링이 옛 identity를 계속 읽었습니다: 커넥터 헬스, DLQ 깊이, 테이블별 CDC 컬럼이 stale하거나 빈 채로 남고(읽기는 fail closed) 운영자가 방금 적용한 프로파일 수정이 아무 효과 없어 보였습니다. 읽기 전용 화면에 국한되지만(Deploy/Start/Stop은 클릭 시점에 클라이언트를 만듭니다) 조용히 잘못된 상태였습니다. 이제 `(region, aws_profile)`이 바뀌면 버리고, 직접 주입된 controller는 버리지 않고 현재 identity를 채택합니다.
+- **controller의 DLQ 읽기 커서가 로그 그룹별로 나뉘어 있지 않던 문제 수정.** 다른 CDC 스택에 attach하면 이전 파이프라인의 커서를 재사용해서 채택한 파이프라인의 이전 dead-letter가 전혀 표면화되지 않았습니다 — 격리된 행이 있는 파이프라인의 DLQ 카드가 "0 quarantined"를 보여줬습니다. 이제 커서와 seen-id 집합이 로그 그룹별입니다.
+- **재시도가 로드를 완료한 뒤 재시도한 테이블만 identity 시퀀스가 전진하던 문제 수정.** 첫 시도는 불완전했으므로 아무것도 동기화하지 않고(설계상), 재시도는 자기 부분집합으로만 좁혔습니다 — 그래서 **첫 시도에서 성공한 모든 테이블**은 행이 이미 그 값들을 차지한 상태에서 DSQL 시퀀스가 시작값에 머물렀고, cut over 후 첫 애플리케이션 INSERT가 운영자가 의심할 이유가 없는 테이블에서 중복 키로 실패할 수 있었습니다. 이제 재시도가 완료된 실행이 로드한 모든 테이블을 동기화합니다.
+
+### 변경 (Changed)
+
+- 멀티프로세스 샤딩 규칙이 이제 순수 predicate(`_sharding_is_consistent` / `_table_may_shard`)이고 **동작으로** 단정합니다. 이전 가드는 소스 텍스트 `"_shardable_ok = bool(migrator._inputs.cdc_coexisting)"`를 단정했는데, 이것이 넓어진 조건(`... or _shared_snapshot`)의 **접두사**로 남아서 계속 통과하면서 아무것도 지키지 않았고, 위의 주석은 코드가 이미 버린 불변식을 여전히 주장했습니다(PostgreSQL 비-CDC REPLACE는 이제 exported snapshot 하나로 안전하게 샤딩됩니다). 동작 변경은 없고, 규칙을 한 곳에 명시했습니다.
+
+### 테스트
+
+- 3793 통과. 뮤테이션 5종 전부 잡힘. 그중 하나는 처음에 **살아남았습니다** — controller identity 테스트가 뮤턴트와 동등한 경로만 밟았기 때문에 — 그래서 문서화한 계약을 실제로 단정하도록 테스트를 강화했습니다.
+
 ## v0.1.456
 
 정체 워치독은 liveness 시계를 900초 동안 갱신하지 않은 job을 실패 처리하는데, 실제로 그 시계를 갱신한 것은 Full Load의 progress drain 뿐이었습니다 — 그래서 오래 걸리는 대부분의 작업이 실행 내내 침묵했고 **완전히 정상인데도** reap됐습니다. 그런 구간 9개와, 그 뒤에 있던 블로킹 대기 결함 2건을 함께 닫았습니다.
