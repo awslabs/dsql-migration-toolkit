@@ -2687,12 +2687,15 @@ def _recreate_dependent_views(migrator: DataMigrator) -> None:
 
 def _apply_foreign_keys(
     migrator: DataMigrator, handle: "Optional[JobHandle]" = None
-) -> int:
-    """Call the migrator's post-load foreign-key apply; return how many FKs FAILED.
+) -> tuple[int, int, int]:
+    """Call the migrator's foreign-key apply; return ``(applied, skipped, failed)``.
 
-    The count is returned (not just logged) so ``run completed`` can say that referential
-    integrity is incomplete: the pass already logs its own FAILURE line, but a reader who
-    only scans the summary saw "N table(s) loaded / SUCCESS" and missed the missing FK.
+    The FULL triple is returned, not just the failure count, because this is what the Data
+    Migration step's explicit "Apply foreign keys" action reports back to the operator --
+    "15 applied" / "13 applied, 2 skipped (orphan rows)". It previously returned only the
+    failed count (the load used it for one summary clause); the UI then stored an int where
+    a triple was expected and the step raised TypeError on the next render. Found by live
+    verification, not by the suite.
 
     Best-effort run-level post-pass, mirroring :func:`_recreate_dependent_views`:
     Aurora DSQL enforces foreign keys, but they must be added AFTER the concurrent
@@ -2704,7 +2707,7 @@ def _apply_foreign_keys(
     """
     hook = getattr(migrator, "apply_foreign_keys", None)
     if not callable(hook):
-        return 0
+        return (0, 0, 0)
     _beat = _heartbeat_of(handle)
 
     def _stopped() -> bool:
@@ -2722,7 +2725,7 @@ def _apply_foreign_keys(
         counts = _call()
     except Exception:  # noqa: BLE001 - optional post-pass; never fail the run
         _LOGGER.warning("Foreign-key apply pass failed", exc_info=True)
-        return 0
+        return (0, 0, 0)
     # Surface the post-load FK pass as a NAMED step in the activity log (the
     # migration's visible audit trail), mirroring the CDC cut-over "Apply foreign
     # keys" action, so a Full-Load-only run shows the foreign keys being (re)created
@@ -2731,7 +2734,7 @@ def _apply_foreign_keys(
     # CDC run that defers them to cut over, returns (0, 0, 0) -> no noise. A hook that
     # returns nothing (older/test double) is tolerated (no summary line).
     if not isinstance(counts, tuple) or len(counts) != 3:
-        return 0
+        return (0, 0, 0)
     applied, skipped, failed = counts
     if applied or skipped or failed:
         log_activity(
@@ -2743,7 +2746,7 @@ def _apply_foreign_keys(
                 f"{skipped} skipped (orphaned rows), {failed} failed."
             ),
         )
-    return int(failed or 0)
+    return (int(applied or 0), int(skipped or 0), int(failed or 0))
 
 
 def _log_excluded_lob_columns(

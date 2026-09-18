@@ -18524,12 +18524,18 @@ def test_fk_failure_detail_records_the_real_reason_and_the_statement() -> None:
     assert "ADD CONSTRAINT" in other
 
 
-def test_apply_foreign_keys_returns_the_failed_count_for_the_run_summary(
+def test_apply_foreign_keys_returns_the_full_triple_for_the_step_to_report(
     monkeypatch,
 ) -> None:
-    # The count has to leave this function so `run completed` can say integrity is
-    # incomplete: the pass logs its own FAILURE line, but a reader who only scans the
-    # summary saw "N table(s) loaded / SUCCESS" and missed the missing constraint.
+    """The WHOLE outcome has to leave this function, not just the failure count.
+
+    It is what the Data Migration step's explicit "Apply foreign keys" action reports back
+    -- "15 applied" / "13 applied, 2 skipped (orphan rows)". It used to return only the
+    failed count (the load needed one summary clause), and when the action started storing
+    that value the step tried `list(<int>)` and raised TypeError on the next render. A LIVE
+    run caught that; no unit test did, because none carried the value into the renderer --
+    which `test_the_fk_action_result_renders` now does.
+    """
     import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     monkeypatch.setattr(engine, "log_activity", lambda *a, **k: None)
@@ -18538,21 +18544,67 @@ def test_apply_foreign_keys_returns_the_failed_count_for_the_run_summary(
         def apply_foreign_keys(self):
             return (5, 0, 1)          # the workshop's real outcome
 
-    assert engine._apply_foreign_keys(_Partial()) == 1
+    assert engine._apply_foreign_keys(_Partial()) == (5, 0, 1)
 
     class _Clean:
         def apply_foreign_keys(self):
             return (6, 0, 0)
 
-    assert engine._apply_foreign_keys(_Clean()) == 0
+    assert engine._apply_foreign_keys(_Clean()) == (6, 0, 0)
 
-    # Tolerated shapes must not blow up the run, and report nothing missing.
+    # Tolerated shapes must not blow up, and must report nothing applied or missing.
     class _Legacy:
         def apply_foreign_keys(self):
             return None
 
-    assert engine._apply_foreign_keys(_Legacy()) == 0
-    assert engine._apply_foreign_keys(object()) == 0   # no hook at all
+    assert engine._apply_foreign_keys(_Legacy()) == (0, 0, 0)
+    assert engine._apply_foreign_keys(object()) == (0, 0, 0)   # no hook at all
+
+
+def test_the_fk_action_result_renders(monkeypatch) -> None:
+    """Carry what the action STORES into the renderer -- the gap that let a TypeError ship.
+
+    The action does `set_fk_apply_result(_apply_foreign_keys(...))` and the step renders that
+    value. Nothing joined the two, so an int flowed into `list(applied)`.
+    """
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+    from dsql_migrator.ui.data_migration._full_load_ui import _render_foreign_key_action
+    from dsql_migrator.ui.data_migration._state import DataMigrationState
+
+    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: None)
+
+    class _M:
+        def apply_foreign_keys(self, **_kw):
+            return (13, 2, 0)
+
+    state = DataMigrationState()
+    state.set_fk_apply_result(engine._apply_foreign_keys(_M()))
+
+    class _Ui:
+        def __init__(self):
+            self.texts: list = []
+
+        class _El:
+            def __init__(self, ui): self._ui = ui
+            def __enter__(self): return self
+            def __exit__(self, *e): return False
+            def __getattr__(self, _n): return lambda *a, **k: self
+
+        def label(self, text="", *a, **k):
+            self.texts.append(str(text)); return _Ui._El(self)
+
+        def __getattr__(self, _n):
+            return lambda *a, **k: _Ui._El(self)
+
+    ui = _Ui()
+    # Must not raise -- this is the exact call that failed with an int.
+    _render_foreign_key_action(
+        ui, terminal=True, pending=0, applied=state.fk_apply_result,
+        apply_foreign_keys=lambda: None, connections_ready=True,
+    )
+    joined = " ".join(ui.texts)
+    assert "13 applied" in joined, ui.texts
+    assert "2 skipped" in joined, ui.texts
 
 
 def test_run_completed_names_foreign_keys_that_were_not_applied(monkeypatch) -> None:
