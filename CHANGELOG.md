@@ -5,6 +5,31 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.450
+
+### Fixed
+
+- **Drop & reload was blocked by the foreign keys the tool created itself, and blamed a
+  view.** DSQL refuses `DROP TABLE orders` while `order_items`' foreign key still
+  references it, and a `Full load only` run creates exactly those FKs in its post-load
+  pass — so choosing **Drop & reload** afterwards hit a wall built by the tool. The
+  recreate path now removes them first and the existing post-load pass puts them back,
+  the same pre-drop/recreate pairing the dependent-VIEW pass already used. Only FKs from
+  this migration's own conversion whose PARENT is being replaced are touched (derived from
+  the same `foreign_key_ddls` the apply pass uses, so a hand-made constraint is never
+  dropped, and no catalog read is needed); an FK that merely lives ON a replaced table
+  needs no action because `DROP TABLE` takes its own constraints with it. Each removal is
+  logged, naming the constraint and that the post-load pass re-creates it.
+- **The failure message named the wrong cause and gave an impossible instruction.**
+  `dependent_objects_hint` parsed only `view|materialized view … depends on`, so DSQL's
+  real DETAIL (`constraint fk_order_items_orders on table order_items depends on table
+  orders`) fell through to a fallback that blamed "usually a view" and told the user to
+  "select the dependent object in the object browser" — impossible for a foreign key,
+  which is not an item there, leaving no way out of the screen. It now names the
+  constraint and its table and offers an action that exists (drop it yourself, or choose
+  Append), and the unparseable fallback no longer asserts the blocker is a view: it names
+  both causes with the remedy for each.
+
 ## v0.1.449
 
 ### Fixed

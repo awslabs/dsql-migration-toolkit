@@ -5,6 +5,27 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.450
+
+### 수정 (Fixed)
+
+- **Drop & reload가 도구 자신이 만든 외래 키에 막히고, 뷰 탓으로 오진하던 문제 수정.** DSQL은
+  `order_items`의 외래 키가 `orders`를 참조하는 동안 `DROP TABLE orders`를 거부하는데, `Full load only`
+  실행이 바로 그 FK들을 적재 후 패스에서 생성합니다 — 그래서 이후 **Drop & reload**를 고르면 도구가 만든
+  상태에 도구가 막혔습니다. 이제 재생성 경로가 먼저 제거하고 기존 적재 후 패스가 다시 만듭니다. 의존 **뷰**
+  패스가 이미 쓰던 pre-drop/recreate 짝과 동일한 구조입니다. 이 마이그레이션의 변환이 소유하고 **부모가
+  교체 대상인** FK만 건드립니다(apply 패스와 동일한 `foreign_key_ddls`에서 도출하므로 사람이 만든 제약은
+  절대 삭제되지 않고, 카탈로그 조회도 불필요). 교체되는 테이블에 **달려 있는** FK는 `DROP TABLE`이 함께
+  가져가므로 조치가 필요 없습니다. 제거는 각각 활동 로그에 기록되며, 제약 이름과 "적재 후 패스가 다시
+  만든다"는 사실을 함께 남깁니다.
+- **실패 메시지가 원인을 잘못 짚고 실행 불가능한 조치를 안내하던 문제 수정.**
+  `dependent_objects_hint`가 `view|materialized view … depends on`만 파싱했기 때문에 DSQL의 실제 DETAIL
+  (`constraint fk_order_items_orders on table order_items depends on table orders`)이 폴백으로 떨어져
+  "usually a view"라고 뷰를 지목하고 "object browser에서 그 의존 객체를 선택하라"고 안내했습니다 — 외래
+  키는 object browser의 항목이 아니므로 실행 불가능하고, 사용자는 그 화면에서 빠져나갈 방법이 없었습니다.
+  이제 제약 이름과 그것이 속한 테이블을 명시하고 실제로 가능한 조치(직접 삭제, 또는 Append 선택)를
+  제시합니다. 파싱되지 않는 폴백도 더 이상 뷰라고 단정하지 않고 두 원인과 각각의 해결책을 함께 안내합니다.
+
 ## v0.1.449
 
 ### 수정 (Fixed)

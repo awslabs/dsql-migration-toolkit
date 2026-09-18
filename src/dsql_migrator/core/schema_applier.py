@@ -894,12 +894,43 @@ def dependent_objects_hint(error_text: str) -> str:
             "CASCADE, which the database suggests: it would delete the "
             f"{'view' if one else 'views'} outright.)"
         )
+    # A FOREIGN KEY blocker reads "constraint fk_order_items_orders on table order_items
+    # depends on table orders". It used to fall through to the view fallback below, which
+    # blamed a view and told the user to select the dependent object in the object browser
+    # -- impossible for a foreign key, which is not an item there. So name the constraint
+    # and give an action that exists. (The reload path now pre-drops the FKs this migration
+    # owns, so reaching this text means the constraint is NOT ours to remove.)
+    constraints: list[str] = []
+    for match in re.finditer(
+        r"\bconstraint\s+([A-Za-z_][\w.\"$]*)\s+on\s+table\s+([A-Za-z_][\w.\"$]*)\s+"
+        r"depends on\b",
+        error_text,
+        re.IGNORECASE,
+    ):
+        entry = f"{match.group(2).strip(chr(34))}.{match.group(1).strip(chr(34))}"
+        if entry not in constraints:
+            constraints.append(entry)
+    if constraints:
+        listed = ", ".join(constraints)
+        one = len(constraints) == 1
+        return (
+            f"Cannot replace this table: the foreign {'key' if one else 'keys'} {listed} "
+            f"still {'depends' if one else 'depend'} on it. This migration did not create "
+            f"{'it' if one else 'them'}, so the tool will not remove "
+            f"{'it' if one else 'them'} (it could not put "
+            f"{'it' if one else 'them'} back). Drop "
+            f"{'it' if one else 'them'} yourself and re-run, or choose Append instead of "
+            "Drop & reload. (Avoid DROP ... CASCADE, which the database suggests: it "
+            "would delete the dependent objects outright.)"
+        )
     return (
-        "Cannot replace this table: another object (usually a view) still depends on "
-        "it. Select the dependent object in the object browser as well and re-run the "
-        "apply — it is then dropped before the table is recreated, and recreated "
-        "afterwards. (Avoid DROP ... CASCADE, which the database suggests: it would "
-        "delete the dependent object outright.)"
+        "Cannot replace this table: another object (a view or a foreign key) still "
+        "depends on it. If it is a view, select it in the object browser as well and "
+        "re-run the apply — it is then dropped before the table is recreated, and "
+        "recreated afterwards. If it is a foreign key this migration does not own, drop "
+        "it yourself and re-run, or choose Append instead of Drop & reload. (Avoid "
+        "DROP ... CASCADE, which the database suggests: it would delete the dependent "
+        "object outright.)"
     )
 
 

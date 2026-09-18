@@ -29,7 +29,8 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import (
-    Any, Callable, Iterator, Mapping, NamedTuple, Optional, Protocol, Sequence, Union,
+    Any, Callable, Iterable, Iterator, Mapping, NamedTuple, Optional, Protocol,
+    Sequence, Union,
 )
 
 from dsql_migrator.config import SecretValue, load_config
@@ -2472,6 +2473,21 @@ def _finalize_run(
     )
 
 
+def _predrop_blocking_foreign_keys(migrator: DataMigrator) -> None:
+    """Call the migrator's blocking-FK pre-drop, if it supports one (else no-op).
+
+    Same contract as :func:`_predrop_dependent_views`: optional, and any failure is logged
+    and swallowed rather than aborting the run -- if a foreign key really still blocks a
+    table's DROP, that surfaces as a normal per-table failure the user can act on.
+    """
+    hook = getattr(migrator, "predrop_blocking_foreign_keys", None)
+    if callable(hook):
+        try:
+            hook()
+        except Exception:  # noqa: BLE001 - optional pre-pass; never fail the run
+            _LOGGER.warning("Blocking-FK pre-drop pass failed", exc_info=True)
+
+
 def _predrop_dependent_views(migrator: DataMigrator) -> None:
     """Call the migrator's dependent-view pre-drop, if it supports one.
 
@@ -2704,6 +2720,7 @@ def run_full_load(
     # On a "drop & reload" run, drop views that depend on the replaced tables
     # BEFORE the per-table DROP+recreate (a view can span several tables loaded in
     # parallel, so this is a run-level pre-pass), then recreate them after.
+    _predrop_blocking_foreign_keys(migrator)
     _predrop_dependent_views(migrator)
     counts = _migrate_tables_in_parallel(handle, job_id, tables, migrator, error_log)
     _recreate_dependent_views(migrator)
@@ -2792,6 +2809,7 @@ def run_full_load_retry(
     # Same run-level view pre-drop / recreate as run_full_load, so a retry that
     # DROP+recreates a table whose view dependency blocked the first attempt now
     # succeeds instead of silently skip-loading over stale rows.
+    _predrop_blocking_foreign_keys(migrator)
     _predrop_dependent_views(migrator)
     counts = _migrate_tables_in_parallel(
         handle, job_id, tables_to_retry, migrator, error_log
@@ -3609,6 +3627,65 @@ class BatchedTableMigrator:
             self._inputs.dependent_view_ddls, self._inputs.replace_tables
         )
 
+    def predrop_blocking_foreign_keys(self) -> None:
+        """Drop the FKs that would refuse a replace target's ``DROP TABLE``.
+
+        Run-level pre-pass for a "drop & reload" run, the exact counterpart of
+        :meth:`predrop_dependent_views`: DSQL refuses ``DROP TABLE orders`` while
+        ``order_items``' foreign key still references it, and a preceding
+        ``Full load only`` run created that FK in its own post-load pass -- so the tool's
+        reload path was blocked by state the tool built, and the failure was reported as a
+        VIEW dependency with an instruction (pick the object in the object browser) that
+        cannot apply to a foreign key.
+
+        Only FKs from THIS migration's conversion whose PARENT is being replaced are
+        touched (:func:`foreign_keys_blocking_replace`), so a hand-made constraint is never
+        dropped. Idempotent (``DROP CONSTRAINT IF EXISTS``). On a Full-load-only run the
+        existing post-load pass (:meth:`apply_foreign_keys`) re-creates them, so nothing
+        else is needed to restore them. On a CDC-BEARING run that pass defers to cut over
+        (it returns ``(0, 0, 0)`` when ``is_cdc_migration`` / ``cdc_coexisting`` /
+        ``cdc_stack_name`` is set), so the drop is NOT undone within this run -- which is
+        the correct state for a live stream: an enforced FK would make the sink
+        dead-letter out-of-order child rows, and cut over re-creates them once the stream
+        has drained. No-op on an append run (no replace targets).
+        """
+        blocking = foreign_keys_blocking_replace(
+            self._inputs.table_conversions, self._inputs.replace_tables
+        )
+        if not blocking:
+            return
+        from dsql_migrator.core.schema_applier import drop_foreign_key
+
+        connect = self._view_connection_factory()
+        for table_name, constraint_name in blocking:
+            target = f"{table_name}.{constraint_name}"
+            try:
+                drop_foreign_key(table_name, constraint_name, connection_factory=connect)
+                log_activity(
+                    ActivityCategory.FULL_LOAD,
+                    "foreign key removed for reload",
+                    status=ActivityStatus.INFO,
+                    target=target,
+                    detail=(
+                        "dropped so the referenced table can be recreated; the post-load "
+                        "foreign-key pass re-creates it after the load"
+                    ),
+                )
+            except Exception:  # noqa: BLE001 - a real block still surfaces on the DROP
+                _LOGGER.warning(
+                    "Could not pre-drop blocking FK %s", target, exc_info=True
+                )
+                log_activity(
+                    ActivityCategory.FULL_LOAD,
+                    "foreign key not removed for reload",
+                    status=ActivityStatus.FAILURE,
+                    target=target,
+                    detail=(
+                        "could not be dropped, so recreating the table it references may "
+                        "fail; drop it manually or choose Append instead"
+                    ),
+                )
+
     def predrop_dependent_views(self) -> None:
         """Drop views that depend on the replace tables (before recreating them).
 
@@ -3915,6 +3992,50 @@ def apply_preserved_foreign_keys(
         ),
     )
     return (applied, skipped, failed)
+
+
+def foreign_keys_blocking_replace(
+    table_conversions: Mapping[str, TableConversion],
+    replace_targets: "Iterable[str]",
+) -> list[tuple[str, str]]:
+    """Return ``(child_table, constraint)`` FKs that would block a table REPLACE. Pure.
+
+    ``DROP TABLE orders`` is refused while any other table's foreign key still references
+    it (``cannot drop table orders because other objects depend on it / constraint
+    fk_order_items_orders on table order_items depends on table orders``). A
+    ``Full load only`` run creates exactly those FKs in its post-load pass, so choosing
+    **Drop & reload** afterwards hit a wall built by the tool itself -- and the error text
+    blamed a view and told the user to pick the dependent object in the object browser,
+    which is impossible for a foreign key (it is not an item there). So the recreate path
+    removes them first and the existing post-load pass puts them back, exactly as the
+    dependent-VIEW pre-drop/recreate pair already does. (On a CDC-bearing run that pass
+    defers to cut over instead, so the drop stays in effect for the rest of the run --
+    correct, because a live stream must not have enforced FKs.)
+
+    Derived from THIS migration's own conversion (the same ``foreign_key_ddls`` the apply
+    pass uses), so everything returned is by definition ours to drop and to re-create --
+    no catalog read, and a constraint the user made by hand is never touched.
+
+    Only FKs whose PARENT is being replaced are returned. An FK that merely lives ON a
+    replaced table needs no action: ``DROP TABLE`` takes its own constraints with it, and
+    the post-load pass re-adds them.
+    """
+    targets = {str(name) for name in replace_targets}
+    if not targets:
+        return []
+    blocking: list[tuple[str, str]] = []
+    for table_name, conv in table_conversions.items():
+        by_name = {fk.name: fk for fk in conv.preserved_foreign_keys}
+        for add_ddl in conv.foreign_key_ddls:
+            constraint_name = _constraint_name_from_ddl(add_ddl)
+            fk = by_name.get(constraint_name) if constraint_name else None
+            if fk is None or not constraint_name:
+                continue
+            if fk.referenced_table in targets:
+                pair = (table_name, constraint_name)
+                if pair not in blocking:
+                    blocking.append(pair)
+    return sorted(blocking)
 
 
 def preserved_foreign_key_names(

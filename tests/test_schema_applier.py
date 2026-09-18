@@ -820,8 +820,12 @@ def test_dependent_objects_hint_handles_several_blockers_and_none_named() -> Non
     generic = dependent_objects_hint(
         "cannot drop table x because other objects depend on it"
     )
-    assert "another object (usually a view)" in generic
-    assert "object browser" in generic
+    # It must NOT assert the blocker is a view: an unparseable DETAIL is just as likely
+    # a foreign key, and "usually a view" sent a user hunting for a view in a schema that
+    # had none. Both causes are named, each with its own action.
+    assert "view or a foreign key" in generic
+    assert "object browser" in generic   # the view remedy
+    assert "Append" in generic           # the foreign-key remedy
 
 
 def test_recreate_table_translates_dependency_failure() -> None:
@@ -1151,3 +1155,52 @@ def test_drop_foreign_key_retries_on_occ_conflict() -> None:
     # The conflicting attempt was retried and the DROP ultimately ran once.
     assert len(connection.executed) == 1
     assert "DROP CONSTRAINT IF EXISTS" in connection.executed[0]
+
+
+def test_dependent_objects_hint_names_a_blocking_foreign_key() -> None:
+    """A foreign-key blocker must be named, with an action that can actually be taken.
+
+    THE DEFECT: the regex matched only ``view|materialized view``, so DSQL's real DETAIL
+    for an FK blocker fell through to the fallback, which blamed "usually a view" and told
+    the user to "select the dependent object in the object browser" -- impossible for a
+    foreign key, which is not an item there. The user was left with no way out of the
+    Drop & reload screen. Fixture is the VERBATIM DSQL error.
+    """
+    from dsql_migrator.core.schema_applier import dependent_objects_hint
+
+    message = dependent_objects_hint(
+        "cannot drop table orders because other objects depend on it\n"
+        "DETAIL:  constraint fk_order_items_orders on table order_items depends on "
+        "table orders\n"
+        "HINT:  Use DROP ... CASCADE to drop the dependent objects too."
+    )
+    assert "fk_order_items_orders" in message          # names the real blocker
+    assert "order_items" in message                    # and where it lives
+    assert "foreign key" in message
+    assert "object browser" not in message             # never the impossible instruction
+    assert "usually a view" not in message
+    assert "Append" in message                         # an action that exists
+    assert "CASCADE" in message                        # still warns off the DB's advice
+
+
+def test_dependent_objects_hint_still_names_a_blocking_view() -> None:
+    # The view path must be untouched by the FK addition.
+    from dsql_migrator.core.schema_applier import dependent_objects_hint
+
+    message = dependent_objects_hint(
+        "cannot drop table countries because other objects depend on it\n"
+        "DETAIL:  view v_countries depends on table ecommerce_demo.countries"
+    )
+    assert "v_countries" in message
+    assert "object browser" in message                 # correct advice FOR a view
+
+
+def test_dependent_objects_hint_fallback_mentions_both_causes() -> None:
+    # An unparseable DETAIL must not assert it is a view: that is what sent the user
+    # looking for a view in a schema that had none.
+    from dsql_migrator.core.schema_applier import dependent_objects_hint
+
+    message = dependent_objects_hint("cannot drop table t because other objects depend on it")
+    assert "view or a foreign key" in message
+    assert "usually a view" not in message
+    assert "Append" in message

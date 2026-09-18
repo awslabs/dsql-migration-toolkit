@@ -18687,3 +18687,220 @@ def test_lob_card_on_the_full_load_screen_explains_its_own_lock() -> None:
     assert locked is True
     assert "excluded columns are fixed" in reason
     assert "Start over" in reason
+
+
+# ---------------------------------------------------------------------------
+# Drop & reload: the tool must not be blocked by the FKs it created itself
+# ---------------------------------------------------------------------------
+
+
+def test_foreign_keys_blocking_replace_selects_only_parents_being_replaced() -> None:
+    """`DROP TABLE orders` is refused while order_items' FK still references it.
+
+    A `Full load only` run creates that FK in its own post-load pass, so choosing
+    Drop & reload afterwards hit a wall the tool itself built -- and the error blamed a
+    view and told the user to pick the dependent object in the object browser, which is
+    impossible for a foreign key. Only FKs whose PARENT is being replaced need removing;
+    an FK that merely lives ON a replaced table goes away with the DROP.
+    """
+    from dsql_migrator.core.converter import TableConversion
+    from dsql_migrator.core.models import ForeignKeyDef
+    from dsql_migrator.ui.data_migration._full_load_engine import (
+        foreign_keys_blocking_replace,
+    )
+
+    fk_ddl = (
+        'ALTER TABLE "ecommerce"."order_items" ADD CONSTRAINT "fk_order_items_orders" '
+        'FOREIGN KEY ("order_id") REFERENCES "ecommerce"."orders" ("id") NOT VALID'
+    )
+    conversions = {
+        "ecommerce.order_items": TableConversion(
+            table="ecommerce.order_items",
+            target_ddl="CREATE TABLE x (id INT)",
+            foreign_key_ddls=[fk_ddl],
+            preserved_foreign_keys=[
+                ForeignKeyDef(
+                    name="fk_order_items_orders", columns=["order_id"],
+                    referenced_table="ecommerce.orders", referenced_columns=["id"],
+                )
+            ],
+        ),
+    }
+
+    # Replacing the PARENT -> the child's FK must be dropped first.
+    assert foreign_keys_blocking_replace(conversions, {"ecommerce.orders"}) == [
+        ("ecommerce.order_items", "fk_order_items_orders")
+    ]
+    # Replacing the CHILD -> nothing to do (DROP TABLE takes its own constraints).
+    assert foreign_keys_blocking_replace(conversions, {"ecommerce.order_items"}) == []
+    # An append run replaces nothing.
+    assert foreign_keys_blocking_replace(conversions, set()) == []
+    # A table outside this migration's conversion is never implicated.
+    assert foreign_keys_blocking_replace(conversions, {"other.thing"}) == []
+
+
+def test_predrop_blocking_foreign_keys_drops_them_and_logs(monkeypatch) -> None:
+    # The pre-pass mirrors the dependent-VIEW pre-drop: remove first, and the EXISTING
+    # post-load pass re-creates them, so no new restore code is needed.
+    from types import SimpleNamespace
+
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    dropped: list = []
+    events: list = []
+    monkeypatch.setattr(
+        "dsql_migrator.core.schema_applier.drop_foreign_key",
+        lambda table, name, **kw: dropped.append((table, name)),
+    )
+    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: events.append((a, k)))
+    monkeypatch.setattr(
+        engine, "foreign_keys_blocking_replace",
+        lambda *a, **k: [("ecommerce.order_items", "fk_order_items_orders")],
+    )
+
+    class _Migrator:
+        _inputs = SimpleNamespace(table_conversions={}, replace_tables=frozenset({"x"}))
+
+        def _view_connection_factory(self):
+            return lambda: object()
+
+        predrop_blocking_foreign_keys = (
+            engine.BatchedTableMigrator.predrop_blocking_foreign_keys
+        )
+
+    _Migrator().predrop_blocking_foreign_keys()
+    assert dropped == [("ecommerce.order_items", "fk_order_items_orders")]
+    detail = [k.get("detail", "") for _a, k in events if "removed for reload" in str(_a)]
+    assert detail and "post-load foreign-key pass re-creates it" in detail[0]
+
+
+def test_predrop_blocking_foreign_keys_runs_before_the_load(monkeypatch) -> None:
+    """Record the actual CALL ORDER, not the source text.
+
+    The order matters: if the pre-drop ran after the load, the replace's DROP would still
+    hit the foreign key. Asserting it by comparing offsets in `inspect.getsource` is the
+    same instrument that missed the v0.1.448 NameError -- and it would silently keep
+    passing if a refactor moved the call inside a helper. So the passes are stubbed and the
+    sequence they execute in is recorded.
+    """
+    from types import SimpleNamespace
+
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        engine, "_predrop_blocking_foreign_keys", lambda m: calls.append("fk-predrop")
+    )
+    monkeypatch.setattr(
+        engine, "_predrop_dependent_views", lambda m: calls.append("view-predrop")
+    )
+    monkeypatch.setattr(
+        engine, "_migrate_tables_in_parallel",
+        lambda *a, **k: calls.append("load") or engine._RunCounts(
+            real_failed=0, quarantined=0
+        ),
+    )
+    monkeypatch.setattr(
+        engine, "_recreate_dependent_views", lambda m: calls.append("view-recreate")
+    )
+    monkeypatch.setattr(
+        engine, "_apply_foreign_keys", lambda m: calls.append("fk-apply") or 0
+    )
+    monkeypatch.setattr(engine, "_finalize_run", lambda *a, **k: None)
+    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: None)
+    monkeypatch.setattr(engine, "_log_excluded_lob_columns", lambda *a, **k: None)
+
+    class _Handle:
+        cancelled = False
+        job_id = "job-1"
+
+        def __getattr__(self, _name):
+            return lambda *a, **k: None
+
+    class _Migrator:
+        """Only what run_full_load itself calls; the passes above are stubbed out."""
+
+        def capture_watermark(self, _tables):
+            return None
+
+    engine.run_full_load(
+        _Handle(), [], migrator=_Migrator(), error_log=SimpleNamespace()
+    )
+
+    # The FK pre-drop must precede the load; the restore passes come after it.
+    assert calls.index("fk-predrop") < calls.index("load"), calls
+    assert calls.index("load") < calls.index("fk-apply"), calls
+    # And it runs before the view pre-drop (a view can sit on top of the FK'd table).
+    assert calls.index("fk-predrop") < calls.index("view-predrop"), calls
+
+
+def test_cdc_run_predrops_fks_and_deliberately_does_not_restore_them(monkeypatch) -> None:
+    """On a CDC-bearing run the pre-drop stands: cut over restores, not this run.
+
+    `apply_foreign_keys` returns (0,0,0) when `is_cdc_migration` / `cdc_coexisting` /
+    `cdc_stack_name` is set, so a Drop & reload on a Full-load+CDC migration drops the FKs
+    and does NOT re-create them before the run ends. That is CORRECT -- an enforced FK
+    makes the sink dead-letter out-of-order child rows, so cut over adds them once the
+    stream has drained -- but it looks like a missing restore, so pin it here to stop
+    someone "fixing" it later.
+    """
+    from types import SimpleNamespace
+
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    dropped: list = []
+    monkeypatch.setattr(
+        "dsql_migrator.core.schema_applier.drop_foreign_key",
+        lambda table, name, **kw: dropped.append((table, name)),
+    )
+    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: None)
+    monkeypatch.setattr(
+        engine, "foreign_keys_blocking_replace",
+        lambda *a, **k: [("ecommerce.order_items", "fk_order_items_orders")],
+    )
+
+    class _CdcMigrator:
+        _inputs = SimpleNamespace(
+            table_conversions={},
+            replace_tables=frozenset({"ecommerce.orders"}),
+            is_cdc_migration=True,          # the CDC-bearing signal
+            cdc_coexisting=False,
+            cdc_stack_name=None,
+            inventory=None,
+        )
+
+        def _view_connection_factory(self):
+            return lambda: object()
+
+        predrop_blocking_foreign_keys = (
+            engine.BatchedTableMigrator.predrop_blocking_foreign_keys
+        )
+        apply_foreign_keys = engine.BatchedTableMigrator.apply_foreign_keys
+
+    migrator = _CdcMigrator()
+
+    # 1) the pre-drop still runs -- the replace would otherwise be blocked
+    migrator.predrop_blocking_foreign_keys()
+    assert dropped == [("ecommerce.order_items", "fk_order_items_orders")]
+
+    # 2) and the post-load pass deliberately restores NOTHING on a CDC run
+    assert migrator.apply_foreign_keys() == (0, 0, 0)
+
+    # 3) contrast: a Full-load-ONLY run does restore (same class, CDC signals unset)
+    class _LoadOnlyMigrator(_CdcMigrator):
+        _inputs = SimpleNamespace(
+            table_conversions={},
+            replace_tables=frozenset({"ecommerce.orders"}),
+            is_cdc_migration=False,
+            cdc_coexisting=False,
+            cdc_stack_name=None,
+            inventory=None,
+        )
+
+    applied: list = []
+    monkeypatch.setattr(
+        engine, "apply_preserved_foreign_keys",
+        lambda *a, **k: applied.append("restored") or (1, 0, 0),
+    )
+    assert _LoadOnlyMigrator().apply_foreign_keys() == (1, 0, 0)
+    assert applied == ["restored"]
