@@ -5,6 +5,36 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.449
+
+### Fixed
+
+- **BLOCKER: the Data Migration step could not render at all on 0.1.448.** That release
+  added a `lob_exclusion_lock(...)` call to `ui/data_migration/__init__.py` without
+  importing the helper, so every render raised `NameError: name 'lob_exclusion_lock' is
+  not defined` and the Full Load screen showed only "Data Migration could not be
+  displayed". A missing global is raised only when the function RUNS, so the module still
+  imported cleanly and nothing caught it before the image reached three registries and both
+  live app stacks. 0.1.448 should not be used; upgrade to 0.1.449 (or stay on 0.1.447).
+
+### Added
+
+- **A guard for the whole class of bug that shipped it** (`tests/test_no_undefined_globals.py`).
+  After importing each module it scans every function's bytecode for `LOAD_GLOBAL` — the
+  opcode that reads a module-level or builtin name — and asserts each one resolves. That
+  catches any call to a helper that was never imported, in any module, including nested
+  functions and comprehensions, with no NiceGUI double, no rendering and no new dependency.
+  Verified against the real defect: with the import removed it fails with
+  `build_data_migration_screen.<locals>.content: lob_exclusion_lock`. Function-local
+  imports (the repo's deliberate lazy-import pattern) compile to `LOAD_FAST`, so they are
+  unaffected.
+  - The regression test that was supposed to cover the 0.1.448 change used
+    `inspect.getsource`, which reads source TEXT and so passed with the import missing. It
+    now resolves the name through the module namespace. This was the SECOND time in two
+    releases that a test exercised a helper but not its call site — v0.1.446's own commit
+    message recorded the first — which is why the check is now mechanical and package-wide
+    rather than per-change.
+
 ## v0.1.448
 
 ### Fixed

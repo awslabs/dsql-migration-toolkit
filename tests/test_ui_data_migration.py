@@ -18668,6 +18668,15 @@ def test_lob_card_on_the_full_load_screen_explains_its_own_lock() -> None:
     from dsql_migrator.ui.data_migration._cdc_monitoring import lob_exclusion_lock
 
     # The screen wires the LOB-specific lock into the panel call (not a bare None).
+    # NB source-TEXT assertions are why the v0.1.448 blocker shipped: `inspect.getsource`
+    # passes even when the helper was never imported, so the call site's NameError went
+    # unseen until users hit the screen. The name is therefore resolved through the
+    # module namespace here, and every call site in the package is checked mechanically
+    # by tests/test_no_undefined_globals.py.
+    assert callable(_dm.lob_exclusion_lock), (
+        "build_data_migration_screen calls lob_exclusion_lock, so the name must resolve "
+        "in the module namespace -- a missing import only raises when content() runs"
+    )
     src = inspect.getsource(_dm.build_data_migration_screen)
     assert "lob_exclusion_lock(" in src
     assert "lock_reason=_lob_reason" in src

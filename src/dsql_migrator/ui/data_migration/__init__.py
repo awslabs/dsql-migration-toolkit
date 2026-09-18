@@ -3595,6 +3595,7 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     _render_cdc_least_privilege_note,
     _render_cdc_live_monitoring,
     _render_cdc_lob_exclusion_panel,
+    lob_exclusion_lock,
     _render_cdc_manual_inputs,
     _render_cdc_params_file,
     _render_cdc_partial_actions,
