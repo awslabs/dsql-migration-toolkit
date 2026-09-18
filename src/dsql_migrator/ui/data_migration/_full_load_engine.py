@@ -2335,6 +2335,10 @@ def _finalize_run(
     inputs: "Optional[DataMigrationInputs]" = None,
     sync_sequences: "Optional[Callable[..., dict]]" = None,
     foreign_keys_failed: int = 0,
+    # table -> owning job id for a RETRY's carried-forward error records, so the
+    # quarantined-row count spans the lineage (see _count_quarantined_rows). Empty on a
+    # first run, where every record is already under this job id.
+    error_job_ids: Optional[dict] = None,
 ) -> None:
     """Log the run outcome and raise :class:`FullLoadIncompleteError` unless complete.
 
@@ -2379,11 +2383,7 @@ def _finalize_run(
     total = len(table_names)
     # Quarantine records are the error-log rows whose message marks an isolated
     # dropped row (PK + reason), distinct from a table-level load failure.
-    quarantined_rows = sum(
-        1
-        for record in error_log.records(job_id)
-        if str(getattr(record, "message", "")).startswith("quarantined row pk[")
-    )
+    quarantined_rows = _count_quarantined_rows(error_log, job_id, error_job_ids)
     quarantine_only = counts.real_failed == 0 and counts.quarantined > 0
     if accept_quarantined_rows and quarantine_only:
         log_activity(
@@ -2741,6 +2741,9 @@ def _seed_retry_chunks(
     job: MigrationJob,
     prior_chunks: Sequence[ChunkState],
     retry_names: set,
+    *,
+    prior_job_id: Optional[str] = None,
+    prior_table_error_job_ids: Optional[dict] = None,
 ) -> None:
     """Seed a retry job from the prior run, resetting only the failed chunks.
 
@@ -2764,7 +2767,75 @@ def _seed_retry_chunks(
         else:
             chunks.append(prior.model_copy(deep=True))
     job.chunks = chunks
+    # Carry the error-log lineage with the chunks. Without this the unified view the
+    # chunks give is only half true: a table kept its quarantined-row COUNT while its
+    # per-row reasons stayed under the prior job id, so it rendered a count with no
+    # reason -- and the oversized-LOB recovery action, which is keyed on those records,
+    # vanished for exactly the table that still needed it.
+    job.table_error_job_ids = _retry_error_lineage(
+        prior_chunks, retry_names, job.job_id,
+        prior_job_id=prior_job_id,
+        inherited=prior_table_error_job_ids,
+    )
     _recompute_progress(job)
+
+
+def _retry_error_lineage(
+    prior_chunks: Sequence[ChunkState],
+    retry_names: set,
+    new_job_id: str,
+    *,
+    prior_job_id: Optional[str] = None,
+    inherited: Optional[dict] = None,
+) -> dict:
+    """Map table -> the job id whose error records stay authoritative after a retry.
+
+    Retried tables are deliberately ABSENT (readers then default to the new job id), so a
+    re-loaded table gets a clean slate instead of resurrecting its old reasons. Every
+    other table keeps the id that actually recorded it, walking through any lineage the
+    prior run had already inherited so repeated retries compose.
+    """
+    previous = dict(inherited or {})
+    lineage: dict[str, str] = {}
+    for prior in prior_chunks:
+        table = prior.chunk_id
+        if table in retry_names:
+            continue
+        owner = previous.get(table) or prior_job_id
+        if owner and owner != new_job_id:
+            lineage[table] = owner
+    return lineage
+
+
+def _count_quarantined_rows(error_log, job_id: str, owners: Optional[dict] = None) -> int:
+    """Count ``quarantined row pk[...]`` records for a run, across its retry lineage.
+
+    Mirrors ``full_load_error_records_for``'s ownership rule. Reading only ``job_id``
+    UNDERCOUNTED a retry: tables the retry did not re-run keep their quarantined rows
+    (permanently dropped) but their records live under the prior job id -- so the
+    "quarantined and ACCEPTED" audit line understated what the operator was accepting.
+    """
+    owners = dict(owners or {})
+
+    def _quarantined(key: str) -> list:
+        try:
+            records = error_log.records(key) or ()
+        except Exception:  # noqa: BLE001 - advisory count; never break finalize
+            return []
+        return [
+            r for r in records
+            if str(getattr(r, "message", "")).startswith("quarantined row pk[")
+        ]
+
+    total = 0
+    for key in [job_id, *sorted(set(owners.values()))]:
+        if not key:
+            continue
+        total += sum(
+            1 for r in _quarantined(key)
+            if (owners.get(getattr(r, "table", "")) or job_id) == key
+        )
+    return total
 
 
 def run_full_load_retry(
@@ -2776,6 +2847,10 @@ def run_full_load_retry(
     error_log: ErrorLogStore,
     watermark: Optional[Watermark] = None,
     accept_quarantined_rows: bool = False,
+    # The PRIOR run's identity, so the error-log lineage survives the new job id (see
+    # _seed_retry_chunks). Defaulted: an omitting caller just gets the old behavior.
+    prior_job_id: Optional[str] = None,
+    prior_table_error_job_ids: Optional[dict] = None,
     # See run_full_load: needed for the post-load identity-sequence sync. A retry that
     # COMPLETES the load is exactly when the sync must run -- the first attempt's
     # finalize skipped it (the run was incomplete), so without this the sequence stays
@@ -2793,7 +2868,18 @@ def run_full_load_retry(
     """
     job_id = handle.job_id
     retry_names = {table.name for table in tables_to_retry}
-    handle.update(lambda job: _seed_retry_chunks(job, prior_chunks, retry_names))
+    error_job_ids = _retry_error_lineage(
+        prior_chunks, retry_names, job_id,
+        prior_job_id=prior_job_id,
+        inherited=prior_table_error_job_ids,
+    )
+    handle.update(
+        lambda job: _seed_retry_chunks(
+            job, prior_chunks, retry_names,
+            prior_job_id=prior_job_id,
+            prior_table_error_job_ids=prior_table_error_job_ids,
+        )
+    )
     _log_excluded_lob_columns(inputs, scope=retry_names)
     if watermark is not None:
         handle.update(lambda job: setattr(job, "watermark", watermark))
@@ -2824,6 +2910,7 @@ def run_full_load_retry(
         error_log,
         foreign_keys_failed=_fk_failed,
         accept_quarantined_rows=accept_quarantined_rows,
+        error_job_ids=error_job_ids,
         inputs=inputs,
     )
 
@@ -3832,6 +3919,8 @@ def apply_preserved_foreign_keys(
     # Matching on the constraint name (the DDL's own key) keeps the pre-gate and the
     # VALIDATE target aligned to the constraint actually being added.
     pending: list[tuple[str, Optional[str], Optional[ForeignKeyDef], str]] = []
+    # One memo per PASS: the same parent index is commonly referenced by several FKs.
+    index_state_cache: dict = {}
     for table_name, conv in table_conversions.items():
         by_name = {fk.name: fk for fk in conv.preserved_foreign_keys}
         for add_ddl in conv.foreign_key_ddls:
@@ -3928,7 +4017,7 @@ def apply_preserved_foreign_keys(
                 # the index to become valid first. "absent" returns at once (waiting would
                 # be pointless) and the ADD then fails with an actionable reason.
                 index_state, index_waited = _wait_for_referenced_unique_index(
-                    fk, connection_factory
+                    fk, connection_factory, cache=index_state_cache
                 )
                 if index_waited > 0:
                     # A wait ACTUALLY happened, so say so: this is the only evidence that
@@ -3942,7 +4031,7 @@ def apply_preserved_foreign_keys(
                         detail=(
                             f"the referenced table's unique index was still building "
                             f"(CREATE INDEX ASYNC); waited {index_waited:.1f}s, then it "
-                            f"was {index_state}"
+                            f"was {_index_state_phrase(index_state)}"
                         ),
                     )
                 # DSQL only accepts ADD CONSTRAINT ... NOT VALID (renders that way);
@@ -4085,6 +4174,21 @@ _INDEX_WAIT_BUDGET_SECONDS = 300.0
 _INDEX_WAIT_POLL_SECONDS = 2.0
 
 
+def _index_state_phrase(state: Optional[str]) -> str:
+    """Render a unique-index state for an OPERATOR, never as a Python literal.
+
+    The activity log is downloaded and pasted into runbooks, so "then it was None" (the
+    catalog was unreadable) is both meaningless to a reader and indistinguishable from a
+    real state. Each phrase also says what it implies for the foreign key.
+    """
+    return {
+        "valid": "ready",
+        "building": "still building when the wait budget ran out",
+        "absent": "absent (no such unique index)",
+        None: "unknown (the target catalog could not be read)",
+    }.get(state, str(state))
+
+
 def _wait_for_referenced_unique_index(
     fk: "Optional[ForeignKeyDef]",
     connection_factory: Callable[[], Any],
@@ -4093,7 +4197,12 @@ def _wait_for_referenced_unique_index(
     poll_seconds: float = _INDEX_WAIT_POLL_SECONDS,
     sleep: Callable[[float], None] = _time.sleep,
     monotonic: Callable[[], float] = _time.monotonic,
-) -> Optional[str]:
+    # Per-FK-pass memo of (referenced table, columns) -> final state. The wait is per FK
+    # but the INDEX is shared: N foreign keys onto one stuck parent each paid the full
+    # budget (N x 300s) and each emitted a near-identical log line. Populated by this
+    # function; the caller supplies one dict per pass.
+    cache: Optional[dict] = None,
+) -> tuple[Optional[str], float]:
     """Wait while the FK's referenced unique index is still building. Returns its state.
 
     THE RACE this closes: a table Full Load had to RECREATE (e.g. a composite-PK re-key)
@@ -4114,23 +4223,58 @@ def _wait_for_referenced_unique_index(
     last table load and the FK pass was ~5.4s either way, and neither the activity log nor
     CloudWatch had an entry. The caller logs it (only when a wait actually occurred, so a
     normal run stays quiet) and folds it into the failure detail when the budget runs out.
+
+    It measures the POLLING WAIT ONLY -- the first probe's own round trip is excluded, so
+    "did not wait" reports exactly ``0.0`` rather than that probe's latency. The caller
+    keys its log line on this being non-zero, so anything else makes it log for every FK.
     """
     if fk is None or not fk.referenced_columns:
         return None, 0.0
     from dsql_migrator.core.target_introspector import unique_index_state
 
-    started = monotonic()
-    deadline = started + max(0.0, budget_seconds)
-    state = unique_index_state(
-        fk.referenced_table, fk.referenced_columns,
-        connection_factory=connection_factory,
-    )
-    while state == "building" and monotonic() < deadline:
-        sleep(poll_seconds)
-        state = unique_index_state(
+    def _probe() -> Optional[str]:
+        return unique_index_state(
             fk.referenced_table, fk.referenced_columns,
             connection_factory=connection_factory,
         )
+
+    key = (fk.referenced_table, tuple(fk.referenced_columns))
+    if cache is not None and key in cache:
+        # Already settled for this parent index in this pass: no probe, no second wait,
+        # and no duplicate log line (the caller keys that on a non-zero wait).
+        return cache[key], 0.0
+
+    state = _probe()
+    if state != "building":
+        if cache is not None:
+            cache[key] = state
+        # Nothing was waited for. The timer must NOT start before this first probe: that
+        # probe is a DSQL round trip (IAM token + TLS), so its own latency landed in
+        # waited_seconds and made it non-zero for EVERY foreign key. The caller's
+        # `index_waited > 0` guard then logged a line per FK reading "the index was still
+        # building ... waited 0.0s" -- self-contradictory, and the opposite of the silence
+        # this log promised for the normal case.
+        return state, 0.0
+    started = monotonic()
+    deadline = started + max(0.0, budget_seconds)
+    while monotonic() < deadline:
+        sleep(poll_seconds)
+        fresh = _probe()
+        if fresh is None:
+            # UNKNOWN is not an answer. ``unique_index_state`` swallows every exception
+            # and returns None, so one transient connect/read failure mid-wait used to
+            # end the loop (``while state == "building"`` went false) after a single poll
+            # of a 300s budget -- and the ADD CONSTRAINT then raced the very index build
+            # this helper exists to wait for. We already know this index WAS building, so
+            # keep polling within the remaining budget and keep that as the last known
+            # state; the operator-facing reason stays actionable instead of degrading to
+            # a bare "None".
+            continue
+        state = fresh
+        if state != "building":
+            break
+    if cache is not None:
+        cache[key] = state
     return state, max(0.0, monotonic() - started)
 
 

@@ -1391,6 +1391,71 @@ def full_load_error_records(error_log, job_id: str) -> list:
     return [r for r in records or () if not is_cdc_error_record(r)]
 
 
+def full_load_error_records_for(error_log, job) -> list:
+    """Full Load error records for ``job``, resolved across its retry lineage.
+
+    A retry runs under a NEW job id (the job manager enforces uniqueness), so reading
+    ``job.job_id`` alone returns nothing for the tables the retry did NOT re-run: their
+    chunk -- and its quarantined-row count -- was carried forward, but their per-row
+    records stayed under the prior job id. That rendered a count with no reason, and the
+    oversized-LOB recovery action (keyed on those records) disappeared for exactly the
+    table that still needed it.
+
+    ``job.table_error_job_ids`` maps table -> the job id that owns its records; anything
+    absent belongs to ``job.job_id``. Retried tables are deliberately NOT in the map, so
+    they get a clean slate -- a successful re-load must not resurrect its old reasons.
+
+    Records are returned oldest-first by ``occurred_at`` so the merged view (and the
+    downloadable log) has one deterministic order regardless of which job wrote what.
+    """
+    job_id = getattr(job, "job_id", None) or ""
+    owners = dict(getattr(job, "table_error_job_ids", None) or {})
+    if not owners:
+        return full_load_error_records(error_log, job_id)   # first run: unchanged path
+    merged: list = []
+    for key in [job_id, *sorted(set(owners.values()))]:
+        if not key:
+            continue
+        for record in full_load_error_records(error_log, key):
+            # A record counts only from the job that OWNS its table, so a retried
+            # table's superseded records stay invisible even though they still exist.
+            if (owners.get(record.table) or job_id) == key:
+                merged.append(record)
+    def _when(record):
+        # Never compares a datetime against a placeholder: records with no stamp sort
+        # last as a group instead of raising TypeError mid-render.
+        stamp = getattr(record, "occurred_at", None)
+        return (0, stamp) if stamp is not None else (1, None)
+
+    merged.sort(key=_when)
+    return merged
+
+
+def full_load_error_summary_for(error_log, job):
+    """:func:`full_load_error_summary` over the retry lineage (see
+    :func:`full_load_error_records_for`)."""
+    from dsql_migrator.core.models import ErrorLogSummary
+
+    records = full_load_error_records_for(error_log, job)
+    by_table: dict[str, int] = {}
+    for record in records:
+        by_table[record.table] = by_table.get(record.table, 0) + 1
+    return ErrorLogSummary(
+        total_errors=len(records),
+        errors_by_table=by_table,
+        log_available=bool(records),
+    )
+
+
+def full_load_latest_messages_for(error_log, job) -> dict:
+    """:func:`full_load_latest_messages` over the retry lineage (see
+    :func:`full_load_error_records_for`)."""
+    messages: dict[str, str] = {}
+    for record in full_load_error_records_for(error_log, job):
+        messages[record.table] = record.message
+    return messages
+
+
 def full_load_error_summary(error_log, job_id: str):
     """Summarize ONLY the Full Load's own error records under ``job_id``.
 

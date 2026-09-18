@@ -1281,6 +1281,13 @@ def build_data_migration_screen(
                 retry_migrator = migrator_factory(retry_inputs)
                 error_log = migration_state.error_log
                 prior_chunks = current.chunks
+                # The retry gets a NEW job id, so hand it the prior run's error-log
+                # owners: without them every table it does NOT re-run loses its reason
+                # text (and its recovery action) while keeping its dropped-row count.
+                prior_job_id = current.job_id
+                prior_error_owners = dict(
+                    getattr(current, "table_error_job_ids", None) or {}
+                )
                 watermark = current.watermark
                 accept_quarantined = migration_state.accept_quarantined_rows
                 migration_state.set_active_substep("full_load")
@@ -1301,6 +1308,8 @@ def build_data_migration_screen(
                         error_log=error_log,
                         watermark=watermark,
                         accept_quarantined_rows=accept_quarantined,
+                        prior_job_id=prior_job_id,
+                        prior_table_error_job_ids=prior_error_owners,
                         inputs=retry_inputs,
                     )
 

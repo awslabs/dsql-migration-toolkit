@@ -51,8 +51,11 @@ from dsql_migrator.ui.data_migration._models import (
 from dsql_migrator.ui.data_migration._cdc_status import (
     _current_job,
     full_load_error_records,
+    full_load_error_records_for,
     full_load_error_summary,
+    full_load_error_summary_for,
     full_load_latest_messages,
+    full_load_latest_messages_for,
 )
 from dsql_migrator.ui.data_migration._cdc_ui import cdc_streaming_started
 
@@ -803,11 +806,13 @@ def _render_full_load_step(
             )
         # Full Load records ONLY: CDC writes under this same job_id (cdc_error_log_key),
         # so an unfiltered read counts dead-lettered rows as Full Load failures.
-        summary = full_load_error_summary(migration_state.error_log, current.job_id)
+        # ..._for() resolves the retry lineage: a retry runs under a NEW job id, so
+        # reading only that id blanks the reason for every table it did not re-run.
+        summary = full_load_error_summary_for(migration_state.error_log, current)
         rows = build_full_load_table_rows(
             current,
             summary,
-            full_load_latest_messages(migration_state.error_log, current.job_id),
+            full_load_latest_messages_for(migration_state.error_log, current),
         )
         _render_full_load_progress(
             ui,
@@ -831,8 +836,8 @@ def _render_full_load_step(
             # and the count above it disagreed with the list below.
             quarantine_records=[
                 (str(record.table), str(record.message))
-                for record in full_load_error_records(
-                    migration_state.error_log, current.job_id
+                for record in full_load_error_records_for(
+                    migration_state.error_log, current
                 )
             ],
             ai_error_opener=ai_error_opener,
@@ -1107,8 +1112,8 @@ def _render_full_load_step(
                     # retry it now. FAILED tables carry their error-log message; a
                     # still-PENDING table was never attempted (the run ended first),
                     # so it gets a plain "not yet loaded" note.
-                    _failure_reasons = full_load_latest_messages(
-                        migration_state.error_log, job.job_id
+                    _failure_reasons = full_load_latest_messages_for(
+                        migration_state.error_log, job
                     )
                     _pending_names = {
                         c.chunk_id for c in job.chunks if c.status == "PENDING"
@@ -1998,6 +2003,18 @@ def _render_full_load_progress(
         for table, message in (quarantine_records or ())
         if str(message).startswith(quar_prefix)
     ] or [(r.table, str(r.error_message)) for r in quarantined]
+    # LAST RESORT: key on the DURABLE per-chunk count when no message survives. A table
+    # can carry a dropped-row count with no reason text at all -- a restored session has
+    # lost the in-memory error log entirely (see _quarantined_row_count). Keying this
+    # panel only on records meant the whole card vanished, taking the recovery action
+    # ("Exclude column & reload") with it for exactly the table that still needed it, so
+    # Start over was the only escape left. The count is authoritative either way.
+    if not quarantine_entries:
+        quarantine_entries = [
+            (r.table, "a value exceeded a DSQL per-value limit")
+            for r in rows
+            if (getattr(r, "rows_quarantined", 0) or 0) > 0
+        ]
     if quarantine_entries:
         # NO header notice here. The completeness banner below already states the verdict
         # ("N rows permanently dropped (table)") and the remedy, and the summary chip +
@@ -2225,8 +2242,8 @@ def _render_error_log(ui, migration_state, job: MigrationJob) -> None:
     job_id = job.job_id
     # Full Load records only -- CDC shares this key, and its dead-lettered rows belong
     # to the CDC panel's own download (see full_load_error_records).
-    records = full_load_error_records(migration_state.error_log, job_id)
-    summary = full_load_error_summary(migration_state.error_log, job_id)
+    records = full_load_error_records_for(migration_state.error_log, job)
+    summary = full_load_error_summary_for(migration_state.error_log, job)
     # NO "Data errors" heading + count when there is nothing to download: with zero
     # errors it printed a section header over "No data errors recorded." -- a whole block
     # asserting an absence. And when there ARE errors, every one of them is already shown

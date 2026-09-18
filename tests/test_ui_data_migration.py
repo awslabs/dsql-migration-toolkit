@@ -19193,3 +19193,410 @@ def test_exclude_and_reload_dialog_preticks_the_matching_column_and_confirms() -
 
     ui.handlers["Exclude and reload"]()               # confirm
     assert applied == [("ecommerce.product_media", ["content"])]
+
+
+def test_index_wait_reports_zero_when_it_never_waited_even_as_the_clock_advances() -> None:
+    """The first probe's own latency must not be reported as a wait.
+
+    It is a DSQL round trip (IAM token + TLS handshake), so timing it made
+    ``waited_seconds`` non-zero for EVERY foreign key. Every pre-existing test for this
+    helper injected ``monotonic=lambda: 0.0`` -- a FROZEN clock -- so the probe's cost was
+    structurally invisible and this could not be caught. Here the clock ADVANCES on every
+    read, which is what a real one does.
+    """
+    from dsql_migrator.core.models import ForeignKeyDef
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    fk = ForeignKeyDef(
+        name="fk", columns=["pid"], referenced_table="parent", referenced_columns=["id"],
+    )
+    ticks = {"t": 0.0}
+
+    def _advancing() -> float:
+        ticks["t"] += 0.75          # every read costs time, as a round trip does
+        return ticks["t"]
+
+    for first in ("valid", "absent", None):
+        import dsql_migrator.core.target_introspector as _ti
+        saved = _ti.unique_index_state
+        _ti.unique_index_state = lambda *a, **k: first  # noqa: B023
+        try:
+            state, waited = _engine._wait_for_referenced_unique_index(
+                fk, lambda: object(), sleep=lambda _s: None, monotonic=_advancing,
+            )
+        finally:
+            _ti.unique_index_state = saved
+        assert state == first
+        assert waited == 0.0, f"{first!r} never waited, yet reported {waited}s"
+
+
+def test_a_normal_fk_pass_logs_no_wait_line_through_the_real_timer(monkeypatch) -> None:
+    """End-to-end with the REAL helper: an already-valid index must log NOTHING.
+
+    The call site keys its log on ``index_waited > 0``. The prior call-site test injected
+    ``_wait_for_referenced_unique_index -> ("valid", 0.0)``, so it asserted the guard
+    while never running the code that computes the value -- it passed against the bug.
+    This one lets the real timer run, so the microseconds the probe costs are enough to
+    trip the guard if the timer starts too early (which is how the field log filled up
+    with "still building ... waited 0.0s" for every FK).
+    """
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    events: list = []
+    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: events.append((a, k)))
+    monkeypatch.setattr(engine, "apply_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+    # NOT patched: _wait_for_referenced_unique_index. Only the catalog probe is faked, and
+    # it reports the index as already valid -- the normal case.
+    monkeypatch.setattr(
+        "dsql_migrator.core.target_introspector.unique_index_state",
+        lambda *a, **k: "valid",
+    )
+
+    result = engine.apply_preserved_foreign_keys(
+        {"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])}, lambda: _FkProbeConnection(0)
+    )
+    assert result == (1, 0, 0)                       # the FK was applied
+    waited = [k for _a, k in events if "waited" in str(_a)]
+    assert not waited, f"a normal run must stay quiet, got {waited}"
+
+
+def test_a_genuine_index_wait_still_logs_with_the_real_timer(monkeypatch) -> None:
+    # The other half of the fix: silencing the false line must not silence the true one.
+    # Guards against "just never log". The reported time covers the polling only, so it
+    # can never round to the self-contradictory "still building ... waited 0.0s".
+    from dsql_migrator.core.models import ForeignKeyDef
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    states = ["building", "building", "valid"]
+    asked = {"n": 0}
+
+    def _fake(table_name, columns, *, connection_factory):  # noqa: ANN001
+        asked["n"] += 1
+        return states[min(asked["n"] - 1, len(states) - 1)]
+
+    monkeypatch.setattr(
+        "dsql_migrator.core.target_introspector.unique_index_state", _fake
+    )
+    clock = {"t": 100.0}
+
+    def _monotonic() -> float:
+        clock["t"] += 0.01          # reads cost time too
+        return clock["t"]
+
+    def _sleep(seconds: float) -> None:
+        clock["t"] += seconds
+
+    fk = ForeignKeyDef(
+        name="fk", columns=["pid"], referenced_table="parent", referenced_columns=["id"],
+    )
+    state, waited = _engine._wait_for_referenced_unique_index(
+        fk, lambda: object(), budget_seconds=300.0, poll_seconds=2.0,
+        sleep=_sleep, monotonic=_monotonic,
+    )
+    assert state == "valid"
+    assert asked["n"] == 3                       # polled until the build finished
+    assert waited >= 4.0                         # the two 2.0s polls, at least
+    assert f"{waited:.1f}s" != "0.0s"            # never the contradictory message
+
+
+def _lineage_log(entries):
+    """An ErrorLogStore holding (job_id, table, message) rows."""
+    from dsql_migrator.core.error_log import ErrorLogStore
+    from dsql_migrator.core.models import DataErrorRecord
+
+    from datetime import datetime, timedelta, timezone
+
+    base = datetime(2026, 9, 18, 5, 0, tzinfo=timezone.utc)
+    log = ErrorLogStore()
+    for index, (job_id, table, message) in enumerate(entries):
+        log.record(
+            job_id,
+            DataErrorRecord(
+                table=table, message=message, chunk_id=table,
+                occurred_at=base + timedelta(seconds=index),
+            ),
+        )
+    return log
+
+
+_QUAR = "quarantined row pk[id={n}]: datatype limit greater than 1048576 bytes not supported for bytea"
+
+
+def test_a_retry_keeps_the_quarantine_reason_for_tables_it_did_not_rerun() -> None:
+    """A retry must not blank the reason for tables it left alone.
+
+    The error log is keyed by job id and a retry runs under a NEW one (the job manager
+    refuses to reuse an id), while _seed_retry_chunks carries non-retried chunks forward
+    WITH their quarantined-row count. So those tables rendered a count and no reason --
+    and because the oversized-LOB recovery action is keyed on those records, it vanished
+    for exactly the table that still needed it, leaving Start over as the only escape.
+    """
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+    from dsql_migrator.ui.data_migration._cdc_status import (
+        full_load_error_records_for,
+        full_load_error_summary_for,
+        full_load_latest_messages_for,
+    )
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    prior_chunks = [
+        ChunkState(chunk_id="ecommerce.product_media", status="DONE",
+                   rows_loaded=12, rows_quarantined=3, attempts=1),
+        ChunkState(chunk_id="ecommerce.attachments", status="DONE",
+                   rows_loaded=40, rows_quarantined=2, attempts=1),
+    ]
+    log = _lineage_log([
+        ("job-A", "ecommerce.product_media", _QUAR.format(n=1)),
+        ("job-A", "ecommerce.product_media", _QUAR.format(n=2)),
+        ("job-A", "ecommerce.product_media", _QUAR.format(n=3)),
+        ("job-A", "ecommerce.attachments", _QUAR.format(n=7)),
+        ("job-A", "ecommerce.attachments", _QUAR.format(n=8)),
+    ])
+
+    # Retry ONLY product_media (what exclude-and-reload does: it scopes to one table).
+    retry = MigrationJob(job_id="job-B")
+    _engine._seed_retry_chunks(
+        retry, prior_chunks, {"ecommerce.product_media"}, prior_job_id="job-A",
+    )
+    assert retry.table_error_job_ids == {"ecommerce.attachments": "job-A"}
+
+    # attachments keeps its reason AND its records; product_media gets a clean slate.
+    messages = full_load_latest_messages_for(log, retry)
+    assert "ecommerce.attachments" in messages, messages
+    assert "not supported for bytea" in messages["ecommerce.attachments"]
+    assert "ecommerce.product_media" not in messages, (
+        "the retried table must NOT resurrect its old reasons"
+    )
+    records = full_load_error_records_for(log, retry)
+    assert [r.table for r in records] == ["ecommerce.attachments"] * 2
+    assert full_load_error_summary_for(log, retry).errors_by_table == {
+        "ecommerce.attachments": 2
+    }
+
+    # After the retry succeeds and records its own drop, both are visible, unmixed.
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.models import DataErrorRecord
+
+    log.record(
+        "job-B",
+        DataErrorRecord(
+            table="ecommerce.product_media", message=_QUAR.format(n=9),
+            chunk_id="ecommerce.product_media",
+            occurred_at=datetime(2026, 9, 18, 6, 0, tzinfo=timezone.utc),
+        ),
+    )
+    assert full_load_error_summary_for(log, retry).errors_by_table == {
+        "ecommerce.attachments": 2, "ecommerce.product_media": 1,
+    }
+
+
+def test_repeated_retries_compose_the_error_lineage() -> None:
+    # A third run must still reach records written by the FIRST, or the reason decays
+    # after two retries instead of one.
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+    from dsql_migrator.ui.data_migration._cdc_status import full_load_latest_messages_for
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    log = _lineage_log([("job-A", "t.untouched", _QUAR.format(n=1))])
+    chunks = [
+        ChunkState(chunk_id="t.untouched", status="DONE", rows_loaded=1,
+                   rows_quarantined=1, attempts=1),
+        ChunkState(chunk_id="t.retried", status="FAILED", rows_loaded=0, attempts=1),
+    ]
+
+    b = MigrationJob(job_id="job-B")
+    _engine._seed_retry_chunks(b, chunks, {"t.retried"}, prior_job_id="job-A")
+    c = MigrationJob(job_id="job-C")
+    _engine._seed_retry_chunks(
+        c, b.chunks, {"t.retried"}, prior_job_id="job-B",
+        prior_table_error_job_ids=b.table_error_job_ids,
+    )
+    assert c.table_error_job_ids == {"t.untouched": "job-A"}   # NOT job-B
+    assert "t.untouched" in full_load_latest_messages_for(log, c)
+
+
+def test_the_accepted_quarantine_count_spans_the_retry_lineage() -> None:
+    # The audit line "N row(s) quarantined and ACCEPTED" is what the operator is agreeing
+    # to. Counting only the retry's own job id understated it by every table not re-run.
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    log = _lineage_log([
+        ("job-A", "t.left_alone", _QUAR.format(n=1)),
+        ("job-A", "t.left_alone", _QUAR.format(n=2)),
+        ("job-A", "t.reloaded", _QUAR.format(n=3)),   # superseded by the retry
+        ("job-B", "t.reloaded", _QUAR.format(n=4)),
+    ])
+    owners = {"t.left_alone": "job-A"}
+    assert _engine._count_quarantined_rows(log, "job-B", owners) == 3
+    # No lineage (a first run) counts only its own, exactly as before.
+    assert _engine._count_quarantined_rows(log, "job-B", None) == 1
+
+
+def test_the_recovery_action_survives_a_session_whose_error_log_is_gone() -> None:
+    """The durable per-chunk count must be enough to offer the recovery.
+
+    A restored session has no in-memory error log, so there are no records and no reason
+    text -- yet the dropped rows are real and recorded on the chunk. Keying the panel only
+    on records made the whole card (and its "Exclude column & reload" button) disappear.
+    """
+    from dsql_migrator.ui.data_migration import (
+        _render_full_load_progress,
+        build_full_load_table_rows,
+    )
+
+    _Ui, _job, _reason = _quar_render_ui()
+    job = _job()          # one chunk, rows_quarantined=3
+    rows = build_full_load_table_rows(job, None, {})      # NO messages at all
+    ui = _Ui()
+    _render_full_load_progress(
+        ui, job, rows, quarantine_only=True,
+        quarantine_records=[],                            # log is gone
+        connections_ready=True,
+        lob_candidates_for=lambda _t: (("content", "longblob"),),
+        exclude_lob_and_reload=lambda *_a: None,
+    )
+    assert [b for b in ui.buttons if b[0] == "Exclude column & reload"], (
+        f"recovery lost when the log is gone; buttons={[b[0] for b in ui.buttons]}"
+    )
+
+
+def test_a_transient_catalog_read_does_not_abort_the_index_wait() -> None:
+    """An unreadable probe mid-wait is UNKNOWN, not "no longer building".
+
+    ``unique_index_state`` swallows every exception and returns None, so one transient
+    connect/read failure used to end the loop (``while state == "building"`` went false)
+    after a single poll of a 300s budget -- and the ADD CONSTRAINT then raced the very
+    index build this helper exists to wait for, failing 42830 with the actionable reason
+    degraded to a bare "None".
+    """
+    from dsql_migrator.core.models import ForeignKeyDef
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    # building, then a transient blip, then still building, then ready.
+    states = ["building", None, "building", "valid"]
+    asked = {"n": 0}
+
+    def _fake(table_name, columns, *, connection_factory):  # noqa: ANN001
+        asked["n"] += 1
+        return states[min(asked["n"] - 1, len(states) - 1)]
+
+    import dsql_migrator.core.target_introspector as _ti
+    saved = _ti.unique_index_state
+    _ti.unique_index_state = _fake
+    clock = {"t": 0.0}
+    try:
+        state, waited = _engine._wait_for_referenced_unique_index(
+            ForeignKeyDef(name="fk", columns=["pid"], referenced_table="parent",
+                          referenced_columns=["id"]),
+            lambda: object(), budget_seconds=300.0, poll_seconds=2.0,
+            sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
+            monotonic=lambda: clock["t"],
+        )
+    finally:
+        _ti.unique_index_state = saved
+    assert state == "valid", "a transient blip must not end the wait"
+    assert asked["n"] == 4                     # kept polling through the None
+    assert waited >= 6.0                       # three 2.0s polls
+
+
+def test_an_unreadable_catalog_for_the_whole_wait_keeps_the_actionable_state() -> None:
+    # If every probe after the first is unreadable, the last KNOWN state ("building") is
+    # what the failure detail needs -- not None, which degrades to "apply it manually".
+    from dsql_migrator.core.models import ForeignKeyDef
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    states = ["building", None]
+    asked = {"n": 0}
+
+    def _fake(table_name, columns, *, connection_factory):  # noqa: ANN001
+        asked["n"] += 1
+        return states[min(asked["n"] - 1, len(states) - 1)]
+
+    import dsql_migrator.core.target_introspector as _ti
+    saved = _ti.unique_index_state
+    _ti.unique_index_state = _fake
+    clock = {"t": 0.0}
+    try:
+        state, _waited = _engine._wait_for_referenced_unique_index(
+            ForeignKeyDef(name="fk", columns=["pid"], referenced_table="parent",
+                          referenced_columns=["id"]),
+            lambda: object(), budget_seconds=10.0, poll_seconds=2.0,
+            sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
+            monotonic=lambda: clock["t"],
+        )
+    finally:
+        _ti.unique_index_state = saved
+    assert state == "building"                 # NOT None
+    assert clock["t"] >= 10.0                  # used the budget, still bounded
+
+
+def test_one_stuck_parent_index_is_waited_for_once_not_once_per_foreign_key() -> None:
+    """N foreign keys onto one parent must not cost N x the budget, nor N log lines.
+
+    The wait is per FK but the INDEX is shared, so a parent whose index never becomes
+    valid used to burn the full 300s budget once per referencing FK (and emit a
+    near-identical INFO line each time), every poll opening a fresh DSQL connection.
+    """
+    from dsql_migrator.core.models import ForeignKeyDef
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    asked = {"n": 0}
+
+    def _always_building(table_name, columns, *, connection_factory):  # noqa: ANN001
+        asked["n"] += 1
+        return "building"
+
+    import dsql_migrator.core.target_introspector as _ti
+    saved = _ti.unique_index_state
+    _ti.unique_index_state = _always_building
+    cache: dict = {}
+    clock = {"t": 0.0}
+    waits = []
+    try:
+        for name in ("fk_a", "fk_b", "fk_c"):
+            _state, waited = _engine._wait_for_referenced_unique_index(
+                ForeignKeyDef(name=name, columns=["pid"], referenced_table="parent",
+                              referenced_columns=["id"]),
+                lambda: object(), budget_seconds=10.0, poll_seconds=2.0,
+                sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
+                monotonic=lambda: clock["t"], cache=cache,
+            )
+            waits.append(waited)
+    finally:
+        _ti.unique_index_state = saved
+    assert waits[0] >= 10.0                    # the first FK pays the budget
+    assert waits[1:] == [0.0, 0.0]             # the rest reuse the verdict...
+    assert clock["t"] < 20.0                   # ...so the budget is paid ONCE
+    probes_after_first = asked["n"]
+    assert probes_after_first == 6, asked      # 6 probes total, none for fk_b/fk_c
+
+
+def test_the_wait_log_never_prints_a_python_literal_to_an_operator(monkeypatch) -> None:
+    # The activity log is downloaded and pasted into runbooks; "then it was None" is both
+    # meaningless and indistinguishable from a real state.
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    assert _engine._index_state_phrase(None) == (
+        "unknown (the target catalog could not be read)"
+    )
+    assert _engine._index_state_phrase("valid") == "ready"
+    assert "budget" in _engine._index_state_phrase("building")
+    assert "no such unique index" in _engine._index_state_phrase("absent")
+
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    events: list = []
+    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: events.append((a, k)))
+    monkeypatch.setattr(engine, "apply_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(
+        engine, "_wait_for_referenced_unique_index", lambda *a, **k: (None, 3.0)
+    )
+    engine.apply_preserved_foreign_keys(
+        {"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])}, lambda: _FkProbeConnection(0)
+    )
+    detail = [k.get("detail", "") for _a, k in events if "waited" in str(_a)][0]
+    assert "None" not in detail, detail
+    assert "unknown" in detail

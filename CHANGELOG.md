@@ -5,6 +5,60 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.453
+
+### Fixed
+
+- **The FK pass logged "the index was still building ... waited 0.0s" for every foreign
+  key.** The elapsed-time counter started BEFORE the first catalog probe, and that probe
+  is a DSQL round trip (IAM token + TLS), so its own latency landed in the reported wait
+  and made it non-zero even when nothing was waited for. The caller keys its log line on
+  that value being non-zero, so a normal run emitted one line per FK -- self-contradictory
+  (a 0.0s wait that was nonetheless "still building"), and the opposite of the silence
+  this log was introduced to keep. In a live 6-FK run 5 of the 6 lines were spurious. The
+  timer now measures the POLLING wait only: the probe runs first and a state other than
+  `building` returns immediately with exactly `0.0`. A genuine wait (the same run's 32.6s)
+  still logs.
+  - Every pre-existing test for this helper injected `monotonic=lambda: 0.0` -- a FROZEN
+    clock -- and the call-site test monkeypatched the helper to return a hardcoded
+    `("valid", 0.0)`, so no test ever ran the real timer. The new tests let it run.
+- **Hardening in the same pass, from an adversarial review of the fix above:**
+  - A transient catalog read mid-wait no longer aborts it. `unique_index_state` swallows
+    every exception and returns `None`, and the loop condition (`while state ==
+    "building"`) treated that as "no longer building" -- so one blip ended a 300s wait
+    after a single poll and the `ADD CONSTRAINT` raced the very index build being waited
+    for. An unknown reading is now skipped (we already know it WAS building) and the last
+    known state is kept, so the failure reason stays actionable instead of degrading to
+    the generic "apply it manually".
+  - One stuck parent index is waited for ONCE per pass, not once per referencing foreign
+    key. The wait is per FK but the index is shared, so N FKs onto one parent cost N x the
+    300s budget and emitted N near-identical log lines, each poll opening a fresh DSQL
+    connection.
+  - The log no longer prints a Python literal to an operator ("then it was None"); each
+    state renders as a phrase that says what it means for the foreign key.
+  - The helper's return annotation said `Optional[str]` while all three returns are
+    `(state, waited_seconds)` tuples.
+- **A retry blanked the quarantine reason for every table it did not re-run -- and took
+  that table's recovery action with it.** The error log is keyed by job id and a retry runs
+  under a NEW one (the job manager refuses to reuse an id), while the retry seeding carries
+  non-retried chunks forward WITH their quarantined-row count. So those tables rendered a
+  dropped-row count and no reason, and because v0.1.452's "Exclude column & reload" is
+  keyed on those records, it disappeared for exactly the table that still needed it --
+  fixing one oversized-LOB table stranded the others, leaving Start over as the only
+  escape. `MigrationJob` now carries `table_error_job_ids` (table -> the job id whose
+  records are authoritative), seeded on retry: re-run tables are deliberately absent so
+  they get a clean slate, every other table keeps the id that recorded it, and repeated
+  retries compose. Kept self-contained rather than a parent link, so resolution needs no
+  ancestor lookup and survives job pruning; the error log stays append-only and its
+  storage Protocol is unchanged.
+- **The "N row(s) quarantined and ACCEPTED" audit line undercounted on a retry**, by every
+  table the retry did not re-run -- understating what the operator was agreeing to
+  permanently drop. It now counts across the same lineage.
+- **The recovery action no longer depends on the error log at all.** The quarantine panel
+  also keys on the durable per-chunk `rows_quarantined`, so a restored session -- whose
+  in-memory error log is gone -- still offers "Exclude column & reload" instead of hiding
+  the card entirely.
+
 ## v0.1.452
 
 ### Added

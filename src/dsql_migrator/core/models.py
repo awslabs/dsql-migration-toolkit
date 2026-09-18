@@ -853,6 +853,18 @@ class MigrationJob(BaseModel):
     # workers' throttle transitions; empty by default and additive so persisted
     # snapshots still deserialize (a stale entry on a reloaded terminal job is unread).
     throttled_tables: dict[str, int] = Field(default_factory=dict)
+    # Retry lineage for the job-keyed error log: table name -> the job id whose error
+    # records are AUTHORITATIVE for that table. A retry runs under a NEW job_id (the job
+    # manager enforces id uniqueness), and ``_seed_retry_chunks`` carries non-retried
+    # chunks forward -- but their per-row error records stay under the PRIOR job id, so a
+    # retry left those tables with a quarantined-row COUNT and no reason text (and, with
+    # nothing to key a card on, no recovery action either). This map is what restores
+    # them: retried tables point at the new job (a clean slate, which is the behavior a
+    # retry must have), every other table keeps pointing at the job that recorded it.
+    # Self-contained rather than a parent link, so resolution needs no ancestor lookup and
+    # survives job pruning. Empty on a first run -> readers fall back to ``job_id``, i.e.
+    # the pre-existing behavior. Additive + defaulted so persisted snapshots deserialize.
+    table_error_job_ids: dict[str, str] = Field(default_factory=dict)
     watermark: Optional[Watermark] = Field(
         default=None,
         description=(
