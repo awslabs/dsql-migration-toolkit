@@ -20418,3 +20418,131 @@ def test_the_fk_pass_threads_its_heartbeat_into_the_orphan_pre_gate() -> None:
     # The keyword really is passed: it appears in the call's keyword-argument names.
     kwnames = [c for c in code.co_consts if isinstance(c, tuple) and "on_page" in c]
     assert kwnames, "the FK pass no longer passes on_page into the orphan pre-gate"
+
+
+def test_the_orphan_pre_gates_run_concurrently_not_one_after_another() -> None:
+    """The FK pass was serial over every FK, and the pre-gate is its whole cost.
+
+    Measured live: 0.022 ms per child row after v0.1.459, ~6 min for a 15-FK / 15.5M-row
+    schema. Removing the pre-gate is not an option -- a failed `ALTER TABLE ASYNC ...
+    VALIDATE CONSTRAINT` is unobservable on DSQL (convalidated stays false, no sys.jobs row,
+    and a synchronous VALIDATE is FeatureNotSupported), so the tool's own count is the only
+    reliable verdict. Concurrency is the remaining lever.
+    """
+    import threading
+    import time
+
+    from dsql_migrator.core.models import ForeignKeyDef
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    pending = []
+    for i in range(8):
+        fk = ForeignKeyDef(name=f"fk{i}", columns=["pid"],
+                           referenced_table="e.parent", referenced_columns=["id"])
+        pending.append((f"e.child{i}", f"fk{i}", fk, "ALTER TABLE ..."))
+
+    live = {"now": 0, "peak": 0}
+    lock = threading.Lock()
+    conns: list = []
+
+    class _Conn:
+        def close(self):
+            return None
+
+    def factory():
+        c = _Conn()
+        conns.append(c)
+        return c
+
+    def slow_count(_conn, _table, _fk, _pk, on_page=None):  # noqa: ANN001
+        with lock:
+            live["now"] += 1
+            live["peak"] = max(live["peak"], live["now"])
+        try:
+            if on_page is not None:
+                on_page()
+            time.sleep(0.25)
+            return 0
+        finally:
+            with lock:
+                live["now"] -= 1
+
+    real = _engine._count_orphans
+    _engine._count_orphans = slow_count
+    beats: list[int] = []
+    try:
+        t0 = time.monotonic()
+        out = _engine._pregate_orphans(
+            pending, factory, {}, beat=lambda: beats.append(1), stopped=lambda: False
+        )
+        elapsed = time.monotonic() - t0
+    finally:
+        _engine._count_orphans = real
+
+    assert len(out) == 8 and all(v == 0 for v in out.values()), out
+    # Serial would be 8 x 0.25s = 2.0s; concurrent must be far less.
+    assert elapsed < 1.2, f"the pre-gates ran serially ({elapsed:.2f}s for 8 x 0.25s)"
+    assert live["peak"] > 1, f"only {live['peak']} pre-gate ran at a time"
+    assert live["peak"] <= _engine._FK_PREGATE_WORKERS, "the fan-out is unbounded"
+    # Each worker gets its OWN connection: one psycopg connection cannot serve concurrent
+    # queries, and they are closed again.
+    assert len(conns) == 8, conns
+    assert beats, "the pre-gate reported no liveness"
+
+
+def test_a_failing_pre_gate_falls_back_to_the_serial_check() -> None:
+    # The concurrent pass is an OPTIMISATION only: anything it could not determine must fall
+    # through to the existing serial pre-check so the verdict and its error handling are
+    # unchanged. A wrong answer here would add a constraint over violating rows.
+    from dsql_migrator.core.models import ForeignKeyDef
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    fk = ForeignKeyDef(name="fk", columns=["pid"], referenced_table="e.parent",
+                       referenced_columns=["id"])
+    pending = [("e.child", "fk", fk, "ALTER TABLE ...")]
+
+    class _Conn:
+        def close(self):
+            return None
+
+    def boom(*_a, **_k):
+        raise RuntimeError("catalog unreadable")
+
+    real = _engine._count_orphans
+    _engine._count_orphans = boom
+    try:
+        out = _engine._pregate_orphans(
+            pending, lambda: _Conn(), {}, beat=lambda: None, stopped=lambda: False
+        )
+    finally:
+        _engine._count_orphans = real
+    # Recorded as an exception, NOT as "0 orphans" -- the caller then re-checks serially.
+    assert isinstance(out.get(0), Exception), out
+    assert not isinstance(out.get(0), int)
+
+
+def test_the_pre_gate_fan_out_honours_a_stop() -> None:
+    # Stop must not be held for a whole concurrent sweep of large children.
+    from dsql_migrator.core.models import ForeignKeyDef
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    fk = ForeignKeyDef(name="fk", columns=["pid"], referenced_table="e.parent",
+                       referenced_columns=["id"])
+    pending = [(f"e.c{i}", f"fk{i}", fk, "ALTER ...") for i in range(6)]
+    calls = {"n": 0}
+
+    def counted(*_a, **_k):
+        calls["n"] += 1
+        return 0
+
+    real = _engine._count_orphans
+    _engine._count_orphans = counted
+    try:
+        out = _engine._pregate_orphans(
+            pending, lambda: type("C", (), {"close": lambda s: None})(), {},
+            beat=lambda: None, stopped=lambda: True,
+        )
+    finally:
+        _engine._count_orphans = real
+    assert out == {}, out
+    assert calls["n"] == 0, "a stop did not prevent the pre-gate work"

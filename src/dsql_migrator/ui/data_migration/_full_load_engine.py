@@ -4137,10 +4137,15 @@ def apply_preserved_foreign_keys(
     if not pending:
         return (0, 0, 0)
 
+    # Pre-count orphans for every FK CONCURRENTLY. The DDL below stays SERIAL (one DDL per
+    # transaction on DSQL, and it costs 0.18s per FK), so only the expensive read fans out.
+    _pregated = _pregate_orphans(
+        pending, connection_factory, child_pk_columns, beat=_beat, stopped=_stopped
+    )
     probe = connection_factory()  # one read-only connection for the orphan pre-gate
     applied = skipped = failed = 0
     try:
-        for table_name, constraint_name, fk, add_ddl in pending:
+        for _fk_index, (table_name, constraint_name, fk, add_ddl) in enumerate(pending):
             # One FK is a real unit of work: report liveness so a long pass is not reaped,
             # and honour a stop so Stop is not held for the rest of the pass. Both are
             # no-ops for the cut-over caller, which supplies neither.
@@ -4165,9 +4170,16 @@ def apply_preserved_foreign_keys(
                     orphans = 0
                     _LOGGER.debug("No FK metadata for %s; skipping orphan pre-gate", target)
                 else:
-                    orphans = _count_orphans(
-                        probe, table_name, fk, pk_col, on_page=_beat
-                    )
+                    # Use the concurrent pre-count when it produced a number; anything else
+                    # (missing, or an exception) falls through to the serial count so the
+                    # verdict and its error handling are unchanged.
+                    _pre = _pregated.get(_fk_index)
+                    if isinstance(_pre, int):
+                        orphans = _pre
+                    else:
+                        orphans = _count_orphans(
+                            probe, table_name, fk, pk_col, on_page=_beat
+                        )
             except Exception as exc:  # noqa: BLE001 - cannot verify -> do not risk a bad ADD
                 if is_transient_connection_error(exc):
                     # The shared probe died mid-pass (class 08 / expired IAM token /
@@ -4181,8 +4193,8 @@ def apply_preserved_foreign_keys(
                     try:
                         probe = connection_factory()
                         orphans = _count_orphans(
-                        probe, table_name, fk, pk_col, on_page=_beat
-                    )
+                            probe, table_name, fk, pk_col, on_page=_beat
+                        )
                     except Exception:  # noqa: BLE001 - reconnect/re-check still failing
                         failed += 1
                         _LOGGER.warning(
@@ -4567,6 +4579,75 @@ def _constraint_name_from_ddl(add_ddl: object) -> Optional[str]:
 # Rows scanned per keyset page in the orphan pre-gate's paged path. Bounded so a
 # billion-row child never runs one orphan scan past DSQL's ~300s transaction limit.
 _ORPHAN_PAGE_SIZE = 5000
+
+
+# How many orphan pre-gates run at once. The pre-gate is READ-ONLY, and each worker opens
+# its own short-lived connection, so they are independent -- but the target is a live cluster
+# and the pass may run at CUT OVER alongside a draining CDC sink, so the fan-out stays small
+# and bounded rather than one connection per foreign key.
+#
+# WHY THIS EXISTS: the pass is otherwise serial over every FK, and the pre-gate is the whole
+# cost (measured live: 0.022 ms per child row after v0.1.459, ~6 min for a 15-FK / 15.5M-row
+# schema). Removing the pre-gate is NOT an option -- a failed `ALTER TABLE ASYNC ... VALIDATE
+# CONSTRAINT` is unobservable on DSQL (convalidated stays false, indistinguishable from
+# "still running"; no sys.jobs row appears; a synchronous VALIDATE is FeatureNotSupported),
+# so the tool's own count is the only reliable verdict. Concurrency is what is left.
+_FK_PREGATE_WORKERS = 8
+
+
+def _pregate_orphans(
+    pending: "Sequence[tuple]",
+    connection_factory: Callable[[], Any],
+    child_pk_columns: Optional[Mapping[str, Optional[str]]],
+    *,
+    beat: Callable[[], None],
+    stopped: Callable[[], bool],
+) -> dict:
+    """Count orphans for every pending FK CONCURRENTLY. Returns ``{index: count | Exception}``.
+
+    Read-only and independent per FK, each on its own short-lived connection (one psycopg
+    connection cannot serve concurrent queries). Best-effort: an entry that fails or is
+    missing simply falls back to the caller's existing serial pre-check, so this can only
+    make the pass faster, never change its verdict.
+    """
+    out: dict = {}
+    if not pending:
+        return out
+
+    def one(index: int, table_name: str, fk) -> None:
+        if stopped():
+            return
+        pk_col = (child_pk_columns or {}).get(table_name)
+        conn = None
+        try:
+            conn = connection_factory()
+            out[index] = _count_orphans(conn, table_name, fk, pk_col, on_page=beat)
+        except Exception as exc:  # noqa: BLE001 - recorded; the caller retries serially
+            out[index] = exc
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001 - best-effort
+                    pass
+        beat()
+
+    jobs = [
+        (i, table_name, fk)
+        for i, (table_name, _cname, fk, _ddl) in enumerate(pending)
+        if fk is not None
+    ]
+    if not jobs:
+        return out
+    workers = max(1, min(_FK_PREGATE_WORKERS, len(jobs)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(one, *job) for job in jobs]
+        for future in futures:
+            try:
+                future.result()
+            except Exception:  # noqa: BLE001 - `one` already records its own failure
+                pass
+    return out
 
 
 def _count_orphans(

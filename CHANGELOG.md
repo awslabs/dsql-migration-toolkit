@@ -5,6 +5,48 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.460
+
+### Changed
+
+- **The foreign-key pass's orphan pre-gates now run concurrently (bounded at 8), so the pass
+  is no longer serial over every foreign key.** After v0.1.459's 27x query fix the pre-gate
+  was still ~6 min for a 15-FK / 15.5M-row schema, and it is the whole cost of the pass --
+  the `ADD CONSTRAINT ... NOT VALID` DDL itself measures 0.18s. The DDL stays SERIAL (DSQL
+  takes one DDL per transaction); only the read fans out, each worker on its own short-lived
+  connection.
+  - Bounded rather than one connection per FK: this pass runs at **cut over** for a CDC
+    migration, alongside a draining sink, on a live cluster.
+  - Purely an optimisation: a pre-gate that fails or is missing falls through to the existing
+    serial check, so the verdict and its error handling are unchanged. A failure is recorded
+    as an exception, never as "0 orphans" -- reporting zero would add a constraint over
+    violating rows.
+
+### Why the pre-gate could not simply be removed (measured live)
+
+Aurora DSQL only accepts `ADD CONSTRAINT ... NOT VALID`, which enforces new writes but does
+not check existing rows (both confirmed: a bad insert raised `ForeignKeyViolation`, while a
+pre-existing orphan was accepted). The natural idea is to let DSQL validate server-side with
+`ALTER TABLE ASYNC ... VALIDATE CONSTRAINT` and skip the tool's own scan. That was measured
+and **rejected**, because a FAILED validation is unobservable:
+
+| observation | with a real orphan present |
+| --- | --- |
+| `pg_constraint.convalidated` | stayed `false` for 240s -- indistinguishable from "still running" |
+| `sys.jobs` | no row ever appeared for the VALIDATE |
+| synchronous `VALIDATE CONSTRAINT` | `FeatureNotSupported` -- no synchronous verdict exists |
+| success case, for contrast | `convalidated` flipped `true` after 330s on a 3M-row child |
+
+Success is observable; failure is not. Dropping the pre-gate would leave a constraint sitting
+unvalidated over violating rows with no signal, which is worse than a slow check -- so the
+tool's own count stays the verdict, and concurrency is the lever.
+
+Also measured and rejected as levers, so neither is a guess: the page size (identical ms/row
+from 5k to 250k; 500k exceeds DSQL's 300s transaction limit), the `array_agg` keyset-boundary
+trick (0.21s per page on its own; `max()` genuinely has no uuid overload), a DISTINCT-key
+anti-join (**5x slower** on a high-cardinality FK) and a semi-join-and-subtract (**6x
+slower**).
+
 ## v0.1.459
 
 ### Changed
