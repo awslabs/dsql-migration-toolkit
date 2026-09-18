@@ -11,7 +11,8 @@ All notable changes to this project are recorded here. This project follows
 
 - **The foreign-key pass's orphan pre-gates now run concurrently (bounded at 8), so the pass
   is no longer serial over every foreign key.** After v0.1.459's 27x query fix the pre-gate
-  was still ~6 min for a 15-FK / 15.5M-row schema, and it is the whole cost of the pass --
+  still took 28.0 min end to end for a 15-FK / 15.5M-row schema, and it is the whole cost of
+  the pass --
   the `ADD CONSTRAINT ... NOT VALID` DDL itself measures 0.18s. The DDL stays SERIAL (DSQL
   takes one DDL per transaction); only the read fans out, each worker on its own short-lived
   connection.
@@ -21,6 +22,21 @@ All notable changes to this project are recorded here. This project follows
     serial check, so the verdict and its error handling are unchanged. A failure is recorded
     as an exception, never as "0 orphans" -- reporting zero would add a constraint over
     violating rows.
+
+### Measured, end to end (this schema: 11 tables, 15 foreign keys, 15.46M child rows)
+
+| foreign-key pass | wall clock | applied |
+| --- | --- | --- |
+| anti-join, serial (v0.1.459) | **1680.5s / 28.01 min** | 15/15 |
+| anti-join, 8-way pre-gate (v0.1.460) | **472.9s / 7.88 min** | 15/15 |
+
+Concurrency gain **3.55x**, both arms in one run on one build, both applying all 15.
+
+A note on method, because it changed a conclusion: the 6-minute figure first quoted for the
+serial pass was EXTRAPOLATED from a single page's latency, and it was 4.5x optimistic --
+per-page timing ignores accumulated overhead and the rising cost of deeper keyset positions.
+On that projection the 8-way run (7.7 min) looked like a regression and was nearly reverted.
+Only the end-to-end A/B showed it is a 3.55x win. Projections are not measurements.
 
 ### Why the pre-gate could not simply be removed (measured live)
 
@@ -60,7 +76,8 @@ slower**).
   FILTER existed to protect (a filtered window would skip PK ranges and under-count).
   - Measured on a live ap-northeast-2 cluster over a 100k-row window of a 3M-row child:
     **0.59 ms/row -> 0.022 ms/row**. For an 8.5M-row schema with 15 foreign keys
-    (15.5M child rows scanned in total) that is **~153 min -> ~6 min**. All three candidate
+    (15.5M child rows scanned in total) the serial pass measures **28.0 min end to end**
+    (a per-page extrapolation had suggested ~6 min -- see the note below). All three candidate
     formulations returned exactly the same `(orphan_count, last_pk, row_count)` as the
     shipped query.
   - This is the pre-cut-over gate, so the cost landed where it hurts most: for a Full-Load
