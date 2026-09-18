@@ -5,6 +5,29 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.458
+
+### Fixed
+
+- **v0.1.456's liveness report in the foreign-key pass was at the wrong level, so a healthy
+  run could still be reaped.** The pass reported once per FOREIGN KEY, but that is not where
+  it spends its time: the orphan pre-gate pages a large child at 5000 rows per round trip --
+  roughly 600 round trips for a 3M-row child -- so a SINGLE foreign key left the pass silent
+  for minutes. The pre-gate now reports liveness per PAGE, the same shape used for
+  Validation's bounded scans.
+  - **Found by live verification, not by the suite.** A real Full Load of 11 tables / 8.5M
+    rows with foreign keys preserved (15 of them), run in Seoul Fargate under a deliberately
+    short 90s stall watchdog, was reaped mid-pass. Instrumenting the run located it exactly:
+    `_apply_foreign_keys` started at +411.0s, the last liveness report was at +412.3s, and
+    the pass never returned. The review that produced v0.1.456 had flagged this cost
+    ("each orphan pre-gate pages the child at 5000 rows per round trip"); the fix simply put
+    the report a level too high.
+
+### Tests
+
+- 3795 green. Two mutations checked, each caught: removing the per-page report, and stopping
+  the pass from threading its heartbeat into the pre-gate.
+
 ## v0.1.457
 
 Completes the sweep started in v0.1.453: state keyed by an identifier that a legitimate

@@ -4165,7 +4165,9 @@ def apply_preserved_foreign_keys(
                     orphans = 0
                     _LOGGER.debug("No FK metadata for %s; skipping orphan pre-gate", target)
                 else:
-                    orphans = _count_orphans(probe, table_name, fk, pk_col)
+                    orphans = _count_orphans(
+                        probe, table_name, fk, pk_col, on_page=_beat
+                    )
             except Exception as exc:  # noqa: BLE001 - cannot verify -> do not risk a bad ADD
                 if is_transient_connection_error(exc):
                     # The shared probe died mid-pass (class 08 / expired IAM token /
@@ -4178,7 +4180,9 @@ def apply_preserved_foreign_keys(
                         pass
                     try:
                         probe = connection_factory()
-                        orphans = _count_orphans(probe, table_name, fk, pk_col)
+                        orphans = _count_orphans(
+                        probe, table_name, fk, pk_col, on_page=_beat
+                    )
                     except Exception:  # noqa: BLE001 - reconnect/re-check still failing
                         failed += 1
                         _LOGGER.warning(
@@ -4571,6 +4575,7 @@ def _count_orphans(
     fk: ForeignKeyDef,
     pk_column: Optional[str] = None,
     page_size: int = _ORPHAN_PAGE_SIZE,
+    on_page: Optional[Callable[[], None]] = None,
 ) -> int:
     """Count child rows whose foreign key points to a missing parent (target).
 
@@ -4603,7 +4608,7 @@ def _count_orphans(
             pass
         if pk_column is not None:
             return _count_orphans_keyset(
-                connection, child_table, fk, pk_column, page_size
+                connection, child_table, fk, pk_column, page_size, on_page=on_page
             )
         cursor = connection.cursor()
         try:
@@ -4625,6 +4630,7 @@ def _count_orphans_keyset(
     fk: ForeignKeyDef,
     pk_column: str,
     page_size: int,
+    on_page: Optional[Callable[[], None]] = None,
 ) -> int:
     """Accumulate the orphan count over bounded keyset pages (single-column-PK child).
 
@@ -4638,6 +4644,12 @@ def _count_orphans_keyset(
     total = 0
     last: object = None
     while True:
+        # A page is a real unit of work, and this loop is where the pass actually spends
+        # its time: a 3M-row child is ~600 round trips for ONE foreign key. Reporting
+        # liveness only per FK (v0.1.456) still left a single FK's pre-gate silent for
+        # minutes, so a live run under an armed watchdog was reaped mid-pass.
+        if on_page is not None:
+            on_page()
         cursor = connection.cursor()
         try:
             if last is None:

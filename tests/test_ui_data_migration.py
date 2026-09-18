@@ -20351,3 +20351,70 @@ def test_a_retry_resyncs_the_identity_sequence_for_every_loaded_table() -> None:
     assert "prior_chunks" in retry_src.split("sync_table_names=")[1][:200], (
         "the retry still narrows the identity sync to the retried tables"
     )
+
+
+def test_the_orphan_pre_gate_reports_liveness_per_page() -> None:
+    """Per-FK liveness was too coarse: the pass spends its time INSIDE one FK.
+
+    v0.1.456 reported liveness once per foreign key, but the orphan pre-gate pages a large
+    child at 5000 rows per round trip -- ~600 round trips for a 3M-row child -- so a single
+    FK left the pass silent for minutes. A LIVE run under an armed 90s watchdog was reaped
+    mid-pass with the last liveness report 1.2s after the pass started, which is how this
+    was found.
+    """
+    import inspect
+
+    from dsql_migrator.core.models import ForeignKeyDef
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    assert "on_page" in inspect.signature(_engine._count_orphans).parameters
+    assert "on_page" in inspect.signature(_engine._count_orphans_keyset).parameters
+
+    # Behaviour: one report per page, not one per call.
+    pages = [(0, 10, 5), (0, 20, 5), (0, 30, 2)]   # 3 pages, last one short
+    state = {"n": 0}
+
+    class _Cur:
+        def execute(self, *_a, **_k):
+            return None
+
+        def fetchone(self):
+            row = pages[min(state["n"], len(pages) - 1)]
+            state["n"] += 1
+            return row
+
+        def close(self):
+            return None
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+    beats: list[int] = []
+    total = _engine._count_orphans_keyset(
+        _Conn(), "e.child",
+        ForeignKeyDef(name="fk", columns=["pid"], referenced_table="e.parent",
+                      referenced_columns=["id"]),
+        "id", 5, on_page=lambda: beats.append(1),
+    )
+    assert total == 0
+    assert len(beats) == state["n"] == 3, (beats, state)
+
+
+def test_the_fk_pass_threads_its_heartbeat_into_the_orphan_pre_gate() -> None:
+    # Wiring guard: the per-page seam is useless unless the pass actually passes its
+    # heartbeat down. Bytecode names, not a source substring.
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    code = _engine.apply_preserved_foreign_keys.__code__
+    names = set(code.co_names)
+    for const in code.co_consts:
+        if hasattr(const, "co_names"):
+            names |= set(const.co_names)
+    assert "_count_orphans" in names
+    assert "on_page" in set(code.co_varnames) | set(code.co_names) | {
+        n for c in code.co_consts if hasattr(c, "co_varnames") for n in c.co_varnames
+    } or True   # kwarg name lives in co_consts as a keyword tuple; checked below
+    # The keyword really is passed: it appears in the call's keyword-argument names.
+    kwnames = [c for c in code.co_consts if isinstance(c, tuple) and "on_page" in c]
+    assert kwnames, "the FK pass no longer passes on_page into the orphan pre-gate"
