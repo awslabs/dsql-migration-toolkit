@@ -641,6 +641,18 @@ _CHUNK_STARTED = "\x00chunk-started"
 # load" hint. Distinct 3-tuple sentinel so it is matched BEFORE the generic
 # ``(table, delta_loaded, delta_skipped)`` progress tuple.
 _CHUNK_THROTTLED = "\x00chunk-throttled"
+# Marker for "still alive, deliberately waiting". A source-retry backoff can legitimately
+# sleep for minutes; nothing on that path reported progress, so the JobManager stall
+# watchdog (900 s of silence) reaped a HEALTHY job and reported it as an unresponsive
+# connection. This is an explicit liveness signal -- unlike a diagnostic read, which must
+# NOT stamp liveness (see JobHandle.snapshot).
+_HEARTBEAT = "\x00heartbeat"
+
+# Ceiling for the source-retry backoff. ``base * 2**(attempt-1)`` is uncapped, so raising
+# the retry budget turned a 30 s wait into hours (attempt 10 = 256 x base). Capped like the
+# house pattern in ``core/occ.py`` (which clamps before jitter), and kept comfortably under
+# the stall window so a single wait can never look like silence even without the heartbeat.
+_SOURCE_RETRY_MAX_DELAY_SECONDS = 120.0
 
 
 @dataclass(frozen=True)
@@ -761,6 +773,34 @@ def _report_progress(
         pass
 
 
+def _abandon_pool_workers(pool) -> None:
+    """Tear a ``ProcessPoolExecutor`` down WITHOUT waiting for a wedged worker.
+
+    ``Executor.__exit__`` calls ``shutdown(wait=True)``, which joins the executor-manager
+    thread and therefore returns only once every RUNNING work item finishes. So abandoning
+    the cancel wait and falling out of ``with ProcessPoolExecutor(...)`` still blocked on
+    exactly the worker the grace period had just given up on -- Stop never completed, the
+    job never reached CANCELLED, and the UI sat on "finishing the current batch" while the
+    log already claimed the pool was torn down. ``future.cancel()`` cannot stop an
+    already-running task, so the only bounded escape is to stop accepting work and then
+    terminate the worker processes; the manager thread then observes the dead children, so
+    the ``shutdown(wait=True)`` that follows returns immediately.
+
+    Best-effort throughout: this runs on the way out of a cancelled run, so nothing here
+    may raise and mask the cancellation.
+    """
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+    except Exception:  # noqa: BLE001 - teardown must not mask the cancel
+        _LOGGER.debug("Full Load cancel: non-blocking shutdown failed", exc_info=True)
+    for proc in list((getattr(pool, "_processes", None) or {}).values()):
+        try:
+            if proc.is_alive():
+                proc.terminate()
+        except Exception:  # noqa: BLE001 - a child may already be gone
+            _LOGGER.debug("Full Load cancel: terminate failed", exc_info=True)
+
+
 def _retry_source_drops_in_process(
     work,
     *,
@@ -879,7 +919,7 @@ def _wait_before_source_reread(
     The wait itself is sliced so a user Stop is honored promptly rather than after
     the full delay.
     """
-    delay = backoff * (2 ** (attempt - 1))
+    delay = min(_SOURCE_RETRY_MAX_DELAY_SECONDS, backoff * (2 ** (attempt - 1)))
     _LOGGER.warning(
         "Full Load source connection lost for table %s (attempt %d/%d): %s -- "
         "re-reading from a fresh snapshot in %.0fs",
@@ -891,6 +931,10 @@ def _wait_before_source_reread(
             return False
         _time.sleep(min(1.0, delay - waited))
         waited += 1.0
+        # Same reason as the in-parent path, one hop further: a child process reaches the
+        # watchdog only through the progress queue, so a silent backoff here read as a
+        # dead worker. Non-blocking (put_nowait) -- telemetry must never wedge the wait.
+        _report_progress(_worker_progress_queue, _HEARTBEAT)
     return not cancelled()
 
 
@@ -1292,17 +1336,18 @@ class _MemoryPressureLogger:
     def _loading_suffix(self) -> str:
         """`` while loading: t1, t2`` for the tables currently IN_PROGRESS, or ``""``.
 
-        Read under the manager lock via ``handle.update`` (the only thread-safe path to
-        the live job), so the memory line names the likely culprit table(s).
+        Read via ``handle.snapshot()``, NOT ``handle.update``: update refreshes the stall
+        watchdog's liveness clock, so routing this diagnostic read through it made a
+        memory sample count as "progress" -- a Full Load whose worker was wedged but whose
+        memory kept creeping was therefore never reaped and sat in RUNNING forever.
         """
         names: list[str] = []
         try:
-            self._handle.update(
-                lambda job: names.extend(
-                    chunk.chunk_id
-                    for chunk in job.chunks
-                    if chunk.status == "IN_PROGRESS"
-                )
+            snapshot = self._handle.snapshot()
+            names.extend(
+                chunk.chunk_id
+                for chunk in snapshot.chunks
+                if chunk.status == "IN_PROGRESS"
             )
         except Exception:  # noqa: BLE001 - sampling must never break the drain thread
             return ""
@@ -1334,6 +1379,11 @@ def _drain_progress_queue(
             continue
         if msg is _PROGRESS_SENTINEL:
             break
+        if msg == _HEARTBEAT:
+            # "Still alive, deliberately waiting" (a source-retry backoff). Stamps the
+            # watchdog's liveness clock without changing any job state.
+            handle.update(lambda job: None)
+            continue
         if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == _CHUNK_STARTED:
             # A worker actually began its table -> mark IN_PROGRESS now (not at submission).
             # (== not is: the marker is pickled across the process boundary.)
@@ -1493,7 +1543,9 @@ def _migrate_table_with_source_retry(
                 raise
             if handle.cancelled:
                 raise
-            delay = backoff * (2 ** (attempt - 1))
+            delay = min(
+                _SOURCE_RETRY_MAX_DELAY_SECONDS, backoff * (2 ** (attempt - 1))
+            )
             _LOGGER.warning(
                 "Full Load source connection lost for table %s (attempt %d/%d): "
                 "%s: %s -- re-reading from a fresh snapshot in %.0fs",
@@ -1520,6 +1572,13 @@ def _migrate_table_with_source_retry(
                     raise
                 _time.sleep(min(1.0, delay - waited))
                 waited += 1.0
+                # Deliberate waiting is NOT silence. Without this the stall watchdog
+                # reaped a healthy job mid-backoff and blamed "an unresponsive
+                # source/target connection" for a wait the tool chose to take.
+                try:
+                    handle.update(lambda job: None)
+                except Exception:  # noqa: BLE001 - liveness only; never break the retry
+                    pass
     # Unreachable: the loop either returns or raises.
     raise AssertionError("source retry loop exited without a result")
 
@@ -2048,10 +2107,11 @@ def _migrate_tables_in_parallel(
                             _cancel_deadline is not None
                             and _time.monotonic() >= _cancel_deadline
                         ):
-                            # Cooperative stop did not take. Abandon the wait; the
-                            # `with ProcessPoolExecutor` exit terminates the workers,
-                            # and the unfinished chunks are marked FAILED below (they
-                            # are retryable -- the load is idempotent).
+                            # Cooperative stop did not take. Abandon the wait AND tear
+                            # the pool down without waiting -- the `with` exit calls
+                            # shutdown(wait=True), which would block on this very worker
+                            # (see _abandon_pool_workers). The unfinished chunks are
+                            # marked FAILED below (retryable -- the load is idempotent).
                             _LOGGER.warning(
                                 "Full Load cancel: %d worker task(s) did not stop "
                                 "within %.0fs; abandoning the wait and tearing down "
@@ -2060,6 +2120,7 @@ def _migrate_tables_in_parallel(
                             )
                             for _f in _pending:
                                 _f.cancel()
+                            _abandon_pool_workers(pool)
                             break
                         continue
                     _pending.discard(future)

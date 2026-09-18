@@ -2724,3 +2724,63 @@ def test_pg_source_keyset_count_through_shim_non_integer_and_composite() -> None
     sqla2 = _PagedSqla([[(2,)]])
     assert _source_row_count_live(_FakeDialect(SourceType.POSTGRES), sqla2, ct, 2) == 2
     assert "COUNT(*)" in sqla2.sqls[0]
+
+
+def test_reconnect_retry_covers_the_reconnect_itself() -> None:
+    """The one failure this budget exists for was the one it did not retry.
+
+    The retry `try:` began AFTER `_live()` (the DSQL connect factory) and `.cursor()`, so
+    "a fresh reconnect transiently hits DSQL's new-connection rate limit" -- the case the
+    constants' own comment cites -- escaped after 1 of 4 attempts, the table was reported
+    errored with a raw driver message, and the cut-over gate shut on a transient event.
+    Every pre-existing test injected `sleep=lambda _s: None` and never recorded the delay,
+    so neither the retry nor its backoff had coverage here.
+    """
+    from dsql_migrator.core import validator as _v
+
+    class _Cursor:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def execute(self, *_a, **_k):
+            return self
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _Conn:
+        def cursor(self):
+            return _Cursor()
+
+    attempts_seen = {"n": 0}
+
+    class _Transient(Exception):
+        pass
+
+    def _connect():
+        attempts_seen["n"] += 1
+        if attempts_seen["n"] < 3:
+            raise _Transient("too many connections, please retry")   # the RECONNECT fails
+        return _Conn()
+
+    slept: list[float] = []
+    monkey = _v.is_transient_connection_error
+    _v.is_transient_connection_error = lambda exc: isinstance(exc, _Transient)
+    try:
+        owner = _v._ReconnectingTargetConnection.__new__(_v._ReconnectingTargetConnection)
+        owner._connection = None
+        owner._max_attempts = 4
+        owner._base_delay = 0.5
+        owner._sleep = slept.append
+        owner._factory = _connect
+        owner._live = _connect          # the connect factory itself is what fails
+        owner._discard = lambda: None
+        cur = _v._ReconnectingCursor(owner)
+        result = cur.execute("SELECT 1")
+    finally:
+        _v.is_transient_connection_error = monkey
+
+    assert result is not None
+    assert attempts_seen["n"] == 3, "the reconnect itself must be retried, not raised"
+    # And the backoff actually grows with the attempt (0.5 * 1, then 0.5 * 2).
+    assert slept == [0.5, 1.0], slept

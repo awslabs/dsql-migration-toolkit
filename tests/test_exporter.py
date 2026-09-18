@@ -1418,3 +1418,39 @@ def test_shardable_leading_int_pk_postgres_membership() -> None:
     for t in ("uuid", "text", "numeric(10,0)", "timestamp with time zone"):
         table = TableDef(name="t", columns=[ColumnDef(name="id", mysql_type=t)], primary_key=["id"])
         assert shardable_leading_int_pk(table, pg) is None, t
+
+
+def test_governor_reading_expires_after_the_ttl() -> None:
+    """The cache-MISS half of the TTL, which a frozen clock cannot express.
+
+    `test_governor_caches_reading_within_ttl` injects `monotonic=lambda: 100.0`, so the
+    elapsed delta is always 0 and "caches within the window" is indistinguishable from
+    "caches forever". The governor is the only thing protecting a live-serving source, so
+    a never-expiring reading would either throttle the load forever or never throttle.
+    """
+    from dsql_migrator.core.exporter import SourceLoadGovernor
+
+    conn = _FakeConnection([], threads_running=[5, 999, 5])
+    now = {"t": 100.0}
+    sleeps: list[float] = []
+
+    def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        now["t"] += seconds          # a slice of waiting really passes
+
+    governor = SourceLoadGovernor(
+        conn, 10, sleep=_sleep, monotonic=lambda: now["t"],
+        ttl_seconds=2.0, slice_seconds=1.0,
+    )
+    governor.throttle()                       # fresh read: 5 threads, under the ceiling
+    assert conn.status_reads == 1
+    assert sleeps == []
+
+    now["t"] += 0.5                           # still INSIDE the TTL -> cache hit
+    governor.throttle()
+    assert conn.status_reads == 1, "a reading inside the TTL must be reused"
+
+    now["t"] += 2.0                           # past the TTL -> must RE-READ and act
+    governor.throttle()
+    assert conn.status_reads > 1, "the cached reading never expired"
+    assert sleeps, "the fresh over-ceiling reading (999) must pause the reader"

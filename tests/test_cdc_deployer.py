@@ -986,3 +986,27 @@ def test_seeder_eni_count_is_none_on_read_error() -> None:
         raise_on={"describe_stack_resources": RuntimeError("throttled")},
     )
     assert _dep(client).seeder_eni_count("mysql-dsql-cdc-stack") is None
+
+
+def test_the_wait_deadline_helpers_actually_fire() -> None:
+    """The deadline is the ONLY thing that can end a wedged CDC wait, so it must fire.
+
+    Both CDC wait loops heartbeat every poll, which deliberately defeats the JobManager
+    stall watchdog -- so nothing else would ever end a wait whose stack never settles.
+    Yet no test in the suite crosses a deadline (they use `delete_timeout_seconds=1e9`,
+    `timeout=10_000.0`, or fakes that settle first), and these two helpers had NO direct
+    test at all. A sign or units error in them would ship green and produce a job that
+    never ends.
+    """
+    import time
+
+    from dsql_migrator.core.cdc_deployer import _deadline_passed, _monotonic_deadline
+
+    assert _deadline_passed(_monotonic_deadline(0.0)) is True
+    assert _deadline_passed(_monotonic_deadline(-5.0)) is True     # already past
+    assert _deadline_passed(_monotonic_deadline(60.0)) is False    # plenty of budget
+    # And it is a WALL-CLOCK deadline: it flips once real time passes it.
+    deadline = _monotonic_deadline(0.05)
+    assert _deadline_passed(deadline) is False
+    time.sleep(0.08)
+    assert _deadline_passed(deadline) is True

@@ -156,6 +156,17 @@ class JobHandle:
         """
         return self._manager.is_cancel_requested(self._job_id)
 
+    def snapshot(self) -> "MigrationJob":
+        """Return a deep-copied read of the live job WITHOUT touching liveness.
+
+        Use this for a DIAGNOSTIC read. :meth:`update` refreshes the stall watchdog's
+        clock (``last_progress_at``) because every caller of it is reporting progress --
+        so reading the job through ``update`` made a purely diagnostic sample (the Full
+        Load memory sampler naming the in-progress tables) indistinguishable from work
+        getting done, and a wedged job whose memory kept creeping was never reaped.
+        """
+        return self._manager.get_status(self._job_id)
+
     def update(self, mutator: Mutator) -> None:
         """Apply ``mutator`` to the live :class:`MigrationJob` under the lock.
 

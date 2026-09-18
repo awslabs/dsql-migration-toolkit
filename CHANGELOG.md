@@ -5,6 +5,64 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.454
+
+Four defects found by probing test blind spots -- places where a test was structurally
+unable to catch a class of bug (a frozen clock, or an assertion on a value the test itself
+injected). Two further areas probed the same way turned out CLEAN and got the missing
+assertion instead.
+
+### Fixed
+
+- **Stop never completed if a worker was wedged.** The sliced cancel wait correctly noticed
+  its grace period expiring and abandoned the wait -- but `break` fell straight out of
+  `with ProcessPoolExecutor(...)`, whose `__exit__` calls `shutdown(wait=True)` and so
+  returns only once every RUNNING work item finishes. It therefore blocked on exactly the
+  worker the grace period had just given up on (`future.cancel()` cannot stop an
+  already-running task), leaving the job in RUNNING with the UI on "finishing the current
+  batch" while the log already claimed the pool was torn down. The abandon path now stops
+  accepting work and terminates the worker processes, so the following `shutdown` returns
+  at once. The pre-existing test asserted substrings of `inspect.getsource` and never ran
+  the wait, so it passed against the block.
+- **A diagnostic memory sample counted as progress, so a wedged Full Load was never
+  reaped.** The memory-pressure sampler read the in-progress table names through
+  `handle.update` -- the WRITE path -- and `JobManager.apply_update` unconditionally
+  refreshes `last_progress_at`, the stall watchdog's liveness clock. A Full Load whose
+  worker was stuck but whose memory kept creeping therefore sat in RUNNING indefinitely
+  with a frozen row count and no terminal affordance. `JobHandle` gained `snapshot()`, a
+  read that does not touch liveness, and the sampler uses it.
+- **The validator's reconnect budget did not cover the reconnect.** In
+  `_ReconnectingCursor.execute` the retry `try:` began AFTER `_live()` (the DSQL connect
+  factory) and `.cursor()`, so the one failure the budget documents itself as existing for
+  -- "a fresh reconnect can transiently hit DSQL's new-connection rate limit" -- escaped
+  after 1 of 4 attempts and 0.5 of 3.0s of backoff. That table was reported as errored with
+  a raw driver message and the cut-over gate shut on a transient event the retry was meant
+  to absorb.
+- **An uncapped source-retry backoff could get a healthy job reaped as "stalled".**
+  `base * 2**(attempt-1)` had no clamp (unlike the house pattern in `core/occ.py`), and
+  neither wait loop reported liveness -- so raising the retry budget produced a wait longer
+  than the 900s stall window, and the watchdog failed a job that was deliberately waiting,
+  blaming "an unresponsive source/target connection" for the tool's own chosen pause. The
+  delay is now capped (`_SOURCE_RETRY_MAX_DELAY_SECONDS`, kept under the stall window) and
+  each wait slice sends an explicit heartbeat -- from a child process via the progress queue
+  (`_HEARTBEAT`), which the drain turns into a liveness stamp that changes no job state.
+
+### Tests
+
+- Regression coverage for all four, each mutation-checked (7 mutations, each caught):
+  reverting the pool teardown, making it wait, putting the sampler back on the write path,
+  removing the backoff clamp, removing the heartbeat, moving the reconnect back outside the
+  retry, and making `snapshot()` stamp liveness.
+- Two areas probed and found CLEAN -- correct behaviour, no coverage -- now guarded:
+  - The CDC deploy/delete wait deadlines DO fire (verified against loops whose fakes never
+    settle). But both waits heartbeat every poll, which deliberately defeats the stall
+    watchdog, so the deadline is the ONLY thing that can end a wedged wait -- and
+    `_monotonic_deadline`/`_deadline_passed` had no direct test, so a sign or units error
+    there would have shipped green as a job that never ends.
+  - The `SourceLoadGovernor` TTL cache DOES expire. Its only TTL test froze the clock, so
+    "caches within the window" was indistinguishable from "caches forever" -- verified by
+    mutation: a cache-forever mutant leaves that test passing.
+
 ## v0.1.453
 
 ### Fixed

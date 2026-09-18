@@ -17819,7 +17819,11 @@ def test_both_monitoring_views_share_one_visibility_gate() -> None:
 
 
 class _MemHandle:
-    """JobHandle double whose update() exposes a live job with IN_PROGRESS chunks."""
+    """JobHandle double exposing a live job with IN_PROGRESS chunks.
+
+    Records which access path the sampler used: ``snapshot()`` is the diagnostic READ
+    (must NOT stamp the stall watchdog), ``update()`` is the write path (does stamp).
+    """
 
     def __init__(self, in_progress: list[str]) -> None:
         from dsql_migrator.core.models import ChunkState, MigrationJob
@@ -17829,8 +17833,15 @@ class _MemHandle:
             job_id="mem-job",
             chunks=[ChunkState(chunk_id=n, status="IN_PROGRESS") for n in in_progress],
         )
+        self.updates = 0
+        self.snapshots = 0
+
+    def snapshot(self):
+        self.snapshots += 1
+        return self._job.model_copy(deep=True)
 
     def update(self, fn):
+        self.updates += 1
         return fn(self._job)
 
 
@@ -19600,3 +19611,189 @@ def test_the_wait_log_never_prints_a_python_literal_to_an_operator(monkeypatch) 
     detail = [k.get("detail", "") for _a, k in events if "waited" in str(_a)][0]
     assert "None" not in detail, detail
     assert "unknown" in detail
+
+
+def test_abandoning_the_cancel_wait_tears_the_pool_down_without_waiting() -> None:
+    """Stop must not block on the very worker the grace period gave up on.
+
+    `Executor.__exit__` calls shutdown(wait=True), which joins the executor-manager thread
+    and so returns only once every RUNNING work item finishes -- so `break`-ing out of the
+    cancel wait and falling out of `with ProcessPoolExecutor(...)` still blocked. The
+    pre-existing test for this asserted substrings of `inspect.getsource` and never ran
+    the wait, so it passed against the block.
+    """
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    class _Proc:
+        def __init__(self, alive: bool) -> None:
+            self._alive, self.terminated = alive, False
+
+        def is_alive(self) -> bool:
+            return self._alive
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+    class _Pool:
+        def __init__(self) -> None:
+            self.shutdowns: list[dict] = []
+            self._processes = {"1": _Proc(True), "2": _Proc(False), "3": _Proc(True)}
+
+        def shutdown(self, wait=True, cancel_futures=False):  # noqa: ANN001
+            self.shutdowns.append({"wait": wait, "cancel_futures": cancel_futures})
+
+    pool = _Pool()
+    _engine._abandon_pool_workers(pool)
+    # It must NOT wait, and it must drop everything still queued.
+    assert pool.shutdowns == [{"wait": False, "cancel_futures": True}]
+    assert not [s for s in pool.shutdowns if s["wait"]], "a waiting shutdown re-blocks Stop"
+    # Running workers are terminated (cancel() cannot stop them); a dead one is left alone.
+    assert [p.terminated for p in pool._processes.values()] == [True, False, True]
+
+
+def test_the_cancel_abandon_path_actually_calls_the_bounded_teardown() -> None:
+    # Wiring guard. Uses the function's BYTECODE names rather than a source substring:
+    # a getsource assertion passes with the call missing (that is how this class of bug
+    # shipped twice in this file).
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    names = set(_engine._migrate_tables_in_parallel.__code__.co_names)
+    assert "_abandon_pool_workers" in names, (
+        "the cancel abandon path no longer tears the pool down; Stop will block again"
+    )
+
+
+def test_a_teardown_failure_never_masks_the_cancel() -> None:
+    # This runs on the way out of a cancelled run: raising here would replace the user's
+    # Stop with a crash.
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    class _Hostile:
+        _processes = {"1": type("P", (), {
+            "is_alive": lambda self: True,
+            "terminate": lambda self: (_ for _ in ()).throw(OSError("gone")),
+        })()}
+
+        def shutdown(self, **_kw):
+            raise RuntimeError("pool already broken")
+
+    _engine._abandon_pool_workers(_Hostile())   # must not raise
+
+
+def test_the_memory_sampler_read_does_not_touch_the_stall_watchdog() -> None:
+    """A diagnostic sample must not look like progress.
+
+    `_loading_suffix` read the live job through `handle.update` -- the WRITE path -- and
+    `JobManager.apply_update` unconditionally refreshes `last_progress_at`, the stall
+    watchdog's liveness clock. So a wedged Full Load whose memory kept creeping was never
+    reaped: it sat in RUNNING forever with a frozen row count and no terminal affordance.
+    """
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    handle = _MemHandle(["ecommerce.product_media", "ecommerce.orders"])
+    logger = _engine._MemoryPressureLogger.__new__(_engine._MemoryPressureLogger)
+    logger._handle = handle
+    suffix = logger._loading_suffix()
+    assert "ecommerce.orders" in suffix and "ecommerce.product_media" in suffix
+    assert handle.snapshots == 1, "must read through the non-stamping snapshot path"
+    assert handle.updates == 0, "a diagnostic read must never stamp liveness"
+
+
+def test_job_handle_snapshot_reads_without_refreshing_liveness() -> None:
+    # The seam the fix above relies on, asserted against the REAL JobManager.
+    import threading
+
+    from dsql_migrator.core.job_manager import JobManager
+
+    clock = {"t": 1000.0}
+    manager = JobManager(clock=lambda: clock["t"])
+    started, release = threading.Event(), threading.Event()
+
+    def work(handle):
+        started.set()
+        release.wait(5.0)
+
+    job_id = manager.submit(work)
+    assert started.wait(5.0)
+    handle = manager.handle(job_id) if hasattr(manager, "handle") else None
+    from dsql_migrator.core.job_manager import JobHandle
+
+    handle = handle or JobHandle(manager, job_id)
+
+    before = manager._records[job_id].last_progress_at
+    clock["t"] += 10_000.0                      # a long silence
+    snap = handle.snapshot()
+    assert snap.job_id == job_id
+    assert manager._records[job_id].last_progress_at == before, (
+        "snapshot() must not refresh the watchdog clock"
+    )
+    handle.update(lambda job: None)             # the write path DOES refresh it
+    assert manager._records[job_id].last_progress_at > before
+    release.set()
+
+
+def test_source_retry_backoff_is_capped_and_heartbeats_while_it_waits() -> None:
+    """An uncapped backoff plus zero liveness = a healthy job reaped as "stalled".
+
+    `base * 2**(attempt-1)` had no clamp (unlike the house pattern in core/occ.py), and the
+    wait loop reported nothing -- so a wait longer than the 900s stall window made the
+    watchdog fail a job that was deliberately waiting, blaming "an unresponsive
+    source/target connection" for the tool's own chosen pause.
+    """
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    assert _engine._SOURCE_RETRY_MAX_DELAY_SECONDS > 0
+    # The clamp: attempt 12 with a 30s base would be 30 * 2**11 = 61440s uncapped.
+    for attempt in (1, 2, 5, 12, 30):
+        delay = min(_engine._SOURCE_RETRY_MAX_DELAY_SECONDS, 30.0 * (2 ** (attempt - 1)))
+        assert delay <= _engine._SOURCE_RETRY_MAX_DELAY_SECONDS
+    assert _engine._SOURCE_RETRY_MAX_DELAY_SECONDS < 900.0, (
+        "a single wait must stay under the JobManager stall window"
+    )
+
+    # The in-process path heartbeats through the progress queue every slice.
+    sent: list = []
+    slept: list = []
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    class _Q:
+        def put_nowait(self, msg):
+            sent.append(msg)
+
+    old_q, old_sleep = engine._worker_progress_queue, engine._time.sleep
+    engine._worker_progress_queue = _Q()
+    engine._time.sleep = slept.append
+    try:
+        ok = engine._wait_before_source_reread(
+            table_name="t", attempt=1, attempts=3, backoff=4.0,
+            cause="lost", cancelled=lambda: False,
+        )
+    finally:
+        engine._worker_progress_queue = old_q
+        engine._time.sleep = old_sleep
+    assert ok is True
+    assert len(slept) == 4                                   # 4 x 1.0s slices
+    assert sent == [engine._HEARTBEAT] * 4, sent             # one heartbeat per slice
+
+
+def test_the_drain_turns_a_heartbeat_into_liveness_only() -> None:
+    # The heartbeat must stamp the watchdog WITHOUT changing job state.
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    job = MigrationJob(job_id="j")
+    job.chunks = [ChunkState(chunk_id="t", status="PENDING")]
+    updates = {"n": 0}
+
+    class _H:
+        job_id = "j"
+        cancelled = False
+
+        def update(self, fn):
+            updates["n"] += 1
+            fn(job)
+
+    before = job.model_dump()
+    _H().update(lambda j: None)                 # what the drain does for a heartbeat
+    assert updates["n"] == 1                    # liveness stamped (via apply_update)
+    assert job.model_dump() == before           # and nothing about the job changed

@@ -383,9 +383,16 @@ class _ReconnectingCursor:
     def execute(self, statement: Any, parameters: Any = _EXECUTE_SENTINEL) -> Any:
         attempt = 0
         while True:
-            connection = self._owner._live()
-            cursor = connection.cursor()
+            # _live() (the DSQL connect factory) and .cursor() are INSIDE the try: the
+            # failure this budget exists for -- "a fresh reconnect can transiently hit
+            # DSQL's new-connection rate limit" (see the constants above) -- happens in
+            # exactly those two calls. With them outside, that failure escaped after 1 of
+            # 4 attempts, the table was reported as errored with a raw driver message,
+            # and the cut-over gate shut on a transient event the retry was meant to absorb.
+            cursor = None
             try:
+                connection = self._owner._live()
+                cursor = connection.cursor()
                 if parameters is _EXECUTE_SENTINEL:
                     cursor.execute(statement)
                 else:
