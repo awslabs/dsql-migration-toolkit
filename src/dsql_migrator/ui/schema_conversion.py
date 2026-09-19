@@ -163,6 +163,8 @@ from dsql_migrator.ui.schema_conversion_apply import (  # noqa: F401
     build_apply_objects,
     build_composite_conversion,
     build_identity_conversion,
+    predrop_owned_foreign_keys,
+    replace_table_names,
     composite_leading_candidates,
     composite_leading_from_ddl,
     default_applier_factory,
@@ -1192,6 +1194,13 @@ def build_schema_conversion_screen(
     existence_checker: Optional[TargetExistenceChecker] = None,
     on_continue_to_data_migration: Optional[Callable[[], None]] = None,
     cdc_active_check: Optional[Callable[[], bool]] = None,
+    # Called when a CONFIRMED REPLACE is about to recreate target TABLES. DSQL drops a
+    # table's foreign keys with the table, so every "N foreign keys applied" verdict the
+    # other steps hold becomes false at that moment -- and nothing else clears it, so the
+    # Data Migration card kept rendering a green "referential integrity is in place on the
+    # target" with its Apply button withdrawn, and the cut-over finish gate stayed
+    # un-blocked. Injected because this screen owns no data-migration/validation state.
+    on_target_tables_replaced: Optional[Callable[[], None]] = None,
     open_ai_scope: Optional[Callable[..., object]] = None,
     ai_post_event: Optional[Callable[..., object]] = None,
     ai_tools: "Optional[Sequence[Mapping[str, object]]]" = None,
@@ -1323,6 +1332,150 @@ def build_schema_conversion_screen(
             conv_state.replace_confirmed,
         )
 
+    def _foreign_keys_to_predrop(
+        objects: Sequence[ApplyObject],
+    ) -> "list[tuple[str, str]]":
+        """The ``(child_table, constraint)`` pairs a REPLACE of ``objects`` will drop. Pure.
+
+        The SAME computation the pre-drop itself runs, so the confirmation dialog cannot
+        disclose a different set from the one that is actually dropped. No target I/O.
+        Returns ``[]`` on any error -- a disclosure failure must never stop the dialog from
+        opening, and the pre-drop reports its own failures.
+        """
+        inventory = _inventory()
+        if inventory is None:
+            return []
+        try:
+            conversions = applied_table_conversions(
+                schema_converter.convert(
+                    inventory, SchemaConvertOptions(preserve_foreign_keys=True)
+                ),
+                conv_state.edited_target_ddls,
+                preserve_foreign_keys=True,
+            )
+            from dsql_migrator.ui.data_migration._full_load_engine import (
+                foreign_keys_blocking_replace,
+            )
+
+            return foreign_keys_blocking_replace(
+                conversions, replace_table_names(objects)
+            )
+        except Exception:  # noqa: BLE001 - disclosure is advisory
+            return []
+
+    def _invalidate_applied_foreign_keys() -> None:
+        """Tell the other steps their foreign-key verdicts no longer describe the target.
+
+        Fired on "a table is being replaced", NOT on "the pre-drop dropped something": the
+        selector is parent-side only (``DROP TABLE`` takes a table's OWN constraints with
+        it), so replacing a CHILD table destroys its foreign keys while producing no pair at
+        all. Over-firing is the safe direction -- the worst case is a "not yet applied"
+        prompt for constraints that are in fact still there, and re-applying one is a no-op.
+        """
+        if on_target_tables_replaced is None:
+            return
+        try:
+            on_target_tables_replaced()
+        except Exception:  # noqa: BLE001 - advisory; never fail the apply over it
+            logger.warning("Could not invalidate the applied-foreign-key state", exc_info=True)
+
+    def _predrop_replace_blocking_foreign_keys(
+        objects: Sequence[ApplyObject], beat: Optional[Callable[[], None]] = None
+    ) -> None:
+        """Drop this migration's foreign keys that would refuse a REPLACE's DROP TABLE.
+
+        Narrow: the selector is the SAME pure one the Full Load reload path uses
+        (``foreign_keys_blocking_replace``), so only constraints from this migration's own
+        conversion, whose PARENT table is in this apply set, are dropped -- a hand-made
+        constraint is never touched. Each drop is idempotent (``DROP CONSTRAINT IF EXISTS``).
+        A failure never fails the apply, but it IS reported (logger + activity log): silently
+        swallowing it left the operator with the recreate failure plus a hint telling them to
+        re-run, which would fail again for the same unreported reason.
+
+        The conversion is always rendered with ``preserve_foreign_keys=True`` regardless of
+        the current toggle. The question here is "what might THIS MIGRATION have put on the
+        target", and unticking the toggle empties ``foreign_key_ddls`` without removing
+        anything from the target -- so reading the toggle made the pre-drop select nothing
+        precisely when constraints were still live and still blocking.
+
+        ``beat`` stamps job liveness. One drop is a DSQL connect + DDL, and this whole pass
+        runs BEFORE the first per-object callback, so on a schema with many foreign keys it
+        was silence measured against the 900 s stall window -- the reap this apply path was
+        already bitten by once.
+        """
+        # Function-local imports: the engine module imports from this package's apply
+        # module, so a module-level import here would close a cycle.
+        from dsql_migrator.core.schema_applier import drop_foreign_key
+        from dsql_migrator.core.target_connection import DsqlConnector
+        from dsql_migrator.ui.data_migration._full_load_engine import (
+            foreign_keys_blocking_replace,
+        )
+
+        inventory = _inventory()
+        target_config = session.target_config
+        if inventory is None or target_config is None:
+            return
+        try:
+            conversions = applied_table_conversions(
+                # Converted here rather than through the render memo: that memo is keyed on
+                # the live toggle, so asking it for the preserved view would evict and
+                # re-fill it on every apply. One conversion per confirmed REPLACE is
+                # negligible beside the apply.
+                schema_converter.convert(
+                    inventory, SchemaConvertOptions(preserve_foreign_keys=True)
+                ),
+                conv_state.edited_target_ddls,
+                preserve_foreign_keys=True,
+            )
+            pairs = foreign_keys_blocking_replace(
+                conversions, replace_table_names(objects)
+            )
+        except Exception:  # noqa: BLE001 - advisory pre-pass; never break the apply
+            return
+        if not pairs:
+            return
+        connect = DsqlConnector(
+            target_config, aws_profile=getattr(session, "aws_profile", None)
+        ).connect
+
+        def _log(table_name: str, constraint_name: str) -> None:
+            log_activity(
+                ActivityCategory.SCHEMA_CONVERSION,
+                "foreign key removed for replace",
+                status=ActivityStatus.INFO,
+                target=f"{table_name}.{constraint_name}",
+                detail=(
+                    "dropped if present, so the referenced table can be recreated. "
+                    "Nothing re-creates it automatically: re-apply after the next load "
+                    'with "Apply foreign keys" on the Data Migration step (at cut over '
+                    "for a CDC migration)."
+                ),
+            )
+
+        def _log_failure(
+            table_name: str, constraint_name: str, exc: BaseException
+        ) -> None:
+            log_activity(
+                ActivityCategory.SCHEMA_CONVERSION,
+                "foreign key not removed for replace",
+                status=ActivityStatus.FAILURE,
+                target=f"{table_name}.{constraint_name}",
+                detail=(
+                    f"could not drop it before recreating the referenced table: "
+                    f"{type(exc).__name__}. The table's recreate will fail while this "
+                    "constraint exists — drop it manually and re-run the apply."
+                ),
+            )
+
+        def _drop(table_name: str, constraint_name: str) -> None:
+            if callable(beat):
+                beat()
+            drop_foreign_key(table_name, constraint_name, connection_factory=connect)
+
+        predrop_owned_foreign_keys(
+            pairs, _drop, on_dropped=_log, on_failed=_log_failure
+        )
+
     def _submit_apply(
         objects: list[ApplyObject],
         applier: SchemaApplier,
@@ -1394,8 +1547,25 @@ def build_schema_conversion_screen(
                     detail=detail,
                 )
 
+            # A confirmed REPLACE drops and recreates the selected tables, and DSQL refuses
+            # DROP TABLE while ANOTHER table's foreign key still references it. The apply
+            # already pre-drops the selection's VIEWS for exactly that reason, but not its
+            # foreign keys -- so a table referenced by a constraint THIS MIGRATION had just
+            # created (Data Migration -> "Apply foreign keys") failed to recreate. The
+            # Full Load "drop & reload" path has always pre-dropped them; both destructive
+            # paths now agree. run_schema_apply invokes this itself, under the same
+            # confirmed-REPLACE gate as the view pre-drop, so the per-object "Apply to
+            # target" button gets it too.
+            if mode is ApplyMode.REPLACE and confirmed and replace_table_names(objects):
+                # Any recreated table loses its OWN constraints as well (DROP TABLE takes
+                # them with it), and that produces no pre-drop pair, so the invalidation is
+                # keyed on "a table is being replaced", not on what the pre-drop dropped.
+                _invalidate_applied_foreign_keys()
             results = run_schema_apply(
                 objects,
+                predrop_foreign_keys=lambda objs: _predrop_replace_blocking_foreign_keys(
+                    objs, beat=getattr(_handle, "heartbeat", None)
+                ),
                 applier=applier,
                 mode=mode,
                 confirmed=confirmed,
@@ -1657,7 +1827,21 @@ def build_schema_conversion_screen(
                     conv_state.replace_confirmed = False
                 _refresh_view()
 
-            _open_replace_dialog(replace_confirmation_message(existing), _confirmed)
+            # Name the foreign keys the pre-drop will remove. They live on tables the
+            # operator did NOT select, so a dialog listing only the selection understated
+            # what the confirmation authorises.
+            _fk_pairs = _foreign_keys_to_predrop(
+                [
+                    obj
+                    for obj in _all_apply_objects(inventory)
+                    if only_names is None or obj.object_name in only_names
+                ]
+                if inventory is not None
+                else []
+            )
+            _open_replace_dialog(
+                replace_confirmation_message(existing, _fk_pairs), _confirmed
+            )
             return
         _run_bulk_apply(only_names, merge=merge)
         # SKIP submits immediately; refresh here so the in-progress panel and
@@ -1751,8 +1935,14 @@ def build_schema_conversion_screen(
             )
             return None
 
+        if mode is ApplyMode.REPLACE and confirmed and replace_table_names(one):
+            _invalidate_applied_foreign_keys()
         results = await _run.io_bound(
-            run_schema_apply, one, applier=applier, mode=mode, confirmed=confirmed
+            run_schema_apply, one, applier=applier, mode=mode, confirmed=confirmed,
+            # The single-object path forces REPLACE for any EDITED object even in global
+            # SKIP mode, so it is the likeliest route straight after a key edit -- and it
+            # reproduced the recreate failure verbatim until it was given the pre-drop too.
+            predrop_foreign_keys=_predrop_replace_blocking_foreign_keys,
         )
         conv_state.merge_apply_results(results)
         result = results[0] if results else None
@@ -1826,8 +2016,23 @@ def build_schema_conversion_screen(
 
                 return _run()
 
+            # The per-object path pre-drops too (the seam lives inside run_schema_apply),
+            # so it must disclose the same set. Built from THIS object's apply units.
+            _inv = _inventory()
+            _one = (
+                [
+                    obj
+                    for obj in _all_apply_objects(_inv)
+                    if obj.object_name == object_name
+                ]
+                if _inv is not None
+                else []
+            )
             _open_replace_dialog(
-                replace_confirmation_message([object_name] if exists else []),
+                replace_confirmation_message(
+                    [object_name] if exists else [],
+                    _foreign_keys_to_predrop(_one) if _one else (),
+                ),
                 _confirmed,
             )
             return

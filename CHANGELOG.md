@@ -5,6 +5,68 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.471
+
+### Fixed
+
+- **Schema Conversion's destructive REPLACE could not recreate a table this migration's own
+  foreign keys referenced.** Reported live: with 6 preserved foreign keys applied, editing two
+  primary keys and re-applying all 7 objects as Replace reported *created: 6, failed: 1* —
+  `ecommerce.categories` could not be recreated because `ecommerce.products.fk_products_category`
+  still depended on it. The apply pre-dropped the selection's **views** for exactly this
+  reason but not its **foreign keys**, while Full Load's "drop & reload" path had always
+  pre-dropped them. Both destructive paths now agree: the pre-drop uses the SAME pure selector
+  (`foreign_keys_blocking_replace`), so only constraints from this migration's own conversion
+  whose parent is being recreated are touched — a hand-made constraint is never dropped — and
+  each drop is idempotent and reported to the activity log.
+  - **The pre-drop lives inside `run_schema_apply`, beside its view sibling.** Wiring it into
+    the bulk caller alone left the per-object **"Apply to target"** button reproducing the
+    failure verbatim — and that is the likelier route straight after a key edit, because an
+    edited object forces REPLACE even in global SKIP mode.
+  - A pre-drop failure is now **reported** (logger + activity log), not swallowed. Silently
+    skipping it left the operator with the recreate failure plus a hint telling them to
+    re-run, which would fail again for the same unreported reason.
+  - The selector no longer reads the live "preserve foreign keys" toggle: unticking it empties
+    the generated FK DDL without removing anything from the target, so the pre-drop selected
+    nothing exactly when constraints were still live and still blocking.
+  - It stamps job liveness. The whole pass runs before the first per-object callback, so on a
+    schema with many foreign keys it was silence measured against the 900 s stall window.
+- **The failure text asserted the tool had not created the constraint it had just created.** It
+  said *"This migration did not create it, so the tool will not remove it"* on the strength of
+  the reload path pre-dropping owned constraints — a premise that never held for this path. It
+  now states only what it can know, and is short enough that the durable record's 200-character
+  detail keeps the **action** rather than cutting it mid-clause.
+- **Both later steps kept claiming referential integrity was in place after a REPLACE dropped
+  it.** DSQL drops a table's foreign keys with the table and nothing cleared the verdicts, so
+  Data Migration rendered a green *"N applied — referential integrity is in place on the
+  target"* with its Apply button withdrawn, and cut over's finish gate stopped blocking with
+  nothing enforced. A confirmed REPLACE of any table now clears both. It is keyed on *a table
+  is being replaced*, not on what the pre-drop dropped: the selector is parent-side only, so
+  replacing a **child** destroys its own foreign keys while producing no pair at all.
+- **The REPLACE confirmation dialog now names the foreign keys it will drop.** They sit on
+  tables the operator did **not** select, so a dialog listing only the selection understated
+  what the confirmation authorises (Property 12), and nothing re-creates them afterwards.
+- **Removed three more claims that the tool re-creates foreign keys automatically** — the Full
+  Load pre-drop's own activity detail, the apply hint's fallback, and a `validator` docstring.
+  Nothing has done that since v0.1.461; they are the explicit "Apply foreign keys" action.
+
+### Tests
+
+- 3884 green (+11), including a new `tests/test_schema_conversion_apply.py`. Seven mutations
+  checked, each caught — removing the seam from `run_schema_apply`, running it for an
+  unconfirmed REPLACE, letting a seam failure fail the apply, dropping the dialog disclosure,
+  leaving `proceed_without_foreign_keys` standing, restoring the ownership claim, and making a
+  pre-drop failure silent again (that last one exposed a missing assertion on the first pass).
+- The structural test that only grepped the screen for a call site is gone: it was satisfied by
+  the bulk path alone, which is precisely how the per-object regression hid.
+
+### Known gaps
+
+- Not yet verified live end-to-end (6 foreign keys applied → edit two keys → REPLACE all 7 →
+  expect `failed: 0`); the change is unit- and mutation-checked only.
+- Pre-existing and out of scope: a REPLACE invalidates nothing ELSE about the superseded run,
+  so the Full Load panel above still reads "complete — all N tables loaded every source row".
+
 ## v0.1.470
 
 ### Changed

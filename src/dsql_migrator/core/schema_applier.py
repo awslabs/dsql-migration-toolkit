@@ -898,8 +898,15 @@ def dependent_objects_hint(error_text: str) -> str:
     # depends on table orders". It used to fall through to the view fallback below, which
     # blamed a view and told the user to select the dependent object in the object browser
     # -- impossible for a foreign key, which is not an item there. So name the constraint
-    # and give an action that exists. (The reload path now pre-drops the FKs this migration
-    # owns, so reaching this text means the constraint is NOT ours to remove.)
+    # and give an action that exists.
+    #
+    # It must NOT assert whose the constraint is. This text used to say "This migration did
+    # not create it, so the tool will not remove it" on the strength of the reload path
+    # pre-dropping the constraints this migration owns -- but Schema Conversion's REPLACE did
+    # NOT, so an operator who had just used the tool's own "Apply foreign keys" was told the
+    # tool did not create the constraint it had created minutes earlier. Both destructive
+    # paths pre-drop now, yet this function cannot see the preserved set, so it states only
+    # what it knows: the constraint blocks, it was not dropped, and here is the way out.
     constraints: list[str] = []
     for match in re.finditer(
         r"\bconstraint\s+([A-Za-z_][\w.\"$]*)\s+on\s+table\s+([A-Za-z_][\w.\"$]*)\s+"
@@ -913,22 +920,25 @@ def dependent_objects_hint(error_text: str) -> str:
     if constraints:
         listed = ", ".join(constraints)
         one = len(constraints) == 1
+        # Kept SHORT on purpose: the durable Full Load record truncates a detail at 200
+        # characters, so a long explanation was cut mid-clause and the action was the part
+        # lost. It also must not claim who owns the constraint (this function cannot know)
+        # nor that anything re-creates foreign keys automatically (nothing has since
+        # v0.1.461 -- they are the explicit "Apply foreign keys" action).
+        it_them = "it" if one else "them"
         return (
             f"Cannot replace this table: the foreign {'key' if one else 'keys'} {listed} "
-            f"still {'depends' if one else 'depend'} on it. This migration did not create "
-            f"{'it' if one else 'them'}, so the tool will not remove "
-            f"{'it' if one else 'them'} (it could not put "
-            f"{'it' if one else 'them'} back). Drop "
-            f"{'it' if one else 'them'} yourself and re-run, or choose Append instead of "
-            "Drop & reload. (Avoid DROP ... CASCADE, which the database suggests: it "
-            "would delete the dependent objects outright.)"
+            f"still {'depends' if one else 'depend'} on it and {'was' if one else 'were'} "
+            f"not dropped. Drop {it_them} and re-run, or use Append. (Not DROP ... CASCADE "
+            f"— it deletes dependents.) Re-apply foreign keys after the next load."
         )
     return (
         "Cannot replace this table: another object (a view or a foreign key) still "
         "depends on it. If it is a view, select it in the object browser as well and "
         "re-run the apply — it is then dropped before the table is recreated, and "
-        "recreated afterwards. If it is a foreign key this migration does not own, drop "
-        "it yourself and re-run, or choose Append instead of Drop & reload. (Avoid "
+        "recreated afterwards. If it is a foreign key, drop it and re-run, or choose "
+        "Append instead of Drop & reload; re-apply the foreign keys after the next load "
+        '("Apply foreign keys" on the Data Migration step). (Avoid '
         "DROP ... CASCADE, which the database suggests: it would delete the dependent "
         "object outright.)"
     )

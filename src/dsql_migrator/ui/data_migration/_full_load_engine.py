@@ -3971,8 +3971,14 @@ class BatchedTableMigrator:
                     status=ActivityStatus.INFO,
                     target=target,
                     detail=(
-                        "dropped so the referenced table can be recreated; the post-load "
-                        "foreign-key pass re-creates it after the load"
+                        # NOT "the post-load pass re-creates it": no pass has done that
+                        # since v0.1.461, when applying foreign keys became the explicit
+                        # "Apply foreign keys" action. Telling the operator it is handled
+                        # is how a constraint stays missing.
+                        "dropped so the referenced table can be recreated. Nothing "
+                        "re-creates it automatically: re-apply after this load with "
+                        '"Apply foreign keys" on the Data Migration step (at cut over '
+                        "for a CDC migration)."
                     ),
                 )
             except Exception:  # noqa: BLE001 - a real block still surfaces on the DROP

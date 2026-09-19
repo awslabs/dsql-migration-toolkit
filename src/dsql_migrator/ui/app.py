@@ -95,6 +95,35 @@ DATA_MIGRATION_STORE = DataMigrationStore()
 # Per-session validation options / report (process memory only).
 VALIDATION_STORE = ValidationStore()
 
+
+def _forget_applied_foreign_keys(session_id: str) -> None:
+    """Drop every "foreign keys applied" verdict for ``session_id``.
+
+    Called when a confirmed Schema Conversion REPLACE is about to recreate target TABLES:
+    DSQL drops a table's foreign keys with the table, so the verdicts held by Data Migration
+    ("N applied -- referential integrity is in place on the target", with its Apply button
+    withdrawn) and by cut over (a green "Applied N foreign key(s)", plus a finish gate that
+    stops blocking) become false at that moment. Nothing else cleared them.
+
+    Clearing is the fail-closed direction: the worst case is a prompt to re-apply constraints
+    that are in fact still present, and re-applying one is a no-op (42710). Best-effort per
+    store so one failure cannot stop the apply.
+    """
+    try:
+        _dm = DATA_MIGRATION_STORE.get_or_create(session_id)
+        _dm.set_fk_apply_result(None)
+        _dm.set_fk_apply_progress(0, 0)
+    except Exception:  # noqa: BLE001 - advisory; the apply must still run
+        logging.getLogger(__name__).warning(
+            "Could not clear the Full Load foreign-key result", exc_info=True
+        )
+    try:
+        VALIDATION_STORE.get_or_create(session_id).clear_cutover_outcomes()
+    except Exception:  # noqa: BLE001 - advisory
+        logging.getLogger(__name__).warning(
+            "Could not clear the cut-over foreign-key result", exc_info=True
+        )
+
 # Per-session Query Playground inputs/outputs (process memory only).
 PLAYGROUND_STORE = PlaygroundStore()
 
@@ -427,6 +456,13 @@ def build_page(
         cdc_active_check=lambda: cdc_streaming_started(
             DATA_MIGRATION_STORE.get_or_create(session_id), JOB_MANAGER
         ),
+        # A confirmed REPLACE recreates target tables, and DSQL drops a table's foreign keys
+        # with it -- so both later steps' "N foreign keys applied" verdicts stop describing
+        # the target. Nothing else clears them, so Data Migration kept showing a green
+        # "referential integrity is in place" with its Apply button withdrawn, and cut over's
+        # finish gate stayed un-blocked with nothing enforced. Both setters are lock-guarded,
+        # so calling them from the apply worker thread is safe.
+        on_target_tables_replaced=lambda: _forget_applied_foreign_keys(session_id),
         open_ai_scope=_open_ai_scope,
         ai_post_event=_ai_post_event,
         # Give the per-object conversion chat the same read-only tools as Evaluation,

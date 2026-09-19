@@ -1204,3 +1204,28 @@ def test_dependent_objects_hint_fallback_mentions_both_causes() -> None:
     assert "view or a foreign key" in message
     assert "usually a view" not in message
     assert "Append" in message
+
+
+def test_dependent_objects_hint_does_not_claim_the_tool_did_not_create_the_fk() -> None:
+    """The message must not assert whose constraint it is -- it cannot know.
+
+    THE DEFECT (observed live): it said "This migration did not create it, so the tool will
+    not remove it", justified by the reload path pre-dropping the constraints this migration
+    owns. Schema Conversion's REPLACE did NOT pre-drop them, so an operator who had used the
+    tool's own "Apply foreign keys" minutes earlier was told the tool had not created the
+    constraint it had just created -- and was sent off to drop it by hand for a failure that
+    a re-run clears. This function has no access to the preserved set, so it must state only
+    what it knows.
+    """
+    from dsql_migrator.core.schema_applier import dependent_objects_hint
+
+    message = dependent_objects_hint(
+        "cannot drop table categories because other objects depend on it\n"
+        "DETAIL:  constraint fk_products_category on table products depends on "
+        "table categories\n"
+        "HINT:  Use DROP ... CASCADE to drop the dependent objects too."
+    )
+    assert "fk_products_category" in message
+    assert "did not create" not in message, message
+    # It offers the action that actually resolves an owned constraint.
+    assert "re-run" in message.lower(), message

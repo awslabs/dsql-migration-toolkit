@@ -5747,3 +5747,29 @@ def test_cutover_fk_reset_clears_the_job_and_progress_slots() -> None:
             "for the rest of the session"
         )
         assert state.cutover_fk_apply_progress is None, f"{name}() left stale progress"
+
+
+def test_clear_cutover_outcomes_forgets_every_fk_verdict() -> None:
+    """A schema REPLACE drops the target's foreign keys, so cut over must forget its verdict.
+
+    Without this the cut-over card kept showing a green "Applied N foreign key(s)" and the
+    finish gate stopped blocking with nothing enforced on the target. The gate reads
+    ``proceed_without_foreign_keys`` BEFORE the result, so clearing the result alone would
+    leave a previously-ticked "cut over without enforced foreign keys" standing.
+    """
+    from dsql_migrator.ui.validation import ValidationState
+
+    state = ValidationState()
+    state.set_cutover_fk_apply((6, 0, 0))
+    state.set_cutover_fk_apply_job("job-1")
+    state.set_cutover_fk_apply_progress(6, 6)
+    state.proceed_without_foreign_keys = True
+
+    state.clear_cutover_outcomes()
+
+    assert state.cutover_fk_apply is None
+    assert state.cutover_fk_apply_job_id is None
+    assert state.cutover_fk_apply_progress is None
+    assert state.proceed_without_foreign_keys is False, (
+        "a stale 'proceed without foreign keys' would un-block the finish gate on its own"
+    )

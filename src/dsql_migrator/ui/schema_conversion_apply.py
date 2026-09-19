@@ -171,6 +171,8 @@ _SCHEMA_KIND = "SCHEMA"
 # table's DROP during a destructive REPLACE, so apply-set views are dropped in a
 # pre-pass before any table is recreated (see _predrop_dependent_views).
 _VIEW_KIND = "VIEW"
+# parse_create_object's kind for a table, used to select the REPLACE's table targets.
+_TABLE_KIND = "TABLE"
 
 
 def _describe_ddl(ddl: str) -> tuple[str, Optional[str]]:
@@ -902,6 +904,83 @@ def _view_create_ddls(objects: Sequence[ApplyObject]) -> list[str]:
     return view_ddls
 
 
+def replace_table_names(objects: Sequence[ApplyObject]) -> list[str]:
+    """Return the names of the TABLES this apply set will recreate, in order. Pure.
+
+    A REPLACE drops and recreates every selected object, so these are exactly the tables
+    whose ``DROP TABLE`` an inbound foreign key can refuse. Feeds
+    ``foreign_keys_blocking_replace`` to select the constraints to pre-drop -- the same
+    selector the Full Load "drop & reload" path uses, so both paths agree on what is ours.
+    Non-table statements (a view, an index, the schema scaffolding) are ignored.
+    """
+    from dsql_migrator.core.schema_applier import (
+        SchemaApplyError,
+        parse_create_object,
+    )
+
+    names: list[str] = []
+    for obj in objects:
+        for ddl in obj.ddls:
+            try:
+                # parse_create_object, NOT _describe_ddl: the latter returns a display
+                # LABEL ("TABLE categories"), which would never match a conversion key.
+                name, kind = parse_create_object(ddl)
+            except SchemaApplyError:
+                continue  # a placeholder / unparseable statement is not a table
+            if kind == _TABLE_KIND and name and name not in names:
+                names.append(name)
+    return names
+
+
+def predrop_owned_foreign_keys(
+    pairs: "Sequence[tuple[str, str]]",
+    drop_fk: "Callable[[str, str], None]",
+    on_dropped: "Optional[Callable[[str, str], None]]" = None,
+    on_failed: "Optional[Callable[[str, str, BaseException], None]]" = None,
+) -> list[tuple[str, str]]:
+    """Drop the ``(child_table, constraint)`` foreign keys blocking a REPLACE.
+
+    The counterpart of :func:`_predrop_dependent_views` for foreign keys, and of the Full
+    Load reload path's ``predrop_blocking_foreign_keys``. Schema Conversion's REPLACE
+    pre-dropped only VIEWS, so a table referenced by a foreign key THIS MIGRATION had just
+    created (via "Apply foreign keys") failed to recreate -- and the failure text told the
+    operator the constraint was not the tool's to remove. The two destructive paths now
+    behave the same way.
+
+    ``pairs`` must already be narrowed to this migration's own constraints
+    (``foreign_keys_blocking_replace``), so a hand-made constraint is never touched. Each
+    drop is idempotent (``DROP CONSTRAINT IF EXISTS``) and best-effort: an error is
+    swallowed so the per-object apply still surfaces the real failure rather than this
+    pre-pass masking it. Returns the pairs it dropped, for the caller to report.
+    """
+    dropped: list[tuple[str, str]] = []
+    for table_name, constraint_name in pairs:
+        try:
+            drop_fk(table_name, constraint_name)
+        except Exception as exc:  # noqa: BLE001 - never fail the apply over the pre-pass
+            # REPORT it. Swallowing it silently left the operator with the recreate failure
+            # and a hint telling them to re-run -- which would fail again for the same
+            # unreported reason, forever. The per-object apply still surfaces its own error;
+            # this says WHY the pre-drop that should have prevented it did not happen.
+            logger.warning(
+                "Could not pre-drop foreign key %s.%s before the replace",
+                table_name, constraint_name, exc_info=True,
+            )
+            if on_failed is not None:
+                try:
+                    on_failed(table_name, constraint_name, exc)
+                except Exception:  # noqa: BLE001 - reporting must not break the pre-pass
+                    pass
+            continue
+        dropped.append((table_name, constraint_name))
+        if on_dropped is not None:
+            try:
+                on_dropped(table_name, constraint_name)
+            except Exception:  # noqa: BLE001 - reporting must not break the pre-pass
+                pass
+    return dropped
+
+
 def _predrop_dependent_views(
     objects: Sequence[ApplyObject], applier: SchemaApplier
 ) -> None:
@@ -933,6 +1012,13 @@ def run_schema_apply(
     confirmed: bool,
     on_object_start: Optional[Callable[[str], None]] = None,
     on_object_result: Optional[Callable[[ObjectApplyResult], None]] = None,
+    # Confirmed-REPLACE pre-pass for INBOUND FOREIGN KEYS, the sibling of the view pre-drop
+    # below. It lives HERE, not at a call site, because run_schema_apply has two callers --
+    # the bulk apply and the per-object "Apply to target" button -- and wiring it into only
+    # the bulk one left the single-object REPLACE reproducing the exact failure this fixes
+    # (an edited object forces REPLACE even in global SKIP mode). Injected rather than
+    # imported so this module keeps no target-connection dependency and stays unit-testable.
+    predrop_foreign_keys: Optional[Callable[[Sequence[ApplyObject]], None]] = None,
 ) -> list[ObjectApplyResult]:
     """Apply ``objects`` to the target and return a per-object result list.
 
@@ -969,6 +1055,14 @@ def run_schema_apply(
     # drop seam (test doubles need not), so SKIP mode and unconfirmed REPLACE are
     # untouched.
     if mode is ApplyMode.REPLACE and not require_confirmation:
+        # Foreign keys BEFORE views: a view blocking a table is independent of a constraint
+        # blocking it, and doing the cheap ordered thing first keeps one pass per dependency
+        # kind rather than interleaving them.
+        if predrop_foreign_keys is not None:
+            try:
+                predrop_foreign_keys(objects)
+            except Exception:  # noqa: BLE001 - advisory; per-object apply reports the truth
+                logger.warning("Foreign-key pre-drop pass failed", exc_info=True)
         _predrop_dependent_views(objects, applier)
     for obj in objects:
         if on_object_start is not None:
@@ -1045,7 +1139,10 @@ def apply_progress_text(done: int, total: int) -> str:
     return "Applying converted DDL to the target..."
 
 
-def replace_confirmation_message(existing_names: Sequence[str]) -> str:
+def replace_confirmation_message(
+    existing_names: Sequence[str],
+    foreign_keys: "Sequence[tuple[str, str]]" = (),
+) -> str:
     """Build the body shown in the action-time REPLACE confirmation dialog.
 
     Lists the existing target objects a REPLACE will DROP and recreate so the
@@ -1053,16 +1150,37 @@ def replace_confirmation_message(existing_names: Sequence[str]) -> str:
     Property 12), instead of a sticky checkbox set far from the action. When no
     existing object is known in scope (e.g. target introspection is unavailable)
     the message still warns that any existing object would be dropped.
+
+    ``foreign_keys`` are the ``(child_table, constraint)`` constraints the apply will
+    pre-drop to clear the way. They are disclosed because they sit on tables the operator
+    did NOT select: the pre-drop happens on OTHER tables than the ones listed above, so
+    without naming them the dialog understates what the confirmation authorises -- and
+    nothing re-creates them afterwards (that is the explicit "Apply foreign keys" action).
+    Defaulted, so a caller with nothing to disclose is unchanged.
     """
     if existing_names:
         listed = ", ".join(sorted(existing_names))
-        return (
+        body = (
             f"REPLACE will DROP and recreate these existing target objects: "
             f"{listed}. This is destructive and cannot be undone."
         )
+    else:
+        body = (
+            "REPLACE will DROP and recreate any target object that already exists. "
+            "This is destructive and cannot be undone."
+        )
+    if not foreign_keys:
+        return body
+    names = ", ".join(
+        sorted(f"{table}.{constraint}" for table, constraint in foreign_keys)
+    )
+    one = len(list(foreign_keys)) == 1
     return (
-        "REPLACE will DROP and recreate any target object that already exists. "
-        "This is destructive and cannot be undone."
+        f"{body} It will also DROP the foreign "
+        f"{'key' if one else 'keys'} {names} — on {'a table' if one else 'tables'} you "
+        f"did not select — because {'it' if one else 'they'} would otherwise refuse the "
+        f"recreate. Nothing re-creates {'it' if one else 'them'}: re-apply with "
+        '"Apply foreign keys" after the next load.'
     )
 
 

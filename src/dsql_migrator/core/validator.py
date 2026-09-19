@@ -16,8 +16,9 @@ and produces a :class:`~dsql_migrator.core.models.ValidationReport`
   cross-engine form -- see the checksum note below); each table lists them in
   ``checksum_excluded_columns`` so a match is not read as "every column verified".
 - Optional orphan-record check (Requirement 6.3): Aurora DSQL now enforces foreign
-  keys, and the tool re-creates them after the load (at cut over for a CDC
-  migration). This check is the PRE-APPLY GATE for that step -- an enforced
+  keys, and the tool re-creates them through the explicit "Apply foreign keys" action
+  after the load (at cut over for a CDC migration) -- not automatically. This check is
+  the PRE-APPLY GATE for that step -- an enforced
   ``ADD CONSTRAINT`` fails if any child row has no matching parent -- and the
   integrity safety net when the user chose to strip foreign keys instead. It counts,
   for each preserved foreign-key rule

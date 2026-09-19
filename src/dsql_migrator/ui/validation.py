@@ -1508,6 +1508,24 @@ class ValidationState:
         # how far it has got instead of looking un-run.
         self._cutover_fk_apply_progress: Optional[tuple[int, int]] = None
 
+    def clear_cutover_outcomes(self) -> None:
+        """Forget every cut-over foreign-key outcome, under ONE lock acquisition.
+
+        Called when the target's schema is replaced underneath us (a confirmed Schema
+        Conversion REPLACE drops and recreates tables, and DSQL drops a table's foreign keys
+        with it). Without this the cut-over card kept showing a green "Applied N foreign
+        key(s)" and the finish gate stayed un-blocked with nothing enforced on the target.
+
+        One lock, not three setter calls: a render between them could observe the result
+        already cleared while ``proceed_without_foreign_keys`` still stood, which is exactly
+        the combination the gate reads first.
+        """
+        with self._lock:
+            self._cutover_fk_apply = None
+            self._cutover_fk_apply_job_id = None
+            self._cutover_fk_apply_progress = None
+            self.proceed_without_foreign_keys = False
+
     def set_cutover_fk_apply_job(self, job_id: Optional[str]) -> None:
         """Record the submitted cut-over foreign-key apply job (re-entrancy guard)."""
         with self._lock:

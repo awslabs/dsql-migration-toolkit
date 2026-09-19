@@ -18868,7 +18868,10 @@ def test_predrop_blocking_foreign_keys_drops_them_and_logs(monkeypatch) -> None:
     _Migrator().predrop_blocking_foreign_keys()
     assert dropped == [("ecommerce.order_items", "fk_order_items_orders")]
     detail = [k.get("detail", "") for _a, k in events if "removed for reload" in str(_a)]
-    assert detail and "post-load foreign-key pass re-creates it" in detail[0]
+    # The detail must NOT promise an automatic re-create: nothing has done that since
+    # v0.1.461, when applying foreign keys became the explicit "Apply foreign keys" action.
+    assert detail and "Nothing re-creates it automatically" in detail[0], detail
+    assert "Apply foreign keys" in detail[0], detail
 
 
 def test_predrop_blocking_foreign_keys_runs_before_the_load(monkeypatch) -> None:
@@ -21412,3 +21415,42 @@ def test_a_reload_that_replaces_a_table_clears_the_stale_fk_result() -> None:
     )
     assert "set_fk_apply_result(None)" in retry, retry
     assert retry.index("if retry_replace:") < retry.index("set_fk_apply_result(None)")
+
+
+def test_a_confirmed_schema_replace_forgets_the_applied_foreign_keys() -> None:
+    """A REPLACE recreates target tables, so both steps' FK verdicts stop being true.
+
+    DSQL drops a table's foreign keys with the table. Nothing cleared the verdicts, so Data
+    Migration kept rendering a green "N applied -- referential integrity is in place on the
+    target" with its Apply button withdrawn, and cut over's finish gate stopped blocking with
+    nothing enforced. Wired as an injected callback because Schema Conversion owns neither
+    store.
+    """
+    import inspect
+
+    import dsql_migrator.ui.app as app
+
+    src = inspect.getsource(app._forget_applied_foreign_keys)
+    assert "set_fk_apply_result(None)" in src, src
+    assert "set_fk_apply_progress(0, 0)" in src, src
+    assert "clear_cutover_outcomes()" in src, src
+
+    wiring = inspect.getsource(app)
+    assert "on_target_tables_replaced=" in wiring, "the screen is not given the callback"
+
+    # It must fire on "a table is being replaced", NOT on "the pre-drop dropped something":
+    # the selector is parent-side only, so replacing a CHILD table destroys its own foreign
+    # keys while producing no pair at all.
+    import dsql_migrator.ui.schema_conversion as sc
+
+    screen = inspect.getsource(sc.build_schema_conversion_screen)
+    assert screen.count("_invalidate_applied_foreign_keys()") >= 2, (
+        "both apply paths (bulk and per-object) must invalidate"
+    )
+    guard = "confirmed and replace_table_names("
+    assert guard in screen, screen[:0] or "not gated on a table replace"
+    body = screen[screen.index("def _invalidate_applied_foreign_keys"):]
+    body = body[:body.index("def _predrop_replace_blocking_foreign_keys")]
+    assert "foreign_keys_blocking_replace" not in body, (
+        "it must NOT be gated on the pre-drop's pairs -- a replaced CHILD produces none"
+    )
