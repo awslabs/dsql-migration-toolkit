@@ -5,6 +5,17 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.465
+
+### Changed
+
+- **Published the container image at `0.1.464` and repointed the `ContainerImageUri`
+  default** in `deploy/cloudformation.yaml` to
+  `public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.464`, so a fresh `git clone` deploy pulls
+  the image carrying the CDC per-value size-guard fix (v0.1.464) instead of the build that
+  still dead-letters `text` values DSQL accepts. Published to ECR Public and the us-east-1
+  private ECR; the release gate passed against a live cluster first. No app-code change.
+
 ## v0.1.464
 
 ### Fixed

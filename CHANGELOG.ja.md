@@ -5,6 +5,18 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.465
+
+### 変更
+
+- **コンテナイメージを `0.1.464` として公開し、`ContainerImageUri` のデフォルトを
+  repoint しました**（`deploy/cloudformation.yaml` ->
+  `public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.464`）。これにより、新規に `git clone`
+  して配置すると、DSQL が受け付ける `text` 値をまだデッドレターに送るビルドではなく、CDC の
+  値サイズガード修正（v0.1.464）を含むイメージを取得します。ECR Public と us-east-1 の
+  プライベート ECR に公開し、事前に実クラスタに対して release gate を通しています。
+  アプリコードの変更はありません。
+
 ## v0.1.464
 
 ### 修正

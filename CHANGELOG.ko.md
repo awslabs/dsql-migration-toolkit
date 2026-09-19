@@ -5,6 +5,17 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.465
+
+### 변경
+
+- **컨테이너 이미지를 `0.1.464`로 발행하고 `ContainerImageUri` 기본값을 repoint** 했습니다
+  (`deploy/cloudformation.yaml` -> `public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.464`).
+  이제 새로 `git clone` 해서 배포하면, DSQL이 받아들이는 `text` 값을 아직 DLQ로 보내는 빌드가
+  아니라 CDC 값 크기 가드 수정(v0.1.464)이 포함된 이미지를 받습니다. ECR Public과 us-east-1
+  프라이빗 ECR에 발행했고, 그 전에 실제 클러스터를 상대로 release gate를 통과했습니다.
+  앱 코드 변경은 없습니다.
+
 ## v0.1.464
 
 ### 수정
