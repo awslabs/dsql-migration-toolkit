@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.470
+
+### Changed
+
+- **Published `0.1.469` to all three registries and repointed the `ContainerImageUri`
+  default to it.** A fresh `git clone` deploy previously defaulted to `0.1.465`, which carries
+  connector plugin **v39** — the reverted per-type value guard — and none of the foreign-key
+  card fixes. `0.1.469` carries plugin **v40** (the documented flat 1 MiB per column) plus
+  v0.1.467–469's progress, stopped-pass and cut-over fixes. The live release gate passed
+  against a real cluster before each build. No app-code change in this release.
+  - ECR Public + us-east-1 private + ap-northeast-2 private all on `0.1.469`.
+  - The two live app stacks are **not** updated by this — they still run `0.1.465` until a
+    stack update is run explicitly.
+
 ## v0.1.469
 
 ### Fixed
