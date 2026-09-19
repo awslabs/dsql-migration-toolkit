@@ -81,7 +81,7 @@ PostgreSQL-16 wire(양쪽 모두 psycopg)이므로 DSQL이 지원하는 값은 �
 처리 — 미지원 타입은 remodel 대상으로 플래그, `numeric` 정밀도 클램핑, `DEFAULT`/serial/identity 미방출 —
 는 즉석 값 변환이 아니라 **Schema Conversion**에서 일어납니다.
 
-전체 매핑(및 "바이너리 값당 1 MiB 한도" 같은 DSQL 제약 처리)은
+전체 매핑(및 "값당 1 MiB 한도" 같은 DSQL 제약 처리)은
 [2장 §2.3](02-evaluation-and-schema-conversion.md#23-mysql--dsql-타입과-제약-처리-참조)과 Schema Conversion
 단계에 있습니다.
 
@@ -150,7 +150,7 @@ MySQL에서는 바이너리 로깅이 꺼져 있거나 권한이 제한된 경�
 
 ### 행 단위 quarantine (테이블은 계속 적재)
 
-적재 시 **DSQL이 특정 행을 거부**하면(SQLSTATE가 있는 에러 — 예: 1 MiB 초과 바이너리(`bytea`) 값, 제약 위반), 로더는
+적재 시 **DSQL이 특정 행을 거부**하면(SQLSTATE가 있는 에러 — 예: 1 MiB 초과 값, 제약 위반), 로더는
 테이블을 실패 처리하지 **않습니다.** 배치를 단일 문제 행까지 이진 분할해 그 행을 **quarantine**하고(그
 **기본 키와 사유만 기록 — 값은 절대 기록 안 함**) 나머지를 적재합니다. quarantine된 행은 다운로드
 가능한 에러 로그에 나타납니다.

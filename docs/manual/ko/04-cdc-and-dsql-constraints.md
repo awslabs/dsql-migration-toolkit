@@ -124,16 +124,15 @@ DSQL은 분산형이면서 PostgreSQL 호환이라, 싱크는 기존 MySQL/JDBC 
 
 ---
 
-## 4.5 값당 크기 한도, 그리고 DLQ
+## 4.5 1 MiB 값당 한도, 그리고 DLQ
 
-DSQL의 값당 상한은 **타입마다 다릅니다**: `bytea`는 1 MiB(1,048,576바이트)를 넘으면 거부되지만,
-`text`에는 1 MiB 상한이 **없습니다**(9.5 MiB까지 정상 저장됨을 실측 — 쓰기 트랜잭션당 10 MiB가
-실질적인 상한). 파이프라인은 초대형 **바이너리** 값을 **세 구간**으로 처리합니다:
+DSQL은 **약 1 MiB를 초과하는 단일 값**(`TEXT`/`bytea`)을 거부합니다. 파이프라인은 초대형 값을 **세
+구간**으로 처리합니다:
 
 | 값 크기 | 처리 |
 |---|---|
 | **≤ 1 MiB** | 정상 적용. |
-| **1 MiB – 8 MiB** | `text` 값은 DSQL이 받아들이므로 **정상 적용**됩니다. `bytea` 값은 싱크가 쓰기 **전에** 크기를 측정해 **DLQ로 격리**(quarantine)합니다(절대 적용 불가). 어느 쪽이든 이 크기의 레코드가 Kafka를 통과하려면 토픽·클라이언트 한도를 상향(기본 4 MiB, 최대 8 MiB). |
+| **1 MiB – 8 MiB** | 싱크가 쓰기 **전에** 각 값을 측정해 초대형 값을 **DLQ로 격리**(quarantine)합니다(절대 적용 불가). 그런 레코드가 DLQ에 닿도록 Kafka를 통과하려면 토픽·클라이언트 한도를 상향(기본 4 MiB, 최대 8 MiB). |
 | **> 8 MiB** | Kafka에 들어갈 수 없음. **캡처 단계에서 제외**해야 함: Debezium `column.exclude.list`가 초대형 LOB 컬럼을 드롭(Evaluation `OVERSIZED_LOB` 플래그로 구동)해 파이프라인에 닿지 않게 함. |
 
 ### DLQ로 가는 것
@@ -158,7 +157,7 @@ Full Load가 어떤 행을 격리했다면(초대형 값을 쓸 수 없었으므
 | 없는 행에 대한 소스 작업 | CDC 동작 | 결과 |
 |---|---|---|
 | `DELETE` | `DELETE … WHERE pk = ?`가 **0행**에 매칭됩니다. 싱크는 0행 delete를 에러로 취급하지 않으므로 조용히 적용·커밋됩니다. | **정상.** 의도한 최종 상태("그 행이 대상에 없음")가 이미 성립합니다. 이를 실패로 처리하면 멱등성이 깨집니다 — 재생·재시도된 delete는 항상 안전해야 합니다. |
-| 값을 해당 타입의 한도 아래로 줄이는 `UPDATE` | Debezium이 **after-image 전체**를 보내고 싱크가 `INSERT … ON CONFLICT (pk) DO UPDATE`를 씁니다. 기존 행이 없으므로 `ON CONFLICT`가 발동하지 않고 **INSERT**됩니다. | **갭이 스스로 치유됩니다.** 조치 불필요. |
+| 값을 1 MiB 아래로 줄이는 `UPDATE` | Debezium이 **after-image 전체**를 보내고 싱크가 `INSERT … ON CONFLICT (pk) DO UPDATE`를 씁니다. 기존 행이 없으므로 `ON CONFLICT`가 발동하지 않고 **INSERT**됩니다. | **갭이 스스로 치유됩니다.** 조치 불필요. |
 | 값이 여전히 초대형인 `UPDATE` | 싱크가 쓰기 **전에** 값을 측정하므로 같은 이유로 **DLQ**에 격리됩니다. | 갭 유지, 단 **가시적**입니다(DLQ 깊이 / 모니터의 "Quarantined"). |
 | *다른* 행의 `INSERT` | 영향 없음. | 정상. |
 
@@ -187,7 +186,7 @@ CDC 실행 중에는 Data Migration 화면이 테이블별 실시간 모니터�
 | **Inserts** | Full Load 이후 이 테이블에 적용된 CDC insert 누적 수 — 싱크가 실시간 보고하는 테이블별 **음수가 되지 않는** 누적 카운트(스캔 없음). |
 | **Updates** | Full Load 이후 이 테이블에 적용된 CDC update 누적 수 — 싱크가 실시간 보고하는 테이블별 **음수가 되지 않는** 누적 카운트(스캔 없음). |
 | **Deletes** | Full Load 이후 이 테이블에 적용된 CDC delete 누적 수 — 싱크가 실시간 보고하는 테이블별 **음수가 되지 않는** 누적 카운트(스캔 없음). |
-| **Quarantined** | **DLQ**로 격리된 변경 이벤트의 테이블별 수 — 영구 거부된 행(타입 불일치, 1 MiB 초과 `bytea` 값, 제약/스키마 드리프트), 싱크가 실시간 보고. |
+| **Quarantined** | **DLQ**로 격리된 변경 이벤트의 테이블별 수 — 영구 거부된 행(타입 불일치, 1 MiB 초과 초대형 값, 제약/스키마 드리프트), 싱크가 실시간 보고. |
 | **Source rows (est.)** | 스캔 없는 카탈로그 **추정치**(MySQL은 `information_schema.tables`, PostgreSQL은 `pg_class.reltuples`). **Target rows** — DSQL 정확 카운트. |
 | **Stream lag** | 타깃이 소스보다 **시간상** 얼마나 뒤처졌는지(아래 참고). |
 | **Consistency** | 색상 배지: 초록 *consistent* = 카운트 일치 · *replicating…* = 따라잡는 중 · 빨강 *rows missing* = 최신 변경은 도착했으나 중간에 행 유실 · 빨강 *data quarantined* = DLQ에 미적용 이벤트 존재. |

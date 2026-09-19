@@ -453,7 +453,7 @@ conversion (redesign).
 |---|---|---|---|---|
 | `CHAR(n)` | `char(n)` | `char(n)` | AUTO | |
 | `VARCHAR(n)` | `varchar(n)` | `varchar(n)` | AUTO | |
-| `TINYTEXT`/`TEXT`/`MEDIUMTEXT`/`LONGTEXT` | `text` | `text` | AUTO | `text` has **no 1 MiB cap** (measured intact at 9.5 MiB); a value is bounded by DSQL's **10 MiB per-write-transaction** limit, and for CDC by Kafka's ~8 MiB message cap → flag oversized LOB columns at Evaluation so they can be excluded at capture. |
+| `TINYTEXT`/`TEXT`/`MEDIUMTEXT`/`LONGTEXT` | `text` | `text` | AUTO | A single value **> ~1 MiB** is rejected by DSQL → per-row quarantine (Full Load) / DLQ (CDC); flag oversized LOB columns at Evaluation. |
 | `CHAR`/`VARCHAR`/`TEXT` with `COLLATE` (e.g. `utf8mb4_*_ci`) | same, **collation dropped** | `text` (collation dropped) | MANUAL | DSQL uses its default collation; a case-insensitive collation is not preserved → flagged MANUAL. |
 | `BINARY(n)` / `VARBINARY(n)` | `bytea` | `bytea` (raw bytes) | AUTO | The length modifier is dropped (PostgreSQL `bytea` takes none). |
 | `TINYBLOB`/`BLOB`/`MEDIUMBLOB`/`LONGBLOB` | `bytea` | `bytea` (raw bytes) | AUTO | Binary payload preserved byte-for-byte. |

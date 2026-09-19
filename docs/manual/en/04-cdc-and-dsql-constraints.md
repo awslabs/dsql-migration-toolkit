@@ -157,17 +157,15 @@ classic MySQL/JDBC writer. Here is what it does for each constraint:
 
 ---
 
-## 4.5 The per-value size limit, and the DLQ
+## 4.5 The 1 MiB per-value limit, and the DLQ
 
-DSQL rejects a **binary** (`bytea`) value larger than **1 MiB**; a `text` value has
-**no 1 MiB cap** (measured intact at 9.5 MiB) and is bounded instead by the sink's
-~8 MiB per-transaction chunk budget. The pipeline handles oversized values in
-**three bands**:
+DSQL rejects a **single value larger than ~1 MiB** (a `TEXT`/`bytea` value). The
+pipeline handles oversized values in **three bands**:
 
 | Value size | What happens |
 |---|---|
 | **≤ 1 MiB** | Applied normally. |
-| **1 MiB – 8 MiB** | A **text**/`json` value is **applied normally** — DSQL does not cap `text` at 1 MiB. A **binary** (`bytea`) value can never be applied: the sink measures each value **before writing** and **quarantines** the oversized one to the **DLQ**, while the rest of the record's table keeps flowing. To let such a record traverse Kafka at all (to be applied or dead-lettered), the per-table topic and client limits are raised (default 4 MiB, max 8 MiB). |
+| **1 MiB – 8 MiB** | The sink measures each value **before writing** and **quarantines** the oversized one to the **DLQ** (it can never be applied), while the rest of the record's table keeps flowing. To let such a record even traverse Kafka to be dead-lettered, the per-table topic and client limits are raised (default 4 MiB, max 8 MiB). |
 | **> 8 MiB** | Cannot enter Kafka at all. These must be **excluded at capture**: Debezium `column.exclude.list` drops the oversized LOB column (driven by the Evaluation `OVERSIZED_LOB` flag) so it never reaches the pipeline. |
 
 ### What gets dead-lettered
@@ -197,7 +195,7 @@ that same row changes later depends on the operation:
 | Source operation on the missing row | What CDC does | Result |
 |---|---|---|
 | `DELETE` | `DELETE … WHERE pk = ?` matches **0 rows**. The sink does not treat a 0-row delete as an error, so it is applied and committed silently. | **Correct.** The intended end state — "the row is not on the target" — already holds. Treating this as a failure would break idempotency: a replayed or retried delete must stay safe. |
-| `UPDATE` that shrinks the value back under its type's limit | Debezium sends the **full after-image** and the sink writes `INSERT … ON CONFLICT (pk) DO UPDATE`. With no existing row, `ON CONFLICT` never fires and the row is **inserted**. | **The gap heals itself.** No action needed. |
+| `UPDATE` that shrinks the value below 1 MiB | Debezium sends the **full after-image** and the sink writes `INSERT … ON CONFLICT (pk) DO UPDATE`. With no existing row, `ON CONFLICT` never fires and the row is **inserted**. | **The gap heals itself.** No action needed. |
 | `UPDATE` where the value is still oversized | The sink measures values **before** writing, so the record is quarantined to the **DLQ** for the same reason. | Gap persists, and it is **visible** (DLQ depth / "Quarantined" in the monitor). |
 | `INSERT` of a *different* row | Unaffected. | Normal. |
 
@@ -230,7 +228,7 @@ never runs a `COUNT(*)` against your production database. The columns:
 | **Inserts** | Cumulative CDC inserts applied to this table since Full Load — a **non-negative** per-table running count reported live by the sink (scan-free). |
 | **Updates** | Cumulative CDC updates applied to this table since Full Load — a **non-negative** per-table running count reported live by the sink (scan-free). |
 | **Deletes** | Cumulative CDC deletes applied to this table since Full Load — a **non-negative** per-table running count reported live by the sink (scan-free). |
-| **Quarantined** | Per-table count of change events set aside to the **DLQ** — permanently-rejected rows (bad type, an oversized `bytea` value over 1 MiB, constraint / schema-drift), reported live by the sink. |
+| **Quarantined** | Per-table count of change events set aside to the **DLQ** — permanently-rejected rows (bad type, oversized > 1 MiB value, constraint / schema-drift), reported live by the sink. |
 | **Source rows (est.)** | Scan-free catalog **estimate** (`information_schema.tables` for MySQL; `pg_class.reltuples` for PostgreSQL). **Target rows** — exact DSQL count. |
 | **Stream lag** | How far the target is behind the source **in time** (see below). |
 | **Consistency** | A colored badge: green *consistent* = counts match · *replicating…* = catching up · red *rows missing* = the newest change landed but rows went missing mid-stream · red *data quarantined* = the DLQ has un-applied events. |

@@ -85,28 +85,10 @@ public class DsqlSinkTask extends SinkTask {
   private static final String OCC_SQLSTATE = "40001";
 
   /**
-   * DSQL's per-value ceiling for a {@code bytea} column: 1 MiB, rejected as
-   * {@code ProgramLimitExceeded: datatype limit greater than 1048576 bytes not supported
-   * for bytea} (SQLSTATE 54000). Such a value can never be applied, so the sink quarantines
-   * it to the DLQ from a copy held in memory <em>before</em> attempting any DSQL write — see
-   * {@link #oversizedColumn}.
-   *
-   * <p><b>bytea ONLY — text is NOT capped at 1 MiB.</b> This guard used to apply 1 MiB to
-   * every String and byte[] value alike, which dead-lettered {@code text} values that DSQL
-   * accepts: measured live 2026-09-19 against a real cluster, a {@code text} value stores
-   * intact at 1 / 2 / 4 / 6 / 8 / 8.5 / 9 / 9.5 MiB and only fails at 10 MiB (the
-   * per-transaction modified-data limit, where the server severs the connection rather than
-   * returning an error), while {@code bytea} rejects anything over 1048576 bytes exactly as
-   * above. The earlier flat cap was calibrated on a June 2026 measurement when {@code text}
-   * did behave that way; DSQL has since raised it. Because {@code binary.handling.mode} is
-   * {@code bytes} (see {@code deploy/cdc-stack/cdc-stack.yaml}), a blob arrives as
-   * {@code byte[]} and text/json arrive as {@code String}, so the Java type IS the
-   * discriminator — see {@link #MAX_STRING_VALUE_BYTES}.
-   *
-   * <p>Left uncorrected this cost rows: Full Load (which reacts to the real DSQL error
-   * instead of pre-checking a size) migrates a 2 MiB {@code longtext} fine, while CDC
-   * dead-lettered the same value — so a Full Load + CDC migration silently diverged on
-   * exactly that column.
+   * DSQL rejects a single TEXT/bytea value larger than 1 MiB ("datatype limit
+   * greater than 1048576 bytes not supported"). Such a value can never be applied,
+   * so the sink quarantines it to the DLQ from a copy held in memory <em>before</em>
+   * attempting any DSQL write — see {@link #oversizedColumn}.
    *
    * <p><b>Why the dead-letter actually works.</b> A record only reaches
    * this task if the broker accepted it, and the MSK Serverless broker caps a
@@ -122,9 +104,9 @@ public class DsqlSinkTask extends SinkTask {
    * <p><b>The hard limit is prevention.</b> A value &gt;8 MiB can't enter Kafka at
    * all, so it must be removed at capture (Debezium {@code column.exclude.list},
    * driven by the Evaluation {@code OVERSIZED_LOB} rule). This guard handles the
-   * band each type can actually reject; prevention handles the &gt;8 MiB band.
+   * 1-8 MiB band (quarantine); prevention handles the &gt;8 MiB band.
    */
-  static final int DSQL_MAX_BYTEA_VALUE_BYTES = 1024 * 1024; // 1 MiB
+  static final int DSQL_MAX_VALUE_BYTES = 1024 * 1024; // 1 MiB
 
   /**
    * Per-transaction byte budget for chunking, with headroom under DSQL's 10 MiB
@@ -138,20 +120,6 @@ public class DsqlSinkTask extends SinkTask {
    * statement overhead + the conservative estimate.
    */
   static final long MAX_BATCH_BYTES = 8L * 1024 * 1024; // 8 MiB
-
-  /**
-   * Ceiling for a single {@code String} (text/json) value — the chunk byte budget itself.
-   *
-   * <p>DSQL accepts a {@code text} value up to just under the 10 MiB per-transaction limit
-   * (measured — see {@link #DSQL_MAX_BYTEA_VALUE_BYTES}), so there is no 1 MiB cap to enforce
-   * here. What DOES bound a String is the transaction it has to fit in: {@link
-   * Batches#partition} lets an oversized lone event form its own chunk, so a single value
-   * larger than the chunk budget is the one case that can never be applied — and at 10 MiB
-   * exactly the server drops the connection instead of returning an error, which is a far
-   * worse outcome than a dead-letter. Defined AS {@link #MAX_BATCH_BYTES} (not a second
-   * 8 MiB literal) so tuning the chunk budget can never leave this guard behind.
-   */
-  static final long MAX_STRING_VALUE_BYTES = MAX_BATCH_BYTES;
 
   /** Fixed per-value estimate for a non-string/non-bytea scalar (number/bool/timestamp). */
   private static final long SCALAR_VALUE_BYTES = 16L;
@@ -305,18 +273,17 @@ public class DsqlSinkTask extends SinkTask {
       if (event.isDelete() && !config.deleteEnabled()) {
         continue;
       }
-      // Size guard: a value DSQL cannot store can neither be applied nor retried, so
-      // quarantine it here (before any DSQL write) rather than let it stall the partition.
-      // The ceiling is PER TYPE -- 1 MiB for bytea, the chunk budget for text/json -- see
-      // oversizedColumn; a flat 1 MiB here used to dead-letter text values DSQL accepts.
+      // Size guard: a value over DSQL's 1 MiB limit can neither be applied nor
+      // dead-lettered through Kafka, so quarantine it here (before any DSQL
+      // write) rather than let it stall the partition.
       String oversized = oversizedColumn(event);
       if (oversized != null) {
         reportOrThrow(
             record,
             new DataException(
-                "Value for column '" + oversized + "' exceeds what DSQL can store for "
-                    + "that column's type; quarantined (exclude oversized LOB columns "
-                    + "at capture)."));
+                "Value for column '" + oversized + "' exceeds DSQL's "
+                    + DSQL_MAX_VALUE_BYTES + "-byte limit; quarantined "
+                    + "(exclude oversized LOB columns at capture)."));
         continue;
       }
       batch.add(new Applicable(record, event));
@@ -452,21 +419,12 @@ public class DsqlSinkTask extends SinkTask {
   }
 
   /**
-   * Return the first column whose value exceeds the ceiling DSQL enforces for ITS type, as
-   * {@code "<column> (<bytes> bytes > <limit>)"}, or {@code null} if every value fits.
-   *
-   * <p>The two ceilings differ by an order of magnitude and applying the lower one to both
-   * threw away rows the target would have taken: {@code byte[]} (a blob →
-   * {@code bytea}, since {@code binary.handling.mode} is {@code bytes}) is capped at
-   * {@link #DSQL_MAX_BYTEA_VALUE_BYTES}, while a {@code String} (text/json) is bounded only
-   * by {@link #MAX_STRING_VALUE_BYTES}. Numbers/booleans/timestamps are small and skipped.
-   * The UTF-8 byte length is what DSQL measures, so a String is sized by its encoded bytes.
-   *
-   * <p>Returning the measured size and the limit — not just the name — is what makes the
-   * dead-letter reason diagnosable: "over the limit" alone left the reader unable to tell a
-   * marginal value from a 9 MiB one, or which of the two ceilings applied.
+   * Return the name of the first column whose value exceeds DSQL's per-value
+   * byte limit, or {@code null} if all values fit. Only string/byte[] values are
+   * size-bounded (TEXT/bytea); numbers/booleans/timestamps are small. The UTF-8
+   * byte length is what DSQL measures, so a String is sized by its encoded bytes.
    */
-  static String oversizedColumn(ChangeEvent event) {
+  private static String oversizedColumn(ChangeEvent event) {
     if (event.isDelete()) {
       return null; // deletes carry only PK values, never a large payload
     }
@@ -474,20 +432,16 @@ public class DsqlSinkTask extends SinkTask {
     List<Object> vals = event.values();
     for (int i = 0; i < vals.size(); i++) {
       Object v = vals.get(i);
-      long bytes;
-      long limit;
+      int bytes;
       if (v instanceof String s) {
         bytes = s.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
-        limit = MAX_STRING_VALUE_BYTES;
       } else if (v instanceof byte[] b) {
         bytes = b.length;
-        limit = DSQL_MAX_BYTEA_VALUE_BYTES;
       } else {
         continue;
       }
-      if (bytes > limit) {
-        String name = i < cols.size() ? cols.get(i) : ("column[" + i + "]");
-        return name + " (" + bytes + " bytes > " + limit + ")";
+      if (bytes > DSQL_MAX_VALUE_BYTES) {
+        return i < cols.size() ? cols.get(i) : ("column[" + i + "]");
       }
     }
     return null;

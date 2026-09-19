@@ -392,7 +392,7 @@ Schema Conversion の後は、**DSQL ターゲットスキーマが確定** し�
 |---|---|---|---|---|
 | `CHAR(n)` | `char(n)` | `char(n)` | AUTO | |
 | `VARCHAR(n)` | `varchar(n)` | `varchar(n)` | AUTO | |
-| `TINYTEXT`/`TEXT`/`MEDIUMTEXT`/`LONGTEXT` | `text` | `text` | AUTO | `text` に 1 MiB の上限はありません — 上限は書き込みトランザクションあたり 10 MiB で、9.5 MiB の値が正常に格納されることを実測済みです。ただし CDC では Kafka のメッセージ上限があるため、約 8 MiB を超える列は **キャプチャ時に除外** する必要があります。特大サイズの LOB 列は Evaluation でフラグ付けされます。 |
+| `TINYTEXT`/`TEXT`/`MEDIUMTEXT`/`LONGTEXT` | `text` | `text` | AUTO | 単一の値が **> 約 1 MiB** の場合は DSQL に拒否されます → 行単位の隔離 (Full Load) / DLQ (CDC)。特大サイズの LOB 列は Evaluation でフラグ付けされます。 |
 | `COLLATE` 付きの `CHAR`/`VARCHAR`/`TEXT` (例: `utf8mb4_*_ci`) | 同一、**照合順序はドロップ** | `text` (collation dropped) | MANUAL | DSQL はデフォルトの照合順序を使用します。大文字小文字を区別しない照合順序は保持されないため MANUAL としてフラグ付けされます。 |
 | `BINARY(n)` / `VARBINARY(n)` | `bytea` | `bytea` (raw bytes) | AUTO | 長さ修飾子はドロップされます (PostgreSQL の `bytea` は取りません)。 |
 | `TINYBLOB`/`BLOB`/`MEDIUMBLOB`/`LONGBLOB` | `bytea` | `bytea` (raw bytes) | AUTO | バイナリペイロードをバイト単位で保持します。 |

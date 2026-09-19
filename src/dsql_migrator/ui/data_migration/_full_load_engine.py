@@ -1847,8 +1847,8 @@ def _migrate_one_table(
                 f"{outcome.rows_loaded:,} rows newly loaded"
                 f"{skipped_note}{quarantine_note}{excluded_note}"
                 + (
-                    " -- quarantined rows were DROPPED (e.g. a binary value over "
-                    "DSQL's 1 MiB bytea limit); see the error log and re-run after "
+                    " -- quarantined rows were DROPPED (e.g. a value over DSQL's "
+                    "~1 MiB per-value limit); see the error log and re-run after "
                     "fixing the source value"
                     if had_quarantine
                     else ""
@@ -2544,7 +2544,7 @@ def _finalize_run(
             status=ActivityStatus.SUCCESS,
             detail=(
                 f"{quarantined_rows} row(s) quarantined and ACCEPTED (permanently "
-                "dropped, e.g. a binary value over DSQL's 1 MiB bytea limit); the "
+                "dropped, e.g. a value over DSQL's ~1 MiB per-value limit); the "
                 f"target intentionally omits them. {counts.quarantined} table(s) "
                 "completed with accepted gaps -- the gap is reported in Validation."
             ),
@@ -2600,7 +2600,7 @@ def _finalize_run(
     if quarantine_only:
         guidance = (
             f"{quarantined_rows} row(s) were QUARANTINED (permanently dropped, "
-            "e.g. a binary value over DSQL's 1 MiB bytea limit) and are listed in "
+            "e.g. a value over DSQL's ~1 MiB per-value limit) and are listed in "
             "the downloadable error log by primary key. Fix the offending source "
             "value(s) and re-run Full Load (the idempotent re-load fills only the "
             "gap), or choose 'Accept quarantined rows & continue' to proceed to "

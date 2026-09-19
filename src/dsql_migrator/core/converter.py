@@ -2713,7 +2713,7 @@ def _key_size_warning(
 
 
 def _oversized_lob_warning(table: TableDef) -> Optional[ConversionWarning]:
-    """Warn about LOB/TEXT columns whose values can exceed what DSQL stores per value.
+    """Warn about LOB/TEXT columns whose values can exceed DSQL's 1 MiB per-value cap.
 
     The DDL converts and applies fine; the failure lands later, per ROW, during Full Load
     or CDC -- which is why it belongs on this screen too. Those rows are quarantined
@@ -2735,18 +2735,10 @@ def _oversized_lob_warning(table: TableDef) -> Optional[ConversionWarning]:
         kind=ConversionNoteKind.RECOMMENDATION,
         message=(
             f"Columns ({names}) are MySQL LOB/TEXT types that can hold more than Aurora "
-            "DSQL stores in one value (a blob becomes bytea, capped at 1 MiB; text has "
-            "no 1 MiB cap and is bounded by the 10 MiB per-transaction limit). The DDL "
-            "itself is fine — the limit bites per "
+            "DSQL's ~1 MiB per-value limit. The DDL itself is fine — the limit bites per "
             "ROW during migration: any oversized value is permanently dropped "
             "(quarantined in Full Load, dead-lettered in CDC) and reloading cannot fix "
-            "it. Check the largest values now; if any exceed the ceiling for their type, "
-            "move that content to Amazon S3 and store a reference instead."
-            "ROW during migration: any oversized value is permanently dropped "
-            "(quarantined in Full Load, dead-lettered in CDC) and reloading cannot fix "
-            "it. Check the largest values now; if any exceed the cap for its converted "
-            "type — 1 MiB for a blob column (bytea), or the ~10 MiB per-transaction "
-            "write limit for a text column — move that content to "
+            "it. Check the largest values now; if any exceed 1 MiB, move that content to "
             "Amazon S3 and store a reference instead."
         ),
     )

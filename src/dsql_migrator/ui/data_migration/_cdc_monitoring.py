@@ -1785,9 +1785,8 @@ def _render_cdc_lob_exclusion_panel(
 ) -> None:
     """Render the explicit, opt-in oversized-LOB column exclusion (H13).
 
-    Lists the columns the evaluation flagged as able to exceed what DSQL stores in
-    one value (bytea caps at 1 MiB; text is bounded by the 10 MiB per-transaction
-    limit) and lets the user exclude them. The selection is
+    Lists the columns the evaluation flagged as able to exceed the DSQL 1 MiB
+    per-value limit and lets the user exclude them. The selection is
     migration-wide: a ticked column is dropped from BOTH the Full Load INSERT list
     and CDC capture (Debezium ``column.exclude.list``) -- one choice, so the two
     data paths never disagree across the gapless handoff. Excluding is the only
@@ -1825,9 +1824,8 @@ def _render_cdc_lob_exclusion_panel(
             icon="data_object",
             header="No oversized LOB columns",
             body=(
-                "No LOB/TEXT columns in the selected tables can exceed what Aurora "
-                f"DSQL stores in one value (blob -> bytea caps at {_DSQL_VALUE_LIMIT_MIB} "
-                "MiB; text is bounded by the 10 MiB per-transaction limit) — nothing "
+                "No LOB/TEXT columns in the selected tables can exceed the "
+                f"Aurora DSQL {_DSQL_VALUE_LIMIT_MIB} MiB value limit — nothing "
                 "needs excluding from "
                 + ("this migration." if migration_wide else "CDC capture.")
             ),
@@ -1846,10 +1844,8 @@ def _render_cdc_lob_exclusion_panel(
         )
         if migration_wide:
             ui.label(  # type: ignore[attr-defined]
-                f"These {lob_noun} can hold values over what Aurora DSQL stores in "
-                f"one value (binary caps at {_DSQL_VALUE_LIMIT_MIB} MiB; text is "
-                "bounded by the 10 MiB per-transaction limit). Ticking one drops it "
-                "from this "
+                f"These {lob_noun} can hold values over the Aurora DSQL "
+                f"{_DSQL_VALUE_LIMIT_MIB} MiB limit. Ticking one drops it from this "
                 "migration entirely — the Full Load never writes it and (if CDC is "
                 "used) capture excludes it too, so the two stay in lockstep. Leave a "
                 "column ticked-off to load it normally; any single value that then "
@@ -1858,9 +1854,8 @@ def _render_cdc_lob_exclusion_panel(
             ).classes("text-xs text-gray-500")
         else:
             ui.label(  # type: ignore[attr-defined]
-                f"These {lob_noun} can hold values over what Aurora DSQL stores in "
-                f"one value (blob/bytea caps at {_DSQL_VALUE_LIMIT_MIB} MiB; text is "
-                f"bounded by the per-transaction limit). A value over the "
+                f"These {lob_noun} can hold values over the Aurora DSQL "
+                f"{_DSQL_VALUE_LIMIT_MIB} MiB limit. A value over the "
                 f"{_BROKER_MESSAGE_LIMIT_MIB} MiB broker limit can't be streamed at "
                 "all, so exclude such columns here to keep CDC from stalling. "
                 "Nothing is excluded unless you tick it."

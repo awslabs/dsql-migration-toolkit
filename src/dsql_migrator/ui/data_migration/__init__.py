@@ -3317,8 +3317,8 @@ def _connector_failure_detail(migration_state, view, name: str) -> str:
     depth = getattr(view, "dlq_depth", None)
     if depth:
         parts.append(
-            f"{depth} record(s) in the DLQ (rejected permanently, e.g. a binary value "
-            "over DSQL's 1 MiB bytea limit)"
+            f"{depth} record(s) in the DLQ (rejected permanently, e.g. a value over "
+            "DSQL's ~1 MiB per-value limit)"
         )
     summary = getattr(view, "error_summary", None)
     by_table = dict(getattr(summary, "errors_by_table", None) or {})

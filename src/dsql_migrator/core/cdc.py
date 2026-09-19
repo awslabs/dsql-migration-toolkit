@@ -389,9 +389,7 @@ class DebeziumSourceConfig(BaseModel):
         description=(
             "Fully-qualified columns (db.table.column) dropped at capture via "
             "Debezium column.exclude.list -- oversized LOB columns whose values "
-            "can exceed what DSQL stores in one value (bytea caps at 1 MiB; text "
-            "is bounded by the 10 MiB per-transaction limit) or the 8 MiB Kafka "
-            "message cap (spike H13). "
+            "can exceed the Aurora DSQL 1 MiB per-value limit (spike H13). "
             "Maps to the cdc-stack ColumnExcludeList parameter. Empty = none."
         ),
     )

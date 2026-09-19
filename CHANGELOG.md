@@ -5,6 +5,49 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.468
+
+### Fixed
+
+- **Reverted v0.1.464's and v0.1.467's claim that Aurora DSQL does not cap a `text` value at
+  1 MiB. It does — the claim was wrong, and this restores the documented limit everywhere.**
+  [Aurora DSQL's quotas page](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html)
+  states it plainly and it applies to **every type**: *Maximum size of a column that's not
+  part of an index — 1 MiB — `54000` — `ERROR: maximum column size exceeded`* (a row is
+  capped at 2 MiB, a write transaction at 10 MiB, and a protocol message at 10 MiB,
+  `08P01 FATAL: invalid message length`).
+  - **How the error was made.** A live probe inserted `"x" * n` into a `text` column and read
+    back `length(t)`; it reported success at 2 / 4 / 6 / 8 / 9.5 MiB, and that was taken as
+    evidence that the documented 1 MiB did not apply to text. The payload was the problem:
+    PostgreSQL TOAST **compresses**, a run of one character collapses to almost nothing, and
+    the cap is on the **stored** size — so the probe never approached the limit while
+    `length()` kept reporting the logical size. The connection dropping at exactly 10 MiB was
+    the **message-size** limit, not the transaction limit. A documented quota should not have
+    been overruled by a probe at all; the probe was not even measuring the right quantity
+    (`pg_column_size`, not `length`) with the right data (incompressible, not repeated).
+  - **What is restored:** the CDC sink's pre-write guard is a flat 1 MiB again for every type
+    (`PLUGIN_VERSION` v39 → **v40**, artifact rebuilt), and all 91 statements across the
+    manual, the UI strings and the READMEs are back to the 1 MiB limit.
+  - **What is kept:** the limitations table (en/ko/ja) now cites the quotas page and states
+    the figures exactly — 1 MiB per non-index **column**, 2 MiB per **row**, 10 MiB per write
+    transaction — including the row limit our docs never stated.
+  - **Impact while v39 shipped (images 0.1.464 / 0.1.465):** a 1–8 MiB text value was handed
+    to DSQL instead of being dead-lettered before the write, so DSQL rejected it (`54000`) and
+    the sink dead-lettered it anyway. Same outcome, reached the slow way, one wasted write
+    attempt per oversized row. **No data was lost or wrongly dropped in either version.**
+- **`scripts/cdc_dlq_demo.py` never actually produced a DLQ entry** (local script). Its
+  oversized `full_description` repeated a readable phrase, with a comment reasoning that "the
+  point is size, not incompressibility" — but the cap is on stored bytes, so 1.2 MiB of
+  repeated text compressed well under it and the row replicated normally. The payload is now
+  drawn from the full printable-ASCII set, the default is 1.6 MiB (≈1.39 MiB compressed), and
+  `--desc-mib` is validated against the **compressed** size instead of the logical one.
+
+### Unaffected
+
+- v0.1.467's "Apply foreign keys" progress fixes (per-FK reporting, providers instead of
+  values frozen at page render, and polling while the FK job runs) are unrelated to the limit
+  and stand as shipped.
+
 ## v0.1.467
 
 ### Fixed
