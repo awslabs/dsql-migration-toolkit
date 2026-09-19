@@ -502,6 +502,15 @@ def build_data_migration_screen(
         error_log = migration_state.error_log
 
         migration_state.clear_outputs()
+        # A new load supersedes any previous foreign-key application: nothing cleared
+        # `fk_apply_result`, so the card kept reporting "N applied -- referential integrity
+        # is in place" for constraints this run may be about to destroy (a replace DROPs the
+        # table, and DSQL drops its foreign keys with it). Clearing makes the step fall back
+        # to "N foreign key(s) not yet applied" with the action offered -- true and
+        # actionable. NOT done inside clear_outputs(): its other caller is the read-only
+        # prerequisite check, which must not touch foreign-key state.
+        migration_state.set_fk_apply_result(None)
+        migration_state.set_fk_apply_progress(0, 0)
         # Record WHICH prerequisite mode cleared the gate for this run. The reports
         # are not persisted, so the run-guard excuses an absent report once a run
         # exists; scoping that excuse to this mode is what stops a later switch to a
@@ -1251,6 +1260,16 @@ def build_data_migration_screen(
                     if retry_cdc_coexisting
                     else frozenset(migration_state.replace_targets) & set(names)
                 )
+                if retry_replace:
+                    # This retry will DROP+recreate these tables, and DSQL drops a table's
+                    # foreign keys with it -- so a previously-applied result no longer
+                    # describes the target. The reachable case is the tool's OWN recovery
+                    # advice: "Exclude column & reload" forces a replace for that table, and
+                    # the card went on claiming referential integrity was in place. An
+                    # append-only retry does NOT invalidate it (the constraints survive and
+                    # would reject a violating row), so this is scoped to replacements.
+                    migration_state.set_fk_apply_result(None)
+                    migration_state.set_fk_apply_progress(0, 0)
                 _retry_conversion = SchemaConverter(
                     source_type=source_config.source_type
                 ).convert(inventory)
@@ -1540,9 +1559,16 @@ def build_data_migration_screen(
                 )
 
             def fk_pending_count() -> int:
-                """Foreign keys still to apply, for the action's label and the warning."""
-                if migration_state.fk_apply_result is not None:
-                    return 0
+                """This run's TOTAL preserved-foreign-key count (static; no DB access).
+
+                It used to return 0 as soon as ``fk_apply_result`` was set, which hid a
+                STOPPED pass completely: the card reads this to work out how many foreign
+                keys a finished pass never reached (total - applied - skipped - failed), so
+                zeroing it made a 2-of-6 stop render as a green "2 applied / referential
+                integrity is in place" with the Apply button withdrawn -- and nothing ever
+                clears the result, so that screen was terminal. The renderer decides what to
+                SHOW; this only reports the denominator.
+                """
                 try:
                     return pending_foreign_key_count(migrator_factory(_fk_apply_inputs()))
                 except Exception:  # noqa: BLE001 - advisory count; never break the panel
@@ -1577,6 +1603,17 @@ def build_data_migration_screen(
                 fk_migrator = migrator_factory(fk_inputs)
 
                 total = pending_foreign_key_count(fk_migrator)
+                # CLEAR THE PREVIOUS RESULT, and do it BEFORE submitting. _fk_apply_running()
+                # returns False while a result exists, so a RESUMED pass (now reachable: the
+                # card keeps the action when a stopped pass left foreign keys unreached) would
+                # report as not-running for its whole duration -- stale summary, no spinner, no
+                # per-FK progress, no "Stop applying" (that branch owns the cancel), no poll
+                # re-arm, and an ENABLED Apply button the operator could click again to submit a
+                # second concurrent pass. Ordering is load-bearing: clearing AFTER submit can
+                # wipe a fast worker's fresh result and strand the card on "not yet applied".
+                # Placed after the inputs/count so a raise in migrator_factory leaves the
+                # previous result intact.
+                migration_state.set_fk_apply_result(None)
                 migration_state.set_fk_apply_progress(0, total)
 
                 def work(handle: JobHandle) -> None:

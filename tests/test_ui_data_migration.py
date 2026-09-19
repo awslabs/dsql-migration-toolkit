@@ -21133,3 +21133,282 @@ def test_the_fk_action_publishes_per_fk_progress_and_no_fake_completion() -> Non
     # The old finally wrote (total, total) unconditionally: with Stop that claimed a
     # partially-applied pass was complete.
     assert "set_fk_apply_progress(total, total)" not in src
+
+
+# --------------------------------------------------------------------------- #
+# A STOPPED foreign-key pass must not read as a clean success
+#
+# "Stop applying" breaks the engine's loop, so the foreign keys it never reached land in
+# no bucket: stopping after 2 of 6 returns (2, 0, 0). The card reported only the buckets,
+# so it rendered a GREEN "Foreign keys: 2 applied -- referential integrity is in place on
+# the target" while four constraints did not exist, and withdrew the Apply button. Nothing
+# clears fk_apply_result, so that screen was the end of the road: Start over was the only
+# way out. Present since v0.1.461; v0.1.467 only made it VISIBLE (before, the card needed a
+# manual page reload to update at all).
+# --------------------------------------------------------------------------- #
+
+
+class _FkCardUi:
+    """NiceGUI double that records notice text and buttons for the FK card."""
+
+    def __init__(self):
+        self.notices: list[str] = []
+        self.buttons: list[tuple[str, str]] = []
+        self.tones: list[str] = []
+
+    class _El:
+        def __init__(self, ui, kind="o", text=""):
+            self._ui, self._kind, self._text = ui, kind, text
+        def __enter__(self): return self
+        def __exit__(self, *_e): return False
+        def props(self, spec="", *_a, **_k):
+            if self._kind == "button":
+                self._ui.buttons.append((self._text, str(spec)))
+            return self
+        def tooltip(self, *_a, **_k): return self
+        def classes(self, *_a, **_k): return self
+        def __getattr__(self, _n): return lambda *_a, **_k: self
+
+    def button(self, text="", on_click=None, *_a, **_k):
+        return _FkCardUi._El(self, "button", str(text))
+
+    def label(self, text="", *_a, **_k):
+        self.notices.append(str(text))
+        return _FkCardUi._El(self)
+
+    def icon(self, name="", *_a, **_k):
+        self.tones.append(str(name))
+        return _FkCardUi._El(self)
+
+    def __getattr__(self, _n):
+        return lambda *_a, **_k: _FkCardUi._El(self)
+
+
+def _render_fk_card(*, pending, applied, terminal=True, connections_ready=True):
+    from dsql_migrator.ui.data_migration._full_load_ui import _render_foreign_key_action
+
+    ui = _FkCardUi()
+    _render_foreign_key_action(
+        ui, terminal=terminal, pending=pending, applied=applied,
+        apply_foreign_keys=lambda: None, connections_ready=connections_ready,
+    )
+    return ui, " ".join(ui.notices)
+
+
+def _has_apply_button(ui) -> bool:
+    return any(b[0] == "Apply foreign keys" for b in ui.buttons)
+
+
+def test_a_stopped_fk_pass_is_not_reported_as_referential_integrity_in_place() -> None:
+    # THE defect: 2 of 6 applied, then stopped.
+    ui, text = _render_fk_card(pending=6, applied=(2, 0, 0))
+    assert "Referential integrity is in place" not in text, (
+        "a stopped pass left 4 constraints missing; this claims the opposite: " + text
+    )
+    assert "2 of 6 applied" in text, text
+    assert "NOT reached" in text or "NOT in place" in text, text
+    # And it must stay actionable -- the operator who clicked Stop needs a way back.
+    assert _has_apply_button(ui), "the Apply action must remain so the pass can be resumed"
+
+
+def test_a_stopped_fk_pass_is_not_toned_as_success() -> None:
+    # The tone carries the severity in this design system, so assert it directly rather
+    # than inferring it from the copy.
+    import dsql_migrator.ui.data_migration._full_load_ui as flu
+
+    captured: list[str] = []
+    real = flu.render_notice
+    try:
+        flu.render_notice = lambda ui, *, tone="info", header="", body="", **k: (
+            captured.append(tone), real(ui, tone=tone, header=header, body=body, **k)
+        )[-1]
+        _render_fk_card(pending=6, applied=(2, 0, 0))
+    finally:
+        flu.render_notice = real
+    assert captured and "success" not in captured, captured
+
+
+def test_a_complete_fk_pass_still_reads_as_a_clean_success() -> None:
+    # The negative control: nothing outstanding must still be green, or the fix would just
+    # alarm every successful run.
+    import dsql_migrator.ui.data_migration._full_load_ui as flu
+
+    captured: list[str] = []
+    real = flu.render_notice
+    try:
+        flu.render_notice = lambda ui, *, tone="info", header="", body="", **k: (
+            captured.append(tone), real(ui, tone=tone, header=header, body=body, **k)
+        )[-1]
+        ui, text = _render_fk_card(pending=6, applied=(6, 0, 0))
+    finally:
+        flu.render_notice = real
+    assert "success" in captured, captured
+    assert "6 applied" in text and "of 6 applied" not in text, text
+    assert "Referential integrity is in place" in text, text
+    assert not _has_apply_button(ui), "nothing is outstanding, so offer no action"
+
+
+def test_a_pass_that_died_does_not_render_as_a_green_zero_applied() -> None:
+    # _apply_foreign_keys swallows an exception from the pass and returns (0, 0, 0). With
+    # the buckets alone that was a green "0 applied -- referential integrity is in place".
+    ui, text = _render_fk_card(pending=6, applied=(0, 0, 0))
+    assert "Referential integrity is in place" not in text, text
+    assert "0 of 6 applied" in text, text
+    assert _has_apply_button(ui)
+
+
+def test_skips_and_failures_are_still_reported_and_need_no_resume() -> None:
+    # Every FK was reached: 4 applied, 2 skipped for orphan rows. Outstanding is 0, so the
+    # card must NOT invent a "not reached" claim, and must not offer a pointless resume --
+    # re-running would only repeat the same orphan verdict.
+    ui, text = _render_fk_card(pending=6, applied=(4, 2, 0))
+    assert "2 skipped (orphan rows)" in text, text
+    assert "NOT reached" not in text, text
+    assert "4 applied" in text and "of 6 applied" not in text, text
+    assert not _has_apply_button(ui)
+
+
+def test_outstanding_is_not_invented_when_the_total_is_unknown() -> None:
+    # pending=0 means "no total available" (e.g. the advisory count failed). Deriving
+    # outstanding from it would report every applied FK as missing.
+    ui, text = _render_fk_card(pending=0, applied=(15, 0, 0))
+    assert "15 applied" in text and "NOT reached" not in text, text
+    assert not _has_apply_button(ui)
+
+
+def test_the_total_provider_no_longer_zeroes_itself_once_a_result_exists() -> None:
+    # The card derives "outstanding" as total - settled, so a provider that returns 0 as
+    # soon as fk_apply_result is set makes the whole fix a no-op -- outstanding is always 0
+    # in exactly the branch that needs it.
+    import inspect
+
+    import dsql_migrator.ui.data_migration as dm
+
+    src = inspect.getsource(dm.build_data_migration_screen)
+    start = src.index("def fk_pending_count()")
+    body = src[start:start + src[start:].index("def cancel_foreign_keys()")]
+    assert "if migration_state.fk_apply_result is not None:" not in body, (
+        "fk_pending_count must report the run's TOTAL; zeroing it on a result hides a "
+        "stopped pass entirely:\n" + body
+    )
+
+
+def test_resuming_a_stopped_fk_pass_reports_as_running() -> None:
+    """A resumed pass must clear the previous result, or it is invisible and unstoppable.
+
+    `_fk_apply_running()` returns False while `fk_apply_result` is set, and nothing used to
+    clear it. Keeping the Apply button after a stopped pass (so it can be resumed) therefore
+    opened a path where the resumed job reported NOT running for its whole duration: the card
+    re-rendered the stale "2 of 6 applied" summary with no spinner, no per-FK progress and no
+    "Stop applying" (the running branch owns the cancel), the poll never re-armed
+    (`if running or fk_running`), and the still-enabled Apply button could submit a SECOND
+    concurrent pass whose job id displaced the first -- leaving the first uncancellable.
+    """
+    import inspect
+
+    import dsql_migrator.ui.data_migration as dm
+
+    src = inspect.getsource(dm.build_data_migration_screen)
+    start = src.index("def apply_foreign_keys_now()")
+    body = src[start:start + src[start:].index("def _fk_apply_running()")]
+    assert "set_fk_apply_result(None)" in body, (
+        "the action must clear the previous result, or a resumed pass never reports as "
+        "running:\n" + body
+    )
+    # Ordering is load-bearing: clearing AFTER submit can wipe a fast worker's fresh result.
+    assert body.index("set_fk_apply_result(None)") < body.index("job_manager.submit(work)"), (
+        "the result must be cleared BEFORE the job is submitted"
+    )
+
+
+def test_the_denominator_falls_back_to_the_passs_own_total() -> None:
+    # `pending` is advisory: its provider returns 0 on ANY error and 0 by design for a CDC
+    # run. With a 0 total the outstanding count clamps to 0 and the card printed the exact
+    # green "referential integrity is in place" this branch exists to prevent -- so it falls
+    # back to the total the engine published on `progress`.
+    from dsql_migrator.ui.data_migration._full_load_ui import _render_foreign_key_action
+
+    ui = _FkCardUi()
+    _render_foreign_key_action(
+        ui, terminal=True, pending=0, applied=(2, 0, 0), progress=(2, 6),
+        apply_foreign_keys=lambda: None, connections_ready=True,
+    )
+    text = " ".join(ui.notices)
+    assert "Referential integrity is in place" not in text, text
+    assert "2 of 6 applied" in text and "of 0 applied" not in text, text
+    assert _has_apply_button(ui)
+
+
+def test_the_card_does_not_promise_an_action_it_will_not_render() -> None:
+    # "Apply them below" was printed even where the button is not rendered (load not
+    # terminal, or no handler wired), telling the operator to use a control that is absent.
+    from dsql_migrator.ui.data_migration._full_load_ui import _render_foreign_key_action
+
+    ui = _FkCardUi()
+    _render_foreign_key_action(
+        ui, terminal=True, pending=6, applied=(2, 0, 0),
+        apply_foreign_keys=None, connections_ready=True,   # nothing to click
+    )
+    text = " ".join(ui.notices)
+    assert "NOT reached" in text, text
+    assert "below" not in text, "promises a button that is not rendered: " + text
+    assert not _has_apply_button(ui)
+
+
+def test_resuming_says_what_it_costs() -> None:
+    # The outstanding-state notice (which carries the "reads the whole child table" warning)
+    # is suppressed under the applied summary, so this render is the only place the cost of
+    # resuming can be stated -- and resume re-checks EVERY foreign key, not just the rest.
+    ui, text = _render_fk_card(pending=6, applied=(2, 0, 0))
+    assert "EVERY foreign key" in text and "whole child table" in text, text
+
+
+def test_cutover_does_not_claim_foreign_keys_were_applied_automatically() -> None:
+    # Since v0.1.461 foreign keys are an explicit action, but the Cut over screen still told
+    # a Full-Load-only operator they "were applied automatically at the end of the load" --
+    # so someone who never clicked it, or clicked Stop, was told integrity was in place.
+    import inspect
+
+    import dsql_migrator.ui.validation as v
+
+    src = inspect.getsource(v)
+    assert "were applied automatically at the" not in src, (
+        "the cut-over copy still asserts the load applied the foreign keys"
+    )
+    assert 'explicit \\"Apply foreign keys\\" action' in src, (
+        "the copy must name the explicit action that does apply them"
+    )
+
+
+def test_a_reload_that_replaces_a_table_clears_the_stale_fk_result() -> None:
+    """A dropped table loses its foreign keys, so "N applied" must not survive the reload.
+
+    Structural, because the two write sites live inside closures of
+    ``build_data_migration_screen`` that cannot be driven without the whole screen. The
+    reachable case is the tool's OWN recovery advice: "Exclude column & reload" forces
+    ``set_replace_targets({table})``, DSQL drops that table's foreign keys with the table,
+    and nothing cleared ``fk_apply_result`` -- so the card went on reporting "referential
+    integrity is in place on the target" for constraints that no longer existed.
+    """
+    import inspect
+
+    import dsql_migrator.ui.data_migration as dm
+
+    src = inspect.getsource(dm.build_data_migration_screen)
+
+    # 1. a fresh load supersedes any earlier application outright.
+    fresh = src[src.index("migration_state.clear_outputs()"):]
+    fresh = fresh[:fresh.index("set_prereq_gated_mode")]
+    assert "set_fk_apply_result(None)" in fresh, (
+        "a new load must clear the previous foreign-key result:\n" + fresh
+    )
+
+    # 2. a retry clears it ONLY when it will actually replace a table -- an append-only
+    #    retry leaves the constraints in place, and clearing then would nag for no reason.
+    retry = src[src.index("retry_replace = ("):]
+    retry = retry[:retry.index("_retry_conversion = SchemaConverter")]
+    assert "if retry_replace:" in retry, (
+        "the retry's clear must be scoped to replacements:\n" + retry
+    )
+    assert "set_fk_apply_result(None)" in retry, retry
+    assert retry.index("if retry_replace:") < retry.index("set_fk_apply_result(None)")

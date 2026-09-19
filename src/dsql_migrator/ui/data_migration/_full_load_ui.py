@@ -2162,30 +2162,79 @@ def _render_foreign_key_action(
         return
     if applied is not None:
         got_applied, got_skipped, got_failed = (list(applied) + [0, 0, 0])[:3]
-        tone = "success" if not (got_skipped or got_failed) else "warning"
-        render_notice(
-            ui, tone=tone,
-            header=f"Foreign keys: {got_applied} applied",
-            body=(
+        # A finished pass does NOT mean every foreign key was dealt with. "Stop applying"
+        # breaks the engine's loop, so the foreign keys it never reached are in no bucket at
+        # all: stopping after 2 of 6 returns (2, 0, 0). Reporting only the buckets therefore
+        # announced a GREEN "2 applied -- referential integrity is in place on the target"
+        # while four constraints did not exist, and withdrew the Apply button; since nothing
+        # clears the result, that screen was the end of the road. `pending` is the run's
+        # TOTAL, so whatever the buckets do not account for is still outstanding. The same
+        # test catches a pass that DIED: _apply_foreign_keys swallows the exception and
+        # returns (0, 0, 0), which used to render as a green "0 applied".
+        settled = got_applied + got_skipped + got_failed
+        # The denominator must not fail OPEN. `pending` is an ADVISORY count: its provider
+        # swallows any error and returns 0, and it is 0 by design for a CDC run -- and with a
+        # 0 total, `outstanding` clamps to 0 and the card prints the very green "referential
+        # integrity is in place" this branch exists to prevent (and would read "2 of 0
+        # applied"). The pass itself publishes a total on `progress`, so fall back to that.
+        progress_total = int((tuple(progress or ()) + (0, 0))[1] or 0)
+        total = pending or progress_total
+        # max() still clamps: with NEITHER total available nothing is invented.
+        outstanding = max(0, total - settled)
+        tone = "success" if not (got_skipped or got_failed or outstanding) else "warning"
+        # Decided once, used by both the copy and the guard below, so the card cannot promise
+        # an action it does not render.
+        can_apply = bool(outstanding and terminal and apply_foreign_keys is not None)
+        detail = []
+        if got_skipped or got_failed:
+            detail.append(
                 f"{got_skipped} skipped (orphan rows), {got_failed} failed. "
                 "See the activity log for the per-constraint detail."
-                if (got_skipped or got_failed)
-                else "Referential integrity is in place on the target."
+            )
+        if outstanding:
+            detail.append(
+                f"{outstanding} foreign key(s) were NOT reached — the pass was stopped or "
+                "ended early, so referential integrity is NOT in place for them."
+            )
+            detail.append(
+                # Say what resuming costs: the pass re-checks every FK, so it is not a cheap
+                # "finish the last few" -- and this render is the only place that warning can
+                # appear, because the outstanding-state notice is suppressed here.
+                "Apply them below to finish; re-applying one that already exists is a harmless "
+                "no-op, but the pass re-checks EVERY foreign key and each check reads the whole "
+                "child table, so resuming costs about as much as the first run."
+                if can_apply else
+                "Apply them from this step once the load is settled and both connections are "
+                "verified."
+            )
+        if not detail:
+            detail.append("Referential integrity is in place on the target.")
+        render_notice(
+            ui, tone=tone,
+            header=(
+                f"Foreign keys: {got_applied} of {total} applied"
+                if outstanding else f"Foreign keys: {got_applied} applied"
+            ),
+            body=" ".join(detail),
+        )
+        if not can_apply:
+            return
+        # Fall through to the action so a stopped pass can be resumed. Withdrawing it left
+        # the operator who clicked Stop with no way back other than Start over.
+    elif not (terminal and pending and apply_foreign_keys is not None):
+        return
+    if applied is None:
+        render_notice(
+            ui, tone="warning",
+            header=f"{pending} foreign key(s) not yet applied",
+            body=(
+                "The load itself succeeded. Referential integrity is the next required step "
+                "and is NOT in place until you apply them. Each one is orphan-checked "
+                "first, which "
+                "reads the whole child table, so this can take several minutes on a large "
+                "schema — it is a separate step so it no longer holds up the load."
             ),
         )
-        return
-    if not (terminal and pending and apply_foreign_keys is not None):
-        return
-    render_notice(
-        ui, tone="warning",
-        header=f"{pending} foreign key(s) not yet applied",
-        body=(
-            "The load itself succeeded. Referential integrity is the next required step and "
-            "is NOT in place until you apply them. Each one is orphan-checked first, which "
-            "reads the whole child table, so this can take several minutes on a large "
-            "schema — it is a separate step so it no longer holds up the load."
-        ),
-    )
     with ui.row().classes("items-center gap-2 w-full"):
         btn = ui.button(
             "Apply foreign keys",

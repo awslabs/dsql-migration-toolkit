@@ -2555,10 +2555,11 @@ def test_cutover_section_apply_foreign_keys_blocked_until_cdc_drained_confirmed(
 
 
 def test_cutover_section_full_load_reoffers_skipped_foreign_keys() -> None:
-    # FIX 9: a Full-Load-only cut-over surfaces / re-offers the foreign keys (applied at
-    # load end) so any that were skipped/failed can be completed -- the runbook must not
-    # read fully-ready while referential integrity is not enforced. No CDC-drained gate
-    # (there is no live stream), so the apply fires immediately on click.
+    # FIX 9: a Full-Load-only cut-over surfaces / re-offers the foreign keys so any that
+    # were never applied, stopped part-way, skipped or failed can be completed -- the runbook
+    # must not read fully-ready while referential integrity is not enforced. No CDC-drained
+    # gate (there is no live stream), so the apply fires immediately on click.
+    # (This used to say "applied at load end"; since v0.1.461 they are an explicit action.)
     from dsql_migrator.ui.validation import _render_cutover_section
 
     provider_calls: list = []
@@ -2572,7 +2573,12 @@ def test_cutover_section_full_load_reoffers_skipped_foreign_keys() -> None:
     blob = " ".join(ui.texts)
     # The Full-Load FK section is shown (verification / re-apply), NOT hidden.
     assert "Verify foreign keys are enforced" in blob
-    assert "referential integrity is not fully enforced" in blob
+    assert "referential integrity is NOT fully enforced" in blob
+    # And it must NOT assert they were already applied for us: foreign keys have been an
+    # explicit action since v0.1.461, so an operator who never clicked it -- or who clicked
+    # "Stop applying" -- was being told integrity was already in place.
+    assert "were applied automatically" not in blob, blob
+    assert "explicit" in blob and "Apply foreign keys" in blob, blob
     fk_buttons = [(t, cb) for t, cb in ui.buttons if "Apply foreign keys" in t]
     assert len(fk_buttons) == 1
     # No CDC-drained confirmation checkbox for a Full-Load-only migration.
@@ -5606,3 +5612,138 @@ def test_the_validation_job_reports_liveness_per_table_and_per_page(monkeypatch)
         f"the validation job reported liveness {beats['n']} time(s); progress went only "
         "to the UI state, which is what got healthy runs reaped as stalled"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Cut-over "Apply foreign keys": one pass at a time, and it reports progress
+#
+# The action submitted a job and then said nothing at all -- no spinner, no count -- for a
+# pass that runs an O(child rows) orphan pre-gate per foreign key. On a real schema that is
+# minutes, so an operator reasonably concluded the click had not registered and clicked
+# again: a second CONCURRENT pass, each re-checking EVERY foreign key, and the newer job id
+# displaced the older so the first could no longer be tracked.
+# --------------------------------------------------------------------------- #
+
+
+def _cutover_fk_fixtures(monkeypatch, result=(1, 0, 0)):
+    """Session/stores/patches for driving _run_cutover_foreign_keys. Returns captured kwargs."""
+    from types import SimpleNamespace
+
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+    from dsql_migrator.core.models import (
+        SourceConnectionConfig, SourceType, TargetConnectionConfig,
+    )
+
+    inv = _fk_inventory()
+    eval_store = SimpleNamespace(
+        get_or_create=lambda sid: SimpleNamespace(result=SimpleNamespace(inventory=inv))
+    )
+    conv_store = SimpleNamespace(
+        get=lambda sid: SimpleNamespace(edited_target_ddls={}, preserve_foreign_keys=True)
+    )
+    session = SimpleNamespace(
+        target_config=TargetConnectionConfig(
+            cluster_endpoint="c.dsql.us-east-1.on.aws", region="us-east-1"
+        ),
+        aws_profile=None,
+        source_config=SourceConnectionConfig(
+            host="h", database="d", source_type=SourceType.MYSQL
+        ),
+    )
+    captured: dict = {"calls": 0}
+
+    def _fake_apply(conversions, connection_factory, child_pk_columns=None, **kw):
+        captured["calls"] += 1
+        captured.update(kw)
+        if callable(kw.get("on_progress")):
+            kw["on_progress"](1, 3)
+        return result
+
+    monkeypatch.setattr(engine, "apply_preserved_foreign_keys", _fake_apply)
+    monkeypatch.setattr(
+        "dsql_migrator.core.target_connection.DsqlConnector",
+        lambda *a, **k: SimpleNamespace(connect=lambda: object()),
+    )
+    return session, eval_store, conv_store, captured
+
+
+class _OneJobManager:
+    """Job manager double: runs the work inline and reports the job as still RUNNING.
+
+    Inline execution keeps the test deterministic; reporting RUNNING afterwards is what a
+    real multi-minute pass looks like to the second click.
+    """
+
+    def __init__(self):
+        self.submitted = 0
+
+    def submit(self, work):
+        self.submitted += 1
+        work(None)
+        return f"job-{self.submitted}"
+
+    def get_status(self, job_id):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(status="RUNNING", job_id=job_id)
+
+
+def test_cutover_fk_apply_refuses_to_start_a_second_concurrent_pass(monkeypatch) -> None:
+    from dsql_migrator.ui.validation import ValidationState, _run_cutover_foreign_keys
+
+    session, eval_store, conv_store, captured = _cutover_fk_fixtures(monkeypatch)
+    state = ValidationState()
+    jm = _OneJobManager()
+
+    for _ in range(3):  # an impatient operator clicking a silent button
+        _run_cutover_foreign_keys(
+            session, state, eval_store=eval_store, conversion_store=conv_store,
+            session_id="s", job_manager=jm, refresh=lambda: None,
+        )
+
+    assert jm.submitted == 1, (
+        f"{jm.submitted} concurrent foreign-key passes were submitted; each one re-runs the "
+        "orphan pre-gate over every foreign key"
+    )
+    assert state.cutover_fk_apply_job_id == "job-1", state.cutover_fk_apply_job_id
+
+
+def test_cutover_fk_apply_publishes_progress(monkeypatch) -> None:
+    from dsql_migrator.ui.validation import ValidationState, _run_cutover_foreign_keys
+
+    session, eval_store, conv_store, captured = _cutover_fk_fixtures(monkeypatch)
+    state = ValidationState()
+    _run_cutover_foreign_keys(
+        session, state, eval_store=eval_store, conversion_store=conv_store,
+        session_id="s", job_manager=None, refresh=lambda: None,
+    )
+    assert callable(captured.get("on_progress")), (
+        "the pass must be given a progress reporter, or a render during it looks un-run"
+    )
+    assert state.cutover_fk_apply_progress == (1, 3), state.cutover_fk_apply_progress
+
+
+def test_cutover_fk_reset_clears_the_job_and_progress_slots() -> None:
+    # A stale job id would make the guard refuse every future click ("one is already
+    # running") for the rest of the session.
+    from dsql_migrator.ui.validation import ValidationState
+
+    state = ValidationState()
+    state.set_cutover_fk_apply((2, 0, 0))
+    state.set_cutover_fk_apply_job("job-9")
+    state.set_cutover_fk_apply_progress(2, 6)
+    # The two paths that already reset _cutover_fk_apply: a NEW validation result
+    # (set_result) and clear_outputs(). Both must clear the new slots too.
+    for name, call in (
+        ("clear_outputs", lambda: state.clear_outputs()),
+        ("set_result", lambda: state.set_result(_cutover_summary())),
+    ):
+        state.set_cutover_fk_apply((2, 0, 0))
+        state.set_cutover_fk_apply_job("job-9")
+        state.set_cutover_fk_apply_progress(2, 6)
+        call()
+        assert state.cutover_fk_apply_job_id is None, (
+            f"{name}() left a stale job id, so the guard would refuse every later click "
+            "for the rest of the session"
+        )
+        assert state.cutover_fk_apply_progress is None, f"{name}() left stale progress"

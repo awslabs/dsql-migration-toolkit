@@ -5,6 +5,73 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.469
+
+### Fixed
+
+- **A STOPPED foreign-key pass reported itself as a clean success.** "Stop applying" breaks
+  the engine's loop, so the foreign keys it never reached land in no bucket at all: stopping
+  after 2 of 6 returns `(2, 0, 0)`. The card was toned and worded from those buckets alone, so
+  it announced a GREEN *"Foreign keys: 2 applied — referential integrity is in place on the
+  target"* while four constraints did not exist, and withdrew the Apply button. Nothing clears
+  the result, so that screen was the end of the road: **Start over** was the only way out.
+  Present since v0.1.461; v0.1.467 only made it visible (before, the card needed a manual page
+  reload to change at all). The card now derives what is still outstanding
+  (`total − applied − skipped − failed`), tones and words it accordingly
+  (*"2 of 6 applied … 4 were NOT reached"*), and **keeps the Apply action so the pass can be
+  resumed**. The same test catches a pass that DIED: `_apply_foreign_keys` swallows the
+  exception and returns `(0, 0, 0)`, which used to render as a green "0 applied".
+  - The count provider no longer returns 0 once a result exists — it reports the run's TOTAL,
+    which is the denominator the card needs. Zeroing it made the fix a no-op in exactly the
+    branch that needed it.
+  - It also no longer fails OPEN: that count is advisory (its provider swallows any error, and
+    it is 0 by design for a CDC run), so the denominator falls back to the total the pass
+    itself publishes on its progress — otherwise an unavailable count restored the original
+    false green and printed "2 of 0 applied".
+- **Resuming a stopped pass was invisible and unstoppable.** `_fk_apply_running()` reports
+  False while a result exists and nothing cleared it, so keeping the Apply button (above) first
+  exposed a resume path where the new job reported *not running* for its whole duration: the
+  stale summary re-rendered with no spinner, no per-FK progress and no "Stop applying" (that
+  branch owns the cancel), the poll never re-armed, and the still-enabled button could submit a
+  **second concurrent pass** whose job id displaced the first — leaving it uncancellable. The
+  action now clears the previous result **before** submitting (ordering matters: clearing after
+  submit can wipe a fast worker's fresh result).
+- **A reload that replaces a table no longer leaves a stale "N applied".** DSQL drops a table's
+  foreign keys with the table, and nothing cleared the result — so after the tool's own
+  recovery advice ("Exclude column & reload", which forces a replace for that table) the card
+  went on claiming referential integrity was in place for constraints that no longer existed. A
+  fresh load clears it outright; a retry clears it only when it will actually replace a table
+  (an append-only retry leaves the constraints intact).
+- **Cut over no longer claims the load applied the foreign keys for you.** Its Full-Load-only
+  copy said this schema's foreign keys *"were applied automatically at the end of the load"* —
+  untrue since v0.1.461, so an operator who never ran the action, or who stopped it, was told
+  referential integrity was already in place. It now names the explicit **"Apply foreign keys"**
+  action and says plainly that integrity is NOT enforced if it was never run, stopped part-way,
+  skipped or failed.
+- **Cut over's "Apply foreign keys" can no longer start two concurrent passes.** It submitted a
+  job and then reported nothing at all — no spinner, no count — for a pass that runs an
+  O(child rows) orphan pre-gate per foreign key, so on a real schema an operator reasonably
+  concluded the click had not registered and clicked again, each click costing another full
+  pass. It now records its job and refuses to start a second while one is live, and publishes
+  per-foreign-key progress.
+
+### Tests
+
+- 3872 green (+13). Eighteen mutations checked across the two rounds, each caught — including
+  toning from the buckets alone, withdrawing the action on a stopped pass, removing the
+  denominator fallback, dropping the result-clear (or moving it after submit), clearing the
+  result on an append-only retry, removing the cut-over guard or its progress reporter, and
+  leaving a stale cut-over job id (which would refuse every later click for the session).
+
+### Known gaps
+
+- Cut over still has **no truth source** for whether the foreign keys are actually enforced: the
+  false claim is gone and the idempotent apply is offered, but confirming the real state needs a
+  target-catalog probe, which is deliberately left for a separate change.
+- The cut-over screen installs no poll timer, so its new progress is visible on a refresh rather
+  than live.
+- v0.1.464's per-value guard remains **unverified live** (needs an MSK pipeline).
+
 ## v0.1.468
 
 ### Fixed

@@ -1498,6 +1498,37 @@ class ValidationState:
         # ADD CONSTRAINTs are deferred to cut over (they must not exist while the sink
         # streams out-of-order rows); this records the button's result. Lock-guarded.
         self._cutover_fk_apply: Optional[tuple[int, int, int]] = None
+        # The submitted apply job, so a second click cannot start a second CONCURRENT pass.
+        # Cut over gave no feedback while the pass ran -- no spinner, no count -- so on a
+        # real schema (minutes per pass) an operator reasonably concluded nothing had
+        # happened and clicked again, each click costing another full O(child rows) orphan
+        # pre-gate over EVERY foreign key.
+        self._cutover_fk_apply_job_id: Optional[str] = None
+        # (settled, total) published by the pass itself, so a render during the pass says
+        # how far it has got instead of looking un-run.
+        self._cutover_fk_apply_progress: Optional[tuple[int, int]] = None
+
+    def set_cutover_fk_apply_job(self, job_id: Optional[str]) -> None:
+        """Record the submitted cut-over foreign-key apply job (re-entrancy guard)."""
+        with self._lock:
+            self._cutover_fk_apply_job_id = job_id
+
+    @property
+    def cutover_fk_apply_job_id(self) -> Optional[str]:
+        with self._lock:
+            return self._cutover_fk_apply_job_id
+
+    def set_cutover_fk_apply_progress(
+        self, settled: int, total: int
+    ) -> None:
+        """Record how many foreign keys the running cut-over pass has finished."""
+        with self._lock:
+            self._cutover_fk_apply_progress = (int(settled), int(total))
+
+    @property
+    def cutover_fk_apply_progress(self) -> "Optional[tuple[int, int]]":
+        with self._lock:
+            return self._cutover_fk_apply_progress
 
     def set_cutover_fk_apply(self, result: "Optional[tuple[int, int, int]]") -> None:
         """Record the cut-over foreign-key apply outcome (applied, skipped, failed)."""
@@ -1640,6 +1671,8 @@ class ValidationState:
             self._cutover_identity_sync = None
             self._cutover_identity_sync_failed = None
             self._cutover_fk_apply = None
+            self._cutover_fk_apply_job_id = None
+            self._cutover_fk_apply_progress = None
             self.proceed_without_foreign_keys = False
 
     def set_identity_sync(
@@ -1786,6 +1819,8 @@ class ValidationState:
             self._cutover_identity_sync = None
             self._cutover_identity_sync_failed = None
             self._cutover_fk_apply = None
+            self._cutover_fk_apply_job_id = None
+            self._cutover_fk_apply_progress = None
             self.proceed_without_foreign_keys = False
 
 
@@ -2890,6 +2925,9 @@ def _run_cutover_foreign_keys(
         connect = DsqlConnector(target_config, aws_profile=aws_profile).connect
         result = apply_preserved_foreign_keys(
             applied, connect, child_pk_columns=child_pk_columns_for(inventory),
+            # Publish per-FK progress so a render during the pass reports how far it has
+            # got. The pass can run for minutes and said nothing at all before.
+            on_progress=validation_state.set_cutover_fk_apply_progress,
             # Per FK and per poll of a still-building parent index. This pass is an
             # O(rows) orphan pre-gate per FK plus up to 300 s per distinct parent index,
             # so at scale it ran well past the watchdog's window with nothing reported and
@@ -2902,7 +2940,21 @@ def _run_cutover_foreign_keys(
             refresh()
 
     if job_manager is not None:
-        job_manager.submit(_work)
+        # RE-ENTRANCY GUARD: refuse to start a second pass while one is live. Without it a
+        # second click submitted a second CONCURRENT pass -- both re-running the orphan
+        # pre-gate over every foreign key -- and the newer job id displaced the older, so
+        # the first could no longer be tracked at all.
+        running = validation_state.cutover_fk_apply_job_id
+        if running:
+            try:
+                live = job_manager.get_status(running)
+            except Exception:  # noqa: BLE001 - an unknown id is not a live job
+                live = None
+            if live is not None and getattr(live, "status", None) in ("PENDING", "RUNNING"):
+                if refresh is not None:
+                    refresh()
+                return
+        validation_state.set_cutover_fk_apply_job(job_manager.submit(_work))
     else:
         _work()
 
@@ -4557,12 +4609,20 @@ def _render_cutover_section(
                         "Verify foreign keys are enforced"
                     ).classes("text-sm font-semibold text-gray-900")
                     ui.label(  # type: ignore[attr-defined]
-                        f"Aurora DSQL enforces foreign keys, and this schema's "
-                        f"{fk_pending_count} {_fk_noun} were applied automatically at the "
-                        "end of the load. If any were skipped (orphan rows) or failed, "
-                        "referential integrity is not fully enforced — re-apply here to "
-                        "complete them and see the result. Already-applied foreign keys "
-                        "are left as-is (safe to run more than once)."
+                        # Do NOT assert they were applied. They have not been applied at
+                        # the end of the load since v0.1.461 -- they are an EXPLICIT action
+                        # ("Apply foreign keys" on Data Migration, or here), so an operator
+                        # who never clicked it, or who clicked "Stop applying", was told by
+                        # this screen that referential integrity was already in place.
+                        f"Aurora DSQL enforces foreign keys, and this schema has "
+                        f"{fk_pending_count} preserved {_fk_noun}. They are applied by the "
+                        "explicit \"Apply foreign keys\" action — on the Data Migration "
+                        "step, or here — not automatically at the end of the load. If that "
+                        "action was never run, was stopped part-way, or skipped some "
+                        "(orphan rows) / failed, referential integrity is NOT fully "
+                        "enforced. Apply here to complete them and see the result; "
+                        "already-applied foreign keys are left as-is (safe to run more "
+                        "than once)."
                     ).classes("text-xs text-gray-600 leading-snug")
 
                 # The ADD CONSTRAINT pass must run ONLY after CDC has drained: applying it
