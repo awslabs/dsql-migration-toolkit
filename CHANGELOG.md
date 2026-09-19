@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.473
+
+### Changed
+
+- **Published `0.1.472` to all three registries, deployed it to both live app stacks, and
+  repointed the `ContainerImageUri` default to it.** A fresh `git clone` deploy previously
+  defaulted to `0.1.469`, which predates the Schema-Conversion REPLACE fixes (the foreign-key
+  pre-drop, v0.1.471, and the stale-applier invalidation, v0.1.472). The live release gate
+  passed against a real cluster before each build. No app-code change in this release.
+  - ECR Public + us-east-1 private + ap-northeast-2 private all on `0.1.472`.
+  - `mysql-dsql-migrator` (us-east-1): task definition `app:55` -> `app:56`, 1/1 running,
+    ALB target `healthy`.
+  - `mysql-dsql-migrator-seoul` (ap-northeast-2): `app:101` -> `app:102`, 1/1 running, with
+    4096 CPU / 8192 MiB and the Cognito user pool (and its user) untouched.
+  - Both updates were image-only (`--use-previous-template`, one overridden parameter of 26,
+    the rest `UsePreviousValue`, the list generated from each deployed stack's own parameters).
+
 ## v0.1.472
 
 ### Fixed

@@ -5,6 +5,23 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.473
+
+### 변경
+
+- **`0.1.472`를 세 레지스트리 모두에 발행하고, 라이브 앱 스택 두 곳에 배포하고,
+  `ContainerImageUri` 기본값을 그 태그로 repoint 했습니다.** 그전에는 새로 `git clone` 해서
+  배포하면 기본값이 `0.1.469`였고, 이는 Schema Conversion REPLACE 수정(외래 키 사전 삭제
+  v0.1.471, 낡은 applier 무효화 v0.1.472) 이전 이미지입니다. 각 빌드 전에 실제 클러스터를 상대로
+  release gate를 통과했습니다. 이번 릴리스에 앱 코드 변경은 없습니다.
+  - ECR Public + us-east-1 프라이빗 + ap-northeast-2 프라이빗 모두 `0.1.472`.
+  - `mysql-dsql-migrator`(us-east-1): 태스크 정의 `app:55` -> `app:56`, 1/1 실행, ALB 타깃
+    `healthy`.
+  - `mysql-dsql-migrator-seoul`(ap-northeast-2): `app:101` -> `app:102`, 1/1 실행,
+    4096 CPU / 8192 MiB와 Cognito 사용자 풀(및 사용자)은 그대로.
+  - 두 업데이트 모두 image-only(`--use-previous-template`, 26개 중 1개만 override, 나머지는
+    `UsePreviousValue`, 목록은 배포된 스택 자체의 파라미터에서 생성).
+
 ## v0.1.472
 
 ### 수정

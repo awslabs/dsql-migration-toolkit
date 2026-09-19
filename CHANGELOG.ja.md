@@ -5,6 +5,23 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.473
+
+### 変更
+
+- **`0.1.472` を 3 つのレジストリすべてに公開し、稼働中のアプリスタック 2 つへデプロイし、
+  `ContainerImageUri` のデフォルトをそのタグに repoint しました。** それ以前は新規に `git clone`
+  して配置するとデフォルトが `0.1.469` で、これは Schema Conversion の REPLACE 修正（外部キーの
+  事前削除 v0.1.471、古い applier の無効化 v0.1.472）より前のイメージです。各ビルドの前に実
+  クラスタに対して release gate を通しています。今回のリリースにアプリコードの変更はありません。
+  - ECR Public + us-east-1 プライベート + ap-northeast-2 プライベートすべてが `0.1.472`。
+  - `mysql-dsql-migrator`（us-east-1）: タスク定義 `app:55` -> `app:56`、1/1 稼働、ALB ターゲット
+    `healthy`。
+  - `mysql-dsql-migrator-seoul`（ap-northeast-2）: `app:101` -> `app:102`、1/1 稼働、
+    4096 CPU / 8192 MiB と Cognito ユーザープール（およびそのユーザー）はそのまま。
+  - どちらの更新もイメージのみ（`--use-previous-template`、26 個のうち 1 つだけ上書き、残りは
+    `UsePreviousValue`、リストは各稼働スタック自身のパラメータから生成）。
+
 ## v0.1.472
 
 ### 修正
