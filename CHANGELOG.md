@@ -62,8 +62,14 @@ All notable changes to this project are recorded here. This project follows
 
 ### Known gaps
 
-- Not yet verified live end-to-end (6 foreign keys applied → edit two keys → REPLACE all 7 →
-  expect `failed: 0`); the change is unit- and mutation-checked only.
+- ~~Not yet verified live end-to-end.~~ **Verified live** against a real Aurora DSQL cluster
+  (local MySQL source, 6 tables / 5 preserved foreign keys): with all 5 applied, a confirmed
+  REPLACE of every object reported **`failed: 0`**, where the *identical* apply without the
+  pre-drop failed on `fkdb.categories` with *"the foreign key fkdb.products.fk_products_category
+  still depends on it"* — the reported failure, reproduced as a negative control so the pass
+  means something. The pre-drop removed exactly the 5 constraints this migration owns, and the
+  confirmation text named all 5 as sitting on tables the operator did not select. Scratch schema
+  and container torn down.
 - Pre-existing and out of scope: a REPLACE invalidates nothing ELSE about the superseded run,
   so the Full Load panel above still reads "complete — all N tables loaded every source row".
 

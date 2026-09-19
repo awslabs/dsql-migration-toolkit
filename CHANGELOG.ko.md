@@ -56,8 +56,13 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 
 ### 남은 미검증
 
-- 라이브 종단 검증(외래 키 6개 적용 → 키 2개 편집 → 7개 REPLACE → `failed: 0` 기대)은 아직입니다.
-  현재는 유닛 + 변이 검증만 되어 있습니다.
+- ~~라이브 종단 검증은 아직입니다.~~ **라이브 검증 완료** — 실제 Aurora DSQL 클러스터 대상(로컬
+  MySQL 소스, 테이블 6개 / 보존 외래 키 5개). 5개를 모두 적용한 상태에서 전체 객체를 confirmed
+  REPLACE 하니 **`failed: 0`**, 반면 사전 삭제 없는 *동일한* apply는 `fkdb.categories`에서
+  *"the foreign key fkdb.products.fk_products_category still depends on it"* 로 실패했습니다 —
+  보고된 실패를 음성 대조군으로 재현했으므로 통과가 의미를 갖습니다. 사전 삭제는 이 마이그레이션
+  소유의 5개만 정확히 제거했고, 확인 문구는 그 5개가 선택하지 않은 테이블에 있다고 모두 명시했습니다.
+  스크래치 스키마와 컨테이너는 정리했습니다.
 - 기존 결함이며 범위 외: REPLACE는 대체된 이전 실행의 **다른** 정보를 무효화하지 않으므로, 위쪽
   Full Load 패널은 여전히 "complete — 모든 N개 테이블이 원본 모든 행을 적재"로 읽힙니다.
 
