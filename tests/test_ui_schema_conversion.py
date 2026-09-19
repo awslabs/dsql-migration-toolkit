@@ -4152,3 +4152,50 @@ def test_silent_target_sync_does_not_toast_or_double_render() -> None:
     # Generate is wired to the silent variant; the button keeps the announcing one.
     assert "on_sync_target=lambda: refresh_target(announce=False)" in src
     assert "on_refresh_target=refresh_target," in src
+
+
+# --------------------------------------------------------------------------- #
+# The cached applier must not outlive the target state it snapshotted
+#
+# The applier answers "does this object already exist?" from a name snapshot taken ONCE when
+# it is built, and the screen caches it for the session so a per-object click does not
+# re-browse the whole catalog. But an apply CHANGES the target. Apply to an empty target, then
+# apply again as REPLACE in the same session: the stale snapshot still says "absent", the DROP
+# is skipped, and every object fails with `relation "x" already exists` -- with nothing telling
+# the operator that "Refresh target" is what clears it. Reproduced live while verifying
+# v0.1.471: six tables created, then the identical REPLACE failed 6/6 exactly that way.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_mutating_apply_invalidates_the_cached_applier() -> None:
+    import inspect
+
+    import dsql_migrator.ui.schema_conversion as sc
+
+    src = inspect.getsource(sc.build_schema_conversion_screen)
+    body = src[src.index("def _invalidate_applier_cache_if_target_changed"):]
+    body = body[:body.index("def _invalidate_applied_foreign_keys")]
+    # Only a run that actually wrote to the target invalidates: a fully-skipped run changed
+    # nothing, so its snapshot is still true and a browse would be the pure waste this cache
+    # exists to avoid.
+    assert "ObjectApplyStatus.CREATED" in body, body
+    assert "_applier_cache.clear()" in body, body
+
+    # BOTH apply paths must call it -- the bulk run and the per-object "Apply to target"
+    # button, which is the one that mutates the target on every single click.
+    assert src.count("_invalidate_applier_cache_if_target_changed(results)") >= 2, (
+        "each apply path must invalidate, or the next apply reads a stale snapshot"
+    )
+
+
+def test_the_invalidation_runs_before_the_results_are_recorded() -> None:
+    # Ordering guard: recording results can refresh the view, and a render that rebuilds the
+    # applier from the stale cache before it is cleared would re-cache the wrong snapshot.
+    import inspect
+
+    import dsql_migrator.ui.schema_conversion as sc
+
+    src = inspect.getsource(sc.build_schema_conversion_screen)
+    for recorder in ("conv_state.set_apply_results(results)", "conv_state.merge_apply_results(results)"):
+        invalidate = src.index("_invalidate_applier_cache_if_target_changed(results)")
+        assert invalidate < src.index(recorder), recorder

@@ -1363,6 +1363,28 @@ def build_schema_conversion_screen(
         except Exception:  # noqa: BLE001 - disclosure is advisory
             return []
 
+    def _invalidate_applier_cache_if_target_changed(
+        results: "Sequence[ObjectApplyResult]",
+    ) -> None:
+        """Drop the cached applier when this run actually changed the target.
+
+        The applier answers "does this object already exist?" from a name snapshot taken
+        ONCE, when it is built (``_build_core_applier`` browses the catalog then), and it is
+        cached for the whole session so a per-object click does not re-browse. But an apply
+        CHANGES the target, which makes that snapshot wrong about the objects it just wrote:
+        apply to an empty target, then apply again as REPLACE in the same session, and the
+        stale snapshot still says "absent", so the DROP is skipped and every object fails with
+        ``relation "x" already exists``. Nothing told the operator to press "Refresh target",
+        which is what actually cleared it. (Reproduced live: six tables created, then the same
+        REPLACE failed 6/6 that way.)
+
+        Invalidated only when something was CREATED/replaced. A run that skipped everything
+        changed nothing, so its snapshot is still true and the browse would be wasted -- which
+        is the cost this cache exists to avoid.
+        """
+        if any(r.status is ObjectApplyStatus.CREATED for r in results):
+            _applier_cache.clear()
+
     def _invalidate_applied_foreign_keys() -> None:
         """Tell the other steps their foreign-key verdicts no longer describe the target.
 
@@ -1577,6 +1599,7 @@ def build_schema_conversion_screen(
                 on_object_start=_beat_then(conv_state.begin_apply_object),
                 on_object_result=_beat_then(_record_and_log),
             )
+            _invalidate_applier_cache_if_target_changed(results)
             if merge:
                 conv_state.merge_apply_results(results)
             else:
@@ -1944,6 +1967,7 @@ def build_schema_conversion_screen(
             # reproduced the recreate failure verbatim until it was given the pre-drop too.
             predrop_foreign_keys=_predrop_replace_blocking_foreign_keys,
         )
+        _invalidate_applier_cache_if_target_changed(results)
         conv_state.merge_apply_results(results)
         result = results[0] if results else None
         if result is not None:

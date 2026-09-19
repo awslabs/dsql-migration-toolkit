@@ -5,6 +5,42 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.472
+
+### Fixed
+
+- **A second apply in the same session failed with `relation "x" already exists` instead of
+  replacing.** The applier answers *"does this object already exist?"* from a name snapshot
+  taken ONCE when it is built, and the screen caches it for the whole session so a per-object
+  click does not re-browse the entire target catalog. But an apply CHANGES the target, which
+  makes that snapshot wrong about the objects it just wrote: apply to an empty target, then
+  apply again as REPLACE without leaving the screen, and the stale snapshot still reports the
+  tables absent — so the `DROP` is skipped and every object fails on the `CREATE`. Nothing in
+  the error pointed at the actual remedy, **"Refresh target"**, which was the only thing that
+  cleared it. The cached applier is now dropped after an apply that actually wrote to the
+  target, so the next one re-browses.
+  - Invalidated only when something came back CREATED. A run that skipped everything changed
+    nothing, so its snapshot is still true and the browse would be exactly the cost this cache
+    exists to avoid.
+  - Both apply paths do it — the bulk run and the per-object **"Apply to target"** button,
+    which is the one that mutates the target on every single click.
+  - Found while verifying v0.1.471's foreign-key pre-drop: the first harness run failed 6/6
+    with `already exists`, which was the harness reusing one applier — the same shape as the
+    UI's cached one, and the reason that run was reported INVALID rather than as a pass.
+
+### Verified live
+
+- Against a real Aurora DSQL cluster (local MySQL source, 2 tables): one applier built against
+  an empty target created both; **reusing** it for a REPLACE failed both with
+  `relation "..." already exists`; a **fresh** applier replaced both cleanly. So the defect and
+  the fix are both demonstrated, not inferred.
+
+### Tests
+
+- 3886 green (+2). Five mutations checked, each caught: never invalidating, dropping it from
+  either apply path, invalidating AFTER the results are recorded (a render in between could
+  re-cache the stale snapshot), and invalidating unconditionally.
+
 ## v0.1.471
 
 ### Fixed
