@@ -20762,3 +20762,142 @@ def test_outstanding_foreign_keys_are_rendered_as_an_error_not_a_quiet_button() 
         apply_foreign_keys=lambda: None, connections_ready=True,
     )
     assert not ui5.buttons and not ui5.notices
+
+
+def test_the_fk_action_never_writes_the_full_load_job_slot() -> None:
+    """Applying foreign keys must ADD to the load's result, not replace it.
+
+    The action was submitted with `migration_state.job_id = job_manager.submit(work)` --
+    copied from the retry path, where the new job IS the load. Here it made the Full Load
+    panel read the FK job instead: per-table rows became "No data available", 7/7 settled
+    became 0/0, the completion badge vanished, and the EXPORT WATERMARK was replaced by "the
+    consistency point is captured when the migration starts". CDC then reported "no usable
+    Full Load watermark", leaving the operator to choose between CDC and referential
+    integrity -- destroyed by the very action the tool told them to run.
+    """
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+    from dsql_migrator.ui.data_migration._state import DataMigrationState
+
+    import re
+
+    src = inspect.getsource(dm.build_data_migration_screen)
+    # Count ASSIGNMENTS, not mentions: exactly two are legitimate -- starting the load, and
+    # the retry (there the new job IS the load). A third means something else re-keyed the
+    # slot the Full Load panel and the CDC handoff read.
+    writes = re.findall(r"migration_state\.job_id\s*=(?!=)", src)
+    assert len(writes) == 2, (
+        f"{len(writes)} writes to migration_state.job_id; only starting the load and the "
+        "retry may re-key it. A third erases the load's per-table rows, completion badge "
+        "and export watermark, and blocks the CDC handoff."
+    )
+    action = src[src.index("def apply_foreign_keys_now("):]
+    action = action[:action.index("def accept_quarantine_and_continue(")]
+    assert not re.search(r"migration_state\.job_id\s*=(?!=)", action), (
+        "the FK action writes the Full Load's job slot again"
+    )
+    assert "set_fk_apply_job(" in action
+
+    # The slots are genuinely separate, and the setter does not touch job_id.
+    state = DataMigrationState()
+    state.job_id = "load-job"
+    state.set_fk_apply_job("fk-job")
+    assert state.job_id == "load-job", "the load's job slot was overwritten"
+    assert state.fk_apply_job_id == "fk-job"
+    state.set_fk_apply_progress(2, 6)
+    assert state.fk_apply_progress == (2, 6)
+    assert state.job_id == "load-job"
+
+
+def test_outstanding_foreign_keys_read_as_a_next_step_not_a_failure() -> None:
+    # This notice sits directly under a GREEN "Full Load complete". A red card there reads as
+    # "my load failed" -- a workshop participant read it exactly that way. The load DID
+    # succeed; foreign keys are the next required step, which is what `warning` means here.
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _full_load_ui as ui_mod
+
+    src = inspect.getsource(ui_mod._render_foreign_key_action)
+    outstanding = src[src.index("not yet applied") - 400:src.index("not yet applied")]
+    assert 'tone="error"' not in outstanding, (
+        "the outstanding-FK notice is error-toned again; under a green 'complete' banner "
+        "that reads as a failed load"
+    )
+    assert 'tone="warning"' in outstanding
+    assert "The load itself succeeded" in src
+
+
+def test_a_running_fk_apply_shows_progress_and_a_way_to_stop() -> None:
+    """No confirm dialog, no spinner, no count -- the operator assumes it hung and re-clicks.
+
+    The card itself warns the orphan pre-check "reads the whole child table", so a running
+    state has to be visible and stoppable.
+    """
+    from dsql_migrator.ui.data_migration._full_load_ui import (
+        _render_foreign_key_action,
+    )
+
+    class _Ui:
+        def __init__(self):
+            self.texts: list = []
+            self.buttons: list = []
+            self.spinners = 0
+
+        class _El:
+            def __init__(self, ui, kind="o", text=""):
+                self._ui, self._kind, self._text = ui, kind, text
+            def __enter__(self): return self
+            def __exit__(self, *e): return False
+            def props(self, spec="", *a, **k):
+                if self._kind == "button":
+                    self._ui.buttons.append((self._text, str(spec)))
+                return self
+            def __getattr__(self, _n): return lambda *a, **k: self
+
+        def button(self, text="", on_click=None, *a, **k):
+            return _Ui._El(self, "button", str(text))
+
+        def label(self, text="", *a, **k):
+            self.texts.append(str(text)); return _Ui._El(self)
+
+        def spinner(self, *a, **k):
+            self.spinners += 1; return _Ui._El(self)
+
+        def __getattr__(self, _n):
+            return lambda *a, **k: _Ui._El(self)
+
+    stopped: list = []
+    ui = _Ui()
+    _render_foreign_key_action(
+        ui, terminal=True, pending=6, applied=None,
+        apply_foreign_keys=lambda: None, connections_ready=True,
+        running=True, progress=(2, 6), cancel_foreign_keys=lambda: stopped.append(1),
+    )
+    joined = " ".join(ui.texts)
+    assert "2 of 6 done" in joined, ui.texts
+    assert ui.spinners == 1, "no spinner while it runs"
+    stop = [b for b in ui.buttons if b[0] == "Stop applying"]
+    assert stop, f"no way to stop; buttons={[b[0] for b in ui.buttons]}"
+    # While running, the start button must NOT also be offered (double-click re-runs it).
+    assert not [b for b in ui.buttons if b[0] == "Apply foreign keys"], ui.buttons
+
+
+def test_the_schema_conversion_notices_name_the_explicit_action() -> None:
+    # Both notices said foreign keys are "(re)created at the end of Full Load", which reads
+    # as automatic. They are not: the operator clicks a button.
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion as sc
+
+    src = inspect.getsource(sc)
+    assert "(re)created at the end of Full Load" not in src
+    assert "as a post-load ALTER TABLE … ADD CONSTRAINT pass after Full Load" not in src
+    # Both surviving notices must name the button.
+    fk_notices = [
+        chunk for chunk in src.split("render_notice(")
+        if "Foreign keys" in chunk[:400] and "not" in chunk[:400]
+    ]
+    assert len(fk_notices) >= 2, len(fk_notices)
+    for chunk in fk_notices:
+        assert "Apply foreign keys" in chunk[:1400], chunk[:200]

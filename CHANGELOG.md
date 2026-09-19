@@ -5,6 +5,42 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.463
+
+### Fixed
+
+- **BLOCKER: "Apply foreign keys" destroyed the Full Load's own result and blocked the CDC
+  handoff.** The action was submitted with `migration_state.job_id = job_manager.submit(...)`
+  -- copied from the retry path, where the new job legitimately IS the load. Here it made the
+  Full Load panel read the FK job instead, so the moment the operator ran the action the tool
+  itself had told them to run: the per-table rows became "No data available", "7/7 tables
+  settled" became 0/0, the green completion summary vanished, and the **export watermark** was
+  replaced by "the consistency point is captured when the migration starts". CDC then reported
+  "No usable Full Load watermark in this session", leaving a choice between CDC and
+  referential integrity. A page refresh did not recover it. The action now has its own job
+  slot (`fk_apply_job_id`) and never writes the load's.
+  - The data was never at risk -- only the job record the panel and the CDC seed read.
+- **The outstanding-foreign-keys notice is `warning`, not `error`.** It renders directly under
+  a green "Full Load complete", where a red card reads as "my load failed" -- which is how a
+  workshop participant read it. The load did succeed; foreign keys are the next required step,
+  which is exactly what `warning` means in this design system.
+- **The running action now shows progress and can be stopped.** Clicking it previously gave no
+  confirmation, no spinner and no count until it finished -- while the card itself warns that
+  each constraint "reads the whole child table". On a real schema an operator assumes it hung
+  and clicks again. It now shows "Applying foreign keys — N of M done" with a spinner and a
+  "Stop applying" button, and the start button is withdrawn while it runs.
+- **Schema Conversion no longer describes foreign keys as automatic.** Three notices said they
+  are "(re)created at the end of Full Load" / "as a post-load ALTER TABLE … ADD CONSTRAINT
+  pass", which reads as something the tool does by itself. All three now name the
+  **"Apply foreign keys"** button and say the step is explicit, and why (the orphan pre-check
+  reads every child table).
+
+### Tests
+
+- 3806 green. Five mutations checked, each caught: re-clobbering the load's job slot (both
+  from the action and from the setter), restoring the error tone, removing the running state,
+  and a notice dropping the button's name.
+
 ## v0.1.462
 
 ### Fixed

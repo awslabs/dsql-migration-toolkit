@@ -2354,14 +2354,18 @@ def build_schema_conversion_screen(
                         render_notice(
                             ui,
                             tone="info",
-                            header="Foreign keys are applied after Full Load, not here",
+                            header=(
+                                "Foreign keys are applied by a separate action, not here"
+                            ),
                             body=(
                                 "Preserved foreign keys are intentionally NOT in this "
-                                "apply — they are (re)created as a post-load "
-                                "ALTER TABLE … ADD CONSTRAINT pass after Full Load (at "
-                                "cut over for a CDC migration). A target with no foreign "
-                                "keys immediately after Schema Apply is expected, not a "
-                                "failure."
+                                "apply. You apply them YOURSELF with the "
+                                "\"Apply foreign keys\" button — on Data Migration once "
+                                "the load finishes, or at cut over for a CDC migration. "
+                                "They are not created automatically: the orphan pre-check "
+                                "reads every child table, so it is a step you start when "
+                                "you are ready. A target with no foreign keys immediately "
+                                "after Schema Apply is expected, not a failure."
                             ),
                         )
 
@@ -2909,12 +2913,16 @@ def _render_browser_and_preview(
         render_notice(
             ui,
             tone="info",
-            header="Foreign keys are created after Full Load, not at Schema Apply",
+            header=(
+                "Foreign keys need a separate \"Apply foreign keys\" step after the load"
+            ),
             body=(
-                "They are (re)created at the end of Full Load (at cut over for a CDC "
-                "migration), so the target has no foreign keys immediately after "
-                "Schema Apply. This is by design — the concurrent bulk load has no "
-                "parent-before-child ordering."
+                "They are NOT created at Schema Apply, and NOT automatically at the end of "
+                "the load: you click \"Apply foreign keys\" on Data Migration once the "
+                "load finishes (at cut over for a CDC migration). Deferring them is by "
+                "design — the concurrent bulk load has no parent-before-child ordering — "
+                "and the step is explicit because each constraint is orphan-checked first, "
+                "which reads the whole child table."
             ),
         )
 
@@ -3853,11 +3861,12 @@ def _render_fk_section(ui: object, fk_ddl: str) -> None:
     render_notice(
         ui,
         tone="info",
-        header="Foreign keys — applied after Full Load, not at Schema Apply",
+        header="Foreign keys — applied by a separate action, not at Schema Apply",
         body=(
-            "These ALTER TABLE … ADD CONSTRAINT statements are (re)created as a "
-            "post-load pass (at cut over for a CDC migration), so they are shown "
-            "read-only here and are NOT part of this object's Schema Apply."
+            "These ALTER TABLE … ADD CONSTRAINT statements are applied when YOU click "
+            "\"Apply foreign keys\" — on Data Migration after the load finishes, or at cut "
+            "over for a CDC migration. They are shown read-only here and are NOT part of "
+            "this object's Schema Apply."
         ),
     )
     ui.add_css(_DDL_PANE_CSS)  # type: ignore[attr-defined]

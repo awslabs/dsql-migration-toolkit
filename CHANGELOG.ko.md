@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.463
+
+### 수정 (Fixed)
+
+- **차단: "Apply foreign keys"가 Full Load의 실행 결과를 파괴하고 CDC 인계를 막던 문제 수정.** 액션이 `migration_state.job_id = job_manager.submit(...)`으로 제출됐습니다 — 재시도 경로에서 복사한 것인데, 거기서는 새 작업이 **정당하게 로드 그 자체**입니다. 여기서는 Full Load 패널이 FK 작업을 읽게 만들어, **도구가 스스로 실행하라고 한 액션을 실행한 순간**: 테이블별 결과가 "No data available"이 되고, "7/7 tables settled"가 0/0이 되고, 녹색 완료 요약이 사라지고, **export watermark**가 "the consistency point is captured when the migration starts"로 바뀌었습니다. 이어서 CDC가 "No usable Full Load watermark in this session"이라고 보고해, CDC와 참조 정합성 중 하나를 포기해야 하는 상황이 됐습니다. 페이지 새로고침으로도 복구되지 않았습니다. 이제 액션이 자기 작업 슬롯(`fk_apply_job_id`)을 쓰고 로드의 슬롯은 건드리지 않습니다.
+  - 데이터는 전혀 위험하지 않았습니다 — 패널과 CDC 시드가 읽는 **작업 기록만** 가려졌습니다.
+- **FK 미적용 안내를 `error`에서 `warning`으로 변경.** 이 안내는 녹색 "Full Load complete" 바로 아래에 렌더되고, 거기의 빨간 카드는 "내 적재가 실패했다"로 읽힙니다 — 워크숍 참가자가 실제로 그렇게 읽었습니다. 적재는 성공했고, 외래 키는 다음 필수 단계이며, 그것이 이 디자인 시스템에서 `warning`의 정의입니다.
+- **실행 중 진행 표시와 중지 수단을 추가.** 이전에는 클릭해도 확인 대화상자도, 스피너도, 개수도 없이 끝날 때까지 아무 표시가 없었습니다 — 카드 자체가 각 제약이 "자식 테이블 전체를 읽는다"고 경고하는데도요. 실제 스키마에서는 멈춘 줄 알고 다시 누릅니다. 이제 "Applying foreign keys — N of M done"을 스피너와 함께 표시하고 "Stop applying" 버튼을 제공하며, 실행 중에는 시작 버튼을 내립니다.
+- **Schema Conversion이 더 이상 외래 키를 자동인 것처럼 설명하지 않습니다.** 세 곳의 안내문이 "(re)created at the end of Full Load" / "post-load ALTER TABLE … ADD CONSTRAINT pass"라고 말해 도구가 알아서 하는 일로 읽혔습니다. 세 곳 모두 **"Apply foreign keys"** 버튼을 명시하고 명시적 단계임과 그 이유(orphan 사전 검사가 모든 자식 테이블을 읽음)를 밝힙니다.
+
+### 테스트
+
+- 3806 통과. 뮤테이션 5종 전부 잡힘: 로드의 작업 슬롯 재덮어쓰기(액션과 setter 양쪽), error 톤 복원, 실행 중 상태 제거, 안내문에서 버튼 이름 제거.
+
 ## v0.1.462
 
 ### 수정 (Fixed)

@@ -199,6 +199,14 @@ class DataMigrationState:
         # was holding the END of the load for minutes), so the step has to SHOW that they
         # are still pending -- an unapplied constraint is invisible otherwise.
         self.fk_apply_result: Optional[tuple] = None
+        # The FK action's OWN job id. It must NEVER be written to `job_id`: that slot is
+        # what the Full Load panel and the CDC handoff read, so overwriting it made a
+        # successful load's per-table rows, completion badge and EXPORT WATERMARK vanish the
+        # moment the operator applied the foreign keys -- and CDC then reported "no usable
+        # Full Load watermark", forcing a choice between CDC and referential integrity.
+        self.fk_apply_job_id: Optional[str] = None
+        # (done, total) foreign keys, for the action's progress while it runs.
+        self.fk_apply_progress: Optional[tuple] = None
         self.cdc_connector_names: list[str] = []
         # Subset of cdc_connector_names whose MSK connectorState is RUNNING (vs
         # still CREATING/UPDATING). Lets the lifecycle card distinguish "deployed
@@ -740,6 +748,16 @@ class DataMigrationState:
         """Empty the deploy step log (called when a new deploy starts)."""
         with self._lock:
             self._cdc_deploy_log = []
+
+    def set_fk_apply_job(self, job_id: Optional[str]) -> None:
+        """Record the FK action's job id -- deliberately NOT ``job_id`` (see that slot)."""
+        with self._lock:
+            self.fk_apply_job_id = job_id
+
+    def set_fk_apply_progress(self, done: int, total: int) -> None:
+        """Record how many foreign keys the running action has finished."""
+        with self._lock:
+            self.fk_apply_progress = (int(done), int(total))
 
     def set_fk_apply_result(self, result: Optional[tuple]) -> None:
         """Record the "Apply foreign keys" outcome ``(applied, skipped, failed)``."""

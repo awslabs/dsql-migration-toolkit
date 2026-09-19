@@ -283,6 +283,9 @@ def _render_full_load_step(
     apply_foreign_keys: Optional[Callable[[], None]] = None,
     foreign_keys_pending: int = 0,
     foreign_keys_applied: Optional[tuple] = None,
+    foreign_keys_running: bool = False,
+    foreign_keys_progress: Optional[tuple] = None,
+    cancel_foreign_keys: Optional[Callable[[], None]] = None,
 ) -> None:
     """Render the Full Load step: confirm the selected workloads, then run it.
 
@@ -890,6 +893,9 @@ def _render_full_load_step(
             applied=foreign_keys_applied,
             apply_foreign_keys=apply_foreign_keys,
             connections_ready=session.connection_ready(),
+            running=foreign_keys_running,
+            progress=foreign_keys_progress,
+            cancel_foreign_keys=cancel_foreign_keys,
         )
         if running:
             # Re-arm a single-shot poll: it fires once, refreshes only this live
@@ -2069,6 +2075,9 @@ def _render_foreign_key_action(
     applied: Optional[tuple],
     apply_foreign_keys=None,
     connections_ready: bool = False,
+    running: bool = False,
+    progress: Optional[tuple] = None,
+    cancel_foreign_keys=None,
 ) -> None:
     """Render the explicit "Apply foreign keys" action, and its outstanding state.
 
@@ -2081,8 +2090,37 @@ def _render_foreign_key_action(
 
     The risk that buys is a FORGOTTEN click: an unapplied constraint is invisible, and DSQL
     cannot tell us later (a failed async VALIDATE is unobservable -- live-verified). So the
-    outstanding state is an `error`-tone notice naming the count, not a quiet button.
+    outstanding state is a prominent notice naming the count, not a quiet button.
+
+    WARNING, not error: this sits directly under a GREEN "Full Load complete", and a red card
+    there reads as "my load failed" -- a workshop participant read it exactly that way. The
+    load DID succeed; foreign keys are the next required step, which is what `warning` means
+    in this design system (a real but non-blocking issue), while `error` means the step
+    itself failed.
     """
+    if running:
+        done, total = (tuple(progress or ()) + (0, 0))[:2]
+        render_notice(
+            ui, tone="info",
+            header=(
+                f"Applying foreign keys — {done} of {total} done"
+                if total else "Applying foreign keys…"
+            ),
+            body=(
+                "Each one is orphan-checked first, which reads the whole child table, so "
+                "this can take several minutes on a large schema. You can leave this page; "
+                "it keeps running."
+            ),
+        )
+        with ui.row().classes("items-center gap-2 w-full"):
+            ui.spinner(size="sm")
+            if total:
+                ui.label(f"{done}/{total}").classes("text-xs text-gray-500")
+            if cancel_foreign_keys is not None:
+                ui.button(
+                    "Stop applying", on_click=lambda: cancel_foreign_keys()
+                ).props("flat color=negative icon=stop")
+        return
     if applied is not None:
         got_applied, got_skipped, got_failed = (list(applied) + [0, 0, 0])[:3]
         tone = "success" if not (got_skipped or got_failed) else "warning"
@@ -2100,13 +2138,13 @@ def _render_foreign_key_action(
     if not (terminal and pending and apply_foreign_keys is not None):
         return
     render_notice(
-        ui, tone="error",
+        ui, tone="warning",
         header=f"{pending} foreign key(s) not yet applied",
         body=(
-            "The load is complete, but referential integrity is NOT in place until you "
-            "apply them. Each one is orphan-checked first, which reads the whole child "
-            "table, so this can take a while on a large schema — it is a separate step so "
-            "it no longer holds up the load."
+            "The load itself succeeded. Referential integrity is the next required step and "
+            "is NOT in place until you apply them. Each one is orphan-checked first, which "
+            "reads the whole child table, so this can take several minutes on a large "
+            "schema — it is a separate step so it no longer holds up the load."
         ),
     )
     with ui.row().classes("items-center gap-2 w-full"):

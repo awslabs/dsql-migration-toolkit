@@ -1548,6 +1548,18 @@ def build_data_migration_screen(
                 except Exception:  # noqa: BLE001 - advisory count; never break the panel
                     return 0
 
+            def cancel_foreign_keys() -> None:
+                """Stop the FK pass. Already-applied constraints stay; the rest remain
+                pending and the action can be run again (a duplicate ADD is a no-op, 42710).
+
+                A sibling of the action, not nested inside it: the renderer needs it, and a
+                nested definition is invisible there (the undefined-global guard caught that).
+                """
+                jid = migration_state.fk_apply_job_id
+                if jid:
+                    job_manager.request_cancel(jid)
+                refresh()
+
             def apply_foreign_keys_now() -> None:
                 """Apply the preserved foreign keys -- an explicit operator action.
 
@@ -1564,17 +1576,42 @@ def build_data_migration_screen(
                 fk_inputs = _fk_apply_inputs()
                 fk_migrator = migrator_factory(fk_inputs)
 
-                def work(handle: JobHandle) -> None:
-                    result = _apply_foreign_keys_for(fk_migrator, handle)
-                    migration_state.set_fk_apply_result(result)
+                total = pending_foreign_key_count(fk_migrator)
+                migration_state.set_fk_apply_progress(0, total)
 
-                migration_state.job_id = job_manager.submit(work)
+                def work(handle: JobHandle) -> None:
+                    try:
+                        result = _apply_foreign_keys_for(fk_migrator, handle)
+                        migration_state.set_fk_apply_result(result)
+                    finally:
+                        migration_state.set_fk_apply_progress(total, total)
+
+                # Its OWN slot. Writing `migration_state.job_id` here (copied from the
+                # retry path, where the new job IS the load) made the Full Load panel read
+                # this job instead: per-table rows, the completion badge and the EXPORT
+                # WATERMARK all disappeared, and CDC then had "no usable Full Load
+                # watermark" -- the load's own result destroyed by the action the tool told
+                # the operator to run.
+                migration_state.set_fk_apply_job(job_manager.submit(work))
                 ui.notify(
-                    "Applying foreign keys — progress below. The orphan pre-check reads "
-                    "each child table, so this can take a while on a large schema.",
+                    f"Applying {total} foreign key(s) — progress below. Each one is "
+                    "orphan-checked first, which reads the whole child table.",
                     type="positive", position="top",
                 )
                 refresh()
+
+            def _fk_apply_running() -> bool:
+                """Is the FK action's OWN job still running?
+
+                Reads ``fk_apply_job_id``, never ``job_id`` -- that slot belongs to the Full
+                Load, and writing this job into it is what erased the load's per-table rows
+                and export watermark.
+                """
+                jid = migration_state.fk_apply_job_id
+                if not jid or migration_state.fk_apply_result is not None:
+                    return False
+                job = _current_job(job_manager, jid)
+                return job is not None and job.status in ("PENDING", "RUNNING")
 
             def accept_quarantine_and_continue() -> None:
                 # Accept permanently-quarantined rows (>1 MiB values, etc.) as an
@@ -1876,6 +1913,9 @@ def build_data_migration_screen(
                             apply_foreign_keys=apply_foreign_keys_now,
                             foreign_keys_pending=fk_pending_count(),
                             foreign_keys_applied=migration_state.fk_apply_result,
+                            foreign_keys_running=_fk_apply_running(),
+                            foreign_keys_progress=migration_state.fk_apply_progress,
+                            cancel_foreign_keys=cancel_foreign_keys,
                             stop_full_load=stop_full_load,
                             refresh=refresh,
                             ai_error_opener=ai_error_opener,
