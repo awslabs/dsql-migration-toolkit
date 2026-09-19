@@ -20,7 +20,7 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
 | **기본 키 필수** | PK 없는 테이블은 마이그레이션 불가. | **UNSUPPORTED** 플래그; Full Load도 차단(keyset export에 PK 필요). |
 | **트리거/저장 프로시저/함수/스케줄 이벤트 없음** | 서버 측 로직은 옮겨지지 않음. | **UNSUPPORTED** — 애플리케이션으로 재구현(이벤트 → EventBridge/Lambda). |
 | **네이티브 파티셔닝 없음** | DSQL이 직접 자동 분산. | 파티션 테이블 **MANUAL**(파티셔닝 제거). |
-| **값당 1 MiB 한도** | ~1 MiB를 초과하는 단일 대용량 텍스트/바이너리 값은 저장 불가(MySQL `TEXT`/`BLOB`, PostgreSQL `text`/`bytea`). | 1–8 MiB 값은 에러 로그/DLQ로 **격리(quarantine)**; > 8 MiB 컬럼은 **캡처 단계에서 제외**해야 함. 대형 LOB 컬럼은 `OVERSIZED_LOB`(MANUAL). |
+| **값 하나의 크기 한도(타입별로 다름)** | **바이너리** 값은 1 MiB를 넘으면 저장할 수 없습니다(`bytea`; MySQL `BLOB`, PostgreSQL `bytea`) — DSQL이 즉시 거부합니다. **텍스트** 값에는 1 MiB 상한이 없고, 쓰기 트랜잭션당 10 MiB 한도가 실질적인 상한입니다(9.5 MiB까지 정상 저장됨을 실측). | 한도를 넘는 **바이너리** 값은 에러 로그/DLQ로 **격리(quarantine)**되고, 같은 크기의 **텍스트** 값은 정상적으로 복제됩니다. 약 8 MiB를 넘는 컬럼은 Kafka 메시지 상한 때문에 **캡처 단계에서 제외**해야 합니다. 대형 LOB 컬럼은 `OVERSIZED_LOB`(MANUAL)로 표시됩니다. |
 | **`DECIMAL` 정밀도 > 38** | 더 높은 정밀도 미지원. | Evaluation은 **UNSUPPORTED**(`NUMERIC_PRECISION`)로 표시하지만, 변환된 DDL을 적용하면 Schema Conversion이 **`numeric(38,37)`로 clamp**(손실)하며 경고 — 스케일도 37로 제한. |
 | **공간/geometry 타입** | MySQL 소스에서는 `bytea`로 대체(원본 WKB가 Full Load·CDC 전 구간에서 그대로 보존됨); PostgreSQL 소스는 자동 대체 **안 함**. | MySQL 소스: 변환기가 각 컬럼을 `bytea`로 자동 대체하고, 평가기가 해당 테이블을 검토 대상 **MANUAL**로 표시. PostgreSQL 소스: geometric 타입(point/line/lseg/box/path/polygon/circle)은 Evaluation(`PG_UNSUPPORTED_TYPE`)과 Schema Conversion 양쪽에서 **UNSUPPORTED**로 표시되고 `text`로의 재모델링이 제안됨 — DDL 적용 전에 직접 재모델링해야 함. (자동 대체가 아니라 수동 재모델링이 필요한 그 밖의 PG 전용 타입: 배열, network `inet`/`cidr`/`macaddr`, `xml`, `money`, `bit`/`varbit`, `tsvector`/`tsquery`, range/multirange, `enum`, composite, pgvector.) |
 | **FULLTEXT / SPATIAL 인덱스** | 미지원. | **UNSUPPORTED**. |

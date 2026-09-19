@@ -5,6 +5,72 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.464
+
+### Fixed
+
+- **CDC dead-lettered `text` values that Aurora DSQL accepts — permanent, silent row loss.**
+  The sink's pre-write size guard applied a flat 1 MiB ceiling to every `String` and `byte[]`
+  value alike, so a 2 MiB `longtext` row went to the DLQ instead of the target. Measured live
+  on a real cluster (2026-09-19): a `text` value stores **intact at 1 / 2 / 4 / 6 / 8 / 8.5 /
+  9 / 9.5 MiB** and fails only at 10 MiB -- the per-write-transaction limit, where the server
+  severs the connection rather than returning an error -- while `bytea` rejects anything over
+  1048576 bytes (`ProgramLimitExceeded: datatype limit greater than 1048576 bytes not
+  supported for bytea`, SQLSTATE 54000). The flat cap was calibrated in June 2026, when text
+  *did* behave that way; DSQL has since raised it, and the guard was never revisited.
+  - **Why it mattered beyond the dropped rows:** Full Load reacts to the real DSQL error
+    instead of pre-checking a size, so it migrated a 2 MiB `longtext` **fine** while CDC
+    dead-lettered the same value. A Full Load + CDC migration therefore diverged silently on
+    exactly that column -- the tool's own Validation would later report the difference with no
+    explanation for it.
+  - The guard is now per type: `byte[]` at 1 MiB (DSQL's real `bytea` cap) and `String` at the
+    chunk byte budget, declared **as** `MAX_BATCH_BYTES` rather than a second 8 MiB literal so
+    tuning one cannot strand the other. `binary.handling.mode=bytes` is what makes the Java
+    type a sound discriminator: a blob arrives as `byte[]`, text/json as `String`.
+  - The dead-letter reason now carries the **measured size and the limit breached**
+    (`body (2097152 bytes > 1048576)`). It previously named only the column, so a DLQ reader
+    could not tell a marginal value from a 9 MiB one, nor which ceiling applied.
+  - Plugin artifact rebuilt; `PLUGIN_VERSION` v38 -> v39. A running cdc-stack keeps its current
+    plugin until Delete + Deploy infra.
+- **Three harness scripts died at import and had done so for weeks** -- one of them a
+  committed, documented entry point (`scripts/run_full_load.py`; the other two,
+  `run_fullload_resume_harness.py` and `verify_fullload_edgecases.py`, are local-only).
+  All three imported
+  `dsql_migrator.ui.data_migration._engine`, a private submodule the v0.1.346-351 refactor
+  split into `_full_load_engine`. Every invocation raised `ModuleNotFoundError`, and
+  `run_full_load.py` is listed in `scripts/README.md`. All four import sites
+  now use the **package**, whose re-exports are the stable surface, so a future split cannot
+  break them again.
+- **The oversized-LOB picker no longer implies one ceiling for both types.** It labelled the
+  checkboxes "Columns that can exceed DSQL's 1 MiB per-value limit" while listing blob *and*
+  text columns, pointing the user at the wrong box; it now names each type's real bound. The
+  manual's limitations table (en/ko/ja) is corrected the same way.
+
+### Verified live
+
+- **Review item 5 re-verified end to end on the current build** (the workshop item that could
+  not be checked at the time, because the oversized column had been excluded up front so
+  nothing ever quarantined). A real MySQL source with three 1.5 MiB `longblob` rows loaded
+  into the real Seoul cluster: DSQL rejected exactly those three (54000), the two fitting rows
+  landed (confirmed by `COUNT(*)` on the target), and the rejection became a **durable
+  per-chunk `rows_quarantined=3`**. Rendering the panel from that job with an **empty error
+  log** -- precisely a restored session -- still offers **"Exclude column & reload"**, keyed on
+  the durable count rather than the in-memory messages. The unit suite covers this with a
+  double; what a double cannot establish is that a real DSQL rejection becomes a per-chunk
+  count at all, which is the seam every defect found this session sat on.
+
+### Tests
+
+- 3847 Python green (+41 new), 107 Java green (+6 new). Nine mutations checked, each caught:
+  re-applying the flat 1 MiB cap to `String` (the exact bug -- caught by the 2 MiB-text case),
+  loosening `bytea` to the String ceiling, dropping the size/limit from the dead-letter reason,
+  unbinding the String ceiling from the chunk budget, and restoring the broken `_engine`
+  import path.
+- New `tests/test_scripts_imports_resolve.py` resolves every `dsql_migrator` name the
+  `scripts/` harnesses import, statically -- the scripts are never executed, so nothing
+  connects to a database. `tests/test_no_undefined_globals.py` could not have caught this: it
+  walks the `dsql_migrator` package, and `scripts/` is outside it.
+
 ## v0.1.463
 
 ### Fixed

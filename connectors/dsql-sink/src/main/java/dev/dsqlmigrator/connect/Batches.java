@@ -43,10 +43,12 @@ final class Batches {
    * <p>A chunk is flushed when it reaches {@code size} rows OR when adding the next item
    * would push the chunk's estimated modified bytes past {@code maxBytes} (headroom under
    * DSQL's 10 MiB per-write-transaction limit). A non-empty chunk always keeps at least one
-   * item -- a single event cannot be split, and it is independently bounded by DSQL's 2 MiB
-   * row limit plus the sink's 1 MiB per-value guard -- so an oversized lone item forms its
-   * own chunk rather than being dropped. {@code sizer} estimates one item's modified bytes
-   * cheaply (see {@code DsqlSinkTask#estimateModifiedBytes}); it is summed once per item, so
+   * item -- a single event cannot be split, and it is independently bounded by the sink's
+   * per-value guard, which caps a {@code bytea} value at 1 MiB and a text/json one at this
+   * same byte budget ({@code DsqlSinkTask#oversizedColumn}) -- so an oversized lone item
+   * forms its own chunk rather than being dropped. {@code sizer} estimates one item's
+   * modified bytes cheaply (see {@code DsqlSinkTask#estimateModifiedBytes}); it is summed
+   * once per item, so
    * a size-skewed run (small first row, large later rows) still splits correctly.
    */
   static <T> List<List<T>> partition(

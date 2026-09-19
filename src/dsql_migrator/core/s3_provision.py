@@ -59,6 +59,23 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v39 rebuilds the DSQL sink jar so the per-value size guard uses the ceiling DSQL actually
+#    enforces for EACH type instead of a flat 1 MiB for both. It dead-lettered every String
+#    over 1 MiB, but only `bytea` is capped there: measured live 2026-09-19 against a real
+#    cluster, a `text` value stores intact at 1/2/4/6/8/8.5/9/9.5 MiB and fails only at
+#    10 MiB (the per-transaction wall, where the server severs the connection rather than
+#    returning an error), while `bytea` rejects anything over 1048576 bytes
+#    ("ProgramLimitExceeded: datatype limit greater than 1048576 bytes not supported for
+#    bytea"). The flat cap was calibrated when text DID behave that way (June 2026); DSQL has
+#    since raised it. Consequence while uncorrected: Full Load -- which reacts to the real
+#    DSQL error instead of pre-checking a size -- migrated a 2 MiB longtext fine while CDC
+#    dead-lettered the same value, so a Full Load + CDC migration silently diverged on that
+#    column. Now byte[] is bounded at 1 MiB and String at the chunk byte budget
+#    (MAX_STRING_VALUE_BYTES == MAX_BATCH_BYTES, so tuning one cannot strand the other);
+#    binary.handling.mode=bytes is what makes the Java type a sound discriminator (a blob
+#    arrives as byte[], text/json as String). The dead-letter reason now carries the measured
+#    size and the limit breached. Sink-jar change only; a running cdc-stack keeps its current
+#    plugin until a redeploy.
 # v38 rebuilds the DSQL sink jar so chunking respects DSQL's per-write-transaction BYTE
 #    limit, not just the 3,000-row limit. put() previously partitioned by row count alone
 #    (Batches.partition(batch, batchSize)), so a wide / JSON-heavy 3,000-row chunk could
@@ -357,7 +374,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # existing plugin resource collides -- adding it needs no version bump and does NOT
 # force a Delete+Deploy on a live MySQL stack. Bump only when a plugin's CONTENT
 # changes.
-PLUGIN_VERSION = "v38"
+PLUGIN_VERSION = "v39"
 
 
 class S3ProvisionError(RuntimeError):

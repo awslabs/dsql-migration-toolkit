@@ -16,6 +16,8 @@ package dev.dsqlmigrator.connect;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -217,5 +219,83 @@ class DsqlSinkTaskTest {
     // A null or non-Struct key contributes nothing.
     assertEquals("", DsqlSinkTask.formatPk((Object) null));
     assertEquals("", DsqlSinkTask.formatPk("not-a-struct"));
+  }
+
+  // --- per-value size guard: the ceiling is PER TYPE ----------------------------
+  //
+  // The guard applied a flat 1 MiB to every String and byte[] alike, which dead-lettered
+  // text values DSQL accepts -- permanent CDC loss on a row Full Load migrates fine, so a
+  // Full Load + CDC migration silently diverged on that column. Measured live 2026-09-19:
+  // bytea rejects >1048576 bytes ("datatype limit ... not supported for bytea"), while text
+  // stores intact at 2/4/6/8/9.5 MiB and only fails at the 10 MiB per-transaction wall.
+
+  /** An upsert of one row: pk + a single value in column "body". */
+  private static ChangeEvent bodyUpsert(Object body) {
+    return ChangeEvent.upsert(
+        "docs",
+        List.of("id", "body"),
+        java.util.Arrays.asList(1, body), // Arrays.asList, not List.of: one case is null
+        List.of("id"),
+        List.of(1),
+        0L);
+  }
+
+  @Test
+  void byteaValueOverOneMiBIsOversizedAndExactlyOneMiBIsNot() {
+    int oneMiB = DsqlSinkTask.DSQL_MAX_BYTEA_VALUE_BYTES;
+    assertNull(
+        DsqlSinkTask.oversizedColumn(bodyUpsert(new byte[oneMiB])),
+        "exactly 1 MiB of bytea is accepted by DSQL, so it must not be quarantined");
+    String over = DsqlSinkTask.oversizedColumn(bodyUpsert(new byte[oneMiB + 1]));
+    assertNotNull(over, "bytea over 1 MiB can never be applied -- DSQL rejects it (54000)");
+    assertTrue(over.startsWith("body"), over);
+  }
+
+  @Test
+  void textValueOverOneMiBIsNotOversized() {
+    // THE regression guard. A 2 MiB text value used to be dead-lettered here; DSQL stores
+    // it, so quarantining it lost a row the target would have taken.
+    assertNull(
+        DsqlSinkTask.oversizedColumn(bodyUpsert("x".repeat(2 * 1024 * 1024))),
+        "2 MiB of text is within what DSQL stores -- it must reach the target, not the DLQ");
+  }
+
+  @Test
+  void textValueOverTheChunkBudgetIsOversized() {
+    // Above the chunk byte budget a lone value cannot be applied at all, and the 10 MiB wall
+    // (where the server severs the connection) is worse than a dead-letter.
+    String over =
+        DsqlSinkTask.oversizedColumn(
+            bodyUpsert("x".repeat((int) DsqlSinkTask.MAX_STRING_VALUE_BYTES + 1)));
+    assertNotNull(over, "a text value past the chunk budget must be quarantined");
+    assertTrue(over.startsWith("body"), over);
+  }
+
+  @Test
+  void stringGuardIsTheChunkBudgetSoTuningOneCannotStrandTheOther() {
+    assertEquals(
+        DsqlSinkTask.MAX_BATCH_BYTES,
+        DsqlSinkTask.MAX_STRING_VALUE_BYTES,
+        "the String ceiling must stay bound to the chunk budget, not a second literal");
+  }
+
+  @Test
+  void oversizedReasonCarriesTheMeasuredSizeAndTheLimitItBreached() {
+    // "over the limit" alone could not distinguish a marginal value from a 9 MiB one, nor
+    // say WHICH of the two ceilings applied -- and the reason is all the DLQ reader gets.
+    int oneMiB = DsqlSinkTask.DSQL_MAX_BYTEA_VALUE_BYTES;
+    String reason = DsqlSinkTask.oversizedColumn(bodyUpsert(new byte[oneMiB + 5]));
+    assertEquals("body (" + (oneMiB + 5) + " bytes > " + oneMiB + ")", reason);
+  }
+
+  @Test
+  void deleteIsNeverOversizedAndSmallValuesPass() {
+    assertNull(
+        DsqlSinkTask.oversizedColumn(
+            ChangeEvent.delete("docs", List.of("id"), List.of(1), 0L)),
+        "a delete carries only PK values");
+    assertNull(DsqlSinkTask.oversizedColumn(bodyUpsert("small")));
+    assertNull(DsqlSinkTask.oversizedColumn(bodyUpsert(42)));
+    assertNull(DsqlSinkTask.oversizedColumn(bodyUpsert(null)));
   }
 }

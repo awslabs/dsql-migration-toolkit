@@ -5,6 +5,71 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.464
+
+### 修正
+
+- **CDC が Aurora DSQL は受け付ける `text` 値をデッドレターに送り、行を恒久的に失っていました。**
+  シンクの書き込み前サイズガードが、すべての `String` と `byte[]` に一律 1 MiB の上限を適用して
+  いたため、2 MiB の `longtext` 行がターゲットではなく DLQ に送られていました。実クラスタでの
+  実測（2026-09-19）では、`text` 値は **1 / 2 / 4 / 6 / 8 / 8.5 / 9 / 9.5 MiB のいずれでもその
+  まま保存**され、失敗するのは 10 MiB のときだけです（書き込みトランザクションあたりの上限で、
+  このときサーバーはエラーを返さず接続を切断します）。一方 `bytea` は 1048576 バイトを超えると
+  拒否します（`ProgramLimitExceeded: datatype limit greater than 1048576 bytes not supported
+  for bytea`、SQLSTATE 54000）。この一律の上限は text も実際にそう振る舞っていた 2026 年 6 月の
+  計測に合わせたもので、その後 DSQL が上限を引き上げたのにガードは見直されていませんでした。
+  - **落ちた行そのものより大きな問題:** Full Load はサイズを事前チェックせず実際の DSQL エラー
+    に反応するため、2 MiB の `longtext` を**正常に移行**する一方で、CDC は同じ値をデッドレターに
+    送っていました。結果として Full Load + CDC の移行はまさにその列で静かに乖離し、後から
+    Validation が差分を報告してもその理由を説明できませんでした。
+  - ガードは型ごとになりました。`byte[]` は 1 MiB（DSQL の実際の `bytea` 上限）、`String` は
+    チャンクのバイト予算で、8 MiB のリテラルを二重に置く代わりに `MAX_BATCH_BYTES` **そのもの**
+    として宣言し、片方を調整してもう片方が取り残されないようにしています。
+    `binary.handling.mode=bytes` であるため Java の型が妥当な判別基準になります（blob は
+    `byte[]`、text/json は `String` として届く）。
+  - デッドレターの理由に**実測サイズと超えた上限**を含めます（`body (2097152 bytes >
+    1048576)`）。以前は列名だけだったため、境界付近の値か 9 MiB の値か、どちらの上限に触れたのか
+    が分かりませんでした。
+  - プラグイン成果物を再ビルドし、`PLUGIN_VERSION` を v38 -> v39 に。稼働中の cdc-stack は
+    インフラを Delete + Deploy するまで現在のプラグインを保持します。
+- **ハーネススクリプト 3 本が、数週間にわたり import で失敗していました**（うち 1 本は
+  コミット済みで文書化されたエントリポイントの `scripts/run_full_load.py`。残りの
+  `run_fullload_resume_harness.py` と `verify_fullload_edgecases.py` はローカル専用）。
+  `scripts/run_full_load.py`、`scripts/run_fullload_resume_harness.py`、
+  `scripts/verify_fullload_edgecases.py` が、v0.1.346-351 のリファクタリングで
+  `_full_load_engine` に分割された非公開サブモジュール
+  `dsql_migrator.ui.data_migration._engine` を import していました。実行すると必ず
+  `ModuleNotFoundError` になり、`run_full_load.py` は `scripts/README.md` に記載された
+  エントリポイントです。4 箇所すべてを、再エクスポートが安定面である**パッケージ**経路に
+  変更しました。
+- **大きな LOB の選択画面が、2 つの型に同じ上限があるかのように書かれていました。** blob と text
+  の列を並べつつ「DSQL の 1 MiB の値上限を超えうる列」と表示しており、誤ったチェックボックスへ
+  誘導していました。現在は型ごとの実際の上限を明記します。マニュアルの制限事項表（en/ko/ja）も
+  同様に修正しました。
+
+### ライブ検証
+
+- **レビュー項目 5 を現行ビルドで通しで再検証しました**（当時は大きな列を先に除外していたため
+  隔離が発生せず、確認できなかった項目）。1.5 MiB の `longblob` 行 3 件を持つ実際の MySQL
+  ソースを実際のソウルのクラスタへロードすると、DSQL はその 3 件だけを拒否し（54000）、収まる
+  2 件はロードされ（ターゲットの `COUNT(*)` で確認）、その拒否が**チャンクに残る
+  `rows_quarantined=3`** になりました。このジョブを**エラーログが空の状態**、つまりセッションが
+  復元された状態のままレンダリングしても、メモリ上のメッセージではなくその永続的なカウントを
+  根拠に **"Exclude column & reload"** が提供され続けます。ユニットテストはダブルでこの部分を
+  覆いますが、「実際の DSQL の拒否がチャンクのカウントになる」という前段はダブルでは証明でき
+  ません — 今回のセッションで見つかった欠陥がすべて座っていた、まさにその継ぎ目です。
+
+### テスト
+
+- Python 3847 件成功（+41）、Java 107 件成功（+6）。ミューテーション 9 件すべて検出: `String` に
+  一律 1 MiB の上限を復活（まさにこのバグ — 2 MiB text のケースが検出）、`bytea` を String の
+  上限まで緩める、デッドレター理由からサイズ/上限を削除、String の上限をチャンク予算から切り
+  離す、壊れた `_engine` import 経路の復活。
+- `tests/test_scripts_imports_resolve.py` を新規追加: `scripts/` のハーネスが import する
+  すべての `dsql_migrator` 名を静的に解決します（スクリプトは実行しないので DB には接続しま
+  せん）。`tests/test_no_undefined_globals.py` は `dsql_migrator` パッケージのみを走査し、
+  `scripts/` はその外なので、この欠陥は検出できませんでした。
+
 ## v0.1.463
 
 ### 修正 (Fixed)

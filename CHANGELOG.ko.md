@@ -5,6 +5,66 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.464
+
+### 수정
+
+- **CDC가 Aurora DSQL이 받아들이는 `text` 값을 DLQ로 보내 행을 영구히 잃고 있었습니다.**
+  싱크의 쓰기 전 크기 가드가 모든 `String`과 `byte[]`에 1 MiB 상한을 똑같이 적용해서, 2 MiB
+  `longtext` 행이 타깃이 아니라 DLQ로 갔습니다. 실제 클러스터에서 측정한 결과(2026-09-19)
+  `text` 값은 **1 / 2 / 4 / 6 / 8 / 8.5 / 9 / 9.5 MiB에서 모두 그대로 저장**되고 10 MiB에서만
+  실패합니다(쓰기 트랜잭션당 한도이며, 이때 서버는 오류를 주지 않고 연결을 끊습니다). 반면
+  `bytea`는 1048576바이트를 넘으면 거부합니다(`ProgramLimitExceeded: datatype limit greater
+  than 1048576 bytes not supported for bytea`, SQLSTATE 54000). 이 평면 상한은 text도 실제로
+  그렇게 동작했던 2026년 6월 측정에 맞춘 값이고, 그 뒤 DSQL이 한도를 올렸는데 가드는 그대로
+  남아 있었습니다.
+  - **버려진 행 자체보다 더 큰 문제:** Full Load는 크기를 미리 검사하지 않고 실제 DSQL 오류에
+    반응하므로 2 MiB `longtext`를 **정상 이관**했는데 CDC는 같은 값을 DLQ로 보냈습니다. 결국
+    Full Load + CDC 마이그레이션이 바로 그 컬럼에서 조용히 어긋나고, 나중에 Validation이
+    차이를 보고해도 원인을 설명해 주지 못했습니다.
+  - 이제 가드는 타입별입니다. `byte[]`는 1 MiB(DSQL의 실제 `bytea` 상한), `String`은 청크
+    바이트 예산이며, 8 MiB 리터럴을 또 쓰는 대신 `MAX_BATCH_BYTES` **그 자체로** 선언해 한쪽만
+    조정해도 다른 쪽이 뒤처지지 않게 했습니다. `binary.handling.mode=bytes` 덕분에 Java 타입이
+    타당한 판별 기준이 됩니다(블롭은 `byte[]`, text/json은 `String`으로 도착).
+  - DLQ 사유에 **측정된 크기와 위반한 한도**를 담습니다(`body (2097152 bytes > 1048576)`).
+    이전에는 컬럼명만 있어서 경계선 값인지 9 MiB인지, 두 상한 중 어느 것에 걸렸는지 알 수
+    없었습니다.
+  - 플러그인 아티팩트 재빌드, `PLUGIN_VERSION` v38 -> v39. 실행 중인 cdc-stack은 인프라를
+    Delete + Deploy 할 때까지 기존 플러그인을 유지합니다.
+- **하네스 스크립트 3개가 몇 주째 import 단계에서 죽고 있었습니다**(그중 하나는 커밋되어
+  문서화된 엔트리 포인트인 `scripts/run_full_load.py`이고, 나머지
+  `run_fullload_resume_harness.py`/`verify_fullload_edgecases.py`는 로컬 전용입니다).
+  `scripts/run_full_load.py`, `scripts/run_fullload_resume_harness.py`,
+  `scripts/verify_fullload_edgecases.py`가 v0.1.346-351 리팩터링에서 `_full_load_engine`으로
+  분리된 비공개 서브모듈 `dsql_migrator.ui.data_migration._engine`을 import 하고 있었습니다.
+  실행하면 항상 `ModuleNotFoundError`였고, `run_full_load.py`는 `scripts/README.md`에 문서화된
+  엔트리 포인트입니다. 네 곳 모두 재export가 안정적인 **패키지** 경로로 바꿨습니다.
+- **대용량 LOB 선택 화면이 두 타입에 같은 상한을 암시하지 않습니다.** 블롭과 text 컬럼을 함께
+  나열하면서 "DSQL의 1 MiB 값 한도를 넘을 수 있는 컬럼"이라고 적어 엉뚱한 체크박스를 고르게
+  만들었습니다. 이제 타입별 실제 한도를 명시합니다. 매뉴얼 제약 표(en/ko/ja)도 같이 정정했습니다.
+
+### 라이브 검증
+
+- **리뷰 5번 항목을 현재 빌드에서 처음부터 끝까지 재검증했습니다**(당시에는 대용량 컬럼을 미리
+  제외해 격리가 발생하지 않아 확인할 수 없었던 항목). 1.5 MiB `longblob` 행 3개를 담은 실제
+  MySQL 소스를 실제 서울 클러스터로 적재하니 DSQL이 정확히 그 3개를 거부하고(54000) 들어갈 수
+  있는 2개는 적재됐으며(타깃 `COUNT(*)`로 확인), 그 거부가 **청크에 남는
+  `rows_quarantined=3`**으로 기록됐습니다. 이 잡을 **에러 로그가 빈 상태**로 — 즉 세션이 복원된
+  상태 그대로 — 렌더링해도 메모리상의 메시지가 아니라 그 지속 카운트를 근거로
+  **"Exclude column & reload"**가 그대로 제공됩니다. 유닛 테스트는 더블로 이 부분을 덮지만,
+  더블로는 "실제 DSQL 거부가 청크 카운트가 된다"는 앞단을 증명할 수 없습니다 — 이번 세션에서
+  찾은 결함이 모두 앉아 있던 바로 그 이음새입니다.
+
+### 테스트
+
+- Python 3847개 통과(+41), Java 107개 통과(+6). 변이 9건 모두 검출: `String`에 평면 1 MiB 상한
+  복원(바로 그 버그 — 2 MiB text 케이스가 잡음), `bytea`를 String 상한으로 완화, DLQ 사유에서
+  크기/한도 제거, String 상한을 청크 예산에서 분리, 깨진 `_engine` import 경로 복원.
+- `tests/test_scripts_imports_resolve.py` 신규: `scripts/` 하네스가 import 하는 모든
+  `dsql_migrator` 이름을 정적으로 해석합니다(스크립트를 실행하지 않으므로 DB에 접속하지 않음).
+  `tests/test_no_undefined_globals.py`는 `dsql_migrator` 패키지만 순회하고 `scripts/`는 그
+  밖이라 이 결함을 잡을 수 없었습니다.
+
 ## v0.1.463
 
 ### 수정 (Fixed)

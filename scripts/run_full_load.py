@@ -114,7 +114,11 @@ def main() -> int:
         SourceConnectionConfig, TargetConnectionConfig,
     )
     from dsql_migrator.core.table_selection import TableSelection, TableSelector
-    from dsql_migrator.ui.data_migration._engine import (
+    # Import from the PACKAGE, not a private submodule: the engine was split out of
+    # ``_engine`` into ``_full_load_engine`` and these three scripts kept importing the
+    # old path, so every run died at import (ModuleNotFoundError). The package re-exports
+    # the stable names, so a future split cannot break them again.
+    from dsql_migrator.ui.data_migration import (
         DataMigrationInputs, default_migrator_factory, run_full_load,
     )
     from dsql_migrator.ui.evaluation import _default_introspector_factory

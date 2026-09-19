@@ -1908,9 +1908,14 @@ def _render_full_load_progress(
                     "are replaced."
                 ),
             )
-            ui.label("Columns that can exceed DSQL's 1 MiB per-value limit:").classes(
-                "text-sm text-gray-700"
-            )
+            # Naming the per-type ceiling, not a single "1 MiB" figure: only a blob
+            # column (-> bytea) is capped at 1 MiB; a text column holds far more, so
+            # calling both "over 1 MiB" pointed the user at the wrong checkbox.
+            ui.label(
+                "Columns large enough to exceed what DSQL stores in one value "
+                "(blob -> bytea caps at 1 MiB; text is bounded by the 10 MiB "
+                "per-transaction limit):"
+            ).classes("text-sm text-gray-700")
             for name, mysql_type in columns:
                 box = ui.checkbox(
                     f"{name}  ({mysql_type})", value=chosen[name]
