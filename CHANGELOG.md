@@ -5,6 +5,29 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.466
+
+### Changed
+
+- **Published `0.1.465` to all three registries, deployed it to both live app stacks, and
+  repointed the `ContainerImageUri` default to it.** The v0.1.465 notes above describe
+  publishing `0.1.464`; what actually shipped and now runs in production is `0.1.465`, which
+  carries the same CDC per-value size-guard fix plus that release's own metadata. Publishing
+  the newer tag was the deliberate choice: the Seoul stack pulls from its own
+  ap-northeast-2 private ECR and had to be built anyway, and building the current tree under
+  the older tag would have produced an image tagged `0.1.464` whose UI reported `0.1.465`
+  (the displayed version comes from installed package metadata, not `pyproject.toml`) — the
+  exact tag/version drift this repo has been bitten by before.
+  - ECR Public + us-east-1 private + ap-northeast-2 private all on `0.1.465`; the live
+    release gate passed against a real cluster before each build.
+  - `mysql-dsql-migrator` (us-east-1): task definition `app:53` -> `app:54`, image
+    `0.1.463` -> `0.1.465`, 1/1 running, ALB target `healthy`.
+  - `mysql-dsql-migrator-seoul` (ap-northeast-2): `app:99` -> `app:100`, same image bump,
+    1/1 running, 4096 CPU / 8192 MiB and the Cognito user pool (with its user) untouched.
+  - Both updates were image-only (`--use-previous-template`, one overridden parameter out of
+    26, the rest `UsePreviousValue`), and the stack events confirm only the task definition
+    and the ECS service changed -- no load balancer, listener, security group or user pool.
+
 ## v0.1.465
 
 ### Changed
