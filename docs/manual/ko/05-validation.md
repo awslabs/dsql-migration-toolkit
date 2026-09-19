@@ -97,7 +97,7 @@ Validation은 **테이블 단위**로, 선택할 수 있는 점증적 엄밀도�
 
 - 모든 테이블 **MATCH**(고아 없음) → 전환 안전.
 - 작은 **타깃 부족**은 보통 (a) **드리프트** — 워터마크 이후 소스가 전진(드리프트 플래그 확인), 또는
-  (b) **의도된** — 격리(quarantine)된 행(예: DSQL 1 MiB 초과 값)입니다. 이제 어느 쪽인지 직접 판별할
+  (b) **의도된** — 격리(quarantine)된 행(예: DSQL 1 MiB 초과 `bytea` 값)입니다. 이제 어느 쪽인지 직접 판별할
   필요가 없습니다: 부족분이 마이그레이션이 영구 드롭한 행 수와 **정확히** 일치하면 테이블이 그렇게
   알려 줍니다 — *"Fully explained: N rows were permanently dropped during the migration …
   this deficit is expected, not new data loss"*. 부족분이 드롭 건수보다 **크면**

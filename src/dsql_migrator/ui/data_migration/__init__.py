@@ -1580,11 +1580,22 @@ def build_data_migration_screen(
                 migration_state.set_fk_apply_progress(0, total)
 
                 def work(handle: JobHandle) -> None:
-                    try:
-                        result = _apply_foreign_keys_for(fk_migrator, handle)
-                        migration_state.set_fk_apply_result(result)
-                    finally:
-                        migration_state.set_fk_apply_progress(total, total)
+                    # PER-FK progress. Before this the card only ever showed two values --
+                    # (0, total) written before submit and (total, total) written in a
+                    # finally -- so an operator watching a multi-minute pass saw
+                    # "0 of N done" the whole way and concluded it had hung, which is the
+                    # very thing the explicit action was introduced to stop. The engine now
+                    # reports each FK as it settles, and re-publishes the total, so a
+                    # denominator that disagreed with the pass is corrected too.
+                    #
+                    # No finally that forces (total, total): the card reads progress ONLY
+                    # while the job is running, so a terminal write is never displayed --
+                    # and forcing it would misreport a pass cut short by Stop as complete.
+                    result = _apply_foreign_keys_for(
+                        fk_migrator, handle,
+                        on_progress=migration_state.set_fk_apply_progress,
+                    )
+                    migration_state.set_fk_apply_result(result)
 
                 # Its OWN slot. Writing `migration_state.job_id` here (copied from the
                 # retry path, where the new job IS the load) made the Full Load panel read
@@ -1911,10 +1922,19 @@ def build_data_migration_screen(
                             # the END of the load for minutes. Same flow a CDC migration
                             # already uses at cut over.
                             apply_foreign_keys=apply_foreign_keys_now,
-                            foreign_keys_pending=fk_pending_count(),
-                            foreign_keys_applied=migration_state.fk_apply_result,
-                            foreign_keys_running=_fk_apply_running(),
-                            foreign_keys_progress=migration_state.fk_apply_progress,
+                            # PROVIDERS, not values. The FK card is rendered inside the
+                            # step's @ui.refreshable live region, so a value evaluated here
+                            # is captured when the PAGE renders and then frozen: refreshing
+                            # the region re-ran the render with the same stale "not running,
+                            # no result" it had before the button was ever clicked. That is
+                            # why the card stayed on its spinner even after all the
+                            # constraints existed on the target, and only a manual page
+                            # reload showed "6 applied". A callable is re-read on every
+                            # refresh, so the region reflects the job as it advances.
+                            foreign_keys_pending=fk_pending_count,
+                            foreign_keys_applied=lambda: migration_state.fk_apply_result,
+                            foreign_keys_running=_fk_apply_running,
+                            foreign_keys_progress=lambda: migration_state.fk_apply_progress,
                             cancel_foreign_keys=cancel_foreign_keys,
                             stop_full_load=stop_full_load,
                             refresh=refresh,
@@ -3297,8 +3317,8 @@ def _connector_failure_detail(migration_state, view, name: str) -> str:
     depth = getattr(view, "dlq_depth", None)
     if depth:
         parts.append(
-            f"{depth} record(s) in the DLQ (rejected permanently, e.g. a value over "
-            "DSQL's ~1 MiB per-value limit)"
+            f"{depth} record(s) in the DLQ (rejected permanently, e.g. a binary value "
+            "over DSQL's 1 MiB bytea limit)"
         )
     summary = getattr(view, "error_summary", None)
     by_table = dict(getattr(summary, "errors_by_table", None) or {})

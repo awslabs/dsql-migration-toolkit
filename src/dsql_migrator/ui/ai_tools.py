@@ -154,8 +154,8 @@ AI_TOOL_SCHEMAS: list[dict] = [
         "name": "list_failed_full_load_tables",
         "description": (
             "List the Full Load tables that FAILED (each with its latest error message) "
-            "and the tables that had rows QUARANTINED (permanently dropped, e.g. a value "
-            "over DSQL's ~1 MiB per-value limit). Use it to NAME the specific tables "
+            "and the tables that had rows QUARANTINED (permanently dropped, e.g. a binary "
+            "value over DSQL's 1 MiB bytea limit). Use it to NAME the specific tables "
             "blocking the migration and to reason about the standing-gap-before-CDC risk. "
             "Names + messages only, never row data. No arguments."
         ),

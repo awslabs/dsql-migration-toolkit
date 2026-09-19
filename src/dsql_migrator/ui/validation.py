@@ -4335,7 +4335,8 @@ def _render_recovery_section(
                 header="These rows can't be stored as-is — shrink the value or accept the gap",
                 body=(
                     "Every missing row was isolated because its value exceeds a "
-                    "permanent Aurora DSQL limit (e.g. the ~1 MiB per-value cap), so "
+                    "permanent Aurora DSQL limit (e.g. the 1 MiB cap on a binary "
+                    "bytea value), so "
                     "re-running Full Load alone just isolates them again — a plain "
                     "reload cannot bring them in. Two real paths: reduce the offending "
                     "source value(s) below the limit first — for example move a large "
@@ -5187,8 +5188,9 @@ def _failure_reasons(item: TableValidationResult) -> list[str]:
             row_noun = "row was" if item.rows_quarantined == 1 else "rows were"
             reasons.append(
                 f"Fully explained: {item.rows_quarantined:,} {row_noun} permanently "
-                "dropped during the migration (a value DSQL could not store, e.g. over "
-                "its ~1 MiB per-value limit) — this deficit is expected, not new data "
+                "dropped during the migration (a value DSQL could not store, e.g. a "
+                "binary value over its 1 MiB bytea limit) — this deficit is expected, "
+                "not new data "
                 "loss. Fix the source value(s) and reload that table to close it."
             )
         elif item.rows_quarantined > 0 and item.deficit > item.rows_quarantined:

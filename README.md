@@ -71,7 +71,7 @@ tool, and an optional continuous **CDC** stream on managed MSK Connect. A waterm
   the replication stream.
 - **Single region only** — the source and target must be in the same AWS region.
 - **Inherits DSQL's constraints** — no triggers or stored procedures; a
-  per-transaction row limit; a ~1 MiB per-value limit; and more.
+  per-transaction row limit; a 1 MiB limit on binary (`bytea`) values; and more.
 
 > Full enforced-limit list and workarounds: User Manual
 > [Chapter 6 — Limitations](docs/manual/en/06-limitations.md).

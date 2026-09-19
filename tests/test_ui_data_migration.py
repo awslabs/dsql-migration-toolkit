@@ -20901,3 +20901,235 @@ def test_the_schema_conversion_notices_name_the_explicit_action() -> None:
     assert len(fk_notices) >= 2, len(fk_notices)
     for chunk in fk_notices:
         assert "Apply foreign keys" in chunk[:1400], chunk[:200]
+
+
+# --------------------------------------------------------------------------- #
+# "Apply foreign keys": the progress card must actually advance and then settle
+#
+# Reported from a workshop on 0.1.463: the card appeared correctly (0 of 6, spinner,
+# Stop applying, start button withdrawn) and then NEVER changed -- polled for 110s, all
+# "0 of 6 done" -- and after all six constraints existed on the target (convalidated=t,
+# checked in psql) the card was STILL spinning until the page was reloaded by hand. Two
+# independent causes, both covered here:
+#   1. no per-FK progress was ever published: the action wrote only (0, total) before
+#      submitting and (total, total) in a finally;
+#   2. the card is rendered inside the step's @ui.refreshable live region, but its inputs
+#      were passed as VALUES captured at page render, and nothing re-armed the poll once
+#      the LOAD job was terminal -- so the region never re-read them and never re-rendered.
+# --------------------------------------------------------------------------- #
+
+
+def _three_fk_conv():
+    """One child with three FKs, so a pass can settle them to three different buckets."""
+    from dsql_migrator.core.converter import TableConversion
+    from dsql_migrator.core.models import ForeignKeyDef
+
+    ddls = [
+        f'ALTER TABLE "child" ADD CONSTRAINT "fk_{n}" FOREIGN KEY ("{n}_id") '
+        f'REFERENCES "p{n}" ("id") NOT VALID'
+        for n in ("a", "b", "c")
+    ]
+    return ddls, TableConversion(
+        table="child",
+        target_ddl='CREATE TABLE "child" ("id" integer PRIMARY KEY)',
+        foreign_key_ddls=ddls,
+        preserved_foreign_keys=[
+            ForeignKeyDef(
+                name=f"fk_{n}", columns=[f"{n}_id"],
+                referenced_table=f"p{n}", referenced_columns=["id"],
+            )
+            for n in ("a", "b", "c")
+        ],
+    )
+
+
+def test_fk_pass_reports_progress_for_every_settled_fk(monkeypatch) -> None:
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    ddls, conv = _three_fk_conv()
+    # Mixed outcomes so the count cannot be an artefact of the happy path alone:
+    # fk_a applies, fk_b has orphans (skipped), fk_c's ALTER raises (failed).
+    monkeypatch.setattr(engine, "_pregate_orphans",
+                        lambda pending, *a, **k: {0: 0, 1: 4, 2: 0})
+    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+
+    def _apply(add_ddl, *, connection_factory):
+        if '"fk_c"' in add_ddl:
+            raise RuntimeError("ALTER rejected")
+
+    monkeypatch.setattr(engine, "apply_foreign_key", _apply)
+    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: None)
+
+    seen: list[tuple[int, int]] = []
+    result = engine.apply_preserved_foreign_keys(
+        {"child": conv}, lambda: _FkProbeConnection(0), on_progress=lambda d, t: seen.append((d, t))
+    )
+    assert result == (1, 1, 1), result
+    # The denominator is the real number of FKs the pass works through, published up front
+    # so the card never shows a total it will not reach.
+    assert seen[0] == (0, 3), seen
+    # Every intermediate count appears, and the pass ends at "all three settled".
+    assert seen[-1] == (3, 3), seen
+    assert [d for d, _t in seen] == sorted(d for d, _t in seen), f"not monotonic: {seen}"
+    assert {d for d, _t in seen} == {0, 1, 2, 3}, seen
+    assert all(t == 3 for _d, t in seen), seen
+
+
+def test_fk_pass_final_progress_is_the_partial_count_when_stopped(monkeypatch) -> None:
+    # Stop applying must leave the card reporting what it ACTUALLY finished. The old
+    # unconditional (total, total) write would have claimed a stopped pass was complete.
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    _ddls, conv = _three_fk_conv()
+    monkeypatch.setattr(engine, "_pregate_orphans", lambda pending, *a, **k: {0: 0, 1: 0, 2: 0})
+    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(engine, "apply_foreign_key", lambda add_ddl, *, connection_factory: None)
+    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: None)
+
+    calls = {"n": 0}
+
+    def _stop() -> bool:
+        # False for the first FK's check, then True: exactly one FK settles.
+        calls["n"] += 1
+        return calls["n"] > 1
+
+    seen: list[tuple[int, int]] = []
+    applied, skipped, failed = engine.apply_preserved_foreign_keys(
+        {"child": conv}, lambda: _FkProbeConnection(0),
+        should_cancel=_stop, on_progress=lambda d, t: seen.append((d, t)),
+    )
+    assert (applied, skipped, failed) == (1, 0, 0)
+    assert seen[-1] == (1, 3), f"a stopped pass must not report itself complete: {seen}"
+
+
+def test_fk_pass_survives_a_progress_reporter_that_raises(monkeypatch) -> None:
+    # Progress is display only; a reporter error must never cost a foreign key.
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    _ddls, conv = _three_fk_conv()
+    monkeypatch.setattr(engine, "_pregate_orphans", lambda pending, *a, **k: {0: 0, 1: 0, 2: 0})
+    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(engine, "apply_foreign_key", lambda add_ddl, *, connection_factory: None)
+    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: None)
+
+    def _boom(_done, _total):
+        raise RuntimeError("the UI went away")
+
+    assert engine.apply_preserved_foreign_keys(
+        {"child": conv}, lambda: _FkProbeConnection(0), on_progress=_boom
+    ) == (3, 0, 0)
+
+
+def test_apply_foreign_keys_wrapper_forwards_the_progress_reporter() -> None:
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    got = {}
+
+    class _Migrator:
+        def apply_foreign_keys(self, heartbeat=None, should_cancel=None, on_progress=None):
+            got["on_progress"] = on_progress
+            if on_progress is not None:
+                on_progress(2, 5)
+            return (2, 0, 0)
+
+    seen: list[tuple[int, int]] = []
+    assert engine._apply_foreign_keys(
+        _Migrator(), None, on_progress=lambda d, t: seen.append((d, t))
+    ) == (2, 0, 0)
+    assert got["on_progress"] is not None
+    assert seen == [(2, 5)], "the reporter must reach the pass, not be swallowed"
+
+
+def test_apply_foreign_keys_wrapper_still_drives_a_hook_without_progress() -> None:
+    # The degrade chain must drop on_progress FIRST: a double that predates it keeps
+    # heartbeat/should_cancel instead of losing both to a single TypeError.
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    got = {}
+
+    class _Older:
+        def apply_foreign_keys(self, heartbeat=None, should_cancel=None):
+            got["heartbeat"] = heartbeat is not None
+            got["should_cancel"] = should_cancel is not None
+            return (1, 0, 0)
+
+    assert engine._apply_foreign_keys(_Older(), None, on_progress=lambda d, t: None) == (1, 0, 0)
+    assert got == {"heartbeat": True, "should_cancel": True}
+
+
+def test_fk_card_inputs_are_providers_not_values_captured_at_page_render() -> None:
+    # THE staleness defect. The step renders the FK card inside its @ui.refreshable live
+    # region, so a value evaluated at the call site is frozen for the life of the page:
+    # refreshing the region replayed "not running, no result" from before the click, which
+    # is why the spinner never became "6 applied" without a manual reload.
+    import inspect
+
+    import dsql_migrator.ui.data_migration as dm
+
+    src = inspect.getsource(dm.build_data_migration_screen)
+    for frozen in (
+        "foreign_keys_running=_fk_apply_running()",
+        "foreign_keys_progress=migration_state.fk_apply_progress,",
+        "foreign_keys_applied=migration_state.fk_apply_result,",
+        "foreign_keys_pending=fk_pending_count(),",
+    ):
+        assert frozen not in src, (
+            f"{frozen!r} is evaluated once at page render; the live region must be given a "
+            "provider it can re-read on every refresh"
+        )
+    assert "foreign_keys_running=_fk_apply_running," in src
+    assert "foreign_keys_progress=lambda: migration_state.fk_apply_progress," in src
+
+
+def test_fk_card_providers_are_resolved_on_every_refresh() -> None:
+    # Not just "a callable is passed" -- the renderer must CALL it. Drive the real inner
+    # renderer through the resolver and show a second render sees the new value.
+    from dsql_migrator.ui.data_migration import _full_load_ui as flu
+
+    state = {"running": True, "progress": (1, 6)}
+    assert flu._call_or(lambda: state["running"], False) is True
+    assert flu._call_or(lambda: state["progress"], None) == (1, 6)
+    state["running"], state["progress"] = False, (6, 6)
+    assert flu._call_or(lambda: state["running"], False) is False
+    assert flu._call_or(lambda: state["progress"], None) == (6, 6)
+    # A plain value still works (existing callers/tests), and a raising provider falls back
+    # rather than tearing down the region it renders into.
+    assert flu._call_or(7, 0) == 7
+    assert flu._call_or(None, "d") == "d"
+
+    def _boom():
+        raise RuntimeError("status read failed")
+
+    assert flu._call_or(_boom, "fallback") == "fallback"
+
+
+def test_the_live_region_rearms_its_poll_while_only_the_fk_job_runs() -> None:
+    # The FK pass is a SEPARATE job that starts only once the LOAD is terminal, so gating
+    # the re-arm on the load alone left nothing to refresh the card: it could neither
+    # advance its counter nor replace the spinner with the result.
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _full_load_ui as flu
+
+    src = inspect.getsource(flu._render_full_load_step)
+    assert "if running or fk_running:" in src, (
+        "the live region must re-arm its poll while the foreign-key job runs, not only "
+        "while the load does"
+    )
+    # And the poll itself must not fall into its terminal branch (a FULL page refresh every
+    # tick, and no re-arm) while that job is live.
+    assert 'if bool(_call_or(foreign_keys_running, False)):\n            _live_detail.refresh()' in src
+
+
+def test_the_fk_action_publishes_per_fk_progress_and_no_fake_completion() -> None:
+    import inspect
+
+    import dsql_migrator.ui.data_migration as dm
+
+    src = inspect.getsource(dm.build_data_migration_screen)
+    assert "on_progress=migration_state.set_fk_apply_progress," in src, (
+        "the action must hand the engine a reporter, or the card cannot advance"
+    )
+    # The old finally wrote (total, total) unconditionally: with Stop that claimed a
+    # partially-applied pass was complete.
+    assert "set_fk_apply_progress(total, total)" not in src

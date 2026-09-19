@@ -52,11 +52,11 @@ transaction must **re-run**, and under contention this happens often.
 | Retry budget exhausted | Conflicts never clear | Recorded as a **failure**, never silently dropped (`test_exhausted_occ_conflict_is_recorded_as_failure`) |
 | High concurrency vs. connection quota (10,000/cluster, 100/s) | Many tables × many batches at once | Total in-flight connections stay bounded (`test_parallel_connection_use_is_bounded`); default 4 tables × 8 batches = 32 ≪ quota |
 
-### 1 MiB per-value limit — a single big value can't be stored
+### Per-value size limit — a single big value can't be stored
 
 | DSQL characteristic | Scenario tested | How it's exercised |
 |---|---|---|
-| Value > 1 MiB | A large value (MySQL LOB/TEXT, or PostgreSQL `text`/`bytea`/`json`) over the limit during Full Load **and** during CDC | Per-row **quarantine** (PK + reason recorded, table keeps loading) at Full Load; **DLQ** at the sink, measured before the write (`DsqlSinkTask` oversized guard) |
+| Binary value > 1 MiB | A large binary value (MySQL `BLOB` family, PostgreSQL `bytea`) over DSQL's 1 MiB `bytea` limit during Full Load **and** during CDC — a `text`/`json` value has no 1 MiB cap, so it is only oversized past the 8 MiB per-transaction safety budget | Per-row **quarantine** (PK + reason recorded, table keeps loading) at Full Load; **DLQ** at the sink, measured **per type** before the write (`DsqlSinkTask` oversized guard) |
 | Value > 8 MiB (can't traverse Kafka) | An even larger column | Excluded **at capture** via Debezium `column.exclude.list`, driven by the Evaluation `OVERSIZED_LOB` flag |
 
 ### IAM-token auth — no password, 15-min tokens, 60-min connections
@@ -149,8 +149,10 @@ hit as many DSQL characteristics as possible in one run:
   precision > 38, `FLOAT`/`DOUBLE`, `BIT`, collation, the full DATE/TIME family,
   `ENUM`/`SET`/`JSON`, and the full LOB family (forces the **type-heterogeneity**
   and **unsupported-type** scenarios).
-- **Deliberately failing rows**: ~1.5 MiB LOB values (forces the **1 MiB
-  quarantine/DLQ** scenario) and a `TINYINT(1)` = `2` in an isolated table (forces
+- **Deliberately failing rows**: ~1.5 MiB LOB values (forces the
+  **oversized-value quarantine/DLQ** scenario — reproduce it today with a
+  `LONGBLOB`, the type DSQL still caps at 1 MiB) and a `TINYINT(1)` = `2` in an
+  isolated table (forces
   the **loud table-fatal** scenario).
 
 > **PostgreSQL source.** The same end-to-end path was validated separately on live

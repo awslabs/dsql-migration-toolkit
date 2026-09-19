@@ -91,7 +91,7 @@ types flagged for remodel, `numeric` precision clamping, no `DEFAULT` / serial /
 identity emitted — happens in **Schema Conversion**, not as an on-the-fly value
 transform.
 
-The full mapping (and how DSQL constraints like the 1 MiB per-value limit are handled)
+The full mapping (and how DSQL constraints like the 1 MiB per-value limit on `bytea` are handled)
 lives in [Chapter 2 §2.3](02-evaluation-and-schema-conversion.md#23-mysql--dsql-type-and-constraint-handling-reference)
 and the Schema Conversion step.
 
@@ -175,7 +175,7 @@ deliberately different.
 ### Per-row quarantine (the table keeps loading)
 
 If **DSQL rejects a specific row** at apply time (an error that carries a
-SQLSTATE — e.g. a value over DSQL's 1 MiB limit, a constraint violation), the
+SQLSTATE — e.g. a binary value over DSQL's 1 MiB `bytea` limit, a constraint violation), the
 loader does **not** fail the table. It binary-splits the batch down to the single
 offending row, **quarantines** that row (recording its **primary key and the
 reason — never its values**), and loads the rest. Quarantined rows show up in a

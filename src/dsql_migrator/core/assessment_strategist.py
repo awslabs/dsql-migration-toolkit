@@ -813,7 +813,7 @@ _FULL_LOAD_RECOVERY_CONTEXT = (
     "Retry failed tables). If it persists, check target reachability / IAM token "
     "expiry and source read headroom.\n"
     "- 'quarantined row' entries are NOT failures: the table loaded and specific "
-    "rows were skipped (e.g. a value over DSQL's ~1 MiB per-value limit).\n"
+    "rows were skipped (e.g. a binary value over DSQL's 1 MiB bytea limit).\n"
     "- STANDING-GAP TRAP (critical before CDC): CDC only carries changes forward from "
     "the Full Load watermark -- it does NOT backfill history. So a table that FAILED "
     "in Full Load, or that has quarantined/dropped rows, is a STANDING gap CDC will "

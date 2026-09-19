@@ -380,7 +380,7 @@ CDC 싱크(Java) — 가 동일한 매핑을 따르며, 공유 **write-contract*
 |---|---|---|---|---|
 | `CHAR(n)` | `char(n)` | `char(n)` | AUTO | |
 | `VARCHAR(n)` | `varchar(n)` | `varchar(n)` | AUTO | |
-| `TINYTEXT`/`TEXT`/`MEDIUMTEXT`/`LONGTEXT` | `text` | `text` | AUTO | 단일 값 **> ~1 MiB**는 DSQL이 거부 → 행 단위 격리(Full Load) / DLQ(CDC); 초대형 LOB 컬럼은 Evaluation에서 플래그. |
+| `TINYTEXT`/`TEXT`/`MEDIUMTEXT`/`LONGTEXT` | `text` | `text` | AUTO | `text` 값에는 1 MiB 상한이 **없습니다**(9.5 MiB까지 정상 저장됨을 실측) — 쓰기 트랜잭션당 10 MiB가 실질적인 상한. CDC는 Kafka 메시지 상한 때문에 약 8 MiB를 넘는 값을 캡처 단계에서 제외해야 하며, 초대형 LOB 컬럼은 Evaluation에서 플래그. |
 | `COLLATE`(예: `utf8mb4_*_ci`)가 있는 `CHAR`/`VARCHAR`/`TEXT` | 동일, **collation 드롭** | `text` (collation dropped) | MANUAL | DSQL은 기본 collation 사용; 대소문자 무시 collation은 보존 안 됨 → MANUAL 플래그. |
 | `BINARY(n)` / `VARBINARY(n)` | `bytea` | `bytea` (raw bytes) | AUTO | 길이 수식어 드롭(PostgreSQL `bytea`는 받지 않음). |
 | `TINYBLOB`/`BLOB`/`MEDIUMBLOB`/`LONGBLOB` | `bytea` | `bytea` (raw bytes) | AUTO | 바이너리 페이로드를 바이트 단위로 보존. |

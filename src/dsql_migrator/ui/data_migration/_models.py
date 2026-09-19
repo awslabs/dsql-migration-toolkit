@@ -1243,7 +1243,8 @@ def format_watermark(watermark: Watermark) -> WatermarkDisplay:
 # data, mirroring format_watermark / format_error_summary.
 # ---------------------------------------------------------------------------
 
-# Aurora DSQL rejects a single text/bytea value over 1 MiB; a row over the Kafka
+# Aurora DSQL rejects a single bytea value over 1 MiB (text has no such cap -- it is
+# bounded by the 10 MiB per-write-transaction limit); a row over the Kafka
 # client limit kills the source task. The CDC screen reuses the
 # evaluation OVERSIZED_LOB type set (_OVERSIZED_LOB_BASES) and base-type parser
 # (_base_type) imported above, so the exclusion offer stays in lock-step with the
@@ -1256,7 +1257,9 @@ class LobExclusionCandidate:
 
     ``columns`` are the column names flagged by the evaluation ``OVERSIZED_LOB``
     rule (MySQL ``mediumtext/longtext/mediumblob/longblob``) whose values can
-    exceed the Aurora DSQL 1 MiB per-value limit. Excluding them at capture
+    exceed what DSQL accepts in one value (``mediumblob``/``longblob`` -> ``bytea``,
+    hard-capped at 1 MiB; ``mediumtext``/``longtext`` -> ``text``, bounded by the
+    10 MiB per-transaction limit). Excluding them at capture
     (Debezium ``column.exclude.list``) is the only safe handling for values that
     can also exceed the 8 MiB broker limit -- runtime isolation cannot catch
     those.
@@ -1266,11 +1269,13 @@ class LobExclusionCandidate:
     columns: tuple[str, ...]
 
 
-# PostgreSQL base types whose values can exceed the DSQL 1 MiB per-value limit:
-# unbounded ``text`` and ``bytea`` (a length-bounded varchar(n) with small n cannot,
-# and json/jsonb are stored differently and are not hit by the text 1 MiB cap the same
-# way). The MySQL set (_OVERSIZED_LOB_BASES) does not match PG type names, so a PG
-# source would otherwise offer NO exclusions and the panel would falsely report none.
+# PostgreSQL base types whose values can exceed what DSQL stores in one value:
+# unbounded ``text`` and ``bytea`` (``bytea`` is hard-capped at 1 MiB, while ``text``
+# is bounded only by the 10 MiB per-write-transaction limit; a length-bounded
+# varchar(n) with small n cannot reach either, and json/jsonb are stored
+# differently). The MySQL set (_OVERSIZED_LOB_BASES) does not match PG type names, so
+# a PG source would otherwise offer NO exclusions and the panel would falsely report
+# none.
 _PG_OVERSIZED_LOB_BASES = frozenset({"text", "bytea"})
 
 
@@ -1398,8 +1403,11 @@ def format_column_exclude_list(
     return ",".join(entries)
 
 
-# DSQL caps a single value at 1 MiB and the MSK Serverless broker caps a message
-# at 8 MiB; the Kafka *client* default is 1 MiB (spike H13). Used for display.
+# DSQL caps a single BINARY (bytea) value at 1 MiB; text has NO 1 MiB cap (it is
+# bounded instead by the 10 MiB per-write-transaction limit), so 1 MiB is the
+# conservative display floor for a column set that can hold either type. The MSK
+# Serverless broker caps a message at 8 MiB; the Kafka *client* default is 1 MiB
+# (spike H13). Used for display.
 _DSQL_VALUE_LIMIT_MIB = 1
 _BROKER_MESSAGE_LIMIT_MIB = 8
 
@@ -1639,7 +1647,10 @@ def cdc_handling_facts() -> list[CdcHandlingFact]:
         ),
         CdcHandlingFact(
             handled=False,
-            title=f"Very large values (over {_DSQL_VALUE_LIMIT_MIB} MiB) must be excluded",
+            title=(
+                f"Very large values (binary over {_DSQL_VALUE_LIMIT_MIB} MiB, any "
+                f"value over {_BROKER_MESSAGE_LIMIT_MIB} MiB) must be excluded"
+            ),
             detail=(
                 "A value too large to stream cannot be recovered later. Exclude such "
                 "oversized LOB/TEXT columns at capture (the panel below)."

@@ -64,6 +64,24 @@ _LOGGER = logging.getLogger(__name__)
 # How often the live Full Load progress region polls the background job (seconds).
 _POLL_INTERVAL_SECONDS = 1.5
 
+
+def _call_or(provider, default):
+    """Resolve a provider (or a plain value) to a value, falling back to ``default``.
+
+    Lets a live region re-read its inputs on every refresh instead of rendering whatever
+    they were when the page was first built. A plain value is passed through so a caller --
+    or a test -- can still supply one, and a provider that raises yields ``default`` rather
+    than tearing down the region it was being rendered into.
+    """
+    if provider is None:
+        return default
+    if not callable(provider):
+        return provider
+    try:
+        return provider()
+    except Exception:  # noqa: BLE001 - a status read must never break the render
+        return default
+
 # Cloudscape "Alert" renderer alias (single source of truth in ui.design).
 _render_notice = render_notice
 
@@ -281,10 +299,16 @@ def _render_full_load_step(
     # the end of the load for minutes. A CDC migration already applies them at cut over;
     # this makes the Full-Load-only path the same flow.
     apply_foreign_keys: Optional[Callable[[], None]] = None,
-    foreign_keys_pending: int = 0,
-    foreign_keys_applied: Optional[tuple] = None,
-    foreign_keys_running: bool = False,
-    foreign_keys_progress: Optional[tuple] = None,
+    # PROVIDERS, deliberately not values: the FK card renders inside the @ui.refreshable
+    # live region below, so anything evaluated at page-render time is frozen for the life of
+    # the page. Passing values meant a refresh re-rendered the card with the state from
+    # BEFORE the button was clicked -- the spinner never advanced and never gave way to the
+    # result, even with every constraint already on the target. Each is called on every
+    # refresh instead. They stay Optional so a caller that needs none passes none.
+    foreign_keys_pending: Optional[Callable[[], int]] = None,
+    foreign_keys_applied: Optional[Callable[[], Optional[tuple]]] = None,
+    foreign_keys_running: Optional[Callable[[], bool]] = None,
+    foreign_keys_progress: Optional[Callable[[], Optional[tuple]]] = None,
     cancel_foreign_keys: Optional[Callable[[], None]] = None,
 ) -> None:
     """Render the Full Load step: confirm the selected workloads, then run it.
@@ -886,18 +910,25 @@ def _render_full_load_step(
         )
         # Referential integrity is a SEPARATE, explicit step now -- and the load reports
         # complete without it, so this must state plainly that it is still outstanding.
+        # Resolved HERE, per refresh, so the card tracks the FK job instead of replaying the
+        # state the page was first built with.
+        fk_running = bool(_call_or(foreign_keys_running, False))
         _render_foreign_key_action(
             ui,
             terminal=current.status in ("DONE", "FAILED", "CANCELLED"),
-            pending=foreign_keys_pending,
-            applied=foreign_keys_applied,
+            pending=int(_call_or(foreign_keys_pending, 0) or 0),
+            applied=_call_or(foreign_keys_applied, None),
             apply_foreign_keys=apply_foreign_keys,
             connections_ready=session.connection_ready(),
-            running=foreign_keys_running,
-            progress=foreign_keys_progress,
+            running=fk_running,
+            progress=_call_or(foreign_keys_progress, None),
             cancel_foreign_keys=cancel_foreign_keys,
         )
-        if running:
+        # The FK pass is its OWN job and runs entirely AFTER the load is terminal, so gating
+        # the poll on the load alone left nothing to re-arm it: the card could not advance
+        # its counter and could not replace the spinner with the result. Poll while EITHER is
+        # live.
+        if running or fk_running:
             # Re-arm a single-shot poll: it fires once, refreshes only this live
             # region (not the whole page), and the refresh renders a fresh timer.
             # once=True avoids the "parent slot deleted" crash a repeating timer
@@ -914,6 +945,14 @@ def _render_full_load_step(
             return
         mapped = job_status_to_step_status(current.status)
         if mapped is None:
+            _live_detail.refresh()
+            return
+        # The load is terminal -- but the foreign-key action is a SEPARATE job that only
+        # STARTS once it is, so ending the poll here left its card frozen on "0 of N done"
+        # with a spinner that never gave way to the result. While that job runs, refresh
+        # just the live region (which re-arms the next tick); the single full refresh below
+        # then happens on the first tick after it settles.
+        if bool(_call_or(foreign_keys_running, False)):
             _live_detail.refresh()
             return
         if mapped is StepStatus.FAILED:
@@ -1311,7 +1350,8 @@ def _quarantined_cell_tooltip(row: "FullLoadTableRow") -> str:
     noun = "row was" if dropped == 1 else "rows were"
     return (
         f"{dropped:,} {noun} permanently dropped — a value Aurora DSQL could not "
-        "store (e.g. over its ~1 MiB per-value limit). The rest of this table loaded "
+        "store (e.g. a binary value over its 1 MiB bytea limit). The rest of this "
+        "table loaded "
         "normally. See the quarantine panel below for each row's primary key and "
         "reason; fix the source value and Reload this table to close the gap."
     )

@@ -39,7 +39,7 @@ PostgreSQL-16 와이어) 타입 이질성 상황은 해당되지 않지만, 분�
 | 당신의 데이터에 이런 게 있으면 | 순진하게 옮기면 위험한 이유 (DSQL 차이) | 도구가 대신 하는 일 | 당신이 확인하는 곳 |
 |---|---|---|---|
 | **아주 큰 테이블** (수억 행) | DSQL은 트랜잭션당 3,000행·10 MiB·5분·DDL 1개로 제한 — 한 번에 밀어넣으면 실패하거나 잘림 | PK 순서로 **스트리밍**하며 한도에 맞춰 배치로 나눠 적재 — 테이블이 아무리 커도 메모리와 트랜잭션이 안전하게 유지. 인덱스는 데이터 적재를 마친 뒤 따로 생성 | Full Load 진행률, Validation **행 수** |
-| **1 MiB가 넘는 큰 값** (MySQL LOB/TEXT 또는 PostgreSQL `text`/`bytea`/`json`) | DSQL은 값 하나가 1 MiB를 넘으면 저장 불가 | 그 **행만 격리**(quarantine)해 PK와 사유를 기록하고 나머지 테이블은 계속 적재. CDC 중에도 같은 값은 DLQ로 분리 — 값 하나 때문에 테이블 전체가 멈추지 않음 | Full Load **에러 로그**, CDC **DLQ**, Validation의 부족분 |
+| **초대형 값** (MySQL LOB/TEXT 또는 PostgreSQL `text`/`bytea`/`json`) | DSQL은 **바이너리**(`bytea`) 값이 1 MiB를 넘으면 저장 불가 — **텍스트**는 1 MiB 상한이 없고 쓰기 트랜잭션당 10 MiB가 실질적인 상한 | 한도를 넘는 **바이너리** 값은 그 **행만 격리**(quarantine)해 PK와 사유를 기록하고 나머지 테이블은 계속 적재. CDC 중에도 같은 값은 DLQ로 분리 — 값 하나 때문에 테이블 전체가 멈추지 않음 | Full Load **에러 로그**, CDC **DLQ**, Validation의 부족분 |
 | **타입이 애매하게 변환되는 값** (MySQL 소스 한정 — 예: `TINYINT(1)`에 든 `2`, 24시간 범위를 벗어난 `TIME`) | `TINYINT(1)` → `boolean`에서 `2`를 `true`로 뭉개거나, 범위 밖 `TIME`을 하루 단위로 잘라 넣으면 **조용한 손상** | 그런 값은 임의로 평탄화하지 않고 **그 테이블 적재를 시끄럽게 멈춰** 사람이 판단하도록 넘김(어떤 컬럼·값인지, 어떻게 고칠지도 함께 안내). PostgreSQL 소스에는 네이티브 `boolean` 타입이 있어 그대로 통과하므로 이런 평탄화 위험이 없음 | Full Load **에러 로그** (테이블 단위 실패) |
 | **DSQL이 지원하지 않는 객체·타입** (MySQL: 트리거, 프로시저, 정밀도 38 초과 `DECIMAL`, 컬럼 255 초과 등 / PostgreSQL: 배열, 기하 타입(point/line/box 등), 네트워크 타입(inet/cidr/macaddr), xml, money, bit/bit varying, tsvector/tsquery, range/multirange, enum, 복합 타입, pgvector 등) | 그냥 옮기면 적재 도중에야 하나씩 터짐 | **Evaluation** 단계에서 미리 전수 분류(AUTO / MANUAL / UNSUPPORTED)하고 항목마다 사유·권장 조치·작업량을 제시 — 로드 전에 결정. 지원하지 않는 타입은 임의로 대체하지 않음. 단, PostgreSQL `numeric(p,s)`에서 p가 38을 넘으면 (MySQL `DECIMAL`>38처럼 거부하지 않고) 경고와 함께 **클램프**하고, 정밀도 없는 `numeric`/`decimal`은 `numeric(18,6)`으로 기본 지정 | **Evaluation** 리포트 |
 | **소스 고유 타입이 많은 스키마** (MySQL: 모든 정수/unsigned, `DECIMAL`, `BIT`, DATE/TIME 계열, `ENUM`/`SET`/`JSON`, LOB 등) | Full Load(벌크)와 CDC(스트리밍)가 같은 값을 **다르게** 저장하면 나중에 불일치 | 두 경로가 각 값을 **똑같은 형태**로 저장하도록 하나의 규약으로 강제. MySQL 소스는 MySQL→PostgreSQL 방언 변환을 거치지만, PostgreSQL 소스는 변환이 없어(소스·타깃 모두 PostgreSQL-16 와이어) 두 경로가 값을 그대로 전달 — 그래도 두 엔진 모두 이 규약을 지켜야 함 | Validation **체크섬** (값까지 비교) |
@@ -64,7 +64,8 @@ PostgreSQL-16 와이어) 타입 이질성 상황은 해당되지 않지만, 분�
 - parent → child → lob로 이어지는 **외래 키 체인** (FK 보존·적용 + PK 필수 + 고아 검사를 강제).
 - **최대한 다양한 타입** — 모든 정수/unsigned, 정밀도 38을 넘는 `DECIMAL`, `FLOAT`/`DOUBLE`, `BIT`,
   collation, 전체 DATE/TIME 계열, `ENUM`/`SET`/`JSON`, 전체 LOB 계열(타입 이질성·미지원 타입을 강제).
-- **일부러 실패하도록 심은 데이터** — 약 1.5 MiB짜리 LOB 값(1 MiB 격리를 강제)과, 격리된 테이블의
+- **일부러 실패하도록 심은 데이터** — 약 1.5 MiB짜리 LOB 값(실행 당시 DSQL의 값당 1 MiB 한도로 격리를
+  강제 — 이 한도는 현재 `bytea`(바이너리)에만 적용)과, 격리된 테이블의
   `TINYINT(1)` = `2`(시끄러운 테이블 실패를 강제).
 
 > **PostgreSQL 소스.** 동일한 end-to-end 경로를 PostgreSQL 소스(RDS/Aurora PostgreSQL → MSK →

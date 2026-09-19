@@ -1847,8 +1847,8 @@ def _migrate_one_table(
                 f"{outcome.rows_loaded:,} rows newly loaded"
                 f"{skipped_note}{quarantine_note}{excluded_note}"
                 + (
-                    " -- quarantined rows were DROPPED (e.g. a value over DSQL's "
-                    "~1 MiB per-value limit); see the error log and re-run after "
+                    " -- quarantined rows were DROPPED (e.g. a binary value over "
+                    "DSQL's 1 MiB bytea limit); see the error log and re-run after "
                     "fixing the source value"
                     if had_quarantine
                     else ""
@@ -2544,7 +2544,7 @@ def _finalize_run(
             status=ActivityStatus.SUCCESS,
             detail=(
                 f"{quarantined_rows} row(s) quarantined and ACCEPTED (permanently "
-                "dropped, e.g. a value over DSQL's ~1 MiB per-value limit); the "
+                "dropped, e.g. a binary value over DSQL's 1 MiB bytea limit); the "
                 f"target intentionally omits them. {counts.quarantined} table(s) "
                 "completed with accepted gaps -- the gap is reported in Validation."
             ),
@@ -2600,7 +2600,7 @@ def _finalize_run(
     if quarantine_only:
         guidance = (
             f"{quarantined_rows} row(s) were QUARANTINED (permanently dropped, "
-            "e.g. a value over DSQL's ~1 MiB per-value limit) and are listed in "
+            "e.g. a binary value over DSQL's 1 MiB bytea limit) and are listed in "
             "the downloadable error log by primary key. Fix the offending source "
             "value(s) and re-run Full Load (the idempotent re-load fills only the "
             "gap), or choose 'Accept quarantined rows & continue' to proceed to "
@@ -2686,7 +2686,9 @@ def _recreate_dependent_views(migrator: DataMigrator) -> None:
 
 
 def _apply_foreign_keys(
-    migrator: DataMigrator, handle: "Optional[JobHandle]" = None
+    migrator: DataMigrator,
+    handle: "Optional[JobHandle]" = None,
+    on_progress: Optional[Callable[[int, int], None]] = None,
 ) -> tuple[int, int, int]:
     """Call the migrator's foreign-key apply; return ``(applied, skipped, failed)``.
 
@@ -2714,8 +2716,16 @@ def _apply_foreign_keys(
         return bool(getattr(handle, "cancelled", False)) if handle is not None else False
 
     def _call():
-        # Simpler migrator doubles accept no arguments; liveness/stop reporting is
-        # best-effort, so fall back rather than fail the pass.
+        # Simpler migrator doubles accept fewer arguments; liveness/stop/progress reporting
+        # is best-effort, so degrade one step at a time rather than fail the pass. The
+        # progress reporter is tried FIRST and dropped first, so a double that predates it
+        # still gets heartbeat/should_cancel instead of losing both to one TypeError.
+        try:
+            return hook(
+                heartbeat=_beat, should_cancel=_stopped, on_progress=on_progress
+            )
+        except TypeError:
+            pass
         try:
             return hook(heartbeat=_beat, should_cancel=_stopped)
         except TypeError:
@@ -4027,6 +4037,7 @@ class BatchedTableMigrator:
         self,
         heartbeat: Optional[Callable[[], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
+        on_progress: Optional[Callable[[int, int], None]] = None,
     ) -> tuple[int, int, int]:
         """Run-level POST-PASS: re-create preserved foreign keys after the data load.
 
@@ -4074,6 +4085,7 @@ class BatchedTableMigrator:
             child_pk_columns=child_pk_columns_for(self._inputs.inventory),
             heartbeat=heartbeat,
             should_cancel=should_cancel,
+            on_progress=on_progress,
         )
 
     def _view_connection_factory(self):
@@ -4112,6 +4124,12 @@ def apply_preserved_foreign_keys(
     # which _mark_done cannot undo. Also called by the cut-over action, which passes none.
     heartbeat: Optional[Callable[[], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
+    # Progress reporter, called ``(settled, total)`` once per FK that finishes (applied,
+    # skipped or failed) -- DISTINCT from ``heartbeat``, which fires many times per FK
+    # (every orphan-count page and every index poll) and so cannot be counted. Without
+    # this the step's card sat at "0 of N done" for the whole pass, which is exactly the
+    # "it looks stuck, click it again" the explicit action was meant to end.
+    on_progress: Optional[Callable[[int, int], None]] = None,
 ) -> tuple[int, int, int]:
     """Re-create preserved foreign keys as post-load ``ADD CONSTRAINT``, orphan-gated.
 
@@ -4155,6 +4173,22 @@ def apply_preserved_foreign_keys(
     if not pending:
         return (0, 0, 0)
 
+    _total = len(pending)
+
+    def _report(settled: int) -> None:
+        """Publish ``(settled, total)``; cosmetic, so a reporter error never breaks the pass."""
+        if not callable(on_progress):
+            return
+        try:
+            on_progress(settled, _total)
+        except Exception:  # noqa: BLE001 - progress is display only
+            _LOGGER.debug("Foreign-key progress reporter raised", exc_info=True)
+
+    # Publish the real total up front. The caller's own pre-count (pending_foreign_key_count)
+    # is computed separately, so this is what keeps the card's denominator equal to the number
+    # of FKs the pass will actually work through.
+    _report(0)
+
     # Pre-count orphans for every FK CONCURRENTLY. The DDL below stays SERIAL (one DDL per
     # transaction on DSQL, and it costs 0.18s per FK), so only the expensive read fans out.
     _pregated = _pregate_orphans(
@@ -4168,6 +4202,11 @@ def apply_preserved_foreign_keys(
             # and honour a stop so Stop is not held for the rest of the pass. Both are
             # no-ops for the cut-over caller, which supplies neither.
             _beat()
+            # Exactly ``_fk_index`` FKs have finished by the time iteration ``_fk_index``
+            # starts, so reporting here is accurate, not lagging -- and it needs no
+            # re-indentation of the body below, whose many ``continue`` paths would each
+            # have to remember to report.
+            _report(_fk_index)
             if _stopped():
                 _LOGGER.info(
                     "Foreign-key pass stopped by request with %d of %d applied.",
@@ -4321,6 +4360,10 @@ def apply_preserved_foreign_keys(
                     ),
                 )
     finally:
+        # Final count, from the buckets themselves: every settled FK increments exactly one
+        # of applied/skipped/failed, so this is right both for a completed pass (== total)
+        # and for one cut short by Stop (fewer, which is what the card should then show).
+        _report(applied + skipped + failed)
         try:
             probe.close()
         except Exception:  # noqa: BLE001 - best-effort close

@@ -156,8 +156,10 @@ _MAX_KEY_COLUMNS = 8
 # DSQL numeric maximum precision (numeric supports a precision of up to 38).
 _MAX_NUMERIC_PRECISION = 38
 
-# MySQL LOB/TEXT base types whose maximum size exceeds the DSQL text/bytea 1 MiB
-# limit, so a large enough value cannot be stored and must be reviewed.
+# MySQL LOB/TEXT base types whose maximum size exceeds what DSQL stores in one value
+# (blob -> bytea is capped at 1 MiB; text has no 1 MiB cap but is bounded by the
+# 10 MiB per-write-transaction limit), so a large enough value cannot be stored and
+# must be reviewed.
 _OVERSIZED_LOB_BASES = frozenset(
     {"mediumtext", "longtext", "mediumblob", "longblob"}
 )
@@ -876,7 +878,7 @@ class TooManyKeyColumnsRule(Rule):
 
 
 class OversizedLobRule(Rule):
-    """Flag columns whose MySQL LOB/TEXT type can exceed the DSQL 1 MiB limit."""
+    """Flag columns whose MySQL LOB/TEXT type can exceed what DSQL stores per value."""
 
     rule_id = "OVERSIZED_LOB"
 
@@ -897,11 +899,17 @@ class OversizedLobRule(Rule):
                         classification=Classification.MANUAL,
                         risk=(
                             f"Columns ({names}) use a large MySQL LOB/TEXT type "
-                            "whose values can exceed the Aurora DSQL 1 MiB limit "
-                            "for text/bytea; an oversized value fails to load."
+                            "whose values can exceed what Aurora DSQL stores in one "
+                            "value: a BLOB column becomes bytea, which rejects "
+                            "anything over 1 MiB; a TEXT column becomes text, which "
+                            "has no 1 MiB cap but is bounded by the 10 MiB "
+                            "per-write-transaction limit. An oversized value fails "
+                            "to load."
                         ),
                         recommendation=(
-                            "Confirm no value exceeds 1 MiB, or move large objects "
+                            "Confirm no binary (BLOB) value exceeds 1 MiB and no "
+                            "text value approaches the 10 MiB per-transaction "
+                            "write limit, or move large objects "
                             "to external storage (e.g. Amazon S3) and store a "
                             "reference instead."
                         ),

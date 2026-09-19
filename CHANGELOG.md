@@ -5,6 +5,60 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.467
+
+### Fixed
+
+- **"Apply foreign keys" showed `0 of N done` for the whole pass, then kept spinning after
+  every constraint was already on the target.** Reported from a workshop: the card appeared
+  correctly, was polled for 110 s, never moved, and only a manual page reload turned it into
+  "6 applied" — so the "it looks stuck, click it again" that the explicit action was
+  introduced to end was still there, for minutes on a real schema. Three distinct causes:
+  - **No per-FK progress was ever published.** The action wrote only `(0, total)` before
+    submitting and `(total, total)` in a `finally`. The pass now takes an `on_progress`
+    reporter and calls it once per foreign key as it settles. This is deliberately NOT the
+    existing `heartbeat`: since v0.1.456 that fires on every orphan-count page and every
+    index poll, many times per FK, so counting it would have produced nonsense.
+  - **The card's inputs were frozen at page render.** It is drawn inside the step's
+    `@ui.refreshable` live region, but `running` / `progress` / `applied` / `pending` were
+    passed as *values* evaluated at the call site — so refreshing the region replayed the
+    state from before the button was ever clicked. They are providers now, re-read on every
+    refresh. This, not the missing counter, is why completion never appeared.
+  - **Nothing re-armed the poll.** The re-arm was gated on the *load* job, and the FK pass is
+    a separate job that starts only once the load is terminal. The live region now polls while
+    either is live, and the poll refreshes only that region while the FK job runs (a full page
+    rebuild every 1.5 s would have been the alternative), doing its single full refresh on the
+    first tick after it settles.
+  - The `finally` that forced `(total, total)` is gone: it reported a pass cut short by **Stop
+    applying** as complete, and the card reads progress only while the job runs, so the write
+    was never displayed anyway. The engine's own final report counts settled foreign keys, so
+    a stopped pass now shows its true partial count.
+- **Corrected 91 statements across the manual, the UI and the READMEs that told the reader
+  Aurora DSQL caps any single value at ~1 MiB.** Measured live 2026-09-19: that is true only
+  for `bytea`; a `text` value stores intact at 9.5 MiB and is bounded by the 10 MiB
+  per-write-transaction limit. v0.1.464 fixed the sink and the limitations table, but the
+  claim was repeated in ~60 more places — the MySQL/PostgreSQL type tables ("a value > ~1 MiB
+  is rejected" on the `TEXT` row), the CDC three-band DLQ table (which said every 1–8 MiB
+  value is dead-lettered, when text in that band now applies normally), the test-scenario
+  matrix, and customer FAQ Q24. All three languages. Changelog entries were left untouched as
+  the historical record.
+
+### Tests
+
+- 3856 green (+9). Eight mutations checked, each caught: removing the per-FK report, forcing
+  the final count to the total (the Stop misreport), letting a reporter error escape, dropping
+  the reporter in the wrapper's degrade chain, re-arming the poll on the load only, reverting
+  the call site to frozen values, removing `_call_or`'s fallback, and letting the poll fall
+  into its full-refresh branch while the FK job runs.
+
+### Known gaps
+
+- v0.1.464's per-type value guard is still **unverified live** — it needs an MSK pipeline, and
+  none has been stood up since. Unit + mutation only.
+- The local `scripts/cdc_dlq_demo.py` can no longer produce an oversized-value DLQ at all: its
+  1.2 MiB `longtext` now replicates normally, and `product_media`'s only blob is excluded at
+  capture. Its docstring now says so and points at schema drift as the reliable trigger.
+
 ## v0.1.466
 
 ### Changed

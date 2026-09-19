@@ -39,7 +39,8 @@ No. DSQL speaks the **PostgreSQL** wire protocol, authenticates with short-lived
 **IAM tokens** (no password), uses **optimistic concurrency** instead of locks,
 and intentionally omits features that don't scale horizontally — **no
 triggers/stored procedures, a per-transaction row limit, a 1 MiB per-value
-limit**, and more (foreign keys, by contrast, **are supported and enforced**).
+limit on binary (`bytea`) columns**, and more (foreign keys, by contrast, **are
+supported and enforced**).
 Your schema and, in places, your application must adapt. Evaluation (step 1) tells
 you exactly where.
 
@@ -229,7 +230,8 @@ livelock on hot keys (a per-row, record-by-record replay happens only on a
 *permanent, non-OCC* error, to isolate the bad row to the DLQ while healthy rows
 commit); (2) it mints and
 **refreshes short-lived IAM tokens** so an hours-long stream never stalls on auth;
-(3) it enforces DSQL's 3000-row / 1 MiB envelopes and routes poison rows to a DLQ.
+(3) it enforces DSQL's 3000-row and per-value size envelopes (1 MiB for `bytea`)
+and routes poison rows to a DLQ.
 See [Chapter 4 §4.1](04-cdc-and-dsql-constraints.md#41-the-pipeline).
 
 
@@ -418,11 +420,12 @@ tool does not recompute an LSN-based drift figure; watch CDC convergence instead
 a clean final go/no-go, freeze source writes and let CDC drain first (Q27).
 
 
-**Q24. What happens to rows DSQL can't store (e.g. a value > 1 MiB)?**
+**Q24. What happens to rows DSQL can't store (e.g. a binary value > 1 MiB)?**
 
-They are **never silently dropped**. In Full Load a value over DSQL's ~1 MiB
-per-value limit is **quarantined** per-row (its primary key + reason recorded in the
-error log) while the rest of the table loads; in CDC such a row goes to the **DLQ**.
+They are **never silently dropped**. In Full Load a **binary** value over DSQL's
+1 MiB `bytea` limit is **quarantined** per-row (its primary key + reason recorded in
+the error log) while the rest of the table loads; in CDC such a row goes to the
+**DLQ**. (A `text` value has no 1 MiB cap, so it loads normally.)
 Values that can't even traverse the pipeline (> ~8 MiB) are **excluded at capture**,
 driven by the `OVERSIZED_LOB` flag from Evaluation. You see exactly what was set
 aside. See [Chapter 6 §6.1](06-limitations.md#61-aurora-dsql-feature-limits-your-schema-must-fit-these).
