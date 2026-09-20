@@ -4199,3 +4199,42 @@ def test_the_invalidation_runs_before_the_results_are_recorded() -> None:
     for recorder in ("conv_state.set_apply_results(results)", "conv_state.merge_apply_results(results)"):
         invalidate = src.index("_invalidate_applier_cache_if_target_changed(results)")
         assert invalidate < src.index(recorder), recorder
+
+
+def test_the_foreign_key_pane_is_compact_not_the_tall_ddl_pane() -> None:
+    """The deferred-FK section is two lines, not the DDL panes' 8rem-floor box.
+
+    It reused ``ddl-pane``, whose ``min-height: 8rem`` gave a two-statement ALTER list the
+    same tall box as a 30-line CREATE TABLE -- so the one section Schema Apply does not even
+    run dominated the Generated DDL panel.
+    """
+    import re
+
+    import dsql_migrator.ui.schema_conversion as sc
+
+    css = sc._DDL_PANE_CSS
+    scroller = re.search(r"\.ddl-fk-pane \.cm-scroller \{([^}]*)\}", css)
+    assert scroller, css
+    rule = scroller.group(1)
+    # min == max, so one constraint and twenty render the same height.
+    heights = re.findall(r"(?:min|max)-height:\s*([\d.]+)rem", rule)
+    assert len(heights) == 2 and heights[0] == heights[1], rule
+    assert float(heights[0]) < 4, f"a two-line box should be well under 4rem: {rule}"
+    assert "overflow: auto" in rule, rule
+    # CodeMirror falls back to a fixed 256px unless the wrapper and editor are auto -- the
+    # trap the panes above this one document, and the reason a scroller bound alone is not
+    # enough.
+    assert ".ddl-fk-pane { height: auto; }" in css, css
+    assert ".ddl-fk-pane .cm-editor { height: auto; }" in css, css
+
+
+def test_the_foreign_key_pane_offers_expand_since_it_is_now_clipped() -> None:
+    # A two-line box needs a way to read the whole list; the pane and the dialog are both
+    # read-only, so offering it here cannot invite edits into a discarded copy.
+    import inspect
+
+    import dsql_migrator.ui.schema_conversion as sc
+
+    src = inspect.getsource(sc._render_fk_section)
+    assert "ddl-fk-pane" in src and "ddl-pane\"" not in src, src
+    assert "_render_expand_ddl_button" in src, src

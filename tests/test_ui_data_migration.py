@@ -2681,15 +2681,15 @@ def test_apply_foreign_keys_logs_named_activity_step(monkeypatch) -> None:
         def apply_foreign_keys(self):
             return (2, 1, 0)
 
+    # The WRAPPER must log nothing: the audit event is emitted by the shared pass
+    # (apply_preserved_foreign_keys), which is also the only record the CUT-OVER caller
+    # gets -- it logs nothing of its own. Both logging produced two lines 0.3 ms apart for
+    # one event, disagreeing on action name, status and wording ("orphan rows" vs
+    # "orphaned rows").
     engine._apply_foreign_keys(_Applied())
-    assert len(events) == 1
-    category, action, kw = events[0]
-    assert category is engine.ActivityCategory.FULL_LOAD
-    assert action == "apply foreign keys"
-    assert kw["status"] is engine.ActivityStatus.SUCCESS
-    assert "2 applied" in kw["detail"] and "1 skipped" in kw["detail"]
+    assert events == [], f"the wrapper must not log a second line: {events}"
 
-    # A failure in the pass -> FAILURE status.
+    # Nor for a failing pass -- still exactly one line, and it comes from the pass.
     events.clear()
 
     class _Failed:
@@ -2697,7 +2697,45 @@ def test_apply_foreign_keys_logs_named_activity_step(monkeypatch) -> None:
             return (0, 0, 3)
 
     engine._apply_foreign_keys(_Failed())
-    assert events and events[0][2]["status"] is engine.ActivityStatus.FAILURE
+    assert events == [], events
+
+
+def test_the_foreign_key_pass_emits_one_named_audit_line_with_its_outcome(monkeypatch) -> None:
+    """The single audit event lives in the shared pass, so EVERY caller gets exactly one.
+
+    It has to live here, not in ``_apply_foreign_keys``: the cut-over action calls this
+    function directly and logs nothing of its own, so moving the line to that wrapper -- the
+    obvious way to de-duplicate -- would have silently deleted cut over's only record.
+    """
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    _ddls, conv = _three_fk_conv()
+    monkeypatch.setattr(engine, "_pregate_orphans", lambda pending, *a, **k: {0: 0, 1: 4, 2: 0})
+    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+
+    def _apply(add_ddl, *, connection_factory):
+        if '"fk_c"' in add_ddl:
+            raise RuntimeError("ALTER rejected")
+
+    monkeypatch.setattr(engine, "apply_foreign_key", _apply)
+    events: list[tuple] = []
+    monkeypatch.setattr(
+        engine, "log_activity",
+        lambda category, action, **kw: events.append((category, action, kw)),
+    )
+    engine.apply_preserved_foreign_keys({"child": conv}, lambda: _FkProbeConnection(0))
+
+    summary = [e for e in events if e[1] == "apply foreign keys"]
+    assert len(summary) == 1, f"exactly one summary line per pass: {events}"
+    category, _action, kw = summary[0]
+    assert category is engine.ActivityCategory.FULL_LOAD
+    # A failed constraint makes the pass's own line a FAILURE, not an unconditional INFO.
+    assert kw["status"] is engine.ActivityStatus.FAILURE, kw
+    assert "1 applied" in kw["detail"] and "1 skipped (orphan rows)" in kw["detail"], kw
+    # Not "post-load": the identical pass runs at cut over for a CDC migration.
+    assert "post-load" not in kw["detail"].lower(), kw
+    # One spelling only -- the two lines used to disagree ("orphan" vs "orphaned").
+    assert "orphaned" not in kw["detail"], kw
 
 
 def test_apply_foreign_keys_no_activity_when_nothing_applied(monkeypatch) -> None:
@@ -10986,19 +11024,29 @@ def test_log_cdc_connector_transitions_logs_changes_only(monkeypatch) -> None:  
         pass
 
     ms = _MS()
-    # First pass: src RUNNING logged; sink PROVISIONING (intermediate) not logged.
+    # FIRST pass: nothing is logged. "No last-seen state" is not a transition -- it used to
+    # be treated as one, so a session's first poll asserted "connector src running" in the
+    # AUDIT TRAIL for a state nobody had seen change. Observed live: a fresh page render
+    # logged two connectors RUNNING for a cdc-stack that had been DELETE_COMPLETE for
+    # twelve hours. The first observation seeds the baseline instead.
     dm._log_cdc_connector_transitions(ms, object())
-    assert events == [("connector src running", dm.ActivityStatus.SUCCESS)]
+    assert events == [], f"a first observation must seed, not log: {events}"
+    assert getattr(ms, "_last_logged_connector_states", None) == {
+        "src": "RUNNING", "sink": "PROVISIONING"
+    }, "the baseline must be seeded, or the next poll logs a false transition"
 
-    # Same states again: nothing new (de-duped on the last-seen state).
+    # Same states again: still nothing.
     dm._log_cdc_connector_transitions(ms, object())
-    assert len(events) == 1
+    assert events == []
 
-    # sink transitions to FAILED -> a single FAILURE event; src unchanged (no re-log).
+    # A GENUINE transition after the seed still logs -- the point of the function.
     holder["states"] = {"src": "RUNNING", "sink": "FAILED"}
     dm._log_cdc_connector_transitions(ms, object())
-    assert events[-1] == ("connector sink failed", dm.ActivityStatus.FAILURE)
-    assert len(events) == 2
+    assert events == [("connector sink failed", dm.ActivityStatus.FAILURE)], events
+
+    # And src, unchanged across the whole sequence, is never logged at all.
+    assert not [e for e in events if "src" in e[0]], events
+    assert len(events) == 1
 
 
 def test_apply_cdc_status_merges_applied_ops_and_never_wipes_on_empty() -> None:
@@ -21453,4 +21501,69 @@ def test_a_confirmed_schema_replace_forgets_the_applied_foreign_keys() -> None:
     body = body[:body.index("def _predrop_replace_blocking_foreign_keys")]
     assert "foreign_keys_blocking_replace" not in body, (
         "it must NOT be gated on the pre-drop's pairs -- a replaced CHILD produces none"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# An EMPTY live connector listing must clear remembered names, not be ignored
+#
+# Observed live (event account, 2026-09-20): the Schema Conversion screen warned "CDC is
+# streaming to the target — the schema is already applied" for a cdc-stack that had been
+# DELETE_COMPLETE for twelve hours, while the Data Migration panel -- from the SAME
+# discovery pass -- correctly said "No cdc-stack is deployed yet" and the chip read
+# CDC: NOT_STARTED.
+#
+# Cause: _ensure_cdc_controller stores the controller, then returns on an empty listing
+# WITHOUT writing the names. cdc_pipeline_live is
+# (controller is not None AND cdc_connector_names), so it stayed TRUE on leftover names --
+# and after a restart those come from the session snapshot, restored with no AWS
+# confirmation (gated only on the last action not being delete/stop, so a console-side
+# delete leaves them). The Schema Conversion warning reads that predicate with no AWS call
+# of its own, so nothing else could ever correct it.
+# --------------------------------------------------------------------------- #
+
+
+def test_an_empty_live_listing_clears_remembered_connector_names(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import dsql_migrator.ui.data_migration._cdc_status as cdc_status
+    from dsql_migrator.ui.data_migration._cdc_state import cdc_pipeline_live
+
+    state = DataMigrationState()
+    # What a session snapshot restores: the names, with nothing confirming they still exist.
+    state.set_cdc_stack_name("dsql-cdc-stack")
+    state.set_cdc_connector_names(
+        ["dsql-cdc-stack-debezium-source", "dsql-cdc-stack-dsql-sink"]
+    )
+    state.set_cdc_connector_running_names(["dsql-cdc-stack-debezium-source"])
+
+    class _Controller:
+        def list_connectors(self):
+            return []  # the stack is gone -- and this is ALSO what an access error returns
+
+    # The builder is imported function-locally, so patch it on its OWN module.
+    import dsql_migrator.core.msk_connect_controller as msk
+
+    monkeypatch.setattr(
+        msk, "build_msk_connect_controller", lambda *a, **k: _Controller()
+    )
+    session = SimpleNamespace(
+        target_config=SimpleNamespace(region="us-east-2"), aws_profile=None,
+        workflow=None, set_workflow=lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(cdc_status, "_sync_cdc_step_status", lambda *_a, **_k: None)
+    monkeypatch.setattr(cdc_status, "_probe_cdc_stack_phase", lambda *_a, **_k: None)
+
+    # Signature is (migration_state, session) -- not the other way round.
+    cdc_status._ensure_cdc_controller(state, session)
+
+    assert state.cdc_connector_names == [], (
+        "an empty live listing must CLEAR the remembered names; leaving them makes "
+        "cdc_pipeline_live true with zero connectors in AWS"
+    )
+    assert state.cdc_connector_running_names == []
+    assert state.cdc_controller is not None, "the controller is still stored (a later deploy needs it)"
+    assert cdc_pipeline_live(state) is False, (
+        "this is the predicate behind Schema Conversion's 'CDC is streaming' warning, "
+        "which makes no AWS call of its own -- so it must not outlive the evidence"
     )

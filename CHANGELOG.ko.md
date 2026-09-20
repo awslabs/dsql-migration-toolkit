@@ -5,6 +5,61 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.474
+
+### 수정
+
+- **커넥터 목록이 비었을 때 더 이상 fail-OPEN 하지 않으므로, "CDC is streaming"이 커넥터보다 오래
+  살아남지 못합니다.** discovery는 MSK Connect 컨트롤러를 저장한 뒤, 라이브 목록이 비면 *이름을 쓰지
+  않고* 반환했습니다 — 그런데 `cdc_pipeline_live`는 `컨트롤러 있음 AND cdc_connector_names`이므로
+  **남아 있던 이름으로 계속 참**이었습니다. 재시작 뒤 그 이름은 세션 스냅샷에서, AWS 확인 없이
+  복원됩니다(가드는 마지막 UI 액션이 delete/stop인지 뿐이라, 콘솔에서 스택을 지우면 그대로 남습니다).
+  실제 관측: **Schema Conversion** 화면이 12시간 전에 `DELETE_COMPLETE`된 스택에 대해
+  *"CDC is streaming to the target — the schema is already applied"* 라고 경고하는 동시에, **같은
+  discovery 패스**에서 나온 Data Migration 패널은 *"No cdc-stack is deployed yet"*, 칩은
+  `CDC: NOT_STARTED`였습니다. 그 경고는 자체 AWS 호출이 없어 다른 무엇도 바로잡을 수 없었습니다.
+  이제 빈 목록은 이름과 running-names를 모두 지웁니다. 컨트롤러는 이후 배포에 필요하므로 유지합니다.
+- **활동 로그가 아무도 변경을 본 적 없는 커넥터를 `running`으로 기록했습니다.**
+  `_log_cdc_connector_transitions`는 "last-seen 상태에서의 변경만 기록한다"고 선언하지만 기준값이
+  초기화되지 않아, 세션의 **첫 관측**이 전이로 취급됐습니다. 실제로 새 페이지 렌더가 12시간 전에
+  삭제된 스택의 커넥터 2개를 `SUCCESS [cdc] connector … running`으로 남겼고, 활동 로그는 **감사
+  추적**이라 사후 조사가 그 거짓 주장에서 출발합니다. 이제 첫 관측은 조용히 기준값만 시딩하고, 그
+  이후의 진짜 전이는 그대로 기록합니다.
+- **외래 키 패스 하나가 서로 모순되는 감사 줄 두 개를 만들었습니다.** 패스 내부의 무조건 `INFO`와
+  호출자의 조건부 `SUCCESS`가 같은 사건에 0.3ms 간격으로 찍히며 액션 이름·상태·문구가 달랐습니다
+  (`orphan rows` vs `orphaned rows`, 대소문자, 마침표). 이제 패스가 내는 한 줄입니다 — 이건 의도적
+  선택이고 "내부를 지운다"는 명백해 보이는 방향이 아닙니다: **컷오버** 액션이 그 패스를 직접 호출하고
+  자체 로그가 없어서, 줄을 호출자로 옮기면 컷오버의 유일한 기록이 조용히 사라집니다(실제 로그에서
+  짝 없는 `foreign keys applied` 한 줄로 확인됨). 남은 줄은 호출자의 이름과 SUCCESS/FAILURE 상태를
+  가져오고, 같은 패스가 컷오버에서도 도므로 "post-load"는 뺐습니다.
+- **"migration type selected"가 고른 타입으로 분류됩니다.** 카테고리가 `full_load`로 고정돼 있어
+  **CDC only**를 골라도 `[full_load]`로 남았습니다 — 영역으로 로그를 필터링하면 CDC 마이그레이션을
+  정의하는 그 결정이 가려집니다.
+
+### 변경
+
+- **Generated DDL의 지연 외래 키 창이 2줄 높이가 되고 확대 버튼이 붙었습니다.** DDL 비교 패널의
+  클래스를 재사용해 `min-height: 8rem` 바닥값을 물려받았고, `ALTER TABLE … ADD CONSTRAINT` 두 줄이
+  30줄 `CREATE TABLE`과 같은 크기의 박스로 그려졌습니다 — Schema Apply가 실행하지도 않는 섹션이
+  패널을 지배한 셈입니다. 제약이 1개든 20개든 같은 높이이며, 넘치면 스크롤하고 전체는 클릭 한 번입니다.
+
+### 테스트
+
+- 3890개 통과(+8). 네 수정에 걸쳐 변이 15건 모두 검출 — 이름을 지우지 않고 반환, 이름만 지우고 낡은
+  running-names 유지, 첫 관측을 다시 로깅, 기준값 기록 없이 시딩, 호출자의 중복 줄 재추가,
+  `orphaned rows` 표기 복원 등. 기존 테스트 2개가 결함을 기대값으로 박아두고 있어(첫 관측이 로깅된다,
+  래퍼가 로깅한다) 함께 정정했습니다.
+
+### 남은 미해결
+
+- 거짓 `running` 두 줄은 더 이상 기록되지 않지만, **그 상태가 어디서 왔는지는 확정하지 못했습니다**.
+  `connector_states`의 생산자는 라이브 `list_connectors` 필터 하나뿐이고 결과가 비면 로거가 그냥
+  반환하므로, 현재 코드로는 프레시 프로세스에서 그 줄이 나올 수 없습니다. 추측으로 채우지 않았습니다.
+- `list_connectors()`가 모든 오류를 삼켜 `[]`를 반환하므로 "커넥터가 없음"과 "이 태스크가
+  `kafkaconnect:ListConnectors`를 호출할 수 없음"이 구분되지 않습니다. 이번 릴리스로 그것이
+  *streaming*이 아니라 *absent*로 읽히게(UI 주장 기준 fail-closed) 됐지만, 둘은 여전히 구분할
+  가치가 있습니다.
+
 ## v0.1.473
 
 ### 변경

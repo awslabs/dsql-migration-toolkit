@@ -2746,16 +2746,9 @@ def _apply_foreign_keys(
     if not isinstance(counts, tuple) or len(counts) != 3:
         return (0, 0, 0)
     applied, skipped, failed = counts
-    if applied or skipped or failed:
-        log_activity(
-            ActivityCategory.FULL_LOAD,
-            "apply foreign keys",
-            status=ActivityStatus.FAILURE if failed else ActivityStatus.SUCCESS,
-            detail=(
-                f"Post-load foreign-key pass: {applied} applied, "
-                f"{skipped} skipped (orphaned rows), {failed} failed."
-            ),
-        )
+    # No log_activity here: apply_preserved_foreign_keys already emits the one audit event
+    # for the pass, and it is the only one the CUT-OVER caller gets. Logging again produced
+    # two lines 0.3 ms apart for a single event, disagreeing on name, status and wording.
     return (int(applied or 0), int(skipped or 0), int(failed or 0))
 
 
@@ -4374,13 +4367,23 @@ def apply_preserved_foreign_keys(
             probe.close()
         except Exception:  # noqa: BLE001 - best-effort close
             pass
+    # THE single audit event for a foreign-key pass, emitted HERE because every caller
+    # shares this function -- the Full Load post-pass, the Data Migration action, and the
+    # CUT-OVER action, which logs nothing of its own (so moving this to the caller, as the
+    # obvious de-duplication, would have deleted cut over's only record of the pass).
+    # There used to be a second line from _apply_foreign_keys 0.3 ms later, with a different
+    # action name, a different status and different wording ("orphaned rows", capitalised,
+    # full stop) -- one event reported twice, contradicting itself. Unreachable for a run
+    # with no foreign keys: the `if not pending` return above fires first, so the caller's
+    # "no noise" intent holds without a second condition.
     log_activity(
         ActivityCategory.FULL_LOAD,
-        "foreign keys applied",
-        status=ActivityStatus.INFO,
+        "apply foreign keys",
+        status=ActivityStatus.FAILURE if failed else ActivityStatus.SUCCESS,
         detail=(
-            f"post-load foreign keys: {applied} applied, {skipped} skipped "
-            f"(orphan rows), {failed} failed"
+            # Not "post-load": the same pass runs at cut over for a CDC migration.
+            f"Foreign-key pass: {applied} applied, {skipped} skipped (orphan rows), "
+            f"{failed} failed."
         ),
     )
     return (applied, skipped, failed)

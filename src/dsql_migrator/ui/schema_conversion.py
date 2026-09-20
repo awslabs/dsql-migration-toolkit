@@ -3883,6 +3883,16 @@ _DDL_PANE_CSS = """
 .ddl-expanded { height: auto; max-height: min(44rem, 74vh); }
 .ddl-expanded .cm-editor { height: auto; max-height: min(44rem, 74vh); }
 .ddl-expanded .cm-scroller { max-height: min(44rem, 74vh); min-height: 6rem; overflow: auto; }
+/* The deferred-foreign-key pane is COMPACT: two lines, then it scrolls. It used ``ddl-pane``,
+   whose ``min-height: 8rem`` gave a two-statement ALTER list the same tall box as a 30-line
+   CREATE TABLE -- so the section that Schema Apply does not even run dominated the panel.
+   ``height: auto`` on the wrapper and the editor (CodeMirror otherwise falls back to a fixed
+   256px and ignores the scroller bound -- the trap the panes above document), with min == max
+   so the box is the same height whether there is one constraint or twenty. Deliberately a
+   hair over two lines: the clipped third line is the signal that there is more to scroll. */
+.ddl-fk-pane { height: auto; }
+.ddl-fk-pane .cm-editor { height: auto; }
+.ddl-fk-pane .cm-scroller { max-height: 3.25rem; min-height: 3.25rem; overflow: auto; }
 """
 
 
@@ -4100,14 +4110,24 @@ def _render_fk_section(ui: object, fk_ddl: str) -> None:
     )
     ui.add_css(_DDL_PANE_CSS)  # type: ignore[attr-defined]
     with ui.element("div").classes("w-full min-w-0"):  # type: ignore[attr-defined]
+        # Expand sits WITH the compact pane, not instead of it: two lines is enough to see
+        # what the section is, and the full list is one click away. (Unlike the editable
+        # target, offering it here cannot invite edits into a discarded copy -- both this
+        # pane and the dialog are read-only.)
+        with ui.row().classes("items-center gap-1 w-full no-wrap"):  # type: ignore[attr-defined]
+            ui.space()  # type: ignore[attr-defined]
+            _render_expand_ddl_button(
+                ui, fk_ddl, title="Foreign keys", language="PostgreSQL"
+            )
         # ``disable`` (not ``readonly``) blocks input on NiceGUI's CodeMirror -- the
-        # same read-only treatment as the source/target comparison panes.
+        # same read-only treatment as the source/target comparison panes. ``ddl-fk-pane``
+        # (not ``ddl-pane``) keeps it two lines tall instead of inheriting the 8rem floor.
         ui.codemirror(  # type: ignore[attr-defined]
             fk_ddl,
             language="PostgreSQL",
             theme="basicLight",
             line_wrapping=False,
-        ).classes("w-full ddl-pane").props("disable")
+        ).classes("w-full ddl-fk-pane").props("disable")
 
 
 def _render_editable_target(

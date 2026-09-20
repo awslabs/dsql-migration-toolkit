@@ -5,6 +5,71 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.474
+
+### Fixed
+
+- **An empty connector listing no longer fails OPEN, so "CDC is streaming" cannot outlive the
+  connectors.** Discovery stores the MSK Connect controller, then returned on an empty live
+  listing *without writing the names* — and `cdc_pipeline_live` is
+  `controller is not None AND cdc_connector_names`, so it stayed **true on leftover names**.
+  After a restart those names come from the session snapshot, restored with no AWS
+  confirmation at all (gated only on the last UI action not being delete/stop, so a stack
+  deleted from the console leaves them). Observed live: the **Schema Conversion** screen warned
+  *"CDC is streaming to the target — the schema is already applied"* for a cdc-stack that had
+  been `DELETE_COMPLETE` for twelve hours, while the Data Migration panel — from the SAME
+  discovery pass — correctly said *"No cdc-stack is deployed yet"* with the chip on
+  `CDC: NOT_STARTED`. That warning reads the predicate with no AWS call of its own, so nothing
+  else could ever correct it. An empty listing now clears both the names and the running-names;
+  the controller is still kept, because a later deploy needs it.
+- **The activity log recorded connectors as `running` that nobody had seen change.**
+  `_log_cdc_connector_transitions` promises "only a CHANGE from the last-seen state is logged",
+  but its baseline is never initialised, so a session's FIRST observation was treated as a
+  transition. Live, a fresh page render wrote two `SUCCESS [cdc] connector … running` lines for
+  a stack deleted twelve hours earlier — and the activity log is an **audit trail**, so an
+  investigation starts from that false claim. The first observation now seeds the baseline
+  silently; a genuine transition after it still logs.
+- **One foreign-key pass produced two contradictory audit lines.** An unconditional `INFO`
+  inside the pass and a conditional `SUCCESS` from its caller fired 0.3 ms apart for the same
+  event, disagreeing on action name, status and wording (`orphan rows` vs `orphaned rows`,
+  capitalisation, full stop). Now one line, emitted by the pass — which is deliberate, not the
+  obvious de-duplication: the **cut-over** action calls that pass directly and logs nothing of
+  its own, so moving the line to the caller would have silently deleted cut over's only record
+  (visible in the real log as a lone `foreign keys applied` with no companion). The surviving
+  line takes the caller's named action and SUCCESS/FAILURE status, and drops "post-load" since
+  the same pass runs at cut over.
+- **"migration type selected" is filed under the type that was chosen.** The category was fixed
+  at `full_load`, so picking **CDC only** was logged as `[full_load]` — filtering the log by
+  area hid the decision that defines a CDC migration.
+
+### Changed
+
+- **The deferred foreign-key pane in Generated DDL is two lines tall, with an expand button.**
+  It reused the DDL comparison panes' class, whose `min-height: 8rem` gave a two-statement
+  `ALTER TABLE … ADD CONSTRAINT` list the same tall box as a 30-line `CREATE TABLE` — so the one
+  section Schema Apply does not even run dominated the panel. Same height for one constraint or
+  twenty; it scrolls, and the full list is one click away.
+
+### Tests
+
+- 3890 green (+8). Fifteen mutations checked across the four fixes, each caught — including
+  returning without clearing the names, clearing the names but keeping the stale running-names,
+  logging a first observation again, seeding without recording the baseline, re-adding the
+  caller's duplicate line, and restoring the `orphaned rows` spelling. Two existing tests had
+  encoded the defects as expected behaviour (a first observation logs; the wrapper logs) and
+  were corrected.
+
+### Known gaps
+
+- The two false `running` log lines are no longer written, but **where their state came from is
+  not established**: `connector_states` has one producer, a live `list_connectors` filter, and
+  an empty result makes the logger bail — so a fresh process cannot produce them from the code
+  as written. Not invented into a fix.
+- `list_connectors()` swallows every error and returns `[]`, so "the connectors are gone" and
+  "this task cannot call `kafkaconnect:ListConnectors`" are indistinguishable. With this
+  release that now reads as *absent* (fail-closed for the UI claim) rather than *streaming*,
+  but the two still deserve to be told apart.
+
 ## v0.1.473
 
 ### Changed

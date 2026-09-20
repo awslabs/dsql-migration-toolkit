@@ -1083,6 +1083,21 @@ def _ensure_cdc_controller(migration_state, session) -> None:
     if not names:
         # No connectors of mine: this is also how a Stop/Delete reads once it lands,
         # so the step status must follow (see _sync_cdc_step_status).
+        #
+        # CLEAR the names -- this branch used to return WITHOUT writing them, which made an
+        # empty live listing fail OPEN. The controller is stored just above regardless, so
+        # `cdc_controller is not None and cdc_connector_names` (cdc_pipeline_live) stayed
+        # TRUE on whatever names were left over -- and after a restart those come from the
+        # session snapshot, which restores them with no AWS confirmation at all (it is gated
+        # only on the last UI action not being delete/stop, so a stack deleted from the
+        # console leaves them). Observed live: the Schema Conversion screen warned "CDC is
+        # streaming to the target" for a cdc-stack that had been deleted twelve hours
+        # earlier, while this same discovery had just proved the stack absent -- that screen
+        # reads cdc_streaming_started with no AWS call of its own, so nothing else could ever
+        # correct it. Writing the empty list is what makes "I looked and there are none"
+        # beat a remembered value.
+        migration_state.set_cdc_connector_names([])
+        migration_state.set_cdc_connector_running_names([])
         _sync_cdc_step_status(session, streaming=False)
         return
     migration_state.set_cdc_connector_names(names)

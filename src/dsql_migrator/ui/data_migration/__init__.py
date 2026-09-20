@@ -2799,7 +2799,13 @@ def _render_migration_type_selector(
             # real choice). Logged only on an actual change, so re-confirming the
             # current tile on a refresh never spams the log.
             log_activity(
-                ActivityCategory.FULL_LOAD,
+                # The category has to follow the CHOICE: fixed at FULL_LOAD, picking
+                # "CDC only" was filed under [full_load], so filtering the log by area
+                # hid the decision that defines a CDC migration. A combined run touches
+                # both, and the load is what it starts with, so it stays FULL_LOAD.
+                ActivityCategory.CDC
+                if new_type is MigrationType.CDC_ONLY
+                else ActivityCategory.FULL_LOAD,
                 "migration type selected",
                 status=ActivityStatus.INFO,
                 detail=f"migration type set to {new_type.value}",
@@ -3300,7 +3306,20 @@ def _log_cdc_connector_transitions(migration_state, job_manager) -> None:
         return
     if not states:
         return
-    last = getattr(migration_state, "_last_logged_connector_states", {}) or {}
+    last = getattr(migration_state, "_last_logged_connector_states", None)
+    if last is None:
+        # FIRST observation of this session: SEED, do not log. "No last-seen state" was
+        # being treated as "changed", so the very first poll of a session wrote
+        # "connector X running" -- a positive factual claim, at that timestamp, about a
+        # connector nobody had seen change. Observed live: a fresh page render logged two
+        # connectors RUNNING for a cdc-stack that had been DELETE_COMPLETE for twelve
+        # hours, and the activity log is an AUDIT TRAIL, so an investigation starts from
+        # that false line. The docstring's promise -- only a CHANGE is logged -- is now
+        # actually kept; a genuine transition after this seed still logs.
+        migration_state._last_logged_connector_states = {
+            n: str(st).upper() for n, st in states.items()
+        }
+        return
     for name, state in states.items():
         norm = str(state).upper()
         if last.get(name) == norm:
