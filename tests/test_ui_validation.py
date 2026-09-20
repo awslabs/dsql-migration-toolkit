@@ -2139,84 +2139,39 @@ def test_cdc_in_use_resolves_from_migration_type() -> None:
     assert _cdc_in_use(_S(MigrationType.FULL_LOAD_ONLY)) is False
     # Unresolvable type degrades to the simpler (Full-Load-only) runbook.
     assert _cdc_in_use(object()) is False
+def test_the_cutover_screen_no_longer_offers_an_ai_dba_chat() -> None:
+    """The "Ask AI DBA about cut over" section was removed deliberately.
 
-
-def test_cutover_ai_facts_assembles_credential_free_grounding() -> None:
-    # The AI DBA cut-over chat is grounded on this facts block. It must carry the
-    # non-secret target coordinates, migration path, validation verdict, and identity-
-    # sync state, and NEVER a password / IAM token (Property 7).
-    from types import SimpleNamespace
-
-    from dsql_migrator.core.models import (
-        TargetConnectionConfig, ValidationMode, ValidationReport,
-    )
-    from dsql_migrator.ui.validation import (
-        cutover_ai_facts,
-        summarize_validation,
-    )
-
-    session = SimpleNamespace(
-        target_config=TargetConnectionConfig(
-            cluster_endpoint="abc.dsql.us-east-1.on.aws",
-            region="us-east-1",
-            database="postgres",
-            username="admin",
-        ),
-    )
-    # A clean 1-of-1 report is enough grounding for the facts assertions below.
-    report = ValidationReport(
-        items=[
-            TableValidationResult(
-                table="orders", source_row_count=1, target_row_count=1,
-                row_count_match=True, matched=True,
-            )
-        ],
-        mode=ValidationMode.ROW_COUNT,
-    )
-    summary = summarize_validation(report)
-    facts = cutover_ai_facts(
-        session,
-        validation_summary=summary, release="clean", drift=None,
-        cdc_in_use=True,
-        identity_sync_result=None, identity_sync_failed=False,
-    )
-    # Non-secret target coords are named; the auth model is called out.
-    assert "abc.dsql.us-east-1.on.aws" in facts and "region=us-east-1" in facts
-    assert "role=admin" in facts and "short-lived IAM tokens" in facts
-    # NEVER a secret VALUE: no `password=` / `token=` assignment, even a placeholder.
-    # (The word "password" may appear as grounding — DSQL has NO password — which is
-    # exactly why we must not fake one.)
-    lowered = facts.lower()
-    assert "password=" not in lowered and "token=" not in lowered
-    assert "no password" in lowered  # positive: the auth model is grounded
-    # Verdict facts: the summary's verdict is woven in (whatever summarize_validation
-    # returned for this shape), plus the release/path.
-    assert "matched=1/1" in facts and "mode=ROW_COUNT" in facts
-    assert "Full Load + CDC" in facts and "CDC is live" in facts
-    assert "Release state: clean" in facts
-    # Identity-sync not run -> the STANDING risk is called out (23505 collision).
-    assert "NOT RUN" in facts and "23505" in facts
-
-
-def test_cutover_screen_offers_ai_dba_button_when_ai_is_on() -> None:
-    # The cut-over screen renders an "Ask AI DBA about cut over" button when AI is
-    # enabled + the opener is wired. Verify it appears via source inspection.
+    Its copy promised a verdict "grounded on your real validation, CDC and identity-sync
+    state" -- and that grounding did exist -- but it never carried the FOREIGN-KEY state,
+    which is the fact that decides GO/HOLD on this screen (cut over is where a CDC
+    migration applies them). A chat that sounds authoritative about a cut over while blind
+    to that is worse than not offering one. This pins the removal, including the grounding
+    helpers, so the section cannot drift back in half-wired.
+    """
     import inspect
 
-    from dsql_migrator.ui.validation import build_cutover_screen
+    import dsql_migrator.core.assessment_strategist as strategist_mod
+    import dsql_migrator.ui.validation as validation_mod
 
-    src = inspect.getsource(build_cutover_screen)
-    assert "Ask AI DBA about cut over" in src
-    assert 'scope_id="cutover"' in src
-    assert "cutover_ai_facts" in src  # credential-free grounding
-    assert "stream_cutover_chat" in src  # via the strategist
-    # Gated on AI being USABLE (enabled and not known-denied) + opener wired, so a
-    # session whose Bedrock access was refused stops offering an action that can only
-    # fail -- never renders without either. (The behavioral guarantee that the gate
-    # actually flips lives in test_ai_availability_* / test_no_ui_gate_reads_the_raw_ai
-    # _preference; this only pins that THIS screen consults the shared helper.)
-    assert "ai_is_usable(session)" in src
-    assert "open_ai_scope is not None" in src
+    # Comment lines are stripped: the signature carries a comment EXPLAINING the removal
+    # (and naming the section), which is documentation, not rendered copy.
+    src = inspect.getsource(validation_mod.build_cutover_screen)
+    code = "\n".join(
+        line for line in src.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "Ask AI DBA about cut over" not in code, code
+    assert 'scope_id="cutover"' not in code, code
+
+    # And nothing orphaned: the grounding builder and the strategist entry point are gone
+    # too, rather than left as dead code a reader has to reason about.
+    assert not hasattr(validation_mod, "cutover_ai_facts")
+    assert not hasattr(strategist_mod.AssessmentStrategist, "stream_cutover_chat")
+
+    # The screen still posts to the activity feed -- only the chat went.
+    import re as _re
+
+    assert _re.search(r"\bai_post_event\b", src), src
 
 
 def test_cutover_runner_marks_step_done() -> None:
@@ -4852,37 +4807,6 @@ def test_set_result_and_clear_outputs_reset_cutover_outcomes() -> None:
     assert state.cutover_identity_sync_failed == {}
     assert state.cutover_fk_apply is None
     assert state.proceed_without_foreign_keys is False
-
-
-def test_cutover_ai_facts_reports_real_advanced_table_count() -> None:
-    # FIX 6: the AI-facts identity-sync line reports the REAL advanced-table count (the
-    # length of the {table: restart_value} map), not a non-existent "synced_tables" key
-    # that always read 0.
-    from types import SimpleNamespace
-
-    from dsql_migrator.ui.validation import cutover_ai_facts
-
-    facts = cutover_ai_facts(
-        SimpleNamespace(target_config=None),
-        validation_summary=None,
-        release="clean",
-        drift=None,
-        cdc_in_use=True,
-        identity_sync_result={"orders": 743, "order_items": 1505},
-        identity_sync_failed=None,
-    )
-    assert "succeeded on 2 table(s)" in facts
-    assert "succeeded on 0 table(s)" not in facts
-
-    # A recorded FAILURE dict takes precedence and is called out as a 23505 risk.
-    facts_failed = cutover_ai_facts(
-        SimpleNamespace(target_config=None),
-        validation_summary=None, release="clean", drift=None, cdc_in_use=True,
-        identity_sync_result={}, identity_sync_failed={"orders": "boom"},
-    )
-    assert "FAILED" in facts_failed and "23505" in facts_failed
-
-
 def test_validation_run_identity_sync_failed_stored_and_surfaced() -> None:
     # FIX 7: a failed AUTOMATIC advance (validation-run sync) must be stored on the
     # state (not only logged) and surfaced on the results panel as an error.

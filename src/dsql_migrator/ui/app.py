@@ -525,12 +525,10 @@ def build_page(
         # conversions from the source inventory + schema-conversion edits/toggle.
         eval_store=EVALUATION_STORE,
         conversion_store=SCHEMA_CONVERSION_STORE,
+        # Activity feed only. The "Ask AI DBA about cut over" chat was removed: its advice
+        # did not read as grounded in the actual migration, and the one fact that decides
+        # GO/HOLD here -- the foreign-key state -- was never in its grounding.
         ai_post_event=_ai_post_event,
-        # The repoint-recipe / "safe to cut over?" chat can consult the real validation,
-        # CDC and load state via the shared read-only tools -- never sees secrets.
-        open_ai_scope=_open_ai_scope,
-        ai_tool_execute=_ai_tool_execute,
-        ai_tools=_AI_TOOL_SCHEMAS,
     )
     # Optional tool (not a workflow step): the Query Playground — convert a MySQL
     # statement to DSQL and non-destructively test whether it runs on the target.

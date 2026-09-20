@@ -1578,32 +1578,6 @@ class AssessmentStrategist:
             )
         return self.stream_chat(system, messages, on_delta)
 
-    def stream_cutover_chat(
-        self,
-        facts: str,
-        messages: Sequence[Mapping[str, str]],
-        on_delta: Callable[[str], None],
-        *,
-        tools: Optional[Sequence[Mapping[str, Any]]] = None,
-        execute: Optional[Callable[[str, Mapping[str, Any]], str]] = None,
-    ) -> "ObjectGuidanceOutcome":
-        """Stream one assistant turn of a chat about CUTTING OVER to Aurora DSQL.
-
-        Grounded by :func:`build_cutover_chat_system` on the credential-free cut-over
-        ``facts`` (migration type, non-secret target coordinates, last validation
-        verdict, CDC in use, identity-sync state), so replies produce a framework-
-        tailored repoint recipe and a GO/HOLD verdict that map to the real buttons in
-        this tool -- not generic advice. With ``tools`` + ``execute`` the turn runs
-        through :meth:`tool_chat` so it can consult live CDC/validation/load state.
-        Never raises.
-        """
-        system = build_cutover_chat_system(facts, source_engine=self._source_engine)
-        if tools is not None and execute is not None:
-            return self.tool_chat(
-                system, messages, on_delta, tools=tools, execute=execute
-            )
-        return self.stream_chat(system, messages, on_delta)
-
     def stream_cdc_chat(
         self,
         facts: str,

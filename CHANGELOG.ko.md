@@ -5,6 +5,32 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.479
+
+### 제거
+
+- **Cut over 단계의 "Ask AI DBA about cut over" 섹션을 제거했습니다.** 이 문구는 "grounded on your
+  real validation, CDC and identity-sync state"라며 GO/HOLD 판정과 repoint 레시피를 약속했고, 그
+  grounding은 실제로 있었습니다(타깃 좌표, 마지막 검증 결과의 matched/missing/extra 수치,
+  마이그레이션 경로, 소스 드리프트, identity-sync 결과와 `23505` 위험). 그런데 **외래 키 상태**는
+  한 번도 담기지 않았습니다 — 이 화면에서 GO/HOLD를 실제로 가르는 사실이고, 컷오버는 CDC
+  마이그레이션이 미뤄둔 외래 키를 적용하는 바로 그 단계입니다. 그것을 모른 채 컷오버에 대해 권위 있게
+  들리는 답을 주는 것은 아예 제공하지 않는 것보다 나쁘므로, 보완이 아니라 제거를 택했습니다.
+  - 고아 코드를 남기지 않았습니다: `cutover_ai_facts`(grounding 생성기)와
+    `AssessmentStrategist.stream_cutover_chat`(유일한 진입점)도 함께 제거했고,
+    `build_cutover_screen`에서 쓰이지 않게 된 AI 파라미터 3개와 `app.py`가 넘기던 인자도 정리했습니다.
+    읽는 사람만 고민하게 만드는 죽은 코드는 절약이 아닙니다.
+  - Cut over 단계는 여전히 **활동 피드**에 기록합니다(`ai_post_event`). 사라진 것은 채팅뿐입니다.
+  - AI 어시스턴트는 나머지 위치에서 그대로 동작합니다 — Evaluation, Schema Conversion, 격리 설명,
+    CDC/DLQ 화면은 손대지 않았습니다.
+
+### 테스트
+
+- 3896개 통과. 버튼 존재를 고정했던 테스트를 그 반대로 교체했습니다 — 섹션과 **두 grounding 헬퍼가
+  모두** 사라진 상태를 유지해야 하므로, 반쯤 배선된 상태로 되돌아올 수 없습니다 — 그리고 주석 줄을
+  걸러내 제거 이유를 적은 주석에 걸리지 않게 했습니다. 변이 3건 모두 검출: 섹션 복원, 두 헬퍼를 각각
+  죽은 코드로 남겨두는 경우.
+
 ## v0.1.478
 
 ### 변경

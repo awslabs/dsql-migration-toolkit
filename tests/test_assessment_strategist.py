@@ -669,44 +669,6 @@ def test_build_cutover_chat_system_grounds_on_facts_and_cutover_model() -> None:
     # Loosened guard for tool-wired chat.
     assert "USE ANY TOOLS" in system
     assert "decline" in system.lower()
-
-
-def test_stream_cutover_chat_routes_to_tool_chat_when_tools_given() -> None:
-    class _ToolClient:
-        def __init__(self) -> None:
-            self._round = 0
-
-        def invoke_model(self, **kwargs: object) -> dict:
-            self._round += 1
-            if self._round == 1:
-                return {"body": json.dumps({
-                    "stop_reason": "tool_use",
-                    "content": [{"type": "tool_use", "id": "t1",
-                                 "name": "get_validation_summary", "input": {}}],
-                })}
-            return {"body": json.dumps({
-                "stop_reason": "end_turn",
-                "content": [{"type": "text",
-                             "text": "GO. Repoint with sslmode=require and mint a fresh IAM token per connection."}],
-            })}
-
-    strategist = AssessmentStrategist(_config(), client=_ToolClient())
-    executed: list[str] = []
-
-    def execute(name: str, inp) -> str:  # noqa: ANN001
-        executed.append(name)
-        return json.dumps({"is_match": True, "matched_tables": 8, "total_tables": 8})
-
-    tools = [{"name": "get_validation_summary", "description": "x",
-              "input_schema": {"type": "object", "properties": {}}}]
-    outcome = strategist.stream_cutover_chat(
-        "Cut over facts", [{"role": "user", "text": "safe to cut over?"}],
-        lambda _t: None, tools=tools, execute=execute,
-    )
-    assert outcome.available and "GO" in outcome.markdown
-    assert executed == ["get_validation_summary"]  # the tool loop actually ran
-
-
 def test_build_cdc_error_chat_system_grounds_on_facts_and_cdc_model() -> None:
     from dsql_migrator.core.assessment_strategist import build_cdc_error_chat_system
 

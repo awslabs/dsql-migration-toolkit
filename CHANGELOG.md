@@ -5,6 +5,33 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.479
+
+### Removed
+
+- **The "Ask AI DBA about cut over" section is gone from the Cut over step.** Its copy promised
+  a GO/HOLD verdict and repoint recipe "grounded on your real validation, CDC and identity-sync
+  state" — and that grounding did exist (target coordinates, the last validation verdict with its
+  matched/missing/extra counts, the migration path, source drift, and the identity-sync outcome
+  with its `23505` risk). What it never carried was the **foreign-key state**, which is the fact
+  that decides GO/HOLD on this screen: cut over is where a CDC migration applies its deferred
+  foreign keys. A chat that sounds authoritative about a cut over while blind to that is worse
+  than not offering one, so the section was removed rather than patched.
+  - Nothing is left orphaned: `cutover_ai_facts` (the grounding builder) and
+    `AssessmentStrategist.stream_cutover_chat` (its only entry point) are removed too, along with
+    the three now-unused AI parameters on `build_cutover_screen` and the arguments `app.py`
+    passed for them. Dead code that only a reader has to reason about is not a saving.
+  - The Cut over step still posts to the **activity feed** (`ai_post_event`); only the chat went.
+  - The AI assistant remains available everywhere else it was — Evaluation, Schema Conversion,
+    the quarantine explainer, and the CDC/DLQ surfaces are untouched.
+
+### Tests
+
+- 3896 green. The test that pinned the button's presence is replaced by its inverse — the section
+  and BOTH grounding helpers must stay gone, so it cannot drift back in half-wired — and it
+  strips comment lines, so the comment explaining the removal does not trip it. Three mutations
+  checked, each caught: re-adding the section, and leaving either helper behind as dead code.
+
 ## v0.1.478
 
 ### Changed
