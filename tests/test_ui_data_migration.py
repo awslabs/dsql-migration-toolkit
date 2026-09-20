@@ -21713,3 +21713,218 @@ def test_both_run_paths_log_their_load_mode() -> None:
     assert "_load_mode_detail(inputs, sorted(retry_names))" in retry, retry
     # Scoped to the retried tables, not the whole original selection.
     assert "retry_names" in retry.split('"retry started"')[1][:400], retry
+
+
+# --------------------------------------------------------------------------- #
+# Start CDC: removing the blocking foreign keys must not throw the dialog away
+#
+# The removal used to close the dialog and tell the operator to "reopen Start CDC", which
+# made a two-click job four clicks and discarded the pre-flight results (binlog probe,
+# connection check) that had just been computed for them. The dialog now reports the removal
+# in place and unlocks Start.
+# --------------------------------------------------------------------------- #
+
+
+class _DialogUi:
+    """NiceGUI double for the Start CDC dialog: records notices, buttons and their state."""
+
+    def __init__(self):
+        self.notices: list[tuple[str, str]] = []   # (tone, header)
+        self.labels: list[str] = []
+        self.buttons: dict = {}
+        self.notifications: list[str] = []
+        self.dialog_open = False
+        self.dialog_closed = 0
+
+    class _Button:
+        def __init__(self, text, on_click):
+            self.text, self.on_click = text, on_click
+            self.enabled = True
+            self.props_seen: list[str] = []
+            self.tooltip_text = None
+
+        def props(self, spec="", *, remove=None, **_k):
+            if remove and "disable" in str(remove):
+                self.enabled = True
+            if "disable" in str(spec):
+                self.enabled = False
+            self.props_seen.append(f"{spec}|remove={remove}")
+            return self
+
+        def disable(self):
+            self.enabled = False
+            return self
+
+        def enable(self):
+            self.enabled = True
+            return self
+
+        def tooltip(self, text="", *_a, **_k):
+            self.tooltip_text = text
+            return self
+
+        def set_text(self, text):
+            self.text = text
+
+        def classes(self, *_a, **_k):
+            return self
+
+    class _Column:
+        def __init__(self, ui):
+            self._ui = ui
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_e):
+            return False
+
+        def clear(self):
+            self._ui.notices.clear()
+
+        def classes(self, *_a, **_k):
+            return self
+
+        def __getattr__(self, _n):
+            return lambda *_a, **_k: self
+
+    class _Dialog:
+        def __init__(self, ui):
+            self._ui = ui
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_e):
+            return False
+
+        def open(self):
+            self._ui.dialog_open = True
+
+        def close(self):
+            self._ui.dialog_open = False
+            self._ui.dialog_closed += 1
+
+        def classes(self, *_a, **_k):
+            return self
+
+        def style(self, *_a, **_k):
+            return self
+
+        def __getattr__(self, _n):
+            return lambda *_a, **_k: self
+
+    def dialog(self, *_a, **_k):
+        return _DialogUi._Dialog(self)
+
+    def card(self, *_a, **_k):
+        return _DialogUi._Column(self)
+
+    def column(self, *_a, **_k):
+        return _DialogUi._Column(self)
+
+    def row(self, *_a, **_k):
+        return _DialogUi._Column(self)
+
+    def label(self, text="", *_a, **_k):
+        self.labels.append(str(text))
+        return _DialogUi._Column(self)
+
+    def button(self, text="", on_click=None, *_a, **_k):
+        btn = _DialogUi._Button(str(text), on_click)
+        self.buttons[str(text)] = btn
+        return btn
+
+    def notify(self, message="", *_a, **_k):
+        self.notifications.append(str(message))
+
+    def __getattr__(self, _n):
+        return lambda *_a, **_k: _DialogUi._Column(self)
+
+
+def _drive_start_dialog(monkeypatch, *, drop_result):
+    """Open the real Start CDC dialog with one blocking FK, then click Remove."""
+    import asyncio
+    from types import SimpleNamespace
+
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+
+    ui = _DialogUi()
+    blocked = SimpleNamespace(
+        ours=[("ecommerce.products", "fk_products_category")], foreign=[], unknown=False
+    )
+    monkeypatch.setattr(cdc_ui, "cdc_deploy_connection_blocker", lambda *_a, **_k: None)
+    monkeypatch.setattr(cdc_ui, "_cdc_fk_block_reason", lambda *_a: ("x", "Foreign keys block CDC"))
+    monkeypatch.setattr(cdc_ui, "_cdc_fk_block_body", lambda *_a: "body")
+    monkeypatch.setattr(
+        cdc_ui, "_render_notice",
+        lambda _ui, *, tone="info", icon=None, header="", body="": ui.notices.append(
+            (tone, header)
+        ),
+    )
+    # The dialog gets fk_block from _probe_cdc_blocking_foreign_keys (blocking DSQL I/O),
+    # keeping it only when .blocking is true.
+    blocked.blocking = True
+    monkeypatch.setattr(
+        cdc_ui, "_probe_cdc_blocking_foreign_keys", lambda *_a, **_k: blocked
+    )
+    monkeypatch.setattr(cdc_ui, "_probe_binlog_resume_gap", lambda *_a, **_k: None)
+    monkeypatch.setattr(cdc_ui, "_current_job", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        cdc_ui, "_drop_cdc_blocking_foreign_keys", lambda *_a, **_k: drop_result
+    )
+
+    class _Run:
+        @staticmethod
+        async def io_bound(fn, *a, **k):
+            return fn(*a, **k)
+
+    import nicegui
+
+    monkeypatch.setattr(nicegui, "run", _Run, raising=False)
+    refreshes: list[int] = []
+    state = SimpleNamespace(cdc_stack_name="dsql-cdc-stack", job_id=None)
+    asyncio.run(
+        cdc_ui._open_cdc_start_dialog(
+            ui, state, lambda: None, session=object(), job_manager=object(),
+            inventory=None, refresh_after_drop=lambda: refreshes.append(1),
+        )
+    )
+    return ui, refreshes
+
+
+def test_removing_the_blocking_foreign_keys_keeps_the_dialog_and_unlocks_start(monkeypatch) -> None:
+    import asyncio
+
+    ui, refreshes = _drive_start_dialog(monkeypatch, drop_result=(1, 0))
+    start = ui.buttons.get("Start CDC")
+    remove = ui.buttons.get("Remove foreign keys")
+    assert start is not None and remove is not None, ui.buttons
+    assert start.enabled is False, "Start must be locked while an enforced FK remains"
+
+    asyncio.run(remove.on_click())
+
+    assert ui.dialog_closed == 0, (
+        "the dialog must STAY OPEN -- closing it discarded the pre-flight results and made "
+        "the operator reopen Start CDC"
+    )
+    assert start.enabled is True, "Start must be usable immediately after the removal"
+    tones = [tone for tone, _h in ui.notices]
+    assert "success" in tones, ui.notices
+    assert "error" not in tones, "the block notice must be replaced, not left standing"
+
+
+def test_a_partial_removal_leaves_start_locked(monkeypatch) -> None:
+    import asyncio
+
+    ui, _refreshes = _drive_start_dialog(monkeypatch, drop_result=(1, 1))
+    start = ui.buttons["Start CDC"]
+    asyncio.run(ui.buttons["Remove foreign keys"].on_click())
+
+    assert start.enabled is False, (
+        "a surviving enforced FK would make the stream dead-letter out-of-order child rows "
+        "(23503), so Start must stay locked"
+    )
+    tones = [tone for tone, _h in ui.notices]
+    assert "success" not in tones and "error" in tones, ui.notices
+    assert ui.dialog_closed == 0

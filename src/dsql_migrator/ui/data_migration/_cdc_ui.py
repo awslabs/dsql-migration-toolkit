@@ -2946,48 +2946,97 @@ async def _open_cdc_start_dialog(
                 header="The snapshot's binary log has been purged",
                 body=binlog_gap,
             )
+        # Tracks whether the removal already happened, so Cancel can still refresh the card
+        # behind the dialog (the drop is real even if the operator then backs out).
+        _fk_state = {"cleared": False}
         if fk_block is not None:
-            _render_notice(
-                ui,
-                tone="error",
-                icon="link",
-                header=_cdc_fk_block_reason(fk_block)[1],
-                body=_cdc_fk_block_body(fk_block),
-            )
-            if fk_block.ours:
+            # The block notice and the Remove button live in a container that can be
+            # REPLACED in place: the removal used to close the dialog and tell the operator
+            # to "reopen Start CDC", which made a two-click job a four-click one and threw
+            # away the pre-flight results (binlog probe, connection check) that had just
+            # been computed. Now the same dialog reports the removal and unlocks Start.
+            fk_slot = ui.column().classes("w-full gap-2")  # type: ignore[attr-defined]
 
-                async def _remove_fks() -> None:
-                    from nicegui import run
-
-                    remove_btn.disable()
-                    remove_btn.set_text("Removing…")
-                    dropped, failed = await run.io_bound(
-                        _drop_cdc_blocking_foreign_keys, fk_block.ours, session
+            def _render_fk_block() -> None:
+                fk_slot.clear()
+                with fk_slot:
+                    _render_notice(
+                        ui,
+                        tone="error",
+                        icon="link",
+                        header=_cdc_fk_block_reason(fk_block)[1],
+                        body=_cdc_fk_block_body(fk_block),
                     )
-                    dialog.close()
-                    if failed:
-                        ui.notify(  # type: ignore[attr-defined]
-                            f"Removed {dropped} foreign key(s), {failed} failed — see "
-                            "the activity log, then reopen Start CDC.",
-                            type="warning", position="top",
-                        )
-                    else:
-                        ui.notify(  # type: ignore[attr-defined]
-                            f"Removed {dropped} foreign key(s). Reopen Start CDC to "
-                            "continue; cut over re-creates them.",
-                            type="positive", position="top",
-                        )
-                    if refresh_after_drop is not None:
-                        refresh_after_drop()
+                    if not fk_block.ours:
+                        return
 
-                remove_btn = ui.button(  # type: ignore[attr-defined]
-                    "Remove foreign keys", on_click=_remove_fks, icon="link_off"
-                ).props("color=negative")
-                remove_btn.tooltip(
-                    "Drops exactly the "
-                    f"{len(fk_block.ours)} foreign key(s) this migration created; the "
-                    "cut-over 'Apply foreign keys' step re-creates them."
-                )
+                    async def _remove_fks() -> None:
+                        from nicegui import run
+
+                        remove_btn.disable()
+                        remove_btn.set_text("Removing…")
+                        dropped, failed = await run.io_bound(
+                            _drop_cdc_blocking_foreign_keys, fk_block.ours, session
+                        )
+                        if failed:
+                            # Still blocked: an enforced FK that survived would make the
+                            # stream dead-letter out-of-order child rows (23503), so Start
+                            # must stay locked. Re-render the block with the outcome rather
+                            # than closing -- the operator needs to see WHICH state they are
+                            # in, and the remaining constraints are still listed above.
+                            _fk_state["cleared"] = dropped > 0
+                            fk_slot.clear()
+                            with fk_slot:
+                                _render_notice(
+                                    ui,
+                                    tone="error",
+                                    icon="link",
+                                    header=(
+                                        f"{failed} foreign key(s) could not be removed — "
+                                        "CDC is still blocked"
+                                    ),
+                                    body=(
+                                        f"{dropped} removed, {failed} failed. The activity "
+                                        "log names each one. Drop the remaining "
+                                        "constraint(s) and reopen Start CDC; starting now "
+                                        "would make the stream dead-letter out-of-order "
+                                        "child rows (23503)."
+                                    ),
+                                )
+                            return
+                        # Cleared: report it HERE and unlock Start, so the operator carries
+                        # straight on instead of re-opening the dialog and re-running the
+                        # pre-flight checks.
+                        _fk_state["cleared"] = True
+                        fk_slot.clear()
+                        with fk_slot:
+                            _render_notice(
+                                ui,
+                                tone="success",
+                                icon="link_off",
+                                header=f"{dropped} foreign key(s) removed — ready to start",
+                                body=(
+                                    "The target no longer enforces the foreign keys this "
+                                    "migration created, so the stream cannot dead-letter "
+                                    "out-of-order child rows. Cut over re-creates them with "
+                                    '"Apply foreign keys" once the stream has drained.'
+                                ),
+                            )
+                        if not conn_blocker:
+                            start_btn.enable()
+                            start_btn.props(remove="disable")
+                            start_btn.tooltip("")
+
+                    remove_btn = ui.button(  # type: ignore[attr-defined]
+                        "Remove foreign keys", on_click=_remove_fks, icon="link_off"
+                    ).props("color=negative")
+                    remove_btn.tooltip(
+                        "Drops exactly the "
+                        f"{len(fk_block.ours)} foreign key(s) this migration created; the "
+                        "cut-over 'Apply foreign keys' step re-creates them."
+                    )
+
+            _render_fk_block()
 
         def _go() -> None:
             start_btn.disable()
@@ -2998,8 +3047,17 @@ async def _open_cdc_start_dialog(
             dialog.close()
             on_confirm()
 
+        def _dismiss() -> None:
+            dialog.close()
+            # The removal is REAL even if the operator then backs out, so the card behind
+            # the dialog must stop showing the FK block. The close used to happen inside the
+            # removal, which refreshed implicitly; now that the dialog stays open, the
+            # refresh has to hang off the dismissal instead.
+            if _fk_state["cleared"] and refresh_after_drop is not None:
+                refresh_after_drop()
+
         with ui.row().classes("justify-end gap-2 w-full"):  # type: ignore[attr-defined]
-            ui.button("Cancel", on_click=dialog.close).props("flat")  # type: ignore[attr-defined]
+            ui.button("Cancel", on_click=_dismiss).props("flat")  # type: ignore[attr-defined]
             start_btn = ui.button("Start CDC", on_click=_go).props("color=primary")  # type: ignore[attr-defined]
             if conn_blocker:
                 start_btn.props("disable")

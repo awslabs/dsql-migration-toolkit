@@ -5,6 +5,37 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.478
+
+### Changed
+
+- **Removing the foreign keys that block Start CDC now happens IN the Start CDC dialog, which
+  stays open.** Clicking **Remove foreign keys** used to drop them, close the dialog, and tell
+  the operator to "reopen Start CDC to continue" — turning a two-click job into four and
+  discarding the pre-flight results (the binary-log resume probe and the connection check) that
+  had just been computed for them. The dialog now replaces the block notice with
+  *"N foreign key(s) removed — ready to start"* and **enables Start CDC in place**, so the next
+  click is the one the operator came for.
+  - A PARTIAL removal keeps Start **locked** and says which state they are in ("N removed, M
+    failed"). A surviving enforced foreign key would make the sink dead-letter out-of-order
+    child rows (`23503`) permanently and silently, so this must not become a soft warning.
+  - **Cancel** now refreshes the CDC card when a removal happened: the drop is real even if the
+    operator then backs out, and the close used to do that refresh implicitly.
+
+- **Published `0.1.477` to all three registries and deployed it**, and repointed the
+  `ContainerImageUri` default to it.
+  - `mysql-dsql-migrator` (us-east-1): `app:58` -> `app:59`, 1/1, ALB target `healthy`.
+  - `mysql-dsql-migrator-seoul` (ap-northeast-2): `app:104` -> `app:105`.
+
+### Tests
+
+- 3899 green (+2). The new tests DRIVE the real dialog through a NiceGUI double and click
+  Remove, rather than grepping its source: they assert the dialog is not closed, that Start
+  becomes enabled, and that a partial failure leaves it disabled. Four mutations checked, each
+  caught. Source-grepping would not have been enough — while making this change the Cancel edit
+  landed in the WRONG dialog (`_open_cdc_infra_dialog`, which has an identical button row) and
+  only the undefined-globals guard caught it.
+
 ## v0.1.477
 
 ### Fixed

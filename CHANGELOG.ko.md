@@ -5,6 +5,32 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.478
+
+### 변경
+
+- **Start CDC를 막는 외래 키 제거가 Start CDC 팝업 안에서 끝나고, 팝업이 닫히지 않습니다.**
+  전에는 **Remove foreign keys**를 누르면 제거 후 팝업이 닫히고 "reopen Start CDC to continue"라고
+  안내했습니다 — 두 번이면 될 일이 네 번이 되고, 방금 계산해 둔 사전 점검 결과(바이너리 로그 재개
+  프로브, 연결 확인)를 버리게 됩니다. 이제 차단 알림이 *"N foreign key(s) removed — ready to
+  start"*로 바뀌고 **그 자리에서 Start CDC가 활성화**되어, 다음 클릭이 원래 하려던 그 클릭이 됩니다.
+  - **부분 실패**면 Start는 **계속 잠긴 채** 상태를 알려 줍니다("N removed, M failed"). 남아 있는
+    외래 키는 싱크가 순서 어긋난 자식 행을 영구히·조용히 dead-letter(`23503`)하게 만들므로, 이걸
+    가벼운 경고로 바꿀 수는 없습니다.
+  - **Cancel**은 제거가 있었던 경우 CDC 카드를 새로고침합니다: 조작자가 되돌아가도 삭제는 실제로
+    일어났고, 전에는 팝업이 닫히면서 그 새로고침이 암묵적으로 이뤄졌습니다.
+
+- **`0.1.477`을 세 레지스트리에 발행·배포**하고 `ContainerImageUri` 기본값을 repoint 했습니다.
+  - `mysql-dsql-migrator`(us-east-1): `app:58` -> `app:59`, 1/1, ALB 타깃 `healthy`.
+  - `mysql-dsql-migrator-seoul`(ap-northeast-2): `app:104` -> `app:105`.
+
+### 테스트
+
+- 3899개 통과(+2). 새 테스트는 소스를 grep하지 않고 NiceGUI 더블로 **실제 팝업을 구동해** Remove를
+  클릭합니다: 팝업이 닫히지 않는지, Start가 활성화되는지, 부분 실패 시 잠긴 채인지를 확인합니다.
+  변이 4건 모두 검출. grep으로는 부족했을 것입니다 — 이 변경 중 Cancel 수정이 **다른 팝업**
+  (`_open_cdc_infra_dialog`, 버튼 행이 동일)에 들어갔고 undefined-globals 가드만이 그것을 잡았습니다.
+
 ## v0.1.477
 
 ### 수정
