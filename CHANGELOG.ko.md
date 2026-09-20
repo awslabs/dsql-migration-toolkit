@@ -5,6 +5,34 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.477
+
+### 수정
+
+- **CDC 인프라 배포가 4분 작업에 15-20분을 안내하지 않습니다.** "Stack creation submitted — this
+  provisions MSK (~15-20 min)"는 템플릿이 *provisioned* MSK 클러스터를 만들던 시절의 값입니다. MSK
+  Serverless에서는 실제 실행 두 번이 **3분 34초**, **4분 7초**에 끝났습니다(후자는 실제 활동 로그의
+  `deploy CDC infrastructure … completed in 4m 7s` 줄). 3~5배 과대 추정은 무해한 여유가 아닙니다:
+  운영자가 화면을 떠나고, 다음에 **Start CDC**를 눌러야 하는 배포가 유휴로 남습니다. 진행 라벨과 제출
+  로그는 이제 *usually ~5 min*이라고 적습니다 — 리전/VPC에 따라 더 걸릴 수 있으므로 약속이 아니라
+  통상값입니다.
+  - 같은 낡은 수치가 운영자에게 보이는 다른 2곳에도 있었습니다(Prerequisites의 "먼저 배포하게 됩니다"
+    안내, Start over 프로비저닝 배너). 배포 로그만 고치면 놀람의 위치만 옮기는 셈입니다. 그 수치가
+    운영자 노출 문구에 다시 들어오면 실패하는 스윕 테스트를 추가했습니다.
+  - 삭제 추정치(`~15–45 min`, 네이티브 ENI 분리가 지배)는 그대로 뒀습니다 — 측정값이 없고, 없는 수치를
+    만들어 넣는 것이 지금 바로잡는 그 실수입니다.
+
+### 변경
+
+- **`0.1.476`을 세 레지스트리에 발행·배포하고 `ContainerImageUri` 기본값을 repoint 했습니다.**
+  `0.1.476`은 적재 모드 감사 줄(APPEND vs REPLACE, 그리고 신규 `retry started`)을 담은 첫 이미지입니다.
+  - `mysql-dsql-migrator`(us-east-1): `app:57` -> `app:58`, 1/1, ALB 타깃 `healthy`.
+  - `mysql-dsql-migrator-seoul`(ap-northeast-2): `app:103` -> `app:104`, 동일 이미지.
+
+### 테스트
+
+- 3897개 통과(+2). 변이 3건 모두 검출: 단계 라벨·제출 로그·다른 운영자 노출 문구에서 낡은 수치 복원.
+
 ## v0.1.476
 
 ### 추가

@@ -95,7 +95,7 @@ CDC_INFRA_STAGES: tuple[tuple[str, str], ...] = (
     ("check_existing", "Checking for existing stack"),
     ("validate_params", "Validating infrastructure parameters"),
     ("create_stack", "Submitting stack creation"),
-    ("stack_create", "Creating infrastructure (~15-20 min)"),
+    ("stack_create", "Creating infrastructure (usually ~5 min)"),
     ("infra_ready", "Infrastructure ready"),
 )
 
@@ -765,7 +765,17 @@ def run_cdc_infra_deploy(
             driver.stage("create_stack", "IN_PROGRESS")
             since = _now()
             deployer.create_stack(stack_name, template_body, params.filled)
-            driver.log("Stack creation submitted — this provisions MSK (~15-20 min).")
+            # MEASURED, not guessed. "~15-20 min" was a stale estimate from when this
+            # provisioned a PROVISIONED MSK cluster; with MSK Serverless the whole
+            # CloudFormation run is dominated by the Lambda + cluster create and finished in
+            # 3m34s and 4m07s on two real runs. Telling an operator to expect 15-20 minutes
+            # for a 4-minute job is not a harmless over-estimate: they leave the screen, and
+            # the deploy that needs them to press Start CDC next sits idle. Phrased as a
+            # typical, not a promise -- a different region/VPC can be slower.
+            driver.log(
+                "Stack creation submitted — provisioning MSK Serverless and the connector "
+                "plugins. This usually takes ~5 min."
+            )
             driver.stage("create_stack", "DONE")
 
             driver.stage("stack_create", "IN_PROGRESS")

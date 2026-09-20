@@ -1010,3 +1010,50 @@ def test_the_wait_deadline_helpers_actually_fire() -> None:
     assert _deadline_passed(deadline) is False
     time.sleep(0.08)
     assert _deadline_passed(deadline) is True
+
+
+def test_the_create_duration_estimate_matches_what_the_run_takes() -> None:
+    """A 3x-5x over-estimate is not a harmless margin.
+
+    "~15-20 min" dated from when this provisioned a PROVISIONED MSK cluster. With MSK
+    Serverless two real runs finished in 3m34s and 4m07s -- so the operator was told to expect
+    15-20 minutes for a ~4-minute job, left the screen, and the deploy that needs them to
+    press "Start CDC" next sat idle. Phrased as a typical, not a promise.
+    """
+    import inspect
+
+    import dsql_migrator.core.cdc_deployer as deployer
+
+    labels = dict(deployer.CDC_INFRA_STAGES)
+    create = labels["stack_create"]
+    assert "15-20" not in create and "15–20" not in create, create
+    assert "~5 min" in create, create
+
+    src = inspect.getsource(deployer)
+    assert "this provisions MSK (~15-20 min)" not in src, (
+        "the submitted-stack log line still carries the stale estimate"
+    )
+    # And the phrasing must not promise: a different region/VPC can be slower.
+    assert "usually takes ~5 min" in src, src
+
+
+def test_no_user_visible_copy_still_promises_a_15_20_minute_create() -> None:
+    # The same stale figure appeared in three places the operator reads; a fix to one of them
+    # only moves the surprise.
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[1] / "src" / "dsql_migrator"
+    offenders: list[str] = []
+    for path in root.rglob("*.py"):
+        for number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                continue  # a comment is not shown to the operator
+            if re.search(r'"[^"]*(?:10|15)[-–](?:15|20) ?min', line):
+                offenders.append(f"{path.relative_to(root)}:{number}: {stripped[:90]}")
+    assert not offenders, "stale create estimate in operator-visible copy:\n" + "\n".join(
+        offenders
+    )

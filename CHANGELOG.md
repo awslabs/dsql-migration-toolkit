@@ -5,6 +5,38 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.477
+
+### Fixed
+
+- **The CDC infrastructure deploy no longer tells the operator to expect 15-20 minutes for a
+  ~4-minute job.** "Stack creation submitted — this provisions MSK (~15-20 min)" dated from when
+  the template provisioned a *provisioned* MSK cluster. With MSK Serverless two real runs
+  finished in **3m34s** and **4m07s** (the second is the `deploy CDC infrastructure … completed
+  in 4m 7s` line in a real activity log). A 3–5× over-estimate is not a harmless margin: the
+  operator leaves the screen, and the deploy that needs them to press **Start CDC** next sits
+  idle. The progress label and the submitted-stack line now say *usually ~5 min* — a typical,
+  not a promise, since a different region or VPC can be slower.
+  - The same stale figure appeared in two more places the operator reads (the Prerequisites
+    "you'll deploy it first" hint and the Start-over provisioning banner); fixing only the
+    deploy log would have moved the surprise rather than removed it. A sweep test now fails if
+    that figure reappears in operator-visible copy.
+  - The teardown estimates (`~15–45 min`, dominated by the native ENI detach) are left alone —
+    there is no measurement for them, and inventing one is the mistake being corrected here.
+
+### Changed
+
+- **Published `0.1.476` to all three registries, deployed it, and repointed the
+  `ContainerImageUri` default.** `0.1.476` is the first image carrying the load-mode audit lines
+  (APPEND vs REPLACE, and the new `retry started`).
+  - `mysql-dsql-migrator` (us-east-1): `app:57` -> `app:58`, 1/1, ALB target `healthy`.
+  - `mysql-dsql-migrator-seoul` (ap-northeast-2): `app:103` -> `app:104`, same image.
+
+### Tests
+
+- 3897 green (+2). Three mutations checked, each caught: restoring the stale figure in the stage
+  label, in the submitted-stack log line, and in one of the other operator-visible surfaces.
+
 ## v0.1.476
 
 ### Added
