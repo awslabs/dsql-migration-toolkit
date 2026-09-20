@@ -5,6 +5,37 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.475
+
+### Fixed
+
+- **A connector read that FAILS no longer reads as "there are none" — v0.1.474's clearing made
+  that case worse, and this corrects it.** `list_connectors()` folds every error into `[]`
+  (fail-closed by design), so a task missing `kafkaconnect:ListConnectors` looks exactly like a
+  deleted stack. v0.1.474 then started clearing the remembered connector names on an empty
+  listing — right for a stack that really is gone, and **wrong for a permission error**: the
+  tool would report a LIVE, streaming pipeline as absent. That is the more dangerous of the two
+  lies. An operator who believes nothing is streaming may edit the CDC inputs, or press
+  **Apply foreign keys** — and applying them while the sink streams out-of-order child rows
+  dead-letters those rows (`23503`), which is a hazard the tool documents against itself.
+  - `list_connectors_checked()` now returns `(read_succeeded, connectors)`. Both discovery
+    branches clear ONLY on a successful empty read; a failed read leaves the last known names
+    untouched — **unknown, not asserted either way** — and logs the failure.
+  - A controller without the new method (an injected double, or anything predating it) is
+    treated as a successful read, so nothing that used to clear silently stops clearing.
+
+| | before v0.1.474 | v0.1.474 | now |
+|---|---|---|---|
+| stack really deleted | reported *streaming* ❌ | *absent* ✅ | *absent* ✅ |
+| no `ListConnectors` permission | *streaming* (accidentally right) | reported *absent* ❌ | *unknown*, names kept ✅ |
+
+### Tests
+
+- 3893 green (+3). Four mutations checked. The first pass MISSED one — folding the controller's
+  failure back into success — because every test used its own double and the real
+  `MskConnectController` error path had no coverage at all; a test against the real controller
+  was added and the mutation is now caught.
+
 ## v0.1.474
 
 ### Fixed
@@ -65,10 +96,9 @@ All notable changes to this project are recorded here. This project follows
   not established**: `connector_states` has one producer, a live `list_connectors` filter, and
   an empty result makes the logger bail — so a fresh process cannot produce them from the code
   as written. Not invented into a fix.
-- `list_connectors()` swallows every error and returns `[]`, so "the connectors are gone" and
-  "this task cannot call `kafkaconnect:ListConnectors`" are indistinguishable. With this
-  release that now reads as *absent* (fail-closed for the UI claim) rather than *streaming*,
-  but the two still deserve to be told apart.
+- ~~`list_connectors()` swallows every error, so "gone" and "cannot call
+  `kafkaconnect:ListConnectors`" are indistinguishable.~~ **Fixed in v0.1.475** — and it had to
+  be, because this release's own clearing made that case WORSE (see below).
 
 ## v0.1.473
 

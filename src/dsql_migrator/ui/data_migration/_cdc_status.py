@@ -979,6 +979,21 @@ def _probe_cdc_stack_phase(migration_state, session) -> None:
     migration_state.set_cdc_other_stack_tables(candidate_tables)
 
 
+def _list_connectors_checked(controller) -> "tuple[bool, list]":
+    """``(read_succeeded, connectors)`` from ``controller``, tolerating older controllers.
+
+    A controller without ``list_connectors_checked`` (an injected double, or anything built
+    before that method existed) falls back to ``list_connectors()`` and its result is treated
+    as a SUCCESSFUL read -- the pre-existing behaviour, so nothing that used to clear stops
+    clearing. Only a controller that can actually report failure gets the stronger guarantee.
+    """
+    checked = getattr(controller, "list_connectors_checked", None)
+    if callable(checked):
+        ok, connectors = checked()
+        return bool(ok), list(connectors or [])
+    return True, list(controller.list_connectors() or [])
+
+
 def _ensure_cdc_controller(migration_state, session) -> None:
     """Wire the read-only MSK Connect controller, probe stack phase, detect connectors.
 
@@ -1031,15 +1046,26 @@ def _ensure_cdc_controller(migration_state, session) -> None:
         # removed connectors flips the phase back off "running".
         controller = migration_state.cdc_controller
         stack = getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
+        # (read_ok, connectors): "cannot see them" is NOT "they do not exist". The plain
+        # list_connectors() folds a missing kafkaconnect:ListConnectors permission into an
+        # empty list, so clearing on emptiness would report a LIVE, streaming pipeline as
+        # absent -- and an operator who believes nothing is streaming may edit the CDC
+        # inputs or apply foreign keys, which makes the sink dead-letter out-of-order child
+        # rows (23503). On a failed read, leave the last known names ALONE: unknown, not
+        # asserted either way.
+        read_ok, names, running = True, [], []
         try:
-            raw = controller.list_connectors()
+            read_ok, raw = _list_connectors_checked(controller)
             names = _filter_mine(raw, stack)
             running = _running_mine(raw, stack)
-        except Exception:  # noqa: BLE001
-            names = list(getattr(migration_state, "cdc_connector_names", []) or [])
-            running = list(
-                getattr(migration_state, "cdc_connector_running_names", []) or []
+        except Exception:  # noqa: BLE001 - an older/injected controller without the method
+            read_ok = False
+        if not read_ok:
+            _sync_cdc_step_status(
+                session,
+                streaming=bool(getattr(migration_state, "cdc_connector_names", []) or []),
             )
+            return
         migration_state.set_cdc_connector_names(names)
         migration_state.set_cdc_connector_running_names(running)
         # This is the path a Stop/Delete lands on (the controller is already wired), so
@@ -1058,7 +1084,7 @@ def _ensure_cdc_controller(migration_state, session) -> None:
             target.region, aws_profile=getattr(session, "aws_profile", None)
         )
         stack = getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
-        raw = controller.list_connectors()
+        read_ok, raw = _list_connectors_checked(controller)
         names = _filter_mine(raw, stack)
         running = _running_mine(raw, stack)
     except Exception:  # noqa: BLE001 - no controller is a valid (un-provisioned) state
@@ -1096,9 +1122,19 @@ def _ensure_cdc_controller(migration_state, session) -> None:
         # reads cdc_streaming_started with no AWS call of its own, so nothing else could ever
         # correct it. Writing the empty list is what makes "I looked and there are none"
         # beat a remembered value.
-        migration_state.set_cdc_connector_names([])
-        migration_state.set_cdc_connector_running_names([])
-        _sync_cdc_step_status(session, streaming=False)
+        #
+        # Only on a SUCCESSFUL read, though. A failed one also arrives here as "no names",
+        # and clearing then would report a live pipeline as absent -- the opposite lie, and
+        # the more dangerous one (an operator who thinks nothing is streaming may apply
+        # foreign keys, which dead-letters out-of-order child rows, 23503). So a failed read
+        # leaves the previous names untouched: unknown, not asserted either way.
+        if read_ok:
+            migration_state.set_cdc_connector_names([])
+            migration_state.set_cdc_connector_running_names([])
+        _sync_cdc_step_status(
+            session,
+            streaming=bool(getattr(migration_state, "cdc_connector_names", []) or []),
+        )
         return
     migration_state.set_cdc_connector_names(names)
     migration_state.set_cdc_connector_running_names(running)

@@ -306,14 +306,35 @@ class MskConnectController:
     def list_connectors(self) -> list[dict]:
         """Return the raw ``connectors`` list from ``kafkaconnect:ListConnectors``.
 
-        Empty list on any access error (fail-closed).
+        Empty list on any access error (fail-closed). Callers that DECIDE something from
+        emptiness must use :meth:`list_connectors_checked` instead -- see why there.
+        """
+        _ok, connectors = self.list_connectors_checked()
+        return connectors
+
+    def list_connectors_checked(self) -> "tuple[bool, list[dict]]":
+        """Return ``(read_succeeded, connectors)``.
+
+        ``list_connectors`` folds every error into ``[]``, so "there are no connectors" and
+        "this task cannot call ``kafkaconnect:ListConnectors``" are the same value. That is
+        fine for a read that only DISPLAYS what it found, and wrong for anything that
+        concludes something from emptiness: with a missing permission the tool would report a
+        live, streaming pipeline as absent -- and an operator who believes nothing is
+        streaming may edit the CDC inputs or apply foreign keys, which makes the sink
+        dead-letter out-of-order child rows (23503). Distinguishing the two is what lets a
+        caller leave its state UNKNOWN instead of asserting either way.
         """
         try:
             client = self._client("kafkaconnect")
             response = client.list_connectors()
-            return list(response.get("connectors", []) or [])
-        except Exception:  # noqa: BLE001 - treated as "no connectors visible"
-            return []
+            return True, list(response.get("connectors", []) or [])
+        except Exception:  # noqa: BLE001 - cannot see them != they do not exist
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "kafkaconnect:ListConnectors failed", exc_info=True
+            )
+            return False, []
 
     def describe_connector(self, connector_arn: str) -> Optional[dict]:
         """Return the raw ``describe_connector`` response, or ``None`` on error."""

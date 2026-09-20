@@ -785,3 +785,42 @@ def test_dlq_errors_first_read_uses_the_wide_initial_lookback() -> None:
     call = next(c for c in client.calls if c[0] == "filter_log_events")
     now_ms = int(now.timestamp() * 1000)
     assert call[1]["startTime"] == now_ms - _DLQ_INITIAL_LOOKBACK_SECONDS * 1000
+
+
+def test_list_connectors_checked_separates_a_failed_read_from_an_empty_one() -> None:
+    """The caller has to be able to tell "none exist" from "I cannot look".
+
+    ``list_connectors`` folds every error into ``[]`` -- fine for a read that only displays
+    what it found, wrong for anything that CONCLUDES from emptiness. Discovery clears the
+    remembered connector names on an empty listing (so a deleted stack stops being reported
+    as streaming); if a missing ``kafkaconnect:ListConnectors`` permission looked the same,
+    that clear would report a LIVE, streaming pipeline as absent -- and an operator who
+    believes nothing is streaming may apply foreign keys, which dead-letters out-of-order
+    child rows (23503).
+    """
+
+    class _Boom:
+        def list_connectors(self):
+            raise RuntimeError("AccessDeniedException")
+
+    class _Empty:
+        def list_connectors(self):
+            return {"connectors": []}
+
+    denied = MskConnectController("us-east-2", session=_FakeSession(_Boom()))
+    assert denied.list_connectors_checked() == (False, [])
+    # The lenient wrapper keeps its old shape for display-only callers.
+    assert denied.list_connectors() == []
+
+    empty = MskConnectController("us-east-2", session=_FakeSession(_Empty()))
+    assert empty.list_connectors_checked() == (True, [])
+    assert empty.list_connectors() == []
+
+    class _Two:
+        def list_connectors(self):
+            return {"connectors": [{"connectorName": "a"}, {"connectorName": "b"}]}
+
+    ok, found = MskConnectController(
+        "us-east-2", session=_FakeSession(_Two())
+    ).list_connectors_checked()
+    assert ok is True and [c["connectorName"] for c in found] == ["a", "b"]

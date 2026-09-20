@@ -21567,3 +21567,87 @@ def test_an_empty_live_listing_clears_remembered_connector_names(monkeypatch) ->
         "this is the predicate behind Schema Conversion's 'CDC is streaming' warning, "
         "which makes no AWS call of its own -- so it must not outlive the evidence"
     )
+
+
+def test_a_failed_connector_read_does_not_clear_the_known_names(monkeypatch) -> None:
+    """"Cannot see them" is not "they do not exist".
+
+    ``list_connectors()`` folds a missing ``kafkaconnect:ListConnectors`` permission into an
+    empty list, so v0.1.474's "an empty listing clears the names" -- correct for a stack that
+    really is gone -- would report a LIVE, streaming pipeline as absent. That is the more
+    dangerous lie of the two: an operator who believes nothing is streaming may edit the CDC
+    inputs or apply foreign keys, and applying them while the sink streams out-of-order child
+    rows dead-letters them (23503). A failed read must leave the state UNKNOWN.
+    """
+    from types import SimpleNamespace
+
+    import dsql_migrator.core.msk_connect_controller as msk
+    import dsql_migrator.ui.data_migration._cdc_status as cdc_status
+    from dsql_migrator.ui.data_migration._cdc_state import cdc_pipeline_live
+
+    live = ["dsql-cdc-stack-debezium-source", "dsql-cdc-stack-dsql-sink"]
+
+    class _Denied:
+        """What a task without kafkaconnect:ListConnectors sees."""
+
+        def list_connectors_checked(self):
+            return False, []
+
+        def list_connectors(self):
+            return []
+
+    monkeypatch.setattr(msk, "build_msk_connect_controller", lambda *a, **k: _Denied())
+    monkeypatch.setattr(cdc_status, "_sync_cdc_step_status", lambda *_a, **_k: None)
+    monkeypatch.setattr(cdc_status, "_probe_cdc_stack_phase", lambda *_a, **_k: None)
+    session = SimpleNamespace(
+        target_config=SimpleNamespace(region="us-east-2"), aws_profile=None
+    )
+
+    # (a) FRESH controller: the read fails, so the names it cannot verify must survive.
+    state = DataMigrationState()
+    state.set_cdc_stack_name("dsql-cdc-stack")
+    state.set_cdc_connector_names(live)
+    cdc_status._ensure_cdc_controller(state, session)
+    assert state.cdc_connector_names == live, (
+        "a failed read must not be reported as 'no connectors' -- CDC may be streaming"
+    )
+    assert cdc_pipeline_live(state) is True
+
+    # (b) ALREADY-WIRED controller: same rule on the other branch.
+    state2 = DataMigrationState()
+    state2.set_cdc_stack_name("dsql-cdc-stack")
+    state2.set_cdc_connector_names(live)
+    state2.set_cdc_controller(_Denied())
+    state2._cdc_discovery_monotonic = None
+    cdc_status._ensure_cdc_controller(state2, session)
+    assert state2.cdc_connector_names == live, "the pre-wired branch must fail unknown too"
+
+    # And the negative control: a SUCCESSFUL empty read still clears (v0.1.474's fix).
+    class _Gone:
+        def list_connectors_checked(self):
+            return True, []
+
+    monkeypatch.setattr(msk, "build_msk_connect_controller", lambda *a, **k: _Gone())
+    state3 = DataMigrationState()
+    state3.set_cdc_stack_name("dsql-cdc-stack")
+    state3.set_cdc_connector_names(live)
+    cdc_status._ensure_cdc_controller(state3, session)
+    assert state3.cdc_connector_names == [], "a proven-empty read must still clear"
+
+
+def test_a_controller_without_the_checked_read_still_clears(monkeypatch) -> None:
+    # Back-compat: an injected double (or any controller predating the method) is treated as
+    # a successful read, so nothing that used to clear silently stops clearing.
+    import dsql_migrator.ui.data_migration._cdc_status as cdc_status
+
+    class _Old:
+        def list_connectors(self):
+            return []
+
+    assert cdc_status._list_connectors_checked(_Old()) == (True, [])
+
+    class _New:
+        def list_connectors_checked(self):
+            return False, []
+
+    assert cdc_status._list_connectors_checked(_New()) == (False, [])
