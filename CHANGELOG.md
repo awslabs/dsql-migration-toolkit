@@ -5,6 +5,43 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.476
+
+### Added
+
+- **The activity log now records whether a load APPENDED or REPLACED.** `run started` said only
+  "7 table(s) selected", omitting the run's most consequential choice: a **replace** DROPs and
+  recreates the target table — taking its foreign keys with it — while an **append** keeps every
+  existing row and inserts only the missing ones. Afterwards a reader of the audit trail could
+  not tell which had happened to a table's rows. The mode is named per run, and because the
+  choice is per table a mixed run is reported as such ("REPLACE for 1 of 3 (ecommerce.b) …
+  APPEND for the rest").
+- **A retry now has a run-level line at all.** `run_full_load_retry` logged the watermark and
+  the excluded columns but nothing to open the run — so the most common single-table replace,
+  the per-table **Reload** and **"Exclude column & reload"** (which force a replace for that
+  table), left no record that those rows had been dropped and reloaded rather than added to. It
+  is named `retry started` so a scoped re-run is distinguishable from a fresh one, and it names
+  the retried tables and their mode.
+
+### Changed
+
+- **Published `0.1.475` to all three registries, deployed it to both live app stacks, and
+  repointed the `ContainerImageUri` default.** A fresh `git clone` deploy previously defaulted to
+  `0.1.472`, which predates every activity-log and CDC fix in v0.1.474–475 (the false
+  `connector … running` audit lines, the duplicated foreign-key summary, and the connector read
+  that could not tell "gone" from "no permission"). The live release gate passed before each
+  build.
+  - `mysql-dsql-migrator` (us-east-1): `app:56` -> `app:57`, 1/1, ALB target `healthy`.
+  - `mysql-dsql-migrator-seoul` (ap-northeast-2): `app:102` -> `app:103`, 1/1, 4096 CPU /
+    8192 MiB and the Cognito user pool (with its user) untouched.
+
+### Tests
+
+- 3895 green (+2). Five mutations checked. The first pass MISSED one — dropping the
+  "is it in this selection?" filter, so a leftover replace target from another run coloured the
+  verdict — because the assertion only looked for "APPEND", which the partial-replace text also
+  contains ("APPEND for the rest"). Tightened to require the ABSENCE of "REPLACE".
+
 ## v0.1.475
 
 ### Fixed

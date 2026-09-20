@@ -2752,6 +2752,45 @@ def _apply_foreign_keys(
     return (int(applied or 0), int(skipped or 0), int(failed or 0))
 
 
+def _load_mode_detail(
+    inputs: "Optional[DataMigrationInputs]", table_names: "Sequence[str]"
+) -> str:
+    """Describe the run's load mode for the audit trail. Pure.
+
+    ``replace_tables`` is the per-table choice, so a run is not necessarily all one mode:
+    "Drop & reload" sets it for the selection, a per-table Reload sets it for one table, and
+    an append run leaves it empty. The three shapes are worth distinguishing in the log
+    because they mean different things about the rows already on the target:
+
+    * append (no replace target)   -- existing rows are KEPT; the load fills only the gap
+      (``INSERT ... ON CONFLICT DO NOTHING``), so a re-run never duplicates.
+    * replace (every table)        -- each target table is DROPPED and recreated, which also
+      removes its foreign keys (re-apply them afterwards).
+    * replace (some tables)        -- names them, so a reader can tell which tables lost
+      their previous rows and which merely gained new ones.
+    """
+    replace = {
+        str(name)
+        for name in (getattr(inputs, "replace_tables", None) or ())
+        if str(name) in set(table_names)
+    }
+    if not replace:
+        return (
+            "load mode: APPEND (existing target rows kept; only missing rows are inserted)"
+        )
+    if len(replace) == len(set(table_names)):
+        return (
+            "load mode: REPLACE (every selected table is dropped and recreated, which also "
+            "drops its foreign keys)"
+        )
+    listed = ", ".join(sorted(replace))
+    return (
+        f"load mode: REPLACE for {len(replace)} of {len(set(table_names))} table(s) "
+        f"({listed}) -- dropped and recreated, which also drops their foreign keys; "
+        "APPEND for the rest"
+    )
+
+
 def _log_excluded_lob_columns(
     inputs: "Optional[DataMigrationInputs]",
     scope: Optional[set[str]] = None,
@@ -2891,7 +2930,13 @@ def run_full_load(
         ActivityCategory.FULL_LOAD,
         "run started",
         status=ActivityStatus.STARTED,
-        detail=f"{len(table_names)} table(s) selected",
+        # Name the LOAD MODE. It is the run's most consequential choice -- a replace DROPs
+        # and recreates the target table (and takes its foreign keys with it), an append
+        # keeps every existing row and only fills the gap -- and the audit trail recorded
+        # neither, so a reader could not tell afterwards whether a table's rows had been
+        # replaced or added to. The per-table set is named because the choice is per table:
+        # a run can replace some and append to others.
+        detail=f"{len(table_names)} table(s) selected; {_load_mode_detail(inputs, table_names)}",
     )
     _log_excluded_lob_columns(inputs)
 
@@ -3076,6 +3121,20 @@ def run_full_load_retry(
             prior_job_id=prior_job_id,
             prior_table_error_job_ids=prior_table_error_job_ids,
         )
+    )
+    # A retry had NO run-level line at all, so the most common replace-one-table case --
+    # the per-table Reload, and "Exclude column & reload", which FORCE a replace for that
+    # table -- left nothing in the audit trail saying a table's rows had been dropped and
+    # reloaded rather than added to. Named distinctly from "run started" so a reader can tell
+    # a scoped re-run from a fresh one.
+    log_activity(
+        ActivityCategory.FULL_LOAD,
+        "retry started",
+        status=ActivityStatus.STARTED,
+        detail=(
+            f"{len(retry_names)} table(s) re-run: {', '.join(sorted(retry_names))}; "
+            f"{_load_mode_detail(inputs, sorted(retry_names))}"
+        ),
     )
     _log_excluded_lob_columns(inputs, scope=retry_names)
     if watermark is not None:

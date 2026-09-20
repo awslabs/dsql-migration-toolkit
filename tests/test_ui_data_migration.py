@@ -21651,3 +21651,65 @@ def test_a_controller_without_the_checked_read_still_clears(monkeypatch) -> None
             return False, []
 
     assert cdc_status._list_connectors_checked(_New()) == (False, [])
+
+
+# --------------------------------------------------------------------------- #
+# The audit trail must say whether a load APPENDED or REPLACED
+#
+# "run started - 7 table(s) selected" did not record the run's most consequential choice: a
+# replace DROPs and recreates the target table (taking its foreign keys with it), an append
+# keeps every existing row and only fills the gap. Afterwards a reader could not tell which
+# had happened. And a RETRY -- the per-table Reload, and "Exclude column & reload", which
+# FORCE a replace for that one table -- had no run-level line at all.
+# --------------------------------------------------------------------------- #
+
+
+def test_load_mode_detail_names_each_shape() -> None:
+    from types import SimpleNamespace
+
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    tables = ["ecommerce.a", "ecommerce.b", "ecommerce.c"]
+
+    def _inputs(replace):
+        return SimpleNamespace(replace_tables=frozenset(replace))
+
+    append = engine._load_mode_detail(_inputs([]), tables)
+    assert "APPEND" in append and "REPLACE" not in append, append
+    assert "kept" in append, "an append must say the existing rows survive: " + append
+
+    every = engine._load_mode_detail(_inputs(tables), tables)
+    assert "REPLACE" in every and "every selected table" in every, every
+    assert "foreign keys" in every, "a replace also drops them -- say so: " + every
+
+    # A run can replace SOME and append to the rest, so the partial case must name which.
+    some = engine._load_mode_detail(_inputs(["ecommerce.b"]), tables)
+    assert "REPLACE for 1 of 3" in some and "ecommerce.b" in some, some
+    assert "APPEND for the rest" in some, some
+
+    # Missing inputs -> the honest default (the loader appends when nothing says otherwise).
+    assert "APPEND" in engine._load_mode_detail(None, tables)
+    # A replace target outside the selection must not colour this run's verdict. Assert the
+    # ABSENCE of REPLACE, not just the presence of APPEND -- the partial text contains
+    # "APPEND for the rest", so a looser check passes while reporting a phantom replace.
+    stale = engine._load_mode_detail(_inputs(["not.selected"]), tables)
+    assert "APPEND" in stale and "REPLACE" not in stale, stale
+    assert "not.selected" not in stale, stale
+
+
+def test_both_run_paths_log_their_load_mode() -> None:
+    import inspect
+
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    fresh = inspect.getsource(engine.run_full_load)
+    assert '"run started"' in fresh and "_load_mode_detail(inputs, table_names)" in fresh, fresh
+
+    retry = inspect.getsource(engine.run_full_load_retry)
+    assert '"retry started"' in retry, (
+        "a retry had no run-level line at all, so a per-table Reload -- which forces a "
+        "REPLACE for that table -- left no record that its rows were dropped"
+    )
+    assert "_load_mode_detail(inputs, sorted(retry_names))" in retry, retry
+    # Scoped to the retried tables, not the whole original selection.
+    assert "retry_names" in retry.split('"retry started"')[1][:400], retry

@@ -5,6 +5,39 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.476
+
+### 추가
+
+- **활동 로그가 적재가 APPEND였는지 REPLACE였는지 기록합니다.** `run started`는 "7 table(s)
+  selected"만 적어, 이 실행의 가장 중요한 선택을 빠뜨렸습니다: **replace**는 대상 테이블을 DROP하고
+  재생성하며(외래 키까지 함께 사라집니다), **append**는 기존 행을 전부 유지하고 없는 행만 넣습니다.
+  사후에 감사 추적을 읽는 사람은 어느 쪽이 일어났는지 알 수 없었습니다. 이제 실행마다 모드를
+  명시하고, 선택이 테이블 단위이므로 혼합 실행도 그렇게 보고합니다("REPLACE for 1 of 3
+  (ecommerce.b) … APPEND for the rest").
+- **retry에 run-level 줄이 아예 생겼습니다.** `run_full_load_retry`는 워터마크와 제외 컬럼만 남기고
+  실행을 여는 줄이 없었습니다 — 그래서 가장 흔한 단일 테이블 replace인 테이블별 **Reload**와
+  **"Exclude column & reload"**(해당 테이블의 replace를 강제)가, 그 행들이 추가된 게 아니라 버려지고
+  다시 적재됐다는 기록을 전혀 남기지 않았습니다. 새 실행과 구분되도록 `retry started`로 이름 붙이고,
+  재실행한 테이블과 그 모드를 적습니다.
+
+### 변경
+
+- **`0.1.475`를 세 레지스트리에 발행하고 라이브 앱 스택 두 곳에 배포한 뒤 `ContainerImageUri`
+  기본값을 repoint 했습니다.** 그전 기본값은 `0.1.472`로, Schema Conversion REPLACE의 외래 키
+  사전 삭제(v0.1.471)와 v0.1.474–475의 활동 로그·CDC 수정 이전입니다. 각 빌드 전에 release gate를
+  통과했습니다.
+  - `mysql-dsql-migrator`(us-east-1): `app:56` -> `app:57`, 1/1, ALB 타깃 `healthy`.
+  - `mysql-dsql-migrator-seoul`(ap-northeast-2): `app:102` -> `app:103`, 1/1,
+    4096 CPU / 8192 MiB와 Cognito 사용자 풀(사용자 포함) 그대로.
+
+### 테스트
+
+- 3895개 통과(+2). 변이 5건 검증. 1차에서 **한 건을 놓쳤습니다** — "이 선택에 포함된 테이블인가?"
+  필터를 제거해 다른 실행에서 남은 replace 대상이 판정을 물들이는 변이. 어설션이 "APPEND"만 확인했고
+  부분 replace 문구에도 "APPEND for the rest"가 있었기 때문입니다. "REPLACE"의 **부재**를 요구하도록
+  조였습니다.
+
 ## v0.1.475
 
 ### 수정
