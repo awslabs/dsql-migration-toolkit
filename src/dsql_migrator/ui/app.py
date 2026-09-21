@@ -50,6 +50,7 @@ from dsql_migrator.ui.ai_tools import (
 from dsql_migrator.ui.data_migration import (
     DataMigrationStore,
     build_data_migration_screen,
+    cdc_evidence_unverified,
     cdc_streaming_started,
     full_load_run_guard_reason,
     prereq_mode_for_type,
@@ -455,6 +456,15 @@ def build_page(
         # same data-migration state that drives the CDC lock.
         cdc_active_check=lambda: cdc_streaming_started(
             DATA_MIGRATION_STORE.get_or_create(session_id), JOB_MANAGER
+        ),
+        # The block above reads cdc_controller / cdc_stack_phase, and NEITHER survives a
+        # session restore -- only cdc_connector_names does, and all three are written only
+        # by a render of the CDC sub-step. So after a UI restart an operator who comes
+        # straight here is told nothing while the stream is still running on AWS. This
+        # reports that unchecked-but-recorded state so the step can WARN (not block: names
+        # left behind by an out-of-band teardown must not trap anyone).
+        cdc_unverified_check=lambda: cdc_evidence_unverified(
+            DATA_MIGRATION_STORE.get_or_create(session_id)
         ),
         # A confirmed REPLACE recreates target tables, and DSQL drops a table's foreign keys
         # with it -- so both later steps' "N foreign keys applied" verdicts stop describing

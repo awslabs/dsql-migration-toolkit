@@ -5,6 +5,52 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.481
+
+### Added
+
+- **Reload specific tables — a scoped re-load for tables that finished cleanly.** The per-table
+  "Reload" button lives only on the quarantine card, so a table that loaded with no dropped rows
+  had no scoped control at all, and the table picker locks once a load has run ("Use 'Start over'
+  to migrate a different set of tables"). That made the normal recovery after re-applying ONE
+  table's schema — a REPLACE drops and recreates it EMPTY — either a full "Re-run Full Load" over
+  every table (a whole-source re-read) or Start over, which discards the evaluation, the conversion
+  edits and the CDC inputs. A finished run now offers **"Reload specific tables…"**, opening the
+  same confirm checklist the retry path uses, scoped to the tables that loaded and starting with
+  **nothing ticked** (pre-checking would arm a full re-load from a button that says "specific").
+  The engine already supported the scoped run — the same path the quarantine Reload takes, keeping
+  the run's ORIGINAL watermark so a later CDC start is still gapless — so this only adds the
+  missing entry point. Disabled while CDC streams, and while either connection is unverified, with
+  the reason in the tooltip.
+
+### Fixed
+
+- **A dropped TARGET table is now reported as its own, more severe condition.** When the table the
+  CDC sink writes to disappears — a Schema Conversion REPLACE, or an out-of-band `DROP`, under a
+  live stream — DSQL answers `42P01`, which the sink's transient test (`40001` / `08*` / `57*` / a
+  null state) does not match. So it is permanent: every event for that table is dead-lettered with
+  its offset committed, no retries, and no replay. But `42P01` was not in the drift map, so the
+  most destructive failure of all was also the quietest: no banner, and under 50 records not even
+  an amber DLQ badge. `42P01` / `3F000` now map to a new `MISSING_TABLE` kind — the one
+  target-side kind — which takes the error tone (rows are being lost as it renders, so "be aware"
+  is the wrong severity), its own header ("Target table missing — rows are being lost") instead of
+  the source-change wording that does not apply, and a distinct recovery notice: the stream cannot
+  heal it, so stop CDC, confirm the table exists, reload just that table, and let Validation prove
+  the gap is closed. The `add-column` "Fix target schema…" action stays out of it — an `ALTER …
+  ADD COLUMN` cannot fix a missing table.
+- **Schema Conversion no longer goes silent about CDC after a restart.** The guard that blocks
+  applying schema while CDC streams reads `cdc_controller` / `cdc_stack_phase`, and NEITHER is
+  snapshotted — only `cdc_connector_names` is, and all three are written solely by a render of the
+  Data Migration CDC sub-step. So after a UI restart an operator who went straight to Schema
+  Conversion saw nothing at all while the pipeline was still running on AWS, and a destructive
+  REPLACE proceeded behind only the generic confirm. That unchecked-but-recorded state is now
+  surfaced ("CDC may still be streaming — this session hasn't checked") with the danger, the check
+  to run, and a statement that the notice is stale if CDC was already torn down. It **warns rather
+  than blocks**, deliberately: connector names left behind by an out-of-band teardown would
+  otherwise trap the operator forever (a screen was once observed warning "CDC is streaming" for a
+  stack deleted twelve hours earlier). No AWS call is added — this screen re-renders on every
+  refresh.
+
 ## v0.1.480
 
 ### Fixed

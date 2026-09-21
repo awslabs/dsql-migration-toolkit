@@ -319,6 +319,25 @@ def test_classify_schema_drift_maps_known_sqlstates() -> None:
     assert classify_schema_drift("42804") is SchemaDriftKind.TYPE_CHANGE
 
 
+def test_classify_schema_drift_maps_a_missing_target_table() -> None:
+    """42P01 / 3F000 are the one TARGET-side kind and must not stay anonymous.
+
+    DSQL raises 42P01 when the table the sink writes to is gone (a Schema Conversion
+    REPLACE, or an out-of-band DROP, under a live stream). The sink's isTransient covers
+    only 40001 / 08* / 57* / a null state, so 42P01 is PERMANENT: every event for that
+    table is dead-lettered with its offset committed and no retry. Unmapped, that -- the
+    most destructive failure of the three -- rendered as an ordinary poison row with no
+    banner at all, and under 50 records not even an amber DLQ badge.
+    """
+    assert classify_schema_drift("42P01") is SchemaDriftKind.MISSING_TABLE
+    assert classify_schema_drift("3F000") is SchemaDriftKind.MISSING_TABLE
+    # Same normalization as the others.
+    assert classify_schema_drift(" 42p01 ") is SchemaDriftKind.MISSING_TABLE
+    # And it reaches the model the banner reads.
+    err = CdcConnectorError(table="db.orders", message="x", error_code="42P01")
+    assert err.drift_kind is SchemaDriftKind.MISSING_TABLE
+
+
 def test_classify_schema_drift_class_22_is_not_drift() -> None:
     # Class 22 (data exception): string-too-long / numeric-range / bad-datetime / bad
     # text are per-VALUE rejections ordinary bad data raises with NO source DDL change,
@@ -432,3 +451,168 @@ def test_composite_cdc_excluded_key_columns_flags_excluded_key() -> None:
         mkc, ["app.orders.customer_id", "app.orders.blob_col"]
     ) == ["app.orders.customer_id"]
     assert composite_cdc_excluded_key_columns(mkc, ["app.orders.blob_col"]) == []
+
+
+# ---------------------------------------------------------------------------
+# A missing TARGET table is reported as its own, more severe condition
+# ---------------------------------------------------------------------------
+
+
+def test_missing_target_table_banner_does_not_call_it_a_source_change() -> None:
+    """The banner must name the real condition, at the real severity.
+
+    A dropped TARGET table is not a source DDL change, and it is not "be aware": rows are
+    being permanently lost while it renders (dead-lettered with the offset committed, and
+    never replayed). Reusing the source-drift header and the amber warning tone would
+    have understated the only drift kind that is actively destroying data.
+    """
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import SchemaDriftSummary
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+
+    class _Ui:
+        def __init__(self):
+            self.texts: list[str] = []
+            self.classes_seen: list[str] = []
+
+        def _el(self):
+            ui = self
+
+            class _El:
+                def classes(self, *a, **k):
+                    for value in a:
+                        ui.classes_seen.append(str(value))
+                    for value in k.values():
+                        ui.classes_seen.append(str(value))
+                    return self
+
+                def props(self, *a, **k):
+                    return self
+
+                def tooltip(self, *a, **k):
+                    return self
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+            return _El()
+
+        def column(self, *a, **k):
+            return self._el()
+
+        def row(self, *a, **k):
+            return self._el()
+
+        def label(self, text="", *a, **k):
+            self.texts.append(str(text))
+            return self._el()
+
+        def icon(self, name="", *a, **k):
+            return self._el()
+
+        def button(self, text="", *a, **k):
+            self.texts.append(str(text))
+            return self._el()
+
+        def space(self, *a, **k):
+            return self._el()
+
+        def card(self, *a, **k):
+            return self._el()
+
+    view = SimpleNamespace(
+        schema_drift=[
+            SchemaDriftSummary(table="db.orders", kind="missing-table", count=7)
+        ]
+    )
+    ui = _Ui()
+    cm._render_cdc_schema_drift_banner(ui, view, session=None)
+    blob = " ".join(ui.texts)
+
+    assert "Target table missing" in blob
+    assert "Source schema change detected" not in blob
+    # The distinct recovery: the stream cannot heal it, so stop CDC and reload.
+    assert "Stop CDC and reload these tables" in blob
+    assert "db.orders" in blob
+    # "Fix target schema…" is ADD COLUMN's ALTER -- useless for a missing table.
+    assert "Fix target schema" not in blob
+    # Error tone, not warning, on the BANNER's own surface. Assert the FIRST recorded
+    # classes string -- the outer column -- not "any", because the nested stop-and-reload
+    # render_notice also emits an error surface and would mask an amber banner.
+    from dsql_migrator.ui.design import NOTICE_STYLE
+
+    banner_surface = ui.classes_seen[0]
+    assert NOTICE_STYLE["error"][1] in banner_surface, banner_surface
+    assert NOTICE_STYLE["warning"][1] not in banner_surface, banner_surface
+
+
+def test_source_drift_banner_keeps_its_warning_framing() -> None:
+    # Regression guard for the split: an ordinary source ADD COLUMN must still read as a
+    # source change at warning severity, and must NOT gain the stop-and-reload notice.
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import SchemaDriftSummary
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+
+    class _Ui:
+        def __init__(self):
+            self.texts: list[str] = []
+
+        def _el(self):
+            class _El:
+                def classes(self, *a, **k):
+                    return self
+
+                def props(self, *a, **k):
+                    return self
+
+                def tooltip(self, *a, **k):
+                    return self
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+            return _El()
+
+        def column(self, *a, **k):
+            return self._el()
+
+        def row(self, *a, **k):
+            return self._el()
+
+        def label(self, text="", *a, **k):
+            self.texts.append(str(text))
+            return self._el()
+
+        def icon(self, name="", *a, **k):
+            return self._el()
+
+        def button(self, text="", *a, **k):
+            self.texts.append(str(text))
+            return self._el()
+
+        def space(self, *a, **k):
+            return self._el()
+
+        def card(self, *a, **k):
+            return self._el()
+
+    view = SimpleNamespace(
+        schema_drift=[
+            SchemaDriftSummary(table="db.orders", kind="add-column", count=2)
+        ]
+    )
+    ui = _Ui()
+    cm._render_cdc_schema_drift_banner(ui, view, session=None)
+    blob = " ".join(ui.texts)
+
+    assert "Source schema change detected" in blob
+    assert "Target table missing" not in blob
+    assert "Stop CDC and reload these tables" not in blob

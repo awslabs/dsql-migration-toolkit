@@ -1155,6 +1155,17 @@ _POLL_INTERVAL_SECONDS = 0.5
 # Debezium does not propagate DDL, so a REPLACE would drop/corrupt what CDC is
 # replicating). The message is single-sourced here so the persistent notice on
 # the page and the on-Apply toast say the same thing and stay in sync.
+CDC_APPLY_UNVERIFIED_HEADER = "CDC may still be streaming — this session hasn't checked"
+CDC_APPLY_UNVERIFIED_BODY = (
+    "This migration has CDC connectors recorded, but nothing has read their live state "
+    "since the app restarted, so the tool cannot tell you whether the pipeline is still "
+    "running on AWS. Applying conversion here -- especially a REPLACE, which drops and "
+    "recreates tables -- would corrupt what a live sink is writing, and its rows would be "
+    "dead-lettered with no replay. Open Data Migration -> CDC first to check (and stop it "
+    "if it is live). If CDC was already torn down, this notice is stale and you can "
+    "continue."
+)
+
 CDC_APPLY_BLOCK_HEADER = "CDC is streaming to the target — the schema is already applied"
 CDC_APPLY_BLOCK_BODY = (
     "A CDC pipeline is replicating live changes into the target right now, so "
@@ -1194,6 +1205,7 @@ def build_schema_conversion_screen(
     existence_checker: Optional[TargetExistenceChecker] = None,
     on_continue_to_data_migration: Optional[Callable[[], None]] = None,
     cdc_active_check: Optional[Callable[[], bool]] = None,
+    cdc_unverified_check: Optional[Callable[[], bool]] = None,
     # Called when a CONFIRMED REPLACE is about to recreate target TABLES. DSQL drops a
     # table's foreign keys with the table, so every "N foreign keys applied" verdict the
     # other steps hold becomes false at that moment -- and nothing else clears it, so the
@@ -2160,6 +2172,14 @@ def build_schema_conversion_screen(
             # forward is to Skip (the schema is already applied), which both
             # continues and unlocks Data Migration to stop CDC there if needed.
             cdc_active = _cdc_apply_is_blocked(cdc_active_check)
+            # "There was a pipeline, and nothing has checked since this session began."
+            # The block above cannot see a restored session's CDC (see
+            # ``cdc_evidence_unverified``), so without this the screen is SILENT while the
+            # stream runs. A warning, not a block: names left behind by an out-of-band
+            # teardown would otherwise trap the operator forever.
+            cdc_unverified = (
+                not cdc_active and _cdc_apply_is_blocked(cdc_unverified_check)
+            )
             with ui.card().classes("w-full"):
                 if cdc_active:
                     render_notice(
@@ -2167,6 +2187,13 @@ def build_schema_conversion_screen(
                         tone="warning",
                         header=CDC_APPLY_BLOCK_HEADER,
                         body=CDC_APPLY_BLOCK_BODY,
+                    )
+                elif cdc_unverified:
+                    render_notice(
+                        ui,
+                        tone="warning",
+                        header=CDC_APPLY_UNVERIFIED_HEADER,
+                        body=CDC_APPLY_UNVERIFIED_BODY,
                     )
                 else:
                     render_notice(

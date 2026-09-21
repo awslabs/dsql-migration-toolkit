@@ -1272,6 +1272,10 @@ class _ConfirmDialogUi:
         self.buttons: list[str] = []
         self.opened = 0
         self.handlers: list[tuple[str, object]] = []
+        # (label, initial value) per checkbox, so a test can assert whether the
+        # per-table checklist starts ticked (retry) or empty (scoped reload).
+        self.checkboxes: list[tuple[str, object]] = []
+        self.checkbox_handlers: list[object] = []
 
     class _El:
         def __init__(self, ui):
@@ -1308,10 +1312,29 @@ class _ConfirmDialogUi:
             self.handlers.append((str(text), on_click))
         return self._El(self)
 
+    def checkbox(self, text="", *_a, **kwargs):
+        self.checkboxes.append((str(text), kwargs.get("value")))
+        # The on_change handler too, so a test can TICK a box and then confirm --
+        # the only way to observe the dialog's internal checked set.
+        self.checkbox_handlers.append(kwargs.get("on_change"))
+        if text:
+            self.texts.append(str(text))
+        return self._El(self)
+
     def radio(self, options=None, *_a, **_k):
         if isinstance(options, dict):
             self.texts.extend(str(v) for v in options.values())
         return self._El(self)
+
+    def refreshable(self, fn):
+        # @ui.refreshable returns a wrapper that renders when CALLED and carries a
+        # .refresh(); decorating must not invoke the body. Needed once this double
+        # drives _render_full_load_step with a JOB (the live-detail region).
+        def _w(*a, **k):
+            return fn(*a, **k)
+
+        _w.refresh = lambda *_a, **_k: None
+        return _w
 
     def notify(self, *_a, **_k):
         return None
@@ -1349,6 +1372,10 @@ def _open_full_load_confirm_dialog(
     migration_state=None,
     session=None,
     selected_names=("ecommerce.orders",),
+    job=None,
+    status=None,
+    retry_tables=None,
+    click="Start",
 ):
     """Render the Full Load step, click Start, and return the UI double.
 
@@ -1392,13 +1419,17 @@ def _open_full_load_confirm_dialog(
 
             raise JobNotFoundError(job_id)
 
+        def get_error(self, job_id):
+            return None  # a terminal job with no job-level failure
+
     dm._render_full_load_step(
         ui,
         migration_state if migration_state is not None else DataMigrationState(),
         _NoJobs(),
         session,  # None -> no target_config -> the probe is skipped entirely
-        job=None,
-        status=StepStatus.NOT_STARTED,
+        job=job,
+        status=status if status is not None else StepStatus.NOT_STARTED,
+        retry_tables=retry_tables,
         selected_names=list(selected_names),
         guard_reason=None,
         start_full_load=noop,
@@ -1415,8 +1446,8 @@ def _open_full_load_confirm_dialog(
             else (lambda: recreate_candidates)
         ),
     )
-    start = [h for (label, h) in ui.handlers if "Start" in label]
-    assert start, f"no Start handler captured; buttons={ui.buttons}"
+    start = [h for (label, h) in ui.handlers if click in label]
+    assert start, f"no {click!r} handler captured; buttons={ui.buttons}"
     asyncio.run(start[0]())
     return ui
 
@@ -21928,3 +21959,208 @@ def test_a_partial_removal_leaves_start_locked(monkeypatch) -> None:
     tones = [tone for tone, _h in ui.notices]
     assert "success" not in tones and "error" in tones, ui.notices
     assert ui.dialog_closed == 0
+
+
+# ---------------------------------------------------------------------------
+# Reloading a CLEANLY-loaded table (the gap that forced Start over)
+# ---------------------------------------------------------------------------
+
+
+class _VerifiedSession:
+    """A session with both connections verified live, so reconnect gates clear."""
+
+    target_config = None
+    aws_profile = None
+    source_verified = True
+    target_verified = True
+
+
+def test_finished_load_offers_a_scoped_reload(monkeypatch) -> None:
+    """A table that loaded cleanly must be re-loadable without touching the others.
+
+    The per-table "Reload" button lives only on the QUARANTINE card, so a table that
+    finished with no dropped rows had no scoped control -- and the table picker locks once
+    a load has run ("Use 'Start over' to migrate a different set of tables"). After
+    re-applying ONE table's schema (a REPLACE recreates it EMPTY) the only escapes were a
+    full "Re-run Full Load" over every table, or Start over.
+    """
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+
+    job = MigrationJob(job_id="j1")
+    job.status = "DONE"
+    job.progress_pct = 100.0
+    job.chunks = [
+        ChunkState(chunk_id="ecommerce.orders", status="DONE", rows_loaded=5, attempts=1),
+        ChunkState(chunk_id="ecommerce.customers", status="DONE", rows_loaded=3, attempts=1),
+    ]
+
+    picked: list = []
+    ui = _open_full_load_confirm_dialog(
+        monkeypatch,
+        recreate_candidates=[],
+        selected_names=["ecommerce.orders", "ecommerce.customers"],
+        job=job,
+        status=StepStatus.DONE,
+        retry_tables=lambda names: picked.append(list(names)),
+        click="Reload specific tables",
+    )
+
+    assert ui.opened == 1, "the scoped-reload dialog did not open"
+    # Every LOADED table is offered, and NOTHING is pre-ticked: the action set is the
+    # whole load, so pre-checking would arm a full re-load from this button.
+    body = " ".join(ui.texts)
+    assert "ecommerce.orders" in body and "ecommerce.customers" in body
+    assert len(ui.checkboxes) == 2, ui.checkboxes
+    assert all(value is False for _label, value in ui.checkboxes), ui.checkboxes
+    # The hint explains the scope and the gapless-watermark guarantee.
+    assert "Tick the tables to reload" in body
+    assert "untouched" in body
+    assert "gapless" in body
+
+    # DECISIVE: tick ONE table, confirm, and only that table is reloaded. Asserting the
+    # rendered checkbox values alone would not catch a dialog whose internal checked set
+    # still started full -- confirming would then reload everything while the boxes looked
+    # empty, which is the failure this whole control exists to avoid.
+    from types import SimpleNamespace
+
+    tick = [h for h in ui.checkbox_handlers if callable(h)]
+    assert len(tick) == 2, ui.checkbox_handlers
+    # The checklist is rendered in the loaded set's sorted order, so the checkbox
+    # handlers line up with it positionally.
+    order = sorted(["ecommerce.orders", "ecommerce.customers"])
+    tick[order.index("ecommerce.orders")](SimpleNamespace(value=True))
+    _CONFIRM_LABELS = {
+        "Confirm and start", "Append and load", "Drop, recreate and load",
+        "Recreate and load", "Re-run anyway (CDC is live)",
+    }
+    confirm = [h for (label, h) in ui.handlers if label in _CONFIRM_LABELS]
+    assert confirm, ui.buttons
+    import asyncio as _asyncio
+
+    result = confirm[-1]()
+    if _asyncio.iscoroutine(result):
+        _asyncio.run(result)
+    assert picked == [["ecommerce.orders"]], picked
+
+
+def test_scoped_reload_is_absent_while_tables_are_still_unfinished(monkeypatch) -> None:
+    # With unfinished tables the recovery row ("Retry unfinished tables") owns this
+    # space; the scoped reload must not compete with it.
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+
+    job = MigrationJob(job_id="j1")
+    job.status = "FAILED"
+    job.chunks = [
+        ChunkState(chunk_id="ecommerce.orders", status="DONE", rows_loaded=5, attempts=1),
+        ChunkState(chunk_id="ecommerce.customers", status="FAILED", rows_loaded=0, attempts=1),
+    ]
+
+    ui = _ConfirmDialogUi()
+    noop = lambda *_a, **_k: None  # noqa: E731
+
+    class _NoJobs:
+        def get_status(self, job_id):
+            from dsql_migrator.core.job_manager import JobNotFoundError
+
+            raise JobNotFoundError(job_id)
+
+        def get_error(self, job_id):
+            return None  # a terminal job with no job-level failure
+
+    from dsql_migrator.ui import data_migration as dm
+
+    dm._render_full_load_step(
+        ui, DataMigrationState(), _NoJobs(), _VerifiedSession(),
+        job=job, status=StepStatus.FAILED,
+        selected_names=["ecommerce.orders", "ecommerce.customers"],
+        guard_reason=None, start_full_load=noop, retry_failed_load=noop,
+        reload_table=noop, accept_quarantine_and_continue=noop, stop_full_load=noop,
+        refresh=noop, retry_tables=noop,
+        schema_recreate_candidates=lambda: [],
+    )
+
+    assert not any("Reload specific tables" in b for b in ui.buttons), ui.buttons
+    assert any("Retry unfinished tables" in b for b in ui.buttons), ui.buttons
+
+
+def test_scoped_reload_is_disabled_while_cdc_streams(monkeypatch) -> None:
+    # Reloading under a live sink can drop streamed rows, and CDC resumes from the
+    # ORIGINAL watermark -- the same rule Re-run already follows.
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+    from dsql_migrator.ui.data_migration import _full_load_ui as fl
+
+    monkeypatch.setattr(fl, "cdc_streaming_started", lambda *a, **k: True)
+
+    job = MigrationJob(job_id="j1")
+    job.status = "DONE"
+    job.chunks = [
+        ChunkState(chunk_id="ecommerce.orders", status="DONE", rows_loaded=5, attempts=1)
+    ]
+
+    class _BtnRecorder(_ConfirmDialogUi):
+        def __init__(self):
+            super().__init__()
+            self.btn_props: list[tuple[str, str]] = []
+
+        def button(self, text="", *_a, on_click=None, **_k):
+            label = str(text)
+            if label:
+                self.buttons.append(label)
+            if on_click is not None:
+                self.handlers.append((label, on_click))
+            recorder = self
+
+            class _Btn:
+                def props(self, *a, **k):
+                    for value in a:
+                        recorder.btn_props.append((label, str(value)))
+                    return self
+
+                def disable(self):
+                    recorder.btn_props.append((label, "disable"))
+                    return self
+
+                def tooltip(self, *a, **k):
+                    recorder.btn_props.append(
+                        (label, " ".join(str(x) for x in a))
+                    )
+                    return self
+
+                def __getattr__(self, _n):
+                    return lambda *a, **k: self
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+            return _Btn()
+
+    noop = lambda *_a, **_k: None  # noqa: E731
+
+    class _NoJobs:
+        def get_status(self, job_id):
+            from dsql_migrator.core.job_manager import JobNotFoundError
+
+            raise JobNotFoundError(job_id)
+
+        def get_error(self, job_id):
+            return None  # a terminal job with no job-level failure
+
+    from dsql_migrator.ui import data_migration as dm
+
+    ui = _BtnRecorder()
+    dm._render_full_load_step(
+        ui, DataMigrationState(), _NoJobs(), _VerifiedSession(),
+        job=job, status=StepStatus.DONE,
+        selected_names=["ecommerce.orders"],
+        guard_reason=None, start_full_load=noop, retry_failed_load=noop,
+        reload_table=noop, accept_quarantine_and_continue=noop, stop_full_load=noop,
+        refresh=noop, retry_tables=noop,
+        schema_recreate_candidates=lambda: [],
+    )
+
+    reload_props = [p for label, p in ui.btn_props if "Reload specific" in label]
+    assert any("disable" == p for p in reload_props), ui.btn_props
+    assert any("Stop CDC first" in p for p in reload_props), ui.btn_props

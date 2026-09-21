@@ -144,6 +144,7 @@ from dsql_migrator.ui.data_migration._cdc_state import (  # noqa: E402,F401
     _cdc_is_streaming,
     cdc_infra_deploy_in_flight,
     cdc_monitoring_visible,
+    cdc_evidence_unverified,
     cdc_pipeline_live,
     cdc_streaming_started,
     cdc_teardown_badge,

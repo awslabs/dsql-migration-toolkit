@@ -3895,6 +3895,7 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     cdc_deploy_card_superseded,
     cdc_deploy_connection_blocker,
     cdc_live_running_names,
+    cdc_evidence_unverified,
     cdc_pipeline_live,
     cdc_infra_deploy_in_flight,
     cdc_streaming_started,

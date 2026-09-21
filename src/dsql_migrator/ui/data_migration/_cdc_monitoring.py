@@ -1039,7 +1039,18 @@ _DRIFT_LABELS: dict[str, tuple[str, str]] = {
         "the source changed a column's type incompatibly, so DSQL rejected the rows "
         "(SQLSTATE 42804 / 22xxx)",
     ),
+    # TARGET-side, and the most destructive: every event for the table is dead-lettered
+    # with its offset committed, so the rows are not waiting anywhere to be retried.
+    "missing-table": (
+        "the TARGET table no longer exists",
+        "the table this stream writes to is gone from Aurora DSQL — dropped and "
+        "recreated (a Schema Conversion REPLACE) or dropped out of band — so DSQL "
+        "rejected every row (SQLSTATE 42P01)",
+    ),
 }
+
+# Drift kinds that are NOT a source DDL change, so the banner must not call them one.
+_TARGET_SIDE_DRIFT_KINDS = frozenset({"missing-table"})
 
 
 async def _open_add_column_dialog(ui, session, table: str, on_refresh=None) -> None:
@@ -1301,15 +1312,24 @@ def _render_cdc_schema_drift_banner(
     drift = getattr(status_view, "schema_drift", None) or []
     if not drift:
         return
-    bg, border, icon_color, _icon = NOTICE_STYLE.get("warning", NOTICE_STYLE["info"])
+    # A missing TARGET table is not a source DDL change and is not merely "be aware":
+    # rows are being permanently lost right now, so it takes the error tone and its own
+    # header. Mixed drift reports the more severe of the two.
+    _target_side = [
+        g for g in drift if getattr(g, "kind", "") in _TARGET_SIDE_DRIFT_KINDS
+    ]
+    _tone = "error" if _target_side else "warning"
+    bg, border, icon_color, _icon = NOTICE_STYLE.get(_tone, NOTICE_STYLE["info"])
     with ui.column().classes(  # type: ignore[attr-defined]
         f"w-full gap-1 rounded-md border {border} {bg} p-2"
     ):
         with ui.row().classes("w-full items-center gap-2 no-wrap"):  # type: ignore[attr-defined]
             ui.icon("schema").classes(f"{icon_color} text-lg")  # type: ignore[attr-defined]
-            ui.label("Source schema change detected").classes(  # type: ignore[attr-defined]
-                "text-sm font-semibold text-gray-900"
-            )
+            ui.label(  # type: ignore[attr-defined]
+                "Target table missing — rows are being lost"
+                if _target_side
+                else "Source schema change detected"
+            ).classes("text-sm font-semibold text-gray-900")
             if cdc_ai_opener is not None:
                 ui.space()  # type: ignore[attr-defined]
                 _render_cdc_ai_button(
@@ -1350,6 +1370,26 @@ def _render_cdc_schema_drift_banner(
             "rows that were set aside. Stop CDC first if a column was dropped or "
             "retyped, since those may require recreating the table."
         ).classes("text-xs italic text-gray-600")
+        if _target_side:
+            # The recovery is different in kind: dead-lettered rows are NOT replayed and
+            # their Kafka offsets are already committed, so nothing will re-deliver them
+            # -- and rows applied BEFORE the table was dropped went with the table. Only
+            # a re-read of the source restores them.
+            _names = ", ".join(sorted({g.table for g in _target_side}))
+            render_notice(
+                ui,
+                tone="error",
+                header="Stop CDC and reload these tables",
+                body=(
+                    f"Dead-lettered rows are never replayed and their stream position is "
+                    f"already committed, so {_names} will not catch up on its own — and "
+                    "any rows applied before the table was dropped went with it. Stop "
+                    "CDC, confirm the table exists on the target (re-apply Schema "
+                    "Conversion if it does not), reload just that table on the Full Load "
+                    "step, then start CDC again. Validation (step 4) is what proves the "
+                    "gap is closed; this panel cannot."
+                ),
+            )
 
 
 def _render_cdc_dlq_panel(

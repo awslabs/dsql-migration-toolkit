@@ -57,6 +57,37 @@ def cdc_pipeline_live(migration_state) -> bool:
     return getattr(migration_state, "cdc_stack_phase", None) == "running"
 
 
+def cdc_evidence_unverified(migration_state) -> bool:
+    """True when CDC connectors are RECORDED for this migration but unchecked this session.
+
+    ``cdc_pipeline_live`` is deliberately a no-false-positive signal built from
+    ``cdc_controller`` / ``cdc_stack_phase``, and NEITHER survives a session restore --
+    only ``cdc_connector_names`` does. Both are written solely by a render of the Data
+    Migration CDC sub-step, so after a UI restart an operator who goes straight to Schema
+    Conversion gets ``False``: no "CDC is streaming" notice, and a destructive REPLACE
+    proceeds behind only the generic confirm. The stream is still running on AWS.
+
+    This is the honest middle state -- "there WAS a pipeline, and nothing has looked since
+    this session began" -- kept separate from ``cdc_pipeline_live`` for two reasons. It
+    must not promote the Data Migration step or unlock Validation (that is what the
+    no-false-positive rule protects), and it must not HARD-block Apply either: a stack
+    torn down out of band would leave these names behind forever, which is the stale
+    "CDC is streaming" that was observed live on a stack deleted twelve hours earlier.
+    So the caller warns and lets the operator decide, rather than trapping them.
+
+    Pure: no AWS I/O (this screen re-renders on every refresh).
+    """
+    # A wired controller or a probed stack phase both mean THIS session looked, so
+    # ``cdc_pipeline_live`` is authoritative either way and this predicate stands down.
+    # (Those two cover every case ``cdc_pipeline_live`` is True -- controller+names and
+    # phase == "running" -- so checking it again here would be dead code.)
+    if getattr(migration_state, "cdc_controller", None) is not None:
+        return False
+    if getattr(migration_state, "cdc_stack_phase", None) is not None:
+        return False
+    return bool(getattr(migration_state, "cdc_connector_names", []) or [])
+
+
 def cdc_infra_deploy_in_flight(migration_state, job_manager) -> bool:
     """True while this session's cdc-stack CREATE job is PENDING/RUNNING.
 

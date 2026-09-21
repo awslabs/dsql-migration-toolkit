@@ -427,32 +427,49 @@ class SinkConnectorConfig(BaseModel):
 
 
 class SchemaDriftKind(str, Enum):
-    """The kind of source-schema drift a permanent sink rejection reveals.
+    """The kind of schema mismatch a permanent sink rejection reveals.
 
     CDC does NOT propagate DDL: a source ``ALTER TABLE`` never changes the target,
     and the DDL event itself never reaches the sink. What DOES reach the sink is
     the first row written under the *new* source schema, whose column set no longer
     matches the target -- DSQL rejects it with a telltale SQLSTATE and the sink
     quarantines the row to the DLQ. Mapping that SQLSTATE back to a drift kind lets
-    the tool surface "the source schema changed" instead of an opaque quarantine.
+    the tool surface "the schema changed" instead of an opaque quarantine.
     Detection only -- the recovery (manual target ALTER, then per-table Reload to
     backfill missing rows) stays operator-driven (the tool never auto-alters the
     target: Property 6, no silent schema mutation).
+
+    Most kinds are SOURCE-side, but ``MISSING_TABLE`` is TARGET-side: the target table
+    the sink writes to has gone away underneath a live stream. It is in this enum
+    because it surfaces through the identical channel (a permanent rejection carrying a
+    telltale SQLSTATE) and needs the same banner -- and because without it the most
+    destructive case of all rendered as an anonymous poison row.
     """
 
     ADD_COLUMN = "add-column"      # 42703 undefined_column: source added a column the target lacks
     DROP_COLUMN = "drop-column"    # 23502 not_null_violation: source dropped a column the target requires
     TYPE_CHANGE = "type-change"    # 42804 datatype_mismatch: source changed a column's type incompatibly
+    MISSING_TABLE = "missing-table"  # 42P01 / 3F000: the TARGET table (or schema) is gone
 
 
 # SQLSTATE -> drift kind. Only STRUCTURAL rejections (tied to the row's column set
 # or a column's declared type) map to drift; a per-VALUE data exception does NOT (see
 # classify_schema_drift). 42804 (datatype_mismatch) is the type-change signal --
 # deliberately NOT class 22 (22001/22003/…), which ordinary bad data raises.
+#
+# 42P01 (undefined_table) / 3F000 (undefined_schema) are the TARGET-side entry: they
+# mean the table the sink writes to no longer exists, which happens when the target
+# schema is dropped and recreated while the stream runs (a Schema Conversion REPLACE, or
+# an out-of-band DROP). It is NOT transient by the sink's classifier, so every event for
+# that table is dead-lettered with the offset committed and no retry -- a silent,
+# per-table data hole. Unmapped, it rendered as an ordinary poison row: no banner, and
+# under 50 records not even an amber DLQ badge.
 _DRIFT_BY_SQLSTATE: dict[str, SchemaDriftKind] = {
     "42703": SchemaDriftKind.ADD_COLUMN,
     "23502": SchemaDriftKind.DROP_COLUMN,
     "42804": SchemaDriftKind.TYPE_CHANGE,
+    "42P01": SchemaDriftKind.MISSING_TABLE,
+    "3F000": SchemaDriftKind.MISSING_TABLE,
 }
 
 
@@ -464,7 +481,8 @@ def classify_schema_drift(error_code: Optional[str]) -> Optional[SchemaDriftKind
     a column's DECLARED TYPE, which a source DDL change produces:
     ``42703`` (a column the target lacks -> ADD COLUMN), ``23502`` (a NOT NULL target
     column got no value -> a dropped source column), ``42804`` (datatype_mismatch ->
-    TYPE CHANGE).
+    TYPE CHANGE), and ``42P01`` / ``3F000`` (the TARGET table or schema is gone ->
+    MISSING TABLE -- the one target-side kind).
 
     A class ``22`` data exception (``22001`` string-too-long / ``22003`` numeric range
     / ``22007`` bad datetime / ``22P02`` bad text) is deliberately NOT drift: it is a

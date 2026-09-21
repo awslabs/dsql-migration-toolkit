@@ -4238,3 +4238,96 @@ def test_the_foreign_key_pane_offers_expand_since_it_is_now_clipped() -> None:
     src = inspect.getsource(sc._render_fk_section)
     assert "ddl-fk-pane" in src and "ddl-pane\"" not in src, src
     assert "_render_expand_ddl_button" in src, src
+
+
+# ---------------------------------------------------------------------------
+# CDC evidence that has not been checked THIS session (restart false-negative)
+# ---------------------------------------------------------------------------
+
+
+def test_cdc_unverified_notice_warns_without_blocking() -> None:
+    """The restart hole: a live stream the screen could not see.
+
+    The block reads ``cdc_controller`` / ``cdc_stack_phase``, and NEITHER is snapshotted;
+    both are written only by a render of the CDC sub-step. So after a UI restart an
+    operator who comes straight to Schema Conversion saw NOTHING while the pipeline was
+    still running on AWS, and a REPLACE went ahead behind only the generic confirm.
+
+    It must WARN, not block: connector names left behind by an out-of-band teardown would
+    otherwise trap the operator forever (observed live -- a screen warned "CDC is
+    streaming" for a stack deleted twelve hours earlier).
+    """
+    from dsql_migrator.ui.schema_conversion import (
+        CDC_APPLY_UNVERIFIED_BODY,
+        CDC_APPLY_UNVERIFIED_HEADER,
+    )
+
+    # Says it is UNCHECKED, not that CDC is definitely live.
+    assert "may still be streaming" in CDC_APPLY_UNVERIFIED_HEADER
+    assert "hasn't checked" in CDC_APPLY_UNVERIFIED_HEADER
+    # Names the check, the danger, and the way out if the notice is stale.
+    assert "CDC" in CDC_APPLY_UNVERIFIED_BODY
+    assert "REPLACE" in CDC_APPLY_UNVERIFIED_BODY
+    assert "dead-lettered" in CDC_APPLY_UNVERIFIED_BODY
+    assert "already torn down" in CDC_APPLY_UNVERIFIED_BODY
+    assert "continue" in CDC_APPLY_UNVERIFIED_BODY
+
+
+def test_cdc_unverified_is_rendered_but_never_blocks_apply() -> None:
+    # Structural: the unverified probe must reach the step's notice branch and must NOT
+    # be consulted by _cdc_blocks_apply (which hard-returns from Apply).
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion as sc
+
+    step = inspect.getsource(sc.build_schema_conversion_screen)
+    assert "cdc_unverified_check" in step
+    # The branch CONDITION, not merely the constant: `elif False:` would leave the
+    # header in the source and render the notice unreachable.
+    assert "elif cdc_unverified:" in step
+    assert "header=CDC_APPLY_UNVERIFIED_HEADER" in step
+    # The blocking predicate stays keyed on the definite signal only.
+    blocker = inspect.getsource(sc.build_schema_conversion_screen)
+    assert "_cdc_apply_is_blocked(cdc_unverified_check)" in blocker
+    # ...and the unverified state is only ever consulted when NOT already blocked, so the
+    # definite notice wins and the two are never shown together.
+    assert "not cdc_active and _cdc_apply_is_blocked(cdc_unverified_check)" in blocker
+
+
+def test_cdc_evidence_unverified_only_fires_on_restored_names() -> None:
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.data_migration import cdc_evidence_unverified
+
+    # Restored session: names survived the snapshot, controller/phase did not.
+    restored = SimpleNamespace(
+        cdc_controller=None, cdc_stack_phase=None,
+        cdc_connector_names=["src", "sink"],
+    )
+    assert cdc_evidence_unverified(restored) is True
+
+    # Nothing recorded at all -> silent (a migration that never used CDC).
+    fresh = SimpleNamespace(
+        cdc_controller=None, cdc_stack_phase=None, cdc_connector_names=[]
+    )
+    assert cdc_evidence_unverified(fresh) is False
+
+    # Checked this session and found live -> the DEFINITE notice applies instead.
+    live = SimpleNamespace(
+        cdc_controller=object(), cdc_stack_phase="running",
+        cdc_connector_names=["src"],
+    )
+    assert cdc_evidence_unverified(live) is False
+
+    # Probed this session and found nothing live -> not "unverified" any more.
+    probed = SimpleNamespace(
+        cdc_controller=None, cdc_stack_phase="absent",
+        cdc_connector_names=["src"],
+    )
+    assert cdc_evidence_unverified(probed) is False
+
+    # A controller wired but no names (mid-start): the live check is authoritative.
+    wired = SimpleNamespace(
+        cdc_controller=object(), cdc_stack_phase=None, cdc_connector_names=[]
+    )
+    assert cdc_evidence_unverified(wired) is False

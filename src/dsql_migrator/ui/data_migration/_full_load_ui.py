@@ -352,7 +352,8 @@ def _render_full_load_step(
     # periodic poll re-render can't tear a stale value into the dialog).
 
     def _open_confirm_dialog_now(
-        *, action_tables, on_confirm, title, table_reasons=None
+        *, action_tables, on_confirm, title, table_reasons=None,
+        preselect=True, checklist_hint=None,
     ) -> None:
         """Build + open the Full-Load confirm dialog in the TOP-LEVEL client.
 
@@ -371,6 +372,12 @@ def _render_full_load_step(
         tables they aren't ready to retry (e.g. a not-yet-fixed source value) and
         retry only the rest. ``on_confirm`` is then called with the checked subset;
         otherwise it is called with no arguments.
+
+        ``preselect=False`` starts the checklist EMPTY (confirm disabled until
+        something is ticked) -- the "reload just these tables" case, where the action
+        set is every loaded table and pre-checking all of them would offer a
+        full re-load behind a button that says the opposite. ``checklist_hint``
+        replaces the retry-specific instruction line for that case.
         """
         from nicegui import context as _ctx
 
@@ -428,9 +435,11 @@ def _render_full_load_step(
                 if n not in _present and n not in _will_create
             ]
         selectable = table_reasons is not None
-        # Live set of checked tables (mutated by the per-row checkboxes). Starts as
-        # the full action set (all pre-checked) -- the common "retry everything".
-        checked: set = set(action_tables)
+        # Live set of checked tables (mutated by the per-row checkboxes). Retry starts
+        # with the full action set (all pre-checked) -- the common "retry everything".
+        # A scoped reload starts EMPTY: its action set is every loaded table, so
+        # pre-checking would arm a full re-load from a button that says "specific".
+        checked: set = set(action_tables) if preselect else set()
 
         def _build() -> None:
             with ui.dialog() as confirm_dialog, ui.card().classes("min-w-[360px]"):
@@ -492,7 +501,8 @@ def _render_full_load_step(
                 # and retry only the rest. Other actions just show badges.
                 if selectable and action_tables:
                     ui.label(
-                        "Uncheck any table you're not ready to retry yet (e.g. a "
+                        checklist_hint
+                        or "Uncheck any table you're not ready to retry yet (e.g. a "
                         "source value you haven't fixed):"
                     ).classes("text-xs text-gray-500")
                     with ui.column().classes(
@@ -509,9 +519,9 @@ def _render_full_load_step(
                                 _sync_confirm_enabled()
 
                             with ui.row().classes("items-start gap-2 no-wrap w-full"):
-                                ui.checkbox(value=True, on_change=_toggle).props(
-                                    "dense"
-                                )
+                                ui.checkbox(
+                                    value=bool(preselect), on_change=_toggle
+                                ).props("dense")
                                 with ui.column().classes("gap-0 min-w-0"):
                                     ui.label(name).classes(
                                         "text-sm font-medium text-gray-900"
@@ -688,6 +698,8 @@ def _render_full_load_step(
         on_confirm=None,
         title="Start Full Load?",
         table_reasons=None,
+        preselect=True,
+        checklist_hint=None,
     ) -> None:
         """Probe which target tables hold data, then open the confirm dialog.
 
@@ -698,8 +710,9 @@ def _render_full_load_step(
         run's replace set), then opens the confirm dialog in the top-level client
         context. ``on_confirm`` is the action to run on confirm (defaults to
         ``start_full_load``); ``title`` is the dialog heading. ``table_reasons``
-        (Retry-failed) turns the dialog into a per-table checklist and makes
-        ``on_confirm`` receive the checked subset.
+        (Retry-failed / scoped Reload) turns the dialog into a per-table checklist and
+        makes ``on_confirm`` receive the checked subset; ``preselect=False`` starts that
+        checklist empty and ``checklist_hint`` replaces its instruction line.
         """
         if _confirm_busy["value"]:
             return  # a probe is already in flight -> ignore the extra click
@@ -786,6 +799,8 @@ def _render_full_load_step(
                 on_confirm=confirm_action,
                 title=title,
                 table_reasons=table_reasons,
+                preselect=preselect,
+                checklist_hint=checklist_hint,
             )
         finally:
             _confirm_busy["value"] = False
@@ -1220,6 +1235,85 @@ def _render_full_load_step(
                             "succeeded table(s) are kept as-is (no re-load, no new "
                             "snapshot)."
                         )
+            else:
+                # Every table finished. Until now this state offered NO scoped action at
+                # all: the per-table "Reload" button lives only on the quarantine card,
+                # so a table that loaded CLEANLY but has to be re-loaded -- the normal
+                # case after re-applying ONE table's schema on the Schema Conversion
+                # step, which drops and recreates it EMPTY -- had no control. The table
+                # picker is locked once a load has run, so the only escape was a full
+                # "Re-run Full Load" over every table (a whole-source re-read) or Start
+                # over (discarding Evaluation, the conversion edits and the CDC inputs).
+                #
+                # The engine already supports the scoped run (the same retry path the
+                # quarantine Reload uses, which keeps the ORIGINAL watermark so a later
+                # CDC start stays gapless), so this only adds the missing entry point:
+                # the identical confirm checklist, starting EMPTY so nothing is reloaded
+                # by accident.
+                _loaded = sorted(
+                    c.chunk_id for c in job.chunks if c.status == "DONE"
+                )
+                if _loaded and retry_tables is not None:
+                    # getattr, not attribute access: this branch renders for ANY
+                    # terminal job, including a UI double / a session-less render, and a
+                    # missing flag must read as "not verified" (button disabled) rather
+                    # than raising out of the whole step.
+                    _rl_missing: list[str] = []
+                    if not getattr(session, "source_verified", False):
+                        _rl_missing.append("source")
+                    if not getattr(session, "target_verified", False):
+                        _rl_missing.append("target")
+
+                    async def _confirm_scoped_reload(event: object = None) -> None:
+                        await _open_full_load_confirm(
+                            event,
+                            probe_tables=list(_loaded),
+                            on_confirm=retry_tables,
+                            title="Reload selected tables?",
+                            # A checklist needs the reasons map to render; every entry is
+                            # blank here because there is no failure to explain -- the
+                            # hint line below carries the meaning instead.
+                            table_reasons={n: "" for n in _loaded},
+                            preselect=False,
+                            checklist_hint=(
+                                "Tick the tables to reload. Reloading re-reads those "
+                                "tables from the source and leaves every other table "
+                                "untouched; the run keeps its original watermark, so a "
+                                "later CDC start is still gapless."
+                            ),
+                        )
+
+                    with ui.row().classes("items-center gap-2 w-full"):
+                        _reload_btn = ui.button(
+                            "Reload specific tables…",
+                            on_click=_confirm_scoped_reload,
+                            icon="replay",
+                        ).props("color=primary outline")
+                        if _rl_missing:
+                            _reload_btn.disable()
+                            _reload_btn.tooltip(
+                                f"Reconnect the {' and '.join(_rl_missing)} connection "
+                                "first (Connect step) — credentials are not restored "
+                                "after a restart."
+                            )
+                        elif guard_reason:
+                            _reload_btn.disable()
+                            _reload_btn.tooltip(guard_reason)
+                        elif cdc_streaming_started(migration_state, job_manager):
+                            # Same rule as Re-run: reloading under a live sink can drop
+                            # streamed rows, and CDC would resume from the ORIGINAL
+                            # watermark rather than this run.
+                            _reload_btn.disable()
+                            _reload_btn.tooltip(
+                                "CDC is streaming -- reloading would collide with the "
+                                "live pipeline. Stop CDC first (CDC step → Stop CDC)."
+                            )
+                        else:
+                            _reload_btn.tooltip(
+                                "Re-load only the tables you pick (e.g. after "
+                                "re-applying one table's schema, which recreates it "
+                                "empty). Other tables are not touched."
+                            )
 
 
 # Quasar color names for each per-table Full Load state badge.
