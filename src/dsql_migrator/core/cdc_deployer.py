@@ -1339,6 +1339,10 @@ def run_cdc_delete(
     driver = _StageDriver(
         handle, stages=CDC_DELETE_STAGES, on_log=on_log, sleep=sleep
     )
+    # Stamped BEFORE any work: the secret cleanup at the end only deletes a secret not
+    # written since this moment, so a new deployment that upserted the same name while this
+    # teardown was still polling keeps its credentials (see delete_source_secret).
+    _teardown_started_at = datetime.now(timezone.utc)
     try:
         # 1. discover (non-raising — a rolled-back stack must still be deletable)
         driver.stage("discover_stack", "IN_PROGRESS")
@@ -1470,9 +1474,22 @@ def run_cdc_delete(
             secret_name = cdc_source_secret_name(stack_name)
             try:
                 result = delete_source_secret(
-                    stack_name=stack_name, aws_profile=aws_profile, region=region
+                    stack_name=stack_name, aws_profile=aws_profile, region=region,
+                    not_modified_since=_teardown_started_at,
                 )
-                if result == "absent":
+                if result == "skipped-modified":
+                    driver.log(
+                        f"Left the source secret '{secret_name}' in place: it was written "
+                        "AFTER this teardown started, so a newer deployment owns it. "
+                        "Deleting it would have broken that pipeline's Start CDC."
+                    )
+                elif result == "skipped-unverified":
+                    driver.log(
+                        f"Left the source secret '{secret_name}' in place: could not read "
+                        "its last-changed time to confirm this teardown owns it. Delete it "
+                        "manually in Secrets Manager if no other deployment uses it."
+                    )
+                elif result == "absent":
                     driver.log(
                         f"No tool-managed source secret '{secret_name}' to remove "
                         "(the source likely used Secrets Manager auth)."

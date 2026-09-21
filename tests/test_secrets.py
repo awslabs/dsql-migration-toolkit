@@ -515,3 +515,122 @@ def test_delete_passes_region_to_client() -> None:
     service, kwargs = session.client_calls[0]
     assert service == "secretsmanager"
     assert kwargs["region_name"] == "eu-west-1"
+
+
+def test_a_secret_written_after_the_teardown_started_is_not_deleted() -> None:
+    """The race the review found, and why freshness is the only usable discriminator.
+
+    The teardown polls the stack every 30 s while the UI re-probes every 5 s, so for up to
+    ~30 s after the stack vanishes the UI can already offer a fresh deploy -- whose
+    ensure_source_secret upserts the SAME deterministic name. The still-running cleanup then
+    scheduled the NEW deployment's credentials for deletion; the deploy succeeded and Start
+    CDC failed minutes later with the Debezium source unable to read its credentials,
+    reported as a generic "<connector> entered FAILED state" with no self-heal.
+
+    An ownership TAG or the ARN cannot discriminate: the racing upsert is from the same tool
+    for the same stack name, so any marker matches on both sides. Only "was this written
+    after I started?" separates them.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from dsql_migrator.core.secrets import delete_source_secret
+
+    started = datetime(2026, 9, 21, 12, 0, 0, tzinfo=timezone.utc)
+
+    class _Client:
+        def __init__(self, changed):
+            self._changed = changed
+            self.deleted: list = []
+
+        def describe_secret(self, SecretId):  # noqa: N803 - boto3 kwarg
+            return {"Name": SecretId, "LastChangedDate": self._changed}
+
+        def delete_secret(self, **kwargs):
+            self.deleted.append(kwargs)
+            return {}
+
+    def _factory(client):
+        class _Session:
+            def client(self, _name, region_name=None):
+                return client
+
+        return lambda **_kw: _Session()
+
+    # Written AFTER the teardown began -> a newer deployment owns it; leave it alone.
+    newer = _Client(started + timedelta(seconds=5))
+    assert delete_source_secret(
+        stack_name="dsql-cdc-stack", aws_profile=None, region="us-east-1",
+        not_modified_since=started, session_factory=_factory(newer),
+    ) == "skipped-modified"
+    assert newer.deleted == [], "the new deployment's credentials must survive"
+
+    # Written BEFORE -> this teardown owns it; delete as before.
+    older = _Client(started - timedelta(minutes=5))
+    assert delete_source_secret(
+        stack_name="dsql-cdc-stack", aws_profile=None, region="us-east-1",
+        not_modified_since=started, session_factory=_factory(older),
+    ) == "deleted"
+    assert older.deleted and older.deleted[0]["RecoveryWindowInDays"] == 7
+
+
+def test_an_unreadable_last_changed_time_leaves_the_secret_alone() -> None:
+    # Fail SAFE: skipping a cleanup costs a lingering secret an operator can delete;
+    # deleting the wrong one costs a pipeline that cannot start and says why.
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.secrets import delete_source_secret
+
+    class _Client:
+        def __init__(self):
+            self.deleted: list = []
+
+        def describe_secret(self, SecretId):  # noqa: N803
+            raise RuntimeError("AccessDeniedException: not authorized")
+
+        def delete_secret(self, **kwargs):
+            self.deleted.append(kwargs)
+            return {}
+
+    client = _Client()
+
+    class _Session:
+        def client(self, _name, region_name=None):
+            return client
+
+    assert delete_source_secret(
+        stack_name="s", aws_profile=None, region="us-east-1",
+        not_modified_since=datetime.now(timezone.utc),
+        session_factory=lambda **_kw: _Session(),
+    ) == "skipped-unverified"
+    assert client.deleted == []
+
+
+def test_without_the_timestamp_the_behaviour_is_unchanged() -> None:
+    # Every existing caller that passes no timestamp keeps the old path: no extra API call.
+    from dsql_migrator.core.secrets import delete_source_secret
+
+    class _Client:
+        def __init__(self):
+            self.described = 0
+            self.deleted: list = []
+
+        def describe_secret(self, SecretId):  # noqa: N803
+            self.described += 1
+            return {}
+
+        def delete_secret(self, **kwargs):
+            self.deleted.append(kwargs)
+            return {}
+
+    client = _Client()
+
+    class _Session:
+        def client(self, _name, region_name=None):
+            return client
+
+    assert delete_source_secret(
+        stack_name="s", aws_profile=None, region="us-east-1",
+        session_factory=lambda **_kw: _Session(),
+    ) == "deleted"
+    assert client.described == 0, "no DescribeSecret call when no timestamp is given"
+    assert client.deleted

@@ -1324,8 +1324,11 @@ def test_delete_cleans_up_source_secret_when_region_given(monkeypatch) -> None:
 
     seen: dict = {}
 
-    def _fake_delete(*, stack_name, aws_profile, region):
-        seen.update(stack_name=stack_name, aws_profile=aws_profile, region=region)
+    def _fake_delete(*, stack_name, aws_profile, region, not_modified_since=None):
+        seen.update(
+            stack_name=stack_name, aws_profile=aws_profile, region=region,
+            not_modified_since=not_modified_since,
+        )
         return "deleted"
 
     monkeypatch.setattr(
@@ -1338,7 +1341,14 @@ def test_delete_cleans_up_source_secret_when_region_given(monkeypatch) -> None:
         sleep=lambda _s: None, delete_timeout_seconds=5.0, poll_interval_seconds=0.0,
     )
     assert all(s == "DONE" for s in _statuses(handle).values())
-    assert seen == {"stack_name": STACK, "aws_profile": "prof", "region": "us-east-1"}
+    assert seen["stack_name"] == STACK
+    assert seen["aws_profile"] == "prof"
+    assert seen["region"] == "us-east-1"
+    # The teardown's start time must reach the cleanup: it is what stops this teardown
+    # deleting a secret a NEWER deployment upserted while it was still polling (the UI
+    # re-probes every 5 s, the teardown every 30 s, so that window is real).
+    assert seen["not_modified_since"] is not None
+    assert seen["not_modified_since"].tzinfo is not None, "must be tz-aware for comparison"
     assert any("scheduled for deletion" in m for m in logs)
 
 

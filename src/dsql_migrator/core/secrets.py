@@ -23,6 +23,8 @@ injectable so unit tests never reach AWS.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import json
 from typing import Callable, Optional
 
@@ -318,6 +320,15 @@ def delete_source_secret(
     region: Optional[str],
     recovery_window_in_days: int = 7,
     session_factory: Optional[SessionFactory] = None,
+    # Only delete a secret NOT touched since the teardown began. The teardown polls the
+    # stack every 30 s while the UI re-probes every 5 s, so for up to ~30 s after the stack
+    # vanishes the UI can already offer a fresh deploy -- whose ensure_source_secret upserts
+    # THIS name. Without the check the still-running cleanup then scheduled the NEW
+    # deployment's credentials for deletion, the deploy succeeded, and Start CDC failed
+    # minutes later with the Debezium source unable to read its credentials -- reported as a
+    # generic "<connector> entered FAILED state" with no self-heal (the Start pass never
+    # re-upserts the secret and the connector reads it by name).
+    not_modified_since: "Optional[datetime]" = None,
 ) -> str:
     """Delete the tool-managed source-credentials secret; return a status string.
 
@@ -330,8 +341,11 @@ def delete_source_secret(
 
     Returns a short, credential-free status: ``"deleted"`` (scheduled for deletion),
     ``"absent"`` (nothing to delete -- e.g. the source used Secrets Manager auth, so
-    the tool never created one), or raises :class:`SecretProvisionError` on a real
-    failure. Idempotent: a missing secret is a success, not an error.
+    the tool never created one), ``"skipped-modified"`` (a newer write exists, so this
+    teardown does not own it -- see ``not_modified_since``), ``"skipped-unverified"``
+    (ownership could not be read, so the secret is left alone), or raises
+    :class:`SecretProvisionError` on a real failure. Idempotent: a missing secret is a
+    success, not an error.
     """
     name = cdc_source_secret_name(stack_name)
     try:
@@ -343,6 +357,31 @@ def delete_source_secret(
             f"Could not reach Secrets Manager to delete the source secret "
             f"'{name}': {str(exc).splitlines()[0]}"
         ) from exc
+
+    if not_modified_since is not None:
+        # FRESHNESS, not ownership: a tag or the ARN cannot discriminate here, because the
+        # racing upsert is from the SAME tool for the SAME stack name -- any ownership
+        # marker matches on both sides. Only "was this written after I started tearing
+        # down?" separates the secret this teardown created from one a new deployment just
+        # wrote. A read failure leaves the secret alone: skipping a cleanup costs a
+        # lingering secret the operator can delete, while deleting the wrong one costs a
+        # pipeline that cannot start and gives no reason.
+        try:
+            described = client.describe_secret(SecretId=name)  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001
+            if "ResourceNotFoundException" in str(exc):
+                return "absent"
+            return "skipped-unverified"
+        changed = described.get("LastChangedDate") or described.get("CreatedDate")
+        if changed is not None:
+            reference = not_modified_since
+            # Compare in one frame: boto3 returns tz-aware, a caller may pass naive.
+            if changed.tzinfo is not None and reference.tzinfo is None:
+                reference = reference.replace(tzinfo=timezone.utc)
+            elif changed.tzinfo is None and reference.tzinfo is not None:
+                changed = changed.replace(tzinfo=timezone.utc)
+            if changed > reference:
+                return "skipped-modified"
 
     try:
         client.delete_secret(  # type: ignore[attr-defined]

@@ -5,6 +5,30 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.490
+
+### Fixed
+
+- **A CDC teardown can no longer delete a NEWER deployment's source credentials.** The teardown
+  polls the stack every 30 s while the UI re-probes every 5 s, so for up to ~30 s after the stack
+  vanishes the UI can already offer a fresh deploy — whose `ensure_source_secret` upserts the same
+  deterministic secret name. The still-running cleanup then scheduled THAT secret for deletion
+  (7-day recovery), the deploy succeeded, and Start CDC failed minutes later with the Debezium
+  source unable to read its credentials — surfaced as a generic "&lt;connector&gt; entered FAILED
+  state", with no self-heal (the Start pass never re-upserts the secret and the connector reads it
+  by name). The cleanup now deletes only a secret **not written since the teardown began**.
+  - **Freshness, not ownership.** A tag or the ARN cannot discriminate here: the racing upsert is
+    from the same tool for the same stack name, so any ownership marker matches on both sides. Only
+    "was this written after I started tearing down?" separates them.
+  - **Fails safe.** If the last-changed time cannot be read, the secret is left alone and the log
+    says so: skipping a cleanup costs a lingering secret an operator can delete, while deleting the
+    wrong one costs a pipeline that cannot start and gives no reason. Callers that pass no
+    timestamp keep the old behaviour with no extra API call.
+  - Verified before implementing that this guard cannot silently fail open: `secretsmanager:
+    DescribeSecret` is **allowed** on both live TaskRoles (`iam simulate-principal-policy`
+    against `mysql-dsql-migrator` in us-east-1 and `mysql-dsql-migrator-seoul` in ap-northeast-2),
+    which mattered because both stacks were created from older template revisions.
+
 ## v0.1.489
 
 ### Fixed
