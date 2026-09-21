@@ -88,6 +88,27 @@ _SETS: dict[str, tuple[list[str], list[tuple[str, str]]]] = {
             ("product_reviews", "review_id"),
         ],
     ),
+    # The small real ``ecommerce`` schema (~2.5k rows, 7 tables + audit_people): the
+    # fastest end-to-end that still exercises an oversized-LOB quarantine
+    # (product_media.content longblob / full_description longtext). Parent-first order.
+    # NOTE: every registered schema is integer-PK only, so none of them gives the
+    # quarantine key-value withholding rule a negative control -- a natural-key PK table
+    # has to be added to the source for that (done ad hoc, then removed).
+    "ecommerce": (
+        [
+            "categories", "users", "products", "inventory", "orders",
+            "order_items", "product_media",
+        ],
+        [
+            ("categories", "id"),
+            ("users", "id"),
+            ("products", "id"),
+            ("inventory", "id"),
+            ("orders", "id"),
+            ("order_items", "id"),
+            ("product_media", "id"),
+        ],
+    ),
     # New type-coverage schema: a small parent->child/lob FK chain that exercises
     # the maximum MySQL type/syntax surface (incl. LOB). typetest_loud and
     # typetest_spatial are intentionally EXCLUDED from the migrated set -- they

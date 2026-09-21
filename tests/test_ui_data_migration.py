@@ -22513,3 +22513,75 @@ def test_the_cutover_action_passes_its_origin_to_the_shared_pass() -> None:
 
     src = inspect.getsource(val._run_cutover_foreign_keys)
     assert 'origin="cut-over"' in src
+
+
+def test_a_pre_loop_failure_writes_a_terminal_run_failed_line(monkeypatch) -> None:
+    """A run that dies before the table loop must not leave a dangling "run started".
+
+    Observed live three times in one session -- a target foreign key blocking the
+    DROP+recreate, and a PostgreSQL replication slot that could not be created because
+    wal_level was replica (twice). Each had a nameable cause, every chunk stayed PENDING,
+    and the activity log held "run started" with NO terminal line at all.
+
+    SCOPE, deliberately stated: this brackets the IN-PROCESS pre-loop phase (watermark
+    capture, the CDC slot/publication, the view and foreign-key pre-drops). A failure
+    relayed from a multiprocess table WORKER is a different path and still has no
+    run-level line -- see the note in the changelog.
+    """
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    events: list[tuple] = []
+    monkeypatch.setattr(
+        engine, "log_activity",
+        lambda category, action, **kw: events.append((category, action, kw)),
+    )
+
+    class _Boom:
+        def capture_watermark(self, tables):
+            raise RuntimeError(
+                "could not create replication slot\n"
+                "DETAIL:  wal_level must be logical, secret-token-should-not-appear"
+            )
+
+    class _Handle:
+        job_id = "job-1"
+
+        def update(self, *_a, **_k):
+            return None
+
+        def __getattr__(self, _name):
+            return lambda *a, **k: None
+
+    from dsql_migrator.core.error_log import ErrorLogStore
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    table = TableDef(
+        name="db.t",
+        columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+        primary_key=["id"],
+    )
+    with pytest.raises(RuntimeError):
+        engine.run_full_load(
+            _Handle(), [table], migrator=_Boom(), error_log=ErrorLogStore()
+        )
+
+    failed = [e for e in events if e[1] == "run failed"]
+    assert len(failed) == 1, [e[1] for e in events]
+    category, _action, kw = failed[0]
+    assert category is engine.ActivityCategory.FULL_LOAD
+    assert kw["status"] is engine.ActivityStatus.FAILURE
+    detail = kw["detail"]
+    assert "no rows were written" in detail
+    assert "replication slot" in detail
+    # This test stubs log_activity, so the detail it captures is PRE-sanitizer. The
+    # guarantee is the composition: log_activity reduces every detail to its first line,
+    # which is what drops the driver's DETAIL block (and anything in it). Assert that, so
+    # the contract is pinned where it actually lives rather than assumed here.
+    from dsql_migrator.core.activity_log import _safe_detail
+
+    reduced = _safe_detail(detail)
+    assert reduced is not None
+    assert "\n" not in reduced
+    assert "secret-token-should-not-appear" not in reduced
+    assert "wal_level" not in reduced          # the DETAIL line is dropped whole
+    assert "replication slot" in reduced       # the actionable primary line survives

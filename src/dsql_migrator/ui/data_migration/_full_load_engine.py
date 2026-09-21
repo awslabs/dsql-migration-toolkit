@@ -2837,12 +2837,19 @@ def watermark_coordinate(
     """
     if watermark is None:
         return "no watermark"
-    if watermark.gtid_executed:
-        return f"GTID {watermark.gtid_executed}"
-    if watermark.binlog_file:
-        return f"binlog {watermark.binlog_file}:{watermark.binlog_position}"
-    if watermark.wal_lsn:
-        return f"WAL LSN {watermark.wal_lsn}"
+    # getattr, not attribute access: this is now also called on the Start CDC SUBMIT path
+    # (to record the resume point), and an audit string must never be able to abort a
+    # long, billable operation. A Watermark restored from an older persisted job, or any
+    # duck-typed stand-in, can lack a field.
+    gtid = getattr(watermark, "gtid_executed", None)
+    binlog_file = getattr(watermark, "binlog_file", None)
+    wal_lsn = getattr(watermark, "wal_lsn", None)
+    if gtid:
+        return f"GTID {gtid}"
+    if binlog_file:
+        return f"binlog {binlog_file}:{getattr(watermark, 'binlog_position', None)}"
+    if wal_lsn:
+        return f"WAL LSN {wal_lsn}"
     if source_type is SourceType.MYSQL:
         return "no binlog/GTID coordinate available (binary logging off or restricted)"
     engine = dialect_for(source_type).engine_display_name
@@ -2956,19 +2963,45 @@ def run_full_load(
     )
     _log_excluded_lob_columns(inputs)
 
-    watermark = migrator.capture_watermark(tables)
-    handle.update(lambda job: setattr(job, "watermark", watermark))
-    # inputs is Optional here; fall back to MySQL when absent (matches the default).
-    _log_captured_watermark(
-        watermark,
-        getattr(getattr(inputs, "source_config", None), "source_type", SourceType.MYSQL),
-    )
+    # EVERYTHING up to the per-table loop is bracketed, because a failure in here ends the
+    # run with every chunk still PENDING -- and until now that left an audit log holding a
+    # "run started" line and NO terminal line at all. Observed live three times in one
+    # session: a target foreign key that blocked the DROP+recreate (MySQL), and a
+    # PostgreSQL replication slot that could not be created because wal_level was replica
+    # (twice). Each had a nameable cause and the log said nothing about it.
+    #
+    # The reason is reduced to its first line by log_activity, so a driver message cannot
+    # carry row values in here (Property 7). Re-raised unchanged: the JobManager still marks
+    # the job FAILED and the UI still shows the error.
+    try:
+        watermark = migrator.capture_watermark(tables)
+        handle.update(lambda job: setattr(job, "watermark", watermark))
+        # inputs is Optional here; fall back to MySQL when absent (matches the default).
+        _log_captured_watermark(
+            watermark,
+            getattr(
+                getattr(inputs, "source_config", None), "source_type", SourceType.MYSQL
+            ),
+        )
 
-    # On a "drop & reload" run, drop views that depend on the replaced tables
-    # BEFORE the per-table DROP+recreate (a view can span several tables loaded in
-    # parallel, so this is a run-level pre-pass), then recreate them after.
-    _predrop_blocking_foreign_keys(migrator)
-    _predrop_dependent_views(migrator)
+        # On a "drop & reload" run, drop views that depend on the replaced tables
+        # BEFORE the per-table DROP+recreate (a view can span several tables loaded in
+        # parallel, so this is a run-level pre-pass), then recreate them after.
+        _predrop_blocking_foreign_keys(migrator)
+        _predrop_dependent_views(migrator)
+    except Exception as exc:  # noqa: BLE001 - logged, then re-raised unchanged
+        log_activity(
+            ActivityCategory.FULL_LOAD,
+            "run failed",
+            status=ActivityStatus.FAILURE,
+            detail=(
+                "the run ended BEFORE any table was loaded, so no rows were written: "
+                f"{exc}"
+            ),
+            error_code=getattr(exc, "sqlstate", None),
+            exc=exc,
+        )
+        raise
     counts = _migrate_tables_in_parallel(handle, job_id, tables, migrator, error_log)
     _recreate_dependent_views(migrator)
     # Foreign keys are NOT applied here any more -- they are an explicit operator action on

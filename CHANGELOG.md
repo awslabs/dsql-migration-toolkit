@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.484
+
+### Added
+
+- **A run that dies before the table loop now writes a terminal audit line.** Everything from the
+  watermark capture through the CDC replication slot and the view / foreign-key pre-drops is
+  bracketed: on a failure it logs `run failed` (`FAILURE`) naming the reason and stating that no
+  rows were written, then re-raises unchanged. Observed live three times in one session — a target
+  foreign key that blocked the DROP+recreate, and a PostgreSQL replication slot that could not be
+  created because `wal_level` was `replica` (twice). Each had a nameable cause, every chunk stayed
+  `PENDING`, and the activity log held a `run started` line with no terminal line at all. The
+  reason is reduced to its first line by `log_activity`, so a driver message cannot carry row
+  values into it (Property 7).
+  - **Scope, stated because it is not the whole gap:** this covers the IN-PROCESS pre-loop phase.
+    A failure relayed from a multiprocess table worker is a different path and still produces no
+    run-level line; the MySQL foreign-key case above reached the job that way.
+
 ## v0.1.483
 
 ### Security
