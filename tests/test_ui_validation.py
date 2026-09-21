@@ -6033,3 +6033,41 @@ def test_the_ack_and_waiver_are_wired_to_the_log() -> None:
     assert waiver.index("log_activity") < waiver.index(
         "proceed_without_foreign_keys = True"
     )
+
+
+def test_cancelling_validation_is_recorded_once_from_the_click() -> None:
+    """An abandoned verdict must be visible: the cut-over gate reads the last one.
+
+    And the line must live in the CLICK handler -- _is_stopping()/_sync() run on every poll
+    tick and would re-log the same request every half-second.
+    """
+    import inspect
+
+    from dsql_migrator.ui import validation as val
+
+    src = inspect.getsource(val)
+    assert '"cancel requested"' in src
+
+    # AST, not a character window: _is_stopping / _sync sit right next to _cancel in the
+    # source, so a "nearby text" check cannot tell which function the call is IN -- and
+    # WHICH function is the whole point (the poll helpers run every half-second).
+    import ast
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(src))
+    owners = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = ast.get_source_segment(textwrap.dedent(src), node) or ""
+        if '"cancel requested"' in body:
+            owners.append(node.name)
+    # The innermost owner is the one that matters.
+    assert "_cancel" in owners, owners
+    assert "_is_stopping" not in owners and "_sync" not in owners, owners
+
+    # Read-only is the reassuring half of the message, and it is true of validation.
+    i = src.index('"cancel requested"')
+    block = src[i:i + 600]
+    assert "read only" in block or "read-only" in block
+    assert "no verdict is produced" in block

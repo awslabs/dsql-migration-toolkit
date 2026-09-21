@@ -2533,6 +2533,24 @@ def _finalize_run(
             _log_identity_sequence_sync(
                 inputs, _sync_names, sync=sync_sequences
             )
+        else:
+            # A run the OPERATOR stopped returned here silently, so the audit log held a
+            # "run started" line and nothing else -- the same dangling-start shape as an
+            # aborted run, but for the one case where the operator KNOWS what happened and
+            # a reader six weeks later does not. WARNING, not FAILURE: nothing broke and the
+            # loaded tables are kept; not INFO either, because a partial target is a fact
+            # someone must act on.
+            _loaded = sum(1 for c in handle.snapshot().chunks if c.status == "DONE")
+            log_activity(
+                ActivityCategory.FULL_LOAD,
+                "run stopped",
+                status=ActivityStatus.WARNING,
+                detail=(
+                    f"stopped by the operator -- {_loaded} of {len(table_names)} table(s) "
+                    "loaded. The loaded tables are kept (the load is idempotent), so a "
+                    "re-run fills only the unfinished ones."
+                ),
+            )
         return
     total = len(table_names)
     # Quarantine records are the error-log rows whose message marks an isolated

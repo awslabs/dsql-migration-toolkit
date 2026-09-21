@@ -5,6 +5,35 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.488
+
+### Added
+
+- **A run the operator STOPPED now writes a terminal line.** `_finalize_run` returned silently
+  on a cancelled run, so the audit log held `run started` and nothing else — the same
+  dangling-start shape the last two releases closed for aborted runs, but for the one case where
+  the operator knows what happened and a reader six weeks later does not. `run stopped` at
+  `WARNING` (nothing broke and the loaded tables are kept, but a partial target is a fact someone
+  must act on) with how many of how many tables loaded and that a re-run fills only the rest.
+- **The stop / cancel REQUEST is recorded too.** Both stops are cooperative, so minutes can pass
+  between the click and the run ending; without the request line the log cannot tell an
+  operator-requested stop from a crash that happened to end the run at the same moment. Full Load
+  logs `stop requested`, Validation logs `cancel requested` (noting that no verdict is produced for
+  the skipped tables and that validation is read-only, so nothing on the target changed). Both live
+  in the click handler, never in the poll helpers that run every half-second.
+- **A job reaped by the stall watchdog is audited.** The watchdog flips a RUNNING job to `FAILED`
+  after its silence timeout and did so with NO event at all — so a run reaped for an unresponsive
+  source or target left a `run started` line and nothing else, with no operator present to know
+  why. `core` must not import the activity log, so the reaper now announces each reap through an
+  injected listener that the app wires to a `job stalled` line (`SYSTEM`, because the watchdog
+  reaps validation jobs too). A listener that raises can never break the reap.
+- **Changes to the activity log's own recording are recorded.** `activity log level changed` and
+  `activity log mirror changed`, so a reader comparing two runs can tell the quieter one was
+  configured that way rather than idle. Turning the CloudWatch mirror OFF logs at `WARNING` — on
+  ECS that mirror is what makes the trail survive a task replacement — and the line is emitted
+  BEFORE the handler is removed, or it would be the one event the sink it just removed never
+  carried, leaving the CloudWatch copy ending with no explanation.
+
 ## v0.1.487
 
 ### Fixed

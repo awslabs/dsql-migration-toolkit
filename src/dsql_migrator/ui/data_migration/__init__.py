@@ -1210,6 +1210,19 @@ def build_data_migration_screen(
                 # finishes its current batch and the job ends as CANCELLED.
                 job_id = migration_state.job_id
                 if job_id is not None:
+                    # Record the REQUEST, not just its outcome: the stop is cooperative, so
+                    # minutes can pass between the click and the run ending, and without this
+                    # the log could not tell an operator-requested stop from a crash that
+                    # happened to end the run at the same moment.
+                    log_activity(
+                        ActivityCategory.FULL_LOAD,
+                        "stop requested",
+                        status=ActivityStatus.INFO,
+                        detail=(
+                            "operator requested a stop -- in-flight batches finish first, "
+                            "and every table already loaded is kept"
+                        ),
+                    )
                     job_manager.request_cancel(job_id)
                 refresh()
 

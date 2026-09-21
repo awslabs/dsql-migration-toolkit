@@ -131,6 +131,39 @@ PLAYGROUND_STORE = PlaygroundStore()
 # Runs long-running steps (e.g. introspection) off the UI event loop (Req 9.3).
 JOB_MANAGER = JobManager()
 
+
+def _log_stalled_job(job_id: str, unfinished: int, total: int, timeout_s: float) -> None:
+    """Audit a job the stall watchdog reaped.
+
+    The watchdog flips a RUNNING job to FAILED after ``timeout_s`` of silence, and did so
+    with NO audit event -- so a run reaped for an unresponsive source/target left a
+    "run started" line and nothing else, with no operator present to know why. The reaper
+    reports through an injected listener because ``core`` must not import the activity log.
+    SYSTEM, not FULL_LOAD: the watchdog reaps validation jobs too.
+    """
+    # Imported here, like every other activity-log use in this module (module scope keeps
+    # the app importable without touching the log config).
+    from dsql_migrator.core.activity_log import (
+        ActivityCategory,
+        ActivityStatus,
+        log_activity,
+    )
+
+    log_activity(
+        ActivityCategory.SYSTEM,
+        "job stalled",
+        status=ActivityStatus.FAILURE,
+        detail=(
+            f"no progress for {int(timeout_s)}s, so job {job_id} was marked FAILED "
+            f"({unfinished} of {total} unit(s) unfinished). Usually an unresponsive "
+            "source or target connection. Work already completed is kept -- retry to "
+            "resume the rest."
+        ),
+    )
+
+
+JOB_MANAGER.set_stall_listener(_log_stalled_job)
+
 # Durable per-session workbench state (attached in main()); None until then so
 # tests/imports do not touch disk. Holds the latest persisted snapshot signature
 # per session to skip redundant writes (large inventories are not re-serialized
@@ -1575,10 +1608,13 @@ def _render_activity_log_controls(activity_log_path: str) -> None:
     from nicegui import ui
 
     from dsql_migrator.core.activity_log import (
+        ActivityCategory,
+        ActivityStatus,
         activity_stdout_enabled,
         configure_activity_stdout_log,
         current_activity_log_level,
         disable_activity_stdout_log,
+        log_activity,
         read_activity_log,
         set_activity_log_level,
     )
@@ -1602,17 +1638,46 @@ def _render_activity_log_controls(activity_log_path: str) -> None:
 
     def _on_level(event: object) -> None:
         value = str(getattr(event, "value", "INFO"))
+        _before = logging.getLevelName(current_activity_log_level())
         set_activity_log_level(getattr(logging, value, logging.INFO))
+        # The audit trail should record changes to its OWN verbosity: a reader comparing two
+        # runs needs to know the quieter one was configured that way, not idle.
+        log_activity(
+            ActivityCategory.SYSTEM,
+            "activity log level changed",
+            status=ActivityStatus.INFO,
+            detail=f"level {_before} -> {value}",
+        )
         ui.notify(f"Log level set to {value}.", type="info")
 
     def _on_toggle(event: object) -> None:
         if bool(getattr(event, "value", False)):
             configure_activity_stdout_log(level=current_activity_log_level())
+            log_activity(
+                ActivityCategory.SYSTEM,
+                "activity log mirror changed",
+                status=ActivityStatus.INFO,
+                detail="CloudWatch Logs mirroring turned ON",
+            )
             ui.notify(
                 "Mirroring the activity log to CloudWatch Logs (via stdout on ECS).",
                 type="info",
             )
         else:
+            # BEFORE removing the handler: logged after, the "mirror off" event would be the
+            # one event the sink it just removed never carried -- so the CloudWatch copy
+            # would end with no explanation of why it ends. WARNING, not INFO: on ECS the
+            # mirror is what makes the trail survive a task replacement, so turning it off
+            # is a real (if deliberate) loss of durability.
+            log_activity(
+                ActivityCategory.SYSTEM,
+                "activity log mirror changed",
+                status=ActivityStatus.WARNING,
+                detail=(
+                    "CloudWatch Logs mirroring turned OFF -- the activity log now survives "
+                    "only in the container's file sink, which a task replacement discards"
+                ),
+            )
             disable_activity_stdout_log()
             ui.notify("Stopped mirroring the activity log to CloudWatch Logs.", type="info")
 

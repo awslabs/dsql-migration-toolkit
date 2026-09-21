@@ -3510,6 +3510,20 @@ def _render_in_progress(
     def _cancel() -> None:
         job_id = validation_state.job_id
         if job_id is not None:
+            # In the CLICK handler, never in _is_stopping()/_sync(): those run on every
+            # poll tick and would re-log the same request every half-second. Validation is
+            # read-only, so this records an abandoned VERDICT, not a data change -- which
+            # matters because the cut-over gate reads the last verdict.
+            log_activity(
+                ActivityCategory.VALIDATION,
+                "cancel requested",
+                status=ActivityStatus.INFO,
+                detail=(
+                    "operator cancelled the comparison -- tables not yet started are "
+                    "skipped and no verdict is produced for them; validation is read only, "
+                    "so nothing on the target changed"
+                ),
+            )
             job_manager.request_cancel(job_id)
         validation_state.cancel_requested = True
         _sync()  # reflect it immediately, without rebuilding the panel

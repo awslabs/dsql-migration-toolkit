@@ -621,3 +621,62 @@ def test_a_failed_jobs_persisted_error_keeps_only_the_first_line() -> None:
     assert "alice@example.com" not in error
     assert "secret-token" not in error
     assert "\n" not in error
+
+
+def test_a_stall_reaped_job_notifies_the_listener() -> None:
+    """The watchdog flipped a job to FAILED with no audit event at all.
+
+    So a run reaped for an unresponsive source/target left a "run started" line and nothing
+    else -- the same dangling-start shape as an aborted run, except no operator was present
+    to know why. ``core`` must not import the activity log, so the reap is announced through
+    an injected listener the UI wires to a log line.
+    """
+    clock = {"t": 1000.0}
+    mgr = JobManager(stall_timeout_seconds=10.0, clock=lambda: clock["t"])
+    seen: list = []
+    mgr.set_stall_listener(lambda *args: seen.append(args))
+    try:
+        started = threading.Event()
+        release = threading.Event()
+
+        def _work(handle=None):
+            started.set()
+            release.wait(10)
+
+        job_id = mgr.submit(_work)
+        assert started.wait(5)
+        clock["t"] += 60.0  # past the stall timeout
+
+        assert mgr.reap_stalled_jobs() == [job_id]
+        assert len(seen) == 1, seen
+        reaped_id, unfinished, total, timeout = seen[0]
+        assert reaped_id == job_id
+        assert timeout == 10.0
+        assert isinstance(unfinished, int) and isinstance(total, int)
+        assert mgr.get_status(job_id).status == "FAILED"
+    finally:
+        release.set()
+        mgr.shutdown()
+
+
+def test_a_raising_stall_listener_never_breaks_the_reap() -> None:
+    # The watchdog must never die: reporting is best-effort, the state change is not.
+    clock = {"t": 0.0}
+    mgr = JobManager(stall_timeout_seconds=5.0, clock=lambda: clock["t"])
+    mgr.set_stall_listener(lambda *_a: (_ for _ in ()).throw(RuntimeError("boom")))
+    try:
+        started = threading.Event()
+        release = threading.Event()
+
+        def _work(handle=None):
+            started.set()
+            release.wait(10)
+
+        job_id = mgr.submit(_work)
+        assert started.wait(5)
+        clock["t"] += 60.0
+        assert mgr.reap_stalled_jobs() == [job_id]      # did not propagate
+        assert mgr.get_status(job_id).status == "FAILED"  # and still reaped
+    finally:
+        release.set()
+        mgr.shutdown()

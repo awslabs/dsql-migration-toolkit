@@ -97,6 +97,11 @@ def is_interrupted_by_restart(error: Optional[str]) -> bool:
 # is immune to system time jumps).
 Clock = Callable[[], float]
 
+# Reports a stall-reaped job to the UI: (job_id, unfinished, total, timeout_s).
+# core must not import the activity log, so the reap is announced through this
+# injected callback instead (see JobManager.set_stall_listener).
+StallListener = Callable[[str, int, int, float], None]
+
 # A unit of background work. It receives a :class:`JobHandle` to record progress
 # and may run for a long time; returning normally marks the job ``DONE`` and
 # raising marks it ``FAILED``.
@@ -236,6 +241,9 @@ class JobManager:
         self._store: "Optional[JobStore]" = store
         self._clock: Clock = clock or time.monotonic
         self._stall_timeout = stall_timeout_seconds
+        # Set by the UI (set_stall_listener) so a reap can be audited without core
+        # importing the activity log.
+        self._stall_listener: "Optional[StallListener]" = None
         self._watchdog: Optional[threading.Thread] = None
         self._watchdog_stop = threading.Event()
         if store is not None:
@@ -465,6 +473,7 @@ class JobManager:
             return []
         now = self._clock()
         reaped: list[str] = []
+        stalled: list[tuple[str, int, int]] = []
         with self._lock:
             for record in self._records.values():
                 if record.job.status != "RUNNING":
@@ -493,7 +502,32 @@ class JobManager:
                 record.last_progress_at = now
                 self._persist_locked(record)
                 reaped.append(record.job.job_id)
+                stalled.append(
+                    (record.job.job_id, failed_chunks, len(record.job.chunks))
+                )
+        # OUTSIDE the lock, and after the mutation: the watchdog flipped a job to FAILED
+        # with no audit event at all, so a run reaped for silence left a "run started" line
+        # and nothing else -- the same dangling-start shape as an aborted run, except no
+        # operator was there to see it happen. core keeps its no-activity_log dependency, so
+        # the UI injects a listener; a listener that raises must never kill the watchdog.
+        for job_id, unfinished, total in stalled:
+            listener = self._stall_listener
+            if listener is None:
+                continue
+            try:
+                listener(job_id, unfinished, total, self._stall_timeout)
+            except Exception:  # noqa: BLE001 - reporting must not break the reap
+                pass
         return reaped
+
+    def set_stall_listener(self, listener: "Optional[StallListener]") -> None:
+        """Register a callback invoked for each job the stall watchdog reaps.
+
+        Called with ``(job_id, unfinished_chunks, total_chunks, timeout_seconds)`` AFTER the
+        job has been marked FAILED, outside the manager lock. Exists so the UI can write an
+        audit line for a reap without ``core`` importing the activity log.
+        """
+        self._stall_listener = listener
 
     def shutdown(self) -> None:
         """Stop the stall watchdog thread (best effort). Safe to call repeatedly.

@@ -433,3 +433,46 @@ def test_warning_status_maps_to_the_warning_log_level() -> None:
     src = inspect.getsource(al.log_activity)
     assert "logging.WARNING if st == ActivityStatus.WARNING.value" in src
     assert logging.WARNING < logging.ERROR
+
+
+def test_the_settings_tab_records_level_and_mirror_changes() -> None:
+    """The audit trail must record changes to its own recording.
+
+    A reader comparing two runs needs to know the quieter one was CONFIGURED that way rather
+    than idle -- and turning the CloudWatch mirror off is, on ECS, what makes the trail stop
+    surviving a task replacement. The mirror-off line is emitted BEFORE the handler is
+    removed, or it would be the one event the sink it just removed never carried, leaving the
+    CloudWatch copy ending with no explanation.
+    """
+    import inspect
+
+    from dsql_migrator.ui import app as app_mod
+
+    src = inspect.getsource(app_mod._render_activity_log_controls)
+    assert '"activity log level changed"' in src
+    assert '"activity log mirror changed"' in src
+    # Ordering: the OFF line precedes disable_activity_stdout_log().
+    off = src.index("CloudWatch Logs mirroring turned OFF")
+    assert off < src.index("disable_activity_stdout_log()", off - 2000 if off > 2000 else 0) or \
+        off < src.rindex("disable_activity_stdout_log()")
+    # Severity: turning the mirror off is a real (deliberate) durability loss.
+    mirror_off_block = src[off - 400:off + 400]
+    assert "ActivityStatus.WARNING" in mirror_off_block, mirror_off_block[:200]
+    # The change handlers, never the render body.
+    assert "def _on_level" in src and "def _on_toggle" in src
+
+
+def test_a_stall_reap_is_wired_to_an_audit_line() -> None:
+    # core must not import the activity log, so the reap reports through a listener; without
+    # the wiring the listener is dead code and a reaped job stays unaudited.
+    import inspect
+
+    from dsql_migrator.ui import app as app_mod
+
+    src = inspect.getsource(app_mod)
+    assert "JOB_MANAGER.set_stall_listener(_log_stalled_job)" in src
+    fn = inspect.getsource(app_mod._log_stalled_job)
+    assert '"job stalled"' in fn
+    assert "ActivityCategory.SYSTEM" in fn, "the watchdog reaps validation jobs too"
+    assert "ActivityStatus.FAILURE" in fn
+    assert "unfinished" in fn and "marked FAILED" in fn

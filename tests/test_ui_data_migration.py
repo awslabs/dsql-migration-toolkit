@@ -22751,3 +22751,72 @@ def test_a_table_loop_abort_also_writes_run_failed(monkeypatch) -> None:
             _Handle(done=1), [table], migrator=_Migrator(), error_log=ErrorLogStore()
         )
     assert [e for e in events if e[1] == "run failed"] == [], events
+
+
+def test_an_operator_stopped_run_writes_a_terminal_line(monkeypatch) -> None:
+    """A stopped run returned from _finalize_run silently.
+
+    So the audit log held "run started" and nothing else -- the same dangling-start shape as
+    an aborted run, but for the one case where the operator knows what happened and a reader
+    six weeks later does not. WARNING: nothing broke and the loaded tables are kept, but a
+    partial target is a fact someone must act on.
+    """
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+    from dsql_migrator.core.error_log import ErrorLogStore
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+
+    events: list[tuple] = []
+    monkeypatch.setattr(
+        engine, "log_activity",
+        lambda category, action, **kw: events.append((category, action, kw)),
+    )
+
+    class _Handle:
+        cancelled = True
+
+        def __init__(self):
+            self._job = MigrationJob(job_id="j1")
+            self._job.chunks = [
+                ChunkState(chunk_id="db.a", status="DONE"),
+                ChunkState(chunk_id="db.b", status="PENDING"),
+                ChunkState(chunk_id="db.c", status="PENDING"),
+            ]
+
+        def snapshot(self):
+            return self._job
+
+        def __getattr__(self, _n):
+            return lambda *a, **k: None
+
+    engine._finalize_run(
+        _Handle(), "j1", ["db.a", "db.b", "db.c"],
+        engine._RunCounts(real_failed=0, quarantined=0),
+        ErrorLogStore(),
+        accept_quarantined_rows=False,
+    )
+    stopped = [e for e in events if e[1] == "run stopped"]
+    assert len(stopped) == 1, [e[1] for e in events]
+    _cat, _action, kw = stopped[0]
+    assert kw["status"] is engine.ActivityStatus.WARNING
+    assert "1 of 3 table(s) loaded" in kw["detail"]
+    assert "kept" in kw["detail"]
+    # A stopped run must NOT also claim completion.
+    assert not [e for e in events if e[1] == "run completed"]
+
+
+def test_the_stop_request_itself_is_recorded() -> None:
+    # The stop is cooperative, so minutes can pass between the click and the run ending.
+    # Without the request line the log cannot tell an operator stop from a crash that
+    # happened to end the run at the same moment.
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    src = inspect.getsource(dm._render_data_migration_content) if hasattr(
+        dm, "_render_data_migration_content"
+    ) else inspect.getsource(dm)
+    assert '"stop requested"' in src
+    assert "operator requested a stop" in src
+    # And it is in the click handler, not a poll path.
+    i = src.index('"stop requested"')
+    assert "def stop_full_load" in src[max(0, i - 1200):i]
