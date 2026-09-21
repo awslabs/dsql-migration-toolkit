@@ -22671,3 +22671,83 @@ def test_a_debug_pk_range_withholds_a_natural_key() -> None:
     from decimal import Decimal
 
     assert _safe_key_value(Decimal("1.5")) == "<withheld>"
+
+
+def test_a_table_loop_abort_also_writes_run_failed(monkeypatch) -> None:
+    """The table loop can abort at RUN level too, before any chunk leaves PENDING.
+
+    Traced live: run_full_load -> _migrate_tables_in_parallel -> recreate ->
+    SchemaApplyError, raised by the loop's run-level DROP+recreate pre-pass when a target
+    foreign key still referenced a table being replaced. That raise skips _finalize_run, so
+    nothing wrote a terminal line -- the same dangling "run started" as a pre-loop failure.
+    My first fix bracketed only the pre-passes and I asserted the remainder was a
+    "multiprocess relay" path; the traceback shows it is the same process, one frame further
+    in. Verified against the real failure, not inferred.
+    """
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+    from dsql_migrator.core.error_log import ErrorLogStore
+    from dsql_migrator.core.models import (
+        ChunkState,
+        ColumnDef,
+        MigrationJob,
+        TableDef,
+    )
+
+    events: list[tuple] = []
+    monkeypatch.setattr(
+        engine, "log_activity",
+        lambda category, action, **kw: events.append((category, action, kw)),
+    )
+    boom = RuntimeError("Cannot replace this table: the foreign key db.child.fk still depends")
+    monkeypatch.setattr(
+        engine, "_migrate_tables_in_parallel",
+        lambda *a, **k: (_ for _ in ()).throw(boom),
+    )
+    monkeypatch.setattr(engine, "_predrop_blocking_foreign_keys", lambda *a, **k: None)
+    monkeypatch.setattr(engine, "_predrop_dependent_views", lambda *a, **k: None)
+
+    class _Migrator:
+        def capture_watermark(self, tables):
+            return None
+
+    class _Handle:
+        def __init__(self, done):
+            self._job = MigrationJob(job_id="j1")
+            self._job.chunks = [
+                ChunkState(chunk_id=f"db.t{i}", status="DONE" if i < done else "PENDING")
+                for i in range(2)
+            ]
+
+        def snapshot(self):
+            return self._job
+
+        def update(self, *_a, **_k):
+            return None
+
+        def __getattr__(self, _n):
+            return lambda *a, **k: None
+
+    table = TableDef(
+        name="db.t0",
+        columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+        primary_key=["id"],
+    )
+
+    # NOTHING finished -> the run-level line is the only record there will be.
+    with pytest.raises(RuntimeError):
+        engine.run_full_load(
+            _Handle(done=0), [table], migrator=_Migrator(), error_log=ErrorLogStore()
+        )
+    failed = [e for e in events if e[1] == "run failed"]
+    assert len(failed) == 1, [e[1] for e in events]
+    assert "no rows were written" in failed[0][2]["detail"]
+    assert "foreign key" in failed[0][2]["detail"]
+
+    # Tables DID finish -> their per-table lines plus _finalize_run's "run incomplete"
+    # already tell the story, so a second run-level line would be duplicate reporting.
+    events.clear()
+    with pytest.raises(RuntimeError):
+        engine.run_full_load(
+            _Handle(done=1), [table], migrator=_Migrator(), error_log=ErrorLogStore()
+        )
+    assert [e for e in events if e[1] == "run failed"] == [], events

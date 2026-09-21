@@ -3004,7 +3004,38 @@ def run_full_load(
             exc=exc,
         )
         raise
-    counts = _migrate_tables_in_parallel(handle, job_id, tables, migrator, error_log)
+    # The table loop can ALSO abort at run level, before any chunk leaves PENDING: its
+    # run-level DROP+recreate pre-pass raises there (traced live -- run_full_load ->
+    # _migrate_tables_in_parallel -> recreate -> SchemaApplyError for a target foreign key
+    # that still referenced a table being replaced). A raise from here skips _finalize_run,
+    # so nothing wrote a terminal line -- the same dangling "run started" as the pre-loop
+    # case, which is why this bracket is not limited to the pre-passes above.
+    #
+    # Gated on nothing having finished: once tables HAVE loaded, their per-table "load table"
+    # lines plus _finalize_run's "run incomplete" already tell the story, and a second
+    # run-level line would be the duplicate-reporting this log has been cleaned of before.
+    try:
+        counts = _migrate_tables_in_parallel(handle, job_id, tables, migrator, error_log)
+    except Exception as exc:  # noqa: BLE001 - logged, then re-raised unchanged
+        _done = 0
+        try:
+            _job = handle.snapshot() if hasattr(handle, "snapshot") else None
+            _done = sum(1 for c in getattr(_job, "chunks", ()) if c.status == "DONE")
+        except Exception:  # noqa: BLE001 - the audit line must not depend on this
+            _done = 0
+        if _done == 0:
+            log_activity(
+                ActivityCategory.FULL_LOAD,
+                "run failed",
+                status=ActivityStatus.FAILURE,
+                detail=(
+                    "the run ended BEFORE any table was loaded, so no rows were written: "
+                    f"{exc}"
+                ),
+                error_code=getattr(exc, "sqlstate", None),
+                exc=exc,
+            )
+        raise
     _recreate_dependent_views(migrator)
     # Foreign keys are NOT applied here any more -- they are an explicit operator action on
     # the Data Migration step, exactly as they already are at cut over for a CDC migration.

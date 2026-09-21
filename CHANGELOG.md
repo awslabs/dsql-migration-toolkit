@@ -5,6 +5,26 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.487
+
+### Fixed
+
+- **A run-level abort inside the table loop now writes a terminal line too.** v0.1.484 bracketed
+  only the pre-loop phase, and I attributed the remaining case to a "multiprocess relay path" —
+  that attribution was an inference, and it was wrong. Tracing the real failure shows the same
+  process, one frame further in: `run_full_load` → `_migrate_tables_in_parallel` → `recreate` →
+  `SchemaApplyError`, raised by the loop's own run-level DROP+recreate pre-pass when a target
+  foreign key still referenced a table being replaced. That raise skips `_finalize_run`, so
+  nothing wrote a terminal line — the identical dangling `run started` the previous fix was
+  supposed to end. The bracket now covers the loop, gated on nothing having finished: once tables
+  HAVE loaded, their per-table `load table` lines plus `_finalize_run`'s `run incomplete` already
+  tell the story, and a second run-level line would be the duplicate reporting this log has been
+  cleaned of before.
+  - Verified by reproducing the real failure against a live Aurora MySQL source and Aurora DSQL
+    target (a blocking foreign key re-created on the target on purpose), not by inference: the
+    line appears, names the blocking constraint, states that no rows were written, and is one
+    line at `FAILURE`.
+
 ## v0.1.486
 
 ### Fixed
