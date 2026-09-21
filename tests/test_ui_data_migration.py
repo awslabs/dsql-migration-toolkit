@@ -22889,3 +22889,87 @@ def test_the_lob_panel_is_never_locked_without_a_reason() -> None:
     # And the caller falls back to the selection lock's reason for ANY future contributor.
     src = inspect.getsource(dm)
     assert "lock_reason=_lob_reason or selection_lock," in src
+
+
+def test_start_cdc_logs_the_resume_point_through_the_real_ui_path(monkeypatch) -> None:
+    """Closes the verification gap left open by the live run.
+
+    The resume-point STRING was verified live (a real Full Load watermark through the real
+    formatter), but its WIRING was pinned only by a source-text assertion, because the E2E
+    harness drives CloudFormation through the aws CLI and never enters _start_cdc_deploy --
+    so nothing proved the UI actually passes that detail to the log. This drives the REAL
+    _start_cdc_deploy with the AWS and NiceGUI seams injected (the repo's standard UI-test
+    shape) and asserts what _log_cdc_event actually receives, which is the part a browser
+    pass would otherwise have to confirm by eye.
+    """
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import Watermark
+    from dsql_migrator.ui.data_migration import _cdc_ui as _cdcui
+
+    events: list[tuple] = []
+    monkeypatch.setattr(
+        _cdcui, "_log_cdc_event",
+        lambda action, **kw: events.append((action, kw)),
+    )
+    # The deploy itself must not run: only the SUBMIT-time detail is under test.
+    monkeypatch.setattr(_cdcui, "build_cdc_stack_deployer", lambda *a, **k: object(),
+                        raising=False)
+    monkeypatch.setattr(_cdcui, "_read_cdc_template_body", lambda *a, **k: "{}",
+                        raising=False)
+
+    class _SubmitOnlyJM:
+        def __init__(self):
+            self.work = None
+
+        def submit(self, work):
+            self.work = work
+            return "job-1"
+
+        def get_status(self, job_id):
+            # The Full Load job carries the watermark the CDC start must resume from.
+            return SimpleNamespace(
+                job_id=job_id,
+                status="DONE",
+                watermark=Watermark(
+                    binlog_file="mysql-bin-changelog.000007",
+                    binlog_position=76653880,
+                    gtid_executed=None,
+                    snapshot_timestamp=datetime(2026, 9, 21, 7, 34, tzinfo=timezone.utc),
+                ),
+                chunks=[],
+            )
+
+    class _Ui:
+        def notify(self, *_a, **_k):
+            return None
+
+        def __getattr__(self, _n):
+            return lambda *a, **k: None
+
+    session = SimpleNamespace(
+        target_config=SimpleNamespace(
+            region="ap-northeast-2", cluster_endpoint="ep.dsql.amazonaws.com",
+            database="postgres", username="admin",
+        ),
+        aws_profile=None, source_password=None, source_config=None,
+        source_secret_id=None,
+    )
+    state = DataMigrationState()
+    state.set_selection(TableSelection(selected_tables=["orders"]))
+    state.job_id = "fl-1"
+
+    _cdcui._start_cdc_deploy(
+        _Ui(), state, _SubmitOnlyJM(), lambda: None,
+        inventory=_inventory(), session=session,
+    )
+
+    started = [e for e in events if "start CDC" in e[0]]
+    assert started, [e[0] for e in events]
+    detail = started[0][1]["detail"]
+    # The coordinate the Full Load captured, carried into the CDC start's audit line.
+    assert "binlog mysql-bin-changelog.000007:76653880" in detail, detail
+    assert "gapless" in detail
+    assert "mode " in detail
+    # No GTID claimed for a source that has none (this one's gtid_executed is None).
+    assert "GTID" not in detail
