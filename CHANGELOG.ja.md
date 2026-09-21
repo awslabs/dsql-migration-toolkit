@@ -5,6 +5,29 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.486
+
+### 修正
+
+- **`DeletesApplied` が 1 件のソース DELETE を 2 と数えていました。** Debezium は同じ削除行に対して `op=d`
+  エンベロープと**トゥームストーン**の**両方**を送ります(`tombstones.on.delete` は既定で on)。シンクの
+  applied-ops カウンタは「delete か?」だけを見ていたため、それぞれで加算していました。ライブ実測
+  (`ecommerce.order_items`): ソースで挿入 3 / 更新 1 / 削除 1 なのに `InsertsApplied 3`、
+  `UpdatesApplied 1`、`DeletesApplied 2` と報告されました。これはメトリクス自身の定義(「適用した delete
+  の数」)と矛盾します — トゥームストーンは新たに適用するものがなく(同じキーへの冪等な DELETE で、行は
+  1 つだけ削除される) — ソースの DML 数との比較も壊れ、**delete だけがちょうど 2 倍**に見えていました。
+  ツールの per-table migration status 表にも 2 倍の値がそのまま表示されていました。
+  - `ChangeEvent` がトゥームストーンのフラグを持ち(キーのみで値が null の経路でのみ設定)、`recordOps` が
+    それをスキップします。**適用経路は不変です** — トゥームストーンを適用から外すとキーのみのケースとログ
+    コンパクションの契約が壊れるため、従来どおり適用し、計数だけを変更しました。`recordOps` は適用の**後**に
+    走るので順序に影響はなく、トゥームストーンは `source.ts_ms` を持たず lag のゲートが既にスキップして
+    いたため `ReplicationLagMs` にも影響しません。
+  - `sourceTsMs == 0` をプロキシに使う方法は採りませんでした — コード自身のコメントが述べるとおり `op=d`
+    エンベロープも `ts_ms` を欠くことがあり、その判定では実際の delete を静かに取りこぼします。
+  - コネクタプラグインの `PLUGIN_VERSION` は `v41` です。シンク ZIP の内容が変わったため、稼働中の
+    cdc-stack がこれを取り込むには **Delete + Deploy infrastructure** が必要です — Start CDC だけでは
+    プラグインは再登録されません。
+
 ## v0.1.485
 
 ### 変更

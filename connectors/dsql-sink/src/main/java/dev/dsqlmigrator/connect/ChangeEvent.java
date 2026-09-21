@@ -20,6 +20,16 @@ final class ChangeEvent {
 
   private final String table;
   private final boolean delete;
+  /**
+   * True only for a Debezium TOMBSTONE (a keyed record with a null value). It applies
+   * exactly like an {@code op=d} delete -- the same idempotent DELETE by key -- but it is
+   * not a SECOND delete: Debezium emits both an {@code op=d} envelope AND a tombstone for
+   * one source DELETE, so counting both made DeletesApplied report 2 for one deleted row
+   * while Inserts/Updates stayed 1:1. The flag exists so the METRIC can skip it without
+   * touching the apply path (dropping the tombstone from the apply would break the
+   * key-only case and the log-compaction contract).
+   */
+  private final boolean tombstone;
   // Effect on the target's row count for the per-table net-rows monitor metric:
   // +1 for an insert (Debezium op c/r), -1 for a delete (op d), 0 for an update
   // (op u — an upsert of an existing row does not change the count). This is an
@@ -40,6 +50,7 @@ final class ChangeEvent {
   private ChangeEvent(
       String table,
       boolean delete,
+      boolean tombstone,
       int netRowDelta,
       List<String> columns,
       List<Object> values,
@@ -48,6 +59,7 @@ final class ChangeEvent {
       long sourceTsMs) {
     this.table = table;
     this.delete = delete;
+    this.tombstone = tombstone;
     this.netRowDelta = netRowDelta;
     this.columns = columns;
     this.values = values;
@@ -65,7 +77,8 @@ final class ChangeEvent {
       List<Object> pkValues,
       long sourceTsMs) {
     return new ChangeEvent(
-        table, false, 0, List.copyOf(columns), values, List.copyOf(pkColumns), pkValues, sourceTsMs);
+        table, false, false, 0, List.copyOf(columns), values,
+        List.copyOf(pkColumns), pkValues, sourceTsMs);
   }
 
   /** An INSERT (op c / snapshot r): same upsert apply, but net row delta +1. */
@@ -77,13 +90,27 @@ final class ChangeEvent {
       List<Object> pkValues,
       long sourceTsMs) {
     return new ChangeEvent(
-        table, false, 1, List.copyOf(columns), values, List.copyOf(pkColumns), pkValues, sourceTsMs);
+        table, false, false, 1, List.copyOf(columns), values,
+        List.copyOf(pkColumns), pkValues, sourceTsMs);
   }
 
+  /** A DELETE from an {@code op=d} envelope: applied by key, net row delta -1. */
   static ChangeEvent delete(
       String table, List<String> pkColumns, List<Object> pkValues, long sourceTsMs) {
     return new ChangeEvent(
-        table, true, -1, List.of(), List.of(), List.copyOf(pkColumns), pkValues, sourceTsMs);
+        table, true, false, -1, List.of(), List.of(), List.copyOf(pkColumns), pkValues,
+        sourceTsMs);
+  }
+
+  /**
+   * A TOMBSTONE delete (keyed record, null value): applied identically to {@link #delete},
+   * but flagged so the applied-ops metric does not count it as a second delete.
+   */
+  static ChangeEvent tombstone(
+      String table, List<String> pkColumns, List<Object> pkValues, long sourceTsMs) {
+    return new ChangeEvent(
+        table, true, true, -1, List.of(), List.of(), List.copyOf(pkColumns), pkValues,
+        sourceTsMs);
   }
 
   String table() {
@@ -92,6 +119,14 @@ final class ChangeEvent {
 
   boolean isDelete() {
     return delete;
+  }
+
+  /**
+   * True for a Debezium tombstone. Applied like any delete; excluded from the applied-ops
+   * metric so one source DELETE is counted once (Debezium sends op=d AND a tombstone).
+   */
+  boolean isTombstone() {
+    return tombstone;
   }
 
   /** An INSERT (Debezium op c / snapshot r): applied as an upsert, net row delta +1. */

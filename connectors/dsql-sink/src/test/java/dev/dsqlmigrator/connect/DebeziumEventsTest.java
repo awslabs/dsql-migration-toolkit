@@ -152,6 +152,25 @@ class DebeziumEventsTest {
     assertTrue(event.isDelete());
     assertEquals("app.users", event.table());
     assertEquals(List.of(7L), event.pkValues());
+    // Flagged as a tombstone: it APPLIES like any delete, but Debezium sends an op=d
+    // envelope AND a tombstone for one source DELETE, so counting both reported
+    // DeletesApplied=2 for a single deleted row. The flag is what lets the metric skip it
+    // without changing the apply.
+    assertTrue(event.isTombstone());
+  }
+
+  @Test
+  void anOpDeleteIsNotATombstone() {
+    // The negative control for the flag: without it, excluding tombstones from the metric
+    // would also exclude real deletes and DeletesApplied would report 0 instead of 2.
+    Struct env =
+        new Struct(ENVELOPE)
+            .put("op", "d")
+            .put("before", row(5L, "Bob"))
+            .put("source", source("users"));
+    ChangeEvent event = DebeziumEvents.parse(record(key(5L), env, "dsqlcdc.app.users"));
+    assertTrue(event.isDelete());
+    assertFalse(event.isTombstone());
   }
 
   @Test

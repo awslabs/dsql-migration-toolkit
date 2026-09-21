@@ -152,7 +152,7 @@ public class DsqlSinkTask extends SinkTask {
   private String metricsStack = "";
   private final Map<String, LongAdder> insertsByTable = new ConcurrentHashMap<>();
   private final Map<String, LongAdder> updatesByTable = new ConcurrentHashMap<>();
-  private final Map<String, LongAdder> deletesByTable = new ConcurrentHashMap<>();
+  final Map<String, LongAdder> deletesByTable = new ConcurrentHashMap<>();
   // Per-table worst replication lag (ms) since the last emit (reset on emit).
   private final Map<String, AtomicLong> lagByTable = new ConcurrentHashMap<>();
   private volatile CloudWatchClient cloudWatch; // built lazily on first emit
@@ -993,8 +993,20 @@ public class DsqlSinkTask extends SinkTask {
     }
   }
 
-  private void recordOps(ChangeEvent event) {
+  // Package-private (not private) so a same-package test can assert the COUNTING rule
+  // directly -- that a tombstone does not count as a second delete.
+  void recordOps(ChangeEvent event) {
     if (!metricsEnabled) {
+      return;
+    }
+    // A TOMBSTONE is not a second delete. Debezium emits both an op=d envelope and a
+    // tombstone for one source DELETE, so counting both made DeletesApplied report 2 for a
+    // single deleted row -- contradicting this metric's own definition ("how many deletes it
+    // APPLIED", since the tombstone applies nothing new: same key, idempotent) and breaking
+    // comparison with Inserts/Updates, which are 1:1. Returning here is safe for ordering:
+    // recordOps runs AFTER the apply. Lag is unaffected -- a tombstone carries no
+    // source.ts_ms, so the `src > 0` gate below already skipped it.
+    if (event.isTombstone()) {
       return;
     }
     // Count the applied op by KIND (inserts / updates / deletes). Unlike the old net

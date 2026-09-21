@@ -376,7 +376,15 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # existing plugin resource collides -- adding it needs no version bump and does NOT
 # force a Delete+Deploy on a live MySQL stack. Bump only when a plugin's CONTENT
 # changes.
-PLUGIN_VERSION = "v40"
+# v41: the sink no longer counts a Debezium TOMBSTONE as a second delete. Debezium emits
+# both an op=d envelope AND a tombstone for one source DELETE, so DeletesApplied reported 2
+# for a single deleted row (measured live: Inserts 3 / Updates 1 / Deletes 2 for 3/1/1
+# source DML) while Inserts and Updates stayed 1:1. ChangeEvent carries a tombstone flag and
+# recordOps skips it; the APPLY is unchanged (still an idempotent DELETE by key), so this is
+# a metric-only correction with no data-path effect. Bumped because the sink ZIP's CONTENT
+# changed, which means a live cdc-stack needs Delete + Deploy infra to pick it up (Start CDC
+# alone does not re-register the plugin).
+PLUGIN_VERSION = "v41"
 
 
 class S3ProvisionError(RuntimeError):

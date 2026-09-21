@@ -15,10 +15,12 @@
 package dev.dsqlmigrator.connect;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -117,5 +119,45 @@ class DsqlSinkMetricsOffCommitPathTest {
     task.startMetrics(props);
     task.flush(Collections.emptyMap());
     assertEquals(0, task.emitCount, "metrics disabled: nothing should be emitted");
+  }
+
+  @Test
+  void aTombstoneIsNotCountedAsASecondDelete() {
+    // Debezium emits BOTH an op=d envelope and a tombstone for one source DELETE, and the
+    // counter keyed only on isDelete() incremented for each -- so DeletesApplied reported 2
+    // for a single deleted row (measured live on ecommerce.order_items: Inserts 3, Updates 1,
+    // Deletes 2 for 3/1/1 source DML). That contradicts the metric's own definition, since a
+    // tombstone applies nothing new, and breaks comparison with Inserts/Updates, which are
+    // 1:1. The APPLY still happens for both -- only the counting changed.
+    DsqlSinkTask task = new DsqlSinkTask();
+    task.startMetrics(metricsEnabledProps());
+    try {
+      ChangeEvent opDelete =
+          ChangeEvent.delete("app.users", List.of("id"), List.of(1L), 1_700_000_000_000L);
+      ChangeEvent tombstone =
+          ChangeEvent.tombstone("app.users", List.of("id"), List.of(1L), 0L);
+
+      task.recordOps(opDelete);
+      task.recordOps(tombstone);
+
+      // One source DELETE -> exactly one counted delete.
+      assertEquals(1L, task.deletesByTable.get("app.users").sum());
+
+      // And a real delete is still counted (the flag did not disable delete counting).
+      task.recordOps(opDelete);
+      assertEquals(2L, task.deletesByTable.get("app.users").sum());
+
+      // A tombstone alone counts nothing at all.
+      DsqlSinkTask only = new DsqlSinkTask();
+      only.startMetrics(metricsEnabledProps());
+      try {
+        only.recordOps(tombstone);
+        assertNull(only.deletesByTable.get("app.users"));
+      } finally {
+        only.stop();
+      }
+    } finally {
+      task.stop();
+    }
   }
 }

@@ -68,8 +68,12 @@ final class DebeziumEvents {
     extractStruct(record.key(), pkColumns, pkValues, pgSource);
 
     if (value == null) {
-      // Tombstone -> delete by key. No envelope, so no source.ts_ms (lag unknown).
-      return buildDelete(tableFromTopic(record.topic()), pkColumns, pkValues, 0L);
+      // Tombstone -> delete by key. No envelope, so no source.ts_ms (lag unknown). Flagged
+      // as a tombstone so the applied-ops metric counts one source DELETE ONCE: Debezium
+      // emits an op=d envelope AND a tombstone for the same row, and counting both reported
+      // DeletesApplied=2 for one deleted row. The APPLY is unchanged -- still an idempotent
+      // DELETE by key.
+      return buildTombstone(tableFromTopic(record.topic()), pkColumns, pkValues);
     }
     if (envelope == null) {
       throw new DataException(
@@ -117,6 +121,17 @@ final class DebeziumEvents {
           "Cannot build DELETE for table " + table + ": no primary key in record key or before-image");
     }
     return ChangeEvent.delete(table, pkColumns, pkValues, sourceTsMs);
+  }
+
+  private static ChangeEvent buildTombstone(
+      String table, List<String> pkColumns, List<Object> pkValues) {
+    if (pkColumns.isEmpty()) {
+      throw new DataException(
+          "Cannot build DELETE for table "
+              + table
+              + ": no primary key in record key or before-image");
+    }
+    return ChangeEvent.tombstone(table, pkColumns, pkValues, 0L);
   }
 
   private static void extractStruct(

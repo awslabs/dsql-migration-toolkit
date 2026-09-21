@@ -5,6 +5,31 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.486
+
+### Fixed
+
+- **`DeletesApplied` counted one source DELETE twice.** Debezium emits BOTH an `op=d` envelope
+  and a TOMBSTONE for the same deleted row (`tombstones.on.delete` defaults on), and the sink's
+  applied-ops counter keyed only on "is this a delete?" — so it incremented for each. Measured live
+  on `ecommerce.order_items`: 3 inserts / 1 update / 1 delete at the source reported
+  `InsertsApplied 3`, `UpdatesApplied 1`, `DeletesApplied 2`. That contradicts the metric's own
+  definition ("how many deletes it applied"): a tombstone applies nothing new — it is the same
+  idempotent DELETE by key, and one row is removed — and it broke comparison against the source's
+  DML counts, where only deletes came out at exactly double. The tool's own per-table migration
+  status table showed the doubled figure too.
+  - `ChangeEvent` now carries a tombstone flag, set only on the keyed-null-value path, and
+    `recordOps` skips it. **The APPLY path is unchanged** — dropping the tombstone from the apply
+    would break the key-only case and the log-compaction contract, so it is still applied exactly
+    as before; only the counting changed. Ordering is unaffected because `recordOps` runs after the
+    apply, and `ReplicationLagMs` is unaffected because a tombstone carries no `source.ts_ms` and
+    the lag gate already skipped it.
+  - A `sourceTsMs == 0` proxy was rejected: the code's own comment notes an `op=d` envelope can
+    also omit `ts_ms`, so that test would silently stop counting real deletes.
+  - Connector plugin `PLUGIN_VERSION` is `v41`. The sink ZIP's content changed, so a live
+    cdc-stack needs **Delete + Deploy infrastructure** to pick it up — Start CDC alone does not
+    re-register the plugin.
+
 ## v0.1.485
 
 ### Changed

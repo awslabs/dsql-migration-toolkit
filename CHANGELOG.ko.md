@@ -5,6 +5,28 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.486
+
+### 수정
+
+- **`DeletesApplied`가 소스 DELETE 하나를 2로 계수했습니다.** Debezium은 같은 삭제 행에 대해 `op=d` 엔벨로프와
+  **톰스톤**을 **둘 다** 보내는데(`tombstones.on.delete` 기본 on), 싱크의 applied-ops 카운터가 "delete인가?"만
+  보고 각각 증가시켰습니다. 라이브 실측(`ecommerce.order_items`): 소스에서 삽입 3 / 수정 1 / 삭제 1인데
+  `InsertsApplied 3`, `UpdatesApplied 1`, `DeletesApplied 2`로 보고됐습니다. 이는 메트릭의 자체 정의
+  ("적용한 delete 수")와 어긋납니다 — 톰스톤은 새로 적용하는 것이 없고(같은 키에 멱등한 DELETE, 행은 하나만
+  삭제됨) — 소스 DML 수와의 비교도 깨져 **delete만 정확히 2배**로 보였습니다. 도구의 per-table migration
+  status 표에도 2배 값이 그대로 표시됐습니다.
+  - 이제 `ChangeEvent`가 톰스톤 플래그를 갖고(키만 있고 값이 null인 경로에서만 설정) `recordOps`가 이를
+    건너뜁니다. **적용 경로는 그대로입니다** — 톰스톤을 적용에서 빼면 키 전용 케이스와 로그 압축 계약이
+    깨지므로 이전과 똑같이 적용하고, 계수만 바꿨습니다. `recordOps`는 적용 **후에** 실행되므로 순서에 영향이
+    없고, 톰스톤은 `source.ts_ms`가 없어 lag 게이트가 이미 건너뛰었으므로 `ReplicationLagMs`도 영향이
+    없습니다.
+  - `sourceTsMs == 0`을 프록시로 쓰는 방식은 배제했습니다 — 코드 주석이 밝히듯 `op=d` 엔벨로프도 `ts_ms`가
+    없을 수 있어, 그 판정은 실제 delete를 조용히 누락시킵니다.
+  - 커넥터 플러그인 `PLUGIN_VERSION`이 `v41`입니다. 싱크 ZIP 내용이 바뀌었으므로 운영 중인 cdc-stack이 이를
+    반영하려면 **Delete + Deploy infrastructure**가 필요합니다 — Start CDC만으로는 플러그인이 재등록되지
+    않습니다.
+
 ## v0.1.485
 
 ### 변경
