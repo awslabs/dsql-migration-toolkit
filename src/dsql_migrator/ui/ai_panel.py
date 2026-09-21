@@ -1076,7 +1076,7 @@ def build_ai_panel(
             except Exception:  # noqa: BLE001 - panel may have been closed
                 _stop = timer_box.get("timer")
                 if _stop is not None:
-                    _stop.active = False  # type: ignore[attr-defined]
+                    _stop.cancel()  # type: ignore[attr-defined]
                 return
             if not done:
                 if not bool(conv.get("stop_requested")):
@@ -1086,7 +1086,7 @@ def build_ai_panel(
                 # boto3 cannot be interrupted mid-iteration -- but the turn ends here.)
                 _t = timer_box.get("timer")
                 if _t is not None:
-                    _t.active = False  # type: ignore[attr-defined]
+                    _t.cancel()  # type: ignore[attr-defined]
                 conv["stop_requested"] = False
                 try:
                     typing.set_visibility(False)  # type: ignore[attr-defined]
@@ -1113,7 +1113,7 @@ def build_ai_panel(
                 return
             _t = timer_box.get("timer")
             if _t is not None:
-                _t.active = False  # type: ignore[attr-defined]
+                _t.cancel()  # type: ignore[attr-defined]
             try:
                 typing.set_visibility(False)  # type: ignore[attr-defined]
             except Exception:  # noqa: BLE001
@@ -1204,6 +1204,12 @@ def build_ai_panel(
         # (stranded conv["busy"]=True). convo is never cleared, so the timer survives
         # nav and still finalizes the (also convo-owned) reply bubble.
         with convo:  # type: ignore[attr-defined]
+            # CANCEL this on every exit path, never just `.active = False`: nicegui's
+            # _run_in_loop only checks `active` to decide whether to INVOKE the callback
+            # -- the loop itself keeps waking on the interval until cancel() sets
+            # _is_canceled. Deactivating therefore leaked one 8 Hz asyncio task per chat
+            # turn, each retaining the full reply through the tick closure, on the same
+            # event loop that serves the UI.
             timer_box["timer"] = ui.timer(0.12, tick)  # type: ignore[attr-defined]
 
     def _send() -> None:

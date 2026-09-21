@@ -304,14 +304,18 @@ class DataMigrationState:
         # followed only the FIRST stack and vanished the moment it settled, while the
         # others were still deleting and still billing for MSK / NAT with nothing on
         # screen. This list lets the banner advance to the next unfinished stack and
-        # report "2 of 3". Preserved across a Start-over reset, like the marker.
+        # report "2 of 3". Preserved across a Start-over reset, like the marker (see
+        # ``DataMigrationStore.reset_in_place`` -- it was NOT, until v0.1.482, and the
+        # queue's only writer runs in the same handler as the reset, so every entry was
+        # lost the moment it was written).
         self.cdc_teardown_queue: list[tuple[str, str]] = []
         # A FINISHED teardown the operator has not dismissed yet: {"kind", "stacks"}.
         # Completion used to be signalled only by a ui.notify toast, which hangs off a
         # ui.timer and so is gone after a refresh -- leaving no way to tell "finished"
         # from "never ran", for an operation that takes 15-45 min and is expected to be
         # left unattended. Held durably so the banner can report the result until it is
-        # explicitly closed. Preserved across a Start-over reset, like the marker.
+        # explicitly closed. Preserved across a Start-over reset, like the marker (see
+        # ``DataMigrationStore.reset_in_place``; it was not, until v0.1.482).
         self.cdc_teardown_done: dict = {}
         # Everything a one-click "Retry cleanup" needs to re-launch this teardown
         # AFTER a Start-over session reset has wiped the session config (region /
@@ -1217,6 +1221,18 @@ class DataMigrationStore:
                 getattr(state, "cdc_teardown_stack", None),
                 getattr(state, "cdc_teardown_ctx", None),
             )
+            # The multi-stack QUEUE and the finished-teardown record must survive too --
+            # their own docstrings claimed they did, and they did not. The queue's only
+            # writer runs in the SAME synchronous Start-over handler as this reset (the
+            # dialog calls on_reset_cdc(mode) and then on_reset()), so it was written and
+            # wiped in one event, EVERY time: the banner never showed "1 of 3", the
+            # advance to the next stack was gated on len(queue) > 1 and so never ran, and
+            # a multi-stack teardown announced "MSK / NAT billing has stopped" after only
+            # the FIRST stack -- while the rest kept deleting and kept billing. That made
+            # teardown_queue_progress / next_unfinished_teardown / advance_cdc_teardown
+            # dead code in production, reachable only from tests that seed the queue.
+            teardown_queue = list(getattr(state, "cdc_teardown_queue", []) or [])
+            teardown_done = dict(getattr(state, "cdc_teardown_done", {}) or {})
             state.__init__()  # type: ignore[misc]  # re-run init on the same object
             if bound is not None:
                 state.bind_session(bound)
@@ -1226,3 +1242,7 @@ class DataMigrationStore:
                 state.set_cdc_teardown(
                     teardown[0], kind=teardown[1], stack=teardown[2], ctx=teardown[3]
                 )
+            if teardown_queue:
+                state.set_cdc_teardown_queue(teardown_queue)
+            if teardown_done:
+                state.cdc_teardown_done = teardown_done

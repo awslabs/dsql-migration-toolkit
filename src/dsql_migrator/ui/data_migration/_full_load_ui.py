@@ -957,6 +957,28 @@ def _render_full_load_step(
         try:
             current = job_manager.get_status(migration_state.job_id)
         except JobNotFoundError:
+            # A one-shot chain has no next tick of its own, so a bare return killed the
+            # poll for the rest of the session: the load card stayed "In progress" with a
+            # spinner and the foreign-key card froze on its counter, with nothing left to
+            # advance either. If the FK pass is still running, refresh the live region --
+            # that render re-arms the timer. Otherwise this is terminal: reconcile the step
+            # off what we have and do one full refresh (which correctly installs no timer).
+            if bool(_call_or(foreign_keys_running, False)):
+                _live_detail.refresh()
+                return
+            migration_state.set_error(
+                "The Full Load job record was lost (the app restarted, or the job was "
+                "reaped). Re-run the load, or check Validation — the rows already "
+                "written are still on the target."
+            )
+            session.set_workflow(  # type: ignore[attr-defined]
+                with_status(
+                    session.workflow,  # type: ignore[attr-defined]
+                    WorkflowStep.DATA_MIGRATION,
+                    StepStatus.FAILED,
+                )
+            )
+            refresh()
             return
         mapped = job_status_to_step_status(current.status)
         if mapped is None:

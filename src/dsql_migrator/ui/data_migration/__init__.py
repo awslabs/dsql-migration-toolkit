@@ -259,6 +259,8 @@ from dsql_migrator.ui.data_migration._cdc_status import (
     _filter_mine,
     _is_inflight_stack_status,
     is_infra_create_stack_status,
+    is_stack_teardown_status,
+    split_cleanup_by_progress,
     cdc_attach_scope_mismatch,
     split_attachable_stacks,
     _classify_cdc_stack_phase,
@@ -1846,10 +1848,30 @@ def build_data_migration_screen(
                     _stack_status = getattr(
                         migration_state, "cdc_stack_phase_status", None
                     )
+                    # A TEARDOWN is excluded for the same reason the infra create is:
+                    # a delete runs ~15-25 min during which nothing streams, no
+                    # connector exists and no load runs, so re-checking prerequisites is
+                    # precisely what that time is for. Blocking it also blocked Full Load
+                    # (no prereq report -> full_load_run_guard_reason refuses the start),
+                    # so a teardown silently gated the main flow for up to 45 minutes
+                    # behind the message "A migration operation is in progress".
+                    #
+                    # Both halves need the exclusion: the STATUS is DELETE_IN_PROGRESS,
+                    # and an in-session delete records kind="delete", which
+                    # cdc_streaming_started counts as streaming (it excludes only
+                    # "infra"). Stop CDC (UPDATE_IN_PROGRESS) keeps blocking -- it leaves
+                    # MSK, the topics and the immutable partition plan in place, so it
+                    # really is a live pipeline operation.
+                    _cdc_tearing_down = is_stack_teardown_status(
+                        _stack_status
+                    ) or cdc_delete_in_flight(migration_state, job_manager)
                     _cdc_deploying = (
-                        _is_inflight_stack_status(_stack_status)
-                        and not is_infra_create_stack_status(_stack_status)
-                    ) or cdc_streaming_started(migration_state, job_manager)
+                        (
+                            _is_inflight_stack_status(_stack_status)
+                            and not is_infra_create_stack_status(_stack_status)
+                        )
+                        or cdc_streaming_started(migration_state, job_manager)
+                    ) and not _cdc_tearing_down
                     _render_prerequisites_panel(
                         ui,
                         migration_state,
@@ -2638,20 +2660,40 @@ def _render_cdc_existing_infra_banner(ui, migration_state, refresh) -> None:
     attachable, needs_cleanup = split_attachable_stacks(others)
 
     if needs_cleanup:
-        listed = ", ".join(f"{name} ({status})" for name, status in needs_cleanup)
-        _render_notice(
-            ui,
-            tone="error",
-            header="Leftover CDC infrastructure needs cleanup — it may still be billing",
-            body=(
-                f"{listed}. A previous teardown did not finish, so this stack cannot "
-                "be used (it is partly deleted) and cannot be attached to — but its "
-                "Amazon MSK / NAT resources may still be incurring cost. Delete it "
-                "from the CloudFormation console (a DELETE_FAILED stack usually needs "
-                "'Retain resources' on the leftovers), or retry the delete from the "
-                "CDC step, before deploying anything new."
-            ),
-        )
+        # Same split as the CDC step's adopt panel: an in-flight delete is not a failed
+        # one, and recommending 'Retain resources' for it would abandon the resources it
+        # is about to remove cleanly.
+        _in_flight, _terminal = split_cleanup_by_progress(needs_cleanup)
+        if _in_flight:
+            _busy = ", ".join(f"{name} ({status})" for name, status in _in_flight)
+            _render_notice(
+                ui,
+                tone="warning",
+                header="CDC infrastructure is still being removed",
+                body=(
+                    f"{_busy}. This is in progress, not stuck: a cdc-stack delete takes "
+                    "~15–25 min because the in-VPC Lambda's network interfaces detach "
+                    "slowly. It cannot be attached to or replaced while it runs, and "
+                    "MSK / NAT billing stops when it completes. No action is needed."
+                ),
+            )
+        if _terminal:
+            listed = ", ".join(f"{name} ({status})" for name, status in _terminal)
+            _render_notice(
+                ui,
+                tone="error",
+                header=(
+                    "Leftover CDC infrastructure needs cleanup — it may still be billing"
+                ),
+                body=(
+                    f"{listed}. A previous teardown did not finish, so this stack cannot "
+                    "be used (it is partly deleted) and cannot be attached to — but its "
+                    "Amazon MSK / NAT resources may still be incurring cost. Delete it "
+                    "from the CloudFormation console (a DELETE_FAILED stack usually needs "
+                    "'Retain resources' on the leftovers), or retry the delete from the "
+                    "CDC step, before deploying anything new."
+                ),
+            )
 
     # Withhold attach for a pipeline that does not cover THIS session's tables. Attaching
     # promotes Data Migration to DONE and unlocks Validation, so attaching a stack that
@@ -3895,6 +3937,7 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     cdc_deploy_card_superseded,
     cdc_deploy_connection_blocker,
     cdc_live_running_names,
+    cdc_delete_in_flight,
     cdc_evidence_unverified,
     cdc_pipeline_live,
     cdc_infra_deploy_in_flight,

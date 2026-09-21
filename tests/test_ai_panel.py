@@ -116,6 +116,15 @@ class _Timer:
         # deletes a container's descendants -- including timers created in its slot.
         self.parent = None
         self.is_deleted = False
+        self.canceled = False
+
+    def cancel(self) -> None:
+        # nicegui's Timer.cancel() stops the loop for good; deactivate() only skips the
+        # callback while the 8 Hz wake-up continues. Mirror both effects so a test can
+        # assert which one the panel used, and so the existing _pump sites (which read
+        # .active) keep behaving identically.
+        self.canceled = True
+        self.active = False
 
 
 class _Ui:
@@ -1018,3 +1027,24 @@ def test_composer_hint_explains_a_denial_instead_of_saying_enable_ai() -> None:
     ]
     assert any("bedrock:InvokeModel" in h for h in hints), hints
     assert not any("AI Assist is off" in h for h in hints), hints
+
+
+def test_chat_timer_is_cancelled_not_just_deactivated() -> None:
+    """Every exit path must cancel the 8 Hz tick, not merely deactivate it.
+
+    nicegui's ``_run_in_loop`` reads ``active`` only to decide whether to INVOKE the
+    callback -- the loop keeps waking on the interval until ``cancel()`` sets
+    ``_is_canceled``. Deactivating therefore leaked one 8.33 Hz asyncio task per chat
+    turn, each retaining the full reply through the tick closure, on the same event loop
+    that serves the UI, for as long as the anchor conversation lived (until Start over).
+    """
+    import inspect
+
+    from dsql_migrator.ui import ai_panel
+
+    src = inspect.getsource(ai_panel)
+    # No exit path may fall back to deactivation for the chat tick.
+    assert "_t.active = False" not in src, "a chat-tick exit still only deactivates"
+    assert "_stop.active = False" not in src
+    assert src.count("_t.cancel()") == 2
+    assert src.count("_stop.cancel()") == 1

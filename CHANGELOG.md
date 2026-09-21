@@ -5,6 +5,86 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.482
+
+### Fixed
+
+- **A Start over wiped the multi-stack CDC teardown queue it had just written, so a teardown of
+  several stacks announced that billing had stopped after only the first one.** The queue's only
+  writer runs in the SAME synchronous handler as the session reset (the dialog calls the CDC
+  teardown, then the reset), so it was written and wiped in one event — every time. That made
+  `teardown_queue_progress`, `next_unfinished_teardown` and `advance_cdc_teardown` dead code in
+  production, reachable only from tests that seeded the queue by hand: the banner never said
+  "1 of 3", never advanced to the next stack, and the completion notice named only the tracked
+  one — while the rest were still deleting and still billing for MSK / NAT. The queue and the
+  finished-teardown record now survive the reset. Both fields' docstrings had claimed they did.
+- **A CDC teardown no longer blocks the prerequisite checks — and through them, Full Load.** The
+  gate lumped `DELETE_IN_PROGRESS` in with a live connector operation and explained it as "A
+  migration operation is in progress". With no prerequisite report,
+  `full_load_run_guard_reason` then refuses to start a load, so a ~15–45 minute teardown silently
+  gated the main flow behind a reason that was false — and it cleared with no explanation when the
+  stack finally vanished. A teardown is now excluded for exactly the reason the infrastructure
+  create already was: nothing streams, no connector exists and no load is running, so re-running
+  the checks is what that time is for. Both halves of the gate needed it — the status, and the
+  in-session delete job, whose `kind="delete"` makes `cdc_streaming_started` answer True.
+  **Stop CDC (`UPDATE_IN_PROGRESS`) keeps blocking**: it leaves MSK, the topics and the immutable
+  partition plan in place, so it really is a live pipeline operation.
+- **Prerequisites no longer paints a deleting or failed cdc-stack green.** Its "ready" state folds
+  EVERY non-stable CloudFormation status (only `CREATE_COMPLETE` / `UPDATE_COMPLETE` /
+  `UPDATE_ROLLBACK_COMPLETE` / `IMPORT_COMPLETE` are stable), so a stack being torn down — or stuck
+  in `ROLLBACK_COMPLETE` / `CREATE_FAILED` / `DELETE_FAILED` — was announced in a green success box
+  with a positive "Ready" badge as "already deployed, so there is nothing to provision here", while
+  the CDC card one sub-step below, reading the same state, correctly said "CDC infrastructure is
+  being deleted". One screen contradicting itself. The badge, tone and copy now come from the raw
+  status through the same pure helper the CDC card uses, and the section re-polls while the status
+  can still change on its own. The fold itself is unchanged and still hides the deploy form — a
+  `CreateStack` against a same-named deleting stack is rejected anyway — and no new action is added
+  here, because Delete already lives one sub-step below.
+- **A delete that is progressing normally is no longer diagnosed as a failed one.** Both the
+  "leftover infrastructure needs cleanup" panels and the app-wide teardown banner treated the
+  in-flight statuses (`DELETE_IN_PROGRESS`, `ROLLBACK_IN_PROGRESS`, `UPDATE_ROLLBACK_IN_PROGRESS`)
+  as failures, because they share the un-attachable bucket with the genuinely stuck ones. The
+  panels said "a previous teardown did not finish" and recommended `Retain resources` in the
+  CloudFormation console — which would abandon the very MSK / NAT resources the delete was about to
+  remove cleanly, the opposite of the stated goal of stopping the cost. The banner said "CDC
+  teardown failed — action needed" for a teardown that was simply still working. Both now split the
+  two cases and describe the in-flight one as in progress, at warning rather than error severity.
+- **The teardown failure banner reports the status it observed instead of asserting
+  `DELETE_FAILED`.** It named that status for every failed teardown, including a job that timed out
+  or was reconciled after a restart with the stack in `ROLLBACK_COMPLETE` — sending the operator to
+  hunt a status the console never showed. It now echoes the observed status, or says plainly that
+  the last reported state is not a completed delete when none was read.
+- **A failed CDC deploy now reports the CloudFormation reason it already had.** The notification
+  read `job_error` only to ask whether a restart had interrupted the job, then discarded it in
+  favour of a generic per-kind sentence recommending a second Delete — so a stack that failed for a
+  nameable reason (a quota, a subnet with no egress, an IAM gap) showed boilerplate. The real cause
+  is now appended.
+- **A lost job record no longer freezes a poll forever.** The Full Load and Validation pollers are
+  one-shot chains that re-arm only by rendering again, so `except JobNotFoundError: return` killed
+  the chain for the rest of the session: the load card stayed "In progress" with a spinner, the
+  foreign-key card froze on its counter, and Validation sat at IN_PROGRESS with a Cancel button that
+  could never resolve — only a restart triggers the reconcile in `session_persistence`. Both now
+  either re-arm (when the foreign-key pass is still running) or do a terminal reconcile and one
+  full refresh. The CDC deploy poller's lost-job path likewise now refreshes the whole card, which
+  re-probes the stack, instead of refreshing a region that early-returns to empty. An AST test
+  guards the whole class: no one-shot poller's `JobNotFoundError` handler may bare-return.
+- **The AI panel's chat tick is cancelled, not just deactivated.** nicegui's timer loop reads
+  `active` only to decide whether to invoke the callback — the loop keeps waking on the interval
+  until `cancel()` runs. All three exit paths only deactivated, leaking one 8.33 Hz asyncio task per
+  chat turn, each retaining the full reply through its closure, on the same event loop that serves
+  the UI, for as long as the conversation lived.
+
+### Note
+
+- A reported crash from "bare repeating `ui.timer`" was **investigated and refuted**, so nothing
+  changed for it. The premise — that nicegui's `Timer._run_in_loop` captures the slot context
+  outside the loop — is true of `nicegui/timer.py`, but `ui.timer` instantiates the ELEMENT
+  subclass, which overrides `_handle_delete()` to cancel and `_should_stop()` to include
+  `is_deleted`: tearing down the anchor cancels the timer, so there is no next tick and no
+  exception (confirmed on the pinned nicegui with a live browser probe over ~58,000 create/destroy
+  cycles). The investigation found the opposite hazard instead — `_run_in_loop` catches a raising
+  tick and keeps polling while a one-shot chain does not — which is the lost-job fix above.
+
 ## v0.1.481
 
 ### Added

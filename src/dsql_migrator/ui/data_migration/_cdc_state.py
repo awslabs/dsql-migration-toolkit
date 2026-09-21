@@ -107,6 +107,24 @@ def cdc_infra_deploy_in_flight(migration_state, job_manager) -> bool:
     return job is not None and job.status in ("PENDING", "RUNNING")
 
 
+def cdc_delete_in_flight(migration_state, job_manager) -> bool:
+    """True while this session's cdc-stack DELETE job is PENDING/RUNNING.
+
+    ``cdc_streaming_started`` excludes only ``kind == "infra"``, so a delete job
+    (``kind="delete"``) makes it answer True -- and every gate keyed on it then reports
+    "CDC is running" about the operation that is removing CDC. This names the teardown
+    so a gate can exclude it without widening ``cdc_streaming_started`` itself, whose
+    no-false-positive contract other callers (the Full Load start gate, the step
+    promotion) depend on.
+
+    Pure apart from reading the job's status through ``job_manager``; no AWS I/O.
+    """
+    if getattr(migration_state, "cdc_action_kind", None) != "delete":
+        return False
+    job = _current_job(job_manager, getattr(migration_state, "cdc_deploy_job_id", None))
+    return job is not None and job.status in ("PENDING", "RUNNING")
+
+
 def cdc_streaming_started(migration_state, job_manager) -> bool:
     """True once CDC has been started, so its inputs must no longer change.
 

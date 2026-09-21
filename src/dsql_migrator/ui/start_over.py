@@ -404,12 +404,22 @@ def _cdc_teardown_banner_copy(
             "run together. This banner clears itself when the deploy finishes.",
         )
     if state == "failed":
+        # Report what was actually OBSERVED. This asserted "CloudFormation reported
+        # DELETE_FAILED" for every failed teardown, including a job that timed out or was
+        # reconciled after a restart with the stack in ROLLBACK_COMPLETE or still
+        # deleting -- sending the operator to hunt a status the console never showed.
+        _observed = info.get("status")
+        _reported = (
+            f"CloudFormation last reported {_observed}"
+            if _observed
+            else "its last reported state is not a completed delete"
+        )
         return (
             "error",
             "CDC teardown failed — action needed",
-            f"Tearing down '{stack}' did not complete (CloudFormation reported "
-            "DELETE_FAILED). MSK / NAT may still be billing. Retry the cleanup, or "
-            "dismiss this to finish in the AWS console.",
+            f"Tearing down '{stack}' did not complete ({_reported}). MSK / NAT may "
+            "still be billing. Retry the cleanup, or dismiss this to finish in the AWS "
+            "console.",
         )
     # Several stacks in one teardown: say which of how many, or the banner names a single
     # stack and reads as if it were the only one (it then appeared to finish early while

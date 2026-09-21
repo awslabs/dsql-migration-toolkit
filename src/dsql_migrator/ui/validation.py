@@ -3950,6 +3950,31 @@ def _install_poll_timer(
         try:
             job = job_manager.get_status(job_id)
         except JobNotFoundError:
+            # A one-shot chain has NO next tick of its own: a bare return here killed the
+            # poll for good, leaving the screen at IN_PROGRESS with a live spinner and a
+            # Cancel button that could never resolve -- for the rest of the session, since
+            # only a restart triggers the reconcile in ``session_persistence``. Reconcile
+            # here instead, exactly as a restart would: a report means it finished, no
+            # report means the record is gone and the run must be re-run. Either way this
+            # is a TERMINAL exit, so installing no new timer is correct.
+            _mapped = (
+                StepStatus.DONE
+                if validation_state.result is not None
+                else StepStatus.FAILED
+            )
+            if _mapped is StepStatus.FAILED:
+                validation_state.set_error(
+                    "The validation job record was lost (the app restarted, or the job "
+                    "was reaped). Re-run validation."
+                )
+            session.set_workflow(  # type: ignore[attr-defined]
+                with_status(
+                    session.workflow,  # type: ignore[attr-defined]
+                    WorkflowStep.VALIDATION,
+                    _mapped,
+                )
+            )
+            refresh()
             return
         mapped = job_status_to_step_status(job.status)
         if mapped is None:

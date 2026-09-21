@@ -815,6 +815,7 @@ def build_page(
         """
         from dsql_migrator.ui.data_migration._cdc_status import (
             cdc_teardown_banner_state,
+            settled_teardown_banner_state as _settled_teardown_banner_state,
             stack_status_needs_cleanup as _stack_status_needs_cleanup,
         )
 
@@ -917,13 +918,19 @@ def build_page(
         # last probed stack status (cached -- no AWS call on this render path) and keep
         # an actionable failed banner when the stack is still in a failed/rolled-back
         # state.
-        if _stack_status_needs_cleanup(
-            getattr(migration_state, "cdc_stack_phase_status", None)
-        ):
+        _last_status = getattr(migration_state, "cdc_stack_phase_status", None)
+        _settled_state = _settled_teardown_banner_state(_last_status)
+        if _settled_state is not None:
+            # needs_cleanup is True for the *_IN_PROGRESS statuses too, so a stack still
+            # being deleted was reported as "CDC teardown failed — action needed". The
+            # helper routes an in-flight status to the RUNNING banner instead; the observed
+            # status rides along so the failed copy can name what CloudFormation actually
+            # said rather than asserting a DELETE_FAILED it never read.
             return {
-                "state": "failed",
+                "state": _settled_state,
                 "kind": getattr(migration_state, "cdc_teardown_kind", None),
                 "stack": getattr(migration_state, "cdc_teardown_stack", None),
+                "status": _last_status,
             }
         # Everything finished cleanly. Record it as a DISMISSABLE completion notice before
         # clearing the marker: a 15-45 min teardown is meant to be left unattended, and

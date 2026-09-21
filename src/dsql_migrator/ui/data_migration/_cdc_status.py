@@ -496,6 +496,53 @@ _UNATTACHABLE_STACK_STATUSES = frozenset(
 )
 
 
+def settled_teardown_banner_state(status: Optional[str]) -> Optional[str]:
+    """Banner state for a teardown whose JOB has settled, from the last probed status.
+
+    ``None`` means the stack is gone / clean and the banner should clear. Otherwise:
+
+    * ``"running"`` -- the stack is still ``*_IN_PROGRESS``. The job ending is not the
+      same as the stack being gone (a job can time out, or be reconciled after a
+      restart, while CloudFormation is still working), and ``stack_status_needs_cleanup``
+      is True for the in-flight statuses too -- so a delete that was simply still running
+      was announced as "CDC teardown failed - action needed".
+    * ``"failed"`` -- a terminal state that needs an operator action.
+
+    Extracted from the banner getter so this one decision is testable: inside the closure
+    the wrong branch was unreachable from any test.
+    """
+    if not stack_status_needs_cleanup(status):
+        return None
+    return "running" if _is_inflight_stack_status(status) else "failed"
+
+
+def split_cleanup_by_progress(
+    needs_cleanup: "Sequence[tuple[str, str]]",
+) -> "tuple[list[tuple[str, str]], list[tuple[str, str]]]":
+    """Split a needs-cleanup list into ``(in_flight, terminal)`` by stack status.
+
+    ``_UNATTACHABLE_STACK_STATUSES`` deliberately mixes two very different things: a
+    stack that is being torn down RIGHT NOW (``DELETE_IN_PROGRESS`` and the rollback
+    ``*_IN_PROGRESS`` states) and one that is stuck and will not clear on its own
+    (``DELETE_FAILED`` / ``ROLLBACK_COMPLETE`` / ``CREATE_FAILED`` / ...). Both are
+    correctly un-attachable, so folding them was right for that decision -- but the copy
+    that followed diagnosed BOTH as "a previous teardown did not finish" and recommended
+    'Retain resources' in the CloudFormation console. For a delete that is simply still
+    running (~15-25 min of ENI detachment) that is wrong twice over: it is not a
+    failure, and the recommended remedy would abandon live resources that are about to
+    be removed cleanly -- the opposite of the stated goal of stopping the billing.
+
+    Pure; preserves input order within each bucket.
+    """
+    in_flight: "list[tuple[str, str]]" = []
+    terminal: "list[tuple[str, str]]" = []
+    for name, status in needs_cleanup:
+        (in_flight if _is_inflight_stack_status(status) else terminal).append(
+            (name, status)
+        )
+    return in_flight, terminal
+
+
 def stack_status_needs_cleanup(status: Optional[str]) -> bool:
     """True when a cdc-stack is in a state that leaves resources needing cleanup.
 
@@ -724,6 +771,21 @@ def _is_inflight_stack_status(status: Optional[str]) -> bool:
     will never clear it, so the user must delete the stack and retry.
     """
     return bool(status) and status.upper().endswith("_IN_PROGRESS")
+
+
+def is_stack_teardown_status(status: Optional[str]) -> bool:
+    """True when the stack status is a CDC-infrastructure TEARDOWN in flight.
+
+    The mirror of :func:`is_infra_create_stack_status`, and for the same reason. A
+    delete takes ~15-25 min (the in-VPC Lambda's ENIs detach slowly), and during it
+    nothing streams, no connector exists to re-configure and no load is running -- so
+    the prerequisite checks are exactly what the operator should be running with that
+    time, not the thing to forbid. The generic ``_is_inflight_stack_status`` disabled
+    them for the whole teardown and explained it as "a migration operation is in
+    progress", which is both false and unactionable: the only way out was to wait
+    without being told what for. Pure.
+    """
+    return bool(status) and status.strip().upper() == "DELETE_IN_PROGRESS"
 
 
 def is_infra_create_stack_status(status: Optional[str]) -> bool:

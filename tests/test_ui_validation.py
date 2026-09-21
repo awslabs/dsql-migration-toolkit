@@ -5870,3 +5870,71 @@ def test_clear_cutover_outcomes_forgets_every_fk_verdict() -> None:
     assert state.proceed_without_foreign_keys is False, (
         "a stale 'proceed without foreign keys' would un-block the finish gate on its own"
     )
+
+
+def test_a_lost_validation_job_does_not_freeze_the_poll_forever() -> None:
+    """A one-shot poll chain must never bare-return: there is no next tick.
+
+    ``except JobNotFoundError: return`` killed the chain for the rest of the session,
+    leaving the screen at IN_PROGRESS with a live spinner and a Cancel button that could
+    never resolve -- only a restart triggers the reconcile in ``session_persistence``.
+    """
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.job_manager import JobNotFoundError
+    from dsql_migrator.ui.validation import ValidationState, _install_poll_timer
+    from dsql_migrator.ui.workflow import (
+        StepStatus,
+        WorkflowState,
+        WorkflowStep,
+        get_status,
+    )
+
+    class _Ui:
+        def __init__(self):
+            self.timers: list = []
+
+        def timer(self, interval, cb, **kwargs):
+            self.timers.append((interval, cb, kwargs))
+            return SimpleNamespace(
+                classes=lambda *a, **k: None, props=lambda *a, **k: None
+            )
+
+        def __getattr__(self, _n):
+            return lambda *a, **k: SimpleNamespace(
+                __enter__=lambda s: s, __exit__=lambda *e: False,
+                classes=lambda *a, **k: None, props=lambda *a, **k: None,
+            )
+
+    class _LostJobs:
+        def get_status(self, job_id):
+            raise JobNotFoundError(job_id)
+
+    class _Session:
+        def __init__(self):
+            self.workflow = WorkflowState()
+
+        def set_workflow(self, wf):
+            self.workflow = wf
+
+    for has_report, expected in ((True, StepStatus.DONE), (False, StepStatus.FAILED)):
+        state = ValidationState()
+        state.job_id = "v1"
+        if has_report:
+            state.set_result(_report())
+            state.job_id = "v1"  # set_result does not clear the id
+        session = _Session()
+        refreshed: list = []
+        ui = _Ui()
+        _install_poll_timer(
+            ui, _LostJobs(), session, state,
+            refresh=lambda: refreshed.append(True),
+        )
+        assert ui.timers, "the initial one-shot must be armed"
+        ui.timers[0][1]()  # fire the poll with the job record gone
+
+        # It reconciled and did ONE full refresh (a terminal exit installs no timer).
+        assert refreshed == [True]
+        assert get_status(session.workflow, WorkflowStep.VALIDATION) is expected
+        if not has_report:
+            assert "job record was lost" in (state.error or "")

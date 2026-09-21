@@ -38,6 +38,16 @@ _STABLE_STACK_STATES = frozenset(
 )
 
 
+def is_stable_stack_status(status: "Optional[str]") -> bool:
+    """True when ``status`` is a settled CloudFormation state (an update may start).
+
+    The public read of :data:`_STABLE_STACK_STATES`, so a UI that has only the raw
+    status can ask the same question the deployer asks without reimplementing the set.
+    A missing status is NOT stable -- "unknown" must never read as settled.
+    """
+    return bool(status) and str(status).strip().upper() in _STABLE_STACK_STATES
+
+
 def _stack_absent_error(exc: Exception) -> bool:
     """True when a ``describe_stacks`` failure means the stack does not EXIST (as
     opposed to a read/credential error).

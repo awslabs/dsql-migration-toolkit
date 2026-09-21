@@ -5,6 +5,81 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.482
+
+### 修正
+
+- **Start over が直前に書き込んだマルチスタック CDC 撤去キューを消してしまい、複数スタックの撤去でも
+  1 つ目が終わった時点で課金停止を宣言していました。** キューを書く唯一のコードがセッションリセットと
+  **同じ同期ハンドラ**で実行されます(ダイアログが CDC 撤去を呼び、続けてリセット)。そのため 1 つの
+  イベント内で書かれて消されていました — 毎回です。結果として
+  `teardown_queue_progress`・`next_unfinished_teardown`・`advance_cdc_teardown` は本番では
+  デッドコードで、キューを手で設定するテストからのみ到達可能でした。バナーは「1 of 3」を言ったことがなく、
+  次のスタックへ進むこともなく、完了通知は追跡中のスタック 1 つだけを挙げていました — 残りはまだ削除中で
+  MSK / NAT の課金も続いている間に。現在はキューと完了記録がリセットを越えて保持されます。両フィールドの
+  docstring は元々「保持される」と主張していました。
+- **CDC 撤去が事前チェックを、ひいては Full Load をブロックしなくなりました。** ゲートが
+  `DELETE_IN_PROGRESS` をライブなコネクタ操作と一緒に扱い、「A migration operation is in progress」と
+  説明していました。事前チェックのレポートが無いと `full_load_run_guard_reason` がロード開始を拒否するため、
+  ~15〜45 分の撤去が**誤った理由**の裏で静かにメインフローを止め、スタックが消えると何の説明もなく解除されて
+  いました。現在はインフラ作成が既に除外されていたのと**まったく同じ理由**で撤去も除外します: 何もストリーム
+  しておらず、コネクタも存在せず、ロードも走っていないので、その時間はまさにチェックを再実行するための時間
+  です。ゲートの両側に修正が必要でした — status と、`kind="delete"` のために
+  `cdc_streaming_started` が True を返すセッション内 delete ジョブです。**Stop CDC
+  (`UPDATE_IN_PROGRESS`)は引き続きブロックします**: MSK・トピック・不変のパーティション計画をそのまま
+  残すため、実際にライブなパイプライン操作です。
+- **Prerequisites が削除中・失敗した cdc-stack を緑で塗らなくなりました。** この画面の "ready" 状態は
+  **すべての**非安定 CloudFormation status を 1 つに畳み込みます(安定は `CREATE_COMPLETE` /
+  `UPDATE_COMPLETE` / `UPDATE_ROLLBACK_COMPLETE` / `IMPORT_COMPLETE` のみ)。そのため撤去中のスタックや
+  `ROLLBACK_COMPLETE` / `CREATE_FAILED` / `DELETE_FAILED` で止まったスタックが、緑の success ボックスと
+  positive な "Ready" バッジで「already deployed, so there is nothing to provision here」と案内されて
+  いました — 1 つ下のサブステップの CDC カードは同じ状態を読んで「CDC infrastructure is being deleted」と
+  正しく言っているのに。1 つの画面が自分自身と矛盾していたわけです。現在はバッジ・トーン・文言を CDC カードが
+  使うのと**同じ純粋ヘルパー**で raw status から作り、status が自力で変わりうる間は再ポーリングします。
+  畳み込み自体は変えていないのでデプロイフォームも隠したままです(同名の削除中スタックへの `CreateStack` は
+  どうせ拒否されます)。Delete ボタンは追加していません — 1 つ下のサブステップに既にあります。
+- **正常に進行中の削除を失敗と診断しなくなりました。** 「leftover infrastructure needs cleanup」パネル
+  2 か所とアプリ全体の撤去バナーが、in-flight な status(`DELETE_IN_PROGRESS`、
+  `ROLLBACK_IN_PROGRESS`、`UPDATE_ROLLBACK_IN_PROGRESS`)を失敗として扱っていました — 本当に詰まって
+  いるものと同じ「アタッチ不可」バケットを共有しているためです。パネルは「a previous teardown did not
+  finish」と述べ、CloudFormation コンソールでの `Retain resources` を勧めていましたが、それは削除が
+  まさにきれいに取り除こうとしている MSK / NAT リソースを放置せよという意味で、コストを止めるという目的と
+  正反対です。バナーは単に動作中の撤去を「CDC teardown failed — action needed」と言っていました。現在は
+  2 つのケースを分け、進行中のものは error ではなく warning の重大度で「進行中」と説明します。
+- **撤去失敗バナーが `DELETE_FAILED` を断定せず、観測した status を報告します。** すべての失敗撤去に対して
+  その status を明示しており、ジョブがタイムアウトした場合や再起動後にスタックが `ROLLBACK_COMPLETE` の
+  状態で整合された場合まで含まれていました — コンソールに出たことのない status を探させていたわけです。
+  現在は観測した status をそのまま出し、読めていない場合は「最後に報告された状態は完了した削除ではない」と
+  だけ述べます。
+- **CDC デプロイ失敗時に、既に手元にあった CloudFormation の理由を報告します。** 通知は `job_error` を
+  「再起動で中断されたジョブか」を判定するためだけに読み、2 回目の Delete を勧める汎用文で置き換えて
+  いました — そのためクォータ、egress の無いサブネット、IAM の不足といった**名前を挙げられる**理由で失敗した
+  スタックにも定型文が表示されていました。現在は実際の原因を付け加えます。
+- **ジョブ記録が失われても poll が永久に止まりません。** Full Load と Validation の poller は再描画時にのみ
+  再武装する one-shot チェーンなので、`except JobNotFoundError: return` がセッションの残り全体でチェーンを
+  殺していました: ロードカードはスピナー付きで「In progress」のまま、外部キーカードはカウンタで固まり、
+  Validation は解消しえない Cancel ボタンとともに IN_PROGRESS に座っていました — `session_persistence` の
+  整合は再起動時にしか走りません。現在は(外部キーのパスが動作中なら)再武装するか、終端として整合して
+  フル refresh を 1 回行います。CDC デプロイ poller の「ジョブ喪失」経路も、空になる領域だけを refresh
+  するのではなくカード全体を refresh してスタックを再プローブします。AST テストがこのクラス全体を固定
+  します: one-shot poller の `JobNotFoundError` ハンドラは bare return できません。
+- **AI パネルのチャット tick を deactivate ではなく cancel します。** nicegui のタイマーループは `active` を
+  コールバックを呼ぶかの判断にしか使わず、ループ自体は `cancel()` が実行されるまで起き続けます。3 つの終了
+  経路すべてが deactivate のみだったため、チャットターンごとに 8.33 Hz の asyncio タスクが 1 つ蓄積し、
+  それぞれがクロージャで返答全体を保持していました — UI を提供するまさにその イベントループ上で、会話が
+  生きている限り。
+
+### 備考
+
+- 「bare repeating `ui.timer` のクラッシュ」という報告は**調査の結果、反証**されたため何も変更していません。
+  前提(nicegui の `Timer._run_in_loop` がループ外でスロットコンテキストを取得する)は `nicegui/timer.py`
+  については事実ですが、`ui.timer` が実際に生成するのは **element サブクラス**で、こちらは
+  `_handle_delete()` で cancel し、`_should_stop()` に `is_deleted` を含みます。アンカーが破棄されると
+  タイマーはキャンセルされるので次の tick も例外もありません(固定された nicegui 版で実ブラウザにより
+  約 58,000 回の create/destroy サイクルを回して確認)。調査ではむしろ逆の危険が判明しました —
+  `_run_in_loop` は例外を捕まえてポーリングを続けるが one-shot チェーンはそうではない — それが上記の
+  「ジョブ喪失」修正です。
+
 ## v0.1.481
 
 ### 追加

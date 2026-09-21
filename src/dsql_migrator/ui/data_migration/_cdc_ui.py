@@ -84,6 +84,7 @@ from dsql_migrator.ui.data_migration._models import (
     lob_exclusion_candidates,
     per_table_counts_notice_body,
 )
+from dsql_migrator.core.cdc_stack_deployer import is_stable_stack_status
 from dsql_migrator.ui.data_migration._cdc_status import (
     _CDC_ACTION_NOUN,
     _CDC_ACTION_TERMINAL,
@@ -103,6 +104,7 @@ from dsql_migrator.ui.data_migration._cdc_status import (
     _is_inflight_stack_status,
     cdc_attach_scope_mismatch,
     split_attachable_stacks,
+    split_cleanup_by_progress,
     _migration_status_tables,
     _read_cdc_template_body,
     cdc_dlq_records,
@@ -144,6 +146,7 @@ from dsql_migrator.ui.data_migration._cdc_state import (  # noqa: E402,F401
     _cdc_is_streaming,
     cdc_infra_deploy_in_flight,
     cdc_monitoring_visible,
+    cdc_delete_in_flight,
     cdc_evidence_unverified,
     cdc_pipeline_live,
     cdc_streaming_started,
@@ -2039,6 +2042,20 @@ def _render_cdc_running_actions(
         "kept, so you can Start CDC again quickly."
     )
 
+def _cdc_prep_ready_badge(migration_state) -> tuple[str, str]:
+    """Badge for the prep section's ``ready`` state, honouring the raw stack status.
+
+    ``ready`` folds every non-stable status, so a flat ("Ready", "positive") badge
+    labelled a deleting or failed stack green. Derives the badge from the same pure
+    helper the CDC card uses, so the two surfaces cannot disagree again.
+    """
+    status = getattr(migration_state, "cdc_stack_phase_status", None)
+    if status and not is_stable_stack_status(status):
+        badge_text, _tone, _header, _body = cdc_unstable_message(status)
+        return (badge_text, "warning")
+    return ("Ready", "positive")
+
+
 def cdc_infra_prep_state(migration_state, job_manager) -> str:
     """Classify the CDC-infrastructure situation for the Prerequisites-step section.
 
@@ -2105,7 +2122,7 @@ def _render_cdc_infra_prep_section(
         title="CDC streaming infrastructure",
         badge=(
             ("Deploying…", "primary") if prep == "deploying"
-            else ("Ready", "positive") if prep == "ready"
+            else _cdc_prep_ready_badge(migration_state) if prep == "ready"
             else ("Not deployed", "grey")
         ),
     )
@@ -2128,6 +2145,31 @@ def _render_cdc_infra_prep_section(
 
     if prep == "ready":
         stack = getattr(migration_state, "cdc_stack_name", "the cdc-stack")
+        # "ready" is a fold: EVERY non-stable CloudFormation status lands here, because
+        # only CREATE_COMPLETE / UPDATE_COMPLETE / UPDATE_ROLLBACK_COMPLETE /
+        # IMPORT_COMPLETE are in _STABLE_STACK_STATES. So a stack that is being torn down,
+        # or parked in ROLLBACK_COMPLETE / CREATE_FAILED / DELETE_FAILED, was announced in
+        # a green success box as "already deployed, so there is nothing to provision" --
+        # while the CDC card one sub-step below, reading the SAME state, correctly said
+        # "CDC infrastructure is being deleted". One screen contradicting itself.
+        #
+        # The fold itself is right (hiding the deploy affordance is correct: CreateStack
+        # against a same-named deleting stack raises AlreadyExistsException), so only the
+        # badge / tone / copy change, from the raw status through the same pure helper the
+        # CDC card uses. No new action here -- Delete already lives one sub-step below.
+        _raw_status = getattr(migration_state, "cdc_stack_phase_status", None)
+        if _raw_status and not is_stable_stack_status(_raw_status):
+            _badge, _tone, _header, _body = cdc_unstable_message(_raw_status)
+            render_notice(ui, tone=_tone, header=_header, body=_body)
+            # Re-poll while the status can still change on its own, so the section does
+            # not sit on a stale in-flight message until something else refreshes. A
+            # terminal status (DELETE_FAILED, ROLLBACK_COMPLETE) needs an operator
+            # action, so arming a timer for it would poll forever for nothing.
+            if _is_inflight_stack_status(_raw_status) and refresh is not None:
+                ui.timer(  # type: ignore[attr-defined]
+                    _CDC_POLL_INTERVAL_SECONDS, refresh, once=True
+                )
+            return
         # "after the Full Load" is false for CDC only -- there is no Full Load in that
         # plan, and the operator's next action is Start CDC on the (now-expanded) CDC
         # step. Naming a step that does not exist reads as a missing prerequisite.
@@ -2203,20 +2245,43 @@ def _render_cdc_adopt_or_deploy_choice(
     attachable, needs_cleanup = split_attachable_stacks(other_stacks)
 
     if needs_cleanup:
-        stuck = ", ".join(f"{name} ({status})" for name, status in needs_cleanup)
-        render_notice(
-            ui,
-            tone="error",
-            header="Leftover CDC infrastructure needs cleanup — it may still be billing",
-            body=(
-                f"{stuck}. A previous teardown did not finish, so this stack cannot be "
-                "used or attached to (it is partly deleted) — but its Amazon MSK / NAT "
-                "resources may still be incurring cost. Finish the delete first: use "
-                "'Delete CDC infrastructure' below, or delete the stack in the "
-                "CloudFormation console (a DELETE_FAILED stack usually needs 'Retain "
-                "resources' on whatever is stuck)."
-            ),
-        )
+        # A delete that is simply STILL RUNNING is not a failed one. Both are equally
+        # un-attachable, so they share the bucket -- but the failure copy told the
+        # operator "a previous teardown did not finish" about a teardown progressing
+        # normally, and recommended 'Retain resources', which would abandon the very MSK /
+        # NAT resources the delete is about to remove (the opposite of stopping the cost).
+        _in_flight, _terminal = split_cleanup_by_progress(needs_cleanup)
+        if _in_flight:
+            _busy = ", ".join(f"{name} ({status})" for name, status in _in_flight)
+            render_notice(
+                ui,
+                tone="warning",
+                header="CDC infrastructure is still being removed",
+                body=(
+                    f"{_busy}. This is in progress, not stuck: a cdc-stack delete takes "
+                    "~15–25 min because the in-VPC Lambda's network interfaces detach "
+                    "slowly. It cannot be attached to while it runs, and MSK / NAT "
+                    "billing stops when it completes. No action is needed — you can keep "
+                    "working on the earlier steps meanwhile."
+                ),
+            )
+        if _terminal:
+            stuck = ", ".join(f"{name} ({status})" for name, status in _terminal)
+            render_notice(
+                ui,
+                tone="error",
+                header=(
+                    "Leftover CDC infrastructure needs cleanup — it may still be billing"
+                ),
+                body=(
+                    f"{stuck}. A previous teardown did not finish, so this stack cannot "
+                    "be used or attached to (it is partly deleted) — but its Amazon MSK / "
+                    "NAT resources may still be incurring cost. Finish the delete first: "
+                    "use 'Delete CDC infrastructure' below, or delete the stack in the "
+                    "CloudFormation console (a DELETE_FAILED stack usually needs 'Retain "
+                    "resources' on whatever is stuck)."
+                ),
+            )
 
     # Split the candidates by whether they actually cover THIS session's tables. Attaching
     # promotes Data Migration to DONE and unlocks Validation, so a pipeline streaming a
@@ -4198,19 +4263,35 @@ def _render_cdc_deploy_live(ui, migration_state, job_manager, refresh) -> None:
                     ),
                 )
             else:
+                # ``job_error`` is the REAL reason -- the CloudFormation failure text the
+                # deployer already extracted -- and it was read just above only to ask
+                # whether a restart interrupted the job, then discarded in favour of the
+                # generic per-kind sentence. So an operator whose stack failed for a
+                # nameable reason (a quota, a subnet without egress, an IAM gap) was shown
+                # boilerplate recommending a second Delete. Lead with the generic sentence
+                # (it carries the next action) and append what AWS actually said.
                 render_notice(
                     ui,
                     tone="error",
                     header=f"{fail_noun} failed"
                     + (f" (after {total})" if total else ""),
-                    body=fail_msg,
+                    body=(
+                        f"{fail_msg} Reported cause: {job_error}"
+                        if job_error
+                        else fail_msg
+                    ),
                 )
 
     def _poll_deploy() -> None:
         job = _current_job(job_manager, migration_state.cdc_deploy_job_id)
-        # When the operation finishes, re-probe the stack so the lifecycle card
-        # advances to the next action; otherwise just refresh the live region.
-        if job is not None and job.status not in ("PENDING", "RUNNING"):
+        # When the operation finishes, re-probe the stack so the lifecycle card advances
+        # to the next action; otherwise just refresh the live region.
+        #
+        # ``job is None`` (how _current_job reports a lost job record) must take the
+        # refresh() branch too: _deploy_live early-returns on a missing job, so refreshing
+        # only the live region emptied the card and left it blank forever. A full refresh
+        # re-probes the stack, so a lost job resolves from live AWS state instead.
+        if job is None or job.status not in ("PENDING", "RUNNING"):
             refresh()
         else:
             _deploy_live.refresh()

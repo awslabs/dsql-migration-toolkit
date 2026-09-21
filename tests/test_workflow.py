@@ -1171,13 +1171,27 @@ def test_cdc_teardown_banner_copy_running_failed_and_none() -> None:
         {"state": "running", "kind": "stop", "stack": "cdc-y"}
     )
     assert tone == "info" and "connector" in header.lower() and "cdc-y" in body
-    # failed → error tone + actionable wording.
+    # failed → error tone + actionable wording. With NO observed status the copy must
+    # not invent one: it used to assert "CloudFormation reported DELETE_FAILED" for every
+    # failed teardown, including a job that timed out or was reconciled after a restart
+    # with the stack in ROLLBACK_COMPLETE or still deleting -- sending the operator to
+    # hunt a status the console never showed.
     tone, header, body = _cdc_teardown_banner_copy(
         {"state": "failed", "kind": "delete", "stack": "cdc-z"}
     )
     assert tone == "error"
     assert "failed" in header.lower()
-    assert "cdc-z" in body and "DELETE_FAILED" in body
+    assert "cdc-z" in body
+    assert "DELETE_FAILED" not in body, body
+    assert "not a completed delete" in body
+
+    # With an observed status, it echoes exactly that.
+    _, _, observed = _cdc_teardown_banner_copy(
+        {"state": "failed", "kind": "delete", "stack": "cdc-z",
+         "status": "ROLLBACK_COMPLETE"}
+    )
+    assert "ROLLBACK_COMPLETE" in observed
+    assert "DELETE_FAILED" not in observed
     # No state defaults to running; missing stack → generic label (no dangling quote).
     _, _, fb = _cdc_teardown_banner_copy({"kind": "delete"})
     assert "the cdc-stack" in fb

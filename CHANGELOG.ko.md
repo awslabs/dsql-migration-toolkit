@@ -5,6 +5,76 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.482
+
+### 수정
+
+- **Start over가 방금 기록한 다중 스택 CDC 철거 큐를 지워 버려서, 여러 스택을 철거해도 첫 번째가 끝나면
+  과금이 멈췄다고 알렸습니다.** 큐를 채우는 유일한 코드가 세션 리셋과 **같은 동기 핸들러**에서 실행됩니다
+  (다이얼로그가 CDC 철거를 호출하고 바로 리셋). 그래서 한 이벤트 안에서 기록되고 지워졌습니다 — 매번.
+  결과적으로 `teardown_queue_progress`·`next_unfinished_teardown`·`advance_cdc_teardown`이 프로덕션에서
+  죽은 코드였고, 큐를 손으로 넣는 테스트에서만 도달했습니다. 배너는 "1 of 3"을 말한 적이 없고, 다음 스택으로
+  넘어가지도 않았고, 완료 알림은 추적 중인 스택 하나만 이름을 댔습니다 — 나머지는 계속 삭제 중이고 MSK / NAT
+  과금도 계속되는 동안에요. 이제 큐와 완료 기록이 리셋을 넘어 유지됩니다. 두 필드의 docstring은 원래부터
+  유지된다고 주장하고 있었습니다.
+- **CDC 철거가 더 이상 사전 점검을, 그리고 그것을 통해 Full Load를 막지 않습니다.** 게이트가
+  `DELETE_IN_PROGRESS`를 라이브 커넥터 작업과 한데 묶고 "A migration operation is in progress"라고
+  설명했습니다. 사전 점검 보고서가 없으면 `full_load_run_guard_reason`이 적재 시작을 거부하므로, ~15–45분짜리
+  철거가 **거짓 사유** 뒤에서 조용히 메인 플로를 막았고, 스택이 사라지면 아무 설명도 없이 풀렸습니다. 이제
+  인프라 생성이 이미 제외돼 있던 것과 **정확히 같은 이유로** 철거도 제외합니다: 아무것도 스트리밍하지 않고,
+  커넥터도 없고, 적재도 돌지 않으므로 그 시간은 바로 점검을 다시 돌리기 위한 시간입니다. 게이트의 양쪽 모두
+  수정이 필요했습니다 — status와, `kind="delete"` 때문에 `cdc_streaming_started`가 True를 반환하게 만드는
+  세션 내 delete 잡. **Stop CDC(`UPDATE_IN_PROGRESS`)는 계속 막습니다**: MSK·토픽·불변 파티션 계획을 그대로
+  두므로 실제로 라이브 파이프라인 작업입니다.
+- **Prerequisites가 삭제 중이거나 실패한 cdc-stack을 초록색으로 칠하지 않습니다.** 이 화면의 "ready" 상태는
+  **모든** 비안정 CloudFormation status를 하나로 접습니다(안정 상태는 `CREATE_COMPLETE` /
+  `UPDATE_COMPLETE` / `UPDATE_ROLLBACK_COMPLETE` / `IMPORT_COMPLETE`뿐). 그래서 철거 중인 스택이나
+  `ROLLBACK_COMPLETE` / `CREATE_FAILED` / `DELETE_FAILED`에 걸린 스택이 초록 success 박스와 positive
+  "Ready" 배지로 "already deployed, so there is nothing to provision here"라고 안내됐습니다 — 바로 아래
+  서브스텝의 CDC 카드는 같은 상태를 읽고 "CDC infrastructure is being deleted"라고 정확히 말하는데도요.
+  한 화면이 자기 자신과 모순된 셈입니다. 이제 배지·톤·문구를 CDC 카드가 쓰는 것과 **같은 순수 헬퍼**로
+  raw status에서 만들고, status가 스스로 변할 수 있는 동안에는 다시 폴링합니다. fold 자체는 그대로 두어
+  배포 폼도 계속 숨깁니다(같은 이름의 삭제 중 스택에 대한 `CreateStack`은 어차피 거부됩니다). Delete 버튼은
+  추가하지 않았습니다 — 바로 아래 서브스텝에 이미 있습니다.
+- **정상적으로 진행 중인 삭제를 실패로 진단하지 않습니다.** "leftover infrastructure needs cleanup" 패널
+  두 곳과 앱 전역 철거 배너가 in-flight status(`DELETE_IN_PROGRESS`, `ROLLBACK_IN_PROGRESS`,
+  `UPDATE_ROLLBACK_IN_PROGRESS`)를 실패로 취급했습니다 — 진짜로 멈춴 것들과 같은 "attach 불가" 버킷을
+  공유하기 때문입니다. 패널은 "a previous teardown did not finish"라고 하며 CloudFormation 콘솔에서
+  `Retain resources`를 권했는데, 이는 삭제가 곧 깔끔하게 제거할 바로 그 MSK / NAT 자원을 버리라는 뜻이고,
+  비용을 멈추겠다는 목적과 정반대입니다. 배너는 그냥 아직 동작 중인 철거를 "CDC teardown failed — action
+  needed"라고 했습니다. 이제 두 경우를 분리하고, 진행 중인 쪽은 error가 아니라 warning 심각도로 "진행 중"
+  이라고 설명합니다.
+- **철거 실패 배너가 `DELETE_FAILED`를 단정하지 않고 관측한 status를 보고합니다.** 모든 실패 철거에 대해 그
+  status를 명시했는데, 잡이 타임아웃했거나 재시작 후 스택이 `ROLLBACK_COMPLETE`인 상태로 정리된 경우까지
+  포함됐습니다 — 콘솔에 나온 적 없는 status를 찾아다니게 만든 셈입니다. 이제 관측한 status를 그대로 echo하고,
+  읽은 값이 없으면 "마지막 보고 상태가 완료된 삭제가 아니다"라고만 말합니다.
+- **CDC 배포 실패 시 이미 갖고 있던 CloudFormation 사유를 보고합니다.** 알림이 `job_error`를 재시작으로
+  중단된 잡인지 판단하는 데만 쓰고, 두 번째 Delete를 권하는 일반 문구로 대체해 버렸습니다 — 그래서 쿼터,
+  egress 없는 서브넷, IAM 누락처럼 **이름을 댈 수 있는** 이유로 실패한 스택에도 보일러플레이트가 표시됐습니다.
+  이제 실제 원인을 덧붙입니다.
+- **잡 기록이 사라져도 poll이 영구히 멈추지 않습니다.** Full Load와 Validation의 poller는 다시 렌더될 때만
+  재무장하는 one-shot 체인이라, `except JobNotFoundError: return`이 세션이 끝날 때까지 체인을 죽였습니다:
+  적재 카드는 스피너와 함께 "In progress"에 머물고, 외래 키 카드는 카운터에 얼어붙고, Validation은 해소될 수
+  없는 Cancel 버튼과 함께 IN_PROGRESS에 앉아 있었습니다 — `session_persistence`의 정리는 재시작 때만
+  일어납니다. 이제 (외래 키 패스가 돌고 있으면) 재무장하거나, 종료 상태로 정리하고 전체 refresh를 한 번
+  합니다. CDC 배포 poller의 잡 소실 경로도 비어버리는 영역만 refresh하지 않고 카드 전체를 refresh해 스택을
+  다시 프로브합니다. AST 테스트가 이 부류 전체를 고정합니다: one-shot poller의 `JobNotFoundError` 핸들러는
+  bare return을 할 수 없습니다.
+- **AI 패널의 채팅 tick을 deactivate가 아니라 cancel합니다.** nicegui의 타이머 루프는 `active`를 콜백을
+  호출할지 판단하는 데만 쓰고, 루프 자체는 `cancel()`이 실행될 때까지 계속 깨어납니다. 종료 경로 세 곳 모두
+  deactivate만 해서, 채팅 턴마다 8.33 Hz asyncio 태스크 하나가 누적됐고 각각이 클로저로 전체 답변을 붙들고
+  있었습니다 — UI를 서비스하는 바로 그 이벤트 루프 위에서, 대화가 살아 있는 동안 계속요.
+
+### 참고
+
+- "bare repeating `ui.timer` 크래시" 보고는 **조사 후 반박**되어 아무것도 바꾸지 않았습니다. 전제(nicegui의
+  `Timer._run_in_loop`가 루프 밖에서 슬롯 컨텍스트를 잡는다)는 `nicegui/timer.py`에 대해서는 사실이지만,
+  `ui.timer`가 실제로 만드는 것은 **element 서브클래스**이고 이쪽은 `_handle_delete()`에서 cancel하고
+  `_should_stop()`에 `is_deleted`를 포함합니다. 앵커가 철거되면 타이머가 취소되므로 다음 tick도, 예외도
+  없습니다(고정된 nicegui 버전에서 실제 브라우저로 약 58,000 create/destroy 사이클을 돌려 확인). 조사에서
+  오히려 반대 위험이 드러났습니다 — `_run_in_loop`는 예외를 잡고 계속 도는데 one-shot 체인은 그렇지 않다는
+  것 — 그것이 위의 잡 소실 수정입니다.
+
 ## v0.1.481
 
 ### 추가

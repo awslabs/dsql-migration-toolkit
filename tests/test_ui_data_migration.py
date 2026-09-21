@@ -5009,15 +5009,23 @@ def test_infra_create_stack_status_is_not_a_live_migration_operation() -> None:
     ):
         assert is_infra_create_stack_status(other) is False, other
 
-    # The composite the Prerequisites panel uses: in-flight AND not an infra create.
+    # The composite the Prerequisites panel uses: in-flight, NOT an infra create, and
+    # NOT a teardown. (A local mirror; the teardown exclusion and its reason are pinned
+    # by test_a_teardown_no_longer_blocks_the_prerequisite_checks.)
+    from dsql_migrator.ui.data_migration._cdc_status import is_stack_teardown_status
+
     def _live_operation(status: str | None) -> bool:
-        return bool(_is_inflight_stack_status(status)) and not is_infra_create_stack_status(
-            status
+        return (
+            bool(_is_inflight_stack_status(status))
+            and not is_infra_create_stack_status(status)
+            and not is_stack_teardown_status(status)
         )
 
     assert _live_operation("CREATE_IN_PROGRESS") is False
     assert _live_operation("UPDATE_IN_PROGRESS") is True
-    assert _live_operation("DELETE_IN_PROGRESS") is True
+    # A teardown no longer counts: re-checking prerequisites is what that ~15-25 min is
+    # FOR, and blocking it also blocked Full Load behind a false reason.
+    assert _live_operation("DELETE_IN_PROGRESS") is False
 
 
 def test_infra_deploy_does_not_block_schema_conversion_apply() -> None:
@@ -22164,3 +22172,290 @@ def test_scoped_reload_is_disabled_while_cdc_streams(monkeypatch) -> None:
     reload_props = [p for label, p in ui.btn_props if "Reload specific" in label]
     assert any("disable" == p for p in reload_props), ui.btn_props
     assert any("Stop CDC first" in p for p in reload_props), ui.btn_props
+
+
+# ---------------------------------------------------------------------------
+# CDC teardown: the queue survives Start over, and a live delete is not a failure
+# ---------------------------------------------------------------------------
+
+
+def test_start_over_reset_preserves_the_multi_stack_teardown_queue() -> None:
+    """The queue's only writer runs in the SAME handler as the reset.
+
+    So it was written and wiped in one event, EVERY time -- which made
+    teardown_queue_progress / next_unfinished_teardown / advance_cdc_teardown dead code
+    in production: the banner never said "1 of 3", the advance was gated on
+    len(queue) > 1 and never fired, and a multi-stack teardown announced that MSK / NAT
+    billing had stopped after only the FIRST stack while the rest kept deleting and kept
+    billing. Both fields' own docstrings claimed they were preserved.
+    """
+    from dsql_migrator.ui.data_migration._state import DataMigrationStore
+
+    store = DataMigrationStore()
+    state = store.get_or_create("S1")
+    state.set_cdc_teardown("j1", kind="delete", stack="dsql-cdc-a", ctx={"region": "x"})
+    state.set_cdc_teardown_queue(
+        [("j1", "dsql-cdc-a"), ("j2", "dsql-cdc-b"), ("j3", "dsql-cdc-c")]
+    )
+    state.set_cdc_teardown_done(kind="delete", stacks=["dsql-cdc-z"])
+
+    store.reset_in_place("S1")
+    after = store.get_or_create("S1")
+
+    assert after.cdc_teardown_job_id == "j1"
+    assert after.cdc_teardown_queue == [
+        ("j1", "dsql-cdc-a"), ("j2", "dsql-cdc-b"), ("j3", "dsql-cdc-c")
+    ]
+    assert after.cdc_teardown_done.get("stacks") == ["dsql-cdc-z"]
+
+
+def test_a_preserved_queue_makes_the_multi_stack_banner_work() -> None:
+    """The consequences the wipe made unreachable, driven through the real helpers.
+
+    With an empty queue (the old post-reset state) the banner cannot say which stack of
+    how many, cannot advance to the next one, and the completion notice names only the
+    tracked stack -- so the first stack settling announced the whole teardown done.
+    """
+    from dsql_migrator.ui.data_migration._cdc_status import (
+        finished_teardown_stacks,
+        next_unfinished_teardown,
+        teardown_queue_progress,
+    )
+
+    queue = [("j1", "dsql-cdc-a"), ("j2", "dsql-cdc-b"), ("j3", "dsql-cdc-c")]
+
+    # "1 of 3" is only possible with the queue.
+    assert teardown_queue_progress(queue, "j1") == (1, 3)
+    assert teardown_queue_progress([], "j1") is None
+
+    # The advance to the next unfinished stack, likewise.
+    mgr = _StubJobManager({
+        "j1": _StubJob("DONE"), "j2": _StubJob("RUNNING"), "j3": _StubJob("PENDING"),
+    })
+    assert next_unfinished_teardown(mgr, queue) == ("j2", "dsql-cdc-b", 2, 3)
+    assert next_unfinished_teardown(mgr, []) is None
+
+    # And the completion notice names EVERY stack, not just the tracked one.
+    assert finished_teardown_stacks(queue, "dsql-cdc-a") == [
+        "dsql-cdc-a", "dsql-cdc-b", "dsql-cdc-c"
+    ]
+    assert finished_teardown_stacks([], "dsql-cdc-a") == ["dsql-cdc-a"]
+
+
+def test_a_teardown_no_longer_blocks_the_prerequisite_checks() -> None:
+    """A delete must not disable Check -- and so must not block Full Load.
+
+    The gate lumped DELETE_IN_PROGRESS in with a live connector operation and explained
+    it as "A migration operation is in progress". With no prereq report,
+    full_load_run_guard_reason then refuses to start a load, so a ~15-45 min teardown
+    silently gated the main flow behind a false reason. Stop CDC (UPDATE_IN_PROGRESS)
+    must keep blocking: it leaves MSK, the topics and the immutable partition plan in
+    place, so it really is a live pipeline operation.
+    """
+    from dsql_migrator.ui.data_migration import cdc_delete_in_flight
+    from dsql_migrator.ui.data_migration._cdc_status import (
+        _is_inflight_stack_status,
+        is_infra_create_stack_status,
+        is_stack_teardown_status,
+    )
+
+    assert is_stack_teardown_status("DELETE_IN_PROGRESS") is True
+    assert is_stack_teardown_status("delete_in_progress") is True
+    for other in ("UPDATE_IN_PROGRESS", "CREATE_IN_PROGRESS", "DELETE_FAILED", None, ""):
+        assert is_stack_teardown_status(other) is False, other
+
+    # The composite the Prerequisites panel now uses.
+    def _live_operation(status, state=None, mgr=None) -> bool:
+        tearing = is_stack_teardown_status(status) or (
+            cdc_delete_in_flight(state, mgr) if state is not None else False
+        )
+        return (
+            bool(_is_inflight_stack_status(status))
+            and not is_infra_create_stack_status(status)
+        ) and not tearing
+
+    assert _live_operation("CREATE_IN_PROGRESS") is False   # infra create: never blocked
+    assert _live_operation("UPDATE_IN_PROGRESS") is True    # Stop CDC: still blocked
+    assert _live_operation("DELETE_IN_PROGRESS") is False   # teardown: no longer blocked
+
+    # The job-level half: an in-session delete records kind="delete", which
+    # cdc_streaming_started counts as streaming, so the status test alone is not enough.
+    state = DataMigrationState()
+    state.set_cdc_deploy_job_id("del-1", kind="delete")
+    mgr = _StubJobManager({"del-1": _StubJob("RUNNING")})
+    assert cdc_delete_in_flight(state, mgr) is True
+    from dsql_migrator.ui.data_migration import cdc_streaming_started
+
+    assert cdc_streaming_started(state, mgr) is True, "the gate's other half still fires"
+    assert _live_operation(None, state, mgr) is False
+
+    # A start/stop job is NOT a teardown.
+    other = DataMigrationState()
+    other.set_cdc_deploy_job_id("start-1", kind="start")
+    assert cdc_delete_in_flight(other, _StubJobManager(
+        {"start-1": _StubJob("RUNNING")}
+    )) is False
+
+
+def test_in_flight_teardown_is_split_from_a_stuck_one() -> None:
+    # "Needs cleanup" folds a delete that is still running with one that is stuck. The
+    # failure copy then diagnosed a normal delete as "a previous teardown did not finish"
+    # and recommended 'Retain resources' -- which would abandon the resources the delete
+    # is about to remove cleanly, the opposite of stopping the billing.
+    from dsql_migrator.ui.data_migration._cdc_status import split_cleanup_by_progress
+
+    in_flight, terminal = split_cleanup_by_progress([
+        ("a", "DELETE_IN_PROGRESS"),
+        ("b", "DELETE_FAILED"),
+        ("c", "ROLLBACK_IN_PROGRESS"),
+        ("d", "ROLLBACK_COMPLETE"),
+    ])
+    assert in_flight == [("a", "DELETE_IN_PROGRESS"), ("c", "ROLLBACK_IN_PROGRESS")]
+    assert terminal == [("b", "DELETE_FAILED"), ("d", "ROLLBACK_COMPLETE")]
+    assert split_cleanup_by_progress([]) == ([], [])
+
+
+def test_cdc_prep_section_does_not_paint_a_deleting_stack_green() -> None:
+    """One screen must not contradict itself.
+
+    prep == "ready" folds EVERY non-stable status, so a stack being torn down -- or stuck
+    in ROLLBACK_COMPLETE / DELETE_FAILED -- was announced in a green success box as
+    "already deployed, so there is nothing to provision", while the CDC card one sub-step
+    below, reading the same state, said "CDC infrastructure is being deleted".
+    """
+    from dsql_migrator.ui.data_migration._cdc_ui import (
+        _cdc_prep_ready_badge,
+        cdc_infra_prep_state,
+    )
+
+    class _NoJobs:
+        def get_status(self, job_id):
+            from dsql_migrator.core.job_manager import JobNotFoundError
+
+            raise JobNotFoundError(job_id)
+
+    state = DataMigrationState()
+    state.set_cdc_stack_phase("unstable", status="DELETE_IN_PROGRESS")
+
+    # The prep-state contract is unchanged (hiding the deploy form is correct: CreateStack
+    # against a same-named deleting stack raises AlreadyExistsException).
+    assert cdc_infra_prep_state(state, _NoJobs()) == "ready"
+    # ...but the badge is no longer a green "Ready".
+    badge, tone = _cdc_prep_ready_badge(state)
+    assert badge != "Ready"
+    assert tone != "positive"
+    assert badge == "Deleting…"
+
+    # A genuinely deployed stack keeps the green badge.
+    ok = DataMigrationState()
+    ok.set_cdc_stack_phase("running", status="CREATE_COMPLETE")
+    assert _cdc_prep_ready_badge(ok) == ("Ready", "positive")
+    # And so does one whose raw status was never recorded (no false alarm).
+    bare = DataMigrationState()
+    bare.set_cdc_stack_phase("running")
+    assert _cdc_prep_ready_badge(bare) == ("Ready", "positive")
+
+
+def test_cdc_prep_ready_branch_renders_the_status_message_not_already_deployed() -> None:
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_ui as cu
+
+    src = inspect.getsource(cu._render_cdc_infra_prep_section)
+    # The unstable branch must consult the RAW status and reuse the shared pure helper,
+    # and must return before the "already deployed" copy.
+    assert "cdc_stack_phase_status" in src
+    assert "cdc_unstable_message(_raw_status)" in src
+    assert "not is_stable_stack_status(_raw_status)" in src
+    # Re-poll only while the status can still change on its own.
+    assert "_is_inflight_stack_status(_raw_status)" in src
+
+
+def test_a_still_deleting_stack_is_not_reported_as_a_failed_teardown() -> None:
+    """The job settling is not the stack being gone -- and not a failure either.
+
+    ``stack_status_needs_cleanup`` is True for the ``*_IN_PROGRESS`` statuses as well as
+    the terminal ones, so a delete that was simply still running (a job that timed out, or
+    was reconciled after a restart) was announced as "CDC teardown failed — action
+    needed", telling the operator to retry a cleanup that was already working.
+    """
+    from dsql_migrator.ui.data_migration._cdc_status import (
+        settled_teardown_banner_state,
+    )
+
+    # Still working -> the RUNNING banner, not a failure.
+    assert settled_teardown_banner_state("DELETE_IN_PROGRESS") == "running"
+    assert settled_teardown_banner_state("ROLLBACK_IN_PROGRESS") == "running"
+    assert settled_teardown_banner_state("UPDATE_ROLLBACK_IN_PROGRESS") == "running"
+    # Terminal and needing action -> failed.
+    assert settled_teardown_banner_state("DELETE_FAILED") == "failed"
+    assert settled_teardown_banner_state("ROLLBACK_COMPLETE") == "failed"
+    assert settled_teardown_banner_state("CREATE_FAILED") == "failed"
+    # Gone / clean / unknown -> clear the banner.
+    assert settled_teardown_banner_state(None) is None
+    assert settled_teardown_banner_state("") is None
+    assert settled_teardown_banner_state("CREATE_COMPLETE") is None
+
+
+def test_the_banner_getter_uses_the_settled_state_helper() -> None:
+    # Structural: the decision must come from the shared helper, so the in-flight case
+    # cannot drift back to "failed" inside the closure where no test can reach it.
+    import inspect
+
+    from dsql_migrator.ui import app as app_mod
+
+    src = inspect.getsource(app_mod)
+    assert "_settled_teardown_banner_state(_last_status)" in src
+    assert '"state": _settled_state,' in src
+    # And the observed status is carried for the copy to echo.
+    assert '"status": _last_status,' in src
+
+
+def test_no_one_shot_poller_bare_returns_on_a_lost_job() -> None:
+    """A one-shot poll chain has no next tick, so a bare return kills it for good.
+
+    ``ui.timer(..., once=True)`` chains re-arm only by rendering again, so
+    ``except JobNotFoundError: return`` left the screen at IN_PROGRESS with a live spinner
+    for the rest of the session -- nothing remained to advance it, and only a restart
+    triggers the reconcile in ``session_persistence``. Checked structurally across both
+    pollers because each is a closure no test can call directly, and a behavioural test
+    of one does not protect the other.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import validation as val
+    from dsql_migrator.ui.data_migration import _full_load_ui as flu
+
+    targets = [
+        (flu, "_render_full_load_step"),
+        (val, "_install_poll_timer"),
+    ]
+    checked = 0
+    for module, func_name in targets:
+        src = inspect.getsource(getattr(module, func_name))
+        tree = ast.parse(textwrap_dedent(src))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ExceptHandler):
+                continue
+            name = ""
+            if isinstance(node.type, ast.Name):
+                name = node.type.id
+            if name != "JobNotFoundError":
+                continue
+            checked += 1
+            first = node.body[0]
+            assert not (
+                isinstance(first, ast.Return) and first.value is None
+            ), (
+                f"{func_name}: a JobNotFoundError handler bare-returns; it must either "
+                "re-arm (refresh a refreshable that installs the next timer) or do a "
+                "terminal reconcile + one full refresh"
+            )
+    assert checked >= 2, f"expected both pollers' handlers, saw {checked}"
+
+
+def textwrap_dedent(src: str) -> str:
+    import textwrap
+
+    return textwrap.dedent(src)
