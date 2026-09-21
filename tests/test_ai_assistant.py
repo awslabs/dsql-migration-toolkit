@@ -878,10 +878,60 @@ def test_verify_access_falls_back_when_the_configured_model_is_not_enabled() -> 
     assert "not enabled" in result.detail
 
 
-def test_verify_access_does_not_fall_back_on_access_denied() -> None:
-    # ACCESS_DENIED is a missing IAM permission on the caller, not a property of the
-    # model, so another model cannot fix it. Retrying would add latency and bury the
-    # real cause behind a fallback's error.
+def test_verify_access_falls_back_when_the_configured_model_is_account_denied() -> None:
+    """A model the ACCOUNT cannot invoke must reach the fallback chain.
+
+    Reproduces the measured failure: Bedrock answers AccessDeniedException -- not
+    ValidationException -- for a model this account has no access to, so keying the
+    fallback on MODEL_NOT_ENABLED alone made the chain unreachable in the one case it
+    exists for, and the operator was told to fix an IAM policy that was fine.
+    """
+    from dsql_migrator.ui.ai_assist import (
+        BEDROCK_MODEL_FALLBACKS,
+        DEFAULT_BEDROCK_MODEL_ID,
+    )
+
+    fallback = BEDROCK_MODEL_FALLBACKS[0]
+
+    class _AccountDeniedClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+            self.model_ids: list[str] = []
+
+        def invoke_model(self, **kwargs: Any) -> dict[str, Any]:
+            self.calls.append(kwargs)
+            self.model_ids.append(kwargs["modelId"])
+            if kwargs["modelId"] == fallback:
+                return _FakeBedrockRuntimeClient("pong").invoke_model(**kwargs)
+            raise _client_error("AccessDeniedException")
+
+    client = _AccountDeniedClient()
+    assistant = AiConversionAssistant(
+        AiAssistConfig(
+            enabled=True, model_id=DEFAULT_BEDROCK_MODEL_ID, region="ap-northeast-2"
+        ),
+        client=client,
+    )
+
+    result = assistant.verify_access()
+
+    assert result.ok is True
+    assert result.model_id == fallback
+    assert client.model_ids == [DEFAULT_BEDROCK_MODEL_ID, fallback]
+    # The denial variant names both models AND both remediations (model access OR the
+    # deployment's InvokeModel scope) -- the not-enabled wording names only one.
+    assert fallback in result.detail
+    assert DEFAULT_BEDROCK_MODEL_ID in result.detail
+    assert "not authorized to invoke" in result.detail
+    assert "bedrock:InvokeModel" in result.detail
+    assert "not enabled" not in result.detail
+
+
+def test_verify_access_reports_the_configured_reason_when_the_fallback_is_denied_too(
+) -> None:
+    # Both denied: the verdict is still the configured model's, with the IAM/re-auth
+    # remediation. One extra minimal InvokeModel is the deliberate cost of telling an
+    # account-level model denial apart from a real permission gap.
     client = _RaisingBedrockRuntimeClient(_client_error("AccessDeniedException"))
     assistant = AiConversionAssistant(
         AiAssistConfig(enabled=True, region="us-east-1"), client=client
@@ -891,7 +941,25 @@ def test_verify_access_does_not_fall_back_on_access_denied() -> None:
 
     assert result.ok is False
     assert result.reason == "ACCESS_DENIED"
-    assert len(client.calls) == 1, "must not retry a fallback on an IAM failure"
+    assert result.model_id == assistant._config.model_id
+    assert "bedrock:InvokeModel" in result.detail
+    assert len(client.calls) == 2, "the fallback is probed exactly once"
+
+
+def test_verify_access_does_not_probe_a_fallback_on_expired_credentials() -> None:
+    # A credential-identity failure is NOT fixable by another model, so it must return
+    # immediately. This is what keeps the code-only split honest: only the
+    # authorization-ambiguous denial codes reach the chain.
+    client = _RaisingBedrockRuntimeClient(_client_error("ExpiredTokenException"))
+    assistant = AiConversionAssistant(
+        AiAssistConfig(enabled=True, region="us-east-1"), client=client
+    )
+
+    result = assistant.verify_access()
+
+    assert result.ok is False
+    assert result.reason == "ACCESS_DENIED"
+    assert len(client.calls) == 1, "must not retry a fallback on an expired credential"
 
 
 def test_verify_access_reports_the_configured_models_reason_not_the_fallbacks() -> None:

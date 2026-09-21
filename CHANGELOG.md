@@ -5,6 +5,76 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.480
+
+### Fixed
+
+- **A Schema-Conversion edit was never persisted, so a task restart could silently revert it.**
+  `capture_session_snapshot` has always recorded `edited_target_ddls`, `preserve_foreign_keys` and
+  `ticked_node_ids` — but the dirty-check that decides whether to WRITE a snapshot
+  (`session_signature`) did not look at any of them, so an edit-only change left the signature
+  unchanged and the save was skipped entirely. The per-table primary-key picker stores its answer
+  nowhere else, so choosing a server-generated IDENTITY key (or turning FK preservation off) was
+  lost on a Fargate task replacement unless some unrelated state happened to change too — and
+  because the cut-over "Sync identity sequences" action is derived from that DDL, it then vanished
+  from the runbook. The signature now includes a cheap term for all three (key names + a hash of
+  the pairs; never the DDL text, so the per-poll cost stays a dict walk and a large inventory is
+  still not re-serialized on every refresh).
+  - A reported diagnosis of the same symptom — that a restart empties the evaluation/conversion
+    state the cut-over gates count — was **not** the cause and is not what changed: the snapshot
+    does restore the inventory, the edited DDLs and the preserve-FK flag, and a real
+    capture → JSON → restore round trip onto fresh state keeps both cut-over counts intact. A new
+    test pins exactly that, since nothing covered it before.
+- **The cut-over runbook could render empty and read as "nothing left to do".** Both gate counts
+  are 0 both when there is genuinely nothing to apply AND when the Step 1/2 schema inputs are not
+  loaded in this session, and 0 hides the action — so "done" and "can't tell" looked identical on
+  the one screen that decides whether referential integrity is enforced. The two zeros are now
+  distinguished: the runbook shows a warning naming the missing input and the recovery, and the
+  finish gate returns a new `"unknown"` state that soft-blocks "I've cut over" (the explicit
+  "cut over without enforced foreign keys" opt-out still clears it, so it is not a trap). The
+  count helpers themselves are untouched — 0 for a schema with no foreign keys, or for the default
+  integer-PK strategy, is correct and stays pinned. No target-catalog probe was added: the count
+  must match what the FK pass will actually render from the source inventory plus your conversion
+  choices, which a `pg_constraint` read cannot reconstruct, and this screen re-renders on every
+  refresh so it must never scan the target.
+- **The cut-over "I have frozen source writes and CDC has drained to zero lag" tick no longer
+  clears itself.** The gate's entire memory was a per-render local with no bound value, so any
+  `refresh()` — including the foreign-key apply's own completion refresh, and the refresh on a
+  click while a pass was running — redrew the checkbox unchecked and re-disabled the button.
+  That landed on exactly the remediation loop the screen recommends ("resolve the orphan rows,
+  then click Apply foreign keys again — it is idempotent"). Applying foreign keys does not unfreeze
+  the source, so the attestation is still true afterwards; it is now latched on `ValidationState`,
+  and a later un-tick still re-disables the button. Deliberately NOT snapshotted — a claim that
+  writes are frozen must not survive into a session restored hours later — and cleared on every
+  event that could make it stale: a new verdict, a re-run, a target-schema REPLACE, and Start over.
+- **The Bedrock preflight's fallback model was unreachable in the one case it exists for.** The
+  fallback was tried only for `MODEL_NOT_ENABLED`, but Bedrock reports "this model is not available
+  for this account" as `AccessDeniedException` — so the chain was skipped and the operator was told
+  to add a `bedrock:InvokeModel` permission that was already correct (measured: a `global.` profile
+  denied for the account while a different model answered on the same credentials). A denial whose
+  code is authorization-ambiguous (`AccessDeniedException` / `AccessDenied` /
+  `UnauthorizedException`) now reaches the fallback; credential-identity denials (expired token,
+  bad signature) still return immediately, because another model cannot fix those. Classification
+  is still by error **code** only — no message body is ever read (Property 7) — and the two cases
+  are told apart by the *outcome*: if the fallback answers, the configured model is un-granted or
+  outside this deployment's `BedrockModelArns` scope (both named in the message); if it is denied
+  too, the verdict stays the configured model's original `ACCESS_DENIED` reason.
+  - **Companion:** a preflight that passes on a fallback now adopts that model. Previously it
+    reported success while leaving the denied model configured, so every real call still failed —
+    the check proved a working model existed and then nothing used it. The status line, the toast
+    and the dropdown all name the substitution, and verification resets to unverified, so nothing
+    claims green.
+  - The operator-facing IAM comment in `deploy/cloudformation.yaml` and the `.kiro` spec's error
+    mapping asserted the same refuted premise and are corrected.
+
+### Removed
+
+- `target_lag_seconds` (MSK Connect controller) is deleted. It was exported but had no call site
+  anywhere in the app: per-table "Stream lag" uses `ReplicationLagMs` and the headline uses the
+  connector state's `lag_seconds`, so the only thing it did was suggest to a reader that some
+  path computes lag from the target's `max(ts)`. Its five tests go with it — they guaranteed the
+  behaviour of code nothing ran.
+
 ## v0.1.479
 
 ### Removed

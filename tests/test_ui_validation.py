@@ -1964,6 +1964,8 @@ class _CutoverUi:
         # Records (label, on_change) for every checkbox so a test can drive a
         # confirmation toggle (the cut-over FK-apply CDC-drained gate).
         self.checkboxes: list[tuple[str, object]] = []
+        # The ``value=`` each checkbox was created with, in the same order.
+        self.checkbox_values: list[object] = []
 
     def card(self, *_a, **_k):
         return _CutoverEl()
@@ -1972,6 +1974,9 @@ class _CutoverUi:
         if text:
             self.texts.append(str(text))
         self.checkboxes.append((str(text), kwargs.get("on_change")))
+        # Recorded separately so the 2-tuple unpacking above keeps working: the double
+        # ignores props/value, so an initial tick can only be asserted from here.
+        self.checkbox_values.append(kwargs.get("value"))
         return _CutoverEl()
 
     def row(self, *_a, **_k):
@@ -2507,6 +2512,174 @@ def test_cutover_section_apply_foreign_keys_blocked_until_cdc_drained_confirmed(
     on_change(SimpleNamespace(value=False))
     on_click()
     assert provider_calls == [True]  # unchanged -- still gated
+
+
+def test_cutover_fk_confirmation_survives_a_refresh() -> None:
+    """A latched "CDC has drained" tick must not be forgotten by the next render.
+
+    The gate's only memory used to be a per-render local, so ANY refresh -- including the
+    apply's own completion refresh -- redrew the checkbox unchecked and re-disabled the
+    button. That hit the remediation loop this screen itself recommends for skipped /
+    failed keys ("click Apply foreign keys again -- it is idempotent"), and applying
+    foreign keys does not unfreeze the source, so the attestation was still true.
+    """
+    from dsql_migrator.ui.validation import _render_cutover_section
+
+    provider_calls: list = []
+    ui = _RecheckUi()
+    _render_cutover_section(
+        ui, _cutover_summary(), _no_drift(), cdc_in_use=True,
+        fk_apply_provider=lambda: provider_calls.append(True),
+        fk_apply_result=(1, 1, 0),  # one skipped -> the retry the screen recommends
+        fk_pending_count=2,
+        cdc_drained_confirmed=True,
+    )
+
+    # The checkbox is re-rendered already ticked...
+    assert True in ui.checkbox_values
+    # ...and Apply fires on the FIRST click, with no re-tick.
+    fk_buttons = [(t, cb) for t, cb in ui.buttons if "Apply foreign keys" in t]
+    assert len(fk_buttons) == 1
+    fk_buttons[0][1]()
+    assert provider_calls == [True]
+
+
+def test_cutover_fk_confirmation_is_latched_onto_the_state() -> None:
+    # The toggle reports both directions to the caller, so ValidationState -- not the
+    # render -- owns the answer.
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.validation import _render_cutover_section
+
+    latched: list = []
+    ui = _RecheckUi()
+    _render_cutover_section(
+        ui, _cutover_summary(), _no_drift(), cdc_in_use=True,
+        fk_apply_provider=lambda: None,
+        fk_apply_result=None,
+        fk_pending_count=1,
+        on_cdc_drained_change=latched.append,
+    )
+    confirm = [(t, cb) for t, cb in ui.checkboxes if "CDC has drained" in t]
+    assert len(confirm) == 1
+    _text, on_change = confirm[0]
+
+    on_change(SimpleNamespace(value=True))
+    assert latched == [True]
+    on_change(SimpleNamespace(value=False))
+    assert latched == [True, False]
+
+
+def test_validation_state_clears_the_drain_confirmation() -> None:
+    """The attestation must not outlive the state it describes."""
+    from dsql_migrator.ui.validation import ValidationState, ValidationStore
+
+    state = ValidationState()
+    assert state.cutover_cdc_drained_confirmed is False
+
+    state.set_cutover_cdc_drained_confirmed(True)
+    assert state.cutover_cdc_drained_confirmed is True
+    state.clear_cutover_outcomes()  # a target-schema REPLACE
+    assert state.cutover_cdc_drained_confirmed is False
+
+    state.set_cutover_cdc_drained_confirmed(True)
+    state.clear_outputs()  # a re-run is starting
+    assert state.cutover_cdc_drained_confirmed is False
+
+    state.set_cutover_cdc_drained_confirmed(True)
+    state.set_result(_report())  # a new verdict read the source again
+    assert state.cutover_cdc_drained_confirmed is False
+
+    state.set_cutover_cdc_drained_confirmed(True)
+    store = ValidationStore()
+    store._states["S1"] = state  # type: ignore[attr-defined]
+    store.reset_in_place("S1")  # Start over
+    assert (
+        store.get_or_create("S1").cutover_cdc_drained_confirmed is False
+    )
+
+
+def test_the_drain_confirmation_is_never_snapshotted() -> None:
+    # A freeze attestation is a claim about a moment: a session restored hours later must
+    # not still assert that source writes are frozen. Guard it at the source so nobody
+    # "fixes" the restart case by persisting it.
+    import inspect
+
+    from dsql_migrator.core import session_state_store
+    from dsql_migrator.ui import session_persistence
+
+    for module in (session_persistence, session_state_store):
+        assert "cutover_cdc_drained_confirmed" not in inspect.getsource(module)
+
+
+def test_cutover_finish_gate_is_unknown_when_the_schema_inputs_are_missing() -> None:
+    """An indeterminate FK count must not paint the finish button green.
+
+    Both cut-over gates answer 0 when the Step 1/2 state they read is absent, and 0
+    normally means "nothing to apply" -- which would let an operator acknowledge cut over
+    on a CDC migration with zero enforced foreign keys and no warning anywhere.
+    """
+    from dsql_migrator.ui.validation import cutover_finish_fk_gate
+
+    assert cutover_finish_fk_gate(
+        cdc_in_use=True, fk_pending_count=0, fk_apply_result=None,
+        proceed_without_fks=False, inputs_unknown=True,
+    ) == "unknown"
+    # Full-Load-only is still never gated here.
+    assert cutover_finish_fk_gate(
+        cdc_in_use=False, fk_pending_count=0, fk_apply_result=None,
+        proceed_without_fks=False, inputs_unknown=True,
+    ) is None
+    # The explicit opt-out still clears it -- a soft-block, not a trap.
+    assert cutover_finish_fk_gate(
+        cdc_in_use=True, fk_pending_count=0, fk_apply_result=None,
+        proceed_without_fks=True, inputs_unknown=True,
+    ) is None
+    # And a known-zero is unchanged (no new blocking for a schema with no FKs).
+    assert cutover_finish_fk_gate(
+        cdc_in_use=True, fk_pending_count=0, fk_apply_result=None,
+        proceed_without_fks=False,
+    ) is None
+
+
+def test_cutover_runbook_says_it_cannot_confirm_when_inputs_are_missing() -> None:
+    # Without the Step 1/2 inputs neither action can be offered, so the runbook would
+    # render as though nothing were outstanding. It must say "unknown" instead.
+    from dsql_migrator.ui.validation import _render_cutover_section
+
+    ui = _CutoverUi()
+    _render_cutover_section(
+        ui, _cutover_summary(), _no_drift(), cdc_in_use=True,
+        fk_apply_provider=lambda: None,
+        fk_apply_result=None,
+        fk_pending_count=0,
+        identity_pending_count=0,
+        inputs_unknown=True,
+    )
+    blob = " ".join(ui.texts)
+    assert "Can't confirm foreign keys / identity sequences" in blob
+    assert "not \"nothing to do\"" in blob, blob
+
+
+def test_cutover_gate_inputs_missing_distinguishes_absent_state() -> None:
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.evaluation import EvaluationState
+    from dsql_migrator.ui.schema_conversion import SchemaConversionState
+    from dsql_migrator.ui.validation import _cutover_gate_inputs_missing
+
+    assert _cutover_gate_inputs_missing(None, None, "S1") is True
+    assert _cutover_gate_inputs_missing(
+        SimpleNamespace(get_or_create=lambda _s: EvaluationState()),
+        SimpleNamespace(get=lambda _s: None),
+        "S1",
+    ) is True
+    # A conversion state with no evaluation result is still indeterminate.
+    assert _cutover_gate_inputs_missing(
+        SimpleNamespace(get_or_create=lambda _s: EvaluationState()),
+        SimpleNamespace(get=lambda _s: SchemaConversionState()),
+        "S1",
+    ) is True
 
 
 def test_cutover_section_full_load_reoffers_skipped_foreign_keys() -> None:

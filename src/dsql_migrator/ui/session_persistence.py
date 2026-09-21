@@ -611,6 +611,37 @@ def _ai_conversation_sig(conv: object) -> tuple:
     )
 
 
+def _conversion_edit_sig(conv_state: object) -> tuple:
+    """A cheap signature of the Schema-Conversion EDITS (no DDL text copied).
+
+    ``capture_session_snapshot`` persists ``edited_target_ddls``,
+    ``preserve_foreign_keys`` and ``ticked_node_ids``, but the dirty-check used to omit
+    all three -- so a change to any of them did not make the signature move and
+    ``_persist_session`` skipped the write entirely. The per-table PK-strategy picker
+    stores its answer ONLY in ``edited_target_ddls`` (and the cut-over "Sync identity
+    sequences" gate is derived from it), so choosing a server-generated IDENTITY key was
+    silently lost on a task replacement unless some unrelated state happened to change
+    too; the same held for turning FK preservation off, which came back on.
+
+    Cheap by construction: key names plus ``hash`` of the (key, ddl) pairs -- CPython
+    caches ``str.__hash__``, so after the first signature per edit this is a dict walk,
+    never a re-hash of the DDL text. The tuple is only ever compared with another tuple
+    from the SAME process (``_LAST_SESSION_SIGNATURE`` is a module-level dict), so
+    per-process hash randomization is irrelevant.
+    """
+    if conv_state is None:
+        return (0,)
+    edited = getattr(conv_state, "edited_target_ddls", None) or {}
+    ticked = getattr(conv_state, "ticked_node_ids", None)
+    return (
+        len(edited),
+        tuple(sorted(edited)),
+        hash(frozenset(edited.items())),
+        bool(getattr(conv_state, "preserve_foreign_keys", True)),
+        tuple(ticked) if ticked else None,
+    )
+
+
 def session_signature(
     session: object,
     eval_state: object,
@@ -694,6 +725,11 @@ def session_signature(
         # triggers a snapshot save (and a re-run that replaces it does too). Cheap:
         # a bool + timestamp, never the report itself.
         _validation_sig(validation_state),
+        # Schema-Conversion edits (edited DDLs, the preserve-FK toggle, ticked nodes).
+        # Without this the snapshot was never written for an edit-only change, so a PK
+        # strategy chosen in Step 2 -- and with it the cut-over "Sync identity sequences"
+        # action -- silently reverted on a task replacement.
+        _conversion_edit_sig(conv_state),
     )
 
 

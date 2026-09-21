@@ -170,7 +170,7 @@ Parameters:
   # default and refresh the tag to the released version.
   ContainerImageUri:
     Type: String
-    Default: public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.477
+    Default: public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.479
     Description: >
       App container image URI. Defaults to the published ECR Public image, so a
       normal deploy needs NO image build -- Fargate pulls it directly (works from
@@ -1263,10 +1263,13 @@ Resources:
               # Anthropic Messages body anyway), and it is never a blanket `*`. The
               # region is `*` on BOTH so a BedrockRegion different from the deploy
               # region still resolves (the "Region" field on the Connect form).
-              # NB: broad IAM does NOT bypass account-level Bedrock model access --
-              # each model must still be enabled in the account/region (otherwise the
-              # call fails MODEL_NOT_ENABLED, not AccessDenied). Set BedrockModelArns
-              # to narrow this to specific ARN(s) or to allow a non-Anthropic model.
+              # NB: broad IAM does NOT bypass account-level Bedrock model access -- each
+              # model must still be granted in the account/region. Bedrock reports that
+              # denial as AccessDeniedException (NOT ValidationException), so it looks
+              # exactly like a missing IAM permission from the error code alone; the
+              # preflight therefore probes its fallback model once to tell the two apart
+              # and says which fix applies. Set BedrockModelArns to narrow this to
+              # specific ARN(s) or to allow a non-Anthropic model.
               Fn::If:
                 - HasBedrockModelArnsOverride
                 - Ref: BedrockModelArns

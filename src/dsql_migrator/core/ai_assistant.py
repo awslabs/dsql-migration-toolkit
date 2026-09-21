@@ -418,6 +418,22 @@ _ACCESS_DENIED_CODES = frozenset(
 )
 
 
+def _error_code(exc: BaseException) -> str:
+    """Return a botocore ``ClientError``'s ``response['Error']['Code']``, or ``""``.
+
+    The ONLY thing read off an exception anywhere in this module's classification: never
+    the message, endpoint or any credential (Requirement 11.15 / Property 7). Shared by
+    both classifiers and by the preflight's fallback decision so there is one definition
+    of "which code was this".
+    """
+    response = getattr(exc, "response", None)
+    if isinstance(response, Mapping):
+        error = response.get("Error")
+        if isinstance(error, Mapping):
+            return str(error.get("Code") or "")
+    return ""
+
+
 def _classify_bedrock_error(exc: BaseException) -> UnavailableReason:
     """Map a boto/Bedrock exception to a credential-free unavailability reason.
 
@@ -428,12 +444,7 @@ def _classify_bedrock_error(exc: BaseException) -> UnavailableReason:
     exception text is intentionally not used, so no credential/endpoint detail
     can leak (Property 7).
     """
-    code = ""
-    response = getattr(exc, "response", None)
-    if isinstance(response, Mapping):
-        error = response.get("Error")
-        if isinstance(error, Mapping):
-            code = str(error.get("Code") or "")
+    code = _error_code(exc)
 
     if code in _ACCESS_DENIED_CODES:
         return "ACCESS_DENIED"
@@ -524,8 +535,31 @@ _MODEL_NOT_ENABLED_CODES = frozenset(
     }
 )
 
+# Denial codes a DIFFERENT model can plausibly fix, so the preflight's fallback chain
+# must be reachable from them. Bedrock reports "this model is not available for this
+# account" as AccessDeniedException -- NOT ValidationException -- so keying the fallback
+# on _MODEL_NOT_ENABLED_CODES alone made it unreachable in exactly the case it was
+# written for (measured: a global. inference profile denied for the account while a
+# different model answered on the same credentials).
+#
+# The credential-identity codes in _ACCESS_DENIED_CODES (ExpiredToken*, RequestExpired,
+# InvalidSignature*, SignatureDoesNotMatch, InvalidClientTokenId, InvalidAccessKeyId,
+# UnrecognizedClientException, AuthFailure) are deliberately NOT here: another modelId
+# provably cannot fix a bad or expired credential, so probing one would only add a round
+# trip and delay the real cause. This split is by error CODE only -- no message body is
+# ever read (Requirement 11.15 / Property 7).
+_MODEL_ACCESS_DENIED_CODES = frozenset(
+    {
+        "AccessDeniedException",
+        "AccessDenied",
+        "UnauthorizedException",
+    }
+)
 
-def _fallback_ok_detail(*, configured: str, used: str) -> str:
+
+def _fallback_ok_detail(
+    *, configured: str, used: str, denied: bool = False
+) -> str:
     """Detail for a preflight that passed on a fallback rather than the configured model.
 
     Says so explicitly rather than reporting a plain success: the operator picked a
@@ -533,9 +567,26 @@ def _fallback_ok_detail(*, configured: str, used: str) -> str:
     suggestions come from a model that is not actually reachable. Names both ids and
     the one action that restores their choice.
 
+    ``denied`` distinguishes the two ways the configured model can be unusable while
+    another answers. Without it, a model the ACCOUNT is not authorized to invoke was
+    described as merely "not enabled", which points at only one of the two fixes; the
+    denial wording names both (un-granted model access, or a deployment whose
+    ``bedrock:InvokeModel`` scope excludes the model). The phrase "not enabled" is kept
+    out of the denial variant so the two paths stay distinguishable.
+
     Contains only the two model ids and fixed prose -- no exception text, endpoint,
     or credential (Requirement 11.15 / Property 7).
     """
+    if denied:
+        return (
+            f"Amazon Bedrock access verified, but using {used} instead of the "
+            f"configured {configured}, which this account is not authorized to invoke "
+            "in this region. AI assist works and suggestions will come from the "
+            f"fallback model. To use {configured}, either grant its model access in the "
+            "Amazon Bedrock console for this account and region, or widen this "
+            "deployment's bedrock:InvokeModel scope (BedrockModelArns) to cover it, "
+            "then verify again."
+        )
     return (
         f"Amazon Bedrock access verified, but using {used} instead of the "
         f"configured {configured}, which is not enabled for this account in this "
@@ -558,12 +609,7 @@ def _classify_access_check_error(exc: BaseException) -> AccessCheckReason:
     the raw exception text, so no credential/endpoint detail can leak
     (Requirement 11.15 / Property 7).
     """
-    code = ""
-    response = getattr(exc, "response", None)
-    if isinstance(response, Mapping):
-        error = response.get("Error")
-        if isinstance(error, Mapping):
-            code = str(error.get("Code") or "")
+    code = _error_code(exc)
 
     if code in _ACCESS_DENIED_CODES:
         return "ACCESS_DENIED"
@@ -857,12 +903,18 @@ class AiConversionAssistant:
         (Requirement 11.16). It only checks connectivity/permission and does not
         change the AI suggestion review gate (Property 13).
         """
-        # Try the configured model, then the fallback chain -- but ONLY for
-        # MODEL_NOT_ENABLED. A `global.` inference profile can be ACTIVE in a region
-        # while this account still lacks access to it, which is the one failure a
-        # different model can actually fix. ACCESS_DENIED (missing IAM), THROTTLED,
-        # and UNKNOWN (connectivity) are properties of the caller or the network, so
-        # retrying another model would only add latency and bury the real cause.
+        # Try the configured model, then the fallback chain -- but only for the failures a
+        # DIFFERENT model can actually fix: MODEL_NOT_ENABLED, and a denial whose code is
+        # in _MODEL_ACCESS_DENIED_CODES. That second case is the common one and used to be
+        # excluded: a `global.` inference profile can be ACTIVE in a region while this
+        # account lacks access to it, and Bedrock reports that as AccessDeniedException,
+        # so the chain was unreachable in precisely the situation it exists for and the
+        # operator was told to fix an IAM policy that was not the problem.
+        #
+        # A credential-identity denial (expired token, bad signature) and THROTTLED /
+        # UNKNOWN (network) are properties of the caller or the network, so they still
+        # return immediately -- retrying another model would only add latency and bury the
+        # real cause. Classification stays code-only; no message body is read.
         first_reason: Optional[AccessCheckReason] = None
         for candidate in self._access_check_candidates():
             try:
@@ -878,7 +930,10 @@ class AiConversionAssistant:
                 reason = _classify_access_check_error(exc)
                 if first_reason is None:
                     first_reason = reason
-                if reason == "MODEL_NOT_ENABLED":
+                if reason == "MODEL_NOT_ENABLED" or (
+                    reason == "ACCESS_DENIED"
+                    and _error_code(exc) in _MODEL_ACCESS_DENIED_CODES
+                ):
                     continue
                 # Report the reason for the model the OPERATOR configured, not a
                 # fallback's -- an IAM gap on the fallback is not their problem.
@@ -898,14 +953,21 @@ class AiConversionAssistant:
                     _ACCESS_CHECK_DETAILS["OK"]
                     if candidate == self._config.model_id
                     else _fallback_ok_detail(
-                        configured=self._config.model_id, used=candidate
+                        configured=self._config.model_id,
+                        used=candidate,
+                        # A fallback reached after a DENIAL needs different remediation
+                        # from one reached after "not enabled": the configured model may
+                        # be un-granted for the account OR outside this deployment's
+                        # bedrock:InvokeModel scope, and the operator cannot tell which
+                        # from a sentence that only mentions model access.
+                        denied=first_reason == "ACCESS_DENIED",
                     )
                 ),
                 model_id=candidate,
                 region=self._config.region,
             )
 
-        # Every candidate reported not-enabled.
+        # Every candidate failed in a way a different model could have fixed.
         reason = first_reason or "MODEL_NOT_ENABLED"
         return AiAccessCheckResult(
             ok=False,

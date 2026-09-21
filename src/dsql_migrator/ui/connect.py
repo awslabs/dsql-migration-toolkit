@@ -1443,6 +1443,23 @@ def build_connect_page(
                 ai_status.classes(replace=f"text-sm {INLINE_HINT_TEXT[tone]}")
                 ai_status.set_text(display.message)
                 ui.notify(display.message, type=display.notify_type)
+                # Adopt the model that actually ANSWERED. Without this, a preflight that
+                # passed on a fallback left the denied/not-enabled model configured, so
+                # every real call still failed -- the fallback proved a working model
+                # existed and then nothing used it. The status line and toast already name
+                # both ids, and the dropdown visibly moves, so the substitution is not
+                # silent; set_ai_assist resets verification, so nothing claims green.
+                answered = getattr(result, "model_id", None)
+                if getattr(result, "ok", False) and answered and answered != config.model_id:
+                    config = build_ai_assist_config(
+                        enabled=bool(ai_enabled.value),
+                        model_id=answered,
+                        region=ai_region.value,
+                    )
+                    state.set_ai_assist(config)
+                    ai_model.set_value(config.model_id)
+                    if on_state_change is not None:
+                        on_state_change()
                 # Turn the section badge green only on a CLEAN pass (a fallback pass is
                 # reported as a warning, not success, so it must not read as Verified).
                 # Record the verdict on the SESSION so the journey header and every

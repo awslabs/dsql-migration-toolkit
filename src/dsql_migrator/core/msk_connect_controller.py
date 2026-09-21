@@ -815,47 +815,8 @@ def build_msk_connect_controller(
     return MskConnectController(region, aws_profile=aws_profile)
 
 
-def target_lag_seconds(
-    cursor: object, qualified_table: str, ts_column: str, *, now: datetime
-) -> Optional[float]:
-    """Return end-to-end replication lag (seconds) from the DSQL target.
-
-    Computes ``now - max(ts_column)`` for ``qualified_table`` on the target: the
-    most recently applied row's source timestamp tells how far behind the sink
-    is, end-to-end (the most accurate lag signal, and free of any CloudWatch /
-    cdc-stack dependency). ``cursor`` is an open DB-API cursor on the DSQL
-    target. Returns ``None`` when the table is empty, the max is NULL, or any
-    query error occurs (UI shows "lag unknown").
-
-    The table/column names are quoted by splitting on the schema dot; they come
-    from the tool's own inventory (not user free-text), so this is safe for the
-    monitoring read. ``now`` is passed in so the computation is deterministic and
-    unit-testable.
-    """
-    parts = qualified_table.split(".")
-    quoted_table = ".".join('"' + p.replace('"', '""') + '"' for p in parts)
-    quoted_col = '"' + ts_column.replace('"', '""') + '"'
-    try:
-        cursor.execute(f"SELECT max({quoted_col}) FROM {quoted_table}")  # type: ignore[attr-defined]
-        row = cursor.fetchone()  # type: ignore[attr-defined]
-    except Exception:  # noqa: BLE001 - treated as "lag unknown"
-        return None
-    if not row or row[0] is None:
-        return None
-    max_ts = row[0]
-    if not isinstance(max_ts, datetime):
-        return None
-    # Normalize naive timestamps to UTC so the subtraction is well-defined.
-    if max_ts.tzinfo is None:
-        max_ts = max_ts.replace(tzinfo=timezone.utc)
-    reference = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
-    delta = (reference - max_ts).total_seconds()
-    return max(0.0, delta)
-
-
 __all__ = [
     "ConnectorHealth",
     "MskConnectController",
     "build_msk_connect_controller",
-    "target_lag_seconds",
 ]

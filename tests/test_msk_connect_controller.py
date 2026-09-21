@@ -19,7 +19,6 @@ from dsql_migrator.core.msk_connect_controller import (
     _DLQ_INITIAL_LOOKBACK_SECONDS,
     _METRIC_DIM_CACHE_TTL_SECONDS,
     MskConnectController,
-    target_lag_seconds,
 )
 
 
@@ -631,61 +630,6 @@ def test_match_metric_tables_prefers_exact_then_unambiguous_bare() -> None:
     assert _match_metric_tables(["orders"], discovered) == {}
     # Unknown table -> skipped.
     assert _match_metric_tables(["nope"], discovered) == {}
-
-
-# ---------------------------------------------------------------------------
-# target_lag_seconds (DSQL end-to-end lag)
-# ---------------------------------------------------------------------------
-
-
-class _FakeCursor:
-    def __init__(self, row: Any, *, raise_on_execute: bool = False):
-        self._row = row
-        self._raise = raise_on_execute
-        self.executed: list[str] = []
-
-    def execute(self, sql: str) -> None:
-        self.executed.append(sql)
-        if self._raise:
-            raise RuntimeError("boom")
-
-    def fetchone(self) -> Any:
-        return self._row
-
-
-_NOW = datetime(2026, 6, 22, 12, 0, 30, tzinfo=timezone.utc)
-
-
-def test_target_lag_computes_seconds_behind() -> None:
-    max_ts = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
-    cur = _FakeCursor((max_ts,))
-    lag = target_lag_seconds(cur, "cdc_demo.orders", "created_at", now=_NOW)
-    assert lag == 30.0
-    # Schema-qualified table is quoted part-wise.
-    assert 'FROM "cdc_demo"."orders"' in cur.executed[0]
-    assert 'max("created_at")' in cur.executed[0]
-
-
-def test_target_lag_naive_timestamp_treated_as_utc() -> None:
-    cur = _FakeCursor((datetime(2026, 6, 22, 12, 0, 0),))  # naive
-    assert target_lag_seconds(cur, "public.heartbeat", "ts", now=_NOW) == 30.0
-
-
-def test_target_lag_none_when_empty_table() -> None:
-    cur = _FakeCursor((None,))
-    assert target_lag_seconds(cur, "cdc_demo.orders", "created_at", now=_NOW) is None
-
-
-def test_target_lag_none_on_query_error() -> None:
-    cur = _FakeCursor((None,), raise_on_execute=True)
-    assert target_lag_seconds(cur, "cdc_demo.orders", "created_at", now=_NOW) is None
-
-
-def test_target_lag_never_negative() -> None:
-    # A target timestamp slightly ahead of now (clock skew) clamps to 0.
-    future = datetime(2026, 6, 22, 12, 1, 0, tzinfo=timezone.utc)
-    cur = _FakeCursor((future,))
-    assert target_lag_seconds(cur, "cdc_demo.orders", "created_at", now=_NOW) == 0.0
 
 
 # ---------------------------------------------------------------------------

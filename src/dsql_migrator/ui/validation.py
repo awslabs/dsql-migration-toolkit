@@ -628,6 +628,7 @@ def cutover_finish_fk_gate(
     fk_pending_count: int,
     fk_apply_result: "Optional[tuple[int, int, int]]",
     proceed_without_fks: bool,
+    inputs_unknown: bool = False,
 ) -> "Optional[str]":
     """Whether "I've cut over" is soft-blocked on preserved foreign keys, and why. Pure.
 
@@ -641,15 +642,25 @@ def cutover_finish_fk_gate(
     * ``"pending"``   -- preserved FKs exist but the cut-over apply has NOT been run.
     * ``"incomplete"`` -- the apply ran but some FKs were skipped (orphans) or failed,
       so referential integrity is not fully enforced.
+    * ``"unknown"``    -- the schema inputs the FK count is derived from are not loaded
+      in this session, so the tool cannot say whether the deferred ``ADD CONSTRAINT``s
+      are still outstanding. Checked BEFORE the ``fk_pending_count <= 0`` clear, because
+      that count is itself 0 in exactly this case: an indeterminate denominator must not
+      paint the finish button green (the same rule Full Load applies to a 0 denominator).
 
     ``proceed_without_fks`` is the operator's explicit "cut over without enforced FKs"
-    opt-out; when set the gate clears. Full-Load-only runs are never gated here (their
-    FKs are applied automatically at load end, and FIX 9 re-offers any that were
-    skipped/failed on the runbook itself).
+    opt-out; when set the gate clears -- including for ``"unknown"``, so this is a
+    soft-block with a stated escape hatch, never a trap. Full-Load-only runs are never
+    gated here (their FKs are applied automatically at load end, and FIX 9 re-offers any
+    that were skipped/failed on the runbook itself).
     """
-    if not cdc_in_use or fk_pending_count <= 0:
+    if not cdc_in_use:
         return None
     if proceed_without_fks:
+        return None
+    if inputs_unknown:
+        return "unknown"
+    if fk_pending_count <= 0:
         return None
     if fk_apply_result is None:
         return "pending"
@@ -1352,6 +1363,23 @@ class ValidationState:
         # the deliberate "I'll enforce integrity in the app" decision that unblocks the
         # acknowledgement. Set on the UI thread; a fresh verdict resets it.
         self.proceed_without_foreign_keys: bool = False
+        # The operator's attestation that source writes are frozen and CDC has drained to
+        # zero lag -- the gate on the cut-over "Apply foreign keys" button for a CDC
+        # migration (the ADD CONSTRAINT pass must not run while the sink still streams
+        # rows out of parent-before-child order). It lives HERE, not in the render, because
+        # the gate's entire memory used to be a per-render local: any ``refresh()`` --
+        # including the apply's own completion refresh -- recreated the checkbox unchecked
+        # and re-disabled the button, so the remediation loop the screen itself recommends
+        # ("resolve the orphan rows, then click Apply again -- it is idempotent") demanded
+        # a re-tick every time. Applying foreign keys does not unfreeze anything, so the
+        # attestation is still true afterwards.
+        #
+        # Deliberately NOT in ``SessionSnapshot``: this is a claim about the world at a
+        # moment, and a session restored hours later must not still assert that writes are
+        # frozen. It therefore dies with the process, and is cleared here on every event
+        # that could make it stale (a new verdict, a re-run, a target-schema replace,
+        # Start over).
+        self.cutover_cdc_drained_confirmed: bool = False
         self._result: Optional[ValidationReport] = None
         self._error: Optional[str] = None
         # Per-table RE-CHECK track (the same single job slot as a full run --
@@ -1451,6 +1479,19 @@ class ValidationState:
             self._cutover_fk_apply_job_id = None
             self._cutover_fk_apply_progress = None
             self.proceed_without_foreign_keys = False
+            # The target's tables were just dropped and recreated, so whatever the
+            # operator attested about a drained stream belongs to the previous schema.
+            self.cutover_cdc_drained_confirmed = False
+
+    def set_cutover_cdc_drained_confirmed(self, confirmed: bool) -> None:
+        """Latch the operator's "source frozen, CDC drained to zero lag" attestation.
+
+        Session-only and never snapshotted (see ``__init__``): it gates the cut-over
+        foreign-key apply, and it exists so the gate survives a ``refresh()`` instead of
+        being forgotten by the render that drew it.
+        """
+        with self._lock:
+            self.cutover_cdc_drained_confirmed = bool(confirmed)
 
     def set_cutover_fk_apply_job(self, job_id: Optional[str]) -> None:
         """Record the submitted cut-over foreign-key apply job (re-entrancy guard)."""
@@ -1618,6 +1659,9 @@ class ValidationState:
             self._cutover_fk_apply_job_id = None
             self._cutover_fk_apply_progress = None
             self.proceed_without_foreign_keys = False
+            # A new comparison means the source was read again, so a freeze/drain
+            # attestation made before it no longer describes the current state.
+            self.cutover_cdc_drained_confirmed = False
 
     def set_identity_sync(
         self,
@@ -1766,6 +1810,7 @@ class ValidationState:
             self._cutover_fk_apply_job_id = None
             self._cutover_fk_apply_progress = None
             self.proceed_without_foreign_keys = False
+            self.cutover_cdc_drained_confirmed = False
 
 
 @dataclass
@@ -2758,6 +2803,32 @@ def _cutover_pending_foreign_keys(
     return sum(len(conv.foreign_key_ddls) for conv in applied.values())
 
 
+def _cutover_gate_inputs_missing(
+    eval_store: "Optional[EvaluationStore]",
+    conversion_store: "Optional[Any]",
+    session_id: str,
+) -> bool:
+    """Whether the cut-over gates have no schema inputs to count from.
+
+    ``_cutover_pending_foreign_keys`` / ``_cutover_pending_identity_tables`` answer 0
+    both when there is genuinely nothing to apply AND when the evaluation / conversion
+    state they read is absent -- and 0 hides the corresponding runbook action. Those
+    semantics are correct and pinned, so this is a SEPARATE predicate: it tells the
+    render which of the two zeros it is looking at, so "nothing to do" and "can't tell"
+    stop rendering identically (an empty runbook that reads as done).
+
+    Pure: no DB, no target-catalog read. The cut-over screen re-renders on every
+    refresh, so it must never scan the target -- the O(rows) orphan pre-gate is behind a
+    button for the same reason.
+    """
+    if conversion_store is None or eval_store is None:
+        return True
+    if conversion_store.get(session_id) is None:
+        return True
+    result = eval_store.get_or_create(session_id).result
+    return result is None or result.inventory is None
+
+
 def _cutover_pending_identity_tables(
     session: object,
     eval_store: "Optional[EvaluationStore]",
@@ -3030,6 +3101,12 @@ def build_cutover_screen(
         _identity_pending = _cutover_pending_identity_tables(
             session, eval_store, conversion_store, session_id
         )
+        # Both counts above are 0 when their schema inputs are missing, and 0 hides the
+        # action. Distinguish "nothing to apply" from "can't tell" so a session without
+        # those inputs is told so instead of shown a silently complete runbook.
+        _gate_inputs_unknown = _cutover_gate_inputs_missing(
+            eval_store, conversion_store, session_id
+        )
 
         # Dev-only UI review: with no clean verdict, synthesize a ready summary so
         # the runbook itself can be reviewed without running the whole workflow.
@@ -3176,6 +3253,9 @@ def build_cutover_screen(
             fk_apply_result=validation_state.cutover_fk_apply,
             fk_pending_count=_fk_pending,
             identity_pending_count=_identity_pending,
+            cdc_drained_confirmed=validation_state.cutover_cdc_drained_confirmed,
+            on_cdc_drained_change=validation_state.set_cutover_cdc_drained_confirmed,
+            inputs_unknown=_gate_inputs_unknown,
         )
 
         done = get_status(session.workflow, WorkflowStep.CUT_OVER) is StepStatus.DONE
@@ -3203,26 +3283,42 @@ def build_cutover_screen(
                     fk_pending_count=_fk_pending,
                     fk_apply_result=validation_state.cutover_fk_apply,
                     proceed_without_fks=validation_state.proceed_without_foreign_keys,
+                    inputs_unknown=_gate_inputs_unknown,
                 )
                 if _fk_gate is not None:
                     _fk_noun = "foreign key" if _fk_pending == 1 else "foreign keys"
+                    if _fk_gate == "unknown":
+                        _gate_header = "Can't confirm whether foreign keys are applied"
+                        _gate_body = (
+                            "The schema inputs this check reads (the Step 1 evaluation "
+                            "and your Step 2 conversion choices) are not loaded in this "
+                            "session, so the tool cannot say whether the foreign keys "
+                            "deferred during CDC still need applying. Re-run Evaluation "
+                            "(or reload the page to resume the session) and come back, "
+                            "or explicitly choose to cut over without enforced foreign "
+                            "keys below."
+                        )
+                    elif _fk_gate == "pending":
+                        _gate_header = "Foreign keys are not applied yet"
+                        _gate_body = (
+                            f"This schema's {_fk_pending} preserved {_fk_noun} were "
+                            "deferred during CDC and have NOT been applied to the target "
+                            "yet. Use \"Apply foreign keys\" above before finishing, or "
+                            "explicitly choose to cut over without them below."
+                        )
+                    else:
+                        _gate_header = "Foreign keys are not applied yet"
+                        _gate_body = (
+                            "Some preserved foreign keys were skipped (orphan rows) or "
+                            "failed to apply, so referential integrity is not fully "
+                            "enforced. Use \"Apply foreign keys\" above before finishing, "
+                            "or explicitly choose to cut over without them below."
+                        )
                     render_notice(
                         ui,
                         tone="warning",
-                        header="Foreign keys are not applied yet",
-                        body=(
-                            (
-                                f"This schema's {_fk_pending} preserved {_fk_noun} were "
-                                "deferred during CDC and have NOT been applied to the "
-                                "target yet. "
-                                if _fk_gate == "pending"
-                                else "Some preserved foreign keys were skipped (orphan "
-                                "rows) or failed to apply, so referential integrity is "
-                                "not fully enforced. "
-                            )
-                            + "Use \"Apply foreign keys\" above before finishing, or "
-                            "explicitly choose to cut over without them below."
-                        ),
+                        header=_gate_header,
+                        body=_gate_body,
                     )
 
                     def _proceed_without_fks() -> None:
@@ -4361,6 +4457,9 @@ def _render_cutover_section(
     fk_apply_result: "Optional[tuple[int, int, int]]" = None,
     fk_pending_count: int = 0,
     identity_pending_count: int = 0,
+    cdc_drained_confirmed: bool = False,
+    on_cdc_drained_change: "Optional[Callable[[bool], None]]" = None,
+    inputs_unknown: bool = False,
 ) -> None:
     """Render the go-path cut-over runbook as its OWN titled section card.
 
@@ -4463,6 +4562,26 @@ def _render_cutover_section(
                     )
                     ui.label(text).classes("text-sm text-gray-700 leading-snug")  # type: ignore[attr-defined]
 
+        # Neither action below can be offered without the Step 1/2 schema inputs, and both
+        # gates read 0 when those are missing -- which renders as a runbook with nothing
+        # outstanding. Say so instead: an empty runbook must not be mistaken for a complete
+        # one on the screen that decides whether integrity is enforced.
+        if inputs_unknown:
+            render_notice(
+                ui,
+                tone="warning",
+                header="Can't confirm foreign keys / identity sequences",
+                body=(
+                    "The Step 1 evaluation and Step 2 conversion choices this runbook "
+                    "reads are not loaded in this session, so the tool cannot tell you "
+                    "whether foreign keys still need applying or identity sequences still "
+                    "need advancing — the two actions that normally appear here. Reload "
+                    "the page to resume the session, or re-run Evaluation and Schema "
+                    "Conversion, before you repoint. Treat this as \"unknown\", not "
+                    "\"nothing to do\"."
+                ),
+            )
+
         # Explicit foreign-key apply. For a CDC migration the FK ADD CONSTRAINTs were
         # DEFERRED during the stream (they must not exist while the sink applies rows out
         # of parent-before-child order — an FK violation would be dead-lettered), so this
@@ -4519,7 +4638,13 @@ def _render_cutover_section(
                 # stream, so it is never gated (pre-confirmed). The button element is held
                 # in a tiny mutable box so the confirmation toggle (rendered above it) can
                 # enable/disable it without a forward reference.
-                _fk_confirmed = {"ok": not cdc_in_use}
+                #
+                # The tick itself is LATCHED on ValidationState (``cdc_drained_confirmed``),
+                # not in this render: the box used to be the gate's only memory, so every
+                # refresh -- the apply's own completion refresh included -- cleared the
+                # checkbox and re-disabled the button, forcing a re-tick before the
+                # idempotent retry this screen recommends for skipped/failed keys.
+                _fk_confirmed = {"ok": (not cdc_in_use) or bool(cdc_drained_confirmed)}
                 _fk_btn_box: "dict[str, Any]" = {}
 
                 def _fk_apply_clicked() -> None:
@@ -4530,6 +4655,12 @@ def _render_cutover_section(
                 if cdc_in_use:
                     def _fk_confirm_toggle(event: object) -> None:
                         _fk_confirmed["ok"] = bool(getattr(event, "value", False))
+                        # Latch it so the next render starts from the operator's answer.
+                        # Deliberately no refresh() here: the button props are flipped
+                        # directly below, and refreshing would rebuild the whole section
+                        # on every tick.
+                        if on_cdc_drained_change is not None:
+                            on_cdc_drained_change(_fk_confirmed["ok"])
                         _btn = _fk_btn_box.get("btn")
                         if _btn is None:
                             return
@@ -4540,6 +4671,7 @@ def _render_cutover_section(
 
                     ui.checkbox(  # type: ignore[attr-defined]
                         "I have frozen source writes and CDC has drained to zero lag",
+                        value=bool(cdc_drained_confirmed),
                         on_change=_fk_confirm_toggle,
                     ).props("dense")
 
@@ -4550,8 +4682,12 @@ def _render_cutover_section(
                         on_click=_fk_apply_clicked,
                     ).props("color=primary outline no-caps")
                     if cdc_in_use:
-                        # Enabled only once the operator confirms CDC has drained.
-                        _fk_apply_btn.props("disable")
+                        # Enabled only once the operator confirms CDC has drained -- but a
+                        # latched confirmation must not be re-disabled on re-render, or the
+                        # tick would show ticked next to a dead button. Register the button
+                        # either way so a LATER un-tick still disables it.
+                        if not _fk_confirmed["ok"]:
+                            _fk_apply_btn.props("disable")
                         _fk_btn_box["btn"] = _fk_apply_btn
                     if fk_apply_result is not None:
                         _applied, _skipped, _failed = fk_apply_result
