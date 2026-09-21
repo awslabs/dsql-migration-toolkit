@@ -5,6 +5,38 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.485
+
+### Changed
+
+- **Raising the log level now actually helps you troubleshoot a migration.** The Settings tab's
+  level switch did take effect — it just had almost nothing to change. All it did was attach a
+  stacktrace to failure events that pass an exception, and only **3 of the 61** log call sites did,
+  so a participant who flipped to DEBUG while stuck on a schema apply, a CDC deploy or a foreign-key
+  pass saw a byte-identical log. Two things changed:
+  - **The switch now raises the data-path loggers too.** The traces that answer "which data was
+    moving when it broke" already existed — one DEBUG line per keyset export page and per import
+    batch, naming the table, the PK range in flight, rows attempted / inserted / skipped, the
+    conflict mode and the OCC retry count — but they hang off the `dsql_migrator` package logger,
+    settable only by `DSQL_MIGRATOR_LOG_LEVEL` **at start-up**, which a workshop participant cannot
+    do. One switch now moves both. Those lines go to the container log (stdout → CloudWatch Logs on
+    ECS); the downloadable activity file stays the audit trail.
+  - **Six more failure sites forward their exception**, so DEBUG attaches a stacktrace where
+    failures actually happen: the CDC lifecycle wrapper (a failed deploy / start / stop / teardown —
+    the action an operator is most likely to be stuck on, which had the exception in hand and
+    dropped it), both identity-sequence syncs, and all three foreign-key apply failures.
+  - The tab's description now says what DEBUG turns on and where those lines land, instead of
+    "DEBUG adds failure stacktraces to the activity log".
+
+### Security
+
+- **A natural-key PK value can no longer appear in the DEBUG trace.** The export/import trace names
+  the PK **range** in flight. That was reachable only via an env var plus a restart, so its own
+  docstring called a natural-key primary key "the operator's risk" — but the Settings switch now
+  enables it with one click, which would have put an email or account-number range a click away.
+  The range now uses the same withholding rule as a quarantined row's primary key: surrogate keys
+  (integer / bool / UUID) shown, anything else `<withheld>`.
+
 ## v0.1.484
 
 ### Added

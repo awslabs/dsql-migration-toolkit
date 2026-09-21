@@ -76,7 +76,8 @@ from dsql_migrator.core.watermark import (
 # lines record the PK range + count of each keyset page so a developer can trace
 # exactly which rows Full Load read, in what order. Guarded by ``isEnabledFor`` so
 # production (INFO) builds no strings and pays nothing. Logs PK values + counts
-# only -- NEVER row values (Property 7); a natural-key PK is the operator's risk.
+# only -- NEVER row values (Property 7), and a NATURAL-key PK value is withheld
+# (`<withheld>`) because the Settings tab can enable this trace with one click.
 _LOGGER = logging.getLogger(__name__)
 
 # Default rows fetched per keyset page. A page is bounded by this value, so a
@@ -885,8 +886,14 @@ def keyset_stream(
         if _LOGGER.isEnabledFor(logging.DEBUG):
             single = len(pk_columns) == 1
             pk_repr = pk_columns[0] if single else pk_columns
+            from dsql_migrator.core.batched_import import _safe_key_value
+
+            # Same withholding rule as a quarantine record's pk: the Settings tab can now
+            # enable this trace, so a natural-key PK range must not be one click away.
             lo = first_key[0] if (single and first_key is not None) else first_key
             hi = last_key[0] if (single and last_key is not None) else last_key
+            lo = _safe_key_value(lo) if single else lo
+            hi = _safe_key_value(hi) if single else hi
             _LOGGER.debug(
                 "export keyset page table=%s page=%d pk=%s range=[%s..%s] rows=%d",
                 table.name, page_index, pk_repr, lo, hi, page_count,

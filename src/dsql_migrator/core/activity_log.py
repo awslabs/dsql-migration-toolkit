@@ -311,14 +311,33 @@ def configure_activity_stdout_log(*, level: int = logging.INFO) -> None:
     logger.addHandler(handler)
 
 
-def set_activity_log_level(level: int) -> None:
-    """Change the activity logger's level at runtime (no restart needed).
+# The package logger the data-path traces hang off (``dsql_migrator.core.exporter`` and
+# ``...batched_import`` are its children). Set alongside the activity logger so ONE switch
+# turns troubleshooting on: flipping to DEBUG previously changed only whether a failure
+# event carried a stacktrace -- and only 3 of the 61 call sites pass an exception -- so an
+# operator who raised the level to diagnose a stuck migration saw an identical log. The
+# per-page / per-batch traces that answer "which rows were in flight when it failed"
+# already existed, but hung off THIS logger and could be enabled only by
+# DSQL_MIGRATOR_LOG_LEVEL at start-up, which a workshop participant cannot do.
+_PACKAGE_LOGGER_NAME = "dsql_migrator"
 
-    Lets an operator flip INFO<->DEBUG while troubleshooting without a redeploy;
-    at DEBUG, subsequent failure events carry the full stacktrace. Process-wide
-    (the activity logger is a singleton), which suits the single-task app.
+
+def set_activity_log_level(level: int) -> None:
+    """Change the activity AND data-path logger levels at runtime (no restart needed).
+
+    Lets an operator flip INFO<->DEBUG while troubleshooting without a redeploy. At DEBUG:
+    failure events carry a value-free stacktrace, AND the Full Load export/import traces
+    turn on -- one line per keyset page and per import batch, naming the table, the PK
+    range in flight (surrogate keys shown, a natural key withheld), rows attempted /
+    inserted / skipped, the conflict mode and the OCC retry count. That is what answers
+    "which data was being moved when it broke".
+
+    Process-wide (both loggers are singletons), which suits the single-task app. The
+    data-path lines go to the app's ordinary log stream (stdout -> CloudWatch Logs on ECS),
+    NOT the downloadable activity file, which stays the audit trail.
     """
     logging.getLogger(ACTIVITY_LOGGER_NAME).setLevel(level)
+    logging.getLogger(_PACKAGE_LOGGER_NAME).setLevel(level)
 
 
 def current_activity_log_level() -> int:

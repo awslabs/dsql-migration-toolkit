@@ -1704,6 +1704,21 @@ def _index_name_of(ddl: str) -> str:
 _SAFE_KEY_TYPES = (int, bool)
 
 
+def _safe_key_value(value: object) -> object:
+    """A key value safe to log: surrogate keys as-is, anything else ``<withheld>``.
+
+    The single-value form of :func:`format_key_values`, for the DEBUG keyset/batch range
+    trace where there is no column name to pair it with.
+    """
+    import uuid
+
+    if isinstance(value, bool) or isinstance(value, _SAFE_KEY_TYPES):
+        return value
+    if isinstance(value, uuid.UUID) or value is None:
+        return value
+    return "<withheld>"
+
+
 def format_key_values(
     columns: "Sequence[str]", row: "Mapping[str, Any]", *, limit: int = 200
 ) -> str:
@@ -1875,7 +1890,14 @@ def _batch_pk_range(work: "_BatchWork") -> tuple[object, object]:
     if len(work.key_columns) != 1 or not work.rows:
         return (None, None)
     pk = work.key_columns[0]
-    return (work.rows[0].get(pk), work.rows[-1].get(pk))
+    # WITHHELD for a natural key, exactly as a quarantine record's pk is. This trace used
+    # to be reachable only via DSQL_MIGRATOR_LOG_LEVEL + a restart, so its docstring called
+    # a natural-key PK "the operator's risk" -- but the Settings tab's level switch now
+    # turns it on, which would put an email/account-number range one click away.
+    return (
+        _safe_key_value(work.rows[0].get(pk)),
+        _safe_key_value(work.rows[-1].get(pk)),
+    )
 
 
 def _resolve_outcome(

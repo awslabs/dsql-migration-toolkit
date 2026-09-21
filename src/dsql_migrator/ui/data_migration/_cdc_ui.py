@@ -253,6 +253,7 @@ def _logged_cdc_lifecycle(action: str, *, detail: str, work):
                     f"{detail} — failed after {_elapsed()}: "
                     f"{type(exc).__name__}: {exc}"
                 ),
+                exc=exc,
             )
             raise
         if bool(getattr(handle, "cancelled", False)):

@@ -1630,7 +1630,14 @@ def _render_activity_log_controls(activity_log_path: str) -> None:
         with form_field(
             ui,
             label="Log level",
-            description="DEBUG adds failure stacktraces to the activity log.",
+            description=(
+                "DEBUG adds failure stacktraces to the activity log AND turns on the "
+                "Full Load export/import trace — one line per keyset page and per "
+                "import batch (table, the PK range in flight, rows attempted / "
+                "inserted / skipped, OCC retries) in the container log, so you can see "
+                "WHICH data was moving when a problem hit. The audit trail itself is "
+                "always recorded."
+            ),
         ):
             ui.select(levels, value=current, on_change=_on_level).props(
                 "dense outlined options-dense"

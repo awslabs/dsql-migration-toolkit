@@ -322,6 +322,7 @@ def _sync_identity_sequences_after_load(
                 "<max(pk)+1> before cut-over, or the application's first insert will "
                 "hit a duplicate key."
             ),
+            exc=exc,
         )
         return {}
 
@@ -2459,6 +2460,7 @@ def sync_identity_sequences_for_tables(
                 "primary key, run ALTER TABLE <t> ALTER COLUMN <pk> RESTART WITH "
                 "<max(pk)+1> before cut-over, or re-run Validation to sync them."
             ),
+            exc=exc,
         )
         return {}
     _log_identity_sequence_sync_outcome(synced)
@@ -4382,6 +4384,7 @@ def apply_preserved_foreign_keys(
                                 "orphan pre-check failed; verify referential integrity "
                                 "and apply this foreign key manually"
                             ),
+                            exc=exc,
                         )
                         continue
                 else:
@@ -4396,6 +4399,7 @@ def apply_preserved_foreign_keys(
                             "orphan pre-check failed; verify referential integrity and "
                             "apply this foreign key manually"
                         ),
+                        exc=exc,
                     )
                     continue
             if orphans:
@@ -4473,6 +4477,7 @@ def apply_preserved_foreign_keys(
                     detail=_fk_failure_detail(
                         exc, add_ddl, index_state, waited_seconds=index_waited
                     ),
+                    exc=exc,
                 )
     finally:
         # Final count, from the buckets themselves: every settled FK increments exactly one

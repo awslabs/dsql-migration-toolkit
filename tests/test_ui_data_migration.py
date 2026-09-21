@@ -11525,7 +11525,11 @@ def _capture_cdc_events(monkeypatch) -> list:
 
     events: list = []
 
-    def _fake(action, *, detail=None, status=None):
+    def _fake(action, *, detail=None, status=None, exc=None):
+        # Accepts (and ignores) ``exc`` so the anchor's real signature is honoured; the
+        # forwarding guarantee is asserted where it lives, against log_activity itself
+        # (test_cdc_failure_forwards_the_exception_for_debug_stacktraces). Keeping the
+        # 3-tuple leaves every existing unpack site working.
         events.append((action, getattr(status, "value", status), detail))
 
     monkeypatch.setattr(cdc_ui, "_log_cdc_event", _fake)
@@ -22585,3 +22589,85 @@ def test_a_pre_loop_failure_writes_a_terminal_run_failed_line(monkeypatch) -> No
     assert "secret-token-should-not-appear" not in reduced
     assert "wal_level" not in reduced          # the DETAIL line is dropped whole
     assert "replication slot" in reduced       # the actionable primary line survives
+
+
+def test_cdc_failure_forwards_the_exception_for_debug_stacktraces(monkeypatch) -> None:
+    """Raising the log level must actually help on a failed CDC action.
+
+    Only 3 of the 61 log_activity call sites passed an exception, so flipping the Settings
+    tab to DEBUG produced an identical log almost everywhere -- including a failed CDC
+    deploy / start / stop / teardown, which is the action an operator is most likely to be
+    stuck on. The lifecycle wrapper had the exception in hand and dropped it.
+    """
+    import dsql_migrator.ui.data_migration as dm
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+
+    calls: list = []
+    monkeypatch.setattr(
+        dm, "log_activity",
+        lambda category, action, **kw: calls.append((category, action, kw)),
+    )
+
+    boom = RuntimeError("CFN update failed")
+
+    def _work(_handle):
+        raise boom
+
+    wrapped = cdc_ui._logged_cdc_lifecycle("deploy CDC infrastructure",
+                                           detail="stack s", work=_work)
+    with pytest.raises(RuntimeError):
+        wrapped(object())
+
+    failures = [c for c in calls if c[2].get("status") is dm.ActivityStatus.FAILURE]
+    assert failures, calls
+    _category, _action, kw = failures[0]
+    assert kw.get("exc") is boom, "the exception must reach log_activity for the stacktrace"
+
+
+def test_the_level_switch_also_raises_the_data_path_loggers() -> None:
+    """The traces that answer "which data was moving" hung off a DIFFERENT logger.
+
+    The per-keyset-page and per-import-batch DEBUG lines already existed, but on the
+    ``dsql_migrator`` package logger -- settable only by DSQL_MIGRATOR_LOG_LEVEL at
+    start-up, which a workshop participant cannot do. The Settings tab changed only
+    ``dsql_migrator.activity``, so raising the level did not turn them on.
+    """
+    import logging
+
+    from dsql_migrator.core.activity_log import (
+        ACTIVITY_LOGGER_NAME,
+        current_activity_log_level,
+        set_activity_log_level,
+    )
+
+    before_activity = logging.getLogger(ACTIVITY_LOGGER_NAME).level
+    before_pkg = logging.getLogger("dsql_migrator").level
+    try:
+        set_activity_log_level(logging.DEBUG)
+        assert current_activity_log_level() == logging.DEBUG
+        # The decisive one: the data-path traces are gated on THIS logger.
+        assert logging.getLogger("dsql_migrator").isEnabledFor(logging.DEBUG)
+        from dsql_migrator.core import batched_import, exporter
+
+        assert logging.getLogger(exporter.__name__).isEnabledFor(logging.DEBUG)
+        assert logging.getLogger(batched_import.__name__).isEnabledFor(logging.DEBUG)
+
+        set_activity_log_level(logging.INFO)
+        assert not logging.getLogger(exporter.__name__).isEnabledFor(logging.DEBUG)
+    finally:
+        logging.getLogger(ACTIVITY_LOGGER_NAME).setLevel(before_activity)
+        logging.getLogger("dsql_migrator").setLevel(before_pkg)
+
+
+def test_a_debug_pk_range_withholds_a_natural_key() -> None:
+    # The trace names the PK RANGE in flight. It used to be reachable only via an env var
+    # + restart, so its docstring called a natural-key PK "the operator's risk" -- but the
+    # Settings switch now enables it, which would put an email range one click away.
+    from dsql_migrator.core.batched_import import _safe_key_value
+
+    assert _safe_key_value(14) == 14
+    assert _safe_key_value(None) is None
+    assert _safe_key_value("alice@example.com") == "<withheld>"
+    from decimal import Decimal
+
+    assert _safe_key_value(Decimal("1.5")) == "<withheld>"

@@ -3321,6 +3321,7 @@ def _log_cdc_event(
     *,
     detail: "Optional[str]" = None,
     status: ActivityStatus = ActivityStatus.STARTED,
+    exc: "Optional[BaseException]" = None,
 ) -> None:
     """Append a discrete CDC lifecycle milestone to the activity log.
 
@@ -3330,7 +3331,13 @@ def _log_cdc_event(
     stays out of the log (it would flood the rotated file); it lives in the live
     monitoring panel.
     """
-    log_activity(ActivityCategory.CDC, action, status=status, detail=detail)
+    log_activity(
+        ActivityCategory.CDC, action, status=status, detail=detail,
+        # Forwarded so a DEBUG level attaches the (value-free) stacktrace. Without it a
+        # failed deploy / start / stop / teardown -- the actions an operator is most likely
+        # to be stuck on -- gained nothing from raising the level.
+        exc=exc,
+    )
 
 
 def _log_cdc_connector_transitions(migration_state, job_manager) -> None:
