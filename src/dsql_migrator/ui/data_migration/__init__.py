@@ -1104,7 +1104,13 @@ def build_data_migration_screen(
                     inventory,
                     refresh,
                     locked=selection_locked or _lob_locked,
-                    lock_reason=_lob_reason,
+                    # Fall back to the SELECTION lock's reason when the LOB clause has
+                    # none: the `locked` flag is an OR, so any contributor without a
+                    # reason renders a frozen card with nothing explaining it (the panel
+                    # only draws the text `if locked and lock_reason`). Adding "unstable"
+                    # to lob_exclusion_lock closed today's instance; this closes the
+                    # CLASS, so the next contributor cannot reopen it.
+                    lock_reason=_lob_reason or selection_lock,
                     migration_wide=True,
                     selected_tables=selected_names,
                     source_type=getattr(
@@ -2635,9 +2641,24 @@ def selection_lock_reason(
             "Locked — CDC is running and its source connector streams a fixed table "
             "set. To change it, stop CDC on the CDC step first."
         )
-    if "cdc" in substeps_for_type(migration_type) and cdc_infra_prep_state(
-        migration_state, job_manager
-    ) in ("ready", "deploying"):
+    # cdc_infra_prep_state folds EVERY non-stable stack status into "ready", so a stack
+    # being TORN DOWN reached this clause and the remedy read "delete the CDC
+    # infrastructure on the CDC step first" -- instructing the operator to start the
+    # deletion that was already running, with no way to comply and no explanation when it
+    # unlocked ~15-25 min later. The lock's own premise does not hold for a deleting stack
+    # either: it exists because the stack OWNS each table's immutable Kafka topic
+    # partition count, and a stack on its way out owns nothing.
+    #
+    # Narrowed to the DELETE_IN_PROGRESS literal, not generalised to "any teardown": Stop
+    # CDC is an UPDATE that leaves MSK, the topics and that partition plan in place, so
+    # unlocking there would let a table be added and then streamed forever on one
+    # partition -- the exact harm this lock prevents.
+    if (
+        "cdc" in substeps_for_type(migration_type)
+        and cdc_infra_prep_state(migration_state, job_manager)
+        in ("ready", "deploying")
+        and not _cdc_stack_being_deleted(migration_state, job_manager)
+    ):
         return (
             "Locked — CDC infrastructure is deployed for this table set, and each "
             "table's Kafka topic partitions are fixed when it is created. A table "
@@ -2645,6 +2666,22 @@ def selection_lock_reason(
             "the CDC infrastructure on the CDC step first."
         )
     return None
+
+
+def _cdc_stack_being_deleted(migration_state, job_manager) -> bool:
+    """True while THIS session's cdc-stack is being torn down.
+
+    Deliberately keyed on the DELETE_IN_PROGRESS status (or an in-flight delete job), not on
+    "any teardown": a Stop CDC is an UPDATE that keeps MSK, the topics and the immutable
+    partition plan, so it must keep locking the table set. Pure apart from reading the job
+    status; no AWS I/O.
+    """
+    status = getattr(migration_state, "cdc_stack_phase_status", None)
+    if is_stack_teardown_status(status):
+        return True
+    return bool(
+        job_manager is not None and cdc_delete_in_flight(migration_state, job_manager)
+    )
 
 
 def _render_cdc_existing_infra_banner(ui, migration_state, refresh) -> None:

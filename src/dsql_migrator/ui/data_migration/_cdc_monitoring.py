@@ -1791,11 +1791,18 @@ def lob_exclusion_lock(
             "Locked while the CDC infrastructure is being created — the excluded "
             "columns are part of the stack's parameters and were submitted with it."
         )
+    # "unstable" belongs here too. It is the phase for EVERY non-stable stack status, so a
+    # stack mid-operation (or parked in a terminal rollback) fell through every clause and
+    # returned (False, None) -- yet the panel's caller ORs this with the selection lock, so
+    # the card still rendered locked, now with NO reason at all. Its own sibling set
+    # (_EXCLUSION_BAKED_PHASES) already includes "unstable" and carries a comment naming the
+    # asymmetry; this closes it.
     if getattr(migration_state, "cdc_stack_phase", None) in (
         "infra",
         "running",
         "provisioning",
         "partial",
+        "unstable",
     ):
         # Infrastructure is deployed (e.g. after a Stop CDC, which keeps the stack and
         # its committed offset). Explain the lock and name the only safe remedy --

@@ -5,6 +5,28 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.489
+
+### Fixed
+
+- **The table picker no longer tells you to start a deletion that is already running.**
+  `cdc_infra_prep_state` folds EVERY non-stable stack status into `"ready"`, so a stack being
+  torn down reached the CDC-infrastructure clause and its remedy read "delete the CDC
+  infrastructure on the CDC step first" — impossible to comply with, and it then unlocked
+  ~15–25 minutes later with no explanation. The lock's own premise does not hold there either: it
+  exists because the stack OWNS each table's immutable Kafka topic partition count, and a stack on
+  its way out owns nothing. Narrowed to the `DELETE_IN_PROGRESS` literal (and an in-flight delete
+  job), **not** generalised to "any teardown": Stop CDC is an UPDATE that leaves MSK, the topics
+  and that partition plan in place, so unlocking there would let a table be added and then streamed
+  forever on a single partition — the exact harm the lock prevents.
+- **The oversized-LOB exclusion panel can no longer freeze with no reason given.**
+  `lob_exclusion_lock`'s phase tuple lacked `"unstable"` — the phase for every non-stable status —
+  so it returned "not locked, no reason" while the panel's caller ORs it with the selection lock
+  and still rendered the card locked, with nothing explaining why. An adjacent comment names that
+  as the thing that must never happen, and its own sibling set already included `"unstable"`. Fixed
+  in two places: the tuple closes today's instance, and the call site now falls back to the
+  selection lock's reason so the NEXT contributor to that OR cannot reopen the class.
+
 ## v0.1.488
 
 ### Added

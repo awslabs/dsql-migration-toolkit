@@ -22820,3 +22820,72 @@ def test_the_stop_request_itself_is_recorded() -> None:
     # And it is in the click handler, not a poll path.
     i = src.index('"stop requested"')
     assert "def stop_full_load" in src[max(0, i - 1200):i]
+
+
+def test_a_deleting_stack_does_not_lock_the_table_selector() -> None:
+    """The lock's remedy was to start the deletion that was already running.
+
+    cdc_infra_prep_state folds EVERY non-stable status into "ready", so a stack being torn
+    down reached the clause and the message said "delete the CDC infrastructure on the CDC
+    step first" -- impossible to comply with, and it unlocked ~15-25 min later with no
+    explanation. The lock's premise does not hold there either: it exists because the stack
+    owns each table's immutable Kafka partition count, and a stack on its way out owns
+    nothing.
+    """
+    from dsql_migrator.ui.data_migration import selection_lock_reason
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    class _NoJobs:
+        def get_status(self, job_id):
+            from dsql_migrator.core.job_manager import JobNotFoundError
+
+            raise JobNotFoundError(job_id)
+
+    def _reason(status):
+        state = DataMigrationState()
+        state.set_cdc_stack_phase("unstable", status=status)
+        return selection_lock_reason(
+            state, _NoJobs(),
+            status=StepStatus.NOT_STARTED,
+            migration_type=MigrationType.FULL_LOAD_AND_CDC,
+            has_job=False,
+        )
+
+    # Being deleted -> NOT locked by the CDC-infra clause.
+    deleting = _reason("DELETE_IN_PROGRESS")
+    assert deleting is None or "delete the CDC infrastructure" not in deleting, deleting
+
+    # Stop CDC is an UPDATE that keeps MSK, the topics and the immutable partition plan,
+    # so it must KEEP locking -- unlocking there is how a table gets added and then
+    # streamed forever on one partition.
+    stopping = _reason("UPDATE_IN_PROGRESS")
+    assert stopping is not None and "partition" in stopping, stopping
+
+    # A terminal rollback also still owns its resources.
+    failed = _reason("ROLLBACK_COMPLETE")
+    assert failed is not None, failed
+
+
+def test_the_lob_panel_is_never_locked_without_a_reason() -> None:
+    """A frozen card with nothing explaining it -- the invariant an adjacent comment names.
+
+    lob_exclusion_lock's phase tuple lacked "unstable" (the phase for every non-stable
+    status), so it returned (False, None) while the caller's OR still rendered the card
+    locked. Fixed in two places: the tuple, and the call site's reason fallback -- the tuple
+    closes today's instance, the fallback closes the class.
+    """
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+    from dsql_migrator.ui.data_migration._cdc_monitoring import lob_exclusion_lock
+
+    for status in ("DELETE_IN_PROGRESS", "ROLLBACK_COMPLETE", "UPDATE_IN_PROGRESS"):
+        state = DataMigrationState()
+        state.set_cdc_stack_phase("unstable", status=status)
+        locked, reason = lob_exclusion_lock(state, None)
+        assert locked is True, status
+        assert reason, f"locked with no reason for {status}"
+
+    # And the caller falls back to the selection lock's reason for ANY future contributor.
+    src = inspect.getsource(dm)
+    assert "lock_reason=_lob_reason or selection_lock," in src
