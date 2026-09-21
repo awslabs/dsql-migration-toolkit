@@ -27,6 +27,7 @@ from datetime import (
     timezone,
 )
 from typing import (
+    Mapping,
     Optional,
 )
 
@@ -1273,6 +1274,48 @@ def classify_cdc_card_phase(
     if running_names is not None and not expected.issubset(set(running_names)):
         return "provisioning"
     return "running"
+
+
+def _cdc_start_detail(
+    stack_name: str,
+    watermark: object,
+    *,
+    mode: Optional[str],
+    source_type: object,
+    force_snapshot: bool = False,
+    exclusions: Optional[Mapping[str, object]] = None,
+) -> str:
+    """The audit detail for a CDC start: where the stream resumes FROM, and how.
+
+    States the resume coordinate through the same precedence the Full Load watermark line
+    uses (:func:`~dsql_migrator.ui.data_migration._full_load_engine.watermark_coordinate`),
+    so the two lines in one log agree rather than spelling it two ways. With no watermark
+    the stream starts from the source's CURRENT position, which means anything written
+    between an earlier snapshot and now is NOT replicated -- the one case a reader must be
+    able to spot, so it is said explicitly rather than implied by an absent coordinate.
+
+    Log positions, a mode, and column COUNTS only -- never a row value (Property 7).
+    """
+    from dsql_migrator.ui.data_migration._full_load_engine import watermark_coordinate
+
+    parts = [f"stack {stack_name}"]
+    if watermark is not None:
+        parts.append(
+            f"start point {watermark_coordinate(watermark, source_type)} "
+            "(gapless from the Full Load watermark)"
+        )
+    else:
+        parts.append(
+            "start point: the source's CURRENT position — there is no Full Load "
+            "watermark, so any change written before this moment is NOT replicated"
+        )
+    parts.append(f"mode {mode or 'auto'}")
+    if force_snapshot:
+        parts.append("a FULL initial snapshot is forced for this start")
+    excluded = sum(len(cols or ()) for cols in (exclusions or {}).values())
+    if excluded:
+        parts.append(f"{excluded} column(s) excluded from replication (oversized LOB)")
+    return "; ".join(parts)
 
 
 def cdc_unstable_message(status: Optional[str]) -> tuple[str, str, str, str]:
@@ -3686,7 +3729,19 @@ def _start_cdc_deploy(
         )
 
     _action = "start CDC connectors"
-    _detail = f"stack {stack_name}"
+    # The RESUME POINT is the fact this line exists for: it is what makes the Full
+    # Load -> CDC handoff gapless, and it cannot be reconstructed afterwards (the
+    # connector's own offsets are consumed and the deploy log is per-action and
+    # ephemeral). The detail was the stack name alone, so a downloaded activity log
+    # recorded that CDC was started but not FROM WHERE.
+    _detail = _cdc_start_detail(
+        stack_name,
+        watermark,
+        mode=mode,
+        source_type=_cdc_source_type(session),
+        force_snapshot=_force_initial_snapshot,
+        exclusions=exclusions,
+    )
     job_id = job_manager.submit(
         _logged_cdc_lifecycle(_action, detail=_detail, work=work)
     )

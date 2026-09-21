@@ -20,6 +20,7 @@ Covers:
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 
@@ -589,3 +590,34 @@ def test_heartbeat_never_raises_for_an_unknown_job() -> None:
     from dsql_migrator.core.job_manager import JobHandle, JobManager
 
     JobHandle(JobManager(), "no-such-job").heartbeat()   # must not raise
+
+
+def test_a_failed_jobs_persisted_error_keeps_only_the_first_line() -> None:
+    """The docstring promised a redacted message; it was raw, and it is PERSISTED.
+
+    ``str(exc)`` on a psycopg error keeps the server's ``DETAIL:`` / "Failing row contains"
+    lines, which carry the offending row's COLUMN VALUES -- and this record is saved to the
+    job store, so the raw text outlived the process (Property 7).
+    """
+    from dsql_migrator.core.job_manager import JobManager
+
+    mgr = JobManager()
+
+    def _boom(handle=None):
+        raise RuntimeError(
+            "duplicate key value violates unique constraint \"users_email_key\"\n"
+            "DETAIL:  Key (email)=(alice@example.com) already exists.\n"
+            "Failing row contains (14, alice@example.com, secret-token)."
+        )
+
+    job_id = mgr.submit(_boom)
+    for _ in range(200):
+        if mgr.get_status(job_id).status in ("DONE", "FAILED", "CANCELLED"):
+            break
+        time.sleep(0.01)
+
+    error = mgr.get_error(job_id) or ""
+    assert "users_email_key" in error, error
+    assert "alice@example.com" not in error
+    assert "secret-token" not in error
+    assert "\n" not in error

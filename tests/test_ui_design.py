@@ -1063,7 +1063,10 @@ def test_activity_log_tab_uses_the_same_form_field_rows() -> None:
     # Renamed control: destination, not "stdout".
     assert "Log level" in blob and "Mirror to CloudWatch Logs" in blob
     assert "Mirror to stdout" not in blob, "the opaque 'stdout' label must be gone"
-    assert ui.selects and ui.selects[0][0] == ("DEBUG", "INFO", "WARNING", "ERROR")
+    # DEBUG/INFO only: every non-failure audit event is INFO (a waiver/stop is
+    # WARNING), so WARNING/ERROR could not filter noise -- only discard the audit
+    # trail, which this tab must never offer.
+    assert ui.selects and ui.selects[0][0] == ("DEBUG", "INFO")
     assert ui.switches
     assert "CloudWatch" in blob
     # Merged in: the download action lives on this same tab now.

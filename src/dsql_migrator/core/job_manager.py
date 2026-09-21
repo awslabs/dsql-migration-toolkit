@@ -570,7 +570,19 @@ class JobManager:
             record.job.status = "FAILED"
             if record.job.error_count == 0:
                 record.job.error_count = 1
-            record.error = f"{type(exc).__name__}: {exc}"
+            # First line only. ``str(exc)`` on a psycopg error keeps the server's
+            # DETAIL: / "Failing row contains (...)" lines, which carry the offending
+            # row's COLUMN VALUES -- and this record is PERSISTED to the job store
+            # (S3/file), so the raw text outlived the process. The docstring above has
+            # always promised a redacted message; now it is one. A plain string op, so
+            # core keeps its no-activity_log dependency.
+            _first = str(exc).strip().splitlines()
+            _head = _first[0].strip() if _first else ""
+            if len(_head) > 300:
+                _head = _head[:297] + "..."
+            record.error = (
+                f"{type(exc).__name__}: {_head}" if _head else type(exc).__name__
+            )
             self._persist_locked(record)
 
     def _require(self, job_id: str) -> _JobRecord:

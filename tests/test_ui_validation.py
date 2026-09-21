@@ -1726,6 +1726,38 @@ def test_cut_over_acknowledgement_is_logged(monkeypatch) -> None:
     (ack,) = [e for e in captured if e["action"] == "cut over acknowledged"]
     assert ack["status"].value == "success"
     assert "clean match" in ack["detail"]
+    # And the integrity outcome it is signing off on. Without it, an auditor reading only
+    # the log could not tell whether the target went live with its foreign keys enforced --
+    # the ABSENCE of an apply line is ambiguous across four situations. (No stores wired
+    # here, so nothing is in scope: that must be SAID, not left blank.)
+    assert "foreign keys" in ack["detail"], ack["detail"]
+    assert "identity sequences" in ack["detail"], ack["detail"]
+
+
+def test_cut_over_acknowledgement_states_a_waiver(monkeypatch) -> None:
+    # The loudest of the four situations: the operator went live with integrity unenforced.
+    from dsql_migrator.ui import validation as _v
+    from dsql_migrator.ui.session import SessionStore
+
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        _v, "log_activity",
+        lambda category, action, **kw: captured.append({"action": action, **kw}),
+    )
+    session_id = "cutover2"
+    store = SessionStore()
+    validation_store = ValidationStore()
+    vstate = validation_store.get_or_create(session_id)
+    vstate.set_result(_report(matched=True))
+    vstate.proceed_without_foreign_keys = True
+
+    _content, runner = _v.build_cutover_screen(
+        store, session_id, validation_store=validation_store, job_manager=JobManager(),
+    )
+    runner()
+
+    (ack,) = [e for e in captured if e["action"] == "cut over acknowledged"]
+    assert "WAIVED" in ack["detail"], ack["detail"]
 
 
 def test_resync_identity_sequences_partitions_advanced_failed_and_never_raises() -> None:
@@ -5938,3 +5970,66 @@ def test_a_lost_validation_job_does_not_freeze_the_poll_forever() -> None:
         assert get_status(session.workflow, WorkflowStep.VALIDATION) is expected
         if not has_report:
             assert "job record was lost" in (state.error or "")
+
+
+def test_cutover_ack_records_the_referential_integrity_outcome() -> None:
+    """The decisive audit question: did the target go live with its FKs enforced?
+
+    Reading only the log, an auditor could not tell. The waiver click wrote nothing, the
+    acknowledgement never mentioned foreign keys, and an ABSENT apply line is ambiguous
+    across four situations: no FKs in the schema, applied, never run, or waived.
+    """
+    from dsql_migrator.ui.validation import ValidationState, _cutover_integrity_detail
+
+    # 1. Nothing in scope.
+    state = ValidationState()
+    assert "none in scope" in _cutover_integrity_detail(state, 0)
+
+    # 2. Outstanding and never applied -- must NOT read as done.
+    state = ValidationState()
+    detail = _cutover_integrity_detail(state, 5)
+    assert "NOT applied" in detail and "5 outstanding" in detail
+
+    # 3. Applied cleanly.
+    state = ValidationState()
+    state.set_cutover_fk_apply((5, 0, 0))
+    assert "5/5 applied" in _cutover_integrity_detail(state, 5)
+
+    # 4. Applied with orphan skips / failures -- the shortfall is named.
+    state = ValidationState()
+    state.set_cutover_fk_apply((3, 1, 1))
+    detail = _cutover_integrity_detail(state, 5)
+    assert "3/5 applied" in detail
+    assert "1 skipped on orphan rows" in detail and "1 failed" in detail
+
+    # 5. Explicitly waived -- the loudest of the four.
+    state = ValidationState()
+    state.proceed_without_foreign_keys = True
+    assert "WAIVED" in _cutover_integrity_detail(state, 5)
+
+    # The identity half rides along.
+    state = ValidationState()
+    assert "identity sequences not synced" in _cutover_integrity_detail(state, 0)
+    state.set_cutover_identity_sync({"db.orders": 42}, None)
+    assert "identity sequences synced (1 advanced)" in _cutover_integrity_detail(state, 0)
+    state2 = ValidationState()
+    state2.set_cutover_identity_sync({}, None)
+    assert "nothing to advance" in _cutover_integrity_detail(state2, 0)
+
+
+def test_the_ack_and_waiver_are_wired_to_the_log() -> None:
+    # Wiring: without these the helper is dead code and the waiver stays invisible.
+    import inspect
+
+    from dsql_migrator.ui import validation as val
+
+    src = inspect.getsource(val.build_cutover_screen)
+    assert '"foreign keys waived at cut over"' in src
+    assert "ActivityStatus.WARNING" in src
+    assert "_cutover_integrity_detail(" in src
+    # The waiver line must be emitted BEFORE the flag flips, or the detail would read
+    # the post-decision state and the count would already be irrelevant.
+    waiver = src[src.index("def _proceed_without_fks"):]
+    assert waiver.index("log_activity") < waiver.index(
+        "proceed_without_foreign_keys = True"
+    )

@@ -1875,3 +1875,55 @@ def test_quarantine_record_message_is_value_free() -> None:
     assert "alice@example.com" not in rec.message
     assert "secrettoken123" not in rec.message
     assert 'unique constraint "users_email_key"' in rec.message
+
+
+def test_quarantine_key_withholds_natural_key_values() -> None:
+    """A primary key can BE the sensitive datum.
+
+    The loader interpolated every key column with ``!r``, so an email or account-number PK
+    was written verbatim into the durable error log, the activity log and its CloudWatch
+    mirror -- in the very function whose next line is careful to keep the driver's row-value
+    dump out of the same record. The CDC side already applies the right rule
+    (``core/cdc_dlq``, and ``DsqlSinkTask`` in the sink): column NAMES always, VALUES only
+    for a surrogate key.
+    """
+    import uuid
+
+    from dsql_migrator.core.batched_import import format_key_values
+
+    # Surrogate keys: shown, because they identify the row without exposing anything.
+    assert format_key_values(["id"], {"id": 14}) == "id=14"
+    assert format_key_values(["ok"], {"ok": True}) == "ok=True"
+    uid = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    assert format_key_values(["uid"], {"uid": uid}) == f"uid={uid}"
+
+    # Natural keys: name kept, value withheld.
+    assert format_key_values(["email"], {"email": "alice@example.com"}) == (
+        "email=<withheld>"
+    )
+    from decimal import Decimal
+
+    assert format_key_values(["amt"], {"amt": Decimal("1.5")}) == "amt=<withheld>"
+
+    # Composite, mixed: each column judged on its own.
+    assert format_key_values(
+        ["tenant", "id"], {"tenant": "acme-corp", "id": 7}
+    ) == "tenant=<withheld>, id=7"
+
+    # NULL is not something anyone is identified by, and it is the actionable fact.
+    assert format_key_values(["id"], {"id": None}) == "id=None"
+
+    # Bounded: a wide composite key cannot grow the line without limit.
+    wide = format_key_values([f"c{i}" for i in range(80)], {f"c{i}": "x" for i in range(80)})
+    assert len(wide) <= 200 and wide.endswith("...")
+
+
+def test_quarantine_record_uses_the_withholding_formatter() -> None:
+    # Wiring: without this the formatter is dead code and the raw values still ship.
+    import inspect
+
+    from dsql_migrator.core import batched_import as bi
+
+    src = inspect.getsource(bi)
+    assert "format_key_values(work.key_columns, row)" in src
+    assert "f\"{column}={row.get(column)!r}\"" not in src, "the raw interpolation is back"

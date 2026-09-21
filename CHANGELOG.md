@@ -5,6 +5,72 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.483
+
+### Security
+
+- **A quarantined row's PRIMARY KEY VALUES no longer reach the log.** The loader rendered every
+  key column with `!r` (`core/batched_import.py`), so a natural-key primary key — an email, an
+  account number, a national id — was written verbatim into the downloadable error log, the
+  activity log and its CloudWatch mirror. It was a Property 7 violation in the very function whose
+  next line is careful to keep the driver's row-value dump out of the same record. Column NAMES are
+  always kept (without them the row cannot be located at all); VALUES only for a surrogate key
+  (integer / bool / UUID), everything else renders `col=<withheld>`. This is the rule the CDC side
+  already applies to a dead-lettered record's primary key.
+- **A raw driver message can no longer carry row values into the log.** Several call sites
+  interpolate an exception directly (`detail=f"Apply failed: {exc}"`), and psycopg keeps the
+  server's `DETAIL:` / `Failing row contains (...)` lines in `str(exc)` — the offending row's
+  column values. `log_activity` now reduces every `detail` to its first line (where the actionable
+  message lives), collapses whitespace so one event stays one line, and caps the length. Enforced
+  centrally rather than per caller so a future call site cannot reintroduce it.
+- **A failed job's persisted error is redacted, as its docstring always claimed.**
+  `JobManager._mark_failed` stored `f"{type(exc).__name__}: {exc}"` and then persisted the record
+  to the job store, so the raw text — including any row-value dump — outlived the process. It is
+  now first-line-only.
+
+### Added
+
+- **The cut-over acknowledgement records the referential-integrity outcome it signs off on.**
+  Reading only the activity log, an auditor could not answer the question the Cut over screen
+  exists to settle: did the target go live with its foreign keys enforced? The waiver click wrote
+  nothing at all, the acknowledgement never mentioned foreign keys, and an ABSENT apply line was
+  ambiguous across four situations — no foreign keys in the schema, applied, never run, or waived.
+  "Cut over acknowledged" now names which of the four it was (with the applied/outstanding counts,
+  and any orphan skips or failures), plus whether the identity sequences were advanced. Choosing
+  "Cut over without enforced foreign keys" is its own `WARNING` line: it is the one decision on
+  that screen that cannot be reconstructed afterwards.
+- **Start CDC records the resume point.** Its audit detail was the stack name alone, so a
+  downloaded log showed THAT CDC was started but not from where — while the connector's own
+  offsets are consumed and the deploy log is per-action and ephemeral. It now states the coordinate
+  through the same precedence the Full Load watermark line uses (GTID → `binlog file:pos` → WAL
+  LSN), so the two lines in one log agree instead of spelling it two ways, plus the start mode, a
+  forced initial snapshot, and the count of columns excluded from replication. With no watermark it
+  says so explicitly — that the stream starts from the source's CURRENT position and any change
+  written before that moment is NOT replicated — because that is the case a reader must be able to
+  spot, and an absent coordinate only implies it.
+- **The per-object "Apply to target" button logs what it applied.** It passed no result callback to
+  `run_schema_apply` while the bulk path recorded every object — and this is the path that force-
+  REPLACEs an EDITED object, dropping and recreating the table. The most destructive single-object
+  action was the one that left no record. Both paths now share one logger, so the line reads the
+  same whichever button was used.
+- **`ActivityStatus.WARNING`** — the calibrated middle the four existing statuses lacked: nothing
+  failed, but the event is not routine (a waived invariant, an operator stop, a log sink turned
+  off). `INFO` buried exactly the line a reader needs to find; `FAILURE` would claim a break. Maps
+  to `logging.WARNING`.
+
+### Changed
+
+- **The activity-log tab offers DEBUG and INFO only.** Every non-failure audit event is `INFO`, so
+  selecting `WARNING` or `ERROR` could not filter noise — it could only discard the audit trail,
+  which is never what an operator wants from that tab.
+- **A cut-over foreign-key pass is logged as a cut-over event.** The shared audit line is
+  parameterised by where the pass ran: at cut over it files under `validation` as "apply foreign
+  keys (cut-over)" and says so in the detail. For a CDC migration this pass runs ONLY at cut over
+  (the post-load pass is a no-op there), so recording it under `full_load` with no marker made the
+  most important pre-repoint fact read as something that happened back during the load — while the
+  identity-sequence sync standing beside it on the same screen already logged "(cut-over)" under
+  `validation`. Still exactly one line per pass; only its category and label vary.
+
 ## v0.1.482
 
 ### Fixed

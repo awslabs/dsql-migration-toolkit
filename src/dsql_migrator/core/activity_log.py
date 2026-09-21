@@ -46,6 +46,11 @@ from typing import Optional, Union
 # structured file never mixes with the human-readable terminal stream.
 ACTIVITY_LOGGER_NAME = "dsql_migrator.activity"
 
+# Cap for a sanitized ``detail``. Generous enough for the run-level roll-ups (which
+# list per-table reasons) while bounding an unbounded interpolation such as a full
+# GTID set or a driver message that concatenates a long statement.
+_MAX_DETAIL_CHARS = 500
+
 # Rotation bounds for the activity-log file: cap each segment and keep a small
 # number of rotated backups so the on-disk audit trail -- and the in-memory
 # download that concatenates the segments -- stays bounded in a long-lived
@@ -82,11 +87,20 @@ class ActivityCategory(str, Enum):
 
 
 class ActivityStatus(str, Enum):
-    """The outcome an activity event records."""
+    """The outcome an activity event records.
+
+    ``WARNING`` is the calibrated middle the other four lacked: nothing FAILED, but the
+    event is not routine either -- an operator deliberately waiving an invariant (cutting
+    over without enforced foreign keys), a run the operator stopped part-way, or turning a
+    log sink off. Recording those as ``INFO`` buried the one line a reader most needs to
+    find; recording them as ``FAILURE`` would claim something broke. Mirrors the design
+    system's tone calibration (``ui/design.py``): warning == a real but non-blocking fact.
+    """
 
     STARTED = "started"
     SUCCESS = "success"
     FAILURE = "failure"
+    WARNING = "warning"
     INFO = "info"
 
 
@@ -152,6 +166,7 @@ def log_activity(
     """
     cat = category.value if isinstance(category, ActivityCategory) else str(category)
     st = status.value if isinstance(status, ActivityStatus) else str(status)
+    detail = _safe_detail(detail)
     parts = [f"[{cat}]", action, f"({st})"]
     if target:
         parts.append(f"target={target}")
@@ -160,7 +175,11 @@ def log_activity(
     if detail:
         parts.append(f"- {detail}")
     summary = " ".join(parts)
-    level = logging.ERROR if st == ActivityStatus.FAILURE.value else logging.INFO
+    level = (
+        logging.ERROR if st == ActivityStatus.FAILURE.value
+        else logging.WARNING if st == ActivityStatus.WARNING.value
+        else logging.INFO
+    )
     logger = logging.getLogger(ACTIVITY_LOGGER_NAME)
     # Attach the full traceback for debugging only when DEBUG is enabled, so the
     # detailed call stack is available on demand without bloating routine logs.
@@ -193,6 +212,40 @@ def log_activity(
             "stacktrace": stacktrace,
         },
     )
+
+
+def _safe_detail(detail: Optional[str]) -> Optional[str]:
+    """Reduce a ``detail`` to one credential- and VALUE-free line, length-capped.
+
+    Enforced HERE rather than per caller because several call sites interpolate a raw
+    exception (``detail=f"Apply failed: {exc}"``), and a psycopg error's ``str(exc)``
+    keeps the server's ``DETAIL:`` / ``Failing row contains (...)`` lines -- which carry
+    the offending row's COLUMN VALUES. Those lines are always AFTER the first, so
+    first-line-only both keeps the actionable message and drops the value dump. It is the
+    same rule :func:`dsql_migrator.core.batched_import._safe_error` and
+    ``validator._safe_error_message`` already apply locally, and the stacktrace reduction
+    below applies to the traceback tail -- centralising it means a future call site cannot
+    reintroduce the leak (Property 7).
+
+    Also collapses internal whitespace (so one event stays one NDJSON line and one line in
+    the rendered text download) and caps the length, since a detail can carry an unbounded
+    value such as a full GTID set.
+
+    Residual, deliberately accepted: a few SQLSTATEs put a literal in their PRIMARY line
+    (``22P02: invalid input syntax for type integer: "abc"``). That is bounded and matches
+    what :mod:`dsql_migrator.core.cdc_dlq` already accepts for a dead-letter reason; it is
+    not a reason to discard the message entirely.
+    """
+    if detail is None:
+        return None
+    text = str(detail).strip()
+    if not text:
+        return None
+    first_line = text.splitlines()[0]
+    collapsed = " ".join(first_line.split())
+    if len(collapsed) > _MAX_DETAIL_CHARS:
+        collapsed = collapsed[: _MAX_DETAIL_CHARS - 3] + "..."
+    return collapsed
 
 
 def configure_activity_file_log(

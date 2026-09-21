@@ -1177,6 +1177,34 @@ CDC_APPLY_BLOCK_BODY = (
 )
 
 
+def log_apply_object(result: "ObjectApplyResult") -> None:
+    """Log one object's apply outcome (CREATED/SKIPPED = ok, FAILED = error).
+
+    Module-level, and shared: the bulk path recorded every object here while the
+    per-object "Apply to target" button -- the likeliest route straight after editing a
+    DDL, and the one that forces a destructive REPLACE for an edited object -- passed no
+    result callback at all, so that apply left NO trace of which object was created or
+    replaced. Same action name and status calibration either way, so a reader cannot tell
+    (or need to care) which button was used.
+    """
+    if result.status is ObjectApplyStatus.FAILED:
+        activity_status = ActivityStatus.FAILURE
+    elif result.status is ObjectApplyStatus.SKIPPED:
+        activity_status = ActivityStatus.INFO
+    else:
+        activity_status = ActivityStatus.SUCCESS
+    detail = result.status.value
+    if result.detail:
+        detail = f"{detail}: {result.detail}"
+    log_activity(
+        ActivityCategory.SCHEMA_CONVERSION,
+        "apply object",
+        status=activity_status,
+        target=result.object_name,
+        detail=detail,
+    )
+
+
 def _cdc_apply_is_blocked(cdc_active_check: Optional[Callable[[], bool]]) -> bool:
     """Best-effort: True when a live CDC pipeline must block applying schema.
 
@@ -1564,22 +1592,7 @@ def build_schema_conversion_screen(
                 # Record live progress, then log the per-object outcome to the
                 # downloadable activity log (CREATED/SKIPPED = ok, FAILED = error).
                 conv_state.record_apply_progress(result)
-                if result.status is ObjectApplyStatus.FAILED:
-                    activity_status = ActivityStatus.FAILURE
-                elif result.status is ObjectApplyStatus.SKIPPED:
-                    activity_status = ActivityStatus.INFO
-                else:
-                    activity_status = ActivityStatus.SUCCESS
-                detail = result.status.value
-                if result.detail:
-                    detail = f"{detail}: {result.detail}"
-                log_activity(
-                    ActivityCategory.SCHEMA_CONVERSION,
-                    "apply object",
-                    status=activity_status,
-                    target=result.object_name,
-                    detail=detail,
-                )
+                log_apply_object(result)
 
             # A confirmed REPLACE drops and recreates the selected tables, and DSQL refuses
             # DROP TABLE while ANOTHER table's foreign key still references it. The apply
@@ -1981,6 +1994,11 @@ def build_schema_conversion_screen(
         )
         _invalidate_applier_cache_if_target_changed(results)
         conv_state.merge_apply_results(results)
+        # The same per-object audit line the bulk path writes. Without it this button --
+        # which force-REPLACEs an edited object, dropping and recreating the table -- was
+        # the one apply path that left no record of what it did.
+        for _applied in results:
+            log_apply_object(_applied)
         result = results[0] if results else None
         if result is not None:
             notify_type = {

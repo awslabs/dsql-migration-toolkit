@@ -1585,7 +1585,10 @@ def _render_activity_log_controls(activity_log_path: str) -> None:
 
     from dsql_migrator.ui.design import form_field
 
-    levels = ["DEBUG", "INFO", "WARNING", "ERROR"]
+    # DEBUG/INFO only. Every non-failure audit event is INFO (and a waiver/stop is
+    # WARNING), so selecting WARNING or ERROR could not filter noise -- it could only
+    # DISCARD the audit trail, which is never what an operator wants from this tab.
+    levels = ["DEBUG", "INFO"]
     current = logging.getLevelName(current_activity_log_level())
     if current not in levels:
         current = "INFO"

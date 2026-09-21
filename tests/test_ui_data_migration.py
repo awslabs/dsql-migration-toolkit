@@ -22459,3 +22459,57 @@ def textwrap_dedent(src: str) -> str:
     import textwrap
 
     return textwrap.dedent(src)
+
+
+def test_the_cutover_foreign_key_pass_is_logged_as_a_cutover_event(monkeypatch) -> None:
+    """The same pass, but the audit line must say WHERE it ran.
+
+    For a CDC migration this pass runs ONLY at cut over -- the post-load pass is a no-op
+    there -- so recording it under FULL_LOAD with no marker made the single most important
+    pre-repoint fact read as something that happened back during the load. The
+    identity-sequence sync standing beside it on the same screen already logs
+    "(cut-over)" under VALIDATION, so the two halves of one operator action were recorded
+    differently. Still exactly ONE line: only its category and label vary.
+    """
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    _ddls, conv = _three_fk_conv()
+    monkeypatch.setattr(engine, "_pregate_orphans", lambda pending, *a, **k: {0: 0, 1: 0, 2: 0})
+    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(engine, "apply_foreign_key", lambda *a, **k: None)
+    events: list[tuple] = []
+    monkeypatch.setattr(
+        engine, "log_activity",
+        lambda category, action, **kw: events.append((category, action, kw)),
+    )
+
+    engine.apply_preserved_foreign_keys(
+        {"child": conv}, lambda: _FkProbeConnection(0), origin="cut-over"
+    )
+
+    assert len(events) == 1, f"still exactly one line per pass: {events}"
+    category, action, kw = events[0]
+    assert category is engine.ActivityCategory.VALIDATION
+    assert action == "apply foreign keys (cut-over)"
+    assert kw["status"] is engine.ActivityStatus.SUCCESS
+    # The detail says when it ran and why it is the only chance for a CDC migration.
+    assert "cut over" in kw["detail"].lower(), kw
+    assert "only pass" in kw["detail"], kw
+
+    # The DEFAULT (post-load / Data Migration action) is unchanged.
+    events.clear()
+    engine.apply_preserved_foreign_keys({"child": conv}, lambda: _FkProbeConnection(0))
+    category, action, kw = events[0]
+    assert category is engine.ActivityCategory.FULL_LOAD
+    assert action == "apply foreign keys"
+    assert "cut over" not in kw["detail"].lower(), kw
+
+
+def test_the_cutover_action_passes_its_origin_to_the_shared_pass() -> None:
+    # Wiring: without this the engine's new label is dead code.
+    import inspect
+
+    from dsql_migrator.ui import validation as val
+
+    src = inspect.getsource(val._run_cutover_foreign_keys)
+    assert 'origin="cut-over"' in src

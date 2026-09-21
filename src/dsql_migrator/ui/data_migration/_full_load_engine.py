@@ -2823,6 +2823,35 @@ def _log_excluded_lob_columns(
             )
 
 
+def watermark_coordinate(
+    watermark: "Optional[Watermark]",
+    source_type: SourceType = SourceType.MYSQL,
+) -> str:
+    """The resume COORDINATE a watermark pins, as one human sentence.
+
+    GTID (MySQL's portable coordinate) -> ``binlog file:pos`` -> PostgreSQL ``WAL LSN`` ->
+    a worded absence for the source engine. Factored out of
+    :func:`_log_captured_watermark` so the CDC start logs the SAME coordinate it resumes
+    from, rather than a second spelling of the precedence. Only a log position -- never a
+    row value (Property 7).
+    """
+    if watermark is None:
+        return "no watermark"
+    if watermark.gtid_executed:
+        return f"GTID {watermark.gtid_executed}"
+    if watermark.binlog_file:
+        return f"binlog {watermark.binlog_file}:{watermark.binlog_position}"
+    if watermark.wal_lsn:
+        return f"WAL LSN {watermark.wal_lsn}"
+    if source_type is SourceType.MYSQL:
+        return "no binlog/GTID coordinate available (binary logging off or restricted)"
+    engine = dialect_for(source_type).engine_display_name
+    return (
+        f"row-count baseline only (Full Load; the WAL/LSN handoff coordinate for a "
+        f"gapless CDC catch-up could not be read for this {engine} source)"
+    )
+
+
 def _log_captured_watermark(
     watermark: "Optional[Watermark]",
     source_type: SourceType = SourceType.MYSQL,
@@ -2844,20 +2873,7 @@ def _log_captured_watermark(
     # Prefer the GTID (MySQL's portable resume coordinate); then binlog file:pos; then
     # the PostgreSQL WAL LSN (its resume coordinate); else word the absence for the source
     # engine (e.g. binary logging off on MySQL, or the LSN unreadable on PostgreSQL).
-    if watermark.gtid_executed:
-        coord = f"GTID {watermark.gtid_executed}"
-    elif watermark.binlog_file:
-        coord = f"binlog {watermark.binlog_file}:{watermark.binlog_position}"
-    elif watermark.wal_lsn:
-        coord = f"WAL LSN {watermark.wal_lsn}"
-    elif source_type is SourceType.MYSQL:
-        coord = "no binlog/GTID coordinate available (binary logging off or restricted)"
-    else:
-        engine = dialect_for(source_type).engine_display_name
-        coord = (
-            f"row-count baseline only (Full Load; the WAL/LSN handoff coordinate for a "
-            f"gapless CDC catch-up could not be read for this {engine} source)"
-        )
+    coord = watermark_coordinate(watermark, source_type)
     ts = watermark.snapshot_timestamp.isoformat().replace("+00:00", "Z")
     approx = " (row counts are approximate estimates)" if watermark.row_counts_approximate else ""
     log_activity(
@@ -4188,6 +4204,14 @@ def apply_preserved_foreign_keys(
     # this the step's card sat at "0 of N done" for the whole pass, which is exactly the
     # "it looks stuck, click it again" the explicit action was meant to end.
     on_progress: Optional[Callable[[int, int], None]] = None,
+    # WHERE this pass was run from, for the audit line only. The pass itself is identical
+    # -- but for a CDC migration it runs ONLY at cut over (the post-load pass is a no-op
+    # there), and logging that under FULL_LOAD with no marker made the single most
+    # important pre-repoint fact read as something that happened back in the load. The
+    # identity-sequence sync standing right beside it on the same screen already logs
+    # "(cut-over)" under VALIDATION, so the two halves of one operator action were
+    # recorded differently. Still ONE log call -- only its category and label vary.
+    origin: str = "post-load",
 ) -> tuple[int, int, int]:
     """Re-create preserved foreign keys as post-load ``ADD CONSTRAINT``, orphan-gated.
 
@@ -4435,14 +4459,24 @@ def apply_preserved_foreign_keys(
     # full stop) -- one event reported twice, contradicting itself. Unreachable for a run
     # with no foreign keys: the `if not pending` return above fires first, so the caller's
     # "no noise" intent holds without a second condition.
+    _at_cutover = origin == "cut-over"
     log_activity(
-        ActivityCategory.FULL_LOAD,
-        "apply foreign keys",
+        # Cut over is the Validation step's screen, and the sync beside it logs there too,
+        # so a reader filtering that step sees the whole hand-off in one place.
+        ActivityCategory.VALIDATION if _at_cutover else ActivityCategory.FULL_LOAD,
+        "apply foreign keys (cut-over)" if _at_cutover else "apply foreign keys",
         status=ActivityStatus.FAILURE if failed else ActivityStatus.SUCCESS,
         detail=(
-            # Not "post-load": the same pass runs at cut over for a CDC migration.
+            # Not "post-load" unconditionally: the same pass runs at cut over for a CDC
+            # migration, where it is the ONLY thing that ever creates these constraints.
             f"Foreign-key pass: {applied} applied, {skipped} skipped (orphan rows), "
             f"{failed} failed."
+            + (
+                " Run at cut over, before repointing — for a CDC migration this is the "
+                "only pass that creates the deferred constraints."
+                if _at_cutover
+                else ""
+            )
         ),
     )
     return (applied, skipped, failed)

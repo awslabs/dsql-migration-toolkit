@@ -88,7 +88,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from enum import Enum
 from queue import Queue
-from typing import Any, Callable, Iterable, Iterator, Mapping, Optional
+from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Sequence
 
 from psycopg import sql
 from pydantic import BaseModel, ConfigDict, Field
@@ -1300,9 +1300,10 @@ class BatchedImporter:
         """
         row = work.rows[0]
         if work.key_columns:
-            primary_key = ", ".join(
-                f"{column}={row.get(column)!r}" for column in work.key_columns
-            )
+            # Column names always, values only for a surrogate key: a natural-key PK can
+            # itself be the sensitive datum, and this string is written to the durable
+            # error log, the activity log and its CloudWatch mirror (Property 7).
+            primary_key = format_key_values(work.key_columns, row)
         else:
             primary_key = "(no primary key)"
         record = QuarantineRecord(
@@ -1696,6 +1697,49 @@ def _index_name_of(ddl: str) -> str:
         re.IGNORECASE,
     )
     return match.group(1) if match else ddl[:60]
+
+
+# Key-value types whose value is safe to show: a surrogate key. Everything else is a
+# possible natural key (email, account number, national id) and is withheld.
+_SAFE_KEY_TYPES = (int, bool)
+
+
+def format_key_values(
+    columns: "Sequence[str]", row: "Mapping[str, Any]", *, limit: int = 200
+) -> str:
+    """Render a row's key columns for an error/audit line, withholding natural-key VALUES.
+
+    Column NAMES are always included -- they are schema, not data, and without them the
+    record cannot be located at all. VALUES are shown only for a surrogate key (integer,
+    bool, UUID); anything else renders ``col=<withheld>``, because a primary key can BE
+    the sensitive datum (an email or account-number PK), and this string reaches the
+    downloadable error log, the activity log and its CloudWatch mirror.
+
+    This is the rule the CDC side already applies to a dead-lettered record's pk
+    (:mod:`dsql_migrator.core.cdc_dlq`, and ``DsqlSinkTask`` in the sink connector); the
+    loader interpolated every key column with ``!r`` instead, so a natural-key PK was
+    written out verbatim -- a Property 7 violation, in the very function whose next line
+    is careful to keep the driver's row-value dump out of the same record.
+    """
+    import uuid
+
+    parts: list[str] = []
+    for column in columns:
+        value = row.get(column)
+        if isinstance(value, bool) or isinstance(value, _SAFE_KEY_TYPES):
+            parts.append(f"{column}={value}")
+        elif isinstance(value, uuid.UUID):
+            parts.append(f"{column}={value}")
+        elif value is None:
+            # NULL is not a value anyone can be identified by, and "col=None" is the
+            # actionable fact for a key that should never be null.
+            parts.append(f"{column}=None")
+        else:
+            parts.append(f"{column}=<withheld>")
+    rendered = ", ".join(parts)
+    if len(rendered) > limit:
+        rendered = rendered[: limit - 3] + "..."
+    return rendered
 
 
 def _safe_error(exc: BaseException) -> str:

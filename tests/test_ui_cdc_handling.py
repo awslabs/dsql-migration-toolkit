@@ -1021,3 +1021,77 @@ def test_cdc_start_card_postgres_auto_shows_slot_resume_and_wal_lsn() -> None:
     radio_values = [v for r in fake.radios for v in r.values()]
     assert any("gapless from the replication slot" in v for v in radio_values)
     assert "3/AF012B8" in " ".join(fake.texts)  # WAL LSN summary + confirmation
+
+
+def test_start_cdc_detail_names_the_resume_point() -> None:
+    """Where the stream resumes FROM cannot be reconstructed afterwards.
+
+    The detail was the stack name alone, so a downloaded activity log recorded THAT CDC was
+    started but not from where -- while the connector's own offsets are consumed and the
+    deploy log is per-action and ephemeral. It is the fact that makes the Full Load -> CDC
+    handoff gapless.
+    """
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration._cdc_ui import _cdc_start_detail
+
+    # MySQL GTID wins the precedence (the portable coordinate).
+    wm = SimpleNamespace(
+        gtid_executed="aaa:1-9", binlog_file="bin.000004", binlog_position=1234,
+        wal_lsn=None,
+    )
+    detail = _cdc_start_detail(
+        "dsql-cdc-stack", wm, mode="auto", source_type=SourceType.MYSQL
+    )
+    assert "dsql-cdc-stack" in detail
+    assert "GTID aaa:1-9" in detail
+    assert "gapless" in detail
+    assert "mode auto" in detail
+
+    # file:pos when there is no GTID.
+    wm2 = SimpleNamespace(
+        gtid_executed=None, binlog_file="bin.000004", binlog_position=1234, wal_lsn=None
+    )
+    assert "binlog bin.000004:1234" in _cdc_start_detail(
+        "s", wm2, mode="auto", source_type=SourceType.MYSQL
+    )
+
+    # PostgreSQL WAL LSN.
+    wm3 = SimpleNamespace(
+        gtid_executed=None, binlog_file=None, binlog_position=None, wal_lsn="0/1A2B3C"
+    )
+    assert "WAL LSN 0/1A2B3C" in _cdc_start_detail(
+        "s", wm3, mode="auto", source_type=SourceType.POSTGRES
+    )
+
+    # NO watermark is the case a reader must be able to spot: changes before now are lost.
+    none_detail = _cdc_start_detail(
+        "s", None, mode="manual", source_type=SourceType.MYSQL
+    )
+    assert "CURRENT position" in none_detail
+    assert "NOT replicated" in none_detail
+    assert "mode manual" in none_detail
+
+    # A forced initial snapshot and LOB exclusions are stated, as counts only.
+    rich = _cdc_start_detail(
+        "s", wm, mode="manual", source_type=SourceType.POSTGRES,
+        force_snapshot=True, exclusions={"db.t": ["blob_a", "blob_b"], "db.u": ["c"]},
+    )
+    assert "FULL initial snapshot is forced" in rich
+    assert "3 column(s) excluded" in rich
+    # Column COUNTS, never a row value.
+    assert "blob_a" not in rich
+
+
+def test_start_cdc_uses_the_shared_watermark_coordinate() -> None:
+    # The same precedence as the Full Load watermark line, so the two lines in one log
+    # agree instead of spelling the coordinate two ways.
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    src = inspect.getsource(_cdc_ui._cdc_start_detail)
+    assert "watermark_coordinate(" in src
+    start = inspect.getsource(_cdc_ui._start_cdc_deploy)
+    assert "_cdc_start_detail(" in start

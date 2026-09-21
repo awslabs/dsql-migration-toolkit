@@ -2803,6 +2803,42 @@ def _cutover_pending_foreign_keys(
     return sum(len(conv.foreign_key_ddls) for conv in applied.values())
 
 
+def _cutover_integrity_detail(validation_state: "ValidationState", pending: int) -> str:
+    """One clause stating whether the target went live with its foreign keys enforced.
+
+    The absence of an "apply foreign keys" line is ambiguous across FOUR situations -- the
+    schema had none, they were applied, the action was never run, or the operator
+    explicitly waived them -- so an auditor reading only the log could not answer the
+    question this screen exists to settle. Says which, plus whether the identity sequences
+    were advanced (an un-advanced sequence is a post-cut-over duplicate-key risk).
+
+    Pure: reads the already-recorded outcomes, no DB. Counts and states only, never a row
+    value (Property 7).
+    """
+    if validation_state.proceed_without_foreign_keys:
+        fk = f"foreign keys WAIVED ({pending} not applied)"
+    elif pending <= 0:
+        fk = "foreign keys: none in scope"
+    else:
+        result = validation_state.cutover_fk_apply
+        if result is None:
+            fk = f"foreign keys NOT applied ({pending} outstanding)"
+        else:
+            applied, skipped, failed = result
+            fk = f"foreign keys {applied}/{pending} applied"
+            if skipped or failed:
+                fk += f" ({skipped} skipped on orphan rows, {failed} failed)"
+    synced = validation_state.cutover_identity_sync
+    identity = (
+        f"identity sequences synced ({len(synced)} advanced)"
+        if synced
+        else "identity sequences not synced"
+        if synced is None
+        else "identity sequences synced (nothing to advance)"
+    )
+    return f"{fk}; {identity}"
+
+
 def _cutover_gate_inputs_missing(
     eval_store: "Optional[EvaluationStore]",
     conversion_store: "Optional[Any]",
@@ -2949,6 +2985,11 @@ def _run_cutover_foreign_keys(
             # left a spurious FAILED job record behind (the id is not polled, so the reap
             # was invisible while still being persisted).
             heartbeat=getattr(_handle, "heartbeat", None),
+            # Audit only: the pass is identical, but it must not read as something that
+            # happened during the load -- for a CDC migration this is the ONLY pass that
+            # creates these constraints, and it runs here, right before the repoint. Puts
+            # it in the same category as the identity-sequence sync beside it.
+            origin="cut-over",
         )
         validation_state.set_cutover_fk_apply(result)
         if refresh is not None:
@@ -3038,6 +3079,17 @@ def build_cutover_screen(
                     else f"release state: {_release}"
                 )
                 + ")"
+                # The integrity state, on the line that closes the journey. Without it an
+                # auditor reading only the log could not tell whether the target went live
+                # with its foreign keys enforced -- the absence of an apply line covers
+                # four different situations.
+                + "; "
+                + _cutover_integrity_detail(
+                    validation_state,
+                    _cutover_pending_foreign_keys(
+                        session, eval_store, conversion_store, session_id
+                    ),
+                )
             ),
         )
         if ai_post_event is not None:
@@ -3322,6 +3374,22 @@ def build_cutover_screen(
                     )
 
                     def _proceed_without_fks() -> None:
+                        # The one decision on this screen that CANNOT be reconstructed
+                        # afterwards: nothing else records that the operator chose to go
+                        # live with referential integrity unenforced, and the absence of
+                        # an "apply foreign keys" line is ambiguous between "no FKs in
+                        # the schema", "applied", "never run" and "waived".
+                        log_activity(
+                            ActivityCategory.VALIDATION,
+                            "foreign keys waived at cut over",
+                            status=ActivityStatus.WARNING,
+                            detail=(
+                                f"operator chose to cut over WITHOUT applying "
+                                f"{_fk_pending} preserved foreign key(s) — referential "
+                                "integrity is the application's responsibility on the "
+                                "target"
+                            ),
+                        )
                         validation_state.proceed_without_foreign_keys = True
                         refresh()
 

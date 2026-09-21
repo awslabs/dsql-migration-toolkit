@@ -4331,3 +4331,58 @@ def test_cdc_evidence_unverified_only_fires_on_restored_names() -> None:
         cdc_controller=object(), cdc_stack_phase=None, cdc_connector_names=[]
     )
     assert cdc_evidence_unverified(wired) is False
+
+
+def test_the_inline_apply_logs_its_object_like_the_bulk_path() -> None:
+    """The per-object "Apply to target" button left no audit trace.
+
+    It passed no result callback to ``run_schema_apply``, while the bulk path recorded every
+    object -- and this is the path that force-REPLACEs an EDITED object, dropping and
+    recreating the table. So the most destructive single-object action was the one with no
+    record of what it did.
+    """
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion as sc
+    from dsql_migrator.ui.schema_conversion_apply import (
+        ObjectApplyResult,
+        ObjectApplyStatus,
+    )
+
+    events: list = []
+    real = sc.log_activity
+    sc.log_activity = lambda category, action, **kw: events.append(  # type: ignore[assignment]
+        (category, action, kw)
+    )
+    try:
+        sc.log_apply_object(
+            ObjectApplyResult(
+                object_name="db.orders", status=ObjectApplyStatus.CREATED, detail=None
+            )
+        )
+        sc.log_apply_object(
+            ObjectApplyResult(
+                object_name="db.items", status=ObjectApplyStatus.FAILED,
+                detail="relation already exists",
+            )
+        )
+        sc.log_apply_object(
+            ObjectApplyResult(
+                object_name="db.old", status=ObjectApplyStatus.SKIPPED, detail=None
+            )
+        )
+    finally:
+        sc.log_activity = real  # type: ignore[assignment]
+
+    assert [e[1] for e in events] == ["apply object"] * 3, events
+    assert events[0][2]["status"] is sc.ActivityStatus.SUCCESS
+    assert events[0][2]["target"] == "db.orders"
+    # A failure is a FAILURE, a skip is INFO -- the bulk path's calibration, shared.
+    assert events[1][2]["status"] is sc.ActivityStatus.FAILURE
+    assert "relation already exists" in events[1][2]["detail"]
+    assert events[2][2]["status"] is sc.ActivityStatus.INFO
+
+    # Wiring: both apply paths must route through the shared logger.
+    inline = inspect.getsource(sc.build_schema_conversion_screen)
+    assert "log_apply_object(_applied)" in inline, "the inline apply still logs nothing"
+    assert inline.count("log_apply_object(") >= 2, "the bulk path must share it"

@@ -348,3 +348,88 @@ def test_debug_stacktrace_does_not_leak_exception_detail_row_values(tmp_path) ->
 def test_render_activity_text_passes_through_non_json_lines() -> None:
     out = render_activity_text(b"not json\n")
     assert out == b"not json\n"
+
+
+# ---------------------------------------------------------------------------
+# detail is sanitized centrally (Property 7)
+# ---------------------------------------------------------------------------
+
+
+def test_detail_keeps_only_the_first_line_so_row_values_cannot_leak(tmp_path) -> None:
+    """A driver error's later lines carry the offending row's COLUMN VALUES.
+
+    Several call sites interpolate a raw exception (``detail=f"Apply failed: {exc}"``), and
+    psycopg keeps the server's ``DETAIL:`` / ``Failing row contains (...)`` lines in
+    ``str(exc)`` -- so the durable log and its CloudWatch mirror carried row values.
+    Enforced in ``log_activity`` rather than per caller so a future site cannot reintroduce
+    it (Property 7).
+    """
+    from dsql_migrator.core.activity_log import (
+        ActivityCategory,
+        ActivityStatus,
+        configure_activity_file_log,
+        log_activity,
+    )
+
+    path = tmp_path / "a.ndjson"
+    configure_activity_file_log(path)
+    raw = (
+        'duplicate key value violates unique constraint "users_email_key"\n'
+        "DETAIL:  Key (email)=(alice@example.com) already exists.\n"
+        "Failing row contains (14, alice@example.com, secret-token)."
+    )
+    log_activity(
+        ActivityCategory.SCHEMA_CONVERSION, "apply object",
+        status=ActivityStatus.FAILURE, detail=f"Apply failed: {raw}",
+    )
+    written = path.read_text()
+
+    assert "alice@example.com" not in written, written
+    assert "secret-token" not in written
+    assert "Failing row contains" not in written
+    # The actionable primary line survives.
+    assert "users_email_key" in written
+    # One event stays one line.
+    assert len([ln for ln in written.splitlines() if ln.strip()]) == 1
+
+
+def test_detail_is_length_capped_and_whitespace_collapsed(tmp_path) -> None:
+    from dsql_migrator.core.activity_log import (
+        _MAX_DETAIL_CHARS,
+        ActivityCategory,
+        ActivityStatus,
+        _safe_detail,
+        configure_activity_file_log,
+        log_activity,
+    )
+
+    assert _safe_detail(None) is None
+    assert _safe_detail("   ") is None
+    assert _safe_detail("a\t\t b   c") == "a b c"
+    long = _safe_detail("x" * (_MAX_DETAIL_CHARS + 200))
+    assert long is not None and len(long) == _MAX_DETAIL_CHARS and long.endswith("...")
+
+    path = tmp_path / "b.ndjson"
+    configure_activity_file_log(path)
+    log_activity(
+        ActivityCategory.CDC, "start CDC connectors",
+        status=ActivityStatus.STARTED, detail="g" * 4000,
+    )
+    assert len(path.read_text()) < 4000
+
+
+def test_warning_status_maps_to_the_warning_log_level() -> None:
+    # The calibrated middle: nothing failed, but the event is not routine (a waived
+    # invariant, an operator stop). INFO buried it; FAILURE would claim a break.
+    import logging
+
+    from dsql_migrator.core.activity_log import ActivityStatus
+
+    assert ActivityStatus.WARNING.value == "warning"
+    import inspect
+
+    from dsql_migrator.core import activity_log as al
+
+    src = inspect.getsource(al.log_activity)
+    assert "logging.WARNING if st == ActivityStatus.WARNING.value" in src
+    assert logging.WARNING < logging.ERROR
