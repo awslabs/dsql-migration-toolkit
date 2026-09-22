@@ -21,7 +21,13 @@ from typing import Callable, Optional, Sequence
 
 from dsql_migrator.core.error_log import ErrorLogStore
 from dsql_migrator.core.job_manager import JobNotFoundError
-from dsql_migrator.core.models import LoadKind, LoadStatusView, MigrationJob, StepStatus
+from dsql_migrator.core.models import (
+    LoadKind,
+    LoadStatusView,
+    MigrationJob,
+    SourceType,
+    StepStatus,
+)
 from dsql_migrator.core.target_connection import DsqlConnector
 from dsql_migrator.core.target_introspector import (
     target_primary_keys,
@@ -879,6 +885,9 @@ def _render_full_load_step(
             lob_candidates_for=lob_candidates_for,
             exclude_lob_and_reload=exclude_lob_and_reload,
             exclude_lob_block_reason=exclude_lob_block_reason,
+            source_type=getattr(
+                getattr(session, "source_config", None), "source_type", None
+            ),
             # Reload/Retry need a LIVE source+target (the source password is not restored
             # after a session restore, Property 7). connection_ready() reflects "verified
             # this session" -- unlike has_source(), which is True whenever the config is
@@ -1704,6 +1713,10 @@ def _render_full_load_progress(
     lob_candidates_for: Optional[Callable[[str], Sequence[tuple[str, str]]]] = None,
     exclude_lob_and_reload: Optional[Callable[[str, Sequence[str]], None]] = None,
     exclude_lob_block_reason: Optional[str] = None,
+    # The source engine, used ONLY to pre-tick the right column in the exclude dialog
+    # (PG -> DSQL is the identity for these types, MySQL is not). Optional so a caller
+    # without a session keeps the MySQL default.
+    source_type: "Optional[SourceType]" = None,
 ) -> None:
     """Render the overall progress, a status distribution, and a live per-table
     table with colored status badges and per-row progress bars."""
@@ -2051,7 +2064,13 @@ def _render_full_load_progress(
         column whose source type maps to the type in the reason is pre-ticked
         (``preselect_lob_columns_for_reason``) so the common case is one confirm.
         """
-        preselected = set(preselect_lob_columns_for_reason(columns, reason_text))
+        preselected = set(
+            preselect_lob_columns_for_reason(
+                columns,
+                reason_text,
+                source_type=source_type or SourceType.MYSQL,
+            )
+        )
         chosen: dict[str, bool] = {
             name: (name in preselected) for name, _type in columns
         }

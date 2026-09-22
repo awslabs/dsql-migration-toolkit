@@ -5,6 +5,79 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.492
+
+PostgreSQL 소스에서 1 MiB를 넘는 `text`/`bytea`가 세 관문 모두 침묵하고 격리 후 복구 버튼이 사라진다는
+수정 요청을 검증했습니다. 전부 확인됐고, 같은 근본 원인의 사례 하나를 더 찾았습니다.
+**노트 자신의 결론 하나는 거꾸로였고 여기서 교정했습니다.**
+
+### 수정
+
+- **PostgreSQL 마이그레이션이 격리 후 복구 버튼을 되찾았습니다.** "Exclude column & reload"의 후보 목록이
+  `lob_exclusion_candidates(inventory)`를 `source_type` 없이 호출해 MySQL 기본값으로 떨어지고,
+  `mediumtext`/`longblob`을 PostgreSQL 인벤토리의 `text`/`bytea`에 매칭했습니다 — 아무것도 맞지 않고,
+  렌더러의 "후보 없음 → 죽은 버튼을 내지 않는다" early return이 모든 PostgreSQL 소스에서 도구 안의 유일한
+  진행 경로를 숨겼습니다. 이 함수의 다른 두 호출부는 엔진을 넘기는데, 나중에 추가된 이 호출부만 받지
+  않았습니다.
+  - **잃은 것은 데이터가 아니라 복구 경로입니다.** 초과 값 자체는 어느 쪽이든 시끄럽게 보고됩니다(행 단위
+    격리, 앰버 완전성 배너, Validation 부족분). PostgreSQL 사용자에게 없던 것은 **해결 수단**입니다: 적재
+    후에는 사전 제외 패널이 잠기고 그 문구가 *Start over*를 가리키는데, 그것은 Evaluation과 Schema
+    Conversion(직접/AI 편집한 DDL 포함), CDC 입력을 버립니다. 게다가 테이블별 배너는 "소스 값을 고쳐 다시
+    적재하라"고 안내하는데, 읽기 전용 소스에서는 불가능합니다.
+  - PostgreSQL이 MySQL보다 이 위험에 **더** 노출됩니다: `text`/`bytea`는 **기본이 무제한**이고, MySQL
+    사용자는 `mediumtext`/`longblob`을 의도적으로 골라야 합니다.
+  - 호출부에 대한 AST 단정으로 고정했습니다. 동작 테스트로는 닿을 수 없습니다 — 그 헬퍼는 화면 빌더 안의
+    클로저이고, 이 버튼을 다루는 기존 테스트는 모두 그것을 람다로 주입합니다. 결함이 살아남은 이유가
+    정확히 그것입니다(그중 하나는 이 결함이 악용하는 "빈 목록 → 버튼 없음" 분기를 고정해 두기까지 합니다).
+- **Evaluation과 Schema Conversion이 PostgreSQL의 초대형 컬럼에 더는 침묵하지 않습니다.** 매뉴얼은 이
+  처리의 신호로 Evaluation `OVERSIZED_LOB` 플래그를 명시하고 PostgreSQL을 직접 언급하는데, 규칙이 발동할
+  수 없었습니다: PostgreSQL 규칙 셋에서 제외돼 있었고, 그냥 등록해도 무조건 0건입니다 — 규칙은 MySQL 타입
+  **이름**을 매칭하는데 PostgreSQL 인벤토리는 `format_type` 철자를 담기 때문입니다. Schema Conversion도
+  대응물을 억제했습니다 — 그 엔진 분기 튜플에서 `_pg_*` 짝이 없는 유일한 항목이 oversized-LOB였습니다.
+  `PgOversizedLobRule`과 `_pg_oversized_lob_warning`을 추가하고, 둘 다 이제 `core.assessor`에 있는 하나의
+  술어를 읽게 해서 Evaluation·Schema Conversion·UI 제외 제안이 위험 컬럼에 대해 어긋날 수 없게 했습니다.
+  - 이것은 DSQL 한도 중 **다시 적재해도 되돌릴 수 없는** 유일한 것입니다 — 값이 들어가지 않습니다. 그래서
+    go/no-go 단계의 침묵이 문제였습니다.
+- **`json` / `jsonb`가 이제 포함되고, 무제한 `varchar`도 함께 포함됩니다.** 아래 참조: 이들을 제외했던
+  근거가 틀렸습니다.
+- **제외 대화 상자가 PostgreSQL 소스에서 올바른 컬럼을 미리 체크합니다.** 격리 사유는 DSQL *타입*을
+  이야기하고 PostgreSQL→DSQL은 이 타입들에 대해 항등이므로, MySQL 맵(`mediumblob`→`bytea`)은 아무것도
+  맞히지 못해 대화 상자가 아무것도 선택하지 않은 채 열렸습니다. MySQL 맵에 합치지 않고 PostgreSQL 맵을
+  따로 두었습니다: MySQL에도 자체 `text` 타입이 있고, 오늘은 이 헬퍼에 닿을 수 없지만 합치면 그 배제가
+  **정확성의 전제**가 되기 때문입니다. `jsonb` 사유가 `json` 항목에도 매칭되던 것도 고쳤습니다.
+- **매뉴얼이 "capture 단계 제외는 Evaluation `OVERSIZED_LOB` 플래그가 구동한다"고 말하지 않습니다.**
+  `column.exclude.list`를 추적하면 **어느 엔진에서도** 그런 의존이 없습니다: 제외는 같은 타입 집합을 읽는
+  Data Migration / CDC 단계의 opt-in 카드입니다. 3개 언어 모두 고쳤습니다(`DsqlSinkTask` Javadoc에 같은
+  문장이 있지만 의도적으로 남겼습니다 — 주석 하나 때문에 커넥터 소스를 고치면 `PLUGIN_VERSION` 범프와
+  라이브 CDC 스택의 Delete + Deploy 사이클이 필요합니다).
+- **복원되거나 새로고침된 PostgreSQL 세션이 "MySQL to Aurora DSQL" 제목의 리포트를 내보내지 않습니다.**
+  노트의 근본 원인(호출부가 넘기지 않는 엔진 기본값)을 전수 스윕해 찾았습니다: `EvaluationResult`를
+  재조립하는 4곳이 `source_type`을 떨어뜨려, Schema Conversion의 Generate를 누르거나 Refresh 버튼 둘 중
+  하나를 누르거나 앱을 재시작해 세션을 복원하면 Step-1 산출물의 제목이 틀렸습니다. 제자리 재조립 3곳은 이제
+  `dataclasses.replace`를 쓰므로, 다음에 필드가 추가돼도 같은 일이 반복될 수 없습니다.
+
+### 교정 (노트의 결론이 거꾸로였습니다)
+
+- **`json`/`jsonb`는 1 MiB 캡에서 면제되지 않습니다.** 노트는 코드가 이들을 제외한 것이 옳고 매뉴얼이 더
+  느슨한 진술이라고 했고, 근거는 측정값이었습니다: 1,117,396자 text 값의 `pg_column_size`가 4400, 즉
+  압축됐다는 것. 그 관측은 사실이지만 아무것도 결정하지 못합니다:
+  - DSQL은 `json`/`jsonb` **뿐 아니라** `text`/`varchar`/`bpchar`도 자동 압축합니다. 따라서 압축은 구분
+    기준이 되지 못합니다. 압축이 `json`을 빼는 근거라면 `text`도 똑같이 빼야 하고, 집합은 비어버립니다.
+  - 문서는 1 MiB 한도를 `bytea`·`text`·`json`·`jsonb`에 두고, `json`/`jsonb`에 대해서는 그 한도가
+    **압축된** 크기에 적용된다고 명시합니다 — 캡을 없앤 것이 아니라 옮긴 것입니다.
+  - 이것은 v0.1.468이 한 릴리스를 들여 되돌린 바로 그 실수입니다: 압축 프로브는 문서화된 쿼터를 이기지
+    못합니다. 노트대로 했다면 3개 언어 고객 문서를 느슨하게 만들었을 것입니다.
+  즉 코드 주석이 틀렸고 매뉴얼이 맞았습니다. 집합은 이제 `{text, bytea, json, jsonb}` 더하기 무제한
+  `character varying`(길이 인식이므로 `varchar(50)`은 건드리지 않음)이며, 교정된 근거를 그 옆에 적었습니다.
+
+### 알면서 바꾸지 않은 것
+
+- CDC 싱크의 쓰기 전 1 MiB 가드는 **raw** 바이트 길이를 재는데, `json`/`jsonb`와 `text`의 문서화된 캡은
+  **압축된** 크기 기준입니다. 그 사이에 있는 잘 압축되는 문서는 DSQL이 받아줬을 텐데도 dead-letter됩니다.
+  조용하지 않습니다(DLQ 깊이, Validation의 누락 수). 닫으려면 DSQL이 판정하게 해야 합니다 — 써 보고
+  `54000`에 dead-letter — 이는 `PLUGIN_VERSION` 범프와 Delete + Deploy 인프라 사이클이 필요한 의도적인
+  커넥터 설계 변경이므로, 여기에 접어넣지 않고 별도 결정으로 둡니다.
+
 ## v0.1.491
 
 PostgreSQL 소스 경로 감사에서 17건이 보고되었습니다. 17건 모두를 코드에 대해 재검증한 뒤, 각 건을

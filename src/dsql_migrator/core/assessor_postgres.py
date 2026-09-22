@@ -13,7 +13,7 @@ DSQL column / index / key-column-count limits. These read structural inventory f
 
 Excluded (all inspect MySQL specifics, so they would misfire or mislead on a PostgreSQL
 source): the MySQL type/feature rules (ENUM/SET, TINYINT(1), BIT, YEAR, MySQL collation,
-MySQL spatial + LOB, ON UPDATE CURRENT_TIMESTAMP, MySQL index types), the MySQL-binlog
+MySQL spatial, ON UPDATE CURRENT_TIMESTAMP, MySQL index types), the MySQL-binlog
 CDC cascade rule (its guidance is entirely MySQL/Debezium-framed; PostgreSQL CDC uses its
 own logical-replication readiness checks instead), and the view rule (its linter targets
 MySQL application-query anti-patterns).
@@ -32,6 +32,12 @@ reads a MySQL TYPE STRING or a structural field:
   :class:`PgGeneratedColumnRule` / :class:`PgIdentityKeyRule`, which keep the rule ids and
   mirror the Schema Conversion wording for the same condition -- the same
   separate-PG-variant shape ``converter._pg_generated_column_warning`` already uses.
+* ``OversizedLobRule`` needed BOTH: the 1 MiB cap is a TARGET limit that applies to
+  PostgreSQL ``text``/``bytea``/``json``/``jsonb`` just as much, but the rule matches MySQL
+  type NAMES, so registering it here would have found nothing forever.
+  :class:`PgOversizedLobRule` keeps the ``OVERSIZED_LOB`` id and reads the shared
+  ``assessor.is_pg_oversized_lob_type`` predicate, which Schema Conversion and the UI's
+  exclusion offer also use -- one definition, three layers.
 
 The DSQL-unsupported PostgreSQL TYPE rule IS included (``UnsupportedPostgresTypeRule``,
 below) so Evaluation flags an unsupported column type the same as Schema Conversion does.
@@ -191,6 +197,64 @@ class PgGeneratedColumnRule(Rule):
         return findings
 
 
+class PgOversizedLobRule(Rule):
+    """Flag PostgreSQL columns with no length limit, whose values can exceed 1 MiB.
+
+    Shares the rule id with the MySQL ``OversizedLobRule`` but not its type set: that one
+    matches ``mediumtext``/``longblob``, which a PostgreSQL inventory never contains
+    (``column.mysql_type`` holds ``format_type`` output), so REGISTERING the shared rule
+    here would have reported zero findings forever. The 1 MiB cap is a TARGET (DSQL) limit
+    and applies to PostgreSQL ``text``/``bytea``/``json``/``jsonb`` and an unbounded
+    ``varchar`` identically -- the reason the rule was excluded was the MySQL type names,
+    not the risk being MySQL-specific.
+
+    This matters more than the MySQL case, not less: PostgreSQL ``text``/``bytea`` are
+    unbounded by DEFAULT, and this is the one DSQL limit whose breach cannot be undone by
+    reloading -- the value simply does not fit, so the row is quarantined (Full Load) or
+    dead-lettered (CDC). The manual documents ``OVERSIZED_LOB`` as the flag for exactly
+    this, naming PostgreSQL explicitly, so a PostgreSQL source reading AUTO here left the
+    documented signal with nothing behind it.
+    """
+
+    rule_id = "OVERSIZED_LOB"
+
+    def evaluate(self, inventory: "SourceInventory") -> "list[Finding]":
+        from dsql_migrator.core.assessor import is_pg_oversized_lob_type
+
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            columns = [
+                f"{column.name} ({column.mysql_type})"
+                for column in table.columns
+                if is_pg_oversized_lob_type(column.mysql_type)
+            ]
+            if not columns:
+                continue
+            names = ", ".join(columns)
+            findings.append(
+                Finding(
+                    object=ObjectKey(KIND_TABLE, table.name),
+                    rule_id=self.rule_id,
+                    classification=Classification.MANUAL,
+                    risk=(
+                        f"Columns ({names}) have no length limit, so a value can exceed "
+                        "the Aurora DSQL 1 MiB per-value limit. An oversized value cannot "
+                        "be stored: the row is quarantined during Full Load or "
+                        "dead-lettered during CDC, and reloading cannot fix it."
+                    ),
+                    recommendation=(
+                        "Check the largest value in each column. If any exceeds 1 MiB, "
+                        "move that content to external storage (e.g. Amazon S3) and store "
+                        "a reference instead, or exclude the column on the Data Migration "
+                        "step. For json/jsonb and text the limit applies to the COMPRESSED "
+                        "size, so a highly compressible document may still fit."
+                    ),
+                    effort=EffortLevel.MEDIUM,
+                )
+            )
+        return findings
+
+
 class PgIdentityKeyRule(Rule):
     """Throughput advice for a serial / ``GENERATED AS IDENTITY`` primary key.
 
@@ -265,7 +329,10 @@ def default_rules() -> "list[Rule]":
         UnsupportedPostgresTypeRule(),
         # PG-specific: materialized views / foreign tables (no DSQL equivalent).
         UnsupportedRelationRule(),
-        # PG-worded variants of two shared conditions whose MySQL text cannot be reused.
+        # PG-worded variants of shared conditions whose MySQL text/type set cannot be
+        # reused. The oversized-LOB one is first of the three: it is the only DSQL limit
+        # here whose breach cannot be undone by reloading.
+        PgOversizedLobRule(),
         PgGeneratedColumnRule(),
         PgIdentityKeyRule(),
         ForeignKeyRule(),

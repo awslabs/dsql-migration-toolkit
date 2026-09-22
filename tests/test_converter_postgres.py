@@ -1007,3 +1007,44 @@ def test_pk_strategy_notes_never_say_auto_increment_for_a_pg_source() -> None:
         assert "AUTO_INCREMENT column 'id'" in " ".join(
             w.message for w in mysql_conv.warnings
         )
+
+
+def test_pg_source_gets_an_oversized_lob_note_at_schema_conversion() -> None:
+    """Oversized-LOB was the ONLY entry in the converter's optional-warning tuple that was
+    suppressed for PostgreSQL with no `_pg_*` counterpart -- and it is the one DSQL limit
+    whose breach cannot be fixed by reloading. PG text/bytea are unbounded by DEFAULT, so a
+    PG source is strictly MORE likely to hit it than MySQL."""
+    table = TableDef(
+        name="shop.media",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="content", mysql_type="bytea"),
+            ColumnDef(name="body", mysql_type="text"),
+            ColumnDef(name="code", mysql_type="character varying(50)"),
+        ],
+        primary_key=["id"],
+    )
+    conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    note = next(w for w in conv.warnings if "1 MiB per-value" in w.message)
+    assert "content (bytea)" in note.message
+    assert "body (text)" in note.message
+    assert "code" not in note.message  # a bounded varchar cannot exceed the cap
+    assert "MySQL" not in note.message
+    # Names the in-tool remedy, not only "move it to S3".
+    assert "exclude the column" in note.message
+
+
+def test_mysql_oversized_lob_note_is_unchanged_for_a_mysql_source() -> None:
+    table = TableDef(
+        name="media",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="content", mysql_type="longblob"),
+        ],
+        primary_key=["id"],
+    )
+    conv = SchemaConverter().convert_table(table)
+    note = next(w for w in conv.warnings if "1 MiB per-value" in w.message)
+    assert "are MySQL LOB/TEXT types" in note.message
+    # And the PG variant does not also fire for a MySQL source.
+    assert sum(1 for w in conv.warnings if "1 MiB per-value" in w.message) == 1

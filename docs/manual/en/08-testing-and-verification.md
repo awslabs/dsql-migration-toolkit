@@ -57,7 +57,7 @@ transaction must **re-run**, and under contention this happens often.
 | DSQL characteristic | Scenario tested | How it's exercised |
 |---|---|---|
 | Value > 1 MiB | A large value (MySQL LOB/TEXT, or PostgreSQL `text`/`bytea`/`json`) over the limit during Full Load **and** during CDC | Per-row **quarantine** (PK + reason recorded, table keeps loading) at Full Load; **DLQ** at the sink, measured before the write (`DsqlSinkTask` oversized guard) |
-| Value > 8 MiB (can't traverse Kafka) | An even larger column | Excluded **at capture** via Debezium `column.exclude.list`, driven by the Evaluation `OVERSIZED_LOB` flag |
+| Value > 8 MiB (can't traverse Kafka) | An even larger column | Excluded **at capture** via Debezium `column.exclude.list` — you tick the column on the Data Migration / CDC step's oversized-LOB card (the same columns Evaluation flags `OVERSIZED_LOB`) |
 
 ### IAM-token auth — no password, 15-min tokens, 60-min connections
 

@@ -391,12 +391,26 @@ def apply_session_snapshot(
         and snapshot.assessment is not None
         and snapshot.target_inventory is not None
     ):
+        # The engine has to be restored too, or a restored PostgreSQL session exports an
+        # Evaluation report titled "MySQL to Aurora DSQL...". Derived here rather than
+        # reusing the ``_stype`` above, because that one sits inside the
+        # ``if snapshot.source_host`` block and an older snapshot without a host would
+        # otherwise silently fall back to MySQL.
+        try:
+            restored_source_type = (
+                SourceType(snapshot.source_type)
+                if snapshot.source_type
+                else SourceType.MYSQL
+            )
+        except ValueError:
+            restored_source_type = SourceType.MYSQL
         eval_state.set_result(  # type: ignore[attr-defined]
             EvaluationResult(
                 inventory=snapshot.inventory,
                 assessment=snapshot.assessment,
                 target_inventory=snapshot.target_inventory,
                 target_conflicts=list(snapshot.target_conflicts),
+                source_type=restored_source_type,
             )
         )
 

@@ -20,6 +20,7 @@ from typing import Iterable, Mapping, Optional, Sequence
 from dsql_migrator.core.assessor import (
     _OVERSIZED_LOB_BASES,
     _base_type,
+    is_pg_oversized_lob_type,
 )
 from dsql_migrator.core.models import (
     ChunkState,
@@ -1294,14 +1295,6 @@ class LobExclusionCandidate:
     columns: tuple[str, ...]
 
 
-# PostgreSQL base types whose values can exceed the DSQL 1 MiB per-value limit:
-# unbounded ``text`` and ``bytea`` (a length-bounded varchar(n) with small n cannot,
-# and json/jsonb are stored differently and are not hit by the text 1 MiB cap the same
-# way). The MySQL set (_OVERSIZED_LOB_BASES) does not match PG type names, so a PG
-# source would otherwise offer NO exclusions and the panel would falsely report none.
-_PG_OVERSIZED_LOB_BASES = frozenset({"text", "bytea"})
-
-
 def lob_exclusion_candidates(
     inventory: Optional[SourceInventory],
     *,
@@ -1310,18 +1303,21 @@ def lob_exclusion_candidates(
     """Return the oversized-LOB columns per table, sorted by table name.
 
     Pure: derived directly from the source inventory's column types, so the CDC
-    screen can offer exclusion without re-running evaluation. The base-type set is
+    screen can offer exclusion without re-running evaluation. The classification is
     chosen by ``source_type`` -- MySQL ``mediumtext/longtext/mediumblob/longblob`` vs
-    PostgreSQL ``text/bytea`` -- because ``column.mysql_type`` holds the SOURCE engine's
-    type name (matching a MySQL set against PG types found nothing). Primary-key columns
-    are never offered (a PK can't be dropped); returns ``[]`` when nothing qualifies.
+    PostgreSQL's ``is_pg_oversized_lob_type`` -- because ``column.mysql_type`` holds the
+    SOURCE engine's type name (matching a MySQL set against PG types found nothing).
+    Both come from :mod:`core.assessor`, so this offer, the Evaluation
+    ``OVERSIZED_LOB`` rule and the Schema Conversion note can never disagree about which
+    columns are at risk. Primary-key columns are never offered (a PK can't be dropped);
+    returns ``[]`` when nothing qualifies.
     """
     if inventory is None:
         return []
-    bases = (
-        _PG_OVERSIZED_LOB_BASES
+    is_oversized = (
+        is_pg_oversized_lob_type
         if source_type is SourceType.POSTGRES
-        else _OVERSIZED_LOB_BASES
+        else (lambda spelling: _base_type(spelling) in _OVERSIZED_LOB_BASES)
     )
     candidates: list[LobExclusionCandidate] = []
     for table in inventory.tables:
@@ -1329,8 +1325,7 @@ def lob_exclusion_candidates(
         columns = tuple(
             column.name
             for column in table.columns
-            if _base_type(column.mysql_type) in bases
-            and column.name not in pk
+            if is_oversized(column.mysql_type) and column.name not in pk
         )
         if columns:
             candidates.append(
@@ -1340,18 +1335,36 @@ def lob_exclusion_candidates(
     return candidates
 
 
-# MySQL LOB base types split by the DSQL type they convert to, so a quarantine reason
+# Source LOB base types split by the DSQL type they convert to, so a quarantine reason
 # that names the DSQL type can be narrowed back to the source columns that produced it.
-# (converter: mediumblob/longblob -> bytea, mediumtext/longtext -> text.)
+# (MySQL converter: mediumblob/longblob -> bytea, mediumtext/longtext -> text.)
 _LOB_BASES_BY_TARGET_TYPE: "dict[str, frozenset[str]]" = {
     "bytea": frozenset({"mediumblob", "longblob"}),
     "text": frozenset({"mediumtext", "longtext"}),
+}
+
+# The PostgreSQL map. PG -> DSQL is the IDENTITY for these types, so the source spelling
+# equals the target type named in the reason -- which is precisely why the MySQL map found
+# nothing for a PG source and the dialog opened with nothing pre-ticked. Kept as a separate
+# dict rather than merged into the one above: a MySQL source has its own ``text`` type, and
+# although it can never reach this helper today (``_OVERSIZED_LOB_BASES`` deliberately
+# omits plain ``text``/``blob`` as too small to exceed 1 MiB), merging would make that
+# exclusion load-bearing for CORRECTNESS -- widen the MySQL set later and a MySQL ``text``
+# column would start being pre-ticked from a ``text`` reason. ``json``/``jsonb`` map to
+# themselves and appear in a reason under their own name.
+_PG_LOB_BASES_BY_TARGET_TYPE: "dict[str, frozenset[str]]" = {
+    "bytea": frozenset({"bytea"}),
+    "text": frozenset({"text", "character varying", "character"}),
+    "jsonb": frozenset({"jsonb"}),
+    "json": frozenset({"json"}),
 }
 
 
 def preselect_lob_columns_for_reason(
     columns_with_types: "Sequence[tuple[str, str]]",
     reason_text: str,
+    *,
+    source_type: SourceType = SourceType.MYSQL,
 ) -> tuple[str, ...]:
     """Return the LOB columns a quarantine reason points at, for pre-ticking a picker.
 
@@ -1361,24 +1374,37 @@ def preselect_lob_columns_for_reason(
     (``datatype limit greater than 1048576 bytes not supported for bytea``).
 
     That type token is still a real signal, because the source->DSQL mapping is
-    deterministic: ``mediumblob``/``longblob`` become ``bytea`` and
-    ``mediumtext``/``longtext`` become ``text``. So a ``bytea`` reason narrows a table with
-    both a blob and a text LOB column (``product_media`` has ``content`` and
-    ``full_description``) down to the blob one.
+    deterministic: for MySQL ``mediumblob``/``longblob`` become ``bytea`` and
+    ``mediumtext``/``longtext`` become ``text``; for PostgreSQL the mapping is the identity.
+    So a ``bytea`` reason narrows a table with both a blob and a text LOB column
+    (``product_media`` has ``content`` and ``full_description``) down to the blob one.
+
+    ``source_type`` picks the mapping. Without it a PostgreSQL source matched PG spellings
+    against MySQL base names and pre-ticked NOTHING -- not a blocker (the dialog's
+    documented else-branch explains the empty selection and the action refuses an empty
+    pick), but one avoidable click on the recovery path.
 
     This only PRE-SELECTS; the caller must still show the choice, because excluding the
     wrong column silently NULLs it for the whole table. Returns ``()`` when the reason
     names no known type or nothing matches, which means "make the user choose".
     """
     lowered = (reason_text or "").lower()
+    by_target = (
+        _PG_LOB_BASES_BY_TARGET_TYPE
+        if source_type is SourceType.POSTGRES
+        else _LOB_BASES_BY_TARGET_TYPE
+    )
     matched: list[str] = []
-    for target_type, bases in _LOB_BASES_BY_TARGET_TYPE.items():
+    # Longest target name first so a "jsonb" reason is not also matched by the "json"
+    # entry, which would pre-tick a json column for a jsonb failure.
+    for target_type in sorted(by_target, key=len, reverse=True):
         if target_type not in lowered:
             continue
         for column, mysql_type in columns_with_types:
             base = str(mysql_type or "").split("(")[0].strip().lower()
-            if base in bases and column not in matched:
+            if base in by_target[target_type] and column not in matched:
                 matched.append(column)
+        break
     return tuple(matched)
 
 

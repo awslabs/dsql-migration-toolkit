@@ -423,8 +423,9 @@ a clean final go/no-go, freeze source writes and let CDC drain first (Q27).
 They are **never silently dropped**. In Full Load a value over DSQL's ~1 MiB
 per-value limit is **quarantined** per-row (its primary key + reason recorded in the
 error log) while the rest of the table loads; in CDC such a row goes to the **DLQ**.
-Values that can't even traverse the pipeline (> ~8 MiB) are **excluded at capture**,
-driven by the `OVERSIZED_LOB` flag from Evaluation. You see exactly what was set
+Values that can't even traverse the pipeline (> ~8 MiB) are **excluded at capture**:
+you tick the column on the Data Migration / CDC step's oversized-LOB card, which offers
+the same columns Evaluation flags `OVERSIZED_LOB`. You see exactly what was set
 aside. See [Chapter 6 §6.1](06-limitations.md#61-aurora-dsql-feature-limits-your-schema-must-fit-these).
 
 

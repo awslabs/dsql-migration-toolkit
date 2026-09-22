@@ -2380,6 +2380,7 @@ from dsql_migrator.core.assessor import (  # noqa: E402 - avoids duplicate liter
     _OVERSIZED_LOB_BASES,
     _UNSUPPORTED_INDEX_TYPES,
     _base_type,
+    is_pg_oversized_lob_type,
 )
 
 
@@ -2804,6 +2805,43 @@ def _oversized_lob_warning(table: TableDef) -> Optional[ConversionWarning]:
             "(quarantined in Full Load, dead-lettered in CDC) and reloading cannot fix "
             "it. Check the largest values now; if any exceed 1 MiB, move that content to "
             "Amazon S3 and store a reference instead."
+        ),
+    )
+
+
+def _pg_oversized_lob_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """PostgreSQL-source variant of :func:`_oversized_lob_warning`.
+
+    Same target limit, different source types -- and a strictly HIGHER chance of hitting
+    it: PostgreSQL ``text``/``bytea`` are unbounded by default, whereas a MySQL user has to
+    choose ``mediumtext``/``longblob`` deliberately. Kept as a separate helper so the MySQL
+    message stays byte-identical, which is the pairing every other engine-branched note in
+    the optional-warning tuple already uses. Until now oversized-LOB was the only item in
+    that tuple suppressed for PostgreSQL with no counterpart, so the one DSQL limit whose
+    breach cannot be fixed by reloading was the one the PostgreSQL path never mentioned.
+    """
+    columns = [
+        f"{column.name} ({column.mysql_type})"
+        for column in table.columns
+        if is_pg_oversized_lob_type(column.mysql_type)
+    ]
+    if not columns:
+        return None
+    names = ", ".join(columns)
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.RECOMMENDATION,
+        message=(
+            f"Columns ({names}) have no length limit, so a value can exceed Aurora DSQL's "
+            "1 MiB per-value cap. The DDL itself is fine — the limit bites per ROW during "
+            "migration: any oversized value is permanently dropped (quarantined in Full "
+            "Load, dead-lettered in CDC) and reloading cannot fix it. Check the largest "
+            "values now; if any exceed 1 MiB, move that content to Amazon S3 and store a "
+            "reference instead, or exclude the column on the Data Migration step. (For "
+            "json/jsonb and text the limit applies to the COMPRESSED size, so a highly "
+            "compressible document may still fit — treat this as a ceiling to check, not "
+            "a certain failure.)"
         ),
     )
 
@@ -3704,6 +3742,7 @@ class SchemaConverter:
             # the key's byte estimate, and COMPOSITE_KEY changes its columns).
             _key_size_warning(table, create, is_postgres=is_postgres),
             (_oversized_lob_warning(table) if not is_postgres else None),
+            (_pg_oversized_lob_warning(table) if is_postgres else None),
             (_generated_column_warning(table) if not is_postgres else None),
             (_pg_generated_column_warning(table) if is_postgres else None),
             (_collation_warning(table) if not is_postgres else None),

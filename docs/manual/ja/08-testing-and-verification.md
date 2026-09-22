@@ -40,7 +40,7 @@ DSQL は書き込み競合をコミット時に検出し、`SQLSTATE 40001` を�
 | DSQL 特性 | テストするシナリオ | どう検証するか |
 |---|---|---|
 | 1 MiB を超える値 | Full Load 中 **および** CDC 中に、上限を超える大きな値(MySQL の LOB/TEXT、または PostgreSQL の `text`/`bytea`/`json`) | Full Load では行単位の **隔離**(quarantine)(PK と理由を記録し、テーブルの読み込みは継続)。シンクでは書き込み前に計測して **DLQ** へ(`DsqlSinkTask` のサイズ超過ガード) |
-| 8 MiB を超える値(Kafka を通過できない) | さらに大きなカラム | Evaluation の `OVERSIZED_LOB` フラグに基づき、Debezium の `column.exclude.list` によって **キャプチャ時点で** 除外する |
+| 8 MiB を超える値(Kafka を通過できない) | さらに大きなカラム | Debezium の `column.exclude.list` によって **キャプチャ時点で** 除外する — Data Migration / CDC ステップの特大 LOB カードで列をチェックします(Evaluation が `OVERSIZED_LOB` としてフラグ付けするのと同じ集合) |
 
 ### IAM トークン認証 — パスワードなし、15 分のトークン、60 分の接続
 

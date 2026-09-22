@@ -5,6 +5,98 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.492
+
+A fix-request note reported that a PostgreSQL source's oversized `text`/`bytea` values pass
+all three gates in silence and that the post-quarantine recovery button disappears. All of
+it is confirmed, plus one more instance of the same root cause. **One of the note's own
+conclusions was backwards and is corrected here.**
+
+### Fixed
+
+- **A PostgreSQL migration gets its post-quarantine recovery button back.** The
+  "Exclude column & reload" action's candidate list came from
+  `lob_exclusion_candidates(inventory)` with no `source_type`, so it fell back to the MySQL
+  default and matched `mediumtext`/`longblob` against a PostgreSQL inventory's `text`/`bytea`
+  — nothing matched, and the renderer's "no candidates → do not offer a dead button" early
+  return then hid the only in-tool route forward for every PostgreSQL source. The other two
+  callers of that function pass the engine; this one, added later, never picked it up.
+  - **The loss is the RECOVERY ROUTE, not the data.** The oversized value is loudly
+    reported either way (per-row quarantine, the amber completeness banner, the Validation
+    deficit). What a PostgreSQL operator lacked was the fix: the pre-load exclusion panel is
+    locked once a load has committed and its own text points at *Start over*, which discards
+    Evaluation, Schema Conversion (including hand/AI-edited DDL) and the CDC inputs. The
+    per-table banner meanwhile advises "fix the source value and reload", impossible on a
+    read-only source.
+  - PostgreSQL is strictly more exposed to this than MySQL: `text`/`bytea` are **unbounded
+    by default**, whereas a MySQL user has to choose `mediumtext`/`longblob` deliberately.
+  - Pinned by an AST assertion on the call site. A behavioural test cannot reach it — the
+    helper is a closure inside the screen builder, and every existing test of this button
+    injects it as a lambda, which is exactly why the defect survived (one of them even pins
+    the "empty → no button" branch it exploits).
+- **Evaluation and Schema Conversion no longer stay silent about oversized PostgreSQL
+  columns.** The manual documents the Evaluation `OVERSIZED_LOB` flag as the signal for
+  this and names PostgreSQL explicitly, yet the rule could not fire: it was excluded from
+  the PostgreSQL rule set, and merely registering it would have found nothing forever
+  because it matches MySQL type NAMES while a PostgreSQL inventory holds `format_type`
+  spellings. Schema Conversion suppressed its counterpart too — oversized-LOB was the only
+  entry in that engine-branched tuple with no `_pg_*` pair. Added `PgOversizedLobRule` and
+  `_pg_oversized_lob_warning`, both reading one shared predicate now in `core.assessor`, so
+  Evaluation, Schema Conversion and the UI's exclusion offer cannot disagree about which
+  columns are at risk.
+  - This is the one DSQL limit whose breach **cannot be undone by reloading** — the value
+    does not fit — which is why silence at the go/no-go step mattered.
+- **`json` / `jsonb` are now covered, and an unbounded `varchar` with them.** See below: the
+  reasoning that excluded them was wrong.
+- **The exclude dialog pre-ticks the right column for a PostgreSQL source.** The quarantine
+  reason names the DSQL *type*, and PostgreSQL → DSQL is the identity for these types, so
+  the MySQL map (`mediumblob`→`bytea`) matched nothing and the dialog opened with nothing
+  selected. Kept as a separate PostgreSQL map rather than merged into the MySQL one: MySQL
+  has its own `text` type, and although it cannot reach this helper today, merging would
+  make that exclusion load-bearing for correctness. A `jsonb` reason no longer also matches
+  the `json` entry.
+- **The manual no longer claims the capture-stage exclusion is "driven by the Evaluation
+  `OVERSIZED_LOB` flag".** Tracing `column.exclude.list` shows no such dependency for
+  *either* engine: the exclusion is an opt-in card on the Data Migration / CDC step reading
+  the same type set. Reworded in all three languages (the `DsqlSinkTask` Javadoc carries the
+  same sentence and is deliberately left alone — editing connector source would require a
+  `PLUGIN_VERSION` bump and a Delete + Deploy cycle on live CDC stacks for a comment).
+- **A restored or refreshed PostgreSQL session no longer exports a report titled "MySQL to
+  Aurora DSQL".** Found by sweeping for the note's root cause (an engine default the caller
+  does not pass): four sites rebuild `EvaluationResult` and dropped `source_type`, so after
+  clicking Generate in Schema Conversion, either Refresh-browser button, or any app restart,
+  the Step-1 deliverable was mislabelled. The three in-place rebuilds now use
+  `dataclasses.replace`, so the next field added cannot repeat this.
+
+### Corrected (the note's conclusion was backwards)
+
+- **`json`/`jsonb` are NOT exempt from the 1 MiB cap.** The note argued the code was right
+  to exclude them and the manual was the looser statement, citing a measurement: a
+  1,117,396-character text value reported `pg_column_size` 4400, i.e. it compressed. That
+  observation is true and settles nothing:
+  - DSQL auto-compresses `text`/`varchar`/`bpchar` **as well as** `json`/`jsonb`, so
+    compression cannot discriminate between them. If it justified dropping `json` it would
+    equally justify dropping `text`, leaving the set empty.
+  - The documentation puts the 1 MiB limit on `bytea`, `text`, `json` and `jsonb`, and for
+    `json`/`jsonb` states it applies to the **compressed** size — which relocates the cap,
+    it does not remove it.
+  - This is the same mistake v0.1.468 spent a release reverting: a compression probe does
+    not overrule a documented quota. Acting on the note as written would have loosened
+    customer-facing docs in three languages.
+  So the code comment was wrong and the manual was right. The set is now
+  `{text, bytea, json, jsonb}` plus an unbounded `character varying` (length-aware, so
+  `varchar(50)` is untouched), and the corrected reasoning is recorded beside it.
+
+### Known and deliberately not changed
+
+- The CDC sink's pre-write 1 MiB guard measures the **raw** byte length, while the
+  documented cap for `json`/`jsonb` and `text` is on the **compressed** size. A highly
+  compressible document between those two points is dead-lettered although DSQL would have
+  accepted it. It is visible (DLQ depth, Validation's missing count), not silent. Closing it
+  means letting DSQL arbitrate — attempt the write and dead-letter on `54000` — which is a
+  deliberate connector design change requiring a `PLUGIN_VERSION` bump and a Delete + Deploy
+  infrastructure cycle, so it belongs in its own decision rather than folded in here.
+
 ## v0.1.491
 
 A PostgreSQL-source path audit reported 17 findings. All 17 were re-verified against the

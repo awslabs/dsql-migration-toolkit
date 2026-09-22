@@ -926,11 +926,10 @@ def build_data_migration_screen(
                 now present on the target) reflects the latest schema -- e.g.
                 tables just created on the target in Step 2.
                 """
+                from dataclasses import replace as _dc_replace
+
                 from nicegui import run as _run
 
-                from dsql_migrator.ui.evaluation import (
-                    EvaluationResult as _ER,
-                )
                 from dsql_migrator.ui.evaluation import (
                     _default_introspector_factory,
                     _default_target_browser_factory,
@@ -966,10 +965,13 @@ def build_data_migration_screen(
                 except Exception as exc:  # noqa: BLE001
                     ui.notify(f"Could not refresh objects: {exc}", type="negative")
                     return
+                # ``replace`` copies every field this rebuild does not change -- including
+                # ``source_type``, which it used to drop, titling a PostgreSQL migration's
+                # exported Evaluation report "MySQL to Aurora DSQL...".
                 eval_state.set_result(
-                    _ER(
+                    _dc_replace(
+                        current,
                         inventory=new_inventory,
-                        assessment=current.assessment,
                         target_inventory=new_target,
                         target_conflicts=_find_target_conflicts(
                             new_inventory, new_target
@@ -1398,7 +1400,24 @@ def build_data_migration_screen(
                     return ()
                 allowed = {
                     c.table: set(c.columns)
-                    for c in (lob_exclusion_candidates(inventory) or ())
+                    # The engine MUST be passed: the parameter defaults to MySQL, whose
+                    # type names (mediumtext/longblob/...) never match a PostgreSQL
+                    # inventory's format_type spellings (text/bytea), so the set came back
+                    # empty and _quar_exclude_reload's "no candidates -> do not offer a
+                    # dead button" early return hid the ONLY post-quarantine recovery
+                    # action for every PostgreSQL migration. Same expression as the
+                    # pre-load panel's call above.
+                    for c in (
+                        lob_exclusion_candidates(
+                            inventory,
+                            source_type=getattr(
+                                getattr(session, "source_config", None),
+                                "source_type",
+                                SourceType.MYSQL,
+                            ),
+                        )
+                        or ()
+                    )
                 }.get(table_name, set())
                 return tuple(
                     (col.name, col.mysql_type)

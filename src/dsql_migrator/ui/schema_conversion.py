@@ -2280,11 +2280,10 @@ def build_schema_conversion_screen(
             )
             async def refresh_source() -> None:
                 """Re-introspect the source DB and refresh the source tree."""
+                from dataclasses import replace as _replace
+
                 from nicegui import run as _run
 
-                from dsql_migrator.ui.evaluation import (
-                    EvaluationResult as _ER,
-                )
                 from dsql_migrator.ui.evaluation import (
                     _default_introspector_factory,
                 )
@@ -2308,13 +2307,12 @@ def build_schema_conversion_screen(
                     return
                 old_result = eval_state.result
                 if old_result is not None:
+                    # ``replace`` rather than re-listing every field: this rebuild silently
+                    # dropped ``source_type`` (added later), which titled a PostgreSQL
+                    # migration's exported report "MySQL to Aurora DSQL...". Copying by
+                    # default means the NEXT field added cannot repeat that.
                     eval_state.set_result(
-                        _ER(
-                            inventory=new_inventory,
-                            assessment=old_result.assessment,
-                            target_inventory=old_result.target_inventory,
-                            target_conflicts=old_result.target_conflicts,
-                        )
+                        _replace(old_result, inventory=new_inventory)
                     )
                 ui.notify("Source browser refreshed.", type="positive")  # type: ignore[attr-defined]
                 refresh()
@@ -2328,11 +2326,10 @@ def build_schema_conversion_screen(
                 re-render are noise, because the caller renders once it has committed its
                 own state. The manual refresh button keeps both.
                 """
+                from dataclasses import replace as _replace
+
                 from nicegui import run as _run
 
-                from dsql_migrator.ui.evaluation import (
-                    EvaluationResult as _ER,
-                )
                 from dsql_migrator.ui.evaluation import (
                     _default_target_browser_factory,
                     _find_target_conflicts,
@@ -2355,10 +2352,10 @@ def build_schema_conversion_screen(
                     return
                 old_result = eval_state.result
                 if old_result is not None:
+                    # ``replace`` for the same reason as refresh_source above.
                     eval_state.set_result(
-                        _ER(
-                            inventory=old_result.inventory,
-                            assessment=old_result.assessment,
+                        _replace(
+                            old_result,
                             target_inventory=new_target,
                             target_conflicts=_find_target_conflicts(
                                 old_result.inventory, new_target

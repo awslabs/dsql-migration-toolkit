@@ -1561,3 +1561,61 @@ def test_restored_snapshot_still_gates_the_cutover_actions() -> None:
         SimpleNamespace(get=lambda _sid: SchemaConversionState()),
         "S1",
     ) is True
+
+
+def test_restored_session_keeps_the_source_engine_on_the_evaluation_result() -> None:
+    """SWEEP-1: `EvaluationResult.source_type` exists so the exported Step-1 report is
+    titled for the right engine, but the restore rebuilt the result without it -- so after
+    any app restart a PostgreSQL migration's downloaded report read "MySQL to Aurora DSQL
+    Compatibility Assessment", contradicting the journey header on the same screen."""
+    from dsql_migrator.core.models import SourceConnectionConfig, SourceType
+
+    session, eval_state, conv_state, migration_state = _populated_states()
+    session.set_source(
+        SourceConnectionConfig(
+            source_type=SourceType.POSTGRES,
+            host="pg.example.com",
+            port=5432,
+            database="app",
+            username="mig",
+        ),
+        "pw",  # never persisted (Property 7); needed only to set the config
+    )
+    eval_state.set_result(
+        EvaluationResult(
+            inventory=_inventory(),
+            assessment=AssessmentReport.from_items([]),
+            target_inventory=TargetInventory(schemas=[]),
+            target_conflicts=[],
+            source_type=SourceType.POSTGRES,
+        )
+    )
+    snapshot = capture_session_snapshot(
+        "pg1", session, eval_state, conv_state, migration_state
+    )
+
+    restored = EvaluationState()
+    apply_session_snapshot(
+        snapshot,
+        SessionConnectionState(),
+        restored,
+        SchemaConversionState(),
+        DataMigrationState(),
+    )
+    assert restored.result is not None
+    assert restored.result.source_type is SourceType.POSTGRES
+
+    # A MySQL snapshot (and an older one with no engine recorded) still restores MySQL.
+    mysql_snapshot = capture_session_snapshot(
+        "my1", *_populated_states()
+    )
+    restored_mysql = EvaluationState()
+    apply_session_snapshot(
+        mysql_snapshot,
+        SessionConnectionState(),
+        restored_mysql,
+        SchemaConversionState(),
+        DataMigrationState(),
+    )
+    assert restored_mysql.result is not None
+    assert restored_mysql.result.source_type is SourceType.MYSQL

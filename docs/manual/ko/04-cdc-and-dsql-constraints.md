@@ -133,7 +133,7 @@ DSQL은 **약 1 MiB를 초과하는 단일 값**(`TEXT`/`bytea`)을 거부합니
 |---|---|
 | **≤ 1 MiB** | 정상 적용. |
 | **1 MiB – 8 MiB** | 싱크가 쓰기 **전에** 각 값을 측정해 초대형 값을 **DLQ로 격리**(quarantine)합니다(절대 적용 불가). 그런 레코드가 DLQ에 닿도록 Kafka를 통과하려면 토픽·클라이언트 한도를 상향(기본 4 MiB, 최대 8 MiB). |
-| **> 8 MiB** | Kafka에 들어갈 수 없음. **캡처 단계에서 제외**해야 함: Debezium `column.exclude.list`가 초대형 LOB 컬럼을 드롭(Evaluation `OVERSIZED_LOB` 플래그로 구동)해 파이프라인에 닿지 않게 함. |
+| **> 8 MiB** | Kafka에 들어갈 수 없음. **캡처 단계에서 제외**해야 함: Debezium `column.exclude.list`가 초대형 LOB 컬럼을 드롭해 파이프라인에 닿지 않게 함. 어떤 컬럼을 드롭할지는 Data Migration / CDC 단계의 초대형 LOB 카드에서 고릅니다 — Evaluation이 `OVERSIZED_LOB`로 표시하는 컬럼과 같은 집합입니다. |
 
 ### DLQ로 가는 것
 

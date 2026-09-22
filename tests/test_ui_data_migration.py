@@ -23001,3 +23001,109 @@ def test_format_watermark_trusts_the_known_engine_over_an_absent_lsn() -> None:
         wal_lsn="3/AF012B8",
     )
     assert format_watermark(with_lsn).is_postgres is True
+
+
+def test_quarantine_recovery_call_site_passes_the_source_engine() -> None:
+    """A/B3: the post-quarantine "Exclude column & reload" button's candidate list came from
+    `lob_exclusion_candidates(inventory)` with NO `source_type`, so it defaulted to MySQL,
+    matched MySQL type names against a PostgreSQL inventory, returned nothing, and
+    `_quar_exclude_reload`'s "no candidates -> do not offer a dead button" early return hid
+    the ONLY post-load recovery route for every PostgreSQL migration.
+
+    Asserted on the CALL SITE by AST. A behavioural test cannot reach it: the helper is a
+    closure inside `build_data_migration_screen`, and every existing test of this button
+    injects `lob_candidates_for` as a lambda -- bypassing the closure entirely, which is
+    exactly why the defect survived (one of them even pins "empty -> no button")."""
+    import ast
+    import pathlib
+
+    source = pathlib.Path(
+        "src/dsql_migrator/ui/data_migration/__init__.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    closures = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "lob_candidates_for"
+    ]
+    assert len(closures) == 1, "expected exactly one lob_candidates_for closure"
+
+    calls = [
+        node
+        for node in ast.walk(closures[0])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "lob_exclusion_candidates"
+    ]
+    assert len(calls) == 1, "expected one lob_exclusion_candidates call in the closure"
+    assert "source_type" in {kw.arg for kw in calls[0].keywords}, (
+        "lob_candidates_for must pass source_type; the parameter defaults to MySQL and "
+        "a PostgreSQL inventory then yields no candidates, hiding the recovery button"
+    )
+
+
+def test_preselect_lob_columns_is_engine_aware() -> None:
+    """P-4: the quarantine reason names the DSQL TYPE, and PG -> DSQL is the IDENTITY for
+    these types -- so the MySQL map (mediumblob/longblob -> bytea) matched nothing for a PG
+    source and the dialog opened with nothing pre-ticked."""
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration._models import (
+        preselect_lob_columns_for_reason,
+    )
+
+    pg_columns = [("content", "bytea"), ("body", "text"), ("doc", "jsonb")]
+    reason_bytea = (
+        "datatype limit greater than 1048576 bytes not supported for bytea"
+    )
+    assert preselect_lob_columns_for_reason(pg_columns, reason_bytea) == ()
+    assert preselect_lob_columns_for_reason(
+        pg_columns, reason_bytea, source_type=SourceType.POSTGRES
+    ) == ("content",)
+    # A text reason narrows to the text column, not the bytea one.
+    assert preselect_lob_columns_for_reason(
+        pg_columns,
+        "datatype limit greater than 1048576 bytes not supported for text",
+        source_type=SourceType.POSTGRES,
+    ) == ("body",)
+    # "jsonb" must not also match the "json" entry (substring) and pre-tick a json column.
+    assert preselect_lob_columns_for_reason(
+        [("doc", "jsonb"), ("meta", "json")],
+        "datatype limit greater than 1048576 bytes not supported for jsonb",
+        source_type=SourceType.POSTGRES,
+    ) == ("doc",)
+    # MySQL is unchanged.
+    assert preselect_lob_columns_for_reason(
+        [("content", "longblob"), ("body", "longtext")], reason_bytea
+    ) == ("content",)
+
+
+def test_lob_exclusion_candidates_cover_json_jsonb_and_unbounded_varchar() -> None:
+    from dsql_migrator.core.models import ColumnDef, SourceInventory, SourceType, TableDef
+    from dsql_migrator.ui.data_migration._models import lob_exclusion_candidates
+
+    inventory = SourceInventory(
+        tables=[
+            TableDef(
+                name="public.docs",
+                columns=[
+                    ColumnDef(name="id", mysql_type="bigint"),
+                    ColumnDef(name="body", mysql_type="text"),
+                    ColumnDef(name="payload", mysql_type="bytea"),
+                    ColumnDef(name="doc", mysql_type="jsonb"),
+                    ColumnDef(name="meta", mysql_type="json"),
+                    ColumnDef(name="free", mysql_type="character varying"),
+                    ColumnDef(name="code", mysql_type="character varying(50)"),
+                ],
+                primary_key=["id"],
+            )
+        ]
+    )
+    # The MySQL default still finds nothing in a PG inventory (the reason source_type
+    # has to be passed at every call site).
+    assert lob_exclusion_candidates(inventory) == []
+    candidates = lob_exclusion_candidates(
+        inventory, source_type=SourceType.POSTGRES
+    )
+    assert len(candidates) == 1
+    assert candidates[0].columns == ("body", "payload", "doc", "meta", "free")

@@ -38,12 +38,15 @@ _EXPECTED_PG_RULE_IDS = {
     "GENERATED_COLUMN",
     "AUTO_INCREMENT",
     "NUMERIC_PRECISION",
+    # Same id, but it needed a PG-worded rule AND a PG type set: the 1 MiB cap is a
+    # TARGET limit that applies to PG text/bytea/json/jsonb identically, while the shared
+    # rule matches MySQL type NAMES -- so registering that one would have found nothing.
+    "OVERSIZED_LOB",
 }
 
 _EXCLUDED_MYSQL_RULE_IDS = {
     "CI_COLLATION",
     "SPATIAL_TYPE",
-    "OVERSIZED_LOB",
     "ENUM_SET_TYPE",
     "TINYINT_BOOLEAN",
     "BIT_TYPE",
@@ -56,7 +59,11 @@ _EXCLUDED_MYSQL_RULE_IDS = {
 
 # The MySQL classes whose rule id a PG source now also reports, but NEVER via the MySQL
 # class itself: their text names MySQL features the source does not have.
-_MYSQL_ONLY_RULE_CLASSES = {"GeneratedColumnRule", "AutoIncrementRule"}
+_MYSQL_ONLY_RULE_CLASSES = {
+    "GeneratedColumnRule",
+    "AutoIncrementRule",
+    "OversizedLobRule",
+}
 
 
 def test_pg_default_rules_are_exactly_the_structural_source_neutral_set() -> None:
@@ -70,7 +77,11 @@ def test_pg_default_rules_are_exactly_the_structural_source_neutral_set() -> Non
     # generated columns" in front of a PostgreSQL operator.
     names = {type(r).__name__ for r in pg_default_rules()}
     assert not (names & _MYSQL_ONLY_RULE_CLASSES)
-    assert {"PgGeneratedColumnRule", "PgIdentityKeyRule"} <= names
+    assert {
+        "PgGeneratedColumnRule",
+        "PgIdentityKeyRule",
+        "PgOversizedLobRule",
+    } <= names
 
 
 def test_assessor_default_rules_postgres_delegates_to_the_pg_module() -> None:
@@ -313,3 +324,76 @@ def test_pg_source_flags_an_over_precision_numeric_at_evaluation() -> None:
         rule_ids.add(item.rule_id)
         rule_ids.update(c.rule_id for c in (item.concerns or []))
     assert "NUMERIC_PRECISION" in rule_ids
+
+
+def test_pg_oversized_lob_rule_covers_what_the_manual_documents() -> None:
+    """The 1 MiB per-value cap is a TARGET limit, so it applies to PostgreSQL identically --
+    but the shared rule matches MySQL type NAMES, so registering it for PG would have found
+    nothing forever. The manual names `OVERSIZED_LOB` as the flag for exactly this, and
+    names PostgreSQL explicitly, so a PG source reading AUTO left that signal empty."""
+    from dsql_migrator.core.assessor_postgres import PgOversizedLobRule
+    from dsql_migrator.core.models import Classification, EffortLevel
+
+    table = TableDef(
+        name="shop.media",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint"),
+            ColumnDef(name="content", mysql_type="bytea"),
+            ColumnDef(name="body", mysql_type="text"),
+            ColumnDef(name="doc", mysql_type="jsonb"),
+            ColumnDef(name="meta", mysql_type="json"),
+            ColumnDef(name="unbounded", mysql_type="character varying"),
+            ColumnDef(name="code", mysql_type="character varying(50)"),  # bounded
+            ColumnDef(name="qty", mysql_type="integer"),
+        ],
+        primary_key=["id"],
+    )
+    findings = PgOversizedLobRule().evaluate(SourceInventory(tables=[table]))
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.rule_id == "OVERSIZED_LOB"
+    assert f.classification is Classification.MANUAL
+    assert f.effort is EffortLevel.MEDIUM
+    for named in ("content", "body", "doc", "meta", "unbounded"):
+        assert named in f.risk, named
+    # A LENGTH-BOUNDED varchar cannot exceed 1 MiB, and a plain integer is irrelevant.
+    assert "code" not in f.risk
+    assert "qty" not in f.risk
+    # PG-worded: no MySQL LOB/TEXT type names.
+    assert "MySQL" not in f.risk
+
+
+def test_pg_oversized_lob_rule_ignores_a_table_with_only_bounded_types() -> None:
+    from dsql_migrator.core.assessor_postgres import PgOversizedLobRule
+
+    table = TableDef(
+        name="shop.ok",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint"),
+            ColumnDef(name="name", mysql_type="character varying(200)"),
+            ColumnDef(name="price", mysql_type="numeric(12,2)"),
+        ],
+        primary_key=["id"],
+    )
+    assert PgOversizedLobRule().evaluate(SourceInventory(tables=[table])) == []
+
+
+def test_json_and_jsonb_are_in_the_pg_oversized_set_not_exempt() -> None:
+    """Pins the CORRECTED reasoning. An earlier comment excluded json/jsonb as "stored
+    differently and not hit by the text 1 MiB cap the same way", justified by a compression
+    measurement. The DSQL docs say the 1 MiB limit applies to bytea/text/json/jsonb, that
+    text/varchar/bpchar are auto-compressed TOO (so compression cannot discriminate -- if it
+    justified dropping json it would equally justify dropping text, emptying the set), and
+    that for json/jsonb the limit applies to the COMPRESSED size, which relocates the cap
+    rather than removing it. A documented quota outranks a probe."""
+    from dsql_migrator.core.assessor import (
+        _PG_OVERSIZED_LOB_BASES,
+        is_pg_oversized_lob_type,
+    )
+
+    assert {"text", "bytea", "json", "jsonb"} <= _PG_OVERSIZED_LOB_BASES
+    for spelling in ("text", "bytea", "json", "jsonb", "character varying", "varchar"):
+        assert is_pg_oversized_lob_type(spelling), spelling
+    # A length limit is what makes a column safe, not the type family.
+    for spelling in ("character varying(50)", "varchar(10)", "integer", "numeric(12,2)"):
+        assert not is_pg_oversized_lob_type(spelling), spelling

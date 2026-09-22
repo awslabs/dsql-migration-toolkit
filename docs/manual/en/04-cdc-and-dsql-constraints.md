@@ -166,7 +166,7 @@ pipeline handles oversized values in **three bands**:
 |---|---|
 | **≤ 1 MiB** | Applied normally. |
 | **1 MiB – 8 MiB** | The sink measures each value **before writing** and **quarantines** the oversized one to the **DLQ** (it can never be applied), while the rest of the record's table keeps flowing. To let such a record even traverse Kafka to be dead-lettered, the per-table topic and client limits are raised (default 4 MiB, max 8 MiB). |
-| **> 8 MiB** | Cannot enter Kafka at all. These must be **excluded at capture**: Debezium `column.exclude.list` drops the oversized LOB column (driven by the Evaluation `OVERSIZED_LOB` flag) so it never reaches the pipeline. |
+| **> 8 MiB** | Cannot enter Kafka at all. These must be **excluded at capture**: Debezium `column.exclude.list` drops the oversized LOB column so it never reaches the pipeline. You choose it on the Data Migration / CDC step's oversized-LOB card — the same columns Evaluation flags `OVERSIZED_LOB`. |
 
 ### What gets dead-lettered
 

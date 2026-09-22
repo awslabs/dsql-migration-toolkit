@@ -162,6 +162,49 @@ _OVERSIZED_LOB_BASES = frozenset(
     {"mediumtext", "longtext", "mediumblob", "longblob"}
 )
 
+# The PostgreSQL counterpart. Lives here, beside the MySQL set, because three layers need
+# the SAME answer -- Evaluation (PgOversizedLobRule), Schema Conversion
+# (_pg_oversized_lob_warning) and the UI's exclusion offer
+# (ui/data_migration/_models.lob_exclusion_candidates) -- and it was previously defined in
+# the UI layer only, which is why Evaluation and Schema Conversion stayed silent.
+#
+# ``json``/``jsonb`` ARE included. An earlier comment excluded them as "stored differently
+# and not hit by the text 1 MiB cap the same way"; that is wrong, and the mistake it repeats
+# is the one v0.1.468 spent a release reverting -- a compression measurement does not
+# overrule a documented quota. Per the Aurora DSQL "Supported data types" page: the 1 MiB
+# per-value limit applies to bytea, text, json AND jsonb; DSQL auto-compresses
+# text/varchar/bpchar AND json/jsonb, so compression cannot discriminate between them (if it
+# justified dropping json it would equally justify dropping text, leaving the set empty);
+# and for json/jsonb the limit applies to the COMPRESSED size, which relocates the cap
+# rather than removing it. This set answers "can a value here exceed 1 MiB", i.e. it is a
+# ceiling, not a prediction -- which is all the exclusion offer and the MANUAL flag claim.
+# https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-postgresql-compatibility-unsupported-features.html
+_PG_OVERSIZED_LOB_BASES = frozenset({"text", "bytea", "json", "jsonb"})
+
+
+def _is_unbounded_pg_character(mysql_type: str) -> bool:
+    """True for a PostgreSQL ``character varying`` / ``character`` with NO length limit.
+
+    An unbounded ``varchar`` is semantically identical to ``text`` and can likewise exceed
+    1 MiB, but it cannot be expressed through :func:`_base_type` alone: ``format_type``
+    renders it as ``character varying`` and ``_base_type`` collapses BOTH that and
+    ``character varying(50)`` to ``character``, so matching on the base type would wrongly
+    flag every bounded varchar. The length modifier is therefore read off the FULL type
+    string: no ``(`` means no limit.
+    """
+    normalized = " ".join((mysql_type or "").strip().lower().split())
+    if "(" in normalized:
+        return False
+    return normalized in ("character varying", "varchar", "character", "char", "bpchar")
+
+
+def is_pg_oversized_lob_type(mysql_type: str) -> bool:
+    """True when this PostgreSQL column type can hold a value over DSQL's 1 MiB limit."""
+    return (
+        _base_type(mysql_type) in _PG_OVERSIZED_LOB_BASES
+        or _is_unbounded_pg_character(mysql_type)
+    )
+
 # MySQL base types with no native DSQL equivalent that map to text, losing their
 # allowed-value/domain semantics (manual review).
 _ENUM_SET_BASES = frozenset({"enum", "set"})
