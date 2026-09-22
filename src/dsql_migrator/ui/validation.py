@@ -71,7 +71,11 @@ from dsql_migrator.core.models import (
     Watermark,
 )
 from dsql_migrator.core.table_selection import TableSelectionError, TableSelector
-from dsql_migrator.core.validator import ValidationCancelled, Validator
+from dsql_migrator.core.validator import (
+    ValidationCancelled,
+    Validator,
+    with_migration_excluded_columns,
+)
 from dsql_migrator.core.validator import export_report as export_validation_report
 from dsql_migrator.ui.ai_assist import ai_is_usable
 from dsql_migrator.ui.connect import make_source_engine_factory
@@ -308,19 +312,26 @@ def run_validation(
     # Stamp the applied DSQL target types so the CHECKSUM honors a target-type remap
     # (no-op when target_types is empty / mode is ROW_COUNT).
     tables = _apply_target_types(tables, inputs.target_types)
-    return validator.validate(
-        inputs.source_config,
-        inputs.target_config,
-        tables,
-        inputs.mode,
-        watermark=inputs.watermark,
-        check_orphans=inputs.check_orphans,
-        reconcile=inputs.reconcile,
-        should_cancel=should_cancel,
-        on_progress=on_progress,
-        max_workers=workers,
-        deep_only_on_count_mismatch=deep_only_on_count_mismatch,
-        quarantined_by_table=inputs.quarantined_by_table,
+    # Stamp the exclusion back onto the finished report. The strip above is what makes
+    # the comparison correct, but it also erases the only evidence that a column was
+    # left behind, so without this the report claims "Data identical: yes" with no
+    # mention of a column that holds no target data at all.
+    return with_migration_excluded_columns(
+        validator.validate(
+            inputs.source_config,
+            inputs.target_config,
+            tables,
+            inputs.mode,
+            watermark=inputs.watermark,
+            check_orphans=inputs.check_orphans,
+            reconcile=inputs.reconcile,
+            should_cancel=should_cancel,
+            on_progress=on_progress,
+            max_workers=workers,
+            deep_only_on_count_mismatch=deep_only_on_count_mismatch,
+            quarantined_by_table=inputs.quarantined_by_table,
+        ),
+        inputs.excluded_columns,
     )
 
 
@@ -527,6 +538,11 @@ class ValidationSummary:
     # as "every column EXCEPT these", not "every column verified" (a non-key value diff
     # confined to such a column is undetected by any mode). Empty outside CHECKSUM mode.
     checksum_excluded_columns: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # Per-table columns the OPERATOR excluded from the migration, so they hold no data on
+    # the target and were not validated either. A permanent data gap rather than a
+    # rendering limit, so it is surfaced in every mode -- see
+    # ``TableValidationResult.migration_excluded_columns``.
+    migration_excluded_columns: dict[str, tuple[str, ...]] = field(default_factory=dict)
     # Whether the run REQUESTED record-level reconciliation (regardless of eligibility).
     # Distinguishes "turned off" from "requested but no eligible table" so the latter is
     # never presented as a clean pass -- in the DEFAULT ROW_COUNT mode a same-count-but-
@@ -718,6 +734,11 @@ def summarize_validation(report: ValidationReport) -> ValidationSummary:
             item.table: tuple(item.checksum_excluded_columns)
             for item in report.items
             if item.checksum_excluded_columns
+        },
+        migration_excluded_columns={
+            item.table: tuple(item.migration_excluded_columns)
+            for item in report.items
+            if item.migration_excluded_columns
         },
         reconcile_requested=_reconcile_was_requested(report),
         reconcile_inapplicable_tables=reconcile_skipped_tables(report),
@@ -1255,7 +1276,8 @@ def format_drift(report: ValidationReport) -> DriftDisplay:
     if not determinable:
         summary = (
             "Source changes since the snapshot could not be determined "
-            "(no GTID or binlog position to compare)."
+            "(no comparable source replication coordinate — a MySQL GTID/binlog "
+            "position or a PostgreSQL WAL LSN)."
         )
     elif drift.drifted:
         evidence = "binlog position moved" if basis == "binlog" else "GTID changed"
@@ -5118,6 +5140,28 @@ def _render_readiness_checks(
                 "form, so the checksum omits them — a 'Data identical' result means every "
                 "OTHER column was value-compared, and a non-key value difference confined "
                 f"to one of these columns would not be detected. Omitted: {detail}."
+            ),
+        )
+
+    # The operator's own exclusions. Distinct from the caveat above in both reason and
+    # remedy -- these columns were never written to the target, so "not compared" here
+    # means "there is nothing to compare". Stated because this report is the cut-over
+    # sign-off artifact and a reviewer who did not tick the box has no other way to see
+    # the gap; warning tone because, unlike a rendering limit, it is a permanent loss.
+    if summary.migration_excluded_columns:
+        detail = "; ".join(
+            f"{table} ({', '.join(cols)})"
+            for table, cols in summary.migration_excluded_columns.items()
+        )
+        render_notice(
+            ui,
+            tone="warning",
+            header="Some columns were excluded from the migration",
+            body=(
+                "These columns were deliberately left out of the load, so they hold no "
+                "data on the target and validation skipped them — a match here says "
+                "nothing about them. Re-including a column needs a reload of its table. "
+                f"Excluded: {detail}."
             ),
         )
 

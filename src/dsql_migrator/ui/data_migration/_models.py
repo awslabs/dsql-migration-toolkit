@@ -998,6 +998,13 @@ class PrereqCategory(str, Enum):
 # to both ends; Source Configuration = source server settings/privileges; Schema &
 # Tables = per-table readiness on source and target; Streaming = the optional CDC
 # transport (MSK / MSK Connect).
+#
+# This must stay EXHAUSTIVE over ``PrerequisiteCheckId`` -- the lookup falls back to
+# SCHEMA_TABLES, so a missing entry does not raise, it just files the check under the
+# wrong heading. That is how the five PostgreSQL logical-replication checks ended up
+# there: four of them are server settings/privileges, so "Source Configuration" rendered
+# nearly empty on a PG CDC run while "Schema & Tables" was padded with server-level rows.
+# ``test_prereq_category_map_covers_every_check_id`` pins the exhaustiveness.
 _PREREQ_CATEGORY_BY_CHECK: dict[PrerequisiteCheckId, PrereqCategory] = {
     PrerequisiteCheckId.SOURCE_REACHABLE: PrereqCategory.CONNECTIVITY,
     PrerequisiteCheckId.TARGET_DSQL_REACHABLE: PrereqCategory.CONNECTIVITY,
@@ -1007,8 +1014,19 @@ _PREREQ_CATEGORY_BY_CHECK: dict[PrerequisiteCheckId, PrereqCategory] = {
     PrerequisiteCheckId.BINLOG_ROW_FORMAT: PrereqCategory.SOURCE_CONFIG,
     PrerequisiteCheckId.BINLOG_RETENTION: PrereqCategory.SOURCE_CONFIG,
     PrerequisiteCheckId.GTID_MODE: PrereqCategory.SOURCE_CONFIG,
+    # PostgreSQL logical-replication readiness: server settings and server privileges,
+    # the same nature as the MySQL binlog/GTID rows above.
+    PrerequisiteCheckId.WAL_LEVEL_LOGICAL: PrereqCategory.SOURCE_CONFIG,
+    PrerequisiteCheckId.REPLICATION_ROLE: PrereqCategory.SOURCE_CONFIG,
+    PrerequisiteCheckId.REPLICATION_SLOTS: PrereqCategory.SOURCE_CONFIG,
+    PrerequisiteCheckId.SOURCE_IS_WRITER: PrereqCategory.SOURCE_CONFIG,
+    PrerequisiteCheckId.SLOT_WAL_RETENTION: PrereqCategory.SOURCE_CONFIG,
     PrerequisiteCheckId.TABLE_PRIMARY_KEY: PrereqCategory.SCHEMA_TABLES,
     PrerequisiteCheckId.TARGET_SCHEMA_READY: PrereqCategory.SCHEMA_TABLES,
+    # Per-table, on the target and the source respectively -- the fallback already put
+    # these two here, but only by accident; stated so the map is exhaustive.
+    PrerequisiteCheckId.TARGET_COLUMNS_LOADABLE: PrereqCategory.SCHEMA_TABLES,
+    PrerequisiteCheckId.REPLICA_IDENTITY: PrereqCategory.SCHEMA_TABLES,
     PrerequisiteCheckId.MSK_AVAILABLE: PrereqCategory.STREAMING,
     PrerequisiteCheckId.MSK_CONNECT_AVAILABLE: PrereqCategory.STREAMING,
 }
@@ -1180,7 +1198,9 @@ def format_binlog_coordinate(watermark: Watermark) -> str:
     return _UNAVAILABLE
 
 
-def format_watermark(watermark: Watermark) -> WatermarkDisplay:
+def format_watermark(
+    watermark: Watermark, *, source_type: "Optional[SourceType]" = None
+) -> WatermarkDisplay:
     """Format a :class:`Watermark` for display (Requirement 8.5 / Property 11).
 
     Source-agnostic: a MySQL watermark yields the binlog ``file:position`` (+ GTID)
@@ -1188,9 +1208,17 @@ def format_watermark(watermark: Watermark) -> WatermarkDisplay:
     binlog/GTID) yields a "WAL LSN <lsn>" summary and populates the PG fields, so the
     panel shows the coordinate the loader actually captured instead of rendering every
     MySQL field as "unavailable".
+
+    ``source_type`` is the engine the caller KNOWS, and it wins. Without it the engine can
+    only be inferred from the presence of a WAL LSN -- but the PG Full-Load-only LSN read
+    is best-effort (``probe_scalar``, ``None`` without the privilege), so a PG run whose
+    one LSN read came back empty rendered the MySQL binlog/GTID/server-UUID rows and
+    reported an "unavailable binlog coordinate" for a source that has no binlog at all.
+    The LSN fallback is kept so a caller that has no session (and any older caller) behaves
+    as before.
     """
     snapshot_timestamp = watermark.snapshot_timestamp.isoformat()
-    is_postgres = bool(watermark.wal_lsn)
+    is_postgres = source_type is SourceType.POSTGRES or bool(watermark.wal_lsn)
 
     if is_postgres:
         coordinate = watermark.wal_lsn or _UNAVAILABLE

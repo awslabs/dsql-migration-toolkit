@@ -56,7 +56,7 @@ import sqlglot
 from sqlglot import exp
 from pydantic import BaseModel, ConfigDict, Field
 
-from dsql_migrator.core.models import Classification
+from dsql_migrator.core.models import Classification, SourceType
 
 _MYSQL = "mysql"
 _POSTGRES = "postgres"
@@ -148,14 +148,22 @@ def classify_statement(tree: exp.Expression) -> StatementKind:
     return StatementKind.OTHER
 
 
-def classify_sql(sql: str) -> StatementKind:
-    """Parse ``sql`` as MySQL and classify it; ``OTHER`` when it cannot be parsed.
+def classify_sql(
+    sql: str, *, source_type: "Optional[SourceType]" = None
+) -> StatementKind:
+    """Parse ``sql`` in the SOURCE dialect and classify it; ``OTHER`` when unparseable.
 
     A convenience wrapper over :func:`classify_statement` for callers that have a
     raw string rather than a parsed tree. Parsing only -- never executed.
+
+    ``source_type`` selects the read dialect and defaults to MySQL (the original engine).
+    It matters because the classification gates the read-only target probe: a statement
+    that does not parse falls to ``OTHER``, which is not testable, so hard-coding MySQL
+    made every PostgreSQL-only construct untestable on a PostgreSQL migration.
     """
+    read = _POSTGRES if source_type is SourceType.POSTGRES else _MYSQL
     try:
-        tree = sqlglot.parse_one(sql, read=_MYSQL)
+        tree = sqlglot.parse_one(sql, read=read)
     except sqlglot.errors.ParseError:
         return StatementKind.OTHER
     if tree is None:
@@ -473,33 +481,56 @@ def _for_update_warnings(tree: exp.Expression) -> list[QueryWarning]:
 
 
 class QueryConverter:
-    """Converts MySQL DML/SELECT to DSQL PostgreSQL and flags lock anti-patterns.
+    """Converts source DML/SELECT to DSQL PostgreSQL and flags lock anti-patterns.
 
     See the module docstring for the full contract (Requirements 4.1-4.4,
     Property 6). The converter is stateless and has no schema/primary-key
     knowledge; lock detection is therefore conservative and never asserts a
     primary-key violation it cannot prove.
+
+    ``source_type`` selects the READ dialect, defaulting to MySQL (the original engine) --
+    the same constructor shape as ``converter.SchemaConverter``. It is not cosmetic: read
+    as MySQL, a PostgreSQL statement using ``||`` or a double-quoted identifier either
+    fails to parse (so the screen refuses to convert or test it, naming the wrong engine)
+    or -- worse -- parses to something ELSE, because MySQL reads ``||`` as OR and
+    ``"x"`` as a string literal. That produced a silently DIFFERENT query labelled AUTO
+    ("fully automatic, no review needed") which the Test button would then run against the
+    real target.
     """
 
-    def convert(self, sql: str, *, pretty: bool = False) -> QueryConversionResult:
-        """Convert one MySQL statement and return the original/converted pair.
+    def __init__(self, *, source_type: SourceType = SourceType.MYSQL) -> None:
+        self._source_type = source_type
 
-        Parses ``sql`` as MySQL, rewrites ``ON DUPLICATE KEY UPDATE``, inspects
-        the AST for ``FOR UPDATE`` anti-patterns, and renders the result in the
+    @property
+    def _is_postgres(self) -> bool:
+        return self._source_type is SourceType.POSTGRES
+
+    def convert(self, sql: str, *, pretty: bool = False) -> QueryConversionResult:
+        """Convert one source statement and return the original/converted pair.
+
+        Parses ``sql`` in the source dialect, rewrites ``ON DUPLICATE KEY UPDATE``,
+        inspects the AST for ``FOR UPDATE`` anti-patterns, and renders the result in the
         ``postgres`` dialect. ``pretty`` renders the converted SQL multi-line and
         indented (sqlglot pretty-print) so a long statement is readable in the UI;
         it changes only the formatting, never the semantics. Unparseable or
         unrenderable input is flagged for manual review with ``converted_sql=None``
         rather than being dropped silently (Property 6). The input is only
         parsed/transpiled, never executed (Requirement 9.4).
+
+        The MySQL-only rewrites (``ON DUPLICATE KEY UPDATE`` -> ``ON CONFLICT``,
+        ``JSON_UNQUOTE``) are skipped for a PostgreSQL source: neither construct exists
+        there, so running them could only misfire.
         """
+        engine = "PostgreSQL" if self._is_postgres else "MySQL"
         try:
-            tree = sqlglot.parse_one(sql, read=_MYSQL)
+            tree = sqlglot.parse_one(
+                sql, read=_POSTGRES if self._is_postgres else _MYSQL
+            )
         except sqlglot.errors.ParseError as exc:
             return self._manual_review(
                 sql,
                 CODE_PARSE_ERROR,
-                f"Unable to parse the SQL as MySQL; flag for manual review: {exc}",
+                f"Unable to parse the SQL as {engine}; flag for manual review: {exc}",
             )
 
         if tree is None:
@@ -514,11 +545,11 @@ class QueryConverter:
         statement_kind = classify_statement(tree)
         warnings: list[QueryWarning] = []
 
-        on_duplicate_warning = _rewrite_on_duplicate_key_update(tree)
-        if on_duplicate_warning is not None:
-            warnings.append(on_duplicate_warning)
-
-        warnings.extend(_rewrite_json_unquote(tree))
+        if not self._is_postgres:
+            on_duplicate_warning = _rewrite_on_duplicate_key_update(tree)
+            if on_duplicate_warning is not None:
+                warnings.append(on_duplicate_warning)
+            warnings.extend(_rewrite_json_unquote(tree))
         _inline_having_aliases(tree)
         warnings.extend(_for_update_warnings(tree))
 

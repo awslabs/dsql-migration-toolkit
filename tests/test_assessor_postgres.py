@@ -3,9 +3,11 @@
 
 """PostgreSQL-source assessment rules (``assessor_postgres``) -- Phase 1.
 
-v1 is the source-neutral, target-DSQL STRUCTURAL rule set; the MySQL type/feature rules,
-the MySQL-binlog CDC-cascade rule, and the MySQL-function view rule are excluded so they
-never misfire on a PostgreSQL source.
+The source-neutral, target-DSQL STRUCTURAL rule set. Rules that inspect a MySQL TYPE
+STRING or a MySQL feature are excluded so they never misfire on a PostgreSQL source, as
+are the MySQL-binlog CDC-cascade rule and the MySQL-function view rule. Rules whose
+condition is a STRUCTURAL field the PG inventory populates are kept -- with PG-worded
+variants where the MySQL prose would have been wrong.
 """
 
 from dsql_migrator.core.assessor import CompatibilityAssessor, default_rules
@@ -30,24 +32,31 @@ _EXPECTED_PG_RULE_IDS = {
     "TOO_MANY_COLUMNS",
     "TOO_MANY_INDEXES",
     "TOO_MANY_KEY_COLUMNS",
+    # Conditions read from STRUCTURAL fields the PG inventory populates, so they are
+    # engine-neutral and belong here; only the MySQL PROSE had to be replaced (the first
+    # two by PG-worded variants carrying the same rule id).
+    "GENERATED_COLUMN",
+    "AUTO_INCREMENT",
+    "NUMERIC_PRECISION",
 }
 
 _EXCLUDED_MYSQL_RULE_IDS = {
-    "AUTO_INCREMENT",
     "CI_COLLATION",
     "SPATIAL_TYPE",
     "OVERSIZED_LOB",
-    "NUMERIC_PRECISION",
     "ENUM_SET_TYPE",
     "TINYINT_BOOLEAN",
     "BIT_TYPE",
     "YEAR_TYPE",
-    "GENERATED_COLUMN",
     "ON_UPDATE_TIMESTAMP",
     "UNSUPPORTED_INDEX_TYPE",
     "FK_CASCADE_CDC_GAP",  # MySQL-binlog framed
     "VIEW_UNSUPPORTED_SQL",  # MySQL app-query linter
 }
+
+# The MySQL classes whose rule id a PG source now also reports, but NEVER via the MySQL
+# class itself: their text names MySQL features the source does not have.
+_MYSQL_ONLY_RULE_CLASSES = {"GeneratedColumnRule", "AutoIncrementRule"}
 
 
 def test_pg_default_rules_are_exactly_the_structural_source_neutral_set() -> None:
@@ -56,6 +65,12 @@ def test_pg_default_rules_are_exactly_the_structural_source_neutral_set() -> Non
     assert len(ids) == len(set(ids))  # no duplicates
     for excluded in _EXCLUDED_MYSQL_RULE_IDS:
         assert excluded not in ids
+    # The two shared ids must come from the PG-worded variants, never from the MySQL
+    # class: reusing the MySQL class would put "AUTO_INCREMENT column" / "MySQL
+    # generated columns" in front of a PostgreSQL operator.
+    names = {type(r).__name__ for r in pg_default_rules()}
+    assert not (names & _MYSQL_ONLY_RULE_CLASSES)
+    assert {"PgGeneratedColumnRule", "PgIdentityKeyRule"} <= names
 
 
 def test_assessor_default_rules_postgres_delegates_to_the_pg_module() -> None:
@@ -223,3 +238,78 @@ def test_html_report_title_reflects_the_postgres_source_engine() -> None:
     assert "MySQL to Aurora DSQL" not in pg_html
     # Default (MySQL) keeps the original title.
     assert "MySQL to Aurora DSQL Compatibility Assessment" in render_html_report(report)
+
+
+def test_pg_generated_column_rule_uses_pg_wording_not_the_mysql_text() -> None:
+    # The condition is the engine-neutral `generated` flag, which PG introspection sets
+    # from attgenerated -- previously the whole rule was skipped for PG because the MySQL
+    # rule's PROSE was wrong, so Evaluation said "compatible" about a column Schema
+    # Conversion warns is a permanent drift risk.
+    from dsql_migrator.core.assessor import GeneratedColumnRule
+    from dsql_migrator.core.assessor_postgres import PgGeneratedColumnRule
+    from dsql_migrator.core.models import Classification
+
+    table = TableDef(
+        name="shop.orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint"),
+            ColumnDef(name="total", mysql_type="numeric(12,2)", generated=True),
+        ],
+        primary_key=["id"],
+    )
+    inventory = SourceInventory(tables=[table])
+    findings = PgGeneratedColumnRule().evaluate(inventory)
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.rule_id == "GENERATED_COLUMN"
+    assert f.classification is Classification.MANUAL
+    assert "total" in f.risk
+    assert "PostgreSQL generated" in f.risk
+    # Neither the MySQL naming nor its "recreate as a PostgreSQL GENERATED column"
+    # advice, which is meaningless when the source already is PostgreSQL.
+    assert "MySQL" not in f.risk
+    assert "GENERATED column" not in f.recommendation
+    # The MySQL rule fires on the same condition -- which is exactly why its text must
+    # not be the one a PG operator sees.
+    assert "MySQL generated" in GeneratedColumnRule().evaluate(inventory)[0].risk
+
+
+def test_pg_identity_key_rule_never_says_auto_increment() -> None:
+    from dsql_migrator.core.assessor_postgres import PgIdentityKeyRule
+    from dsql_migrator.core.models import ConversionNoteKind
+
+    table = TableDef(
+        name="shop.orders",
+        columns=[ColumnDef(name="id", mysql_type="bigint")],
+        primary_key=["id"],
+        auto_increment_column="id",
+    )
+    findings = PgIdentityKeyRule().evaluate(SourceInventory(tables=[table]))
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.rule_id == "AUTO_INCREMENT"  # same id, PG wording
+    assert "AUTO_INCREMENT" not in f.risk
+    assert "serial / identity" in f.risk
+    # Throughput advice, not a loss -- same calibration as the MySQL rule.
+    assert f.note_kind is ConversionNoteKind.RECOMMENDATION
+
+
+def test_pg_source_flags_an_over_precision_numeric_at_evaluation() -> None:
+    # numeric(40,10) exceeds DSQL's 38-digit maximum and Schema Conversion CLAMPS it, so
+    # Evaluation -- the go/no-go artifact -- must not report the table as AUTO.
+    table = TableDef(
+        name="shop.items",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint"),
+            ColumnDef(name="storage_cost_usd", mysql_type="numeric(40,10)"),
+        ],
+        primary_key=["id"],
+    )
+    report = CompatibilityAssessor(source_type=SourceType.POSTGRES).assess(
+        SourceInventory(tables=[table])
+    )
+    rule_ids: set[str] = set()
+    for item in report.items:
+        rule_ids.add(item.rule_id)
+        rule_ids.update(c.rule_id for c in (item.concerns or []))
+    assert "NUMERIC_PRECISION" in rule_ids

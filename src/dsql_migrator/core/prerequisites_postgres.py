@@ -54,6 +54,10 @@ class PostgresCdcFacts:
     used_wal_senders: Optional[int] = None
     is_in_recovery: bool = False
     replica_identity: Mapping[str, str] = field(default_factory=dict)
+    # ``max_slot_wal_keep_size`` in MEGABYTES (PG13+). ``-1`` means unlimited: the server
+    # never discards WAL a slot still needs. Any other value caps that retention, so a
+    # slow Full Load can outlive the slot's WAL and invalidate it.
+    max_slot_wal_keep_size_mb: Optional[int] = None
 
 
 def check_wal_level_logical(facts: PostgresCdcFacts) -> PrerequisiteResult:
@@ -259,6 +263,67 @@ def check_postgres_cdc_facts_unavailable() -> PrerequisiteResult:
     )
 
 
+def check_slot_wal_retention(facts: PostgresCdcFacts) -> PrerequisiteResult:
+    """WARN when the source may discard WAL the CDC slot still needs.
+
+    The PostgreSQL counterpart of :func:`prerequisites.check_binlog_retention`, and the
+    same failure shape: CDC resumes from the replication slot created at the Full Load
+    snapshot point, so the source must still hold that WAL when CDC begins. With a finite
+    ``max_slot_wal_keep_size`` the server is free to discard it and INVALIDATE the slot
+    (``pg_replication_slots.wal_status = 'lost'``) -- after which the connector cannot
+    resume from the watermark, so the changes made during the load are never replayed: a
+    SILENT data gap, exactly what the MySQL binlog check exists to prevent.
+
+    Follows that check's calibration deliberately. ``-1`` (unlimited, and the PostgreSQL
+    default) is a PASS. A finite cap never hard-blocks -- WARN / ``required=False``, per
+    Property 14 -- because a fast load followed by a prompt Start CDC can easily fit
+    inside the cap; it is a real but non-obvious risk, not a certainty. Unknown (the probe
+    lacked the privilege, or a pre-13 server has no such GUC) degrades to a non-blocking
+    INFO rather than a false alarm.
+    """
+    cap = facts.max_slot_wal_keep_size_mb
+    if cap is None:
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.SLOT_WAL_RETENTION,
+            title="WAL retention covers the CDC handoff",
+            status=PrerequisiteStatus.INFO,
+            required=False,
+            detail="Could not read max_slot_wal_keep_size on the source.",
+            remediation=(
+                "Check max_slot_wal_keep_size on the source: -1 (unlimited) guarantees "
+                "the replication slot keeps the WAL that CDC resumes from."
+            ),
+        )
+    if cap < 0:
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.SLOT_WAL_RETENTION,
+            title="WAL retention covers the CDC handoff",
+            status=PrerequisiteStatus.PASS,
+            required=False,
+            detail=(
+                "max_slot_wal_keep_size is -1 (unlimited), so the source keeps every WAL "
+                "segment the replication slot still needs."
+            ),
+        )
+    return PrerequisiteResult(
+        check_id=PrerequisiteCheckId.SLOT_WAL_RETENTION,
+        title="WAL retention covers the CDC handoff",
+        status=PrerequisiteStatus.WARN,
+        required=False,
+        detail=(
+            f"max_slot_wal_keep_size caps slot WAL retention at {cap} MB, so the source "
+            "may discard WAL the CDC slot still needs and invalidate it."
+        ),
+        remediation=(
+            "If Full Load takes long enough to write more than this much WAL, the slot is "
+            "invalidated and the changes made during the load are lost — CDC cannot "
+            "resume from the watermark. Raise max_slot_wal_keep_size (or set -1 for "
+            "unlimited) before starting, or start CDC promptly after the load and watch "
+            "the slot's WAL-pressure panel."
+        ),
+    )
+
+
 def check_postgres_cdc_prerequisites(
     facts: PostgresCdcFacts, tables: Sequence[TableDef]
 ) -> list[PrerequisiteResult]:
@@ -267,6 +332,7 @@ def check_postgres_cdc_prerequisites(
         check_wal_level_logical(facts),
         check_replication_role(facts),
         check_replication_slot_headroom(facts),
+        check_slot_wal_retention(facts),
         check_source_is_writer(facts),
     ]
     results.extend(check_replica_identity(table, facts) for table in tables)
@@ -279,6 +345,7 @@ __all__ = [
     "check_wal_level_logical",
     "check_replication_role",
     "check_replication_slot_headroom",
+    "check_slot_wal_retention",
     "check_source_is_writer",
     "check_replica_identity",
     "check_postgres_cdc_prerequisites",

@@ -829,6 +829,18 @@ class PrerequisiteChecker:
                 )
             )
             results.append(
+                # The PG equivalent of this risk is its own check
+                # (SLOT_WAL_RETENTION, from max_slot_wal_keep_size) run above. Skipped
+                # here rather than omitted so all three MySQL binlog rows stay together:
+                # BINLOG_RETENTION appears as a SKIP in Full Load mode, and a check id
+                # that is present in the weaker mode but absent in the stronger one reads
+                # as an oversight.
+                _skipped(
+                    PrerequisiteCheckId.BINLOG_RETENTION,
+                    "Binary log retention covers the CDC handoff",
+                )
+            )
+            results.append(
                 _skipped(PrerequisiteCheckId.GTID_MODE, "GTID mode is enabled")
             )
             results.append(

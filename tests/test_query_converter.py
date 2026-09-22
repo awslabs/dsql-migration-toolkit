@@ -308,3 +308,58 @@ def test_conversion_result_carries_statement_kind() -> None:
         _convert("CREATE TABLE t (id INT PRIMARY KEY)").statement_kind
         is StatementKind.DDL
     )
+
+
+def test_pg_source_reads_the_postgres_dialect_not_mysql() -> None:
+    # Read as MySQL, `||` is OR and a double-quoted identifier is a string literal, so a
+    # valid PostgreSQL SELECT converted to a DIFFERENT query -- and was still labelled
+    # AUTO ("no review needed"), which the Test button would then run on the real target.
+    from dsql_migrator.core.models import SourceType
+
+    sql = 'SELECT "user_name" || \'@\' || domain AS email FROM public."Users"'
+    mysql_result = QueryConverter().convert(sql)
+    assert mysql_result.converted_sql is not None
+    assert " OR " in mysql_result.converted_sql  # the silent corruption
+    pg_result = QueryConverter(source_type=SourceType.POSTGRES).convert(sql)
+    assert pg_result.converted_sql is not None
+    assert "||" in pg_result.converted_sql
+    assert " OR " not in pg_result.converted_sql
+
+
+def test_pg_only_syntax_becomes_testable_instead_of_other() -> None:
+    # statement_kind gates the read-only target probe (is_testable), so a PG statement
+    # that would not parse as MySQL was not merely mislabelled -- it could not be tested.
+    from dsql_migrator.core.models import SourceType
+
+    sql = "SELECT id FROM t WHERE tags @> '[1]'::jsonb"
+    assert QueryConverter().convert(sql).statement_kind is StatementKind.OTHER
+    assert classify_sql(sql) is StatementKind.OTHER
+    pg = QueryConverter(source_type=SourceType.POSTGRES).convert(sql)
+    assert pg.statement_kind is StatementKind.SELECT
+    assert pg.converted_sql is not None
+    assert classify_sql(sql, source_type=SourceType.POSTGRES) is StatementKind.SELECT
+
+
+def test_parse_error_names_the_source_engine() -> None:
+    from dsql_migrator.core.models import SourceType
+
+    broken = "SELECT FROM WHERE ((("
+    assert "as MySQL" in " ".join(
+        w.message for w in QueryConverter().convert(broken).warnings
+    )
+    assert "as PostgreSQL" in " ".join(
+        w.message
+        for w in QueryConverter(source_type=SourceType.POSTGRES).convert(broken).warnings
+    )
+
+
+def test_mysql_only_rewrites_do_not_run_for_a_pg_source() -> None:
+    # ON DUPLICATE KEY UPDATE / JSON_UNQUOTE do not exist in PostgreSQL, so running their
+    # rewrites there could only misfire. A PG upsert is already ON CONFLICT and passes
+    # through with no rewrite note.
+    from dsql_migrator.core.models import SourceType
+
+    sql = "INSERT INTO t (id, v) VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET v = 2"
+    result = QueryConverter(source_type=SourceType.POSTGRES).convert(sql)
+    assert result.converted_sql is not None
+    assert not any(w.code == CODE_ON_DUPLICATE_KEY_UPDATE for w in result.warnings)

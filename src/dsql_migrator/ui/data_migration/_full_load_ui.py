@@ -85,8 +85,14 @@ def _call_or(provider, default):
 # Cloudscape "Alert" renderer alias (single source of truth in ui.design).
 _render_notice = render_notice
 
-def _render_watermark(ui: object, job: MigrationJob) -> None:
+def _render_watermark(ui: object, job: MigrationJob, source_type=None) -> None:
     """Render the export watermark for ``job`` (Requirement 8.5 / Property 11).
+
+    ``source_type`` is the session's source engine, passed so the panel does not have to
+    INFER it from the presence of a WAL LSN -- a PostgreSQL run whose best-effort LSN read
+    came back empty otherwise rendered MySQL binlog/GTID rows (see
+    :func:`_models.format_watermark`). Optional so an existing caller/test without a
+    session keeps the old inference.
 
     Compact by design: this is provenance the operator reads once (or copies into a
     runbook), not something to watch, so it must not occupy the height a 4-row
@@ -105,7 +111,7 @@ def _render_watermark(ui: object, job: MigrationJob) -> None:
         ).classes("text-sm text-gray-500")
         return
 
-    display = format_watermark(job.watermark)
+    display = format_watermark(job.watermark, source_type=source_type)
     with ui.element("div").classes(  # type: ignore[attr-defined]
         "w-full rounded-md border border-gray-200 bg-gray-50 p-3"
     ):
@@ -1107,7 +1113,11 @@ def _render_full_load_step(
         # ~1.5s poll tick), so its snapshot-row-counts expansion is still never collapsed
         # by the poll -- the reason it was hoisted out in the first place holds either
         # way, because order within the parent does not affect what the poll rebuilds.
-        _render_watermark(ui, job)
+        _render_watermark(
+            ui,
+            job,
+            getattr(getattr(session, "source_config", None), "source_type", None),
+        )
 
         # Terminal-only affordances (shown after the job finishes, on the full
         # refresh the poll triggers): the job-level failure reason and retry.

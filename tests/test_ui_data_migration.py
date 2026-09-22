@@ -22973,3 +22973,31 @@ def test_start_cdc_logs_the_resume_point_through_the_real_ui_path(monkeypatch) -
     assert "mode " in detail
     # No GTID claimed for a source that has none (this one's gtid_executed is None).
     assert "GTID" not in detail
+
+
+def test_format_watermark_trusts_the_known_engine_over_an_absent_lsn() -> None:
+    """F-2: the panel inferred the engine from `bool(watermark.wal_lsn)`. A PostgreSQL
+    Full-Load-only LSN read is best-effort (probe_scalar -> None without the privilege), so
+    a PG run whose one LSN read came back empty rendered the MySQL binlog/GTID/server-UUID
+    rows and reported an "unavailable binlog coordinate" for a source with no binlog."""
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.models import SourceType, Watermark
+
+    no_lsn = Watermark(
+        snapshot_timestamp=datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    )
+    # Inference alone gets it wrong.
+    assert format_watermark(no_lsn).is_postgres is False
+    # The engine the caller KNOWS wins.
+    assert (
+        format_watermark(no_lsn, source_type=SourceType.POSTGRES).is_postgres is True
+    )
+    # A MySQL session is unaffected, and the LSN fallback still stands on its own for a
+    # caller with no session.
+    assert format_watermark(no_lsn, source_type=SourceType.MYSQL).is_postgres is False
+    with_lsn = Watermark(
+        snapshot_timestamp=datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
+        wal_lsn="3/AF012B8",
+    )
+    assert format_watermark(with_lsn).is_postgres is True

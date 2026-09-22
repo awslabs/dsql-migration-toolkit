@@ -17,8 +17,9 @@ key. Column DEFAULTs ARE carried across (like the MySQL path): the source defaul
 emitted verbatim and the ``read="postgres"`` re-parse normalizes it to DSQL-valid SQL
 (``'active'::character varying`` -> ``CAST('active' AS VARCHAR)``, ``now()`` ->
 ``CURRENT_TIMESTAMP``). A generated column's computed value and a ``serial``/identity
-``nextval`` are the exclusions -- ``nextval`` is the identity mechanism the primary-key
-strategy governs, not a literal default (see :func:`pg_column_default_sql`).
+``nextval`` are the exclusions -- for the KEY column ``nextval`` is the identity mechanism
+the primary-key strategy governs, not a literal default; on any other column it is a
+reported loss (see :func:`pg_column_default_sql`).
 """
 
 from __future__ import annotations
@@ -39,7 +40,9 @@ _PG = PostgresSourceDialect()
 _PG_NEXTVAL_DEFAULT_RE = re.compile(r"nextval\s*\(", re.IGNORECASE)
 
 
-def pg_column_default_sql(column: ColumnDef) -> "tuple[Optional[str], Optional[str]]":
+def pg_column_default_sql(
+    column: ColumnDef, *, is_key_column: bool = False
+) -> "tuple[Optional[str], Optional[str]]":
     """Return ``(default_sql, drop_reason)`` for a PostgreSQL source column's DEFAULT.
 
     ``default_sql`` is the text to place after ``DEFAULT`` in the rebuilt PostgreSQL
@@ -48,21 +51,39 @@ def pg_column_default_sql(column: ColumnDef) -> "tuple[Optional[str], Optional[s
     -- e.g. ``'active'::character varying`` -> ``CAST('active' AS VARCHAR)``, ``now()`` ->
     ``CURRENT_TIMESTAMP``). ``None`` means emit no default. ``drop_reason`` is set ONLY
     when a PRESENT default could not be carried (so the caller warns, Property 6); it is
-    ``None`` both when there is nothing to carry (no default / generated / serial-identity
-    ``nextval``) and when the default IS carried.
+    ``None`` both when there is nothing to carry (no default / generated column) and when
+    the default IS carried.
 
     PostgreSQL -> DSQL is near-identity, so a source default is carried by default (MySQL
     carries them too). The two exclusions -- a generated column's computed value and a
-    serial/identity ``nextval`` -- match the MySQL path; a ``nextval`` is the identity
-    mechanism the primary-key strategy governs, never a literal default. A default that
-    does not parse as a PostgreSQL expression is dropped (with a reason) rather than
-    emitted, so one odd default cannot abort the whole-table parse.
+    serial/identity ``nextval`` -- match the MySQL path. A default that does not parse as a
+    PostgreSQL expression is dropped (with a reason) rather than emitted, so one odd default
+    cannot abort the whole-table parse.
+
+    A ``nextval`` is never re-emitted, but whether that omission is SILENT now depends on
+    ``is_key_column``. For a PRIMARY-KEY column the omission really is governed elsewhere --
+    the primary-key strategy turns it into ``GENERATED ... AS IDENTITY``, where a DEFAULT
+    would be rejected, and cut-over's "Sync identity sequences" advances it. For any OTHER
+    column nothing governs it: it lands on the target with neither identity nor default, so
+    a reason is returned. The gate is the primary key rather than
+    ``table.auto_increment_column`` on purpose -- that field is set by PostgreSQL
+    enrichment, so keying on it would turn an un-enriched inventory's key column into a
+    wrongly-worded warning, while the primary key is always present on the ``TableDef``.
     """
     raw = (column.default or "").strip()
     if not raw or column.generated:
         return None, None
     if _PG_NEXTVAL_DEFAULT_RE.search(raw):
-        return None, None
+        if is_key_column:
+            return None, None
+        return None, (
+            "takes its value from a sequence (serial / identity), which is not carried "
+            "over: Aurora DSQL has no source sequence to point at, and the primary-key "
+            "strategy generates values only for the key column. The target column is "
+            "created with no default, so an INSERT that omits it writes NULL instead of "
+            "the next number -- supply the value from the application, or add an identity "
+            "to the column on the target before cutting over."
+        )
     # Validate the default parses as a PostgreSQL expression in isolation, so a malformed
     # one is dropped with a warning instead of aborting the entire CREATE TABLE parse.
     try:
@@ -365,7 +386,9 @@ def build_pg_source_ddl(table: TableDef) -> str:
         # column, a serial/identity nextval, and the identity primary-key column (which the
         # PK strategy turns into GENERATED ... AS IDENTITY -- a DEFAULT there is rejected).
         if column.name != table.auto_increment_column:
-            default_sql, _drop_reason = pg_column_default_sql(column)
+            default_sql, _drop_reason = pg_column_default_sql(
+                column, is_key_column=column.name in table.primary_key
+            )
             if default_sql is not None:
                 clause += f" DEFAULT {default_sql}"
         column_clauses.append(clause)

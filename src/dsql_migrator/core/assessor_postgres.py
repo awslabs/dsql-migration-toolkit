@@ -11,19 +11,32 @@ constraints, triggers / procedures / events, missing primary key, partitioning, 
 DSQL column / index / key-column-count limits. These read structural inventory fields
 (not source type strings), so they are correct for a PostgreSQL source as-is.
 
-Excluded from v1 (all inspect MySQL specifics, so they would misfire or mislead on a
-PostgreSQL source): the MySQL type/feature rules (ENUM/SET, TINYINT(1), BIT, YEAR,
-AUTO_INCREMENT, MySQL collation, MySQL spatial + LOB, ON UPDATE CURRENT_TIMESTAMP, MySQL
-index types, DECIMAL-precision parsed from a MySQL type), the MySQL-binlog CDC cascade
-rule (its guidance is entirely MySQL/Debezium-framed; PostgreSQL CDC uses its own
-logical-replication readiness checks instead), and the view rule (its linter targets
+Excluded (all inspect MySQL specifics, so they would misfire or mislead on a PostgreSQL
+source): the MySQL type/feature rules (ENUM/SET, TINYINT(1), BIT, YEAR, MySQL collation,
+MySQL spatial + LOB, ON UPDATE CURRENT_TIMESTAMP, MySQL index types), the MySQL-binlog
+CDC cascade rule (its guidance is entirely MySQL/Debezium-framed; PostgreSQL CDC uses its
+own logical-replication readiness checks instead), and the view rule (its linter targets
 MySQL application-query anti-patterns).
+
+Note what is NOT excluded, and why -- the distinction that matters here is whether a rule
+reads a MySQL TYPE STRING or a structural field:
+
+* ``DecimalPrecisionRule`` is shared and included. It was once excluded as "DECIMAL
+  precision parsed from a MySQL type", but ``_DECIMAL_BASES`` already contains
+  ``numeric`` and the precision comes from the first parenthesised integer, so
+  ``numeric(40,10)`` is caught and the message names only the DSQL limit.
+* ``GeneratedColumnRule`` and ``AutoIncrementRule`` read pure structural fields that PG
+  introspection populates (``ColumnDef.generated`` from ``attgenerated``,
+  ``TableDef.auto_increment_column`` for a sequence/identity PK), so the CONDITION is
+  engine-neutral and only the MySQL prose was wrong. They are replaced here by
+  :class:`PgGeneratedColumnRule` / :class:`PgIdentityKeyRule`, which keep the rule ids and
+  mirror the Schema Conversion wording for the same condition -- the same
+  separate-PG-variant shape ``converter._pg_generated_column_warning`` already uses.
 
 The DSQL-unsupported PostgreSQL TYPE rule IS included (``UnsupportedPostgresTypeRule``,
 below) so Evaluation flags an unsupported column type the same as Schema Conversion does.
-The remaining PG-specific refinements -- identity/serial notes and GIN/GiST/BRIN index
-methods -- and stored trigger/function/event flagging (which depends on PostgreSQL-catalog
-enrichment) are still later refinements.
+GIN/GiST/BRIN index-method notes and stored trigger/function/event flagging (which depends
+on PostgreSQL-catalog enrichment) are still later refinements.
 """
 
 from __future__ import annotations
@@ -31,7 +44,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from dsql_migrator.core.assessor import KIND_TABLE, KIND_VIEW, Finding, ObjectKey, Rule
-from dsql_migrator.core.models import Classification, EffortLevel
+from dsql_migrator.core.models import Classification, ConversionNoteKind, EffortLevel
 
 if TYPE_CHECKING:
     from dsql_migrator.core.models import SourceInventory
@@ -130,6 +143,100 @@ class UnsupportedRelationRule(Rule):
         return findings
 
 
+class PgGeneratedColumnRule(Rule):
+    """Flag PostgreSQL generated (computed) columns at Evaluation.
+
+    Shares the rule id with the MySQL ``GeneratedColumnRule`` but not its wording: that
+    one names MySQL and recommends "recreate as a PostgreSQL GENERATED column", which is
+    meaningless advice for a source that already IS PostgreSQL and a target that has no
+    such column. The condition itself is engine-neutral (``ColumnDef.generated``, which
+    PG introspection sets from ``pg_attribute.attgenerated``), so the only thing that
+    kept PostgreSQL silent here was the MySQL text.
+
+    Mirrors :func:`converter._pg_generated_column_warning` -- the same condition already
+    surfaces at Schema Conversion -- so the go/no-go Evaluation report and the conversion
+    preview no longer disagree about the same column.
+    """
+
+    rule_id = "GENERATED_COLUMN"
+
+    def evaluate(self, inventory: "SourceInventory") -> "list[Finding]":
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            columns = [column.name for column in table.columns if column.generated]
+            if not columns:
+                continue
+            names = ", ".join(columns)
+            findings.append(
+                Finding(
+                    object=ObjectKey(KIND_TABLE, table.name),
+                    rule_id=self.rule_id,
+                    classification=Classification.MANUAL,
+                    risk=(
+                        f"Columns ({names}) are PostgreSQL generated (computed) columns "
+                        "(STORED or VIRTUAL); Aurora DSQL has no equivalent, so they "
+                        "become ORDINARY columns. Full Load copies the values the source "
+                        "already computed, so the target starts correct -- but nothing "
+                        "maintains them afterwards, and the CDC stream does not carry "
+                        "them either, so any write that does not supply the value drifts."
+                    ),
+                    recommendation=(
+                        "Compute the value in the application (or in the query) before "
+                        "cut over; read the generating expression from the source, since "
+                        "it is not carried over."
+                    ),
+                    effort=EffortLevel.MEDIUM,
+                )
+            )
+        return findings
+
+
+class PgIdentityKeyRule(Rule):
+    """Throughput advice for a serial / ``GENERATED AS IDENTITY`` primary key.
+
+    The PostgreSQL counterpart of the MySQL ``AutoIncrementRule``: same condition
+    (``TableDef.auto_increment_column``, which PG introspection sets for a PK backed by a
+    sequence or an identity attribute) and same advice, but worded for the mechanism the
+    source actually has. Schema Conversion already gives this recommendation for a
+    PostgreSQL source, so without it the two screens differed for no reason.
+
+    ADVICE, not a compatibility gap -- an integer key converts cleanly and returns the
+    same answers; a different key only buys insert throughput, because DSQL stores rows
+    in primary-key order and a monotonic key concentrates writes on one partition. Filed
+    as a RECOMMENDATION so it is not presented as a loss.
+    """
+
+    rule_id = "AUTO_INCREMENT"
+
+    def evaluate(self, inventory: "SourceInventory") -> "list[Finding]":
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            column = table.auto_increment_column
+            if not column:
+                continue
+            findings.append(
+                Finding(
+                    object=ObjectKey(KIND_TABLE, table.name),
+                    rule_id=self.rule_id,
+                    classification=Classification.MANUAL,
+                    risk=(
+                        f"The integer key from serial / identity column '{column}' "
+                        "converts cleanly and works as-is. For higher insert throughput, "
+                        "consider a different key: DSQL stores rows in primary-key order, "
+                        "so a monotonically increasing key concentrates writes on one "
+                        "partition."
+                    ),
+                    recommendation=(
+                        "Optional, for throughput only: use a UUID/random key, or an "
+                        "identity/sequence with cache tuning."
+                    ),
+                    effort=EffortLevel.MEDIUM,
+                    note_kind=ConversionNoteKind.RECOMMENDATION,
+                )
+            )
+        return findings
+
+
 def default_rules() -> "list[Rule]":
     """Ordered PostgreSQL-source compatibility rules (v1: structural, source-neutral).
 
@@ -140,6 +247,7 @@ def default_rules() -> "list[Rule]":
     """
     from dsql_migrator.core.assessor import (
         CheckConstraintRule,
+        DecimalPrecisionRule,
         EventRule,
         ForeignKeyRule,
         NoPrimaryKeyRule,
@@ -157,6 +265,9 @@ def default_rules() -> "list[Rule]":
         UnsupportedPostgresTypeRule(),
         # PG-specific: materialized views / foreign tables (no DSQL equivalent).
         UnsupportedRelationRule(),
+        # PG-worded variants of two shared conditions whose MySQL text cannot be reused.
+        PgGeneratedColumnRule(),
+        PgIdentityKeyRule(),
         ForeignKeyRule(),
         CheckConstraintRule(),
         TriggerRule(),
@@ -167,6 +278,13 @@ def default_rules() -> "list[Rule]":
         TooManyColumnsRule(),
         TooManyIndexesRule(),
         TooManyKeyColumnsRule(),
+        # Shared, and correct as-is for PostgreSQL: _DECIMAL_BASES already contains
+        # "numeric" and the precision is parsed from the first parenthesised integer, so
+        # numeric(40,10) is caught, and the message names only the DSQL limit -- no MySQL
+        # wording. Previously excluded as "DECIMAL precision parsed from a MySQL type",
+        # which left a numeric that Schema Conversion will CLAMP reading AUTO at
+        # Evaluation, i.e. the go/no-go report understated a lossy conversion.
+        DecimalPrecisionRule(),
     ]
 
 

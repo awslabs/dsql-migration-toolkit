@@ -5,6 +5,153 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.491
+
+A PostgreSQL-source path audit reported 17 findings. All 17 were re-verified against the
+code and then attacked by three independent skeptics each (is the reading right, does it
+reproduce, is the proposed fix right). **16 stand and are fixed below; one was refuted and
+the current behaviour pinned instead.** Three of the audit's own conclusions were wrong and
+are corrected here rather than implemented as written.
+
+### Fixed
+
+- **A column excluded from the migration is no longer missing from the Validation report.**
+  `run_validation` strips the operator's excluded columns from each `TableDef` *before* the
+  Validator runs — which is what makes the comparison correct, since a column with no target
+  data would otherwise mismatch on every row. But `checksum_excluded_columns` is then
+  computed from that already-stripped list, so the column appeared in neither the comparison
+  nor the "columns not compared" disclosure: the report printed
+  `Data identical: yes (N/N tables matched)` with no trace that a column holds no data on
+  the target at all. The exclusion is now stamped onto the finished report
+  (`TableValidationResult.migration_excluded_columns`) and stated in the text/JSON report and
+  the readiness panel.
+  - **Engine-independent — MySQL was affected identically.** `_apply_column_exclusions` has
+    no engine branch.
+  - The verdict is deliberately untouched: skipping the column is right, only the silence
+    was wrong. Reported in every mode, and worded as "holds no data on the target" rather
+    than "not compared", because the reason and the remedy differ from the FLOAT/JSON case.
+- **A long CHECKSUM validation can no longer be reaped while healthy.** `_target_checksum`
+  accepted an `on_page` liveness hook but did not forward it to the keyset loop, and
+  `_source_checksum_for` had no such parameter — so for a single-column-PK table (the common
+  case) *neither* side beat the watchdog for the whole scan, which is the longest stretch of
+  a run with no other statement in between. This is exactly what `set_page_hook` exists to
+  prevent.
+  - The obvious test for this is vacuous: the row-count helpers beside these already
+    forwarded the hook, so "did the hook fire during validate()?" passes with the defect
+    fully present (confirmed by reverting the fix — it still passed). The regression test
+    drives the two checksum helpers directly.
+- **Evaluation no longer stays silent about three PostgreSQL conditions Schema Conversion
+  warns about.** The v1 rule set excluded them as "MySQL-specific", but the distinction that
+  matters is whether a rule reads a MySQL *type string* or a *structural field*:
+  - `numeric(40,10)` read AUTO at Evaluation even though `clamp_pg_numeric` will silently
+    clamp it at Schema Conversion — `_DECIMAL_BASES` already contains `numeric`, so the
+    shared rule was correct for PostgreSQL all along and is simply registered now.
+  - A PostgreSQL **generated column** read "compatible" at Evaluation while the converter
+    warns it becomes an ordinary column that drifts on the first write. It was not even
+    listed in the exclusion docstring.
+  - A **serial / identity** key got the hot-partition recommendation at Schema Conversion but
+    not at Evaluation.
+  - The latter two get PG-worded rules rather than the shared MySQL classes, whose text says
+    "MySQL generated columns" and "AUTO_INCREMENT" — a list-only fix would have put a MySQL
+    feature in front of a PostgreSQL operator.
+- **A non-primary-key `serial` / identity column no longer loses its sequence default
+  silently.** `pg_column_default_sql` discarded every `nextval(...)` with no warning on the
+  premise that "the primary-key strategy governs it" — true only for the key column, since PG
+  enrichment sets `auto_increment_column` for a primary key only. Any other sequence column
+  reached the target with neither identity nor default and nothing said so, so the first
+  INSERT that omits it writes NULL instead of the next number. Keyed on the primary key, not
+  on `auto_increment_column`, so an un-enriched inventory cannot produce a wrongly-worded
+  note about its own key column.
+- **The dropped-CHECK note now shows the expression and the statement to re-add it.** It
+  said the expression "is shown in Evaluation" — untrue, Evaluation lists constraint *names*
+  — and told a PostgreSQL operator about "a MySQL CHECK expression". The expression was
+  captured all along (`CheckConstraintDef.expression`) and simply never displayed. The note
+  now prints each constraint with its expression plus a ready-to-run
+  `ALTER TABLE … ADD CONSTRAINT … CHECK (…) NOT VALID`.
+  - Automatically re-emitting the CHECK is deliberately **not** done: DSQL supports CHECK,
+    but a source expression can use functions DSQL does not accept, and carrying constraints
+    over is a post-load pipeline (as foreign keys are) that needs its own design and live
+    verification — not a side effect of a wording fix.
+- **PostgreSQL CDC now checks WAL retention, the analog of the MySQL binlog-retention
+  check.** CDC resumes from the slot created at the Full Load snapshot point, and a finite
+  `max_slot_wal_keep_size` lets the source discard that WAL and invalidate the slot — the same
+  silent Full-Load-to-CDC gap the MySQL check exists to catch, and it was not checked at all.
+  WARN-only with the same calibration (`-1` = unlimited = PASS; unknown = INFO). Read from
+  `pg_settings`, not `SHOW`, which renders a unit-suffixed string.
+  - `BINLOG_RETENTION` also reappears as a SKIP in PostgreSQL CDC mode: it was present as a
+    SKIP in the *weaker* Full Load report and absent from the stronger one.
+- **The replication-slot health panel no longer vanishes when the stack name drifts.** It
+  re-derived the slot name from the mutable stack name, while every other PostgreSQL path
+  (`dispatch_source_config`, `_drop_pg_source_replication`) prefers the recorded/deployed
+  name — their comments say why. Since the derived name embeds a hash of the stack name, an
+  attach/rename/restore pointed the health read at a slot that never existed, so the whole
+  WAL-pressure panel silently disappeared for a live, healthy slot. The deployed `PgSlotName`
+  is now read from the same describe the phase probe already performs.
+- **The Query Playground reads the source engine's dialect.** It hard-coded the MySQL
+  parser. For a PostgreSQL migration that is not cosmetic: `"user_name" || '@' || domain`
+  parses as MySQL into `'user_name' OR '@' OR domain` — a **different query**, still labelled
+  AUTO ("no review needed"), which the Test button would then run against the real target.
+  PostgreSQL-only syntax (`@>`, `::jsonb`) instead failed to parse, fell to `OTHER`, and so
+  could not be tested at all. The MySQL-only rewrites (`ON DUPLICATE KEY UPDATE`,
+  `JSON_UNQUOTE`) are skipped for a PostgreSQL source, and a parse error names the right
+  engine.
+- **Four PostgreSQL prerequisite checks are filed under the right heading.**
+  `_PREREQ_CATEGORY_BY_CHECK` mapped 12 of the (then) 18 check ids and the lookup falls back
+  to "Schema & Tables", so `wal_level`, the replication role, slot headroom and the
+  writer check — all server settings/privileges — were filed as per-table readiness, leaving
+  "Source Configuration" nearly empty on a PostgreSQL CDC run. Gating never depended on the
+  category, so nothing functional was wrong. A test now asserts the map covers the enum,
+  which is how five checks slipped in unnoticed.
+- **The primary-key strategy notes no longer advise a PostgreSQL operator about
+  AUTO_INCREMENT.** The shared DSQL-constraint phase runs for a PostgreSQL source too
+  (enrichment sets `auto_increment_column` for a serial/identity key), so all three strategy
+  messages named a MySQL feature the database does not have. The MySQL strings stay
+  byte-identical — a committed conversion snapshot pins them.
+- **The watermark panel trusts the engine it knows instead of guessing.** It inferred the
+  engine from `bool(watermark.wal_lsn)`, but a PostgreSQL Full-Load-only LSN read is
+  best-effort (`None` without the privilege), so a PostgreSQL run whose LSN came back empty
+  rendered MySQL binlog/GTID/server-UUID rows and reported an "unavailable binlog coordinate"
+  for a source that has no binlog.
+- **A non-default PostgreSQL column collation is now captured and disclosed.**
+  `_reflect_tables` hard-codes `collation=None` (SQLAlchemy does not supply it) and only the
+  MySQL enricher filled it, so the collation warning could never fire for a PostgreSQL
+  source. A column collated case-/accent-insensitively landed under DSQL's default
+  collation, changing `=`, `LIKE`, `ORDER BY` and UNIQUE semantics while every row count and
+  checksum still matched. Any non-default collation is reported, because a PostgreSQL
+  `collname` is an arbitrary name whose sensitivity cannot be read off the string the way
+  MySQL's `_ci` suffix can.
+- **The text report no longer claims "Drifted: no" with nothing to compare.** `drifted`
+  defaults to `False` when no coordinate was comparable, which the report printed as a flat
+  all-clear on the one line an operator reads to confirm a pre-cut-over write freeze held —
+  and that is the state of *every* PostgreSQL run, whose MySQL probes are deliberately
+  skipped to keep the shared snapshot intact. Determinability is now derived from `basis`,
+  exactly as the UI already does, and the undetermined message is source-neutral.
+  - The audit's proposed fix — read the WAL LSN and treat an advance as drift — is **not**
+    implemented, and should not be: an idle PostgreSQL source advances its LSN on its own
+    (autovacuum, checkpoints, `wal_level=logical` bookkeeping), so that comparison would
+    report drift on a source nobody wrote to. Making the existing report honest is the
+    correct fix; a real PostgreSQL drift signal needs a quiescence-safe coordinate.
+- **`timetz` stays offset-agnostic when the applied target types are unavailable.** The
+  `timetz` arm sat inside `if applied:`, so a table whose applied types could not be resolved
+  fell back to a raw `::text` render on both sides. The CDC sink stores `timetz`
+  UTC-normalized (Debezium `ZonedTime`) while Full Load keeps the source offset, so every
+  CDC-written row false-MISMATCHed — a blocking cut-over verdict on correct data. An applied
+  type still wins, so a deliberate remap away from `timetz` is honoured.
+  - The audit's stated trigger (a reconnect empties `target_type`) is wrong and was verified
+    not to happen: the conversion state object always exists by the time Validation reads it,
+    and a session restore rehydrates it. The reachable route is a PK strategy whose DDL
+    clause does not parse.
+
+### Unchanged (reported, and the current behaviour is correct)
+
+- **`jsonb` stays in the checksum.** The audit asked for `jsonb` to be excluded alongside
+  `json`. It must not be: PostgreSQL stores `jsonb` decomposed and re-serializes it through
+  `jsonb_out` on read, so both ends emit the same canonical text whatever wrote the row —
+  the CDC sink's compact form included. `json` keeps its bytes verbatim, which is why it has
+  no byte-identical cross-engine form. Broadening the check would have dropped the type
+  customers actually use out of the only value-level verification there is. A test already
+  pinned the distinction; the reasoning is now recorded beside it so it is not "fixed" again.
+
 ## v0.1.490
 
 ### Fixed

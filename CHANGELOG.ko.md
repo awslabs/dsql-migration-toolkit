@@ -5,6 +5,123 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.491
+
+PostgreSQL 소스 경로 감사에서 17건이 보고되었습니다. 17건 모두를 코드에 대해 재검증한 뒤, 각 건을
+독립 회의론자 3명이 공격했습니다(판독이 맞는가 / 실제로 재현되는가 / 제안된 수정이 옳은가).
+**16건이 성립해 아래에서 수정되었고, 1건은 반증되어 현재 동작을 고정했습니다.** 감사 자체의 결론
+3건은 틀렸으므로 그대로 구현하지 않고 여기서 교정했습니다.
+
+### 수정
+
+- **마이그레이션에서 제외한 컬럼이 Validation 리포트에서 빠지지 않습니다.** `run_validation`은 Validator가
+  돌기 **전에** 제외 컬럼을 각 `TableDef`에서 지웁니다 — 대상에 데이터가 없는 컬럼은 모든 행에서 불일치할
+  것이므로, 비교를 올바르게 만드는 것이 바로 이 제거입니다. 그런데 `checksum_excluded_columns`가 그
+  **이미 잘려나간** 목록에서 계산되므로, 제외한 컬럼은 비교에도 "비교하지 않은 컬럼" 공시에도 나타나지
+  않았습니다: 리포트는 대상에 그 컬럼의 데이터가 전혀 없다는 흔적 없이 `Data identical: yes (N/N tables
+  matched)`라고만 출력했습니다. 이제 제외 정보가 완료된 리포트에 기록되고
+  (`TableValidationResult.migration_excluded_columns`) 텍스트/JSON 리포트와 준비 상태 패널에 명시됩니다.
+  - **엔진 무관 — MySQL도 동일하게 영향받았습니다.** `_apply_column_exclusions`에는 엔진 분기가 없습니다.
+  - 판정은 의도적으로 건드리지 않습니다: 컬럼을 건너뛰는 것은 옳고, 침묵만이 틀렸습니다. 모든 모드에서
+    보고하며, 사유와 조치가 FLOAT/JSON 케이스와 다르므로 "비교하지 않음"이 아니라 "대상에 데이터가 없음"으로
+    표현합니다.
+- **긴 CHECKSUM 검증이 정상인데도 회수되지 않습니다.** `_target_checksum`은 `on_page` liveness 훅을 받으면서도
+  keyset 루프에 넘기지 않았고 `_source_checksum_for`에는 매개변수 자체가 없었습니다 — 그래서 단일 컬럼 PK
+  테이블(대다수)에서는 스캔 내내 **어느 쪽도** 워치독을 두드리지 않았습니다. 그 구간이 바로 다른 문장이 전혀
+  끼어들지 않는 런 최장 구간이며, `set_page_hook`이 막으려던 상황 그대로입니다.
+  - 이 건의 자연스러운 테스트는 무의미합니다: 옆의 행 수 헬퍼들은 이미 훅을 넘기고 있어서
+    "validate() 중에 훅이 울렸는가"는 결함이 그대로 있어도 통과합니다(수정을 되돌려 확인 — 그래도 통과).
+    회귀 테스트는 두 체크섬 헬퍼를 직접 구동합니다.
+- **Evaluation이 Schema Conversion은 경고하는 PostgreSQL 조건 3건에 더는 침묵하지 않습니다.** v1 규칙 셋이
+  "MySQL 전용"이라며 제외했지만, 여기서 중요한 구분은 규칙이 MySQL **타입 문자열**을 읽는지 **구조적 필드**를
+  읽는지입니다:
+  - `numeric(40,10)`이 Evaluation에서 AUTO로 읽혔습니다 — Schema Conversion의 `clamp_pg_numeric`이 조용히
+    깎을 것인데도. `_DECIMAL_BASES`에 이미 `numeric`이 있어 공유 규칙은 애초에 PostgreSQL에서도 맞았고,
+    이제 그냥 등록합니다.
+  - PostgreSQL **생성 컬럼**이 Evaluation에서 "호환"으로 읽혔습니다 — 컨버터는 그것이 일반 컬럼이 되어 첫
+    쓰기부터 드리프트한다고 경고하는데도. 제외 목록 docstring에도 적혀 있지 않았습니다.
+  - **serial / identity** 키는 Schema Conversion에서는 핫 파티션 권고를 받지만 Evaluation에서는 받지
+    못했습니다.
+  - 뒤의 두 건은 공유 MySQL 클래스가 아니라 PG 문구 규칙으로 넣었습니다 — 그 텍스트는 "MySQL generated
+    columns", "AUTO_INCREMENT"라고 말하므로, 목록만 추가하는 수정은 PostgreSQL 사용자 앞에 MySQL 기능을
+    내놓는 셈입니다.
+- **PK가 아닌 `serial` / identity 컬럼이 시퀀스 기본값을 조용히 잃지 않습니다.** `pg_column_default_sql`은
+  "PK 전략이 관리한다"는 전제로 모든 `nextval(...)`을 경고 없이 버렸습니다 — 그 전제는 키 컬럼에만 참입니다.
+  PG 인리치가 `auto_increment_column`을 **PK에만** 세팅하기 때문입니다. 그 외 시퀀스 컬럼은 identity도 기본값도
+  없이 대상에 도착했고 아무 말도 없었으므로, 그 컬럼을 생략한 첫 INSERT가 다음 번호가 아니라 NULL을 씁니다.
+  `auto_increment_column`이 아니라 **PK 기준**으로 판정하므로, 인리치되지 않은 인벤토리가 자기 키 컬럼에 대해
+  잘못된 문구의 경고를 내는 일은 없습니다.
+- **CHECK 드롭 경고가 이제 표현식과 재추가 문장을 보여줍니다.** 기존 문구는 표현식이 "Evaluation에 나온다"고
+  했지만 사실이 아니고(Evaluation은 제약 **이름**만 나열합니다), PostgreSQL 사용자에게 "MySQL CHECK 표현식"을
+  이야기했습니다. 표현식은 처음부터 캡처돼 있었고(`CheckConstraintDef.expression`) 어디에도 표시되지 않았을
+  뿐입니다. 이제 각 제약을 표현식과 함께 출력하고, 바로 실행할 수 있는
+  `ALTER TABLE … ADD CONSTRAINT … CHECK (…) NOT VALID`를 덧붙입니다.
+  - CHECK를 자동으로 다시 내보내는 것은 **의도적으로 하지 않았습니다**: DSQL은 CHECK를 지원하지만 소스
+    표현식이 DSQL이 받지 않는 함수를 쓸 수 있고, 제약 이관은 (외래 키처럼) 자체 설계와 라이브 검증이 필요한
+    적재 후 파이프라인입니다 — 문구 수정의 부수 효과로 낄 일이 아닙니다.
+- **PostgreSQL CDC가 WAL 보관을 점검합니다 — MySQL binlog 보관 점검의 대응물입니다.** CDC는 Full Load 스냅샷
+  시점에 만든 슬롯에서 재개하고, 유한한 `max_slot_wal_keep_size`는 소스가 그 WAL을 버려 슬롯을 무효화하도록
+  허용합니다 — MySQL 점검이 잡으려는 것과 **같은** 조용한 Full Load→CDC 공백인데 전혀 점검되지 않았습니다.
+  같은 보정으로 WARN만 합니다(`-1` = 무제한 = PASS, 미지 = INFO). 단위가 붙은 문자열을 내는 `SHOW`가 아니라
+  `pg_settings`에서 읽습니다.
+  - `BINLOG_RETENTION`도 PostgreSQL CDC 모드에 SKIP으로 되돌아옵니다: **약한** Full Load 리포트에는 SKIP으로
+    있으면서 강한 쪽에는 없었습니다.
+- **복제 슬롯 상태 패널이 스택 이름이 드리프트해도 사라지지 않습니다.** 모니터는 가변 스택 이름에서 슬롯 이름을
+  재파생했지만, 다른 모든 PostgreSQL 경로(`dispatch_source_config`, `_drop_pg_source_replication`)는 기록된/배포된
+  이름을 우선합니다 — 그 이유가 주석에 있습니다. 파생 이름에 스택 이름 해시가 들어가므로 attach/rename/restore
+  후에는 존재하지 않는 슬롯을 읽게 되고, 살아 있는 정상 슬롯에 대해 WAL 압력 패널 전체가 조용히 사라졌습니다.
+  이제 phase 프로브가 이미 수행하는 같은 describe에서 배포된 `PgSlotName`을 읽습니다.
+- **Query Playground가 소스 엔진의 방언으로 파싱합니다.** MySQL 파서를 하드코딩하고 있었습니다. PostgreSQL
+  마이그레이션에서 이는 표현 문제가 아닙니다: `"user_name" || '@' || domain`은 MySQL로 파싱하면
+  `'user_name' OR '@' OR domain`, 즉 **다른 쿼리**가 되는데도 AUTO("검토 불필요")로 표시되고, Test 버튼은 그것을
+  실제 대상에 실행합니다. PostgreSQL 전용 문법(`@>`, `::jsonb`)은 반대로 파싱에 실패해 `OTHER`로 떨어져
+  테스트조차 불가능했습니다. MySQL 전용 리라이트(`ON DUPLICATE KEY UPDATE`, `JSON_UNQUOTE`)는 PostgreSQL
+  소스에서 건너뛰고, 파싱 오류는 올바른 엔진 이름을 말합니다.
+- **PostgreSQL 사전 점검 4건이 올바른 그룹에 들어갑니다.** `_PREREQ_CATEGORY_BY_CHECK`가 (당시) 18개 체크 id
+  중 12개만 매핑하고 조회는 "Schema & Tables"로 fallback하므로, `wal_level`·복제 역할·슬롯 여유분·writer
+  점검 — 모두 서버 설정/권한 — 이 테이블별 준비 상태로 분류되어 PostgreSQL CDC 런에서 "Source Configuration"이
+  거의 비었습니다. 게이팅은 카테고리에 의존하지 않으므로 기능상 문제는 없었습니다. 이제 맵이 enum을 전수
+  덮는지 테스트가 단정합니다 — 체크 5개가 조용히 빠진 경로가 그것입니다.
+- **PK 전략 안내가 PostgreSQL 사용자에게 AUTO_INCREMENT를 이야기하지 않습니다.** 공유 DSQL 제약 단계는
+  PostgreSQL 소스에서도 돌고(인리치가 serial/identity 키에 `auto_increment_column`을 세팅), 그래서 세 전략
+  메시지 모두가 그 데이터베이스에 없는 MySQL 기능을 언급했습니다. MySQL 문자열은 바이트 단위로 동일하게
+  유지됩니다 — 커밋된 변환 스냅샷이 고정하고 있습니다.
+- **워터마크 패널이 추측하지 않고 아는 엔진을 신뢰합니다.** `bool(watermark.wal_lsn)`로 엔진을 추론했지만,
+  PostgreSQL Full-Load-only의 LSN 읽기는 best-effort(권한 없으면 `None`)이므로 LSN이 비어 돌아온 PostgreSQL
+  런은 MySQL binlog/GTID/server-UUID 행을 렌더하고 binlog가 아예 없는 소스에 대해 "unavailable binlog
+  coordinate"를 보고했습니다.
+- **PostgreSQL 컬럼의 비기본 COLLATE가 캡처되고 공시됩니다.** `_reflect_tables`가 `collation=None`을
+  하드코딩하고(SQLAlchemy가 주지 않음) MySQL 인리처만 채우므로, PostgreSQL 소스에서는 collation 경고가 발동할
+  수 없었습니다. 대소문자/악센트 무시 collation 컬럼이 DSQL 기본 collation 아래 놓여 `=`, `LIKE`,
+  `ORDER BY`, UNIQUE 의미가 바뀌는데도 행 수와 체크섬은 모두 일치합니다. MySQL의 `_ci` 접미사와 달리
+  PostgreSQL `collname`은 임의의 이름이어서 문자열만으로 민감도를 알 수 없으므로, 비기본 collation은 모두
+  보고합니다.
+- **텍스트 리포트가 비교할 것이 없는데 "Drifted: no"라고 하지 않습니다.** 비교 가능한 좌표가 없으면 `drifted`는
+  `False`가 기본값이고, 리포트는 그것을 컷오버 전 쓰기 freeze가 유지됐는지 확인하는 단 한 줄에 무조건적인
+  전체 통과로 출력했습니다 — 그리고 그것이 **모든** PostgreSQL 런의 상태입니다(공유 스냅샷을 지키기 위해 MySQL
+  프로브를 의도적으로 건너뜁니다). 이제 UI가 이미 그러는 것과 똑같이 `basis`에서 판정 가능성을 도출하고,
+  판정 불가 메시지는 엔진 중립입니다.
+  - 감사가 제안한 수정 — WAL LSN을 읽어 전진을 드리프트로 본다 — 은 **구현하지 않았고**, 해서는 안 됩니다:
+    유휴 PostgreSQL 소스는 스스로 LSN을 전진시키므로(autovacuum, checkpoint, `wal_level=logical` 기록) 아무도
+    쓰지 않은 소스에 드리프트를 보고합니다. 기존 리포트를 정직하게 만드는 것이 올바른 수정이며, 진짜
+    PostgreSQL 드리프트 신호는 정지 상태에서 안전한 좌표가 필요합니다.
+- **적용된 대상 타입을 알 수 없을 때도 `timetz`가 오프셋 무관으로 유지됩니다.** `timetz` 분기가 `if applied:`
+  안에 있어서, 적용 타입을 해석하지 못한 테이블은 양쪽 모두 raw `::text` 렌더로 떨어졌습니다. CDC 싱크는
+  `timetz`를 UTC 정규화해 저장하고(Debezium `ZonedTime`) Full Load는 소스 오프셋을 보존하므로, CDC가 쓴 모든
+  행이 false MISMATCH를 냈습니다 — 올바른 데이터에 대한 차단성 컷오버 판정입니다. 적용 타입은 여전히 우선하므로
+  `timetz`에서 의도적으로 remap한 경우는 존중됩니다.
+  - 감사가 말한 원인(재연결이 `target_type`을 비운다)은 틀렸고, 그렇지 않음을 확인했습니다: Validation이 읽는
+    시점에 변환 상태 객체는 항상 존재하고, 세션 복원은 그것을 재수화합니다. 실제 경로는 DDL 절이 파싱되지 않는
+    PK 전략입니다.
+
+### 변경하지 않음 (보고되었으나 현재 동작이 맞음)
+
+- **`jsonb`는 체크섬에 남습니다.** 감사는 `jsonb`를 `json`과 함께 제외하자고 했습니다. 그래서는 안 됩니다:
+  PostgreSQL은 `jsonb`를 분해해 저장하고 읽을 때 `jsonb_out`으로 재직렬화하므로, 누가 그 행을 썼든 —
+  CDC 싱크의 compact 형식 포함 — 양쪽이 같은 정규 텍스트를 냅니다. `json`은 바이트를 그대로 보관하며, 그래서
+  엔진 간 바이트 동일 형식이 없습니다. 체크를 넓히면 고객이 실제로 쓰는 타입을 유일한 값 수준 검증에서
+  빼는 셈입니다. 이 구분은 이미 테스트가 고정하고 있었고, 다시 "수정"되지 않도록 근거를 그 옆에 기록했습니다.
+
 ## v0.1.490
 
 ### 수정

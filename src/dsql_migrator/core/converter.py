@@ -2179,9 +2179,13 @@ def _composite_unique_index_ddl(table: TableDef) -> str:
 
 
 def _apply_pk_strategy(
-    create: exp.Expression, table: TableDef, strategy: PrimaryKeyStrategy
+    create: exp.Expression,
+    table: TableDef,
+    strategy: PrimaryKeyStrategy,
+    *,
+    is_postgres: bool = False,
 ) -> list[ConversionWarning]:
-    """Apply the primary-key strategy to a monotonic AUTO_INCREMENT key.
+    """Apply the primary-key strategy to a monotonically increasing generated key.
 
     Rewrites the auto-increment column in ``create`` according to ``strategy``
     and returns the warnings describing the applied strategy (Requirement 3.5):
@@ -2189,11 +2193,26 @@ def _apply_pk_strategy(
     key whose mapped type is wider than signed BIGINT (``bigint unsigned`` ->
     ``numeric(20,0)``) -- a range-narrowing LOSS warning, because DSQL identity
     columns must be BIGINT and any existing source value above 2^63-1 would then fail
-    to load. Returns ``[]`` when the table has no AUTO_INCREMENT column.
+    to load. Returns ``[]`` when the table has no generated key column.
+
+    ``is_postgres`` only selects the word for the SOURCE mechanism. This runs for a
+    PostgreSQL source too (``_pg_enrich_columns`` sets ``auto_increment_column`` for a
+    serial / ``GENERATED AS IDENTITY`` primary key, and the PG branch re-enters this
+    shared phase), so every one of these notes used to advise a PostgreSQL operator about
+    an ``AUTO_INCREMENT`` their database does not have. The substance was right, only the
+    name was borrowed. Same shape as ``assessment_strategist.source_engine_word``.
     """
     column_name = table.auto_increment_column
     if not column_name:
         return []
+    # The MySQL strings stay byte-identical (a committed conversion snapshot pins them);
+    # only the PostgreSQL branch is new wording.
+    key_word = "serial / identity" if is_postgres else "AUTO_INCREMENT"
+    no_generator = (
+        "nothing generates a value for it"
+        if is_postgres
+        else "there is no AUTO_INCREMENT/identity on it"
+    )
 
     column_def = _find_column_def(create, column_name)
     # Set when the identity widening NARROWED the declared range (see below), so the
@@ -2204,7 +2223,7 @@ def _apply_pk_strategy(
         if column_def is not None:
             column_def.set("kind", _build("uuid"))
         message = (
-            f"The primary key from AUTO_INCREMENT column '{column_name}' was "
+            f"The primary key from {key_word} column '{column_name}' was "
             "converted to uuid, which spreads inserts across Aurora DSQL partitions "
             "(a monotonically increasing key concentrates writes on one, since DSQL "
             "stores rows in primary-key order). The application must now generate "
@@ -2250,7 +2269,7 @@ def _apply_pk_strategy(
             constraints.append(exp.ColumnConstraint(kind=identity))
             column_def.set("constraints", constraints)
         message = (
-            f"The primary key from AUTO_INCREMENT column '{column_name}' was "
+            f"The primary key from {key_word} column '{column_name}' was "
             f"converted to a cached identity (CACHE {_IDENTITY_CACHE_SIZE}), which "
             "spreads inserts across Aurora DSQL nodes (a monotonically increasing "
             "key concentrates writes on one partition, since DSQL stores rows in "
@@ -2258,9 +2277,9 @@ def _apply_pk_strategy(
         )
     else:  # PrimaryKeyStrategy.KEEP_INTEGER
         message = (
-            f"The integer key from AUTO_INCREMENT column '{column_name}' was kept as a "
+            f"The integer key from {key_word} column '{column_name}' was kept as a "
             "plain integer. IMPORTANT: Aurora DSQL will NOT auto-generate this key after "
-            "cut-over (there is no AUTO_INCREMENT/identity on it), so the application "
+            f"cut-over ({no_generator}), so the application "
             "must supply the value on every insert — an app that relied on the database "
             "generating it will fail or collide. Choose the 'Server-generated (IDENTITY)' "
             "strategy instead if you want DSQL to fill the key. For higher insert "
@@ -2466,6 +2485,51 @@ def _collation_warning(table: TableDef) -> Optional[ConversionWarning]:
             "and checksum will match. Queries that relied on case-insensitive matching "
             "need LOWER(...) on both sides (with a matching expression index), and a "
             "UNIQUE column that rejected 'Bob' beside 'bob' will now accept both."
+        ),
+    )
+
+
+def _pg_collation_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """PostgreSQL-source variant of :func:`_collation_warning`.
+
+    Same quiet class of change, different mechanism: the rebuilt ``CREATE TABLE`` carries
+    no ``COLLATE`` clause, so a column that was collated non-default on the source is
+    created under the TARGET's default collation. Every row migrates byte-identically and
+    every count and checksum matches, yet ``=``, ``LIKE``, ``ORDER BY`` and UNIQUE can all
+    behave differently afterwards -- most visibly with a case- or accent-insensitive ICU
+    collation (``deterministic = false``), where a UNIQUE column that rejected ``Bob``
+    beside ``bob`` starts accepting both.
+
+    Reports any non-default collation rather than only an insensitive one: unlike MySQL,
+    where the ``_ci`` / ``_cs`` / ``_bin`` suffix states the behaviour, a PostgreSQL
+    ``collname`` is an arbitrary name (``en_US.utf8``, ``case_insensitive``, a custom ICU
+    locale) whose sensitivity cannot be read off the string. The enricher already filtered
+    out ``default`` / ``C`` / ``POSIX``, which match the target and so are not a change.
+    Warn-only: re-emitting the COLLATE clause would need the collation to exist on DSQL.
+    """
+    columns = [
+        f"{column.name} ({column.collation})"
+        for column in table.columns
+        if column.collation
+    ]
+    if not columns:
+        return None
+    names = ", ".join(columns)
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.LOSS,
+        message=(
+            f"Columns ({names}) use a non-default PostgreSQL collation, which is NOT "
+            "carried to the target — the column is created under Aurora DSQL's default "
+            "collation. The data migrates exactly and every row count and checksum will "
+            "match, but text comparison can change: equality, LIKE, ORDER BY order and "
+            "UNIQUE enforcement all follow the target collation instead. If the source "
+            "collation was case- or accent-INSENSITIVE, a UNIQUE column that rejected "
+            "'Bob' beside 'bob' will now accept both, and queries that relied on "
+            "insensitive matching need LOWER(...)/unaccent on both sides (with a matching "
+            "expression index). Check the ordering-dependent queries and unique keys on "
+            "these columns before cutting over."
         ),
     )
 
@@ -3024,29 +3088,63 @@ def _pg_bytea_key_warning(table: TableDef) -> Optional[ConversionWarning]:
     )
 
 
-def _check_constraint_warning(table: TableDef) -> Optional[ConversionWarning]:
+def _check_constraint_warning(
+    table: TableDef, *, is_postgres: bool = False
+) -> Optional[ConversionWarning]:
     """Warn that source CHECK constraints are not re-emitted on the target.
 
-    Aurora DSQL supports CHECK, but a MySQL CHECK expression can use functions/operators
-    that differ on PostgreSQL, so the converter does not blindly copy it (a bad copy would
-    be invalid DDL). The result was a SILENT drop on the conversion screen: the constraint
-    is no longer enforced and nothing said so (Evaluation flags it, but the DDL screen did
+    Aurora DSQL supports CHECK, but a source CHECK expression can use functions/operators
+    DSQL does not accept, so the converter does not blindly copy it (a bad copy would be
+    invalid DDL). The result was a SILENT drop on the conversion screen: the constraint is
+    no longer enforced and nothing said so (Evaluation flags it, but the DDL screen did
     not). The ENUM-derived ``CHECK ... IN (...)`` is emitted separately and is unaffected.
+
+    The note prints each captured EXPRESSION and the ready-to-run ``ALTER TABLE`` --
+    ``CheckConstraintDef.expression`` is already populated for both engines and, until now,
+    nothing displayed it. The old text pointed at Evaluation for the expression, which was
+    simply untrue: Evaluation lists constraint NAMES only. ``is_postgres`` selects the
+    reason wording; a keyword rather than a second helper because only the prose differs
+    (detection is identical), following ``_key_size_warning`` / ``_too_many_indexes_warning``
+    in the same tuple rather than the ``_bytea_key_warning`` pair, whose DETECTION differs.
+
+    ``NOT VALID`` is not optional padding: it is the only ``ADD CONSTRAINT`` form DSQL
+    accepts (see :func:`_build_foreign_key_ddls`), and it enforces every new write
+    immediately, so the pasted statement works as-is.
     """
     if not table.check_constraints:
         return None
-    names = ", ".join(ck.name for ck in table.check_constraints)
+    engine = "PostgreSQL" if is_postgres else "MySQL"
+    detail = "; ".join(
+        f"{ck.name}: CHECK ({ck.expression})" if ck.expression else ck.name
+        for ck in table.check_constraints
+    )
+    alters = " ".join(
+        f"ALTER TABLE {table.name} ADD CONSTRAINT {ck.name} "
+        f"CHECK ({ck.expression}) NOT VALID;"
+        for ck in table.check_constraints
+        if ck.expression
+    )
+    message = (
+        f"CHECK constraint(s) were NOT carried over — {detail}. Aurora DSQL supports "
+        f"CHECK, but a {engine} CHECK expression can use functions/operators DSQL does "
+        "not accept, so the converter does not re-emit it blindly — the rule is no longer "
+        "enforced on the target."
+    )
+    if alters:
+        message += (
+            " If the expression is DSQL-compatible, add it after the load: "
+            f"{alters} (DSQL accepts ADD CONSTRAINT only as NOT VALID, which still "
+            "enforces every NEW write; follow with ALTER TABLE ASYNC … VALIDATE "
+            "CONSTRAINT to check the rows already loaded.) Otherwise enforce it in the "
+            "application."
+        )
+    else:
+        message += " Re-add a DSQL-compatible CHECK by hand, or enforce it in the application."
     return ConversionWarning(
         object_name=table.name,
         classification=Classification.MANUAL,
         kind=ConversionNoteKind.LOSS,
-        message=(
-            f"CHECK constraint(s) ({names}) were NOT carried over. Aurora DSQL supports "
-            "CHECK, but a MySQL CHECK expression can use functions/operators that behave "
-            "differently on PostgreSQL, so the converter does not blindly re-emit it — the "
-            "rule is no longer enforced on the target. Re-add a DSQL-compatible CHECK by "
-            "hand (the expression is shown in Evaluation) or enforce it in the application."
-        ),
+        message=message,
     )
 
 
@@ -3505,16 +3603,19 @@ class SchemaConverter:
 
             # PostgreSQL column DEFAULTs ARE carried to the target (build_pg_source_ddl
             # emits them; the read="postgres" re-parse normalizes each to DSQL-valid SQL).
-            # Warn ONLY for a default that genuinely could not be carried -- one that does
-            # not parse as a PostgreSQL expression -- so dropping it is never silent
-            # (Property 6). A serial/identity nextval and a generated column are the
-            # identity mechanism / computed value, governed elsewhere; pg_column_default_sql
-            # returns no drop reason for them (mirrors the MySQL default-loss loop, which
-            # skips the auto_increment column and reports only the genuinely-dropped ones).
+            # Warn for a default that genuinely could not be carried -- one that does not
+            # parse as a PostgreSQL expression, or a sequence DEFAULT on a NON-key column
+            # (the identity PK is skipped below, and the PK strategy governs only that
+            # one) -- so dropping it is never silent (Property 6). A generated column's
+            # computed value is governed elsewhere and yields no reason. Mirrors the MySQL
+            # default-loss loop, which likewise skips the auto_increment column and reports
+            # only the genuinely-dropped ones.
             for column in table.columns:
                 if column.name == table.auto_increment_column:
                     continue
-                _emitted, drop_reason = pg_column_default_sql(column)
+                _emitted, drop_reason = pg_column_default_sql(
+                    column, is_key_column=column.name in table.primary_key
+                )
                 if drop_reason is None:
                     continue
                 message = f"Column '{column.name}' " + drop_reason
@@ -3565,7 +3666,10 @@ class SchemaConverter:
             # _apply_pk_strategy returns 0..2 warnings: the throughput RECOMMENDATION
             # and (for an identity widening that narrows the range) a LOSS warning.
             pk_strategy_warnings.extend(
-                _apply_pk_strategy(create, table, options.primary_key_strategy)
+                _apply_pk_strategy(
+                    create, table, options.primary_key_strategy,
+                    is_postgres=is_postgres,
+                )
             )
         warnings.extend(pk_strategy_warnings)
         for optional_warning in (
@@ -3577,7 +3681,7 @@ class SchemaConverter:
             (_bytea_key_warning(table) if not is_postgres else None),
             (_pg_bytea_key_warning(table) if is_postgres else None),
             _foreign_key_warning(table, preserve=options.preserve_foreign_keys),
-            _check_constraint_warning(table),
+            _check_constraint_warning(table, is_postgres=is_postgres),
             _identifier_length_warning(
                 table, generated_index_names=generated_index_names
             ),
@@ -3603,6 +3707,7 @@ class SchemaConverter:
             (_generated_column_warning(table) if not is_postgres else None),
             (_pg_generated_column_warning(table) if is_postgres else None),
             (_collation_warning(table) if not is_postgres else None),
+            (_pg_collation_warning(table) if is_postgres else None),
             (_on_update_timestamp_warning(table) if not is_postgres else None),
         ):
             if optional_warning is not None:

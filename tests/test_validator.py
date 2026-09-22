@@ -2889,3 +2889,133 @@ def test_the_page_hook_is_optional_and_defaults_to_no_reporting() -> None:
 
     v.set_page_hook(_boom)
     v._page()                       # advisory: a bad hook must never break a scan
+
+
+def test_migration_excluded_columns_reach_the_report() -> None:
+    """A-1: run_validation strips the operator's excluded columns BEFORE the Validator, so
+    they could appear in neither the comparison nor the 'columns not compared' disclosure --
+    the report said "Data identical: yes (N/N tables matched)" with no trace that a column
+    holds no data on the target at all."""
+    from dsql_migrator.core.validator import (
+        render_text_report,
+        with_migration_excluded_columns,
+    )
+
+    table = _table("media", columns=("id", "caption"))
+    source = _FakeSourceConnection(counts={"media": 2}, checksums={"media": "7"})
+    target = _FakeTargetConnection(counts={"media": 2}, checksums={"media": "7"})
+    report = _validator(source, target).validate(
+        _SOURCE_CONFIG, _TARGET_CONFIG, [table], ValidationMode.CHECKSUM
+    )
+    # Before stamping: a clean match with no disclosure at all.
+    assert report.items[0].matched is True
+    assert report.items[0].migration_excluded_columns == []
+    assert "EXCLUDED from the migration" not in render_text_report(report)
+
+    stamped = with_migration_excluded_columns(report, {"media": {"content"}})
+    assert stamped.items[0].migration_excluded_columns == ["content"]
+    # The verdict is untouched: skipping a never-written column is correct.
+    assert stamped.items[0].matched is True
+    text = render_text_report(stamped)
+    assert "Columns EXCLUDED from the migration" in text
+    assert "media (content)" in text
+    # An empty map returns the report unchanged (no needless copy).
+    assert with_migration_excluded_columns(report, {}) is report
+    assert with_migration_excluded_columns(report, None) is report
+
+
+def test_checksum_page_hook_beats_on_both_sides_for_a_single_pk_table() -> None:
+    """A-2: the keyset checksum loops are the longest stretch of a CHECKSUM run with no
+    other statement in between. `_target_checksum` accepted `on_page` but did not forward
+    it, and `_source_checksum_for` had no such parameter, so for a single-column-PK table
+    NEITHER side beat the liveness hook and a healthy long scan could be reaped.
+
+    Asserted on the two helpers DIRECTLY. Driving a whole `validate()` and checking that
+    the hook fired at all proves nothing: the row-count helpers beside them already
+    forwarded it, so that assertion passes with the defect fully present (verified by
+    reverting the fix -- it still passed)."""
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.core.source_dialect import dialect_for
+    from dsql_migrator.core.validator import _source_checksum_for, _target_checksum
+
+    table = _table("big", columns=("id", "v"))
+
+    target_beats: list[int] = []
+    target = _FakeTargetConnection(counts={"big": 4}, checksums={"big": "9"})
+    _target_checksum(
+        target, table, 2, on_page=lambda: target_beats.append(1)
+    )
+    assert target_beats, "the TARGET keyset checksum must beat the liveness hook"
+
+    source_beats: list[int] = []
+    source = _FakeSourceConnection(counts={"big": 4}, checksums={"big": "9"})
+    _source_checksum_for(
+        dialect_for(SourceType.MYSQL), source, table, 2,
+        on_page=lambda: source_beats.append(1),
+    )
+    assert source_beats, "the SOURCE keyset checksum must beat the liveness hook"
+
+
+def test_drift_lines_do_not_claim_no_drift_without_a_basis() -> None:
+    """E-1: `drifted` defaults to False when nothing was comparable, and the text report
+    printed that as a flat "Drifted: no" -- an unconditional all-clear on the one line an
+    operator reads to confirm a write freeze held, and the state of EVERY PostgreSQL run
+    (its MySQL probes are deliberately skipped to keep the snapshot intact)."""
+    from dsql_migrator.core.models import DriftReport
+    from dsql_migrator.core.validator import _render_drift_lines
+
+    undetermined = DriftReport(
+        drifted=False,
+        detail="Neither a GTID nor a binlog position was available to compare.",
+    )
+    lines = _render_drift_lines(undetermined)
+    assert "- Drifted: could not be determined (no comparable source coordinate)" in lines
+    assert not any(line == "- Drifted: no" for line in lines)
+
+    # A real comparison still renders the full block, verdict included.
+    determined = DriftReport(
+        drifted=False,
+        basis="gtid",
+        watermark_gtid="uuid:1-10",
+        current_gtid="uuid:1-10",
+        detail="The GTID set is unchanged since the snapshot.",
+    )
+    lines = _render_drift_lines(determined)
+    assert "- Drifted: no" in lines
+    assert "- Watermark GTID: uuid:1-10" in lines
+
+
+def test_timetz_is_offset_agnostic_even_without_an_applied_target_type() -> None:
+    """E-3: the timetz arm sat inside `if applied:`, so a table whose applied target types
+    could not be resolved fell back to a raw `::text` render -- offset-SENSITIVE on both
+    sides. The CDC sink stores timetz UTC-normalized (Debezium ZonedTime) while Full Load
+    keeps the source offset, so every CDC-written row then false-MISMATCHes."""
+    from dsql_migrator.core.models import ColumnDef
+    from dsql_migrator.core.validation_sql import _checksum_kind, _pg_checksum_expr
+
+    for spelling in ("timetz", "timetz(3)", "time with time zone", "time(6) with time zone"):
+        without_applied = ColumnDef(name="tz", mysql_type=spelling)
+        assert _checksum_kind(without_applied) == "timetz", spelling
+        rendered = _pg_checksum_expr(without_applied)
+        assert rendered is not None and "AT TIME ZONE 'UTC'" in rendered.as_string(
+            None
+        ), spelling
+
+        with_applied = ColumnDef(name="tz", mysql_type=spelling, target_type=spelling)
+        assert _checksum_kind(with_applied) == "timetz", spelling
+
+    # An APPLIED type still wins, so a deliberate remap away from timetz is honored.
+    remapped = ColumnDef(name="tz", mysql_type="timetz", target_type="text")
+    assert _checksum_kind(remapped) == "plain"
+
+
+def test_jsonb_stays_value_compared_while_json_stays_excluded() -> None:
+    """Pins the deliberate asymmetry (do NOT "fix" it): PostgreSQL re-serializes jsonb via
+    jsonb_out on read, so both ends emit the same canonical text whatever wrote the row --
+    including the CDC sink's compact form. `json` keeps its bytes verbatim and so has no
+    byte-identical cross-engine form."""
+    from dsql_migrator.core.models import ColumnDef
+    from dsql_migrator.core.validation_sql import _checksum_kind
+
+    assert _checksum_kind(ColumnDef(name="j", mysql_type="json")) == "json"
+    assert _checksum_kind(ColumnDef(name="b", mysql_type="jsonb")) == "plain"

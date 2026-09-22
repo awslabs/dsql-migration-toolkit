@@ -174,7 +174,18 @@ def _pg_enrich_columns(connection: object, enrich_db: str, tables: list) -> None
                 # DEFAULT AS IDENTITY, '' = not an identity column. Used (with a nextval
                 # DEFAULT for serial) to flag the identity PRIMARY-KEY column so the
                 # primary-key strategy governs it (see auto_increment_column below).
-                "a.attidentity AS ident "
+                "a.attidentity AS ident, "
+                # A NON-DEFAULT column collation. Aurora DSQL creates the column under
+                # the target's default collation (the converter does not re-emit a
+                # COLLATE clause), so a source column collated e.g. with a
+                # case-insensitive ICU collation silently changes =, LIKE, ORDER BY and
+                # UNIQUE semantics after cut over. 'default'/'C'/'POSIX' are excluded
+                # because they already match the target, so they are not a change --
+                # the same "only report an actual difference" rule the MySQL enricher's
+                # _ci filter applies. NULL for a non-collatable type (attcollation = 0).
+                "(SELECT cl.collname FROM pg_collation cl "
+                " WHERE cl.oid = a.attcollation "
+                "   AND cl.collname NOT IN ('default', 'C', 'POSIX')) AS coll "
                 "FROM pg_attribute a "
                 "JOIN pg_class c ON c.oid = a.attrelid "
                 "JOIN pg_namespace n ON n.oid = c.relnamespace "
@@ -184,7 +195,10 @@ def _pg_enrich_columns(connection: object, enrich_db: str, tables: list) -> None
             params,
         ).mappings()
         exact = {
-            row["col"]: (row["typ"], row.get("gen"), row.get("ident")) for row in rows
+            row["col"]: (
+                row["typ"], row.get("gen"), row.get("ident"), row.get("coll"),
+            )
+            for row in rows
         }
         for column in table.columns:
             resolved = exact.get(column.name)
@@ -192,6 +206,11 @@ def _pg_enrich_columns(connection: object, enrich_db: str, tables: list) -> None
                 column.mysql_type = resolved[0]
                 if resolved[1] in ("s", "v"):  # 's'=STORED, 'v'=VIRTUAL (PG18+)
                     column.generated = True
+                # SQLAlchemy reflection does not supply a collation, so this field was
+                # None for every PostgreSQL column and the collation warning could never
+                # fire for a PG source.
+                if resolved[3]:
+                    column.collation = resolved[3]
         # A serial/identity PRIMARY-KEY column becomes the auto_increment_column so the
         # converter's primary-key strategy (IDENTITY / UUID / KEEP) applies to it.
         if table.auto_increment_column is None:
@@ -733,6 +752,17 @@ class PostgresSourceDialect(SourceDialect):
             ),
             is_in_recovery=bool(_scalar("SELECT pg_is_in_recovery()")),
             replica_identity=identity,
+            # Read from pg_settings, NOT SHOW: SHOW renders a unit-suffixed string ("1GB",
+            # "-1") that would need unit parsing, whereas pg_settings.setting is the raw
+            # number in pg_settings.unit. The unit is always MB for this GUC, so the value
+            # is used as MB directly. PG13+; on an older server the row is absent -> None
+            # -> the check reports "unknown" instead of a false alarm.
+            max_slot_wal_keep_size_mb=_int(
+                _scalar(
+                    "SELECT setting FROM pg_settings "
+                    "WHERE name = 'max_slot_wal_keep_size'"
+                )
+            ),
         )
 
     def read_replication_slot_health(self, connection: object, slot_name: str):

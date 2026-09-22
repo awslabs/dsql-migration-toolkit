@@ -222,6 +222,16 @@ class DataMigrationState:
         # pipeline instead of showing "no tables selected". Populated by the phase
         # probe; empty when no stack / no params. Transient/session-only.
         self.cdc_reconciled_table_names: list[str] = []
+        # The DEPLOYED PostgreSQL replication-slot name, read from the live stack's
+        # ``PgSlotName`` parameter by the same phase probe. The derived name embeds a hash
+        # of the stack name (``cdc_pg_slot.pg_slot_name``), so re-deriving it after the
+        # stack name drifts -- an attach, a rename, a restore -- yields a DIFFERENT slot
+        # and the health read then reports the real slot as missing. Every other PG path
+        # already prefers the recorded/deployed name for exactly this reason
+        # (``cdc_postgres.dispatch_source_config``,
+        # ``cdc_deployer._drop_pg_source_replication``). Empty when no stack / no param.
+        # Transient/session-only.
+        self.cdc_deployed_slot_name: Optional[str] = None
         self.cdc_activity: Optional["CdcActivitySummary"] = None
         # Per-table source/target row counts for the migration-status view, fetched
         # on demand (a direct COUNT(*) on each side -- read-only but adds source
@@ -728,6 +738,7 @@ class DataMigrationState:
             self.cdc_other_stacks = []
             # Belongs to the previously-targeted stack; the fresh probe repopulates.
             self.cdc_reconciled_table_names = []
+            self.cdc_deployed_slot_name = None
             # Applied-ops + replication-lag metrics are per-stack too; drop them so the
             # adopted stack's poll repopulates rather than showing the prior stack's.
             self.cdc_applied_ops_by_table = {}
@@ -794,6 +805,17 @@ class DataMigrationState:
         """
         with self._lock:
             self.cdc_reconciled_table_names = [n.strip() for n in names if n and n.strip()]
+
+    def set_cdc_deployed_slot_name(self, slot_name: Optional[str]) -> None:
+        """Record the DEPLOYED PostgreSQL slot name from the live stack's parameters.
+
+        See :attr:`cdc_deployed_slot_name`: the slot-health read must use the name the
+        connector actually holds, not one re-derived from a stack name that may have
+        drifted since Full Load created the slot.
+        """
+        with self._lock:
+            cleaned = (slot_name or "").strip()
+            self.cdc_deployed_slot_name = cleaned or None
 
     def set_cdc_applied_ops_by_table(
         self, applied_ops: "dict[str, dict[str, int]]"

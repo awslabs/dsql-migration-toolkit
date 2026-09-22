@@ -313,10 +313,24 @@ def _refresh_pg_slot_health(migration_state, source_config, connection) -> None:
     """Read the PostgreSQL replication slot's WAL health onto ``migration_state``.
 
     PostgreSQL-only and best-effort: reuses the already-open read-only source
-    ``connection`` to read ``pg_replication_slots`` for the deterministic slot name of
-    this session's CDC stack, and stores the :class:`SlotHealth` (or None) via
-    :meth:`set_cdc_slot_health`. A MySQL source (dialect returns None) or any failure
-    leaves it None. Never raises -- it must not disturb the row-count read.
+    ``connection`` to read ``pg_replication_slots`` for this session's CDC slot, and stores
+    the :class:`SlotHealth` (or None) via :meth:`set_cdc_slot_health`. A MySQL source
+    (dialect returns None) or any failure leaves it None. Never raises -- it must not
+    disturb the row-count read.
+
+    Resolves the slot name the way every other PostgreSQL path does -- the DEPLOYED
+    ``PgSlotName`` first, the name derived from this session's stack name only as a
+    fallback (compare ``cdc_postgres.dispatch_source_config`` and
+    ``cdc_deployer._drop_pg_source_replication``). The derived name embeds a hash of the
+    stack name, so deriving it unconditionally meant that after the stack name drifted the
+    read looked for a slot that never existed, ``exists=False``, and the WAL-pressure
+    panel silently vanished -- for a live, healthy slot that was accumulating WAL.
+
+    The empty-name guard is defensive only: ``cdc_stack_name`` defaults to
+    ``CDC_DEFAULT_STACK_NAME``, so in the running app there is always a name to derive
+    from. It exists so that if that ever stops being true the result is left ``None``
+    ("not known") instead of probing a guessed name, whose absence would be
+    indistinguishable from a real slot having been lost.
     """
     try:
         from dsql_migrator.core.models import SourceType
@@ -324,16 +338,20 @@ def _refresh_pg_slot_health(migration_state, source_config, connection) -> None:
         if getattr(source_config, "source_type", None) is not SourceType.POSTGRES:
             migration_state.set_cdc_slot_health(None)
             return
-        from dsql_migrator.core.cdc import CDC_DEFAULT_STACK_NAME
         from dsql_migrator.core.cdc_pg_slot import pg_slot_name
         from dsql_migrator.core.source_dialect import dialect_for
 
-        stack_name = getattr(migration_state, "cdc_stack_name", None) or CDC_DEFAULT_STACK_NAME
+        slot = (getattr(migration_state, "cdc_deployed_slot_name", None) or "").strip()
+        if not slot:
+            stack_name = (getattr(migration_state, "cdc_stack_name", None) or "").strip()
+            slot = pg_slot_name(stack_name) if stack_name else ""
+        if not slot:
+            migration_state.set_cdc_slot_health(None)
+            return
         dialect = dialect_for(SourceType.POSTGRES)
-        health = dialect.read_replication_slot_health(
-            connection, pg_slot_name(stack_name)
+        migration_state.set_cdc_slot_health(
+            dialect.read_replication_slot_health(connection, slot)
         )
-        migration_state.set_cdc_slot_health(health)
     except Exception:  # noqa: BLE001 - best-effort; never disturb the counts read
         pass
 
@@ -1016,6 +1034,14 @@ def _probe_cdc_stack_phase(migration_state, session) -> None:
     )
     migration_state.set_cdc_reconciled_table_names(
         [n for n in includes_raw.split(",") if n.strip()]
+    )
+    # The DEPLOYED PostgreSQL slot name, from the SAME describe, so the slot-health read
+    # looks at the slot the connector actually holds instead of re-deriving a name from a
+    # stack name that may have drifted (see cdc_deployed_slot_name).
+    migration_state.set_cdc_deployed_slot_name(
+        (getattr(discovery, "current_parameters", None) or {}).get("PgSlotName")
+        if discovery is not None
+        else None
     )
     # Also read each ATTACH CANDIDATE's replicated table set, so the attach offer can be
     # withheld when the pipeline does not cover what this session loaded. ``list_stacks``

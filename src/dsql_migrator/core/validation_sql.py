@@ -239,17 +239,28 @@ def _checksum_kind(column: "ColumnDef") -> str:
     # vocabulary map_mysql_type produces, so the branches below apply unchanged; falls
     # back to the source-derived default mapping when no applied type is known.
     applied = column.target_type
+    # PostgreSQL timetz must be detected on the FULL type string BEFORE the "(" split
+    # below: format_type spells a precision inline as "time(6) with time zone", which
+    # the split collapses to bare "time" (losing the zone). A timetz is rendered
+    # offset-insensitively (see _pg_checksum_expr) because the CDC sink stores it
+    # UTC-normalized (Debezium's ZonedTime is always GMT) while Full Load keeps the
+    # source offset -- the same instant, so an offset-sensitive ::text would false-
+    # mismatch. Only a PostgreSQL source produces timetz (MySQL has no such type).
+    #
+    # Checked on the APPLIED spelling when there is one and on the SOURCE spelling
+    # otherwise: the applied types are resolved from the converted DDL and can come back
+    # empty for a table (e.g. a PK strategy whose DDL clause does not parse), and there
+    # the source spelling is the only thing left. Gating this on ``applied`` stranded
+    # exactly that case in the offset-SENSITIVE fallback, which false-MISMATCHes every
+    # CDC-written row. Applied still wins, so a deliberate remap away from timetz
+    # (applied = "text") correctly does not reach this arm.
+    spelling = applied or mysql_type
+    if " ".join(_TYPE_MODIFIER_RE.sub("", spelling).lower().split()) in (
+        "time with time zone",
+        "timetz",
+    ):
+        return "timetz"
     if applied:
-        # PostgreSQL timetz must be detected on the FULL type string BEFORE the "(" split
-        # below: format_type spells a precision inline as "time(6) with time zone", which
-        # the split collapses to bare "time" (losing the zone). A timetz is rendered
-        # offset-insensitively (see _pg_checksum_expr) because the CDC sink stores it
-        # UTC-normalized (Debezium's ZonedTime is always GMT) while Full Load keeps the
-        # source offset -- the same instant, so an offset-sensitive ::text would false-
-        # mismatch. Only a PostgreSQL source produces timetz (MySQL has no such type).
-        normalized = " ".join(_TYPE_MODIFIER_RE.sub("", applied).lower().split())
-        if normalized in ("time with time zone", "timetz"):
-            return "timetz"
         kind = applied.split("(", 1)[0].strip().lower()
     else:
         try:
@@ -276,6 +287,12 @@ def _checksum_kind(column: "ColumnDef") -> str:
         # values are logically equal but the text differs, so -- like FLOAT/DOUBLE --
         # JSON is excluded from the checksum (row counts + all other columns still
         # validate; a JSON-text diff is a false positive, not data loss).
+        #
+        # ``jsonb`` is deliberately NOT matched here and must not be added: it is stored
+        # decomposed and re-serialized by ``jsonb_out`` on read, so BOTH ends emit the
+        # same canonical text (keys sorted, whitespace normalized) whatever wrote the
+        # row -- Debezium's compact form included. Widening this to jsonb would drop a
+        # genuinely comparable column out of the only value-level check there is.
         return "json"
     return "plain"
 

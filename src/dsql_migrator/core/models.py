@@ -950,6 +950,10 @@ class PrerequisiteCheckId(str, Enum):
     REPLICATION_SLOTS = "REPLICATION_SLOTS"
     SOURCE_IS_WRITER = "SOURCE_IS_WRITER"
     REPLICA_IDENTITY = "REPLICA_IDENTITY"
+    # The PostgreSQL analog of BINLOG_RETENTION: whether the source may discard the WAL
+    # the Full-Load-time slot still needs, which would leave the same silent data gap at
+    # the Full Load -> CDC handoff.
+    SLOT_WAL_RETENTION = "SLOT_WAL_RETENTION"
 
 
 class PrerequisiteResult(BaseModel):
@@ -1514,6 +1518,15 @@ class TableValidationResult(BaseModel):
     # these was value-compared". Surfaced in the report/UI so it is not read as "every
     # column verified". Empty unless the CHECKSUM ran and a table has such a column.
     checksum_excluded_columns: list[str] = Field(default_factory=list)
+    # Columns the OPERATOR excluded from the migration itself (the oversized-LOB
+    # exclusion), so they hold NO data on the target at all. Validation correctly skips
+    # them -- comparing a never-written column would be a guaranteed false mismatch --
+    # but that removal happens before the comparison, so it cannot appear in
+    # ``checksum_excluded_columns`` above. Recorded separately because the reason and the
+    # remedy differ: a float/json omission is a cross-engine rendering limit, whereas
+    # this is a deliberate, permanent data gap that the sign-off report must state.
+    # Reported in every mode (not just CHECKSUM) since the gap is mode-independent.
+    migration_excluded_columns: list[str] = Field(default_factory=list)
     # Dev-only diagnostic sample of diverging PKs, populated only when this table
     # did NOT match AND the row-diff sample size is configured > 0. None otherwise.
     row_diff_sample: Optional["RowDiffSample"] = None

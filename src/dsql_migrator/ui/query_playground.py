@@ -44,7 +44,11 @@ from dsql_migrator.core.assessment_strategist import (
     build_query_optimize_system,
     source_engine_word,
 )
-from dsql_migrator.core.models import Classification, TargetConnectionConfig
+from dsql_migrator.core.models import (
+    Classification,
+    SourceType,
+    TargetConnectionConfig,
+)
 from dsql_migrator.core.query_converter import (
     QueryConversionResult,
     QueryConverter,
@@ -542,8 +546,28 @@ def build_query_playground_screen(
 
     session = store.get_or_create(session_id)
     state = playground_store.get_or_create(session_id)
-    query_converter = converter or QueryConverter()
     make_factory = target_connection_factory or _default_target_connection_factory
+
+    def _query_converter() -> QueryConverter:
+        """The converter for the session's CURRENT source engine.
+
+        Resolved at click time, not when the screen is built: this screen is reachable
+        from the tools menu before a source is connected, so a converter bound at build
+        time would be stuck on the MySQL default for the whole session. An injected
+        converter always wins, so tests keep full control. Same lazy
+        ``getattr(session.source_config, "source_type", None)`` shape the AI grounding
+        below already uses.
+        """
+        if converter is not None:
+            return converter
+        return QueryConverter(
+            source_type=getattr(
+                getattr(session, "source_config", None),
+                "source_type",
+                SourceType.MYSQL,
+            )
+            or SourceType.MYSQL
+        )
 
     def _inferred_source_schema() -> Optional[str]:
         """The schema inferred from the connection: a MySQL DB maps to a same-named
@@ -581,7 +605,8 @@ def build_query_playground_screen(
                 ui, icon="science", title="Query Converter"
             )
             intro = (
-                "Paste a MySQL statement to see how it converts to Aurora DSQL "
+                f"Paste a {source_engine_word(getattr(getattr(session, 'source_config', None), 'source_type', None))} "
+                "statement to see how it converts to Aurora DSQL "
                 "(PostgreSQL) and, for SELECT/DDL, test whether it runs on the "
                 "target."
             )
@@ -688,7 +713,7 @@ def build_query_playground_screen(
                     raw = state.sql or ""
                 sql = raw.strip()
                 if not sql:
-                    ui.notify("Enter a MySQL statement to convert.", type="warning")
+                    ui.notify("Enter a statement to convert.", type="warning")
                     return
                 # Reflect the trimmed query back into the editor + state so the
                 # input matches exactly what was converted/tested.
@@ -699,7 +724,7 @@ def build_query_playground_screen(
                     pass
                 # Pretty-print the converted SQL (multi-line, indented) so a long
                 # statement is readable; formatting only, never semantics.
-                state.set_result(query_converter.convert(sql, pretty=True))
+                state.set_result(_query_converter().convert(sql, pretty=True))
                 if ai_post_event is not None:
                     converted = state.result
                     if converted is not None:

@@ -870,3 +870,94 @@ def test_check_replication_slot_headroom_states() -> None:
     # Unknown counts -> INFO, never a blocking failure.
     info = check_replication_slot_headroom(PostgresCdcFacts(max_replication_slots=None))
     assert info.status is S.INFO and info.required is False
+
+
+def test_prereq_category_map_covers_every_check_id() -> None:
+    """D-3: `group_prereq_results` falls back to SCHEMA_TABLES, so an unmapped id is filed
+    under the wrong heading rather than raising. That is how the five PostgreSQL
+    logical-replication checks landed there -- four of them are server settings/privileges,
+    leaving 'Source Configuration' nearly empty on a PG CDC run while 'Schema & Tables' was
+    padded with server-level rows. No test covered the map, so they slipped in silently."""
+    from dsql_migrator.core.models import PrerequisiteCheckId
+    from dsql_migrator.ui.data_migration._models import (
+        _PREREQ_CATEGORY_BY_CHECK,
+        PrereqCategory,
+    )
+
+    assert set(PrerequisiteCheckId) == set(_PREREQ_CATEGORY_BY_CHECK)
+    # The server-level PostgreSQL checks belong with the MySQL binlog/GTID rows.
+    for check in (
+        PrerequisiteCheckId.WAL_LEVEL_LOGICAL,
+        PrerequisiteCheckId.REPLICATION_ROLE,
+        PrerequisiteCheckId.REPLICATION_SLOTS,
+        PrerequisiteCheckId.SOURCE_IS_WRITER,
+        PrerequisiteCheckId.SLOT_WAL_RETENTION,
+    ):
+        assert _PREREQ_CATEGORY_BY_CHECK[check] is PrereqCategory.SOURCE_CONFIG, check
+    # The per-table ones stay where the fallback happened to put them.
+    for check in (
+        PrerequisiteCheckId.REPLICA_IDENTITY,
+        PrerequisiteCheckId.TARGET_COLUMNS_LOADABLE,
+    ):
+        assert _PREREQ_CATEGORY_BY_CHECK[check] is PrereqCategory.SCHEMA_TABLES, check
+
+
+def test_slot_wal_retention_follows_binlog_retention_semantics() -> None:
+    """D-1: the PostgreSQL analog of the binlog-retention risk. -1 (unlimited, the default)
+    passes; a finite cap WARNs without blocking; unknown degrades to INFO."""
+    from dsql_migrator.core.models import PrerequisiteCheckId, PrerequisiteStatus
+    from dsql_migrator.core.prerequisites_postgres import (
+        PostgresCdcFacts,
+        check_slot_wal_retention,
+    )
+
+    unlimited = check_slot_wal_retention(
+        PostgresCdcFacts(max_slot_wal_keep_size_mb=-1)
+    )
+    assert unlimited.check_id is PrerequisiteCheckId.SLOT_WAL_RETENTION
+    assert unlimited.status is PrerequisiteStatus.PASS
+
+    capped = check_slot_wal_retention(PostgresCdcFacts(max_slot_wal_keep_size_mb=2048))
+    assert capped.status is PrerequisiteStatus.WARN
+    # Never hard-blocks: a fast load + prompt Start CDC can fit inside the cap.
+    assert capped.required is False
+    assert "2048 MB" in capped.detail
+
+    unknown = check_slot_wal_retention(PostgresCdcFacts())
+    assert unknown.status is PrerequisiteStatus.INFO
+    assert unknown.required is False
+
+
+def test_pg_cdc_report_keeps_binlog_retention_visible_and_adds_the_wal_check() -> None:
+    """D-1: BINLOG_RETENTION appeared as a SKIP in the WEAKER Full Load report but vanished
+    entirely from the PG CDC report -- a check id present in the weaker mode and absent in
+    the stronger one reads as an oversight. And its PostgreSQL equivalent (the slot's WAL
+    can be discarded, invalidating it, which is the same silent Full-Load-to-CDC gap) was
+    not checked at all."""
+    from dsql_migrator.core.models import PrerequisiteCheckId as Id
+
+    def _report(mode, facts=None):
+        checker = PrerequisiteChecker(
+            source_probe=_FakeSource(cdc_facts=facts or _pg_facts_ok()),
+            target_probe=_FakeTarget(existing={"app.orders"}),
+            msk_probe=_FakeMsk(),
+        )
+        return checker.check(
+            PrerequisiteCheckRequest(
+                mode=mode, tables=["app.orders"], source_type=SourceType.POSTGRES
+            ),
+            tables=[_table("app.orders")],
+        )
+
+    cdc = _report(MigrationMode.CDC)
+    full = _report(MigrationMode.FULL_LOAD)
+    # No longer missing from the stronger mode.
+    assert _result(cdc, Id.BINLOG_RETENTION).status is PrerequisiteStatus.SKIP
+    assert _result(full, Id.BINLOG_RETENTION).status is PrerequisiteStatus.SKIP
+    # The PG equivalent runs, and only in CDC mode (a Full Load creates no slot).
+    assert Id.SLOT_WAL_RETENTION in {r.check_id for r in cdc.results}
+    assert Id.SLOT_WAL_RETENTION not in {r.check_id for r in full.results}
+    # A finite cap warns but must never block the run.
+    capped = _report(MigrationMode.CDC, _pg_facts_ok(max_slot_wal_keep_size_mb=512))
+    assert _result(capped, Id.SLOT_WAL_RETENTION).status is PrerequisiteStatus.WARN
+    assert capped.can_proceed is True

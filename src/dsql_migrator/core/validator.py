@@ -78,7 +78,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Callable, Iterator, Mapping, Optional, Protocol
+from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Protocol
 
 from psycopg import sql
 from sqlalchemy import text
@@ -536,7 +536,8 @@ def _target_checksum(
     pk_column = single_pk_column(table)
     if pk_column is not None:
         return _target_checksum_keyset(
-            connection, table, pk_column, page_size, source_is_postgres
+            connection, table, pk_column, page_size, source_is_postgres,
+            on_page=on_page,
         )
     value = _target_scalar(
         connection, build_pg_checksum_sql(table, source_is_postgres)
@@ -791,12 +792,21 @@ def _source_checksum_for(
     connection: _SourceConnection,
     table: TableDef,
     page_size: int,
+    on_page: Optional[Callable[[], None]] = None,
 ) -> str:
+    """Source checksum for either engine, beating ``on_page`` once per keyset page.
+
+    ``on_page`` must reach the keyset loops: a single-column-PK CHECKSUM table scans
+    page after page with no other statement in between, so without it the liveness
+    heartbeat falls silent for the whole scan and the watchdog can reap a healthy run
+    (see :meth:`Validator.set_page_hook`).
+    """
     if _source_is_postgres(dialect):
         return _target_checksum(
-            PgSourceConnection(connection), table, page_size, source_is_postgres=True
+            PgSourceConnection(connection), table, page_size,
+            source_is_postgres=True, on_page=on_page,
         )
-    return _source_checksum(connection, table, page_size)
+    return _source_checksum(connection, table, page_size, on_page=on_page)
 
 
 def _iter_source_pks_for(
@@ -1535,7 +1545,8 @@ class Validator:
         checksum_excluded_columns: list[str] = []
         if mode is ValidationMode.CHECKSUM and run_deep:
             source_checksum = _source_checksum_for(
-                source_dialect, source_connection, table, self._reconcile_page_size
+                source_dialect, source_connection, table, self._reconcile_page_size,
+                on_page=self._page,
             )
             target_checksum = _target_checksum(
                 target_connection, table, self._reconcile_page_size,
@@ -1754,6 +1765,43 @@ def _with_quarantine_counts(
     return report.model_copy(update={"items": updated})
 
 
+def with_migration_excluded_columns(
+    report: ValidationReport,
+    excluded_by_table: Optional[Mapping[str, "Iterable[str]"]],
+) -> ValidationReport:
+    """Record the operator's migration-excluded columns on a finished report.
+
+    Stamped on afterwards for the same reason as :func:`_with_quarantine_counts`: the
+    exclusion is metadata ABOUT the run (the operator ticked it on the Data Migration
+    step), not an input to comparing the two databases, and ``_compare_table`` cannot
+    see it -- ``run_validation`` strips those columns from the ``TableDef`` before the
+    Validator ever runs, precisely so a column with no target data cannot produce a
+    false mismatch.
+
+    Without this the report's only omission disclosure is
+    ``checksum_excluded_columns``, computed from the ALREADY-stripped column list, so an
+    excluded column was neither compared NOR listed -- the report printed "Data
+    identical: yes (N/N tables matched)" with no trace that a column holds no data on
+    the target. Deliberately does NOT touch ``matched``: skipping the column is correct,
+    only the silence was wrong.
+
+    Returns the report unchanged when nothing was excluded.
+    """
+    if not excluded_by_table:
+        return report
+    updated = [
+        item.model_copy(
+            update={
+                "migration_excluded_columns": sorted(
+                    excluded_by_table.get(item.table) or ()
+                )
+            }
+        )
+        for item in report.items
+    ]
+    return report.model_copy(update={"items": updated})
+
+
 def _build_drift(
     watermark: Optional[Watermark],
     current_gtid: Optional[str],
@@ -1925,11 +1973,31 @@ def _render_table_line(item: TableValidationResult) -> str:
 
 
 def _render_drift_lines(drift: Optional[DriftReport]) -> list[str]:
-    """Render the drift-since-watermark section as readable text lines."""
+    """Render the drift-since-watermark section as readable text lines.
+
+    ``drifted`` is only meaningful when a coordinate was actually comparable. With no
+    basis it defaults to ``False``, which this section used to print as the flat
+    "Drifted: no" -- an unconditional all-clear on the one line an operator reads to
+    confirm a pre-cut-over write freeze held. That is the state of EVERY PostgreSQL-source
+    run (the MySQL GTID/binlog probes are deliberately skipped there: they would break
+    the shared snapshot), so the strongest claim in the section was also the one with no
+    evidence behind it. Determinability is derived from ``basis`` exactly as the UI's
+    ``format_drift`` does, and the GTID rows are dropped when they carry nothing.
+    """
     if drift is None:
         return [
             "Drift since snapshot: not available "
             "(validation ran without a watermark)."
+        ]
+    basis = getattr(drift, "basis", "") or ""
+    determinable = bool(basis) if basis else (
+        drift.watermark_gtid is not None and drift.current_gtid is not None
+    )
+    if not determinable:
+        return [
+            "Drift since snapshot:",
+            "- Drifted: could not be determined (no comparable source coordinate)",
+            f"- {drift.detail}",
         ]
     return [
         "Drift since snapshot:",
@@ -1990,6 +2058,24 @@ def render_text_report(report: ValidationReport) -> str:
         lines.append(
             "- Columns NOT value-compared (FLOAT/DOUBLE/JSON -- no cross-engine form, "
             f"a non-key value diff there is undetected): {detail}"
+        )
+    # The operator's own exclusions: a permanent data gap, not a rendering limit, so it
+    # is stated in EVERY mode and worded as "holds no data" rather than "not compared".
+    # Without it a reader of this report -- the pre-cut-over sign-off artifact -- cannot
+    # tell that a column was deliberately left behind.
+    migration_excluded = {
+        item.table: item.migration_excluded_columns
+        for item in report.items
+        if item.migration_excluded_columns
+    }
+    if migration_excluded:
+        detail = "; ".join(
+            f"{table} ({', '.join(cols)})"
+            for table, cols in migration_excluded.items()
+        )
+        lines.append(
+            "- Columns EXCLUDED from the migration (holds no data on the target, so "
+            f"not validated either): {detail}"
         )
     # Tables that reconciliation was REQUESTED for but could not cover (composite /
     # non-integer PK, not errored, not fast-sweep-skipped): compared by count/checksum

@@ -858,3 +858,152 @@ def test_convert_view_surfaces_matview_unsupported_without_downgrading() -> None
         w.classification is Classification.UNSUPPORTED and "materialized view" in w.message
         for w in conv.warnings
     )
+
+
+def test_non_pk_serial_default_is_reported_not_silently_dropped() -> None:
+    # The PK strategy governs only `table.auto_increment_column`, and PG enrichment sets
+    # that field for a PRIMARY KEY only -- so a non-key sequence column used to reach the
+    # target with neither identity nor default and no warning at all.
+    table = TableDef(
+        name="shop.invoices",
+        columns=[
+            ColumnDef(
+                name="id", mysql_type="bigint", nullable=False,
+                default="nextval('invoices_id_seq'::regclass)",
+            ),
+            ColumnDef(
+                name="invoice_no", mysql_type="bigint", nullable=False,
+                default="nextval('invoices_invoice_no_seq'::regclass)",
+            ),
+        ],
+        primary_key=["id"],
+        auto_increment_column="id",
+    )
+    conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    # Neither sequence default is re-emitted -- DSQL has no sequence to point at.
+    assert "nextval" not in conv.target_ddl
+    seq_notes = [w for w in conv.warnings if "sequence" in w.message and "serial" in w.message]
+    assert len(seq_notes) == 1, [w.message for w in conv.warnings]
+    note = seq_notes[0]
+    assert note.column_name == "invoice_no"  # the NON-key column, not the PK
+    assert "writes NULL" in note.message
+    # The NOT NULL half is appended by the shared default-loss loop.
+    assert "REJECTED on Aurora DSQL" in note.message
+
+
+def test_pk_serial_default_stays_silent_even_without_enrichment() -> None:
+    # Keyed on the primary key, not on auto_increment_column: an inventory that was never
+    # enriched (so auto_increment_column is None) must not produce a note claiming the key
+    # column is "not the primary key".
+    table = TableDef(
+        name="shop.orders",
+        columns=[
+            ColumnDef(
+                name="id", mysql_type="bigint", nullable=False,
+                default="nextval('orders_id_seq'::regclass)",
+            ),
+        ],
+        primary_key=["id"],
+    )
+    conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    assert not any("sequence" in w.message for w in conv.warnings)
+
+
+def test_pg_check_constraint_note_prints_the_expression_and_the_alter() -> None:
+    # The expression was captured all along (CheckConstraintDef.expression) but nothing
+    # displayed it, and the note pointed at Evaluation, which lists names only.
+    from dsql_migrator.core.models import CheckConstraintDef
+
+    table = TableDef(
+        name="shop.orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="price", mysql_type="numeric(12,2)"),
+        ],
+        primary_key=["id"],
+        check_constraints=[
+            CheckConstraintDef(name="orders_price_check", expression="price > 0::numeric")
+        ],
+    )
+    conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    note = next(w for w in conv.warnings if "CHECK constraint" in w.message)
+    assert "price > 0::numeric" in note.message  # the expression itself
+    assert "ADD CONSTRAINT orders_price_check CHECK (price > 0::numeric) NOT VALID" in note.message
+    assert "MySQL" not in note.message  # a PG source is not told about MySQL
+    assert "shown in Evaluation" not in note.message  # the old, untrue pointer
+    # The CHECK is still not emitted inline: DSQL rejects a plain ADD, and the load is
+    # unordered, so it is offered as a post-load statement instead.
+    assert "CHECK" not in conv.target_ddl
+
+
+def test_mysql_check_constraint_note_keeps_its_engine_word() -> None:
+    from dsql_migrator.core.models import CheckConstraintDef
+
+    table = TableDef(
+        name="orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="price", mysql_type="decimal(12,2)"),
+        ],
+        primary_key=["id"],
+        check_constraints=[CheckConstraintDef(name="ck_price", expression="`price` > 0")],
+    )
+    conv = SchemaConverter().convert_table(table)
+    note = next(w for w in conv.warnings if "CHECK constraint" in w.message)
+    assert "a MySQL CHECK expression" in note.message
+    assert "`price` > 0" in note.message
+
+
+def test_pg_collation_is_captured_and_warned_but_mysql_ci_rule_does_not_run() -> None:
+    table = TableDef(
+        name="shop.people",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="nick", mysql_type="text", collation="ci"),
+            ColumnDef(name="plain", mysql_type="text"),
+        ],
+        primary_key=["id"],
+    )
+    conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    note = next(w for w in conv.warnings if "collation" in w.message)
+    assert "nick (ci)" in note.message
+    assert "plain" not in note.message
+    # Reported even though the name has no MySQL-style _ci suffix: a PG collname does not
+    # encode its sensitivity, so any non-default collation is a behaviour change.
+    assert "case-INSENSITIVE MySQL collation" not in note.message
+    assert "COLLATE" not in conv.target_ddl
+
+
+def test_pk_strategy_notes_never_say_auto_increment_for_a_pg_source() -> None:
+    from dsql_migrator.core.converter import PrimaryKeyStrategy, SchemaConvertOptions
+
+    table = TableDef(
+        name="shop.orders",
+        columns=[ColumnDef(name="id", mysql_type="bigint", nullable=False)],
+        primary_key=["id"],
+        auto_increment_column="id",
+    )
+    for strategy in (
+        PrimaryKeyStrategy.CONVERT_TO_UUID,
+        PrimaryKeyStrategy.IDENTITY_WITH_CACHE,
+        PrimaryKeyStrategy.KEEP_INTEGER,
+    ):
+        conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(
+            table, SchemaConvertOptions(primary_key_strategy=strategy)
+        )
+        messages = " ".join(w.message for w in conv.warnings)
+        assert "AUTO_INCREMENT" not in messages, strategy
+        assert "serial / identity" in messages, strategy
+        # A MySQL source keeps the original wording (a committed snapshot pins it).
+        mysql_conv = SchemaConverter().convert_table(
+            TableDef(
+                name="orders",
+                columns=[ColumnDef(name="id", mysql_type="bigint", nullable=False)],
+                primary_key=["id"],
+                auto_increment_column="id",
+            ),
+            SchemaConvertOptions(primary_key_strategy=strategy),
+        )
+        assert "AUTO_INCREMENT column 'id'" in " ".join(
+            w.message for w in mysql_conv.warnings
+        )

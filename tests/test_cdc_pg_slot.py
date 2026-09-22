@@ -434,3 +434,60 @@ def test_provision_does_not_drop_a_reused_publication_when_slot_creation_fails()
     ops = [s.upper() for s in conn.writes()]
     assert not any(s.startswith("CREATE PUBLICATION") for s in ops)  # reused, not created
     assert not any(s.startswith("DROP PUBLICATION") for s in ops)   # so never compensated-dropped
+
+
+def test_slot_health_read_prefers_the_deployed_slot_name() -> None:
+    """D-2: the monitor re-derived the slot name from the MUTABLE stack name, while every
+    other PostgreSQL path (dispatch_source_config, _drop_pg_source_replication) prefers the
+    recorded/deployed name -- their comments say why. Since pg_slot_name embeds a hash of
+    the stack name, a drifted name pointed the health read at a slot that never existed, so
+    the WAL-pressure panel silently vanished for a live, healthy slot."""
+    from dsql_migrator.core.cdc_pg_slot import pg_slot_name
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration._cdc_status import _refresh_pg_slot_health
+    from dsql_migrator.ui.data_migration._state import DataMigrationState
+
+    # The hash makes the derived names genuinely different, which is the whole hazard.
+    assert pg_slot_name("cdc-a") != pg_slot_name("cdc-b")
+
+    class _Config:
+        source_type = SourceType.POSTGRES
+
+    read: list[str] = []
+
+    class _Dialect:
+        def read_replication_slot_health(self, _connection, slot_name):
+            read.append(slot_name)
+            return "health"
+
+    import dsql_migrator.core.source_dialect as source_dialect
+
+    original = source_dialect.dialect_for
+    source_dialect.dialect_for = lambda _st: _Dialect()
+    try:
+        # Deployed name present -> used verbatim, even though the stack name differs.
+        state = DataMigrationState()
+        state.cdc_stack_name = "cdc-renamed"
+        state.set_cdc_deployed_slot_name("dsql_cdc_slot_deadbeef")
+        _refresh_pg_slot_health(state, _Config(), object())
+        assert read == ["dsql_cdc_slot_deadbeef"]
+        assert state.cdc_slot_health == "health"
+
+        # No deployed name -> fall back to the name derived from this session's stack.
+        read.clear()
+        state2 = DataMigrationState()
+        state2.cdc_stack_name = "cdc-renamed"
+        _refresh_pg_slot_health(state2, _Config(), object())
+        assert read == [pg_slot_name("cdc-renamed")]
+
+        # An empty name resolves to nothing, so the health is left "not known" rather than
+        # probing a guessed name whose absence would look like a lost slot. Defensive
+        # only -- cdc_stack_name defaults to CDC_DEFAULT_STACK_NAME in the running app.
+        read.clear()
+        state3 = DataMigrationState()
+        state3.cdc_stack_name = ""
+        _refresh_pg_slot_health(state3, _Config(), object())
+        assert read == []
+        assert state3.cdc_slot_health is None
+    finally:
+        source_dialect.dialect_for = original
