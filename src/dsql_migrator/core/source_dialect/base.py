@@ -185,7 +185,11 @@ class SourceDialect(ABC):
 
     @abstractmethod
     def enrich(
-        self, connection: object, enrich_db: str, tables: list
+        self,
+        connection: object,
+        enrich_db: str,
+        tables: list,
+        views: "Optional[list]" = None,
     ) -> tuple[list, list, list]:
         """Enrich reflected ``tables`` and collect (triggers, routines, events).
 
@@ -194,7 +198,23 @@ class SourceDialect(ABC):
         triggers/routines/events returned as three lists. A dialect with no
         engine-specific enrichment returns three empty lists. Structural reflection
         (tables/columns/views) is dialect-agnostic and done by the caller.
+
+        ``views`` is the caller's reflected view list, passed so a dialect can REMOVE an
+        entry the same way it already removes a table (PostgreSQL drops an extension's own
+        relations, which structural reflection cannot tell apart from the user's).
+        Optional, so a dialect that does not need it -- and any caller that has no views to
+        offer -- is unaffected.
         """
+
+    def list_extensions(self, connection: object) -> "list[str]":
+        """Installed EXTENSIONs as ``"name (schema)"``; empty when the engine has none.
+
+        Read ONCE per introspection (not per schema) because an extension is
+        database-scoped. Its own objects are filtered OUT of the collected inventory, so
+        this is what keeps the real signal: Aurora DSQL provides no extensions, so source
+        SQL that calls one must change. Default is none (MySQL).
+        """
+        return []
 
     def extra_relations(self, connection: object, enrich_db: str) -> "list":
         """Relations with NO Aurora DSQL target that structural reflection MISSES.

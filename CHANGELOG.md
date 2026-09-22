@@ -5,6 +5,82 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.493
+
+A fix-request note reported that PostgreSQL introspection reports an extension's functions
+as the user's objects. Confirmed, and it is worse than reported: **an extension's own tables
+were migration targets, so their rows were actually loaded into the target.** The note's own
+proposed fix for triggers is also inert and is replaced.
+
+### Fixed
+
+- **An installed extension no longer wrecks the Evaluation verdict.** `_pg_collect_routines`
+  filtered on the schema only, so every function an extension provides was collected and
+  rated `UNSUPPORTED / SIGNIFICANT` — advising the operator to "reimplement as a LANGUAGE
+  SQL function" a C function they did not write and cannot reimplement. Measured live on a
+  textbook `CREATE EXTENSION pgcrypto;` (no `SCHEMA` clause, so it lands in `public`, which
+  the tool always sweeps) over a **one-table database with zero user functions**: 37 objects
+  / 36 UNSUPPORTED and a readiness score of **2/100 "Significant effort"**, against 1 object
+  / 0 UNSUPPORTED and **57/100** for the same user schema without the extension.
+  - Nothing warned, and there was no provenance to filter on downstream: `ObjectRef` has no
+    such field, and `pg_depend` / `pg_extension` / `deptype` appeared **nowhere** in the
+    package.
+  - The phantom count did not stay in Evaluation: the same `inventory.routines` feeds the
+    Schema Conversion object tree and its "N stored routines are not shown" notice, N bogus
+    conversion warnings, and the AI briefing — where it is passed as "authoritative facts
+    you MUST respect and never contradict".
+- **An extension's own TABLES and VIEWS are no longer migrated.** The most consequential
+  part, and not in the note: `get_table_names` / `get_view_names` apply no extension filter,
+  so PostGIS's `spatial_ref_sys` / `geometry_columns`, pg_partman's `part_config` and the
+  like arrived as ordinary tables — and because the default selection is *all* tables, Full
+  Load **wrote their rows to the target**, Schema Apply was handed a view whose body calls a
+  C function, and Validation then compared objects the user never created. Dropped in place
+  during enrichment, exactly as `_pg_apply_partitioning` already drops partition children.
+- **A schema an extension created is no longer treated as the user's.** `list_schemas`
+  excluded only real system schemas, so PostGIS's `topology` / `tiger` / `tiger_data` and
+  pg_cron's `cron` were enumerated as user schemas and everything inside them flowed into
+  the migration.
+- **Extension-owned triggers, materialized views and foreign tables no longer produce bogus
+  findings.** `NOT tgisinternal` does not cover this: it marks only SYSTEM-generated
+  constraint triggers, so a trigger an extension creates in its install script reads as the
+  user's.
+- **Overloaded functions are distinguishable in the report.** The name came from `proname`
+  alone, discarding the signature, so PostgreSQL overloads produced rows nothing could tell
+  apart — and because findings are bucketed by object name, each duplicate row repeated
+  every sibling's concerns, rendering 3 overloads as **9** table rows. Names now carry the
+  identity arguments (`crypt(text, text)`), which needs no extra privilege and renders a
+  zero-argument routine as `sync_all()`.
+
+### Added
+
+- **One finding per installed extension** (`PG_EXTENSION_UNSUPPORTED`, MANUAL/MEDIUM). This
+  is the pairing that makes the filtering above honest: Aurora DSQL provides no user
+  extensions, so application SQL calling `crypt()`, `ST_Contains()` or
+  `uuid_generate_v4()` has a real incompatibility. Before, that fact was technically
+  present but unusable (76 rows); simply removing those rows would have replaced an
+  unusable signal with **no** signal. Now it is one line per extension that says which one
+  and what to do, and the risk text states that the extension's own objects were excluded so
+  nobody goes looking for them.
+
+### Corrected (the note's proposed fix for triggers does nothing)
+
+- The note proposed one shared `pg_depend` fragment with only `classid` swapped. For
+  **triggers that is a silent no-op**: a trigger created by an extension's install script is
+  *not* recorded as an extension member — verified against a purpose-built extension, its
+  only `pg_depend` rows are `'a'`→its table and `'n'`→its function — so a
+  `pg_trigger`-keyed test is always false. It has to key on the trigger's **table**. Keying
+  on the trigger's *function* would be wrong in the other direction: a genuine user trigger
+  calling contrib `moddatetime` would silently vanish from the report. The shared fragment is
+  therefore parameterised by `(classid, oid expression)`, and a test asserts the trigger
+  query does **not** mention `pg_trigger` — it fails if the note's version is applied.
+- `classid` is required rather than decorative: `pg_depend.objid` "references any OID
+  column", so an object is identified by the pair `(classid, objid)` and OIDs are not unique
+  across catalogs. Omitting it risks silently dropping a real user object — a missing
+  finding, strictly worse than the over-reporting being fixed.
+- The filter is object-level, so a user function that merely LIVES in an extension's schema
+  is still reported (live-verified). `deptype='e'` is the same line `pg_dump` draws, which
+  makes the tool's notion of "the user's objects" match it.
+
 ## v0.1.492
 
 A fix-request note reported that a PostgreSQL source's oversized `text`/`bytea` values pass

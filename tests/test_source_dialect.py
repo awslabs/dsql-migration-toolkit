@@ -1086,3 +1086,176 @@ def test_mysql_dialect_enrich_no_ops_on_non_mysql_connection(monkeypatch) -> Non
     assert MySQLSourceDialect().enrich(
         _FakeEnrichConnection("sqlite"), "app", []
     ) == ([], [], [])
+
+
+# ---------------------------------------------------------------------------
+# Extension-owned objects must not be reported as the user's (pg_depend deptype='e')
+# ---------------------------------------------------------------------------
+
+
+def test_every_pg_discovery_query_carries_the_extension_filter() -> None:
+    """One `CREATE EXTENSION pgcrypto` -- which defaults to `public`, a schema the tool
+    always sweeps -- added 36 UNSUPPORTED/SIGNIFICANT findings telling the operator to
+    reimplement C functions they did not write, and swung a one-table database's readiness
+    from 57/100 to 2/100. The filter has to be on EVERY discovery query, so this asserts on
+    the SQL the dialect actually issues rather than on one of them."""
+    from dsql_migrator.core.source_dialect.postgres import (
+        PostgresSourceDialect,
+        _pg_collect_routines,
+        _pg_collect_triggers,
+    )
+
+    seen: list[str] = []
+
+    class _Recorder(_DispatchPgConnection):
+        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+            seen.append(" ".join(str(statement).split()))
+            return super().execute(statement, parameters)
+
+    conn = _Recorder({})
+    _pg_collect_routines(conn, "app")
+    _pg_collect_triggers(conn, "app")
+    PostgresSourceDialect().extra_relations(conn, "app")
+    PostgresSourceDialect().list_schemas(conn)
+
+    assert len(seen) == 4
+    for sql in seen:
+        assert "pg_depend" in sql, sql
+        assert "deptype = 'e'" in sql, sql
+        # classid is REQUIRED: pg_depend.objid "references any OID column", so an object is
+        # identified by the PAIR (classid, objid). Without it a user object whose OID
+        # collided with an extension member's would be silently dropped -- a MISSING
+        # finding, strictly worse than the over-reporting being fixed.
+        assert "d.classid" in sql, sql
+
+    routines_sql, triggers_sql, relations_sql, schemas_sql = seen
+    assert "d.objid = p.oid" in routines_sql
+    # A TRIGGER is filtered by its TABLE, not by itself: a trigger created by an
+    # extension's install script is NOT recorded as an extension member (verified against a
+    # real extension -- pg_depend holds only 'a'->its table and 'n'->its function), so a
+    # pg_trigger-keyed test is silently always false. Keying on the trigger's FUNCTION
+    # would be wrong the other way: a genuine user trigger calling contrib moddatetime
+    # would vanish from the report.
+    assert "'pg_trigger'" not in triggers_sql
+    assert "'pg_class'::regclass" in triggers_sql and "d.objid = c.oid" in triggers_sql
+    assert "'pg_class'::regclass" in relations_sql and "d.objid = c.oid" in relations_sql
+    assert "'pg_namespace'::regclass" in schemas_sql and "d.objid = n.oid" in schemas_sql
+
+
+def test_routine_names_carry_the_signature_so_overloads_are_distinguishable() -> None:
+    """PostgreSQL allows overloading, and `proname` alone produced report rows that could
+    not be told apart. Worse than N duplicates: the findings bucket is keyed by object
+    name, so each duplicate row repeated every sibling's concerns (3 overloads rendered as
+    9 table rows)."""
+    from dsql_migrator.core.source_dialect.postgres import _pg_collect_routines
+
+    captured: dict[str, str] = {}
+
+    class _Recorder(_DispatchPgConnection):
+        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+            captured["sql"] = " ".join(str(statement).split())
+            return super().execute(statement, parameters)
+
+    _pg_collect_routines(
+        _Recorder({"pg_proc": lambda _p: [
+            {"name": "crypt(text, text)", "kind": "f"},
+            {"name": "digest(bytea, text)", "kind": "f"},
+            {"name": "sync_all()", "kind": "p"},
+        ]}),
+        "app",
+    )
+    assert "pg_get_function_identity_arguments(p.oid)" in captured["sql"]
+    # Ordered by name THEN signature, so overloads of one function stay adjacent.
+    assert "ORDER BY p.proname, 1" in captured["sql"]
+
+
+def test_extension_owned_relations_are_dropped_from_tables_and_views() -> None:
+    """The consequential half: `get_table_names`/`get_view_names` apply no extension
+    filter, so an extension's own relations (PostGIS spatial_ref_sys, pg_partman's
+    part_config) arrived as ordinary migratable tables -- and since the default selection
+    is "all tables", Full Load would WRITE their rows to the target and a view whose body
+    calls a C function would fail at Schema Apply."""
+    from dsql_migrator.core.models import ColumnDef, TableDef, ViewDef
+    from dsql_migrator.core.source_dialect.postgres import PostgresSourceDialect
+
+    tables = [
+        TableDef(
+            name="orders",
+            columns=[ColumnDef(name="id", mysql_type="bigint")],
+            primary_key=["id"],
+        ),
+        TableDef(
+            name="spatial_ref_sys",
+            columns=[ColumnDef(name="srid", mysql_type="integer")],
+            primary_key=["srid"],
+        ),
+    ]
+    views = [
+        ViewDef(name="order_summary", definition="SELECT 1"),
+        ViewDef(name="geometry_columns", definition="SELECT 1"),
+    ]
+    conn = _DispatchPgConnection({
+        # The POSITIVE query: the schema's extension-owned relation names.
+        "JOIN pg_depend d ON d.classid = 'pg_class'::regclass": lambda _p: [
+            {"relname": "spatial_ref_sys"},
+            {"relname": "geometry_columns"},
+        ],
+    })
+    PostgresSourceDialect().enrich(conn, "app", tables, views)
+    assert [t.name for t in tables] == ["orders"]
+    assert [v.name for v in views] == ["order_summary"]
+
+
+def test_enrich_without_views_still_drops_extension_tables() -> None:
+    # ``views`` is optional so an existing caller/test that passes none is unaffected.
+    from dsql_migrator.core.models import ColumnDef, TableDef
+    from dsql_migrator.core.source_dialect.postgres import PostgresSourceDialect
+
+    tables = [
+        TableDef(
+            name="part_config",
+            columns=[ColumnDef(name="id", mysql_type="bigint")],
+            primary_key=["id"],
+        )
+    ]
+    conn = _DispatchPgConnection({
+        "JOIN pg_depend d ON d.classid = 'pg_class'::regclass": lambda _p: [
+            {"relname": "part_config"}
+        ],
+    })
+    PostgresSourceDialect().enrich(conn, "app", tables)
+    assert tables == []
+
+
+def test_list_extensions_reports_the_real_blocker_and_skips_plpgsql() -> None:
+    """The pairing for the filters above: DSQL provides no user extensions, so application
+    SQL calling one has a real incompatibility. Filtering the objects without reporting the
+    extension would turn an unusable signal (76 rows) into no signal at all."""
+    from dsql_migrator.core.source_dialect.postgres import PostgresSourceDialect
+
+    conn = _DispatchPgConnection({
+        "pg_extension": lambda _p: [
+            {"name": "pgcrypto", "nsp": "public"},
+            {"name": "postgis", "nsp": "gis"},
+        ],
+    })
+    assert PostgresSourceDialect().list_extensions(conn) == [
+        "pgcrypto (public)",
+        "postgis (gis)",
+    ]
+    # The query itself excludes plpgsql (present in every database by default).
+    captured: dict[str, str] = {}
+
+    class _Recorder(_DispatchPgConnection):
+        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+            captured["sql"] = " ".join(str(statement).split())
+            return super().execute(statement, parameters)
+
+    PostgresSourceDialect().list_extensions(_Recorder({}))
+    assert "extname <> 'plpgsql'" in captured["sql"]
+
+
+def test_mysql_dialect_reports_no_extensions() -> None:
+    from dsql_migrator.core.source_dialect import MySQLSourceDialect
+
+    assert MySQLSourceDialect().list_extensions(object()) == []

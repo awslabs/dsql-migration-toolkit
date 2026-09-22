@@ -978,7 +978,9 @@ def _assemble_inventory(
         views = _reflect_views(inspector, schema=reflect_schema)
         # Engine-specific enrichment (columns/indexes/partitions in place + stored
         # triggers/routines/events). No-ops for a dialect/connection without it.
-        triggers, routines, events = dialect.enrich(connection, enrich_db, tables)
+        triggers, routines, events = dialect.enrich(
+            connection, enrich_db, tables, views
+        )
         # Relations with no plain-table/plain-view migration target that structural
         # reflection misses entirely (PostgreSQL materialized views + foreign tables,
         # relkinds 'm'/'f'). Carried as flagged views so Evaluation surfaces them
@@ -1000,6 +1002,9 @@ def _assemble_inventory(
         triggers=all_triggers,
         routines=all_routines,
         events=all_events,
+        # Database-scoped, so read once rather than per schema. The extension's own
+        # objects were filtered out above; this is what keeps the fact reportable.
+        extensions=dialect.list_extensions(connection),
     )
 
 

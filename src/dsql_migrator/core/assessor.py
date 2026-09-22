@@ -1392,6 +1392,48 @@ def check_table_count(inventory: SourceInventory) -> list[AssessmentItem]:
     return [item.model_copy(update={"concerns": _single_concern(item)}) for item in items]
 
 
+def check_postgres_extensions(inventory: SourceInventory) -> list[AssessmentItem]:
+    """Report each installed PostgreSQL EXTENSION -- Aurora DSQL provides none.
+
+    This is the pairing for filtering extension-owned objects out of the inventory. That
+    filter is right (an extension's functions and tables are not the user's to re-create,
+    and one ``CREATE EXTENSION pgcrypto`` otherwise added 36 UNSUPPORTED findings advising
+    the operator to reimplement C functions they did not write), but on its own it would
+    hide a REAL incompatibility: DSQL ships no user extensions, so any application SQL
+    calling ``crypt()``, ``ST_Contains()`` or ``uuid_generate_v4()`` has to change.
+
+    One item per extension keeps that signal in a line or two instead of hundreds of rows,
+    and says the actionable thing -- which extension, and that the calls must be replaced.
+    Inventory-level rather than per-object because the extension is a property of the
+    database, not of any one object.
+    """
+    items = [
+        AssessmentItem(
+            object_name=name,
+            rule_id="PG_EXTENSION_UNSUPPORTED",
+            classification=Classification.MANUAL,
+            risk=(
+                f"The source has the PostgreSQL extension {name} installed. Aurora DSQL "
+                "provides no user extensions, so its functions, operators and types do "
+                "not exist on the target. The extension's own objects are excluded from "
+                "this migration (they are not yours to re-create), but any application "
+                "SQL that calls it will fail after cut over."
+            ),
+            recommendation=(
+                "Find the queries that use this extension and replace them: move the "
+                "logic to the application, or to a DSQL-supported equivalent (e.g. "
+                "gen_random_uuid() is built in; hashing/encryption can move to the "
+                "application or AWS KMS). Data stored in an extension-provided TYPE "
+                "needs a supported column type instead."
+            ),
+            effort=EffortLevel.MEDIUM,
+            kind=KIND_DATABASE.upper(),
+        )
+        for name in inventory.extensions
+    ]
+    return [item.model_copy(update={"concerns": _single_concern(item)}) for item in items]
+
+
 def default_inventory_rules(
     source_type: SourceType = SourceType.MYSQL,
 ) -> list[InventoryRule]:
@@ -1405,7 +1447,7 @@ def default_inventory_rules(
     source. The table-count limit applies to every engine.
     """
     if source_type is SourceType.POSTGRES:
-        return [check_table_count]
+        return [check_table_count, check_postgres_extensions]
     return [check_multiple_source_databases, check_table_count]
 
 

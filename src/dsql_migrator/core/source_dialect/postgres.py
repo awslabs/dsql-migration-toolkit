@@ -31,6 +31,42 @@ from dsql_migrator.core.source_dialect.base import (
 # reflected schema is available -- the fallback path in _pg_enrich_columns.
 _PG_SYSTEM_SCHEMAS_SQL = "('pg_catalog', 'information_schema', 'pg_toast')"
 
+
+def _not_extension_owned(classid: str, oid_expr: str) -> str:
+    """SQL fragment excluding rows that belong to an installed EXTENSION.
+
+    ``pg_depend`` records extension membership as ``deptype='e'`` (the PostgreSQL docs'
+    ``DEPENDENCY_EXTENSION``: "the dependent object is a member of the extension that is
+    the referenced object"), which is exactly the line ``pg_dump`` draws -- it emits an
+    extension's objects as ``CREATE EXTENSION``, never as their own DDL. Matching it makes
+    the tool's notion of "the user's objects" the same as pg_dump's.
+
+    Parameterised by BOTH the catalog and the oid expression, not by ``classid`` alone,
+    because a single fragment does not fit all three call sites:
+
+    * ``('pg_proc', 'p.oid')`` / ``('pg_class', 'c.oid')`` test the object itself.
+    * A TRIGGER must test its TABLE (``('pg_class', 'c.oid')``): a trigger created by an
+      extension's install script is NOT recorded as an extension member -- verified against
+      a real extension, ``pg_depend`` holds only ``'a'``->its table and ``'n'``->its
+      function -- so a ``pg_trigger``-keyed test is silently always false. (Keying on the
+      trigger's FUNCTION would be wrong the other way: a genuine USER trigger calling
+      contrib ``moddatetime`` would vanish.)
+
+    ``classid`` is required, not decorative: ``pg_depend.objid`` "references any OID
+    column", so an object is identified by the PAIR (classid, objid) and OIDs are not
+    unique across catalogs. Without it a user object whose OID collided with an
+    extension member's would be silently dropped -- a MISSING finding, worse than the
+    over-reporting this fixes.
+
+    Both arguments are module-owned literals, never user input (the same
+    interpolate-dialect-owned-SQL argument as ``base.estimate_row_counts_query``).
+    """
+    return (
+        "AND NOT EXISTS (SELECT 1 FROM pg_depend d "
+        f"WHERE d.classid = '{classid}'::regclass AND d.objid = {oid_expr} "
+        "AND d.deptype = 'e') "
+    )
+
 # PostgreSQL SQLSTATEs (beyond connection class ``08``) that a fresh connection +
 # idempotent re-read recovers from during Full Load: operator_intervention (57P0x --
 # admin/crash shutdown and cannot_connect_now during a failover), insufficient_resources
@@ -133,6 +169,42 @@ def _pg_apply_partitioning(connection: object, nsp: str, tables: list) -> None:
             table.partitioned = True
         kept.append(table)
     tables[:] = kept
+
+
+def _pg_drop_extension_relations(connection: object, nsp: str, tables: list) -> set:
+    """DROP extension-owned tables from ``tables`` in place; return their names.
+
+    The most consequential half of the extension problem, and the only one that is not
+    merely report noise. ``get_table_names`` / ``get_view_names`` apply no extension filter,
+    so an extension's OWN relations (PostGIS ``spatial_ref_sys`` / ``geometry_columns``,
+    pg_partman's ``part_config``, a monitoring extension's tables) arrive as ordinary
+    migratable tables -- and since the default selection is "all tables", Full Load
+    actually WRITES their rows to the target, a view whose body calls a C function is
+    handed to Schema Apply and fails there, and Validation then compares objects the user
+    never created.
+
+    Structured exactly like :func:`_pg_apply_partitioning` -- one ``pg_class`` read for the
+    reflected schema, then a filter of the list the caller holds -- because it is the same
+    kind of correction: an object the catalog reports that is not an independent migration
+    unit. Returns the dropped names so the caller can prune ``views`` the same way.
+    """
+    rows = connection.execute(  # type: ignore[attr-defined]
+        text(
+            # The POSITIVE form of :func:`_not_extension_owned` -- spelled out rather than
+            # derived from it, so what this executes is readable on its own.
+            "SELECT c.relname AS relname "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "JOIN pg_depend d ON d.classid = 'pg_class'::regclass "
+            "  AND d.objid = c.oid AND d.deptype = 'e' "
+            "WHERE n.nspname = :nsp"
+        ),
+        {"nsp": nsp},
+    ).mappings()
+    owned = {row["relname"] for row in rows}
+    if not owned:
+        return owned
+    tables[:] = [table for table in tables if table.name not in owned]
+    return owned
 
 
 def _pg_enrich_columns(connection: object, enrich_db: str, tables: list) -> None:
@@ -267,6 +339,13 @@ def _pg_collect_triggers(connection: object, nsp: str) -> list:
     Excludes internal triggers (``tgisinternal``, e.g. FK-enforcement triggers) and
     returns bare ``ObjectRef``s of type TRIGGER; the caller qualifies the names. Aurora
     DSQL has no trigger object, so TriggerRule flags each UNSUPPORTED.
+
+    ``tgisinternal`` alone is NOT enough: it marks only SYSTEM-generated constraint
+    triggers, so a trigger an extension creates in its install script has
+    ``tgisinternal = false`` and was reported as the user's. Filtered via its TABLE, since
+    the trigger itself carries no extension-membership row -- see
+    :func:`_not_extension_owned`. A trigger an extension puts on a USER table is still
+    reported, which is right: that one really does have no DSQL target.
     """
     rows = connection.execute(  # type: ignore[attr-defined]
         text(
@@ -274,7 +353,8 @@ def _pg_collect_triggers(connection: object, nsp: str) -> list:
             "JOIN pg_class c ON c.oid = t.tgrelid "
             "JOIN pg_namespace n ON n.oid = c.relnamespace "
             "WHERE NOT t.tgisinternal AND n.nspname = :nsp "
-            "ORDER BY t.tgname"
+            + _not_extension_owned("pg_class", "c.oid")
+            + "ORDER BY t.tgname"
         ),
         {"nsp": nsp},
     ).mappings()
@@ -287,12 +367,31 @@ def _pg_collect_routines(connection: object, nsp: str) -> list:
     ``prokind`` distinguishes a procedure ('p') from a function ('f'); an aggregate ('a')
     or window ('w') routine is reported as a FUNCTION (DSQL supports none of them). Bare
     ObjectRefs; the caller qualifies. ProcedureRule flags each UNSUPPORTED.
+
+    EXTENSION-owned routines are excluded (see :func:`_not_extension_owned`). Without that
+    filter a single ``CREATE EXTENSION pgcrypto`` -- which defaults to ``public``, a schema
+    the tool always sweeps -- added 36 ``UNSUPPORTED / SIGNIFICANT`` findings advising the
+    operator to "reimplement as a LANGUAGE SQL function" a C function they did not write
+    and cannot reimplement, and swung the readiness score of a one-table database from
+    57/100 to 2/100. The filter is OBJECT-level, so a user function that merely LIVES in an
+    extension's schema is still reported.
+
+    The name carries the IDENTITY ARGUMENTS because PostgreSQL allows overloading, and
+    ``proname`` alone produced rows the report could not tell apart -- worse than N
+    duplicates, since the findings bucket is keyed by object name, so each duplicate row
+    repeated every sibling's concerns (3 overloads rendered as 9 table rows).
+    ``pg_get_function_identity_arguments`` needs no privilege beyond reading ``pg_proc``
+    and renders a zero-argument routine as the idiomatic ``name()``.
     """
     rows = connection.execute(  # type: ignore[attr-defined]
         text(
-            "SELECT p.proname AS name, p.prokind AS kind FROM pg_proc p "
+            "SELECT p.proname || '(' "
+            "|| pg_get_function_identity_arguments(p.oid) || ')' AS name, "
+            "p.prokind AS kind FROM pg_proc p "
             "JOIN pg_namespace n ON n.oid = p.pronamespace "
-            "WHERE n.nspname = :nsp ORDER BY p.proname"
+            "WHERE n.nspname = :nsp "
+            + _not_extension_owned("pg_proc", "p.oid")
+            + "ORDER BY p.proname, 1"
         ),
         {"nsp": nsp},
     ).mappings()
@@ -376,7 +475,11 @@ class PostgresSourceDialect(SourceDialect):
         return {"pool_pre_ping": True, "connect_args": connect_args}
 
     def enrich(
-        self, connection: object, enrich_db: str, tables: list
+        self,
+        connection: object,
+        enrich_db: str,
+        tables: list,
+        views: "Optional[list]" = None,
     ) -> tuple[list, list, list]:
         # PostgreSQL catalog enrichment for ONE reflected schema (``enrich_db``): at this
         # point every ``table.name`` is still BARE (the caller qualifies with the schema
@@ -393,6 +496,13 @@ class PostgresSourceDialect(SourceDialect):
         # every partition's rows), so mark the parent ``partitioned`` (PartitionedTableRule)
         # and REMOVE the children from ``tables`` IN PLACE (the caller holds the same list).
         _pg_apply_partitioning(connection, enrich_db, tables)
+
+        # (1b) DROP the extension's OWN relations. Unlike everything else here this is not
+        # report cosmetics: with the default select-all they would be LOADED into the
+        # target, and a view whose body calls a C function would fail at Schema Apply.
+        owned = _pg_drop_extension_relations(connection, enrich_db, tables)
+        if views is not None and owned:
+            views[:] = [view for view in views if view.name not in owned]
 
         # (2) Exact column types + generated flag, scoped to THIS schema (``enrich_db``).
         # format_type keeps array element types (text[], not the lossy "ARRAY"),
@@ -428,7 +538,11 @@ class PostgresSourceDialect(SourceDialect):
                 "SELECT c.relname AS name, c.relkind AS relkind "
                 "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
                 "WHERE n.nspname = :nsp AND c.relkind IN ('m', 'f') "
-                "ORDER BY c.relname"
+                # An extension's own matview / foreign table is not the user's object to
+                # re-create; the extension itself is reported once instead
+                # (PgExtensionRule), so the information is kept without N bogus rows.
+                + _not_extension_owned("pg_class", "c.oid")
+                + "ORDER BY c.relname"
             ),
             {"nsp": enrich_db},
         ).mappings()
@@ -448,13 +562,38 @@ class PostgresSourceDialect(SourceDialect):
         # Enumerate directly and ESCAPE the underscore so ONLY real system/temp schemas
         # (pg_catalog, pg_toast, pg_temp_*, pg_toast_temp_*) are excluded; the caller
         # then subtracts system_schemas (drops information_schema). Keeps `pgapp`.
+        # A schema an EXTENSION created in its install script is excluded too (postgis's
+        # topology/tiger/tiger_data, pg_cron's cron): otherwise the whole schema is
+        # enumerated as the user's and everything in it flows into Evaluation, Schema
+        # Conversion and the default select-all Full Load. Belt-and-braces on top of the
+        # per-object filters, never a replacement for them.
         rows = connection.execute(  # type: ignore[attr-defined]
             text(
-                r"SELECT nspname FROM pg_catalog.pg_namespace "
-                r"WHERE nspname NOT LIKE 'pg\_%' ESCAPE '\' ORDER BY nspname"
+                r"SELECT n.nspname FROM pg_catalog.pg_namespace n "
+                r"WHERE n.nspname NOT LIKE 'pg\_%' ESCAPE '\' "
+                + _not_extension_owned("pg_namespace", "n.oid")
+                + r"ORDER BY n.nspname"
             )
         ).mappings()
         return [row["nspname"] for row in rows]
+
+    def list_extensions(self, connection: object) -> "list[str]":
+        # ``plpgsql`` is excluded: it is installed in every PostgreSQL database by default
+        # and is not something the operator chose. Best-effort -- a failure returns none
+        # rather than breaking introspection, since this feeds a report line, not the
+        # migration itself.
+        try:
+            rows = connection.execute(  # type: ignore[attr-defined]
+                text(
+                    "SELECT e.extname AS name, n.nspname AS nsp "
+                    "FROM pg_extension e "
+                    "JOIN pg_namespace n ON n.oid = e.extnamespace "
+                    "WHERE e.extname <> 'plpgsql' ORDER BY e.extname"
+                )
+            ).mappings()
+            return [f"{row['name']} ({row['nsp']})" for row in rows]
+        except Exception:  # noqa: BLE001 - best-effort; never break introspection
+            return []
 
     def quote_identifier(self, name: str) -> str:
         # PostgreSQL: double quotes, embedded double-quotes doubled.

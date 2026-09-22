@@ -397,3 +397,64 @@ def test_json_and_jsonb_are_in_the_pg_oversized_set_not_exempt() -> None:
     # A length limit is what makes a column safe, not the type family.
     for spelling in ("character varying(50)", "varchar(10)", "integer", "numeric(12,2)"):
         assert not is_pg_oversized_lob_type(spelling), spelling
+
+
+def test_pg_extension_finding_keeps_the_signal_the_object_filter_removes() -> None:
+    """Filtering extension-owned objects out of the inventory is right -- they are not the
+    user's to re-create -- but on its own it would hide a REAL incompatibility: Aurora DSQL
+    provides no user extensions, so application SQL calling one must change. One item per
+    extension carries that in a line or two instead of hundreds of per-object rows."""
+    from dsql_migrator.core.assessor import (
+        check_postgres_extensions,
+        default_inventory_rules,
+    )
+    from dsql_migrator.core.models import Classification, EffortLevel
+
+    assert check_postgres_extensions in default_inventory_rules(SourceType.POSTGRES)
+    # MySQL has no extensions, so the rule is not in its list at all.
+    assert check_postgres_extensions not in default_inventory_rules(SourceType.MYSQL)
+
+    inventory = SourceInventory(
+        tables=[
+            TableDef(
+                name="app.orders",
+                columns=[ColumnDef(name="id", mysql_type="bigint")],
+                primary_key=["id"],
+            )
+        ],
+        extensions=["pgcrypto (public)", "postgis (gis)"],
+    )
+    items = check_postgres_extensions(inventory)
+    assert [i.object_name for i in items] == ["pgcrypto (public)", "postgis (gis)"]
+    for item in items:
+        assert item.rule_id == "PG_EXTENSION_UNSUPPORTED"
+        # MANUAL/MEDIUM, not UNSUPPORTED/SIGNIFICANT: the target is buildable, the app's
+        # calls have to change. Rating it SIGNIFICANT would re-create the score distortion
+        # the object filter just removed.
+        assert item.classification is Classification.MANUAL
+        assert item.effort is EffortLevel.MEDIUM
+        assert "no user extensions" in item.risk
+        # Says the objects were excluded, so a reader does not go looking for them.
+        assert "excluded from this migration" in item.risk
+
+    # No extensions -> no items (a PG source without extensions reads clean).
+    assert check_postgres_extensions(SourceInventory(tables=[])) == []
+
+
+def test_a_pg_source_with_an_extension_no_longer_reads_as_significant_effort() -> None:
+    """End-to-end over the real assessor: the extension contributes ONE MANUAL item, not a
+    per-object flood, so the effort rollup reflects the user's actual work."""
+    inventory = SourceInventory(
+        tables=[
+            TableDef(
+                name="app.orders",
+                columns=[ColumnDef(name="id", mysql_type="bigint")],
+                primary_key=["id"],
+            )
+        ],
+        extensions=["pgcrypto (public)"],
+    )
+    report = CompatibilityAssessor(source_type=SourceType.POSTGRES).assess(inventory)
+    rule_ids = [item.rule_id for item in report.items]
+    assert rule_ids.count("PG_EXTENSION_UNSUPPORTED") == 1
+    assert "PROC_PLPGSQL" not in rule_ids  # no phantom routines

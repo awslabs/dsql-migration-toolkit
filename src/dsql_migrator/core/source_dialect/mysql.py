@@ -59,8 +59,14 @@ class MySQLSourceDialect(SourceDialect):
         return source_engine_kwargs(read_timeout_seconds=read_timeout_seconds)
 
     def enrich(
-        self, connection: object, enrich_db: str, tables: list
+        self,
+        connection: object,
+        enrich_db: str,
+        tables: list,
+        views: "Optional[list]" = None,
     ) -> tuple[list, list, list]:
+        # ``views`` is unused: MySQL has no extension-owned objects to prune, and its
+        # reflection returns exactly the user's views.
         # MySQL enrichment reads information_schema; run it only against a genuine
         # MySQL connection. A non-MySQL engine (e.g. the SQLite double used in tests)
         # safely no-ops, preserving the prior runtime gate

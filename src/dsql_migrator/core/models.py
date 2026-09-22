@@ -406,6 +406,14 @@ class SourceInventory(BaseModel):
         default_factory=list,
         description="MySQL scheduled EVENTs (no Aurora DSQL equivalent).",
     )
+    # Installed PostgreSQL EXTENSIONs, as "name (schema)". Their own objects are
+    # deliberately NOT in the lists above -- an extension's functions/tables/matviews are
+    # not the user's to re-create, and listing them buried the real findings (one
+    # pgcrypto install added 36 UNSUPPORTED rows). The extension itself IS reported,
+    # because Aurora DSQL provides no extensions, so application SQL that calls one has a
+    # real incompatibility: the signal is kept, in one line per extension instead of N per
+    # object. Empty for MySQL and for a PostgreSQL source with no extensions.
+    extensions: list[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

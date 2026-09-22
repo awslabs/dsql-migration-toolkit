@@ -1957,9 +1957,11 @@ def test_enrichment_is_unconditional_for_a_mysql_source() -> None:
     from dsql_migrator.core import introspector, source_dialect
 
     # Reflection is immediately followed by dialect-driven enrichment in the loop.
-    intro_src = _inspect.getsource(introspector)
+    # Whitespace-collapsed so the assertion survives the call being wrapped across lines
+    # (it broke once when an argument was added, for a contract that had not changed).
+    intro_src = " ".join(_inspect.getsource(introspector).split())
     reflect_index = intro_src.index("tables = _reflect_tables(inspector")
-    enrich_index = intro_src.index("dialect.enrich(connection", reflect_index)
+    enrich_index = intro_src.index("dialect.enrich(", reflect_index)
     assert enrich_index > reflect_index
 
     # The MySQL dialect's enrichment runs enrich_columns for a MySQL connection.
