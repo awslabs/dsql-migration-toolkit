@@ -389,6 +389,11 @@ class DataMigrationState:
         # Optional customer-managed KMS key id for the tool-created source secret
         # (process config, threaded at screen-build time). None -> default key.
         self.cdc_secret_kms_key_id: Optional[str] = None
+        # Which CDC activity events have already been mirrored into the AI feed, per CDC
+        # log key, so the ~5s monitor poll announces each transition ONCE. Lives HERE (not
+        # in a module dict) so Start over's ``reset_in_place`` -> ``__init__`` clears it;
+        # keyed by CDC log key so a Full Load retry that repins the key still re-announces.
+        self.cdc_announced: "dict[str, set]" = {}
 
     def set_lob_exclusion(self, table: str, column: str, exclude: bool) -> None:
         """Toggle whether one oversized-LOB column is excluded from the migration.
@@ -1231,6 +1236,14 @@ class DataMigrationStore:
             # TaskRole -- which lacks cloudformation:DescribeStacks -- and fail with
             # AccessDenied on the deployed stack after any Start over.
             deploy_role_arn = getattr(state, "cdc_deploy_role_arn", None)
+            # The optional CMK for the tool-managed source-credentials secret is the
+            # SAME kind of value, set on the very next line of the builder
+            # (data_migration/__init__.py:375-376) from the same process config -- and it
+            # was left out of this preserve list. So a Start over silently dropped it and
+            # the next CDC deploy created the secret under the account's default
+            # aws/secretsmanager key instead of the operator's CMK, with no UI signal;
+            # nobody would notice until they audited the secret's encryption key.
+            secret_kms_key_id = getattr(state, "cdc_secret_kms_key_id", None)
             # Preserve an in-flight CDC teardown marker across the reset. A Start-over
             # that chose stop/delete submits the teardown BEFORE this reset; the
             # persistent teardown banner and the Start-over race-guard both read this
@@ -1260,6 +1273,7 @@ class DataMigrationStore:
                 state.bind_session(bound)
             # Deploy-time config, not user state -- it must outlive Start over.
             state.cdc_deploy_role_arn = deploy_role_arn
+            state.cdc_secret_kms_key_id = secret_kms_key_id
             if teardown[0] is not None:
                 state.set_cdc_teardown(
                     teardown[0], kind=teardown[1], stack=teardown[2], ctx=teardown[3]

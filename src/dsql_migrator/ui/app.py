@@ -427,29 +427,47 @@ def build_page(
         # this migration's real data (converted DDL, assessment, validation, load
         # status) on demand and answer with actual values, not generically. Carries the
         # same migration-only guardrail. None when AI is off (the panel stays inert).
-        st = SESSION_STORE.get_or_create(session_id)
-        if not ai_is_usable(st):
+        #
+        # The grounding (engine word, current step, migration type, the fact summary,
+        # and the Bedrock config behind the strategist) is resolved per SEND, inside the
+        # returned callable -- deliberately NOT here. The panel caches the streamer it
+        # gets for the whole scope (``ai_panel``'s ``_ensure_general_scope`` returns
+        # early while ``conv["streamer"]`` is set), and the panel is app-wide, so a user
+        # who opens it on the Connect screen created this streamer BEFORE connecting:
+        # everything baked in at creation time then stayed frozen for the session. The
+        # chat gave MySQL-flavoured advice (binlog, AUTO_INCREMENT) for a PostgreSQL
+        # migration, claimed to be at the Connect step with no migration facts while the
+        # chip above it read e.g. "Validation", and kept answering from the previous
+        # Bedrock model after the user switched models. ``_refresh_model_line`` already
+        # re-reads the model for DISPLAY on open for exactly this reason; the streamer
+        # has to do the same for the ANSWER.
+        if not ai_is_usable(SESSION_STORE.get_or_create(session_id)):
             return None
-        engine = source_engine_word(
-            getattr(getattr(st, "source_config", None), "source_type", None)
-        )
-        strategist = AssessmentStrategist(
-            st.ai_assist, aws_profile=st.aws_profile, source_engine=engine
-        )
-        ctx = _ai_context()
-        system = (
-            build_general_chat_system(
-                current_step=ctx.current_step,
-                migration_type=ctx.migration_type,
-                summary=ctx.summary,
-                source_engine=engine,
+
+        def _stream(messages, on_delta):
+            st = SESSION_STORE.get_or_create(session_id)
+            engine = source_engine_word(
+                getattr(getattr(st, "source_config", None), "source_type", None)
             )
-            + _AI_TOOLS_SYSTEM_HINT
-        )
-        return lambda messages, on_delta: strategist.tool_chat(
-            system, messages, on_delta,
-            tools=_AI_TOOL_SCHEMAS, execute=_ai_tool_execute,
-        )
+            strategist = AssessmentStrategist(
+                st.ai_assist, aws_profile=st.aws_profile, source_engine=engine
+            )
+            ctx = _ai_context()
+            system = (
+                build_general_chat_system(
+                    current_step=ctx.current_step,
+                    migration_type=ctx.migration_type,
+                    summary=ctx.summary,
+                    source_engine=engine,
+                )
+                + _AI_TOOLS_SYSTEM_HINT
+            )
+            return strategist.tool_chat(
+                system, messages, on_delta,
+                tools=_AI_TOOL_SCHEMAS, execute=_ai_tool_execute,
+            )
+
+        return _stream
 
     # Build each step's (content_builder, runner). These only prepare closures;
     # nothing renders until the sidebar selects and invokes a screen.

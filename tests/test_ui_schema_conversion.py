@@ -4386,3 +4386,386 @@ def test_the_inline_apply_logs_its_object_like_the_bulk_path() -> None:
     inline = inspect.getsource(sc.build_schema_conversion_screen)
     assert "log_apply_object(_applied)" in inline, "the inline apply still logs nothing"
     assert inline.count("log_apply_object(") >= 2, "the bulk path must share it"
+
+
+# --- The source engine must be read LIVE, not captured at page-build time ----------
+#
+# ``build_page`` builds every screen once at page load -- BEFORE the user has connected
+# anything -- and nothing re-enters this builder afterwards (the sidebar re-invokes only
+# the returned content callable). So a builder that bound the engine to a local at build
+# time stayed on the MySQL default for the whole page session: a PostgreSQL user on a
+# fresh session got backticked AUTO_INCREMENT source DDL, a PK tile naming a mechanism
+# their database does not have, NO PG-only warnings, and MySQL-converter target DDL that
+# Apply wrote to DSQL. Only a browser hard refresh recovered, and nothing said so.
+#
+# Every other test of this builder is an ``inspect.getsource`` string assertion, which is
+# exactly why the defect survived a run of releases aimed at the PG path: the buggy line
+# still MENTIONED the right helper, it just read it at the wrong TIME. These two tests
+# therefore BUILD the real screen and RENDER it, which is the only way capture timing is
+# observable.
+
+
+class _RecordingUi:
+    """Minimal recording NiceGUI double: collects rendered text, no-ops everything else.
+
+    Same technique as ``tests/test_ui_validation.py``'s ``_ScreenUi``: the builder does
+    ``from nicegui import ui`` at call time, so a double injected into ``sys.modules``
+    drives the genuine render branches.
+    """
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+
+    class _El:
+        def __getattr__(self, _name):
+            return lambda *_a, **_k: self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    def _record(self, text="", *_a, **kwargs):
+        if text:
+            self.texts.append(str(text))
+        # ``ui.expansion(name, caption=...)`` carries a second text payload.
+        caption = kwargs.get("caption")
+        if caption:
+            self.texts.append(str(caption))
+        return self._El()
+
+    # Text-bearing elements. ``code``/``codemirror`` carry the DDL panes.
+    label = markdown = html = badge = link = expansion = _record
+    code = _record
+
+    def codemirror(self, value="", *_a, **_k):
+        return self._record(value)
+
+    def button(self, text="", *_a, **_k):
+        return self._record(text)
+
+    def __getattr__(self, _name):
+        return lambda *_a, **_k: self._El()
+
+    def body(self) -> str:
+        return "\n".join(self.texts)
+
+
+def _render_schema_conversion_after_connecting(source_type):
+    """Build the REAL screen with NO source, then connect ``source_type``, then render.
+
+    Returns ``(recorder, constructed_source_types)`` -- the second being the engine every
+    ``SchemaConverter`` the builder made was constructed with, in order.
+    """
+    import sys
+    import types
+
+    from dsql_migrator.core.assessor import AssessmentReport
+    from dsql_migrator.core.models import SourceConnectionConfig, TargetInventory
+    from dsql_migrator.core.job_manager import JobManager
+    from dsql_migrator.ui import schema_conversion as sc
+    from dsql_migrator.ui.evaluation import EvaluationResult, EvaluationStore
+    from dsql_migrator.ui.session import SessionStore
+
+    inventory = SourceInventory(
+        tables=[
+            TableDef(
+                name="ecommerce.orders",
+                columns=[
+                    ColumnDef(name="id", mysql_type="integer", nullable=False),
+                    ColumnDef(name="note", mysql_type="text", nullable=True),
+                ],
+                primary_key=["id"],
+                indexes=[
+                    IndexDef(name="idx_orders_note", columns=["note"], unique=False)
+                ],
+                auto_increment_column="id",
+            )
+        ],
+        views=[],
+    )
+
+    recorder = _RecordingUi()
+    fake = types.ModuleType("nicegui")
+    fake.ui = recorder  # type: ignore[attr-defined]
+    saved = sys.modules.get("nicegui")
+    sys.modules["nicegui"] = fake
+    constructed: list[SourceType] = []
+    real_converter_cls = sc.SchemaConverter
+    try:
+        def _spy(*args, **kwargs):
+            constructed.append(kwargs.get("source_type", SourceType.MYSQL))
+            return real_converter_cls(*args, **kwargs)
+
+        sc.SchemaConverter = _spy  # type: ignore[assignment]
+
+        store = SessionStore()
+        eval_store = EvaluationStore()
+        conv_store = sc.SchemaConversionStore()
+        session_id = f"engine-capture-{source_type.value}"
+
+        # The state at first page load: the page is built before anything is connected.
+        content, _runner = sc.build_schema_conversion_screen(
+            store,
+            session_id,
+            job_manager=JobManager(),
+            eval_store=eval_store,
+            conv_store=conv_store,
+        )
+        session = store.get_or_create(session_id)
+        assert session.source_config is None, "the builder must run before Connect"
+
+        # ...and only NOW does the user connect, which is what Connect's test does.
+        session.set_source(
+            SourceConnectionConfig(host="db", database="app", source_type=source_type),
+            None,
+        )
+        eval_store.get_or_create(session_id).set_result(
+            EvaluationResult(
+                inventory=inventory,
+                assessment=AssessmentReport.from_items([]),
+                target_inventory=TargetInventory(),
+                target_conflicts=[],
+                source_type=source_type,
+            )
+        )
+        # Previews render only for a GENERATED scope, and only the expanded ones emit the
+        # PK tile + DDL panes -- so drive both, exactly as the "Generate DDL for selected"
+        # / "Expand all" handlers do (schema_conversion.py:2827, :3283). Without this the
+        # source-DDL and PK-tile assertions below would be vacuous.
+        conv_state_obj = conv_store.get_or_create(session_id)
+        conv_state_obj.ticked_node_ids = [f"{sc.TABLE_PREFIX}ecommerce.orders"]
+        conv_state_obj.generated_node_ids = list(conv_state_obj.ticked_node_ids)
+        conv_state_obj.expand_all = True
+        content(lambda: None)
+    finally:
+        sc.SchemaConverter = real_converter_cls  # type: ignore[assignment]
+        if saved is None:
+            sys.modules.pop("nicegui", None)
+        else:
+            sys.modules["nicegui"] = saved
+    return recorder, constructed
+
+
+def test_schema_conversion_reads_the_engine_connected_after_the_page_was_built() -> None:
+    """A PostgreSQL source connected AFTER page build must still render as PostgreSQL."""
+    ui, constructed = _render_schema_conversion_after_connecting(SourceType.POSTGRES)
+    body = ui.body()
+
+    assert "Source (PostgreSQL)" in body, (
+        "the source pane is labelled with the build-time engine, not the connected one; "
+        f"rendered instead: {[t for t in ui.texts if t.startswith('Source (')]}"
+    )
+    assert "Source (MySQL)" not in body
+    # The PK decision tile must name the source's real key mechanism.
+    assert "serial / identity" in body, "the primary-key tile lost the PostgreSQL wording"
+    assert "AUTO_INCREMENT" not in body, (
+        "the primary-key tile names AUTO_INCREMENT for a PostgreSQL source"
+    )
+    # The source DDL pane must be PostgreSQL, not MySQL backticks.
+    assert "`ecommerce.orders`" not in body, "source DDL rendered in the MySQL dialect"
+    # ...and the converter feeding the whole preview/apply path must be PG-dialect. Every
+    # converter the builder built has to be, so a stale MySQL one cannot reach Apply.
+    assert constructed, "no SchemaConverter was built at all"
+    assert set(constructed) == {SourceType.POSTGRES}, constructed
+
+
+def test_schema_conversion_still_renders_mysql_for_a_mysql_source() -> None:
+    """Control: the same late-connect flow on MySQL keeps the MySQL dialect."""
+    ui, constructed = _render_schema_conversion_after_connecting(SourceType.MYSQL)
+    body = ui.body()
+    assert "Source (MySQL)" in body
+    assert "Source (PostgreSQL)" not in body
+    assert set(constructed) == {SourceType.MYSQL}, constructed
+
+
+def _build_and_render_n_times(n, *, injected=None):
+    """Build with no source, connect PostgreSQL, render ``n`` times.
+
+    Returns the engine of every ``SchemaConverter`` the builder constructed. Guards the
+    two contracts the lazy resolver introduced: it must not construct a converter per
+    render (the whole point of the cache), and an INJECTED converter must win and never
+    be rebuilt -- the same contract ``existence_checker_injected`` has.
+    """
+    import sys
+    import types
+
+    from dsql_migrator.core.assessor import AssessmentReport
+    from dsql_migrator.core.job_manager import JobManager
+    from dsql_migrator.core.models import SourceConnectionConfig, TargetInventory
+    from dsql_migrator.ui import schema_conversion as sc
+    from dsql_migrator.ui.evaluation import EvaluationResult, EvaluationStore
+    from dsql_migrator.ui.session import SessionStore
+
+    inventory = SourceInventory(
+        tables=[
+            TableDef(
+                name="app.t",
+                columns=[ColumnDef(name="id", mysql_type="integer", nullable=False)],
+                primary_key=["id"],
+                indexes=[],
+            )
+        ],
+        views=[],
+    )
+    recorder = _RecordingUi()
+    fake = types.ModuleType("nicegui")
+    fake.ui = recorder  # type: ignore[attr-defined]
+    saved = sys.modules.get("nicegui")
+    sys.modules["nicegui"] = fake
+    built: list[SourceType] = []
+    real_converter_cls = sc.SchemaConverter
+    try:
+        def _spy(*args, **kwargs):
+            built.append(kwargs.get("source_type", SourceType.MYSQL))
+            return real_converter_cls(*args, **kwargs)
+
+        sc.SchemaConverter = _spy  # type: ignore[assignment]
+        store = SessionStore()
+        eval_store = EvaluationStore()
+        conv_store = sc.SchemaConversionStore()
+        session_id = "engine-capture-cache"
+        content, _runner = sc.build_schema_conversion_screen(
+            store,
+            session_id,
+            job_manager=JobManager(),
+            eval_store=eval_store,
+            conv_store=conv_store,
+            converter=injected,
+        )
+        eval_store.get_or_create(session_id).set_result(
+            EvaluationResult(
+                inventory=inventory,
+                assessment=AssessmentReport.from_items([]),
+                target_inventory=TargetInventory(),
+                target_conflicts=[],
+            )
+        )
+        store.get_or_create(session_id).set_source(
+            SourceConnectionConfig(
+                host="db", database="app", source_type=SourceType.POSTGRES
+            ),
+            None,
+        )
+        for _ in range(n):
+            content(lambda: None)
+    finally:
+        sc.SchemaConverter = real_converter_cls  # type: ignore[assignment]
+        if saved is None:
+            sys.modules.pop("nicegui", None)
+        else:
+            sys.modules["nicegui"] = saved
+    return built
+
+
+def test_schema_converter_is_rebuilt_only_when_the_engine_changes() -> None:
+    """Lazy must not mean per-render: N renders on one engine build ONE converter."""
+    built = _build_and_render_n_times(4)
+    assert built == [SourceType.POSTGRES], (
+        "the converter is being rebuilt on every render; the engine-keyed cache is not "
+        f"working: {built}"
+    )
+
+
+def test_an_injected_schema_converter_is_never_rebuilt() -> None:
+    """The test seam still wins: an injected converter is used as-is, engine ignored."""
+    injected = SchemaConverter(source_type=SourceType.MYSQL)
+    built = _build_and_render_n_times(4, injected=injected)
+    assert built == [], f"an injected converter must never be replaced: {built}"
+
+
+def test_a_render_before_connecting_does_not_poison_the_conversion_memo() -> None:
+    """A pre-connect render must not leave MySQL-dialect target DDL in the memo.
+
+    The nastier half of the engine-capture bug: once ``_conversion`` has memoized a
+    result, keying that memo on the inventory alone means a later engine change fixes
+    the LABELS while Apply still writes the MySQL-dialect DDL -- correct-looking screen,
+    corrupt target. Here a PostgreSQL expression default (``'x'::text``) is the tell:
+    the MySQL reader re-quotes it into the literal 10-character string ``'x'::text``,
+    whereas the PostgreSQL reader renders a real ``CAST``.
+    """
+    import sys
+    import types
+
+    from dsql_migrator.core.assessor import AssessmentReport
+    from dsql_migrator.core.job_manager import JobManager
+    from dsql_migrator.core.models import SourceConnectionConfig, TargetInventory
+    from dsql_migrator.ui import schema_conversion as sc
+    from dsql_migrator.ui.evaluation import EvaluationResult, EvaluationStore
+    from dsql_migrator.ui.session import SessionStore
+
+    inventory = SourceInventory(
+        tables=[
+            TableDef(
+                name="app.t",
+                columns=[
+                    ColumnDef(name="id", mysql_type="integer", nullable=False),
+                    ColumnDef(
+                        name="v", mysql_type="text", nullable=False, default="'x'::text"
+                    ),
+                ],
+                primary_key=["id"],
+                indexes=[],
+            )
+        ],
+        views=[],
+    )
+    recorder = _RecordingUi()
+    fake = types.ModuleType("nicegui")
+    fake.ui = recorder  # type: ignore[attr-defined]
+    saved = sys.modules.get("nicegui")
+    sys.modules["nicegui"] = fake
+    try:
+        store = SessionStore()
+        eval_store = EvaluationStore()
+        conv_store = sc.SchemaConversionStore()
+        session_id = "memo-poison"
+        content, _runner = sc.build_schema_conversion_screen(
+            store,
+            session_id,
+            job_manager=JobManager(),
+            eval_store=eval_store,
+            conv_store=conv_store,
+        )
+        eval_store.get_or_create(session_id).set_result(
+            EvaluationResult(
+                inventory=inventory,
+                assessment=AssessmentReport.from_items([]),
+                target_inventory=TargetInventory(),
+                target_conflicts=[],
+            )
+        )
+        state = conv_store.get_or_create(session_id)
+        state.ticked_node_ids = [f"{sc.TABLE_PREFIX}app.t"]
+        state.generated_node_ids = list(state.ticked_node_ids)
+        state.expand_all = True
+
+        # Render while still unconnected (the MySQL default) -- this fills the memo...
+        content(lambda: None)
+        assert "'''x''::text'" in recorder.body(), (
+            "fixture no longer exercises the MySQL re-quoting, so this test is vacuous"
+        )
+
+        # ...then connect PostgreSQL and render again.
+        store.get_or_create(session_id).set_source(
+            SourceConnectionConfig(
+                host="db", database="app", source_type=SourceType.POSTGRES
+            ),
+            None,
+        )
+        recorder.texts.clear()
+        content(lambda: None)
+    finally:
+        if saved is None:
+            sys.modules.pop("nicegui", None)
+        else:
+            sys.modules["nicegui"] = saved
+
+    body = recorder.body()
+    assert "Source (PostgreSQL)" in body, "the label did not even follow the engine"
+    assert "CAST('x' AS TEXT)" in body, (
+        "the conversion memo still serves the MySQL-dialect target DDL after the engine "
+        "changed -- correct labels over a corrupt target, the worst failure mode"
+    )
+    assert "'''x''::text'" not in body

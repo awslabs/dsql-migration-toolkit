@@ -984,6 +984,15 @@ class PrerequisiteCheckId(str, Enum):
     # the Full-Load-time slot still needs, which would leave the same silent data gap at
     # the Full Load -> CDC handoff.
     SLOT_WAL_RETENTION = "SLOT_WAL_RETENTION"
+    # Whether the source user can CREATE the publication CDC needs. Distinct from
+    # REPLICATION_ROLE (which is about the SLOT): PostgreSQL additionally requires CREATE
+    # on the database plus ownership of every published table, so a correctly-granted
+    # least-privilege replication user can still fail at the first step of a CDC start.
+    PUBLICATION_PRIVILEGE = "PUBLICATION_PRIVILEGE"
+    # Per-table: can this relation be in a publication at all? An UNLOGGED table is
+    # rejected by PostgreSQL (its changes are never WAL-logged, so it can never be
+    # replicated), which aborts the whole CREATE PUBLICATION.
+    TABLE_REPLICABLE = "TABLE_REPLICABLE"
 
 
 class PrerequisiteResult(BaseModel):

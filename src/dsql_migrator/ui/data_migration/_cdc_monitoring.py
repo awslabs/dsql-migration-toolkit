@@ -555,31 +555,37 @@ def _render_migration_table_status(
                     "not a proven exact match); Validation (step 4) is the exact check."
                 ).classes("text-xs text-gray-600")
 
-# CDC activity events already mirrored into the AI feed, keyed by the stable CDC log
-# key, so the ~5s monitor poll announces each transition ONCE (not every tick). Resets
-# on process restart (in-memory) -- a benign re-announce, never a data risk.
-_CDC_ANNOUNCED: "dict[tuple, set]" = {}
-
-
 def _announce_cdc_events(migration_state, status_view, ai_post_event) -> None:
     """Edge-triggered CDC activity events into the AI feed (once per transition).
 
     Announces: CDC streaming started, source schema drift (per table+kind), the DLQ
     first growing past zero, and a confirmed sink stall -- the silent-data-loss signals
-    the assistant should be aware of. Deduped per stream via :data:`_CDC_ANNOUNCED`.
+    the assistant should be aware of. Deduped per stream via ``migration_state
+    .cdc_announced``, so Start over's in-place state reset clears the markers.
     Credential/row-free text only (Property 7); never raises into the poller."""
     if ai_post_event is None:
         return
     try:
-        # Keyed by the pinned CDC key AND the state object's identity. The key alone was
+        # Keyed by the pinned CDC key, and held ON THE MIGRATION STATE. The key alone was
         # wrong in both directions: a Full Load retry changed it, so every event was
         # re-announced to the AI feed (a stream that appears to start twice); and the
         # stack-derived fallback is IDENTICAL across migrations, so after Start over a
         # fresh CDC-only session inherited the old markers and announced NOTHING at all.
-        # id() distinguishes the migration state, which Start over rebuilds.
-        seen = _CDC_ANNOUNCED.setdefault(
-            (id(migration_state), cdc_error_log_key(migration_state)), set()
-        )
+        #
+        # Adding ``id(migration_state)`` to a module-level dict did NOT fix that second
+        # half, because Start over does not rebuild the state object -- it calls
+        # ``reset_in_place``, which re-runs ``__init__`` on the SAME instance precisely so
+        # the builders' captured closures stay valid. The id is therefore unchanged and the
+        # stale markers survived, which is the regression this keying was meant to prevent:
+        # after a Start over a fresh CDC run posted NO "CDC streaming started", drift or DLQ
+        # event at all. Storing the markers on the state instead makes ``__init__`` clear
+        # them for free, and drops a process-lifetime module dict that also leaked one entry
+        # per stream per session.
+        announced = getattr(migration_state, "cdc_announced", None)
+        if not isinstance(announced, dict):
+            announced = {}
+            migration_state.cdc_announced = announced
+        seen = announced.setdefault(cdc_error_log_key(migration_state), set())
         if "started" not in seen:
             seen.add("started")
             ai_post_event(text="CDC streaming started", status="started")

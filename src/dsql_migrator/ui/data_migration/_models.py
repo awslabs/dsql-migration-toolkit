@@ -1023,6 +1023,11 @@ _PREREQ_CATEGORY_BY_CHECK: dict[PrerequisiteCheckId, PrereqCategory] = {
     PrerequisiteCheckId.REPLICATION_SLOTS: PrereqCategory.SOURCE_CONFIG,
     PrerequisiteCheckId.SOURCE_IS_WRITER: PrereqCategory.SOURCE_CONFIG,
     PrerequisiteCheckId.SLOT_WAL_RETENTION: PrereqCategory.SOURCE_CONFIG,
+    # Also a server-level privilege (CREATE on the database + table ownership), so it sits
+    # with REPLICATION_ROLE rather than under Schema & Tables.
+    PrerequisiteCheckId.PUBLICATION_PRIVILEGE: PrereqCategory.SOURCE_CONFIG,
+    # Per-table, like REPLICA_IDENTITY below.
+    PrerequisiteCheckId.TABLE_REPLICABLE: PrereqCategory.SCHEMA_TABLES,
     PrerequisiteCheckId.TABLE_PRIMARY_KEY: PrereqCategory.SCHEMA_TABLES,
     PrerequisiteCheckId.TARGET_SCHEMA_READY: PrereqCategory.SCHEMA_TABLES,
     # Per-table, on the target and the source respectively -- the fallback already put

@@ -856,11 +856,22 @@ def test_check_replication_slot_headroom_states() -> None:
         PostgresCdcFacts(max_replication_slots=5, used_replication_slots=5,
                          max_wal_senders=10, used_wal_senders=1)
     ).status is S.WARN
-    # Degenerate max_wal_senders=0 -> WARN.
-    assert check_replication_slot_headroom(
+    # A CONFIGURED zero BLOCKS (was WARN): nothing can be freed to make room, so the
+    # WARN's remediation ("drop an unused slot") could not work, and since the Full Load
+    # takes its snapshot through the same slot the run cannot even begin. Categorically
+    # different from a full pool, which stays a non-blocking WARN above.
+    for zero in (
         PostgresCdcFacts(max_replication_slots=10, used_replication_slots=0,
-                         max_wal_senders=0)
-    ).status is S.WARN
+                         max_wal_senders=0),
+        PostgresCdcFacts(max_replication_slots=0, used_replication_slots=0,
+                         max_wal_senders=10),
+    ):
+        blocked = check_replication_slot_headroom(zero)
+        assert blocked.status is S.FAIL, zero
+        assert blocked.required is True, "a source that forbids every slot must block"
+        assert "cannot be freed" in blocked.remediation.lower() or (
+            "nothing can be freed" in blocked.remediation.lower()
+        )
     # NEW: walsender pool exhausted even with FREE slots -> WARN (was PASS before #8).
     walsender_full = check_replication_slot_headroom(
         PostgresCdcFacts(max_replication_slots=10, used_replication_slots=1,
@@ -954,10 +965,600 @@ def test_pg_cdc_report_keeps_binlog_retention_visible_and_adds_the_wal_check() -
     # No longer missing from the stronger mode.
     assert _result(cdc, Id.BINLOG_RETENTION).status is PrerequisiteStatus.SKIP
     assert _result(full, Id.BINLOG_RETENTION).status is PrerequisiteStatus.SKIP
-    # The PG equivalent runs, and only in CDC mode (a Full Load creates no slot).
-    assert Id.SLOT_WAL_RETENTION in {r.check_id for r in cdc.results}
-    assert Id.SLOT_WAL_RETENTION not in {r.check_id for r in full.results}
+    # The PG equivalent RUNS only in CDC mode (a Full Load creates no slot) -- but it is
+    # still LISTED in Full Load as a SKIP, for the very reason asserted just above: a
+    # check id present in one mode and absent in the other reads as an oversight, and the
+    # Full-Load SKIP list exists to preview what switching to CDC will require. (This
+    # assertion used to demand the id be ABSENT from Full Load, which contradicted the
+    # BINLOG_RETENTION rule two lines up and was how a PostgreSQL operator ended up with
+    # a Full-Load preview listing only MySQL's binlog/GTID checks and none of their own.)
+    assert _result(cdc, Id.SLOT_WAL_RETENTION).status is not PrerequisiteStatus.SKIP
+    assert _result(full, Id.SLOT_WAL_RETENTION).status is PrerequisiteStatus.SKIP
     # A finite cap warns but must never block the run.
     capped = _report(MigrationMode.CDC, _pg_facts_ok(max_slot_wal_keep_size_mb=512))
     assert _result(capped, Id.SLOT_WAL_RETENTION).status is PrerequisiteStatus.WARN
     assert capped.can_proceed is True
+
+
+def _prereq_report(mode, source_type, facts=None):
+    """A healthy report for one (mode, engine) pair."""
+    checker = PrerequisiteChecker(
+        source_probe=_FakeSource(cdc_facts=facts or _pg_facts_ok()),
+        target_probe=_FakeTarget(existing={"app.orders"}),
+        msk_probe=_FakeMsk(),
+    )
+    return checker.check(
+        PrerequisiteCheckRequest(
+            mode=mode, tables=["app.orders"], source_type=source_type
+        ),
+        tables=[_table("app.orders")],
+    )
+
+
+# The PG readiness checks an operator must satisfy before switching to CDC -- so the
+# Full-Load-only preview has to list exactly these, not MySQL's binlog/GTID trio.
+_PG_CDC_CHECK_IDS = (
+    PrerequisiteCheckId.WAL_LEVEL_LOGICAL,
+    PrerequisiteCheckId.REPLICATION_ROLE,
+    PrerequisiteCheckId.REPLICATION_SLOTS,
+    PrerequisiteCheckId.SLOT_WAL_RETENTION,
+    PrerequisiteCheckId.SOURCE_IS_WRITER,
+    PrerequisiteCheckId.REPLICA_IDENTITY,
+)
+
+
+def test_full_load_only_previews_the_postgres_readiness_checks_for_a_pg_source() -> None:
+    """The Full-Load SKIP list must preview THIS engine's CDC requirements.
+
+    Leaving the CDC checks visible as SKIP in Full-Load-only mode exists to show what
+    switching to CDC will additionally require. For a PostgreSQL source that preview
+    listed MySQL's three binlog/GTID rows and NONE of the six PG checks -- so it
+    previewed another engine's requirements while hiding the operator's own.
+    """
+    report = _prereq_report(MigrationMode.FULL_LOAD, SourceType.POSTGRES)
+
+    for check_id in _PG_CDC_CHECK_IDS:
+        result = _result(report, check_id)
+        assert result.status is PrerequisiteStatus.SKIP, (
+            f"{check_id.value} must be previewed as SKIP in Full-Load-only mode"
+        )
+        assert result.detail == "Not applicable for this mode.", (
+            f"{check_id.value} DOES apply to PostgreSQL under CDC, so the reason is the "
+            f"mode, not the engine: {result.detail!r}"
+        )
+    # Still non-blocking -- a preview must never gate a Full Load.
+    assert report.can_proceed is True
+
+
+def test_binlog_and_gtid_skips_blame_the_engine_not_the_mode_for_a_pg_source() -> None:
+    """"Not applicable for this mode" implies "it will apply under CDC" -- false for PG.
+
+    PostgreSQL has no binary log and no GTID in ANY mode, so the reason has to name the
+    engine. Asserted in BOTH modes: the rows stay visible (a check id present in one mode
+    and absent in the other reads as an oversight) but must never claim to be pending.
+    """
+    mysql_only = (
+        PrerequisiteCheckId.BINLOG_ROW_FORMAT,
+        PrerequisiteCheckId.BINLOG_RETENTION,
+        PrerequisiteCheckId.GTID_MODE,
+    )
+    for mode in (MigrationMode.FULL_LOAD, MigrationMode.CDC):
+        report = _prereq_report(mode, SourceType.POSTGRES)
+        for check_id in mysql_only:
+            result = _result(report, check_id)
+            assert result.status is PrerequisiteStatus.SKIP, (mode, check_id)
+            assert result.detail == "Not applicable for this source engine.", (
+                f"{mode.value}/{check_id.value} still blames the mode, telling a "
+                f"PostgreSQL operator these apply under CDC: {result.detail!r}"
+            )
+
+
+def test_full_load_only_for_mysql_is_unchanged_and_lists_no_pg_checks() -> None:
+    """Control: a MySQL source keeps the binlog/GTID preview and gains no PG rows."""
+    report = _prereq_report(MigrationMode.FULL_LOAD, SourceType.MYSQL)
+    present = {r.check_id for r in report.results}
+
+    for check_id in (
+        PrerequisiteCheckId.BINLOG_ROW_FORMAT,
+        PrerequisiteCheckId.BINLOG_RETENTION,
+        PrerequisiteCheckId.GTID_MODE,
+    ):
+        result = _result(report, check_id)
+        assert result.status is PrerequisiteStatus.SKIP
+        # For MySQL these DO apply under CDC, so the mode is the right reason.
+        assert result.detail == "Not applicable for this mode."
+    assert not (set(_PG_CDC_CHECK_IDS) & present), (
+        "a MySQL source must not be shown PostgreSQL logical-replication checks"
+    )
+
+
+def test_every_check_id_appears_in_both_modes_for_each_engine() -> None:
+    """The invariant behind all of the above, stated once.
+
+    A check id present in one mode but not the other reads as an oversight (this is the
+    D-1 rule, generalised): whichever mode the operator looks at, the same rows appear --
+    only their status/reason differs. Holds per ENGINE, which is what was broken: the PG
+    Full-Load report was missing all six PG ids that its own CDC report had.
+    """
+    for source_type in (SourceType.MYSQL, SourceType.POSTGRES):
+        full = {r.check_id for r in _prereq_report(
+            MigrationMode.FULL_LOAD, source_type).results}
+        cdc = {r.check_id for r in _prereq_report(
+            MigrationMode.CDC, source_type).results}
+        assert cdc - full == set(), (
+            f"{source_type.value}: CDC checks invisible in the Full-Load preview: "
+            f"{sorted(i.value for i in cdc - full)}"
+        )
+        assert full - cdc == set(), (
+            f"{source_type.value}: Full-Load rows that vanish under CDC: "
+            f"{sorted(i.value for i in full - cdc)}"
+        )
+
+
+# --- PostgreSQL CDC gate: the ten defects found in the 0.1.498 review ---------------
+#
+# Every scenario below was reproduced against a real PostgreSQL 16 before being pinned
+# here; the fixtures use the exact catalog codes that server produces.
+
+
+def _pg_facts_healthy(**over):
+    """Facts for a healthy, fully-readable PostgreSQL source."""
+    from dsql_migrator.core.prerequisites_postgres import PostgresCdcFacts
+
+    base = dict(
+        wal_level="logical",
+        is_superuser=False,
+        has_replication_role=True,
+        max_replication_slots=10,
+        used_replication_slots=1,
+        max_wal_senders=10,
+        used_wal_senders=1,
+        is_in_recovery=False,
+        max_slot_wal_keep_size_mb=-1,
+        has_database_create=True,
+        tables_not_owned=(),
+    )
+    base.update(over)
+    return PostgresCdcFacts(**base)
+
+
+def test_replica_identity_index_must_still_have_its_backing_index() -> None:
+    """relreplident stays 'i' after the identity index is dropped; the table is then dead.
+
+    Live PG 16: `ALTER TABLE t REPLICA IDENTITY USING INDEX u; DROP INDEX u;` leaves
+    relreplident='i', and an UPDATE once t is published fails with 'does not have a
+    replica identity and publishes updates'. Grading 'i' by code alone called that PASS.
+    """
+    from dsql_migrator.core.prerequisites_postgres import check_replica_identity
+
+    table = _table("app.idxdrop")
+    dropped = check_replica_identity(
+        table,
+        _pg_facts_healthy(
+            replica_identity={"app.idxdrop": "i"},
+            identity_index_valid={"app.idxdrop": False},
+            identity_index_is_primary={"app.idxdrop": False},
+        ),
+    )
+    assert dropped.status is PrerequisiteStatus.FAIL, (
+        "a REPLICA IDENTITY index that no longer exists must not read as usable"
+    )
+    assert dropped.required is True
+    assert "dropped" in dropped.detail
+
+    intact = check_replica_identity(
+        table,
+        _pg_facts_healthy(
+            replica_identity={"app.idxdrop": "i"},
+            identity_index_valid={"app.idxdrop": True},
+            identity_index_is_primary={"app.idxdrop": True},
+        ),
+    )
+    assert intact.status is PrerequisiteStatus.PASS
+
+
+def test_replica_identity_on_a_non_primary_key_index_warns_about_the_null_key() -> None:
+    """A non-PK identity index publishes only its own columns, so the target's key is NULL."""
+    from dsql_migrator.core.prerequisites_postgres import check_replica_identity
+
+    result = check_replica_identity(
+        _table("app.idxnonpk"),
+        _pg_facts_healthy(
+            replica_identity={"app.idxnonpk": "i"},
+            identity_index_valid={"app.idxnonpk": True},
+            identity_index_is_primary={"app.idxnonpk": False},
+        ),
+    )
+    assert result.status is PrerequisiteStatus.WARN, "silently PASSing hides a NULL key"
+    assert result.required is False, "non-blocking: the load itself is unaffected"
+    assert "primary key" in result.detail
+
+
+def test_partitioned_parent_is_graded_on_its_partitions_identity() -> None:
+    """PostgreSQL enforces the LEAF's identity, and ALTER on the parent does not reach it.
+
+    Live PG 16: parent REPLICA IDENTITY FULL + one leaf NOTHING -> an UPDATE through the
+    parent still errors, naming the LEAF. The migration selects only the parent (the
+    children are dropped from the inventory), so reading the parent's own code called this
+    PASS and the gate armed a source write outage.
+    """
+    from dsql_migrator.core.prerequisites_postgres import check_replica_identity
+
+    bad_leaf = check_replica_identity(
+        _table("app.part"),
+        _pg_facts_healthy(
+            replica_identity={"app.part": "f"},  # the PARENT looks perfect
+            leaf_replica_identity={"app.part": {"app.part_2026": "n"}},
+        ),
+    )
+    assert bad_leaf.status is PrerequisiteStatus.FAIL
+    assert bad_leaf.required is True
+    assert "app.part_2026" in bad_leaf.detail, "the operator must be told WHICH partition"
+    assert "partition" in bad_leaf.remediation.lower()
+
+    good_leaves = check_replica_identity(
+        _table("app.part"),
+        _pg_facts_healthy(
+            replica_identity={"app.part": "d"},
+            leaf_replica_identity={"app.part": {"app.part_2026": "d"}},
+        ),
+    )
+    assert good_leaves.status is PrerequisiteStatus.PASS
+
+
+def test_unlogged_table_is_caught_before_it_aborts_the_publication() -> None:
+    """An UNLOGGED table is rejected from a publication, killing the WHOLE creation."""
+    from dsql_migrator.core.prerequisites_postgres import check_table_replicable
+
+    bad = check_table_replicable(
+        _table("app.scratch"), _pg_facts_healthy(unlogged={"app.scratch": True})
+    )
+    assert bad.status is PrerequisiteStatus.FAIL and bad.required is True
+    assert "UNLOGGED" in bad.detail
+    assert "SET LOGGED" in bad.remediation
+
+    ok = check_table_replicable(
+        _table("app.orders"), _pg_facts_healthy(unlogged={"app.orders": False})
+    )
+    assert ok.status is PrerequisiteStatus.PASS
+
+
+def test_publication_creation_privilege_is_checked_separately_from_the_slot() -> None:
+    """CREATE on the database + ownership of every table -- neither is REPLICATION."""
+    from dsql_migrator.core.prerequisites_postgres import check_publication_privilege
+
+    no_create = check_publication_privilege(
+        _pg_facts_healthy(has_database_create=False)
+    )
+    assert no_create.status is PrerequisiteStatus.FAIL and no_create.required is True
+    assert "CREATE on the database" in no_create.detail
+
+    not_owner = check_publication_privilege(
+        _pg_facts_healthy(tables_not_owned=("app.orders", "app.users"))
+    )
+    assert not_owner.status is PrerequisiteStatus.FAIL
+    assert "app.orders" in not_owner.detail, "name the tables, not just 'permission denied'"
+
+    assert check_publication_privilege(_pg_facts_healthy()).status is (
+        PrerequisiteStatus.PASS
+    )
+    # A superuser owns everything implicitly -- no false alarm.
+    assert check_publication_privilege(
+        _pg_facts_healthy(is_superuser=True, has_database_create=None)
+    ).status is PrerequisiteStatus.PASS
+    # Unreadable -> a non-blocking INFO, never a false FAIL.
+    unknown = check_publication_privilege(_pg_facts_healthy(has_database_create=None))
+    assert unknown.status is PrerequisiteStatus.INFO and unknown.required is False
+
+
+def test_unreadable_facts_never_produce_a_confident_green_pass() -> None:
+    """A REQUIRED check must not assert a catalog value the probe never read (fail-open).
+
+    ``is_in_recovery`` defaulted to False, so an unreadable source got a green
+    "Source accepts writes (pg_is_in_recovery=false)" -- on the single fact that decides
+    whether a replication slot can exist.
+    """
+    from dsql_migrator.core.prerequisites_postgres import (
+        check_replication_role,
+        check_source_is_writer,
+    )
+
+    writer = check_source_is_writer(_pg_facts_healthy(is_in_recovery=None))
+    assert writer.status is PrerequisiteStatus.INFO, "unknown must not read as PASS"
+    assert writer.required is False
+    assert "pg_is_in_recovery=false" not in (writer.detail or "")
+
+    role = check_replication_role(
+        _pg_facts_healthy(is_superuser=None, has_replication_role=None)
+    )
+    assert role.status is PrerequisiteStatus.INFO and role.required is False
+    # ...but a real False is still a real FAIL.
+    assert check_source_is_writer(
+        _pg_facts_healthy(is_in_recovery=True)
+    ).status is PrerequisiteStatus.FAIL
+
+
+def test_a_probe_that_read_nothing_blocks_instead_of_proceeding() -> None:
+    """All-unknown facts are unverified readiness, not "partially known".
+
+    A PostgresCdcFacts full of Nones is not None, so every check degraded to a
+    non-blocking INFO and the report PROCEEDED -- the blocking
+    check_postgres_cdc_facts_unavailable could never engage. Live-reproduced: a report
+    that had correctly blocked on a REPLICA IDENTITY of 'nothing' flipped to
+    can_proceed=True with nothing verified.
+    """
+    from dsql_migrator.core.prerequisites_postgres import (
+        PostgresCdcFacts,
+        postgres_cdc_facts_are_unverified,
+    )
+
+    assert postgres_cdc_facts_are_unverified(PostgresCdcFacts()) is True
+    # One readable critical fact is enough to be "partially known", not unverified.
+    assert postgres_cdc_facts_are_unverified(
+        PostgresCdcFacts(wal_level="logical")
+    ) is False
+
+    checker = PrerequisiteChecker(
+        source_probe=_FakeSource(cdc_facts=PostgresCdcFacts()),
+        target_probe=_FakeTarget(existing={"app.orders"}),
+        msk_probe=_FakeMsk(),
+    )
+    report = checker.check(
+        PrerequisiteCheckRequest(
+            mode=MigrationMode.CDC,
+            tables=["app.orders"],
+            source_type=SourceType.POSTGRES,
+        ),
+        tables=[_table("app.orders")],
+    )
+    assert report.can_proceed is False, (
+        "CDC must not start against a source whose readiness was never verified"
+    )
+
+
+def test_pg_cdc_aggregate_covers_every_table_with_both_per_table_checks() -> None:
+    """Each selected table gets BOTH a replicability and a REPLICA IDENTITY row."""
+    from dsql_migrator.core.prerequisites_postgres import (
+        check_postgres_cdc_prerequisites,
+    )
+
+    tables = [_table("app.a"), _table("app.b")]
+    results = check_postgres_cdc_prerequisites(
+        _pg_facts_healthy(
+            replica_identity={"app.a": "d", "app.b": "d"},
+            unlogged={"app.a": False, "app.b": False},
+        ),
+        tables,
+    )
+    by_id: dict = {}
+    for r in results:
+        by_id.setdefault(r.check_id, []).append(r.target)
+    assert sorted(by_id[PrerequisiteCheckId.REPLICA_IDENTITY]) == ["app.a", "app.b"]
+    assert sorted(by_id[PrerequisiteCheckId.TABLE_REPLICABLE]) == ["app.a", "app.b"]
+    # And every global check appears exactly once.
+    for check_id in (
+        PrerequisiteCheckId.WAL_LEVEL_LOGICAL,
+        PrerequisiteCheckId.REPLICATION_ROLE,
+        PrerequisiteCheckId.PUBLICATION_PRIVILEGE,
+        PrerequisiteCheckId.REPLICATION_SLOTS,
+        PrerequisiteCheckId.SLOT_WAL_RETENTION,
+        PrerequisiteCheckId.SOURCE_IS_WRITER,
+    ):
+        assert len(by_id[check_id]) == 1, check_id
+
+
+def test_the_checker_forwards_the_selected_tables_to_the_pg_probe() -> None:
+    """Without the names the probe returns no per-table facts and every row becomes INFO.
+
+    Nothing pinned this, so dropping the argument was a silent downgrade of the only
+    checks protecting the source from a write-breaking publication.
+    """
+    seen: list = []
+
+    class _RecordingSource(_FakeSource):
+        def cdc_prerequisites(self, table_names):
+            seen.append(list(table_names))
+            return _pg_facts_healthy(
+                replica_identity={n: "d" for n in table_names},
+                unlogged={n: False for n in table_names},
+            )
+
+    checker = PrerequisiteChecker(
+        source_probe=_RecordingSource(),
+        target_probe=_FakeTarget(existing={"app.orders", "app.users"}),
+        msk_probe=_FakeMsk(),
+    )
+    checker.check(
+        PrerequisiteCheckRequest(
+            mode=MigrationMode.CDC,
+            tables=["app.orders", "app.users"],
+            source_type=SourceType.POSTGRES,
+        ),
+        tables=[_table("app.orders"), _table("app.users")],
+    )
+    assert seen == [["app.orders", "app.users"]], (
+        f"the probe was not given the selected tables: {seen}"
+    )
+
+
+def test_replica_identity_and_writer_are_blocking_checks() -> None:
+    """Both must be required=True: they gate whether CDC can work at all.
+
+    Flipping either to required=False used to pass the whole suite, letting an operator
+    start CDC on a table whose UPDATE/DELETE the source will refuse.
+    """
+    from dsql_migrator.core.prerequisites_postgres import (
+        check_replica_identity,
+        check_source_is_writer,
+    )
+
+    bad_identity = check_replica_identity(
+        _table("app.t"), _pg_facts_healthy(replica_identity={"app.t": "n"})
+    )
+    assert bad_identity.status is PrerequisiteStatus.FAIL
+    assert bad_identity.required is True
+
+    standby = check_source_is_writer(_pg_facts_healthy(is_in_recovery=True))
+    assert standby.status is PrerequisiteStatus.FAIL
+    assert standby.required is True
+
+    # ...and the report they belong to must actually refuse to proceed.
+    checker = PrerequisiteChecker(
+        source_probe=_FakeSource(
+            cdc_facts=_pg_facts_healthy(
+                replica_identity={"app.orders": "n"}, unlogged={"app.orders": False}
+            )
+        ),
+        target_probe=_FakeTarget(existing={"app.orders"}),
+        msk_probe=_FakeMsk(),
+    )
+    report = checker.check(
+        PrerequisiteCheckRequest(
+            mode=MigrationMode.CDC,
+            tables=["app.orders"],
+            source_type=SourceType.POSTGRES,
+        ),
+        tables=[_table("app.orders")],
+    )
+    assert report.can_proceed is False
+
+
+def test_a_failed_probe_statement_does_not_blank_the_later_facts() -> None:
+    """One unreadable catalog must blank only ITSELF, not everything after it.
+
+    All the probe's statements share one connection, so one implicit transaction: without
+    a rollback the first failure left it ABORTED and every later statement failed with
+    25P02 and silently became None. Live-measured on PostgreSQL 16 with pg_class revoked:
+    3 of 9 facts survived without the rollback, 9 of 9 with it.
+
+    The double below reproduces exactly that server behaviour -- once a statement has
+    failed, every further statement raises until ``rollback()`` is called.
+    """
+    from dsql_migrator.core.source_dialect.postgres import PostgresSourceDialect
+
+    class _PoisoningConnection:
+        """Fails one designated statement, then mimics PostgreSQL's aborted transaction."""
+
+        def __init__(self, fail_on: str) -> None:
+            self._fail_on = fail_on
+            self._aborted = False
+            self.rollbacks = 0
+
+        def rollback(self) -> None:
+            self.rollbacks += 1
+            self._aborted = False
+
+        def execute(self, statement, params=None):
+            sql = str(statement)
+            if self._aborted:
+                raise RuntimeError(
+                    "current transaction is aborted, commands ignored until end of "
+                    "transaction block"
+                )
+            if self._fail_on in sql:
+                self._aborted = True
+                raise RuntimeError("permission denied")
+            return _FakeResult(sql)
+
+    class _FakeResult:
+        def __init__(self, sql: str) -> None:
+            self._sql = sql
+
+        def scalar(self):
+            low = self._sql.lower()
+            if "wal_level" in low:
+                return "logical"
+            if "is_superuser" in low:
+                return "off"
+            if "pg_is_in_recovery" in low:
+                return False
+            if "max_replication_slots" in low:
+                return "10"
+            if "max_wal_senders" in low:
+                return "10"
+            if "max_slot_wal_keep_size" in low:
+                return "-1"
+            if "has_database_privilege" in low:
+                return True
+            if "count(*)" in low:
+                return 0
+            return None
+
+        def fetchall(self):
+            return []
+
+    # pg_class is read EARLY (the per-table facts), so a cascade would take out
+    # everything after it: the slot capacity, the writer flag, the WAL cap, the
+    # database-CREATE privilege.
+    connection = _PoisoningConnection(fail_on="pg_class")
+    facts = PostgresSourceDialect().probe_cdc_prerequisites(
+        connection, ["app.orders"]
+    )
+
+    assert connection.rollbacks >= 1, "the probe never rolled back the aborted transaction"
+    # The failing fact is unknown...
+    assert dict(facts.replica_identity) == {}
+    # ...and every later one still read.
+    for name in (
+        "max_replication_slots",
+        "max_wal_senders",
+        "is_in_recovery",
+        "max_slot_wal_keep_size_mb",
+        "has_database_create",
+    ):
+        assert getattr(facts, name) is not None, (
+            f"{name} was blanked by an unrelated statement's failure (transaction "
+            "poisoning is back)"
+        )
+
+
+def test_walsender_count_is_unknown_rather_than_a_false_zero() -> None:
+    """A non-superuser outside pg_monitor cannot see other backends' backend_type.
+
+    Live-verified on PostgreSQL 16: a least-privilege user sees its own row only, so the
+    walsender count came back 0 and the exhaustion WARN could never fire -- dead in
+    exactly the setup the tool recommends. Unknown must be reported as unknown.
+    """
+    from dsql_migrator.core.source_dialect.postgres import PostgresSourceDialect
+
+    class _Connection:
+        def __init__(self, *, monitor: bool) -> None:
+            self._monitor = monitor
+
+        def rollback(self) -> None:
+            pass
+
+        def execute(self, statement, params=None):
+            return _Res(str(statement), self._monitor)
+
+    class _Res:
+        def __init__(self, sql, monitor) -> None:
+            self._sql, self._monitor = sql, monitor
+
+        def scalar(self):
+            low = self._sql.lower()
+            if "is_superuser" in low:
+                return "off"
+            if "pg_monitor" in low:
+                return self._monitor
+            if "backend_type" in low:
+                return 7  # what a privileged connection would see
+            if "wal_level" in low:
+                return "logical"
+            if "max_wal_senders" in low:
+                return "10"
+            return None
+
+        def fetchall(self):
+            return []
+
+    blind = PostgresSourceDialect().probe_cdc_prerequisites(
+        _Connection(monitor=False), []
+    )
+    assert blind.used_wal_senders is None, (
+        "a masked pg_stat_activity must not be reported as 0 used walsenders"
+    )
+    sighted = PostgresSourceDialect().probe_cdc_prerequisites(
+        _Connection(monitor=True), []
+    )
+    assert sighted.used_wal_senders == 7

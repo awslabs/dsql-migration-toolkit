@@ -1268,16 +1268,48 @@ def build_schema_conversion_screen(
     session = store.get_or_create(session_id)
     conv_state = conv_store.get_or_create(session_id)
     eval_state = eval_store.get_or_create(session_id)
-    # Convert with the source engine's dialect (PostgreSQL vs the MySQL default). This one
-    # construction feeds the whole memoized preview/apply/result path, which is why falling
-    # back to MySQL on a RESUME was the worst place to do it: source_config is None there,
-    # so a restored PostgreSQL session converted its PG inventory with the MySQL dialect and
-    # the primary-key picker went back to saying AUTO_INCREMENT. The helper consults the
-    # engine the snapshot recorded.
+    # Convert with the source engine's dialect (PostgreSQL vs the MySQL default). This feeds
+    # the whole memoized preview/apply/result path, which is why falling back to MySQL was
+    # the worst place to get it wrong: a PostgreSQL inventory converted with the MySQL
+    # dialect renders backticked AUTO_INCREMENT source DDL, tells the primary-key picker to
+    # say AUTO_INCREMENT, DROPS every PG-only warning (array/inet unsupported, the 1 MiB
+    # per-value cap, numeric precision), and emits genuinely WRONG target DDL that Apply
+    # then writes to DSQL -- a PG expression default is re-quoted as a string literal, so
+    # `DEFAULT 'pending'::text` becomes the literal 15-character text and `DEFAULT now()`
+    # becomes `DEFAULT 'now()'`, which PostgreSQL FREEZES to a constant at CREATE TABLE
+    # time (every post-cutover row gets the same migration-time timestamp, silently).
+    #
+    # Both must therefore be resolved LAZILY, per render/action -- never bound once here.
+    # Two independent things set the engine AFTER this builder has run:
+    #   1. Connecting. ``build_page`` builds every screen at page load, before the user has
+    #      connected anything, and nothing re-enters this builder afterwards (the sidebar
+    #      re-invokes only the returned content callable). A value bound here would stay on
+    #      the MySQL default for the entire page session -- the normal first-session flow.
+    #   2. Restoring. ``apply_session_snapshot`` also runs after the builders, and a
+    #      snapshot that carried no connection coordinates leaves ``source_config`` None
+    #      while still knowing the engine (``session_source_type`` reads that hint).
+    # Recovering needed a browser hard refresh, and nothing told the user to do that.
+    # Same shape as ``query_playground.py``'s ``_query_converter`` (click-time resolve,
+    # injected instance always wins).
     from dsql_migrator.ui.data_migration._models import session_source_type
 
-    _src_type = session_source_type(session)
-    schema_converter = converter or SchemaConverter(source_type=_src_type)
+    def _source_type() -> SourceType:
+        """The session's CURRENT source engine, re-read on every call."""
+        return session_source_type(session)
+
+    # Rebuilt only when the live engine actually changes, so a render does not construct a
+    # converter per call. An INJECTED converter (tests) always wins and is NEVER rebuilt --
+    # same contract as ``existence_checker_injected`` below.
+    _converter_cache: dict[str, object] = {}
+
+    def _schema_converter() -> SchemaConverter:
+        if converter is not None:
+            return converter
+        source_type = _source_type()
+        if _converter_cache.get("source_type") is not source_type:
+            _converter_cache["source_type"] = source_type
+            _converter_cache["converter"] = SchemaConverter(source_type=source_type)
+        return _converter_cache["converter"]  # type: ignore[return-value]
 
     # An INJECTED existence checker (tests) always wins and is never rebuilt. A DERIVED one
     # (built from the browsed target inventory) must be rebuilt when that snapshot changes --
@@ -1314,12 +1346,19 @@ def build_schema_conversion_screen(
         inventory is ever held (one entry).
         """
         preserve_fk = conv_state.preserve_foreign_keys
+        # Keyed on the CONVERTER too, not just the inventory: the converter is rebuilt when
+        # the live source engine changes, and without this key the memo would keep serving
+        # the MySQL-dialect result it had already computed -- correct labels over wrong
+        # target DDL, which is the harder half of the bug to notice.
+        schema_converter = _schema_converter()
         if (
             _conversion_cache.get("inventory") is not inventory
             or _conversion_cache.get("preserve_fk") != preserve_fk
+            or _conversion_cache.get("converter") is not schema_converter
         ):
             _conversion_cache["inventory"] = inventory
             _conversion_cache["preserve_fk"] = preserve_fk
+            _conversion_cache["converter"] = schema_converter
             _conversion_cache["result"] = schema_converter.convert(
                 inventory,
                 SchemaConvertOptions(preserve_foreign_keys=preserve_fk),
@@ -1388,7 +1427,7 @@ def build_schema_conversion_screen(
             return []
         try:
             conversions = applied_table_conversions(
-                schema_converter.convert(
+                _schema_converter().convert(
                     inventory, SchemaConvertOptions(preserve_foreign_keys=True)
                 ),
                 conv_state.edited_target_ddls,
@@ -1484,7 +1523,7 @@ def build_schema_conversion_screen(
                 # the live toggle, so asking it for the preserved view would evict and
                 # re-fill it on every apply. One conversion per confirmed REPLACE is
                 # negligible beside the apply.
-                schema_converter.convert(
+                _schema_converter().convert(
                     inventory, SchemaConvertOptions(preserve_foreign_keys=True)
                 ),
                 conv_state.edited_target_ddls,
@@ -2537,7 +2576,7 @@ def build_schema_conversion_screen(
                     # Wire the AI activity feed so Generate posts its summary event
                     # (on_generate lives in this helper, not the builder scope).
                     ai_post_event=ai_post_event,
-                    source_type=_src_type,
+                    source_type=_source_type(),
                 )
 
             def apply_all() -> None:

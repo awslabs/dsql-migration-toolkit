@@ -685,14 +685,29 @@ def check_msk_connect_available(available: bool) -> PrerequisiteResult:
     )
 
 
-def _skipped(check_id: PrerequisiteCheckId, title: str) -> PrerequisiteResult:
-    """Build a non-applicable (SKIP) result for a check not run in this mode."""
+def _skipped(
+    check_id: PrerequisiteCheckId, title: str, *, reason: str = "mode"
+) -> PrerequisiteResult:
+    """Build a non-applicable (SKIP) result for a check that did not run.
+
+    ``reason`` says WHY, because the two are not interchangeable and saying the wrong
+    one misleads: ``"mode"`` means the check applies to this engine but only in CDC
+    (so Full Load previews it as upcoming work), while ``"engine"`` means it never
+    applies to this source at all. A PostgreSQL source was shown "Binary log uses ROW
+    format ... Not applicable for this mode", which reads as "it WILL apply once you
+    switch to CDC" -- PostgreSQL has no binary log in any mode.
+    """
+    detail = (
+        "Not applicable for this source engine."
+        if reason == "engine"
+        else "Not applicable for this mode."
+    )
     return PrerequisiteResult(
         check_id=check_id,
         title=title,
         status=PrerequisiteStatus.SKIP,
         required=True,
-        detail="Not applicable for this mode.",
+        detail=detail,
     )
 
 
@@ -808,6 +823,14 @@ class PrerequisiteChecker:
             from dsql_migrator.core import prerequisites_postgres
 
             facts = self._source.cdc_prerequisites([table.name for table in tables])
+            # ``facts`` full of Nones is NOT "partially known" -- it is a source whose
+            # readiness was never verified, and it used to slip past this gate because the
+            # object itself was not None: every check degraded to a non-blocking INFO and
+            # the report proceeded. Treated the same as no facts at all.
+            if facts is not None and prerequisites_postgres.postgres_cdc_facts_are_unverified(
+                facts
+            ):
+                facts = None
             if facts is None:
                 # For a PostgreSQL source the probe returns facts unless it FAILED
                 # (unreachable / insufficient privilege). CDC must not start against a
@@ -822,10 +845,14 @@ class PrerequisiteChecker:
                         facts, [effective[table.name] for table in tables]
                     )
                 )
+            # reason="engine", not the default "mode": PostgreSQL has no binary log and
+            # no GTID in ANY mode, so "not applicable for this mode" told the operator
+            # these would start applying -- they never do.
             results.append(
                 _skipped(
                     PrerequisiteCheckId.BINLOG_ROW_FORMAT,
                     "Binary log uses ROW format with full row image",
+                    reason="engine",
                 )
             )
             results.append(
@@ -838,10 +865,15 @@ class PrerequisiteChecker:
                 _skipped(
                     PrerequisiteCheckId.BINLOG_RETENTION,
                     "Binary log retention covers the CDC handoff",
+                    reason="engine",
                 )
             )
             results.append(
-                _skipped(PrerequisiteCheckId.GTID_MODE, "GTID mode is enabled")
+                _skipped(
+                    PrerequisiteCheckId.GTID_MODE,
+                    "GTID mode is enabled",
+                    reason="engine",
+                )
             )
             results.append(
                 check_msk_available(
@@ -869,20 +901,46 @@ class PrerequisiteChecker:
                 )
             )
         else:
+            # Full Load only: no CDC check RUNS, but they stay visible as SKIP so the
+            # operator can preview what switching to CDC will additionally require. That
+            # preview has to be the SOURCE ENGINE's requirements -- this branch used to
+            # emit MySQL's three binlog/GTID rows unconditionally, so a PostgreSQL user
+            # was previewed another engine's checks (labelled "not applicable for this
+            # mode", implying they WOULD apply under CDC) and shown none of their own six.
+            # The engine split mirrors the CDC branch above, which already splits here.
+            is_postgres = request.source_type is SourceType.POSTGRES
+            if is_postgres:
+                from dsql_migrator.core import prerequisites_postgres
+
+                results.extend(
+                    prerequisites_postgres.postgres_cdc_prerequisites_skipped()
+                )
+            # The MySQL rows stay present for a PostgreSQL source too, but as an ENGINE
+            # skip rather than a mode skip: D-1 established that a check id present in
+            # one mode and absent in another reads as an oversight, so PG CDC keeps them
+            # visible -- and Full Load must match, or the id would vanish going the other
+            # way. Only the reason differs by engine.
+            _reason = "engine" if is_postgres else "mode"
             results.append(
                 _skipped(
                     PrerequisiteCheckId.BINLOG_ROW_FORMAT,
                     "Binary log uses ROW format with full row image",
+                    reason=_reason,
                 )
             )
             results.append(
                 _skipped(
                     PrerequisiteCheckId.BINLOG_RETENTION,
                     "Binary log retention covers the CDC handoff",
+                    reason=_reason,
                 )
             )
             results.append(
-                _skipped(PrerequisiteCheckId.GTID_MODE, "GTID mode is enabled")
+                _skipped(
+                    PrerequisiteCheckId.GTID_MODE,
+                    "GTID mode is enabled",
+                    reason=_reason,
+                )
             )
             results.append(
                 _skipped(PrerequisiteCheckId.MSK_AVAILABLE, "MSK cluster is available")

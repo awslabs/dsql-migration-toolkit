@@ -852,13 +852,43 @@ class PostgresSourceDialect(SourceDialect):
         # SELECT on system catalogs, so it passes the read-only guard.
         from dsql_migrator.core.prerequisites_postgres import PostgresCdcFacts
 
+        # ROLL BACK after a failed statement. All ~13 statements share one connection,
+        # hence one implicit transaction: swallowing the exception without a rollback left
+        # the transaction ABORTED, so every LATER statement failed with 25P02 and silently
+        # became None too. One unreadable catalog therefore blanked every fact after it --
+        # and because the object returned is still a PostgresCdcFacts (not None), the
+        # blocking "readiness could not be verified" FAIL could not engage: a report that
+        # had correctly BLOCKED on a REPLICA IDENTITY of 'nothing' flipped to
+        # can_proceed=True with nothing actually verified. Now a failure blanks only its
+        # own fact. (Verified: with pg_class revoked, statements after it succeed on their
+        # own connection, so the Nones were purely transaction poisoning.)
+        def _rollback() -> None:
+            try:
+                connection.rollback()  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001 - best-effort probe
+                pass
+
         def _scalar(sql: str, params=None):
             try:
                 return connection.execute(  # type: ignore[attr-defined]
                     text(sql), params or {}
                 ).scalar()
             except Exception:  # noqa: BLE001 - best-effort probe
+                _rollback()
                 return None
+
+        def _rows(sql: str, params=None):
+            try:
+                return connection.execute(  # type: ignore[attr-defined]
+                    text(sql), params or {}
+                ).fetchall()
+            except Exception:  # noqa: BLE001 - best-effort probe
+                _rollback()
+                return None
+
+        def _bool(value):
+            """Tri-state: None stays None (unread), anything else becomes a real bool."""
+            return None if value is None else bool(value)
 
         def _int(value):
             try:
@@ -867,56 +897,126 @@ class PostgresSourceDialect(SourceDialect):
                 return None
 
         wal_level = _scalar("SHOW wal_level")
-        is_super = str(
-            _scalar("SELECT current_setting('is_superuser')") or ""
-        ).lower() == "on"
+        _super_raw = _scalar("SELECT current_setting('is_superuser')")
+        is_super = (
+            None if _super_raw is None else str(_super_raw).strip().lower() == "on"
+        )
         # REPLICATION role attribute (self-managed) OR rds_replication membership
         # (RDS/Aurora, where the attribute cannot be granted). The CASE guards
         # pg_has_role against a non-existent rds_replication role (self-managed).
-        repl_attr = bool(
+        repl_attr = _bool(
             _scalar("SELECT rolreplication FROM pg_roles WHERE rolname = current_user")
         )
-        rds_member = bool(
+        rds_member = _bool(
             _scalar(
                 "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE "
                 "rolname = 'rds_replication') THEN pg_has_role(current_user, "
                 "'rds_replication', 'MEMBER') ELSE false END"
             )
         )
+        has_repl_role = (
+            None
+            if repl_attr is None and rds_member is None
+            else bool(repl_attr) or bool(rds_member)
+        )
+        # Counting walsenders needs to SEE other backends: outside pg_monitor (and without
+        # superuser) pg_stat_activity masks backend_type for every row but your own, so the
+        # count came back 0 and the exhaustion WARN was dead in the least-privilege setup
+        # the tool recommends. Only trust the count when the connection can actually see it.
+        can_see_backends = bool(is_super) or bool(
+            _scalar("SELECT pg_has_role(current_user, 'pg_monitor', 'MEMBER')")
+        )
         identity: dict[str, str] = {}
+        leaf_identity: dict[str, dict[str, str]] = {}
+        identity_index_valid: dict[str, bool] = {}
+        identity_index_is_primary: dict[str, bool] = {}
+        unlogged: dict[str, bool] = {}
+        not_owned: list[str] = []
         names = list(table_names)
         if names:
-            try:
-                rows = connection.execute(  # type: ignore[attr-defined]
-                    text(
-                        "SELECT n.nspname || '.' || c.relname AS qname, "
-                        "c.relreplident FROM pg_class c "
-                        "JOIN pg_namespace n ON n.oid = c.relnamespace "
-                        "WHERE n.nspname || '.' || c.relname = ANY(:names)"
-                    ),
-                    {"names": names},
-                ).fetchall()
-                identity = {str(r[0]): str(r[1]) for r in rows}
-            except Exception:  # noqa: BLE001 - best-effort probe
-                identity = {}
+            # One catalog read per concern, each isolated by _rows so an unreadable one
+            # cannot blank the others. All catalog-only: no table scan, no lock.
+            rows = _rows(
+                "SELECT n.nspname || '.' || c.relname AS qname, c.relreplident, "
+                "c.relpersistence, pg_catalog.pg_get_userbyid(c.relowner) AS owner, "
+                "EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid "
+                "        AND i.indisreplident AND i.indisvalid) AS has_identity_index, "
+                "EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid "
+                "        AND i.indisreplident AND i.indisvalid "
+                "        AND i.indisprimary) AS identity_index_is_pk "
+                "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname || '.' || c.relname = ANY(:names)",
+                {"names": names},
+            )
+            for r in rows or ():
+                qname = str(r[0])
+                identity[qname] = str(r[1])
+                unlogged[qname] = str(r[2]) == "u"
+                identity_index_valid[qname] = bool(r[4])
+                identity_index_is_primary[qname] = bool(r[5])
+            # Ownership of every published table is required for CREATE PUBLICATION.
+            owned = _rows(
+                "SELECT n.nspname || '.' || c.relname AS qname "
+                "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname || '.' || c.relname = ANY(:names) "
+                "  AND NOT pg_catalog.pg_has_role(current_user, c.relowner, 'USAGE')",
+                {"names": names},
+            )
+            if owned is not None:
+                not_owned = sorted(str(r[0]) for r in owned)
+            # Leaf partitions of any selected PARTITIONED parent. pg_partition_tree gives
+            # the whole tree (PG12+); isleaf picks the relations PostgreSQL actually
+            # publishes and whose identity it enforces.
+            leaves = _rows(
+                "SELECT pn.nspname || '.' || p.relname AS parent, "
+                "       ln.nspname || '.' || l.relname AS leaf, l.relreplident "
+                "FROM pg_class p "
+                "JOIN pg_namespace pn ON pn.oid = p.relnamespace "
+                "JOIN LATERAL pg_partition_tree(p.oid) t ON t.isleaf "
+                "JOIN pg_class l ON l.oid = t.relid "
+                "JOIN pg_namespace ln ON ln.oid = l.relnamespace "
+                "WHERE p.relkind = 'p' "
+                "  AND pn.nspname || '.' || p.relname = ANY(:names)",
+                {"names": names},
+            )
+            for r in leaves or ():
+                leaf_identity.setdefault(str(r[0]), {})[str(r[1])] = str(r[2])
         return PostgresCdcFacts(
             wal_level=str(wal_level) if wal_level is not None else None,
             is_superuser=is_super,
-            has_replication_role=repl_attr or rds_member,
+            has_replication_role=has_repl_role,
             max_replication_slots=_int(_scalar("SHOW max_replication_slots")),
             used_replication_slots=_int(
                 _scalar("SELECT count(*) FROM pg_replication_slots")
             ),
             max_wal_senders=_int(_scalar("SHOW max_wal_senders")),
             # Active walsender backends (read replicas / other CDC + our own). A full pool
-            # means no sender for a new CDC slot even when slot entries are free.
-            used_wal_senders=_int(
+            # means no sender for a new CDC slot even when slot entries are free. Only read
+            # when this connection can see other backends (see can_see_backends): a masked
+            # count of 0 would claim headroom that may not exist.
+            used_wal_senders=(
+                _int(
+                    _scalar(
+                        "SELECT count(*) FROM pg_stat_activity "
+                        "WHERE backend_type = 'walsender'"
+                    )
+                )
+                if can_see_backends
+                else None
+            ),
+            is_in_recovery=_bool(_scalar("SELECT pg_is_in_recovery()")),
+            replica_identity=identity,
+            leaf_replica_identity=leaf_identity,
+            identity_index_valid=identity_index_valid,
+            identity_index_is_primary=identity_index_is_primary,
+            unlogged=unlogged,
+            has_database_create=_bool(
                 _scalar(
-                    "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'walsender'"
+                    "SELECT pg_catalog.has_database_privilege("
+                    "current_user, current_database(), 'CREATE')"
                 )
             ),
-            is_in_recovery=bool(_scalar("SELECT pg_is_in_recovery()")),
-            replica_identity=identity,
+            tables_not_owned=tuple(not_owned),
             # Read from pg_settings, NOT SHOW: SHOW renders a unit-suffixed string ("1GB",
             # "-1") that would need unit parsing, whereas pg_settings.setting is the raw
             # number in pg_settings.unit. The unit is always MB for this GUC, so the value

@@ -1048,3 +1048,99 @@ def test_chat_timer_is_cancelled_not_just_deactivated() -> None:
     assert "_stop.active = False" not in src
     assert src.count("_t.cancel()") == 2
     assert src.count("_stop.cancel()") == 1
+
+
+# --- The general chat's grounding must be resolved per SEND, not at streamer creation ---
+
+
+def _general_chat_systems_after(connect_then):
+    """Drive the REAL ``build_page`` streamer factory and return what it grounded on.
+
+    ``_ensure_general_scope`` caches the streamer it gets for the whole scope, and the
+    panel is app-wide, so the streamer is typically created the first time the user
+    opens the panel -- often while still on Connect, BEFORE a source exists. Anything
+    baked in at creation time is then frozen for the session.
+
+    ``connect_then(session)`` mutates the session AFTER the streamer was created;
+    returns the ``(system_prompt, strategist_kwargs)`` of the send that follows.
+    """
+    import sys
+    import types
+
+    recorder = _Ui()
+    fake = types.ModuleType("nicegui")
+    fake.ui = recorder  # type: ignore[attr-defined]
+    fake.run = types.SimpleNamespace(io_bound=None, cpu_bound=None)  # type: ignore[attr-defined]
+    saved = sys.modules.get("nicegui")
+    sys.modules["nicegui"] = fake
+    try:
+        from dsql_migrator.ui import app as app_module
+
+        real_sidebar = app_module.build_workflow_sidebar
+        real_strategist = app_module.AssessmentStrategist
+        real_usable = app_module.ai_is_usable
+        captured: dict = {}
+        grounded: list = []
+
+        class _FakeStrategist:
+            def __init__(self, *_a, **kwargs) -> None:
+                self.kwargs = kwargs
+
+            def tool_chat(self, system, _messages, _on_delta, **_k):
+                grounded.append((system, self.kwargs))
+                return "ok"
+
+        def _spy_sidebar(*_a, **kwargs):
+            captured["factory"] = kwargs.get("ai_general_streamer_factory")
+            return (None, lambda *_a, **_k: None)
+
+        app_module.build_workflow_sidebar = _spy_sidebar  # type: ignore[assignment]
+        app_module.AssessmentStrategist = _FakeStrategist  # type: ignore[assignment]
+        app_module.ai_is_usable = lambda _st: True  # type: ignore[assignment]
+        try:
+            session_id = f"ai-ground-{id(connect_then)}"
+            app_module.build_page(app_module.AppConfig(), session_id)
+            factory = captured.get("factory")
+            assert factory is not None, "build_page no longer wires the general streamer"
+
+            # The panel opens (and so builds its streamer) BEFORE anything is connected.
+            streamer = factory()
+            assert streamer is not None
+
+            connect_then(app_module.SESSION_STORE.get_or_create(session_id))
+            streamer([{"role": "user", "content": "what should I watch out for?"}],
+                     lambda _d: None)
+        finally:
+            app_module.build_workflow_sidebar = real_sidebar  # type: ignore[assignment]
+            app_module.AssessmentStrategist = real_strategist  # type: ignore[assignment]
+            app_module.ai_is_usable = real_usable  # type: ignore[assignment]
+    finally:
+        if saved is None:
+            sys.modules.pop("nicegui", None)
+        else:
+            sys.modules["nicegui"] = saved
+    assert grounded, "the streamer never reached the strategist"
+    return grounded[-1]
+
+
+def test_general_chat_follows_a_source_connected_after_the_streamer_was_built() -> None:
+    """A PostgreSQL source connected after the panel opened must reground the chat."""
+    from dsql_migrator.core.models import SourceConnectionConfig, SourceType
+
+    def _connect_postgres(session) -> None:
+        session.set_source(
+            SourceConnectionConfig(
+                host="db", database="app", source_type=SourceType.POSTGRES
+            ),
+            None,
+        )
+
+    system, kwargs = _general_chat_systems_after(_connect_postgres)
+
+    assert kwargs.get("source_engine") == "PostgreSQL", (
+        "the strategist is still grounded on the engine as it was when the panel was "
+        f"opened, so the chat gives MySQL advice for a PostgreSQL migration: {kwargs}"
+    )
+    assert "migrating a PostgreSQL database" in system
+    assert "THIS PostgreSQL -> Aurora DSQL migration" in system
+    assert "migrating a MySQL database" not in system

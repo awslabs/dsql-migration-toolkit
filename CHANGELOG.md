@@ -5,6 +5,138 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.498
+
+Five defects that share one shape: a value read **once, too early**, then reused as if it were
+still current. Four were found by sweeping for that pattern after the first one turned up; the
+fifth is the mirror image of a bug fixed in v0.1.491 in one place but not its twin.
+
+### Fixed
+
+- **Schema Conversion converted a PostgreSQL source with the MySQL dialect, and applied it.**
+  The screen read the source engine once, in the page builder — but `build_page` runs every
+  screen at page load, *before* the user has connected anything, and nothing re-enters that
+  builder afterwards (the sidebar re-invokes only the returned content callable). So on the
+  normal first-session flow a PostgreSQL user got: a `Source (MySQL)` pane, backticked
+  `AUTO_INCREMENT` source DDL, a primary-key tile naming a mechanism their database does not
+  have, and — the part that leaves the tool — **MySQL-converter target DDL written to DSQL by
+  Apply**. Only a browser hard refresh recovered, and nothing said so.
+  - Verified against real PostgreSQL 16: a PG expression default is re-quoted as a string
+    literal, so `DEFAULT 'pending'::text` became the literal 15-character text and
+    `DEFAULT now()` became `DEFAULT 'now()'` — which PostgreSQL **freezes to a constant at
+    `CREATE TABLE` time**, so every row inserted after cut over gets the same migration-time
+    timestamp. Both are accepted silently: no error, no warning, and Validation cannot catch
+    it (it compares migrated rows, not future defaults). Three PG-only warnings
+    (array/`inet` unsupported, the 1 MiB per-value cap) disappeared as well.
+  - The engine and the converter are now resolved per render/action, the converter rebuilt only
+    when the engine actually changes, and the conversion memo keyed on the converter too —
+    without that last key the labels correct themselves while Apply keeps writing the
+    MySQL-dialect DDL, which is the harder half to notice. An injected converter (tests) still
+    wins and is never rebuilt. Same shape as `query_playground`'s click-time resolver, where
+    this exact bug class was already fixed in v0.1.491 — in the screen that does *not* write
+    to the target.
+- **The AI DBA's general chat answered from whatever was true when the panel first opened.**
+  The panel caches the streamer for the whole scope, so opening it on the Connect screen froze
+  the engine word, the current step, the migration fact summary, and the Bedrock config for
+  the rest of the session: MySQL advice (binlog, `AUTO_INCREMENT`) for a PostgreSQL migration,
+  "Current step: Connect" with no facts while the chip above read e.g. `Validation`, and
+  replies still coming from the previously selected model. The grounding is now resolved per
+  **send**; `_refresh_model_line` already re-read the model for display on open, and the
+  answer now does the same.
+- **Start over silently dropped the CDC source-secret CMK.** It is deployment config, threaded
+  onto the state once at screen-build time — and `reset_in_place` re-runs `__init__` on the
+  *same* object (deliberately, so the builders' captured closures stay valid), so the value was
+  wiped with no builder left to re-supply it. The next CDC deploy then created the tool-managed
+  secret under the account's default `aws/secretsmanager` key instead of the operator's CMK,
+  with no UI signal — invisible until someone audited the secret's encryption key.
+  `cdc_deploy_role_arn`, set on the adjacent line, was already preserved; its twin was not.
+- **After Start over, CDC posted no activity events at all.** The dedupe markers were keyed on
+  `id(migration_state)` in a module-level dict, on the stated assumption that "Start over
+  rebuilds the migration state" — it does not, it resets that same object in place, so the id
+  never changed and the stale markers survived. A fresh CDC run therefore announced no
+  "CDC streaming started", no schema drift and no DLQ growth, so neither the assistant nor the
+  activity feed ever learned the stream had started or that records were being dead-lettered.
+  The markers now live **on the state**, which `__init__` clears for free (and this drops a
+  module dict that leaked an entry per stream per session).
+- **Full-load-only prerequisites listed the wrong engine's checks for a PostgreSQL source.**
+  The Full-Load branch appended MySQL's `BINLOG_ROW_FORMAT` / `BINLOG_RETENTION` / `GTID_MODE`
+  with no engine split, so a PG report was byte-identical to a MySQL one. The point of leaving
+  the CDC checks visible as SKIP is to preview what switching to CDC will additionally require
+  — so this previewed *another engine's* requirements while hiding the operator's own six
+  (`wal_level`, replication role, slot headroom, WAL retention, writer, REPLICA IDENTITY),
+  which were generated only under CDC. Those six are now previewed, and the MySQL rows say
+  **"Not applicable for this source engine"** instead of "for this mode" (which reads as
+  "these will apply once you switch to CDC" — PostgreSQL has no binary log in any mode). The
+  wording is corrected in CDC mode too. This is the mirror of v0.1.491's D-1 fix, which
+  aligned the two *modes* but left engine fitness untouched.
+
+Also, from a review of the PostgreSQL-source **CDC** prerequisite gate — ten defects, each
+reproduced against a real PostgreSQL 16 before being fixed:
+
+- **One unreadable catalog silently disarmed every later check, and the report then said
+  "can proceed".** The probe's ~13 statements share one connection, so one transaction:
+  swallowing a failure without a rollback left it aborted, so every *subsequent* statement
+  failed with `25P02` and became `None` too. Because the object returned is still a
+  `PostgresCdcFacts` (not `None`), the blocking "readiness could not be verified" FAIL could
+  not engage — each check degraded itself to a non-blocking INFO. Measured with `pg_class`
+  revoked: **3 of 9 facts survived before the fix, 9 of 9 after.** A report that had
+  correctly blocked on a REPLICA IDENTITY of `nothing` flipped to proceeding with nothing
+  verified. Each statement is now isolated, and facts with *no* CDC-critical value read are
+  routed to the blocking FAIL like a probe that returned nothing at all.
+- **Partitioned tables passed the gate, then broke writes on the source.** The migration
+  selects the partitioned parent (the children are dropped from the inventory), but a
+  publication on a parent expands to the **leaves** and PostgreSQL enforces and logs the
+  *leaf's* identity. Live-verified: with the parent at `REPLICA IDENTITY FULL` and one leaf
+  at `NOTHING`, `UPDATE` through the parent still fails — naming the leaf — and `ALTER TABLE`
+  on the parent does not propagate. The check now grades the partitions and names the
+  offending one.
+- **`REPLICA IDENTITY USING INDEX` whose index was dropped read as usable.** PostgreSQL does
+  not reset `relreplident` when that index goes away: the table keeps reporting `'i'` while
+  behaving exactly like `NOTHING`, so every `UPDATE`/`DELETE` is refused once it is published.
+  `pg_index.indisreplident` is now consulted. A non-PK identity index is a new WARN — its
+  before-image carries only that index's columns, so the key the target upserts on arrives
+  NULL.
+- **An UNLOGGED table aborted the whole publication** with a raw driver error; it is now
+  caught per-table and named (`TABLE_REPLICABLE`).
+- **Nothing checked that the source user can CREATE the publication.** That needs CREATE on
+  the database plus ownership of every published table — neither is the REPLICATION right the
+  gate already checks, so a correctly-granted least-privilege user passed and then failed at
+  the first step of CDC, after the Full Load had run (`PUBLICATION_PRIVILEGE`).
+- **Unknown facts no longer render as confident green.** `is_in_recovery` and the two
+  privilege flags defaulted to `False`, so an unreadable source produced
+  "Source accepts writes (pg_is_in_recovery=false)" on a *required* check — failing open on
+  the one fact that decides whether a slot can exist. They are tri-state now.
+- **`max_replication_slots`/`max_wal_senders` of 0 now blocks.** A configured zero is not a
+  full pool: nothing can be freed, so the old WARN's "drop an unused slot" could not work,
+  and since Full Load takes its snapshot through the same slot the run cannot even begin.
+- **The walsender-exhaustion warning was dead in the setup the tool recommends.** Outside
+  `pg_monitor`, `pg_stat_activity` masks `backend_type` for other backends, so the count came
+  back 0 and the WARN could never fire. It reports unknown when it cannot see.
+- **A CDC-only start is warned that its publication and slot must already exist** — Full Load
+  creates them, and the connector runs with `publication.autocreate.mode=disabled`.
+- **The panel no longer drops the measurement.** It rendered `remediation or detail`, so every
+  FAIL/WARN row lost the observed value — the WAL-retention row told the operator to raise a
+  cap whose current value it never showed. `SLOT_WAL_RETENTION` was also missing from the
+  CDC-only set, so a CDC-handoff check was tagged "Full load + CDC".
+
+### Internal
+
+- The regression tests for the Schema Conversion defect **build the real screen and render it**.
+  All ten prior references to that builder were `inspect.getsource` string assertions, which is
+  why a run of releases aimed at the PostgreSQL path could ship with the path unreachable and CI
+  green — the buggy line still *mentioned* the right helper, it just read it at the wrong time.
+- The prerequisite suite now pins the mode-symmetry rule **per engine** in one test, so this
+  class of bug cannot recur a third time from a new branch.
+- Two test bugs found and fixed while verifying: a dedupe-isolation line popped a bare job id
+  from a dict whose keys were tuples (so it never matched anything), and the v0.1.491 D-1 test
+  asserted a check id must be *absent* from Full Load, contradicting the rule it asserted two
+  lines above.
+- The PostgreSQL CDC probe and its production caller had **no tests at all** — replacing the
+  probe with `return None` passed the entire suite, as did flipping `REPLICA_IDENTITY` and
+  `SOURCE_IS_WRITER` to non-blocking, and dropping the table names the probe is given. Every
+  check's correctness rested on facts nobody verified. All three are pinned now, and each new
+  assertion was mutation-checked: the defect was re-introduced and the test confirmed to fail.
+
 ## v0.1.497
 
 A review of v0.1.496 raised seven items. Six are real and fixed here; one was a methodology

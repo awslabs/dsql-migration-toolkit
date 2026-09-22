@@ -3596,6 +3596,32 @@ def _start_cdc_deploy(
     if _cdc_source_type(session) is SourceType.POSTGRES:
         from dsql_migrator.core import cdc_pg_slot as _pg_slot
 
+        # The publication and slot are created by Full Load's provisioning step, and the
+        # connector runs with publication.autocreate.mode=disabled (cdc_postgres) -- so it
+        # will NOT create them for itself. A CDC-only start (no Full Load in this session)
+        # therefore has no watermark carrying their names, and the connector would be
+        # deployed pointing at objects that may not exist, failing after the infra is up.
+        # The watermark is the record of provisioning, so this needs no source probe.
+        if not getattr(watermark, "publication_name", None) or not getattr(
+            watermark, "slot_name", None
+        ):
+            _stack = getattr(
+                migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME
+            )
+            render_notice(
+                ui,
+                tone="warning",
+                header="CDC needs a publication and replication slot that already exist",
+                body=(
+                    "Full Load did not run in this session, so the tool has not created "
+                    "them — and the connector is configured NOT to create a publication "
+                    "itself. Before starting, confirm the source already has publication "
+                    f'"{_pg_slot.pg_publication_name(_stack)}" covering the selected '
+                    f'tables and replication slot "{_pg_slot.pg_slot_name(_stack)}"; '
+                    "otherwise run Full Load first (it creates both at a consistent LSN) "
+                    "or create them on the source with the same names."
+                ),
+            )
         _rekeyed_full = _pg_slot.rekeyed_tables_needing_full_identity(
             message_key_columns,
             {t.name: list(t.primary_key) for t in tables_for_config},

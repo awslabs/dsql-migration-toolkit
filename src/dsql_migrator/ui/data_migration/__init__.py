@@ -3484,9 +3484,15 @@ _CDC_ONLY_CHECK_IDS = frozenset(
         PrerequisiteCheckId.GTID_MODE,
         PrerequisiteCheckId.WAL_LEVEL_LOGICAL,
         PrerequisiteCheckId.REPLICATION_ROLE,
+        PrerequisiteCheckId.PUBLICATION_PRIVILEGE,
         PrerequisiteCheckId.REPLICATION_SLOTS,
         PrerequisiteCheckId.SOURCE_IS_WRITER,
+        PrerequisiteCheckId.TABLE_REPLICABLE,
         PrerequisiteCheckId.REPLICA_IDENTITY,
+        # SLOT_WAL_RETENTION had drifted out of this set, so the CDC-handoff WAL check --
+        # the PostgreSQL counterpart of BINLOG_RETENTION, which IS listed -- was tagged
+        # "Full load + CDC" on the combined panel even though only CDC needs it.
+        PrerequisiteCheckId.SLOT_WAL_RETENTION,
         PrerequisiteCheckId.MSK_AVAILABLE,
         PrerequisiteCheckId.MSK_CONNECT_AVAILABLE,
     }
@@ -3796,7 +3802,14 @@ def _render_prereq_table(
             "check": result.title
             + (f" ({result.target})" if result.target else ""),
             "status": result.status.value,
-            "detail": result.remediation or result.detail,
+            # BOTH, not "remediation or detail". ``detail`` carries the OBSERVED value and
+            # ``remediation`` the instruction, and preferring remediation dropped the
+            # measurement on every FAIL/WARN row -- so SLOT_WAL_RETENTION told the operator
+            # to raise a cap whose current value the panel never showed, and a REPLICA
+            # IDENTITY failure named no partition. The finding first, then what to do.
+            "detail": " ".join(
+                part for part in (result.detail, result.remediation) if part
+            ),
             **(
                 {"phase": prereq_phase_tag(result.check_id, combined=True)}
                 if combined

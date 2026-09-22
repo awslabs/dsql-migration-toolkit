@@ -1705,7 +1705,10 @@ def test_cdc_activity_events_are_edge_triggered_once() -> None:
         cdc_stack_name=None,
         cdc_activity=SimpleNamespace(sink_stall_confirmed=False),
     )
-    cm._CDC_ANNOUNCED.pop("cdc-events-test", None)  # isolate from other tests
+    # No cross-test isolation needed any more: the dedupe markers live on the migration
+    # state (``cdc_announced``), and this test builds a fresh one. (The line that used to
+    # sit here popped a BARE job-id from a module-level dict whose keys were tuples, so it
+    # never matched anything -- the isolation it claimed was already imaginary.)
     view = SimpleNamespace(
         dlq_depth=5,
         schema_drift=[SimpleNamespace(table="orders", kind="add-column", count=3)],
@@ -23199,3 +23202,151 @@ def test_every_session_engine_site_uses_the_one_helper() -> None:
         "these read source_config directly and so ignore restored_source_type; route them "
         f"through session_source_type: {offenders}"
     )
+
+
+def test_start_over_preserves_the_cdc_secret_cmk() -> None:
+    """The source-secret CMK is deploy-time config and must outlive Start over.
+
+    It is threaded onto the state ONCE at screen-build time (from the process config,
+    ``data_migration/__init__.py:375-376``) and the builder does not re-run afterwards --
+    so a reset that wiped it silently downgraded the next CDC deploy to the account's
+    default ``aws/secretsmanager`` key with no UI signal. ``cdc_deploy_role_arn``, set on
+    the adjacent line, was already preserved; this pins its twin.
+    """
+    from dsql_migrator.ui.data_migration._state import DataMigrationStore
+
+    store = DataMigrationStore()
+    state = store.get_or_create("cmk-reset")
+    state.cdc_deploy_role_arn = "arn:aws:iam::123456789012:role/CdcDeployRole"
+    state.cdc_secret_kms_key_id = "arn:aws:kms:us-east-1:123456789012:key/abc-123"
+
+    store.reset_in_place("cmk-reset")
+    after = store.get_or_create("cmk-reset")
+
+    assert after is state, "reset_in_place must keep the captured object identity"
+    assert after.cdc_deploy_role_arn == "arn:aws:iam::123456789012:role/CdcDeployRole"
+    assert after.cdc_secret_kms_key_id == (
+        "arn:aws:kms:us-east-1:123456789012:key/abc-123"
+    ), "Start over dropped the operator's CMK; the next CDC deploy would use the "
+    "account default key silently"
+
+
+def test_start_over_lets_cdc_events_be_announced_again() -> None:
+    """Start over must clear the AI-feed dedupe markers so a fresh run announces.
+
+    ``reset_in_place`` re-runs ``__init__`` on the SAME object (so the builders' captured
+    closures stay valid), which is exactly why keying the markers on ``id(state)`` in a
+    module-level dict did not reset them: the id never changed. A fresh CDC-only run after
+    a Start over therefore posted NO "CDC streaming started" / drift / DLQ event at all --
+    the regression that keying was introduced to prevent.
+    """
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+    from dsql_migrator.ui.data_migration._state import DataMigrationStore
+
+    posted: list = []
+    view = SimpleNamespace(dlq_depth=0, schema_drift=[])
+    store = DataMigrationStore()
+    state = store.get_or_create("announce-reset")
+    state.job_id = "cdc-reset-test"
+    state.cdc_activity = SimpleNamespace(sink_stall_confirmed=False)
+
+    cm._announce_cdc_events(state, view, lambda **kw: posted.append(kw["text"]))
+    assert any("streaming started" in t for t in posted), posted
+    # Same state, same poll -> still edge-triggered, nothing re-announced.
+    posted.clear()
+    cm._announce_cdc_events(state, view, lambda **kw: posted.append(kw["text"]))
+    assert posted == []
+
+    store.reset_in_place("announce-reset")
+    after = store.get_or_create("announce-reset")
+    assert after is state, "reset_in_place must keep the captured object identity"
+    after.job_id = "cdc-reset-test"
+    after.cdc_activity = SimpleNamespace(sink_stall_confirmed=False)
+
+    posted.clear()
+    cm._announce_cdc_events(after, view, lambda **kw: posted.append(kw["text"]))
+    assert any("streaming started" in t for t in posted), (
+        "after Start over the stale dedupe markers still suppress every CDC event, so "
+        f"the assistant never learns the stream started: {posted}"
+    )
+
+
+def test_slot_wal_retention_is_tagged_cdc_only_like_its_mysql_counterpart() -> None:
+    """SLOT_WAL_RETENTION had drifted out of _CDC_ONLY_CHECK_IDS.
+
+    It is the PostgreSQL counterpart of BINLOG_RETENTION -- which IS in the set -- so the
+    combined "Full load + CDC" panel tagged a CDC-handoff-only check as needed by Full
+    Load too. Every PostgreSQL CDC-only id must be in the set, or a PG source's CDC-only
+    finding reads as "Full Load: Blocked".
+    """
+    from dsql_migrator.core.models import PrerequisiteCheckId as Id
+    from dsql_migrator.ui.data_migration import _CDC_ONLY_CHECK_IDS, prereq_phase_tag
+
+    for check_id in (
+        Id.WAL_LEVEL_LOGICAL,
+        Id.REPLICATION_ROLE,
+        Id.PUBLICATION_PRIVILEGE,
+        Id.REPLICATION_SLOTS,
+        Id.SLOT_WAL_RETENTION,
+        Id.SOURCE_IS_WRITER,
+        Id.TABLE_REPLICABLE,
+        Id.REPLICA_IDENTITY,
+    ):
+        assert check_id in _CDC_ONLY_CHECK_IDS, check_id
+        assert "CDC" in prereq_phase_tag(check_id, combined=True)
+    # ...and a check Full Load genuinely needs is NOT tagged CDC-only.
+    assert Id.TABLE_PRIMARY_KEY not in _CDC_ONLY_CHECK_IDS
+
+
+def test_prereq_table_shows_the_observed_value_and_the_remediation() -> None:
+    """The row must carry BOTH: what was measured, then what to do about it.
+
+    It used to render ``remediation or detail``, so every FAIL/WARN row dropped the
+    measurement -- SLOT_WAL_RETENTION told the operator to raise a cap whose current value
+    the panel never showed, and a partition REPLICA IDENTITY failure named no partition.
+    """
+    import inspect
+
+    from dsql_migrator.core.models import (
+        PrerequisiteCheckId,
+        PrerequisiteResult,
+        PrerequisiteStatus,
+    )
+    from dsql_migrator.ui import data_migration as dm
+
+    src = inspect.getsource(dm._render_prereq_table)
+    assert "result.remediation or result.detail" not in src, (
+        "the observed value is being dropped again"
+    )
+
+    captured: list = []
+
+    class _Ui:
+        def table(self, columns=None, rows=None, row_key=None):
+            captured.append(rows)
+
+            class _E:
+                def classes(self, *_a, **_k):
+                    return self
+
+            return _E()
+
+    dm._render_prereq_table(
+        _Ui(),
+        [
+            PrerequisiteResult(
+                check_id=PrerequisiteCheckId.SLOT_WAL_RETENTION,
+                title="WAL retention covers the CDC handoff",
+                status=PrerequisiteStatus.WARN,
+                required=False,
+                detail="max_slot_wal_keep_size caps slot WAL retention at 512 MB.",
+                remediation="Raise max_slot_wal_keep_size (or set -1 for unlimited).",
+            )
+        ],
+    )
+    (rows,) = captured
+    detail = rows[0]["detail"]
+    assert "512 MB" in detail, f"the measured value vanished: {detail!r}"
+    assert "Raise max_slot_wal_keep_size" in detail, f"the instruction vanished: {detail!r}"

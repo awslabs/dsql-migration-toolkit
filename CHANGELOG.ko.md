@@ -5,6 +5,40 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.498
+
+한 가지 형태를 공유하는 결함 5건입니다 — **한 번, 너무 일찍** 읽은 값을 이후에도 현재 값인 것처럼 계속 쓰는 패턴. 첫 건이 드러난 뒤 같은 패턴으로 훑어 4건을 더 찾았고, 다섯째는 v0.1.491에서 한쪽만 고치고 쌍둥이는 놓친 버그의 거울상입니다.
+
+### 수정
+
+- **Schema Conversion이 PostgreSQL 소스를 MySQL 방언으로 변환하고, 그대로 적용했습니다.** 화면이 소스 엔진을 페이지 빌더에서 한 번만 읽는데, `build_page`는 **연결 전인** 페이지 로드 시점에 모든 화면을 만들고 이후 그 빌더로 다시 들어오지 않습니다(사이드바는 반환된 content 콜러블만 재호출). 그래서 정상적인 첫 세션 흐름에서 PostgreSQL 사용자는 `Source (MySQL)` 패널, backtick `AUTO_INCREMENT` 소스 DDL, 자기 DB에 없는 키 메커니즘을 말하는 기본키 타일, 그리고 — 도구 밖으로 나가는 부분 — **Apply가 DSQL에 쓰는 MySQL 컨버터 대상 DDL**을 받았습니다. 브라우저 하드 리프레시만이 복구 수단이었고, 아무것도 그렇게 하라고 알려주지 않았습니다.
+  - 실제 PostgreSQL 16으로 확인: PG 표현식 기본값이 문자열 리터럴로 재인용되어 `DEFAULT 'pending'::text`가 리터럴 15자 텍스트가 되고, `DEFAULT now()`가 `DEFAULT 'now()'`가 됩니다 — 이건 PostgreSQL이 **`CREATE TABLE` 시점 상수로 동결**하므로 컷오버 이후 모든 행이 마이그레이션 시각을 갖습니다. 둘 다 조용히 통과합니다: 에러도 경고도 없고, Validation도 잡지 못합니다(이관된 행을 비교하며 미래의 기본값은 보지 않음). PG 전용 경고 3종(배열/`inet` 미지원, 1 MiB 값 상한)도 함께 사라졌습니다.
+  - 엔진과 컨버터를 렌더/액션 시점에 해석하고, 엔진이 실제로 바뀔 때만 컨버터를 재생성하며, 변환 메모도 컨버터로 키잉합니다 — 마지막 키가 없으면 라벨만 제자리를 찾고 Apply는 계속 MySQL 방언 DDL을 씁니다(알아채기 더 어려운 절반). 주입된 컨버터(테스트)는 여전히 우선하고 절대 재생성되지 않습니다. v0.1.491에서 이 버그 계열을 이미 고친 `query_playground`의 클릭 시점 해석과 같은 형태입니다 — 대상에 쓰지 **않는** 화면에서만 고쳐져 있었습니다.
+- **AI DBA 일반 채팅이 패널을 처음 열었을 때의 사실로 답했습니다.** 패널이 scope 내내 streamer를 캐싱하므로 Connect 화면에서 열면 엔진 단어·현재 단계·마이그레이션 사실 요약·Bedrock 설정이 세션 끝까지 동결됩니다: PostgreSQL 마이그레이션에 MySQL 조언(binlog, `AUTO_INCREMENT`), 위 칩은 예컨대 `Validation`인데 "Current step: Connect"에 사실 없음, 모델을 바꿔도 이전 모델이 답변. grounding을 **전송 시점**에 해석하게 했습니다. `_refresh_model_line`은 이미 같은 이유로 열 때 모델을 다시 읽어 **표시**하고 있었고, 이제 **답변**도 같습니다.
+- **Start over가 CDC 소스 시크릿 CMK를 조용히 버렸습니다.** 배포 설정이라 화면 빌드 시점에 state에 한 번 실립니다 — 그런데 `reset_in_place`는 (빌더가 잡은 클로저를 살리려고 의도적으로) **같은** 객체에 `__init__`을 다시 돌리므로, 값은 지워지고 다시 넣어줄 빌더는 없습니다. 이후 CDC 배포가 운영자의 CMK 대신 계정 기본 `aws/secretsmanager` 키로 시크릿을 만들고, UI 신호는 없습니다 — 시크릿의 암호화 키를 감사할 때까지 보이지 않습니다. 바로 옆 줄의 `cdc_deploy_role_arn`은 이미 보존되고 있었는데 쌍둥이는 빠져 있었습니다.
+- **Start over 후 CDC가 활동 이벤트를 하나도 올리지 않았습니다.** dedupe 마커가 모듈 전역 dict에서 `id(migration_state)`로 키잉되어 있었고, "Start over가 migration state를 새로 만든다"는 전제를 달고 있었습니다 — 새로 만들지 않고 같은 객체를 제자리에서 재설정하므로 id가 바뀌지 않아 낡은 마커가 살아남았습니다. 그래서 새 CDC 실행이 "CDC streaming started"도, 스키마 드리프트도, DLQ 증가도 알리지 않았고, 어시스턴트도 활동 피드도 스트림이 시작됐는지·레코드가 dead-letter 되는지 알 수 없었습니다. 마커를 **state로** 옮겨 `__init__`이 알아서 지우게 했습니다(세션·스트림당 한 항목씩 새던 모듈 dict도 함께 제거).
+- **Full-load-only 사전 점검이 PostgreSQL 소스에 다른 엔진의 체크를 나열했습니다.** Full Load 분기가 엔진 분기 없이 MySQL의 `BINLOG_ROW_FORMAT`/`BINLOG_RETENTION`/`GTID_MODE`를 붙여, PG 리포트가 MySQL 리포트와 완전히 동일했습니다. CDC 체크를 SKIP으로 남겨두는 목적은 CDC로 전환할 때 추가로 무엇이 필요한지 미리 보여주는 것인데 — 그래서 이건 *다른 엔진의* 요구사항을 미리 보여주고, 정작 운영자 자신의 여섯(`wal_level`, 복제 역할, 슬롯 여유, WAL 보존, writer, REPLICA IDENTITY)은 숨겼습니다(그 여섯은 CDC 모드에서만 생성됨). 이제 그 여섯이 미리 표시되고, MySQL 행은 "for this mode"가 아니라 **"Not applicable for this source engine"**이라고 말합니다("this mode"는 "CDC로 바꾸면 적용된다"로 읽히는데, PostgreSQL에는 어떤 모드에서도 binlog가 없습니다). CDC 모드의 문구도 함께 바로잡았습니다. v0.1.491의 D-1 수정의 거울상입니다 — 그때는 두 *모드*를 맞췄지만 엔진 적합성은 손대지 않았습니다.
+
+또한 PostgreSQL 소스 **CDC** 사전 점검 게이트 리뷰에서 나온 10건 — 각 항목을 실제 PostgreSQL 16으로 재현한 뒤 수정했습니다:
+
+- **카탈로그 하나를 못 읽으면 이후 모든 체크가 조용히 무력화되고, 리포트는 "진행 가능"이라고 말했습니다.** 프로브의 ~13개 문장이 한 커넥션, 즉 한 트랜잭션을 공유합니다: 실패를 rollback 없이 삼키면 트랜잭션이 abort 상태로 남아 **이후** 모든 문장이 `25P02`로 실패하며 역시 `None`이 됩니다. 반환 객체는 여전히 `PostgresCdcFacts`(None 아님)이므로 차단용 "readiness could not be verified" FAIL이 작동할 수 없고, 각 체크는 스스로 비차단 INFO로 내려갑니다. `pg_class` 권한을 회수한 상태로 측정: **수정 전 9개 중 3개, 수정 후 9개 중 9개**가 살아남았습니다. REPLICA IDENTITY가 `nothing`이라 올바르게 차단됐던 리포트가, 아무것도 검증되지 않은 채 진행 가능으로 뒤집혔습니다. 이제 각 문장을 격리하고, CDC 핵심 사실을 **하나도** 못 읽은 facts는 프로브가 아무것도 반환하지 않은 것과 동일하게 차단 FAIL로 보냅니다.
+- **파티션 테이블이 게이트를 통과한 뒤 소스의 쓰기를 깨뜨렸습니다.** 마이그레이션은 파티션 부모를 선택하지만(자식은 인벤토리에서 제거됨), 부모에 대한 publication은 **리프로 확장**되고 PostgreSQL은 *리프의* identity를 강제·기록합니다. 라이브 확인: 부모가 `REPLICA IDENTITY FULL`이고 리프 하나가 `NOTHING`이면 부모를 통한 `UPDATE`가 여전히 실패하며 — 리프 이름을 대며 — 부모에 대한 `ALTER TABLE`은 전파되지 않습니다. 이제 파티션을 기준으로 등급을 매기고 문제 파티션을 지목합니다.
+- **인덱스가 DROP된 `REPLICA IDENTITY USING INDEX`가 사용 가능으로 읽혔습니다.** PostgreSQL은 그 인덱스가 사라져도 `relreplident`를 되돌리지 않습니다: 테이블은 계속 `'i'`를 보고하면서 정확히 `NOTHING`처럼 동작하므로, publish된 순간부터 모든 `UPDATE`/`DELETE`가 거부됩니다. 이제 `pg_index.indisreplident`를 확인합니다. PK가 아닌 identity 인덱스는 새 WARN입니다 — before-image가 그 인덱스 컬럼만 담아 대상이 upsert할 키가 NULL로 도착합니다.
+- **UNLOGGED 테이블이 publication 전체를 중단**시키며 raw 드라이버 에러를 냈습니다. 이제 테이블별로 검출하고 이름을 알려줍니다(`TABLE_REPLICABLE`).
+- **소스 사용자가 publication을 CREATE할 수 있는지 아무도 확인하지 않았습니다.** DB의 CREATE 권한 + 대상 테이블 전부의 소유권이 필요하며, 둘 다 게이트가 이미 확인하는 REPLICATION 권한이 아닙니다. 그래서 올바르게 부여된 최소권한 사용자가 통과한 뒤, Full Load가 끝난 다음 CDC 1단계에서 실패했습니다(`PUBLICATION_PRIVILEGE`).
+- **모르는 사실을 더는 초록색 확신으로 표시하지 않습니다.** `is_in_recovery`와 권한 플래그 2개가 `False`로 기본값을 가져, 읽기 실패한 소스가 *required* 체크에서 "Source accepts writes (pg_is_in_recovery=false)"를 냈습니다 — 슬롯 존재 가능성을 결정하는 단 하나의 사실에서 fail-open. 이제 3-상태입니다.
+- **`max_replication_slots`/`max_wal_senders`가 0이면 차단합니다.** 설정된 0은 풀이 가득 찬 것과 다릅니다: 비울 것이 없으니 기존 WARN의 "미사용 슬롯을 드롭하라"가 작동할 수 없고, Full Load도 같은 슬롯으로 스냅샷을 잡으므로 실행 자체가 시작될 수 없습니다.
+- **walsender 고갈 경고가 도구가 권장하는 구성에서 죽어 있었습니다.** `pg_monitor` 밖에서는 `pg_stat_activity`가 다른 백엔드의 `backend_type`을 가리므로 카운트가 0으로 돌아와 WARN이 절대 발생할 수 없었습니다. 이제 볼 수 없으면 unknown으로 보고합니다.
+- **CDC-only 시작 시 publication과 슬롯이 이미 존재해야 한다고 경고합니다** — 생성은 Full Load가 하고, 커넥터는 `publication.autocreate.mode=disabled`로 동작합니다.
+- **패널이 더는 측정값을 버리지 않습니다.** `remediation or detail`로 렌더해서 모든 FAIL/WARN 행이 관측값을 잃었고 — WAL 보존 행은 현재 값을 보여주지 않은 채 상한을 올리라고 했습니다. `SLOT_WAL_RETENTION`도 CDC-only 집합에서 빠져 있어 CDC 핸드오프 체크가 "Full load + CDC"로 표기됐습니다.
+
+### 내부
+
+- Schema Conversion 결함의 회귀 테스트는 **실제 화면을 만들어 렌더합니다**. 그 빌더에 대한 기존 참조 10개가 전부 `inspect.getsource` 문자열 단정이었고, 그래서 PostgreSQL 경로를 겨냥한 릴리스가 연달아 나가는 동안 그 경로가 도달 불가인 채로 CI는 green일 수 있었습니다 — 버그가 있는 줄도 올바른 헬퍼를 *언급*하긴 했고, 읽는 **시점**만 틀렸기 때문입니다.
+- 사전 점검 스위트가 모드 대칭 규칙을 **엔진별로** 한 테스트에 고정하므로, 새 분기에서 이 계열 버그가 세 번째로 재발할 수 없습니다.
+- 검증 중 테스트 버그 2건 발견·수정: dedupe 격리 줄이 키가 튜플인 dict에서 맨 job id를 pop해 아무것도 매칭하지 않았고, v0.1.491의 D-1 테스트가 어떤 check id는 Full Load에 *없어야* 한다고 단정해 두 줄 위에서 자기가 주장한 규칙과 모순됐습니다.
+- PostgreSQL CDC 프로브와 그 프로덕션 호출자에 **테스트가 하나도 없었습니다** — 프로브를 `return None`으로 바꿔도 전체 스위트가 통과했고, `REPLICA_IDENTITY`·`SOURCE_IS_WRITER`를 비차단으로 바꿔도, 프로브에 넘기는 테이블명을 빼도 마찬가지였습니다. 모든 체크의 정확성이 아무도 검증하지 않는 fact에 얹혀 있었습니다. 셋 다 고정했고, 새 단정은 전부 뮤테이션 확인했습니다 — 결함을 되돌려 테스트가 실패하는지 검증했습니다.
+
 ## v0.1.497
 
 0.1.496 리뷰가 7건을 제기했습니다. 6건이 실재해 여기서 고쳤고, 1건은 이 리포의 검증에는 해당하지 않는
