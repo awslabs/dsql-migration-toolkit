@@ -5,6 +5,26 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.494
+
+### 보안
+
+- **transitive 의존성 `anyio`를 4.14.2로 올려**, Dependabot이 배포 lockfile에 대해 제기한 권고 2건을
+  닫았습니다:
+  - `CVE-2026-63374` / `GHSA-82r6-8w77-94w6` — **critical** (CVSS 4.0 점수 9.3). `TLSStream`이
+    호스트 이름을 IDNA 2003으로 인코딩해서, **국제화** 도메인으로의 연결이 가로채였을 때 그 이름의
+    IDNA-2003 철자로 발급받은 인증서가 정상 검증될 수 있었습니다 — TLS 인증서 스푸핑.
+  - `CVE-2026-64847` / `GHSA-5p39-cfhj-2xmp` — medium (6.8). anyio 프로세스 풀 워커가 배수되지 않는
+    파이프에 `stderr`를 연결한 채 시작되므로, 워커가 `stderr`에 충분히 쓰면 파이프가 차서 기다리던
+    호출이 멈춥니다.
+- **이 프로젝트의 실질적 노출은 낮았고, 그래도 패치했습니다.** `anyio`는 NiceGUI/Starlette/uvicorn 웹
+  스택과 `httpx` 아래로만 들어옵니다. 도구 자신의 아웃바운드 TLS는 botocore/urllib3로 AWS 엔드포인트에,
+  pymysql/psycopg로 소스 DB에 가며 어느 쪽도 `anyio`의 `TLSStream`을 쓰지 않고, AWS·DB 엔드포인트는
+  ASCII 호스트 이름으로 접속하며, anyio 프로세스 풀은 사용하지 않습니다. 다만 **배포되는 이미지 안의**
+  라이브러리에 대한 critical 권고는 도달 가능성과 무관하게 패치를 내보낼 값이 있습니다.
+- lockfile만 변경 — 1st-party 코드 변경 없음. 전체 테스트 통과, 4.14.2에서 UI를 부팅해 웹 스택에 영향이
+  없음을 확인했습니다.
+
 ## v0.1.493
 
 PostgreSQL 조회가 확장(extension)의 함수를 사용자 객체로 보고한다는 수정 요청을 검증했습니다. 확인됐고,

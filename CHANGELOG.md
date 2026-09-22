@@ -5,6 +5,29 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.494
+
+### Security
+
+- **Upgraded the transitive `anyio` dependency to 4.14.2**, closing two advisories Dependabot
+  raised against the shipped lockfile:
+  - `CVE-2026-63374` / `GHSA-82r6-8w77-94w6` — **critical** (CVSS 4.0 score 9.3).
+    `TLSStream` encoded host names with IDNA 2003, so a hijacked connection to an
+    **internationalized** domain could be validated against a certificate obtained for the
+    IDNA-2003 spelling of that name — TLS certificate spoofing.
+  - `CVE-2026-64847` / `GHSA-5p39-cfhj-2xmp` — medium (6.8). anyio process-pool workers are
+    started with `stderr` on a pipe that is never drained, so a worker writing enough to
+    `stderr` fills the pipe and wedges the awaiting call.
+- **Practical exposure here was low, and the patch is applied anyway.** `anyio` reaches this
+  project only under the NiceGUI/Starlette/uvicorn web stack and `httpx`; the tool's own
+  outbound TLS goes to AWS endpoints through botocore/urllib3 and to the source database
+  through pymysql/psycopg, none of which use `anyio`'s `TLSStream`, it connects to AWS and
+  database endpoints by ASCII host name, and it uses no anyio process pool. A critical
+  advisory against a library inside the published image is worth shipping a patch for
+  regardless of reachability.
+- Lockfile only — no first-party code changed. The full suite passes and the UI was booted
+  on 4.14.2 to confirm the web stack is unaffected.
+
 ## v0.1.493
 
 A fix-request note reported that PostgreSQL introspection reports an extension's functions
