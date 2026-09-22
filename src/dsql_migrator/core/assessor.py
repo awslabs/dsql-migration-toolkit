@@ -47,6 +47,7 @@ from dsql_migrator.core.models import (
     ObjectType,
     SourceInventory,
     SourceType,
+    TableDef,
     TargetInventory,
 )
 
@@ -200,6 +201,87 @@ def _is_unbounded_pg_character(mysql_type: str) -> bool:
     # cannot arrive from a PG source -- and if it somehow did, treating a 1-character column
     # as unbounded would be a false alarm. ``bpchar`` is the one bare unbounded spelling.
     return normalized in ("character varying", "varchar", "bpchar")
+
+
+def pg_columns_bounded_by_check(table: "TableDef") -> "set[str]":
+    """Column names a CHECK constraint restricts to a finite set of LITERALS.
+
+    Such a column cannot hold an oversized value however unbounded its TYPE is: a
+    ``status text`` limited to ``('active','inactive','out_of_stock')`` can only ever hold
+    one of three short strings. Reporting it as a 1 MiB risk is a false statement, and it
+    buries the genuine one -- a workshop Evaluation listed a real 1,114,112-byte ``bytea``
+    at the same grade as two CHECK-limited enums.
+
+    The constraint text is ALREADY captured and already displayed in the same report (the
+    dropped-CHECK note quotes each name and expression), so this reads data the tool holds
+    rather than adding a probe. Parsed with sqlglot, not matched with a regex, because
+    PostgreSQL rewrites ``IN (...)`` to ``= ANY (ARRAY[...::text])`` -- the literal form is
+    not what the user typed.
+
+    Only the finite-literal-set form is recognised. A ``length(col) <= n`` CHECK also bounds
+    a column, but deciding "small enough" needs a byte-vs-character judgement (a 1 MiB cap
+    against a character count that can be 4 bytes each), so it is deliberately NOT claimed
+    here -- such a column is still reported, which is the safe direction. A CHECK that merely
+    mentions the column (``notes <> ''``) bounds nothing and is correctly not matched.
+    """
+    import sqlglot
+    from sqlglot import exp
+
+    bounded: set[str] = set()
+    for check in getattr(table, "check_constraints", None) or []:
+        expression = (getattr(check, "expression", "") or "").strip()
+        if not expression:
+            continue
+        try:
+            tree = sqlglot.parse_one(f"SELECT {expression}", read="postgres")
+        except Exception:  # noqa: BLE001 - an unparsable CHECK simply bounds nothing
+            continue
+
+        def _all_literals(nodes) -> bool:
+            # CAST('a' AS TEXT) is how PostgreSQL stores 'a'::text, so unwrap one level.
+            for node in nodes:
+                inner = node.this if isinstance(node, exp.Cast) else node
+                if not isinstance(inner, exp.Literal):
+                    return False
+            return bool(nodes)
+
+        # `col = ANY (ARRAY[...])` -- what PostgreSQL stores an IN-list as.
+        for eq in tree.find_all(exp.EQ):
+            column = eq.this
+            right = eq.expression
+            if not isinstance(column, exp.Column):
+                continue
+            if not isinstance(right, exp.Any):
+                continue
+            # ``Any.this`` is a Paren wrapping the Array for the PostgreSQL
+            # ``= ANY (ARRAY[...])`` spelling, so unwrap before looking for the Array.
+            array = right.this
+            while isinstance(array, exp.Paren):
+                array = array.this
+            if isinstance(array, exp.Array) and _all_literals(array.expressions):
+                bounded.add(column.name)
+        # A literal `col IN (...)`, for a source that stores it that way.
+        for node in tree.find_all(exp.In):
+            column = node.this
+            if isinstance(column, exp.Column) and _all_literals(
+                node.args.get("expressions") or []
+            ):
+                bounded.add(column.name)
+    return bounded
+
+
+def pg_oversized_lob_column_names(table: "TableDef") -> "list[str]":
+    """Columns of ``table`` that can genuinely hold a value over DSQL's 1 MiB limit.
+
+    The TYPE predicate plus the CHECK exclusion above, in one place, so Evaluation, Schema
+    Conversion and the UI's exclusion offer cannot disagree about which columns are at risk.
+    """
+    bounded = pg_columns_bounded_by_check(table)
+    return [
+        column.name
+        for column in table.columns
+        if is_pg_oversized_lob_type(column.mysql_type) and column.name not in bounded
+    ]
 
 
 def is_pg_oversized_lob_type(mysql_type: str) -> bool:
@@ -584,14 +666,21 @@ class AutoIncrementRule(Rule):
                         classification=Classification.MANUAL,
                         risk=(
                             f"The integer key from AUTO_INCREMENT column '{column}' "
-                            "converts cleanly and works as-is. For higher insert "
-                            "throughput, consider a different key: DSQL stores rows in "
-                            "primary-key order, so a monotonically increasing key "
-                            "concentrates writes on one partition."
+                            "converts cleanly, but Aurora DSQL will NOT generate it: the "
+                            "default conversion keeps a plain integer with no identity, so "
+                            "the APPLICATION must supply the value on every insert — code "
+                            "that relied on the database generating it fails or collides. "
+                            "Separately, for higher insert throughput consider a different "
+                            "key: DSQL stores rows in primary-key order, so a monotonically "
+                            "increasing key concentrates writes on one partition."
                         ),
                         recommendation=(
-                            "Optional, for throughput only: use a UUID/random key, or "
-                            "an identity/sequence with cache tuning."
+                            "Decide at Schema Conversion who generates the key: choose "
+                            "the 'Server-generated (IDENTITY)' strategy to have DSQL fill "
+                            "it (the column is widened to bigint), or keep the plain "
+                            "integer and supply the value from the application. Optional, "
+                            "for throughput only: a UUID/random key or a cached identity "
+                            "spreads the writes."
                         ),
                         effort=EffortLevel.MEDIUM,
                         note_kind=ConversionNoteKind.RECOMMENDATION,

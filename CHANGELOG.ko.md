@@ -5,6 +5,48 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.496
+
+워크숍 Evaluation이 실제 PostgreSQL 스키마에서 찾아낸 부정확 2건입니다.
+
+### 수정
+
+- **CHECK로 리터럴 집합에 제한된 `text` 컬럼을 1 MiB 위험으로 보고하지 않습니다.**
+  `products.status`, `orders.status`, `product_media.media_type` — 각각 CHECK로 3~5개의 짧은 값으로
+  제한됨 — 이 모두 "no length limit … can exceed 1 MiB"로 보고됐습니다. 두 가지가 틀렸습니다: 진술 자체가
+  거짓이고(그런 컬럼은 초과 값을 담을 수 없습니다), **진짜를 묻어버립니다** — 같은 테이블의 `content`
+  (실제로 1,114,112바이트가 든 `bytea`)가 같은 등급으로 나열됐습니다.
+  - **도구가 이미 답을 갖고 있었습니다.** 같은 리포트에서 그 CHECK 표현식을 읽고 **표시**합니다(드롭된
+    CHECK 노트가 이름과 표현식을 인용). LOB 규칙만 타입을 봤습니다. 새 조회 없이 Evaluation·Schema
+    Conversion·UI 제외 제안이 하나의 테이블 인식 술어를 공유하므로, CHECK로 제한된 컬럼은 **제외 후보로도
+    제시되지 않습니다**(제외해도 얻는 것 없이 컬럼만 버립니다).
+  - 패턴 매칭이 아니라 sqlglot으로 파싱합니다: PostgreSQL은 `IN (...)`을 `= ANY (ARRAY[…::text])`로
+    바꿔 저장하므로 저장된 형태는 사용자가 쓴 것이 아닙니다. 컬럼을 단지 언급하는 CHECK
+    (`notes <> ''`)는 아무것도 제한하지 않으며 올바르게 무시됩니다. `length(col) <= n` CHECK도 제한하지만
+    **의도적으로 주장하지 않았습니다** — "충분히 작은가"는 1 MiB 상한에 대해 바이트 대 문자 판단이
+    필요하므로, 그런 컬럼은 계속 보고됩니다(안전한 방향).
+  - 이 건의 **심각도** 절반은 v0.1.495에서 이미 고쳤습니다(`RECOMMENDATION`으로 재조정 → `text`만 있는
+    스키마의 준비도가 57이 아니라 100 "Ready"로 복귀). 이번에는 **거짓 진술 자체**를 고칩니다.
+- **Evaluation이 "누가 PK를 생성하는지"를 말합니다 — 더 빠를 수 있다는 얘기만이 아니라.**
+  키가 `AUTO_INCREMENT` / `GENERATED AS IDENTITY`인 소스에 대해 Evaluation은 그 키가
+  "converts cleanly and **works as-is**"라고 하고 전부를 "optional, for throughput only"로 표현했습니다.
+  **기본 변환에서는 대상 컬럼이 identity 없는 평범한 integer**이므로 애플리케이션이 매 INSERT에 값을
+  공급해야 합니다 — 앱 코드 변경 사항이고, Schema Conversion은 그것을 말하는데("IMPORTANT: Aurora DSQL
+  will NOT auto-generate this key") go/no-go 산출물은 말하지 않았습니다. 두 단계가 같은 키에 대해 서로
+  다른 말을 했습니다.
+  - **엔진 무관**: MySQL 규칙도 같은 문구였으므로 MySQL 마이그레이션도 똑같이 덜 알려졌습니다.
+  - 여전히 실패가 아니라 **조언**으로 보정돼 있습니다 — 이것이 결함처럼 읽히지 않게 한 v0.1.151의 교정은
+    유지됩니다. 처리량 절반은 명시적으로 선택사항이고, 추가된 것은 **운영자가 내려야 하는 결정**입니다.
+
+### 검토했고 바꾸지 않은 것
+
+- identity 컬럼이 `bigint`여야 한다는 DSQL 규칙은 실재하지만 **조건부이고 이미 처리됩니다**: 운영자가
+  Server-generated (IDENTITY) 전략을 고를 때만 적용되고, 그때 컨버터가 `integer`를 `BIGINT`로 직접
+  넓힙니다(실행으로 확인). 기본값(Keep)에서는 identity를 만들지 않으므로 `integer`가 맞습니다. 고칠 것이
+  없고, 이제 권고 문구가 그 확장을 언급해 선택이 정보에 근거하게 합니다.
+- identity CACHE 제약(1 또는 ≥65536)은 사용자가 위반할 경로가 없습니다: 컨버터가 항상 `CACHE 65536`을
+  내보냅니다.
+
 ## v0.1.495
 
 v0.1.491~493을 검증한 결과 접수 26건 중 20건 해결이 확인됐고, **수정 자체가 만든 결함 14건**이

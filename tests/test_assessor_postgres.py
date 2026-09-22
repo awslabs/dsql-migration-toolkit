@@ -500,3 +500,108 @@ def test_pg_database_collation_finding_covers_what_the_column_capture_cannot() -
         ) == []
     # Unreadable / MySQL -> no item.
     assert check_postgres_database_collation(SourceInventory(tables=[])) == []
+
+
+def test_check_limited_text_enum_is_not_an_oversized_lob_risk() -> None:
+    """Measured in a workshop Evaluation: `products.status`, `orders.status` and
+    `product_media.media_type` -- each a text column a CHECK limits to 3-5 literals -- were
+    reported as "no length limit ... can exceed 1 MiB", and the table's one GENUINE oversized
+    column (a bytea holding 1,114,112 bytes) was listed at the same grade. The tool already
+    reads those CHECKs in the SAME report, so this needs no new probe."""
+    from dsql_migrator.core.assessor import (
+        pg_columns_bounded_by_check,
+        pg_oversized_lob_column_names,
+    )
+    from dsql_migrator.core.assessor_postgres import PgOversizedLobRule
+    from dsql_migrator.core.models import CheckConstraintDef
+
+    table = TableDef(
+        name="ecommerce.product_media",
+        columns=[
+            ColumnDef(name="id", mysql_type="integer"),
+            # PostgreSQL stores an IN-list as `= ANY (ARRAY[...::text])`, which is what the
+            # tool captures -- so the detection has to parse, not pattern-match the source.
+            ColumnDef(name="media_type", mysql_type="text"),
+            ColumnDef(name="content", mysql_type="bytea"),
+            ColumnDef(name="full_description", mysql_type="text"),
+            ColumnDef(name="notes", mysql_type="text"),
+        ],
+        primary_key=["id"],
+        check_constraints=[
+            CheckConstraintDef(
+                name="product_media_media_type_check",
+                expression=(
+                    "media_type = ANY (ARRAY['image'::text, 'video'::text, 'doc'::text])"
+                ),
+            ),
+            # Mentions a column but bounds nothing -- must NOT exclude it.
+            CheckConstraintDef(
+                name="product_media_notes_check", expression="notes <> ''::text"
+            ),
+        ],
+    )
+    assert pg_columns_bounded_by_check(table) == {"media_type"}
+    at_risk = pg_oversized_lob_column_names(table)
+    assert "content" in at_risk  # the genuine one survives
+    assert "full_description" in at_risk
+    assert "notes" in at_risk  # `<> ''` bounds nothing
+    assert "media_type" not in at_risk
+
+    finding = PgOversizedLobRule().evaluate(SourceInventory(tables=[table]))[0]
+    assert "content (bytea)" in finding.risk
+    assert "media_type" not in finding.risk
+
+
+def test_a_table_whose_only_text_column_is_check_limited_is_clean() -> None:
+    """The workshop's `orders`: its only unbounded-typed columns were CHECK-limited enums, so
+    the table should raise no oversized-LOB finding at all."""
+    from dsql_migrator.core.assessor_postgres import PgOversizedLobRule
+    from dsql_migrator.core.models import CheckConstraintDef
+
+    table = TableDef(
+        name="ecommerce.orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="integer"),
+            ColumnDef(name="status", mysql_type="text"),
+        ],
+        primary_key=["id"],
+        check_constraints=[
+            CheckConstraintDef(
+                name="orders_status_check",
+                expression=(
+                    "status = ANY (ARRAY['pending'::text, 'paid'::text, "
+                    "'shipped'::text, 'delivered'::text, 'cancelled'::text])"
+                ),
+            )
+        ],
+    )
+    assert PgOversizedLobRule().evaluate(SourceInventory(tables=[table])) == []
+
+
+def test_identity_finding_states_who_generates_the_key_not_only_throughput() -> None:
+    """A workshop Evaluation listed 7 AUTO_INCREMENT recommendations as throughput advice
+    only. Under the DEFAULT conversion the target column is a plain integer with no identity,
+    so the APPLICATION must supply the value on every insert -- an app-code change. Schema
+    Conversion says so ("IMPORTANT: Aurora DSQL will NOT auto-generate this key"); Evaluation,
+    the go/no-go artifact, said "works as-is ... optional, for throughput only".
+    Engine-independent: the MySQL rule had the same wording."""
+    from dsql_migrator.core.assessor import AutoIncrementRule
+    from dsql_migrator.core.assessor_postgres import PgIdentityKeyRule
+
+    pg_table = TableDef(
+        name="ecommerce.orders",
+        columns=[ColumnDef(name="id", mysql_type="integer")],
+        primary_key=["id"],
+        auto_increment_column="id",
+    )
+    for rule in (PgIdentityKeyRule(), AutoIncrementRule()):
+        finding = rule.evaluate(SourceInventory(tables=[pg_table]))[0]
+        text = finding.risk + " " + finding.recommendation
+        assert "will NOT generate it" in finding.risk, type(rule).__name__
+        assert "APPLICATION must supply" in finding.risk, type(rule).__name__
+        assert "Server-generated (IDENTITY)" in finding.recommendation
+        # Still calibrated as advice, not a failure (the v0.1.151 correction): the
+        # THROUGHPUT half stays explicitly optional, and the throughput mechanism is kept.
+        assert "Optional, for throughput only" in finding.recommendation
+        assert "primary-key order" in text
+        assert "cause hot partitions" not in text.lower()

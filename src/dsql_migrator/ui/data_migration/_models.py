@@ -21,6 +21,7 @@ from dsql_migrator.core.assessor import (
     _OVERSIZED_LOB_BASES,
     _base_type,
     is_pg_oversized_lob_type,
+    pg_oversized_lob_column_names,
 )
 from dsql_migrator.core.models import (
     ChunkState,
@@ -1314,18 +1315,24 @@ def lob_exclusion_candidates(
     """
     if inventory is None:
         return []
-    is_oversized = (
-        is_pg_oversized_lob_type
-        if source_type is SourceType.POSTGRES
-        else (lambda spelling: _base_type(spelling) in _OVERSIZED_LOB_BASES)
-    )
     candidates: list[LobExclusionCandidate] = []
     for table in inventory.tables:
         pk = set(table.primary_key)
+        if source_type is SourceType.POSTGRES:
+            # Table-aware: a CHECK limiting the column to a finite literal set means it
+            # cannot hold an oversized value, so it must not be OFFERED for exclusion
+            # either -- excluding it would drop a column for nothing.
+            at_risk = set(pg_oversized_lob_column_names(table))
+        else:
+            at_risk = {
+                column.name
+                for column in table.columns
+                if _base_type(column.mysql_type) in _OVERSIZED_LOB_BASES
+            }
         columns = tuple(
             column.name
             for column in table.columns
-            if is_oversized(column.mysql_type) and column.name not in pk
+            if column.name in at_risk and column.name not in pk
         )
         if columns:
             candidates.append(

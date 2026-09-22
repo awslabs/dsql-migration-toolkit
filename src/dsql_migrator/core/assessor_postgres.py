@@ -219,14 +219,18 @@ class PgOversizedLobRule(Rule):
     rule_id = "OVERSIZED_LOB"
 
     def evaluate(self, inventory: "SourceInventory") -> "list[Finding]":
-        from dsql_migrator.core.assessor import is_pg_oversized_lob_type
+        from dsql_migrator.core.assessor import pg_oversized_lob_column_names
 
         findings: list[Finding] = []
         for table in inventory.tables:
+            # A CHECK that limits the column to a finite literal set is an exclusion, not
+            # just noise-reduction: such a column CANNOT hold an oversized value, and
+            # reporting it both states something false and buries the genuine one.
+            at_risk = set(pg_oversized_lob_column_names(table))
             columns = [
                 f"{column.name} ({column.mysql_type})"
                 for column in table.columns
-                if is_pg_oversized_lob_type(column.mysql_type)
+                if column.name in at_risk
             ]
             if not columns:
                 continue
@@ -294,14 +298,21 @@ class PgIdentityKeyRule(Rule):
                     classification=Classification.MANUAL,
                     risk=(
                         f"The integer key from serial / identity column '{column}' "
-                        "converts cleanly and works as-is. For higher insert throughput, "
-                        "consider a different key: DSQL stores rows in primary-key order, "
-                        "so a monotonically increasing key concentrates writes on one "
-                        "partition."
+                        "converts cleanly, but Aurora DSQL will NOT generate it: the "
+                        "default conversion keeps a plain integer with no identity and no "
+                        "sequence, so the APPLICATION must supply the value on every insert "
+                        "— code that relied on the database generating it fails or "
+                        "collides. Separately, for higher insert throughput consider a "
+                        "different key: DSQL stores rows in primary-key order, so a "
+                        "monotonically increasing key concentrates writes on one partition."
                     ),
                     recommendation=(
-                        "Optional, for throughput only: use a UUID/random key, or an "
-                        "identity/sequence with cache tuning."
+                        "Decide at Schema Conversion who generates the key: choose the "
+                        "'Server-generated (IDENTITY)' strategy to have DSQL fill it (the "
+                        "column is widened to bigint, which DSQL requires for an identity), "
+                        "or keep the plain integer and supply the value from the "
+                        "application. Optional, for throughput only: a UUID/random key or a "
+                        "cached identity spreads the writes."
                     ),
                     effort=EffortLevel.MEDIUM,
                     note_kind=ConversionNoteKind.RECOMMENDATION,

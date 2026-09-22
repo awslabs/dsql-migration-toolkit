@@ -5,6 +5,55 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.496
+
+Two inaccuracies a workshop Evaluation surfaced on a real PostgreSQL schema.
+
+### Fixed
+
+- **A `text` column a CHECK limits to a literal set is no longer reported as a 1 MiB risk.**
+  `products.status`, `orders.status` and `product_media.media_type` — each restricted by a
+  CHECK to 3-5 short values — were all reported as "no length limit … can exceed 1 MiB". Two
+  things were wrong: the statement is false (such a column cannot hold an oversized value),
+  and it buried the genuine one, since the same table's `content` (a `bytea` actually holding
+  1,114,112 bytes) was listed at the same grade.
+  - **The tool already had the answer.** It reads and DISPLAYS those CHECK expressions in the
+    same report (the dropped-CHECK note quotes each name and expression); only the LOB rule
+    looked at the type alone. No new probe — Evaluation, Schema Conversion and the UI's
+    exclusion offer now share one table-aware predicate, so a CHECK-limited column is also
+    no longer OFFERED for exclusion (excluding it would drop a column for nothing).
+  - Parsed with sqlglot, not pattern-matched: PostgreSQL rewrites `IN (...)` into
+    `= ANY (ARRAY[…::text])`, so the stored form is not what the user typed. A CHECK that
+    merely mentions the column (`notes <> ''`) bounds nothing and is correctly ignored. A
+    `length(col) <= n` CHECK does bound it but is deliberately NOT claimed — judging "small
+    enough" needs a byte-versus-character call against the 1 MiB cap, so such a column is
+    still reported, which is the safe direction.
+  - The **severity** half of this was already fixed in v0.1.495 (re-rated to
+    `RECOMMENDATION`, so the readiness score is back to 100 "Ready" on a `text`-only schema
+    rather than 57). This fixes the false statement itself.
+- **Evaluation now says WHO generates the primary key, not just that it could be faster.**
+  For a source whose keys are `AUTO_INCREMENT` / `GENERATED AS IDENTITY`, Evaluation said the
+  key "converts cleanly and works as-is" and framed everything as "optional, for throughput
+  only". Under the DEFAULT conversion the target column is a plain integer with **no
+  identity**, so the application must supply the value on every insert — an app-code change,
+  which Schema Conversion does state ("IMPORTANT: Aurora DSQL will NOT auto-generate this
+  key") while the go/no-go artifact did not. The two steps disagreed about the same key.
+  - **Engine-independent**: the MySQL rule carried the same wording, so a MySQL migration was
+    equally under-informed.
+  - Still calibrated as ADVICE, not a failure — the v0.1.151 correction that stopped this
+    reading like a defect stands. The throughput half remains explicitly optional; what was
+    added is the decision the operator has to make.
+
+### Reviewed and NOT changed
+
+- The DSQL rule that an identity column must be `bigint` is real but CONDITIONAL and already
+  handled: it applies only if the operator picks the Server-generated (IDENTITY) strategy, and
+  the converter then widens `integer` to `BIGINT` itself (verified by execution). Under the
+  default (Keep) no identity is created, so `integer` is correct. Nothing to fix; the
+  recommendation now mentions the widening so the choice is informed.
+- The identity CACHE constraint (1 or >= 65536) has no user-reachable violation: the converter
+  always emits `CACHE 65536`.
+
 ## v0.1.495
 
 A verification pass over v0.1.491-493 confirmed 20 of 26 filed items resolved, and found

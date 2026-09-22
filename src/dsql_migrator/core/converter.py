@@ -2381,6 +2381,7 @@ from dsql_migrator.core.assessor import (  # noqa: E402 - avoids duplicate liter
     _UNSUPPORTED_INDEX_TYPES,
     _base_type,
     is_pg_oversized_lob_type,
+    pg_oversized_lob_column_names,
 )
 
 
@@ -2820,10 +2821,11 @@ def _pg_oversized_lob_warning(table: TableDef) -> Optional[ConversionWarning]:
     that tuple suppressed for PostgreSQL with no counterpart, so the one DSQL limit whose
     breach cannot be fixed by reloading was the one the PostgreSQL path never mentioned.
     """
+    at_risk = set(pg_oversized_lob_column_names(table))
     columns = [
         f"{column.name} ({column.mysql_type})"
         for column in table.columns
-        if is_pg_oversized_lob_type(column.mysql_type)
+        if column.name in at_risk
     ]
     if not columns:
         return None
