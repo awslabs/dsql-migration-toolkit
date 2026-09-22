@@ -71,9 +71,14 @@ def pg_column_default_sql(
     wrongly-worded warning, while the primary key is always present on the ``TableDef``.
     """
     raw = (column.default or "").strip()
-    if not raw or column.generated:
+    if column.generated:
         return None, None
-    if _PG_NEXTVAL_DEFAULT_RE.search(raw):
+    # BOTH sequence spellings, treated identically: a ``serial``'s ``nextval`` DEFAULT and a
+    # PG10+ ``GENERATED ... AS IDENTITY``. The latter has no pg_attrdef default at all, so
+    # testing the default alone silently missed the spelling PostgreSQL 10+ RECOMMENDS --
+    # only the legacy one was covered. Checked BEFORE the empty-default return for that
+    # reason: an identity column arrives with ``default`` None.
+    if column.identity or (raw and _PG_NEXTVAL_DEFAULT_RE.search(raw)):
         if is_key_column:
             return None, None
         return None, (
@@ -84,6 +89,8 @@ def pg_column_default_sql(
             "the next number -- supply the value from the application, or add an identity "
             "to the column on the target before cutting over."
         )
+    if not raw:
+        return None, None
     # Validate the default parses as a PostgreSQL expression in isolation, so a malformed
     # one is dropped with a warning instead of aborting the entire CREATE TABLE parse.
     try:

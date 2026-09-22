@@ -5,6 +5,110 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.495
+
+A verification pass over v0.1.491-493 confirmed 20 of 26 filed items resolved, and found
+**14 defects the fixes themselves introduced**. All are fixed here. Two were self-inflicted
+regressions in shipped behaviour; one is a case where the reasoning I used to justify a
+v0.1.493 change condemns another part of the same change.
+
+### Fixed
+
+- **An extension-created schema no longer takes the user's objects with it.** v0.1.493 added
+  a SCHEMA-level exclusion to `list_schemas` as "belt-and-braces" over the per-object
+  filters. It is strictly COARSER than them: a schema is a container, so excluding PostGIS's
+  `tiger_data` or pg_cron's `cron` also excluded whatever the user put inside — and people do
+  (the TIGER loader's own tables live there). That table vanished from Evaluation, could not
+  be listed for Full Load, and Validation reported MATCH over a set that silently excluded
+  it, with nothing to explain any of it. Removed; the per-object `deptype='e'` filters
+  already empty such a schema of the extension's own objects while keeping the user's.
+  - The same commit justified requiring `classid` on the ground that **a missing finding is
+    strictly worse than an over-reported one**. That argument applies against this layer, and
+    a test now asserts `list_schemas` does *not* filter.
+- **PostgreSQL routine bodies are no longer always empty.** Putting the identity arguments
+  into a routine's name (so overloads are distinguishable) broke the definition lookup, which
+  still matched `proname = :name` — `order_count()` can never equal `order_count`. Every
+  PostgreSQL function and procedure returned an empty body through the AI object-detail tool,
+  with a *false* reason blaming a dropped object or a missing privilege. Dot-splitting was
+  wrong for a second reason too: a schema-qualified argument type (`app.f(a app.hstore)`) has
+  three parts. Now matched against all four renderings a name can arrive in, so an overload
+  asked for by signature returns its own body.
+- **The friendly name works again in the AI object-detail tool.** Same root cause: only the
+  full name or the last dot-segment matched, so `order_count` — what an operator or the model
+  actually says — returned `not_found` for an object Evaluation had just listed. A supplied
+  signature still matches exactly, so one overload never resolves to another.
+- **A validation RE-CHECK is no longer reaped as stalled.** The v0.1.491 liveness fix covered
+  the checksum helpers but not this sibling call path: the re-check passed no `on_page`, so
+  the Validator's page hook was inert and the watchdog failed the job at 900 s — reporting a
+  read-only comparison with the *Full Load* wording "the load appears to have stalled", while
+  the comparison itself completed. Re-checking one large mismatched table is exactly what the
+  button is for. **Engine-independent: MySQL sources were affected too.**
+- **A non-primary-key `GENERATED AS IDENTITY` column no longer loses its value generation
+  silently.** The v0.1.492 fix keyed on a `nextval(` default, but a PostgreSQL identity column
+  has **no `pg_attrdef` default at all** — so only the legacy `serial` spelling was covered and
+  the PG10+ *recommended* one stayed silent. `attidentity` is now recorded for every column,
+  not only the key, via a new `ColumnDef.identity`.
+- **`OVERSIZED_LOB` is advice, not per-table manual work.** Adding `text` to the PostgreSQL
+  set made the rule fire on nearly every real schema, because `text` is PostgreSQL's idiomatic
+  string type — a plain schema read "Moderate effort" purely because a column has no length
+  limit, with no evidence any value approaches 1 MiB. Re-rated to `RECOMMENDATION`, matching
+  its sibling rule. That is the same unusable-signal shape v0.1.493 fixed for extension
+  objects, reintroduced one release later in a different place.
+- **The paste-ready `ALTER TABLE … ADD CONSTRAINT … CHECK` now quotes identifiers.** It is the
+  only in-tool route to re-creating a dropped CHECK, so for a mixed-case or spaced name the
+  remedy itself was a syntax error — while the `CREATE TABLE` beside it quoted correctly.
+- **The Schema Conversion primary-key picker speaks the source's language.** v0.1.491 fixed
+  the converter warnings and Evaluation but not the picker, where the decision is actually
+  made: a PostgreSQL operator was told about AUTO_INCREMENT, and the "no alternative applies"
+  hint explained the absence in MySQL terms.
+- **The drift DETAIL text is engine-correct.** The summary line was made source-neutral in
+  v0.1.491; the detail a PostgreSQL operator reads on the sign-off report was not, so it
+  explained the verdict with two coordinates their database does not have. It now says why
+  drift is deliberately not computed from a WAL LSN.
+- **The oversized-LOB pre-tick can no longer disagree with the offer.** The reverse map was a
+  second, hand-kept copy of PostgreSQL type knowledge, already missing `bpchar`/bare `varchar`,
+  and it stripped the length modifier — so a bounded `character varying(50)` fell into the
+  `text` bucket and could be pre-ticked in a dialog whose confirm NULLs the column for every
+  row. Both halves are now gated on the single `is_pg_oversized_lob_type` predicate.
+- **A restored session keeps its engine.** The new PostgreSQL-aware call sites read only
+  `source_config`, which a snapshot without connection coordinates leaves `None` — so right
+  after a restore the pre-load LOB panel claimed "no oversized LOB columns" for a schema full
+  of `text`/`bytea`, the pre-tick was empty, and the watermark panel labelled MySQL rows. One
+  `session_source_type` helper now consults the restored hint, as `ui/connect.py` already did.
+
+### Added
+
+- **One finding for a source database collation Aurora DSQL does not match**
+  (`PG_DATABASE_COLLATION`). The v0.1.491 per-column capture deliberately ignores the
+  collation named `default` — that is not a collation, it is "this database's default" — which
+  hid the ORDINARY case: on a stock RDS/Aurora PostgreSQL every text column inherits
+  `en_US.utf8` while DSQL runs `C`. Measured on the live cluster: DSQL reports
+  `datcollate = 'C'`, so `'Bob' < 'alice'` is TRUE and `ORDER BY` yields `A, B, a, b`; the same
+  queries on `en_US.utf8` give FALSE and `a, A, b, B`. Ordering and range predicates change
+  after cut over while every row count and checksum still matches. Worded not to overstate it:
+  equality and UNIQUE enforcement are unchanged.
+
+### Testing
+
+- **The load-bearing line behind the quarantine-recovery button now has a real test.** Its
+  only guard was an AST assertion that the `source_type` keyword *appears* — which a
+  hard-coded `SourceType.MYSQL` would also satisfy — and it guarded a different call site than
+  the one that can regress. I had recorded that a behavioural test was impossible because the
+  helper was a closure; the honest fix was to stop making it a closure. It is now the
+  module-level `make_lob_candidates_for(inventory, session)` factory, and the test drives the
+  shipped body. It fails under all three ways the wiring can regress.
+- The shared PostgreSQL test double gained `.first()`, without which the single-value catalog
+  probes hit their own best-effort `except` and returned `None` — a probe test would have
+  passed for the wrong reason.
+
+### Unchanged (reported, and correct as shipped)
+
+- The "no slot in this run" branch of the CDC slot-health fix is unreachable in the running
+  app — which its own docstring already states as defensive-only, so there is nothing to fix.
+- `is_pg_oversized_lob_type` treating a bare `character`/`char` as unbounded is unreachable:
+  PostgreSQL's `format_type` always renders a modifier-less char as `character(1)`. Those two
+  spellings are dropped as dead weight, with the reason recorded.
+
 ## v0.1.494
 
 ### Security

@@ -1354,7 +1354,9 @@ _LOB_BASES_BY_TARGET_TYPE: "dict[str, frozenset[str]]" = {
 # themselves and appear in a reason under their own name.
 _PG_LOB_BASES_BY_TARGET_TYPE: "dict[str, frozenset[str]]" = {
     "bytea": frozenset({"bytea"}),
-    "text": frozenset({"text", "character varying", "character"}),
+    "text": frozenset(
+        {"text", "character varying", "varchar", "character", "char", "bpchar"}
+    ),
     "jsonb": frozenset({"jsonb"}),
     "json": frozenset({"json"}),
 }
@@ -1401,11 +1403,84 @@ def preselect_lob_columns_for_reason(
         if target_type not in lowered:
             continue
         for column, mysql_type in columns_with_types:
+            # The single source of truth decides whether this column can hold an oversized
+            # value at all, so the pre-tick can never disagree with the candidate offer. The
+            # bucket match alone strips the length modifier, so a bounded
+            # `character varying(50)` fell into the `text` bucket -- pre-ticking a column
+            # that CANNOT exceed 1 MiB, in a dialog whose confirm NULLs it for every row.
+            # Unreachable today only because the candidate list already excludes bounded
+            # types; keyed here so the two filters cannot drift apart, and so widening the
+            # core set later does not silently reopen the empty-pre-tick symptom.
+            if source_type is SourceType.POSTGRES and not is_pg_oversized_lob_type(
+                mysql_type or ""
+            ):
+                continue
             base = str(mysql_type or "").split("(")[0].strip().lower()
             if base in by_target[target_type] and column not in matched:
                 matched.append(column)
         break
     return tuple(matched)
+
+
+def session_source_type(session) -> SourceType:
+    """The session's source engine, falling back to the RESTORED hint, then MySQL.
+
+    A live ``source_config`` is the authority. But a restored snapshot that carried no
+    connection coordinates leaves it ``None`` while still knowing the engine, which
+    ``apply_session_snapshot`` records as ``restored_source_type`` -- so reading only
+    ``source_config`` sent every PG-aware surface back to the MySQL default right after a
+    restore: the pre-load LOB panel claimed "no oversized LOB columns" for a schema full of
+    text/bytea, the quarantine dialog pre-ticked nothing, and the watermark panel labelled
+    MySQL rows. ``ui/connect.py`` already consults that hint for the same reason; this makes
+    one helper of it so the next PG-aware call site cannot forget the second half.
+    """
+    live = getattr(getattr(session, "source_config", None), "source_type", None)
+    if live is not None:
+        return live
+    return getattr(session, "restored_source_type", None) or SourceType.MYSQL
+
+
+def make_lob_candidates_for(inventory, session):
+    """Build the post-quarantine LOB picker's candidate lookup for one session.
+
+    Module-level, not a closure inside the page builder, so it can be TESTED. It used to be
+    nested, which is what let the engine-unaware call inside it ship: every test of the
+    button injects a lambda for this callable, so no test ever ran the real body, and the
+    only guard left was an AST assertion that the ``source_type`` keyword appears -- which a
+    hard-coded ``SourceType.MYSQL`` would also satisfy. Closing over just ``inventory`` and
+    ``session`` made hoisting it a two-argument factory.
+
+    The picker needs the TYPES, not just the names: the quarantine reason names the DSQL
+    type (``bytea``/``text``) rather than the column, and the source type is what maps back
+    to it. :class:`LobExclusionCandidate` carries names only, so the types come from the
+    inventory here.
+    """
+
+    def lob_candidates_for(table_name: str):
+        if inventory is None:
+            return ()
+        table = next((t for t in inventory.tables if t.name == table_name), None)
+        if table is None:
+            return ()
+        allowed = {
+            c.table: set(c.columns)
+            # The engine MUST be passed: the parameter defaults to MySQL, whose type names
+            # (mediumtext/longblob/...) never match a PostgreSQL inventory's format_type
+            # spellings (text/bytea), so the set came back empty and the caller's "no
+            # candidates -> do not offer a dead button" early return hid the ONLY
+            # post-quarantine recovery action for every PostgreSQL migration.
+            for c in (
+                lob_exclusion_candidates(
+                    inventory, source_type=session_source_type(session)
+                )
+                or ()
+            )
+        }.get(table_name, set())
+        return tuple(
+            (col.name, col.mysql_type) for col in table.columns if col.name in allowed
+        )
+
+    return lob_candidates_for
 
 
 def scope_lob_candidates(

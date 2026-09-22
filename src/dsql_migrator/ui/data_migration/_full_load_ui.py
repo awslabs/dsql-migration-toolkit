@@ -41,6 +41,7 @@ from dsql_migrator.ui.data_migration._full_load_engine import (
     job_status_to_step_status,
 )
 from dsql_migrator.ui.data_migration._models import (
+    session_source_type,
     FullLoadCompleteness,
     preselect_lob_columns_for_reason,
     FullLoadTableRow,
@@ -885,9 +886,7 @@ def _render_full_load_step(
             lob_candidates_for=lob_candidates_for,
             exclude_lob_and_reload=exclude_lob_and_reload,
             exclude_lob_block_reason=exclude_lob_block_reason,
-            source_type=getattr(
-                getattr(session, "source_config", None), "source_type", None
-            ),
+            source_type=session_source_type(session),
             # Reload/Retry need a LIVE source+target (the source password is not restored
             # after a session restore, Property 7). connection_ready() reflects "verified
             # this session" -- unlike has_source(), which is True whenever the config is

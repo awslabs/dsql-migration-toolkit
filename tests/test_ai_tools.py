@@ -133,3 +133,47 @@ def test_new_diagnostic_tools_are_registered() -> None:
         "get_prerequisite_verdicts",
         "list_cdc_dlq_samples",
     } <= names
+
+
+def test_object_detail_finds_a_pg_routine_by_its_friendly_name() -> None:
+    """R-9: v0.1.493 put the identity ARGUMENTS into a PostgreSQL routine's inventory name so
+    overloads are distinguishable, and the lookup only accepted the full name or the last
+    dot-segment -- so the name an operator or the model actually says ('order_count', or
+    'app.order_count') matched nothing and the tool answered not_found for an object
+    Evaluation had just listed."""
+    from dsql_migrator.core.models import ObjectRef, ObjectType, SourceInventory
+
+    inventory = SourceInventory(
+        routines=[
+            ObjectRef(name="app.order_count()", object_type=ObjectType.FUNCTION),
+            ObjectRef(name="app.ovl(a integer)", object_type=ObjectType.FUNCTION),
+            ObjectRef(name="app.ovl(a text)", object_type=ObjectType.FUNCTION),
+        ]
+    )
+    execute = build_ai_tool_executor(
+        session_id="s1",
+        session_store=_Store(_Obj(target_config=None, target_verified=False,
+                                  source_config=None, source_password=None)),
+        evaluation_store=_Store(get_returns=_Obj(result=_Obj(inventory=inventory))),
+        schema_conversion_store=_Store(_Obj(generated_node_ids=[], apply_results=[])),
+        validation_store=_Store(_Obj(result=None)),
+        data_migration_store=_Store(_Obj(job_id=None, get_prereq_report=lambda _m: None)),
+        job_manager=_Obj(),
+        full_load_rate_eta=lambda *_a, **_k: (None, None),
+    )
+
+    def _name_for(asked: str):
+        payload = json.loads(
+            execute("get_source_object_detail", {"object_name": asked})
+        )
+        return payload.get("object_name"), payload.get("status")
+
+    # The friendly forms now resolve (to the first match).
+    assert _name_for("order_count") == ("app.order_count()", "ok")
+    assert _name_for("app.order_count") == ("app.order_count()", "ok")
+    assert _name_for("app.order_count()") == ("app.order_count()", "ok")
+    # A SIGNATURE asked for exactly still wins its own overload -- never a sibling.
+    assert _name_for("app.ovl(a text)") == ("app.ovl(a text)", "ok")
+    assert _name_for("app.ovl(a integer)") == ("app.ovl(a integer)", "ok")
+    # A genuinely absent object is still not_found.
+    assert _name_for("nope")[1] == "not_found"

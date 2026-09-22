@@ -195,7 +195,11 @@ def _is_unbounded_pg_character(mysql_type: str) -> bool:
     normalized = " ".join((mysql_type or "").strip().lower().split())
     if "(" in normalized:
         return False
-    return normalized in ("character varying", "varchar", "character", "char", "bpchar")
+    # ``character``/``char`` are deliberately absent: PostgreSQL renders a modifier-less
+    # char as ``character(1)`` (format_type always emits the length), so a bare spelling
+    # cannot arrive from a PG source -- and if it somehow did, treating a 1-character column
+    # as unbounded would be a false alarm. ``bpchar`` is the one bare unbounded spelling.
+    return normalized in ("character varying", "varchar", "bpchar")
 
 
 def is_pg_oversized_lob_type(mysql_type: str) -> bool:
@@ -1434,6 +1438,55 @@ def check_postgres_extensions(inventory: SourceInventory) -> list[AssessmentItem
     return [item.model_copy(update={"concerns": _single_concern(item)}) for item in items]
 
 
+def check_postgres_database_collation(inventory: SourceInventory) -> list[AssessmentItem]:
+    """Report a source DATABASE collation that Aurora DSQL does not match.
+
+    The per-COLUMN collation capture deliberately ignores the collation named ``default``,
+    because that is not a collation -- it is "this database's default" -- and flagging every
+    text column would be noise, and a false alarm when the source default already IS ``C``.
+    But that left the ORDINARY case invisible: on a stock RDS/Aurora PostgreSQL the database
+    collation is something like ``en_US.utf8`` and every text column inherits it, while
+    Aurora DSQL runs ``C``. Measured on a live cluster: DSQL reports
+    ``datcollate = 'C'``, so ``'Bob' < 'alice'`` is TRUE and ``ORDER BY`` yields
+    ``A, B, a, b``; the same query on ``en_US.utf8`` gives FALSE and ``a, A, b, B``.
+
+    So this is the DATABASE-level half of that capture, in one item rather than one per
+    column -- the same pairing shape as :func:`check_postgres_extensions`. ``C`` and
+    ``POSIX`` need no item: they are byte ordering, which is what the target does.
+
+    Equality and UNIQUE are NOT affected by a deterministic collation change (only ordering
+    and pattern/range behaviour), so the wording must not overstate it.
+    """
+    collation = (inventory.database_collation or "").strip()
+    if not collation or collation.upper() in ("C", "POSIX"):
+        return []
+    items = [
+        AssessmentItem(
+            object_name=collation,
+            rule_id="PG_DATABASE_COLLATION",
+            classification=Classification.MANUAL,
+            risk=(
+                f"The source database's default collation is {collation}; Aurora DSQL uses "
+                "C (byte ordering). Every text column that does not name its own collation "
+                "inherits this, so after cut over ORDER BY returns a DIFFERENT order and "
+                "range predicates (BETWEEN, <, >) change on mixed-case or accented data -- "
+                "while every row migrates exactly and every row count and checksum matches, "
+                "so nothing else flags it. Equality and UNIQUE enforcement are unchanged."
+            ),
+            recommendation=(
+                "Review the queries whose RESULT ORDER matters (paged listings, "
+                "'first/last by name', range filters on text) and the reports built on "
+                "them. Where the source order must be preserved, sort explicitly with a "
+                "COLLATE clause the target supports, or normalise the values (e.g. compare "
+                "and sort on lower(col)) with a matching expression index."
+            ),
+            effort=EffortLevel.MEDIUM,
+            kind=KIND_DATABASE.upper(),
+        )
+    ]
+    return [item.model_copy(update={"concerns": _single_concern(item)}) for item in items]
+
+
 def default_inventory_rules(
     source_type: SourceType = SourceType.MYSQL,
 ) -> list[InventoryRule]:
@@ -1447,7 +1500,11 @@ def default_inventory_rules(
     source. The table-count limit applies to every engine.
     """
     if source_type is SourceType.POSTGRES:
-        return [check_table_count, check_postgres_extensions]
+        return [
+            check_table_count,
+            check_postgres_extensions,
+            check_postgres_database_collation,
+        ]
     return [check_multiple_source_databases, check_table_count]
 
 

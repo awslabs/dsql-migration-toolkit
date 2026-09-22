@@ -2331,6 +2331,13 @@ def build_validation_screen(
                     inputs,
                     validator_factory=validator_factory,
                     should_cancel=lambda: bool(getattr(handle, "cancelled", False)),
+                    # The same liveness seam the full run passes. A re-check is typically
+                    # ONE large mismatched table -- the longest single-table scan in the
+                    # app, with no other statement in between -- so without a per-page beat
+                    # the job is silent for its whole duration and the stall watchdog reaps
+                    # it at 900 s, reporting a read-only comparison as a stalled LOAD while
+                    # the comparison itself completes.
+                    on_page=getattr(handle, "heartbeat", None),
                     deep_only_on_count_mismatch=False,
                 )
             except ValidationCancelled:

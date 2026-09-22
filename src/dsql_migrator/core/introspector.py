@@ -1005,6 +1005,7 @@ def _assemble_inventory(
         # Database-scoped, so read once rather than per schema. The extension's own
         # objects were filtered out above; this is what keeps the fact reportable.
         extensions=dialect.list_extensions(connection),
+        database_collation=dialect.database_collation(connection),
     )
 
 
@@ -1192,13 +1193,31 @@ def _pg_object_definition(connection, object_name: str, object_type: ObjectType)
 
     if object_type in (ObjectType.PROCEDURE, ObjectType.FUNCTION, ObjectType.ROUTINE):
         # pg_get_functiondef covers both functions (prokind 'f') and procedures ('p').
+        #
+        # Matched against the SAME four renderings a name can arrive in, rather than by
+        # splitting on "." and comparing ``proname``: the inventory now carries the identity
+        # ARGUMENTS (``schema.name(a integer)``) so overloads are distinguishable, and the
+        # old ``proname = :name`` could never match that -- every PostgreSQL routine's body
+        # came back empty, with the caller blaming a dropped object or a missing privilege.
+        # Dot-splitting is wrong for a second reason: a schema-qualified ARGUMENT type
+        # (``app.f(a app.hstore)``) has three dots' worth of parts.
+        #
+        # Comparing the whole string also keeps an overload asked for BY SIGNATURE resolving
+        # to its own body; truncating at "(" instead would return an arbitrary overload.
+        # ``to_regprocedure`` is not usable here -- it raises on an identity-argument string
+        # that carries argument names or IN/OUT modes, which these do.
         sql = (
             "SELECT pg_get_functiondef(p.oid) FROM pg_proc p "
-            "JOIN pg_namespace n ON n.oid = p.pronamespace WHERE p.proname = :name"
-            + (" AND n.nspname = :schema" if schema else "")
-            + " LIMIT 1"
+            "JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE CAST(:full AS text) IN ("
+            "  p.proname,"
+            "  n.nspname || '.' || p.proname,"
+            "  p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')',"
+            "  n.nspname || '.' || p.proname"
+            "    || '(' || pg_get_function_identity_arguments(p.oid) || ')')"
+            " ORDER BY p.oid LIMIT 1"
         )
-        return _one(sql, name=name, **({"schema": schema} if schema else {}))
+        return _one(sql, full=object_name)
     if object_type is ObjectType.TRIGGER:
         sql = (
             "SELECT pg_get_triggerdef(t.oid) FROM pg_trigger t "

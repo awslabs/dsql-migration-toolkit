@@ -423,10 +423,24 @@ def build_ai_tool_executor(
                     )
                 _key = _obj.lower()
                 _tail = _key.rsplit(".", 1)[-1]
+                # A PostgreSQL routine's inventory name now carries its identity ARGUMENTS
+                # (``app.fn(a integer)``) so overloads are distinguishable. Without the
+                # signature-tolerant arm below, the friendly name an operator or the model
+                # actually says -- ``fn``, or ``app.fn`` -- matched nothing and the tool
+                # answered not_found for an object Evaluation had just listed.
+                _key_base = _key.split("(", 1)[0]
+                _tail_base = _key_base.rsplit(".", 1)[-1]
 
                 def _matches(_n: str) -> bool:
                     _nl = _n.lower()
-                    return _nl == _key or _nl.rsplit(".", 1)[-1] == _tail
+                    if _nl == _key or _nl.rsplit(".", 1)[-1] == _tail:
+                        return True
+                    # A SIGNATURE was supplied: match it exactly, so asking for one overload
+                    # never resolves to another.
+                    if _key != _key_base:
+                        return False
+                    _n_base = _nl.split("(", 1)[0]
+                    return _n_base == _key_base or _n_base.rsplit(".", 1)[-1] == _tail_base
 
                 _t = next((t for t in _inv.tables if _matches(t.name)), None)
                 if _t is None:

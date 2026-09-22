@@ -1244,7 +1244,8 @@ class Validator:
             source_engine.dispose()
 
         drift = _build_drift(
-            watermark, current_gtid, current_binlog_file, current_binlog_position
+            watermark, current_gtid, current_binlog_file, current_binlog_position,
+            source_is_postgres=_source_is_postgres(source_dialect),
         )
         snapshot_timestamp = (
             watermark.snapshot_timestamp if watermark is not None else None
@@ -1338,7 +1339,8 @@ class Validator:
             self._read_source_position(source)
         )
         drift = _build_drift(
-            watermark, current_gtid, current_binlog_file, current_binlog_position
+            watermark, current_gtid, current_binlog_file, current_binlog_position,
+            source_is_postgres=source.source_type is SourceType.POSTGRES,
         )
         snapshot_timestamp = (
             watermark.snapshot_timestamp if watermark is not None else None
@@ -1807,6 +1809,8 @@ def _build_drift(
     current_gtid: Optional[str],
     current_binlog_file: Optional[str] = None,
     current_binlog_position: Optional[int] = None,
+    *,
+    source_is_postgres: bool = False,
 ) -> Optional[DriftReport]:
     """Build a drift report from the watermark and the source's current position.
 
@@ -1874,9 +1878,24 @@ def _build_drift(
         watermark_gtid=watermark_gtid,
         current_gtid=current_gtid,
         drifted=False,
+        # ``source_is_postgres`` only words the undeterminable case. The summary line was
+        # made engine-neutral earlier, but THIS is the text a PostgreSQL operator reads on
+        # the sign-off report and in the screen's technical detail -- and it explained the
+        # verdict with two coordinates their database does not have, so it read as a
+        # malfunction rather than a deliberate abstention.
         detail=(
-            "Neither a GTID nor a binlog position was available on both sides, so "
-            "drift since the snapshot could not be determined."
+            (
+                "A PostgreSQL source has no GTID or binlog position, and drift by WAL LSN "
+                "is deliberately not computed: an idle PostgreSQL source advances its LSN "
+                "on its own (autovacuum, checkpoints, logical-decoding bookkeeping), so "
+                "that comparison would report drift on a source nobody wrote to. Freeze "
+                "writes before cut over and confirm quiescence on the source."
+            )
+            if source_is_postgres
+            else (
+                "Neither a GTID nor a binlog position was available on both sides, so "
+                "drift since the snapshot could not be determined."
+            )
         ),
         basis="",
         watermark_binlog=watermark_binlog,

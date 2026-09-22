@@ -150,6 +150,16 @@ class ColumnDef(BaseModel):
             "PostgreSQL GENERATED ALWAYS AS (...) STORED column."
         ),
     )
+    identity: bool = Field(
+        default=False,
+        description=(
+            "True for a PostgreSQL GENERATED {ALWAYS|BY DEFAULT} AS IDENTITY column "
+            "(pg_attribute.attidentity in 'a'/'d'). Needed as its OWN flag because such a "
+            "column has NO pg_attrdef default at all -- so the serial/nextval spelling "
+            "cannot stand in for it, and keying value-generation checks on ``default`` "
+            "alone silently missed the PG10+ RECOMMENDED spelling."
+        ),
+    )
     auto_update_timestamp: bool = Field(
         default=False,
         description="True when the column uses ON UPDATE CURRENT_TIMESTAMP.",
@@ -414,6 +424,12 @@ class SourceInventory(BaseModel):
     # real incompatibility: the signal is kept, in one line per extension instead of N per
     # object. Empty for MySQL and for a PostgreSQL source with no extensions.
     extensions: list[str] = Field(default_factory=list)
+    # The SOURCE database's default collation (PostgreSQL ``datcollate``), when readable.
+    # Database-scoped like ``extensions``. Aurora DSQL runs ``C``, so any other value means
+    # every text column that inherits the default sorts and compares differently on the
+    # target -- a change no per-column capture can see, because such a column's collation is
+    # literally named ``default``. None for MySQL and when it could not be read.
+    database_collation: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

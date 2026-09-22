@@ -928,7 +928,14 @@ def test_pg_check_constraint_note_prints_the_expression_and_the_alter() -> None:
     conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
     note = next(w for w in conv.warnings if "CHECK constraint" in w.message)
     assert "price > 0::numeric" in note.message  # the expression itself
-    assert "ADD CONSTRAINT orders_price_check CHECK (price > 0::numeric) NOT VALID" in note.message
+    # Identifiers are QUOTED: this statement is the only in-tool route to re-creating the
+    # dropped CHECK, so an unquoted mixed-case or spaced name would make the remedy itself
+    # a syntax error.
+    assert (
+        'ADD CONSTRAINT "orders_price_check" CHECK (price > 0::numeric) NOT VALID'
+        in note.message
+    )
+    assert 'ALTER TABLE "shop"."orders"' in note.message
     assert "MySQL" not in note.message  # a PG source is not told about MySQL
     assert "shown in Evaluation" not in note.message  # the old, untrue pointer
     # The CHECK is still not emitted inline: DSQL rejects a plain ADD, and the load is
@@ -1048,3 +1055,51 @@ def test_mysql_oversized_lob_note_is_unchanged_for_a_mysql_source() -> None:
     assert "are MySQL LOB/TEXT types" in note.message
     # And the PG variant does not also fire for a MySQL source.
     assert sum(1 for w in conv.warnings if "1 MiB per-value" in w.message) == 1
+
+
+def test_non_pk_generated_as_identity_is_reported_not_only_serial() -> None:
+    """R-4: the v0.1.492 fix keyed on a `nextval(` DEFAULT, but a PG10+
+    `GENERATED ... AS IDENTITY` column has NO pg_attrdef default at all -- so the RECOMMENDED
+    spelling still lost its value generation silently while only the legacy `serial` was
+    covered."""
+    table = TableDef(
+        name="shop.invoices",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False, identity=True),
+            ColumnDef(
+                name="invoice_no", mysql_type="integer", nullable=False, identity=True
+            ),
+            ColumnDef(
+                name="legacy_no", mysql_type="bigint", nullable=False,
+                default="nextval('invoices_legacy_no_seq'::regclass)",
+            ),
+        ],
+        primary_key=["id"],
+        auto_increment_column="id",
+    )
+    conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    notes = [w for w in conv.warnings if "sequence" in w.message]
+    # BOTH non-key spellings are reported; the identity PRIMARY KEY stays silent (the PK
+    # strategy governs it).
+    assert sorted(n.column_name for n in notes) == ["invoice_no", "legacy_no"]
+    assert "nextval" not in conv.target_ddl
+
+
+def test_pg_oversized_lob_is_advice_not_per_table_manual_work() -> None:
+    """R-5: `text` is PostgreSQL's IDIOMATIC string type, so rating each such table MANUAL
+    made a plain schema read "Moderate effort" purely because a column has no length limit,
+    with no evidence any value approaches 1 MiB -- the same unusable-signal shape this
+    release fixed for extension objects."""
+    from dsql_migrator.core.assessor_postgres import PgOversizedLobRule
+    from dsql_migrator.core.models import ConversionNoteKind, SourceInventory
+
+    table = TableDef(
+        name="shop.orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint"),
+            ColumnDef(name="notes", mysql_type="text"),
+        ],
+        primary_key=["id"],
+    )
+    finding = PgOversizedLobRule().evaluate(SourceInventory(tables=[table]))[0]
+    assert finding.note_kind is ConversionNoteKind.RECOMMENDATION

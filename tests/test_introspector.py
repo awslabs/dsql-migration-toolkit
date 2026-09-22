@@ -1168,3 +1168,54 @@ def test_single_database_mode_leaves_a_cross_schema_fk_parent_alone() -> None:
     )
     orders = next(t for t in inventory.tables if t.name == "shop.orders")
     assert orders.foreign_keys[0].referenced_table == "billing.customers"
+
+
+def test_pg_routine_definition_matches_the_signature_bearing_name() -> None:
+    """R-2: v0.1.493 put the identity ARGUMENTS into a routine's inventory name so overloads
+    are distinguishable, but the definition lookup still matched ``proname = :name`` -- so
+    ``order_count()`` could never match and EVERY PostgreSQL routine's body came back empty,
+    with the caller blaming a dropped object or a missing privilege. Splitting on "." was
+    wrong for a second reason: a schema-qualified ARGUMENT type has three parts."""
+    from dsql_migrator.core.introspector import _pg_object_definition
+    from dsql_migrator.core.models import ObjectType
+
+    asked: list[dict] = []
+
+    class _Row:
+        def __init__(self, value):
+            self._value = value
+
+        def __getitem__(self, index):
+            return self._value
+
+    class _Result:
+        def __init__(self, value):
+            self._value = value
+
+        def first(self):
+            return _Row(self._value) if self._value else None
+
+    class _Conn:
+        """Answers only when the bound parameter is one of the four real renderings."""
+
+        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+            params = parameters or {}
+            asked.append(params)
+            known = {
+                "order_count",
+                "app.order_count",
+                "order_count()",
+                "app.order_count()",
+            }
+            return _Result(
+                "CREATE FUNCTION app.order_count() ..."
+                if params.get("full") in known
+                else None
+            )
+
+    for name in ("app.order_count()", "order_count()", "app.order_count"):
+        assert _pg_object_definition(_Conn(), name, ObjectType.FUNCTION), name
+    # The whole string is bound -- never a dot-split fragment, which is what broke a
+    # schema-qualified argument type.
+    assert all("name" not in p for p in asked)
+    assert asked[0]["full"] == "app.order_count()"

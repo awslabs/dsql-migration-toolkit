@@ -206,6 +206,19 @@ class SourceDialect(ABC):
         offer -- is unaffected.
         """
 
+    def database_collation(self, connection: object) -> "Optional[str]":
+        """The DATABASE-level default collation, or ``None`` when the engine has no such
+        concept / it cannot be read.
+
+        Database-scoped, so read ONCE per introspection. Needed because the per-COLUMN
+        collation capture deliberately ignores the collation literally named ``default`` --
+        that is not a collation, it is "whatever this database's default is" -- which means
+        the ordinary case, where every text column inherits a non-C database collation, was
+        invisible. Aurora DSQL runs ``C``, so on a stock ``en_US.utf8`` source every text
+        column's ORDER BY and range comparison changes after cut over.
+        """
+        return None
+
     def list_extensions(self, connection: object) -> "list[str]":
         """Installed EXTENSIONs as ``"name (schema)"``; empty when the engine has none.
 

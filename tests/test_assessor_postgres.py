@@ -458,3 +458,45 @@ def test_a_pg_source_with_an_extension_no_longer_reads_as_significant_effort() -
     rule_ids = [item.rule_id for item in report.items]
     assert rule_ids.count("PG_EXTENSION_UNSUPPORTED") == 1
     assert "PROC_PLPGSQL" not in rule_ids  # no phantom routines
+
+
+def test_pg_database_collation_finding_covers_what_the_column_capture_cannot() -> None:
+    """S-1: the per-column capture ignores the collation named ``default`` -- which is not a
+    collation but "this database's default" -- so the ORDINARY case was invisible: a stock
+    en_US.utf8 source whose every text column inherits it, migrating onto a DSQL target that
+    runs C. Measured on a live cluster: DSQL datcollate='C' gives 'Bob' < 'alice' TRUE and
+    order A,B,a,b; en_US.utf8 gives FALSE and a,A,b,B."""
+    from dsql_migrator.core.assessor import (
+        check_postgres_database_collation,
+        default_inventory_rules,
+    )
+    from dsql_migrator.core.models import Classification, EffortLevel
+
+    assert check_postgres_database_collation in default_inventory_rules(
+        SourceType.POSTGRES
+    )
+    assert check_postgres_database_collation not in default_inventory_rules(
+        SourceType.MYSQL
+    )
+
+    items = check_postgres_database_collation(
+        SourceInventory(tables=[], database_collation="en_US.utf8")
+    )
+    assert len(items) == 1
+    item = items[0]
+    assert item.rule_id == "PG_DATABASE_COLLATION"
+    assert item.classification is Classification.MANUAL
+    assert item.effort is EffortLevel.MEDIUM
+    assert "en_US.utf8" in item.risk
+    assert "ORDER BY" in item.risk
+    # Must NOT overstate it: a deterministic collation change moves ordering and range
+    # behaviour, not equality or UNIQUE.
+    assert "Equality and UNIQUE enforcement are unchanged" in item.risk
+
+    # C / POSIX is byte ordering -- what the target already does, so no item.
+    for same in ("C", "POSIX", "c"):
+        assert check_postgres_database_collation(
+            SourceInventory(tables=[], database_collation=same)
+        ) == []
+    # Unreadable / MySQL -> no item.
+    assert check_postgres_database_collation(SourceInventory(tables=[])) == []

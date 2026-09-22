@@ -23003,43 +23003,81 @@ def test_format_watermark_trusts_the_known_engine_over_an_absent_lsn() -> None:
     assert format_watermark(with_lsn).is_postgres is True
 
 
-def test_quarantine_recovery_call_site_passes_the_source_engine() -> None:
-    """A/B3: the post-quarantine "Exclude column & reload" button's candidate list came from
-    `lob_exclusion_candidates(inventory)` with NO `source_type`, so it defaulted to MySQL,
-    matched MySQL type names against a PostgreSQL inventory, returned nothing, and
-    `_quar_exclude_reload`'s "no candidates -> do not offer a dead button" early return hid
-    the ONLY post-load recovery route for every PostgreSQL migration.
+def test_quarantine_recovery_offers_the_button_and_preticks_for_a_pg_source() -> None:
+    """A/B3 + P-4 through the REAL body, not a lambda.
 
-    Asserted on the CALL SITE by AST. A behavioural test cannot reach it: the helper is a
-    closure inside `build_data_migration_screen`, and every existing test of this button
-    injects `lob_candidates_for` as a lambda -- bypassing the closure entirely, which is
-    exactly why the defect survived (one of them even pins "empty -> no button")."""
-    import ast
-    import pathlib
+    This replaces an AST test that only asserted the ``source_type`` KEYWORD appears at the
+    call site -- which a hard-coded ``source_type=SourceType.MYSQL`` would also satisfy, and
+    which guarded neither of the two links that actually matter. A behavioural test was
+    written off as impossible because the helper was a closure inside the page builder; the
+    honest fix was to stop making it a closure, so ``make_lob_candidates_for`` is now a
+    module-level factory and the shipped body runs here.
 
-    source = pathlib.Path(
-        "src/dsql_migrator/ui/data_migration/__init__.py"
-    ).read_text(encoding="utf-8")
-    tree = ast.parse(source)
+    Every other test of this button injects a lambda for ``lob_candidates_for``, bypassing
+    that body -- which is exactly how the engine-unaware call inside it shipped.
+    """
+    from dsql_migrator.core.models import (
+        ColumnDef,
+        SourceConnectionConfig,
+        SourceInventory,
+        SourceType,
+        TableDef,
+    )
+    from dsql_migrator.ui.data_migration._models import (
+        make_lob_candidates_for,
+        preselect_lob_columns_for_reason,
+        session_source_type,
+    )
 
-    closures = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "lob_candidates_for"
-    ]
-    assert len(closures) == 1, "expected exactly one lob_candidates_for closure"
+    inventory = SourceInventory(
+        tables=[
+            TableDef(
+                name="shop.product_media",
+                columns=[
+                    ColumnDef(name="id", mysql_type="bigint"),
+                    ColumnDef(name="content", mysql_type="bytea"),
+                    ColumnDef(name="caption", mysql_type="character varying(200)"),
+                ],
+                primary_key=["id"],
+            )
+        ]
+    )
 
-    calls = [
-        node
-        for node in ast.walk(closures[0])
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "lob_exclusion_candidates"
-    ]
-    assert len(calls) == 1, "expected one lob_exclusion_candidates call in the closure"
-    assert "source_type" in {kw.arg for kw in calls[0].keywords}, (
-        "lob_candidates_for must pass source_type; the parameter defaults to MySQL and "
-        "a PostgreSQL inventory then yields no candidates, hiding the recovery button"
+    class _Session:
+        def __init__(self, source_type):
+            self.source_config = (
+                None
+                if source_type is None
+                else SourceConnectionConfig(
+                    source_type=source_type, host="h", port=5432, database="app"
+                )
+            )
+
+    reason = "datatype limit greater than 1048576 bytes not supported for bytea"
+
+    # PostgreSQL: the button gets candidates (so it renders) AND the bytea column is
+    # pre-ticked (so the recovery is one confirm).
+    pg = make_lob_candidates_for(inventory, _Session(SourceType.POSTGRES))
+    columns = pg("shop.product_media")
+    assert columns == (("content", "bytea"),)
+    assert preselect_lob_columns_for_reason(
+        columns, reason, source_type=session_source_type(_Session(SourceType.POSTGRES))
+    ) == ("content",)
+
+    # MySQL is unaffected: a PG inventory yields nothing under the MySQL type names, which
+    # is the correct answer for a MySQL session and the behaviour the default preserves.
+    assert make_lob_candidates_for(inventory, _Session(SourceType.MYSQL))(
+        "shop.product_media"
+    ) == ()
+
+    # A RESTORED session whose snapshot carried no connection coordinates still knows the
+    # engine, so the PG behaviour must survive it (S-2).
+    class _Restored:
+        source_config = None
+        restored_source_type = SourceType.POSTGRES
+
+    assert make_lob_candidates_for(inventory, _Restored())("shop.product_media") == (
+        ("content", "bytea"),
     )
 
 

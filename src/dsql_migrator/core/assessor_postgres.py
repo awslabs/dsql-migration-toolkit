@@ -250,6 +250,15 @@ class PgOversizedLobRule(Rule):
                         "size, so a highly compressible document may still fit."
                     ),
                     effort=EffortLevel.MEDIUM,
+                    # A RECOMMENDATION, not a loss -- the same calibration as
+                    # PgIdentityKeyRule below. ``text`` is PostgreSQL's IDIOMATIC string
+                    # type, so this condition holds for most real schemas, and rating each
+                    # such table MANUAL made a one-table database read "Moderate effort"
+                    # purely because a column has no length limit, with no evidence any
+                    # value approaches 1 MiB. That is the same unusable-signal failure this
+                    # release fixed for extension objects: something to CHECK, stated once
+                    # per table, not per-table manual work.
+                    note_kind=ConversionNoteKind.RECOMMENDATION,
                 )
             )
         return findings

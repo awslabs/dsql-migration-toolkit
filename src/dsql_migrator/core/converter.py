@@ -3156,8 +3156,13 @@ def _check_constraint_warning(
         f"{ck.name}: CHECK ({ck.expression})" if ck.expression else ck.name
         for ck in table.check_constraints
     )
+    # Identifiers are QUOTED. This statement is the only in-tool route to re-creating the
+    # dropped CHECK, so an unquoted mixed-case or spaced name made the remedy itself a
+    # syntax error for exactly the tables that need it most -- while the CREATE TABLE beside
+    # it quoted correctly. Same helpers the foreign-key DDL uses.
     alters = " ".join(
-        f"ALTER TABLE {table.name} ADD CONSTRAINT {ck.name} "
+        f"ALTER TABLE {_quote_pg_qualified(table.name)} "
+        f"ADD CONSTRAINT {_quote_pg_identifier(ck.name)} "
         f"CHECK ({ck.expression}) NOT VALID;"
         for ck in table.check_constraints
         if ck.expression

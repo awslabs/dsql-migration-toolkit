@@ -128,6 +128,18 @@ class _FakePgMappings:
     def mappings(self) -> list[dict]:
         return self._rows
 
+    def first(self):  # noqa: ANN201
+        """The first row POSITIONALLY, like SQLAlchemy's ``Result.first()``.
+
+        Needed by the single-value catalog probes (``database_collation``), which index the
+        row by position rather than taking ``.mappings()``. Without it those probes hit
+        their own best-effort ``except`` and silently returned None in tests -- which would
+        have made a probe test pass for the wrong reason.
+        """
+        if not self._rows:
+            return None
+        return tuple(self._rows[0].values())
+
 
 class _FakePgConnection:
     """A connection whose dialect is PostgreSQL, returning canned rows for ONE query kind.
@@ -1119,7 +1131,8 @@ def test_every_pg_discovery_query_carries_the_extension_filter() -> None:
     PostgresSourceDialect().list_schemas(conn)
 
     assert len(seen) == 4
-    for sql in seen:
+    routines_sql, triggers_sql, relations_sql, schemas_sql = seen
+    for sql in (routines_sql, triggers_sql, relations_sql):
         assert "pg_depend" in sql, sql
         assert "deptype = 'e'" in sql, sql
         # classid is REQUIRED: pg_depend.objid "references any OID column", so an object is
@@ -1128,7 +1141,13 @@ def test_every_pg_discovery_query_carries_the_extension_filter() -> None:
         # finding, strictly worse than the over-reporting being fixed.
         assert "d.classid" in sql, sql
 
-    routines_sql, triggers_sql, relations_sql, schemas_sql = seen
+    # list_schemas deliberately does NOT filter, and must not start: a schema is a
+    # CONTAINER, so excluding an extension-created one also excludes whatever the USER put
+    # inside it (PostGIS's tiger_data holds the loader's tables). That silently removed a
+    # user table from Evaluation, Full Load and Validation with no finding -- the very
+    # MISSING-over-over-reporting failure the classid assertion above guards against. The
+    # per-object filters already empty such a schema of the extension's own objects.
+    assert "pg_depend" not in schemas_sql, schemas_sql
     assert "d.objid = p.oid" in routines_sql
     # A TRIGGER is filtered by its TABLE, not by itself: a trigger created by an
     # extension's install script is NOT recorded as an extension member (verified against a
@@ -1139,7 +1158,6 @@ def test_every_pg_discovery_query_carries_the_extension_filter() -> None:
     assert "'pg_trigger'" not in triggers_sql
     assert "'pg_class'::regclass" in triggers_sql and "d.objid = c.oid" in triggers_sql
     assert "'pg_class'::regclass" in relations_sql and "d.objid = c.oid" in relations_sql
-    assert "'pg_namespace'::regclass" in schemas_sql and "d.objid = n.oid" in schemas_sql
 
 
 def test_routine_names_carry_the_signature_so_overloads_are_distinguishable() -> None:
@@ -1259,3 +1277,80 @@ def test_mysql_dialect_reports_no_extensions() -> None:
     from dsql_migrator.core.source_dialect import MySQLSourceDialect
 
     assert MySQLSourceDialect().list_extensions(object()) == []
+
+
+def test_user_objects_in_an_extension_created_schema_survive() -> None:
+    """R-1: the schema-level exclusion shipped in v0.1.493 was strictly COARSER than the
+    per-object ones it was meant to back up. A schema is a CONTAINER, so excluding an
+    extension-created one also excluded whatever the USER put inside it (PostGIS's tiger_data
+    holds the loader's tables) -- that table vanished from Evaluation, could not be listed
+    for Full Load, and Validation reported MATCH over a set that silently excluded it. The
+    repo's own rule, that a MISSING finding is worse than an over-reported one, condemns it."""
+    from dsql_migrator.core.source_dialect.postgres import PostgresSourceDialect
+
+    captured: dict[str, str] = {}
+
+    class _Recorder(_DispatchPgConnection):
+        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+            captured["sql"] = " ".join(str(statement).split())
+            return super().execute(statement, parameters)
+
+    schemas = PostgresSourceDialect().list_schemas(
+        _Recorder({"NOT LIKE": lambda _p: [
+            {"nspname": "public"},
+            {"nspname": "tiger_data"},  # created by an extension, holds user tables
+        ]})
+    )
+    assert schemas == ["public", "tiger_data"]
+    # The query must not filter by extension membership at all.
+    assert "pg_depend" not in captured["sql"], captured["sql"]
+
+
+def test_database_collation_is_captured_for_a_pg_source() -> None:
+    """S-1: the per-column capture ignores the collation named ``default`` (it is not a
+    collation, it is "this database's default"), which hid the ORDINARY case -- a stock
+    en_US.utf8 source whose every text column inherits it, against a DSQL target running C.
+    Measured live: DSQL datcollate='C' ('Bob' < 'alice' TRUE, order A,B,a,b) vs en_US.utf8
+    (FALSE, order a,A,b,B)."""
+    from dsql_migrator.core.source_dialect import MySQLSourceDialect
+    from dsql_migrator.core.source_dialect.postgres import PostgresSourceDialect
+
+    conn = _DispatchPgConnection({"datcollate": lambda _p: [{"datcollate": "en_US.utf8"}]})
+    assert PostgresSourceDialect().database_collation(conn) == "en_US.utf8"
+    # MySQL has no such concept.
+    assert MySQLSourceDialect().database_collation(object()) is None
+    # Unreadable -> None, never an exception: this feeds a report line, not the migration.
+    class _Boom(_DispatchPgConnection):
+        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+            raise RuntimeError("no privilege")
+
+    assert PostgresSourceDialect().database_collation(_Boom({})) is None
+
+
+def test_non_pk_identity_column_is_recorded_for_every_column() -> None:
+    """R-4: a PG identity column has NO pg_attrdef default, so a value-generation check keyed
+    on ``default`` could not see it -- only the legacy serial/nextval spelling was covered,
+    and the PG10+ RECOMMENDED spelling lost its generation silently. attidentity was read
+    only for the PK column."""
+    from dsql_migrator.core.models import ColumnDef, TableDef
+    from dsql_migrator.core.source_dialect.postgres import _pg_enrich_columns
+
+    table = TableDef(
+        name="orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint"),
+            ColumnDef(name="invoice_no", mysql_type="integer"),
+            ColumnDef(name="note", mysql_type="text"),
+        ],
+        primary_key=["id"],
+    )
+    conn = _DispatchPgConnection({"pg_attribute": lambda _p: [
+        {"col": "id", "typ": "bigint", "gen": "", "ident": "d", "coll": None},
+        {"col": "invoice_no", "typ": "integer", "gen": "", "ident": "a", "coll": None},
+        {"col": "note", "typ": "text", "gen": "", "ident": "", "coll": None},
+    ]})
+    _pg_enrich_columns(conn, "app", [table])
+    by_name = {c.name: c for c in table.columns}
+    assert by_name["id"].identity is True
+    assert by_name["invoice_no"].identity is True  # NON-key: the case that was invisible
+    assert by_name["note"].identity is False

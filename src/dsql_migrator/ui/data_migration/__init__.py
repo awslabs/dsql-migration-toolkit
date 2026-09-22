@@ -220,6 +220,8 @@ from dsql_migrator.ui.data_migration._models import (
     format_watermark,
     LobExclusionCandidate,
     lob_exclusion_candidates,
+    make_lob_candidates_for,
+    session_source_type,
     scope_lob_candidates,
     format_column_exclude_list,
     _DSQL_VALUE_LIMIT_MIB,
@@ -1115,11 +1117,7 @@ def build_data_migration_screen(
                     lock_reason=_lob_reason or selection_lock,
                     migration_wide=True,
                     selected_tables=selected_names,
-                    source_type=getattr(
-                        getattr(session, "source_config", None),
-                        "source_type",
-                        SourceType.MYSQL,
-                    ),
+                    source_type=session_source_type(session),
                 )
             # A Full Load that already ran (live job, or the step reached DONE --
             # both survive a session restore) is proof its prerequisites passed at
@@ -1383,47 +1381,10 @@ def build_data_migration_screen(
                 # previously-quarantined row now loads. Reuses the scoped retry path.
                 _run_retry_for([table_name])
 
-            def lob_candidates_for(table_name: str):
-                """Return this table's oversized-LOB columns as ``(name, mysql_type)``.
-
-                The picker needs the TYPES, not just the names: the quarantine reason
-                names the DSQL type (``bytea``/``text``) rather than the column, and the
-                source type is what maps back to it. ``LobExclusionCandidate`` carries
-                names only, so the types come from the inventory here.
-                """
-                if inventory is None:
-                    return ()
-                table = next(
-                    (t for t in inventory.tables if t.name == table_name), None
-                )
-                if table is None:
-                    return ()
-                allowed = {
-                    c.table: set(c.columns)
-                    # The engine MUST be passed: the parameter defaults to MySQL, whose
-                    # type names (mediumtext/longblob/...) never match a PostgreSQL
-                    # inventory's format_type spellings (text/bytea), so the set came back
-                    # empty and _quar_exclude_reload's "no candidates -> do not offer a
-                    # dead button" early return hid the ONLY post-quarantine recovery
-                    # action for every PostgreSQL migration. Same expression as the
-                    # pre-load panel's call above.
-                    for c in (
-                        lob_exclusion_candidates(
-                            inventory,
-                            source_type=getattr(
-                                getattr(session, "source_config", None),
-                                "source_type",
-                                SourceType.MYSQL,
-                            ),
-                        )
-                        or ()
-                    )
-                }.get(table_name, set())
-                return tuple(
-                    (col.name, col.mysql_type)
-                    for col in table.columns
-                    if col.name in allowed
-                )
+            # Built by a module-level factory so the real body is TESTABLE: as a
+            # closure it was unreachable from any test, which is how an engine-unaware
+            # call inside it shipped.
+            lob_candidates_for = make_lob_candidates_for(inventory, session)
 
             def exclude_lob_and_reload(table_name: str, columns: Sequence[str]) -> None:
                 """Exclude oversized-LOB column(s) AND reload the table, as ONE action.
