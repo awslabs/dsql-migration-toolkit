@@ -772,8 +772,9 @@ def build_connect_page(
         def _db_field_hint(source_type: SourceType) -> str:
             if source_type is SourceType.POSTGRES:
                 return (
-                    'hint="PostgreSQL connects to ONE database -- enter its name '
-                    "(blank uses the role's default database).\""
+                    'hint="PostgreSQL connects to ONE database -- enter the DATABASE '
+                    "name, not a schema name (blank uses the role's default "
+                    'database)."'
                 )
             return (
                 'hint="Empty assesses the whole cluster; set it to scope to a '

@@ -219,6 +219,19 @@ class SourceDialect(ABC):
         """
         return None
 
+    def sibling_databases(self, connection: object) -> "list[str]":
+        """Other databases on the same server, for a "wrong database?" hint. Empty default.
+
+        Only meaningful where a connection is scoped to ONE database, which for the sources
+        this tool supports means PostgreSQL: MySQL assesses the whole cluster when the
+        Database field is blank, so it has no equivalent trap. A PostgreSQL operator who
+        enters the wrong name -- easiest with Aurora, which always provides an empty
+        ``postgres`` database alongside theirs, and easiest of all when the database and the
+        schema share a name -- gets a clean run over zero tables with nothing pointing at
+        the cause. Naming the alternatives turns that dead end into one obvious next step.
+        """
+        return []
+
     def list_extensions(self, connection: object) -> "list[str]":
         """Installed EXTENSIONs as ``"name (schema)"``; empty when the engine has none.
 
@@ -260,8 +273,15 @@ class SourceDialect(ABC):
         """Base type names whose LEADING PK column is range-shardable (integers)."""
 
     @abstractmethod
-    def select_column_sql(self, column: object) -> str:
+    def select_column_sql(
+        self, column: object, *, target_type: Optional[str] = None
+    ) -> str:
         """SELECT-list expression to read one source column (quoted, engine-specific).
+
+        ``target_type`` is the APPLIED target column type when it is known and differs
+        from the source's -- the operator may have remodelled a DSQL-unsupported type in
+        Schema Conversion, on the tool's own advice, and the read has to produce something
+        the new column can accept. ``None`` means "read it as itself".
 
         MySQL wraps a spatial column as ``ST_AsBinary(col) AS col`` (WKB bytes,
         matching what Debezium delivers) so it can migrate to ``bytea``; an ordinary

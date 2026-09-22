@@ -207,7 +207,9 @@ def _render_watermark(ui: object, job: MigrationJob, source_type=None) -> None:
                         )
                         # Monospace, matching the coordinate values -- a column of counts
                         # then lines up on the digits and is comparable at a glance.
-                        ui.label(f"{rows_count:,}").classes(  # type: ignore[attr-defined]
+                        # ``_abbrev_count`` renders an UNKNOWN estimate (None, e.g. a
+                        # never-analyzed PostgreSQL table) as an em dash rather than 0.
+                        ui.label(_abbrev_count(rows_count)).classes(  # type: ignore[attr-defined]
                             "text-xs font-mono text-gray-800"
                         )
 
@@ -1486,7 +1488,8 @@ def _quarantined_cell_tooltip(row: "FullLoadTableRow") -> str:
         f"{dropped:,} {noun} permanently dropped — a value Aurora DSQL could not "
         "store (e.g. over its ~1 MiB per-value limit). The rest of this table loaded "
         "normally. See the quarantine panel below for each row's primary key and "
-        "reason; fix the source value and Reload this table to close the gap."
+        "reason; either reduce the source value and Reload this table, or use "
+        "\"Exclude column & reload\" if the value is legitimately too large to store."
     )
 
 
@@ -2568,9 +2571,10 @@ def _render_completeness_banner(
         )
     elif completeness.quarantined_rows:
         remedy = (
-            "The dropped rows are listed above with their reason: fix the source "
-            "value(s) and Reload that table to load them, or accept the gap to "
-            "continue (Validation reports it)."
+            "The dropped rows are listed above with their reason: reduce the source "
+            "value(s) and Reload that table, use \"Exclude column & reload\" if a "
+            "value is legitimately too large to store, or accept the gap to continue "
+            "(Validation reports it)."
         )
     else:
         remedy = "Run Validation (Step 4) for a full row-count/checksum check."

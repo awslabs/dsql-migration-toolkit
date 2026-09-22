@@ -174,6 +174,20 @@ class ColumnDef(BaseModel):
             "otherwise indistinguishable."
         ),
     )
+    base_type: Optional[str] = Field(
+        default=None,
+        description=(
+            "The UNDERLYING type when ``mysql_type`` names a wrapper the source reports "
+            "instead of the storage type -- today a PostgreSQL DOMAIN, whose "
+            "``format_type`` is the domain's own NAME. Read decisions must follow this, "
+            "not the wrapper: PostgreSQL still describes the result with the BASE type's "
+            "OID, so psycopg applies the base type's loader. A domain over jsonb was "
+            "therefore read NATIVELY -- collapsing a JSON literal ``null`` to SQL NULL -- "
+            "and a domain over interval lost months/years to days, both silently, because "
+            "the text-cast rule matched the domain name and found no jsonb/interval. "
+            "``None`` when ``mysql_type`` already IS the storage type (the normal case)."
+        ),
+    )
     comment: Optional[str] = Field(
         default=None,
         description=(
@@ -436,6 +450,12 @@ class SourceInventory(BaseModel):
     # target -- a change no per-column capture can see, because such a column's collation is
     # literally named ``default``. None for MySQL and when it could not be read.
     database_collation: Optional[str] = None
+    # Other databases on the same server (PostgreSQL only; empty for MySQL, which
+    # assesses the whole cluster). Read so a run that found ZERO migratable tables can
+    # name the likely cause -- the wrong database -- instead of reporting a clean,
+    # confident evaluation of nothing. Aurora always provides an empty ``postgres``
+    # database next to the real one, which is exactly what gets connected by mistake.
+    sibling_databases: list[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -839,9 +859,17 @@ class Watermark(BaseModel):
     snapshot_timestamp: datetime = Field(
         description="UTC timestamp captured at the consistent-snapshot point."
     )
-    table_row_counts: dict[str, int] = Field(
+    table_row_counts: dict[str, Optional[int]] = Field(
         default_factory=dict,
-        description="Per-table row counts captured at the snapshot point.",
+        description=(
+            "Per-table row counts captured at the snapshot point. A value is ``None`` "
+            "when the count is UNKNOWN, which is distinct from a real 0: PostgreSQL 14+ "
+            "reports reltuples = -1 for a never-analyzed table (the normal state of a "
+            "freshly bulk-loaded source), and the dialect deliberately maps that to None. "
+            "Collapsing it to 0 made the panel read \"5 / 0\" -- a target ahead of its "
+            "source, which looks like a bug in the migration rather than a missing "
+            "estimate. Consumers must render None as \"unknown\", not as a number."
+        ),
     )
     row_counts_approximate: bool = Field(
         default=False,

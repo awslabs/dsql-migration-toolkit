@@ -536,6 +536,7 @@ def build_data_migration_screen(
                 migrator=migrator,
                 error_log=error_log,
                 accept_quarantined_rows=migration_state.accept_quarantined_rows,
+                accepted_quarantine_rows=migration_state.accepted_quarantine_rows,
                 inputs=inputs,
             )
 
@@ -1352,6 +1353,7 @@ def build_data_migration_screen(
                         error_log=error_log,
                         watermark=watermark,
                         accept_quarantined_rows=accept_quarantined,
+                        accepted_quarantine_rows=getattr(migration_state, 'accepted_quarantine_rows', None),
                         prior_job_id=prior_job_id,
                         prior_table_error_job_ids=prior_error_owners,
                         inputs=retry_inputs,
@@ -1674,10 +1676,14 @@ def build_data_migration_screen(
                     current, migration_state.error_log
                 ):
                     return
-                migration_state.set_accept_quarantined_rows(True)
                 quarantined = _quarantined_row_count(
                     current, migration_state.error_log
                 )
+                # Record WHAT was accepted, not just that something was. The flag used to be
+                # sticky and unscoped, so consenting to a 3-row gap auto-accepted every later
+                # run's gap of any size -- a load that dropped thousands then completed as a
+                # success nobody had agreed to.
+                migration_state.set_accept_quarantined_rows(True, gap=quarantined)
                 log_activity(
                     ActivityCategory.FULL_LOAD,
                     "quarantine accepted",

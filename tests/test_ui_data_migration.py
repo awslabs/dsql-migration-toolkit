@@ -669,7 +669,12 @@ def test_capture_watermark_skips_binlog_for_postgres_source(monkeypatch) -> None
     # The PG resume coordinate (WAL LSN) IS captured -- the gapless CDC handoff point.
     assert watermark.wal_lsn == "3/AF012B8"
     assert watermark.row_counts_approximate is True
-    assert watermark.table_row_counts == {"orders": 5, "customers": 0}  # None -> 0
+    # An unknown estimate stays None -- it is NOT 0. PostgreSQL 14+ reports
+    # reltuples = -1 for a never-analyzed table (the normal state of a freshly
+    # bulk-loaded source) and the dialect maps that to None on purpose; collapsing it
+    # to 0 made the load panel read "5 / 0", a target apparently ahead of its source.
+    # (This assertion used to pin the collapse, comment and all.)
+    assert watermark.table_row_counts == {"orders": 5, "customers": None}
     assert fake_engine.disposed is True  # source engine disposed (no leak)
     assert watermark.slot_name is None  # Full-Load-only: no slot (would pin WAL)
     assert watermark.publication_name is None
@@ -23350,3 +23355,602 @@ def test_prereq_table_shows_the_observed_value_and_the_remediation() -> None:
     detail = rows[0]["detail"]
     assert "512 MB" in detail, f"the measured value vanished: {detail!r}"
     assert "Raise max_slot_wal_keep_size" in detail, f"the instruction vanished: {detail!r}"
+
+
+# --- 0.1.499: an unknown row estimate is not 0; quarantine advice names every recovery ---
+
+
+def test_unknown_source_estimate_stays_unknown_instead_of_becoming_zero() -> None:
+    """PostgreSQL 14+ reports reltuples = -1 for a never-analyzed table.
+
+    The dialect maps that to None on purpose ("unknown", not a real 0). Collapsing it
+    with ``or 0`` made the load panel read "5 / 0" -- a target apparently ahead of its
+    source, which looks like a migration bug rather than a missing estimate. It is the
+    normal state of a freshly bulk-loaded source, which is exactly what gets migrated.
+    """
+    from dsql_migrator.core.models import Watermark
+
+    # The model must be able to HOLD unknown; typed dict[str, int] it could not.
+    watermark = Watermark(
+        snapshot_timestamp=datetime.now(timezone.utc),
+        table_row_counts={"app.known": 5, "app.never_analyzed": None},
+        row_counts_approximate=True,
+    )
+    assert watermark.table_row_counts["app.never_analyzed"] is None
+
+    # ...and the panel renders it as an em dash, not "0".
+    from dsql_migrator.ui.data_migration._full_load_ui import _abbrev_count
+
+    assert _abbrev_count(None) == "—"
+    assert _abbrev_count(0) == "0"
+
+
+def test_unknown_estimate_is_not_labelled_an_estimate_in_the_table_rows() -> None:
+    """An absent figure must not be dressed up as "estimate"; it has no figure at all.
+
+    The fallback branch keyed on mere PRESENCE in the watermark, so a table whose
+    estimate is None took it and reported source_rows=None with source_estimate=True.
+    """
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import Watermark
+    from dsql_migrator.ui.data_migration._models import build_migration_table_status
+
+    job = SimpleNamespace(
+        chunks=[],
+        watermark=Watermark(
+            snapshot_timestamp=datetime.now(timezone.utc),
+            table_row_counts={"app.known": 5, "app.unknown": None},
+            row_counts_approximate=True,
+        ),
+    )
+    rows = {
+        r.table: r
+        for r in build_migration_table_status(
+            ["app.known", "app.unknown"], full_load_job=job
+        )
+    }
+    assert rows["app.known"].source_rows == 5
+    assert rows["app.known"].source_estimate is True
+    assert rows["app.unknown"].source_rows is None
+    assert rows["app.unknown"].source_estimate is False, (
+        "a table with no figure must not claim to have an estimate"
+    )
+
+
+def test_every_quarantine_surface_offers_the_exclude_column_recovery() -> None:
+    """"Fix the source value" alone is impossible on a read-only source.
+
+    And it is impossible in principle when the value is legitimately over the 1 MiB cap
+    -- which is the common cause of this drop. Excluding the column is the tool's own
+    answer there, and it had a button right next to the banner while all three advice
+    surfaces named only the impossible option.
+    """
+    from dsql_migrator.ui.data_migration import _full_load_engine as fle
+    from dsql_migrator.ui.data_migration import _full_load_ui as flu
+    from dsql_migrator.ui.data_migration._models import FullLoadTableRow
+
+    # Asserted on the EMITTED text, never on inspect.getsource: the first draft of this
+    # test grepped the function source, and the explanatory COMMENT above the string
+    # contains the phrase too -- so it passed even with the advice stripped from the
+    # user-facing message. A source grep cannot tell a comment from an output.
+
+    # 1. The per-row durable activity entry.
+    logged: list = []
+    real = fle.log_activity
+    try:
+        fle.log_activity = lambda *a, **k: logged.append(k.get("detail", ""))
+        fle._log_quarantined_row("app.t", "id=7", "value too large", "54000")
+    finally:
+        fle.log_activity = real
+    (row_detail,) = logged
+    assert "Exclude column & reload" in row_detail, (
+        f"the audit entry names no workable way out: {row_detail}"
+    )
+
+    # 2. The per-table "N dropped" badge tooltip.
+    badge = flu._quarantined_cell_tooltip(
+        FullLoadTableRow(
+            table="app.t", state="DONE", rows_loaded=10, expected_rows=12,
+            attempts=1, errors=0, rows_quarantined=2,
+        )
+    )
+    assert "Exclude column & reload" in badge, badge
+
+    # 3. The run-level guidance carried on the raised incompleteness error.
+    run_level = fle.incomplete_load_message(
+        incomplete=1, total=2, quarantined_rows=2, quarantine_only=True
+    )
+    assert "Exclude column & reload" in run_level, run_level
+
+
+def test_run_level_quarantine_guidance_survives_the_persisted_error_cap() -> None:
+    """JobManager caps the persisted job error at 300 chars -- so the advice must fit.
+
+    The cap exists to redact psycopg DETAIL lines that can carry row values, so it is
+    not going away. Anything past it is silently dropped: a longer, richer wording lost
+    the last recovery option (and once lost "re-run" itself), leaving the operator with
+    an error that names fewer ways out than the tool actually has.
+    """
+    from dsql_migrator.ui.data_migration._full_load_engine import (
+        incomplete_load_message,
+    )
+
+    message = incomplete_load_message(
+        incomplete=12, total=40, quarantined_rows=1234, quarantine_only=True
+    )
+    assert len(message) <= 300, (
+        f"the guidance is {len(message)} chars, so JobManager will truncate it and the "
+        "operator loses the tail: " + message[290:]
+    )
+    low = message.lower()
+    for option in ("re-run", "exclude column & reload", "accept quarantined rows"):
+        assert option in low, f"{option!r} did not survive: {message}"
+
+
+def test_a_source_reread_discards_the_batch_ordinal_resume_watermark() -> None:
+    """A retry re-reads a DIFFERENT snapshot, so an ordinal resume skip loses rows.
+
+    ``BatchedImporter`` skips a batch when ``index <= high-water``, valid only while
+    batch index *i* denotes the same rows. The source-drop retry deliberately opens a new
+    snapshot (its own docstring explains why resuming the dead one would splice two points
+    in time), and it promises the cost is only re-read I/O because ``ON CONFLICT`` skips
+    rows already written. The ordinal skip broke that promise: it does not re-write, it
+    skips by count.
+
+    Reproduced independently by the lead: with batches 0-2 committed (ids 1..6) and the
+    application deleting id=1 before the retry, the re-read's batch 3 becomes [8, 9] and
+    row 7 is never written -- while the loader reports ``failures=0`` and the table DONE.
+    """
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.batched_import import (
+        BatchedImporter,
+        OnConflictMode,
+        _SkipCounter,
+    )
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    table = TableDef(
+        name="app.t",
+        columns=[ColumnDef(name="id", mysql_type="integer", nullable=False)],
+        primary_key=["id"],
+        indexes=[],
+    )
+    importer = BatchedImporter.__new__(BatchedImporter)  # pure generator; no connection
+    importer._options = SimpleNamespace(batch_size=2)
+
+    def batches(rows, watermark):
+        counter = _SkipCounter()
+        out = [
+            [r["id"] for r in work.rows]
+            for work in importer._iter_work(
+                iter(rows), table, ["id"], ["id"], watermark, counter,
+                OnConflictMode.SKIP_EXISTING,
+            )
+        ]
+        return out, counter.value
+
+    first, _ = batches([{"id": i} for i in range(1, 11)], {})
+    assert first[:3] == [[1, 2], [3, 4], [5, 6]]
+    committed = {i for b in first[:3] for i in b}   # batches 0-2 landed, then the drop
+
+    # The retry re-reads a fresh snapshot in which id=1 no longer exists.
+    reread = [{"id": i} for i in range(2, 11)]
+    stale, skipped = batches(reread, {"": 2})       # carrying the ordinal watermark
+    assert skipped == 3
+    never_written = {r["id"] for r in reread} - (committed | {i for b in stale for i in b})
+    assert never_written == {7}, (
+        "fixture no longer demonstrates the loss, so this test proves nothing: "
+        f"{never_written}"
+    )
+
+    # With the watermark discarded -- what the fix does before every re-read -- the
+    # re-read covers every row, and ON CONFLICT makes re-writing the committed ones safe.
+    fresh, skipped_fresh = batches(reread, {})
+    assert skipped_fresh == 0
+    assert {r["id"] for r in reread} - {i for b in fresh for i in b} == set()
+
+
+def test_the_in_process_retry_clears_the_resume_watermark_before_rereading() -> None:
+    """The wiring: every whole-table re-read must discard the ordinal watermark.
+
+    Pins the hook itself, so a future caller that forgets ``before_reread`` cannot
+    silently reintroduce the skip. A shard with a SHARED snapshot is the one exception --
+    it reopens the same snapshot, so its row sequence is stable.
+    """
+    import inspect
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.data_migration import _full_load_engine as fle
+
+    job = SimpleNamespace(resume_batch_watermark={"": 7})
+    fle._discard_ordinal_resume_state(job)
+    assert job.resume_batch_watermark == {}, "the stale ordinal watermark survived"
+    fle._discard_ordinal_resume_state(None)  # tolerates a missing job
+
+    attempts: list = []
+
+    class _Dropped(Exception):
+        """A MySQL "lost connection" (errno 2013) -- what an Aurora failover raises."""
+
+        def __init__(self) -> None:
+            super().__init__(2013, "Lost connection to MySQL server during query")
+            self.errno = 2013
+
+    def _work():
+        attempts.append(len(attempts))
+        if len(attempts) == 1:
+            raise _Dropped()
+        return "ok"
+
+    live = SimpleNamespace(resume_batch_watermark={"": 3})
+    result = fle._retry_source_drops_in_process(
+        _work,
+        cancelled=lambda: False,
+        table_name="app.t",
+        before_reread=lambda: fle._discard_ordinal_resume_state(live),
+    )
+    assert result == "ok" and len(attempts) == 2
+    assert live.resume_batch_watermark == {}, (
+        "the retry re-read a fresh snapshot while still carrying the batch ordinals"
+    )
+
+    # Both in-process workers must pass the hook (the shard one gated on the shared
+    # snapshot); a caller that omits it reopens the data-loss path. Scoped PER WORKER --
+    # a whole-module count also matches the parameter's own default and so survives a
+    # call site being deleted.
+    for worker in (fle._migrate_one_table_in_process, fle._migrate_shard_in_process):
+        body = inspect.getsource(worker)
+        assert "before_reread=" in body, (
+            f"{worker.__name__} no longer discards the ordinal watermark before a "
+            "re-read, reopening the silent data loss"
+        )
+    # The shard worker keeps the watermark only when it reopens the SAME snapshot.
+    assert "args.shared_snapshot_id" in inspect.getsource(fle._migrate_shard_in_process)
+
+
+def test_a_resumed_import_keeps_and_dedups_the_previous_attempt_quarantine() -> None:
+    """A resumed attempt must not erase rows a previous attempt permanently dropped.
+
+    ``import_rows`` cleared its quarantine sink at the start of EVERY call, so an attempt
+    that skips the already-committed batches never re-reads their rows and the surviving
+    result carried ``quarantined=0``. The table then logged SUCCESS, no primary key reached
+    the error log, ``_finalize_run`` saw nothing incomplete, and the Validation gate that
+    exists for exactly this never fired -- rows silently missing with no record anywhere.
+
+    Only reachable where the batch watermark survives a re-read (a shard reopening one
+    shared PostgreSQL snapshot; every other path discards it now), but there the loss is
+    total. And because a retry re-reads rows a previous attempt already dropped -- the cause
+    is deterministic -- the records must DEDUP by primary key, or the drop total the operator
+    reconciles would inflate on every retry.
+
+    Drives the REAL ``_quarantine_one``; an earlier draft re-implemented the dedup in the
+    test and so proved only that the copy worked.
+    """
+    import threading
+
+    from dsql_migrator.core.batched_import import BatchedImporter, _BatchWork
+
+    importer = BatchedImporter.__new__(BatchedImporter)
+    importer._quarantine_lock = threading.Lock()
+    importer._quarantine = []
+    importer._quarantine_total = 0
+    importer._quarantine_seen = set()
+
+    def work_for(pk: int) -> _BatchWork:
+        return _BatchWork(
+            chunk_id=f"app.t#{pk}", table_name="app.t", columns=("id",),
+            key_columns=("id",), on_conflict=None, rows=({"id": pk},),
+        )
+
+    class _Poison(Exception):
+        sqlstate = "54000"
+
+    importer._quarantine_one(work_for(1), _Poison("value too large"))
+    importer._quarantine_one(work_for(2), _Poison("value too large"))
+    assert importer._quarantine_total == 2
+
+    # The same rows re-read on a retry must NOT be counted again, even when the driver
+    # text differs for the same failure.
+    importer._quarantine_one(work_for(1), _Poison("value too large"))
+    importer._quarantine_one(work_for(2), _Poison("value too large for the column"))
+    assert importer._quarantine_total == 2, "a re-read inflated the permanent-drop total"
+
+    # ...and a genuinely new drop still lands.
+    importer._quarantine_one(work_for(3), _Poison("value too large"))
+    assert importer._quarantine_total == 3
+    assert len(importer._quarantine) == 3
+
+
+def test_the_resume_carry_is_gated_on_an_actual_resume() -> None:
+    """A fresh load starts with an EMPTY sink; only a resumed call carries records over.
+
+    Pins both halves of the condition, so neither a leak into an unrelated load nor a
+    silent return of the erase can slip back in.
+    """
+    import inspect
+
+    from dsql_migrator.core.batched_import import BatchedImporter
+
+    src = inspect.getsource(BatchedImporter.import_rows)
+    assert 'getattr(job, "resume_batch_watermark", None)' in src, (
+        "the carry is no longer gated on the resume watermark"
+    )
+    assert "carried = list(self._quarantine) if resuming else []" in src, (
+        "a resumed attempt no longer carries the previous attempt's quarantine forward"
+    )
+
+
+def test_a_plain_insert_shortfall_fails_loudly_instead_of_counting_as_skipped() -> None:
+    """Under NONE there is no ON CONFLICT clause, so a shortfall is LOST ROWS.
+
+    ``_execute_insert`` derived ``conflicts`` as ``attempted - inserted`` for every mode.
+    With no conflict target there is nothing to conflict WITH, so a server that stored
+    fewer rows than were sent had silently dropped them -- and the run reported them as
+    "already on target (skipped)" and completed. That is exactly the row-drop the NONE mode
+    exists to rule out.
+    """
+    import pytest as _pytest
+
+    from dsql_migrator.core.batched_import import (
+        BatchedImportError,
+        BatchedImporter,
+        OnConflictMode,
+    )
+
+    class _Cursor:
+        def __init__(self, rowcount: int) -> None:
+            self.rowcount = rowcount
+
+        def execute(self, *a, **k):
+            return None
+
+        def close(self):
+            return None
+
+    class _Conn:
+        def __init__(self, rowcount: int) -> None:
+            self._rowcount = rowcount
+
+        def cursor(self):
+            return _Cursor(self._rowcount)
+
+    class _Pool:
+        def __init__(self, rowcount: int) -> None:
+            self._rowcount = rowcount
+
+        def lease(self):
+            from contextlib import contextmanager
+
+            @contextmanager
+            def _cm():
+                yield _Conn(self._rowcount)
+
+            return _cm()
+
+    importer = BatchedImporter.__new__(BatchedImporter)
+
+    # NONE: 8 of 10 stored -> two rows vanished -> hard error, not a "conflict".
+    with _pytest.raises(BatchedImportError) as excinfo:
+        importer._execute_insert(
+            _Pool(8), "stmt", [], 10, on_conflict=OnConflictMode.NONE
+        )
+    assert "8 of 10" in str(excinfo.value)
+    assert "silently absent" in str(excinfo.value)
+
+    # NONE with everything stored is fine.
+    assert importer._execute_insert(
+        _Pool(10), "stmt", [], 10, on_conflict=OnConflictMode.NONE
+    ) == (10, 0)
+
+    # SKIP_EXISTING / DO_NOTHING DO have a conflict target, so a shortfall is a real
+    # conflict and must stay a count, not an error.
+    assert importer._execute_insert(
+        _Pool(8), "stmt", [], 10, on_conflict=OnConflictMode.SKIP_EXISTING
+    ) == (8, 2)
+
+
+def test_a_failed_shard_does_not_discard_its_siblings_quarantine_evidence() -> None:
+    """Per-row evidence must be recorded before the aggregate verdict branches.
+
+    The quarantine and index-failure loops lived in the all-shards-clean branch only, so a
+    single FAILED or STOPPED shard threw away every OTHER shard's records: rows those
+    shards permanently dropped left no primary key in the error log and no audit entry,
+    with "one or more shards failed" as the only trace -- precisely when the detail matters
+    most.
+    """
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _full_load_engine as fle
+
+    src = inspect.getsource(fle)
+    marker = "for rec in all_quarantine:"
+    assert src.count(marker) == 1, (
+        "the shard quarantine loop was duplicated rather than hoisted"
+    )
+    recorded_at = src.index(marker)
+    branch_at = src.index("if any_failed:")
+    assert recorded_at < branch_at, (
+        "the shard quarantine records are still written inside a success-only branch, so a "
+        "failed sibling discards them"
+    )
+    # The index-failure evidence must be hoisted with it.
+    assert src.index("_record_index_failures(\n                            error_log") < branch_at
+
+
+def test_accepting_a_quarantine_gap_does_not_auto_accept_a_bigger_one_later() -> None:
+    """The acceptance is scoped to the gap the operator actually consented to.
+
+    ``accept_quarantined_rows`` was a sticky, unscoped bool: consenting to a 3-row gap
+    auto-accepted every LATER run's gap, of any size, in any table -- so a second load that
+    dropped thousands completed as a success nobody had agreed to, with the banner still
+    saying "you accepted that gap".
+    """
+    from dsql_migrator.ui.data_migration._state import DataMigrationStore
+
+    store = DataMigrationStore()
+    state = store.get_or_create("accept-scope")
+
+    state.set_accept_quarantined_rows(True, gap=3)
+    assert state.accept_quarantined_rows is True
+    assert state.accepted_quarantine_rows == 3
+
+    # Clearing the flag clears the number with it -- a stale count must not outlive it.
+    state.set_accept_quarantined_rows(False)
+    assert state.accepted_quarantine_rows is None
+
+    # The finaliser's gate: the same gap (or smaller) is covered; a larger one is not.
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _full_load_engine as fle
+
+    gate = inspect.getsource(fle._finalize_run)
+    assert "quarantined_rows <= accepted_quarantine_rows" in gate, (
+        "the auto-accept no longer compares the new gap against the accepted one"
+    )
+    assert "accepted_quarantine_rows is None" in gate, (
+        "an acceptance recorded before the count was tracked must keep the old behaviour "
+        "rather than retroactively blocking a run"
+    )
+    assert "gap_within_acceptance" in gate
+
+
+def test_identity_sync_survives_a_dropped_connection_and_keeps_its_results() -> None:
+    """One dead backend must not discard the tables already synced, nor the ones after it.
+
+    This pass runs at the END of a load that can take hours, so its connection is the most
+    likely in the tool to be dead -- a DSQL IAM token is short-lived. It held ONE connection
+    for the whole table list with no reconnect, so a drop made the function RAISE: measured
+    on a real backend kill, 5 of 6 tables were left at ``nextval=1`` with ``max(id)=11`` and
+    even the one recorded success was thrown away. Nothing was reported, which is the silent
+    post-cut-over duplicate-key outage this function's docstring calls the worst shape a
+    migration failure can take.
+    """
+    from dsql_migrator.core.target_introspector import (
+        partition_identity_sync,
+        sync_identity_sequences,
+    )
+
+    class _Cursor:
+        def __init__(self, conn) -> None:
+            self._conn = conn
+
+        def execute(self, statement, *a, **k):
+            self._conn.statements.append(str(statement))
+            limit = self._conn.die_after
+            if limit is not None and len(self._conn.statements) > limit:
+                self._conn.dead = True
+            if self._conn.dead:
+                raise RuntimeError("consuming input failed: server closed the connection")
+            return None
+
+        def fetchall(self):
+            return [("id",)]          # every table has an identity column
+
+        def fetchone(self):
+            return (11,)              # max(id) = 11
+
+        def close(self):
+            return None
+
+    class _Conn:
+        def __init__(self) -> None:
+            self.dead = False
+            self.die_after = None
+            self.statements: list[str] = []
+
+        def cursor(self):
+            return _Cursor(self)
+
+        def close(self):
+            return None
+
+    built: list = []
+
+    def factory():
+        conn = _Conn()
+        # The FIRST connection dies after it has already synced one table -- the real shape:
+        # a backend/token loss partway through a long list. Later connections are healthy, so
+        # a correct pass records the drop for the affected table and syncs the rest.
+        conn.die_after = 3 if not built else None   # 3 statements ~= one table's work
+        built.append(conn)
+        return conn
+
+    tables = [f"app.t{i}" for i in range(4)]
+    result = sync_identity_sequences(tables, connection_factory=factory)
+
+    advanced, failed = partition_identity_sync(result)
+    assert set(result) == set(tables), "a table was dropped from the result entirely"
+    assert advanced, "every table was lost to one dead connection"
+    assert failed, "the dead connection was not reported at all"
+    # The failure is confined: the tables after it still synced.
+    assert len(advanced) >= 2, (advanced, failed)
+    assert all(value == 12 for value in advanced.values()), advanced
+    assert len(built) > 1, "the pass never reconnected after the drop"
+
+
+def test_the_progress_drain_survives_a_failing_job_store_write() -> None:
+    """The drain thread is the only path for Stop and for the watchdog's liveness clock.
+
+    Its loop body was unguarded, so ONE exception out of ``handle.update()`` -- which writes
+    the job store on every message -- killed the thread. After that a user Stop never
+    reached the workers (``cancel_event`` is set only here) and a healthy run was reaped by
+    the 900s stall watchdog blaming an unresponsive connection. ``drain.join(timeout=5)``
+    notices nothing, so the failure was invisible.
+
+    Driven, not grepped: an earlier draft asserted on the source text and still passed when
+    the except was narrowed to a type that never fires.
+    """
+    import queue
+    import threading
+
+    from dsql_migrator.ui.data_migration import _full_load_engine as fle
+
+    applied: list = []
+
+    class _Handle:
+        cancelled = False
+
+        def update(self, fn):
+            applied.append(fn)
+            # Every job-store write fails -- the shape that used to kill the thread.
+            raise RuntimeError("database is locked")
+
+    class _Event:
+        def __init__(self) -> None:
+            self._set = False
+
+        def is_set(self) -> bool:
+            return self._set
+
+        def set(self) -> None:
+            self._set = True
+
+    progress: "queue.Queue[object]" = queue.Queue()
+    for i in range(3):
+        progress.put((f"app.t{i}", 10, 0))
+    progress.put(fle._PROGRESS_SENTINEL)
+
+    handle = _Handle()
+    cancel_event = _Event()
+    stop_event = threading.Event()
+
+    # Must RETURN, not raise, and must have attempted EVERY message rather than dying on
+    # the first one.
+    fle._drain_progress_queue(progress, handle, cancel_event, stop_event)
+    assert len(applied) >= 3, (
+        f"the drain thread died after {len(applied)} message(s), so Stop and liveness stop "
+        "with it"
+    )
+
+    # And it still mirrors cancellation while updates are failing -- the half whose loss
+    # leaves workers running after a user Stop.
+    handle2 = _Handle()
+    handle2.cancelled = True
+    progress2: "queue.Queue[object]" = queue.Queue()
+    progress2.put(("app.t0", 1, 0))
+    progress2.put(fle._PROGRESS_SENTINEL)
+    cancel2 = _Event()
+    fle._drain_progress_queue(progress2, handle2, cancel2, threading.Event())
+    assert cancel2.is_set(), "a user Stop never reached the workers"

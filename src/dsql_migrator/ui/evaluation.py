@@ -1389,6 +1389,9 @@ def _render_result(
     # Migration-readiness score (its own leading card; skipped for an empty
     # report, which has nothing to score).
     _render_score_card(ui, result.assessment)
+    # Directly under the score, because it is the score that needs qualifying: an
+    # evaluation over ZERO tables still produces a confident band.
+    _render_empty_inventory_notice(ui, result)
 
     with ui.card().classes("w-full"):  # type: ignore[attr-defined]
         # Title on the left, export buttons on the top-right so the user can
@@ -1463,6 +1466,52 @@ def _render_score_card(ui: object, report: AssessmentReport) -> None:
                             )
                             ui.label(lbl).classes("text-xs text-gray-600")  # type: ignore[attr-defined]
         render_notice(ui, tone=score.tone, header=score.band, body=score.summary)
+
+
+def empty_inventory_message(result: EvaluationResult) -> "Optional[str]":
+    """The "you may be on the wrong database" body, or ``None`` when there are tables.
+
+    Zero migratable tables is almost never a real finding -- it is the wrong database. The
+    old behaviour was the dangerous kind of quiet: Evaluation ran to completion over nothing
+    and reported a confident readiness score, so the operator's next signal was an empty
+    migration. PostgreSQL is where this bites, because a connection is scoped to ONE
+    database and Aurora always provides an empty ``postgres`` alongside the real one; the
+    trap is worst when the database and the schema share a name, since the existing hint
+    ("PostgreSQL connects to ONE database -- enter its name") cannot tell the operator which
+    of the two they typed. MySQL assesses the whole cluster when Database is blank, so it
+    has no equivalent, but the message is engine-neutral and would be just as true there.
+
+    Names the siblings when the probe could read them (``sibling_databases``), because
+    that turns a dead end into one obvious next step.
+    """
+    inventory = result.inventory
+    if inventory.tables:
+        return None
+    others = [name for name in (inventory.sibling_databases or []) if name]
+    database = getattr(inventory, "database", None) or "the connected database"
+    body = (
+        f"No tables were found in {database}, so there is nothing to migrate and the "
+        "score above is a report on an empty schema. The usual cause is the wrong "
+        "Database on the Connect step -- it is the DATABASE name, not the schema name."
+    )
+    if others:
+        listed = ", ".join(others[:8])
+        more = f" (and {len(others) - 8} more)" if len(others) > 8 else ""
+        body += f" Other databases on this server: {listed}{more}."
+    return body
+
+
+def _render_empty_inventory_notice(ui: object, result: EvaluationResult) -> None:
+    """Warn when an evaluation completed over ZERO tables (see :func:`empty_inventory_message`)."""
+    body = empty_inventory_message(result)
+    if not body:
+        return
+    render_notice(
+        ui,
+        tone="warning",
+        header="No tables found — check the Database on the Connect step",
+        body=body,
+    )
 
 
 def _guidance_question(item: "AssessmentItem") -> str:

@@ -713,6 +713,20 @@ class _ConnectionPool:
 _MAX_QUARANTINE_RECORDS = 1000
 
 
+def _quarantine_key(record: object) -> tuple:
+    """Identity of one quarantined row: ``(table, primary key)``.
+
+    Used both to carry a prior attempt's drops across a resumed ``import_rows`` and to
+    keep a re-read from recording the same drop twice. The PK is what the error log lists,
+    so it is the operator-visible identity; the message is deliberately excluded (the same
+    row can fail with slightly different driver text and is still the same lost row).
+    """
+    return (
+        str(getattr(record, "table", "") or ""),
+        str(getattr(record, "primary_key", "") or ""),
+    )
+
+
 class BatchedImporter:
     """Built-in batched ``INSERT ... ON CONFLICT`` importer (fallback path).
 
@@ -861,9 +875,24 @@ class BatchedImporter:
             ]
 
         pool = _ConnectionPool(self._connection_factory, self._options.parallelism)
+        # A RESUMED call keeps what the previous attempt quarantined. Clearing the sink
+        # unconditionally lost it: a source-drop retry that SKIPS the already-committed
+        # batches never re-reads their rows, so rows permanently dropped during attempt 1
+        # were absent from the surviving result -- the table then logged SUCCESS with
+        # ``rows_quarantined=0``, no PK appeared in the error log, ``_finalize_run`` saw
+        # nothing incomplete, and the Validation gate that should have held never fired.
+        # Only reachable where the watermark survives a re-read (a shard reopening one
+        # SHARED PostgreSQL snapshot; every other path now discards it), but there the loss
+        # is total and silent. Deduped by primary key, so a re-read that re-quarantines the
+        # same row cannot double-count it.
+        resuming = bool(job is not None and getattr(job, "resume_batch_watermark", None))
         with self._quarantine_lock:
-            self._quarantine = []
-            self._quarantine_total = 0
+            carried = list(self._quarantine) if resuming else []
+            self._quarantine = carried
+            self._quarantine_total = len(carried) if resuming else 0
+            self._quarantine_seen = {
+                _quarantine_key(record) for record in carried
+            }
         # OWN the resume high-water HERE (seeded from the prior attempt's watermark) rather
         # than inside _run_data_batches, so the completed contiguous prefix survives even
         # when the SOURCE READ raises mid-load: _run_data_batches records into THIS tracker,
@@ -1316,6 +1345,17 @@ class BatchedImporter:
             message=_safe_error(exc),
         )
         with self._quarantine_lock:
+            # Dedup by (table, primary key): a retry re-reads rows a previous attempt
+            # already quarantined, and the cause is deterministic (a value over DSQL's
+            # per-value cap fails identically every time), so counting it again would
+            # inflate the drop total the operator has to reconcile.
+            key = _quarantine_key(record)
+            seen = getattr(self, "_quarantine_seen", None)
+            if seen is None:
+                seen = self._quarantine_seen = set()
+            if key in seen:
+                return
+            seen.add(key)
             self._quarantine_total += 1
             if len(self._quarantine) < _MAX_QUARANTINE_RECORDS:
                 self._quarantine.append(record)
@@ -1380,7 +1420,10 @@ class BatchedImporter:
             nonlocal attempts
             attempts += 1
             try:
-                return self._execute_insert(pool_, statement_, params_, attempted_)
+                return self._execute_insert(
+                    pool_, statement_, params_, attempted_,
+                    on_conflict=work.on_conflict,
+                )
             except Exception as exc:  # noqa: BLE001 - inspect sqlstate
                 # A NONE-mode plain INSERT (clean load into an empty target) can only hit a
                 # unique violation (23505) on a RETRY after the batch already committed but the
@@ -1425,6 +1468,7 @@ class BatchedImporter:
         statement: sql.Composed,
         params: list[object],
         attempted: int,
+        on_conflict: "OnConflictMode" = None,  # type: ignore[assignment]
     ) -> tuple[int, int]:
         """Run one batch ``INSERT`` on a pooled connection (single transaction).
 
@@ -1442,6 +1486,19 @@ class BatchedImporter:
                 _safe_close(cursor)
         inserted = rowcount if isinstance(rowcount, int) and rowcount >= 0 else attempted
         inserted = min(inserted, attempted)
+        # Under NONE there is no ON CONFLICT clause, so there is no such thing as a
+        # "conflict": a shortfall means the server accepted the statement and stored FEWER
+        # rows than were sent -- rows silently lost, which is precisely what the NONE mode
+        # exists to make impossible. Folding it into ``conflicts`` reported those rows as
+        # "already on target (skipped)", so the run looked complete. Fail the batch loudly
+        # instead; the 23505 -> _select_filter_insert recovery above stays the ONLY
+        # legitimate source of skipped rows in this mode.
+        if on_conflict is OnConflictMode.NONE and inserted < attempted:
+            raise BatchedImportError(
+                f"plain INSERT stored {inserted} of {attempted} row(s) with no ON CONFLICT "
+                "clause -- the missing rows were neither inserted nor rejected, so they "
+                "would be silently absent from the target"
+            )
         return inserted, attempted - inserted
 
     def _execute_skip_existing(

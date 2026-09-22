@@ -1710,3 +1710,112 @@ def test_run_evaluation_threads_postgres_source_type_to_assessor() -> None:
     assert "PG_UNSUPPORTED_TYPE" in rule_ids  # PG rules ran (not MySQL)
     item = next(it for it in result.assessment.items if it.object_name == "t")
     assert item.classification is Classification.UNSUPPORTED
+
+
+def test_an_evaluation_over_zero_tables_says_check_the_database() -> None:
+    """Zero migratable tables is almost never a finding -- it is the wrong database.
+
+    The old behaviour was the dangerous kind of quiet: Evaluation ran to completion over
+    nothing and printed a confident readiness band, so the operator's next signal was an
+    empty migration. PostgreSQL is where this bites (a connection is scoped to ONE database
+    and Aurora always provides an empty ``postgres`` beside the real one), and it is worst
+    when the database and the schema share a name -- the existing hint cannot tell the
+    operator which of the two they typed.
+    """
+    from dsql_migrator.core.assessor import AssessmentReport
+    from dsql_migrator.core.models import (
+        ColumnDef,
+        SourceInventory,
+        TableDef,
+        TargetInventory,
+    )
+    from dsql_migrator.ui.evaluation import EvaluationResult, empty_inventory_message
+
+    def result(tables, siblings):
+        return EvaluationResult(
+            inventory=SourceInventory(
+                tables=tables, views=[], sibling_databases=siblings
+            ),
+            assessment=AssessmentReport.from_items([]),
+            target_inventory=TargetInventory(),
+            target_conflicts=[],
+        )
+
+    body = empty_inventory_message(result([], ["ecommerce", "analytics"]))
+    assert body is not None
+    assert "nothing to migrate" in body
+    # It must name the DATABASE/schema confusion, which is the actual mistake.
+    assert "not the schema name" in body
+    # ...and the alternatives, so the operator has a next step rather than a dead end.
+    assert "ecommerce" in body and "analytics" in body
+
+    # Unreadable siblings must not block the warning -- the cause still needs saying.
+    bare = empty_inventory_message(result([], []))
+    assert bare is not None and "not the schema name" in bare
+    assert "Other databases" not in bare
+
+    # A populated inventory says nothing at all (no alarm on the normal case).
+    table = TableDef(
+        name="app.t",
+        columns=[ColumnDef(name="id", mysql_type="integer", nullable=False)],
+        primary_key=["id"],
+        indexes=[],
+    )
+    assert empty_inventory_message(result([table], ["postgres"])) is None
+
+
+def test_the_empty_inventory_notice_is_rendered_under_the_score() -> None:
+    """Pins the WIRING: the message helper is useless if nothing renders it.
+
+    Placed under the score card because it is the SCORE that needs qualifying -- an
+    evaluation over zero tables still produces a confident band.
+    """
+    import inspect
+
+    from dsql_migrator.ui import evaluation as ev
+
+    body = inspect.getsource(ev._render_result)
+    assert "_render_empty_inventory_notice(ui, result)" in body, (
+        "the empty-inventory warning is no longer rendered, so a wrong-database run is "
+        "silent again"
+    )
+    notice = inspect.getsource(ev._render_empty_inventory_notice)
+    assert 'tone="warning"' in notice, "a wrong-database run must not read as informational"
+
+
+def test_postgres_reports_sibling_databases_and_mysql_reports_none() -> None:
+    """Only a one-database-per-connection engine has this trap; MySQL must stay silent."""
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.core.source_dialect import dialect_for
+
+    class _Rows:
+        def mappings(self):
+            return [{"datname": "ecommerce"}, {"datname": "analytics"}]
+
+    class _Conn:
+        def __init__(self) -> None:
+            self.statements: list[str] = []
+
+        def execute(self, statement, *a, **k):
+            self.statements.append(str(statement))
+            return _Rows()
+
+    pg_conn = _Conn()
+    assert dialect_for(SourceType.POSTGRES).sibling_databases(pg_conn) == [
+        "ecommerce",
+        "analytics",
+    ]
+    sql = pg_conn.statements[0]
+    # Only connectable, non-template databases, and never the one already connected.
+    assert "datallowconn" in sql and "NOT datistemplate" in sql
+    assert "current_database()" in sql
+
+    # MySQL assesses the whole cluster when Database is blank, so it has no equivalent.
+    assert dialect_for(SourceType.MYSQL).sibling_databases(_Conn()) == []
+
+    # A failure is best-effort: a hint must never break introspection.
+    class _Broken:
+        def execute(self, *a, **k):
+            raise RuntimeError("permission denied for table pg_database")
+
+    assert dialect_for(SourceType.POSTGRES).sibling_databases(_Broken()) == []

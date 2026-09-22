@@ -5,6 +5,112 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.499
+
+A Full Load audit, executed against a real PostgreSQL 16 rather than read. Eight defects that
+lose, corrupt or misreport data, plus four reporting defects and a wrong-database trap. Every
+fix was mutation-checked: the defect was re-introduced and the new test confirmed to fail.
+
+### Fixed
+
+- **A source-drop retry could skip rows it never wrote, and still report success.** The
+  resumable unit was the batch ORDINAL: `index <= high-water` means "this PK range is
+  committed" only while batch *i* denotes the same rows -- and the retry deliberately opens a
+  NEW snapshot (its own docstring explains that resuming the dead one would splice two points
+  in time, and promises the cost is only re-read I/O because `ON CONFLICT` skips what is
+  already written). The ordinal skip broke that promise: it does not re-write, it skips by
+  count. Reproduced -- with batches 0-2 committed (ids 1..6) and the application deleting
+  id=1 before the retry, the re-read's batch 3 became `[8, 9]` and **row 7 was never
+  written**, with `failures=0` and the table DONE. Because `_iter_batches` also cuts on a
+  payload-byte budget, a plain UPDATE that changes one already-loaded row's SIZE is enough --
+  no insert or delete needed. The watermark is now discarded before every re-read; a shard
+  reopening one SHARED PostgreSQL snapshot keeps it, because there the row sequence really is
+  stable.
+- **"Exclude column & reload" did nothing on a sharded table.** The shard worker does not go
+  through `migrate_table`, so it never applied the operator's oversized-LOB exclusions: the
+  column was read and written anyway, every >1 MiB value was rejected and the whole ROW
+  quarantined again -- the opposite of the intent, which is to keep the row and drop the
+  column -- and past the quarantine cap the load aborted. The recovery was therefore a no-op
+  on exactly the tables large enough to be sharded.
+- **A PostgreSQL DOMAIN bypassed the faithful read.** `format_type` reports a domain as the
+  DOMAIN's name, so the text-cast rule (json/jsonb/interval) matched nothing -- while
+  PostgreSQL still describes the result with the BASE type's OID, so psycopg applied the base
+  loader and produced the exact loss the cast prevents. Live-confirmed: a domain over jsonb
+  turned the JSON literal `null` into SQL NULL, and a domain over interval turned
+  `2 years 3 mons` into `820 days`, silently, with the table reported DONE.
+- **The tool's own remodel advice was unimplementable on the data path.** It tells the
+  operator exactly what to remodel a DSQL-unsupported PostgreSQL type to, and the loader even
+  parses the applied DDL's types -- but `PostgresValueConverter` discarded them, so every
+  value still arrived in the SOURCE type. Live-confirmed: `money` -> numeric was rejected
+  22P02 (psycopg returns `'$12.34'`), `text[]` -> jsonb was rejected 22P02, and **`bit` ->
+  bytea silently stored the ASCII digits of `'10101010'`** instead of the byte `0xAA`. The
+  read now follows the applied target type (textual targets take the canonical source text,
+  money casts to numeric, an array reads `to_jsonb`), and the bit -> bytea advice is withdrawn
+  because the loader cannot produce it faithfully.
+- **A date/time value PostgreSQL stores happily could kill the whole worker.** `infinity`, a
+  year past 9999 and a BC date load into `datetime` only by raising `psycopg.DataError` --
+  out of the streaming cursor, so not a per-row quarantine: the worker dies and the table
+  fails with a driver message ("timestamp too large (after year 10K)") naming no column.
+  These columns are now read as text, which handled all three faithfully on PostgreSQL 16.
+- **The identity-sequence sync discarded its own results when its connection dropped.** It
+  held ONE connection across every table with no reconnect -- the only post-load pass without
+  one -- and this pass runs at the END of a load that can take hours, when a short-lived DSQL
+  IAM token is most likely dead. Measured on a real backend kill: the function RAISED, 5 of 6
+  tables were left at `nextval=1` with `max(id)=11`, and even the recorded success was thrown
+  away. It now reconnects per table and keeps what it has. Separately, a failed `SELECT MAX`
+  was swallowed as a silent no-op (so the table vanished from the log while the same entry
+  promised "the first insert after cut-over cannot collide"), and `sql.Identifier(*name.split("."))`
+  split on EVERY dot, so a table whose bare name contains one addressed a relation that does
+  not exist.
+- **One exception killed the thread that carries Stop and liveness.** The Full Load progress
+  drain's loop body was unguarded, and `handle.update()` writes the job store on every
+  message. After it died, a user Stop never reached the workers (`cancel_event` is set only
+  there) and a healthy run was reaped by the 900s stall watchdog blaming an unresponsive
+  connection -- while `drain.join(timeout=5)` noticed nothing.
+- **A plain INSERT that stored fewer rows than it was sent counted them as "skipped".** Under
+  the NONE mode there is no `ON CONFLICT` clause, so there is nothing to conflict with: a
+  shortfall is lost rows, which is precisely what that mode exists to rule out. It now fails
+  the batch loudly.
+- **Quarantined rows could disappear on a resume, and a failed shard discarded its siblings'.**
+  `import_rows` cleared its quarantine sink on every call, so an attempt that skipped the
+  already-committed batches reported `quarantined=0` -- the table logged SUCCESS, no primary
+  key reached the error log, and the Validation gate never fired. Records now carry across a
+  resumed attempt, deduped by primary key. Separately, the per-row evidence loops sat in the
+  all-shards-clean branch, so one FAILED shard threw away every other shard's quarantine
+  records and index failures.
+- **"Accept quarantined rows" was a sticky, unscoped flag.** Consenting to a 3-row gap
+  auto-accepted every later run's gap, of any size, in any table -- so a load that dropped
+  thousands completed as a success nobody had agreed to, with the banner still saying "you
+  accepted that gap". The accepted row count is recorded, and a larger gap re-asks.
+- **An unknown row estimate is no longer reported as 0.** PostgreSQL 14+ reports
+  `reltuples = -1` for a never-analyzed table and `autovacuum_analyze_threshold` defaults to
+  50, so EVERY small PostgreSQL table is affected, not just freshly-loaded ones. The dialect
+  maps that to `None` on purpose; `or 0` threw the distinction away and the panel read
+  "5 / 0" -- a target apparently ahead of its source.
+- **Quarantine advice named only the one recovery that cannot work.** All three surfaces said
+  "fix the source value", impossible on a read-only source and impossible in principle when
+  the value is legitimately over 1 MiB -- the usual cause. They now also name
+  "Exclude column & reload", the tool's own answer. The sharded path's per-table log line was
+  bare ("12 rows newly loaded") with no mention of the quarantine that caused its FAILURE, and
+  now shares the single-path wording.
+- **An evaluation over ZERO tables warns instead of scoring an empty schema.** Zero migratable
+  tables is almost never a finding -- it is the wrong database, easiest to hit on PostgreSQL
+  (one database per connection, and Aurora always provides an empty `postgres` beside the real
+  one) and worst when the database and the schema share a name. The notice names the
+  DATABASE/schema confusion and lists the other databases on the server.
+
+### Internal
+
+- Bounded memory was MEASURED and the standing O(rows) suspicion refuted: retained memory is
+  flat across 4k / 20k / 40k rows (~0.05 bytes/row, ~0.5 MB extrapolated to 10M), peak traced
+  memory tracks one page x prefetch depth rather than row count, and `SKIP_EXISTING`'s key set
+  is rebuilt per batch. OCC retry, wait timeouts and lock ordering were checked and are sound.
+- Three of this release's own new assertions were VACUOUS on first write and were caught by
+  mutation-checking them: a whole-module string count also matched the parameter's own default;
+  a function-wide search also matched an adjacent call; and an `inspect.getsource` grep matched
+  the explanatory COMMENT rather than the emitted message. Each was replaced with a test that
+  drives the real code and asserts on its output.
+
 ## v0.1.498
 
 Five defects that share one shape: a value read **once, too early**, then reused as if it were

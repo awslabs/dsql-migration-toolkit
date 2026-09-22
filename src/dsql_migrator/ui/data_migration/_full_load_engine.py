@@ -853,6 +853,37 @@ def _abandon_pool_workers(pool) -> None:
             _LOGGER.debug("Full Load cancel: terminate failed", exc_info=True)
 
 
+def _discard_ordinal_resume_state(job) -> None:
+    """Drop the batch-ORDINAL resume watermark before a re-read of a different snapshot.
+
+    ``BatchedImporter`` skips a batch on resume when ``index <= high-water``, which is
+    only "this PK range is already committed" while batch index *i* denotes the same
+    rows. That holds within one snapshot -- and a source-drop retry deliberately opens a
+    NEW one (see :func:`_migrate_table_with_source_retry`, which spells out why resuming
+    the dead snapshot would splice two points in time). Once the row sequence shifts, the
+    ordinal no longer maps to a PK range:
+
+    * a row DELETED below the frontier shifts every later boundary by one row, and
+    * because ``_iter_batches`` also cuts on a payload-byte budget, a plain UPDATE that
+      changes one already-loaded row's SIZE is enough -- no insert or delete needed.
+
+    Either way the retry skips batches whose rows were never written, and the table still
+    reports ``failures=0`` / DONE, so nothing surfaces until Validation -- where, on a
+    CDC-coexisting run, a missing row is indistinguishable from the replication lag
+    operators are told to expect.
+
+    Discarding the watermark restores exactly the behaviour the retry already advertises:
+    re-read everything and let ``INSERT ... ON CONFLICT`` skip the rows already written.
+    The only cost is re-read I/O, which that docstring accepts by design.
+    """
+    if job is None:
+        return
+    try:
+        job.resume_batch_watermark = {}
+    except Exception:  # noqa: BLE001 - a test double may not carry the field
+        pass
+
+
 def _retry_source_drops_in_process(
     work,
     *,
@@ -860,6 +891,7 @@ def _retry_source_drops_in_process(
     table_name: str,
     release=None,
     source_type: SourceType = SourceType.MYSQL,
+    before_reread=None,
 ):
     """Run ``work()`` in a child process, retrying a dropped SOURCE connection.
 
@@ -899,6 +931,13 @@ def _retry_source_drops_in_process(
             # waiting -- see _wait_before_source_reread for why that matters.
             cause = f"{type(exc).__name__}: {exc}"
         _release_source_stream(release)
+        # The re-read opens a DIFFERENT snapshot (that is the whole point -- see above),
+        # so any batch-ORDINAL resume state from the failed attempt is now invalid: batch
+        # index i no longer denotes the same PK range once the row sequence shifts. This
+        # hook lets the caller discard it, restoring the idempotent-re-write behaviour
+        # this function's docstring already promises ("already-written rows are skipped").
+        if before_reread is not None:
+            before_reread()
         if not _wait_before_source_reread(
             table_name=table_name, attempt=attempt, attempts=attempts,
             backoff=backoff, cause=cause, cancelled=cancelled,
@@ -1073,6 +1112,10 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
                 cancelled=_is_cancelled,
                 table_name=name,
                 source_type=args.inputs.source_config.source_type,
+                # A whole-table re-read always opens a fresh snapshot, so the ordinal
+                # resume watermark cannot be carried across it -- see
+                # _discard_ordinal_resume_state.
+                before_reread=lambda: _discard_ordinal_resume_state(_resume_job),
             )
         )
         # Flush remaining progress.
@@ -1111,10 +1154,24 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
     Same pattern as _migrate_one_table_in_process but reads only the
     [pk_lower, pk_upper) slice. Each shard builds its own source connection +
     DSQL connection pool so they run on independent cores.
+
+    The operator's oversized-LOB column exclusions are applied HERE: this worker does not
+    go through :meth:`BatchedTableMigrator.migrate_table` (which filters), it drives the
+    exporter and importer directly -- and both derive their column lists from
+    ``table.columns``, so an unfiltered ``TableDef`` reads and writes the excluded column
+    anyway. That made "Exclude column & reload" a NO-OP on exactly the tables big enough to
+    be sharded: the >1 MiB values are rejected (54000) and the whole ROW is quarantined
+    again -- the opposite of the operator's intent, which is to keep the row and drop the
+    column -- and past the quarantine cap the load aborts outright. ``_slim_worker_inputs``
+    already carried the exclusions into the worker; only the filter was missing.
+    ``args.table`` retains the full column set for anything that must see it (a target
+    recreation must not drop the column from the SCHEMA).
     """
     progress_queue = _worker_progress_queue
     cancel_event = _worker_cancel_event
-    table = args.table
+    table = apply_lob_exclusions(
+        args.table, args.inputs.excluded_lob_columns.get(args.table.name)
+    )
     name = table.name
     # Signal that this worker actually began the table, so the parent marks the chunk
     # IN_PROGRESS now (a bounded pool runs only a few at once) rather than at submission.
@@ -1237,6 +1294,14 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             _attempt, cancelled=_is_cancelled, table_name=name,
             release=_release_rows,
             source_type=args.inputs.source_config.source_type,
+            # A shard re-read reopens the SAME exported snapshot when the dialect can
+            # share one (PostgreSQL SET TRANSACTION SNAPSHOT), and only then is the row
+            # sequence -- and so the batch-ordinal watermark -- stable across attempts.
+            before_reread=(
+                None
+                if args.shared_snapshot_id
+                else lambda: _discard_ordinal_resume_state(_resume_job)
+            ),
         )
         if (pending_loaded or pending_skipped) and progress_queue is not None:
             _report_progress(progress_queue, (name, pending_loaded, pending_skipped))
@@ -1453,30 +1518,46 @@ def _drain_progress_queue(
             msg = progress_queue.get(timeout=0.3)
         except Exception:  # noqa: BLE001 - queue.Empty or other
             continue
+
         if msg is _PROGRESS_SENTINEL:
             break
-        if msg == _HEARTBEAT:
-            # "Still alive, deliberately waiting" (a source-retry backoff). Stamps the
-            # watchdog's liveness clock without changing any job state.
-            handle.update(lambda job: None)
-            continue
-        if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == _CHUNK_STARTED:
-            # A worker actually began its table -> mark IN_PROGRESS now (not at submission).
-            # (== not is: the marker is pickled across the process boundary.)
-            handle.update(lambda job, n=msg[1]: _start_chunk_if_pending(job, n))
-            continue
-        if isinstance(msg, tuple) and len(msg) == 3 and msg[0] == _CHUNK_THROTTLED:
-            # Source-load governor paused/resumed a reader -> update the caption hint.
+        # Everything below writes the job store, so wrap the HANDLING of one message:
+        # this thread is the ONLY thing that mirrors handle.cancelled into cancel_event
+        # and the only thing that stamps the watchdog's liveness clock, and its body was
+        # unguarded. One exception out of handle.update() -- which writes on EVERY message
+        # -- killed the thread, and then a user Stop never reached the workers and a
+        # perfectly healthy run was reaped by the 900s stall watchdog blaming an
+        # unresponsive connection. ``drain.join(timeout=5)`` notices nothing, so the
+        # failure was invisible. A lost progress message costs a stale count; losing this
+        # thread costs the run.
+        try:
+            if msg == _HEARTBEAT:
+                # "Still alive, deliberately waiting" (a source-retry backoff). Stamps the
+                # watchdog's liveness clock without changing any job state.
+                handle.update(lambda job: None)
+                continue
+            if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == _CHUNK_STARTED:
+                # A worker actually began its table -> mark IN_PROGRESS now (not at
+                # submission). (== not is: the marker is pickled across the process boundary.)
+                handle.update(lambda job, n=msg[1]: _start_chunk_if_pending(job, n))
+                continue
+            if isinstance(msg, tuple) and len(msg) == 3 and msg[0] == _CHUNK_THROTTLED:
+                # Source-load governor paused/resumed a reader -> update the caption hint.
+                handle.update(
+                    lambda job, n=msg[1], p=msg[2]: _set_table_throttled(job, n, p)
+                )
+                continue
+            table_name, delta_loaded, delta_skipped = msg
             handle.update(
-                lambda job, n=msg[1], p=msg[2]: _set_table_throttled(job, n, p)
+                lambda job, n=table_name, dl=delta_loaded, ds=delta_skipped: (
+                    _start_then_advance(job, n, dl, ds)
+                )
             )
-            continue
-        table_name, delta_loaded, delta_skipped = msg
-        handle.update(
-            lambda job, n=table_name, dl=delta_loaded, ds=delta_skipped: (
-                _start_then_advance(job, n, dl, ds)
+        except Exception:  # noqa: BLE001 - one message must never kill the drain thread
+            _LOGGER.warning(
+                "Full Load progress drain could not apply a message; continuing",
+                exc_info=True,
             )
-        )
     # Final drain (anything left after stop).
     while True:
         try:
@@ -1485,20 +1566,29 @@ def _drain_progress_queue(
             break
         if msg is _PROGRESS_SENTINEL or msg is None:
             break
-        if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == _CHUNK_STARTED:
-            handle.update(lambda job, n=msg[1]: _start_chunk_if_pending(job, n))
-            continue
-        if isinstance(msg, tuple) and len(msg) == 3 and msg[0] == _CHUNK_THROTTLED:
+        # Guarded per message, like the main loop: this runs at TEARDOWN, where an
+        # exception would propagate out of the drain thread's target and be reported as a
+        # run failure for work that had already finished.
+        try:
+            if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == _CHUNK_STARTED:
+                handle.update(lambda job, n=msg[1]: _start_chunk_if_pending(job, n))
+                continue
+            if isinstance(msg, tuple) and len(msg) == 3 and msg[0] == _CHUNK_THROTTLED:
+                handle.update(
+                    lambda job, n=msg[1], p=msg[2]: _set_table_throttled(job, n, p)
+                )
+                continue
+            table_name, delta_loaded, delta_skipped = msg
             handle.update(
-                lambda job, n=msg[1], p=msg[2]: _set_table_throttled(job, n, p)
+                lambda job, n=table_name, dl=delta_loaded, ds=delta_skipped: (
+                    _start_then_advance(job, n, dl, ds)
+                )
             )
-            continue
-        table_name, delta_loaded, delta_skipped = msg
-        handle.update(
-            lambda job, n=table_name, dl=delta_loaded, ds=delta_skipped: (
-                _start_then_advance(job, n, dl, ds)
+        except Exception:  # noqa: BLE001 - teardown must not raise over a progress count
+            _LOGGER.warning(
+                "Full Load final progress drain could not apply a message; continuing",
+                exc_info=True,
             )
-        )
 
 
 def _log_quarantined_row(name: str, primary_key: object, message: object,
@@ -1521,9 +1611,16 @@ def _log_quarantined_row(name: str, primary_key: object, message: object,
         status=ActivityStatus.FAILURE,
         target=name,
         error_code=error_code,
+        # Names BOTH recoveries. "Fix the source value" is impossible on a read-only
+        # source, and impossible in principle when the value is legitimately over the
+        # 1 MiB cap -- which is the common case for this drop. Excluding the column is
+        # the tool's own answer there ("Exclude column & reload"), so omitting it left
+        # the audit trail advising the one thing that cannot be done.
         detail=(
             f"row pk[{primary_key}] PERMANENTLY DROPPED: {message}. The rest of the "
-            "table loaded; fix the source value and reload this table to close the gap."
+            "table loaded; either reduce the source value and reload this table, or -- "
+            "if the value is legitimately too large -- use \"Exclude column & reload\" "
+            "to migrate the table without that column."
         ),
     )
 
@@ -1819,17 +1916,7 @@ def _migrate_one_table(
         _record_index_failures(
             error_log, job_id, name, getattr(outcome, "index_failures", ())
         )
-        skipped_note = (
-            f", {outcome.rows_skipped:,} already on target (skipped)"
-            if outcome.rows_skipped
-            else ""
-        )
         quarantined = getattr(outcome, "rows_quarantined", 0) or 0
-        quarantine_note = f", {quarantined:,} quarantined" if quarantined else ""
-        # Surface any oversized-LOB column excluded from THIS table's load in the
-        # per-table detail too (the run-level "column excluded" events are the audit
-        # record; this is the at-a-glance echo on the table's own line).
-        excluded_note = _lob_excluded_note(migrator, name)
         # Quarantined rows are permanently DROPPED from the target (e.g. a value
         # over DSQL's ~1 MiB per-value limit, or another non-retryable row error),
         # so the table did NOT fully load. Report it as a FAILURE -- not SUCCESS --
@@ -1844,16 +1931,11 @@ def _migrate_one_table(
             "load table",
             status=ActivityStatus.FAILURE if had_quarantine else ActivityStatus.SUCCESS,
             target=name,
-            detail=(
-                f"{outcome.rows_loaded:,} rows newly loaded"
-                f"{skipped_note}{quarantine_note}{excluded_note}"
-                + (
-                    " -- quarantined rows were DROPPED (e.g. a value over DSQL's "
-                    "~1 MiB per-value limit); see the error log and re-run after "
-                    "fixing the source value"
-                    if had_quarantine
-                    else ""
-                )
+            detail=_load_table_detail(
+                migrator, name,
+                rows_loaded=outcome.rows_loaded,
+                quarantined=quarantined,
+                skipped=outcome.rows_skipped,
             ),
         )
         handle.update(
@@ -2227,6 +2309,30 @@ def _migrate_tables_in_parallel(
                         ]
                         any_failed = any(r.status == "FAILED" for r in shard_results[name])
                         any_stopped = any(r.status == "STOPPED" for r in shard_results[name])
+                        # Record every shard's PER-ROW evidence BEFORE branching on the
+                        # sibling outcomes. These loops used to live in the all-clean branch
+                        # only, so one FAILED or STOPPED shard discarded the quarantine
+                        # records and index failures of every OTHER shard: rows those shards
+                        # permanently dropped vanished from the error log and the audit trail,
+                        # leaving "one or more shards failed" as the only trace and no primary
+                        # key to act on -- exactly when the operator needs the detail most.
+                        # The chunk verdict below is unchanged; only the evidence is kept.
+                        for rec in all_quarantine:
+                            error_log.record(job_id, DataErrorRecord(
+                                table=name, chunk_id=name,
+                                error_code=rec.get("error_code"),
+                                message=f"quarantined row pk[{rec.get('primary_key')}]: {rec.get('message')}",
+                                occurred_at=datetime.now(timezone.utc),
+                            ))
+                            _log_quarantined_row(
+                                name, rec.get("primary_key"), rec.get("message"),
+                                rec.get("error_code"),
+                            )
+                        _record_index_failures(
+                            error_log, job_id, name,
+                            [f for r in shard_results[name]
+                             for f in (r.index_failures or ())],
+                        )
                         if any_failed:
                             # Record EVERY shard's outcome (status + rows + message),
                             # not just failed shards that carried a message. A shard
@@ -2249,35 +2355,32 @@ def _migrate_tables_in_parallel(
                                     ))
                             log_activity(ActivityCategory.FULL_LOAD, "load table",
                                 status=ActivityStatus.FAILURE, target=name,
-                                detail=f"one or more shards failed ({total_loaded:,} rows loaded)")
+                                detail=_load_table_detail(
+                                    migrator, name,
+                                    rows_loaded=total_loaded,
+                                    quarantined=len(all_quarantine),
+                                    skipped=total_skipped,
+                                ) + " -- one or more shards FAILED, so the table is "
+                                "incomplete beyond any quarantined rows")
                             handle.update(lambda job, n=name: _fail_chunk(job, n))
                             _tally(_TableLoadOutcome.FAILED)
                         elif any_stopped:
                             handle.update(lambda job, n=name: _fail_chunk(job, n))
                             _tally(_TableLoadOutcome.STOPPED)
                         else:
-                            for rec in all_quarantine:
-                                error_log.record(job_id, DataErrorRecord(
-                                    table=name, chunk_id=name,
-                                    error_code=rec.get("error_code"),
-                                    message=f"quarantined row pk[{rec.get('primary_key')}]: {rec.get('message')}",
-                                    occurred_at=datetime.now(timezone.utc),
-                                ))
-                                _log_quarantined_row(
-                                    name, rec.get("primary_key"), rec.get("message"),
-                                    rec.get("error_code"),
-                                )
-                            _record_index_failures(
-                                error_log, job_id, name,
-                                [f for r in shard_results[name]
-                                 for f in (r.index_failures or ())],
-                            )
                             had_q = len(all_quarantine) > 0
                             log_activity(ActivityCategory.FULL_LOAD, "load table",
                                 status=ActivityStatus.FAILURE if had_q else ActivityStatus.SUCCESS,
                                 target=name,
-                                detail=f"{total_loaded:,} rows loaded across {expected_shards} shards"
-                                + _lob_excluded_note(migrator, name))
+                                # Shares the single-path wording so a sharded FAILURE
+                                # explains WHY (the quarantine), instead of a bare row count
+                                # that reads as contradicting the screen's DONE badge.
+                                detail=_load_table_detail(
+                                    migrator, name,
+                                    rows_loaded=total_loaded,
+                                    quarantined=len(all_quarantine),
+                                    skipped=total_skipped,
+                                ) + f" across {expected_shards} shards")
                             handle.update(lambda job, n=name, r=total_loaded, s=total_skipped,
                                 q=len(all_quarantine):
                                 _complete_chunk(job, n, r, s, q))
@@ -2315,11 +2418,20 @@ def _migrate_tables_in_parallel(
                             _record_index_failures(
                                 error_log, job_id, name, result.index_failures
                             )
+                            # Same detail as the in-process path: a FAILURE whose text says
+                            # only "N rows newly loaded" is an unexplained failure, and it
+                            # reads as contradicting the screen (which shows the table DONE
+                            # with a "dropped" badge). The status is deliberate -- a table
+                            # missing rows must not be logged as a success -- so the fix is
+                            # to say WHY, on the path that was silent about it.
                             log_activity(ActivityCategory.FULL_LOAD, "load table",
                                 status=ActivityStatus.FAILURE if had_quarantine else ActivityStatus.SUCCESS,
                                 target=name,
-                                detail=f"{result.rows_loaded:,} rows newly loaded"
-                                + _lob_excluded_note(migrator, name))
+                                detail=_load_table_detail(
+                                    migrator, name,
+                                    rows_loaded=result.rows_loaded,
+                                    quarantined=len(result.quarantine_records),
+                                ))
                             handle.update(lambda job, n=name, r=result.rows_loaded, s=result.rows_skipped,
                                 q=len(result.quarantine_records):
                                 _complete_chunk(job, n, r, s, q))
@@ -2475,6 +2587,9 @@ def _finalize_run(
     error_log: ErrorLogStore,
     *,
     accept_quarantined_rows: bool,
+    # The row count that acceptance covered, so a LARGER later gap re-asks instead of being
+    # waved through by a stale flag. None = not recorded (older acceptance): behave as before.
+    accepted_quarantine_rows: "Optional[int]" = None,
     inputs: "Optional[DataMigrationInputs]" = None,
     sync_sequences: "Optional[Callable[..., dict]]" = None,
     # Foreign keys the run did NOT apply because they are now an explicit operator action
@@ -2557,7 +2672,14 @@ def _finalize_run(
     # dropped row (PK + reason), distinct from a table-level load failure.
     quarantined_rows = _count_quarantined_rows(error_log, job_id, error_job_ids)
     quarantine_only = counts.real_failed == 0 and counts.quarantined > 0
-    if accept_quarantined_rows and quarantine_only:
+    # Auto-accept only a gap NO LARGER than the one the operator actually consented to.
+    # ``accepted_quarantine_rows`` is None for an acceptance recorded before this was
+    # tracked (or by a caller that does not supply it), which keeps the old behaviour for
+    # that case rather than re-blocking a run retroactively.
+    gap_within_acceptance = (
+        accepted_quarantine_rows is None or quarantined_rows <= accepted_quarantine_rows
+    )
+    if accept_quarantined_rows and quarantine_only and gap_within_acceptance:
         log_activity(
             ActivityCategory.FULL_LOAD,
             "run completed (quarantine accepted)",
@@ -2617,31 +2739,13 @@ def _finalize_run(
         status=ActivityStatus.FAILURE,
         detail=". ".join(detail_parts),
     )
-    if quarantine_only:
-        guidance = (
-            f"{quarantined_rows} row(s) were QUARANTINED (permanently dropped, "
-            "e.g. a value over DSQL's ~1 MiB per-value limit) and are listed in "
-            "the downloadable error log by primary key. Fix the offending source "
-            "value(s) and re-run Full Load (the idempotent re-load fills only the "
-            "gap), or choose 'Accept quarantined rows & continue' to proceed to "
-            "CDC with the gap acknowledged; a plain retry cannot recover a "
-            "permanently-rejected value."
-        )
-    elif quarantined_rows:
-        guidance = (
-            "some tables failed to load and "
-            f"{quarantined_rows} row(s) were quarantined; review the downloadable "
-            "error log, fix the offending source value(s) for quarantined rows, "
-            "then use 'Retry failed tables'."
-        )
-    else:
-        guidance = (
-            "review the downloadable error log, then use 'Retry failed tables' to "
-            "load the remaining tables before validating."
-        )
     raise FullLoadIncompleteError(
-        f"Full Load incomplete: {incomplete} of {total} table(s) did not fully "
-        f"load. The target holds partial data -- {guidance}"
+        incomplete_load_message(
+            incomplete=incomplete,
+            total=total,
+            quarantined_rows=quarantined_rows,
+            quarantine_only=quarantine_only,
+        )
     )
 
 
@@ -2914,6 +3018,92 @@ def _log_captured_watermark(
     )
 
 
+# JobManager caps the PERSISTED job error at 300 characters -- it takes the first line and
+# truncates, because ``str(exc)`` on a psycopg error carries DETAIL: / "Failing row
+# contains (...)" lines with the offending row's column VALUES, and the record is written
+# to the job store. So the cap is a Property 7 protection and is not going away: any
+# guidance past it is silently dropped. That bit once: a richer wording pushed the last
+# recovery option (and then "re-run" itself) past the cut, leaving an error that named
+# fewer ways out than the tool actually offers. Pinned by
+# ``test_run_level_quarantine_guidance_survives_the_persisted_error_cap``.
+_PERSISTED_ERROR_CAP = 300
+
+
+def incomplete_load_message(
+    *,
+    incomplete: int,
+    total: int,
+    quarantined_rows: int,
+    quarantine_only: bool,
+) -> str:
+    """The ``FullLoadIncompleteError`` text: what is wrong, then every real recovery.
+
+    Pure and public so the 300-character budget (see :data:`_PERSISTED_ERROR_CAP`) can be
+    asserted directly instead of being discovered when an operator loses the tail of the
+    advice. Deliberately terse and front-loaded for that reason -- the full wording lives
+    on the panel banner, which is not truncated.
+
+    For a quarantine-only run all three recoveries are named, including
+    ``"Exclude column & reload"``: "fix the source value" is impossible on a read-only
+    source and impossible in principle when the value is legitimately over DSQL's ~1 MiB
+    per-value cap, which is the usual cause of the drop.
+    """
+    if quarantine_only:
+        guidance = (
+            f"{quarantined_rows} row(s) QUARANTINED (permanently dropped). Reduce the "
+            "value and re-run, or 'Exclude column & reload' if it is legitimately too "
+            "large, or 'Accept quarantined rows & continue'. See the error log."
+        )
+    elif quarantined_rows:
+        guidance = (
+            "some tables failed to load and "
+            f"{quarantined_rows} row(s) were quarantined; review the error log, then "
+            "'Retry failed tables', or 'Exclude column & reload' for a value that is "
+            "legitimately too large to store."
+        )
+    else:
+        guidance = (
+            "review the downloadable error log, then use 'Retry failed tables' to "
+            "load the remaining tables before validating."
+        )
+    return (
+        f"Full Load incomplete: {incomplete} of {total} table(s) did not fully "
+        f"load. The target holds partial data -- {guidance}"
+    )
+
+
+def _load_table_detail(
+    migrator: "DataMigrator",
+    table_name: str,
+    *,
+    rows_loaded: int,
+    quarantined: int,
+    skipped: int = 0,
+) -> str:
+    """The per-table ``"load table"`` activity detail, shared by every load path.
+
+    Factored out because the sharded path built its own shorter string: a FAILURE whose
+    text said only "N rows newly loaded", with no mention of the quarantine that CAUSED
+    the failure. That read as an unexplained failure and as contradicting the screen,
+    which shows the table DONE with a "dropped" badge. The FAILURE status is deliberate
+    (a table missing rows must never be logged as a success) -- what was missing was the
+    reason, on the path least likely to be checked by hand (the large, sharded tables).
+    """
+    skipped_note = f", {skipped:,} already on target (skipped)" if skipped else ""
+    quarantine_note = f", {quarantined:,} quarantined" if quarantined else ""
+    explanation = (
+        " -- quarantined rows were DROPPED (e.g. a value over DSQL's ~1 MiB per-value "
+        "limit); see the error log, then reload after reducing the source value or use "
+        '"Exclude column & reload" if the value is legitimately too large'
+        if quarantined
+        else ""
+    )
+    return (
+        f"{rows_loaded:,} rows newly loaded{skipped_note}{quarantine_note}"
+        f"{_lob_excluded_note(migrator, table_name)}{explanation}"
+    )
+
+
 def _lob_excluded_note(migrator: "DataMigrator", table_name: str) -> str:
     """Return the per-table `` (N column(s) excluded: ...)`` suffix, or ``""``.
 
@@ -2939,6 +3129,7 @@ def run_full_load(
     migrator: DataMigrator,
     error_log: ErrorLogStore,
     accept_quarantined_rows: bool = False,
+    accepted_quarantine_rows: "Optional[int]" = None,
     # Needed only to open a target connection for the post-load identity-sequence sync
     # (see _sync_identity_sequences_after_load). Optional so existing callers/tests that
     # do not exercise that path keep working -- but the UI DOES pass it, because an
@@ -3075,6 +3266,7 @@ def run_full_load(
         error_log,
         foreign_keys_pending=_fk_pending,
         accept_quarantined_rows=accept_quarantined_rows,
+        accepted_quarantine_rows=accepted_quarantine_rows,
         inputs=inputs,
     )
 
@@ -3189,6 +3381,7 @@ def run_full_load_retry(
     error_log: ErrorLogStore,
     watermark: Optional[Watermark] = None,
     accept_quarantined_rows: bool = False,
+    accepted_quarantine_rows: "Optional[int]" = None,
     # The PRIOR run's identity, so the error-log lineage survives the new job id (see
     # _seed_retry_chunks). Defaulted: an omitting caller just gets the old behavior.
     prior_job_id: Optional[str] = None,
@@ -3275,6 +3468,7 @@ def run_full_load_retry(
         ] or list(retry_names),
         foreign_keys_pending=_fk_pending,
         accept_quarantined_rows=accept_quarantined_rows,
+        accepted_quarantine_rows=accepted_quarantine_rows,
         error_job_ids=error_job_ids,
         inputs=inputs,
     )
@@ -3622,7 +3816,13 @@ class BatchedTableMigrator:
             slot_name=slot_name,
             publication_name=publication_name,
             # None estimate (never-analyzed / missing) -> 0, matching the MySQL baseline.
-            table_row_counts={n: (c or 0) for n, c in estimates.items()},
+            # Pass the estimate through UNCHANGED, including None. ``or 0`` threw away the
+            # one distinction the dialect goes out of its way to make: PostgreSQL 14+
+            # reports reltuples = -1 for a never-analyzed table -- the normal state of a
+            # freshly bulk-loaded source -- and ``parse_estimate`` maps that to None for
+            # "unknown". Collapsed to 0, the panel showed "5 / 0": a target apparently
+            # ahead of its source. The UI already renders None as an em dash.
+            table_row_counts=dict(estimates),
             row_counts_approximate=True,
         )
 

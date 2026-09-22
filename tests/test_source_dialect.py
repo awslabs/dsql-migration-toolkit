@@ -593,11 +593,14 @@ def test_postgres_select_column_casts_json_and_interval_to_text(pg_type: str) ->
 
 @pytest.mark.parametrize(
     "pg_type",
-    ["integer", "bigint", "text", "numeric(12,2)", "uuid", "timestamp with time zone",
-     "bytea", "boolean"],
+    ["integer", "bigint", "text", "numeric(12,2)", "uuid", "bytea", "boolean"],
 )
 def test_postgres_select_column_reads_scalars_as_is(pg_type: str) -> None:
     # Everything that binds natively is read as-is (just quoted) -- no needless cast.
+    # ``timestamp with time zone`` was in this list until PostgreSQL 16 proved a native read
+    # RAISES for values it stores happily -- infinity, a year past 9999, a BC date -- killing
+    # the whole worker rather than quarantining a row (see
+    # test_postgres_reads_date_time_as_text_so_out_of_range_values_do_not_kill_the_worker).
     from dsql_migrator.core.models import ColumnDef
 
     d = dialect_for(SourceType.POSTGRES)
@@ -1354,3 +1357,33 @@ def test_non_pk_identity_column_is_recorded_for_every_column() -> None:
     assert by_name["id"].identity is True
     assert by_name["invoice_no"].identity is True  # NON-key: the case that was invisible
     assert by_name["note"].identity is False
+
+
+@pytest.mark.parametrize(
+    "pg_type",
+    ["date", "timestamp", "timestamptz", "timestamp with time zone",
+     "timestamp without time zone", "timestamp(6) with time zone"],
+)
+def test_postgres_reads_date_time_as_text_so_out_of_range_values_do_not_kill_the_worker(
+    pg_type: str,
+) -> None:
+    """psycopg cannot represent every value PostgreSQL stores in a date/time column.
+
+    ``infinity``/``-infinity``, a year past 9999 and a BC date all load into ``datetime``
+    only by raising ``psycopg.DataError``. That error comes out of the STREAMING CURSOR, so
+    it is not a per-row quarantine: the worker dies and the table fails, with a driver
+    message ("timestamp too large (after year 10K)") that names no column. Live-verified on
+    PostgreSQL 16 -- the native read raised for all three, the text cast read all three
+    faithfully. The session pins ISO DateStyle + UTC, so the text is unambiguous, and the
+    exporter table-qualifies the PK in ORDER BY, so a text-cast timestamp PK still paginates
+    on the NATIVE ordering and stays gapless.
+    """
+    from dsql_migrator.core.models import ColumnDef
+
+    d = dialect_for(SourceType.POSTGRES)
+    assert d.select_column_sql(ColumnDef(name="c", mysql_type=pg_type)) == (
+        'CAST("c" AS text) AS "c"'
+    ), pg_type
+
+    # A time-of-day column has no such range problem, so it must NOT be cast needlessly.
+    assert d.select_column_sql(ColumnDef(name="c", mysql_type="time")) == '"c"'

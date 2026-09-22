@@ -290,9 +290,13 @@ _PG_UNSUPPORTED_REMODEL = {
     "macaddr8": "text",
     "xml": "text",
     "money": "numeric (preserves the exact amount; avoid locale-formatted text)",
-    "bit": "text (the bit string, e.g. '10101010') or bytea",
-    "bit varying": "text (the bit string) or bytea",
-    "varbit": "text (the bit string) or bytea",
+    # NOT bytea: the loader reads a bit string as its text, so binding it to bytea
+    # stored the ASCII digits of "10101010" rather than the byte 0xAA -- silent
+    # corruption a green DONE hid, catchable only by a CHECKSUM validation. Advise only
+    # what the data path can faithfully produce.
+    "bit": "text (the bit string, e.g. '10101010')",
+    "bit varying": "text (the bit string)",
+    "varbit": "text (the bit string)",
     "tsvector": "text",
     "tsquery": "text",
     "point": "text, or separate numeric columns for the coordinates",

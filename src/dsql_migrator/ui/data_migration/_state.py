@@ -74,6 +74,9 @@ class DataMigrationState:
         # Load no longer blocks CDC. Set explicitly via "Accept quarantined rows";
         # carried into re-runs so the engine completes a quarantine-only run.
         self.accept_quarantined_rows: bool = False
+        # How many rows that acceptance covered, so a LARGER later gap re-asks
+        # instead of being waved through by a stale flag. None = no count recorded.
+        self.accepted_quarantine_rows: Optional[int] = None
         # Active sub-step of the Prerequisites -> Full Load -> CDC stepper. Held
         # here so it survives the content re-render driven by the progress poller
         # (None => derive a sensible default from the current job/prereq state).
@@ -1035,10 +1038,21 @@ class DataMigrationState:
             self.selection = selection
             self.selection_touched = True
 
-    def set_accept_quarantined_rows(self, accepted: bool) -> None:
-        """Record whether permanently-quarantined rows are accepted (UI thread)."""
+    def set_accept_quarantined_rows(
+        self, accepted: bool, *, gap: "Optional[int]" = None
+    ) -> None:
+        """Record whether permanently-quarantined rows are accepted (UI thread).
+
+        ``gap`` is the row count the operator actually consented to losing. Without it the
+        flag was STICKY and UNSCOPED: one acceptance of a 3-row gap silently auto-accepted
+        every later run's gap, of any size and in any table, so a second load that dropped
+        thousands completed as a success the operator had never seen -- and the banner still
+        said "you accepted that gap". Recording the number lets the finaliser re-ask when
+        the gap GREW. Clearing the flag clears the number with it.
+        """
         with self._lock:
             self.accept_quarantined_rows = accepted
+            self.accepted_quarantine_rows = int(gap) if accepted and gap is not None else None
 
     def set_active_substep(self, substep: Optional[str]) -> None:
         """Record the active Prerequisites/Full Load/CDC sub-step (UI thread).

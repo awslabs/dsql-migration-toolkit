@@ -748,7 +748,7 @@ def build_migration_table_status(
     poll.
     """
     chunks_by_table: dict[str, ChunkState] = {}
-    expected: dict[str, int] = {}
+    expected: dict[str, Optional[int]] = {}
     if full_load_job is not None:
         chunks_by_table = {c.chunk_id: c for c in full_load_job.chunks}
         if full_load_job.watermark is not None:
@@ -771,9 +771,11 @@ def build_migration_table_status(
             # A live source figure was supplied. It is an estimate unless the
             # caller says it ran an exact count (source_is_estimate=False).
             src, est = live_source, source_is_estimate
-        elif name in expected:
+        elif expected.get(name) is not None:
             # Fall back to the Full Load watermark snapshot count -- always an
-            # approximate (scan-free) figure.
+            # approximate (scan-free) figure. Keyed on the VALUE, not just presence: a
+            # table whose estimate is None is present in the watermark but has no figure,
+            # and taking that branch would label the missing number an "estimate".
             src, est = expected[name], True
         else:
             src, est = None, False
@@ -1185,7 +1187,9 @@ class WatermarkDisplay:
     server_uuid: str
     snapshot_timestamp: str
     summary: str
-    table_row_counts: dict[str, int]
+    # ``None`` for a table whose snapshot estimate is UNKNOWN (never-analyzed PostgreSQL
+    # table); the panel renders it as an em dash, not as 0.
+    table_row_counts: dict[str, Optional[int]]
     # PostgreSQL-source coordinates (empty for a MySQL source). A PG watermark has a
     # WAL LSN + replication slot + publication instead of binlog/GTID/server-uuid, so
     # the panel must show these rather than rendering the MySQL fields as "unavailable"

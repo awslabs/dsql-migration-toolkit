@@ -110,8 +110,67 @@ def _reads_as_text(type_string: str) -> bool:
     to the identical target column as an unknown-typed literal (oid 0, which the server
     re-parses) is faithful for all of them -- the same path MySQL's JSON text uses.
     """
-    base = type_string.split("(", 1)[0].strip().lower()
-    return base in ("json", "jsonb") or base.startswith("interval")
+    base = _base_type_name(type_string)
+    if base in ("json", "jsonb") or base.startswith("interval"):
+        return True
+    # Date/time types, for the same reason one step further: psycopg loads them into
+    # ``datetime``, which CANNOT represent values PostgreSQL stores happily --
+    # ``infinity``/``-infinity``, a year past 9999, or a BC date. Those raise
+    # ``psycopg.DataError`` ("timestamp too large (after year 10K)") on the READ, which is
+    # not a per-row quarantine but an exception out of the streaming cursor: the whole
+    # worker dies and the table fails, with a driver message that names no column.
+    # Live-verified on PostgreSQL 16; the text cast reads all three faithfully, and the
+    # session already pins ISO DateStyle + UTC so the text is unambiguous and re-parses
+    # into the identical value on the target.
+    return base in ("date", "timestamp", "timestamptz") or base.startswith("timestamp")
+
+
+def _base_type_name(type_string: str) -> str:
+    """The lower-cased type name with any precision/length modifier stripped."""
+    return str(type_string or "").split("(", 1)[0].strip().lower()
+
+
+# Target types that accept a value's canonical SOURCE TEXT verbatim. Reading a remodelled
+# column as ``CAST(col AS text)`` and binding it as an unknown-typed literal (oid 0, which
+# the server re-parses) is faithful for these -- the same mechanism json/interval already
+# use. This is what makes the tool's own remodel advice ("inet -> text, its canonical
+# address string round-trips losslessly", xml/tsvector/point/geometric -> text) actually
+# work on the data path; without it the value arrived in the SOURCE type and the target
+# rejected it, or -- worse -- accepted a wrong one.
+_PG_TEXTUAL_TARGETS = frozenset(
+    {"text", "varchar", "character varying", "char", "character", "citext"}
+)
+
+
+def _pg_read_expression(
+    quoted: str, source_type: str, target_type: Optional[str]
+) -> Optional[str]:
+    """The SELECT expression for a column whose TARGET type differs from its source.
+
+    ``None`` when no target-driven cast is needed (the caller falls back to the
+    source-driven rule). Each case below exists because the operator was TOLD to remodel
+    this way by ``converter_postgres._PG_UNSUPPORTED_REMODEL`` and the loader then had to
+    be able to produce it:
+
+    * -> a textual target: read the canonical source text.
+    * ``money`` -> ``numeric``: psycopg returns money as a LOCALE-FORMATTED string
+      (``'$12.34'``), which numeric rejects (22P02), so cast on the source instead.
+    * an ARRAY -> ``jsonb``: the array's own text (``{a,b}``) is not JSON, so read
+      ``to_jsonb(col)`` as text.
+    """
+    if not target_type:
+        return None
+    src = _base_type_name(source_type)
+    tgt = _base_type_name(target_type)
+    if src == tgt:
+        return None
+    if tgt in _PG_TEXTUAL_TARGETS:
+        return f"CAST({quoted} AS text) AS {quoted}"
+    if src == "money" and tgt in ("numeric", "decimal"):
+        return f"CAST({quoted} AS numeric) AS {quoted}"
+    if source_type.strip().endswith("[]") and tgt in ("jsonb", "json"):
+        return f"CAST(to_jsonb({quoted}) AS text) AS {quoted}"
+    return None
 
 # PostgreSQL integer base types (lower-cased, precision stripped). Same sharding
 # rationale as MySQL: only a collation-free integer leading PK column is range-shardable.
@@ -258,7 +317,14 @@ def _pg_enrich_columns(connection: object, enrich_db: str, tables: list) -> None
                 "(SELECT cl.collname FROM pg_collation cl "
                 " WHERE cl.oid = a.attcollation "
                 "   AND cl.collname NOT IN ('default', 'C', 'POSIX')) AS coll "
+                # A DOMAIN's format_type is the domain NAME, but PostgreSQL still
+                # describes the result with the BASE type's OID (so psycopg applies the
+                # base loader). Carry the base type so read decisions see the storage
+                # type; NULL for a non-domain (typtype <> 'd').
+                ", CASE WHEN t.typtype = 'd' THEN "
+                "  format_type(t.typbasetype, a.atttypmod) END AS base_typ "
                 "FROM pg_attribute a "
+                "JOIN pg_type t ON t.oid = a.atttypid "
                 "JOIN pg_class c ON c.oid = a.attrelid "
                 "JOIN pg_namespace n ON n.oid = c.relnamespace "
                 "WHERE c.relname = :rel AND a.attnum > 0 "
@@ -269,6 +335,7 @@ def _pg_enrich_columns(connection: object, enrich_db: str, tables: list) -> None
         exact = {
             row["col"]: (
                 row["typ"], row.get("gen"), row.get("ident"), row.get("coll"),
+                row.get("base_typ"),
             )
             for row in rows
         }
@@ -290,6 +357,10 @@ def _pg_enrich_columns(connection: object, enrich_db: str, tables: list) -> None
                 # fire for a PG source.
                 if resolved[3]:
                     column.collation = resolved[3]
+                # A DOMAIN column: record the storage type so select_column_sql's
+                # text-cast rule matches on it rather than on the domain's own name.
+                if len(resolved) > 4 and resolved[4]:
+                    column.base_type = str(resolved[4])
         # A serial/identity PRIMARY-KEY column becomes the auto_increment_column so the
         # converter's primary-key strategy (IDENTITY / UUID / KEEP) applies to it.
         if table.auto_increment_column is None:
@@ -603,6 +674,24 @@ class PostgresSourceDialect(SourceDialect):
         except Exception:  # noqa: BLE001 - best-effort; never break introspection
             return None
 
+    def sibling_databases(self, connection: object) -> "list[str]":
+        # The other connectable, non-template databases on this server. Read from the same
+        # catalog ``database_collation`` above already uses, so this costs one extra cheap
+        # query and no new privilege. Best-effort: a failure returns none rather than
+        # breaking introspection over a hint.
+        try:
+            rows = connection.execute(  # type: ignore[attr-defined]
+                text(
+                    "SELECT datname FROM pg_database "
+                    "WHERE datallowconn AND NOT datistemplate "
+                    "  AND datname <> current_database() "
+                    "ORDER BY datname"
+                )
+            ).mappings()
+            return [str(row["datname"]) for row in rows]
+        except Exception:  # noqa: BLE001 - best-effort; never break introspection
+            return []
+
     def list_extensions(self, connection: object) -> "list[str]":
         # ``plpgsql`` is excluded: it is installed in every PostgreSQL database by default
         # and is not something the operator chose. Best-effort -- a failure returns none
@@ -638,7 +727,9 @@ class PostgresSourceDialect(SourceDialect):
     def integer_pk_types(self) -> frozenset[str]:
         return _PG_INTEGER_PK_TYPES
 
-    def select_column_sql(self, column: object) -> str:
+    def select_column_sql(
+        self, column: object, *, target_type: Optional[str] = None
+    ) -> str:
         # Most columns read as-is (quoted). json/jsonb/interval are read via a text cast so
         # Full Load streams their EXACT text and binds it back to the identical target
         # column as an unknown-typed literal (oid 0), which the server re-parses --
@@ -652,7 +743,24 @@ class PostgresSourceDialect(SourceDialect):
         # the PK in ORDER BY (see keyset_stream) to keep both orderings native and gapless.
         # PostGIS geometry is out of scope (no ST_AsBinary-style case) for a first release.
         quoted = self.quote_identifier(column.name)  # type: ignore[attr-defined]
-        if _reads_as_text(column.mysql_type):  # type: ignore[attr-defined]
+        # Match on the STORAGE type. A DOMAIN's format_type is the domain's own NAME, so
+        # matching ``mysql_type`` alone missed a domain over jsonb/interval -- while
+        # PostgreSQL still describes the result with the BASE type's OID, so psycopg
+        # applied the base loader and the exact loss this cast exists to prevent happened
+        # silently: a JSON literal ``null`` became SQL NULL, and ``1 mon`` became
+        # ``30 days``. ``base_type`` is set only for a domain (see ColumnDef.base_type).
+        declared = getattr(column, "mysql_type", "")  # type: ignore[attr-defined]
+        storage = getattr(column, "base_type", None) or declared
+        # The APPLIED target type wins when it differs: the operator may have remodelled a
+        # DSQL-unsupported type on the tool's own advice, and until this consulted
+        # ``target_type`` that advice was unimplementable on the data path -- the value
+        # arrived in the SOURCE type, so money->numeric and array->jsonb were rejected with
+        # an opaque driver error and bit->bytea SILENTLY stored the ASCII digits of the bit
+        # string instead of the bits.
+        retyped = _pg_read_expression(quoted, storage, target_type)
+        if retyped is not None:
+            return retyped
+        if _reads_as_text(declared) or _reads_as_text(storage):
             return f"CAST({quoted} AS text) AS {quoted}"
         return quoted
 

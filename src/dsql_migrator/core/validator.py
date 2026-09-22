@@ -1657,10 +1657,14 @@ class Validator:
         time, never during the migration itself, and is dispatched per source engine
         (MySQL ``COUNT(*)``; PostgreSQL keyset-bounded like the target).
         """
+        # ``is not None``, not merely present: an entry can be None for "unknown" (a
+        # never-analyzed PostgreSQL table). Such a watermark is always approximate, so
+        # this branch is unreachable for it today -- but returning None here would make
+        # the row-count comparison silently compare against nothing.
         if (
             watermark is not None
             and not watermark.row_counts_approximate
-            and table.name in watermark.table_row_counts
+            and watermark.table_row_counts.get(table.name) is not None
         ):
             return watermark.table_row_counts[table.name]
         return _source_row_count_live(

@@ -112,6 +112,21 @@ def _default_connector_factory(conn: TargetConnectionConfig) -> _Connector:
     return DsqlConnector(conn)
 
 
+def _table_identifier(name: str):
+    """A psycopg identifier for a ``schema.table`` name, splitting on the FIRST dot only.
+
+    ``sql.Identifier(*name.split("."))`` splits on EVERY dot, so a table whose bare name
+    contains one (``app."orders.2024"``) became a three-part identifier and every statement
+    built from it addressed a relation that does not exist. The catalog reads in this module
+    already use ``split(".", 1)``, so the two disagreed -- and the callers that swallowed the
+    resulting error reported a silent no-op. One helper keeps every call site consistent.
+    """
+    from psycopg import sql
+
+    schema_name, _, bare = name.partition(".")
+    return sql.Identifier(schema_name, bare) if bare else sql.Identifier(name)
+
+
 def _safe_close(closeable: Any) -> None:
     """Close a cursor/connection, swallowing any error during cleanup."""
     try:
@@ -315,7 +330,7 @@ def tables_with_rows(
     connection = connection_factory()
     try:
         for name in table_names:
-            identifier = sql.Identifier(*name.split("."))
+            identifier = _table_identifier(name)
             statement = sql.SQL("SELECT 1 FROM {table} LIMIT 1").format(
                 table=identifier
             )
@@ -356,7 +371,7 @@ def tables_present(
     connection = connection_factory()
     try:
         for name in table_names:
-            identifier = sql.Identifier(*name.split("."))
+            identifier = _table_identifier(name)
             statement = sql.SQL("SELECT 1 FROM {table} LIMIT 0").format(
                 table=identifier
             )
@@ -401,7 +416,7 @@ def count_target_rows(
     connection = connection_factory()
     try:
         for name in table_names:
-            identifier = sql.Identifier(*name.split("."))
+            identifier = _table_identifier(name)
             statement = sql.SQL("SELECT COUNT(*) FROM {table}").format(
                 table=identifier
             )
@@ -852,7 +867,7 @@ def max_pk_target(
             if not pk:
                 out[name] = None
                 continue
-            table_id = sql.Identifier(*name.split("."))
+            table_id = _table_identifier(name)
             col_id = sql.Identifier(pk)
             statement = sql.SQL("SELECT MAX({col}) FROM {table}").format(
                 col=col_id, table=table_id
@@ -917,10 +932,30 @@ def sync_identity_sequences(
     from psycopg import sql
 
     out: dict[str, Optional[int]] = {}
-    connection = connection_factory()
+    # RECONNECT per table, and never let one table's connection loss discard the work
+    # already recorded. This pass runs at the END of a load that can have taken hours, so
+    # its connection is the most likely in the tool to be dead: a DSQL IAM token is
+    # short-lived and a dropped backend used to make the whole function RAISE -- losing
+    # every table after the failure AND the successes already in ``out``. Live-reproduced:
+    # killing the backend after the first table left 5 of 6 tables at nextval=1 with
+    # max(id)=11 and reported nothing, which is the silent post-cut-over duplicate-key
+    # outage this function's own docstring calls the worst shape a migration failure can
+    # take. Every other post-load pass already reconnects; this was the one that did not.
+    connection = None
     try:
         for name in table_names:
             out[name] = None
+            if connection is None:
+                try:
+                    connection = connection_factory()
+                except Exception as exc:  # noqa: BLE001
+                    # Cannot even connect: record it for THIS table and try again for the
+                    # next one, so a transient outage does not blank the whole pass.
+                    out[name] = (
+                        f"{type(exc).__name__}: "
+                        f"{(str(exc).strip().splitlines() or [''])[0]}"
+                    )
+                    continue
             parts = name.split(".", 1)
             if len(parts) == 2:
                 schema_name, bare = parts
@@ -956,13 +991,23 @@ def sync_identity_sequences(
                 out[name] = (
                     f"{type(exc).__name__}: {_head}" if _head else type(exc).__name__
                 )
+                # Drop the connection here too: the catalog read is the FIRST statement per
+                # table, so it is where a dead backend / expired token surfaces, and keeping
+                # the corpse made every remaining table fail for the same reason.
+                _safe_close(connection)
+                connection = None
                 continue
             _safe_close(cursor)
             if not rows:
                 continue  # no identity column: nothing to sync
             column = str(rows[0][0])
 
-            table_id = sql.Identifier(*name.split("."))
+            # Split the SAME way the catalog read above did (``split(".", 1)`` -> parts),
+            # not on every dot: a table whose bare name CONTAINS a dot produced a 3-part
+            # identifier here while the catalog read produced the right 2-part one, so the
+            # MAX was sent to a relation that does not exist -- and the bare `continue`
+            # below then buried the failure.
+            table_id = sql.Identifier(*([schema_name, bare] if schema_name else [bare]))
             col_id = sql.Identifier(column)
             cursor = connection.cursor()
             try:
@@ -973,8 +1018,24 @@ def sync_identity_sequences(
                 )
                 row = cursor.fetchone()
                 current_max = row[0] if row is not None else None
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                # Record the FAILURE, never a silent no-op. This function's own docstring
+                # states the invariant -- "a failed ALTER MUST be distinguishable from a
+                # no-op, or the caller paints a swallowed failure green" -- and the catalog
+                # read and the ALTER both honour it; only this step did not. ``None`` is
+                # classified as neither advanced nor failed, so the table was OMITTED from
+                # the activity log while the same entry told the operator that "the
+                # application's first insert after cut-over cannot collide". Any cause lands
+                # here: an expired DSQL IAM token, an OCC 40001, a reset connection. The
+                # result is the worst shape a migration failure can take -- counts and
+                # checksums MATCH, Validation passes, and it only surfaces after cut-over,
+                # with the source already frozen.
                 _safe_close(cursor)
+                out[name] = f"{type(exc).__name__}: {str(exc).strip().splitlines()[0]}"
+                # The connection may be the casualty (a dead backend, an expired token), so
+                # discard it: the next table reconnects instead of inheriting the corpse.
+                _safe_close(connection)
+                connection = None
                 continue
             _safe_close(cursor)
             if not isinstance(current_max, int):
@@ -1003,10 +1064,13 @@ def sync_identity_sequences(
                 first = str(exc).strip().splitlines()
                 head = first[0].strip() if first else ""
                 out[name] = f"{type(exc).__name__}: {head}" if head else type(exc).__name__
+                _safe_close(connection)
+                connection = None
             finally:
                 _safe_close(cursor)
     finally:
-        _safe_close(connection)
+        if connection is not None:
+            _safe_close(connection)
     return out
 
 

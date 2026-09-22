@@ -726,6 +726,7 @@ def keyset_stream(
     pk_upper: Optional[int] = None,
     governor: Optional["SourceLoadGovernor"] = None,
     dialect: "SourceDialect" = _MYSQL_DIALECT,
+    target_types: Optional[Mapping[str, str]] = None,
 ) -> Iterator[Mapping[str, object]]:
     """Yield ``table`` rows in ascending primary-key order via keyset pagination.
 
@@ -765,8 +766,13 @@ def keyset_stream(
     if not column_names:
         raise ExportError(f"table '{table.name}' has no columns to export")
 
+    # Pass the APPLIED target type per column: a source type the operator remodelled in
+    # Schema Conversion (the tool's own advice for a DSQL-unsupported PG type) has to be
+    # READ in a form the target column can accept, which only the dialect can decide.
+    applied_types = target_types or {}
     columns_sql = ", ".join(
-        dialect.select_column_sql(column) for column in table.columns
+        dialect.select_column_sql(column, target_type=applied_types.get(column.name))
+        for column in table.columns
     )
     table_sql = dialect.quote_table(table.name)
     # Table-QUALIFY each PK reference in ORDER BY so it resolves to the NATIVE input
@@ -1098,6 +1104,7 @@ class TableExporter:
                         pk_upper=pk_upper,
                         governor=governor,
                         dialect=dialect,
+                        target_types=target_types,
                     ):
                         yield converter.convert_row(raw)
                 finally:

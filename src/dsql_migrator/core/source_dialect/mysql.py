@@ -110,7 +110,9 @@ class MySQLSourceDialect(SourceDialect):
     def integer_pk_types(self) -> frozenset[str]:
         return _MYSQL_INTEGER_PK_TYPES
 
-    def select_column_sql(self, column: object) -> str:
+    def select_column_sql(
+        self, column: object, *, target_type: Optional[str] = None
+    ) -> str:
         # Spatial columns have no DSQL type -> read as ST_AsBinary (WKB bytes, matching
         # what Debezium delivers for CDC) aliased back to the name; others read as-is.
         from dsql_migrator.core.converter import is_spatial_mysql_type

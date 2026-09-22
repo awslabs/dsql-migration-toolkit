@@ -1011,6 +1011,7 @@ def _assemble_inventory(
         # objects were filtered out above; this is what keeps the fact reportable.
         extensions=dialect.list_extensions(connection),
         database_collation=dialect.database_collation(connection),
+        sibling_databases=dialect.sibling_databases(connection),
     )
 
 
