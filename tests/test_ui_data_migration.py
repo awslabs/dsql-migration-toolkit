@@ -23637,6 +23637,7 @@ def test_a_resumed_import_keeps_and_dedups_the_previous_attempt_quarantine() -> 
     importer._quarantine = []
     importer._quarantine_total = 0
     importer._quarantine_seen = set()
+    importer._max_quarantine = 1000   # the cap __init__ would have set
 
     def work_for(pk: int) -> _BatchWork:
         return _BatchWork(
@@ -23954,3 +23955,64 @@ def test_the_progress_drain_survives_a_failing_job_store_write() -> None:
     cancel2 = _Event()
     fle._drain_progress_queue(progress2, handle2, cancel2, threading.Event())
     assert cancel2.is_set(), "a user Stop never reached the workers"
+
+
+def test_a_failed_unique_index_is_reported_as_a_missing_constraint() -> None:
+    """A UNIQUE index that did not get created is a missing CONSTRAINT, not a slow query.
+
+    A failed CREATE INDEX is deliberately not a table failure -- the data is complete -- but
+    "no data was lost and you do not need to re-run" was true of the data and false of the
+    constraint: the target now accepts duplicates the source forbids. A COMPOSITE_KEY
+    table's post-load pass can contain ONLY such an index, and that path is not opt-in.
+    """
+    import inspect
+
+    from dsql_migrator.core.batched_import import BatchedImporter
+    from dsql_migrator.ui.data_migration import _full_load_ui as flu
+
+    # The uniqueness bit must be carried from the DDL, which is the only place that knows.
+    create = inspect.getsource(BatchedImporter._create_indexes)
+    assert "CREATE\\\\s+UNIQUE" in create or "CREATE\\s+UNIQUE" in create, (
+        "the UNIQUE keyword is thrown away again, so the notice cannot tell them apart"
+    )
+
+    # ...and the notice must split on it.
+    class _Row:
+        def __init__(self, message: str) -> None:
+            self.error_message = message
+
+    assert flu._has_unique_index_failure([_Row("UNIQUE ux_orders_id: boom")]) is True
+    assert flu._has_unique_index_failure([_Row("idx_orders_user: boom")]) is False
+    assert flu._has_unique_index_failure([]) is False
+
+    notice = inspect.getsource(flu._render_full_load_progress)
+    assert "_has_unique_index_failure(index_only)" in notice, (
+        "the notice no longer distinguishes a missing constraint from a missing index"
+    )
+    assert "BEFORE cutting over" in notice, (
+        "a missing uniqueness constraint must say when it has to be fixed"
+    )
+
+
+def test_the_shared_snapshot_anchor_is_kept_alive_and_its_loss_stops_the_load() -> None:
+    """The anchor sits idle in transaction for the whole sharded load.
+
+    Every shard imports its exported snapshot id as it STARTS, and a bounded pool means the
+    last shard may import it hours later -- so an idle timeout or
+    ``idle_in_transaction_session_timeout`` can end the transaction and take the snapshot
+    with it. Shards that start afterwards then read their OWN snapshot and the table is
+    consistent as of no single point in time, with nothing said.
+    """
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _full_load_engine as fle
+
+    assert fle._ANCHOR_KEEPALIVE_SECONDS > 0
+    src = inspect.getsource(fle)
+    ping_at = src.index("_anchor_next_ping")
+    window = src[ping_at : ping_at + 3000]
+    assert 'exec_driver_sql("SELECT 1")' in window, "the anchor is no longer kept alive"
+    # Losing it must STOP the load, not let later shards diverge.
+    assert "cancel_event.set()" in window, (
+        "a lost anchor no longer stops the shards, so they read different snapshots"
+    )

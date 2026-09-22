@@ -1473,6 +1473,20 @@ def _rows_target_source_cell(row: "FullLoadTableRow") -> str:
     return f"{_abbrev_count(row.rows_present)} / {_abbrev_count(row.expected_rows)}"
 
 
+def _has_unique_index_failure(rows) -> bool:
+    """True when any of ``rows``' index failures names a UNIQUE index.
+
+    ``BatchedImporter._create_indexes`` prefixes such a failure with ``"UNIQUE "`` because
+    it is the only place that still has the DDL. A unique index is a CONSTRAINT the source
+    enforced, so its absence is a correctness gap on the target, not just a slower query.
+    """
+    for row in rows or ():
+        message = str(getattr(row, "error_message", "") or "")
+        if "UNIQUE " in message:
+            return True
+    return False
+
+
 def _quarantined_cell_tooltip(row: "FullLoadTableRow") -> str:
     """Hover text for a table's "N dropped" badge (empty when nothing was dropped).
 
@@ -2183,13 +2197,29 @@ def _render_full_load_progress(
         with ui.column().classes("w-full gap-2"):
             render_notice(
                 ui,
-                tone="info",
+                # A UNIQUE index that failed to create is NOT merely a missing access
+                # path: it is a missing CONSTRAINT, so the target now accepts duplicates
+                # the source forbids. "No data was lost and you do not need to re-run"
+                # was true of the data and false of the constraint, and a COMPOSITE_KEY
+                # table's post-load pass can contain ONLY such an index. Split the notice,
+                # and raise the tone when one is unique -- cutting over onto a table that
+                # no longer enforces uniqueness is not an FYI.
+                tone="warning" if _has_unique_index_failure(index_only) else "info",
                 header=(
-                    f"Indexes not created ({len(index_only)}) — the data loaded "
+                    f"Unique index NOT created ({len(index_only)}) — the data loaded, "
+                    "but a constraint is missing"
+                    if _has_unique_index_failure(index_only)
+                    else f"Indexes not created ({len(index_only)}) — the data loaded "
                     "completely"
                 ),
                 body=(
-                    "Every row is on the target; only these secondary indexes are "
+                    "Every row is on the target, so no data was lost. But at least one of "
+                    "these is a UNIQUE index, which the source enforced as a constraint "
+                    "and the target now does not — duplicates can be written until it "
+                    "exists, so create it BEFORE cutting over. Aurora DSQL allows 24 "
+                    "indexes per table, including the primary key."
+                    if _has_unique_index_failure(index_only)
+                    else "Every row is on the target; only these secondary indexes are "
                     "missing, so no data was lost and you do not need to re-run the "
                     "load. Add them later, or reduce the table's index count — Aurora "
                     "DSQL allows 24 indexes per table, including the primary key. "

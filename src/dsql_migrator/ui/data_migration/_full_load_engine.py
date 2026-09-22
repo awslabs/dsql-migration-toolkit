@@ -47,6 +47,7 @@ from dsql_migrator.core.introspector import (
 )
 from dsql_migrator.core.job_manager import JobHandle
 from dsql_migrator.core.batched_import import (
+    MAX_QUARANTINE_RECORDS,
     BatchedImporter,
     BatchedImportOptions,
     OnConflictMode,
@@ -636,6 +637,10 @@ _PROCESS_LAUNCH_STAGGER_SECONDS = 0.15
 # ALWAYS terminates: without it a worker wedged anywhere (a hung socket read, a
 # blocked queue put -- the observed deadlock) left the parent in ``as_completed``
 # forever while the UI insisted it was "finishing the current batch".
+# How often the parent pings the shared-snapshot anchor to keep its transaction from
+# being reaped while idle. Well under a typical idle_in_transaction_session_timeout.
+_ANCHOR_KEEPALIVE_SECONDS = 60.0
+
 _CANCEL_GRACE_SECONDS = 90.0
 
 # Sentinel put onto progress_queue to signal drain thread to stop.
@@ -697,6 +702,12 @@ class _ShardWorkerArgs:
     # (consistent sharded read of a REPLACE load without CDC). None => each shard uses its
     # own snapshot (MySQL, or the CDC-handoff path).
     shared_snapshot_id: Optional[str] = None
+    # This shard's SHARE of the table's single permanently-dropped-row budget. A shard runs
+    # in its own process with its own importer, so the module-level cap alone let K shards
+    # drop K x 1000 rows before the safety net fired -- K times the intended bound. A truly
+    # shared counter would need IPC; dividing the one budget keeps the guarantee without it.
+    # None => the whole budget (a non-sharded load).
+    max_quarantine_records: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -1226,6 +1237,14 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
         if shard_key_columns == list(table.primary_key):
             shard_key_columns = None  # unchanged key: keep the existing fallback
         importer = migrator._importer_factory(args.inputs)
+        # Apply THIS shard's share of the table's permanently-dropped-row budget (see
+        # _ShardWorkerArgs.max_quarantine_records). Set on the built importer rather than
+        # threaded through the factory so an INJECTED factory (tests) keeps working.
+        if args.max_quarantine_records:
+            try:
+                importer._max_quarantine = max(1, int(args.max_quarantine_records))
+            except Exception:  # noqa: BLE001 - a double may not carry the field
+                pass
 
         # First attempt uses the planned mode; any retry downgrades to SKIP_EXISTING
         # so re-reading a partially-written shard stays duplicate-free. ``_live_rows``
@@ -2244,6 +2263,18 @@ def _migrate_tables_in_parallel(
                             inputs=_slim_worker_inputs(migrator._inputs, table.name),
                             pk_lower=lo, pk_upper=hi, shard_index=shard_idx,
                             shared_snapshot_id=shared_snapshot_id,
+                            # Divide the one table-level budget among this table's shards.
+                            max_quarantine_records=max(
+                                1,
+                                MAX_QUARANTINE_RECORDS
+                                // max(
+                                    1,
+                                    sum(
+                                        1 for _wu in work_units
+                                        if _wu[0] == "shard" and _wu[1].name == table.name
+                                    ),
+                                ),
+                            ),
                         )
                         f = pool.submit(_migrate_shard_in_process, shard_args)
                         futures[f] = ("shard", table.name, shard_idx)
@@ -2256,10 +2287,43 @@ def _migrate_tables_in_parallel(
                 # current batch". Waiting in slices lets us notice the grace period
                 # expiring and stop waiting instead.
                 _cancel_deadline: Optional[float] = None
+                _anchor_next_ping = _time.monotonic() + _ANCHOR_KEEPALIVE_SECONDS
+                # Set when the anchor dies, so the run is reported as FAILED rather than as
+                # a user Stop -- the operator did not ask for this.
+                _anchor_lost = [False]
                 _pending = set(futures)
                 while _pending:
                     if handle.cancelled and _cancel_deadline is None:
                         _cancel_deadline = _time.monotonic() + _CANCEL_GRACE_SECONDS
+                    # Keep the shared-snapshot ANCHOR alive, and notice if it dies. It sits
+                    # `idle in transaction` for the whole sharded load while every shard
+                    # imports its exported snapshot id -- a bounded pool means the last
+                    # shard may import it hours later -- so an idle timeout, a firewall or
+                    # `idle_in_transaction_session_timeout` can end the transaction and
+                    # take the snapshot with it. Shards that start afterwards then read
+                    # their OWN snapshot, and the table is consistent as of no single point
+                    # in time with nothing said. This loop already wakes every second.
+                    if _anchor_conn is not None and _time.monotonic() >= _anchor_next_ping:
+                        _anchor_next_ping = (
+                            _time.monotonic() + _ANCHOR_KEEPALIVE_SECONDS
+                        )
+                        try:
+                            _anchor_conn.exec_driver_sql("SELECT 1")
+                        except Exception:  # noqa: BLE001 - the snapshot is gone
+                            _LOGGER.warning(
+                                "Shared-snapshot anchor connection lost; cancelling the "
+                                "sharded load rather than letting later shards read a "
+                                "different snapshot",
+                                exc_info=True,
+                            )
+                            _anchor_conn = None
+                            # Stop the workers cooperatively via the same Event the drain
+                            # thread uses for a user Stop (``handle.cancelled`` is
+                            # read-only). A shard that has not yet imported the snapshot
+                            # would otherwise open its own and read a different point in
+                            # time; failing the load is the honest outcome.
+                            cancel_event.set()
+                            _anchor_lost[0] = True
                     try:
                         done_iter = as_completed(_pending, timeout=1.0)
                         future = next(iter(done_iter))

@@ -1387,3 +1387,29 @@ def test_postgres_reads_date_time_as_text_so_out_of_range_values_do_not_kill_the
 
     # A time-of-day column has no such range problem, so it must NOT be cast needlessly.
     assert d.select_column_sql(ColumnDef(name="c", mysql_type="time")) == '"c"'
+
+
+def test_postgres_row_estimate_sums_a_partitioned_parents_leaves() -> None:
+    """A partitioned PARENT stores 0/-1 in its own reltuples -- the rows live in partitions.
+
+    Reading it alone left the estimate UNKNOWN for exactly the tables most likely to be
+    huge, so the load panel showed no denominator and no ETA for hours. The migration
+    selects the PARENT (``_pg_apply_partitioning`` drops the children), so this is the
+    normal state of a live PostgreSQL source, not an edge case. Summing the LEAF partitions
+    is still catalog-only -- no scan.
+    """
+    import inspect
+
+    from dsql_migrator.core.source_dialect.postgres import PostgresSourceDialect
+
+    src = inspect.getsource(PostgresSourceDialect.estimate_row_counts)
+    assert "pg_partition_tree" in src, "a partitioned parent has no estimate again"
+    assert "t.isleaf" in src, "the sum must cover the LEAVES, not intermediate levels"
+    # FILTER, not COALESCE/GREATEST: with no leaf analysed the sum must stay NULL -> None
+    # ("unknown"), never collapse to a confident and wrong 0.
+    assert "FILTER (WHERE l.reltuples >= 0)" in src
+    # Scoped to the estimate EXPRESSION: the method legitimately mentions these elsewhere.
+    expr = src[src.index("estimate_column=") : src.index("extra_filter=")]
+    assert "COALESCE" not in expr.upper() and "GREATEST" not in expr.upper()
+    # A plain table keeps the direct read.
+    assert "ELSE c.reltuples::bigint END" in src

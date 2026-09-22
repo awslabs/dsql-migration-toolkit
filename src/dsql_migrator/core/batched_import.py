@@ -710,7 +710,34 @@ class _ConnectionPool:
 # otherwise binary-split every batch down to single rows (O(rows) transactions) and append a
 # QuarantineRecord per row without bound. Beyond the cap the load fails loudly so the operator
 # fixes the root cause instead of the tool silently quarantining a huge fraction of the table.
-_MAX_QUARANTINE_RECORDS = 1000
+MAX_QUARANTINE_RECORDS = 1000
+# Back-compat alias for the internal call sites and tests that already name it privately.
+_MAX_QUARANTINE_RECORDS = MAX_QUARANTINE_RECORDS
+
+
+# PostgreSQL ``bpchar`` (CHAR(n)) pads its OUTPUT to the declared length while a MySQL
+# CHAR source value arrives TRIMMED (MySQL strips trailing blanks on retrieval). The server
+# itself compares bpchar blank-insensitively, so ``WHERE (code) IN (%s)`` with the trimmed
+# value DOES match the stored row -- but the Python-side set compare then saw
+# ``'AB        '`` against ``'AB'`` and concluded the key was absent. Every already-present
+# row was therefore re-inserted: an idempotent resume became a full re-write, and on the
+# plain-INSERT path a duplicate-key failure. Normalising by the type the SELECT itself
+# reports needs no new plumbing.
+_BPCHAR_OID = 1042
+
+
+def _normalize_key(values: tuple, description: object) -> tuple:
+    """Make a key tuple comparable across the wire's padding rules (see :data:`_BPCHAR_OID`)."""
+    columns = tuple(description or ())
+    if not columns or len(columns) != len(values):
+        return values
+    return tuple(
+        value.rstrip(" ")
+        if isinstance(value, str)
+        and getattr(column, "type_code", None) == _BPCHAR_OID
+        else value
+        for value, column in zip(values, columns)
+    )
 
 
 def _quarantine_key(record: object) -> tuple:
@@ -748,6 +775,7 @@ class BatchedImporter:
         occ_base_delay: float = DEFAULT_BASE_DELAY_SECONDS,
         sleep: SleepFunc = time.sleep,
         jitter: JitterFunc = random.random,
+        max_quarantine_records: Optional[int] = None,
     ) -> None:
         """Create an importer.
 
@@ -768,6 +796,12 @@ class BatchedImporter:
         )
         self._occ_max_attempts = occ_max_attempts
         self._occ_base_delay = occ_base_delay
+        # The permanently-dropped-row safety cap, per importer. A SHARDED table builds one
+        # importer PER SHARD in its own process, so the module constant alone let K shards
+        # drop K x 1000 rows before the cap fired -- K times the intended bound, and a
+        # shared counter is impossible across processes. The orchestrator therefore divides
+        # the single budget among the shards; default keeps the whole budget.
+        self._max_quarantine = max(1, int(max_quarantine_records or _MAX_QUARANTINE_RECORDS))
         self._sleep = sleep
         self._jitter = jitter
         # Side-channel sink for poison rows isolated during a load (thread-safe so
@@ -1287,13 +1321,13 @@ class BatchedImporter:
         rows are accumulated on the importer's quarantine sink (read via
         :meth:`import_rows`'s result).
         """
-        if self._quarantine_total >= _MAX_QUARANTINE_RECORDS:
+        if self._quarantine_total >= self._max_quarantine:
             # A systematic data error has already quarantined the cap's worth of rows; stop
             # binary-splitting and quarantining unboundedly and fail loudly so the operator
             # fixes the root cause (see _MAX_QUARANTINE_RECORDS) instead of the tool silently
             # dropping a huge fraction of the table.
             raise BatchedImportError(
-                f"table '{work.table_name}': quarantine cap ({_MAX_QUARANTINE_RECORDS}) "
+                f"table '{work.table_name}': quarantine cap ({self._max_quarantine}) "
                 "reached -- too many rows failed with a permanent data error; aborting so the "
                 "systematic cause is fixed rather than silently dropping more rows."
             )
@@ -1357,7 +1391,7 @@ class BatchedImporter:
                 return
             seen.add(key)
             self._quarantine_total += 1
-            if len(self._quarantine) < _MAX_QUARANTINE_RECORDS:
+            if len(self._quarantine) < self._max_quarantine:
                 self._quarantine.append(record)
 
     def _execute_for_mode(
@@ -1606,9 +1640,17 @@ class BatchedImporter:
                 cursor = connection.cursor()
                 try:
                     cursor.execute(select_sql, select_params)
-                    existing = {tuple(row) for row in cursor.fetchall()}
+                    # getattr: a test double's cursor need not expose ``description``,
+                    # and None simply means "no padding to normalise".
+                    key_types = getattr(cursor, "description", None)
+                    existing = {
+                        _normalize_key(tuple(row), key_types)
+                        for row in cursor.fetchall()
+                    }
                     missing = [
-                        row for row in work.rows if _key_of(row) not in existing
+                        row
+                        for row in work.rows
+                        if _normalize_key(_key_of(row), key_types) not in existing
                     ]
                     if not missing:
                         return 0, total
@@ -1699,7 +1741,15 @@ class BatchedImporter:
             except Exception as exc:  # noqa: BLE001 - isolate per-index failure
                 # Log-safe: the DDL is tool-generated (no row values, no
                 # credentials) and the driver message is a schema-level error.
-                failures.append(f"{_index_name_of(ddl)}: {_safe_error(exc)}")
+                # Tag a UNIQUE index: it is not only a missing access path, it is a
+                # missing CONSTRAINT -- the target now accepts duplicates the source
+                # forbids. The reporting layer needs to tell the two apart, and the DDL
+                # (tool-generated, no row values) is the only place that knows.
+                _unique = bool(re.match(r"\s*CREATE\s+UNIQUE\b", ddl, re.IGNORECASE))
+                failures.append(
+                    f"{'UNIQUE ' if _unique else ''}{_index_name_of(ddl)}: "
+                    f"{_safe_error(exc)}"
+                )
                 _LOGGER.warning(
                     "Post-load index creation failed (data is unaffected): %s",
                     failures[-1],

@@ -1927,3 +1927,89 @@ def test_quarantine_record_uses_the_withholding_formatter() -> None:
     src = inspect.getsource(bi)
     assert "format_key_values(work.key_columns, row)" in src
     assert "f\"{column}={row.get(column)!r}\"" not in src, "the raw interpolation is back"
+
+
+def test_a_blank_padded_char_key_is_recognised_as_already_present() -> None:
+    """PostgreSQL pads CHAR(n) on OUTPUT; a MySQL CHAR source value arrives TRIMMED.
+
+    The server compares bpchar blank-insensitively, so its own ``WHERE (code) IN (%s)``
+    DOES match the stored row -- but the Python-side set compare then saw ``'AB        '``
+    against ``'AB'`` and concluded the key was absent. Every already-present row was
+    re-inserted: an idempotent resume became a full re-write, and on the plain-INSERT path a
+    duplicate-key failure. Live-confirmed on PostgreSQL 16: the verbatim compare matched
+    NONE of two present keys.
+    """
+    from dsql_migrator.core.batched_import import _BPCHAR_OID, _normalize_key
+
+    class _Col:
+        def __init__(self, oid: int) -> None:
+            self.type_code = oid
+
+    bpchar = (_Col(_BPCHAR_OID),)
+    assert _normalize_key(("AB        ",), bpchar) == ("AB",)
+    assert _normalize_key(("AB",), bpchar) == ("AB",)
+    # ...so the two sides now meet.
+    assert _normalize_key(("AB        ",), bpchar) == _normalize_key(("AB",), bpchar)
+
+    # A text/varchar key (any other oid) is NOT trimmed -- trailing spaces are data there.
+    text = (_Col(25),)
+    assert _normalize_key(("AB  ",), text) == ("AB  ",)
+    # Non-string values and a missing/short description pass through untouched.
+    assert _normalize_key((7,), bpchar) == (7,)
+    assert _normalize_key(("AB  ",), None) == ("AB  ",)
+    assert _normalize_key(("A", "B"), bpchar) == ("A", "B")
+
+
+def test_a_sharded_table_divides_the_one_quarantine_budget() -> None:
+    """The cap is per-importer, and a sharded table builds one importer per PROCESS.
+
+    So the module constant alone let K shards drop K x 1000 rows before the safety net
+    fired -- K times the intended bound. A shared counter would need IPC, so the single
+    budget is divided instead.
+    """
+    from dsql_migrator.core.batched_import import (
+        MAX_QUARANTINE_RECORDS,
+        BatchedImporter,
+    )
+
+    def importer(cap=None):
+        return BatchedImporter(
+            connection_factory=lambda: None, max_quarantine_records=cap
+        )
+
+    assert importer()._max_quarantine == MAX_QUARANTINE_RECORDS
+    assert importer(MAX_QUARANTINE_RECORDS // 4)._max_quarantine == 250
+    # Never zero or negative, however the division lands.
+    assert importer(0)._max_quarantine == MAX_QUARANTINE_RECORDS
+    assert importer(-5)._max_quarantine >= 1
+
+
+def test_a_client_side_psycopg_error_is_not_retried_as_transient() -> None:
+    """A no-SQLSTATE psycopg error is transient only when it is CONNECTION-level.
+
+    "Anything raised from the psycopg module" also caught its CLIENT-side errors, which
+    never succeed on retry -- and they are reachable from real SOURCE DATA, not just a tool
+    bug: a MySQL TEXT column holding a 0x00 byte raises ``DataError("PostgreSQL text fields
+    cannot contain NUL (0x00) bytes")`` with no sqlstate. The batch then retried its whole
+    budget with backoff and failed with an opaque message instead of failing at once.
+    """
+    import psycopg
+
+    from dsql_migrator.core.target_connection import is_transient_connection_error
+
+    # Client-side: never transient.
+    assert not is_transient_connection_error(
+        psycopg.DataError("PostgreSQL text fields cannot contain NUL (0x00) bytes")
+    )
+    assert not is_transient_connection_error(
+        psycopg.ProgrammingError("cannot adapt type 'dict'")
+    )
+    # Connection-level: still transient.
+    assert is_transient_connection_error(
+        psycopg.OperationalError("server closed the connection unexpectedly")
+    )
+    assert is_transient_connection_error(psycopg.InterfaceError("the connection is closed"))
+    # A real SQLSTATE class 08 is unchanged.
+    err = psycopg.OperationalError("boom")
+    err.sqlstate = "08006"
+    assert is_transient_connection_error(err)

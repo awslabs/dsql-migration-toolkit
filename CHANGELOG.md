@@ -5,6 +5,54 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.500
+
+The six findings the v0.1.499 audit left unadjudicated, re-verified against a real
+PostgreSQL 16 and fixed. Every fix mutation-checked.
+
+### Fixed
+
+- **A blank-padded `CHAR(n)` key made an idempotent resume re-write the whole table.**
+  PostgreSQL pads `bpchar` on OUTPUT while a MySQL `CHAR` source value arrives TRIMMED (MySQL
+  strips trailing blanks on retrieval). The server compares bpchar blank-insensitively, so its
+  own `WHERE (code) IN (%s)` DOES match the stored row -- but the Python-side set compare then
+  saw `'AB        '` against `'AB'` and concluded the key was absent. Live-confirmed: the
+  verbatim compare matched NONE of two present keys. Keys are now normalised by the type the
+  SELECT itself reports, so no new plumbing is needed; a text/varchar key is untouched, where
+  trailing spaces are data.
+- **A psycopg error raised CLIENT-side was retried as if a connection had dropped.** The
+  no-SQLSTATE arm treated anything from the psycopg module as transient, and psycopg raises
+  `ProgrammingError`/`DataError` with no sqlstate for a value it cannot adapt or a statement it
+  cannot render. Reachable from real SOURCE DATA, not just a tool bug: a MySQL TEXT column
+  holding a `0x00` byte raises `DataError("PostgreSQL text fields cannot contain NUL (0x00)
+  bytes")`, so the batch burned its whole retry budget with backoff and then failed with an
+  opaque message, instead of failing at once. Narrowed to CONNECTION-level errors --
+  deliberately NOT their shared `DatabaseError` base, which would re-admit both.
+- **A partitioned source table had no row estimate at all.** `pg_class.reltuples` is 0/-1 on a
+  partitioned PARENT because the rows live in its partitions -- and the parent is exactly what
+  the migration selects, so the tables most likely to be huge showed no progress denominator
+  and no ETA for hours. The estimate now sums the LEAF partitions via `pg_partition_tree`,
+  still catalog-only. `FILTER`, not `COALESCE`: with no leaf analysed it stays unknown rather
+  than collapsing to a confident and wrong 0.
+- **"Indexes not created" reassured the operator about a missing CONSTRAINT.** A failed
+  `CREATE INDEX` is deliberately not a table failure -- the data is complete -- but "no data was
+  lost and you do not need to re-run" was true of the data and false of the constraint: a
+  failed UNIQUE index means the target now accepts duplicates the source forbids, and a
+  COMPOSITE_KEY table's post-load pass can contain ONLY such an index. The uniqueness bit is
+  carried from the DDL (the only place that knows it) and the notice splits on it, warning that
+  it must be created BEFORE cut-over.
+- **The shared-snapshot anchor could die mid-load and take the snapshot with it.** A sharded
+  PostgreSQL read pins one connection `idle in transaction` so every shard can
+  `SET TRANSACTION SNAPSHOT` to it -- and with a bounded pool the last shard may import that id
+  hours later. An idle timeout or `idle_in_transaction_session_timeout` ends the transaction,
+  after which later shards read their OWN snapshot and the table is consistent as of no single
+  point in time, with nothing said. The parent now pings the anchor once a minute from the loop
+  it already runs, and a lost anchor stops the shards instead of letting them diverge.
+- **The quarantine safety cap was multiplied by the shard count.** `MAX_QUARANTINE_RECORDS` is
+  enforced per importer, and a sharded table builds one importer per PROCESS, so K shards could
+  drop K x 1000 rows before the safety net fired. A shared counter would need IPC, so the one
+  budget is divided among the table's shards instead.
+
 ## v0.1.499
 
 A Full Load audit, executed against a real PostgreSQL 16 rather than read. Eight defects that

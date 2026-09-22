@@ -812,7 +812,20 @@ class PostgresSourceDialect(SourceDialect):
             select_from="FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace",
             schema_column="n.nspname",
             table_column="c.relname",
-            estimate_column="c.reltuples::bigint",
+            # A partitioned PARENT stores 0/-1 in its own reltuples -- the rows live in the
+            # partitions -- so reading it alone left the estimate UNKNOWN for exactly the
+            # tables most likely to be huge, and the load panel showed no denominator and no
+            # ETA for hours. Summing the LEAF partitions is still catalog-only (no scan).
+            # FILTER, not COALESCE/GREATEST: when NO leaf has stats the sum stays NULL ->
+            # None ("unknown"), rather than collapsing to a confident and wrong 0.
+            estimate_column=(
+                "CASE WHEN c.relkind = 'p' THEN ("
+                "  SELECT (sum(l.reltuples) FILTER (WHERE l.reltuples >= 0))::bigint"
+                "  FROM pg_catalog.pg_partition_tree(c.oid) t"
+                "  JOIN pg_catalog.pg_class l ON l.oid = t.relid"
+                "  WHERE t.isleaf"
+                ") ELSE c.reltuples::bigint END"
+            ),
             extra_filter="c.relkind IN ('r', 'p')",
             parse_estimate=lambda value: (
                 None if value is None or int(value) < 0 else int(value)

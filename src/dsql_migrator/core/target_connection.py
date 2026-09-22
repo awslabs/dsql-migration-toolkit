@@ -118,9 +118,20 @@ def is_transient_connection_error(exc: BaseException) -> bool:
     if isinstance(state, str) and state.startswith("08"):
         return True
     if state is None:
-        module = type(exc).__module__ or ""
-        name = type(exc).__name__
-        if module.startswith("psycopg") or name in ("OperationalError", "InterfaceError"):
+        # A no-SQLSTATE error is transient only when it is CONNECTION-level. Treating
+        # "anything raised from the psycopg module" as transient caught psycopg's
+        # CLIENT-side errors too -- a value it cannot adapt, or a statement it cannot
+        # render -- and those never succeed on retry. Reachable from real SOURCE DATA, not
+        # just a tool bug: a MySQL TEXT column holding a 0x00 byte raises
+        # ``DataError("PostgreSQL text fields cannot contain NUL (0x00) bytes")`` with no
+        # sqlstate, so the batch retried its full budget with backoff and then failed with
+        # an opaque message, instead of failing at once and naming the row. Matched on the
+        # MRO NAMES so real psycopg subclasses (ConnectionTimeout, ...) still qualify while
+        # ProgrammingError / DataError do not. ``DatabaseError`` is deliberately NOT in the
+        # set: it is the shared base of ProgrammingError and DataError too, so including it
+        # would re-admit exactly the client-side errors this narrowing excludes.
+        connection_level = {"OperationalError", "InterfaceError"}
+        if any(cls.__name__ in connection_level for cls in type(exc).__mro__):
             return True
         message = str(exc).lower()
         return any(sig in message for sig in TRANSIENT_CONN_SIGNATURES)
