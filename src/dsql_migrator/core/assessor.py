@@ -203,6 +203,30 @@ def _is_unbounded_pg_character(mysql_type: str) -> bool:
     return normalized in ("character varying", "varchar", "bpchar")
 
 
+# The PostgreSQL oversized-LOB types split by what the type DECLARES, which is what decides
+# how severely to grade the finding:
+#
+# * ``bytea``/``json``/``jsonb`` exist to hold a document or a blob -- choosing one IS the
+#   intent to store something large, so "no length limit" is the risk itself. Graded a LOSS,
+#   the same as MySQL's mediumblob/longblob/mediumtext/longtext, every member of which is
+#   likewise a deliberately-large type. This keeps the two engines in step: a ``bytea``
+#   column holding 1,114,112 bytes must not read "Ready" on PostgreSQL while the identical
+#   ``longblob`` reads "Moderate effort" on MySQL.
+# * An unbounded ``text``/``varchar`` is PostgreSQL's IDIOMATIC way to spell an ordinary short
+#   string (names, emails, SKUs). Grading those a LOSS put an 18-table schema of perfectly
+#   ordinary columns into per-table manual work -- measured -- which is the noise the v0.1.495
+#   downgrade was for. Graded a RECOMMENDATION: something to check, not work to budget.
+#
+# MySQL has no idiomatic-short member in its set (plain ``text`` is excluded as too small to
+# exceed 1 MiB), which is why it needs no such split.
+_PG_LOB_DELIBERATELY_LARGE = frozenset({"bytea", "json", "jsonb"})
+
+
+def pg_lob_is_deliberately_large(mysql_type: str) -> bool:
+    """True when the PG type itself declares an intent to store something large."""
+    return _base_type(mysql_type) in _PG_LOB_DELIBERATELY_LARGE
+
+
 def pg_columns_bounded_by_check(table: "TableDef") -> "set[str]":
     """Column names a CHECK constraint restricts to a finite set of LITERALS.
 
@@ -232,10 +256,32 @@ def pg_columns_bounded_by_check(table: "TableDef") -> "set[str]":
         expression = (getattr(check, "expression", "") or "").strip()
         if not expression:
             continue
+        # A NOT VALID constraint was never checked against the rows ALREADY stored, so it
+        # proves nothing about existing data: a multi-megabyte value written before the
+        # constraint was added is still there, and Full Load reads exactly those rows.
+        # Treating it as a bound hid precisely the value that would fail to load.
+        if getattr(check, "not_valid", False):
+            continue
         try:
             tree = sqlglot.parse_one(f"SELECT {expression}", read="postgres")
         except Exception:  # noqa: BLE001 - an unparsable CHECK simply bounds nothing
             continue
+
+        def _conjuncts(node):
+            """The top-level AND-conjuncts of the expression.
+
+            Only a conjunct BOUNDS the column. Searching the whole tree for an EQ/In node
+            instead made two shapes suppress a genuine risk, both verified live:
+            ``status = ANY (ARRAY['a','b']) OR body IS NOT NULL`` (the OR means a row can
+            satisfy the CHECK via the other branch, so ``status`` may hold anything), and
+            ``NOT (other = ANY (ARRAY['x','y']))`` (the negation permits everything EXCEPT
+            those two). Both excluded the column and hid the risk.
+            """
+            if isinstance(node, exp.Paren):
+                return _conjuncts(node.this)
+            if isinstance(node, exp.And):
+                return _conjuncts(node.this) + _conjuncts(node.expression)
+            return [node]
 
         def _all_literals(nodes) -> bool:
             # CAST('a' AS TEXT) is how PostgreSQL stores 'a'::text, so unwrap one level.
@@ -245,28 +291,33 @@ def pg_columns_bounded_by_check(table: "TableDef") -> "set[str]":
                     return False
             return bool(nodes)
 
-        # `col = ANY (ARRAY[...])` -- what PostgreSQL stores an IN-list as.
-        for eq in tree.find_all(exp.EQ):
-            column = eq.this
-            right = eq.expression
-            if not isinstance(column, exp.Column):
-                continue
-            if not isinstance(right, exp.Any):
-                continue
-            # ``Any.this`` is a Paren wrapping the Array for the PostgreSQL
-            # ``= ANY (ARRAY[...])`` spelling, so unwrap before looking for the Array.
-            array = right.this
-            while isinstance(array, exp.Paren):
-                array = array.this
-            if isinstance(array, exp.Array) and _all_literals(array.expressions):
-                bounded.add(column.name)
-        # A literal `col IN (...)`, for a source that stores it that way.
-        for node in tree.find_all(exp.In):
-            column = node.this
-            if isinstance(column, exp.Column) and _all_literals(
-                node.args.get("expressions") or []
-            ):
-                bounded.add(column.name)
+        root = tree.expressions[0] if isinstance(tree, exp.Select) else tree
+        for conjunct in _conjuncts(root):
+            if isinstance(conjunct, exp.Paren):
+                conjunct = conjunct.this
+            # `col = ANY (ARRAY[...])` -- what PostgreSQL stores an IN-list as.
+            if isinstance(conjunct, exp.EQ):
+                eq = conjunct
+                column = eq.this
+                right = eq.expression
+                if not isinstance(column, exp.Column):
+                    continue
+                if not isinstance(right, exp.Any):
+                    continue
+                # ``Any.this`` is a Paren wrapping the Array for the PostgreSQL
+                # ``= ANY (ARRAY[...])`` spelling, so unwrap before looking for the Array.
+                array = right.this
+                while isinstance(array, exp.Paren):
+                    array = array.this
+                if isinstance(array, exp.Array) and _all_literals(array.expressions):
+                    bounded.add(column.name)
+            # A literal `col IN (...)`, for a source that stores it that way.
+            elif isinstance(conjunct, exp.In):
+                column = conjunct.this
+                if isinstance(column, exp.Column) and _all_literals(
+                    conjunct.args.get("expressions") or []
+                ):
+                    bounded.add(column.name)
     return bounded
 
 

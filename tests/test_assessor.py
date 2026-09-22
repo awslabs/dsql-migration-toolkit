@@ -566,7 +566,15 @@ def test_default_rules_source_type_seam() -> None:
     # relations -- materialized views / foreign tables); the REST are the shared
     # source-neutral structural rules -- a proper subset of the MySQL ids (PG drops the
     # MySQL type/feature rules). Detailed assertions in tests/test_assessor_postgres.py.
-    _PG_SPECIFIC = {"PG_UNSUPPORTED_TYPE", "PG_UNSUPPORTED_RELATION"}
+    # PG-only rule ids: a condition MySQL has no equivalent for, so they are legitimately
+    # absent from the MySQL set rather than a drift between the two lists.
+    _PG_SPECIFIC = {
+        "PG_UNSUPPORTED_TYPE",
+        "PG_UNSUPPORTED_RELATION",
+        # A non-PK serial / GENERATED AS IDENTITY column. MySQL allows only ONE
+        # AUTO_INCREMENT column and it must be a key, so the condition cannot arise there.
+        "NON_KEY_SEQUENCE",
+    }
     pg_ids = {r.rule_id for r in default_rules(SourceType.POSTGRES)}
     mysql_ids = {r.rule_id for r in default_rules(SourceType.MYSQL)}
     assert _PG_SPECIFIC <= pg_ids

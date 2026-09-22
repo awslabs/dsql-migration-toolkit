@@ -1124,7 +1124,7 @@ def _render_full_load_step(
         _render_watermark(
             ui,
             job,
-            getattr(getattr(session, "source_config", None), "source_type", None),
+            session_source_type(session),
         )
 
         # Terminal-only affordances (shown after the job finishes, on the full

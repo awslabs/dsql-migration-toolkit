@@ -1878,6 +1878,8 @@ def _build_drift(
         watermark_gtid=watermark_gtid,
         current_gtid=current_gtid,
         drifted=False,
+        # Nothing was comparable, so `drifted=False` is a default, not a verdict.
+        determinable=False,
         # ``source_is_postgres`` only words the undeterminable case. The summary line was
         # made engine-neutral earlier, but THIS is the text a PostgreSQL operator reads on
         # the sign-off report and in the screen's technical detail -- and it explained the

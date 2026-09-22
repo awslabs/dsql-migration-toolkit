@@ -2381,6 +2381,7 @@ from dsql_migrator.core.assessor import (  # noqa: E402 - avoids duplicate liter
     _UNSUPPORTED_INDEX_TYPES,
     _base_type,
     is_pg_oversized_lob_type,
+    pg_lob_is_deliberately_large,
     pg_oversized_lob_column_names,
 )
 
@@ -2830,10 +2831,23 @@ def _pg_oversized_lob_warning(table: TableDef) -> Optional[ConversionWarning]:
     if not columns:
         return None
     names = ", ".join(columns)
+    # Graded like the Evaluation rule: a LOSS when any at-risk column is a binary/document
+    # type (choosing bytea/json/jsonb IS the intent to store something large, and MySQL's
+    # equivalent is a LOSS), a RECOMMENDATION when they are only unbounded character
+    # columns, which is PostgreSQL's idiomatic spelling for an ordinary short string.
+    deliberately_large = any(
+        pg_lob_is_deliberately_large(column.mysql_type)
+        for column in table.columns
+        if column.name in at_risk
+    )
     return ConversionWarning(
         object_name=table.name,
         classification=Classification.MANUAL,
-        kind=ConversionNoteKind.RECOMMENDATION,
+        kind=(
+            ConversionNoteKind.LOSS
+            if deliberately_large
+            else ConversionNoteKind.RECOMMENDATION
+        ),
         message=(
             f"Columns ({names}) have no length limit, so a value can exceed Aurora DSQL's "
             "1 MiB per-value cap. The DDL itself is fine — the limit bites per ROW during "

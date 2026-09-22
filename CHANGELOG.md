@@ -5,6 +5,82 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.497
+
+A review of v0.1.496 raised seven items. Six are real and fixed here; one was a methodology
+warning that did not apply to this repo's checks. **Item 1 is mine: I applied two remedies
+that were offered as alternatives.**
+
+### Fixed
+
+- **A genuinely oversized column no longer reads "Ready", and the two engines agree again.**
+  R-5 offered a choice — downgrade the grade OR filter by CHECK — and v0.1.495 took the first
+  while v0.1.496 took the second, so both landed. With the false positives gone the downgrade
+  was no longer buying anything and was actively harmful: a `bytea` holding 1,114,112 bytes
+  read `AUTO` / **100 "Ready"** while an identical MySQL `longblob` read `MANUAL` / **57
+  "Moderate effort"** — the one unrecoverable DSQL limit, graded opposite ways by engine.
+  - Restored by SPLITTING on what the type declares, rather than reverting: `bytea` /
+    `json` / `jsonb` are a **LOSS** (choosing one is the intent to store something large, and
+    every member of MySQL's set is likewise deliberately-large), while an unbounded
+    `text` / `varchar` stays a **RECOMMENDATION** (PostgreSQL's idiomatic spelling for an
+    ordinary short string). Measured both ways first: a plain reversion would have put an
+    18-table schema of ordinary `text` columns back into per-table manual work, which is what
+    the v0.1.495 downgrade was for. Now `bytea` = 57 both engines, 18 ordinary `text` tables =
+    100 "Ready".
+- **Two holes in the v0.1.496 CHECK predicate, both of which HID a real risk.** Verified
+  against real PostgreSQL:
+  - It matched an `EQ` node ANYWHERE in the parsed tree, so
+    `status = ANY (ARRAY['a','b']) OR body IS NOT NULL` excluded `status` (the OR lets a row
+    satisfy the CHECK via the other branch) and `NOT (other = ANY (...))` excluded `other`
+    (the negation permits everything else). Only a top-level AND-conjunct bounds a column now.
+  - It treated a **`NOT VALID`** CHECK as a bound. Such a constraint was never checked against
+    the rows already stored, so a multi-megabyte value written before it was added is still
+    there — and Full Load reads exactly those rows. The flag was not even captured;
+    `CheckConstraintDef.not_valid` now reflects it from SQLAlchemy's `dialect_options`.
+- **The engine-wiring call site is tested, and the remaining sites now honour a restored
+  session.** Deleting the renderer's `source_type` argument left the ENTIRE suite green
+  (measured: 4009 passed) — the three mutations quoted in the v0.1.495 changelog all targeted
+  `_models.py`, not this second link, so that claim overstated the coverage. Also,
+  `session_source_type` had reached only 2 of the session-based sites; the watermark panel,
+  `_cdc_source_type` and Schema Conversion's `_src_type` still read `source_config` directly
+  and so ignored the restored hint. The last one mattered most: on a resume it converted a
+  PostgreSQL inventory with the MySQL dialect and put AUTO_INCREMENT back in the PK picker.
+  A test now fails if any of them regresses to a raw read.
+- **Evaluation reports a NON-primary-key sequence column** (`NON_KEY_SEQUENCE`). Schema
+  Conversion warned that such a column reaches the target with neither identity nor default,
+  while Evaluation said nothing — the same contradiction v0.1.496 closed for the KEY column,
+  one column over. Graded a LOSS rather than advice: for the key the operator gets a choice at
+  Schema Conversion, for a non-key column the generation is simply gone.
+- **An aggregate no longer blanks every routine body in its schema.** `pg_get_functiondef`
+  raises `WrongObjectType` for an aggregate or window routine, and that error ABORTS THE
+  TRANSACTION — so one aggregate made every SUBSEQUENT object-detail lookup on the same
+  connection fail too, each reported with the false "the object may have been dropped or you
+  may lack permission". Confirmed live: asking for the aggregate first turned a healthy
+  neighbouring function's body into `None`, while a fresh connection returned it. The lookup
+  is now restricted to `prokind IN ('f','p')`. The review reported the symptom for aggregates
+  only; the transaction-abort blast radius was wider.
+- **A schema-qualified argument type no longer cross-matches an overload.** The
+  bare-last-segment arm was computed on the whole name, so the tail of `app.f(b geo.point)` is
+  `point)` — which also ends `app.f(a geo.point)`. Asking for one overload returned the other,
+  making the v0.1.495 claim that "a supplied signature still matches exactly" false in that
+  case. Both sides are now compared with the signature stripped.
+- **The drift JSON no longer says `"drifted": false` when nothing was comparable.** Added a
+  `determinable` sibling field rather than making `drifted` nullable, so a consumer reading
+  `drifted` as a bool keeps working and one wanting the truth has a field to read. Derived
+  from `basis`, which already encodes it.
+- **The manual's `OVERSIZED_LOB` grade is accurate again** in all three languages, including
+  that a CHECK-limited column is not flagged at all.
+
+### Not applicable
+
+- The review warned that a mutation check run from a `/tmp` copy is invalid because pytest
+  imports the installed package. True in general, but not what happened here: these checks
+  mutate files IN PLACE under `src/` (an editable install, so the edit is what runs) and
+  restore from a backup afterwards. The decisive evidence is that the mutations FAILED — a
+  mutation that was not seen would pass. The two that unexpectedly PASSED were investigated
+  rather than accepted, and both turned out to be the check's own fault (one vacuous
+  assertion, one string that never matched).
+
 ## v0.1.496
 
 Two inaccuracies a workshop Evaluation surfaced on a real PostgreSQL schema.

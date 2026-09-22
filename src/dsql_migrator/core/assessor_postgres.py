@@ -219,7 +219,10 @@ class PgOversizedLobRule(Rule):
     rule_id = "OVERSIZED_LOB"
 
     def evaluate(self, inventory: "SourceInventory") -> "list[Finding]":
-        from dsql_migrator.core.assessor import pg_oversized_lob_column_names
+        from dsql_migrator.core.assessor import (
+            pg_lob_is_deliberately_large,
+            pg_oversized_lob_column_names,
+        )
 
         findings: list[Finding] = []
         for table in inventory.tables:
@@ -227,10 +230,99 @@ class PgOversizedLobRule(Rule):
             # just noise-reduction: such a column CANNOT hold an oversized value, and
             # reporting it both states something false and buries the genuine one.
             at_risk = set(pg_oversized_lob_column_names(table))
+            by_type = {column.name: column.mysql_type for column in table.columns}
+            # Split by what the TYPE declares, and emit one finding per family present, so a
+            # genuinely-large column is never averaged in with an idiomatic short string.
+            # Grading them together is what went wrong twice: as one LOSS an 18-table schema
+            # of ordinary `text` read per-table manual work, and as one RECOMMENDATION a
+            # bytea holding 1,114,112 bytes read "Ready" while MySQL's identical longblob
+            # read "Moderate effort".
+            groups = [
+                (
+                    [n for n in sorted(at_risk) if pg_lob_is_deliberately_large(by_type[n])],
+                    ConversionNoteKind.LOSS,
+                    (
+                        "are binary/document columns with no length limit, so a value can "
+                        "exceed the Aurora DSQL 1 MiB per-value limit"
+                    ),
+                ),
+                (
+                    [
+                        n
+                        for n in sorted(at_risk)
+                        if not pg_lob_is_deliberately_large(by_type[n])
+                    ],
+                    ConversionNoteKind.RECOMMENDATION,
+                    (
+                        "are unbounded character columns, so a value CAN exceed the Aurora "
+                        "DSQL 1 MiB per-value limit -- though an unbounded text/varchar is "
+                        "PostgreSQL's idiomatic spelling for an ordinary short string, so "
+                        "this is a ceiling to confirm rather than work to budget"
+                    ),
+                ),
+            ]
+            for names, note_kind, clause in groups:
+                if not names:
+                    continue
+                listed = ", ".join(f"{n} ({by_type[n]})" for n in names)
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_TABLE, table.name),
+                        rule_id=self.rule_id,
+                        classification=Classification.MANUAL,
+                        risk=(
+                            f"Columns ({listed}) {clause}. An oversized value cannot be "
+                            "stored: the row is quarantined during Full Load or "
+                            "dead-lettered during CDC, and reloading cannot fix it."
+                        ),
+                        recommendation=(
+                            "Check the largest value in each column. If any exceeds 1 MiB, "
+                            "move that content to external storage (e.g. Amazon S3) and "
+                            "store a reference instead, or exclude the column on the Data "
+                            "Migration step. For json/jsonb and text the limit applies to "
+                            "the COMPRESSED size, so a highly compressible document may "
+                            "still fit."
+                        ),
+                        effort=EffortLevel.MEDIUM,
+                        note_kind=note_kind,
+                    )
+                )
+        return findings
+
+
+class PgNonKeySequenceRule(Rule):
+    """Flag a NON-primary-key ``serial`` / ``GENERATED AS IDENTITY`` column at Evaluation.
+
+    The same contradiction :class:`PgIdentityKeyRule` was written to close, one column over.
+    Schema Conversion warns that such a column reaches the target with neither identity nor
+    default -- so an INSERT that omits it writes NULL instead of the next number -- while
+    Evaluation said nothing at all about it, because its identity rule only looks at
+    ``table.auto_increment_column``, which PostgreSQL enrichment sets for a PRIMARY KEY only.
+    The go/no-go artifact and the conversion preview therefore disagreed about the same
+    column.
+
+    Graded a LOSS, unlike the key rule's RECOMMENDATION: for the KEY column the operator gets
+    a CHOICE at Schema Conversion (Server-generated IDENTITY fills it), but for a non-key
+    column there is no such offer -- the value generation is simply gone and the application
+    must supply it.
+    """
+
+    rule_id = "NON_KEY_SEQUENCE"
+
+    def evaluate(self, inventory: "SourceInventory") -> "list[Finding]":
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            key_columns = set(table.primary_key or ())
+            if table.auto_increment_column:
+                key_columns.add(table.auto_increment_column)
             columns = [
-                f"{column.name} ({column.mysql_type})"
+                column.name
                 for column in table.columns
-                if column.name in at_risk
+                if column.name not in key_columns
+                and (
+                    column.identity
+                    or "nextval(" in (column.default or "").lower()
+                )
             ]
             if not columns:
                 continue
@@ -241,28 +333,20 @@ class PgOversizedLobRule(Rule):
                     rule_id=self.rule_id,
                     classification=Classification.MANUAL,
                     risk=(
-                        f"Columns ({names}) have no length limit, so a value can exceed "
-                        "the Aurora DSQL 1 MiB per-value limit. An oversized value cannot "
-                        "be stored: the row is quarantined during Full Load or "
-                        "dead-lettered during CDC, and reloading cannot fix it."
+                        f"Columns ({names}) take their value from a sequence (serial / "
+                        "GENERATED AS IDENTITY) but are NOT the primary key. Aurora DSQL has "
+                        "no source sequence to point at, and the primary-key strategy "
+                        "generates values only for the key column, so each lands on the "
+                        "target with neither identity nor default: an INSERT that omits it "
+                        "writes NULL instead of the next number."
                     ),
                     recommendation=(
-                        "Check the largest value in each column. If any exceeds 1 MiB, "
-                        "move that content to external storage (e.g. Amazon S3) and store "
-                        "a reference instead, or exclude the column on the Data Migration "
-                        "step. For json/jsonb and text the limit applies to the COMPRESSED "
-                        "size, so a highly compressible document may still fit."
+                        "Supply the value from the application, or add an identity to the "
+                        "column on the target before cutting over. Already-loaded rows are "
+                        "unaffected -- Full Load copies the existing values."
                     ),
                     effort=EffortLevel.MEDIUM,
-                    # A RECOMMENDATION, not a loss -- the same calibration as
-                    # PgIdentityKeyRule below. ``text`` is PostgreSQL's IDIOMATIC string
-                    # type, so this condition holds for most real schemas, and rating each
-                    # such table MANUAL made a one-table database read "Moderate effort"
-                    # purely because a column has no length limit, with no evidence any
-                    # value approaches 1 MiB. That is the same unusable-signal failure this
-                    # release fixed for extension objects: something to CHECK, stated once
-                    # per table, not per-table manual work.
-                    note_kind=ConversionNoteKind.RECOMMENDATION,
+                    note_kind=ConversionNoteKind.LOSS,
                 )
             )
         return findings
@@ -355,6 +439,7 @@ def default_rules() -> "list[Rule]":
         PgOversizedLobRule(),
         PgGeneratedColumnRule(),
         PgIdentityKeyRule(),
+        PgNonKeySequenceRule(),
         ForeignKeyRule(),
         CheckConstraintRule(),
         TriggerRule(),

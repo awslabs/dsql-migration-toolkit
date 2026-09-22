@@ -23145,3 +23145,57 @@ def test_lob_exclusion_candidates_cover_json_jsonb_and_unbounded_varchar() -> No
     )
     assert len(candidates) == 1
     assert candidates[0].columns == ("body", "payload", "doc", "meta", "free")
+
+
+def test_the_renderer_supplies_the_engine_to_the_pretick() -> None:
+    """The gap the previous test did NOT cover. `_render_full_load_progress` is what hands
+    `source_type` to `preselect_lob_columns_for_reason`; deleting that one argument left the
+    ENTIRE suite green (measured: 4009 passed), so the wiring could regress silently. The
+    earlier behavioural test exercised the factory and the helper -- both in `_models.py` --
+    not this call site, which is the second of the two links."""
+    import inspect as _inspect
+
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration import _full_load_ui
+
+    # The renderer must ACCEPT the engine ...
+    assert "source_type" in _inspect.signature(
+        _full_load_ui._render_full_load_progress
+    ).parameters
+    # ... and the step must PASS it, resolved through the one helper (so the restored-session
+    # hint is honoured) rather than a raw getattr that ignores it.
+    step_source = _inspect.getsource(_full_load_ui._render_full_load_step)
+    assert "source_type=session_source_type(session)" in " ".join(step_source.split()), (
+        "_render_full_load_step must pass source_type=session_source_type(session) to "
+        "_render_full_load_progress; without it the PG quarantine dialog pre-ticks nothing"
+    )
+    # And the renderer must forward it to the pre-select, not default to MySQL.
+    renderer_source = " ".join(
+        _inspect.getsource(_full_load_ui._render_full_load_progress).split()
+    )
+    assert "preselect_lob_columns_for_reason(" in renderer_source
+    assert "source_type=source_type or SourceType.MYSQL" in renderer_source
+
+
+def test_every_session_engine_site_uses_the_one_helper() -> None:
+    """`session_source_type` exists so the RESTORED hint is honoured at every PG-aware
+    surface. It was applied to 2 of the session-based sites; the others kept a raw getattr
+    that ignores the hint, so after a restore the watermark panel labelled MySQL rows, CDC
+    config dispatched MySQL, and Schema Conversion converted a PG inventory with the MySQL
+    dialect (which also reopened the AUTO_INCREMENT wording in the PK picker)."""
+    import pathlib
+
+    import dsql_migrator.ui.data_migration as dm
+    import dsql_migrator.ui.schema_conversion as sc
+
+    root = pathlib.Path(dm.__file__).parent
+    raw = 'getattr(getattr(session, "source_config", None), "source_type"'
+    offenders = []
+    for path in list(root.glob("*.py")) + [pathlib.Path(sc.__file__)]:
+        text = path.read_text(encoding="utf-8")
+        if raw in text and path.name != "_models.py":
+            offenders.append(path.name)
+    assert not offenders, (
+        "these read source_config directly and so ignore restored_source_type; route them "
+        f"through session_source_type: {offenders}"
+    )

@@ -42,6 +42,9 @@ _EXPECTED_PG_RULE_IDS = {
     # TARGET limit that applies to PG text/bytea/json/jsonb identically, while the shared
     # rule matches MySQL type NAMES -- so registering that one would have found nothing.
     "OVERSIZED_LOB",
+    # PG-only: a non-PK serial/identity column. Schema Conversion warned about it while
+    # Evaluation said nothing, the same contradiction the identity-KEY rule closed.
+    "NON_KEY_SEQUENCE",
 }
 
 _EXCLUDED_MYSQL_RULE_IDS = {
@@ -349,15 +352,32 @@ def test_pg_oversized_lob_rule_covers_what_the_manual_documents() -> None:
         primary_key=["id"],
     )
     findings = PgOversizedLobRule().evaluate(SourceInventory(tables=[table]))
-    assert len(findings) == 1
-    f = findings[0]
-    assert f.rule_id == "OVERSIZED_LOB"
-    assert f.classification is Classification.MANUAL
-    assert f.effort is EffortLevel.MEDIUM
-    for named in ("content", "body", "doc", "meta", "unbounded"):
-        assert named in f.risk, named
-    # A LENGTH-BOUNDED varchar cannot exceed 1 MiB, and a plain integer is irrelevant.
-    assert "code" not in f.risk
+    # TWO findings: the grading is split by what the TYPE declares, so a bytea/json/jsonb
+    # column is never averaged in with an idiomatic short string. Grading them together
+    # went wrong in both directions -- one LOSS made 18 tables of ordinary `text` read as
+    # per-table manual work, one RECOMMENDATION made a bytea holding 1,114,112 bytes read
+    # "Ready" while MySQL's identical longblob read "Moderate effort".
+    from dsql_migrator.core.models import ConversionNoteKind
+
+    assert len(findings) == 2
+    by_kind = {f.note_kind: f for f in findings}
+    loss = by_kind[ConversionNoteKind.LOSS]
+    advice = by_kind[ConversionNoteKind.RECOMMENDATION]
+    for f in findings:
+        assert f.rule_id == "OVERSIZED_LOB"
+        assert f.classification is Classification.MANUAL
+        assert f.effort is EffortLevel.MEDIUM
+        # A LENGTH-BOUNDED varchar cannot exceed 1 MiB, and a plain integer is irrelevant.
+        assert "code" not in f.risk
+        assert "qty" not in f.risk
+    # Deliberately-large types -> LOSS, matching MySQL's mediumblob/longblob grade.
+    for named in ("content", "doc", "meta"):
+        assert named in loss.risk, named
+    # Merely-unbounded character types -> advice.
+    for named in ("body", "unbounded"):
+        assert named in advice.risk, named
+    assert "content" not in advice.risk
+    f = loss
     assert "qty" not in f.risk
     # PG-worded: no MySQL LOB/TEXT type names.
     assert "MySQL" not in f.risk
@@ -605,3 +625,122 @@ def test_identity_finding_states_who_generates_the_key_not_only_throughput() -> 
         assert "Optional, for throughput only" in finding.recommendation
         assert "primary-key order" in text
         assert "cause hot partitions" not in text.lower()
+
+
+def test_or_and_not_checks_do_not_suppress_a_real_lob_risk() -> None:
+    """Both verified against real PostgreSQL. Searching the whole parsed tree for an EQ node
+    let two shapes hide a genuine risk: an OR means a row can satisfy the CHECK via the other
+    branch (so the column may hold anything), and a NOT permits everything EXCEPT the listed
+    values. Only a top-level AND-conjunct bounds a column."""
+    from dsql_migrator.core.assessor import (
+        pg_columns_bounded_by_check,
+        pg_oversized_lob_column_names,
+    )
+    from dsql_migrator.core.models import CheckConstraintDef
+
+    table = TableDef(
+        name="app.t",
+        columns=[
+            ColumnDef(name="id", mysql_type="integer"),
+            ColumnDef(name="status", mysql_type="text"),
+            ColumnDef(name="other", mysql_type="text"),
+            ColumnDef(name="bounded", mysql_type="text"),
+        ],
+        primary_key=["id"],
+        check_constraints=[
+            CheckConstraintDef(
+                name="or_check",
+                expression=(
+                    "(status = ANY (ARRAY['a'::text, 'b'::text])) OR id IS NOT NULL"
+                ),
+            ),
+            CheckConstraintDef(
+                name="not_check",
+                expression="NOT (other = ANY (ARRAY['x'::text, 'y'::text]))",
+            ),
+            # A genuine top-level conjunct still bounds its column, including inside an AND.
+            CheckConstraintDef(
+                name="and_check",
+                expression=(
+                    "id > 0 AND bounded = ANY (ARRAY['s'::text, 'm'::text])"
+                ),
+            ),
+        ],
+    )
+    assert pg_columns_bounded_by_check(table) == {"bounded"}
+    at_risk = pg_oversized_lob_column_names(table)
+    assert "status" in at_risk  # the OR branch leaves it unbounded
+    assert "other" in at_risk  # the negation permits everything else
+    assert "bounded" not in at_risk
+
+
+def test_a_not_valid_check_bounds_nothing() -> None:
+    """A NOT VALID constraint was never checked against the rows ALREADY stored, so a
+    multi-megabyte value written before it was added is still there -- and Full Load reads
+    exactly those rows. Treating it as a bound hid the value that would fail to load."""
+    from dsql_migrator.core.assessor import (
+        pg_columns_bounded_by_check,
+        pg_oversized_lob_column_names,
+    )
+    from dsql_migrator.core.models import CheckConstraintDef
+
+    def _table(not_valid: bool) -> TableDef:
+        return TableDef(
+            name="app.t",
+            columns=[
+                ColumnDef(name="id", mysql_type="integer"),
+                ColumnDef(name="blob_col", mysql_type="text"),
+            ],
+            primary_key=["id"],
+            check_constraints=[
+                CheckConstraintDef(
+                    name="c",
+                    expression="blob_col = ANY (ARRAY['s'::text, 'm'::text])",
+                    not_valid=not_valid,
+                )
+            ],
+        )
+
+    assert pg_columns_bounded_by_check(_table(not_valid=False)) == {"blob_col"}
+    assert pg_columns_bounded_by_check(_table(not_valid=True)) == set()
+    assert "blob_col" in pg_oversized_lob_column_names(_table(not_valid=True))
+
+
+def test_non_key_sequence_rule_matches_what_schema_conversion_warns() -> None:
+    """Evaluation said nothing about a NON-primary-key serial/identity column while Schema
+    Conversion warned about it -- the same contradiction the identity-KEY rule closed, one
+    column over. Graded a LOSS, unlike the key rule: for the key the operator gets a CHOICE
+    at Schema Conversion, for a non-key column the generation is simply gone."""
+    from dsql_migrator.core.assessor_postgres import PgNonKeySequenceRule
+    from dsql_migrator.core.models import Classification, ConversionNoteKind
+
+    table = TableDef(
+        name="shop.invoices",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False, identity=True),
+            ColumnDef(name="invoice_no", mysql_type="integer", nullable=False, identity=True),
+            ColumnDef(
+                name="legacy_no", mysql_type="bigint", nullable=False,
+                default="nextval('invoices_legacy_no_seq'::regclass)",
+            ),
+            ColumnDef(name="note", mysql_type="text"),
+        ],
+        primary_key=["id"],
+        auto_increment_column="id",
+    )
+    findings = PgNonKeySequenceRule().evaluate(SourceInventory(tables=[table]))
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.rule_id == "NON_KEY_SEQUENCE"
+    assert f.classification is Classification.MANUAL
+    assert f.note_kind is ConversionNoteKind.LOSS
+    # BOTH spellings, and never the primary key.
+    assert "invoice_no" in f.risk and "legacy_no" in f.risk
+    assert "id" not in f.risk.replace("identity", "").replace("IDENTITY", "")
+    assert "writes NULL" in f.risk
+    # A table with no non-key sequence column raises nothing.
+    assert PgNonKeySequenceRule().evaluate(
+        SourceInventory(tables=[TableDef(
+            name="t", columns=[ColumnDef(name="id", mysql_type="bigint", identity=True)],
+            primary_key=["id"], auto_increment_column="id")])
+    ) == []

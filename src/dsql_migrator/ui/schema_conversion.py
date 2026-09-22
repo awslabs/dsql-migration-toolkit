@@ -1268,14 +1268,15 @@ def build_schema_conversion_screen(
     session = store.get_or_create(session_id)
     conv_state = conv_store.get_or_create(session_id)
     eval_state = eval_store.get_or_create(session_id)
-    # Convert with the source engine's dialect (PostgreSQL vs the MySQL default);
-    # source_config is None before Connect / on a resume, so fall back to MySQL. This one
-    # construction feeds the whole memoized preview/apply/result path.
-    _src_type = (
-        session.source_config.source_type
-        if session.source_config is not None
-        else SourceType.MYSQL
-    )
+    # Convert with the source engine's dialect (PostgreSQL vs the MySQL default). This one
+    # construction feeds the whole memoized preview/apply/result path, which is why falling
+    # back to MySQL on a RESUME was the worst place to do it: source_config is None there,
+    # so a restored PostgreSQL session converted its PG inventory with the MySQL dialect and
+    # the primary-key picker went back to saying AUTO_INCREMENT. The helper consults the
+    # engine the snapshot recorded.
+    from dsql_migrator.ui.data_migration._models import session_source_type
+
+    _src_type = session_source_type(session)
     schema_converter = converter or SchemaConverter(source_type=_src_type)
 
     # An INJECTED existence checker (tests) always wins and is never rebuilt. A DERIVED one

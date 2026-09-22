@@ -177,3 +177,41 @@ def test_object_detail_finds_a_pg_routine_by_its_friendly_name() -> None:
     assert _name_for("app.ovl(a integer)") == ("app.ovl(a integer)", "ok")
     # A genuinely absent object is still not_found.
     assert _name_for("nope")[1] == "not_found"
+
+
+def test_a_schema_qualified_argument_type_does_not_cross_match_an_overload() -> None:
+    """The bare-last-segment arm was computed on the WHOLE name, so the tail of
+    `app.f(b geo.point)` is `point)` -- which also ends `app.f(a geo.point)`. Asking for one
+    overload therefore returned the other, before the exact-signature guard could apply, and
+    the changelog's claim that "a supplied signature still matches exactly" was false here."""
+    from dsql_migrator.core.models import ObjectRef, ObjectType, SourceInventory
+
+    inventory = SourceInventory(
+        routines=[
+            ObjectRef(name="app.f(a geo.point)", object_type=ObjectType.FUNCTION),
+            ObjectRef(name="app.f(b geo.point)", object_type=ObjectType.FUNCTION),
+        ]
+    )
+    execute = build_ai_tool_executor(
+        session_id="s1",
+        session_store=_Store(_Obj(target_config=None, target_verified=False,
+                                  source_config=None, source_password=None)),
+        evaluation_store=_Store(get_returns=_Obj(result=_Obj(inventory=inventory))),
+        schema_conversion_store=_Store(_Obj(generated_node_ids=[], apply_results=[])),
+        validation_store=_Store(_Obj(result=None)),
+        data_migration_store=_Store(_Obj(job_id=None, get_prereq_report=lambda _m: None)),
+        job_manager=_Obj(),
+        full_load_rate_eta=lambda *_a, **_k: (None, None),
+    )
+
+    def _resolved(asked: str):
+        return json.loads(
+            execute("get_source_object_detail", {"object_name": asked})
+        ).get("object_name")
+
+    # Each signature resolves to ITS OWN overload.
+    assert _resolved("app.f(b geo.point)") == "app.f(b geo.point)"
+    assert _resolved("app.f(a geo.point)") == "app.f(a geo.point)"
+    # The friendly name still resolves (to the first).
+    assert _resolved("f") == "app.f(a geo.point)"
+    assert _resolved("app.f") == "app.f(a geo.point)"

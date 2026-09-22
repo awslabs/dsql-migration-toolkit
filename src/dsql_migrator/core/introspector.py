@@ -566,6 +566,11 @@ def _reflect_tables(inspector: object, schema: Optional[str] = None) -> list[Tab
                     CheckConstraintDef(
                         name=str(ck_name),
                         expression=str(ck.get("sqltext") or ""),
+                        # PostgreSQL NOT VALID, surfaced by SQLAlchemy under
+                        # dialect_options. Absent for MySQL -> False.
+                        not_valid=bool(
+                            (ck.get("dialect_options") or {}).get("not_valid", False)
+                        ),
                     )
                 )
         except Exception:  # noqa: BLE001 - reflection of checks is best-effort
@@ -1206,10 +1211,17 @@ def _pg_object_definition(connection, object_name: str, object_type: ObjectType)
         # to its own body; truncating at "(" instead would return an arbitrary overload.
         # ``to_regprocedure`` is not usable here -- it raises on an identity-argument string
         # that carries argument names or IN/OUT modes, which these do.
+        # ``prokind IN ('f','p')`` is REQUIRED, not an optimisation: pg_get_functiondef
+        # RAISES ``WrongObjectType`` for an aggregate ('a') or window ('w') routine, and that
+        # error ABORTS THE TRANSACTION -- so one aggregate in the schema made every
+        # SUBSEQUENT object-detail lookup on the same connection fail too, each reported with
+        # the false "the object may have been dropped or you may lack permission". Verified
+        # live: asking for the aggregate first turned a healthy neighbouring function's body
+        # into None, while a fresh connection returned it fine.
         sql = (
             "SELECT pg_get_functiondef(p.oid) FROM pg_proc p "
             "JOIN pg_namespace n ON n.oid = p.pronamespace "
-            "WHERE CAST(:full AS text) IN ("
+            "WHERE p.prokind IN ('f', 'p') AND CAST(:full AS text) IN ("
             "  p.proname,"
             "  n.nspname || '.' || p.proname,"
             "  p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')',"

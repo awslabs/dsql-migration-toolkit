@@ -422,18 +422,19 @@ def build_ai_tool_executor(
                          "message": "Run Evaluation (Step 1) first to read the source schema."}
                     )
                 _key = _obj.lower()
-                _tail = _key.rsplit(".", 1)[-1]
-                # A PostgreSQL routine's inventory name now carries its identity ARGUMENTS
-                # (``app.fn(a integer)``) so overloads are distinguishable. Without the
-                # signature-tolerant arm below, the friendly name an operator or the model
-                # actually says -- ``fn``, or ``app.fn`` -- matched nothing and the tool
-                # answered not_found for an object Evaluation had just listed.
+                # Compared on the name with any SIGNATURE stripped from BOTH sides. A
+                # PostgreSQL routine's inventory name now carries its identity arguments
+                # (``app.fn(a integer)``), so the friendly name an operator or the model says
+                # -- ``fn``, or ``app.fn`` -- has to resolve. Taking the last dot-segment of
+                # the WHOLE string instead made a schema-qualified argument type
+                # cross-match: the tail of ``app.f(b geo.point)`` is ``point)``, which also
+                # ends ``app.f(a geo.point)``, so asking for one overload returned the other.
                 _key_base = _key.split("(", 1)[0]
                 _tail_base = _key_base.rsplit(".", 1)[-1]
 
                 def _matches(_n: str) -> bool:
                     _nl = _n.lower()
-                    if _nl == _key or _nl.rsplit(".", 1)[-1] == _tail:
+                    if _nl == _key:
                         return True
                     # A SIGNATURE was supplied: match it exactly, so asking for one overload
                     # never resolves to another.

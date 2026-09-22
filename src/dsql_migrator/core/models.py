@@ -297,6 +297,12 @@ class CheckConstraintDef(BaseModel):
     # The constraint's SQL text as reflected (``sqltext``), e.g. ``price > 0``. Kept for
     # display so the operator can re-create the check on the target by hand if needed.
     expression: str = ""
+    # True for a PostgreSQL ``NOT VALID`` CHECK. Such a constraint is enforced on NEW writes
+    # but was never checked against the rows ALREADY stored, so it does not prove anything
+    # about existing data -- a column it appears to limit can still hold a multi-megabyte
+    # value written before the constraint was added. Captured so a size analysis cannot treat
+    # it as a bound. Reflected from SQLAlchemy's ``dialect_options``; False for MySQL.
+    not_valid: bool = False
 
 
 class TableDef(BaseModel):
@@ -1648,6 +1654,16 @@ class DriftReport(BaseModel):
     watermark_gtid: Optional[str] = None
     current_gtid: Optional[str] = None
     drifted: bool = False
+    # Whether ``drifted`` MEANS anything. ``drifted`` defaults to False when nothing was
+    # comparable, so a machine consumer keying on it alone read "the source did not change"
+    # on every PostgreSQL run -- where the MySQL probes are deliberately skipped to keep the
+    # snapshot intact, so drift is never determined. The prose says "could not be
+    # determined"; only the serialized field still claimed otherwise.
+    #
+    # Added as a SIBLING rather than making ``drifted`` nullable: an existing consumer that
+    # reads ``drifted`` as a bool keeps working, and one that wants the truth has a field to
+    # read. Derived from ``basis``, which already encodes it, so the two cannot disagree.
+    determinable: bool = True
     detail: str = ""
     # "gtid" | "binlog" | "" (undeterminable). Defaulted so older persisted reports
     # (written before the fallback existed) still validate under extra="forbid".
