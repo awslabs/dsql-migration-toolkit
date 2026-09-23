@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.502
+
+### Changed
+
+- **A PostgreSQL source no longer lists MySQL's binlog/GTID checks at all.** They were kept
+  as SKIP rows to satisfy a mode-symmetry rule -- a check id present in the weaker mode but
+  absent in the stronger one reads as an oversight -- and v0.1.498 corrected their wording
+  from "Not applicable for this MODE" (which reads as "they WILL apply under CDC") to "...for
+  this source ENGINE". But symmetry is about the two MODES of one engine, and it still holds
+  now that they are absent from BOTH PostgreSQL modes. What was left was simply another
+  engine's requirements on a PostgreSQL operator's screen: three rows that can never apply,
+  beside the nine that do. The PostgreSQL counterpart of the retention risk is its own check
+  (`SLOT_WAL_RETENTION`), so nothing is lost. MySQL is unchanged.
+
 ## v0.1.501
 
 ### Fixed

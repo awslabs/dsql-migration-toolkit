@@ -486,13 +486,14 @@ def test_postgres_cdc_request_never_runs_mysql_variable_checks() -> None:
     )
     report = checker.check(request, tables=[_table("app.orders")])
 
-    # The MySQL-only checks are not applicable for this engine.
-    assert _result(report, PrerequisiteCheckId.BINLOG_ROW_FORMAT).status is (
-        PrerequisiteStatus.SKIP
-    )
-    assert _result(report, PrerequisiteCheckId.GTID_MODE).status is (
-        PrerequisiteStatus.SKIP
-    )
+    # The MySQL-only checks are not LISTED for this engine at all. They used to appear as
+    # SKIP rows to satisfy a mode-symmetry rule, but symmetry is about the two MODES of one
+    # engine -- and for PostgreSQL they are now absent from both, so it holds. What was left
+    # was another engine's requirements on a PostgreSQL operator's screen.
+    present = {r.check_id for r in report.results}
+    assert PrerequisiteCheckId.BINLOG_ROW_FORMAT not in present
+    assert PrerequisiteCheckId.BINLOG_RETENTION not in present
+    assert PrerequisiteCheckId.GTID_MODE not in present
     # Healthy PG facts -> the real checks ran and pass.
     assert report.can_proceed is True
 
@@ -559,8 +560,8 @@ def test_postgres_cdc_facts_run_the_real_readiness_checks() -> None:
     assert Id.REPLICA_IDENTITY in ids
     # MSK is engine-neutral -> still runs for PostgreSQL CDC.
     assert Id.MSK_AVAILABLE in ids
-    # MySQL binlog/GTID are not applicable -> SKIP.
-    assert _result(report, Id.BINLOG_ROW_FORMAT).status is PrerequisiteStatus.SKIP
+    # MySQL binlog/GTID are not applicable to this engine, so they are not listed at all.
+    assert Id.BINLOG_ROW_FORMAT not in ids
     assert report.can_proceed is True
 
 
@@ -940,11 +941,17 @@ def test_slot_wal_retention_follows_binlog_retention_semantics() -> None:
 
 
 def test_pg_cdc_report_keeps_binlog_retention_visible_and_adds_the_wal_check() -> None:
-    """D-1: BINLOG_RETENTION appeared as a SKIP in the WEAKER Full Load report but vanished
-    entirely from the PG CDC report -- a check id present in the weaker mode and absent in
-    the stronger one reads as an oversight. And its PostgreSQL equivalent (the slot's WAL
-    can be discarded, invalidating it, which is the same silent Full-Load-to-CDC gap) was
-    not checked at all."""
+    """D-1, superseded: the PG report now omits BINLOG_RETENTION in BOTH modes.
+
+    D-1 originally restored it as a SKIP in the PG CDC report because a check id present in
+    the weaker mode and absent in the stronger one reads as an oversight. That symmetry rule
+    is about the two MODES of one engine -- and it still holds, because the id is now absent
+    from both PostgreSQL modes rather than present in both. Keeping it was showing a
+    PostgreSQL operator another engine's requirement; the part of D-1 that still matters is
+    its second half, which this test continues to pin: the PostgreSQL EQUIVALENT of the
+    retention risk (the slot's WAL being discarded, the same silent Full-Load-to-CDC gap) is
+    checked as SLOT_WAL_RETENTION.
+    """
     from dsql_migrator.core.models import PrerequisiteCheckId as Id
 
     def _report(mode, facts=None):
@@ -962,9 +969,9 @@ def test_pg_cdc_report_keeps_binlog_retention_visible_and_adds_the_wal_check() -
 
     cdc = _report(MigrationMode.CDC)
     full = _report(MigrationMode.FULL_LOAD)
-    # No longer missing from the stronger mode.
-    assert _result(cdc, Id.BINLOG_RETENTION).status is PrerequisiteStatus.SKIP
-    assert _result(full, Id.BINLOG_RETENTION).status is PrerequisiteStatus.SKIP
+    # Absent from BOTH PostgreSQL modes -- symmetric, and no longer another engine's row.
+    assert Id.BINLOG_RETENTION not in {r.check_id for r in cdc.results}
+    assert Id.BINLOG_RETENTION not in {r.check_id for r in full.results}
     # The PG equivalent RUNS only in CDC mode (a Full Load creates no slot) -- but it is
     # still LISTED in Full Load as a SKIP, for the very reason asserted just above: a
     # check id present in one mode and absent in the other reads as an oversight, and the
@@ -1030,12 +1037,15 @@ def test_full_load_only_previews_the_postgres_readiness_checks_for_a_pg_source()
     assert report.can_proceed is True
 
 
-def test_binlog_and_gtid_skips_blame_the_engine_not_the_mode_for_a_pg_source() -> None:
-    """"Not applicable for this mode" implies "it will apply under CDC" -- false for PG.
+def test_a_postgres_source_is_never_shown_mysql_binlog_or_gtid_rows() -> None:
+    """Another engine's requirements have no place on a PostgreSQL operator's screen.
 
-    PostgreSQL has no binary log and no GTID in ANY mode, so the reason has to name the
-    engine. Asserted in BOTH modes: the rows stay visible (a check id present in one mode
-    and absent in the other reads as an oversight) but must never claim to be pending.
+    These were first mislabelled ("Not applicable for this MODE", which reads as "they WILL
+    apply under CDC" -- PostgreSQL has no binary log in any mode), then relabelled to name
+    the engine, and are now omitted outright. The mode-symmetry rule that kept them is about
+    the two MODES of one engine, and it still holds: absent from both PostgreSQL modes. The
+    PostgreSQL counterpart of the retention risk is its own check (SLOT_WAL_RETENTION), so
+    nothing is lost.
     """
     mysql_only = (
         PrerequisiteCheckId.BINLOG_ROW_FORMAT,
@@ -1043,14 +1053,17 @@ def test_binlog_and_gtid_skips_blame_the_engine_not_the_mode_for_a_pg_source() -
         PrerequisiteCheckId.GTID_MODE,
     )
     for mode in (MigrationMode.FULL_LOAD, MigrationMode.CDC):
-        report = _prereq_report(mode, SourceType.POSTGRES)
+        present = {
+            r.check_id for r in _prereq_report(mode, SourceType.POSTGRES).results
+        }
         for check_id in mysql_only:
-            result = _result(report, check_id)
-            assert result.status is PrerequisiteStatus.SKIP, (mode, check_id)
-            assert result.detail == "Not applicable for this source engine.", (
-                f"{mode.value}/{check_id.value} still blames the mode, telling a "
-                f"PostgreSQL operator these apply under CDC: {result.detail!r}"
+            assert check_id not in present, (
+                f"{mode.value}: a PostgreSQL source is still shown {check_id.value}, "
+                "a requirement that can never apply to it"
             )
+        # ...and the operator's OWN checks are there instead.
+        assert PrerequisiteCheckId.WAL_LEVEL_LOGICAL in present, mode
+        assert PrerequisiteCheckId.SLOT_WAL_RETENTION in present, mode
 
 
 def test_full_load_only_for_mysql_is_unchanged_and_lists_no_pg_checks() -> None:

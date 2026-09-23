@@ -5,6 +5,12 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.502
+
+### 변경
+
+- **PostgreSQL 소스에서 MySQL의 binlog/GTID 체크를 아예 표시하지 않습니다.** 모드 대칭 규칙(약한 모드에 있고 강한 모드에 없는 check id는 누락처럼 읽힘)을 만족시키려 SKIP 행으로 유지했고, v0.1.498에서 문구를 "Not applicable for this MODE"("CDC에서는 적용된다"로 읽힘)에서 "...for this source ENGINE"으로 바로잡았습니다. 그러나 대칭은 **한 엔진의 두 모드**에 관한 것이고, 이제 PostgreSQL의 **양쪽 모드 모두**에서 사라졌으므로 여전히 성립합니다. 남아 있던 것은 PostgreSQL 운영자 화면 위의 다른 엔진 요구사항 — 적용될 수 없는 세 줄이, 적용되는 아홉 줄 옆에 — 이었습니다. 보존 리스크의 PostgreSQL 대응물은 자체 체크(`SLOT_WAL_RETENTION`)이므로 잃는 것이 없습니다. MySQL은 변경 없습니다.
+
 ## v0.1.501
 
 ### 수정

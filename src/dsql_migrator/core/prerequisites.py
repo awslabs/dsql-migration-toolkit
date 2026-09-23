@@ -845,36 +845,16 @@ class PrerequisiteChecker:
                         facts, [effective[table.name] for table in tables]
                     )
                 )
-            # reason="engine", not the default "mode": PostgreSQL has no binary log and
-            # no GTID in ANY mode, so "not applicable for this mode" told the operator
-            # these would start applying -- they never do.
-            results.append(
-                _skipped(
-                    PrerequisiteCheckId.BINLOG_ROW_FORMAT,
-                    "Binary log uses ROW format with full row image",
-                    reason="engine",
-                )
-            )
-            results.append(
-                # The PG equivalent of this risk is its own check
-                # (SLOT_WAL_RETENTION, from max_slot_wal_keep_size) run above. Skipped
-                # here rather than omitted so all three MySQL binlog rows stay together:
-                # BINLOG_RETENTION appears as a SKIP in Full Load mode, and a check id
-                # that is present in the weaker mode but absent in the stronger one reads
-                # as an oversight.
-                _skipped(
-                    PrerequisiteCheckId.BINLOG_RETENTION,
-                    "Binary log retention covers the CDC handoff",
-                    reason="engine",
-                )
-            )
-            results.append(
-                _skipped(
-                    PrerequisiteCheckId.GTID_MODE,
-                    "GTID mode is enabled",
-                    reason="engine",
-                )
-            )
+            # MySQL's binlog/GTID rows are NOT listed for a PostgreSQL source, in either
+            # mode. They were kept as SKIPs to satisfy a mode-symmetry rule (a check id
+            # present in the weaker mode but absent in the stronger one reads as an
+            # oversight), and v0.1.498 at least corrected their wording from "not
+            # applicable for this MODE" to "...this source ENGINE". But symmetry is about
+            # the two MODES of one engine, and for PostgreSQL these are absent from BOTH
+            # modes now, so it holds. What remains is simply another engine's requirements
+            # on a PostgreSQL operator's screen: three rows that can never apply, beside
+            # the six that do. The PG counterpart of the retention risk is its own check
+            # (SLOT_WAL_RETENTION), so nothing is lost by omitting them.
             results.append(
                 check_msk_available(
                     self._msk.cluster_available() if self._msk else False
@@ -920,28 +900,25 @@ class PrerequisiteChecker:
             # one mode and absent in another reads as an oversight, so PG CDC keeps them
             # visible -- and Full Load must match, or the id would vanish going the other
             # way. Only the reason differs by engine.
-            _reason = "engine" if is_postgres else "mode"
-            results.append(
-                _skipped(
-                    PrerequisiteCheckId.BINLOG_ROW_FORMAT,
-                    "Binary log uses ROW format with full row image",
-                    reason=_reason,
+            if not is_postgres:
+                # MySQL only: these preview what switching to CDC will additionally
+                # require. A PostgreSQL source gets its OWN six previewed above instead --
+                # listing another engine's requirements was the whole defect.
+                results.append(
+                    _skipped(
+                        PrerequisiteCheckId.BINLOG_ROW_FORMAT,
+                        "Binary log uses ROW format with full row image",
+                    )
                 )
-            )
-            results.append(
-                _skipped(
-                    PrerequisiteCheckId.BINLOG_RETENTION,
-                    "Binary log retention covers the CDC handoff",
-                    reason=_reason,
+                results.append(
+                    _skipped(
+                        PrerequisiteCheckId.BINLOG_RETENTION,
+                        "Binary log retention covers the CDC handoff",
+                    )
                 )
-            )
-            results.append(
-                _skipped(
-                    PrerequisiteCheckId.GTID_MODE,
-                    "GTID mode is enabled",
-                    reason=_reason,
+                results.append(
+                    _skipped(PrerequisiteCheckId.GTID_MODE, "GTID mode is enabled")
                 )
-            )
             results.append(
                 _skipped(PrerequisiteCheckId.MSK_AVAILABLE, "MSK cluster is available")
             )
