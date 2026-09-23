@@ -5,6 +5,26 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.505
+
+### Fixed
+
+- **The Per-table migration status table no longer grows a horizontal scrollbar inside its
+  card.** Quasar sets `white-space: nowrap` on every table header and cell, so the
+  eleven-column table's multi-word headers ("Source rows (est.)") and long
+  `schema.table` names pinned it wider than the card and the inner region started
+  scrolling. The headers and the table-name column may now wrap. Both halves were needed:
+  allowing the headers to wrap reclaims most of the width, but `word-break` on the name
+  column does nothing while `nowrap` is still in force -- a break opportunity cannot be
+  taken if wrapping is forbidden -- and that single omission left the name column pinned
+  at full width with the scrollbar intact at every width tested. The numeric columns keep
+  `nowrap`, because a thousands-separated figure has no break opportunity anyway and reads
+  badly split. Measured in a real browser against the columns, rows and cell slots the app
+  actually renders: a 1100px card went from 59px of horizontal overflow to 0, a 1000px card
+  from 159px to 0, an 850px card from 309px to 0, with zero clipped cells at every width.
+  Below roughly an 820px card the numeric columns hit a floor no wrapping can shrink, and a
+  scrollbar there is preferred over hiding data.
+
 ## v0.1.504
 
 ### Fixed

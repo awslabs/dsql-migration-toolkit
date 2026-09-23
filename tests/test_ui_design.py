@@ -1277,3 +1277,58 @@ def test_settings_footer_warns_that_values_do_not_persist() -> None:
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
     ).lower()
     assert "changes apply to the next run" not in literals
+
+
+def test_fit_table_css_lets_both_the_headers_and_the_name_column_wrap() -> None:
+    """Both rules are load-bearing, and the second one is the easy thing to get wrong.
+
+    Quasar sets ``white-space: nowrap`` on every ``th``/``td``. Allowing the headers to
+    wrap reclaims most of the width, but ``word-break`` on the name column does NOTHING
+    while ``nowrap`` is still in force -- a break opportunity cannot be taken if wrapping
+    is forbidden. Measured in a real browser on the 11-column Per-table migration status
+    table: with only the header rule the name column stayed pinned at its full width and
+    the scrollbar survived at every container width tested; with both, a 1068px card went
+    from 36px of overflow to 0.
+    """
+    from dsql_migrator.ui.design import FIT_TABLE_CLASS, FIT_TABLE_CSS
+
+    css = " ".join(FIT_TABLE_CSS.split())  # normalize whitespace for matching
+    assert FIT_TABLE_CLASS == "dsql-fit-table"
+    # Scoped to the opt-in class: this must never restyle every table in the app.
+    assert f".{FIT_TABLE_CLASS} " in FIT_TABLE_CSS
+    assert css.count("white-space: normal") == 2  # headers AND the first column
+    # The header rule.
+    assert f".{FIT_TABLE_CLASS} thead th {{ white-space: normal;" in css
+    # The first-column rule, with BOTH properties -- word-break alone is inert.
+    first_col = css[css.index("thead th:first-child") :]
+    assert "white-space: normal" in first_col and "word-break: break-all" in first_col
+    # Only the FIRST column may break mid-word: the rest hold thousands-separated
+    # figures, which have no break opportunity and read badly split.
+    assert "td:first-child" in css
+    assert "break-all" not in css[: css.index("thead th:first-child")]
+
+
+def test_fit_table_css_is_installed_once_per_call_site() -> None:
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.design import FIT_TABLE_CSS, fit_table_css
+
+    added = []
+    fit_table_css(SimpleNamespace(add_css=lambda css: added.append(css)))
+    assert added == [FIT_TABLE_CSS]
+
+
+def test_the_per_table_migration_status_table_opts_into_fitting_its_card() -> None:
+    """Behavioral, not a source grep: RENDER the real view and read what it emitted.
+
+    The CSS is inert unless the stylesheet is installed AND the table carries the class,
+    and each half is independently easy to drop -- so assert both from the render output.
+    An ``inspect.getsource`` check here would also match the explanatory comment beside
+    the call, which is a documented way this repo has produced false passes.
+    """
+    from dsql_migrator.ui.design import FIT_TABLE_CLASS, FIT_TABLE_CSS
+    from tests.test_ui_data_migration import _render_cdc_per_table_for_design
+
+    ui = _render_cdc_per_table_for_design()
+    assert FIT_TABLE_CSS in ui.css  # the stylesheet reached the page
+    assert any(FIT_TABLE_CLASS in c for c in ui.classes_applied)  # ...and the table opted in

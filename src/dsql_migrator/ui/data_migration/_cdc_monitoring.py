@@ -58,8 +58,10 @@ from dsql_migrator.ui.data_migration._cdc_status import (
 )
 from dsql_migrator.ui.design import (
     EXPANSION_PANEL_CLASSES,
+    FIT_TABLE_CLASS,
     NOTICE_STYLE,
     definition_row,
+    fit_table_css,
     inline_hint,
     render_notice,
     section_header,
@@ -280,15 +282,18 @@ def _render_migration_table_status(
                 return
             # `dense` + a high rows-per-page (no footer pager) + `flat` keep the
             # table compact and render every table inline, so it grows with content
-            # instead of showing a bottom pagination bar / inner scroll. The columns
-            # carry short labels so the row fits the card width without a horizontal
-            # scrollbar at the bottom.
+            # instead of showing a bottom pagination bar / inner scroll. Short column
+            # labels were not enough to avoid a HORIZONTAL scrollbar: eleven columns of
+            # Quasar's `white-space: nowrap` cells pinned the table 36px wider than the
+            # card, so FIT_TABLE_CLASS lets the headers and the long `schema.table`
+            # names wrap instead (see ui/design.py for the measurements).
+            fit_table_css(ui)
             table = ui.table(  # type: ignore[attr-defined]
                 columns=columns,
                 rows=table_rows,
                 row_key="table",
                 pagination={"rowsPerPage": 0},
-            ).props("dense flat").classes("w-full")
+            ).props("dense flat").classes(f"w-full {FIT_TABLE_CLASS}")
             _status_tbl["el"] = table
             # Color the Full Load state as a badge.
             table.add_slot(

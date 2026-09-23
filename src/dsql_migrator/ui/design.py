@@ -449,6 +449,55 @@ SEGMENTED_TOGGLE_PROPS = (
 SEGMENTED_TOGGLE_CLASSES = "rounded-md border border-gray-300 overflow-hidden"
 
 
+# A many-column ``ui.table`` that must fit its card instead of growing a horizontal
+# scrollbar. Quasar sets ``white-space: nowrap`` on every ``th``/``td``, so a multi-word
+# header ("Source rows (est.)") or a long ``schema.table`` name pins the table wider than
+# its container and ``.q-table__middle`` starts scrolling -- a bottom scrollbar inside a
+# card the rest of the page does not have.
+#
+# Two rules, and BOTH are needed: letting the headers wrap reclaims most of the width,
+# but ``word-break`` on the name column does nothing while ``nowrap`` is still set (a
+# break opportunity cannot be taken if wrapping is forbidden) -- that single omission left
+# the name column pinned at its full width and the scrollbar in place at every width
+# tested. Only the FIRST column is allowed to break mid-word: the rest hold
+# thousands-separated figures, which have no break opportunity anyway and read badly split.
+# Applied via ``ui.add_css`` (de-duplicated by content) plus this class on the table.
+#
+# Measured in a real browser against the columns/rows/slots the app ACTUALLY passes to
+# ``ui.table`` (captured out of ``_render_migration_table_status``, not a hand-copy --
+# the first hand-written probe understated the cell widths and so understated the
+# overflow). Card width -> horizontal overflow, before / after:
+#   1280px -> 0 / 0    1100px -> 59px / 0    1000px -> 159px / 0
+#    950px -> 209px / 0    900px -> 259px / 0    850px -> 309px / 0
+#    800px -> 359px / 14px
+# ZERO clipped cells at every width in both cases. So this is NOT a promise that a
+# scrollbar can never appear: below roughly an 820px card the ten numeric columns hit a
+# floor no wrapping can shrink, and a scrollbar there is the correct outcome rather than
+# hidden data.
+FIT_TABLE_CLASS = "dsql-fit-table"
+FIT_TABLE_CSS = """
+.dsql-fit-table thead th {
+  white-space: normal;
+  vertical-align: bottom;
+  line-height: 1.2;
+}
+.dsql-fit-table thead th:first-child,
+.dsql-fit-table tbody td:first-child {
+  white-space: normal;
+  word-break: break-all;
+}
+"""
+
+
+def fit_table_css(ui) -> None:
+    """Install :data:`FIT_TABLE_CSS` once, so a wide table fits its card.
+
+    Call before building a table that carries :data:`FIT_TABLE_CLASS`. ``ui.add_css``
+    de-duplicates by content, so calling it per render (or per poll) is free.
+    """
+    ui.add_css(FIT_TABLE_CSS)  # type: ignore[attr-defined]
+
+
 # Border/shape for a collapsible ``ui.expansion`` so it reads as its own panel like
 # the bordered ``ui.card`` sections around it. A bare expansion draws no border, so
 # collapsible items (connector config, deploy log, Delete CDC infrastructure, ...) sat

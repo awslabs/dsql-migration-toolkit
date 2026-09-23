@@ -9267,6 +9267,12 @@ class _RecordingUi:
         self.buttons: list = []
         # Rendered ui.table() payloads ({"rows": [...], "columns": [...]}).
         self.tables: list = []
+        # Stylesheets installed via ui.add_css, so a test can assert a screen actually
+        # installs the CSS its classes depend on (a class without its stylesheet is
+        # inert). Recorded rather than ignored for the same reason texts are.
+        self.css: list[str] = []
+        # Every `.classes(...)` string applied to any element on this page.
+        self.classes_applied: list[str] = []
 
     class _El:
         # Class-level default: subclasses below (_Btn, _Input, ...) define their own
@@ -9280,6 +9286,11 @@ class _RecordingUi:
             self._ui = ui
 
         def classes(self, *_a, **_k):
+            # Recorded, not discarded: a Tailwind/Quasar class is the whole mechanism for
+            # several layout rules (e.g. FIT_TABLE_CLASS), so dropping it here would make
+            # "the class was never applied" untestable without an inspect.getsource grep.
+            if _a and self._ui is not None:
+                self._ui.classes_applied.append(str(_a[0]))
             return self
 
         def props(self, *_a, **_k):
@@ -9430,6 +9441,9 @@ class _RecordingUi:
         def enable(self, *_a, **_k):
             self.enabled = True
             return self
+
+    def add_css(self, css="", *_a, **_k) -> None:
+        self.css.append(str(css))
 
     def table(self, *_a, rows=None, columns=None, **_k):
         # Record the ROWS, not just that a table was drawn: the DLQ record table is
@@ -17120,6 +17134,21 @@ def _render_cdc_per_table(state, *, job_id="job-fullload-1"):
             ]
         ),
     )
+    return ui
+
+
+def _render_cdc_per_table_for_design():
+    """Render the per-table status view and return the UI double, for design-rule tests.
+
+    A thin named wrapper so tests/test_ui_design.py can drive the REAL view without
+    reconstructing its fixtures (or resorting to an ``inspect.getsource`` grep). The
+    job id is load-bearing: the table set comes from the Full Load job's chunk ids, so
+    without it the view early-returns and renders nothing at all.
+    """
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"
+    ui = _render_cdc_per_table(state)
+    assert ui.tables, "the view rendered no table -- the fixture is not driving it"
     return ui
 
 
