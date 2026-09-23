@@ -674,7 +674,10 @@ def run_cdc_infra_deploy(
     """Deploy CDC infrastructure with ``create_stack`` (no connectors yet).
 
     Walks :data:`CDC_INFRA_STAGES`: ensure the managed plugin S3 bucket exists and
-    upload the two bundled connector artifacts, then refuse to create over an
+    upload the connector artifacts THIS SOURCE ENGINE uses (the engine is derived from
+    ``params``' ``EngineType``, so the uploaded set cannot disagree with the stack being
+    created -- a PostgreSQL stack references neither the MySQL source plugin nor the
+    offset-seeder Lambda), then refuse to create over an
     existing stack (directing the user to Start, or to Delete a rolled-back one),
     then create the stack and poll until ``CREATE_COMPLETE``. The MSK Serverless
     cluster takes ~15-20 min, so ``create_timeout_seconds`` defaults to 30 min.
@@ -683,6 +686,7 @@ def run_cdc_infra_deploy(
     drive the bucket+upload stages; the resulting bucket ARN / keys / version are
     patched into ``params`` before ``create_stack``.
     """
+    from dsql_migrator.core.models import SourceType
     from dsql_migrator.core.s3_provision import (
         S3ProvisionError,
         build_s3_client,
@@ -694,7 +698,8 @@ def run_cdc_infra_deploy(
         handle, stages=CDC_INFRA_STAGES, on_log=on_log, sleep=sleep
     )
     try:
-        # 0a. ensure plugin bucket + 0b. upload plugins (background — ~42 MiB).
+        # 0a. ensure plugin bucket + 0b. upload plugins (background — ~32-43 MiB,
+        #     depending on the source engine).
         driver.stage("ensure_bucket", "IN_PROGRESS")
         if region is None:
             raise CdcDeployError(
@@ -705,8 +710,23 @@ def run_cdc_infra_deploy(
         driver.stage("ensure_bucket", "DONE")
 
         driver.stage("upload_plugins", "IN_PROGRESS")
+        # Derive the engine from the params we are ABOUT TO SUBMIT rather than take it as
+        # an argument: EngineType is exactly what the cdc-stack's IsMySqlSource /
+        # IsPostgresSource read, and it is absent on a MySQL set (template Default:
+        # mysql). Deriving it HERE makes it structurally impossible for the uploaded
+        # artifacts to disagree with the stack being created, and needs no change at
+        # either call site (the UI and scripts/run_pg_cdc_e2e.py, neither of which knows
+        # to pass an engine -- a defaulted kwarg would have silently skipped the
+        # PostgreSQL plugin in the one harness that would otherwise catch it).
+        source_engine = (
+            SourceType.POSTGRES
+            if _param_value(params, "EngineType") == "postgres"
+            else SourceType.MYSQL
+        )
         try:
-            upload = ensure_and_upload_plugins(s3, sts, region, on_progress=driver.log)
+            upload = ensure_and_upload_plugins(
+                s3, sts, region, on_progress=driver.log, source_engine=source_engine
+            )
         except S3ProvisionError as exc:
             driver.stage("upload_plugins", "FAILED")
             raise CdcDeployError(str(exc)) from exc

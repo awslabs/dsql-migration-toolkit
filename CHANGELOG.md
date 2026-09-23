@@ -5,6 +5,32 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.506
+
+### Fixed
+
+- **A PostgreSQL "Deploy CDC infrastructure" log no longer reports MySQL artifacts as if
+  they mattered.** The upload stage pushed all four bundled artifacts on every deploy, so
+  the log opened with `cdc-plugins/debezium-mysql-plugin.zip: already up to date` and
+  `offset-seeder-lambda.zip` on a PostgreSQL run — neither of which a PostgreSQL cdc-stack
+  can reference (`DebeziumSourcePlugin` is conditional on `IsMySqlSource`, and
+  `DeploySeederFunction` ANDs `IsMySqlSource`). The stage is now engine-aware: a PostgreSQL
+  deploy uploads the PostgreSQL source plugin and the shared DSQL sink, a MySQL deploy
+  uploads the MySQL source plugin, the sink and the offset-seeder Lambda, and one line
+  states what is not being uploaded and why. As a side effect a first PostgreSQL deploy no
+  longer transfers the 31.3 MiB MySQL plugin it can never use, and a first MySQL deploy no
+  longer transfers the 21.2 MiB PostgreSQL one.
+- **An upload result now names only artifacts it actually uploaded.** A key is returned as
+  empty when its object was skipped, so a cdc-stack parameter can no longer point at an
+  object that is not in the bucket — which is also what keeps the template's
+  `Fn::Equals [LambdaSeederS3Key, ""]` truthful for a PostgreSQL stack, with no
+  engine-awareness needed in the parameter patcher.
+
+The engine is derived from the CloudFormation parameters the deploy is about to submit
+(`EngineType`), not passed in by the caller, so the uploaded set cannot disagree with the
+stack being created; an unknown engine falls back to uploading everything, because the
+failure mode of guessing wrong is a plugin whose file is missing.
+
 ## v0.1.505
 
 ### Fixed

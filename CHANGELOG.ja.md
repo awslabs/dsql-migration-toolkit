@@ -5,6 +5,15 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.506
+
+### 修正
+
+- **PostgreSQL の「Deploy CDC infrastructure」ログに、MySQL のアーティファクトが重要であるかのように表示されなくなりました。** アップロード段階がすべてのデプロイで同梱 4 アーティファクトをすべて送っていたため、PostgreSQL の実行でもログが `cdc-plugins/debezium-mysql-plugin.zip: already up to date` と `offset-seeder-lambda.zip` で始まっていました。どちらも PostgreSQL の cdc-stack は参照できません（`DebeziumSourcePlugin` は `IsMySqlSource` 条件付き、`DeploySeederFunction` は `IsMySqlSource` を AND しています）。現在この段階はエンジンを認識します — PostgreSQL デプロイは PostgreSQL ソースプラグインと共通の DSQL シンクを、MySQL デプロイは MySQL ソースプラグイン・シンク・オフセットシーダー Lambda をアップロードし、何をアップロードしないのかとその理由を 1 行で述べます。副次的効果として、初回の PostgreSQL デプロイは使えない 31.3 MiB の MySQL プラグインを、初回の MySQL デプロイは 21.2 MiB の PostgreSQL プラグインを、もう転送しません。
+- **アップロード結果は、実際にアップロードしたアーティファクトのみを名前として返します。** スキップされたオブジェクトのキーは空で返るため、cdc-stack のパラメータがバケットに存在しないオブジェクトを指すことがなくなりました。これが PostgreSQL スタックでテンプレートの `Fn::Equals [LambdaSeederS3Key, ""]` を真のまま保ち、パラメータのパッチ処理はエンジンを知る必要がありません。
+
+エンジンは、デプロイがこれから送信する CloudFormation パラメータ（`EngineType`）から導出し、呼び出し側が渡すことはありません。そのためアップロードした集合が作成されるスタックと食い違うことはあり得ません。エンジンが不明な場合はすべてをアップロードする側に倒します — 推測を誤った場合の失敗形態が「ファイルの無いプラグイン」だからです。
+
 ## v0.1.505
 
 ### 修正

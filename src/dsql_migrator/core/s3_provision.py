@@ -3,12 +3,16 @@
 
 """Provision the S3 bucket + connector plugin artifacts for a CDC deploy.
 
-The cdc-stack's two MSK Connect plugins (the Debezium MySQL source zip and our
-custom DSQL sink jar) are loaded from S3. Rather than make the operator create a
-bucket and upload the artifacts by hand, the tool manages a per-account/region
-bucket and uploads the two bundled artifacts itself, then feeds the bucket ARN +
-object keys into the deploy. This is what lets the deploy form ask for only a
-VpcId.
+The cdc-stack's MSK Connect plugins (a Debezium source zip and our custom DSQL sink
+jar) are loaded from S3. Rather than make the operator create a bucket and upload the
+artifacts by hand, the tool manages a per-account/region bucket and uploads the
+bundled artifacts itself, then feeds the bucket ARN + object keys into the deploy.
+This is what lets the deploy form ask for only a VpcId.
+
+Which artifacts are uploaded depends on the SOURCE ENGINE, because the cdc-stack can
+only reference one set: the MySQL and PostgreSQL source plugins are mutually exclusive
+(``IsMySqlSource`` / ``IsPostgresSource``) and the offset-seeder Lambda seeds a MySQL
+binlog offset (``DeploySeederFunction`` ANDs ``IsMySqlSource``). The sink is shared.
 
 Bucket name is deterministic per identity: ``mysql-dsql-migrator-plugins-<account>-<region>``
 (globally unique because the account id is in the name). Uploads are idempotent
@@ -16,8 +20,9 @@ Bucket name is deterministic per identity: ``mysql-dsql-migrator-plugins-<accoun
 
 Read/writes share the single profile-aware boto3 session (mirroring
 :mod:`dsql_migrator.core.dsql_metadata`). Clients are injectable for tests. The
-artifact UPLOAD is large (~42 MiB total) and MUST run in the background deploy
-job, never on the UI thread.
+artifact UPLOAD is large (64.1 MiB bundled; ~42.9 MiB of it for a MySQL deploy,
+~32.1 MiB for a PostgreSQL one) and MUST run in the background deploy job, never on
+the UI thread.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from dsql_migrator.core.aws_session import BotoSessionLike, build_session
+from dsql_migrator.core.models import SourceType
 
 # Canonical, version-independent object keys. The MSK Connect plugin RESOURCE
 # names carry a version suffix (cdc-stack PluginVersion) for immutability; the S3
@@ -36,9 +42,10 @@ DEBEZIUM_PLUGIN_KEY = "cdc-plugins/debezium-mysql-plugin.zip"
 # The Debezium PostgreSQL source-connector plugin (pgoutput). Same packaging as the
 # MySQL one: the stock Debezium 2.7.4.Final PostgreSQL plugin with the
 # msk-config-providers jar injected (the Secrets Manager config provider used for
-# database.user/password is not on the MSK Connect runtime classpath). Uploaded for
-# every deploy (harmless when the source is MySQL); only a PostgreSQL cdc-stack
-# instantiates the CustomPlugin that references this key.
+# database.user/password is not on the MSK Connect runtime classpath). Uploaded only
+# when the source is PostgreSQL -- the MySQL and PostgreSQL source plugins are mutually
+# exclusive in the cdc-stack (IsMySqlSource / IsPostgresSource), so each deploy uploads
+# exactly one of them.
 DEBEZIUM_PG_PLUGIN_KEY = "cdc-plugins/debezium-postgres-plugin.zip"
 # The sink plugin is a ZIP bundle (sink jar + Glue Schema Registry Avro converter
 # jar) -- not a bare jar -- because both connectors' worker configs declare the
@@ -571,31 +578,75 @@ def ensure_and_upload_plugins(
     region: str,
     *,
     on_progress: Optional[Callable[[str], None]] = None,
+    source_engine: Optional["SourceType"] = None,
 ) -> PluginUploadResult:
-    """Ensure the managed bucket exists and upload both plugin artifacts.
+    """Ensure the managed bucket exists and upload the artifacts this engine uses.
 
-    Single entry point for the deploy job's bucket/upload stages. Returns the
-    bucket ARN + object keys + plugin version for the cdc-stack parameters.
+    Single entry point for the deploy job's bucket/upload stages. Returns the bucket ARN
+    + object keys + plugin version for the cdc-stack parameters.
+
+    ``source_engine`` selects the artifact set, because the cdc-stack can only reference
+    one: the two source plugins are mutually exclusive (``IsMySqlSource`` /
+    ``IsPostgresSource``) and the offset-seeder Lambda seeds a MySQL binlog offset
+    (``DeploySeederFunction`` ANDs ``IsMySqlSource``), so a PostgreSQL stack can reference
+    NEITHER MySQL artifact. ``None`` means "engine unknown at this call site" and uploads
+    everything, which is the old behavior: a miswiring must degrade to harmless redundancy,
+    never to a CustomPlugin ``FileKey`` with no object behind it.
+
+    A key is returned ONLY when its object was uploaded (else ``""``), so a cdc-stack
+    parameter can never name an artifact that is not in the bucket -- that is also what
+    keeps the template's ``Fn::Equals [LambdaSeederS3Key, ""]`` truthful for a PostgreSQL
+    stack without the params patcher needing to know anything about engines.
     Raises :class:`S3ProvisionError` on any unrecoverable failure.
     """
     account_id = get_account_id(sts_client)
     bucket = ensure_plugin_bucket(s3_client, account_id, region)
     deb_path, deb_pg_path, sink_path, seeder_path = _artifact_paths()
-    upload_plugin(s3_client, bucket, DEBEZIUM_PLUGIN_KEY, deb_path, on_progress=on_progress)
-    # The PostgreSQL source plugin is uploaded for every deploy (both engines share
-    # the managed bucket). It is inert unless a PostgreSQL cdc-stack references it.
-    upload_plugin(
-        s3_client, bucket, DEBEZIUM_PG_PLUGIN_KEY, deb_pg_path, on_progress=on_progress
-    )
-    upload_plugin(s3_client, bucket, DSQL_SINK_PLUGIN_KEY, sink_path, on_progress=on_progress)
-    upload_plugin(s3_client, bucket, LAMBDA_SEEDER_KEY, seeder_path, on_progress=on_progress)
+
+    is_mysql = source_engine is SourceType.MYSQL
+    is_postgres = source_engine is SourceType.POSTGRES
+    wanted: list[tuple[str, Path]] = []
+    if not is_postgres:
+        wanted.append((DEBEZIUM_PLUGIN_KEY, deb_path))
+    if not is_mysql:
+        wanted.append((DEBEZIUM_PG_PLUGIN_KEY, deb_pg_path))
+    # The sink plugin has no Condition in the cdc-stack: both engines create it.
+    wanted.append((DSQL_SINK_PLUGIN_KEY, sink_path))
+    if not is_postgres:
+        wanted.append((LAMBDA_SEEDER_KEY, seeder_path))
+    uploaded = {key for key, _ in wanted}
+
+    # Say what is NOT being uploaded and why, rather than silently omitting it: an
+    # operator reading this log needs to know which key is absent. "Not uploading" is
+    # deliberate and must not be "simplified" to "Skipping" -- upload_plugin's own
+    # "already up to date -- skipping upload." means UNCHANGED, and on a first deploy an
+    # engine-skipped object is ABSENT, not current. One verb must not mean both. Likewise
+    # "does not use" and never "is not required": a MySQL SeedMode=External deploy does
+    # not read the seeder either, so "required" would overclaim.
+    skipped = [
+        key
+        for key in (DEBEZIUM_PLUGIN_KEY, DEBEZIUM_PG_PLUGIN_KEY, LAMBDA_SEEDER_KEY)
+        if key not in uploaded
+    ]
+    if skipped and on_progress is not None:
+        engine_name = "PostgreSQL" if is_postgres else "MySQL"
+        on_progress(
+            f"Not uploading {' or '.join(skipped)} — a {engine_name} source "
+            f"does not use {'them' if len(skipped) > 1 else 'it'}."
+        )
+
+    for key, path in wanted:
+        upload_plugin(s3_client, bucket, key, path, on_progress=on_progress)
+
     return PluginUploadResult(
         bucket_name=bucket,
         bucket_arn=f"arn:aws:s3:::{bucket}",
-        debezium_key=DEBEZIUM_PLUGIN_KEY,
-        debezium_pg_key=DEBEZIUM_PG_PLUGIN_KEY,
+        debezium_key=DEBEZIUM_PLUGIN_KEY if DEBEZIUM_PLUGIN_KEY in uploaded else "",
+        debezium_pg_key=(
+            DEBEZIUM_PG_PLUGIN_KEY if DEBEZIUM_PG_PLUGIN_KEY in uploaded else ""
+        ),
         dsql_sink_key=DSQL_SINK_PLUGIN_KEY,
-        lambda_seeder_key=LAMBDA_SEEDER_KEY,
+        lambda_seeder_key=LAMBDA_SEEDER_KEY if LAMBDA_SEEDER_KEY in uploaded else "",
         plugin_version=PLUGIN_VERSION,
     )
 

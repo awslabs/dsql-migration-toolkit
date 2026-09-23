@@ -5,6 +5,15 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.506
+
+### 수정
+
+- **PostgreSQL "Deploy CDC infrastructure" 로그에 MySQL 아티팩트가 중요한 것처럼 나오지 않습니다.** 업로드 단계가 모든 배포에서 번들된 네 개 아티팩트를 전부 올렸기 때문에, PostgreSQL 실행에서도 로그가 `cdc-plugins/debezium-mysql-plugin.zip: already up to date`와 `offset-seeder-lambda.zip`으로 시작했습니다. 둘 다 PostgreSQL cdc-stack이 참조할 수 없습니다(`DebeziumSourcePlugin`은 `IsMySqlSource` 조건이고, `DeploySeederFunction`은 `IsMySqlSource`를 AND로 묶습니다). 이제 단계가 엔진을 인식합니다 — PostgreSQL 배포는 PostgreSQL 소스 플러그인과 공용 DSQL 싱크를, MySQL 배포는 MySQL 소스 플러그인·싱크·오프셋 시더 Lambda를 올리고, 무엇을 올리지 않는지와 그 이유를 한 줄로 밝힙니다. 부수 효과로, 첫 PostgreSQL 배포는 쓸 수 없는 31.3 MiB MySQL 플러그인을, 첫 MySQL 배포는 21.2 MiB PostgreSQL 플러그인을 더 이상 전송하지 않습니다.
+- **업로드 결과가 실제로 올린 아티팩트만 이름으로 돌려줍니다.** 건너뛴 객체의 키는 빈 값으로 반환되므로, cdc-stack 파라미터가 버킷에 없는 객체를 가리킬 수 없습니다. 이것이 PostgreSQL 스택에서 템플릿의 `Fn::Equals [LambdaSeederS3Key, ""]`를 참으로 유지시키며, 파라미터 패처는 엔진을 알 필요가 없습니다.
+
+엔진은 배포가 곧 제출할 CloudFormation 파라미터(`EngineType`)에서 유도하며 호출자가 넘기지 않습니다. 그래서 업로드한 집합이 생성되는 스택과 어긋날 수 없습니다. 엔진을 알 수 없으면 전부 업로드하는 쪽으로 되돌아갑니다 — 잘못 추측했을 때의 실패 형태가 "파일 없는 플러그인"이기 때문입니다.
+
 ## v0.1.505
 
 ### 수정

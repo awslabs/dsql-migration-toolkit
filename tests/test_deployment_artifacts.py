@@ -95,6 +95,12 @@ def test_dockerfile_bundles_runtime_cdc_artifacts() -> None:
     )
     for plugin in (
         "connectors/plugins/debezium-mysql-plugin.zip",
+        # Now that the upload stage is engine-aware, a missing PostgreSQL plugin no
+        # longer breaks EVERY deploy (it used to, because the upload stat'd all four
+        # artifacts and raised on any absent one) -- it would break only PostgreSQL
+        # deploys. That accidental coverage disappeared exactly when it started to
+        # matter, so guard this one explicitly.
+        "connectors/plugins/debezium-postgres-plugin.zip",
         "connectors/plugins/dsql-sink-plugin.zip",
         "connectors/plugins/offset-seeder-lambda.zip",
     ):

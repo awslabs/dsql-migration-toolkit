@@ -183,7 +183,10 @@ def test_ensure_and_upload_returns_result(tmp_path: Path, monkeypatch) -> None:
     assert result.bucket_name == "mysql-dsql-migrator-plugins-123456789012-us-east-1"
     assert result.bucket_arn.endswith(result.bucket_name)
     assert result.debezium_key.endswith("debezium-mysql-plugin.zip")
-    # The PostgreSQL source plugin is uploaded alongside the MySQL one.
+    # No source_engine was passed, so the engine is unknown here and ALL FOUR artifacts
+    # are uploaded -- the FAIL-OPEN contract. A miswiring that loses the engine must
+    # degrade to this harmless redundancy, never to a CustomPlugin FileKey with no object
+    # behind it. This test is that contract's regression guard.
     assert result.debezium_pg_key.endswith("debezium-postgres-plugin.zip")
     # Sink ships as a ZIP bundle holding the single sink jar (the JSON converter is
     # provided by the MSK Connect runtime -- no Glue converter jar bundled).
@@ -262,3 +265,136 @@ def test_extract_secret_name_from_plain_name() -> None:
 def test_extract_secret_name_arn_without_suffix() -> None:
     arn = "arn:aws:secretsmanager:us-east-1:123:secret:plainname"
     assert extract_secret_name(arn) == "plainname"
+
+
+# --- Engine-aware artifact selection ------------------------------------------
+# The cdc-stack can only reference one set (the two source plugins are mutually
+# exclusive; the offset-seeder Lambda seeds a MySQL binlog offset), so uploading the
+# other engine's artifacts is work nothing can read -- and it put a MySQL plugin line at
+# the top of every PostgreSQL deploy log.
+
+
+def _paths(tmp_path: Path, monkeypatch):
+    names = ("deb.zip", "deb-pg.zip", "sink.zip", "seeder.zip")
+    paths = []
+    for n in names:
+        f = tmp_path / n
+        f.write_bytes(n.encode())
+        paths.append(f)
+    monkeypatch.setattr(
+        "dsql_migrator.core.s3_provision._artifact_paths", lambda: tuple(paths)
+    )
+    return paths
+
+
+@pytest.mark.parametrize(
+    "engine,expected_keys,expected_empty",
+    [
+        (
+            "POSTGRES",
+            {
+                "cdc-plugins/debezium-postgres-plugin.zip",
+                "cdc-plugins/dsql-sink-connector.zip",
+            },
+            ("debezium_key", "lambda_seeder_key"),
+        ),
+        (
+            "MYSQL",
+            {
+                "cdc-plugins/debezium-mysql-plugin.zip",
+                "cdc-plugins/dsql-sink-connector.zip",
+                "cdc-plugins/offset-seeder-lambda.zip",
+            },
+            ("debezium_pg_key",),
+        ),
+    ],
+)
+def test_only_the_engines_own_artifacts_are_uploaded_and_named(
+    engine, expected_keys, expected_empty, tmp_path: Path, monkeypatch
+) -> None:
+    from dsql_migrator.core.models import SourceType
+
+    _paths(tmp_path, monkeypatch)
+    s3 = _FakeS3(head_object=None)  # always upload
+    result = ensure_and_upload_plugins(
+        s3, _FakeSts(), "us-east-1", source_engine=getattr(SourceType, engine)
+    )
+    # EXACT set equality: a superset is pointless work plus a misleading log line, a
+    # subset is a cdc-stack FileKey with no object behind it.
+    assert {c[1]["Key"] for c in s3.calls if c[0] == "put_object"} == expected_keys
+    # A key is returned ONLY for an artifact that was uploaded. This is what makes
+    # _patch_plugin_params stamp LambdaSeederS3Key="" for PostgreSQL with no
+    # engine-awareness of its own, keeping Fn::Equals [LambdaSeederS3Key, ""] truthful.
+    for field in expected_empty:
+        assert getattr(result, field) == "", field
+    assert result.dsql_sink_key  # the sink is shared: always uploaded, always named
+    named = {
+        v
+        for v in (
+            result.debezium_key,
+            result.debezium_pg_key,
+            result.dsql_sink_key,
+            result.lambda_seeder_key,
+        )
+        if v
+    }
+    assert named == expected_keys
+
+
+@pytest.mark.parametrize(
+    "engine,phrase,mentioned,not_mentioned",
+    [
+        (
+            "POSTGRES",
+            "a PostgreSQL source does not use them.",
+            ("debezium-mysql-plugin.zip", "offset-seeder-lambda.zip"),
+            ("debezium-postgres-plugin.zip",),
+        ),
+        (
+            "MYSQL",
+            "a MySQL source does not use it.",
+            ("debezium-postgres-plugin.zip",),
+            ("debezium-mysql-plugin.zip", "offset-seeder-lambda.zip"),
+        ),
+    ],
+)
+def test_the_skipped_artifacts_and_the_reason_are_logged(
+    engine, phrase, mentioned, not_mentioned, tmp_path: Path, monkeypatch
+) -> None:
+    from dsql_migrator.core.models import SourceType
+
+    _paths(tmp_path, monkeypatch)
+    logs: list[str] = []
+    ensure_and_upload_plugins(
+        _FakeS3(head_object=None),
+        _FakeSts(),
+        "us-east-1",
+        on_progress=logs.append,
+        source_engine=getattr(SourceType, engine),
+    )
+    # The skip line comes FIRST, before any upload chatter, so the absence is explained
+    # before the operator starts reading key names.
+    assert logs and logs[0].startswith("Not uploading")
+    assert phrase in logs[0]
+    for key in mentioned:
+        assert key in logs[0], key
+    for key in not_mentioned:
+        assert key not in logs[0], key
+    # "Not uploading", never "skipping": upload_plugin's own "already up to date --
+    # skipping upload." means UNCHANGED, and an engine-skipped object may be ABSENT.
+    # One verb must not mean both.
+    assert "skipping" not in logs[0]
+
+
+def test_an_unknown_engine_still_uploads_everything(tmp_path: Path, monkeypatch) -> None:
+    # Fail-open, asserted directly rather than only as a side effect of the older test:
+    # a call site that does not know the engine must get today's behavior, because the
+    # failure mode of guessing wrong is a stack referencing a missing object.
+    _paths(tmp_path, monkeypatch)
+    s3 = _FakeS3(head_object=None)
+    result = ensure_and_upload_plugins(s3, _FakeSts(), "us-east-1", source_engine=None)
+    assert len({c[1]["Key"] for c in s3.calls if c[0] == "put_object"}) == 4
+    assert all(
+        (result.debezium_key, result.debezium_pg_key, result.dsql_sink_key,
+         result.lambda_seeder_key)
+    )

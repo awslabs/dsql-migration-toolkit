@@ -238,9 +238,13 @@ def _logs():
 class _FakeS3:
     """Fake S3 for the infra-deploy bucket+upload stages (always 'exists', skip)."""
 
-    def __init__(self, *, fail_create=None):
+    def __init__(self, *, fail_create=None, absent: bool = False):
         self._fail_create = fail_create
+        self._absent = absent
         self.calls: list[str] = []
+        # (method, Key) for the plugin-upload assertions. `calls` stays
+        # method-name-only so every existing assertion on it is untouched.
+        self.keys: list[tuple[str, str]] = []
 
     def head_bucket(self, **kw):
         self.calls.append("head_bucket")
@@ -254,11 +258,18 @@ class _FakeS3:
 
     def head_object(self, **kw):
         self.calls.append("head_object")
+        self.keys.append(("head_object", kw["Key"]))
+        if self._absent:
+            # A fresh bucket: nothing is up there, so the PUT path runs. Without this
+            # the size-0 temp files always "match" and put_object is never called, so a
+            # put-based key-set assertion would be vacuously empty for both engines.
+            raise RuntimeError("absent")
         # Report a matching object so upload is skipped (no real file needed).
         return {"ContentLength": 0, "ETag": '"x-1"'}
 
     def put_object(self, **kw):
         self.calls.append("put_object")
+        self.keys.append(("put_object", kw["Key"]))
         return {}
 
 
@@ -267,7 +278,7 @@ class _FakeSts:
         return {"Account": "123456789012"}
 
 
-def _run_infra(handle, deployer, on_log, **kw):
+def _run_infra(handle, deployer, on_log, *, s3_client=None, **kw):
     """Drive run_cdc_infra_deploy with injected fake S3/STS clients.
 
     Patches s3_provision._artifact_paths to three real temp files (upload_plugin
@@ -292,7 +303,9 @@ def _run_infra(handle, deployer, on_log, **kw):
         try:
             run_cdc_infra_deploy(
                 handle, deployer=deployer, on_log=on_log,
-                region="us-east-1", s3_client=_FakeS3(), sts_client=_FakeSts(),
+                region="us-east-1",
+                s3_client=s3_client if s3_client is not None else _FakeS3(),
+                sts_client=_FakeSts(),
                 sleep=lambda _s: None, **kw,
             )
         finally:
@@ -1769,3 +1782,85 @@ def test_external_seed_honours_an_explicitly_configured_host_cidr(monkeypatch) -
     # The refusal leads with the CHEAP remedy, not "delete and re-deploy".
     assert "ConnectorSecurityGroup" in str(exc.value)
     assert deployer2.updates == []
+
+
+# --- The upload set must match the stack the deploy is about to create ---------
+# A PostgreSQL cdc-stack references NEITHER MySQL artifact (DebeziumSourcePlugin is
+# Condition IsMySqlSource; DeploySeederFunction ANDs IsMySqlSource), so uploading them
+# is work whose result nothing can read -- and it put a MySQL plugin line at the top of
+# every PostgreSQL deploy log. A LIVE deploy cannot catch a wrong-engine regression: the
+# four object keys are fixed constants and uploads skip on match, so in any account that
+# ever ran a MySQL deploy all four objects already exist and a wrong set still works.
+# This test is the only detector.
+
+_MYSQL_PLUGIN = "cdc-plugins/debezium-mysql-plugin.zip"
+_PG_PLUGIN = "cdc-plugins/debezium-postgres-plugin.zip"
+_SINK_PLUGIN = "cdc-plugins/dsql-sink-connector.zip"
+_SEEDER = "cdc-plugins/offset-seeder-lambda.zip"
+
+
+def _pg_infra_params():
+    from tests.test_cdc_postgres import _pg_infra
+
+    return _pg_infra()
+
+
+@pytest.mark.parametrize("fresh_bucket", [False, True])
+def test_the_infra_deploy_uploads_exactly_the_artifacts_its_stack_references(
+    fresh_bucket,
+) -> None:
+    expected = {
+        "postgres": {_PG_PLUGIN, _SINK_PLUGIN},
+        "mysql": {_MYSQL_PLUGIN, _SINK_PLUGIN, _SEEDER},
+    }
+    for engine, params in (("postgres", _pg_infra_params()), ("mysql", _infra_params())):
+        s3 = _FakeS3(absent=fresh_bucket)
+        logs, on_log = _logs()
+        deployer = _FakeDeployer(stack_statuses=("CREATE_IN_PROGRESS", "CREATE_COMPLETE"))
+        _run_infra(
+            _FakeHandle(), deployer, on_log, s3_client=s3,
+            stack_name=STACK, template_body="T", params=params,
+            create_timeout_seconds=5.0, poll_interval_seconds=0.0,
+        )
+        # EXACT set equality both ways: a superset means pointless work and a wrong log
+        # line, a subset means a CustomPlugin FileKey with no object behind it.
+        touched = {k for m, k in s3.keys if m == "head_object"}
+        assert touched == expected[engine], (engine, fresh_bucket)
+        if fresh_bucket:
+            assert {k for m, k in s3.keys if m == "put_object"} == expected[engine]
+
+        # The submitted cdc-stack params may name ONLY artifacts that were uploaded.
+        _, created = deployer.created[0]
+        pdict = dict(created)
+        named = {
+            pdict.get(k, "")
+            for k in (
+                "DebeziumPluginS3Key",
+                "DebeziumPostgresPluginS3Key",
+                "DsqlSinkPluginS3Key",
+                "LambdaSeederS3Key",
+            )
+        } - {""}
+        assert named == expected[engine], (engine, named)
+        # A PostgreSQL stack must leave the seeder key EMPTY -- that is what keeps the
+        # template's Fn::Equals [LambdaSeederS3Key, ""] truthful, and it falls out of
+        # PluginUploadResult returning "" for a key it did not upload, with no
+        # engine-awareness needed in _patch_plugin_params at all.
+        if engine == "postgres":
+            assert pdict.get("LambdaSeederS3Key", "") == ""
+            assert pdict["DebeziumPostgresPluginS3Key"] == _PG_PLUGIN
+            assert pdict.get("DebeziumPluginS3Key", "") == ""
+        else:
+            assert pdict["LambdaSeederS3Key"] == _SEEDER
+            assert pdict["DebeziumPluginS3Key"] == _MYSQL_PLUGIN
+
+        # The log explains the absence instead of silently omitting it.
+        joined = "\n".join(logs)
+        if engine == "postgres":
+            assert "Not uploading" in joined
+            assert _MYSQL_PLUGIN in joined and _SEEDER in joined
+            assert "a PostgreSQL source does not use them" in joined
+            # ...and never claims the MySQL plugin was handled.
+            assert f"{_MYSQL_PLUGIN}: already up to date" not in joined
+        else:
+            assert _PG_PLUGIN in joined and "a MySQL source does not use it" in joined
