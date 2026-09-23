@@ -1008,6 +1008,22 @@ def _render_full_load_step(
         if bool(_call_or(foreign_keys_running, False)):
             _live_detail.refresh()
             return
+        # An ACCEPTED quarantine gap makes this run complete, and the job's own status can
+        # never say so: the job is terminally FAILED (its rows really were dropped) and
+        # "Accept quarantined rows & continue" is an operator decision recorded on the
+        # SESSION. This poll re-armed itself on every refresh and wrote the job status back
+        # unconditionally, so the acceptance was undone within a tick: the panel showed
+        # "Full Load complete -- with an accepted gap" while the sidebar said Data
+        # Migration FAILED and Validation stayed locked -- a dead end, because re-running
+        # drops the same rows again. Honour the decision here, exactly as the finaliser and
+        # the panel already do. Still gated on quarantine-ONLY, so a real retryable failure
+        # is never waved through by a stale flag.
+        if (
+            mapped is StepStatus.FAILED
+            and getattr(migration_state, "accept_quarantined_rows", False)
+            and _incomplete_is_quarantine_only(current, migration_state.error_log)
+        ):
+            mapped = StepStatus.DONE
         if mapped is StepStatus.FAILED:
             migration_state.set_error(
                 job_manager.get_error(migration_state.job_id)

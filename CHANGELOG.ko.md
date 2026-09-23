@@ -5,6 +5,12 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.501
+
+### 수정
+
+- **`Accept quarantined rows & continue`가 1초 만에 되돌려져 진행할 길이 없었습니다.** Full Load 패널은 "complete — with an accepted gap"을, 표는 `Done · 3 dropped`를 보여주는데 사이드바는 Data Migration **Failed**이고 Validation은 잠겨 있었습니다. 수락은 실제로 적용됐고 — 그 뒤 **라이브 폴이 job 상태를 그 위에 다시 썼습니다.** job은 영구 FAILED이고(행은 실제로 버려졌으므로) 수락은 **세션**에 기록된 운영자 결정이라 job 상태로는 표현될 수 없습니다. 폴은 매 refresh마다 재무장하며 `mapped`를 무조건 썼으므로 결정이 약 1초 후 되돌려지고, `set_error`가 "Migration failed" 배너를 다시 기록하고, 이 단계를 읽는 Validation 게이트가 계속 닫혀 있었습니다. 막다른 길입니다 — 재실행하면 같은 행이 다시 격리되므로 탈출구는 Start over뿐이었습니다. 이제 폴이 쓰기 **전에** 수락을 반영하며, 불완전성이 **격리 전용**일 때로 게이트해 실제 재시도 가능한 실패는 낡은 플래그에 통과되지 않습니다. v0.1.350부터의 결함이라 배포된 모든 버전에 존재합니다.
+
 ## v0.1.500
 
 0.1.499 감사에서 판정이 남아 있던 6건을 실제 PostgreSQL 16으로 재검증해 수정했습니다. 전부 뮤테이션 검증했습니다.

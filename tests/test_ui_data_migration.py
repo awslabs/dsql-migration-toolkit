@@ -24016,3 +24016,80 @@ def test_the_shared_snapshot_anchor_is_kept_alive_and_its_loss_stops_the_load() 
     assert "cancel_event.set()" in window, (
         "a lost anchor no longer stops the shards, so they read different snapshots"
     )
+
+
+def test_an_accepted_quarantine_gap_survives_the_live_poll() -> None:
+    """The poll must not undo "Accept quarantined rows & continue" within a tick.
+
+    The job is terminally FAILED -- its rows really were dropped -- and the acceptance is an
+    operator decision recorded on the SESSION, so the job status can never express it. The
+    poll wrote that status back to the workflow step unconditionally and re-armed on every
+    refresh, so the acceptance was reverted immediately: the Full Load panel showed
+    "complete -- with an accepted gap" and `product_media` showed `Done · 3 dropped`, while
+    the sidebar said Data Migration FAILED and Validation stayed locked. That is a dead end,
+    because re-running drops the same rows again. Observed live on 0.1.500; the defect dates
+    to v0.1.350.
+    """
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _full_load_ui as flu
+
+    poll = inspect.getsource(flu)
+    start = poll.index("mapped = job_status_to_step_status(current.status)")
+    window = poll[start : start + 2200]
+    assert "accept_quarantined_rows" in window, (
+        "the poll no longer honours an accepted quarantine gap, so it reverts the step"
+    )
+    assert "_incomplete_is_quarantine_only(current" in window, (
+        "the override must stay gated on quarantine-ONLY so a real retryable failure is "
+        "never waved through by a stale flag"
+    )
+    # The promotion must happen BEFORE the FAILED branch, or set_error still fires and the
+    # "Migration failed" banner comes back with it.
+    promote_at = window.index("mapped = StepStatus.DONE")
+    fail_at = window.index("if mapped is StepStatus.FAILED:\n            migration_state.set_error")
+    assert promote_at < fail_at, (
+        "the accepted gap is promoted after the failure branch, so the error is re-recorded"
+    )
+
+
+def test_the_accepted_gap_override_needs_both_the_flag_and_quarantine_only() -> None:
+    """Behavioural half: the override's two conditions, driven not grepped.
+
+    Mirrors the poll's decision so a change to either condition is caught: a set flag alone
+    must not promote a run with retryable work left, and quarantine-only alone must not
+    promote without the operator's consent.
+    """
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import StepStatus
+    from dsql_migrator.ui.data_migration._full_load_ui import (
+        _incomplete_is_quarantine_only,
+    )
+
+    def chunk(name: str, status: str, quarantined: int = 0):
+        return SimpleNamespace(chunk_id=name, status=status, rows_quarantined=quarantined)
+
+    log = SimpleNamespace(records=lambda *a, **k: [])
+
+    # Quarantine-only: every chunk DONE, one carrying dropped rows.
+    quarantine_only_job = SimpleNamespace(
+        chunks=[chunk("app.a", "DONE"), chunk("app.b", "DONE", 3)], status="FAILED"
+    )
+    assert _incomplete_is_quarantine_only(quarantine_only_job, log) is True
+
+    # A FAILED chunk is retryable work and must keep blocking, flag or no flag.
+    retryable_job = SimpleNamespace(
+        chunks=[chunk("app.a", "FAILED"), chunk("app.b", "DONE", 3)], status="FAILED"
+    )
+    assert _incomplete_is_quarantine_only(retryable_job, log) is False
+
+    def poll_decision(job, accepted: bool) -> StepStatus:
+        mapped = StepStatus.FAILED
+        if accepted and _incomplete_is_quarantine_only(job, log):
+            mapped = StepStatus.DONE
+        return mapped
+
+    assert poll_decision(quarantine_only_job, True) is StepStatus.DONE
+    assert poll_decision(quarantine_only_job, False) is StepStatus.FAILED
+    assert poll_decision(retryable_job, True) is StepStatus.FAILED

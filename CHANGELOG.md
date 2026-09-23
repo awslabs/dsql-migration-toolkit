@@ -5,6 +5,24 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.501
+
+### Fixed
+
+- **"Accept quarantined rows & continue" was undone within a tick, leaving no way forward.**
+  The Full Load panel showed "complete -- with an accepted gap" and the table showed
+  `Done · 3 dropped`, while the sidebar said Data Migration **Failed** and Validation stayed
+  locked. The acceptance really was applied -- and then the live poll wrote the JOB's status
+  back over it. The job is terminally FAILED (its rows really were dropped) and the
+  acceptance is an operator decision recorded on the SESSION, so the job status can never
+  express it; the poll re-arms on every refresh and wrote `mapped` unconditionally, so the
+  decision was reverted about a second after it was made, `set_error` re-recorded the
+  "Migration failed" banner, and the Validation gate -- which reads this step -- stayed shut.
+  A dead end: re-running drops the same rows again, so the only escape was Start over.
+  The poll now honours the acceptance before writing, still gated on the incompleteness
+  being quarantine-ONLY so a real retryable failure is never waved through by a stale flag.
+  Dates to v0.1.350, so every deployed version has it.
+
 ## v0.1.500
 
 The six findings the v0.1.499 audit left unadjudicated, re-verified against a real
