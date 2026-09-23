@@ -335,7 +335,10 @@ AWS_REGION=<region> deploy/create_test_cert.sh
 나머지 파라미터는 기본값 유지(예: 컨테이너 이미지). 특히 **`HttpsEgressCidr`는
 `0.0.0.0/0` 그대로 두세요** — 태스크가 NAT/IGW로 AWS API(DSQL·Secrets Manager·ECR·CloudWatch)에
 나가는 아웃바운드 CIDR입니다. 이 서비스들을 전부 VPC 엔드포인트(PrivateLink)로 둘 때만 좁히고,
-그렇지 않은데 좁히면 이미지 pull/DSQL이 막혀 태스크가 기동 실패합니다. → **Next**.
+그렇지 않은데 좁히면 이미지 pull/DSQL이 막혀 태스크가 기동 실패합니다.
+`MskEgressCidr`를 따로 둔 것은 의도적입니다 — PostgreSQL 소스의 cdc-stack은 앱이 직접
+MSK **9098** 포트로 시드하고, 그 주소는 CDC VPC *내부*로 해석되므로 별도 파라미터를
+쓰며 `HttpsEgressCidr`에 합치면 안 됩니다. → **Next**.
 
 > [!TIP]
 > **어떤 서브넷을 고를까.** 드롭다운은 (내 VpcId 것만이 아니라) **리전의 모든 서브넷**을
@@ -528,6 +531,7 @@ Schema Conversion → Data Migration → Validation → Cut over). UI가 보이�
 | `SourceDbCidr` | no* | `""` | 소스 DB CIDR(SG id 없을 때 사용). *이것/`SourceDbSecurityGroupId` 중 하나 필수. |
 | `SourceDbPort` | no | `3306` | 소스 DB 포트 — **`3306`은 MySQL, `5432`는 PostgreSQL** (PostgreSQL 소스는 기본값을 재정의). |
 | `HttpsEgressCidr` | no | `0.0.0.0/0` | 태스크 아웃바운드 443(AWS API: DSQL 토큰·Secrets Manager·ECR·CloudWatch·Bedrock) + 5432(DSQL)의 **대상** CIDR. **권장: 기본값 `0.0.0.0/0` 그대로** — 태스크가 NAT/IGW로 퍼블릭 AWS 엔드포인트에 도달. 좁히기(예: 내 VPC CIDR)는 위 서비스들을 *전부* 인터페이스 VPC 엔드포인트(PrivateLink)로 둘 때만; 엔드포인트 없이 좁히면 이미지 pull/DSQL이 막혀 태스크가 기동 실패합니다. |
+| `MskEgressCidr` | no | `0.0.0.0/0` | 태스크 아웃바운드 **9098**(MSK Serverless, IAM/TLS SASL)의 대상 CIDR. **PostgreSQL 소스에서는 필수** — PostgreSQL cdc-stack은 항상 `SeedMode=External`이라 시더 Lambda가 아니라 *앱이 직접* CDC Kafka 토픽을 만들고 시작 오프셋을 시드합니다. `HttpsEgressCidr`와 분리한 이유: 그쪽은 *퍼블릭* AWS 엔드포인트용이고 MSK 부트스트랩은 CDC VPC 내부로 해석되므로, `HttpsEgressCidr`를 좁혀도 CDC가 조용히 깨지지 않게 하려는 것입니다. 기본값 그대로 두거나, CDC 인프라를 배포할 VPC의 CIDR로 좁히세요. |
 | `EnableCognitoAuth` | no | `false` | ALB가 Cognito(OIDC)로 인증. 기본 `false`: internal ALB(또는 내 CIDR로 범위 제한한 ALB)가 접근 게이트이고 운영자가 이미 IAM/DB 권한을 보유하므로 로그인 불필요. **`AllowedIngressCidr=0.0.0.0/0`일 때만 필수(강제됨).** `true`면 `CognitoDomainPrefix`와 `CognitoAdminEmail` **둘 다** 필요. |
 | `AppDomainName` | no | `""` | ALB 앞단 DNS 이름(인증서와 일치해야 함). **비워 두면** ALB 자체 DNS 이름을 Cognito 콜백 호스트로 사용 — 커스텀 도메인이나 Route 53 레코드가 필요 없습니다. |
 | `CognitoDomainPrefix` | Cognito 시 | `""` | 전역 유니크 Cognito hosted-UI prefix (`https://<prefix>.auth.<region>.amazoncognito.com`). |
@@ -676,6 +680,16 @@ aws cloudformation deploy \
   # $TEMPLATE_BUCKET: 위 AWS CLI 배포 섹션에서 만든 스테이징 버킷
   # (이 템플릿은 CloudFormation 인라인 업로드 한도 51,200바이트를 초과합니다)
 ```
+
+> [!IMPORTANT]
+> **PostgreSQL 소스에서 v0.1.503 이상으로 올릴 때는 전체 템플릿**(위처럼
+> `--template-file deploy/cloudformation.yaml`)**이 필요합니다** — 기존 템플릿에
+> `ContainerImageUri`만 덮어쓰는 이미지-only 갱신으로는 부족합니다. PostgreSQL cdc-stack은
+> 항상 앱이 직접 MSK 9098 포트로 시드하는데, 여기엔 템플릿만 줄 수 있는 두 가지가
+> 필요합니다 — `MskEgress` 보안 그룹 규칙과 태스크 역할의 `cdc-external-seed` 정책.
+> 템플릿을 갱신하기 전에는, 시드할 수 없는 과금 MSK Serverless 클러스터를 만드는 대신
+> 도구가 CDC 인프라 배포를 **사전에 거부**합니다(메시지에 해결 방법 포함).
+> `MskEgressCidr`에는 기본값이 있어 새로 입력할 것은 없습니다. MySQL은 어느 쪽이든 무관합니다.
 
 > [!WARNING]
 > 컨트롤 플레인은 **단일 태스크**로 실행되므로 교체 중 짧은 중단이 있습니다. 마이그레이션된 데이터,

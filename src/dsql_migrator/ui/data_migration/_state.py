@@ -77,6 +77,12 @@ class DataMigrationState:
         # How many rows that acceptance covered, so a LARGER later gap re-asks
         # instead of being waved through by a stale flag. None = no count recorded.
         self.accepted_quarantine_rows: Optional[int] = None
+        # Provenance of a VpcId derived from the source DB's own DBSubnetGroup, e.g.
+        # "the source cluster pgtest-ecommerce (subnet group ...)". Shown beside the
+        # field so a prefilled value is never a SILENT substitution: the operator can
+        # see where it came from and change it (the pipeline may belong in another VPC,
+        # reached by peering / Transit Gateway / PrivateLink). None when not derived.
+        self.cdc_vpc_provenance: Optional[str] = None
         # Active sub-step of the Prerequisites -> Full Load -> CDC stepper. Held
         # here so it survives the content re-render driven by the progress poller
         # (None => derive a sensible default from the current job/prereq state).

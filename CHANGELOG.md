@@ -5,6 +5,65 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.503
+
+### Fixed
+
+- **PostgreSQL CDC could not be started at all from the Fargate deployment.** A PostgreSQL
+  cdc-stack is always created `SeedMode=External`, which means the APP -- not the in-VPC
+  seeder Lambda MySQL uses -- creates the CDC Kafka topics and seeds the start offset itself,
+  over the MSK Serverless IAM endpoint on port 9098. The Fargate app stack granted neither
+  half of what that needs: its task security group declares an explicit egress list (443 +
+  5432), which suppresses the default allow-all, so 9098 was denied at the source; and the
+  task role held no data-plane `kafka-cluster` permissions at all. The cdc-stack's matching
+  ingress rule already existed but was never armed, because the `HostSubnetCidr` that gates
+  it was only ever set by the EC2 host's user-data and was structurally empty on Fargate.
+  The visible failure was a `KafkaTimeoutError` after the MSK Serverless cluster had already
+  been created and started billing. Now the app stack ships the `MskEgress` rule (with its
+  own `MskEgressCidr` parameter -- deliberately NOT `HttpsEgressCidr`, which operators are
+  told to narrow to their NAT/PrivateLink range, while the MSK bootstrap resolves inside the
+  CDC VPC) and a `cdc-external-seed` task-role policy, and the app registers the VPC CIDR
+  block containing its own address as the cdc-stack's admitted network -- the VPC block, not
+  the task's subnet, because the single task is placed into a LIST of subnets and a
+  replacement may land in another one, which would silently stale a subnet-scoped rule.
+  **An existing Fargate stack needs a FULL-TEMPLATE update**
+  (`--template-file deploy/cloudformation.yaml`), not an image-only `ContainerImageUri`
+  override: the task-role grant has no code substitute. MySQL is unchanged on every
+  deployment, and the in-VPC EC2 deployment is unaffected.
+- **A CDC infrastructure deploy that could never be seeded is now refused up front instead
+  of costing a cluster.** Previously the whole cdc-stack was created -- MSK Serverless
+  included, 5-20 minutes and billable -- and only then did Start CDC fail with a raw
+  `KafkaTimeoutError`. The Deploy dialog now checks the deployment's capability and the
+  network the stack would admit before the spend, disables Deploy with the remedy named, and
+  re-checks on the click (an EC2 describe that succeeded when the dialog opened can since be
+  throttled) so nothing is created for a doomed configuration -- not even the source-secret
+  upsert. This half is pure app code, so **it takes effect on an already-deployed stack**:
+  without the template update the deploy is refused in seconds rather than after 20 minutes.
+  Start CDC likewise refuses. The old "Start PostgreSQL CDC from inside the VPC" warning is
+  gone: it was factually wrong on Fargate (the task IS in the cdc-stack VPC -- it was simply
+  not admitted and held no IAM), it fired even on a correctly equipped stack, and it warned
+  and then proceeded into a guaranteed failure. The engine keeps one fail-open backstop: at
+  seed time it refuses only on a certainty -- the deployed stack admits a network this host
+  is not in -- which also covers an adopted stack, where local config says nothing.
+- **The CDC `VpcId` is derived from the source database, and a mismatch warns before the
+  deploy.** The VPC comes off the same `DescribeDBInstances` response the tool already reads
+  for the source security group, so there is no extra API call and no extra IAM. It fills only
+  an EMPTY field -- an operator's own value is never overwritten -- and shows its provenance
+  rather than substituting silently. Entering a VPC that is not the source's now warns (not
+  blocks: peering, Transit Gateway and PrivateLink make it legitimate) and says what to
+  confirm, instead of surfacing ~20 minutes into an MSK deploy that leaves a stack to tear
+  down. Best-effort throughout: a non-RDS host, a cross-account endpoint or a missing
+  `rds:DescribeDBInstances` leaves the field blank and stays silent rather than guessing.
+
+### Security
+
+- The new task-role `kafka-cluster` grants are scoped tighter than the seed's create/describe
+  permissions: `ReadData`/`WriteData` are limited to the `-debezium-source-offsets` topic
+  alone, because that is the only topic the seed reads or writes. The broader
+  `topic/<family>/*/*` form would have let this long-lived, ALB-fronted role consume the full
+  replicated row content of every cdc-stack in the account. No consumer-group action is
+  granted at all -- the seed uses `consumer.assign()` and joins no group.
+
 ## v0.1.502
 
 ### Changed

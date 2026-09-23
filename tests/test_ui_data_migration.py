@@ -3684,9 +3684,16 @@ def test_cdc_start_seed_mode_is_engine_aware() -> None:
     assert _cdc_start_seed_mode(SourceType.MYSQL, "external") == "external"
 
 
-def _run_start_cdc_capture_seed_mode(monkeypatch, *, source_type, host_seed_mode):
+def _run_start_cdc_capture_seed_mode(
+    monkeypatch, *, source_type, host_seed_mode, msk_access=True
+):
     """Drive _start_cdc_deploy for a source engine + host seed_mode; return the seed_mode
-    kwarg run_cdc_start was invoked with (running the submitted job body)."""
+    kwarg run_cdc_start was invoked with (running the submitted job body).
+
+    ``msk_access`` is the deployment's DSQL_MIGRATOR_CDC_MSK_ACCESS attestation. It
+    defaults to True (an equipped app stack) so these tests keep exercising the seed-mode
+    derivation; the un-equipped case is a blocking refusal covered separately.
+    """
     from types import SimpleNamespace
 
     import dsql_migrator.config as _config
@@ -3724,6 +3731,7 @@ def _run_start_cdc_capture_seed_mode(monkeypatch, *, source_type, host_seed_mode
         lambda *a, **k: SimpleNamespace(
             cdc_seed_mode=host_seed_mode,
             cdc_host_subnet_cidr="",
+            cdc_msk_access=msk_access,
             cdc_sink_mcu_count=1,
         ),
     )
@@ -3769,35 +3777,99 @@ def _run_start_cdc_capture_seed_mode(monkeypatch, *, source_type, host_seed_mode
     _cdcui._start_cdc_deploy(
         _Ui(), state, jm, lambda: None, inventory=_inventory(), session=session
     )
-    assert jm.work is not None
-    jm.work(SimpleNamespace())
-    return captured.get("seed_mode"), notices
+    # A refusing pre-flight submits NO job, so the caller distinguishes the two by
+    # `submitted` rather than by an assertion buried in this helper.
+    if jm.work is not None:
+        jm.work(SimpleNamespace())
+    return captured.get("seed_mode"), notices, jm.work is not None
+
+
+def _seed_blocker_notices(notices):
+    """Only the MSK-seed capability notices, ignoring the PG publication/slot reminder."""
+    return [
+        n
+        for n in notices
+        if n.get("header") == "This deployment cannot start PostgreSQL CDC"
+    ]
 
 
 def test_start_cdc_deploy_forces_external_seed_mode_for_postgres(monkeypatch) -> None:
     # FIX 4: even on a host whose cdc_seed_mode is the (non-external) default, a PostgreSQL
     # Start must invoke run_cdc_start with seed_mode="external" -- otherwise the in-process
-    # External Kafka prep is skipped and PG CDC never streams. A loud pre-flight warning is
-    # surfaced because that prep needs the app to run in-VPC.
+    # External Kafka prep is skipped and PG CDC never streams. On an EQUIPPED deployment
+    # (DSQL_MIGRATOR_CDC_MSK_ACCESS=true) that is all that happens: no notice at all. The
+    # old "Start PostgreSQL CDC from inside the VPC" warning was wrong here -- the Fargate
+    # task IS in the cdc-stack VPC -- and is now a blocking refusal keyed on capability.
     from dsql_migrator.core.models import SourceType
 
-    seed_mode, notices = _run_start_cdc_capture_seed_mode(
+    seed_mode, notices, submitted = _run_start_cdc_capture_seed_mode(
         monkeypatch, source_type=SourceType.POSTGRES, host_seed_mode="lambda"
     )
     assert seed_mode == "external"
-    assert any("VPC" in (n.get("header", "") + n.get("body", "")) for n in notices)
+    assert submitted
+    assert not _seed_blocker_notices(notices)
+
+
+def test_start_cdc_deploy_refuses_when_this_deployment_cannot_seed_msk(
+    monkeypatch,
+) -> None:
+    # A PostgreSQL cdc-stack is always SeedMode=External, so the APP must reach MSK on
+    # 9098 with data-plane kafka-cluster IAM. An app stack that predates those grants
+    # (DSQL_MIGRATOR_CDC_MSK_ACCESS unset, cdc_seed_mode="lambda") cannot, and used to
+    # proceed into a ~60s KafkaTimeoutError. It must now REFUSE: no job submitted, and an
+    # error notice that names the remedy.
+    from dsql_migrator.core.models import SourceType
+
+    seed_mode, notices, submitted = _run_start_cdc_capture_seed_mode(
+        monkeypatch,
+        source_type=SourceType.POSTGRES,
+        host_seed_mode="lambda",
+        msk_access=False,
+    )
+    assert not submitted  # nothing was started
+    assert seed_mode is None  # run_cdc_start was never reached
+    blockers = _seed_blocker_notices(notices)
+    assert [n["tone"] for n in blockers] == ["error"]
+    body = blockers[0]["body"]
+    # The remedy, not just the symptom: the full-template update, the EC2 alternative,
+    # and the run-from-source escape hatch.
+    assert "deploy/cloudformation.yaml" in body
+    assert "deploy/cloudformation-ec2.yaml" in body
+    assert "DSQL_MIGRATOR_CDC_SEED_MODE=external" in body
+
+
+def test_start_cdc_deploy_allows_postgres_on_an_in_vpc_host(monkeypatch) -> None:
+    # The in-VPC EC2 host attests the same capability through cdc_seed_mode="external"
+    # (its template has always carried the 9098 egress rule and the kafka-cluster
+    # policy), so it is NOT blocked even with DSQL_MIGRATOR_CDC_MSK_ACCESS unset.
+    from dsql_migrator.core.models import SourceType
+
+    seed_mode, notices, submitted = _run_start_cdc_capture_seed_mode(
+        monkeypatch,
+        source_type=SourceType.POSTGRES,
+        host_seed_mode="external",
+        msk_access=False,
+    )
+    assert seed_mode == "external"
+    assert submitted
+    assert not _seed_blocker_notices(notices)
 
 
 def test_start_cdc_deploy_keeps_host_seed_mode_for_mysql(monkeypatch) -> None:
-    # MySQL is unchanged: SeedMode still derives from the host config (here "lambda"), and
-    # no in-VPC warning is surfaced.
+    # MySQL is unchanged: SeedMode still derives from the host config (here "lambda"), so
+    # the capability gate is never reached -- it must NOT fire on an un-equipped
+    # deployment, because MySQL seeds through the cdc-stack's in-VPC Lambda.
     from dsql_migrator.core.models import SourceType
 
-    seed_mode, notices = _run_start_cdc_capture_seed_mode(
-        monkeypatch, source_type=SourceType.MYSQL, host_seed_mode="lambda"
+    seed_mode, notices, submitted = _run_start_cdc_capture_seed_mode(
+        monkeypatch,
+        source_type=SourceType.MYSQL,
+        host_seed_mode="lambda",
+        msk_access=False,
     )
     assert seed_mode == "lambda"
-    assert not any("VPC" in (n.get("header", "") + n.get("body", "")) for n in notices)
+    assert submitted
+    assert not _seed_blocker_notices(notices)
 
 
 # ---------------------------------------------------------------------------
@@ -24093,3 +24165,316 @@ def test_the_accepted_gap_override_needs_both_the_flag_and_quarantine_only() -> 
     assert poll_decision(quarantine_only_job, True) is StepStatus.DONE
     assert poll_decision(quarantine_only_job, False) is StepStatus.FAILED
     assert poll_decision(retryable_job, True) is StepStatus.FAILED
+
+
+def test_the_cdc_vpc_is_prefilled_from_the_source_and_only_when_empty() -> None:
+    """Derive the VpcId, show where it came from, and never overwrite the operator.
+
+    The comment claiming "VpcId is the one input the tool cannot infer" was wrong: the value
+    is on the SAME DescribeDBInstances response the tool already reads for the source
+    security group. Prefilling silently and prefilling visibly are different things, so the
+    provenance is recorded for the field to show -- and an operator's own value is left
+    alone, because the pipeline may legitimately belong in another VPC.
+    """
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.rds_metadata import SourceInstanceInfo
+    from dsql_migrator.ui.data_migration import _cdc_ui
+    from dsql_migrator.ui.data_migration._state import DataMigrationStore
+
+    info = SourceInstanceInfo(
+        vpc_id="vpc-0ea4",
+        subnet_ids=("subnet-0fbf", "subnet-0dfe"),
+        db_subnet_group="workshop-base-dbsubnetgroup",
+        db_identifier="pgtest-ecommerce",
+    )
+    session = SimpleNamespace(
+        source_config=SimpleNamespace(host="pgtest-ecommerce.cluster-x.us-east-2.rds.amazonaws.com"),
+        aws_profile=None,
+    )
+
+    real_fetch = _cdc_ui.__dict__.get("fetch_source_network")
+    import dsql_migrator.core.rds_metadata as rds
+
+    saved_fetch, saved_client = rds.fetch_source_network, rds.build_rds_client
+    try:
+        rds.fetch_source_network = lambda *a, **k: info
+        rds.build_rds_client = lambda *a, **k: object()
+
+        store = DataMigrationStore()
+        state = store.get_or_create("vpc-derive")
+        assert _cdc_ui.derive_cdc_vpc_from_source(state, session) is True
+        fields = state.cdc_infra_inputs()
+        assert fields["vpc_id"] == "vpc-0ea4"
+        assert fields["connector_subnet_ids"] == "subnet-0fbf,subnet-0dfe"
+        assert "pgtest-ecommerce" in (state.cdc_vpc_provenance or "")
+        assert "workshop-base-dbsubnetgroup" in (state.cdc_vpc_provenance or "")
+
+        # An operator's own value is NOT overwritten on a later pass.
+        state.set_cdc_infra_inputs({"vpc_id": "vpc-mine", "connector_subnet_ids": ""})
+        assert _cdc_ui.derive_cdc_vpc_from_source(state, session) is False
+        assert state.cdc_infra_inputs()["vpc_id"] == "vpc-mine"
+
+        # Best effort: nothing derivable leaves the field for the operator.
+        rds.fetch_source_network = lambda *a, **k: None
+        state2 = store.get_or_create("vpc-none")
+        assert _cdc_ui.derive_cdc_vpc_from_source(state2, session) is False
+        assert not (state2.cdc_infra_inputs().get("vpc_id") or "")
+        assert state2.cdc_vpc_provenance is None
+        # No source host at all (no session) is silent too.
+        assert _cdc_ui.derive_cdc_vpc_from_source(state2, None) is False
+    finally:
+        rds.fetch_source_network, rds.build_rds_client = saved_fetch, saved_client
+        assert real_fetch is None or True  # nothing to restore on _cdc_ui itself
+
+
+def _drive_cdc_infra_dialog(
+    monkeypatch, *, source_vpc_warning="", admission=None, net=None
+):
+    """Open the REAL Deploy-CDC-infrastructure dialog; return (notices, buttons).
+
+    Behavioral, not a source-text check: an ``inspect.getsource`` assertion here once
+    passed against the author's own explanatory COMMENT. The two blocking probes are
+    patched at the module boundary and ``run.io_bound`` is made pass-through, so the
+    dialog builds in-process with no AWS.
+    """
+    import asyncio
+
+    import nicegui.run as nrun
+
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+    from dsql_migrator.core.cdc import MskSeedAdmission
+
+    ui = _DialogUi()
+    notices: list[dict] = []
+
+    async def _io_bound(fn, *a, **k):
+        return fn(*a, **k)
+
+    monkeypatch.setattr(nrun, "io_bound", _io_bound)
+    monkeypatch.setattr(cdc_ui, "cdc_deploy_connection_blocker", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        cdc_ui,
+        "_diagnose_for_dialog",
+        lambda *_a, **_k: net or ("Found existing NAT subnets.", "discovered", ""),
+    )
+    monkeypatch.setattr(
+        cdc_ui,
+        "_source_vpc_warning_for_dialog",
+        lambda *_a, **_k: source_vpc_warning,
+    )
+    monkeypatch.setattr(
+        cdc_ui, "_msk_seed_admission", lambda *_a, **_k: admission or MskSeedAdmission()
+    )
+    monkeypatch.setattr(
+        cdc_ui,
+        "_render_notice",
+        lambda _ui, *, tone="info", icon=None, header="", body="": notices.append(
+            {"tone": tone, "header": header, "body": body}
+        ),
+    )
+    monkeypatch.setattr(cdc_ui, "_render_cdc_cost_estimate", lambda *_a, **_k: None)
+
+    state = DataMigrationState()
+    state.set_cdc_infra_inputs({"vpc_id": "vpc-app"})
+    asyncio.run(
+        cdc_ui._open_cdc_infra_dialog(
+            ui, state, lambda: None, session=_SimpleSourceSession()
+        )
+    )
+    return notices, ui
+
+
+class _SimpleSourceSession:
+    """Minimal session stand-in: the dialog's probes are patched, so only attrs matter."""
+
+    aws_profile = None
+    source_config = None
+    target_config = None
+
+
+def test_the_deploy_dialog_checks_the_vpc_against_the_source_before_deploying(
+    monkeypatch,
+) -> None:
+    # A wrong VpcId is otherwise only discovered after roughly twenty minutes of MSK
+    # deployment, leaving a failed stack to tear down. A mismatch WARNS and leaves
+    # Deploy enabled: peering / TGW / PrivateLink make a different VPC legitimate.
+    notices, ui = _drive_cdc_infra_dialog(
+        monkeypatch, source_vpc_warning="vpc-elsewhere is not the source's VPC."
+    )
+    hit = [n for n in notices if n["header"] == "This is not the source's VPC"]
+    assert [n["tone"] for n in hit] == ["warning"]
+    assert ui.buttons["Deploy"].enabled is True
+    # ...and it is silent when the VPC checks out, so a normal deploy is not nagged.
+    quiet, _ = _drive_cdc_infra_dialog(monkeypatch)
+    assert not [n for n in quiet if n["header"] == "This is not the source's VPC"]
+
+
+def test_deploy_dialog_blocks_a_postgres_deploy_this_app_cannot_seed(
+    monkeypatch,
+) -> None:
+    # A PostgreSQL cdc-stack is always SeedMode=External, so this app seeds MSK itself.
+    # A deployment that cannot (no 9098 egress, no data-plane kafka-cluster IAM) must be
+    # stopped HERE -- one click later an MSK Serverless cluster exists and bills, and
+    # Start CDC could never use it.
+    from dsql_migrator.core.cdc import MskSeedAdmission
+
+    notices, ui = _drive_cdc_infra_dialog(
+        monkeypatch,
+        admission=MskSeedAdmission(blocker="Update the app stack: no 9098 egress."),
+    )
+    blocked = [
+        n for n in notices if n["header"] == "This deployment cannot start PostgreSQL CDC"
+    ]
+    assert [n["tone"] for n in blocked] == ["error"]
+    assert "billable MSK Serverless cluster" in blocked[0]["body"]
+    assert ui.buttons["Deploy"].enabled is False
+    assert "9098" in (ui.buttons["Deploy"].tooltip_text or "")
+
+
+def test_deploy_dialog_discloses_the_msk_ingress_it_will_create(monkeypatch) -> None:
+    # The resolved state is NORMAL -> a calm info line, never a warning (the repo's
+    # severity calibration). It also discloses the ingress rule about to be created,
+    # which is security-relevant, and leaves Deploy enabled.
+    from dsql_migrator.core.cdc import MskSeedAdmission
+
+    notices, ui = _drive_cdc_infra_dialog(
+        monkeypatch,
+        admission=MskSeedAdmission(
+            cidr="10.0.0.0/16", note="The cdc-stack will admit 10.0.0.0/16 on MSK 9098."
+        ),
+    )
+    hit = [
+        n for n in notices if n["header"] == "MSK access for the PostgreSQL CDC seed"
+    ]
+    assert [n["tone"] for n in hit] == ["info"]
+    assert "10.0.0.0/16" in hit[0]["body"]
+    assert ui.buttons["Deploy"].enabled is True
+
+
+def test_deploy_dialog_is_silent_for_a_lambda_seeded_deploy(monkeypatch) -> None:
+    # MySQL on Fargate/local: an all-empty admission -> no MSK notice of any kind, so the
+    # dialog looks exactly as it did before this feature existed.
+    notices, ui = _drive_cdc_infra_dialog(monkeypatch)
+    assert not [n for n in notices if "MSK" in n["header"]]
+    assert ui.buttons["Deploy"].enabled is True
+
+
+def _drive_infra_deploy_submit(monkeypatch, *, admission, source_type=None):
+    """Click Deploy for real; return (captured host_subnet_cidr or None, notifications).
+
+    Patched at the module boundary only: the click path makes a DSQL GetCluster, EC2
+    describes and a Secrets Manager upsert, none of which a unit test may do.
+    ``dispatch_cdc_infra_params`` is the capture point -- reaching it at all proves the
+    deploy was NOT aborted.
+    """
+    import asyncio
+    from types import SimpleNamespace
+
+    import nicegui.run as nrun
+
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+    from dsql_migrator.core.models import SourceType
+
+    captured: dict = {}
+    notes: list[tuple[str, str]] = []
+
+    async def _io_bound(fn, *a, **k):
+        return fn(*a, **k)
+
+    monkeypatch.setattr(nrun, "io_bound", _io_bound)
+    monkeypatch.setattr(
+        cdc_ui,
+        "_cdc_target_region",
+        lambda *_a, **_k: (SimpleNamespace(region="us-east-1"), "us-east-1"),
+    )
+    monkeypatch.setattr(
+        cdc_ui,
+        "_cdc_infra_prefill",
+        lambda *_a, **_k: {
+            "vpc_id": "vpc-app",
+            "dsql_cluster_arn": "arn:aws:dsql:us-east-1:1:cluster/c",
+            "connector_subnet_ids": "subnet-a,subnet-b",
+        },
+    )
+    monkeypatch.setattr(
+        cdc_ui,
+        "_resolve_cdc_source_secret",
+        lambda *_a, **_k: SimpleNamespace(
+            ok=True, arn="arn:secret", name="sec", error=None, error_type=None
+        ),
+    )
+    monkeypatch.setattr(
+        cdc_ui, "_msk_seed_admission", lambda *_a, **_k: admission
+    )
+
+    def _dispatch(*_a, **kw):
+        captured["host_subnet_cidr"] = kw.get("host_subnet_cidr")
+        raise _StopAfterDispatch()
+
+    monkeypatch.setattr(cdc_ui, "dispatch_cdc_infra_params", _dispatch)
+
+    class _Ui:
+        def notify(self, message="", *, type="info", **_k):
+            notes.append((type, str(message)))
+
+    state = DataMigrationState()
+    state.set_cdc_infra_inputs({"vpc_id": "vpc-app"})
+    session = SimpleNamespace(
+        aws_profile=None,
+        target_config=SimpleNamespace(region="us-east-1"),
+        source_config=SimpleNamespace(
+            source_type=source_type or SourceType.POSTGRES, database="app"
+        ),
+    )
+    try:
+        asyncio.run(
+            cdc_ui._start_cdc_infra_deploy(
+                _Ui(), state, _NoopJobManager(), lambda: None, session=session
+            )
+        )
+    except _StopAfterDispatch:
+        pass
+    return captured.get("host_subnet_cidr"), notes
+
+
+class _StopAfterDispatch(Exception):
+    """Sentinel: params were built, so the deploy was not aborted."""
+
+
+class _NoopJobManager:
+    def submit(self, work):
+        return "job-1"
+
+
+def test_infra_deploy_submits_the_resolved_admission_cidr_and_aborts_when_blocked(
+    monkeypatch,
+) -> None:
+    from dsql_migrator.core.cdc import MskSeedAdmission
+
+    # Resolved: the admission's CIDR -- NOT the raw config value -- becomes the
+    # cdc-stack's HostSubnetCidr, which is what arms ConnectorHostDiagnosticsIngress.
+    cidr, notes = _drive_infra_deploy_submit(
+        monkeypatch, admission=MskSeedAdmission(cidr="10.0.0.0/16")
+    )
+    assert cidr == "10.0.0.0/16"
+    assert notes == []
+
+    # Blocked: the deploy is ABORTED. Reaching dispatch would mean an MSK Serverless
+    # cluster gets created that this app could never seed, so "params were never built"
+    # is the assertion that matters -- a notify alone would not prove it stopped.
+    cidr, notes = _drive_infra_deploy_submit(
+        monkeypatch,
+        admission=MskSeedAdmission(blocker="no 9098 egress on this deployment"),
+    )
+    assert cidr is None
+    assert [t for t, _m in notes] == ["warning"]
+    assert "9098" in notes[0][1]
+
+    # A Lambda-seeded (MySQL) deploy still submits an EMPTY HostSubnetCidr, so no
+    # ingress rule is created -- byte-identical to before this feature.
+    cidr, notes = _drive_infra_deploy_submit(
+        monkeypatch, admission=MskSeedAdmission()
+    )
+    assert cidr == ""
+    assert notes == []

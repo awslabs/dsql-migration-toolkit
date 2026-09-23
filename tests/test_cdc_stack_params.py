@@ -1090,3 +1090,91 @@ def test_connectors_still_wait_for_the_cluster_at_create_time() -> None:
         assert "MskCluster" in depends, (
             f"{connector} must DependsOn MskCluster so it is created after the cluster"
         )
+
+
+# --- MSK external-seed admission (pure decision, no AWS) ----------------------
+# A PostgreSQL cdc-stack is ALWAYS SeedMode=External, so the APP creates the Kafka
+# topics and the CDC start offset itself over MSK 9098. That needs two things the app
+# cannot observe at runtime (9098 egress + data-plane kafka-cluster IAM), so the
+# equipped templates ATTEST them, and one pure function decides the outcome for the
+# deploy dialog, the create call and the Start gate alike.
+
+
+def test_msk_seed_capability_blocker_accepts_either_attestation() -> None:
+    from dsql_migrator.core.cdc import msk_seed_capability_blocker
+
+    # Fargate, equipped (deploy/cloudformation.yaml sets DSQL_MIGRATOR_CDC_MSK_ACCESS).
+    assert (
+        msk_seed_capability_blocker(cdc_seed_mode="lambda", cdc_msk_access=True) == ""
+    )
+    # The in-VPC EC2 host attests the same capability its own way.
+    assert (
+        msk_seed_capability_blocker(cdc_seed_mode="external", cdc_msk_access=False) == ""
+    )
+    # Neither: a laptop, a run-from-source host, or an app stack older than the release
+    # that added the grants. It must name every remedy, not just the symptom.
+    blocker = msk_seed_capability_blocker(cdc_seed_mode="lambda", cdc_msk_access=False)
+    assert "deploy/cloudformation.yaml" in blocker  # update the app stack
+    assert "deploy/cloudformation-ec2.yaml" in blocker  # or use the in-VPC deployment
+    assert "DSQL_MIGRATOR_CDC_SEED_MODE=external" in blocker  # or attest from source
+    assert "9098" in blocker
+
+
+def test_msk_seed_admission_decision_table() -> None:
+    from dsql_migrator.core.cdc import msk_seed_admission
+    from dsql_migrator.core.ec2_metadata import HostNetwork
+
+    host = HostNetwork(
+        ip="10.0.11.31", vpc_id="vpc-app", subnet_id="subnet-a", cidr="10.0.0.0/16"
+    )
+
+    def decide(**kw):
+        base = dict(
+            seed_mode="external",
+            cdc_seed_mode="lambda",
+            cdc_msk_access=True,
+            configured_host_cidr="",
+            vpc_id="vpc-app",
+            host=None,
+        )
+        base.update(kw)
+        return msk_seed_admission(**base)
+
+    # 1. A Lambda-seeded deploy (MySQL on Fargate/local) is untouched: no CIDR, no
+    #    notice of any kind -- so no ingress rule is created, exactly as before.
+    lam = decide(seed_mode="lambda", cdc_msk_access=False, host=host)
+    assert (lam.cidr, lam.blocker, lam.warning, lam.note) == ("", "", "", "")
+
+    # 2. An explicit DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR wins FIRST and engine-blind, so
+    #    the in-VPC EC2 host is byte-identical to today and never triggers discovery --
+    #    including for MySQL, which also seeds in-process on that host.
+    ec2 = decide(
+        cdc_seed_mode="external", cdc_msk_access=False, configured_host_cidr="172.31.64.0/20"
+    )
+    assert ec2.cidr == "172.31.64.0/20"
+    assert not ec2.blocker
+
+    # 3. Fargate on an app stack that predates the grants: BLOCKED before any spend.
+    old = decide(cdc_msk_access=False, host=host)
+    assert old.cidr == ""  # nothing is registered
+    assert "9098" in old.blocker
+
+    # 4. Fargate, equipped, network resolved -> the VPC block is registered.
+    ok = decide(host=host)
+    assert ok.cidr == "10.0.0.0/16"
+    assert not ok.blocker and not ok.warning
+    assert "10.0.0.0/16" in ok.note
+
+    # 5. Fargate, equipped, but it cannot find itself in the entered VPC: nothing on the
+    #    new cluster would admit it, so refuse rather than bill for MSK first.
+    lost = decide(host=None)
+    assert lost.cidr == ""
+    assert "vpc-app" in lost.blocker
+
+    # 6. An in-VPC host that set no CIDR and could not resolve its network: a
+    #    NON-blocking warning. It may already be admitted by a hand-added rule (a
+    #    documented maintainer flow), so a refusal here would break a working setup.
+    maint = decide(cdc_seed_mode="external", cdc_msk_access=False, host=None)
+    assert maint.cidr == ""
+    assert not maint.blocker
+    assert "DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR" in maint.warning

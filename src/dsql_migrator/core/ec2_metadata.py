@@ -22,6 +22,8 @@ is NOT recognized as NAT egress, so such VPCs fall back to manual subnet entry
 
 from __future__ import annotations
 
+import ipaddress
+import socket
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -465,6 +467,110 @@ def _vpc_cidr_blocks(ec2_client: BotoSessionLike, vpc_id: str) -> list[str]:
     return blocks
 
 
+@dataclass(frozen=True)
+class HostNetwork:
+    """Where THIS process runs, resolved from its own primary IPv4 address.
+
+    ``cidr`` is the VPC block that CONTAINS ``ip`` -- deliberately the VPC block and
+    NOT the ENI's subnet CIDR. The Fargate service is DesiredCount 1 over a LIST of
+    ServiceSubnetIds with MinimumHealthyPercent 0, so a replacement task may land in
+    a DIFFERENT subnet; a subnet-scoped MSK ingress rule written once at cdc-stack
+    create time would then silently stop admitting the app and Start CDC would break
+    hours after a green deploy. Both live app stacks use two subnets with different
+    /20s inside one /16, so this is not hypothetical.
+    """
+
+    ip: str
+    vpc_id: str
+    subnet_id: str
+    cidr: str
+
+
+def cidr_contains(cidr: str, addr: str) -> bool:
+    """Is IPv4 ``addr`` inside ``cidr``? False for empty/invalid input (never raises)."""
+    try:
+        return ipaddress.ip_address(addr.strip()) in ipaddress.ip_network(
+            cidr.strip(), strict=False
+        )
+    except (ValueError, AttributeError):
+        return False
+
+
+def local_ipv4() -> Optional[str]:
+    """This process's primary IPv4 address, or None. No AWS call, no metadata endpoint.
+
+    A UDP socket is "connected" to the task-metadata link-local address: nothing is
+    sent -- the kernel just binds the socket to the interface that owns the route --
+    so ``getsockname()`` returns the address the host actually uses, which on an
+    awsvpc Fargate task and on EC2 is the ENI's private IP. 169.254.170.2 is chosen
+    because it is on-link by construction in a Fargate task namespace (the SDK
+    reaches the credentials endpoint there) and link-local on EC2 and a laptop --
+    unlike an off-link RFC1918 target, which needs a default route the subnet may not
+    have. Deliberately NOT an HTTP GET to that endpoint: AWS documents the task
+    metadata ``Networks`` entry with one sentence and no subfield spec, and a blind
+    link-local GET is not fast-failing. Not ``gethostbyname(gethostname())`` either:
+    that raises ``gaierror`` on macOS.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(0.5)
+        sock.connect(("169.254.170.2", 1))  # link-local; no packet is sent
+        return sock.getsockname()[0] or None
+    except OSError:
+        return None
+    finally:
+        sock.close()
+
+
+def discover_host_network(
+    ec2_client: BotoSessionLike, vpc_id: str, *, ip: Optional[str] = None
+) -> Optional[HostNetwork]:
+    """This process's network INSIDE ``vpc_id``, or ``None`` when it cannot be proven.
+
+    Used to fill the cdc-stack's ``HostSubnetCidr`` so ConnectorHostDiagnosticsIngress
+    admits this app on MSK 9098 for the in-process (SeedMode=External) CDC seed. Needs
+    NO new IAM -- the app's task role already holds ``ec2:DescribeNetworkInterfaces``
+    and ``ec2:DescribeVpcs`` (the same grants this module's subnet discovery uses).
+
+    The ENI lookup is filtered by this process's address AND by ``vpc_id`` -- the VPC
+    the operator is deploying the CDC infrastructure into. That is load-bearing twice
+    over: private IPv4 addresses are unique only within a VPC, so an unfiltered lookup
+    could match a foreign ENI and register some other network's CIDR as a real MSK
+    ingress source; and filtering resolves the duplicate-address ambiguity instead of
+    refusing to answer. A host that is not in ``vpc_id`` therefore resolves to
+    ``None``, which is correct -- the MSK bootstrap is private to that VPC.
+
+    Returns ``None`` -- NEVER raises -- for every uncertain answer: no local address,
+    no matching ENI, a denied/throttled describe, or an address outside every block of
+    the VPC. The caller decides what "unknown" means; this never guesses.
+    Blocking I/O: callers MUST run it off the event loop.
+    """
+    addr = ip or local_ipv4()
+    if not addr or not vpc_id:
+        return None
+    try:
+        resp = ec2_client.describe_network_interfaces(  # type: ignore[attr-defined]
+            Filters=[
+                {"Name": "addresses.private-ip-address", "Values": [addr]},
+                {"Name": "vpc-id", "Values": [vpc_id]},
+            ]
+        )
+        enis = resp.get("NetworkInterfaces") or []
+        if len(enis) != 1:
+            return None  # 0 = not in this VPC; >1 would be ambiguous
+        for block in _vpc_cidr_blocks(ec2_client, vpc_id):
+            if cidr_contains(block, addr):
+                return HostNetwork(
+                    ip=addr,
+                    vpc_id=vpc_id,
+                    subnet_id=enis[0].get("SubnetId") or "",
+                    cidr=block,
+                )
+    except Exception:  # noqa: BLE001 - "unknown" is a valid answer; never raise
+        return None
+    return None
+
+
 def _find_free_subnet_cidrs(
     vpc_cidrs: list[str], used_cidrs: list[str], *, count: int = 2, new_prefix: int = 24
 ) -> list[str]:
@@ -475,8 +581,6 @@ def _find_free_subnet_cidrs(
     ranges as strings. Returns fewer than ``count`` (possibly empty) when space is
     exhausted -- the caller treats that as "blocked". Pure (stdlib ipaddress).
     """
-    import ipaddress
-
     used_nets = []
     for c in used_cidrs:
         try:
@@ -638,7 +742,11 @@ __all__ = [
     "SubnetInfo",
     "SubnetSelection",
     "CdcNetworkDiagnosis",
+    "HostNetwork",
     "build_ec2_client",
     "select_connector_subnets",
     "diagnose_cdc_network",
+    "cidr_contains",
+    "local_ipv4",
+    "discover_host_network",
 ]

@@ -352,7 +352,11 @@ Leave the remaining parameters at their defaults (e.g. the container image).
 In particular **keep `HttpsEgressCidr` at `0.0.0.0/0`** — it's the task's
 outbound CIDR for reaching AWS APIs (DSQL, Secrets Manager, ECR, CloudWatch) via
 NAT/IGW; only tighten it if you front all of those with VPC endpoints (PrivateLink),
-otherwise the task can't pull its image or reach DSQL and fails to start. → **Next**.
+otherwise the task can't pull its image or reach DSQL and fails to start.
+`MskEgressCidr` is deliberately separate: a PostgreSQL source's cdc-stack is seeded
+by the app itself over MSK port **9098**, which resolves *inside* the CDC VPC — so
+that destination gets its own parameter and must not be folded into
+`HttpsEgressCidr`. → **Next**.
 
 > [!TIP]
 > **Which subnets to pick.** The dropdown lists **every subnet in the region**
@@ -561,6 +565,7 @@ Optional deep-dives — expand what you need; none of this is required for a fir
 | `SourceDbCidr` | no* | `""` | Source DB CIDR (use if no SG id). *One of this / `SourceDbSecurityGroupId` is required. |
 | `SourceDbPort` | no | `3306` | Source DB port — **`3306` for MySQL, `5432` for PostgreSQL** (override the default for a PostgreSQL source). |
 | `HttpsEgressCidr` | no | `0.0.0.0/0` | Destination CIDR for the task's outbound 443 (AWS APIs: DSQL token, Secrets Manager, ECR, CloudWatch, Bedrock) and 5432 (DSQL). **Recommended: leave the `0.0.0.0/0` default** — the task reaches public AWS endpoints via NAT/IGW. Only tighten (e.g. to your VPC CIDR) when you front *all* those services with interface VPC endpoints (PrivateLink); tightening without them blocks image pull / DSQL and the task fails to start. |
+| `MskEgressCidr` | no | `0.0.0.0/0` | Destination CIDR for the task's outbound **9098** to MSK Serverless (IAM/TLS SASL). **Required for a PostgreSQL source:** its cdc-stack is always `SeedMode=External`, so the *app* — not a seeder Lambda — creates the CDC Kafka topics and seeds the start offset itself. Kept separate from `HttpsEgressCidr` on purpose: that one is for *public* AWS endpoints, while the MSK bootstrap resolves inside the CDC VPC, so narrowing `HttpsEgressCidr` must not silently break CDC. Leave the default, or narrow to the CIDR of the VPC you will deploy the CDC infrastructure into. |
 | `EnableCognitoAuth` | no | `false` | ALB authenticates via Cognito (OIDC). Defaults to `false`: an internal ALB (or one scoped to your CIDR) is the access gate and the operator already holds the IAM/DB permissions, so no login is needed. **Required (enforced) only when `AllowedIngressCidr=0.0.0.0/0`.** Needs **both** `CognitoDomainPrefix` and `CognitoAdminEmail` when `true`. |
 | `AppDomainName` | no | `""` | DNS name fronting the ALB (must match the cert). Leave **empty** to use the ALB's own DNS name as the Cognito callback host — then no custom domain or Route 53 record is needed. |
 | `CognitoDomainPrefix` | if Cognito | `""` | Globally-unique Cognito hosted-UI prefix (`https://<prefix>.auth.<region>.amazoncognito.com`). |
@@ -723,6 +728,17 @@ aws cloudformation deploy \
   # $TEMPLATE_BUCKET: the staging bucket from the AWS CLI deploy section above
   # (the template exceeds CloudFormation's 51,200-byte inline-upload limit)
 ```
+
+> [!IMPORTANT]
+> **Upgrading to v0.1.503 or later with a PostgreSQL source needs the FULL template**
+> (`--template-file deploy/cloudformation.yaml`, as above) — not an image-only
+> `ContainerImageUri` override on the existing template. A PostgreSQL cdc-stack is
+> always seeded by the app itself over MSK port 9098, which needs two things only the
+> template can grant: the `MskEgress` security-group rule and the task role's
+> `cdc-external-seed` policy. Until the template is updated the tool **refuses** the
+> CDC infrastructure deploy up front (with the remedy in the message) instead of
+> creating a billable MSK Serverless cluster it could never seed. `MskEgressCidr` has
+> a default, so no new input is required. MySQL is unaffected either way.
 
 > [!WARNING]
 > The control plane runs as a **single task**, so expect a brief interruption

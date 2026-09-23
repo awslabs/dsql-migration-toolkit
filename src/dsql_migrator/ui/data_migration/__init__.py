@@ -1779,12 +1779,27 @@ def build_data_migration_screen(
                             )
                         except Exception:  # noqa: BLE001 - best-effort discovery
                             pass
+                        # Prefill the CDC VpcId from the source DB's own DBSubnetGroup.
+                        # Runs HERE, off the event loop, because render must not block on a
+                        # control-plane round-trip (one asyncio loop serves every browser
+                        # session on Fargate). Best effort and only fills an empty field, so
+                        # a non-RDS / cross-account / unpermitted source simply leaves it to
+                        # the operator -- the flow before this existed.
+                        _vpc_derived = False
+                        try:
+                            _vpc_derived = await _disc_run.io_bound(
+                                derive_cdc_vpc_from_source, migration_state, session
+                            )
+                        except Exception:  # noqa: BLE001 - best-effort prefill
+                            _vpc_derived = False
                         # Log any connector RUNNING/FAILED transition (on change).
                         _log_cdc_connector_transitions(migration_state, job_manager)
                         # A real change (first probe reporting, a new stack found, a
                         # connector appearing/going away) still refreshes, so the
                         # duplicate-MSK adopt guard shows up as soon as it is known.
-                        if cdc_discovery_fingerprint(migration_state) != _before:
+                        if _vpc_derived or (
+                            cdc_discovery_fingerprint(migration_state) != _before
+                        ):
                             refresh()
 
                     ui.timer(0.05, _discover_cdc, once=True)  # type: ignore[attr-defined]
@@ -3942,6 +3957,7 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     _DLQ_RECORD_LIST_LIMIT,
     _DLQ_RECORD_PAGE_SIZE,
     _cdc_infra_prefill,
+    derive_cdc_vpc_from_source,
     _cdc_is_streaming,
     _cdc_tables_for_config,
     _cdc_target_region,

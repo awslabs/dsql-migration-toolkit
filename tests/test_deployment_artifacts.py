@@ -2061,3 +2061,99 @@ def test_anchor_slug_helper_matches_github_for_a_known_heading() -> None:
 
     ja = _github_anchor_slugs(manual / "ja" / "01-setup.md")
     assert "11-前提条件" in ja
+
+
+# --- PostgreSQL CDC: the app seeds MSK itself (SeedMode=External) --------------
+# A PostgreSQL cdc-stack has no in-VPC offset-seeder Lambda, so THIS task creates the
+# Kafka topics and the CDC start offset over the MSK Serverless IAM endpoint on 9098
+# before any connector exists. That needs three things from this template, and without
+# them Start CDC dies with KafkaTimeoutError -- after the MSK cluster is already billing.
+
+
+def test_service_can_reach_msk_9098_for_the_external_seed(template: dict) -> None:
+    # The task SG declares an explicit inline SecurityGroupEgress list, which SUPPRESSES
+    # the default allow-all egress. So 9098 needs its own rule or it is a deny at the
+    # source. Asserted on the PARSED rule, not on the text: grepping for "9098" would
+    # also match the explanatory comments and the parameter description.
+    rule = template["Resources"]["MskEgress"]
+    assert rule["Type"] == "AWS::EC2::SecurityGroupEgress"
+    props = rule["Properties"]
+    assert props["GroupId"] == {"Fn::GetAtt": ["ServiceSecurityGroup", "GroupId"]}
+    assert (props["IpProtocol"], props["FromPort"], props["ToPort"]) == ("tcp", 9098, 9098)
+    # Its OWN destination parameter, NOT HttpsEgressCidr: that one is documented as the
+    # NAT/PrivateLink range for AWS PUBLIC endpoints, while the MSK bootstrap resolves
+    # inside the cdc-stack VPC -- an operator narrowing it would silently break PG CDC.
+    assert props["CidrIp"] == {"Ref": "MskEgressCidr"}
+    assert template["Parameters"]["MskEgressCidr"]["Default"] == "0.0.0.0/0"
+    # It must be the TASK security group that gets the rule, not some other SG.
+    net = template["Resources"]["Service"]["Properties"]["NetworkConfiguration"]
+    assert net["AwsvpcConfiguration"]["SecurityGroups"] == [
+        {"Fn::GetAtt": ["ServiceSecurityGroup", "GroupId"]}
+    ]
+
+
+def test_task_role_can_seed_msk_in_process_with_offsets_only_data_access(
+    template: dict,
+) -> None:
+    statements = _task_role_statements(template)
+    # It must be the TASK role: the seed runs on the ambient credential chain
+    # (core/cdc_kafka_seed.py threads no session), NOT as the assumed CdcDeployRole.
+    connect = statements["MskConnect"]
+    assert set(connect["Action"]) == {
+        "kafka-cluster:Connect",
+        "kafka-cluster:DescribeCluster",
+        "kafka-cluster:WriteDataIdempotently",
+    }
+    create = statements["MskSeedCreateTopics"]
+    assert set(create["Action"]) == {
+        "kafka-cluster:CreateTopic",
+        "kafka-cluster:DescribeTopic",
+        "kafka-cluster:DescribeTopicDynamicConfiguration",
+        "kafka-cluster:AlterTopicDynamicConfiguration",
+    }
+
+    def _arns(stmt):
+        return [r["Fn::Sub"] for r in stmt["Resource"]]
+
+    # Bounded to the tool's cdc-stack family, and BOTH prefixes: the canonical
+    # "dsql-cdc-*" and the legacy "mysql-dsql-cdc-*" that existing deploys still use.
+    for stmt in (connect, create):
+        arns = _arns(stmt)
+        assert any("cluster/dsql-cdc-*-msk" in a or "topic/dsql-cdc-*-msk" in a for a in arns)
+        assert any("mysql-dsql-cdc-*-msk" in a for a in arns)
+        assert not any(a.strip() == "*" for a in arns)
+
+    # The load-bearing narrowing: the seed reads and writes ONLY the offsets topic, so
+    # this long-lived, ALB-fronted role must NOT be able to consume the replicated data
+    # topics of every cdc-stack in the account. A "topic/<family>/*/*" resource here
+    # would be that over-grant, so assert the offsets suffix on EVERY arn.
+    data = statements["MskSeedOffsetTopicData"]
+    assert set(data["Action"]) == {"kafka-cluster:ReadData", "kafka-cluster:WriteData"}
+    assert _arns(data) and all(
+        a.endswith("-debezium-source-offsets") for a in _arns(data)
+    )
+    # No consumer-group action at all: the seed uses consumer.assign() and joins none.
+    all_actions = {
+        a
+        for stmt in statements.values()
+        for a in (
+            stmt["Action"] if isinstance(stmt["Action"], list) else [stmt["Action"]]
+        )
+    }
+    assert not any("Group" in a for a in all_actions if a.startswith("kafka-cluster:"))
+
+
+def test_container_attests_the_msk_seed_capability(template: dict) -> None:
+    # The app cannot observe either of the two grants above at runtime (it holds no
+    # iam:Simulate*, and ec2:DescribeSecurityGroups belongs to CdcDeployRole), so this
+    # template revision DECLARES the capability. Shipped in the same revision as both
+    # grants, so its presence implies them -- which is what lets the pre-flight refuse
+    # an un-updated stack in seconds instead of spending 5-20 min of billable MSK.
+    container = template["Resources"]["TaskDefinition"]["Properties"][
+        "ContainerDefinitions"
+    ][0]
+    env = {e["Name"]: e["Value"] for e in container["Environment"]}
+    assert env["DSQL_MIGRATOR_CDC_MSK_ACCESS"] == "true"
+    # NOT via DSQL_MIGRATOR_CDC_SEED_MODE: that would also switch MySQL off the
+    # cdc-stack's in-VPC seeder Lambda, which is its live-verified path.
+    assert "DSQL_MIGRATOR_CDC_SEED_MODE" not in env

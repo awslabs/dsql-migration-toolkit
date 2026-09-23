@@ -2487,9 +2487,15 @@ def _render_cdc_infra_deploy_action(
         )
         return
 
-    # VpcId is the one input the tool cannot infer (subnets/NAT, the plugin bucket, the
-    # DSQL cluster ARN, the source host and its secret are all resolved at deploy time),
-    # but it was validated only in the SUBMIT path: the button looked ready, the click
+    # VpcId is the one input the operator may still have to CHOOSE (subnets/NAT, the plugin
+    # bucket, the DSQL cluster ARN, the source host and its secret are all resolved at deploy
+    # time). For an RDS/Aurora source it is now PREFILLED from the source's own DBSubnetGroup
+    # -- the same DescribeDBInstances response the tool already reads for the source security
+    # group, so no extra API call and no extra IAM -- and the field stays editable, because
+    # the CDC pipeline may legitimately run in another VPC reached by peering / Transit
+    # Gateway / PrivateLink. It is still REQUIRED: a non-RDS host (self-managed PostgreSQL on
+    # EC2), a cross-account endpoint or a missing rds:DescribeDBInstances leaves it blank.
+    # It was validated only in the SUBMIT path: the button looked ready, the click
     # opened the confirmation dialog (which runs a network diagnosis and a cost
     # estimate), and only the final Deploy answered with an "Enter your VPC ID." toast.
     # State the requirement before the click instead.
@@ -2596,7 +2602,11 @@ def _render_cdc_delete_action(
 # (label, state-key, placeholder/help, required?) for the Deploy-infra form.
 # The form asks for ONLY the VPC id; from it the tool diagnoses egress and either
 # reuses existing NAT subnets, has the stack create its own NAT, or (blocked) asks
-# for the subnet override below. Everything else is auto-discovered/derived.
+# for the subnet override below. Everything else is auto-discovered/derived, and for an
+# RDS/Aurora source the VPC id itself is PREFILLED from the source's DBSubnetGroup (shown
+# with its provenance, and editable -- the pipeline may belong in another VPC). It stays in
+# the form because the derivation is best-effort: a non-RDS host, a cross-account endpoint
+# or a missing rds:DescribeDBInstances leaves it for the operator to supply.
 # DsqlClusterArn + source host are auto-prefilled silently.
 _CDC_INFRA_FIELDS: tuple[tuple[str, str, str, bool], ...] = (
     ("VPC ID", "vpc_id", "vpc-0123456789abcdef0", True),
@@ -2691,11 +2701,23 @@ def _render_cdc_infra_form(
             # source's own VPC (or one with private connectivity to it) is the
             # safe default.
             if key == "vpc_id":
-                ui.label(  # type: ignore[attr-defined]
-                    "Recommended: the same VPC as your source database (or one with "
-                    "private connectivity to it) — the connector must reach the "
-                    "source privately."
-                ).classes("w-full text-xs text-gray-500")
+                # Show the PROVENANCE of a derived value. Prefilling silently and
+                # prefilling visibly are different things: the operator has to be able to
+                # see that this came from the source and that changing it is expected (the
+                # pipeline may belong in another VPC, reached by peering / Transit Gateway /
+                # PrivateLink). Absent when nothing could be derived.
+                _provenance = getattr(migration_state, "cdc_vpc_provenance", None)
+                if _provenance and (values.get(key) or "").strip():
+                    ui.label(  # type: ignore[attr-defined]
+                        f"Derived from {_provenance}. Change it if the CDC pipeline "
+                        "should run elsewhere."
+                    ).classes("w-full text-xs text-gray-500")
+                else:
+                    ui.label(  # type: ignore[attr-defined]
+                        "Recommended: the same VPC as your source database (or one with "
+                        "private connectivity to it) — the connector must reach the "
+                        "source privately."
+                    ).classes("w-full text-xs text-gray-500")
 
             def _save(_e, k=key, f=field) -> None:
                 current = migration_state.cdc_infra_inputs()
@@ -2837,6 +2859,16 @@ async def _open_cdc_infra_dialog(ui, migration_state, on_confirm, *, session=Non
     net_message, net_kind, routed_warning = await run.io_bound(
         _diagnose_for_dialog, migration_state, session
     )
+    # Checked here, not after Deploy: a VpcId that cannot reach the source fails only once
+    # the MSK cluster exists, ~20 minutes in, and leaves a stack to tear down.
+    source_vpc_warning = await run.io_bound(
+        _source_vpc_warning_for_dialog, migration_state, session
+    )
+    # Checked here, not after Deploy: a PostgreSQL cdc-stack is always created
+    # SeedMode=External and is seeded BY THIS APP over MSK 9098, so a deployment that
+    # cannot reach MSK -- or that the new cluster would not admit -- fails only at
+    # Start CDC, after a billable MSK Serverless cluster already exists.
+    seed_admission = await run.io_bound(_msk_seed_admission, migration_state, session)
     with ui.dialog() as dialog, ui.card().classes("gap-2").style("min-width: 460px"):  # type: ignore[attr-defined]
         ui.label("Deploy CDC infrastructure").classes("text-lg font-semibold")  # type: ignore[attr-defined]
         ui.label(  # type: ignore[attr-defined]
@@ -2869,6 +2901,16 @@ async def _open_cdc_infra_dialog(ui, migration_state, on_confirm, *, session=Non
             _render_notice(
                 ui, tone=net_tone, icon=net_icon, header="Network", body=net_message
             )
+        if source_vpc_warning:
+            # A mismatch is not a blocker -- peering / TGW / PrivateLink are legitimate --
+            # but it is the shape of a typo, so it warns and says what to confirm.
+            _render_notice(
+                ui,
+                tone="warning",
+                icon="lan",
+                header="This is not the source's VPC",
+                body=source_vpc_warning,
+            )
         if routed_warning:
             # A complex-VPC caution (TGW/peering/VPN) for the auto-carved subnets:
             # something to be aware of, not a blocker -> amber "warning" notice.
@@ -2877,6 +2919,35 @@ async def _open_cdc_infra_dialog(ui, migration_state, on_confirm, *, session=Non
                 tone="warning",
                 header="Check subnet overlap",
                 body=routed_warning,
+            )
+        if seed_admission.blocker:
+            _render_notice(
+                ui,
+                tone="error",
+                icon="vpn_lock",
+                header="This deployment cannot start PostgreSQL CDC",
+                body=(
+                    seed_admission.blocker
+                    + " Deploying now would create a billable MSK Serverless cluster "
+                    "that Start CDC could never use."
+                ),
+            )
+        elif seed_admission.warning:
+            _render_notice(
+                ui,
+                tone="warning",
+                icon="vpn_lock",
+                header="MSK ingress for this host was not registered",
+                body=seed_admission.warning,
+            )
+        elif seed_admission.note:
+            # A normal, resolved state -> calm info, never a warning.
+            _render_notice(
+                ui,
+                tone="info",
+                icon="vpn_lock",
+                header="MSK access for the PostgreSQL CDC seed",
+                body=seed_admission.note,
             )
 
         async def _go() -> None:
@@ -2898,7 +2969,152 @@ async def _open_cdc_infra_dialog(ui, migration_state, on_confirm, *, session=Non
             elif net_kind == "blocked":
                 # Cannot auto-resolve egress; block the deploy until fixed/overridden.
                 deploy_btn.props("disable")
+            elif seed_admission.blocker:
+                # Would create a billable MSK cluster this app could never seed.
+                deploy_btn.props("disable")
+                deploy_btn.tooltip(seed_admission.blocker)
     dialog.open()
+
+def derive_cdc_vpc_from_source(migration_state, session) -> bool:
+    """Prefill the CDC VpcId from the source DB's own DBSubnetGroup. True when it changed.
+
+    The value comes from the SAME ``DescribeDBInstances`` response the tool already reads for
+    the source security group, so there is no extra API call and no extra IAM -- only more
+    fields off a response it has. Best effort, exactly like the rest of ``rds_metadata``: a
+    non-RDS host (self-managed PostgreSQL on EC2), a cross-account endpoint or a missing
+    ``rds:DescribeDBInstances`` leaves the field blank for the operator to fill, which is the
+    flow this feature had before it existed.
+
+    Only fills an EMPTY field -- an operator's own value is never overwritten -- and records
+    the provenance so the prefill is visible rather than a silent substitution. Blocking I/O:
+    callers MUST run it off the event loop.
+    """
+    if session is None:
+        return False
+    host = getattr(getattr(session, "source_config", None), "host", None)
+    if not host:
+        return False
+    fields = migration_state.cdc_infra_inputs()
+    if (fields.get("vpc_id") or "").strip():
+        return False  # the operator (or an earlier derivation) already supplied one
+    try:
+        from dsql_migrator.core.rds_metadata import (
+            build_rds_client,
+            fetch_source_network,
+            parse_rds_region,
+        )
+
+        client = build_rds_client(
+            getattr(session, "aws_profile", None), parse_rds_region(host)
+        )
+        info = fetch_source_network(client, host)
+    except Exception:  # noqa: BLE001 - best effort; the manual field remains
+        return False
+    if info is None or not info.vpc_id:
+        return False
+    fields["vpc_id"] = info.vpc_id
+    # The advanced subnet override gets the same treatment: the source's own subnets are
+    # the overwhelmingly common answer, and leaving it blank still auto-configures.
+    if not (fields.get("connector_subnet_ids") or "").strip() and info.subnet_ids:
+        fields["connector_subnet_ids"] = ",".join(info.subnet_ids)
+    migration_state.set_cdc_infra_inputs(fields)
+    where = info.db_identifier or "the source database"
+    group = f" (subnet group {info.db_subnet_group})" if info.db_subnet_group else ""
+    migration_state.cdc_vpc_provenance = f"the source {where}{group}"
+    return True
+
+
+def _source_vpc_warning_for_dialog(migration_state, session) -> str:
+    """The "this is not the source's VPC" caution for the deploy dialog, or "".
+
+    Checked BEFORE Deploy because a wrong VpcId is otherwise only discovered after roughly
+    twenty minutes of MSK deployment, leaving a failed stack to clean up. Read-only, and
+    silent whenever the answer is unknown -- a non-RDS host, a cross-account endpoint or a
+    missing ``rds:DescribeDBInstances`` yields no warning rather than a false one. Blocking
+    I/O: the caller runs it via ``run.io_bound`` alongside the network diagnosis.
+    """
+    if session is None:
+        return ""
+    source = getattr(session, "source_config", None)
+    host = getattr(source, "host", None)
+    if not host:
+        return ""
+    vpc_id = (migration_state.cdc_infra_inputs().get("vpc_id") or "").strip()
+    if not vpc_id:
+        return ""
+    try:
+        from dsql_migrator.core.rds_metadata import (
+            build_rds_client,
+            fetch_source_network,
+            parse_rds_region,
+            source_vpc_mismatch_warning,
+        )
+
+        client = build_rds_client(
+            getattr(session, "aws_profile", None), parse_rds_region(host)
+        )
+        return source_vpc_mismatch_warning(vpc_id, fetch_source_network(client, host)) or ""
+    except Exception:  # noqa: BLE001 - best effort; the dialog works without it
+        return ""
+
+
+def _msk_seed_admission(migration_state, session, *, vpc_id=None):
+    """External-seed admission for the deploy dialog AND the create call (blocking).
+
+    ONE decision used in two places, so the dialog cannot say "clear" while the
+    submitted ``HostSubnetCidr`` is empty (or vice versa). Keyed on the existing
+    :func:`_cdc_start_seed_mode` so a Lambda-seeded deploy (MySQL on Fargate/local)
+    returns an all-empty verdict and behaves exactly as before -- no notice, no
+    discovery, no AWS call, an empty ``HostSubnetCidr`` and therefore no ingress rule.
+    An explicitly configured ``DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR`` short-circuits
+    inside :func:`msk_seed_admission` before any discovery, which is what keeps the
+    in-VPC EC2 host byte-identical.
+
+    ``vpc_id`` overrides the state's own value: the submit path has already resolved
+    ``fields`` (which may carry a derived VpcId the state has not been written back
+    from), and the network the cdc-stack admits must be resolved against the VPC the
+    create call is ACTUALLY about, not a possibly-staler copy.
+
+    Blocking: the callers run it via ``run.io_bound``, like the network diagnosis
+    beside it.
+    """
+    from dsql_migrator.config import load_config as _load_config
+    from dsql_migrator.core.cdc import MskSeedAdmission, msk_seed_admission
+
+    cfg = _load_config()
+    seed_mode = _cdc_start_seed_mode(_cdc_source_type(session), cfg.cdc_seed_mode)
+    if seed_mode != "external":
+        return MskSeedAdmission()
+    if vpc_id is None:
+        vpc_id = migration_state.cdc_infra_inputs().get("vpc_id") or ""
+    vpc_id = vpc_id.strip()
+    host = None
+    if not cfg.cdc_host_subnet_cidr and vpc_id:
+        try:
+            from dsql_migrator.core.ec2_metadata import (
+                build_ec2_client,
+                discover_host_network,
+            )
+
+            target = getattr(session, "target_config", None)
+            host = discover_host_network(
+                build_ec2_client(
+                    getattr(session, "aws_profile", None),
+                    getattr(target, "region", None) if target else None,
+                ),
+                vpc_id,
+            )
+        except Exception:  # noqa: BLE001 - discovery must never break the deploy path
+            host = None
+    return msk_seed_admission(
+        seed_mode=seed_mode,
+        cdc_seed_mode=cfg.cdc_seed_mode,
+        cdc_msk_access=getattr(cfg, "cdc_msk_access", False),
+        configured_host_cidr=cfg.cdc_host_subnet_cidr,
+        vpc_id=vpc_id,
+        host=host,
+    )
+
 
 def _diagnose_for_dialog(migration_state, session):
     """Return (message, kind, routed_warning) for the deploy dialog, best-effort.
@@ -3649,24 +3865,36 @@ def _start_cdc_deploy(
 
     _host_cfg = _load_config()
     seed_mode = _cdc_start_seed_mode(_cdc_source_type(session), _host_cfg.cdc_seed_mode)
-    # The External prep runs IN-PROCESS over the MSK IAM bootstrap, so it needs the app to
-    # be inside the cdc-stack VPC (the in-VPC host sets cdc_seed_mode=external). Warn loudly
-    # when a PostgreSQL Start is attempted from a host that is not in-VPC: the in-process
-    # seed cannot reach MSK there (run_cdc_start also fails loudly mid-deploy), so this is a
-    # pre-flight heads-up rather than silently proceeding.
-    if seed_mode == "external" and _host_cfg.cdc_seed_mode != "external":
-        render_notice(
-            ui,
-            tone="warning",
-            header="Start PostgreSQL CDC from inside the VPC",
-            body=(
-                "PostgreSQL CDC prepares its Kafka topics and start offset in-process over "
-                "the MSK IAM endpoint, which requires running inside the cdc-stack VPC "
-                "(admitted on port 9098). This host does not appear to be in-VPC, so the "
-                "start may fail to reach MSK. Start CDC from the in-VPC host that deployed "
-                "the CDC infrastructure."
-            ),
+    # The External prep runs IN-PROCESS over the MSK IAM bootstrap, so a deployment
+    # without 9098 egress + data-plane kafka-cluster IAM cannot do it at all. This used
+    # to WARN ("this host does not appear to be in-VPC") and proceed, which was both
+    # wrong on Fargate -- the task IS in the cdc-stack VPC; it is simply not admitted
+    # and holds no data-plane IAM -- and useless, because the seed then died a minute
+    # later with a raw KafkaTimeoutError. Block instead: nothing has been submitted yet.
+    # Keyed on the DEPLOYMENT's declared capability, NOT on cdc_seed_mode: Fargate must
+    # keep cdc_seed_mode="lambda" so MySQL keeps using the cdc-stack's in-VPC seeder
+    # Lambda, so the old condition fired even on a correctly equipped app stack. Whether
+    # the DEPLOYED cdc-stack admits this host is a separate, fact-based check in
+    # cdc_deployer._run_external_seed.
+    if seed_mode == "external":
+        from dsql_migrator.core.cdc import msk_seed_capability_blocker
+
+        _seed_blocker = msk_seed_capability_blocker(
+            cdc_seed_mode=_host_cfg.cdc_seed_mode,
+            cdc_msk_access=getattr(_host_cfg, "cdc_msk_access", False),
         )
+        if _seed_blocker:
+            render_notice(
+                ui,
+                tone="error",
+                icon="vpn_lock",
+                header="This deployment cannot start PostgreSQL CDC",
+                body=(
+                    _seed_blocker
+                    + " No connectors were created and the cdc-stack is unchanged."
+                ),
+            )
+            return
     source_config = dispatch_source_config(
         _cdc_source_type(session),
         tables_for_config,
@@ -3900,6 +4128,22 @@ async def _start_cdc_infra_deploy(
         )
         return
 
+    # HostSubnetCidr: the network the cdc-stack admits on MSK 9098 so a
+    # SeedMode=External (PostgreSQL, or the in-VPC EC2 host) Start can seed in-process.
+    # Re-resolved here rather than trusting the dialog's verdict -- the dialog may have
+    # been open for minutes and its EC2 describe can since have been throttled or
+    # denied, and deploying with an empty value would create a cluster nothing admits.
+    # Checked FIRST, before the network diagnosis and the Secrets Manager upsert, so a
+    # refusal leaves nothing behind. Explicit DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR wins
+    # inside msk_seed_admission (so the EC2 host is byte-identical); a Lambda-seeded
+    # deploy resolves to "" -> no ingress rule, unchanged.
+    _admission = await run.io_bound(
+        _msk_seed_admission, migration_state, session, vpc_id=fields["vpc_id"]
+    )
+    if _admission.blocker:
+        ui.notify(_admission.blocker, type="warning", position="top")  # type: ignore[attr-defined]
+        return
+
     # --- Click-time network resolution (read-only, off the event loop) ----------
     # (a) An explicit subnet override (Advanced) is used as-is. Otherwise diagnose
     #     the VPC: reuse existing NAT-egress subnets (discovered), let the stack
@@ -4123,7 +4367,7 @@ async def _start_cdc_infra_deploy(
         row_counts_by_table=row_counts_by_table,
         sink_mcu_count=_sink_mcu_count(),
         seed_mode=_cfg.cdc_seed_mode,
-        host_subnet_cidr=_cfg.cdc_host_subnet_cidr,
+        host_subnet_cidr=_admission.cidr,
     )
     deployer = build_cdc_stack_deployer(
         region,

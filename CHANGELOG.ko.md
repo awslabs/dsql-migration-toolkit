@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.503
+
+### 수정
+
+- **Fargate 배포에서는 PostgreSQL CDC를 아예 시작할 수 없었습니다.** PostgreSQL cdc-stack은 항상 `SeedMode=External`로 생성됩니다. 즉 MySQL이 쓰는 VPC 내 시더 Lambda가 아니라 **앱이 직접** MSK Serverless IAM 엔드포인트(9098)로 CDC Kafka 토픽을 만들고 시작 오프셋을 시드합니다. 그런데 Fargate 앱 스택은 그 두 조건 중 어느 것도 주지 않았습니다 — 태스크 보안 그룹이 egress 목록(443 + 5432)을 명시해 기본 allow-all을 덮으므로 9098이 출발지에서 막혔고, 태스크 역할에는 데이터 플레인 `kafka-cluster` 권한이 전혀 없었습니다. cdc-stack의 대응 ingress 규칙은 이미 있었지만 한 번도 무장되지 않았는데, 그 게이트인 `HostSubnetCidr`가 EC2 호스트 user-data에서만 설정되어 Fargate에서는 구조적으로 비어 있었기 때문입니다. 사용자가 보는 증상은 **MSK Serverless 클러스터가 이미 생성되어 과금이 시작된 뒤**의 `KafkaTimeoutError`였습니다. 이제 앱 스택이 `MskEgress` 규칙(전용 `MskEgressCidr` 파라미터 — `HttpsEgressCidr`를 재사용하지 않은 것은 의도적입니다: 그쪽은 NAT/PrivateLink 범위로 좁히라고 안내하는 값인데 MSK 부트스트랩은 CDC VPC 내부로 해석되므로)과 `cdc-external-seed` 태스크 역할 정책을 함께 배포하고, 앱은 자기 주소를 포함하는 **VPC CIDR 블록**을 cdc-stack의 허용 네트워크로 등록합니다 — 태스크의 서브넷이 아니라 VPC 블록인 이유는, 단일 태스크가 서브넷 **목록**에 배치되어 교체 시 다른 서브넷에 착륙할 수 있고 그러면 서브넷 범위 규칙이 조용히 낡기 때문입니다. **기존 Fargate 스택은 전체 템플릿 갱신**(`--template-file deploy/cloudformation.yaml`)**이 필요합니다** — 이미지만 바꾸는 `ContainerImageUri` 덮어쓰기로는 안 됩니다. 태스크 역할 권한은 코드로 대체할 수 없습니다. MySQL은 모든 배포에서 변경 없고, VPC 내 EC2 배포도 영향 없습니다.
+- **시드할 수 없는 CDC 인프라 배포를 클러스터 비용을 치르기 전에 거부합니다.** 이전에는 MSK Serverless까지 포함해 cdc-stack 전체를 만든 뒤(5–20분, 과금) Start CDC에서 맨 `KafkaTimeoutError`로 실패했습니다. 이제 배포 대화상자가 지출 전에 배포의 능력과 스택이 허용할 네트워크를 확인해 해결 방법을 명시하며 Deploy를 비활성화하고, 클릭 시점에 다시 확인합니다(대화상자를 열 때 성공한 EC2 describe가 그 사이 스로틀될 수 있음) — 그래서 실패가 확정된 구성에서는 소스 시크릿 upsert조차 만들지 않습니다. 이쪽 절반은 순수 앱 코드라 **이미 배포된 스택에서도 즉시 동작합니다**: 템플릿 갱신 없이도 20분 뒤가 아니라 몇 초 안에 거부됩니다. Start CDC도 같이 거부합니다. 기존의 "Start PostgreSQL CDC from inside the VPC" 경고는 제거했습니다 — Fargate에서는 사실과 달랐고(태스크는 cdc-stack VPC 안에 있습니다. 단지 허용되지 않았고 IAM이 없었을 뿐), 올바르게 갖춰진 스택에서도 떴으며, 경고만 하고 확정된 실패로 진행했습니다. 엔진에는 fail-open 백스톱 하나만 남겼습니다 — 시드 시점에 **확실할 때만** 거부합니다(배포된 스택이 이 호스트가 속하지 않은 네트워크를 허용하는 경우). 이는 로컬 설정이 아무것도 말해주지 않는 **채택(adopt)된 스택**까지 커버합니다.
+- **CDC `VpcId`를 소스 데이터베이스에서 유도하고, 불일치는 배포 전에 경고합니다.** VPC는 도구가 소스 보안 그룹을 읽을 때 쓰는 **바로 그** `DescribeDBInstances` 응답에서 나오므로 추가 API 호출도, 추가 IAM도 없습니다. **빈 칸일 때만** 채우고 — 운영자가 넣은 값은 절대 덮어쓰지 않습니다 — 조용히 대체하는 대신 출처를 함께 보여줍니다. 소스의 VPC가 아닌 값을 넣으면 이제 경고하고(차단은 아닙니다: 피어링·Transit Gateway·PrivateLink는 정당합니다) 무엇을 확인해야 하는지 알려줍니다 — MSK 배포 20분쯤 뒤에 드러나 정리할 스택만 남기는 대신에. 전 구간 best-effort입니다: 비RDS 호스트, 크로스 계정 엔드포인트, `rds:DescribeDBInstances` 권한 부재 시에는 추측하지 않고 빈 칸으로 두고 침묵합니다.
+
+### 보안
+
+- 새 태스크 역할 `kafka-cluster` 권한은 시드의 create/describe 권한보다 더 좁게 스코프했습니다: `ReadData`/`WriteData`는 `-debezium-source-offsets` 토픽 **하나**로 제한합니다. 시드가 읽고 쓰는 유일한 토픽이기 때문입니다. 더 넓은 `topic/<family>/*/*` 형태라면, ALB 앞단에서 상시 동작하는 이 역할이 계정 내 **모든** cdc-stack의 복제된 행 데이터 전체를 읽을 수 있었습니다. 컨슈머 그룹 액션은 전혀 부여하지 않습니다 — 시드는 `consumer.assign()`을 쓰고 어떤 그룹에도 참여하지 않습니다.
+
 ## v0.1.502
 
 ### 변경

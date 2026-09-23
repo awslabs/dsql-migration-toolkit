@@ -47,6 +47,7 @@ Metadata:
           - CertificateArn
           - AllowedIngressCidr
           - HttpsEgressCidr
+          - MskEgressCidr
       - Label:
           default: "4. Authentication — only needed for a fully public (0.0.0.0/0) ALB"
         Parameters:
@@ -96,6 +97,8 @@ Metadata:
         default: "Allowed ingress CIDR  [Optional] — who can reach the ALB · internal: your VPC/VPN CIDR · internet-facing: your public IP as x.x.x.x/32 (curl https://checkip.amazonaws.com)"
       HttpsEgressCidr:
         default: "Outbound HTTPS CIDR  [Optional] — tighten to your NAT/PrivateLink range"
+      MskEgressCidr:
+        default: "Outbound MSK CIDR  [Optional, default 0.0.0.0/0] — CIDR the task may reach MSK Serverless on 9098; required for a PostgreSQL source's CDC seed; narrow only to the CDC VPC's CIDR"
       EnableCognitoAuth:
         default: "Enable Cognito login  [Optional, default off] — OIDC login at the ALB"
       CognitoDomainPrefix:
@@ -278,6 +281,27 @@ Parameters:
       CIDR for outbound HTTPS (443) to reach Aurora DSQL, Secrets Manager, ECR,
       CloudWatch, and (when enabled) Bedrock via NAT. Tighten to your
       VPC-endpoint/NAT CIDR when using PrivateLink.
+
+  # 9098 gets its OWN destination CIDR, deliberately NOT HttpsEgressCidr: that
+  # parameter is documented as the NAT/PrivateLink range for AWS PUBLIC endpoints
+  # (see above), while the MSK Serverless bootstrap resolves to ENIs INSIDE the
+  # cdc-stack VPC (AWS::MSK::ServerlessCluster VpcConfigs,
+  # deploy/cdc-stack/cdc-stack.yaml). An operator who follows HttpsEgressCidr's own
+  # advice and narrows it to their NAT range would then SILENTLY break PostgreSQL CDC.
+  # CloudFormation cannot derive a CIDR from an AWS::EC2::VPC::Id / Subnet::Id
+  # parameter (the EC2 stack resolves it at boot instead -- cloudformation-ec2.yaml
+  # user-data), so it is an explicit parameter. Mirrors
+  # deploy/cloudformation-ec2.yaml's MskEgressCidr.
+  MskEgressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: >
+      CIDR the task may reach MSK Serverless on 9098 (IAM/TLS SASL) for the in-process
+      CDC Kafka prep + offset seed. Required for a PostgreSQL source: its cdc-stack is
+      always SeedMode=External, so the APP -- not a seeder Lambda -- creates the topics
+      and seeds the start offset. Leave the default, or narrow to the CIDR of the VPC
+      you will deploy the CDC infrastructure into (the MSK endpoints are created in
+      that VPC, so a narrower guess can break the seed).
 
   EnableCognitoAuth:
     Type: String
@@ -783,6 +807,65 @@ Resources:
                 Action: sts:AssumeRole
                 Resource:
                   Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-cdc-deploy
+        # The in-process CDC offset seed (SeedMode=External). MySQL delegates it to the
+        # in-VPC offset-seeder Lambda the cdc-stack creates (its OffsetSeederRole holds
+        # these grants -- deploy/cdc-stack/cdc-stack.yaml). A POSTGRESQL cdc-stack has no
+        # such Lambda, so the APP seeds MSK itself in process and needs the cluster +
+        # topic data-plane grants on THIS role: the seed runs on the ambient credential
+        # chain (core/cdc_kafka_seed.py threads no session), i.e. as the TASK role, NOT
+        # as the assumed CdcDeployRole.
+        #
+        # WILDCARD SCOPE: the runtime cdc-stack's name is chosen at CDC-deploy time and
+        # is UNKNOWN when this app stack is deployed, so the cluster cannot be pinned
+        # here. The ARNs are bounded to the tool's cdc-stack family ("dsql-cdc-*-msk" +
+        # legacy "mysql-dsql-cdc-*-msk") -- exactly the family CdcDeployRole may create
+        # and the only names core/cdc.py accepts.
+        #
+        # ReadData/WriteData are scoped TIGHTER than the create/describe grants, to the
+        # offsets topic alone: the seed reads and writes ONLY
+        # "<stack>-debezium-source-offsets" (core/cdc_kafka_seed.py::read_existing_offset
+        # / ::produce, both passed offset_topic), so this role must NOT be able to
+        # consume the replicated data topics. No kafka-cluster group action either: the
+        # seed uses consumer.assign() and never joins a consumer group.
+        - PolicyName: cdc-external-seed
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: MskConnect
+                Effect: Allow
+                Action:
+                  - kafka-cluster:Connect
+                  - kafka-cluster:DescribeCluster
+                  # Cluster-scoped, and granted by both existing working roles (the
+                  # cdc-stack seeder Lambda and the EC2 host): kafka-python turns on the
+                  # idempotent producer under acks=all, which needs this for the
+                  # InitProducerId. Today's seed sets enable_idempotence=False, so it is
+                  # belt-and-braces.
+                  - kafka-cluster:WriteDataIdempotently
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:cluster/dsql-cdc-*-msk/*
+                  - Fn::Sub: arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:cluster/mysql-dsql-cdc-*-msk/*
+              - Sid: MskSeedCreateTopics
+                Effect: Allow
+                Action:
+                  - kafka-cluster:CreateTopic
+                  - kafka-cluster:DescribeTopic
+                  # create_topics is called WITH topic_configs (max.message.bytes,
+                  # cleanup.policy=compact), so the dynamic-config actions are required
+                  # at create, not later.
+                  - kafka-cluster:DescribeTopicDynamicConfiguration
+                  - kafka-cluster:AlterTopicDynamicConfiguration
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/dsql-cdc-*-msk/*/*
+                  - Fn::Sub: arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/mysql-dsql-cdc-*-msk/*/*
+              - Sid: MskSeedOffsetTopicData
+                Effect: Allow
+                Action:
+                  - kafka-cluster:ReadData
+                  - kafka-cluster:WriteData
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/dsql-cdc-*-msk/*/*-debezium-source-offsets
+                  - Fn::Sub: arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/mysql-dsql-cdc-*-msk/*/*-debezium-source-offsets
 
   # Dedicated privileged role the task assumes ONLY for cdc-stack lifecycle (keeps
   # CFN/MSK/iam:CreateRole/PassRole off the long-running task role). Explicit
@@ -1319,6 +1402,29 @@ Resources:
             Ref: HttpsEgressCidr
           Description: Egress to Aurora DSQL (PostgreSQL wire protocol, port 5432).
 
+  # 9098 egress for the PostgreSQL-source CDC in-process Kafka prep. For a PostgreSQL
+  # source the cdc-stack is ALWAYS SeedMode=External
+  # (core/cdc_postgres.py::build_pg_cdc_infra_params), so core/cdc_deployer.py runs
+  # core/cdc_kafka_seed.py IN THIS TASK over the MSK Serverless IAM bootstrap BEFORE any
+  # connector is created. The inline SecurityGroupEgress list above SUPPRESSES the
+  # default allow-all egress (see the AlbHttpsEgress comment below for the same trap),
+  # so without this rule Start CDC dies with KafkaTimeoutError "Unable to bootstrap from
+  # boot-...kafka-serverless...:9098" -- after the MSK cluster is already billing.
+  # Declared standalone (not appended to the inline list) so adding it to an EXISTING
+  # stack cannot disturb the live 443/5432 rules. MySQL is unaffected either way: it
+  # seeds via the cdc-stack's in-VPC Lambda.
+  MskEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId:
+        Fn::GetAtt: [ServiceSecurityGroup, GroupId]
+      IpProtocol: tcp
+      FromPort: 9098
+      ToPort: 9098
+      CidrIp:
+        Ref: MskEgressCidr
+      Description: Egress to MSK Serverless (IAM/TLS SASL, 9098) for the in-process CDC offset seed.
+
   # Allow the ALB to reach the task on the app port.
   AlbToServiceEgress:
     Type: AWS::EC2::SecurityGroupEgress
@@ -1694,6 +1800,17 @@ Resources:
             - Name: BEDROCK_REGION
               Value:
                 Ref: BedrockRegion
+            # Declares to the app that THIS template revision equipped the task for the
+            # in-process (SeedMode=External) MSK seed a PostgreSQL cdc-stack requires:
+            # the MskEgress 9098 rule above and the TaskRole 'cdc-external-seed'
+            # kafka-cluster policy. The app cannot observe either (no iam:Simulate*, and
+            # ec2:DescribeSecurityGroups belongs to CdcDeployRole), so without this
+            # marker its pre-flight could not tell a fixed stack from an un-updated one
+            # and would spend 5-20 min of billable MSK Serverless to find out. NOT
+            # DSQL_MIGRATOR_CDC_SEED_MODE: that would also switch MySQL off the
+            # cdc-stack's in-VPC seeder Lambda.
+            - Name: DSQL_MIGRATOR_CDC_MSK_ACCESS
+              Value: "true"
           Secrets:
             # Stable cookie-signing secret for the UI's browser session id, so a
             # reconnecting browser resumes its persisted workbench state (workflow

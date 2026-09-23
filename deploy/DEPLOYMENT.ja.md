@@ -352,7 +352,10 @@ A か B のいずれかを選んでください:
 タスクが NAT/IGW 経由で AWS API（DSQL、Secrets Manager、ECR、CloudWatch）に到達する
 ためのアウトバウンド CIDR です。これらすべてを VPC エンドポイント（PrivateLink）で
 フロントする場合にのみ絞り込んでください。そうでないのに絞り込むと、タスクは
-イメージを取得できず DSQL に到達できず、起動に失敗します。→ **Next**。
+イメージを取得できず DSQL に到達できず、起動に失敗します。
+`MskEgressCidr` を分けているのは意図的です — PostgreSQL ソースの cdc-stack はアプリ自身が
+MSK の **9098** ポート経由でシードし、そのアドレスは CDC VPC の*内部*に解決されるため、
+独立したパラメータを使い `HttpsEgressCidr` に統合してはいけません。→ **Next**。
 
 > [!TIP]
 > **どのサブネットを選ぶか。** ドロップダウンは（すべての VPC にわたる）**リージョン内の
@@ -560,6 +563,7 @@ Data Migration → Validation → Cut over）です。UI が表示されれば�
 | `SourceDbCidr` | no* | `""` | ソース DB の CIDR（SG id がない場合に使用）。*これ / `SourceDbSecurityGroupId` のいずれか一方が必須。 |
 | `SourceDbPort` | no | `3306` | ソース DB ポート — **`3306` は MySQL、`5432` は PostgreSQL**（PostgreSQL ソースは既定値を上書き）。 |
 | `HttpsEgressCidr` | no | `0.0.0.0/0` | タスクのアウトバウンド 443（AWS API: DSQL トークン、Secrets Manager、ECR、CloudWatch、Bedrock）および 5432（DSQL）の宛先 CIDR。**推奨: デフォルトの `0.0.0.0/0` のまま**にする — タスクは NAT/IGW 経由でパブリックな AWS エンドポイントに到達します。絞り込み（例: ご自身の VPC CIDR へ）は、それらのサービス*すべて*をインターフェース VPC エンドポイント（PrivateLink）でフロントする場合にのみ行ってください。エンドポイントなしで絞り込むとイメージの取得 / DSQL がブロックされ、タスクは起動に失敗します。 |
+| `MskEgressCidr` | no | `0.0.0.0/0` | タスクのアウトバウンド **9098**（MSK Serverless、IAM/TLS SASL）の宛先 CIDR。**PostgreSQL ソースでは必須** — PostgreSQL の cdc-stack は常に `SeedMode=External` なので、シーダー Lambda ではなく*アプリ自身*が CDC Kafka トピックを作成し開始オフセットをシードします。`HttpsEgressCidr` と分けているのは意図的です。あちらは*パブリック*な AWS エンドポイント向けで、MSK のブートストラップは CDC VPC 内部に解決されるため、`HttpsEgressCidr` を絞り込んでも CDC が黙って壊れないようにしています。デフォルトのままにするか、CDC インフラをデプロイする VPC の CIDR に絞り込んでください。 |
 | `EnableCognitoAuth` | no | `false` | ALB が Cognito (OIDC) で認証します。デフォルトは `false`: internal ALB（またはご自身の CIDR に絞り込んだ ALB）がアクセスゲートであり、運用者はすでに IAM/DB の権限を保持しているため、ログインは不要です。**`AllowedIngressCidr=0.0.0.0/0` の場合にのみ必須（強制されます）。** `true` の場合は `CognitoDomainPrefix` と `CognitoAdminEmail` の **両方**が必要です。 |
 | `AppDomainName` | no | `""` | ALB をフロントする DNS 名（証明書と一致する必要があります）。**空のままにすると** ALB 自身の DNS 名を Cognito のコールバックホストとして使用します — カスタムドメインや Route 53 レコードは不要です。 |
 | `CognitoDomainPrefix` | Cognito 時 | `""` | グローバルに一意な Cognito hosted-UI プレフィックス（`https://<prefix>.auth.<region>.amazoncognito.com`）。 |
@@ -720,6 +724,17 @@ aws cloudformation deploy \
   # $TEMPLATE_BUCKET: 上の AWS CLI デプロイのセクションで作成したステージング用バケット
   # (このテンプレートは CloudFormation のインラインアップロード上限 51,200 バイトを超えています)
 ```
+
+> [!IMPORTANT]
+> **PostgreSQL ソースで v0.1.503 以降にアップグレードする場合は、完全なテンプレート**
+> （上記の `--template-file deploy/cloudformation.yaml`）**が必要です** — 既存テンプレートに
+> 対する `ContainerImageUri` のみの上書きでは不十分です。PostgreSQL の cdc-stack は常に
+> アプリ自身が MSK の 9098 ポート経由でシードし、それにはテンプレートだけが付与できる
+> 2 つ（`MskEgress` セキュリティグループ規則と、タスクロールの `cdc-external-seed`
+> ポリシー）が必要です。テンプレートを更新するまでは、シードできない課金対象の MSK
+> Serverless クラスターを作成する代わりに、ツールが CDC インフラのデプロイを事前に
+> **拒否**します（メッセージに対処方法を含みます）。`MskEgressCidr` にはデフォルトが
+> あるため、新たな入力は不要です。MySQL はいずれの場合も影響を受けません。
 
 > [!WARNING]
 > コントロールプレーンは**単一タスク**として実行されるため、置き換え中は短い中断が

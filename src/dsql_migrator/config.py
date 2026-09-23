@@ -242,12 +242,35 @@ class AppConfig(BaseModel):
     cdc_host_subnet_cidr: str = Field(
         default="",
         description=(
-            "Subnet CIDR of the Lambda-free 'EC2 + MSK only' host, passed to the "
-            "cdc-stack HostSubnetCidr parameter so MSK Serverless admits this host on "
-            "9098 for the in-process (SeedMode=External) CDC seed. Set by the EC2 "
-            "user-data (resolved from the host's subnet at boot); empty everywhere "
-            "else (Fargate/local), which adds no ingress rule. Config key: "
+            "CIDR of the network the deploying app runs in, passed to the cdc-stack "
+            "HostSubnetCidr parameter so MSK Serverless admits this app on 9098 for the "
+            "in-process (SeedMode=External) CDC seed. Set explicitly by the EC2 "
+            "user-data (that host's own subnet, resolved at boot) and it ALWAYS wins "
+            "when set. When empty the app resolves the VPC CIDR block containing its "
+            "own address at CDC-deploy time instead "
+            "(ec2_metadata.discover_host_network -> cdc.msk_seed_admission) -- the VPC "
+            "block, not the subnet, so a Fargate task replaced into another "
+            "ServiceSubnetId keeps its MSK access. Stays empty for a Lambda-seeded "
+            "(MySQL) deploy and whenever the app cannot prove which network it is on, "
+            "which adds no ingress rule. Config key: "
             "DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR."
+        ),
+    )
+    cdc_msk_access: bool = Field(
+        default=False,
+        description=(
+            "True when THIS deployment's own template gave the runtime what the "
+            "in-process (SeedMode=External) CDC Kafka prep needs: outbound TCP 9098 to "
+            "MSK Serverless AND data-plane kafka-cluster IAM. A PostgreSQL cdc-stack is "
+            "ALWAYS SeedMode=External, so without both the app cannot create the topics "
+            "or seed the start offset and Start CDC fails with KafkaTimeoutError. Set to "
+            "'true' by deploy/cloudformation.yaml's task definition -- the same template "
+            "revision that ships the MskEgress rule and the TaskRole 'cdc-external-seed' "
+            "policy -- and by nothing else; the in-VPC EC2 host declares the same "
+            "capability with DSQL_MIGRATOR_CDC_SEED_MODE=external. It is a claim about "
+            "the DEPLOYMENT, not a user preference: setting it by hand changes only a "
+            "pre-flight verdict, never the missing rule or permissions. Config key: "
+            "DSQL_MIGRATOR_CDC_MSK_ACCESS."
         ),
     )
     log_level: str = Field(
@@ -494,6 +517,9 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> AppConfig:
         values["cdc_seed_mode"] = cdc_seed_mode.lower()
     if (cdc_host_cidr := _read(source, "CDC_HOST_SUBNET_CIDR")) is not None:
         values["cdc_host_subnet_cidr"] = cdc_host_cidr.strip()
+    if (msk_access := _read(source, "CDC_MSK_ACCESS")) is not None:
+        # Accept the common truthy spellings; anything else is treated as false.
+        values["cdc_msk_access"] = msk_access.lower() in ("1", "true", "yes", "on")
     if (log_level := _read(source, "LOG_LEVEL")) is not None:
         values["log_level"] = log_level.upper()
     if (row_diff := _read(source, "VALIDATE_ROW_DIFF_SAMPLE_SIZE")) is not None:

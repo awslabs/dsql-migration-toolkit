@@ -1585,3 +1585,74 @@ def test_wait_connector_running_fails_fast_on_expired_credentials() -> None:
         _wait(_StateSeqDeployer([err]))
     msg = str(ei.value)
     assert "Could not read" in msg and ("expired" in msg.lower() or "Credentials" in msg)
+
+
+# --- External seed: does the DEPLOYED stack actually admit this host? ----------
+# HostSubnetCidr (the cdc-stack's 9098 ingress source) is fixed when the stack is
+# CREATED and rides UsePreviousValue into the Start pass, so it cannot be added now.
+# Judging the deployed stack -- not local config -- is what covers an ADOPTED stack and
+# a stack created from a different host, where local config says nothing.
+
+
+def _run_start_external_with_admitted(admitted, own_ip, monkeypatch, seed_calls):
+    import dsql_migrator.core.ec2_metadata as _em
+
+    monkeypatch.setattr(_em, "local_ipv4", lambda: own_ip)
+    handle = _FakeHandle()
+    deployer = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]},
+        discovery_params={"HostSubnetCidr": admitted} if admitted is not None else None,
+    )
+    _run_start_external(handle, deployer, seed_calls)
+    return deployer
+
+
+def test_external_seed_refuses_only_when_the_stack_admits_a_different_network(
+    monkeypatch,
+) -> None:
+    import dsql_migrator.core.ec2_metadata as _em
+
+    # REFUSE: a non-empty admitted CIDR that does not contain this host. Raised before
+    # any Kafka I/O and before any submit_update, so nothing was created or changed --
+    # and the message names the remedy instead of a 60s KafkaTimeoutError.
+    monkeypatch.setattr(_em, "local_ipv4", lambda: "10.9.9.9")
+    handle = _FakeHandle()
+    deployer = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]},
+        discovery_params={"HostSubnetCidr": "10.0.0.0/16"},
+    )
+    seed_calls: list[dict] = []
+    with pytest.raises(CdcDeployError) as exc:
+        _run_start_external(handle, deployer, seed_calls)
+    msg = str(exc.value)
+    assert "10.0.0.0/16" in msg and "10.9.9.9" in msg
+    assert "No connectors were created" in msg
+    assert seed_calls == []  # refused BEFORE any Kafka I/O
+    assert deployer.updates == []
+
+
+@pytest.mark.parametrize(
+    "admitted,own_ip",
+    [
+        # Admitted: this host is inside the registered network.
+        ("10.0.0.0/16", "10.0.11.31"),
+        # Admitted by the cdc-stack's UNCONDITIONAL bastion rule -- refusing a
+        # default-VPC host that MSK genuinely admits would break a working setup.
+        ("10.0.0.0/16", "172.31.5.9"),
+        # Empty admitted value: fails OPEN. This keeps the documented manual-ingress
+        # maintainer flow and the laptop-deploy / in-VPC-start harness flow working.
+        ("", "10.9.9.9"),
+        (None, "10.9.9.9"),
+        # Unknown local address (a sandbox with no route): fails OPEN, never guesses.
+        ("10.0.0.0/16", None),
+    ],
+)
+def test_external_seed_proceeds_whenever_refusal_is_not_certain(
+    admitted, own_ip, monkeypatch
+) -> None:
+    seed_calls: list[dict] = []
+    deployer = _run_start_external_with_admitted(
+        admitted, own_ip, monkeypatch, seed_calls
+    )
+    assert len(seed_calls) == 1
+    assert len(deployer.updates) == 1

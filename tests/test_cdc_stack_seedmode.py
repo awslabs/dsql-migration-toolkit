@@ -157,3 +157,11 @@ def test_bastion_diagnostics_literal_cidr_unchanged() -> None:
     # The pre-existing bastion rule's hardcoded /20 must NOT be touched or widened.
     rule = _load_template()["Resources"]["ConnectorBastionDiagnosticsIngress"]
     assert rule["Properties"]["CidrIp"] == "172.31.0.0/20"
+    # It has NO Condition, so it exists in EVERY deployed cdc-stack -- which is why the
+    # Start-time reachability backstop must treat it as a real admission path. Pin the
+    # Python mirror against the template literal so the two cannot drift: if they did,
+    # the backstop would refuse a default-VPC host that MSK genuinely admits.
+    assert "Condition" not in rule
+    from dsql_migrator.core.cdc import CDC_BASTION_DIAGNOSTICS_CIDR
+
+    assert CDC_BASTION_DIAGNOSTICS_CIDR == rule["Properties"]["CidrIp"]

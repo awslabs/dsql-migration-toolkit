@@ -465,3 +465,152 @@ def test_verify_subnet_egress_empty_ids() -> None:
     ok, reason = verify_subnet_egress(_FakeEc2Verify([], []), [])
     assert ok is False
     assert "No subnet" in reason
+
+
+# --- discover_host_network: "which network am I on, inside THIS VPC" -----------
+# Fills the cdc-stack's HostSubnetCidr so ConnectorHostDiagnosticsIngress admits the
+# app on MSK 9098 for the in-process (SeedMode=External) CDC seed a PostgreSQL source
+# always uses.
+
+
+class _FakeEc2Host:
+    """Records the Filters it is handed, so the test can prove the VPC scoping."""
+
+    def __init__(self, enis, vpcs, *, raise_on=None):
+        self._enis = enis
+        self._vpcs = vpcs
+        self._raise_on = raise_on or set()
+        self.eni_filters = None
+        self.describe_eni_calls = 0
+
+    def describe_network_interfaces(self, **kw):
+        self.describe_eni_calls += 1
+        self.eni_filters = kw.get("Filters")
+        if "describe_network_interfaces" in self._raise_on:
+            raise RuntimeError("AccessDenied")
+        return {"NetworkInterfaces": self._enis}
+
+    def describe_vpcs(self, **kw):
+        if "describe_vpcs" in self._raise_on:
+            raise RuntimeError("AccessDenied")
+        return {"Vpcs": self._vpcs}
+
+
+def _vpc_two_blocks():
+    # A secondary-CIDR VPC: the ENCLOSING block must be picked, not the first one.
+    return [
+        {
+            "CidrBlock": "10.0.0.0/16",
+            "CidrBlockAssociationSet": [
+                {"CidrBlock": "10.0.0.0/16", "CidrBlockState": {"State": "associated"}},
+                {
+                    "CidrBlock": "100.64.0.0/16",
+                    "CidrBlockState": {"State": "associated"},
+                },
+            ],
+        }
+    ]
+
+
+def test_discover_host_network_filters_by_this_address_and_the_entered_vpc() -> None:
+    from dsql_migrator.core.ec2_metadata import HostNetwork, discover_host_network
+
+    fake = _FakeEc2Host(
+        [{"VpcId": "vpc-app", "SubnetId": "subnet-b"}], _vpc_two_blocks()
+    )
+    got = discover_host_network(fake, "vpc-app", ip="100.64.3.9")
+
+    # The VPC block CONTAINING the address -- picking blocks[0] would yield
+    # 10.0.0.0/16, an MSK ingress rule matching nobody.
+    assert got == HostNetwork(
+        ip="100.64.3.9",
+        vpc_id="vpc-app",
+        subnet_id="subnet-b",
+        cidr="100.64.0.0/16",
+    )
+    # The lookup MUST be scoped to the VPC being deployed into. A private IPv4 address
+    # is unique only within a VPC, so an unscoped lookup could match a foreign ENI and
+    # register somebody else's CIDR as a real MSK ingress source. A fake client ignores
+    # filters it is not asked about, so only this assertion can catch a dropped filter.
+    assert fake.eni_filters == [
+        {"Name": "addresses.private-ip-address", "Values": ["100.64.3.9"]},
+        {"Name": "vpc-id", "Values": ["vpc-app"]},
+    ]
+
+
+@pytest.mark.parametrize(
+    "enis,vpcs,raise_on,ip",
+    [
+        # Not in this VPC at all (the vpc-id filter matched nothing).
+        ([], _vpc_two_blocks(), None, "10.0.1.5"),
+        # Ambiguous: two ENIs carry the address -> refuse to guess.
+        (
+            [{"VpcId": "vpc-app", "SubnetId": "a"}, {"VpcId": "vpc-app", "SubnetId": "b"}],
+            _vpc_two_blocks(),
+            None,
+            "10.0.1.5",
+        ),
+        # The describes are denied / throttled.
+        (
+            [{"VpcId": "vpc-app", "SubnetId": "a"}],
+            _vpc_two_blocks(),
+            {"describe_network_interfaces"},
+            "10.0.1.5",
+        ),
+        (
+            [{"VpcId": "vpc-app", "SubnetId": "a"}],
+            _vpc_two_blocks(),
+            {"describe_vpcs"},
+            "10.0.1.5",
+        ),
+        # An address outside every associated block.
+        ([{"VpcId": "vpc-app", "SubnetId": "a"}], _vpc_two_blocks(), None, "192.168.1.9"),
+    ],
+)
+def test_discover_host_network_is_none_when_it_cannot_be_proven(
+    enis, vpcs, raise_on, ip
+) -> None:
+    # "Unknown" is a valid answer and must NEVER raise: the caller turns it into a
+    # blocker or a warning, and an exception here would break the deploy dialog.
+    from dsql_migrator.core.ec2_metadata import discover_host_network
+
+    fake = _FakeEc2Host(enis, vpcs, raise_on=raise_on)
+    assert discover_host_network(fake, "vpc-app", ip=ip) is None
+
+
+def test_discover_host_network_needs_a_vpc_and_an_address() -> None:
+    from dsql_migrator.core import ec2_metadata as _em
+
+    fake = _FakeEc2Host([{"VpcId": "vpc-app", "SubnetId": "a"}], _vpc_two_blocks())
+    # No VpcId entered yet -> nothing to scope to, and no AWS call is made.
+    assert _em.discover_host_network(fake, "", ip="10.0.1.5") is None
+    assert fake.describe_eni_calls == 0
+    # No resolvable local address (a sandbox with no route) -> same, still no call.
+    fake2 = _FakeEc2Host([{"VpcId": "vpc-app", "SubnetId": "a"}], _vpc_two_blocks())
+    import unittest.mock
+
+    with unittest.mock.patch.object(_em, "local_ipv4", return_value=None):
+        assert _em.discover_host_network(fake2, "vpc-app") is None
+    assert fake2.describe_eni_calls == 0
+
+
+def test_cidr_contains_is_total() -> None:
+    from dsql_migrator.core.ec2_metadata import cidr_contains
+
+    assert cidr_contains("10.0.0.0/16", "10.0.11.31") is True
+    assert cidr_contains("172.31.0.0/20", "172.31.5.9") is True
+    assert cidr_contains("172.31.0.0/20", "172.31.20.9") is False
+    # Never raises on junk -- it gates a refusal, so a crash would be worse than False.
+    for cidr, addr in (("", "10.0.0.1"), ("10.0.0.0/16", ""), ("nonsense", "x"), ("10.0.0.0/16", "::1")):
+        assert cidr_contains(cidr, addr) is False
+
+
+def test_local_ipv4_is_a_v4_address_or_none() -> None:
+    # No AWS, no metadata endpoint: a UDP connect to a link-local address just binds
+    # the socket, so this must return quickly and never raise anywhere it runs.
+    import ipaddress
+
+    from dsql_migrator.core.ec2_metadata import local_ipv4
+
+    got = local_ipv4()
+    assert got is None or isinstance(ipaddress.IPv4Address(got), ipaddress.IPv4Address)

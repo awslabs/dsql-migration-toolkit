@@ -33,6 +33,18 @@ class SourceInstanceInfo:
     # scope the CDC connector's egress-to-source rule to the source DB's SG instead
     # of falling back to an open ``0.0.0.0/0`` egress. Empty when unknown.
     security_group_ids: tuple[str, ...] = field(default_factory=tuple)
+    # The source's own network placement, from the SAME ``DBSubnetGroup`` this response
+    # already carries -- no extra API call and no extra IAM. Used to PREFILL the CDC
+    # infrastructure's VpcId (and the advanced connector subnets) and, more importantly, to
+    # warn when the VpcId an operator typed is not the source's: today a wrong VpcId is only
+    # discovered after ~20 minutes of MSK deployment. ``None``/empty when the host is not an
+    # RDS endpoint, the permission is missing, or the DB is not in a VPC.
+    vpc_id: Optional[str] = None
+    subnet_ids: tuple[str, ...] = field(default_factory=tuple)
+    db_subnet_group: Optional[str] = None
+    # The identifier the values were derived FROM, so the UI can show its provenance
+    # ("Derived from the source cluster <id>") rather than silently substituting a value.
+    db_identifier: Optional[str] = None
 
 
 def parse_db_identifier(endpoint: str) -> Optional[str]:
@@ -106,11 +118,16 @@ def describe_source_instance(
             if is_cluster_endpoint(endpoint)
             else instances[0]
         )
+        subnet_group = instance.get("DBSubnetGroup") or {}
         return SourceInstanceInfo(
             instance_class=instance.get("DBInstanceClass"),
             engine=instance.get("Engine"),
             engine_version=instance.get("EngineVersion"),
             security_group_ids=_active_security_group_ids(instance),
+            vpc_id=(subnet_group.get("VpcId") or None),
+            subnet_ids=_subnet_ids(subnet_group),
+            db_subnet_group=(subnet_group.get("DBSubnetGroupName") or None),
+            db_identifier=identifier,
         )
     except Exception:  # noqa: BLE001 - metadata is optional, never fatal
         return None
@@ -167,6 +184,39 @@ def _active_security_group_ids(instance: dict) -> tuple[str, ...]:
     return tuple(ids)
 
 
+def _subnet_ids(subnet_group: dict) -> tuple[str, ...]:
+    """The ``Available`` subnet ids of an RDS ``DBSubnetGroup``, order preserved.
+
+    Only ``Available`` subnets are usable placement targets; a subnet mid-modification
+    would be a poor default for the CDC connector. Falls back to any subnet carrying an id
+    when none report a status, mirroring :func:`_active_security_group_ids`.
+    """
+    ids: list[str] = []
+    for subnet in subnet_group.get("Subnets") or []:
+        subnet_id = (subnet.get("SubnetIdentifier") or "").strip()
+        status = (subnet.get("SubnetStatus") or "").strip().lower()
+        if subnet_id and status in ("", "available") and subnet_id not in ids:
+            ids.append(subnet_id)
+    return tuple(ids)
+
+
+def fetch_source_network(
+    rds_client: object, endpoint: str
+) -> Optional["SourceInstanceInfo"]:
+    """The source DB's VPC / subnets / subnet group (best effort, ``None`` on any gap).
+
+    A thin alias of :func:`describe_source_instance` named for the CDC call site, which
+    wants the network placement rather than the instance size. Same best-effort contract as
+    every other function here: a non-RDS host (self-managed PostgreSQL on EC2), a
+    cross-account endpoint, or a missing ``rds:DescribeDBInstances`` yields ``None`` and the
+    caller falls back to the manual field -- the flow this feature had before it existed.
+    """
+    info = describe_source_instance(rds_client, endpoint)
+    if info is None or not info.vpc_id:
+        return None
+    return info
+
+
 def fetch_source_security_group_id(
     rds_client: object, endpoint: str
 ) -> Optional[str]:
@@ -183,6 +233,40 @@ def fetch_source_security_group_id(
     return info.security_group_ids[0]
 
 
+def source_vpc_mismatch_warning(
+    entered_vpc_id: Optional[str], source: Optional["SourceInstanceInfo"]
+) -> Optional[str]:
+    """Warn when the CDC VpcId is not the source DB's VPC. ``None`` when it matches or is
+    unknowable.
+
+    Pure, so the decision is testable without AWS. A mismatch is NOT an error -- the CDC
+    pipeline may legitimately run in another VPC reached by peering, Transit Gateway or
+    PrivateLink -- but it is the shape of a typo, and today a wrong VpcId is only discovered
+    after roughly twenty minutes of MSK deployment, leaving a failed stack to clean up. So
+    this warns BEFORE Deploy and says what to confirm, rather than blocking.
+
+    Silent (``None``) whenever the answer is not known: no VpcId typed yet, or no source
+    network resolved (a non-RDS host, a cross-account endpoint, a missing
+    ``rds:DescribeDBInstances``). Same best-effort contract as the rest of this module --
+    absence of information must never manufacture a warning.
+    """
+    entered = (entered_vpc_id or "").strip()
+    if not entered or source is None:
+        return None
+    source_vpc = (source.vpc_id or "").strip()
+    if not source_vpc or source_vpc == entered:
+        return None
+    where = source.db_identifier or "the source database"
+    return (
+        f"The VPC you entered ({entered}) is not the source's: {where} is in "
+        f"{source_vpc}. That is valid only if this VPC can actually reach the source -- "
+        "VPC peering, a Transit Gateway attachment or PrivateLink, with routes and "
+        "security groups to match. If it cannot, the connectors will fail to reach the "
+        "source AFTER the MSK cluster has been created. Confirm the path, or use "
+        f"{source_vpc}."
+    )
+
+
 def build_rds_client(aws_profile: Optional[str], region: Optional[str]) -> object:
     """Build an RDS client from the shared session (honoring the global profile)."""
     from dsql_migrator.core.aws_session import build_session
@@ -196,6 +280,8 @@ __all__ = [
     "is_cluster_endpoint",
     "parse_rds_region",
     "describe_source_instance",
+    "fetch_source_network",
+    "source_vpc_mismatch_warning",
     "fetch_source_security_group_id",
     "build_rds_client",
 ]

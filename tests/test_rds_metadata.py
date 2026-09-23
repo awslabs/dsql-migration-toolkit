@@ -120,7 +120,10 @@ def test_describe_source_instance_for_instance_endpoint() -> None:
     )
     info = describe_source_instance(rds, _INSTANCE)
     assert info == SourceInstanceInfo(
-        instance_class="db.r6g.large", engine="mysql", engine_version="8.0.35"
+        instance_class="db.r6g.large", engine="mysql", engine_version="8.0.35",
+        # The identifier the lookup resolved, kept so the CDC screen can show the
+        # PROVENANCE of a derived VpcId rather than silently substituting a value.
+        db_identifier="myinstance",
     )
 
 
@@ -189,3 +192,85 @@ def test_fetch_source_security_group_id_best_effort_none() -> None:
     # An instance with no security groups also yields None (not an empty string).
     rds = _FakeRds(by_id={"myinstance": [{"DBInstanceClass": "db.t3.medium"}]})
     assert fetch_source_security_group_id(rds, _INSTANCE) is None
+
+
+def test_source_network_comes_from_the_response_the_tool_already_reads() -> None:
+    """VpcId/subnets are more fields off the SAME DescribeDBInstances response.
+
+    The tool already calls it to scope the CDC connector's egress rule to the source DB's
+    security group, so deriving the network placement needs no extra API call and no extra
+    IAM -- which is why the comment claiming "VpcId is the one input the tool cannot infer"
+    was wrong.
+    """
+    from dsql_migrator.core.rds_metadata import fetch_source_network
+
+    rds = _FakeRds(
+        by_id={
+            "myinstance": [{
+                "DBInstanceClass": "db.r6g.large",
+                "Engine": "postgres",
+                "VpcSecurityGroups": [
+                    {"VpcSecurityGroupId": "sg-0a2f", "Status": "active"}
+                ],
+                "DBSubnetGroup": {
+                    "DBSubnetGroupName": "workshop-base-dbsubnetgroup",
+                    "VpcId": "vpc-0ea46c134d00458bc",
+                    "Subnets": [
+                        {"SubnetIdentifier": "subnet-0fbf", "SubnetStatus": "Available"},
+                        {"SubnetIdentifier": "subnet-0dfe", "SubnetStatus": "Available"},
+                        # Mid-modification subnets are poor placement targets.
+                        {"SubnetIdentifier": "subnet-bad", "SubnetStatus": "Modifying"},
+                    ],
+                },
+            }],
+        }
+    )
+    info = fetch_source_network(rds, _INSTANCE)
+    assert info is not None
+    assert info.vpc_id == "vpc-0ea46c134d00458bc"
+    assert info.subnet_ids == ("subnet-0fbf", "subnet-0dfe")
+    assert info.db_subnet_group == "workshop-base-dbsubnetgroup"
+    assert info.db_identifier == "myinstance"
+    # The security group the tool already used is untouched.
+    assert info.security_group_ids == ("sg-0a2f",)
+
+    # Best effort: a DB with no subnet group (non-VPC / unresolvable) yields None, so the
+    # caller falls back to the manual field rather than inventing a value.
+    bare = _FakeRds(by_id={"myinstance": [{"Engine": "postgres"}]})
+    assert fetch_source_network(bare, _INSTANCE) is None
+
+
+def test_a_vpc_that_is_not_the_sources_warns_but_never_blocks() -> None:
+    """A mismatch is the shape of a typo, and today it costs ~20 minutes to discover.
+
+    The MSK cluster is created first, so a VpcId that cannot reach the source fails only
+    after the deploy is well under way, leaving a failed stack to tear down. It must warn
+    BEFORE Deploy -- and only warn, because peering / Transit Gateway / PrivateLink make a
+    different VPC legitimate.
+    """
+    from dsql_migrator.core.rds_metadata import (
+        SourceInstanceInfo,
+        source_vpc_mismatch_warning,
+    )
+
+    source = SourceInstanceInfo(
+        vpc_id="vpc-source", db_identifier="pgtest-ecommerce"
+    )
+
+    warning = source_vpc_mismatch_warning("vpc-elsewhere", source)
+    assert warning is not None
+    assert "vpc-elsewhere" in warning and "vpc-source" in warning
+    assert "pgtest-ecommerce" in warning, "the operator needs to know which source"
+    # It must name what to verify, not just object.
+    assert "peering" in warning.lower()
+
+    # Matching -> silent.
+    assert source_vpc_mismatch_warning("vpc-source", source) is None
+    # Unknowable -> silent. Absence of information must never manufacture a warning:
+    # a non-RDS host, a cross-account endpoint or a missing permission all land here.
+    assert source_vpc_mismatch_warning("vpc-elsewhere", None) is None
+    assert source_vpc_mismatch_warning(
+        "vpc-elsewhere", SourceInstanceInfo(vpc_id=None)
+    ) is None
+    assert source_vpc_mismatch_warning("", source) is None
+    assert source_vpc_mismatch_warning(None, source) is None

@@ -605,11 +605,17 @@ Parameters:
     Type: String
     Default: ""
     Description: >
-      Subnet CIDR of the Lambda-free "EC2 + MSK only" control-plane host, admitted
-      to MSK Serverless on 9098 so the app can do the CDC Kafka prep in-process
-      (SeedMode=External). Empty (default) adds NO ingress rule, so every Lambda-mode
-      / existing deploy is unchanged. Supplied by CIDR (not an SG id) to keep the
-      app-stack and cdc-stack teardown decoupled, mirroring the bastion rule.
+      CIDR of the network the deploying app runs in, admitted to MSK Serverless on
+      9098 so that app can do the CDC Kafka prep in-process (SeedMode=External,
+      which a PostgreSQL source always uses). The Lambda-free "EC2 + MSK only" host
+      supplies its own SUBNET CIDR (its user-data resolves it at boot); the Fargate
+      app supplies the VPC CIDR BLOCK that contains it, because its single task is
+      placed into a LIST of subnets and a replacement may land in a different one --
+      a subnet-scoped rule would then silently stop admitting it. Empty (default)
+      adds NO ingress rule, so every Lambda-mode / existing deploy is unchanged.
+      Supplied by CIDR (not an SG id) so the two stacks' teardown stays decoupled: a
+      cdc-stack rule referencing the app's SG would make an app-stack delete fail
+      with DependencyViolation while this stack still exists.
 
   KafkaConnectVersion:
     Type: String
@@ -985,10 +991,13 @@ Resources:
       CidrIp: 172.31.0.0/20
       Description: Diagnostics - bastion subnet to MSK Serverless (IAM/TLS 9098).
 
-  # Lambda-free ("EC2 + MSK only", SeedMode=External) reachability: admit the in-VPC
-  # EC2 control-plane host to MSK on 9098 so the app can do the CDC Kafka prep
-  # in-process (create topics + seed the offset) instead of the seeder Lambda. Like
-  # the bastion rule above, allowed BY CIDR (the host's subnet), NOT by SG id, so the
+  # SeedMode=External reachability: admit the DEPLOYING APP to MSK on 9098 so it can
+  # do the CDC Kafka prep in-process (create topics + seed the offset) instead of the
+  # seeder Lambda. Two hosts arrive here -- the Lambda-free in-VPC EC2 control-plane
+  # host (its own subnet CIDR, from its user-data) and the Fargate app for a
+  # PostgreSQL source, whose cdc-stack is ALWAYS SeedMode=External (the VPC CIDR block
+  # containing its task, so a task replaced into another of the service's subnets stays
+  # admitted). Like the bastion rule above, allowed BY CIDR, NOT by SG id, so the
   # two stacks' teardown stays decoupled (an SG-id cross-reference previously blocked
   # stack deletion). Condition-gated on a NON-EMPTY HostSubnetCidr with an empty
   # default, so every existing deploy (and every Lambda-mode deploy) templates

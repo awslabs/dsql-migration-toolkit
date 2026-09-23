@@ -846,6 +846,39 @@ def _run_external_seed(
 
     filled = dict(params.filled)
     current = discovery.current_parameters
+    # The 9098 ingress that lets THIS process reach MSK is created at INFRA-DEPLOY time
+    # from HostSubnetCidr (cdc-stack.yaml ConnectorHostDiagnosticsIngress, Condition
+    # HasHostSubnetCidr) and rides UsePreviousValue into this pass, so it cannot be
+    # added now. Judge the DEPLOYED stack, not local config: a session can Start CDC on
+    # an ADOPTED stack, or on one created from a different host, and without this the
+    # only symptom is a ~60s KafkaTimeoutError for what is really "this stack does not
+    # admit you". Refuse ONLY on a certainty -- a NON-EMPTY admitted CIDR that does not
+    # contain this address and is not the bastion range. An empty value or an unknown
+    # local address proceeds: the stack may admit this host by a hand-added rule or by
+    # SG membership (ConnectorSelfIngress), and the seed's own three-condition failure
+    # text still applies. A gate that wrongly refuses a working host is worse than the
+    # bug it guards.
+    from dsql_migrator.core.cdc import CDC_BASTION_DIAGNOSTICS_CIDR
+    from dsql_migrator.core.ec2_metadata import cidr_contains, local_ipv4
+
+    admitted = (current.get("HostSubnetCidr") or "").strip()
+    own_ip = local_ipv4()
+    if (
+        admitted
+        and own_ip
+        and not (
+            cidr_contains(admitted, own_ip)
+            or cidr_contains(CDC_BASTION_DIAGNOSTICS_CIDR, own_ip)
+        )
+    ):
+        raise CdcDeployError(
+            f"The cdc-stack '{stack_name}' admits {admitted} on MSK port 9098 and this "
+            f"app's address {own_ip} is not in it, so the in-process CDC seed could not "
+            "reach MSK. Start CDC from the host whose network the stack admits, or "
+            "delete the CDC infrastructure and deploy it again from this app so it "
+            "registers this network — HostSubnetCidr is set when the stack is created "
+            "and cannot be changed now. No connectors were created."
+        )
     # Prefer the freshly-computed connector params; fall back to the values the
     # stack already carries (the partition plan + MaxMessageBytes are set at create
     # and carried forward via UsePreviousValue, so they live on the deployed stack).

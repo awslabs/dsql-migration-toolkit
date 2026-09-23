@@ -84,13 +84,31 @@ def test_load_config_reads_cdc_seed_mode_lowercased() -> None:
 
 
 def test_load_config_cdc_host_subnet_cidr_defaults_empty() -> None:
-    # Only the EC2 host sets this; empty everywhere else -> no 9098 ingress rule.
+    # Only the EC2 host sets this explicitly; empty everywhere else, and an empty value
+    # means "resolve my own network at CDC-deploy time" (cdc.msk_seed_admission).
     assert load_config(env={}).cdc_host_subnet_cidr == ""
 
 
 def test_load_config_reads_cdc_host_subnet_cidr() -> None:
     config = load_config(env={f"{ENV_PREFIX}CDC_HOST_SUBNET_CIDR": " 172.31.64.0/20 "})
     assert config.cdc_host_subnet_cidr == "172.31.64.0/20"  # stripped
+
+
+def test_load_config_reads_cdc_msk_access() -> None:
+    # The deployment's attestation that it can do the in-process MSK seed a PostgreSQL
+    # cdc-stack requires. Fail-CLOSED: absent or unrecognized means "not equipped", so
+    # a stack that predates the grants is refused instead of billing for MSK first.
+    assert load_config(env={}).cdc_msk_access is False
+    for spelling in ("true", "TRUE", "1", "yes", "on"):
+        assert (
+            load_config(env={f"{ENV_PREFIX}CDC_MSK_ACCESS": spelling}).cdc_msk_access
+            is True
+        ), spelling
+    for spelling in ("false", "0", "no", "maybe"):
+        assert (
+            load_config(env={f"{ENV_PREFIX}CDC_MSK_ACCESS": spelling}).cdc_msk_access
+            is False
+        ), spelling
 
 
 def test_load_config_full_load_parallelism_defaults() -> None:

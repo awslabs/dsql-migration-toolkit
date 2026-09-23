@@ -47,7 +47,15 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Callable, Literal, Mapping, NamedTuple, Optional, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Literal,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+)
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -64,6 +72,9 @@ from dsql_migrator.core.models import (
     TargetConnectionConfig,
     Watermark,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, keeps this module boto3-free
+    from dsql_migrator.core.ec2_metadata import HostNetwork
 
 
 class CdcStatus(str, Enum):
@@ -544,6 +555,14 @@ CDC_DEFAULT_TOPIC_PREFIX = "dsqlcdc"
 CDC_DEFAULT_DLQ_TOPIC = "dsql-sink-dlq"
 CDC_SOURCE_SUFFIX = "-debezium-source"
 CDC_SINK_SUFFIX = "-dsql-sink"
+# The cdc-stack also creates an UNCONDITIONAL 9098 ingress for the maintainer's in-VPC
+# bastion (ConnectorBastionDiagnosticsIngress, deploy/cdc-stack/cdc-stack.yaml).
+# Mirrored here because it is a real admission path present in EVERY deployed
+# cdc-stack: the Start-time reachability backstop must treat it as a disjunct, or it
+# would refuse a default-VPC host that MSK actually admits -- a gate that wrongly
+# refuses a working setup is worse than the bug it guards. Never relied on: it matches
+# nothing in a 10.0.0.0/16 customer VPC.
+CDC_BASTION_DIAGNOSTICS_CIDR = "172.31.0.0/20"
 
 # --- CDC throughput smart defaults ------------------------------------------
 # The connector-scaling knobs (MSK Connect MCUs, sink tasks.max, per-table topic
@@ -1578,6 +1597,131 @@ class CdcInfraParams(BaseModel):
     filled: list[tuple[str, str]]
     stack_name: str
     topic_prefix: str
+
+
+@dataclass(frozen=True)
+class MskSeedAdmission:
+    """Can THIS deployment do the in-process (SeedMode=External) MSK seed?
+
+    ``cidr`` is what to pass as the cdc-stack ``HostSubnetCidr`` ("" when unknown or
+    not applicable). ``blocker`` is one actionable paragraph naming the fix, "" when
+    clear. ``warning`` is a non-blocking caution, ``note`` the calm info line.
+    """
+
+    cidr: str = ""
+    blocker: str = ""
+    warning: str = ""
+    note: str = ""
+
+
+def msk_seed_capability_blocker(*, cdc_seed_mode: str, cdc_msk_access: bool) -> str:
+    """Why this DEPLOYMENT cannot do the in-process MSK seed at all, or "".
+
+    The seed needs outbound TCP 9098 to MSK Serverless and data-plane
+    ``kafka-cluster`` IAM. Both are properties of the deployment TEMPLATE that the app
+    cannot observe at runtime (it holds no ``iam:Simulate*``, and
+    ``ec2:DescribeSecurityGroups`` belongs to the CdcDeployRole), so each equipped
+    template DECLARES the capability: the in-VPC EC2 stack through
+    ``DSQL_MIGRATOR_CDC_SEED_MODE=external`` (that template has carried both the 9098
+    egress rule and the kafka-cluster policy since it existed), the Fargate stack
+    through ``DSQL_MIGRATOR_CDC_MSK_ACCESS=true``. Neither set means a laptop, a
+    run-from-source host, or an app stack older than the release that added them --
+    exactly the population that would otherwise pay for an MSK Serverless cluster and
+    only then discover it cannot be seeded.
+    """
+    if cdc_seed_mode == "external" or cdc_msk_access:
+        return ""
+    return (
+        "A PostgreSQL cdc-stack is always created SeedMode=External: this app — not a "
+        "Lambda in your VPC — creates the Kafka topics and the CDC start offset itself, "
+        "over the MSK Serverless IAM endpoint on port 9098. That endpoint is private to "
+        "the cdc-stack VPC, and this deployment is not equipped to reach it: it has no "
+        "outbound rule on 9098 and no data-plane kafka-cluster permissions. Update the "
+        "app stack with the full deploy/cloudformation.yaml template — it adds the "
+        "MskEgress rule and the task role's cdc-external-seed policy — or use the in-VPC "
+        "EC2 deployment (deploy/cloudformation-ec2.yaml). Running from source on a host "
+        "inside the cdc-stack VPC instead? Set DSQL_MIGRATOR_CDC_SEED_MODE=external and "
+        "DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR to that host's subnet CIDR — that also "
+        "switches MySQL CDC on this host to the in-process seed."
+    )
+
+
+def msk_seed_admission(
+    *,
+    seed_mode: str,
+    cdc_seed_mode: str,
+    cdc_msk_access: bool,
+    configured_host_cidr: str,
+    vpc_id: str,
+    host: Optional["HostNetwork"] = None,
+) -> MskSeedAdmission:
+    """Decide the External-seed admission from facts only -- no probes, no AWS calls.
+
+    ``seed_mode`` is the RESOLVED mode for this migration (``_cdc_start_seed_mode``),
+    not the host default: keying on it rather than on the source engine is what keeps
+    the in-VPC EC2 host's MySQL migrations working, because that host runs the
+    in-process seed for MySQL too.
+
+    ``host`` is the result of :func:`ec2_metadata.discover_host_network` (None when the
+    caller could not prove which network it is on). ``vpc_id`` is the VPC the operator
+    is deploying the CDC infrastructure into.
+
+    Branch order is deliberate. An explicit ``configured_host_cidr`` wins FIRST and
+    engine-blind, so the EC2 host path is byte-identical to today and no discovery
+    runs. An in-VPC host that could not resolve its network gets a non-blocking warning
+    (it may already be admitted by a hand-added rule or the bastion rule, a documented
+    maintainer flow), while an attested Fargate deployment that cannot find itself in
+    ``vpc_id`` is BLOCKED -- nothing on the new cluster would admit it and Start CDC
+    would fail after the cluster was already billing.
+    """
+    if seed_mode != "external":
+        return MskSeedAdmission()
+    if configured_host_cidr:
+        return MskSeedAdmission(
+            cidr=configured_host_cidr,
+            note=(
+                f"The cdc-stack will admit {configured_host_cidr} on MSK port 9098, "
+                "from DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR."
+            ),
+        )
+    if blocker := msk_seed_capability_blocker(
+        cdc_seed_mode=cdc_seed_mode, cdc_msk_access=cdc_msk_access
+    ):
+        return MskSeedAdmission(blocker=blocker)
+    if host is None:
+        if cdc_seed_mode == "external":
+            # An in-VPC host said so itself; it may already be admitted out of band.
+            return MskSeedAdmission(
+                warning=(
+                    "This host runs the CDC Kafka prep in-process "
+                    "(DSQL_MIGRATOR_CDC_SEED_MODE=external), but the tool could not "
+                    "resolve the network MSK should admit on port 9098, so the "
+                    "cdc-stack is created with no ingress rule for it. Set "
+                    "DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR to this host's subnet CIDR and "
+                    "deploy again, or add the 9098 ingress to the connector security "
+                    "group yourself before Start CDC."
+                )
+            )
+        return MskSeedAdmission(
+            blocker=(
+                "The MSK Serverless endpoint that the PostgreSQL CDC seed uses only "
+                "admits a network this app registers when the CDC infrastructure is "
+                "created, and the tool could not find this app's network interface in "
+                f"{vpc_id}. Nothing on the new cluster would admit it, so Start CDC "
+                "would fail after the cluster was already billing. Deploy the CDC "
+                "infrastructure into the VPC this app runs in, or run the tool on a "
+                f"host inside {vpc_id}."
+            )
+        )
+    return MskSeedAdmission(
+        cidr=host.cidr,
+        note=(
+            f"The cdc-stack will admit this app's VPC range {host.cidr} "
+            f"({host.vpc_id}) on MSK port 9098, so the in-process CDC seed keeps "
+            "working if the task is replaced into another of the app's subnets. What "
+            "it may then do on the cluster is still gated by kafka-cluster IAM."
+        ),
+    )
 
 
 def build_cdc_infra_params(
