@@ -74,7 +74,7 @@ from dsql_migrator.core.models import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, keeps this module boto3-free
-    from dsql_migrator.core.ec2_metadata import HostNetwork
+    from dsql_migrator.core.ec2_metadata import HostLookup
 
 
 class CdcStatus(str, Enum):
@@ -1605,13 +1605,22 @@ class MskSeedAdmission:
 
     ``cidr`` is what to pass as the cdc-stack ``HostSubnetCidr`` ("" when unknown or
     not applicable). ``blocker`` is one actionable paragraph naming the fix, "" when
-    clear. ``warning`` is a non-blocking caution, ``note`` the calm info line.
+    clear. ``warning`` is a non-blocking caution, ``note`` the calm info line, and
+    ``header`` the notice header for a warning ("" = the generic one).
     """
 
     cidr: str = ""
     blocker: str = ""
     warning: str = ""
     note: str = ""
+    header: str = ""
+
+
+_SG_REMEDY = (
+    "add a TCP 9098 inbound rule for this app's range to the cdc-stack's "
+    "ConnectorSecurityGroup (CloudFormation -> the cdc-stack -> Resources) before you "
+    "run Start CDC"
+)
 
 
 def msk_seed_capability_blocker(*, cdc_seed_mode: str, cdc_msk_access: bool) -> str:
@@ -1653,7 +1662,7 @@ def msk_seed_admission(
     cdc_msk_access: bool,
     configured_host_cidr: str,
     vpc_id: str,
-    host: Optional["HostNetwork"] = None,
+    lookup: Optional["HostLookup"] = None,
 ) -> MskSeedAdmission:
     """Decide the External-seed admission from facts only -- no probes, no AWS calls.
 
@@ -1662,18 +1671,20 @@ def msk_seed_admission(
     the in-VPC EC2 host's MySQL migrations working, because that host runs the
     in-process seed for MySQL too.
 
-    ``host`` is the result of :func:`ec2_metadata.discover_host_network` (None when the
-    caller could not prove which network it is on). ``vpc_id`` is the VPC the operator
-    is deploying the CDC infrastructure into.
+    ``lookup`` is the result of :func:`ec2_metadata.discover_host_network` (None when
+    the caller did not even try). Its ``reason`` is what lets each distinct cause name
+    its own remedy -- collapsing all four into one message is what produced advice
+    ("deploy into the VPC this app runs in") that was circular for an app already in it.
+    ``vpc_id`` is the VPC the operator is deploying the CDC infrastructure into.
 
     Branch order is deliberate. An explicit ``configured_host_cidr`` wins FIRST and
-    engine-blind, so the EC2 host path is byte-identical to today and no discovery
-    runs. An in-VPC host that could not resolve its network gets a non-blocking warning
-    (it may already be admitted by a hand-added rule or the bastion rule, a documented
-    maintainer flow), while an attested Fargate deployment that cannot find itself in
-    ``vpc_id`` is BLOCKED -- nothing on the new cluster would admit it and Start CDC
-    would fail after the cluster was already billing.
+    engine-blind, so the EC2 host path is byte-identical and no discovery runs. The ONLY
+    blocker left is the capability blocker -- a template-declared certainty no
+    security-group rule can fix. An unresolved network WARNS, because the cdc-stack's
+    9098 ingress is a CIDR rule with an empty default: proceeding leaves the operator one
+    hand-added rule from a working stack, whereas blocking left no path at all.
     """
+    host = lookup.host if lookup else None
     if seed_mode != "external":
         return MskSeedAdmission()
     if configured_host_cidr:
@@ -1702,17 +1713,60 @@ def msk_seed_admission(
                     "group yourself before Start CDC."
                 )
             )
-        return MskSeedAdmission(
-            blocker=(
-                "The MSK Serverless endpoint that the PostgreSQL CDC seed uses only "
-                "admits a network this app registers when the CDC infrastructure is "
-                "created, and the tool could not find this app's network interface in "
-                f"{vpc_id}. Nothing on the new cluster would admit it, so Start CDC "
-                "would fail after the cluster was already billing. Deploy the CDC "
-                "infrastructure into the VPC this app runs in, or run the tool on a "
-                f"host inside {vpc_id}."
-            )
+        # WARNS, does not block. v0.1.503 blocked here and that was the wrong call: it
+        # made the release's headline capability 0% functional with NO workaround (the
+        # deploy was blocked with the env var unset, the Start was refused with it set),
+        # and it contradicted the sibling gate's own written policy -- refuse only on a
+        # certainty. There is no certainty here, and the cost of proceeding is bounded
+        # and RECOVERABLE: ConnectorHostDiagnosticsIngress is a CidrIp rule gated on a
+        # non-empty HostSubnetCidr, so an empty value simply omits it, leaving the
+        # operator one hand-added security-group rule from a working stack (and the
+        # Start-time backstop fails open on an empty admitted value). So the old
+        # justification -- "a cluster Start CDC could never use" -- was simply false.
+        reason = (lookup.reason if lookup else "") or "no-address"
+        ip = (lookup.ip if lookup else "") or ""
+        detail = (lookup.detail if lookup else "") or ""
+        where = (
+            f" (checked in {detail}, the target's region)"
+            if detail and reason == "not-found"
+            else ""
         )
+        lead = (
+            "A PostgreSQL cdc-stack is seeded by this app over the MSK Serverless IAM "
+            "endpoint on port 9098, so the new cluster has to admit the network this "
+            "app runs in. "
+        )
+        tail = (
+            " Without it the cdc-stack is created with NO ingress rule for this app and "
+            "Start CDC would time out reaching MSK, so you can still deploy — just "
+            + _SG_REMEDY
+            + ". The cluster estimated above is billed either way."
+        )
+        header, middle = {
+            "no-address": (
+                "The tool could not read this app's own IP address",
+                "The tool could not determine its own address.",
+            ),
+            "lookup-failed": (
+                "Could not look up this app's network",
+                f"The lookup failed: {detail}. Grant ec2:DescribeNetworkInterfaces and "
+                "ec2:DescribeVpcs to this app's task role and reopen this dialog.",
+            ),
+            "not-found": (
+                f"This app's network was not found in {vpc_id}",
+                f"This app's address is {ip}, but no single network interface with that "
+                f"address exists in {vpc_id}{where}. If {vpc_id} is not the VPC this "
+                "app runs in, enter the app's own VPC above.",
+            ),
+            "outside-vpc-cidr": (
+                "This app's address is outside the VPC's CIDR blocks",
+                f"This app's interface is in {vpc_id} but its address {ip} is not "
+                "inside any CIDR block associated with that VPC, so there is no range "
+                "to register. That should not normally happen — please report it with "
+                "the version in the footer.",
+            ),
+        }[reason]
+        return MskSeedAdmission(warning=lead + middle + tail, header=header)
     return MskSeedAdmission(
         cidr=host.cidr,
         note=(

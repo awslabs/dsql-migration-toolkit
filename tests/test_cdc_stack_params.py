@@ -1122,10 +1122,13 @@ def test_msk_seed_capability_blocker_accepts_either_attestation() -> None:
 
 def test_msk_seed_admission_decision_table() -> None:
     from dsql_migrator.core.cdc import msk_seed_admission
-    from dsql_migrator.core.ec2_metadata import HostNetwork
+    from dsql_migrator.core.ec2_metadata import HostLookup, HostNetwork
 
-    host = HostNetwork(
-        ip="10.0.11.31", vpc_id="vpc-app", subnet_id="subnet-a", cidr="10.0.0.0/16"
+    host = HostLookup(
+        host=HostNetwork(
+            ip="10.0.11.31", vpc_id="vpc-app", subnet_id="subnet-a", cidr="10.0.0.0/16"
+        ),
+        ip="10.0.11.31",
     )
 
     def decide(**kw):
@@ -1135,14 +1138,14 @@ def test_msk_seed_admission_decision_table() -> None:
             cdc_msk_access=True,
             configured_host_cidr="",
             vpc_id="vpc-app",
-            host=None,
+            lookup=None,
         )
         base.update(kw)
         return msk_seed_admission(**base)
 
     # 1. A Lambda-seeded deploy (MySQL on Fargate/local) is untouched: no CIDR, no
     #    notice of any kind -- so no ingress rule is created, exactly as before.
-    lam = decide(seed_mode="lambda", cdc_msk_access=False, host=host)
+    lam = decide(seed_mode="lambda", cdc_msk_access=False, lookup=host)
     assert (lam.cidr, lam.blocker, lam.warning, lam.note) == ("", "", "", "")
 
     # 2. An explicit DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR wins FIRST and engine-blind, so
@@ -1155,26 +1158,99 @@ def test_msk_seed_admission_decision_table() -> None:
     assert not ec2.blocker
 
     # 3. Fargate on an app stack that predates the grants: BLOCKED before any spend.
-    old = decide(cdc_msk_access=False, host=host)
+    old = decide(cdc_msk_access=False, lookup=host)
     assert old.cidr == ""  # nothing is registered
     assert "9098" in old.blocker
 
     # 4. Fargate, equipped, network resolved -> the VPC block is registered.
-    ok = decide(host=host)
+    ok = decide(lookup=host)
     assert ok.cidr == "10.0.0.0/16"
     assert not ok.blocker and not ok.warning
     assert "10.0.0.0/16" in ok.note
 
-    # 5. Fargate, equipped, but it cannot find itself in the entered VPC: nothing on the
-    #    new cluster would admit it, so refuse rather than bill for MSK first.
-    lost = decide(host=None)
+    # 5. Fargate, equipped, but it cannot find itself in the entered VPC: WARN, never
+    #    block. v0.1.503 blocked here and that left NO working path at all, while the
+    #    cdc-stack's 9098 ingress is a CIDR rule with an empty default -- so proceeding
+    #    leaves the operator one hand-added security-group rule from a working stack.
+    from dsql_migrator.core.ec2_metadata import HostLookup as _HL
+
+    lost = decide(lookup=_HL(reason="not-found", ip="10.0.11.31", detail="us-east-1"))
     assert lost.cidr == ""
-    assert "vpc-app" in lost.blocker
+    assert lost.blocker == ""  # NOT a block
+    assert "vpc-app" in lost.warning and "10.0.11.31" in lost.warning
+    assert "vpc-app" in lost.header
 
     # 6. An in-VPC host that set no CIDR and could not resolve its network: a
     #    NON-blocking warning. It may already be admitted by a hand-added rule (a
     #    documented maintainer flow), so a refusal here would break a working setup.
-    maint = decide(cdc_seed_mode="external", cdc_msk_access=False, host=None)
+    maint = decide(cdc_seed_mode="external", cdc_msk_access=False, lookup=None)
     assert maint.cidr == ""
     assert not maint.blocker
     assert "DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR" in maint.warning
+
+
+def test_msk_seed_admission_warns_per_reason_instead_of_blocking() -> None:
+    # v0.1.503 BLOCKED whenever the network could not be resolved, and all four causes
+    # rendered ONE 448-character message whose advice ("deploy into the VPC this app
+    # runs in") was circular for an app already in that VPC. Now each cause warns with
+    # its own header and its own interpolated fact, and Deploy stays enabled -- the
+    # cdc-stack's 9098 ingress is a CIDR rule with an empty default, so proceeding
+    # leaves the operator one hand-added security-group rule from a working stack.
+    from dsql_migrator.core.cdc import msk_seed_admission
+    from dsql_migrator.core.ec2_metadata import HostLookup
+
+    def decide(lookup):
+        return msk_seed_admission(
+            seed_mode="external",
+            cdc_seed_mode="lambda",
+            cdc_msk_access=True,
+            configured_host_cidr="",
+            vpc_id="vpc-app",
+            lookup=lookup,
+        )
+
+    cases = {
+        "no-address": HostLookup(reason="no-address"),
+        "lookup-failed": HostLookup(
+            reason="lookup-failed", ip="10.0.11.73", detail="AccessDeniedException"
+        ),
+        "not-found": HostLookup(
+            reason="not-found", ip="10.0.11.73", detail="us-east-1"
+        ),
+        "outside-vpc-cidr": HostLookup(reason="outside-vpc-cidr", ip="10.0.11.73"),
+    }
+    seen = {}
+    for reason, lookup in cases.items():
+        a = decide(lookup)
+        assert not a.blocker, reason  # NOT a block, for any reason
+        assert a.cidr == "", reason  # nothing is registered
+        # Every message names the action that actually works on Fargate.
+        assert "9098" in a.warning, reason
+        assert "ConnectorSecurityGroup" in a.warning, reason
+        assert a.header, reason
+        seen[reason] = (a.header, a.warning)
+
+    # DISTINCT, not merely non-empty: identical copy for four causes is the defect.
+    assert len({w for _h, w in seen.values()}) == 4
+    assert len({h for h, _w in seen.values()}) == 4
+    # ...and each carries the specific FACT that makes it diagnosable.
+    assert "10.0.11.73" in seen["not-found"][1] and "vpc-app" in seen["not-found"][1]
+    assert "us-east-1" in seen["not-found"][1]
+    assert "AccessDeniedException" in seen["lookup-failed"][1]
+    assert "vpc-app" in seen["not-found"][0]
+
+    # The Fargate copy must NOT advertise DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR: the
+    # Fargate template exposes no way to set it, so it would be advice the user cannot
+    # follow. The in-VPC host branch, where the env var IS settable, still names it.
+    for _h, w in seen.values():
+        assert "DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR" not in w
+    ec2 = msk_seed_admission(
+        seed_mode="external",
+        cdc_seed_mode="external",
+        cdc_msk_access=False,
+        configured_host_cidr="",
+        vpc_id="vpc-app",
+        lookup=None,
+    )
+    assert "DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR" in ec2.warning
+    assert not ec2.blocker

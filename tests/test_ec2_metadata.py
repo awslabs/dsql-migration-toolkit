@@ -9,6 +9,9 @@ DescribeSubnets / DescribeRouteTables responses. No AWS.
 
 from __future__ import annotations
 
+import json
+import logging
+
 import pytest
 
 from dsql_migrator.core.ec2_metadata import (
@@ -522,7 +525,8 @@ def test_discover_host_network_filters_by_this_address_and_the_entered_vpc() -> 
 
     # The VPC block CONTAINING the address -- picking blocks[0] would yield
     # 10.0.0.0/16, an MSK ingress rule matching nobody.
-    assert got == HostNetwork(
+    assert got.reason == ""
+    assert got.host == HostNetwork(
         ip="100.64.3.9",
         vpc_id="vpc-app",
         subnet_id="subnet-b",
@@ -575,7 +579,9 @@ def test_discover_host_network_is_none_when_it_cannot_be_proven(
     from dsql_migrator.core.ec2_metadata import discover_host_network
 
     fake = _FakeEc2Host(enis, vpcs, raise_on=raise_on)
-    assert discover_host_network(fake, "vpc-app", ip=ip) is None
+    got = discover_host_network(fake, "vpc-app", ip=ip)
+    assert got.host is None
+    assert got.reason  # never a bare "unknown": the stage that failed is named
 
 
 def test_discover_host_network_needs_a_vpc_and_an_address() -> None:
@@ -583,14 +589,14 @@ def test_discover_host_network_needs_a_vpc_and_an_address() -> None:
 
     fake = _FakeEc2Host([{"VpcId": "vpc-app", "SubnetId": "a"}], _vpc_two_blocks())
     # No VpcId entered yet -> nothing to scope to, and no AWS call is made.
-    assert _em.discover_host_network(fake, "", ip="10.0.1.5") is None
+    assert _em.discover_host_network(fake, "", ip="10.0.1.5").host is None
     assert fake.describe_eni_calls == 0
     # No resolvable local address (a sandbox with no route) -> same, still no call.
     fake2 = _FakeEc2Host([{"VpcId": "vpc-app", "SubnetId": "a"}], _vpc_two_blocks())
     import unittest.mock
 
     with unittest.mock.patch.object(_em, "local_ipv4", return_value=None):
-        assert _em.discover_host_network(fake2, "vpc-app") is None
+        assert _em.discover_host_network(fake2, "vpc-app").host is None
     assert fake2.describe_eni_calls == 0
 
 
@@ -605,12 +611,367 @@ def test_cidr_contains_is_total() -> None:
         assert cidr_contains(cidr, addr) is False
 
 
-def test_local_ipv4_is_a_v4_address_or_none() -> None:
-    # No AWS, no metadata endpoint: a UDP connect to a link-local address just binds
-    # the socket, so this must return quickly and never raise anywhere it runs.
-    import ipaddress
-
-    from dsql_migrator.core.ec2_metadata import local_ipv4
+def test_local_ipv4_returns_a_usable_vpc_address_or_none() -> None:
+    # This REPLACES an assertion that only checked the TYPE ("is None or parses as an
+    # IPv4Address"), which was satisfied by the 169.254.172.2 that v0.1.503 actually
+    # returned on Fargate. An environment-independent assertion cannot test an
+    # environment-dependent function, so assert the CLASS of answer instead: whatever
+    # this machine reports, it must never be an address a VPC interface cannot carry.
+    from dsql_migrator.core.ec2_metadata import _usable_vpc_ipv4, local_ipv4
 
     got = local_ipv4()
-    assert got is None or isinstance(ipaddress.IPv4Address(got), ipaddress.IPv4Address)
+    assert got is None or _usable_vpc_ipv4(got) == got
+
+
+# --- local_ipv4: never a wrong answer (the v0.1.503 Fargate regression) --------
+# v0.1.503 UDP-connect()ed to 169.254.170.2 and read getsockname(). On an awsvpc ECS
+# task that binds to the metadata/credentials link-local interface, so the app reported
+# 169.254.172.2 as "its own" address -- a well-formed WRONG answer, which then blocked
+# the PostgreSQL CDC deploy AND the Start. These tests fake the ENVIRONMENT, because an
+# environment-independent assertion cannot test an environment-dependent function.
+
+
+class _FakeSock:
+    """A socket double bound to a scripted address; records nothing is sent."""
+
+    def __init__(self, bound, *, fail=None):
+        self._bound = bound
+        self._fail = fail
+        self.connected_to = None
+        self.timeout = None
+
+    def settimeout(self, t):
+        self.timeout = t
+
+    def connect(self, addr):
+        self.connected_to = addr
+        if self._fail:
+            raise self._fail
+
+    def getsockname(self):
+        return (self._bound, 0)
+
+    def close(self):
+        return None
+
+
+def _socket_double(monkeypatch, bound, *, fail=None):
+    """Replace the module's `socket` global; returns the list of sockets constructed."""
+    from types import SimpleNamespace
+
+    from dsql_migrator.core import ec2_metadata as _em
+
+    made = []
+
+    def _factory(*_a, **_k):
+        sock = _FakeSock(bound, fail=fail)
+        made.append(sock)
+        return sock
+
+    monkeypatch.setattr(
+        _em,
+        "socket",
+        SimpleNamespace(AF_INET=2, SOCK_DGRAM=2, socket=_factory, timeout=TimeoutError),
+    )
+    return made
+
+
+@pytest.mark.parametrize(
+    "bound",
+    [
+        "169.254.172.2",  # the ECS metadata interface -- the reported bug
+        "169.254.170.2",
+        "169.254.169.254",
+        "127.0.0.1",
+        "0.0.0.0",
+        "224.0.0.1",
+        "240.1.2.3",
+    ],
+)
+def test_local_ipv4_never_returns_an_address_that_cannot_be_an_eni(
+    bound, monkeypatch
+) -> None:
+    from dsql_migrator.core.ec2_metadata import local_ipv4
+
+    monkeypatch.delenv("ECS_CONTAINER_METADATA_URI_V4", raising=False)
+    _socket_double(monkeypatch, bound)
+    assert local_ipv4() is None
+
+
+@pytest.mark.parametrize("bound", ["10.0.11.73", "100.64.3.9", "203.0.113.24"])
+def test_local_ipv4_keeps_an_address_that_could_be_an_eni(bound, monkeypatch) -> None:
+    # The paired positive half: without it, a guard that rejects EVERYTHING would pass
+    # the test above. 100.64.3.9 is the load-bearing row -- it is NOT `is_private`, so
+    # an `is_private` allowlist would create a brand-new false block.
+    from dsql_migrator.core.ec2_metadata import local_ipv4
+
+    monkeypatch.delenv("ECS_CONTAINER_METADATA_URI_V4", raising=False)
+    _socket_double(monkeypatch, bound)
+    assert local_ipv4() == bound
+
+
+def _fargate_task_doc(addr="10.0.11.73", *, mode="awsvpc", containers=2):
+    """A /task payload in the documented Fargate shape. NO top-level VPCID: AWS
+    documents that field for EC2 only, so a fixture carrying it would let an
+    implementation that reads it look green and still fail on Fargate."""
+    one = {
+        "Name": "app",
+        "Networks": [{"NetworkMode": mode, "IPv4Addresses": [addr]}],
+    }
+    return {"Cluster": "c", "TaskARN": "arn:...", "Containers": [one] * containers}
+
+
+class _FakeOpener:
+    def __init__(self, body=None, *, raises=None):
+        self._body = body
+        self._raises = raises
+        self.calls = []
+
+    def open(self, url, timeout=None):  # noqa: A002
+        self.calls.append((url, timeout))
+        if self._raises:
+            raise self._raises
+        payload = self._body
+
+        class _Resp:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *_e):
+                return False
+
+            def read(self_inner, n=None):
+                return payload[:n] if n else payload
+
+        return _Resp()
+
+
+def _opener_spy(monkeypatch, opener):
+    """Spy on build_opener; returns (builds, handler_names, proxies)."""
+    from dsql_migrator.core import ec2_metadata as _em
+
+    builds = []
+
+    def _build(*handlers):
+        builds.append(handlers)
+        return opener
+
+    monkeypatch.setattr(_em.urllib.request, "build_opener", _build)
+    return builds
+
+
+def test_local_ipv4_prefers_the_ecs_task_metadata_endpoint(monkeypatch) -> None:
+    from dsql_migrator.core.ec2_metadata import local_ipv4
+
+    monkeypatch.setenv(
+        "ECS_CONTAINER_METADATA_URI_V4", "http://169.254.170.2/v4/deadbeef"
+    )
+    opener = _FakeOpener(json.dumps(_fargate_task_doc()).encode())
+    builds = _opener_spy(monkeypatch, opener)
+    made = _socket_double(monkeypatch, "169.254.172.2")
+
+    assert local_ipv4() == "10.0.11.73"
+    # PREFERS it: the socket probe must not run at all, or the wrong answer survives.
+    assert made == []
+    url, timeout = opener.calls[0]
+    assert url == "http://169.254.170.2/v4/deadbeef/task"
+    assert timeout is not None and timeout <= 2
+    # ProxyHandler({}) is load-bearing: a plain urlopen honors http_proxy and would
+    # send this link-local GET to the proxy instead.
+    proxies = [getattr(h, "proxies", None) for h in builds[0]]
+    assert {} in proxies
+
+
+def test_local_ipv4_falls_back_to_the_socket_off_ecs(monkeypatch) -> None:
+    from dsql_migrator.core.ec2_metadata import local_ipv4
+
+    monkeypatch.delenv("ECS_CONTAINER_METADATA_URI_V4", raising=False)
+    opener = _FakeOpener(b"{}")
+    builds = _opener_spy(monkeypatch, opener)
+    _socket_double(monkeypatch, "10.0.11.73")
+
+    assert local_ipv4() == "10.0.11.73"
+    assert builds == []  # "not a blind link-local GET": the env var gates it
+    assert opener.calls == []
+
+
+@pytest.mark.parametrize(
+    "body,raises",
+    [
+        (None, OSError("timed out")),
+        (None, TimeoutError()),
+        (None, ValueError("unknown url type")),
+        (b"<html>not json", None),
+        (b"{}", None),
+        (b'{"Containers": []}', None),
+        (json.dumps(_fargate_task_doc(mode="bridge")).encode(), None),
+        (json.dumps(_fargate_task_doc("169.254.172.2")).encode(), None),
+        (
+            json.dumps(
+                {
+                    "Containers": [
+                        {"Networks": [{"NetworkMode": "awsvpc", "IPv4Addresses": ["10.0.1.5"]}]},
+                        {"Networks": [{"NetworkMode": "awsvpc", "IPv4Addresses": ["10.0.2.6"]}]},
+                    ]
+                }
+            ).encode(),
+            None,
+        ),
+    ],
+)
+def test_a_bad_metadata_endpoint_falls_back_instead_of_raising(
+    body, raises, monkeypatch
+) -> None:
+    # Asserting "did not raise" is not an assertion -- pytest reports an exception as a
+    # failure either way. Assert the FALLBACK VALUE, which pins both "didn't raise" and
+    # "actually fell through". ValueError is deliberately in the list: it is NOT an
+    # OSError, so narrowing the except clause would let it escape into the dialog.
+    from dsql_migrator.core.ec2_metadata import local_ipv4
+
+    monkeypatch.setenv(
+        "ECS_CONTAINER_METADATA_URI_V4", "http://169.254.170.2/v4/deadbeef"
+    )
+    _opener_spy(monkeypatch, _FakeOpener(body, raises=raises))
+    _socket_double(monkeypatch, "10.0.11.73")
+    assert local_ipv4() == "10.0.11.73"
+
+
+@pytest.mark.parametrize(
+    "base", ["http://metadata.example.com/v4/x", "file:///etc/passwd", "not a url at all"]
+)
+def test_ecs_task_metadata_refuses_a_non_literal_ip_base_before_any_io(
+    base, monkeypatch
+) -> None:
+    # Asserting only `is None` would pass even if the code performed the I/O first --
+    # and a DNS lookup runs BEFORE the socket timeout, so it is unbounded. Assert that
+    # no request was ATTEMPTED. `file://` matters too: build_opener installs a
+    # FileHandler by default, so a bad base could become a local file read.
+    from dsql_migrator.core.ec2_metadata import _ecs_task_ipv4
+
+    monkeypatch.setenv("ECS_CONTAINER_METADATA_URI_V4", base)
+    opener = _FakeOpener(json.dumps(_fargate_task_doc()).encode())
+    _opener_spy(monkeypatch, opener)
+    assert _ecs_task_ipv4() is None
+    assert opener.calls == []
+
+
+def test_ecs_task_metadata_is_not_consulted_off_ecs(monkeypatch) -> None:
+    from dsql_migrator.core.ec2_metadata import _ecs_task_ipv4
+
+    monkeypatch.delenv("ECS_CONTAINER_METADATA_URI_V4", raising=False)
+    opener = _FakeOpener(b"{}")
+    builds = _opener_spy(monkeypatch, opener)
+    assert _ecs_task_ipv4() is None
+    assert builds == [] and opener.calls == []
+
+
+def test_discover_host_network_reports_which_stage_failed(monkeypatch) -> None:
+    from dsql_migrator.core.ec2_metadata import HostNetwork, discover_host_network
+
+    monkeypatch.delenv("ECS_CONTAINER_METADATA_URI_V4", raising=False)
+
+    # (a) No usable own address -> 'no-address', and NOT ONE describe is spent on it.
+    #     This subcase drives the REAL discovery (no ip= injection), which is exactly
+    #     what the ip=-injected tests structurally cannot do.
+    _socket_double(monkeypatch, "169.254.172.2")
+    fake = _FakeEc2Host([{"VpcId": "vpc-app", "SubnetId": "a"}], _vpc_two_blocks())
+    got = discover_host_network(fake, "vpc-app")
+    assert (got.host, got.reason) == (None, "no-address")
+    assert fake.describe_eni_calls == 0
+
+    # (b) The DISCOVERED address reaches the filter, and 0 ENIs is 'not-found'.
+    _socket_double(monkeypatch, "10.0.11.73")
+    fake = _FakeEc2Host([], _vpc_two_blocks())
+    got = discover_host_network(fake, "vpc-app")
+    assert got.reason == "not-found" and got.ip == "10.0.11.73"
+    assert fake.eni_filters == [
+        {"Name": "addresses.private-ip-address", "Values": ["10.0.11.73"]},
+        {"Name": "vpc-id", "Values": ["vpc-app"]},
+    ]
+
+    # (c) A denied/throttled describe is its own stage, with the cause in `detail`.
+    fake = _FakeEc2Host(
+        [{"VpcId": "vpc-app", "SubnetId": "a"}],
+        _vpc_two_blocks(),
+        raise_on={"describe_network_interfaces"},
+    )
+    got = discover_host_network(fake, "vpc-app", ip="10.0.11.73")
+    assert got.reason == "lookup-failed" and "RuntimeError" in got.detail
+
+    # (d) An ENI matched but the address is outside every associated block.
+    fake = _FakeEc2Host([{"VpcId": "vpc-app", "SubnetId": "a"}], _vpc_two_blocks())
+    got = discover_host_network(fake, "vpc-app", ip="192.168.1.9")
+    assert got.reason == "outside-vpc-cidr" and got.ip == "192.168.1.9"
+
+    # (e) Happy path: the ENCLOSING block, not blocks[0].
+    fake = _FakeEc2Host(
+        [{"VpcId": "vpc-app", "SubnetId": "subnet-b"}], _vpc_two_blocks()
+    )
+    got = discover_host_network(fake, "vpc-app", ip="100.64.3.9")
+    assert got.reason == ""
+    assert got.host == HostNetwork(
+        ip="100.64.3.9", vpc_id="vpc-app", subnet_id="subnet-b", cidr="100.64.0.0/16"
+    )
+    # All four failure reasons must be distinguishable, or the copy collapses again.
+    assert len({"no-address", "not-found", "lookup-failed", "outside-vpc-cidr"}) == 4
+
+
+def test_discarding_an_unusable_address_is_logged_at_warning(monkeypatch, caplog) -> None:
+    # WARNING, not DEBUG: the deployed task definition hardcodes LOG_LEVEL=INFO with no
+    # CloudFormation parameter, so a DEBUG line is invisible on the stack that has the
+    # problem -- which is why diagnosing this cost a one-off Fargate task.
+    from dsql_migrator.core import ec2_metadata as _em
+
+    monkeypatch.delenv("ECS_CONTAINER_METADATA_URI_V4", raising=False)
+
+    _socket_double(monkeypatch, "169.254.172.2")
+    with caplog.at_level(logging.DEBUG, logger="dsql_migrator.core.ec2_metadata"):
+        assert _em.local_ipv4() is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "169.254.172.2" in warnings[0].getMessage()
+
+    # PAIRED: a good address logs NO warning, so the fix cannot be "always warn".
+    caplog.clear()
+    _socket_double(monkeypatch, "10.0.11.73")
+    with caplog.at_level(logging.DEBUG, logger="dsql_migrator.core.ec2_metadata"):
+        assert _em.local_ipv4() == "10.0.11.73"
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+    assert any("10.0.11.73" in r.getMessage() for r in caplog.records)
+
+    # A failed AWS lookup is logged too -- first line only, never a whole boto response.
+    caplog.clear()
+    fake = _FakeEc2Host(
+        [{"VpcId": "vpc-app", "SubnetId": "a"}],
+        _vpc_two_blocks(),
+        raise_on={"describe_network_interfaces"},
+    )
+    with caplog.at_level(logging.DEBUG, logger="dsql_migrator.core.ec2_metadata"):
+        _em.discover_host_network(fake, "vpc-app", ip="10.0.11.73")
+    hits = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(hits) == 1
+    msg = hits[0].getMessage()
+    assert "vpc-app" in msg and "RuntimeError" in msg and "\n" not in msg
+
+
+def test_an_unusable_address_never_reaches_the_eni_lookup(monkeypatch) -> None:
+    # Defense in depth for the WRITE side, independent of local_ipv4's own guard: the
+    # resolved CIDR becomes the cdc-stack's HostSubnetCidr, i.e. a real MSK 9098 ingress
+    # source. An address that cannot belong to a VPC interface must be rejected BEFORE
+    # the describe, so it can never be registered -- and so a caller that injects one
+    # (the ip= seam, or a future second discovery path) cannot bypass the check.
+    from dsql_migrator.core.ec2_metadata import discover_host_network
+
+    monkeypatch.delenv("ECS_CONTAINER_METADATA_URI_V4", raising=False)
+    for bad in ("169.254.172.2", "127.0.0.1", "224.0.0.1", "0.0.0.0"):
+        fake = _FakeEc2Host(
+            [{"VpcId": "vpc-app", "SubnetId": "subnet-b"}], _vpc_two_blocks()
+        )
+        got = discover_host_network(fake, "vpc-app", ip=bad)
+        assert (got.host, got.reason) == (None, "no-address"), bad
+        assert fake.describe_eni_calls == 0, bad  # not even one API call spent on it
+    # PAIRED: a usable injected address still goes all the way through, so the guard
+    # cannot degenerate into "reject everything".
+    fake = _FakeEc2Host([{"VpcId": "vpc-app", "SubnetId": "subnet-b"}], _vpc_two_blocks())
+    assert discover_host_network(fake, "vpc-app", ip="100.64.3.9").host is not None
+    assert fake.describe_eni_calls == 1

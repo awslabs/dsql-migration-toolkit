@@ -50,6 +50,7 @@ RUNNING) to avoid burning quota on retries.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -81,6 +82,8 @@ from dsql_migrator.core.cdc_stack_deployer import (  # noqa: F401
     CdcStackDiscovery,
     build_cdc_stack_deployer,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 # Each lifecycle operation is a list of ordered stages, surfaced as a
@@ -858,14 +861,33 @@ def _run_external_seed(
     # SG membership (ConnectorSelfIngress), and the seed's own three-condition failure
     # text still applies. A gate that wrongly refuses a working host is worse than the
     # bug it guards.
+    from dsql_migrator.config import load_config
     from dsql_migrator.core.cdc import CDC_BASTION_DIAGNOSTICS_CIDR
     from dsql_migrator.core.ec2_metadata import cidr_contains, local_ipv4
 
     admitted = (current.get("HostSubnetCidr") or "").strip()
     own_ip = local_ipv4()
+    # An operator who SET DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR to exactly what the stack
+    # admits has attested to this host's network, and that attestation outranks an
+    # address heuristic. The in-VPC EC2 deployment (its user-data sets the value at
+    # boot) and scripts/run_pg_cdc_e2e.py both rely on it, so without this disjunct the
+    # gate could refuse a live-verified path -- and a wrong-but-routable own address
+    # (bridge-mode ECS, a multi-homed VPN laptop, a multi-ENI instance) is exactly the
+    # case the address class guard in ec2_metadata cannot catch.
+    try:
+        attested = (load_config().cdc_host_subnet_cidr or "").strip()
+    except Exception:  # noqa: BLE001 - a config problem must not gate the seed
+        attested = ""
+    _LOGGER.debug(
+        "external-seed admission: admitted=%r own_ip=%r attested=%r",
+        admitted,
+        own_ip,
+        attested,
+    )
     if (
         admitted
         and own_ip
+        and admitted != attested
         and not (
             cidr_contains(admitted, own_ip)
             or cidr_contains(CDC_BASTION_DIAGNOSTICS_CIDR, own_ip)
@@ -874,10 +896,11 @@ def _run_external_seed(
         raise CdcDeployError(
             f"The cdc-stack '{stack_name}' admits {admitted} on MSK port 9098 and this "
             f"app's address {own_ip} is not in it, so the in-process CDC seed could not "
-            "reach MSK. Start CDC from the host whose network the stack admits, or "
-            "delete the CDC infrastructure and deploy it again from this app so it "
-            "registers this network — HostSubnetCidr is set when the stack is created "
-            "and cannot be changed now. No connectors were created."
+            "reach MSK. Add a TCP 9098 inbound rule for this app's range to the "
+            f"cdc-stack's ConnectorSecurityGroup (CloudFormation -> {stack_name} -> "
+            "Resources) and start again, or start CDC from the host whose network the "
+            "stack admits. HostSubnetCidr itself is fixed when the stack is created, so "
+            "changing THAT needs a delete and re-deploy. No connectors were created."
         )
     # Prefer the freshly-computed connector params; fall back to the values the
     # stack already carries (the partition plan + MaxMessageBytes are set at create

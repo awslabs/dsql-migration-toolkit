@@ -23,11 +23,18 @@ is NOT recognized as NAT egress, so such VPCs fall back to manual subnet entry
 from __future__ import annotations
 
 import ipaddress
+import json
+import logging
+import os
 import socket
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Optional
+from urllib.parse import urlsplit
 
 from dsql_migrator.core.aws_session import BotoSessionLike, build_session
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class Ec2MetadataError(RuntimeError):
@@ -496,36 +503,160 @@ def cidr_contains(cidr: str, addr: str) -> bool:
         return False
 
 
-def local_ipv4() -> Optional[str]:
-    """This process's primary IPv4 address, or None. No AWS call, no metadata endpoint.
+_UNUSABLE = (
+    "a link-local, loopback, multicast or reserved address can never be a VPC ENI address"
+)
 
-    A UDP socket is "connected" to the task-metadata link-local address: nothing is
-    sent -- the kernel just binds the socket to the interface that owns the route --
-    so ``getsockname()`` returns the address the host actually uses, which on an
-    awsvpc Fargate task and on EC2 is the ENI's private IP. 169.254.170.2 is chosen
-    because it is on-link by construction in a Fargate task namespace (the SDK
-    reaches the credentials endpoint there) and link-local on EC2 and a laptop --
-    unlike an off-link RFC1918 target, which needs a default route the subnet may not
-    have. Deliberately NOT an HTTP GET to that endpoint: AWS documents the task
-    metadata ``Networks`` entry with one sentence and no subfield spec, and a blind
-    link-local GET is not fast-failing. Not ``gethostbyname(gethostname())`` either:
-    that raises ``gaierror`` on macOS.
+
+def _usable_vpc_ipv4(raw: object) -> Optional[str]:
+    """``raw`` as a dotted quad that COULD be a VPC ENI address, else None.
+
+    A denylist of address CLASSES, deliberately NOT an allowlist: ``is_private`` is
+    False for 100.64.0.0/10 (a legal VPC CIDR, and the one this module's own tests
+    use) and ``is_global`` is False for every legal VPC address, so either allowlist
+    form would reject good answers and create a new false block.
     """
+    try:
+        addr = ipaddress.IPv4Address(str(raw).strip())
+    except (ValueError, AttributeError, TypeError):
+        return None
+    if (
+        addr.is_link_local
+        or addr.is_loopback
+        or addr.is_unspecified
+        or addr.is_multicast
+        or addr.is_reserved
+    ):
+        return None
+    return str(addr)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """The metadata endpoint never redirects; a chain would multiply the timeout."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+def _ecs_task_ipv4(*, timeout: float = 1.0) -> Optional[str]:
+    """The task ENI's private IPv4 from the ECS task metadata endpoint, or None.
+
+    Gated on ``ECS_CONTAINER_METADATA_URI_V4``, which AWS injects into every container
+    from Fargate platform 1.4.0 on, so this is never a blind link-local GET (the
+    objection that kept v0.1.503 on the socket probe). Requires EXACTLY ONE distinct
+    usable address across all ``awsvpc`` entries -- never "the first" -- so a
+    bridge/host-mode entry, the pause container or any future second ENI yields an
+    honest None instead of a coin flip.
+    """
+    base = (os.environ.get("ECS_CONTAINER_METADATA_URI_V4") or "").strip()
+    if not base:
+        return None
+    url = base.rstrip("/") + "/task"
+    try:
+        parts = urlsplit(url)
+        if parts.scheme != "http" or not parts.hostname:
+            raise ValueError(f"not a plain-http metadata URL: {base!r}")
+        # A literal IP only: no DNS (getaddrinfo runs BEFORE the socket timeout, so a
+        # slow resolver would blow the budget) and no file:// / ftp:// handler.
+        ipaddress.ip_address(parts.hostname)
+        # ProxyHandler({}) is load-bearing: a plain urlopen honors http_proxy and
+        # would send this link-local GET to the proxy.
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _NoRedirect()
+        )
+        with opener.open(url, timeout=timeout) as resp:
+            # Bounded read: the documented /task payload is ~2 KB and ECS allows at
+            # most 10 containers per task, so 64 KiB cannot truncate a real response.
+            doc = json.loads(resp.read(65536).decode("utf-8", "replace"))
+        found: set[str] = set()
+        for container in doc.get("Containers") or []:
+            for net in container.get("Networks") or []:
+                if str(net.get("NetworkMode") or "").lower() != "awsvpc":
+                    continue
+                for raw in net.get("IPv4Addresses") or []:
+                    if addr := _usable_vpc_ipv4(raw):
+                        found.add(addr)
+        if len(found) != 1:
+            _LOGGER.warning(
+                "ECS task metadata gave %d usable awsvpc IPv4 addresses, not 1",
+                len(found),
+            )
+            return None
+        return found.pop()
+    except Exception as exc:  # noqa: BLE001 - ValueError is NOT an OSError
+        _LOGGER.warning(
+            "Could not read this task's own IP from %s (%s: %s)",
+            url,
+            type(exc).__name__,
+            (str(exc).splitlines() or [""])[0][:160],
+        )
+        return None
+
+
+def local_ipv4() -> Optional[str]:
+    """This process's own VPC IPv4 address, or None. Never a wrong answer.
+
+    An awsvpc ECS task has a SEPARATE link-local interface for the metadata /
+    credentials endpoint, so the UDP-``connect()`` probe below binds to THAT interface
+    and reports its 169.254.x.x address -- not the task ENI's. v0.1.503 shipped that
+    wrong answer because the target was chosen for being "on-link by construction" in
+    a Fargate task namespace; being on-link THERE is precisely what selects the wrong
+    interface (``connect()`` on SOCK_DGRAM sends nothing, so the route lookup is the
+    whole mechanism, and the off-link RFC1918 target it avoided is the one that works).
+    Hence two layers:
+
+    1. On ECS (``ECS_CONTAINER_METADATA_URI_V4`` set) ask the platform, which reports
+       the ENI address authoritatively.
+    2. Otherwise the UDP probe, which is correct on EC2 and on a laptop.
+
+    Both answers pass through :func:`_usable_vpc_ipv4`, so an address that can never be
+    a VPC ENI address becomes None. "Unknown" is a valid answer here and a plausible
+    wrong one never is: two callers act on this, and the Start-CDC backstop's fail-open
+    depends on an honest None.
+    """
+    if addr := _ecs_task_ipv4():
+        _LOGGER.debug("local_ipv4: ECS task metadata -> %s", addr)
+        return addr
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(0.5)
         sock.connect(("169.254.170.2", 1))  # link-local; no packet is sent
-        return sock.getsockname()[0] or None
-    except OSError:
+        raw = sock.getsockname()[0]
+    except OSError as exc:
+        _LOGGER.debug("local_ipv4: UDP probe failed (%s: %s)", type(exc).__name__, exc)
         return None
     finally:
         sock.close()
+    addr = _usable_vpc_ipv4(raw)
+    if addr is None:
+        _LOGGER.warning("local_ipv4: discarded %s -- %s", raw, _UNUSABLE)
+    else:
+        _LOGGER.debug("local_ipv4: UDP probe -> %s", addr)
+    return addr
+
+
+@dataclass(frozen=True)
+class HostLookup:
+    """The result of resolving this process's network, with WHY when it failed.
+
+    ``reason`` is "" on success and otherwise one of ``no-address`` (could not learn
+    our own IP, or the one we learned can never be an ENI address), ``lookup-failed``
+    (an AWS describe was denied / throttled / mis-regioned), ``not-found`` (no single
+    ENI carries the address in this VPC) or ``outside-vpc-cidr``. Collapsing these into
+    a bare ``None`` is what made four different causes render identical copy, and left
+    the operator with advice that did not match their situation.
+    """
+
+    host: Optional[HostNetwork] = None
+    reason: str = ""
+    ip: str = ""
+    detail: str = ""
 
 
 def discover_host_network(
     ec2_client: BotoSessionLike, vpc_id: str, *, ip: Optional[str] = None
-) -> Optional[HostNetwork]:
-    """This process's network INSIDE ``vpc_id``, or ``None`` when it cannot be proven.
+) -> HostLookup:
+    """This process's network INSIDE ``vpc_id``, or WHY it cannot be proven.
 
     Used to fill the cdc-stack's ``HostSubnetCidr`` so ConnectorHostDiagnosticsIngress
     admits this app on MSK 9098 for the in-process (SeedMode=External) CDC seed. Needs
@@ -540,14 +671,18 @@ def discover_host_network(
     refusing to answer. A host that is not in ``vpc_id`` therefore resolves to
     ``None``, which is correct -- the MSK bootstrap is private to that VPC.
 
-    Returns ``None`` -- NEVER raises -- for every uncertain answer: no local address,
-    no matching ENI, a denied/throttled describe, or an address outside every block of
-    the VPC. The caller decides what "unknown" means; this never guesses.
+    Always returns a :class:`HostLookup` and NEVER raises. ``host`` is None for every
+    uncertain answer, with ``reason`` naming the stage that failed so the caller can say
+    something the operator can act on. The caller decides what "unknown" means; this
+    never guesses. ``ip`` is filtered through :func:`_usable_vpc_ipv4` even when it was
+    injected, so an address that cannot belong to a VPC interface never reaches the ENI
+    filter -- and can never be registered as an MSK ingress source.
     Blocking I/O: callers MUST run it off the event loop.
     """
-    addr = ip or local_ipv4()
+    region = getattr(getattr(ec2_client, "meta", None), "region_name", "") or ""
+    addr = _usable_vpc_ipv4(ip or local_ipv4() or "")
     if not addr or not vpc_id:
-        return None
+        return HostLookup(reason="no-address", detail=region)
     try:
         resp = ec2_client.describe_network_interfaces(  # type: ignore[attr-defined]
             Filters=[
@@ -556,19 +691,35 @@ def discover_host_network(
             ]
         )
         enis = resp.get("NetworkInterfaces") or []
-        if len(enis) != 1:
-            return None  # 0 = not in this VPC; >1 would be ambiguous
+        if len(enis) != 1:  # 0 = not in this VPC; >1 would be ambiguous
+            return HostLookup(reason="not-found", ip=addr, detail=region)
         for block in _vpc_cidr_blocks(ec2_client, vpc_id):
             if cidr_contains(block, addr):
-                return HostNetwork(
-                    ip=addr,
-                    vpc_id=vpc_id,
-                    subnet_id=enis[0].get("SubnetId") or "",
-                    cidr=block,
+                _LOGGER.debug(
+                    "host network resolved: ip=%s vpc=%s subnet=%s cidr=%s",
+                    addr,
+                    vpc_id,
+                    enis[0].get("SubnetId"),
+                    block,
                 )
-    except Exception:  # noqa: BLE001 - "unknown" is a valid answer; never raise
-        return None
-    return None
+                return HostLookup(
+                    host=HostNetwork(
+                        ip=addr,
+                        vpc_id=vpc_id,
+                        subnet_id=enis[0].get("SubnetId") or "",
+                        cidr=block,
+                    ),
+                    ip=addr,
+                )
+    except Exception as exc:  # noqa: BLE001 - "unknown" is valid; never raise
+        detail = f"{type(exc).__name__}: {(str(exc).splitlines() or [''])[0][:160]}" + (
+            f" (region {region})" if region else ""
+        )
+        _LOGGER.warning(
+            "Could not resolve this host's network in %s: %s", vpc_id, detail
+        )
+        return HostLookup(reason="lookup-failed", ip=addr, detail=detail)
+    return HostLookup(reason="outside-vpc-cidr", ip=addr, detail=region)
 
 
 def _find_free_subnet_cidrs(
@@ -743,6 +894,7 @@ __all__ = [
     "SubnetSelection",
     "CdcNetworkDiagnosis",
     "HostNetwork",
+    "HostLookup",
     "build_ec2_client",
     "select_connector_subnets",
     "diagnose_cdc_network",

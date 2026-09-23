@@ -1656,3 +1656,116 @@ def test_external_seed_proceeds_whenever_refusal_is_not_certain(
     )
     assert len(seed_calls) == 1
     assert len(deployer.updates) == 1
+
+
+# --- The DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR escape hatch, end to end -----------
+# v0.1.503 shipped this chain broken while EVERY link passed in isolation: the dialog
+# was fine, the param plumbing was fine, the capability gate was fine -- and Start CDC
+# refused, because the backstop compared the admitted CIDR against a link-local address
+# that local_ipv4() wrongly reported as the app's own. So this runs the whole chain, and
+# deliberately does NOT monkeypatch local_ipv4: it patches the module's `socket` global
+# so the REAL function executes. Patching local_ipv4 is what let the bug through.
+
+
+def _link_local_socket(monkeypatch, bound="169.254.172.2"):
+    from types import SimpleNamespace
+
+    from dsql_migrator.core import ec2_metadata as _em
+
+    class _S:
+        def settimeout(self, _t):
+            return None
+
+        def connect(self, _a):
+            return None
+
+        def getsockname(self):
+            return (bound, 0)
+
+        def close(self):
+            return None
+
+    monkeypatch.delenv("ECS_CONTAINER_METADATA_URI_V4", raising=False)
+    monkeypatch.setattr(
+        _em,
+        "socket",
+        SimpleNamespace(AF_INET=2, SOCK_DGRAM=2, socket=lambda *_a, **_k: _S()),
+    )
+
+
+def test_the_configured_host_cidr_escape_hatch_works_end_to_end(monkeypatch) -> None:
+    from dsql_migrator.core.cdc import msk_seed_admission
+
+    cidr = "10.0.11.0/24"
+
+    # Link 1: an explicitly configured CIDR is accepted and is NOT blocked.
+    adm = msk_seed_admission(
+        seed_mode="external",
+        cdc_seed_mode="lambda",
+        cdc_msk_access=True,
+        configured_host_cidr=cidr,
+        vpc_id="vpc-app",
+        lookup=None,
+    )
+    assert adm.cidr == cidr and adm.blocker == ""
+
+    # Link 2: it reaches the cdc-stack parameter that arms the 9098 ingress.
+    from tests.test_cdc_stack_params import _infra  # noqa: PLC0415
+
+    assert dict(_infra(seed_mode="external", host_subnet_cidr=cidr).filled)[
+        "HostSubnetCidr"
+    ] == cidr
+
+    # Link 3: Start CDC proceeds. With the REAL local_ipv4 over a link-local bind this
+    # raised CdcDeployError at 0.1.503 ("this app's address 169.254.172.2 is not in it").
+    _link_local_socket(monkeypatch)
+    handle = _FakeHandle()
+    deployer = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]},
+        discovery_params={"HostSubnetCidr": cidr},
+    )
+    seed_calls: list[dict] = []
+    _run_start_external(handle, deployer, seed_calls)
+    # Counts, not "no exception": a no-raise assertion cannot tell "proceeded" from
+    # "returned early".
+    assert len(seed_calls) == 1
+    assert len(deployer.updates) == 1
+
+
+def test_external_seed_honours_an_explicitly_configured_host_cidr(monkeypatch) -> None:
+    # A wrong-but-ROUTABLE own address (bridge-mode ECS, a multi-homed VPN laptop, a
+    # multi-ENI instance) is the case the address-class guard cannot catch. An operator
+    # who set the env var to exactly what the stack admits has attested to this host's
+    # network, and that attestation outranks an address heuristic.
+    from types import SimpleNamespace
+
+    import dsql_migrator.config as _config
+    import dsql_migrator.core.ec2_metadata as _em
+
+    monkeypatch.setattr(_em, "local_ipv4", lambda: "172.17.0.5")
+
+    def _cfg(cidr):
+        return lambda *_a, **_k: SimpleNamespace(cdc_host_subnet_cidr=cidr)
+
+    monkeypatch.setattr(_config, "load_config", _cfg("10.0.11.0/24"))
+    deployer = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]},
+        discovery_params={"HostSubnetCidr": "10.0.11.0/24"},
+    )
+    seed_calls: list[dict] = []
+    _run_start_external(_FakeHandle(), deployer, seed_calls)
+    assert len(seed_calls) == 1 and len(deployer.updates) == 1
+
+    # PAIRED negative -- the trap: without it, `admitted != attested` could be replaced
+    # by an unconditional "never refuse" and this test would still pass, silently
+    # deleting the gate that protects an adopted stack.
+    monkeypatch.setattr(_config, "load_config", _cfg(""))
+    deployer2 = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]},
+        discovery_params={"HostSubnetCidr": "10.0.11.0/24"},
+    )
+    with pytest.raises(CdcDeployError) as exc:
+        _run_start_external(_FakeHandle(), deployer2, [])
+    # The refusal leads with the CHEAP remedy, not "delete and re-deploy".
+    assert "ConnectorSecurityGroup" in str(exc.value)
+    assert deployer2.updates == []

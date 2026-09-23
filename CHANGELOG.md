@@ -5,6 +5,49 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.504
+
+### Fixed
+
+- **PostgreSQL CDC still could not be started from the Fargate deployment: the app read the
+  wrong IP address for itself.** v0.1.503 resolved the network the cdc-stack must admit on
+  MSK port 9098 by UDP-`connect()`ing a socket to a link-local address and reading back the
+  address the kernel bound. On an `awsvpc` ECS task that is the WRONG interface -- the task
+  has a separate link-local interface for the ECS metadata/credentials endpoint, and being
+  on-link THERE is precisely what selects it -- so the app reported `169.254.172.2` instead
+  of its ENI's private IP. It returned a well-formed wrong answer, not "unknown". The
+  consequence was two false refusals, not one: the deploy dialog blocked with "the tool could
+  not find this app's network interface in vpc-…" while the same dialog's Network panel
+  described that very VPC correctly, and Start CDC ALSO refused -- which is why setting
+  `DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR` did not work around it either. On Fargate there was no
+  supported configuration that could start PostgreSQL CDC. The app now asks the ECS task
+  metadata endpoint for its own ENI address when it runs on ECS, and -- more importantly --
+  REJECTS any address that can never belong to a VPC network interface (link-local, loopback,
+  multicast, reserved) instead of acting on it, so an unknown answer is now honestly unknown.
+  Start CDC additionally honours an explicitly configured `DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR`
+  over its own address check, since an operator who set it has attested to this host's network.
+
+### Changed
+
+- **An unresolvable network now warns instead of blocking the deploy, and says which step
+  failed.** Four different causes -- no own address, a denied or throttled
+  `ec2:DescribeNetworkInterfaces`, no interface with that address in the entered VPC, and an
+  address outside the VPC's CIDR blocks -- all rendered one identical message whose only
+  advice ("deploy the CDC infrastructure into the VPC this app runs in") was circular for an
+  app already in that VPC. Each now has its own message naming its own remedy, and the deploy
+  is no longer blocked: the cdc-stack's 9098 ingress is a CIDR rule with an empty default, so
+  deploying without it and adding a TCP 9098 inbound rule to the cdc-stack's
+  `ConnectorSecurityGroup` afterwards is a working path -- whereas the block left no path at
+  all. A deployment whose TEMPLATE declares it cannot reach MSK is still blocked, because no
+  security-group rule can add a missing egress rule or a missing task-role policy.
+- **The network resolution is no longer silent.** `core/ec2_metadata.py` had no logger at all
+  and three separate places swallowed the reason, so diagnosing this needed a one-off Fargate
+  task. The resolved address, a discarded address and a failed AWS lookup are now logged --
+  at `WARNING` for the give-ups, so they are visible at the deployed default `INFO` level.
+
+App code only: an existing stack needs just the image (`ContainerImageUri`), not a
+full-template update.
+
 ## v0.1.503
 
 ### Fixed

@@ -39,6 +39,7 @@ from dsql_migrator.core.cdc import (
     CDC_STACK_NAME_PREFIX,
     CdcPipelineOrchestrator,
     CdcResumePoint,
+    MskSeedAdmission,
     build_cdc_stack_name,
     cdc_expected_connector_names,
     composite_cdc_excluded_key_columns,
@@ -2868,7 +2869,12 @@ async def _open_cdc_infra_dialog(ui, migration_state, on_confirm, *, session=Non
     # SeedMode=External and is seeded BY THIS APP over MSK 9098, so a deployment that
     # cannot reach MSK -- or that the new cluster would not admit -- fails only at
     # Start CDC, after a billable MSK Serverless cluster already exists.
-    seed_admission = await run.io_bound(_msk_seed_admission, migration_state, session)
+    # `or MskSeedAdmission()`: nicegui's run.io_bound returns None once the app is
+    # stopping, and an attribute access on that would raise out of the dialog.
+    seed_admission = (
+        await run.io_bound(_msk_seed_admission, migration_state, session)
+        or MskSeedAdmission()
+    )
     with ui.dialog() as dialog, ui.card().classes("gap-2").style("min-width: 460px"):  # type: ignore[attr-defined]
         ui.label("Deploy CDC infrastructure").classes("text-lg font-semibold")  # type: ignore[attr-defined]
         ui.label(  # type: ignore[attr-defined]
@@ -2937,7 +2943,10 @@ async def _open_cdc_infra_dialog(ui, migration_state, on_confirm, *, session=Non
                 ui,
                 tone="warning",
                 icon="vpn_lock",
-                header="MSK ingress for this host was not registered",
+                header=(
+                    seed_admission.header
+                    or "MSK ingress for this host was not registered"
+                ),
                 body=seed_admission.warning,
             )
         elif seed_admission.note:
@@ -3079,7 +3088,7 @@ def _msk_seed_admission(migration_state, session, *, vpc_id=None):
     beside it.
     """
     from dsql_migrator.config import load_config as _load_config
-    from dsql_migrator.core.cdc import MskSeedAdmission, msk_seed_admission
+    from dsql_migrator.core.cdc import msk_seed_admission
 
     cfg = _load_config()
     seed_mode = _cdc_start_seed_mode(_cdc_source_type(session), cfg.cdc_seed_mode)
@@ -3088,31 +3097,44 @@ def _msk_seed_admission(migration_state, session, *, vpc_id=None):
     if vpc_id is None:
         vpc_id = migration_state.cdc_infra_inputs().get("vpc_id") or ""
     vpc_id = vpc_id.strip()
-    host = None
+    lookup = None
     if not cfg.cdc_host_subnet_cidr and vpc_id:
-        try:
-            from dsql_migrator.core.ec2_metadata import (
-                build_ec2_client,
-                discover_host_network,
-            )
+        from dsql_migrator.core.ec2_metadata import (
+            HostLookup,
+            build_ec2_client,
+            discover_host_network,
+        )
 
+        try:
             target = getattr(session, "target_config", None)
-            host = discover_host_network(
+            lookup = discover_host_network(
                 build_ec2_client(
                     getattr(session, "aws_profile", None),
                     getattr(target, "region", None) if target else None,
                 ),
                 vpc_id,
             )
-        except Exception:  # noqa: BLE001 - discovery must never break the deploy path
-            host = None
+        except Exception as exc:  # noqa: BLE001 - never break the deploy path
+            # Distinguished, not collapsed: a failed build_ec2_client or a denied
+            # describe used to render the SAME message as "no interface found", and
+            # left no log line either -- three causes, one indistinguishable verdict.
+            first = (str(exc).splitlines() or [""])[0][:160]
+            _LOGGER.warning(
+                "MSK seed host discovery failed for %s (%s: %s)",
+                vpc_id,
+                type(exc).__name__,
+                first,
+            )
+            lookup = HostLookup(
+                reason="lookup-failed", detail=f"{type(exc).__name__}: {first}"
+            )
     return msk_seed_admission(
         seed_mode=seed_mode,
         cdc_seed_mode=cfg.cdc_seed_mode,
         cdc_msk_access=getattr(cfg, "cdc_msk_access", False),
         configured_host_cidr=cfg.cdc_host_subnet_cidr,
         vpc_id=vpc_id,
-        host=host,
+        lookup=lookup,
     )
 
 
@@ -4137,11 +4159,16 @@ async def _start_cdc_infra_deploy(
     # refusal leaves nothing behind. Explicit DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR wins
     # inside msk_seed_admission (so the EC2 host is byte-identical); a Lambda-seeded
     # deploy resolves to "" -> no ingress rule, unchanged.
-    _admission = await run.io_bound(
-        _msk_seed_admission, migration_state, session, vpc_id=fields["vpc_id"]
+    _admission = (
+        await run.io_bound(
+            _msk_seed_admission, migration_state, session, vpc_id=fields["vpc_id"]
+        )
+        or MskSeedAdmission()
     )
     if _admission.blocker:
-        ui.notify(_admission.blocker, type="warning", position="top")  # type: ignore[attr-defined]
+        # "negative", matching the dialog's error tone for the same string: this is a
+        # refusal, and the deploy does not happen.
+        ui.notify(_admission.blocker, type="negative", position="top")  # type: ignore[attr-defined]
         return
 
     # --- Click-time network resolution (read-only, off the event loop) ----------

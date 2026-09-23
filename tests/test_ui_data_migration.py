@@ -24225,7 +24225,6 @@ def test_the_cdc_vpc_is_prefilled_from_the_source_and_only_when_empty() -> None:
         assert _cdc_ui.derive_cdc_vpc_from_source(state2, None) is False
     finally:
         rds.fetch_source_network, rds.build_rds_client = saved_fetch, saved_client
-        assert real_fetch is None or True  # nothing to restore on _cdc_ui itself
 
 
 def _drive_cdc_infra_dialog(
@@ -24468,7 +24467,8 @@ def test_infra_deploy_submits_the_resolved_admission_cidr_and_aborts_when_blocke
         admission=MskSeedAdmission(blocker="no 9098 egress on this deployment"),
     )
     assert cidr is None
-    assert [t for t, _m in notes] == ["warning"]
+    # "negative", matching the dialog's error tone for the same string: a refusal.
+    assert [t for t, _m in notes] == ["negative"]
     assert "9098" in notes[0][1]
 
     # A Lambda-seeded (MySQL) deploy still submits an EMPTY HostSubnetCidr, so no
@@ -24478,3 +24478,63 @@ def test_infra_deploy_submits_the_resolved_admission_cidr_and_aborts_when_blocke
     )
     assert cidr == ""
     assert notes == []
+
+
+def test_the_deploy_dialog_reports_a_failed_lookup_as_its_own_stage(monkeypatch) -> None:
+    """The ONLY test that runs `_msk_seed_admission -> discover_host_network` for real.
+
+    Every other UI test replaces `_msk_seed_admission` wholesale at the module boundary,
+    which is exactly how v0.1.503 shipped 27 green tests around a value nobody ever
+    computed. Do not add a `_msk_seed_admission` monkeypatch here.
+    """
+    from types import SimpleNamespace
+
+    import dsql_migrator.config as _config
+    import dsql_migrator.core.ec2_metadata as _em
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+    from dsql_migrator.core.models import SourceType
+
+    calls = []
+
+    def _boom(*_a, **_k):
+        calls.append(1)
+        raise RuntimeError("AccessDeniedException on ec2:DescribeNetworkInterfaces")
+
+    monkeypatch.setattr(_em, "build_ec2_client", _boom)
+    monkeypatch.setattr(
+        _config,
+        "load_config",
+        lambda *_a, **_k: SimpleNamespace(
+            cdc_seed_mode="lambda", cdc_host_subnet_cidr="", cdc_msk_access=True
+        ),
+    )
+
+    state = DataMigrationState()
+    state.set_cdc_infra_inputs({"vpc_id": "vpc-app"})
+    pg = SimpleNamespace(
+        aws_profile=None,
+        target_config=SimpleNamespace(region="us-east-1"),
+        source_config=SimpleNamespace(source_type=SourceType.POSTGRES, database="app"),
+    )
+
+    got = cdc_ui._msk_seed_admission(state, pg)
+    # A denied describe is ITS OWN stage: it used to render the same message as
+    # "no interface found", and left no log line either.
+    assert got.header == "Could not look up this app's network"
+    assert "AccessDeniedException" in got.warning
+    assert not got.blocker
+    assert calls  # the real chain ran
+
+    # MySQL resolves to the Lambda seed, so discovery must not even be attempted --
+    # without this half, a fix that always returns "lookup-failed" would pass.
+    calls.clear()
+    mysql = SimpleNamespace(
+        aws_profile=None,
+        target_config=SimpleNamespace(region="us-east-1"),
+        source_config=SimpleNamespace(
+            source_type=SourceType.MYSQL, database="app", port=3306
+        ),
+    )
+    quiet = cdc_ui._msk_seed_admission(state, mysql)
+    assert (quiet.cidr, quiet.blocker, quiet.warning, quiet.note) == ("", "", "", "")
+    assert calls == []
