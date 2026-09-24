@@ -427,7 +427,12 @@ class SourceDialect(ABC):
 
     @abstractmethod
     def probe_cdc_prerequisites(
-        self, connection: object, table_names: Sequence[str]
+        self,
+        connection: object,
+        table_names: Sequence[str],
+        *,
+        publication_name: str = "",
+        slot_name: str = "",
     ) -> "Optional[PostgresCdcFacts]":
         """Read the CDC logical-replication readiness facts (PostgreSQL only).
 

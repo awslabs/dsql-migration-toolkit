@@ -6936,10 +6936,23 @@ def test_migration_type_requirements_are_source_aware() -> None:
         # PostgreSQL: logical replication / pgoutput publication -- never MySQL binlog.
         pg = migration_type_requirements(mt, SourceType.POSTGRES)
         assert "MSK" in pg
-        assert "logical replication" in pg.lower() and "pgoutput" in pg
+        assert "logical replication" in pg.lower()
         assert "binlog" not in pg.lower()
         # Unknown/default engine falls back to the MySQL wording (the static baseline).
         assert migration_type_requirements(mt) == mysql
+
+    # ...and on PostgreSQL the two CDC types differ in the one way that decides whether
+    # the handoff can be gapless: only the combined type CREATES the publication and slot,
+    # and only before the load, when a slot can still sit at the snapshot point. Saying
+    # "a pgoutput publication" to both implied the CDC-only tile would arrange one.
+    cdc_only = migration_type_requirements(MigrationType.CDC_ONLY, SourceType.POSTGRES)
+    combined = migration_type_requirements(
+        MigrationType.FULL_LOAD_AND_CDC, SourceType.POSTGRES
+    )
+    assert cdc_only != combined
+    assert "does not create them" in cdc_only and "already exist" in cdc_only.lower()
+    assert "re-snapshot" in cdc_only  # the route that still works
+    assert "creates the publication and replication slot itself" in combined
 
     # Non-CDC types have no change-stream requirement for either engine.
     for st in (SourceType.MYSQL, SourceType.POSTGRES):
@@ -23390,20 +23403,21 @@ def test_slot_wal_retention_is_tagged_cdc_only_like_its_mysql_counterpart() -> N
     from dsql_migrator.core.models import PrerequisiteCheckId as Id
     from dsql_migrator.ui.data_migration import _CDC_ONLY_CHECK_IDS, prereq_phase_tag
 
-    for check_id in (
-        Id.WAL_LEVEL_LOGICAL,
-        Id.REPLICATION_ROLE,
-        Id.PUBLICATION_PRIVILEGE,
-        Id.REPLICATION_SLOTS,
-        Id.SLOT_WAL_RETENTION,
-        Id.SOURCE_IS_WRITER,
-        Id.TABLE_REPLICABLE,
-        Id.REPLICA_IDENTITY,
-    ):
+    # Derived from the PostgreSQL CDC preview itself rather than enumerated by hand: an
+    # enumerated list is exactly how SLOT_WAL_RETENTION drifted out unnoticed, and it
+    # cannot fail for a PG CDC id added later.
+    from dsql_migrator.core.prerequisites_postgres import (
+        postgres_cdc_prerequisites_skipped,
+    )
+
+    pg_cdc_ids = {r.check_id for r in postgres_cdc_prerequisites_skipped()}
+    assert len(pg_cdc_ids) >= 8  # the preview is the source of truth, and it is populated
+    for check_id in pg_cdc_ids | {Id.BINLOG_RETENTION, Id.GTID_MODE}:
         assert check_id in _CDC_ONLY_CHECK_IDS, check_id
         assert "CDC" in prereq_phase_tag(check_id, combined=True)
     # ...and a check Full Load genuinely needs is NOT tagged CDC-only.
     assert Id.TABLE_PRIMARY_KEY not in _CDC_ONLY_CHECK_IDS
+    assert prereq_phase_tag(Id.TABLE_PRIMARY_KEY, combined=True) == "Full Load + CDC"
 
 
 def test_prereq_table_shows_the_observed_value_and_the_remediation() -> None:
@@ -24321,6 +24335,44 @@ class _SimpleSourceSession:
     target_config = None
 
 
+def _drive_cdc_infra_dialog_with_state(monkeypatch, state):
+    """Like _drive_cdc_infra_dialog but with a caller-supplied migration state."""
+    import asyncio
+
+    import nicegui.run as nrun
+
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+    from dsql_migrator.core.cdc import MskSeedAdmission
+
+    ui = _DialogUi()
+    notices: list[dict] = []
+
+    async def _io_bound(fn, *a, **k):
+        return fn(*a, **k)
+
+    monkeypatch.setattr(nrun, "io_bound", _io_bound)
+    monkeypatch.setattr(cdc_ui, "cdc_deploy_connection_blocker", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        cdc_ui, "_diagnose_for_dialog",
+        lambda *_a, **_k: ("Found existing NAT subnets.", "discovered", ""),
+    )
+    monkeypatch.setattr(cdc_ui, "_source_vpc_warning_for_dialog", lambda *_a, **_k: "")
+    monkeypatch.setattr(cdc_ui, "_msk_seed_admission", lambda *_a, **_k: MskSeedAdmission())
+    monkeypatch.setattr(
+        cdc_ui, "_render_notice",
+        lambda _ui, *, tone="info", icon=None, header="", body="": notices.append(
+            {"tone": tone, "header": header, "body": body}
+        ),
+    )
+    monkeypatch.setattr(cdc_ui, "_render_cdc_cost_estimate", lambda *_a, **_k: None)
+    asyncio.run(
+        cdc_ui._open_cdc_infra_dialog(
+            ui, state, lambda: None, session=_SimpleSourceSession()
+        )
+    )
+    return notices, ui
+
+
 def test_the_deploy_dialog_checks_the_vpc_against_the_source_before_deploying(
     monkeypatch,
 ) -> None:
@@ -24800,3 +24852,70 @@ def test_the_probe_only_demands_a_slot_when_the_start_would_resume_from_one(
     )
     assert blocked is not None
     assert "cannot be created at a past position" in blocked[1]
+
+
+def test_the_post_full_load_invite_does_not_recommend_the_broken_path_on_postgres() -> None:
+    """The TOP of the complaint chain, and the report missed it entirely.
+
+    After a Full-load-only PostgreSQL run the tool RECOMMENDED, in its own voice, setting
+    the type to "CDC only" because it "streams from this Full Load's watermark onto the
+    already-loaded target (no re-snapshot)" -- false on BOTH counts for PostgreSQL (no slot
+    was created, and a slot cannot be positioned in the past) -- and handed over a
+    one-click jump link. MySQL's wording is true and must stay byte-identical.
+    """
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    src = inspect.getsource(dm.build_data_migration_screen)
+    # Both branches exist and the PostgreSQL one is reached by engine, not by guesswork.
+    assert "is SourceType.POSTGRES" in src
+    pg_body = src[src.index("This run created no replication slot") :][:1200]
+    # It must name the cost and the two honest routes, and must NOT claim "no re-snapshot".
+    assert "re-snapshotting every selected" in pg_body
+    assert "Full load + CDC" in pg_body
+    assert "BEFORE" in pg_body
+    # The MySQL claim must not appear inside the PostgreSQL branch.
+    assert "no re-snapshot" not in pg_body
+    # ...and the MySQL branch keeps it, so this is a split, not a rewrite of both.
+    assert "watermark onto the already-loaded target (no " in src
+
+
+def test_the_deploy_infra_dialog_refuses_a_cdc_only_deploy_with_nothing_to_stream_from(
+    monkeypatch,
+) -> None:
+    """The COST gate: refuse before the ~5-minute billable MSK Serverless create.
+
+    Asymmetric by migration type on purpose -- in "Full load + CDC" the objects are
+    SUPPOSED to be absent (the Full Load creates them) and deploying the infra first is the
+    flow this very card recommends, so that case must stay silent and enabled.
+    """
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    monkeypatch.setattr(
+        cdc_ui, "_probe_pg_replication_objects",
+        lambda *_a, **_k: ("CDC's publication does not exist on the source", "do X"),
+    )
+
+    def _drive(migration_type):
+        state = DataMigrationState()
+        state.set_cdc_infra_inputs({"vpc_id": "vpc-app"})
+        state.migration_type = migration_type
+        return _drive_cdc_infra_dialog_with_state(monkeypatch, state)
+
+    notices, ui = _drive(MigrationType.CDC_ONLY)
+    blocked = [
+        n for n in notices if n["header"] == "CDC's publication does not exist on the source"
+    ]
+    assert [n["tone"] for n in blocked] == ["error"]
+    assert "billable MSK Serverless cluster" in blocked[0]["body"]
+    assert ui.buttons["Deploy"].enabled is False
+
+    # PAIRED: the combined type must NOT be blocked by the same probe result.
+    notices2, ui2 = _drive(MigrationType.FULL_LOAD_AND_CDC)
+    assert not [
+        n for n in notices2
+        if n["header"] == "CDC's publication does not exist on the source"
+    ]
+    assert ui2.buttons["Deploy"].enabled is True

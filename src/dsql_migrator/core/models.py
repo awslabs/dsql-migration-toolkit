@@ -1021,6 +1021,13 @@ class PrerequisiteCheckId(str, Enum):
     # rejected by PostgreSQL (its changes are never WAL-logged, so it can never be
     # replicated), which aborts the whole CREATE PUBLICATION.
     TABLE_REPLICABLE = "TABLE_REPLICABLE"
+    # Do CDC's publication and replication slot actually EXIST on the source? Distinct
+    # from PUBLICATION_PRIVILEGE, which asks whether the user COULD create one: different
+    # question, different remedy (grant vs. run the load / re-snapshot). Keeping them
+    # merged is how a green pre-flight came to be followed by a guaranteed deploy failure
+    # -- the privilege check passes while the object is absent. Only meaningful for a run
+    # that must FIND them (see PrerequisiteCheckRequest.provisions_replication).
+    CDC_REPLICATION_OBJECTS = "CDC_REPLICATION_OBJECTS"
 
 
 class PrerequisiteResult(BaseModel):
@@ -1056,6 +1063,15 @@ class PrerequisiteCheckRequest(BaseModel):
     MySQL binlog/GTID today, so a PostgreSQL source reports them as not-applicable
     and gets an honest "CDC not yet supported" INFO instead of MySQL checks that
     would falsely FAIL. Defaults to MySQL so existing callers are unchanged.
+
+    ``provisions_replication`` is True when THIS run creates the PostgreSQL CDC
+    publication + replication slot itself, so they must NOT exist yet; False when the run
+    must find them already on the source. The mode enum cannot express this -- both
+    "CDC only" and "Full load + CDC" map to :attr:`MigrationMode.CDC` -- and getting it
+    wrong would break the one path that works, so it is an explicit field. Defaults True
+    so MySQL and every existing caller are unchanged and the check can never block them.
+
+    ``cdc_stack_name`` derives the expected publication / slot names for that check.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1063,6 +1079,8 @@ class PrerequisiteCheckRequest(BaseModel):
     mode: MigrationMode
     tables: list[str] = Field(default_factory=list)
     source_type: SourceType = SourceType.MYSQL
+    provisions_replication: bool = True
+    cdc_stack_name: str = ""
 
 
 class PrerequisiteReport(BaseModel):

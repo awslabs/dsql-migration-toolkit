@@ -73,7 +73,11 @@ class SourceProbe(Protocol):
         """
 
     def cdc_prerequisites(
-        self, table_names: Sequence[str]
+        self,
+        table_names: Sequence[str],
+        *,
+        publication_name: str = "",
+        slot_name: str = "",
     ) -> "Optional[PostgresCdcFacts]":
         """Return the PostgreSQL CDC readiness facts, or ``None`` for a MySQL source.
 
@@ -822,7 +826,20 @@ class PrerequisiteChecker:
             # checks do not apply and are SKIP.
             from dsql_migrator.core import prerequisites_postgres
 
-            facts = self._source.cdc_prerequisites([table.name for table in tables])
+            # Derive the object names ONLY when the run must find them, so a
+            # Full-load-+-CDC probe stays byte-identical (it reads no existence facts and
+            # the existence check SKIPs).
+            _pub_name = _slot_name = ""
+            if not request.provisions_replication and request.cdc_stack_name:
+                from dsql_migrator.core import cdc_pg_slot as _pg_names
+
+                _pub_name = _pg_names.pg_publication_name(request.cdc_stack_name)
+                _slot_name = _pg_names.pg_slot_name(request.cdc_stack_name)
+            facts = self._source.cdc_prerequisites(
+                [table.name for table in tables],
+                publication_name=_pub_name,
+                slot_name=_slot_name,
+            )
             # ``facts`` full of Nones is NOT "partially known" -- it is a source whose
             # readiness was never verified, and it used to slip past this gate because the
             # object itself was not None: every check degraded to a non-blocking INFO and
@@ -842,7 +859,9 @@ class PrerequisiteChecker:
             else:
                 results.extend(
                     prerequisites_postgres.check_postgres_cdc_prerequisites(
-                        facts, [effective[table.name] for table in tables]
+                        facts,
+                        [effective[table.name] for table in tables],
+                        provisions_replication=request.provisions_replication,
                     )
                 )
             # MySQL's binlog/GTID rows are NOT listed for a PostgreSQL source, in either

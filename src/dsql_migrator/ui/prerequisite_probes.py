@@ -161,7 +161,7 @@ class SessionSourceProbe:
             pass
         return result
 
-    def cdc_prerequisites(self, table_names):
+    def cdc_prerequisites(self, table_names, *, publication_name="", slot_name=""):
         """Return the PostgreSQL CDC readiness facts, or None for a MySQL source.
 
         Delegates to the source dialect (read-only), mirroring :meth:`grants`: only
@@ -175,7 +175,12 @@ class SessionSourceProbe:
         try:
             engine = self._engine_factory(self._config)
             with engine.connect() as connection:
-                return dialect.probe_cdc_prerequisites(connection, list(table_names))
+                return dialect.probe_cdc_prerequisites(
+                    connection,
+                    list(table_names),
+                    publication_name=publication_name,
+                    slot_name=slot_name,
+                )
         except Exception:  # noqa: BLE001 - treated as "facts unknown"
             return None
 

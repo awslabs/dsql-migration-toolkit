@@ -184,8 +184,9 @@ Parameters:
   # server.id/GTID/schema-history; instead a publication + a logical replication
   # slot (pgoutput) identify the capture. The publication and slot are pre-created
   # out of band (publication.autocreate.mode=disabled) -- created by the tool at the
-  # Full Load consistency point for a gapless handoff (that wiring lands in a later
-  # Phase). All default to empty/inert so a MySQL deploy is unaffected.
+  # Full Load consistency point for a gapless handoff. Nothing creates them for a CDC-only
+  # start, which is why such a start must either find them or autocreate the publication
+  # and re-snapshot. All default to empty/inert so a MySQL deploy is unaffected.
   PgDatabaseName:
     Type: String
     Default: ""
@@ -210,9 +211,14 @@ Parameters:
     Default: disabled
     AllowedValues: [disabled, filtered, all_tables]
     Description: >
-      Debezium publication.autocreate.mode. 'disabled' (default) means the tool/DBA
-      pre-creates the publication -- the safe choice; 'all_tables' is rejected by
-      design elsewhere in the tool.
+      Debezium publication.autocreate.mode. 'disabled' (default) means the publication
+      already exists -- the tool creates it at the Full Load snapshot point, which is the
+      safe choice. 'filtered' lets the CONNECTOR create one over exactly the captured
+      tables; the tool uses it only for a CDC-only start that has no publication, paired
+      with snapshot.mode=initial so the handoff is gapless by re-snapshotting.
+      'all_tables' is rejected by design elsewhere in the tool (it would publish tables
+      outside the migration, arming a source-write outage on any REPLICA IDENTITY NOTHING
+      table).
   PgSnapshotMode:
     Type: String
     Default: never

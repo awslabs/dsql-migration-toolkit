@@ -2887,6 +2887,21 @@ async def _open_cdc_infra_dialog(ui, migration_state, on_confirm, *, session=Non
         await run.io_bound(_msk_seed_admission, migration_state, session)
         or MskSeedAdmission()
     )
+    # The COST gate. For a CDC-ONLY session, absent publication/slot means Start CDC cannot
+    # work, so refuse BEFORE the ~5-minute billable MSK Serverless create. ASYMMETRIC by
+    # migration type on purpose: in a Full-load-+-CDC run the objects legitimately do not
+    # exist yet (the Full Load creates them), and deploying the infra first is the flow this
+    # very card recommends -- so that case stays silent. It cannot strand anyone: the
+    # Start-side gate RE-PROBES rather than remembering this verdict, so provisioning
+    # between the two steps simply turns the block off.
+    pg_infra_block: Optional[tuple] = None
+    if getattr(migration_state, "migration_type", None) is MigrationType.CDC_ONLY:
+        try:
+            pg_infra_block = await run.io_bound(
+                _probe_pg_replication_objects, migration_state, session, [], None
+            )
+        except Exception:  # noqa: BLE001 - unreadable is not absent; never block on it
+            pg_infra_block = None
     with ui.dialog() as dialog, ui.card().classes("gap-2").style("min-width: 460px"):  # type: ignore[attr-defined]
         ui.label("Deploy CDC infrastructure").classes("text-lg font-semibold")  # type: ignore[attr-defined]
         ui.label(  # type: ignore[attr-defined]
@@ -2970,6 +2985,19 @@ async def _open_cdc_infra_dialog(ui, migration_state, on_confirm, *, session=Non
                 header="MSK access for the PostgreSQL CDC seed",
                 body=seed_admission.note,
             )
+        if pg_infra_block is not None:
+            _render_notice(
+                ui,
+                tone="error",
+                icon="sync_problem",
+                header=pg_infra_block[0],
+                body=(
+                    pg_infra_block[1]
+                    + " Deploying now would create a billable MSK Serverless cluster that "
+                    "Start CDC could not use. Fix this first, or start the migration over "
+                    'as "Full load + CDC", which creates both at the snapshot point.'
+                ),
+            )
 
         async def _go() -> None:
             dialog.close()
@@ -2994,6 +3022,10 @@ async def _open_cdc_infra_dialog(ui, migration_state, on_confirm, *, session=Non
                 # Would create a billable MSK cluster this app could never seed.
                 deploy_btn.props("disable")
                 deploy_btn.tooltip(seed_admission.blocker)
+            elif pg_infra_block is not None:
+                # CDC-only, and the source has nothing to stream from.
+                deploy_btn.props("disable")
+                deploy_btn.tooltip(pg_infra_block[1])
     dialog.open()
 
 def derive_cdc_vpc_from_source(migration_state, session) -> bool:

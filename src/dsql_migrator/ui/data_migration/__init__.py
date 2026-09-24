@@ -697,6 +697,17 @@ def build_data_migration_screen(
                 target_config=target_config,
                 aws_profile=session.aws_profile,
             )
+            # THE gate for CDC_REPLICATION_OBJECTS, derived from the PROVISIONER'S OWN
+            # predicate rather than re-derived from the migration type. _pg_cdc_handoff_stack
+            # is the sole decider of whether this run creates the publication + slot -- its
+            # return value IS the cdc_stack_name that _capture_postgres_watermark branches
+            # on -- so reusing it makes it structurally impossible for the gate and the
+            # provisioner to disagree. Writing `migration_type is CDC_ONLY` here would miss
+            # its other None cases (MySQL; CDC already streaming, where the objects DO exist
+            # and the check correctly passes).
+            _handoff_stack = _pg_cdc_handoff_stack(
+                migration_state, source_config, job_manager
+            )
             request = PrerequisiteCheckRequest(
                 mode=mode,
                 tables=[table.name for table in tables],
@@ -704,6 +715,12 @@ def build_data_migration_screen(
                 # CDC as not-yet-supported (INFO) instead of running MySQL binlog
                 # checks that would falsely FAIL.
                 source_type=source_config.source_type,
+                provisions_replication=_handoff_stack is not None,
+                cdc_stack_name=(
+                    _handoff_stack
+                    or getattr(migration_state, "cdc_stack_name", "")
+                    or ""
+                ),
             )
             from nicegui import run
 
@@ -2107,14 +2124,45 @@ def build_data_migration_screen(
                                 infra_ready = getattr(
                                     migration_state, "cdc_stack_phase", None
                                 ) in ("infra", "running", "unstable")
-                                body = (
-                                    "To keep the target in sync with ongoing source "
-                                    "changes, set the migration type to "
-                                    "\"CDC only\" — it streams from this Full Load's "
-                                    "watermark onto the already-loaded target (no "
-                                    "re-snapshot). Use the link below to jump to that "
-                                    "setting."
-                                )
+                                # ENGINE-SPLIT. The MySQL wording is byte-identical and
+                                # true: its binlog retains history with no consumer, so a
+                                # later CDC-only start really does resume from this
+                                # watermark with no re-snapshot. For PostgreSQL it is
+                                # false on BOTH counts -- only a replication slot retains
+                                # WAL, a Full-load-only run created none, and a slot
+                                # cannot be created at a past position -- so recommending
+                                # it here handed the operator a one-click route into a
+                                # dead start. (The app already says as much 1100 lines
+                                # away in _cdc_ui's start-point card.)
+                                if (
+                                    getattr(
+                                        getattr(session, "source_config", None),
+                                        "source_type",
+                                        None,
+                                    )
+                                    is SourceType.POSTGRES
+                                ):
+                                    body = (
+                                        "This run created no replication slot, so there "
+                                        "is no retained WAL to stream from: on PostgreSQL "
+                                        "a gapless handoff needs the slot to exist BEFORE "
+                                        "the load. To add replication now, \"CDC only\" "
+                                        "can still do it by re-snapshotting every selected "
+                                        "table (nothing is lost, but the source is read "
+                                        "again); to avoid the re-read, start over as "
+                                        "\"Full load + CDC\", which creates the slot at "
+                                        "the snapshot point. Use the link below to jump to that "
+                                        "setting."
+                                    )
+                                else:
+                                    body = (
+                                        "To keep the target in sync with ongoing source "
+                                        "changes, set the migration type to "
+                                        "\"CDC only\" — it streams from this Full Load's "
+                                        "watermark onto the already-loaded target (no "
+                                        "re-snapshot). Use the link below to jump to that "
+                                        "setting."
+                                    )
                                 if not infra_ready:
                                     body += (
                                         " CDC streaming infrastructure isn't deployed "
@@ -3483,9 +3531,13 @@ def _connector_failure_detail(migration_state, view, name: str) -> str:
             f"{table}={count}" for table, count in sorted(by_table.items())[:5]
         )
         parts.append(f"data errors by table: {listed}")
+    # NAME the log group instead of promising a link that does not exist: nothing in the
+    # UI ever rendered one (grep for msk-connect/ finds only the deployer's own read), so
+    # "linked on the CDC step" sent the operator looking for something that was not there.
+    # The name is deterministic -- cdc-stack.yaml creates /msk-connect/<stack>-cdc.
+    _stack = getattr(migration_state, "cdc_stack_name", "") or CDC_DEFAULT_STACK_NAME
     parts.append(
-        "see the connector's CloudWatch log group (linked on the CDC step) for the "
-        "task stack trace"
+        f"see CloudWatch log group /msk-connect/{_stack}-cdc for the task stack trace"
     )
     return "; ".join(parts)
 
@@ -3514,6 +3566,9 @@ _CDC_ONLY_CHECK_IDS = frozenset(
         # the PostgreSQL counterpart of BINLOG_RETENTION, which IS listed -- was tagged
         # "Full load + CDC" on the combined panel even though only CDC needs it.
         PrerequisiteCheckId.SLOT_WAL_RETENTION,
+        # Same drift risk as SLOT_WAL_RETENTION above: omitting it would tag a CDC-only
+        # finding "Full load + CDC" and make it read as "Full Load: Blocked".
+        PrerequisiteCheckId.CDC_REPLICATION_OBJECTS,
         PrerequisiteCheckId.MSK_AVAILABLE,
         PrerequisiteCheckId.MSK_CONNECT_AVAILABLE,
     }

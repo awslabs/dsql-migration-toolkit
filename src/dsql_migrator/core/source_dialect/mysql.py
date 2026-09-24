@@ -200,7 +200,9 @@ class MySQLSourceDialect(SourceDialect):
 
         return _read_threads_running(connection)
 
-    def probe_cdc_prerequisites(self, connection: object, table_names):
+    def probe_cdc_prerequisites(
+        self, connection: object, table_names, *, publication_name="", slot_name=""
+    ):
         # MySQL CDC readiness is the binlog/GTID checks (not logical-replication slots),
         # so there are no PostgreSQL-style facts to gather here.
         return None

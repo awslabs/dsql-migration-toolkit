@@ -92,6 +92,19 @@ class PostgresCdcFacts:
     # never discards WAL a slot still needs. Any other value caps that retention, so a
     # slow Full Load can outlive the slot's WAL and invalidate it.
     max_slot_wal_keep_size_mb: Optional[int] = None
+    # Do CDC's objects EXIST? Only read when the run must FIND them (a CDC-only start);
+    # ``None`` means not read, never a defaulted bool -- the same tri-state discipline as
+    # the facts above, and for the same reason: a defaulted False here would assert an
+    # absence nobody verified and block the deploy on it.
+    publication_present: Optional[bool] = None
+    publication_publishes_all_dml: Optional[bool] = None
+    slot_present_any_database: Optional[bool] = None
+    slot_usable: Optional[bool] = None
+    publication_tables: Sequence[str] = field(default_factory=tuple)
+    # The names actually checked, so the row can name them and a stack rename cannot make
+    # the row silently describe a different object than the connector will use.
+    checked_publication_name: str = ""
+    checked_slot_name: str = ""
 
 
 def check_wal_level_logical(facts: PostgresCdcFacts) -> PrerequisiteResult:
@@ -601,14 +614,175 @@ def check_slot_wal_retention(facts: PostgresCdcFacts) -> PrerequisiteResult:
     )
 
 
+def check_cdc_replication_objects(
+    facts: PostgresCdcFacts,
+    tables: Sequence[TableDef],
+    *,
+    provisions_replication: bool,
+) -> PrerequisiteResult:
+    """Do CDC's publication + replication slot EXIST? Distinct from the PRIVILEGE check.
+
+    ``provisions_replication`` is the whole non-regression guarantee. In "Full load + CDC"
+    the Full Load CREATES both at the snapshot point, so they are SUPPOSED to be absent
+    beforehand -- this must read as SKIP there, never as a problem. Only a run that has to
+    FIND them (a CDC-only start) is graded.
+
+    Grading: an absent publication, or one that omits a selected table or narrows its
+    publish list, is a FAIL -- each makes the connector either die at once or report
+    RUNNING while replicating nothing. A missing SLOT is only a WARN, because with the
+    recorded-slot invariant in ``build_pg_source_config`` such a start re-snapshots and is
+    gapless; it costs a re-read, not correctness.
+    """
+    title = "CDC's publication and replication slot exist on the source"
+    if provisions_replication:
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.CDC_REPLICATION_OBJECTS,
+            title=title,
+            status=PrerequisiteStatus.SKIP,
+            required=True,
+            detail=(
+                "Full Load creates the publication and replication slot at the snapshot "
+                "LSN for this run, so they must not exist beforehand."
+            ),
+        )
+    pub = facts.checked_publication_name
+    slot = facts.checked_slot_name
+    if not pub or not slot:
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.CDC_REPLICATION_OBJECTS,
+            title=title,
+            status=PrerequisiteStatus.INFO,
+            required=False,
+            detail=(
+                "The CDC stack name is not set yet, so the publication and slot names "
+                "this run needs cannot be derived. They are checked again before Start CDC."
+            ),
+        )
+    if facts.publication_present is None:
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.CDC_REPLICATION_OBJECTS,
+            title=title,
+            status=PrerequisiteStatus.INFO,
+            required=False,
+            detail=(
+                "Could not read the source's publications and replication slots, so "
+                f'whether "{pub}" and "{slot}" exist is unknown. They are checked again '
+                "before Start CDC."
+            ),
+        )
+    resnapshot_note = (
+        "Otherwise choose the re-snapshot option on the CDC start card, which re-reads "
+        "every selected table and loses nothing; a slot created now begins at the "
+        "source's CURRENT WAL position and can never replay the changes committed since "
+        "the Full Load."
+    )
+    gapless_note = (
+        'For a handoff with no gap, run this migration as "Full load + CDC", which '
+        "creates the publication and the slot at the snapshot point before the load. "
+    )
+    if not facts.publication_present:
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.CDC_REPLICATION_OBJECTS,
+            title=title,
+            status=PrerequisiteStatus.FAIL,
+            required=True,
+            detail=(
+                f'Publication "{pub}" does not exist on the source. The connector does '
+                "not create it (publication.autocreate.mode=disabled), so the Debezium "
+                "source task is killed seconds after the connectors are created: "
+                '"Publication autocreation is disabled, please create one and restart '
+                'the connector".'
+            ),
+            remediation=(
+                "Fix this BEFORE deploying the CDC infrastructure — MSK Serverless and "
+                "both connectors are billed from creation. " + gapless_note + resnapshot_note
+            ),
+        )
+    selected = [t.name for t in tables]
+    missing = sorted(set(selected) - set(facts.publication_tables or ()))
+    if missing:
+        shown = ", ".join(missing[:5]) + (" …" if len(missing) > 5 else "")
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.CDC_REPLICATION_OBJECTS,
+            title=title,
+            status=PrerequisiteStatus.FAIL,
+            required=True,
+            detail=(
+                f'Publication "{pub}" exists but does not include {len(missing)} of the '
+                f"{len(selected)} selected tables: {shown}."
+            ),
+            remediation=(
+                "Those tables would replicate NOTHING while the connector reported "
+                "RUNNING, which is worse than a visible failure. " + gapless_note
+                + resnapshot_note
+            ),
+        )
+    if facts.publication_publishes_all_dml is False:
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.CDC_REPLICATION_OBJECTS,
+            title=title,
+            status=PrerequisiteStatus.FAIL,
+            required=True,
+            detail=(
+                f'Publication "{pub}" is restricted to a subset of '
+                "INSERT/UPDATE/DELETE, so the change types it omits would never reach "
+                "the target while the connector still reported RUNNING."
+            ),
+            remediation=(
+                "Recreate the publication with all three operations, or "
+                + resnapshot_note[0].lower() + resnapshot_note[1:]
+            ),
+        )
+    if not facts.slot_usable:
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.CDC_REPLICATION_OBJECTS,
+            title=title,
+            status=PrerequisiteStatus.WARN,
+            required=False,
+            detail=(
+                f'Publication "{pub}" covers all {len(selected)} selected tables, but '
+                "there is no logical pgoutput replication slot named "
+                f'"{slot}" on this database.'
+            ),
+            remediation=(
+                "CDC can still start — Debezium creates the slot itself and takes a fresh "
+                "snapshot of every selected table first, so nothing is lost, but the "
+                "whole selection is read from the source again. To stream without "
+                're-reading, run the migration as "Full load + CDC", which creates the '
+                "slot at the snapshot point."
+            ),
+        )
+    return PrerequisiteResult(
+        check_id=PrerequisiteCheckId.CDC_REPLICATION_OBJECTS,
+        title=title,
+        status=PrerequisiteStatus.PASS,
+        required=True,
+        detail=(
+            f'Publication "{pub}" covers all {len(selected)} selected tables and '
+            f'replication slot "{slot}" is present, so CDC can resume from it.'
+        ),
+    )
+
+
 def check_postgres_cdc_prerequisites(
-    facts: PostgresCdcFacts, tables: Sequence[TableDef]
+    facts: PostgresCdcFacts,
+    tables: Sequence[TableDef],
+    *,
+    provisions_replication: bool = True,
 ) -> list[PrerequisiteResult]:
-    """Run all PostgreSQL CDC readiness checks (global + per-table REPLICA IDENTITY)."""
+    """Run all PostgreSQL CDC readiness checks (global + per-table REPLICA IDENTITY).
+
+    ``provisions_replication`` defaults True -- "this run creates the objects itself" --
+    so every existing caller and the whole Full-load-+-CDC path is unchanged and the
+    existence check can never block them.
+    """
     results = [
         check_wal_level_logical(facts),
         check_replication_role(facts),
         check_publication_privilege(facts),
+        check_cdc_replication_objects(
+            facts, tables, provisions_replication=provisions_replication
+        ),
         check_replication_slot_headroom(facts),
         check_slot_wal_retention(facts),
         check_source_is_writer(facts),
@@ -641,15 +815,32 @@ def postgres_cdc_facts_are_unverified(facts: PostgresCdcFacts) -> bool:
 # Title per skipped check, so the Full-Load preview rows read EXACTLY like the CDC rows
 # they stand in for. Kept next to the checks themselves rather than in prerequisites.py:
 # duplicating the strings there is how a retitled check silently grows a second wording.
-_SKIPPED_TITLES: "tuple[tuple[PrerequisiteCheckId, str], ...]" = (
+_SKIPPED_TITLES: "tuple[tuple, ...]" = (
     (PrerequisiteCheckId.WAL_LEVEL_LOGICAL, "Source wal_level is 'logical'"),
     (PrerequisiteCheckId.REPLICATION_ROLE, "Source user can create a replication slot"),
     (
         PrerequisiteCheckId.PUBLICATION_PRIVILEGE,
         "Source user can create the CDC publication",
     ),
+    # The two PROVISIONING-DEPENDENT rows get a bespoke preview detail. This report is the
+    # LAST moment the gapless choice is still available: once a Full-load-only run
+    # finishes, no slot was retaining WAL and the changes made during the load can never
+    # be replayed -- only re-snapshotted. "Not applicable for this mode." hides that.
+    (
+        PrerequisiteCheckId.CDC_REPLICATION_OBJECTS,
+        "CDC's publication and replication slot exist on the source",
+        "Not applicable for this mode — and note that a Full-load-only run does NOT "
+        'create them. If you may want to stream changes afterwards, choose "Full load + '
+        'CDC" now: the replication slot has to exist BEFORE the load, or the changes made '
+        "during it can never be replayed.",
+    ),
     (PrerequisiteCheckId.REPLICATION_SLOTS, "Source has replication-slot headroom"),
-    (PrerequisiteCheckId.SLOT_WAL_RETENTION, "WAL retention covers the CDC handoff"),
+    (
+        PrerequisiteCheckId.SLOT_WAL_RETENTION,
+        "WAL retention covers the CDC handoff",
+        "Not applicable for this mode — a Full-load-only run creates no replication "
+        "slot, so no WAL is being retained for a later CDC start.",
+    ),
     (PrerequisiteCheckId.SOURCE_IS_WRITER, "Source is a writer (not a standby)"),
     (PrerequisiteCheckId.TABLE_REPLICABLE, "Table can be replicated (not UNLOGGED)"),
     (PrerequisiteCheckId.REPLICA_IDENTITY, "Table has a usable REPLICA IDENTITY"),
@@ -669,13 +860,15 @@ def postgres_cdc_prerequisites_skipped() -> list[PrerequisiteResult]:
     """
     return [
         PrerequisiteResult(
-            check_id=check_id,
-            title=title,
+            check_id=row[0],
+            title=row[1],
             status=PrerequisiteStatus.SKIP,
             required=True,
-            detail="Not applicable for this mode.",
+            # A row may carry its own preview detail (element 3); the rest say only that
+            # the mode does not apply, which is all there is to say about them.
+            detail=row[2] if len(row) > 2 else "Not applicable for this mode.",
         )
-        for check_id, title in _SKIPPED_TITLES
+        for row in _SKIPPED_TITLES
     ]
 
 
@@ -691,6 +884,7 @@ __all__ = [
     "check_replica_identity",
     "check_table_replicable",
     "check_publication_privilege",
+    "check_cdc_replication_objects",
     "check_postgres_cdc_prerequisites",
     "postgres_cdc_facts_are_unverified",
 ]

@@ -1028,6 +1028,9 @@ _PREREQ_CATEGORY_BY_CHECK: dict[PrerequisiteCheckId, PrereqCategory] = {
     # Also a server-level privilege (CREATE on the database + table ownership), so it sits
     # with REPLICATION_ROLE rather than under Schema & Tables.
     PrerequisiteCheckId.PUBLICATION_PRIVILEGE: PrereqCategory.SOURCE_CONFIG,
+    # Beside the privilege row on purpose, so the panel reads "can create" then
+    # "does exist" as a pair -- they are different questions with different remedies.
+    PrerequisiteCheckId.CDC_REPLICATION_OBJECTS: PrereqCategory.SOURCE_CONFIG,
     # Per-table, like REPLICA_IDENTITY below.
     PrerequisiteCheckId.TABLE_REPLICABLE: PrereqCategory.SCHEMA_TABLES,
     PrerequisiteCheckId.TABLE_PRIMARY_KEY: PrereqCategory.SCHEMA_TABLES,
@@ -2150,9 +2153,28 @@ def migration_type_requirements(
     meta = _MIGRATION_TYPE_META[mt]
     if mt not in _CDC_MIGRATION_TYPES or source_type is not SourceType.POSTGRES:
         return meta.requirements
-    return (
+    base = (
         "Needs a managed MSK pipeline and the source's change stream enabled — "
-        "PostgreSQL logical replication (wal_level=logical + a pgoutput publication)."
+        "PostgreSQL logical replication (wal_level=logical)."
+    )
+    # Split by TYPE, because on PostgreSQL the two modes differ in a way that decides
+    # whether the handoff can be gapless at all: only the combined type creates the
+    # publication and slot, and only BEFORE the load, when a slot can still be positioned
+    # at the snapshot point. Saying "a pgoutput publication" to both implied the CDC-only
+    # tile would arrange one. "MSK" must stay in the string -- the needs-infra icon keys
+    # on it.
+    if mt is MigrationType.CDC_ONLY:
+        return (
+            base
+            + " The publication and replication slot must ALREADY exist on the source: "
+            'this mode does not create them; only "Full load + CDC" does, at the snapshot '
+            "point. Without them CDC can still start by re-snapshotting every selected "
+            "table."
+        )
+    return (
+        base
+        + " The tool creates the publication and replication slot itself, at the Full "
+        "Load snapshot point, so the handoff has no gap."
     )
 
 

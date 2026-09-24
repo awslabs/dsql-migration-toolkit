@@ -13,6 +13,8 @@ Covers (Property 14 / Property 1 / Property 7 / Requirements 5.10, 5.11, 12.1):
 
 from __future__ import annotations
 
+from dataclasses import fields
+
 from dsql_migrator.core.models import (
     ConnectionResult,
     MigrationMode,
@@ -71,7 +73,7 @@ class _FakeSource:
     def variables(self) -> dict[str, str]:
         return dict(self._variables)
 
-    def cdc_prerequisites(self, table_names):
+    def cdc_prerequisites(self, table_names, *, publication_name="", slot_name=""):
         # None (default) -> the checker's PostgreSQL branch falls back to the
         # not-yet-supported INFO; a PostgresCdcFacts -> the real PG checks run.
         return self._cdc_facts
@@ -1011,6 +1013,7 @@ _PG_CDC_CHECK_IDS = (
     PrerequisiteCheckId.SLOT_WAL_RETENTION,
     PrerequisiteCheckId.SOURCE_IS_WRITER,
     PrerequisiteCheckId.REPLICA_IDENTITY,
+    PrerequisiteCheckId.CDC_REPLICATION_OBJECTS,
 )
 
 
@@ -1029,10 +1032,28 @@ def test_full_load_only_previews_the_postgres_readiness_checks_for_a_pg_source()
         assert result.status is PrerequisiteStatus.SKIP, (
             f"{check_id.value} must be previewed as SKIP in Full-Load-only mode"
         )
-        assert result.detail == "Not applicable for this mode.", (
+        # The reason is always the MODE, never the engine -- these DO apply to PostgreSQL
+        # under CDC. Two rows say more than that, deliberately: the ones that depend on
+        # provisioning are the only place this report can still tell the operator that the
+        # gapless choice expires when the Full Load starts.
+        assert result.detail.startswith("Not applicable for this mode"), (
             f"{check_id.value} DOES apply to PostgreSQL under CDC, so the reason is the "
             f"mode, not the engine: {result.detail!r}"
         )
+    provisioning_dependent = {
+        PrerequisiteCheckId.CDC_REPLICATION_OBJECTS,
+        PrerequisiteCheckId.SLOT_WAL_RETENTION,
+    }
+    for check_id in _PG_CDC_CHECK_IDS:
+        detail = _result(report, check_id).detail
+        if check_id in provisioning_dependent:
+            # A Full-load-only run creates NO slot, so the preview must say so here --
+            # after the load it is too late, and this row would otherwise imply the
+            # requirement is merely deferred rather than forfeited.
+            assert detail != "Not applicable for this mode.", check_id.value
+            assert "Full load + CDC" in detail or "replication slot" in detail
+        else:
+            assert detail == "Not applicable for this mode.", check_id.value
     # Still non-blocking -- a preview must never gate a Full Load.
     assert report.can_proceed is True
 
@@ -1369,7 +1390,7 @@ def test_the_checker_forwards_the_selected_tables_to_the_pg_probe() -> None:
     seen: list = []
 
     class _RecordingSource(_FakeSource):
-        def cdc_prerequisites(self, table_names):
+        def cdc_prerequisites(self, table_names, *, publication_name="", slot_name=""):
             seen.append(list(table_names))
             return _pg_facts_healthy(
                 replica_identity={n: "d" for n in table_names},
@@ -1575,3 +1596,245 @@ def test_walsender_count_is_unknown_rather_than_a_false_zero() -> None:
         _Connection(monitor=True), []
     )
     assert sighted.used_wal_senders == 7
+
+
+# --- CDC_REPLICATION_OBJECTS: existence, not privilege -------------------------
+# "Source user can create the CDC publication" PASSES while the publication is absent --
+# a privilege, not an existence, check. That is how a green pre-flight came to be followed
+# by a guaranteed deploy failure, and the two need different remedies (grant vs. run the
+# load / re-snapshot).
+
+
+def _pg_facts(**kw):
+    from dsql_migrator.core.prerequisites_postgres import PostgresCdcFacts
+
+    base = dict(
+        checked_publication_name="dsqlmig_pub_x",
+        checked_slot_name="dsqlmig_x",
+        publication_present=True,
+        publication_publishes_all_dml=True,
+        publication_tables=("app.orders", "app.items"),
+        slot_usable=True,
+        slot_present_any_database=True,
+    )
+    base.update(kw)
+    return PostgresCdcFacts(**base)
+
+
+def _tabs(*names):
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    return [
+        TableDef(
+            name=n,
+            columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+            primary_key=["id"],
+        )
+        for n in names
+    ]
+
+
+def test_the_existence_check_skips_in_the_mode_that_creates_the_objects() -> None:
+    """THE non-regression assertion. "Full load + CDC" creates both at the snapshot point,
+    so they are SUPPOSED to be absent beforehand -- this row must never read as a problem
+    in the one mode that works, or it would disable the Run button and deadlock it."""
+    from dsql_migrator.core.models import PrerequisiteStatus
+    from dsql_migrator.core.prerequisites_postgres import check_cdc_replication_objects
+
+    # Absent objects AND provisioning -> SKIP, not FAIL.
+    result = check_cdc_replication_objects(
+        _pg_facts(publication_present=False, slot_usable=False, publication_tables=()),
+        _tabs("app.orders"),
+        provisions_replication=True,
+    )
+    assert result.status is PrerequisiteStatus.SKIP
+    assert "Full Load creates" in result.detail
+    # required stays True so the row keeps its weight, but SKIP never gates progression.
+    assert result.required is True
+
+
+def test_the_existence_check_grades_absence_coverage_and_dml() -> None:
+    from dsql_migrator.core.models import PrerequisiteStatus
+    from dsql_migrator.core.prerequisites_postgres import check_cdc_replication_objects
+
+    def verdict(**kw):
+        return check_cdc_replication_objects(
+            _pg_facts(**kw), _tabs("app.orders", "app.items"),
+            provisions_replication=False,
+        )
+
+    # All present -> PASS.
+    assert verdict().status is PrerequisiteStatus.PASS
+
+    # Absent -> FAIL, and the remediation must say "before deploying" (the cost) and name
+    # BOTH routes, without recommending a hand-created slot.
+    absent = verdict(publication_present=False, publication_tables=())
+    assert absent.status is PrerequisiteStatus.FAIL and absent.required is True
+    assert "BEFORE deploying" in absent.remediation
+    assert "Full load + CDC" in absent.remediation
+    assert "re-snapshot" in absent.remediation
+    assert "CURRENT WAL position" in absent.remediation
+
+    # A publication that omits a selected table: RUNNING but replicating nothing for it.
+    gap = verdict(publication_tables=("app.orders",))
+    assert gap.status is PrerequisiteStatus.FAIL
+    assert "app.items" in gap.detail
+
+    # A narrowed publish list: the omitted change types never arrive, silently.
+    narrowed = verdict(publication_publishes_all_dml=False)
+    assert narrowed.status is PrerequisiteStatus.FAIL
+    assert "INSERT/UPDATE/DELETE" in narrowed.detail
+
+    # A missing SLOT is only a WARN: such a start re-snapshots, so it costs a re-read, not
+    # correctness. Grading it FAIL would block the one route a Full-load-only operator has.
+    no_slot = verdict(slot_usable=False, slot_present_any_database=False)
+    assert no_slot.status is PrerequisiteStatus.WARN
+    assert no_slot.required is False
+    assert "nothing is lost" in no_slot.remediation
+
+    # Unread facts are UNKNOWN, never absent -- an INFO that cannot gate anything.
+    unknown = verdict(publication_present=None)
+    assert unknown.status is PrerequisiteStatus.INFO and unknown.required is False
+
+
+def test_the_existence_check_is_gated_by_the_provisioners_own_predicate() -> None:
+    """The gate must come from _pg_cdc_handoff_stack, not a re-derived migration type.
+
+    That helper is the sole decider of whether the run provisions, so reusing it makes it
+    structurally impossible for the gate and the provisioner to disagree -- and it covers
+    cases a `migration_type is CDC_ONLY` test would miss (MySQL; CDC already streaming,
+    where the objects DO exist and the check should pass).
+    """
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    src = inspect.getsource(dm)
+    idx = src.index("request = PrerequisiteCheckRequest(")
+    window = src[max(0, idx - 900) : idx + 500]
+    assert "_pg_cdc_handoff_stack(" in window
+    assert "provisions_replication=_handoff_stack is not None" in window
+    # ...and NOT re-derived from the migration type, which is the drift this avoids.
+    assert "provisions_replication=migration_state.migration_type" not in src
+
+
+def test_the_checker_derives_the_object_names_and_forwards_the_provisioning_flag() -> None:
+    """End-to-end through the checker: the two wires the pure check cannot test itself.
+
+    Without this, the checker could pass ``provisions_replication=True`` unconditionally
+    (so the row always SKIPs and the gate is dead) or never derive the names (so the probe
+    reads nothing and the row is always INFO) -- and every pure-function test would still
+    be green.
+    """
+    from dsql_migrator.core import cdc_pg_slot
+    from dsql_migrator.core.prerequisites_postgres import PostgresCdcFacts
+
+    seen: dict = {}
+
+    class _Probe(_FakeSource):
+        def cdc_prerequisites(self, table_names, *, publication_name="", slot_name=""):
+            seen["pub"], seen["slot"] = publication_name, slot_name
+            base = _pg_facts_ok()
+            return PostgresCdcFacts(
+                **{
+                    **{f.name: getattr(base, f.name) for f in fields(base)},
+                    "checked_publication_name": publication_name,
+                    "checked_slot_name": slot_name,
+                    "publication_present": False,
+                    "publication_tables": (),
+                }
+            )
+
+    def _run(**kw):
+        checker = PrerequisiteChecker(
+            source_probe=_Probe(cdc_facts=_pg_facts_ok()),
+            target_probe=_FakeTarget(existing={"app.orders"}),
+            msk_probe=_FakeMsk(),
+        )
+        return checker.check(
+            PrerequisiteCheckRequest(
+                mode=MigrationMode.CDC,
+                tables=["app.orders"],
+                source_type=SourceType.POSTGRES,
+                **kw,
+            ),
+            tables=[_table("app.orders")],
+        )
+
+    report = _run(provisions_replication=False, cdc_stack_name="dsql-cdc-stack")
+    # The names are DERIVED from the stack, the same way dispatch_source_config does, so
+    # the check cannot be about different objects than the connector will use.
+    assert seen["pub"] == cdc_pg_slot.pg_publication_name("dsql-cdc-stack")
+    assert seen["slot"] == cdc_pg_slot.pg_slot_name("dsql-cdc-stack")
+    row = _result(report, PrerequisiteCheckId.CDC_REPLICATION_OBJECTS)
+    assert row.status is PrerequisiteStatus.FAIL
+    assert report.can_proceed is False  # a required FAIL gates it
+
+    # PAIRED: the SAME facts with provisioning ON must SKIP and never gate, or the mode
+    # that works would deadlock. Note the names are NOT derived in that mode either.
+    seen.clear()
+    ok = _run(provisions_replication=True, cdc_stack_name="dsql-cdc-stack")
+    skipped = _result(ok, PrerequisiteCheckId.CDC_REPLICATION_OBJECTS)
+    assert skipped.status is PrerequisiteStatus.SKIP
+    assert seen == {"pub": "", "slot": ""}
+
+
+def test_the_dialect_reports_an_unread_existence_fact_as_unknown_not_absent() -> None:
+    """Tri-state, not a defaulted bool -- the lesson already written into these facts.
+
+    A defaulted ``False`` here would assert an ABSENCE nobody verified, and the existence
+    check blocks on absence: an under-privileged or throttled catalog read would then
+    refuse a deploy whose objects are actually fine. And the names must only be asked about
+    when the caller supplied them, so a provisioning run reads nothing extra.
+    """
+    from dsql_migrator.core.source_dialect.postgres import PostgresSourceDialect
+
+    class _Conn:
+        """Answers everything as unreadable EXCEPT the plain settings reads."""
+
+        def __init__(self):
+            self.asked: list[str] = []
+
+        def execute(self, statement, params=None):
+            sql = str(statement)
+            self.asked.append(sql)
+            low = sql.lower()
+            if "pg_publication" in low or "pg_replication_slots" in low:
+                raise RuntimeError("permission denied")
+            outer = self
+
+            class _R:
+                def scalar(self):
+                    return "logical" if "wal_level" in low else None
+
+                def fetchall(self):
+                    return []
+
+                def first(self):
+                    return None
+
+            return _R()
+
+        def rollback(self):
+            return None
+
+    conn = _Conn()
+    facts = PostgresSourceDialect().probe_cdc_prerequisites(
+        conn, ["app.orders"], publication_name="p1", slot_name="s1"
+    )
+    # UNKNOWN (None), never False -- the check turns None into a non-blocking INFO.
+    assert facts.publication_present is None
+    assert facts.slot_usable is None
+    assert facts.publication_publishes_all_dml is None
+    # The names are still recorded, so the row can say WHICH objects it could not read.
+    assert facts.checked_publication_name == "p1"
+    assert facts.checked_slot_name == "s1"
+
+    # PAIRED: with NO names supplied (a provisioning run) the catalogs are not asked at all.
+    conn2 = _Conn()
+    facts2 = PostgresSourceDialect().probe_cdc_prerequisites(conn2, ["app.orders"])
+    assert facts2.checked_publication_name == ""
+    assert not any(
+        "pg_publication" in s.lower() and "pg_publication_tables" not in s.lower()
+        for s in conn2.asked
+    )

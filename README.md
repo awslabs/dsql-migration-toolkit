@@ -30,6 +30,14 @@ Two data paths converge on Aurora DSQL: a one-shot **Full Load** driven by the
 tool, and an optional continuous **CDC** stream on managed MSK Connect. A watermark
 (MySQL binlog/GTID, or PostgreSQL LSN) bridges the two for a gapless handoff.
 
+How that handoff stays gapless differs by engine. MySQL's binary log retains history with
+no consumer, so CDC can attach later and still resume from the watermark. PostgreSQL only
+retains WAL for a **logical replication slot**, and a slot cannot be created at a past
+position — so the slot has to exist *before* the load. Choose **Full load + CDC** and the
+tool creates it at the snapshot point; after a **Full-load-only** run that option is gone,
+and a later CDC start re-snapshots the tables instead (still gapless, but it reads the
+source again).
+
 <p align="center">
   <b>Simple architecture</b><br>
   <img src="docs/images/architecture-aws-simple.png" alt="Architecture diagram" width="720">
@@ -242,7 +250,7 @@ to both stacks. Debezium is open-source software running *on* MSK Connect.
 | --- | --- |
 | Amazon MSK (Serverless) | Kafka backbone: per-table topics partitioned by PK, plus a DLQ topic. |
 | Amazon MSK Connect | Managed Kafka Connect hosting the Debezium source and our custom DSQL sink connector (JSON converter, `schemas.enable=true` — no schema registry). |
-| AWS Lambda | In-VPC offset seeder (CFN custom resource) auto-seeding the Debezium watermark (MySQL GTID / PostgreSQL LSN) for a gapless handoff. |
+| AWS Lambda | In-VPC offset seeder (CFN custom resource) auto-seeding the Debezium watermark for a gapless handoff. **MySQL only** — a PostgreSQL stack resumes from its replication slot, so it creates no seeder. |
 | Amazon VPC | CDC runs in the VPC you provide (typically the source's) to reach the source privately — optionally in its own subnets + NAT that the stack creates there. |
 
 </details>

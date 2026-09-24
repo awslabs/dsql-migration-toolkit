@@ -5,6 +5,50 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.508
+
+### Added
+
+- **A prerequisite row for whether CDC's publication and replication slot actually EXIST.**
+  "Source user can create the CDC publication" checks a PRIVILEGE, so it passed green while
+  the object was absent -- which is how a green pre-flight came to be followed by a
+  guaranteed deploy failure. The two are different questions with different remedies (grant
+  vs. run the load / re-snapshot), so they are now separate rows, side by side. It grades
+  coverage, not just existence: a publication that omits a selected table, or that narrows
+  its INSERT/UPDATE/DELETE list, FAILS -- each would leave the connector reporting RUNNING
+  while replicating nothing for those tables or those change types. A missing SLOT is only a
+  WARN, because such a start re-snapshots and so costs a re-read, not correctness. Unread
+  facts stay UNKNOWN and cannot gate anything.
+
+  The row is gated on the PROVISIONER's own predicate, not on the migration type: in
+  "Full load + CDC" the objects are supposed to be absent beforehand (the Full Load creates
+  them), so the row SKIPs there and can never block the one path that is gapless.
+
+### Changed
+
+- **Deploying the CDC infrastructure for a "CDC only" run is refused when the source has
+  nothing to stream from**, before the ~5-minute billable MSK Serverless create rather than
+  after it. Asymmetric by design: a "Full load + CDC" run is left alone, because deploying
+  the infrastructure before the load is the flow the tool itself recommends and the objects
+  legitimately do not exist yet. It cannot strand anyone -- the Start-side check re-probes
+  rather than remembering this verdict, so provisioning in between simply clears it.
+- **A Full-load-only PostgreSQL run no longer recommends the broken path in the tool's own
+  voice.** The post-load invite said to set the type to "CDC only" because it "streams from
+  this Full Load's watermark onto the already-loaded target (no re-snapshot)" -- false on
+  both counts for PostgreSQL -- and offered a one-click jump to do it. It now explains that
+  no slot was created, that a gapless handoff needs the slot to exist BEFORE the load, and
+  what the two honest routes cost. MySQL's wording is unchanged and remains true.
+- **The "CDC only" tile no longer implies it will arrange a publication.** Its PostgreSQL
+  requirements now say the publication and slot must already exist and that this mode does
+  not create them; the "Full load + CDC" tile says the tool creates them at the snapshot
+  point. The Full-load-only prerequisite PREVIEW says it too -- that report is the last
+  moment the gapless choice is still available.
+- **A FAILED connector's troubleshooting line names its CloudWatch log group** instead of
+  promising a link that was never rendered anywhere in the UI.
+- README and the cdc-stack template no longer describe the gapless handoff
+  source-agnostically: the mechanism differs by engine, and the PostgreSQL half is what the
+  source-agnostic wording got wrong.
+
 ## v0.1.507
 
 ### Fixed

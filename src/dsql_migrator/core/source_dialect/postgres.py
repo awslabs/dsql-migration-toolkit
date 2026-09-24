@@ -966,7 +966,9 @@ class PostgresSourceDialect(SourceDialect):
         except (TypeError, ValueError):
             return None
 
-    def probe_cdc_prerequisites(self, connection: object, table_names):
+    def probe_cdc_prerequisites(
+        self, connection: object, table_names, *, publication_name="", slot_name=""
+    ):
         # Gather the PostgreSQL CDC logical-replication readiness facts read-only and
         # best-effort (each field None/False on any failure, so an under-privileged
         # source degrades to "unknown" rather than erroring the gate). All plain SHOW /
@@ -997,6 +999,11 @@ class PostgresSourceDialect(SourceDialect):
             except Exception:  # noqa: BLE001 - best-effort probe
                 _rollback()
                 return None
+
+        def _bool_or_none(value):
+            # None must stay None: "not read" is not "absent". A defaulted False here
+            # would assert an absence nobody verified and block the deploy on it.
+            return None if value is None else bool(value)
 
         def _rows(sql: str, params=None):
             try:
@@ -1148,6 +1155,60 @@ class PostgresSourceDialect(SourceDialect):
                     "SELECT setting FROM pg_settings "
                     "WHERE name = 'max_slot_wal_keep_size'"
                 )
+            ),
+            # Do CDC's objects EXIST? Only asked when the caller knows their names, i.e.
+            # when this run must FIND them rather than create them. Each read goes through
+            # _scalar/_rows, so one unreadable catalog blanks only its OWN fact instead of
+            # poisoning the transaction and nulling every later one. The slot match is
+            # scoped to a logical pgoutput slot in THIS database: pg_replication_slots is
+            # cluster-wide, so a bare name match can hit a slot the connector cannot use.
+            **(
+                {
+                    "checked_publication_name": publication_name,
+                    "checked_slot_name": slot_name,
+                    "publication_present": _bool_or_none(
+                        _scalar(
+                            "SELECT count(*) > 0 FROM pg_publication "
+                            "WHERE pubname = :p",
+                            {"p": publication_name},
+                        )
+                    ),
+                    "publication_publishes_all_dml": _bool_or_none(
+                        _scalar(
+                            "SELECT bool_and(pubinsert AND pubupdate AND pubdelete) "
+                            "FROM pg_publication WHERE pubname = :p",
+                            {"p": publication_name},
+                        )
+                    ),
+                    "publication_tables": tuple(
+                        str(r[0])
+                        for r in (
+                            _rows(
+                                "SELECT schemaname || '.' || tablename "
+                                "FROM pg_publication_tables WHERE pubname = :p",
+                                {"p": publication_name},
+                            )
+                            or ()
+                        )
+                    ),
+                    "slot_present_any_database": _bool_or_none(
+                        _scalar(
+                            "SELECT count(*) > 0 FROM pg_replication_slots "
+                            "WHERE slot_name = :s",
+                            {"s": slot_name},
+                        )
+                    ),
+                    "slot_usable": _bool_or_none(
+                        _scalar(
+                            "SELECT count(*) > 0 FROM pg_replication_slots "
+                            "WHERE slot_name = :s AND slot_type = 'logical' "
+                            "AND plugin = 'pgoutput' AND database = current_database()",
+                            {"s": slot_name},
+                        )
+                    ),
+                }
+                if publication_name and slot_name
+                else {}
             ),
         )
 
