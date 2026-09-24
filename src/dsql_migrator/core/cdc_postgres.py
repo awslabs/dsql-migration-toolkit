@@ -146,10 +146,17 @@ def build_pg_source_config(
     tables from scratch (``initial``) instead of using the gapless slot. There is no
     manual WAL-LSN value to carry, so this is a plain flag, not a ``resume_override``.
 
-    ``slot_name`` / ``publication_name`` name the pre-created objects (the tool/DBA
-    creates them out of band; the live creation wiring is a later phase, which is why
-    they are passed in here rather than derived). ``column_exclude_list`` and
-    ``message_key_columns`` mean the same as on the MySQL source config. Pure.
+    ``slot_name`` / ``publication_name`` name the objects the connector will use. Exactly
+    ONE thing creates them in production: the Full Load's provisioning step
+    (``_full_load_engine._capture_postgres_watermark`` ->
+    ``cdc_pg_slot.provision_pg_replication``), and only when that run is part of a CDC
+    plan. NOTHING creates them for a CDC-only start -- which is why a late start must
+    either FIND them already on the source or let Debezium autocreate the publication and
+    re-snapshot (``publication_autocreate_mode="filtered"`` + ``snapshot_mode="initial"``).
+    Late provisioning is not an option: a slot cannot be created at a past LSN, so it
+    would start streaming from now and silently skip the load-to-start window.
+    ``column_exclude_list`` and ``message_key_columns`` mean the same as on the MySQL
+    source config. Pure.
     """
     resume = (
         resume_override
@@ -161,6 +168,19 @@ def build_pg_source_config(
         and resume_override is None
         and resume is not None
         and resume.can_resume_from_lsn()
+        # The RECORD of provisioning, not just a coordinate. Only a Full-Load-+-CDC run
+        # writes ``slot_name`` onto the WATERMARK, and only then is the slot known to sit
+        # AT this LSN. A Full-load-only watermark carries a wal_lsn and NO slot, so
+        # ``never`` would resume from a slot of unknown position -- or from one Debezium
+        # creates at NOW, which silently drops every change committed since the load. A
+        # logical replication slot cannot be created at, or rewound to, a past LSN
+        # (live-verified on PostgreSQL 16 and 18: the function takes no LSN argument,
+        # CREATE_REPLICATION_SLOT rejects one, pg_replication_slot_advance only moves
+        # forward, and START_REPLICATION silently clamps), so the honest fallback is
+        # ``initial``: snapshot, then stream from the slot Debezium made -- no window
+        # between the two, so nothing is lost. Note the ``slot_name`` PARAMETER is always
+        # non-empty (derived from the stack name) and must NOT be used for this test.
+        and bool(getattr(watermark, "slot_name", None))
     )
     mode: Literal["never", "initial", "no_data"] = "never" if has_lsn else "initial"
     return PostgresSourceConfig(
@@ -320,6 +340,7 @@ def dispatch_source_config(
     resume_override: Optional[CdcResumePoint] = None,
     force_initial_snapshot: bool = False,
     message_key_columns: Optional[Mapping[str, Sequence[str]]] = None,
+    publication_autocreate_mode: str = "disabled",
 ):
     """Build the source connector config for ``source_type`` (MySQL or PostgreSQL).
 
@@ -333,6 +354,12 @@ def dispatch_source_config(
     start choice = re-snapshot) is honored only on the PG path. MySQL -> the orchestrator's
     ``build_source_config`` exactly as before (byte-identical; the flag does not apply --
     MySQL's manual start is a seeded ``resume_override``).
+
+    ``publication_autocreate_mode`` defaults to ``"disabled"`` (the tool's publication is
+    created by the Full Load, so the connector must never invent one). ``"filtered"`` is the
+    one supported escape: paired with ``force_initial_snapshot`` it lets a CDC-only start
+    create its own publication over exactly the captured tables and re-snapshot them, which
+    is gapless by construction. Ignored on the MySQL path.
     """
     if source_type is SourceType.POSTGRES:
         from dsql_migrator.core import cdc_pg_slot
@@ -354,6 +381,7 @@ def dispatch_source_config(
             message_key_columns=message_key_columns,
             resume_override=resume_override,
             force_initial_snapshot=force_initial_snapshot,
+            publication_autocreate_mode=publication_autocreate_mode,
         )
     from dsql_migrator.core.cdc import CdcPipelineOrchestrator
 

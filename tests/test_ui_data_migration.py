@@ -24567,3 +24567,236 @@ def test_the_deploy_dialog_reports_a_failed_lookup_as_its_own_stage(monkeypatch)
     quiet = cdc_ui._msk_seed_admission(state, mysql)
     assert (quiet.cidr, quiet.blocker, quiet.warning, quiet.note) == ("", "", "", "")
     assert calls == []
+
+
+# --- PostgreSQL CDC start: the publication/slot precondition --------------------
+
+
+def test_the_pg_replication_probe_fails_open_and_is_engine_scoped(monkeypatch) -> None:
+    # Unreadable is NOT absent: a denied catalog read, a missing source password after a
+    # restart, or a MySQL source must all degrade to silence, because a missing
+    # publication kills the connector LOUDLY anyway. A probe that blocked on uncertainty
+    # would strand operators whose source the tool merely could not ask.
+    from types import SimpleNamespace
+
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+    from dsql_migrator.core.models import SourceType
+
+    state = DataMigrationState()
+    wm = SimpleNamespace(slot_name=None, publication_name=None)
+
+    # MySQL: never probed at all.
+    calls = []
+    monkeypatch.setattr(
+        "dsql_migrator.ui.connect.make_source_engine_factory",
+        lambda *_a, **_k: (lambda *_b, **_c: calls.append(1) or (_ for _ in ()).throw(RuntimeError("x"))),
+    )
+    mysql = SimpleNamespace(
+        source_config=SimpleNamespace(source_type=SourceType.MYSQL), source_password=None
+    )
+    assert cdc_ui._probe_pg_replication_objects(state, mysql, [], wm) is None
+    assert calls == []
+
+    # PostgreSQL with an unusable engine -> silence, not a block.
+    pg = SimpleNamespace(
+        source_config=SimpleNamespace(source_type=SourceType.POSTGRES, database="app"),
+        source_password=None,
+    )
+    assert cdc_ui._probe_pg_replication_objects(state, pg, [], wm) is None
+
+    # No source_config at all (a fresh session) -> silence.
+    assert (
+        cdc_ui._probe_pg_replication_objects(
+            state, SimpleNamespace(source_config=None), [], wm
+        )
+        is None
+    )
+
+
+def test_the_probe_checks_the_objects_the_connector_will_actually_use(monkeypatch) -> None:
+    # The probe and dispatch_source_config must resolve the SAME names, or the check is
+    # about different objects than the connector. Both prefer the watermark's recorded
+    # names and fall back to the stack-derived ones.
+    from types import SimpleNamespace
+
+    import dsql_migrator.core.cdc_pg_slot as pg_slot
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+    from dsql_migrator.core.models import SourceType
+
+    seen: dict = {}
+
+    def _read(_conn, *, publication_name, slot_name):
+        seen["pub"], seen["slot"] = publication_name, slot_name
+        return pg_slot.PgReplicationObjects(
+            publication_name=publication_name, slot_name=slot_name,
+            publication_present=True, publication_publishes_all_dml=True,
+            publication_tables=frozenset({"app.orders"}),
+            slot_present_any_database=True, slot_usable=True,
+        )
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_e):
+            return False
+
+    class _Eng:
+        def connect(self):
+            return _Conn()
+
+        def dispose(self):
+            return None
+
+    monkeypatch.setattr(pg_slot, "read_pg_replication_objects", _read)
+    monkeypatch.setattr(
+        "dsql_migrator.ui.connect.make_source_engine_factory",
+        lambda *_a, **_k: (lambda *_b, **_c: _Eng()),
+    )
+    state = DataMigrationState()
+    state.cdc_stack_name = "dsql-cdc-stack"
+    pg = SimpleNamespace(
+        source_config=SimpleNamespace(source_type=SourceType.POSTGRES, database="app"),
+        source_password=None,
+    )
+    tables = [SimpleNamespace(name="app.orders")]
+
+    # No recorded names -> derived from the stack, exactly like dispatch_source_config.
+    cdc_ui._probe_pg_replication_objects(
+        state, pg, tables, SimpleNamespace(slot_name=None, publication_name=None)
+    )
+    assert seen["pub"] == pg_slot.pg_publication_name("dsql-cdc-stack")
+    assert seen["slot"] == pg_slot.pg_slot_name("dsql-cdc-stack")
+
+    # Recorded names win, so a stack rename after Full Load cannot point the check at a
+    # different object than the connector resumes from.
+    cdc_ui._probe_pg_replication_objects(
+        state, pg, tables,
+        SimpleNamespace(slot_name="recorded_slot", publication_name="recorded_pub"),
+    )
+    assert (seen["pub"], seen["slot"]) == ("recorded_pub", "recorded_slot")
+
+
+def test_start_cdc_is_blocked_on_the_worker_thread_when_the_publication_is_missing(
+    monkeypatch,
+) -> None:
+    # The dialog blocks first, but "Retry CDC" submits this job with NO dialog and a
+    # cached verdict can be stale -- so the job itself must refuse before creating
+    # anything. Nothing may be built: reaching build_cdc_stack_deployer means the
+    # connectors get created and the Debezium task dies after the stack update.
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+    from dsql_migrator.core.models import SourceType
+
+    monkeypatch.setattr(
+        cdc_ui, "_probe_pg_replication_objects",
+        lambda *_a, **_k: ("CDC's publication does not exist on the source", "do X"),
+    )
+    with pytest.raises(RuntimeError) as exc:
+        _run_start_cdc_capture_seed_mode(
+            monkeypatch, source_type=SourceType.POSTGRES, host_seed_mode="lambda"
+        )
+    # The refusal names the cause. It raises BEFORE run_cdc_start, so no connector is
+    # created and the cdc-stack is untouched -- exactly the waste the block prevents.
+    assert "Start CDC blocked" in str(exc.value)
+    assert "publication does not exist" in str(exc.value)
+
+    # PAIRED: with the objects present the same job runs THROUGH the backstop and reaches
+    # run_cdc_start. Without this half the test would pass for a backstop that refuses
+    # unconditionally, which would break the mode that works.
+    monkeypatch.setattr(cdc_ui, "_probe_pg_replication_objects", lambda *_a, **_k: None)
+    seed_mode, _notices, submitted = _run_start_cdc_capture_seed_mode(
+        monkeypatch, source_type=SourceType.POSTGRES, host_seed_mode="lambda"
+    )
+    assert submitted and seed_mode == "external"
+
+
+def test_pg_connector_failures_are_diagnosed_instead_of_left_to_cloudwatch() -> None:
+    # The reporter had to open the MSK Connect log group to learn why the task died: every
+    # existing needle was MySQL/MSK-flavoured, so a PostgreSQL failure produced the
+    # content-free "<connector> entered FAILED state."
+    from dsql_migrator.core.cdc_deployer import _diagnose_connector_log
+
+    real_log = (
+        "[dsql-cdc-stack-debezium-source|task-0] Creating new publication "
+        "'dsqlmig_pub_dsql_cdc_stack_e39edcbe' for plugin 'PGOUTPUT'\n"
+        "ERROR WorkerSourceTask{id=dsql-cdc-stack-debezium-source-0} Task threw an "
+        "uncaught and unrecoverable exception.\n"
+        "org.apache.kafka.connect.errors.ConnectException: Publication autocreation is "
+        "disabled, please create one and restart the connector."
+    )
+    guidance = _diagnose_connector_log("dsql-cdc-stack-debezium-source", real_log)
+    assert guidance is not None
+    assert "Re-snapshot every table instead" in guidance
+    # ...and it must warn OFF the remedy that silently loses data.
+    assert "cannot start at a past position" in guidance
+    # An unrelated log still yields nothing rather than a wrong diagnosis.
+    assert _diagnose_connector_log("c", "something else entirely") is None
+
+
+def test_the_probe_only_demands_a_slot_when_the_start_would_resume_from_one(
+    monkeypatch,
+) -> None:
+    """``resumes_from_slot`` must come from the WATERMARK, matching the config invariant.
+
+    Hardcoding it True would block every re-snapshot start -- the one path a Full-load-only
+    operator has left -- leaving them nothing at all. Hardcoding it False would let a
+    resume-from-slot start proceed against a slot that does not exist, which is the silent
+    gap. So drive the real probe both ways with a source that has a publication but NO
+    usable slot, and assert the two verdicts differ.
+    """
+    from types import SimpleNamespace
+
+    import dsql_migrator.core.cdc_pg_slot as pg_slot
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+    from dsql_migrator.core.models import SourceType
+
+    def _read(_conn, *, publication_name, slot_name):
+        return pg_slot.PgReplicationObjects(
+            publication_name=publication_name, slot_name=slot_name,
+            publication_present=True, publication_publishes_all_dml=True,
+            publication_tables=frozenset({"app.orders"}),
+            slot_present_any_database=False, slot_usable=False,
+        )
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_e):
+            return False
+
+    class _Eng:
+        def connect(self):
+            return _Conn()
+
+        def dispose(self):
+            return None
+
+    monkeypatch.setattr(pg_slot, "read_pg_replication_objects", _read)
+    monkeypatch.setattr(
+        "dsql_migrator.ui.connect.make_source_engine_factory",
+        lambda *_a, **_k: (lambda *_b, **_c: _Eng()),
+    )
+    state = DataMigrationState()
+    state.cdc_stack_name = "dsql-cdc-stack"
+    pg = SimpleNamespace(
+        source_config=SimpleNamespace(source_type=SourceType.POSTGRES, database="app"),
+        source_password=None,
+    )
+    tables = [SimpleNamespace(name="app.orders")]
+
+    # NO recorded slot -> the start re-snapshots, Debezium makes its own slot, so a
+    # missing slot is not a gap and must NOT block.
+    assert (
+        cdc_ui._probe_pg_replication_objects(
+            state, pg, tables, SimpleNamespace(slot_name=None, publication_name="p")
+        )
+        is None
+    )
+    # A recorded slot -> the start would resume from it (snapshot.mode=never), and it is
+    # not there. That IS the silent gap, so it must block.
+    blocked = cdc_ui._probe_pg_replication_objects(
+        state, pg, tables, SimpleNamespace(slot_name="recorded", publication_name="p")
+    )
+    assert blocked is not None
+    assert "cannot be created at a past position" in blocked[1]

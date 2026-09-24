@@ -356,7 +356,45 @@ _CONNECTOR_LOG_DIAGNOSES: tuple[tuple[str, str], ...] = (
         "(access denied). Verify the CDC user's username/password and that it has the "
         "required REPLICATION privileges, then Start CDC again.",
     ),
+    # --- PostgreSQL source ----------------------------------------------------
+    # Every needle above is MySQL/MSK-flavoured, so a PostgreSQL source connector that
+    # died got the content-free "<connector> entered FAILED state." and the operator had
+    # to open the MSK Connect log group themselves.
+    (
+        "publication autocreation is disabled",
+        "{connector} failed: the PostgreSQL CDC publication does not exist on the "
+        "source, and the connector is configured not to create one. Only a "
+        "'Full load + CDC' run creates it. Delete the connectors (Stop CDC), then Start "
+        "CDC again and choose \"Re-snapshot every table instead\" when the dialog offers "
+        "it -- that lets the connector create its own publication and snapshot the "
+        "tables, which has no replication gap. Do NOT create a replication slot by hand "
+        "to resume from: a slot cannot start at a past position, so it would silently "
+        "skip every change made since the Full Load.",
+    ),
+    (
+        "replication slot",
+        "{connector} failed while setting up its PostgreSQL replication slot. Check that "
+        "the source's wal_level is 'logical', that the CDC user has REPLICATION (or is "
+        "rds_replication on RDS/Aurora), and that max_replication_slots is not "
+        "exhausted; the connector's log line above names the specific cause.",
+    ),
 )
+
+
+def _connector_timeout_message(deployer, stack_name: str, connector: str) -> str:
+    """Timeout text, with the worker log's diagnosis when it explains the stall.
+
+    Diagnose on TIMEOUT too, not only on connectorState=FAILED. MSK Connect exposes no
+    task-level state and no last-task exception (the kafkaconnect API has no task
+    operation; stateDescription is only on DescribeConnector), so a connector whose only
+    task died at startup can sit in CREATING until the budget expires with the cause
+    visible ONLY in CloudWatch -- which is exactly the trip the operator should not have
+    to make. Falls back to the bare timeout wording when nothing matches.
+    """
+    message = _connector_failure_message(deployer, stack_name, connector)
+    if message.endswith("entered FAILED state."):
+        return f"{connector} did not reach RUNNING in time."
+    return f"{connector} did not reach RUNNING in time. {message}"
 
 
 def _diagnose_connector_log(connector: str, log_tail: str) -> Optional[str]:
@@ -1638,7 +1676,9 @@ def _wait_connector_running(
                     f"Could not read {connector} state: {cause}.{hint}"
                 )
             if _deadline_passed(deadline):
-                raise CdcDeployError(f"{connector} did not reach RUNNING in time.")
+                raise CdcDeployError(_connector_timeout_message(
+                    deployer, stack_name, connector
+                ))
             driver.sleep(interval)
             continue
         read_failures = 0  # a successful read clears the transient-failure streak
@@ -1649,7 +1689,9 @@ def _wait_connector_running(
             raise CdcDeployError(_connector_failure_message(deployer, stack_name, connector))
         driver.log(f"{connector}: {state or 'creating'}…")
         if _deadline_passed(deadline):
-            raise CdcDeployError(f"{connector} did not reach RUNNING in time.")
+            raise CdcDeployError(_connector_timeout_message(
+                    deployer, stack_name, connector
+                ))
         driver.sleep(interval)
 
 

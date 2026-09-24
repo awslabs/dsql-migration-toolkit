@@ -55,8 +55,21 @@ def _sink() -> SinkConnectorConfig:
     )
 
 
-def _wm(*, wal_lsn: str | None = None) -> Watermark:
-    return Watermark(snapshot_timestamp=datetime.now(timezone.utc), wal_lsn=wal_lsn)
+def _wm(*, wal_lsn: str | None = None, slot_name: str | None = None) -> Watermark:
+    """A PostgreSQL watermark.
+
+    ``slot_name`` is load-bearing and NOT interchangeable with ``wal_lsn``: it is the
+    tool's record that the slot was CREATED at that LSN, which only a Full-Load-+-CDC run
+    writes. A watermark with an LSN and no slot is what a "Full load only" run produces,
+    and it must NOT select snapshot.mode=never -- a slot cannot be created at a past LSN,
+    so resuming would silently skip the load-to-start window. Pass both to model the
+    gapless handoff; pass wal_lsn alone to model the Full-load-only case.
+    """
+    return Watermark(
+        snapshot_timestamp=datetime.now(timezone.utc),
+        wal_lsn=wal_lsn,
+        slot_name=slot_name,
+    )
 
 
 def _neutral_infra_kwargs() -> dict:
@@ -93,10 +106,13 @@ def test_resume_point_carries_wal_lsn_from_watermark() -> None:
 
 def test_pg_source_config_gapless_uses_snapshot_never() -> None:
     src = build_pg_source_config(
-        "pg-source", _tables(), _wm(wal_lsn="3/AF012B8"),
+        "pg-source", _tables(), _wm(wal_lsn="3/AF012B8", slot_name="dsqlmig_s1"),
         database_name="app", slot_name="dsqlmig_s1", publication_name="dsqlmig_pub1",
     )
-    assert src.snapshot_mode == "never"  # slot holds the start LSN -> no snapshot
+    # The WATERMARK's slot_name is what makes this gapless: it is the record that the slot
+    # was created AT this LSN. With an LSN alone (a "Full load only" run) the mode must be
+    # `initial`, because a slot cannot be created at a past LSN.
+    assert src.snapshot_mode == "never"
     assert src.table_include_list == ["app.orders", "app.customers"]
     assert src.database_name == "app"
     assert src.slot_name == "dsqlmig_s1"
@@ -119,14 +135,15 @@ def test_pg_source_config_force_initial_snapshot_overrides_gapless() -> None:
     # would otherwise select `never`). Debezium PG resumes only from the slot, so Manual
     # cannot supply a start LSN -- it re-snapshots instead.
     forced = build_pg_source_config(
-        "pg-source", _tables(), _wm(wal_lsn="3/AF012B8"),
+        "pg-source", _tables(), _wm(wal_lsn="3/AF012B8", slot_name="s1"),
         database_name="app", slot_name="s1", publication_name="p1",
         force_initial_snapshot=True,
     )
     assert forced.snapshot_mode == "initial"
-    # Without the flag the same gapless watermark -> never (Automatic).
+    # Without the flag the same gapless watermark -> never (Automatic). "Gapless" here
+    # requires the watermark's recorded slot, not just its LSN.
     auto = build_pg_source_config(
-        "pg-source", _tables(), _wm(wal_lsn="3/AF012B8"),
+        "pg-source", _tables(), _wm(wal_lsn="3/AF012B8", slot_name="s1"),
         database_name="app", slot_name="s1", publication_name="p1",
     )
     assert auto.snapshot_mode == "never"
@@ -164,8 +181,10 @@ def test_pg_source_config_manual_override_snapshots_initial() -> None:
 
 
 def _pg_infra():
+    # A GAPLESS handoff: the watermark carries both the LSN and the slot the Full Load
+    # created at it, which is what selects PgSnapshotMode=never.
     src = build_pg_source_config(
-        "pg-source", _tables(), _wm(wal_lsn="3/AF012B8"),
+        "pg-source", _tables(), _wm(wal_lsn="3/AF012B8", slot_name="dsqlmig_s1"),
         database_name="app", slot_name="dsqlmig_s1", publication_name="dsqlmig_pub1",
     )
     return build_pg_cdc_infra_params(src, _sink(), **_neutral_infra_kwargs())
@@ -248,7 +267,7 @@ def test_every_emitted_pg_infra_param_is_declared_in_the_template() -> None:
 
 def test_pg_stack_params_swap_snapshot_for_engine_and_pg_snapshot() -> None:
     src = build_pg_source_config(
-        "pg-source", _tables(), _wm(wal_lsn="3/AF012B8"),
+        "pg-source", _tables(), _wm(wal_lsn="3/AF012B8", slot_name="s1"),
         database_name="app", slot_name="s1", publication_name="p1",
     )
     params = build_pg_cdc_stack_params(src, _sink(), target_endpoint="ep")
@@ -326,7 +345,12 @@ def test_dispatch_source_config_branches_by_engine() -> None:
     assert isinstance(mysql_cfg, DebeziumSourceConfig)
     assert mysql_cfg.name == "mysql-source"
     # PostgreSQL -> a PostgresSourceConfig with the database + deterministic slot/pub
-    # names from the stack, snapshot.mode=never (a WAL LSN is present).
+    # names derived from the stack, and snapshot.mode=INITIAL -- not `never`. This
+    # watermark has a WAL LSN but NO recorded slot, which is exactly what a "Full load
+    # only" run produces: nothing was retaining WAL during the load, and a slot cannot be
+    # created at a past LSN, so resuming would silently skip the load-to-start window.
+    # Re-snapshotting is the only gapless option left. (This assertion used to be `never`,
+    # i.e. it asserted the defect.)
     pg_cfg = dispatch_source_config(
         SourceType.POSTGRES, tables, _wm(wal_lsn="3/AF012B8"),
         database="app", stack_name="mysql-dsql-cdc-stack",
@@ -338,8 +362,14 @@ def test_dispatch_source_config_branches_by_engine() -> None:
 
     assert pg_cfg.slot_name == pg_slot_name("mysql-dsql-cdc-stack")
     assert pg_cfg.publication_name == pg_publication_name("mysql-dsql-cdc-stack")
-    assert pg_cfg.snapshot_mode == "never"
+    assert pg_cfg.snapshot_mode == "initial"
     assert pg_cfg.table_include_list == ["app.orders", "app.customers"]
+    # ...and WITH the recorded slot the same call is gapless.
+    gapless = dispatch_source_config(
+        SourceType.POSTGRES, tables, _wm(wal_lsn="3/AF012B8", slot_name="dsqlmig_s9"),
+        database="app", stack_name="mysql-dsql-cdc-stack",
+    )
+    assert gapless.snapshot_mode == "never"
 
 
 def test_dispatch_source_config_uses_recorded_watermark_names() -> None:
@@ -480,3 +510,55 @@ def test_pg_stack_params_filled_carries_no_plugin_location_or_immutable_param() 
         "DebeziumPostgresPluginS3Key", "DebeziumPluginS3Key", "PluginBucketArn",
         "DsqlSinkPluginS3Key", "LambdaSeederS3Key", "PluginVersion",
     }), filled_keys
+
+
+# --- The recorded SLOT, not just an LSN, is what makes a handoff gapless --------
+# A "Full load only" run writes wal_lsn and NO slot_name, because nothing provisioned a
+# slot. v0.1.506 keyed snapshot.mode on the LSN alone, so such a watermark selected
+# `never` -- resume from a slot that does not exist. If the objects happened to be there
+# (an operator created them by hand, or a previous session left them), the connector would
+# start and SILENTLY skip every change committed since the load. A slot cannot be created
+# at, or rewound to, a past LSN (verified live on PostgreSQL 16 and 18), so re-snapshotting
+# is the only gapless option and `initial` is the only honest mode.
+
+
+def test_a_full_load_only_watermark_must_not_select_snapshot_never() -> None:
+    lsn_only = build_pg_source_config(
+        "pg-source", _tables(), _wm(wal_lsn="3/AF012B8"),
+        database_name="app", slot_name="s1", publication_name="p1",
+    )
+    assert lsn_only.snapshot_mode == "initial"
+    # The slot_name PARAMETER is always non-empty (derived from the stack name), so it
+    # must NOT be what the decision reads -- only the WATERMARK's record counts.
+    assert lsn_only.slot_name == "s1"
+
+    with_slot = build_pg_source_config(
+        "pg-source", _tables(), _wm(wal_lsn="3/AF012B8", slot_name="s1"),
+        database_name="app", slot_name="s1", publication_name="p1",
+    )
+    assert with_slot.snapshot_mode == "never"
+
+
+def test_publication_autocreate_mode_reaches_the_stack_params() -> None:
+    # The one supported escape for a CDC-only start: the CONNECTOR creates a publication
+    # over exactly the captured tables and re-snapshots them. Paired with the forced
+    # initial snapshot that start is gapless by construction.
+    cfg = dispatch_source_config(
+        SourceType.POSTGRES, _tables(), _wm(wal_lsn="3/AF012B8"),
+        database="app", stack_name="dsql-cdc-stack",
+        force_initial_snapshot=True,
+        publication_autocreate_mode="filtered",
+    )
+    assert cfg.publication_autocreate_mode == "filtered"
+    assert cfg.snapshot_mode == "initial"
+    params = dict(build_pg_cdc_stack_params(cfg, _sink(), target_endpoint="ep").filled)
+    assert params["PgPublicationAutocreateMode"] == "filtered"
+    assert params["PgSnapshotMode"] == "initial"
+    # Default stays disabled, so every existing caller is unchanged.
+    assert (
+        dispatch_source_config(
+            SourceType.POSTGRES, _tables(), _wm(wal_lsn="3/AF012B8"),
+            database="app", stack_name="dsql-cdc-stack",
+        ).publication_autocreate_mode
+        == "disabled"
+    )

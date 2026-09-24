@@ -172,6 +172,12 @@ class DataMigrationState:
         # lets the UI show a clear radio choice and keep "Manual + empty inputs"
         # distinct from "Automatic".
         self._cdc_start_mode: str = "auto"
+        # Set only when the operator takes the Start dialog's "Re-snapshot every table
+        # instead" escape on a PostgreSQL source whose CDC publication does not exist. It
+        # lets the CONNECTOR (never the tool) create a publication over exactly the
+        # captured tables, which paired with the forced initial snapshot is gapless by
+        # construction. Cleared by the same reset that clears _cdc_start_mode.
+        self._cdc_pg_autocreate_publication: bool = False
         # Manual CDC start-position override the operator entered (a GTID set or
         # a binlog file:position). Only used when ``_cdc_start_mode == "manual"``.
         self._cdc_start_gtid: Optional[str] = None
@@ -486,6 +492,22 @@ class DataMigrationState:
         """Return the chosen CDC start mode (``"auto"`` or ``"manual"``)."""
         with self._lock:
             return self._cdc_start_mode
+
+    def set_cdc_pg_autocreate_publication(self, enabled: bool) -> None:
+        """Let the Debezium connector create the PostgreSQL CDC publication itself.
+
+        Only the Start dialog's re-snapshot escape sets this, and only when the source has
+        no publication. It selects ``publication.autocreate.mode=filtered``, so the
+        CONNECTOR's database user creates a publication over exactly the captured tables --
+        the tool itself still never writes to the source.
+        """
+        with self._lock:
+            self._cdc_pg_autocreate_publication = bool(enabled)
+
+    def cdc_pg_autocreate_publication(self) -> bool:
+        """Whether the connector may create the PostgreSQL CDC publication itself."""
+        with self._lock:
+            return self._cdc_pg_autocreate_publication
 
     def set_cdc_start_position(
         self,

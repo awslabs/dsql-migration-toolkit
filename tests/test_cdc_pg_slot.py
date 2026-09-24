@@ -491,3 +491,129 @@ def test_slot_health_read_prefers_the_deployed_slot_name() -> None:
         assert state3.cdc_slot_health is None
     finally:
         source_dialect.dialect_for = original
+
+
+# --- CDC-start pre-flight: what the source actually has ------------------------
+# A CDC-only start deploys connectors against objects only a Full-Load-+-CDC run creates.
+# The probe reads the state; the blocker turns it into a verdict. Both must distinguish
+# "absent" from "unreadable", and must NOT block the legitimate re-snapshot start.
+
+
+class _ObjectsConn:
+    """Answers read_pg_replication_objects' two statements from scripted facts."""
+
+    def __init__(self, *, pub_n=1, all_dml=True, slot_any=1, slot_ok=1, covered=()):
+        self._row = (pub_n, all_dml, slot_any, slot_ok)
+        self._covered = list(covered)
+        self.statements: list[str] = []
+
+    def execute(self, statement, params=None):
+        sql = str(statement)
+        self.statements.append(sql)
+        if "PG_PUBLICATION_TABLES" in sql.upper():
+            return _Result([(t,) for t in self._covered])
+        return _Result([self._row])
+
+
+def test_read_pg_replication_objects_reads_the_catalog_shape() -> None:
+    from dsql_migrator.core.cdc_pg_slot import read_pg_replication_objects
+
+    conn = _ObjectsConn(covered=["app.orders", "app.items"])
+    got = read_pg_replication_objects(conn, publication_name="p1", slot_name="s1")
+    assert got.publication_present is True
+    assert got.publication_publishes_all_dml is True
+    assert got.slot_present_any_database is True and got.slot_usable is True
+    assert got.publication_tables == frozenset({"app.orders", "app.items"})
+    # The slot query must be scoped to a LOGICAL pgoutput slot in THIS database:
+    # pg_replication_slots is cluster-wide, so a bare name match can hit a slot bound
+    # elsewhere that the connector cannot use.
+    joined = " ".join(s.upper() for s in conn.statements)
+    assert "CURRENT_DATABASE()" in joined
+    assert "'PGOUTPUT'" in joined.replace('"', "'")
+    assert "SLOT_TYPE = 'LOGICAL'" in joined
+
+
+def test_no_publication_means_unknown_dml_not_false() -> None:
+    # bool_and over zero rows is NULL. Reporting that as False would claim the
+    # publication restricts its change types, which is a different (and wrong) remedy.
+    from dsql_migrator.core.cdc_pg_slot import read_pg_replication_objects
+
+    got = read_pg_replication_objects(
+        _ObjectsConn(pub_n=0, all_dml=None, slot_any=0, slot_ok=0),
+        publication_name="p1",
+        slot_name="s1",
+    )
+    assert got.publication_present is False
+    assert got.publication_publishes_all_dml is None  # not False
+    assert got.publication_tables == frozenset()
+
+
+def _objects(**kw):
+    from dsql_migrator.core.cdc_pg_slot import PgReplicationObjects
+
+    base = dict(
+        publication_name="p1",
+        slot_name="s1",
+        publication_present=True,
+        publication_publishes_all_dml=True,
+        publication_tables=frozenset({"app.orders", "app.items"}),
+        slot_present_any_database=True,
+        slot_usable=True,
+    )
+    base.update(kw)
+    return PgReplicationObjects(**base)
+
+
+def test_the_blocker_grades_coverage_not_just_existence() -> None:
+    from dsql_migrator.core.cdc_pg_slot import pg_replication_objects_blocker as blocker
+
+    selected = ["app.orders", "app.items"]
+
+    # Everything present -> no block, for BOTH start shapes.
+    assert blocker(_objects(), selected, resumes_from_slot=True) is None
+    assert blocker(_objects(), selected, resumes_from_slot=False) is None
+
+    # Absent publication: the reported crash. The message must name the remedy AND warn
+    # off the one that silently loses data.
+    absent = blocker(
+        _objects(publication_present=False, publication_tables=frozenset(),
+                 publication_publishes_all_dml=None),
+        selected, resumes_from_slot=False,
+    )
+    assert absent is not None
+    assert "Publication autocreation is disabled" in absent[1]
+    assert "Full load + CDC" in absent[1]
+
+    # A publication that omits a selected table is WORSE than a crash: RUNNING while
+    # replicating nothing for it. It must block even though the publication "exists".
+    gap = blocker(
+        _objects(publication_tables=frozenset({"app.orders"})),
+        selected, resumes_from_slot=False,
+    )
+    assert gap is not None and "app.items" in gap[1]
+
+    # A publication restricted to a subset of INSERT/UPDATE/DELETE: also silent.
+    narrowed = blocker(
+        _objects(publication_publishes_all_dml=False), selected, resumes_from_slot=False
+    )
+    assert narrowed is not None and "INSERT/UPDATE/DELETE" in narrowed[1]
+
+
+def test_a_missing_slot_blocks_a_resume_but_never_a_re_snapshot() -> None:
+    # THE line that keeps this from over-blocking. With snapshot.mode=initial Debezium
+    # creates the slot itself and snapshots every captured table, so there is no window
+    # and nothing to lose -- blocking that start would leave the operator no path at all.
+    from dsql_migrator.core.cdc_pg_slot import pg_replication_objects_blocker as blocker
+
+    no_slot = _objects(slot_usable=False, slot_present_any_database=False)
+    resume = blocker(no_slot, ["app.orders", "app.items"], resumes_from_slot=True)
+    assert resume is not None
+    assert "cannot be created at a past position" in resume[1]
+    assert blocker(no_slot, ["app.orders", "app.items"], resumes_from_slot=False) is None
+
+    # A name collision with an UNUSABLE slot blocks either way: the connector can neither
+    # use it nor create its own under that name.
+    collision = _objects(slot_usable=False, slot_present_any_database=True)
+    for resumes in (True, False):
+        verdict = blocker(collision, ["app.orders", "app.items"], resumes_from_slot=resumes)
+        assert verdict is not None, resumes

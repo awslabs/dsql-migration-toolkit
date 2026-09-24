@@ -250,7 +250,7 @@ def slot_exists(connection: object, name: str) -> bool:
     return row is not None
 
 
-def _publication_tables(connection: object, name: str) -> set:
+def publication_tables(connection: object, name: str) -> set:
     """Return the set of qualified ``schema.table`` names a publication covers."""
     rows = connection.execute(  # type: ignore[attr-defined]
         text(
@@ -260,6 +260,137 @@ def _publication_tables(connection: object, name: str) -> set:
         {"name": name},
     ).fetchall()
     return {str(r[0]) for r in rows}
+
+
+# Kept as the private name the existing provisioning call site uses.
+_publication_tables = publication_tables
+
+
+@dataclass(frozen=True)
+class PgReplicationObjects:
+    """What the source actually has, for a CDC-start pre-flight. All read-only facts.
+
+    ``publication_publishes_all_dml`` is ``None`` when no publication exists -- NULL means
+    UNKNOWN, never False. ``slot_present_any_database`` vs ``slot_usable`` is a real
+    distinction: ``pg_replication_slots`` is CLUSTER-wide, so a bare name match can hit a
+    slot bound to a DIFFERENT database or created with another plugin, which the connector
+    cannot use. That is why :func:`slot_exists` must not be reused as a pre-flight assertion.
+    """
+
+    publication_name: str
+    slot_name: str
+    publication_present: bool
+    publication_publishes_all_dml: Optional[bool]
+    publication_tables: frozenset
+    slot_present_any_database: bool
+    slot_usable: bool
+
+
+def read_pg_replication_objects(
+    connection: object, *, publication_name: str, slot_name: str
+) -> PgReplicationObjects:
+    """Read the CDC publication + slot state from the source (read-only).
+
+    Needs no special privilege: ``pg_publication`` / ``pg_replication_slots`` /
+    ``pg_publication_tables`` are readable by an ordinary role (live-verified with
+    ``rolsuper=f rolreplication=f`` and no grants, inside ``BEGIN TRANSACTION READ ONLY``),
+    so this is strictly cheaper than the publication-privilege check that already runs.
+
+    RAISES on failure rather than returning "absent": unreadable is NOT evidence of
+    absence, and the caller must be able to tell the two apart before it blocks anything.
+    """
+    row = connection.execute(  # type: ignore[attr-defined]
+        text(
+            "SELECT "
+            "(SELECT count(*) FROM pg_publication WHERE pubname = :pub) AS pub_n, "
+            "(SELECT bool_and(pubinsert AND pubupdate AND pubdelete) "
+            "   FROM pg_publication WHERE pubname = :pub) AS pub_all_dml, "
+            "(SELECT count(*) FROM pg_replication_slots WHERE slot_name = :slot) "
+            "  AS slot_any_n, "
+            "(SELECT count(*) FROM pg_replication_slots WHERE slot_name = :slot "
+            "   AND slot_type = 'logical' AND plugin = 'pgoutput' "
+            "   AND database = current_database()) AS slot_ok_n"
+        ),
+        {"pub": publication_name, "slot": slot_name},
+    ).first()
+    pub_n = int(row[0] or 0)
+    all_dml = row[1]
+    covered = publication_tables(connection, publication_name) if pub_n else set()
+    return PgReplicationObjects(
+        publication_name=publication_name,
+        slot_name=slot_name,
+        publication_present=pub_n > 0,
+        publication_publishes_all_dml=(None if all_dml is None else bool(all_dml)),
+        publication_tables=frozenset(covered),
+        slot_present_any_database=int(row[2] or 0) > 0,
+        slot_usable=int(row[3] or 0) > 0,
+    )
+
+
+def pg_replication_objects_blocker(
+    objects: PgReplicationObjects,
+    selected_tables: Sequence[str],
+    *,
+    resumes_from_slot: bool,
+) -> Optional[tuple]:
+    """Why CDC must not start against these objects, as ``(header, body)``, or None. Pure.
+
+    ``resumes_from_slot`` is the connector's intent -- True only when the watermark carries
+    the slot the Full Load created, i.e. exactly when ``build_pg_source_config`` selects
+    ``snapshot.mode=never``. It is what keeps this from over-blocking the legitimate
+    re-snapshot start: with ``initial``, Debezium creates the slot itself and snapshots
+    every captured table, so a missing slot is not a gap and must not block.
+
+    Coverage is graded, not just existence: a publication that omits a selected table lets
+    Debezium reach RUNNING while replicating NOTHING for it -- strictly worse than a task
+    that dies loudly. Deliberately NOT graded here: ``puballtables`` and whether the slot is
+    currently ``active`` (neither is a failure of THIS migration).
+    """
+    pub = objects.publication_name
+    if not objects.publication_present:
+        return (
+            "CDC's publication does not exist on the source",
+            f"The connector is configured with publication.autocreate.mode=disabled and "
+            f"expects a publication named '{pub}', which is not on the source. Only a "
+            "'Full load + CDC' run creates it; a 'Full load only' run does not. Starting "
+            "now would deploy the connectors and the Debezium task would die immediately "
+            "with \"Publication autocreation is disabled\".",
+        )
+    missing = sorted(set(selected_tables) - set(objects.publication_tables))
+    if missing:
+        shown = ", ".join(missing[:5]) + (" …" if len(missing) > 5 else "")
+        return (
+            "CDC's publication does not cover every selected table",
+            f"Publication '{pub}' exists but does not include {len(missing)} of the "
+            f"selected tables: {shown}. Those tables would replicate NOTHING while the "
+            "connector reported RUNNING, which is worse than a visible failure.",
+        )
+    if objects.publication_publishes_all_dml is False:
+        return (
+            "CDC's publication does not publish every change type",
+            f"Publication '{pub}' is restricted to a subset of INSERT/UPDATE/DELETE, so "
+            "the change types it omits would never reach the target and the connector "
+            "would still report RUNNING. Recreate it with all three, or let this run "
+            "re-snapshot and create its own.",
+        )
+    if resumes_from_slot and not objects.slot_usable:
+        return (
+            "CDC's replication slot does not exist on the source",
+            f"This start is configured to resume from replication slot "
+            f"'{objects.slot_name}' (snapshot.mode=never), and the source has no usable "
+            "logical pgoutput slot of that name in this database. A slot cannot be created "
+            "at a past position, so one created now would start from the CURRENT WAL and "
+            "silently skip every change committed since the Full Load.",
+        )
+    if objects.slot_present_any_database and not objects.slot_usable:
+        return (
+            "A replication slot of that name is not usable for CDC",
+            f"A slot named '{objects.slot_name}' exists in this cluster but is not a "
+            "logical pgoutput slot in this database, so the connector cannot use it and "
+            "cannot create its own under that name. Drop it, or use a different CDC stack "
+            "name so the derived slot name differs.",
+        )
+    return None
 
 
 def _verify_tables_replicable(connection: object, tables: Sequence[str]) -> None:
@@ -528,6 +659,10 @@ __all__ = [
     "build_pg_source_write_engine",
     "publication_exists",
     "slot_exists",
+    "publication_tables",
+    "PgReplicationObjects",
+    "read_pg_replication_objects",
+    "pg_replication_objects_blocker",
     "create_publication",
     "create_replication_slot",
     "drop_replication_slot",

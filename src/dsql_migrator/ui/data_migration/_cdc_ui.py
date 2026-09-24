@@ -421,12 +421,24 @@ def _render_cdc_source_config_card(
     )
     if is_pg:
         # PostgreSQL Automatic = gapless resume from the logical replication slot created
-        # at the Full Load consistency point (the watermark carries the WAL LSN + slot
-        # name). Manual = re-snapshot from scratch (snapshot.mode=initial), which needs no
+        # at the Full Load consistency point. BOTH the WAL LSN and the recorded SLOT NAME
+        # are required, and the slot is the load-bearing half: only a Full-Load-+-CDC run
+        # writes it, and it is the tool's only record that a slot exists AT that LSN. The
+        # comment here already CLAIMED "the WAL LSN + slot name" while the predicate tested
+        # the LSN alone -- so a Full-load-only watermark rendered "Automatic -- gapless
+        # from the replication slot (recommended)", a positive Ready badge and a green
+        # "Start point set" line, promising gaplessness with no slot in existence. Same bug
+        # shape as the MySQL GTID-only post-mortem 11 lines below. A slot cannot be created
+        # at a past LSN, so without the record the only honest option is Manual.
+        # Manual = re-snapshot from scratch (snapshot.mode=initial), which needs no
         # coordinate and is ALWAYS a resolvable start point -- Debezium PG resumes only from
         # the slot and cannot start from an arbitrary WAL LSN, so there is no binlog offset
         # to seed and the MySQL can_seed_offset()/gtid-only tests do not apply.
-        wm_usable = wm_resume is not None and wm_resume.can_resume_from_lsn()
+        wm_usable = (
+            wm_resume is not None
+            and wm_resume.can_resume_from_lsn()
+            and bool(getattr(watermark, "slot_name", None))
+        )
         wm_gtid_only = False
         effective_resume: Optional[CdcResumePoint] = (
             wm_resume if (mode == "auto" and wm_usable) else None
@@ -3212,6 +3224,59 @@ def _probe_binlog_resume_gap(migration_state, job_manager, session) -> Optional[
     return binlog_resume_gap_reason(watermark_file, retained)
 
 
+def _probe_pg_replication_objects(
+    migration_state, session, tables, watermark
+) -> Optional[tuple]:
+    """Read-only: do CDC's publication + slot exist on the PostgreSQL source? (blocking)
+
+    Returns the blocker's ``(header, body)`` or None. Fails CLOSED on "the catalog says
+    absent/incomplete" and OPEN on "I could not ask" -- unreadable is not evidence of
+    absence, and a missing publication makes the connector die LOUDLY anyway. Same
+    degrade-to-silence discipline as :func:`_probe_binlog_resume_gap`.
+
+    The object names come from the SAME fallback ``dispatch_source_config`` uses (recorded
+    on the watermark, else derived from the stack name), so the probe can never check a
+    different object than the connector will. ``resumes_from_slot`` mirrors
+    ``build_pg_source_config``'s invariant exactly -- the recorded slot, not the LSN -- so
+    the check and the config agree by construction.
+
+    Blocking I/O: callers MUST run it via ``run.io_bound`` (NEVER on the NiceGUI loop --
+    one asyncio loop serves every browser session on Fargate).
+    """
+    if _cdc_source_type(session) is not SourceType.POSTGRES:
+        return None
+    source_config = getattr(session, "source_config", None)
+    if source_config is None:
+        return None
+    stack = getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
+    try:
+        from dsql_migrator.core import cdc_pg_slot as _pg
+        from dsql_migrator.ui.connect import make_source_engine_factory
+
+        pub = (
+            getattr(watermark, "publication_name", None)
+            or _pg.pg_publication_name(stack)
+        )
+        slot = getattr(watermark, "slot_name", None) or _pg.pg_slot_name(stack)
+        engine = make_source_engine_factory(getattr(session, "source_password", None))(
+            source_config
+        )
+        try:
+            with engine.connect() as connection:
+                objects = _pg.read_pg_replication_objects(
+                    connection, publication_name=pub, slot_name=slot
+                )
+        finally:
+            engine.dispose()
+    except Exception:  # noqa: BLE001 - unreadable is NOT absent; degrade to silence
+        return None
+    return _pg.pg_replication_objects_blocker(
+        objects,
+        [getattr(t, "name", str(t)) for t in (tables or [])],
+        resumes_from_slot=bool(getattr(watermark, "slot_name", None)),
+    )
+
+
 async def _open_cdc_start_dialog(
     ui, migration_state, on_confirm, *, session=None, job_manager=None, inventory=None,
     refresh_after_drop=None,
@@ -3238,6 +3303,8 @@ async def _open_cdc_start_dialog(
     conn_blocker = cdc_deploy_connection_blocker(session)
     binlog_gap: Optional[str] = None
     fk_block = None
+    pg_objects_block: Optional[tuple] = None
+    inventory_tables = list(getattr(inventory, "tables", None) or [])
     if job_manager is not None:
         from nicegui import run
 
@@ -3270,6 +3337,19 @@ async def _open_cdc_start_dialog(
                 )
             if probed is not None and probed.blocking:
                 fk_block = probed
+        # The PostgreSQL publication/slot precondition. Checked HERE, before the operator
+        # pays: starting without it deploys both connectors and the Debezium task dies on
+        # "Publication autocreation is disabled" -- after the cdc-stack update. Blocking
+        # source I/O -> run.io_bound, never on the loop.
+        try:
+            _job2 = _current_job(job_manager, migration_state.job_id)
+            _wm2 = getattr(_job2, "watermark", None) if _job2 is not None else None
+            pg_objects_block = await run.io_bound(
+                _probe_pg_replication_objects,
+                migration_state, session, inventory_tables, _wm2,
+            )
+        except Exception:  # noqa: BLE001 - unreadable is not absent; never block on it
+            pg_objects_block = None
     with ui.dialog() as dialog, ui.card().classes("gap-2").style("min-width: 460px"):  # type: ignore[attr-defined]
         ui.label("Start CDC — create connectors").classes("text-lg font-semibold")  # type: ignore[attr-defined]
         ui.label(  # type: ignore[attr-defined]
@@ -3294,6 +3374,71 @@ async def _open_cdc_start_dialog(
                 header="The snapshot's binary log has been purged",
                 body=binlog_gap,
             )
+        # The PostgreSQL publication/slot block, with its remedy in the SAME dialog (same
+        # shape as the FK slot below): a block whose only advice is "re-run the whole Full
+        # Load" is a dead end, and the pre-flight results just computed would be thrown
+        # away by closing. There is deliberately NO "accept the gap and stream from now"
+        # option: the window starts at Full Load START, so it spans the entire load plus
+        # all think time, the tool cannot say how many rows or which tables are affected,
+        # and Validation's default ROW_COUNT mode would then certify the result clean --
+        # an acknowledgement nobody can evaluate is a click-through, not consent.
+        _pg_state = {"resolved": False}
+        if pg_objects_block is not None:
+            pg_slot_area = ui.column().classes("w-full gap-2")  # type: ignore[attr-defined]
+
+            def _render_pg_block() -> None:
+                pg_slot_area.clear()
+                with pg_slot_area:
+                    _render_notice(
+                        ui,
+                        tone="error",
+                        icon="sync_problem",
+                        header=pg_objects_block[0],
+                        body=pg_objects_block[1],
+                    )
+                    _render_notice(
+                        ui,
+                        tone="info",
+                        icon="restart_alt",
+                        header="Re-snapshot instead — gapless, no second Full Load",
+                        body=(
+                            "Debezium can create its own replication slot, snapshot every "
+                            "selected table and then stream from that slot. There is no "
+                            "window between the snapshot and the stream, so nothing is "
+                            "lost, and the target load is idempotent (INSERT ... ON "
+                            "CONFLICT), so re-reading a row is safe. The cost is reading "
+                            "the source tables again. If the publication is also missing, "
+                            "the CONNECTOR's database user creates one over exactly the "
+                            "captured tables — the tool itself never writes to your source."
+                        ),
+                    )
+
+                    def _take_resnapshot() -> None:
+                        migration_state.set_cdc_start_mode("manual")
+                        migration_state.set_cdc_pg_autocreate_publication(True)
+                        _pg_state["resolved"] = True
+                        pg_slot_area.clear()
+                        with pg_slot_area:
+                            _render_notice(
+                                ui,
+                                tone="success",
+                                icon="restart_alt",
+                                header="Will re-snapshot every selected table",
+                                body=(
+                                    "CDC will snapshot the selected tables and then stream "
+                                    "from the slot it creates, so the handoff has no gap. "
+                                    "Start CDC is unlocked."
+                                ),
+                            )
+                        start_btn.props(remove="disable")
+                        start_btn.tooltip("")
+
+                    ui.button(  # type: ignore[attr-defined]
+                        "Re-snapshot every table instead",
+                        icon="restart_alt",
+                        on_click=_take_resnapshot,
+                    ).props("color=primary")
+
         # Tracks whether the removal already happened, so Cancel can still refresh the card
         # behind the dialog (the drop is real even if the operator then backs out).
         _fk_state = {"cleared": False}
@@ -3422,6 +3567,12 @@ async def _open_cdc_start_dialog(
                     "blocked while this is unknown — re-test the target connection "
                     "and retry."
                 )
+            elif pg_objects_block is not None and not _pg_state["resolved"]:
+                start_btn.props("disable")
+                start_btn.tooltip(pg_objects_block[1])
+        # Rendered LAST because the remedy re-enables start_btn, which must exist first.
+        if pg_objects_block is not None:
+            _render_pg_block()
     dialog.open()
 
 def _open_cdc_stop_dialog(ui, migration_state, on_confirm, *, partial: bool = False) -> None:
@@ -3834,32 +3985,15 @@ def _start_cdc_deploy(
     if _cdc_source_type(session) is SourceType.POSTGRES:
         from dsql_migrator.core import cdc_pg_slot as _pg_slot
 
-        # The publication and slot are created by Full Load's provisioning step, and the
-        # connector runs with publication.autocreate.mode=disabled (cdc_postgres) -- so it
-        # will NOT create them for itself. A CDC-only start (no Full Load in this session)
-        # therefore has no watermark carrying their names, and the connector would be
-        # deployed pointing at objects that may not exist, failing after the infra is up.
-        # The watermark is the record of provisioning, so this needs no source probe.
-        if not getattr(watermark, "publication_name", None) or not getattr(
-            watermark, "slot_name", None
-        ):
-            _stack = getattr(
-                migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME
-            )
-            render_notice(
-                ui,
-                tone="warning",
-                header="CDC needs a publication and replication slot that already exist",
-                body=(
-                    "Full Load did not run in this session, so the tool has not created "
-                    "them — and the connector is configured NOT to create a publication "
-                    "itself. Before starting, confirm the source already has publication "
-                    f'"{_pg_slot.pg_publication_name(_stack)}" covering the selected '
-                    f'tables and replication slot "{_pg_slot.pg_slot_name(_stack)}"; '
-                    "otherwise run Full Load first (it creates both at a consistent LSN) "
-                    "or create them on the source with the same names."
-                ),
-            )
+        # The publication/slot precondition used to be WARNED about here and decided from
+        # the watermark. Both halves were wrong. The watermark is not the record of
+        # provisioning it claimed to be -- it dies with an app restart and SURVIVES a
+        # Delete-infra that DROPS both objects -- and the advice "or create them on the
+        # source with the same names" is, at CDC-start time, the defect itself: a slot
+        # created now starts at the CURRENT WAL, so resuming from it silently skips every
+        # change since the load. The check is now a source PROBE that BLOCKS, in the Start
+        # dialog (with a one-click re-snapshot remedy) and again on the worker thread just
+        # before anything is created -- see _probe_pg_replication_objects and work() below.
         _rekeyed_full = _pg_slot.rekeyed_tables_needing_full_identity(
             message_key_columns,
             {t.name: list(t.primary_key) for t in tables_for_config},
@@ -3927,6 +4061,17 @@ def _start_cdc_deploy(
         resume_override=_resume_override,
         force_initial_snapshot=_force_initial_snapshot,
         message_key_columns=message_key_columns,
+        # "filtered" ONLY when the operator took the block's re-snapshot escape: the
+        # connector's own DB user then creates a publication over exactly the captured
+        # tables. The TOOL still never writes to the source, so cdc_pg_slot's documented
+        # Property-1 exception is not widened. Paired with force_initial_snapshot, that
+        # start is gapless by construction (snapshot, then stream from the slot Debezium
+        # made -- no window between the two).
+        publication_autocreate_mode=(
+            "filtered"
+            if getattr(migration_state, "cdc_pg_autocreate_publication", lambda: False)()
+            else "disabled"
+        ),
     )
     sink_config = CdcPipelineOrchestrator().build_sink_config(
         "mysql-sink", tables_for_config, CDC_DEFAULT_DLQ_TOPIC
@@ -3974,6 +4119,24 @@ def _start_cdc_deploy(
             raise RuntimeError(
                 f"Start CDC blocked: {_cdc_fk_block_reason(fk_state)[0]}. " + _detail
             )
+        # BACKSTOP for the PostgreSQL publication/slot precondition, on the worker thread
+        # right before anything is created. The Start dialog already blocks on this, but
+        # "Retry CDC" (_render_cdc_partial_actions) calls this job with NO dialog, and a
+        # cached dialog verdict can be stale. It must live HERE and not in
+        # _start_cdc_deploy's body: that runs ON the NiceGUI event loop and this probe is
+        # blocking source I/O. Fails OPEN on an unreadable source (the probe returns
+        # None) -- unlike the FK gate, because a missing publication kills the connector
+        # LOUDLY whereas an enforced FK loses rows silently.
+        _pg_block = _probe_pg_replication_objects(
+            migration_state, session, tables_for_config, watermark
+        )
+        if _pg_block is not None:
+            _log_cdc_event(
+                "start blocked by missing PostgreSQL replication objects",
+                status=ActivityStatus.FAILURE,
+                detail=_pg_block[1],
+            )
+            raise RuntimeError(f"Start CDC blocked: {_pg_block[0]}. {_pg_block[1]}")
         deployer = build_cdc_stack_deployer(
             region, aws_profile=aws_profile, assume_role_arn=assume_role_arn
         )

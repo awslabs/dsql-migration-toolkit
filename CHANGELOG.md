@@ -5,6 +5,67 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.507
+
+### Fixed
+
+- **A PostgreSQL "CDC only" start after a "Full load only" run killed the Debezium task,
+  and the tool let you pay for the infrastructure first.** The CDC publication and
+  replication slot are created by exactly one thing -- the Full Load's provisioning step --
+  and only when that run is part of a CDC plan. A Full-load-only run creates neither, so the
+  connectors deployed against objects that did not exist and the source task died on
+  "Publication autocreation is disabled". The tool already detected this and only WARNED, so
+  a billable MSK Serverless cluster and both connectors were created first. Start CDC now
+  PROBES the source (a privilege-free catalog read) and blocks before the spend, in the Start
+  dialog and again on the worker thread just before anything is created -- the second check
+  covers "Retry CDC", which submits the job with no dialog. It fails closed only on "the
+  catalog says absent", never on "I could not ask".
+- **A worse, silent bug behind it: the tool asked to resume from a replication slot it had
+  never created.** `snapshot.mode` was chosen from the watermark's WAL LSN alone, and a
+  Full-load-only watermark carries an LSN with no slot -- so a CDC-only start was configured
+  `snapshot.mode=never`, i.e. resume from a slot of unknown position. Today's loud task-kill
+  was the only thing preventing that: had the objects existed (created by hand, or left by an
+  earlier session) the connector would have started and silently skipped every change
+  committed since the load, which the default ROW_COUNT validation cannot detect. The mode is
+  now chosen from the RECORDED SLOT, not the coordinate: no recorded slot means `initial`.
+- **The start-point card promised gaplessness with no slot in existence.** Same root cause in
+  the UI: it tested the LSN alone, so a Full-load-only watermark rendered "Automatic --
+  gapless from the replication slot (recommended)", a positive Ready badge and a green
+  "Start point set" line. It now requires the recorded slot too. (Same bug shape as the MySQL
+  GTID-only post-mortem already documented beside it.)
+- **A PostgreSQL connector failure is diagnosed instead of left in CloudWatch.** Every
+  existing log signature was MySQL/MSK-flavoured, so a PostgreSQL task death produced the
+  content-free "<connector> entered FAILED state." and the operator had to go open the MSK
+  Connect log group. Two PostgreSQL signatures were added, and the worker log is now
+  consulted on TIMEOUT as well as on FAILED -- MSK Connect exposes no task-level state and no
+  last-task exception, so a connector whose only task died at startup can otherwise sit in
+  CREATING until the budget expires with the cause visible nowhere in the tool.
+
+### Changed
+
+- **When the objects are missing, the block offers a one-click way out instead of a dead
+  end.** "Re-snapshot every table instead" makes Debezium create its own slot, snapshot the
+  selected tables and then stream from that slot -- there is no window between the snapshot
+  and the stream, so nothing is lost, and the target load is idempotent so re-reading a row is
+  safe. When the publication is also missing, the CONNECTOR's database user creates one over
+  exactly the captured tables; the tool itself still never writes to your source. The cost is
+  reading the source tables again.
+
+  There is deliberately no "accept the gap and stream from now" option. The window starts at
+  Full Load START, so it spans the whole load plus all think time; the tool cannot tell you
+  how many rows or which tables are affected; and the default validation mode would then
+  certify the result clean. An acknowledgement nobody can evaluate is a click-through, not
+  consent.
+
+Gaplessness on a PostgreSQL source is a decision made BEFORE the load: "Full load + CDC"
+creates the slot at the snapshot point, so the handoff has no gap and no re-read. After a
+Full-load-only run that option is gone -- a logical replication slot cannot be created at,
+or rewound to, a past position (verified live on PostgreSQL 16 and 18: the function takes no
+LSN argument, CREATE_REPLICATION_SLOT rejects one, slot_advance only moves forward, and
+START_REPLICATION silently clamps) -- so the remaining gapless route is to re-snapshot.
+MySQL is unaffected in every mode: its binlog retains history with no consumer, so nothing
+needs provisioning.
+
 ## v0.1.506
 
 ### Fixed
