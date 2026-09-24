@@ -862,6 +862,7 @@ class PrerequisiteChecker:
                         facts,
                         [effective[table.name] for table in tables],
                         provisions_replication=request.provisions_replication,
+                        cdc_start_resnapshots=request.cdc_start_resnapshots,
                     )
                 )
             # MySQL's binlog/GTID rows are NOT listed for a PostgreSQL source, in either

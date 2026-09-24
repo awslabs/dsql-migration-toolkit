@@ -1838,3 +1838,137 @@ def test_the_dialect_reports_an_unread_existence_fact_as_unknown_not_absent() ->
         "pg_publication" in s.lower() and "pg_publication_tables" not in s.lower()
         for s in conn2.asked
     )
+
+
+def test_accepting_the_resnapshot_regrades_only_what_it_repairs() -> None:
+    """ONE re-graded report has to clear every downstream gate, or the operator is told how
+    to unblock a button that stays disabled. And it must re-grade ONLY the absences a
+    re-snapshot actually repairs -- Debezium's `filtered` autocreate does not ALTER an
+    existing publication, so a narrow or incomplete one stays a FAIL."""
+    from dsql_migrator.core.models import PrerequisiteStatus
+    from dsql_migrator.core.prerequisites_postgres import check_cdc_replication_objects
+
+    def row(*, resnap, **kw):
+        base = dict(
+            checked_publication_name="p", checked_slot_name="s",
+            publication_present=True, publication_publishes_all_dml=True,
+            publication_tables=("app.orders",),
+            slot_usable=True, slot_present_any_database=True,
+        )
+        base.update(kw)
+        return check_cdc_replication_objects(
+            _pg_facts(**base), _tabs("app.orders"),
+            provisions_replication=False, cdc_start_resnapshots=resnap,
+        )
+
+    absent = dict(publication_present=False, publication_tables=())
+    # Without the decision: a blocking FAIL that ADVERTISES the remedy via the discriminator.
+    blocked = row(resnap=False, **absent)
+    assert blocked.status is PrerequisiteStatus.FAIL
+    assert blocked.required is True
+    assert blocked.resolvable_by_resnapshot is True
+    # With it: a non-blocking INFO, so can_proceed goes True and every gate un-gates.
+    cleared = row(resnap=True, **absent)
+    assert cleared.status is PrerequisiteStatus.INFO
+    assert cleared.required is False
+    assert "re-snapshot" in cleared.detail
+
+    # NOT re-graded, because a re-snapshot does not repair them:
+    for kw in (dict(publication_tables=()), dict(publication_publishes_all_dml=False)):
+        still = row(resnap=True, **kw)
+        assert still.status is PrerequisiteStatus.FAIL, kw
+        assert still.resolvable_by_resnapshot is False, kw
+
+
+def test_the_checker_forwards_the_resnapshot_decision() -> None:
+    """The flag is useless if the checker drops it, and every pure-function test would
+    still be green."""
+    from dataclasses import fields
+
+    from dsql_migrator.core.models import (
+        MigrationMode,
+        PrerequisiteCheckId,
+        PrerequisiteCheckRequest,
+        PrerequisiteStatus,
+        SourceType,
+    )
+    from dsql_migrator.core.prerequisites_postgres import PostgresCdcFacts
+
+    class _Probe(_FakeSource):
+        def cdc_prerequisites(self, table_names, *, publication_name="", slot_name=""):
+            base = _pg_facts_ok()
+            return PostgresCdcFacts(
+                **{
+                    **{f.name: getattr(base, f.name) for f in fields(base)},
+                    "checked_publication_name": publication_name or "p",
+                    "checked_slot_name": slot_name or "s",
+                    "publication_present": False,
+                    "publication_tables": (),
+                }
+            )
+
+    def run(resnap):
+        checker = PrerequisiteChecker(
+            source_probe=_Probe(cdc_facts=_pg_facts_ok()),
+            target_probe=_FakeTarget(existing={"app.orders"}),
+            msk_probe=_FakeMsk(),
+        )
+        return checker.check(
+            PrerequisiteCheckRequest(
+                mode=MigrationMode.CDC, tables=["app.orders"],
+                source_type=SourceType.POSTGRES, provisions_replication=False,
+                cdc_stack_name="dsql-cdc-stack", cdc_start_resnapshots=resnap,
+            ),
+            tables=[_table("app.orders")],
+        )
+
+    blocked = run(False)
+    assert (
+        _result(blocked, PrerequisiteCheckId.CDC_REPLICATION_OBJECTS).status
+        is PrerequisiteStatus.FAIL
+    )
+    assert blocked.can_proceed is False
+    cleared = run(True)
+    assert (
+        _result(cleared, PrerequisiteCheckId.CDC_REPLICATION_OBJECTS).status
+        is PrerequisiteStatus.INFO
+    )
+    # THE payoff: the whole report stops gating, which is what un-gates Deploy and Start.
+    assert cleared.can_proceed is True
+
+
+def test_the_dialect_grades_an_invalidated_slot_unusable() -> None:
+    """Both probes must agree. Without this the prerequisite PASSES a `lost` slot while the
+    runtime probe blocks it -- so the operator is told they are ready and then refused."""
+    from dsql_migrator.core.source_dialect.postgres import PostgresSourceDialect
+
+    asked: list[str] = []
+
+    class _Conn:
+        def execute(self, statement, params=None):
+            asked.append(str(statement))
+
+            class _R:
+                def scalar(self_inner):
+                    return None
+
+                def fetchall(self_inner):
+                    return []
+
+                def first(self_inner):
+                    return None
+
+            return _R()
+
+        def rollback(self):
+            return None
+
+    PostgresSourceDialect().probe_cdc_prerequisites(
+        _Conn(), ["app.orders"], publication_name="p", slot_name="s"
+    )
+    slot_usable_sql = [
+        q for q in asked if "plugin = 'pgoutput'" in q and "current_database()" in q
+    ]
+    assert slot_usable_sql, "the slot-usable probe did not run"
+    assert any("wal_status" in q for q in slot_usable_sql)
+    assert any("coalesce" in q.lower() for q in slot_usable_sql)  # NULL-safe on PG<13

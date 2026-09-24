@@ -617,3 +617,90 @@ def test_a_missing_slot_blocks_a_resume_but_never_a_re_snapshot() -> None:
     for resumes in (True, False):
         verdict = blocker(collision, ["app.orders", "app.items"], resumes_from_slot=resumes)
         assert verdict is not None, resumes
+
+
+def test_the_blocker_honours_the_connectors_own_publication_creation() -> None:
+    """The v0.1.507 escape hatch shipped DEAD, and this is the assertion that proves it.
+
+    The Start-CDC worker backstop calls this function right before creating anything. It
+    blocked an absent publication unconditionally, so clicking "Re-snapshot every table
+    instead" un-disabled Start and the job then raised "Start CDC blocked". The two keywords
+    must mirror build_pg_source_config exactly: autocreate <-> filtered, resumes <-> never.
+    """
+    from dsql_migrator.core.cdc_pg_slot import pg_replication_objects_blocker as blocker
+
+    nothing = _objects(
+        publication_present=False,
+        publication_publishes_all_dml=None,
+        publication_tables=frozenset(),
+        slot_present_any_database=False,
+        slot_usable=False,
+    )
+    selected = ["app.orders", "app.items"]
+
+    # The accepted re-snapshot: the connector makes both, so neither absence blocks.
+    assert (
+        blocker(
+            nothing,
+            selected,
+            resumes_from_slot=False,
+            connector_autocreates_publication=True,
+        )
+        is None
+    )
+    # Without the recorded intent it still blocks -- the default must not over-permit.
+    assert blocker(nothing, selected, resumes_from_slot=False) is not None
+
+    # The coverage branch must be SKIPPED too, not just the first one: an absent
+    # publication has no tables, so grading coverage would report the whole selection
+    # "missing" and block on the very next branch instead.
+    verdict = blocker(
+        nothing, selected, resumes_from_slot=False, connector_autocreates_publication=True
+    )
+    assert verdict is None
+
+    # ...but a publication that EXISTS and is incomplete still blocks even with autocreate:
+    # Debezium's `filtered` mode does not ALTER an existing publication.
+    incomplete = _objects(publication_tables=frozenset({"app.orders"}))
+    assert (
+        blocker(
+            incomplete,
+            selected,
+            resumes_from_slot=False,
+            connector_autocreates_publication=True,
+        )
+        is not None
+    )
+    narrowed = _objects(publication_publishes_all_dml=False)
+    assert (
+        blocker(
+            narrowed,
+            selected,
+            resumes_from_slot=False,
+            connector_autocreates_publication=True,
+        )
+        is not None
+    )
+
+
+def test_an_invalidated_slot_is_not_usable() -> None:
+    """An over-run slot is INVALIDATED (wal_status='lost'), and grading it usable turns a
+    recoverable re-snapshot into a dead Debezium task. Live-verified on PostgreSQL 16.15:
+    with max_slot_wal_keep_size=0 and enough churn the slot reached wal_status=lost while
+    the source kept committing -- so this is a lost OPTION, not a source outage."""
+    from dsql_migrator.core.cdc_pg_slot import read_pg_replication_objects
+
+    conn = _ObjectsConn(covered=["app.orders"])
+    read_pg_replication_objects(conn, publication_name="p", slot_name="s")
+    joined = " ".join(s.upper() for s in conn.statements)
+    assert "WAL_STATUS" in joined
+    assert "'LOST'" in joined.replace('"', "'")
+    # COALESCE keeps it NULL-safe: wal_status is PG13+ and the tool targets PG13-18.
+    assert "COALESCE" in joined
+    # ...and only on the USABLE subquery -- an invalidated slot still EXISTS in the
+    # cluster, which is what slot_present_any_database means, and the name collision it
+    # causes still has to be reported.
+    usable_q = joined[joined.index("SLOT_OK_N") - 400 : joined.index("SLOT_OK_N")]
+    assert "COALESCE(WAL_STATUS" in usable_q
+    any_q = joined[: joined.index("SLOT_ANY_N")]
+    assert "WAL_STATUS" not in any_q.split("SLOT_NAME = :SLOT")[-1]

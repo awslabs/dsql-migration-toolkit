@@ -619,6 +619,7 @@ def check_cdc_replication_objects(
     tables: Sequence[TableDef],
     *,
     provisions_replication: bool,
+    cdc_start_resnapshots: bool = False,
 ) -> PrerequisiteResult:
     """Do CDC's publication + replication slot EXIST? Distinct from the PRIVILEGE check.
 
@@ -629,9 +630,15 @@ def check_cdc_replication_objects(
 
     Grading: an absent publication, or one that omits a selected table or narrows its
     publish list, is a FAIL -- each makes the connector either die at once or report
-    RUNNING while replicating nothing. A missing SLOT is only a WARN, because with the
-    recorded-slot invariant in ``build_pg_source_config`` such a start re-snapshots and is
-    gapless; it costs a re-read, not correctness.
+    RUNNING while replicating nothing. A missing SLOT is only a WARN when no slot is
+    RECORDED, because then ``build_pg_source_config`` selects ``initial`` and the connector
+    creates its own -- a re-read, not a gap.
+
+    ``cdc_start_resnapshots`` is the operator's recorded decision to re-snapshot
+    (``publication.autocreate.mode=filtered`` + ``snapshot.mode=initial``). It re-grades the
+    two absences it genuinely repairs to a non-blocking INFO, which is what lets ONE
+    re-graded report clear every downstream gate at once instead of leaving a red FAIL
+    beside a button the operator has already been told how to unblock.
     """
     title = "CDC's publication and replication slot exist on the source"
     if provisions_replication:
@@ -681,11 +688,24 @@ def check_cdc_replication_objects(
         "creates the publication and the slot at the snapshot point before the load. "
     )
     if not facts.publication_present:
+        if cdc_start_resnapshots:
+            return PrerequisiteResult(
+                check_id=PrerequisiteCheckId.CDC_REPLICATION_OBJECTS,
+                title=title,
+                status=PrerequisiteStatus.INFO,
+                required=False,
+                detail=(
+                    f'Publication "{pub}" does not exist, and this start is set to '
+                    "re-snapshot: the connector creates its own publication over exactly "
+                    "the captured tables and snapshots them before streaming."
+                ),
+            )
         return PrerequisiteResult(
             check_id=PrerequisiteCheckId.CDC_REPLICATION_OBJECTS,
             title=title,
             status=PrerequisiteStatus.FAIL,
             required=True,
+            resolvable_by_resnapshot=True,
             detail=(
                 f'Publication "{pub}" does not exist on the source. The connector does '
                 "not create it (publication.autocreate.mode=disabled), so the Debezium "
@@ -769,6 +789,7 @@ def check_postgres_cdc_prerequisites(
     tables: Sequence[TableDef],
     *,
     provisions_replication: bool = True,
+    cdc_start_resnapshots: bool = False,
 ) -> list[PrerequisiteResult]:
     """Run all PostgreSQL CDC readiness checks (global + per-table REPLICA IDENTITY).
 
@@ -781,7 +802,10 @@ def check_postgres_cdc_prerequisites(
         check_replication_role(facts),
         check_publication_privilege(facts),
         check_cdc_replication_objects(
-            facts, tables, provisions_replication=provisions_replication
+            facts,
+            tables,
+            provisions_replication=provisions_replication,
+            cdc_start_resnapshots=cdc_start_resnapshots,
         ),
         check_replication_slot_headroom(facts),
         check_slot_wal_retention(facts),

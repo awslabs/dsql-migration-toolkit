@@ -1202,7 +1202,10 @@ class PostgresSourceDialect(SourceDialect):
                         _scalar(
                             "SELECT count(*) > 0 FROM pg_replication_slots "
                             "WHERE slot_name = :s AND slot_type = 'logical' "
-                            "AND plugin = 'pgoutput' AND database = current_database()",
+                            "AND plugin = 'pgoutput' AND database = current_database() "
+                            # Must match read_pg_replication_objects exactly, or a `lost`
+                            # slot passes the PREREQUISITE while the runtime probe blocks.
+                            "AND coalesce(wal_status, 'reserved') <> 'lost'",
                             {"s": slot_name},
                         )
                     ),

@@ -411,7 +411,7 @@ def _render_cdc_source_config_card(
     override is applied.
     """
     job = _current_job(job_manager, migration_state.job_id)
-    watermark = getattr(job, "watermark", None) if job is not None else None
+    watermark = _cdc_watermark(job)
     source_type = _cdc_source_type(session)
     is_pg = source_type is SourceType.POSTGRES
     override = migration_state.cdc_start_override()
@@ -1868,7 +1868,7 @@ def _render_cdc_start_button(
 ) -> None:
     """The 'Start CDC' button shown when infra is deployed but no connectors run."""
     job = _current_job(job_manager, migration_state.job_id)
-    watermark = getattr(job, "watermark", None) if job is not None else None
+    watermark = _cdc_watermark(job)
     override = migration_state.cdc_start_override()
     wm_resume = (
         CdcResumePoint.from_watermark(watermark) if watermark is not None else None
@@ -3244,7 +3244,7 @@ def _probe_binlog_resume_gap(migration_state, job_manager, session) -> Optional[
     if migration_state.cdc_start_override() is not None:
         return None
     job = _current_job(job_manager, getattr(migration_state, "job_id", None))
-    watermark = getattr(job, "watermark", None) if job is not None else None
+    watermark = _cdc_watermark(job)
     watermark_file = getattr(watermark, "binlog_file", None)
     if not watermark_file:
         return None
@@ -3271,8 +3271,32 @@ def _probe_binlog_resume_gap(migration_state, job_manager, session) -> Optional[
     return binlog_resume_gap_reason(watermark_file, retained)
 
 
+def _cdc_watermark(job):
+    """The watermark a CDC start may resume from; the slot is suppressed on an UNFINISHED load.
+
+    The watermark is attached BEFORE the first table loads, so a FAILED or partial run leaves
+    one byte-identical to a successful run's -- same WAL LSN, same slot name. Nothing in the
+    CDC-start path reads the job's status, so honouring that slot selects
+    ``snapshot.mode=never`` and the never-loaded tables get NO baseline and NO backfill: their
+    rows are permanently absent from the target, silently. Switching the type to "CDC only"
+    even removes the "retry the failed tables first" hint, because that substep disappears.
+
+    Dropping ONLY ``slot_name`` routes such a job to ``snapshot.mode=initial`` -- re-snapshot
+    every captured table -- which is lossless. It SELF-HEALS: a retry carries the ORIGINAL
+    watermark forward, so once the job reaches DONE the slot is honoured again and the gapless
+    resume comes back on its own. It also fails in the safe direction: a load that completed
+    but whose post-load pass raised costs a re-read, never correctness.
+    """
+    wm = getattr(job, "watermark", None) if job is not None else None
+    if wm is None:
+        return None
+    if getattr(job, "status", None) != "DONE" and getattr(wm, "slot_name", None):
+        return wm.model_copy(update={"slot_name": None})
+    return wm
+
+
 def _probe_pg_replication_objects(
-    migration_state, session, tables, watermark
+    migration_state, session, tables, watermark, *, force_initial: bool = False
 ) -> Optional[tuple]:
     """Read-only: do CDC's publication + slot exist on the PostgreSQL source? (blocking)
 
@@ -3317,10 +3341,15 @@ def _probe_pg_replication_objects(
             engine.dispose()
     except Exception:  # noqa: BLE001 - unreadable is NOT absent; degrade to silence
         return None
+    # MIRROR build_pg_source_config's two decisions exactly, or this refuses a
+    # configuration that would have worked. force_initial (the Manual / re-snapshot start)
+    # means the connector does NOT resume from the slot and DOES create its own
+    # publication -- so neither absence is a blocker.
     return _pg.pg_replication_objects_blocker(
         objects,
         [getattr(t, "name", str(t)) for t in (tables or [])],
-        resumes_from_slot=bool(getattr(watermark, "slot_name", None)),
+        resumes_from_slot=bool(getattr(watermark, "slot_name", None)) and not force_initial,
+        connector_autocreates_publication=force_initial,
     )
 
 
@@ -3366,7 +3395,7 @@ async def _open_cdc_start_dialog(
         # "unknown" must block too. Blocking DSQL I/O -> run.io_bound, never on the loop.
         if not conn_blocker:
             _job = _current_job(job_manager, migration_state.job_id)
-            _wm = getattr(_job, "watermark", None) if _job is not None else None
+            _wm = _cdc_watermark(_job)
             try:
                 probed = await run.io_bound(
                     _probe_cdc_blocking_foreign_keys,
@@ -3390,10 +3419,12 @@ async def _open_cdc_start_dialog(
         # source I/O -> run.io_bound, never on the loop.
         try:
             _job2 = _current_job(job_manager, migration_state.job_id)
-            _wm2 = getattr(_job2, "watermark", None) if _job2 is not None else None
+            _wm2 = _cdc_watermark(_job2)
+            _resume_sig, _force_init = _cdc_resume_signal(migration_state, session)
             pg_objects_block = await run.io_bound(
                 _probe_pg_replication_objects,
                 migration_state, session, inventory_tables, _wm2,
+                force_initial=_force_init,
             )
         except Exception:  # noqa: BLE001 - unreadable is not absent; never block on it
             pg_objects_block = None
@@ -3972,7 +4003,7 @@ def _start_cdc_deploy(
     from dsql_migrator.core.cdc_deployer import build_cdc_stack_deployer, run_cdc_start
 
     job = _current_job(job_manager, migration_state.job_id)
-    watermark = getattr(job, "watermark", None) if job is not None else None
+    watermark = _cdc_watermark(job)
     override = migration_state.cdc_start_override()
     exclusions = migration_state.lob_exclusions()
     exclude_value = format_column_exclude_list(
@@ -4175,7 +4206,8 @@ def _start_cdc_deploy(
         # None) -- unlike the FK gate, because a missing publication kills the connector
         # LOUDLY whereas an enforced FK loses rows silently.
         _pg_block = _probe_pg_replication_objects(
-            migration_state, session, tables_for_config, watermark
+            migration_state, session, tables_for_config, watermark,
+            force_initial=_force_initial_snapshot,
         )
         if _pg_block is not None:
             _log_cdc_event(
@@ -4498,7 +4530,7 @@ async def _start_cdc_infra_deploy(
         return
 
     job = _current_job(job_manager, migration_state.job_id)
-    watermark = getattr(job, "watermark", None) if job is not None else None
+    watermark = _cdc_watermark(job)
     override = migration_state.cdc_start_override()
     exclusions = migration_state.lob_exclusions()
     exclude_value = format_column_exclude_list(

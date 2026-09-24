@@ -5,6 +5,58 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.510
+
+### Fixed
+
+- **A PostgreSQL "Full load only" run could not continue to CDC at all — the lossless route
+  shipped dead, and then both buttons that led to it were disabled.** v0.1.507 added
+  "Re-snapshot every table instead" so a CDC-only start with no publication could still
+  proceed losslessly, but the Start-CDC worker backstop calls the same blocker right before
+  creating anything and that blocker refused an absent publication REGARDLESS of intent. So
+  the button un-disabled Start and the job then raised "Start CDC blocked". v0.1.509 then
+  correctly disabled Deploy on the failing prerequisite, and the only surface that could
+  record the re-snapshot decision was a dialog behind that button — leaving no route at all.
+  The blocker now takes the connector's two intents explicitly, mirroring
+  `build_pg_source_config`: `publication.autocreate.mode=filtered` excuses an absent
+  publication, and `snapshot.mode=initial` excuses a missing slot. A publication that EXISTS
+  but omits tables or narrows its publish list still blocks — Debezium's `filtered` mode does
+  not alter an existing publication.
+- **An unfinished Full Load's watermark was honoured as a gapless resume point, silently
+  dropping the never-loaded tables.** Nobody reported this and it is the most serious defect
+  in the chain. The watermark is attached BEFORE the first table loads, so a FAILED or partial
+  run leaves one byte-identical to a successful run's — same LSN, same slot name — and nothing
+  in the CDC-start path read the job's status. Starting CDC then selected `snapshot.mode=never`
+  and the tables that never loaded got no baseline and no backfill: their rows were permanently
+  absent from the target. Switching the type to "CDC only" even removed the "retry the failed
+  tables first" hint, because that substep disappears. The slot is now suppressed on any job
+  that is not `DONE`, which routes such a start to a full re-snapshot (lossless) and self-heals
+  — a retry carries the original watermark forward, so the gapless resume returns once the load
+  completes.
+- **An invalidated replication slot graded as usable**, turning a recoverable re-snapshot into
+  a dead Debezium task. Both probes now reject `wal_status='lost'`. Live-verified on
+  PostgreSQL 16.15: with `max_slot_wal_keep_size=0` and enough churn the slot reached
+  `wal_status=lost` while the source kept committing — so an over-run slot is an invalidated
+  OPTION, not a source outage.
+
+### Added
+
+- **The continuation is offered beside the prerequisite that fails, not in a dialog behind a
+  disabled button.** "Re-snapshot every table" records the decision and re-runs the
+  (read-only, seconds) checks, so ONE re-graded report clears every gate at once instead of
+  leaving a red FAIL next to an enabled primary button. It is offered only for the failures a
+  re-snapshot genuinely repairs, keyed on an explicit flag rather than by matching message
+  text. The copy discloses both real costs: the source tables are read again, and a row
+  DELETED between the load and the CDC start is in neither the snapshot nor the stream, so it
+  stays on the target and Validation reports it as an extra row.
+
+So "finish a Full Load, then continue to CDC" now works on PostgreSQL by two routes, and the
+difference is stated rather than discovered. Gapless with no re-read requires deciding BEFORE
+the load — a logical replication slot cannot be created at or rewound to a past position — and
+the tool already implements that decision as the "Full load + CDC" type, whose CDC phase can be
+started later. After a Full-load-only run the remaining lossless route is the re-snapshot.
+MySQL is unaffected in every mode: its binary log retains history with no consumer.
+
 ## v0.1.509
 
 ### Fixed

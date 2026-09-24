@@ -1049,6 +1049,12 @@ class PrerequisiteResult(BaseModel):
     target: Optional[str] = None
     detail: str = ""
     remediation: str = ""
+    # Set ONLY by the FAILs a re-snapshot genuinely repairs, so the UI can offer that
+    # affordance beside exactly those rows. An absent publication and a recorded-but-missing
+    # slot qualify; a publication that EXISTS but omits tables or narrows its publish list
+    # does NOT -- Debezium's `filtered` autocreate does not alter an existing publication.
+    # A discriminator, not a text match: matching on detail wording would be fragile.
+    resolvable_by_resnapshot: bool = False
 
 
 class PrerequisiteCheckRequest(BaseModel):
@@ -1081,6 +1087,7 @@ class PrerequisiteCheckRequest(BaseModel):
     source_type: SourceType = SourceType.MYSQL
     provisions_replication: bool = True
     cdc_stack_name: str = ""
+    cdc_start_resnapshots: bool = False
 
 
 class PrerequisiteReport(BaseModel):

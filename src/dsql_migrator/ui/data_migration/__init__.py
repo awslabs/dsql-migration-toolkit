@@ -717,6 +717,15 @@ def build_data_migration_screen(
                 # checks that would falsely FAIL.
                 source_type=source_config.source_type,
                 provisions_replication=_handoff_stack is not None,
+                # The operator's RECORDED decision to re-snapshot. On PostgreSQL a
+                # "manual" start mode means exactly that (_cdc_resume_signal returns
+                # force_initial_snapshot for it), so the report re-grades the two absences
+                # a re-snapshot repairs -- which is what un-gates Deploy and Start without
+                # leaving a red FAIL beside them.
+                cdc_start_resnapshots=(
+                    source_config.source_type is SourceType.POSTGRES
+                    and migration_state.cdc_start_mode() == "manual"
+                ),
                 cdc_stack_name=(
                     _handoff_stack
                     or getattr(migration_state, "cdc_stack_name", "")
@@ -3746,6 +3755,67 @@ def _render_prerequisites_panel(
                 ),
             )
         _render_prereq_results(ui, mode, report, combined=combined)
+        # The continuation affordance, BESIDE the failing row rather than in a dialog behind
+        # the button this very failure disables. Without it a PostgreSQL "Full load only ->
+        # CDC only" operator has no route at all: Deploy is gated on this FAIL, and the only
+        # place that could record the re-snapshot decision was the Start CDC dialog, which
+        # needs infrastructure that cannot be deployed. Re-running the (read-only, seconds)
+        # checks means ONE re-graded report clears every gate at once, so no red FAIL is left
+        # sitting next to an enabled primary button.
+        _resnap = [
+            r
+            for r in report.results
+            if r.check_id is PrerequisiteCheckId.CDC_REPLICATION_OBJECTS
+            and r.status is PrerequisiteStatus.FAIL
+            and getattr(r, "resolvable_by_resnapshot", False)
+        ]
+        if mode is MigrationMode.CDC and _resnap:
+            render_notice(
+                ui,
+                tone="warning",
+                icon="history_toggle_off",
+                header="A gapless handoff is no longer possible for this load",
+                body=(
+                    "Nothing was retaining WAL while the Full Load ran, and a replication "
+                    "slot cannot be created at a past position — so the changes committed "
+                    "since the load cannot be replayed. CDC can still be added without "
+                    "losing a row that still exists, by re-reading the tables."
+                ),
+            )
+            render_notice(
+                ui,
+                tone="info",
+                icon="restart_alt",
+                header="Re-snapshot every table, then stream",
+                body=(
+                    "The connector creates its own publication over exactly the captured "
+                    "tables, snapshots them, and then streams from the slot it made — there "
+                    "is no window between the snapshot and the stream. The target load is "
+                    "idempotent, so re-reading a row is safe. Two things to know: the source "
+                    "tables are read again, and a row DELETED between the load and the start "
+                    "is in neither the snapshot nor the stream, so it stays on the target "
+                    "(Validation reports it as an extra row — reload that table to clear it)."
+                ),
+            )
+            render_notice(
+                ui,
+                tone="info",
+                icon="replay",
+                header="Or start over as \"Full load + CDC\"",
+                body=(
+                    "That mode creates the replication slot at the Full Load snapshot point, "
+                    "so the handoff has no gap and nothing is re-read — but it loads every "
+                    "table again. You can run it and start the CDC phase later."
+                ),
+            )
+
+            async def _take_resnapshot() -> None:
+                migration_state.set_cdc_start_mode("manual")
+                await run_checks(MigrationMode.CDC)
+
+            ui.button(  # type: ignore[attr-defined]
+                "Re-snapshot every table", icon="restart_alt", on_click=_take_resnapshot
+            ).props("color=primary")
 
 
 # Quasar color names for each prerequisite check status badge. INFO is a calm

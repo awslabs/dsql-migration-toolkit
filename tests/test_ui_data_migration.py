@@ -9383,6 +9383,10 @@ class _RecordingUi:
             self.texts.append(str(text))
         el = self._El(self)
         el.on_click = on_click
+        # The LABEL on the element too, not only in `texts`: a test that drives a click
+        # has to identify WHICH action it is driving, and pairing by list index across two
+        # lists is fragile the moment a card renders more than one button.
+        el.text = str(text)
         self.buttons.append(el)
         return el
 
@@ -25104,3 +25108,173 @@ def test_the_deploy_button_is_disabled_and_explains_a_failing_publication_check(
     # ...and it carries the route, so they do not have to go back to the table for it.
     assert "BEFORE deploying" in rendered
     assert "re-snapshot" in rendered
+
+
+def test_an_unfinished_load_never_lets_cdc_resume_from_its_slot() -> None:
+    """The most serious defect in this chain, and nobody reported it.
+
+    The watermark is attached BEFORE the first table loads, so a FAILED or partial run leaves
+    one byte-identical to a successful run's -- same LSN, same slot. Nothing in the CDC-start
+    path reads the job's status, so honouring that slot selects snapshot.mode=never and the
+    never-loaded tables get NO baseline and NO backfill: their rows are permanently absent
+    from the target, silently. Switching the type to "CDC only" even removes the
+    "retry the failed tables first" hint, because that substep disappears.
+    """
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import Watermark
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    wm = Watermark(
+        snapshot_timestamp=datetime.now(timezone.utc),
+        wal_lsn="3/AF012B8",
+        slot_name="dsqlmig_s1",
+        publication_name="dsqlmig_p1",
+    )
+
+    # A FINISHED load keeps its slot -> the gapless resume is honoured.
+    done = _cdc_ui._cdc_watermark(SimpleNamespace(status="DONE", watermark=wm))
+    assert done.slot_name == "dsqlmig_s1"
+    assert done.wal_lsn == "3/AF012B8"
+
+    # Anything else suppresses ONLY the slot, which routes the start to
+    # snapshot.mode=initial -- re-snapshot every table, which is lossless.
+    for status in ("FAILED", "IN_PROGRESS", "PARTIAL", None):
+        got = _cdc_ui._cdc_watermark(SimpleNamespace(status=status, watermark=wm))
+        assert got.slot_name is None, status
+        # The LSN survives: it is still the record of WHERE the load was, and dropping it
+        # would lose information the UI shows.
+        assert got.wal_lsn == "3/AF012B8", status
+
+    # It must not invent a watermark, and must not crash on a job without one.
+    assert _cdc_ui._cdc_watermark(SimpleNamespace(status="DONE", watermark=None)) is None
+    assert _cdc_ui._cdc_watermark(None) is None
+
+    # ...and it must not mutate the job's own watermark -- a retry carries the ORIGINAL
+    # forward, which is what makes the gapless resume come back once the load completes.
+    assert wm.slot_name == "dsqlmig_s1"
+
+
+def test_the_config_and_the_probe_agree_on_the_two_start_knobs() -> None:
+    """The probe must mirror build_pg_source_config, or it refuses a start that would work.
+
+    force_initial (the Manual / re-snapshot start) means the connector does NOT resume from
+    the slot and DOES create its own publication. A probe that ignores it blocks on a slot
+    the connector will not use, and on a publication the connector is about to make.
+    """
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    src = inspect.getsource(_cdc_ui._probe_pg_replication_objects)
+    assert "force_initial" in src
+    assert "connector_autocreates_publication=force_initial" in src
+    assert "and not force_initial" in src  # resumes_from_slot is narrowed by it
+
+    # Both call sites must pass it, or the surface that forgot re-blocks the accepted
+    # re-snapshot. The worker backstop is the one that actually aborts the job.
+    whole = inspect.getsource(_cdc_ui)
+    calls = whole.count("_probe_pg_replication_objects,")
+    assert calls >= 2, calls
+    assert whole.count("force_initial=") >= 2
+
+
+def test_the_prerequisite_panel_offers_the_continuation_beside_the_failing_row() -> None:
+    """The reporter's item 2, asserted BEHAVIORALLY.
+
+    The failing row had no affordance, and the only place that could record the re-snapshot
+    decision was a dialog behind the button this failure disables -- so the route existed and
+    was unreachable. An inspect.getsource check here is worthless: it still finds every
+    string when the whole block is wrapped in `if False:` (proven by mutation).
+    """
+    import asyncio
+
+    from dsql_migrator.core.models import (
+        ColumnDef,
+        MigrationMode,
+        PrerequisiteCheckId,
+        PrerequisiteReport,
+        PrerequisiteStatus,
+        TableDef,
+    )
+    from dsql_migrator.core.prerequisites_postgres import (
+        PostgresCdcFacts,
+        check_cdc_replication_objects,
+    )
+    from dsql_migrator.ui import data_migration as dm
+
+    table = TableDef(
+        name="app.orders",
+        columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+        primary_key=["id"],
+    )
+
+    def panel(row):
+        ui = _RecordingUi()
+        state = DataMigrationState()
+        state.set_prereq_report(
+            MigrationMode.CDC,
+            PrerequisiteReport(
+                mode=MigrationMode.CDC, results=[row],
+                can_proceed=row.status is not PrerequisiteStatus.FAIL,
+            ),
+        )
+        ran: list = []
+
+        async def _run_checks(mode):
+            ran.append(mode)
+
+        dm._render_prerequisites_panel(ui, state, _run_checks, MigrationMode.CDC)
+        return ui, state, ran
+
+    absent = check_cdc_replication_objects(
+        PostgresCdcFacts(
+            checked_publication_name="p", checked_slot_name="s",
+            publication_present=False, publication_tables=(),
+        ),
+        [table], provisions_replication=False,
+    )
+    assert absent.status is PrerequisiteStatus.FAIL
+    assert absent.resolvable_by_resnapshot is True
+
+    ui, state, ran = panel(absent)
+    rendered = " ".join(ui.texts)
+    assert "Re-snapshot every table" in rendered, (
+        "the failing row must carry the continuation affordance"
+    )
+    btn = next(
+        (b for b in ui.buttons if "Re-snapshot" in getattr(b, "text", "")), None
+    )
+    assert btn is not None and btn.on_click is not None
+    # The copy must disclose BOTH real costs, not just promise "nothing is lost", and must
+    # name the gapless alternative.
+    assert "read again" in rendered
+    # The delete divergence must name its CONSEQUENCE, not just mention deletes: a row
+    # removed in the window is in neither the snapshot nor the stream, so it persists on
+    # the target and Validation reports it as an extra row. Asserting only the word
+    # "DELETED" would pass for copy that says deletes "are handled" (proven by mutation).
+    assert "DELETED" in rendered
+    assert "stays on the target" in rendered
+    assert "extra row" in rendered
+    assert "Full load + CDC" in rendered
+
+    # Clicking it RECORDS the decision and RE-RUNS the checks, so one re-graded report
+    # clears every gate at once instead of leaving a red FAIL beside an enabled button.
+    asyncio.run(btn.on_click())
+    assert state.cdc_start_mode() == "manual"
+    assert ran == [MigrationMode.CDC]
+
+    # A coverage FAIL is NOT resolvable by re-snapshot (filtered autocreate does not alter
+    # an existing publication), so no affordance -- offering it there would be a lie.
+    gap = check_cdc_replication_objects(
+        PostgresCdcFacts(
+            checked_publication_name="p", checked_slot_name="s",
+            publication_present=True, publication_publishes_all_dml=True,
+            publication_tables=(), slot_usable=True, slot_present_any_database=True,
+        ),
+        [table], provisions_replication=False,
+    )
+    assert gap.status is PrerequisiteStatus.FAIL
+    assert gap.resolvable_by_resnapshot is False
+    ui2, _s2, _r2 = panel(gap)
+    assert "Re-snapshot every table" not in " ".join(ui2.texts)

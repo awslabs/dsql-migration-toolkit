@@ -309,7 +309,12 @@ def read_pg_replication_objects(
             "  AS slot_any_n, "
             "(SELECT count(*) FROM pg_replication_slots WHERE slot_name = :slot "
             "   AND slot_type = 'logical' AND plugin = 'pgoutput' "
-            "   AND database = current_database()) AS slot_ok_n"
+            "   AND database = current_database() "
+            # An INVALIDATED slot still EXISTS (so slot_any_n counts it) but the connector
+            # cannot stream from it -- grading it usable turns a recoverable re-snapshot
+            # into a dead Debezium task. wal_status is PG13+ and the tool targets PG13-18,
+            # so coalesce keeps it NULL-safe on an older server.
+            "   AND coalesce(wal_status, 'reserved') <> 'lost') AS slot_ok_n"
         ),
         {"pub": publication_name, "slot": slot_name},
     ).first()
@@ -332,14 +337,24 @@ def pg_replication_objects_blocker(
     selected_tables: Sequence[str],
     *,
     resumes_from_slot: bool,
+    connector_autocreates_publication: bool = False,
 ) -> Optional[tuple]:
     """Why CDC must not start against these objects, as ``(header, body)``, or None. Pure.
 
-    ``resumes_from_slot`` is the connector's intent -- True only when the watermark carries
-    the slot the Full Load created, i.e. exactly when ``build_pg_source_config`` selects
-    ``snapshot.mode=never``. It is what keeps this from over-blocking the legitimate
-    re-snapshot start: with ``initial``, Debezium creates the slot itself and snapshots
-    every captured table, so a missing slot is not a gap and must not block.
+    The two keywords are the connector's INTENT and must mirror
+    ``build_pg_source_config`` exactly, or this refuses a configuration that would have
+    worked:
+
+    * ``resumes_from_slot`` <-> ``snapshot.mode=never``. True only when the watermark
+      carries the slot the Full Load created. With ``initial`` instead, Debezium creates
+      the slot itself and snapshots every captured table, so a missing slot is not a gap
+      and must not block.
+    * ``connector_autocreates_publication`` <-> ``publication.autocreate.mode=filtered``.
+      True when the connector's own DB user will create the publication over exactly the
+      captured tables. Without this, an absent publication blocked UNCONDITIONALLY -- so
+      the Start dialog's "Re-snapshot every table instead" button un-disabled Start and
+      the worker backstop, which calls this function right before creating anything, then
+      raised "Start CDC blocked". The escape hatch shipped dead in v0.1.507.
 
     Coverage is graded, not just existence: a publication that omits a selected table lets
     Debezium reach RUNNING while replicating NOTHING for it -- strictly worse than a task
@@ -347,7 +362,7 @@ def pg_replication_objects_blocker(
     currently ``active`` (neither is a failure of THIS migration).
     """
     pub = objects.publication_name
-    if not objects.publication_present:
+    if not objects.publication_present and not connector_autocreates_publication:
         return (
             "CDC's publication does not exist on the source",
             f"The connector is configured with publication.autocreate.mode=disabled and "
@@ -356,7 +371,15 @@ def pg_replication_objects_blocker(
             "now would deploy the connectors and the Debezium task would die immediately "
             "with \"Publication autocreation is disabled\".",
         )
-    missing = sorted(set(selected_tables) - set(objects.publication_tables))
+    # Coverage and publish-list grading READ the publication, so they are meaningless when
+    # it does not exist yet and the connector is about to create it: an empty
+    # publication_tables would otherwise report every selected table as "missing" and
+    # block on the very next branch.
+    missing = (
+        sorted(set(selected_tables) - set(objects.publication_tables))
+        if objects.publication_present
+        else []
+    )
     if missing:
         shown = ", ".join(missing[:5]) + (" …" if len(missing) > 5 else "")
         return (
@@ -365,7 +388,7 @@ def pg_replication_objects_blocker(
             f"selected tables: {shown}. Those tables would replicate NOTHING while the "
             "connector reported RUNNING, which is worse than a visible failure.",
         )
-    if objects.publication_publishes_all_dml is False:
+    if objects.publication_present and objects.publication_publishes_all_dml is False:
         return (
             "CDC's publication does not publish every change type",
             f"Publication '{pub}' is restricted to a subset of INSERT/UPDATE/DELETE, so "
