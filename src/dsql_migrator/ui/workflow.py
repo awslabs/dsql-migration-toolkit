@@ -1120,12 +1120,22 @@ def _migration_type_meta(state: "object"):
     workflow). Falls back to a neutral label if the metadata can't be resolved.
     """
     try:
-        from dsql_migrator.ui.data_migration import _MIGRATION_TYPE_META
+        from dsql_migrator.ui.data_migration import (
+            _MIGRATION_TYPE_META,
+            migration_type_blurb,
+            session_source_type,
+        )
 
         mt = getattr(state, "migration_type", None)
         meta = _MIGRATION_TYPE_META.get(mt)
         if meta is not None:
-            return meta.label, meta.icon, meta.blurb
+            # Source-aware: this blurb is re-rendered as the STEP BANNER, so a clause that
+            # is false for the session's engine stands above every screen of the step.
+            return (
+                meta.label,
+                meta.icon,
+                migration_type_blurb(mt, session_source_type(state)),
+            )
     except Exception:  # noqa: BLE001 - header is decorative; never break the page
         pass
     return "Migration", "tune", ""

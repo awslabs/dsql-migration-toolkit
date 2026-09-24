@@ -9295,8 +9295,11 @@ class _RecordingUi:
         # drops tooltips instead of breaking the render.
         _ui = None
 
+        props_seen: list = []
+
         def __init__(self, ui=None):
             self._ui = ui
+            self.props_seen = []
 
         def classes(self, *_a, **_k):
             # Recorded, not discarded: a Tailwind/Quasar class is the whole mechanism for
@@ -9307,6 +9310,11 @@ class _RecordingUi:
             return self
 
         def props(self, *_a, **_k):
+            # Recorded so a test can ask whether an action is the PRIMARY call to action
+            # (color=primary) or a secondary one -- which is the difference between
+            # recommending a route and merely offering it.
+            if _a:
+                self.props_seen.append(str(_a[0]))
             return self
 
         def tooltip(self, text="", *_a, **_k):
@@ -24284,7 +24292,8 @@ def test_the_cdc_vpc_is_prefilled_from_the_source_and_only_when_empty() -> None:
 
 
 def _drive_cdc_infra_dialog(
-    monkeypatch, *, source_vpc_warning="", admission=None, net=None
+    monkeypatch, *, source_vpc_warning="", admission=None, net=None,
+    pg_objects_required=False,
 ):
     """Open the REAL Deploy-CDC-infrastructure dialog; return (notices, buttons).
 
@@ -24334,7 +24343,8 @@ def _drive_cdc_infra_dialog(
     state.set_cdc_infra_inputs({"vpc_id": "vpc-app"})
     asyncio.run(
         cdc_ui._open_cdc_infra_dialog(
-            ui, state, lambda: None, session=_SimpleSourceSession()
+            ui, state, lambda: None, session=_SimpleSourceSession(),
+            pg_objects_required=pg_objects_required,
         )
     )
     return notices, ui
@@ -24348,7 +24358,7 @@ class _SimpleSourceSession:
     target_config = None
 
 
-def _drive_cdc_infra_dialog_with_state(monkeypatch, state):
+def _drive_cdc_infra_dialog_with_state(monkeypatch, state, *, pg_objects_required=False):
     """Like _drive_cdc_infra_dialog but with a caller-supplied migration state."""
     import asyncio
 
@@ -24380,7 +24390,8 @@ def _drive_cdc_infra_dialog_with_state(monkeypatch, state):
     monkeypatch.setattr(cdc_ui, "_render_cdc_cost_estimate", lambda *_a, **_k: None)
     asyncio.run(
         cdc_ui._open_cdc_infra_dialog(
-            ui, state, lambda: None, session=_SimpleSourceSession()
+            ui, state, lambda: None, session=_SimpleSourceSession(),
+            pg_objects_required=pg_objects_required,
         )
     )
     return notices, ui
@@ -24911,11 +24922,19 @@ def test_the_deploy_infra_dialog_refuses_a_cdc_only_deploy_with_nothing_to_strea
         lambda *_a, **_k: ("CDC's publication does not exist on the source", "do X"),
     )
 
-    def _drive(migration_type):
+    def _drive(migration_type, *, objects_required=None):
         state = DataMigrationState()
         state.set_cdc_infra_inputs({"vpc_id": "vpc-app"})
         state.migration_type = migration_type
-        return _drive_cdc_infra_dialog_with_state(monkeypatch, state)
+        return _drive_cdc_infra_dialog_with_state(
+            monkeypatch,
+            state,
+            pg_objects_required=(
+                migration_type is MigrationType.CDC_ONLY
+                if objects_required is None
+                else objects_required
+            ),
+        )
 
     notices, ui = _drive(MigrationType.CDC_ONLY)
     blocked = [
@@ -24925,13 +24944,25 @@ def test_the_deploy_infra_dialog_refuses_a_cdc_only_deploy_with_nothing_to_strea
     assert "billable MSK Serverless cluster" in blocked[0]["body"]
     assert ui.buttons["Deploy"].enabled is False
 
-    # PAIRED: the combined type must NOT be blocked by the same probe result.
+    # PAIRED: a FRESH combined run (no watermark -> objects not required yet) must NOT be
+    # blocked -- deploying the infrastructure before the load is the flow the card itself
+    # recommends, and the objects legitimately do not exist yet.
     notices2, ui2 = _drive(MigrationType.FULL_LOAD_AND_CDC)
     assert not [
         n for n in notices2
         if n["header"] == "CDC's publication does not exist on the source"
     ]
     assert ui2.buttons["Deploy"].enabled is True
+
+    # ...but switching to the combined type AFTER a finished Full-load-only run re-grades
+    # the prerequisite to SKIP and un-gates Deploy while the objects still do not exist. The
+    # caller detects that from the watermark, so the cost gate must still fire.
+    notices3, ui3 = _drive(MigrationType.FULL_LOAD_AND_CDC, objects_required=True)
+    assert [
+        n["tone"] for n in notices3
+        if n["header"] == "CDC's publication does not exist on the source"
+    ] == ["error"]
+    assert ui3.buttons["Deploy"].enabled is False
 
 
 def test_the_deploy_gate_blocks_a_failing_publication_check_but_nothing_softer() -> None:
@@ -25246,8 +25277,7 @@ def test_the_prerequisite_panel_offers_the_continuation_beside_the_failing_row()
         (b for b in ui.buttons if "Re-snapshot" in getattr(b, "text", "")), None
     )
     assert btn is not None and btn.on_click is not None
-    # The copy must disclose BOTH real costs, not just promise "nothing is lost", and must
-    # name the gapless alternative.
+    # The copy must disclose BOTH real costs, not just promise "nothing is lost".
     assert "read again" in rendered
     # The delete divergence must name its CONSEQUENCE, not just mention deletes: a row
     # removed in the window is in neither the snapshot nor the stream, so it persists on
@@ -25256,7 +25286,18 @@ def test_the_prerequisite_panel_offers_the_continuation_beside_the_failing_row()
     assert "DELETED" in rendered
     assert "stays on the target" in rendered
     assert "extra row" in rendered
+
+    # ORDER MATTERS: re-running as "Full load + CDC" is RECOMMENDED and must come first.
+    # Both routes re-read every table, so the re-read is not the differentiator -- but only
+    # the re-run can drop each target table, which is the only way to clear rows deleted on
+    # the source since the first load, and only it creates the slot before the load so the
+    # handoff is gapless afterwards. Same cost, strictly better result.
     assert "Full load + CDC" in rendered
+    assert rendered.index("Recommended") < rendered.index("Or continue from here")
+    assert "DROP" in rendered  # the delete-clearing step the other route cannot do
+    # ...and the re-snapshot button must therefore NOT be the primary call to action.
+    assert btn is not None
+    assert not any("color=primary" in p for p in getattr(btn, "props_seen", []))
 
     # Clicking it RECORDS the decision and RE-RUNS the checks, so one re-graded report
     # clears every gate at once instead of leaving a red FAIL beside an enabled button.
@@ -25278,3 +25319,211 @@ def test_the_prerequisite_panel_offers_the_continuation_beside_the_failing_row()
     assert gap.resolvable_by_resnapshot is False
     ui2, _s2, _r2 = panel(gap)
     assert "Re-snapshot every table" not in " ".join(ui2.texts)
+
+
+def test_a_finished_load_with_no_slot_gates_the_spend_whatever_tile_is_selected() -> None:
+    """The trap on the RECOMMENDED continuation route.
+
+    Switching the type to "Full load + CDC" after a finished Full-load-only run re-grades the
+    existence prerequisite to SKIP -- its detail says "Full Load creates them for this run" --
+    so the prerequisite gate un-gates Deploy while the objects still do not exist. Deploy then
+    creates a billable MSK Serverless cluster and Start CDC refuses. EXECUTED against the
+    prerequisite chain: `provisions_replication=True` turns the FAIL into a SKIP and
+    `cdc_prerequisite_block_reason` returns None. So the cost gate cannot key on the tile.
+    """
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import Watermark
+    from dsql_migrator.ui.data_migration._cdc_ui import pg_objects_required_before_deploy
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    def state(mt):
+        return SimpleNamespace(migration_type=mt)
+
+    slotless = SimpleNamespace(
+        status="DONE",
+        watermark=Watermark(
+            snapshot_timestamp=datetime.now(timezone.utc), wal_lsn="0/5816858"
+        ),
+    )
+    provisioned = SimpleNamespace(
+        status="DONE",
+        watermark=Watermark(
+            snapshot_timestamp=datetime.now(timezone.utc),
+            wal_lsn="0/5816858",
+            slot_name="dsqlmig_s1",
+        ),
+    )
+
+    # THE case the helper exists for: the tile says the run will create them, the load has
+    # already finished, and it did not.
+    assert (
+        pg_objects_required_before_deploy(
+            state(MigrationType.FULL_LOAD_AND_CDC), slotless
+        )
+        is True
+    )
+    # A FRESH combined run has no job at all -> silent. Deploying the infrastructure before
+    # the load is the flow the card itself recommends, so gating it would be a false block.
+    assert (
+        pg_objects_required_before_deploy(state(MigrationType.FULL_LOAD_AND_CDC), None)
+        is False
+    )
+    # A combined run whose load DID provision -> silent.
+    assert (
+        pg_objects_required_before_deploy(
+            state(MigrationType.FULL_LOAD_AND_CDC), provisioned
+        )
+        is False
+    )
+    # CDC only always needs them, with or without a job.
+    for job in (None, slotless, provisioned):
+        assert pg_objects_required_before_deploy(state(MigrationType.CDC_ONLY), job) is True
+
+    # An UNFINISHED load's slot is suppressed upstream, so it also requires the objects --
+    # otherwise the partial-load re-snapshot would deploy before they exist.
+    partial = SimpleNamespace(status="FAILED", watermark=provisioned.watermark)
+    assert (
+        pg_objects_required_before_deploy(
+            state(MigrationType.FULL_LOAD_AND_CDC), partial
+        )
+        is True
+    )
+
+
+def test_the_deploy_action_derives_the_gate_rather_than_reading_the_tile() -> None:
+    # The helper is useless if the call site ignores it. Pin the wiring: the dialog must be
+    # opened with the DERIVED value, not with a migration-type comparison inlined there.
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    src = inspect.getsource(_cdc_ui._render_cdc_infra_deploy_action)
+    assert "pg_objects_required_before_deploy(" in src
+    assert "pg_objects_required=_needs_objects" in src
+
+
+def test_the_cdc_only_tile_is_honest_on_postgres_rather_than_disabled() -> None:
+    """Deliberately NOT disabled, and this test records why.
+
+    CDC-only is valid and GAPLESS on PostgreSQL whenever an earlier "Full load + CDC" run
+    recorded its replication slot -- and job state including the watermark is persisted
+    (S3JobStore on the Fargate deployment, SqliteJobStore locally) and reloaded on startup,
+    so a LATER session sees it. Disabling the tile would also remove the re-snapshot
+    continuation, which is the only route left after a Full-load-only run. So the fix is the
+    two clauses that are FALSE on PostgreSQL, not the tile's availability.
+    """
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration import (
+        MigrationType,
+        migration_type_blurb,
+    )
+
+    mysql = migration_type_blurb(MigrationType.CDC_ONLY, SourceType.MYSQL)
+    pg = migration_type_blurb(MigrationType.CDC_ONLY, SourceType.POSTGRES)
+    assert pg != mysql
+    # MySQL keeps both clauses, and they are true there: its binlog retains history with no
+    # consumer, and a manual GTID/binlog offset IS seeded into connect-offsets.
+    assert "prior watermark" in mysql and "external start position" in mysql
+    # PostgreSQL has neither. _cdc_resume_signal DISCARDS the override for PG, and a
+    # Full-load-only watermark's LSN is not a usable start point.
+    assert "external start position" not in pg
+    # ...and it says what actually decides the outcome.
+    assert "Full load + CDC" in pg
+    assert "re-snapshot" in pg
+    # The default (unknown engine) stays the MySQL baseline, so existing callers are unchanged.
+    assert migration_type_blurb(MigrationType.CDC_ONLY) == mysql
+
+    # The combined tile advertises the deferral, which is the gapless "load now, CDC later"
+    # route the tool already implements and never mentioned.
+    combined = migration_type_blurb(MigrationType.FULL_LOAD_AND_CDC, SourceType.POSTGRES)
+    assert "BEFORE the load" in combined
+    assert "started later" in combined
+
+    # The tile itself must still be OFFERED for PostgreSQL -- no disabling, no removal.
+    from dsql_migrator.ui.data_migration._models import _MIGRATION_TYPE_META
+
+    assert MigrationType.CDC_ONLY in _MIGRATION_TYPE_META
+
+
+def test_the_journey_banner_is_source_aware_too() -> None:
+    # The blurb is re-rendered as the Data Migration step BANNER, so a false clause stands
+    # above every screen of the step -- worse than on the tile, which is a one-time choice.
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration import MigrationType
+    from dsql_migrator.ui.workflow import _migration_type_meta
+
+    class _State:
+        migration_type = MigrationType.CDC_ONLY
+
+        def __init__(self, st):
+            self.source_config = SimpleNamespace(source_type=st)
+
+    _l, _i, pg = _migration_type_meta(_State(SourceType.POSTGRES))
+    _l2, _i2, mysql = _migration_type_meta(_State(SourceType.MYSQL))
+    assert pg != mysql
+    assert "external start position" not in pg
+    assert "external start position" in mysql
+    # It must never raise: the banner is decorative and a broken engine read must not take
+    # the page down.
+    assert _migration_type_meta(object())[0]
+
+
+def test_the_rendered_tile_shows_the_engine_aware_blurb() -> None:
+    """The pure function being right is not enough -- the TILE has to use it.
+
+    Mutation-proven: reverting the tile to the static `meta.blurb` left every other test
+    green, because they exercised the function and the banner but never the tile itself.
+    """
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration import (
+        DataMigrationState,
+        _render_migration_type_selector,
+    )
+    from dsql_migrator.ui.session import SessionConnectionState
+
+    def render(source_type):
+        session = SessionConnectionState()
+        session.set_restored_source_type(source_type)
+        state = DataMigrationState()
+        state.bind_session(session)
+        ui = _RecordingUi()
+        _render_migration_type_selector(
+            ui, state, status=StepStatus.NOT_STARTED, refresh=lambda: None,
+            locked=False, source_type=source_type,
+        )
+        return " ".join(ui.texts)
+
+    pg = render(SourceType.POSTGRES)
+    mysql = render(SourceType.MYSQL)
+    # The clause that is false on PostgreSQL must not be on a PostgreSQL operator's screen.
+    assert "external start position" in mysql
+    assert "external start position" not in pg
+    # ...and the PostgreSQL tile states what actually decides the outcome.
+    assert "re-snapshots every selected table" in pg
+    # The combined tile advertises the deferral -- the gapless "load now, CDC later" route.
+    assert "started later" in pg
+    # All three tiles are still OFFERED: honesty, not unavailability.
+    for label in ("Full load only", "Full load + CDC", "CDC only"):
+        assert label in pg, label
+
+    # ...and the CALL SITE must derive the engine via session_source_type, not from a
+    # source_config read with a MySQL fallback: a RESTORED session records the engine
+    # WITHOUT a source_config, so the fallback showed a PostgreSQL operator MySQL semantics
+    # and would have defeated all of the above.
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    call_site = inspect.getsource(dm.build_data_migration_screen)
+    assert call_site.count("_render_migration_type_selector(") == 1
+    idx = call_site.index("_render_migration_type_selector(")
+    # The CALL's own argument list: closes at this statement's indentation, so the slice
+    # cannot run past it into unrelated code (two other engine reads exist in this
+    # function, both for SchemaConverter -- a separate concern).
+    call = call_site[idx : call_site.index("\n            )\n", idx)]
+    assert "source_type=session_source_type(session)" in call
+    # The MySQL-fallback read this replaced must be gone from the CALL, not just shadowed.
+    assert "session.source_config.source_type" not in call

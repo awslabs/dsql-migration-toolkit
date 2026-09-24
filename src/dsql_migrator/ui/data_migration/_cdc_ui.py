@@ -2466,6 +2466,10 @@ def _render_cdc_infra_deploy_action(
     )
 
     async def _confirm() -> None:
+        _needs_objects = pg_objects_required_before_deploy(
+            migration_state,
+            _current_job(job_manager, getattr(migration_state, "job_id", None)),
+        )
         await _open_cdc_infra_dialog(
             ui, migration_state,
             lambda: _start_cdc_infra_deploy(
@@ -2473,6 +2477,7 @@ def _render_cdc_infra_deploy_action(
                 inventory=inventory, session=session,
             ),
             session=session,
+            pg_objects_required=_needs_objects,
         )
 
     # Explicit CDC-prerequisite gate. MSK is billable and takes ~5 min to
@@ -2864,7 +2869,9 @@ def cdc_deploy_connection_blocker(session) -> Optional[str]:
         )
     return None
 
-async def _open_cdc_infra_dialog(ui, migration_state, on_confirm, *, session=None) -> None:
+async def _open_cdc_infra_dialog(
+    ui, migration_state, on_confirm, *, session=None, pg_objects_required=False
+) -> None:
     """Confirm dialog before the (~5 min, billable) infrastructure create.
 
     When ``session`` is given and no manual subnet override is set, runs the
@@ -2910,7 +2917,16 @@ async def _open_cdc_infra_dialog(ui, migration_state, on_confirm, *, session=Non
     # Start-side gate RE-PROBES rather than remembering this verdict, so provisioning
     # between the two steps simply turns the block off.
     pg_infra_block: Optional[tuple] = None
-    if getattr(migration_state, "migration_type", None) is MigrationType.CDC_ONLY:
+    # ``pg_objects_required`` is computed by the caller (which holds job_manager) and is
+    # deliberately NOT just "the type is CDC only". Switching the type to Full-load-+-CDC
+    # after a FINISHED Full-load-only run re-grades the existence row to SKIP -- its detail
+    # says "Full Load creates them for this run" -- so the prerequisite gate un-gates Deploy
+    # while the objects still do not exist. The operator pays for MSK Serverless and Start
+    # then refuses. Keying on the WATERMARK instead is precise: a fresh combined run has no
+    # watermark (so the recommended deploy-before-load flow is untouched), a combined run
+    # whose load provisioned carries a slot_name (untouched), and a load that finished
+    # WITHOUT a slot is exactly the state that must block.
+    if pg_objects_required:
         try:
             pg_infra_block = await run.io_bound(
                 _probe_pg_replication_objects, migration_state, session, [], None
@@ -3269,6 +3285,29 @@ def _probe_binlog_resume_gap(migration_state, job_manager, session) -> Optional[
     except Exception:  # noqa: BLE001 - advisory pre-flight; unknown never blocks
         return None
     return binlog_resume_gap_reason(watermark_file, retained)
+
+
+def pg_objects_required_before_deploy(migration_state, job) -> bool:
+    """Must CDC's publication/slot exist BEFORE the (billable) infrastructure is created?
+
+    Pure, so the decision is testable without a dialog. Deliberately NOT just "the type is
+    CDC only": switching the type to Full-load-+-CDC after a FINISHED Full-load-only run
+    re-grades the existence prerequisite to SKIP -- its detail says "Full Load creates them
+    for this run" -- so the prerequisite gate un-gates Deploy while the objects still do not
+    exist. The operator then pays for MSK Serverless and Start CDC refuses.
+
+    Keying on the WATERMARK is precise:
+
+    * a FRESH combined run has no watermark -> False, so the recommended
+      deploy-the-infra-before-the-load flow is untouched;
+    * a combined run whose load DID provision carries ``slot_name`` -> False;
+    * a load that FINISHED WITHOUT a slot -> True, which is exactly the state that must be
+      gated, whichever tile is selected now.
+    """
+    if getattr(migration_state, "migration_type", None) is MigrationType.CDC_ONLY:
+        return True
+    watermark = _cdc_watermark(job)
+    return watermark is not None and not getattr(watermark, "slot_name", None)
 
 
 def _cdc_watermark(job):

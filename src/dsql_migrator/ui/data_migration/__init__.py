@@ -186,6 +186,7 @@ from dsql_migrator.ui.data_migration._models import (
     should_pin_cdc_substep,
     _MigrationTypeMeta,
     _MIGRATION_TYPE_META,
+    migration_type_blurb,
     migration_type_requirements,
     MigrationProgress,
     summarize_progress,
@@ -829,11 +830,13 @@ def build_data_migration_screen(
                 # sink), so all three tiles are enabled for them; the gate stays as a
                 # defensive default that would disable the CDC tiles for any future
                 # engine whose CDC path is not shipped.
-                source_type=(
-                    session.source_config.source_type
-                    if session.source_config is not None
-                    else SourceType.MYSQL
-                ),
+                # session_source_type, NOT a source_config read with a MySQL fallback: a
+                # RESTORED session (reconnect / task replacement) has the engine recorded
+                # WITHOUT a source_config, so the fallback showed a PostgreSQL operator the
+                # MySQL tile semantics -- which would have defeated the engine-aware copy
+                # entirely. That helper exists for exactly this class of bug and is what
+                # every other PostgreSQL-aware surface uses.
+                source_type=session_source_type(session),
             )
             # Plan-level CDC discovery surfacing: the moment the plan includes CDC,
             # the discovery (armed below on has_cdc) populates cdc_other_stacks. Show
@@ -3020,9 +3023,9 @@ def _render_migration_type_selector(
                     ui.label(meta.label).classes(  # type: ignore[attr-defined]
                         "text-sm font-semibold"
                     )
-                ui.label(meta.blurb).classes(  # type: ignore[attr-defined]
-                    "text-xs text-gray-600"
-                )
+                ui.label(  # type: ignore[attr-defined]
+                    migration_type_blurb(mt, source_type)
+                ).classes("text-xs text-gray-600")
                 if meta.when:
                     ui.label(meta.when).classes(  # type: ignore[attr-defined]
                         "text-xs text-gray-700 font-medium mt-1"
@@ -3778,34 +3781,49 @@ def _render_prerequisites_panel(
                 body=(
                     "Nothing was retaining WAL while the Full Load ran, and a replication "
                     "slot cannot be created at a past position — so the changes committed "
-                    "since the load cannot be replayed. CDC can still be added without "
-                    "losing a row that still exists, by re-reading the tables."
+                    "since the load cannot be replayed. Both ways forward re-read the "
+                    "source tables; they differ in what they leave behind."
+                ),
+            )
+            # RECOMMENDED FIRST, and deliberately so. Both routes re-read every table, so
+            # the re-read is not what distinguishes them -- but re-running as
+            # "Full load + CDC" (a) uses the tool's own bulk loader rather than the CDC
+            # pipeline, (b) creates the slot BEFORE the load so everything from the
+            # snapshot point on is streamed, and (c) can DROP each target table first,
+            # which is the only way to clear rows deleted on the source since the last
+            # load. The re-snapshot route leaves those rows behind forever. Same cost,
+            # strictly better result -- so it leads.
+            render_notice(
+                ui,
+                tone="info",
+                icon="replay",
+                header="Recommended: start over as \"Full load + CDC\"",
+                body=(
+                    "Change the migration type above and run the Full Load again. The tool "
+                    "creates the replication slot at the new snapshot point BEFORE loading, "
+                    "so CDC then resumes from it with no gap — and you can start the CDC "
+                    "phase whenever you like, it does not have to be now. Choose to DROP "
+                    "each table when the load asks: that also clears any row deleted on the "
+                    "source since the first load, which nothing else here can do. It reads "
+                    "the source again, but so does the alternative, and it uses the bulk "
+                    "loader rather than the streaming pipeline."
                 ),
             )
             render_notice(
                 ui,
                 tone="info",
                 icon="restart_alt",
-                header="Re-snapshot every table, then stream",
+                header="Or continue from here by re-snapshotting",
                 body=(
-                    "The connector creates its own publication over exactly the captured "
-                    "tables, snapshots them, and then streams from the slot it made — there "
-                    "is no window between the snapshot and the stream. The target load is "
-                    "idempotent, so re-reading a row is safe. Two things to know: the source "
-                    "tables are read again, and a row DELETED between the load and the start "
-                    "is in neither the snapshot nor the stream, so it stays on the target "
-                    "(Validation reports it as an extra row — reload that table to clear it)."
-                ),
-            )
-            render_notice(
-                ui,
-                tone="info",
-                icon="replay",
-                header="Or start over as \"Full load + CDC\"",
-                body=(
-                    "That mode creates the replication slot at the Full Load snapshot point, "
-                    "so the handoff has no gap and nothing is re-read — but it loads every "
-                    "table again. You can run it and start the CDC phase later."
+                    "Keeps this Full Load and adds CDC without a second load pass: the "
+                    "connector creates its own publication over exactly the captured "
+                    "tables, snapshots them, then streams from the slot it made — there is "
+                    "no window between the snapshot and the stream. Choose this if "
+                    "re-running the load is not acceptable. Two costs: the source tables "
+                    "are read again through the streaming pipeline, and a row DELETED "
+                    "between the load and the start is in neither the snapshot nor the "
+                    "stream, so it stays on the target (Validation reports it as an extra "
+                    "row — reload that table to clear it)."
                 ),
             )
 
@@ -3815,7 +3833,7 @@ def _render_prerequisites_panel(
 
             ui.button(  # type: ignore[attr-defined]
                 "Re-snapshot every table", icon="restart_alt", on_click=_take_resnapshot
-            ).props("color=primary")
+            ).props("flat")
 
 
 # Quasar color names for each prerequisite check status badge. INFO is a calm

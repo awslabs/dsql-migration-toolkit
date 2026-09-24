@@ -2137,6 +2137,48 @@ _MIGRATION_TYPE_META: dict[MigrationType, _MigrationTypeMeta] = {
 }
 
 
+def migration_type_blurb(
+    mt: MigrationType, source_type: SourceType = SourceType.MYSQL
+) -> str:
+    """Source-aware tile blurb, which ``workflow.py`` also re-renders as the step BANNER.
+
+    The MySQL wording is the static baseline, so existing callers are unchanged. The
+    PostgreSQL CDC-only blurb drops two clauses that are FALSE on that engine, and it is not
+    a cosmetic difference: this string stands above every screen of the Data Migration step.
+
+    * "start from a prior watermark" -- only when that watermark carries the SLOT a
+      Full-load-+-CDC run created; a Full-load-only watermark's LSN is not a usable start
+      point, because a slot cannot be created at a past position.
+    * "or an external start position" -- there is none. ``_cdc_resume_signal`` DISCARDS the
+      operator's override for PostgreSQL, because Debezium PostgreSQL resumes only from a
+      slot's committed position and cannot be told to start from an arbitrary WAL LSN.
+
+    Note what this deliberately does NOT do: disable the tile. CDC-only is valid and GAPLESS
+    on PostgreSQL whenever a previous Full-load-+-CDC run recorded the slot -- and job state
+    (including the watermark) is persisted and reloaded on startup, so a LATER session sees
+    it. Disabling the tile would also remove the re-snapshot continuation, which is the only
+    route left after a Full-load-only run. The fix is honesty, not unavailability.
+    """
+    meta = _MIGRATION_TYPE_META[mt]
+    if source_type is not SourceType.POSTGRES:
+        return meta.blurb
+    if mt is MigrationType.CDC_ONLY:
+        return (
+            "Continuous CDC via the optional managed pipeline: check Prerequisites, "
+            "then review the CDC setup. Stand-alone (no Full Load in this session) — "
+            "resumes with no gap only if an earlier \"Full load + CDC\" run left its "
+            "replication slot; otherwise it re-snapshots every selected table first."
+        )
+    if mt is MigrationType.FULL_LOAD_AND_CDC:
+        return (
+            meta.blurb
+            + " The replication slot is created at the snapshot point BEFORE the load, so "
+            "the handoff has no gap — and the CDC phase can be started later, not "
+            "necessarily in this session."
+        )
+    return meta.blurb
+
+
 def migration_type_requirements(
     mt: MigrationType, source_type: SourceType = SourceType.MYSQL
 ) -> str:

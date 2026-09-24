@@ -5,6 +5,50 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.511
+
+### Changed
+
+- **The continuation guidance now leads with "start over as Full load + CDC" instead of
+  re-snapshotting.** Both routes re-read every source table, so the re-read is not what
+  distinguishes them — but re-running the load (a) uses the tool's bulk loader rather than the
+  streaming pipeline, (b) creates the replication slot BEFORE the load so everything from the
+  snapshot point on is streamed, and (c) can DROP each target table first, which is the only
+  way to clear rows deleted on the source since the first load. The re-snapshot route leaves
+  those rows on the target forever. Same cost, strictly better result — so it is the
+  recommendation, and re-snapshot is the secondary option for when re-running the load is not
+  acceptable.
+- **The "CDC only" tile stops promising two things PostgreSQL cannot do.** Its blurb said
+  "start from a prior watermark or an external start position": the first is true only when
+  that watermark carries the slot a Full-load-+-CDC run created, and the second does not exist
+  at all — `_cdc_resume_signal` DISCARDS the operator's start override for PostgreSQL, because
+  Debezium PostgreSQL resumes only from a replication slot's committed position and cannot be
+  told to start from an arbitrary WAL LSN. The tile is deliberately NOT disabled: CDC-only is
+  valid and gapless whenever an earlier run recorded its slot, and job state including the
+  watermark is persisted and reloaded on startup, so a later session sees it — and disabling it
+  would remove the re-snapshot continuation as well. The "Full load + CDC" tile now also says
+  what it uniquely offers: the slot is created before the load, and the CDC phase can be
+  started later. This blurb is re-rendered as the Data Migration step BANNER, so a false clause
+  stood above every screen of the step, not just the tile.
+
+### Fixed
+
+- **Deploying the CDC infrastructure after switching the tile to "Full load + CDC" no longer
+  bills for a cluster the load has not provisioned for.** Switching the type after a finished
+  Full-load-only run re-grades the existence prerequisite to SKIP — its detail says "Full Load
+  creates them for this run" — so the gate un-gated Deploy while the objects still did not
+  exist. MSK Serverless was created and Start CDC then refused. The cost gate now keys on the
+  WATERMARK rather than the tile, which is precise: a fresh combined run has no watermark, so
+  the recommended deploy-before-load flow is untouched; a run whose load provisioned carries a
+  slot; and a load that finished WITHOUT one is exactly the state that must be gated, whichever
+  tile is selected now. This matters because it is the trap on the route this release
+  recommends.
+- **A restored session showed a PostgreSQL operator the MySQL tile semantics.** The
+  migration-type selector read the engine from `source_config` with a MySQL fallback, and a
+  reconnected session records the engine WITHOUT a `source_config` — so every engine-aware
+  string above would have been defeated for exactly the operator who reconnects. It now uses
+  `session_source_type`, as every other PostgreSQL-aware surface does.
+
 ## v0.1.510
 
 ### Fixed
