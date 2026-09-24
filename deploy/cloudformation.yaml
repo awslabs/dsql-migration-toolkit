@@ -1821,6 +1821,17 @@ Resources:
             # cdc-stack's in-VPC seeder Lambda.
             - Name: DSQL_MIGRATOR_CDC_MSK_ACCESS
               Value: "true"
+            # WHICH Secrets Manager secret this deployment can actually read, for the
+            # same reason as the marker above: the app cannot observe its own TaskRole
+            # (no iam:Simulate*), and the GetSecretValue grant below is generated from
+            # the SourceSecretArn PARAMETER -- one ARN, fixed at deploy time -- while the
+            # Connect screen accepts any ARN the operator types. Without this the app
+            # could only report "the AWS identity needs secretsmanager:GetSecretValue",
+            # sending the operator to IAM when the actionable fix is this stack's
+            # parameter (or username/password auth). Empty means no secret was granted.
+            - Name: DSQL_MIGRATOR_SOURCE_SECRET_ARN
+              Value:
+                Ref: SourceSecretArn
           Secrets:
             # Stable cookie-signing secret for the UI's browser session id, so a
             # reconnecting browser resumes its persisted workbench state (workflow

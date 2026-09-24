@@ -53,6 +53,7 @@ from dsql_migrator.core.models import (
 from dsql_migrator.core.secrets import (
     SecretResolutionError,
     SourceSecretResolver,
+    granted_source_secret_arn,
     resolve_source_secret,
 )
 from dsql_migrator.core.target_connection import DsqlConnector
@@ -866,13 +867,33 @@ def build_connect_page(
 
             secret_auth = ui.column().classes("w-full gap-2")
             with secret_auth:
+                # A managed deployment can read exactly ONE secret -- the app stack's
+                # SourceSecretArn -- because that parameter is what generates the
+                # GetSecretValue grant. The app cannot read its own role, so the
+                # template attests the ARN in an env var. Say so BEFORE the operator
+                # types an ARN this deployment will refuse: prefill the one that
+                # works, or state plainly that none was granted. (``None`` = not a
+                # managed deployment, so say nothing and let the field stay blank.)
+                _granted_secret = granted_source_secret_arn()
+                if _granted_secret == "":
+                    render_notice(
+                        ui,
+                        tone="warning",
+                        header="This deployment cannot read any secret",
+                        body=(
+                            "Its app stack's SourceSecretArn parameter is empty, so no "
+                            "Secrets Manager read permission was created. Use a username "
+                            "and password below, or update the stack with SourceSecretArn "
+                            "set to the secret you want to use."
+                        ),
+                    )
                 # The ARN example lives on the field as a Quasar ``hint`` (gray,
                 # below the field) so it stays visible WHILE typing -- a reference
                 # for the expected format, unlike a placeholder that vanishes on
                 # the first keystroke.
                 source_secret_id = ui.input(
                     "Secrets Manager secret ARN or name",
-                    value="",
+                    value=_granted_secret or "",
                     placeholder="arn:aws:secretsmanager:us-east-1:...:secret:my-db",
                 ).props(
                     "hint=\"Example: arn:aws:secretsmanager:us-east-1:123456789012"

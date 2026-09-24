@@ -22,9 +22,11 @@ from dsql_migrator.config import SecretValue
 from dsql_migrator.core.secrets import (
     SecretProvisionError,
     SecretResolutionError,
+    GRANTED_SECRET_ENV,
     cdc_source_secret_name,
     delete_source_secret,
     ensure_source_secret,
+    granted_source_secret_arn,
     resolve_source_secret,
 )
 
@@ -194,15 +196,100 @@ def test_not_found_error_message() -> None:
     assert "not found" in str(excinfo.value).lower()
 
 
-def test_access_denied_error_message() -> None:
+def _access_denied(secret_id: str = "name") -> str:
+    """Resolve a secret that is refused, and return the operator-facing message."""
     client = _FakeSecretsClient(error=_client_error("AccessDeniedException"))
     with pytest.raises(SecretResolutionError) as excinfo:
         resolve_source_secret(
-            "name", None, session_factory=_factory_for(_FakeSession(client))
+            secret_id, None, session_factory=_factory_for(_FakeSession(client))
         )
-    message = str(excinfo.value)
+    return str(excinfo.value)
+
+
+def test_access_denied_error_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No attestation env var = not a managed deployment, so the ambient credentials
+    # really are what the operator has to fix and the IAM wording is right.
+    monkeypatch.delenv(GRANTED_SECRET_ENV, raising=False)
+    message = _access_denied()
     assert "Access denied" in message
     assert "secretsmanager:GetSecretValue" in message
+
+
+def test_access_denied_names_the_stack_parameter_when_nothing_was_granted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one case the old message could not express, and the one that shipped.
+
+    A managed deployment whose ``SourceSecretArn`` parameter is empty was granted no
+    secret at all. "The AWS identity needs secretsmanager:GetSecretValue" sent the
+    operator to a task role they cannot edit; the fix is the stack parameter (or
+    password auth), so the message has to say that.
+    """
+    monkeypatch.setenv(GRANTED_SECRET_ENV, "")
+    message = _access_denied("arn:aws:secretsmanager:us-east-1:1:secret:pg-src-AbCdEf")
+    assert "SourceSecretArn" in message
+    assert "username and password" in message
+    # The ARN they typed is echoed so it can be pasted straight into the parameter.
+    assert "pg-src-AbCdEf" in message
+    # Must NOT send them to IAM: that is what made the original message a dead end.
+    assert "secretsmanager:GetSecretValue" not in message
+
+
+def test_access_denied_names_the_one_granted_secret_when_a_different_one_was_asked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    granted = "arn:aws:secretsmanager:us-east-1:1:secret:pg-src-AbCdEf"
+    monkeypatch.setenv(GRANTED_SECRET_ENV, granted)
+    message = _access_denied("arn:aws:secretsmanager:us-east-1:1:secret:other-ZyXwVu")
+    assert granted in message, "name the secret that WOULD work"
+    assert "different one" in message
+    assert "SourceSecretArn" in message
+
+
+def test_access_denied_on_the_granted_secret_points_at_kms_not_the_parameter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The grant is right, so this is a genuine IAM/KMS problem -- keep that advice.
+
+    Telling the operator to change ``SourceSecretArn`` to the value it ALREADY has
+    would be a contradiction, so the granted-and-refused case must stay on the IAM/KMS
+    path (a customer-managed key whose policy omits the task role).
+    """
+    monkeypatch.setenv(
+        GRANTED_SECRET_ENV, "arn:aws:secretsmanager:us-east-1:1:secret:pg-src-AbCdEf"
+    )
+    message = _access_denied("arn:aws:secretsmanager:us-east-1:1:secret:pg-src-AbCdEf")
+    assert "kms:Decrypt" in message
+    assert "SourceSecretArn" not in message
+
+
+def test_a_bare_name_matches_the_granted_full_arn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Connect screen accepts a NAME, so a name must not read as "a different one".
+
+    A full ARN also carries Secrets Manager's random 6-character suffix, which the
+    operator may not have pasted. A plain string compare would produce advice that
+    contradicts itself ("update the parameter to the secret it is already set to").
+    """
+    monkeypatch.setenv(
+        GRANTED_SECRET_ENV, "arn:aws:secretsmanager:us-east-1:1:secret:pg-src-AbCdEf"
+    )
+    for requested in ("pg-src", "pg-src-AbCdEf"):
+        message = _access_denied(requested)
+        assert "different one" not in message, requested
+        assert "kms:Decrypt" in message, requested
+
+
+def test_granted_source_secret_arn_separates_none_from_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(GRANTED_SECRET_ENV, raising=False)
+    assert granted_source_secret_arn() is None, "absent = cannot tell, must stay silent"
+    monkeypatch.setenv(GRANTED_SECRET_ENV, "  ")
+    assert granted_source_secret_arn() == "", "blank = definitely granted nothing"
+    monkeypatch.setenv(GRANTED_SECRET_ENV, " arn:aws:secretsmanager:1:2:secret:s ")
+    assert granted_source_secret_arn() == "arn:aws:secretsmanager:1:2:secret:s"
 
 
 def test_decryption_failure_error_message() -> None:

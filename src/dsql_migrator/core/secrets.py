@@ -26,6 +26,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 import json
+import os
 from typing import Callable, Optional
 
 from dsql_migrator.config import SecretValue
@@ -72,6 +73,95 @@ def _region_from_arn(secret_id: str) -> Optional[str]:
     return None
 
 
+# Set by the deploy templates to the app stack's ``SourceSecretArn`` parameter --
+# the ONE secret whose ``GetSecretValue`` grant was generated for this deployment.
+# Empty string = the parameter was left unset, so NO secret is readable. Absent
+# entirely = not a managed deployment (laptop / hand-rolled host), where ambient
+# credentials decide and the app must not claim to know the grant.
+GRANTED_SECRET_ENV = "DSQL_MIGRATOR_SOURCE_SECRET_ARN"
+
+
+def granted_source_secret_arn() -> Optional[str]:
+    """The secret ARN this deployment can read, ``""`` for none, ``None`` if unknown.
+
+    The app cannot observe its own task role (no ``iam:Simulate*``), so the grant is
+    *attested* by the template through an env var -- the same pattern as
+    ``DSQL_MIGRATOR_CDC_MSK_ACCESS``. Distinguishing "granted nothing" (``""``) from
+    "cannot tell" (``None``) matters: the first is a definite, actionable statement
+    and the second must stay silent rather than guess.
+    """
+    raw = os.environ.get(GRANTED_SECRET_ENV)
+    return None if raw is None else raw.strip()
+
+
+def _access_denied_message(secret_id: str) -> str:
+    """The AccessDenied message, aware of what THIS deployment was actually granted.
+
+    "The AWS identity needs secretsmanager:GetSecretValue" is true and useless on a
+    managed deployment: the operator cannot edit the task role by hand, because the
+    grant is GENERATED from the app stack's ``SourceSecretArn`` parameter -- one ARN,
+    fixed at deploy time -- while the Connect screen accepts any ARN they type. So the
+    only message the app could produce sent them to IAM when the actionable fix was a
+    stack parameter (or username/password auth), and it could not even say that the
+    deployment had been granted NOTHING.
+
+    ``DSQL_MIGRATOR_SOURCE_SECRET_ARN`` closes that: the template passes the granted
+    ARN (empty when the parameter was left unset), exactly as
+    ``DSQL_MIGRATOR_CDC_MSK_ACCESS`` attests the MSK grant the app equally cannot
+    observe. Unset entirely means a laptop/EC2 run where the ambient credentials really
+    are the thing to fix, so the original wording stands there.
+    """
+    granted = granted_source_secret_arn()
+    iam_advice = (
+        "The AWS identity needs secretsmanager:GetSecretValue (and kms:Decrypt when "
+        "the secret uses a customer-managed key)."
+    )
+    if granted is None:
+        # Not a managed deployment (no marker): the credentials themselves are the fix.
+        return f"Access denied reading the secret. {iam_advice}"
+    if not granted:
+        return (
+            "Access denied reading the secret: this deployment was not granted access "
+            "to ANY Secrets Manager secret. Its app stack's SourceSecretArn parameter "
+            "is empty, so no read permission was created. Either update the stack with "
+            f"SourceSecretArn set to '{secret_id}', or connect with a username and "
+            "password instead (no secret is needed for that)."
+        )
+    if _same_secret(granted, secret_id):
+        # The right secret IS granted, so this really is an IAM/KMS problem -- most
+        # likely a customer-managed KMS key whose policy omits this role.
+        return (
+            f"Access denied reading '{secret_id}', which this deployment IS granted. "
+            f"{iam_advice} A customer-managed KMS key is the usual cause: add this "
+            "task role to the key's policy."
+        )
+    return (
+        f"Access denied reading the secret. This deployment is granted exactly one "
+        f"secret -- '{granted}' -- and '{secret_id}' is a different one. Update the app "
+        "stack's SourceSecretArn parameter to this secret, or connect with a username "
+        "and password instead."
+    )
+
+
+def _same_secret(granted: str, requested: str) -> bool:
+    """Do two Secrets Manager references name the same secret? Pure.
+
+    A full ARN carries a random 6-character suffix (``...:my/secret-AbCdEf``) that the
+    operator may or may not have pasted, and the Connect screen accepts a bare NAME as
+    well as an ARN -- so a plain string compare would call the granted secret "a
+    different one" and print advice that contradicts itself.
+    """
+    def _key(value: str) -> str:
+        name = value.strip()
+        if name.startswith("arn:"):
+            name = name.split(":secret:", 1)[-1]
+        # Drop Secrets Manager's 6-char uniqueness suffix when present.
+        if len(name) > 7 and name[-7] == "-":
+            name = name[:-7]
+        return name
+    return bool(granted) and _key(granted) == _key(requested)
+
+
 def _friendly_error(secret_id: str, exc: Exception) -> str:
     """Map a boto3/botocore failure to a credential-free, actionable message."""
     code = ""
@@ -86,11 +176,7 @@ def _friendly_error(secret_id: str, exc: Exception) -> str:
             "exists in the resolved region."
         )
     if code in ("AccessDeniedException", "AccessDenied"):
-        return (
-            "Access denied reading the secret. The AWS identity needs "
-            "secretsmanager:GetSecretValue (and kms:Decrypt when the secret uses "
-            "a customer-managed key)."
-        )
+        return _access_denied_message(secret_id)
     if code in ("DecryptionFailure", "DecryptionFailureException"):
         return (
             "Could not decrypt the secret. The AWS identity needs kms:Decrypt on "

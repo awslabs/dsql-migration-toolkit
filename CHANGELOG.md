@@ -5,6 +5,12 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.520
+
+### Fixed
+
+- **"Access denied reading the secret" sent the operator to an IAM role they cannot edit.** Choosing Secrets Manager authentication on a managed deployment failed with *"The AWS identity needs secretsmanager:GetSecretValue"* — true, and a dead end: the task role's read grant is **generated from the app stack's `SourceSecretArn` parameter**, so it covers exactly ONE secret fixed at deploy time, while the Connect screen accepts any ARN typed into it. Leaving that parameter empty (its default) means **no secret is readable at all**, and the app could not say so because it cannot read its own role. The deploy templates now attest the granted ARN in `DSQL_MIGRATOR_SOURCE_SECRET_ARN` (the same pattern as `DSQL_MIGRATOR_CDC_MSK_ACCESS`), so the tool: prefills the secret field with the one ARN that works; states up front, before an ARN is typed, when the deployment was granted none; and on a refusal names the actionable fix — set the stack parameter, or use username/password — instead of IAM. When the granted secret IS the one requested, the IAM/KMS advice stands (a customer-managed key policy is the usual cause). A bare secret **name** or an ARN without Secrets Manager's 6-character suffix still matches the granted ARN, so the message cannot contradict itself. Unmanaged runs (laptop, hand-rolled host) have no marker and keep the original wording.
+
 ## v0.1.519
 
 ### Fixed

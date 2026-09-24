@@ -631,3 +631,117 @@ def test_session_store_isolates_aws_profile_per_session() -> None:
     assert a.aws_profile == "prod"
     # Session B is unaffected and keeps the default (env credential chain).
     assert b.aws_profile is None
+
+
+# ---------------------------------------------------------------------------
+# The granted-secret attestation reaches the Connect screen and both templates
+# ---------------------------------------------------------------------------
+
+
+def _connect_page_tree():
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import connect as connect_mod
+
+    return ast.parse(inspect.getsource(connect_mod.build_connect_page))
+
+
+def test_secret_field_is_prefilled_from_the_granted_arn() -> None:
+    """A managed deployment can read exactly ONE secret -- so offer that one.
+
+    The operator cannot see the app stack's ``SourceSecretArn`` from the browser, and
+    typing any other ARN fails with AccessDenied after a round trip to AWS. Prefilling
+    turns a guess into a confirmation. Asserted on the parse tree so a reworded comment
+    cannot satisfy it and a dropped prefill cannot pass.
+    """
+    import ast
+
+    tree = _connect_page_tree()
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "input"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and "secret" in str(node.args[0].value).lower()
+    ]
+    assert len(calls) == 1, "expected exactly one Secrets Manager ARN input"
+    kwargs = {kw.arg: ast.unparse(kw.value) for kw in calls[0].keywords}
+    assert "granted" in kwargs.get("value", ""), (
+        "the secret ARN field must be prefilled from granted_source_secret_arn(), "
+        f"got value={kwargs.get('value')!r}"
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "granted_source_secret_arn"
+        for node in ast.walk(tree)
+    ), "build_connect_page must call granted_source_secret_arn()"
+
+
+def test_granted_nothing_is_stated_before_the_operator_types_an_arn() -> None:
+    """Empty grant is knowable up front, so do not make them fail to find out.
+
+    ``granted_source_secret_arn() == ""`` means the stack parameter is unset and NO
+    secret is readable. Comparing against ``""`` specifically (not falsy) is what keeps
+    a non-managed run -- where the value is ``None`` and the app genuinely cannot tell
+    -- from being told a stack parameter it does not have is empty.
+    """
+    import ast
+
+    tree = _connect_page_tree()
+    compares = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Compare)
+        and "granted_secret" in ast.unparse(node.left)
+        and any(
+            isinstance(c, ast.Constant) and c.value == "" for c in node.comparators
+        )
+    ]
+    assert compares, (
+        "the screen must branch on granted_source_secret_arn() == '' so an "
+        "un-granted deployment says so before the operator types an ARN"
+    )
+    notices = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "render_notice"
+        and any(
+            kw.arg == "header"
+            and isinstance(kw.value, ast.Constant)
+            and "cannot read any secret" in kw.value.value
+            for kw in node.keywords
+        )
+    ]
+    assert notices, "the un-granted state must be a notice box, not loose text"
+
+
+def test_both_deploy_templates_export_the_granted_secret_marker() -> None:
+    """The app cannot observe its own role, so the TEMPLATE has to tell it.
+
+    Without this env var the AccessDenied message can only send the operator to IAM --
+    a task role they cannot edit -- when the actionable fix is the stack's
+    ``SourceSecretArn`` parameter. The Fargate and EC2 templates write env differently
+    (container ``Environment`` vs a UserData env file), so both are checked, and both
+    must pass the PARAMETER (not a literal) or the marker would lie.
+    """
+    from pathlib import Path
+
+    from dsql_migrator.core.secrets import GRANTED_SECRET_ENV
+
+    root = Path(__file__).resolve().parents[1]
+    for name in ("cloudformation.yaml", "cloudformation-ec2.yaml"):
+        text = (root / "deploy" / name).read_text(encoding="utf-8")
+        assert GRANTED_SECRET_ENV in text, f"{name} does not export {GRANTED_SECRET_ENV}"
+        marker_at = text.index(GRANTED_SECRET_ENV)
+        following = text[marker_at : marker_at + 200]
+        assert "SourceSecretArn" in following, (
+            f"{name} must set {GRANTED_SECRET_ENV} from the SourceSecretArn parameter, "
+            "not a literal"
+        )
