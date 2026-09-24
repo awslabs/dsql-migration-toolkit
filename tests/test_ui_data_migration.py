@@ -25214,10 +25214,20 @@ def test_the_config_and_the_probe_agree_on_the_two_start_knobs() -> None:
 
     from dsql_migrator.ui.data_migration import _cdc_ui
 
+    # The probe must grade BOTH decisions off the EFFECTIVE snapshot mode, through the same
+    # pure rule the config builder uses. It used to pass `connector_autocreates_publication=
+    # force_initial`, i.e. re-derive the answer from the start mode -- which agreed with the
+    # config only by coincidence, because the config read a SEPARATE flag that the
+    # start-position radio and session restore never set. The gate then waved through
+    # snapshot.mode=initial + publication.autocreate.mode=disabled, the one combination it
+    # exists to stop.
     src = inspect.getsource(_cdc_ui._probe_pg_replication_objects)
-    assert "force_initial" in src
-    assert "connector_autocreates_publication=force_initial" in src
-    assert "and not force_initial" in src  # resumes_from_slot is narrowed by it
+    assert "snapshot_mode" in src
+    assert "pg_publication_autocreate_mode(snapshot_mode)" in src
+    assert 'snapshot_mode == "never"' in src  # resumes_from_slot is narrowed by it
+    assert "force_initial" not in src, (
+        "the probe must not re-derive intent from the start mode"
+    )
 
     # EXACTLY ONE caller derives the probe's inputs: the shared gate. Per-call-site
     # derivation is how this defect kept coming back -- v0.1.509's Deploy gate passed
@@ -25243,10 +25253,11 @@ def test_the_config_and_the_probe_agree_on_the_two_start_knobs() -> None:
         f"raw probe and so derive its inputs themselves: {sorted(referencing)}"
     )
     gate = inspect.getsource(_cdc_ui._pg_objects_gate_block)
-    # The gate derives BOTH mirrored decisions from the functions the config builder uses.
+    # The gate derives every mirrored input from the functions the config builder uses.
     assert "_cdc_tables_for_config(" in gate
     assert "_cdc_resume_signal(" in gate
-    assert "force_initial=force_initial" in gate
+    assert "pg_snapshot_mode(" in gate
+    assert "snapshot_mode=snapshot_mode" in gate
 
 
 def test_the_prerequisite_panel_offers_the_continuation_beside_the_failing_row() -> None:
@@ -25484,44 +25495,79 @@ def test_the_recommended_route_clears_a_previously_taken_re_snapshot_decision() 
     """Otherwise the route that exists to RESTORE a gapless handoff silently forfeits it.
 
     An operator may click "Re-snapshot every table" and then change their mind. That click
-    records start-mode "manual" + autocreate, which on PostgreSQL means
-    ``snapshot.mode=initial`` and ``publication.autocreate.mode=filtered``. Carried into
-    the combined run, the connector would re-read every table instead of streaming from the
-    slot the tool just created at the snapshot point -- paying for a second full read and
-    throwing away the gapless handoff this route is for.
+    records start-mode "manual", which on PostgreSQL forces ``snapshot.mode=initial``.
+    Carried into the combined run, the connector would re-read every table instead of
+    streaming from the slot the tool just created at the snapshot point -- paying for a
+    second full read and throwing away the gapless handoff this route is for.
     """
     import asyncio
+
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.cdc_postgres import (
+        pg_publication_autocreate_mode,
+        pg_snapshot_mode,
+    )
+    from dsql_migrator.core.models import Watermark
 
     ui, state, _ran, _refreshed = _gapless_choice_panel()
     resnap = next(b for b in ui.buttons if "Re-snapshot" in getattr(b, "text", ""))
     asyncio.run(resnap.on_click())
     assert state.cdc_start_mode() == "manual"
-    assert state.cdc_pg_autocreate_publication() is True
 
     rec = next(b for b in ui.buttons if "Start over" in getattr(b, "text", ""))
     asyncio.run(rec.on_click())
     assert state.cdc_start_mode() == "auto"
-    assert state.cdc_pg_autocreate_publication() is False
+
+    # What the reset is FOR, asserted on the values the connector actually gets: with a
+    # provisioned slot on the watermark, "auto" resumes from it and must not touch the
+    # publication; a leftover "manual" would re-snapshot instead.
+    wm = Watermark(
+        snapshot_timestamp=datetime.now(timezone.utc),
+        wal_lsn="3/AF012B8",
+        slot_name="dsqlmig_s1",
+    )
+    mode = pg_snapshot_mode(wm, force_initial_snapshot=state.cdc_start_mode() == "manual")
+    assert mode == "never"
+    assert pg_publication_autocreate_mode(mode) == "disabled"
 
 
 def test_the_panels_re_snapshot_route_also_lets_the_connector_make_the_publication() -> None:
-    """The route's own copy promises it, and without the second knob the job dies paid-for.
+    """The route's own copy promises it, and a half-recorded decision kills the job paid-for.
 
-    Recording only the start mode un-gates the checks, the ~5-minute billable
-    infrastructure deploy AND the Start dialog (whose probe mirrors ``force_initial``, so
-    it raises no objection) -- and then the Debezium task dies on "Publication autocreation
-    is disabled", after both connectors were created. The Start dialog's version of this
-    escape always set both knobs; this one is the same decision, so it must too.
+    This used to need a SECOND piece of state, and the route that forgot it un-gated the
+    checks, the ~5-minute billable deploy AND the Start dialog -- and then the Debezium task
+    died on "Publication autocreation is disabled" after both connectors were created. The
+    autocreate mode is now derived from the snapshot mode, so recording the start mode IS
+    recording the whole decision: this asserts the promise on the derived value, not on a
+    flag that could drift from it.
     """
     import asyncio
 
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.cdc_postgres import (
+        pg_publication_autocreate_mode,
+        pg_snapshot_mode,
+    )
+    from dsql_migrator.core.models import Watermark
+
     ui, state, _ran, _refreshed = _gapless_choice_panel()
-    assert state.cdc_pg_autocreate_publication() is False  # default
     resnap = next(b for b in ui.buttons if "Re-snapshot" in getattr(b, "text", ""))
     asyncio.run(resnap.on_click())
-    assert state.cdc_pg_autocreate_publication() is True, (
-        "the connector must be allowed to create the publication this route relies on"
+    assert state.cdc_start_mode() == "manual"
+
+    # Even against a watermark that DOES carry a provisioned slot -- the case where "auto"
+    # would resume gaplessly -- the recorded decision re-snapshots, and the connector is
+    # therefore allowed to create the publication this route relies on.
+    wm = Watermark(
+        snapshot_timestamp=datetime.now(timezone.utc),
+        wal_lsn="3/AF012B8",
+        slot_name="dsqlmig_s1",
     )
+    mode = pg_snapshot_mode(wm, force_initial_snapshot=True)
+    assert mode == "initial"
+    assert pg_publication_autocreate_mode(mode) == "filtered"
 
 
 def test_one_situation_one_box_not_three_stacked_notices() -> None:
@@ -26163,6 +26209,10 @@ def test_the_deploy_gate_honours_a_recorded_re_snapshot_decision(monkeypatch) ->
     """
     from dsql_migrator.ui.data_migration import _cdc_ui
 
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.models import Watermark
+
     session, inventory = _pg_gate_fixture(
         monkeypatch, publication_present=False, covered=[]
     )
@@ -26170,19 +26220,35 @@ def test_the_deploy_gate_honours_a_recorded_re_snapshot_decision(monkeypatch) ->
     state.cdc_stack_name = "dsql-cdc-stack"
     state.set_selection(TableSelection(selected_tables=["app.orders"]))
 
-    # Default (no decision recorded): an absent publication DOES block -- the connector
-    # would die seconds after two billable connectors exist.
-    blocked = _cdc_ui._pg_objects_gate_block(state, session, inventory, None)
+    # The GAPLESS state: the watermark carries the slot the Full Load provisioned, so this
+    # start would resume from it (snapshot.mode=never) and must NOT touch the publication.
+    # The publication is missing, so the connector would die seconds after two billable
+    # connectors exist -- this must block.
+    gapless = Watermark(
+        snapshot_timestamp=datetime.now(timezone.utc),
+        wal_lsn="3/AF012B8",
+        slot_name="dsqlmig_s1",
+    )
+    blocked = _cdc_ui._pg_objects_gate_block(state, session, inventory, gapless)
     assert blocked is not None
     assert "publication" in (blocked[0] + blocked[1]).lower()
 
-    # The operator takes the re-snapshot route: the CONNECTOR's own DB user creates the
-    # publication (publication.autocreate.mode=filtered), so the absence is no longer a
-    # blocker -- and this gate must agree, because it is what stands between the operator
-    # and the deploy.
+    # The operator takes the re-snapshot route. That records ONE thing now, and from it the
+    # connector config derives publication.autocreate.mode=filtered -- the CONNECTOR's own
+    # DB user creates the publication -- so the absence is no longer a blocker, and this
+    # gate must agree, because it is what stands between the operator and the deploy.
     state.set_cdc_start_mode("manual")
-    state.set_cdc_pg_autocreate_publication(True)
-    assert _cdc_ui._pg_objects_gate_block(state, session, inventory, None) is None
+    assert _cdc_ui._pg_objects_gate_block(state, session, inventory, gapless) is None
+
+    # ...and with NO watermark at all (a CDC-only start with nothing provisioned) the
+    # effective mode is initial whatever the radio says, so the connector creates the
+    # publication and the absence must not block either. Keying this on "manual" alone --
+    # as every gate used to -- FAILED a run that was about to work.
+    fresh = DataMigrationState()
+    fresh.cdc_stack_name = "dsql-cdc-stack"
+    fresh.set_selection(TableSelection(selected_tables=["app.orders"]))
+    assert fresh.cdc_start_mode() == "auto"  # the default, not "manual"
+    assert _cdc_ui._pg_objects_gate_block(fresh, session, inventory, None) is None
 
 
 def test_the_deploy_and_start_gates_cannot_disagree(monkeypatch) -> None:
@@ -26198,16 +26264,25 @@ def test_the_deploy_and_start_gates_cannot_disagree(monkeypatch) -> None:
         monkeypatch, publication_present=False, covered=[]
     )
 
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.models import Watermark
+
+    gapless = Watermark(
+        snapshot_timestamp=datetime.now(timezone.utc),
+        wal_lsn="3/AF012B8",
+        slot_name="dsqlmig_s1",
+    )
+
     def verdict(*, resnapshot: bool):
         state = DataMigrationState()
         state.cdc_stack_name = "dsql-cdc-stack"
         state.set_selection(TableSelection(selected_tables=["app.orders"]))
         if resnapshot:
             state.set_cdc_start_mode("manual")
-            state.set_cdc_pg_autocreate_publication(True)
         # ONE function serves both the Deploy dialog and the Start dialog/worker, so the
         # two cannot drift; asserting it twice records the intent, not just the plumbing.
-        return _cdc_ui._pg_objects_gate_block(state, session, inventory, None)
+        return _cdc_ui._pg_objects_gate_block(state, session, inventory, gapless)
 
     assert verdict(resnapshot=False) is not None
     assert verdict(resnapshot=True) is None

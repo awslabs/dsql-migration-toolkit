@@ -111,6 +111,7 @@ from dsql_migrator.core.models import (
 from dsql_migrator.core.table_selection import TableSelector
 from dsql_migrator.core.watermark import WatermarkCapturer
 from dsql_migrator.ui.ai_assist import ai_is_usable
+from dsql_migrator.core.cdc_postgres import pg_snapshot_mode
 from dsql_migrator.ui.design import (
     NOTICE_STYLE,
     WRAP_CELLS_PROP,
@@ -734,14 +735,30 @@ def build_data_migration_screen(
                 # checks that would falsely FAIL.
                 source_type=source_config.source_type,
                 provisions_replication=_handoff_stack is not None,
-                # The operator's RECORDED decision to re-snapshot. On PostgreSQL a
-                # "manual" start mode means exactly that (_cdc_resume_signal returns
-                # force_initial_snapshot for it), so the report re-grades the two absences
-                # a re-snapshot repairs -- which is what un-gates Deploy and Start without
-                # leaving a red FAIL beside them.
+                # Will this start re-snapshot? Read off the EFFECTIVE snapshot mode --
+                # the same pure rule the connector config and the Deploy/Start gates use --
+                # not off the start mode alone. "manual" is only ONE of the two ways to end
+                # up at snapshot.mode=initial: a CDC-only start with no provisioned slot on
+                # the watermark lands there too, and keying on "manual" graded that run as
+                # if it would resume from a slot that does not exist. The report then FAILed
+                # on an absent publication the connector is in fact about to create, while
+                # the gates (now on the same rule) said proceed -- a screen disagreeing with
+                # the button next to it. When this is True the report re-grades the two
+                # absences a re-snapshot repairs, so nothing leaves a red FAIL beside an
+                # enabled primary button.
                 cdc_start_resnapshots=(
                     source_config.source_type is SourceType.POSTGRES
-                    and migration_state.cdc_start_mode() == "manual"
+                    and pg_snapshot_mode(
+                        _cdc_watermark(
+                            _current_job(
+                                job_manager, getattr(migration_state, "job_id", None)
+                            )
+                        ),
+                        force_initial_snapshot=(
+                            migration_state.cdc_start_mode() == "manual"
+                        ),
+                    )
+                    == "initial"
                 ),
                 cdc_stack_name=(
                     _handoff_stack
@@ -3875,7 +3892,6 @@ def _render_gapless_choice(ui, migration_state, run_checks, *, refresh=None) -> 
         # point -- silently paying for a second full read and discarding the gapless
         # handoff this route exists to restore.
         migration_state.set_cdc_start_mode("auto")
-        migration_state.set_cdc_pg_autocreate_publication(False)
         log_activity(
             ActivityCategory.FULL_LOAD,
             "migration type selected",
@@ -3899,17 +3915,15 @@ def _render_gapless_choice(ui, migration_state, run_checks, *, refresh=None) -> 
                 refresh()
 
     async def _take_resnapshot() -> None:
+        # ONE knob. "manual" forces snapshot.mode=initial, and
+        # publication.autocreate.mode=filtered is DERIVED from that, so the connector's own
+        # database user creates the publication this load never had (over exactly the
+        # captured tables -- the tool itself still never writes to the source). This used to
+        # be two independent values that both had to be set: v0.1.513 fixed this call site
+        # by setting both, and the pair still broke from the start-position radio and from a
+        # session restore (the second flag was never persisted), because discipline cannot
+        # hold an invariant that the type system can.
         migration_state.set_cdc_start_mode("manual")
-        # BOTH knobs, because this route depends on both. "manual" selects
-        # snapshot.mode=initial; the publication this load never had still has to come from
-        # somewhere, and on this route that is the CONNECTOR's own database user
-        # (publication.autocreate.mode=filtered, over exactly the captured tables -- the
-        # tool itself still never writes to the source). Recording only the start mode
-        # un-gated the checks, the billable deploy AND the Start dialog -- whose own probe
-        # mirrors force_initial and so raised no objection -- and then the Debezium task
-        # died on "Publication autocreation is disabled" after both connectors were paid
-        # for. The Start dialog's version of this escape always set both.
-        migration_state.set_cdc_pg_autocreate_publication(True)
         log_activity(
             ActivityCategory.CDC,
             "CDC start mode selected",
@@ -4273,6 +4287,7 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     _cdc_is_streaming,
     _cdc_tables_for_config,
     _cdc_target_region,
+    _cdc_watermark,
     _diagnose_for_dialog,
     _dlq_panel_tone,
     _open_cdc_delete_dialog,

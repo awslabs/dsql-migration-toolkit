@@ -58,6 +58,8 @@ from dsql_migrator.core.cdc_postgres import (
     dispatch_cdc_infra_params,
     dispatch_cdc_stack_params,
     dispatch_source_config,
+    pg_publication_autocreate_mode,
+    pg_snapshot_mode,
 )
 from dsql_migrator.core.models import (
     LoadStatusView,
@@ -889,8 +891,15 @@ def _render_cdc_start_point_card(
             migration_state.set_cdc_start_mode(value)
             refresh()
 
-        # AWS-console-style radio choice. Disable Automatic when no usable
-        # watermark exists so the user is steered to Manual rather than a dead end.
+        # AWS-console-style radio choice. Both options stay SELECTABLE even when no usable
+        # watermark exists -- the steering is the label ("...(unavailable)") plus the notice
+        # below, not a disabled option. (A previous version of this comment claimed the
+        # option was disabled; no such code existed, and a Quasar radio built from a plain
+        # dict has no per-option disable. Automatic also stays PRE-selected, since the start
+        # mode defaults to "auto".) Picking Automatic without a provisioned slot is not a
+        # dead end and not a silent gap: the effective snapshot mode is then `initial`
+        # anyway (pg_snapshot_mode requires the slot RECORDED on the watermark), so the
+        # connector re-snapshots and creates its own publication.
         # When CDC has started the whole choice is disabled (read-only).
         radio = ui.radio(  # type: ignore[attr-defined]
             {"auto": auto_label, "manual": manual_label},
@@ -3363,20 +3372,35 @@ def _pg_objects_gate_block(
 
     ``pg_replication_objects_blocker``'s contract is to MIRROR ``build_pg_source_config``'s
     two decisions exactly; that is only checkable if the mirror lives in ONE place. So the
-    tables come from :func:`_cdc_tables_for_config` and the re-snapshot intent from
-    :func:`_cdc_resume_signal` -- the very functions the config builder itself calls.
+    tables come from :func:`_cdc_tables_for_config`, the resume signal from
+    :func:`_cdc_resume_signal`, and the two graded decisions from
+    :func:`pg_snapshot_mode` / :func:`pg_publication_autocreate_mode` -- the very functions
+    the config builder itself calls. Re-deriving "will the connector autocreate?" from the
+    start mode instead (which is what this did) made the gate agree with the config only by
+    coincidence: it read ``manual`` as "autocreates", while the config read a SEPARATE flag
+    that the start-position radio and session restore never set. The gate then waved through
+    the one combination it exists to stop.
 
     Blocking source I/O: callers MUST run it via ``run.io_bound``.
     """
     tables = _cdc_tables_for_config(migration_state, inventory, watermark)
-    _resume_override, force_initial = _cdc_resume_signal(migration_state, session)
+    resume_override, force_initial = _cdc_resume_signal(migration_state, session)
+    snapshot_mode = pg_snapshot_mode(
+        watermark,
+        resume_override=resume_override,
+        force_initial_snapshot=force_initial,
+    )
     return _probe_pg_replication_objects(
-        migration_state, session, tables, watermark, force_initial=force_initial
+        migration_state,
+        session,
+        tables,
+        watermark,
+        snapshot_mode=snapshot_mode,
     )
 
 
 def _probe_pg_replication_objects(
-    migration_state, session, tables, watermark, *, force_initial: bool = False
+    migration_state, session, tables, watermark, *, snapshot_mode: str = "never"
 ) -> Optional[tuple]:
     """Read-only: do CDC's publication + slot exist on the PostgreSQL source? (blocking)
 
@@ -3422,14 +3446,21 @@ def _probe_pg_replication_objects(
     except Exception:  # noqa: BLE001 - unreadable is NOT absent; degrade to silence
         return None
     # MIRROR build_pg_source_config's two decisions exactly, or this refuses a
-    # configuration that would have worked. force_initial (the Manual / re-snapshot start)
-    # means the connector does NOT resume from the slot and DOES create its own
-    # publication -- so neither absence is a blocker.
+    # configuration that would have worked -- or, worse, passes one that cannot. Both are
+    # read off the EFFECTIVE snapshot mode, through the same pure function the config uses:
+    # ``initial`` means the connector does not resume from the slot and DOES create its own
+    # publication, so neither absence blocks; ``never`` means it resumes from the
+    # provisioned slot and may not touch the publication, so both absences block.
+    autocreates = (
+        pg_publication_autocreate_mode(snapshot_mode) == "filtered"
+    )
     return _pg.pg_replication_objects_blocker(
         objects,
         [getattr(t, "name", str(t)) for t in (tables or [])],
-        resumes_from_slot=bool(getattr(watermark, "slot_name", None)) and not force_initial,
-        connector_autocreates_publication=force_initial,
+        resumes_from_slot=(
+            bool(getattr(watermark, "slot_name", None)) and snapshot_mode == "never"
+        ),
+        connector_autocreates_publication=autocreates,
     )
 
 
@@ -3569,8 +3600,11 @@ async def _open_cdc_start_dialog(
                     )
 
                     def _take_resnapshot() -> None:
+                        # "manual" is the WHOLE decision now: it forces
+                        # snapshot.mode=initial, from which publication.autocreate.mode
+                        # =filtered is derived, so the connector's own DB user creates the
+                        # publication. There is no second flag to forget.
                         migration_state.set_cdc_start_mode("manual")
-                        migration_state.set_cdc_pg_autocreate_publication(True)
                         _pg_state["resolved"] = True
                         pg_slot_area.clear()
                         with pg_slot_area:
@@ -4216,17 +4250,11 @@ def _start_cdc_deploy(
         resume_override=_resume_override,
         force_initial_snapshot=_force_initial_snapshot,
         message_key_columns=message_key_columns,
-        # "filtered" ONLY when the operator took the block's re-snapshot escape: the
-        # connector's own DB user then creates a publication over exactly the captured
-        # tables. The TOOL still never writes to the source, so cdc_pg_slot's documented
-        # Property-1 exception is not widened. Paired with force_initial_snapshot, that
-        # start is gapless by construction (snapshot, then stream from the slot Debezium
-        # made -- no window between the two).
-        publication_autocreate_mode=(
-            "filtered"
-            if getattr(migration_state, "cdc_pg_autocreate_publication", lambda: False)()
-            else "disabled"
-        ),
+        # publication.autocreate.mode is NOT passed: it is derived from the snapshot mode
+        # (pg_publication_autocreate_mode). It used to come from a separate piece of UI
+        # state that the start-position radio and session restore never set, which is how
+        # snapshot.mode=initial + autocreate=disabled -- guaranteed connector death, after
+        # both connectors are billed -- became reachable.
     )
     sink_config = CdcPipelineOrchestrator().build_sink_config(
         "mysql-sink", tables_for_config, CDC_DEFAULT_DLQ_TOPIC

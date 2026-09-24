@@ -445,3 +445,107 @@ def test_missing_extra_raises_cdcseederror(monkeypatch) -> None:
     monkeypatch.setattr(builtins, "__import__", _blocked)
     with pytest.raises(CdcSeedError, match="cdc-external"):
         cdc_kafka_seed.ensure_topics("boot", "us-east-1", [TopicSpec("t", 1)])
+
+
+def test_the_seed_waits_for_brokers_that_are_not_ready_yet() -> None:
+    """A cluster reports ACTIVE before its brokers complete a SASL/IAM handshake.
+
+    Measured on a real us-east-2 cluster: CREATE_COMPLETE at 06:50:01, the seed's single
+    30-second attempt failed at 06:51:03 with `KafkaTimeoutError: Unable to bootstrap from
+    boot-...:9098`, and an IDENTICAL retry ~11 minutes later succeeded with nothing
+    reconfigured. The failure aborted Start CDC, and its message named the three static
+    preconditions -- so the operator spent the wait auditing subnets, security groups and IAM
+    that were all already correct.
+    """
+    from dsql_migrator.core.cdc_kafka_seed import await_kafka_bootstrap
+
+    class _Admin:
+        def close(self):
+            return None
+
+    calls = {"n": 0}
+    slept: list = []
+    logs: list = []
+
+    def factory(**_kw):
+        calls["n"] += 1
+        if calls["n"] < 5:
+            raise RuntimeError("Unable to bootstrap from boot-x:9098")
+        return _Admin()
+
+    attempts = await_kafka_bootstrap(
+        "boot-x:9098", "us-east-2",
+        admin_factory=factory, sleep=slept.append, log=logs.append,
+    )
+    assert attempts == 5
+    assert calls["n"] == 5
+    assert len(slept) == 4, slept  # one wait per failed attempt, none after success
+    # The operator is told WHY the step is pausing, on the first failure rather than after
+    # the whole wait -- a silent multi-minute pause reads as a hang.
+    assert logs and "ACTIVE" in logs[0] and "9098" not in logs[0]
+    assert "several minutes" in logs[0]
+
+
+def test_the_seed_does_not_wait_when_the_cluster_is_already_warm() -> None:
+    """Every run except the one right after a create must pay nothing for this."""
+    from dsql_migrator.core.cdc_kafka_seed import await_kafka_bootstrap
+
+    class _Admin:
+        def close(self):
+            return None
+
+    slept: list = []
+    logs: list = []
+    assert (
+        await_kafka_bootstrap(
+            "boot-x:9098", "us-east-2",
+            admin_factory=lambda **_k: _Admin(),
+            sleep=slept.append, log=logs.append,
+        )
+        == 1
+    )
+    assert slept == []
+    assert logs == []
+
+
+def test_the_exhausted_wait_stops_blaming_the_three_static_conditions_first() -> None:
+    """After a long wait, warm-up is no longer the likely cause -- so say the path is.
+
+    The old message led with "the app must run inside the cdc-stack VPC, be admitted on MSK
+    port 9098, and hold data-plane kafka-cluster IAM" for a failure that was really a
+    warm-up race, sending the operator to audit correct configuration. Now the wait absorbs
+    the race, and only if it is exhausted do those conditions become the prime suspects --
+    which the message states in that order, with the last error attached.
+    """
+    import pytest
+
+    from dsql_migrator.core.cdc_kafka_seed import CdcSeedError, await_kafka_bootstrap
+
+    def always_fail(**_kw):
+        raise RuntimeError("Unable to bootstrap from boot-x:9098")
+
+    with pytest.raises(CdcSeedError) as excinfo:
+        await_kafka_bootstrap(
+            "boot-x:9098", "us-east-2",
+            admin_factory=always_fail, attempts=3, sleep=lambda _s: None,
+        )
+    msg = str(excinfo.value)
+    assert "did not accept a connection after 3 attempts" in msg
+    assert "likely cause is the path rather than warm-up" in msg
+    assert "9098" in msg and "kafka-cluster" in msg
+    assert "Unable to bootstrap" in msg  # the underlying error is not swallowed
+
+
+def test_the_seed_waits_before_its_first_topic_call() -> None:
+    """The wait must guard the FIRST Kafka contact, not sit after it.
+
+    ensure_topics builds the admin client itself; if the wait ran later, that call would
+    still take the 30-second timeout and fail the Start.
+    """
+    import inspect
+
+    from dsql_migrator.core import cdc_kafka_seed
+
+    src = inspect.getsource(cdc_kafka_seed.seed_kafka_prep)
+    assert "await_kafka_bootstrap(" in src
+    assert src.index("await_kafka_bootstrap(") < src.index("ensure_topics(")

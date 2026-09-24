@@ -121,7 +121,6 @@ def build_pg_source_config(
     database_name: str,
     slot_name: str,
     publication_name: str,
-    publication_autocreate_mode: str = "disabled",
     column_exclude_list: Optional[Sequence[str]] = None,
     message_key_columns: Optional[Mapping[str, Sequence[str]]] = None,
     resume_override: Optional[CdcResumePoint] = None,
@@ -158,6 +157,50 @@ def build_pg_source_config(
     ``column_exclude_list`` and ``message_key_columns`` mean the same as on the MySQL
     source config. Pure.
     """
+    mode = pg_snapshot_mode(
+        watermark,
+        resume_override=resume_override,
+        force_initial_snapshot=force_initial_snapshot,
+    )
+    return PostgresSourceConfig(
+        name=name,
+        table_include_list=[table.name for table in tables],
+        database_name=database_name,
+        slot_name=slot_name,
+        publication_name=publication_name,
+        # DERIVED from the snapshot mode, never passed in: see
+        # pg_publication_autocreate_mode for why these two cannot be separate values.
+        publication_autocreate_mode=pg_publication_autocreate_mode(mode),  # type: ignore[arg-type]
+        snapshot_mode=mode,  # type: ignore[arg-type]
+        column_exclude_list=list(column_exclude_list or []),
+        message_key_columns={
+            table: list(cols) for table, cols in (message_key_columns or {}).items()
+        },
+    )
+
+
+def pg_snapshot_mode(
+    watermark,
+    *,
+    resume_override: Optional[CdcResumePoint] = None,
+    force_initial_snapshot: bool = False,
+) -> str:
+    """Return the Debezium ``snapshot.mode`` for a PostgreSQL start: ``never`` or ``initial``.
+
+    Extracted so the CONFIG and every GATE that must mirror it read one function instead of
+    re-deriving the same decision. ``never`` requires the RECORD of provisioning -- only a
+    Full-Load-+-CDC run writes ``slot_name`` onto the watermark, and only then is the slot
+    known to sit AT this LSN. A Full-load-only watermark carries a ``wal_lsn`` and NO slot,
+    so ``never`` would resume from a slot of unknown position -- or from one Debezium creates
+    at NOW, silently dropping every change committed since the load. A logical replication
+    slot cannot be created at, or rewound to, a past LSN (live-verified on PostgreSQL 16 and
+    18: the function takes no LSN argument, CREATE_REPLICATION_SLOT rejects one,
+    pg_replication_slot_advance only moves forward, and START_REPLICATION silently clamps),
+    so the honest fallback is ``initial``: snapshot, then stream from the slot Debezium
+    made -- no window between the two, so nothing is lost. Note the ``slot_name`` PARAMETER
+    is always non-empty (derived from the stack name) and must NOT be used for this test.
+    Pure.
+    """
     resume = (
         resume_override
         if resume_override is not None
@@ -168,34 +211,49 @@ def build_pg_source_config(
         and resume_override is None
         and resume is not None
         and resume.can_resume_from_lsn()
-        # The RECORD of provisioning, not just a coordinate. Only a Full-Load-+-CDC run
-        # writes ``slot_name`` onto the WATERMARK, and only then is the slot known to sit
-        # AT this LSN. A Full-load-only watermark carries a wal_lsn and NO slot, so
-        # ``never`` would resume from a slot of unknown position -- or from one Debezium
-        # creates at NOW, which silently drops every change committed since the load. A
-        # logical replication slot cannot be created at, or rewound to, a past LSN
-        # (live-verified on PostgreSQL 16 and 18: the function takes no LSN argument,
-        # CREATE_REPLICATION_SLOT rejects one, pg_replication_slot_advance only moves
-        # forward, and START_REPLICATION silently clamps), so the honest fallback is
-        # ``initial``: snapshot, then stream from the slot Debezium made -- no window
-        # between the two, so nothing is lost. Note the ``slot_name`` PARAMETER is always
-        # non-empty (derived from the stack name) and must NOT be used for this test.
         and bool(getattr(watermark, "slot_name", None))
     )
-    mode: Literal["never", "initial", "no_data"] = "never" if has_lsn else "initial"
-    return PostgresSourceConfig(
-        name=name,
-        table_include_list=[table.name for table in tables],
-        database_name=database_name,
-        slot_name=slot_name,
-        publication_name=publication_name,
-        publication_autocreate_mode=publication_autocreate_mode,  # type: ignore[arg-type]
-        snapshot_mode=mode,
-        column_exclude_list=list(column_exclude_list or []),
-        message_key_columns={
-            table: list(cols) for table, cols in (message_key_columns or {}).items()
-        },
-    )
+    return "never" if has_lsn else "initial"
+
+
+def pg_publication_autocreate_mode(snapshot_mode: str) -> str:
+    """Return ``publication.autocreate.mode`` for a given ``snapshot.mode``. Pure.
+
+    **The two are ONE decision, which is why this is a function and not a setting.** They
+    were independent state for three releases and the pair broke twice: an operator could
+    reach ``snapshot.mode=initial`` + ``publication.autocreate.mode=disabled``, which is
+    guaranteed death -- ``initial`` means "Debezium creates its own slot and snapshots", and
+    that requires a publication, while ``disabled`` means "Debezium may not create one". The
+    task dies on "Publication autocreation is disabled, please create one and restart the
+    connector" seconds after both billable connectors exist, and CloudFormation then rolls
+    the whole cdc-stack back -- taking the healthy sink connector with it. It was reachable
+    from the start-position radio, from a session restore (the flag was never persisted) and
+    from two config call sites that did not pass it at all. Discipline ("always set both")
+    had already been written into three call sites and still did not hold, so the pairing is
+    now structural: there is no flag to forget and nothing to pass.
+
+    ``initial`` -> ``filtered``: the connector's own database user creates the publication
+    over exactly the captured tables (``table.include.list``). The TOOL still never writes to
+    the source; this is the documented Property-1 exception.
+
+    ``never`` -> ``disabled``: the run resumes from a slot the Full Load provisioned, so the
+    publication provisioned alongside it must already be there. Letting the connector touch
+    it would be an unrequested write on the gapless path.
+
+    NOTE, and it corrects a claim this repo previously recorded: ``filtered`` does NOT leave
+    an existing publication alone. The shipped plugin (debezium-connector-postgres-2.7.4)
+    special-cases FILTERED in ``initPublication()`` and issues ``ALTER PUBLICATION <name>
+    SET TABLE <table.include.list>`` when the publication already exists. That is bounded
+    but real: the name is always tool-derived (``pg_publication_name(stack)``, sha1-suffixed,
+    or the one recorded on the watermark -- which the tool itself wrote), and the new table
+    list is exactly the captured set, so it rewrites the tool's OWN publication to the tool's
+    OWN intent, on the same database user that created it. It is not a customer publication
+    and it is not data loss. Two residual edges are deliberately not graded: the ALTER needs
+    ownership, and Debezium aborts if the existing publication happens to be FOR ALL TABLES
+    (the tool's ``create_publication`` only ever emits ``FOR TABLE <exact tables>``, so only
+    a hand-made publication under the tool's sha1-suffixed name could be one).
+    """
+    return "filtered" if snapshot_mode == "initial" else "disabled"
 
 
 def _pg_source_param_tuples(source_config: PostgresSourceConfig) -> list[tuple[str, str]]:
@@ -340,7 +398,6 @@ def dispatch_source_config(
     resume_override: Optional[CdcResumePoint] = None,
     force_initial_snapshot: bool = False,
     message_key_columns: Optional[Mapping[str, Sequence[str]]] = None,
-    publication_autocreate_mode: str = "disabled",
 ):
     """Build the source connector config for ``source_type`` (MySQL or PostgreSQL).
 
@@ -355,11 +412,13 @@ def dispatch_source_config(
     ``build_source_config`` exactly as before (byte-identical; the flag does not apply --
     MySQL's manual start is a seeded ``resume_override``).
 
-    ``publication_autocreate_mode`` defaults to ``"disabled"`` (the tool's publication is
-    created by the Full Load, so the connector must never invent one). ``"filtered"`` is the
-    one supported escape: paired with ``force_initial_snapshot`` it lets a CDC-only start
-    create its own publication over exactly the captured tables and re-snapshot them, which
-    is gapless by construction. Ignored on the MySQL path.
+    ``publication.autocreate.mode`` is NOT a parameter here: it is DERIVED from the snapshot
+    mode inside :func:`build_pg_source_config` (see :func:`pg_publication_autocreate_mode`).
+    It used to be one, defaulting to ``"disabled"``, and two of this function's three call
+    sites never passed it -- so the connector-config PREVIEW disagreed with the deploy, and a
+    re-snapshot start could be configured ``snapshot.mode=initial`` with autocreation
+    disabled, which kills the Debezium task on first contact after both connectors are paid
+    for. There is now nothing to pass and nothing to forget.
     """
     if source_type is SourceType.POSTGRES:
         from dsql_migrator.core import cdc_pg_slot
@@ -381,7 +440,6 @@ def dispatch_source_config(
             message_key_columns=message_key_columns,
             resume_override=resume_override,
             force_initial_snapshot=force_initial_snapshot,
-            publication_autocreate_mode=publication_autocreate_mode,
         )
     from dsql_migrator.core.cdc import CdcPipelineOrchestrator
 

@@ -35,6 +35,7 @@ VPC-co-location changes that let a real host reach the cluster land separately.
 """
 from __future__ import annotations
 
+import time
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from dsql_migrator.core.cdc_kafka_prep import (
@@ -293,6 +294,82 @@ def produce(
 # --------------------------------------------------------------------------- #
 # Orchestrator — mirrors seeder._seed, decisions delegated to cdc_kafka_prep
 # --------------------------------------------------------------------------- #
+# A freshly-created MSK Serverless cluster reports ACTIVE, and its bootstrap endpoint
+# resolves, BEFORE the brokers will complete a SASL/IAM handshake. Measured on a real
+# us-east-2 cluster: CREATE_COMPLETE at 06:50:01, the seed's single 30-second attempt failed
+# at 06:51:03 with `KafkaTimeoutError: Unable to bootstrap from boot-...:9098`, and an
+# otherwise IDENTICAL retry ~11 minutes later succeeded -- nothing was reconfigured in
+# between. Every static precondition had been verified by hand in the meantime (app and MSK
+# in the same subnets, 9098 inbound from the app's range, 9098 outbound, the cdc-external-seed
+# IAM ARNs matching the live cluster, VPC DNS support and hostnames on), which is exactly the
+# wasted hour this wait exists to prevent: the failure message named those three conditions,
+# so it sent the operator auditing security groups for a broker warm-up.
+#
+# The budget must cover that ~11 minutes or it buys nothing. Each attempt carries
+# kafka-python's own 30-second bootstrap timeout, so the wall clock is roughly
+# attempts * (30s + delay).
+BOOTSTRAP_WAIT_ATTEMPTS = 24
+BOOTSTRAP_WAIT_DELAY_SECONDS = 5.0
+
+
+def await_kafka_bootstrap(
+    bootstrap: str,
+    region: str,
+    *,
+    admin_factory: Optional[Callable[..., Any]] = None,
+    attempts: int = BOOTSTRAP_WAIT_ATTEMPTS,
+    delay_seconds: float = BOOTSTRAP_WAIT_DELAY_SECONDS,
+    sleep: Optional[Callable[[float], None]] = None,
+    log: Optional[Callable[[str], None]] = None,
+) -> int:
+    """Block until the MSK brokers accept an IAM-authenticated admin connection.
+
+    Returns the number of attempts it took (1 when the cluster was already warm, which is
+    every run except the one right after a create). Raises :class:`CdcSeedError` on
+    exhaustion, with a message that does NOT send the operator back to auditing the three
+    static preconditions first -- after this much waiting a warm-up is no longer the likely
+    explanation, and saying so is the whole point of having waited.
+
+    Each successful client is closed immediately: this probes reachability only, and the
+    callers that follow build their own clients.
+    """
+    (KafkaAdminClient, _C, _P, _TP, _NT, _TAE) = _import_kafka()
+    factory = admin_factory or KafkaAdminClient
+    _sleep = sleep or time.sleep
+    last: Optional[BaseException] = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            admin = factory(bootstrap_servers=bootstrap, **iam_sasl_args(region))
+        except Exception as exc:  # noqa: BLE001 - any failure to reach MSK is retryable here
+            last = exc
+            if attempt == 1 and log is not None:
+                log(
+                    "Waiting for the MSK brokers to accept connections (a cluster reports "
+                    "ACTIVE before it completes a SASL/IAM handshake; this can take "
+                    "several minutes right after a create)."
+                )
+            elif log is not None and attempt % 4 == 0:
+                log(f"Still waiting for the MSK brokers (attempt {attempt}/{attempts}).")
+            if attempt < max(1, attempts):
+                _sleep(delay_seconds)
+            continue
+        try:
+            admin.close()
+        except Exception:  # noqa: BLE001 - probe only; a close failure is not a verdict
+            pass
+        if attempt > 1 and log is not None:
+            log(f"MSK brokers accepted a connection on attempt {attempt}.")
+        return attempt
+    raise CdcSeedError(
+        f"The MSK brokers at {bootstrap} did not accept a connection after {attempts} "
+        f"attempts. A cluster created moments ago normally becomes reachable within a few "
+        "minutes, so after this long the likely cause is the path rather than warm-up: "
+        "check that this app runs inside the cdc-stack VPC, that the cdc-stack's "
+        "ConnectorSecurityGroup admits this app's range on TCP 9098, and that the task role "
+        f"holds data-plane kafka-cluster permissions for the cluster. Last error: {last}"
+    )
+
+
 def seed_kafka_prep(
     *,
     bootstrap: str,
@@ -310,6 +387,8 @@ def seed_kafka_prep(
     admin_factory: Optional[Callable[..., Any]] = None,
     consumer_factory: Optional[Callable[..., Any]] = None,
     producer_factory: Optional[Callable[..., Any]] = None,
+    sleep: Optional[Callable[[float], None]] = None,
+    log: Optional[Callable[[str], None]] = None,
 ) -> str:
     """Do the full in-process CDC Kafka prep. Mirrors ``seeder._seed``.
 
@@ -335,6 +414,11 @@ def seed_kafka_prep(
         partitions_map=parse_partitions_map(sink_topic_partitions_csv),
         max_message_bytes=max_message_bytes,
         dlq_topic=dlq_topic,
+    )
+    # FIRST Kafka contact -- wait for the brokers rather than letting one 30-second
+    # bootstrap timeout fail the whole Start (and roll back a billable stack update).
+    await_kafka_bootstrap(
+        bootstrap, region, admin_factory=admin_factory, sleep=sleep, log=log
     )
     ensure_topics(bootstrap, region, specs, admin_factory=admin_factory)
 

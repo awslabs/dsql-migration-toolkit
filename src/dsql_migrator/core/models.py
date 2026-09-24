@@ -1052,7 +1052,19 @@ class PrerequisiteResult(BaseModel):
     # Set ONLY by the FAILs a re-snapshot genuinely repairs, so the UI can offer that
     # affordance beside exactly those rows. An absent publication and a recorded-but-missing
     # slot qualify; a publication that EXISTS but omits tables or narrows its publish list
-    # does NOT -- Debezium's `filtered` autocreate does not alter an existing publication.
+    # does NOT.
+    #
+    # CORRECTION to the reason previously recorded here ("Debezium's `filtered` autocreate
+    # does not alter an existing publication"): it DOES. The shipped plugin
+    # (debezium-connector-postgres-2.7.4) special-cases FILTERED in initPublication() and
+    # issues `ALTER PUBLICATION <name> SET TABLE <table.include.list>` when the publication
+    # already exists, so a coverage gap would in fact be repaired by a re-snapshot start.
+    # The conservative grading STAYS anyway, deliberately: we have not verified that ALTER
+    # against a live source ourselves, and "let the connector silently rewrite a publication
+    # that already exists on your database" is not a remedy this tool should recommend when
+    # the alternative is one explicit statement the operator runs knowingly. Widen this only
+    # with a live verification behind it.
+    #
     # A discriminator, not a text match: matching on detail wording would be fragile.
     resolvable_by_resnapshot: bool = False
 

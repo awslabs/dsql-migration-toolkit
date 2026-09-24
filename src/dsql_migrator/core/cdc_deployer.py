@@ -995,6 +995,11 @@ def _run_external_seed(
             connector_name=src_name,
             topic_prefix=topic_prefix,
             watermark=watermark,
+            # So the operator sees the broker wait instead of a stalled step. A cluster
+            # created minutes ago reports ACTIVE before it completes a SASL/IAM handshake,
+            # and the seed now waits for that rather than failing the Start on one
+            # 30-second bootstrap timeout.
+            log=driver.log,
         )
     except CdcSeedError as exc:
         raise CdcDeployError(str(exc)) from exc

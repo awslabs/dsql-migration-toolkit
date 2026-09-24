@@ -5,6 +5,76 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.515
+
+### Fixed
+
+- **A PostgreSQL re-snapshot start could be configured `snapshot.mode=initial` +
+  `publication.autocreate.mode=disabled`, which kills the connector by construction.**
+  `initial` means "Debezium creates its own slot and snapshots", which requires a
+  publication; `disabled` means "Debezium may not create one". Observed live on Aurora
+  PostgreSQL 17.7: the Debezium source task died on its first contact --
+  `Publication autocreation is disabled, please create one and restart the connector` --
+  13 minutes into the deploy, and CloudFormation then rolled the whole cdc-stack back,
+  **destroying the sink connector that had reached RUNNING six minutes earlier**. Two
+  connectors at 2 MCU each plus MSK Serverless, billed ~14 minutes, for a rollback.
+
+  The two values were **independent session state**, kept in agreement only by the
+  discipline of always setting both — which had already been written into three call sites
+  and still did not hold. Two writers set only the snapshot half: the CDC card's
+  Automatic/Manual radio, and a session restore (the autocreate flag was never persisted,
+  so it silently reverted to "disabled" on an app restart or reopened tab — taking both
+  remedies with it, since the escape button and the two-route fork only render while the
+  prerequisite is still failing). Two of the three connector-config call sites never passed
+  the value at all, so the config PREVIEW could disagree with the deploy.
+
+  Fixed structurally rather than per writer: `publication.autocreate.mode` is no longer a
+  parameter anywhere. It is DERIVED from the snapshot mode
+  (`pg_publication_autocreate_mode`: `initial` → `filtered`, `never` → `disabled`), the
+  separate state is deleted, and a test enumerates every reachable (watermark, start-mode)
+  input and asserts the fatal pair — and its mirror image, `never` + `filtered`, an
+  unrequested source write that was also reachable — cannot be expressed.
+- **The gates that exist to catch exactly this combination structurally could not see it.**
+  `pg_replication_objects_blocker`'s `connector_autocreates_publication` documents itself as
+  the mirror of the connector's actual setting, but it was fed a value re-derived from the
+  START MODE, so it agreed with the config only by coincidence: it read "manual" as "will
+  autocreate" while the config read the separate flag nothing had set. Every surface — the
+  prerequisite grading, the Deploy dialog, the Start dialog and the worker backstop — waved
+  the run through. They now all read the effective snapshot mode through the same pure
+  function the config builder uses.
+- **The prerequisite re-grading keyed on the start mode alone, which mis-graded a second
+  case.** "manual" is only one of two ways to reach `snapshot.mode=initial`: a CDC-only start
+  with no provisioned slot on its watermark lands there too. Graded as if it would resume
+  from a slot that does not exist, the report FAILed on an absent publication the connector
+  was in fact about to create — a screen contradicting the (now correct) gate beside it.
+- **The in-app CDC offset seed failed on a just-created MSK cluster and blamed the wrong
+  thing.** An MSK Serverless cluster reports ACTIVE, and its bootstrap endpoint resolves,
+  before the brokers complete a SASL/IAM handshake. The seed made ONE attempt with
+  kafka-python's 30-second bootstrap timeout and no retry: measured, it failed 62 seconds
+  after CREATE_COMPLETE and an identical retry ~11 minutes later succeeded with nothing
+  reconfigured. Its message named the three static preconditions (in-VPC, 9098 ingress,
+  data-plane IAM), so the operator audited subnets, security groups and IAM that were all
+  already correct. The seed now waits for the brokers before its first Kafka call (bounded,
+  ~14 minutes worst case, with progress lines so a pause does not read as a hang) and only
+  if that is exhausted does it name those preconditions — saying explicitly that after such
+  a wait the path, not warm-up, is the likely cause.
+
+### Changed
+
+- **Corrected a claim this repo recorded about Debezium.** `publication.autocreate.mode=
+  filtered` does NOT leave an existing publication alone: the shipped plugin
+  (debezium-connector-postgres-2.7.4) special-cases FILTERED and issues `ALTER PUBLICATION
+  <name> SET TABLE <table.include.list>` when it already exists. Bounded in practice — the
+  name is always tool-derived and the new table list is exactly the captured set, so it
+  rewrites the tool's own publication to the tool's own intent on the same database user
+  that created it — but it is a source write, and the note that said otherwise was
+  load-bearing for the design. The conservative grading it justified (a publication that
+  exists but omits tables is NOT offered the re-snapshot route) deliberately stays, because
+  that ALTER has not been verified against a live source here.
+- A stale comment on the CDC start-position radio claimed it disables Automatic when no
+  usable watermark exists. No such code ever existed (a Quasar radio built from a dict has
+  no per-option disable); the steering is the label and the notice below it.
+
 ## v0.1.514
 
 ### Fixed

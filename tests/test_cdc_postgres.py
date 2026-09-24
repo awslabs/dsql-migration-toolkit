@@ -539,26 +539,126 @@ def test_a_full_load_only_watermark_must_not_select_snapshot_never() -> None:
     assert with_slot.snapshot_mode == "never"
 
 
-def test_publication_autocreate_mode_reaches_the_stack_params() -> None:
-    # The one supported escape for a CDC-only start: the CONNECTOR creates a publication
-    # over exactly the captured tables and re-snapshots them. Paired with the forced
-    # initial snapshot that start is gapless by construction.
-    cfg = dispatch_source_config(
+def test_the_autocreate_mode_is_derived_from_the_snapshot_mode_not_passed_in() -> None:
+    """The two are ONE decision, so there is nothing to pass and nothing to forget.
+
+    They were independent for three releases and the pair broke twice, ending in
+    snapshot.mode=initial + publication.autocreate.mode=disabled -- guaranteed connector
+    death ("Publication autocreation is disabled") after both billable connectors exist,
+    followed by a CloudFormation rollback that also destroyed the healthy sink.
+    """
+    import inspect
+
+    from dsql_migrator.core.cdc_postgres import (
+        build_pg_source_config,
+        dispatch_source_config as _dispatch,
+        pg_publication_autocreate_mode,
+    )
+
+    # The rule itself.
+    assert pg_publication_autocreate_mode("initial") == "filtered"
+    assert pg_publication_autocreate_mode("never") == "disabled"
+
+    # It is not a parameter of EITHER builder any more -- a caller cannot set the pair
+    # inconsistently, and the two call sites that previously omitted it (the config preview
+    # and the infra deploy) now get the same value as the Start pass by construction.
+    for fn in (build_pg_source_config, _dispatch):
+        assert "publication_autocreate_mode" not in inspect.signature(fn).parameters, fn
+
+    # A re-snapshot start: initial => filtered, and it reaches the stack parameters.
+    resnap = _dispatch(
         SourceType.POSTGRES, _tables(), _wm(wal_lsn="3/AF012B8"),
         database="app", stack_name="dsql-cdc-stack",
         force_initial_snapshot=True,
-        publication_autocreate_mode="filtered",
     )
-    assert cfg.publication_autocreate_mode == "filtered"
-    assert cfg.snapshot_mode == "initial"
-    params = dict(build_pg_cdc_stack_params(cfg, _sink(), target_endpoint="ep").filled)
-    assert params["PgPublicationAutocreateMode"] == "filtered"
+    assert (resnap.snapshot_mode, resnap.publication_autocreate_mode) == (
+        "initial", "filtered",
+    )
+    params = dict(build_pg_cdc_stack_params(resnap, _sink(), target_endpoint="ep").filled)
     assert params["PgSnapshotMode"] == "initial"
-    # Default stays disabled, so every existing caller is unchanged.
-    assert (
-        dispatch_source_config(
-            SourceType.POSTGRES, _tables(), _wm(wal_lsn="3/AF012B8"),
-            database="app", stack_name="dsql-cdc-stack",
-        ).publication_autocreate_mode
-        == "disabled"
+    assert params["PgPublicationAutocreateMode"] == "filtered"
+
+    # A CDC-only start with no provisioned slot on the watermark ALSO lands on initial --
+    # and therefore on filtered. This is the case the old two-flag design got fatally
+    # wrong: nothing had set the flag, so it shipped "disabled" against an initial snapshot.
+    bare = _dispatch(
+        SourceType.POSTGRES, _tables(), _wm(wal_lsn="3/AF012B8"),
+        database="app", stack_name="dsql-cdc-stack",
     )
+    assert (bare.snapshot_mode, bare.publication_autocreate_mode) == (
+        "initial", "filtered",
+    )
+
+    # The gapless path: a watermark carrying the RECORDED slot resumes from it, so the
+    # connector must not touch the publication the Full Load provisioned.
+    gapless = _dispatch(
+        SourceType.POSTGRES, _tables(),
+        _wm(wal_lsn="3/AF012B8", slot_name="dsqlmig_s1"),
+        database="app", stack_name="dsql-cdc-stack",
+    )
+    assert (gapless.snapshot_mode, gapless.publication_autocreate_mode) == (
+        "never", "disabled",
+    )
+
+    # The invariant, stated directly: the two fields can never disagree, whatever inputs
+    # reach the builder.
+    for cfg in (resnap, bare, gapless):
+        assert cfg.publication_autocreate_mode == pg_publication_autocreate_mode(
+            cfg.snapshot_mode
+        ), cfg
+
+
+def test_no_reachable_state_produces_initial_snapshot_with_autocreate_disabled() -> None:
+    """The reported fatal combination, asserted as UNREACHABLE rather than merely unset.
+
+    Observed live (0.1.514, Aurora PostgreSQL 17.7): snapshot.mode=initial +
+    publication.autocreate.mode=disabled. The Debezium source task died 13 minutes into a
+    billable deploy --
+
+        Creating new publication 'dsqlmig_pub_...' for plugin 'PGOUTPUT'
+        ERROR Publication autocreation is disabled, please create one and restart the
+        connector
+
+    -- and CloudFormation rolled the cdc-stack back, destroying the SINK connector that had
+    reached RUNNING six minutes earlier. Two connectors at 2 MCU each plus MSK Serverless,
+    billed for ~14 minutes, for a stack rollback.
+
+    It was reachable because the two values were independent state: the start-position radio
+    and a session restore each set the snapshot half without the publication half. Fixing
+    the writers would have left the NEXT writer free to repeat it, so the pairing is now
+    structural -- which is what this test pins, by enumerating the inputs a real start can
+    have and asserting the combination cannot be expressed.
+    """
+    from dsql_migrator.core.cdc_postgres import pg_publication_autocreate_mode
+
+    watermarks = [
+        None,                                        # CDC-only, nothing provisioned
+        _wm(),                                       # watermark with no coordinates
+        _wm(wal_lsn="3/AF012B8"),                    # Full-load-only: LSN, NO slot
+        _wm(wal_lsn="3/AF012B8", slot_name="s1"),    # Full load + CDC: the gapless record
+        _wm(slot_name="s1"),                         # slot but no LSN
+    ]
+    seen = set()
+    for wm in watermarks:
+        for force_initial in (False, True):
+            cfg = dispatch_source_config(
+                SourceType.POSTGRES, _tables(), wm,
+                database="app", stack_name="dsql-cdc-stack",
+                force_initial_snapshot=force_initial,
+            )
+            pair = (cfg.snapshot_mode, cfg.publication_autocreate_mode)
+            seen.add(pair)
+            assert pair != ("initial", "disabled"), (
+                f"the fatal combination is reachable again: watermark={wm!r} "
+                f"force_initial={force_initial}"
+            )
+            # And the reverse mismatch, which was also reachable (flip the radio back to
+            # Automatic after taking the escape): resuming from a provisioned slot while
+            # letting the connector rewrite the publication is an unrequested source write.
+            assert pair != ("never", "filtered"), pair
+            assert cfg.publication_autocreate_mode == pg_publication_autocreate_mode(
+                cfg.snapshot_mode
+            )
+    # Both legitimate pairs really do occur in that sweep -- otherwise the assertions above
+    # could be passing because nothing interesting was exercised.
+    assert seen == {("initial", "filtered"), ("never", "disabled")}, seen
