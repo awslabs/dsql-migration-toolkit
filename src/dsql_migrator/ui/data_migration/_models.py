@@ -2210,6 +2210,22 @@ def cdc_cascade_gap_tables(assessment: object) -> list[str]:
     return sorted(names)
 
 
+def cdc_prerequisite_block_header(
+    report: Optional[PrerequisiteReport],
+    *,
+    cdc_checks_already_passed: bool = False,
+) -> str:
+    """The notice header that matches :func:`cdc_prerequisite_block_reason`'s verdict.
+
+    "Run the CDC prerequisite checks first" is right when the checks have not run, and
+    WRONG once they have and one of them failed -- which is the whole point of the new
+    existence gate. Pure; mirrors the reason function's own branch order.
+    """
+    if report is None and not cdc_checks_already_passed:
+        return "Run the CDC prerequisite checks first"
+    return "A CDC prerequisite is failing"
+
+
 def cdc_prerequisite_block_reason(
     report: Optional[PrerequisiteReport],
     *,
@@ -2233,6 +2249,15 @@ def cdc_prerequisite_block_reason(
       without ``binlog_row_image=FULL``), or ``WAL_LEVEL_LOGICAL`` for PostgreSQL
       (pgoutput needs ``wal_level=logical``). A report carries only its own engine's
       check, so gating on the MySQL one alone blocked every PostgreSQL CDC deploy.
+    * ``CDC_REPLICATION_OBJECTS`` did not FAIL -- CDC's publication is absent, omits a
+      selected table, or narrows its publish list, any of which means streaming cannot
+      work against this source at all (the Debezium task dies within seconds, or reports
+      RUNNING while replicating nothing). Exactly the same GRADE as the change-stream
+      check above, so it belongs beside it. The row's own remediation says "Fix this
+      BEFORE deploying the CDC infrastructure -- MSK Serverless and both connectors are
+      billed from creation", and until this gate existed the button it referred to was
+      still enabled: the cluster was created, billing started, and Start CDC then refused,
+      leaving a cluster nobody could use (~$1.4-2.0/hour).
 
     Without this, a source on the wrong binlog format surfaced only as an
     undiagnosed connector ``CREATE_FAILED`` ~26 min into a billable create; and
@@ -2241,7 +2266,13 @@ def cdc_prerequisite_block_reason(
 
     Deliberately does NOT gate on ``report.can_proceed``: that also covers per-table
     ``TARGET_SCHEMA_READY`` / ``TABLE_PRIMARY_KEY`` failures, which the Full Load
-    guard already owns and which do not make streaming impossible.
+    guard already owns and which do not make streaming impossible. Gating on
+    ``CDC_REPLICATION_OBJECTS``'s FAIL specifically -- not on ``can_proceed`` -- keeps that
+    distinction, and the row's GRADING already draws the line for us: a missing SLOT is a
+    WARN (such a start re-snapshots, so it costs a re-read, not correctness), unread facts
+    are INFO, and the whole row SKIPs in "Full load + CDC" where the objects are supposed
+    to be absent. So this gate fires on the one state that makes streaming impossible and
+    on nothing else -- verified by execution over all five states.
 
     ``cdc_checks_already_passed`` excuses an ABSENT report. The reports live in process
     memory only and are deliberately never persisted, so they vanish on an app restart.
@@ -2288,5 +2319,24 @@ def cdc_prerequisite_block_reason(
             "format with a FULL row image; PostgreSQL: wal_level=logical) — that check "
             f"has not passed.{suffix} Fix it on the source (an RDS parameter-group "
             "change needs a reboot), then re-run the checks."
+        )
+    objects = next(
+        (
+            r
+            for r in report.results
+            if r.check_id is PrerequisiteCheckId.CDC_REPLICATION_OBJECTS
+        ),
+        None,
+    )
+    if objects is not None and objects.status is PrerequisiteStatus.FAIL:
+        # Carry the row's OWN detail + remediation, so the disabled button's tooltip shows
+        # the route (including where the re-snapshot option is) instead of sending the
+        # operator back to the prerequisite table to find out.
+        parts = [
+            (objects.detail or "").strip(),
+            (objects.remediation or "").strip(),
+        ]
+        return " ".join(p for p in parts if p) or (
+            "CDC's publication and replication slot do not exist on the source."
         )
     return None

@@ -5,6 +5,34 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.509
+
+### Fixed
+
+- **"Deploy CDC infrastructure" ignored a failing CDC prerequisite, so a cluster nobody
+  could use started billing.** v0.1.508's new row ("CDC's publication and replication slot
+  exist on the source") is `required` and sets `can_proceed=False`, and its own remediation
+  says "Fix this BEFORE deploying the CDC infrastructure — MSK Serverless and both
+  connectors are billed from creation". But the deploy gate only ever consulted two things:
+  that a report exists, and that the engine's change-stream check passed. So the button the
+  remediation referred to stayed enabled: the MSK Serverless cluster was created and started
+  billing (~$1.4–2.0/hour), and Start CDC — correctly gated since v0.1.507 — then refused,
+  leaving a cluster that could never be used. The gate now also blocks on that row's FAIL,
+  as a peer of the change-stream check: both mean streaming cannot work against this source
+  at all, and both must be known before anything is paid for.
+
+  Deliberately still NOT gating on `can_proceed`, which would also take in per-table Full
+  Load failures the Full Load guard already owns. The row's GRADING draws the line instead,
+  and it was already right: a missing SLOT is a WARN (such a start re-snapshots, so it costs
+  a re-read, not correctness), unread facts are INFO, and the whole row SKIPs in
+  "Full load + CDC" where the objects are supposed to be absent. Verified by execution over
+  all five states that the gate fires on exactly one of them.
+- **The disabled button now explains the way out.** Its tooltip and the notice carry the
+  failing row's own detail and remediation, so the route — including where the re-snapshot
+  option is — is visible without going back to the prerequisite table. The notice header
+  also stops saying "Run the CDC prerequisite checks first" once the checks have run and one
+  of them failed.
+
 ## v0.1.508
 
 ### Added

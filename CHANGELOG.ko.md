@@ -5,6 +5,15 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.509
+
+### 수정
+
+- **"Deploy CDC infrastructure"가 실패한 CDC 사전 점검을 무시해, 아무도 쓸 수 없는 클러스터에 과금이 시작됐습니다.** v0.1.508이 추가한 행("CDC's publication and replication slot exist on the source")은 `required`이고 `can_proceed=False`를 만들며, 그 조치 문구 자체가 "Fix this BEFORE deploying the CDC infrastructure — MSK Serverless and both connectors are billed from creation"이라고 말합니다. 그런데 배포 게이트는 두 가지만 봤습니다 — 리포트 존재 여부와 엔진의 변경 스트림 검사 통과. 그래서 그 조치 문구가 가리키는 버튼이 활성 상태로 남았습니다: MSK Serverless 클러스터가 생성돼 과금이 시작되고(시간당 약 $1.4–2.0), v0.1.507부터 올바르게 게이팅되는 Start CDC가 거부해서, 결코 쓸 수 없는 클러스터만 남았습니다. 이제 게이트가 그 행의 FAIL도 차단합니다 — 변경 스트림 검사와 **동급**으로. 둘 다 "이 소스에서는 스트리밍이 아예 성립하지 않는다"는 뜻이고, 둘 다 비용을 치르기 전에 알아야 합니다.
+
+  `can_proceed` 전체로 넓히지는 **않았습니다.** 그러면 Full Load 가드가 이미 담당하는 테이블 단위 실패까지 끌어들입니다. 대신 그 행의 **등급 설계**가 선을 그어주고, 그 설계는 이미 정확했습니다: **슬롯** 부재는 WARN(그런 시작은 재스냅샷하므로 정확성이 아니라 재읽기 비용), 읽지 못한 사실은 INFO, 그리고 객체가 없는 것이 정상인 "Full load + CDC"에서는 행 전체가 SKIP. 다섯 가지 상태 전부를 실행해, 게이트가 정확히 하나에서만 발동함을 확인했습니다.
+- **비활성화된 버튼이 해결 경로를 알려줍니다.** 툴팁과 안내문이 실패한 행의 detail과 remediation을 그대로 담아서, **Re-snapshot every table instead**가 어디 있는지를 포함한 경로를 사전 점검 표로 돌아가지 않고 볼 수 있습니다. 검사가 이미 실행돼 하나가 실패한 뒤에는 안내문 제목도 "Run the CDC prerequisite checks first"라고 말하지 않습니다.
+
 ## v0.1.508
 
 ### 추가

@@ -12317,8 +12317,17 @@ def test_cdc_gate_call_sites_pass_the_escape_hatch() -> None:
     from dsql_migrator.ui.data_migration import _cdc_ui
 
     src = inspect.getsource(_cdc_ui)
-    assert src.count("cdc_checks_already_passed=") == 2, (
-        "both the deploy and start gates must pass cdc_checks_already_passed"
+    # Every call into the gate must carry it, counted rather than hardcoded so adding a
+    # gate call (the header companion was one) cannot silently drop the escape hatch on
+    # the new one while the old magic number still matched.
+    # The trailing "(" already excludes the import lines (which end in a comma).
+    gate_calls = src.count("cdc_prerequisite_block_reason(") + src.count(
+        "cdc_prerequisite_block_header("
+    )
+    assert gate_calls >= 2, "both the deploy and start gates must consult the gate"
+    assert src.count("cdc_checks_already_passed=") == gate_calls, (
+        "every CDC gate call must pass cdc_checks_already_passed, or the reports-vanish-"
+        f"on-restart bug returns on the one that missed it ({gate_calls} calls)"
     )
 
 
@@ -24919,3 +24928,179 @@ def test_the_deploy_infra_dialog_refuses_a_cdc_only_deploy_with_nothing_to_strea
         if n["header"] == "CDC's publication does not exist on the source"
     ]
     assert ui2.buttons["Deploy"].enabled is True
+
+
+def test_the_deploy_gate_blocks_a_failing_publication_check_but_nothing_softer() -> None:
+    """The FAIL must block Deploy; SKIP / WARN / INFO / PASS must not.
+
+    The row's remediation says "Fix this BEFORE deploying the CDC infrastructure — MSK
+    Serverless and both connectors are billed from creation", and until this gate existed
+    the button it referred to stayed enabled: the cluster was created and billed, then
+    Start CDC refused, leaving a cluster nobody could use. The GRADING already draws the
+    line, so the gate only has to read it -- which is why the softer states are the real
+    assertion here: over-blocking would take away the re-snapshot route, the one path a
+    Full-load-only operator has left.
+    """
+    from dsql_migrator.core.models import (
+        ColumnDef,
+        MigrationMode,
+        PrerequisiteCheckId,
+        PrerequisiteReport,
+        PrerequisiteResult,
+        PrerequisiteStatus,
+        TableDef,
+    )
+    from dsql_migrator.core.prerequisites_postgres import (
+        PostgresCdcFacts,
+        check_cdc_replication_objects,
+    )
+    from dsql_migrator.ui.data_migration import cdc_prerequisite_block_reason
+
+    wal_ok = PrerequisiteResult(
+        check_id=PrerequisiteCheckId.WAL_LEVEL_LOGICAL,
+        title="wal_level",
+        status=PrerequisiteStatus.PASS,
+        required=True,
+        detail="logical",
+    )
+    table = TableDef(
+        name="app.orders",
+        columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+        primary_key=["id"],
+    )
+
+    def row(*, provisions, **facts_kw):
+        base = dict(
+            checked_publication_name="dsqlmig_pub_x",
+            checked_slot_name="dsqlmig_x",
+            publication_present=True,
+            publication_publishes_all_dml=True,
+            publication_tables=("app.orders",),
+            slot_usable=True,
+            slot_present_any_database=True,
+        )
+        base.update(facts_kw)
+        return check_cdc_replication_objects(
+            PostgresCdcFacts(**base), [table], provisions_replication=provisions
+        )
+
+    def gate(result):
+        return cdc_prerequisite_block_reason(
+            PrerequisiteReport(
+                mode=MigrationMode.CDC,
+                results=[wal_ok, result],
+                can_proceed=result.status is not PrerequisiteStatus.FAIL,
+            ),
+            cdc_checks_already_passed=True,
+        )
+
+    # BLOCKS: the publication is absent -- streaming cannot work against this source.
+    absent = row(provisions=False, publication_present=False, publication_tables=())
+    assert absent.status is PrerequisiteStatus.FAIL
+    blocked = gate(absent)
+    assert blocked is not None
+    # The tooltip/notice carries the ROW's own remediation, so the operator sees the route
+    # (including the re-snapshot option) without going back to the prerequisite table.
+    assert "BEFORE deploying" in blocked
+    assert "re-snapshot" in blocked
+
+    # ...and a coverage gap, which is worse than a crash (RUNNING while replicating
+    # nothing for those tables), blocks too.
+    assert gate(row(provisions=False, publication_tables=())) is not None
+
+    # DOES NOT BLOCK -- each for its own reason, and each would be a false block:
+    #   SKIP: "Full load + CDC" creates the objects, so absent is CORRECT there.
+    assert row(provisions=True, publication_present=False, publication_tables=()).status \
+        is PrerequisiteStatus.SKIP
+    assert gate(row(provisions=True, publication_present=False, publication_tables=())) is None
+    #   WARN: only the slot is missing -> the start re-snapshots. Blocking would remove
+    #   the one route a Full-load-only operator has left.
+    slotless = row(provisions=False, slot_usable=False, slot_present_any_database=False)
+    assert slotless.status is PrerequisiteStatus.WARN
+    assert gate(slotless) is None
+    #   INFO: the catalog could not be read. Unreadable is not absent.
+    assert gate(row(provisions=False, publication_present=None)) is None
+    #   PASS.
+    assert gate(row(provisions=False)) is None
+
+
+def test_the_block_notice_header_stops_saying_run_the_checks_once_they_have_run() -> None:
+    from dsql_migrator.core.models import MigrationMode, PrerequisiteReport
+    from dsql_migrator.ui.data_migration import cdc_prerequisite_block_header
+
+    # No report and no recorded pass -> the checks really have not run.
+    assert "Run the CDC prerequisite" in cdc_prerequisite_block_header(None)
+    # A report EXISTS and something in it failed -> telling the operator to run the checks
+    # is wrong; they ran, and one failed.
+    report = PrerequisiteReport(mode=MigrationMode.CDC, results=[], can_proceed=False)
+    header = cdc_prerequisite_block_header(report)
+    assert "failing" in header and "Run the CDC prerequisite" not in header
+
+
+def test_the_deploy_button_is_disabled_and_explains_a_failing_publication_check() -> None:
+    """Behavioral: RENDER the deploy action with the failing row and read what it emitted.
+
+    The prerequisite row's own remediation says "Fix this BEFORE deploying the CDC
+    infrastructure", and until this gate existed the button it referred to stayed enabled --
+    so the MSK Serverless cluster was created and billed, and Start CDC then refused.
+    """
+    from dsql_migrator.core.models import (
+        ColumnDef,
+        MigrationMode,
+        PrerequisiteCheckId,
+        PrerequisiteReport,
+        PrerequisiteResult,
+        PrerequisiteStatus,
+        TableDef,
+    )
+    from dsql_migrator.core.prerequisites_postgres import (
+        PostgresCdcFacts,
+        check_cdc_replication_objects,
+    )
+
+    absent = check_cdc_replication_objects(
+        PostgresCdcFacts(
+            checked_publication_name="dsqlmig_pub_x",
+            checked_slot_name="dsqlmig_x",
+            publication_present=False,
+            publication_tables=(),
+        ),
+        [
+            TableDef(
+                name="app.orders",
+                columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+                primary_key=["id"],
+            )
+        ],
+        provisions_replication=False,
+    )
+    assert absent.status is PrerequisiteStatus.FAIL
+
+    state = _cdc_state_ready_for_deploy()
+    state.set_cdc_infra_inputs({"vpc_id": "vpc-0123456789abcdef0"})
+    state.set_prereq_report(
+        MigrationMode.CDC,
+        PrerequisiteReport(
+            mode=MigrationMode.CDC,
+            results=[
+                PrerequisiteResult(
+                    check_id=PrerequisiteCheckId.WAL_LEVEL_LOGICAL,
+                    title="wal_level",
+                    status=PrerequisiteStatus.PASS,
+                    required=True,
+                    detail="logical",
+                ),
+                absent,
+            ],
+            can_proceed=False,
+        ),
+    )
+    ui = _render_deploy_action(state)
+    assert ui.deploy_button().enabled is False
+    rendered = " ".join(ui.texts)
+    # The notice must NOT tell the operator to run checks that just ran and failed...
+    assert "Run the CDC prerequisite checks first" not in rendered
+    assert "failing" in rendered
+    # ...and it carries the route, so they do not have to go back to the table for it.
+    assert "BEFORE deploying" in rendered
+    assert "re-snapshot" in rendered

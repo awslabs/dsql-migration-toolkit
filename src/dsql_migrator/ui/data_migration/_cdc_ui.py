@@ -78,6 +78,7 @@ from dsql_migrator.ui.data_migration._models import (
     build_lag_chart_option,
     build_migration_table_status,
     cdc_handling_facts,
+    cdc_prerequisite_block_header,
     cdc_prerequisite_block_reason,
     connector_health_rows,
     connector_role_label,
@@ -2062,7 +2063,13 @@ def _render_cdc_start_button(
         render_notice(
             ui,
             tone="warning",
-            header="Run the CDC prerequisite checks first",
+            header=cdc_prerequisite_block_header(
+                migration_state.get_prereq_report(MigrationMode.CDC),
+                cdc_checks_already_passed=(
+                    getattr(migration_state, "prereq_gated_mode", None)
+                    is MigrationMode.CDC
+                ),
+            ),
             body=prereq_block,
         )
 
@@ -2495,7 +2502,15 @@ def _render_cdc_infra_deploy_action(
         render_notice(
             ui,
             tone="warning",
-            header="Run the CDC prerequisite checks first",
+            # The header must not say "run the checks first" once they HAVE run and one
+            # failed -- which is exactly the CDC_REPLICATION_OBJECTS case.
+            header=cdc_prerequisite_block_header(
+                migration_state.get_prereq_report(MigrationMode.CDC),
+                cdc_checks_already_passed=(
+                    getattr(migration_state, "prereq_gated_mode", None)
+                    is MigrationMode.CDC
+                ),
+            ),
             body=_prereq_block,
         )
         return

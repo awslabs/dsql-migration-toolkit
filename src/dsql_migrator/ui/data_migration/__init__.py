@@ -236,6 +236,7 @@ from dsql_migrator.ui.data_migration._models import (
     CdcHandlingFact,
     cdc_cascade_gap_tables,
     cdc_handling_facts,
+    cdc_prerequisite_block_header,
     cdc_prerequisite_block_reason,
 )
 
@@ -3982,6 +3983,7 @@ __all__ = [
     "CdcHandlingFact",
     "cdc_cascade_gap_tables",
     "cdc_handling_facts",
+    "cdc_prerequisite_block_header",
     "cdc_prerequisite_block_reason",
     "ImporterFactory",
     "BatchedTableMigrator",

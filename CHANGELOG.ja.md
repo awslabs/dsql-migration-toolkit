@@ -5,6 +5,15 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.509
+
+### 修正
+
+- **「Deploy CDC infrastructure」が失敗した CDC 前提条件を無視し、誰も使えないクラスターの課金が始まっていました。** v0.1.508 で追加した行（"CDC's publication and replication slot exist on the source"）は `required` で `can_proceed=False` にし、その対処文自体が "Fix this BEFORE deploying the CDC infrastructure — MSK Serverless and both connectors are billed from creation" と述べています。しかしデプロイのゲートが見ていたのは 2 つだけ — レポートの存在と、エンジンの変更ストリームチェックの合格。そのため対処文が指すボタンは有効なままでした: MSK Serverless クラスターが作成されて課金が始まり（毎時約 $1.4〜2.0）、v0.1.507 以降正しくゲートされている Start CDC が拒否して、決して使えないクラスターだけが残りました。現在はゲートがその行の FAIL もブロックします — 変更ストリームチェックと**同格**として。どちらも「このソースではストリーミングがまったく成立しない」を意味し、どちらも費用を払う前に分かっていなければなりません。
+
+  `can_proceed` 全体にはあえて**広げていません**。それでは Full Load ガードが既に担当しているテーブル単位の失敗まで取り込んでしまいます。代わりにその行の**採点**が線を引いており、その設計はすでに正しかったのです: **スロット**の欠落は WARN（その開始は再スナップショットするため、正確性ではなく再読み取りのコスト）、読み取れなかった事実は INFO、そしてオブジェクトが無いのが正常な「Full load + CDC」では行全体が SKIP。5 つの状態すべてを実行し、ゲートがちょうど 1 つでのみ発動することを確認しました。
+- **無効化されたボタンが解決の道筋を示します。** ツールチップと通知が、失敗した行の detail と remediation をそのまま含むため、**Re-snapshot every table instead** がどこにあるかを含む経路が、前提条件の表に戻らずに見えます。チェックが実行済みでそのうち 1 つが失敗した後は、通知の見出しも「Run the CDC prerequisite checks first」と言わなくなります。
+
 ## v0.1.508
 
 ### 追加
