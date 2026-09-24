@@ -417,6 +417,139 @@ def check_replica_identity(
     )
 
 
+def check_replica_identity_covers_key(
+    table: TableDef,
+    facts: PostgresCdcFacts,
+    key_columns: Sequence[str],
+) -> Optional[PrerequisiteResult]:
+    """Can the before-image supply every column the CDC record is KEYED on?
+
+    A different question from :func:`check_replica_identity`, with a different remedy, so it
+    is a separate check (the precedent this repo already set for PUBLICATION_PRIVILEGE vs
+    CDC_REPLICATION_OBJECTS). That one asks "is an identity set at all" and accepts 'd';
+    this one asks whether 'd' is ENOUGH -- and for a re-keyed table it is not.
+
+    **The failure it exists to stop is silent.** When Schema Conversion's per-table
+    "Composite key" option prepends a high-cardinality column to the target primary key (a
+    DSQL hot-partition remedy), the connector is told ``message.key.columns`` = that target
+    key. Under ``REPLICA IDENTITY DEFAULT`` PostgreSQL limits the UPDATE/DELETE before-image
+    to the SOURCE primary key, so the prepended column is ABSENT from a DELETE: the record
+    key carries a NULL component, the sink renders ``WHERE "leading" = NULL AND "id" = ?``,
+    three-valued logic matches nothing, and the delete is applied as 0 rows with no error, no
+    dead-letter and no log. Live-observed on Aurora PostgreSQL 17.7: one deleted order stayed
+    on the target while its child rows (no re-key, so keyed on the source PK) deleted
+    correctly. INSERT and UPDATE are unaffected -- their after-image carries every column.
+
+    The tool DOES widen the identity itself (``cdc_pg_slot.set_replica_identity_full``), but
+    only on the path where the Full Load provisions the replication slot. A Full-load-only
+    run continued to CDC, a CDC-only start, an identity reset after provisioning, and a
+    PARTITIONED table (``ALTER TABLE`` on the parent does not reach existing partitions,
+    while PostgreSQL logs the LEAF's identity) all reach streaming with the identity still
+    DEFAULT. This check verifies the source's actual catalog instead of trusting that the
+    widening ran, so every route is covered by the same gate.
+
+    Returns ``None`` when there is nothing to grade: no re-key for this table, or the key
+    adds nothing beyond the source primary key (a pure reorder). Pure.
+    """
+    extra = [c for c in (key_columns or []) if c not in set(table.primary_key or ())]
+    if not extra:
+        return None
+    identity = facts.replica_identity.get(table.name)
+    title = "Re-keyed table's before-image carries the record key"
+    key_desc = ", ".join(key_columns)
+    missing = ", ".join(extra)
+    if identity is None:
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.REPLICA_IDENTITY_COVERS_KEY,
+            title=title,
+            status=PrerequisiteStatus.INFO,
+            required=False,
+            target=table.name,
+            detail=(
+                "Could not read the table's REPLICA IDENTITY, so it is unknown whether a "
+                f"DELETE would carry {missing}."
+            ),
+        )
+
+    def _fail(detail: str, remediation: str) -> PrerequisiteResult:
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.REPLICA_IDENTITY_COVERS_KEY,
+            title=title,
+            status=PrerequisiteStatus.FAIL,
+            required=True,
+            target=table.name,
+            detail=detail,
+            remediation=remediation,
+        )
+
+    # PARTITIONS FIRST, and they are graded even when the parent itself is FULL: PostgreSQL
+    # enforces and logs the LEAF's identity, and ALTER TABLE on a parent does not propagate
+    # to existing partitions (live-verified elsewhere in this module). So a re-keyed
+    # partitioned table whose parent the tool widened still loses deletes on every leaf.
+    weak_leaves = sorted(
+        leaf
+        for leaf, code in (facts.leaf_replica_identity.get(table.name) or {}).items()
+        if code != "f"
+    )
+    if weak_leaves:
+        shown = ", ".join(weak_leaves[:5])
+        more = f" (and {len(weak_leaves) - 5} more)" if len(weak_leaves) > 5 else ""
+        return _fail(
+            f"The CDC record key for {table.name} is ({key_desc}), which adds {missing} "
+            f"beyond the source primary key, but {len(weak_leaves)} partition(s) are not "
+            f"REPLICA IDENTITY FULL: {shown}{more}. PostgreSQL logs the PARTITION's "
+            f"identity, so a DELETE would arrive without {missing} and be silently applied "
+            "to 0 rows.",
+            "Run ALTER TABLE <partition> REPLICA IDENTITY FULL on each PARTITION (the "
+            "parent does not propagate to existing partitions), and set it on new "
+            "partitions as they are created.",
+        )
+
+    if identity == "f":
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.REPLICA_IDENTITY_COVERS_KEY,
+            title=title,
+            status=PrerequisiteStatus.PASS,
+            required=True,
+            target=table.name,
+            detail=(
+                f"REPLICA IDENTITY FULL, so a DELETE carries {missing} and the re-keyed "
+                f"record key ({key_desc}) can locate the target row."
+            ),
+        )
+
+    # Everything else -- 'd', 'n', and 'i' whether or not the index is the primary key --
+    # publishes at most the primary key (or that index's columns) in the before-image, so
+    # the added key column is absent. 'i' is graded FAIL rather than probed for its column
+    # list: FULL is the remedy either way, and a WARN here would let the silent loss ship.
+    _reason = {
+        "d": (
+            "REPLICA IDENTITY is DEFAULT, so the UPDATE/DELETE before-image carries only "
+            "the source primary key"
+        ),
+        "n": (
+            "REPLICA IDENTITY is 'nothing', so there is no before-image at all (and "
+            "UPDATE/DELETE would fail on the publisher)"
+        ),
+    }.get(
+        identity,
+        "REPLICA IDENTITY is an index, so the before-image carries only that index's "
+        "columns",
+    )
+    return _fail(
+        f"The CDC record key for {table.name} is ({key_desc}) -- the target primary key "
+        f"chosen in Schema Conversion -- which adds {missing} beyond the source primary "
+        f"key ({', '.join(table.primary_key or ()) or 'none'}). {_reason}, so {missing} "
+        "would be NULL in a DELETE and the sink would apply it to 0 rows: the delete is "
+        "SILENTLY LOST, with no error and no dead-letter. INSERT and UPDATE are unaffected "
+        "(their after-image carries every column).",
+        f"Run ALTER TABLE {table.name} REPLICA IDENTITY FULL on the source, then re-run "
+        "these checks. DEFAULT is not enough for a re-keyed table. The alternative is to "
+        f"set {table.name} back to \"Keep source PK\" in Schema Conversion, which removes "
+        "the re-key and the requirement with it.",
+    )
+
+
 def check_table_replicable(
     table: TableDef, facts: PostgresCdcFacts
 ) -> PrerequisiteResult:
@@ -790,12 +923,18 @@ def check_postgres_cdc_prerequisites(
     *,
     provisions_replication: bool = True,
     cdc_start_resnapshots: bool = False,
+    message_key_columns: Optional[Mapping[str, Sequence[str]]] = None,
 ) -> list[PrerequisiteResult]:
     """Run all PostgreSQL CDC readiness checks (global + per-table REPLICA IDENTITY).
 
     ``provisions_replication`` defaults True -- "this run creates the objects itself" --
     so every existing caller and the whole Full-load-+-CDC path is unchanged and the
     existence check can never block them.
+
+    ``message_key_columns`` is the connector's re-key map (qualified table -> the target
+    primary key the change record is keyed on). Only tables in it can fail
+    :func:`check_replica_identity_covers_key`; an empty/None map means no table was re-keyed,
+    so that check emits nothing at all.
     """
     results = [
         check_wal_level_logical(facts),
@@ -811,9 +950,15 @@ def check_postgres_cdc_prerequisites(
         check_slot_wal_retention(facts),
         check_source_is_writer(facts),
     ]
+    _keys = dict(message_key_columns or {})
     for table in tables:
         results.append(check_table_replicable(table, facts))
         results.append(check_replica_identity(table, facts))
+        _covers = check_replica_identity_covers_key(
+            table, facts, _keys.get(table.name) or ()
+        )
+        if _covers is not None:
+            results.append(_covers)
     return results
 
 

@@ -4188,18 +4188,28 @@ def _start_cdc_deploy(
             {t.name: list(t.primary_key) for t in tables_for_config},
         )
         if _rekeyed_full:
+            # WARNING, not info, and it no longer says the tool has handled it. The old copy
+            # read "The tool sets REPLICA IDENTITY FULL on them during Full Load" -- true
+            # ONLY when the Full Load provisions the slot, which a Full-load-ONLY run does
+            # not do. An operator who had in fact run Full Load therefore concluded it was
+            # handled, started CDC, and lost every delete on the re-keyed table silently
+            # (live-observed on Aurora PostgreSQL 17.7). The authoritative gate is now the
+            # REPLICA_IDENTITY_COVERS_KEY prerequisite, which reads the source's actual
+            # relreplident and BLOCKS; this notice only points at it, so the two can never
+            # disagree about whether the source is ready.
             render_notice(
                 ui,
-                tone="info",
-                header="Re-keyed tables need REPLICA IDENTITY FULL",
+                tone="warning",
+                header="Re-keyed tables need REPLICA IDENTITY FULL on the source",
                 body=(
-                    "These tables use a composite (re-keyed) primary key, so their "
-                    "UPDATE/DELETE before-image must carry the added leading key column "
-                    "for deletes to replicate: " + ", ".join(_rekeyed_full) + ". The tool "
-                    "sets REPLICA IDENTITY FULL on them during Full Load. If you did not "
-                    "run Full Load in this session, run ALTER TABLE … REPLICA IDENTITY FULL "
-                    "on the source for these tables before starting CDC, or their deletes "
-                    "will be lost."
+                    "These tables are keyed on a composite (re-keyed) primary key, so a "
+                    "DELETE must carry the added leading key column or it is applied to 0 "
+                    "rows and silently lost: " + ", ".join(_rekeyed_full) + ". The tool sets "
+                    "REPLICA IDENTITY FULL during Full Load ONLY when that run also "
+                    "provisions the replication slot — a Full-load-only run does not, and "
+                    "neither does a CDC-only start. Run the CDC prerequisite checks: they "
+                    "read the source's actual REPLICA IDENTITY and block the start with the "
+                    "exact ALTER TABLE to run."
                 ),
             )
     # FIX 4: SeedMode is engine-aware -- the SINGLE source of truth shared with the infra

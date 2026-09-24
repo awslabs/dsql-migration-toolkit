@@ -120,7 +120,48 @@ final class DebeziumEvents {
       throw new DataException(
           "Cannot build DELETE for table " + table + ": no primary key in record key or before-image");
     }
+    requireNoNullKeyComponent(table, pkColumns, pkValues, "DELETE");
     return ChangeEvent.delete(table, pkColumns, pkValues, sourceTsMs);
+  }
+
+  /**
+   * Refuse a delete whose key has a NULL component, instead of applying it to zero rows.
+   *
+   * <p>The emptiness checks above ask "is there a key at all"; this asks whether the key can
+   * actually locate a row. The delete SQL renders {@code "col" = ?} per component, so a NULL
+   * makes the predicate UNKNOWN and the statement removes nothing -- and the affected-row
+   * count is not inspected, so the record was acknowledged, its offset committed, and the
+   * delete lost with no error, no log and no dead-letter. Live-observed on a PostgreSQL
+   * source: a deleted row stayed on the target while rows from the same transaction that were
+   * keyed on the source primary key deleted correctly.
+   *
+   * <p>The cause is upstream of the sink -- a table re-keyed onto the target primary key whose
+   * source {@code REPLICA IDENTITY} is DEFAULT, so the added key column is absent from the
+   * DELETE before-image -- and the tool now blocks that configuration in its prerequisites.
+   * This is the backstop: a key the sink cannot use must be LOUD (dead-lettered, like any
+   * other unusable record) rather than silently dropped, because a silent drop is
+   * indistinguishable from success and the operator has no way to find it.
+   */
+  private static void requireNoNullKeyComponent(
+      String table, List<String> pkColumns, List<Object> pkValues, String opName) {
+    for (int i = 0; i < pkColumns.size(); i++) {
+      if (i >= pkValues.size() || pkValues.get(i) == null) {
+        throw new DataException(
+            "Cannot build "
+                + opName
+                + " for table "
+                + table
+                + ": key column '"
+                + pkColumns.get(i)
+                + "' is null, so the target row cannot be located and the "
+                + opName
+                + " would be applied to 0 rows. On a PostgreSQL source this means the"
+                + " UPDATE/DELETE before-image does not carry that column: run"
+                + " ALTER TABLE "
+                + table
+                + " REPLICA IDENTITY FULL.");
+      }
+    }
   }
 
   private static ChangeEvent buildTombstone(
@@ -131,6 +172,7 @@ final class DebeziumEvents {
               + table
               + ": no primary key in record key or before-image");
     }
+    requireNoNullKeyComponent(table, pkColumns, pkValues, "DELETE");
     return ChangeEvent.tombstone(table, pkColumns, pkValues, 0L);
   }
 

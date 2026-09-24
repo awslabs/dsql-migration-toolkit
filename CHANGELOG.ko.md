@@ -5,6 +5,21 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.516
+
+### 수정
+
+- **재키잉된 테이블의 DELETE가 PostgreSQL 소스에서 조용히 유실되었고, 사전 점검은 소스를 "준비됨"으로 보고했습니다.** Aurora PostgreSQL 17.7에서 실측: 삭제한 `orders` 1행이 DSQL 타깃에 그대로 남았고 — 에러도, DLQ 기록도, 로그도 없었습니다 — 같은 트랜잭션에서 삭제된 자식 `order_items` 행들은 정상 전파되었습니다. **그 대조가 곧 진단입니다.** Schema Conversion의 테이블별 **Composite key** 옵션이 타깃 기본 키에 고카디널리티 컬럼을 앞에 붙이면(DSQL 핫파티션 대책), 커넥터는 그 타깃 키로 키잉됩니다(`message.key.columns=ecommerce\.orders:user_id,id`). `REPLICA IDENTITY DEFAULT`에서 PostgreSQL은 DELETE의 before 이미지를 **소스** 기본 키 `(id)`로 한정하므로 `user_id`가 NULL로 도착하고, 싱크는 `WHERE "user_id" = NULL AND "id" = ?`를 만들며, 3값 논리로 아무것도 매칭되지 않아 DELETE가 0행에 적용됩니다. INSERT와 UPDATE는 영향 없습니다(after 이미지가 모든 컬럼을 담습니다). MySQL은 도달 불가입니다 — 거기서는 `binlog_row_image=FULL`이 **차단하는 필수** 사전 점검입니다.
+
+  도구는 이미 identity를 스스로 넓히고 있었습니다 — 다만 **Full Load가 복제 슬롯을 프로비저닝하는 경로에서만**입니다. **Full load only를 끝내고 CDC로 이어가는 경우**(v0.1.510이 의도적으로 열어둔 경로), CDC-only 시작, 프로비저닝 후 identity 재설정, 그리고 **파티션 테이블**(부모에 대한 `ALTER TABLE`은 기존 파티션에 전파되지 않는데 PostgreSQL은 **리프**의 identity를 로깅합니다) 모두 identity가 DEFAULT인 상태로 스트리밍에 도달합니다. 그 경로들의 유일한 가드는 "The tool sets REPLICA IDENTITY FULL on them during Full Load"라고 적힌 **비차단** 안내였고 — 그래서 Full Load를 **실제로 돌린** 운영자는 처리됐다고 합리적으로 결론지었습니다.
+
+  이제 필수 사전 점검 `REPLICA_IDENTITY_COVERS_KEY`가 소스의 실제 `relreplident`를 읽고, 실행할 정확한 문장(`ALTER TABLE … REPLICA IDENTITY FULL`)과 함께 테이블별로 시작을 차단합니다. 빠진 컬럼을 이름으로 말하고 **DEFAULT로는 부족하다**고 명시합니다 — identity가 설정되어 있는지만 묻고 DEFAULT를 올바르게 수용하는 기존 REPLICA_IDENTITY 점검과 **의도적으로 분리**했습니다. 부모가 아니라 파티션 **리프**를 채점하므로 도구 자신의 ALTER가 고칠 수 없는 경우까지 덮고, 넓히기가 실행됐다고 믿는 대신 카탈로그를 검증하므로 모든 경로가 같은 게이트를 지납니다. 재키잉되지 않은 테이블이나 소스 기본 키를 단순 재배열한 경우에는 아무것도 출력하지 않습니다.
+- **싱크가 적용할 수 없는 삭제를 더 이상 받아들이지 않습니다(싱크 플러그인 v42).** 키에 NULL 컴포넌트가 있으면 이제 거부합니다 — 다른 사용 불가 레코드와 마찬가지로 DLQ로 보내고, 해당 컬럼과 실행할 `ALTER TABLE`을 메시지에 담습니다 — 조용히 0행을 지우는 대신에. 영향 행 수는 애초에 검사되지 않았으므로 레코드는 확인 처리되고 오프셋이 커밋됐으며, `DeletesApplied`는 오히려 증가해 모니터에는 삭제가 흐르는데 실제로는 아무것도 삭제되지 않았습니다. 톰스톤도 동일하게 가드합니다. **이 절반은 기존 cdc 스택에 Delete + Deploy CDC infrastructure가 필요합니다**(Start CDC만으로는 플러그인이 재등록되지 않습니다). 그때까지는 위의 사전 점검이 그 배포를 보호합니다.
+
+### 변경
+
+- CDC 카드의 재키잉 안내가 경고로 바뀌었고, 도구가 처리했다는 함의를 없앴습니다: 넓히기는 **그 실행이 슬롯까지 프로비저닝할 때만** Full Load 중에 일어난다고 명시하고, 소스를 실제로 검증하는 사전 점검을 가리킵니다.
+
 ## v0.1.515
 
 ### 수정

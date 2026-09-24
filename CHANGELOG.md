@@ -5,6 +5,56 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.516
+
+### Fixed
+
+- **A re-keyed table's DELETEs were silently lost on a PostgreSQL source, and the report
+  called the source ready.** Live-observed on Aurora PostgreSQL 17.7: one deleted `orders`
+  row stayed on the DSQL target with no error, no dead-letter and no log line, while the
+  child `order_items` rows deleted in the same transaction replicated correctly. That
+  contrast IS the diagnosis. When Schema Conversion's per-table **Composite key** option
+  prepends a high-cardinality column to the target primary key (a DSQL hot-partition remedy),
+  the connector is keyed on that target key (`message.key.columns=ecommerce\.orders:user_id,id`).
+  Under `REPLICA IDENTITY DEFAULT` PostgreSQL limits a DELETE's before-image to the SOURCE
+  primary key `(id)`, so `user_id` arrives NULL, the sink renders `WHERE "user_id" = NULL AND
+  "id" = ?`, three-valued logic matches nothing, and the delete is applied to 0 rows.
+  INSERT and UPDATE are unaffected (their after-image carries every column). MySQL cannot
+  reach this: `binlog_row_image=FULL` is a hard, blocking prerequisite there.
+
+  The tool already widened the identity itself — but only on the path where the Full Load
+  provisions the replication slot. A **Full-load-only run continued to CDC** (the route
+  v0.1.510 deliberately opened), a CDC-only start, an identity reset after provisioning, and
+  a PARTITIONED table (`ALTER TABLE` on a parent does not reach existing partitions, while
+  PostgreSQL logs the LEAF's identity) all reach streaming with the identity still DEFAULT.
+  The only guard on those routes was a non-blocking note that said "The tool sets REPLICA
+  IDENTITY FULL on them during Full Load" — so an operator who HAD run Full Load reasonably
+  concluded it was handled.
+
+  Now a required prerequisite, `REPLICA_IDENTITY_COVERS_KEY`, reads the source's actual
+  `relreplident` and blocks the start with the exact statement to run
+  (`ALTER TABLE … REPLICA IDENTITY FULL`), per table, naming the missing column and saying
+  that DEFAULT is not enough — deliberately a separate check from the existing
+  REPLICA_IDENTITY, which asks whether an identity is set at all and correctly accepts
+  DEFAULT. It grades partition LEAVES rather than the parent, so the case the tool's own
+  ALTER cannot fix is covered too, and it verifies the catalog instead of trusting that the
+  widening ran, so every route is gated the same way. It emits nothing for a table that was
+  not re-keyed, or whose re-key only reorders the source primary key.
+- **The sink no longer accepts a delete it cannot apply (sink plugin v42).** A key with a
+  NULL component is now refused — dead-lettered like any other unusable record, with a
+  message naming the column and the `ALTER TABLE` to run — instead of silently removing 0
+  rows. The affected-row count was never inspected, so the record was acknowledged and its
+  offset committed; `DeletesApplied` even incremented, so the monitor showed deletes flowing
+  while nothing was deleted. Tombstones are guarded identically. **This half needs Delete +
+  Deploy CDC infrastructure on an existing cdc-stack** (Start CDC alone does not re-register
+  a plugin); until then the prerequisite above is what protects that deployment.
+
+### Changed
+
+- The re-keyed-table notice on the CDC card is now a warning and no longer implies the tool
+  has handled it: it states that the widening happens during Full Load ONLY when that run
+  also provisions the slot, and points at the prerequisite that actually verifies the source.
+
 ## v0.1.515
 
 ### Fixed

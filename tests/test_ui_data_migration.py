@@ -26315,3 +26315,40 @@ def test_the_gate_grades_coverage_against_the_captured_tables_not_the_whole_sour
     assert _cdc_ui._pg_objects_gate_block(state, session, inventory, None) is None, (
         "a publication covering every CAPTURED table must not block"
     )
+
+
+def test_the_prerequisite_request_carries_the_rekey_map_from_state() -> None:
+    """The last hop of the fix, and the one no other test covered.
+
+    Proven by mutation: deleting this keyword from the request left the ENTIRE suite green
+    (4215 passed) while the check it feeds became permanently silent -- the check would exist,
+    be tested, and never grade anything in the running app. The map cannot be re-derived
+    inside the checker: it comes from the APPLIED target DDL, which only the UI has.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    tree = ast.parse(inspect.getsource(dm.build_data_migration_screen))
+    requests = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "PrerequisiteCheckRequest"
+    ]
+    assert len(requests) == 1, f"expected one prerequisite request, found {len(requests)}"
+    kwargs = {kw.arg: kw for kw in requests[0].keywords}
+    assert "message_key_columns" in kwargs, (
+        "the request must carry the connector's re-key map, or a re-keyed table's silently "
+        "lost DELETE is never graded"
+    )
+    # ...and sourced from the state the UI already recomputes on every render, not from a
+    # second derivation that could drift from what the connector is configured with.
+    names = {
+        sub.attr
+        for sub in ast.walk(kwargs["message_key_columns"].value)
+        if isinstance(sub, ast.Attribute)
+    }
+    assert "cdc_message_key_columns" in names, sorted(names)

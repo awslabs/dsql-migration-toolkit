@@ -1081,6 +1081,7 @@ _PREREQ_CATEGORY_BY_CHECK: dict[PrerequisiteCheckId, PrereqCategory] = {
     # these two here, but only by accident; stated so the map is exhaustive.
     PrerequisiteCheckId.TARGET_COLUMNS_LOADABLE: PrereqCategory.SCHEMA_TABLES,
     PrerequisiteCheckId.REPLICA_IDENTITY: PrereqCategory.SCHEMA_TABLES,
+    PrerequisiteCheckId.REPLICA_IDENTITY_COVERS_KEY: PrereqCategory.SCHEMA_TABLES,
     PrerequisiteCheckId.MSK_AVAILABLE: PrereqCategory.STREAMING,
     PrerequisiteCheckId.MSK_CONNECT_AVAILABLE: PrereqCategory.STREAMING,
 }

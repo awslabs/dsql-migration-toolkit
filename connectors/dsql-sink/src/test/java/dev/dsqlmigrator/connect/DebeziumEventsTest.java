@@ -5,10 +5,12 @@ package dev.dsqlmigrator.connect;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
 import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.sink.SinkRecord;
@@ -428,5 +430,62 @@ class DebeziumEventsTest {
     assertEquals(
         DebeziumEvents.TOAST_UNAVAILABLE_PLACEHOLDER,
         event.values().get(event.columns().indexOf("name")));
+  }
+
+  private static final Schema COMPOSITE_KEY =
+      SchemaBuilder.struct()
+          .name("Key")
+          .field("user_id", Schema.OPTIONAL_INT64_SCHEMA)
+          .field("id", Schema.INT64_SCHEMA)
+          .build();
+
+  @Test
+  void aDeleteWithANullKeyComponentIsRejectedRatherThanAppliedToZeroRows() {
+    // A table re-keyed onto the target primary key (user_id, id) whose PostgreSQL source is
+    // REPLICA IDENTITY DEFAULT: the DELETE before-image carries only the source PK (id), so
+    // user_id arrives null. The delete SQL renders "user_id" = ? AND "id" = ?, and a NULL
+    // makes that predicate UNKNOWN -- the statement removes nothing. The affected-row count
+    // is not inspected, so before this guard the record was acknowledged and the delete lost
+    // with no error, no log and no dead-letter. Live-observed on Aurora PostgreSQL 17.7.
+    Struct k = new Struct(COMPOSITE_KEY).put("user_id", null).put("id", 510L);
+    Struct env =
+        new Struct(ENVELOPE)
+            .put("op", "d")
+            .put("before", row(510L, "Bob"))
+            .put("source", source("orders"));
+    DataException thrown =
+        assertThrows(
+            DataException.class,
+            () -> DebeziumEvents.parse(record(k, env, "dsqlcdc.app.orders")));
+    // The message has to name the column AND the remedy: the cause is on the source, so an
+    // operator reading only the dead-letter must still know what to change.
+    assertTrue(thrown.getMessage().contains("user_id"), thrown.getMessage());
+    assertTrue(thrown.getMessage().contains("0 rows"), thrown.getMessage());
+    assertTrue(
+        thrown.getMessage().contains("REPLICA IDENTITY FULL"), thrown.getMessage());
+  }
+
+  @Test
+  void aTombstoneWithANullKeyComponentIsAlsoRejected() {
+    // Debezium sends a tombstone alongside the op=d envelope for one source DELETE, and it
+    // applies like any delete -- so the same null key would be the same silent no-op.
+    Struct k = new Struct(COMPOSITE_KEY).put("user_id", null).put("id", 510L);
+    assertThrows(
+        DataException.class, () -> DebeziumEvents.parse(record(k, null, "dsqlcdc.app.orders")));
+  }
+
+  @Test
+  void aCompositeKeyWithEveryComponentPresentStillDeletes() {
+    // The negative control: the guard must reject a NULL component, not composite keys.
+    Struct k = new Struct(COMPOSITE_KEY).put("user_id", 42L).put("id", 510L);
+    Struct env =
+        new Struct(ENVELOPE)
+            .put("op", "d")
+            .put("before", row(510L, "Bob"))
+            .put("source", source("orders"));
+    ChangeEvent event = DebeziumEvents.parse(record(k, env, "dsqlcdc.app.orders"));
+    assertTrue(event.isDelete());
+    assertEquals(List.of("user_id", "id"), event.pkColumns());
+    assertEquals(List.of(42L, 510L), event.pkValues());
   }
 }

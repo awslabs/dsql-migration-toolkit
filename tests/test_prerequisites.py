@@ -1972,3 +1972,264 @@ def test_the_dialect_grades_an_invalidated_slot_unusable() -> None:
     assert slot_usable_sql, "the slot-usable probe did not run"
     assert any("wal_status" in q for q in slot_usable_sql)
     assert any("coalesce" in q.lower() for q in slot_usable_sql)  # NULL-safe on PG<13
+
+
+def test_a_rekeyed_table_on_replica_identity_default_blocks_cdc() -> None:
+    """The reported silent DELETE loss, gated before any of it can happen.
+
+    Live-observed on Aurora PostgreSQL 17.7 at v0.1.515: one deleted `orders` row stayed on
+    the DSQL target -- no error, no DLQ entry, no log line -- while the child `order_items`
+    rows deleted from the same transaction replicated correctly. The controlled contrast is
+    the whole diagnosis: `orders` was the ONLY table with a re-keyed record key
+    (`message.key.columns=ecommerce\\.orders:user_id,id`, the target PK chosen in Schema
+    Conversion), and under REPLICA IDENTITY DEFAULT PostgreSQL limits a DELETE's before-image
+    to the SOURCE primary key `(id)` -- so `user_id` arrives NULL, the sink renders
+    `WHERE "user_id" = NULL AND "id" = ?`, and three-valued logic matches 0 rows.
+
+    The existing REPLICA_IDENTITY check graded this table PASS ("REPLICA IDENTITY is set for
+    change replication"), because it asks a different question and accepts 'd'.
+    """
+    from dsql_migrator.core.prerequisites_postgres import (
+        check_replica_identity,
+        check_replica_identity_covers_key,
+    )
+
+    table = TableDef(name="ecommerce.orders", primary_key=["id"])
+    facts = _pg_facts_healthy(replica_identity={"ecommerce.orders": "d"})
+
+    # The premise: the check that already existed says this source is fine.
+    assert check_replica_identity(table, facts).status is PrerequisiteStatus.PASS
+
+    blocked = check_replica_identity_covers_key(table, facts, ["user_id", "id"])
+    assert blocked is not None
+    assert blocked.status is PrerequisiteStatus.FAIL
+    assert blocked.required is True, "a silently-lost DELETE must block the start"
+    assert blocked.target == "ecommerce.orders"
+    # It must name the missing column, the consequence, and that INSERT/UPDATE are fine --
+    # otherwise the operator cannot tell this from the generic identity check above.
+    assert "user_id" in blocked.detail
+    assert "SILENTLY LOST" in blocked.detail
+    assert "UPDATE are unaffected" in blocked.detail
+    # The remediation is the one statement Debezium itself documents, and it must say that
+    # DEFAULT is not enough -- the neighbouring check's remedy says "the default is enough".
+    assert "REPLICA IDENTITY FULL" in blocked.remediation
+    assert "DEFAULT is not enough" in blocked.remediation
+    assert "ecommerce.orders" in blocked.remediation
+
+
+def test_replica_identity_full_satisfies_a_rekeyed_table() -> None:
+    """The verification point the reporter named: after the ALTER, the start is allowed."""
+    from dsql_migrator.core.prerequisites_postgres import (
+        check_replica_identity_covers_key,
+    )
+
+    table = TableDef(name="ecommerce.orders", primary_key=["id"])
+    ok = check_replica_identity_covers_key(
+        table,
+        _pg_facts_healthy(replica_identity={"ecommerce.orders": "f"}),
+        ["user_id", "id"],
+    )
+    assert ok is not None and ok.status is PrerequisiteStatus.PASS
+    assert "user_id" in ok.detail
+
+
+def test_the_key_coverage_check_stays_silent_when_there_is_nothing_to_grade() -> None:
+    """It must not add a row per table to every PostgreSQL report.
+
+    A table with no re-key (the default, "Keep source PK") and a re-key that merely REORDERS
+    the existing primary-key columns both need nothing from the source: the before-image
+    already carries those columns under DEFAULT.
+    """
+    from dsql_migrator.core.prerequisites_postgres import (
+        check_replica_identity_covers_key,
+    )
+
+    facts = _pg_facts_healthy(replica_identity={"app.t": "d"})
+    composite = TableDef(name="app.t", primary_key=["order_id", "id"])
+    # No re-key at all -- this is what order_items was, and why its deletes worked.
+    assert check_replica_identity_covers_key(composite, facts, []) is None
+    assert check_replica_identity_covers_key(composite, facts, ()) is None
+    # A pure REORDER of the source PK: every key column is still in the before-image.
+    assert (
+        check_replica_identity_covers_key(composite, facts, ["id", "order_id"]) is None
+    )
+
+
+def test_the_key_coverage_check_grades_partitions_not_the_parent() -> None:
+    """ALTER TABLE on a partitioned PARENT does not reach existing partitions.
+
+    PostgreSQL enforces and logs the LEAF's identity (live-verified elsewhere in this
+    module), so the tool's own ALTER on the parent leaves every leaf losing deletes. A parent
+    reading FULL is therefore not evidence: the leaves decide.
+    """
+    from dsql_migrator.core.prerequisites_postgres import (
+        check_replica_identity_covers_key,
+    )
+
+    table = TableDef(name="app.events", primary_key=["id"])
+    leaky = check_replica_identity_covers_key(
+        table,
+        _pg_facts_healthy(
+            replica_identity={"app.events": "f"},  # the parent looks fine
+            leaf_replica_identity={"app.events": {"app.events_p1": "d"}},
+        ),
+        ["tenant_id", "id"],
+    )
+    assert leaky is not None and leaky.status is PrerequisiteStatus.FAIL
+    assert "app.events_p1" in leaky.detail
+    assert "partition" in leaky.remediation.lower()
+    assert "does not propagate" in leaky.remediation
+
+    # Every leaf FULL -> nothing to report.
+    fine = check_replica_identity_covers_key(
+        table,
+        _pg_facts_healthy(
+            replica_identity={"app.events": "f"},
+            leaf_replica_identity={"app.events": {"app.events_p1": "f"}},
+        ),
+        ["tenant_id", "id"],
+    )
+    assert fine is not None and fine.status is PrerequisiteStatus.PASS
+
+
+def test_an_identity_index_is_not_accepted_for_a_rekeyed_table() -> None:
+    """'i' publishes only that index's columns, so the added key column can still be NULL.
+
+    Graded FAIL rather than probed for the index's column list: FULL is the remedy either
+    way, and a WARN would let the silent loss ship (the neighbouring check WARNs, which is
+    right for its question and wrong for this one).
+    """
+    from dsql_migrator.core.prerequisites_postgres import (
+        check_replica_identity_covers_key,
+    )
+
+    table = TableDef(name="app.t", primary_key=["id"])
+    for is_primary in (True, False):
+        r = check_replica_identity_covers_key(
+            table,
+            _pg_facts_healthy(
+                replica_identity={"app.t": "i"},
+                identity_index_valid={"app.t": True},
+                identity_index_is_primary={"app.t": is_primary},
+            ),
+            ["tenant_id", "id"],
+        )
+        assert r is not None and r.status is PrerequisiteStatus.FAIL, is_primary
+        assert "REPLICA IDENTITY FULL" in r.remediation
+
+    # An unreadable identity is unknown, not absent: INFO, never a block.
+    unknown = check_replica_identity_covers_key(
+        table, _pg_facts_healthy(replica_identity={}), ["tenant_id", "id"]
+    )
+    assert unknown is not None and unknown.status is PrerequisiteStatus.INFO
+    assert unknown.required is False
+
+
+def test_the_rekey_map_reaches_the_aggregate_report_and_blocks_it() -> None:
+    """End to end through the aggregator: the report cannot proceed, and only for that table."""
+    from dsql_migrator.core.models import PrerequisiteCheckId, PrerequisiteReport
+    from dsql_migrator.core.prerequisites_postgres import (
+        check_postgres_cdc_prerequisites,
+    )
+
+    tables = [
+        TableDef(name="ecommerce.orders", primary_key=["id"]),
+        TableDef(name="ecommerce.order_items", primary_key=["order_id", "id"]),
+    ]
+    facts = _pg_facts_healthy(
+        replica_identity={"ecommerce.orders": "d", "ecommerce.order_items": "d"}
+    )
+
+    # Without the map nothing is graded -- this is the pre-fix behaviour, and it is what
+    # makes the map (not a re-derivation inside the checker) the load-bearing input.
+    silent = check_postgres_cdc_prerequisites(facts, tables)
+    assert not [
+        r
+        for r in silent
+        if r.check_id is PrerequisiteCheckId.REPLICA_IDENTITY_COVERS_KEY
+    ]
+
+    graded = check_postgres_cdc_prerequisites(
+        facts, tables, message_key_columns={"ecommerce.orders": ["user_id", "id"]}
+    )
+    rows = [
+        r
+        for r in graded
+        if r.check_id is PrerequisiteCheckId.REPLICA_IDENTITY_COVERS_KEY
+    ]
+    assert len(rows) == 1, "only the re-keyed table is graded"
+    assert rows[0].target == "ecommerce.orders"
+    assert rows[0].status is PrerequisiteStatus.FAIL
+    assert PrerequisiteReport.build(MigrationMode.CDC, graded).can_proceed is False
+
+
+def test_the_checker_forwards_the_rekey_map() -> None:
+    """The map is useless if the checker drops it, and every pure-function test stays green.
+
+    Proven necessary by mutation: replacing the forward with ``message_key_columns=None``
+    left all eight direct tests of the check passing, because they call the aggregate
+    function rather than going through PrerequisiteCheckRequest.
+    """
+    from dataclasses import fields, replace
+
+    from dsql_migrator.core.models import (
+        MigrationMode,
+        PrerequisiteCheckId,
+        PrerequisiteCheckRequest,
+        PrerequisiteStatus,
+        SourceType,
+    )
+
+    class _Probe(_FakeSource):
+        def cdc_prerequisites(self, table_names, *, publication_name="", slot_name=""):
+            base = _pg_facts_ok()
+            return replace(
+                base, replica_identity={"app.orders": "d"}
+            ) if any(f.name == "replica_identity" for f in fields(base)) else base
+
+    def run(keys):
+        checker = PrerequisiteChecker(
+            source_probe=_Probe(cdc_facts=_pg_facts_ok()),
+            target_probe=_FakeTarget(existing={"app.orders"}),
+            msk_probe=_FakeMsk(),
+        )
+        return checker.check(
+            PrerequisiteCheckRequest(
+                mode=MigrationMode.CDC, tables=["app.orders"],
+                source_type=SourceType.POSTGRES,
+                message_key_columns=keys,
+            ),
+            tables=[_table("app.orders")],
+        )
+
+    # No re-key -> the check is absent entirely (no noise for the common case).
+    assert not [
+        r
+        for r in run({}).results
+        if r.check_id is PrerequisiteCheckId.REPLICA_IDENTITY_COVERS_KEY
+    ]
+
+    # Re-keyed -> the row is there, it FAILs, and the whole report is blocked.
+    report = run({"app.orders": ["user_id", "id"]})
+    row = _result(report, PrerequisiteCheckId.REPLICA_IDENTITY_COVERS_KEY)
+    assert row.status is PrerequisiteStatus.FAIL
+    assert report.can_proceed is False
+
+
+def test_the_request_accepts_the_rekey_map_at_all() -> None:
+    """PrerequisiteCheckRequest is extra="forbid", so an undeclared field is a hard error."""
+    from dsql_migrator.core.models import (
+        MigrationMode,
+        PrerequisiteCheckRequest,
+        SourceType,
+    )
+
+    req = PrerequisiteCheckRequest(
+        mode=MigrationMode.CDC,
+        tables=["app.orders"],
+        source_type=SourceType.POSTGRES,
+        message_key_columns={"app.orders": ["user_id", "id"]},
+    )
+    assert req.message_key_columns == {"app.orders": ["user_id", "id"]}
+    # Default is empty, so every existing caller keeps its current behaviour.
+    assert PrerequisiteCheckRequest(mode=MigrationMode.CDC).message_key_columns == {}

@@ -391,7 +391,21 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # a metric-only correction with no data-path effect. Bumped because the sink ZIP's CONTENT
 # changed, which means a live cdc-stack needs Delete + Deploy infra to pick it up (Start CDC
 # alone does not re-register the plugin).
-PLUGIN_VERSION = "v41"
+# v42: the sink REFUSES a delete whose record key has a NULL component instead of applying
+# it to zero rows. The delete SQL renders `"col" = ?` per key component, so a NULL makes the
+# predicate UNKNOWN and the statement removes nothing -- and the affected-row count was never
+# inspected, so the record was acknowledged, its offset committed, and the delete lost with no
+# error, no log and no dead-letter. Live-observed on Aurora PostgreSQL 17.7: a deleted row
+# stayed on the target while rows from the SAME transaction that were keyed on the source
+# primary key deleted correctly. The cause is upstream (a table re-keyed onto the target
+# primary key whose source REPLICA IDENTITY is DEFAULT, so the added key column is absent from
+# the DELETE before-image) and is now blocked by the REPLICA_IDENTITY_COVERS_KEY prerequisite;
+# this is the backstop, so a key the sink cannot use is LOUD (dead-lettered like any other
+# unusable record) rather than silently dropped. Tombstones are guarded identically. Bumped
+# because the sink ZIP's CONTENT changed: a live cdc-stack needs Delete + Deploy infra to pick
+# it up (Start CDC alone does not re-register the plugin), and until it does, the PREREQUISITE
+# is what protects that deployment.
+PLUGIN_VERSION = "v42"
 
 
 class S3ProvisionError(RuntimeError):

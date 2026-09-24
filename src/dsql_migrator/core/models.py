@@ -1008,6 +1008,11 @@ class PrerequisiteCheckId(str, Enum):
     REPLICATION_SLOTS = "REPLICATION_SLOTS"
     SOURCE_IS_WRITER = "SOURCE_IS_WRITER"
     REPLICA_IDENTITY = "REPLICA_IDENTITY"
+    # A DIFFERENT question from REPLICA_IDENTITY, with a different remedy: that one asks
+    # whether an identity is set at all and accepts DEFAULT; this one asks whether DEFAULT is
+    # ENOUGH, which it is not for a table whose CDC record key was re-keyed to the target
+    # primary key. Kept separate so the remediation can say "DEFAULT is not enough -- FULL".
+    REPLICA_IDENTITY_COVERS_KEY = "REPLICA_IDENTITY_COVERS_KEY"
     # The PostgreSQL analog of BINLOG_RETENTION: whether the source may discard the WAL
     # the Full-Load-time slot still needs, which would leave the same silent data gap at
     # the Full Load -> CDC handoff.
@@ -1100,6 +1105,12 @@ class PrerequisiteCheckRequest(BaseModel):
     provisions_replication: bool = True
     cdc_stack_name: str = ""
     cdc_start_resnapshots: bool = False
+    # The connector's re-key map: qualified table -> the TARGET primary key the change
+    # record is keyed on (``message.key.columns``). Needed because a re-keyed table's
+    # DELETE is silently lost unless the source's REPLICA IDENTITY can supply every key
+    # column, and the checker cannot derive this map -- it comes from the APPLIED target
+    # DDL. Empty means no table was re-keyed.
+    message_key_columns: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class PrerequisiteReport(BaseModel):

@@ -765,6 +765,18 @@ def build_data_migration_screen(
                     or getattr(migration_state, "cdc_stack_name", "")
                     or ""
                 ),
+                # The re-key map the connector will actually be configured with (already
+                # recomputed onto state on every render from the APPLIED target DDL). A
+                # re-keyed table whose source REPLICA IDENTITY cannot supply the added key
+                # column loses every DELETE silently, and only the source catalog can say
+                # whether it can -- so the check needs this map, not a re-derivation.
+                message_key_columns={
+                    table: list(cols)
+                    for table, cols in (
+                        migration_state.cdc_message_key_columns() or {}
+                    ).items()
+                    if table in set(names)
+                },
             )
             from nicegui import run
 
