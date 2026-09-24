@@ -4248,10 +4248,15 @@ def _start_cdc_deploy(
             # ONLY when the Full Load provisions the slot, which a Full-load-ONLY run does
             # not do. An operator who had in fact run Full Load therefore concluded it was
             # handled, started CDC, and lost every delete on the re-keyed table silently
-            # (live-observed on Aurora PostgreSQL 17.7). The authoritative gate is now the
-            # REPLICA_IDENTITY_COVERS_KEY prerequisite, which reads the source's actual
-            # relreplident and BLOCKS; this notice only points at it, so the two can never
-            # disagree about whether the source is ready.
+            # (live-observed on Aurora PostgreSQL 17.7).
+            #
+            # The authoritative gate is the REPLICA_IDENTITY_COVERS_KEY prerequisite, which
+            # reads the source's actual relreplident and BLOCKS; this notice only points at
+            # it. That claim was FALSE when first written (v0.1.516): the check existed and
+            # graded correctly, but cdc_prerequisite_block_reason gated on an ALLOWLIST of
+            # three check ids that did not include it, so Deploy and Start stayed enabled
+            # beside a red FAIL. The gate is a denylist as of v0.1.517, which is what makes
+            # this comment true -- do not re-assert it from a check's existence alone.
             render_notice(
                 ui,
                 tone="warning",

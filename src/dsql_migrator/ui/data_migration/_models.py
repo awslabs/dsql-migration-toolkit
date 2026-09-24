@@ -2343,6 +2343,34 @@ def cdc_prerequisite_block_header(
     return "A CDC prerequisite is failing"
 
 
+# Required FAILs that must NOT block the CDC actions. Everything not listed blocks -- see the
+# denylist rationale in cdc_prerequisite_block_reason.
+#
+# EXACTLY ONE entry, and the shortness is the point: an audit of all 23 check ids found that
+# every state which legitimately should not stop CDC is ALREADY graded required=False
+# (BINLOG_RETENTION, GTID_MODE, MSK_AVAILABLE, MSK_CONNECT_AVAILABLE, SELECT_GRANT_SCOPE, the
+# REPLICATION_GRANTS role downgrade, SLOT_WAL_RETENTION, the REPLICATION_SLOTS full-pool
+# states, CDC_REPLICATION_OBJECTS's SKIP/INFO/WARN, REPLICA_IDENTITY's non-PK-index WARN,
+# REPLICA_IDENTITY_COVERS_KEY's unreadable-identity INFO). So the denylist cannot over-block
+# by accident -- the required flag already carries that distinction.
+#
+# TARGET_SCHEMA_READY is the one exception, and it is deliberate on two grounds. Its
+# remediation points OFF this screen ("Apply converted DDL for X in Step 2"), and the Deploy
+# card sits at the bottom of Prerequisites precisely so the MSK create can overlap the Full
+# Load -- which is what applies that DDL. Blocking here would forfeit the overlap to report a
+# problem the Full Load guard already owns.
+#
+# TABLE_PRIMARY_KEY is deliberately NOT exempt, though an earlier draft of this list had it.
+# Its own remediation names CDC, not the load ("CDC keying and idempotent upsert require
+# it"), the sink throws "Cannot build upsert for table <t>: record has no key (pk) fields"
+# and dead-letters every record for that table, and the app's own phase taxonomy already tags
+# it "Full Load + CDC" -- so the panel was rendering "CDC: Blocked" for it while both buttons
+# stayed enabled.
+_CDC_NON_BLOCKING_FAILURES: frozenset = frozenset(
+    {PrerequisiteCheckId.TARGET_SCHEMA_READY}
+)
+
+
 def cdc_prerequisite_block_reason(
     report: Optional[PrerequisiteReport],
     *,
@@ -2456,4 +2484,30 @@ def cdc_prerequisite_block_reason(
         return " ".join(p for p in parts if p) or (
             "CDC's publication and replication slot do not exist on the source."
         )
+    # EVERY OTHER required FAIL, minus an explicit non-blocking list. This used to be a
+    # third allowlist entry, and that shape failed twice: CDC_REPLICATION_OBJECTS had to be
+    # retro-fitted in v0.1.509, and REPLICA_IDENTITY_COVERS_KEY (v0.1.516) was added to the
+    # checker WITHOUT being added here -- so it diagnosed a silently-lost DELETE in perfect
+    # detail while Deploy and Start stayed enabled, and a comment elsewhere claimed it was
+    # "the authoritative gate". An allowlist fails SILENTLY (a new blocking check enforces
+    # nothing); a denylist fails LOUDLY (an over-blocked button is reported in minutes). So
+    # the default is now to block, and anything that must not block says so by name below.
+    blocking = [
+        r
+        for r in report.results
+        if r.required
+        and r.status is PrerequisiteStatus.FAIL
+        and r.check_id not in _CDC_NON_BLOCKING_FAILURES
+    ]
+    if blocking:
+        first = blocking[0]
+        where = f" ({first.target})" if first.target else ""
+        parts = [
+            f"{first.title}{where} failed.",
+            (first.detail or "").strip(),
+            (first.remediation or "").strip(),
+        ]
+        if len(blocking) > 1:
+            parts.append(f"({len(blocking) - 1} more required check(s) also failed.)")
+        return " ".join(p for p in parts if p)
     return None

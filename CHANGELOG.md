@@ -34,6 +34,31 @@ All notable changes to this project are recorded here. This project follows
   source's full write rate. The common `max_slot_wal_keep_size=-1` (the PostgreSQL default,
   which this tool grades PASS for the handoff-gap risk) is exactly the unbounded case.
 
+- **A new required CDC check blocked nothing: the gate was an allowlist, and the list was not
+  updated.** `cdc_prerequisite_block_reason` deliberately does not gate on
+  `report.can_proceed` (that also covers Full-Load-only concerns), but it did so via an
+  allowlist of three check ids — so adding a blocking check meant editing two places, and the
+  second edit was missed twice. v0.1.516's `REPLICA_IDENTITY_COVERS_KEY` diagnosed a silently
+  lost DELETE in full detail while **Deploy CDC infrastructure and Start CDC stayed enabled
+  next to the red FAIL**, and a comment elsewhere claimed it was "the authoritative gate …
+  the two can never disagree". An audit of all 23 check ids found this was a class defect with
+  **13 members**, the worst being `REPLICA_IDENTITY` = `nothing`: proceeding there arms a write
+  outage on the production SOURCE (every UPDATE/DELETE on that table then ERRORs on the
+  publisher), and the tool's only other backstop misses a stale identity index, a partitioned
+  leaf, and the whole connector-autocreate path.
+
+  The gate is now a DENYLIST: every `required` FAIL blocks, with one documented exception
+  (`TARGET_SCHEMA_READY` — its remediation points off-screen to Schema Conversion, and the
+  Deploy card sits beside Prerequisites precisely so the MSK create can overlap the Full Load
+  that applies that DDL). An allowlist fails silently; a denylist fails loudly. The audit also
+  confirmed the inversion cannot over-block by accident: every state that legitimately should
+  not stop CDC is already graded `required=False`, which is the flag that carries "advisory".
+  `TABLE_PRIMARY_KEY` is deliberately NOT exempt — its own remediation names CDC, the sink
+  dead-letters every record for a keyless table, and the panel was already rendering "CDC:
+  Blocked" for it while both buttons stayed enabled. A test now drives every check id through
+  the gate, so the next blocking check is enforced by existing rather than by remembering, and
+  the disabled button's tooltip names the failing check, its table and its remediation.
+
 ### Changed
 
 - **The CDC teardown time estimate is engine-aware and comes from one place.** It was written

@@ -26373,3 +26373,133 @@ def test_the_prerequisite_request_carries_the_rekey_map_from_state() -> None:
         if isinstance(sub, ast.Attribute)
     }
     assert "cdc_message_key_columns" in names, sorted(names)
+
+
+def test_every_required_cdc_failure_blocks_except_the_documented_exception() -> None:
+    """The structural guard the allowlist never had — and the reason it failed twice.
+
+    ``cdc_prerequisite_block_reason`` gated on an ALLOWLIST of three check ids. Adding a new
+    blocking check therefore required editing two places, and the second edit was missed
+    twice: CDC_REPLICATION_OBJECTS had to be retro-fitted in v0.1.509, and
+    REPLICA_IDENTITY_COVERS_KEY (v0.1.516) was never added at all -- so it diagnosed a
+    silently-lost DELETE in full detail while Deploy CDC infrastructure and Start CDC stayed
+    enabled next to the red FAIL. An audit found 13 of the 14 required FAILs a CDC report can
+    carry were ignored, including REPLICA_IDENTITY='nothing', which ARMS a write outage on
+    the production SOURCE (every UPDATE/DELETE on that table then ERRORs on the publisher).
+
+    An allowlist fails SILENTLY; a denylist fails LOUDLY. This test drives EVERY check id
+    through the gate so a future blocking check is enforced by existing, not by remembering.
+    """
+    from dsql_migrator.core.models import (
+        MigrationMode,
+        PrerequisiteCheckId,
+        PrerequisiteReport,
+        PrerequisiteResult,
+        PrerequisiteStatus,
+    )
+    from dsql_migrator.ui.data_migration import cdc_prerequisite_block_reason
+    from dsql_migrator.ui.data_migration._models import _CDC_NON_BLOCKING_FAILURES
+
+    def report_with(check_id, *, status=PrerequisiteStatus.FAIL, required=True):
+        # The engine's change-stream check must PASS, or its own earlier branch fires first
+        # and this test would pass for the wrong reason.
+        passing_stream = PrerequisiteResult(
+            check_id=PrerequisiteCheckId.WAL_LEVEL_LOGICAL,
+            title="wal_level is logical",
+            status=PrerequisiteStatus.PASS,
+            required=True,
+        )
+        row = PrerequisiteResult(
+            check_id=check_id,
+            title=f"{check_id.value} row",
+            status=status,
+            required=required,
+            target="app.orders",
+            detail="detail text",
+            remediation="remediation text",
+        )
+        return PrerequisiteReport.build(MigrationMode.CDC, [passing_stream, row])
+
+    blocked, allowed = [], []
+    for check_id in PrerequisiteCheckId:
+        if check_id in (
+            PrerequisiteCheckId.WAL_LEVEL_LOGICAL,
+            PrerequisiteCheckId.BINLOG_ROW_FORMAT,
+        ):
+            continue  # graded by the change-stream branch above, not the sweep
+        reason = cdc_prerequisite_block_reason(report_with(check_id))
+        (blocked if reason else allowed).append(check_id)
+
+    # Exactly the documented exceptions are allowed through; everything else blocks.
+    assert set(allowed) == set(_CDC_NON_BLOCKING_FAILURES), (
+        f"unexpected non-blocking required FAILs: {sorted(c.value for c in allowed)}"
+    )
+    assert blocked, "the sweep must actually block something"
+
+    # The two that motivated this: the reported omission, and the most severe one the audit
+    # found. Named explicitly so a future exception-list edit cannot quietly re-admit them.
+    for must_block in (
+        PrerequisiteCheckId.REPLICA_IDENTITY_COVERS_KEY,
+        PrerequisiteCheckId.REPLICA_IDENTITY,
+        PrerequisiteCheckId.TABLE_PRIMARY_KEY,
+    ):
+        assert must_block in blocked, must_block
+
+    # A required=False FAIL never blocks: that flag is the ONLY thing carrying "advisory",
+    # and it is what makes the denylist safe (BINLOG_RETENTION, GTID_MODE, MSK_AVAILABLE,
+    # MSK_CONNECT_AVAILABLE, SLOT_WAL_RETENTION and the WARN branches of REPLICA_IDENTITY /
+    # CDC_REPLICATION_OBJECTS all rely on it). Asserted with a FAIL, not a WARN: a WARN is
+    # not a FAIL either way, so a WARN-based assertion survives dropping the required
+    # condition entirely (proven by mutation).
+    advisory = cdc_prerequisite_block_reason(
+        report_with(
+            PrerequisiteCheckId.REPLICA_IDENTITY,
+            status=PrerequisiteStatus.FAIL,
+            required=False,
+        )
+    )
+    assert advisory is None, "a required=False failure is advisory and must not block"
+
+
+def test_the_block_reason_names_the_failing_check_and_its_remedy() -> None:
+    """A disabled button's tooltip must say which check and what to do, not just "blocked"."""
+    from dsql_migrator.core.models import (
+        MigrationMode,
+        PrerequisiteCheckId,
+        PrerequisiteReport,
+        PrerequisiteResult,
+        PrerequisiteStatus,
+    )
+    from dsql_migrator.ui.data_migration import cdc_prerequisite_block_reason
+
+    rows = [
+        PrerequisiteResult(
+            check_id=PrerequisiteCheckId.WAL_LEVEL_LOGICAL,
+            title="wal_level is logical",
+            status=PrerequisiteStatus.PASS,
+            required=True,
+        ),
+        PrerequisiteResult(
+            check_id=PrerequisiteCheckId.REPLICA_IDENTITY_COVERS_KEY,
+            title="Re-keyed table's before-image carries the record key",
+            status=PrerequisiteStatus.FAIL,
+            required=True,
+            target="ecommerce.orders",
+            detail="user_id would be NULL in a DELETE",
+            remediation="Run ALTER TABLE ecommerce.orders REPLICA IDENTITY FULL",
+        ),
+        PrerequisiteResult(
+            check_id=PrerequisiteCheckId.SOURCE_IS_WRITER,
+            title="Source is the writer",
+            status=PrerequisiteStatus.FAIL,
+            required=True,
+        ),
+    ]
+    reason = cdc_prerequisite_block_reason(
+        PrerequisiteReport.build(MigrationMode.CDC, rows)
+    )
+    assert reason is not None
+    assert "Re-keyed table's before-image" in reason
+    assert "ecommerce.orders" in reason          # the per-table target
+    assert "REPLICA IDENTITY FULL" in reason     # the row's own remediation
+    assert "1 more required check(s) also failed" in reason
