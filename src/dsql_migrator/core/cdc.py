@@ -461,6 +461,16 @@ class SchemaDriftKind(str, Enum):
     DROP_COLUMN = "drop-column"    # 23502 not_null_violation: source dropped a column the target requires
     TYPE_CHANGE = "type-change"    # 42804 datatype_mismatch: source changed a column's type incompatibly
     MISSING_TABLE = "missing-table"  # 42P01 / 3F000: the TARGET table (or schema) is gone
+    # 23505 unique_violation. NOT a schema change and not target-schema loss -- a KEY-MODEL
+    # conflict, classified because it is the only signal that a row may have VANISHED from
+    # the target. It is what an UPDATE to a re-keyed table's leading key column produces:
+    # Debezium splits that into delete(old key) + create(new key), the two carry different
+    # keys so they land on different partitions and tasks with no ordering between them, and
+    # while both key forms coexist the composite uniqueness index over the ORIGINAL primary
+    # key rejects the insert. The sink classifies 23505 as permanent, so the insert is
+    # dead-lettered with its offset committed; if the delete then lands, the row is gone from
+    # the target with only an unclassified poison row to show for it.
+    UNIQUE_CONFLICT = "unique-conflict"  # 23505 unique_violation
 
 
 # SQLSTATE -> drift kind. Only STRUCTURAL rejections (tied to the row's column set
@@ -481,6 +491,7 @@ _DRIFT_BY_SQLSTATE: dict[str, SchemaDriftKind] = {
     "42804": SchemaDriftKind.TYPE_CHANGE,
     "42P01": SchemaDriftKind.MISSING_TABLE,
     "3F000": SchemaDriftKind.MISSING_TABLE,
+    "23505": SchemaDriftKind.UNIQUE_CONFLICT,
 }
 
 

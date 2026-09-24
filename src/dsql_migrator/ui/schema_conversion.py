@@ -3614,13 +3614,44 @@ def _render_pk_strategy_picker(
                 body=(
                     f"The target primary key becomes ({', '.join(key_order)}). This "
                     "spreads writes across DSQL partitions, but the application's "
-                    "queries, joins, and upserts must key on the full composite key, "
-                    f"and '{current_leading}' must be immutable (DSQL keys cannot "
-                    "change after creation). A UNIQUE index on the original key "
-                    f"({', '.join(table.primary_key)}) preserves its uniqueness. "
-                    "If you replicate this table with CDC, keep every key column in "
-                    "capture: change records are keyed on the composite key, so "
-                    "excluding one of its columns stops replication for this table."
+                    "queries, joins, and upserts must key on the full composite key. A "
+                    f"UNIQUE index on the original key ({', '.join(table.primary_key)}) "
+                    "preserves its uniqueness. If you replicate this table with CDC, keep "
+                    "every key column in capture: change records are keyed on the "
+                    "composite key, so excluding one of its columns stops replication for "
+                    "this table."
+                ),
+            )
+            # Its own notice, because the consequence is data loss and the previous wording
+            # buried it as a DSQL property ("keys cannot change after creation") -- which
+            # reads as a target-side rule about ALTER, not as a requirement on the SOURCE
+            # with a measured cost. What actually happens: Debezium replicates a change to a
+            # key column as a DELETE of the old key plus an INSERT of the new one. Those two
+            # records carry different keys, so they land on different topic partitions and
+            # different sink tasks with no ordering between them, and while both key forms
+            # coexist the UNIQUE index over the original primary key rejects the insert
+            # (SQLSTATE 23505). The sink treats that as permanent: the insert is
+            # dead-lettered with its offset committed, and if the delete lands afterwards the
+            # row is GONE from the target. REPLICA IDENTITY FULL does not help, and this one
+            # is not PostgreSQL-specific -- MySQL behaves the same way.
+            render_notice(
+                ui,
+                tone="warning",
+                icon="key_off",
+                header=(
+                    f"'{current_leading}' must be a column the application never updates"
+                ),
+                body=(
+                    "Pick a column whose value is fixed for the life of the row (a tenant "
+                    "or customer id, a creation-date bucket). If the source ever UPDATEs "
+                    f"'{current_leading}', CDC replicates that as a delete of the old key "
+                    "plus an insert of the new one; the two go to different partitions with "
+                    "no ordering between them, and the unique index over the original key "
+                    "rejects the insert while both still exist. That insert is "
+                    "dead-lettered permanently, so the row can disappear from the target. "
+                    "It applies to both source engines, and no source setting prevents it — "
+                    "only choosing an immutable column does. Aurora DSQL also cannot change "
+                    "a key value after the row is created."
                 ),
             )
         elif is_identity:

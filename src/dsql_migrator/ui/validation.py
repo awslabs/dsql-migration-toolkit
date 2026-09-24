@@ -567,6 +567,19 @@ class ValidationSummary:
         )
 
     @property
+    def has_extra_target_rows(self) -> bool:
+        """Does the target hold rows the source does not? Pure.
+
+        The signature of a DELETE that never applied -- the one difference profile the
+        idempotent-reload runbook CANNOT fix. ``INSERT ... ON CONFLICT`` only fills missing
+        rows; it never removes one, so telling an operator to "re-run Full Load + CDC to
+        backfill the gap" for an extra row sends them through ~30 minutes of reload to
+        arrive at the identical mismatch. Clearing an extra row needs the target table
+        dropped and reloaded (or the row deleted), which is a different runbook.
+        """
+        return self.extra_on_target > 0
+
+    @property
     def unexplained_mismatched_tables(self) -> int:
         """Mismatched tables whose shortfall is NOT fully explained by dropped rows.
 
@@ -4512,6 +4525,34 @@ def _render_recovery_section(
                     "object out to Amazon S3 and store a reference — then reload those "
                     "tables; or accept the gap deliberately and cut over knowing those "
                     "rows will be absent from the target."
+                ),
+            )
+        elif summary.has_extra_target_rows:
+            # A THIRD recovery, because the reload runbook below is not merely unhelpful
+            # here -- it cannot work. The target holding rows the source does not is the
+            # signature of a DELETE that never applied, and INSERT ... ON CONFLICT only
+            # FILLS rows; nothing in a reload removes one. Sending the operator through a
+            # ~30-minute Full Load to reach the identical mismatch is worse than saying
+            # nothing. It also names the likely cause, because an extra row is otherwise
+            # undiagnosable: the count is printed, the PK is enumerated, and nothing
+            # connects either to a lost delete.
+            render_notice(
+                ui,
+                tone="warning",
+                header="The target holds rows the source does not — a delete did not apply",
+                body=(
+                    f"{summary.extra_on_target} row(s) exist on the target and not on the "
+                    "source. Re-running the Full Load will NOT clear them: it is "
+                    "idempotent (INSERT ... ON CONFLICT), so it only fills missing rows "
+                    "and never removes one. The usual cause is a DELETE that CDC applied "
+                    "to zero rows — on a PostgreSQL source, a table whose CDC record key "
+                    "was re-keyed (Schema Conversion's Composite key) while the source's "
+                    "REPLICA IDENTITY is DEFAULT, so the added key column arrives NULL. "
+                    "Check the CDC prerequisites for that table, and check the dead-letter "
+                    "queue for a unique-violation entry (an UPDATE to a re-keyed table's "
+                    "leading key column can also drop the row). To clear the extra rows, "
+                    "re-run the Full Load and choose to DROP that table when it asks — "
+                    "that rebuilds it from the source instead of adding to it."
                 ),
             )
         else:

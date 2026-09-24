@@ -51,6 +51,33 @@ All notable changes to this project are recorded here. This project follows
 
 ### Changed
 
+- **A re-keyed table's leading key column must be one the application never updates, and the
+  picker now says so with the real cost.** It said "'<col>' must be immutable (DSQL keys
+  cannot change after creation)" — which reads as a target-side rule about ALTER, so the
+  cost that actually matters was invisible. Debezium replicates a change to a key column as a
+  DELETE of the old key plus an INSERT of the new one. The two records carry different keys,
+  so they land on different topic partitions and different sink tasks with no ordering between
+  them, and while both key forms coexist the UNIQUE index over the ORIGINAL primary key
+  rejects the insert (SQLSTATE 23505). The sink treats 23505 as permanent: the insert is
+  dead-lettered with its offset committed, and if the delete lands afterwards **the row is
+  gone from the target**. This applies to BOTH source engines and no source setting prevents
+  it — `REPLICA IDENTITY FULL` does not help — so the only protection is choosing a column
+  whose value is fixed for the life of the row, which the notice now says, with examples.
+- **SQLSTATE 23505 is classified instead of rendering as an anonymous poison row.** It gets
+  its own kind (`unique-conflict`), excluded from the "source schema change" banner because it
+  is not one. The label deliberately does not assert a cause — any unique index raises 23505,
+  including an out-of-band duplicate — but the body says the thing an unclassified DLQ entry
+  cannot: a row may now be MISSING from the target, and what to check.
+- **Validation no longer prescribes a recovery that cannot work.** Rows present on the target
+  and absent from the source — the signature of a DELETE that never applied — fell into the
+  one non-quarantine branch, which told the operator to "Re-run Full Load + CDC to backfill
+  the gap … The Full Load is idempotent (INSERT ... ON CONFLICT) — it only fills missing
+  rows". That is exactly why it cannot remove an extra row: following it means a full reload
+  to reach the identical mismatch. Extra target rows now get their own guidance that states
+  the count, why a reload will not clear it, the likely causes (a re-keyed table whose source
+  REPLICA IDENTITY is DEFAULT; an UPDATE to a re-keyed leading key column) and the remedy that
+  does work (re-run the Full Load and choose to DROP that table). The missing-rows and
+  permanently-quarantined branches are unchanged.
 - The re-keyed-table notice on the CDC card is now a warning and no longer implies the tool
   has handled it: it states that the widening happens during Full Load ONLY when that run
   also provisions the slot, and points at the prerequisite that actually verifies the source.

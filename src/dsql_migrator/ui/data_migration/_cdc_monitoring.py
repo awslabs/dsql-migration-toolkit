@@ -1058,10 +1058,24 @@ _DRIFT_LABELS: dict[str, tuple[str, str]] = {
         "recreated (a Schema Conversion REPLACE) or dropped out of band — so DSQL "
         "rejected every row (SQLSTATE 42P01)",
     ),
+    # Deliberately does NOT assert a cause: 23505 is raised by any unique index, so an
+    # out-of-band duplicate raises it too. It names the realistic causes and, above all,
+    # that a row may be MISSING -- the one thing an unclassified poison row cannot say.
+    "unique-conflict": (
+        "a unique constraint rejected the row",
+        "Aurora DSQL refused the row because a unique index already holds its values "
+        "(SQLSTATE 23505). On a table whose CDC key was re-keyed (Schema Conversion's "
+        "Composite key), this is what an UPDATE to the leading key column produces: it is "
+        "replicated as a delete of the old key plus an insert of the new one, and while "
+        "both exist the uniqueness index over the original primary key rejects the insert "
+        "— so that row can end up MISSING from the target. Validate the table and reload "
+        "it if a row is short; the leading key column must be one the application never "
+        "updates",
+    ),
 }
 
 # Drift kinds that are NOT a source DDL change, so the banner must not call them one.
-_TARGET_SIDE_DRIFT_KINDS = frozenset({"missing-table"})
+_TARGET_SIDE_DRIFT_KINDS = frozenset({"missing-table", "unique-conflict"})
 
 
 async def _open_add_column_dialog(ui, session, table: str, on_refresh=None) -> None:

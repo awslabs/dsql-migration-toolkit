@@ -4773,7 +4773,7 @@ def test_verdict_says_what_is_outstanding_instead_of_review_the_failures() -> No
 # ---------------------------------------------------------------------------
 
 
-def _release_summary(*, is_match, explained=(), rows=0, mismatched=0, errored=0):
+def _release_summary(*, is_match, explained=(), rows=0, mismatched=0, errored=0, extra=0):
     from dsql_migrator.ui.validation import ValidationSummary
 
     return ValidationSummary(
@@ -4788,7 +4788,7 @@ def _release_summary(*, is_match, explained=(), rows=0, mismatched=0, errored=0)
         reconciled_tables=8,
         inconsistent_tables=mismatched,
         missing_on_target=rows,
-        extra_on_target=0,
+        extra_on_target=extra,
         errored_tables=errored,
         ready_for_cutover=is_match,
         quarantine_explained_tables=explained,
@@ -6071,3 +6071,61 @@ def test_cancelling_validation_is_recorded_once_from_the_click() -> None:
     block = src[i:i + 600]
     assert "read only" in block or "read-only" in block
     assert "no verdict is produced" in block
+
+
+def test_an_extra_target_row_is_not_sent_through_a_reload_that_cannot_fix_it() -> None:
+    """The recovery card prescribed a remedy that is arithmetically incapable of working.
+
+    Rows on the target that are not on the source are the signature of a DELETE that never
+    applied. The card's only non-quarantine branch told the operator to "Re-run Full Load +
+    CDC to backfill the gap … The Full Load is idempotent (INSERT ... ON CONFLICT) — it only
+    fills missing rows" -- which is exactly why it cannot remove one. Following it means ~30
+    minutes of reload to reach the identical mismatch.
+    """
+    from dsql_migrator.ui.validation import _render_recovery_section
+
+    ui = _CopyUi()
+    _render_recovery_section(
+        ui, _release_summary(is_match=False, mismatched=1, extra=1), _drift_na()
+    )
+    body = ui.body()
+    # The remedy that cannot work must NOT be the guidance here.
+    assert "Re-run Full Load + CDC to backfill the gap" not in body
+    # The instruction, not the phrase: this branch itself explains that a reload only
+    # FILLS rows, which is WHY it cannot clear an extra one -- so what must be absent is
+    # being told to go and do it.
+    assert "Backfill them by re-running the migration" not in body
+    # It states the state, the count, why a reload will not clear it, and the remedy that
+    # will (a DROP + reload of that table).
+    assert "a delete did not apply" in body
+    assert "1 row(s) exist on the target and not on the source" in body
+    assert "never removes one" in body
+    assert "DROP" in body
+    # ...and names the likely cause, because an extra row is otherwise undiagnosable.
+    assert "REPLICA IDENTITY" in body
+    assert "dead-letter" in body
+
+    # The ordinary missing-rows gap keeps the reload runbook, unchanged.
+    plain = _CopyUi()
+    _render_recovery_section(
+        plain, _release_summary(is_match=False, mismatched=1), _drift_na()
+    )
+    assert "Re-run Full Load + CDC to backfill the gap" in plain.body()
+
+    # A fully-explained quarantine gap still wins over the extra-row branch: those rows hit
+    # a permanent limit and "accept or shrink" remains the honest advice.
+    explained = _CopyUi()
+    _render_recovery_section(
+        explained,
+        _release_summary(is_match=False, mismatched=1, explained=("app.t",), rows=3),
+        _drift_na(),
+    )
+    assert "can't be stored as-is" in explained.body()
+
+
+def test_has_extra_target_rows_is_the_pure_signal() -> None:
+    from dsql_migrator.ui.validation import ValidationSummary  # noqa: F401
+
+    assert _release_summary(is_match=False, extra=2).has_extra_target_rows is True
+    assert _release_summary(is_match=False, extra=0).has_extra_target_rows is False
+    assert _release_summary(is_match=True).has_extra_target_rows is False

@@ -4769,3 +4769,44 @@ def test_a_render_before_connecting_does_not_poison_the_conversion_memo() -> Non
         "changed -- correct labels over a corrupt target, the worst failure mode"
     )
     assert "'''x''::text'" not in body
+
+
+def test_the_composite_key_picker_states_the_immutability_requirement_and_its_cost() -> None:
+    """The requirement was buried as a DSQL property, so its real cost was invisible.
+
+    The old wording was "'<col>' must be immutable (DSQL keys cannot change after
+    creation)" -- which reads as a target-side rule about ALTER. The actual cost is on the
+    SOURCE: Debezium replicates a change to a key column as a DELETE of the old key plus an
+    INSERT of the new one. Those two records carry different keys, so they land on different
+    topic partitions and different sink tasks with no ordering between them, and while both
+    key forms coexist the UNIQUE index over the original primary key rejects the insert
+    (23505). The sink treats that as permanent, dead-letters the insert with its offset
+    committed, and if the delete lands afterwards the ROW IS GONE. REPLICA IDENTITY FULL does
+    not help and this is not PostgreSQL-specific.
+    """
+    ui = _PickerUi()
+    state = SchemaConversionState()
+    table = _pk_table()
+    state.set_edited_target_ddl(
+        "orders",
+        render_target_ddl(
+            build_composite_conversion(SchemaConverter(), table, "customer_id")
+        ),
+    )
+    _render_pk_strategy_picker(ui, table, state, lambda: None)
+    body = ui.body()
+
+    assert "never updates" in body, body[:500]
+    # The consequence, stated as loss -- not as a DSQL ALTER limitation.
+    assert "delete of the old key" in body
+    assert "disappear from the target" in body
+    assert "dead-lettered" in body
+    # Engine-agnostic, and no source setting saves you: both are load-bearing, because an
+    # operator who just read the REPLICA IDENTITY guidance would otherwise assume FULL fixes
+    # this too.
+    assert "both source engines" in body
+    assert "no source setting prevents it" in body
+    # It must offer what a good column looks like, not only a prohibition.
+    assert "tenant" in body or "customer id" in body
+    # The surviving composite guidance is unchanged (queries must use the new key).
+    assert "composite key" in body
