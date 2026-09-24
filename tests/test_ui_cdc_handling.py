@@ -856,14 +856,24 @@ def test_cdc_resume_signal_is_engine_aware() -> None:
 class _FakeEl:
     def __init__(self, sink):
         self._sink = sink
+        # Recorded, not discarded: whether a control is DISABLED and what its tooltip says is
+        # the difference between "shown with the reason" and "silently dead" -- a distinction
+        # several of this repo's UI rules turn on.
+        self.props_seen: list[str] = []
+        self.on_click = None
+        self.text = ""
 
     def classes(self, *_a, **_k):
         return self
 
     def props(self, *_a, **_k):
+        if _a:
+            self.props_seen.append(str(_a[0]))
         return self
 
     def tooltip(self, text="", *_a, **_k):
+        if text and self._sink is not None:
+            self._sink.tooltips.append(str(text))
         return self
 
     def __enter__(self):
@@ -879,6 +889,10 @@ class _FakeUi:
     def __init__(self):
         self.texts: list[str] = []
         self.radios: list[dict] = []
+        # Buttons and hover-only text, kept apart from `texts`: a test that drives a click has
+        # to identify WHICH action, and guidance must not live only in a tooltip.
+        self.buttons: list = []
+        self.tooltips: list[str] = []
 
     def _el(self):
         return _FakeEl(self)
@@ -918,9 +932,13 @@ class _FakeUi:
         self.texts.append(str(label))
         return self._el()
 
-    def button(self, text="", *_a, **_k):
+    def button(self, text="", *_a, on_click=None, **_k):
         self.texts.append(str(text))
-        return self._el()
+        el = self._el()
+        el.on_click = on_click
+        el.text = str(text)
+        self.buttons.append(el)
+        return el
 
     def notify(self, *_a, **_k):
         return None
@@ -1144,3 +1162,134 @@ def test_the_dlq_panel_points_at_validation_and_names_the_blind_spot() -> None:
     quiet = _FakeUi()
     _render_cdc_dlq_breakdown(quiet, SimpleNamespace(error_summary=None))
     assert "Validation" not in " ".join(quiet.texts)
+
+
+def _oversized_record(table: str, pk: str, column: str = "content"):
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.models import DataErrorRecord
+
+    return DataErrorRecord(
+        table=table,
+        pk=pk,
+        error_code="OVERSIZED_VALUE",
+        message=(
+            f"DLQ offset=6: Value for column '{column}' exceeds DSQL's 1048576-byte "
+            "limit; quarantined."
+        ),
+        occurred_at=datetime.now(timezone.utc),
+    )
+
+
+def test_the_oversized_quarantine_groups_only_the_class_that_has_a_remedy() -> None:
+    """Offering "exclude the column" for a duplicate-key or a drift rejection would be a lie.
+
+    Only the per-value-limit class has an in-app remedy, and the sink NAMES the column in its
+    reason -- better evidence than the Full Load has for the same recovery, where the driver
+    message names the TYPE and the picker has to infer candidates from a type token.
+    """
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import DataErrorRecord
+    from dsql_migrator.ui.data_migration._cdc_monitoring import (
+        cdc_oversized_quarantine_groups,
+    )
+
+    records = [
+        _oversized_record("ecommerce.product_media", "id=1"),
+        _oversized_record("ecommerce.product_media", "id=2"),
+        _oversized_record("ecommerce.product_media", "id=1"),  # duplicate pk, deduped
+        DataErrorRecord(
+            table="ecommerce.orders", pk="id=510", error_code="23505",
+            message="DLQ offset=7: duplicate key",
+            occurred_at=datetime.now(timezone.utc),
+        ),
+        # A record whose TABLE is unusable: grouping must skip it rather than render a card
+        # with no table to act on. (The model forbids an empty table, so this models the
+        # defensive path with a stand-in object -- the grouper reads attributes, not a model.)
+        SimpleNamespace(table="", pk="id=9", error_code="OVERSIZED_VALUE", message="x"),
+    ]
+    groups = cdc_oversized_quarantine_groups(records)
+    assert len(groups) == 1, groups
+    table, pks, columns = groups[0]
+    assert table == "ecommerce.product_media"
+    assert pks == ["id=1", "id=2"]
+    assert columns == ["content"]
+    # Nothing to group -> nothing rendered at all.
+    assert cdc_oversized_quarantine_groups([]) == []
+    assert cdc_oversized_quarantine_groups(None) == []
+
+
+def test_the_cdc_quarantine_card_offers_the_in_app_recovery() -> None:
+    """The CDC dead-letter surface was read-only while the Full Load had a recovery card.
+
+    So an operator who hit the 1 MiB limit on the load could fix it in-app and one who hit it
+    on the stream could not -- and the AI assistant, asked what to do, filled that vacuum by
+    telling them to hand-edit column.exclude.list on the Debezium connector, which this UI
+    cannot do and does not need (the tool owns that setting).
+    """
+    from dsql_migrator.ui.data_migration._cdc_monitoring import (
+        _render_cdc_oversized_recovery,
+    )
+
+    class _State:
+        pass
+
+    ui = _FakeUi()
+    captured: list = []
+    _render_cdc_oversized_recovery(
+        ui,
+        _State(),
+        "log",
+        lob_candidates_for=lambda _t: [("content", "bytea")],
+        exclude_columns=lambda t, c: captured.append((t, c)),
+        block_reason=lambda *_a: None,
+        records=[_oversized_record("ecommerce.product_media", "id=1")],
+    )
+    body = " ".join(ui.texts)
+    assert "ecommerce.product_media" in body
+    assert "id=1" in body                      # the dropped row is named
+    assert "never retried" in body             # permanent, not a retry
+    assert "Exclude column…" in body           # the action exists
+    btn = next((b for b in ui.buttons if "Exclude column" in getattr(b, "text", "")), None)
+    assert btn is not None and btn.on_click is not None
+
+
+def test_the_exclude_button_is_disabled_while_cdc_streams_not_hidden() -> None:
+    """While the sink streams, the exclusion is genuinely unsafe -- its connectors committed
+    offsets under the CURRENT column set. So Stop CDC is step 1 of the runbook, and the button
+    says so instead of disappearing (a silently absent control reads as a missing feature).
+    """
+    from dsql_migrator.ui.data_migration._cdc_monitoring import (
+        _render_cdc_oversized_recovery,
+    )
+
+    ui = _FakeUi()
+    reason = "CDC is streaming — stop CDC first."
+    _render_cdc_oversized_recovery(
+        ui,
+        object(),
+        "log",
+        lob_candidates_for=lambda _t: [("content", "bytea")],
+        exclude_columns=lambda *_a: None,
+        block_reason=lambda *_a: reason,
+        records=[_oversized_record("ecommerce.product_media", "id=1")],
+    )
+    assert "Exclude column…" in " ".join(ui.texts), "the control must stay visible"
+    btn = next(b for b in ui.buttons if "Exclude column" in getattr(b, "text", ""))
+    assert any("disable" in p for p in btn.props_seen), btn.props_seen
+    assert reason in ui.tooltips, ui.tooltips
+
+
+def test_the_card_renders_nothing_without_an_in_app_action() -> None:
+    """No exclusion handler wired (AI off / older caller) -> no dead card."""
+    from dsql_migrator.ui.data_migration._cdc_monitoring import (
+        _render_cdc_oversized_recovery,
+    )
+
+    ui = _FakeUi()
+    _render_cdc_oversized_recovery(
+        ui, object(), "log", records=[_oversized_record("t", "id=1")]
+    )
+    assert ui.texts == []

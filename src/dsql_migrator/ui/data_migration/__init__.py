@@ -1464,6 +1464,34 @@ def build_data_migration_screen(
             # call inside it shipped.
             lob_candidates_for = make_lob_candidates_for(inventory, session)
 
+            def exclude_cdc_capture_columns(
+                table_name: str, columns: Sequence[str]
+            ) -> None:
+                """Record a LOB column exclusion from the CDC dead-letter recovery card.
+
+                The exclusion ONLY -- deliberately not bundled with a reload the way the Full
+                Load's action is. For a CDC quarantine the reload is step 3 of a four-step
+                runbook whose FIRST step is Stop CDC (the streaming connectors have already
+                committed offsets under the current column set), and the card spells those out
+                rather than pretending one click finished the job. Same guard as the bundled
+                action, so this cannot be used to sneak an exclusion past a live pipeline.
+                """
+                blocked = exclude_and_reload_block_reason(migration_state, job_manager)
+                if blocked:
+                    ui.notify(blocked, type="warning", position="top")
+                    return
+                if not columns:
+                    return
+                for column in columns:
+                    migration_state.set_lob_exclusion(table_name, column, True)
+                ui.notify(
+                    f"{table_name}: {', '.join(columns)} excluded at capture. Next: reload "
+                    "this table (choose DROP), then start CDC again.",
+                    type="warning",
+                    position="top",
+                )
+                refresh()
+
             def exclude_lob_and_reload(table_name: str, columns: Sequence[str]) -> None:
                 """Exclude oversized-LOB column(s) AND reload the table, as ONE action.
 
@@ -2292,6 +2320,12 @@ def build_data_migration_screen(
                             # committed data under an exclusion set (survives a switch
                             # to cdc_only): FULL_LOAD stays DONE across the switch.
                             full_load_status=status,
+                            # The DLQ's in-app recovery for rows dropped over DSQL's
+                            # per-value limit: the candidate lookup needs the inventory and
+                            # the exclusion writes migration-wide state, so both come from
+                            # here rather than being re-derived in the monitoring panel.
+                            lob_candidates_for=lob_candidates_for,
+                            exclude_columns=exclude_cdc_capture_columns,
                         )
                         with ui.row().classes(
                             "!flex w-full justify-start items-center"

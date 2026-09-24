@@ -5,6 +5,51 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.519
+
+### Fixed
+
+- **The AI DBA told operators to hand-edit the Debezium connector, which this UI cannot do and
+  does not need.** Asked what to do about a dead-lettered oversized row, it replied with
+  `"column.exclude.list": "ecommerce.product_media.content"` and "restart the connector" —
+  advice the operator can only follow in the AWS console, for a setting **this tool owns**: it
+  writes `column.exclude.list` itself from the migration's LOB exclusion. Its CDC grounding
+  simply did not know that, and did not know the per-value-limit quarantine class at all (it
+  listed 22P02 / 22001 / 23505 / 23502 and nothing about the 1 MiB limit), so it treated an
+  oversized row as retryable. The grounding now states the class and its permanence, forbids
+  hand-editing connector config, names the in-app control instead, and carries the ordered
+  runbook.
+
+  It also corrects a premise the codebase had recorded as fact: `ColumnExcludeList` is **not**
+  baked in at connector-create time. Start CDC re-sends it on every pass (verified by executing
+  the real parameter builders — it reaches `submit_update` and `config_changed` returns True
+  against a stack carrying the old value), so a new exclusion reaches a **running** pipeline
+  with no cdc-stack teardown.
+
+### Added
+
+- **The CDC dead-letter surface can now recover rows dropped over DSQL's 1 MiB per-value
+  limit.** It was read-only, so an operator who hit that limit during the Full Load could fix
+  it in-app ("Exclude column & reload") and one who hit it on the stream could not — which is
+  the vacuum the AI advice above was filling. The DLQ panel now shows one amber card per
+  affected table with the dropped rows' primary keys and an **Exclude column…** action, and it
+  renders only for the one quarantine class that HAS an in-app remedy (offering it for a
+  duplicate-key or a drift rejection would be a lie).
+
+  The picker pre-ticks exactly the right column, which the CDC path can do better than the Full
+  Load one: the sink NAMES the offending column (`Value for column 'content' exceeds …`),
+  whereas the Full Load only has the driver's message, which names the TYPE and forces the
+  picker to infer candidates from a type token.
+
+  Deliberately **not** a one-click "exclude and reload" like the Full Load's, because the order
+  matters and two steps are other buttons: **(1) Stop CDC** — its connectors already committed
+  offsets under the current column set, and a reload under a live sink is forced into APPEND
+  mode, so rows already on the target would keep the old column set; (2) exclude the column;
+  (3) reload the table choosing DROP; (4) Start CDC again, which re-sends the new capture
+  config. The dialog does the one step it can do atomically and spells out the rest in order,
+  and the action itself respects the existing guard — while CDC streams the button is shown
+  **disabled** with the reason, never hidden.
+
 ## v0.1.518
 
 ### Fixed

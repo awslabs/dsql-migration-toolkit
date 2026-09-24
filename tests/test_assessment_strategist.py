@@ -1042,3 +1042,60 @@ def test_strategist_source_engine_setter_pins_engine() -> None:
     # A falsy value falls back to the MySQL default.
     strategist.source_engine = ""
     assert strategist.source_engine == "MySQL"
+
+
+def test_the_cdc_chat_never_advises_hand_editing_the_connector_config() -> None:
+    """Observed: asked about a dead-lettered oversized row, the AI DBA replied
+
+        ② Debezium 소스 커넥터 설정에서 content 컬럼 제외 … 커넥터를 재시작하세요
+           "column.exclude.list": "ecommerce.product_media.content"
+
+    That is not doable from this UI and it is not necessary: THE TOOL OWNS that setting. It
+    writes column.exclude.list itself from the migration's LOB exclusion and re-sends it on
+    every Start CDC, so the change reaches a RUNNING pipeline with no cdc-stack teardown and no
+    manual connector restart (verified by executing the real parameter builders:
+    ColumnExcludeList lands in params.filled, in the start-pass overrides, and config_changed
+    returns True against a stack carrying the old value).
+
+    Advice the operator cannot execute is worse than no advice -- it sends them to the AWS
+    console for a control this screen already has.
+    """
+    from dsql_migrator.core.assessment_strategist import build_cdc_error_chat_system
+
+    system = build_cdc_error_chat_system("DLQ depth: 3", scope="dlq")
+
+    # The prohibition is explicit, and names the thing the model kept reaching for.
+    assert "NEVER tell the operator to hand-edit connector configuration" in system
+    assert "column.exclude.list" in system
+    assert "THIS TOOL OWNS" in system
+    # ...and it corrects the premise that made the bad advice look necessary.
+    assert "re-sends it on EVERY Start CDC" in system
+    assert "no cdc-stack teardown" in system
+    # It must point at the IN-APP control instead of leaving a vacuum.
+    assert "Exclude-column action on the quarantine card" in system
+
+
+def test_the_cdc_chat_knows_the_oversized_value_class_and_its_order() -> None:
+    """The grounding listed 22P02 / 22001 / 23505 / 23502 and NOT the 1 MiB per-value limit --
+    which is the most common quarantine in practice and the only one with a permanent verdict.
+
+    Without it the model treated an oversized row as retryable. The order of the recovery also
+    matters and is load-bearing: a reload while the sink is live is forced into APPEND mode, so
+    the rows already on the target would keep the old column set.
+    """
+    from dsql_migrator.core.assessment_strategist import build_cdc_error_chat_system
+
+    system = build_cdc_error_chat_system("DLQ depth: 3", scope="dlq")
+
+    assert "OVERSIZED_VALUE" in system
+    assert "1 MiB per-value limit" in system
+    # Permanent, and the model must not suggest otherwise.
+    assert "NEVER retried" in system
+    assert "do not suggest retrying" in system
+    # The ordered runbook, including WHY Stop CDC comes before the reload.
+    assert "Stop CDC" in system
+    assert "APPEND mode" in system
+    assert "choosing DROP" in system
+    # The migration-wide side effect is disclosed, not buried.
+    assert "MIGRATION-WIDE" in system
+    assert "Validation" in system

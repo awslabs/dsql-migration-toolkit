@@ -339,6 +339,8 @@ def _render_cdc_step(
     full_load_status: "Optional[StepStatus]" = None,
     cdc_ai_opener=None,
     ai_post_event=None,
+    lob_candidates_for=None,
+    exclude_columns=None,
 ) -> None:
     """Render the CDC step in user-journey order: decide -> prepare -> start ->
     monitor -> reference.
@@ -424,6 +426,11 @@ def _render_cdc_step(
     _render_cdc_live_monitoring(
         ui, migration_state, job_manager, session=session,
         cdc_ai_opener=cdc_ai_opener, ai_post_event=ai_post_event,
+        # The in-app recovery for rows CDC dropped over DSQL's per-value limit. Threaded from
+        # the caller because the candidate lookup needs the INVENTORY and the exclusion writes
+        # migration-wide state; the panel itself has neither.
+        lob_candidates_for=lob_candidates_for,
+        exclude_columns=exclude_columns,
     )
 
     # 5b. PER-TABLE: Full Load outcome + live source/target row counts per selected

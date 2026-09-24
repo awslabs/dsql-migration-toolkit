@@ -84,6 +84,27 @@ _OVERSIZED = re.compile(r"exceeds DSQL's\s+\d+-byte limit", re.IGNORECASE)
 _MAX_MESSAGE_LEN = 2000
 
 
+# The offending column, which the sink names verbatim: "Value for column 'content' exceeds
+# DSQL's 1048576-byte limit". This is BETTER evidence than the Full Load has for the same
+# recovery -- there, the driver message names the TYPE and not the column, so the picker has to
+# infer candidates from a type token (see preselect_lob_columns_for_reason). Here the column is
+# stated, so the exclusion picker can pre-tick exactly the right one.
+_OVERSIZED_COLUMN = re.compile(r"Value for column '(?P<column>[^']+)'", re.IGNORECASE)
+
+
+def oversized_column_from_reason(message: Optional[str]) -> Optional[str]:
+    """Return the column a quarantine reason blames for exceeding the per-value limit. Pure.
+
+    ``None`` when the message is not an oversized-value quarantine (or a future sink wording
+    stops naming the column), so the caller falls back to making the operator choose rather
+    than pre-ticking a guess.
+    """
+    if not message:
+        return None
+    match = _OVERSIZED_COLUMN.search(message)
+    return match.group("column") if match else None
+
+
 def _table_from_topic(topic: str) -> str:
     """Return the ``db.table`` identity from a ``<prefix>.<db>.<table>`` Kafka topic.
 

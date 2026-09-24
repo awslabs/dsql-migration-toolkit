@@ -56,6 +56,7 @@ from dsql_migrator.ui.data_migration._cdc_status import (
     cdc_error_log_key,
     is_cdc_error_record,
 )
+from dsql_migrator.ui.data_migration._full_load_ui import _quarantine_detail_row
 from dsql_migrator.ui.design import (
     EXPANSION_PANEL_CLASSES,
     FIT_TABLE_CLASS,
@@ -1417,6 +1418,212 @@ def _render_cdc_schema_drift_banner(
             )
 
 
+def cdc_oversized_quarantine_groups(records) -> "list[tuple[str, list[str], list[str]]]":
+    """Group the OVERSIZED_VALUE dead-letter records by table. Pure.
+
+    Returns ``(table, primary_keys, columns)`` per table in first-seen order, so the recovery
+    card can name the rows that were dropped and pre-tick exactly the column to stop capturing.
+    Only the oversized class is grouped: it is the one quarantine with an in-app remedy, and
+    offering that remedy for a duplicate-key or a drift rejection would be a lie.
+
+    Empty list when nothing qualifies, so the card renders nothing at all -- the same
+    render-only-when-actionable rule the schema-drift banner beside it follows.
+    """
+    from dsql_migrator.core.cdc_dlq import (
+        OVERSIZED_VALUE_CODE,
+        oversized_column_from_reason,
+    )
+
+    order: list[str] = []
+    pks: dict[str, list[str]] = {}
+    cols: dict[str, list[str]] = {}
+    for record in records or []:
+        if getattr(record, "error_code", None) != OVERSIZED_VALUE_CODE:
+            continue
+        table = getattr(record, "table", "") or ""
+        if not table:
+            continue
+        if table not in pks:
+            order.append(table)
+            pks[table] = []
+            cols[table] = []
+        pk = getattr(record, "pk", None)
+        if pk and pk not in pks[table]:
+            pks[table].append(pk)
+        column = oversized_column_from_reason(getattr(record, "message", ""))
+        if column and column not in cols[table]:
+            cols[table].append(column)
+    return [(table, pks[table], cols[table]) for table in order]
+
+
+def _render_cdc_oversized_recovery(
+    ui,
+    migration_state,
+    log_key: str,
+    *,
+    job_manager=None,
+    lob_candidates_for=None,
+    exclude_columns=None,
+    block_reason=None,
+    session=None,
+    records=None,
+) -> None:
+    """Offer the in-app recovery for rows CDC dropped over DSQL's 1 MiB per-value limit.
+
+    The CDC dead-letter surface was read-only: it reported, per table, that rows had been
+    dropped and never let the operator act. The Full Load has had an "Exclude column & reload"
+    card for the same failure since earlier releases, so an operator who hit it on the load
+    could fix it and one who hit it on the stream could not -- and the AI assistant, asked what
+    to do, filled the vacuum by telling them to hand-edit ``column.exclude.list`` on the
+    Debezium connector, which is not doable from this UI and is not necessary (the tool owns
+    that setting and re-sends it on every Start CDC).
+
+    Deliberately NOT a one-click "exclude and reload" like the Full Load's. The ORDER matters
+    and two of the steps are other buttons: a reload while the sink is live is forced into
+    APPEND mode, so the rows already on the target would keep the old column set. The dialog
+    therefore does the one thing it can do atomically -- record the exclusion -- and spells out
+    the remaining steps in order instead of pretending one click finished the job.
+    """
+    if exclude_columns is None:
+        # No in-app action wired (an older caller) -> render nothing rather than a dead card.
+        return
+    if records is None:
+        from dsql_migrator.ui.data_migration._cdc_status import cdc_dlq_records
+
+        records = cdc_dlq_records(migration_state, log_key)
+    groups = cdc_oversized_quarantine_groups(records)
+    if not groups:
+        return
+
+    def _action(table: str, columns: "list[str]"):
+        def _render() -> None:
+            candidates = list(lob_candidates_for(table)) if lob_candidates_for else []
+            if not candidates:
+                # Nothing excludable on this table (e.g. the only oversized column is part of
+                # the primary key, which lob_exclusion_candidates deliberately withholds). A
+                # dead button would read as a broken feature, so say why instead.
+                inline_hint(
+                    ui,
+                    "No column on this table can be excluded at capture.",
+                    tone="warning",
+                )
+                return
+            button = ui.button(  # type: ignore[attr-defined]
+                "Exclude column…",
+                icon="filter_alt_off",
+                on_click=lambda: _open_dialog(table, columns, candidates),
+            )
+            button.props("flat dense no-caps size=sm color=warning")
+            # The SAME guard the Full Load's bundled action respects, surfaced the same way:
+            # shown-but-disabled with the reason as the tooltip, never hidden ("a silently
+            # absent control reads as a missing feature"). While CDC streams the exclusion is
+            # genuinely unsafe -- the connectors committed offsets under the current column
+            # set -- so the first step of the runbook is Stop CDC, and this button is what
+            # tells the operator that.
+            blocked = (
+                block_reason(migration_state, job_manager)
+                if block_reason is not None
+                else None
+            )
+            if blocked:
+                button.props("disable").tooltip(blocked)
+            else:
+                button.tooltip(
+                    "Stop capturing the column that cannot fit, then reload this table "
+                    "and start CDC again."
+                )
+
+        return _render
+
+    def _open_dialog(table: str, blamed: "list[str]", candidates) -> None:
+        picked: dict[str, bool] = {
+            name: (name in blamed) for name, _type in candidates
+        }
+        with ui.dialog() as dialog, ui.card().style("min-width: 540px"):  # type: ignore[attr-defined]
+            ui.label(f"Stop capturing a column of {table}?").classes(  # type: ignore[attr-defined]
+                "text-lg font-semibold"
+            )
+            render_notice(
+                ui,
+                tone="warning",
+                header="The column stops migrating everywhere, and this is not the whole fix",
+                body=(
+                    "The exclusion is migration-wide: the Full Load, the prerequisite checks "
+                    "and the Validation comparison all stop covering this column too, and it "
+                    "arrives NULL for every row. Rows already dropped are NOT recovered by "
+                    "excluding the column — do the four steps below, in this order."
+                ),
+            )
+            ui.label(  # type: ignore[attr-defined]
+                "Columns that can exceed DSQL's 1 MiB per-value limit:"
+            ).classes("text-sm text-gray-700")
+            for name, col_type in candidates:
+                box = ui.checkbox(  # type: ignore[attr-defined]
+                    f"{name}  ({col_type})",
+                    value=picked.get(name, False),
+                    on_change=lambda e, n=name: picked.__setitem__(n, bool(e.value)),
+                )
+                box.props("dense")
+            if blamed:
+                inline_hint(
+                    ui,
+                    "Pre-ticked from the dead-letter record: the sink named "
+                    + ", ".join(blamed)
+                    + ".",
+                    tone="neutral",
+                )
+            # STOP CDC FIRST, and the order is not cosmetic: while the sink streams, its
+            # connectors have already committed offsets under the CURRENT excluded-column set,
+            # so changing the set now makes the rows already streamed inconsistent with
+            # everything after -- which is exactly why exclude_and_reload_block_reason refuses
+            # it, and why the button that opens this dialog is disabled until CDC is stopped. A
+            # reload under a live sink is separately forced into APPEND mode, so the rows
+            # already on the target would keep the old column set too.
+            for index, step in enumerate(
+                (
+                    "Stop CDC (CDC step → Stop CDC) — its connectors committed offsets "
+                    "under the current column set.",
+                    "Exclude the column (this dialog).",
+                    "Reload this table from the Full Load step, choosing DROP so it is "
+                    "recreated without the column.",
+                    "Start CDC again — it re-sends the new capture config and resumes from "
+                    "the new snapshot point.",
+                ),
+                start=1,
+            ):
+                with ui.row().classes("items-start gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
+                    ui.badge(str(index)).props("color=grey-7 outline")  # type: ignore[attr-defined]
+                    ui.label(step).classes("text-xs text-gray-700")  # type: ignore[attr-defined]
+
+            def _go() -> None:
+                chosen = [name for name, on in picked.items() if on]
+                if not chosen:
+                    ui.notify("Tick at least one column to exclude.", type="warning")
+                    return
+                dialog.close()
+                exclude_columns(table, chosen)
+
+            with ui.row().classes("w-full justify-end gap-2 items-center"):  # type: ignore[attr-defined]
+                ui.button("Cancel", on_click=dialog.close).props("flat")  # type: ignore[attr-defined]
+                ui.button(  # type: ignore[attr-defined]
+                    "Exclude at capture", icon="filter_alt_off", on_click=_go
+                ).props("color=negative")
+        dialog.open()
+
+    for table, pks, columns in groups:
+        _quarantine_detail_row(
+            ui,
+            table=table,
+            primary_keys=pks,
+            reasons=[
+                "Dropped over DSQL's 1 MiB per-value limit"
+                + (f" — column {', '.join(columns)}" if columns else "")
+                + ". This row cannot be stored as-is and is never retried."
+            ],
+            action=_action(table, columns),
+        )
+
+
 def _render_cdc_dlq_panel(
     ui,
     migration_state,
@@ -1425,6 +1632,8 @@ def _render_cdc_dlq_panel(
     on_refresh=None,
     session=None,
     cdc_ai_opener=None,
+    lob_candidates_for=None,
+    exclude_columns=None,
 ) -> None:
     """Render the dead-letter queue as one cohesive, AWS-console-style card.
 
@@ -1506,6 +1715,16 @@ def _render_cdc_dlq_panel(
         # download off the same stable CDC key the fold used (cdc_error_log_key) --
         # not _current_job, which would be None and hide everything.
         log_key = cdc_error_log_key(migration_state)
+        # The in-app recovery for the one quarantine class that HAS one, rendered as a sibling
+        # of the drift banner above and, like it, invisible when its subset is empty.
+        _render_cdc_oversized_recovery(
+            ui, migration_state, log_key,
+            job_manager=job_manager,
+            lob_candidates_for=lob_candidates_for,
+            exclude_columns=exclude_columns,
+            block_reason=exclude_and_reload_block_reason,
+            session=session,
+        )
         _render_cdc_dlq_records(ui, migration_state, log_key)
         if health.depth > 0:
             _render_cdc_error_download(ui, migration_state, log_key)
@@ -1753,9 +1972,18 @@ def exclude_and_reload_block_reason(migration_state, job_manager) -> "Optional[s
 
     * CDC is streaming -- the connectors committed offsets on MSK under the old
       ``column.exclude.list``, so history was captured with different columns.
-    * A cdc-stack exists (or is being created) -- ``ColumnExcludeList`` is baked into the
-      stack at create time, so an exclusion added afterwards would make Full Load skip a
-      column CDC keeps capturing.
+    * A cdc-stack exists (or is being created) -- an exclusion added afterwards would make
+      Full Load skip a column the deployed pipeline was given.
+
+    CORRECTION to the reason previously recorded for that second clause ("ColumnExcludeList is
+    baked into the stack at create time"): it is not. Start CDC re-sends it on EVERY pass --
+    ``cdc_deployer`` builds the connector overrides from ``params.filled`` and only excludes
+    the bootstrap/DeploySink/watermark keys, so ``ColumnExcludeList`` reaches ``submit_update``
+    and ``config_changed`` returns True against a stack carrying the old value (verified by
+    executing the real builders). So a new exclusion DOES reach a running pipeline at the next
+    Start CDC, with no teardown. The gate stays anyway, and conservatively: what makes the
+    change unsafe is not how the value is delivered but that offsets were already committed
+    under the OLD set, which is the first clause. Do not relax this on the delivery argument.
 
     Pure apart from the job-status reads the CDC helpers already do; no AWS I/O.
     """
