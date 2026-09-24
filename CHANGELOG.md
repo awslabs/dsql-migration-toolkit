@@ -5,6 +5,70 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.513
+
+### Changed
+
+- **The CDC prerequisite guidance is ONE decision block instead of one problem stated four
+  times.** A PostgreSQL "Full load only -> CDC only" continuation rendered seven stacked
+  things under the checks, and a single fact -- the publication does not exist -- carried
+  four different severities on the way down: a red `Blocked` badge, a red "1 failed" badge
+  on Source Configuration, an amber "a gapless handoff is no longer possible" notice, and a
+  red "Resolve the failed prerequisite(s)" line, with two blue info panels wedged in
+  between, so "is this serious, or is this reading material?" had no answer. It also took
+  ~11 lines of prose to reach the point that there are exactly two options. Now one amber
+  box states the situation once and carries BOTH routes inside it as peers, each with its
+  own button and a one-line summary of what it leaves behind; the costs and mechanics
+  collapse behind "What this does, and what it costs" so only the reader who wants the
+  derivation pays for it. (This repository had already recorded the same failure mode once,
+  in `stale_error_notice`: "three verdicts at once, and the user cannot tell which is
+  true.")
+- **The RECOMMENDED route is now a button the tool executes, not an instruction.** It said
+  "Change the migration type above and run the Full Load again" while the only clickable
+  action on screen sat on the route it explicitly does not recommend -- visual pull and
+  stated advice pointing opposite ways. "Start over as Full load + CDC" is now the primary
+  button: it switches the migration type, re-runs the (read-only, seconds) prerequisite
+  checks for the new type, and opens the Full Load. It navigates ONLY when the re-graded
+  report can actually proceed, because the explanation for a block lives on the panel the
+  operator would have been moved off.
+- **The run-guard line no longer restates the verdict underneath its own solution.** Reading
+  order was inverted (here is how to fix it, then "you must fix it") and it duplicated two
+  badges that already carried the verdict. When a route choice is on screen the line says
+  only what the empty primary-action slot means: "Pick one of the two routes above to
+  continue."
+- **A blocked prerequisite names the action it blocks.** "Resolve the failed
+  prerequisite(s) before running: ..." is ambiguous on a screen where the Full Load, a
+  billable ~5-minute CDC infrastructure deploy and Start CDC can all "run". It now reads
+  "before deploying the CDC infrastructure or starting CDC" for CDC -- the deploy is the
+  first thing the failure stops, and the one that costs money -- and "before running the
+  Full Load" for the load.
+- **The "Full load only" tile now discloses what a PostgreSQL source gives up by picking
+  it.** v0.1.511 addressed this from the other side (the "Full load + CDC" tile says its CDC
+  phase can be started later), but an operator reading only the cheap,
+  no-extra-infrastructure tile still had no way to know it is the one choice that forfeits a
+  gapless CDC handoff permanently -- and that is exactly why the reporter picked it. The tile
+  now says so, where the decision is made: nothing retains WAL during the load and a
+  replication slot cannot be created at a past position, so adding CDC afterwards means
+  re-snapshotting every table or starting over as "Full load + CDC". MySQL is unaffected -- a
+  CDC-only start seeds the connector from the watermark's binlog coordinates, so its handoff
+  stays gapless as long as the binlogs are retained.
+
+### Fixed
+
+- **The prerequisite panel's re-snapshot route recorded only half the decision, so the job
+  died after being paid for.** That route's own copy promises the connector will create the
+  publication this load never had, but the button (v0.1.510) set only the start mode
+  ("manual", i.e. `snapshot.mode=initial`) and NOT
+  `publication.autocreate.mode=filtered`. Half a decision un-gated everything: the
+  re-graded checks passed, the ~5-minute billable infrastructure deploy was allowed, and the
+  Start CDC dialog -- whose own probe mirrors `force_initial` and therefore raised no
+  objection -- started both connectors, after which the Debezium task died on "Publication
+  autocreation is disabled". The Start CDC dialog's version of the same escape always set
+  both knobs; this one now does too. The recommended route additionally CLEARS both, so an
+  operator who takes the re-snapshot route and then changes their mind does not carry
+  `snapshot.mode=initial` + `autocreate=filtered` into the very run whose entire point is to
+  stream from the slot the tool creates at the snapshot point.
+
 ## v0.1.512
 
 ### Fixed

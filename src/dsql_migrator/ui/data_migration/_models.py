@@ -960,13 +960,21 @@ def lob_exclusion_scope_gap(
     return sorted(added)
 
 
-def prerequisite_block_reason(report: PrerequisiteReport) -> Optional[str]:
+def prerequisite_block_reason(
+    report: PrerequisiteReport, *, mode: Optional[MigrationMode] = None
+) -> Optional[str]:
     """Return a run-guard disable reason when prerequisites block the mode.
 
     Returns ``None`` when ``report.can_proceed`` is ``True``; otherwise an
     English, user-facing reason naming the failed required checks, suitable for a
     disabled Run button's tooltip (Property 14). Mirrors the workflow
     ``run_guards`` contract used by other steps.
+
+    ``mode`` names the ACTION the failure gates. A bare "before running" is ambiguous
+    on this screen -- the Prerequisites panel sits above a Full Load, a billable CDC
+    infrastructure deploy AND a Start CDC, so "running" could mean any of the three and
+    the operator cannot tell which is held. Naming it also makes the CDC-only case
+    honest: what the failure actually stops first is the ~5-minute billable deploy.
     """
     if report.can_proceed:
         return None
@@ -981,7 +989,41 @@ def prerequisite_block_reason(report: PrerequisiteReport) -> Optional[str]:
         if title not in titles:
             titles.append(title)
     joined = "; ".join(titles) if titles else "a required check"
-    return f"Resolve the failed prerequisite(s) before running: {joined}."
+    if mode is MigrationMode.CDC:
+        gated = "before deploying the CDC infrastructure or starting CDC"
+    elif mode is MigrationMode.FULL_LOAD:
+        gated = "before running the Full Load"
+    else:
+        gated = "before running"
+    return f"Resolve the failed prerequisite(s) {gated}: {joined}."
+
+
+def resnapshot_resolvable_failures(
+    report: Optional[PrerequisiteReport],
+) -> list[PrerequisiteResult]:
+    """Return the CDC failures a route CHOICE resolves, not a source-side fix.
+
+    The PostgreSQL "publication + slot exist" check fails in two very different ways.
+    A coverage gap (the publication exists but omits captured tables) needs someone to
+    change the source. Plain ABSENCE does not: it means this load never had a gapless
+    handoff to begin with, and the operator's way out is to pick one of two routes the
+    tool can take. ``resolvable_by_resnapshot`` on the result is where the checker
+    records that difference, so both the affordance and the run guard read it from the
+    one place instead of re-deriving it.
+
+    Used by the render guard as well: when a choice is pending, repeating the verdict as
+    a third red line under the choices adds no information and inverts the reading order
+    (solution, then "resolve it"). Pure.
+    """
+    if report is None:
+        return []
+    return [
+        result
+        for result in report.results
+        if result.check_id is PrerequisiteCheckId.CDC_REPLICATION_OBJECTS
+        and result.status is PrerequisiteStatus.FAIL
+        and getattr(result, "resolvable_by_resnapshot", False)
+    ]
 
 
 class PrereqCategory(str, Enum):
@@ -2217,6 +2259,38 @@ def migration_type_requirements(
         base
         + " The tool creates the publication and replication slot itself, at the Full "
         "Load snapshot point, so the handoff has no gap."
+    )
+
+
+def migration_type_tradeoff(
+    mt: MigrationType, source_type: SourceType = SourceType.MYSQL
+) -> str:
+    """The consequence of picking this tile that is not visible from its own copy.
+
+    Only "Full load only" on PostgreSQL has one, and it is decided HERE, irreversibly:
+    nothing retains WAL during the load, and a logical replication slot cannot be
+    created at -- or rewound to -- a past position (live-verified on PG 16 and 18:
+    ``pg_create_logical_replication_slot`` takes no LSN, ``pg_replication_slot_advance``
+    is forward-only). So the changes committed during and after the load are gone for
+    replication purposes, and adding CDC later costs a second read of every table.
+
+    Stated on the tile because that is where the decision is made. "Full load + CDC"
+    carries the mirror-image note ("the CDC phase can be started later"), but an
+    operator who reads only THIS tile -- the cheap, no-infrastructure one -- had no way
+    to know it was the one choice that forfeits a gapless handoff for good. MySQL is
+    unaffected: a CDC-only start seeds the connector from the watermark's binlog
+    coordinates, so the handoff stays gapless as long as the binlogs are retained.
+
+    Returns "" when there is nothing extra to say. Pure.
+    """
+    if mt is not MigrationType.FULL_LOAD_ONLY or source_type is not SourceType.POSTGRES:
+        return ""
+    return (
+        "On PostgreSQL this gives up a gapless CDC handoff for good: nothing retains "
+        "WAL during the load and a replication slot cannot be created at a past "
+        "position, so adding CDC afterwards means re-snapshotting every table (or "
+        'starting over as "Full load + CDC"). Pick one of those if you may want CDC '
+        "later."
     )
 
 

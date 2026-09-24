@@ -309,6 +309,62 @@ def test_render_activity_event_unknown_tone_falls_back_to_info() -> None:
     assert ACTIVITY_EVENT_STYLE["info"][3] in ui.icons
 
 
+def test_notice_container_is_the_same_box_and_yields_room_for_the_actions() -> None:
+    """One alert can state a situation AND carry the routes out of it.
+
+    The Cloudscape pattern; the alternative (one notice per option) repeats the severity
+    per box and makes whichever option happens to carry a button read as the endorsed one.
+    """
+    from dsql_migrator.ui.design import notice_box_classes, notice_container
+
+    ui = _RecordingUi()
+    with notice_container(
+        ui, tone="warning", header="Cannot be gapless", body="Two ways forward."
+    ):
+        ui.label("Route A")
+        ui.label("Route B")
+
+    assert "Cannot be gapless" in ui.texts
+    assert "Two ways forward." in ui.texts
+    # The content really landed INSIDE (after the header/body), not before or instead.
+    assert ui.texts.index("Route A") > ui.texts.index("Two ways forward.")
+    assert "Route B" in ui.texts
+    # Identical box treatment to render_notice -- same tone palette, same geometry.
+    assert notice_box_classes("warning") in ui.classes
+    assert NOTICE_STYLE["warning"][3] in ui.icons
+
+
+def test_notice_container_and_render_notice_share_one_box_definition() -> None:
+    """Two hand-copied class strings would drift the moment one is tuned."""
+    from dsql_migrator.ui.design import notice_box_classes, notice_container
+
+    a = _RecordingUi()
+    render_notice(a, tone="error", header="h")
+    b = _RecordingUi()
+    with notice_container(b, tone="error", header="h"):
+        pass
+    box = notice_box_classes("error")
+    assert box in a.classes and box in b.classes
+    bg, border, _ic, _icon = NOTICE_STYLE["error"]
+    assert bg in box and border in box
+
+
+def test_notice_container_icon_override_and_unknown_tone_fallback() -> None:
+    from dsql_migrator.ui.design import notice_box_classes, notice_container
+
+    ui = _RecordingUi()
+    with notice_container(ui, tone="warning", header="h", icon="history_toggle_off"):
+        pass
+    assert "history_toggle_off" in ui.icons
+    assert NOTICE_STYLE["warning"][3] not in ui.icons
+
+    other = _RecordingUi()
+    with notice_container(other, tone="bogus", header="h"):
+        pass
+    assert NOTICE_STYLE["info"][3] in other.icons
+    assert notice_box_classes("bogus") == notice_box_classes("info")
+
+
 def test_render_notice_icon_override() -> None:
     ui = _RecordingUi()
     render_notice(ui, tone="info", header="Cost", body="x", icon="payments")

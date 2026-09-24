@@ -9371,7 +9371,13 @@ class _RecordingUi:
             self.texts.append(str(text))
         return self._El(self)
 
-    def expansion(self, *_a, **_k):
+    def expansion(self, text="", *_a, **_k):
+        # An expansion's HEADER is user-visible copy and is often the only thing on
+        # screen until the operator clicks it, so record it like a label. Dropping it made
+        # "the detail is collapsed behind a summary" unassertable, which is exactly the
+        # layout property a progressive-disclosure fix has to prove.
+        if text:
+            self.texts.append(str(text))
         return self._El(self)
 
     def label(self, text="", *_a, **_k):
@@ -25255,8 +25261,10 @@ def test_the_prerequisite_panel_offers_the_continuation_beside_the_failing_row()
         async def _run_checks(mode):
             ran.append(mode)
 
-        dm._render_prerequisites_panel(ui, state, _run_checks, MigrationMode.CDC)
-        return ui, state, ran
+        pending = dm._render_prerequisites_panel(
+            ui, state, _run_checks, MigrationMode.CDC
+        )
+        return ui, state, ran, pending
 
     absent = check_cdc_replication_objects(
         PostgresCdcFacts(
@@ -25268,8 +25276,9 @@ def test_the_prerequisite_panel_offers_the_continuation_beside_the_failing_row()
     assert absent.status is PrerequisiteStatus.FAIL
     assert absent.resolvable_by_resnapshot is True
 
-    ui, state, ran = panel(absent)
+    ui, state, ran, pending = panel(absent)
     rendered = " ".join(ui.texts)
+    assert pending is True, "the caller needs to know a route choice is on screen"
     assert "Re-snapshot every table" in rendered, (
         "the failing row must carry the continuation affordance"
     )
@@ -25293,11 +25302,11 @@ def test_the_prerequisite_panel_offers_the_continuation_beside_the_failing_row()
     # the source since the first load, and only it creates the slot before the load so the
     # handoff is gapless afterwards. Same cost, strictly better result.
     assert "Full load + CDC" in rendered
-    assert rendered.index("Recommended") < rendered.index("Or continue from here")
+    assert rendered.index("Recommended") < rendered.index("Re-snapshot every table")
     assert "DROP" in rendered  # the delete-clearing step the other route cannot do
     # ...and the re-snapshot button must therefore NOT be the primary call to action.
     assert btn is not None
-    assert not any("color=primary" in p for p in getattr(btn, "props_seen", []))
+    assert not any(p.startswith("color=primary") for p in getattr(btn, "props_seen", []))
 
     # Clicking it RECORDS the decision and RE-RUNS the checks, so one re-graded report
     # clears every gate at once instead of leaving a red FAIL beside an enabled button.
@@ -25317,8 +25326,295 @@ def test_the_prerequisite_panel_offers_the_continuation_beside_the_failing_row()
     )
     assert gap.status is PrerequisiteStatus.FAIL
     assert gap.resolvable_by_resnapshot is False
-    ui2, _s2, _r2 = panel(gap)
+    ui2, _s2, _r2, pending2 = panel(gap)
     assert "Re-snapshot every table" not in " ".join(ui2.texts)
+    assert pending2 is False
+
+
+def _gapless_choice_panel(*, can_proceed_after=True):
+    """Render the PG gapless-handoff fork and hand back everything a test must drive.
+
+    The FAIL is built by the real ``check_cdc_replication_objects``, not a hand-made row,
+    so the affordance stays keyed to the checker's own ``resolvable_by_resnapshot`` grading.
+    ``can_proceed_after`` controls what the re-run of the checks reports, which is what
+    decides whether the recommended route may navigate.
+    """
+    from dsql_migrator.core.models import (
+        ColumnDef,
+        MigrationMode,
+        PrerequisiteReport,
+        PrerequisiteStatus,
+        TableDef,
+    )
+    from dsql_migrator.core.prerequisites_postgres import (
+        PostgresCdcFacts,
+        check_cdc_replication_objects,
+    )
+    from dsql_migrator.ui import data_migration as dm
+
+    row = check_cdc_replication_objects(
+        PostgresCdcFacts(
+            checked_publication_name="p", checked_slot_name="s",
+            publication_present=False, publication_tables=(),
+        ),
+        [
+            TableDef(
+                name="app.orders",
+                columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+                primary_key=["id"],
+            )
+        ],
+        provisions_replication=False,
+    )
+    assert row.status is PrerequisiteStatus.FAIL
+
+    ui = _RecordingUi()
+    state = DataMigrationState()
+    state.set_prereq_report(
+        MigrationMode.CDC,
+        PrerequisiteReport(mode=MigrationMode.CDC, results=[row], can_proceed=False),
+    )
+    ran: list = []
+    refreshed: list = []
+
+    async def _run_checks(mode):
+        ran.append(mode)
+        # Stand in for the real re-grade: switching to "Full load + CDC" makes the tool
+        # the provisioner of the publication + slot, so the existence FAIL becomes a SKIP
+        # and the report can proceed.
+        state.set_prereq_report(
+            MigrationMode.CDC,
+            PrerequisiteReport(
+                mode=MigrationMode.CDC, results=[], can_proceed=can_proceed_after
+            ),
+        )
+
+    dm._render_prerequisites_panel(
+        ui,
+        state,
+        _run_checks,
+        MigrationMode.CDC,
+        refresh=lambda: refreshed.append(True),
+    )
+    return ui, state, ran, refreshed
+
+
+def test_the_recommended_gapless_route_is_a_button_the_tool_executes() -> None:
+    """The reporter's item 2: the ONLY button sat on the route we do not recommend.
+
+    "Change the migration type above and run the Full Load again" is an instruction for
+    work the tool can do itself -- and leaving the single clickable action on the
+    re-snapshot panel made the visual pull and the stated advice point opposite ways. So
+    the recommended route is a primary button that performs the switch.
+    """
+    import asyncio
+
+    from dsql_migrator.core.models import MigrationMode
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    ui, state, ran, refreshed = _gapless_choice_panel()
+
+    rec = next(
+        (b for b in ui.buttons if "Start over" in getattr(b, "text", "")), None
+    )
+    assert rec is not None, "the recommended route must be clickable, not prose"
+    assert any(p.startswith("color=primary") for p in rec.props_seen), (
+        "the recommended route carries the primary call to action"
+    )
+
+    asyncio.run(rec.on_click())
+    assert state.migration_type is MigrationType.FULL_LOAD_AND_CDC
+    # It re-runs the checks for the NEW type (read-only, seconds), so the operator does not
+    # land on a blocked Run button...
+    assert ran == [MigrationMode.CDC]
+    # ...and then moves them to the Full Load, which is the work this route needs next.
+    assert state.active_substep == "full_load"
+    assert refreshed, "the navigation needs a re-render to be visible"
+
+
+def test_the_recommended_route_stays_put_when_the_re_run_is_still_blocked() -> None:
+    """Navigating unconditionally would strand the operator on a blocked Run button.
+
+    The explanation for the block lives on the Prerequisites panel; moving them off it
+    leaves the "why" behind. So the jump is conditional on the re-graded verdict.
+    """
+    import asyncio
+
+    ui, state, _ran, refreshed = _gapless_choice_panel(can_proceed_after=False)
+    rec = next(b for b in ui.buttons if "Start over" in getattr(b, "text", ""))
+    asyncio.run(rec.on_click())
+    assert state.active_substep != "full_load"
+    assert not refreshed
+
+
+def test_the_recommended_route_clears_a_previously_taken_re_snapshot_decision() -> None:
+    """Otherwise the route that exists to RESTORE a gapless handoff silently forfeits it.
+
+    An operator may click "Re-snapshot every table" and then change their mind. That click
+    records start-mode "manual" + autocreate, which on PostgreSQL means
+    ``snapshot.mode=initial`` and ``publication.autocreate.mode=filtered``. Carried into
+    the combined run, the connector would re-read every table instead of streaming from the
+    slot the tool just created at the snapshot point -- paying for a second full read and
+    throwing away the gapless handoff this route is for.
+    """
+    import asyncio
+
+    ui, state, _ran, _refreshed = _gapless_choice_panel()
+    resnap = next(b for b in ui.buttons if "Re-snapshot" in getattr(b, "text", ""))
+    asyncio.run(resnap.on_click())
+    assert state.cdc_start_mode() == "manual"
+    assert state.cdc_pg_autocreate_publication() is True
+
+    rec = next(b for b in ui.buttons if "Start over" in getattr(b, "text", ""))
+    asyncio.run(rec.on_click())
+    assert state.cdc_start_mode() == "auto"
+    assert state.cdc_pg_autocreate_publication() is False
+
+
+def test_the_panels_re_snapshot_route_also_lets_the_connector_make_the_publication() -> None:
+    """The route's own copy promises it, and without the second knob the job dies paid-for.
+
+    Recording only the start mode un-gates the checks, the ~5-minute billable
+    infrastructure deploy AND the Start dialog (whose probe mirrors ``force_initial``, so
+    it raises no objection) -- and then the Debezium task dies on "Publication autocreation
+    is disabled", after both connectors were created. The Start dialog's version of this
+    escape always set both knobs; this one is the same decision, so it must too.
+    """
+    import asyncio
+
+    ui, state, _ran, _refreshed = _gapless_choice_panel()
+    assert state.cdc_pg_autocreate_publication() is False  # default
+    resnap = next(b for b in ui.buttons if "Re-snapshot" in getattr(b, "text", ""))
+    asyncio.run(resnap.on_click())
+    assert state.cdc_pg_autocreate_publication() is True, (
+        "the connector must be allowed to create the publication this route relies on"
+    )
+
+
+def test_one_situation_one_box_not_three_stacked_notices() -> None:
+    """The reporter's items 1 and 4: one problem was stated in four severities.
+
+    Blocked badge -> "1 failed" badge -> amber notice -> red guard line, with two blue
+    info panels wedged between, so "is this serious or is this reading material?" had no
+    answer. The two routes are alternatives to ONE situation and belong inside its box.
+    """
+    ui, _state, _ran, _refreshed = _gapless_choice_panel()
+    rendered = " ".join(ui.texts)
+
+    # The situation is stated exactly once...
+    assert rendered.count("A gapless handoff is no longer possible") == 1
+    # ...and the two former notice HEADERS are gone: the routes are button labels now, so
+    # there is no second and third bold verdict competing with the first.
+    assert "Recommended: start over" not in rendered
+    assert "Or continue from here" not in rendered
+
+    # One notice box on screen, not three. Each render_notice/notice_container draws its
+    # box classes, so counting them counts boxes -- the layout complaint, measured.
+    from dsql_migrator.ui.design import notice_box_classes
+
+    boxes = [
+        c
+        for c in ui.classes_applied
+        if c == notice_box_classes("warning") or c == notice_box_classes("info")
+    ]
+    assert len(boxes) == 1, boxes
+
+    # The detail that explains the trade-off is present but COLLAPSED behind an expansion,
+    # so reaching "there are two options" does not take ~11 lines of prose first.
+    assert "What this does, and what it costs" in rendered
+
+
+def test_the_guard_line_does_not_restate_the_verdict_under_its_own_solution() -> None:
+    """The reporter's item 3: "Resolve the failed prerequisite(s)" sat BELOW the fix.
+
+    Reading order was inverted (how to fix it, then "you must fix it"), and it duplicated
+    two badges that already carried the verdict. When a route choice is on screen the guard
+    says only what the empty primary-action slot means.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    tree = ast.parse(inspect.getsource(dm.build_data_migration_screen))
+    branch = next(
+        (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "_route_choice_pending"
+        ),
+        None,
+    )
+    assert branch is not None, (
+        "the run-guard row must branch on whether a route choice is on screen"
+    )
+
+    def names(nodes) -> set[str]:
+        found: set[str] = set()
+        for node in nodes:
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Name):
+                    found.add(sub.id)
+        return found
+
+    # REPLACES the block reason, not appended alongside it: the pointer branch must not
+    # also render guard_reason, and the reason must still exist on the other branch (a
+    # mutation that deletes it entirely would leave a disabled state with no explanation
+    # in the no-choice case).
+    assert "guard_reason" not in names(branch.body)
+    assert "guard_reason" in names(branch.orelse)
+
+    def strings(nodes) -> str:
+        out = []
+        for node in nodes:
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                    out.append(sub.value)
+        return " ".join(out)
+
+    assert "Pick one of the two routes above" in strings(branch.body)
+
+
+def test_the_block_reason_names_the_action_it_gates() -> None:
+    """"before running" is ambiguous where three different things can run.
+
+    The Prerequisites panel sits above a Full Load, a billable CDC infrastructure deploy
+    and a Start CDC. For CDC the first thing the failure stops is the deploy -- the one
+    that costs money -- so it is named.
+    """
+    from dsql_migrator.core.models import (
+        MigrationMode,
+        PrerequisiteCheckId,
+        PrerequisiteReport,
+        PrerequisiteResult,
+        PrerequisiteStatus,
+    )
+    from dsql_migrator.ui.data_migration import prerequisite_block_reason
+
+    report = PrerequisiteReport(
+        mode=MigrationMode.CDC,
+        results=[
+            PrerequisiteResult(
+                check_id=PrerequisiteCheckId.CDC_REPLICATION_OBJECTS,
+                title="CDC's publication and replication slot exist on the source",
+                status=PrerequisiteStatus.FAIL,
+                required=True,
+            )
+        ],
+        can_proceed=False,
+    )
+    cdc = prerequisite_block_reason(report, mode=MigrationMode.CDC)
+    assert cdc is not None
+    assert "deploying the CDC infrastructure" in cdc
+    assert "before running:" not in cdc
+
+    full = prerequisite_block_reason(report, mode=MigrationMode.FULL_LOAD)
+    assert full is not None and "before running the Full Load" in full
+
+    # The failed check is still named -- the wording change must not drop the WHAT.
+    assert "publication and replication slot" in cdc
 
 
 def test_a_finished_load_with_no_slot_gates_the_spend_whatever_tile_is_selected() -> None:
@@ -25631,3 +25927,66 @@ def test_the_converter_reads_consume_engine_independent_values_today() -> None:
     my_ddl = "\n".join(types[SourceType.MYSQL])
     assert "TIMESTAMPTZ" in my_ddl and "TIMESTAMPTZ" not in pg_ddl
     assert "BIT(1)" in pg_ddl and "BIT(1)" not in my_ddl
+
+
+def test_the_full_load_only_tile_discloses_the_pg_gapless_forfeit() -> None:
+    """The reporter's side note: the cheapest tile hides the most consequential choice.
+
+    v0.1.511 fixed this from the OTHER side -- "Full load + CDC" says the CDC phase can be
+    started later -- but an operator reading only "Full load only" (no extra
+    infrastructure, one-shot, cheap) still had nothing telling them that on PostgreSQL this
+    is the one option that gives up a gapless CDC handoff for good. The reporter picked it
+    for exactly that reason. MySQL is unaffected: a CDC-only start seeds the connector from
+    the watermark's binlog coordinates.
+    """
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration import (
+        DataMigrationState,
+        _render_migration_type_selector,
+    )
+
+    def tiles(source_type):
+        ui = _RecordingUi()
+        _render_migration_type_selector(
+            ui,
+            DataMigrationState(),
+            status=StepStatus.NOT_STARTED,
+            refresh=lambda: None,
+            locked=False,
+            source_type=source_type,
+        )
+        return " ".join(ui.texts)
+
+    pg = tiles(SourceType.POSTGRES)
+    # The forfeit, its reason, and the two alternatives -- not a bare "may not be gapless".
+    assert "gives up a gapless CDC handoff" in pg
+    assert "cannot be created at a past position" in pg
+    assert "re-snapshotting every table" in pg
+    # ...and it must NOT be attached to the tile that has no such problem.
+    assert pg.index("gives up a gapless CDC handoff") < pg.index("Continuous CDC"), (
+        "the disclosure belongs on the Full load only tile, which renders first"
+    )
+
+    my = tiles(SourceType.MYSQL)
+    assert "gives up a gapless CDC handoff" not in my
+    # The tile's own copy is otherwise untouched on both engines.
+    assert "No extra infrastructure." in pg and "No extra infrastructure." in my
+
+
+def test_the_tradeoff_note_is_only_for_full_load_only_on_postgres() -> None:
+    """A note on every tile is a note nobody reads; this one is engine- and type-specific."""
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration import (
+        MigrationType,
+        migration_type_tradeoff,
+    )
+
+    assert migration_type_tradeoff(
+        MigrationType.FULL_LOAD_ONLY, SourceType.POSTGRES
+    ).startswith("On PostgreSQL")
+    for mt in MigrationType:
+        assert migration_type_tradeoff(mt, SourceType.MYSQL) == "", mt
+        if mt is not MigrationType.FULL_LOAD_ONLY:
+            assert migration_type_tradeoff(mt, SourceType.POSTGRES) == "", mt
+    # Default engine is MySQL, so an older caller that passes no engine gains no note.
+    assert migration_type_tradeoff(MigrationType.FULL_LOAD_ONLY) == ""

@@ -111,7 +111,12 @@ from dsql_migrator.core.models import (
 from dsql_migrator.core.table_selection import TableSelector
 from dsql_migrator.core.watermark import WatermarkCapturer
 from dsql_migrator.ui.ai_assist import ai_is_usable
-from dsql_migrator.ui.design import NOTICE_STYLE, inline_hint, render_notice
+from dsql_migrator.ui.design import (
+    NOTICE_STYLE,
+    inline_hint,
+    notice_container,
+    render_notice,
+)
 from dsql_migrator.ui.evaluation import EvaluationStore
 from dsql_migrator.ui.prerequisite_probes import build_prerequisite_checker
 from dsql_migrator.ui.schema_conversion import (
@@ -188,6 +193,7 @@ from dsql_migrator.ui.data_migration._models import (
     _MIGRATION_TYPE_META,
     migration_type_blurb,
     migration_type_requirements,
+    migration_type_tradeoff,
     MigrationProgress,
     summarize_progress,
     build_full_load_status_view,
@@ -208,6 +214,7 @@ from dsql_migrator.ui.data_migration._models import (
     lob_exclusion_scope_gap,
     schema_recreate_tables,
     prerequisite_block_reason,
+    resnapshot_resolvable_failures,
     PrereqCategory,
     _PREREQ_CATEGORY_BY_CHECK,
     _PREREQ_CATEGORY_ORDER,
@@ -1930,7 +1937,7 @@ def build_data_migration_screen(
                         )
                         or cdc_streaming_started(migration_state, job_manager)
                     ) and not _cdc_tearing_down
-                    _render_prerequisites_panel(
+                    _route_choice_pending = _render_prerequisites_panel(
                         ui,
                         migration_state,
                         run_checks,
@@ -1941,6 +1948,7 @@ def build_data_migration_screen(
                         load_running=(
                             status is StepStatus.IN_PROGRESS or _cdc_deploying
                         ),
+                        refresh=refresh,
                     )
                     # Right-align ONLY when this row holds the primary action (design
                     # system: primary actions sit on the right of a button row). The
@@ -1959,6 +1967,20 @@ def build_data_migration_screen(
                                 on_click=lambda t=first_phase: go(t),
                                 icon="arrow_forward",
                             ).props("color=primary")
+                        elif _route_choice_pending:
+                            # The panel just rendered the two routes WITH their buttons.
+                            # Repeating the block reason here would state one failure's
+                            # severity a fourth time (Blocked badge, the category's "1
+                            # failed" badge, the situation notice, this line) and put
+                            # "you must resolve it" BELOW the thing that resolves it. Say
+                            # only what this empty spot means: the next action is one of
+                            # the two above.
+                            inline_hint(
+                                ui,
+                                "Pick one of the two routes above to continue.",
+                                tone="info",
+                                classes="text-sm",
+                            )
                         else:
                             inline_hint(
                                 ui, guard_reason, tone="warning", classes="text-sm"
@@ -2439,7 +2461,10 @@ def full_load_run_guard_reason(
             "ran, so the target's requirements were never re-verified against the "
             "reduced column set."
         )
-    return prerequisite_block_reason(report)
+    # Pass the mode so the reason names the action it gates: on this screen "before
+    # running" could mean the Full Load, the billable CDC infrastructure deploy or Start
+    # CDC, and the operator cannot tell which is held.
+    return prerequisite_block_reason(report, mode=prereq_mode)
 
 
 def _split_migration_schema(name: str) -> tuple[str, str]:
@@ -3072,6 +3097,19 @@ def _render_migration_type_selector(
                             "info" if needs_infra else "check_circle",
                         ).classes("text-gray-500 text-xs mt-0.5")
                         ui.label(requirements).classes("text-xs text-gray-500")
+                # The consequence of this tile that its own copy cannot show, stated where
+                # the choice is made. Amber (a real, non-blocking cost) rather than the
+                # gray requirements tone: "Full load only" on PostgreSQL is the one option
+                # that forfeits a gapless CDC handoff permanently, and an operator reading
+                # only this tile -- the cheap, no-infrastructure one -- had no way to know.
+                # Empty for every other tile/engine, so nothing else gains a line.
+                tradeoff = migration_type_tradeoff(mt, source_type)
+                if tradeoff and not gated:
+                    with ui.row().classes("items-start gap-1 no-wrap mt-1"):  # type: ignore[attr-defined]
+                        ui.icon("history_toggle_off").classes(  # type: ignore[attr-defined]
+                            "text-amber-600 text-xs mt-0.5"
+                        )
+                        ui.label(tradeoff).classes("text-xs text-amber-700")  # type: ignore[attr-defined]
     if running:
         ui.label(  # type: ignore[attr-defined]
             "Migration type is locked once the migration has started."
@@ -3669,7 +3707,8 @@ def _render_prerequisites_panel(
     *,
     combined: bool = False,
     load_running: bool = False,
-) -> None:
+    refresh=None,
+) -> bool:
     """Render a mode's prerequisite check button and result panel (Req 5.10).
 
     Shared by Full Load, CDC, and the combined "Full load + CDC" type so every
@@ -3688,6 +3727,17 @@ def _render_prerequisites_panel(
     run, not the in-flight one) and adds avoidable source read load. When set, the
     Check button is disabled with an explanatory notice, matching how the
     migration-type selector locks during a run.
+
+    ``refresh`` re-renders the screen. Only the gapless-handoff choice below needs it (to
+    move the operator onto the Full Load sub-step once its re-graded checks pass); every
+    other action here re-renders via ``run_checks``. Optional so a test can render the
+    panel without one.
+
+    **Returns** whether the gapless-handoff route choice was rendered. The caller draws
+    the run guard directly below this panel, and when a choice is pending that guard would
+    be the FOURTH statement of one failure's severity -- sitting *under* the solution, so
+    the screen reads "here is how to fix it" then "you must fix it". Returning the fact
+    rather than letting the caller re-derive it keeps the two in lockstep by construction.
     """
     is_cdc = mode is MigrationMode.CDC
     if combined:
@@ -3748,104 +3798,198 @@ def _render_prerequisites_panel(
             ui.spinner(size="sm")
             ui.label(running_text).classes("text-sm text-gray-600")
     report = migration_state.get_prereq_report(mode)
-    if report is not None:
-        # A report can outlive the selection it covered (nothing clears it, and the
-        # picker stays editable until a migration commits). If tables were ADDED since,
-        # the verdict below is stale for them -- they were never checked -- and the run
-        # guard blocks on exactly this. Surface it here too so the reason sits next to
-        # the results the user is reading, not only on a disabled button elsewhere.
-        added = prereq_scope_gap(report, migration_state.selection.selected_tables)
-        if added:
-            listed = ", ".join(added[:6]) + (
-                f" +{len(added) - 6} more" if len(added) > 6 else ""
+    if report is None:
+        return False
+    # A report can outlive the selection it covered (nothing clears it, and the
+    # picker stays editable until a migration commits). If tables were ADDED since,
+    # the verdict below is stale for them -- they were never checked -- and the run
+    # guard blocks on exactly this. Surface it here too so the reason sits next to
+    # the results the user is reading, not only on a disabled button elsewhere.
+    added = prereq_scope_gap(report, migration_state.selection.selected_tables)
+    if added:
+        listed = ", ".join(added[:6]) + (
+            f" +{len(added) - 6} more" if len(added) > 6 else ""
+        )
+        render_notice(
+            ui,
+            tone="warning",
+            header="These results don't cover your current selection",
+            body=(
+                f"{listed} {'were' if len(added) > 1 else 'was'} added after these "
+                "checks ran, so they were never checked. Re-run the checks to cover "
+                "the full selection before migrating."
+            ),
+        )
+    _render_prereq_results(ui, mode, report, combined=combined)
+    # The continuation affordance, BESIDE the failing row rather than in a dialog behind
+    # the button this very failure disables. Without it a PostgreSQL "Full load only ->
+    # CDC only" operator has no route at all: Deploy is gated on this FAIL, and the only
+    # place that could record the re-snapshot decision was the Start CDC dialog, which
+    # needs infrastructure that cannot be deployed.
+    if mode is MigrationMode.CDC and resnapshot_resolvable_failures(report):
+        _render_gapless_choice(ui, migration_state, run_checks, refresh=refresh)
+        return True
+    return False
+
+
+def _render_gapless_choice(ui, migration_state, run_checks, *, refresh=None) -> None:
+    """The PostgreSQL "Full load only -> CDC" fork: ONE situation, two routes, a button each.
+
+    Shipped first (v0.1.510/511) as three stacked notices -- amber situation, blue
+    recommendation, blue alternative -- plus a lone flat button. That layout said one
+    problem's severity four times (Blocked badge, "1 failed" badge, amber notice, red
+    guard line) with two blue panels wedged in between, and it left the ONLY clickable
+    action on the route it explicitly does not recommend: visual pull and stated advice
+    pointing opposite ways, with the recommended route reduced to "change the migration
+    type above and run the Full Load again" -- instructions for work the tool can do
+    itself. The codebase had already recorded this failure mode once, in
+    ``stale_error_notice``: "three verdicts at once, and the user cannot tell which is
+    true."
+
+    So: one box states the situation, and the two routes sit inside it as peers, each with
+    its own button and a one-line summary of what it leaves behind. Costs and mechanics go
+    in a collapsed expansion, because the operator picking a route needs the difference
+    (~11 lines of prose to reach "there are two options" was the complaint), not the full
+    derivation up front.
+
+    Both handlers RE-RUN the (read-only, seconds) prerequisite checks, so one re-graded
+    report clears every gate at once instead of leaving a red FAIL beside an enabled
+    primary button.
+    """
+    # RECOMMENDED FIRST, and deliberately so -- against the usual "primary action on the
+    # right" rule, which governs a form's action row, not a two-way fork where reading
+    # order IS the recommendation. Both routes re-read every table, so the re-read is not
+    # what distinguishes them; re-running as "Full load + CDC" (a) uses the tool's own bulk
+    # loader rather than the streaming pipeline, (b) creates the slot BEFORE the load so
+    # everything from the snapshot point on is streamed, and (c) can DROP each target table
+    # first, which is the only way to clear rows deleted on the source since the last load.
+    # The re-snapshot route leaves those rows behind forever. Same cost, strictly better
+    # result -- so it leads, and it is the one that carries color=primary.
+    async def _start_over() -> None:
+        migration_state.set_migration_type(MigrationType.FULL_LOAD_AND_CDC)
+        # Clear any re-snapshot decision recorded earlier in this session. Without this, an
+        # operator who clicked "Re-snapshot every table" first and then changed their mind
+        # would get snapshot.mode=initial + publication.autocreate=filtered on the very run
+        # whose entire point is to stream from the slot the tool creates at the snapshot
+        # point -- silently paying for a second full read and discarding the gapless
+        # handoff this route exists to restore.
+        migration_state.set_cdc_start_mode("auto")
+        migration_state.set_cdc_pg_autocreate_publication(False)
+        log_activity(
+            ActivityCategory.FULL_LOAD,
+            "migration type selected",
+            status=ActivityStatus.INFO,
+            detail=(
+                "migration type set to "
+                f"{MigrationType.FULL_LOAD_AND_CDC.value} to restore a gapless "
+                "CDC handoff"
+            ),
+        )
+        _mode = prereq_mode_for_type(MigrationType.FULL_LOAD_AND_CDC)
+        await run_checks(_mode)
+        # Land on the Full Load screen -- the work this route needs next -- but ONLY when
+        # the re-graded report says it can actually run. Navigating unconditionally would
+        # drop the operator on a blocked Run button with the explanation left behind on the
+        # panel they were moved off.
+        _report = migration_state.get_prereq_report(_mode)
+        if _report is not None and getattr(_report, "can_proceed", False):
+            migration_state.set_active_substep("full_load")
+            if refresh is not None:
+                refresh()
+
+    async def _take_resnapshot() -> None:
+        migration_state.set_cdc_start_mode("manual")
+        # BOTH knobs, because this route depends on both. "manual" selects
+        # snapshot.mode=initial; the publication this load never had still has to come from
+        # somewhere, and on this route that is the CONNECTOR's own database user
+        # (publication.autocreate.mode=filtered, over exactly the captured tables -- the
+        # tool itself still never writes to the source). Recording only the start mode
+        # un-gated the checks, the billable deploy AND the Start dialog -- whose own probe
+        # mirrors force_initial and so raised no objection -- and then the Debezium task
+        # died on "Publication autocreation is disabled" after both connectors were paid
+        # for. The Start dialog's version of this escape always set both.
+        migration_state.set_cdc_pg_autocreate_publication(True)
+        log_activity(
+            ActivityCategory.CDC,
+            "CDC start mode selected",
+            status=ActivityStatus.INFO,
+            detail="re-snapshot every selected table (no gapless slot for this load)",
+        )
+        await run_checks(MigrationMode.CDC)
+
+    def _route(
+        *, label: str, icon: str, primary: bool, summary: str, detail: str, on_click
+    ) -> None:
+        with ui.column().classes("flex-1 min-w-0 gap-1"):
+            btn = ui.button(label, icon=icon, on_click=on_click)  # type: ignore[attr-defined]
+            btn.props("color=primary" if primary else "outline color=primary")
+            # A fixed floor on the summary height keeps the two routes' expansions on the
+            # same baseline: the summaries wrap to different line counts, and a ragged pair
+            # reads as two unrelated blocks rather than two options being compared.
+            ui.label(summary).classes(  # type: ignore[attr-defined]
+                "text-xs text-gray-700 min-h-[2.25rem]"
             )
-            render_notice(
-                ui,
-                tone="warning",
-                header="These results don't cover your current selection",
-                body=(
-                    f"{listed} {'were' if len(added) > 1 else 'was'} added after these "
-                    "checks ran, so they were never checked. Re-run the checks to cover "
-                    "the full selection before migrating."
-                ),
-            )
-        _render_prereq_results(ui, mode, report, combined=combined)
-        # The continuation affordance, BESIDE the failing row rather than in a dialog behind
-        # the button this very failure disables. Without it a PostgreSQL "Full load only ->
-        # CDC only" operator has no route at all: Deploy is gated on this FAIL, and the only
-        # place that could record the re-snapshot decision was the Start CDC dialog, which
-        # needs infrastructure that cannot be deployed. Re-running the (read-only, seconds)
-        # checks means ONE re-graded report clears every gate at once, so no red FAIL is left
-        # sitting next to an enabled primary button.
-        _resnap = [
-            r
-            for r in report.results
-            if r.check_id is PrerequisiteCheckId.CDC_REPLICATION_OBJECTS
-            and r.status is PrerequisiteStatus.FAIL
-            and getattr(r, "resolvable_by_resnapshot", False)
-        ]
-        if mode is MigrationMode.CDC and _resnap:
-            render_notice(
-                ui,
-                tone="warning",
-                icon="history_toggle_off",
-                header="A gapless handoff is no longer possible for this load",
-                body=(
-                    "Nothing was retaining WAL while the Full Load ran, and a replication "
-                    "slot cannot be created at a past position — so the changes committed "
-                    "since the load cannot be replayed. Both ways forward re-read the "
-                    "source tables; they differ in what they leave behind."
-                ),
-            )
-            # RECOMMENDED FIRST, and deliberately so. Both routes re-read every table, so
-            # the re-read is not what distinguishes them -- but re-running as
-            # "Full load + CDC" (a) uses the tool's own bulk loader rather than the CDC
-            # pipeline, (b) creates the slot BEFORE the load so everything from the
-            # snapshot point on is streamed, and (c) can DROP each target table first,
-            # which is the only way to clear rows deleted on the source since the last
-            # load. The re-snapshot route leaves those rows behind forever. Same cost,
-            # strictly better result -- so it leads.
-            render_notice(
-                ui,
-                tone="info",
+            # header-class strips Quasar's own header padding so the expansion's label lines
+            # up with the summary above it instead of sitting indented from it.
+            with ui.expansion("What this does, and what it costs").props(  # type: ignore[attr-defined]
+                'dense header-class="q-px-none"'
+            ).classes("w-full text-xs"):
+                ui.label(detail).classes("text-xs text-gray-700")  # type: ignore[attr-defined]
+
+    with notice_container(
+        ui,
+        tone="warning",
+        icon="history_toggle_off",
+        header="A gapless handoff is no longer possible for this load",
+        body=(
+            "Nothing was retaining WAL while the Full Load ran, and a replication slot "
+            "cannot be created at a past position, so the changes committed since the "
+            "load cannot be replayed. Both ways forward re-read the source tables. They "
+            "differ in what they leave behind."
+        ),
+    ):
+        with ui.row().classes("w-full gap-4 items-start flex-wrap"):  # type: ignore[attr-defined]
+            _route(
+                label='Start over as "Full load + CDC"',
                 icon="replay",
-                header="Recommended: start over as \"Full load + CDC\"",
-                body=(
-                    "Change the migration type above and run the Full Load again. The tool "
-                    "creates the replication slot at the new snapshot point BEFORE loading, "
-                    "so CDC then resumes from it with no gap — and you can start the CDC "
-                    "phase whenever you like, it does not have to be now. Choose to DROP "
-                    "each table when the load asks: that also clears any row deleted on the "
-                    "source since the first load, which nothing else here can do. It reads "
-                    "the source again, but so does the alternative, and it uses the bulk "
-                    "loader rather than the streaming pipeline."
+                primary=True,
+                summary=(
+                    "Recommended — also clears rows deleted on the source since the load."
                 ),
+                detail=(
+                    "Switches the migration type and re-runs the prerequisite checks for "
+                    "it, then opens the Full Load. The tool creates the replication slot "
+                    "at the new snapshot point BEFORE loading, so CDC resumes from it with "
+                    "no gap — and you can start the CDC phase whenever you like, it does "
+                    "not have to be now. Choose to DROP each table when the load asks: "
+                    "that also clears any row deleted on the source since the first load, "
+                    "which nothing else here can do. It reads the source again, but so "
+                    "does the alternative, and it uses the bulk loader rather than the "
+                    "streaming pipeline."
+                ),
+                on_click=_start_over,
             )
-            render_notice(
-                ui,
-                tone="info",
+            _route(
+                label="Re-snapshot every table",
                 icon="restart_alt",
-                header="Or continue from here by re-snapshotting",
-                body=(
-                    "Keeps this Full Load and adds CDC without a second load pass: the "
-                    "connector creates its own publication over exactly the captured "
-                    "tables, snapshots them, then streams from the slot it made — there is "
-                    "no window between the snapshot and the stream. Choose this if "
-                    "re-running the load is not acceptable. Two costs: the source tables "
-                    "are read again through the streaming pipeline, and a row DELETED "
-                    "between the load and the start is in neither the snapshot nor the "
-                    "stream, so it stays on the target (Validation reports it as an extra "
-                    "row — reload that table to clear it)."
+                primary=False,
+                summary=(
+                    "Keeps this Full Load — but a row deleted on the source since the "
+                    "load stays on the target."
                 ),
+                detail=(
+                    "Adds CDC without a second load pass: the connector creates its own "
+                    "publication over exactly the captured tables, snapshots them, then "
+                    "streams from the slot it made — there is no window between the "
+                    "snapshot and the stream. Choose this if re-running the load is not "
+                    "acceptable. Two costs: the source tables are read again through the "
+                    "streaming pipeline, and a row DELETED between the load and the start "
+                    "is in neither the snapshot nor the stream, so it stays on the target "
+                    "(Validation reports it as an extra row — reload that table to clear "
+                    "it)."
+                ),
+                on_click=_take_resnapshot,
             )
-
-            async def _take_resnapshot() -> None:
-                migration_state.set_cdc_start_mode("manual")
-                await run_checks(MigrationMode.CDC)
-
-            ui.button(  # type: ignore[attr-defined]
-                "Re-snapshot every table", icon="restart_alt", on_click=_take_resnapshot
-            ).props("flat")
 
 
 # Quasar color names for each prerequisite check status badge. INFO is a calm
@@ -4041,6 +4185,7 @@ __all__ = [
     "summarize_table_states",
     "run_full_load_retry",
     "prerequisite_block_reason",
+    "resnapshot_resolvable_failures",
     "group_prereq_results",
     "PrereqCategory",
     "PrereqCategoryGroup",
@@ -4055,6 +4200,7 @@ __all__ = [
     "source_supports_cdc",
     "prereq_mode_for_type",
     "migration_type_requirements",
+    "migration_type_tradeoff",
     "substeps_for_type",
     "resolve_active_substep_for_type",
     "prerequisites_section_expanded",

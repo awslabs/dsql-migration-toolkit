@@ -37,6 +37,7 @@ Design rules:
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -74,6 +75,44 @@ _QUASAR_SPINNER_COLOR: dict[str, str] = {
 }
 
 
+def notice_box_classes(tone: str) -> str:
+    """Tailwind classes for the notice BOX itself, for the tone's palette.
+
+    Shared by :func:`render_notice` and :func:`notice_container` so the box geometry
+    (rounded, bordered, tinted, padded) is defined exactly once -- two hand-copied
+    class strings would drift the moment one is tuned.
+    """
+    bg, border, _icon_color, _icon = NOTICE_STYLE.get(tone, NOTICE_STYLE["info"])
+    return f"items-start gap-2 no-wrap w-full rounded-md border {border} {bg} p-3"
+
+
+@contextmanager
+def notice_container(ui, *, tone: str, header: str, body: str = "", icon: str = ""):
+    """A :func:`render_notice` box that can hold CONTENT, yielded as its body column.
+
+    Same Cloudscape "Alert" treatment (tinted box, leading status glyph, bold header,
+    optional body line), but the caller can append elements *inside* the box -- the
+    Cloudscape pattern where one alert states a situation and carries the actions that
+    resolve it.
+
+    Use it when a single problem has a small set of mutually exclusive ways forward.
+    Stacking one notice per option instead says the same severity three times in three
+    boxes and leaves the reader to assemble "these are alternatives" themselves; worse,
+    whichever option happens to carry the only button reads as the endorsed one. One box
+    with the choices in it makes the structure (one situation, N routes) visible.
+    """
+    _bg, _border, icon_color, default_icon = NOTICE_STYLE.get(
+        tone, NOTICE_STYLE["info"]
+    )
+    with ui.row().classes(notice_box_classes(tone)):
+        ui.icon(icon or default_icon).classes(f"{icon_color} text-lg")
+        with ui.column().classes("gap-2 flex-1 min-w-0") as body_column:
+            ui.label(header).classes("text-sm font-semibold text-gray-900")
+            if body:
+                ui.label(body).classes("text-xs text-gray-700")
+            yield body_column
+
+
 def render_notice(
     ui,
     *,
@@ -105,10 +144,10 @@ def render_notice(
     tooltip flickers and cannot be read. Callers that just draw a static notice can
     keep ignoring the return value.
     """
-    bg, border, icon_color, default_icon = NOTICE_STYLE.get(tone, NOTICE_STYLE["info"])
-    with ui.row().classes(
-        f"items-start gap-2 no-wrap w-full rounded-md border {border} {bg} p-3"
-    ):
+    _bg, _border, icon_color, default_icon = NOTICE_STYLE.get(
+        tone, NOTICE_STYLE["info"]
+    )
+    with ui.row().classes(notice_box_classes(tone)):
         if busy:
             # Quasar's spinner takes a Quasar color name, while the tone palette is a
             # Tailwind text class ("text-sky-600"); map it to the closest Quasar color
@@ -788,6 +827,8 @@ def form_field(
 
 __all__ = [
     "NOTICE_STYLE",
+    "notice_box_classes",
+    "notice_container",
     "render_notice",
     "ACTIVITY_EVENT_STYLE",
     "render_activity_event",
