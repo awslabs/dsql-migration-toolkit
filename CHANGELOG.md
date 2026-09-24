@@ -5,6 +5,29 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.512
+
+### Fixed
+
+- **A restored session built a MySQL schema converter for a PostgreSQL source.** Two engine
+  reads on the Data Migration screen took the source engine from `source_config` with a MySQL
+  fallback, and a RESTORED session (reconnect, task replacement) records the engine WITHOUT a
+  `source_config` — so it fell back for exactly the operator who reconnects, which is why it
+  went unnoticed. Measured consequence: a PostgreSQL `timestamp` converts to `TIMESTAMPTZ`
+  instead of `TIMESTAMP` (a timezone-semantics change) and `bit(1)` to `SMALLINT`, and every
+  PostgreSQL conversion warning is dropped — including the array / range "unsupported in
+  Aurora DSQL" notes and the 1 MiB per-value ceiling.
+
+  No behaviour changes with this release, and that was verified rather than assumed: the two
+  values these call sites actually consume — the CDC composite re-key columns with
+  foreign-key ownership, and the target primary key for the recreate disclosure — were
+  identical under both converters across nine primary-key shapes including a `bytea` key, no
+  key, a composite key, and a table with a foreign key. The fix is worth making anyway,
+  because that agreement is luck: the moment an engine difference reaches the re-key choice,
+  the CDC record key would be wrong and the sink would upsert on the wrong columns, silently.
+  Both reads now use `session_source_type`, as every other PostgreSQL-aware surface does, so
+  one rule holds for every engine read instead of two with different reasons for being right.
+
 ## v0.1.511
 
 ### Changed

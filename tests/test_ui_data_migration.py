@@ -25527,3 +25527,107 @@ def test_the_rendered_tile_shows_the_engine_aware_blurb() -> None:
     assert "source_type=session_source_type(session)" in call
     # The MySQL-fallback read this replaced must be gone from the CALL, not just shadowed.
     assert "session.source_config.source_type" not in call
+
+
+def test_every_engine_read_in_the_data_migration_screen_survives_a_restore() -> None:
+    """One rule for reading the source engine, because the fallback is wrong exactly once.
+
+    A RESTORED session (reconnect, task replacement) records the engine WITHOUT a
+    ``source_config``, so ``session.source_config.source_type if ... else MYSQL`` yields
+    MySQL for a PostgreSQL session -- and it yields it only for the operator who reconnects,
+    which is why it survived. Measured consequence for the SchemaConverter reads: a PG
+    ``timestamp`` converts to TIMESTAMPTZ instead of TIMESTAMP (a timezone-semantics change)
+    and ``bit(1)`` to SMALLINT, plus every PostgreSQL conversion warning is dropped.
+    """
+    import inspect
+
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration import session_source_type
+    from dsql_migrator.ui import data_migration as dm
+    from dsql_migrator.ui.session import SessionConnectionState
+
+    # The premise, asserted rather than assumed: the two expressions really do disagree.
+    restored = SessionConnectionState()
+    restored.set_restored_source_type(SourceType.POSTGRES)
+    assert restored.source_config is None
+    assert session_source_type(restored) is SourceType.POSTGRES
+
+    # No engine read in this screen may use the fallback form.
+    src = inspect.getsource(dm.build_data_migration_screen)
+    assert "session.source_config.source_type" not in src, (
+        "an engine read still falls back to MySQL; a restored PostgreSQL session would be "
+        "treated as MySQL"
+    )
+    # ...and the reads that replaced it are the shared helper.
+    assert src.count("session_source_type(session)") >= 3
+
+
+def test_the_converter_reads_consume_engine_independent_values_today() -> None:
+    """Pins WHY the fix above is behaviour-preserving, so a future change cannot quietly
+    rely on the opposite. The two SchemaConverter call sites consume the CDC re-key columns,
+    foreign-key ownership, and the target PRIMARY KEY -- none of which diverged by engine
+    when measured. The column TYPES do diverge, which is what made the fix worth making."""
+    from dsql_migrator.core.converter import SchemaConverter, parse_target_primary_key
+    from dsql_migrator.core.models import (
+        ColumnDef,
+        ForeignKeyDef,
+        SourceInventory,
+        SourceType,
+        TableDef,
+    )
+    from dsql_migrator.core.cdc import composite_key_columns_for_cdc
+    from dsql_migrator.ui.data_migration import applied_table_conversions
+
+    def tables():
+        return [
+            TableDef(
+                name="public.blobs",
+                columns=[
+                    ColumnDef(name="h", mysql_type="bytea", nullable=False),
+                    ColumnDef(name="ts", mysql_type="timestamp", nullable=True),
+                    ColumnDef(name="flag", mysql_type="bit(1)", nullable=True),
+                ],
+                primary_key=["h"],
+            ),
+            TableDef(
+                name="public.child",
+                columns=[
+                    ColumnDef(name="id", mysql_type="integer", nullable=False),
+                    ColumnDef(name="pid", mysql_type="integer", nullable=True),
+                ],
+                primary_key=["id"],
+                foreign_keys=[
+                    ForeignKeyDef(
+                        name="fk_child_parent",
+                        columns=["pid"],
+                        referenced_table="public.parent",
+                        referenced_columns=["id"],
+                    )
+                ],
+            ),
+        ]
+
+    consumed, types = {}, {}
+    for st in (SourceType.POSTGRES, SourceType.MYSQL):
+        tabs = tables()
+        conv = SchemaConverter(source_type=st).convert(SourceInventory(tables=tabs))
+        applied = applied_table_conversions(conv, {}, preserve_foreign_keys=True)
+        consumed[st] = (
+            composite_key_columns_for_cdc(tabs, applied),
+            [
+                (t.table, tuple(str(fk) for fk in (t.preserved_foreign_keys or [])))
+                for t in conv.tables
+            ],
+            [parse_target_primary_key(t.target_ddl) for t in conv.tables],
+        )
+        types[st] = [t.target_ddl for t in conv.tables]
+
+    # What the call sites read: identical, so the fix changes no behaviour.
+    assert consumed[SourceType.POSTGRES] == consumed[SourceType.MYSQL]
+    # What they do NOT read: genuinely divergent, so the fix is not cosmetic. If this ever
+    # becomes equal the premise changed and the reasoning above needs revisiting.
+    assert types[SourceType.POSTGRES] != types[SourceType.MYSQL]
+    pg_ddl = "\n".join(types[SourceType.POSTGRES])
+    my_ddl = "\n".join(types[SourceType.MYSQL])
+    assert "TIMESTAMPTZ" in my_ddl and "TIMESTAMPTZ" not in pg_ddl
+    assert "BIT(1)" in pg_ddl and "BIT(1)" not in my_ddl

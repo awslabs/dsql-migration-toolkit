@@ -610,12 +610,20 @@ def build_data_migration_screen(
         # match the target -- no sink change. Recompute from the applied conversion
         # each render and store it on the state for the CDC start path to read.
         if inventory is not None and inventory.tables:
-            _stype = (
-                session.source_config.source_type
-                if session.source_config is not None
-                else SourceType.MYSQL
-            )
-            _conversion = SchemaConverter(source_type=_stype).convert(inventory)
+            # session_source_type, NOT a source_config read with a MySQL fallback: a
+            # RESTORED session (reconnect / task replacement) records the engine WITHOUT a
+            # source_config, so the fallback built a MySQL converter for a PostgreSQL
+            # inventory. Measured: that changes column TYPES (a PG `timestamp` becomes
+            # TIMESTAMPTZ instead of TIMESTAMP -- a timezone-semantics change -- and
+            # `bit(1)` becomes SMALLINT) and drops every PostgreSQL conversion warning.
+            # Neither of the two values THIS site consumes diverges today (verified over
+            # nine PK shapes incl. bytea/no-PK/composite, and with foreign keys), so the
+            # fix is behaviour-preserving -- but only by luck: the moment an engine
+            # difference reaches the re-key choice or FK ownership, the wrong CDC record
+            # key would make the sink upsert on the wrong columns, silently.
+            _conversion = SchemaConverter(
+                source_type=session_source_type(session)
+            ).convert(inventory)
             _applied = applied_table_conversions(
                 _conversion,
                 conv_state.edited_target_ddls,
@@ -2062,11 +2070,15 @@ def build_data_migration_screen(
                                 table_conversions=(
                                     applied_table_conversions(
                                         SchemaConverter(
-                                            source_type=(
-                                                session.source_config.source_type
-                                                if session.source_config is not None
-                                                else SourceType.MYSQL
-                                            )
+                                            # Same restored-session fallback as above.
+                                            # This site only reads the target PRIMARY KEY
+                                            # (schema_recreate_tables ->
+                                            # parse_target_primary_key), which does not
+                                            # diverge by engine, so it is safe today --
+                                            # changed anyway so one rule holds for every
+                                            # engine read rather than two with different
+                                            # reasons for being correct.
+                                            source_type=session_source_type(session)
                                         ).convert(inventory),
                                         conv_state.edited_target_ddls,
                                         preserve_foreign_keys=(
