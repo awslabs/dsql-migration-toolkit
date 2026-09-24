@@ -218,4 +218,36 @@ class DsqlSinkTaskTest {
     assertEquals("", DsqlSinkTask.formatPk((Object) null));
     assertEquals("", DsqlSinkTask.formatPk("not-a-struct"));
   }
+
+  @Test
+  void opSuffixTagsTheDmlOperationThatDecidesTheRecovery() {
+    // The quarantine reason must carry the DML op, because it is what splits the two
+    // recoveries. CDC replicates STATE: a quarantined INSERT or UPDATE converges by
+    // re-reading the source's CURRENT row, so the intermediate value is not needed. A
+    // quarantined DELETE is the opposite -- the row is gone from the source, so no source
+    // query can reveal that the target still holds it, and it must be deleted on the target.
+    // The op was parsed into a local and never logged: an operator grepped 2,705 sink log
+    // lines for it and found zero.
+    assertEquals(
+        " | op: d",
+        DsqlSinkTask.opSuffix(ChangeEvent.delete("app.orders", List.of("id"), List.of(1L), 0L)));
+    assertEquals(
+        " | op: c/r",
+        DsqlSinkTask.opSuffix(
+            ChangeEvent.insert(
+                "app.orders", List.of("id"), List.of(1L), List.of("id"), List.of(1L), 0L)));
+    assertEquals(
+        " | op: u",
+        DsqlSinkTask.opSuffix(
+            ChangeEvent.upsert(
+                "app.orders", List.of("id"), List.of(1L), List.of("id"), List.of(1L), 0L)));
+    // A tombstone APPLIES as a delete, so it reports as one -- with a marker, because
+    // Debezium sends it alongside the op=d envelope for a single source DELETE.
+    assertEquals(
+        " | op: d (tombstone)",
+        DsqlSinkTask.opSuffix(
+            ChangeEvent.tombstone("app.orders", List.of("id"), List.of(1L), 0L)));
+    // No event (the envelope did not parse) -> no op, never a guess.
+    assertEquals("", DsqlSinkTask.opSuffix(null));
+  }
 }

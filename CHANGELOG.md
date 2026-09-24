@@ -5,6 +5,58 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.518
+
+### Fixed
+
+- **A CDC dead-letter record did not say which DML was dropped, so it could not be recovered
+  from (sink plugin v43).** CDC replicates STATE, so a quarantined INSERT or UPDATE converges
+  by re-reading the source's CURRENT row — the intermediate value is not needed. A quarantined
+  DELETE is the opposite: the row is gone from the source, so **no source query can reveal
+  that the target still holds it**, and it must be deleted on the target instead. Those are
+  opposite remedies, and the operation was the only thing that could tell them apart — it was
+  parsed into a local variable in the sink and never logged (an operator grepped 2,705 sink log
+  lines for it and found zero). The quarantine reason now carries `| op: d` / `c/r` / `u` /
+  `d (tombstone)`, and the pre-write size guard passes its parsed event so the op is available
+  on the one path where nothing else could imply it (no SQL is rendered, because nothing was
+  attempted). **Needs Delete + Deploy CDC infrastructure on an existing cdc-stack** — it ships
+  with v42's null-key delete guard, so one redeploy covers both.
+- **The record's structured fields were empty while the information sat in free text.** The
+  CDC quarantine surface parses the sink's CloudWatch log line, and it was discarding most of
+  what it had already matched. Now promoted to real fields: the failed row's **primary key**
+  (it was in the text as `| pk: id=1`, so an operator had to regex the tool's own JSON), the
+  **op**, and the **Kafka topic/partition/offset** — which for a quarantined DELETE is the only
+  route to the original record, because the dead-letter topic is the only place that row still
+  exists. `chunk_id` stays `None` deliberately: it is the sole CDC-vs-Full-Load discriminator
+  in both directions, so filling it would empty the DLQ card and dump every quarantine into the
+  Full Load error log.
+- **A quarantine with no SQLSTATE now has a stable class.** The pre-write size guard raises a
+  `DataException`, so there is no server error and no SQLSTATE to report — which left
+  `error_code` null and forced the UI to match prose. It now reports `OVERSIZED_VALUE`.
+  Deliberately not a 5-character SQLSTATE shape, because the source-schema-drift banner keys
+  off `error_code` and a synthetic code must never be mistaken for one of the SQLSTATEs it
+  maps; a real SQLSTATE always wins over the synthetic one.
+- **The Java logger's own suffix was leaking into an operator-facing field.** The MSK Connect
+  worker's log4j layout appends `(dev.dsqlmigrator.connect.DsqlSinkTask:759)` to every line and
+  its config is AWS-managed, so it cannot be turned off at the source. It is stripped here —
+  without eating the primary key that sits immediately before it.
+- **The oversized-value reason no longer reads as "retry it".** It now states that the row
+  cannot be stored as-is and is never retried, which is what the sink's own classification
+  already guarantees: the transient branches never reach quarantine, so the existence of a
+  `Quarantined record to DLQ` line is itself proof the record was permanently dropped.
+
+### Changed
+
+- **The DLQ panel points at Validation, and names the blind spot.** A dead-letter record says a
+  row was dropped; only Validation shows the consequence on the target, per table and by
+  primary key — and the two surfaces were not linked at all (Validation never reads a
+  dead-letter record, and the quarantine count feeding its "known gap" acknowledgement is
+  Full-Load-only, so a CDC quarantine can never populate it). The panel now says which
+  Validation result means which recovery — rows MISSING are a dropped insert that a reload
+  fixes, rows EXTRA are a dropped delete that a reload **cannot** — and discloses the gap: a
+  dropped UPDATE changes no row count, so the DEFAULT row-count mode cannot see it at all, and
+  even CHECKSUM skips json and floating-point columns.
+
 ## v0.1.517
 
 ### Fixed

@@ -612,6 +612,19 @@ class CdcConnectorError(BaseModel):
     table: str = Field(min_length=1)
     message: str = Field(min_length=1)
     error_code: Optional[str] = None
+    # The failed row's PK, the DML op, and the Kafka coordinates -- promoted out of the free
+    # text because an operator cannot decide a recovery from prose. ``op`` is what splits the
+    # two recoveries: a quarantined INSERT/UPDATE converges by re-reading the source's current
+    # row, a quarantined DELETE never can (the row is gone from the source, so no source query
+    # reveals that the target still holds it). ``topic``/``partition``/``offset`` locate the
+    # ORIGINAL record on the dead-letter topic, which for a quarantined DELETE is the only
+    # place that row still exists. All None on a record from a sink older than plugin v43, or
+    # from a path with no op to report -- never guessed.
+    pk: Optional[str] = None
+    op: Optional[str] = None
+    topic: Optional[str] = None
+    partition: Optional[int] = None
+    offset: Optional[int] = None
     occurred_at: Optional[datetime] = None
 
     @property
@@ -1248,6 +1261,13 @@ class CdcPipelineOrchestrator:
                 DataErrorRecord(
                     table=error.table,
                     error_code=error.error_code,
+                    # The structured PK, so the downloadable error log and the DLQ card can
+                    # show it as a column instead of leaving the operator to regex the JSON.
+                    # chunk_id is deliberately left None: is_cdc_error_record() uses
+                    # "chunk_id is None" as the ONLY CDC-vs-Full-Load discriminator, in both
+                    # directions, so filling it would empty the DLQ card and dump every
+                    # quarantine into the Full Load error log.
+                    pk=error.pk,
                     message=error.message,
                     occurred_at=error.occurred_at or self._now(),
                 ),

@@ -97,8 +97,16 @@ def test_parse_keeps_surrogate_pk_in_message() -> None:
     assert rec is not None
     assert rec.table == "ecommerce.product_media"
     assert "pk: product_id=14" in rec.message
-    # A permanent-limit rejection carries no SQLSTATE.
-    assert rec.error_code is None
+    # The PK is ALSO promoted to a structured field: an operator should not have to regex the
+    # tool's own JSON to get it. It stays in the message because the downloadable error log
+    # renders the message.
+    assert rec.pk == "product_id=14"
+    # A permanent-limit rejection carries no SQLSTATE (the sink's pre-write size guard raises a
+    # DataException -- there is no server error), so it gets a stable synthetic class instead of
+    # leaving the UI to match prose.
+    from dsql_migrator.core.cdc_dlq import OVERSIZED_VALUE_CODE
+
+    assert rec.error_code == OVERSIZED_VALUE_CODE
 
 
 def test_parse_keeps_withheld_natural_key_pk_in_message() -> None:
@@ -153,5 +161,130 @@ def test_parse_ordinary_poison_row_has_no_drift_kind() -> None:
     )
     rec = parse_dlq_log_message(msg)
     assert rec is not None
-    assert rec.error_code is None
+    # Classified, but NOT as schema drift: the synthetic class must never be mistaken for one
+    # of the SQLSTATEs classify_schema_drift maps, or an oversized row would raise a "source
+    # schema change" banner. Not a 5-character SQLSTATE shape, so it cannot collide.
+    from dsql_migrator.core.cdc_dlq import OVERSIZED_VALUE_CODE
+
+    assert rec.error_code == OVERSIZED_VALUE_CODE
+    assert len(OVERSIZED_VALUE_CODE) != 5
     assert rec.drift_kind is None
+
+
+def test_the_quarantine_record_carries_the_op_that_decides_the_recovery() -> None:
+    """Without the op an operator cannot tell which recovery applies, and one of the two
+    cannot be discovered from the source at all.
+
+    CDC replicates STATE, so a quarantined INSERT or UPDATE converges by re-reading the
+    source's CURRENT row -- the intermediate value is not needed. A quarantined DELETE is the
+    opposite: the row is gone from the source, so no source query can reveal that the target
+    still holds it; it must be deleted on the target. A real operator grepped 2,705 sink log
+    lines for the operation and found zero. The sink tags it as of plugin v43.
+    """
+    ops = {
+        "d": "d",
+        "c/r": "c/r",
+        "u": "u",
+        "d (tombstone)": "d (tombstone)",
+    }
+    for tag, expected in ops.items():
+        msg = (
+            "Quarantined record to DLQ (topic=dsqlcdc.app.orders, partition=1, offset=6): "
+            f"boom | pk: id=510 | op: {tag}"
+        )
+        rec = parse_dlq_log_message(msg)
+        assert rec is not None, tag
+        assert rec.op == expected, tag
+        # The op tag must not leak into the pk field.
+        assert rec.pk == "id=510", tag
+
+    # A record from a sink OLDER than v43 has no op. It must stay None, never guessed: a wrong
+    # op sends the operator to the wrong recovery, which is worse than no op at all.
+    old = parse_dlq_log_message(
+        "Quarantined record to DLQ (topic=dsqlcdc.app.orders, partition=1, offset=6): "
+        "boom | pk: id=510"
+    )
+    assert old is not None and old.op is None
+    assert old.pk == "id=510"
+
+
+def test_the_quarantine_record_keeps_the_kafka_coordinates() -> None:
+    """For a quarantined DELETE the dead-letter topic is the ONLY place the row still exists.
+
+    The source no longer has it, so the Kafka coordinates are the operator's only route to the
+    original record (key + value + Connect context headers). The parser captured partition
+    since its first version and then discarded it.
+    """
+    rec = parse_dlq_log_message(
+        "Quarantined record to DLQ (topic=dsqlcdc.app.orders, partition=3, offset=99): boom"
+    )
+    assert rec is not None
+    assert (rec.topic, rec.partition, rec.offset) == ("dsqlcdc.app.orders", 3, 99)
+    assert rec.table == "app.orders"
+
+
+def test_the_log4j_logger_suffix_is_stripped_from_the_operator_message() -> None:
+    """The MSK Connect worker's layout appends "(logger:line)" to every line.
+
+    Its log4j config is AWS-managed and not operator-editable, so the Java class name and a
+    source line number were landing inside a field the operator reads. It cannot be turned off
+    at the source; it is stripped here.
+    """
+    rec = parse_dlq_log_message(
+        "Quarantined record to DLQ (topic=dsqlcdc.app.orders, partition=1, offset=6): "
+        "Value for column 'content' exceeds DSQL's 1048576-byte limit; quarantined. "
+        "| pk: id=1 (dev.dsqlmigrator.connect.DsqlSinkTask:759)"
+    )
+    assert rec is not None
+    assert "DsqlSinkTask" not in rec.message, rec.message
+    assert ":759" not in rec.message
+    # ...and stripping it must not eat the PK that sits immediately before it.
+    assert rec.pk == "id=1"
+    assert rec.message.endswith("| pk: id=1")
+
+
+def test_the_pk_parser_stops_at_the_next_section() -> None:
+    """The sink appends " | op: ..." and " | sql: ..." after the PK; the PK must not swallow
+    them (the SQL template is long, and a bloated pk field is unusable as a column)."""
+    rec = parse_dlq_log_message(
+        "Quarantined record to DLQ (topic=dsqlcdc.app.orders, partition=1, offset=6): "
+        "sqlstate=23505 duplicate key | pk: user_id=42,id=510 | op: c/r "
+        "| sql: INSERT INTO \"app\".\"orders\" (\"id\") VALUES (?) ON CONFLICT ..."
+    )
+    assert rec is not None
+    assert rec.pk == "user_id=42,id=510"
+    assert rec.op == "c/r"
+    # A real SQLSTATE still wins over the synthetic class.
+    assert rec.error_code == "23505"
+    # The SQL template stays in the message (it is what the error log renders).
+    assert "ON CONFLICT" in rec.message
+
+
+def test_the_sink_wires_the_event_into_the_size_guard_quarantine() -> None:
+    """Cross-language guard: the op is useless if the call site does not pass the event.
+
+    Proven necessary by mutation — dropping ``event`` from the size-guard's reportOrThrow call
+    COMPILES and every Java test still passed, because the overload without it is a valid
+    signature. That path is the one the reported record came from, and it is the only path
+    where the op cannot be inferred from anything else (no SQL is rendered, because nothing was
+    attempted).
+    """
+    import pathlib
+
+    sink = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "connectors/dsql-sink/src/main/java/dev/dsqlmigrator/connect/DsqlSinkTask.java"
+    )
+    src = sink.read_text(encoding="utf-8")
+
+    # The size guard must use the 3-arg overload (record, event, cause).
+    guard = src[src.index("String oversized = oversizedColumn(event);") :]
+    guard = guard[: guard.index("batch.add(")]
+    assert "reportOrThrow(\n            record,\n            event," in guard, guard[:600]
+
+    # Both quarantine paths that HAVE an event must render the op.
+    assert src.count("opSuffix(event)") >= 2, "the op must reach both quarantine reasons"
+    # ...and the parse-failure path must NOT invent one (there is no event there).
+    parse_fail = src[src.index("// Unparseable/poison envelope") :]
+    parse_fail = parse_fail[: parse_fail.index("if (event.isDelete()")]
+    assert "opSuffix" not in parse_fail

@@ -49,6 +49,35 @@ _DLQ_LINE = re.compile(
 # Extract a SQLSTATE-like code (e.g. "sqlstate=42804") when the sink included it.
 _SQLSTATE = re.compile(r"sqlstate[=:\s]+(?P<state>[0-9A-Za-z]{5})", re.IGNORECASE)
 
+# The failed row's PRIMARY KEY, which the sink appends as " | pk: id=1". It was left buried
+# in the message text, so an operator had to regex the tool's own JSON to get it. Stops at the
+# next " | " section (the sink may append " | op: ..." and " | sql: ...") and at the log4j
+# suffix below, so it never swallows either.
+_PK = re.compile(r"\|\s*pk:\s*(?P<pk>.+?)(?=\s*\||\s*\([\w.$]+:\d+\)\s*$|$)")
+
+# The DML operation the sink now tags (plugin v43): " | op: d", " | op: c/r", " | op: u",
+# " | op: d (tombstone)". THE field that decides the recovery, because CDC replicates state: a
+# quarantined INSERT or UPDATE converges by re-reading the source's current row, while a
+# quarantined DELETE cannot -- the row is gone from the source, so no source query can reveal
+# that the target still holds it. Absent on a record produced by an older sink, in which case
+# it stays None rather than being guessed.
+_OP = re.compile(r"\|\s*op:\s*(?P<op>[a-z](?:/[a-z])?)(?P<tombstone>\s*\(tombstone\))?")
+
+# log4j's own "(logger:line)" tail. The MSK Connect worker's layout is AWS-managed and appends
+# %c:%L to every line, so "(dev.dsqlmigrator.connect.DsqlSinkTask:759)" was landing inside the
+# operator-facing message. It cannot be turned off at the source; strip it here.
+_LOG4J_TAIL = re.compile(r"\s*\([\w.$]+:\d+\)\s*$")
+
+# A STABLE code for the quarantines that carry no SQLSTATE, so the UI can branch on the error
+# CLASS instead of matching prose. The sink's pre-write size guard raises a DataException --
+# there is no server error and therefore no SQLSTATE to report (asserted in tests/test_cdc_dlq
+# as intended behaviour), yet it is the most common quarantine in practice and the one with a
+# specific remedy. Deliberately NOT a 5-character SQLSTATE shape: classify_schema_drift() keys
+# the source-schema-drift banner off error_code, and a synthetic code must never be mistaken
+# for one of the SQLSTATEs it maps.
+OVERSIZED_VALUE_CODE = "OVERSIZED_VALUE"
+_OVERSIZED = re.compile(r"exceeds DSQL's\s+\d+-byte limit", re.IGNORECASE)
+
 # The reason may carry the sink's rendered SQL TEMPLATE (column names + `?`
 # placeholders, never values), so allow a longer message than a bare error string
 # while still bounding it so a pathological line can't bloat the error log.
@@ -105,11 +134,36 @@ def parse_dlq_log_message(
     if match is None:
         return None
     reason = (match.group("reason") or "").strip() or "quarantined to DLQ"
+    reason = _LOG4J_TAIL.sub("", reason).strip() or "quarantined to DLQ"
     code = _SQLSTATE.search(message)
+    # A synthetic class only when the sink reported no SQLSTATE: a real one always wins, so
+    # this can never mask a server error.
+    error_code = code.group("state") if code else None
+    if error_code is None and _OVERSIZED.search(reason):
+        error_code = OVERSIZED_VALUE_CODE
+    pk_match = _PK.search(reason)
+    op_match = _OP.search(reason)
+    op = None
+    if op_match is not None:
+        op = op_match.group("op")
+        if op_match.group("tombstone"):
+            op = f"{op} (tombstone)"
     surfaced = f"DLQ offset={match.group('offset')}: {reason}"
     return CdcConnectorError(
         table=_table_from_topic(match.group("topic")),
         message=surfaced[:_MAX_MESSAGE_LEN],
-        error_code=code.group("state") if code else None,
+        error_code=error_code,
+        # Promoted OUT of the message into structured fields. Both stay in the message too --
+        # the message is what the downloadable error log renders, and truncating history to
+        # move a field would lose information.
+        pk=pk_match.group("pk").strip() if pk_match else None,
+        op=op,
+        # Kafka coordinates, parsed since the first version of this regex and then discarded.
+        # They are how an operator finds the ORIGINAL record (key + value + Connect context
+        # headers) on the dead-letter topic, which for a quarantined DELETE is the only place
+        # the row still exists at all -- the source no longer has it.
+        topic=match.group("topic"),
+        partition=int(match.group("partition")),
+        offset=int(match.group("offset")),
         occurred_at=occurred_at,
     )

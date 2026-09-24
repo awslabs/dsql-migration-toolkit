@@ -1581,6 +1581,33 @@ def _render_cdc_dlq_breakdown(ui, status_view: LoadStatusView) -> None:
         ui.label("By table:").classes("text-xs text-gray-500")  # type: ignore[attr-defined]
         for table, count in ordered:
             ui.badge(f"{table} ×{count}").props("color=grey-7 outline")  # type: ignore[attr-defined]
+    # WHAT TO DO with a quarantine, and where the answer actually lives. The dead-letter
+    # record says a row was dropped; only Validation says what the TARGET is missing or
+    # holding as a result, per table and by primary key -- and the two surfaces were not
+    # linked at all (Validation never reads a dead-letter record, and the Full-Load-only
+    # quarantine count that feeds its "known gap" acknowledgement is not populated by CDC).
+    #
+    # The blind spot is stated because it is wider than it looks: a quarantined UPDATE changes
+    # no row count, so RECONCILE cannot see it -- and ROW_COUNT is the DEFAULT validation mode,
+    # so on a default run nothing catches it. CHECKSUM does, except on columns it excludes
+    # (json / floating point). Telling the operator to run CHECKSUM is the difference between
+    # "verified" and "assumed".
+    render_notice(
+        ui,
+        tone="info",
+        icon="fact_check",
+        header="Confirm the effect of these drops in Validation",
+        body=(
+            "A dead-lettered record is a row the stream did NOT apply; Validation is what "
+            "shows the consequence on the target. Re-run it for the tables above and read "
+            "the record-level result: rows MISSING on the target are a dropped insert (a "
+            "reload fixes them), rows EXTRA on the target are a dropped delete (a reload "
+            "cannot — that table must be dropped and reloaded, or the row deleted). Run it "
+            "in CHECKSUM mode: a dropped UPDATE changes no row count, so the default "
+            "row-count mode cannot see it, and even CHECKSUM skips json and floating-point "
+            "columns."
+        ),
+    )
 
 # Cap the inline DLQ record list so a flood of poison rows never renders an
 # unbounded table in the browser; the full set is always in the downloadable log.

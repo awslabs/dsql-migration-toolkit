@@ -278,12 +278,18 @@ public class DsqlSinkTask extends SinkTask {
       // write) rather than let it stall the partition.
       String oversized = oversizedColumn(event);
       if (oversized != null) {
+        // The event is in scope here, so the op can be reported -- and on THIS path it is
+        // the only source of it: no SQL is rendered (nothing was attempted), so the
+        // delete-vs-upsert shape of the statement cannot stand in for it.
         reportOrThrow(
             record,
+            event,
             new DataException(
                 "Value for column '" + oversized + "' exceeds DSQL's "
                     + DSQL_MAX_VALUE_BYTES + "-byte limit; quarantined "
-                    + "(exclude oversized LOB columns at capture)."));
+                    + "(exclude oversized LOB columns at capture). This row cannot be "
+                    + "stored as-is and is never retried: exclude the column at capture "
+                    + "and keep the value outside the database."));
         continue;
       }
       batch.add(new Applicable(record, event));
@@ -630,14 +636,65 @@ public class DsqlSinkTask extends SinkTask {
   }
 
   /**
+   * The DML operation, as a {@code " | op: d"} tag for the quarantine reason.
+   *
+   * <p>Without it a quarantine record cannot be recovered from. CDC replicates STATE, so a
+   * lost INSERT or UPDATE converges by re-reading the source's CURRENT row -- but a lost
+   * DELETE does NOT: the row is gone from the source, so no source query can reveal that the
+   * target still holds it. Those two need opposite remedies (apply the current value vs.
+   * delete on the target), and the op is the only thing that tells them apart. It was parsed
+   * into a local and thrown away: a real operator grepped 2,705 log lines for it and found
+   * nothing.
+   *
+   * <p>Debezium's own letters, so the tag matches the envelope the operator can read in the
+   * DLQ topic: {@code c} create, {@code u} update, {@code d} delete, {@code r} snapshot read.
+   * A tombstone is reported as {@code d} with a marker, because it APPLIES as a delete.
+   */
+  // Package-private so a unit test can assert the rendering directly, the same seam
+  // sqlStateTag/safeCauseMessage already use.
+  static String opSuffix(ChangeEvent event) {
+    if (event == null) {
+      return "";
+    }
+    if (event.isTombstone()) {
+      return " | op: d (tombstone)";
+    }
+    if (event.isDelete()) {
+      return " | op: d";
+    }
+    if (event.isInsert()) {
+      return " | op: c/r";
+    }
+    if (event.isUpdate()) {
+      return " | op: u";
+    }
+    return "";
+  }
+
+  /**
    * Quarantine a permanently-rejected record to the DLQ and continue. If no
    * reporter is wired, log and skip rather than killing the task (the pipeline
    * keeps moving; the loss is visible in the log).
    */
   private void reportOrThrow(SinkRecord record, Exception cause) {
-    // No ChangeEvent on this path (the envelope did not parse, or the size guard
-    // fired before batching), so read the PK straight off the Connect record key.
+    // No ChangeEvent on this path (the envelope did not parse), so read the PK straight off
+    // the Connect record key and report no op -- there is genuinely none to report.
     quarantine(record, cause, safeCauseMessage(cause) + pkSuffix(formatPk(record.key())));
+  }
+
+  /**
+   * Quarantine a PRE-WRITE rejection that does have a parsed event (the size guard).
+   *
+   * <p>Separate from the {@code SQLException} overload below because nothing was attempted,
+   * so there is no SQL template to render -- but the op and the event's own type-converted PK
+   * ARE available, and both are what make the record recoverable.
+   */
+  private void reportOrThrow(SinkRecord record, ChangeEvent event, Exception cause) {
+    String pk = pkSuffix(formatPk(event.pkColumns(), event.pkValues()));
+    if (pk.isEmpty()) {
+      pk = pkSuffix(formatPk(record.key()));
+    }
+    quarantine(record, cause, safeCauseMessage(cause) + pk + opSuffix(event));
   }
 
   /**
@@ -670,7 +727,8 @@ public class DsqlSinkTask extends SinkTask {
     // key is empty.
     String pk = pkSuffix(formatPk(event.pkColumns(), event.pkValues()));
     String message = safeCauseMessage(cause);
-    String reason = sql == null ? message + pk : message + pk + " | sql: " + sql;
+    String op = opSuffix(event);
+    String reason = sql == null ? message + pk + op : message + pk + op + " | sql: " + sql;
     quarantine(record, cause, sqlStateTag(cause) + reason);
   }
 

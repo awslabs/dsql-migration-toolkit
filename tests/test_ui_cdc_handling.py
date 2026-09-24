@@ -1095,3 +1095,52 @@ def test_start_cdc_uses_the_shared_watermark_coordinate() -> None:
     assert "watermark_coordinate(" in src
     start = inspect.getsource(_cdc_ui._start_cdc_deploy)
     assert "_cdc_start_detail(" in start
+
+
+def test_the_dlq_panel_points_at_validation_and_names_the_blind_spot() -> None:
+    """A dead-letter record says a row was dropped; only Validation says what that COST.
+
+    The two surfaces were not linked at all: Validation never reads a dead-letter record, and
+    the quarantine count feeding its "known gap" acknowledgement is Full-Load-only, so a CDC
+    quarantine can never populate it. Worse, the operator cannot reach the right answer by
+    default -- a dropped UPDATE changes no row count, and ROW_COUNT is the default validation
+    mode, so nothing catches it unless CHECKSUM is chosen (and even CHECKSUM skips json and
+    floating-point columns). Saying that is the difference between verified and assumed.
+    """
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import ErrorLogSummary
+    from dsql_migrator.ui.data_migration._cdc_monitoring import _render_cdc_dlq_breakdown
+
+    ui = _FakeUi()
+    view = SimpleNamespace(
+        error_summary=ErrorLogSummary(
+            total_errors=4,
+            errors_by_table={"ecommerce.product_media": 3, "ecommerce.orders": 1},
+        )
+    )
+    _render_cdc_dlq_breakdown(ui, view)
+    body = " ".join(ui.texts)
+
+    # The per-table chips still render (the at-a-glance answer is unchanged).
+    assert "ecommerce.product_media ×3" in body
+
+    # It points at Validation in the HEADER, not only buried in the body: the bold header is
+    # what a scanning operator reads, and a body-only mention survived a mutation that reworded
+    # the header to say nothing actionable.
+    assert "Confirm the effect of these drops in Validation" in ui.texts, ui.texts
+    # ...and splits the two recoveries by what Validation actually reports.
+    assert "Validation" in body
+    assert "MISSING on the target" in body and "dropped insert" in body
+    assert "EXTRA on the target" in body and "dropped delete" in body
+    # The extra-row case must say a reload cannot fix it -- that is the whole distinction.
+    assert "reload cannot" in body
+    # The blind spot, including that the DEFAULT mode is the one that misses it.
+    assert "CHECKSUM" in body
+    assert "row-count mode cannot see it" in body
+    assert "json" in body
+
+    # Nothing to say when the stream is clean.
+    quiet = _FakeUi()
+    _render_cdc_dlq_breakdown(quiet, SimpleNamespace(error_summary=None))
+    assert "Validation" not in " ".join(quiet.texts)

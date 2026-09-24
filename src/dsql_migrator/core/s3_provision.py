@@ -405,7 +405,19 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # because the sink ZIP's CONTENT changed: a live cdc-stack needs Delete + Deploy infra to pick
 # it up (Start CDC alone does not re-register the plugin), and until it does, the PREREQUISITE
 # is what protects that deployment.
-PLUGIN_VERSION = "v42"
+# v43: the quarantine log line now carries the DML OP ("| op: d" / "c/r" / "u" /
+# "d (tombstone)"), and the pre-write size guard reports the parsed event so the op is
+# available on the path that has no SQL to infer it from. Without it a dead-letter record
+# could not be recovered from: CDC replicates STATE, so a quarantined INSERT or UPDATE
+# converges by re-reading the source's CURRENT row, while a quarantined DELETE never can --
+# the row is gone from the source, so no source query reveals that the target still holds it,
+# and it must be deleted on the target instead. Those are opposite remedies and the op is the
+# only thing that tells them apart; a real operator grepped 2,705 sink log lines for it and
+# found zero. The oversized-value reason also now states that the row cannot be stored as-is
+# and is never retried. Bumped because the sink ZIP's CONTENT changed: a live cdc-stack needs
+# Delete + Deploy infra to pick it up. Ships together with v42's null-key delete guard, so one
+# redeploy covers both.
+PLUGIN_VERSION = "v43"
 
 
 class S3ProvisionError(RuntimeError):
