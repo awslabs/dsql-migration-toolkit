@@ -113,6 +113,7 @@ from dsql_migrator.core.watermark import WatermarkCapturer
 from dsql_migrator.ui.ai_assist import ai_is_usable
 from dsql_migrator.ui.design import (
     NOTICE_STYLE,
+    WRAP_CELLS_PROP,
     inline_hint,
     notice_container,
     render_notice,
@@ -4139,7 +4140,15 @@ def _render_prereq_table(
         }
         for result in results
     ]
-    ui.table(columns=columns, rows=rows, row_key="check").classes("w-full")
+    # WRAP the cells. "Detail / remediation" is by far the widest column -- a failed
+    # PostgreSQL replication-objects check carries ~800 characters of detail plus
+    # remediation -- and on one line it pinned the table ~3.5x its card, so the row was
+    # clipped ("The connector does n...") and only reachable through a horizontal
+    # scrollbar. The longest remediation is the one the operator most needs and was the
+    # least visible. Costs row height, which the page can scroll; see WRAP_CELLS_PROP.
+    ui.table(columns=columns, rows=rows, row_key="check").classes("w-full").props(
+        WRAP_CELLS_PROP
+    )
 
 
 # -- Infrastructure input form (BYO-VPC) ------------------------------------

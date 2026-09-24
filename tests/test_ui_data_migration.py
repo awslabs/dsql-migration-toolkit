@@ -9280,6 +9280,10 @@ class _RecordingUi:
         self.buttons: list = []
         # Rendered ui.table() payloads ({"rows": [...], "columns": [...]}).
         self.tables: list = []
+        # The table ELEMENTS, parallel to `tables`, so a test can ask what props a table
+        # carries -- a Quasar table prop is the difference between a wrapped cell and a
+        # clipped one, and an unrecognised prop is silently ignored rather than raising.
+        self.table_elements: list = []
         # Stylesheets installed via ui.add_css, so a test can assert a screen actually
         # installs the CSS its classes depend on (a class without its stylesheet is
         # inert). Recorded rather than ignored for the same reason texts are.
@@ -9484,7 +9488,9 @@ class _RecordingUi:
             for value in row.values():
                 if value is not None:
                     self.texts.append(str(value))
-        return self._El(self)
+        el = self._El(self)
+        self.table_elements.append(el)
+        return el
 
     def checkbox(self, text="", *_a, on_change=None, **_k):
         if text is not None:
@@ -23478,6 +23484,11 @@ def test_prereq_table_shows_the_observed_value_and_the_remediation() -> None:
                 def classes(self, *_a, **_k):
                     return self
 
+                def props(self, *_a, **_k):
+                    # Real NiceGUI elements are chainable through .props too, and the
+                    # prerequisite table now sets one (wrap-cells) after .classes().
+                    return self
+
             return _E()
 
     dm._render_prereq_table(
@@ -25208,12 +25219,34 @@ def test_the_config_and_the_probe_agree_on_the_two_start_knobs() -> None:
     assert "connector_autocreates_publication=force_initial" in src
     assert "and not force_initial" in src  # resumes_from_slot is narrowed by it
 
-    # Both call sites must pass it, or the surface that forgot re-blocks the accepted
-    # re-snapshot. The worker backstop is the one that actually aborts the job.
-    whole = inspect.getsource(_cdc_ui)
-    calls = whole.count("_probe_pg_replication_objects,")
-    assert calls >= 2, calls
-    assert whole.count("force_initial=") >= 2
+    # EXACTLY ONE caller derives the probe's inputs: the shared gate. Per-call-site
+    # derivation is how this defect kept coming back -- v0.1.509's Deploy gate passed
+    # `[], None` with no force_initial and re-blocked the accepted re-snapshot, and the
+    # Start dialog graded coverage against the whole inventory instead of the captured set.
+    # By AST, and over REFERENCES rather than call syntax: the Deploy gate's bug passed the
+    # probe to run.io_bound as a VALUE (`run.io_bound(_probe_pg_replication_objects, ...)`),
+    # which a substring count of "_probe_pg_replication_objects(" does not see at all
+    # (proven by mutation -- the count-based version of this assertion survived reverting
+    # the Deploy dialog to its own derivation).
+    import ast
+
+    tree = ast.parse(inspect.getsource(_cdc_ui))
+    referencing = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name) and sub.id == "_probe_pg_replication_objects":
+                referencing.add(node.name)
+    assert referencing == {"_pg_objects_gate_block"}, (
+        "every gate surface must go through _pg_objects_gate_block; these reference the "
+        f"raw probe and so derive its inputs themselves: {sorted(referencing)}"
+    )
+    gate = inspect.getsource(_cdc_ui._pg_objects_gate_block)
+    # The gate derives BOTH mirrored decisions from the functions the config builder uses.
+    assert "_cdc_tables_for_config(" in gate
+    assert "_cdc_resume_signal(" in gate
+    assert "force_initial=force_initial" in gate
 
 
 def test_the_prerequisite_panel_offers_the_continuation_beside_the_failing_row() -> None:
@@ -25990,3 +26023,220 @@ def test_the_tradeoff_note_is_only_for_full_load_only_on_postgres() -> None:
             assert migration_type_tradeoff(mt, SourceType.POSTGRES) == "", mt
     # Default engine is MySQL, so an older caller that passes no engine gains no note.
     assert migration_type_tradeoff(MigrationType.FULL_LOAD_ONLY) == ""
+
+
+def test_the_prerequisite_results_table_wraps_its_remediation_cells() -> None:
+    """The longest remediation was the least visible.
+
+    "Detail / remediation" is by far the widest column -- a failed PostgreSQL
+    replication-objects check carries ~800 characters of detail plus remediation -- and
+    Quasar holds every cell on ONE line unless the table says otherwise (it puts
+    `q-table--no-wrap` on its container by default). Measured in a real browser at a 1304px
+    card: the cell was 4656px wide and `.q-table__middle` scrolled (scrollWidth 5082), so
+    the row read "The connector does n..." and the rest was behind a horizontal scrollbar.
+    With the prop the cell wraps to 1092px and the scrollbar is gone.
+    """
+    from dsql_migrator.core.models import ColumnDef, TableDef
+    from dsql_migrator.core.prerequisites_postgres import (
+        PostgresCdcFacts,
+        check_cdc_replication_objects,
+    )
+    from dsql_migrator.ui.data_migration import _render_prereq_table
+    from dsql_migrator.ui.design import WRAP_CELLS_PROP
+
+    row = check_cdc_replication_objects(
+        PostgresCdcFacts(
+            checked_publication_name="dsql_cdc_pub", checked_slot_name="dsql_cdc_slot",
+            publication_present=False, publication_tables=(),
+        ),
+        [
+            TableDef(
+                name="ecommerce.orders",
+                columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+                primary_key=["id"],
+            )
+        ],
+        provisions_replication=False,
+    )
+    # The premise: this really is a cell no card width can show on one line.
+    cell = " ".join(p for p in (row.detail, row.remediation) if p)
+    assert len(cell) > 600, len(cell)
+
+    ui = _RecordingUi()
+    _render_prereq_table(ui, [row])
+    assert ui.table_elements, "the results table must render"
+    applied = " ".join(ui.table_elements[0].props_seen)
+    assert WRAP_CELLS_PROP in applied, applied
+    # Via the design-system constant, so the Quasar prop name lives in one place -- an
+    # unrecognised prop is silently IGNORED by Quasar, so a typo here degrades to the exact
+    # clipped table this fixes, with nothing raising.
+    assert WRAP_CELLS_PROP == "wrap-cells"
+
+    # ...and the full text is in the row, so wrapping is the only thing between the
+    # operator and the remediation (it is never truncated server-side).
+    assert ui.tables[0]["rows"][0]["detail"] == cell
+
+
+def test_the_wrap_cells_prop_is_one_quasar_actually_recognises() -> None:
+    """A wrong prop name is INERT, not an error -- the worst shape of a UI regression.
+
+    So this asserts against the Quasar build NiceGUI actually ships: QTable exposes the
+    prop as `wrapCells` (kebab-case `wrap-cells` in the template), and it is what removes
+    the `q-table--no-wrap` container class that carries `white-space: nowrap` onto every
+    cell. If a NiceGUI upgrade renames or drops it, this fails here instead of silently
+    restoring the horizontal scrollbar.
+    """
+    from pathlib import Path
+
+    import nicegui
+
+    from dsql_migrator.ui.design import WRAP_CELLS_PROP
+
+    js = Path(nicegui.__file__).parent / "static" / "quasar.umd.prod.js"
+    if not js.exists():  # pragma: no cover - only if NiceGUI restructures its assets
+        pytest.skip("bundled Quasar build not found")
+    source = js.read_text(encoding="utf-8", errors="replace")
+    camel = "".join(
+        part.capitalize() if i else part
+        for i, part in enumerate(WRAP_CELLS_PROP.split("-"))
+    )
+    assert camel == "wrapCells"
+    assert camel in source, "the bundled Quasar no longer defines this prop"
+    assert "q-table--no-wrap" in source, (
+        "the container class this prop removes is gone; re-verify the wrapping mechanism"
+    )
+
+
+def _pg_gate_fixture(monkeypatch, *, publication_present, covered):
+    """Wire a fake PostgreSQL source whose catalog answers the replication-objects query."""
+    from types import SimpleNamespace
+
+    from dsql_migrator.core import cdc_pg_slot as pg_slot
+    from dsql_migrator.core.models import SourceType
+
+    def _read(_conn, *, publication_name, slot_name):
+        return pg_slot.PgReplicationObjects(
+            publication_name=publication_name,
+            slot_name=slot_name,
+            publication_present=publication_present,
+            publication_publishes_all_dml=True,
+            publication_tables=frozenset(covered),
+            slot_present_any_database=False,
+            slot_usable=False,
+        )
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _Eng:
+        def connect(self):
+            return _Conn()
+
+        def dispose(self):
+            return None
+
+    monkeypatch.setattr(pg_slot, "read_pg_replication_objects", _read)
+    monkeypatch.setattr(
+        "dsql_migrator.ui.connect.make_source_engine_factory",
+        lambda *_a, **_k: (lambda *_b, **_c: _Eng()),
+    )
+    session = SimpleNamespace(
+        source_config=SimpleNamespace(source_type=SourceType.POSTGRES, database="app"),
+        source_password=None,
+    )
+    inventory = SimpleNamespace(tables=[SimpleNamespace(name="app.orders")])
+    return session, inventory
+
+
+def test_the_deploy_gate_honours_a_recorded_re_snapshot_decision(monkeypatch) -> None:
+    """The reporter's item: the decision block's route was ignored one screen later.
+
+    v0.1.509 gave the Deploy dialog this gate but called the probe with `[], None` and no
+    force_initial, so an operator who chose "Re-snapshot every table" -- watching the checks
+    flip to Can proceed -- was then blocked by a red panel whose claim ("the connector is
+    configured with publication.autocreate.mode=disabled") is FALSE for that route, and told
+    to start over as "Full load + CDC". The continuation was a dead end again.
+    """
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    session, inventory = _pg_gate_fixture(
+        monkeypatch, publication_present=False, covered=[]
+    )
+    state = DataMigrationState()
+    state.cdc_stack_name = "dsql-cdc-stack"
+    state.set_selection(TableSelection(selected_tables=["app.orders"]))
+
+    # Default (no decision recorded): an absent publication DOES block -- the connector
+    # would die seconds after two billable connectors exist.
+    blocked = _cdc_ui._pg_objects_gate_block(state, session, inventory, None)
+    assert blocked is not None
+    assert "publication" in (blocked[0] + blocked[1]).lower()
+
+    # The operator takes the re-snapshot route: the CONNECTOR's own DB user creates the
+    # publication (publication.autocreate.mode=filtered), so the absence is no longer a
+    # blocker -- and this gate must agree, because it is what stands between the operator
+    # and the deploy.
+    state.set_cdc_start_mode("manual")
+    state.set_cdc_pg_autocreate_publication(True)
+    assert _cdc_ui._pg_objects_gate_block(state, session, inventory, None) is None
+
+
+def test_the_deploy_and_start_gates_cannot_disagree(monkeypatch) -> None:
+    """Both surfaces must reach the same verdict from the same state.
+
+    The defect was never the verdict function -- it was one call site deriving the inputs
+    differently. So this pins the property that matters: identical state, identical answer,
+    for both the un-decided and the re-snapshot case.
+    """
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    session, inventory = _pg_gate_fixture(
+        monkeypatch, publication_present=False, covered=[]
+    )
+
+    def verdict(*, resnapshot: bool):
+        state = DataMigrationState()
+        state.cdc_stack_name = "dsql-cdc-stack"
+        state.set_selection(TableSelection(selected_tables=["app.orders"]))
+        if resnapshot:
+            state.set_cdc_start_mode("manual")
+            state.set_cdc_pg_autocreate_publication(True)
+        # ONE function serves both the Deploy dialog and the Start dialog/worker, so the
+        # two cannot drift; asserting it twice records the intent, not just the plumbing.
+        return _cdc_ui._pg_objects_gate_block(state, session, inventory, None)
+
+    assert verdict(resnapshot=False) is not None
+    assert verdict(resnapshot=True) is None
+
+
+def test_the_gate_grades_coverage_against_the_captured_tables_not_the_whole_source(
+    monkeypatch,
+) -> None:
+    """The Start dialog passed every inventory table, which can block on a fine publication.
+
+    A publication covering exactly what this migration replicates is correct; other tables
+    in the same database are none of CDC's business. Grading against the inventory made an
+    untouched neighbour table read as a coverage gap.
+    """
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    # The publication covers app.orders -- the only SELECTED table -- but not app.audit.
+    session, inventory = _pg_gate_fixture(
+        monkeypatch, publication_present=True, covered=["app.orders"]
+    )
+    inventory = SimpleNamespace(
+        tables=[SimpleNamespace(name="app.orders"), SimpleNamespace(name="app.audit")]
+    )
+    state = DataMigrationState()
+    state.cdc_stack_name = "dsql-cdc-stack"
+    state.set_selection(TableSelection(selected_tables=["app.orders"]))
+
+    assert _cdc_ui._pg_objects_gate_block(state, session, inventory, None) is None, (
+        "a publication covering every CAPTURED table must not block"
+    )

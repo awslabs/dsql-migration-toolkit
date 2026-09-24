@@ -2466,10 +2466,8 @@ def _render_cdc_infra_deploy_action(
     )
 
     async def _confirm() -> None:
-        _needs_objects = pg_objects_required_before_deploy(
-            migration_state,
-            _current_job(job_manager, getattr(migration_state, "job_id", None)),
-        )
+        _job = _current_job(job_manager, getattr(migration_state, "job_id", None))
+        _needs_objects = pg_objects_required_before_deploy(migration_state, _job)
         await _open_cdc_infra_dialog(
             ui, migration_state,
             lambda: _start_cdc_infra_deploy(
@@ -2478,6 +2476,10 @@ def _render_cdc_infra_deploy_action(
             ),
             session=session,
             pg_objects_required=_needs_objects,
+            # The gate inside needs the same inputs the connector config gets: the captured
+            # table set (from the inventory + watermark) and the re-snapshot intent.
+            inventory=inventory,
+            job=_job,
         )
 
     # Explicit CDC-prerequisite gate. MSK is billable and takes ~5 min to
@@ -2870,7 +2872,8 @@ def cdc_deploy_connection_blocker(session) -> Optional[str]:
     return None
 
 async def _open_cdc_infra_dialog(
-    ui, migration_state, on_confirm, *, session=None, pg_objects_required=False
+    ui, migration_state, on_confirm, *, session=None, pg_objects_required=False,
+    inventory=None, job=None,
 ) -> None:
     """Confirm dialog before the (~5 min, billable) infrastructure create.
 
@@ -2928,8 +2931,14 @@ async def _open_cdc_infra_dialog(
     # WITHOUT a slot is exactly the state that must block.
     if pg_objects_required:
         try:
+            # Through the shared gate, so the operator's RECORDED re-snapshot decision is
+            # honoured here exactly as it is at Start. Passing `[], None` with no
+            # force_initial (v0.1.509) made this dialog re-block the route the tool had just
+            # recommended, with a notice that is false for it, and sent the operator back to
+            # "start over as Full load + CDC" -- the dead end v0.1.510 existed to remove.
             pg_infra_block = await run.io_bound(
-                _probe_pg_replication_objects, migration_state, session, [], None
+                _pg_objects_gate_block,
+                migration_state, session, inventory, _cdc_watermark(job),
             )
         except Exception:  # noqa: BLE001 - unreadable is not absent; never block on it
             pg_infra_block = None
@@ -3334,6 +3343,38 @@ def _cdc_watermark(job):
     return wm
 
 
+def _pg_objects_gate_block(
+    migration_state, session, inventory, watermark
+) -> Optional[tuple]:
+    """The publication/slot gate, run with the SAME inputs the connector config will get.
+
+    THE single entry point for every surface that gates on those objects, because deriving
+    the probe's three inputs per call site is how this defect keeps coming back:
+
+    * v0.1.507 fixed the Start path so a recorded re-snapshot decision stops the block.
+    * v0.1.509 added the same gate to the Deploy dialog and passed ``[], None`` with no
+      ``force_initial`` -- so the operator who took the re-snapshot route was re-blocked one
+      screen later by a notice that is FALSE for that route ("the connector is configured
+      with publication.autocreate.mode=disabled"), told to "start the migration over as
+      'Full load + CDC'", and the continuation v0.1.510 built was a dead end again.
+    * The Start DIALOG meanwhile graded coverage against every table in the inventory rather
+      than the captured set, which can block on a publication that covers everything this
+      migration actually replicates.
+
+    ``pg_replication_objects_blocker``'s contract is to MIRROR ``build_pg_source_config``'s
+    two decisions exactly; that is only checkable if the mirror lives in ONE place. So the
+    tables come from :func:`_cdc_tables_for_config` and the re-snapshot intent from
+    :func:`_cdc_resume_signal` -- the very functions the config builder itself calls.
+
+    Blocking source I/O: callers MUST run it via ``run.io_bound``.
+    """
+    tables = _cdc_tables_for_config(migration_state, inventory, watermark)
+    _resume_override, force_initial = _cdc_resume_signal(migration_state, session)
+    return _probe_pg_replication_objects(
+        migration_state, session, tables, watermark, force_initial=force_initial
+    )
+
+
 def _probe_pg_replication_objects(
     migration_state, session, tables, watermark, *, force_initial: bool = False
 ) -> Optional[tuple]:
@@ -3458,12 +3499,9 @@ async def _open_cdc_start_dialog(
         # source I/O -> run.io_bound, never on the loop.
         try:
             _job2 = _current_job(job_manager, migration_state.job_id)
-            _wm2 = _cdc_watermark(_job2)
-            _resume_sig, _force_init = _cdc_resume_signal(migration_state, session)
             pg_objects_block = await run.io_bound(
-                _probe_pg_replication_objects,
-                migration_state, session, inventory_tables, _wm2,
-                force_initial=_force_init,
+                _pg_objects_gate_block,
+                migration_state, session, inventory, _cdc_watermark(_job2),
             )
         except Exception:  # noqa: BLE001 - unreadable is not absent; never block on it
             pg_objects_block = None
@@ -4244,9 +4282,8 @@ def _start_cdc_deploy(
         # blocking source I/O. Fails OPEN on an unreadable source (the probe returns
         # None) -- unlike the FK gate, because a missing publication kills the connector
         # LOUDLY whereas an enforced FK loses rows silently.
-        _pg_block = _probe_pg_replication_objects(
-            migration_state, session, tables_for_config, watermark,
-            force_initial=_force_initial_snapshot,
+        _pg_block = _pg_objects_gate_block(
+            migration_state, session, inventory, watermark
         )
         if _pg_block is not None:
             _log_cdc_event(

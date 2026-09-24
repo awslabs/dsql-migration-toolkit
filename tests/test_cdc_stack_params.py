@@ -1254,3 +1254,41 @@ def test_msk_seed_admission_warns_per_reason_instead_of_blocking() -> None:
     )
     assert "DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR" in ec2.warning
     assert not ec2.blocker
+
+
+def test_the_seed_admission_note_is_one_actionable_line() -> None:
+    """A billable confirmation dialog is not the place for design rationale.
+
+    The note sits beside the cost estimate and the network plan -- the two panels that
+    actually inform the Deploy decision. It used to add why the whole VPC range is admitted
+    rather than the task's subnet (task replacement) and that the grant is still narrowed by
+    kafka-cluster IAM: both true, neither a decision input, and together they made the
+    panels that matter harder to find.
+    """
+    from dsql_migrator.core.cdc import msk_seed_admission
+    from dsql_migrator.core.ec2_metadata import HostLookup, HostNetwork
+
+    ok = msk_seed_admission(
+        seed_mode="external",
+        cdc_seed_mode="external",
+        cdc_msk_access=True,
+        configured_host_cidr="",
+        vpc_id="vpc-app",
+        lookup=HostLookup(
+            host=HostNetwork(
+                ip="10.0.11.31", vpc_id="vpc-app", subnet_id="subnet-a",
+                cidr="10.0.0.0/16",
+            ),
+            ip="10.0.11.31",
+        ),
+    )
+    assert ok.blocker == "" and ok.warning == ""
+    # What the operator can check against the VPC they entered: the range, the VPC, the port.
+    assert "10.0.0.0/16" in ok.note and "vpc-app" in ok.note and "9098" in ok.note
+    # ...and nothing else. ONE sentence (no ". " inside; the dots in a CIDR are not
+    # sentence breaks) and short enough that it cannot creep back as one run-on line.
+    assert ". " not in ok.note, ok.note
+    assert ok.note.rstrip().endswith(".")
+    assert len(ok.note) < 160, len(ok.note)
+    for rationale in ("kafka-cluster IAM", "task is replaced", "still gated"):
+        assert rationale not in ok.note, rationale

@@ -488,11 +488,23 @@ SEGMENTED_TOGGLE_PROPS = (
 SEGMENTED_TOGGLE_CLASSES = "rounded-md border border-gray-300 overflow-hidden"
 
 
+# Quasar's QTable puts ``q-table--no-wrap`` on its container unless the ``wrap-cells``
+# prop is set, and that class is what carries ``white-space: nowrap`` onto every
+# ``th``/``td`` (verified in a real browser: the rule matching the cell is
+# ``.q-table--no-wrap th, .q-table--no-wrap td``). So a table whose cells must wrap has
+# TWO mechanisms available, and they are not interchangeable:
+#
+# * :data:`WRAP_CELLS_PROP` -- the native prop, for a column of PROSE. Wrapping at word
+#   boundaries is all it needs, and no stylesheet is involved.
+# * :data:`FIT_TABLE_CLASS` (below) -- for a column whose long content is a single
+#   unbreakable token (``schema.very_long_table_name``). ``wrap-cells`` alone cannot help
+#   there: with no space to break at, the cell still pins the table open, so that column
+#   additionally needs ``word-break: break-all``.
+#
 # A many-column ``ui.table`` that must fit its card instead of growing a horizontal
-# scrollbar. Quasar sets ``white-space: nowrap`` on every ``th``/``td``, so a multi-word
-# header ("Source rows (est.)") or a long ``schema.table`` name pins the table wider than
-# its container and ``.q-table__middle`` starts scrolling -- a bottom scrollbar inside a
-# card the rest of the page does not have.
+# scrollbar. A multi-word header ("Source rows (est.)") or a long ``schema.table`` name
+# pins the table wider than its container and ``.q-table__middle`` starts scrolling -- a
+# bottom scrollbar inside a card the rest of the page does not have.
 #
 # Two rules, and BOTH are needed: letting the headers wrap reclaims most of the width,
 # but ``word-break`` on the name column does nothing while ``nowrap`` is still set (a
@@ -526,6 +538,18 @@ FIT_TABLE_CSS = """
   word-break: break-all;
 }
 """
+
+# Quasar QTable prop that lets cell text WRAP instead of being held on one line and clipped
+# (it is what removes ``q-table--no-wrap``; see the note above). Use it on any table with a
+# prose column -- a remediation, a detail, an explanation -- because such a column is always
+# the widest, so it is the first thing pushed out of view and the last thing the operator can
+# read. Measured on the prerequisite results table with the real 801-character
+# detail+remediation of a failed PostgreSQL replication-objects check, in a 1304px-wide card:
+# without it the cell was 4656px on one line and ``.q-table__middle`` scrolled (scrollWidth
+# 5082); with it the cell wraps to 1092px, scrollWidth equals the viewport (no horizontal
+# scrollbar) and the row grows from 48px to 112px. Height is the correct trade: an
+# operator can scroll the page, and a hidden remediation is the whole cost of not doing it.
+WRAP_CELLS_PROP = "wrap-cells"
 
 
 def fit_table_css(ui) -> None:
@@ -850,6 +874,7 @@ __all__ = [
     "SEGMENTED_TOGGLE_PROPS",
     "SEGMENTED_TOGGLE_CLASSES",
     "EXPANSION_PANEL_CLASSES",
+    "WRAP_CELLS_PROP",
     "segmented_control",
     "FILTER_SELECT_PROPS",
     "FILTER_SELECT_CLASSES",

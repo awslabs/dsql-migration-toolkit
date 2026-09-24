@@ -5,6 +5,57 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.514
+
+### Fixed
+
+- **"Re-snapshot every table" was ignored by the Deploy dialog, so the continuation was a
+  dead end again.** Choosing that route flipped the prerequisites to `Can proceed` and
+  demoted the failing row to a recommendation -- and then Deploy CDC infrastructure blocked
+  with a red panel claiming "the connector is configured with
+  publication.autocreate.mode=disabled … the Debezium task would die immediately", which is
+  FALSE for that route (it is the one where the CONNECTOR's own database user creates the
+  publication), and told the operator to "start the migration over as Full load + CDC" --
+  discarding the choice they had just made. The verdict function was never wrong: v0.1.509
+  gave the Deploy dialog this gate but called the probe with `[], None` and no
+  `force_initial`, so it graded a decision it had not been told about, against an empty table
+  list and an absent watermark. Fixed at the root rather than at the call site: a single
+  shared gate now derives all three inputs from the very functions the connector config
+  builder uses (`_cdc_tables_for_config`, `_cdc_resume_signal`), and every surface that gates
+  on those objects -- the Deploy dialog, the Start dialog and the worker backstop -- goes
+  through it. `pg_replication_objects_blocker`'s contract is to MIRROR
+  `build_pg_source_config`'s two decisions exactly, and that is only checkable if the mirror
+  lives in one place: this is the second time the same defect shipped on a second surface
+  (v0.1.507 fixed the Start path; v0.1.509 reopened it on Deploy). A test now asserts by AST
+  that no other function even REFERENCES the raw probe -- deliberately over references rather
+  than call syntax, because the bug passed it to `run.io_bound` as a value, which a textual
+  search for a call would not have seen.
+- **The Start dialog graded publication coverage against every table in the source instead
+  of the captured set.** Found while consolidating the above: it passed the whole inventory,
+  so a publication covering exactly the tables this migration replicates could still be
+  reported as a coverage gap because of an untouched neighbouring table in the same database.
+
+### Changed
+
+- **The prerequisite results table wraps its cells, so the longest remediation is readable.**
+  "Detail / remediation" is by far the widest column -- a failed PostgreSQL
+  replication-objects check carries ~800 characters of detail plus remediation -- and
+  Quasar's QTable holds every cell on ONE line unless told otherwise (it adds
+  `q-table--no-wrap`, which is what carries `white-space: nowrap` onto each cell). Measured
+  in a real browser at a 1304px-wide card: the cell was 4656px and `.q-table__middle`
+  scrolled (scrollWidth 5082), so the row read "The connector does n…" and the rest was
+  behind a horizontal scrollbar -- the guidance the operator most needs was the least
+  visible. With wrapping the cell is 1092px, there is no horizontal scrollbar, and the row
+  grows from 48px to 112px: height the page can scroll, which is the right trade against
+  hidden remediation. Same fix as v0.1.505 made for the per-table status card, and the design
+  system now records both mechanisms and when each applies.
+- **The Deploy dialog's MSK-seed note is one line.** Two of its three sentences were design
+  rationale -- why the whole VPC range is admitted rather than the task's subnet, and that
+  what the app may then do on the cluster is still gated by `kafka-cluster` IAM. Both true,
+  neither a decision input, and padding a billable confirmation with justification makes the
+  panels that do inform the decision (the cost estimate and the network plan) harder to
+  find. It now states the range, the VPC, the port and the purpose.
+
 ## v0.1.513
 
 ### Changed

@@ -1767,13 +1767,19 @@ def msk_seed_admission(
             ),
         }[reason]
         return MskSeedAdmission(warning=lead + middle + tail, header=header)
+    # ONE line, and only what the operator can act on. This note sits in the Deploy dialog
+    # beside the cost estimate and the network plan -- the two panels that genuinely inform
+    # the decision -- and it used to spend two further sentences on DESIGN RATIONALE: why
+    # the whole VPC range rather than the task's subnet (task replacement) and that the
+    # grant is still narrowed by kafka-cluster IAM. Neither changes what the operator
+    # decides, and padding a billable confirmation with justification makes the panels that
+    # do matter harder to find. The range and the VPC id stay: they are the one thing the
+    # operator can check against the VPC they entered above.
     return MskSeedAdmission(
         cidr=host.cidr,
         note=(
             f"The cdc-stack will admit this app's VPC range {host.cidr} "
-            f"({host.vpc_id}) on MSK port 9098, so the in-process CDC seed keeps "
-            "working if the task is replaced into another of the app's subnets. What "
-            "it may then do on the cluster is still gated by kafka-cluster IAM."
+            f"({host.vpc_id}) on MSK port 9098, so the CDC seed can reach the cluster."
         ),
     )
 
