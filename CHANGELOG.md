@@ -5,6 +5,52 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.517
+
+### Fixed
+
+- **A PostgreSQL teardown could not drop its own replication slot, and then deleted the
+  credentials needed to drop it by hand.** Observed on a real teardown: `WARNING: could not
+  drop the PostgreSQL replication slot '…': Access denied reading the secret` — followed one
+  second later by `Source-credentials secret … scheduled for deletion`. Three separate
+  defects lined up:
+  - The drop authenticated ONLY by reading a secret, and the app's own identity is not
+    granted `secretsmanager:GetSecretValue` on `mysql-dsql-migrator/cdc/*` (the TaskRole's
+    policy grants Create, Put, Describe, Restore and **Delete** — but not Get). The tool
+    already holds the source password in memory, because the operator typed it to connect;
+    it now uses that FIRST, which needs no IAM at all. `GetSecretValue` was also added to
+    the prefix so the secret fallback works for a restored session (**a template change** —
+    an existing app stack needs a full-template update, not just the new image).
+  - "Tool-managed source secret absent" was a MISDIAGNOSIS: `resolve_source_secret` funnels
+    every failure — including AccessDenied — into one error, and the caller called it
+    absent. The log then proved it existed by deleting it. It now reports what happened.
+  - The secret's deletion was unconditional, so the one stored credential path to a
+    WAL-pinning slot was destroyed immediately after the operator was told to go and use it.
+    When the drop fails the secret is now KEPT, with a line saying why and to delete it once
+    the slot is gone.
+
+  This matters because a left-behind logical slot is a source-outage-class hazard: once the
+  connectors are gone the slot is inactive, its `restart_lsn` freezes, and WAL accrues at the
+  source's full write rate. The common `max_slot_wal_keep_size=-1` (the PostgreSQL default,
+  which this tool grades PASS for the handoff-gap risk) is exactly the unbounded case.
+
+### Changed
+
+- **The CDC teardown time estimate is engine-aware and comes from one place.** It was written
+  out at eight UI and doc sites that disagreed with each other for the same operation
+  ("~15–25 min", "up to ~20 min", "~15–45 min", "~45 min") and every one of them was
+  engine-blind — all attributing the wait to the in-VPC offset-seeder Lambda's network
+  interfaces. That Lambda **cannot exist in a PostgreSQL stack**: its CloudFormation condition
+  requires `IsMySqlSource` AND `SeedMode=Lambda`, and PostgreSQL is forced to the
+  external-seed path. Measured in the template's own notes, the Lambda's ENI reclamation takes
+  18m30s while the MSK Serverless cluster takes 93s, and every other resource deletes in under
+  a minute — so a real PostgreSQL teardown finished in **2m07s** against a promised 20. The
+  estimate now comes from `cdc_teardown_estimate()`, keyed on whether the stack actually has
+  that Lambda (so an externally-seeded MySQL stack gets the short number too), the reason only
+  blames the ENIs when they exist, and a test forbids a hardcoded estimate anywhere in the UI.
+- The "deploying CDC again later takes ~45 min" copy on the delete tiles was stale by the same
+  drift — the infra create is ~5 min plus a Start CDC pass.
+
 ## v0.1.516
 
 ### Fixed

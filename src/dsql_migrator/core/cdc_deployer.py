@@ -1327,7 +1327,8 @@ def _drop_pg_source_replication(
     stack_params: dict,
     region: Optional[str],
     aws_profile: Optional[str],
-) -> None:
+    source_credentials: Optional[tuple[str, str]] = None,
+) -> bool:
     """Drop the PostgreSQL CDC replication slot + publication on the source (teardown).
 
     Reconstructs the source connection from the (captured) stack parameters
@@ -1339,8 +1340,20 @@ def _drop_pg_source_replication(
     the session's stack name drifted; it falls back to the deterministic name. Credentials
     come from the tool-managed secret, or -- for a Secrets-Manager-auth source where the
     tool never created one -- from the stack's own ``SourceSecretArn`` / ``SourceSecretName``.
+    ``source_credentials`` are the SESSION's own source username/password, already in this
+    process's memory because the operator entered them to connect. They are tried FIRST.
+    Without them this function had only one credential path -- reading a secret -- and the
+    app's identity is not granted ``secretsmanager:GetSecretValue`` on
+    ``mysql-dsql-migrator/cdc/*`` (the TaskRole's policy grants Create/Put/Describe/Restore/
+    Delete but not Get), so on a real teardown the drop failed with "Access denied reading
+    the secret" while the very next step successfully DELETED that same secret. Using the
+    credentials the tool already has needs no IAM at all and is the path that works.
+
     Best-effort but LOUD: any failure logs a prominent manual-drop reminder (a surviving
     slot pins the source WAL) and returns without failing the already-complete teardown.
+
+    **Returns** whether the slot was dropped, so the caller can keep the credential path
+    alive (and report the outcome honestly) when it was not.
     """
     # Prefer the DEPLOYED names the connector actually used; fall back to the derived name.
     slot = (stack_params.get("PgSlotName") or "").strip() or cdc_pg_slot.pg_slot_name(
@@ -1374,28 +1387,41 @@ def _drop_pg_source_replication(
             resolve_source_secret,
         )
 
-        # The tool-managed secret is only created for a username/password source. For a
-        # Secrets-Manager-auth source it was never created, so fall back to the stack's
-        # own source secret (SourceSecretArn/Name) -- the exact creds the connector used.
-        try:
-            username, password = resolve_source_secret(
-                cdc_source_secret_name(stack_name), aws_profile, region=region
-            )
-        except SecretResolutionError:
-            fallback = (
-                stack_params.get("SourceSecretArn")
-                or stack_params.get("SourceSecretName")
-                or ""
-            ).strip()
-            if not fallback:
-                raise
-            driver.log(
-                "Tool-managed source secret absent; using the stack's source secret "
-                "to drop the replication slot."
-            )
-            username, password = resolve_source_secret(
-                fallback, aws_profile, region=region
-            )
+        # Credentials, cheapest and most reliable FIRST: the session's own source
+        # username/password, already in this process's memory. Reading a secret needs
+        # secretsmanager:GetSecretValue, which the app's identity is not granted for the
+        # tool-managed CDC secret -- so a teardown that had only that path failed with
+        # "Access denied reading the secret" and left the slot pinning WAL.
+        if source_credentials and (source_credentials[1] or "").strip():
+            username, password = source_credentials
+        else:
+            # The tool-managed secret is only created for a username/password source. For a
+            # Secrets-Manager-auth source it was never created, so fall back to the stack's
+            # own source secret (SourceSecretArn/Name) -- the exact creds the connector used.
+            try:
+                username, password = resolve_source_secret(
+                    cdc_source_secret_name(stack_name), aws_profile, region=region
+                )
+            except SecretResolutionError as _exc:
+                fallback = (
+                    stack_params.get("SourceSecretArn")
+                    or stack_params.get("SourceSecretName")
+                    or ""
+                ).strip()
+                if not fallback:
+                    raise
+                # NOT "absent": resolve_source_secret turns every boto failure -- including
+                # AccessDenied -- into SecretResolutionError, and calling that "absent" told
+                # the operator the wrong thing about a secret the very next step then
+                # deleted. Report what actually happened.
+                driver.log(
+                    "Could not read the tool-managed source secret "
+                    f"({str(_exc).splitlines()[0]}); trying the stack's own source secret "
+                    "to drop the replication slot."
+                )
+                username, password = resolve_source_secret(
+                    fallback, aws_profile, region=region
+                )
         source_config = SourceConnectionConfig(
             source_type=SourceType.POSTGRES,
             host=host,
@@ -1419,11 +1445,13 @@ def _drop_pg_source_replication(
             driver.log("Source replication slot + publication dropped.")
         finally:
             engine.dispose()
+        return True
     except Exception as exc:  # noqa: BLE001 - teardown is already complete; never fatal
         driver.log(
             f"WARNING: could not drop the PostgreSQL replication slot '{slot}': "
             f"{str(exc).splitlines()[0]}. {manual}"
         )
+        return False
 
 
 def run_cdc_delete(
@@ -1435,6 +1463,7 @@ def run_cdc_delete(
     region: Optional[str] = None,
     aws_profile: Optional[str] = None,
     cleanup_source_secret: bool = True,
+    source_credentials: Optional[tuple[str, str]] = None,
     delete_timeout_seconds: float = 1800.0,
     poll_interval_seconds: float = 30.0,
     sleep: Callable[[float], None] = None,  # type: ignore[assignment]
@@ -1569,13 +1598,15 @@ def run_cdc_delete(
         #     but LOUD -- a surviving slot is a production hazard, so a failure logs a
         #     prominent manual-drop reminder rather than failing the (already-complete)
         #     infra teardown.
+        _slot_dropped = True
         if stack_params.get("EngineType") == "postgres":
-            _drop_pg_source_replication(
+            _slot_dropped = _drop_pg_source_replication(
                 driver,
                 stack_name=stack_name,
                 stack_params=stack_params,
                 region=region,
                 aws_profile=aws_profile,
+                source_credentials=source_credentials,
             )
 
         # 4. clean up the tool-managed source-credentials secret (best effort).
@@ -1583,7 +1614,21 @@ def run_cdc_delete(
         #    in Secrets Manager with production DB credentials. A failure here is
         #    logged, not fatal -- the infrastructure is already gone.
         driver.stage("cleanup_secret", "IN_PROGRESS")
-        if cleanup_source_secret and region:
+        if cleanup_source_secret and region and not _slot_dropped:
+            # The slot is still on the source pinning WAL, and this secret holds the only
+            # stored credentials that can drop it. Deleting it here destroyed the operator's
+            # own recovery path one second after telling them to go and use it -- so keep it,
+            # and say why. The credentials are still in Secrets Manager either way; what
+            # changes is whether they are scheduled for destruction while a WAL-pinning slot
+            # is outstanding.
+            from dsql_migrator.core.secrets import cdc_source_secret_name
+            driver.log(
+                "Keeping the source-credentials secret "
+                f"'{cdc_source_secret_name(stack_name)}' in place: the replication slot "
+                "could not be dropped, and these are the credentials needed to drop it. "
+                "Delete the secret yourself once the slot is gone."
+            )
+        elif cleanup_source_secret and region:
             from dsql_migrator.core.secrets import (
                 SecretProvisionError,
                 cdc_source_secret_name,

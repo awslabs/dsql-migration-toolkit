@@ -1864,3 +1864,157 @@ def test_the_infra_deploy_uploads_exactly_the_artifacts_its_stack_references(
             assert f"{_MYSQL_PLUGIN}: already up to date" not in joined
         else:
             assert _PG_PLUGIN in joined and "a MySQL source does not use it" in joined
+
+
+def _pg_teardown_params(**over):
+    p = {
+        "EngineType": "postgres",
+        "SourceDbHostname": "src.example.com",
+        "SourceDbPort": "5432",
+        "PgDatabaseName": "app",
+        "PgSlotName": "dsqlmig_s1",
+        "PgPublicationName": "dsqlmig_p1",
+    }
+    p.update(over)
+    return p
+
+
+def test_the_teardown_slot_drop_uses_the_session_credentials_first(monkeypatch) -> None:
+    """The teardown must not depend on a permission the app's identity does not have.
+
+    Live teardown of a PostgreSQL stack: "WARNING: could not drop the PostgreSQL replication
+    slot ...: Access denied reading the secret." -- and the very next line scheduled that same
+    secret for deletion. The role could Create, Put, Describe, Restore and DELETE the
+    tool-managed CDC secret but not READ it, so the only credential path the drop had was
+    closed. The session's own source password is already in this process's memory (the
+    operator typed it to connect), needs no IAM at all, and is now tried first.
+    """
+    from dsql_migrator.core import cdc_deployer
+
+    from dsql_migrator.core import secrets as _secrets
+
+    def _no_secrets(*_a, **_k):  # any secret read must NOT happen
+        raise AssertionError("the slot drop must not need a secret when creds are in hand")
+
+    monkeypatch.setattr(_secrets, "resolve_source_secret", _no_secrets)
+    used: dict = {}
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _Eng:
+        def connect(self):
+            return _Conn()
+
+        def dispose(self):
+            return None
+
+    from dsql_migrator.core import cdc_pg_slot
+
+    monkeypatch.setattr(
+        cdc_pg_slot, "build_pg_source_write_engine",
+        lambda cfg, pw: used.setdefault("creds", (cfg.username, pw)) and _Eng() or _Eng(),
+    )
+    monkeypatch.setattr(
+        cdc_pg_slot, "deprovision_pg_replication",
+        lambda *_a, **_k: used.setdefault("dropped", True),
+    )
+
+    logs: list = []
+
+    class _Driver:
+        def log(self, msg):
+            logs.append(msg)
+
+    ok = cdc_deployer._drop_pg_source_replication(
+        _Driver(),
+        stack_name="dsql-cdc-stack",
+        stack_params=_pg_teardown_params(),
+        region="us-east-2",
+        aws_profile=None,
+        source_credentials=("app_user", "s3cret"),
+    )
+    assert ok is True
+    assert used.get("dropped") is True
+    assert used["creds"] == ("app_user", "s3cret")
+    # Property 7: the password must never reach a log line.
+    assert not any("s3cret" in m for m in logs), logs
+
+
+def test_the_teardown_reports_whether_the_slot_survived() -> None:
+    """A failed drop must be visible to the caller, not just printed.
+
+    The teardown kept the source-credentials secret's deletion unconditional, so the only
+    stored credentials that could drop a WAL-pinning slot were destroyed one second after the
+    operator was told to go and use them.
+    """
+    from dsql_migrator.core import cdc_deployer
+
+    logs: list = []
+
+    class _Driver:
+        def log(self, msg):
+            logs.append(msg)
+
+    # No credentials and an unreachable secret -> the drop fails and says so.
+    ok = cdc_deployer._drop_pg_source_replication(
+        _Driver(),
+        stack_name="dsql-cdc-stack",
+        stack_params=_pg_teardown_params(SourceSecretArn=""),
+        region=None,
+        aws_profile=None,
+    )
+    assert ok is False
+    joined = " ".join(logs)
+    assert "could not drop the PostgreSQL replication slot" in joined
+    # The manual remedy must carry BOTH statements the operator needs.
+    assert "pg_drop_replication_slot" in joined
+    assert "DROP PUBLICATION" in joined
+
+
+def test_a_failed_secret_read_is_not_reported_as_the_secret_being_absent(monkeypatch) -> None:
+    """"Tool-managed source secret absent" was a misdiagnosis of AccessDenied.
+
+    resolve_source_secret funnels every boto failure -- including AccessDenied -- into
+    SecretResolutionError, and the caller printed "absent". The log then proved it existed by
+    deleting it seconds later. Saying which of the two happened is what sends the operator to
+    the right fix (an IAM grant, not a redeploy).
+    """
+    from dsql_migrator.core import cdc_deployer
+    from dsql_migrator.core.secrets import SecretResolutionError
+
+    calls: list = []
+
+    def _resolve(name, _profile, region=None):
+        calls.append(name)
+        raise SecretResolutionError("Access denied reading the secret.")
+
+    from dsql_migrator.core import secrets as _secrets
+
+    # The function imports resolve_source_secret LOCALLY, so patching cdc_deployer's
+    # attribute is inert -- patch the source module (proven: the first version of this test
+    # silently exercised the real function).
+    monkeypatch.setattr(_secrets, "resolve_source_secret", _resolve)
+    logs: list = []
+
+    class _Driver:
+        def log(self, msg):
+            logs.append(msg)
+
+    cdc_deployer._drop_pg_source_replication(
+        _Driver(),
+        stack_name="dsql-cdc-stack",
+        stack_params=_pg_teardown_params(SourceSecretArn="arn:aws:secretsmanager:x:1:secret:s"),
+        region="us-east-2",
+        aws_profile=None,
+    )
+    joined = " ".join(logs)
+    assert "absent" not in joined, joined
+    assert "Could not read the tool-managed source secret" in joined
+    assert "Access denied" in joined
+    # It still TRIED the stack's own secret as the fallback.
+    assert len(calls) == 2, calls

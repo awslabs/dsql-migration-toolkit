@@ -17746,7 +17746,7 @@ def test_per_table_notice_reflects_whether_counts_were_fetched() -> None:
         )
 
 
-def _render_deploy_stages_for(kind, *, running_stage="stack_delete"):
+def _render_deploy_stages_for(kind, *, running_stage="stack_delete", has_seeder_lambda=None):
     """Render the CDC stage-progress card for ``kind`` mid-run and return the double."""
     from dsql_migrator.core.models import ChunkState, MigrationJob
     from dsql_migrator.ui.data_migration import _cdc_ui
@@ -17763,7 +17763,9 @@ def _render_deploy_stages_for(kind, *, running_stage="stack_delete"):
         chunks.append(ChunkState(chunk_id=sid, status=status))
     job = MigrationJob(job_id="j", status="RUNNING", chunks=chunks)
     ui = _RecordingUi()
-    _cdc_ui._render_deploy_stages(ui, job, kind=kind)
+    _cdc_ui._render_deploy_stages(
+        ui, job, kind=kind, has_seeder_lambda=has_seeder_lambda
+    )
     return ui
 
 
@@ -17772,13 +17774,32 @@ def test_delete_progress_shows_an_upper_bound_not_a_countdown() -> None:
 
     Reported: "est. ~5 min remaining" while it actually took far longer. Show an honest
     upper bound instead of a countdown that reads as a stuck UI.
+
+    The bound is now ENGINE-AWARE. It was a fixed "up to ~20 min" whose entire cause -- the
+    in-VPC offset-seeder Lambda's ENI reclamation -- cannot exist in a PostgreSQL stack (the
+    template's DeploySeederFunctionLambda condition requires IsMySqlSource, and PostgreSQL is
+    forced to the external-seed path). A real PostgreSQL teardown was measured end to end at
+    2m07s, so the old text overstated it by ~10x.
     """
-    ui = _render_deploy_stages_for("delete")
-    joined = " ".join(ui.texts)
-    assert "up to ~20 min" in joined, "delete must show an upper-bound wait"
+    from dsql_migrator.core.cdc import (
+        CDC_TEARDOWN_ESTIMATE_NO_SEEDER,
+        CDC_TEARDOWN_ESTIMATE_WITH_SEEDER,
+    )
+
+    # A stack WITH the seeder Lambda: the long bound is still the honest one.
+    joined = " ".join(_render_deploy_stages_for("delete", has_seeder_lambda=True).texts)
+    assert CDC_TEARDOWN_ESTIMATE_WITH_SEEDER in joined
     assert "remaining" not in joined, (
         "delete must not show a precise 'est. N remaining' countdown"
     )
+
+    # A stack WITHOUT it (every PostgreSQL stack, and an externally-seeded MySQL one).
+    pg = " ".join(_render_deploy_stages_for("delete", has_seeder_lambda=False).texts)
+    assert CDC_TEARDOWN_ESTIMATE_NO_SEEDER in pg
+    assert CDC_TEARDOWN_ESTIMATE_WITH_SEEDER not in pg, (
+        "a stack with no seeder Lambda must not be told to expect the ENI wait"
+    )
+    assert "remaining" not in pg
 
 
 def test_delete_stages_show_no_per_stage_eta_hint() -> None:

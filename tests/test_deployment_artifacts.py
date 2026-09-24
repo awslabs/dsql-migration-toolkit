@@ -520,9 +520,17 @@ def test_task_role_provisions_cdc_source_secret_scoped_to_prefix(template: dict)
         "secretsmanager:RestoreSecret",
         # DeleteSecret so a full teardown removes the credentials the tool stored.
         "secretsmanager:DeleteSecret",
+        # GetSecretValue for ONE job: a PostgreSQL teardown drops the logical replication
+        # slot on the source and needs the credentials it stored here to connect. Without it
+        # the role could Create, Put, Describe, Restore and DELETE this secret but not READ
+        # it -- and a real teardown failed with "Access denied reading the secret", left the
+        # slot pinning the source WAL, then deleted that same secret one second later.
+        "secretsmanager:GetSecretValue",
     }
     resource = str(stmt["Resource"])
     assert "secret:mysql-dsql-migrator/cdc/*" in resource
+    # Still the prefix, never "*" -- read access must not widen the blast radius.
+    assert resource.count("*") >= 1 and ":secret:*" not in resource
     assert resource != "*"
 
 

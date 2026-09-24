@@ -54,6 +54,11 @@ from dsql_migrator.core.job_manager import (
     JobNotFoundError,
     is_interrupted_by_restart,
 )
+from dsql_migrator.core.cdc import (
+    cdc_teardown_estimate,
+    cdc_teardown_reason,
+    stack_has_seeder_lambda,
+)
 from dsql_migrator.core.cdc_postgres import (
     dispatch_cdc_infra_params,
     dispatch_cdc_stack_params,
@@ -169,6 +174,51 @@ def _cdc_source_type(session) -> SourceType:
 def _cdc_source_database(session) -> str:
     """The session's source database name (PostgreSQL captures a single database)."""
     return getattr(getattr(session, "source_config", None), "database", "") or ""
+
+
+def _session_source_credentials(session) -> Optional[tuple[str, str]]:
+    """The session's own source username/password, for the teardown's slot drop.
+
+    Property 7 is unchanged: these live in process memory only and are handed straight to a
+    source connection -- never logged, never written to job state. They exist because the
+    operator typed them to connect, which makes them the one credential path a teardown can
+    rely on without an IAM grant. Reading the tool-managed CDC secret instead needs
+    ``secretsmanager:GetSecretValue``, which the app's own identity does not have, and that
+    is why a real teardown left a WAL-pinning replication slot behind.
+
+    Returns ``None`` when there is no usable password (a Secrets-Manager-auth source, or a
+    restored session whose password was not re-entered), so the caller falls back to the
+    secrets path as before.
+    """
+    if session is None:
+        return None
+    config = getattr(session, "source_config", None)
+    password = getattr(session, "source_password", None)
+    if not (password or "").strip():
+        return None
+    return (getattr(config, "username", "") or "", password)
+
+
+def _cdc_stack_has_seeder_lambda(migration_state) -> Optional[bool]:
+    """Does THIS session's cdc-stack contain the in-VPC offset-seeder Lambda?
+
+    It is the only slow resource in a teardown (measured 18m30s of ENI reclamation, against
+    MSK Serverless's 93s), so it is what decides the estimate the operator is shown. Read off
+    the bound session's source engine rather than plumbed through every render layer:
+    ``DataMigrationState`` already holds the session (``bind_session``), and a PostgreSQL
+    stack is always created without the Lambda. Returns ``None`` when the engine cannot be
+    determined, so the caller shows a range covering both cases instead of guessing.
+    """
+    session = getattr(migration_state, "_session", None)
+    if session is None:
+        return None
+    source_type = _cdc_source_type(session)
+    if source_type is None:
+        return None
+    # The seed mode only matters for MySQL (PostgreSQL is forced external), and reading the
+    # host config here would be I/O on a render path. The default IS lambda, so the MySQL
+    # answer stays the conservative "expect the ENI wait".
+    return stack_has_seeder_lambda(source_type, None)
 
 
 def _cdc_start_seed_mode(source_type: SourceType, host_seed_mode: str) -> str:
@@ -1342,7 +1392,9 @@ def _cdc_start_detail(
     return "; ".join(parts)
 
 
-def cdc_unstable_message(status: Optional[str]) -> tuple[str, str, str, str]:
+def cdc_unstable_message(
+    status: Optional[str], *, has_seeder_lambda: Optional[bool] = None
+) -> tuple[str, str, str, str]:
     """Message for the ``unstable`` CDC card, keyed on the raw stack status.
 
     Returns ``(badge_text, tone, header, body)``. Three cases:
@@ -1364,10 +1416,11 @@ def cdc_unstable_message(status: Optional[str]) -> tuple[str, str, str, str]:
             "Deleting…",
             "info",
             "CDC infrastructure is being deleted",
-            "The cdc-stack is being torn down (this takes ~15–25 min — the in-VPC "
-            "Lambda's network interfaces take time to detach). MSK / NAT billing "
-            "stops once it completes. This view refreshes automatically; no action "
-            "is needed.",
+            f"The cdc-stack is being torn down (this takes "
+            f"{cdc_teardown_estimate(has_seeder_lambda=has_seeder_lambda)} — "
+            f"{cdc_teardown_reason(has_seeder_lambda=has_seeder_lambda)}). MSK / NAT "
+            "billing stops once it completes. This view refreshes automatically; no "
+            "action is needed.",
         )
     if _is_inflight_stack_status(raw):
         return (
@@ -2326,16 +2379,18 @@ def _render_cdc_adopt_or_deploy_choice(
         _in_flight, _terminal = split_cleanup_by_progress(needs_cleanup)
         if _in_flight:
             _busy = ", ".join(f"{name} ({status})" for name, status in _in_flight)
+            _has_seeder = _cdc_stack_has_seeder_lambda(migration_state)
             render_notice(
                 ui,
                 tone="warning",
                 header="CDC infrastructure is still being removed",
                 body=(
                     f"{_busy}. This is in progress, not stuck: a cdc-stack delete takes "
-                    "~15–25 min because the in-VPC Lambda's network interfaces detach "
-                    "slowly. It cannot be attached to while it runs, and MSK / NAT "
-                    "billing stops when it completes. No action is needed — you can keep "
-                    "working on the earlier steps meanwhile."
+                    f"{cdc_teardown_estimate(has_seeder_lambda=_has_seeder)} because "
+                    f"{cdc_teardown_reason(has_seeder_lambda=_has_seeder)}. It cannot be "
+                    "attached to while it runs, and MSK / NAT billing stops when it "
+                    "completes. No action is needed — you can keep working on the earlier "
+                    "steps meanwhile."
                 ),
             )
         if _terminal:
@@ -4867,6 +4922,10 @@ def _start_cdc_delete(
             region=region,
             aws_profile=aws_profile,
             cleanup_source_secret=cleanup_secret,
+            # The credentials this process already holds, so dropping the PostgreSQL
+            # replication slot does not depend on secretsmanager:GetSecretValue (which the
+            # app's identity is not granted for the tool-managed CDC secret).
+            source_credentials=_session_source_credentials(session),
         )
 
     _action = "delete CDC infrastructure"
@@ -4925,7 +4984,10 @@ def _render_cdc_deploy_live(ui, migration_state, job_manager, refresh) -> None:
         # "Refresh now" forces an immediate poll of the same live region (the 5s
         # timer keeps running too); reuses _poll_deploy so a finished job also
         # advances the card, identical to the automatic tick.
-        _render_deploy_stages(ui, job, kind, on_refresh=_poll_deploy)
+        _render_deploy_stages(
+            ui, job, kind, on_refresh=_poll_deploy,
+            has_seeder_lambda=_cdc_stack_has_seeder_lambda(migration_state),
+        )
         _render_deploy_log(ui, migration_state.get_cdc_deploy_log(), log_state)
         if job.status in ("PENDING", "RUNNING"):
             ui.timer(_CDC_POLL_INTERVAL_SECONDS, _poll_deploy, once=True)  # type: ignore[attr-defined]
@@ -5007,7 +5069,9 @@ def _render_cdc_deploy_live(ui, migration_state, job_manager, refresh) -> None:
 
     _deploy_live()
 
-def _render_deploy_stages(ui, job, kind: str = "start", on_refresh=None) -> None:
+def _render_deploy_stages(
+    ui, job, kind: str = "start", on_refresh=None, *, has_seeder_lambda=None
+) -> None:
     """Render each stage (job chunk) of the running operation as an icon row.
 
     Each not-yet-finished stage shows a rough ETA hint (``~3 min``) so the user
@@ -5040,9 +5104,10 @@ def _render_deploy_stages(ui, job, kind: str = "start", on_refresh=None) -> None
         # ~20 min") instead of a countdown. Other operations keep the summed ETA.
         if running:
             if kind == "delete":
-                ui.label("can take up to ~20 min").classes(  # type: ignore[attr-defined]
-                    "text-xs text-gray-400"
-                )
+                ui.label(  # type: ignore[attr-defined]
+                    "can take "
+                    + cdc_teardown_estimate(has_seeder_lambda=has_seeder_lambda)
+                ).classes("text-xs text-gray-400")
             else:
                 remaining_total = sum(
                     etas.get(c.chunk_id, 0) for c in job.chunks if c.status != "DONE"

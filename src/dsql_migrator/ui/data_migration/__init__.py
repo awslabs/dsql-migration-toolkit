@@ -111,6 +111,7 @@ from dsql_migrator.core.models import (
 from dsql_migrator.core.table_selection import TableSelector
 from dsql_migrator.core.watermark import WatermarkCapturer
 from dsql_migrator.ui.ai_assist import ai_is_usable
+from dsql_migrator.core.cdc import cdc_teardown_estimate, cdc_teardown_reason
 from dsql_migrator.core.cdc_postgres import pg_snapshot_mode
 from dsql_migrator.ui.design import (
     NOTICE_STYLE,
@@ -2845,15 +2846,17 @@ def _render_cdc_existing_infra_banner(ui, migration_state, refresh) -> None:
         _in_flight, _terminal = split_cleanup_by_progress(needs_cleanup)
         if _in_flight:
             _busy = ", ".join(f"{name} ({status})" for name, status in _in_flight)
+            _has_seeder = _cdc_stack_has_seeder_lambda(migration_state)
             _render_notice(
                 ui,
                 tone="warning",
                 header="CDC infrastructure is still being removed",
                 body=(
                     f"{_busy}. This is in progress, not stuck: a cdc-stack delete takes "
-                    "~15–25 min because the in-VPC Lambda's network interfaces detach "
-                    "slowly. It cannot be attached to or replaced while it runs, and "
-                    "MSK / NAT billing stops when it completes. No action is needed."
+                    f"{cdc_teardown_estimate(has_seeder_lambda=_has_seeder)} because "
+                    f"{cdc_teardown_reason(has_seeder_lambda=_has_seeder)}. It cannot be "
+                    "attached to or replaced while it runs, and MSK / NAT billing stops "
+                    "when it completes. No action is needed."
                 ),
             )
         if _terminal:
@@ -4297,6 +4300,7 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     _cdc_infra_prefill,
     derive_cdc_vpc_from_source,
     _cdc_is_streaming,
+    _cdc_stack_has_seeder_lambda,
     _cdc_tables_for_config,
     _cdc_target_region,
     _cdc_watermark,

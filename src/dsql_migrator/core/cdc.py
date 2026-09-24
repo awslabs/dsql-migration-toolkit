@@ -67,6 +67,7 @@ from dsql_migrator.core.models import (
     LoadStatusView,
     SchemaDriftSummary,
     SourceConnectionConfig,
+    SourceType,
     TableDef,
     TableStatusRow,
     TargetConnectionConfig,
@@ -493,6 +494,80 @@ _DRIFT_BY_SQLSTATE: dict[str, SchemaDriftKind] = {
     "3F000": SchemaDriftKind.MISSING_TABLE,
     "23505": SchemaDriftKind.UNIQUE_CONFLICT,
 }
+
+
+# How long a cdc-stack DELETE takes, and WHY -- the single source of truth, because the
+# estimate was written out at eight UI/doc sites that disagreed with each other for the same
+# operation ("~15-25 min", "up to ~20 min", "~15-45 min", "~45 min") and every one of them was
+# ENGINE-BLIND.
+#
+# The wall clock is dominated by ONE resource: the in-VPC offset-seeder Lambda. AWS reclaims a
+# VPC-attached function's hyperplane ENIs asynchronously, and they pin the connector security
+# group and the owned subnets until they are gone -- measured at 18m30s, against MSK
+# Serverless's own 93s (both recorded in deploy/cdc-stack/cdc-stack.yaml). Everything else --
+# connectors, plugins, worker configs, the IAM role, the log group, the SG rules -- deletes in
+# well under a minute.
+#
+# That Lambda is NOT always there. Its CloudFormation condition chain requires
+# ``IsMySqlSource`` AND ``SeedMode=Lambda``, and a PostgreSQL stack is forced to the
+# no-Lambda path (``SeedByExternal = Or(SeedMode=External, IsPostgresSource)``; the app
+# hard-codes ``seed_mode="external"`` for PostgreSQL in ``build_pg_cdc_infra_params``). So a
+# PostgreSQL teardown -- and equally a MySQL teardown that seeded externally -- has no ENI
+# reclamation to wait for and finishes in a couple of minutes. Live-measured on a real
+# PostgreSQL stack: submitted 10:55:57, "CDC infrastructure deleted" 10:58:04.
+CDC_TEARDOWN_ESTIMATE_WITH_SEEDER = "~15-25 min"
+CDC_TEARDOWN_ESTIMATE_NO_SEEDER = "~2-5 min"
+
+
+def cdc_teardown_estimate(*, has_seeder_lambda: Optional[bool]) -> str:
+    """Return the wall-clock estimate for deleting the cdc-stack. Pure.
+
+    ``has_seeder_lambda`` is whether the deployed stack contains the in-VPC offset-seeder
+    Lambda -- the only slow resource in the teardown. ``None`` means the caller cannot tell
+    (a surface with no engine/seed-mode in reach), and gets a range covering both, which is
+    still an improvement on the four mutually inconsistent fixed numbers it replaces.
+    """
+    if has_seeder_lambda is None:
+        return f"{CDC_TEARDOWN_ESTIMATE_NO_SEEDER.rstrip()} to {CDC_TEARDOWN_ESTIMATE_WITH_SEEDER.lstrip('~')}"
+    return (
+        CDC_TEARDOWN_ESTIMATE_WITH_SEEDER
+        if has_seeder_lambda
+        else CDC_TEARDOWN_ESTIMATE_NO_SEEDER
+    )
+
+
+def cdc_teardown_reason(*, has_seeder_lambda: Optional[bool]) -> str:
+    """Return the WHY that goes with :func:`cdc_teardown_estimate`. Pure.
+
+    Naming the cause is what makes a long wait legible as progress rather than a hang -- and
+    saying it only when it applies is what stops a PostgreSQL operator being told to expect
+    20 minutes of ENI cleanup for a Lambda their stack never had.
+    """
+    if has_seeder_lambda is False:
+        return (
+            "this stack has no in-VPC seeder Lambda, so there are no network interfaces to "
+            "wait for"
+        )
+    if has_seeder_lambda:
+        return "the in-VPC seeder Lambda's network interfaces take time to detach"
+    return (
+        "a stack with the in-VPC seeder Lambda waits for its network interfaces to detach; "
+        "one without it finishes in a couple of minutes"
+    )
+
+
+def stack_has_seeder_lambda(
+    source_type: Optional[SourceType], seed_mode: Optional[str]
+) -> bool:
+    """Does a cdc-stack for this engine/seed mode contain the offset-seeder Lambda? Pure.
+
+    Mirrors the template's own condition chain (``DeploySeederFunctionLambda`` =
+    ``IsMySqlSource`` AND ``SeedMode=Lambda``). PostgreSQL is always externally seeded, so it
+    never has the Lambda whatever the seed-mode value says.
+    """
+    if source_type is not None and source_type is not SourceType.MYSQL:
+        return False
+    return (seed_mode or "lambda").strip().lower() == "lambda"
 
 
 def classify_schema_drift(error_code: Optional[str]) -> Optional[SchemaDriftKind]:

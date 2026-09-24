@@ -692,6 +692,16 @@ Resources:
                   # tool stored (they do not belong to a CloudFormation resource, so
                   # delete-stack cannot clean them up). Scoped to the same prefix.
                   - secretsmanager:DeleteSecret
+                  # GetSecretValue on the SAME prefix, for one job: a PostgreSQL teardown
+                  # drops the logical replication slot on the source, and to connect it needs
+                  # the credentials it stored here. Without it the role could Create, Put,
+                  # Describe, Restore and DELETE this secret but not READ it -- so a real
+                  # teardown failed with "Access denied reading the secret", left the slot
+                  # pinning the source WAL (which can fill the source disk), and then deleted
+                  # that very secret one second later. The tool now prefers the session's own
+                  # in-memory credentials, which needs no grant at all; this closes the
+                  # fallback for a restored session or a Secrets-Manager-auth source.
+                  - secretsmanager:GetSecretValue
                 Resource:
                   Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:mysql-dsql-migrator/cdc/*
               # NOTE: when DSQL_MIGRATOR_CDC_SECRET_KMS_KEY_ID is set to a customer-

@@ -38,6 +38,7 @@ from dsql_migrator.core.assessment_strategist import (
     build_general_chat_system,
     source_engine_word,
 )
+from dsql_migrator.core.cdc import cdc_teardown_estimate
 from dsql_migrator.core.job_manager import JobManager
 from dsql_migrator.core.models import MigrationContext, SourceType
 from dsql_migrator.ui.ai_assist import ai_is_usable
@@ -1203,7 +1204,10 @@ def build_page(
         if job_id is None:
             job_id = getattr(migration_state, "cdc_teardown_job_id", None)
         if mode == "delete":
-            started = "Deleting CDC infrastructure in the background (~45 min)…"
+            started = (
+                "Deleting CDC infrastructure in the background "
+                f"({cdc_teardown_estimate(has_seeder_lambda=None)})…"
+            )
             done = "CDC infrastructure deleted — MSK/NAT billing stopped."
         else:
             started = "Removing the CDC connectors in the background…"

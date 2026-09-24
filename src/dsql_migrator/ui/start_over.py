@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 from typing import Callable, Optional, Sequence
 
+from dsql_migrator.core.cdc import cdc_teardown_estimate
 from dsql_migrator.ui.design import render_notice
 
 def _start_over_cdc_warning(
@@ -128,7 +129,8 @@ def _open_start_over_dialog(
                 header="A CDC teardown is already running",
                 body=(
                     "Your previous CDC stop/delete is still in progress (deleting "
-                    "the stack can take ~15–25 min). Starting over now would launch "
+                    f"the stack can take {cdc_teardown_estimate(has_seeder_lambda=None)}). "
+                    "Starting over now would launch "
                     "a second teardown and then clear this session, hiding the "
                     "one already running. Wait for it to finish (watch the Data "
                     "Migration step), then Start over."
@@ -242,8 +244,8 @@ def _open_start_over_dialog(
                     ),
                     "Tears down "
                     + ("every stack listed" if plural else "the whole stack")
-                    + " — stops MSK / NAT billing, but it takes ~45 min to recreate "
-                    "later.",
+                    + " — stops MSK / NAT billing, but recreating it later takes "
+                    "~5 min plus a Start CDC pass.",
                 ),
                 "none": (
                     "Leave CDC untouched",
@@ -381,7 +383,7 @@ def _cdc_teardown_banner_copy(
                 "success",
                 "CDC infrastructure deleted",
                 f"Teardown of the cdc-{noun} ({listed}) finished — MSK / NAT billing has "
-                "stopped. Deploying CDC again later takes ~45 min from scratch.",
+                "stopped. Deploying CDC again later takes ~5 min plus a Start CDC pass.",
             )
         return (
             "success",
@@ -436,7 +438,8 @@ def _cdc_teardown_banner_copy(
         return (
             "info",
             "CDC infrastructure teardown in progress",
-            f"Deleting '{stack}'{progress} in the background (~15–45 min). MSK / NAT "
+            f"Deleting '{stack}'{progress} in the background "
+            f"({cdc_teardown_estimate(has_seeder_lambda=None)}). MSK / NAT "
             "keep billing until it completes. You can keep working — this banner "
             "reports the result when the teardown finishes.",
         )

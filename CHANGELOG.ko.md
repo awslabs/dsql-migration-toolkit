@@ -5,6 +5,22 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.517
+
+### 수정
+
+- **PostgreSQL 인프라 제거가 자기 복제 슬롯을 드롭하지 못하고, 그 다음 수동 드롭에 필요한 자격증명을 삭제했습니다.** 실제 teardown에서 관측: `WARNING: could not drop the PostgreSQL replication slot '…': Access denied reading the secret` — 그리고 **1초 뒤** `Source-credentials secret … scheduled for deletion`. 세 결함이 겹쳐 있었습니다:
+  - 드롭이 **시크릿 읽기만으로** 인증했고, 앱 자신의 아이덴티티에는 `mysql-dsql-migrator/cdc/*`에 대한 `secretsmanager:GetSecretValue`가 **없습니다**(TaskRole 정책은 Create·Put·Describe·Restore·**Delete**를 주지만 Get은 없습니다). 도구는 운영자가 연결할 때 입력한 소스 비밀번호를 **이미 메모리에 갖고 있으므로**, 이제 그것을 **먼저** 씁니다 — IAM이 전혀 필요 없습니다. 복원된 세션을 위해 `GetSecretValue`도 해당 프리픽스에 추가했습니다(**템플릿 변경** — 기존 앱 스택은 이미지 갱신만으로는 안 되고 full-template 업데이트가 필요합니다).
+  - "Tool-managed source secret absent"는 **오진**이었습니다: `resolve_source_secret`이 AccessDenied를 포함한 모든 실패를 하나의 예외로 묶는데, 호출부가 그것을 "없음"으로 불렀습니다. 로그 자체가 그 시크릿을 삭제하며 존재를 증명했습니다. 이제 실제로 무슨 일이 있었는지 보고합니다.
+  - 시크릿 삭제가 **무조건**이었기 때문에, WAL을 붙잡고 있는 슬롯을 드롭할 유일한 저장 자격증명이 "가서 쓰세요"라고 안내한 직후에 파괴됐습니다. 드롭이 실패하면 이제 시크릿을 **유지**하고, 이유와 "슬롯을 지운 뒤 직접 삭제하라"를 함께 남깁니다.
+
+  이것이 중요한 이유: 남겨진 논리 슬롯은 **소스 장애 등급** 위험입니다. 커넥터가 사라지면 슬롯은 inactive가 되고 `restart_lsn`이 고정되며, WAL이 소스의 쓰기 속도 그대로 쌓입니다. 흔한 `max_slot_wal_keep_size=-1`(PostgreSQL 기본값이고, 이 도구는 핸드오프 갭 위험 기준으로 PASS를 줍니다)이 바로 **무한 증가** 경우입니다.
+
+### 변경
+
+- **CDC 제거 예상 시간이 엔진을 인식하고 한 곳에서 나옵니다.** 기존에는 UI·문서 **8곳**에 각각 적혀 있었고 같은 작업에 대해 서로 값이 달랐으며("~15–25분", "최대 ~20분", "~15–45분", "~45분") 전부 **엔진 무관**이었습니다 — 모두 대기 원인을 in-VPC 오프셋 시더 Lambda의 네트워크 인터페이스로 돌렸습니다. 그 Lambda는 **PostgreSQL 스택에 존재할 수 없습니다**: CloudFormation 조건이 `IsMySqlSource` **그리고** `SeedMode=Lambda`를 요구하고, PostgreSQL은 external-seed 경로로 고정됩니다. 템플릿 자체의 측정 기록에 따르면 Lambda의 ENI 회수는 **18분 30초**, MSK Serverless는 **93초**이며 나머지 리소스는 1분 미만입니다 — 그래서 실제 PostgreSQL teardown이 20분이라 안내된 자리에서 **2분 07초**에 끝났습니다. 이제 예상 시간은 `cdc_teardown_estimate()`에서 나오고, 스택에 그 Lambda가 실제로 있는지로 결정되며(external-seed로 배포된 MySQL 스택도 짧은 값을 받습니다), 원인 설명은 ENI가 실제로 있을 때만 그것을 지목하고, UI 어디에도 하드코딩된 예상 시간이 없도록 테스트가 막습니다.
+- 삭제 타일의 "나중에 CDC를 다시 배포하면 ~45분" 문구도 같은 드리프트로 낡아 있었습니다 — 인프라 생성은 ~5분 + Start CDC 패스입니다.
+
 ## v0.1.516
 
 ### 수정
