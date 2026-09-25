@@ -1390,6 +1390,9 @@ Resources:
             # could only say "the AWS identity needs secretsmanager:GetSecretValue",
             # pointing at IAM when the fix is this stack's parameter. Empty = none.
             DSQL_MIGRATOR_SOURCE_SECRET_ARN=${SourceSecretArn}
+            # WHICH DSQL cluster this deployment's instance role can connect to -- same
+            # attestation as the secret above (generated from DsqlClusterArn, one cluster).
+            DSQL_MIGRATOR_DSQL_CLUSTER_ARN=${DsqlClusterArn}
             EOF
             chmod 600 /etc/dsql-migrator.env
 

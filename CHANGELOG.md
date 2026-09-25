@@ -5,6 +5,12 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.523
+
+### Fixed
+
+- **A wrong Aurora DSQL endpoint failed with an IAM error that pointed at a role the operator cannot edit.** Typing a second cluster's endpoint on the Connect screen — the normal thing to do when testing two sources against two targets — returned *"not authorized to perform: dsql:DbConnectAdmin … confirm your AWS identity has dsql:DbConnectAdmin on this cluster"*. True, and a dead end on a managed deployment: DSQL is IAM-token auth and the task role's `dsql:DbConnect`/`DbConnectAdmin` **Resource is generated from the app stack's `DsqlClusterArn` parameter** — ONE cluster ARN fixed at deploy time — while the Connect screen accepts any endpoint. It cannot be widened by hand, so the only actionable fix was a stack parameter the message never mentioned, and the app could not mention it because it cannot observe its own role. Both deploy templates now attest the granted ARN in `DSQL_MIGRATOR_DSQL_CLUSTER_ARN` (the same pattern as `DSQL_MIGRATOR_SOURCE_SECRET_ARN` in v0.1.520 and `DSQL_MIGRATOR_CDC_MSK_ACCESS`), so the tool: prefills the target endpoint with the one cluster that works (as the LAST fallback, so a live session's own target and a configured default still win); **warns before the round trip** when the typed endpoint is a different cluster; and on a refusal names that cluster's endpoint and the `DsqlClusterArn` parameter instead of IAM. A wildcard grant (`cluster/*`) has no single endpoint to name, so it keeps the IAM/region wording — the cluster really should be reachable there. Unmanaged runs (laptop, hand-rolled host) have no marker and are unchanged.
+
 ## v0.1.522
 
 ### Fixed

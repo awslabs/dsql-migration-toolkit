@@ -745,3 +745,50 @@ def test_both_deploy_templates_export_the_granted_secret_marker() -> None:
             f"{name} must set {GRANTED_SECRET_ENV} from the SourceSecretArn parameter, "
             "not a literal"
         )
+
+
+def test_target_endpoint_is_prefilled_from_the_granted_cluster() -> None:
+    """DSQL is IAM-token auth for ONE cluster ARN, so offer that cluster's endpoint.
+
+    The task role's dsql:DbConnect Resource is generated from the app stack's
+    DsqlClusterArn, and the operator cannot see it from the browser -- typing any other
+    endpoint fails with an IAM authorization error after a round trip. Asserted on the
+    parse tree so a reworded comment cannot satisfy it.
+    """
+    import ast
+
+    tree = _connect_page_tree()
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "granted_dsql_cluster_endpoint"
+        for node in ast.walk(tree)
+    ), "build_connect_page must call granted_dsql_cluster_endpoint()"
+    src = ast.unparse(tree)
+    assert "_granted_endpoint" in src
+    # LAST fallback only: a live session's target and a configured default still win, so
+    # the attestation never overrides what the operator already chose.
+    assert "d.target_endpoint or _granted_endpoint or ''" in src.replace('"', "'"), src
+
+
+def test_a_mismatched_target_endpoint_is_flagged_before_the_round_trip() -> None:
+    import ast
+
+    tree = _connect_page_tree()
+    notices = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "render_notice"
+        and any(
+            kw.arg == "header"
+            and isinstance(kw.value, ast.Constant)
+            and "only connect to one DSQL cluster" in kw.value.value
+            for kw in node.keywords
+        )
+    ]
+    assert notices, "a wrong-cluster endpoint must be flagged as a notice, not loose text"
+    # Gated on an ACTUAL mismatch: warning on the granted endpoint itself would be noise.
+    src = ast.unparse(tree)
+    assert "_granted_endpoint and tgt_endpoint != _granted_endpoint" in src, src

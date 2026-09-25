@@ -35,6 +35,7 @@ as a separate utility in a later subtask.
 
 from __future__ import annotations
 
+import os
 import socket
 import time
 from typing import Any, Callable, Optional
@@ -432,6 +433,82 @@ def _sanitize_message(message: str, cached: Optional[_CachedToken]) -> str:
     return message
 
 
+# Set by the deploy templates to the app stack's ``DsqlClusterArn`` parameter -- the ONE
+# cluster whose dsql:DbConnect / dsql:DbConnectAdmin grant was generated for this
+# deployment. Absent entirely = not a managed deployment (laptop / hand-rolled host),
+# where the ambient credentials really are what decides.
+GRANTED_CLUSTER_ENV = "DSQL_MIGRATOR_DSQL_CLUSTER_ARN"
+
+
+def granted_dsql_cluster_arn() -> Optional[str]:
+    """The DSQL cluster ARN this deployment can connect to, or ``None`` if unknown.
+
+    The app cannot read its own task role (no ``iam:Simulate*``), so the grant is
+    *attested* by the template through an env var -- the same pattern as
+    ``DSQL_MIGRATOR_SOURCE_SECRET_ARN`` and ``DSQL_MIGRATOR_CDC_MSK_ACCESS``.
+    """
+    raw = os.environ.get(GRANTED_CLUSTER_ENV)
+    return None if raw is None else raw.strip()
+
+
+def granted_dsql_cluster_endpoint() -> Optional[str]:
+    """The DSQL endpoint hostname derived from the granted ARN, or ``None``. Pure.
+
+    ``arn:aws:dsql:<region>:<acct>:cluster/<id>`` -> ``<id>.dsql.<region>.on.aws``.
+    Returns ``None`` for an unset/blank marker or a wildcard grant (``cluster/*``),
+    where there is no single endpoint to name.
+    """
+    arn = granted_dsql_cluster_arn()
+    if not arn:
+        return None
+    parts = arn.split(":")
+    if len(parts) < 6 or not parts[5].startswith("cluster/"):
+        return None
+    region, identifier = parts[3].strip(), parts[5].split("/", 1)[1].strip()
+    if not region or not identifier or "*" in identifier:
+        return None
+    return f"{identifier}.dsql.{region}.on.aws"
+
+
+def _dsql_access_denied_hint() -> str:
+    """The IAM-failure hint, aware of what THIS deployment was actually granted.
+
+    "Confirm your AWS identity has dsql:DbConnectAdmin on this cluster" is true and
+    useless on a managed deployment: the operator cannot edit the task role, because its
+    ``dsql:DbConnect``/``DbConnectAdmin`` Resource is GENERATED from the app stack's
+    ``DsqlClusterArn`` parameter -- ONE cluster ARN fixed at deploy time -- while the
+    Connect screen accepts any endpoint they type. Typing a second cluster's endpoint
+    (a perfectly reasonable thing to do when testing two sources) therefore fails with an
+    IAM error whose only actionable fix is a stack parameter, and the app could not say so
+    because it cannot observe its own role.
+    """
+    generic = (
+        "looks like an IAM/auth issue — confirm your AWS identity has "
+        "dsql:DbConnectAdmin on this cluster and the AWS profile/region are correct"
+    )
+    granted = granted_dsql_cluster_arn()
+    if granted is None:
+        return generic
+    if not granted:
+        return (
+            "this deployment was not granted access to ANY Aurora DSQL cluster — its app "
+            "stack's DsqlClusterArn parameter is empty, so no dsql:DbConnect permission "
+            "was created. Update the stack with DsqlClusterArn set to this cluster"
+        )
+    endpoint = granted_dsql_cluster_endpoint()
+    if endpoint is None:
+        # A wildcard grant, so the cluster really should be reachable: this is a genuine
+        # IAM/region problem rather than the wrong-cluster case.
+        return generic
+    return (
+        "this deployment is granted exactly ONE Aurora DSQL cluster — "
+        f"{endpoint} — and the endpoint above is a different one. Either connect to "
+        "that cluster, or update the app stack's DsqlClusterArn parameter to this one "
+        "(the task role's dsql:DbConnect permission is generated from it, so it cannot "
+        "be widened by hand)"
+    )
+
+
 def _failure_hint(reason: str) -> str:
     """Classify a DSQL connection failure into one actionable next step.
 
@@ -456,11 +533,7 @@ def _failure_hint(reason: str) -> str:
             "28p01",  # invalid password
         )
     ):
-        return (
-            "looks like an IAM/auth issue — confirm your AWS identity has "
-            "dsql:DbConnectAdmin on this cluster and the AWS profile/region are "
-            "correct"
-        )
+        return _dsql_access_denied_hint()
     # Network / reachability: cannot reach the endpoint at all.
     if any(
         s in low

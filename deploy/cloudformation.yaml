@@ -1832,6 +1832,15 @@ Resources:
             - Name: DSQL_MIGRATOR_SOURCE_SECRET_ARN
               Value:
                 Ref: SourceSecretArn
+            # WHICH Aurora DSQL cluster this deployment can connect to. Same reason as the
+            # secret marker above: the task role's dsql:DbConnect/DbConnectAdmin Resource
+            # is generated from DsqlClusterArn -- one cluster, fixed at deploy time --
+            # while the Connect screen accepts any endpoint typed into it. Without this the
+            # app could only say "confirm your AWS identity has dsql:DbConnectAdmin",
+            # pointing at a role the operator cannot edit.
+            - Name: DSQL_MIGRATOR_DSQL_CLUSTER_ARN
+              Value:
+                Ref: DsqlClusterArn
           Secrets:
             # Stable cookie-signing secret for the UI's browser session id, so a
             # reconnecting browser resumes its persisted workbench state (workflow

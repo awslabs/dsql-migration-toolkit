@@ -56,7 +56,10 @@ from dsql_migrator.core.secrets import (
     granted_source_secret_arn,
     resolve_source_secret,
 )
-from dsql_migrator.core.target_connection import DsqlConnector
+from dsql_migrator.core.target_connection import (
+    DsqlConnector,
+    granted_dsql_cluster_endpoint,
+)
 from dsql_migrator.ui.design import (
     INLINE_HINT_TEXT,
     inline_hint,
@@ -560,7 +563,16 @@ def build_connect_page(
     )
     src_database = _eff(getattr(_sc, "database", None), d.source_database)
     src_username = _eff(getattr(_sc, "username", None), d.source_username)
-    tgt_endpoint = _eff(getattr(_tc, "cluster_endpoint", None), d.target_endpoint or "")
+    # The ONE cluster this deployment's task role can connect to, attested by the
+    # template (it cannot be observed from inside the container). Used as the LAST
+    # fallback only: a live session's own target and an explicit configured default both
+    # still win, so this never overrides what the operator already chose -- it just stops
+    # the field starting empty on a managed deployment where exactly one endpoint works.
+    _granted_endpoint = granted_dsql_cluster_endpoint()
+    tgt_endpoint = _eff(
+        getattr(_tc, "cluster_endpoint", None),
+        d.target_endpoint or _granted_endpoint or "",
+    )
     tgt_region = _eff(
         getattr(_tc, "region", None),
         d.target_region or parse_region_from_endpoint(d.target_endpoint or "") or "",
@@ -1122,6 +1134,22 @@ def build_connect_page(
             target_endpoint = ui.input(
                 "Cluster endpoint", value=tgt_endpoint or ""
             ).classes("w-full")
+            if _granted_endpoint and tgt_endpoint != _granted_endpoint:
+                # The operator is pointing somewhere this deployment cannot authenticate
+                # to. DSQL is IAM-token auth and the token is minted for ONE cluster ARN
+                # (the stack's DsqlClusterArn), so say it here rather than after a round
+                # trip that returns "not authorized to perform dsql:DbConnectAdmin" and
+                # sends them to a task role they cannot edit.
+                render_notice(
+                    ui,
+                    tone="warning",
+                    header="This deployment can only connect to one DSQL cluster",
+                    body=(
+                        f"Its app stack grants {_granted_endpoint}. A different endpoint "
+                        "will fail with an IAM authorization error — connect to that "
+                        "cluster, or update the stack's DsqlClusterArn parameter."
+                    ),
+                )
             target_region = ui.input(
                 "AWS region",
                 value=tgt_region or "",

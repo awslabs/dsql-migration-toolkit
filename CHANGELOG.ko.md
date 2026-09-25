@@ -5,6 +5,12 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.523
+
+### 수정
+
+- **잘못된 Aurora DSQL 엔드포인트가 운영자가 편집할 수 없는 역할을 가리키는 IAM 에러로 실패했습니다.** Connect 화면에 두 번째 클러스터의 엔드포인트를 입력하면 — 소스 2개를 타깃 2개에 테스트할 때 당연한 동작입니다 — *"not authorized to perform: dsql:DbConnectAdmin … confirm your AWS identity has dsql:DbConnectAdmin on this cluster"* 가 돌아왔습니다. 사실이지만 관리형 배포에서는 막다른 길입니다: DSQL은 IAM 토큰 인증이고 태스크 롤의 `dsql:DbConnect`/`DbConnectAdmin` **Resource는 앱 스택의 `DsqlClusterArn` 파라미터에서 생성**되어 배포 시점에 고정된 **클러스터 ARN 하나**인데, Connect 화면은 아무 엔드포인트나 받습니다. 손으로 넓힐 수도 없으니 실행 가능한 해결책은 그 메시지가 한 번도 언급하지 않은 스택 파라미터뿐이었고, 앱은 자기 역할을 조회할 수 없어 언급할 수도 없었습니다. 이제 두 배포 템플릿이 부여된 ARN을 `DSQL_MIGRATOR_DSQL_CLUSTER_ARN` 으로 알려 주므로(v0.1.520의 `DSQL_MIGRATOR_SOURCE_SECRET_ARN` 및 `DSQL_MIGRATOR_CDC_MSK_ACCESS` 와 같은 방식), 도구는: 실제로 동작하는 그 클러스터 엔드포인트를 타깃 입력란에 미리 채우고(**최후 폴백**이라 진행 중 세션의 타깃과 설정된 기본값이 여전히 우선), 입력된 엔드포인트가 다른 클러스터면 **왕복 전에 경고**하고, 거부되면 IAM이 아니라 그 클러스터 엔드포인트와 `DsqlClusterArn` 파라미터를 이름으로 가리킵니다. 와일드카드 부여(`cluster/*`)는 지목할 단일 엔드포인트가 없으므로 기존 IAM/리전 문구를 유지합니다 — 그 경우엔 실제로 접속이 되어야 하기 때문입니다. 비관리형 실행(노트북, 직접 구성한 호스트)에는 이 표식이 없어 동작이 그대로입니다.
+
 ## v0.1.522
 
 ### 수정

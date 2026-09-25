@@ -509,3 +509,120 @@ def test_target_error_hint_falls_back_to_message_text() -> None:
 def test_target_error_hint_none_for_unrecognized() -> None:
     assert target_error_hint(_TargetError("some opaque failure")) is None
     assert target_error_hint(RuntimeError("nothing recognizable here")) is None
+
+
+# ---------------------------------------------------------------------------
+# The DSQL IAM hint must name the actionable fix, not a role nobody can edit
+# ---------------------------------------------------------------------------
+
+
+_DENIED = (
+    'connection to server at "18.97.33.134", port 5432 failed: FATAL: unable to '
+    "accept connection, access denied DETAIL: Session Id: abc HINT: User: "
+    "arn:aws:sts::076914959415:assumed-role/mysql-dsql-migrator-TaskRole-X/sess is "
+    "not authorized to perform: dsql:DbConnectAdmin on resource: "
+    "arn:aws:dsql:us-east-1:076914959415:cluster/ejudkwl6is27j3gmifw75amwme because "
+    "no identity-based policy allows the dsql:DbConnectAdmin action"
+)
+
+
+def test_granted_cluster_endpoint_is_derived_from_the_arn(monkeypatch) -> None:
+    from dsql_migrator.core.target_connection import (
+        GRANTED_CLUSTER_ENV,
+        granted_dsql_cluster_endpoint,
+    )
+
+    monkeypatch.delenv(GRANTED_CLUSTER_ENV, raising=False)
+    assert granted_dsql_cluster_endpoint() is None, "unset = cannot tell"
+    monkeypatch.setenv(GRANTED_CLUSTER_ENV, "")
+    assert granted_dsql_cluster_endpoint() is None, "blank = nothing granted"
+    monkeypatch.setenv(
+        GRANTED_CLUSTER_ENV, " arn:aws:dsql:us-east-1:076914959415:cluster/abc123 "
+    )
+    assert granted_dsql_cluster_endpoint() == "abc123.dsql.us-east-1.on.aws"
+    # A wildcard grant has no single endpoint to name.
+    monkeypatch.setenv(
+        GRANTED_CLUSTER_ENV, "arn:aws:dsql:us-east-1:076914959415:cluster/*"
+    )
+    assert granted_dsql_cluster_endpoint() is None
+    # Junk must not produce a junk endpoint.
+    monkeypatch.setenv(GRANTED_CLUSTER_ENV, "not-an-arn")
+    assert granted_dsql_cluster_endpoint() is None
+
+
+def test_an_unmanaged_run_keeps_the_original_iam_wording(monkeypatch) -> None:
+    from dsql_migrator.core.target_connection import (
+        GRANTED_CLUSTER_ENV,
+        _failure_hint,
+    )
+
+    monkeypatch.delenv(GRANTED_CLUSTER_ENV, raising=False)
+    hint = _failure_hint(_DENIED)
+    assert "dsql:DbConnectAdmin on this cluster" in hint
+    assert "DsqlClusterArn" not in hint
+
+
+def test_a_different_cluster_is_named_instead_of_sending_them_to_iam(monkeypatch) -> None:
+    """The task role's Resource is GENERATED from a stack parameter -- one cluster.
+
+    Typing a second cluster's endpoint (reasonable when testing two sources) failed with
+    "confirm your AWS identity has dsql:DbConnectAdmin", which on a managed deployment
+    points at a role the operator cannot edit. The actionable fix is the parameter.
+    """
+    from dsql_migrator.core.target_connection import (
+        GRANTED_CLUSTER_ENV,
+        _failure_hint,
+    )
+
+    monkeypatch.setenv(
+        GRANTED_CLUSTER_ENV,
+        "arn:aws:dsql:us-east-1:076914959415:cluster/grto2rur2hklwxhnkctspgxwdm",
+    )
+    hint = _failure_hint(_DENIED)
+    assert "grto2rur2hklwxhnkctspgxwdm.dsql.us-east-1.on.aws" in hint, hint
+    assert "DsqlClusterArn" in hint, hint
+    assert "cannot be widened by hand" in hint, hint
+    assert "confirm your AWS identity" not in hint, hint
+
+
+def test_no_cluster_granted_at_all_says_so(monkeypatch) -> None:
+    from dsql_migrator.core.target_connection import (
+        GRANTED_CLUSTER_ENV,
+        _failure_hint,
+    )
+
+    monkeypatch.setenv(GRANTED_CLUSTER_ENV, "")
+    hint = _failure_hint(_DENIED)
+    assert "not granted access to ANY" in hint, hint
+    assert "DsqlClusterArn parameter is empty" in hint, hint
+
+
+def test_a_wildcard_grant_falls_back_to_the_iam_wording(monkeypatch) -> None:
+    """With cluster/* the cluster SHOULD be reachable, so this is a real IAM/region bug."""
+    from dsql_migrator.core.target_connection import (
+        GRANTED_CLUSTER_ENV,
+        _failure_hint,
+    )
+
+    monkeypatch.setenv(
+        GRANTED_CLUSTER_ENV, "arn:aws:dsql:us-east-1:076914959415:cluster/*"
+    )
+    hint = _failure_hint(_DENIED)
+    assert "dsql:DbConnectAdmin on this cluster" in hint
+    assert "different one" not in hint
+
+
+def test_both_templates_attest_the_granted_dsql_cluster() -> None:
+    """The app cannot observe its own role, so the TEMPLATE has to tell it."""
+    from pathlib import Path
+
+    from dsql_migrator.core.target_connection import GRANTED_CLUSTER_ENV
+
+    root = Path(__file__).resolve().parents[1]
+    for name in ("cloudformation.yaml", "cloudformation-ec2.yaml"):
+        text = (root / "deploy" / name).read_text(encoding="utf-8")
+        assert GRANTED_CLUSTER_ENV in text, f"{name} does not export {GRANTED_CLUSTER_ENV}"
+        at = text.index(GRANTED_CLUSTER_ENV)
+        assert "DsqlClusterArn" in text[at : at + 200], (
+            f"{name} must set {GRANTED_CLUSTER_ENV} from the DsqlClusterArn parameter"
+        )
