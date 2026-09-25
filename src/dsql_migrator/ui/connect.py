@@ -776,8 +776,16 @@ def build_connect_page(
         # Seed from the live source config if present, else the non-secret engine hint
         # recovered from a snapshot restore (so a PG operator resuming a restored
         # workbench is not reset to the MySQL default), else MySQL.
+        # The operator's CURRENT pick wins, then the live config, then the snapshot hint.
+        # The pick has to come first: with an already-verified config of the other engine
+        # on the session, seeding from ``source_config`` reverted the tile on the next
+        # rebuild and brought that engine's host/port/database back with it -- and nothing
+        # re-locks the journey (the workflow latch is one-way), so Schema Conversion stayed
+        # openable against the wrong dialect. This project has already shipped that bug
+        # once ("converted a PostgreSQL source with the MySQL dialect, and applied it").
         _engine = {
-            "type": getattr(state.source_config, "source_type", None)
+            "type": getattr(state, "source_engine_choice", None)
+            or getattr(state.source_config, "source_type", None)
             or getattr(state, "restored_source_type", None)
             or SourceType.MYSQL
         }
@@ -800,6 +808,10 @@ def build_connect_page(
                 return  # radio_tiles fires on re-select too; ignore a no-op
             old_default = dialect_for(_engine["type"]).default_port
             _engine["type"] = new_type
+            # Record it on the SESSION, not only in this builder-local dict: the dict dies
+            # with the render, which is what reverted the pick.
+            if hasattr(state, "set_source_engine_choice"):
+                state.set_source_engine_choice(new_type)
             # Move the port to the new engine's default UNLESS the user typed a custom
             # one (mirror on_endpoint_change's don't-clobber guard).
             if int(source_port.value or 0) == old_default:
@@ -860,9 +872,17 @@ def build_connect_page(
             # secret). The secret is read with the AWS profile selected above, so
             # no password is typed or held beyond this session (Property 7).
             ui.label("Authentication").classes("text-sm font-medium")
+            # A recorded secret reference IS the operator's auth choice, so seed from it
+            # rather than from a literal: the screen is rebuilt on every render, so
+            # leaving Connect and coming back reverted a Secrets-Manager session to
+            # username/password even though the chosen secret was still on the session.
             source_auth_method = ui.radio(
                 [AUTH_METHOD_PASSWORD, AUTH_METHOD_SECRET],
-                value=AUTH_METHOD_PASSWORD,
+                value=(
+                    AUTH_METHOD_SECRET
+                    if getattr(state, "source_secret_id", None)
+                    else AUTH_METHOD_PASSWORD
+                ),
             ).props("inline")
 
             manual_auth = ui.column().classes("w-full gap-2")
@@ -872,7 +892,17 @@ def build_connect_page(
                 ).classes("w-full")
                 source_password = ui.input(
                     "Password",
-                    value=d.source_password.reveal() if d.source_password else "",
+                    # The SESSION's password outranks the deployment default. Every other
+                    # source field already prefers the session (``_eff``); this one did
+                    # not, so after the operator re-pointed to a different database the
+                    # rebuilt form showed the new host and username beside the .env
+                    # DEFAULT password -- a mismatched credential set that the next test
+                    # then wrote over the working in-memory one.
+                    value=(
+                        state.source_password.reveal()
+                        if getattr(state, "source_password", None)
+                        else (d.source_password.reveal() if d.source_password else "")
+                    ),
                     password=True,
                     password_toggle_button=True,
                 ).classes("w-full")
@@ -905,7 +935,11 @@ def build_connect_page(
                 # the first keystroke.
                 source_secret_id = ui.input(
                     "Secrets Manager secret ARN or name",
-                    value=_granted_secret or "",
+                    # The session's own recorded reference first -- restoring the radio
+                    # while leaving this blank would just move the dead end (the next test
+                    # would resolve an empty secret id). The granted ARN stays as the
+                    # first-time default.
+                    value=getattr(state, "source_secret_id", None) or _granted_secret or "",
                     placeholder="arn:aws:secretsmanager:us-east-1:...:secret:my-db",
                 ).props(
                     "hint=\"Example: arn:aws:secretsmanager:us-east-1:123456789012"

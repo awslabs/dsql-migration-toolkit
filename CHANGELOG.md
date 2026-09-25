@@ -5,6 +5,18 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.529
+
+### Fixed
+
+- **A re-render reverted four operator choices on the Connect screen, and a restored session lost two decisions.** NiceGUI rebuilds a screen on every render, so any widget seeded from a literal silently discards what the operator picked — leaving Connect and coming back was enough.
+  - **The source engine (MySQL / PostgreSQL) reverted.** `on_engine_change` mutated only a builder-local dict that nothing else ever saw, and the tile re-seeded from `source_config.source_type`. With an already-verified config of the OTHER engine on the session, a fresh PostgreSQL pick vanished on the next rebuild and that engine's host/port/database came back with it — while the workflow latch is one-way, so Schema Conversion stayed openable against the wrong dialect. This project has shipped exactly that failure before ("converted a PostgreSQL source with the MySQL dialect, and applied it"). The pick is now recorded on the session and consulted AHEAD of the live config; a successful test clears it, because the config is then the truth.
+  - **The Authentication choice reverted to username/password** even though the chosen secret was still on the session — the radio's initial value was a hardcoded literal. It is now derived from the recorded secret reference.
+  - **The Secrets Manager ARN field came back empty**, which would have made the radio fix worse than useless (the next test would resolve an empty secret id). It now prefers the session's own reference, keeping the deployment-granted ARN as the first-time default.
+  - **The password field preferred the deployment `.env` default over the session's password.** Every other source field already preferred the session; this one did not, so after re-pointing to a different database the rebuilt form showed the new host and username beside the DEFAULT password — a mismatched credential set the next test then wrote over the working in-memory one.
+  - **The Secrets Manager reference is now persisted**, so a restored session keeps the auth METHOD as well as the reference. It is not a credential (the password is never persisted), and the CDC deploy/teardown reads it to decide whether the tool owns a secret it may delete.
+  - **The "accept the quarantined rows and continue" decision is now persisted**, with the gap size signed off on. Held only in memory before, so a restored session came back as if the decision had never been made: the panel reverted from "complete — with an accepted gap" to the amber issues alarm, and a re-run then raised `FullLoadIncompleteError`, flipped Data Migration to FAILED and **skipped the identity-sequence sync** the accepted path performs.
+
 ## v0.1.528
 
 ### Added

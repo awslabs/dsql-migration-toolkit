@@ -149,6 +149,19 @@ class SessionSnapshot(BaseModel):
     # the cursor restored there is no re-read of old events to de-duplicate, and the sets
     # are bounded at thousands of ids (snapshot bloat for no gain).
     cdc_dlq_cursor_ms: dict[str, int] = Field(default_factory=dict)
+    # The NON-SECRET Secrets Manager reference the operator authenticated the source with.
+    # Not a credential (the password is never persisted), and without it a restored session
+    # forgot the auth METHOD as well as the reference -- and the CDC deploy/teardown reads
+    # it to decide whether the tool owns a secret it may delete.
+    source_secret_id: Optional[str] = None
+    # The operator's explicit "accept the quarantined rows and continue" decision, and the
+    # gap size they signed off on. Held only in memory before, so a restored session came
+    # back as if the decision had never been made: the panel reverted from "complete -- with
+    # an accepted gap" to the amber issues alarm, and a re-run then raised
+    # FullLoadIncompleteError, flipped the step to FAILED and SKIPPED the identity-sequence
+    # sync the accepted path performs.
+    full_load_quarantine_accepted: bool = False
+    full_load_accepted_quarantine_rows: Optional[int] = None
     # Non-secret target (Aurora DSQL) connection so a reconnecting session can
     # re-probe the cdc-stack phase WITHOUT the user re-entering the target first
     # (DSQL auth is IAM-token based, so endpoint + region are enough to describe).

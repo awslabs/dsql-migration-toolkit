@@ -1725,3 +1725,82 @@ def test_the_provenance_stamp_is_part_of_the_dirty_check() -> None:
         )
     )
     assert _sig() != before, "a re-stamp alone must move the signature"
+
+
+def test_the_secret_reference_survives_a_restore_so_the_auth_method_does_too() -> None:
+    """The auth method is INFERRED from this reference, so losing it reverted the choice.
+
+    It is not a credential (the password is never persisted) — and the CDC deploy/teardown
+    reads it to decide whether the tool owns a secret it may delete, so a restored session
+    that forgot it would judge that differently.
+    """
+    from dsql_migrator.core.session_state_store import SessionSnapshot
+
+    session, eval_state, conv_state, migration_state = _populated_states()
+    session.set_source_secret_id(
+        "arn:aws:secretsmanager:us-east-1:1:secret:pg-src-AbCdEf"
+    )
+    snapshot = capture_session_snapshot(
+        "s1", session, eval_state, conv_state, migration_state
+    )
+    assert snapshot.source_secret_id == (
+        "arn:aws:secretsmanager:us-east-1:1:secret:pg-src-AbCdEf"
+    )
+
+    restored = SessionConnectionState()
+    assert restored.source_secret_id is None
+    apply_session_snapshot(
+        snapshot, restored, EvaluationState(), SchemaConversionState(),
+        DataMigrationState(),
+    )
+    assert restored.source_secret_id == (
+        "arn:aws:secretsmanager:us-east-1:1:secret:pg-src-AbCdEf"
+    )
+    # Older snapshots restore cleanly to "no secret" (username/password).
+    assert SessionSnapshot(session_id="s1").source_secret_id is None
+
+
+def test_the_accepted_quarantine_decision_survives_a_restore() -> None:
+    """Losing it reverted a completed migration to the amber issues alarm.
+
+    And a re-run then raised FullLoadIncompleteError, flipped the step to FAILED and
+    SKIPPED the identity-sequence sync that the accepted path performs.
+    """
+    from dsql_migrator.core.session_state_store import SessionSnapshot
+
+    session, eval_state, conv_state, migration_state = _populated_states()
+    migration_state.set_accept_quarantined_rows(True, gap=7)
+    snapshot = capture_session_snapshot(
+        "s1", session, eval_state, conv_state, migration_state
+    )
+    assert snapshot.full_load_quarantine_accepted is True
+    assert snapshot.full_load_accepted_quarantine_rows == 7
+
+    restored = DataMigrationState()
+    assert restored.accept_quarantined_rows is False
+    apply_session_snapshot(
+        snapshot, SessionConnectionState(), EvaluationState(),
+        SchemaConversionState(), restored,
+    )
+    assert restored.accept_quarantined_rows is True
+    assert restored.accepted_quarantine_rows == 7
+
+    old = SessionSnapshot(session_id="s1")
+    assert old.full_load_quarantine_accepted is False
+    assert old.full_load_accepted_quarantine_rows is None
+
+
+def test_recording_either_choice_moves_the_dirty_check() -> None:
+    # Without this the newly-recorded value is never written and the restore loses it again.
+    session, eval_state, conv_state, migration_state = _populated_states()
+
+    def _sig():
+        return session_signature(session, eval_state, conv_state, migration_state)
+
+    before = _sig()
+    session.set_source_secret_id("arn:aws:secretsmanager:us-east-1:1:secret:s-AbCdEf")
+    after_secret = _sig()
+    assert after_secret != before, "a new secret reference must move the signature"
+
+    migration_state.set_accept_quarantined_rows(True, gap=3)
+    assert _sig() != after_secret, "accepting a gap must move the signature"

@@ -67,6 +67,7 @@ class SessionConnectionState:
         "_cdc_infra_inputs",
         "source_secret_id",
         "restored_source_type",
+        "source_engine_choice",
     )
 
     def __init__(self) -> None:
@@ -163,6 +164,15 @@ class SessionConnectionState:
         # Connect screen -- the CDC deploy reads it to auto-fill SourceSecretArn/Name
         # (Property 7: only the non-secret reference is stored, never the credential).
         self.source_secret_id: Optional[str] = None
+        # The engine the operator has CURRENTLY picked on the Connect screen, which is not
+        # the same thing as the engine of the last successful connection. NiceGUI rebuilds
+        # a screen on every render, so the picker seeded itself from a builder-local dict
+        # that on_engine_change mutated and nothing else ever saw -- leaving Connect and
+        # coming back reverted the pick, and with an already-verified config of the OTHER
+        # engine the old host/port/database came back with it. Consulted AHEAD of
+        # ``source_config.source_type`` for exactly that case; cleared by ``set_source``,
+        # because a live config then IS the truth.
+        self.source_engine_choice: Optional[SourceType] = None
         # The source ENGINE kind recovered from a snapshot restore (never the source
         # connection/secret, which is not persisted). A hint only: it pre-selects the
         # engine on the Connect screen so a PostgreSQL operator resuming a restored
@@ -182,13 +192,23 @@ class SessionConnectionState:
         """
         self.source_config = config
         self._source_password = password
-        # A live source supersedes any restored-engine hint (the picker now reads the
-        # real config's source_type).
+        # A live source supersedes any restored-engine hint AND any pending pick (the
+        # picker now reads the real config's source_type).
         self.restored_source_type = None
+        self.source_engine_choice = None
 
     def set_restored_source_type(self, source_type: Optional[SourceType]) -> None:
         """Record the source engine kind recovered from a snapshot restore (hint only)."""
         self.restored_source_type = source_type
+
+    def set_source_engine_choice(self, source_type: Optional[SourceType]) -> None:
+        """Record the engine the operator just picked, before any connection test.
+
+        Kept separate from ``source_config.source_type`` so the pick survives a re-render
+        even when a config for the OTHER engine is still on the session -- which is the
+        case that silently reverted both the tile and the host/port/database with it.
+        """
+        self.source_engine_choice = source_type
 
     @property
     def source_password(self) -> Optional[SecretValue]:
@@ -442,6 +462,7 @@ class SessionConnectionState:
         self._migration_type_chosen = False
         self._cdc_infra_inputs = {}
         self.source_secret_id = None
+        self.source_engine_choice = None
         self.restored_source_type = None
 
     def __repr__(self) -> str:

@@ -145,6 +145,13 @@ def capture_session_snapshot(
         cdc_ops_window_start=getattr(migration_state, "cdc_ops_window_start", None),
         cdc_stack_name=getattr(migration_state, "cdc_stack_name", None),
         cdc_infra_inputs=dict(migration_state.cdc_infra_inputs()),  # type: ignore[attr-defined]
+        source_secret_id=getattr(session, "source_secret_id", None),
+        full_load_quarantine_accepted=bool(
+            getattr(migration_state, "accept_quarantined_rows", False)
+        ),
+        full_load_accepted_quarantine_rows=getattr(
+            migration_state, "accepted_quarantine_rows", None
+        ),
         cdc_dlq_cursor_ms={
             str(group): int(value)
             for group, value in (
@@ -526,6 +533,20 @@ def apply_session_snapshot(
     # which cdc-stack this session owns and the VpcId/subnet it deployed with. On
     # the next render (after the user re-verifies the target connection), the
     # read-only AWS probe recovers the live phase (Infra ready / Streaming).
+    # The source auth METHOD is inferred from this reference, so restoring it is what
+    # keeps a Secrets-Manager session from coming back as username/password.
+    if getattr(snapshot, "source_secret_id", None) and hasattr(
+        session, "set_source_secret_id"
+    ):
+        session.set_source_secret_id(snapshot.source_secret_id)  # type: ignore[attr-defined]
+    # The accepted-quarantine decision, or the restored run reads as "finished with
+    # issues" and a re-run fails the step outright.
+    if getattr(snapshot, "full_load_quarantine_accepted", False) and hasattr(
+        migration_state, "set_accept_quarantined_rows"
+    ):
+        migration_state.set_accept_quarantined_rows(  # type: ignore[attr-defined]
+            True, gap=snapshot.full_load_accepted_quarantine_rows
+        )
     # Restore the DLQ read position BEFORE any poll rebuilds the controller: without it a
     # restarted task re-reads only its blind look-back window and the quarantine count
     # silently loses everything older (see SessionSnapshot.cdc_dlq_cursor_ms).
@@ -712,6 +733,13 @@ def session_signature(
         getattr(target, "cluster_endpoint", None),
         getattr(target, "region", None),
     )
+    # Part of the dirty-check, or a newly-recorded secret reference / a just-accepted
+    # quarantine gap would never be written and the restore would lose it again.
+    auth_sig = (
+        getattr(session, "source_secret_id", None),  # type: ignore[attr-defined]
+        bool(getattr(migration_state, "accept_quarantined_rows", False)),
+        getattr(migration_state, "accepted_quarantine_rows", None),
+    )
     infra = migration_state.cdc_infra_inputs()  # type: ignore[attr-defined]
     infra_sig = tuple(sorted(infra.items()))
     return (
@@ -736,6 +764,7 @@ def session_signature(
         getattr(migration_state, "cdc_stack_name", None),  # type: ignore[attr-defined]
         infra_sig,
         target_sig,
+        auth_sig,
         # CDC lifecycle-job link, so starting/finishing a CDC operation triggers a
         # save and the deploy-stage view survives a reconnect.
         getattr(migration_state, "cdc_deploy_job_id", None),  # type: ignore[attr-defined]

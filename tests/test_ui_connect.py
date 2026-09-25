@@ -813,3 +813,132 @@ def test_a_target_retest_does_not_push_an_invalidation() -> None:
             f"{forbidden} appeared in the Connect screen: staleness is handled at the "
             "point of use, not pushed from here"
         )
+
+
+# ---------------------------------------------------------------------------
+# A re-render must not revert the operator's choices (NiceGUI rebuilds screens)
+# ---------------------------------------------------------------------------
+
+
+def test_the_engine_pick_outranks_a_stale_verified_config() -> None:
+    """The pick must win over ``source_config.source_type``, not the other way round.
+
+    With an already-verified MySQL config on the session, seeding the tile from the config
+    reverted a fresh PostgreSQL pick on the next rebuild AND brought MySQL's
+    host/port/database back with it — while the workflow latch is one-way, so Schema
+    Conversion stayed openable against the wrong dialect. This project has shipped exactly
+    that bug before ("converted a PostgreSQL source with the MySQL dialect, and applied it").
+    """
+    import ast
+
+    tree = _connect_page_tree()
+    flat = ast.unparse(tree)
+    # The pick is consulted FIRST in the seeding chain.
+    seed = flat[flat.index("_engine = {"):]
+    first = seed.index("source_engine_choice")
+    assert first < seed.index("source_type"), seed[:400]
+    # ...and the pick is recorded on the SESSION, not only in the builder-local dict.
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "set_source_engine_choice"
+        for node in ast.walk(tree)
+    ), "on_engine_change must record the pick on the session"
+
+
+def test_a_successful_test_clears_the_pending_engine_pick() -> None:
+    # Once a real config exists it IS the truth; a lingering pick would then shadow it.
+    from dsql_migrator.core.models import SourceConnectionConfig, SourceType
+
+    state = SessionConnectionState()
+    state.set_source_engine_choice(SourceType.POSTGRES)
+    assert state.source_engine_choice is SourceType.POSTGRES
+    state.set_source(
+        SourceConnectionConfig(
+            source_type=SourceType.MYSQL, host="h", port=3306, username="u"
+        ),
+        None,
+    )
+    assert state.source_engine_choice is None
+
+
+def test_the_auth_method_is_derived_from_the_recorded_secret() -> None:
+    """A recorded secret reference IS the operator's auth choice.
+
+    The radio was a literal, so leaving Connect and coming back reverted a
+    Secrets-Manager session to username/password even though the chosen secret was still
+    on the session.
+    """
+    import ast
+
+    tree = _connect_page_tree()
+    radios = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "radio"
+        and any(kw.arg == "value" for kw in node.keywords)
+    ]
+    auth = [
+        r for r in radios
+        if "AUTH_METHOD_SECRET" in ast.unparse(r)
+    ]
+    assert auth, "the authentication radio was not found"
+    value = next(
+        ast.unparse(kw.value) for kw in auth[0].keywords if kw.arg == "value"
+    )
+    assert "source_secret_id" in value, value
+    assert "AUTH_METHOD_SECRET" in value, value
+
+
+def test_the_secret_field_prefers_the_session_over_the_granted_default() -> None:
+    """Restoring the radio while leaving this blank just moves the dead end.
+
+    The next test would resolve an empty secret id and fail, so the two must be fixed
+    together.
+    """
+    import ast
+
+    tree = _connect_page_tree()
+    inputs = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "input"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and "secret" in str(node.args[0].value).lower()
+    ]
+    assert len(inputs) == 1
+    value = next(ast.unparse(kw.value) for kw in inputs[0].keywords if kw.arg == "value")
+    assert "source_secret_id" in value, value
+    # The session's value comes FIRST; the granted ARN stays as the first-time default.
+    assert value.index("source_secret_id") < value.index("_granted_secret"), value
+
+
+def test_the_password_field_prefers_the_session_over_the_env_default() -> None:
+    """Every other source field already preferred the session; this one did not.
+
+    So after re-pointing to a different database the rebuilt form showed the new host and
+    username beside the .env DEFAULT password — a mismatched credential set that the next
+    test then wrote over the working in-memory one.
+    """
+    import ast
+
+    tree = _connect_page_tree()
+    inputs = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "input"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "Password"
+    ]
+    assert len(inputs) == 1
+    value = next(ast.unparse(kw.value) for kw in inputs[0].keywords if kw.arg == "value")
+    assert "state.source_password" in value, value
+    assert value.index("state.source_password") < value.index("d.source_password"), value
