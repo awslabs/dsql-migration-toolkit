@@ -937,23 +937,35 @@ class TooManyIndexesRule(Rule):
                     object=ObjectKey(KIND_TABLE, table.name),
                     rule_id=self.rule_id,
                     classification=Classification.MANUAL,
+                    # The outcome, not a failure that this tool's own pipeline makes
+                    # impossible. Since v0.1.433 Schema Conversion truncates the index
+                    # list at the budget and names what it dropped, so error 54000 never
+                    # fires -- but this text was left predicting it, telling the operator
+                    # to prepare for a post-load failure and a re-run decision when the
+                    # real result is a target that loads cleanly with specific indexes
+                    # silently absent. Opposite outcomes from the two steps, and the
+                    # quieter one is the one that actually happens.
                     risk=(
                         f"The table has {count} secondary indexes; with its primary "
                         f"key that is {count + 1} against Aurora DSQL's limit of "
-                        f"{_MAX_INDEXES_PER_TABLE} indexes per table. The excess index "
-                        "fails with error 54000 \"more than "
-                        f"{_MAX_INDEXES_PER_TABLE} indexes per table are not "
-                        "allowed\" — and because secondary indexes are built AFTER "
-                        "the data loads, that failure appears only once Full Load has "
-                        "already written every row."
+                        f"{_MAX_INDEXES_PER_TABLE} indexes per table. Schema Conversion "
+                        "therefore OMITS the over-budget indexes from the applied script "
+                        f"(it names them) and keeps {_MAX_SECONDARY_INDEXES_PER_TABLE}, "
+                        "because emitting them would fail with error 54000 \"more than "
+                        f"{_MAX_INDEXES_PER_TABLE} indexes per table are not allowed\" "
+                        "after Full Load had already written every row. So the load "
+                        "SUCCEEDS and the target is left missing those indexes -- queries "
+                        "relying on them fall back to scans."
                     ),
                     recommendation=(
-                        f"Drop indexes you no longer need so at most "
+                        "Choose which indexes to keep rather than letting the cut-off "
+                        f"choose: drop the ones you no longer need so at most "
                         f"{_MAX_SECONDARY_INDEXES_PER_TABLE} secondary indexes remain "
                         "(unused or redundant indexes are common — review the source's "
-                        "index usage), or split the table. "
-                        "Decide before loading: re-running Full Load will not clear "
-                        "this, since the limit is not transient."
+                        "index usage), or split the table. Decide before generating the "
+                        "DDL: re-running Full Load will not clear this, since the limit is "
+                        "not transient, and Schema Conversion's own warning lists exactly "
+                        "which indexes it left out."
                     ),
                     effort=EffortLevel.MEDIUM,
                 )

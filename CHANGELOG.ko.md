@@ -5,6 +5,15 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.526
+
+### 수정
+
+- **PostgreSQL 비-키 시퀀스 컬럼이 컷오버 시 애플리케이션 장애인데 나중에 정리할 데이터 품질 항목으로 보고됐습니다.** finding이 모든 대상 컬럼에 대해 *"an INSERT that omits it writes NULL instead of the next number"* 라고 하면서 이미 로드된 행은 무관하다고 안심시켰습니다. 그런데 `serial` 은 `NOT NULL DEFAULT nextval(...)` 로 확장되고 `GENERATED AS IDENTITY` 는 NOT NULL을 함의합니다 — 라이브 PostgreSQL 카탈로그와 이 도구 자신의 introspector로 모두 확인 — 즉 지배적 케이스에서 타깃 컬럼은 기본값 없는 NOT NULL이고 생략 INSERT는 **거부**됩니다(not-null 위반, SQLSTATE 23502). 도구가 생성한 DDL과 생략 INSERT를 실제 실행하니 **0행**이 기록됐습니다. nullability로 분기하는 Schema Conversion은 같은 컬럼에 대해 이미 "REJECTED on Aurora DSQL"이라고 말했습니다. 이제 finding이 컬럼을 nullability로 나누고, 각 컬럼의 메커니즘(`serial` / `GENERATED AS IDENTITY`)을 명시하고, 실제 결과를 각각 서술하며, NOT NULL 케이스는 **컷오버 전에** 처리해야 한다고 말합니다. 이 risk 문구는 AI 전략가 프롬프트로 그대로 복사되므로 틀린 결과가 생성된 마이그레이션 계획에까지 전파되고 있었습니다. **기존 테스트가 틀린 결과를 고정**하고 있었습니다(NOT NULL 컬럼을 만들어 놓고 문구에 `"writes NULL"` 을 요구) — v0.1.438 `lc_numeric` 회귀와 같은 형태입니다.
+- **인덱스 한도 finding이 이 도구의 파이프라인으로는 발생 불가능한 실패를 예고했습니다.** Full Load가 모든 행을 쓴 뒤 초과 인덱스가 *"fails with error 54000"* 라고 했지만, v0.1.433부터 Schema Conversion이 DSQL 예산에서 인덱스 목록을 절단하고 생략한 것을 이름으로 적습니다. 즉 로드는 **성공**하고 타깃에 그 인덱스들만 없는 상태가 됩니다. 두 단계가 정반대 결과를 말했고 조용한 쪽이 실제였으므로, 운영자는 어떤 인덱스를 남길지 고르는 대신 로드 후 실패와 재실행 결정을 준비했습니다. 이제 생략·성공·결과(쿼리가 스캔으로 떨어짐)를 명시합니다.
+- **지원되지 않는 컬럼 타입 때문에 삭제된 PostgreSQL secondary index가 어디에도 기록되지 않았습니다.** 건너뛰기 자체는 의도적이고 테스트되어 있습니다(실패가 예정된 `CREATE INDEX ASYNC` 를 내보내면 적용 시 실패할 뿐). 문제는 **두 단계 모두 아무 말도 하지 않았다는 것** — 운영자는 안내대로 `inet` 을 `text` 로 리모델하고도 그 인덱스가 함께 사라진 것을 알 방법이 없었습니다. 같은 함수의 바로 옆 `bytea` 건너뛰기는 이름까지 보고합니다. 이제 각 인덱스와 문제 컬럼·타입을 명시하고, 컬럼 리모델만으로는 충분하지 않다고 말합니다.
+- **이름이 같고 테이블이 다른 PostgreSQL 트리거가 구별 불가능한 행이 됐습니다.** 트리거 이름은 테이블마다만 유일한데(`pg_trigger` 는 `(tgrelid, tgname)` 로 키잉) 수집기가 `tgname` 만 선택해서, 통상적인 `set_updated_at` 이 12개 테이블에 있으면 동일한 finding 12개가 나오고 어느 테이블의 로직을 재구현해야 하는지 어디에도 없었으며, findings 버킷이 객체명으로 묶이기 때문에 중복 행 각각이 다른 행의 concerns까지 모두 반복했습니다. 이제 수집된 이름이 테이블을 포함합니다 — 루틴 수집기가 오버로드를 위해 이미 식별 인자를 포함하는 것과 같은 방식입니다.
+
 ## v0.1.525
 
 ### 수정

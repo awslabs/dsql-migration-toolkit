@@ -737,7 +737,44 @@ def test_non_key_sequence_rule_matches_what_schema_conversion_warns() -> None:
     # BOTH spellings, and never the primary key.
     assert "invoice_no" in f.risk and "legacy_no" in f.risk
     assert "id" not in f.risk.replace("identity", "").replace("IDENTITY", "")
-    assert "writes NULL" in f.risk
+    # The fixture's columns are all NOT NULL -- which is what `serial` and
+    # `GENERATED AS IDENTITY` actually produce -- so the outcome is a REJECTED insert, not a
+    # NULL. This test previously asserted `"writes NULL" in f.risk` on exactly these
+    # NOT NULL columns, i.e. it pinned the wrong outcome (the same shape as the v0.1.438
+    # `lc_numeric` regression, where the test asserted the bug). Verified against a live
+    # PostgreSQL catalog: the tool's own DDL emits `INT NOT NULL` with no default and an
+    # omitting INSERT fails with SQLSTATE 23502, writing zero rows.
+    assert "REJECTED on Aurora DSQL" in f.risk, f.risk
+    assert "23502" in f.risk, f.risk
+    assert "writes NULL" not in f.risk, f.risk
+    # The mechanism is named per column, so the operator can see which spelling it is.
+    assert "invoice_no (GENERATED AS IDENTITY)" in f.risk, f.risk
+    assert "legacy_no (serial)" in f.risk, f.risk
+    # The remedy must not read as deferrable for a NOT NULL column.
+    assert "BEFORE cut over" in f.recommendation, f.recommendation
+
+    # A NULLABLE sequence-defaulted column (a hand-attached DEFAULT nextval(...) without
+    # NOT NULL) is the case where NULL really is the outcome -- both must be expressible,
+    # and in one finding they must stay told apart.
+    mixed = TableDef(
+        name="shop.mixed",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False, identity=True),
+            ColumnDef(name="strict_no", mysql_type="integer", nullable=False, identity=True),
+            ColumnDef(
+                name="opt_no", mysql_type="bigint", nullable=True,
+                default="nextval('mixed_opt_no_seq'::regclass)",
+            ),
+        ],
+        primary_key=["id"],
+        auto_increment_column="id",
+    )
+    m = PgNonKeySequenceRule().evaluate(SourceInventory(tables=[mixed]))[0]
+    assert "REJECTED on Aurora DSQL" in m.risk, m.risk
+    assert "writes NULL instead of the next number" in m.risk, m.risk
+    assert "strict_no" in m.risk.split("nullable, so")[0], "the NOT NULL one is grouped first"
+    assert "2 column(s)" in m.risk, m.risk
+
     # A table with no non-key sequence column raises nothing.
     assert PgNonKeySequenceRule().evaluate(
         SourceInventory(tables=[TableDef(

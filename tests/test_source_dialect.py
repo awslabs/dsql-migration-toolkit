@@ -1413,3 +1413,33 @@ def test_postgres_row_estimate_sums_a_partitioned_parents_leaves() -> None:
     assert "COALESCE" not in expr.upper() and "GREATEST" not in expr.upper()
     # A plain table keeps the direct read.
     assert "ELSE c.reltuples::bigint END" in src
+
+
+def test_trigger_names_carry_their_table_so_same_named_triggers_are_distinguishable() -> None:
+    """A PostgreSQL trigger name is unique only PER TABLE (pg_trigger is keyed on
+    (tgrelid, tgname)), so `tgname` alone produced rows the report could not tell apart --
+    and because the findings bucket is keyed by object name, each duplicate row also
+    repeated every sibling's concerns. A conventional `set_updated_at` on twelve tables
+    rendered as twelve identical rows, none saying which table to reimplement the logic
+    for. Same defect the routine collector already fixed with identity arguments."""
+    from dsql_migrator.core.source_dialect.postgres import _pg_collect_triggers
+
+    captured: dict[str, str] = {}
+
+    class _Recorder(_DispatchPgConnection):
+        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+            captured["sql"] = " ".join(str(statement).split())
+            return super().execute(statement, parameters)
+
+    refs = _pg_collect_triggers(
+        _Recorder({"pg_trigger": lambda _p: [
+            {"name": "orders.set_updated_at"},
+            {"name": "customers.set_updated_at"},
+        ]}),
+        "app",
+    )
+    # The TABLE is selected into the name, so the two rows are distinct objects.
+    assert "c.relname || '.' || t.tgname" in captured["sql"], captured["sql"]
+    # Ordered by table THEN trigger, so a table's triggers stay adjacent.
+    assert "ORDER BY c.relname, t.tgname" in captured["sql"], captured["sql"]
+    assert len({r.name for r in refs}) == 2, [r.name for r in refs]

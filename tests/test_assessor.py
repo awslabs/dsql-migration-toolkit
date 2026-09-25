@@ -1756,3 +1756,42 @@ def test_every_assessed_item_has_at_least_one_concern_unless_clean() -> None:
         if item.classification is Classification.AUTO:
             continue
         assert item.concerns, f"{item.object_name} ({item.kind}) has no concerns"
+
+
+def test_the_index_limit_finding_states_the_outcome_that_actually_happens() -> None:
+    """It predicted error 54000 — which this tool's own pipeline makes impossible.
+
+    Since v0.1.433 Schema Conversion truncates the index list at DSQL's budget and names
+    what it dropped, so the load SUCCEEDS with specific indexes silently absent. The
+    Evaluation wording was left predicting a post-load failure and a re-run decision, i.e.
+    the two steps stated opposite outcomes and the quieter one is the real one.
+    """
+    from dsql_migrator.core.assessor import CompatibilityAssessor
+    from dsql_migrator.core.converter import SchemaConverter
+    from dsql_migrator.core.models import IndexDef, SourceInventory, SourceType, TableDef
+
+    table = TableDef(
+        name="shop.wide",
+        columns=[ColumnDef(name="id", mysql_type="bigint")]
+        + [ColumnDef(name=f"c{i}", mysql_type="int") for i in range(30)],
+        primary_key=["id"],
+        indexes=[IndexDef(name=f"idx_{i}", columns=[f"c{i}"]) for i in range(30)],
+    )
+    inventory = SourceInventory(tables=[table])
+    item = next(
+        i
+        for i in CompatibilityAssessor(source_type=SourceType.MYSQL)
+        .assess(inventory)
+        .items
+        if "TOO_MANY_INDEXES" in i.rule_id
+    )
+    # The converter is the ground truth for what lands on the target.
+    conv = SchemaConverter(source_type=SourceType.MYSQL).convert_table(table)
+    assert len(conv.index_ddls) == 23, len(conv.index_ddls)
+
+    assert "OMITS" in item.risk, item.risk
+    assert "SUCCEEDS" in item.risk, item.risk
+    # It must not read as "the load will fail".
+    assert "The excess index fails with error 54000" not in item.risk, item.risk
+    # The real consequence is a silently under-indexed target.
+    assert "fall back to scans" in item.risk, item.risk

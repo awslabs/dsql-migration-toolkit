@@ -1103,3 +1103,65 @@ def test_pg_oversized_lob_is_advice_not_per_table_manual_work() -> None:
     )
     finding = PgOversizedLobRule().evaluate(SourceInventory(tables=[table]))[0]
     assert finding.note_kind is ConversionNoteKind.RECOMMENDATION
+
+
+def test_an_index_skipped_for_an_unsupported_pg_type_is_named_not_silent() -> None:
+    """The skip is deliberate; its SILENCE was the defect.
+
+    The operator reads "remodel inet to text", does exactly that, and had no way to learn
+    that the index on it went too — so the post-migration workload falls back to scans with
+    nothing in the conversion output about it. The adjacent bytea skip in the same function
+    IS reported by name.
+    """
+    from dsql_migrator.core.converter import SchemaConverter
+    from dsql_migrator.core.models import (
+        ColumnDef,
+        IndexDef,
+        SourceType,
+        TableDef,
+    )
+
+    table = TableDef(
+        name="ecommerce.events",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint"),
+            ColumnDef(name="client_ip", mysql_type="inet"),
+            ColumnDef(name="tags", mysql_type="text[]"),
+            ColumnDef(name="note", mysql_type="text"),
+        ],
+        primary_key=["id"],
+        indexes=[
+            IndexDef(name="idx_ip", columns=["client_ip"]),
+            IndexDef(name="idx_tags", columns=["tags"]),
+            IndexDef(name="idx_note", columns=["note"]),
+        ],
+    )
+    conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    # The supported index still ships; the two unsupported ones do not.
+    assert len(conv.index_ddls) == 1 and "idx_note" in conv.index_ddls[0]
+
+    skipped = [w for w in conv.warnings if "were NOT emitted because" in w.message]
+    assert len(skipped) == 1, [w.message for w in conv.warnings]
+    message = skipped[0].message
+    assert "idx_ip (on client_ip inet)" in message, message
+    assert "idx_tags (on tags text[])" in message, message
+    # Remodelling the column is NOT sufficient -- say so, or the index stays missing.
+    assert "not enough on its own" in message, message
+    assert "2 secondary index(es)" in message, message
+
+
+def test_a_table_with_no_unsupported_index_column_gets_no_such_warning() -> None:
+    from dsql_migrator.core.converter import SchemaConverter
+    from dsql_migrator.core.models import ColumnDef, IndexDef, SourceType, TableDef
+
+    table = TableDef(
+        name="ecommerce.ok",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint"),
+            ColumnDef(name="note", mysql_type="text"),
+        ],
+        primary_key=["id"],
+        indexes=[IndexDef(name="idx_note", columns=["note"])],
+    )
+    conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    assert not [w for w in conv.warnings if "were NOT emitted because" in w.message]

@@ -357,35 +357,70 @@ class PgNonKeySequenceRule(Rule):
             key_columns = set(table.primary_key or ())
             if table.auto_increment_column:
                 key_columns.add(table.auto_increment_column)
-            columns = [
-                column.name
-                for column in table.columns
-                if column.name not in key_columns
-                and (
+            not_null, nullable = [], []
+            for column in table.columns:
+                if column.name in key_columns:
+                    continue
+                if not (
                     column.identity
                     or "nextval(" in (column.default or "").lower()
-                )
-            ]
-            if not columns:
+                ):
+                    continue
+                mechanism = "GENERATED AS IDENTITY" if column.identity else "serial"
+                label = f"{column.name} ({mechanism})"
+                (nullable if column.nullable else not_null).append(label)
+            if not (not_null or nullable):
                 continue
-            names = ", ".join(columns)
+            # The outcome depends on the column's NULLABILITY, and the two are not
+            # remotely equivalent. A ``serial`` expands to NOT NULL DEFAULT nextval(...)
+            # and GENERATED AS IDENTITY implies NOT NULL -- confirmed against a live
+            # PostgreSQL catalog AND against this tool's own introspector -- so for the
+            # dominant case the target column is NOT NULL with no default, and an INSERT
+            # that omits it is REJECTED (not-null violation, SQLSTATE 23502): an
+            # application outage at cut over. The old text stated only the NULL outcome,
+            # which requires a hand-attached sequence default on a NULLABLE column and is
+            # the rarer case -- so the go/no-go artifact described a data-quality item to
+            # clean up later while Schema Conversion, which DOES branch on nullability,
+            # said "REJECTED on Aurora DSQL" about the same column. This risk text is also
+            # copied into the AI strategist's prompt, so the wrong outcome propagated into
+            # the generated migration plan.
+            clauses, remedies = [], []
+            if not_null:
+                clauses.append(
+                    f"{', '.join(not_null)} -- NOT NULL, so an INSERT that omits the "
+                    "column succeeds on the source but is REJECTED on Aurora DSQL "
+                    "(not-null violation, SQLSTATE 23502)"
+                )
+                remedies.append(
+                    "For the NOT NULL column(s) this must be handled BEFORE cut over or "
+                    "writes fail outright: set the value explicitly in the application, "
+                    "or add an identity to the column on the target."
+                )
+            if nullable:
+                clauses.append(
+                    f"{', '.join(nullable)} -- nullable, so an INSERT that omits the "
+                    "column writes NULL instead of the next number"
+                )
+                remedies.append(
+                    "For the nullable column(s), supply the value from the application "
+                    "(or add an identity on the target) to stop NULLs accumulating."
+                )
             findings.append(
                 Finding(
                     object=ObjectKey(KIND_TABLE, table.name),
                     rule_id=self.rule_id,
                     classification=Classification.MANUAL,
                     risk=(
-                        f"Columns ({names}) take their value from a sequence (serial / "
-                        "GENERATED AS IDENTITY) but are NOT the primary key. Aurora DSQL has "
-                        "no source sequence to point at, and the primary-key strategy "
-                        "generates values only for the key column, so each lands on the "
-                        "target with neither identity nor default: an INSERT that omits it "
-                        "writes NULL instead of the next number."
+                        f"{len(not_null) + len(nullable)} column(s) take their value from a "
+                        "sequence but are NOT the primary key. Aurora DSQL has no source "
+                        "sequence to point at, and the primary-key strategy generates "
+                        "values only for the key column, so each lands on the target with "
+                        f"neither identity nor default: {'; '.join(clauses)}."
                     ),
                     recommendation=(
-                        "Supply the value from the application, or add an identity to the "
-                        "column on the target before cutting over. Already-loaded rows are "
-                        "unaffected -- Full Load copies the existing values."
+                        " ".join(remedies)
+                        + " Already-loaded rows are unaffected -- Full Load copies the "
+                        "existing values."
                     ),
                     effort=EffortLevel.MEDIUM,
                     note_kind=ConversionNoteKind.LOSS,

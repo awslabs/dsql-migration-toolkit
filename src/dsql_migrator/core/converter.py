@@ -3142,6 +3142,57 @@ def _pg_bytea_key_warning(table: TableDef) -> Optional[ConversionWarning]:
     )
 
 
+def _pg_unsupported_index_column_warning(
+    table: TableDef,
+) -> Optional[ConversionWarning]:
+    """Name the secondary indexes dropped because their column type is not a DSQL column.
+
+    The SKIP itself is deliberate and tested (:func:`_pg_unsupported_key_columns` --
+    emitting a doomed ``CREATE INDEX ASYNC`` would just fail at apply). What was missing is
+    any record of it: the operator reads "remodel inet to text", does exactly that, and has
+    no way to learn that two indexes went with it, so the post-migration workload silently
+    falls back to scans. The adjacent bytea skip in the same function IS reported by name
+    (:func:`_pg_bytea_key_warning`) -- this is the same disclosure for the PG type case.
+
+    Only SECONDARY indexes: an unsupported column in the PRIMARY KEY already produces the
+    per-column UNSUPPORTED type warning, which says the CREATE TABLE is rejected outright.
+    """
+    unsupported = _pg_unsupported_key_columns(table)
+    if not unsupported:
+        return None
+    skipped = [
+        (index.name, sorted(c for c in index.columns if c in unsupported))
+        for index in table.indexes
+        if any(c in unsupported for c in index.columns)
+        and (index.index_type or "").strip().lower() not in _UNSUPPORTED_INDEX_TYPES
+    ]
+    if not skipped:
+        return None
+    types = {
+        column.name: column.mysql_type
+        for column in table.columns
+        if column.name in unsupported
+    }
+    detail = "; ".join(
+        f"{name} (on "
+        + ", ".join(f"{c} {types.get(c, '?')}" for c in cols)
+        + ")"
+        for name, cols in skipped
+    )
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.LOSS,
+        message=(
+            f"{len(skipped)} secondary index(es) were NOT emitted because they are on "
+            "column(s) whose PostgreSQL type Aurora DSQL does not support as a column "
+            f"type: {detail}. Remodelling those columns to a DSQL-supported type is not "
+            "enough on its own -- re-create the index(es) on the remodelled column(s), or "
+            "queries relying on them fall back to a scan."
+        ),
+    )
+
+
 def _check_constraint_warning(
     table: TableDef, *, is_postgres: bool = False
 ) -> Optional[ConversionWarning]:
@@ -3739,6 +3790,11 @@ class SchemaConverter:
             # are surfaced per-column, as UNSUPPORTED, by the is_postgres type-check loop).
             (_bytea_key_warning(table) if not is_postgres else None),
             (_pg_bytea_key_warning(table) if is_postgres else None),
+            (
+                _pg_unsupported_index_column_warning(table)
+                if is_postgres
+                else None
+            ),
             _foreign_key_warning(table, preserve=options.preserve_foreign_keys),
             _check_constraint_warning(table, is_postgres=is_postgres),
             _identifier_length_warning(

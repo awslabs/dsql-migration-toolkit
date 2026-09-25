@@ -424,15 +424,23 @@ def _pg_collect_triggers(connection: object, nsp: str) -> list:
     the trigger itself carries no extension-membership row -- see
     :func:`_not_extension_owned`. A trigger an extension puts on a USER table is still
     reported, which is right: that one really does have no DSQL target.
+
+    The name carries its TABLE for exactly the reason the routine collector carries identity
+    arguments: a PostgreSQL trigger name is unique only per table (``pg_trigger`` is keyed on
+    ``(tgrelid, tgname)``), so ``tgname`` alone produced rows the report could not tell
+    apart -- and because the findings bucket is keyed by object name, each duplicate row also
+    repeated every sibling's concerns. A conventional name like ``set_updated_at`` on twelve
+    tables rendered as twelve identical rows, none of which said which table to reimplement
+    the logic for -- the one fact the operator needs.
     """
     rows = connection.execute(  # type: ignore[attr-defined]
         text(
-            "SELECT t.tgname AS name FROM pg_trigger t "
+            "SELECT c.relname || '.' || t.tgname AS name FROM pg_trigger t "
             "JOIN pg_class c ON c.oid = t.tgrelid "
             "JOIN pg_namespace n ON n.oid = c.relnamespace "
             "WHERE NOT t.tgisinternal AND n.nspname = :nsp "
             + _not_extension_owned("pg_class", "c.oid")
-            + "ORDER BY t.tgname"
+            + "ORDER BY c.relname, t.tgname"
         ),
         {"nsp": nsp},
     ).mappings()
