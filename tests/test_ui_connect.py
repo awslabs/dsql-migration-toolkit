@@ -792,3 +792,24 @@ def test_a_mismatched_target_endpoint_is_flagged_before_the_round_trip() -> None
     # Gated on an ACTUAL mismatch: warning on the granted endpoint itself would be noise.
     src = ast.unparse(tree)
     assert "_granted_endpoint and tgt_endpoint != _granted_endpoint" in src, src
+
+
+def test_a_target_retest_does_not_push_an_invalidation() -> None:
+    """Invalidation is by USE, deliberately -- pin it so nobody adds a second mechanism.
+
+    A Connect-side clear cannot cover every path: ``set_target`` runs BEFORE the test (so
+    a FAILED test still leaves the new endpoint configured), the per-keystroke
+    invalidation must not destroy a good catalog, and a restored snapshot re-creates the
+    mismatched pair with no Connect event at all. ``build_connect_page`` is also handed
+    only the SessionStore, so it cannot reach the evaluation store to clear anything.
+    """
+    import inspect
+
+    from dsql_migrator.ui import connect as connect_mod
+
+    src = inspect.getsource(connect_mod.build_connect_page)
+    for forbidden in ("eval_state", "eval_store", "EvaluationStore", "set_result"):
+        assert forbidden not in src, (
+            f"{forbidden} appeared in the Connect screen: staleness is handled at the "
+            "point of use, not pushed from here"
+        )

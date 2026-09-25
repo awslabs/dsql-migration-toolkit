@@ -186,6 +186,7 @@ def capture_session_snapshot(
         snapshot.inventory = result.inventory
         snapshot.assessment = result.assessment
         snapshot.target_inventory = result.target_inventory
+        snapshot.target_inventory_endpoint = result.target_endpoint
         snapshot.target_conflicts = list(result.target_conflicts)
     # Step 4 (Validation): persist the last completed report so a reconnect reopens
     # the result page (credential-free; mirrors the Evaluation result restore).
@@ -418,6 +419,7 @@ def apply_session_snapshot(
                 target_inventory=snapshot.target_inventory,
                 target_conflicts=list(snapshot.target_conflicts),
                 source_type=restored_source_type,
+                target_endpoint=snapshot.target_inventory_endpoint,
             )
         )
 
@@ -694,6 +696,10 @@ def session_signature(
             len(result.inventory.tables),
             len(result.inventory.views),
             sum(len(s.tables) for s in result.target_inventory.schemas),
+            # Part of the dirty-check: a target refresh that only re-stamps the
+            # provenance (same catalog, different cluster read) must still persist, or
+            # the restored session keeps reporting the pair as stale.
+            result.target_endpoint,
         )
     generated = conv_state.generated_node_ids  # type: ignore[attr-defined]
     generated_sig = tuple(generated) if generated is not None else None

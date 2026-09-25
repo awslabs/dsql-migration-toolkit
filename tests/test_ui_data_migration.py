@@ -27041,3 +27041,105 @@ def test_the_dlq_card_badge_says_at_least_when_the_read_was_bounded() -> None:
     src = inspect.getsource(mon._render_cdc_dlq_panel)
     assert 'f"at least {health.depth} quarantined"' in src
     assert "This count is a minimum, not a total" in src
+
+
+# ---------------------------------------------------------------------------
+# A target catalog from a DIFFERENT cluster must not widen the load's scope
+# ---------------------------------------------------------------------------
+
+
+def test_a_stale_target_catalog_cannot_produce_a_false_go(monkeypatch) -> None:
+    """THE decision test: the go/no-go was judged on cluster A, the load runs on B.
+
+    ``_target_inventory()`` feeds ``migratable_table_names``, which feeds the Full Load
+    run guard, the prerequisite-pinned selection, CDC's capture list and the Validation
+    scope. With cluster A's catalog cached and cluster B connected, a table present on A
+    and absent from B was offered and ticked, so the load started and INSERTed into a
+    relation that was never created (it is not in ``replace_tables``, so nothing creates
+    it). Failing CLOSED -- offering only this session's generated DDL -- is the honest
+    answer until the operator refreshes.
+    """
+    from dsql_migrator.core.models import (
+        AssessmentReport,
+        SourceInventory,
+        TableDef,
+        TargetInventory,
+        TargetObjectKind,
+        TargetRelation,
+        TargetSchemaNode,
+    )
+    from dsql_migrator.ui.data_migration import migratable_table_names
+    from dsql_migrator.ui.evaluation import EvaluationResult, target_inventory_is_stale
+
+    inventory = SourceInventory(
+        tables=[TableDef(name="shop.orders", columns=[])], views=[]
+    )
+    cluster_a = TargetInventory(
+        schemas=[
+            TargetSchemaNode(
+                name="shop",
+                tables=[
+                    TargetRelation(
+                        schema_name="shop", name="orders", kind=TargetObjectKind.TABLE
+                    )
+                ],
+            )
+        ]
+    )
+    result = EvaluationResult(
+        inventory=inventory,
+        assessment=AssessmentReport(items=[]),
+        target_inventory=cluster_a,
+        target_conflicts=[],
+        target_endpoint="a.dsql.us-east-1.on.aws",
+    )
+
+    class _Cfg:
+        cluster_endpoint = "b.dsql.us-east-1.on.aws"
+
+    assert target_inventory_is_stale(result, _Cfg())
+    # Trusted (same cluster): the table already on the target IS migratable.
+    assert migratable_table_names(inventory, None, cluster_a) == ["shop.orders"]
+    # Stale: the honest answer is "nothing this session generated", i.e. fail closed.
+    assert migratable_table_names(inventory, None, None) == []
+
+
+def test_the_data_migration_target_inventory_fails_closed_when_stale() -> None:
+    """Wiring: the helper is dead code unless _target_inventory() consults it."""
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    src = inspect.getsource(dm.build_data_migration_screen)
+    tree = ast.parse(src)
+    targets = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_target_inventory"
+    ]
+    assert targets, "_target_inventory not found"
+    calls = [
+        n
+        for n in ast.walk(targets[0])
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "target_inventory_is_stale"
+    ]
+    assert calls, (
+        "_target_inventory must fail closed on a stale catalog, or a load can be "
+        "authorised against tables that do not exist on the connected cluster"
+    )
+
+
+def test_refresh_objects_restamps_so_the_refresh_actually_clears_staleness() -> None:
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    src = inspect.getsource(dm.build_data_migration_screen)
+    assert "target_endpoint=getattr(" in src, (
+        'without a re-stamp the "Refresh objects" button reads the right cluster but '
+        "leaves the pair flagged stale forever"
+    )

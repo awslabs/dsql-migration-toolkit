@@ -1655,3 +1655,73 @@ def test_the_dlq_read_cursor_round_trips_so_a_restart_keeps_its_coverage() -> No
         SchemaConversionState(), fresh,
     )
     assert fresh.cdc_dlq_cursor_ms == {}
+
+
+def test_the_target_catalog_provenance_round_trips() -> None:
+    """The one path a Connect-side invalidation could never cover.
+
+    A restored snapshot re-creates the pair -- a catalog from cluster A alongside a
+    configured endpoint B -- with no Connect event at all, so the stamp has to be durable
+    or the mismatch comes back invisible after every restart.
+    """
+    from dsql_migrator.core.session_state_store import SessionSnapshot
+    from dsql_migrator.ui.evaluation import target_inventory_is_stale
+
+    session, eval_state, conv_state, migration_state = _populated_states()
+    original = eval_state.result
+    assert original is not None
+    eval_state.set_result(
+        original.__class__(
+            inventory=original.inventory,
+            assessment=original.assessment,
+            target_inventory=original.target_inventory,
+            target_conflicts=list(original.target_conflicts),
+            source_type=original.source_type,
+            target_endpoint="a.dsql.us-east-1.on.aws",
+        )
+    )
+    snapshot = capture_session_snapshot(
+        "s1", session, eval_state, conv_state, migration_state
+    )
+    assert snapshot.target_inventory_endpoint == "a.dsql.us-east-1.on.aws"
+
+    restored_eval = EvaluationState()
+    apply_session_snapshot(
+        snapshot, SessionConnectionState(), restored_eval,
+        SchemaConversionState(), DataMigrationState(),
+    )
+    assert restored_eval.result is not None
+    assert restored_eval.result.target_endpoint == "a.dsql.us-east-1.on.aws"
+
+    class _Cfg:
+        cluster_endpoint = "b.dsql.us-east-1.on.aws"
+
+    # The durable mismatch is detected after the restore, with no Connect event.
+    assert target_inventory_is_stale(restored_eval.result, _Cfg())
+
+    # An older snapshot has no stamp and restores as trusted (unknown provenance).
+    old = SessionSnapshot(session_id="s1")
+    assert old.target_inventory_endpoint is None
+
+
+def test_the_provenance_stamp_is_part_of_the_dirty_check() -> None:
+    """A refresh that only re-stamps must still persist, or the restore stays stale."""
+    session, eval_state, conv_state, migration_state = _populated_states()
+    original = eval_state.result
+    assert original is not None
+
+    def _sig():
+        return session_signature(session, eval_state, conv_state, migration_state)
+
+    before = _sig()
+    eval_state.set_result(
+        original.__class__(
+            inventory=original.inventory,
+            assessment=original.assessment,
+            target_inventory=original.target_inventory,
+            target_conflicts=list(original.target_conflicts),
+            source_type=original.source_type,
+            target_endpoint="b.dsql.us-east-1.on.aws",
+        )
+    )
+    assert _sig() != before, "a re-stamp alone must move the signature"

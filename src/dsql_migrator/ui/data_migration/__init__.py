@@ -120,7 +120,7 @@ from dsql_migrator.ui.design import (
     notice_container,
     render_notice,
 )
-from dsql_migrator.ui.evaluation import EvaluationStore
+from dsql_migrator.ui.evaluation import EvaluationStore, target_inventory_is_stale
 from dsql_migrator.ui.prerequisite_probes import build_prerequisite_checker
 from dsql_migrator.ui.schema_conversion import (
     TABLE_PREFIX,
@@ -397,8 +397,23 @@ def build_data_migration_screen(
         # The target DSQL catalog from Step 1 (Evaluation). Used to treat tables
         # that already exist on the target as migratable, so Data Migration can
         # proceed when Schema Conversion was applied in a prior session.
+        #
+        # FAIL CLOSED when it was read from a DIFFERENT cluster than the one now
+        # connected. This is not a display concern here: the value flows into
+        # ``migratable_table_names`` and from there into the Full Load run guard, the
+        # prerequisite-pinned selection, CDC's capture list and the Validation scope. A
+        # catalog from cluster A therefore produced a GO for tables that do not exist on
+        # cluster B -- the load then INSERTs into relations that were never created
+        # (they are not in ``replace_tables``, so nothing creates them) -- or silently
+        # NARROWED the selection to A's subset. Returning None means only tables whose
+        # DDL was generated in this session are offered, which is the honest answer
+        # until the operator refreshes.
         result = eval_state.result
-        return result.target_inventory if result is not None else None
+        if result is None or target_inventory_is_stale(
+            result, getattr(session, "target_config", None)
+        ):
+            return None
+        return result.target_inventory
 
     def _assessment():
         """The Step 1 (Evaluation) compatibility report, or None if it hasn't run."""
@@ -1055,6 +1070,11 @@ def build_data_migration_screen(
                         target_conflicts=_find_target_conflicts(
                             new_inventory, new_target
                         ),
+                        # Re-stamp with the cluster this catalog was just read from, or
+                        # the pair stays flagged stale and the refresh fixes nothing.
+                        target_endpoint=getattr(
+                            session.target_config, "cluster_endpoint", None
+                        ),
                     )
                 )
                 ui.notify("Object browser refreshed.", type="positive")
@@ -1099,6 +1119,29 @@ def build_data_migration_screen(
             with ui.column().classes(
                 "w-full gap-2 p-3 rounded-lg border border-gray-200 bg-gray-50"
             ):
+                # The target catalog is what makes an already-created table count as
+                # migratable, so when it belongs to a DIFFERENT cluster the picker is
+                # deliberately narrowed to this session's generated DDL (see
+                # _target_inventory). Say so: silently offering fewer tables than the
+                # connected cluster can actually take is its own confusion.
+                _eval_result = eval_state.result
+                if target_inventory_is_stale(
+                    _eval_result, getattr(session, "target_config", None)
+                ):
+                    render_notice(
+                        ui,
+                        tone="warning",
+                        header="Target catalog is from a different cluster",
+                        body=(
+                            "It was read from "
+                            f"{_eval_result.target_endpoint}; the connected target is "
+                            f"now {session.target_config.cluster_endpoint}. Tables "
+                            "already present on the connected cluster cannot be "
+                            "detected until you refresh, so only tables whose DDL was "
+                            'generated in this session are offered. Use "Refresh '
+                            'objects" to re-read the target.'
+                        ),
+                    )
                 _render_table_selection(
                     ui,
                     inventory,

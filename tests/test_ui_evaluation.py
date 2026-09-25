@@ -1819,3 +1819,161 @@ def test_postgres_reports_sibling_databases_and_mysql_reports_none() -> None:
             raise RuntimeError("permission denied for table pg_database")
 
     assert dialect_for(SourceType.POSTGRES).sibling_databases(_Broken()) == []
+
+
+# ---------------------------------------------------------------------------
+# A target catalog read from a DIFFERENT cluster must not be trusted
+# ---------------------------------------------------------------------------
+
+
+class _NoticeUi:
+    """Fake NiceGUI covering what render_notice touches (icon / column / spinner)."""
+
+    def __init__(self) -> None:
+        self.text: list[str] = []
+
+    def label(self, value=""):
+        self.text.append(str(value))
+        return self
+
+    def badge(self, value=""):
+        self.text.append(str(value))
+        return self
+
+    def icon(self, *_a, **_k):
+        return self
+
+    def spinner(self, *_a, **_k):
+        return self
+
+    def button(self, value="", **_k):
+        self.text.append(str(value))
+        return self
+
+    def classes(self, *_a, **_k):
+        return self
+
+    def props(self, *_a, **_k):
+        return self
+
+    def tooltip(self, *_a, **_k):
+        return self
+
+    def row(self, *_a, **_k):
+        return self
+
+    def column(self, *_a, **_k):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+
+class _Endpoint:
+    def __init__(self, cluster_endpoint) -> None:
+        self.cluster_endpoint = cluster_endpoint
+
+
+def _result_stamped(endpoint, *, target=None, conflicts=None) -> EvaluationResult:
+    from dsql_migrator.core.models import AssessmentReport, SourceInventory
+
+    return EvaluationResult(
+        inventory=SourceInventory(tables=[], views=[]),
+        assessment=AssessmentReport(items=[]),
+        target_inventory=target if target is not None else _empty_target(),
+        target_conflicts=list(conflicts or []),
+        target_endpoint=endpoint,
+    )
+
+
+def test_stale_when_the_stamped_cluster_is_not_the_connected_one() -> None:
+    from dsql_migrator.ui.evaluation import target_inventory_is_stale
+
+    result = _result_stamped("a.dsql.us-east-1.on.aws")
+    assert target_inventory_is_stale(result, _Endpoint("b.dsql.us-east-1.on.aws"))
+    assert not target_inventory_is_stale(result, _Endpoint("a.dsql.us-east-1.on.aws"))
+    # Normalised the same way the Connect screen normalises what is typed -- on BOTH
+    # sides. A one-sided normalisation passes whenever the fixture happens to be
+    # lowercase already, so the stamp here is deliberately mixed-case and padded.
+    mixed = _result_stamped("  A.Dsql.US-East-1.On.AWS  ")
+    assert not target_inventory_is_stale(mixed, _Endpoint("a.dsql.us-east-1.on.aws"))
+    assert not target_inventory_is_stale(
+        mixed, _Endpoint("  A.DSQL.US-EAST-1.ON.AWS  ")
+    )
+    assert not target_inventory_is_stale(
+        result, _Endpoint("  A.DSQL.US-EAST-1.ON.AWS  ")
+    )
+    assert target_inventory_is_stale(mixed, _Endpoint("b.dsql.us-east-1.on.aws"))
+
+
+def test_an_unanswerable_question_is_never_reported_as_stale() -> None:
+    """Never invalidate a catalog we merely failed to identify."""
+    from dsql_migrator.ui.evaluation import target_inventory_is_stale
+
+    assert not target_inventory_is_stale(None, _Endpoint("b.dsql.us-east-1.on.aws"))
+    # No stamp = unknown provenance (a pre-0.1.524 snapshot or a test fixture).
+    assert not target_inventory_is_stale(
+        _result_stamped(None), _Endpoint("b.dsql.us-east-1.on.aws")
+    )
+    assert not target_inventory_is_stale(_result_stamped("a.dsql..."), None)
+    assert not target_inventory_is_stale(_result_stamped("a.dsql..."), _Endpoint(""))
+
+
+def test_an_evaluation_run_stamps_the_cluster_it_browsed() -> None:
+    """Everything downstream keys off this stamp, so an unstamped run disables it all."""
+    src_factory, _ = _source_factory(_inventory_with_fk())
+    tgt_factory, _ = _target_factory(_target_with_tables("orders"))
+    inputs = _inputs()
+
+    result = run_evaluation(
+        inputs,
+        introspector_factory=src_factory,
+        target_browser_factory=tgt_factory,
+    )
+    assert result.target_endpoint == inputs.target_config.cluster_endpoint
+    assert result.target_endpoint, "must not be blank"
+    # ...and the freshly-stamped result is not reported stale against that same target.
+    from dsql_migrator.ui.evaluation import target_inventory_is_stale
+
+    assert not target_inventory_is_stale(result, inputs.target_config)
+
+
+def test_a_stale_target_suppresses_the_false_all_clear() -> None:
+    """The worst display symptom: a green "No conflicts" about a cluster never read.
+
+    Conflicts are computed against the ASSESSED cluster, so an empty list from cluster A
+    rendered "No source objects conflict with existing target objects" even when the
+    connected cluster B already held those very tables.
+    """
+    from dsql_migrator.ui.evaluation import _render_target
+
+    ui = _NoticeUi()
+    _render_target(
+        ui,
+        _result_stamped("a.dsql.us-east-1.on.aws", conflicts=[]),
+        live_endpoint="b.dsql.us-east-1.on.aws",
+    )
+    joined = " ".join(ui.text)
+    assert "No conflicts on the target" not in joined, joined
+    assert "out of date" in joined, joined
+    # Both endpoints named, so the operator knows which cluster they are looking at.
+    assert "a.dsql.us-east-1.on.aws" in joined and "b.dsql.us-east-1.on.aws" in joined
+    # The counts would describe the wrong cluster, so they are suppressed too.
+    assert "Target catalog:" not in joined, joined
+
+
+def test_a_current_target_still_renders_the_normal_subsection() -> None:
+    from dsql_migrator.ui.evaluation import _render_target
+
+    ui = _NoticeUi()
+    _render_target(
+        ui,
+        _result_stamped("a.dsql.us-east-1.on.aws", conflicts=[]),
+        live_endpoint="a.dsql.us-east-1.on.aws",
+    )
+    joined = " ".join(ui.text)
+    assert "Target catalog:" in joined
+    assert "out of date" not in joined

@@ -4810,3 +4810,79 @@ def test_the_composite_key_picker_states_the_immutability_requirement_and_its_co
     assert "tenant" in body or "customer id" in body
     # The surviving composite guidance is unchanged (queries must use the new key).
     assert "composite key" in body
+
+
+# ---------------------------------------------------------------------------
+# A target catalog from a DIFFERENT cluster is not browsed as if it were this one
+# ---------------------------------------------------------------------------
+
+
+def test_a_stale_target_catalog_is_not_browsed_and_says_why() -> None:
+    """Nothing on this screen names the cluster it shows, so the operator had no cue.
+
+    And the generic "Run Step 1 (Evaluation)" empty state would be the wrong advice --
+    a target refresh is enough -- so the stale case gets its own notice naming BOTH
+    endpoints plus a labelled refresh button (the header affordance is an icon only).
+    """
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion as sc
+
+    src = inspect.getsource(sc._render_browser_and_preview)
+    assert "stale_target" in src, "the renderer is not told about staleness"
+    assert "Target catalog is from a different cluster" in src
+    assert "Refresh target catalog" in src
+    # Must NOT fall through to the generic empty state, which advises re-running Step 1.
+    stale_branch = src[src.index("elif stale_target is not None:") :]
+    generic = stale_branch.find("No target objects to browse yet")
+    notice = stale_branch.find("Target catalog is from a different cluster")
+    assert notice < generic or generic == -1, "stale must be handled before the empty state"
+
+
+def test_the_content_closure_computes_staleness_and_withholds_the_inventory() -> None:
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion as sc
+
+    src = inspect.getsource(sc.build_schema_conversion_screen)
+    tree = ast.parse(src)
+    assert any(
+        isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "target_inventory_is_stale"
+        for n in ast.walk(tree)
+    ), "the screen must consult target_inventory_is_stale"
+    flat = ast.unparse(tree)
+    # The inventory is withheld, not merely annotated.
+    assert "_stale_target is None" in flat, flat[:0] or "inventory not gated on staleness"
+
+
+def test_the_derived_existence_checker_is_dropped_not_just_left_behind() -> None:
+    """The old branch only ever REPLACED the checker.
+
+    So with no usable inventory the nonlocal kept answering "exists on target" from the
+    previous cluster -- wrong labels, and a Replace/Skip prompt for objects that are not
+    on the connected cluster at all.
+    """
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion as sc
+
+    src = inspect.getsource(sc.build_schema_conversion_screen)
+    assert "elif not existence_checker_injected and target_inventory is None:" in src
+    reset = src[src.index("elif not existence_checker_injected and target_inventory is None:") :]
+    assert "existence_checker = None" in reset[:900], reset[:900]
+    assert '_derived_checker_state["snapshot"] = None' in reset[:900]
+
+
+def test_refresh_target_restamps_the_provenance() -> None:
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion as sc
+
+    src = inspect.getsource(sc.build_schema_conversion_screen)
+    assert "target_endpoint=target_conn.cluster_endpoint" in src, (
+        "without a re-stamp the refresh reads the right cluster but the pair stays "
+        "flagged stale forever"
+    )

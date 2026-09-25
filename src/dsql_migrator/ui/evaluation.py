@@ -204,6 +204,59 @@ class EvaluationResult:
     # ("PostgreSQL to Aurora DSQL..." vs "MySQL to..."). Defaults to MySQL for older
     # callers/tests that build a result without it.
     source_type: SourceType = SourceType.MYSQL
+    # The DSQL endpoint ``target_inventory`` / ``target_conflicts`` were read FROM.
+    #
+    # Without it the target half of this result is indistinguishable from a target half
+    # read somewhere else, and the operator can change the target cluster at any time
+    # from the Connect screen: the browsed catalog then describes cluster A while every
+    # consumer acts on cluster B. That is not only a wrong tree -- Data Migration derives
+    # the set of migratable tables (and from it the CDC capture list and the Validation
+    # scope) from this inventory, so a stale value produces a GO for tables that do not
+    # exist on the connected cluster.
+    #
+    # The stamp is compared at the point of USE (:func:`target_inventory_is_stale`), not
+    # cleared on a target change: ``set_target`` runs BEFORE the connection test, the
+    # per-keystroke invalidation must not destroy a good catalog, and a restored session
+    # snapshot re-creates the mismatched pair with no Connect event at all -- so an
+    # invariant checked where the value is read is the only form that covers every path.
+    # ``None`` means unknown provenance (a pre-0.1.524 snapshot, or a test fixture) and is
+    # trusted, so older sessions keep working exactly as before.
+    target_endpoint: Optional[str] = None
+
+
+class _EndpointOnly:
+    """Minimal stand-in carrying just ``cluster_endpoint``.
+
+    Lets the render reuse the one staleness predicate instead of re-implementing the
+    comparison (which is where a second, subtly different rule would drift in).
+    """
+
+    __slots__ = ("cluster_endpoint",)
+
+    def __init__(self, cluster_endpoint: "Optional[str]") -> None:
+        self.cluster_endpoint = cluster_endpoint
+
+
+def target_inventory_is_stale(
+    result: "Optional[EvaluationResult]",
+    target_config: "Optional[TargetConnectionConfig]",
+) -> bool:
+    """Whether ``result``'s target half was read from a DIFFERENT cluster. Pure.
+
+    ``False`` whenever the question cannot be answered -- no result, no stamp (unknown
+    provenance), or no configured target -- so this never invalidates a catalog it merely
+    failed to identify. Endpoint comparison is case-insensitive and whitespace-trimmed,
+    matching how the Connect screen normalises what the operator types.
+    """
+    if result is None or target_config is None:
+        return False
+    stamped = (getattr(result, "target_endpoint", None) or "").strip().lower()
+    if not stamped:
+        return False
+    live = (getattr(target_config, "cluster_endpoint", None) or "").strip().lower()
+    if not live:
+        return False
+    return stamped != live
 
 
 def _find_target_conflicts(
@@ -739,6 +792,7 @@ def run_evaluation(
         target_inventory=target_inventory,
         target_conflicts=target_conflicts,
         source_type=inputs.source_config.source_type,
+        target_endpoint=inputs.target_config.cluster_endpoint,
     )
 
 
@@ -1281,6 +1335,13 @@ def build_evaluation_screen(
                     refresh=refresh,
                     guidance_provider=guidance_provider,
                     open_ai_scope=open_ai_scope,
+                    # So the target subsection can tell the operator when the assessed
+                    # cluster is no longer the connected one.
+                    live_target_endpoint=getattr(
+                        getattr(session, "target_config", None),
+                        "cluster_endpoint",
+                        None,
+                    ),
                 )
 
     return content, runner
@@ -1362,6 +1423,7 @@ def _render_result(
         ]
     ] = None,
     open_ai_scope: Optional[Callable[..., object]] = None,
+    live_target_endpoint: Optional[str] = None,
 ) -> None:
     """Render the result as distinct, readable sections (one card per group).
 
@@ -1423,7 +1485,7 @@ def _render_result(
         # report includes target name-conflict detection), so the target analysis
         # is a subsection of this card rather than a separate top-level card.
         ui.separator().classes("my-2")  # type: ignore[attr-defined]
-        _render_target(ui, result)
+        _render_target(ui, result, live_endpoint=live_target_endpoint)
 
 
 def _render_score_card(ui: object, report: AssessmentReport) -> None:
@@ -2083,8 +2145,36 @@ def _render_item_ai_action(
         )
 
 
-def _render_target(ui: object, result: EvaluationResult) -> None:
-    """Render the target catalog summary and any pre-existing-object conflicts."""
+def _render_target(
+    ui: object,
+    result: EvaluationResult,
+    *,
+    live_endpoint: "Optional[str]" = None,
+) -> None:
+    """Render the target catalog summary and any pre-existing-object conflicts.
+
+    ``live_endpoint`` is the CURRENTLY connected DSQL endpoint. When the assessed target
+    was a different cluster, the whole subsection is replaced by one notice: the counts
+    would describe the wrong cluster, and -- worse -- the "No conflicts on the target"
+    success notice below is a FALSE ALL-CLEAR, telling the operator the target is clean
+    when the connected cluster may already hold the very tables about to be created.
+    """
+    if target_inventory_is_stale(
+        result, _EndpointOnly(live_endpoint) if live_endpoint else None
+    ):
+        ui.label("Target analysis (Aurora DSQL)").classes("text-lg font-semibold")  # type: ignore[attr-defined]
+        render_notice(
+            ui,
+            tone="warning",
+            header="Target analysis is out of date",
+            body=(
+                f"The target was assessed on {result.target_endpoint}; the connected "
+                f"target is now {live_endpoint}. Re-run Evaluation to assess the "
+                "current target — the catalog counts and conflict list below would "
+                "describe the other cluster."
+            ),
+        )
+        return
     target = result.target_inventory
     table_count = sum(len(schema.tables) for schema in target.schemas)
     view_count = sum(len(schema.views) for schema in target.schemas)

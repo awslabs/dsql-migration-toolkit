@@ -56,6 +56,13 @@ class SessionSnapshot(BaseModel):
     inventory: Optional[SourceInventory] = None
     assessment: Optional[AssessmentReport] = None
     target_inventory: Optional[TargetInventory] = None
+    # WHICH DSQL cluster ``target_inventory`` / ``target_conflicts`` were read from.
+    # Without it a restored session re-creates the mismatched pair (a catalog from
+    # cluster A alongside a configured endpoint B) with no Connect event to notice it --
+    # the one path a Connect-side invalidation could never have covered. Additive and
+    # defaulted, so snapshots written before 0.1.524 restore unchanged (``None`` = unknown
+    # provenance, which is trusted).
+    target_inventory_endpoint: Optional[str] = None
     target_conflicts: list[str] = Field(default_factory=list)
     # Step 2 (Schema Conversion): object-leaf node ids whose DDL was generated.
     generated_node_ids: Optional[list[str]] = None

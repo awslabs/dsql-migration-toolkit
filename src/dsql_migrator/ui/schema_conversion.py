@@ -107,7 +107,11 @@ from dsql_migrator.ui.design import (
     radio_tiles,
     render_notice,
 )
-from dsql_migrator.ui.evaluation import EvaluationStore, classification_label
+from dsql_migrator.ui.evaluation import (
+    EvaluationStore,
+    classification_label,
+    target_inventory_is_stale,
+)
 from dsql_migrator.ui.session import SessionStore
 from dsql_migrator.ui.workflow import (
     WorkflowStep,
@@ -2285,8 +2289,23 @@ def build_schema_conversion_screen(
                 return conversion_cache["result"]
 
             eval_result = eval_state.result
+            # A catalog read from a DIFFERENT cluster must not be browsed as if it were
+            # this one: nothing on this screen names the cluster it is showing, so the
+            # operator had no cue at all. Kept as a pair so the notice can name both
+            # endpoints -- silently emptying the panel would send them to the existing
+            # "Run Step 1 (Evaluation)" empty state, which is the wrong advice (a target
+            # refresh is enough).
+            _stale_target = (
+                (eval_result.target_endpoint, session.target_config.cluster_endpoint)
+                if target_inventory_is_stale(
+                    eval_result, getattr(session, "target_config", None)
+                )
+                else None
+            )
             target_inventory = (
-                eval_result.target_inventory if eval_result is not None else None
+                eval_result.target_inventory
+                if eval_result is not None and _stale_target is None
+                else None
             )
             # Resolve the existence checker: prefer the explicitly injected one
             # (tests), otherwise build one from the target inventory (which is
@@ -2305,6 +2324,14 @@ def build_schema_conversion_screen(
             ):
                 existence_checker = _InventoryExistenceChecker(target_inventory)
                 _derived_checker_state["snapshot"] = target_inventory
+            elif not existence_checker_injected and target_inventory is None:
+                # Explicitly DROP the derived checker. The branch above only ever
+                # replaced it, so a stale/absent inventory left the nonlocal serving the
+                # previous cluster's existence verdicts -- "exists on target" labels and
+                # a Replace/Skip prompt for objects that are not on the connected
+                # cluster at all.
+                existence_checker = None
+                _derived_checker_state["snapshot"] = None
             # AI assistance is integrated per generated object (not a separate
             # section): for each object the deterministic conversion and the AI
             # suggestion are compared and shown as one view when identical, or as
@@ -2400,6 +2427,10 @@ def build_schema_conversion_screen(
                             target_conflicts=_find_target_conflicts(
                                 old_result.inventory, new_target
                             ),
+                            # Re-stamp: this catalog was just read from the CURRENT
+                            # cluster, so without it the pair would stay flagged stale
+                            # forever and the refresh would fix nothing.
+                            target_endpoint=target_conn.cluster_endpoint,
                         )
                     )
                 # The target catalog just changed, so drop the cached applier (its browsed
@@ -2577,6 +2608,7 @@ def build_schema_conversion_screen(
                     # (on_generate lives in this helper, not the builder scope).
                     ai_post_event=ai_post_event,
                     source_type=_source_type(),
+                    stale_target=_stale_target,
                 )
 
             def apply_all() -> None:
@@ -2889,6 +2921,10 @@ def _render_browser_and_preview(
     apply_in_progress: bool = False,
     ai_post_event: Optional[Callable[..., object]] = None,
     source_type: SourceType = SourceType.MYSQL,
+    # ``(assessed_endpoint, connected_endpoint)`` when the browsed target catalog belongs
+    # to a DIFFERENT DSQL cluster than the one now connected, else None. Passed in rather
+    # than derived here so this renderer stays free of session/eval-store coupling.
+    stale_target: Optional[tuple] = None,
 ) -> None:
     """Render side-by-side source/target browsers and the selected DDL diff.
 
@@ -3110,6 +3146,28 @@ def _render_browser_and_preview(
                         tgt_tree.expand(  # type: ignore[attr-defined]
                             list(conv_state.target_expanded_node_ids)
                         )
+                elif stale_target is not None:
+                    # NOT the generic empty state: "Run Step 1 (Evaluation)" is the wrong
+                    # advice here (a target refresh is enough) and it hides the real
+                    # reason. Naming both endpoints is the whole point -- nothing else on
+                    # this screen says which cluster the panel is showing.
+                    _old_ep, _new_ep = stale_target
+                    render_notice(
+                        ui,
+                        tone="warning",
+                        header="Target catalog is from a different cluster",
+                        body=(
+                            f"This catalog was read from {_old_ep}. The connected target "
+                            f"is now {_new_ep}, so it is not shown. Refresh the target "
+                            "catalog to browse the connected cluster."
+                        ),
+                    )
+                    if on_refresh_target is not None:
+                        ui.button(  # type: ignore[attr-defined]
+                            "Refresh target catalog",
+                            icon="refresh",
+                            on_click=on_refresh_target,
+                        ).props("outline dense")
                 else:
                     ui.label(  # type: ignore[attr-defined]
                         "No target objects to browse yet. Run Step 1 "

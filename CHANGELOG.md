@@ -5,6 +5,16 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.524
+
+### Fixed
+
+- **Changing the target DSQL cluster left every screen showing — and deciding from — the OLD cluster's catalog.** The target catalog is browsed once by Evaluation and stored on its result; the Connect screen's target invalidation only re-locks the Next button, so after switching clusters the Schema Conversion object browser still rendered cluster A's schemas, with nothing on the screen naming which cluster it was showing. Two consequences went beyond display. **Data Migration decides the load's scope from that catalog** (a table already on the target counts as migratable, which also sets CDC's capture list and the Validation scope), so cluster A's catalog produced a **GO for tables that do not exist on the connected cluster** — the load then INSERTs into relations nothing created — or silently NARROWED the selection to A's subset. And Evaluation's **"No conflicts on the target" green all-clear** was a false all-clear: conflicts were computed against A, so the connected cluster could already hold the very tables about to be created. The evaluation result now records the endpoint its target catalog was read FROM, and every consumer checks that stamp **at the point of use** — Connect cannot do it (`set_target` runs before the connection test, the per-keystroke invalidation must not destroy a good catalog, and a restored session snapshot re-creates the mismatched pair with no Connect event at all), so the invariant lives where the value is read. Data Migration **fails closed**, offering only tables whose DDL was generated in this session; Schema Conversion withholds the catalog, **drops the derived existence checker** (it previously kept answering "exists on target" from the old cluster) and shows a notice naming both endpoints plus a labelled refresh button; Evaluation replaces the target subsection with an out-of-date notice instead of the counts and the false all-clear; and both "Refresh" actions re-stamp, so a refresh actually clears the state. The stamp is persisted, so a restored session detects the mismatch too. A result with no stamp (written before this release) is trusted, so older sessions behave exactly as before.
+
+### Known issue
+
+- **Switching the target cluster does not reset the step-completion state or a prior Validation verdict.** A schema applied to cluster A leaves Schema Conversion `DONE` and its prerequisite report all-PASS, so "Start migration" stays enabled against an empty cluster B (the Full Load confirmation still probes the live target and warns that the tables are absent). More seriously, a `ValidationReport` earned on cluster A still releases the cut-over runbook — `ValidationReport` carries no target identity, so the staleness is currently undetectable. Re-run Validation after changing the target cluster until this is fixed.
+
 ## v0.1.523
 
 ### Fixed
