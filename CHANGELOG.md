@@ -5,6 +5,12 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.525
+
+### Fixed
+
+- **An unsupported-type finding named a column's TYPE in a form that reads as another TABLE, and threw away the guidance it had already computed.** For a PostgreSQL source, `orders`' finding said *"Column(s) status (ecommerce.order_status) use PostgreSQL types Aurora DSQL does not support…"*. A user-defined enum's type name is schema-qualified, and this tool writes `schema.table` everywhere else — so an operator read `ecommerce.order_status` as a reference to a different TABLE and asked why it appeared in `orders`' finding. It now names the kind: *"1 column(s) … : column "status" of type ecommerce.order_status"*. The recommendation was worse: the rule calls `unsupported_dsql_reason` for each column — which returns the faithful remodel target for THAT type — and discarded it in favour of a generic list of eight mappings the operator had to match against their own columns, while Schema Conversion (the same function, the same column) stated it precisely. The per-column reason is now carried through verbatim, so the two steps cannot drift; a wide table spells out the first six and then names the remaining columns with a count, because one finding is rendered into a UI card, a text report and an HTML report and must stay bounded. No test pinned any of this wording before.
+
 ## v0.1.524
 
 ### Fixed

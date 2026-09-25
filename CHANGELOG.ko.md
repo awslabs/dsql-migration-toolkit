@@ -5,6 +5,12 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.525
+
+### 수정
+
+- **지원되지 않는 타입 finding이 컬럼의 타입을 다른 테이블처럼 읽히는 형태로 적고, 이미 계산해 둔 안내를 버렸습니다.** PostgreSQL 소스에서 `orders`의 finding이 *"Column(s) status (ecommerce.order_status) use PostgreSQL types Aurora DSQL does not support…"* 라고 표시했습니다. 사용자 정의 enum의 타입명은 스키마로 수식되고 이 도구는 다른 모든 곳에서 `schema.table` 형태를 쓰므로, 운영자가 `ecommerce.order_status` 를 **다른 테이블** 참조로 읽고 왜 `orders`의 finding에 나오는지 물었습니다. 이제 종류를 명시합니다: *"1 column(s) … : column "status" of type ecommerce.order_status"*. 권고문이 더 문제였습니다: 규칙은 컬럼마다 `unsupported_dsql_reason` 을 호출해 **그 타입에 맞는 정확한 리모델 대상**을 받아 놓고 버린 뒤, 운영자가 자기 컬럼에 직접 대조해야 하는 8개 매핑 목록으로 대체했습니다 — 반면 Schema Conversion은 같은 함수·같은 컬럼에 대해 정확히 알려 줬습니다. 이제 컬럼별 이유를 그대로 전달하므로 두 단계가 어긋날 수 없습니다. 컬럼이 많은 테이블은 앞의 6개를 상세히 쓰고 나머지는 개수와 이름으로 요약합니다 — 하나의 finding이 UI 카드·텍스트 리포트·HTML 리포트 세 곳에 렌더되므로 길이가 묶여 있어야 합니다. 이 문구를 고정하는 테스트는 이전에 하나도 없었습니다.
+
 ## v0.1.524
 
 ### 수정

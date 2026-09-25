@@ -744,3 +744,96 @@ def test_non_key_sequence_rule_matches_what_schema_conversion_warns() -> None:
             name="t", columns=[ColumnDef(name="id", mysql_type="bigint", identity=True)],
             primary_key=["id"], auto_increment_column="id")])
     ) == []
+
+
+# ---------------------------------------------------------------------------
+# The unsupported-type finding must say WHICH KIND each identifier is
+# ---------------------------------------------------------------------------
+
+
+def _orders_with_enum():
+    return TableDef(
+        name="ecommerce.orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint"),
+            # A user-defined enum's type name is SCHEMA-QUALIFIED, which is exactly the
+            # shape this tool uses for tables.
+            ColumnDef(name="status", mysql_type="ecommerce.order_status"),
+        ],
+        primary_key=["id"],
+    )
+
+
+def test_a_qualified_type_name_is_not_presented_as_a_table_reference() -> None:
+    """The reported confusion: "why is another table mentioned in orders' finding?"
+
+    ``status (ecommerce.order_status)`` read as ``column (schema.table)`` because that is
+    the form the tool uses for tables everywhere else -- so an operator concluded a
+    different TABLE was involved. Naming the kind is what removes the ambiguity;
+    parentheses alone cannot.
+    """
+    from dsql_migrator.core.assessor_postgres import UnsupportedPostgresTypeRule
+
+    f = UnsupportedPostgresTypeRule().evaluate(
+        SourceInventory(tables=[_orders_with_enum()])
+    )[0]
+    assert 'column "status" of type ecommerce.order_status' in f.risk, f.risk
+    # The bare parenthesised form is what was misread, so it must be gone.
+    assert "status (ecommerce.order_status)" not in f.risk, f.risk
+    # Only the offending column is counted.
+    assert "1 column(s)" in f.risk, f.risk
+
+
+def test_the_recommendation_names_the_target_for_THIS_type() -> None:
+    """The per-type reason was computed and thrown away for a generic catalogue.
+
+    The operator was handed eight mappings and left to match them against their own
+    columns, while Schema Conversion -- the same function, the same column -- said exactly
+    what to do. Two steps, one column, different answers.
+    """
+    from dsql_migrator.core.assessor_postgres import UnsupportedPostgresTypeRule
+    from dsql_migrator.core.converter_postgres import unsupported_dsql_reason
+
+    table = TableDef(
+        name="ecommerce.orders",
+        columns=[
+            ColumnDef(name="status", mysql_type="ecommerce.order_status"),
+            ColumnDef(name="tags", mysql_type="text[]"),
+            ColumnDef(name="price", mysql_type="money"),
+        ],
+        primary_key=["status"],
+    )
+    f = UnsupportedPostgresTypeRule().evaluate(SourceInventory(tables=[table]))[0]
+    # Each column's own reason, verbatim from the single source of truth -- so Evaluation
+    # and Schema Conversion cannot drift.
+    for col, typ in (
+        ("status", "ecommerce.order_status"),
+        ("tags", "text[]"),
+        ("price", "money"),
+    ):
+        assert f"{col}: {unsupported_dsql_reason(typ)}" in f.recommendation, col
+    # money -> numeric specifically, not a list the operator has to search.
+    assert "numeric" in f.recommendation
+    # The old generic catalogue enumerated every mapping regardless of the columns; a
+    # table with no xml column must not be told about xml.
+    assert "xml" not in f.recommendation, f.recommendation
+
+
+def test_a_very_wide_table_cannot_produce_an_unbounded_message() -> None:
+    """One finding is rendered into a UI card, a text report and an HTML report."""
+    from dsql_migrator.core.assessor_postgres import (
+        _MAX_DETAILED_COLUMNS,
+        UnsupportedPostgresTypeRule,
+    )
+
+    table = TableDef(
+        name="app.wide",
+        columns=[ColumnDef(name=f"c{i}", mysql_type="money") for i in range(40)],
+        primary_key=["c0"],
+    )
+    f = UnsupportedPostgresTypeRule().evaluate(SourceInventory(tables=[table]))[0]
+    assert "40 column(s)" in f.risk, "the count must stay truthful"
+    # Bounded per-column reasons, and the remainder is NAMED, not silently dropped.
+    assert f.recommendation.count("Aurora DSQL does not support") == _MAX_DETAILED_COLUMNS
+    assert f"{40 - _MAX_DETAILED_COLUMNS} more column(s)" in f.recommendation
+    assert "c39" in f.recommendation, "the summarised columns are still named"

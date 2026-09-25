@@ -5,6 +5,12 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.525
+
+### 修正
+
+- **未サポート型の finding が、列の型を別のテーブルのように読める形で示し、既に計算済みのガイダンスを捨てていました。** PostgreSQL ソースで `orders` の finding が *"Column(s) status (ecommerce.order_status) use PostgreSQL types Aurora DSQL does not support…"* と表示していました。ユーザー定義 enum の型名はスキーマ修飾され、本ツールは他のあらゆる箇所で `schema.table` 形式を使うため、オペレーターは `ecommerce.order_status` を**別のテーブル**への参照と読み、なぜ `orders` の finding に出てくるのかと尋ねました。現在は種別を明示します: *"1 column(s) … : column "status" of type ecommerce.order_status"*。推奨文のほうがより問題でした: ルールは列ごとに `unsupported_dsql_reason` を呼び、**その型に対する忠実なリモデル先**を受け取っていながら破棄し、オペレーターが自分の列と突き合わせる必要のある 8 個のマッピング一覧に置き換えていました — 一方 Schema Conversion は同じ関数・同じ列について正確に述べていました。現在は列ごとの理由をそのまま伝えるため、2 つのステップが乖離できません。列数の多いテーブルは先頭 6 列を詳述し、残りは件数と名前で要約します — 1 つの finding が UI カード・テキストレポート・HTML レポートの 3 か所に描画されるため、長さが有界である必要があります。この文言を固定するテストは以前は 1 つもありませんでした。
+
 ## v0.1.524
 
 ### 修正

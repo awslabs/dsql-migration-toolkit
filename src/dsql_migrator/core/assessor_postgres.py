@@ -56,6 +56,48 @@ if TYPE_CHECKING:
     from dsql_migrator.core.models import SourceInventory
 
 
+# How many columns one finding spells out in full before it summarises the rest. A wide
+# table can carry dozens of unsupported columns, and the finding is rendered into a UI
+# card, a text report and an HTML report -- a message that grows without bound is unusable
+# in all three. The remaining columns are still COUNTED and named, just without their
+# individual reason.
+_MAX_DETAILED_COLUMNS = 6
+
+
+def _render_bad_columns(bad: "list[tuple[str, object, str]]") -> str:
+    """Name each offending column and its TYPE, saying which is which. Pure.
+
+    The type of a user-defined PostgreSQL enum or composite is schema-qualified
+    (``ecommerce.order_status``), and this tool writes ``schema.table`` everywhere else --
+    so the original ``status (ecommerce.order_status)`` was read as a reference to another
+    TABLE, and an operator asked why a different table appeared in this one's finding.
+    Naming the kind is what removes the ambiguity; parentheses alone cannot.
+    """
+    return ", ".join(
+        f"column \"{name}\" of type {typ}" for name, typ, _reason in bad
+    )
+
+
+def _render_remodel_guidance(bad: "list[tuple[str, object, str]]") -> str:
+    """One actionable line per column, from the reason already computed for its type.
+
+    Bounded: the first :data:`_MAX_DETAILED_COLUMNS` get their own reason and the rest are
+    named with a count, so a very wide table cannot produce an unbounded message.
+    """
+    lines = [
+        f"{name}: {reason}"
+        for name, _typ, reason in bad[:_MAX_DETAILED_COLUMNS]
+    ]
+    rest = bad[_MAX_DETAILED_COLUMNS:]
+    if rest:
+        names = ", ".join(name for name, _typ, _reason in rest)
+        lines.append(
+            f"The same applies to {len(rest)} more column(s) ({names}) -- Schema "
+            "Conversion states the target type for each."
+        )
+    return " ".join(lines)
+
+
 class UnsupportedPostgresTypeRule(Rule):
     """Flag columns whose PostgreSQL type Aurora DSQL does not support as a column type.
 
@@ -74,30 +116,30 @@ class UnsupportedPostgresTypeRule(Rule):
 
         findings: list[Finding] = []
         for table in inventory.tables:
-            bad = [
-                (col.name, col.mysql_type)
-                for col in table.columns
-                if unsupported_dsql_reason(col.mysql_type) is not None
-            ]
+            bad = []
+            for col in table.columns:
+                reason = unsupported_dsql_reason(col.mysql_type)
+                if reason is not None:
+                    bad.append((col.name, col.mysql_type, reason))
             if not bad:
                 continue
-            cols = ", ".join(f"{name} ({typ})" for name, typ in bad)
             findings.append(
                 Finding(
                     object=ObjectKey(KIND_TABLE, table.name),
                     rule_id=self.rule_id,
                     classification=Classification.UNSUPPORTED,
                     risk=(
-                        f"Column(s) {cols} use PostgreSQL types Aurora DSQL does not "
-                        "support as column types, so this table's CREATE would be "
-                        "rejected as-is."
+                        f"{len(bad)} column(s) of this table use a PostgreSQL data type "
+                        "Aurora DSQL does not support as a column type, so its CREATE "
+                        f"would be rejected as-is: {_render_bad_columns(bad)}."
                     ),
-                    recommendation=(
-                        "Remodel each to a DSQL-supported type before migrating; Schema "
-                        "Conversion names the target per type (array -> jsonb or a child "
-                        "table; inet/cidr/xml/tsvector/bit -> text; money -> numeric; "
-                        "range -> text; enum -> text; composite -> columns or jsonb)."
-                    ),
+                    # The per-type reason, not a catalogue to match against. Each reason
+                    # names the faithful remodel target for THAT type, and it was already
+                    # being computed and thrown away -- so the operator was handed eight
+                    # generic mappings and left to work out which of them applied, while
+                    # Schema Conversion (the same function, same column) told them
+                    # precisely. Two steps, one column, different answers.
+                    recommendation=_render_remodel_guidance(bad),
                     effort=EffortLevel.MEDIUM,
                 )
             )
