@@ -4619,6 +4619,19 @@ def apply_preserved_foreign_keys(
     # of FKs the pass will actually work through.
     _report(0)
 
+    # A STARTED line, so an INTERRUPTED pass leaves evidence. The roll-up below is emitted
+    # after the loop, so a pass killed part-way -- the Fargate task replaced, or the
+    # cut-over caller's connection factory raising on an expired IAM token -- wrote NOTHING
+    # to the audit trail while the target had already gained enforced constraints. Cheap:
+    # the `if not pending` return above means a run with no foreign keys still logs nothing.
+    _cutover_origin = origin == "cut-over"
+    log_activity(
+        ActivityCategory.VALIDATION if _cutover_origin else ActivityCategory.FULL_LOAD,
+        "apply foreign keys (cut-over)" if _cutover_origin else "apply foreign keys",
+        status=ActivityStatus.STARTED,
+        detail=f"Foreign-key pass starting: {_total} constraint(s) to add.",
+    )
+
     # Pre-count orphans for every FK CONCURRENTLY. The DDL below stays SERIAL (one DDL per
     # transaction on DSQL, and it costs 0.18s per FK), so only the expensive read fans out.
     _pregated = _pregate_orphans(
@@ -4811,17 +4824,46 @@ def apply_preserved_foreign_keys(
     # with no foreign keys: the `if not pending` return above fires first, so the caller's
     # "no noise" intent holds without a second condition.
     _at_cutover = origin == "cut-over"
+    # FKs the loop never reached -- it `break`s on a stop request, and previously the
+    # roll-up then reported "3 applied, 0 skipped, 0 failed." as a SUCCESS for a 15-FK
+    # schema, with the 12 un-attempted constraints appearing only in _LOGGER.info (the app
+    # stream, not the audit file). An operator reading the log saw a completed pass.
+    _unattempted = max(0, _total - (applied + skipped + failed))
+    # SUCCESS only when every constraint is actually ENFORCED on the target. An
+    # orphan-skipped FK was deliberately not added, so referential integrity is NOT in
+    # place for it; reporting that as SUCCESS is the reassurance that hides it. WARNING,
+    # not FAILURE: nothing broke, and the remedy (clean the orphans, re-run the
+    # idempotent pass) is the operator's.
+    _status = (
+        ActivityStatus.FAILURE
+        if failed
+        else ActivityStatus.WARNING
+        if (skipped or _unattempted)
+        else ActivityStatus.SUCCESS
+    )
     log_activity(
         # Cut over is the Validation step's screen, and the sync beside it logs there too,
         # so a reader filtering that step sees the whole hand-off in one place.
         ActivityCategory.VALIDATION if _at_cutover else ActivityCategory.FULL_LOAD,
         "apply foreign keys (cut-over)" if _at_cutover else "apply foreign keys",
-        status=ActivityStatus.FAILURE if failed else ActivityStatus.SUCCESS,
+        status=_status,
         detail=(
             # Not "post-load" unconditionally: the same pass runs at cut over for a CDC
             # migration, where it is the ONLY thing that ever creates these constraints.
             f"Foreign-key pass: {applied} applied, {skipped} skipped (orphan rows), "
             f"{failed} failed."
+            + (
+                f" {_unattempted} of {_total} NOT ATTEMPTED (pass stopped early) — those "
+                "constraints are not enforced; re-run the (idempotent) pass."
+                if _unattempted
+                else ""
+            )
+            + (
+                f" The {skipped} skipped constraint(s) are NOT enforced on the target: "
+                "clear the orphan rows and re-run the pass."
+                if skipped
+                else ""
+            )
             + (
                 " Run at cut over, before repointing — for a CDC migration this is the "
                 "only pass that creates the deferred constraints."

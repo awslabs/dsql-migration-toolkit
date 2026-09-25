@@ -262,7 +262,7 @@ def _cdc_resume_signal(migration_state, session):
     return (override if usable else None), False
 
 
-def _logged_cdc_lifecycle(action: str, *, detail: str, work):
+def _logged_cdc_lifecycle(action: str, *, detail: str, work, residue=None):
     """Wrap a CDC lifecycle job body so its OUTCOME reaches the activity log.
 
     The four lifecycle actions (deploy infra / start / stop / delete) each take
@@ -315,6 +315,24 @@ def _logged_cdc_lifecycle(action: str, *, detail: str, work):
                 action,
                 status=ActivityStatus.INFO,
                 detail=f"{detail} — cancelled after {_elapsed()}",
+            )
+            return
+        # A teardown that finished its own work can still have LEFT SOMETHING on the
+        # customer's source -- a logical replication slot that keeps pinning WAL until
+        # the source disk fills. That cleanup is deliberately non-fatal (the stack is
+        # already gone, so it must not fail the job), which meant the durable audit
+        # line read "delete CDC infrastructure (success)" while the hazard survived and
+        # its only record sat in the in-memory deploy log the next action wipes.
+        # WARNING, not FAILURE: the action did complete; something needs doing next.
+        _left = tuple(residue() or ()) if residue is not None else ()
+        if _left:
+            _log_cdc_event(
+                action,
+                status=ActivityStatus.WARNING,
+                detail=(
+                    f"{detail} — completed in {_elapsed()}, but LEFT BEHIND on the "
+                    f"source: {'; '.join(_left)}"
+                ),
             )
             return
         _log_cdc_event(
@@ -4925,6 +4943,11 @@ def _start_cdc_delete(
     # the customer's own SM-auth secret entirely out of scope.
     cleanup_secret = not getattr(session, "source_secret_id", None)
 
+    # What the teardown could not remove from the customer's source. Collected here and
+    # read by _logged_cdc_lifecycle so the DURABLE audit line carries it -- the deploy
+    # log this also goes to is in-memory and the next lifecycle action wipes it.
+    _residue: list[str] = []
+
     def work(handle) -> None:
         run_cdc_delete(
             handle,
@@ -4938,12 +4961,28 @@ def _start_cdc_delete(
             # replication slot does not depend on secretsmanager:GetSecretValue (which the
             # app's identity is not granted for the tool-managed CDC secret).
             source_credentials=_session_source_credentials(session),
+            on_residue=_residue.append,
+            # Destroying the slot/publication on the customer's source is as auditable
+            # as creating them (which Full Load already logs via its own _audit hook);
+            # without this, teardown's source writes lived only in the in-memory deploy
+            # log. Value-free -- object names and outcomes, no row data.
+            on_source_write=lambda message: _log_cdc_event(
+                "CDC source replication teardown",
+                status=(
+                    ActivityStatus.WARNING
+                    if message.startswith(("WARNING", "FAILED"))
+                    else ActivityStatus.INFO
+                ),
+                detail=f"source ({stack_name}): {message}",
+            ),
         )
 
     _action = "delete CDC infrastructure"
     _detail = f"stack {stack_name}"
     job_id = job_manager.submit(
-        _logged_cdc_lifecycle(_action, detail=_detail, work=work)
+        _logged_cdc_lifecycle(
+            _action, detail=_detail, work=work, residue=lambda: tuple(_residue)
+        )
     )
     migration_state.set_cdc_deploy_job_id(job_id, kind="delete")
     # Clear any latched redeploy answer: this teardown must prompt again when it lands,

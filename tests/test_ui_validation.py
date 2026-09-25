@@ -6129,3 +6129,205 @@ def test_has_extra_target_rows_is_the_pure_signal() -> None:
     assert _release_summary(is_match=False, extra=2).has_extra_target_rows is True
     assert _release_summary(is_match=False, extra=0).has_extra_target_rows is False
     assert _release_summary(is_match=True).has_extra_target_rows is False
+
+
+# ---------------------------------------------------------------------------
+# The verdict must disclose what it did NOT cover (false-reassurance guards)
+# ---------------------------------------------------------------------------
+
+
+def _coverage_report(
+    *,
+    fast_sweep: int = 0,
+    reconciled: int = 0,
+    composite_pk: int = 0,
+    excluded: dict[str, tuple[str, ...]] | None = None,
+) -> ValidationReport:
+    """A CHECKSUM report with a chosen mix of coverage shortfalls."""
+    items: list[TableValidationResult] = []
+    for i in range(fast_sweep):
+        items.append(
+            TableValidationResult(
+                table=f"swept{i}", source_row_count=5, target_row_count=5,
+                row_count_match=True, matched=True, deep_checks_skipped=True,
+            )
+        )
+    for i in range(reconciled):
+        items.append(
+            TableValidationResult(
+                table=f"recon{i}", source_row_count=5, target_row_count=5,
+                row_count_match=True, matched=True,
+                reconcile=ReconcileResult(
+                    pk_column="id", source_count=5, target_count=5, consistent=True
+                ),
+            )
+        )
+    for i in range(composite_pk):
+        items.append(
+            TableValidationResult(
+                table=f"composite{i}", source_row_count=5, target_row_count=5,
+                row_count_match=True, matched=True,
+            )
+        )
+    for table, cols in (excluded or {}).items():
+        items.append(
+            TableValidationResult(
+                table=table, source_row_count=5, target_row_count=5,
+                row_count_match=True, matched=True,
+                migration_excluded_columns=cols,
+            )
+        )
+    return ValidationReport.build(mode=ValidationMode.CHECKSUM, items=items)
+
+
+def test_a_verdict_that_covered_everything_discloses_nothing() -> None:
+    """No caveat clause when the verdict really is as strong as it reads."""
+    from dsql_migrator.ui.validation import verdict_evidence_caveats
+
+    report = _coverage_report(reconciled=3)
+    assert verdict_evidence_caveats(summarize_validation(report), report) == ""
+
+
+def test_a_fast_sweep_verdict_says_how_many_tables_were_count_only() -> None:
+    """The line an auditor attaches to a ticket must be falsifiable from the log.
+
+    A fast sweep skips the checksum for every table whose counts agree, yet the verdict
+    still named the REQUESTED mode -- so 10 of 11 tables compared by ``COUNT(*)`` alone
+    produced the identical "CHECKSUM verdict: MATCH … ready for cut-over" as a fully
+    value-compared run.
+    """
+    from dsql_migrator.ui.validation import verdict_evidence_caveats
+
+    report = _coverage_report(fast_sweep=10, reconciled=1)
+    caveat = verdict_evidence_caveats(summarize_validation(report), report)
+    assert "10/11" in caveat, caveat
+    assert "ROW COUNT" in caveat, caveat
+    assert "swept0" in caveat, caveat
+
+
+def test_reconcile_coverage_is_disclosed_when_it_could_not_cover_every_table() -> None:
+    """"0 missing / 0 extra" fires as soon as ONE table reconciled."""
+    from dsql_migrator.ui.validation import verdict_evidence_caveats
+
+    report = _coverage_report(reconciled=1, composite_pk=9)
+    caveat = verdict_evidence_caveats(summarize_validation(report), report)
+    assert "1/10" in caveat, caveat
+    assert "composite" in caveat, caveat
+
+
+def test_an_excluded_column_is_disclosed_on_the_verdict_itself() -> None:
+    """v0.1.491 disclosed exclusions in the report and the panel, but not in the log."""
+    from dsql_migrator.ui.validation import verdict_evidence_caveats
+
+    report = _coverage_report(
+        reconciled=1, excluded={"product_media": ("content",)}
+    )
+    caveat = verdict_evidence_caveats(summarize_validation(report), report)
+    assert "EXCLUDED" in caveat, caveat
+    assert "product_media (content)" in caveat, caveat
+    assert "hold no data on the target" in caveat, caveat
+
+
+def test_the_caveat_is_bounded_so_it_survives_the_detail_truncation() -> None:
+    """A silent truncation would itself be a false reassurance (500-char cap)."""
+    from dsql_migrator.core.activity_log import _MAX_DETAIL_CHARS
+    from dsql_migrator.ui.validation import verdict_evidence_caveats
+
+    report = _coverage_report(fast_sweep=200, reconciled=1, composite_pk=200)
+    caveat = verdict_evidence_caveats(summarize_validation(report), report)
+    assert "more" in caveat, "a capped list must say how many it dropped"
+    assert len(caveat) < _MAX_DETAIL_CHARS, len(caveat)
+
+
+def test_both_verdict_and_cutover_lines_carry_the_disclosure() -> None:
+    """Wiring: the helper is dead code unless both audit lines call it.
+
+    The verdict line and the cut-over acknowledgement are the two places an auditor
+    reads a go/no-go, so one of them disclosing is not enough.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import validation as val
+
+    tree = ast.parse(inspect.getsource(val))
+    callers = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any(
+            isinstance(c, ast.Call)
+            and isinstance(c.func, ast.Name)
+            and c.func.id == "verdict_evidence_caveats"
+            for c in ast.walk(node)
+        )
+    }
+    assert callers, "verdict_evidence_caveats is never called"
+    src = inspect.getsource(val)
+    # Both log details must be built from it.
+    for marker in ("NOT covered:", "NOT covered by validation:"):
+        assert marker in src, f"{marker} missing -- a verdict line is not disclosing"
+
+
+def test_stripped_foreign_keys_are_not_reported_as_none_in_scope() -> None:
+    """``preserve_foreign_keys=False`` is the fact an auditor most needs, and it read as 0.
+
+    The operator's documented opt-out leaves the target live with NO foreign keys, but it
+    reaches the count as a plain ``0`` -- indistinguishable from a schema that had none,
+    so the cut-over line said "foreign keys: none in scope".
+    """
+    from dsql_migrator.ui.validation import _cutover_integrity_detail
+
+    state = ValidationState()
+    detail = _cutover_integrity_detail(state, 0, fks_stripped=True)
+    assert "STRIPPED" in detail, detail
+    assert "application's job" in detail, detail
+    assert "none in scope" not in detail, detail
+
+
+def test_unreadable_schema_state_is_not_reported_as_none_in_scope() -> None:
+    """The other ambiguous zero: the state the count reads is simply absent."""
+    from dsql_migrator.ui.validation import _cutover_integrity_detail
+
+    detail = _cutover_integrity_detail(ValidationState(), 0, inputs_missing=True)
+    assert "NOT KNOWN" in detail, detail
+    assert "none in scope" not in detail, detail
+
+
+def test_a_genuinely_fk_free_schema_still_says_none_in_scope() -> None:
+    # The reassuring wording is correct for exactly one of the three zeros.
+    from dsql_migrator.ui.validation import _cutover_integrity_detail
+
+    assert "none in scope" in _cutover_integrity_detail(ValidationState(), 0)
+
+
+def test_cutover_foreign_keys_stripped_reads_the_conversion_toggle() -> None:
+    from dsql_migrator.ui.validation import _cutover_foreign_keys_stripped
+
+    class _State:
+        def __init__(self, preserve: bool) -> None:
+            self.preserve_foreign_keys = preserve
+
+    class _Store:
+        def __init__(self, state) -> None:
+            self._state = state
+
+        def get(self, _sid):
+            return self._state
+
+    assert _cutover_foreign_keys_stripped(_Store(_State(False)), "s") is True
+    assert _cutover_foreign_keys_stripped(_Store(_State(True)), "s") is False
+    # An ABSENT state must never be reported as a deliberate strip.
+    assert _cutover_foreign_keys_stripped(_Store(None), "s") is False
+    assert _cutover_foreign_keys_stripped(None, "s") is False
+
+
+def test_the_cutover_ack_passes_both_ambiguity_predicates() -> None:
+    """Wiring: the new branches are dead unless the ack line supplies them."""
+    import inspect
+
+    from dsql_migrator.ui import validation as val
+
+    src = inspect.getsource(val)
+    assert "inputs_missing=_cutover_gate_inputs_missing(" in src
+    assert "fks_stripped=_cutover_foreign_keys_stripped(" in src

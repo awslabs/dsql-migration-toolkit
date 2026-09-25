@@ -873,6 +873,78 @@ def count_verified_tables(report: ValidationReport) -> tuple[str, ...]:
     )
 
 
+def _bounded_names(names: "Sequence[str]", limit: int = 6) -> str:
+    """Join table names for a log detail, capped so the 500-char limit is never hit."""
+    shown = ", ".join(names[:limit])
+    return shown + (f" (+{len(names) - limit} more)" if len(names) > limit else "")
+
+
+def verdict_evidence_caveats(
+    summary: "ValidationSummary", report: ValidationReport
+) -> str:
+    """Every reason the verdict is WEAKER than "MATCH … ready for cut-over" reads.
+
+    The activity log is the artifact an auditor attaches to a change ticket, and its
+    strongest line was not falsifiable from the log itself: the verdict names the
+    REQUESTED mode and a reconcile clause that fires as soon as ONE table reconciled,
+    so a fast sweep that compared 10 of 11 tables by ``COUNT(*)`` alone, a schema where
+    only one table had a reconcilable primary key, and a fully value-compared run all
+    produced the identical line. A column the operator excluded from the migration --
+    which holds no data on the target and is dropped from the checksum -- was likewise
+    invisible: v0.1.491 disclosed it in the text/JSON report and the readiness panel,
+    but never in the log.
+
+    The report and the panel already say all of this (``render_validation_report``,
+    the readiness notices); this is the same disclosure compressed to one log clause,
+    so the three surfaces cannot disagree. Returns ``""`` when the verdict really is as
+    strong as it reads.
+
+    Pure: counts and identifiers only, never a row value (Property 7). Bounded: table
+    lists are capped, because ``log_activity`` truncates a detail at 500 characters and
+    a silent truncation would itself be a false reassurance.
+    """
+    parts: list[str] = []
+    # Worst first: a column that was never written to the target at all. "Excluded"
+    # rather than "not compared" -- there is nothing on the target to compare.
+    if summary.migration_excluded_columns:
+        detail = "; ".join(
+            f"{table} ({', '.join(cols)})"
+            for table, cols in list(summary.migration_excluded_columns.items())[:4]
+        )
+        more = len(summary.migration_excluded_columns) - 4
+        parts.append(
+            "columns EXCLUDED from the migration (hold no data on the target, so not "
+            f"validated): {detail}" + (f" (+{more} more table(s))" if more > 0 else "")
+        )
+    # Fast sweep: equal counts meant the checksum/reconcile never ran for these tables,
+    # so the verdict's own mode label over-states what was actually compared.
+    count_only = count_verified_tables(report)
+    if count_only:
+        parts.append(
+            f"{len(count_only)}/{summary.total_tables} table(s) compared by ROW COUNT "
+            "only -- fast sweep skipped their deep check: "
+            f"{_bounded_names(count_only)}"
+        )
+    # Reconcile coverage: "0 missing / 0 extra" is true of the tables it covered, which
+    # is not necessarily the tables in the verdict.
+    if summary.reconcile_requested:
+        inapplicable = summary.reconcile_inapplicable_tables
+        if not summary.reconcile_performed:
+            parts.append(
+                "record-level reconcile ran for NO table (composite / non-integer "
+                f"primary key): {_bounded_names(inapplicable)}"
+                if inapplicable
+                else "record-level reconcile ran for no table"
+            )
+        elif inapplicable:
+            parts.append(
+                f"record reconcile covered {summary.reconciled_tables}/"
+                f"{summary.total_tables} table(s); not reconciled (composite / "
+                f"non-integer primary key): {_bounded_names(inapplicable)}"
+            )
+    return "; ".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Re-checking individual tables (merge a fresh comparison into a prior report)
 # ---------------------------------------------------------------------------
@@ -2195,6 +2267,15 @@ def build_validation_screen(
                     + (
                         "; ready for cut-over" if _summary.ready_for_cutover else ""
                     )
+                    # What the verdict does NOT cover, on the same line -- otherwise
+                    # "MATCH … ready for cut-over" reads as "every column of every table
+                    # was value-compared" when a fast sweep, an unreconcilable primary
+                    # key or an excluded column means it was not.
+                    + (
+                        f"; NOT covered: {_caveats}"
+                        if (_caveats := verdict_evidence_caveats(_summary, result))
+                        else ""
+                    )
                 ),
             )
             if ai_post_event is not None:
@@ -2845,7 +2926,33 @@ def _cutover_pending_foreign_keys(
     return sum(len(conv.foreign_key_ddls) for conv in applied.values())
 
 
-def _cutover_integrity_detail(validation_state: "ValidationState", pending: int) -> str:
+def _cutover_foreign_keys_stripped(
+    conversion_store: "Optional[Any]", session_id: str
+) -> bool:
+    """Whether the operator turned FK preservation OFF for this migration.
+
+    ``preserve_foreign_keys=False`` is the documented opt-out: the target goes live with
+    NO foreign keys and referential integrity becomes the application's job. That is
+    exactly the fact an auditor most needs on the cut-over line, yet it reaches
+    ``_cutover_pending_foreign_keys`` as a plain ``0`` -- indistinguishable from a schema
+    that simply had none. Returns ``False`` when the state is absent, so a missing
+    snapshot is never reported as a deliberate strip.
+
+    Pure: reads recorded state, no DB.
+    """
+    if conversion_store is None:
+        return False
+    conv_state = conversion_store.get(session_id)
+    return conv_state is not None and not conv_state.preserve_foreign_keys
+
+
+def _cutover_integrity_detail(
+    validation_state: "ValidationState",
+    pending: int,
+    *,
+    inputs_missing: bool = False,
+    fks_stripped: bool = False,
+) -> str:
     """One clause stating whether the target went live with its foreign keys enforced.
 
     The absence of an "apply foreign keys" line is ambiguous across FOUR situations -- the
@@ -2854,11 +2961,29 @@ def _cutover_integrity_detail(validation_state: "ValidationState", pending: int)
     question this screen exists to settle. Says which, plus whether the identity sequences
     were advanced (an un-advanced sequence is a post-cut-over duplicate-key risk).
 
+    ``pending <= 0`` is itself ambiguous across three MORE situations, and the reassuring
+    one was being printed for all of them: the schema genuinely has no foreign keys, the
+    schema state could not be read (a partial session snapshot loses it), or the operator
+    STRIPPED every foreign key via ``preserve_foreign_keys=False``. Only the first is
+    "none in scope"; the render already distinguishes them with
+    :func:`_cutover_gate_inputs_missing`, so the log now takes the same two predicates
+    rather than collapsing a deliberate integrity trade-off into "nothing to do".
+
     Pure: reads the already-recorded outcomes, no DB. Counts and states only, never a row
     value (Property 7).
     """
     if validation_state.proceed_without_foreign_keys:
         fk = f"foreign keys WAIVED ({pending} not applied)"
+    elif fks_stripped:
+        fk = (
+            "foreign keys STRIPPED by the schema conversion -- the target is live "
+            "WITHOUT them and referential integrity is the application's job"
+        )
+    elif inputs_missing:
+        fk = (
+            "foreign keys: NOT KNOWN (the schema-conversion / evaluation state this "
+            "count reads is unavailable, so this is not an assertion that there are none)"
+        )
     elif pending <= 0:
         fk = "foreign keys: none in scope"
     else:
@@ -3131,6 +3256,24 @@ def build_cutover_screen(
                     _cutover_pending_foreign_keys(
                         session, eval_store, conversion_store, session_id
                     ),
+                    inputs_missing=_cutover_gate_inputs_missing(
+                        eval_store, conversion_store, session_id
+                    ),
+                    fks_stripped=_cutover_foreign_keys_stripped(
+                        conversion_store, session_id
+                    ),
+                )
+                # The go-live line must carry the same disclosure as the verdict it
+                # signs off; an auditor who reads only the closing line would otherwise
+                # see a clean cut-over over an unvalidated column or a count-only sweep.
+                + (
+                    f"; NOT covered by validation: {_ack_caveats}"
+                    if _summary is not None
+                    and _report is not None
+                    and (
+                        _ack_caveats := verdict_evidence_caveats(_summary, _report)
+                    )
+                    else ""
                 )
             ),
         )

@@ -226,11 +226,27 @@ def _run_write(
     on_log: Optional[Callable[[str], None]],
     params: Optional[dict] = None,
 ):
-    """Execute one allowlisted source write, logging it for audit. Returns the result."""
+    """Execute one allowlisted source write, logging it for audit. Returns the result.
+
+    The audit line is written AFTER the statement commits, and a failure gets its own
+    line. Logging the intent first made the audit trail assert source writes that never
+    happened -- and these are writes on the CUSTOMER'S production source (creating a
+    publication, widening a table's REPLICA IDENTITY permanently, dropping a
+    WAL-pinning slot), so a record that claims one landed when it did not is the worst
+    kind of false reassurance: the operator stops looking for the thing still there.
+    """
     _assert_allowed(statement)
+    try:
+        result = connection.execute(text(statement), params or {})  # type: ignore[attr-defined]
+    except Exception as exc:
+        if on_log is not None:
+            # First line only, no parameter values -- the statements are tool-built and
+            # their params are identifiers, but the server message is not ours.
+            on_log(f"FAILED: {action} - {str(exc).splitlines()[0][:200]}")
+        raise
     if on_log is not None:
         on_log(action)
-    return connection.execute(text(statement), params or {})  # type: ignore[attr-defined]
+    return result
 
 
 def publication_exists(connection: object, name: str) -> bool:
@@ -648,7 +664,16 @@ def provision_pg_replication(
             try:
                 drop_publication(connection, name=publication_name, on_log=on_log)
             except Exception:  # noqa: BLE001 - best-effort compensation
-                pass
+                # Swallowed so the ORIGINAL slot failure is what the caller sees, but
+                # never silently: the publication this call created is still on the
+                # customer's source arming the write outage the compensation exists to
+                # prevent, and the operator has to drop it by hand.
+                if on_log is not None:
+                    on_log(
+                        f"publication {publication_name} is STILL ON THE SOURCE -- the "
+                        "compensating drop failed; drop it manually with "
+                        f'DROP PUBLICATION "{publication_name}"'
+                    )
         raise
     return PgReplicationHandles(
         slot_name=slot_name, publication_name=publication_name, consistent_lsn=lsn

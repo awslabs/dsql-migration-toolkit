@@ -704,3 +704,87 @@ def test_an_invalidated_slot_is_not_usable() -> None:
     assert "COALESCE(WAL_STATUS" in usable_q
     any_q = joined[: joined.index("SLOT_ANY_N")]
     assert "WAL_STATUS" not in any_q.split("SLOT_NAME = :SLOT")[-1]
+
+
+# ---------------------------------------------------------------------------
+# Audit honesty: a source write is recorded AFTER it lands, never before
+# ---------------------------------------------------------------------------
+
+
+def test_a_failed_source_write_is_logged_as_failed_not_as_done() -> None:
+    """These writes are on the CUSTOMER's production source, so the log must not lie.
+
+    The audit line used to be emitted before ``connection.execute``, so a publication
+    that was never created, a REPLICA IDENTITY that was never widened, or a WAL-pinning
+    slot that was never dropped were all recorded as facts. That is the worst kind of
+    false reassurance: the operator stops looking for the thing that is still there.
+    """
+    from dsql_migrator.core.cdc_pg_slot import _run_write
+
+    class _Boom:
+        def execute(self, _statement, _params=None):
+            raise RuntimeError("permission denied for database app\nCONTEXT: ignored")
+
+    seen: list[str] = []
+    with pytest.raises(RuntimeError):
+        _run_write(
+            _Boom(),
+            'CREATE PUBLICATION "p" FOR TABLE "public"."t"',
+            action="creating publication p",
+            on_log=seen.append,
+        )
+    assert len(seen) == 1, seen
+    assert seen[0].startswith("FAILED: creating publication p"), seen
+    assert "permission denied" in seen[0]
+    # First line only -- the server message is not ours to trust for length or content.
+    assert "CONTEXT" not in seen[0], seen
+
+
+def test_a_successful_source_write_is_logged_once_after_it_lands() -> None:
+    from dsql_migrator.core.cdc_pg_slot import _run_write
+
+    order: list[str] = []
+
+    class _Conn:
+        def execute(self, _statement, _params=None):
+            order.append("executed")
+            return _Result([])
+
+    _run_write(
+        _Conn(),
+        'DROP PUBLICATION "p"',
+        action="dropping publication p",
+        on_log=lambda m: order.append(f"logged:{m}"),
+    )
+    assert order == ["executed", "logged:dropping publication p"], order
+
+
+def test_a_swallowed_compensating_drop_still_says_the_publication_survived() -> None:
+    """Compensation is best-effort, but its failure must not be silent.
+
+    The publication this call created is still on the source arming the write outage the
+    compensation exists to prevent, and the original slot error is what propagates -- so
+    without a line the log claims the cleanup happened.
+    """
+    from dsql_migrator.core import cdc_pg_slot as mod
+
+    conn = _FakeConn(fail_slot_create=True)
+    real_execute = conn.execute
+
+    def _execute(statement, params=None):
+        if " ".join(str(statement).upper().split()).startswith("DROP PUBLICATION"):
+            raise RuntimeError("must be owner of publication")
+        return real_execute(statement, params)
+
+    conn.execute = _execute  # type: ignore[assignment]
+    seen: list[str] = []
+    with pytest.raises(Exception):
+        mod.provision_pg_replication(
+            conn,
+            tables=["public.t"],
+            slot_name="dsqlmig_s",
+            publication_name="dsqlmig_pub_s",
+            on_log=seen.append,
+        )
+    assert any("STILL ON THE SOURCE" in m for m in seen), seen
+    assert any("DROP PUBLICATION" in m for m in seen), seen

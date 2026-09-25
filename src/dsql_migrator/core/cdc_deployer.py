@@ -1328,8 +1328,15 @@ def _drop_pg_source_replication(
     region: Optional[str],
     aws_profile: Optional[str],
     source_credentials: Optional[tuple[str, str]] = None,
+    on_source_write: Optional[Callable[[str], None]] = None,
 ) -> bool:
     """Drop the PostgreSQL CDC replication slot + publication on the source (teardown).
+
+    ``on_source_write`` mirrors every source write/failure into a DURABLE channel (the
+    caller's audit log). Provisioning these same objects is audited; destroying them was
+    not -- it went only to the in-memory deploy log that the next lifecycle action
+    wipes -- so the audit trail recorded the creation of a WAL-pinning slot on the
+    customer's production source and nothing about its removal.
 
     Reconstructs the source connection from the (captured) stack parameters
     (``SourceDbHostname`` / ``SourceDbPort`` / ``PgDatabaseName``) plus the source
@@ -1429,10 +1436,19 @@ def _drop_pg_source_replication(
             database=database,
             username=username or "",
         )
-        driver.log(
+        _announce = (
             f"Dropping the PostgreSQL replication slot '{slot}' + publication "
             f"'{publication}' on the source (releases pinned WAL)…"
         )
+        driver.log(_announce)
+        if on_source_write is not None:
+            on_source_write(_announce)
+
+        def _source_log(message: str) -> None:
+            driver.log(f"source: {message}")
+            if on_source_write is not None:
+                on_source_write(message)
+
         engine = cdc_pg_slot.build_pg_source_write_engine(source_config, password)
         try:
             with engine.connect() as connection:
@@ -1440,17 +1456,20 @@ def _drop_pg_source_replication(
                     connection,
                     slot_name=slot,
                     publication_name=publication,
-                    on_log=lambda m: driver.log(f"source: {m}"),
+                    on_log=_source_log,
                 )
-            driver.log("Source replication slot + publication dropped.")
+            _source_log("replication slot + publication dropped")
         finally:
             engine.dispose()
         return True
     except Exception as exc:  # noqa: BLE001 - teardown is already complete; never fatal
-        driver.log(
+        _failure = (
             f"WARNING: could not drop the PostgreSQL replication slot '{slot}': "
             f"{str(exc).splitlines()[0]}. {manual}"
         )
+        driver.log(_failure)
+        if on_source_write is not None:
+            on_source_write(_failure)
         return False
 
 
@@ -1467,8 +1486,19 @@ def run_cdc_delete(
     delete_timeout_seconds: float = 1800.0,
     poll_interval_seconds: float = 30.0,
     sleep: Callable[[float], None] = None,  # type: ignore[assignment]
+    on_residue: Optional[Callable[[str], None]] = None,
+    on_source_write: Optional[Callable[[str], None]] = None,
 ) -> None:
     """Delete the entire cdc-stack (full teardown / rollback recovery).
+
+    ``on_residue`` receives one short line per object this teardown could NOT remove
+    from the customer's source. It exists because the teardown is deliberately
+    non-fatal -- the infrastructure is already gone, so a failed source cleanup must
+    not fail the job -- which meant a surviving logical replication slot, the code's
+    own "production hazard" (it pins source WAL until the source disk fills), was
+    reported ONLY into the in-memory deploy log that the next lifecycle action wipes,
+    while the durable audit line said the teardown completed successfully. ``core``
+    has no activity-log dependency, so the caller decides how to record it.
 
     Walks :data:`CDC_DELETE_STAGES`. Uses :meth:`describe_stack_or_none` (not
     ``discover_stack``) so a ``ROLLBACK_COMPLETE`` stack can still be deleted. If
@@ -1607,7 +1637,16 @@ def run_cdc_delete(
                 region=region,
                 aws_profile=aws_profile,
                 source_credentials=source_credentials,
+                on_source_write=on_source_write,
             )
+            if not _slot_dropped and on_residue is not None:
+                # Durable, not just the wiped-on-next-action deploy log: this is the
+                # one outcome of a teardown that can take the source down later.
+                on_residue(
+                    "the PostgreSQL logical replication slot "
+                    f"'{(stack_params.get('PgSlotName') or '').strip() or cdc_pg_slot.pg_slot_name(stack_name)}' "
+                    "is STILL ON THE SOURCE and keeps pinning WAL -- drop it manually"
+                )
 
         # 4. clean up the tool-managed source-credentials secret (best effort).
         #    CloudFormation never owned it, so it must be removed here or it lingers

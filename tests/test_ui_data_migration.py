@@ -2764,7 +2764,22 @@ def test_the_foreign_key_pass_emits_one_named_audit_line_with_its_outcome(monkey
     )
     engine.apply_preserved_foreign_keys({"child": conv}, lambda: _FkProbeConnection(0))
 
-    summary = [e for e in events if e[1] == "apply foreign keys"]
+    # A STARTED line + exactly ONE outcome line. The pinned invariant is the OUTCOME
+    # count -- this pass once emitted two contradictory outcome lines 0.3 ms apart -- not
+    # the total; a pass killed mid-way (task replaced, expired token) needs the STARTED
+    # line or it leaves no trace at all while the target has already gained constraints.
+    started = [
+        e for e in events
+        if e[1] == "apply foreign keys"
+        and e[2]["status"] is engine.ActivityStatus.STARTED
+    ]
+    assert len(started) == 1, f"exactly one started line per pass: {events}"
+    assert "3 constraint(s)" in started[0][2]["detail"], started
+    summary = [
+        e for e in events
+        if e[1] == "apply foreign keys"
+        and e[2]["status"] is not engine.ActivityStatus.STARTED
+    ]
     assert len(summary) == 1, f"exactly one summary line per pass: {events}"
     category, _action, kw = summary[0]
     assert category is engine.ActivityCategory.FULL_LOAD
@@ -22667,8 +22682,12 @@ def test_the_cutover_foreign_key_pass_is_logged_as_a_cutover_event(monkeypatch) 
         {"child": conv}, lambda: _FkProbeConnection(0), origin="cut-over"
     )
 
-    assert len(events) == 1, f"still exactly one line per pass: {events}"
-    category, action, kw = events[0]
+    # One STARTED + one OUTCOME, both carrying the cut-over label/category.
+    assert len(events) == 2, f"still exactly one outcome line per pass: {events}"
+    assert events[0][2]["status"] is engine.ActivityStatus.STARTED
+    assert events[0][0] is engine.ActivityCategory.VALIDATION, events
+    assert events[0][1] == "apply foreign keys (cut-over)", events
+    category, action, kw = events[1]
     assert category is engine.ActivityCategory.VALIDATION
     assert action == "apply foreign keys (cut-over)"
     assert kw["status"] is engine.ActivityStatus.SUCCESS
@@ -22679,7 +22698,7 @@ def test_the_cutover_foreign_key_pass_is_logged_as_a_cutover_event(monkeypatch) 
     # The DEFAULT (post-load / Data Migration action) is unchanged.
     events.clear()
     engine.apply_preserved_foreign_keys({"child": conv}, lambda: _FkProbeConnection(0))
-    category, action, kw = events[0]
+    category, action, kw = events[-1]
     assert category is engine.ActivityCategory.FULL_LOAD
     assert action == "apply foreign keys"
     assert "cut over" not in kw["detail"].lower(), kw
@@ -26503,3 +26522,197 @@ def test_the_block_reason_names_the_failing_check_and_its_remedy() -> None:
     assert "ecommerce.orders" in reason          # the per-table target
     assert "REPLICA IDENTITY FULL" in reason     # the row's own remediation
     assert "1 more required check(s) also failed" in reason
+
+
+# ---------------------------------------------------------------------------
+# A teardown that left a hazard behind must not log SUCCESS
+# ---------------------------------------------------------------------------
+
+
+def test_a_teardown_that_left_a_slot_behind_logs_warning_not_success(monkeypatch) -> None:
+    """The one teardown outcome that can take the customer's source down later.
+
+    Dropping the PostgreSQL replication slot is deliberately non-fatal -- the stack is
+    already gone, so it must not fail the job -- which meant a surviving slot (the code's
+    own "production hazard": it pins source WAL until the disk fills) was reported ONLY
+    into the in-memory deploy log that the next lifecycle action wipes, while the durable
+    audit line said ``delete CDC infrastructure (success)``.
+    """
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+
+    events = _capture_cdc_events(monkeypatch)
+    left = ["the PostgreSQL logical replication slot 'dsqlmig_s' is STILL ON THE SOURCE"]
+    wrapped = cdc_ui._logged_cdc_lifecycle(
+        "delete CDC infrastructure",
+        detail="stack s1",
+        work=lambda _h: None,
+        residue=lambda: tuple(left),
+    )
+    wrapped(_RecordingHandle())
+
+    (action, status, detail) = events[-1]
+    assert action == "delete CDC infrastructure"
+    assert status == "warning", (status, detail)
+    assert "LEFT BEHIND" in detail, detail
+    assert "STILL ON THE SOURCE" in detail, detail
+    # It did complete -- the elapsed time is still recorded, so this is not a FAILURE.
+    assert "completed in" in detail, detail
+
+
+def test_a_clean_teardown_still_logs_success(monkeypatch) -> None:
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+
+    events = _capture_cdc_events(monkeypatch)
+    wrapped = cdc_ui._logged_cdc_lifecycle(
+        "delete CDC infrastructure",
+        detail="stack s1",
+        work=lambda _h: None,
+        residue=lambda: (),
+    )
+    wrapped(_RecordingHandle())
+    (_action, status, detail) = events[-1]
+    assert status == "success", (status, detail)
+    assert "LEFT BEHIND" not in detail
+
+
+def test_the_delete_action_wires_both_audit_channels() -> None:
+    """Wiring: the residue + source-write channels are dead code unless passed.
+
+    Asserted on the parse tree so a reworded comment cannot satisfy it -- dropping either
+    keyword restores the exact defect (a SUCCESS line over a surviving slot, and a
+    source-destroying write with no durable record).
+    """
+    import ast
+    import inspect
+
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+
+    tree = ast.parse(inspect.getsource(cdc_ui._start_cdc_delete))
+    delete_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "run_cdc_delete"
+    ]
+    assert len(delete_calls) == 1, "expected one run_cdc_delete call"
+    kwargs = {kw.arg for kw in delete_calls[0].keywords}
+    assert "on_residue" in kwargs, "a surviving slot would log as SUCCESS again"
+    assert "on_source_write" in kwargs, (
+        "destroying the slot/publication on the customer's source would go unaudited"
+    )
+    lifecycle = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_logged_cdc_lifecycle"
+    ]
+    assert lifecycle and any(
+        kw.arg == "residue" for kw in lifecycle[0].keywords
+    ), "the lifecycle wrapper must be given the residue to read"
+
+
+# ---------------------------------------------------------------------------
+# The FK pass must not report SUCCESS over unenforced constraints
+# ---------------------------------------------------------------------------
+
+
+def test_orphan_skipped_constraints_make_the_pass_a_warning(monkeypatch) -> None:
+    """An orphan-skipped FK is NOT enforced, so the pass did not fully succeed.
+
+    ``status=FAILURE if failed else SUCCESS`` reported a pass that silently left
+    constraints off the target as a clean success -- exactly the line a cut-over reviewer
+    reads to conclude referential integrity is in place.
+    """
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    _ddls, conv = _three_fk_conv()
+    monkeypatch.setattr(engine, "_pregate_orphans", lambda pending, *a, **k: {0: 0, 1: 7, 2: 0})
+    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(engine, "apply_foreign_key", lambda *a, **k: None)
+    events: list[tuple] = []
+    monkeypatch.setattr(
+        engine, "log_activity",
+        lambda category, action, **kw: events.append((category, action, kw)),
+    )
+    applied, skipped, failed = engine.apply_preserved_foreign_keys(
+        {"child": conv}, lambda: _FkProbeConnection(0)
+    )
+    assert (applied, skipped, failed) == (2, 1, 0)
+    outcome = [
+        e for e in events if e[2]["status"] is not engine.ActivityStatus.STARTED
+    ][-1]
+    assert outcome[2]["status"] is engine.ActivityStatus.WARNING, outcome
+    assert "NOT enforced" in outcome[2]["detail"], outcome
+    # Not FAILURE: nothing broke, and the remedy is the operator's.
+    assert outcome[2]["status"] is not engine.ActivityStatus.FAILURE
+
+
+def test_a_pass_stopped_part_way_names_the_unattempted_constraints(monkeypatch) -> None:
+    """Stop mid-pass logged "3 applied, 0 skipped, 0 failed." as a SUCCESS.
+
+    For a 15-FK schema that reads as a completed pass; the un-attempted constraints went
+    only to ``_LOGGER.info``, which is the app stream, not the audit file.
+    """
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    _ddls, conv = _three_fk_conv()
+    monkeypatch.setattr(engine, "_pregate_orphans", lambda pending, *a, **k: {0: 0, 1: 0, 2: 0})
+    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(engine, "apply_foreign_key", lambda *a, **k: None)
+    events: list[tuple] = []
+    monkeypatch.setattr(
+        engine, "log_activity",
+        lambda category, action, **kw: events.append((category, action, kw)),
+    )
+    calls = {"n": 0}
+
+    def _stopped() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 1  # let exactly one FK through, then stop
+
+    engine.apply_preserved_foreign_keys(
+        {"child": conv}, lambda: _FkProbeConnection(0), should_cancel=_stopped
+    )
+    outcome = [
+        e for e in events if e[2]["status"] is not engine.ActivityStatus.STARTED
+    ][-1]
+    assert outcome[2]["status"] is engine.ActivityStatus.WARNING, outcome
+    assert "NOT ATTEMPTED" in outcome[2]["detail"], outcome
+    assert "of 3" in outcome[2]["detail"], outcome
+
+
+def test_an_interrupted_pass_still_left_a_started_line(monkeypatch) -> None:
+    """A pass killed before its roll-up must not be invisible.
+
+    The target can already carry enforced constraints while the audit trail has no
+    evidence the pass ever ran (Fargate task replaced, or an expired IAM token raising
+    inside the loop).
+    """
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    _ddls, conv = _three_fk_conv()
+    monkeypatch.setattr(engine, "_pregate_orphans", lambda pending, *a, **k: {0: 0, 1: 0, 2: 0})
+    events: list[tuple] = []
+    monkeypatch.setattr(
+        engine, "log_activity",
+        lambda category, action, **kw: events.append((category, action, kw)),
+    )
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("token expired")
+
+    monkeypatch.setattr(engine, "apply_foreign_key", _boom)
+    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+
+    def _explode():
+        raise RuntimeError("task replaced")
+
+    with pytest.raises(RuntimeError):
+        engine.apply_preserved_foreign_keys(
+            {"child": conv}, lambda: _FkProbeConnection(0), heartbeat=_explode
+        )
+    started = [e for e in events if e[2]["status"] is engine.ActivityStatus.STARTED]
+    assert len(started) == 1, events
+    assert "3 constraint(s)" in started[0][2]["detail"], started
