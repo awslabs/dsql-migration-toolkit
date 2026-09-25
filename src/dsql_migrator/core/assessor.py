@@ -487,6 +487,14 @@ class ForeignKeyRule(Rule):
         return findings
 
 
+# How many CHECK expressions / view matches one finding spells out before it summarises
+# the rest. A finding is rendered into a UI card, a text report and an HTML report, so an
+# unbounded string is unusable in all three -- but the remainder is always COUNTED, never
+# silently dropped (an invisible truncation would be its own false reassurance).
+_MAX_CHECKS_SHOWN = 6
+_MAX_VIEW_MATCHES_SHOWN = 6
+
+
 class CheckConstraintRule(Rule):
     """Flag tables with a CHECK constraint (not re-emitted by the converter).
 
@@ -504,21 +512,47 @@ class CheckConstraintRule(Rule):
         findings: list[Finding] = []
         for table in inventory.tables:
             if table.check_constraints:
-                names = ", ".join(c.name for c in table.check_constraints)
+                # Show the EXPRESSION, because that is the only thing that answers the
+                # question this finding asks. MySQL auto-names an unnamed CHECK
+                # ``<table>_chk_N``, so from names alone a trivially portable
+                # ``amount > 0`` and an unportable ``json_valid(payload)`` were
+                # indistinguishable -- yet the recommendation asked the operator to judge
+                # "if its expression is Aurora DSQL-compatible" and to size the work.
+                # ``CheckConstraintDef.expression`` is populated by both introspectors and
+                # its own docstring says it is "kept for display so the operator can
+                # re-create the check on the target by hand"; Schema Conversion already
+                # prints it. Bounded like the v0.1.525 fix: the first few in full, the rest
+                # named with a count, since one finding renders into a UI card and two
+                # report formats. Value-free by nature -- a CHECK expression is schema
+                # DDL, not row data.
+                shown = table.check_constraints[:_MAX_CHECKS_SHOWN]
+                rest = table.check_constraints[_MAX_CHECKS_SHOWN:]
+                names = ", ".join(
+                    f"{c.name}: CHECK ({c.expression})" if c.expression else c.name
+                    for c in shown
+                )
+                if rest:
+                    names += (
+                        f", and {len(rest)} more ("
+                        + ", ".join(c.name for c in rest)
+                        + ")"
+                    )
                 findings.append(
                     Finding(
                         object=ObjectKey(KIND_TABLE, table.name),
                         rule_id=self.rule_id,
                         classification=Classification.MANUAL,
                         risk=(
-                            f"CHECK constraint(s) ({names}) are not carried over by the "
-                            "converter, so the source's value rules would be lost on the "
-                            "target."
+                            f"CHECK constraint(s) are not carried over by the converter, "
+                            f"so the source's value rules would be lost on the target -- "
+                            f"{names}."
                         ),
                         recommendation=(
-                            "Re-create the CHECK on the target by hand if its expression "
-                            "is Aurora DSQL-compatible, or enforce the rule in the "
-                            "application layer."
+                            "Re-create each CHECK on the target by hand when its "
+                            "expression above uses only functions and operators Aurora "
+                            "DSQL accepts (a plain comparison usually ports as-is; a "
+                            "MySQL-specific function such as json_valid() does not), or "
+                            "enforce the rule in the application layer."
                         ),
                         effort=EffortLevel.SIMPLE,
                     )
@@ -1155,30 +1189,62 @@ class EnumSetRule(Rule):
     def evaluate(self, inventory: SourceInventory) -> list[Finding]:
         findings: list[Finding] = []
         for table in inventory.tables:
-            columns = [
-                column.name
-                for column in table.columns
-                if _base_type(column.mysql_type) in _ENUM_SET_BASES
-            ]
-            if columns:
-                names = ", ".join(columns)
-                findings.append(
-                    Finding(
-                        object=ObjectKey(KIND_TABLE, table.name),
-                        rule_id=self.rule_id,
-                        classification=Classification.MANUAL,
-                        risk=(
-                            f"Columns ({names}) use MySQL ENUM/SET, for which "
-                            "Aurora DSQL has no native type; the allowed-value "
-                            "constraint is lost when the column is mapped to text."
-                        ),
-                        recommendation=(
-                            "Re-enforce the allowed values in the application "
-                            "layer (or with a CHECK constraint if supported)."
-                        ),
-                        effort=EffortLevel.SIMPLE,
-                    )
+            enums, sets = [], []
+            for column in table.columns:
+                base = _base_type(column.mysql_type)
+                if base not in _ENUM_SET_BASES:
+                    continue
+                (enums if base == "enum" else sets).append(column.name)
+            if not (enums or sets):
+                continue
+            # ENUM and SET are NOT the same problem, and merging them stated a loss the
+            # converter does not have. For an ENUM the converter emits
+            # ``TEXT CHECK (col IN (...))``, so the allowed values ARE preserved -- the
+            # user manual documents exactly that mapping in all three languages and names
+            # ORDERING as the loss. The old text told the operator to "Re-enforce the
+            # allowed values in the application layer" at effort=SIMPLE, i.e. it budgeted
+            # work Schema Conversion had already done, and never mentioned ordering; the
+            # column that genuinely loses its domain (SET, whose multi-value combinations
+            # get no CHECK) was described under the same sentence as the same problem.
+            # The hedge "(or with a CHECK constraint if supported)" also equivocated about
+            # a feature DSQL supports and this tool already relies on.
+            risks, remedies = [], []
+            if enums:
+                risks.append(
+                    f"ENUM column(s) {', '.join(enums)} are mapped to text with a "
+                    "generated CHECK (col IN (...)), so the ALLOWED VALUES are kept; "
+                    "what is lost is ENUM ORDERING -- comparisons and ORDER BY follow "
+                    "text collation, not the declaration order -- and MySQL's empty-string "
+                    "sentinel for an invalid value would now violate that CHECK"
                 )
+                remedies.append(
+                    "For the ENUM column(s), review any comparison or ORDER BY that "
+                    "relied on the declaration order (store an explicit sort key if it "
+                    "matters); no application-side value check is needed."
+                )
+            if sets:
+                risks.append(
+                    f"SET column(s) {', '.join(sets)} are mapped to text as the "
+                    "comma-joined value with NO CHECK, so both the allowed-value set and "
+                    "the multi-value semantics are lost"
+                )
+                remedies.append(
+                    "For the SET column(s), enforce the allowed values and the "
+                    "multi-value semantics in the application (or remodel to a child "
+                    "table or a jsonb array)."
+                )
+            findings.append(
+                Finding(
+                    object=ObjectKey(KIND_TABLE, table.name),
+                    rule_id=self.rule_id,
+                    classification=Classification.MANUAL,
+                    risk=(
+                        "Aurora DSQL has no ENUM or SET type: " + "; ".join(risks) + "."
+                    ),
+                    recommendation=" ".join(remedies),
+                    effort=EffortLevel.SIMPLE,
+                )
+            )
         return findings
 
 
@@ -1429,19 +1495,36 @@ class ViewCompatibilityRule(Rule):
             matches = self._linter.scan(source)  # type: ignore[attr-defined]
             if not matches:
                 continue
-            patterns = sorted({match.pattern.value for match in matches})
+            # The linter already returns the matched TEXT, its line, and a per-match
+            # recommendation. Reporting ``match.pattern.value`` instead handed the
+            # operator internal enum tokens (PESSIMISTIC_LOCK, UNSUPPORTED_FUNCTION) that
+            # appear nowhere in their view and cannot be searched for, and the
+            # recommendation sent them to an "application anti-pattern report" that NO
+            # surface of this tool produces -- not a page, not an export, not a CLI
+            # command (the linter's only caller is this rule). So the one artifact holding
+            # the locations was the thing being pointed at, and it does not exist.
+            located = ", ".join(
+                f"{match.matched_text} (line {match.line})"
+                for match in sorted(matches, key=lambda m: (m.line, m.column))[
+                    :_MAX_VIEW_MATCHES_SHOWN
+                ]
+            )
+            extra = len(matches) - _MAX_VIEW_MATCHES_SHOWN
+            actions = list(dict.fromkeys(match.recommendation for match in matches))
             findings.append(
                 Finding(
                     object=ObjectKey(KIND_VIEW, view.name),
                     rule_id=self.rule_id,
                     classification=Classification.MANUAL,
                     risk=(
-                        "The view definition uses DSQL-unsupported or risky "
-                        f"constructs ({', '.join(patterns)})."
+                        "The view definition uses constructs Aurora DSQL does not "
+                        f"support or that are risky on it: {located}"
+                        + (f", and {extra} more" if extra > 0 else "")
+                        + "."
                     ),
                     recommendation=(
-                        "Rewrite the view to avoid these constructs; see the "
-                        "application anti-pattern report for the exact locations."
+                        "Rewrite the view to avoid them. "
+                        + " ".join(actions[:_MAX_VIEW_MATCHES_SHOWN])
                     ),
                     effort=EffortLevel.MEDIUM,
                 )

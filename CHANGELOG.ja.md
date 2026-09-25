@@ -5,6 +5,14 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.527
+
+### 修正
+
+- **MySQL の ENUM 列が許容値を失うと報告していましたが、本ツール自身のマニュアルはそうではないと述べています。** finding は *"the allowed-value constraint is lost when the column is mapped to text"* と述べ、*"Re-enforce the allowed values in the application layer"* を SIMPLE の工数で指示していました。しかしコンバーターは `"status" TEXT CHECK ("status" IN ('new','paid','shipped'))` を**無条件に**出力し、ユーザーマニュアルは 3 言語すべてでまさにそのマッピングを文書化しつつ、失われるのは **ordering** だと明記しています(`06-limitations.md` は生成される ENUM の `CHECK` が実際に保持される制約だとわざわざ述べています)。つまり Evaluation は Schema Conversion が既に行った作業をアプリ側の工数として見積もらせ、実際の損失には触れず、本当にドメインを失う SET(多値がカンマ連結の text になり `CHECK` が無い)を同じ文の下で同じ問題として記述していました。現在は ENUM と SET を分離します: ENUM の節は値が保持され、壊れるのは ordering と MySQL の空文字列による無効値センチネルであることを述べ、SET の節は `CHECK` の欠如と多値セマンティクスの損失を述べ、アプリ側での強制は SET にのみ求めます。*"(or with a CHECK constraint if supported)"* という保留表現も削除しました — DSQL は `CHECK` をサポートし、ツールは既にそれに依存しています。
+- **CHECK 制約の finding が、見せもしない式を判断せよと要求していました。** 名前だけを列挙していましたが、MySQL は名前の無い `CHECK` を `<table>_chk_N` と自動命名するため、容易に移植できる `amount > 0` と移植不能な `json_valid(payload)` が区別できませんでした — にもかかわらず推奨文は「式が Aurora DSQL と互換か」を判断し工数を見積もれと述べていました。`CheckConstraintDef.expression` は両方の introspector が埋め、その docstring は表示用に保持すると述べ、Schema Conversion は既に出力しています。現在は各制約を `name: CHECK (expression)` で描画し、6 件までを詳述して残りは名前と件数で要約し、助言に移植可能／不可能な例を併記します。
+- **ビューのリンティング finding が内部の enum トークンを出力し、存在しないレポートへ誘導していました。** risk は `PESSIMISTIC_LOCK` / `UNSUPPORTED_FUNCTION` を示していましたが — オペレーターのビュー本文には存在せず検索もできない文字列です — 推奨文は *"see the application anti-pattern report for the exact locations"* と述べていました。しかしリンターの唯一の呼び出し元はこのルールであり、そのようなレポートを生成するページ・エクスポート・CLI コマンド・文書化された手順は**存在しません**。現在はオペレーター自身のマッチテキストと行番号を示し(`SLEEP (line 1)`、`FOR UPDATE (line 1)`)、計算されながら破棄されていたリンターのマッチ別推奨を併せて伝えます。
+
 ## v0.1.526
 
 ### 修正

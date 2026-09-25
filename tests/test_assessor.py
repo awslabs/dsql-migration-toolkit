@@ -1795,3 +1795,177 @@ def test_the_index_limit_finding_states_the_outcome_that_actually_happens() -> N
     assert "The excess index fails with error 54000" not in item.risk, item.risk
     # The real consequence is a silently under-indexed target.
     assert "fall back to scans" in item.risk, item.risk
+
+
+def test_enum_and_set_are_not_described_as_the_same_loss() -> None:
+    """The finding claimed a loss the converter does not have — and the manual says so.
+
+    For an ENUM the converter emits ``TEXT CHECK (col IN (...))``, which the user manual
+    documents in all three languages while naming ORDERING as the loss. The old text told
+    the operator to re-enforce the allowed values in the application at effort=SIMPLE, i.e.
+    it budgeted work Schema Conversion had already done, and never mentioned ordering;
+    meanwhile SET, which genuinely loses its domain, was described as the same problem.
+    """
+    from dsql_migrator.core.assessor import EnumSetRule
+    from dsql_migrator.core.converter import SchemaConverter
+    from dsql_migrator.core.models import SourceInventory, SourceType, TableDef
+
+    table = TableDef(
+        name="shop.orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint"),
+            ColumnDef(name="status", mysql_type="enum('new','paid','shipped')"),
+            ColumnDef(name="flags", mysql_type="set('a','b')"),
+        ],
+        primary_key=["id"],
+    )
+    f = EnumSetRule().evaluate(SourceInventory(tables=[table]))[0]
+
+    # Ground truth: the CHECK really is emitted for the ENUM and not for the SET.
+    conv = SchemaConverter(source_type=SourceType.MYSQL).convert_table(table)
+    assert 'CHECK ("status" IN' in conv.target_ddl, conv.target_ddl
+    assert 'CHECK ("flags" IN' not in conv.target_ddl, conv.target_ddl
+
+    # ENUM: values kept, ordering lost.
+    assert "ALLOWED VALUES are kept" in f.risk, f.risk
+    assert "ORDERING" in f.risk, f.risk
+    assert "status" in f.risk.split("SET column(s)")[0], "ENUM grouped separately"
+    # SET: the real problem, stated as its own.
+    assert "flags" in f.risk.split("SET column(s)")[1], f.risk
+    assert "NO CHECK" in f.risk, f.risk
+    assert "multi-value semantics are lost" in f.risk, f.risk
+    # The remedy must not ask for application-side value checks the tool already made.
+    assert "no application-side value check is needed" in f.recommendation, f.recommendation
+    # And the hedge about a feature DSQL supports is gone.
+    assert "if supported" not in f.recommendation, f.recommendation
+
+
+def test_an_enum_only_table_is_not_told_its_values_were_lost() -> None:
+    # The common case, where the whole old sentence was wrong with nothing to qualify it.
+    from dsql_migrator.core.assessor import EnumSetRule
+    from dsql_migrator.core.models import SourceInventory, TableDef
+
+    table = TableDef(
+        name="shop.orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint"),
+            ColumnDef(name="status", mysql_type="enum('new','paid')"),
+        ],
+        primary_key=["id"],
+    )
+    f = EnumSetRule().evaluate(SourceInventory(tables=[table]))[0]
+    assert "ALLOWED VALUES are kept" in f.risk, f.risk
+    assert "SET column(s)" not in f.risk, f.risk
+    assert "NO CHECK" not in f.risk, f.risk
+
+
+def test_the_check_finding_shows_the_expression_it_asks_you_to_judge() -> None:
+    """MySQL auto-names an unnamed CHECK, so names alone cannot be judged.
+
+    The recommendation asks the operator to decide "if its expression is Aurora
+    DSQL-compatible" — impossible from ``orders_chk_1`` / ``orders_chk_2``, while the
+    expression is populated and Schema Conversion already prints it.
+    """
+    from dsql_migrator.core.assessor import CheckConstraintRule
+    from dsql_migrator.core.models import (
+        CheckConstraintDef,
+        SourceInventory,
+        TableDef,
+    )
+
+    table = TableDef(
+        name="shop.orders",
+        columns=[ColumnDef(name="id", mysql_type="bigint")],
+        primary_key=["id"],
+        check_constraints=[
+            CheckConstraintDef(name="orders_chk_1", expression="(amount > 0)"),
+            CheckConstraintDef(name="orders_chk_2", expression="json_valid(payload)"),
+        ],
+    )
+    f = CheckConstraintRule().evaluate(SourceInventory(tables=[table]))[0]
+    assert "orders_chk_1: CHECK ((amount > 0))" in f.risk, f.risk
+    assert "orders_chk_2: CHECK (json_valid(payload))" in f.risk, f.risk
+    # The advice now tells them HOW to judge, with a portable and a non-portable example.
+    assert "json_valid()" in f.recommendation, f.recommendation
+
+
+def test_a_check_with_no_recorded_expression_still_renders_its_name() -> None:
+    # Older persisted inventories and the best-effort reflection path can carry no
+    # expression; that must degrade to the name, not to an empty "CHECK ()".
+    from dsql_migrator.core.assessor import CheckConstraintRule
+    from dsql_migrator.core.models import (
+        CheckConstraintDef,
+        SourceInventory,
+        TableDef,
+    )
+
+    table = TableDef(
+        name="shop.orders",
+        columns=[ColumnDef(name="id", mysql_type="bigint")],
+        primary_key=["id"],
+        check_constraints=[CheckConstraintDef(name="orders_chk_1", expression="")],
+    )
+    f = CheckConstraintRule().evaluate(SourceInventory(tables=[table]))[0]
+    assert "orders_chk_1" in f.risk
+    assert "CHECK ()" not in f.risk, f.risk
+
+
+def test_many_checks_are_bounded_but_the_remainder_is_counted() -> None:
+    from dsql_migrator.core.assessor import _MAX_CHECKS_SHOWN, CheckConstraintRule
+    from dsql_migrator.core.models import (
+        CheckConstraintDef,
+        SourceInventory,
+        TableDef,
+    )
+
+    table = TableDef(
+        name="shop.wide",
+        columns=[ColumnDef(name="id", mysql_type="bigint")],
+        primary_key=["id"],
+        check_constraints=[
+            CheckConstraintDef(name=f"chk_{i}", expression=f"(c{i} > 0)")
+            for i in range(20)
+        ],
+    )
+    f = CheckConstraintRule().evaluate(SourceInventory(tables=[table]))[0]
+    assert f.risk.count("CHECK (") == _MAX_CHECKS_SHOWN, f.risk
+    assert f"and {20 - _MAX_CHECKS_SHOWN} more" in f.risk, f.risk
+    assert "chk_19" in f.risk, "the summarised remainder is still named"
+
+
+def test_the_view_finding_names_the_real_constructs_not_internal_tokens() -> None:
+    """It printed enum tokens and pointed at a report this tool never produces.
+
+    PESSIMISTIC_LOCK / UNSUPPORTED_FUNCTION appear nowhere in the operator's view text, so
+    they cannot even be searched for — and the linter's only caller is this rule, so the
+    "application anti-pattern report" holding "the exact locations" does not exist.
+    """
+    from dsql_migrator.core.assessor import ViewCompatibilityRule
+    from dsql_migrator.core.models import SourceInventory, TableDef, ViewDef
+
+    inventory = SourceInventory(
+        tables=[
+            TableDef(
+                name="shop.orders",
+                columns=[ColumnDef(name="id", mysql_type="bigint")],
+                primary_key=["id"],
+            )
+        ],
+        views=[
+            ViewDef(
+                name="shop.v_orders",
+                definition="SELECT id, SLEEP(1) AS s FROM orders FOR UPDATE",
+            )
+        ],
+    )
+    f = ViewCompatibilityRule().evaluate(inventory)[0]
+    # The operator's OWN text, with a location.
+    assert "SLEEP (line 1)" in f.risk, f.risk
+    assert "FOR UPDATE (line 1)" in f.risk, f.risk
+    # Internal enum tokens are gone.
+    assert "PESSIMISTIC_LOCK" not in f.risk, f.risk
+    assert "UNSUPPORTED_FUNCTION" not in f.risk, f.risk
+    # The dead pointer is gone, replaced by the linter's own per-match advice.
+    assert "anti-pattern report" not in f.recommendation, f.recommendation
+    assert "optimistic concurrency" in f.recommendation.lower(), f.recommendation
+    assert "no direct Aurora DSQL" in f.recommendation, f.recommendation
