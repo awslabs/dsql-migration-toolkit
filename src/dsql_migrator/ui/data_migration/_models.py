@@ -1080,6 +1080,9 @@ _PREREQ_CATEGORY_BY_CHECK: dict[PrerequisiteCheckId, PrereqCategory] = {
     # Per-table, on the target and the source respectively -- the fallback already put
     # these two here, but only by accident; stated so the map is exhaustive.
     PrerequisiteCheckId.TARGET_COLUMNS_LOADABLE: PrereqCategory.SCHEMA_TABLES,
+    # A per-table, per-column data fact, so it belongs beside the other table rows rather
+    # than with the server settings.
+    PrerequisiteCheckId.SOURCE_VALUE_SIZE: PrereqCategory.SCHEMA_TABLES,
     PrerequisiteCheckId.REPLICA_IDENTITY: PrereqCategory.SCHEMA_TABLES,
     PrerequisiteCheckId.REPLICA_IDENTITY_COVERS_KEY: PrereqCategory.SCHEMA_TABLES,
     PrerequisiteCheckId.MSK_AVAILABLE: PrereqCategory.STREAMING,

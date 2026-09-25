@@ -85,6 +85,27 @@ class SourceProbe(Protocol):
         source in CDC mode (MySQL uses the binlog/GTID variable checks instead).
         """
 
+    def oversized_values(
+        self,
+        table_name: str,
+        columns: "Sequence[str]",
+        *,
+        limit_bytes: int,
+        timeout_seconds: float,
+    ) -> "Optional[dict[str, bool]]":
+        """Whether any value in each column EXCEEDS ``limit_bytes``. Read-only.
+
+        Returns ``{column: True/False}``, or ``None`` when the answer could not be
+        established (the probe is absent, the read failed, or it hit
+        ``timeout_seconds``) -- which the check reports as "not determined" rather
+        than as a pass, because a silent pass here is exactly the false reassurance
+        the check exists to remove.
+
+        OPTIONAL on the protocol: :class:`PrerequisiteChecker` calls it through
+        ``getattr`` so a probe that predates it (and every existing test fake)
+        simply yields "not determined".
+        """
+
 
 class TargetProbe(Protocol):
     """Read-only access to the target Aurora DSQL used by prerequisite checks."""
@@ -470,6 +491,97 @@ def check_target_columns_loadable(
     )
 
 
+# Aurora DSQL's documented per-value ceiling for a non-index column. Quoted, not
+# probed: a probe once appeared to store 9.5 MiB of text because TOAST compressed it,
+# and a measurement must never overrule a documented quota.
+DSQL_MAX_VALUE_BYTES = 1024 * 1024
+
+# How long the oversized-value probe may run per table before it gives up. The probe
+# stops at the FIRST offending row, so a table that HAS one answers fast; proving the
+# ABSENCE of one is a full pass over the column, which on a very large table is exactly
+# the source scan this project avoids. Timing out yields "not determined", never a pass.
+VALUE_SIZE_PROBE_TIMEOUT_SECONDS = 15.0
+
+
+def check_source_value_size(
+    table: TableDef,
+    columns: "Sequence[str]",
+    oversized: "Optional[Mapping[str, bool]]",
+) -> "Optional[PrerequisiteResult]":
+    """Grade whether a LOB column already holds a value DSQL cannot store. Pure.
+
+    ``None`` when the table has no LOB column to ask about, so a schema of ordinary
+    columns adds no row to the report.
+
+    NON-blocking by design (``required=False``): an oversized value is a decision the
+    operator owns -- accept that the row is quarantined, shrink the value, move the
+    content to S3 and store a reference, or exclude the column on Data Migration -- and
+    the tool must not refuse to start a migration over it. What it must not do is stay
+    silent, which is what it did: the Evaluation finding said "check the largest value in
+    each column" and nothing in the tool could.
+
+    ``oversized`` is ``{column: exceeded}`` from the probe, or ``None`` when the answer
+    could not be established. "Not determined" is reported as such (INFO), never as a
+    pass -- an unverifiable ceiling presented as verified is the defect, not the fix.
+    """
+    if not columns:
+        return None
+    title = "No value exceeds the Aurora DSQL 1 MiB per-value limit"
+    listed = ", ".join(f"`{name}`" for name in columns)
+    if oversized is None:
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.SOURCE_VALUE_SIZE,
+            title=title,
+            status=PrerequisiteStatus.INFO,
+            required=False,
+            target=table.name,
+            detail=(
+                f"Not determined for {listed}. Proving that no value exceeds the limit "
+                "needs a full pass over the column, which was not completed (the read "
+                "failed or timed out)."
+            ),
+            remediation=(
+                "Optional: check the largest value yourself (PostgreSQL "
+                "`SELECT max(octet_length(col)) FROM table`, MySQL "
+                "`SELECT MAX(OCTET_LENGTH(col)) FROM table`). An oversized value is "
+                "quarantined during Full Load and dead-lettered during CDC, and "
+                "reloading cannot fix it."
+            ),
+        )
+    exceeded = [name for name in columns if oversized.get(name)]
+    if not exceeded:
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.SOURCE_VALUE_SIZE,
+            title=title,
+            status=PrerequisiteStatus.PASS,
+            required=False,
+            target=table.name,
+            detail=f"No value in {listed} exceeds 1 MiB.",
+            remediation="",
+        )
+    hit = ", ".join(f"`{name}`" for name in exceeded)
+    return PrerequisiteResult(
+        check_id=PrerequisiteCheckId.SOURCE_VALUE_SIZE,
+        title=title,
+        status=PrerequisiteStatus.WARN,
+        required=False,
+        target=table.name,
+        detail=(
+            f"{hit} already holds at least one value over 1 MiB. Those rows CANNOT be "
+            "stored on Aurora DSQL: each is quarantined during Full Load (or "
+            "dead-lettered during CDC) and reloading cannot fix it."
+        ),
+        remediation=(
+            "Decide before loading: move the content to external storage (e.g. Amazon "
+            "S3) and store a reference, shrink the value, or exclude the column on the "
+            "Data Migration step so the rest of the row migrates. Proceeding as-is "
+            "loads every other row and quarantines these. Note the limit applies to the "
+            "COMPRESSED size for text/json, so a highly compressible value may still "
+            "fit -- this probe measures the uncompressed byte length, an upper bound."
+        ),
+    )
+
+
 def _on(value: Optional[str]) -> bool:
     """Return True when a MySQL variable value means 'on' (case-insensitive)."""
     return (value or "").strip().upper() in {"ON", "1"}
@@ -739,12 +851,40 @@ class PrerequisiteChecker:
         self._target = target_probe
         self._msk = msk_probe
 
+    def _probe_oversized_values(
+        self, table_name: str, columns: "Sequence[str]"
+    ) -> "Optional[dict[str, bool]]":
+        """Ask the source whether any value exceeds the limit, or ``None`` if it cannot.
+
+        ``oversized_values`` is OPTIONAL on :class:`SourceProbe` -- resolved through
+        ``getattr`` so every probe written before it (and every existing test fake) keeps
+        working and simply yields "not determined". Any failure is swallowed to ``None``
+        for the same reason: this check is advisory and must never break the gate, and
+        ``None`` is reported honestly as not-determined rather than as a pass.
+        """
+        probe = getattr(self._source, "oversized_values", None)
+        if not callable(probe):
+            return None
+        try:
+            answer = probe(
+                table_name,
+                list(columns),
+                limit_bytes=DSQL_MAX_VALUE_BYTES,
+                timeout_seconds=VALUE_SIZE_PROBE_TIMEOUT_SECONDS,
+            )
+        except Exception:  # noqa: BLE001 - advisory read; never break the gate
+            return None
+        if not isinstance(answer, Mapping):
+            return None
+        return {str(k): bool(v) for k, v in answer.items()}
+
     def check(
         self,
         request: PrerequisiteCheckRequest,
         *,
         tables: Sequence[TableDef],
         excluded_columns: Optional[Mapping[str, Iterable[str]]] = None,
+        lob_columns: Optional[Mapping[str, Sequence[str]]] = None,
     ) -> PrerequisiteReport:
         """Run all checks for ``request.mode`` over the resolved ``tables``.
 
@@ -763,9 +903,14 @@ class PrerequisiteChecker:
         filled) instead of passing here and failing every batch mid-load. A PK is
         never excluded (the filter guards), so ``check_table_primary_key`` is
         unaffected. Empty/omitted => no filtering (the common case).
+
+        ``lob_columns`` (optional, table name -> column names) are the oversized-LOB
+        candidates to ask the per-value size question about. Supplied by the caller
+        because the helper that identifies them lives in the UI layer; omitted => the
+        size check is not run at all (no row in the report).
         """
         exclusions = excluded_columns or {}
-        results: list[PrerequisiteResult] = []
+        results: list[Optional[PrerequisiteResult]] = []
 
         # Source-side checks
         results.append(check_source_reachable(self._source.reachable()))
@@ -793,8 +938,35 @@ class PrerequisiteChecker:
             table.name: apply_lob_exclusions(table, exclusions.get(table.name))
             for table in tables
         }
+        # The at-risk LOB columns are supplied BY THE CALLER, from the same helper that
+        # drives the oversized-LOB finding and the exclusion picker, so the three surfaces
+        # cannot disagree about which columns are at risk. Passed in rather than derived
+        # here because that helper lives in the UI layer and ``core`` must not import it
+        # (the dependency is deliberately one-way) -- the same reason ``excluded_columns``
+        # is a parameter. Omitted => the size question is simply not asked.
+        lob_by_table = {
+            name: tuple(cols) for name, cols in (lob_columns or {}).items()
+        }
+
         for table in tables:
             results.append(check_table_primary_key(effective[table.name]))
+            # Ask only about columns that SURVIVE the exclusion: a column the operator
+            # already excluded is not going to be written, so warning about its size
+            # would be noise -- and it is the remedy this very check recommends.
+            already_excluded = set(exclusions.get(table.name) or ())
+            lob_columns = tuple(
+                name
+                for name in lob_by_table.get(table.name, ())
+                if name not in already_excluded
+            )
+            if lob_columns:
+                results.append(
+                    check_source_value_size(
+                        table,
+                        lob_columns,
+                        self._probe_oversized_values(table.name, lob_columns),
+                    )
+                )
 
         # Target-side checks
         results.append(check_target_dsql_reachable(self._target.reachable()))
@@ -950,7 +1122,11 @@ class PrerequisiteChecker:
                 )
             )
 
-        return PrerequisiteReport.build(request.mode, results)
+        # check_source_value_size returns None for a table with no LOB column, so a
+        # schema of ordinary columns adds no row at all.
+        return PrerequisiteReport.build(
+            request.mode, [r for r in results if r is not None]
+        )
 
 
 __all__ = [

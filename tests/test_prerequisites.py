@@ -2233,3 +2233,190 @@ def test_the_request_accepts_the_rekey_map_at_all() -> None:
     assert req.message_key_columns == {"app.orders": ["user_id", "id"]}
     # Default is empty, so every existing caller keeps its current behaviour.
     assert PrerequisiteCheckRequest(mode=MigrationMode.CDC).message_key_columns == {}
+
+
+# ---------------------------------------------------------------------------
+# "Check the largest value in each column" -- now the tool can
+# ---------------------------------------------------------------------------
+
+
+def _media_table(name: str = "ecommerce.product_media") -> TableDef:
+    return TableDef(
+        name=name,
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint"),
+            ColumnDef(name="content", mysql_type="bytea"),
+            ColumnDef(name="notes", mysql_type="text"),
+        ],
+        primary_key=["id"],
+    )
+
+
+def test_a_table_with_no_lob_column_adds_no_row() -> None:
+    from dsql_migrator.core.prerequisites import check_source_value_size
+
+    assert check_source_value_size(_media_table(), (), {}) is None
+
+
+def test_an_oversized_value_is_reported_as_already_present() -> None:
+    """The finding said "check the largest value in each column" and nothing could.
+
+    So the one concrete fact behind an oversized-LOB warning -- will it actually bite? --
+    was learned only when Full Load quarantined the row.
+    """
+    from dsql_migrator.core.prerequisites import check_source_value_size
+
+    r = check_source_value_size(
+        _media_table(), ("content", "notes"), {"content": True, "notes": False}
+    )
+    assert r is not None
+    assert r.status is PrerequisiteStatus.WARN
+    # NEVER blocking: an oversized value is the operator's decision, not a stop.
+    assert r.required is False
+    assert "`content`" in r.detail and "`notes`" not in r.detail, r.detail
+    assert "CANNOT be stored" in r.detail, r.detail
+    assert "reloading cannot fix it" in r.detail, r.detail
+    # The remedies, including the one the tool itself offers.
+    assert "exclude the column on the Data Migration step" in r.remediation
+    assert "Amazon S3" in r.remediation
+    # Honest about what was measured: an upper bound, because DSQL's limit is on the
+    # COMPRESSED size for text/json.
+    assert "uncompressed" in r.remediation, r.remediation
+
+
+def test_no_oversized_value_passes_without_alarming() -> None:
+    from dsql_migrator.core.prerequisites import check_source_value_size
+
+    r = check_source_value_size(
+        _media_table(), ("content",), {"content": False}
+    )
+    assert r is not None
+    assert r.status is PrerequisiteStatus.PASS
+    assert r.required is False
+    assert "No value" in r.detail
+
+
+def test_an_undetermined_probe_is_never_reported_as_a_pass() -> None:
+    """An unverifiable ceiling shown as verified is the defect, not the fix.
+
+    Proving the ABSENCE of an oversized value needs a full pass over the column, which is
+    exactly the source scan this project avoids -- so the probe is allowed to time out, and
+    a timeout must read as "not determined".
+    """
+    from dsql_migrator.core.prerequisites import check_source_value_size
+
+    r = check_source_value_size(_media_table(), ("content",), None)
+    assert r is not None
+    assert r.status is PrerequisiteStatus.INFO, r.status
+    assert r.required is False
+    assert "Not determined" in r.detail, r.detail
+    assert "timed out" in r.detail, r.detail
+    # Gives the operator the query, so "check it yourself" is actionable.
+    assert "octet_length" in r.remediation, r.remediation
+
+
+def test_the_checker_asks_only_about_columns_the_caller_named() -> None:
+    """The at-risk columns come from the ONE helper that drives the finding and the picker.
+
+    Core cannot import it (it lives in the UI layer), so it is a parameter -- and omitting
+    it must mean the question is simply not asked, never that it silently passed.
+    """
+    from dsql_migrator.core.models import PrerequisiteCheckId
+
+    table = _media_table()
+    asked: list[tuple] = []
+
+    class _Probe(_FakeSource):
+        def oversized_values(self, table_name, columns, *, limit_bytes, timeout_seconds):
+            asked.append((table_name, tuple(columns), limit_bytes))
+            return {"content": True}
+
+    checker = PrerequisiteChecker(source_probe=_Probe(), target_probe=_FakeTarget())
+    # Not supplied -> no size row at all.
+    report = checker.check(PrerequisiteCheckRequest(mode=MigrationMode.FULL_LOAD, tables=[table.name]), tables=[table])
+    assert not [
+        r for r in report.results
+        if r.check_id is PrerequisiteCheckId.SOURCE_VALUE_SIZE
+    ]
+    assert asked == []
+
+    # Supplied -> exactly those columns, with DSQL's documented limit.
+    report = checker.check(
+        PrerequisiteCheckRequest(mode=MigrationMode.FULL_LOAD, tables=[table.name]),
+        tables=[table],
+        lob_columns={table.name: ("content", "notes")},
+    )
+    rows = [
+        r for r in report.results
+        if r.check_id is PrerequisiteCheckId.SOURCE_VALUE_SIZE
+    ]
+    assert len(rows) == 1 and rows[0].status is PrerequisiteStatus.WARN
+    assert asked == [(table.name, ("content", "notes"), 1024 * 1024)]
+
+
+def test_an_already_excluded_column_is_not_asked_about() -> None:
+    # Excluding the column IS the remedy this check recommends, so warning about its size
+    # afterwards is noise.
+    table = _media_table()
+    asked: list[tuple] = []
+
+    class _Probe(_FakeSource):
+        def oversized_values(self, table_name, columns, *, limit_bytes, timeout_seconds):
+            asked.append(tuple(columns))
+            return {name: False for name in columns}
+
+    checker = PrerequisiteChecker(source_probe=_Probe(), target_probe=_FakeTarget())
+    checker.check(
+        PrerequisiteCheckRequest(mode=MigrationMode.FULL_LOAD, tables=[table.name]),
+        tables=[table],
+        lob_columns={table.name: ("content", "notes")},
+        excluded_columns={table.name: ["content"]},
+    )
+    assert asked == [("notes",)]
+
+
+def test_a_probe_that_raises_degrades_to_not_determined() -> None:
+    """Advisory: this must never break the gate, and must never fake a pass."""
+    from dsql_migrator.core.models import PrerequisiteCheckId
+
+    table = _media_table()
+
+    class _Probe(_FakeSource):
+        def oversized_values(self, *_a, **_k):
+            raise RuntimeError("read timed out")
+
+    checker = PrerequisiteChecker(source_probe=_Probe(), target_probe=_FakeTarget())
+    report = checker.check(
+        PrerequisiteCheckRequest(mode=MigrationMode.FULL_LOAD, tables=[table.name]), tables=[table], lob_columns={table.name: ("content",)}
+    )
+    row = next(
+        r for r in report.results
+        if r.check_id is PrerequisiteCheckId.SOURCE_VALUE_SIZE
+    )
+    assert row.status is PrerequisiteStatus.INFO
+    # Advisory: it can never be the reason the gate closes (other stub-driven checks in
+    # this synthetic report may fail; this row must not be among the blockers).
+    assert row.required is False
+    assert not [
+        r for r in report.results
+        if r.required and r.status is PrerequisiteStatus.FAIL
+        and r.check_id is PrerequisiteCheckId.SOURCE_VALUE_SIZE
+    ]
+
+
+def test_a_probe_without_the_method_still_works() -> None:
+    # Every probe written before this check (and every existing test fake) must keep
+    # working -- the method is resolved through getattr for exactly that reason.
+    from dsql_migrator.core.models import PrerequisiteCheckId
+
+    table = _media_table()
+    checker = PrerequisiteChecker(source_probe=_FakeSource(), target_probe=_FakeTarget())
+    report = checker.check(
+        PrerequisiteCheckRequest(mode=MigrationMode.FULL_LOAD, tables=[table.name]), tables=[table], lob_columns={table.name: ("content",)}
+    )
+    row = next(
+        r for r in report.results
+        if r.check_id is PrerequisiteCheckId.SOURCE_VALUE_SIZE
+    )
+    assert row.status is PrerequisiteStatus.INFO
+    assert row.required is False

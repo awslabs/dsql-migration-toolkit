@@ -40,6 +40,7 @@ from dsql_migrator.core.aws_session import BotoSessionLike, build_session
 from dsql_migrator.core.models import (
     ConnectionResult,
     SourceConnectionConfig,
+    SourceType,
     TargetConnectionConfig,
 )
 from dsql_migrator.core.prerequisites import PrerequisiteChecker
@@ -109,6 +110,102 @@ class SessionSourceProbe:
                 return dialect.probe_grants(connection)
         except Exception:  # noqa: BLE001 - treated as "no grants visible"
             return []
+
+    def oversized_values(
+        self,
+        table_name: str,
+        columns: "Sequence[str]",
+        *,
+        limit_bytes: int,
+        timeout_seconds: float,
+    ) -> "Optional[dict[str, bool]]":
+        """Whether any value in each column exceeds ``limit_bytes``. Read-only.
+
+        Answers the one question the oversized-LOB finding tells the operator to check and
+        that nothing in the tool could answer: does a value ALREADY exceed Aurora DSQL's
+        per-value limit, so rows will be quarantined?
+
+        Bounded three ways, because this is the only prerequisite that reads row DATA:
+        * ``EXISTS (SELECT 1 ... WHERE octet_length(col) > :limit)`` -- the engine may stop
+          at the FIRST offending row, so a table that HAS one answers immediately.
+        * a per-statement timeout, so proving the ABSENCE of an offender on a very large
+          table cannot stall the gate; a timeout returns ``None`` ("not determined"),
+          never a pass.
+        * one statement per column, so a failure on one column does not lose the others.
+
+        Measures the UNCOMPRESSED byte length, which is an upper bound: DSQL's limit
+        applies to the compressed size for text/json, so a highly compressible value may
+        still fit. Over-reporting in that direction is the safe side, and the check's
+        remediation says so.
+
+        Returns ``None`` when nothing could be established at all (no engine, every
+        statement failed), so the check reports not-determined rather than a false pass.
+        """
+        from sqlalchemy import bindparam
+
+        if not columns:
+            return {}
+        # Identifiers cannot be bind parameters; the names come from the tool's own
+        # introspected inventory (never from user text), and are quoted for the engine.
+        is_postgres = self._config.source_type is SourceType.POSTGRES
+        length_fn = "octet_length" if is_postgres else "OCTET_LENGTH"
+        if is_postgres:
+            schema, _, obj = table_name.partition(".")
+            qualified = (
+                f'"{schema}"."{obj}"' if obj else f'"{table_name}"'
+            )
+            quote = lambda name: f'"{name}"'  # noqa: E731
+        else:
+            schema, _, obj = table_name.partition(".")
+            qualified = f"`{schema}`.`{obj}`" if obj else f"`{table_name}`"
+            quote = lambda name: f"`{name}`"  # noqa: E731
+
+        answer: dict[str, bool] = {}
+        try:
+            engine = self._engine_factory(self._config)
+        except Exception:  # noqa: BLE001 - advisory read
+            return None
+        try:
+            with engine.connect() as connection:
+                self._apply_statement_timeout(connection, timeout_seconds, is_postgres)
+                for name in columns:
+                    statement = text(
+                        "SELECT EXISTS (SELECT 1 FROM "
+                        + qualified
+                        + f" WHERE {length_fn}({quote(name)}) > :limit)"
+                    ).bindparams(bindparam("limit", limit_bytes))
+                    try:
+                        row = connection.execute(statement).first()
+                    except Exception:  # noqa: BLE001 - one column's failure only
+                        continue
+                    if row is not None:
+                        answer[name] = bool(row[0])
+        except Exception:  # noqa: BLE001 - advisory read; never break the gate
+            return answer or None
+        return answer or None
+
+    @staticmethod
+    def _apply_statement_timeout(
+        connection: object, timeout_seconds: float, is_postgres: bool
+    ) -> None:
+        """Cap how long one size probe may run. Best-effort; a failure is not fatal.
+
+        Without it, proving that a very large table holds NO oversized value is an
+        unbounded sequential scan on the customer's production source -- exactly the scan
+        this project avoids. The timeout turns that into an honest "not determined".
+        """
+        millis = max(1, int(timeout_seconds * 1000))
+        try:
+            if is_postgres:
+                connection.execute(text(f"SET LOCAL statement_timeout = {millis}"))  # type: ignore[attr-defined]
+            else:
+                # MySQL's optimizer hint unit is milliseconds too, but the session
+                # variable is the portable form across 5.7/8.x.
+                connection.execute(  # type: ignore[attr-defined]
+                    text(f"SET SESSION MAX_EXECUTION_TIME = {millis}")
+                )
+        except Exception:  # noqa: BLE001 - best effort; the probe still runs
+            pass
 
     def variables(self) -> dict[str, str]:
         """Return the CDC-relevant source variables (empty on error).

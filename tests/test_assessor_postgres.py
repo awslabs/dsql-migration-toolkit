@@ -874,3 +874,27 @@ def test_a_very_wide_table_cannot_produce_an_unbounded_message() -> None:
     assert f.recommendation.count("Aurora DSQL does not support") == _MAX_DETAILED_COLUMNS
     assert f"{40 - _MAX_DETAILED_COLUMNS} more column(s)" in f.recommendation
     assert "c39" in f.recommendation, "the summarised columns are still named"
+
+
+def test_the_oversized_lob_finding_points_at_the_check_that_answers_it() -> None:
+    """It used to say "Check the largest value in each column" with no way to do so.
+
+    Nothing in the tool could measure a value's size -- pg_column_size / octet_length
+    appear nowhere -- so the finding's own instruction was homework. It now names the
+    prerequisite check that probes it.
+    """
+    from dsql_migrator.core.assessor_postgres import PgOversizedLobRule
+
+    table = TableDef(
+        name="ecommerce.product_media",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint"),
+            ColumnDef(name="content", mysql_type="bytea"),
+        ],
+        primary_key=["id"],
+    )
+    findings = PgOversizedLobRule().evaluate(SourceInventory(tables=[table]))
+    assert findings, "the oversized-LOB rule no longer fires for a bytea column"
+    joined = " ".join(f.recommendation for f in findings)
+    assert "prerequisite checks" in joined, joined
+    assert "ALREADY exceeds 1 MiB" in joined, joined

@@ -808,11 +808,28 @@ def build_data_migration_screen(
                 # written: an excluded NOT NULL/no-default target column FAILs
                 # loadability here instead of failing every batch mid-load.
                 _prereq_exclusions = migration_state.lob_exclusions()
+                # The oversized-LOB columns to ask the per-value SIZE question about.
+                # Derived here, from the same helper that drives the Evaluation finding
+                # and the exclusion picker, because it lives in this UI layer and the
+                # core gate must not import it. Without this the size check does not run
+                # at all -- and until it existed, the finding's own instruction ("check
+                # the largest value in each column") had no tool support anywhere.
+                _prereq_lob_columns = {
+                    candidate.table: tuple(candidate.columns)
+                    for candidate in (
+                        lob_exclusion_candidates(
+                            SourceInventory(tables=list(tables)),
+                            source_type=session_source_type(session),
+                        )
+                        or ()
+                    )
+                }
                 report = await run.io_bound(
                     lambda: checker.check(
                         request,
                         tables=tables,
                         excluded_columns=_prereq_exclusions,
+                        lob_columns=_prereq_lob_columns,
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - surface as inline feedback

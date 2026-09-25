@@ -318,7 +318,8 @@ class PgOversizedLobRule(Rule):
                             "dead-lettered during CDC, and reloading cannot fix it."
                         ),
                         recommendation=(
-                            "Check the largest value in each column. If any exceeds 1 MiB, "
+                            "Run the Data Migration prerequisite checks: they probe each column and "
+                            "report whether a value ALREADY exceeds 1 MiB. If one does, "
                             "move that content to external storage (e.g. Amazon S3) and "
                             "store a reference instead, or exclude the column on the Data "
                             "Migration step. For json/jsonb and text the limit applies to "

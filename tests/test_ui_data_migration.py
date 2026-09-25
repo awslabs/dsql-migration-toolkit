@@ -27143,3 +27143,38 @@ def test_refresh_objects_restamps_so_the_refresh_actually_clears_staleness() -> 
         'without a re-stamp the "Refresh objects" button reads the right cluster but '
         "leaves the pair flagged stale forever"
     )
+
+
+def test_the_prereq_gate_is_given_the_lob_columns_to_size_check() -> None:
+    """Without this keyword the oversized-value check never runs at all.
+
+    The at-risk columns must be derived HERE (the helper lives in this UI layer and core
+    must not import it) and handed to the gate — so the one thing the Evaluation finding
+    tells the operator to check would silently go unasked again.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    tree = ast.parse(inspect.getsource(dm.build_data_migration_screen))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "check"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "checker"
+    ]
+    assert calls, "the prerequisite gate is no longer invoked"
+    for call in calls:
+        kwargs = {kw.arg for kw in call.keywords}
+        assert "lob_columns" in kwargs, (
+            "checker.check must be given lob_columns, or the per-value size check "
+            "never runs"
+        )
+    flat = ast.unparse(tree)
+    assert "lob_exclusion_candidates(" in flat, (
+        "the at-risk columns must come from the shared helper, not be re-derived"
+    )

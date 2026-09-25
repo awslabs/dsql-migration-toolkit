@@ -5,6 +5,12 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.528
+
+### 추가
+
+- **oversized-LOB finding이 "확인하라"고 지시한 것을 실제로 확인해 주는 사전 점검을 추가했습니다.** Evaluation은 길이 제한 없는 `text`/`bytea`/`jsonb` 컬럼을 모두 표시하며 *"Check the largest value in each column. If any exceeds 1 MiB…"* 라고 말하지만, 도구에는 그걸 확인할 수단이 없었습니다 — `pg_column_size`·`octet_length`·`MAX(LENGTH(...))` 가 코드 어디에도 없어서, 그 경고 뒤의 유일한 구체적 사실(실제로 걸리는가?)을 Full Load가 행을 격리한 뒤에야 알 수 있었습니다. 이제 Data Migration 사전 점검이 테이블별·위험 컬럼별로 프로브해서 **이미** Aurora DSQL의 1 MiB 값 한도를 초과하는 값이 있는지 보고합니다. 행 데이터를 읽는 유일한 사전 점검이므로 세 가지로 제한했습니다: `EXISTS (SELECT 1 … WHERE octet_length(col) > :limit)` 로 엔진이 **첫 번째** 위반 행에서 멈출 수 있게 하고, 구문별 타임아웃으로 위반이 **없음을 증명**하는 작업이 고객 소스의 무제한 스캔이 되지 않게 하고, 컬럼마다 별도 구문이라 한 컬럼 실패가 나머지를 잃지 않게 했습니다. 타임아웃이나 읽기 실패는 **"not determined"** 로 보고하며 절대 통과로 처리하지 않습니다 — 검증할 수 없는 한도를 검증된 것처럼 보이는 게 바로 이 점검이 없애려는 거짓 안심이기 때문입니다. 이 점검은 **차단하지 않습니다**(`required=False`): 초과 값은 운영자의 결정이고(S3로 옮기고 참조 저장, 값 축소, 컬럼 제외, 격리 수용) 권고문이 그 전부를 이름으로 제시합니다. 측정값은 압축 전 바이트 길이, 즉 상한이며 그 사실도 명시합니다(DSQL 한도는 text/json에서 압축 후 크기에 적용). 위험 컬럼은 Evaluation finding과 제외 선택기를 구동하는 같은 헬퍼에서 오므로 세 표면이 어긋날 수 없고, 운영자가 이미 제외한 컬럼은 묻지 않습니다. Evaluation finding과 Schema Conversion 노트도 이제 숙제를 남기지 않고 이 점검을 가리킵니다.
+
 ## v0.1.527
 
 ### 수정

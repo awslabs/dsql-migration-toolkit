@@ -340,3 +340,146 @@ def test_variables_omits_rds_key_on_self_managed() -> None:
     # No mysql.rds_configuration rows (non-RDS / no access) -> no synthetic key.
     result = _source_probe(_RecordingConnection([("log_bin", "ON")])).variables()
     assert "rds_binlog_retention_hours" not in result
+
+
+# ---------------------------------------------------------------------------
+# The oversized-value probe: bounded, engine-correct, honest when it cannot tell
+# ---------------------------------------------------------------------------
+
+
+class _SizeProbeConn:
+    """Records statements; answers the EXISTS probe per column."""
+
+    def __init__(self, oversized: set[str], *, fail: set[str] | None = None) -> None:
+        self.statements: list[str] = []
+        self.bound: list[dict] = []
+        self._oversized = oversized
+        self._fail = fail or set()
+
+    def execute(self, statement, params=None):  # noqa: ANN001, ANN201
+        sql = " ".join(str(statement).split())
+        self.statements.append(sql)
+        if "SET " in sql:
+            return None
+        # The byte limit must arrive as a BOUND parameter. Checking only that ":limit"
+        # appears in the text is not enough -- dropping the bindparams() call leaves the
+        # placeholder in the SQL and the value nowhere, which a permissive fake would
+        # happily answer. Record what was actually bound.
+        try:
+            self.bound.append(dict(statement.compile().params))
+        except Exception:  # noqa: BLE001 - only the assertions care
+            self.bound.append({})
+        for name in self._fail:
+            if f'"{name}"' in sql or f"`{name}`" in sql:
+                raise RuntimeError("column read failed")
+
+        class _R:
+            def __init__(self, value):
+                self._v = value
+
+            def first(self):
+                return (self._v,)
+
+        hit = any(f'"{n}"' in sql or f"`{n}`" in sql for n in self._oversized)
+        return _R(hit)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+
+def _size_probe(source_type, conn):
+    from dsql_migrator.core.models import SourceConnectionConfig
+    from dsql_migrator.ui.prerequisite_probes import SessionSourceProbe
+
+    probe = SessionSourceProbe(
+        SourceConnectionConfig(
+            source_type=source_type, host="h", port=5432, username="u"
+        ),
+        None,
+    )
+
+    class _Engine:
+        def connect(self):
+            return conn
+
+    probe._engine_factory = lambda _cfg: _Engine()  # type: ignore[assignment]
+    return probe
+
+
+def test_the_size_probe_stops_at_the_first_offending_row_and_is_bounded() -> None:
+    """This is the ONLY prerequisite that reads row data, so its cost must be capped.
+
+    ``EXISTS`` lets the engine stop at the first offender, and a statement timeout keeps
+    proving the ABSENCE of one from becoming an unbounded scan of the customer's source.
+    """
+    from dsql_migrator.core.models import SourceType
+
+    conn = _SizeProbeConn({"content"})
+    answer = _size_probe(SourceType.POSTGRES, conn).oversized_values(
+        "ecommerce.product_media",
+        ["content", "notes"],
+        limit_bytes=1024 * 1024,
+        timeout_seconds=15.0,
+    )
+    assert answer == {"content": True, "notes": False}
+    joined = " ".join(conn.statements)
+    assert "SELECT EXISTS" in joined, joined
+    assert "octet_length" in joined, joined
+    # Bounded, and the limit is a BOUND parameter, not formatted into the SQL.
+    assert "statement_timeout = 15000" in joined, joined
+    assert ":limit" in joined, joined
+    assert "1048576" not in joined, joined
+    # ...and the value really is bound, not just a placeholder left dangling.
+    assert conn.bound and all(
+        b.get("limit") == 1024 * 1024 for b in conn.bound
+    ), conn.bound
+    # Schema-qualified and quoted for the engine.
+    assert '"ecommerce"."product_media"' in joined, joined
+
+
+def test_the_size_probe_uses_mysql_syntax_for_a_mysql_source() -> None:
+    from dsql_migrator.core.models import SourceType
+
+    conn = _SizeProbeConn(set())
+    _size_probe(SourceType.MYSQL, conn).oversized_values(
+        "shop.docs", ["body"], limit_bytes=1024 * 1024, timeout_seconds=5.0
+    )
+    joined = " ".join(conn.statements)
+    assert "MAX_EXECUTION_TIME = 5000" in joined, joined
+    assert "`shop`.`docs`" in joined, joined
+    assert "`body`" in joined, joined
+    assert "statement_timeout" not in joined, joined
+
+
+def test_one_column_failing_does_not_lose_the_others() -> None:
+    from dsql_migrator.core.models import SourceType
+
+    conn = _SizeProbeConn({"notes"}, fail={"content"})
+    answer = _size_probe(SourceType.POSTGRES, conn).oversized_values(
+        "s.t", ["content", "notes"], limit_bytes=1024 * 1024, timeout_seconds=5.0
+    )
+    assert answer == {"notes": True}, answer
+
+
+def test_a_probe_that_establishes_nothing_returns_none_not_a_clean_answer() -> None:
+    """``{}`` would grade as "no value exceeds the limit" -- a false pass."""
+    from dsql_migrator.core.models import SourceType
+
+    conn = _SizeProbeConn(set(), fail={"content"})
+    answer = _size_probe(SourceType.POSTGRES, conn).oversized_values(
+        "s.t", ["content"], limit_bytes=1024 * 1024, timeout_seconds=5.0
+    )
+    assert answer is None, answer
+
+
+def test_no_columns_is_an_empty_answer_not_a_query() -> None:
+    from dsql_migrator.core.models import SourceType
+
+    conn = _SizeProbeConn(set())
+    assert _size_probe(SourceType.POSTGRES, conn).oversized_values(
+        "s.t", [], limit_bytes=1024 * 1024, timeout_seconds=5.0
+    ) == {}
+    assert conn.statements == []

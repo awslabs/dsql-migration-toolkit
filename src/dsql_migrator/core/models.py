@@ -996,6 +996,13 @@ class PrerequisiteCheckId(str, Enum):
     TARGET_IAM_AUTH = "TARGET_IAM_AUTH"
     TARGET_SCHEMA_READY = "TARGET_SCHEMA_READY"
     TARGET_COLUMNS_LOADABLE = "TARGET_COLUMNS_LOADABLE"
+    # Does a value in a LOB column already EXCEED DSQL's 1 MiB per-value limit? The
+    # Evaluation finding tells the operator to "check the largest value in each column",
+    # and until this check there was no way to do that anywhere in the tool -- so the one
+    # concrete fact behind an oversized-LOB warning (will it actually bite?) was only
+    # learned when Full Load quarantined the row. NON-blocking: an oversized value is a
+    # deliberate decision (accept the quarantine, or exclude the column), not a stop.
+    SOURCE_VALUE_SIZE = "SOURCE_VALUE_SIZE"
     # CDC-only
     BINLOG_ROW_FORMAT = "BINLOG_ROW_FORMAT"
     BINLOG_RETENTION = "BINLOG_RETENTION"

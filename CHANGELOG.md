@@ -5,6 +5,12 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.528
+
+### Added
+
+- **A prerequisite check that answers the question the oversized-LOB finding told you to answer.** Evaluation flags every unbounded `text`/`bytea`/`jsonb` column and says *"Check the largest value in each column. If any exceeds 1 MiB…"* — but nothing in the tool could check it: `pg_column_size`, `octet_length` and `MAX(LENGTH(...))` appeared nowhere, so the one concrete fact behind the warning (will it actually bite?) was learned only when Full Load quarantined the row. The Data Migration prerequisite checks now probe it, per table and per at-risk column, and report whether a value **already** exceeds Aurora DSQL's 1 MiB per-value limit. Bounded three ways, because this is the only prerequisite that reads row data: `EXISTS (SELECT 1 … WHERE octet_length(col) > :limit)` lets the engine stop at the FIRST offending row; a per-statement timeout keeps proving the ABSENCE of one from becoming an unbounded scan of the customer's source; and one statement per column means a failure on one does not lose the others. A timeout or a failed read reports **"not determined"**, never a pass — an unverifiable ceiling shown as verified would be the same false reassurance the check exists to remove. The check is **never blocking** (`required=False`): an oversized value is the operator's decision — move the content to S3 and store a reference, shrink it, exclude the column, or accept the quarantine — and the remediation names all of them. It measures the uncompressed byte length, an upper bound, and says so (DSQL's limit applies to the compressed size for text/json). The at-risk columns come from the same helper that drives the Evaluation finding and the exclusion picker, so the three surfaces cannot disagree, and a column the operator already excluded is not asked about. Both the Evaluation finding and the Schema Conversion note now point at this check instead of leaving homework.
+
 ## v0.1.527
 
 ### Fixed

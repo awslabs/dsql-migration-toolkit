@@ -2805,7 +2805,8 @@ def _oversized_lob_warning(table: TableDef) -> Optional[ConversionWarning]:
             "DSQL's ~1 MiB per-value limit. The DDL itself is fine — the limit bites per "
             "ROW during migration: any oversized value is permanently dropped "
             "(quarantined in Full Load, dead-lettered in CDC) and reloading cannot fix "
-            "it. Check the largest values now; if any exceed 1 MiB, move that content to "
+            "it. The Data Migration prerequisite checks probe each column and report "
+            "whether a value already exceeds 1 MiB; if one does, move that content to "
             "Amazon S3 and store a reference instead."
         ),
     )
