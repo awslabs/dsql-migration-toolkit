@@ -189,6 +189,13 @@ class MskConnectController:
         # its DLQ card read "0 quarantined" for a pipeline that had quarantined rows.
         self._dlq_cursor_ms: "dict[str, int]" = {}
         self._dlq_seen_ids: "dict[str, set[str]]" = {}
+        # Whether a DLQ read's coverage was BOUNDED, and how. Both make the quarantine
+        # count a LOWER bound rather than a total, and the number is what a cut-over
+        # decision turns on -- so it must be reportable, not implicit.
+        # {log_group: window_seconds} for a first read that had no cursor to resume from;
+        # {log_group: bool} for a read that hit the page cap.
+        self._dlq_first_read_window_seconds: "dict[str, int]" = {}
+        self._dlq_read_truncated: "dict[str, bool]" = {}
         # Short-TTL cache for _list_metric_dimensions, keyed on (stack, metric_name):
         # {key: (expiry_monotonic, dims)}. Collapses the 5 per-poll discovery passes
         # (and cross-poll re-discovery) so ListMetrics is not paged every 5 s for data
@@ -220,6 +227,32 @@ class MskConnectController:
             {g: set(ids) for g, ids in self._dlq_seen_ids.items()},
         )
 
+    def dlq_coverage_bound(self, log_group: str) -> Optional[str]:
+        """Why this group's quarantine count may be INCOMPLETE, or ``None`` if it isn't.
+
+        Two bounds exist and both are silent by construction: a read with no cursor to
+        resume from can only look back ``window_seconds`` (anything quarantined before
+        that "can never be picked up"), and a read that hits the page cap stops early.
+        Either way the DLQ depth is a lower bound -- so a cut-over reader who sees
+        "0 quarantined" must be told which, instead of a number that looks like a total.
+
+        Pure: reports what the last read recorded, no AWS call.
+        """
+        if self._dlq_read_truncated.get(log_group):
+            return (
+                "the dead-letter read hit its page cap, so more quarantined records "
+                "exist than were counted"
+            )
+        window = self._dlq_first_read_window_seconds.get(log_group)
+        if window:
+            hours = window // 3600 or 1
+            return (
+                f"the dead-letter history was read from the last {hours}h only (no "
+                "earlier read position to resume from), so any record quarantined "
+                "before that is not counted"
+            )
+        return None
+
     def _client(self, service_name: str) -> object:
         session = self._session or build_session(self._aws_profile)
         return session.client(service_name, region_name=self._region)
@@ -231,6 +264,7 @@ class MskConnectController:
         now: Optional[datetime] = None,
         limit: int = 100,
         window_seconds: int = _DLQ_INITIAL_LOOKBACK_SECONDS,
+        max_pages: int = 20,
     ) -> list[CdcConnectorError]:
         """Read NEW sink dead-letter (DLQ) events from the connector log group.
 
@@ -260,19 +294,45 @@ class MskConnectController:
         start_ms = (
             cursor if cursor is not None else now_ms - window_seconds * 1000
         )
+        # Remember that THIS read had no cursor and therefore only looked back
+        # ``window_seconds``. Anything quarantined before that is, in this module's own
+        # words, an event that can never be picked up -- so the count it produces is a
+        # LOWER BOUND, and a cut-over decision must be told that rather than shown a
+        # number that looks complete.
+        if cursor is None:
+            self._dlq_first_read_window_seconds[log_group] = int(window_seconds)
+        truncated = False
         try:
             logs = self._client("logs")
-            response = logs.filter_log_events(
-                logGroupName=log_group,
-                startTime=start_ms,
-                filterPattern=(
-                    '?"Quarantined record to DLQ" ?"Dropping unapplicable record"'
-                ),
-                limit=limit,
-            )
-            events = list(response.get("events", []) or [])
+            # FOLLOW nextToken. A single page capped at ``limit`` silently dropped every
+            # further dead letter in the window -- and the quarantine count is exactly the
+            # number a cut-over decision turns on, so an undercount reads as a cleaner
+            # stream than there was. Bounded by ``max_pages`` so a pathological log group
+            # cannot turn an advisory poll into an unbounded scan; when the bound is hit we
+            # say so (``dlq_read_truncated``) instead of returning a quiet partial count.
+            events = []
+            token = None
+            for _page in range(max(1, max_pages)):
+                kwargs = {
+                    "logGroupName": log_group,
+                    "startTime": start_ms,
+                    "filterPattern": (
+                        '?"Quarantined record to DLQ" ?"Dropping unapplicable record"'
+                    ),
+                    "limit": limit,
+                }
+                if token:
+                    kwargs["nextToken"] = token
+                response = logs.filter_log_events(**kwargs)
+                events.extend(list(response.get("events", []) or []))
+                token = response.get("nextToken")
+                if not token:
+                    break
+            else:
+                truncated = bool(token)
         except Exception:  # noqa: BLE001 - advisory monitoring read, never crash
             return []
+        self._dlq_read_truncated[log_group] = truncated
         errors: list[CdcConnectorError] = []
         max_ts = cursor or 0
         for event in events:

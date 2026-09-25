@@ -1619,3 +1619,39 @@ def test_restored_session_keeps_the_source_engine_on_the_evaluation_result() -> 
     )
     assert restored_mysql.result is not None
     assert restored_mysql.result.source_type is SourceType.MYSQL
+
+
+def test_the_dlq_read_cursor_round_trips_so_a_restart_keeps_its_coverage() -> None:
+    """The cursor is what stops a restart from re-bounding the quarantine window.
+
+    It lived only in process memory, so a Fargate task replacement left the rebuilt
+    controller cursor-less -- and a cursor-less first read can look back no further than
+    its blind window, permanently dropping every earlier quarantine from the count a
+    cut-over decision turns on.
+    """
+    from dsql_migrator.core.session_state_store import SessionSnapshot
+
+    session, eval_state, conv_state, migration_state = _populated_states()
+    migration_state.cdc_dlq_cursor_ms = {"/msk-connect/cdc-a": 1700000000123}
+    snapshot = capture_session_snapshot(
+        "s1", session, eval_state, conv_state, migration_state
+    )
+    assert snapshot.cdc_dlq_cursor_ms == {"/msk-connect/cdc-a": 1700000000123}
+
+    restored = DataMigrationState()
+    assert restored.cdc_dlq_cursor_ms == {}
+    apply_session_snapshot(
+        snapshot, SessionConnectionState(), EvaluationState(),
+        SchemaConversionState(), restored,
+    )
+    assert restored.cdc_dlq_cursor_ms == {"/msk-connect/cdc-a": 1700000000123}
+
+    # An older snapshot without the field restores cleanly to "no cursor".
+    old = SessionSnapshot(session_id="s1")
+    assert old.cdc_dlq_cursor_ms == {}
+    fresh = DataMigrationState()
+    apply_session_snapshot(
+        old, SessionConnectionState(), EvaluationState(),
+        SchemaConversionState(), fresh,
+    )
+    assert fresh.cdc_dlq_cursor_ms == {}

@@ -1461,6 +1461,15 @@ def _fetch_cdc_status(migration_state, tables=None):
                 migration_state.cdc_dlq_seen_ids = seen
             except Exception:  # noqa: BLE001 - advisory bookkeeping only
                 pass
+            # Whether that read could see the WHOLE dead-letter history. A bounded read
+            # makes the quarantine count a lower bound, and the count is the number a
+            # cut-over decision turns on -- so carry the reason to the UI and the log
+            # instead of publishing a total-looking number.
+            try:
+                bound = controller.dlq_coverage_bound(f"/msk-connect/{stack_name}-cdc")
+            except Exception:  # noqa: BLE001 - advisory, never break the poll
+                bound = None
+            migration_state.cdc_dlq_coverage_bound = bound
     return statuses, health, dlq_errors, applied_ops, lag_ms, lag_series
 
 
@@ -1734,6 +1743,86 @@ def cdc_schema_drift_summary(migration_state, log_key: str) -> list:
     ]
 
 
+# How long between two logged applied-rows roll-ups. The CDC status poll runs every few
+# seconds; logging per poll would bury the discrete control-plane milestones the file
+# exists for (its own docstring's "do not flood the rotated file"). 10 minutes keeps a
+# multi-hour stream to tens of lines while still proving, at cut-over review time, that
+# rows were flowing and roughly when.
+_CDC_APPLIED_ROLLUP_INTERVAL_SECONDS = 600.0
+
+# Tables named in one roll-up line, most active first. ``log_activity`` truncates a detail
+# at 500 characters, and a silent truncation in the one line that evidences the data path
+# would be worse than an explicit "+N more".
+_CDC_APPLIED_ROLLUP_TABLES = 6
+
+
+def cdc_applied_totals(applied_ops: "Optional[Mapping[str, Mapping[str, int]]]") -> tuple:
+    """Return ``(inserts, updates, deletes)`` summed across tables. Pure."""
+    inserts = updates = deletes = 0
+    for ops in (applied_ops or {}).values():
+        inserts += int((ops or {}).get("inserts", 0) or 0)
+        updates += int((ops or {}).get("updates", 0) or 0)
+        deletes += int((ops or {}).get("deletes", 0) or 0)
+    return (inserts, updates, deletes)
+
+
+def cdc_applied_rollup_due(
+    totals: tuple,
+    *,
+    last_totals: "Optional[tuple]",
+    last_at: "Optional[float]",
+    now: float,
+    interval_seconds: float = _CDC_APPLIED_ROLLUP_INTERVAL_SECONDS,
+) -> bool:
+    """Whether an applied-rows roll-up should be written now. Pure.
+
+    Two conditions, both required. The totals must have CHANGED -- an idle stream must not
+    tick out identical lines forever -- and ``interval_seconds`` must have passed since the
+    last logged roll-up. The first roll-up with any activity is always due (``last_at`` is
+    ``None``), so a short stream that ends before the first interval still leaves evidence.
+    """
+    if totals == (0, 0, 0):
+        return False
+    if last_totals is not None and totals == tuple(last_totals):
+        return False
+    if last_at is None:
+        return True
+    return (now - float(last_at)) >= interval_seconds
+
+
+def cdc_applied_rollup_detail(
+    applied_ops: "Optional[Mapping[str, Mapping[str, int]]]",
+    *,
+    limit: int = _CDC_APPLIED_ROLLUP_TABLES,
+) -> str:
+    """One bounded, value-free line describing what CDC has applied so far. Pure.
+
+    Cumulative per-table counts, busiest table first, capped at ``limit`` with an explicit
+    "+N more table(s)" tail so the 500-char detail cap can never truncate it silently.
+    """
+    inserts, updates, deletes = cdc_applied_totals(applied_ops)
+    ranked = sorted(
+        ((name, ops or {}) for name, ops in (applied_ops or {}).items()),
+        key=lambda pair: -(
+            int(pair[1].get("inserts", 0) or 0)
+            + int(pair[1].get("updates", 0) or 0)
+            + int(pair[1].get("deletes", 0) or 0)
+        ),
+    )
+    shown = "; ".join(
+        f"{name} {int(ops.get('inserts', 0) or 0)}i/"
+        f"{int(ops.get('updates', 0) or 0)}u/{int(ops.get('deletes', 0) or 0)}d"
+        for name, ops in ranked[:limit]
+    )
+    more = len(ranked) - limit
+    return (
+        f"cumulative since the stream started: {inserts} insert(s), {updates} update(s), "
+        f"{deletes} delete(s)"
+        + (f" — {shown}" if shown else "")
+        + (f" (+{more} more table(s))" if more > 0 else "")
+    )
+
+
 def _apply_cdc_status(migration_state, fetched) -> None:
     """Build the CDC status view from a fetched ``(statuses, health)`` and store it.
 
@@ -1761,6 +1850,39 @@ def _apply_cdc_status(migration_state, fetched) -> None:
         merged = dict(getattr(migration_state, "cdc_applied_ops_by_table", {}) or {})
         merged.update(applied_ops)
         setter(merged)
+        # THE evidence that CDC moved rows. These counts lived only on screen, so for a
+        # CDC migration the durable log had nothing between "start CDC connectors" and
+        # "validation started" -- half of what a cut-over approval rests on, gone the
+        # moment the tab closed. Throttled + change-gated (see cdc_applied_rollup_due) so
+        # the discrete-milestone log is not flooded, and the markers live on the state so
+        # Start over clears them with everything else.
+        import time as _time
+
+        # Function-local, matching the other activity-log writes in this module (the
+        # dead-letter audit below does the same) -- importing at module scope here would
+        # invert the dependency the UI layer deliberately keeps one-way.
+        from dsql_migrator.core.activity_log import (
+            ActivityCategory,
+            ActivityStatus,
+            log_activity,
+        )
+
+        _totals = cdc_applied_totals(merged)
+        _now = _time.monotonic()
+        if cdc_applied_rollup_due(
+            _totals,
+            last_totals=getattr(migration_state, "cdc_applied_logged_totals", None),
+            last_at=getattr(migration_state, "cdc_applied_logged_at", None),
+            now=_now,
+        ):
+            migration_state.cdc_applied_logged_totals = _totals
+            migration_state.cdc_applied_logged_at = _now
+            log_activity(
+                ActivityCategory.CDC,
+                "CDC applied rows",
+                status=ActivityStatus.INFO,
+                detail=cdc_applied_rollup_detail(merged),
+            )
     # Store per-table replication lag (ms) for the time-based "Stream lag" column.
     lag_setter = getattr(migration_state, "set_cdc_replication_lag_by_table", None)
     if callable(lag_setter):
@@ -1847,6 +1969,28 @@ def _apply_cdc_status(migration_state, fetched) -> None:
                 error_code=getattr(err, "error_code", None),
                 detail=getattr(err, "message", None),
             )
+    # The quarantine count's own coverage, written ONCE to the durable log. A cut-over
+    # reviewer reading only the activity log would otherwise take the recorded count as a
+    # total when the read was bounded -- the single number that decision turns on.
+    _bound = getattr(migration_state, "cdc_dlq_coverage_bound", None)
+    if _bound and not getattr(migration_state, "cdc_dlq_bound_audited", False):
+        # Function-local, as with the other activity-log writes in this module.
+        from dsql_migrator.core.activity_log import (
+            ActivityCategory,
+            ActivityStatus,
+            log_activity,
+        )
+
+        migration_state.cdc_dlq_bound_audited = True
+        log_activity(
+            ActivityCategory.CDC,
+            "dead-letter count is a LOWER BOUND",
+            status=ActivityStatus.WARNING,
+            detail=(
+                f"the quarantined-record count below may be incomplete: {_bound}. "
+                "Treat it as a minimum when deciding to cut over."
+            ),
+        )
     # CDC-sourced records ONLY. The key is shared with the Full Load (it IS the Full
     # Load job id whenever one ran), so an unfiltered summary put batch-loader
     # quarantines into the DLQ card -- see is_cdc_error_record.

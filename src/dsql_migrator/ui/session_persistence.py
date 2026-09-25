@@ -145,6 +145,13 @@ def capture_session_snapshot(
         cdc_ops_window_start=getattr(migration_state, "cdc_ops_window_start", None),
         cdc_stack_name=getattr(migration_state, "cdc_stack_name", None),
         cdc_infra_inputs=dict(migration_state.cdc_infra_inputs()),  # type: ignore[attr-defined]
+        cdc_dlq_cursor_ms={
+            str(group): int(value)
+            for group, value in (
+                getattr(migration_state, "cdc_dlq_cursor_ms", None) or {}
+            ).items()
+            if value is not None
+        },
         ai_assist_enabled=bool(getattr(session.ai_assist, "enabled", False)),  # type: ignore[attr-defined]
         ai_assist_model_id=getattr(session.ai_assist, "model_id", None),  # type: ignore[attr-defined]
         ai_assist_region=getattr(session.ai_assist, "region", None),  # type: ignore[attr-defined]
@@ -517,6 +524,11 @@ def apply_session_snapshot(
     # which cdc-stack this session owns and the VpcId/subnet it deployed with. On
     # the next render (after the user re-verifies the target connection), the
     # read-only AWS probe recovers the live phase (Infra ready / Streaming).
+    # Restore the DLQ read position BEFORE any poll rebuilds the controller: without it a
+    # restarted task re-reads only its blind look-back window and the quarantine count
+    # silently loses everything older (see SessionSnapshot.cdc_dlq_cursor_ms).
+    if getattr(snapshot, "cdc_dlq_cursor_ms", None):
+        migration_state.cdc_dlq_cursor_ms = dict(snapshot.cdc_dlq_cursor_ms)  # type: ignore[attr-defined]
     if snapshot.cdc_stack_name and hasattr(migration_state, "set_cdc_stack_name"):
         migration_state.set_cdc_stack_name(snapshot.cdc_stack_name)  # type: ignore[attr-defined]
     if snapshot.cdc_infra_inputs:

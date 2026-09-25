@@ -200,6 +200,15 @@ class DataMigrationState:
         # another CDC stack (see MskConnectController.seed_dlq_cursor).
         self.cdc_dlq_cursor_ms: dict = {}
         self.cdc_dlq_seen_ids: dict = {}
+        # WHY the quarantine count may be incomplete (a first read with no cursor to
+        # resume from can look back only its blind window; a read can hit its page cap),
+        # or None when it is a true total. The count is what a cut-over decision turns on,
+        # so "0 quarantined" must not render identically to "0 that we could see".
+        self.cdc_dlq_coverage_bound: Optional[str] = None
+        # Set once the bound has been written to the DURABLE activity log, so the
+        # every-5s poll does not re-write the same line. On the state (not a module
+        # global) so Start over clears it with everything else.
+        self.cdc_dlq_bound_audited: bool = False
         # Identities of dead letters already written to the DURABLE activity log, so a
         # re-surfaced record is audited once (the write is append-only and permanent).
         self.cdc_dlq_audited_keys: set = set()
@@ -261,6 +270,12 @@ class DataMigrationState:
         # {"inserts","updates","deletes"}; empty when the metrics are unavailable
         # (older plugin / sink not emitting).
         self.cdc_applied_ops_by_table: dict[str, dict[str, int]] = {}
+        # Throttle markers for the logged applied-rows roll-up: the totals last WRITTEN to
+        # the activity log and the monotonic clock reading when. On the state (not a module
+        # global) so reset_in_place / Start over clears them -- a stale module-level marker
+        # was exactly the v0.1.498 bug where CDC posted no events after a Start over.
+        self.cdc_applied_logged_totals: Optional[tuple] = None
+        self.cdc_applied_logged_at: Optional[float] = None
         # Start of the window the applied-ops above are summed over: the Full Load
         # watermark (this migration's gapless resume point), set when CDC starts. The
         # sink's *Applied CloudWatch metrics have a long retention, so a fixed trailing
@@ -757,6 +772,8 @@ class DataMigrationState:
             # Applied-ops + replication-lag metrics are per-stack too; drop them so the
             # adopted stack's poll repopulates rather than showing the prior stack's.
             self.cdc_applied_ops_by_table = {}
+            self.cdc_applied_logged_totals = None
+            self.cdc_applied_logged_at = None
             self.cdc_ops_window_start = None
             self.cdc_replication_lag_by_table = {}
             self.cdc_replication_lag_series = []

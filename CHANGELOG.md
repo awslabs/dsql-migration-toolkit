@@ -5,6 +5,13 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.522
+
+### Fixed
+
+- **For a CDC migration the activity log had no record of what the stream actually moved.** Between `start CDC connectors` and `validation started` there were zero data-path lines: the per-table Inserts/Updates/Deletes were read from the sink's CloudWatch metrics into process memory and rendered on screen only — never persisted, never logged — so half the evidence a cut-over approval rests on died with the browser tab. A **throttled roll-up** now records the cumulative per-table counts (change-gated, at most one line per 10 minutes, busiest tables first with an explicit `+N more` so the 500-character detail cap cannot truncate it silently), plus **one final cumulative line at Stop** — the last moment those metrics exist, since Stop deletes the connectors and their CloudWatch dimensions. The original design decision that kept continuous progress out of the rotated file still holds: replication lag stays on screen, and the throttle markers live on the migration state so Start over clears them.
+- **The quarantined-record count could be silently incomplete — and it is the number a cut-over decision turns on.** Two bounds were invisible. The dead-letter read position lived only in process memory, so a Fargate task replacement or app restart left the rebuilt controller cursor-less, and a cursor-less first read can look back no further than its blind 6-hour window — everything older is, in the module's own words, an event that can never be picked up. The cursor is now **persisted in the session snapshot**. And the CloudWatch read took a single page capped at 100 events with no `nextToken`, silently dropping the rest; it now **follows pagination** under a bounded page cap. When either bound did apply, the count is reported as a floor rather than a total: the DLQ badge reads `at least N quarantined`, a warning notice says which bound and where the complete record is, and **one durable log line** records it so a reviewer reading only the activity log is told the count is a minimum.
+
 ## v0.1.521
 
 ### Fixed

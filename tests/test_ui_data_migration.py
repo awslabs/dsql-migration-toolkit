@@ -26716,3 +26716,328 @@ def test_an_interrupted_pass_still_left_a_started_line(monkeypatch) -> None:
     started = [e for e in events if e[2]["status"] is engine.ActivityStatus.STARTED]
     assert len(started) == 1, events
     assert "3 constraint(s)" in started[0][2]["detail"], started
+
+
+# ---------------------------------------------------------------------------
+# CDC's applied rows reach the DURABLE log (L-1)
+# ---------------------------------------------------------------------------
+
+
+def _ops(inserts: int = 0, updates: int = 0, deletes: int = 0) -> dict:
+    return {"inserts": inserts, "updates": updates, "deletes": deletes}
+
+
+def test_applied_totals_sum_across_tables() -> None:
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_applied_totals
+
+    assert cdc_applied_totals(None) == (0, 0, 0)
+    assert cdc_applied_totals({}) == (0, 0, 0)
+    assert cdc_applied_totals(
+        {"a": _ops(1, 2, 3), "b": _ops(10, 0, 0)}
+    ) == (11, 2, 3)
+
+
+def test_a_rollup_is_due_once_and_then_only_after_the_interval() -> None:
+    """Throttled + change-gated: the log is a milestone file, not a metrics stream.
+
+    The original design decision -- applied counts stay OUT of the log because a per-poll
+    line would flood the rotated file -- is preserved by this predicate, which is what
+    makes logging them at all acceptable.
+    """
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_applied_rollup_due
+
+    # First activity always writes, so a short stream still leaves evidence.
+    assert cdc_applied_rollup_due((5, 0, 0), last_totals=None, last_at=None, now=100.0)
+    # An idle stream must not tick out identical lines forever.
+    assert not cdc_applied_rollup_due(
+        (5, 0, 0), last_totals=(5, 0, 0), last_at=100.0, now=100_000.0
+    )
+    # Changed, but inside the interval -> wait.
+    assert not cdc_applied_rollup_due(
+        (6, 0, 0), last_totals=(5, 0, 0), last_at=100.0, now=200.0,
+        interval_seconds=600.0,
+    )
+    # Changed and the interval has passed -> write.
+    assert cdc_applied_rollup_due(
+        (6, 0, 0), last_totals=(5, 0, 0), last_at=100.0, now=701.0,
+        interval_seconds=600.0,
+    )
+    # Nothing applied yet -> nothing to say.
+    assert not cdc_applied_rollup_due(
+        (0, 0, 0), last_totals=None, last_at=None, now=1.0
+    )
+
+
+def test_the_rollup_detail_is_bounded_and_value_free() -> None:
+    from dsql_migrator.core.activity_log import _MAX_DETAIL_CHARS
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_applied_rollup_detail
+
+    detail = cdc_applied_rollup_detail(
+        {f"t{i}": _ops(i, i, i) for i in range(50)}
+    )
+    assert "more table(s)" in detail, "a capped list must say how many it dropped"
+    assert len(detail) < _MAX_DETAIL_CHARS, len(detail)
+    # Busiest table first, so the cap keeps the tables that matter.
+    assert detail.index("t49") < detail.index("t48"), detail
+
+
+def test_a_streaming_poll_writes_one_applied_rows_line_then_throttles(monkeypatch) -> None:
+    """For a CDC migration the durable log had NO record of what the stream moved.
+
+    Between "start CDC connectors" and "validation started" there were zero lines, so the
+    counters proving rows flowed lived only on screen and died with the browser tab --
+    half the evidence a cut-over approval rests on.
+    """
+    import dsql_migrator.core.activity_log as act
+    import dsql_migrator.ui.data_migration._cdc_status as status
+
+    events: list[tuple] = []
+    monkeypatch.setattr(
+        act, "log_activity",
+        lambda category, action, **kw: events.append((action, kw)),
+    )
+    state = DataMigrationState()
+    for _poll in range(5):
+        status._apply_cdc_status(
+            state, ([], {}, [], {"orders": _ops(3, 1, 1)}, {}, [])
+        )
+    applied = [e for e in events if e[0] == "CDC applied rows"]
+    assert len(applied) == 1, f"throttled to one line, got {len(applied)}: {events}"
+    detail = applied[0][1]["detail"]
+    assert "3 insert(s), 1 update(s), 1 delete(s)" in detail, detail
+    assert "orders 3i/1u/1d" in detail, detail
+    # The state markers carry the throttle, so Start over (__init__) clears them.
+    assert state.cdc_applied_logged_totals == (3, 1, 1)
+    assert state.cdc_applied_logged_at is not None
+
+
+def test_a_reset_clears_the_rollup_throttle_so_a_new_run_logs_again() -> None:
+    """A module-level marker would silence the next run -- the v0.1.498 Start-over bug."""
+    from dsql_migrator.ui.data_migration._state import DataMigrationStore
+
+    store = DataMigrationStore()
+    state = store.get_or_create("s1")
+    state.cdc_applied_logged_totals = (9, 9, 9)
+    state.cdc_applied_logged_at = 123.0
+    store.reset_in_place("s1")
+    # Same object (reset_in_place re-runs __init__ in place), so the markers must be gone.
+    assert store.get_or_create("s1") is state
+    assert state.cdc_applied_logged_totals is None
+    assert state.cdc_applied_logged_at is None
+
+
+def _stop_cdc_capturing_events(monkeypatch, state):
+    """Run the real Stop CDC submit path with doubles; return the logged CDC events."""
+    from types import SimpleNamespace
+
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+
+    events = _capture_cdc_events(monkeypatch)
+    monkeypatch.setattr(
+        cdc_ui, "build_cdc_stack_deployer", lambda *a, **k: object(), raising=False
+    )
+
+    class _JM:
+        def submit(self, _work):
+            return "job-1"
+
+    class _Ui:
+        def notify(self, *_a, **_k):
+            return None
+
+    session = SimpleNamespace(
+        target_config=SimpleNamespace(
+            region="us-east-1",
+            cluster_endpoint="ep.dsql.amazonaws.com",
+            database="postgres",
+            username="admin",
+        ),
+        aws_profile=None,
+        source_password=None,
+        source_config=None,
+        source_secret_id=None,
+    )
+    cdc_ui._start_cdc_stop(_Ui(), state, _JM(), lambda: None, session=session)
+    return events
+
+
+def test_stop_closes_the_record_with_a_final_cumulative_line(monkeypatch) -> None:
+    """Stop is the last moment the applied-ops metrics exist.
+
+    The periodic roll-up is throttled, so without a line here the final interval -- often
+    the one immediately before cut over -- is missing from the audit trail, and the
+    connectors (with their CloudWatch dimensions) are about to be deleted. Asserted by
+    RUNNING the submit path, not by reading its source: a source check passes even if the
+    logging call is renamed to something that never writes.
+    """
+    state = DataMigrationState()
+    state.set_cdc_applied_ops_by_table(
+        {"orders": _ops(10, 4, 1), "customers": _ops(2, 0, 0)}
+    )
+    events = _stop_cdc_capturing_events(monkeypatch, state)
+
+    finals = [e for e in events if e[0] == "CDC applied rows (final)"]
+    assert len(finals) == 1, f"one closing line at Stop: {events}"
+    detail = finals[0][2]
+    assert "12 insert(s), 4 update(s), 1 delete(s)" in detail, detail
+    assert "orders 10i/4u/1d" in detail, detail
+    # Honest about freshness -- these are last-poll values, not a drain confirmation.
+    assert "as of the last status poll before Stop" in detail, detail
+
+
+def test_stopping_a_stream_that_applied_nothing_logs_no_final_line(monkeypatch) -> None:
+    # No noise for a stop before any row flowed (or a Stop on an idle pipeline).
+    state = DataMigrationState()
+    events = _stop_cdc_capturing_events(monkeypatch, state)
+    assert not [e for e in events if e[0] == "CDC applied rows (final)"], events
+
+
+# ---------------------------------------------------------------------------
+# The quarantine count must say when it is only a floor (critic #4)
+# ---------------------------------------------------------------------------
+
+
+def test_the_dlq_cursor_survives_a_task_replacement() -> None:
+    """A cursor-less first read can look back only its blind window.
+
+    The cursor lived in process memory, so a Fargate task replacement made the next read
+    fall back to the 6 h look-back and everything older dropped out of the quarantine
+    count for good -- the count a cut-over decision turns on.
+    """
+    from dsql_migrator.core.session_state_store import SessionSnapshot
+
+    assert "cdc_dlq_cursor_ms" in SessionSnapshot.model_fields
+    snapshot = SessionSnapshot(session_id="s")
+    assert snapshot.cdc_dlq_cursor_ms == {}, "older snapshots must restore cleanly"
+
+
+def test_the_cursor_is_captured_and_restored_by_the_session_snapshot() -> None:
+    import inspect
+
+    from dsql_migrator.ui import session_persistence as sp
+
+    src = inspect.getsource(sp)
+    assert "cdc_dlq_cursor_ms={" in src, "the snapshot does not capture the cursor"
+    assert "migration_state.cdc_dlq_cursor_ms = dict(snapshot.cdc_dlq_cursor_ms)" in src
+
+
+def test_a_bounded_dlq_read_is_reported_as_a_lower_bound(monkeypatch) -> None:
+    from dsql_migrator.core.msk_connect_controller import MskConnectController
+
+    controller = MskConnectController(region="us-east-1")
+    assert controller.dlq_coverage_bound("/msk-connect/x") is None
+    # A first read with no cursor saw only the look-back window.
+    controller._dlq_first_read_window_seconds["/msk-connect/x"] = 6 * 3600
+    bound = controller.dlq_coverage_bound("/msk-connect/x")
+    assert bound is not None and "6h" in bound, bound
+    assert "not counted" in bound, bound
+    # A truncated read outranks it (more records definitely exist).
+    controller._dlq_read_truncated["/msk-connect/x"] = True
+    bound = controller.dlq_coverage_bound("/msk-connect/x")
+    assert "page cap" in bound, bound
+
+
+def test_a_resumed_read_reports_no_bound() -> None:
+    """Seeding the cursor is what removes the bound -- it must not be reported anyway."""
+    from dsql_migrator.core.msk_connect_controller import MskConnectController
+
+    controller = MskConnectController(region="us-east-1")
+    controller.seed_dlq_cursor({"/msk-connect/x": 1700000000000}, {})
+
+    class _Logs:
+        def filter_log_events(self, **kwargs):
+            assert "nextToken" not in kwargs
+            # startTime must be the cursor, not now-window.
+            assert kwargs["startTime"] == 1700000000000
+            return {"events": []}
+
+    controller._client = lambda _svc: _Logs()  # type: ignore[assignment]
+    controller.dlq_errors("/msk-connect/x")
+    assert controller.dlq_coverage_bound("/msk-connect/x") is None
+
+
+def test_the_dlq_read_follows_next_token_instead_of_dropping_records() -> None:
+    """A single page capped at ``limit`` silently undercounted the quarantines."""
+    from dsql_migrator.core.msk_connect_controller import MskConnectController
+
+    controller = MskConnectController(region="us-east-1")
+    pages = [
+        {"events": [{"eventId": "a", "timestamp": 1, "message": "x"}],
+         "nextToken": "t1"},
+        {"events": [{"eventId": "b", "timestamp": 2, "message": "y"}]},
+    ]
+    seen_tokens: list = []
+
+    class _Logs:
+        def filter_log_events(self, **kwargs):
+            seen_tokens.append(kwargs.get("nextToken"))
+            return pages[len(seen_tokens) - 1]
+
+    controller._client = lambda _svc: _Logs()  # type: ignore[assignment]
+    controller.dlq_errors("/msk-connect/x")
+    assert seen_tokens == [None, "t1"], seen_tokens
+    assert controller.dlq_coverage_bound("/msk-connect/x") is not None, (
+        "a first read still had no cursor, so it is still a lower bound"
+    )
+
+
+def test_hitting_the_page_cap_is_reported_not_silently_partial() -> None:
+    from dsql_migrator.core.msk_connect_controller import MskConnectController
+
+    controller = MskConnectController(region="us-east-1")
+    controller.seed_dlq_cursor({"/msk-connect/x": 1}, {})
+
+    class _Logs:
+        def filter_log_events(self, **_kwargs):
+            return {"events": [], "nextToken": "always-more"}
+
+    controller._client = lambda _svc: _Logs()  # type: ignore[assignment]
+    controller.dlq_errors("/msk-connect/x", max_pages=3)
+    bound = controller.dlq_coverage_bound("/msk-connect/x")
+    assert bound is not None and "page cap" in bound, bound
+
+
+def test_the_bound_is_written_to_the_durable_log_exactly_once(monkeypatch) -> None:
+    """A cut-over reviewer reading only the log must be told the count is a floor."""
+    import dsql_migrator.core.activity_log as act
+    import dsql_migrator.ui.data_migration._cdc_status as status
+
+    events: list[tuple] = []
+    monkeypatch.setattr(
+        act, "log_activity",
+        lambda category, action, **kw: events.append((action, kw)),
+    )
+    state = DataMigrationState()
+    state.cdc_dlq_coverage_bound = "the dead-letter read hit its page cap"
+    for _poll in range(4):
+        status._apply_cdc_status(state, ([], {}, [], {}, {}, []))
+    bound_lines = [e for e in events if e[0] == "dead-letter count is a LOWER BOUND"]
+    assert len(bound_lines) == 1, f"once, not per poll: {events}"
+    assert bound_lines[0][1]["status"] is act.ActivityStatus.WARNING
+    assert "minimum" in bound_lines[0][1]["detail"], bound_lines
+
+
+def test_no_bound_means_no_line(monkeypatch) -> None:
+    import dsql_migrator.core.activity_log as act
+    import dsql_migrator.ui.data_migration._cdc_status as status
+
+    events: list[tuple] = []
+    monkeypatch.setattr(
+        act, "log_activity",
+        lambda category, action, **kw: events.append((action, kw)),
+    )
+    state = DataMigrationState()
+    state.cdc_dlq_coverage_bound = None
+    status._apply_cdc_status(state, ([], {}, [], {}, {}, []))
+    assert not [e for e in events if "LOWER BOUND" in e[0]]
+
+
+def test_the_dlq_card_badge_says_at_least_when_the_read_was_bounded() -> None:
+    """"0 quarantined" and "0 that we could see" must not render identically."""
+    import inspect
+
+    import dsql_migrator.ui.data_migration._cdc_monitoring as mon
+
+    src = inspect.getsource(mon._render_cdc_dlq_panel)
+    assert 'f"at least {health.depth} quarantined"' in src
+    assert "This count is a minimum, not a total" in src

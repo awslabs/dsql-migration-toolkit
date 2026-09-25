@@ -1670,8 +1670,10 @@ def _render_cdc_dlq_panel(
                 if health.depth == 0
                 else "primary"
             )
+            _bound = getattr(migration_state, "cdc_dlq_coverage_bound", None)
             ui.badge(  # type: ignore[attr-defined]
-                f"{health.depth} quarantined"
+                f"at least {health.depth} quarantined" if _bound
+                else f"{health.depth} quarantined"
             ).props(f"color={_badge_color}")
             ui.space()  # type: ignore[attr-defined]
             # Ask AI DBA to triage the poison records (only when there is something to
@@ -1691,6 +1693,20 @@ def _render_cdc_dlq_panel(
                     "flat dense round size=sm icon=refresh"
                 ).tooltip("Refresh dead-letter records from CloudWatch")
         ui.label(health.message).classes("text-xs text-gray-700")  # type: ignore[attr-defined]
+        if _bound:
+            # The count's own coverage. Sibling in intent to the stalled-sink caveat
+            # below: a number that LOOKS like a total but is a floor is the reassurance
+            # a cut-over decision must not be given silently.
+            render_notice(
+                ui,
+                tone="warning",
+                header="This count is a minimum, not a total",
+                body=(
+                    f"The dead-letter history could not be read in full — {_bound}. "
+                    "Treat the count as a floor when deciding to cut over; the "
+                    "connector's CloudWatch log group holds the complete record."
+                ),
+            )
         if _stalled and health.depth == 0:
             # "No records quarantined." is literally true but reads as reassurance, so
             # say why it proves nothing right now: a stalled sink never reaches a record

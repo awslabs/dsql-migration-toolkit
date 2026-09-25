@@ -134,6 +134,14 @@ class SessionSnapshot(BaseModel):
     # so older snapshots restore cleanly.
     cdc_stack_name: Optional[str] = None
     cdc_infra_inputs: dict[str, str] = Field(default_factory=dict)
+    # The DLQ read position, per CloudWatch log group. Held only in process memory before,
+    # so a Fargate task replacement (or any app restart) left the rebuilt controller
+    # cursor-less -- and a cursor-less first read can look back no further than its blind
+    # window, permanently losing every quarantine older than that from the count a
+    # cut-over decision turns on. Only the cursor is persisted, not the seen-id sets: with
+    # the cursor restored there is no re-read of old events to de-duplicate, and the sets
+    # are bounded at thousands of ids (snapshot bloat for no gain).
+    cdc_dlq_cursor_ms: dict[str, int] = Field(default_factory=dict)
     # Non-secret target (Aurora DSQL) connection so a reconnecting session can
     # re-probe the cdc-stack phase WITHOUT the user re-entering the target first
     # (DSQL auth is IAM-token based, so endpoint + region are enough to describe).

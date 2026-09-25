@@ -3556,9 +3556,15 @@ def _log_cdc_event(
 
     Records control-plane actions (deploy / start / stop / teardown) and connector
     state transitions as one-line events -- the audit trail of WHAT happened to the
-    CDC pipeline and WHEN. Continuous progress (replication lag / applied counts)
-    stays out of the log (it would flood the rotated file); it lives in the live
-    monitoring panel.
+    CDC pipeline and WHEN. Continuous progress (replication lag) stays out of the log
+    (it would flood the rotated file); it lives in the live monitoring panel.
+
+    Applied row counts are the ONE exception, added deliberately: the per-table
+    Inserts/Updates/Deletes existed only on screen, so for a CDC migration the audit
+    trail had no record of what the data path actually moved -- half the evidence a
+    cut-over approval rests on. They are logged as a THROTTLED roll-up
+    (:func:`cdc_applied_rollup_due`) plus one final cumulative line at Stop, never
+    per poll, so the original "do not flood the file" intent still holds.
     """
     log_activity(
         ActivityCategory.CDC, action, status=status, detail=detail,

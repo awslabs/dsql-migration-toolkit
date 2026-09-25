@@ -105,6 +105,8 @@ from dsql_migrator.ui.data_migration._cdc_status import (
     _CDC_TONE_STYLE,
     _apply_cdc_status,
     _ascii_log,
+    cdc_applied_rollup_detail,
+    cdc_applied_totals,
     _cdc_status_view,
     _current_job,
     _deploy_total_duration,
@@ -4890,6 +4892,28 @@ def _start_cdc_stop(
             stack_name=stack_name,
             deployer=deployer,
             on_log=migration_state.append_cdc_deploy_log,
+        )
+
+    # CLOSE the run's data-path record before the connectors go away. Stop is the last
+    # moment the applied-ops metrics mean anything (the connectors, and their CloudWatch
+    # dimensions, are about to be deleted), and this is the line a cut-over reviewer reads
+    # to see what the stream actually moved. The periodic roll-up is throttled, so without
+    # this the final interval -- often the one just before cut over -- would be missing.
+    _stop_totals = cdc_applied_totals(
+        getattr(migration_state, "cdc_applied_ops_by_table", None)
+    )
+    if _stop_totals != (0, 0, 0):
+        _log_cdc_event(
+            "CDC applied rows (final)",
+            status=ActivityStatus.INFO,
+            detail=(
+                cdc_applied_rollup_detail(
+                    getattr(migration_state, "cdc_applied_ops_by_table", None)
+                )
+                # Honest about freshness: these come from the last completed poll, not a
+                # drain confirmation, so they are a floor at the moment Stop was clicked.
+                + " — as of the last status poll before Stop"
+            ),
         )
 
     _action = "stop CDC connectors"
