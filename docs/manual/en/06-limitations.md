@@ -102,13 +102,16 @@ fails **loudly** where it can't.
     mismatch — never silently altered. Finite intervals and `timestamp`/`timestamptz`
     `infinity` are unaffected. Remodel such rows (e.g. to a finite sentinel) before
     migrating the column.
-  - **VIRTUAL generated columns (the DEFAULT kind on PG18).** DSQL has no generated
-    columns, so a `GENERATED ALWAYS AS (expr)` column — STORED **or** VIRTUAL — is
-    created as an ordinary column and flagged **MANUAL/LOSS** in Schema Conversion.
-    Full Load materializes the computed value (the target starts correct), but nothing
-    maintains it afterward and CDC does **not** replicate generated columns (VIRTUAL
-    columns cannot be logically replicated at all). Recompute the value in the
-    application before cut over.
+  - **VIRTUAL generated columns (the DEFAULT kind on PG18).** Aurora DSQL supports
+    `GENERATED ALWAYS AS (expr) **STORED**` and maintains the value itself, so a STORED
+    column is **preserved** — nothing to recompute and no drift (a write must simply omit
+    the column, which Full Load and the CDC sink do; DSQL rejects a supplied value). A
+    **VIRTUAL** column is the limitation: DSQL does not accept it, so it is created as an
+    ordinary column and flagged **MANUAL/LOSS**. Full Load materializes the value the
+    source computed (the target starts correct) but nothing maintains it afterward, and a
+    VIRTUAL column cannot be logically replicated at all, so CDC does not carry it.
+    Recompute it in the application before cut over. Decide before **apply** either way:
+    DSQL can DROP an expression from a column but never ADD one.
   - **CDC connector coverage.** The bundled Debezium PostgreSQL connector's tested
     matrix tops out at PG16. `pgoutput` streaming still works on 17/18 (the logical
     replication protocol is unchanged and the driver connects over the stable wire

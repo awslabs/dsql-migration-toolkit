@@ -181,7 +181,7 @@ DSQL_CONSTRAINTS = (
     "procedures are unsupported; auto-increment / sequential (monotonic) keys "
     "cause hot partitions; source-side native/declarative partitioning is not used "
     "(DSQL distributes data automatically); spatial/geometry types have no lossless "
-    "mapping; there are "
+    "mapping; STORED generated columns ARE supported (GENERATED ALWAYS AS (expr) STORED) and Aurora DSQL maintains them -- an INSERT/UPDATE must NOT supply a value for such a column; VIRTUAL generated columns are not supported; an expression can be DROPPED from a column but never ADDED to an existing one; there are "
     "transaction limits (a single DDL statement per transaction)."
 )
 

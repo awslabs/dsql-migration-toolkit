@@ -69,7 +69,8 @@ SCHEMA_DSQL_CONSTRAINTS = (
     "incurs extra reads and CASCADE/SET NULL/SET DEFAULT actions count toward the "
     "3000-row transaction limit), every table requires a primary key, secondary "
     "indexes are built asynchronously (CREATE INDEX ASYNC), the 'C' collation is "
-    "used, and there are transaction limits (a single DDL statement per transaction)."
+    "used, STORED generated columns ARE supported (GENERATED ALWAYS AS (expr) STORED) and Aurora DSQL maintains them -- an INSERT/UPDATE must NOT supply a value for such a column; VIRTUAL generated columns are not supported; an expression can be DROPPED from a column but never ADDED to an existing one, and there are "
+    "transaction limits (a single DDL statement per transaction)."
 )
 
 # DSQL constraints used to ground a query (DML) rewrite suggestion prompt.

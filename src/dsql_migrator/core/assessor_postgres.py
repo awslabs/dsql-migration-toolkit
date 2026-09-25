@@ -239,33 +239,86 @@ class PgGeneratedColumnRule(Rule):
     rule_id = "GENERATED_COLUMN"
 
     def evaluate(self, inventory: "SourceInventory") -> "list[Finding]":
+        # Mirrors converter._pg_generated_column_warning so the go/no-go report and the
+        # conversion preview cannot disagree -- including the SPLIT: Aurora DSQL supports a
+        # STORED generated column and maintains it (live-verified), so grading that as a
+        # loss and telling the operator to rewrite the application was both wrong and
+        # expensive. Only what genuinely cannot be carried is a loss.
+        from dsql_migrator.core.converter import pg_preserved_generated_columns
+
         findings: list[Finding] = []
         for table in inventory.tables:
-            columns = [column.name for column in table.columns if column.generated]
-            if not columns:
-                continue
-            names = ", ".join(columns)
-            findings.append(
-                Finding(
-                    object=ObjectKey(KIND_TABLE, table.name),
-                    rule_id=self.rule_id,
-                    classification=Classification.MANUAL,
-                    risk=(
-                        f"Columns ({names}) are PostgreSQL generated (computed) columns "
-                        "(STORED or VIRTUAL); Aurora DSQL has no equivalent, so they "
-                        "become ORDINARY columns. Full Load copies the values the source "
-                        "already computed, so the target starts correct -- but nothing "
-                        "maintains them afterwards, and the CDC stream does not carry "
-                        "them either, so any write that does not supply the value drifts."
-                    ),
-                    recommendation=(
-                        "Compute the value in the application (or in the query) before "
-                        "cut over; read the generating expression from the source, since "
-                        "it is not carried over."
-                    ),
-                    effort=EffortLevel.MEDIUM,
+            preserved = [c.name for c in pg_preserved_generated_columns(table)]
+            preserved_set = set(preserved)
+            lost = [
+                c.name for c in table.columns if c.generated and c.name not in preserved_set
+            ]
+            if preserved:
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_TABLE, table.name),
+                        rule_id=self.rule_id,
+                        classification=Classification.MANUAL,
+                        risk=(
+                            f"Columns ({', '.join(preserved)}) are PostgreSQL STORED "
+                            "generated columns. Aurora DSQL supports STORED generated "
+                            "columns and maintains them, so Schema Conversion PRESERVES "
+                            "the expression and the target keeps computing the value -- "
+                            "nothing to re-implement and no drift. The consequence to know "
+                            "is that a write must OMIT the column: DSQL rejects an "
+                            "INSERT/UPDATE that supplies a value for it, exactly as "
+                            "PostgreSQL does, which is why Full Load and the CDC sink leave "
+                            "it out."
+                        ),
+                        recommendation=(
+                            "No action needed. Decide only if you would rather NOT have the "
+                            "target compute it: remove the GENERATED clause from the DDL in "
+                            "Schema Conversion before applying, because Aurora DSQL can "
+                            "DROP an expression from a column later but cannot ADD one -- "
+                            "after apply, making the column generated needs the table "
+                            "recreated."
+                        ),
+                        effort=EffortLevel.SIMPLE,
+                        note_kind=ConversionNoteKind.RECOMMENDATION,
+                    )
                 )
-            )
+            if lost:
+                by_name = {c.name: c for c in table.columns}
+                kinds = ", ".join(
+                    f"{name} ("
+                    + (
+                        "VIRTUAL -- Aurora DSQL accepts only STORED"
+                        if by_name[name].generated_kind == "VIRTUAL"
+                        else "generating expression not captured"
+                        if not by_name[name].generated_expression
+                        else "part of the primary key, which cannot be loaded as generated"
+                    )
+                    + ")"
+                    for name in lost
+                )
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_TABLE, table.name),
+                        rule_id=self.rule_id,
+                        classification=Classification.MANUAL,
+                        risk=(
+                            f"Columns ({kinds}) are PostgreSQL generated columns that "
+                            "cannot be carried over, so each becomes an ORDINARY column. "
+                            "Full Load copies the value the source already computed, so the "
+                            "target starts correct -- but nothing maintains it afterwards, "
+                            "and the CDC stream does not carry it either, so any write that "
+                            "does not supply the value drifts."
+                        ),
+                        recommendation=(
+                            "Compute the value in the application (or in the query) before "
+                            "cut over. The expression is shown on the source DDL panel in "
+                            "Schema Conversion when it was captured. Note that Aurora DSQL "
+                            "cannot ADD an expression to an existing column, so this cannot "
+                            "be retrofitted after apply."
+                        ),
+                        effort=EffortLevel.MEDIUM,
+                    )
+                )
         return findings
 
 

@@ -221,7 +221,10 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
   `ON UPDATE CURRENT_TIMESTAMP`는 아예 재현할 수 없습니다 — DSQL에는 `ON UPDATE` 절도 트리거도
   없습니다 — 따라서 애플리케이션이 처리하도록 **MANUAL**로 표시됩니다. **PostgreSQL 소스**에서는
   변환기가 컬럼 DEFAULT를 전혀 내보내지 않습니다 — `serial`/`IDENTITY` `nextval`과 생성 컬럼 표현식
-  포함 — 따라서 타깃의 identity는 선택한 기본 키 전략이 좌우하며, `STORED` 생성 컬럼은 일반 컬럼으로
+  포함 — 따라서 타깃의 identity는 선택한 기본 키 전략이 좌우합니다. 단 `STORED` 생성 컬럼은
+  **보존**됩니다: 식이 `GENERATED ALWAYS AS (expr) STORED`로 다시 출력되고 Aurora DSQL이 모든 쓰기에서
+  값을 유지하므로 다시 구현할 것이 없습니다(쓰기는 그 컬럼을 빼야 하며, Full Load와 CDC 싱크가 그렇게
+  합니다). `VIRTUAL` 생성 컬럼(PG18의 기본 종류)은 DSQL에 대응물이 없어 일반 컬럼으로
   생성됩니다.
 - **외래 키 보존** — FK는 제거되지 않고 **보존**됩니다: 각 소스 FK를 적재 후 실행할
   `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` 문으로 렌더링하고(`CREATE TABLE` 밖에 둠), 데이터
@@ -324,7 +327,8 @@ Schema Conversion과 데이터 경로가 SQL 방언 차이를 메우기 위해 �
 > `tsvector`/`tsquery`, range + PG14 multirange, `pgvector`, `enum`, composite. PG의 numeric
 > 규칙은 아래 표와 같습니다: `p > 38`/`s > 37`인 `numeric(p,s)`는 경고와 함께 clamp되고, 정밀도 없는
 > `numeric`/`decimal`은 `numeric(18,6)`이 됩니다. 컬럼 DEFAULT, `serial`/`IDENTITY` `nextval`,
-> 생성 컬럼 표현식은 **내보내지 않으며**(identity는 PK 전략이 좌우), `STORED` 생성 컬럼은 일반 컬럼이
+> `serial`/`IDENTITY` `nextval`은 **내보내지 않지만**(identity는 PK 전략이 좌우) `STORED` 생성 컬럼의
+> 식은 다시 출력됩니다(Aurora DSQL이 지원·유지하므로). `VIRTUAL` 생성 컬럼은 일반 컬럼이
 > 됩니다.
 
 ### 타입 매핑 (전체 참조)

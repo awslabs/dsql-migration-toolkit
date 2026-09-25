@@ -267,7 +267,11 @@ MySQL→PostgreSQL transpile:
   application to handle. **For a PostgreSQL source** the converter emits **no** column
   DEFAULTs at all — including `serial`/`IDENTITY` `nextval` and generated-column
   expressions — so the chosen primary-key strategy governs identity on the target
-  instead, and `STORED` generated columns are created as ordinary columns.
+  instead. A `STORED` generated column IS preserved, though: its expression is re-emitted
+  as `GENERATED ALWAYS AS (expr) STORED` and Aurora DSQL maintains the value on every
+  write, so nothing has to be re-implemented (a write must simply OMIT the column, which
+  Full Load and the CDC sink do). A `VIRTUAL` generated column — PG18's default kind — has
+  no DSQL equivalent and is created ordinary.
 - **Foreign-key preservation** — Aurora DSQL **enforces** foreign keys, so each
   source FK is kept **out of the `CREATE TABLE`** and rendered as a separate
   post-load `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` statement. Full Load
@@ -394,9 +398,10 @@ shared "write contract" keeps them identical).
 > `tsvector`/`tsquery`, range + PG14 multirange, `pgvector`, `enum`, composite. The PG
 > numeric rules match the table below: `numeric(p,s)` with `p > 1000`/`s > 1000` is clamped
 > with a warning, and a bare `numeric`/`decimal` becomes `numeric(18,6)`. Column
-> DEFAULTs, `serial`/`IDENTITY` `nextval`, and generated-column expressions are **not**
-> emitted (the primary-key strategy governs identity), and `STORED` generated columns
-> become ordinary columns.
+> DEFAULTs and `serial`/`IDENTITY` `nextval` are **not** emitted (the primary-key strategy
+> governs identity). A `STORED` generated column's expression **is** re-emitted
+> (`GENERATED ALWAYS AS (expr) STORED`), because Aurora DSQL supports and maintains those;
+> a `VIRTUAL` one becomes an ordinary column.
 
 ### Type mapping (complete reference)
 

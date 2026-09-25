@@ -75,7 +75,7 @@ MySQL을 쓰던 입장에서 미리 알아 두면 좋은 주요 차이는 다음
 
 PostgreSQL 사용자라면: DSQL이 PostgreSQL 와이어를 쓴다고 해도 **Aurora PostgreSQL을 그대로 갈아
 끼우는 대체재는 아닙니다.** IAM 토큰 인증과 위의 트랜잭션당·값당 제한이 더해지고, 트리거·저장
-프로시저·생성 열(generated column)·`DEFAULT` 지원이 빠진 **제약된 분산형 PostgreSQL**이므로, 평범한
+프로시저가 빠진 **제약된 분산형 PostgreSQL**이므로(외래 키, 컬럼 `DEFAULT`, `STORED` 생성 열은 반대로 지원됩니다 — `VIRTUAL` 생성 열은 미지원), 평범한
 Aurora PostgreSQL처럼 다룰 수는 없습니다. (이 DSQL 차이는 소스 엔진과 무관하게 적용됩니다.)
 
 이런 제약은 DSQL이 **수평 확장**(대규모 분산)을 위해 의도적으로 택한 설계입니다. 걱정하지 않아도

@@ -894,6 +894,65 @@ def parse_target_column_types(create_ddl: str) -> dict[str, str]:
     return types
 
 
+# ``GENERATED {ALWAYS|BY DEFAULT} AS IDENTITY [(options)]`` as the converter emits it.
+# sqlglot's postgres reader raises on the CACHE option, so this is removed before parsing
+# an applied DDL for anything else.
+_IDENTITY_CLAUSE_RE = re.compile(
+    r"GENERATED\s+(?:ALWAYS|BY\s+DEFAULT)\s+AS\s+IDENTITY\s*(?:\([^)]*\))?",
+    re.IGNORECASE,
+)
+
+
+def parse_target_generated_columns(create_ddl: str) -> set[str]:
+    """Return the names of GENERATED ... STORED columns in an applied CREATE TABLE DDL.
+
+    The third applied-DDL reader beside :func:`parse_target_column_types` and
+    :func:`parse_target_primary_key`, and it exists for the same reason: the load must
+    follow the DDL that was actually applied (including a user edit in Schema Conversion),
+    not re-derive the answer from the source.
+
+    Aurora DSQL REJECTS an INSERT that supplies a value for a generated column
+    (``cannot insert a non-DEFAULT value into column ...``, SQLSTATE 428C9), so the loader
+    has to leave such a column out of both the INSERT list and the ON CONFLICT DO UPDATE
+    SET list. Getting that wrong is not subtle: every batch for the table fails and every
+    row is quarantined.
+
+    An unparseable DDL yields an EMPTY set deliberately -- "unknown" must mean "send the
+    column" (which fails loudly) rather than "skip it" (which would write NULL into an
+    ordinary column and only surface much later as a Validation mismatch).
+    """
+    # Strip the identity clause FIRST. sqlglot cannot parse the CACHE option (which is
+    # exactly why the identity is injected as raw text -- see _apply_pk_strategy), so any
+    # applied DDL carrying an identity column raises ParseError. That would return "no
+    # generated columns" for precisely the tables most likely to have one, and the loader
+    # would then send the value and quarantine every row (428C9). The pattern is the tool's
+    # own fixed emission, so removing it is safe and keeps the rest of the DDL intact.
+    stripped = _IDENTITY_CLAUSE_RE.sub("", create_ddl or "")
+    try:
+        parsed = sqlglot.parse_one(stripped, read="postgres")
+    except Exception:  # noqa: BLE001 - unparseable DDL -> unknown (send the column)
+        return set()
+    if not isinstance(parsed, exp.Create):
+        return set()
+    generated: set[str] = set()
+    for column_def in parsed.find_all(exp.ColumnDef):
+        name = column_def.name
+        if not name:
+            continue
+        for constraint in column_def.args.get("constraints") or []:
+            # The clause is INJECTED as raw text (see _apply_pg_generated_columns), so it
+            # comes back as an exp.Var rather than a ComputedColumnConstraint -- match on
+            # the rendered text, which covers BOTH shapes (a hand-edited DDL that sqlglot
+            # parsed structurally, and the tool's own injected string).
+            rendered = constraint.sql(dialect="postgres").upper()
+            # No IDENTITY test needed: _IDENTITY_CLAUSE_RE already removed every identity
+            # clause from the text before it was parsed, so one cannot reach this loop.
+            if "GENERATED" in rendered and "AS" in rendered:
+                generated.add(name)
+                break
+    return generated
+
+
 def parse_target_primary_key(create_ddl: str) -> list[str]:
     """Return the PRIMARY KEY column names (in key order) from a CREATE TABLE DDL.
 
@@ -2531,42 +2590,155 @@ def _generated_column_warning(table: TableDef) -> Optional[ConversionWarning]:
     )
 
 
-def _pg_generated_column_warning(table: TableDef) -> Optional[ConversionWarning]:
-    """PostgreSQL-source variant of :func:`_generated_column_warning`.
+def pg_preserved_generated_columns(table: TableDef) -> "list[ColumnDef]":
+    """The PostgreSQL generated columns whose expression is re-emitted for Aurora DSQL.
 
-    A PostgreSQL ``GENERATED ALWAYS AS (...)`` column -- **STORED** or **VIRTUAL** (the
-    latter new in PG18, where it is the default kind) -- has no Aurora DSQL equivalent, so
-    it is created as an ORDINARY column (``build_pg_source_ddl`` emits no ``GENERATED``
-    clause). Full Load copies the values the source already computed (a VIRTUAL column is
-    computed on read, so its value is materialized too) -- the target starts CORRECT -- but
-    nothing maintains them, so any insert/update that does not supply the value drifts. CDC
-    does not maintain them either: PostgreSQL does not publish generated columns by default,
-    and VIRTUAL generated columns cannot be logically replicated at all. The wording is
-    PG-specific (the MySQL variant names ``SHOW CREATE TABLE``); kept as a separate helper
-    so the MySQL message stays byte-identical.
+    Three conditions, each for a reason proven live:
+
+    * ``generated_kind == "STORED"`` -- DSQL accepts ``GENERATED ALWAYS AS (expr) STORED``
+      and maintains it (INSERT computes, UPDATE recomputes, an explicitly supplied value is
+      rejected). ``VIRTUAL`` is a syntax error there, so it stays an ordinary column.
+    * an expression was captured -- a MySQL source never populates
+      ``generated_expression`` (introspection does not read
+      ``information_schema.COLUMNS.GENERATION_EXPRESSION``), so this condition is what keeps
+      MySQL behaviour byte-identical without testing the engine.
+    * the column is NOT part of the primary key -- DSQL accepts that shape, but the Full
+      Load path cannot write it: the batch INSERT must OMIT a generated column, while
+      ``_select_filter_insert`` reads every KEY column out of the row dict, so a key column
+      that is absent raises ``KeyError`` and fails the batch. Preserving it would trade a
+      correct-but-unloadable table for a loadable one, so the clause is dropped (and the
+      conversion note says so).
     """
-    columns = [column.name for column in table.columns if column.generated]
-    if not columns:
-        return None
-    names = ", ".join(columns)
-    return ConversionWarning(
-        object_name=table.name,
-        classification=Classification.MANUAL,
-        kind=ConversionNoteKind.LOSS,
-        message=(
-            f"Columns ({names}) are PostgreSQL generated (computed) columns (STORED or "
-            "VIRTUAL); Aurora DSQL has no equivalent, so they are created as ORDINARY "
-            "columns. Full Load copies the values the source already computed, so the "
-            "target starts correct — but nothing maintains them afterwards, so any "
-            "insert/update that does not supply the value will drift. CDC does not maintain "
-            "them either: generated columns are not carried by the replication stream "
-            "(PostgreSQL does not publish them by default, and VIRTUAL columns — the default "
-            "kind on PostgreSQL 18 — cannot be logically replicated at all). Compute the "
-            "value in the application (or in the query) before cut over. The generating "
-            "expression is not captured here; read it from the source (e.g. \\d+ on the "
-            "table, or pg_get_expr on pg_attrdef)."
-        ),
-    )
+    primary_key = set(table.primary_key or [])
+    return [
+        column
+        for column in table.columns
+        if column.generated
+        and column.generated_kind == "STORED"
+        and column.generated_expression
+        and column.name not in primary_key
+    ]
+
+
+def _apply_pg_generated_columns(create: exp.Expression, table: TableDef) -> None:
+    """Re-attach each preserved ``GENERATED ALWAYS AS (expr) STORED`` clause, in place.
+
+    Injected as RAW TEXT into the already-parsed tree -- the same technique
+    ``_apply_pk_strategy`` uses for the identity ``CACHE`` clause, but for a different and
+    sharper reason. sqlglot CAN parse and render this clause, so emitting it through
+    ``build_pg_source_ddl`` (which is re-parsed and re-RENDERED) looks fine and silently
+    corrupts real ``pg_get_expr`` output. Measured on what PostgreSQL actually stores:
+
+        (tags #>> '{a,b}'::text[])          -> CAST(tags #>> '{a,b}' AS TEXT[])
+        ((tags -> 'a') ->> 'b'::text)       -> operator does not exist: text ->> unknown
+        date_part('year'::text, d)          -> EXTRACT(CAST('year' AS TEXT) FROM d)
+        ((name IS NOT NULL))::integer       -> sqlglot ParseError
+
+    The last one is the worst: a ParseError here aborts the WHOLE table
+    (``_unparsable_table_conversion``), taking every other column with it. Injecting the
+    source text verbatim preserves all four byte-for-byte.
+    """
+    for column in pg_preserved_generated_columns(table):
+        column_def = _find_column_def(create, column.name)
+        if column_def is None:
+            continue
+        constraints = list(column_def.args.get("constraints") or [])
+        constraints.append(
+            exp.ColumnConstraint(
+                kind=exp.var(
+                    f"GENERATED ALWAYS AS ({column.generated_expression}) STORED"
+                )
+            )
+        )
+        column_def.set("constraints", constraints)
+
+
+def _pg_generated_column_warning(table: TableDef) -> "list[ConversionWarning]":
+    """PostgreSQL-source variant of :func:`_generated_column_warning`, split by KIND.
+
+    The old single message said "Aurora DSQL has no equivalent, so they are created as
+    ORDINARY columns ... Compute the value in the application", which is FALSE for the
+    common kind. Live-verified on a real cluster: DSQL accepts
+    ``GENERATED ALWAYS AS (expr) STORED``, computes the value on INSERT, RECOMPUTES it on
+    UPDATE, reports ``attgenerated='s'``, and REJECTS an INSERT that supplies a value;
+    ``VIRTUAL`` is a syntax error. So there are two outcomes, and telling the operator to
+    rewrite the application for the supported one is both wrong and expensive -- and
+    irreversible after apply, since DSQL cannot ADD an expression to an existing column.
+
+    Returns a LIST because one table can have both kinds.
+    """
+    preserved = [c.name for c in pg_preserved_generated_columns(table)]
+    preserved_set = set(preserved)
+    lost = [
+        c.name
+        for c in table.columns
+        if c.generated and c.name not in preserved_set
+    ]
+    warnings: list[ConversionWarning] = []
+    if preserved:
+        warnings.append(
+            ConversionWarning(
+                object_name=table.name,
+                classification=Classification.MANUAL,
+                kind=ConversionNoteKind.RECOMMENDATION,
+                message=(
+                    f"Columns ({', '.join(preserved)}) are PostgreSQL STORED generated "
+                    "columns and are PRESERVED: the target DDL re-creates them as GENERATED "
+                    "ALWAYS AS (<expression>) STORED, and Aurora DSQL maintains the value on "
+                    "every insert and update — there is nothing to re-implement and no "
+                    "drift. Two consequences follow from that. Any write must OMIT the "
+                    "column: DSQL rejects an INSERT/UPDATE that supplies a value for it "
+                    "(exactly as PostgreSQL does), which is why Full Load and the CDC sink "
+                    "leave it out and let the target compute it. And the decision is made "
+                    "HERE: DSQL can DROP an expression from a column later but cannot ADD "
+                    "one, so if you edit this DDL to remove the clause the column can never "
+                    "be made generated again without recreating the table."
+                ),
+            )
+        )
+    if lost:
+        # What actually cannot be carried, and why -- per column, because the reasons
+        # differ and the operator's next step differs with them.
+        reasons: list[str] = []
+        by_name = {c.name: c for c in table.columns}
+        for name in lost:
+            column = by_name[name]
+            if column.generated_kind == "VIRTUAL":
+                reasons.append(
+                    f"{name}: VIRTUAL (the default kind on PostgreSQL 18), which Aurora "
+                    "DSQL does not accept — only STORED"
+                )
+            elif not column.generated_expression:
+                reasons.append(
+                    f"{name}: the generating expression was not captured, so there is "
+                    "nothing to re-emit"
+                )
+            else:
+                reasons.append(
+                    f"{name}: it is part of the PRIMARY KEY, and a generated key column "
+                    "cannot be loaded (the batch INSERT must omit a generated column, but "
+                    "every key column has to be read back to key the idempotent write)"
+                )
+        warnings.append(
+            ConversionWarning(
+                object_name=table.name,
+                classification=Classification.MANUAL,
+                kind=ConversionNoteKind.LOSS,
+                message=(
+                    f"Columns ({', '.join(lost)}) are PostgreSQL generated columns that "
+                    "could NOT be preserved — " + "; ".join(reasons) + ". Each is created "
+                    "as an ORDINARY column. Full Load copies the value the source already "
+                    "computed, so the target starts correct, but nothing maintains it "
+                    "afterwards: any write that does not supply the value drifts, and the "
+                    "CDC stream does not carry it either (PostgreSQL does not publish "
+                    "generated columns, and a VIRTUAL one cannot be logically replicated at "
+                    "all). Compute the value in the application before cut over. Aurora "
+                    "DSQL cannot ADD an expression to an existing column, so making it "
+                    "generated later means recreating the table."
+                ),
+            )
+        )
+    return warnings
 
 
 def _collation_warning(table: TableDef) -> Optional[ConversionWarning]:
@@ -3679,6 +3851,10 @@ class SchemaConverter:
                 create = sqlglot.parse_one(build_pg_source_ddl(table), read=_POSTGRES)
             except sqlglot.errors.SqlglotError as exc:
                 return _unparsable_table_conversion(table, exc)
+            # Re-attach the STORED generated-column clauses AFTER the parse and BEFORE the
+            # primary-key strategy, so the expression text is never re-rendered by sqlglot
+            # (which mangles real pg_get_expr output -- see _apply_pg_generated_columns).
+            _apply_pg_generated_columns(create, table)
         else:
             # DSQL-unsupported source types (e.g. MySQL spatial) are substituted with
             # bytea so the table still converts and the data is PRESERVED as raw bytes
@@ -3994,7 +4170,9 @@ class SchemaConverter:
             (_oversized_lob_warning(table) if not is_postgres else None),
             (_pg_oversized_lob_warning(table) if is_postgres else None),
             (_generated_column_warning(table) if not is_postgres else None),
-            (_pg_generated_column_warning(table) if is_postgres else None),
+            # Returns a LIST (one table can have both a preserved STORED column and a
+            # lost VIRTUAL one), so it is flattened rather than appended as one note.
+            *(_pg_generated_column_warning(table) if is_postgres else ()),
             (_collation_warning(table) if not is_postgres else None),
             (_pg_collation_warning(table) if is_postgres else None),
             (_on_update_timestamp_warning(table) if not is_postgres else None),

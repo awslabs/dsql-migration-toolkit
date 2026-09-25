@@ -1575,6 +1575,39 @@ def scope_lob_candidates(
     return [c for c in candidates if c.table in stored]
 
 
+def cdc_excluded_columns(
+    lob_exclusions: "Mapping[str, Sequence[str]]",
+    inventory: object,
+) -> "dict[str, list[str]]":
+    """The columns CDC must not stream: the operator's LOB exclusions PLUS the columns
+    Aurora DSQL computes itself.
+
+    A preserved ``GENERATED ALWAYS AS (expr) STORED`` column is maintained by the TARGET, and
+    DSQL REJECTS a write that supplies a value for it (SQLSTATE 428C9, a permanent error the
+    sink dead-letters). So it must be in Debezium's ``column.exclude.list`` for the same
+    reason Full Load omits it from the INSERT.
+
+    In practice PostgreSQL 17 and earlier do not publish generated columns at all, so this is
+    belt-and-braces there; it becomes load-bearing on PostgreSQL 18, whose publications can
+    opt into publishing them (``publish_generated_columns``).
+
+    Derived from the SOURCE inventory with the converter's own predicate, so it agrees with
+    what Schema Conversion emits. Caveat worth knowing: if the operator EDITS the target DDL
+    to delete the GENERATED clause, the target column becomes ordinary and would then want
+    the stream -- re-run Schema Conversion's apply so the two agree.
+    """
+    from dsql_migrator.core.converter import pg_preserved_generated_columns
+
+    merged: dict[str, set[str]] = {
+        table: set(columns) for table, columns in (lob_exclusions or {}).items()
+    }
+    for table in getattr(inventory, "tables", None) or ():
+        preserved = [column.name for column in pg_preserved_generated_columns(table)]
+        if preserved:
+            merged.setdefault(table.name, set()).update(preserved)
+    return {table: sorted(columns) for table, columns in merged.items() if columns}
+
+
 def format_column_exclude_list(
     selected: dict[str, Sequence[str]],
 ) -> str:
@@ -1798,7 +1831,7 @@ def cdc_handling_facts() -> list[CdcHandlingFact]:
             handled=True,
             title="Source types are converted for DSQL",
             detail=(
-                "Column types (e.g. ENUM, JSON, date/time, generated columns) are "
+                "Column types (e.g. ENUM, JSON, date/time) are "
                 "mapped to their DSQL-compatible target types automatically."
             ),
             evidence="H8",

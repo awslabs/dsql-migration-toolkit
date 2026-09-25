@@ -164,11 +164,26 @@ class ColumnDef(BaseModel):
         default=None,
         description=(
             "The expression a PostgreSQL generated column computes (from pg_attrdef via "
-            "pg_get_expr), or None when unknown. Aurora DSQL has no generated columns, so "
-            "this is NEVER emitted into target DDL -- it exists so the rendered SOURCE DDL "
-            "and the conversion note can show WHAT the column computed, which is exactly "
-            "what the operator has to re-implement. Evaluation told them to 'read the "
-            "generating expression from the source' while the tool discarded it."
+            "pg_get_expr), or None when unknown. For a STORED column it IS emitted into "
+            "the target DDL: Aurora DSQL supports STORED generated columns and maintains "
+            "them (live-verified -- CREATE accepted, the value computed on INSERT and "
+            "recomputed on UPDATE, pg_attribute.attgenerated='s', and an INSERT that "
+            "supplies a value rejected). It used to be discarded on the claim that 'Aurora "
+            "DSQL has no generated columns', which was simply false. A MySQL source never "
+            "populates this (introspection does not read "
+            "information_schema.COLUMNS.GENERATION_EXPRESSION), which is why a MySQL "
+            "generated column still cannot be preserved."
+        ),
+    )
+    generated_kind: Optional[str] = Field(
+        default=None,
+        description=(
+            "Which generated-column kind the source uses -- 'STORED' or 'VIRTUAL' (from "
+            "pg_attribute.attgenerated 's'/'v') -- or None when unknown/not generated. The "
+            "kind decides the outcome, so it cannot stay collapsed into the ``generated`` "
+            "boolean: Aurora DSQL supports STORED and rejects VIRTUAL (syntax error), and "
+            "VIRTUAL cannot be logically replicated at all. Same shape as "
+            "``identity_generation``, added for the same reason."
         ),
     )
     identity_generation: Optional[str] = Field(

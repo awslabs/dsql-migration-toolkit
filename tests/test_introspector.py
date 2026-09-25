@@ -1279,3 +1279,68 @@ def test_postgres_introspection_reads_a_materialized_views_defining_query() -> N
     foreign = by_name["ext_customers"]
     assert foreign.unsupported_kind == "foreign table"
     assert foreign.definition == "", foreign.definition
+
+
+def test_postgres_introspection_keeps_the_generated_column_KIND() -> None:
+    """Aurora DSQL supports STORED and REJECTS VIRTUAL, so the kind decides the outcome.
+
+    ``attgenerated`` was read, tested against ``('s','v')`` and then collapsed into a
+    boolean -- the same discard that ``identity_generation`` was added to fix. With both
+    kinds looking identical, the converter treated the SUPPORTED one as unsupported.
+    """
+    from dsql_migrator.core.converter import pg_preserved_generated_columns
+    from dsql_migrator.core.models import ColumnDef, TableDef
+    from dsql_migrator.core.source_dialect.postgres import _pg_enrich_columns
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def mappings(self):
+            return self._rows
+
+    class _Connection:
+        """Answers the enrich query with what the real catalog returns."""
+
+        def execute(self, statement, params):  # noqa: ANN001, ANN201
+            assert params["nsp"] == "ecommerce", params
+            return _Result(
+                [
+                    {"col": "id", "typ": "bigint", "gen": "", "ident": ""},
+                    {
+                        "col": "stored_col",
+                        "typ": "numeric(12,2)",
+                        "gen": "s",
+                        "ident": "",
+                        "gen_expr": "((quantity)::numeric * unit_price)",
+                    },
+                    {
+                        "col": "virtual_col",
+                        "typ": "integer",
+                        "gen": "v",
+                        "ident": "",
+                        "gen_expr": "(quantity + 1)",
+                    },
+                ]
+            )
+
+    table = TableDef(
+        name="ecommerce.order_items",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="stored_col", mysql_type="numeric"),
+            ColumnDef(name="virtual_col", mysql_type="integer"),
+        ],
+        primary_key=["id"],
+    )
+    _pg_enrich_columns(_Connection(), "ecommerce", [table])
+
+    by_name = {c.name: c for c in table.columns}
+    assert by_name["stored_col"].generated_kind == "STORED"
+    assert by_name["virtual_col"].generated_kind == "VIRTUAL"
+    assert by_name["id"].generated_kind is None
+    assert by_name["stored_col"].generated_expression == (
+        "((quantity)::numeric * unit_price)"
+    )
+    # ... and the kind is what decides preservation: only STORED survives.
+    assert [c.name for c in pg_preserved_generated_columns(table)] == ["stored_col"]

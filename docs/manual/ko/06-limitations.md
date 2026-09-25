@@ -83,11 +83,14 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
     **격리(quarantine)**되어(격리 카운트에 표시됨) Validation에서 count/checksum 불일치로 드러납니다 —
     조용히 변형되는 일은 없습니다. 유한 interval과 `timestamp`/`timestamptz`의 `infinity`는 영향받지
     않습니다. 해당 컬럼을 마이그레이션하기 전에 그런 행을 재모델링(예: 유한 sentinel 값)하세요.
-  - **VIRTUAL 생성 컬럼(PG18의 기본 종류).** DSQL에는 생성 컬럼이 없으므로 `GENERATED ALWAYS AS
-    (expr)` 컬럼은 — STORED든 **VIRTUAL**이든 — 일반 컬럼으로 생성되고 Schema Conversion에서
-    **MANUAL/LOSS**로 표시됩니다. Full Load는 계산된 값을 실체화하므로(타깃은 처음엔 정확함) 이후엔
-    아무것도 유지하지 않고, CDC도 생성 컬럼을 복제하지 **않습니다**(VIRTUAL 컬럼은 논리 복제 자체가
-    불가). 컷오버 전에 애플리케이션에서 값을 다시 계산하세요.
+  - **VIRTUAL 생성 컬럼(PG18의 기본 종류).** Aurora DSQL은 `GENERATED ALWAYS AS (expr) **STORED**`를
+    지원하고 값을 스스로 유지하므로 STORED 컬럼은 **보존**됩니다 — 다시 계산할 것도, 드리프트도
+    없습니다(쓰기에서 그 컬럼을 빼면 되고, Full Load와 CDC 싱크가 그렇게 합니다. DSQL은 값을 명시하면
+    거부합니다). 제약은 **VIRTUAL** 쪽입니다: DSQL이 받지 않으므로 일반 컬럼으로 생성되고
+    **MANUAL/LOSS**로 표시됩니다. Full Load가 소스의 계산값을 실체화하므로 타깃은 처음엔 정확하지만
+    이후엔 아무것도 유지하지 않고, VIRTUAL 컬럼은 논리 복제 자체가 불가해 CDC도 나르지 않습니다.
+    컷오버 전에 애플리케이션에서 다시 계산하세요. 어느 쪽이든 **apply 전에** 결정해야 합니다: DSQL은
+    컬럼에서 식을 DROP할 수는 있어도 추가(ADD)할 수는 없습니다.
   - **CDC 커넥터 커버리지.** 번들된 Debezium PostgreSQL 커넥터의 테스트 매트릭스는 PG16까지입니다.
     `pgoutput` 스트리밍은 17/18에서도 동작하지만(논리 복제 프로토콜은 그대로이고 드라이버는 안정적인
     와이어 프로토콜로 연결됨), 17/18 CDC는 **best-effort**로 취급하고 프로덕션에 의존하기 전에 종단 간

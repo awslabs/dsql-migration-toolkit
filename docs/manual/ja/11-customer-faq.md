@@ -305,7 +305,8 @@ DSQL に相当のない PostgreSQL 型は **UNSUPPORTED** としてフラグが�
 `bit`/`varbit`・`tsvector`/`tsquery`・`range` / マルチレンジ → `text`、`money` → `numeric`、
 `pgvector` → `jsonb`/`text`、`enum` → `text`、composite → 列 / `jsonb`。`numeric(p,s)` で p > 38 は警告付きで
 クランプされ、素の `numeric`/`decimal` は DSQL の `numeric(18,6)` になり、列の `DEFAULT` / `serial` /
-identity の `nextval` は **出力されず**（identity は PK 戦略が管理）、`STORED` 生成列は通常の列になります。
+identity の `nextval` は **出力されません**（identity は PK 戦略が管理）。`STORED` 生成列は **保持**され
+（Aurora DSQL が対応し値を維持します）、`VIRTUAL` 生成列は通常の列になりアプリケーションでの再計算が必要です。
 型と制約のリファレンスは
 [第 2 章 §2.3](02-evaluation-and-schema-conversion.md#23-mysql--dsql-の型と制約の処理-リファレンス) をご覧ください。
 

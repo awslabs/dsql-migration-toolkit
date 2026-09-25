@@ -5096,3 +5096,36 @@ def test_keep_tile_does_not_promise_no_application_change_for_a_generated_key() 
     ui = _PickerUi()
     _render_pk_strategy_picker(ui, plain, SchemaConversionState(), lambda: None)
     assert "Nothing in the application changes" in ui.body()
+
+
+def test_the_source_panel_shows_the_real_generated_column_kind() -> None:
+    """VIRTUAL is the DEFAULT kind on PostgreSQL 18 and the ONE kind DSQL rejects.
+
+    The panel hardcoded STORED, so a VIRTUAL source column was mislabelled as the supported
+    kind -- hiding the single difference the side-by-side diff exists to show (and the panel
+    has a Copy Source DDL button, so the wrong text travels).
+    """
+    from dsql_migrator.ui.schema_conversion import _render_source_table_ddl_postgres
+
+    def table(kind: str) -> TableDef:
+        return TableDef(
+            name="ecommerce.t",
+            columns=[
+                ColumnDef(name="id", mysql_type="bigint", nullable=False),
+                ColumnDef(name="q", mysql_type="integer", nullable=False),
+                ColumnDef(
+                    name="g",
+                    mysql_type="numeric(12,2)",
+                    generated=True,
+                    generated_kind=kind,
+                    generated_expression="((q)::numeric * 2)",
+                ),
+            ],
+            primary_key=["id"],
+        )
+
+    stored = _render_source_table_ddl_postgres(table("STORED"))
+    assert "GENERATED ALWAYS AS (((q)::numeric * 2)) STORED" in stored, stored
+    virtual = _render_source_table_ddl_postgres(table("VIRTUAL"))
+    assert "GENERATED ALWAYS AS (((q)::numeric * 2)) VIRTUAL" in virtual, virtual
+    assert "STORED" not in virtual, virtual

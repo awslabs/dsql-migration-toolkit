@@ -5,6 +5,17 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.536
+
+### 수정
+
+- **PostgreSQL `STORED` 생성 컬럼이 "Aurora DSQL에는 대응물이 없다"는 근거로 파괴되고 있었습니다. DSQL에는 있습니다.** 실제 클러스터에서 검증: `GENERATED ALWAYS AS (expr) STORED`가 수락되고, `INSERT` 시 값이 계산되며(3 × 2.50 → 7.50) `UPDATE` 시 재계산되고(→ 10.00), `pg_attribute.attgenerated`가 `'s'`이며, 값을 명시한 `INSERT`는 거부됩니다 — PostgreSQL과 동일합니다. `VIRTUAL`은 syntax error입니다(PostgreSQL 17에도 없습니다). 그런데도 도구는 절을 버리고 일반 컬럼을 만든 뒤, Evaluation·Schema Conversion(2곳)·AI grounding(2곳)·매뉴얼 3종에서 "애플리케이션에서 값을 계산하라"고 안내했습니다 — 불필요한 작업이고, **apply 후에는 되돌릴 수 없습니다**(DSQL은 컬럼에서 식을 `DROP`할 수는 있어도 `ADD`할 수는 없습니다). 이제 식을 다시 출력하므로 타깃이 값을 계속 계산합니다: 드리프트도, 재구현할 것도 없습니다. `VIRTUAL`, 식이 수집되지 않은 컬럼(MySQL 소스 전부 — introspection이 `GENERATION_EXPRESSION`을 읽지 않음), 기본 키에 포함된 생성 컬럼은 각각의 사유와 함께 여전히 일반 컬럼으로 생성됩니다.
+- **절은 RAW 텍스트로 주입합니다 — sqlglot이 실제 `pg_get_expr` 출력을 훼손하기 때문입니다.** 재파싱·재렌더링되는 DDL 빌더로 내보내면 맞아 보이면서 PostgreSQL이 실제로 저장한 것을 조용히 망칩니다. 측정 결과: `(tags #>> '{a,b}'::text[])` → `CAST(tags #>> '{a,b}' AS TEXT[])`; `((tags -> 'a') ->> 'b'::text)` → `operator does not exist: text ->> unknown`; `date_part('year'::text, d)` → `EXTRACT(CAST('year' AS TEXT) FROM d)`; `((name IS NOT NULL))::integer` → `ParseError`로 **테이블 전체**가 중단되고 다른 모든 컬럼까지 함께 망가집니다. 이제 네 형태 모두 바이트 단위로 보존됩니다(identity `CACHE` 절과 동일한 기법).
+- **Full Load가 타깃이 계산하는 컬럼을 제외합니다 — 보존을 안전하게 만드는 핵심입니다.** DSQL은 생성 컬럼에 값을 공급하는 쓰기를 거부하며(SQLSTATE `428C9`) 이는 영구 오류이므로, 절을 보존한 상태로 그대로 두면 모든 배치가 실패하고 모든 행이 격리됩니다 — 재현 결과 64행이 127개 문장이 되어 0행 적재, 64행 영구 폐기였습니다. 해당 컬럼은 하나의 `TableDef` 필터로 keyset `SELECT`, `INSERT` 컬럼 목록, `ON CONFLICT DO UPDATE SET` 목록에서 모두 빠집니다. 어떤 컬럼인지는 기본 키와 똑같이 **두 신호**로 결정합니다: 이번 실행이 타깃을 재생성할 때는 적용된 DDL, 기존 타깃에 append할 때는 **라이브 카탈로그** — 구버전(절을 제거했던)·고객 자신의 DDL·편집 후 되돌린 스크립트로 만들어진 타깃은 이번 변환이 GENERATED라고 해도 실제로는 일반 컬럼일 수 있고, 그때 DDL을 믿으면 모든 행에 NULL이 조용히 기록됩니다. 카탈로그를 읽을 수 없으면 UNKNOWN으로 보고 추측 대신 적재를 거부하며, 생성 컬럼이 전혀 없는 테이블은 추가 왕복 없이 기존 경로를 그대로 탑니다.
+- **CDC는 보존된 생성 컬럼을 스트림에서 제외합니다**(`column.exclude.list`). 같은 이유로 싱크의 쓰기가 거부되어 dead-letter 되기 때문입니다. PostgreSQL 17 이하는 생성 컬럼을 아예 publish하지 않으므로 거기서는 보험이고, publication이 publish를 선택할 수 있는 PostgreSQL 18에서 실질적으로 작동합니다.
+- **`pg_attribute.attgenerated`를 읽고도 boolean으로 버려서, 지원되는 종류가 미지원처럼 보였습니다.** `ColumnDef.generated_kind`('STORED'/'VIRTUAL')가 이를 보존합니다 — `identity_generation`과 같은 수정 — 그리고 소스 DDL 패널이 `STORED`를 하드코딩하는 대신 실제 종류를 렌더링하므로, PG18 `VIRTUAL` 컬럼이 DSQL이 받아들이는 종류로 잘못 표기되지 않습니다.
+- **MySQL 생성 컬럼 결과가 스스로 던진 질문에 이제 답합니다.** "**대상에서 지원되면** PostgreSQL GENERATED 컬럼으로 재생성하라"는 이렇게 바뀝니다: DSQL은 `STORED`를 지원하지만 MySQL 식은 옮길 수 없습니다(introspection이 `information_schema.COLUMNS.GENERATION_EXPRESSION`을 읽지 않음) — 따라서 적용 전에 DDL 편집기에서 직접 다시 넣거나(PostgreSQL 문법으로 번역) 애플리케이션에서 계산하고, 나중에는 식을 추가할 수 없으므로 apply 전에 결정하라고 안내합니다.
+
 ## v0.1.535
 
 ### 수정

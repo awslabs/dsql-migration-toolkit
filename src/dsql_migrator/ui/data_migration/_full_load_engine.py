@@ -63,6 +63,8 @@ from dsql_migrator.core.converter import (
     SchemaConvertOptions,
     TableConversion,
     parse_target_column_types,
+    parse_target_generated_columns,
+    pg_preserved_generated_columns,
     parse_target_primary_key,
 )
 from dsql_migrator.core.schema_applier import (
@@ -1212,6 +1214,22 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
         target_types = (
             parse_target_column_types(applied.target_ddl) if applied else None
         )
+        # The target is ALREADY in its final shape here (the parent recreates every
+        # replace table before submitting shards), so the LIVE catalog is the authority
+        # for which columns DSQL computes -- see BatchedTableMigrator.resolve_generated_
+        # columns. Sending one is a permanent 428C9 for every batch of this shard.
+        generated_columns = migrator.resolve_generated_columns(
+            args.table, applied, target_is_final=False
+        )
+        if generated_columns is None:
+            raise FullLoadIncompleteError(
+                f"Could not determine whether '{name}' has generated columns on Aurora "
+                "DSQL, so this shard was not loaded (reading the target catalog failed). "
+                "A generated column REJECTS a supplied value and omitting the wrong "
+                "column would write NULLs, so neither default is safe."
+            )
+        if generated_columns:
+            table = apply_lob_exclusions(table, generated_columns)
         _is_cancelled = lambda: (  # noqa: E731 - shared by the load + its retry
             cancel_event is not None and cancel_event.is_set()
         )
@@ -3770,6 +3788,9 @@ class BatchedTableMigrator:
         target_pk_reader: Optional[
             Callable[[TableDef], Optional[list[str]]]
         ] = None,
+        target_generated_reader: Optional[
+            Callable[[TableDef], Optional[set[str]]]
+        ] = None,
     ) -> None:
         """Build a migrator bound to one run's ``inputs``."""
         self._inputs = inputs
@@ -3802,6 +3823,11 @@ class BatchedTableMigrator:
         # the append path when the applied conversion asks for a different key than
         # the source, to decide against the live target instead of assuming.
         self._target_pk_reader = target_pk_reader or self._default_target_pk
+        # Reads the target's ACTUAL generated columns (injectable for tests). Used on the
+        # append path, where the applied DDL cannot be trusted to describe the live target.
+        self._target_generated_reader = (
+            target_generated_reader or self._default_target_generated
+        )
 
     @property
     def source_type(self) -> SourceType:
@@ -4000,6 +4026,36 @@ class BatchedTableMigrator:
             table, self._inputs.excluded_lob_columns.get(table.name)
         )
         applied = self._inputs.table_conversions.get(table.name)
+        # A column the TARGET computes must not be sent: Aurora DSQL rejects an INSERT
+        # that supplies a value for a generated column (428C9), permanently, so every
+        # batch would fail and every row would be quarantined. Filtered through the same
+        # primitive as the LOB exclusions, which covers the keyset SELECT, the INSERT
+        # column list and the ON CONFLICT DO UPDATE SET list in one stroke.
+        #
+        # ``target_is_final`` decides WHICH signal is authoritative -- see
+        # resolve_generated_columns. Here the target is final when this run recreates it
+        # from the applied DDL (is_replace, computed below from the same inputs) or the
+        # parent already did (pre_recreated).
+        table_is_replace_now = (
+            not self._inputs.cdc_coexisting
+            and table.name in self._inputs.replace_tables
+        )
+        generated_columns = self.resolve_generated_columns(
+            original_table,
+            applied,
+            target_is_final=(table_is_replace_now or pre_recreated),
+        )
+        if generated_columns is None:
+            raise FullLoadIncompleteError(
+                f"Could not determine whether '{table.name}' has generated columns on "
+                "Aurora DSQL, so the load was not started. Reading the target catalog "
+                "failed. A generated column REJECTS a supplied value (every row would be "
+                "quarantined) and omitting the wrong column would write NULLs, so neither "
+                "default is safe. Check the target connection and retry; if the table has "
+                "no generated columns, applying the schema again also resolves it."
+            )
+        if generated_columns:
+            table = apply_lob_exclusions(table, generated_columns)
         target_types = (
             parse_target_column_types(applied.target_ddl)
             if applied is not None
@@ -4310,6 +4366,68 @@ class BatchedTableMigrator:
             value = counts.get(table.name)
             return value if isinstance(value, int) else None
         except Exception:  # noqa: BLE001 - verification is best-effort, never fatal
+            return None
+
+    def resolve_generated_columns(
+        self,
+        table: TableDef,
+        applied: object,
+        *,
+        target_is_final: bool,
+    ) -> "Optional[set[str]]":
+        """Which columns the TARGET computes, so the load must not send them.
+
+        Aurora DSQL rejects an INSERT that supplies a value for a generated column
+        (``cannot insert a non-DEFAULT value into column ...``, SQLSTATE 428C9) -- and the
+        rejection is permanent, so every batch fails and every row is quarantined. The
+        loader therefore has to drop those columns from the INSERT list, the ON CONFLICT
+        DO UPDATE SET list and the keyset SELECT.
+
+        TWO SIGNALS, exactly like the primary key (``_target_pk_reader`` vs
+        :func:`parse_target_primary_key`), because neither alone is authoritative:
+
+        * ``target_is_final`` -- this run is about to recreate the target from the applied
+          DDL, or the parent already did -- so the APPLIED DDL is what the target will have.
+        * otherwise (append onto an existing target) -- the applied DDL is NOT authoritative:
+          a target created by an older build (which stripped the clause), by the customer's
+          own DDL, or by an edited-then-reverted script can have an ORDINARY column where
+          this run's conversion says GENERATED. Trusting the DDL there drops the column and
+          writes NULL into every row, silently. So the LIVE CATALOG wins.
+
+        Returns ``None`` for UNKNOWN, which the caller must treat as a refusal rather than
+        as "nothing to exclude": sending the value fails the batch and omitting it nulls the
+        data, so there is no safe default.
+        """
+        ddl = getattr(applied, "target_ddl", None)
+        expected = parse_target_generated_columns(ddl) if ddl else set()
+        # Nothing to disagree ABOUT -> no catalog read and no refusal. Gated exactly like
+        # the primary key, whose live read runs only when the applied conversion asks for a
+        # DIFFERENT key: if neither the applied DDL nor the source carries a preserved
+        # generated column, the load's column set is unaffected and the ordinary path (all
+        # columns, no probe) is correct. This keeps the overwhelmingly common table free of
+        # an extra target round-trip AND free of a new failure mode.
+        if not expected and not pg_preserved_generated_columns(table):
+            return set()
+        if target_is_final:
+            if not ddl:
+                # The recreator derives its own conversion, so what the target will end up
+                # with is genuinely unknown.
+                return None
+            return expected
+        return self._target_generated_reader(table)
+
+    def _default_target_generated(self, table: TableDef) -> "Optional[set[str]]":
+        """Read the target's ACTUAL generated columns (None if unreadable)."""
+        from dsql_migrator.core.target_introspector import target_generated_columns
+
+        try:
+            connector = DsqlConnector(
+                self._inputs.target_config, aws_profile=self._inputs.aws_profile
+            )
+            return target_generated_columns(
+                table.name, connection_factory=connector.connect
+            )
+        except Exception:  # noqa: BLE001 - unknown, decided by the caller
             return None
 
     def _default_target_pk(self, table: TableDef) -> Optional[list[str]]:

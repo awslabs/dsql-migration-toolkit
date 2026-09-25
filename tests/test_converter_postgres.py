@@ -704,7 +704,11 @@ def test_pg_stored_generated_column_warns_manual_with_pg_wording() -> None:
     assert warn[0].classification is Classification.MANUAL
     assert warn[0].kind is ConversionNoteKind.LOSS
     assert "PostgreSQL generated" in warn[0].message  # PG-worded
-    assert "STORED or VIRTUAL" in warn[0].message  # covers both kinds (PG18 virtual)
+    # No expression was captured, so there is nothing to re-emit -- the note must say
+    # WHICH reason applies rather than the old blanket "Aurora DSQL has no equivalent"
+    # (it does support STORED; see test_a_stored_generated_column_is_preserved...).
+    assert "expression was not captured" in warn[0].message, warn[0].message
+    assert "has no equivalent" not in warn[0].message, warn[0].message
     assert "SHOW CREATE TABLE" not in warn[0].message  # not the MySQL variant
 
 
@@ -726,7 +730,9 @@ def test_pg_virtual_generated_column_warns_manual_like_stored() -> None:
     assert warn, r.warnings
     assert warn[0].classification is Classification.MANUAL
     assert warn[0].kind is ConversionNoteKind.LOSS
-    assert "STORED or VIRTUAL" in warn[0].message
+    # The kind now DECIDES the outcome (Aurora DSQL supports STORED and rejects VIRTUAL),
+    # so the note names the specific reason instead of lumping the two kinds together.
+    assert "could NOT be preserved" in warn[0].message, warn[0].message
     assert "logically replicated" in warn[0].message  # CDC caveat surfaced
 
 
@@ -1350,3 +1356,160 @@ def test_the_over_long_character_clamp_reaches_the_emitted_ddl_and_a_warning() -
     assert "blurb" in finding.risk and "code" in finding.risk
     assert "ok" not in finding.risk.replace("blurb", "").replace("code", "")
     assert "65535" in finding.risk and "4096" in finding.risk
+
+
+def test_a_stored_generated_column_is_preserved_with_its_expression_verbatim() -> None:
+    """The tool said "Aurora DSQL has no equivalent" and dropped the clause. It was FALSE.
+
+    Live-verified on a real Aurora DSQL cluster: ``GENERATED ALWAYS AS (expr) STORED`` is
+    accepted, the value is computed on INSERT (3 x 2.50 -> 7.50) and RECOMPUTED on UPDATE
+    (4 x 2.50 -> 10.00), ``pg_attribute.attgenerated`` is ``'s'``, and an INSERT that
+    supplies a value is rejected. VIRTUAL is a syntax error. So the operator was told to
+    rewrite their application for a feature the target has -- irreversibly, because DSQL can
+    DROP an expression from a column but never ADD one.
+
+    The expression is injected as RAW TEXT, never re-rendered by sqlglot, which MANGLES real
+    ``pg_get_expr`` output. Each shape below was taken from PostgreSQL's own catalog output
+    and breaks a different way through sqlglot -- the last one raises ParseError, which would
+    abort the WHOLE table and take every other column with it.
+    """
+    from dsql_migrator.core.converter import SchemaConverter
+    from dsql_migrator.core.models import ColumnDef, SourceType, TableDef
+
+    def table(expression: str, *, kind: str = "STORED", pk: str = "id") -> TableDef:
+        return TableDef(
+            name="ecommerce.order_items",
+            columns=[
+                ColumnDef(name="id", mysql_type="bigint", nullable=False),
+                ColumnDef(name="quantity", mysql_type="integer", nullable=False),
+                ColumnDef(name="unit_price", mysql_type="numeric(10,2)", nullable=False),
+                ColumnDef(name="tags", mysql_type="jsonb"),
+                ColumnDef(name="d", mysql_type="date"),
+                ColumnDef(name="name", mysql_type="text"),
+                ColumnDef(
+                    name="g",
+                    mysql_type="numeric(12,2)",
+                    generated=True,
+                    generated_kind=kind,
+                    generated_expression=expression,
+                ),
+            ],
+            primary_key=[pk],
+        )
+
+    for expression in (
+        "((quantity)::numeric * unit_price)",
+        "(tags #>> '{a,b}'::text[])",
+        "((tags -> 'a'::text) ->> 'b'::text)",
+        "date_part('year'::text, d)",
+        "((name IS NOT NULL))::integer",
+        "CASE WHEN quantity > 0 THEN upper(name) ELSE NULL::text END",
+    ):
+        ddl = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(
+            table(expression)
+        ).target_ddl
+        assert f"GENERATED ALWAYS AS ({expression}) STORED" in ddl, (expression, ddl)
+
+    # VIRTUAL is NOT preserved (DSQL rejects it outright) ...
+    virtual = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(
+        table("(quantity * 2)", kind="VIRTUAL")
+    )
+    assert "GENERATED ALWAYS AS" not in virtual.target_ddl, virtual.target_ddl
+    # ... and a generated column that is part of the PRIMARY KEY is not either: the batch
+    # INSERT must omit a generated column, while every key column has to be read back to
+    # key the idempotent write, so preserving it would make the table unloadable.
+    keyed = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(
+        table("(quantity * 2)", pk="g")
+    )
+    assert "GENERATED ALWAYS AS" not in keyed.target_ddl, keyed.target_ddl
+
+    # A MySQL source can never reach this: introspection does not read
+    # GENERATION_EXPRESSION, so there is no expression and nothing changes for it.
+    from dsql_migrator.core.converter import pg_preserved_generated_columns
+
+    mysql_shaped = TableDef(
+        name="shop.t",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="g", mysql_type="int", generated=True),
+        ],
+        primary_key=["id"],
+    )
+    assert pg_preserved_generated_columns(mysql_shaped) == []
+
+
+def test_the_applied_ddls_generated_columns_are_readable_back() -> None:
+    """The loader MUST know which columns the target computes, or every batch dies (428C9).
+
+    The parser has to survive the identity CACHE clause the converter also injects raw --
+    sqlglot's postgres reader raises on it, which would report "no generated columns" for
+    exactly the tables most likely to have one.
+    """
+    from dsql_migrator.core.converter import (
+        SchemaConverter,
+        parse_target_generated_columns,
+    )
+    from dsql_migrator.core.models import ColumnDef, SourceType, TableDef
+
+    table = TableDef(
+        name="ecommerce.order_items",
+        columns=[
+            ColumnDef(name="id", mysql_type="integer", nullable=False, identity=True),
+            ColumnDef(name="quantity", mysql_type="integer", nullable=False),
+            ColumnDef(
+                name="line_total",
+                mysql_type="numeric(12,2)",
+                generated=True,
+                generated_kind="STORED",
+                generated_expression="((quantity)::numeric * 2)",
+            ),
+        ],
+        primary_key=["id"],
+        auto_increment_column="id",
+    )
+    ddl = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table).target_ddl
+    # The DDL carries BOTH raw-injected clauses.
+    assert "GENERATED BY DEFAULT AS IDENTITY (CACHE" in ddl
+    assert "GENERATED ALWAYS AS" in ddl
+    assert parse_target_generated_columns(ddl) == {"line_total"}
+
+    # An identity column alone is NOT a generated column.
+    assert parse_target_generated_columns(
+        'CREATE TABLE t (id bigint NOT NULL GENERATED BY DEFAULT AS IDENTITY (CACHE 65536),'
+        ' q int, PRIMARY KEY (id))'
+    ) == set()
+    # A hand-edited DDL sqlglot parses structurally works too.
+    assert parse_target_generated_columns(
+        "CREATE TABLE t (id int PRIMARY KEY, q int, g int GENERATED ALWAYS AS (q*2) STORED)"
+    ) == {"g"}
+    # Unparseable DDL means UNKNOWN, which must read as "send the column" (loud 428C9)
+    # rather than "skip it" (silent NULLs).
+    assert parse_target_generated_columns("NOT SQL AT ALL (((") == set()
+
+
+def test_a_stored_kind_without_a_captured_expression_is_not_preserved() -> None:
+    """The expression gate is what keeps a MySQL source out, and it must stand alone.
+
+    MySQL introspection sets ``generated=True`` but never reads GENERATION_EXPRESSION, so
+    there is nothing to emit. A column claiming STORED with no expression must fall to the
+    ordinary path rather than emit ``GENERATED ALWAYS AS () STORED``.
+    """
+    from dsql_migrator.core.converter import (
+        SchemaConverter,
+        pg_preserved_generated_columns,
+    )
+    from dsql_migrator.core.models import ColumnDef, SourceType, TableDef
+
+    table = TableDef(
+        name="ecommerce.t",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(
+                name="g", mysql_type="integer", generated=True, generated_kind="STORED"
+            ),
+        ],
+        primary_key=["id"],
+    )
+    assert pg_preserved_generated_columns(table) == []
+    ddl = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table).target_ddl
+    assert "GENERATED ALWAYS AS" not in ddl, ddl

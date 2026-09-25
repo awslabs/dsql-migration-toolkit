@@ -1445,14 +1445,25 @@ class GeneratedColumnRule(Rule):
                         rule_id=self.rule_id,
                         classification=Classification.MANUAL,
                         risk=(
-                            f"Columns ({names}) are MySQL generated/computed "
-                            "columns; their generation expression is not "
-                            "auto-converted to Aurora DSQL."
+                            f"Columns ({names}) are MySQL generated/computed columns "
+                            "(VIRTUAL or STORED). Aurora DSQL DOES support STORED "
+                            "generated columns and maintains them, but the tool cannot "
+                            "carry THIS one over: MySQL introspection does not read "
+                            "information_schema.COLUMNS.GENERATION_EXPRESSION, so there is "
+                            "no expression to re-emit and the column is created ORDINARY. "
+                            "Full Load copies the value the source already computed, so the "
+                            "target starts correct -- but nothing maintains it afterwards, "
+                            "and the CDC stream does not carry it either, so any write that "
+                            "does not supply the value drifts."
                         ),
                         recommendation=(
-                            "Recreate as a PostgreSQL GENERATED column if "
-                            "supported on the target, or compute the value in "
-                            "the application."
+                            "Either re-add the expression yourself before applying -- read "
+                            "it with SHOW CREATE TABLE and edit the target DDL in Schema "
+                            "Conversion to GENERATED ALWAYS AS (<expression>) STORED, "
+                            "translating it to PostgreSQL syntax -- or compute the value in "
+                            "the application. Decide BEFORE applying: Aurora DSQL can DROP "
+                            "an expression from a column but cannot ADD one, so retrofitting "
+                            "it later means recreating the table."
                         ),
                         effort=EffortLevel.MEDIUM,
                     )

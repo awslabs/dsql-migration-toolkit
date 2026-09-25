@@ -336,7 +336,9 @@ network (`inet`/`cidr`/`macaddr`), `xml`, `bit`/`varbit`, `tsvector`/`tsquery`,
 `enum` → `text`; composite → columns / `jsonb`. `numeric(p,s)` with p > 38 is clamped
 with a warning; a bare `numeric`/`decimal` → DSQL `numeric(18,6)`; column `DEFAULT`s /
 `serial` / identity `nextval` are **not** emitted (the PK strategy governs identity);
-`STORED` generated columns become ordinary columns. See the type-and-constraint
+`STORED` generated columns are **preserved** (Aurora DSQL supports them and maintains the
+value); `VIRTUAL` ones become ordinary columns and must be recomputed in the application.
+See the type-and-constraint
 reference in [Chapter 2 §2.3](02-evaluation-and-schema-conversion.md#23-mysql--dsql-type-and-constraint-handling-reference).
 
 

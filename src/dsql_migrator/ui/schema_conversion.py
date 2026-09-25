@@ -563,7 +563,11 @@ def _render_source_table_ddl_postgres(table: TableDef) -> str:
             # very expression from the source left them with no way to do either.
             expression = getattr(column, "generated_expression", None)
             clause += (
-                f" GENERATED ALWAYS AS ({expression}) STORED"
+                f" GENERATED ALWAYS AS ({expression})"
+                # The real kind, not a hardcoded STORED: on PG18 VIRTUAL is the DEFAULT
+                # kind, and it is the one Aurora DSQL does NOT accept -- so mislabelling it
+                # hides the single difference the side-by-side diff exists to show.
+                + f" {column.generated_kind or 'STORED'}"
                 if expression
                 else "  /* GENERATED column - expression not captured */"
             )

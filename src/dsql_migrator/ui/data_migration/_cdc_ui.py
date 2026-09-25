@@ -89,6 +89,7 @@ from dsql_migrator.ui.data_migration._models import (
     cdc_prerequisite_block_reason,
     connector_health_rows,
     connector_role_label,
+    cdc_excluded_columns,
     format_column_exclude_list,
     format_duration,
     lob_exclusion_candidates,
@@ -598,8 +599,10 @@ def _render_cdc_source_config_card(
     # to what the watermark covered when inventory + watermark exist; otherwise
     # fall back to the user's confirmed selection (manual seed).
     exclusions = migration_state.lob_exclusions()
+    # Union in the columns the TARGET computes: DSQL rejects a write that supplies a value
+    # for a preserved STORED generated column, and the sink dead-letters that permanently.
     exclude_value = format_column_exclude_list(
-        {table: sorted(cols) for table, cols in exclusions.items()}
+        cdc_excluded_columns(exclusions, inventory)
     )
     exclude_list = exclude_value.split(",") if exclude_value else None
     tables_for_config = _cdc_tables_for_config(migration_state, inventory, watermark)
@@ -4199,8 +4202,10 @@ def _start_cdc_deploy(
     watermark = _cdc_watermark(job)
     override = migration_state.cdc_start_override()
     exclusions = migration_state.lob_exclusions()
+    # Union in the columns the TARGET computes: DSQL rejects a write that supplies a value
+    # for a preserved STORED generated column, and the sink dead-letters that permanently.
     exclude_value = format_column_exclude_list(
-        {table: sorted(cols) for table, cols in exclusions.items()}
+        cdc_excluded_columns(exclusions, inventory)
     )
     exclude_list = exclude_value.split(",") if exclude_value else None
     tables_for_config = _cdc_tables_for_config(migration_state, inventory, watermark)
@@ -4734,8 +4739,10 @@ async def _start_cdc_infra_deploy(
     watermark = _cdc_watermark(job)
     override = migration_state.cdc_start_override()
     exclusions = migration_state.lob_exclusions()
+    # Union in the columns the TARGET computes: DSQL rejects a write that supplies a value
+    # for a preserved STORED generated column, and the sink dead-letters that permanently.
     exclude_value = format_column_exclude_list(
-        {table: sorted(cols) for table, cols in exclusions.items()}
+        cdc_excluded_columns(exclusions, inventory)
     )
     exclude_list = exclude_value.split(",") if exclude_value else None
     tables_for_config = _cdc_tables_for_config(migration_state, inventory, watermark)

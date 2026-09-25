@@ -528,6 +528,78 @@ def target_primary_key_columns(
         _safe_close(connection)
 
 
+def target_generated_columns(
+    table_name: str,
+    *,
+    connection_factory: Callable[[], Any],
+) -> "Optional[set[str]]":
+    """Return the target table's ACTUAL generated columns (read-only), or ``None``.
+
+    The ground truth for "does the live target compute this column", read from
+    ``pg_attribute.attgenerated`` rather than inferred from the DDL the tool believes it
+    applied -- the same two-signal split Full Load already uses for the primary key
+    (:func:`target_primary_key_columns` on the append path vs
+    :func:`~dsql_migrator.core.converter.parse_target_primary_key` on the recreate path).
+
+    It matters because the applied DDL is NOT authoritative on the append path: a target
+    created by an older build (which stripped the clause), by the customer's own DDL, or by
+    an edited-then-reverted script can have an ORDINARY column where this run's conversion
+    says GENERATED. Trusting the DDL there would drop the column from the INSERT and write
+    NULL into every row -- silently, with no error and no quarantine.
+
+    ``None`` means UNKNOWN (table missing, unreadable catalog, any error) and callers MUST
+    NOT read it as "no generated columns": sending a value to a generated column fails the
+    whole batch (428C9), and omitting one from an ordinary column nulls the data, so the
+    only safe response to unknown is to refuse.
+
+    Verified against a live Aurora DSQL cluster: a ``GENERATED ALWAYS AS (...) STORED``
+    column reports ``attgenerated = 's'``.
+    """
+    parts = table_name.split(".", 1)
+    if len(parts) == 2:
+        schema, relname = parts
+        where_relation = "n.nspname = %(schema)s AND c.relname = %(table)s"
+        params: dict[str, object] = {"schema": schema, "table": relname}
+    else:
+        where_relation = (
+            "c.relname = %(table)s AND pg_catalog.pg_table_is_visible(c.oid)"
+        )
+        params = {"table": parts[0]}
+    statement = (
+        "SELECT a.attname "
+        "FROM pg_catalog.pg_class c "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        "JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
+        f"WHERE {where_relation} "
+        "  AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated <> ''"
+    )
+    try:
+        connection = connection_factory()
+    except Exception:  # noqa: BLE001 - cannot connect -> unknown
+        return None
+    cursor = None
+    try:
+        cursor = connection.cursor()
+        # Confirm the table EXISTS before reading "no generated columns" off an empty
+        # result: a missing table would otherwise look identical to a plain one.
+        cursor.execute(
+            "SELECT 1 FROM pg_catalog.pg_class c "
+            "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+            f"WHERE {where_relation}",
+            params,
+        )
+        if cursor.fetchone() is None:
+            return None
+        cursor.execute(statement, params)
+        return {str(row[0]) for row in cursor.fetchall() if row and row[0]}
+    except Exception:  # noqa: BLE001 - unreadable catalog -> unknown, never a guess
+        return None
+    finally:
+        if cursor is not None:
+            _safe_close(cursor)
+        _safe_close(connection)
+
+
 def target_primary_keys(
     table_names: Sequence[str],
     *,

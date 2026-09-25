@@ -27178,3 +27178,202 @@ def test_the_prereq_gate_is_given_the_lob_columns_to_size_check() -> None:
     assert "lob_exclusion_candidates(" in flat, (
         "the at-risk columns must come from the shared helper, not be re-derived"
     )
+
+
+def test_migrate_table_omits_a_target_generated_column_from_the_load() -> None:
+    """Sending a value to a generated column is a PERMANENT 428C9 for every batch.
+
+    Aurora DSQL rejects an INSERT that supplies a value for a generated column, so with the
+    clause now preserved the loader MUST omit it -- otherwise every row of the table is
+    quarantined. One TableDef filter covers the keyset SELECT, the INSERT column list and
+    the ON CONFLICT DO UPDATE SET list.
+    """
+    import dataclasses
+
+    from dsql_migrator.core.converter import SchemaConverter
+    from dsql_migrator.core.models import ColumnDef, SourceType, TableDef
+
+    table = TableDef(
+        name="ecommerce.order_items",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="quantity", mysql_type="integer", nullable=False),
+            ColumnDef(
+                name="line_total",
+                mysql_type="numeric(12,2)",
+                generated=True,
+                generated_kind="STORED",
+                generated_expression="((quantity)::numeric * 2)",
+            ),
+        ],
+        primary_key=["id"],
+    )
+    conversion = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+
+    def _migrator_for(reader=None) -> BatchedTableMigrator:
+        return BatchedTableMigrator(
+            dataclasses.replace(
+                _inputs(), table_conversions={table.name: conversion}
+            ),
+            exporter=_FakeExporter(),  # type: ignore[arg-type]
+            importer_factory=lambda _i: _FakeImporter(),  # type: ignore[arg-type,return-value]
+            target_generated_reader=reader,
+        )
+
+    # The REPLACE path recreates the target from this applied DDL, so the DDL is the
+    # authority and no catalog read is needed.
+    assert _migrator_for().resolve_generated_columns(
+        table, conversion, target_is_final=True
+    ) == {"line_total"}
+
+    # On the APPEND path the applied DDL is NOT authoritative -- an older build stripped
+    # the clause, so the live target can be ordinary. The catalog wins.
+    assert _migrator_for(lambda _t: set()).resolve_generated_columns(
+        table, conversion, target_is_final=False
+    ) == set()
+    assert _migrator_for(lambda _t: {"line_total"}).resolve_generated_columns(
+        table, conversion, target_is_final=False
+    ) == {"line_total"}
+    # An unreadable catalog is UNKNOWN, never "nothing to exclude": sending the value
+    # quarantines every row and omitting the wrong column writes NULLs.
+    assert _migrator_for(lambda _t: None).resolve_generated_columns(
+        table, conversion, target_is_final=False
+    ) is None
+
+    # A table with NOTHING generated anywhere takes the ordinary path with NO catalog read,
+    # so the common case gains neither a round-trip nor a new failure mode.
+    plain = TableDef(
+        name="ecommerce.plain",
+        columns=[ColumnDef(name="id", mysql_type="bigint", nullable=False)],
+        primary_key=["id"],
+    )
+    plain_conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(plain)
+
+    def _must_not_be_called(_t):  # pragma: no cover - asserted by not running
+        raise AssertionError("the catalog must not be read when nothing is generated")
+
+    plain_migrator = BatchedTableMigrator(
+        dataclasses.replace(_inputs(), table_conversions={plain.name: plain_conv}),
+        exporter=_FakeExporter(),  # type: ignore[arg-type]
+        importer_factory=lambda _i: _FakeImporter(),  # type: ignore[arg-type,return-value]
+        target_generated_reader=_must_not_be_called,
+    )
+    assert plain_migrator.resolve_generated_columns(
+        plain, plain_conv, target_is_final=False
+    ) == set()
+
+
+def test_a_replace_load_with_no_applied_ddl_refuses_rather_than_guessing() -> None:
+    """``target_is_final`` with no applied DDL is UNKNOWN, not "nothing to exclude".
+
+    On the replace path the recreator re-derives its OWN conversion, so if this run has no
+    applied DDL to read, what the target will end up with is genuinely unknown -- and both
+    defaults are harmful: sending a value to a generated column quarantines every row
+    (428C9), while omitting one from an ordinary column writes NULLs silently.
+    """
+    import dataclasses
+
+    from dsql_migrator.core.converter import SchemaConverter
+    from dsql_migrator.core.models import ColumnDef, SourceType, TableDef
+
+    table = TableDef(
+        name="ecommerce.order_items",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="q", mysql_type="integer", nullable=False),
+            ColumnDef(
+                name="g",
+                mysql_type="numeric(12,2)",
+                generated=True,
+                generated_kind="STORED",
+                generated_expression="((q)::numeric * 2)",
+            ),
+        ],
+        primary_key=["id"],
+    )
+    conversion = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    migrator = BatchedTableMigrator(
+        dataclasses.replace(_inputs(), table_conversions={table.name: conversion}),
+        exporter=_FakeExporter(),  # type: ignore[arg-type]
+        importer_factory=lambda _i: _FakeImporter(),  # type: ignore[arg-type,return-value]
+    )
+    # No applied conversion for this table -> unknown -> refuse.
+    assert migrator.resolve_generated_columns(table, None, target_is_final=True) is None
+    # With one, the DDL is authoritative on that path.
+    assert migrator.resolve_generated_columns(
+        table, conversion, target_is_final=True
+    ) == {"g"}
+
+
+def test_migrate_table_drops_a_target_generated_column_from_read_and_write() -> None:
+    """The filter has to REACH the load, or the preserved clause quarantines every row.
+
+    Aurora DSQL rejects an INSERT that supplies a value for a generated column (428C9,
+    permanent), so the column must leave the keyset SELECT and the INSERT column list -- the
+    same single-filter mechanism the LOB exclusions use. Reproduced before the fix: 64 rows
+    became 127 statements, 0 loaded and 64 permanently dropped.
+    """
+    import dataclasses
+
+    from dsql_migrator.core.converter import SchemaConverter
+    from dsql_migrator.core.models import SourceType
+
+    table = TableDef(
+        name="order_items",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="quantity", mysql_type="integer", nullable=False),
+            ColumnDef(
+                name="line_total",
+                mysql_type="numeric(12,2)",
+                generated=True,
+                generated_kind="STORED",
+                generated_expression="((quantity)::numeric * 2)",
+            ),
+        ],
+        primary_key=["id"],
+    )
+    conversion = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    assert "GENERATED ALWAYS AS" in conversion.target_ddl  # the preserved clause
+
+    exporter = _FakeExporter(rows_by_table={"order_items": [{"id": 1}, {"id": 2}]})
+    importer = _FakeImporter()
+    migrator = BatchedTableMigrator(
+        dataclasses.replace(
+            _inputs(),
+            inventory=SourceInventory(tables=[table]),
+            table_conversions={table.name: conversion},
+        ),
+        exporter=exporter,  # type: ignore[arg-type]
+        watermark_capturer=_FakeWatermarkCapturer(_watermark()),  # type: ignore[arg-type]
+        importer_factory=lambda _inputs: importer,  # type: ignore[arg-type,return-value]
+        # Append path -> the LIVE catalog is the authority, and it agrees.
+        target_generated_reader=lambda _t: {"line_total"},
+    )
+
+    result = migrator.migrate_table(table)
+
+    assert exporter.stream_columns_by_table["order_items"] == ["id", "quantity"]
+    assert importer.import_columns_by_table["order_items"] == ["id", "quantity"]
+    assert result.rows_loaded == 2
+
+    # And when the LIVE target has an ORDINARY column (an older build stripped the clause),
+    # the column must still be LOADED -- dropping it there would write NULLs silently.
+    exporter2 = _FakeExporter(rows_by_table={"order_items": [{"id": 1}]})
+    importer2 = _FakeImporter()
+    BatchedTableMigrator(
+        dataclasses.replace(
+            _inputs(),
+            inventory=SourceInventory(tables=[table]),
+            table_conversions={table.name: conversion},
+        ),
+        exporter=exporter2,  # type: ignore[arg-type]
+        watermark_capturer=_FakeWatermarkCapturer(_watermark()),  # type: ignore[arg-type]
+        importer_factory=lambda _inputs: importer2,  # type: ignore[arg-type,return-value]
+        target_generated_reader=lambda _t: set(),
+    ).migrate_table(table)
+    assert exporter2.stream_columns_by_table["order_items"] == [
+        "id",
+        "quantity",
+        "line_total",
+    ]

@@ -5,6 +5,17 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.536
+
+### 修正
+
+- **PostgreSQL の `STORED` 生成列が「Aurora DSQL には対応物がない」という理由で破棄されていました。DSQL にはあります。** 実クラスターで検証: `GENERATED ALWAYS AS (expr) STORED` は受理され、`INSERT` で値が計算され(3 × 2.50 → 7.50)`UPDATE` で再計算され(→ 10.00)、`pg_attribute.attgenerated` は `'s'`、値を明示した `INSERT` は拒否されます — PostgreSQL と同じです。`VIRTUAL` は syntax error です(PostgreSQL 17 にも存在しません)。それでもツールは句を捨てて通常の列を作り、Evaluation・Schema Conversion(2 箇所)・AI grounding(2 箇所)・3 言語のマニュアルで「アプリケーションで値を計算してください」と案内していました — 不要な作業であり、**apply 後は取り消せません**(DSQL は列から式を `DROP` できますが `ADD` はできません)。現在は式を再出力するため、ターゲットが値を計算し続けます: ドリフトも再実装も不要です。`VIRTUAL`、式が取得できなかった列(MySQL ソースはすべて — イントロスペクションが `GENERATION_EXPRESSION` を読まない)、主キーに含まれる生成列は、それぞれの理由を明示したうえで従来どおり通常の列になります。
+- **句は RAW テキストとして注入します — sqlglot が実際の `pg_get_expr` 出力を壊すためです。** 再パース・再レンダリングされる DDL ビルダー経由で出力すると、正しく見えたまま PostgreSQL が実際に保存した内容を静かに壊します。計測: `(tags #>> '{a,b}'::text[])` → `CAST(tags #>> '{a,b}' AS TEXT[])`、`((tags -> 'a') ->> 'b'::text)` → `operator does not exist: text ->> unknown`、`date_part('year'::text, d)` → `EXTRACT(CAST('year' AS TEXT) FROM d)`、`((name IS NOT NULL))::integer` → `ParseError` で **テーブル全体** が中断し他のすべての列も巻き込まれます。現在は 4 つの形すべてがバイト単位で保持されます(identity の `CACHE` 句と同じ手法)。
+- **Full Load がターゲットの計算列を除外します — 保持を安全にする核心です。** DSQL は生成列に値を与える書き込みを拒否し(SQLSTATE `428C9`)これは恒久エラーなので、句を保持したままだと全バッチが失敗し全行が隔離されます — 再現結果は 64 行が 127 文になり、0 行ロード・64 行恒久破棄でした。その列は 1 つの `TableDef` フィルターで keyset `SELECT`、`INSERT` 列リスト、`ON CONFLICT DO UPDATE SET` リストからまとめて外れます。どの列かは主キーと同様に **2 つのシグナル** で決めます: 今回の実行がターゲットを再作成する場合は適用済み DDL、既存ターゲットへ append する場合は **ライブカタログ** — 旧ビルド(句を削っていた)・顧客自身の DDL・編集後に戻したスクリプトで作られたターゲットは、今回の変換が GENERATED と言っても実際には通常の列であり得ます。そこで DDL を信じると全行に NULL が静かに書かれます。カタログが読めない場合は UNKNOWN とし、推測せずロードを拒否します。生成列がまったくないテーブルは追加の往復なしで従来の経路を通ります。
+- **CDC は保持された生成列をストリームから除外します**(`column.exclude.list`)。同じ理由でシンクの書き込みが拒否され dead-letter になるためです。PostgreSQL 17 以前は生成列をそもそも publish しないためそこでは保険であり、publication が publish を選べる PostgreSQL 18 で実効的になります。
+- **`pg_attribute.attgenerated` を読んだうえで boolean に畳んで捨てていたため、サポートされる種類が未サポートのように見えていました。** `ColumnDef.generated_kind`('STORED'/'VIRTUAL')がこれを保持します — `identity_generation` と同じ修正 — またソース DDL パネルは `STORED` をハードコードせず実際の種類を描画するので、PG18 の `VIRTUAL` 列が DSQL が受け付ける種類として誤表示されることはありません。
+- **MySQL の生成列の指摘が、自ら投げた問いに答えるようになりました。** 「**ターゲットが対応していれば** PostgreSQL の GENERATED 列として作り直す」は次のようになります: DSQL は `STORED` に対応していますが、MySQL の式は運べません(イントロスペクションが `information_schema.COLUMNS.GENERATION_EXPRESSION` を読まないため) — したがって適用前に DDL エディタで自分で入れ直す(PostgreSQL 構文に翻訳)か、アプリケーションで計算し、後から式は追加できないので apply の前に決めてください。
+
 ## v0.1.535
 
 ### 修正
