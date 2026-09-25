@@ -5,6 +5,12 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.530
+
+### 수정
+
+- **비어 있는 Aurora DSQL 타깃이 객체를 가진 것으로 보고됐습니다 — 실제로는 DSQL 자신의 카탈로그였습니다.** Evaluation 리포트의 타깃 요약이 아무것도 없는 클러스터에 대해 *"Target catalog: 1 schemas, 3 tables, 4 views"* 라고 표시했습니다. `SYSTEM_SCHEMAS` 가 PostgreSQL 시스템 스키마(`pg_catalog`, `information_schema`, `pg_toast`)는 제외했지만 **`sys`** 는 제외하지 않았고, 이건 Aurora DSQL 자신의 카탈로그입니다(`iam_identity`, `job`, `address_map`, `jobs`/`roles`/`unique_constraint_violations` 뷰 등). 라이브 클러스터로 확인: PostgreSQL 것이 아닌 스키마는 빈 `public` 과 `sys` 뿐이고, `sys` 의 테이블 3개·뷰 4개가 리포트가 보여준 수치와 정확히 일치합니다. 그래서 빈 타깃이 Evaluation 요약과 Schema Conversion 오브젝트 브라우저에서 점유된 것처럼 보였고, DSQL 내부 객체가 `target_existing_table_names`(타깃에 테이블이 있으면 그 소스 테이블을 이주 가능으로 간주)로 흘러 들어갔습니다. `sys` 는 DSQL이 소유한 이름이고(모든 클러스터에 이미 존재하므로 사용자 스키마가 가질 수 없음) MySQL 소스 introspector도 자기 `sys` 를 제외하므로, 이것이 대칭적인 규칙입니다. 하나의 목록이 네 사용처를 모두 구동합니다 — 카탈로그 브라우즈, 이름 기반 릴레이션/컬럼 조회 2곳, Query Playground의 스키마 목록 — 따라서 브라우즈만 제외해서 `relation_exists` 가 DSQL 내부 이름에 `True` 를 답하는 일은 애초에 생길 수 없습니다.
+
 ## v0.1.529
 
 ### 수정

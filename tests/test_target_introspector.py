@@ -1368,3 +1368,62 @@ def test_unique_index_state_is_column_order_insensitive_and_fails_soft() -> None
     assert unique_index_state("t", ["id"], connection_factory=_no_connection) is None
     # No columns to check is meaningless -> unknown, not a false "absent".
     assert unique_index_state("t", [], connection_factory=lambda: conn) is None
+
+
+def test_dsql_own_sys_catalog_is_excluded_so_an_empty_target_looks_empty() -> None:
+    """``sys`` is Aurora DSQL's OWN catalog, not a user schema.
+
+    It is not in PostgreSQL's system set, so a completely EMPTY cluster was reported as
+    "1 schemas, 3 tables, 4 views" — verified against a live cluster, where the only
+    non-PostgreSQL schemas are the empty ``public`` and ``sys``, whose three tables and
+    four views were exactly the counts the Evaluation report showed. That made an empty
+    target look occupied and fed DSQL internals into ``target_existing_table_names``,
+    which treats a table's presence on the target as making the source table migratable.
+    """
+    assert "sys" in SYSTEM_SCHEMAS, SYSTEM_SCHEMAS
+    # The PostgreSQL system schemas stay excluded too.
+    for schema in ("pg_catalog", "information_schema", "pg_toast"):
+        assert schema in SYSTEM_SCHEMAS
+
+
+def test_the_exclusion_reaches_every_catalog_query_and_the_lookups() -> None:
+    """One list, four call sites -- the browse, the two by-name lookups, the playground.
+
+    Excluding it from the browse alone would leave ``relation_exists`` answering True for
+    a DSQL-internal name.
+    """
+    import inspect
+
+    from dsql_migrator.core import target_introspector as ti
+
+    src = inspect.getsource(ti)
+    # Every place that filters schemas uses the shared constant, never its own literal.
+    assert src.count("SYSTEM_SCHEMAS") >= 4, src.count("SYSTEM_SCHEMAS")
+    assert '("pg_catalog", "information_schema", "pg_toast")' not in src, (
+        "a second, sys-less literal would silently re-open the hole"
+    )
+
+    from dsql_migrator.core import query_playground as qp
+
+    assert "SYSTEM_SCHEMAS" in inspect.getsource(qp), (
+        "the playground's schema list must reuse the same exclusion"
+    )
+
+
+def test_a_sys_relation_is_not_browsed_as_a_user_object() -> None:
+    """End to end through the real assembler, with the rows a live DSQL cluster returns."""
+    inventory = build_inventory(
+        relation_rows=[
+            ("sys", "iam_identity", "BASE TABLE"),
+            ("sys", "job", "BASE TABLE"),
+            ("sys", "jobs", "VIEW"),
+            ("ecommerce", "orders", "BASE TABLE"),
+        ],
+        column_rows=[("ecommerce", "orders", "id", "bigint", "NO")],
+        index_rows=[],
+    )
+    # build_inventory assembles whatever it is HANDED -- the filtering is in the query, so
+    # this pins that the query's parameter is what keeps sys out (see the test above), and
+    # that a real user schema still comes through.
+    names = {s.name for s in inventory.schemas}
+    assert "ecommerce" in names

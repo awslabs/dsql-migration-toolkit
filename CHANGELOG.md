@@ -5,6 +5,12 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.530
+
+### Fixed
+
+- **An empty Aurora DSQL target was reported as holding objects — they were DSQL's own catalog.** The Evaluation report's target summary read *"Target catalog: 1 schemas, 3 tables, 4 views"* for a cluster with nothing in it. `SYSTEM_SCHEMAS` excluded PostgreSQL's system schemas (`pg_catalog`, `information_schema`, `pg_toast`) but not **`sys`**, which is Aurora DSQL's own catalog (`iam_identity`, `job`, `address_map`, the `jobs`/`roles`/`unique_constraint_violations` views, …). Verified against a live cluster: the only non-PostgreSQL schemas are the empty `public` and `sys`, whose three tables and four views are exactly the counts the report was showing. So an empty target looked occupied on the Evaluation summary and in Schema Conversion's object browser, and DSQL internals fed `target_existing_table_names`, which treats a table's presence on the target as making the source table migratable. DSQL owns the name (`sys` exists on every cluster, so no user schema can take it) and the MySQL source introspector likewise excludes its own `sys`, so this is the symmetric rule. One list drives all four call sites — the catalog browse, the two by-name relation/column lookups, and the Query Playground's schema list — so excluding it from the browse alone could not have left `relation_exists` answering `True` for a DSQL-internal name.
+
 ## v0.1.529
 
 ### Fixed

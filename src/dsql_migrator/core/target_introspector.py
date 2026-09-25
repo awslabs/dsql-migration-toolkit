@@ -41,7 +41,19 @@ from dsql_migrator.core.models import (
 )
 
 # System schemas that are never part of the user object tree.
-SYSTEM_SCHEMAS = ("pg_catalog", "information_schema", "pg_toast")
+#
+# ``sys`` is Aurora DSQL's OWN catalog (iam_identity, job, address_map, the jobs/roles
+# views, ...), not a user schema -- and it is not in PostgreSQL's system set, so a
+# completely EMPTY DSQL cluster was reported as "1 schemas, 3 tables, 4 views". Verified
+# against a live cluster: the only non-PostgreSQL schemas are the empty ``public`` and
+# ``sys``, whose three tables and four views are exactly the counts the Evaluation report
+# was showing. That made an empty target look occupied on the Evaluation summary and in
+# Schema Conversion's object browser, and fed DSQL internals into
+# ``target_existing_table_names`` (which treats a table's presence on the target as making
+# the source table migratable). DSQL owns the name -- ``sys`` already exists on every
+# cluster, so no user schema can take it -- and the MySQL source introspector likewise
+# excludes its own ``sys`` (``MYSQL_SYSTEM_SCHEMAS``), so this is the symmetric rule.
+SYSTEM_SCHEMAS = ("pg_catalog", "information_schema", "pg_toast", "sys")
 
 # Tables and views, with their type so views can be separated from tables.
 RELATIONS_QUERY = (

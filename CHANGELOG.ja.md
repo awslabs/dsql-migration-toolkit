@@ -5,6 +5,12 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.530
+
+### 修正
+
+- **空の Aurora DSQL ターゲットがオブジェクトを保持していると報告されていました — 実際は DSQL 自身のカタログでした。** Evaluation レポートのターゲット要約が、何も入っていないクラスターについて *"Target catalog: 1 schemas, 3 tables, 4 views"* と表示していました。`SYSTEM_SCHEMAS` は PostgreSQL のシステムスキーマ(`pg_catalog`、`information_schema`、`pg_toast`)を除外していましたが **`sys`** を除外しておらず、これは Aurora DSQL 自身のカタログです(`iam_identity`、`job`、`address_map`、`jobs`/`roles`/`unique_constraint_violations` ビューなど)。ライブクラスターで確認: PostgreSQL 由来でないスキーマは空の `public` と `sys` のみで、`sys` のテーブル 3 個・ビュー 4 個がレポートの示していた数と正確に一致します。そのため空のターゲットが Evaluation の要約と Schema Conversion のオブジェクトブラウザーで占有されているように見え、DSQL の内部オブジェクトが `target_existing_table_names`(ターゲットにテーブルがあればそのソーステーブルを移行可能とみなす)へ流れ込んでいました。`sys` は DSQL が所有する名前であり(すべてのクラスターに既に存在するためユーザースキーマは取得できません)、MySQL のソース introspector も自身の `sys` を除外するため、これが対称的な規則です。1 つのリストが 4 つの呼び出し箇所すべてを駆動します — カタログのブラウズ、名前によるリレーション/列の参照 2 箇所、Query Playground のスキーマ一覧 — したがってブラウズのみ除外して `relation_exists` が DSQL 内部の名前に `True` を返す事態は起こり得ません。
+
 ## v0.1.529
 
 ### 修正
