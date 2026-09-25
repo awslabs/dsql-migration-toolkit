@@ -489,32 +489,36 @@ class PgIdentityKeyRule(Rule):
                     rule_id=self.rule_id,
                     classification=Classification.MANUAL,
                     risk=(
-                        f"The integer key from serial / identity column '{column}' "
-                        "converts cleanly, but Aurora DSQL will NOT generate it: the "
-                        "default conversion keeps a plain integer with no identity and no "
-                        "sequence, so the APPLICATION must supply the value on every insert "
-                        "— code that relied on the database generating it fails or "
-                        "collides. Separately, for higher insert throughput consider a "
-                        "different key: DSQL stores rows in primary-key order, so a "
-                        "monotonically increasing key concentrates writes on one partition."
+                        f"The key from serial / identity column '{column}' converts cleanly "
+                        "AND keeps generating values: the default conversion makes it a "
+                        "cached identity, so the application still does not supply the key. "
+                        "Two things change. The column is WIDENED to bigint (Aurora DSQL "
+                        "supports an identity only on bigint) — lossless for the values, "
+                        "but check anything that assumes a 4-byte id. And because each DSQL "
+                        "node draws its own block of values from the cache, the key is no "
+                        "longer gap-free or strictly increasing, which also spreads inserts "
+                        "instead of concentrating them on one partition (DSQL stores rows "
+                        "in primary-key order)."
                     ),
-                    # Only name a strategy the picker OFFERS -- see the MySQL rule.
+                    # State the DEFAULT, then the opt-out -- see the MySQL rule.
                     recommendation=(
-                        "Decide at Schema Conversion who generates the key: "
-                        + (
-                            "choose the 'Server-generated (IDENTITY)' strategy to have DSQL "
-                            "fill it (the column is widened to bigint, which DSQL requires "
-                            "for an identity), or keep the plain integer and supply the "
-                            "value from the application."
+                        (
+                            "No action needed to keep the behaviour: Schema Conversion "
+                            "defaults to 'Server-generated (IDENTITY)' for this table, and "
+                            "Full Load loads the source's own ids before advancing the "
+                            "sequence past them. Switch to 'Keep source PK' only if the "
+                            "application supplies the key itself — that leaves the column a "
+                            "plain integer with neither identity nor sequence."
                             if table.primary_key == [column]
-                            else "IDENTITY is not offered for this table because its "
+                            else "IDENTITY cannot be used for this table because its "
                             f"primary key is composite ({', '.join(table.primary_key)}) and "
-                            "a DSQL identity applies to a single column, so the value must "
-                            "come from the application — or add an identity to the column "
-                            "on the target after apply."
+                            "a DSQL identity applies to a single column, so the key is "
+                            "converted as a plain integer: the application must supply the "
+                            "value on every insert, or add an identity to the column on the "
+                            "target after apply."
                         )
-                        + " Optional, for throughput only: a UUID/random key or a cached "
-                        "identity spreads the writes."
+                        + " Optional, for throughput only: a UUID/random key spreads the "
+                        "writes further."
                     ),
                     effort=EffortLevel.MEDIUM,
                     note_kind=ConversionNoteKind.RECOMMENDATION,

@@ -771,6 +771,10 @@ class AutoIncrementRule(Rule):
                         # rendered only for a SINGLE-column primary key that IS the
                         # generated column, so on a composite-PK table this recommendation
                         # sent the operator to a control Schema Conversion never shows.
+                        # (MySQL keeps the plain-integer default: AUTO_INCREMENT is not an
+                        # identity column, so converting it to one stays the operator's
+                        # decision -- unlike a PostgreSQL source, whose key already IS an
+                        # identity and is defaulted to one.)
                         recommendation=(
                             "Decide at Schema Conversion who generates the key: "
                             + (
@@ -779,7 +783,7 @@ class AutoIncrementRule(Rule):
                                 "the plain integer and supply the value from the "
                                 "application."
                                 if table.primary_key == [column]
-                                else "IDENTITY is not offered for this table because its "
+                                else "IDENTITY cannot be used for this table because its "
                                 f"primary key is composite ({', '.join(table.primary_key)}) "
                                 "and a DSQL identity applies to a single column, so the "
                                 "value must come from the application — or add an identity "

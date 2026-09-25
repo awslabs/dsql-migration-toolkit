@@ -903,7 +903,12 @@ def test_non_pk_serial_default_is_reported_not_silently_dropped() -> None:
     conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
     # Neither sequence default is re-emitted -- DSQL has no sequence to point at.
     assert "nextval" not in conv.target_ddl
-    seq_notes = [w for w in conv.warnings if "sequence" in w.message and "serial" in w.message]
+    # Filter on the non-key rule's OWN phrase. "sequence"/"serial" also appear in the
+    # primary-key strategy's note (which names the mechanism it ports), so a substring
+    # filter counted that note too once the PK note started mentioning them.
+    seq_notes = [
+        w for w in conv.warnings if "takes its value from a sequence" in w.message
+    ]
     assert len(seq_notes) == 1, [w.message for w in conv.warnings]
     note = seq_notes[0]
     assert note.column_name == "invoice_no"  # the NON-key column, not the PK
@@ -1099,7 +1104,9 @@ def test_non_pk_generated_as_identity_is_reported_not_only_serial() -> None:
         auto_increment_column="id",
     )
     conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
-    notes = [w for w in conv.warnings if "sequence" in w.message]
+    notes = [
+        w for w in conv.warnings if "takes its value from a sequence" in w.message
+    ]
     # BOTH non-key spellings are reported; the identity PRIMARY KEY stays silent (the PK
     # strategy governs it).
     assert sorted(n.column_name for n in notes) == ["invoice_no", "legacy_no"]

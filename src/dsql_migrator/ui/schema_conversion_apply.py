@@ -621,6 +621,26 @@ def build_identity_conversion(
     )
 
 
+def build_keep_conversion(
+    converter: SchemaConverter, table: TableDef
+) -> TableConversion:
+    """Per-table conversion for ``table`` with the source key kept as a plain integer.
+
+    Needed because "Keep source PK" can no longer be expressed by CLEARING the stored
+    DDL: the converter's default is now IDENTITY_WITH_CACHE (it preserves the source's
+    value generation), so for a table with a generated key the no-override path yields
+    an identity. Keep therefore has to be stored like the other two choices, which also
+    makes it resume-safe and round-trippable the same way (``identity_from_ddl`` reports
+    False on this script).
+    """
+    return converter.convert_table(
+        table,
+        SchemaConvertOptions(
+            primary_key_strategy=PrimaryKeyStrategy.KEEP_INTEGER,
+        ),
+    )
+
+
 def identity_from_ddl(table: TableDef, target_ddl: str) -> bool:
     """Return whether the stored target DDL made the AUTO_INCREMENT key an identity.
 

@@ -609,26 +609,41 @@ def test_a_table_whose_only_text_column_is_check_limited_is_clean() -> None:
 
 def test_identity_finding_states_who_generates_the_key_not_only_throughput() -> None:
     """A workshop Evaluation listed 7 AUTO_INCREMENT recommendations as throughput advice
-    only. Under the DEFAULT conversion the target column is a plain integer with no identity,
-    so the APPLICATION must supply the value on every insert -- an app-code change. Schema
-    Conversion says so ("IMPORTANT: Aurora DSQL will NOT auto-generate this key"); Evaluation,
-    the go/no-go artifact, said "works as-is ... optional, for throughput only".
-    Engine-independent: the MySQL rule had the same wording."""
+    only, when the outcome was an app-code change. Each engine's finding must state WHO
+    generates the key under ITS default -- and the two defaults differ on purpose:
+
+    * PostgreSQL: the source column already IS an identity / ``serial``, so the converter
+      defaults to a DSQL identity and the generation is KEPT (nothing to change in the app).
+    * MySQL: ``AUTO_INCREMENT`` is a different mechanism, so converting it to an identity
+      stays the operator's explicit choice; the default keeps a plain integer and the
+      APPLICATION must supply the value.
+    """
     from dsql_migrator.core.assessor import AutoIncrementRule
     from dsql_migrator.core.assessor_postgres import PgIdentityKeyRule
 
-    pg_table = TableDef(
+    table = TableDef(
         name="ecommerce.orders",
         columns=[ColumnDef(name="id", mysql_type="integer")],
         primary_key=["id"],
         auto_increment_column="id",
     )
-    for rule in (PgIdentityKeyRule(), AutoIncrementRule()):
-        finding = rule.evaluate(SourceInventory(tables=[pg_table]))[0]
+
+    pg = PgIdentityKeyRule().evaluate(SourceInventory(tables=[table]))[0]
+    assert "keeps generating values" in pg.risk, pg.risk
+    assert "WIDENED to bigint" in pg.risk, pg.risk
+    assert "no longer gap-free" in pg.risk, pg.risk
+    # ... and the finding must NOT demand app work the default does not require.
+    assert "APPLICATION must supply" not in pg.risk, pg.risk
+    assert "defaults to 'Server-generated (IDENTITY)'" in pg.recommendation
+    assert "Switch to 'Keep source PK' only if" in pg.recommendation
+
+    mysql = AutoIncrementRule().evaluate(SourceInventory(tables=[table]))[0]
+    assert "will NOT generate it" in mysql.risk, mysql.risk
+    assert "APPLICATION must supply" in mysql.risk, mysql.risk
+    assert "Server-generated (IDENTITY)" in mysql.recommendation
+
+    for finding in (pg, mysql):
         text = finding.risk + " " + finding.recommendation
-        assert "will NOT generate it" in finding.risk, type(rule).__name__
-        assert "APPLICATION must supply" in finding.risk, type(rule).__name__
-        assert "Server-generated (IDENTITY)" in finding.recommendation
         # Still calibrated as advice, not a failure (the v0.1.151 correction): the
         # THROUGHPUT half stays explicitly optional, and the throughput mechanism is kept.
         assert "Optional, for throughput only" in finding.recommendation
@@ -980,10 +995,13 @@ def test_a_composite_key_is_not_told_to_choose_a_strategy_that_is_not_offered() 
         report = CompatibilityAssessor(source_type=engine).assess(
             SourceInventory(tables=[table(primary_key)])
         )
+        # Keyed on the RULE, not on a phrase: the two engines word this finding
+        # differently (their conversion defaults differ), so any shared phrase makes the
+        # filter silently match nothing for one of them.
         return " ".join(
             item.recommendation
             for item in report.items
-            if "who generates the key" in item.recommendation
+            if item.rule_id == "AUTO_INCREMENT"
         )
 
     def conversion_text(engine: SourceType, primary_key: "list[str]") -> str:
@@ -998,10 +1016,13 @@ def test_a_composite_key_is_not_told_to_choose_a_strategy_that_is_not_offered() 
             single = text(engine, ["id"])
             composite = text(engine, ["id", "occurred_at"])
             assert single, f"{engine.value} {text.__name__} stopped reporting the key"
-            # The tile IS offered for the single-column key, so keep naming it.
+            # The strategy DOES apply to the single-column key, so keep naming it --
+            # whether as the PostgreSQL default or the MySQL opt-in.
             assert "Server-generated (IDENTITY)" in single, single
-            # It is NOT offered for the composite key -- say so, and name the key.
-            assert "not offered for this table" in composite, composite
+            # It does NOT apply to the composite key -- say so, and name the key.
+            assert "cannot be used for this table" in composite, composite
             assert "occurred_at" in composite, composite
-            # And still give the operator something they CAN do.
-            assert "from the application" in composite, composite
+            # And still give the operator something they CAN do. Asserted on the two
+            # facts every surface must carry, not on one engine's phrasing.
+            assert "application" in composite, composite
+            assert "add an identity to the column on the target" in composite, composite
