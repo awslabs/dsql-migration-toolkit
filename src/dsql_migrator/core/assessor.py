@@ -860,28 +860,58 @@ class CaseInsensitiveCollationRule(Rule):
 
 
 class PartitionedTableRule(Rule):
-    """Flag tables that use MySQL native partitioning."""
+    """Flag tables that use source-native partitioning (MySQL or PostgreSQL).
+
+    The risk text is TAKEN FROM THE CONVERTER (``_partitioned_table_warning``) rather than
+    written again here, because the two had drifted into giving the operator different
+    answers about the same table: Evaluation said "Manual partitioning is not used by
+    Aurora DSQL" and "Remove the manual partitioning", graded MANUAL/LOSS with MEDIUM
+    effort, while Schema Conversion graded the identical fact a RECOMMENDATION with zero
+    losses and a clean target DDL. The Evaluation text was also wrong twice over for a
+    PostgreSQL source: it used MySQL vocabulary, and "remove the manual partitioning" is
+    work the operator must NOT do -- this tool treats the source as read-only, and nothing
+    has to be removed on the TARGET either (the converter emits no PARTITION BY and
+    collapses the partitions into one table).
+    """
 
     rule_id = "PARTITIONED_TABLE"
 
+    def __init__(self, *, is_postgres: bool = False) -> None:
+        """``is_postgres`` selects the engine-correct wording (declarative vs native)."""
+        self._is_postgres = is_postgres
+
     def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        from dsql_migrator.core.converter import _partitioned_table_warning
+
         findings: list[Finding] = []
         for table in inventory.tables:
             if table.partitioned:
+                conversion_note = _partitioned_table_warning(
+                    table, is_postgres=self._is_postgres
+                )
                 findings.append(
                     Finding(
                         object=ObjectKey(KIND_TABLE, table.name),
                         rule_id=self.rule_id,
                         classification=Classification.MANUAL,
                         risk=(
-                            "Manual partitioning is not used by Aurora DSQL, "
-                            "which distributes data automatically."
+                            conversion_note.message
+                            if conversion_note is not None
+                            else "The source table is partitioned, which Aurora DSQL does "
+                            "not have — it distributes rows automatically by primary key."
                         ),
                         recommendation=(
-                            "Remove the manual partitioning and rely on DSQL "
-                            "automatic data distribution."
+                            "No action is required to migrate it: Schema Conversion drops "
+                            "the partitioning automatically and no data is lost (do NOT "
+                            "change the source -- this tool only reads it). What needs a "
+                            "decision is whatever depended on the partitions, as described "
+                            "above."
                         ),
                         effort=EffortLevel.MEDIUM,
+                        # Advisory, matching the converter's own grading of the same fact:
+                        # the conversion succeeds and the target DDL is valid, so this is
+                        # review work to plan, not a defect blocking the migration.
+                        note_kind=ConversionNoteKind.RECOMMENDATION,
                     )
                 )
         return findings
@@ -1158,10 +1188,20 @@ class OversizedLobRule(Rule):
                             "whose values can exceed the Aurora DSQL 1 MiB limit "
                             "for text/bytea; an oversized value fails to load."
                         ),
+                        # "Confirm no value exceeds 1 MiB" was homework the tool can now
+                        # do: the Data Migration prerequisite checks probe each column
+                        # (PrerequisiteCheckId.SOURCE_VALUE_SIZE). The PG sibling was
+                        # pointed at it in v0.1.531; this is the MySQL half.
                         recommendation=(
-                            "Confirm no value exceeds 1 MiB, or move large objects "
-                            "to external storage (e.g. Amazon S3) and store a "
-                            "reference instead."
+                            "Run the Data Migration prerequisite checks: they probe each "
+                            "column and report whether a value ALREADY exceeds that "
+                            "column's limit. If one does, move the content to external "
+                            "storage (e.g. Amazon S3) and store a reference instead, or "
+                            "exclude the column on the Data Migration step. For a TEXT "
+                            "family column the limit applies to the COMPRESSED size "
+                            "(outside a key), so a highly compressible value may still "
+                            "fit; a BLOB family column becomes bytea, which Aurora DSQL "
+                            "does not compress."
                         ),
                         effort=EffortLevel.MEDIUM,
                     )
@@ -1727,19 +1767,30 @@ def check_postgres_database_collation(inventory: SourceInventory) -> list[Assess
             rule_id="PG_DATABASE_COLLATION",
             classification=Classification.MANUAL,
             risk=(
-                f"The source database's default collation is {collation}; Aurora DSQL uses "
-                "C (byte ordering). Every text column that does not name its own collation "
-                "inherits this, so after cut over ORDER BY returns a DIFFERENT order and "
-                "range predicates (BETWEEN, <, >) change on mixed-case or accented data -- "
-                "while every row migrates exactly and every row count and checksum matches, "
-                "so nothing else flags it. Equality and UNIQUE enforcement are unchanged."
+                f"The source database's default collation is {collation}; Aurora DSQL runs "
+                "C for BOTH collation and character classification (live-verified: "
+                "datcollate = datctype = 'C'). Every text column that does not name its own "
+                "collation inherits this, and two things change after cut over. Ordering: "
+                "ORDER BY returns a DIFFERENT order and range predicates (BETWEEN, <, >) "
+                "change on mixed-case or accented data. Case folding: lower()/upper()/"
+                "initcap() fold ASCII ONLY, so lower('JOSÉ') is 'josÉ' on the target but "
+                "'josé' on the source, and ILIKE / ~* stop matching case-insensitively on "
+                "non-ASCII text -- that changes WHICH ROWS a query returns, not just their "
+                "order. Every row still migrates exactly and every row count and checksum "
+                "matches, so nothing else flags it. Equality and UNIQUE enforcement on the "
+                "stored values are unchanged."
             ),
             recommendation=(
                 "Review the queries whose RESULT ORDER matters (paged listings, "
-                "'first/last by name', range filters on text) and the reports built on "
-                "them. Where the source order must be preserved, sort explicitly with a "
-                "COLLATE clause the target supports, or normalise the values (e.g. compare "
-                "and sort on lower(col)) with a matching expression index."
+                "'first/last by name', range filters on text), and separately any predicate "
+                "using ILIKE, ~*, lower() or upper() on data that is not pure ASCII. Note "
+                "what is NOT available on the target: Aurora DSQL accepts only the C / "
+                "POSIX / default collations -- 'unicode' and 'ucs_basic' are listed in "
+                "pg_collation but rejected in use ('provided collation is not supported') "
+                "-- so a COLLATE clause cannot restore linguistic ordering, and there is no "
+                "unaccent() either. Where the source behaviour must be preserved, have the "
+                "APPLICATION store a normalised sort/match key alongside the text (lower- "
+                "and accent-folded at write time) and order or filter on that column."
             ),
             effort=EffortLevel.MEDIUM,
             kind=KIND_DATABASE.upper(),

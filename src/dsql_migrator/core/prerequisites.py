@@ -31,6 +31,7 @@ never include credential or token values.
 
 from __future__ import annotations
 
+import inspect
 from typing import TYPE_CHECKING, Iterable, Mapping, Optional, Protocol, Sequence
 
 if TYPE_CHECKING:
@@ -496,6 +497,86 @@ def check_target_columns_loadable(
 # and a measurement must never overrule a documented quota.
 DSQL_MAX_VALUE_BYTES = 1024 * 1024
 
+# ... but 1 MiB is NOT the ceiling for every type, and using it for all of them told the
+# operator a limit 16x too high on an unbounded varchar. From "Supported data types in
+# Aurora DSQL", each figure re-verified live on a real cluster with INCOMPRESSIBLE values:
+#   text            1 MiB      (1048577 bytes -> "datatype limit greater than 1048576 ...")
+#   bytea           1 MiB      (same, and bytea is NOT compressed)
+#   json / jsonb    1 MiB      applied to the COMPRESSED size
+#   varchar        65535 bytes (65536 -> "datatype limit greater than 65535 ... varchar")
+#   char / bpchar   4096 bytes (4097 -> "value too long for type character(4096)")
+# Compression applies to text/varchar/bpchar and json/jsonb, and ONLY in columns that are
+# not part of a key -- a key column is always stored uncompressed.
+_DSQL_VALUE_LIMIT_BY_BASE_TYPE = {
+    "text": DSQL_MAX_VALUE_BYTES,
+    "bytea": DSQL_MAX_VALUE_BYTES,
+    "json": DSQL_MAX_VALUE_BYTES,
+    "jsonb": DSQL_MAX_VALUE_BYTES,
+    "character varying": 65535,
+    "varchar": 65535,
+    "character": 4096,
+    "char": 4096,
+    "bpchar": 4096,
+    # MySQL LOB families, whose own source limits are all at or under DSQL's text ceiling
+    # (LONGTEXT/LONGBLOB reach 4 GiB, hence the cap).
+    "longtext": DSQL_MAX_VALUE_BYTES,
+    "mediumtext": DSQL_MAX_VALUE_BYTES,
+    "longblob": DSQL_MAX_VALUE_BYTES,
+    "mediumblob": DSQL_MAX_VALUE_BYTES,
+    "blob": DSQL_MAX_VALUE_BYTES,
+    "tinyblob": DSQL_MAX_VALUE_BYTES,
+    "tinytext": DSQL_MAX_VALUE_BYTES,
+}
+
+# The types whose 1 MiB ceiling is measured AFTER compression, so an uncompressed
+# measurement over the limit is an upper bound rather than a verdict.
+# Keyed on the TARGET type each source type converts to: a MySQL LONGTEXT becomes DSQL
+# text (compressed), a LONGBLOB becomes bytea (not compressed).
+_DSQL_COMPRESSED_BASE_TYPES = frozenset(
+    {
+        "text",
+        "character varying",
+        "varchar",
+        "character",
+        "char",
+        "bpchar",
+        "json",
+        "jsonb",
+        "longtext",
+        "mediumtext",
+        "tinytext",
+    }
+)
+
+
+def dsql_value_limit_bytes(column_type: str) -> int:
+    """Aurora DSQL's per-value byte ceiling for a column of ``column_type``.
+
+    Falls back to the generic 1 MiB per-column limit for anything not in the table, which
+    is the documented database-wide maximum for a non-index column -- so an unknown type
+    is never reported with a limit LOWER than the truth.
+    """
+    base = _base_column_type(column_type)
+    return _DSQL_VALUE_LIMIT_BY_BASE_TYPE.get(base, DSQL_MAX_VALUE_BYTES)
+
+
+def dsql_value_limit_is_compressed(column_type: str) -> bool:
+    """Whether ``column_type``'s ceiling applies to the COMPRESSED size (non-key only)."""
+    return _base_column_type(column_type) in _DSQL_COMPRESSED_BASE_TYPES
+
+
+def _base_column_type(column_type: str) -> str:
+    """Lower-cased type name with any length/precision modifier stripped."""
+    text_value = " ".join((column_type or "").strip().lower().split())
+    return text_value.split("(", 1)[0].strip()
+
+
+def _format_limit(limit_bytes: int) -> str:
+    """Render a byte ceiling the way the docs do (1 MiB, or an exact byte count)."""
+    if limit_bytes == DSQL_MAX_VALUE_BYTES:
+        return "1 MiB"
+    return f"{limit_bytes:,} bytes"
+
 # How long the oversized-value probe may run per table before it gives up. The probe
 # stops at the FIRST offending row, so a table that HAS one answers fast; proving the
 # ABSENCE of one is a full pass over the column, which on a very large table is exactly
@@ -520,15 +601,76 @@ def check_source_value_size(
     silent, which is what it did: the Evaluation finding said "check the largest value in
     each column" and nothing in the tool could.
 
-    ``oversized`` is ``{column: exceeded}`` from the probe, or ``None`` when the answer
-    could not be established. "Not determined" is reported as such (INFO), never as a
-    pass -- an unverifiable ceiling presented as verified is the defect, not the fix.
+    ``oversized`` maps ONLY the columns the probe actually measured to whether they
+    exceeded THEIR ceiling. Two things follow, and both were wrong before:
+
+    * The ceiling is PER TYPE, not a flat 1 MiB (:func:`dsql_value_limit_bytes`) -- text /
+      bytea / json / jsonb are 1 MiB, but varchar is 65535 bytes and char 4096, so the old
+      single figure overstated an unbounded varchar's headroom 16-fold.
+    * A column ABSENT from the mapping was treated as "did not exceed" and reported inside
+      a PASS. On PostgreSQL that was reachable in normal use -- ``octet_length(jsonb)``
+      does not exist, so a jsonb column's probe failed -- which produced a green
+      "No value exceeds ..." naming a column nothing had measured. Unmeasured columns are
+      now listed as not-determined, and one unmeasured column downgrades the whole row to
+      INFO rather than PASS.
     """
     if not columns:
         return None
-    title = "No value exceeds the Aurora DSQL 1 MiB per-value limit"
-    listed = ", ".join(f"`{name}`" for name in columns)
-    if oversized is None:
+    by_name = {column.name: column for column in table.columns}
+
+    def limit_of(name: str) -> int:
+        column = by_name.get(name)
+        return dsql_value_limit_bytes(column.mysql_type if column else "")
+
+    def describe(names: "Sequence[str]") -> str:
+        """`col` (limit) for each, grouping is unnecessary and per-column is clearer."""
+        return ", ".join(f"`{name}` ({_format_limit(limit_of(name))})" for name in names)
+
+    title = "No value exceeds the Aurora DSQL per-value limit for its type"
+    measured = dict(oversized or {})
+    unmeasured = [name for name in columns if name not in measured]
+    exceeded = [name for name in columns if measured.get(name)]
+
+    compressed = [name for name in columns if
+                  dsql_value_limit_is_compressed((by_name[name].mysql_type
+                                                  if name in by_name else ""))]
+    compression_note = (
+        " For "
+        + ", ".join(f"`{name}`" for name in compressed)
+        + " the limit applies to the COMPRESSED size (and only outside a key -- a key "
+        "column is stored uncompressed), so a highly compressible value may still fit; "
+        "this probe measures the uncompressed byte length, an upper bound."
+        if compressed
+        else ""
+    )
+
+    if exceeded:
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.SOURCE_VALUE_SIZE,
+            title=title,
+            status=PrerequisiteStatus.WARN,
+            required=False,
+            target=table.name,
+            detail=(
+                f"{describe(exceeded)} already holds at least one value over the limit "
+                "shown. Those rows CANNOT be stored on Aurora DSQL: each is quarantined "
+                "during Full Load (or dead-lettered during CDC) and reloading cannot fix "
+                "it."
+                + (
+                    f" Not determined for {describe(unmeasured)}."
+                    if unmeasured
+                    else ""
+                )
+            ),
+            remediation=(
+                "Decide before loading: move the content to external storage (e.g. Amazon "
+                "S3) and store a reference, shrink the value, or exclude the column on the "
+                "Data Migration step so the rest of the row migrates. Proceeding as-is "
+                "loads every other row and quarantines these." + compression_note
+            ),
+        )
+
+    if unmeasured:
         return PrerequisiteResult(
             check_id=PrerequisiteCheckId.SOURCE_VALUE_SIZE,
             title=title,
@@ -536,49 +678,32 @@ def check_source_value_size(
             required=False,
             target=table.name,
             detail=(
-                f"Not determined for {listed}. Proving that no value exceeds the limit "
-                "needs a full pass over the column, which was not completed (the read "
-                "failed or timed out)."
+                f"Not determined for {describe(unmeasured)}. Proving that no value exceeds "
+                "the limit needs a full pass over the column, which was not completed (the "
+                "read failed or timed out)."
+                + (
+                    f" Measured and within the limit: {describe([n for n in columns if n in measured])}."
+                    if measured
+                    else ""
+                )
             ),
             remediation=(
                 "Optional: check the largest value yourself (PostgreSQL "
-                "`SELECT max(octet_length(col)) FROM table`, MySQL "
-                "`SELECT MAX(OCTET_LENGTH(col)) FROM table`). An oversized value is "
-                "quarantined during Full Load and dead-lettered during CDC, and "
-                "reloading cannot fix it."
+                "`SELECT max(octet_length(col)) FROM table`, casting json/jsonb to text "
+                "first; MySQL `SELECT MAX(OCTET_LENGTH(col)) FROM table`). An oversized "
+                "value is quarantined during Full Load and dead-lettered during CDC, and "
+                "reloading cannot fix it." + compression_note
             ),
         )
-    exceeded = [name for name in columns if oversized.get(name)]
-    if not exceeded:
-        return PrerequisiteResult(
-            check_id=PrerequisiteCheckId.SOURCE_VALUE_SIZE,
-            title=title,
-            status=PrerequisiteStatus.PASS,
-            required=False,
-            target=table.name,
-            detail=f"No value in {listed} exceeds 1 MiB.",
-            remediation="",
-        )
-    hit = ", ".join(f"`{name}`" for name in exceeded)
+
     return PrerequisiteResult(
         check_id=PrerequisiteCheckId.SOURCE_VALUE_SIZE,
         title=title,
-        status=PrerequisiteStatus.WARN,
+        status=PrerequisiteStatus.PASS,
         required=False,
         target=table.name,
-        detail=(
-            f"{hit} already holds at least one value over 1 MiB. Those rows CANNOT be "
-            "stored on Aurora DSQL: each is quarantined during Full Load (or "
-            "dead-lettered during CDC) and reloading cannot fix it."
-        ),
-        remediation=(
-            "Decide before loading: move the content to external storage (e.g. Amazon "
-            "S3) and store a reference, shrink the value, or exclude the column on the "
-            "Data Migration step so the rest of the row migrates. Proceeding as-is "
-            "loads every other row and quarantines these. Note the limit applies to the "
-            "COMPRESSED size for text/json, so a highly compressible value may still "
-            "fit -- this probe measures the uncompressed byte length, an upper bound."
-        ),
+        detail=f"No value exceeds the limit in {describe(list(columns))}.",
+        remediation="",
     )
 
 
@@ -852,7 +977,10 @@ class PrerequisiteChecker:
         self._msk = msk_probe
 
     def _probe_oversized_values(
-        self, table_name: str, columns: "Sequence[str]"
+        self,
+        table_name: str,
+        columns: "Sequence[str]",
+        column_types: "Optional[Mapping[str, str]]" = None,
     ) -> "Optional[dict[str, bool]]":
         """Ask the source whether any value exceeds the limit, or ``None`` if it cannot.
 
@@ -866,12 +994,25 @@ class PrerequisiteChecker:
         if not callable(probe):
             return None
         try:
-            answer = probe(
-                table_name,
-                list(columns),
-                limit_bytes=DSQL_MAX_VALUE_BYTES,
-                timeout_seconds=VALUE_SIZE_PROBE_TIMEOUT_SECONDS,
-            )
+            types = dict(column_types or {})
+            kwargs = {
+                "limit_bytes": DSQL_MAX_VALUE_BYTES,
+                "timeout_seconds": VALUE_SIZE_PROBE_TIMEOUT_SECONDS,
+            }
+            # Per-column ceiling and type are passed only when the probe accepts them, so
+            # every probe/fake written before they existed keeps working (same reason the
+            # whole method is resolved through getattr).
+            try:
+                accepted = set(inspect.signature(probe).parameters)
+            except (TypeError, ValueError):  # pragma: no cover - exotic callable
+                accepted = set()
+            if "limits" in accepted:
+                kwargs["limits"] = {
+                    name: dsql_value_limit_bytes(types.get(name, "")) for name in columns
+                }
+            if "column_types" in accepted:
+                kwargs["column_types"] = types
+            answer = probe(table_name, list(columns), **kwargs)
         except Exception:  # noqa: BLE001 - advisory read; never break the gate
             return None
         if not isinstance(answer, Mapping):
@@ -964,7 +1105,11 @@ class PrerequisiteChecker:
                     check_source_value_size(
                         table,
                         lob_columns,
-                        self._probe_oversized_values(table.name, lob_columns),
+                        self._probe_oversized_values(
+                            table.name,
+                            lob_columns,
+                            {c.name: (c.mysql_type or "") for c in table.columns},
+                        ),
                     )
                 )
 

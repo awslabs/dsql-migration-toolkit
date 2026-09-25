@@ -2420,3 +2420,93 @@ def test_a_probe_without_the_method_still_works() -> None:
     )
     assert row.status is PrerequisiteStatus.INFO
     assert row.required is False
+
+
+def test_the_value_size_ceiling_is_per_type_not_a_flat_1_mib() -> None:
+    """A flat 1 MiB overstated an unbounded varchar's headroom 16-fold.
+
+    Every figure here is from the Aurora DSQL "Supported data types" page AND re-verified
+    live with incompressible values: varchar rejects 65536 bytes ("datatype limit greater
+    than 65535 bytes not supported for varchar"), char(4096) rejects 4097 ("value too long
+    for type character(4096)"), text and bytea reject 1048577.
+    """
+    from dsql_migrator.core.prerequisites import (
+        DSQL_MAX_VALUE_BYTES,
+        dsql_value_limit_bytes,
+        dsql_value_limit_is_compressed,
+    )
+
+    assert DSQL_MAX_VALUE_BYTES == 1024 * 1024
+    for column_type, expected in (
+        ("text", 1024 * 1024),
+        ("bytea", 1024 * 1024),
+        ("json", 1024 * 1024),
+        ("jsonb", 1024 * 1024),
+        ("character varying", 65535),
+        ("character varying(80)", 65535),
+        ("varchar", 65535),
+        ("character(10)", 4096),
+        ("char", 4096),
+        ("bpchar(5)", 4096),
+        ("longtext", 1024 * 1024),
+        ("longblob", 1024 * 1024),
+        # An unknown type falls back to the database-wide per-column maximum, never lower
+        # (reporting a limit BELOW the truth would invent a problem).
+        ("inet", 1024 * 1024),
+    ):
+        assert dsql_value_limit_bytes(column_type) == expected, column_type
+
+    # Compression is keyed on the TARGET type: DSQL compresses text/varchar/bpchar and
+    # json/jsonb (outside a key) but NOT bytea, so a bytea finding must not offer headroom.
+    for column_type in ("text", "character varying", "char(8)", "jsonb", "longtext"):
+        assert dsql_value_limit_is_compressed(column_type) is True, column_type
+    for column_type in ("bytea", "longblob", "blob"):
+        assert dsql_value_limit_is_compressed(column_type) is False, column_type
+
+
+def test_an_unmeasured_lob_column_is_never_reported_inside_a_pass() -> None:
+    """A column the probe could not measure used to be counted as "did not exceed".
+
+    That was reachable in normal PostgreSQL use -- ``octet_length(jsonb)`` does not exist,
+    so the jsonb column's statement failed -- and produced a green "No value exceeds ..."
+    naming a column nothing had measured.
+    """
+    from dsql_migrator.core.models import ColumnDef, TableDef
+    from dsql_migrator.core.prerequisites import (
+        PrerequisiteStatus,
+        check_source_value_size,
+    )
+
+    table = TableDef(
+        name="ecommerce.docs",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="notes", mysql_type="character varying"),
+            ColumnDef(name="payload", mysql_type="jsonb"),
+        ],
+        primary_key=["id"],
+    )
+    columns = ["notes", "payload"]
+
+    everything_measured = check_source_value_size(
+        table, columns, {"notes": False, "payload": False}
+    )
+    assert everything_measured is not None
+    assert everything_measured.status is PrerequisiteStatus.PASS
+    # The PASS states each column's OWN ceiling, so it cannot be read as a flat 1 MiB.
+    assert "`notes` (65,535 bytes)" in everything_measured.detail
+    assert "`payload` (1 MiB)" in everything_measured.detail
+
+    one_unmeasured = check_source_value_size(table, columns, {"notes": False})
+    assert one_unmeasured is not None
+    assert one_unmeasured.status is PrerequisiteStatus.INFO, one_unmeasured.status
+    assert "Not determined for `payload` (1 MiB)" in one_unmeasured.detail
+    # The remedy must work: octet_length has no jsonb overload, so it says to cast.
+    assert "casting json/jsonb to text" in one_unmeasured.remediation
+
+    # An actual offender still WARNs, and still discloses what went unmeasured.
+    mixed = check_source_value_size(table, columns, {"notes": True})
+    assert mixed is not None
+    assert mixed.status is PrerequisiteStatus.WARN
+    assert "`notes` (65,535 bytes) already holds" in mixed.detail
+    assert "Not determined for `payload`" in mixed.detail

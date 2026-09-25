@@ -22,6 +22,9 @@ from dsql_migrator.core.models import (
 _EXPECTED_PG_RULE_IDS = {
     "PG_UNSUPPORTED_TYPE",  # PG-specific: DSQL-unsupported column types
     "PG_UNSUPPORTED_RELATION",  # PG-specific: materialized views / foreign tables
+    # PG-specific: a declared char/varchar length above DSQL's 4096/65535-byte
+    # ceiling, which would make the CREATE TABLE fail at apply.
+    "PG_CHARACTER_LENGTH",
     "FK_PRESERVED",
     "CHECK_CONSTRAINT_DROPPED",
     "TRIGGER_UNSUPPORTED",
@@ -519,8 +522,20 @@ def test_pg_database_collation_finding_covers_what_the_column_capture_cannot() -
     assert "en_US.utf8" in item.risk
     assert "ORDER BY" in item.risk
     # Must NOT overstate it: a deterministic collation change moves ordering and range
-    # behaviour, not equality or UNIQUE.
-    assert "Equality and UNIQUE enforcement are unchanged" in item.risk
+    # behaviour, not equality or UNIQUE on the stored values.
+    assert "UNIQUE enforcement on the stored values are unchanged" in item.risk
+    # ... and must not UNDERSTATE it either. DSQL runs LC_CTYPE=C too, so case folding
+    # changes WHICH ROWS a query returns -- live-verified: lower('JOSÉ') = 'josÉ',
+    # 'JOSÉ' ILIKE 'josé' is false.
+    assert "lower('JOSÉ') is 'josÉ'" in item.risk, item.risk
+    assert "ILIKE" in item.risk and "~*" in item.risk, item.risk
+    # The remedies it names must be ones the target actually has. Live-verified: DSQL
+    # accepts only C/POSIX/default ("provided collation is not supported" for unicode and
+    # ucs_basic) and has no unaccent(), so neither may be prescribed.
+    assert "cannot restore linguistic ordering" in item.recommendation
+    assert "no unaccent()" in item.recommendation
+    assert "sort explicitly with a COLLATE clause" not in item.recommendation
+    assert "sort on lower(col)" not in item.recommendation
 
     # C / POSIX is byte ordering -- what the target already does, so no item.
     for same in ("C", "POSIX", "c"):
@@ -577,7 +592,7 @@ def test_check_limited_text_enum_is_not_an_oversized_lob_risk() -> None:
     assert "media_type" not in at_risk
 
     finding = PgOversizedLobRule().evaluate(SourceInventory(tables=[table]))[0]
-    assert "content (bytea)" in finding.risk
+    assert "content (bytea, limit 1 MiB)" in finding.risk
     assert "media_type" not in finding.risk
 
 
@@ -921,7 +936,10 @@ def test_the_oversized_lob_finding_points_at_the_check_that_answers_it() -> None
     assert findings, "the oversized-LOB rule no longer fires for a bytea column"
     joined = " ".join(f.recommendation for f in findings)
     assert "prerequisite checks" in joined, joined
-    assert "ALREADY exceeds 1 MiB" in joined, joined
+    assert "ALREADY exceeds that column's limit" in joined, joined
+    # bytea is NOT compressed, so this finding must not offer compression headroom.
+    assert "does not compress bytea" in joined, joined
+    assert "COMPRESSED size" not in joined, joined
 
 
 def test_a_materialized_view_finding_carries_the_query_it_asks_to_reimplement() -> None:

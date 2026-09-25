@@ -1266,3 +1266,87 @@ def test_a_default_cast_to_a_dsql_unsupported_type_is_reported_not_emitted() -> 
     assert seq_note and "takes its value from a sequence" in seq_note, seq_note
     assert "regclass" not in seq_note, seq_note
     assert _pg_default_unsupported_type("nextval('ecommerce.s'::regclass)") is None
+
+
+def test_an_over_long_character_length_is_clamped_instead_of_failing_at_apply() -> None:
+    """A PG varchar/char above DSQL's declared-length ceiling broke the whole CREATE TABLE.
+
+    Live-verified on Aurora DSQL: ``VARCHAR(65536)`` -> ``Datatype limit greater than 65535
+    bytes not supported for varchar``; ``CHAR(4097)`` -> the same for char. PostgreSQL
+    allows ~1 GB, so such a column made the table's CREATE fail at APPLY with nothing
+    having warned -- and ``dsql_lint`` returns 0 diagnostics on it, so the linter does not
+    catch it either.
+    """
+    from dsql_migrator.core.converter_postgres import (
+        _DSQL_MAX_CHAR_LENGTH,
+        _DSQL_MAX_VARCHAR_LENGTH,
+        clamp_pg_character,
+    )
+
+    # The documented/verified ceilings, pinned so a service change has one place to update.
+    assert (_DSQL_MAX_VARCHAR_LENGTH, _DSQL_MAX_CHAR_LENGTH) == (65535, 4096)
+
+    # Within the ceiling (and the boundary itself) passes through UNTOUCHED.
+    for ok in (
+        "character varying",
+        "varchar",
+        "character varying(1)",
+        f"character varying({_DSQL_MAX_VARCHAR_LENGTH})",
+        f"char({_DSQL_MAX_CHAR_LENGTH})",
+        "character(1)",
+        "text",
+        "numeric(12,2)",
+    ):
+        assert clamp_pg_character(ok) == (ok, None), ok
+
+    # Above it becomes text -- NOT the clamped length, which would reject values the source
+    # legitimately holds.
+    for over, kind in (
+        (f"character varying({_DSQL_MAX_VARCHAR_LENGTH + 1})", "varchar"),
+        ("character varying(200000)", "varchar"),
+        ("varchar(90000)", "varchar"),
+        (f"character({_DSQL_MAX_CHAR_LENGTH + 1})", "char"),
+        ("bpchar(9000)", "char"),
+    ):
+        clamped, note = clamp_pg_character(over)
+        assert clamped == "text", over
+        assert note and f"declared {kind} length above" in note, note
+        assert "CHECK (length(col) <=" in note, note
+    # A fixed-length column also loses its blank padding; a varchar has none to lose.
+    assert "blank padding" in clamp_pg_character("character(9000)")[1]
+    assert "blank padding" not in clamp_pg_character("character varying(90000)")[1]
+
+
+def test_the_over_long_character_clamp_reaches_the_emitted_ddl_and_a_warning() -> None:
+    from dsql_migrator.core.converter import SchemaConverter
+    from dsql_migrator.core.models import ColumnDef, SourceType, TableDef
+
+    table = TableDef(
+        name="ecommerce.wide",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="blurb", mysql_type="character varying(200000)"),
+            ColumnDef(name="code", mysql_type="character(8192)"),
+            ColumnDef(name="ok", mysql_type="character varying(100)"),
+        ],
+        primary_key=["id"],
+    )
+    conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    assert '"blurb" TEXT' in conv.target_ddl, conv.target_ddl
+    assert '"code" TEXT' in conv.target_ddl, conv.target_ddl
+    # The one within the ceiling keeps its declared length.
+    assert '"ok" VARCHAR(100)' in conv.target_ddl, conv.target_ddl
+    clamped = {w.column_name for w in conv.warnings if "converted to text" in w.message}
+    assert clamped == {"blurb", "code"}, clamped
+
+    # Evaluation must say the same thing, so the two steps cannot disagree.
+    from dsql_migrator.core.assessor import CompatibilityAssessor
+    from dsql_migrator.core.models import SourceInventory
+
+    report = CompatibilityAssessor(source_type=SourceType.POSTGRES).assess(
+        SourceInventory(tables=[table])
+    )
+    finding = next(i for i in report.items if i.rule_id == "PG_CHARACTER_LENGTH")
+    assert "blurb" in finding.risk and "code" in finding.risk
+    assert "ok" not in finding.risk.replace("blurb", "").replace("code", "")
+    assert "65535" in finding.risk and "4096" in finding.risk

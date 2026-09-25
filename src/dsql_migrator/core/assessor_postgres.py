@@ -297,6 +297,14 @@ class PgOversizedLobRule(Rule):
         )
 
         findings: list[Finding] = []
+        # Lazy import: `prerequisites` is the single source of truth for DSQL's per-type
+        # value ceilings, and importing it at module scope would close an import cycle.
+        from dsql_migrator.core.prerequisites import (
+            _format_limit,
+            dsql_value_limit_bytes,
+            dsql_value_limit_is_compressed,
+        )
+
         for table in inventory.tables:
             # A CHECK that limits the column to a finite literal set is an exclusion, not
             # just noise-reduction: such a column CANNOT hold an oversized value, and
@@ -315,7 +323,7 @@ class PgOversizedLobRule(Rule):
                     ConversionNoteKind.LOSS,
                     (
                         "are binary/document columns with no length limit, so a value can "
-                        "exceed the Aurora DSQL 1 MiB per-value limit"
+                        "exceed the Aurora DSQL per-value limit for its type"
                     ),
                 ),
                 (
@@ -327,16 +335,43 @@ class PgOversizedLobRule(Rule):
                     ConversionNoteKind.RECOMMENDATION,
                     (
                         "are unbounded character columns, so a value CAN exceed the Aurora "
-                        "DSQL 1 MiB per-value limit -- though an unbounded text/varchar is "
-                        "PostgreSQL's idiomatic spelling for an ordinary short string, so "
-                        "this is a ceiling to confirm rather than work to budget"
+                        "DSQL per-value limit for its type -- though an unbounded "
+                        "text/varchar is PostgreSQL's idiomatic spelling for an ordinary "
+                        "short string, so this is a ceiling to confirm rather than work to "
+                        "budget"
                     ),
                 ),
             ]
             for names, note_kind, clause in groups:
                 if not names:
                     continue
-                listed = ", ".join(f"{n} ({by_type[n]})" for n in names)
+                # The ceiling is PER TYPE, and it was previously printed as a flat 1 MiB
+                # for all of them: an unbounded `character varying` is capped at 65535
+                # bytes and a `character(n)` at 4096, so the finding overstated the headroom
+                # 16x/256x and an operator sizing a 200 KB value would have been told it
+                # fits (live-verified: 65536 bytes -> "datatype limit greater than 65535
+                # bytes not supported for varchar").
+                listed = ", ".join(
+                    f"{n} ({by_type[n]}, limit "
+                    f"{_format_limit(dsql_value_limit_bytes(by_type[n]))})"
+                    for n in names
+                )
+                # Compression applies to the character and json types, NOT to bytea, and
+                # only outside a key -- saying "for json/jsonb and text" on a bytea finding
+                # implied headroom that does not exist.
+                compressible = [
+                    n for n in names if dsql_value_limit_is_compressed(by_type[n])
+                ]
+                compression_clause = (
+                    " For "
+                    + ", ".join(compressible)
+                    + " the limit applies to the COMPRESSED size (and only outside a key -- "
+                    "a key column is always stored uncompressed), so a highly compressible "
+                    "value may still fit."
+                    if compressible
+                    else " This limit is on the stored bytes: Aurora DSQL does not compress "
+                    "bytea, so there is no headroom beyond it."
+                )
                 findings.append(
                     Finding(
                         object=ObjectKey(KIND_TABLE, table.name),
@@ -348,13 +383,12 @@ class PgOversizedLobRule(Rule):
                             "dead-lettered during CDC, and reloading cannot fix it."
                         ),
                         recommendation=(
-                            "Run the Data Migration prerequisite checks: they probe each column and "
-                            "report whether a value ALREADY exceeds 1 MiB. If one does, "
-                            "move that content to external storage (e.g. Amazon S3) and "
-                            "store a reference instead, or exclude the column on the Data "
-                            "Migration step. For json/jsonb and text the limit applies to "
-                            "the COMPRESSED size, so a highly compressible document may "
-                            "still fit."
+                            "Run the Data Migration prerequisite checks: they probe each "
+                            "column and report whether a value ALREADY exceeds that "
+                            "column's limit. If one does, move that content to external "
+                            "storage (e.g. Amazon S3) and store a reference instead, or "
+                            "exclude the column on the Data Migration step."
+                            + compression_clause
                         ),
                         effort=EffortLevel.MEDIUM,
                         note_kind=note_kind,
@@ -460,6 +494,64 @@ class PgNonKeySequenceRule(Rule):
         return findings
 
 
+class PgCharacterLengthRule(Rule):
+    """Flag a PostgreSQL character column whose DECLARED LENGTH exceeds DSQL's ceiling.
+
+    Aurora DSQL caps a declared character length at 65535 bytes for ``varchar`` and 4096
+    for ``char`` -- live-verified: ``CREATE ... VARCHAR(65536)`` fails with
+    ``Datatype limit greater than 65535 bytes not supported for varchar``. PostgreSQL
+    allows up to ~1 GB, so such a column made the WHOLE ``CREATE TABLE`` fail at apply
+    with nothing having warned (``dsql_lint`` does not catch it either).
+
+    Mirrors the ``NUMERIC_PRECISION`` pair: Evaluation states the issue and the remedy,
+    Schema Conversion emits the clamped type (``text``) with its own MANUAL warning, so
+    the two steps agree instead of the operator meeting this at apply time.
+    """
+
+    rule_id = "PG_CHARACTER_LENGTH"
+
+    def evaluate(self, inventory: "SourceInventory") -> "list[Finding]":
+        from dsql_migrator.core.converter_postgres import clamp_pg_character
+
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            over: list[tuple[str, str]] = []
+            for column in table.columns:
+                _, note = clamp_pg_character(column.mysql_type)
+                if note is not None:
+                    over.append((column.name, column.mysql_type))
+            if not over:
+                continue
+            listed = _render_bad_columns([(name, typ, "") for name, typ in over])
+            findings.append(
+                Finding(
+                    object=ObjectKey(KIND_TABLE, table.name),
+                    rule_id=self.rule_id,
+                    classification=Classification.MANUAL,
+                    risk=(
+                        f"{len(over)} column(s) declare a character length Aurora DSQL "
+                        "does not accept (the maximum is 65535 bytes for varchar and 4096 "
+                        f"for char), so the table's CREATE would be rejected as-is: "
+                        f"{listed}. Schema Conversion converts each to text, which stores "
+                        "MORE of the source's range than a clamped length would (up to "
+                        "Aurora DSQL's 1 MiB per-value limit), but the declared length is "
+                        "then no longer enforced by the database."
+                    ),
+                    recommendation=(
+                        "The conversion itself is automatic; what needs a decision is the "
+                        "length limit, which the target no longer enforces. If the "
+                        "application relies on it, add a CHECK "
+                        "(length(col) <= n) to the target, or shorten the declaration at "
+                        "the source to 65535/4096 or less before converting. A "
+                        "fixed-length char also loses its blank padding semantics "
+                        "(comparisons stop ignoring trailing spaces)."
+                    ),
+                    effort=EffortLevel.SIMPLE,
+                )
+            )
+        return findings
+
+
 class PgIdentityKeyRule(Rule):
     """Throughput advice for a serial / ``GENERATED AS IDENTITY`` primary key.
 
@@ -560,6 +652,7 @@ def default_rules() -> "list[Rule]":
         # here whose breach cannot be undone by reloading.
         PgOversizedLobRule(),
         PgGeneratedColumnRule(),
+        PgCharacterLengthRule(),
         PgIdentityKeyRule(),
         PgNonKeySequenceRule(),
         ForeignKeyRule(),
@@ -568,7 +661,8 @@ def default_rules() -> "list[Rule]":
         ProcedureRule(),
         EventRule(),
         NoPrimaryKeyRule(),
-        PartitionedTableRule(),
+        # PG wording: declarative partitioning, leaves are separate tables.
+        PartitionedTableRule(is_postgres=True),
         TooManyColumnsRule(),
         TooManyIndexesRule(),
         TooManyKeyColumnsRule(),

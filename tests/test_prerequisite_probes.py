@@ -350,15 +350,36 @@ def test_variables_omits_rds_key_on_self_managed() -> None:
 class _SizeProbeConn:
     """Records statements; answers the EXISTS probe per column."""
 
-    def __init__(self, oversized: set[str], *, fail: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        oversized: set[str],
+        *,
+        fail: set[str] | None = None,
+        aborts_on_failure: bool = False,
+    ) -> None:
         self.statements: list[str] = []
         self.bound: list[dict] = []
+        self.rollbacks = 0
         self._oversized = oversized
         self._fail = fail or set()
+        # PostgreSQL leaves the transaction ABORTED after a failed statement, so every
+        # later one fails until the caller rolls back. Modelling that is what makes the
+        # probe's rollback observable (a fake without it answers the rest regardless).
+        self._aborts_on_failure = aborts_on_failure
+        self._aborted = False
+
+    def rollback(self):  # noqa: ANN201
+        self.rollbacks += 1
+        self._aborted = False
 
     def execute(self, statement, params=None):  # noqa: ANN001, ANN201
         sql = " ".join(str(statement).split())
         self.statements.append(sql)
+        if self._aborted:
+            raise RuntimeError(
+                "current transaction is aborted, commands ignored until end of "
+                "transaction block"
+            )
         if "SET " in sql:
             return None
         # The byte limit must arrive as a BOUND parameter. Checking only that ":limit"
@@ -371,6 +392,8 @@ class _SizeProbeConn:
             self.bound.append({})
         for name in self._fail:
             if f'"{name}"' in sql or f"`{name}`" in sql:
+                if self._aborts_on_failure:
+                    self._aborted = True
                 raise RuntimeError("column read failed")
 
         class _R:
@@ -483,3 +506,70 @@ def test_no_columns_is_an_empty_answer_not_a_query() -> None:
         "s.t", [], limit_bytes=1024 * 1024, timeout_seconds=5.0
     ) == {}
     assert conn.statements == []
+
+
+def test_a_failed_column_is_rolled_back_so_the_rest_are_still_measured() -> None:
+    """On PostgreSQL the FIRST failure used to lose every later column silently.
+
+    A failed statement leaves the transaction aborted, so the per-column loop's remaining
+    statements all failed with ``InFailedSqlTransaction`` -- and an unmeasured column was
+    then reported inside a green PASS. Reproduced live on a real PostgreSQL 17: probing
+    ``price_band`` (numrange, which ``octet_length`` cannot take) followed by
+    ``description`` returned only ``{'description': False}`` WITH the rollback, and nothing
+    at all without it.
+    """
+    from dsql_migrator.core.models import SourceType
+
+    conn = _SizeProbeConn({"notes"}, fail={"content"}, aborts_on_failure=True)
+    answer = _size_probe(SourceType.POSTGRES, conn).oversized_values(
+        "s.t", ["content", "notes"], limit_bytes=1024 * 1024, timeout_seconds=5.0
+    )
+    # The failing column is OMITTED (-> reported as not-determined), the next one measured.
+    assert answer == {"notes": True}, answer
+    assert conn.rollbacks == 1, conn.rollbacks
+    # SET LOCAL is scoped to the rolled-back transaction, so the cap must be re-applied or
+    # the remaining columns would run unbounded on the customer's source.
+    assert sum("statement_timeout" in sql for sql in conn.statements) == 2, conn.statements
+
+
+def test_json_columns_are_measured_by_casting_because_octet_length_has_no_overload() -> None:
+    """``octet_length(jsonb)`` does not exist -- verified on live PostgreSQL 17.
+
+    That is how the whole probe used to break on an ordinary schema: the jsonb column's
+    statement failed, aborting the transaction. The cast measures the document's serialized
+    bytes, which is what the value costs on the target.
+    """
+    from dsql_migrator.core.models import SourceType
+
+    conn = _SizeProbeConn(set())
+    answer = _size_probe(SourceType.POSTGRES, conn).oversized_values(
+        "ecommerce.order_events",
+        ["payload", "doc", "notes"],
+        limit_bytes=1024 * 1024,
+        timeout_seconds=5.0,
+        column_types={"payload": "jsonb", "doc": "json", "notes": "text"},
+    )
+    assert answer == {"payload": False, "doc": False, "notes": False}, answer
+    joined = " ".join(conn.statements)
+    assert 'octet_length("payload"::text)' in joined, joined
+    assert 'octet_length("doc"::text)' in joined, joined
+    # A text column needs no cast, and must not grow one.
+    assert 'octet_length("notes")' in joined, joined
+    assert 'octet_length("notes"::text)' not in joined, joined
+
+
+def test_each_column_is_probed_against_its_own_type_limit() -> None:
+    """A flat 1 MiB overstated an unbounded varchar's headroom 16-fold."""
+    from dsql_migrator.core.models import SourceType
+
+    conn = _SizeProbeConn(set())
+    _size_probe(SourceType.POSTGRES, conn).oversized_values(
+        "s.t",
+        ["body", "label"],
+        limit_bytes=1024 * 1024,
+        timeout_seconds=5.0,
+        limits={"body": 1024 * 1024, "label": 65535},
+        column_types={"body": "text", "label": "character varying"},
+    )
+    bound = [b.get("limit") for b in conn.bound]
+    assert bound == [1024 * 1024, 65535], bound

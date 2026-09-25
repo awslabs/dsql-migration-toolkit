@@ -2641,10 +2641,15 @@ def _pg_collation_warning(table: TableDef) -> Optional[ConversionWarning]:
             "match, but text comparison can change: equality, LIKE, ORDER BY order and "
             "UNIQUE enforcement all follow the target collation instead. If the source "
             "collation was case- or accent-INSENSITIVE, a UNIQUE column that rejected "
-            "'Bob' beside 'bob' will now accept both, and queries that relied on "
-            "insensitive matching need LOWER(...)/unaccent on both sides (with a matching "
-            "expression index). Check the ordering-dependent queries and unique keys on "
-            "these columns before cutting over."
+            "'Bob' beside 'bob' will now accept both. Note what the target does NOT "
+            "offer for putting that back (all live-verified on Aurora DSQL): only the C / "
+            "POSIX / default collations are accepted, there is no unaccent(), and because "
+            "DSQL runs LC_CTYPE=C, LOWER()/UPPER() fold ASCII only -- lower('JOSÉ') is "
+            "'josÉ' -- so LOWER() on both sides does NOT give accent- or case-insensitive "
+            "matching for non-ASCII text. Have the application store a normalised key "
+            "column (folded at write time) and match/order on that. Check the "
+            "ordering-dependent queries and unique keys on these columns before cutting "
+            "over."
         ),
     )
 
@@ -3792,6 +3797,7 @@ class SchemaConverter:
         # the user is told to remodel before applying. Property 6 (no silent loss).
         if is_postgres:
             from dsql_migrator.core.converter_postgres import (
+                clamp_pg_character,
                 clamp_pg_numeric,
                 pg_column_default_sql,
                 unconstrained_numeric_note,
@@ -3809,6 +3815,25 @@ class SchemaConverter:
                             target_type=column.mysql_type,
                             classification=Classification.UNSUPPORTED,
                             message=reason,
+                        )
+                    )
+                    continue
+                # A character column whose DECLARED LENGTH exceeds DSQL's ceiling
+                # (varchar 65535 / char 4096 bytes, live-verified) is emitted as text
+                # instead -- without this the whole CREATE TABLE is rejected at apply
+                # ("Datatype limit greater than 65535 bytes not supported for varchar")
+                # and nothing had warned. Checked BEFORE the numeric clamp: the two are
+                # mutually exclusive, and this one changes the type, not just its modifier.
+                char_clamped, char_note = clamp_pg_character(column.mysql_type)
+                if char_note is not None:
+                    warnings.append(
+                        ConversionWarning(
+                            object_name=table.name,
+                            column_name=column.name,
+                            source_type=column.mysql_type,
+                            target_type=char_clamped,
+                            classification=Classification.MANUAL,
+                            message=char_note,
                         )
                     )
                     continue

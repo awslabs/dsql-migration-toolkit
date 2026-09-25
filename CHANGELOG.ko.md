@@ -5,6 +5,17 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.535
+
+### 수정
+
+- **Aurora DSQL 허용치를 넘는 길이로 선언된 PostgreSQL `varchar`/`char`가 적용 단계에서 `CREATE TABLE` 전체를 실패시켰고, 사전 경고가 전혀 없었습니다.** DSQL은 선언 길이를 `varchar` 65535바이트, `char` 4096바이트로 제한합니다(라이브 검증: `VARCHAR(65536)` → `Datatype limit greater than 65535 bytes not supported for varchar`). PostgreSQL은 약 1 GB까지 허용하며, `dsql_lint`도 진단을 내지 않아 린터 역시 잡지 못했습니다. 이제 해당 컬럼은 `text`로 변환합니다 — 상한으로 깎으면 소스가 정상적으로 담고 있는 값을 거부하게 되므로, `text`가 소스 범위를 더 많이 보존합니다 — 그리고 무엇이 사라지는지 경고합니다: 길이 제한은 더 이상 강제되지 않고, 고정 길이 컬럼은 공백 패딩 의미도 잃습니다. 새 Evaluation 결과(`PG_CHARACTER_LENGTH`)가 같은 내용을 알려주므로, 운영자가 적용 시점에 처음 마주치는 일이 없습니다.
+- **값 크기 제한을 모든 타입에 1 MiB로 보고해, 길이 제한 없는 `varchar`의 여유를 16배 과대 안내했습니다.** 이제 타입별 수치를 사용합니다. Aurora DSQL "Supported data types" 문서 기준이며 압축되지 않는 값으로 라이브 재검증했습니다: `text`/`bytea`/`json`/`jsonb` 1 MiB, `varchar` 65,535바이트, `char` 4,096바이트. 압축 예외 범위도 바로잡았습니다 — DSQL은 문자·json 타입을 압축하지만 `bytea`는 **압축하지 않으며**, 키 컬럼도 압축하지 않습니다 — 따라서 `bytea` 결과가 존재하지 않는 여유를 암시하지 않습니다.
+- **값 크기 probe가 `json`/`jsonb` 컬럼을 측정하지 못하면서, 측정 못 한 컬럼을 초록색 PASS 안에 넣어 보고했습니다.** `octet_length`에는 json/jsonb 오버로드가 없어(`function octet_length(jsonb) does not exist`) 해당 문장이 실패하고, PostgreSQL은 실패한 문장 이후 트랜잭션을 중단 상태로 두므로 **그 뒤 모든 컬럼도 실패**했습니다 — probe 자신의 "한 컬럼의 실패가 다른 컬럼을 잃게 하지 않는다"는 설명과 정반대였습니다. 그리고 측정되지 않은 컬럼은 "초과하지 않음"으로 취급되어 PASS에 나열됐습니다. 이제 json/jsonb는 `octet_length(col::text)`로 측정하고, 실패마다 롤백한 뒤 statement timeout을 재적용해(롤백된 트랜잭션에 `SET LOCAL`이 묶여 있었으므로) 남은 컬럼을 계속 측정하며, 측정 불가 컬럼은 미확정으로 보고합니다 — 그런 컬럼이 하나라도 있으면 PASS가 아니라 INFO로 내려갑니다.
+- **파티션 테이블에 대해 Evaluation과 Schema Conversion이 서로 다른 답을 줬습니다.** Evaluation은 "Manual partitioning is not used by Aurora DSQL" / "수동 파티셔닝을 제거하라"며 MANUAL·MEDIUM으로 등급했고, 컨버터는 동일한 사실을 손실 0건의 RECOMMENDATION으로 등급하며 깨끗한 대상 DDL을 만들었습니다. Evaluation 문구는 PostgreSQL 소스에 대해 두 가지로 틀렸습니다: MySQL 용어를 썼고, "수동 파티셔닝을 제거하라"는 운영자가 **해서는 안 되는** 작업입니다(이 도구는 소스를 읽기만 합니다). 대상에서도 할 일이 없습니다(컨버터가 `PARTITION BY`를 내보내지 않고 파티션을 한 테이블로 합칩니다). 이제 결과는 컨버터의 엔진별 문구를 그대로 사용하므로 둘이 다시 어긋날 수 없습니다.
+- **collation 결과가 Aurora DSQL에 없는 세 가지 해법을 권고했습니다.** 모두 실제 클러스터에서 검증: DSQL은 `C`/`POSIX`/`default` collation만 허용하며(`unicode`, `ucs_basic`은 `pg_collation`에 있지만 사용 시 `provided collation is not supported`로 거부됨) "대상이 지원하는 `COLLATE` 절로 명시 정렬"은 불가능하고, `unaccent()`도 없으며, DSQL이 `LC_CTYPE=C`로 동작하므로 `lower()`/`upper()`는 ASCII만 접습니다 — `lower('JOSÉ')`는 `'josÉ'` — 따라서 권고된 `lower(col)` 정규화는 악센트 데이터에 작동하지 않습니다. 이제 실제로 가능한 방법(애플리케이션이 정규화된 정렬·매칭 키를 저장)을 안내하고, 빠져 있던 절반도 공개합니다: `ILIKE`와 `~*`는 비ASCII 텍스트에서 대소문자 무관 매칭을 멈추므로 결과의 **순서만이 아니라 어떤 행이 반환되는지**가 달라집니다.
+- **MySQL의 oversized-LOB 결과는 여전히 도구가 할 수 있는 일을 숙제로 넘겼습니다.** "1 MiB를 넘는 값이 없는지 확인하라"는 이제 이를 측정하는 Data Migration 사전 점검을 가리키며, PostgreSQL 쪽(v0.1.531)과 같아졌습니다.
+
 ## v0.1.534
 
 ### 수정

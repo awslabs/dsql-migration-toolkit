@@ -25,6 +25,7 @@ from dsql_migrator.core.assessor import (
     render_text_report,
 )
 from dsql_migrator.core.models import (
+    ConversionNoteKind,
     AssessmentReport,
     Classification,
     ColumnDef,
@@ -252,13 +253,41 @@ def test_ci_collation_rule_classifies_table_manual() -> None:
     assert "collation" in item.risk.lower()
 
 
-def test_partitioned_table_rule_classifies_table_manual() -> None:
-    inventory = SourceInventory(
-        tables=[_table_with_pk("metrics", partitioned=True)]
-    )
+def test_partitioned_table_finding_is_the_converters_own_text_and_advisory() -> None:
+    """Evaluation and Schema Conversion must not grade or describe this differently.
+
+    They did: Evaluation said "Manual partitioning is not used by Aurora DSQL" / "Remove
+    the manual partitioning", graded MANUAL with MEDIUM effort, while the converter graded
+    the identical fact a RECOMMENDATION with zero losses and a clean target DDL. And
+    "remove the manual partitioning" is work the operator must NOT do -- the source is
+    read-only -- and does not need to do on the target either. The rule now takes the
+    converter's own message, so the two cannot drift apart again.
+    """
+    from dsql_migrator.core.assessor import PartitionedTableRule
+    from dsql_migrator.core.converter import _partitioned_table_warning
+
+    table = _table_with_pk("metrics", partitioned=True)
+    inventory = SourceInventory(tables=[table])
+
+    for is_postgres in (False, True):
+        finding = PartitionedTableRule(is_postgres=is_postgres).evaluate(inventory)[0]
+        expected = _partitioned_table_warning(table, is_postgres=is_postgres)
+        assert expected is not None
+        assert finding.risk == expected.message, is_postgres
+        # Advisory, like the converter's note -- not a blocking loss.
+        assert finding.note_kind is ConversionNoteKind.RECOMMENDATION
+        # And it must not tell the operator to change the READ-ONLY source.
+        assert "Remove the manual partitioning" not in finding.recommendation
+        assert "do NOT change the source" in finding.recommendation
+
+    # The engines describe their own mechanism, never the other's.
+    pg = PartitionedTableRule(is_postgres=True).evaluate(inventory)[0].risk
+    mysql = PartitionedTableRule().evaluate(inventory)[0].risk
+    assert "declarative partitioning" in pg and "PARTITION (p1)" not in pg
+    assert "MySQL native partitioning" in mysql
+
     item = _item_for(_assess(inventory), "metrics")
     assert item.rule_id == "PARTITIONED_TABLE"
-    assert item.classification is Classification.MANUAL
 
 
 def test_spatial_type_rule_classifies_table_manual_not_unsupported() -> None:
@@ -571,6 +600,7 @@ def test_default_rules_source_type_seam() -> None:
     _PG_SPECIFIC = {
         "PG_UNSUPPORTED_TYPE",
         "PG_UNSUPPORTED_RELATION",
+        "PG_CHARACTER_LENGTH",
         # A non-PK serial / GENERATED AS IDENTITY column. MySQL allows only ONE
         # AUTO_INCREMENT column and it must be a key, so the condition cannot arise there.
         "NON_KEY_SEQUENCE",

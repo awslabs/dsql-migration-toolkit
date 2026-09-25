@@ -118,12 +118,19 @@ class SessionSourceProbe:
         *,
         limit_bytes: int,
         timeout_seconds: float,
+        limits: "Optional[Mapping[str, int]]" = None,
+        column_types: "Optional[Mapping[str, str]]" = None,
     ) -> "Optional[dict[str, bool]]":
-        """Whether any value in each column exceeds ``limit_bytes``. Read-only.
+        """Whether any value in each column exceeds ITS limit. Read-only.
 
         Answers the one question the oversized-LOB finding tells the operator to check and
         that nothing in the tool could answer: does a value ALREADY exceed Aurora DSQL's
         per-value limit, so rows will be quarantined?
+
+        ``limits`` gives each column its OWN ceiling (they differ by type: text/bytea/json
+        are 1 MiB but varchar is 65535 bytes and char 4096); ``limit_bytes`` is the
+        fallback for a column not listed. ``column_types`` gives each column's source type,
+        which decides HOW it can be measured (see :meth:`_measured_expression`).
 
         Bounded three ways, because this is the only prerequisite that reads row DATA:
         * ``EXISTS (SELECT 1 ... WHERE octet_length(col) > :limit)`` -- the engine may stop
@@ -131,15 +138,24 @@ class SessionSourceProbe:
         * a per-statement timeout, so proving the ABSENCE of an offender on a very large
           table cannot stall the gate; a timeout returns ``None`` ("not determined"),
           never a pass.
-        * one statement per column, so a failure on one column does not lose the others.
+        * one statement per column, ROLLED BACK on failure so the next column still runs.
+          Without the rollback the claim was false on PostgreSQL: a failed statement
+          aborts the transaction, so the FIRST failing column made every later one fail
+          with ``InFailedSqlTransaction`` -- and an unmeasured column used to be reported
+          inside a green PASS.
+
+        ``octet_length`` has no json/jsonb overload (verified: ``function
+        octet_length(jsonb) does not exist``), which is exactly how that cascade started, so
+        those are measured as ``octet_length(col::text)``.
 
         Measures the UNCOMPRESSED byte length, which is an upper bound: DSQL's limit
-        applies to the compressed size for text/json, so a highly compressible value may
-        still fit. Over-reporting in that direction is the safe side, and the check's
-        remediation says so.
+        applies to the compressed size for the character and json types (outside a key), so
+        a highly compressible value may still fit. Over-reporting in that direction is the
+        safe side, and the check's remediation says so.
 
-        Returns ``None`` when nothing could be established at all (no engine, every
-        statement failed), so the check reports not-determined rather than a false pass.
+        A column is OMITTED from the answer when it could not be measured, so the caller
+        reports not-determined for it rather than a pass. ``None`` means nothing at all
+        could be established (no engine, or the connection itself failed).
         """
         from sqlalchemy import bindparam
 
@@ -169,20 +185,52 @@ class SessionSourceProbe:
             with engine.connect() as connection:
                 self._apply_statement_timeout(connection, timeout_seconds, is_postgres)
                 for name in columns:
+                    measured = self._measured_expression(
+                        length_fn, quote(name), (column_types or {}).get(name, "")
+                    )
                     statement = text(
                         "SELECT EXISTS (SELECT 1 FROM "
                         + qualified
-                        + f" WHERE {length_fn}({quote(name)}) > :limit)"
-                    ).bindparams(bindparam("limit", limit_bytes))
+                        + f" WHERE {measured} > :limit)"
+                    ).bindparams(
+                        bindparam("limit", (limits or {}).get(name, limit_bytes))
+                    )
                     try:
                         row = connection.execute(statement).first()
                     except Exception:  # noqa: BLE001 - one column's failure only
+                        # MUST roll back: on PostgreSQL the failed statement leaves the
+                        # transaction aborted, so without this every REMAINING column fails
+                        # too and silently goes unmeasured.
+                        try:
+                            connection.rollback()  # type: ignore[attr-defined]
+                            # SET LOCAL is scoped to the rolled-back transaction, so the
+                            # cap has to be re-applied or the remaining columns run
+                            # unbounded.
+                            self._apply_statement_timeout(
+                                connection, timeout_seconds, is_postgres
+                            )
+                        except Exception:  # noqa: BLE001 - best effort, like the timeout
+                            pass
                         continue
                     if row is not None:
                         answer[name] = bool(row[0])
         except Exception:  # noqa: BLE001 - advisory read; never break the gate
             return answer or None
         return answer or None
+
+    @staticmethod
+    def _measured_expression(length_fn: str, quoted: str, column_type: str) -> str:
+        """The byte-length expression to measure a column of ``column_type`` with.
+
+        ``octet_length`` accepts text and bytea but has NO json/jsonb overload, so a jsonb
+        column raised ``function octet_length(jsonb) does not exist`` -- the failure that
+        aborted the whole probe transaction. Casting to text measures the document's
+        serialized bytes, which is what the value costs on the target.
+        """
+        base = (column_type or "").strip().lower().split("(", 1)[0].strip()
+        if base in {"json", "jsonb"}:
+            return f"{length_fn}({quoted}::text)"
+        return f"{length_fn}({quoted})"
 
     @staticmethod
     def _apply_statement_timeout(

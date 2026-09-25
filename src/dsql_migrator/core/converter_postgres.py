@@ -292,6 +292,68 @@ def clamp_pg_numeric(pg_type: str) -> "tuple[str, Optional[str]]":
     )
 
 
+# Aurora DSQL's DECLARED-LENGTH ceilings for the character types, live-verified on a real
+# cluster (and documented in "Supported data types in Aurora DSQL"):
+#   CREATE ... VARCHAR(65536) -> ProgramLimitExceeded
+#       "Datatype limit greater than 65535 bytes not supported for varchar"
+#   CREATE ... CHAR(4097)     -> "Datatype limit greater than 4096 bytes not supported for char"
+# VARCHAR(65535) / CHAR(4096) are accepted. PostgreSQL allows up to ~1 GB, so a source
+# column above these ceilings made the WHOLE CREATE TABLE fail at apply with nothing having
+# warned -- and `dsql_lint` does not catch it either (0 diagnostics on VARCHAR(100000)).
+_DSQL_MAX_VARCHAR_LENGTH = 65535
+_DSQL_MAX_CHAR_LENGTH = 4096
+
+# `character varying(n)`/`varchar(n)` and `character(n)`/`char(n)`, capturing n. Deliberately
+# NOT matching a bare spelling (no modifier): an unbounded varchar is already emitted as
+# VARCHAR and DSQL applies its default ceiling to the VALUE, which is the oversized-LOB
+# check's business, not the DDL's.
+_PG_CHAR_SPEC_RE = re.compile(
+    r"^\s*(character\s+varying|varchar|character|char|bpchar)\s*\(\s*(\d+)\s*\)\s*$",
+    re.IGNORECASE,
+)
+
+
+def clamp_pg_character(pg_type: str) -> "tuple[str, Optional[str]]":
+    """Clamp a PostgreSQL character type whose DECLARED LENGTH exceeds DSQL's ceiling.
+
+    Returns ``(type_string, warning)``, mirroring :func:`clamp_pg_numeric`.
+
+    The replacement is ``text``, NOT the ceiling length: emitting ``varchar(65535)`` for a
+    source ``varchar(200000)`` would make DSQL REJECT values the source legitimately holds
+    (a silent data loss discovered only mid-load), whereas ``text`` accepts up to DSQL's
+    1 MiB per-value limit -- strictly more of the source's range, and PostgreSQL's own
+    ``varchar(n)`` is ``text`` plus a length check. What IS lost is that length check, and
+    for ``character(n)`` the blank padding; the warning says so.
+
+    Types within the ceiling pass through verbatim, as does a bare/unbounded spelling.
+    """
+    match = _PG_CHAR_SPEC_RE.match(pg_type or "")
+    if match is None:
+        return pg_type, None
+    base = match.group(1).lower()
+    length = int(match.group(2))
+    is_fixed = base in {"character", "char", "bpchar"}
+    ceiling = _DSQL_MAX_CHAR_LENGTH if is_fixed else _DSQL_MAX_VARCHAR_LENGTH
+    if length <= ceiling:
+        return pg_type, None
+    padding = (
+        " The blank padding of a fixed-length character column is not reproduced either "
+        "(text stores what the source already padded, but comparisons no longer ignore "
+        "trailing spaces)."
+        if is_fixed
+        else ""
+    )
+    return "text", (
+        f"{pg_type} was converted to text: Aurora DSQL does not accept a declared "
+        f"{'char' if is_fixed else 'varchar'} length above {ceiling} bytes, so the column "
+        "as declared would have made the whole CREATE TABLE fail at apply. text keeps more "
+        "of the source's range (values up to Aurora DSQL's 1 MiB per-value limit) than the "
+        f"clamped {ceiling}-byte length would, but the length limit itself is no longer "
+        f"enforced on the target -- re-add it as a CHECK (length(col) <= {length}) if the "
+        f"application relies on it.{padding}"
+    )
+
+
 def _ddl_column_type(pg_type: str) -> str:
     """The type string to emit in the rebuilt ``CREATE TABLE`` (usually verbatim).
 
@@ -323,6 +385,11 @@ def _ddl_column_type(pg_type: str) -> str:
         # (bit strings are not a DSQL column type): unsupported_dsql_reason reads the
         # ORIGINAL column.mysql_type, so the surfaced warning still names "bit varying".
         return "varbit" + pg_type[len("bit varying"):]
+    # Clamp an over-length character(n)/varchar(n) for the same reason as the numeric
+    # clamp below: emit DDL DSQL accepts, and surface the change as a warning.
+    clamped_character = clamp_pg_character(pg_type)[0]
+    if clamped_character != pg_type:
+        return clamped_character
     # Clamp an over-precision numeric(p,s) so the emitted DDL is valid for DSQL (the
     # warning is surfaced separately by the converter -- see convert_table's PG branch).
     return clamp_pg_numeric(pg_type)[0]

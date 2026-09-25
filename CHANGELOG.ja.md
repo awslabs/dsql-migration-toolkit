@@ -5,6 +5,17 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.535
+
+### 修正
+
+- **Aurora DSQL の許容を超える長さで宣言された PostgreSQL の `varchar`/`char` が、適用時に `CREATE TABLE` 全体を失敗させ、事前の警告が一切ありませんでした。** DSQL は宣言長を `varchar` 65535 バイト、`char` 4096 バイトに制限します(ライブ検証: `VARCHAR(65536)` → `Datatype limit greater than 65535 bytes not supported for varchar`)。PostgreSQL は約 1 GB まで許容し、`dsql_lint` も診断を返さないためリンターでも検出できませんでした。該当列は `text` に変換します — 上限に切り詰めるとソースが正当に保持している値を拒否してしまうため、`text` のほうがソースの範囲をより多く保てます — そして失われるものを警告します: 長さ制限はもう強制されず、固定長列は空白パディングの意味も失います。新しい Evaluation の指摘(`PG_CHARACTER_LENGTH`)が同じ内容を伝えるので、運用者が適用時に初めて気づくことはありません。
+- **値サイズの上限をすべての型について一律 1 MiB と報告し、長さ無制限の `varchar` の余裕を 16 倍過大に伝えていました。** 現在は型ごとの数値を使います。Aurora DSQL「Supported data types」に基づき、圧縮されない値でライブ再検証済みです: `text`/`bytea`/`json`/`jsonb` 1 MiB、`varchar` 65,535 バイト、`char` 4,096 バイト。圧縮の例外範囲も正しくしました — DSQL は文字型と json 型を圧縮しますが `bytea` は**圧縮せず**、キー列も圧縮しません — したがって `bytea` の指摘が存在しない余裕を示唆しなくなりました。
+- **値サイズのプローブが `json`/`jsonb` 列を計測できず、計測できていない列を緑の PASS の中に入れて報告していました。** `octet_length` に json/jsonb のオーバーロードは無く(`function octet_length(jsonb) does not exist`)その文が失敗し、PostgreSQL は失敗した文の後トランザクションを中断状態にするため、**その後のすべての列も失敗**しました — プローブ自身の「1 列の失敗で他の列を失わない」という説明と正反対です。さらに計測されなかった列は「超過なし」として PASS に並べられていました。現在は json/jsonb を `octet_length(col::text)` で計測し、失敗ごとにロールバックしてステートメントタイムアウトを再適用し(`SET LOCAL` はロールバックされたトランザクションに紐づいていたため)残りの列を計測し続け、計測できなかった列は未確定として報告します — そのような列が 1 つでもあれば PASS ではなく INFO に下がります。
+- **パーティションテーブルについて Evaluation と Schema Conversion が異なる答えを返していました。** Evaluation は「Manual partitioning is not used by Aurora DSQL」「手動パーティショニングを削除せよ」として MANUAL・MEDIUM と採点し、コンバーターは同じ事実を損失 0 件の RECOMMENDATION として採点し、きれいなターゲット DDL を生成していました。Evaluation の文面は PostgreSQL ソースに対して二重に誤りでした: MySQL の語彙を使い、かつ「手動パーティショニングを削除せよ」は運用者が**行ってはならない**作業です(本ツールはソースを読むだけです)。ターゲット側でも作業は不要です(コンバーターは `PARTITION BY` を出力せず、パーティションを 1 つのテーブルにまとめます)。現在はコンバーター自身のエンジン別メッセージをそのまま用いるため、両者が再び乖離することはありません。
+- **collation の指摘が Aurora DSQL に存在しない 3 つの対処を推奨していました。** いずれも実クラスターで検証: DSQL は `C`/`POSIX`/`default` の collation のみを受け付け(`unicode` と `ucs_basic` は `pg_collation` に載っていますが使用時に `provided collation is not supported` で拒否)「ターゲットが対応する `COLLATE` 句で明示的にソートする」は不可能で、`unaccent()` も無く、DSQL は `LC_CTYPE=C` で動作するため `lower()`/`upper()` は ASCII のみを畳みます — `lower('JOSÉ')` は `'josÉ'` — したがって推奨されていた `lower(col)` による正規化はアクセント付きデータに効きません。現在は実際に可能な方法(アプリケーションが正規化済みのソート・照合キーを保存する)を案内し、完全に欠けていた半分も開示します: `ILIKE` と `~*` は非 ASCII テキストで大文字小文字を無視した一致をしなくなるため、結果の**順序だけでなくどの行が返るか**が変わります。
+- **MySQL の oversized-LOB の指摘は、ツールができることを宿題として残していました。** 「1 MiB を超える値が無いか確認する」は、それを計測する Data Migration の事前チェックを指すようになり、PostgreSQL 側(v0.1.531)と揃いました。
+
 ## v0.1.534
 
 ### 修正
