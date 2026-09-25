@@ -5,6 +5,14 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.533
+
+### 수정
+
+- **DSQL이 지원하지 않는 타입으로 캐스팅하는 컬럼 DEFAULT가 그대로 생성되어, DEFAULT에 대한 언급 없이 `CREATE TABLE` 전체가 적용 단계에서 실패했습니다.** PostgreSQL enum 컬럼은 `DEFAULT CAST('image' AS ecommerce.media_type)`(또는 `'image'::ecommerce.media_type` 표기)를 가집니다. 컬럼 자체는 `text`로 재모델링되고 Evaluation도 그렇게 하라고 안내하지만, DEFAULT 안의 캐스트는 그 수정에도 살아남아 Aurora DSQL에 존재하지 않는 타입을 가리키므로 테이블은 여전히 `type "ecommerce.media_type" does not exist`로 거부됩니다. 이제 DEFAULT를 생략하고 원본 식을 인용한 이유를 함께 제시하므로, 운영자가 DDL에서 평문 리터럴로 다시 넣거나 적용 후 `ALTER TABLE`로 추가할 수 있습니다. `nextval('s'::regclass)`와 그 외 식 전용 카탈로그 캐스트(`regtype`, `regproc`, `oid` 등)는 제외되어, 시퀀스 DEFAULT는 계속 시퀀스 사유로 설명됩니다.
+- **"일반 테이블로 재구현하라"고 하면서 재구현할 대상을 알려주지 않았습니다.** PostgreSQL 머티리얼라이즈드 뷰는 Aurora DSQL에서 미지원이며 권고는 재작성인데, 인트로스펙션이 관계의 이름만 수집해 `ViewDef.definition`이 비어 있었고, HTML 평가 보고서를 내보낸 뒤에는 원본으로 되돌아가 쿼리를 확인할 수도 없었습니다. `pg_get_viewdef()`는 그 관계를 이미 찾아낸 동일한 카탈로그 조회의 컬럼 하나이므로, 이제 정의 쿼리를 읽어 결과에 인용합니다(한 줄로 정규화, 600자로 제한하고 나머지는 원본에서 읽는 방법을 안내). 외래 테이블에는 이 문구가 붙지 않습니다 — 그 형태는 쿼리가 아니라 외부 서버이기 때문입니다.
+- **Evaluation과 Schema Conversion이 해당 타일이 아예 표시되지 않는 테이블에도 "'Server-generated (IDENTITY)' 전략을 선택하라"고 안내했습니다.** 선택기는 생성 컬럼과 동일한 단일 컬럼 기본 키에만 IDENTITY를 제공하므로, serial 컬럼을 포함한 복합 키(예: `order_events PRIMARY KEY (id, occurred_at)`)에서는 세 곳 모두 화면에 없는 컨트롤을 가리키면서 이유도 알려주지 않았습니다. 이제 실제로 제공될 때만 전략을 언급하고, 그렇지 않으면 기본 키가 복합임을 밝히고 구성 컬럼을 나열하며 운영자가 실제로 할 수 있는 조치(애플리케이션에서 값 공급, 또는 적용 후 대상에 IDENTITY 추가)를 제시합니다.
+
 ## v0.1.532
 
 ### 수정

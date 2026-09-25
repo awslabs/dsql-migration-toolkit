@@ -1219,3 +1219,63 @@ def test_pg_routine_definition_matches_the_signature_bearing_name() -> None:
     # schema-qualified argument type.
     assert all("name" not in p for p in asked)
     assert asked[0]["full"] == "app.order_count()"
+
+
+def test_postgres_introspection_reads_a_materialized_views_defining_query() -> None:
+    """The matview arrived as a bare name, so the UNSUPPORTED finding had no query to quote.
+
+    ``extra_relations`` captured only ``relname``/``relkind``, leaving ``ViewDef.definition``
+    at "" -- yet ``pg_get_viewdef`` is one column in the same catalog scan, and without it
+    "reimplement it as a plain table" names nothing to reimplement from. A foreign table
+    correctly has no definition (its shape is an external server, not a query).
+    """
+    from dsql_migrator.core.source_dialect.postgres import PostgresSourceDialect
+
+    class _Dialect:
+        name = "postgresql"
+
+    class _Result:
+        def __init__(self, rows: list) -> None:
+            self._rows = rows
+
+        def mappings(self) -> list:
+            return self._rows
+
+    class _Connection:
+        """Answers the catalog query, and records the SQL the dialect asked for."""
+
+        dialect = _Dialect()
+
+        def __init__(self) -> None:
+            self.sql = ""
+
+        def execute(self, statement: object, params: dict) -> _Result:
+            self.sql = str(statement)
+            assert params == {"nsp": "ecommerce"}, params
+            # What the real catalog returns: the matview gets a viewdef, the foreign
+            # table gets NULL (it has no defining query).
+            return _Result(
+                [
+                    {
+                        "name": "mv_monthly_revenue",
+                        "relkind": "m",
+                        "defn": " SELECT sum(total_amount) AS total_revenue\n"
+                        "   FROM ecommerce.orders;",
+                    },
+                    {"name": "ext_customers", "relkind": "f", "defn": None},
+                ]
+            )
+
+    connection = _Connection()
+    relations = PostgresSourceDialect().extra_relations(connection, "ecommerce")
+
+    assert "pg_get_viewdef" in connection.sql, connection.sql
+    by_name = {v.name: v for v in relations}
+    matview = by_name["mv_monthly_revenue"]
+    assert matview.unsupported_kind == "materialized view"
+    assert "sum(total_amount) AS total_revenue" in matview.definition
+    # A NULL viewdef must become "", never the string "None" (which would be quoted
+    # verbatim into the finding as if it were the query).
+    foreign = by_name["ext_customers"]
+    assert foreign.unsupported_kind == "foreign table"
+    assert foreign.definition == "", foreign.definition

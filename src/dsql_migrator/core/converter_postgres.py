@@ -101,7 +101,60 @@ def pg_column_default_sql(
             "carry, so the column is created without a default; set it in the application "
             "or add it with ALTER TABLE after apply."
         )
+    # A default that references a type DSQL does not have is itself invalid there, even
+    # after the COLUMN is remodelled. The UNSUPPORTED type warning tells the operator to
+    # change the column to text; the cast inside the default (`DEFAULT CAST('image' AS
+    # ecommerce.media_type)`, or the `'image'::ecommerce.media_type` spelling) survives that
+    # edit and the CREATE TABLE still fails -- with nothing having mentioned the default.
+    # So drop it and say why: the value is stated in the reason, which is what the operator
+    # needs to re-add it once the column has a supported type.
+    bad_type = _pg_default_unsupported_type(raw)
+    if bad_type is not None:
+        return None, (
+            f"source default ({raw}) casts to '{bad_type}', a PostgreSQL type Aurora DSQL "
+            "does not support as a column type, so the default is not carried -- it would "
+            "keep failing even after the column itself is remodelled. Re-add it with the "
+            "remodelled type (e.g. a plain text literal) in the DDL or with ALTER TABLE "
+            "after apply."
+        )
     return raw, None
+
+
+# A type reference inside a DEFAULT, in either PostgreSQL spelling: the `::type` cast and
+# the `CAST(... AS type)` form the converter's own re-render produces. The name may be
+# schema-qualified and quoted.
+_PG_DEFAULT_CAST_RE = re.compile(
+    r"(?:::|\bCAST\s*\([^()]*?\bAS\s+)\s*([\w.\"]+(?:\s*\[\s*\])?)",
+    re.IGNORECASE,
+)
+
+
+# Casts that appear INSIDE expressions but are never column types, so the column-type
+# support test does not apply to them. ``regclass`` is the one that matters: PostgreSQL
+# renders a sequence default as ``nextval('s'::regclass)``. That path returns earlier, but
+# a default could legitimately cast to one of these for another reason, and dropping it
+# would be a false positive on a default DSQL would have accepted.
+_PG_EXPRESSION_ONLY_CAST_TYPES = frozenset(
+    {"regclass", "regtype", "regproc", "regprocedure", "regoper", "regnamespace", "oid"}
+)
+
+
+def _pg_default_unsupported_type(raw: str) -> "Optional[str]":
+    """The first type a DEFAULT casts to that DSQL does not support, or ``None``. Pure.
+
+    Reuses the same support test the COLUMN types go through, so the two cannot disagree
+    about what DSQL accepts. Only reports a type that is genuinely unsupported: a default
+    casting to ``VARCHAR``/``numeric``/``timestamp`` is normal (the converter's own
+    re-render emits those) and must not be dropped.
+    """
+    for match in _PG_DEFAULT_CAST_RE.finditer(raw or ""):
+        name = match.group(1).strip().strip('"')
+        if not name or name.lower() in _PG_EXPRESSION_ONLY_CAST_TYPES:
+            continue
+        if unsupported_dsql_reason(name) is not None:
+            return name
+    return None
+
 
 # PostgreSQL base types Aurora DSQL supports AS COLUMN TYPES, normalized (lower-case,
 # type modifiers + whitespace collapsed). Source of truth: the Aurora DSQL User Guide

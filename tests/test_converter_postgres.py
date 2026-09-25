@@ -1209,3 +1209,53 @@ def test_a_postgres_numeric_within_dsqls_documented_maximum_is_never_narrowed() 
     clamped, note = clamp_pg_numeric(f"numeric({P + 1},10)")
     assert clamped == f"numeric({P},10)"
     assert note and f"maximum of {P}" in note, note
+
+
+def test_a_default_cast_to_a_dsql_unsupported_type_is_reported_not_emitted() -> None:
+    """A DEFAULT casting to an enum used to be emitted verbatim and fail at apply.
+
+    The column itself is remodelled (`ecommerce.media_type` -> text), but its default kept
+    the cast to the now-nonexistent type, so the whole CREATE TABLE was rejected on DSQL
+    with "type ecommerce.media_type does not exist" -- a failure the operator had no
+    warning about and no way to attribute to the default.
+    """
+    from dsql_migrator.core.converter_postgres import (
+        _pg_default_unsupported_type,
+        pg_column_default_sql,
+    )
+    from dsql_migrator.core.models import ColumnDef
+
+    def default_of(expr: str):
+        return pg_column_default_sql(
+            ColumnDef(name="media_kind", mysql_type="text", default=expr),
+            is_key_column=False,
+        )
+
+    for raw in (
+        "CAST('image' AS ecommerce.media_type)",
+        "'image'::ecommerce.media_type",
+    ):
+        emitted, note = default_of(raw)
+        assert emitted is None, f"{raw} must not be carried into the DDL"
+        assert note and "media_type" in note, note
+        assert "keep failing even after the column itself is remodelled" in note, note
+
+    # Defaults DSQL accepts are untouched -- including a cast to a supported type.
+    for ok in (
+        "CURRENT_TIMESTAMP",
+        "now()",
+        "1",
+        "true",
+        "'x'::text",
+        "CAST(NULL AS VARCHAR)",
+        "CAST('a' AS character varying)",
+    ):
+        assert default_of(ok)[1] is None, ok
+
+    # A nextval default stays attributed to the SEQUENCE. Its `::regclass` is an EXPRESSION
+    # cast, not a column type, so the new guard must not claim "DSQL does not support
+    # regclass as a column type" and mis-explain the one default that has its own handling.
+    seq_note = default_of("nextval('ecommerce.s'::regclass)")[1]
+    assert seq_note and "takes its value from a sequence" in seq_note, seq_note
+    assert "regclass" not in seq_note, seq_note
+    assert _pg_default_unsupported_type("nextval('ecommerce.s'::regclass)") is None

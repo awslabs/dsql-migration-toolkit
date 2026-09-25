@@ -644,7 +644,13 @@ class PostgresSourceDialect(SourceDialect):
             return []
         rows = connection.execute(  # type: ignore[attr-defined]
             text(
-                "SELECT c.relname AS name, c.relkind AS relkind "
+                "SELECT c.relname AS name, c.relkind AS relkind, "
+                # The matview's DEFINITION. Without it the UNSUPPORTED finding said
+                # "reimplement it as a plain table that the application refreshes" with
+                # nothing to reimplement FROM -- the one artifact the operator needs was a
+                # single catalog call away. A foreign table has no viewdef (NULL), which is
+                # correct: its definition is an external server/options, not a query.
+                "CASE WHEN c.relkind = 'm' THEN pg_get_viewdef(c.oid, true) END AS defn "
                 "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
                 "WHERE n.nspname = :nsp AND c.relkind IN ('m', 'f') "
                 # An extension's own matview / foreign table is not the user's object to
@@ -661,7 +667,13 @@ class PostgresSourceDialect(SourceDialect):
             kind = label.get(str(row.get("relkind")))
             if kind is None:
                 continue
-            out.append(ViewDef(name=row["name"], unsupported_kind=kind))
+            out.append(
+                ViewDef(
+                    name=row["name"],
+                    unsupported_kind=kind,
+                    definition=str(row.get("defn") or ""),
+                )
+            )
         return out
 
     def list_schemas(self, connection: object) -> Optional[list[str]]:

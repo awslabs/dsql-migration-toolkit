@@ -5,6 +5,14 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.533
+
+### 修正
+
+- **DSQL が対応していない型へキャストする列 DEFAULT がそのまま出力され、DEFAULT について何も言及されないまま `CREATE TABLE` 全体が適用時に失敗していました。** PostgreSQL の enum 列は `DEFAULT CAST('image' AS ecommerce.media_type)`(または `'image'::ecommerce.media_type` の表記)を持ちます。列そのものは `text` に置き換えられ、Evaluation もそう案内しますが、DEFAULT 内のキャストはその修正後も残り、Aurora DSQL に存在しない型を指すため、テーブルは依然 `type "ecommerce.media_type" does not exist` で拒否されます。現在は DEFAULT を出力せず、元の式を引用した理由を返すので、運用者は DDL で素のリテラルとして入れ直すか、適用後に `ALTER TABLE` で追加できます。`nextval('s'::regclass)` とその他の式専用カタログキャスト(`regtype`、`regproc`、`oid` など)は除外され、シーケンスの DEFAULT は引き続きシーケンスの理由として説明されます。
+- **「通常のテーブルとして作り直してください」と言いながら、作り直す元を示していませんでした。** PostgreSQL のマテリアライズドビューは Aurora DSQL では非対応で、推奨は再実装ですが、イントロスペクションがリレーションの名前だけを取得していたため `ViewDef.definition` は空で、HTML 評価レポートを書き出した後ではソースに戻って問い合わせを確認することもできませんでした。`pg_get_viewdef()` はそのリレーションを既に見つけている同じカタログ問い合わせの 1 列なので、定義クエリを読み取って指摘に引用します(1 行に正規化し、600 文字で打ち切って残りをソースで読む方法を案内)。外部テーブルにはこの記述は付きません — その形はクエリではなく外部サーバーだからです。
+- **Evaluation と Schema Conversion が、そのタイルがまったく表示されないテーブルにまで「'Server-generated (IDENTITY)' 戦略を選んでください」と案内していました。** 選択 UI は生成列と同一の単一列主キーにのみ IDENTITY を提示するため、serial 列を含む複合キー(例: `order_events PRIMARY KEY (id, occurred_at)`)では 3 か所すべてが画面に存在しないコントロールを指し、理由も示していませんでした。現在は実際に提示される場合のみ戦略名を挙げ、そうでなければ主キーが複合であることを述べ、その構成列を列挙し、運用者が実際に取れる対処(アプリケーションから値を供給する、または適用後にターゲットへ IDENTITY を追加する)を示します。
+
 ## v0.1.532
 
 ### 修正

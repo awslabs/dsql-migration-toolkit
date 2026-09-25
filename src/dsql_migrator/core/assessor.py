@@ -767,13 +767,26 @@ class AutoIncrementRule(Rule):
                             "key: DSQL stores rows in primary-key order, so a monotonically "
                             "increasing key concentrates writes on one partition."
                         ),
+                        # Only name a strategy the picker OFFERS. The IDENTITY tile is
+                        # rendered only for a SINGLE-column primary key that IS the
+                        # generated column, so on a composite-PK table this recommendation
+                        # sent the operator to a control Schema Conversion never shows.
                         recommendation=(
-                            "Decide at Schema Conversion who generates the key: choose "
-                            "the 'Server-generated (IDENTITY)' strategy to have DSQL fill "
-                            "it (the column is widened to bigint), or keep the plain "
-                            "integer and supply the value from the application. Optional, "
-                            "for throughput only: a UUID/random key or a cached identity "
-                            "spreads the writes."
+                            "Decide at Schema Conversion who generates the key: "
+                            + (
+                                "choose the 'Server-generated (IDENTITY)' strategy to have "
+                                "DSQL fill it (the column is widened to bigint), or keep "
+                                "the plain integer and supply the value from the "
+                                "application."
+                                if table.primary_key == [column]
+                                else "IDENTITY is not offered for this table because its "
+                                f"primary key is composite ({', '.join(table.primary_key)}) "
+                                "and a DSQL identity applies to a single column, so the "
+                                "value must come from the application — or add an identity "
+                                "to the column on the target after apply."
+                            )
+                            + " Optional, for throughput only: a UUID/random key or a "
+                            "cached identity spreads the writes."
                         ),
                         effort=EffortLevel.MEDIUM,
                         note_kind=ConversionNoteKind.RECOMMENDATION,

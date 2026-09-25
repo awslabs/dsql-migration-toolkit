@@ -2295,8 +2295,23 @@ def _apply_pk_strategy(
             "plain integer. IMPORTANT: Aurora DSQL will NOT auto-generate this key after "
             f"cut-over ({no_generator}), so the application "
             "must supply the value on every insert — an app that relied on the database "
-            "generating it will fail or collide. Choose the 'Server-generated (IDENTITY)' "
-            "strategy instead if you want DSQL to fill the key. For higher insert "
+            "generating it will fail or collide. "
+            # Only name the strategy when the picker OFFERS it. The Schema Conversion tile
+            # appears only for a SINGLE-column primary key that IS the generated column
+            # (_identity_eligible), yet this advice named it unconditionally -- so for a
+            # composite-PK table (e.g. PRIMARY KEY (id, occurred_at)) the operator was sent
+            # to a control that is not rendered for that table, with no hint why.
+            + (
+                "Choose the 'Server-generated (IDENTITY)' strategy instead if you want "
+                "DSQL to fill the key. "
+                if table.primary_key == [column_name]
+                else "The 'Server-generated (IDENTITY)' strategy is not offered for this "
+                "table because its primary key is composite "
+                f"({', '.join(table.primary_key)}) and DSQL's identity applies to a single "
+                "column, so the value has to come from the application (or add an identity "
+                "to the column on the target after apply). "
+            )
+            + "For higher insert "
             "throughput, consider a UUID/random key or a cached identity: DSQL stores "
             "rows in primary-key order, so a monotonically increasing key concentrates "
             "writes on one partition."

@@ -907,3 +907,101 @@ def test_the_oversized_lob_finding_points_at_the_check_that_answers_it() -> None
     joined = " ".join(f.recommendation for f in findings)
     assert "prerequisite checks" in joined, joined
     assert "ALREADY exceeds 1 MiB" in joined, joined
+
+
+def test_a_materialized_view_finding_carries_the_query_it_asks_to_reimplement() -> None:
+    """"Reimplement it as a plain table" named nothing to reimplement FROM.
+
+    Introspection already reads the defining query (pg_get_viewdef), and once the HTML
+    report is exported the operator cannot go back to the source for it, so the finding
+    quotes it -- bounded, because a definition is an arbitrarily long SELECT.
+    """
+    from dsql_migrator.core.assessor_postgres import (
+        _MAX_VIEWDEF_CHARS,
+        UnsupportedRelationRule,
+    )
+    from dsql_migrator.core.models import ViewDef
+
+    view = ViewDef(
+        name="ecommerce.mv_monthly_revenue",
+        unsupported_kind="materialized view",
+        definition=" SELECT date_trunc('month'::text, created_at) AS month,\n"
+        "    sum(total_amount) AS total_revenue\n   FROM ecommerce.orders\n  GROUP BY 1;",
+    )
+    finding = UnsupportedRelationRule().evaluate(SourceInventory(views=[view]))[0]
+    # Quoted, and collapsed to one line so it survives an HTML/table cell.
+    assert "sum(total_amount) AS total_revenue" in finding.recommendation
+    assert "FROM ecommerce.orders" in finding.recommendation
+    assert "\n" not in finding.recommendation
+
+    # Bounded, and it says where to read the rest.
+    huge = ViewDef(
+        name="ecommerce.mv_wide",
+        unsupported_kind="materialized view",
+        definition="SELECT " + ("col_name, " * 400) + "1",
+    )
+    clipped = UnsupportedRelationRule().evaluate(SourceInventory(views=[huge]))[0]
+    assert f"truncated at {_MAX_VIEWDEF_CHARS} characters" in clipped.recommendation
+    assert "pg_get_viewdef" in clipped.recommendation
+    assert len(clipped.recommendation) < _MAX_VIEWDEF_CHARS + 400
+
+    # A foreign table has no viewdef, and must not grow an empty "defining query" clause.
+    foreign = ViewDef(name="ecommerce.ft", unsupported_kind="foreign table", definition="")
+    ft = UnsupportedRelationRule().evaluate(SourceInventory(views=[foreign]))[0]
+    assert "defining query" not in ft.recommendation, ft.recommendation
+
+
+def test_a_composite_key_is_not_told_to_choose_a_strategy_that_is_not_offered() -> None:
+    """Both engines' generated-key findings named the IDENTITY strategy unconditionally.
+
+    Schema Conversion renders that tile only for a SINGLE-column primary key that IS the
+    generated column (``_identity_eligible``), so on a composite-PK table -- e.g.
+    ``order_events PRIMARY KEY (id, occurred_at)`` with an ``id`` serial -- the operator
+    was sent to a control the screen never shows, with nothing saying why.
+    """
+    from dsql_migrator.core.converter import (
+        PrimaryKeyStrategy,
+        SchemaConvertOptions,
+        SchemaConverter,
+    )
+
+    def table(primary_key: "list[str]") -> TableDef:
+        return TableDef(
+            name="ecommerce.order_events",
+            columns=[
+                ColumnDef(name="id", mysql_type="bigint", nullable=False, identity=True),
+                ColumnDef(name="occurred_at", mysql_type="timestamp", nullable=False),
+            ],
+            primary_key=primary_key,
+            auto_increment_column="id",
+        )
+
+    def finding_text(engine: SourceType, primary_key: "list[str]") -> str:
+        report = CompatibilityAssessor(source_type=engine).assess(
+            SourceInventory(tables=[table(primary_key)])
+        )
+        return " ".join(
+            item.recommendation
+            for item in report.items
+            if "who generates the key" in item.recommendation
+        )
+
+    def conversion_text(engine: SourceType, primary_key: "list[str]") -> str:
+        conv = SchemaConverter(source_type=engine).convert_table(
+            table(primary_key),
+            SchemaConvertOptions(primary_key_strategy=PrimaryKeyStrategy.KEEP_INTEGER),
+        )
+        return " ".join(w.message for w in conv.warnings if "plain integer" in w.message)
+
+    for engine in (SourceType.MYSQL, SourceType.POSTGRES):
+        for text in (finding_text, conversion_text):
+            single = text(engine, ["id"])
+            composite = text(engine, ["id", "occurred_at"])
+            assert single, f"{engine.value} {text.__name__} stopped reporting the key"
+            # The tile IS offered for the single-column key, so keep naming it.
+            assert "Server-generated (IDENTITY)" in single, single
+            # It is NOT offered for the composite key -- say so, and name the key.
+            assert "not offered for this table" in composite, composite
+            assert "occurred_at" in composite, composite
+            # And still give the operator something they CAN do.
+            assert "from the application" in composite, composite

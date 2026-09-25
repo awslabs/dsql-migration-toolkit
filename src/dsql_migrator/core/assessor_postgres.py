@@ -146,6 +146,27 @@ class UnsupportedPostgresTypeRule(Rule):
         return findings
 
 
+# A matview definition is unbounded (a whole SELECT), and this text lands in an HTML
+# report and a UI card -- quote enough to rebuild from, then point at the source.
+_MAX_VIEWDEF_CHARS = 600
+
+
+def _one_line(text: str) -> str:
+    """Collapse a multi-line catalog definition into one whitespace-normalised line."""
+    return " ".join(text.split())
+
+
+def _clip(text: str, limit: int) -> str:
+    """Return ``text`` bounded to ``limit`` chars, saying so when it was cut."""
+    if len(text) <= limit:
+        return text
+    return (
+        text[:limit].rstrip()
+        + f" ... [truncated at {limit} characters; read the full definition with "
+        "pg_get_viewdef() on the source]"
+    )
+
+
 class UnsupportedRelationRule(Rule):
     """Flag PostgreSQL materialized views and foreign tables (no Aurora DSQL equivalent).
 
@@ -170,6 +191,15 @@ class UnsupportedRelationRule(Rule):
                     "Reimplement it as a plain table that the application (or a scheduled "
                     "job) refreshes, since Aurora DSQL has no REFRESH MATERIALIZED VIEW."
                 )
+                # Quote the DEFINING QUERY. "Reimplement it" is not actionable without the
+                # thing to reimplement, and the operator cannot read it off the source once
+                # the report is exported -- introspection already has it (pg_get_viewdef).
+                definition = _one_line(getattr(view, "definition", "") or "")
+                if definition:
+                    recommendation += (
+                        " Its defining query, to build the replacement from: "
+                        + _clip(definition, _MAX_VIEWDEF_CHARS)
+                    )
             else:
                 recommendation = (
                     "Access the external data from the application or land it into a "
@@ -468,13 +498,23 @@ class PgIdentityKeyRule(Rule):
                         "different key: DSQL stores rows in primary-key order, so a "
                         "monotonically increasing key concentrates writes on one partition."
                     ),
+                    # Only name a strategy the picker OFFERS -- see the MySQL rule.
                     recommendation=(
-                        "Decide at Schema Conversion who generates the key: choose the "
-                        "'Server-generated (IDENTITY)' strategy to have DSQL fill it (the "
-                        "column is widened to bigint, which DSQL requires for an identity), "
-                        "or keep the plain integer and supply the value from the "
-                        "application. Optional, for throughput only: a UUID/random key or a "
-                        "cached identity spreads the writes."
+                        "Decide at Schema Conversion who generates the key: "
+                        + (
+                            "choose the 'Server-generated (IDENTITY)' strategy to have DSQL "
+                            "fill it (the column is widened to bigint, which DSQL requires "
+                            "for an identity), or keep the plain integer and supply the "
+                            "value from the application."
+                            if table.primary_key == [column]
+                            else "IDENTITY is not offered for this table because its "
+                            f"primary key is composite ({', '.join(table.primary_key)}) and "
+                            "a DSQL identity applies to a single column, so the value must "
+                            "come from the application — or add an identity to the column "
+                            "on the target after apply."
+                        )
+                        + " Optional, for throughput only: a UUID/random key or a cached "
+                        "identity spreads the writes."
                     ),
                     effort=EffortLevel.MEDIUM,
                     note_kind=ConversionNoteKind.RECOMMENDATION,

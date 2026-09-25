@@ -5,6 +5,14 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.533
+
+### Fixed
+
+- **A column DEFAULT that cast to a DSQL-unsupported type was emitted verbatim, so the whole `CREATE TABLE` failed at apply with nothing having mentioned the default.** A PostgreSQL enum column carries `DEFAULT CAST('image' AS ecommerce.media_type)` (or the `'image'::ecommerce.media_type` spelling). The COLUMN is remodelled to `text`, and Evaluation tells the operator to do exactly that — but the cast inside the default survives the edit and names a type that does not exist on Aurora DSQL, so the table is still rejected with `type "ecommerce.media_type" does not exist`. The default is now dropped with a reason that quotes the source expression, so the operator can re-add it as a plain literal in the DDL or with `ALTER TABLE` after apply. `nextval('s'::regclass)` and the other expression-only catalog casts (`regtype`, `regproc`, `oid`, …) are excluded, so a sequence default stays attributed to the sequence.
+- **"Reimplement it as a plain table" named nothing to reimplement FROM.** A PostgreSQL materialized view is UNSUPPORTED on Aurora DSQL, and the finding's advice is to rebuild it — but introspection captured only the relation's NAME, leaving `ViewDef.definition` empty, and once the HTML assessment report is exported the operator cannot go back to the source for the query. `pg_get_viewdef()` is one column in the same catalog scan that already found the relation, so the defining query is now read and quoted in the finding (collapsed to one line, bounded at 600 characters with a pointer to read the rest on the source). A foreign table correctly gets no such clause — its shape is an external server, not a query.
+- **Both Evaluation and Schema Conversion told the operator to "choose the 'Server-generated (IDENTITY)' strategy" on tables where that tile is never rendered.** The picker offers IDENTITY only for a SINGLE-column primary key that IS the generated column, so for a composite key over a serial column — e.g. `order_events PRIMARY KEY (id, occurred_at)` — all three surfaces pointed at a control the screen does not show, with nothing explaining why. Each now names the strategy only when it is actually offered, and otherwise says the key is composite, lists its columns, and gives what the operator CAN do (supply the value from the application, or add an identity on the target after apply).
+
 ## v0.1.532
 
 ### Fixed
