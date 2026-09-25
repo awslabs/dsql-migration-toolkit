@@ -160,6 +160,29 @@ class ColumnDef(BaseModel):
             "alone silently missed the PG10+ RECOMMENDED spelling."
         ),
     )
+    generated_expression: Optional[str] = Field(
+        default=None,
+        description=(
+            "The expression a PostgreSQL generated column computes (from pg_attrdef via "
+            "pg_get_expr), or None when unknown. Aurora DSQL has no generated columns, so "
+            "this is NEVER emitted into target DDL -- it exists so the rendered SOURCE DDL "
+            "and the conversion note can show WHAT the column computed, which is exactly "
+            "what the operator has to re-implement. Evaluation told them to 'read the "
+            "generating expression from the source' while the tool discarded it."
+        ),
+    )
+    identity_generation: Optional[str] = Field(
+        default=None,
+        description=(
+            "Which identity spelling the source column uses -- 'ALWAYS' or 'BY DEFAULT' "
+            "(from pg_attribute.attidentity 'a'/'d') -- or None when unknown/not an "
+            "identity. ``identity`` above is the boolean every gate keys on; this keeps "
+            "the variant the collector already read and used to discard, so the rendered "
+            "SOURCE DDL can reproduce the real clause instead of inventing one. The "
+            "distinction is user-visible: ALWAYS REJECTS an explicit INSERT value unless "
+            "OVERRIDING SYSTEM VALUE is given, BY DEFAULT accepts it."
+        ),
+    )
     auto_update_timestamp: bool = Field(
         default=False,
         description="True when the column uses ON UPDATE CURRENT_TIMESTAMP.",
