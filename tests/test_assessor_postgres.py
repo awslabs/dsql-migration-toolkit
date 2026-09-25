@@ -309,13 +309,22 @@ def test_pg_identity_key_rule_never_says_auto_increment() -> None:
 
 
 def test_pg_source_flags_an_over_precision_numeric_at_evaluation() -> None:
-    # numeric(40,10) exceeds DSQL's 38-digit maximum and Schema Conversion CLAMPS it, so
+    from dsql_migrator.core.assessor import _MAX_NUMERIC_PRECISION
+
+    # numeric(40,10) is WITHIN DSQL's documented maximum (precision 1000), so it is not
+    # flagged at all. This test asserted the old 38 limit, which is exactly how a stale
+    # quota kept a migratable column graded UNSUPPORTED. Use a precision beyond the real
+    # documented maximum instead, anchored on the constant.
+    # (was: numeric(40,10) exceeds DSQL's 38-digit maximum and Schema Conversion CLAMPS it, so
     # Evaluation -- the go/no-go artifact -- must not report the table as AUTO.
     table = TableDef(
         name="shop.items",
         columns=[
             ColumnDef(name="id", mysql_type="bigint"),
-            ColumnDef(name="storage_cost_usd", mysql_type="numeric(40,10)"),
+            ColumnDef(
+                name="storage_cost_usd",
+                mysql_type=f"numeric({_MAX_NUMERIC_PRECISION + 1},10)",
+            ),
         ],
         primary_key=["id"],
     )

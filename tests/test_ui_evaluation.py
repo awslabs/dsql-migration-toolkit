@@ -1354,7 +1354,8 @@ def test_collapsed_row_summarises_the_findings_the_badge_hides() -> None:
                     columns=[
                         ColumnDef(name="id", mysql_type="int", nullable=False),
                         # Past DSQL's numeric ceiling -> UNSUPPORTED, so it governs.
-                        ColumnDef(name="amt", mysql_type="decimal(65,30)"),
+                        # Beyond the DOCUMENTED maximum (1000); 65,30 now fits DSQL.
+                        ColumnDef(name="amt", mysql_type="decimal(1001,30)"),
                         ColumnDef(
                             name="sku",
                             mysql_type="varchar(40)",

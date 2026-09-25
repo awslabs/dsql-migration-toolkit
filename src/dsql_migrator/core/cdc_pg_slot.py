@@ -267,7 +267,17 @@ def slot_exists(connection: object, name: str) -> bool:
 
 
 def publication_tables(connection: object, name: str) -> set:
-    """Return the set of qualified ``schema.table`` names a publication covers."""
+    """Return the set of qualified ``schema.table`` names a publication covers.
+
+    ``pg_publication_tables`` is the EFFECTIVE membership, which is what the reconcile has
+    to compare against: for a partitioned table it reports the PARENT only because
+    :func:`create_publication` sets ``publish_via_partition_root = true``. Without that
+    option it expands to the LEAVES, so this set could never equal the requested parent
+    name and the reconcile refused every re-run over a partitioned source. Do not "fix"
+    that by reading ``pg_publication_rel`` (which always reports the registered parent) --
+    that would hide the real defect, which is that leaf-named changes are what pgoutput
+    would then stream.
+    """
     rows = connection.execute(  # type: ignore[attr-defined]
         text(
             "SELECT schemaname || '.' || tablename FROM pg_publication_tables "
@@ -481,6 +491,18 @@ def create_publication(
     first. On reuse the existing publication's table set is RECONCILED against ``tables``:
     a mismatch (e.g. a table added on a re-run) is refused loudly rather than silently
     leaving the new table unreplicated -- pgoutput only streams a publication's members.
+
+    Created ``WITH (publish_via_partition_root = true)``, which is REQUIRED for a
+    partitioned source table and harmless otherwise. PostgreSQL's default is ``false``:
+    a publication naming a partitioned PARENT expands to its LEAVES
+    (``pg_publication_tables`` returns ``order_events_2026q3`` / ``_2026q4``, not
+    ``order_events``) and publishes every change under the LEAF's relation name. This tool
+    collapses partitions into the parent, so Debezium's ``table.include.list`` names the
+    PARENT -- and every leaf-named change was therefore filtered out and DISCARDED. CDC
+    replicated NOTHING for a partitioned table, silently: the connector ran, the slot
+    advanced, and no row ever arrived. Verified on a live PostgreSQL 17 (pubviaroot = 'f',
+    publication expanded to both leaves). With the option on, changes are published as the
+    parent and the include-list matches.
     """
     if not tables:
         raise PgReplicationError("cannot create a publication for zero tables")
@@ -503,7 +525,8 @@ def create_publication(
     ident = _sanitize(name)  # allowlisted charset; also the literal in the DDL
     _run_write(
         connection,
-        f'CREATE PUBLICATION "{ident}" FOR TABLE {quoted}',
+        f'CREATE PUBLICATION "{ident}" FOR TABLE {quoted} '
+        "WITH (publish_via_partition_root = true)",
         action=f"creating publication {ident}",
         on_log=on_log,
     )

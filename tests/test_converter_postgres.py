@@ -348,38 +348,59 @@ def test_convert_view_reads_pg_dialect_for_a_pg_source() -> None:
 
 
 def test_clamp_pg_numeric_reduces_over_precision_and_scale() -> None:
-    # Aurora DSQL caps numeric at precision 38 / scale 37. A PG numeric beyond that must be
+    # Aurora DSQL's DOCUMENTED maximum is precision 1000 / scale -1000..1000 (re-verified
+    # live: numeric(1000,1000) accepted, numeric(1001,0) rejected). This test read 38/37 --
+    # the service's OLD limit -- and so pinned a clamp that silently narrowed a perfectly
+    # storable numeric(40,10). Anchored on the constants now, so the next service change
+    # cannot leave the assertion asserting a stale quota.
     # clamped (with a warning) -- otherwise the verbatim numeric(40,10) is REJECTED by DSQL
     # at CREATE TABLE with no prior signal. Mirrors the MySQL DECIMAL clamp.
-    clamped, note = clamp_pg_numeric("numeric(40,10)")
-    assert clamped == "numeric(38,10)" and note and "precision 40" in note
-    clamped, note = clamp_pg_numeric("numeric(1000,500)")
-    assert clamped == "numeric(38,37)" and note and "precision 1000" in note and "scale 500" in note
+    from dsql_migrator.core.converter_postgres import (
+        _DSQL_NUMERIC_MAX_PRECISION as P,
+        _DSQL_NUMERIC_MAX_SCALE as S,
+    )
+
+    # Well within DSQL: carried VERBATIM, no warning. (This is the case that used to lose
+    # digits.)
+    assert clamp_pg_numeric("numeric(40,10)") == ("numeric(40,10)", None)
+    assert clamp_pg_numeric(f"numeric({P},{S})") == (f"numeric({P},{S})", None)
+    # Beyond the documented maximum: clamped, and the warning names what was reduced.
+    clamped, note = clamp_pg_numeric(f"numeric({P + 1},10)")
+    assert clamped == f"numeric({P},10)" and note and f"precision {P + 1}" in note
     # decimal/dec aliases + precision-only.
-    assert clamp_pg_numeric("decimal(50)")[0] == "decimal(38)"
+    assert clamp_pg_numeric("decimal(50)")[0] == "decimal(50)"  # inside the limit now
+    assert clamp_pg_numeric(f"decimal({P + 12})")[0] == f"decimal({P})"
     # In-range, bare, and non-numeric types pass through untouched (no warning).
-    for ok in ("numeric(12,2)", "numeric(38,37)", "numeric", "uuid", "text"):
+    for ok in ("numeric(12,2)", f"numeric({P},{S})", "numeric", "uuid", "text"):
         assert clamp_pg_numeric(ok) == (ok, None)
 
 
 def test_convert_table_clamps_over_precision_pg_numeric_with_warning() -> None:
+    from dsql_migrator.core.converter_postgres import (
+        _DSQL_NUMERIC_MAX_PRECISION as _P,
+    )
+
     # End-to-end: an over-precision PG numeric converts to a VALID DSQL DDL (clamped to
-    # <=38/37) AND carries a MANUAL warning naming the column, so the fidelity loss is
-    # surfaced instead of a silent apply-time CREATE TABLE failure.
+    # the documented maximum) AND carries a MANUAL warning naming the column, so the
+    # fidelity loss is surfaced instead of a silent apply-time CREATE TABLE failure.
+    # The bounds come from the constant: this test read 38/37 while the service had already
+    # raised the maximum to 1000, so it pinned a clamp that narrowed storable values.
     table = TableDef(
         name="prices",
         columns=[
             _col("id", "bigint", nullable=False),
-            _col("huge", "numeric(40,10)"),
-            _col("wild", "numeric(1000,500)"),
+            # Beyond the DOCUMENTED maximum; numeric(40,10) now converts verbatim.
+            _col("huge", f"numeric({_P + 1},10)"),
+            _col("wild", f"numeric({_P + 2},{_P + 3})"),
             _col("ok", "numeric(12,2)"),
         ],
         primary_key=["id"],
     )
     conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
     ddl = conv.target_ddl.lower()  # sqlglot renders numeric as its `decimal` alias
-    assert "decimal(38, 10)" in ddl and "decimal(38, 37)" in ddl  # clamped to DSQL limits
-    assert "(40" not in ddl and "1000" not in ddl                 # originals gone
+    assert f"decimal({_P}, 10)" in ddl, ddl            # precision clamped to the maximum
+    assert f"decimal({_P}, {_P})" in ddl, ddl          # scale never exceeds the precision
+    assert f"({_P + 1}" not in ddl and f"({_P + 2}" not in ddl  # originals gone
     assert "decimal(12, 2)" in ddl                                # in-range unchanged
     clamp_warns = {
         w.column_name
@@ -1165,3 +1186,26 @@ def test_a_table_with_no_unsupported_index_column_gets_no_such_warning() -> None
     )
     conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
     assert not [w for w in conv.warnings if "were NOT emitted because" in w.message]
+
+
+def test_a_postgres_numeric_within_dsqls_documented_maximum_is_never_narrowed() -> None:
+    """The clamp used to cut at 38 — a limit the service had already raised to 1000.
+
+    So `numeric(40,10)`, which DSQL stores exactly (verified live: accepted, and a
+    500+500-digit value round-tripped EXACT at `numeric(1000,500)`), was silently narrowed
+    and lost digits, while the warning asserted a maximum that no longer existed.
+    """
+    from dsql_migrator.core.converter_postgres import (
+        _DSQL_NUMERIC_MAX_PRECISION as P,
+        _DSQL_NUMERIC_MAX_SCALE as S,
+        clamp_pg_numeric,
+    )
+
+    # The documented figures, so a future service change has one place to update.
+    assert (P, S) == (1000, 1000), (P, S)
+    for spec in ("numeric(40,10)", "numeric(65,30)", f"numeric({P},{S})", "numeric(12,2)"):
+        assert clamp_pg_numeric(spec) == (spec, None), spec
+    # Only beyond it does the clamp fire, and it says what it reduced.
+    clamped, note = clamp_pg_numeric(f"numeric({P + 1},10)")
+    assert clamped == f"numeric({P},10)"
+    assert note and f"maximum of {P}" in note, note

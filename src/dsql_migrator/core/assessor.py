@@ -154,8 +154,16 @@ _MAX_SECONDARY_INDEXES_PER_TABLE = _MAX_INDEXES_PER_TABLE - 1
 # CREATE INDEX ASYNC) -- the same late-failure shape as _MAX_INDEXES_PER_TABLE.
 _MAX_KEY_COLUMNS = 8
 
-# DSQL numeric maximum precision (numeric supports a precision of up to 38).
-_MAX_NUMERIC_PRECISION = 38
+# DSQL's documented maximum numeric precision. Was 38 -- the limit the service enforced
+# when this rule was written -- and the service has since raised it to 1000 ("Supported
+# data types": maximum precision 1000, scale -1000..1000, default numeric(18,6)),
+# re-confirmed live: numeric(1000,1000) is accepted, numeric(1001,0) is rejected with
+# "NUMERIC precision 1001 must be between 1 and 1000", and a 500+500-digit value
+# round-trips EXACT. While it said 38 this rule graded a perfectly migratable
+# numeric(40,10) UNSUPPORTED ("a redesign is required") and the converter narrowed it,
+# losing digits DSQL would have stored. MySQL caps DECIMAL at 65, so in practice only a
+# PostgreSQL source can reach this at all.
+_MAX_NUMERIC_PRECISION = 1000
 
 # MySQL LOB/TEXT base types whose maximum size exceeds the DSQL text/bytea 1 MiB
 # limit, so a large enough value cannot be stored and must be reviewed.
@@ -1172,7 +1180,8 @@ class DecimalPrecisionRule(Rule):
                             "so the value cannot be stored without loss."
                         ),
                         recommendation=(
-                            "Reduce the precision to 38 digits or fewer, or store "
+                            f"Reduce the precision to {_MAX_NUMERIC_PRECISION} digits "
+                            "or fewer, or store "
                             "the value as text if full precision must be kept."
                         ),
                         effort=EffortLevel.MEDIUM,

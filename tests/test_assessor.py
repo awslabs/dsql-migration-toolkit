@@ -722,7 +722,9 @@ def test_decimal_precision_rule_flags_over_38_unsupported() -> None:
         "money",
         columns=[
             ColumnDef(name="id", mysql_type="INT"),
-            ColumnDef(name="amount", mysql_type="DECIMAL(40,2)"),
+            # Beyond DSQL's DOCUMENTED maximum (1000). This read DECIMAL(40,2) while the
+            # constant said 38 -- a spec DSQL actually stores fine, graded UNSUPPORTED.
+            ColumnDef(name="amount", mysql_type="DECIMAL(1001,2)"),
         ],
     )
     item = _item_for(_assess(SourceInventory(tables=[table])), "money")
@@ -1643,7 +1645,9 @@ def test_unsupported_gap_outranks_a_manual_gap_which_outranks_advice() -> None:
                 columns=[
                     ColumnDef(name="id", mysql_type="int", nullable=False),
                     # Past DSQL's numeric ceiling -> UNSUPPORTED.
-                    ColumnDef(name="amt", mysql_type="decimal(65,30)"),
+                    # MySQL's widest DECIMAL now fits DSQL, so it is no longer the
+                    # UNSUPPORTED gap this test needs -- go beyond the real maximum.
+                    ColumnDef(name="amt", mysql_type="decimal(1001,30)"),
                     ColumnDef(
                         name="sku",
                         mysql_type="varchar(40)",
@@ -1969,3 +1973,39 @@ def test_the_view_finding_names_the_real_constructs_not_internal_tokens() -> Non
     assert "anti-pattern report" not in f.recommendation, f.recommendation
     assert "optimistic concurrency" in f.recommendation.lower(), f.recommendation
     assert "no direct Aurora DSQL" in f.recommendation, f.recommendation
+
+
+def test_the_numeric_precision_rule_uses_dsqls_documented_maximum() -> None:
+    """The rule graded a storable numeric(40,10) UNSUPPORTED while the constant said 38.
+
+    UNSUPPORTED means "a redesign is required before the table can migrate at all" in this
+    codebase, so a stale quota told the operator to redesign a column DSQL stores exactly.
+    """
+    from dsql_migrator.core.assessor import (
+        CompatibilityAssessor,
+        _MAX_NUMERIC_PRECISION,
+    )
+    from dsql_migrator.core.models import SourceInventory, SourceType, TableDef
+
+    # The documented figure, so the next service change has ONE place to update.
+    assert _MAX_NUMERIC_PRECISION == 1000, _MAX_NUMERIC_PRECISION
+
+    def rules_for(spec: str) -> set:
+        table = TableDef(
+            name="shop.t",
+            primary_key=["id"],
+            columns=[
+                ColumnDef(name="id", mysql_type="bigint"),
+                ColumnDef(name="v", mysql_type=spec),
+            ],
+        )
+        report = CompatibilityAssessor(source_type=SourceType.POSTGRES).assess(
+            SourceInventory(tables=[table])
+        )
+        return {i.rule_id for i in report.items}
+
+    # Inside the documented maximum -> not flagged at all (the case that used to be).
+    for spec in ("numeric(40,10)", "numeric(65,30)", f"numeric({_MAX_NUMERIC_PRECISION},10)"):
+        assert "NUMERIC_PRECISION" not in rules_for(spec), spec
+    # Beyond it -> still flagged.
+    assert "NUMERIC_PRECISION" in rules_for(f"numeric({_MAX_NUMERIC_PRECISION + 1},10)")

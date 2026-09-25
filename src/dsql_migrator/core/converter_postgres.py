@@ -141,11 +141,20 @@ _DSQL_SUPPORTED_PG_BASE_TYPES = frozenset(
 # timestamp(6) with time zone.
 _TYPE_MODIFIER_RE = re.compile(r"\(\s*\d+\s*(?:,\s*\d+\s*)?\)")
 
-# Aurora DSQL numeric limits (same as converter._DSQL_NUMERIC_*): precision 1-38, scale
-# 0-37. A PostgreSQL numeric(p,s) with a larger precision/scale is REJECTED by DSQL at
-# CREATE TABLE, so it must be clamped (with a warning) rather than emitted verbatim.
-_DSQL_NUMERIC_MAX_PRECISION = 38
-_DSQL_NUMERIC_MAX_SCALE = 37
+# Aurora DSQL numeric limits, from the SERVICE DOCUMENTATION ("Supported data types":
+# "The maximum precision is 1000 and scale can be between -1000 and 1000", default
+# numeric(18,6), max storage 510 bytes) and re-confirmed live 2026-09-25 against a real
+# cluster: numeric(1000,1000) is accepted, numeric(1001,0) is rejected with "NUMERIC
+# precision 1001 must be between 1 and 1000", and a 500-integer-digit + 500-decimal-digit
+# value round-tripped EXACT.
+#
+# These were 38/37 (mirroring converter._DSQL_NUMERIC_*), the limit DSQL enforced when this
+# code was written. The service raised it and the constants did not, so a PostgreSQL
+# numeric(40,10) -- well within both engines -- was silently narrowed to numeric(38,10) and
+# lost digits, while the warning asserted a DSQL maximum that no longer exists. A
+# numeric(p,s) beyond 1000 is still REJECTED at CREATE TABLE, so the clamp itself is kept.
+_DSQL_NUMERIC_MAX_PRECISION = 1000
+_DSQL_NUMERIC_MAX_SCALE = 1000
 _NUMERIC_SPEC_RE = re.compile(
     r"^\s*(numeric|decimal|dec)\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)\s*$", re.IGNORECASE
 )

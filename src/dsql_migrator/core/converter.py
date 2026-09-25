@@ -99,12 +99,26 @@ from dsql_migrator.core.models import (
 # concurrent inserts, and CACHE 1 is the non-cached behavior it exists to avoid.
 _IDENTITY_CACHE_SIZE = 65536
 
-# Aurora DSQL numeric limits, confirmed live: "NUMERIC precision 39 must be between 1 and
-# 38" and "NUMERIC scale 38 must be between 0 and 37". MySQL allows DECIMAL up to
-# precision 65 / scale 30, so a wide source column produces DDL that DSQL rejects
-# outright unless it is clamped here.
-_DSQL_NUMERIC_MAX_PRECISION = 38
-_DSQL_NUMERIC_MAX_SCALE = 37
+# Aurora DSQL numeric limits, from the SERVICE DOCUMENTATION ("Supported data types":
+# "The maximum precision is 1000 and scale can be between -1000 and 1000", default
+# numeric(18,6), max storage 510 bytes) and re-confirmed live 2026-09-25 against a real
+# cluster: numeric(1000,1000) is accepted, numeric(1001,0) is rejected with "NUMERIC
+# precision 1001 must be between 1 and 1000", and a 500-integer-digit + 500-decimal-digit
+# value round-tripped EXACT.
+#
+# These were 38/37 -- the limit DSQL enforced when this code was written (the old comment
+# quoted its "precision 39 must be between 1 and 38" error verbatim). The service raised it
+# and the constants did not, so every numeric(p>38) column was silently NARROWED, losing
+# digits DSQL would have stored, while the warning asserted a maximum the service no longer
+# has. Whenever a DSQL limit is load-bearing, re-verify it against the docs first -- a
+# hardcoded quota goes stale invisibly.
+_DSQL_NUMERIC_MAX_PRECISION = 1000
+_DSQL_NUMERIC_MAX_SCALE = 1000
+#
+# For a MySQL source the clamp is now effectively unreachable -- MySQL caps DECIMAL at
+# precision 65 / scale 30, both far below 1000 -- so a MySQL DECIMAL now converts verbatim
+# instead of being cut to 38. The clamp stays for the PostgreSQL path and as the guard for
+# any future source whose range exceeds DSQL's.
 
 
 def _clamp_numeric_spec(params: list) -> tuple[str, Optional[str]]:
@@ -2853,8 +2867,9 @@ def _pg_oversized_lob_warning(table: TableDef) -> Optional[ConversionWarning]:
             f"Columns ({names}) have no length limit, so a value can exceed Aurora DSQL's "
             "1 MiB per-value cap. The DDL itself is fine — the limit bites per ROW during "
             "migration: any oversized value is permanently dropped (quarantined in Full "
-            "Load, dead-lettered in CDC) and reloading cannot fix it. Check the largest "
-            "values now; if any exceed 1 MiB, move that content to Amazon S3 and store a "
+            "Load, dead-lettered in CDC) and reloading cannot fix it. The Data Migration "
+            "prerequisite checks probe each column and report whether a value ALREADY "
+            "exceeds 1 MiB; if one does, move that content to Amazon S3 and store a "
             "reference instead, or exclude the column on the Data Migration step. (For "
             "json/jsonb and text the limit applies to the COMPRESSED size, so a highly "
             "compressible document may still fit — treat this as a ceiling to check, not "
@@ -2997,7 +3012,9 @@ def _pg_partial_or_nonbtree_index_warning(
     )
 
 
-def _partitioned_table_warning(table: TableDef) -> Optional[ConversionWarning]:
+def _partitioned_table_warning(
+    table: TableDef, *, is_postgres: bool = False
+) -> Optional[ConversionWarning]:
     """Return a warning that the source table's native partitioning was dropped.
 
     The TARGET DDL is already correct -- DSQL has no user-visible partitioning (it
@@ -3019,15 +3036,36 @@ def _partitioned_table_warning(table: TableDef) -> Optional[ConversionWarning]:
         object_name=table.name,
         classification=Classification.MANUAL,
         kind=ConversionNoteKind.RECOMMENDATION,
+        # Engine-aware: the two dialects partition differently enough that one message
+        # gave a PostgreSQL operator MySQL-only facts. MySQL partitions are internal to
+        # one table and maintained with DROP/TRUNCATE PARTITION; PostgreSQL's are
+        # declarative and each partition is a SEPARATE TABLE, detached or dropped as such.
+        # Naming `PARTITION (p1)` and `TRUNCATE PARTITION` to a PG user pointed them at
+        # syntax their server does not have.
         message=(
-            "The source table uses MySQL native partitioning, which Aurora DSQL does "
-            "not have — DSQL distributes rows automatically by primary key, so no "
-            "PARTITION BY clause is emitted and no data is lost. Review anything that "
-            "depended on the partitions themselves: partition-scoped SQL "
-            "(PARTITION (p1)), partition pruning assumptions, and partition-level "
-            "maintenance such as DROP/TRUNCATE PARTITION for archiving — the last one "
-            "needs a different approach on DSQL (deleting by range), since it has no "
-            "TRUNCATE."
+            (
+                "The source table is PARTITIONED (PostgreSQL declarative partitioning), "
+                "which Aurora DSQL does not have — DSQL distributes rows automatically by "
+                "primary key, so no PARTITION BY clause is emitted and the partitions are "
+                "collapsed into one table. No data is lost. Review anything that depended "
+                "on the partitions themselves: partition pruning assumptions, and "
+                "partition-level maintenance — on PostgreSQL a partition is a separate "
+                "table you ATTACH/DETACH or drop, which is how range archiving is usually "
+                "done; on DSQL there is no partition to detach and no TRUNCATE, so "
+                "archiving becomes a bounded DELETE by range (mind the 3000-row "
+                "transaction limit). Any object that existed only on a LEAF (an index, a "
+                "CHECK, a column default) is not carried — the collapsed table takes the "
+                "parent's definition."
+                if is_postgres
+                else "The source table uses MySQL native partitioning, which Aurora DSQL "
+                "does not have — DSQL distributes rows automatically by primary key, so "
+                "no PARTITION BY clause is emitted and no data is lost. Review anything "
+                "that depended on the partitions themselves: partition-scoped SQL "
+                "(PARTITION (p1)), partition pruning assumptions, and partition-level "
+                "maintenance such as DROP/TRUNCATE PARTITION for archiving — the last one "
+                "needs a different approach on DSQL (deleting by range), since it has no "
+                "TRUNCATE."
+            )
         ),
     )
 
@@ -3803,7 +3841,7 @@ class SchemaConverter:
             ),
             _expression_index_warning(table),
             _comment_warning(table),
-            _partitioned_table_warning(table),
+            _partitioned_table_warning(table, is_postgres=is_postgres),
             (_unsupported_index_type_warning(table) if not is_postgres else None),
             (_prefix_index_warning(table) if not is_postgres else None),
             # PostgreSQL partial / non-btree indexes lose their predicate / access method

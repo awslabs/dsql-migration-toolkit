@@ -5,6 +5,16 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.531
+
+### 수정
+
+- **PostgreSQL 파티션 테이블에서 CDC가 아무것도 복제하지 않았습니다 — 조용히.** 도구는 파티션 부모를 하나의 타깃 테이블로 접으므로 Debezium의 `table.include.list`는 **부모**를 가리킵니다. 그런데 PostgreSQL publication의 기본값은 `publish_via_partition_root = false` 입니다: 파티션 부모를 지정한 publication은 **리프로 확장**되고 모든 변경을 **리프의** 릴레이션 이름으로 발행합니다. 라이브 PostgreSQL 17으로 확인 — `pubviaroot` 가 `f` 이고 `pg_publication_tables` 가 `order_events` 대신 `order_events_2026q3`/`_2026q4` 를 반환했습니다. 따라서 모든 변경이 include-list에서 걸러져 버려졌습니다: 커넥터는 돌고 슬롯은 전진하는데 행은 하나도 도착하지 않습니다. 이제 publication을 `WITH (publish_via_partition_root = true)` 로 생성하며, 이는 두 번째 증상도 함께 해결합니다 — 재사용 reconcile이 `pg_publication_tables` 와 비교하므로 요청한 부모 이름과 영원히 일치하지 않아 파티션 소스의 모든 재실행을 거부했습니다.
+- **`numeric` 정밀도를 38로 깎았는데, Aurora DSQL에는 더 이상 그 한도가 없습니다 — 자릿수가 조용히 사라졌습니다.** `_DSQL_NUMERIC_MAX_PRECISION = 38` / `_MAX_SCALE = 37` 은 코드 작성 시점에 서비스가 강제했던 한도입니다(주석이 "precision 39 must be between 1 and 38" 에러를 그대로 인용). 이제 DSQL은 **최대 정밀도 1000, scale −1000..1000, 기본 `numeric(18,6)`** 을 문서화합니다 — 라이브 재확인: `numeric(1000,1000)` 수락, `numeric(1001,0)` 은 "NUMERIC precision 1001 must be between 1 and 1000" 으로 거부, 500자리 정수부 + 500자리 소수부 값이 **EXACT** 로 왕복. 상수가 38이던 동안 `numeric(40,10)` 이 `numeric(38,10)` 으로 깎여 DSQL이 저장할 수 있었던 자릿수를 잃었고, 경고문은 존재하지 않는 최대값을 단언했으며, `NUMERIC_PRECISION` Evaluation 규칙은 그런 컬럼을 **UNSUPPORTED**("마이그레이션 전에 재설계가 필요함")로 등급했습니다. MySQL이 허용하는 최대치인 `DECIMAL(65,30)` 도 이제 그대로 변환되므로 MySQL 소스에서는 클램프가 아예 발동하지 않습니다. 한도는 상수 3개에 있고 테스트가 그 상수를 참조하므로, 다음 서비스 변경 때 고칠 곳이 한 군데입니다.
+- **파티션 테이블 변환 노트가 PostgreSQL 운영자에게 MySQL 이야기를 했습니다.** "the source table uses MySQL native partitioning" 이라 하고 `PARTITION (p1)`·`DROP/TRUNCATE PARTITION` 을 검토하라고 했는데, PostgreSQL에는 없는 구문입니다. PostgreSQL 파티셔닝은 선언적이고 각 파티션은 `ATTACH`/`DETACH` 하거나 삭제하는 **별도 테이블**이며, 범위 아카이빙은 보통 그렇게 합니다. 이제 노트가 엔진을 인식하고, MySQL 문구로는 표현할 수 없던 PostgreSQL 전용 결과도 명시합니다: **리프에만** 존재하는 인덱스·`CHECK`·기본값은 이관되지 않습니다(접힌 테이블은 부모의 정의를 취함).
+- **oversized-LOB 노트가 PostgreSQL 경로에서 아직 숙제를 남겼습니다.** v0.1.528은 Evaluation finding과 MySQL 변환 노트를 새 사전 점검으로 연결했지만, PG 소스에서 실제로 쓰이는 PostgreSQL 노트는 여전히 *"Check the largest values now"* 였습니다. 문자열이 소스 줄바꿈으로 쪼개져 있어 원래 검색이 놓쳤습니다. 이제 두 노트 모두 그 질문에 답하는 점검을 가리킵니다.
+- **사용자 매뉴얼 3개 구절이 도구와 모순됐습니다.** `06-limitations.md` 는 PostgreSQL 소스의 `ENUM` 타입이 "text로 변환된다"고 했지만 사실이 아닙니다 — `ENUM` 은 사용자 정의 TYPE이고 컬럼은 UNSUPPORTED로 표시되며 운영자가 직접 리모델해야 합니다(같은 파일이 두 줄 아래에서 그렇게 적고 있습니다). `02-evaluation-and-schema-conversion.md` 와 `11-customer-faq.md` 는 PostgreSQL 소스가 컬럼 DEFAULT를 **내보내지 않는다**고 했지만 v0.1.433부터 이관하며 이번 실행에서 6종이 나왔습니다. 낡은 `38` 도 두 장에 걸쳐 5개 구절에 복사돼 있었습니다.
+
 ## v0.1.530
 
 ### 수정

@@ -37,14 +37,14 @@ a **compatibility assessment report**.
 |---|---|---|
 | **AUTO** | Converts automatically, no human action. | Ordinary tables/columns with mappable types and a PK; **foreign keys** (converted automatically, flagged `RECOMMENDED` — see below). |
 | **MANUAL** | Converts, but needs a decision or an app-side change. | Case-insensitive collation, partitioned tables, oversized LOB columns, `ENUM`/`SET`, generated columns, `ON UPDATE` timestamps, spatial/geometry types, multi-database sources, foreign keys with `CASCADE`/`SET NULL` actions (which CDC can't replicate). |
-| **UNSUPPORTED** | No automatic conversion — redesign needed. | Triggers, stored procedures/functions, scheduled events, tables with no PK, `DECIMAL` precision > 38, > 255 columns/table, > 1000 tables/database, FULLTEXT/SPATIAL indexes. |
+| **UNSUPPORTED** | No automatic conversion — redesign needed. | Triggers, stored procedures/functions, scheduled events, tables with no PK, `DECIMAL` precision > 1000, > 255 columns/table, > 1000 tables/database, FULLTEXT/SPATIAL indexes. |
 
 The examples above are drawn from a MySQL source. For a **PostgreSQL source** the same
 scale applies: unsupported PG column types — arrays (`[]`), geometric
 (`point`/`line`/`box`/…), network (`inet`/`cidr`/`macaddr`/`macaddr8`), `xml`, `money`,
 `bit`/`bit varying`/`varbit`, `tsvector`/`tsquery`, range + multirange, `pgvector`,
 `enum`, composite — are flagged **MANUAL**/**UNSUPPORTED** and **never auto-substituted**,
-and the structural gates (no PK, `numeric` precision > 38, > 8-column keys, etc.) apply to
+and the structural gates (no PK, `numeric` precision > 1000, > 8-column keys, etc.) apply to
 a PostgreSQL source equally.
 
 Nothing is left unclassified — an object matched by no rule defaults to **AUTO**.
@@ -199,7 +199,7 @@ Work the list top-down by severity:
 
 1. **Resolve every UNSUPPORTED item.** These block a clean migration. Add a PK
    where missing; move triggers/routines/events into the application (or
-   EventBridge/Lambda); replace spatial types; reduce `DECIMAL` precision to ≤ 38;
+   EventBridge/Lambda); replace spatial types; reduce `DECIMAL` precision to ≤ 1000;
    exclude or split oversized LOB columns.
 2. **Decide every MANUAL item.** Drop partitioning, accept the default collation,
    handle `ENUM`/`SET`, decide `ON UPDATE` timestamps, replace a cascade action CDC
@@ -392,7 +392,7 @@ shared "write contract" keeps them identical).
 > (`point`/`line`/`lseg`/`box`/`path`/`polygon`/`circle`), network
 > (`inet`/`cidr`/`macaddr`/`macaddr8`), `xml`, `money`, `bit`/`bit varying`/`varbit`,
 > `tsvector`/`tsquery`, range + PG14 multirange, `pgvector`, `enum`, composite. The PG
-> numeric rules match the table below: `numeric(p,s)` with `p > 38`/`s > 37` is clamped
+> numeric rules match the table below: `numeric(p,s)` with `p > 1000`/`s > 1000` is clamped
 > with a warning, and a bare `numeric`/`decimal` becomes `numeric(18,6)`. Column
 > DEFAULTs, `serial`/`IDENTITY` `nextval`, and generated-column expressions are **not**
 > emitted (the primary-key strategy governs identity), and `STORED` generated columns
@@ -430,7 +430,7 @@ conversion (redesign).
 
 | MySQL type | Aurora DSQL type | Stored value form | Class | Note |
 |---|---|---|---|---|
-| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | Precision/scale preserved. **Precision > 38** → Evaluation flags it **UNSUPPORTED** (DSQL caps NUMERIC at 38); Schema Conversion still emits DDL by **clamping to `numeric(38,37)`** with a data-loss warning (scale is also capped at 37). |
+| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | Precision/scale preserved. **Precision > 1000** → Evaluation flags it **UNSUPPORTED** (DSQL documents a maximum precision of 1000, scale -1000..1000, default `numeric(18,6)`); Schema Conversion still emits DDL by **clamping to the maximum** with a data-loss warning. A MySQL `DECIMAL` (max 65,30) and almost every PostgreSQL `numeric` are well inside this, so the clamp normally never fires. |
 | `DECIMAL(p,s) UNSIGNED` | `numeric(p,s)` | `numeric(p,s)` | AUTO | Unsigned-ness is not representable and carries no storage meaning. |
 | `FLOAT` | `real` | `real` | AUTO | Single-precision float. |
 | `FLOAT(M,D)` | `real` | `real` | AUTO | The `(M,D)` display spec is dropped (PostgreSQL `float` takes one precision, not a scale). |
@@ -478,7 +478,7 @@ conversion (redesign).
 | **One DDL per transaction** | Schema conversion emits exactly one DDL statement per execution unit. |
 | **`CREATE INDEX ASYNC`** | Secondary indexes are created asynchronously, after data. |
 | **Optimistic concurrency** | Every batch and DDL is wrapped in `40001` retry. |
-| **Column defaults ARE supported** | **MySQL source:** a source `DEFAULT` is carried across, including `CURRENT_TIMESTAMP[(n)]`, `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`, and `LOCALTIME`/`LOCALTIMESTAMP`. `TINYINT(1)` defaults become `TRUE`/`FALSE` (a `boolean` column rejects `DEFAULT 1`), a `DATETIME` default is pinned to UTC to match the loader's naive-UTC values, and function defaults are translated (`UUID()`→`gen_random_uuid()`, `CURDATE()`→`CURRENT_DATE`, `CURTIME()`→`CURRENT_TIME`, `UTC_TIMESTAMP()`/`UTC_DATE()`→UTC expressions). A default with no DSQL equivalent (e.g. one referencing another column) is dropped and **reported**, never silently lost. Keeping the default matters most on a `NOT NULL` column: MySQL accepts an `INSERT` that omits it, the target would not. **PostgreSQL source:** the converter emits **no** column defaults — `serial`/`IDENTITY` `nextval` and generated-column expressions are stripped — and identity is governed by the chosen PK strategy on the target instead. |
+| **Column defaults ARE supported** | **MySQL source:** a source `DEFAULT` is carried across, including `CURRENT_TIMESTAMP[(n)]`, `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`, and `LOCALTIME`/`LOCALTIMESTAMP`. `TINYINT(1)` defaults become `TRUE`/`FALSE` (a `boolean` column rejects `DEFAULT 1`), a `DATETIME` default is pinned to UTC to match the loader's naive-UTC values, and function defaults are translated (`UUID()`→`gen_random_uuid()`, `CURDATE()`→`CURRENT_DATE`, `CURTIME()`→`CURRENT_TIME`, `UTC_TIMESTAMP()`/`UTC_DATE()`→UTC expressions). A default with no DSQL equivalent (e.g. one referencing another column) is dropped and **reported**, never silently lost. Keeping the default matters most on a `NOT NULL` column: MySQL accepts an `INSERT` that omits it, the target would not. **PostgreSQL source:** a source `DEFAULT` **is** carried across (normalized by a PostgreSQL re-parse) — only a `serial`/`IDENTITY` `nextval` and a generated-column expression are stripped, and identity is governed by the chosen PK strategy on the target instead. Note a default that casts to a user-defined type (e.g. an `ENUM`) is carried verbatim, so it must be remodelled with its column. |
 | **No `ON UPDATE CURRENT_TIMESTAMP`** | Unreproducible: DSQL has neither an `ON UPDATE` clause nor triggers (the usual PostgreSQL workaround). The column keeps its insert-time default and is flagged **MANUAL** — set the timestamp explicitly on update in your application. |
 | **No triggers / stored procedures / events** | Flagged **UNSUPPORTED** — reimplement in the application (or EventBridge/Lambda for scheduled events). |
 | **No native partitioning** | DSQL auto-distributes; partitioned tables are flagged MANUAL. |

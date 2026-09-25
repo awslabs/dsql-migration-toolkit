@@ -2109,18 +2109,30 @@ def test_identity_narrowing_warning_absent_for_other_strategies() -> None:
 
 
 def test_wide_decimal_is_clamped_to_the_dsql_limit_with_a_warning() -> None:
-    """MySQL allows DECIMAL(65,30); DSQL caps precision at 38 and scale at 37.
+    """MySQL's widest DECIMAL(65,30) now fits DSQL, so it is carried VERBATIM.
 
-    Confirmed live: "NUMERIC precision 39 must be between 1 and 38" and "NUMERIC scale 38
-    must be between 0 and 37". Emitting the source spec verbatim made the CREATE TABLE
+    DSQL's documented maximum is precision 1000 / scale -1000..1000 (re-verified live:
+    numeric(1000,1000) accepted, numeric(1001,0) rejected "must be between 1 and 1000"), and
+    MySQL caps DECIMAL at 65,30 — so NO MySQL decimal can exceed it and the clamp must never
+    fire for a MySQL source. While the constant said 38 this very case was narrowed to
+    DECIMAL(38,30), losing 27 integer digits DSQL would have stored. The clamp is still
+    exercised below with a spec beyond the real maximum. Emitting a spec DSQL refuses made
+    the CREATE TABLE
     fail, so the spec is clamped -- but that loses range, so it must be reported.
     """
+    from dsql_migrator.core.converter import _DSQL_NUMERIC_MAX_PRECISION as P
+
+    assert 65 <= P, "a MySQL DECIMAL can no longer exceed DSQL's maximum"
     result = _convert_table(_single_column_table("t", "DECIMAL(65,30)"))
-    assert "DECIMAL(38, 30)" in result.target_ddl
-    assert "NUMERIC(65" not in result.target_ddl.upper()
-    messages = [w.message for w in result.warnings if "precision 65" in w.message]
-    assert messages, result.warnings
-    assert "will not fit" in messages[0]
+    assert "DECIMAL(65, 30)" in result.target_ddl, result.target_ddl
+    assert not [w for w in result.warnings if "reduced" in w.message], (
+        "a MySQL decimal must no longer be clamped"
+    )
+    # And the clamp still works, exercised beyond the REAL maximum.
+    over = _convert_table(_single_column_table("t2", f"DECIMAL({P + 1},2)"))
+    assert f"DECIMAL({P}, 2)" in over.target_ddl, over.target_ddl
+    reduced = [w.message for w in over.warnings if f"precision {P + 1}" in w.message]
+    assert reduced, over.warnings
 
 
 def test_decimal_within_the_limit_is_untouched() -> None:
@@ -2139,13 +2151,21 @@ def test_decimal_scale_is_clamped_and_never_exceeds_the_precision() -> None:
         return _clamp_numeric_spec(list(params))
 
     # Scale over the ceiling is reduced...
-    clamped, warning = spec("DECIMAL(38,38)")
-    assert clamped == "38, 37" and warning is not None
+    from dsql_migrator.core.converter import (
+        _DSQL_NUMERIC_MAX_PRECISION as P,  # noqa: N806
+        _DSQL_NUMERIC_MAX_SCALE as S,  # noqa: N806
+    )
+
+    # Inside the documented maximum -> untouched (this is what used to lose digits).
+    assert spec("DECIMAL(65,30)") == ("65, 30", None)
+    # Scale may not exceed the precision, whatever the service maximum is.
+    clamped, warning = spec(f"DECIMAL({S},{S + 1})")
+    assert clamped == f"{S}, {S}" and warning is not None
     # ...and a clamped precision drags an over-large scale down with it, so the pair
     # stays valid (scale > precision is itself an error).
-    clamped_both, warning_both = spec("DECIMAL(65,60)")
+    clamped_both, warning_both = spec(f"DECIMAL({P + 1},{P + 5})")
     precision, scale = (int(x) for x in clamped_both.split(","))
-    assert precision == 38 and scale <= precision and warning_both is not None
+    assert precision == P and scale <= precision and warning_both is not None
 
 
 # ---------------------------------------------------------------------------
@@ -2553,7 +2573,11 @@ def test_every_table_level_assessor_rule_has_a_conversion_note() -> None:
         ),
         "NUMERIC_PRECISION": TableDef(
             name="t.e",
-            columns=[pk, ColumnDef(name="n", mysql_type="decimal(65,30)", nullable=True)],
+            # Beyond DSQL's DOCUMENTED maximum (1000); MySQL's widest 65,30 now fits.
+            columns=[
+                pk,
+                ColumnDef(name="n", mysql_type="decimal(1001,30)", nullable=True),
+            ],
             primary_key=["id"],
         ),
         "SPATIAL_TYPE": TableDef(
@@ -2702,3 +2726,84 @@ def test_generated_and_on_update_notes_name_the_drift_risk() -> None:
     on_update = next(m for m in messages if "ON UPDATE CURRENT_TIMESTAMP" in m)
     assert "no triggers" in on_update
     assert "stale" in on_update
+
+
+def test_the_partitioned_table_note_is_engine_aware() -> None:
+    """One message gave a PostgreSQL operator MySQL-only facts.
+
+    It said "MySQL native partitioning" and told them to review `PARTITION (p1)` and
+    `DROP/TRUNCATE PARTITION` — syntax PostgreSQL does not have. PG partitioning is
+    declarative and each partition is a SEPARATE TABLE, attached/detached as such.
+    """
+    from dsql_migrator.core.converter import _partitioned_table_warning
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    table = TableDef(
+        name="ecommerce.order_events",
+        primary_key=["id"],
+        partitioned=True,
+        columns=[ColumnDef(name="id", mysql_type="bigint")],
+    )
+    pg = _partitioned_table_warning(table, is_postgres=True).message
+    assert "PostgreSQL declarative partitioning" in pg, pg
+    assert "MySQL" not in pg, pg
+    assert "PARTITION (p1)" not in pg, pg
+    assert "ATTACH/DETACH" in pg, pg
+    # The PG-only consequence the MySQL wording cannot express: a leaf-local object. The
+    # whole clause, not a keyword -- dropping the "is not carried" half leaves the phrase
+    # "only on a LEAF" in place while removing the actual warning.
+    assert "only on a LEAF" in pg, pg
+    assert "is not carried" in pg, pg
+    assert "takes the parent's definition" in pg, pg
+
+    my = _partitioned_table_warning(table, is_postgres=False).message
+    assert "MySQL native partitioning" in my, my
+    assert "PARTITION (p1)" in my, my
+    assert "declarative" not in my, my
+
+    # The flag must actually be threaded from convert_table, or the PG text is dead.
+    import inspect
+
+    from dsql_migrator.core import converter as conv
+
+    src = inspect.getsource(conv)
+    assert "_partitioned_table_warning(table, is_postgres=is_postgres)" in src
+
+
+def test_both_oversized_lob_notes_point_at_the_check_that_answers_them() -> None:
+    """v0.1.528 pointed only the MySQL note at the prerequisite check.
+
+    The PostgreSQL note — the one in use for a PG source — still said "Check the largest
+    values now", leaving the same homework with no tool support. The string is split across
+    source lines, which is how the original grep missed it.
+    """
+    from dsql_migrator.core.converter import (
+        _oversized_lob_warning,
+        _pg_oversized_lob_warning,
+    )
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    pg = _pg_oversized_lob_warning(
+        TableDef(
+            name="t",
+            primary_key=["id"],
+            columns=[
+                ColumnDef(name="id", mysql_type="bigint"),
+                ColumnDef(name="payload", mysql_type="jsonb"),
+            ],
+        )
+    )
+    my = _oversized_lob_warning(
+        TableDef(
+            name="t2",
+            primary_key=["id"],
+            columns=[
+                ColumnDef(name="id", mysql_type="bigint"),
+                ColumnDef(name="b", mysql_type="longblob"),
+            ],
+        )
+    )
+    for w, label in ((pg, "postgres"), (my, "mysql")):
+        assert w is not None, label
+        assert "prerequisite checks probe each column" in w.message, label
+        assert "Check the largest values now" not in w.message, label

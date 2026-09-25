@@ -5,6 +5,16 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.531
+
+### 修正
+
+- **PostgreSQL のパーティションテーブルで CDC が何も複製していませんでした — 無言で。** ツールはパーティションの親を 1 つのターゲットテーブルに畳むため、Debezium の `table.include.list` は**親**を指します。しかし PostgreSQL の publication の既定値は `publish_via_partition_root = false` です: パーティションの親を指定した publication は**リーフに展開**され、すべての変更を**リーフの**リレーション名で発行します。ライブの PostgreSQL 17 で確認 — `pubviaroot` が `f` で、`pg_publication_tables` が `order_events` ではなく `order_events_2026q3`/`_2026q4` を返しました。したがってすべての変更が include-list で除外され破棄されました: コネクターは動きスロットは進むのに、行は 1 つも届きません。現在は publication を `WITH (publish_via_partition_root = true)` で作成し、これは第 2 の症状も同時に解決します — 再利用時の reconcile が `pg_publication_tables` と比較するため、要求した親の名前と一致し得ず、パーティションソースの再実行をすべて拒否していました。
+- **`numeric` の精度を 38 でクランプしていましたが、Aurora DSQL にはもうその上限がありません — 桁が無言で失われていました。** `_DSQL_NUMERIC_MAX_PRECISION = 38` / `_MAX_SCALE = 37` はコード作成時にサービスが強制していた上限です(コメントがその "precision 39 must be between 1 and 38" エラーを引用)。現在 DSQL は**最大精度 1000、スケール −1000..1000、既定 `numeric(18,6)`** を文書化しています — ライブで再確認: `numeric(1000,1000)` は受理、`numeric(1001,0)` は "NUMERIC precision 1001 must be between 1 and 1000" で拒否、整数部 500 桁 + 小数部 500 桁の値が **EXACT** で往復。定数が 38 の間、`numeric(40,10)` は `numeric(38,10)` に狭められ DSQL が保存できた桁を失い、警告は存在しない最大値を断言し、`NUMERIC_PRECISION` の Evaluation ルールはその列を **UNSUPPORTED**(「移行前に再設計が必要」)と格付けしていました。MySQL が許す最大の `DECIMAL(65,30)` も現在はそのまま変換されるため、MySQL ソースではクランプが一切発動しません。上限は 3 つの定数にあり、テストはその定数を参照するので、次のサービス変更で直す箇所は 1 つです。
+- **パーティションテーブルの変換ノートが PostgreSQL のオペレーターに MySQL の話をしていました。** "the source table uses MySQL native partitioning" と述べ、`PARTITION (p1)`・`DROP/TRUNCATE PARTITION` の確認を求めていましたが、PostgreSQL に無い構文です。PostgreSQL のパーティショニングは宣言的で、各パーティションは `ATTACH`/`DETACH` するか削除する**別テーブル**であり、範囲アーカイブは通常そうします。現在はノートがエンジンを認識し、MySQL の文言では表現できなかった PostgreSQL 固有の帰結も明示します: **リーフにのみ**存在するインデックス・`CHECK`・既定値は引き継がれません(畳まれたテーブルは親の定義を取ります)。
+- **oversized-LOB のノートが PostgreSQL 経路でまだ宿題を残していました。** v0.1.528 は Evaluation の finding と MySQL の変換ノートを新しい前提チェックに向けましたが、PG ソースで実際に使われる PostgreSQL のノートは依然 *"Check the largest values now"* でした。文字列がソース行で分割されており、当初の検索が見落としました。現在は両方のノートがその問いに答えるチェックを指します。
+- **ユーザーマニュアルの 3 箇所がツールと矛盾していました。** `06-limitations.md` は PostgreSQL ソースの `ENUM` 型が「`text` に変換される」と述べていましたが事実ではありません — `ENUM` はユーザー定義 TYPE で、列は UNSUPPORTED として示され、オペレーターが自分でリモデルする必要があります(同じファイルが 2 行後にそう述べています)。`02-evaluation-and-schema-conversion.md` と `11-customer-faq.md` は PostgreSQL ソースが列の DEFAULT を**出力しない**と述べていましたが、v0.1.433 から引き継いでおり、今回の実行では 6 種類が出力されました。古い `38` も 2 章にわたる 5 箇所にコピーされていました。
+
 ## v0.1.530
 
 ### 修正

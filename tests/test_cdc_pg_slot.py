@@ -788,3 +788,48 @@ def test_a_swallowed_compensating_drop_still_says_the_publication_survived() -> 
         )
     assert any("STILL ON THE SOURCE" in m for m in seen), seen
     assert any("DROP PUBLICATION" in m for m in seen), seen
+
+
+# ---------------------------------------------------------------------------
+# A partitioned source table must actually replicate
+# ---------------------------------------------------------------------------
+
+
+def test_the_publication_publishes_via_the_partition_root() -> None:
+    """Without this, CDC replicated NOTHING for a partitioned table — silently.
+
+    PostgreSQL's default is ``publish_via_partition_root = false``: a publication naming a
+    partitioned PARENT expands to its LEAVES and publishes every change under the LEAF's
+    relation name. This tool collapses partitions into the parent, so Debezium's
+    ``table.include.list`` names the PARENT — and every leaf-named change was filtered out
+    and discarded. The connector ran, the slot advanced, and no row ever arrived. Verified
+    on a live PostgreSQL 17: ``pubviaroot`` was ``f`` and ``pg_publication_tables`` returned
+    both leaves; with the option on it returns the parent, which ALSO makes the reuse
+    reconcile agree.
+    """
+    conn = _FakeConn()
+    provision_pg_replication(
+        conn,
+        tables=["ecommerce.order_events"],
+        slot_name="dsqlmig_s",
+        publication_name="dsqlmig_pub_s",
+    )
+    created = [s for s in conn.writes() if s.upper().startswith("CREATE PUBLICATION")]
+    assert len(created) == 1, conn.writes()
+    sql = created[0]
+    assert "publish_via_partition_root = true" in sql.lower(), sql
+    # Still FOR TABLE <exact tables>, never FOR ALL TABLES (a write-outage guard).
+    assert "FOR ALL TABLES" not in sql.upper(), sql
+    assert '"ecommerce"."order_events"' in sql, sql
+
+
+def test_the_option_is_a_statement_suffix_not_a_table_name() -> None:
+    # Guard against the WITH clause landing inside the table list, which would name a
+    # table called "WITH" and fail at the server.
+    conn = _FakeConn()
+    provision_pg_replication(
+        conn, tables=["s.a", "s.b"], slot_name="sl", publication_name="pb"
+    )
+    sql = next(s for s in conn.writes() if s.upper().startswith("CREATE PUBLICATION"))
+    assert sql.lower().rstrip().endswith("with (publish_via_partition_root = true)"), sql
+    assert sql.index('"s"."b"') < sql.lower().index("with ("), sql
