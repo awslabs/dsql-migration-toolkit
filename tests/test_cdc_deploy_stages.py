@@ -2126,3 +2126,54 @@ def test_a_failed_secret_read_is_not_reported_as_the_secret_being_absent(monkeyp
     assert "Access denied" in joined
     # It still TRIED the stack's own secret as the fallback.
     assert len(calls) == 2, calls
+
+
+def test_a_failed_external_seed_points_at_retry_not_at_correct_configuration() -> None:
+    """The generic seed-failure branch must not assert the three static preconditions.
+
+    It catches ANY exception, and the seed already exhausts a ~14-minute broker wait before
+    giving up -- that exhaustion path (CdcSeedError) is the one entitled to say "the path is
+    the likely cause", and it does. Asserting it here sent a live operator auditing a VPC, a
+    security group and an IAM policy that were all verified correct afterwards: the real
+    cause was an MSK Serverless cluster minutes old whose brokers were not yet accepting a
+    SASL/IAM handshake, and the identical code bootstrapped in 0.17s once they were.
+
+    So the message must lead with "nothing was created, retry is safe" and name warm-up,
+    while still keeping the path as the fallback suspect.
+    """
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.cdc_deployer import CdcDeployError, _run_external_seed
+
+    logs: list[str] = []
+
+    def boom(**_kw):
+        raise RuntimeError("KafkaTimeoutError: Unable to bootstrap from boot-x:9098")
+
+    with pytest.raises(CdcDeployError) as excinfo:
+        _run_external_seed(
+            stack_name="dsql-cdc-stack",
+            bootstrap="boot-x:9098",
+            region="us-east-1",
+            params=SimpleNamespace(filled={"SinkTopics": "app.t", "TopicPrefix": "pfx"}),
+            # Empty HostSubnetCidr -> the admission gate proceeds (it refuses only on a
+            # certainty), which is what puts us in the branch under test.
+            discovery=SimpleNamespace(current_parameters={}),
+            watermark=None,
+            src_name="src",
+            driver=SimpleNamespace(log=logs.append),
+            seed_fn=boom,
+        )
+    msg = str(excinfo.value)
+    # The underlying failure is still reported verbatim.
+    assert "Unable to bootstrap" in msg
+    # What the operator should DO comes first, and it is cheap.
+    assert "No connectors were created" in msg
+    assert "can simply be retried" in msg
+    assert "a retry is usually all this needs" in msg
+    # The actual common cause is named.
+    assert "ACTIVE before its brokers" in msg
+    # The three static conditions survive, but CONDITIONALLY -- not as the opening verdict.
+    path_at = msg.index("must run inside the cdc-stack VPC")
+    assert msg.index("retried") < path_at, "retry advice must precede the path audit"
+    assert "If retrying keeps failing" in msg

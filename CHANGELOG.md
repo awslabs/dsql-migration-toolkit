@@ -5,6 +5,14 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.548
+
+### Fixed
+
+- **The MSK broker warm-up retry was guarding a throwaway probe instead of the real work, so Start CDC still failed on a minutes-old cluster.** `await_kafka_bootstrap` built an admin client, closed it immediately, and handed the "warm" cluster to `ensure_topics` — which bootstrapped again from scratch with no retry. Every kafka-python client shares one bootstrap path (`kafka/net/manager.py`), so a partially-warm cluster could accept the probe and refuse the very next client. Observed live on a real PostgreSQL Start CDC: `KafkaTimeoutError: Unable to bootstrap from boot-…:9098` *after* the wait had already "succeeded". The retry now wraps each Kafka step itself (`with_bootstrap_retry`), so the topic creation, the offset read and the offset write each survive a cluster that is not ready yet, and the probe is gone. Verified afterwards that nothing else was wrong: the same code bootstrapped in 0.17s from the app's own subnets, security group and task role once the brokers were warm.
+- **The seed-failure message sent the operator to audit configuration that was correct.** The generic handler asserted "the app must run inside the cdc-stack VPC, be admitted on MSK port 9098, and hold data-plane kafka-cluster IAM" for *any* seed exception — so a warm-up race produced an hour of auditing a VPC, a security group and an IAM policy that were all verified correct. It now leads with what is true and cheap (no connectors were created, the infrastructure is unchanged, Start CDC can simply be retried), names the actual common cause (a cluster reports ACTIVE before its brokers accept a SASL/IAM handshake), and keeps the three path conditions as the *fallback* suspects for a retry that keeps failing the same way. The exhausted-wait path already did this correctly and is unchanged — after a ~14-minute wait, the path really is the likely cause.
+- **The seed's own progress never reached CloudWatch.** It logged only to the injected UI activity log, so a failed Start left the app's log group with nothing about the seed at all — diagnosing the live failure meant querying security groups, subnets, DNS and IAM by hand. Every seed line now also goes to the module logger. No credential can ride along: these messages carry a bootstrap host, a step name and an exception type (Property 7).
+
 ## v0.1.547
 
 ### Changed

@@ -1078,11 +1078,24 @@ def _run_external_seed(
     except CdcSeedError as exc:
         raise CdcDeployError(str(exc)) from exc
     except Exception as exc:  # noqa: BLE001 - surface any Kafka/network failure loudly
+        # Do NOT assert the three static preconditions here. This branch catches ANYTHING
+        # the seed raised, and the seed already exhausts a ~14-minute broker wait before it
+        # gives up -- that exhaustion path (CdcSeedError, above) is the one entitled to say
+        # "the path is the likely cause", and it does. Claiming it here sent a live operator
+        # auditing a VPC, a security group and an IAM policy that were all correct: the real
+        # cause was an MSK Serverless cluster minutes old whose brokers were not yet
+        # accepting a handshake, and the identical code bootstrapped in 0.17s once they were.
+        # So: name the failure, say that nothing was created and that a retry is safe, and
+        # mention warm-up as the common cause -- without ruling the path out either.
         raise CdcDeployError(
             "In-process CDC seed (SeedMode=External) failed before creating the "
-            f"connectors: {exc}. The app must run inside the cdc-stack VPC, be "
-            "admitted on MSK port 9098, and hold data-plane kafka-cluster IAM. No "
-            "connectors were created."
+            f"connectors: {exc}. No connectors were created and the infrastructure is "
+            "unchanged, so Start CDC can simply be retried — and a retry is usually all "
+            "this needs: an MSK Serverless cluster reports ACTIVE before its brokers "
+            "accept a SASL/IAM handshake, so a Start run soon after the infrastructure "
+            "deploy can hit a cluster that is not ready yet. If retrying keeps failing the "
+            "same way, then check the path: this app must run inside the cdc-stack VPC, be "
+            "admitted on MSK port 9098, and hold data-plane kafka-cluster IAM."
         ) from exc
     driver.log(f"In-process CDC prep complete (offset seed: {outcome}).")
 

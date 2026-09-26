@@ -35,8 +35,10 @@ VPC-co-location changes that let a real host reach the cluster land separately.
 """
 from __future__ import annotations
 
+import functools
+import logging
 import time
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence, TypeVar
 
 from dsql_migrator.core.cdc_kafka_prep import (
     TopicSpec,
@@ -46,6 +48,23 @@ from dsql_migrator.core.cdc_kafka_prep import (
     plan_topics,
 )
 from dsql_migrator.core.watermark import Watermark
+
+_T = TypeVar("_T")
+
+# The seed's own progress went ONLY to the UI activity log (the injected ``log``), so a
+# failure left nothing in CloudWatch: diagnosing the live warm-up failure meant querying
+# security groups, subnets, DNS and IAM by hand because the app's log group had not one line
+# about the seed. Mirroring every line to the module logger costs nothing and makes the next
+# occurrence readable from the log group alone. Never a credential (Property 7): the messages
+# here carry a bootstrap host, a step name and an exception TYPE.
+_LOGGER = logging.getLogger(__name__)
+
+
+def _log(log: Optional[Callable[[str], None]], message: str) -> None:
+    """Send one seed message to the UI activity log AND to CloudWatch."""
+    _LOGGER.info("cdc-seed: %s", message)
+    if log is not None:
+        log(message)
 
 
 class CdcSeedError(RuntimeError):
@@ -312,56 +331,64 @@ BOOTSTRAP_WAIT_ATTEMPTS = 24
 BOOTSTRAP_WAIT_DELAY_SECONDS = 5.0
 
 
-def await_kafka_bootstrap(
-    bootstrap: str,
-    region: str,
+def with_bootstrap_retry(
+    what: str,
+    fn: Callable[[], _T],
     *,
-    admin_factory: Optional[Callable[..., Any]] = None,
+    bootstrap: str,
     attempts: int = BOOTSTRAP_WAIT_ATTEMPTS,
     delay_seconds: float = BOOTSTRAP_WAIT_DELAY_SECONDS,
     sleep: Optional[Callable[[float], None]] = None,
     log: Optional[Callable[[str], None]] = None,
-) -> int:
-    """Block until the MSK brokers accept an IAM-authenticated admin connection.
+) -> _T:
+    """Run ``fn`` (one Kafka step), retrying while the brokers refuse a bootstrap.
 
-    Returns the number of attempts it took (1 when the cluster was already warm, which is
-    every run except the one right after a create). Raises :class:`CdcSeedError` on
-    exhaustion, with a message that does NOT send the operator back to auditing the three
-    static preconditions first -- after this much waiting a warm-up is no longer the likely
+    Wraps the REAL WORK, not a throwaway probe. It used to be
+    ``await_kafka_bootstrap``: build an admin client, close it immediately, and hand the
+    warm cluster to a caller that then bootstrapped again from scratch. Every kafka-python
+    client shares one bootstrap path (``kafka/net/manager.py``), and each new client starts
+    a fresh one -- so a partially-warm cluster could accept the probe and refuse the very
+    next client, and ``ensure_topics`` had exactly one unprotected attempt. That is how a
+    live PostgreSQL Start CDC failed with ``KafkaTimeoutError: Unable to bootstrap`` after
+    the wait had already "succeeded": the retry protected the wrong call, so the error went
+    to the generic handler and told the operator to audit a VPC, a security group and an IAM
+    policy that were all correct (verified afterwards -- the same code bootstrapped in 0.17s
+    once the brokers were warm).
+
+    Retries ANY exception, because a broker that is not ready yet surfaces differently
+    depending on which client and which phase hit it. Raises :class:`CdcSeedError` on
+    exhaustion, with a message that does NOT send the operator back to the three static
+    preconditions first: after this much waiting a warm-up is no longer the likely
     explanation, and saying so is the whole point of having waited.
-
-    Each successful client is closed immediately: this probes reachability only, and the
-    callers that follow build their own clients.
     """
-    (KafkaAdminClient, _C, _P, _TP, _NT, _TAE) = _import_kafka()
-    factory = admin_factory or KafkaAdminClient
     _sleep = sleep or time.sleep
     last: Optional[BaseException] = None
     for attempt in range(1, max(1, attempts) + 1):
         try:
-            admin = factory(bootstrap_servers=bootstrap, **iam_sasl_args(region))
+            result = fn()
         except Exception as exc:  # noqa: BLE001 - any failure to reach MSK is retryable here
             last = exc
-            if attempt == 1 and log is not None:
-                log(
-                    "Waiting for the MSK brokers to accept connections (a cluster reports "
-                    "ACTIVE before it completes a SASL/IAM handshake; this can take "
-                    "several minutes right after a create)."
+            if attempt == 1:
+                _log(
+                    log,
+                    f"Waiting for the MSK brokers before {what} (a cluster reports ACTIVE "
+                    "before it completes a SASL/IAM handshake; this can take several "
+                    "minutes right after a create).",
                 )
-            elif log is not None and attempt % 4 == 0:
-                log(f"Still waiting for the MSK brokers (attempt {attempt}/{attempts}).")
+            elif attempt % 4 == 0:
+                _log(
+                    log,
+                    f"Still waiting for the MSK brokers before {what} "
+                    f"(attempt {attempt}/{attempts}): {type(exc).__name__}.",
+                )
             if attempt < max(1, attempts):
                 _sleep(delay_seconds)
             continue
-        try:
-            admin.close()
-        except Exception:  # noqa: BLE001 - probe only; a close failure is not a verdict
-            pass
-        if attempt > 1 and log is not None:
-            log(f"MSK brokers accepted a connection on attempt {attempt}.")
-        return attempt
+        if attempt > 1:
+            _log(log, f"MSK brokers accepted {what} on attempt {attempt}.")
+        return result
     raise CdcSeedError(
-        f"The MSK brokers at {bootstrap} did not accept a connection after {attempts} "
+        f"The MSK brokers at {bootstrap} did not accept {what} after {attempts} "
         f"attempts. A cluster created moments ago normally becomes reachable within a few "
         "minutes, so after this long the likely cause is the path rather than warm-up: "
         "check that this app runs inside the cdc-stack VPC, that the cdc-stack's "
@@ -415,20 +442,27 @@ def seed_kafka_prep(
         max_message_bytes=max_message_bytes,
         dlq_topic=dlq_topic,
     )
-    # FIRST Kafka contact -- wait for the brokers rather than letting one 30-second
-    # bootstrap timeout fail the whole Start (and roll back a billable stack update).
-    await_kafka_bootstrap(
-        bootstrap, region, admin_factory=admin_factory, sleep=sleep, log=log
+    # FIRST Kafka contact. The retry wraps THIS call, not a probe before it: every
+    # kafka-python client re-bootstraps from scratch, so a probe that closes its client
+    # proves nothing about the next one (see :func:`with_bootstrap_retry`).
+    _retry = functools.partial(
+        with_bootstrap_retry, bootstrap=bootstrap, sleep=sleep, log=log
     )
-    ensure_topics(bootstrap, region, specs, admin_factory=admin_factory)
+    _retry(
+        "creating the CDC topics",
+        lambda: ensure_topics(bootstrap, region, specs, admin_factory=admin_factory),
+    )
 
     # (2) CONDITIONAL: seed the connect-offsets record only for a gapless handoff.
     if watermark is None or not watermark.binlog_file or watermark.binlog_position is None:
         return "skipped"
 
     key_json, _ = build_connect_offset_record(connector_name, topic_prefix, watermark)
-    existing = read_existing_offset(
-        bootstrap, region, offset_topic, key_json, consumer_factory=consumer_factory
+    existing = _retry(
+        "reading the committed offset",
+        lambda: read_existing_offset(
+            bootstrap, region, offset_topic, key_json, consumer_factory=consumer_factory
+        ),
     )
     wm_compare: Mapping[str, Any] = {
         "file": watermark.binlog_file,
@@ -440,15 +474,19 @@ def seed_kafka_prep(
     key_json, value_json = build_connect_offset_record(
         connector_name, topic_prefix, watermark, base_offset=existing
     )
-    produce(
-        bootstrap, region, offset_topic, key_json, value_json,
-        producer_factory=producer_factory,
+    _retry(
+        "writing the offset seed",
+        lambda: produce(
+            bootstrap, region, offset_topic, key_json, value_json,
+            producer_factory=producer_factory,
+        ),
     )
     return "true"
 
 
 __all__ = [
     "CdcSeedError",
+    "with_bootstrap_retry",
     "ensure_topics",
     "iam_sasl_args",
     "produce",
