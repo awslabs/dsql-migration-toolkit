@@ -5,6 +5,12 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.540
+
+### 수정
+
+- **Schema Conversion 화면이 열리자마자 "Nothing was generated"가 뜨고 Generate가 이미 비활성이라 "Reset all"을 요구했습니다 — v0.1.539가 없애려던 바로 그 막다른 길이, 반대쪽에서 다시 나타난 것입니다.** 그 릴리스는 **커밋** 경로가 변환 결과 없는 선택을 기록하지 못하게 막았지만, `session_persistence`는 `generated_node_ids`를 **복원**하기도 합니다. 그래서 이전에 저장된 범위가 새로 연 화면에 되살아나고, 재-introspection된 inventory에서는 그 노드 id가 더 이상 맞지 않아 아무것도 해석되지 않습니다. 그 결과 화면은 DDL이 하나도 없는 상태로 "생성 완료" 모드에 갇혔습니다. 이제 변환 결과가 없는 커밋된 범위는 "미생성" 상태로 자기 치유되어 "Generate DDL for selected"가 다시 활성화되고, 배너는 실제로 무슨 일이 있었는지("이 세션에 저장된 객체가 소스와 더 이상 일치하지 않습니다")와 무엇을 하면 되는지를 말합니다 — 더 이상 "Reset all"로 보내지 않습니다.
+
 ## v0.1.539
 
 ### 수정

@@ -5,6 +5,12 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.540
+
+### Fixed
+
+- **A Schema Conversion screen could open with "Nothing was generated" and Generate already disabled, demanding "Reset all" — the exact dead end v0.1.539 set out to remove, reached from the other side.** That release stopped the COMMIT path from recording a selection that converts nothing, but `session_persistence` also RESTORES `generated_node_ids`, so a scope saved earlier can reappear on a freshly-opened screen and resolve to nothing against a re-introspected inventory (its node ids no longer match). The screen was then in "generated" mode with no DDL anywhere and no way forward. A committed scope that converts nothing is now healed to not-generated, which re-enables "Generate DDL for selected", and the banner says what actually happened ("the objects saved for this session no longer match the source") and what to do — it no longer sends the operator to "Reset all".
+
 ## v0.1.539
 
 ### Fixed

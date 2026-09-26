@@ -5252,3 +5252,62 @@ def test_the_nothing_generated_message_is_an_error_notice_not_gray_text() -> Non
     assert "Nothing was generated" in source
     # ... and the old gray hint for this case is gone.
     assert "No tables or views were selected. Tick table/view objects (not just" not in source
+
+
+def test_a_restored_scope_that_converts_nothing_does_not_lock_the_screen() -> None:
+    """The regression this release's own fix left behind.
+
+    ``session_persistence`` restores ``generated_node_ids``, so a scope saved earlier can
+    reappear on a freshly-opened screen and resolve to NOTHING against a re-introspected
+    inventory. The commit path refuses such a selection now, but the restored one still
+    flipped the screen into "generated" mode -- Generate disabled, "use Reset all" -- with
+    no DDL anywhere. It is healed to not-generated instead, so Generate stays usable.
+    """
+    from dsql_migrator.ui.schema_conversion import (
+        SchemaConversionState,
+        heal_stale_generated_scope,
+    )
+
+    # A restored scope that converts nothing is cleared, with the reason recorded.
+    state = SchemaConversionState()
+    state.generated_node_ids = ["table:gone.orders"]
+    assert heal_stale_generated_scope(state, lambda _ids: False) is True
+    assert state.generated_node_ids is None, "the scope must be cleared to re-enable Generate"
+    assert state.generate_error and "no longer match the source" in state.generate_error
+    # It must NOT send the operator to Reset all -- that is the dead end being removed.
+    assert "Reset all" not in state.generate_error
+
+    # A scope that DOES convert is left completely alone.
+    state = SchemaConversionState()
+    state.generated_node_ids = ["table:ecommerce.orders"]
+    assert heal_stale_generated_scope(state, lambda _ids: True) is False
+    assert state.generated_node_ids == ["table:ecommerce.orders"]
+    assert state.generate_error is None
+
+    # Nothing generated yet -> nothing to heal, and no spurious error.
+    state = SchemaConversionState()
+    assert heal_stale_generated_scope(state, lambda _ids: False) is False
+    assert state.generate_error is None
+
+    # The predicate is asked about the COMMITTED scope, not the ticked one.
+    state = SchemaConversionState()
+    state.ticked_node_ids = ["table:a"]
+    state.generated_node_ids = ["table:b"]
+    seen: list[list[str]] = []
+    heal_stale_generated_scope(state, lambda ids: seen.append(list(ids)) or True)
+    assert seen == [["table:b"]], seen
+
+    # ... and the SCREEN actually calls it. A rule nothing consults is dead code, and this
+    # is the one call that re-enables the button on a freshly-opened screen.
+    import ast
+    import inspect as _inspect
+
+    from dsql_migrator.ui import schema_conversion as sc
+
+    tree = ast.parse(_inspect.getsource(sc._render_browser_and_preview))
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "heal_stale_generated_scope"
+        for node in ast.walk(tree)
+    ), "_render_browser_and_preview must heal a stale generated scope"

@@ -2890,6 +2890,34 @@ def apply_event_summary(data: dict) -> str:
     return text
 
 
+def heal_stale_generated_scope(
+    conv_state: "SchemaConversionState",
+    is_convertible: Callable[["Sequence[str]"], bool],
+) -> bool:
+    """Clear a committed DDL scope that converts nothing. Returns whether it healed.
+
+    ``session_persistence`` restores ``generated_node_ids``, so a scope saved earlier can
+    reappear on a freshly-opened screen and resolve to NOTHING against a re-introspected
+    inventory (its node ids no longer match). That flipped the screen into "generated"
+    mode -- Generate disabled, "use Reset all to generate a new selection" -- with no DDL
+    anywhere: the same dead end the commit-path fix removed, reached from the other side.
+
+    Healing it to not-generated is what re-enables the button, and the recorded reason is
+    what tells the operator to tick objects instead of hunting for a reset.
+    """
+    scope = conv_state.generated_node_ids
+    if scope is None or is_convertible(scope):
+        return False
+    conv_state.generated_node_ids = None
+    conv_state.generate_error = (
+        "The objects saved for this session no longer match the source, so there is "
+        "nothing to convert. Tick table/view objects in the source browser -- ticking a "
+        "SCHEMA row alone does not select its objects -- then click \"Generate DDL for "
+        "selected\"."
+    )
+    return True
+
+
 async def generate_selected_ddl(
     conv_state: "SchemaConversionState",
     refresh: Callable[[], None],
@@ -3221,12 +3249,13 @@ def _render_browser_and_preview(
                     ).classes("text-sm text-gray-500")
 
     # --- Generate DDL for the ticked objects ------------------------------
-    def _selection_is_convertible() -> bool:
-        """Whether the ticked nodes yield at least one table/view preview."""
+    def _selection_is_convertible(node_ids: "Optional[Sequence[str]]" = None) -> bool:
+        """Whether ``node_ids`` (default: the ticked nodes) yield a table/view preview."""
+        ids = list(conv_state.ticked_node_ids if node_ids is None else node_ids)
         try:
             return bool(
                 generate_previews(
-                    list(conv_state.ticked_node_ids),
+                    ids,
                     inventory,
                     result_provider(),
                     existence_checker=existence_checker,
@@ -3281,6 +3310,15 @@ def _render_browser_and_preview(
         # flag, so a refresh recomputes the preview with/without the FK DDL.
         conv_state.preserve_foreign_keys = bool(value)
         refresh()
+
+    # A COMMITTED scope that converts nothing must not lock the screen either. The commit
+    # path now refuses such a selection, but a scope RESTORED from a session snapshot
+    # (session_persistence restores generated_node_ids) can still resolve to nothing --
+    # e.g. against a re-introspected inventory whose node ids differ. That left the button
+    # disabled behind "Reset all" on a freshly-opened screen, with nothing generated: the
+    # very dead end this release set out to remove. Treat it as not-generated and say why,
+    # so Generate stays usable.
+    heal_stale_generated_scope(conv_state, _selection_is_convertible)
 
     # A rejected Generate, in RED: this is a blocking "action required", and as plain
     # gray text it was easy to miss entirely -- the operator saw a Generate that appeared
@@ -3385,9 +3423,10 @@ def _render_browser_and_preview(
         source_type=source_type,
     )
     if not previews:
-        # Defensive: Generate now refuses to commit a scope that converts nothing, so
-        # this is only reachable for a scope restored from an older session. Still an
-        # ACTION REQUIRED, so it must not be gray text.
+        # Unreachable in practice: a committed scope that converts nothing is healed to
+        # None above (which re-enables Generate), and the commit path refuses one. Kept as
+        # a belt-and-braces ACTION REQUIRED rather than gray text -- and without telling
+        # the operator to "Reset all", which is exactly the dead end being removed.
         render_notice(
             ui,
             tone="error",
@@ -3395,7 +3434,7 @@ def _render_browser_and_preview(
             body=(
                 "No tables or views were selected, so there is nothing to convert. Tick "
                 "table/view objects in the source browser -- ticking a SCHEMA row alone "
-                "does not select its objects -- then use \"Reset all\" and generate again."
+                "does not select its objects -- then click \"Generate DDL for selected\"."
             ),
         )
         return
