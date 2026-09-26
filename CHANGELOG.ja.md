@@ -5,6 +5,17 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.542
+
+### 修正
+
+- **Data Migration ステップ全体がエラー境界に落ちていました(「Data Migration could not be displayed」、TypeError)。** `_render_cdc_live_monitoring` は 2 つのフック(CDC が Aurora DSQL の値上限超過で落とした行のアプリ内リカバリ)を **呼び出し側** とそれが描画する dead-letter パネルには受け取っていたのに、**その間にある自身のシグネチャ** には受け取っていなかったため、描画のたびに `TypeError: _render_cdc_live_monitoring() got an unexpected keyword argument 'lob_candidates_for'` が発生していました。現在はシグネチャが両方を受け取り、必要なパネルへ渡します。
+- **4,401 のテストがこれを通していたため、この種類を静的に検査します。** キーワード引数の不一致は呼び出しが **実行されたときだけ** 発生します — `test_no_undefined_globals` が作られた NameError の種類と同じで、この描画経路を実際の配線で実行するテストがありませんでした。新しい検査はパッケージの全モジュールを解析し、パッケージ内 import を解決して、自分たちの関数に渡されるキーワードのうち関数が受け取らないものを報告します。意図的に保守的で(`**kwargs` を持つ関数、`**spread` 呼び出し、モジュール内で再束縛された名前はスキップ)、失敗は常に実際の TypeError です。報告されたバグで検証: 修正を戻すと `line 447: _render_cdc_live_monitoring(...) does not accept keyword 'lob_candidates_for'` を正確に指摘します。最初の版は **モジュール内だけ** を見ていたため、まさにそのバグを見逃しました(呼び出し側と定義が別モジュール) — そのため import 解決を含めています。
+
+### 変更
+
+- **Full Load の「finished with issues」要約が、すぐ上のパネルを繰り返さなくなりました。** 影響を受けたテーブルが **1 つ** で他に問題がない場合、同じ件数と同じテーブル名を再び述べ、「上に一覧されています」と付け足し、同じ 3 つの対処がパネルに **ボタン** として並んでいるのに(AI Assist / Exclude column & reload / Reload)散文で言い直していました — すぐ下に「Accept quarantined rows & continue」まであるのに、1 つの事実に対して箱が 2 つでした。現在、判定はパネルが言えないことだけを含む 1 行です(ギャップを閉じるか受け入れるまで Validation が不足を報告し、カットオーバーはブロックされたままです)。集計は集計すべきものができた時点で戻ります: 2 つ目の影響テーブル、失敗、または実際の行数不一致。また「N without a source count to compare」(Rows 列の「—」、つまり事前見積もりが無い)が恒久的な損失と同じ文に溶接されていて欠陥がさらにあるように読めていましたが、現在は判定の **後に** 独立した `info` 行として出ます。
+
 ## v0.1.541
 
 ### 修正

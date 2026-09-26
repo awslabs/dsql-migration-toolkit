@@ -2579,6 +2579,18 @@ def _render_completeness_banner(
         )
         return
 
+    # "N without a source count to compare" is NOT a problem: it is the Rows column's
+    # "--", i.e. the pre-load estimate was unavailable for those tables. Mixed into the
+    # same sentence as permanently-dropped rows it read as a second fault ("are those 4
+    # broken too?"), which is half of why this banner looked like noise. Disclosed on its
+    # own line, in its own tone.
+    unknown_note = (
+        f"{completeness.unknown} table(s) had no source count to compare (the \u201c--\u201d "
+        "in the Rows column). Validation (Step 4) does the exact comparison."
+        if completeness.unknown
+        else ""
+    )
+
     problems: list[str] = []
     if completeness.failed:
         problems.append(f"{completeness.failed} failed")
@@ -2602,10 +2614,6 @@ def _render_completeness_banner(
             f"{len(_mismatched_only)} row-count mismatch "
             f"({', '.join(_mismatched_only)})"
         )
-    if completeness.unknown:
-        problems.append(
-            f"{completeness.unknown} without a source count to compare"
-        )
     # Tailor the remedy to the problems actually present. "Retry the failed tables" is
     # dead-end advice when nothing FAILED -- a quarantining table is DONE, so it is not
     # in the retry set; the way to recover those rows is to fix the source value and
@@ -2624,12 +2632,51 @@ def _render_completeness_banner(
         )
     else:
         remedy = "Run Validation (Step 4) for a full row-count/checksum check."
-    _render_notice(
-        ui,
-        tone="warning",
-        header="Full Load finished with issues",
-        body="; ".join(problems) + ". " + remedy,
+    # Don't aggregate when there is nothing to aggregate. With ONE affected table and no
+    # other problem, this banner said only what the panel above it had already said -- the
+    # same count, the same table name, then "the dropped rows are listed above" -- and
+    # restated the three remedies in prose while the same three sit right there as BUTTONS
+    # (AI Assist / Exclude column & reload / Reload), with "Accept quarantined rows &
+    # continue" immediately below. Two boxes, one fact. So the verdict collapses into the
+    # per-table panel, and the aggregate returns as soon as it has something to add: a
+    # SECOND affected table, a failure, or a real mismatch.
+    quarantine_only = bool(completeness.quarantined_rows) and not (
+        completeness.failed or _mismatched_only
     )
+    single_table = len(completeness.quarantined_tables) <= 1
+    if quarantine_only and single_table:
+        row_noun = "row" if completeness.quarantined_rows == 1 else "rows"
+        _render_notice(
+            ui,
+            tone="warning",
+            header=(
+                f"Full Load did not load every row — {completeness.quarantined_rows} "
+                f"{row_noun} permanently dropped"
+            ),
+            # Only what the panel above cannot say: the CONSEQUENCE of doing nothing.
+            # No table name, no count repeated per remedy, no remedy prose.
+            body=(
+                "The rows, their reason and the actions to fix or accept them are on the "
+                "table's panel. Until the gap is closed or accepted, Validation (Step 4) "
+                "reports the shortfall and cut over stays blocked."
+            ),
+        )
+    else:
+        _render_notice(
+            ui,
+            tone="warning",
+            header="Full Load finished with issues",
+            body="; ".join(problems) + ". " + remedy,
+        )
+    # AFTER the verdict, never instead of it: a benign "no count to compare" line must not
+    # be the only thing on screen when rows were actually dropped.
+    if unknown_note:
+        _render_notice(
+            ui,
+            tone="info",
+            header="Some tables had no pre-load count to compare against",
+            body=unknown_note,
+        )
 
 
 def _render_error_log(ui, migration_state, job: MigrationJob) -> None:

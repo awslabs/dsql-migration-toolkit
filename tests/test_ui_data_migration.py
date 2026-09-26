@@ -12952,7 +12952,11 @@ def test_banner_never_claims_every_row_loaded_when_rows_were_dropped() -> None:
 
     assert "loaded every source row" not in body
     assert "1 row permanently dropped" in body
-    assert "ecommerce.product_media" in body
+    assert "did not load every row" in body
+    # The table NAME is deliberately absent: the per-table panel right above carries it
+    # (with the reason and the fix/accept buttons), and repeating it here is what made the
+    # two boxes read as two problems.
+    assert "ecommerce.product_media" not in body
 
 
 def test_banner_does_not_soften_dropped_rows_as_estimate_noise() -> None:
@@ -12964,7 +12968,8 @@ def test_banner_does_not_soften_dropped_rows_as_estimate_noise() -> None:
 
     assert "counts differ from the pre-load estimate" not in body
     assert "This is expected" not in body
-    assert "finished with issues" in body
+    # Stated as a LOSS, whatever the headline wording: a dropped row is never estimate noise.
+    assert "permanently dropped" in body
 
 
 def test_banner_remedy_matches_the_problem() -> None:
@@ -12974,7 +12979,11 @@ def test_banner_remedy_matches_the_problem() -> None:
 
     only_dropped = _banner_text(_screenshot_rows(1))
     assert "Retry the failed tables" not in only_dropped
-    assert "Reload that table" in only_dropped
+    # The three remedies are BUTTONS on the panel above (AI Assist / Exclude column &
+    # reload / Reload), so the banner no longer restates them in prose -- it states what
+    # happens if nothing is done, which the buttons cannot say.
+    assert "Reload that table" not in only_dropped
+    assert "Validation (Step 4) reports the shortfall" in only_dropped
 
     with_failure = _banner_text(
         _screenshot_rows(1)
@@ -12990,7 +12999,7 @@ def test_a_quarantined_table_is_not_double_reported_as_a_mismatch() -> None:
     # The table's shortfall IS the dropped rows, so naming it twice would read as two
     # separate problems.
     body = _banner_text(_screenshot_rows(1))
-    assert body.count("ecommerce.product_media") == 1
+    assert body.count("ecommerce.product_media") == 0, body
     assert "row-count mismatch" not in body
 
 
@@ -14140,7 +14149,7 @@ def test_completeness_banner_stops_calling_an_accepted_gap_an_issue() -> None:
 
     unaccepted = _BannerUi()
     _render_completeness_banner(unaccepted, completeness, quarantine_accepted=False)
-    assert any("finished with issues" in t for t in unaccepted.texts)
+    assert any("did not load every row" in t for t in unaccepted.texts)
 
     accepted = _BannerUi()
     _render_completeness_banner(accepted, completeness, quarantine_accepted=True)
@@ -27380,3 +27389,90 @@ def test_migrate_table_drops_a_target_generated_column_from_read_and_write() -> 
         "quantity",
         "line_total",
     ]
+
+
+def test_the_completeness_banner_aggregates_only_when_it_has_something_to_add() -> None:
+    """Two boxes said one fact: the panel and the banner both named the count and the
+    table, the banner added "the dropped rows are listed above", and it restated the three
+    remedies in prose while the same three sit on the panel as BUTTONS.
+
+    So with ONE affected table and no other problem the aggregate is collapsed into a
+    verdict that adds what the panel cannot say -- the consequence of doing nothing -- and
+    the aggregate returns as soon as it has something to aggregate: a SECOND affected
+    table, a failure, or a real row-count mismatch.
+    """
+    from dsql_migrator.ui.data_migration._full_load_ui import (
+        _render_completeness_banner,
+    )
+
+    from dsql_migrator.ui.data_migration import FullLoadCompleteness
+
+    def banner(**kwargs) -> str:
+        ui = _BannerUi()
+        _render_completeness_banner(
+            ui, FullLoadCompleteness(**kwargs), quarantine_accepted=False
+        )
+        return " ".join(ui.texts)
+
+    one = banner(
+        total=2, settled=2, complete=1, failed=0, quarantined_rows=3,
+        quarantined_tables=["ecommerce.product_media"], mismatched=["ecommerce.product_media"],
+        unknown=0,
+    )
+    assert "did not load every row" in one, one
+    assert "3 rows permanently dropped" in one, one
+    # Nothing the panel already carries: no table name, no remedy prose.
+    assert "ecommerce.product_media" not in one, one
+    assert "listed above" not in one, one
+    assert "Exclude column" not in one, one
+    # ... and the one thing it uniquely adds.
+    assert "Validation (Step 4) reports the shortfall" in one, one
+
+    # A SECOND affected table gives the aggregate a job, so it comes back and names them.
+    two = banner(
+        total=3, settled=3, complete=1, failed=0, quarantined_rows=5,
+        quarantined_tables=["ecommerce.product_media", "ecommerce.users"],
+        mismatched=["ecommerce.product_media", "ecommerce.users"], unknown=0,
+    )
+    assert "finished with issues" in two, two
+    assert "ecommerce.product_media" in two and "ecommerce.users" in two, two
+
+    # So does a failure alongside the drop.
+    with_failure = banner(
+        total=3, settled=3, complete=1, failed=1, quarantined_rows=1,
+        quarantined_tables=["ecommerce.product_media"], mismatched=[], unknown=0,
+    )
+    assert "finished with issues" in with_failure, with_failure
+    assert "Retry the failed tables" in with_failure, with_failure
+
+
+def test_no_source_count_to_compare_is_disclosed_apart_from_a_real_loss() -> None:
+    """It was welded into the same sentence as permanently-dropped rows.
+
+    "3 rows permanently dropped (product_media); 4 without a source count to compare" put
+    a benign disclosure -- the "--" in the Rows column, i.e. no pre-load estimate -- next
+    to a real loss, so the four read as four more faults. It is now its own `info` line,
+    and it must come AFTER the verdict, never instead of it.
+    """
+    from dsql_migrator.ui.data_migration._full_load_ui import (
+        _render_completeness_banner,
+    )
+
+    from dsql_migrator.ui.data_migration import FullLoadCompleteness
+
+    ui = _BannerUi()
+    _render_completeness_banner(
+        ui,
+        FullLoadCompleteness(
+            total=5, settled=5, complete=1, failed=0, quarantined_rows=2,
+            quarantined_tables=["ecommerce.product_media"],
+            mismatched=["ecommerce.product_media"], unknown=4,
+        ),
+        quarantine_accepted=False,
+    )
+    body = " ".join(ui.texts)
+    # The loss is stated FIRST and is not diluted by the disclosure.
+    assert body.index("permanently dropped") < body.index("no source count to compare")
+    assert "no pre-load count to compare" in body
+    # The two are separate notices, not one sentence.
+    assert "dropped; 4" not in body and "dropped; 4 without" not in body

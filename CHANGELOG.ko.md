@@ -5,6 +5,17 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.542
+
+### 수정
+
+- **Data Migration 단계 전체가 오류 경계로 떨어졌습니다("Data Migration could not be displayed", TypeError).** `_render_cdc_live_monitoring`이 두 개의 훅(CDC가 Aurora DSQL 값 한도 초과로 버린 행의 인앱 복구)을 **호출부**와 그것이 렌더하는 dead-letter 패널에는 받았지만 **중간에 있는 자기 시그니처**에는 받지 못해, 렌더마다 `TypeError: _render_cdc_live_monitoring() got an unexpected keyword argument 'lob_candidates_for'`가 발생했습니다. 이제 시그니처가 둘을 받아 필요한 패널로 전달합니다.
+- **4,401개 테스트가 이를 통과시켰으므로, 이 부류를 정적으로 검사합니다.** 키워드 인자 불일치는 호출이 **실행될 때만** 발생합니다 — `test_no_undefined_globals`가 만들어진 NameError 부류와 똑같고, 이 렌더 경로를 실제 배선으로 실행하는 테스트가 없었습니다. 새 검사는 패키지의 모든 모듈을 파싱하고 패키지 내 import를 해석해, 우리 함수에 전달되는 키워드 중 그 함수가 받지 않는 것을 보고합니다. 의도적으로 보수적이라(`**kwargs` 수신자, `**spread` 호출, 모듈 내에서 재바인딩된 이름은 건너뜀) 실패는 항상 실제 TypeError입니다. 보고된 버그로 검증: 수정을 되돌리면 `line 447: _render_cdc_live_monitoring(...) does not accept keyword 'lob_candidates_for'`를 정확히 지목합니다. 처음 만든 버전은 **모듈 내부만** 봐서 정작 그 버그를 지나쳤습니다(호출부와 정의가 다른 모듈) — 그래서 import 해석이 포함됐습니다.
+
+### 변경
+
+- **Full Load의 "finished with issues" 요약이 바로 위 패널을 되풀이하지 않습니다.** 영향받은 테이블이 **하나**이고 다른 문제가 없을 때, 같은 건수와 같은 테이블명을 다시 말하고 "위에 나열되어 있습니다"를 덧붙이며, 같은 조치 3개가 패널에 **버튼**으로 있는데도(AI Assist / Exclude column & reload / Reload) 산문으로 다시 설명했습니다 — 바로 아래에 "Accept quarantined rows & continue"까지 있는데 한 사실에 박스가 둘이었습니다. 이제 판정은 패널이 말할 수 없는 것만 담은 한 줄입니다(격차를 닫거나 수용하기 전까지 Validation이 부족분을 보고하고 cut over가 막힙니다). 집계는 집계할 것이 생기면 돌아옵니다: 두 번째 영향 테이블, 실패, 또는 실제 행 수 불일치. 그리고 "N without a source count to compare"(Rows 열의 "—", 즉 사전 추정치가 없음)가 영구 손실과 한 문장에 묶여 결함이 더 있는 것처럼 읽혔는데, 이제 판정 **다음에** 별도 `info` 줄로 나옵니다.
+
 ## v0.1.541
 
 ### 수정

@@ -5,6 +5,17 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.542
+
+### Fixed
+
+- **The whole Data Migration step fell to its error boundary ("Data Migration could not be displayed", TypeError).** `_render_cdc_live_monitoring` gained two hooks — the in-app recovery for rows CDC dropped over Aurora DSQL's per-value limit — at its CALLER and at the dead-letter panel it renders, but not in its own signature in between, so every render raised `TypeError: _render_cdc_live_monitoring() got an unexpected keyword argument 'lob_candidates_for'`. The signature now accepts both and threads them to the panel that needs them.
+- **4,401 unit tests passed over that, so the class is now checked statically.** A keyword-argument mismatch raises only when the call RUNS, exactly like the NameError class `test_no_undefined_globals` was built for — and nothing exercised this render path with the real wiring. The new check parses every module in the package, resolves its intra-package imports, and reports any keyword passed to one of our own functions that the function does not accept. It is deliberately conservative (skipped for `**kwargs` callees, `**spread` calls, and any name rebound in the module), so a failure is always a real TypeError. Proven against the reported bug: with the fix reverted it names `line 447: _render_cdc_live_monitoring(...) does not accept keyword 'lob_candidates_for'`. A first cut that only looked WITHIN a module passed over the very bug it was written for — the caller and callee are in different modules — which is why import resolution is part of it.
+
+### Changed
+
+- **Full Load's "finished with issues" summary no longer repeats the panel above it.** With ONE affected table and no other problem it stated the same count and the same table name, added "the dropped rows are listed above", and restated the three remedies in prose while the same three sit on the table's panel as buttons (AI Assist / Exclude column & reload / Reload) with "Accept quarantined rows & continue" immediately below — two boxes for one fact. The verdict is now a single line that adds what the panel cannot say (until the gap is closed or accepted, Validation reports the shortfall and cut over stays blocked), and the aggregate returns as soon as it has something to aggregate: a second affected table, a failure, or a real row-count mismatch. Separately, "N without a source count to compare" — the "—" in the Rows column, i.e. no pre-load estimate — was welded into the same sentence as permanently-dropped rows, so it read as more faults; it is now its own `info` line, after the verdict rather than instead of it.
+
 ## v0.1.541
 
 ### Fixed

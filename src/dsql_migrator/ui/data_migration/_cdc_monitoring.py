@@ -653,6 +653,15 @@ def _render_cdc_slot_health(ui, migration_state) -> None:
 def _render_cdc_live_monitoring(
     ui, migration_state, job_manager, session=None, cdc_ai_opener=None,
     ai_post_event=None,
+    # The DLQ panel rendered INSIDE this section owns the in-app recovery for rows CDC
+    # dropped over DSQL's per-value limit, and both hooks come from the caller (the
+    # candidate lookup needs the inventory; the exclusion writes migration-wide state).
+    # They were added to the caller and to the panel but NOT to this function in between,
+    # so every render of the Data Migration step raised
+    # "TypeError: _render_cdc_live_monitoring() got an unexpected keyword argument
+    # 'lob_candidates_for'" and the whole step fell to its error boundary.
+    lob_candidates_for=None,
+    exclude_columns=None,
 ) -> None:
     """Live connector health + DLQ, polled read-only from MSK Connect.
 
@@ -794,6 +803,8 @@ def _render_cdc_live_monitoring(
                 on_refresh=_poll_cdc,
                 session=session,
                 cdc_ai_opener=cdc_ai_opener,
+                lob_candidates_for=lob_candidates_for,
+                exclude_columns=exclude_columns,
             )
         else:
             controller = getattr(migration_state, "cdc_controller", None)
