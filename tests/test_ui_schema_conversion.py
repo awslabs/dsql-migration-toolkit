@@ -1850,6 +1850,8 @@ class _PickerEl:
         self.disabled = False
 
     def classes(self, *_a, **_k):
+        for value in _a:
+            self._recorder.class_strings.append(str(value))
         return self
 
     def props(self, value="", *_a, **_k):
@@ -1884,6 +1886,10 @@ class _PickerUi:
         self.select_options = None
         self.select_value = None
         self.texts: list[str] = []    # every emitted label/badge string, in order
+        # Every class string handed to an element. render_notice paints the tone's tint and
+        # border through these, so recording them makes the TONE assertable -- otherwise a
+        # test can only check a notice's WORDS and an amber/info flip goes unnoticed.
+        self.class_strings: list[str] = []
 
     def card(self, *_a, **_k):
         return _PickerEl(self, "card")
@@ -4796,7 +4802,11 @@ def test_the_composite_key_picker_states_the_immutability_requirement_and_its_co
     _render_pk_strategy_picker(ui, table, state, lambda: None)
     body = ui.body()
 
-    assert "never updates" in body, body[:500]
+    # The requirement is stated as a CONFIRMATION to make, not as a fault report: this
+    # notice is the only amber one in the picker, and it is amber because the tool cannot
+    # verify it and violating it loses rows irreversibly.
+    assert "is never UPDATEd on the source" in body, body[:500]
+    assert "The tool cannot verify this" in body, body[:500]
     # The consequence, stated as loss -- not as a DSQL ALTER limitation.
     assert "delete of the old key" in body
     assert "disappear from the target" in body
@@ -5129,3 +5139,49 @@ def test_the_source_panel_shows_the_real_generated_column_kind() -> None:
     virtual = _render_source_table_ddl_postgres(table("VIRTUAL"))
     assert "GENERATED ALWAYS AS (((q)::numeric * 2)) VIRTUAL" in virtual, virtual
     assert "STORED" not in virtual, virtual
+
+
+def test_only_the_unverifiable_precondition_is_amber_in_the_pk_picker() -> None:
+    """Choosing Composite used to raise TWO amber notices, so an opt-in strategy read as a
+    problem with the table -- while the sibling IDENTITY tile's equally-consequential note
+    was already `info`. Per the project's severity rule, something expected is `info`; amber
+    means a real issue. What changes for the application is a CONSEQUENCE of the operator's
+    own choice, so it is info; the leading column's immutability is a PRECONDITION the tool
+    cannot check whose violation loses rows silently, so it stays amber.
+    """
+    from dsql_migrator.ui.schema_conversion import _render_pk_strategy_picker
+
+    from dsql_migrator.ui.design import NOTICE_STYLE
+
+    ui = _PickerUi()
+    state = SchemaConversionState()
+    table = _pk_table()
+    state.set_edited_target_ddl(
+        "orders",
+        render_target_ddl(
+            build_composite_conversion(SchemaConverter(), table, "customer_id")
+        ),
+    )
+    _render_pk_strategy_picker(ui, table, state, lambda: None)
+    body = ui.body()
+
+    # The consequence note is no longer alarming, and no longer opens on "must".
+    assert "What changes for the application with a composite key" in body, body
+    assert "Queries must use the new composite key" not in body, body
+    # ... and its substance is intact.
+    assert "must key on the FULL composite key" in body
+    assert "is created for you" in body
+    assert "stops replication for this table" in body
+
+    # The precondition is still prominent and still spells out the loss.
+    assert "is never UPDATEd on the source" in body
+    assert "disappear from the target" in body
+
+    # And the TONES themselves, not just the words: exactly ONE amber notice (the
+    # precondition) and at least one info one (the consequence). Asserting the wording
+    # alone would let an amber/info flip through unnoticed.
+    amber = NOTICE_STYLE["warning"][0]
+    info = NOTICE_STYLE["info"][0]
+    painted = " ".join(ui.class_strings)
+    assert painted.count(amber) == 1, [c for c in ui.class_strings if amber in c]
+    assert info in painted, ui.class_strings

@@ -3718,17 +3718,22 @@ def _render_pk_strategy_picker(
                 on_change=_select_leading,
             ).classes("w-full max-w-md").props("dense outlined")
             key_order = [current_leading, *table.primary_key]
+            # INFO, not amber: this is what the operator just CHOSE, so it is a
+            # consequence to plan for, not a problem with the conversion -- and the
+            # sibling IDENTITY tile's equally-consequential note is already info. Amber
+            # here read as "something is wrong with this table".
             render_notice(
                 ui,
-                tone="warning",
-                header="Queries must use the new composite key after cutover",
+                tone="info",
+                header="What changes for the application with a composite key",
                 body=(
-                    f"The target primary key becomes ({', '.join(key_order)}). This "
-                    "spreads writes across DSQL partitions, but the application's "
-                    "queries, joins, and upserts must key on the full composite key. A "
-                    f"UNIQUE index on the original key ({', '.join(table.primary_key)}) "
-                    "preserves its uniqueness. If you replicate this table with CDC, keep "
-                    "every key column in capture: change records are keyed on the "
+                    f"The target primary key becomes ({', '.join(key_order)}), which is "
+                    "what spreads writes across DSQL partitions. Plan for three things. "
+                    "The application's queries, joins and upserts must key on the FULL "
+                    f"composite key. A UNIQUE index on the original key "
+                    f"({', '.join(table.primary_key)}) is created for you, so its "
+                    "uniqueness is preserved. And if you replicate this table with CDC, "
+                    "keep every key column in capture: change records are keyed on the "
                     "composite key, so excluding one of its columns stops replication for "
                     "this table."
                 ),
@@ -3750,11 +3755,17 @@ def _render_pk_strategy_picker(
                 tone="warning",
                 icon="key_off",
                 header=(
-                    f"'{current_leading}' must be a column the application never updates"
+                    f"Confirm that '{current_leading}' is never UPDATEd on the source"
                 ),
                 body=(
-                    "Pick a column whose value is fixed for the life of the row (a tenant "
-                    "or customer id, a creation-date bucket). If the source ever UPDATEs "
+                    # Amber is deliberate even though this is an opt-in choice: unlike the
+                    # note above, this is a PRECONDITION the tool cannot check, and
+                    # violating it loses rows silently and irreversibly. The wording asks
+                    # for a confirmation rather than reporting a fault.
+                    "The tool cannot verify this, and getting it wrong loses rows, so it "
+                    "is worth checking before you apply. Pick a column whose value is "
+                    "fixed for the life of the row (a tenant or customer id, a "
+                    "creation-date bucket). If the source ever UPDATEs "
                     f"'{current_leading}', CDC replicates that as a delete of the old key "
                     "plus an insert of the new one; the two go to different partitions with "
                     "no ordering between them, and the unique index over the original key "

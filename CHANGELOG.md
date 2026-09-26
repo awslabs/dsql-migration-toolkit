@@ -5,6 +5,12 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.538
+
+### Fixed
+
+- **Choosing the composite-key strategy painted two AMBER notices, so an opt-in choice read as a problem with the table.** The sibling "Server-generated (IDENTITY)" tile's equally-consequential note was already `info`, so the picker was internally inconsistent as well. Per the project's severity rule — something expected or optional is `info`; amber means a real issue — the two are now graded apart. "What changes for the application with a composite key" is `info`: it is the consequence of what the operator just chose (queries/joins/upserts key on the full composite key, the original key keeps its uniqueness through a UNIQUE index the tool creates, and CDC must keep every key column in capture), not a fault. The leading column's immutability stays AMBER, because it is a different kind of statement: a PRECONDITION the tool cannot verify whose violation loses rows silently and irreversibly — it now reads as a confirmation to make ("Confirm that 'user_id' is never UPDATEd on the source … The tool cannot verify this, and getting it wrong loses rows") rather than as a report that something is wrong.
+
 ## v0.1.537
 
 ### Fixed
