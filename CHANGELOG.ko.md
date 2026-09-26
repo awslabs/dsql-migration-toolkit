@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.547
+
+### 변경
+
+- **"Deploy CDC infrastructure" 다이얼로그를 알림 7개에서 3개로 줄였습니다.** 보고된 사례(`Full Load만` 실행 후 PostgreSQL, NAT 생성, 라우팅된 VPC, 강제된 외래 키 6개)에서 측정: **7박스 / 532단어 → 3박스 / 335단어**, 행동이 필요한 정보는 하나도 잃지 않았습니다. 바뀐 것: (1) Deploy를 비활성화하는 4개 조건을 **최상단**으로 올려 `Deploy is blocked` 한 박스로 병합했습니다 — 기존에는 소스 순서대로 렌더되어, 마지막에 뜨는 둘이 info 톤 비용 박스 *아래*에 놓였습니다. 즉 비활성 버튼의 설명이 스크롤되는 다이얼로그의 맨 끝에 있었습니다. 각 항목은 원본 블로커 문자열에 없는 결과 문장("would create a billable MSK Serverless cluster that Start CDC could never use")을 그대로 유지합니다. (2) 시간당 추정치와 재스냅샷 고지를 **Cost and how long it runs** 한 박스로 병합 — 같은 결정이고, 두 번째가 첫 번째를 조용히 한정하고 있었습니다. (3) 사용자 **본인의** 작업 2건(타깃 외래 키 제거, 소스 인바운드 규칙 열기)을 **Before the connectors can run** 한 박스로 병합 — 건너뛰면 둘 다 같은 방식으로 실패합니다(커넥터 생성·과금·RUNNING 도달 실패). (4) Network, subnet overlap, VPC 불일치, MSK 시드 안내를 **What this deploy creates in your VPC** 한 박스로 병합 — 어느 것도 사용자에게 행동을 요구하지 않습니다. 메커니즘 설명 2개는 **이 다이얼로그에서만** 제거했습니다. 둘 다 사용자가 방금 지나온 화면에 그대로 있기 때문입니다: 외래 키 근거(순서 없는 자식 행, SQLSTATE 23503, 조용한 dead-letter)는 CDC가 실제로 *거부되는* 곳에 계속 렌더되고, 복제 슬롯 설명은 start-point 카드와 사전점검 행에 계속 있습니다. 이제 테스트가 다이얼로그를 3박스(블로커 포함 4박스)로 **상한**하므로, 다음 추가는 덧붙이는 대신 병합해야 합니다 — 리뷰가 경고했지만 아무것도 강제하지 않던 누적 증가입니다.
+- **PostgreSQL에는 CDC 시작점 선택지가 없어졌습니다. 애초에 선택지가 아니었기 때문입니다.** "Manual — re-snapshot from scratch (initial)"는 선택이 아니라 함정이었습니다: 전체 상태 공간을 실행해 보면 결과가 달라지는 경우는 단 하나입니다. 워터마크가 없을 때, 그리고 `Full Load만` 워터마크일 때 **두 모드 모두** `snapshot.mode=initial`입니다. `DONE`에 도달하지 못한 `Full load + CDC` 작업은 슬롯이 억제되므로 거기서도 둘 다 `initial`입니다. 슬롯을 기록한 완료된 적재에서만 다른데 — 거기서 Manual은 gapless 재개를 버리고 모든 행을 **스트리밍** 파이프라인으로 재복사하며(이 저장소 측정: 벌크 로더 ~103K rows/s 대비 ~19~26K rows/s), 스냅샷은 여전히 존재하는 행만 보고하므로 적재 후 삭제된 행은 지우지도 못합니다. `Full load + CDC`로 재실행하는 것이 모든 축에서 낫고, 고지가 그렇게 말합니다. MySQL 라디오는 그대로입니다: 거기서 Manual은 실제 GTID/binlog 좌표를 제공하며, GTID만 있는 워터마크의 문서화된 해결책입니다. 재스냅샷 **기능**은 그대로 유지됩니다 — publication 누락 시 탈출 버튼이 여전히 기록합니다.
+
+### 수정
+
+- **제거한 라디오가 덮고 있던 거짓 차단.** Start CDC의 준비 판정이 `is_pg and mode == "manual"`을 읽고 있어서, PostgreSQL CDC-only 시작 — 또는 앱 재시작으로 job 레코드를 잃은 PostgreSQL 세션 — 이 Automatic에서 "Set the CDC start point above first."와 함께 비활성화되고 Manual에서만 활성화됐습니다. 두 모드가 동일한 커넥터 설정을 만드는데도요. 해결책은 발견 불가능한 라디오 클릭이었고, 한 화면 위의 start-point 카드는 같은 상태를 이미 "Ready"로 표시하고 있었습니다. 이제 유효 스냅샷 모드로 판정하므로 PostgreSQL은 구조적으로 준비 상태입니다.
+- **start-point 카드가 커넥터는 재스냅샷으로 설정된 상태에서 gapless라고 주장할 수 있었습니다.** 고지는 `not wm_usable and mode == "auto"`로, 확인 줄은 `mode == "manual"`로 게이트되어 있었습니다. 그래서 슬롯이 **있고** 탈출 버튼이 재스냅샷으로 바꾼 유일한 상태 — 세션 복원이 다시 불러오는 상태 — 에서 gapless 줄이 표시됐습니다. 이제 둘 다 커넥터 설정이 파생되는 것과 같은 원인으로 키잉하므로 서로 어긋날 수 없습니다.
+
 ## v0.1.546
 
 ### 수정

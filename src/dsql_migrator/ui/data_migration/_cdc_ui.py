@@ -131,6 +131,7 @@ from dsql_migrator.ui.design import (
     NOTICE_STYLE,
     definition_row,
     inline_hint,
+    notice_container,
     render_notice,
     section_header,
 )
@@ -982,13 +983,21 @@ def _render_cdc_start_point_card(
             # PRE-SELECTED default unavailable was the card's most direct contradiction of
             # itself: it implied the operator had to act while the enabled Start button
             # implied they did not. Name what Automatic will DO instead.
-            auto_label = (
-                "Automatic — gapless from the replication slot (recommended)"
-                if wm_usable
-                else "Automatic — re-snapshot every selected table (no Full Load slot "
-                "to resume from)"
-            )
-            manual_label = "Manual — re-snapshot from scratch (initial)"
+            # PostgreSQL has NO start-point choice to offer, so it gets no radio. The old
+            # "Manual — re-snapshot from scratch (initial)" option was a trap, not a choice:
+            # executed over the whole state space, it changes the outcome in exactly ONE
+            # state family and is a no-op in every other. With no watermark, and with a
+            # Full-load-only watermark, BOTH modes yield snapshot.mode=initial; a
+            # Full-load-+-CDC job that is not DONE has its slot suppressed, so both yield
+            # initial there too. Only a DONE load that recorded a slot differs -- and there
+            # Manual throws away the gapless resume to re-copy every row through the
+            # STREAMING pipeline (~19-26K rows/s against the bulk loader's ~103K, measured in
+            # docs/manual/en/12-performance-test-results.md) while being unable to remove
+            # rows deleted since the load, because a snapshot only reports rows that still
+            # exist. Re-running "Full load + CDC" beats it on every axis, which is what the
+            # disclosure now says. The re-snapshot CAPABILITY stays (the publication-missing
+            # escape buttons still record it); it is just not a start point to pick.
+            pass
         else:
             if wm_usable:
                 auto_label = "Automatic — gapless from Full Load (recommended)"
@@ -1008,45 +1017,40 @@ def _render_cdc_start_point_card(
             migration_state.set_cdc_start_mode(value)
             refresh()
 
-        # AWS-console-style radio choice. Both options stay SELECTABLE even when no usable
-        # watermark exists -- the steering is the label ("...(unavailable)") plus the notice
-        # below, not a disabled option. (A previous version of this comment claimed the
-        # option was disabled; no such code existed, and a Quasar radio built from a plain
-        # dict has no per-option disable. Automatic also stays PRE-selected, since the start
-        # mode defaults to "auto".) Picking Automatic without a provisioned slot is not a
-        # dead end and not a silent gap: the effective snapshot mode is then `initial`
-        # anyway (pg_snapshot_mode requires the slot RECORDED on the watermark), so the
-        # connector re-snapshots and creates its own publication.
-        # When CDC has started the whole choice is disabled (read-only).
-        radio = ui.radio(  # type: ignore[attr-defined]
-            {"auto": auto_label, "manual": manual_label},
-            value=mode,
-            on_change=lambda e: _on_mode(e.value),
-        ).props("inline=false")
-        if locked:
-            # Read-only AND clearly greyed: a bare Quasar `disable` dims too subtly
-            # to read as "locked", so mute the whole choice (opacity + not-allowed
-            # cursor) to match the "Locked" badge.
-            radio.props("disable").classes(
-                "opacity-50 pointer-events-none cursor-not-allowed"
-            )
-        if not wm_usable and mode == "auto" and not locked:
-            if is_pg:
-                # PG has no offset seeder: Automatic needs the replication slot the tool
-                # creates at the Full Load consistency point. Absent one, Automatic
-                # re-snapshots -- so say what it is about to DO and what that costs, keyed
-                # on the CAUSE. The previous wording ("...or choose Manual to re-snapshot
-                # every table from scratch") read as if Automatic were a dead end and the
-                # re-snapshot were Manual's behaviour, i.e. it described the re-read as
-                # something the operator had NOT chosen -- while leaving the default
-                # selected does exactly that. It also named the missing slot as the cause in
-                # every state, which is wrong for a load that merely failed.
-                _notice = pg_resnapshot_notice(resnapshot_reason)
-                if _notice is not None:
-                    render_notice(
-                        ui, tone="warning", header=_notice[0], body=_notice[1]
-                    )
-            elif wm_gtid_only:
+        if not is_pg:
+            # MySQL keeps its radio: there Manual supplies a REAL coordinate (a GTID or
+            # binlog file:position), consumed as `resume_override` in `_cdc_resume_signal`,
+            # and it is the documented cure for a GTID-only watermark that auto cannot seed
+            # from. Both options stay SELECTABLE even when no usable watermark exists -- the
+            # steering is the label ("...(unavailable)") plus the notice below, not a disabled
+            # option. (A previous comment claimed the option was disabled; no such code
+            # existed, and a Quasar radio built from a plain dict has no per-option disable.)
+            # When CDC has started the whole choice is disabled (read-only).
+            radio = ui.radio(  # type: ignore[attr-defined]
+                {"auto": auto_label, "manual": manual_label},
+                value=mode,
+                on_change=lambda e: _on_mode(e.value),
+            ).props("inline=false")
+            if locked:
+                # Read-only AND clearly greyed: a bare Quasar `disable` dims too subtly
+                # to read as "locked", so mute the whole choice (opacity + not-allowed
+                # cursor) to match the "Locked" badge.
+                radio.props("disable").classes(
+                    "opacity-50 pointer-events-none cursor-not-allowed"
+                )
+        # PostgreSQL: keyed on the EFFECTIVE snapshot mode, not on a radio value. With the
+        # radio gone `mode` no longer describes what will happen, and `not wm_usable` never
+        # did -- it missed the state where a slot IS recorded and an escape button set
+        # "manual" (a state session restore can reload), where the card claimed a gapless
+        # start while the connector was configured `initial`. ``resnapshot_reason`` comes from
+        # the RAW job and is None exactly when the start is gapless, so it is the predicate.
+        _pg_resnap = is_pg and resnapshot_reason is not None
+        if _pg_resnap and not locked:
+            _notice = pg_resnapshot_notice(resnapshot_reason)
+            if _notice is not None:
+                render_notice(ui, tone="warning", header=_notice[0], body=_notice[1])
+        if not is_pg and not wm_usable and mode == "auto" and not locked:
+            if wm_gtid_only:
                 # Name the cause AND the fix. This is the one case where the operator can
                 # get a real gapless handoff by changing something on the source, so a
                 # generic "no watermark" message would send them to Manual with a GTID
@@ -1076,13 +1080,10 @@ def _render_cdc_start_point_card(
                     tone="warning",
                 )
 
-        if mode == "manual":
-            if is_pg:
-                _render_cdc_pg_manual_explanation(ui)
-            else:
-                _render_cdc_manual_inputs(
-                    ui, migration_state, refresh, locked=locked, session=session,
-                )
+        if mode == "manual" and not is_pg:
+            _render_cdc_manual_inputs(
+                ui, migration_state, refresh, locked=locked, session=session,
+            )
         elif wm_usable and wm_resume is not None:
             if is_pg:
                 _render_cdc_pg_start_summary(ui, wm_resume.wal_lsn)
@@ -1094,9 +1095,12 @@ def _render_cdc_start_point_card(
 
         # Resolved start-point confirmation (the single source of truth).
         if is_pg:
-            # PG has no MySQL-style coordinate: confirm the resolved mode instead.
+            # PG has no MySQL-style coordinate: confirm the resolved mode instead. Keyed on
+            # the same `_pg_resnap` the disclosure above uses, so the two cannot disagree --
+            # keying this on `mode == "manual"` printed the gapless line for a slot-bearing
+            # watermark that an escape button had switched to a re-snapshot.
             pg_confirm = None
-            if mode == "manual":
+            if _pg_resnap:
                 pg_confirm = "Start point set — re-snapshot every table (snapshot.mode=initial)"
             elif effective_resume is not None:
                 lsn = effective_resume.wal_lsn or "(recorded)"
@@ -1117,30 +1121,6 @@ def _render_cdc_start_point_card(
                 ui.label(f"Start point set — {coord}").classes(  # type: ignore[attr-defined]
                     "text-xs text-gray-700 font-mono"
                 )
-
-def _render_cdc_pg_manual_explanation(ui) -> None:
-    """Explain the PostgreSQL Manual start choice (re-snapshot), shown instead of the
-    MySQL GTID/binlog inputs.
-
-    Debezium PostgreSQL resumes CDC only from the replication slot's committed position
-    and cannot be told to start from an arbitrary WAL LSN, so there is no coordinate to
-    enter. Manual means: skip the gapless slot and re-snapshot every selected table from
-    scratch (``snapshot.mode=initial``) before streaming.
-    """
-    render_notice(
-        ui,
-        tone="info",
-        icon="restart_alt",
-        header="Manual re-snapshots every table (snapshot.mode=initial)",
-        body=(
-            "PostgreSQL resumes CDC from the replication slot created at Full Load — there "
-            "is no way to start streaming from a specific WAL LSN, so there is nothing to "
-            "enter here. Manual takes a fresh initial snapshot of every selected table, "
-            "then streams. Use it when no Full Load slot is available, or when you want a "
-            "clean re-copy instead of the gapless handoff."
-        ),
-    )
-
 
 def _render_cdc_pg_start_summary(ui, wal_lsn) -> None:
     """Show the resolved WAL LSN for the PostgreSQL Automatic (gapless slot) choice."""
@@ -2033,13 +2013,19 @@ def _render_cdc_start_button(
     resumes_from_offset = bool(
         getattr(migration_state, "cdc_has_committed_offset", False)
     )
-    # A PostgreSQL CDC-only migration (no Full Load, so no watermark and no gapless
-    # slot) is steered to Manual = fresh re-snapshot: that mode needs NO prior start
-    # point, so it is a valid ready state on its own. The start-point card already
-    # treats it as "Ready" (its gate includes `is_pg and mode == "manual"`), so the
-    # button MUST mirror that clause -- otherwise the card says Ready while the button
-    # stays disabled with "Set the CDC start point above first", and PG CDC-only can
-    # never be started.
+    # A PostgreSQL start that RE-SNAPSHOTS needs no prior start point: it is a resolved
+    # start on its own (snapshot.mode=initial, the connector creates its own slot). Keyed on
+    # that FACT, not on the radio value it used to read (`is_pg and mode == "manual"`).
+    #
+    # That old clause made the radio load-bearing for a state it has no business deciding:
+    # a PostgreSQL CDC-only start, or any PG session whose job record was lost to a restart,
+    # was disabled under Automatic with "Set the CDC start point above first" and enabled
+    # under Manual -- while BOTH modes produce the identical `initial`/`filtered` config. So
+    # it was a FALSE block whose only cure was an undiscoverable radio click, and the card
+    # one screen up already badged the same state "Ready". Keying on the effective mode makes
+    # PG ready by construction (pg_snapshot_mode returns `never` only with LSN+slot, which
+    # the can_resume_from_lsn disjunct already covers, and `initial` otherwise), which is
+    # what lets the PG radio go away entirely.
     is_pg = _cdc_source_type(session) is SourceType.POSTGRES
     mode = migration_state.cdc_start_mode()
     # Whether THIS start re-snapshots. Two claims below are false when it does: that Start
@@ -2065,7 +2051,7 @@ def _render_cdc_start_button(
             wm_resume is not None
             and (wm_resume.can_seed_offset() or wm_resume.can_resume_from_lsn())
         )
-        or (is_pg and mode == "manual")
+        or (is_pg and _resnapshots)
     )
     # A restart is a materially different operation from a first start -- it resumes an
     # existing position rather than establishing one -- so it must not be described with
@@ -2997,20 +2983,28 @@ def _render_cdc_infra_form(
 
         name_field.on("blur", _save_stack_name)
 
-def _render_cdc_cost_estimate(ui, *, includes_nat: bool) -> None:
-    """Show a ballpark hourly cost line in the deploy dialog (not a quote)."""
+def _render_cdc_cost_estimate(ui, *, includes_nat: bool, extra: str = "") -> None:
+    """Show a ballpark hourly cost line in the deploy dialog (not a quote).
+
+    ``extra`` appends the re-snapshot disclosure, because "what will this cost" and "how long
+    will it run" are ONE decision and were two stacked boxes -- the second silently
+    qualifying the first. Its presence also raises the tone: a time-based hourly figure is an
+    ``info``, but "this start also re-reads the whole source" is a real, non-blocking cost
+    the operator can still avoid by cancelling.
+    """
     from dsql_migrator.core.cdc import estimate_cdc_hourly_cost
 
     est = estimate_cdc_hourly_cost(includes_nat=includes_nat)
+    body = (
+        f"~${est.hourly_low_usd:.2f}–${est.hourly_high_usd:.2f}/hour while deployed "
+        f"({'incl.' if includes_nat else 'no'} NAT gateway). {est.caveat}"
+    )
     _render_notice(
         ui,
-        tone="info",
+        tone="warning" if extra else "info",
         icon="payments",
-        header="Estimated cost",
-        body=(
-            f"~${est.hourly_low_usd:.2f}–${est.hourly_high_usd:.2f}/hour while deployed "
-            f"({'incl.' if includes_nat else 'no'} NAT gateway). {est.caveat}"
-        ),
+        header="Cost and how long it runs" if extra else "Estimated cost",
+        body=f"{body} {extra}".strip(),
     )
 
 def cdc_deploy_connection_blocker(session) -> Optional[str]:
@@ -3150,160 +3144,153 @@ async def _open_cdc_infra_dialog(
             "an IAM role. It takes about 5 minutes and creates billable AWS "
             "resources. No connectors are created yet — run Start CDC afterwards."
         ).classes("text-sm text-gray-700")
-        # Pre-flight connection check: surface a not-ready source/target up front
-        # (Deploy is disabled below) so the user reconnects before starting instead
-        # of hitting a "test the source connection first" failure mid-submit.
+        # BLOCKERS FIRST, and as ONE box. These four are the only conditions that grey out
+        # Deploy, and they used to render in source order -- so the two that fire last sat
+        # BELOW an info-toned cost estimate, i.e. the explanation for a disabled button was
+        # the last thing on a scrolling dialog. Each keeps its own consequence sentence
+        # verbatim, including the "would create a billable MSK Serverless cluster" clauses
+        # the raw blocker strings do NOT carry.
+        _blockers: list[tuple[str, str]] = []
         if conn_blocker:
+            _blockers.append(("Not connected", conn_blocker))
+        if net_kind == "blocked" and net_message:
+            _blockers.append(("Network", net_message))
+        if seed_admission.blocker:
+            _blockers.append((
+                "MSK access",
+                seed_admission.blocker
+                + " Deploying now would create a billable MSK Serverless cluster that "
+                "Start CDC could never use.",
+            ))
+        if pg_infra_block is not None:
+            _blockers.append((
+                "Source replication objects",
+                pg_infra_block[1]
+                + " Fix this first, or start the migration over as "
+                '"Full load + CDC", which creates both at the snapshot point.',
+            ))
+        if len(_blockers) == 1:
             _render_notice(
-                ui,
-                tone="error",
-                icon="link_off",
-                header="Reconnect before deploying",
-                body=conn_blocker,
+                ui, tone="error", icon="block",
+                header=f"Deploy is blocked — {_blockers[0][0].lower()}",
+                body=_blockers[0][1],
             )
-        # NAT base is only incurred when the stack creates its own NAT ("create");
-        # reused existing subnets ("discovered") have no new NAT charge.
-        _render_cdc_cost_estimate(ui, includes_nat=(net_kind == "create"))
-        # THE pre-spend disclosure. This dialog is where the billable MSK cluster is
-        # authorised, and it is the last point at which "cancel and run it as Full load +
-        # CDC" is still cheap -- so if this CDC start is going to re-read the whole source,
-        # it has to be said HERE, under the hourly figure it qualifies.
+        elif _blockers:
+            with notice_container(
+                ui, tone="error", icon="block", header="Deploy is blocked"
+            ):
+                for _term, _body in _blockers:
+                    definition_row(ui, _term, _body)
+        # PRICE AND DURATION, as ONE box. The hourly estimate and the re-snapshot disclosure
+        # are the same decision -- what this deploy will cost and how long it runs -- and
+        # they were two stacked boxes where the second silently qualified the first.
         #
-        # Gated on the AFTER-A-LOAD causes only. A fresh "Full load + CDC" deploy (the
-        # recommended flow: deploy, then load) has no watermark yet and WILL be gapless, so
-        # alarming it would be a false warning on the happy path; the same reasoning
-        # excludes a stand-alone CDC-only start, where nothing was read here to re-read.
+        # The re-snapshot half is gated on the AFTER-A-LOAD causes only. A fresh
+        # "Full load + CDC" deploy (the recommended flow: deploy, then load) has no watermark
+        # yet and WILL be gapless, so alarming it would be a false warning on the happy path;
+        # the same reasoning excludes a stand-alone CDC-only start, where nothing was read
+        # here to re-read.
         _rs_reason = pg_resnapshot_reason(
             job,
             source_type=_cdc_source_type(session),
             start_mode=migration_state.cdc_start_mode(),
         )
-        if _rs_reason in _PG_RESNAPSHOT_AFTER_LOAD:
-            _rs_notice = pg_resnapshot_notice(_rs_reason)
-            if _rs_notice is not None:
-                _rs_header, _rs_body = _rs_notice
-                # Size signal from the Full Load's own scan-free estimates, so the operator
-                # weighs a real dataset rather than the word "every". Omitted silently when
-                # the watermark carries no counts -- an invented number would be worse.
-                _rs_counts = _cdc_row_counts_from_watermark(
-                    _cdc_watermark(job),
-                    _cdc_tables_for_config(
-                        migration_state, inventory, _cdc_watermark(job)
-                    ),
+        _rs_notice = (
+            pg_resnapshot_notice(_rs_reason, brief=True)
+            if _rs_reason in _PG_RESNAPSHOT_AFTER_LOAD
+            else None
+        )
+        _rs_body = ""
+        if _rs_notice is not None:
+            _rs_body = _rs_notice[1]
+            # Size signal from the Full Load's own scan-free estimates, so the operator
+            # weighs a real dataset rather than the word "every". Omitted silently when
+            # the watermark carries no counts -- an invented number would be worse.
+            _rs_counts = _cdc_row_counts_from_watermark(
+                _cdc_watermark(job),
+                _cdc_tables_for_config(migration_state, inventory, _cdc_watermark(job)),
+            )
+            if _rs_counts:
+                _rs_body += (
+                    f" That is about {sum(_rs_counts.values()):,} rows across "
+                    f"{len(_rs_counts)} table(s), by the Full Load's own estimate."
                 )
-                if _rs_counts:
-                    _rs_body += (
-                        f" By the Full Load's own estimate that is about "
-                        f"{sum(_rs_counts.values()):,} rows across {len(_rs_counts)} "
-                        f"table(s)."
-                    )
-                _render_notice(
-                    ui,
-                    tone="warning",
-                    icon="restart_alt",
-                    header=_rs_header,
-                    body=_rs_body,
-                )
+        # NAT base is only incurred when the stack creates its own NAT ("create");
+        # reused existing subnets ("discovered") have no new NAT charge.
+        _render_cdc_cost_estimate(
+            ui, includes_nat=(net_kind == "create"), extra=_rs_body
+        )
+        # ONE box for the only two items that are the OPERATOR'S OWN WORK. Both cost the
+        # same way if skipped -- the connectors are created and billed and then never stream
+        # -- so they belong together, above the "what gets created" detail rather than
+        # interleaved with it. The FK entry drops its mechanism paragraph ("the sink applies
+        # change records across several tasks with no parent-before-child ordering...") which
+        # explains WHY rather than what to do; the instruction and the consequence stay.
+        _todo: list[tuple[str, str]] = []
         if fk_preview is not None:
-            _render_notice(
-                ui,
-                tone="warning",
-                icon="link",
-                header=_cdc_fk_block_reason(fk_preview)[1],
-                body=(
-                    _cdc_fk_block_body(fk_preview, can_remove_here=False)
-                    + " Start CDC refuses while this is true, so clear it BEFORE you "
-                    "deploy: MSK Serverless bills from creation and the cluster would "
-                    "sit idle until it is cleared."
-                ),
-            )
-        if net_message:
-            # Only "blocked" is an error (Deploy is disabled below); creating a NAT
-            # or reusing subnets is just an FYI, so it reads as a calm info notice.
-            net_tone, net_icon = {
-                "create": ("info", "lan"),
-                "blocked": ("error", "error"),
-            }.get(net_kind, ("info", "lan"))
-            _render_notice(
-                ui, tone=net_tone, icon=net_icon, header="Network", body=net_message
-            )
+            _todo.append((
+                "Foreign keys on the target",
+                _cdc_fk_block_body(fk_preview, can_remove_here=False, why=False)
+                + " Start CDC will not stream until they are gone, and MSK Serverless "
+                "bills from creation — so clear them before you deploy.",
+            ))
         if source_inbound_hint:
-            # `info`, not `warning`: this is very often already satisfied and the tool
-            # cannot tell without reading the customer's security groups. Stating the rule
-            # is the whole value -- the stack opens only its own egress, so a missing
-            # ingress on the operator's database shows up as connectors that are created,
-            # billed, and never reach RUNNING.
-            _render_notice(
-                ui,
-                tone="info",
-                icon="security",
-                header="Check the source database's inbound rule",
-                body=source_inbound_hint,
-            )
-        if source_vpc_warning:
-            # A mismatch is not a blocker -- peering / TGW / PrivateLink are legitimate --
-            # but it is the shape of a typo, so it warns and says what to confirm.
-            _render_notice(
-                ui,
-                tone="warning",
-                icon="lan",
-                header="This is not the source's VPC",
-                body=source_vpc_warning,
-            )
+            _todo.append(("Source database inbound rule", source_inbound_hint))
+        if _todo:
+            # `warning` only when a FK really is blocking: the inbound rule is very often
+            # already satisfied and the tool cannot tell without reading a customer
+            # resource, so on its own it stays a calm `info`.
+            _todo_tone = "warning" if fk_preview is not None else "info"
+            if len(_todo) == 1:
+                _render_notice(
+                    ui, tone=_todo_tone, icon="checklist",
+                    header=f"Before the connectors can run — {_todo[0][0].lower()}",
+                    body=_todo[0][1],
+                )
+            else:
+                with notice_container(
+                    ui, tone=_todo_tone, icon="checklist",
+                    header="Before the connectors can run",
+                ):
+                    for _term, _body in _todo:
+                        definition_row(ui, _term, _body)
+        # ONE box for what the stack will CREATE or TOUCH in the account. These were four
+        # separate notices saying four halves of the same thing, and none of them asks the
+        # operator to do anything except read.
+        _creates: list[tuple[str, str]] = []
+        if net_message and net_kind != "blocked":
+            _creates.append(("Networking", net_message))
         if routed_warning:
-            # A complex-VPC caution (TGW/peering/VPN) for the auto-carved subnets:
-            # something to be aware of, not a blocker -> amber "warning" notice.
-            _render_notice(
-                ui,
-                tone="warning",
-                header="Check subnet overlap",
-                body=routed_warning,
-            )
-        if seed_admission.blocker:
-            _render_notice(
-                ui,
-                tone="error",
-                icon="vpn_lock",
-                header="This deployment cannot start PostgreSQL CDC",
-                body=(
-                    seed_admission.blocker
-                    + " Deploying now would create a billable MSK Serverless cluster "
-                    "that Start CDC could never use."
-                ),
-            )
-        elif seed_admission.warning:
-            _render_notice(
-                ui,
-                tone="warning",
-                icon="vpn_lock",
-                header=(
-                    seed_admission.header
-                    or "MSK ingress for this host was not registered"
-                ),
-                body=seed_admission.warning,
-            )
+            _creates.append(("Subnet overlap", routed_warning))
+        if source_vpc_warning:
+            # Not a blocker -- peering / TGW / PrivateLink are legitimate -- but it is the
+            # shape of a typo, so it keeps its own row and the box takes the warning tone.
+            _creates.append(("This is not the source's VPC", source_vpc_warning))
+        if seed_admission.warning:
+            _creates.append((
+                seed_admission.header or "MSK ingress was not registered",
+                seed_admission.warning,
+            ))
         elif seed_admission.note:
-            # A normal, resolved state -> calm info, never a warning.
-            _render_notice(
-                ui,
-                tone="info",
-                icon="vpn_lock",
-                header="MSK access for the PostgreSQL CDC seed",
-                body=seed_admission.note,
+            _creates.append(("MSK access for the CDC seed", seed_admission.note))
+        if _creates:
+            _creates_tone = (
+                "warning"
+                if (routed_warning or source_vpc_warning or seed_admission.warning)
+                else "info"
             )
-        if pg_infra_block is not None:
-            _render_notice(
-                ui,
-                tone="error",
-                icon="sync_problem",
-                header=pg_infra_block[0],
-                body=(
-                    pg_infra_block[1]
-                    + " Deploying now would create a billable MSK Serverless cluster that "
-                    "Start CDC could not use. Fix this first, or start the migration over "
-                    'as "Full load + CDC", which creates both at the snapshot point.'
-                ),
-            )
+            if len(_creates) == 1:
+                _render_notice(
+                    ui, tone=_creates_tone, icon="lan",
+                    header=_creates[0][0], body=_creates[0][1],
+                )
+            else:
+                with notice_container(
+                    ui, tone=_creates_tone, icon="lan",
+                    header="What this deploy creates in your VPC",
+                ):
+                    for _term, _body in _creates:
+                        definition_row(ui, _term, _body)
 
         async def _go() -> None:
             dialog.close()
@@ -3749,7 +3736,40 @@ _PG_RESNAPSHOT_CAUSE: dict[str, tuple[str, str, str]] = {
 _PG_RESNAPSHOT_AFTER_LOAD = {"no_slot", "unfinished_load", "manual"}
 
 
-def pg_resnapshot_notice(reason: Optional[str]) -> Optional[tuple[str, str]]:
+# The same disclosure, compressed to what a SPEND decision needs. Used only in the Deploy
+# dialog, which authorises a billable cluster and where this notice competes with three other
+# boxes; the full version stays on the start-point card and in the prerequisite row, where the
+# operator is reading to UNDERSTAND rather than to decide. Dropped here: the slot mechanism
+# (why a past position cannot be rewound to) and the "nothing is lost" reassurance -- both are
+# verbatim one screen up. Kept: what happens, what it costs, the residue, and the way out.
+_PG_RESNAPSHOT_BRIEF: dict[str, str] = {
+    "no_slot": (
+        "This load recorded no replication slot, so every selected table is read from the "
+        "source again and streamed into DSQL before any change flows — expect it to take "
+        "LONGER than the Full Load did, and rows DELETED on the source since then stay on "
+        'the target. To avoid the re-read, cancel and start over as "Full load + CDC".'
+    ),
+    "unfinished_load": (
+        "This Full Load did not finish, so its replication slot is not used: every selected "
+        "table is re-snapshotted before any change flows. Retry the failed tables first — "
+        "the gapless resume comes back on its own once the load reaches DONE."
+    ),
+    "manual": (
+        "This start re-snapshots instead of resuming from the slot this load created, so "
+        "every selected table is read again. Switch the start point back to Automatic to "
+        "resume with no re-read."
+    ),
+    "no_watermark": (
+        "There is no Full Load watermark to resume from, so every selected table is "
+        "snapshotted through the streaming pipeline before any change flows — expect that to "
+        "take a while on a large source."
+    ),
+}
+
+
+def pg_resnapshot_notice(
+    reason: Optional[str], *, brief: bool = False
+) -> Optional[tuple[str, str]]:
     """``(header, body)`` disclosing a re-snapshotting PostgreSQL start, or ``None``. Pure.
 
     All the copy for this route in ONE place, so the Deploy dialog, the start-point card and
@@ -3765,6 +3785,8 @@ def pg_resnapshot_notice(reason: Optional[str]) -> Optional[tuple[str, str]]:
     if entry is None:
         return None
     header, cause, remedy = entry
+    if brief:
+        return header, _PG_RESNAPSHOT_BRIEF[reason or ""]
     after_load = reason in _PG_RESNAPSHOT_AFTER_LOAD
     lossless = (
         "Nothing is lost: there is no window between the snapshot and the stream, and the "
@@ -4489,11 +4511,19 @@ def _cdc_fk_block_reason(blocking) -> tuple[str, str]:
     )
 
 
-def _cdc_fk_block_body(blocking, *, can_remove_here: bool = True) -> str:
+def _cdc_fk_block_body(
+    blocking, *, can_remove_here: bool = True, why: bool = True
+) -> str:
     """Compose the CDC-start FK precondition message. Pure.
 
     ``can_remove_here`` is False for the consumers that render no Remove control (the job
     error and the activity log), so the copy does not point at a button that is not there.
+
+    ``why=False`` drops the closing mechanism paragraph (out-of-order child rows,
+    SQLSTATE 23503, silent dead-lettering). It is the right explanation at the point CDC is
+    REFUSED, but in the Deploy dialog it is 40 words of rationale competing with three other
+    boxes for an operator who has not been refused anything yet -- there the instruction and
+    its cost are the whole message.
     """
     parts: list[str] = []
     if blocking.ours:
@@ -4522,12 +4552,13 @@ def _cdc_fk_block_body(blocking, *, can_remove_here: bool = True) -> str:
             + ". Re-test the target connection and retry — CDC is blocked while this "
             "is unknown, because an undetected foreign key silently discards rows."
         )
-    parts.append(
-        "Why: the sink applies change records across several tasks with no "
-        "parent-before-child ordering, so a child row can arrive first, be rejected "
-        "with SQLSTATE 23503, and be dead-lettered permanently — the task keeps "
-        "running and offsets advance, so the loss is silent."
-    )
+    if why:
+        parts.append(
+            "Why: the sink applies change records across several tasks with no "
+            "parent-before-child ordering, so a child row can arrive first, be rejected "
+            "with SQLSTATE 23503, and be dead-lettered permanently — the task keeps "
+            "running and offsets advance, so the loss is silent."
+        )
     return " ".join(parts)
 
 

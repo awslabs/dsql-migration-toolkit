@@ -998,47 +998,100 @@ def test_estimate_cdc_table_rows_threads_source_dialect(monkeypatch) -> None:
     assert isinstance(seen["dialect"], MySQLSourceDialect)
 
 
-def test_cdc_start_card_postgres_manual_is_resnapshot_without_coordinate_inputs() -> None:
-    # PostgreSQL Manual renders a re-snapshot explanation (snapshot.mode=initial) with the
-    # PG-worded radio labels -- NO GTID/binlog inputs, which Debezium PG cannot use.
-    from dsql_migrator.core.models import SourceType
-    from dsql_migrator.ui.data_migration._cdc_ui import _render_cdc_start_point_card
+def test_the_postgres_card_offers_no_start_point_radio_at_all() -> None:
+    """PostgreSQL has no start point to CHOOSE, so it must not present one.
 
-    state = DataMigrationState()
-    state.set_cdc_start_mode("manual")
-    fake = _FakeUi()
-    _render_cdc_start_point_card(
-        fake, state, lambda: None,
-        wm_resume=None, wm_usable=False, effective_resume=None,
-        mode="manual", locked=False, session=None, source_type=SourceType.POSTGRES,
-    )
-    radio_values = [v for r in fake.radios for v in r.values()]
-    assert "Manual — re-snapshot from scratch (initial)" in radio_values
-    # No MySQL coordinate wording anywhere in the PG card.
-    assert all("GTID" not in v and "binlog" not in v for v in radio_values)
-    assert "GTID set" not in fake.texts  # the MySQL manual input field label
-    joined = " ".join(fake.texts)
-    assert "snapshot.mode=initial" in joined  # the re-snapshot confirmation/explanation
+    "Manual — re-snapshot from scratch (initial)" was a trap, not a choice: executed over
+    the whole state space it changes the outcome in exactly one state family. With no
+    watermark, and with a Full-load-only watermark, BOTH modes yield snapshot.mode=initial;
+    a Full-load-+-CDC job that is not DONE has its slot suppressed, so both yield initial
+    there too. Only a DONE load that recorded a slot differs -- and there Manual discards
+    the gapless resume to re-copy every row through the STREAMING pipeline (~19-26K rows/s
+    against the loader's ~103K) while being unable to remove rows deleted since the load.
 
-
-def test_cdc_start_card_postgres_auto_shows_slot_resume_and_wal_lsn() -> None:
-    # PostgreSQL Automatic renders the gapless-slot label + the resolved WAL LSN.
+    MySQL keeps its radio: there Manual supplies a REAL coordinate (a GTID or binlog
+    position) that `_cdc_resume_signal` consumes as `resume_override`.
+    """
     from dsql_migrator.core.cdc import CdcResumePoint
     from dsql_migrator.core.models import SourceType
     from dsql_migrator.ui.data_migration._cdc_ui import _render_cdc_start_point_card
 
-    wm = CdcResumePoint(wal_lsn="3/AF012B8")
-    state = DataMigrationState()
-    state.set_cdc_start_mode("auto")
-    fake = _FakeUi()
-    _render_cdc_start_point_card(
-        fake, state, lambda: None,
-        wm_resume=wm, wm_usable=True, effective_resume=wm,
-        mode="auto", locked=False, session=None, source_type=SourceType.POSTGRES,
-    )
-    radio_values = [v for r in fake.radios for v in r.values()]
-    assert any("gapless from the replication slot" in v for v in radio_values)
-    assert "3/AF012B8" in " ".join(fake.texts)  # WAL LSN summary + confirmation
+    def card(source_type, **kw):
+        state = DataMigrationState()
+        state.set_cdc_start_mode(kw.get("mode", "auto"))
+        fake = _FakeUi()
+        _render_cdc_start_point_card(
+            fake, state, lambda: None,
+            wm_resume=kw.get("wm_resume"), wm_usable=kw.get("wm_usable", False),
+            effective_resume=kw.get("effective_resume"), mode=kw.get("mode", "auto"),
+            locked=False, session=None, source_type=source_type,
+            resnapshot_reason=kw.get("resnapshot_reason"),
+        )
+        return fake
+
+    pg = card(SourceType.POSTGRES, resnapshot_reason="no_slot")
+    assert pg.radios == [], "PostgreSQL must render no start-point radio"
+    # The disclosure carries the whole message instead, and no MySQL coordinate wording
+    # leaks into the PG card.
+    joined = " ".join(pg.texts)
+    assert "read from the source a second time" in joined
+    assert "GTID set" not in pg.texts
+
+    # MySQL still gets its two options.
+    my = card(SourceType.MYSQL)
+    assert any(
+        "Manual — enter a GTID or binlog position" in v
+        for r in my.radios
+        for v in r.values()
+    ), my.radios
+
+
+def test_the_postgres_card_confirms_gapless_only_when_the_start_really_is() -> None:
+    """The confirm line is keyed on the effective mode, not on a radio value.
+
+    Two traps here, both execution-confirmed. (1) Keying it on `mode == "manual"` printed
+    the GAPLESS line for a slot-bearing watermark that an escape button had switched to a
+    re-snapshot -- a state session restore reloads. (2) Re-deriving the predicate from
+    `wm_resume` inverts it: that is a `CdcResumePoint`, whose fields are binlog_file /
+    binlog_position / gtid_executed / server_uuid / wal_lsn and NOT `slot_name`, and
+    `pg_snapshot_mode` decides `never` via `bool(getattr(watermark, "slot_name", None))` --
+    so a CdcResumePoint always looks like a re-snapshot and the gapless happy path would be
+    mislabelled, pushing the operator toward a re-load they do not need.
+    """
+    from dsql_migrator.core.cdc import CdcResumePoint
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration._cdc_ui import _render_cdc_start_point_card
+
+    def confirm(*, reason, mode="auto"):
+        wm = CdcResumePoint(wal_lsn="3/AF012B8")
+        state = DataMigrationState()
+        state.set_cdc_start_mode(mode)
+        fake = _FakeUi()
+        _render_cdc_start_point_card(
+            fake, state, lambda: None,
+            wm_resume=wm, wm_usable=reason is None, effective_resume=wm, mode=mode,
+            locked=False, session=None, source_type=SourceType.POSTGRES,
+            resnapshot_reason=reason,
+        )
+        return " ".join(fake.texts)
+
+    # Gapless: the WAL LSN is confirmed and the re-snapshot line must NOT appear.
+    gapless = confirm(reason=None)
+    assert "gapless from the replication slot" in gapless
+    assert "3/AF012B8" in gapless
+    assert "re-snapshot every table" not in gapless
+
+    # An escape button recorded "manual" against a slot-bearing watermark: the card must
+    # report the re-snapshot, which is what the connector is actually configured for.
+    switched = confirm(reason="manual", mode="manual")
+    assert "re-snapshot every table (snapshot.mode=initial)" in switched
+    assert "gapless from the replication slot" not in switched
+
+    # THE case that proves the confirm line is not keyed on the radio value: mode is the
+    # "auto" default (there is no PG radio to change) and the start still re-snapshots.
+    default_mode = confirm(reason="no_slot", mode="auto")
+    assert "re-snapshot every table (snapshot.mode=initial)" in default_mode
+    assert "gapless from the replication slot" not in default_mode
 
 
 def test_pg_resnapshot_predicate_and_cause_agree_with_the_connector_config() -> None:
@@ -1174,10 +1227,9 @@ def test_cdc_start_card_pg_auto_without_a_slot_is_resolved_and_discloses_the_rer
         mode="auto", locked=False, session=None, source_type=SourceType.POSTGRES,
         resnapshot_reason="no_slot",
     )
-    radio_values = [v for r in fake.radios for v in r.values()]
-    # The default names what it WILL DO, and is not marked unavailable.
-    assert any("re-snapshot every selected table" in v for v in radio_values), radio_values
-    assert all("(unavailable)" not in v for v in radio_values), radio_values
+    # No radio at all now -- the disclosure below carries the whole message. There was never
+    # a choice to make: without a slot, Automatic and Manual produce the identical config.
+    assert fake.radios == []
     joined = " ".join(fake.texts)
     # The cost is disclosed, with the remedy, rather than steering to Manual as an escape.
     assert "read from the source a second time" in joined

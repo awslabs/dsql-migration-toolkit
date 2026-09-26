@@ -15590,6 +15590,61 @@ def test_start_cdc_auto_mode_disabled_for_gtid_only_watermark() -> None:
     assert seedable.start_disabled is False
 
 
+def test_start_cdc_is_enabled_for_every_postgres_start_without_a_radio_click() -> None:
+    """PostgreSQL readiness keys on the EFFECTIVE snapshot mode, never on a radio value.
+
+    `or (is_pg and mode == "manual")` made the start-point radio load-bearing for a state it
+    has no business deciding: a PG CDC-only start, or any PG session whose job record was
+    lost to a restart, was DISABLED under Automatic with "Set the CDC start point above
+    first." and enabled under Manual — while both modes produce the identical
+    `initial`/`filtered` connector config. So it was a false block whose only cure was an
+    undiscoverable radio click, and the card one screen up already badged the state "Ready".
+    That radio is gone now, so this must hold with mode left at its "auto" default.
+    """
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    class _JM:
+        def __init__(self, job):
+            self._job = job
+
+        def get_status(self, _job_id):
+            return self._job
+
+    def _render(watermark):
+        ui = _StartButtonUi()
+        state = DataMigrationState()
+        state.set_cdc_stack_phase("infra", status="UPDATE_COMPLETE")
+        state.set_prereq_gated_mode(MigrationMode.CDC)
+        state.set_cdc_has_committed_offset(False)
+        state.job_id = "job-1"
+        _cdc_ui._render_cdc_start_button(
+            ui, state, _JM(SimpleNamespace(watermark=watermark, status="DONE")),
+            lambda: None, inventory=None,
+            session=SimpleNamespace(source_config=SimpleNamespace(
+                source_type=SourceType.POSTGRES
+            )),
+        )
+        return ui
+
+    now = datetime.now(timezone.utc)
+    # No watermark at all (CDC-only, or the job record is gone) -> still startable.
+    assert _render(None).start_disabled is False
+    # A Full-load-only watermark (WAL LSN, no slot) -> re-snapshot, still startable.
+    assert _render(
+        Watermark(snapshot_timestamp=now, wal_lsn="0/16B3748")
+    ).start_disabled is False
+    # A Full-load-+-CDC watermark -> the gapless resume, startable for the other reason.
+    assert _render(
+        Watermark(snapshot_timestamp=now, wal_lsn="0/16B3748", slot_name="dbz_slot")
+    ).start_disabled is False
+    # ...and none of them tells the operator to go and set a start point that has no control.
+    for wm in (None, Watermark(snapshot_timestamp=now, wal_lsn="0/16B3748")):
+        assert "Set the CDC start point above first." not in " ".join(_render(wm).texts)
+
+
 # ---------------------------------------------------------------------------
 # Sink MCU knob: config -> CFN parameter wiring
 # ---------------------------------------------------------------------------
@@ -24588,10 +24643,11 @@ def _drive_cdc_infra_dialog(
         cdc_ui,
         "_render_notice",
         lambda _ui, *, tone="info", icon=None, header="", body="": notices.append(
-            {"tone": tone, "header": header, "body": body}
+            {"tone": tone, "header": header, "body": body, "term": ""}
         ),
     )
-    monkeypatch.setattr(cdc_ui, "_render_cdc_cost_estimate", lambda *_a, **_k: None)
+    _capture_grouped_notices(monkeypatch, cdc_ui, notices)
+    monkeypatch.setattr(cdc_ui, "_render_cdc_cost_estimate", lambda _ui, **_k: cdc_ui._render_notice(_ui, tone="warning" if _k.get("extra") else "info", header="Cost and how long it runs" if _k.get("extra") else "Estimated cost", body=("COST " + (_k.get("extra") or "")).strip()))
 
     state = DataMigrationState()
     state.set_cdc_infra_inputs({"vpc_id": "vpc-app"})
@@ -24602,6 +24658,48 @@ def _drive_cdc_infra_dialog(
         )
     )
     return notices, ui
+
+
+def _capture_grouped_notices(monkeypatch, cdc_ui, notices: list) -> None:
+    """Record ``notice_container`` + ``definition_row`` output into the same notices list.
+
+    The Deploy dialog merges related items into ONE box (blockers, the operator's own
+    pre-deploy work, what the stack creates) instead of stacking a notice per item, so a
+    harness that only patches ``_render_notice`` would see those boxes as absent and every
+    assertion about them would pass vacuously. Each grouped row lands as its own entry
+    carrying the BOX's tone and header plus the row's term, so a test can assert on content
+    without caring whether it was grouped -- which is what lets the grouping change again
+    without rewriting the assertions.
+    """
+    import contextlib
+
+    @contextlib.contextmanager
+    def _container(_ui, *, tone="info", header="", body="", icon=""):
+        notices.append(
+            {"tone": tone, "header": header, "body": body, "term": "", "group": True}
+        )
+        current = {"tone": tone, "header": header}
+        prev = getattr(_container, "_open", None)
+        _container._open = current
+        try:
+            yield _ui
+        finally:
+            _container._open = prev
+
+    def _row(_ui, term, description="", **_kw):
+        open_box = getattr(_container, "_open", None) or {}
+        notices.append(
+            {
+                "tone": open_box.get("tone", "info"),
+                "header": open_box.get("header", ""),
+                "body": str(description),
+                "term": str(term),
+            }
+        )
+        return contextlib.nullcontext(_ui)
+
+    monkeypatch.setattr(cdc_ui, "notice_container", _container)
+    monkeypatch.setattr(cdc_ui, "definition_row", _row)
 
 
 class _SimpleSourceSession:
@@ -24643,7 +24741,7 @@ def _drive_cdc_infra_dialog_with_state(monkeypatch, state, *, pg_objects_require
             {"tone": tone, "header": header, "body": body}
         ),
     )
-    monkeypatch.setattr(cdc_ui, "_render_cdc_cost_estimate", lambda *_a, **_k: None)
+    monkeypatch.setattr(cdc_ui, "_render_cdc_cost_estimate", lambda _ui, **_k: cdc_ui._render_notice(_ui, tone="warning" if _k.get("extra") else "info", header="Cost and how long it runs" if _k.get("extra") else "Estimated cost", body=("COST " + (_k.get("extra") or "")).strip()))
     asyncio.run(
         cdc_ui._open_cdc_infra_dialog(
             ui, state, lambda: None, session=_SimpleSourceSession(),
@@ -24662,12 +24760,18 @@ def test_the_deploy_dialog_checks_the_vpc_against_the_source_before_deploying(
     notices, ui = _drive_cdc_infra_dialog(
         monkeypatch, source_vpc_warning="vpc-elsewhere is not the source's VPC."
     )
-    hit = [n for n in notices if n["header"] == "This is not the source's VPC"]
+    # Rendered in the "what this deploy creates" box -- as its own row when grouped, or as
+    # the box itself when it is the only thing to say. Assert on CONTENT so the grouping can
+    # change again without rewriting this.
+    hit = [n for n in notices if "not the source's VPC" in (n["header"] + n["term"])]
     assert [n["tone"] for n in hit] == ["warning"]
+    assert "vpc-elsewhere" in hit[0]["body"]
     assert ui.buttons["Deploy"].enabled is True
     # ...and it is silent when the VPC checks out, so a normal deploy is not nagged.
     quiet, _ = _drive_cdc_infra_dialog(monkeypatch)
-    assert not [n for n in quiet if n["header"] == "This is not the source's VPC"]
+    assert not [
+        n for n in quiet if "not the source's VPC" in (n["header"] + n["term"])
+    ]
 
 
 def test_the_deploy_dialog_states_the_source_inbound_rule_before_the_spend(
@@ -24684,15 +24788,15 @@ def test_the_deploy_dialog_states_the_source_inbound_rule_before_the_spend(
         monkeypatch,
         source_inbound_hint="Confirm pgtest's security group (sg-abc) allows inbound 5432.",
     )
-    hit = [n for n in notices if n["header"] == "Check the source database's inbound rule"]
-    assert [n["tone"] for n in hit] == ["info"]
+    # It lands in the "before the connectors can run" box -- the operator's own work, kept
+    # together with the foreign-key item because both fail the same way if skipped.
+    hit = [n for n in notices if "inbound rule" in (n["header"] + n["term"]).lower()]
+    assert [n["tone"] for n in hit] == ["info"], "info alone: it is often already satisfied"
     assert "sg-abc" in hit[0]["body"]
     assert ui.buttons["Deploy"].enabled is True
     # Silent when the source network could not be read -- no manufactured advice.
     quiet, _ = _drive_cdc_infra_dialog(monkeypatch)
-    assert not [
-        n for n in quiet if n["header"] == "Check the source database's inbound rule"
-    ]
+    assert not [n for n in quiet if "inbound rule" in (n["header"] + n["term"]).lower()]
 
 
 def test_deploy_dialog_blocks_a_postgres_deploy_this_app_cannot_seed(
@@ -24708,13 +24812,17 @@ def test_deploy_dialog_blocks_a_postgres_deploy_this_app_cannot_seed(
         monkeypatch,
         admission=MskSeedAdmission(blocker="Update the app stack: no 9098 egress."),
     )
-    blocked = [
-        n for n in notices if n["header"] == "This deployment cannot start PostgreSQL CDC"
-    ]
-    assert [n["tone"] for n in blocked] == ["error"]
-    assert "billable MSK Serverless cluster" in blocked[0]["body"]
+    blocked = [n for n in notices if n["tone"] == "error"]
+    assert blocked, "a disabled Deploy must be explained"
+    assert "Deploy is blocked" in blocked[0]["header"]
+    # The consequence sentence the raw blocker string does NOT carry must survive the merge.
+    assert any("billable MSK Serverless cluster" in n["body"] for n in blocked)
+    assert any("9098" in n["body"] for n in blocked)
     assert ui.buttons["Deploy"].enabled is False
     assert "9098" in (ui.buttons["Deploy"].tooltip_text or "")
+    # The blocker is FIRST: it explains a greyed-out button, so it must not sit below an
+    # info-toned cost box the way source order used to put it.
+    assert notices[0]["tone"] == "error", [n["header"] for n in notices]
 
 
 def test_deploy_dialog_discloses_the_msk_ingress_it_will_create(monkeypatch) -> None:
@@ -24729,19 +24837,87 @@ def test_deploy_dialog_discloses_the_msk_ingress_it_will_create(monkeypatch) -> 
             cidr="10.0.0.0/16", note="The cdc-stack will admit 10.0.0.0/16 on MSK 9098."
         ),
     )
-    hit = [
-        n for n in notices if n["header"] == "MSK access for the PostgreSQL CDC seed"
-    ]
+    hit = [n for n in notices if "MSK access" in (n["header"] + n["term"])]
     assert [n["tone"] for n in hit] == ["info"]
     assert "10.0.0.0/16" in hit[0]["body"]
     assert ui.buttons["Deploy"].enabled is True
+
+
+def test_the_deploy_dialog_stays_under_four_boxes_in_its_worst_case(monkeypatch) -> None:
+    """A cap on BOXES, so the next contributor merges instead of appending.
+
+    The dialog reached SEVEN notices / ~530 words above the Deploy button by each change
+    adding one more box that was individually justified — the aggregate risk a review had
+    named and nothing enforced. It is now three: cost-and-duration, the operator's own work,
+    and what gets created; blockers make a fourth and replace nothing (they explain a greyed
+    button). The cap is on boxes rather than words because word counts move with security-
+    group ids, subnet ids and foreign-key names the tool does not control, so a word
+    assertion would fail on real inputs while a box cap forces the right fix.
+    """
+    import types
+
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+    from dsql_migrator.core.cdc import MskSeedAdmission
+
+    monkeypatch.setattr(
+        cdc_ui,
+        "_probe_cdc_blocking_foreign_keys",
+        lambda *_a, **_k: types.SimpleNamespace(
+            blocking=True,
+            ours=[("app.a", "a_fkey"), ("app.b", "b_fkey")],
+            foreign=[],
+            unknown_tables=[],
+        ),
+    )
+    monkeypatch.setattr(cdc_ui, "pg_resnapshot_reason", lambda *_a, **_k: "no_slot")
+
+    # Everything that can speak, speaking at once, WITHOUT a blocker.
+    notices, ui = _drive_cdc_infra_dialog(
+        monkeypatch,
+        source_vpc_warning="vpc-x is not the source's VPC.",
+        source_inbound_hint="Confirm sg-abc allows inbound 5432.",
+        net=("A NAT gateway will be created.", "create", "Check subnet overlap: 10/8."),
+        admission=MskSeedAdmission(cidr="10.0.0.0/16", note="Admits 10.0.0.0/16 on 9098."),
+    )
+    top = [n for n in notices if not n["term"]]
+    assert len(top) <= 3, [n["header"] for n in top]
+    assert ui.buttons["Deploy"].enabled is True
+    # Nothing actionable was lost to the merging.
+    joined = " ".join(n["body"] for n in notices)
+    assert "sg-abc" in joined              # the inbound rule to open
+    assert "a_fkey" in joined              # the FKs to drop
+    assert "subnet overlap" in joined.lower()
+    assert "9098" in joined
+    assert "not the source's VPC" in " ".join(n["header"] + n["term"] for n in notices)
+
+    # ...and the two paragraphs this dialog deliberately does NOT repeat, because both are
+    # verbatim on surfaces the operator has already passed. These are what made it 530 words.
+    assert "Why: the sink applies change records" not in joined, (
+        "the FK mechanism belongs where CDC is REFUSED, not where it is authorised"
+    )
+    assert "cannot be created at, or rewound to" not in joined, (
+        "the slot mechanism is on the start-point card one screen up"
+    )
+    assert "Nothing is lost" not in joined
+
+    # A blocker adds at most ONE box, and it comes first.
+    blocked_notices, blocked_ui = _drive_cdc_infra_dialog(
+        monkeypatch,
+        source_inbound_hint="Confirm sg-abc allows inbound 5432.",
+        net=("A NAT gateway will be created.", "create", "Check subnet overlap: 10/8."),
+        admission=MskSeedAdmission(blocker="Update the app stack: no 9098 egress."),
+    )
+    blocked_top = [n for n in blocked_notices if not n["term"]]
+    assert len(blocked_top) <= 4, [n["header"] for n in blocked_top]
+    assert blocked_notices[0]["tone"] == "error"
+    assert blocked_ui.buttons["Deploy"].enabled is False
 
 
 def test_deploy_dialog_is_silent_for_a_lambda_seeded_deploy(monkeypatch) -> None:
     # MySQL on Fargate/local: an all-empty admission -> no MSK notice of any kind, so the
     # dialog looks exactly as it did before this feature existed.
     notices, ui = _drive_cdc_infra_dialog(monkeypatch)
-    assert not [n for n in notices if "MSK" in n["header"]]
+    assert not [n for n in notices if "MSK" in (n["header"] + n["term"])]
     assert ui.buttons["Deploy"].enabled is True
 
 
@@ -25218,31 +25394,27 @@ def test_the_deploy_infra_dialog_refuses_a_cdc_only_deploy_with_nothing_to_strea
         )
 
     notices, ui = _drive(MigrationType.CDC_ONLY)
-    blocked = [
-        n for n in notices if n["header"] == "CDC's publication does not exist on the source"
-    ]
-    assert [n["tone"] for n in blocked] == ["error"]
-    assert "billable MSK Serverless cluster" in blocked[0]["body"]
+    blocked = [n for n in notices if n["tone"] == "error"]
+    assert blocked, "a disabled Deploy must be explained"
+    assert "Deploy is blocked" in blocked[0]["header"]
+    assert any("do X" in n["body"] for n in blocked), "the probe's reason must survive"
+    # The merge must not drop the route out, which the raw blocker string does not carry.
+    assert any('"Full load + CDC"' in n["body"] for n in blocked)
     assert ui.buttons["Deploy"].enabled is False
 
     # PAIRED: a FRESH combined run (no watermark -> objects not required yet) must NOT be
     # blocked -- deploying the infrastructure before the load is the flow the card itself
     # recommends, and the objects legitimately do not exist yet.
     notices2, ui2 = _drive(MigrationType.FULL_LOAD_AND_CDC)
-    assert not [
-        n for n in notices2
-        if n["header"] == "CDC's publication does not exist on the source"
-    ]
+    assert not [n for n in notices2 if n["tone"] == "error"]
     assert ui2.buttons["Deploy"].enabled is True
 
     # ...but switching to the combined type AFTER a finished Full-load-only run re-grades
     # the prerequisite to SKIP and un-gates Deploy while the objects still do not exist. The
     # caller detects that from the watermark, so the cost gate must still fire.
     notices3, ui3 = _drive(MigrationType.FULL_LOAD_AND_CDC, objects_required=True)
-    assert [
-        n["tone"] for n in notices3
-        if n["header"] == "CDC's publication does not exist on the source"
-    ] == ["error"]
+    assert [n for n in notices3 if n["tone"] == "error"], notices3
+    assert any("do X" in n["body"] for n in notices3 if n["tone"] == "error")
     assert ui3.buttons["Deploy"].enabled is False
 
 
