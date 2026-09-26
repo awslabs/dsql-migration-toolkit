@@ -157,6 +157,37 @@ def test_allowlist_permits_replica_identity_full_only_for_alter_table() -> None:
         _assert_allowed('ALTER TABLE "app"."orders" REPLICA IDENTITY NOTHING')
 
 
+def test_allowlist_permits_only_the_partition_root_flip_for_alter_publication() -> None:
+    """The publication repair widens the un-guarded write surface by ONE statement shape.
+
+    It has to exist: a publication DEBEZIUM created (publication.autocreate.mode=filtered,
+    which is derived from snapshot.mode=initial) lands at PostgreSQL's default
+    publish_via_partition_root=false, and the connector offers no property to change it --
+    under which pgoutput names changes after the LEAF partition while table.include.list
+    names the collapsed PARENT, so the connector silently discards them.
+
+    Constrained the same way ALTER TABLE is: the tail is pinned, so it can never unpublish a
+    table, hand the publication to another owner, or rename it.
+    """
+    _assert_allowed('ALTER PUBLICATION "p" SET (publish_via_partition_root = true)')
+    # Case-insensitive and run-of-whitespace tolerant (the check normalizes both), which is
+    # all the latitude the module needs since it composes the statement itself...
+    _assert_allowed('alter publication "p"   SET (publish_via_partition_root = TRUE)')
+    # ...and the tail is otherwise EXACT, deliberately: a looser match is what would let
+    # this prefix drift into an arbitrary-DDL surface. Anything else is refused.
+    for refused in (
+        'ALTER PUBLICATION "p" SET TABLE app.orders',
+        'ALTER PUBLICATION "p" DROP TABLE app.orders',
+        'ALTER PUBLICATION "p" ADD TABLE app.orders',
+        'ALTER PUBLICATION "p" OWNER TO bob',
+        'ALTER PUBLICATION "p" RENAME TO q',
+        'ALTER PUBLICATION "p" SET (publish = \'insert\')',
+        'ALTER PUBLICATION "p" SET (publish_via_partition_root = false)',
+    ):
+        with pytest.raises(PgReplicationError):
+            _assert_allowed(refused)
+
+
 # ---------------------------------------------------------------------------
 # FIX 1: re-keyed (composite-PK) tables need REPLICA IDENTITY FULL
 # ---------------------------------------------------------------------------
@@ -500,17 +531,40 @@ def test_slot_health_read_prefers_the_deployed_slot_name() -> None:
 
 
 class _ObjectsConn:
-    """Answers read_pg_replication_objects' two statements from scripted facts."""
+    """Answers read_pg_replication_objects' statements from scripted facts.
 
-    def __init__(self, *, pub_n=1, all_dml=True, slot_any=1, slot_ok=1, covered=()):
+    ``via_root`` / ``partition_roots`` matter because the roll-up they drive is the thing
+    that stops a REPAIRABLE publication from reading as a missing table. A double that
+    answered the pubviaroot probe with the generic facts row reported True unconditionally,
+    which is exactly how the whole defect stayed invisible to a green unit suite.
+    """
+
+    def __init__(
+        self,
+        *,
+        pub_n=1,
+        all_dml=True,
+        slot_any=1,
+        slot_ok=1,
+        covered=(),
+        via_root=True,
+        partition_roots=None,
+    ):
         self._row = (pub_n, all_dml, slot_any, slot_ok)
         self._covered = list(covered)
+        self._via_root = via_root
+        self._partition_roots = dict(partition_roots or {})
         self.statements: list[str] = []
 
     def execute(self, statement, params=None):
         sql = str(statement)
         self.statements.append(sql)
-        if "PG_PUBLICATION_TABLES" in sql.upper():
+        upper = sql.upper()
+        if "PUBVIAROOT" in upper:
+            return _Result([] if self._via_root is None else [(self._via_root,)])
+        if "PG_PARTITION_ROOT" in upper:
+            return _Result(list(self._partition_roots.items()))
+        if "PG_PUBLICATION_TABLES" in upper:
             return _Result([(t,) for t in self._covered])
         return _Result([self._row])
 
@@ -531,6 +585,117 @@ def test_read_pg_replication_objects_reads_the_catalog_shape() -> None:
     assert "CURRENT_DATABASE()" in joined
     assert "'PGOUTPUT'" in joined.replace('"', "'")
     assert "SLOT_TYPE = 'LOGICAL'" in joined
+
+
+def test_a_repairable_publication_does_not_read_as_a_missing_partitioned_table() -> None:
+    """THE defect, and the half that made a retry a dead end.
+
+    Live on Aurora PostgreSQL 17.7: a `Full load only` run then Start CDC. Debezium creates
+    the publication (publication.autocreate.mode=filtered, derived from
+    snapshot.mode=initial) and it lands at PostgreSQL's default
+    publish_via_partition_root=false, which the connector cannot set. Under that setting
+    `pg_publication_tables` EXPANDS the registered partitioned parent into its LEAVES --
+    reproduced on PostgreSQL 17.11: `pg_publication_rel` holds `ecommerce.order_events`
+    (relkind 'p') while the view reports `order_events_2026q3` / `_2026q4` and no parent row.
+
+    Two consequences, both fixed here. pgoutput names every change after the leaf while
+    `table.include.list` names the collapsed parent, so the connector DISCARDS them (7 rows
+    lost with the connector RUNNING and the DLQ empty). And the coverage check compared the
+    captured parent against the leaf-expanded view, so it called the parent MISSING -- which
+    turns the next Start into a hard block on a state the Start itself repairs.
+    """
+    from dsql_migrator.core.cdc_pg_slot import (
+        pg_replication_objects_blocker,
+        read_pg_replication_objects,
+    )
+
+    broken = _ObjectsConn(
+        covered=["ecommerce.order_events_2026q3", "ecommerce.order_events_2026q4",
+                 "ecommerce.users"],
+        via_root=False,
+        partition_roots={
+            "ecommerce.order_events_2026q3": "ecommerce.order_events",
+            "ecommerce.order_events_2026q4": "ecommerce.order_events",
+        },
+    )
+    got = read_pg_replication_objects(broken, publication_name="p1", slot_name="s1")
+    assert got.publication_via_partition_root is False
+    # The leaves are rolled up to the table the TARGET actually has, so coverage is judged
+    # against what the publication will effectively cover once the Start repairs it.
+    assert got.publication_tables == frozenset({"ecommerce.order_events", "ecommerce.users"})
+    assert pg_replication_objects_blocker(
+        got,
+        ["ecommerce.order_events", "ecommerce.users"],
+        resumes_from_slot=False,
+    ) is None, "a repairable publication must not block the Start"
+
+    # A table that is genuinely absent in ANY form still blocks -- the relaxation is scoped
+    # to the partition roll-up, not to coverage in general.
+    assert pg_replication_objects_blocker(
+        got,
+        ["ecommerce.order_events", "ecommerce.nowhere"],
+        resumes_from_slot=False,
+    ) is not None
+
+    # And with the property already true the view reports the parent, so nothing is rolled
+    # up and no partition query is even issued -- the gapless route is untouched.
+    healthy = _ObjectsConn(covered=["ecommerce.order_events"], via_root=True)
+    ok = read_pg_replication_objects(healthy, publication_name="p1", slot_name="s1")
+    assert ok.publication_via_partition_root is True
+    assert ok.publication_tables == frozenset({"ecommerce.order_events"})
+    assert not [s for s in healthy.statements if "PG_PARTITION_ROOT" in s.upper()]
+
+
+def test_ensure_publication_via_partition_root_creates_repairs_or_does_nothing() -> None:
+    """Three idempotent outcomes, and the repair must be an in-place ALTER.
+
+    A DROP would destroy the slot with it (the publication and slot are created together and
+    the slot pins the source WAL), so "repaired" has to be an ALTER: measured on PostgreSQL
+    17.11 that flips f->t in place, keeps restart_lsn, and the next commit decodes under the
+    PARENT relid on the SAME slot with no connector restart.
+    """
+    from dsql_migrator.core.cdc_pg_slot import ensure_publication_via_partition_root
+
+    class _Conn:
+        def __init__(self, via_root):
+            self._via_root = via_root
+            self.writes: list[str] = []
+
+        def execute(self, statement, params=None):
+            sql = str(statement)
+            if "PUBVIAROOT" in sql.upper():
+                return _Result([] if self._via_root is None else [(self._via_root,)])
+            self.writes.append(sql)
+            return _Result([])
+
+    logs: list[str] = []
+    already = _Conn(True)
+    assert ensure_publication_via_partition_root(
+        already, name="p1", on_log=logs.append
+    ) == "unchanged"
+    assert already.writes == [], "a correct publication must not be written to"
+    assert logs == []
+
+    repaired = _Conn(False)
+    assert ensure_publication_via_partition_root(
+        repaired, name="p1", on_log=logs.append
+    ) == "repaired"
+    assert len(repaired.writes) == 1
+    assert repaired.writes[0] == (
+        'ALTER PUBLICATION "p1" SET (publish_via_partition_root = true)'
+    )
+    assert "DROP" not in repaired.writes[0].upper(), "a DROP would take the slot with it"
+    # The operator must learn that the repair does not recover what was already missed.
+    assert any("not recovered" in m for m in logs)
+
+    created = _Conn(None)
+    assert ensure_publication_via_partition_root(created, name="p1") == "created"
+    assert created.writes == [
+        'CREATE PUBLICATION "p1" WITH (publish_via_partition_root = true)'
+    ]
+    # No table list: on this route Debezium owns membership and sets it itself, so
+    # reconciling here would turn a changed selection into a hard failure.
+    assert "TABLE" not in created.writes[0].upper()
 
 
 def test_no_publication_means_unknown_dml_not_false() -> None:

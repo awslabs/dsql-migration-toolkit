@@ -67,7 +67,12 @@ from dsql_migrator.core.cdc import (
     build_watermark_params,
     cdc_expected_connector_names,
 )
-from dsql_migrator.core.models import ChunkState, MigrationJob, Watermark
+from dsql_migrator.core.models import (
+    ChunkState,
+    MigrationJob,
+    SourceConnectionConfig,
+    Watermark,
+)
 
 # The CdcStackDeployer boto3/CloudFormation wrapper (its data types, the
 # build_cdc_stack_deployer factory, and the _parse_unsupported_azs / _stack_absent_error
@@ -1100,6 +1105,68 @@ def _run_external_seed(
     driver.log(f"In-process CDC prep complete (offset seed: {outcome}).")
 
 
+def _repair_publication_via_partition_root(
+    *,
+    params: CdcStackParams,
+    discovery: "CdcStackDiscovery",
+    source_config: Optional[SourceConnectionConfig],
+    source_password: Optional[object],
+    driver: "_StageDriver",
+) -> None:
+    """Ensure the CDC publication publishes under the partition ROOT. PostgreSQL only.
+
+    See :func:`~dsql_migrator.core.cdc_pg_slot.ensure_publication_via_partition_root` for
+    why this is needed at all (Debezium creates the publication on the ``initial``-snapshot
+    routes and cannot set the property) and for what "repaired" does and does not recover.
+
+    NEVER fatal. A Start must not be blocked because the source credentials are absent (they
+    are never persisted -- Property 7 -- so a restored session has none) or because the CDC
+    user lacks publication ownership. Both are reported as a WARNING naming the one manual
+    statement, which is the same contract the Delete path uses for the slot drop: the
+    alternative is refusing a Start that would work for every non-partitioned table.
+    """
+    filled = dict(params.filled)
+    current = dict(discovery.current_parameters or {})
+    publication = (
+        filled.get("PgPublicationName") or current.get("PgPublicationName") or ""
+    ).strip()
+    if not publication:
+        return  # MySQL, or a stack with no PostgreSQL publication to repair
+    manual = (
+        f'Run this on the source and start again:  ALTER PUBLICATION "{publication}" '
+        "SET (publish_via_partition_root = true);"
+    )
+    if source_config is None or source_password is None:
+        driver.log(
+            "WARNING: no source credentials in this session, so the CDC publication's "
+            "partition-root setting could not be checked. If any captured table is "
+            "PARTITIONED, its changes will be silently dropped by the connector. " + manual
+        )
+        return
+    engine = None
+    try:
+        engine = cdc_pg_slot.build_pg_source_write_engine(source_config, source_password)
+        with engine.connect() as connection:
+            outcome = cdc_pg_slot.ensure_publication_via_partition_root(
+                connection,
+                name=publication,
+                on_log=lambda message: driver.log(f"source: {message}"),
+            )
+        if outcome == "unchanged":
+            driver.log(
+                f'Publication "{publication}" already publishes under the partition root.'
+            )
+    except Exception as exc:  # noqa: BLE001 - advisory: never fail a Start on this
+        driver.log(
+            "WARNING: could not set the CDC publication to publish under the partition "
+            f"root ({str(exc).splitlines()[0]}). Changes to a PARTITIONED captured table "
+            "would be silently dropped by the connector. " + manual
+        )
+    finally:
+        if engine is not None:
+            engine.dispose()
+
+
 def run_cdc_start(
     handle,
     *,
@@ -1114,6 +1181,12 @@ def run_cdc_start(
     sleep: Callable[[float], None] = None,  # type: ignore[assignment]
     seed_mode: str = "lambda",
     seed_fn: Optional[Callable[..., str]] = None,
+    # PostgreSQL only, and OPTIONAL: without them the publication repair below is skipped
+    # with a WARNING rather than failing the Start, exactly as the Delete path treats a
+    # missing credential for the slot drop. They are never persisted (Property 7), so a
+    # restored session legitimately has none.
+    pg_source_config: Optional[SourceConnectionConfig] = None,
+    pg_source_password: Optional[object] = None,
 ) -> None:
     """Start CDC with a SINGLE-pass update that creates both connectors at once.
 
@@ -1188,6 +1261,24 @@ def run_cdc_start(
         bootstrap = deployer.get_bootstrap_brokers(cluster_arn)
         driver.log("Fetched MSK bootstrap brokers.")
         driver.stage("fetch_bootstrap", "DONE")
+
+        # PostgreSQL only: make the publication publish under the partition ROOT, BEFORE the
+        # update below can create the source connector. This is the only point that
+        # pre-empts it, and it must pre-empt it: on the routes where the effective
+        # snapshot.mode is `initial`, `publication.autocreate.mode` is `filtered` and
+        # DEBEZIUM creates the publication -- at PostgreSQL's default
+        # publish_via_partition_root=false, which it offers no property to change. pgoutput
+        # then names every change after the LEAF partition while `table.include.list` names
+        # the collapsed PARENT (the target has no partitioning), so the connector filters out
+        # and DISCARDS every change to a partitioned table: RUNNING, empty DLQ, no rows.
+        # Live-observed on Aurora PostgreSQL 17.7 -- 7 rows lost with no signal anywhere.
+        _repair_publication_via_partition_root(
+            params=params,
+            discovery=discovery,
+            source_config=pg_source_config,
+            source_password=pg_source_password,
+            driver=driver,
+        )
 
         # connector-control overrides shared by both passes. Watermark* keys are
         # never part of params.filled (they come from the separate watermark arg),

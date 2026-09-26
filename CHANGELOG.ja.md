@@ -5,6 +5,18 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.549
+
+### 修正
+
+- **CDC が PostgreSQL のパーティションテーブルへの変更をすべて静かに破棄していました。** 実際の Aurora PostgreSQL 17.7 → DSQL 実行で発見: CDC ワークロードは通常のテーブル 7 つで約 60 秒以内に収束したのに(`users` 108=108、`orders` 508=508、`order_items` 1514=1514 …)、パーティションテーブル `order_events` はソースで 7 行増え、ターゲットには **0 行**でした — コネクタは両方 `RUNNING`、DLQ も空だったので、唯一のシグナルは Validation だけでした。メカニズムは PostgreSQL 17.11 で生の pgoutput ストリームをデコードして再現しました: ツール自身の `create_publication` はすでに `publish_via_partition_root = true` を設定しますが、それは Full Load が publication をプロビジョニングする**ギャップなし経路でのみ**実行されます。**`Full Load のみ` → CDC** の開始、および **CDC-only** の開始では実効 `snapshot.mode` が `initial` で、それが `publication.autocreate.mode=filtered` を導出し — **Debezium** が publication を作成します。出荷されている 2.7.4 プラグインは属性なしの `CREATE PUBLICATION … FOR TABLE …;` を発行し、この属性を公開していないため、publication は PostgreSQL の既定値 `publish_via_partition_root = false` で作られます。その既定値では pgoutput はすべての変更を**リーフ**パーティション名で発行しますが、`table.include.list` は畳み込まれた**親**を指します(DSQL にパーティショニングはないため Full Load がリーフを 1 つのテーブルに畳みます) — そして Debezium の include フィルターはアンカーされた完全一致なので、各変更は除外されて破棄され、オフセットは前進し、誰も文句を言いません。現在はすべての PostgreSQL CDC 開始が、コネクタを作成しうる更新より**前に** publication をパーティションルート基準で発行するようにします: 不在なら属性付きで作成、存在するが false ならその場で `ALTER`(`DROP` なし — レプリケーションスロットとその位置は生き残り、すでに接続済みの walsender が新しい命名をそのまま受け取ります)、すでに true なら読み取り 1 回で書き込みなし(ギャップなし経路はそのまま)。**この修復は遡及しません**: 修復前にコミットされた変更はリーフ名でデコードされ続けるため、影響を受けたテーブルは Full Load を再実行して(冪等な `INSERT … ON CONFLICT`)取りこぼしを回復する必要があります。
+- **…そして coverage チェックがその状態を行き止まりにしていました。** `pg_publication_tables` は `publish_via_partition_root` が false のとき、登録されたパーティション親をリーフに**展開する**ビューです。そのためプリフライトがキャプチャ対象の(畳まれた)親をリーフ名と比較して「missing」と判定し、次の Start をブロックしていました — Start 自身が修復する状態なのに。現在は公開されているリーフをパーティションルートへロールアップしてから(`pg_partition_root` を使うので多段のパーティションツリーもターゲットが実際に持つテーブルまで上がります)coverage を判定し、`create_publication` のメンバーシップ突き合わせが依存する生のリーダーはそのままにしています。本当に存在しないテーブルは引き続きブロックします。
+- **この修復が Start を失敗させることはありません。** ソースの資格情報は永続化されない(Property 7)ため復元されたセッションには正当に存在しないことがあり、CDC ユーザーが publication の所有者でない場合もあります。どちらの場合も、結果と 1 つの手動ステートメント(`ALTER PUBLICATION "<name>" SET (publish_via_partition_root = true);`)を明示する警告を残し、パーティションのないすべてのテーブルで正常に動くマイグレーションを拒否しません — スロット削除についてティアダウンが使っているのと同じ契約です。MySQL ソースは完全に沈黙します: publication が存在せず、バイナリログは常に親テーブル名を記録するため、MySQL にはそもそもこの問題がありません。
+
+### セキュリティ
+
+- 監査対象のソース書き込み allowlist に `ALTER PUBLICATION` を追加します。`_assert_allowed` で末尾を厳密に `SET (publish_via_partition_root = true)` に制限します — `ALTER TABLE` が `REPLICA IDENTITY FULL` に対してすでに受けているのと同じ扱いです。`SET TABLE`、`DROP TABLE`、`OWNER TO`、`RENAME` に化けることはできません。
+
 ## v0.1.548
 
 ### 修正

@@ -65,10 +65,18 @@ _MAX_SLOT_NAME = 63
 _ALLOWED_WRITE_PREFIXES: tuple[str, ...] = (
     "CREATE PUBLICATION ",
     "DROP PUBLICATION ",
+    # Tail-constrained in ``_assert_allowed`` to the partition-root property flip, so it can
+    # never become SET TABLE / DROP TABLE / OWNER TO / RENAME. Needed because a publication
+    # DEBEZIUM created (publication.autocreate.mode=filtered) lands at PostgreSQL's default
+    # publish_via_partition_root=false, and there is no connector property to set it.
+    "ALTER PUBLICATION ",
     "SELECT LSN FROM PG_CREATE_LOGICAL_REPLICATION_SLOT",
     "SELECT PG_DROP_REPLICATION_SLOT",
     "ALTER TABLE ",
 )
+
+# The ONLY ALTER PUBLICATION this module may run.
+_PUBLICATION_VIA_ROOT_TAIL = " SET (PUBLISH_VIA_PARTITION_ROOT = TRUE)"
 
 
 class PgReplicationError(RuntimeError):
@@ -216,6 +224,13 @@ def _assert_allowed(statement: str) -> None:
             f"refused non-allowlisted ALTER TABLE (only REPLICA IDENTITY FULL): "
             f"{normalized[:60]!r}"
         )
+    if normalized.startswith("ALTER PUBLICATION ") and not normalized.endswith(
+        _PUBLICATION_VIA_ROOT_TAIL
+    ):
+        raise PgReplicationError(
+            "refused non-allowlisted ALTER PUBLICATION (only SET "
+            f"(publish_via_partition_root = true)): {normalized[:60]!r}"
+        )
 
 
 def _run_write(
@@ -292,6 +307,98 @@ def publication_tables(connection: object, name: str) -> set:
 _publication_tables = publication_tables
 
 
+def publication_publishes_via_partition_root(
+    connection: object, name: str
+) -> "Optional[bool]":
+    """Is ``name`` set to publish changes under the partition ROOT? ``None`` = no such publication.
+
+    The ONE fact :func:`publication_tables` cannot give you: that view shows the
+    CONSEQUENCE (leaves vs parent), not the setting, so a repair has to read the setting.
+    ``pubviaroot`` is PostgreSQL 13+, and this tool targets 13-18.
+    """
+    row = connection.execute(  # type: ignore[attr-defined]
+        text("SELECT pubviaroot FROM pg_publication WHERE pubname = :name"),
+        {"name": name},
+    ).first()
+    return None if row is None else bool(row[0])
+
+
+def ensure_publication_via_partition_root(
+    connection: object,
+    *,
+    name: str,
+    on_log: "Optional[Callable[[str], None]]" = None,
+) -> str:
+    """Make ``name`` publish under the partition ROOT. Returns what happened.
+
+    WHY this exists as a repair and not only as a create option: the tool's own
+    :func:`create_publication` already sets the property, but it only runs on the GAPLESS
+    route, where the Full Load provisions the publication at the consistency point. On a
+    ``Full load only`` -> CDC start, and on a CDC-only start, the effective
+    ``snapshot.mode`` is ``initial``, which derives
+    ``publication.autocreate.mode=filtered`` -- and then DEBEZIUM creates the publication.
+    The shipped 2.7.4 PostgreSQL plugin issues a bare
+    ``CREATE PUBLICATION <n> FOR TABLE <t...>;`` and exposes NO property for this, so the
+    publication lands at PostgreSQL's default ``publish_via_partition_root = false``.
+
+    Under that default, pgoutput names every change after the LEAF partition while
+    ``table.include.list`` names the collapsed PARENT (the target has no partitioning, so
+    Full Load folds the leaves into one table). Debezium's include filter is an anchored
+    full match, so every change to a partitioned table is filtered out and DISCARDED: the
+    offset advances, the connector stays RUNNING, the DLQ stays empty, and the rows simply
+    never arrive. Live-observed on Aurora PostgreSQL 17.7 (7 rows lost with no signal
+    anywhere), then reproduced on PostgreSQL 17.11 by decoding the raw pgoutput stream --
+    pre-flip the Insert carries the leaf relation, post-flip the parent.
+
+    Three idempotent outcomes: ``"created"`` (absent -> create WITH the option, which
+    :func:`create_publication` also does), ``"repaired"`` (present but false -> ``ALTER``
+    in place: no DROP, the slot and its LSN survive, and an already-connected walsender
+    picks the new relation naming up without a connector restart), ``"unchanged"``
+    (present and already true -> one read, no write, so the gapless route is untouched).
+
+    NOT retroactive. Changes COMMITTED before the repair keep decoding under the leaf name,
+    so a repair recovers nothing already missed -- re-running Full Load for the affected
+    table is what closes that gap (it is idempotent ``INSERT ... ON CONFLICT``).
+
+    Takes NO table list on purpose. On the autocreate route Debezium issues its own
+    ``ALTER PUBLICATION ... SET TABLE <table.include.list>``, so reconciling membership
+    here would turn a changed selection -- which the connector fixes by itself -- into a
+    hard failure. Coverage stays owned by :func:`pg_replication_objects_blocker`.
+    """
+    present = publication_publishes_via_partition_root(connection, name)
+    if present is True:
+        return "unchanged"
+    if present is None:
+        # An EMPTY publication carrying the property. Membership is deliberately not chosen
+        # here: on this route Debezium owns it and issues its own
+        # ``ALTER PUBLICATION ... SET TABLE <table.include.list>`` (verified behaviour --
+        # ``filtered`` alters an existing publication rather than refusing it), so creating
+        # it empty pre-sets the one property the connector cannot while leaving the table
+        # set to the component that keeps it in sync with the capture list.
+        _run_write(
+            connection,
+            f'CREATE PUBLICATION "{name}" WITH (publish_via_partition_root = true)',
+            action=(
+                f'created publication "{name}" with publish_via_partition_root = true '
+                "(the connector adds its own tables)"
+            ),
+            on_log=on_log,
+        )
+        return "created"
+    _run_write(
+        connection,
+        f'ALTER PUBLICATION "{name}" SET (publish_via_partition_root = true)',
+        action=(
+            f'repaired publication "{name}": publish_via_partition_root false -> true, so '
+            "changes to a partitioned table stream under the parent the target has (in "
+            "place -- the replication slot and its position are untouched). Changes "
+            "committed BEFORE this repair are not recovered by it."
+        ),
+        on_log=on_log,
+    )
+    return "repaired"
+
+
 @dataclass(frozen=True)
 class PgReplicationObjects:
     """What the source actually has, for a CDC-start pre-flight. All read-only facts.
@@ -310,6 +417,14 @@ class PgReplicationObjects:
     publication_tables: frozenset
     slot_present_any_database: bool
     slot_usable: bool
+    # Is the publication set to publish under the partition ROOT? ``None`` when there is no
+    # publication (UNKNOWN, never False). ``False`` is a REPAIRABLE state, not a missing
+    # table: the CDC start flips it in place before the connector exists
+    # (:func:`ensure_publication_via_partition_root`), which is why
+    # ``publication_tables`` below is rolled up to the parent rather than left as the leaves
+    # ``pg_publication_tables`` reports under that setting. Without the roll-up the coverage
+    # check reported a captured partitioned parent as MISSING and made a retry a dead end.
+    publication_via_partition_root: Optional[bool] = None
 
 
 def read_pg_replication_objects(
@@ -347,6 +462,21 @@ def read_pg_replication_objects(
     pub_n = int(row[0] or 0)
     all_dml = row[1]
     covered = publication_tables(connection, publication_name) if pub_n else set()
+    via_root = (
+        publication_publishes_via_partition_root(connection, publication_name)
+        if pub_n
+        else None
+    )
+    if via_root is False and covered:
+        # Roll each published LEAF up to its partition root. Under
+        # publish_via_partition_root=false, ``pg_publication_tables`` EXPANDS a registered
+        # partitioned parent into its leaves -- so a coverage check against the captured
+        # (collapsed) parent name found it "missing" and blocked the start, even though the
+        # parent is registered and the CDC start repairs the property before the connector
+        # exists. Compare against what the publication will EFFECTIVELY cover after that
+        # repair. The raw :func:`publication_tables` reader is left alone: the
+        # membership reconcile in :func:`create_publication` needs the unrolled view.
+        covered = {_partition_roots(connection).get(name, name) for name in covered}
     return PgReplicationObjects(
         publication_name=publication_name,
         slot_name=slot_name,
@@ -355,7 +485,28 @@ def read_pg_replication_objects(
         publication_tables=frozenset(covered),
         slot_present_any_database=int(row[2] or 0) > 0,
         slot_usable=int(row[3] or 0) > 0,
+        publication_via_partition_root=via_root,
     )
+
+
+def _partition_roots(connection: object) -> dict:
+    """``{"schema.leaf": "schema.root"}`` for every partition on the source. Read-only.
+
+    Scoped to ``relispartition`` so it stays small on a large catalog, and keyed on
+    ``pg_partition_root`` (PostgreSQL 12+; the tool targets 13-18) so a multi-level
+    partition tree rolls all the way up to the table the target actually has.
+    """
+    rows = connection.execute(  # type: ignore[attr-defined]
+        text(
+            "SELECT n.nspname || '.' || c.relname, rn.nspname || '.' || r.relname "
+            "FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "JOIN pg_class r ON r.oid = pg_partition_root(c.oid) "
+            "JOIN pg_namespace rn ON rn.oid = r.relnamespace "
+            "WHERE c.relispartition"
+        )
+    ).fetchall()
+    return {str(r[0]): str(r[1]) for r in rows}
 
 
 def pg_replication_objects_blocker(
@@ -731,6 +882,8 @@ __all__ = [
     "publication_exists",
     "slot_exists",
     "publication_tables",
+    "publication_publishes_via_partition_root",
+    "ensure_publication_via_partition_root",
     "PgReplicationObjects",
     "read_pg_replication_objects",
     "pg_replication_objects_blocker",

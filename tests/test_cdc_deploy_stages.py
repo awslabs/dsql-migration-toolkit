@@ -2177,3 +2177,101 @@ def test_a_failed_external_seed_points_at_retry_not_at_correct_configuration() -
     path_at = msg.index("must run inside the cdc-stack VPC")
     assert msg.index("retried") < path_at, "retry advice must precede the path audit"
     assert "If retrying keeps failing" in msg
+
+
+def test_start_repairs_the_publication_before_it_can_create_the_connector() -> None:
+    """The repair must run in run_cdc_start, BEFORE the update that creates the connector.
+
+    This is the wiring the live defect turned on. On the `initial`-snapshot routes DEBEZIUM
+    creates the publication (publication.autocreate.mode=filtered) at PostgreSQL's default
+    publish_via_partition_root=false, which it offers no property to change -- and then
+    pgoutput names every change after the LEAF partition while table.include.list names the
+    collapsed PARENT, so the connector filters out and DISCARDS every change to a
+    partitioned table: RUNNING, empty DLQ, no rows. Once the connector exists it is too
+    late to pre-empt, so ORDER is the assertion, not just presence.
+
+    Held structurally because the call site is what shipped untested: a primitive nothing
+    calls is dead code, and asserting only the primitive is what let this reach production.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.core import cdc_deployer
+
+    src = inspect.getsource(cdc_deployer.run_cdc_start)
+    assert "_repair_publication_via_partition_root(" in src, (
+        "run_cdc_start must repair the publication; a primitive nothing calls is dead code"
+    )
+    assert src.index("_repair_publication_via_partition_root(") < src.index(
+        "submit_update("
+    ), "the repair must precede the update that can create the source connector"
+
+    # It must be reachable with what a Start actually has: the credentials are OPTIONAL
+    # (never persisted -- Property 7), so the signature must accept them and default them.
+    sig = inspect.signature(cdc_deployer.run_cdc_start)
+    for name in ("pg_source_config", "pg_source_password"):
+        assert name in sig.parameters, name
+        assert sig.parameters[name].default is None, f"{name} must be optional"
+
+    # ...and the UI Start worker must actually pass them, from the session, for PostgreSQL.
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    ui_src = inspect.getsource(_cdc_ui._start_cdc_deploy)
+    tree = ast.parse(ui_src.strip())
+    passed = {
+        kw.arg: ast.unparse(kw.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "run_cdc_start"
+        for kw in node.keywords
+    }
+    assert passed, "run_cdc_start is not called from _start_cdc_deploy"
+    assert "pg_source_config" in passed and "pg_source_password" in passed, passed
+    assert "source_password" in passed["pg_source_password"]
+
+
+def test_the_publication_repair_never_fails_a_start() -> None:
+    """A repair that cannot run must WARN, not block — and must name the manual statement.
+
+    Absent credentials are normal (never persisted, Property 7, so a restored session has
+    none), and the CDC user may not own the publication. Refusing the Start there would
+    block a migration that works for every non-partitioned table, which is the worse
+    defect; the same contract the Delete path uses for the slot drop.
+    """
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.cdc_deployer import _repair_publication_via_partition_root
+
+    logs: list[str] = []
+    driver = SimpleNamespace(log=logs.append)
+    params = SimpleNamespace(filled=[("PgPublicationName", "dbz_pub")])
+    discovery = SimpleNamespace(current_parameters={})
+
+    # No credentials -> warn, name the consequence AND the one manual statement.
+    _repair_publication_via_partition_root(
+        params=params, discovery=discovery,
+        source_config=None, source_password=None, driver=driver,
+    )
+    warned = " ".join(logs)
+    assert "WARNING" in warned
+    assert "PARTITIONED" in warned
+    assert 'ALTER PUBLICATION "dbz_pub" SET (publish_via_partition_root = true)' in warned
+
+    # MySQL (no publication name anywhere) -> completely silent, no warning to ignore.
+    logs.clear()
+    _repair_publication_via_partition_root(
+        params=SimpleNamespace(filled=[]), discovery=SimpleNamespace(current_parameters={}),
+        source_config=None, source_password=None, driver=driver,
+    )
+    assert logs == []
+
+    # A connect/permission failure is also advisory, never fatal.
+    logs.clear()
+    boom = SimpleNamespace(source_type=None)
+    _repair_publication_via_partition_root(
+        params=params, discovery=discovery,
+        source_config=boom, source_password="pw", driver=driver,
+    )
+    assert any("WARNING" in m for m in logs)
+    assert any("publish_via_partition_root = true" in m for m in logs)

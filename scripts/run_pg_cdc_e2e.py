@@ -688,6 +688,12 @@ def stage_start_cdc(args) -> None:
             watermark=watermark,
             seed_mode="external",
             connector_timeout_seconds=args.connector_timeout,
+            # So the harness exercises the product's own publication repair -- this is the
+            # vehicle that has to prove a partitioned table actually streams, and without
+            # these it would skip the repair with a warning and pass on a source that has
+            # no partitioned table while the real shape stayed broken.
+            pg_source_config=_source_config(),
+            pg_source_password=_password(),
         )
 
     _run_cdc_job("start-cdc", work, timeout=args.connector_timeout + 600)

@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.549
+
+### 수정
+
+- **CDC가 PostgreSQL 파티션 테이블의 모든 변경을 조용히 버렸습니다.** 실제 Aurora PostgreSQL 17.7 → DSQL 실행에서 발견: CDC 워크로드가 일반 테이블 7개는 약 60초 내에 수렴했는데(`users` 108=108, `orders` 508=508, `order_items` 1514=1514 …) 파티션 테이블 `order_events`는 소스에서 7행 늘고 타깃에는 **0행**이었습니다 — 커넥터 둘 다 `RUNNING`이고 DLQ도 비어 있어서, 유일한 신호는 Validation뿐이었습니다. 메커니즘은 PostgreSQL 17.11에서 raw pgoutput 스트림을 디코딩해 재현했습니다: 도구 자신의 `create_publication`은 이미 `publish_via_partition_root = true`를 설정하지만, 그건 Full Load가 publication을 프로비저닝하는 **gapless 경로에서만** 실행됩니다. **`Full Load만` → CDC** 시작과 **CDC-only** 시작에서는 유효 `snapshot.mode`가 `initial`이고, 이것이 `publication.autocreate.mode=filtered`를 파생시켜 — **Debezium**이 publication을 만듭니다. 출하된 2.7.4 플러그인은 아무 속성 없는 `CREATE PUBLICATION … FOR TABLE …;`를 실행하고 이 속성을 노출하지 않으므로, publication은 PostgreSQL 기본값 `publish_via_partition_root = false`로 만들어집니다. 그 기본값에서 pgoutput은 모든 변경을 **리프** 파티션 이름으로 발행하는데, `table.include.list`는 접힌 **부모**를 가리킵니다(DSQL은 파티셔닝이 없어서 Full Load가 리프를 한 테이블로 접습니다) — 그리고 Debezium의 include 필터는 앵커된 완전 일치이므로 각 변경이 걸러져 버려지고, 오프셋은 전진하고, 아무도 불평하지 않습니다. 이제 모든 PostgreSQL CDC 시작이, 커넥터를 만들 수 있는 업데이트보다 **먼저** publication을 파티션 루트 기준으로 발행하게 만듭니다: 없으면 속성과 함께 생성, 있는데 false면 제자리 `ALTER`(`DROP` 없음 — 복제 슬롯과 위치가 살아남고 이미 연결된 walsender가 새 이름 규칙을 그대로 받습니다), 이미 true면 읽기 한 번에 쓰기 없음(gapless 경로는 그대로). **이 수리는 소급되지 않습니다**: 수리 전에 커밋된 변경은 계속 리프 이름으로 디코딩되므로, 영향받은 테이블은 Full Load를 다시 돌려(멱등 `INSERT … ON CONFLICT`) 놓친 것을 복구해야 합니다.
+- **…그리고 coverage 검사가 그 상태를 막다른 길로 만들었습니다.** `pg_publication_tables`는 `publish_via_partition_root`가 false일 때 등록된 파티션 부모를 리프로 **확장하는** 뷰입니다. 그래서 프리플라이트가 캡처된(접힌) 부모를 리프 이름과 비교해 "missing"으로 판정하고 다음 Start를 차단했습니다 — Start 자신이 수리하는 상태인데요. 이제 게시된 리프를 파티션 루트로 롤업한 뒤(`pg_partition_root`를 써서 다층 파티션 트리도 타깃이 실제로 가진 테이블까지 올라갑니다) coverage를 판정하고, `create_publication`의 멤버십 재조정이 의존하는 원본 리더는 그대로 둡니다. 정말로 없는 테이블은 여전히 차단합니다.
+- **이 수리는 Start를 실패시킬 수 없습니다.** 소스 자격증명은 영속화되지 않으므로(Property 7) 복원된 세션에는 정당하게 없을 수 있고, CDC 사용자가 publication 소유자가 아닐 수도 있습니다. 두 경우 모두 결과와 단일 수동 문장(`ALTER PUBLICATION "<name>" SET (publish_via_partition_root = true);`)을 명시한 경고를 남기며, 파티션 없는 모든 테이블에 대해 정상 동작하는 마이그레이션을 거부하지 않습니다 — 슬롯 드롭에 대해 teardown이 쓰는 것과 같은 계약입니다. MySQL 소스는 완전히 침묵합니다: publication이 없고, 바이너리 로그는 항상 부모 테이블 이름을 기록하므로 MySQL엔 이 문제가 애초에 없습니다.
+
+### 보안
+
+- 감사되는 소스 쓰기 allowlist에 `ALTER PUBLICATION`이 추가됩니다. `_assert_allowed`에서 tail을 정확히 `SET (publish_via_partition_root = true)`로 제한합니다 — `ALTER TABLE`이 `REPLICA IDENTITY FULL`에 대해 이미 받는 것과 같은 처리입니다. `SET TABLE`, `DROP TABLE`, `OWNER TO`, `RENAME`으로 변질될 수 없습니다.
+
 ## v0.1.548
 
 ### 수정

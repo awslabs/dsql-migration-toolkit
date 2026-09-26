@@ -4832,6 +4832,17 @@ def _start_cdc_deploy(
             watermark=watermark,
             template_body=template_body,
             seed_mode=seed_mode,
+            # PostgreSQL only: lets the Start repair a publication DEBEZIUM created, which
+            # lands at publish_via_partition_root=false and therefore makes the connector
+            # silently DISCARD every change to a partitioned table. Optional by design --
+            # absent credentials (never persisted, Property 7) downgrade to a warning rather
+            # than blocking a Start that works for every non-partitioned table.
+            pg_source_config=(
+                getattr(session, "source_config", None)
+                if _cdc_source_type(session) is SourceType.POSTGRES
+                else None
+            ),
+            pg_source_password=getattr(session, "source_password", None),
         )
 
     _action = "start CDC connectors"
