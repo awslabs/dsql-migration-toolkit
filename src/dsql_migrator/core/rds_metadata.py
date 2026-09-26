@@ -267,6 +267,49 @@ def source_vpc_mismatch_warning(
     )
 
 
+def source_inbound_rule_hint(
+    source: Optional["SourceInstanceInfo"], *, port: Optional[int]
+) -> Optional[str]:
+    """The INBOUND rule the operator must open on THEIR source DB, or ``None``. Pure.
+
+    WHY this has to be said, and said BEFORE Deploy: the cdc-stack can only ever add rules
+    to its OWN connector security group. Its source-facing rule is EGRESS (the stack has no
+    authority over the customer's database SG, and the tool will not modify a customer
+    resource), and the template's own comment concedes that "the route table + the source SG
+    inbound rules still gate what is actually reachable". So the reciprocal ingress is the
+    operator's job -- and nothing told them. When it is missing, the Debezium worker cannot
+    open a connection and the only signal is a connector that never reaches RUNNING, after a
+    billable MSK Serverless cluster and both connectors already exist.
+
+    Deliberately NOT a block and NOT a probe. The rule is frequently already satisfied (a
+    VPC-wide or broadly-open source SG), and proving otherwise would need to read the
+    customer's security groups and then trust the result -- new IAM, new machinery, and a
+    false block, which is the worse defect. This is an ``info``: it states the exact rule,
+    with the source's own SG ids filled in, so it can be checked in one look.
+
+    Silent whenever the answer is not known (no source resolved, no SG ids, no port), the
+    same best-effort contract as the rest of this module: absence of information must never
+    manufacture advice the operator cannot act on.
+    """
+    if source is None or not port:
+        return None
+    groups = tuple(g for g in (source.security_group_ids or ()) if g)
+    if not groups:
+        return None
+    where = source.db_identifier or "the source database"
+    listed = ", ".join(groups)
+    plural = "groups" if len(groups) > 1 else "group"
+    return (
+        f"The connectors run in this VPC on the cdc-stack's own security group, and the "
+        f"stack can only open its own OUTBOUND rule -- the matching INBOUND rule on your "
+        f"database is yours to set. Confirm that {where}'s security {plural} ({listed}) "
+        f"allows inbound TCP {port} from the connector subnets; allowing the VPC's CIDR is "
+        f"the simplest rule that works. If it is already open (a VPC-wide rule, for "
+        f"example) there is nothing to do. Without it the connectors are created, billed, "
+        f"and then never reach RUNNING."
+    )
+
+
 def build_rds_client(aws_profile: Optional[str], region: Optional[str]) -> object:
     """Build an RDS client from the shared session (honoring the global profile)."""
     from dsql_migrator.core.aws_session import build_session

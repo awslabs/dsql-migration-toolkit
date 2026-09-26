@@ -6097,13 +6097,25 @@ def test_an_extra_target_row_is_not_sent_through_a_reload_that_cannot_fix_it() -
     assert "Backfill them by re-running the migration" not in body
     # It states the state, the count, why a reload will not clear it, and the remedy that
     # will (a DROP + reload of that table).
-    assert "a delete did not apply" in body
+    assert "a delete never landed" in body
     assert "1 row(s) exist on the target and not on the source" in body
     assert "never removes one" in body
     assert "DROP" in body
     # ...and names the likely cause, because an extra row is otherwise undiagnosable.
     assert "REPLICA IDENTITY" in body
     assert "dead-letter" in body
+    # BOTH causes, because this signature has a second one that is not a defect at all and
+    # is the likelier on a PostgreSQL start that re-snapshotted: rows deleted on the source
+    # between the Full Load and the CDC start were never streamed as deletes, since a fresh
+    # snapshot only reports rows that still exist. Asserting one cause in the header sent
+    # that operator hunting a REPLICA IDENTITY bug that was not there.
+    # Assert the clause that INTRODUCES the second cause, not only its tail: dropping the
+    # opening sentence alone would otherwise leave the rest of the paragraph matching while
+    # the operator no longer learns that a benign explanation exists.
+    assert "benign cause with the same signature" in body
+    assert "re-snapshotted" in body
+    assert "only reports rows that still exist" in body
+    assert "activity log" in body, "the operator needs a way to tell which cause applies"
 
     # The ordinary missing-rows gap keeps the reload runbook, unchanged.
     plain = _CopyUi()

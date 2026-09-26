@@ -1516,7 +1516,8 @@ def test_connector_failed_surfaces_worker_log_guidance() -> None:
 
 def test_connector_failed_without_known_log_falls_back_to_generic() -> None:
     # No recognizable worker-log signature -> the generic FAILED message (still
-    # names the connector), never a crash.
+    # names the connector), never a crash -- and now the last log line with it, because
+    # the tail was already fetched and used to be thrown away.
     handle = _FakeHandle()
     deployer = _FakeDeployer(
         connector_states={SRC: ["CREATING", "FAILED"]},
@@ -1524,7 +1525,114 @@ def test_connector_failed_without_known_log_falls_back_to_generic() -> None:
     )
     with pytest.raises(CdcDeployError) as excinfo:
         _run_start(handle, deployer)
-    assert "FAILED" in str(excinfo.value)
+    msg = str(excinfo.value)
+    assert "FAILED" in msg
+    assert "just some unremarkable log output" in msg
+
+
+def test_unmatched_worker_log_is_repeated_instead_of_discarded() -> None:
+    """A failure nobody wrote a needle for must still say what the log said.
+
+    This was the worst outcome in the CDC flow: the tail WAS fetched, no needle matched,
+    and `_connector_failure_message` returned the bare "<connector> entered FAILED state."
+    -- so an operator who had just waited out a billable connector create had to go read
+    CloudWatch to learn anything at all. Repeating the last line is strictly more general
+    than adding needles: it cannot assert a wrong cause.
+    """
+    from dsql_migrator.core.cdc_deployer import (
+        _connector_failure_message,
+        _connector_log_excerpt,
+        _connector_timeout_message,
+    )
+
+    class _Tail:
+        def __init__(self, tail: str) -> None:
+            self.tail = tail
+
+        def connector_log_tail(self, _stack: str, _connector: str) -> str:
+            return self.tail
+
+    unknown = (
+        "INFO  framework frame that is not the cause\n"
+        "org.apache.kafka.connect.errors.ConnectException: nobody wrote a needle for this\n"
+    )
+    failed = _connector_failure_message(_Tail(unknown), "stack", SRC)
+    assert "nobody wrote a needle for this" in failed
+    assert failed.startswith(f"{SRC} entered FAILED state.")
+    # The LAST line, not the framework frame above it.
+    assert "framework frame" not in failed
+
+    # The excerpt matters MOST on the timeout path (a task that dies at startup leaves the
+    # connector in CREATING, so the state itself says nothing) -- it must survive, without
+    # the "entered FAILED state" framing, which did not happen.
+    timed = _connector_timeout_message(_Tail(unknown), "stack", SRC)
+    assert "did not reach RUNNING in time" in timed
+    assert "nobody wrote a needle for this" in timed
+    assert "entered FAILED state" not in timed
+
+    # Nothing to repeat -> exactly the old wording, on both paths.
+    assert _connector_failure_message(_Tail(""), "stack", SRC) == (
+        f"{SRC} entered FAILED state."
+    )
+    assert _connector_timeout_message(_Tail(""), "stack", SRC) == (
+        f"{SRC} did not reach RUNNING in time."
+    )
+
+    # Property 7: this excerpt reaches the UI and the downloadable activity log, so a
+    # credential-shaped token must never ride along, whatever a connector chose to log.
+    assert _connector_log_excerpt("database.password=hunter2 was rejected") == (
+        "database.password=*** was rejected"
+    )
+    assert "hunter2" not in _connector_failure_message(
+        _Tail("Secret: aws_secret_access_key=AKIAEXAMPLEhunter2\n"), "stack", SRC
+    )
+    # Unbounded stack traces cannot flood the notice.
+    assert len(_connector_log_excerpt("x" * 5000)) < 500
+
+
+def test_connection_test_needle_is_a_last_resort_not_a_network_claim() -> None:
+    """The needle must not out-rank the specific ones, and must not assert connectivity.
+
+    `Failed testing connection for {} with user '{}'` reads like "could not reach the
+    host", but in the shipped plugins it is NOT that: on PostgreSQL it is logged by the
+    catch around `checkWalLevel` in PostgresConnectorTask (the same class that carries
+    "wal_level property must be 'logical'"), and on MySQL by BinlogConnector's catch of ANY
+    SQLException around connect() + SELECT version(). So wording it as a security-group
+    problem would send the most common PostgreSQL CDC mistake -- wal_level=replica -- to
+    the VPC, and ordering it above the replication-slot needle would take that guidance
+    away from the tail that already gets it right.
+    """
+    from dsql_migrator.core.cdc_deployer import _diagnose_connector_log
+
+    wal_level = (
+        "Searching for existing replication slot\n"
+        "Failed testing connection for jdbc:postgresql://db:5432/app with user 'cdc'\n"
+        "org.postgresql.util.PSQLException: Postgres server wal_level property must be "
+        "'logical' but is: 'replica'\n"
+    )
+    # Both substrings present -> the SPECIFIC needle wins and keeps its correct advice.
+    guidance = _diagnose_connector_log(SRC, wal_level)
+    assert guidance is not None
+    assert "replication slot" in guidance
+    assert "wal_level" in guidance
+    # ...and nothing anywhere claims the worker could not connect.
+    assert "could not connect" not in guidance.lower()
+    assert "security group" not in guidance.lower()
+
+    # A tail with only the connection-test line reaches the last-resort entry, which leads
+    # with configuration and only then mentions the path.
+    only_test = (
+        "Failed testing connection for jdbc:postgresql://db:5432/app with user 'cdc'\n"
+        "Caused by: java.net.SocketTimeoutException: connect timed out\n"
+    )
+    last_resort = _diagnose_connector_log(SRC, only_test)
+    assert last_resort is not None
+    assert "connection TEST" in last_resort
+    assert "wal_level" in last_resort  # the most likely PG cause, named first
+    assert "INBOUND" in last_resort  # the path, named as the fallback check
+    # MySQL's own blocked-path needle still outranks it.
+    both = "Communications link failure\nFailed testing connection for jdbc:mysql://h/db\n"
+    assert "could not reach the source MySQL" in (_diagnose_connector_log(SRC, both) or "")
 
 
 # ---------------------------------------------------------------------------

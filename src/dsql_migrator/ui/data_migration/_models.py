@@ -126,6 +126,13 @@ def build_full_load_status_view(
 # Exactness is Validation's (step 4) job -- it runs a real COUNT(*) + reconciliation.
 _ESTIMATE_TOLERANCE = 0.20
 
+# When a measured end-to-end replication lag means the stream's leading edge has NOT caught
+# up. A live stream is always slightly behind, so this must not be near zero or every
+# healthy table reads as behind. 30s matches the threshold the connector-status chip already
+# uses to call a lag "elevated" (``lag_warn_seconds`` in :func:`cdc_connector_status`), so
+# the per-table verdict and the pipeline chip agree instead of contradicting each other.
+_LAG_BEHIND_MS = 30_000
+
 
 @dataclass(frozen=True)
 class FullLoadTableRow:
@@ -531,13 +538,29 @@ class MigrationTableStatus:
 
     @property
     def stream_caught_up(self) -> Optional[bool]:
-        """True when the target's high-water PK has reached the source's.
+        """True when the stream's leading edge has reached the source.
+
+        Reads the TIME-based ``replication_lag_ms`` first and the high-water PK only as a
+        fallback, which is the precedence that field's own docstring already declares ("the
+        accurate Stream lag signal, preferred over the MAX(pk) leading-edge fallback") and
+        that :attr:`consistency`'s docstring already promised ("combines ... the stream
+        high-water (PK) / time-based lag signals"). It did neither: the property read
+        ``pk_gap`` alone, so a table with a measured 12-minute lag was reported
+        ``"consistent"`` -- a green badge in the same row as "12m 0s behind" -- and a table
+        with no single integer PK had no leading-edge signal at all.
+
+        ``None`` lag means "no recent datapoint", which is how an IDLE or caught-up table
+        looks, so it must NOT be read as behind; the PK gap is consulted in that case. Only
+        a lag at or past :data:`_LAG_BEHIND_MS` counts as behind -- a live stream is always
+        a little behind, and calling that a problem would flag every healthy table.
 
         Independent of the row COUNT: True even if rows are missing mid-stream, as
-        long as the newest source row has landed. ``None`` when ``pk_gap`` is
-        unknown. Lets the UI say "stream caught up, but N rows missing mid-stream"
-        vs. "stream is N behind".
+        long as the leading edge has caught up. Lets the UI say "stream caught up, but N
+        rows missing mid-stream" vs. "stream is behind".
         """
+        lag = self.replication_lag_ms
+        if lag is not None:
+            return lag < _LAG_BEHIND_MS
         g = self.pk_gap
         return None if g is None else g <= 0
 
@@ -661,6 +684,13 @@ class MigrationTableStatus:
                 return "unknown" if caught is None else (
                     "consistent" if caught else "behind"
                 )
+            if caught is False:
+                # A MEASURED lag proves the leading edge has not caught up, so it outranks
+                # equal counts. Equal counts do not mean current: an UPDATE-only workload
+                # changes no count at all, and an insert/delete pair nets to zero -- so
+                # returning "consistent" here put a green badge next to the row's own
+                # "12m behind" reading and could invite a cut-over decision on stale data.
+                return "behind"
             if d == 0:
                 return "consistent"
             if d < 0:

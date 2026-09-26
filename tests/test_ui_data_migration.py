@@ -8019,6 +8019,87 @@ def test_migration_table_status_consistency_verdicts() -> None:
     assert verdict(100, 100, dlq=5) == "quarantined"
 
 
+def test_the_monitoring_legend_never_turns_a_live_metric_into_a_cutover_verdict() -> None:
+    """"caught up" must not be sold as "safe to cut over", and green must not mean done.
+
+    The Stream lag legend said `“caught up” = the target is current (safe to cut over)` --
+    the only place the tool converted a live metric into a go/no-go. It is wrong in one
+    reachable state: a table an initial snapshot has not REACHED yet has no lag datapoint,
+    so it reads "caught up" while none of its changes have arrived. The Consistency legend
+    had the matching gap: it explained only that non-green means investigate, never that
+    green does not prove the snapshot got here.
+
+    Held as constants rather than through the live-monitoring render because this is a
+    CLAIM about safety, and this repo has been burned by an `inspect.getsource` assertion
+    that passed against the author's own explanatory comment.
+    """
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+
+    lag, legend = cm._STREAM_LAG_HELP, cm._CONSISTENCY_LEGEND_HELP
+    assert "safe to cut over" not in lag
+    assert "the target is current" not in lag
+    # It must say what "caught up" can also mean, and disclaim the cut-over reading.
+    assert "snapshot has not reached this table" in lag
+    assert "not a cut-over signal on its own" in lag
+    # The reciprocal, on the badge the operator actually scans.
+    assert "does not prove the snapshot has reached this table" in legend
+    # Both must point at the authority that IS gated on.
+    assert "Validation" in legend and "cut over is gated on it" in legend
+    # ...and the one-directional reading it used to be is still there.
+    assert "any non-green badge means investigate" in legend
+
+
+def test_a_measured_lag_outranks_equal_counts_in_the_consistency_verdict() -> None:
+    """A green "consistent" badge must never sit in the same row as "12m behind".
+
+    `replication_lag_ms` documents itself as "the accurate Stream lag signal, preferred
+    over the MAX(pk) leading-edge fallback", and `consistency`'s docstring already claimed
+    to combine "the stream high-water (PK) / time-based lag signals" -- but the code read
+    `pk_gap` alone. So a measured 12-minute lag rendered `consistent`, and a table with no
+    single integer PK had no leading-edge signal at all.
+
+    Equal counts do NOT rescue it: an UPDATE-only workload changes no count, and an
+    insert/delete pair nets to zero, so the target can be equal in size and stale in
+    content -- which is exactly the state a cut-over decision must not read as green.
+    """
+    from dsql_migrator.ui.data_migration import build_migration_table_status
+
+    def row(**kw):
+        (r,) = build_migration_table_status(
+            ["t"], source_counts={"t": 100}, target_counts={"t": 100}, **kw
+        )
+        return r
+
+    twelve_min = {"t": 720_000}
+    # Exact, equal counts -- but the stream is measurably 12 minutes behind.
+    behind = row(source_is_estimate=False, replication_lag_ms=twelve_min)
+    assert behind.stream_caught_up is False
+    assert behind.consistency == "behind"
+    # Same with an estimated source, and with no integer PK to fall back on.
+    assert row(replication_lag_ms=twelve_min).consistency == "behind"
+
+    # A live stream is ALWAYS a little behind; that must stay green or every healthy
+    # table reads as a problem.
+    assert row(source_is_estimate=False, replication_lag_ms={"t": 2_000}).consistency == (
+        "consistent"
+    )
+    # No datapoint means idle/caught-up, NOT behind -- it must fall back to the PK gap.
+    assert row(source_is_estimate=False).consistency == "consistent"
+    assert row(
+        source_is_estimate=False, source_max_pk={"t": 9}, target_max_pk={"t": 4}
+    ).consistency == "behind"
+    # The DLQ still wins over a lag: missing data outranks staleness.
+    assert row(
+        source_is_estimate=False, dlq_counts={"t": 1}, replication_lag_ms=twelve_min
+    ).consistency == "quarantined"
+    # And a caught-up stream that is short on rows is still a GAP, not merely behind.
+    (short,) = build_migration_table_status(
+        ["t"], source_counts={"t": 100}, target_counts={"t": 90},
+        source_is_estimate=False, replication_lag_ms={"t": 500},
+    )
+    assert short.consistency == "gap"
+
+
 def test_estimate_source_never_claims_exact_equality_or_target_ahead() -> None:
     # The CDC status view's source figure is a scan-free information_schema ESTIMATE
     # (InnoDB index sampling), which routinely UNDERCOUNTS by several percent. It
@@ -24358,8 +24439,8 @@ def test_the_cdc_vpc_is_prefilled_from_the_source_and_only_when_empty() -> None:
 
 
 def _drive_cdc_infra_dialog(
-    monkeypatch, *, source_vpc_warning="", admission=None, net=None,
-    pg_objects_required=False,
+    monkeypatch, *, source_vpc_warning="", source_inbound_hint="", admission=None,
+    net=None, pg_objects_required=False,
 ):
     """Open the REAL Deploy-CDC-infrastructure dialog; return (notices, buttons).
 
@@ -24391,7 +24472,9 @@ def _drive_cdc_infra_dialog(
     monkeypatch.setattr(
         cdc_ui,
         "_source_vpc_warning_for_dialog",
-        lambda *_a, **_k: source_vpc_warning,
+        # Returns BOTH readings of the one DescribeDBInstances response the dialog already
+        # makes: the VPC mismatch, and the inbound rule the operator must open themselves.
+        lambda *_a, **_k: (source_vpc_warning, source_inbound_hint),
     )
     monkeypatch.setattr(
         cdc_ui, "_msk_seed_admission", lambda *_a, **_k: admission or MskSeedAdmission()
@@ -24445,7 +24528,9 @@ def _drive_cdc_infra_dialog_with_state(monkeypatch, state, *, pg_objects_require
         cdc_ui, "_diagnose_for_dialog",
         lambda *_a, **_k: ("Found existing NAT subnets.", "discovered", ""),
     )
-    monkeypatch.setattr(cdc_ui, "_source_vpc_warning_for_dialog", lambda *_a, **_k: "")
+    monkeypatch.setattr(
+        cdc_ui, "_source_vpc_warning_for_dialog", lambda *_a, **_k: ("", "")
+    )
     monkeypatch.setattr(cdc_ui, "_msk_seed_admission", lambda *_a, **_k: MskSeedAdmission())
     monkeypatch.setattr(
         cdc_ui, "_render_notice",
@@ -24478,6 +24563,31 @@ def test_the_deploy_dialog_checks_the_vpc_against_the_source_before_deploying(
     # ...and it is silent when the VPC checks out, so a normal deploy is not nagged.
     quiet, _ = _drive_cdc_infra_dialog(monkeypatch)
     assert not [n for n in quiet if n["header"] == "This is not the source's VPC"]
+
+
+def test_the_deploy_dialog_states_the_source_inbound_rule_before_the_spend(
+    monkeypatch,
+) -> None:
+    """The stack opens only its own EGRESS to the source; the ingress is the operator's.
+
+    Missing, it costs both connectors' billable create and then a connector that never
+    reaches RUNNING. It must be `info` and must NOT gate Deploy: the rule is frequently
+    already satisfied and the tool cannot tell without reading the customer's security
+    groups, so a block would be a false block -- the worse defect.
+    """
+    notices, ui = _drive_cdc_infra_dialog(
+        monkeypatch,
+        source_inbound_hint="Confirm pgtest's security group (sg-abc) allows inbound 5432.",
+    )
+    hit = [n for n in notices if n["header"] == "Check the source database's inbound rule"]
+    assert [n["tone"] for n in hit] == ["info"]
+    assert "sg-abc" in hit[0]["body"]
+    assert ui.buttons["Deploy"].enabled is True
+    # Silent when the source network could not be read -- no manufactured advice.
+    quiet, _ = _drive_cdc_infra_dialog(monkeypatch)
+    assert not [
+        n for n in quiet if n["header"] == "Check the source database's inbound rule"
+    ]
 
 
 def test_deploy_dialog_blocks_a_postgres_deploy_this_app_cannot_seed(

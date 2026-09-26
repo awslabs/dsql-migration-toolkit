@@ -274,3 +274,50 @@ def test_a_vpc_that_is_not_the_sources_warns_but_never_blocks() -> None:
     ) is None
     assert source_vpc_mismatch_warning("", source) is None
     assert source_vpc_mismatch_warning(None, source) is None
+
+
+def test_the_source_inbound_rule_is_stated_because_the_stack_cannot_open_it() -> None:
+    """The cdc-stack opens only its OWN egress, so the reciprocal ingress is the operator's.
+
+    Nothing said so before Deploy. When it is missing, both connectors are created and
+    billed and then simply never reach RUNNING -- the single most expensive way to learn
+    about a firewall rule. The tool cannot open it (a customer, assume-production resource)
+    and will not probe it (new IAM for a result it could not fully trust, and a false block
+    is the worse defect), so it STATES it, with the source's own security-group ids filled
+    in from the DescribeDBInstances response the deploy dialog already makes.
+    """
+    from dsql_migrator.core.rds_metadata import (
+        SourceInstanceInfo,
+        source_inbound_rule_hint,
+    )
+
+    source = SourceInstanceInfo(
+        security_group_ids=("sg-abc123", "sg-def456"),
+        db_identifier="pgtest-ecommerce",
+    )
+    hint = source_inbound_rule_hint(source, port=5432)
+    assert hint is not None
+    # The three facts the operator needs to act in one look: which SGs, which port, which DB.
+    assert "sg-abc123" in hint and "sg-def456" in hint
+    assert "5432" in hint
+    assert "pgtest-ecommerce" in hint
+    assert "groups" in hint, "two ids -> plural"
+    # It must say why the tool is asking rather than doing, and name the cheap rule.
+    assert "own OUTBOUND" in hint
+    assert "VPC's CIDR" in hint
+    # ...and must not imply the operator is currently broken -- it is often already open.
+    assert "nothing to do" in hint
+
+    assert "group (" in (source_inbound_rule_hint(
+        SourceInstanceInfo(security_group_ids=("sg-only",)), port=3306
+    ) or ""), "one id -> singular"
+
+    # Unknowable -> silent, the module's standing contract. A non-RDS host, a cross-account
+    # endpoint or a missing rds:DescribeDBInstances must not manufacture advice.
+    assert source_inbound_rule_hint(None, port=5432) is None
+    assert source_inbound_rule_hint(SourceInstanceInfo(), port=5432) is None
+    assert source_inbound_rule_hint(
+        SourceInstanceInfo(security_group_ids=("",)), port=5432
+    ) is None
+    assert source_inbound_rule_hint(source, port=None) is None
+    assert source_inbound_rule_hint(source, port=0) is None

@@ -4682,7 +4682,7 @@ def _render_recovery_section(
             render_notice(
                 ui,
                 tone="warning",
-                header="The target holds rows the source does not — a delete did not apply",
+                header="The target holds rows the source does not — a delete never landed",
                 body=(
                     f"{summary.extra_on_target} row(s) exist on the target and not on the "
                     "source. Re-running the Full Load will NOT clear them: it is "
@@ -4693,7 +4693,21 @@ def _render_recovery_section(
                     "REPLICA IDENTITY is DEFAULT, so the added key column arrives NULL. "
                     "Check the CDC prerequisites for that table, and check the dead-letter "
                     "queue for a unique-violation entry (an UPDATE to a re-keyed table's "
-                    "leading key column can also drop the row). To clear the extra rows, "
+                    "leading key column can also drop the row). "
+                    # The second cause, which this notice asserted away. It is not a defect
+                    # at all, and it is the LIKELIER one on a start that re-snapshotted: a
+                    # fresh snapshot only reports rows that still exist, so anything deleted
+                    # between the Full Load and the CDC start was never streamed as a
+                    # delete. The CDC start point disclosed this; Step 4 is where it shows
+                    # up, and an operator reading only this notice would hunt a
+                    # REPLICA IDENTITY bug that is not there.
+                    "There is also a benign cause with the same signature: if this CDC "
+                    "start had no replication slot to resume from, it re-snapshotted, and "
+                    "a fresh snapshot only reports rows that still exist — so rows DELETED "
+                    "on the source between the Full Load and the CDC start were never "
+                    "streamed as deletes. The CDC start point said so at the time; check "
+                    "the activity log if you are unsure which applies. "
+                    "To clear the extra rows either way, "
                     "re-run the Full Load and choose to DROP that table when it asks — "
                     "that rebuilds it from the source instead of adding to it."
                 ),

@@ -3079,9 +3079,11 @@ async def _open_cdc_infra_dialog(
     )
     # Checked here, not after Deploy: a VpcId that cannot reach the source fails only once
     # the MSK cluster exists, ~20 minutes in, and leaves a stack to tear down.
-    source_vpc_warning = await run.io_bound(
+    # `or ("", "")`: nicegui's run.io_bound returns None once the app is stopping, and
+    # unpacking that would raise out of the dialog.
+    source_vpc_warning, source_inbound_hint = await run.io_bound(
         _source_vpc_warning_for_dialog, migration_state, session
-    )
+    ) or ("", "")
     # Checked here, not after Deploy: a PostgreSQL cdc-stack is always created
     # SeedMode=External and is seeded BY THIS APP over MSK 9098, so a deployment that
     # cannot reach MSK -- or that the new cluster would not admit -- fails only at
@@ -3224,6 +3226,19 @@ async def _open_cdc_infra_dialog(
             }.get(net_kind, ("info", "lan"))
             _render_notice(
                 ui, tone=net_tone, icon=net_icon, header="Network", body=net_message
+            )
+        if source_inbound_hint:
+            # `info`, not `warning`: this is very often already satisfied and the tool
+            # cannot tell without reading the customer's security groups. Stating the rule
+            # is the whole value -- the stack opens only its own egress, so a missing
+            # ingress on the operator's database shows up as connectors that are created,
+            # billed, and never reach RUNNING.
+            _render_notice(
+                ui,
+                tone="info",
+                icon="security",
+                header="Check the source database's inbound rule",
+                body=source_inbound_hint,
             )
         if source_vpc_warning:
             # A mismatch is not a blocker -- peering / TGW / PrivateLink are legitimate --
@@ -3395,8 +3410,14 @@ def derive_cdc_vpc_from_source(migration_state, session) -> bool:
     return True
 
 
-def _source_vpc_warning_for_dialog(migration_state, session) -> str:
-    """The "this is not the source's VPC" caution for the deploy dialog, or "".
+def _source_vpc_warning_for_dialog(migration_state, session) -> tuple[str, str]:
+    """``(vpc_mismatch_warning, source_inbound_hint)`` for the deploy dialog; "" when unknown.
+
+    Returns BOTH because they come from the SAME ``DescribeDBInstances`` response this
+    already fetches and then discarded everything but the VPC id from -- so stating the
+    inbound rule the operator must open on their own database costs no extra API call and no
+    extra IAM. See :func:`~dsql_migrator.core.rds_metadata.source_inbound_rule_hint` for why
+    the tool states that rule instead of opening or probing it.
 
     Checked BEFORE Deploy because a wrong VpcId is otherwise only discovered after roughly
     twenty minutes of MSK deployment, leaving a failed stack to clean up. Read-only, and
@@ -3405,28 +3426,33 @@ def _source_vpc_warning_for_dialog(migration_state, session) -> str:
     I/O: the caller runs it via ``run.io_bound`` alongside the network diagnosis.
     """
     if session is None:
-        return ""
+        return "", ""
     source = getattr(session, "source_config", None)
     host = getattr(source, "host", None)
     if not host:
-        return ""
+        return "", ""
     vpc_id = (migration_state.cdc_infra_inputs().get("vpc_id") or "").strip()
     if not vpc_id:
-        return ""
+        return "", ""
     try:
         from dsql_migrator.core.rds_metadata import (
             build_rds_client,
             fetch_source_network,
             parse_rds_region,
+            source_inbound_rule_hint,
             source_vpc_mismatch_warning,
         )
 
         client = build_rds_client(
             getattr(session, "aws_profile", None), parse_rds_region(host)
         )
-        return source_vpc_mismatch_warning(vpc_id, fetch_source_network(client, host)) or ""
+        info = fetch_source_network(client, host)
+        return (
+            source_vpc_mismatch_warning(vpc_id, info) or "",
+            source_inbound_rule_hint(info, port=getattr(source, "port", None)) or "",
+        )
     except Exception:  # noqa: BLE001 - best effort; the dialog works without it
-        return ""
+        return "", ""
 
 
 def _msk_seed_admission(migration_state, session, *, vpc_id=None):

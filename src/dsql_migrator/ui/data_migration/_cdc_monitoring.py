@@ -69,6 +69,34 @@ from dsql_migrator.ui.design import (
 )
 from dsql_migrator.ui.data_migration import _LOGGER
 
+# The two legend strings that make a CLAIM about cut-over safety, pulled out as constants so
+# a test can hold the claim without driving the whole live-monitoring render (and so a future
+# edit cannot quietly put a go/no-go back into a live metric).
+#
+# "safe to cut over" used to be attached to "caught up" here -- the only place the tool
+# turned a live metric into a go/no-go -- and it is wrong in one reachable state: a table an
+# initial snapshot has not REACHED yet has no lag datapoint at all, so it reads "caught up"
+# while none of its changes have arrived. Cut over is gated on Validation's exact comparison,
+# never on this column.
+_STREAM_LAG_HELP = (
+    "How far behind the target is, in time — the age of the newest source change not yet "
+    "applied. “caught up” = no recent change is waiting; during an initial snapshot that "
+    "can also mean the snapshot has not reached this table yet, so it is not a cut-over "
+    "signal on its own. “N behind (PK)” is a fallback shown only when the time-based "
+    "metric isn't available yet."
+)
+# The legend stated only one direction ("non-green means investigate"). The reciprocal is
+# what a cut-over decision actually needs, and it is load-bearing on a start that
+# re-snapshots: green cannot prove the snapshot has reached this table, because a table it
+# has not reached yet has no lag datapoint and no missing-row signal either.
+_CONSISTENCY_LEGEND_HELP = (
+    "— any non-green badge means investigate. “consistent” means nothing looks wrong (the "
+    "source count is an estimate, so it is not a proven exact match), and on a start that "
+    "re-snapshots it does not prove the snapshot has reached this table; Validation "
+    "(step 4) is the exact check, and cut over is gated on it."
+)
+
+
 def _render_migration_table_status(
     ui, migration_state, job_manager, session, *, inventory=None
 ) -> None:
@@ -537,14 +565,7 @@ def _render_migration_table_status(
                 "target slightly above it is normal — the two numbers are not meant "
                 "to match exactly. Run Validation (step 4) for the exact comparison.",
             )
-            definition_row(
-                ui,
-                "Stream lag",
-                "How far behind the target is, in time — the age of the newest source "
-                "change not yet applied. “caught up” = the target is current (safe to "
-                "cut over); “N behind (PK)” is a fallback shown only when the "
-                "time-based metric isn't available yet.",
-            )
+            definition_row(ui, "Stream lag", _STREAM_LAG_HELP)
             # Consistency: the actual badge chips, colored exactly like the table's
             # body-cell-consistency slot (consistent→positive, behind→warning,
             # gap/quarantined→negative). Keep these labels/colors in sync with that
@@ -555,11 +576,9 @@ def _render_migration_table_status(
                 ui.badge("replicating…").props("color=warning outline")  # type: ignore[attr-defined]
                 ui.badge("rows missing").props("color=negative outline")  # type: ignore[attr-defined]
                 ui.badge("data quarantined").props("color=negative outline")  # type: ignore[attr-defined]
-                ui.label(  # type: ignore[attr-defined]
-                    "— any non-green badge means investigate. “consistent” means "
-                    "nothing looks wrong (the source count is an estimate, so it is "
-                    "not a proven exact match); Validation (step 4) is the exact check."
-                ).classes("text-xs text-gray-600")
+                ui.label(_CONSISTENCY_LEGEND_HELP).classes(  # type: ignore[attr-defined]
+                    "text-xs text-gray-600"
+                )
 
 def _announce_cdc_events(migration_state, status_view, ai_post_event) -> None:
     """Edge-triggered CDC activity events into the AI feed (once per transition).

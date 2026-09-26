@@ -378,7 +378,72 @@ _CONNECTOR_LOG_DIAGNOSES: tuple[tuple[str, str], ...] = (
         "rds_replication on RDS/Aurora), and that max_replication_slots is not "
         "exhausted; the connector's log line above names the specific cause.",
     ),
+    # LAST RESORT -- must stay BELOW every specific needle above, because the failure modes
+    # OVERLAP in the log tail and the first match wins.
+    #
+    # What this string actually means, from the shipped plugins rather than from its
+    # wording: on PostgreSQL `Failed testing connection for {} with user '{}'` is logged by
+    # the catch around `checkWalLevel` in PostgresConnectorTask -- the same class that holds
+    # "wal_level property must be 'logical'" -- so it fires when the connector CONNECTED
+    # and then failed a check, not only when it could not reach the host. On MySQL the same
+    # literal comes from BinlogConnector's catch of ANY SQLException around connect() +
+    # SELECT version(), which covers a wrong database name, TZ/SSL and auth-plugin errors.
+    # So this entry must NOT claim "could not connect": it names the three real causes in
+    # likelihood order and defers to the log line. (Keyed on this literal and not on
+    # pgjdbc's own "The connection attempt failed." because that one could also come from
+    # the SINK reaching DSQL; verified this literal has zero hits in dsql-sink-plugin.zip.)
+    (
+        "failed testing connection",
+        "{connector} failed its connection TEST to the source database -- it got far "
+        "enough to try, so this is usually configuration rather than the network. On "
+        "PostgreSQL the most common cause is wal_level not being 'logical' (on RDS/Aurora "
+        "set rds.logical_replication=1 AND REBOOT -- the parameter alone does nothing); on "
+        "MySQL it is usually the CDC user's credentials, privileges or database name. If "
+        "those are right, check the path: the connectors run in your VPC on the cdc-stack's "
+        "own security group, and the stack can only open its OWN egress -- so the SOURCE "
+        "database's security group must allow INBOUND on the database port from the "
+        "connector subnets. The connector log line above names the specific cause.",
+    ),
 )
+
+# How an UNMATCHED worker log is surfaced. Before this, a tail that matched no needle was
+# fetched and then DISCARDED, leaving the bare "<connector> entered FAILED state." -- the
+# single worst outcome in the CDC flow, because the operator had waited out a billable
+# connector create (up to ``connector_timeout_seconds``) and still had to go read CloudWatch
+# to learn anything at all. Repeating the last log line verbatim is strictly more general
+# than any needle: it cannot assert a wrong cause, and it covers every failure mode nobody
+# has written a needle for yet.
+_UNMATCHED_LOG_HINT = (
+    "No known failure signature matched its worker log, so its last log line is repeated "
+    "verbatim: {excerpt} — the MSK Connect log group has the full stack trace."
+)
+
+# Defensive only: the connector's password is a separate `database.password` config (Kafka
+# Connect masks Password-typed values), so it is not expected in a log line -- but this
+# excerpt is about to reach the UI and the downloadable activity log, and Property 7 says
+# credentials never land there. Cheap to scrub, so scrub.
+_SECRET_IN_LOG_RE = re.compile(
+    r"(?i)\b(password|passwd|pwd|secret|token)\b\s*[=:]\s*\S+"
+)
+_LOG_EXCERPT_MAX = 400
+
+
+def _connector_log_excerpt(log_tail: str) -> Optional[str]:
+    """The last non-empty line of a worker-log tail, scrubbed and length-bounded. Pure.
+
+    Bounded on purpose: a Java stack trace is unbounded and this string flows into a notice
+    and the activity log, so it takes the LAST line (which is where Kafka Connect puts the
+    message that killed the task, not the framework frames above it) and truncates.
+    """
+    for line in reversed((log_tail or "").splitlines()):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        scrubbed = _SECRET_IN_LOG_RE.sub(r"\1=***", stripped)
+        if len(scrubbed) > _LOG_EXCERPT_MAX:
+            scrubbed = scrubbed[:_LOG_EXCERPT_MAX].rstrip() + " …"
+        return scrubbed
+    return None
 
 
 def _connector_timeout_message(deployer, stack_name: str, connector: str) -> str:
@@ -391,10 +456,19 @@ def _connector_timeout_message(deployer, stack_name: str, connector: str) -> str
     visible ONLY in CloudWatch -- which is exactly the trip the operator should not have
     to make. Falls back to the bare timeout wording when nothing matches.
     """
+    timed_out = f"{connector} did not reach RUNNING in time."
     message = _connector_failure_message(deployer, stack_name, connector)
-    if message.endswith("entered FAILED state."):
-        return f"{connector} did not reach RUNNING in time."
-    return f"{connector} did not reach RUNNING in time. {message}"
+    bare = f"{connector} entered FAILED state."
+    if message == bare:
+        return timed_out
+    if message.startswith(bare):
+        # An unmatched-log excerpt. Keep it -- this is the path the excerpt matters MOST on
+        # (a connector whose only task died at startup sits in CREATING until the budget
+        # expires, so the state says nothing and the log is the only evidence) -- but drop
+        # the "entered FAILED state" framing, because it timed out rather than reporting
+        # FAILED. Keyed on the exact prefix, not on `endswith`, which the excerpt broke.
+        return f"{timed_out} {message[len(bare):].lstrip()}"
+    return f"{timed_out} {message}"
 
 
 def _diagnose_connector_log(connector: str, log_tail: str) -> Optional[str]:
@@ -1792,12 +1866,18 @@ def _connector_failure_message(
     Falls back to a plain "entered FAILED state" when no stack name is available
     or the worker log matches no known signature.
     """
+    bare = f"{connector} entered FAILED state."
     if stack_name:
         tail = deployer.connector_log_tail(stack_name, connector)
         guidance = _diagnose_connector_log(connector, tail)
         if guidance:
             return guidance
-    return f"{connector} entered FAILED state."
+        # Nothing matched -- but the tail was already fetched, so say what it said instead
+        # of throwing it away and reporting only the state.
+        excerpt = _connector_log_excerpt(tail)
+        if excerpt:
+            return f"{bare} {_UNMATCHED_LOG_HINT.format(excerpt=excerpt)}"
+    return bare
 
 
 # Monotonic deadline helpers kept tiny + injectable-friendly. Real time is fine
