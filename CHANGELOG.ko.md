@@ -5,6 +5,14 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.541
+
+### 수정
+
+- **도구가 직접 권고한 리모델인데도, 그리고 로더는 이미 준비돼 있었는데도 Schema Apply가 `datatype text[] not supported`로 실패했습니다.** Evaluation은 DSQL 미지원 PostgreSQL 타입을 UNSUPPORTED로 표시하고 대상까지 알려줬지만(배열 → `jsonb`, `numrange` → `text`, `money` → `numeric`, `inet`/`xml`/`bit`/geometric/`tsvector` → `text`), Schema Conversion은 "v1은 자동 치환하지 않는다"는 이유로 소스 타입을 그대로 내보냈습니다 — 그래서 `CREATE TABLE`이 반드시 거부되고, 그런 컬럼 하나가 테이블 전체와 그 인덱스까지 실패시켰습니다. 이제 변환기가 자기가 권고하는 치환을 실제로 적용하고, UNSUPPORTED 막다른 길이 아니라 MANUAL 타입 변경으로 보고합니다. 안전한 근거는 `_pg_read_expression`이 생긴 이후 데이터 경로가 이미 이 대상들로 읽어 왔다는 것입니다: 배열은 `to_jsonb`, `money`는 `numeric` 캐스트, 나머지는 텍스트 캐스트. 실제 Aurora DSQL 클러스터에서 끝까지 검증 — 변환된 `products` DDL이 적용되고, 도구 자신의 SELECT 식으로 읽은 행이 `tags`는 jsonb 배열로, `price_band`는 `'[300,400)'`로 삽입됩니다.
+- **그런 컬럼 위의 인덱스는 조용히 사라졌는데, 이제 치환 대상이 인덱싱 가능하면 함께 살아납니다.** 인덱스 필터가 "컬럼 타입이 미지원"을 기준으로 했기 때문에 `inet`이나 geometric 컬럼의 인덱스가 아무 경고 없이 없어졌습니다 — 도구가 text로 저장하라고 권고한 그 컬럼에서요. 이제 **치환된** 타입을 기준으로 합니다: `text`/`numeric`은 인덱싱 가능하므로 인덱스가 나가고, `json`/`jsonb`/`bytea`는 DSQL 데이터 타입 문서상 "Index support: No"이므로 배열의 인덱스는 계속 제외됩니다(제외된 인덱스 안내에도 그대로 이름이 남습니다). MySQL 공간 타입은 기존 bytea 처리를 유지합니다 — 치환은 PostgreSQL 전용입니다.
+- **identity 컬럼이 있는 테이블에서는 적용된 DDL 파서 3개가 모두 빈 결과를 반환했습니다.** sqlglot은 identity `CACHE` 옵션을 파싱하지 못하며(그래서 그 절을 raw 텍스트로 주입합니다) `sqlglot.parse_one`이 예외를 던져 `parse_target_column_types`·`parse_target_primary_key`·`parse_target_generated_columns`가 각각 빈 값으로 폴백했습니다. PostgreSQL identity 키가 identity 타깃을 기본값으로 갖게 된 순간(v0.1.534) 이것이 **일반적인** 경우가 됐고, 결과는 코드 자신의 주석이 경고한 그대로입니다: Full Load의 값 변환이 **소스** 타입으로 폴백해, 리모델된 컬럼의 값이 소스 타입으로 전송되고 Aurora DSQL이 불투명한 드라이버 오류로 거부했습니다. 사용자가 DDL 편집기에서 직접 바꾼 타입 remap도 같은 이유로 무시됐습니다. 이제 셋 모두 파싱 전에 identity 절을 제거합니다.
+
 ## v0.1.540
 
 ### 수정

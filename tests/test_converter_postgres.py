@@ -42,7 +42,10 @@ def test_renders_exact_pg_types_and_parses_as_postgres() -> None:
     )
     ddl = build_pg_source_ddl(table)
     assert '"public"."orders"' in ddl
-    assert '"tags" text[]' in ddl
+    # An array is SUBSTITUTED here: this string is the conversion's parse INPUT, not the
+    # source-DDL panel, and emitting `text[]` made the resulting CREATE TABLE fail at apply
+    # ("datatype text[] not supported"). The panel still shows the exact source type.
+    assert '"tags" jsonb' in ddl
     assert '"created_at" timestamp with time zone' in ddl
     assert 'PRIMARY KEY ("id")' in ddl
     # Must parse cleanly as PostgreSQL (the converter reads it with read="postgres").
@@ -174,11 +177,15 @@ def test_convert_table_warns_on_array_column_for_pg_source() -> None:
         primary_key=["id"],
     )
     conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    # An array is now SUBSTITUTED to jsonb (which the loader reads with to_jsonb), so it is
+    # a MANUAL type change rather than an UNSUPPORTED dead end -- the DDL applies.
+    assert '"tags" JSONB' in conv.target_ddl, conv.target_ddl
     array_warnings = [
         w
         for w in conv.warnings
         if w.column_name == "tags"
-        and w.classification is Classification.UNSUPPORTED
+        and "converted to jsonb" in w.message
+        and w.classification is Classification.MANUAL
         and "array" in w.message.lower()
     ]
     assert len(array_warnings) == 1
@@ -643,9 +650,12 @@ def test_pg_bit_varying_column_converts_without_aborting_table(bit_type: str) ->
     r = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
     assert "could not auto-convert" not in r.target_ddl.lower()  # not the whole-table fallback
     assert '"public"."flags"' in r.target_ddl
+    # The bit column is SUBSTITUTED to text now (it applies, and the loader reads a bit
+    # string as its text), so the note is a MANUAL type change -- still naming the original
+    # "bit varying" type, which is the half that mattered here.
     assert any(
         w.column_name == "mask"
-        and w.classification is Classification.UNSUPPORTED
+        and w.classification is Classification.MANUAL
         and "bit varying" in w.message
         for w in r.warnings
     ), r.warnings
@@ -656,9 +666,13 @@ def test_bit_varying_ddl_is_emitted_as_parseable_varbit() -> None:
     # alias; a fixed-width bit(n) already parses and is left untouched.
     from dsql_migrator.core.converter_postgres import _ddl_column_type
 
-    assert _ddl_column_type("bit varying") == "varbit"
-    assert _ddl_column_type("bit varying(10)") == "varbit(10)"
-    assert _ddl_column_type("bit(8)") == "bit(8)"
+    # Bit strings are SUBSTITUTED to text now (DSQL has no bit column type, and the loader
+    # reads a bit string as its text -- binding it to bytea stored the ASCII digits). The
+    # varbit alias rewrite is what kept the table parseable BEFORE the substitution; it is
+    # retained for a type the substitution does not cover.
+    assert _ddl_column_type("bit varying") == "text"
+    assert _ddl_column_type("bit varying(10)") == "text"
+    assert _ddl_column_type("bit(8)") == "text"
     table = TableDef(
         name="t",
         columns=[_col("id", "bigint", False), _col("m", "bit varying(8)")],
@@ -751,10 +765,11 @@ def test_pg_source_without_generated_columns_emits_no_generated_warning() -> Non
 
 
 def test_pg_unsupported_type_pk_has_no_contradictory_key_size_note() -> None:
-    # A varbit/bit-varying PRIMARY KEY converts (T4-6) and is flagged UNSUPPORTED as a column
-    # type -- so the key-size estimator must NOT also fire a contradictory ">1 KiB / the DDL
-    # itself applies fine" note (which used to be a false ~1025-byte alarm from the
-    # unbounded-varlen fallback for a type the estimator does not recognize).
+    # A bit-varying PRIMARY KEY is now SUBSTITUTED to text, so it really IS an unbounded
+    # text key and the key-size estimator's warning is CORRECT -- the contradiction this
+    # test was written for (an "applies fine" note next to an UNSUPPORTED column) is gone
+    # because the column is no longer unsupported. What must stay true is that the type
+    # change is reported once, as MANUAL.
     table = TableDef(
         name="public.t3",
         columns=[_col("flags", "bit varying(64)", nullable=False), _col("note", "text")],
@@ -762,19 +777,27 @@ def test_pg_unsupported_type_pk_has_no_contradictory_key_size_note() -> None:
     )
     r = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
     assert any(
-        w.column_name == "flags" and w.classification is Classification.UNSUPPORTED
+        w.column_name == "flags"
+        and w.classification is Classification.MANUAL
+        and "converted to text" in w.message
         for w in r.warnings
-    )
+    ), r.warnings
+    # It is a text key now, so a key-size caution is legitimate; what must NOT happen is
+    # the old FALSE alarm shape -- a note claiming the DDL "applies fine" about a column
+    # the same conversion called unsupported.
     assert not any(
-        "bytes combined" in w.message or "applies fine" in w.message for w in r.warnings
+        w.classification is Classification.UNSUPPORTED for w in r.warnings
     ), r.warnings
 
 
-@pytest.mark.parametrize("typ", ["bit varying(64)", "bytea[]", "int4range", "inet"])
-def test_pg_index_over_unsupported_column_is_not_emitted(typ: str) -> None:
-    # An index over a DSQL-unsupported PG column type (varbit, array, range, network, ...) is
-    # SKIPPED, not emitted as a doomed post-load CREATE INDEX ASYNC, and does not trigger a
-    # key-size note. The column itself is flagged UNSUPPORTED (must be remodelled).
+@pytest.mark.parametrize("typ", ["bytea[]", "text[]", "bytea"])
+def test_pg_index_over_an_unindexable_column_is_not_emitted(typ: str) -> None:
+    """An index is skipped when the column's TARGET type cannot be indexed on DSQL.
+
+    Per the DSQL supported-data-types page json/jsonb and bytea have "Index support: No",
+    so an array (substituted to jsonb) or a bytea keeps its index skipped rather than
+    emitting a doomed post-load CREATE INDEX ASYNC.
+    """
     from dsql_migrator.core.models import IndexDef
 
     table = TableDef(
@@ -784,19 +807,40 @@ def test_pg_index_over_unsupported_column_is_not_emitted(typ: str) -> None:
         indexes=[IndexDef(name="ix_c", columns=["c"], unique=False)],
     )
     r = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
-    assert not any("ix_c" in d for d in r.index_ddls)  # doomed index skipped
+    assert not any("ix_c" in d for d in r.index_ddls), r.index_ddls
     assert not any("bytes combined" in w.message for w in r.warnings)
-    assert any(
-        w.column_name == "c" and w.classification is Classification.UNSUPPORTED
-        for w in r.warnings
+
+
+@pytest.mark.parametrize("typ", ["bit varying(64)", "int4range", "inet", "xml"])
+def test_pg_index_over_a_substituted_but_indexable_column_IS_emitted(typ: str) -> None:
+    """These used to be dropped silently along with the column's "unsupported" verdict.
+
+    Each is now substituted to an INDEXABLE target (text), so the column migrates and its
+    index migrates with it -- previously the operator lost the index with no warning, on a
+    column the tool then told them to store as text anyway.
+    """
+    from dsql_migrator.core.models import IndexDef
+
+    table = TableDef(
+        name="public.t",
+        columns=[_col("id", "bigint", False), _col("c", typ)],
+        primary_key=["id"],
+        indexes=[IndexDef(name="ix_c", columns=["c"], unique=False)],
     )
+    r = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    assert any("ix_c" in d for d in r.index_ddls), r.index_ddls
+    # ... and the type change is still reported, as MANUAL rather than UNSUPPORTED.
+    assert any(
+        w.column_name == "c" and w.classification is Classification.MANUAL
+        for w in r.warnings
+    ), r.warnings
 
 
 def test_pg_geometric_key_column_is_not_mislabeled_as_bytea() -> None:
     # PG reuses the names point/polygon (which appear in the MySQL _SPATIAL_TYPES set), but a
-    # PG source does NOT substitute them to bytea -- so a point key/index must NOT get the
-    # MySQL "convert to bytea" wording. It is surfaced as an UNSUPPORTED column type (store as
-    # text) and its index is skipped.
+    # PG source must NOT get the MySQL "convert to bytea" wording: it is substituted to
+    # TEXT (its canonical form), which is indexable -- so unlike the MySQL spatial path the
+    # index now survives with the column.
     from dsql_migrator.core.models import IndexDef
 
     table = TableDef(
@@ -806,10 +850,11 @@ def test_pg_geometric_key_column_is_not_mislabeled_as_bytea() -> None:
         indexes=[IndexDef(name="ix_loc", columns=["loc"], unique=False)],
     )
     r = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
-    assert not any("ix_loc" in d for d in r.index_ddls)  # geometric index skipped
+    assert any("ix_loc" in d for d in r.index_ddls), r.index_ddls  # text IS indexable
     assert not any("bytea" in w.message.lower() for w in r.warnings)  # not mislabeled bytea
+    assert '"loc" TEXT' in r.target_ddl, r.target_ddl
     assert any(
-        w.column_name == "loc" and w.classification is Classification.UNSUPPORTED
+        w.column_name == "loc" and w.classification is Classification.MANUAL
         for w in r.warnings
     )
 
@@ -1171,17 +1216,21 @@ def test_an_index_skipped_for_an_unsupported_pg_type_is_named_not_silent() -> No
         ],
     )
     conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
-    # The supported index still ships; the two unsupported ones do not.
-    assert len(conv.index_ddls) == 1 and "idx_note" in conv.index_ddls[0]
+    # inet is substituted to TEXT, which is indexable, so its index now ships too -- it used
+    # to be dropped silently. Only the array (-> jsonb, "Index support: No") is skipped.
+    assert len(conv.index_ddls) == 2, conv.index_ddls
+    assert any("idx_note" in d for d in conv.index_ddls)
+    assert any("idx_ip" in d for d in conv.index_ddls)
+    assert not any("idx_tags" in d for d in conv.index_ddls)
 
     skipped = [w for w in conv.warnings if "were NOT emitted because" in w.message]
     assert len(skipped) == 1, [w.message for w in conv.warnings]
     message = skipped[0].message
-    assert "idx_ip (on client_ip inet)" in message, message
     assert "idx_tags (on tags text[])" in message, message
+    assert "idx_ip" not in message, message  # it ships now, so it must not be listed
     # Remodelling the column is NOT sufficient -- say so, or the index stays missing.
     assert "not enough on its own" in message, message
-    assert "2 secondary index(es)" in message, message
+    assert "1 secondary index(es)" in message, message
 
 
 def test_a_table_with_no_unsupported_index_column_gets_no_such_warning() -> None:
@@ -1650,3 +1699,113 @@ def test_only_a_label_of_the_type_itself_is_carried_as_the_enum_default() -> Non
     emitted, note = pg_column_default_sql(column, is_key_column=False)
     assert emitted is None
     assert note and "ecommerce.order_status" in note, note
+
+
+def test_a_dsql_unsupported_pg_type_is_substituted_so_the_ddl_applies() -> None:
+    """Schema Apply failed with "datatype text[] not supported" on a remodel the tool
+    itself recommended and the loader was already prepared for.
+
+    Evaluation said UNSUPPORTED and named the target (array -> jsonb, numrange -> text,
+    money -> numeric, ...), but the converter emitted the source type verbatim on the ground
+    that "v1 does not auto-substitute" -- so the CREATE TABLE was guaranteed to be rejected.
+    The data path has read these targets since ``_pg_read_expression`` existed
+    (``to_jsonb`` for an array, ``CAST(... AS numeric)`` for money, a text cast otherwise),
+    so the substitution is what the tool was already promising.
+
+    Verified end to end on a live Aurora DSQL cluster: the converted products DDL applies,
+    and a row read through the tool's own SELECT expressions inserts -- tags land as a jsonb
+    array (jsonb_array_length = 3) and numrange as '[300,400)'.
+    """
+    from dsql_migrator.core.converter import SchemaConverter
+    from dsql_migrator.core.converter_postgres import substitute_pg_unsupported_type
+    from dsql_migrator.core.models import ColumnDef, SourceType, TableDef
+
+    for source, target in (
+        ("text[]", "jsonb"),
+        ("integer[]", "jsonb"),
+        ("numrange", "text"),
+        ("int4range", "text"),
+        ("money", "numeric"),
+        ("inet", "text"),
+        ("cidr", "text"),
+        ("xml", "text"),
+        ("bit(8)", "text"),
+        ("bit varying", "text"),
+        ("tsvector", "text"),
+        ("point", "text"),
+    ):
+        got, note = substitute_pg_unsupported_type(source)
+        assert got == target, (source, got)
+        assert note and f"converted to {target}" in note, (source, note)
+        # The note must say what the application has to change, not just the new type.
+        assert "application" in note, (source, note)
+
+    # Types DSQL supports are untouched, and so is a user-defined kind (an enum has its own
+    # text+CHECK path; a composite/domain must not be guessed at).
+    for unchanged in ("text", "numeric(12,2)", "jsonb", "bytea", "timestamp with time zone"):
+        assert substitute_pg_unsupported_type(unchanged) == (None, None), unchanged
+    # A user-defined kind is excluded even when its NAME collides with a substitutable base
+    # type (a domain may legally be called `money`): an enum has its own text+CHECK path,
+    # and a composite/domain must not be silently retyped on a name match.
+    for kind in ("enum", "composite", "domain"):
+        assert substitute_pg_unsupported_type("ecommerce.x", type_kind=kind) == (None, None)
+        assert substitute_pg_unsupported_type("money", type_kind=kind) == (None, None), kind
+        assert substitute_pg_unsupported_type("inet", type_kind=kind) == (None, None), kind
+
+    # End to end: the emitted DDL carries the substitutes, reported as MANUAL type changes
+    # rather than UNSUPPORTED dead ends.
+    table = TableDef(
+        name="ecommerce.products",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="tags", mysql_type="text[]"),
+            ColumnDef(name="price_band", mysql_type="numrange"),
+            ColumnDef(name="ip", mysql_type="inet"),
+        ],
+        primary_key=["id"],
+    )
+    conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    assert '"tags" JSONB' in conv.target_ddl, conv.target_ddl
+    assert '"price_band" TEXT' in conv.target_ddl, conv.target_ddl
+    assert '"ip" TEXT' in conv.target_ddl, conv.target_ddl
+    assert not any(
+        w.classification is Classification.UNSUPPORTED for w in conv.warnings
+    ), conv.warnings
+
+
+def test_the_read_expression_matches_the_type_the_converter_now_emits() -> None:
+    """The substitution is only safe because the EXPORTER reads into the new type.
+
+    ``_pg_read_expression`` keys on the APPLIED target type, so if the converter's choice
+    and the reader's expectation ever diverge the value arrives in the source type and DSQL
+    rejects it with an opaque driver error -- the exact failure the substitution is meant to
+    remove. This pins them together.
+    """
+    from dsql_migrator.core.converter import SchemaConverter, parse_target_column_types
+    from dsql_migrator.core.converter_postgres import substitute_pg_unsupported_type
+    from dsql_migrator.core.models import ColumnDef, SourceType, TableDef
+    from dsql_migrator.core.source_dialect.postgres import PostgresSourceDialect
+
+    columns = [ColumnDef(name="id", mysql_type="bigint", nullable=False)] + [
+        ColumnDef(name=f"c{i}", mysql_type=t)
+        for i, t in enumerate(("text[]", "numrange", "money", "inet"))
+    ]
+    table = TableDef(name="s.t", columns=columns, primary_key=["id"])
+    conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    applied = parse_target_column_types(conv.target_ddl)
+    dialect = PostgresSourceDialect()
+
+    for column in columns[1:]:
+        expected = substitute_pg_unsupported_type(column.mysql_type)[0]
+        # The applied DDL really carries the substitute (this is what the loader reads).
+        # `numeric` round-trips through sqlglot as its `decimal` alias, which the reader
+        # accepts as the same target -- so the pair is treated as equivalent here.
+        equivalent = {"numeric": {"numeric", "decimal"}}.get(expected, {expected})
+        assert applied.get(column.name) in equivalent, (column.mysql_type, applied)
+        read = dialect.select_column_sql(column, target_type=applied.get(column.name))
+        if expected == "jsonb":
+            assert "to_jsonb(" in read, read
+        elif expected == "numeric":
+            assert "AS numeric)" in read, read
+        else:
+            assert "AS text)" in read, read

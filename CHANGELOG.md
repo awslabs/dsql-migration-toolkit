@@ -5,6 +5,14 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.541
+
+### Fixed
+
+- **Schema Apply failed with `datatype text[] not supported` on a remodel the tool itself recommended and the loader was already prepared for.** Evaluation flagged a DSQL-unsupported PostgreSQL type UNSUPPORTED and named the target (array → `jsonb`, `numrange` → `text`, `money` → `numeric`, `inet`/`xml`/`bit`/geometric/`tsvector` → `text`), but Schema Conversion emitted the source type verbatim on the stated ground that "v1 does not auto-substitute" — so the `CREATE TABLE` was guaranteed to be rejected, and one such column failed the whole table plus its indexes. The converter now emits the substitute it recommends, reported as a MANUAL type change rather than an UNSUPPORTED dead end. This is safe because the data path has read these targets ever since `_pg_read_expression` existed: an array is read with `to_jsonb`, `money` with a `numeric` cast, the rest with a text cast. Verified end to end on a live Aurora DSQL cluster — the converted `products` DDL applies, and a row read through the tool's own SELECT expressions inserts with `tags` as a jsonb array and `price_band` as `'[300,400)'`.
+- **An index over such a column was dropped silently; now it survives when the substitute is indexable.** The index filter keyed on "the column type is unsupported", so an index over an `inet` or geometric column disappeared with no warning — on a column the tool then told the operator to store as text. It now keys on the SUBSTITUTED type: `text`/`numeric` are indexable so the index ships, while `json`/`jsonb`/`bytea` have "Index support: No" per the DSQL data-types page, so an array's index stays skipped (and is still named in the skipped-index note). A MySQL spatial column keeps its existing bytea treatment — the substitution is PostgreSQL-only.
+- **All three applied-DDL parsers returned nothing for any table with an identity column.** sqlglot cannot parse the identity `CACHE` option — which is exactly why the clause is injected as raw text — so `sqlglot.parse_one` raised and `parse_target_column_types`, `parse_target_primary_key` and `parse_target_generated_columns` each fell back to empty. That became the COMMON case the moment a PostgreSQL identity key started defaulting to an identity target (v0.1.534), and the consequence is the one the code's own comment warns about: Full Load's value conversion fell back to the SOURCE type, so a remodelled column had its value sent in the source type and Aurora DSQL rejected it with an opaque driver error. A user's own type remap in the DDL editor was ignored for the same reason. All three now strip the identity clause before parsing.
+
 ## v0.1.540
 
 ### Fixed

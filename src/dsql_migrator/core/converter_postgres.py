@@ -394,6 +394,92 @@ def clamp_pg_character(pg_type: str) -> "tuple[str, Optional[str]]":
     )
 
 
+# The DSQL type each unsupported PostgreSQL type is SUBSTITUTED with, and why that
+# substitution is safe on the DATA path (not just the DDL). Every target here is one
+# ``_pg_read_expression`` already knows how to read the source value into:
+#   an array  -> jsonb    read as CAST(to_jsonb(col) AS text)
+#   money     -> numeric  read as CAST(col AS numeric)  (its locale-formatted text is lossy)
+#   the rest  -> text     read as CAST(col AS text)     (the type's canonical form)
+# Emitting the source type verbatim instead -- which is what the tool used to do, on the
+# stated ground that "v1 does not auto-substitute" -- guaranteed a FAILED apply
+# ("datatype text[] not supported"), for a remodel the tool itself was recommending and the
+# loader was already prepared for. `bytea` is deliberately NOT a fallback: the loader reads
+# a bit string as its TEXT, so binding it to bytea stored the ASCII digits of "10101010"
+# rather than the byte 0xAA.
+_PG_SUBSTITUTE_TARGET = {
+    "money": "numeric",
+    "inet": "text",
+    "cidr": "text",
+    "macaddr": "text",
+    "macaddr8": "text",
+    "xml": "text",
+    "bit": "text",
+    "bit varying": "text",
+    "varbit": "text",
+    "tsvector": "text",
+    "tsquery": "text",
+    "point": "text",
+    "line": "text",
+    "lseg": "text",
+    "box": "text",
+    "path": "text",
+    "polygon": "text",
+    "circle": "text",
+}
+
+
+def substitute_pg_unsupported_type(
+    pg_type: str,
+    *,
+    type_kind: "Optional[str]" = None,
+) -> "tuple[Optional[str], Optional[str]]":
+    """The DSQL type to emit instead of a DSQL-unsupported one, with a warning.
+
+    Returns ``(target_type, note)``, or ``(None, None)`` when the type needs no
+    substitution or none is safe. The note states the type CHANGE the application has to
+    follow -- the substitution keeps the data, not the type.
+
+    A user-defined kind is excluded: an enum is handled by its own text+CHECK path, and a
+    composite / range NAME cannot be read off the type string reliably enough to pick a
+    target (a range IS handled, by base name, below).
+    """
+    if not pg_type:
+        return None, None
+    if type_kind in ("enum", "composite", "domain"):
+        return None, None
+    stripped = pg_type.strip()
+    if stripped.endswith("[]"):
+        return "jsonb", (
+            f"Column type {stripped} was converted to jsonb: Aurora DSQL has no array "
+            "column type. The values are preserved as a JSON array (Full Load reads them "
+            "with to_jsonb), and jsonb is queryable with the JSON operators -- but the "
+            "application must stop using array operators/indexing on this column. A child "
+            "table keyed by this row's primary key is the alternative if you need to index "
+            "or join on the elements."
+        )
+    base = normalize_pg_base_type(stripped)
+    if base in _PG_RANGE_TYPES:
+        return "text", (
+            f"Column type {stripped} was converted to text: Aurora DSQL has no range "
+            "column type. The value is preserved in its canonical form (e.g. '[1,5)'), so "
+            "nothing is lost, but range operators (@>, &&, lower(), upper()) no longer "
+            "work -- parse it in the application, or split it into two bound columns."
+        )
+    target = _PG_SUBSTITUTE_TARGET.get(base)
+    if target is None:
+        return None, None
+    detail = (
+        "the exact amount is preserved; its locale-formatted text is not used"
+        if base == "money"
+        else "the value is preserved in its canonical text form"
+    )
+    return target, (
+        f"Column type {stripped} was converted to {target}: Aurora DSQL does not support "
+        f"{base} as a column type. {detail[0].upper() + detail[1:]}, but the type changed, "
+        "so any operator or function specific to it must be replaced in the application."
+    )
+
+
 def _ddl_column_type(pg_type: str) -> str:
     """The type string to emit in the rebuilt ``CREATE TABLE`` (usually verbatim).
 
@@ -413,6 +499,14 @@ def _ddl_column_type(pg_type: str) -> str:
     which DSQL accepts, and the data is preserved (source values are already rounded to
     the declared precision). Plain ``interval`` (no modifier) is unaffected.
     """
+    # Substitute a DSQL-unsupported type with the target the tool recommends FIRST, so the
+    # emitted DDL APPLIES instead of failing ("datatype text[] not supported"). It has to
+    # precede the bit-varying alias rewrite below, which returns early -- otherwise a bit
+    # string kept a type DSQL does not have. The data path already reads the source value
+    # into these targets -- see substitute_pg_unsupported_type.
+    substituted = substitute_pg_unsupported_type(pg_type)[0]
+    if substituted is not None:
+        return substituted
     lowered = pg_type.lower()
     if lowered.startswith("interval"):
         return _TYPE_MODIFIER_RE.sub("", pg_type).rstrip()

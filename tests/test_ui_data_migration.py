@@ -26045,7 +26045,10 @@ def test_the_converter_reads_consume_engine_independent_values_today() -> None:
     pg_ddl = "\n".join(types[SourceType.POSTGRES])
     my_ddl = "\n".join(types[SourceType.MYSQL])
     assert "TIMESTAMPTZ" in my_ddl and "TIMESTAMPTZ" not in pg_ddl
-    assert "BIT(1)" in pg_ddl and "BIT(1)" not in my_ddl
+    # A PG bit(1) is SUBSTITUTED to text (DSQL has no bit column type and the loader reads
+    # a bit string as its text), while the MySQL side maps bit(1) to boolean -- so the two
+    # still diverge, which is the point of this assertion.
+    assert '"flag" TEXT' in pg_ddl and '"flag" SMALLINT' in my_ddl
 
 
 def test_the_full_load_only_tile_discloses_the_pg_gapless_forfeit() -> None:

@@ -884,8 +884,17 @@ def parse_target_column_types(create_ddl: str) -> dict[str, str]:
     not a parseable ``CREATE TABLE`` (the caller then falls back to the
     source-derived mapping).
     """
+    # Strip the identity clause FIRST -- see _IDENTITY_CLAUSE_RE. sqlglot's postgres
+    # reader raises on the CACHE option, so before this EVERY table with an identity
+    # column returned {} and the Full Load value conversion silently fell back to the
+    # SOURCE type. That is exactly the failure this function exists to prevent: a
+    # remodelled column (array -> jsonb, money -> numeric) had its value sent in the
+    # source type and DSQL rejected it with an opaque driver error. It became the common
+    # case when a PostgreSQL identity key started defaulting to an identity target.
     try:
-        parsed = sqlglot.parse_one(create_ddl, read="postgres")
+        parsed = sqlglot.parse_one(
+            _IDENTITY_CLAUSE_RE.sub("", create_ddl or ""), read="postgres"
+        )
     except Exception:  # noqa: BLE001 - unparseable DDL -> no overrides (safe default)
         return {}
     if not isinstance(parsed, exp.Create):
@@ -976,7 +985,12 @@ def parse_target_primary_key(create_ddl: str) -> list[str]:
     loudly on disagreement (see the Full Load engine wiring).
     """
     try:
-        parsed = sqlglot.parse_one(create_ddl, read="postgres")
+        # Same identity-clause strip as the sibling parsers: without it a table
+        # whose target key is an identity column reported NO primary key, so the
+        # loader fell back to the source key for its ON CONFLICT target.
+        parsed = sqlglot.parse_one(
+            _IDENTITY_CLAUSE_RE.sub("", create_ddl or ""), read="postgres"
+        )
     except Exception:  # noqa: BLE001 - unparseable DDL -> unknown (empty list)
         return []
     if not isinstance(parsed, exp.Create):
@@ -1680,7 +1694,7 @@ _BINARY_BASE_TYPES = frozenset(
 )
 
 
-def _maps_to_bytea(column: ColumnDef) -> bool:
+def _maps_to_bytea(column: ColumnDef, *, is_postgres: bool = False) -> bool:
     """Return True when ``column`` converts to DSQL ``bytea``.
 
     That is the BINARY/VARBINARY/BLOB family and every MySQL spatial type, plus the
@@ -1692,6 +1706,20 @@ def _maps_to_bytea(column: ColumnDef) -> bool:
     """
     tokens = column.mysql_type.strip().lower().replace("(", " ").split()
     base = tokens[0] if tokens else ""
+    # PostgreSQL reuses the geometric names (point, polygon, ...) that MySQL's spatial set
+    # also holds, but a PG source SUBSTITUTES them to text -- which IS indexable -- so
+    # treating them as bytea dropped the index off a column that had become a perfectly
+    # good text key. Only the genuine PG bytea keeps that treatment; the check is by
+    # substitution, so it needs no PG flag threaded through every caller.
+    if is_postgres and base in _SPATIAL_TYPES and base != "bytea":
+        from dsql_migrator.core.converter_postgres import (
+            substitute_pg_unsupported_type,
+        )
+
+        if substitute_pg_unsupported_type(
+            column.mysql_type, type_kind=column.type_kind
+        )[0] not in (None, "bytea"):
+            return False
     return base in _BINARY_BASE_TYPES or base in _SPATIAL_TYPES or base == "bytea"
 
 
@@ -1886,18 +1914,37 @@ def _pg_unsupported_key_columns(table: TableDef) -> set[str]:
     :func:`_maps_to_bytea`. PG-only: :func:`unsupported_dsql_reason` expects a PG type and
     must never be applied to a MySQL type string.
     """
-    from dsql_migrator.core.converter_postgres import unsupported_dsql_reason
+    from dsql_migrator.core.converter_postgres import (
+        substitute_pg_unsupported_type,
+        unsupported_dsql_reason,
+    )
 
-    return {
-        column.name
-        for column in table.columns
-        if unsupported_dsql_reason(
-            column.mysql_type,
-            type_kind=column.type_kind,
-            enum_labels=column.enum_labels,
+    # A SUBSTITUTED column is a valid DSQL column, so it is no longer excluded on the
+    # "not a column type" ground -- but the substitute may still be UNINDEXABLE. Per the
+    # DSQL supported-data-types page, json/jsonb and bytea have "Index support: No", so an
+    # array substituted to jsonb must keep its index skipped or the CREATE INDEX ASYNC is
+    # a doomed statement; text/numeric substitutes ARE indexable and their index is now
+    # correctly emitted (an index over an inet column used to be dropped silently).
+    unindexable_substitutes = {"json", "jsonb", "bytea"}
+    excluded: set[str] = set()
+    for column in table.columns:
+        substituted, _note = substitute_pg_unsupported_type(
+            column.mysql_type, type_kind=column.type_kind
         )
-        is not None
-    }
+        if substituted is not None:
+            if substituted in unindexable_substitutes:
+                excluded.add(column.name)
+            continue
+        if (
+            unsupported_dsql_reason(
+                column.mysql_type,
+                type_kind=column.type_kind,
+                enum_labels=column.enum_labels,
+            )
+            is not None
+        ):
+            excluded.add(column.name)
+    return excluded
 
 
 def _emittable_secondary_indexes(
@@ -1915,7 +1962,11 @@ def _emittable_secondary_indexes(
     # DSQL cannot index a bytea column ("datatype bytea is not supported in a key"), so an
     # index over a BINARY/VARBINARY/BLOB/spatial column is skipped (reported by
     # _bytea_key_warning / _unsupported_index_type_warning).
-    skip_columns = {column.name for column in table.columns if _maps_to_bytea(column)}
+    skip_columns = {
+        column.name
+        for column in table.columns
+        if _maps_to_bytea(column, is_postgres=is_postgres)
+    }
     # A PG source also has DSQL-unsupported COLUMN types (varbit, arrays, geometric, ...)
     # that cannot be a valid column, let alone indexed -- skip an index over them too.
     if is_postgres:
@@ -3029,7 +3080,11 @@ def _key_size_warning(
     # ("datatype bytea is not supported in a key"), reported by _bytea_key_warning.
     # Skip those keys/indexes here so this note does not contradict it by claiming
     # "the DDL itself applies fine" for a key DSQL refuses (and an index we do not emit).
-    skip_columns = {column.name for column in table.columns if _maps_to_bytea(column)}
+    skip_columns = {
+        column.name
+        for column in table.columns
+        if _maps_to_bytea(column, is_postgres=is_postgres)
+    }
     # Likewise for a PG source's DSQL-unsupported column types (varbit, arrays, geometric):
     # the CREATE TABLE is already UNSUPPORTED for that column, so a key-size "applies fine"
     # note would contradict it -- and the width estimate would be a false >1 KiB alarm from
@@ -3993,6 +4048,7 @@ class SchemaConverter:
             from dsql_migrator.core.converter_postgres import (
                 clamp_pg_character,
                 clamp_pg_numeric,
+                substitute_pg_unsupported_type,
                 pg_column_default_sql,
                 unconstrained_numeric_note,
                 unsupported_dsql_reason,
@@ -4036,6 +4092,26 @@ class SchemaConverter:
                                 "value later is ALTER TABLE ... DROP/ADD CONSTRAINT rather "
                                 "than ALTER TYPE ... ADD VALUE."
                             ),
+                        )
+                    )
+                    continue
+                # A type the converter SUBSTITUTES is no longer unsupported: the emitted
+                # DDL applies and the loader reads the value into the new type, so grading
+                # it UNSUPPORTED alongside the types that genuinely cannot be migrated was
+                # both wrong and the reason the apply failed ("datatype text[] not
+                # supported") on a remodel the tool itself recommended.
+                substituted, substitute_note = substitute_pg_unsupported_type(
+                    column.mysql_type, type_kind=column.type_kind
+                )
+                if substituted is not None and substitute_note is not None:
+                    warnings.append(
+                        ConversionWarning(
+                            object_name=table.name,
+                            column_name=column.name,
+                            source_type=column.mysql_type,
+                            target_type=substituted,
+                            classification=Classification.MANUAL,
+                            message=substitute_note,
                         )
                     )
                     continue

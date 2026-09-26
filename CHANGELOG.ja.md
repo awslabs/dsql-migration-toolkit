@@ -5,6 +5,14 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.541
+
+### 修正
+
+- **ツール自身が推奨したリモデルであり、ローダーも既に対応していたのに、Schema Apply が `datatype text[] not supported` で失敗していました。** Evaluation は DSQL 非対応の PostgreSQL 型を UNSUPPORTED とし対象も示していました(配列 → `jsonb`、`numrange` → `text`、`money` → `numeric`、`inet`/`xml`/`bit`/幾何/`tsvector` → `text`)が、Schema Conversion は「v1 は自動置換しない」という理由でソース型をそのまま出力していました — そのため `CREATE TABLE` は必ず拒否され、そうした列 1 つがテーブル全体とそのインデックスまで失敗させていました。現在はコンバーターが自ら推奨する置換を実際に適用し、UNSUPPORTED の行き止まりではなく MANUAL の型変更として報告します。安全な根拠は、`_pg_read_expression` が存在して以来データ経路がすでにこれらの対象へ読み込んでいたことです: 配列は `to_jsonb`、`money` は `numeric` キャスト、その他はテキストキャスト。実際の Aurora DSQL クラスターで一通り検証 — 変換後の `products` DDL が適用され、ツール自身の SELECT 式で読んだ行が `tags` は jsonb 配列、`price_band` は `'[300,400)'` として挿入されます。
+- **そうした列のインデックスは黙って失われていましたが、置換先がインデックス可能なら一緒に残ります。** インデックスのフィルターが「列の型が非対応」を基準にしていたため、`inet` や幾何型の列のインデックスが警告なしに消えていました — ツールが text で保存せよと推奨したその列で。現在は **置換後** の型を基準にします: `text`/`numeric` はインデックス可能なのでインデックスが出力され、`json`/`jsonb`/`bytea` は DSQL のデータ型ページで「Index support: No」なので配列のインデックスは引き続きスキップされます(スキップされたインデックスの案内には名前が残ります)。MySQL の空間型は従来の bytea 扱いを維持します — 置換は PostgreSQL 専用です。
+- **identity 列を持つテーブルでは、適用済み DDL のパーサー 3 つがすべて空を返していました。** sqlglot は identity の `CACHE` オプションを解析できず(だからこの句は生テキストとして注入されます)`sqlglot.parse_one` が例外を投げ、`parse_target_column_types`・`parse_target_primary_key`・`parse_target_generated_columns` がそれぞれ空にフォールバックしていました。PostgreSQL の identity キーが identity ターゲットを既定とした瞬間(v0.1.534)にこれが **通常の** ケースになり、結果はコード自身のコメントが警告していたとおりです: Full Load の値変換が **ソース** 型にフォールバックし、リモデルされた列の値がソース型で送られて Aurora DSQL が不透明なドライバーエラーで拒否しました。利用者が DDL エディタで行った型の差し替えも同じ理由で無視されていました。現在は 3 つすべてが解析前に identity 句を除去します。
+
 ## v0.1.540
 
 ### 修正
