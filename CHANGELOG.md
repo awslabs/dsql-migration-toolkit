@@ -5,6 +5,15 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.539
+
+### Fixed
+
+- **A Generate that converted nothing locked the button behind "Reset all", so a mis-tick cost a whole session.** Ticking only SCHEMA rows in the object browser yields no table/view preview, but the ticked scope was committed as the generated scope regardless — which flipped the screen into "generated" mode and disabled "Generate DDL for selected" with the note "use Reset all to generate a new selection", after an attempt that had produced no DDL at all. A Generate that converts nothing is now a FAILED Generate: the scope is left untouched, so the operator ticks the objects and presses Generate again.
+- **...and the message saying so was plain gray text, easy to miss entirely.** "No tables or views were selected" was an `inline_hint(tone="neutral")`, so a Generate that did nothing looked like a Generate that did nothing visible. It is an action required that blocks progress, which the project's design system grades `error`, and it now renders as a red notice that also explains the likely cause (ticking a schema row does not select its objects).
+- **"Start over" would not accept RESET until an extra keystroke.** The type-to-confirm gate ran on the raw DOM `input`/`keyup` events and then read the field's value — which Quasar had not synced yet, so after typing R-E-S-E-T the server still held "RESE" and the button stayed disabled. Pressing SPACE fired one more event, by which time "RESET" had arrived and `.strip()` matched, which is how the button appeared to unlock at random. The gate now runs on the model-sync handler, whose payload IS the new value, and the click re-validates (a box that was RESET and then edited must not reset the session).
+- **After "Start over" the secret ARN and DSQL endpoint reappeared, which read as "the reset did not work".** The reset does clear the session's own secret id and target config; what comes back is the app stack's own `SourceSecretArn` / `DsqlClusterArn`, prefilled from the attestation env vars as the LAST fallback — the values that are in fact the only ones this deployment can use. Each prefilled field now names its source and says why substituting another value fails (a different secret is not readable by the task role; Aurora DSQL's IAM token is minted for one cluster). Silent when the operator typed something else, where the existing wrong-cluster warning is the right message.
+
 ## v0.1.538
 
 ### Fixed

@@ -5185,3 +5185,70 @@ def test_only_the_unverifiable_precondition_is_amber_in_the_pk_picker() -> None:
     painted = " ".join(ui.class_strings)
     assert painted.count(amber) == 1, [c for c in ui.class_strings if amber in c]
     assert info in painted, ui.class_strings
+
+
+def test_a_generate_that_converts_nothing_does_not_lock_the_button() -> None:
+    """Ticking only SCHEMA rows produced no DDL, yet locked Generate behind "Reset all".
+
+    The scope was committed unconditionally, so an attempt that converted NOTHING still
+    flipped the screen into "generated" mode -- and the operator had to reset the whole
+    session to correct a mis-tick. A failed Generate now leaves the scope untouched and
+    records the reason, so they can tick objects and press Generate again.
+    """
+    import asyncio
+
+    from dsql_migrator.ui.schema_conversion import (
+        SchemaConversionState,
+        generate_selected_ddl,
+    )
+
+    state = SchemaConversionState()
+    state.ticked_node_ids = ["schema:ecommerce"]
+    refreshed: list[int] = []
+
+    # Nothing convertible -> rejected, scope untouched, reason recorded.
+    asyncio.run(
+        generate_selected_ddl(
+            state,
+            lambda: refreshed.append(1),
+            selection_is_convertible=lambda: False,
+        )
+    )
+    assert state.generated_node_ids is None, "a failed generate must not commit a scope"
+    assert state.generate_error, "the reason must be recorded for the screen"
+    assert "table/view objects" in state.generate_error
+    assert refreshed, "the screen must be refreshed so the message appears"
+
+    # A convertible selection commits and clears the error.
+    state.ticked_node_ids = ["table:ecommerce.orders"]
+    asyncio.run(
+        generate_selected_ddl(
+            state, lambda: None, selection_is_convertible=lambda: True
+        )
+    )
+    assert state.generated_node_ids == ["table:ecommerce.orders"]
+    assert state.generate_error is None
+
+    # ... and "Reset all" clears the error too, so a stale message cannot survive.
+    state.generate_error = "stale"
+    state.reset_generation()
+    assert state.generate_error is None
+
+
+def test_the_nothing_generated_message_is_an_error_notice_not_gray_text() -> None:
+    """It was `inline_hint(tone="neutral")` -- plain gray, easy to miss entirely, so a
+    Generate that did nothing looked like a Generate that did nothing VISIBLE.
+
+    It is an ACTION REQUIRED that blocks progress, which the project's design system grades
+    `error`.
+    """
+    import inspect as _inspect
+
+    from dsql_migrator.ui import schema_conversion as sc
+
+    source = _inspect.getsource(sc._render_browser_and_preview)
+    # The rejected-generate banner and the defensive empty-preview path are BOTH notices.
+    assert source.count('tone="error"') >= 2, source.count('tone="error"')
+    assert "Nothing was generated" in source
+    # ... and the old gray hint for this case is gone.
+    assert "No tables or views were selected. Tick table/view objects (not just" not in source

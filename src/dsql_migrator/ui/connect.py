@@ -389,6 +389,44 @@ def check_target_connection(
     return connector.test_connection()
 
 
+# Where a prefilled credential value came from, per field. Kept as data + a pure
+# function rather than inline UI text so the RULE is testable: the page itself is only
+# reachable through a NiceGUI render, and an inline condition could be deleted with every
+# assertion still passing on the source text.
+_PREFILL_PROVENANCE = {
+    "secret": (
+        "Prefilled from this deployment: its app stack's SourceSecretArn parameter. Only "
+        "this secret is readable by the task role, so another ARN will fail the connection "
+        "test with AccessDenied."
+    ),
+    "endpoint": (
+        "Prefilled from this deployment: its app stack's DsqlClusterArn parameter. Aurora "
+        "DSQL uses IAM-token auth minted for ONE cluster, so this is the only endpoint the "
+        "task role can connect to."
+    ),
+}
+
+
+def prefill_provenance(
+    field: str, granted: "Optional[str]", shown: "Optional[str]"
+) -> "Optional[str]":
+    """The sentence naming where a prefilled value came from, or ``None`` to say nothing.
+
+    Shown only when the value on screen IS the one this deployment's stack declared. That
+    matters after "Start over": the reset really does clear the session's own secret id and
+    target config, and what the operator then sees is the attestation env var reappearing
+    as the LAST fallback -- with nothing saying so, the obvious reading is "the reset did
+    not work". It also stays silent when the operator typed something else, where the
+    existing wrong-cluster warning is the right message instead.
+
+    ``granted`` empty/``None`` means nothing was declared (not a managed deployment, or the
+    parameter is unset), so there is no provenance to state.
+    """
+    if not granted or not shown or shown != granted:
+        return None
+    return _PREFILL_PROVENANCE.get(field)
+
+
 def build_connect_page(
     store: SessionStore,
     session_id: str,
@@ -950,6 +988,17 @@ def build_connect_page(
                     "style). Resolved at test time with the AWS profile above and "
                     "kept only in memory; region comes from the ARN when given."
                 ).classes("text-xs text-gray-500")
+                # WHERE a prefilled value came from. Without this the field looks like
+                # leftover state -- after Start over (which really does clear the session's
+                # own secret id) the deployment's declared ARN reappears as the fallback,
+                # and an operator reasonably reads that as "the reset did not work".
+                _secret_note = prefill_provenance(
+                    "secret",
+                    _granted_secret,
+                    getattr(state, "source_secret_id", None) or _granted_secret or "",
+                )
+                if _secret_note:
+                    ui.label(_secret_note).classes("text-xs text-sky-700")
 
             source_status = ui.label().classes("text-sm")
 
@@ -1168,6 +1217,13 @@ def build_connect_page(
             target_endpoint = ui.input(
                 "Cluster endpoint", value=tgt_endpoint or ""
             ).classes("w-full")
+            # Same reason as the secret field above: after Start over this reappears from
+            # the stack parameter, not from session state.
+            _endpoint_note = prefill_provenance(
+                "endpoint", _granted_endpoint, tgt_endpoint
+            )
+            if _endpoint_note:
+                ui.label(_endpoint_note).classes("text-xs text-sky-700")
             if _granted_endpoint and tgt_endpoint != _granted_endpoint:
                 # The operator is pointing somewhere this deployment cannot authenticate
                 # to. DSQL is IAM-token auth and the token is minted for ONE cluster ARN

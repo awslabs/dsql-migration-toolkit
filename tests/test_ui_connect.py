@@ -647,6 +647,14 @@ def _connect_page_tree():
     return ast.parse(inspect.getsource(connect_mod.build_connect_page))
 
 
+def _connect_page_source() -> str:
+    import inspect
+
+    from dsql_migrator.ui import connect as connect_mod
+
+    return inspect.getsource(connect_mod.build_connect_page)
+
+
 def test_secret_field_is_prefilled_from_the_granted_arn() -> None:
     """A managed deployment can read exactly ONE secret -- so offer that one.
 
@@ -942,3 +950,54 @@ def test_the_password_field_prefers_the_session_over_the_env_default() -> None:
     value = next(ast.unparse(kw.value) for kw in inputs[0].keywords if kw.arg == "value")
     assert "state.source_password" in value, value
     assert value.index("state.source_password") < value.index("d.source_password"), value
+
+
+def test_a_prefilled_credential_field_says_where_the_value_came_from() -> None:
+    """After Start over the deployment's declared ARNs reappear, and that read as a bug.
+
+    The reset really does clear the session's own secret id and target config; the values
+    the operator then sees come from the app stack's ``SourceSecretArn`` /
+    ``DsqlClusterArn`` parameters via the attestation env vars, as the LAST fallback. With
+    nothing saying so, an operator reasonably concludes the reset did not work -- so each
+    prefilled field now names its source, and says why another value would fail.
+    """
+    import ast
+
+    tree = _connect_page_tree()
+    from dsql_migrator.ui.connect import prefill_provenance
+
+    # The RULE, driven directly: shown only when what is on screen IS the value this
+    # deployment declared.
+    secret = prefill_provenance("secret", "arn:aws:...:secret:x", "arn:aws:...:secret:x")
+    assert secret and "Prefilled from this deployment" in secret
+    assert "SourceSecretArn" in secret
+    # ... and it says why substituting another value fails, which is the actionable half.
+    assert "AccessDenied" in secret
+
+    endpoint = prefill_provenance("endpoint", "c.dsql.us-east-1.on.aws", "c.dsql.us-east-1.on.aws")
+    assert endpoint and "DsqlClusterArn" in endpoint
+    assert "IAM-token auth minted for ONE cluster" in endpoint
+
+    # Silent when the operator typed something ELSE (the wrong-cluster warning covers
+    # that), when nothing was declared, and when the parameter is empty.
+    assert prefill_provenance("secret", "arn:a", "arn:b") is None
+    assert prefill_provenance("secret", None, "arn:a") is None
+    assert prefill_provenance("secret", "", "arn:a") is None
+    assert prefill_provenance("endpoint", "c", "") is None
+
+    # ... and the page actually CALLS it for both fields (a rule nothing consults is dead).
+    called = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "prefill_provenance"
+    ]
+    # The field KEYS, not just the call count: an unknown key returns None, so a typo
+    # silently turns the note off while the call is still there.
+    keys = {
+        node.args[0].value
+        for node in called
+        if node.args and isinstance(node.args[0], ast.Constant)
+    }
+    assert keys == {"secret", "endpoint"}, keys

@@ -1013,6 +1013,11 @@ class _DialogUi:
         self.texts: list[str] = []
         self.click_wired = False  # True once a button gets on('click', ...)
         self.dialog_opened = False
+        self.reset_disabled = False   # the reset button's props("disable") state
+        self.input_on_change = None   # the confirm box's model-sync handler
+        self.notifications: list[str] = []
+        self.reset_click = None       # the reset button's on_click handler
+        self.input_el = None          # the confirm box element (carries .value)
 
     class _El:
         def __init__(self, ui, is_button=False):
@@ -1031,9 +1036,24 @@ class _DialogUi:
         def tooltip(self, *_a, **_k):
             return self
 
-        def on(self, event=None, *_a, **_k):
+        def on(self, event=None, handler=None, *_a, **_k):
             if self._is_button and event == "click":
                 self._ui.click_wired = True
+                # Keep the handler so a test can CLICK it and assert the click-time
+                # re-validation, not merely that a button was wired.
+                if handler is not None:
+                    self._ui.reset_click = handler
+            return self
+
+        # ``props("disable")`` / ``props(remove="disable")`` is how the reset button is
+        # gated, so recording it makes the gate assertable. Without this a test can only
+        # see that a button was rendered -- which is what let the gate ship broken.
+        def props(self, value="", *_a, remove=None, **_k):
+            if self._is_button:
+                if "disable" in str(value):
+                    self._ui.reset_disabled = True
+                if remove is not None and "disable" in str(remove):
+                    self._ui.reset_disabled = False
             return self
 
         def open(self, *_a, **_k):  # dialog.open() at the end of the builder
@@ -1057,10 +1077,30 @@ class _DialogUi:
     def button(self, text="", *_a, on_click=None, **_k):
         if text is not None:
             self.texts.append(str(text))
+        # The reset button's handler, so a test can CLICK it and assert the click-time
+        # re-validation (a button enabled and then edited back must not reset).
+        if "Start over" in str(text) and on_click is not None:
+            self.reset_click = on_click
         return self._El(self, is_button=True)
 
-    def input(self, *_a, **_k):
-        return self._El(self)
+    def notify(self, message="", *_a, **_k):
+        self.notifications.append(str(message))
+
+    def input(self, *_a, on_change=None, **_k):
+        # Model NiceGUI faithfully: a model sync sets the element's ``value`` AND calls
+        # ``on_change``. That pairing is the whole point -- the bug was code reading the
+        # element value from a handler that runs BEFORE the sync.
+        el = self._El(self)
+        el.value = ""
+        self.input_el = el
+
+        def _sync(event=None):
+            el.value = getattr(event, "value", "") if event is not None else ""
+            if on_change is not None:
+                on_change(event)
+
+        self.input_on_change = _sync
+        return el
 
     def icon(self, *_a, **_k):
         return self._El(self)
@@ -1813,3 +1853,81 @@ def test_format_source_engine_postgres_variants() -> None:
     assert format_source_engine(None, None, None, source_type=pg) is None
     # MySQL default path is unchanged.
     assert format_source_engine("8.0.35", None) == "MySQL 8.0.35"
+
+
+def test_start_over_enables_reset_on_the_models_synced_value_not_a_raw_dom_event() -> None:
+    """Typing RESET left the button disabled until an EXTRA keystroke.
+
+    The gate ran on the raw DOM ``input``/``keyup`` events and then read the element's
+    value -- which Quasar had not synced yet, so the server still held the PREVIOUS text.
+    After typing R-E-S-E-T the server saw "RESE" and the button stayed disabled; pressing
+    SPACE fired one more event, by which time "RESET" had arrived and `.strip()` matched.
+    That is exactly what the operator hit. The gate now runs on the model-sync handler
+    (``on_change``), whose payload IS the new value.
+    """
+    ui = _render_start_over_dialog(cdc_teardown_in_flight=False, cdc_deployed=False)
+
+    # The confirm box must expose a model-sync handler at all.
+    assert ui.input_on_change is not None, "the gate is not on the model-sync event"
+    # It starts disabled ...
+    assert ui.reset_disabled is True
+
+    class _Change:
+        def __init__(self, value):
+            self.value = value
+
+    # ... a partial value keeps it disabled ...
+    ui.input_on_change(_Change("RESE"))
+    assert ui.reset_disabled is True
+    # ... and the FINAL character enables it, with no extra keystroke needed.
+    ui.input_on_change(_Change("RESET"))
+    assert ui.reset_disabled is False, "typing RESET must enable the button immediately"
+    # Case and surrounding space are tolerated, as before.
+    ui.input_on_change(_Change(" reset "))
+    assert ui.reset_disabled is False
+    # Editing it back to something else re-locks it.
+    ui.input_on_change(_Change("RES"))
+    assert ui.reset_disabled is True
+
+
+def test_start_over_revalidates_at_click_time_so_an_edited_box_cannot_reset() -> None:
+    """The click is its own round-trip, so the value is certainly synced by then.
+
+    Without the re-check, a box that was RESET (enabling the button) and then edited to
+    something else would still reset the session on click -- the button's enabled state
+    was treated as the confirmation.
+    """
+    from dsql_migrator.ui.session import SessionConnectionState
+    from dsql_migrator.ui.workflow import _open_start_over_dialog
+
+    reset_calls: list[int] = []
+    ui = _DialogUi()
+    _open_start_over_dialog(
+        ui,
+        SessionConnectionState(),
+        lambda: reset_calls.append(1),
+        lambda _v: None,
+        lambda: None,
+        object(),
+        cdc_teardown_in_flight=False,
+        cdc_deployed=False,
+    )
+    assert ui.reset_click is not None, "the reset button's handler is not reachable"
+
+    class _Change:
+        def __init__(self, value):
+            self.value = value
+
+    # Enable it, then edit the box to something else.
+    ui.input_on_change(_Change("RESET"))
+    assert ui.reset_disabled is False
+    ui.input_on_change(_Change("RESETX"))
+
+    ui.reset_click()
+    assert reset_calls == [], "an edited confirm box must not reset the session"
+    assert any("Type RESET" in n for n in ui.notifications), ui.notifications
+
+    # With RESET actually in the box, the click goes through.
+    ui.input_on_change(_Change("RESET"))
+    ui.reset_click()
+    assert reset_calls == [1]

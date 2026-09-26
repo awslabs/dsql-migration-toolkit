@@ -930,6 +930,13 @@ class SchemaConversionState:
         # Generation is gated: previews render only for ``generated_node_ids``.
         self.ticked_node_ids: list[str] = []
         self.generated_node_ids: Optional[list[str]] = None
+        # Why the last Generate produced nothing, or None. A selection of SCHEMAS only
+        # yields no table/view preview, and that used to be committed as the generated
+        # scope anyway -- which locked the Generate button ("Reset all to generate a new
+        # selection") after an attempt that had converted nothing, so the operator had to
+        # reset to try again. A rejected Generate now leaves the scope untouched and
+        # records the reason here for the screen to show.
+        self.generate_error: Optional[str] = None
         # Which OBJECT-BROWSER tree nodes are expanded. The tree is rebuilt on every
         # render (Generate DDL, an apply, the progress poll), and NiceGUI's tree keeps
         # its open/closed state client-side -- so without restoring it the whole tree
@@ -1117,6 +1124,7 @@ class SchemaConversionState:
         the generated DDL list.
         """
         self.generated_node_ids = None
+        self.generate_error = None
         self.edited_target_ddls.clear()
         self.replace_confirmed = False
         self.job_id = None
@@ -2887,6 +2895,7 @@ async def generate_selected_ddl(
     refresh: Callable[[], None],
     *,
     sync_target: Optional[Callable[[], object]] = None,
+    selection_is_convertible: Optional[Callable[[], bool]] = None,
 ) -> None:
     """Re-read the target catalog, then commit the ticked objects as the DDL scope.
 
@@ -2920,6 +2929,18 @@ async def generate_selected_ddl(
                 "Target re-browse before Generate failed; "
                 "using the cached target snapshot"
             )
+    # A selection that converts NOTHING is a FAILED generate, so it must not become the
+    # generated scope: committing it locked the button behind "Reset all" after an attempt
+    # that produced no DDL, making the operator reset a session to correct a mis-tick.
+    if selection_is_convertible is not None and not selection_is_convertible():
+        conv_state.generate_error = (
+            "No tables or views were selected, so there is nothing to convert. Tick "
+            "table/view objects in the source browser -- ticking a SCHEMA row alone does "
+            "not select its objects -- then click \"Generate DDL for selected\" again."
+        )
+        refresh()
+        return
+    conv_state.generate_error = None
     conv_state.generated_node_ids = list(conv_state.ticked_node_ids)
     refresh()
 
@@ -3200,9 +3221,27 @@ def _render_browser_and_preview(
                     ).classes("text-sm text-gray-500")
 
     # --- Generate DDL for the ticked objects ------------------------------
+    def _selection_is_convertible() -> bool:
+        """Whether the ticked nodes yield at least one table/view preview."""
+        try:
+            return bool(
+                generate_previews(
+                    list(conv_state.ticked_node_ids),
+                    inventory,
+                    result_provider(),
+                    existence_checker=existence_checker,
+                    source_type=source_type,
+                )
+            )
+        except Exception:  # noqa: BLE001 - never block Generate on the pre-check
+            return True
+
     async def on_generate() -> None:
         await generate_selected_ddl(
-            conv_state, refresh, sync_target=on_sync_target
+            conv_state,
+            refresh,
+            sync_target=on_sync_target,
+            selection_is_convertible=_selection_is_convertible,
         )
         # Mirror the generate action into the AI activity feed with a real summary:
         # how many objects got converted DDL AND which source-object kinds Aurora DSQL
@@ -3243,6 +3282,16 @@ def _render_browser_and_preview(
         conv_state.preserve_foreign_keys = bool(value)
         refresh()
 
+    # A rejected Generate, in RED: this is a blocking "action required", and as plain
+    # gray text it was easy to miss entirely -- the operator saw a Generate that appeared
+    # to do nothing.
+    if conv_state.generate_error:
+        render_notice(
+            ui,
+            tone="error",
+            header="Nothing was generated",
+            body=conv_state.generate_error,
+        )
     with ui.row().classes("gap-2 items-center"):  # type: ignore[attr-defined]
         gen_btn = ui.button(  # type: ignore[attr-defined]
             "Generate DDL for selected", on_click=on_generate
@@ -3336,11 +3385,18 @@ def _render_browser_and_preview(
         source_type=source_type,
     )
     if not previews:
-        inline_hint(
+        # Defensive: Generate now refuses to commit a scope that converts nothing, so
+        # this is only reachable for a scope restored from an older session. Still an
+        # ACTION REQUIRED, so it must not be gray text.
+        render_notice(
             ui,
-            "No tables or views were selected. Tick table/view objects (not just "
-            "schemas) and generate again.",
-            tone="neutral",
+            tone="error",
+            header="Nothing was generated",
+            body=(
+                "No tables or views were selected, so there is nothing to convert. Tick "
+                "table/view objects in the source browser -- ticking a SCHEMA row alone "
+                "does not select its objects -- then use \"Reset all\" and generate again."
+            ),
         )
         return
 

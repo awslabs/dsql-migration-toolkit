@@ -302,34 +302,48 @@ def _open_start_over_dialog(
                 body=warning,
             )
         ui.label("Type RESET to confirm:").classes("text-sm text-gray-700")  # type: ignore[attr-defined]
-        # debounce=0 so the typed value syncs to the server immediately (the gate
-        # below reads it on each keystroke; the default debounce would lag the
-        # button-enable behind the last character).
-        confirm_input = ui.input(placeholder="RESET").classes("w-full").props("debounce=0")  # type: ignore[attr-defined]
-        reset_btn = ui.button("Start over", icon="restart_alt").props("color=negative")  # type: ignore[attr-defined]
-        reset_btn.props("disable")
-
-        def _typed(_e=None) -> str:
-            # Prefer the live event payload (synced immediately) and fall back to
-            # the element value, so the gate never lags a debounced round-trip.
-            val = getattr(_e, "args", None) if _e is not None else None
-            if not isinstance(val, str):
-                val = confirm_input.value
-            return (val or "").strip().upper()
-
         def _check(_e=None) -> None:
+            """Enable the reset button once the typed text is RESET."""
             if _typed(_e) == "RESET":
                 reset_btn.props(remove="disable")
             else:
                 reset_btn.props("disable")
 
-        confirm_input.on("input", _check)
-        confirm_input.on("keyup", _check)
+        # Gated on the MODEL-SYNC event (``on_change``), not on the raw DOM
+        # ``input``/``keyup``. Those fire BEFORE Quasar's value round-trip completes, so
+        # the server still saw the previous text -- typing RESET left the server holding
+        # "RESE" and the button stayed disabled with no way out. ``debounce=0`` keeps the
+        # sync immediate so the enable lands on the last character.
+        confirm_input = (
+            ui.input(placeholder="RESET", on_change=_check)  # type: ignore[attr-defined]
+            .classes("w-full")
+            .props("debounce=0")
+        )
+        reset_btn = ui.button("Start over", icon="restart_alt").props("color=negative")  # type: ignore[attr-defined]
+        reset_btn.props("disable")
+
+        def _typed(_e=None) -> str:
+            # ``on_change`` carries the synced value on ``.value``; ``.args`` covers a raw
+            # DOM handler, and the element's own value is the last resort.
+            for candidate in (
+                getattr(_e, "value", None) if _e is not None else None,
+                getattr(_e, "args", None) if _e is not None else None,
+                getattr(confirm_input, "value", None),
+            ):
+                if isinstance(candidate, str):
+                    return candidate.strip().upper()
+            return ""
 
         def _go() -> None:
-            # The button is only enabled by _check once "RESET" was typed, so the
-            # click itself is the confirmation -- no re-gate on a possibly-lagging
-            # value read.
+            # Re-validate at CLICK time. The click is its own round-trip, so the value is
+            # certainly synced by now -- and a button that was enabled and then edited back
+            # to something else must not reset the session.
+            if _typed() != "RESET":
+                ui.notify(  # type: ignore[attr-defined]
+                    "Type RESET in the box to confirm, then press Start over.",
+                    type="warning",
+                )
+                return
             dialog.close()
             # Tear down CDC per the user's choice BEFORE wiping the session, so the
             # teardown captures the (about-to-be-reset) stack/region config. "stop"
