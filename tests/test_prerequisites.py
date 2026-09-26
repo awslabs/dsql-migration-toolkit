@@ -1690,7 +1690,11 @@ def test_the_existence_check_grades_absence_coverage_and_dml() -> None:
     no_slot = verdict(slot_usable=False, slot_present_any_database=False)
     assert no_slot.status is PrerequisiteStatus.WARN
     assert no_slot.required is False
-    assert "nothing is lost" in no_slot.remediation
+    # Both branches that lead to a re-snapshot share one cost paragraph, so the route is
+    # never described two different ways depending on which object happens to be missing.
+    assert "Nothing is lost" in no_slot.remediation
+    assert "read from the source a second time" in no_slot.remediation
+    assert "DELETED on the source" in no_slot.remediation
 
     # Unread facts are UNKNOWN, never absent -- an INFO that cannot gate anything.
     unknown = verdict(publication_present=None)
@@ -1867,11 +1871,19 @@ def test_accepting_the_resnapshot_regrades_only_what_it_repairs() -> None:
     assert blocked.status is PrerequisiteStatus.FAIL
     assert blocked.required is True
     assert blocked.resolvable_by_resnapshot is True
-    # With it: a non-blocking INFO, so can_proceed goes True and every gate un-gates.
+    # With it: non-blocking (required False), so can_proceed goes True and every gate
+    # un-gates -- but WARN, not INFO. This row is the only surface on the critical path to
+    # the Deploy button, so it is where the second read of the source has to be disclosed;
+    # INFO collapsed it under a green badge and its remediation was the EMPTY STRING, which
+    # is how a "Full load only" operator reached Start CDC still believing the stream would
+    # simply continue from the load. Assert the cost is stated, not just the status.
     cleared = row(resnap=True, **absent)
-    assert cleared.status is PrerequisiteStatus.INFO
+    assert cleared.status is PrerequisiteStatus.WARN
     assert cleared.required is False
-    assert "re-snapshot" in cleared.detail
+    assert "FRESH SNAPSHOT" in cleared.detail
+    assert "read from the source a second time" in cleared.remediation
+    assert "DELETED on the source" in cleared.remediation
+    assert '"Full load + CDC"' in cleared.remediation
 
     # NOT re-graded, because a re-snapshot does not repair them:
     for kw in (dict(publication_tables=()), dict(publication_publishes_all_dml=False)):
@@ -1929,11 +1941,13 @@ def test_the_checker_forwards_the_resnapshot_decision() -> None:
     )
     assert blocked.can_proceed is False
     cleared = run(True)
-    assert (
-        _result(cleared, PrerequisiteCheckId.CDC_REPLICATION_OBJECTS).status
-        is PrerequisiteStatus.INFO
-    )
+    row = _result(cleared, PrerequisiteCheckId.CDC_REPLICATION_OBJECTS)
+    # WARN, not INFO: the re-snapshot is a real (non-blocking) cost, and WARN is also what
+    # auto-expands the section so the row is READ rather than collapsed under a green badge.
+    assert row.status is PrerequisiteStatus.WARN
+    assert row.required is False
     # THE payoff: the whole report stops gating, which is what un-gates Deploy and Start.
+    # Informing must not become blocking -- that is the line this pair of asserts holds.
     assert cleared.can_proceed is True
 
 

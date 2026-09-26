@@ -135,6 +135,42 @@ def test_new_diagnostic_tools_are_registered() -> None:
     } <= names
 
 
+def test_cdc_diagnostics_serialises_against_the_REAL_state_object() -> None:
+    """The CDC diagnostic must answer "ok" when driven by the real DataMigrationState.
+
+    WHY the real object and not an attribute bag: the payload read `_dm.cdc_start_mode`
+    WITHOUT calling it. On the real state that name is a METHOD, so `json.dumps` raised
+    "Object of type method is not JSON serializable" -- and this tool's catch-all turned
+    that into `{"status": "error", "message": "tool lookup failed"}` for EVERY session, on
+    every invocation. The whole CDC diagnostic was dead and no test noticed, because every
+    fake here is an `_Obj` bag on which the missing attribute simply resolves to None.
+
+    So this drives the REAL state: a fake can only reproduce the bug by mirroring the real
+    API exactly, which is the thing a hand-written double keeps getting wrong. Asserting
+    `status == "ok"` (rather than a field) is deliberate -- any future unserialisable value
+    added to this payload fails here instead of silently disabling the tool in production.
+    """
+    import json
+
+    from dsql_migrator.ui.data_migration._state import DataMigrationState
+
+    real_state = DataMigrationState()
+    execute = build_ai_tool_executor(
+        session_id="s1",
+        session_store=_Store(_Obj(target_config=None, target_verified=False)),
+        evaluation_store=_Store(get_returns=None),
+        schema_conversion_store=_Store(_Obj(generated_node_ids=[], apply_results=[])),
+        validation_store=_Store(_Obj(result=None)),
+        data_migration_store=_Store(real_state),
+        job_manager=_Obj(),
+        full_load_rate_eta=lambda *_a, **_k: (None, None),
+    )
+    payload = json.loads(execute("get_cdc_pipeline_diagnostics", {}))
+    assert payload["status"] == "ok", payload
+    # And the value is the MODE, not a repr of the bound method.
+    assert payload["resume_mode"] == real_state.cdc_start_mode() == "auto"
+
+
 def test_object_detail_finds_a_pg_routine_by_its_friendly_name() -> None:
     """R-9: v0.1.493 put the identity ARGUMENTS into a PostgreSQL routine's inventory name so
     overloads are distinguishable, and the lookup only accepted the full name or the last

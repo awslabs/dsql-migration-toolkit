@@ -820,18 +820,46 @@ def check_cdc_replication_objects(
         'For a handoff with no gap, run this migration as "Full load + CDC", which '
         "creates the publication and the slot at the snapshot point before the load. "
     )
+    # The consequence of a re-snapshotting start, in the operator's terms. Shared by the
+    # two branches that lead to one (no publication at all / publication but no slot), so
+    # the same route cannot be described two different ways depending on which object the
+    # source happens to be missing.
+    #
+    # WHY this is spelled out at all: an earlier version answered the no-publication case
+    # with INFO and an EMPTY remediation, on the reasoning that a re-snapshotting start had
+    # already "chosen" this. Nothing chooses it -- it is DERIVED from the absence of a slot
+    # on the Full Load's watermark (``pg_snapshot_mode``), so the operator who ran
+    # "Full load only" and came back for CDC was never told. This report is the one surface
+    # on the critical path to the Deploy button (that button is disabled until the CDC
+    # checks run), which is exactly why the disclosure belongs here and not only on a card.
+    resnapshot_cost_note = (
+        "Nothing is lost: there is no window between the snapshot and the stream, and the "
+        "target apply is idempotent. The cost is that the whole selection is read from the "
+        "source a second time and every row crosses MSK into DSQL -- through the streaming "
+        "pipeline rather than the bulk loader, so expect it to take LONGER than the Full "
+        "Load did. Rows DELETED on the source since the Full Load are also never removed "
+        "from the target, because a fresh snapshot only reports the rows that still exist."
+    )
     if not facts.publication_present:
         if cdc_start_resnapshots:
             return PrerequisiteResult(
                 check_id=PrerequisiteCheckId.CDC_REPLICATION_OBJECTS,
                 title=title,
-                status=PrerequisiteStatus.INFO,
+                # WARN, not INFO: a second full read of a production source and a second
+                # pass of the whole dataset through MSK is a real -- if non-blocking --
+                # issue, and WARN is also what auto-expands the section so the row is read
+                # rather than collapsed under a green badge. Verified that WARN keeps
+                # ``can_proceed`` True and leaves ``cdc_prerequisite_block_reason`` None,
+                # so it informs without blocking a route that is legitimate and lossless.
+                status=PrerequisiteStatus.WARN,
                 required=False,
                 detail=(
-                    f'Publication "{pub}" does not exist, and this start is set to '
-                    "re-snapshot: the connector creates its own publication over exactly "
-                    "the captured tables and snapshots them before streaming."
+                    f'Publication "{pub}" does not exist, so this start cannot resume from '
+                    "a Full Load snapshot point. The connector creates its own publication "
+                    "over exactly the captured tables and takes a FRESH SNAPSHOT of every "
+                    "one of them before it streams any change."
                 ),
+                remediation=resnapshot_cost_note + " " + gapless_note.strip(),
             )
         return PrerequisiteResult(
             check_id=PrerequisiteCheckId.CDC_REPLICATION_OBJECTS,
@@ -899,10 +927,8 @@ def check_cdc_replication_objects(
             ),
             remediation=(
                 "CDC can still start — Debezium creates the slot itself and takes a fresh "
-                "snapshot of every selected table first, so nothing is lost, but the "
-                "whole selection is read from the source again. To stream without "
-                're-reading, run the migration as "Full load + CDC", which creates the '
-                "slot at the snapshot point."
+                "snapshot of every selected table first. " + resnapshot_cost_note + " "
+                + gapless_note.strip()
             ),
         )
     return PrerequisiteResult(

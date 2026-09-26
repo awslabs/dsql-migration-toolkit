@@ -1041,6 +1041,191 @@ def test_cdc_start_card_postgres_auto_shows_slot_resume_and_wal_lsn() -> None:
     assert "3/AF012B8" in " ".join(fake.texts)  # WAL LSN summary + confirmation
 
 
+def test_pg_resnapshot_predicate_and_cause_agree_with_the_connector_config() -> None:
+    """The disclosure predicate must be the SAME decision the connector config makes.
+
+    Pinned AGAINST ``pg_snapshot_mode`` rather than against a hand-written table, so the
+    two cannot drift -- the whole reason this is one function. Separately, the CAUSE has to
+    be read off the RAW job: ``_cdc_watermark`` suppresses ``slot_name`` for an unfinished
+    load, so a stripped watermark cannot tell "never provisioned" from "not honoured yet",
+    and those two have OPPOSITE remedies (re-run the whole load vs. retry a few tables).
+    """
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.cdc_postgres import pg_snapshot_mode
+    from dsql_migrator.core.models import SourceType, Watermark
+    from dsql_migrator.ui.data_migration._cdc_ui import (
+        _cdc_watermark,
+        pg_resnapshot_reason,
+        pg_start_resnapshots,
+    )
+
+    def wm(slot=None):
+        return Watermark(
+            wal_lsn="0/16B3748", slot_name=slot, publication_name="p",
+            snapshot_timestamp=datetime(2026, 9, 26, tzinfo=timezone.utc),
+        )
+
+    jobs = {
+        "no_slot": SimpleNamespace(watermark=wm(), status="DONE"),
+        None: SimpleNamespace(watermark=wm("dbz_slot"), status="DONE"),
+        "unfinished_load": SimpleNamespace(watermark=wm("dbz_slot"), status="FAILED"),
+        "no_watermark": None,
+    }
+    for expected_auto_reason, job in jobs.items():
+        for mode in ("auto", "manual"):
+            effective = _cdc_watermark(job)
+            got = pg_start_resnapshots(
+                effective, source_type=SourceType.POSTGRES, start_mode=mode
+            )
+            # THE anti-drift assertion: identical to what the config will emit.
+            assert got is (
+                pg_snapshot_mode(
+                    effective, force_initial_snapshot=(mode == "manual")
+                )
+                == "initial"
+            ), (expected_auto_reason, mode)
+            reason = pg_resnapshot_reason(
+                job, source_type=SourceType.POSTGRES, start_mode=mode
+            )
+            # A re-snapshot always has a nameable cause, and a gapless start never does.
+            assert (reason is not None) is got, (expected_auto_reason, mode, reason)
+        assert (
+            pg_resnapshot_reason(
+                job, source_type=SourceType.POSTGRES, start_mode="auto"
+            )
+            == expected_auto_reason
+        )
+    # Choosing Manual over an AVAILABLE slot is its own cause -- not "no slot was recorded".
+    assert (
+        pg_resnapshot_reason(
+            jobs[None], source_type=SourceType.POSTGRES, start_mode="manual"
+        )
+        == "manual"
+    )
+    # MySQL never re-snapshots on this axis, whatever its watermark says.
+    assert (
+        pg_start_resnapshots(None, source_type=SourceType.MYSQL, start_mode="manual")
+        is False
+    )
+    assert (
+        pg_resnapshot_reason(
+            jobs["no_slot"], source_type=SourceType.MYSQL, start_mode="auto"
+        )
+        is None
+    )
+
+
+def test_pg_resnapshot_notice_never_claims_a_second_read_without_a_first() -> None:
+    """One copy source for every surface, and the REMEDY must match the CAUSE.
+
+    The failure this prevents: a single "this load recorded no replication slot" message
+    reused for all causes. It would send an operator whose load merely FAILED into a full
+    re-load when retrying the failed tables was enough, and would blame a missing slot for
+    a re-copy the operator deliberately chose. It must also not claim the source is read a
+    SECOND time when no Full Load ran in this session at all.
+    """
+    from dsql_migrator.ui.data_migration._cdc_ui import pg_resnapshot_notice
+
+    assert pg_resnapshot_notice(None) is None
+    assert pg_resnapshot_notice("not-a-cause") is None
+
+    after_load = {"no_slot", "unfinished_load", "manual"}
+    for reason in after_load | {"no_watermark"}:
+        header, body = pg_resnapshot_notice(reason)
+        assert header and body
+        # Lossless is stated everywhere: the route is legitimate, not a defect.
+        assert "Nothing is lost" in body, reason
+        # No wall-clock equivalence to the Full Load -- the repo's own measurements put the
+        # streaming pipeline and the bulk loader an order of magnitude apart.
+        assert "as long as the Full Load" not in body, reason
+        # "a second time" / the deleted-row residue are claims ABOUT a preceding load.
+        assert ("a second time" in body) is (reason in after_load), reason
+        assert ("DELETED on the source" in body) is (reason in after_load), reason
+
+    # Cause-specific remedies, each pointing at the cheapest thing that actually works.
+    assert '"Full load + CDC"' in pg_resnapshot_notice("no_slot")[1]
+    assert "Retry the failed tables" in pg_resnapshot_notice("unfinished_load")[1]
+    assert "back to Automatic" in pg_resnapshot_notice("manual")[1]
+    # ...and the unfinished load is NOT told its slot was never recorded.
+    assert "recorded no replication slot" not in pg_resnapshot_notice(
+        "unfinished_load"
+    )[1]
+
+
+def test_cdc_start_card_pg_auto_without_a_slot_is_resolved_and_discloses_the_reread() -> None:
+    """PostgreSQL Automatic with no slot is a RESOLVED start, and it must say what it does.
+
+    Three contradictions lived here at once: an amber "Action needed" badge directly above
+    an ENABLED Start CDC button, the PRE-SELECTED default labelled "(unavailable)", and a
+    notice offering the re-snapshot as what MANUAL would do -- so leaving the default alone
+    read as "I did not choose this", while it is exactly what Automatic does.
+    """
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration._cdc_ui import _render_cdc_start_point_card
+
+    state = DataMigrationState()
+    state.set_cdc_start_mode("auto")
+    fake = _FakeUi()
+    _render_cdc_start_point_card(
+        fake, state, lambda: None,
+        wm_resume=None, wm_usable=False, effective_resume=None,
+        mode="auto", locked=False, session=None, source_type=SourceType.POSTGRES,
+        resnapshot_reason="no_slot",
+    )
+    radio_values = [v for r in fake.radios for v in r.values()]
+    # The default names what it WILL DO, and is not marked unavailable.
+    assert any("re-snapshot every selected table" in v for v in radio_values), radio_values
+    assert all("(unavailable)" not in v for v in radio_values), radio_values
+    joined = " ".join(fake.texts)
+    # The cost is disclosed, with the remedy, rather than steering to Manual as an escape.
+    assert "read from the source a second time" in joined
+    assert '"Full load + CDC"' in joined
+    assert "choose Manual to re-snapshot" not in joined
+    # A resolved start point must not raise an alarm badge.
+    assert "Action needed" not in joined, joined
+
+
+def test_start_cdc_detail_does_not_certify_a_resnapshot_as_gapless() -> None:
+    """The permanent audit record must not assert gaplessness for a re-snapshotting start.
+
+    Worse than silence: "(gapless from the Full Load watermark)" was appended whenever a
+    watermark existed, never consulting ``slot_name``. On a PostgreSQL Full-load-only run
+    that certified the one route that re-reads the source AND leaves rows the source has
+    since deleted -- and this line is the only durable artifact a Step 4 reader has to
+    explain those extra rows.
+    """
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration._cdc_ui import _cdc_start_detail
+
+    def detail(slot, *, force=False, source=SourceType.POSTGRES):
+        wm = SimpleNamespace(
+            gtid_executed=None, binlog_file=None, binlog_position=None,
+            wal_lsn="0/16B3748", slot_name=slot,
+        )
+        return _cdc_start_detail(
+            "dsql-cdc-demo", wm, mode="auto", source_type=source, force_snapshot=force
+        )
+
+    no_slot = detail(None)
+    assert "gapless" not in no_slot, no_slot
+    assert "re-snapshot" in no_slot
+    assert "DELETED on the source" in no_slot
+    assert "0/16B3748" in no_slot  # the coordinate is still recorded
+
+    # A slot-bearing PostgreSQL watermark IS gapless...
+    assert "gapless from the Full Load watermark" in detail("dbz_slot")
+    # ...unless a full snapshot is forced, which re-reads just the same.
+    assert "gapless" not in detail("dbz_slot", force=True)
+    # MySQL is unaffected: its watermark carries no slot by design.
+    assert "gapless from the Full Load watermark" in detail(
+        None, source=SourceType.MYSQL
+    )
+
+
 def test_start_cdc_detail_names_the_resume_point() -> None:
     """Where the stream resumes FROM cannot be reconstructed afterwards.
 

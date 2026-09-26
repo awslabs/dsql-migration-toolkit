@@ -19,6 +19,14 @@ cut-over runbook, and where to go next.
 | Large-scale / continuous; need **near-zero-downtime** cut-over | **Full Load + CDC** (gapless handoff keeps DSQL live until you switch over). |
 | Target already loaded; you only need to attach or resume streaming | **CDC only** (stream into an already-loaded target — e.g. resume CDC from a prior watermark, or feed a target loaded out of band — with no fresh Full Load). |
 
+On **PostgreSQL** the gapless handoff has to be chosen *before* the load. The
+replication slot that retains WAL cannot be created at a past position, so
+**Full Load + CDC** creates it at the snapshot point; after a **Full Load only**
+run that option is gone, and a later CDC start re-snapshots every captured table
+instead — still lossless, but it reads the source a second time and streams every
+row through MSK. On MySQL the binary log retains history with no consumer, so a
+later CDC start resumes from the watermark with no re-read.
+
 CDC adds real moving parts (MSK, MSK Connect, the sink connector) and **ongoing
 cost while deployed**. Reach for it only when you genuinely need continuous
 replication; otherwise Full Load alone is simpler and cheaper.

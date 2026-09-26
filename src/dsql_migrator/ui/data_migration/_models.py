@@ -2470,8 +2470,14 @@ def cdc_prerequisite_block_reason(
         if cdc_checks_already_passed:
             return None
         return (
-            "Run the CDC prerequisite checks first (Prerequisites step) — they "
-            "verify the source binary log is usable for streaming before any "
+            # Engine-neutral on purpose. "the source binary log" is MySQL's mechanism, and
+            # this is the branch a PostgreSQL operator continuing a Full-load-only run is
+            # GUARANTEED to hit first (that run records prereq_gated_mode=FULL_LOAD, so the
+            # checks never count as already passed) -- so the MySQL wording was the first
+            # thing the PG journey said. The branch below had already been engine-split.
+            "Run the CDC prerequisite checks first (Prerequisites step) — they verify the "
+            "source's change stream is usable for streaming (MySQL: the binary log; "
+            "PostgreSQL: wal_level=logical and the replication objects) before any "
             "billable infrastructure is created."
         )
     # The "CDC possible at all" source check differs by engine: MySQL needs the binary

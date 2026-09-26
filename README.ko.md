@@ -28,6 +28,13 @@ Aurora DSQL은 PostgreSQL 16 호환 *분산* 데이터베이스입니다. **MySQ
 관리형 MSK Connect에서 돌아가는 선택적 연속 **CDC** 스트림. 워터마크(MySQL은 binlog/GTID,
 PostgreSQL은 LSN)가 둘을 무손실로 이어 줍니다.
 
+핸드오프가 무손실로 유지되는 방식은 엔진마다 다릅니다. MySQL의 바이너리 로그는 소비자가 없어도
+히스토리를 보관하므로 CDC를 나중에 붙여도 워터마크부터 재개할 수 있습니다. PostgreSQL은 **논리
+복제 슬롯**에 대해서만 WAL을 보관하고, 슬롯은 과거 위치에 만들 수 없으므로 슬롯이 적재 *이전에*
+존재해야 합니다. **Full load + CDC**를 선택하면 도구가 스냅샷 시점에 슬롯을 만듭니다. **Full
+Load만** 실행한 뒤에는 그 선택지가 사라지고, 나중에 CDC를 시작하면 테이블을 다시 스냅샷합니다
+(여전히 무손실이지만 소스를 한 번 더 읽습니다).
+
 <p align="center">
   <b>Simple architecture</b><br>
   <img src="docs/images/architecture-aws-simple.png" alt="아키텍처 다이어그램" width="720">

@@ -100,6 +100,15 @@ the bulk load and the stream.
    pre-created slot, so nothing is written to Kafka's connect-offsets. Either way
    Debezium begins streaming the **first change after the snapshot** — not from
    "now," and not by re-reading the data.
+
+   > **This describes a `Full load + CDC` run.** It is the slot created *during* that
+   > load that makes the handoff free of a re-read, and a PostgreSQL slot cannot be
+   > created at a past position. If you ran **`Full load only`** and come back to CDC
+   > later, streaming is still lossless but the source connector creates its own
+   > publication and slot and **re-snapshots every selected table first** — the data is
+   > read a second time. See [Chapter 10 §10.1](10-conclusion.md) for choosing between
+   > them. On MySQL the binary log retains history with no consumer, so a later CDC
+   > start resumes from the watermark with no re-read.
 3. **For a MySQL source**, the source connector runs with
    **`snapshot.mode=recovery`**: because an offset is already seeded, Debezium
    rebuilds its internal **schema history** from the **current source tables** (so

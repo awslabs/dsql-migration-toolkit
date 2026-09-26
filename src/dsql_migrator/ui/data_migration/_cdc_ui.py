@@ -581,17 +581,28 @@ def _render_cdc_source_config_card(
         source_type=source_type,
         wm_gtid_only=wm_gtid_only,
         resumes_from_offset=resumes_from_offset,
+        # The CAUSE of a re-snapshot, derived from the RAW job (the card only sees the
+        # watermark, whose slot has already been suppressed for an unfinished load, so it
+        # cannot tell "never provisioned" from "not honoured yet" on its own).
+        resnapshot_reason=pg_resnapshot_reason(
+            job, source_type=source_type, start_mode=mode
+        ),
     )
 
     # On a restart the connector config below is not what decides the start position (the
     # committed offset is), so an absent effective_resume must not hide the rest of the
-    # card -- it is exactly the state a resume renders in. A PostgreSQL Manual choice
-    # (re-snapshot, snapshot.mode=initial) is likewise a resolvable start with no coordinate,
-    # so it must not early-return either.
+    # card -- it is exactly the state a resume renders in. A PostgreSQL re-snapshot is
+    # likewise a resolvable start with no coordinate, so it must not early-return either --
+    # and that holds for AUTOMATIC as much as for Manual. Testing Manual alone hid the
+    # connector-config preview on the one route whose config is the surprise: the params
+    # file inside it prints `PgSnapshotMode: initial` / `PgPublicationAutocreateMode:
+    # filtered`, which is the re-snapshot in the tool's own machine-readable words. MySQL
+    # with a usable watermark has an effective_resume and so always showed it; this closes
+    # a gap that made the PG path look like a different app.
     if (
         effective_resume is None
         and not resumes_from_offset
-        and not (is_pg and mode == "manual")
+        and not (is_pg and (mode == "manual" or not wm_usable))
     ):
         return
 
@@ -872,6 +883,9 @@ def _render_cdc_start_point_card(
     # no start point left to choose -- the card reports the resume instead of demanding a
     # coordinate it does not need.
     resumes_from_offset: bool = False,
+    # Why a PostgreSQL start re-snapshots (see :func:`pg_resnapshot_reason`), or None when
+    # it does not. Passed in because the cause is only visible on the RAW job.
+    resnapshot_reason: Optional[str] = None,
 ) -> None:
     """Render the PRIMARY 'CDC start point' card with an Automatic/Manual choice.
 
@@ -894,9 +908,17 @@ def _render_cdc_start_point_card(
     GTID/binlog inputs are shown.
     """
     is_pg = source_type is SourceType.POSTGRES
-    # A PostgreSQL Manual choice (re-snapshot) is a resolved start with no coordinate, so
-    # it is "ready" even though effective_resume is None.
-    ready = resumes_from_offset or effective_resume is not None or (is_pg and mode == "manual")
+    # A PostgreSQL re-snapshot is a RESOLVED start with no coordinate, so it is "ready" even
+    # though effective_resume is None -- for Automatic just as much as for Manual. Testing
+    # Manual alone put an amber "Action needed" badge directly above an ENABLED blue
+    # "Start CDC" (the button's own readiness test passes on the LSN), telling the operator
+    # something was broken when the only thing missing was a slot they can no longer get.
+    # What Automatic does here is disclosed by the notice below, not by a false alarm.
+    ready = (
+        resumes_from_offset
+        or effective_resume is not None
+        or (is_pg and (mode == "manual" or not wm_usable))
+    )
     with ui.card().classes("w-full"):  # type: ignore[attr-defined]
         with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
             ui.icon(  # type: ignore[attr-defined]
@@ -905,11 +927,20 @@ def _render_cdc_start_point_card(
             ).classes("text-xl")
             ui.label("CDC start point").classes("text-sm font-semibold")  # type: ignore[attr-defined]
             # "What is this?" moved to a hover ⓘ instead of a standing paragraph.
+            # The unconditional "Automatic resumes exactly where the Full Load snapshot
+            # ended" was the tool asserting the operator's assumption as fact, and it was
+            # the ONLY explanatory text attached to Automatic anywhere on this card -- so on
+            # a PostgreSQL load that recorded no slot it taught the wrong model at exactly
+            # the moment the operator was forming one.
             ui.icon("info").classes(  # type: ignore[attr-defined]
                 "text-gray-400 text-sm cursor-help"
             ).tooltip(
                 "Where change streaming begins. Automatic resumes exactly where the "
                 "Full Load snapshot ended (no gap, no overlap)."
+                if wm_usable or not is_pg
+                else "Where change streaming begins. This load left no replication slot "
+                "to resume from, so streaming begins with a fresh snapshot of every "
+                "selected table -- nothing is lost, but the source is read again."
             )
             ui.space()  # type: ignore[attr-defined]
             if locked:
@@ -946,10 +977,16 @@ def _render_cdc_start_point_card(
 
         if is_pg:
             # PostgreSQL: Automatic = gapless from the slot; Manual = re-snapshot (initial).
+            # Without a slot Automatic is NOT "(unavailable)" -- it stays selected, it works,
+            # and it produces the same snapshot.mode=initial Manual does. Labelling the
+            # PRE-SELECTED default unavailable was the card's most direct contradiction of
+            # itself: it implied the operator had to act while the enabled Start button
+            # implied they did not. Name what Automatic will DO instead.
             auto_label = (
                 "Automatic — gapless from the replication slot (recommended)"
                 if wm_usable
-                else "Automatic — needs a Full Load slot (unavailable)"
+                else "Automatic — re-snapshot every selected table (no Full Load slot "
+                "to resume from)"
             )
             manual_label = "Manual — re-snapshot from scratch (initial)"
         else:
@@ -996,19 +1033,19 @@ def _render_cdc_start_point_card(
         if not wm_usable and mode == "auto" and not locked:
             if is_pg:
                 # PG has no offset seeder: Automatic needs the replication slot the tool
-                # creates at the Full Load consistency point. Absent one, steer to Manual
-                # (re-snapshot) rather than a dead end.
-                render_notice(
-                    ui,
-                    tone="warning",
-                    header="No replication slot from a Full Load in this session",
-                    body=(
-                        "Automatic resumes from the logical replication slot the tool "
-                        "creates at the Full Load consistency point, and none is recorded "
-                        "here. Run a Full Load with CDC enabled for a gapless handoff, or "
-                        "choose Manual to re-snapshot every table from scratch."
-                    ),
-                )
+                # creates at the Full Load consistency point. Absent one, Automatic
+                # re-snapshots -- so say what it is about to DO and what that costs, keyed
+                # on the CAUSE. The previous wording ("...or choose Manual to re-snapshot
+                # every table from scratch") read as if Automatic were a dead end and the
+                # re-snapshot were Manual's behaviour, i.e. it described the re-read as
+                # something the operator had NOT chosen -- while leaving the default
+                # selected does exactly that. It also named the missing slot as the cause in
+                # every state, which is wrong for a load that merely failed.
+                _notice = pg_resnapshot_notice(resnapshot_reason)
+                if _notice is not None:
+                    render_notice(
+                        ui, tone="warning", header=_notice[0], body=_notice[1]
+                    )
             elif wm_gtid_only:
                 # Name the cause AND the fix. This is the one case where the operator can
                 # get a real gapless handoff by changing something on the source, so a
@@ -1404,9 +1441,24 @@ def _cdc_start_detail(
 
     parts = [f"stack {stack_name}"]
     if watermark is not None:
+        # "gapless" is a claim about the SLOT, not about merely HAVING a watermark. A
+        # PostgreSQL Full-load-only watermark carries a WAL LSN and no slot, so nothing can
+        # resume from it and the connector re-snapshots instead -- certifying that start as
+        # gapless in the PERMANENT record was worse than saying nothing, because Step 4 will
+        # show rows the source no longer has and this line is the only durable artifact a
+        # reader has to explain them. Mirrors ``pg_snapshot_mode``: PostgreSQL re-snapshots
+        # when no slot was recorded OR a full snapshot is forced.
+        pg_resnapshots = source_type is SourceType.POSTGRES and (
+            not getattr(watermark, "slot_name", None) or force_snapshot
+        )
         parts.append(
             f"start point {watermark_coordinate(watermark, source_type)} "
-            "(gapless from the Full Load watermark)"
+            + (
+                "(re-snapshot: every selected table is read again before streaming, so "
+                "rows DELETED on the source since the Full Load remain on the target)"
+                if pg_resnapshots
+                else "(gapless from the Full Load watermark)"
+            )
         )
     else:
         parts.append(
@@ -1990,6 +2042,12 @@ def _render_cdc_start_button(
     # never be started.
     is_pg = _cdc_source_type(session) is SourceType.POSTGRES
     mode = migration_state.cdc_start_mode()
+    # Whether THIS start re-snapshots. Two claims below are false when it does: that Start
+    # CDC "begins streaming" in "a few minutes", and that the table set "is what makes the
+    # handoff gapless". Computed here so both read the same predicate.
+    _resnapshots = pg_start_resnapshots(
+        watermark, source_type=_cdc_source_type(session), start_mode=mode
+    )
     ready = (
         resumes_from_offset
         or (override is not None and override.has_coordinates())
@@ -2038,6 +2096,17 @@ def _render_cdc_start_button(
                 "Infrastructure is deployed. Start CDC creates the connectors for your "
                 "selected tables (source first, then sink) and begins streaming. It "
                 "takes a few minutes; progress appears below."
+                if not _resnapshots
+                # "begins streaming ... a few minutes" is the sentence that seals the
+                # assumption: it omits the snapshot phase entirely, so an operator on the
+                # re-snapshot route expects incremental changes within minutes and instead
+                # gets a full re-copy of the dataset. The connectors really do appear in
+                # minutes -- what follows them does not.
+                else "Infrastructure is deployed. Start CDC creates the connectors for "
+                "your selected tables (source first, then sink) in a few minutes — but "
+                "this start has nothing to resume from, so the source connector then "
+                "takes a FRESH SNAPSHOT of every selected table before any change "
+                "streams. Progress appears below."
             ),
         )
 
@@ -2114,9 +2183,15 @@ def _render_cdc_start_button(
                 "the infrastructure was created and cannot be changed, and MSK does not "
                 "reclaim that capacity.\n\n"
                 + (
+                    # Only assert gaplessness when this start actually IS gapless. Gated on
+                    # full_load_ran alone, this told the operator in the tool's own voice
+                    # that the handoff was gapless on the one route that re-snapshots.
                     "It matches the Full Load snapshot, which is what makes the handoff "
                     "gapless — streaming a different set means a fresh migration, via "
                     "'Start over' (top right)."
+                    if full_load_ran and not _resnapshots
+                    else "It matches the Full Load snapshot — streaming a different set "
+                    "means a fresh migration, via 'Start over' (top right)."
                     if full_load_ran
                     else "To stream a different set, delete the CDC infrastructure below "
                     "and deploy it again for the tables you want."
@@ -3047,6 +3122,24 @@ async def _open_cdc_infra_dialog(
             )
         except Exception:  # noqa: BLE001 - unreadable is not absent; never block on it
             pg_infra_block = None
+    # The target-foreign-key precondition, checked HERE as well as at Start. It BLOCKS at
+    # Start, and it existed only there -- so a session whose preceding "Full load only" run
+    # applied and validated the FKs (which that run does, by design) paid for the MSK
+    # Serverless cluster first and was refused afterwards, leaving the cluster billing while
+    # idle. Same probe, same copy, lower severity: at Deploy it is a sequencing warning, not
+    # a block, because it is never a dead end (this migration's own FKs have a one-click
+    # Remove in the Start dialog and cut over re-creates them).
+    fk_preview = None
+    if not conn_blocker:
+        try:
+            _fk_probed = await run.io_bound(
+                _probe_cdc_blocking_foreign_keys,
+                migration_state, session, inventory, _cdc_watermark(job),
+            )
+        except Exception:  # noqa: BLE001 - advisory here; Start is the blocking gate
+            _fk_probed = None
+        if _fk_probed is not None and _fk_probed.blocking:
+            fk_preview = _fk_probed
     with ui.dialog() as dialog, ui.card().classes("gap-2").style("min-width: 460px"):  # type: ignore[attr-defined]
         ui.label("Deploy CDC infrastructure").classes("text-lg font-semibold")  # type: ignore[attr-defined]
         ui.label(  # type: ignore[attr-defined]
@@ -3069,6 +3162,59 @@ async def _open_cdc_infra_dialog(
         # NAT base is only incurred when the stack creates its own NAT ("create");
         # reused existing subnets ("discovered") have no new NAT charge.
         _render_cdc_cost_estimate(ui, includes_nat=(net_kind == "create"))
+        # THE pre-spend disclosure. This dialog is where the billable MSK cluster is
+        # authorised, and it is the last point at which "cancel and run it as Full load +
+        # CDC" is still cheap -- so if this CDC start is going to re-read the whole source,
+        # it has to be said HERE, under the hourly figure it qualifies.
+        #
+        # Gated on the AFTER-A-LOAD causes only. A fresh "Full load + CDC" deploy (the
+        # recommended flow: deploy, then load) has no watermark yet and WILL be gapless, so
+        # alarming it would be a false warning on the happy path; the same reasoning
+        # excludes a stand-alone CDC-only start, where nothing was read here to re-read.
+        _rs_reason = pg_resnapshot_reason(
+            job,
+            source_type=_cdc_source_type(session),
+            start_mode=migration_state.cdc_start_mode(),
+        )
+        if _rs_reason in _PG_RESNAPSHOT_AFTER_LOAD:
+            _rs_notice = pg_resnapshot_notice(_rs_reason)
+            if _rs_notice is not None:
+                _rs_header, _rs_body = _rs_notice
+                # Size signal from the Full Load's own scan-free estimates, so the operator
+                # weighs a real dataset rather than the word "every". Omitted silently when
+                # the watermark carries no counts -- an invented number would be worse.
+                _rs_counts = _cdc_row_counts_from_watermark(
+                    _cdc_watermark(job),
+                    _cdc_tables_for_config(
+                        migration_state, inventory, _cdc_watermark(job)
+                    ),
+                )
+                if _rs_counts:
+                    _rs_body += (
+                        f" By the Full Load's own estimate that is about "
+                        f"{sum(_rs_counts.values()):,} rows across {len(_rs_counts)} "
+                        f"table(s)."
+                    )
+                _render_notice(
+                    ui,
+                    tone="warning",
+                    icon="restart_alt",
+                    header=_rs_header,
+                    body=_rs_body,
+                )
+        if fk_preview is not None:
+            _render_notice(
+                ui,
+                tone="warning",
+                icon="link",
+                header=_cdc_fk_block_reason(fk_preview)[1],
+                body=(
+                    _cdc_fk_block_body(fk_preview, can_remove_here=False)
+                    + " Start CDC refuses while this is true, so clear it BEFORE you "
+                    "deploy: MSK Serverless bills from creation and the cluster would "
+                    "sit idle until it is cleared."
+                ),
+            )
         if net_message:
             # Only "blocked" is an error (Deploy is disabled below); creating a NAT
             # or reusing subnets is just an FYI, so it reads as a calm info notice.
@@ -3473,6 +3619,146 @@ def _cdc_watermark(job):
     if getattr(job, "status", None) != "DONE" and getattr(wm, "slot_name", None):
         return wm.model_copy(update={"slot_name": None})
     return wm
+
+
+def pg_start_resnapshots(watermark, *, source_type, start_mode: str) -> bool:
+    """Will this PostgreSQL start RE-READ every captured table? Pure.
+
+    ONE rule for every surface that has to disclose the second read, taken off the same
+    :func:`pg_snapshot_mode` the connector config and the Deploy/Start gates already call --
+    the mirror lives in one place, for exactly the reason spelled out in
+    :func:`_pg_objects_gate_block`.
+
+    Note this is deliberately True when ``watermark is None``: a start with no watermark in
+    this session also runs ``snapshot.mode=initial``, and keying the disclosure on the
+    in-memory object would go SILENT in the one state the job record is gone (an app
+    restart) -- the inverse of the bug this exists to fix. WHY the re-read happens is a
+    separate question with four different answers; ask :func:`pg_resnapshot_reason`, which
+    reads the RAW job because this watermark has already had its slot suppressed.
+    """
+    if source_type is not SourceType.POSTGRES:
+        return False
+    return (
+        pg_snapshot_mode(watermark, force_initial_snapshot=(start_mode == "manual"))
+        == "initial"
+    )
+
+
+def pg_resnapshot_reason(job, *, source_type, start_mode: str) -> Optional[str]:
+    """WHY a PostgreSQL start re-snapshots: the cause decides the REMEDY. Pure.
+
+    ``None`` when the start is gapless. Otherwise one of:
+
+    * ``"unfinished_load"`` -- the slot EXISTS on the source but :func:`_cdc_watermark`
+      suppressed it because the load did not reach ``DONE``. Remedy: retry the failed
+      tables; the slot is honoured again on its own once the job is DONE. Telling this
+      operator "no slot was recorded" would push a full re-load where a retry sufficed.
+    * ``"manual"`` -- a gapless resume WAS available and the operator chose a clean
+      re-copy. Remedy: switch the start point back to Automatic. Not a defect, and not
+      something to blame on a missing slot.
+    * ``"no_slot"`` -- a finished load that never provisioned one, i.e. "Full load only".
+      Remedy: start over as "Full load + CDC"; a slot cannot be created at a past LSN.
+    * ``"no_watermark"`` -- no Full Load record in this session at all (CDC-only, or the
+      job record was lost). Nothing was read here, so "read AGAIN" must not be claimed.
+
+    Checked against the RAW job on purpose: ``_cdc_watermark`` strips ``slot_name`` for an
+    unfinished load, so the stripped watermark cannot tell those two causes apart.
+    """
+    if source_type is not SourceType.POSTGRES:
+        return None
+    raw = getattr(job, "watermark", None) if job is not None else None
+    if raw is None:
+        return "no_watermark"
+    slot_recorded = bool(getattr(raw, "slot_name", None))
+    if not slot_recorded:
+        return "no_slot"
+    if getattr(job, "status", None) != "DONE":
+        return "unfinished_load"
+    return "manual" if start_mode == "manual" else None
+
+
+# Per-CAUSE wording for a re-snapshotting PostgreSQL start: (header, cause, remedy).
+# Kept as data, in one place, because the same disclosure has to appear on several surfaces
+# and the REMEDY is different for every cause -- a single "no slot was recorded" message
+# would send an operator whose load merely FAILED into a full re-load when a retry was
+# enough, and would blame a missing slot for a re-copy the operator deliberately chose.
+_PG_RESNAPSHOT_CAUSE: dict[str, tuple[str, str, str]] = {
+    "no_slot": (
+        "This CDC start will re-read every selected table",
+        "A gapless resume needs the replication slot the tool creates at the Full Load "
+        'consistency point, and a "Full load only" run does not create one. A logical '
+        "replication slot cannot be created at, or rewound to, a past position, so that "
+        "option cannot be recovered for this load.",
+        'To stream without re-reading, start over as "Full load + CDC", which creates the '
+        "slot at the snapshot point before the load.",
+    ),
+    "unfinished_load": (
+        "This Full Load did not finish, so its replication slot is not used",
+        "The slot does exist on the source, but tables that never loaded have no baseline "
+        "-- resuming from it would leave their rows permanently absent, with no error. "
+        "Re-snapshotting every selected table is the lossless route.",
+        "Retry the failed tables first: once the load reaches DONE the slot is honoured "
+        "again and the gapless resume comes back on its own, with no re-read.",
+    ),
+    "manual": (
+        "Manual re-snapshots instead of resuming from this load's slot",
+        "A gapless resume IS available here -- this Full Load created the replication "
+        "slot. Manual takes a fresh copy instead, which is a legitimate choice but reads "
+        "the source again.",
+        "Switch the start point back to Automatic to resume from the slot with no re-read.",
+    ),
+    "no_watermark": (
+        "This CDC start will snapshot every selected table first",
+        "There is no Full Load watermark in this session to resume from, so the connector "
+        "creates its own publication and slot and snapshots every selected table before "
+        "it streams any change.",
+        'If a Full Load did run in this migration, its job record is gone from this '
+        'session; only a "Full load + CDC" run records a slot to resume from.',
+    ),
+}
+
+# Whether a Full Load in THIS migration wrote rows to the target. Decides two sentences:
+# "read a SECOND time" and the deleted-row residue are claims about a preceding load, and
+# both would be false for a stand-alone CDC-only start.
+_PG_RESNAPSHOT_AFTER_LOAD = {"no_slot", "unfinished_load", "manual"}
+
+
+def pg_resnapshot_notice(reason: Optional[str]) -> Optional[tuple[str, str]]:
+    """``(header, body)`` disclosing a re-snapshotting PostgreSQL start, or ``None``. Pure.
+
+    All the copy for this route in ONE place, so the Deploy dialog, the start-point card and
+    the Start dialog cannot tell an operator three different stories -- and so a test can
+    pin the wording without driving three renders.
+
+    No wall-clock estimate is given on purpose. The re-snapshot runs through the STREAMING
+    pipeline (Debezium -> MSK -> the sink), not the bulk loader, and the repo's own
+    measurements put those an order of magnitude apart, so "about as long as the Full Load"
+    would be a number the tool cannot support. State the direction, not a figure.
+    """
+    entry = _PG_RESNAPSHOT_CAUSE.get(reason or "")
+    if entry is None:
+        return None
+    header, cause, remedy = entry
+    after_load = reason in _PG_RESNAPSHOT_AFTER_LOAD
+    lossless = (
+        "Nothing is lost: there is no window between the snapshot and the stream, and the "
+        "target apply is idempotent."
+    )
+    if after_load:
+        cost = (
+            "The cost is that every selected table is read from the source a second time "
+            "and every row crosses MSK into DSQL again -- through the streaming pipeline "
+            "rather than the bulk loader, so expect it to take LONGER than the Full Load "
+            "did. Rows DELETED on the source since the Full Load also stay on the target, "
+            "because a fresh snapshot only reports the rows that still exist."
+        )
+    else:
+        cost = (
+            "The cost is that the whole selection crosses MSK into DSQL through the "
+            "streaming pipeline before any change is streamed, so expect the initial "
+            "snapshot to take a while on a large source."
+        )
+    return header, " ".join((cause, lossless, cost, remedy))
 
 
 def _pg_objects_gate_block(

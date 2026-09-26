@@ -794,7 +794,14 @@ def build_ai_tool_executor(
                         "snapshot_timestamp": _snap.isoformat() if _snap else None,
                     }
                 try:
-                    _resume_mode = _dm.cdc_start_mode
+                    # CALL it. `cdc_start_mode` is a method, so binding it without the
+                    # parentheses put a bound method in the payload and `json.dumps` below
+                    # raised "Object of type method is not JSON serializable" -- for EVERY
+                    # session, on every invocation, swallowed by this tool's catch-all into
+                    # a bare "tool lookup failed". The whole CDC diagnostic was dead, which
+                    # is invisible in tests because nothing asserts the tool's happy path
+                    # serialises.
+                    _resume_mode = _dm.cdc_start_mode()
                 except Exception:  # noqa: BLE001
                     _resume_mode = None
                 return _json.dumps(
