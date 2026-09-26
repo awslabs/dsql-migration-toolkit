@@ -542,6 +542,20 @@ def build_data_migration_screen(
         # prerequisite check, which must not touch foreign-key state.
         migration_state.set_fk_apply_result(None)
         migration_state.set_fk_apply_progress(0, 0)
+        # A NEW run is a NEW decision, so the previous run's accepted gap does not carry
+        # into it. It used to: the flag was read at run time, so an operator who accepted a
+        # 3-row gap and then pressed "Re-run Full Load" got a run that finished green with
+        # "you accepted that gap" for a gap they had never been shown. Scoping the old flag
+        # by gap SIZE (``accepted_quarantine_rows``) was not enough either -- three DIFFERENT
+        # rows, or three rows in a DIFFERENT table, are the same count, and the operator
+        # consented to specific rows, not to a number. It is also exactly backwards for the
+        # commonest reason to re-run: having fixed the offending source values, the operator
+        # needs to SEE whether the gap is gone, and a carried-over acceptance hides that.
+        #
+        # Only the START path clears it. A RETRY (see ``_retry_failed_tables``) continues the
+        # SAME run's unfinished work, and the operator already consented to that run's gap,
+        # so re-asking there would be a click for nothing.
+        migration_state.set_accept_quarantined_rows(False)
         # Record WHICH prerequisite mode cleared the gate for this run. The reports
         # are not persisted, so the run-guard excuses an absent report once a run
         # exists; scoping that excuse to this mode is what stops a later switch to a

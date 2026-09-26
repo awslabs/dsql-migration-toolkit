@@ -14301,6 +14301,111 @@ def test_accept_flag_is_threaded_from_state_into_both_renders() -> None:
         ), f"{fn} must receive the accepted flag from session state, got {wired[fn]}"
 
 
+def test_starting_a_new_full_load_clears_a_previous_accepted_gap() -> None:
+    """A NEW run is a NEW decision; a RETRY of the same run is not.
+
+    The flag was read at RUN time, so an operator who accepted a 3-row gap and then pressed
+    "Re-run Full Load" got a run that finished green with "you accepted that gap" for a gap
+    they had never been shown. Scoping the carried flag by gap SIZE was not enough either:
+    three DIFFERENT rows, or three rows in a DIFFERENT table, are the same count, and the
+    consent was to specific rows, not to a number. It is also backwards for the commonest
+    reason to re-run -- having fixed the offending source values, the operator needs to SEE
+    whether the gap is gone, which a carried-over acceptance hides.
+
+    Asserted structurally (the start handler is a closure inside the page builder, so it
+    cannot be called directly) and BOTH WAYS, because the danger is symmetric: clearing on a
+    retry would re-ask for a gap already consented to, which is a click for nothing.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    tree = ast.parse(inspect.getsource(dm.build_data_migration_screen))
+
+    def _calls(fn_node):
+        return {
+            node.func.attr: [ast.unparse(a) for a in node.args]
+            for node in ast.walk(fn_node)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+
+    # The START path is the function that also supersedes the previous FK application --
+    # the same "a new load invalidates the last one's outcome" block. Find it by that
+    # marker rather than by name, so a rename does not silently skip this test.
+    def _innermost(matching):
+        """Drop any candidate that merely CONTAINS another candidate.
+
+        ``ast.walk`` sees nested defs, so the page builder itself matches every predicate
+        its handlers do -- including the accept handler's own
+        ``set_accept_quarantined_rows(True)``. Only the innermost match is the handler.
+        """
+        return [
+            fn
+            for fn in matching
+            if not any(
+                other is not fn
+                and fn.lineno <= other.lineno
+                and (other.end_lineno or other.lineno) <= (fn.end_lineno or fn.lineno)
+                for other in matching
+            )
+        ]
+
+    starters = _innermost(
+        [
+            fn
+            for fn in ast.walk(tree)
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and "set_fk_apply_result" in _calls(fn)
+            and "set_prereq_gated_mode" in _calls(fn)
+        ]
+    )
+    assert starters, "could not find the Full Load start handler"
+    for fn in starters:
+        calls = _calls(fn)
+        assert "set_accept_quarantined_rows" in calls, (
+            f"{fn.name} starts a new Full Load but does not clear the previous "
+            "accepted gap — the new run would finish green on a gap nobody saw"
+        )
+        assert calls["set_accept_quarantined_rows"] == ["False"], (
+            "the start path must CLEAR the acceptance, not set it"
+        )
+
+    # ...and the RETRY path must NOT clear it: it finishes the SAME run's unfinished work,
+    # whose gap the operator already accepted. Identified by the retry entry point it calls.
+    # Identified by BOTH markers: it submits a retry AND it is the frame that reads the flag
+    # into a local. Keying on `run_full_load_retry` alone matched the nested `work()` closure
+    # instead of the handler around it, which made this half of the assertion vacuous -- a
+    # mutation that cleared the flag on the retry path survived.
+    retries = _innermost(
+        [
+            fn
+            for fn in ast.walk(tree)
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and any(
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name)
+                and n.func.id == "run_full_load_retry"
+                for n in ast.walk(fn)
+            )
+            and any(
+                isinstance(n, ast.Assign)
+                and any(
+                    isinstance(t, ast.Name) and t.id == "accept_quarantined"
+                    for t in n.targets
+                )
+                for n in ast.walk(fn)
+            )
+        ]
+    )
+    assert retries, "could not find the retry handler"
+    for fn in retries:
+        assert "set_accept_quarantined_rows" not in _calls(fn), (
+            f"{fn.name} retries the SAME run, so re-asking for an already-accepted gap "
+            "would be a click for nothing"
+        )
+
+
 def test_accept_action_renders_after_the_completeness_verdict() -> None:
     """The action must follow the verdict it acts on.
 

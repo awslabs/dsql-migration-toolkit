@@ -5,6 +5,12 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.546
+
+### Fixed
+
+- **Accepting a dropped-row gap once made every later Full Load accept its gap silently.** "Accept quarantined rows & continue" set a flag that was read at RUN time, so an operator who accepted a 3-row gap and then pressed **Re-run Full Load** got a run that finished green — "Full Load complete — with an accepted gap … you accepted that gap, so the next step is unblocked" — for a gap they had never been shown and never consented to. The flag was scoped by gap SIZE (auto-accept only a gap no larger than the accepted one), and that is not enough: three DIFFERENT rows, or three rows in a DIFFERENT table, are the same count, and the consent was to specific rows rather than to a number. It is also backwards for the commonest reason to re-run — having fixed the offending source values, the operator needs to SEE whether the gap is gone, and a carried-over acceptance hides exactly that. A new run now starts with the acceptance cleared, in the same "a new load supersedes the last one's outcome" block that already discards the previous foreign-key application, so the operator is asked again against the run in front of them. A **retry** of the same run still keeps it: that finishes the unfinished work of a run whose gap was already accepted, so re-asking there would be a click for nothing.
+
 ## v0.1.545
 
 ### Fixed
