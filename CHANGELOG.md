@@ -5,6 +5,13 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.543
+
+### Fixed
+
+- **The CDC VpcId prefill could never work on a managed deployment, and said nothing about why.** It derives the VPC from the SOURCE database's own `DBSubnetGroup`, but the app stack's task role had no `rds:Describe*` at all (IAM simulate: `rds:DescribeDBInstances` → `implicitDeny`; neither deploy template mentioned it). The read was AccessDenied, the exception was discarded, and the field simply stayed empty — indistinguishable from "the tool never tried". It DOES work from a laptop whose credentials happen to have RDS access, which is why a missing grant looked like a feature that had regressed. Both templates now grant `rds:DescribeDBInstances` **and** `rds:DescribeDBClusters` — the second is load-bearing because an Aurora source is given as a CLUSTER endpoint and the writer member is resolved from the cluster — strictly read-only, on `Resource: "*"` because the source is an arbitrary endpoint the operator types rather than a resource this stack owns. **This is a TEMPLATE change: an image-only stack update leaves the prefill broken** (the same trap as v0.1.503's PG-CDC grants), so the app stack needs a full-template update.
+- **…and the failure is no longer silent.** The derivation now records WHY it produced nothing and the VpcId field shows it, in amber: an AccessDenied names the two missing actions and says to update the app stack (or enter the VPC yourself), while a non-RDS source — a self-managed PostgreSQL on EC2, or a cross-account endpoint — says there is no `DBSubnetGroup` to derive from instead of blaming permissions. The prefill still never blocks: the field remains editable in every case.
+
 ## v0.1.542
 
 ### Fixed

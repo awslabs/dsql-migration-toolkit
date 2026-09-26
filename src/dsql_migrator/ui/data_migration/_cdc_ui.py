@@ -2847,6 +2847,17 @@ def _render_cdc_infra_form(
                         "private connectivity to it) — the connector must reach the "
                         "source privately."
                     ).classes("w-full text-xs text-gray-500")
+                    # WHY it is not prefilled, when the tool tried and could not. Amber
+                    # rather than gray: an AccessDenied here is a real, fixable gap in the
+                    # deployment, and leaving it unsaid is what made the prefill look like
+                    # a feature that had disappeared.
+                    _note = getattr(
+                        migration_state, "cdc_vpc_derivation_note", None
+                    )
+                    if _note:
+                        ui.label(_note).classes(  # type: ignore[attr-defined]
+                            "w-full text-xs text-amber-700"
+                        )
 
             def _save(_e, k=key, f=field) -> None:
                 current = migration_state.cdc_infra_inputs()
@@ -3184,6 +3195,13 @@ def derive_cdc_vpc_from_source(migration_state, session) -> bool:
     fields = migration_state.cdc_infra_inputs()
     if (fields.get("vpc_id") or "").strip():
         return False  # the operator (or an earlier derivation) already supplied one
+    # WHY it produced nothing, for the field's hint. Swallowing the reason is what made
+    # this feature look ABSENT rather than unpermitted: on a managed deployment the read is
+    # AccessDenied (the task role had no rds:DescribeDBInstances), the exception was
+    # discarded, and the field simply stayed empty -- indistinguishable from "the tool never
+    # tried". It works from a laptop whose credentials happen to have RDS access, which is
+    # how it looked like a regression rather than a missing grant.
+    migration_state.cdc_vpc_derivation_note = None
     try:
         from dsql_migrator.core.rds_metadata import (
             build_rds_client,
@@ -3195,9 +3213,29 @@ def derive_cdc_vpc_from_source(migration_state, session) -> bool:
             getattr(session, "aws_profile", None), parse_rds_region(host)
         )
         info = fetch_source_network(client, host)
-    except Exception:  # noqa: BLE001 - best effort; the manual field remains
+    except Exception as exc:  # noqa: BLE001 - best effort; the manual field remains
+        text = f"{type(exc).__name__}: {exc}"
+        if "AccessDenied" in text or "not authorized" in text:
+            migration_state.cdc_vpc_derivation_note = (
+                "This deployment cannot read the source database's network placement: its "
+                "task role is missing rds:DescribeDBInstances (and, for an Aurora cluster "
+                "endpoint, rds:DescribeDBClusters). Update the app stack to a template "
+                "that grants them, or enter the VPC ID yourself."
+            )
+        else:
+            migration_state.cdc_vpc_derivation_note = (
+                "The source database's network placement could not be read "
+                f"({type(exc).__name__}), so the VPC could not be derived — enter it "
+                "yourself."
+            )
         return False
     if info is None or not info.vpc_id:
+        migration_state.cdc_vpc_derivation_note = (
+            "The source endpoint does not resolve to an RDS/Aurora instance in this "
+            "account and region (a self-managed PostgreSQL on EC2, or a cross-account "
+            "endpoint), so there is no DBSubnetGroup to derive the VPC from — enter it "
+            "yourself."
+        )
         return False
     fields["vpc_id"] = info.vpc_id
     # The advanced subnet override gets the same treatment: the source's own subnets are

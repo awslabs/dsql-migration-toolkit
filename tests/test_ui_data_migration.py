@@ -27476,3 +27476,131 @@ def test_no_source_count_to_compare_is_disclosed_apart_from_a_real_loss() -> Non
     assert "no pre-load count to compare" in body
     # The two are separate notices, not one sentence.
     assert "dropped; 4" not in body and "dropped; 4 without" not in body
+
+
+def test_a_vpc_prefill_that_cannot_run_says_why_instead_of_leaving_it_blank() -> None:
+    """The prefill looked like a feature that had disappeared.
+
+    ``derive_cdc_vpc_from_source`` reads the source DB's own DBSubnetGroup, and on a managed
+    deployment that read was AccessDenied -- the task role had no ``rds:DescribeDBInstances``
+    (verified with IAM simulate: implicitDeny; neither deploy template granted any
+    ``rds:Describe*``). The exception was discarded, so the field simply stayed empty,
+    indistinguishable from "the tool never tried" -- and it DID work from a laptop whose
+    credentials happened to have RDS access, which is why it read as a regression rather
+    than a missing grant.
+    """
+    from dsql_migrator.ui.data_migration import derive_cdc_vpc_from_source
+
+    class _State:
+        def __init__(self):
+            self._fields = {}
+            self.cdc_vpc_provenance = None
+            self.cdc_vpc_derivation_note = None
+
+        def cdc_infra_inputs(self):
+            return dict(self._fields)
+
+        def set_cdc_infra_inputs(self, fields):
+            self._fields = dict(fields)
+
+    class _Session:
+        aws_profile = None
+
+        class source_config:  # noqa: N801 - a stand-in for the pydantic config
+            host = "src.cluster-abc.us-east-1.rds.amazonaws.com"
+
+    import dsql_migrator.core.rds_metadata as rds_metadata
+
+    def _denied(*_a, **_k):
+        raise RuntimeError(
+            "An error occurred (AccessDenied) when calling the DescribeDBInstances "
+            "operation: not authorized"
+        )
+
+    state = _State()
+    original = rds_metadata.fetch_source_network
+    try:
+        rds_metadata.fetch_source_network = _denied
+        assert derive_cdc_vpc_from_source(state, _Session()) is False
+    finally:
+        rds_metadata.fetch_source_network = original
+
+    note = state.cdc_vpc_derivation_note
+    assert note, "an AccessDenied prefill must not fail silently"
+    assert "rds:DescribeDBInstances" in note, note
+    assert "rds:DescribeDBClusters" in note, note  # an Aurora source is a CLUSTER endpoint
+    assert "Update the app stack" in note, note  # the actual fix, not just the symptom
+    # The field is still left for the operator -- the prefill never blocks.
+    assert not (state.cdc_infra_inputs().get("vpc_id") or "")
+
+    # A NON-RDS source is a different reason and must say so, not blame permissions.
+    state2 = _State()
+    try:
+        rds_metadata.fetch_source_network = lambda *_a, **_k: None
+        assert derive_cdc_vpc_from_source(state2, _Session()) is False
+    finally:
+        rds_metadata.fetch_source_network = original
+    assert "does not resolve to an RDS/Aurora instance" in (
+        state2.cdc_vpc_derivation_note or ""
+    ), state2.cdc_vpc_derivation_note
+    assert "rds:DescribeDBInstances" not in (state2.cdc_vpc_derivation_note or "")
+
+    # ... and the reason is actually RENDERED on the VpcId field. A note nothing shows is
+    # the same silence this fixes, so the render path is pinned too.
+    # ... and the reason is actually RENDERED on the VpcId field, driven through the form:
+    # a reason nothing shows is the same silence this fixes.
+    from dsql_migrator.ui.data_migration import _render_cdc_infra_form
+
+    labels: list[str] = []
+    classes_seen: list[str] = []
+
+    class _El:
+        def classes(self, *a, **_k):
+            classes_seen.extend(str(x) for x in a)
+            return self
+
+        def props(self, *_a, **_k):
+            return self
+
+        def on(self, *_a, **_k):
+            return self
+
+        def on_value_change(self, *_a, **_k):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_e):
+            return False
+
+    class _Ui:
+        def input(self, *_a, **_k):
+            return _El()
+
+        def label(self, text="", *_a, **_k):
+            if text:
+                labels.append(str(text))
+            return _El()
+
+        row = column = expansion = lambda self, *_a, **_k: _El()
+
+    class _FormState:
+        cdc_stack_name = "dsql-cdc-stack"
+        cdc_vpc_provenance = None
+        cdc_vpc_derivation_note = (
+            "This deployment cannot read the source database's network placement: its task "
+            "role is missing rds:DescribeDBInstances"
+        )
+
+        def cdc_infra_inputs(self):
+            return {}  # VpcId EMPTY -- the case the note explains
+
+        def set_cdc_infra_inputs(self, _v):
+            pass
+
+    _render_cdc_infra_form(_Ui(), _FormState(), session=None)
+    rendered = " ".join(labels)
+    assert "rds:DescribeDBInstances" in rendered, rendered
+    # Amber, not gray: an AccessDenied here is a real, fixable gap in the deployment.
+    assert any("text-amber-700" in c for c in classes_seen), classes_seen

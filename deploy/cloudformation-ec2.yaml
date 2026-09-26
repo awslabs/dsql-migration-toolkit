@@ -544,6 +544,21 @@ Resources:
                 Effect: Allow
                 Action: sts:GetCallerIdentity
                 Resource: "*"
+              # The CDC VpcId prefill reads the SOURCE DB's own DBSubnetGroup, so the
+              # operator does not have to look up a VPC id the tool can derive. Without
+              # this the read is AccessDenied and swallowed, and the field just stays
+              # empty -- which is exactly how the feature looked absent on a managed
+              # deployment while working from a laptop whose credentials happened to have
+              # RDS access. DescribeDBClusters is needed too: an Aurora source is given as
+              # a CLUSTER endpoint, and the writer member is resolved from the cluster.
+              # Read-only, and no resource-level scoping is possible -- the source is an
+              # arbitrary endpoint the operator types, not a resource this stack owns.
+              - Sid: DiscoverSourceNetwork
+                Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusters
+                Resource: "*"
               # The host role itself (NOT the assumed deploy role) polls connector
               # state to drive the CDC UI: it lists connectors to find one by name
               # and waits for RUNNING before starting the sink pass. Without

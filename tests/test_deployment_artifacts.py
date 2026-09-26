@@ -462,6 +462,11 @@ def test_task_role_grants_least_privilege_dsql_and_secrets(template: dict) -> No
         "CallerIdentity",
         "DiscoverCdcConnectors",
         "ReadConnectorMetrics",
+        # The CDC VpcId prefill describes the SOURCE database, which is an arbitrary
+        # endpoint the operator types -- not a resource this stack owns, so there is
+        # nothing to scope the ARN to. Strictly read-only (Describe* only), enforced by
+        # the verb check below.
+        "DiscoverSourceNetwork",
     }
     for sid, stmt in statements.items():
         if sid in _UNSCOPABLE_READONLY_SIDS:
@@ -2171,3 +2176,37 @@ def test_container_attests_the_msk_seed_capability(template: dict) -> None:
     # NOT via DSQL_MIGRATOR_CDC_SEED_MODE: that would also switch MySQL off the
     # cdc-stack's in-VPC seeder Lambda, which is its live-verified path.
     assert "DSQL_MIGRATOR_CDC_SEED_MODE" not in env
+
+
+def test_the_task_role_can_read_the_source_network_for_the_vpc_prefill(
+    template: dict,
+) -> None:
+    """Without this grant the CDC VpcId prefill can never work on a managed deployment.
+
+    It reads the source DB's own DBSubnetGroup, and the deployed task role had NO
+    ``rds:Describe*`` at all (IAM simulate: ``rds:DescribeDBInstances`` -> implicitDeny;
+    neither template mentioned it) -- so the read was AccessDenied, swallowed, and the field
+    just stayed empty. It worked from a laptop whose credentials happened to have RDS
+    access, which is how a missing grant looked like a lost feature.
+
+    ``DescribeDBClusters`` is load-bearing too: an Aurora source is given as a CLUSTER
+    endpoint and the writer member is resolved from the cluster.
+    """
+    statements = _task_role_statements(template)
+    actions: set[str] = set()
+    for stmt in statements.values():
+        acts = stmt["Action"]
+        actions.update(acts if isinstance(acts, list) else [acts])
+
+    assert "rds:DescribeDBInstances" in actions, sorted(
+        a for a in actions if a.startswith("rds:")
+    )
+    assert "rds:DescribeDBClusters" in actions, sorted(
+        a for a in actions if a.startswith("rds:")
+    )
+    # Read-only: no RDS mutation may sneak in beside them.
+    assert all(
+        a.split(":", 1)[1].startswith("Describe")
+        for a in actions
+        if a.startswith("rds:")
+    ), sorted(a for a in actions if a.startswith("rds:"))

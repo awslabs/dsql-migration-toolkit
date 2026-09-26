@@ -83,6 +83,10 @@ class DataMigrationState:
         # see where it came from and change it (the pipeline may belong in another VPC,
         # reached by peering / Transit Gateway / PrivateLink). None when not derived.
         self.cdc_vpc_provenance: Optional[str] = None
+        # Why the VpcId prefill produced NOTHING, or None. The derivation is best effort
+        # and its failure used to be discarded, so an unpermitted deployment looked
+        # identical to one where the tool had never tried -- see derive_cdc_vpc_from_source.
+        self.cdc_vpc_derivation_note: Optional[str] = None
         # Active sub-step of the Prerequisites -> Full Load -> CDC stepper. Held
         # here so it survives the content re-render driven by the progress poller
         # (None => derive a sensible default from the current job/prereq state).
