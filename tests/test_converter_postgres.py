@@ -1513,3 +1513,140 @@ def test_a_stored_kind_without_a_captured_expression_is_not_preserved() -> None:
     assert pg_preserved_generated_columns(table) == []
     ddl = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table).target_ddl
     assert "GENERATED ALWAYS AS" not in ddl, ddl
+
+
+def test_a_postgres_enum_column_converts_to_text_with_its_values_preserved() -> None:
+    """The finding named a type nobody could act on, and the DDL could not be applied.
+
+    `format_type` returns only a user-defined type's NAME, so `ecommerce.order_status` was
+    indistinguishable from a composite or a domain: the message had to hedge across all
+    three, never said the real reason, and never showed the labels -- the ONE thing needed
+    to remodel the column. Meanwhile the DDL emitted the enum type verbatim, and Aurora DSQL
+    has no CREATE TYPE (live-verified: `CREATE TYPE ... AS ENUM` -> "CREATE TYPE not
+    supported"), so the whole CREATE TABLE was rejected at apply.
+
+    With the labels introspected the column now takes the same faithful port MySQL's ENUM
+    has always had. Live-verified end to end on a real DSQL cluster: the converted DDL
+    applies, the DEFAULT fills, a valid label inserts, an invalid one is rejected by the
+    CHECK.
+    """
+    from dsql_migrator.core.converter import SchemaConverter
+    from dsql_migrator.core.models import ColumnDef, SourceType, TableDef
+
+    labels = ("pending", "processing", "shipped", "delivered", "cancelled")
+    table = TableDef(
+        name="ecommerce.orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(
+                name="status",
+                mysql_type="ecommerce.order_status",
+                type_kind="enum",
+                enum_labels=labels,
+                default="'pending'::ecommerce.order_status",
+            ),
+        ],
+        primary_key=["id"],
+    )
+    conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+
+    line = next(l.strip().rstrip(",") for l in conv.target_ddl.splitlines() if '"status"' in l)
+    # text, not the enum type -- the type cannot be created on the target.
+    assert "ecommerce.order_status" not in line, line
+    assert '"status" TEXT' in line, line
+    # ... and the value domain survives as a CHECK over the SAME labels.
+    for label in labels:
+        assert f"'{label}'" in line, (label, line)
+    # ... and the DEFAULT is carried as a plain text literal (the cast to the enum type
+    # would have made the CREATE fail even after the column was remodelled).
+    assert "DEFAULT 'pending'" in line, line
+    assert "::ecommerce.order_status" not in line, line
+
+    # It is no longer graded UNSUPPORTED (nothing prevents the migration now), and the
+    # note leads with the OUTCOME rather than with "DSQL cannot".
+    note = next(w for w in conv.warnings if w.column_name == "status")
+    assert note.classification is Classification.MANUAL, note.classification
+    assert note.target_type == "text"
+    assert note.message.startswith("Column 'status' was converted"), note.message
+    assert "preserves the SAME allowed values" in note.message
+    assert "DEFAULT is carried over" in note.message
+    # The two real consequences must both be stated.
+    assert "DECLARATION order" in note.message
+    assert "ADD CONSTRAINT" in note.message or "ADD/DROP" in note.message.upper()
+
+
+def test_a_user_defined_type_message_names_its_KIND_not_a_type_called_enum() -> None:
+    """PostgreSQL has NO type spelled `enum` -- live-verified: `CREATE TABLE t (c enum)`
+    fails with `type "enum" does not exist`, and `pg_type` holds no row named 'enum'. So a
+    message may describe the KIND ("a user-defined enumerated type") but must never present
+    it as a type name. The kinds also have DIFFERENT outcomes, which is why they cannot stay
+    collapsed: DSQL has no CREATE TYPE (so enum/composite/range cannot exist) but it DOES
+    support CREATE DOMAIN.
+    """
+    from dsql_migrator.core.converter_postgres import unsupported_dsql_reason
+
+    enum_reason = unsupported_dsql_reason(
+        "ecommerce.order_status", type_kind="enum", enum_labels=("a", "b")
+    )
+    assert "user-defined ENUMERATED type" in enum_reason
+    assert "no CREATE TYPE" in enum_reason
+    assert "a, b" in enum_reason  # the labels, in order
+    assert "the type 'enum'" not in enum_reason
+    assert "the PostgreSQL type 'enum'" not in enum_reason
+
+    composite = unsupported_dsql_reason("ecommerce.addr_type", type_kind="composite")
+    assert "user-defined COMPOSITE type" in composite
+    assert "no CREATE TYPE" in composite
+
+    # A DOMAIN is NOT in the same boat: DSQL supports CREATE DOMAIN (live-verified --
+    # created, used as a column type, and an out-of-range value rejected by its CHECK), so
+    # the message must not claim the type is unsupported.
+    domain = unsupported_dsql_reason("ecommerce.email_address", type_kind="domain")
+    assert "supports CREATE DOMAIN" in domain
+    assert "does not support the PostgreSQL type" not in domain
+    assert "no CREATE TYPE" not in domain
+
+    # With the kind UNKNOWN (an un-enriched inventory) it must hedge honestly rather than
+    # assert one kind.
+    unknown = unsupported_dsql_reason("ecommerce.order_status")
+    assert "If it is a user-defined type" in unknown
+
+
+def test_only_a_label_of_the_type_itself_is_carried_as_the_enum_default() -> None:
+    """Rewriting any cast would put a value the new CHECK rejects into the DDL.
+
+    The DEFAULT is only unwrapped when the literal is one of the type's OWN labels, so a
+    default that the source allowed but the converted CHECK would not is left to the
+    existing "not carried" path instead of becoming an INSERT that fails at run time.
+    """
+    from dsql_migrator.core.converter_postgres import (
+        _pg_enum_default_literal,
+        pg_column_default_sql,
+    )
+    from dsql_migrator.core.models import ColumnDef
+
+    labels = ("pending", "shipped")
+    # Both cast spellings PostgreSQL uses, for a value that IS a label.
+    assert _pg_enum_default_literal("'pending'::ecommerce.order_status", labels) == "'pending'"
+    assert (
+        _pg_enum_default_literal("CAST('shipped' AS ecommerce.order_status)", labels)
+        == "'shipped'"
+    )
+    # A literal that is NOT one of the labels must NOT be rewritten.
+    assert _pg_enum_default_literal("'archived'::ecommerce.order_status", labels) is None
+    # Nor an arbitrary expression that merely carries a cast.
+    assert _pg_enum_default_literal("lower('PENDING')::ecommerce.order_status", labels) is None
+    assert _pg_enum_default_literal("CURRENT_TIMESTAMP", labels) is None
+
+    # End to end through the real default path: a non-label default falls through to the
+    # unsupported-cast branch and is reported, not silently emitted.
+    column = ColumnDef(
+        name="status",
+        mysql_type="ecommerce.order_status",
+        type_kind="enum",
+        enum_labels=labels,
+        default="'archived'::ecommerce.order_status",
+    )
+    emitted, note = pg_column_default_sql(column, is_key_column=False)
+    assert emitted is None
+    assert note and "ecommerce.order_status" in note, note

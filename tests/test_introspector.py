@@ -1344,3 +1344,84 @@ def test_postgres_introspection_keeps_the_generated_column_KIND() -> None:
     )
     # ... and the kind is what decides preservation: only STORED survives.
     assert [c.name for c in pg_preserved_generated_columns(table)] == ["stored_col"]
+
+
+def test_postgres_introspection_keeps_the_user_defined_TYPE_KIND_and_enum_labels() -> None:
+    """`format_type` returns only a user-defined type's NAME, which is why every message
+    about `ecommerce.order_status` had to hedge across enum / composite / domain.
+
+    `pg_type.typtype` and `pg_enum` were never read, so the tool could not say "enum", could
+    not show the labels the operator needs to remodel the column, and reported a DOMAIN as
+    unsupported even though Aurora DSQL supports CREATE DOMAIN.
+    """
+    from dsql_migrator.core.models import ColumnDef, TableDef
+    from dsql_migrator.core.source_dialect.postgres import _pg_enrich_columns
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def mappings(self):
+            return self._rows
+
+    class _Connection:
+        def execute(self, statement, params):  # noqa: ANN001, ANN201
+            self.sql = str(statement)
+            return _Result(
+                [
+                    {"col": "id", "typ": "bigint", "gen": "", "ident": ""},
+                    {
+                        "col": "status",
+                        "typ": "ecommerce.order_status",
+                        "gen": "",
+                        "ident": "",
+                        "typkind": "e",
+                        "enum_labels": ["pending", "shipped", "cancelled"],
+                    },
+                    {
+                        "col": "addr",
+                        "typ": "ecommerce.addr_type",
+                        "gen": "",
+                        "ident": "",
+                        "typkind": "c",
+                    },
+                    {
+                        "col": "email",
+                        "typ": "ecommerce.email_address",
+                        "gen": "",
+                        "ident": "",
+                        "typkind": "d",
+                        "base_typ": "text",
+                    },
+                    {"col": "note", "typ": "text", "gen": "", "ident": "", "typkind": None},
+                ]
+            )
+
+    connection = _Connection()
+    table = TableDef(
+        name="ecommerce.orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="status", mysql_type="x"),
+            ColumnDef(name="addr", mysql_type="x"),
+            ColumnDef(name="email", mysql_type="x"),
+            ColumnDef(name="note", mysql_type="x"),
+        ],
+        primary_key=["id"],
+    )
+    _pg_enrich_columns(connection, "ecommerce", [table])
+
+    by_name = {c.name: c for c in table.columns}
+    assert by_name["status"].type_kind == "enum"
+    # The ORDER is the type's own sort order, not alphabetical -- it is what ORDER BY on an
+    # enum column follows, so it must survive introspection unsorted.
+    assert by_name["status"].enum_labels == ("pending", "shipped", "cancelled")
+    assert by_name["addr"].type_kind == "composite"
+    assert by_name["addr"].enum_labels == ()
+    assert by_name["email"].type_kind == "domain"
+    assert by_name["email"].base_type == "text"
+    # A BUILT-IN type carries no kind, so the user-defined-type wording cannot leak onto it.
+    # The query NULLIFs typtype='b' for exactly this reason -- passing 'b' through would put
+    # "(a user-defined b type)" next to every ordinary column in the finding.
+    assert by_name["note"].type_kind is None
+    assert "NULLIF(t.typtype, 'b')" in connection.sql, connection.sql

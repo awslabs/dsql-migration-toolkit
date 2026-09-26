@@ -5,6 +5,15 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.537
+
+### 修正
+
+- **PostgreSQL の enum 列はそもそも移行できず、指摘文はその理由さえ言えていませんでした。** `format_type` はユーザー定義型の名前しか返さず、`pg_type.typtype` は一度も読まれていなかったため、`ecommerce.order_status` は composite や domain と区別できませんでした。そのためメッセージは 3 種類すべてを並べ("a PostgreSQL enum -> text; a composite type -> separate columns or jsonb")実際の理由を述べず、列を作り直すために必要な唯一の情報である許容値も示せませんでした。一方 Schema Conversion は enum 型をそのまま出力し、Aurora DSQL には `CREATE TYPE` がないため(ライブ検証: `CREATE TYPE ... AS ENUM` → `CREATE TYPE not supported`)`CREATE TABLE` 全体が適用時に拒否されていました。現在は型の **種類** と enum の **ラベル** をイントロスペクションし(既存の結合に 2 列追加)、enum 列は MySQL の `ENUM` が従来受けてきたものと同じ変換を受けます: 同じ値集合に対する `CHECK` を伴う `text`、そして捨てられていた `DEFAULT` も素のテキストリテラルとして引き継がれます。実際の Aurora DSQL クラスターで一通り検証: 変換後の DDL が適用され、`DEFAULT` が入り、有効なラベルは挿入でき、無効な値は `CHECK` が拒否します。移行を妨げるものが無くなったため UNSUPPORTED の格付けも解除されます。
+- **「enum」は型名ではなく種類であり、文面がそれに従います。** PostgreSQL に `enum` という型は存在しません — `CREATE TABLE t (c enum)` は `type "enum" does not exist` で失敗し、`pg_type` にもその行はありません — したがって「user-defined ENUMERATED type(`CREATE TYPE ... AS ENUM`)」と述べることはできても、`enum` を型として提示してはいけません。現在は種類ごとに実際の理由を述べます: enum・composite・range は `CREATE TYPE` が無いためターゲットに存在できません。また risk 行の「Aurora DSQL has no CREATE TYPE, so a user-defined type cannot be created there」という文は実際にユーザー定義型が関わるときだけ付くので、組み込みの非対応型(`inet`、`money` など)には影響しません。
+- **DOMAIN 列が UNSUPPORTED と報告されていましたが、これは誤りです — Aurora DSQL は `CREATE DOMAIN` に対応しています。** ライブ検証: domain が作成され、列の型として使え、範囲外の値はその `CHECK` が拒否します。現在はその事実を述べ、実際のギャップを示します(コンバーターがまだ domain の DDL を出力しないため、ターゲットに先に domain を作るか、列を domain の基底型に変えて `CHECK` を列側に付け直す必要があります)。
+- **両エンジンの enum 変換ノートが「非対応」ではなく「何が起きたか」から始まり、同じ内容を述べます。** 2 つの経路が同じことをするようになったからです: 値のドメインは `CHECK` で保持され、実際に変わる 2 点を明示します — 並び順と比較が TEXT になること(enum は **宣言順** で並び、アルファベット順ではないため、この列の `ORDER BY` や範囲条件が変わります)、そして値の追加が `ALTER TYPE ... ADD VALUE` ではなく `ALTER TABLE ... DROP/ADD CONSTRAINT` になることです。
+
 ## v0.1.536
 
 ### 修正

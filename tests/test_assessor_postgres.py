@@ -1044,3 +1044,42 @@ def test_a_composite_key_is_not_told_to_choose_a_strategy_that_is_not_offered() 
             # facts every surface must carry, not on one engine's phrasing.
             assert "application" in composite, composite
             assert "add an identity to the column on the target" in composite, composite
+
+
+def test_the_unsupported_type_risk_line_says_a_user_defined_type_cannot_be_created() -> None:
+    """The risk line read as if `ecommerce.order_status` were a built-in DSQL had left out.
+
+    The real problem is different in kind: Aurora DSQL has no CREATE TYPE (live-verified:
+    `CREATE TYPE ... AS ENUM` -> "CREATE TYPE not supported"), so a user-defined type cannot
+    be created there at all -- which is why "add the type" is not an option and the column
+    must be remodelled. A BUILT-IN unsupported type must NOT get that sentence.
+    """
+    from dsql_migrator.core.assessor_postgres import UnsupportedPostgresTypeRule
+
+    user_defined = TableDef(
+        name="ecommerce.orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(
+                name="addr", mysql_type="ecommerce.addr_type", type_kind="composite"
+            ),
+        ],
+        primary_key=["id"],
+    )
+    finding = UnsupportedPostgresTypeRule().evaluate(
+        SourceInventory(tables=[user_defined])
+    )[0]
+    assert "(a user-defined composite type)" in finding.risk, finding.risk
+    assert "no CREATE TYPE" in finding.risk, finding.risk
+
+    built_in = TableDef(
+        name="ecommerce.events",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="client_ip", mysql_type="inet"),
+        ],
+        primary_key=["id"],
+    )
+    plain = UnsupportedPostgresTypeRule().evaluate(SourceInventory(tables=[built_in]))[0]
+    assert "user-defined" not in plain.risk, plain.risk
+    assert "no CREATE TYPE" not in plain.risk, plain.risk

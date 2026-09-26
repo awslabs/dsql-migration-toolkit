@@ -847,8 +847,14 @@ def map_data_type(data_type: exp.DataType) -> Optional[_Mapping]:
             target=_build("text"),
             enum_values=_enum_values(data_type),
             message=(
-                "ENUM is not supported by Aurora DSQL; mapped to text with a "
-                "CHECK constraint. ENUM ordering semantics are not preserved."
+                "Converted to text with a CHECK that preserves the SAME allowed values: "
+                "Aurora DSQL has no ENUM type, and this is the faithful port. Two things "
+                "DO change for the application. Ordering and comparison are now TEXT: "
+                "MySQL sorted an ENUM in DECLARATION order, which is not alphabetical, so "
+                "any ORDER BY or range predicate on this column changes — sort on an "
+                "explicit ranking if that order mattered. And adding a value later is "
+                "ALTER TABLE ... DROP/ADD CONSTRAINT rather than ALTER TABLE ... MODIFY "
+                "the ENUM."
             ),
             classification=Classification.MANUAL,
         )
@@ -1885,7 +1891,12 @@ def _pg_unsupported_key_columns(table: TableDef) -> set[str]:
     return {
         column.name
         for column in table.columns
-        if unsupported_dsql_reason(column.mysql_type) is not None
+        if unsupported_dsql_reason(
+            column.mysql_type,
+            type_kind=column.type_kind,
+            enum_labels=column.enum_labels,
+        )
+        is not None
     }
 
 
@@ -3855,6 +3866,13 @@ class SchemaConverter:
             # primary-key strategy, so the expression text is never re-rendered by sqlglot
             # (which mangles real pg_get_expr output -- see _apply_pg_generated_columns).
             _apply_pg_generated_columns(create, table)
+            # Re-add each converted ENUM's allowed values as a CHECK, so the value domain
+            # survives the remodel to text (exactly what the MySQL ENUM path does).
+            for column in table.columns:
+                if column.type_kind == "enum" and column.enum_labels:
+                    column_def = _find_column_def(create, column.name)
+                    if column_def is not None:
+                        _add_enum_check(column_def, tuple(column.enum_labels))
         else:
             # DSQL-unsupported source types (e.g. MySQL spatial) are substituted with
             # bytea so the table still converts and the data is PRESERVED as raw bytes
@@ -3981,7 +3999,51 @@ class SchemaConverter:
             )
 
             for column in table.columns:
-                reason = unsupported_dsql_reason(column.mysql_type)
+                # A converted ENUM is no longer unsupported: it lands as text with a CHECK
+                # over the same labels, so it must not be graded UNSUPPORTED alongside the
+                # types that genuinely cannot be migrated -- it is a type CHANGE the
+                # application has to know about, which is MANUAL.
+                if column.type_kind == "enum" and column.enum_labels:
+                    warnings.append(
+                        ConversionWarning(
+                            object_name=table.name,
+                            column_name=column.name,
+                            source_type=column.mysql_type,
+                            target_type="text",
+                            classification=Classification.MANUAL,
+                            # Leads with WHAT HAPPENED, not with "DSQL cannot": the
+                            # conversion succeeds and the value domain is kept, so a
+                            # message that opens on the negative reads in the losses list
+                            # as if the column had failed.
+                            message=(
+                                f"Column '{column.name}' was converted from the "
+                                f"user-defined ENUMERATED type '{column.mysql_type}' to "
+                                "text with a CHECK that preserves the SAME allowed values "
+                                "(" + ", ".join(column.enum_labels) + ")"
+                                + (
+                                    ", and its DEFAULT is carried over as a text literal"
+                                    if column.default
+                                    else ""
+                                )
+                                + ". Aurora DSQL has no CREATE TYPE, so the type itself "
+                                "cannot exist there; this is the faithful port and it is "
+                                "what the MySQL ENUM path does too. Two things DO change "
+                                "for the application. Ordering and comparison are now "
+                                "TEXT: an enum sorted in DECLARATION order (the order "
+                                "above, which is not alphabetical), so any ORDER BY or "
+                                "range predicate on this column changes — sort on an "
+                                "explicit ranking if that order mattered. And adding a "
+                                "value later is ALTER TABLE ... DROP/ADD CONSTRAINT rather "
+                                "than ALTER TYPE ... ADD VALUE."
+                            ),
+                        )
+                    )
+                    continue
+                reason = unsupported_dsql_reason(
+                    column.mysql_type,
+                    type_kind=column.type_kind,
+                    enum_labels=column.enum_labels,
+                )
                 if reason is not None:
                     warnings.append(
                         ConversionWarning(

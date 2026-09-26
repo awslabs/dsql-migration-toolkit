@@ -74,11 +74,12 @@ def _render_bad_columns(bad: "list[tuple[str, object, str]]") -> str:
     Naming the kind is what removes the ambiguity; parentheses alone cannot.
     """
     return ", ".join(
-        f"column \"{name}\" of type {typ}" for name, typ, _reason in bad
+        f"column \"{name}\" of type {typ}" + (f" (a user-defined {kind} type)" if kind else "")
+        for name, typ, _reason, kind in bad
     )
 
 
-def _render_remodel_guidance(bad: "list[tuple[str, object, str]]") -> str:
+def _render_remodel_guidance(bad: "list[tuple[str, object, str, object]]") -> str:
     """One actionable line per column, from the reason already computed for its type.
 
     Bounded: the first :data:`_MAX_DETAILED_COLUMNS` get their own reason and the rest are
@@ -86,11 +87,11 @@ def _render_remodel_guidance(bad: "list[tuple[str, object, str]]") -> str:
     """
     lines = [
         f"{name}: {reason}"
-        for name, _typ, reason in bad[:_MAX_DETAILED_COLUMNS]
+        for name, _typ, reason, _kind in bad[:_MAX_DETAILED_COLUMNS]
     ]
     rest = bad[_MAX_DETAILED_COLUMNS:]
     if rest:
-        names = ", ".join(name for name, _typ, _reason in rest)
+        names = ", ".join(name for name, _typ, _reason, _kind in rest)
         lines.append(
             f"The same applies to {len(rest)} more column(s) ({names}) -- Schema "
             "Conversion states the target type for each."
@@ -118,9 +119,13 @@ class UnsupportedPostgresTypeRule(Rule):
         for table in inventory.tables:
             bad = []
             for col in table.columns:
-                reason = unsupported_dsql_reason(col.mysql_type)
+                reason = unsupported_dsql_reason(
+                    col.mysql_type,
+                    type_kind=col.type_kind,
+                    enum_labels=col.enum_labels,
+                )
                 if reason is not None:
-                    bad.append((col.name, col.mysql_type, reason))
+                    bad.append((col.name, col.mysql_type, reason, col.type_kind))
             if not bad:
                 continue
             findings.append(
@@ -132,6 +137,17 @@ class UnsupportedPostgresTypeRule(Rule):
                         f"{len(bad)} column(s) of this table use a PostgreSQL data type "
                         "Aurora DSQL does not support as a column type, so its CREATE "
                         f"would be rejected as-is: {_render_bad_columns(bad)}."
+                        # The KIND is what the operator needs first -- a user-defined type
+                        # cannot be created on DSQL at all (no CREATE TYPE), which is a
+                        # different problem from a built-in type that is merely outside the
+                        # supported set. Without it, the finding read as if
+                        # `ecommerce.order_status` were a type DSQL had simply left out.
+                        + (
+                            " Aurora DSQL has no CREATE TYPE, so a user-defined type cannot "
+                            "be created there."
+                            if any(kind for *_rest, kind in bad)
+                            else ""
+                        )
                     ),
                     # The per-type reason, not a catalogue to match against. Each reason
                     # names the faithful remodel target for THAT type, and it was already
@@ -575,7 +591,9 @@ class PgCharacterLengthRule(Rule):
                     over.append((column.name, column.mysql_type))
             if not over:
                 continue
-            listed = _render_bad_columns([(name, typ, "") for name, typ in over])
+            # No KIND here: an over-long varchar/char is a BUILT-IN type, so the
+            # user-defined-type suffix must stay off.
+            listed = _render_bad_columns([(name, typ, "", None) for name, typ in over])
             findings.append(
                 Finding(
                     object=ObjectKey(KIND_TABLE, table.name),

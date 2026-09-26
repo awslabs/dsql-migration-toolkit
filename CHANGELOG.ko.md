@@ -5,6 +5,15 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.537
+
+### 수정
+
+- **PostgreSQL enum 컬럼은 애초에 마이그레이션할 수 없었고, 결과 문구는 그 이유조차 말하지 못했습니다.** `format_type`은 사용자 정의 타입의 이름만 돌려주고 `pg_type.typtype`은 전혀 읽지 않았으므로, `ecommerce.order_status`는 composite이나 domain과 구분되지 않았습니다. 그래서 메시지는 세 가지를 모두 늘어놓고("a PostgreSQL enum -> text; a composite type -> separate columns or jsonb") 실제 이유를 말하지 않았으며, 컬럼을 리모델하는 데 필요한 유일한 정보인 허용 값도 보여주지 못했습니다. 한편 Schema Conversion은 enum 타입을 그대로 내보냈고 Aurora DSQL에는 `CREATE TYPE`이 없으므로(라이브 검증: `CREATE TYPE ... AS ENUM` → `CREATE TYPE not supported`) `CREATE TABLE` 전체가 적용 단계에서 거부됐습니다. 이제 타입의 **종류**와 enum의 **라벨**을 introspection하고(이미 있던 조인에 컬럼 두 개 추가), enum 컬럼은 MySQL `ENUM`이 늘 받아온 것과 동일한 변환을 받습니다: 같은 값 목록에 대한 `CHECK`가 붙은 `text`, 그리고 버려지던 `DEFAULT`도 평문 텍스트 리터럴로 이어집니다. 실제 Aurora DSQL 클러스터에서 끝까지 검증: 변환된 DDL이 적용되고, `DEFAULT`가 채워지고, 유효한 라벨은 삽입되고, 잘못된 값은 `CHECK`가 거부합니다. 더 이상 마이그레이션을 막는 것이 없으므로 UNSUPPORTED 등급도 해제됩니다.
+- **"enum"은 타입 이름이 아니라 종류이며, 문구가 이를 따릅니다.** PostgreSQL에는 `enum`이라는 타입이 없습니다 — `CREATE TABLE t (c enum)`은 `type "enum" does not exist`로 실패하고 `pg_type`에도 해당 행이 없습니다 — 따라서 "user-defined ENUMERATED type(`CREATE TYPE ... AS ENUM`)"이라고는 말할 수 있지만 `enum`을 타입처럼 제시해서는 안 됩니다. 이제 종류별로 실제 이유를 말합니다: enum·composite·range는 `CREATE TYPE`이 없어 타깃에 존재할 수 없습니다. 그리고 risk 줄의 "Aurora DSQL has no CREATE TYPE, so a user-defined type cannot be created there" 문장은 실제로 사용자 정의 타입이 있을 때만 붙으므로, 내장 미지원 타입(`inet`, `money` 등)에는 영향이 없습니다.
+- **DOMAIN 컬럼이 UNSUPPORTED로 보고됐는데 이는 틀렸습니다 — Aurora DSQL은 `CREATE DOMAIN`을 지원합니다.** 라이브 검증: domain이 생성되고, 컬럼 타입으로 사용되고, 범위를 벗어난 값은 그 `CHECK`가 거부합니다. 이제 결과 문구가 그 사실을 밝히고 실제 공백을 말합니다(컨버터가 아직 domain DDL을 내보내지 않으므로, 타깃에 domain을 먼저 만들거나 컬럼을 domain의 기반 타입으로 바꾸고 `CHECK`를 컬럼에 다시 붙여야 합니다).
+- **두 엔진의 enum 변환 노트가 "미지원"이 아니라 "무엇이 일어났는지"로 시작하며 같은 내용을 말합니다.** 이제 두 경로가 같은 일을 하기 때문입니다: 값 도메인은 `CHECK`로 보존되고, 실제로 달라지는 두 가지를 명시합니다 — 정렬·비교가 TEXT가 되고(enum은 **선언 순서**로 정렬되며 알파벳 순이 아니므로 이 컬럼의 `ORDER BY`나 범위 조건이 달라집니다), 값 추가는 `ALTER TYPE ... ADD VALUE`가 아니라 `ALTER TABLE ... DROP/ADD CONSTRAINT`가 됩니다.
+
 ## v0.1.536
 
 ### 수정

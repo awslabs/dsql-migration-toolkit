@@ -212,6 +212,33 @@ class ColumnDef(BaseModel):
             "otherwise indistinguishable."
         ),
     )
+    type_kind: Optional[str] = Field(
+        default=None,
+        description=(
+            "Which KIND of type ``mysql_type`` names, for a PostgreSQL USER-DEFINED type: "
+            "'enum' | 'composite' | 'domain' | 'range' (from pg_type.typtype 'e'/'c'/'d'/"
+            "'r'), or None for a built-in/base type. ``format_type`` returns only the "
+            "type's NAME for a user-defined type, so without this the tool could not tell "
+            "an enum from a composite from a domain and every message had to hedge across "
+            "all three -- while the outcomes differ completely (Aurora DSQL has no CREATE "
+            "TYPE, so an enum/composite/range cannot exist there, but it DOES support "
+            "CREATE DOMAIN). Note that 'enum' is a KIND, not a type name: PostgreSQL has "
+            "no type spelled ``enum`` (``CREATE TABLE t (c enum)`` fails with 'type \"enum\" "
+            "does not exist'), so a message must say \"a user-defined enumerated type\", "
+            "never \"the type 'enum'\"."
+        ),
+    )
+    enum_labels: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "A PostgreSQL enumerated type's allowed values, in the type's own sort order "
+            "(pg_enum.enumsortorder). Empty for any other kind. This is the ONE thing the "
+            "operator needs to remodel the column (a CHECK over these labels, or a DOMAIN "
+            "with the same list), and the tool used to tell them to go and find it in the "
+            "source while the catalog had it one join away. The ORDER matters: it is what "
+            "ORDER BY on an enum column follows, and it is NOT alphabetical."
+        ),
+    )
     base_type: Optional[str] = Field(
         default=None,
         description=(

@@ -25,7 +25,7 @@ reported loss (see :func:`pg_column_default_sql`).
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import Optional, Sequence
 
 import sqlglot
 
@@ -108,6 +108,15 @@ def pg_column_default_sql(
     # edit and the CREATE TABLE still fails -- with nothing having mentioned the default.
     # So drop it and say why: the value is stated in the reason, which is what the operator
     # needs to re-add it once the column has a supported type.
+    # A converted ENUM column is now text, so its default -- which PostgreSQL stores as
+    # `'pending'::ecommerce.order_status` -- CAN be carried after all: strip the cast to
+    # the enum's own type and keep the literal. Before the labels were introspected the
+    # column stayed an enum and the default had to be dropped with a "re-add it as a plain
+    # text literal" note; the tool can now do exactly that itself.
+    if column.type_kind == "enum" and column.enum_labels:
+        literal = _pg_enum_default_literal(raw, column.enum_labels)
+        if literal is not None:
+            return literal, None
     bad_type = _pg_default_unsupported_type(raw)
     if bad_type is not None:
         return None, (
@@ -137,6 +146,37 @@ _PG_DEFAULT_CAST_RE = re.compile(
 _PG_EXPRESSION_ONLY_CAST_TYPES = frozenset(
     {"regclass", "regtype", "regproc", "regprocedure", "regoper", "regnamespace", "oid"}
 )
+
+
+# A default that is just one of the enum's own labels, in either cast spelling:
+#   'pending'::ecommerce.order_status        |  CAST('pending' AS ecommerce.order_status)
+_PG_ENUM_DEFAULT_RE = re.compile(
+    r"""^\s*(?:
+          '(?P<a>(?:[^']|'')*)'\s*::\s*[\w."]+
+        | CAST\s*\(\s*'(?P<b>(?:[^']|'')*)'\s*AS\s+[\w."]+\s*\)
+        )\s*$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _pg_enum_default_literal(
+    raw: str, enum_labels: "Sequence[str]"
+) -> "Optional[str]":
+    """Return the plain text literal for an enum-typed default, or ``None``.
+
+    Only when the value is one of the type's OWN labels, so an expression that merely
+    happens to cast to some type is not rewritten, and a default outside the converted
+    CHECK's value set is not silently turned into a value the CHECK would reject.
+    """
+    match = _PG_ENUM_DEFAULT_RE.match(raw or "")
+    if match is None:
+        return None
+    quoted = match.group("a") if match.group("a") is not None else match.group("b")
+    if quoted is None:
+        return None
+    if quoted.replace("''", "'") not in set(enum_labels):
+        return None
+    return f"'{quoted}'"
 
 
 def _pg_default_unsupported_type(raw: str) -> "Optional[str]":
@@ -449,7 +489,12 @@ _PG_RANGE_TYPES = frozenset(
 )
 
 
-def unsupported_dsql_reason(pg_type: Optional[str]) -> Optional[str]:
+def unsupported_dsql_reason(
+    pg_type: Optional[str],
+    *,
+    type_kind: Optional[str] = None,
+    enum_labels: "Sequence[str]" = (),
+) -> Optional[str]:
     """Return why a PostgreSQL column type is unsupported on Aurora DSQL, else ``None``.
 
     Arrays (any ``...[]``) are unsupported as column types; otherwise a base type outside
@@ -492,13 +537,66 @@ def unsupported_dsql_reason(pg_type: Optional[str]) -> Optional[str]:
             f"type. Store it as {target}, and adapt the application before migrating this "
             "column."
         )
-    # Fallback for user-defined types (enum / composite / domain) whose NAME format_type
-    # returns verbatim, and any type not individually mapped.
+    # A USER-DEFINED type. ``format_type`` returns only its NAME, so the message used to
+    # hedge across every kind ("a PostgreSQL enum -> text; a composite type -> ...") and
+    # never stated the real reason. With ``type_kind`` from pg_type.typtype it can.
+    #
+    # Note the wording rule: "enum" is a KIND, not a type name. PostgreSQL has no type
+    # spelled ``enum`` (``CREATE TABLE t (c enum)`` -> 'type "enum" does not exist'), so
+    # this says "a user-defined enumerated type", never "the type 'enum'".
+    if type_kind == "domain":
+        # Not unsupported at all: Aurora DSQL DOES support CREATE DOMAIN (live-verified --
+        # created, used as a column type, and an out-of-range value rejected by the
+        # domain's CHECK). The domain itself still has to be created on the target, which
+        # the caller's own DDL does not do yet, so it is reported as an ACTION rather than
+        # as a loss.
+        return (
+            f"'{pg_type}' is a user-defined DOMAIN. Aurora DSQL supports CREATE DOMAIN, so "
+            "this column can keep its type -- but the domain does not exist on the target "
+            "yet and the converter does not create it, so the CREATE TABLE would be "
+            "rejected as-is. Create the domain on Aurora DSQL first (CREATE DOMAIN "
+            f"{pg_type} AS <base type> CHECK (...), copying the definition from the source "
+            "with \\dD), or replace the column's type with the domain's base type and "
+            "re-add its CHECK on the column."
+        )
+    no_create_type = (
+        "Aurora DSQL has no CREATE TYPE, so the type cannot be created on the target and "
+        "any column declared with it is rejected"
+    )
+    if type_kind == "enum":
+        labels = ", ".join(enum_labels)
+        values = (
+            f" Its allowed values, in the type's own sort order, are: {labels}."
+            if enum_labels
+            else ""
+        )
+        return (
+            f"'{pg_type}' is a user-defined ENUMERATED type (CREATE TYPE ... AS ENUM). "
+            f"{no_create_type}. Remodel the column to text with a CHECK over the same "
+            "values -- or, since Aurora DSQL supports CREATE DOMAIN, to a domain over text "
+            f"carrying that CHECK, which keeps a single named type.{values} Note that enum "
+            "ordering is the declaration order above, NOT alphabetical, so an ORDER BY on "
+            "this column changes unless you sort on an explicit ranking."
+        )
+    if type_kind in ("composite", "range", "multirange"):
+        how = {
+            "composite": "separate columns for its fields, or jsonb",
+            "range": "text (its canonical form, e.g. '[1,5)'), or two columns for the "
+            "lower and upper bounds",
+            "multirange": "jsonb, or a child table with one row per range",
+        }[type_kind]
+        return (
+            f"'{pg_type}' is a user-defined {type_kind.upper()} type. {no_create_type}. "
+            f"Store it as {how}, and adapt the application before migrating this column."
+        )
+    # Kind unknown (an un-enriched inventory), so the honest message names what it can and
+    # lists the possibilities rather than asserting one.
     return (
         f"Aurora DSQL does not support the PostgreSQL type '{pg_type}' as a column type. "
-        "Remodel the column to a DSQL-supported type (a PostgreSQL enum -> text; a "
-        "composite type -> separate columns or jsonb; see the Aurora DSQL supported data "
-        "types) before migrating."
+        "If it is a user-defined type, Aurora DSQL has no CREATE TYPE, so it cannot be "
+        "created there: remodel the column (an enumerated type -> text with a CHECK over "
+        "its values; a composite type -> separate columns or jsonb). See the Aurora DSQL "
+        "supported data types."
     )
 
 
@@ -519,7 +617,18 @@ def build_pg_source_ddl(table: TableDef) -> str:
         # column.mysql_type holds the EXACT PostgreSQL type string (from enrich's
         # format_type); emit it (near-verbatim; _ddl_column_type only massages a
         # fields+precision interval sqlglot can't parse) so the postgres reader parses it.
-        clause = f"{_PG.quote_identifier(column.name)} {_ddl_column_type(column.mysql_type)}"
+        # A user-defined ENUM cannot exist on Aurora DSQL (no CREATE TYPE), so the column
+        # is declared `text` here and the allowed values are re-added as a
+        # CHECK ... IN (...) after the parse -- the same faithful port MySQL's ENUM has
+        # always had. Only possible now that the labels are introspected; before, the
+        # domain was simply lost and the DDL named a type that could not be created, so
+        # the whole CREATE TABLE failed at apply.
+        column_type = (
+            "text"
+            if column.type_kind == "enum" and column.enum_labels
+            else _ddl_column_type(column.mysql_type)
+        )
+        clause = f"{_PG.quote_identifier(column.name)} {column_type}"
         if not column.nullable:
             clause += " NOT NULL"
         # Carry the source column DEFAULT across (MySQL does too). Skipped for a generated

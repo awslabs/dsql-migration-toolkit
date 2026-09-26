@@ -266,6 +266,19 @@ def _pg_drop_extension_relations(connection: object, nsp: str, tables: list) -> 
     return owned
 
 
+# pg_type.typtype -> the KIND name used in messages. 'b' (base/built-in) is deliberately
+# absent: it is normalised to NULL in the query, since only a USER-DEFINED kind changes
+# what the operator has to do. "enum" here names a KIND, not a type -- PostgreSQL has no
+# type spelled ``enum``.
+_PG_TYPE_KINDS = {
+    "e": "enum",
+    "c": "composite",
+    "d": "domain",
+    "r": "range",
+    "m": "multirange",
+}
+
+
 def _pg_enrich_columns(connection: object, enrich_db: str, tables: list) -> None:
     """Overwrite each column's type with the EXACT ``format_type`` string + generated flag,
     and flag a serial/identity PRIMARY-KEY column as the table's ``auto_increment_column``.
@@ -332,6 +345,16 @@ def _pg_enrich_columns(connection: object, enrich_db: str, tables: list) -> None
                 # privilege beyond reading the catalog.
                 ", CASE WHEN a.attgenerated <> '' THEN "
                 "  pg_get_expr(ad.adbin, ad.adrelid) END AS gen_expr "
+                # WHICH KIND of user-defined type, and (for an enum) its labels. Without
+                # these, format_type's bare NAME made an enum, a composite and a domain
+                # indistinguishable, so every message hedged across all three -- and a
+                # DOMAIN was reported UNSUPPORTED even though Aurora DSQL supports
+                # CREATE DOMAIN. 'b' (base) is normalised to NULL so only a user-defined
+                # kind is carried.
+                ", NULLIF(t.typtype, 'b') AS typkind "
+                ", CASE WHEN t.typtype = 'e' THEN ("
+                "    SELECT array_agg(e.enumlabel ORDER BY e.enumsortorder) "
+                "    FROM pg_enum e WHERE e.enumtypid = t.oid) END AS enum_labels "
                 "FROM pg_attribute a "
                 "JOIN pg_type t ON t.oid = a.atttypid "
                 "JOIN pg_class c ON c.oid = a.attrelid "
@@ -346,7 +369,8 @@ def _pg_enrich_columns(connection: object, enrich_db: str, tables: list) -> None
         exact = {
             row["col"]: (
                 row["typ"], row.get("gen"), row.get("ident"), row.get("coll"),
-                row.get("base_typ"), row.get("gen_expr"),
+                row.get("base_typ"), row.get("gen_expr"), row.get("typkind"),
+                row.get("enum_labels"),
             )
             for row in rows
         }
@@ -389,6 +413,12 @@ def _pg_enrich_columns(connection: object, enrich_db: str, tables: list) -> None
                 # text-cast rule matches on it rather than on the domain's own name.
                 if len(resolved) > 4 and resolved[4]:
                     column.base_type = str(resolved[4])
+                # The type's KIND and, for an enum, its labels. Both are read from the
+                # pg_type join that was already there; only the values were missing.
+                if len(resolved) > 6 and resolved[6]:
+                    column.type_kind = _PG_TYPE_KINDS.get(str(resolved[6]))
+                if len(resolved) > 7 and resolved[7]:
+                    column.enum_labels = tuple(str(label) for label in resolved[7])
         # A serial/identity PRIMARY-KEY column becomes the auto_increment_column so the
         # converter's primary-key strategy (IDENTITY / UUID / KEEP) applies to it.
         if table.auto_increment_column is None:
