@@ -2255,6 +2255,13 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
     # One marker per behaviour the ZIP must carry. Each is a literal this repo's Java source
     # owns, so it can only be present if that source was compiled into the committed ZIP.
     markers = {
+        # v45: each array ELEMENT is rendered from its Debezium LOGICAL TYPE, not its Java
+        # class. v44 bound the array as jsonb but rendered elements by class, so a
+        # timestamp[]/date[]/time[] element (a raw epoch Long/Integer on the wire) became a
+        # bare JSON number where to_jsonb writes a quoted ISO string -- valid jsonb, accepted
+        # by DSQL, and detected only by Validation's CHECKSUM after the target already held
+        # the wrong bytes. This marker comes from the timetz[] refusal, which is new in v45.
+        "pg array element logical types": b"to_jsonb keeps the SOURCE offset",
         # v44: PostgreSQL arrays bind as jsonb (the silent total-loss fix).
         "pg array -> jsonb": b"renders array columns as jsonb",
         # v43: the quarantine line carries the DML op, which is what tells a recoverable

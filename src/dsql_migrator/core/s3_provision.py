@@ -442,7 +442,37 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # Delete + Deploy infra to pick it up (Start CDC alone does not re-register the plugin). Until
 # it does, v0.1.550's classified 07006 banner is what makes the loss visible, and the repaired
 # checksum is what measures it.
-PLUGIN_VERSION = "v44"
+# v45: v44 bound a PostgreSQL array as jsonb but rendered each ELEMENT from its JAVA CLASS,
+# and `pgArrayAsJsonb` runs on the RAW Debezium value -- before the name-keyed `convert()`. The
+# deployed source connector uses `time.precision.mode=adaptive_time_microseconds`, so a
+# `timestamp[]` element arrives as a Long of epoch micros, a `date[]` element as epoch days and
+# a `time[]` element as micros-since-midnight: each hit the `instanceof Number` branch and was
+# written as a BARE JSON NUMBER where `to_jsonb` writes a quoted ISO string. Measured on a live
+# PostgreSQL 17.11: `["2026-01-02T03:04:05.678"]` vs `[1767322445678000]`, `["2026-01-02"]` vs
+# `[20455]`, `["03:04:05.678"]` vs `[11045678000]`. `timestamptz[]` wrote Debezium's `Z` where
+# `to_jsonb` writes `+00:00`; `json[]`/`jsonb[]` QUOTED the document instead of embedding it;
+# and `float8[]`/`float4[]` wrote Java's `toString` digits (`[1.0]` and `[1.0E30]` where PG
+# writes `[1]` and plain digits). Every one of those is VALID jsonb that DSQL accepts, so the
+# write succeeded and only Validation's CHECKSUM could see it -- after the target already held
+# the wrong bytes. v45 dispatches on the element's Debezium LOGICAL TYPE first, so the six
+# temporal/json cases render exactly and the float renderer reproduces PostgreSQL's
+# shortest-round-trip, non-scientific spelling (fuzz-verified: 46,340/46,340 float8/float4
+# values byte-identical through the compiled sink, with PostgreSQL computing the expected side).
+#
+# Types whose `to_jsonb` text is NOT recoverable from the change event now dead-letter with the
+# PostgreSQL type named, rather than being approximated: `timetz[]` (Debezium's ZonedTime has
+# already normalized to UTC and discarded the offset `to_jsonb` preserves), `numeric[]` with no
+# declared precision/scale (Debezium strips trailing zeros before the sink sees it, so the
+# display scale `to_jsonb` prints is already gone -- declare `numeric(p,s)`), `bytea[]` (the
+# spelling depends on the SOURCE's `bytea_output` GUC, which the event does not carry), a
+# date/timestamp outside years 0001..9999 (Debezium encodes `infinity` as an ordinary epoch
+# value, indistinguishable from a real far-future date), and `time '24:00:00'`.
+#
+# MySQL is untouched and provably so: the branch is gated on the PostgreSQL source connector,
+# and MySQL's value converters emit no array schema at all. Bumped because the sink ZIP's
+# CONTENT changed: a live cdc-stack needs Delete + Deploy infra to pick it up (Start CDC alone
+# does not re-register the plugin).
+PLUGIN_VERSION = "v45"
 
 
 class S3ProvisionError(RuntimeError):

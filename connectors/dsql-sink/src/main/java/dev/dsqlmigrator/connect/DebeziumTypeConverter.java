@@ -10,10 +10,15 @@
 package dev.dsqlmigrator.connect;
 
 import java.math.BigDecimal;
+import java.math.MathContext;
+import java.math.RoundingMode;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
 import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.DataException;
@@ -104,6 +109,8 @@ final class DebeziumTypeConverter {
   private static final long MICROS_PER_MILLI = 1_000L;
   private static final int NANOS_PER_MICRO = 1_000;
   private static final long MICROS_PER_SECOND = 1_000_000L;
+  /** Half-ulp bound divisor for {@link #appendPgFloat}; exact (dividing by 2 always terminates). */
+  private static final BigDecimal TWO = BigDecimal.valueOf(2);
 
   private DebeziumTypeConverter() {}
 
@@ -322,8 +329,23 @@ final class DebeziumTypeConverter {
    * cannot reproduce byte-for-byte (bytea, a nested array, a composite) raises, so the record
    * dead-letters with a NAMED reason instead of writing a value that silently differs from the
    * loaded one. A visible gap is recoverable; a wrong value that passes the checksum is not.
+   *
+   * <p><b>The element's logical type decides the rendering, not its Java class.</b> This method
+   * runs on the RAW Debezium values (it is reached BEFORE {@link #convert}), so a temporal
+   * element is still a {@code Long}/{@code Integer} and a json element is still a {@code String}.
+   * Dispatching on the Java class alone therefore wrote a bare JSON <i>number</i> where
+   * {@code to_jsonb} writes a quoted ISO <i>string</i> (measured on PostgreSQL 17.11:
+   * {@code timestamp[]} → {@code [1767323045678000]} instead of
+   * {@code ["2026-01-02T03:04:05.678"]}; likewise {@code date[]} → {@code [20455]},
+   * {@code time[]} → {@code [11045678000]}) and quoted a {@code json[]} element as a string
+   * instead of embedding it. Those writes were SILENT — valid jsonb, accepted by DSQL, wrong
+   * bytes — so {@code elementSchema.name()} is now the primary dispatch key.
+   *
+   * @param elementSchema the ARRAY schema's {@code valueSchema()} (the element schema, carrying
+   *     the Debezium logical-type name); {@code null} or unnamed for a plain primitive element
    */
-  static PGobject pgArrayAsJsonb(Object value) {
+  static PGobject pgArrayAsJsonb(Object value, Schema elementSchema) {
+    String elementType = elementSchema == null ? null : elementSchema.name();
     StringBuilder out = new StringBuilder("[");
     boolean first = true;
     for (Object element : (Iterable<?>) value) {
@@ -331,44 +353,294 @@ final class DebeziumTypeConverter {
         out.append(", ");
       }
       first = false;
-      appendJsonbElement(out, element);
+      appendJsonbElement(out, element, elementType);
     }
     return pgObject("jsonb", out.append("]").toString());
   }
 
-  /** Render ONE array element exactly as PostgreSQL's {@code to_jsonb} would. */
-  private static void appendJsonbElement(StringBuilder out, Object element) {
+  /**
+   * Render ONE array element exactly as PostgreSQL's {@code to_jsonb} would, given the element's
+   * Debezium logical-type name ({@code null} for a plain primitive).
+   */
+  private static void appendJsonbElement(StringBuilder out, Object element, String elementType) {
     if (element == null) {
       out.append("null");
       return;
+    }
+    if (elementType != null) {
+      switch (elementType) {
+        case MICRO_TIMESTAMP: // timestamp(4..6)[] -> micros since epoch
+          appendPgTimestamp(out, ((Number) element).longValue());
+          return;
+        case TIMESTAMP_MS: // timestamp(0..3)[] -> MILLIS since epoch
+          appendPgTimestamp(out, ((Number) element).longValue() * MICROS_PER_MILLI);
+          return;
+        case DATE: // date[] -> epoch days
+          appendPgDate(out, ((Number) element).longValue());
+          return;
+        case MICRO_TIME: // time[] -> micros since midnight
+          appendPgTime(out, ((Number) element).longValue());
+          return;
+        case TIME_MS: // time[] under time.precision.mode=adaptive -> millis since midnight
+          appendPgTime(out, ((Number) element).longValue() * MICROS_PER_MILLI);
+          return;
+        case ZONED_TIMESTAMP: // timestamptz[] -> ISO-8601 text, UTC-normalized, offset as "Z"
+          appendPgTimestamptz(out, element.toString());
+          return;
+        case JSON_TYPE:
+          // json[] / jsonb[]: to_jsonb EMBEDS the element's JSON as a JSON VALUE
+          // ([{"a": 2, "b": 1}]), it does not quote it as a string. The target column is jsonb,
+          // so the server re-parses and canonicalizes this text -- which is why embedding a
+          // json[] element's RAW (unnormalized) text is also exact: measured on PG 17.11,
+          // to_jsonb(ARRAY['{"b":1, "a":2}'::json]) and '[{"b":1, "a":2}]'::jsonb agree, and
+          // numeric scale inside the document survives both ([{"a": 1.50}]).
+          out.append(element.toString());
+          return;
+        case ZONED_TIME:
+          throw unrenderableArrayElement(
+              "a PostgreSQL timetz[] element",
+              "to_jsonb keeps the SOURCE offset (measured: [\"03:04:05.678+09\"], and it is NOT "
+                  + "affected by the session TimeZone) but Debezium's ZonedTime has already "
+                  + "normalized the value to UTC and DISCARDED that offset, so the loaded text "
+                  + "cannot be reconstructed from the event");
+        case VARIABLE_SCALE_DECIMAL:
+          throw unrenderableArrayElement(
+              "an unconstrained PostgreSQL numeric[] element (Debezium VariableScaleDecimal)",
+              "Debezium calls stripTrailingZeros() before the sink sees the value, so the "
+                  + "DISPLAY SCALE to_jsonb prints is already gone (to_jsonb writes 1.50, the "
+                  + "event carries 1.5); declare the column numeric(p,s) so the scale survives");
+        default:
+          break; // Decimal / Uuid / Enum / Ltree -> the value-shape branches below
+      }
     }
     if (element instanceof Boolean) {
       out.append(((Boolean) element) ? "true" : "false");
       return;
     }
-    if (element instanceof Number) {
-      // Integral and decimal types render as their plain text, which is what to_jsonb emits.
-      // BigDecimal.toString() can use scientific notation for a large exponent, which
-      // to_jsonb does not -- toPlainString keeps them identical.
-      out.append(
-          element instanceof BigDecimal
-              ? ((BigDecimal) element).toPlainString()
-              : element.toString());
+    if (element instanceof Double || element instanceof Float) {
+      appendPgFloat(out, ((Number) element).doubleValue(), element instanceof Float);
+      return;
+    }
+    if (element instanceof BigDecimal) {
+      // numeric(p,s)[]: to_jsonb PRESERVES the declared scale and never uses scientific
+      // notation. BigDecimal.toString() would print 1E+3; toPlainString is both.
+      out.append(((BigDecimal) element).toPlainString());
+      return;
+    }
+    if (element instanceof Number && elementType == null) {
+      // int2[]/int4[]/int8[]: an unnamed integral primitive prints the same digits as to_jsonb.
+      out.append(element.toString());
       return;
     }
     if (element instanceof CharSequence) {
+      // Every remaining PostgreSQL type Debezium delivers as text carries PostgreSQL's own
+      // canonical output, which to_jsonb quotes verbatim (measured: uuid, inet, cidr, macaddr,
+      // macaddr8, char(n) with its blank padding, and enum labels). The three text-shaped
+      // logical types whose spelling Debezium CHANGES -- ZonedTime, ZonedTimestamp and Json --
+      // are all dispatched by name above, so they never reach here.
       appendJsonString(out, element.toString());
       return;
     }
-    // Deliberately NOT a best-effort toString(): see pgArrayAsJsonb. A byte[] would render
-    // as an object identity, a nested List as Java's "[a, b]" -- both silently unequal to
-    // what the Full Load wrote, which is worse than a dead-letter naming the type.
-    throw new DataException(
-        "Cannot bind a PostgreSQL array whose elements are "
+    if (element instanceof byte[] || element instanceof java.nio.ByteBuffer) {
+      throw unrenderableArrayElement(
+          "a PostgreSQL bytea[] element",
+          "to_jsonb spells the bytes per the SOURCE's bytea_output setting (measured: "
+              + "[\"\\\\x0001ff\"] under hex, [\"\\\\000\\\\001\\\\377\"] under escape) and the "
+              + "change event does not carry that setting");
+    }
+    // Deliberately NOT a best-effort toString(): see pgArrayAsJsonb. A nested List would render
+    // as Java's "[a, b]", a Struct as an object identity -- both silently unequal to what the
+    // Full Load wrote, which is worse than a dead-letter naming the type. A NAMED logical type
+    // that reaches here is one this sink has not been taught (e.g. io.debezium.time.NanoTime):
+    // rendering its raw Long as a bare number is exactly the defect this dispatch table fixes.
+    throw unrenderableArrayElement(
+        "a PostgreSQL array element of Java type "
             + element.getClass().getName()
-            + ": this sink renders array columns as jsonb to match the Full Load, and the "
-            + "jsonb text for this element type cannot be reproduced exactly. Exclude the "
-            + "column from capture, or migrate it without CDC.");
+            + (elementType == null ? "" : " (Debezium logical type " + elementType + ")"),
+        "this sink renders array columns as jsonb to match the Full Load's to_jsonb text, and "
+            + "that text cannot be reproduced from the change event");
+  }
+
+  /** A dead-letter that NAMES the element type and why its to_jsonb text is unreachable. */
+  private static DataException unrenderableArrayElement(String what, String why) {
+    return new DataException(
+        "Cannot bind "
+            + what
+            + " to its jsonb column: "
+            + why
+            + ". Exclude the column from capture (column.exclude.list), or migrate the table "
+            + "with Full Load only.");
+  }
+
+  /**
+   * PostgreSQL's {@code to_jsonb} spelling of a {@code timestamp}:
+   * {@code "2026-01-02T03:04:05.678"} — a QUOTED ISO-8601 string with a {@code T} separator,
+   * independent of {@code DateStyle}. Measured on PostgreSQL 17.11.
+   */
+  private static void appendPgTimestamp(StringBuilder out, long micros) {
+    LocalDateTime ts =
+        LocalDateTime.ofEpochSecond(
+            Math.floorDiv(micros, MICROS_PER_SECOND),
+            (int) (Math.floorMod(micros, MICROS_PER_SECOND) * NANOS_PER_MICRO),
+            ZoneOffset.UTC);
+    out.append('"');
+    appendPgDateParts(out, ts.toLocalDate());
+    out.append('T');
+    appendPgTimeParts(out, ts.toLocalTime());
+    out.append('"');
+  }
+
+  /** PostgreSQL's {@code to_jsonb} spelling of a {@code date}: {@code "2026-01-02"}. */
+  private static void appendPgDate(StringBuilder out, long epochDay) {
+    out.append('"');
+    appendPgDateParts(out, LocalDate.ofEpochDay(epochDay));
+    out.append('"');
+  }
+
+  /**
+   * The {@code yyyy-MM-dd} part, rejecting anything {@code to_jsonb} spells differently.
+   *
+   * <p>PostgreSQL writes a BC date as {@code "0044-03-15 BC"} and the special values as
+   * {@code "infinity"} / {@code "-infinity"}, and Debezium encodes BOTH as ordinary epoch
+   * days / epoch micros — {@code infinity} arrives as the year 294247 and {@code -infinity}
+   * as the year -290308 (measured from {@code PostgresValueConverter.POSITIVE_INFINITY_*}).
+   * Nothing in the event distinguishes those from a genuine far-future date, so the whole
+   * range outside {@code 0001..9999 CE} dead-letters rather than being approximated.
+   */
+  private static void appendPgDateParts(StringBuilder out, LocalDate date) {
+    int year = date.getYear();
+    if (year < 1 || year > 9999) {
+      throw unrenderableArrayElement(
+          "a PostgreSQL date/timestamp array element outside the years 0001..9999 CE (" + date
+              + ")",
+          "to_jsonb spells a BC value \"0044-03-15 BC\" and the special values \"infinity\" / "
+              + "\"-infinity\", and Debezium encodes all of them as ordinary epoch days/micros "
+              + "(infinity arrives as the year 294247), so the two cannot be told apart");
+    }
+    out.append(String.format("%04d-%02d-%02d", year, date.getMonthValue(), date.getDayOfMonth()));
+  }
+
+  /** PostgreSQL's {@code to_jsonb} spelling of a {@code time}: {@code "03:04:05.678"}. */
+  private static void appendPgTime(StringBuilder out, long micros) {
+    if (micros < 0 || micros >= 86_400L * MICROS_PER_SECOND) {
+      throw unrenderableArrayElement(
+          "a PostgreSQL time[] element outside [00:00:00, 24:00:00) (" + micros + " micros)",
+          "PostgreSQL's boundary value time '24:00:00' is spelled \"24:00:00\" by to_jsonb and "
+              + "has no in-range micros-since-midnight form this can render unambiguously");
+    }
+    out.append('"');
+    appendPgTimeParts(out, LocalTime.ofNanoOfDay(micros * NANOS_PER_MICRO));
+    out.append('"');
+  }
+
+  private static void appendPgTimeParts(StringBuilder out, LocalTime time) {
+    out.append(
+        String.format("%02d:%02d:%02d", time.getHour(), time.getMinute(), time.getSecond()));
+    appendTrimmedFraction(out, time.getNano());
+  }
+
+  /**
+   * PostgreSQL omits the fractional second entirely when it is zero and TRIMS trailing zeros
+   * (measured: {@code "03:04:05"} not {@code "03:04:05.000"}, and {@code .100} prints as
+   * {@code .1}). {@code LocalTime.toString()} / {@code DateTimeFormatter.ISO_LOCAL_TIME} pad to
+   * 3, 6 or 9 digits instead, so neither is a drop-in match — hence this explicit trim.
+   */
+  private static void appendTrimmedFraction(StringBuilder out, int nanoOfSecond) {
+    if (nanoOfSecond == 0) {
+      return;
+    }
+    String digits = String.format("%09d", nanoOfSecond);
+    int end = digits.length();
+    while (digits.charAt(end - 1) == '0') {
+      end--;
+    }
+    out.append('.').append(digits, 0, end);
+  }
+
+  /**
+   * PostgreSQL's {@code to_jsonb} spelling of a {@code timestamptz} in the UTC session the Full
+   * Load pins ({@code source_dialect/postgres.py} connects with {@code -c timezone=UTC}):
+   * {@code "2026-01-02T03:04:05.678+00:00"} — the offset carries a COLON. Debezium's
+   * {@code ZonedTimestamp} prints the same instant with a bare {@code "Z"}, so the value is
+   * re-spelled from the parsed instant, never recomputed.
+   */
+  private static void appendPgTimestamptz(StringBuilder out, String isoOffsetDateTime) {
+    OffsetDateTime at;
+    try {
+      at = OffsetDateTime.parse(isoOffsetDateTime).withOffsetSameInstant(ZoneOffset.UTC);
+    } catch (java.time.format.DateTimeParseException parseFailed) {
+      throw unrenderableArrayElement(
+          "a PostgreSQL timestamptz[] element Debezium spelled \"" + isoOffsetDateTime + "\"",
+          "it is not an ISO-8601 offset date-time, so the to_jsonb text cannot be derived");
+    }
+    out.append('"');
+    appendPgDateParts(out, at.toLocalDate());
+    out.append('T');
+    appendPgTimeParts(out, at.toLocalTime());
+    out.append("+00:00").append('"');
+  }
+
+  /**
+   * PostgreSQL's {@code to_jsonb} spelling of a {@code float8} / {@code float4}.
+   *
+   * <p>{@code to_jsonb} of a float is {@code numeric_in(float8out(v))}: the SHORTEST decimal
+   * that reads back as the same float, printed PLAIN (never scientific), and the non-finite
+   * values as JSON STRINGS. {@code Double.toString} is not that text — it keeps the {@code .0}
+   * ({@code "1.0"} vs {@code 1}) and the exponent ({@code "1.0E30"}), and reformatting it
+   * through {@code BigDecimal} still diverges because Java accepts a decimal sitting exactly on
+   * the rounding-interval BOUNDARY (legal when the mantissa is even) while PostgreSQL does not:
+   * measured against live PostgreSQL 17.11 over 45,922 values, the reformat-{@code toString}
+   * approach missed 40/25,515 doubles and 43/20,407 floats (e.g. {@code 171694364235957200} vs
+   * PostgreSQL's {@code 171694364235957180}), while the strict search below matched 45,922/45,922.
+   *
+   * <p>So: the shortest decimal STRICTLY inside {@code (v-½ulp, v+½ulp)}. Bounds are computed at
+   * the value's own width — a {@code float4} must use {@code Math.nextUp/nextDown} on the
+   * {@code float}, not on the widened {@code double}, or it yields the double's digits.
+   *
+   * <p><b>Cost.</b> Measured 4.3 µs per float element against 25 ns for an integral one (the
+   * {@code BigDecimal} search dominates). That is fine for CDC's incremental volumes and is left
+   * deliberately simple; if a wide {@code float8[]} ever shows up as a throughput problem, the
+   * loop can start at the significant-digit count of {@code Double.toString} (a proven lower
+   * bound, since every strictly-inside decimal also round-trips) instead of at 1.
+   */
+  private static void appendPgFloat(StringBuilder out, double value, boolean singlePrecision) {
+    if (Double.isNaN(value)) {
+      out.append("\"NaN\""); // measured: to_jsonb(ARRAY['NaN'::float8]) -> ["NaN"]
+      return;
+    }
+    if (Double.isInfinite(value)) {
+      out.append(value > 0 ? "\"Infinity\"" : "\"-Infinity\"");
+      return;
+    }
+    if (value == 0.0) {
+      out.append('0'); // both +0 and -0: measured to_jsonb(ARRAY[0::float8,'-0'::float8]) -> [0, 0]
+      return;
+    }
+    double magnitude = Math.abs(value);
+    BigDecimal exact = new BigDecimal(magnitude);
+    BigDecimal below =
+        new BigDecimal(
+            singlePrecision ? (double) Math.nextDown((float) magnitude) : Math.nextDown(magnitude));
+    double aboveValue =
+        singlePrecision ? (double) Math.nextUp((float) magnitude) : Math.nextUp(magnitude);
+    BigDecimal low = exact.add(below).divide(TWO);
+    BigDecimal high =
+        Double.isInfinite(aboveValue) // the finite maximum: mirror the lower half-ulp
+            ? exact.add(exact.subtract(low))
+            : exact.add(new BigDecimal(aboveValue)).divide(TWO);
+    BigDecimal shortest = exact;
+    int maxDigits = singlePrecision ? 9 : 17;
+    for (int digits = 1; digits <= maxDigits; digits++) {
+      BigDecimal candidate = exact.round(new MathContext(digits, RoundingMode.HALF_EVEN));
+      if (candidate.compareTo(low) > 0 && candidate.compareTo(high) < 0) {
+        shortest = candidate;
+        break;
+      }
+    }
+    if (value < 0) {
+      out.append('-');
+    }
+    out.append(shortest.stripTrailingZeros().toPlainString());
   }
 
   /** Escape a string the way PostgreSQL's JSON output does. */

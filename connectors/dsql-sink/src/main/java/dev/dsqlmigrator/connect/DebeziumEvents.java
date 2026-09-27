@@ -213,8 +213,14 @@ final class DebeziumEvents {
     // MySQL is untouched: its value converters emit no array schema at all (SET becomes a
     // String, JSON becomes io.debezium.data.Json), so this branch is unreachable there --
     // and it is gated on pgSource regardless.
+    //
+    // The ELEMENT schema (valueSchema()) is passed too: it carries the Debezium logical-type
+    // name that decides each element's to_jsonb spelling. Without it the renderer saw only the
+    // raw Java class and wrote a bare JSON number for timestamp[]/date[]/time[] where to_jsonb
+    // writes a quoted ISO string -- valid jsonb, accepted by DSQL, silently unequal to the
+    // Full Load bytes.
     if (pgSource && fieldSchema.type() == Schema.Type.ARRAY && raw != null) {
-      return DebeziumTypeConverter.pgArrayAsJsonb(raw);
+      return DebeziumTypeConverter.pgArrayAsJsonb(raw, fieldSchema.valueSchema());
     }
     return DebeziumTypeConverter.convert(fieldSchema.name(), raw);
   }

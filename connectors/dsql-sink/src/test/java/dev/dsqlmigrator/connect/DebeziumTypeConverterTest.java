@@ -425,58 +425,294 @@ class DebeziumTypeConverterTest {
 
   @Test
   void arrayListPassesThroughUnchangedKnownGap() {
-    // Documented gap: a PG array (a List, no logical schema name) hits the default branch and
-    // is bound as-is. Arrays are unsupported DSQL COLUMN types (flagged at Schema Conversion),
-    // so one never reaches here as a real target column; this pins the pass-through contract.
+    // A PG array (a List, no logical schema name) hits convert()'s default branch and is
+    // returned as-is. That is still the contract OF convert() -- but it is NOT what a real PG
+    // array column does: DebeziumEvents.convertField intercepts an ARRAY schema first and routes
+    // it to pgArrayAsJsonb (Schema Conversion maps <t>[] to jsonb, so these columns absolutely
+    // DO reach the sink). This pins convert()'s pass-through only.
     java.util.List<Integer> arr = java.util.List.of(1, 2, 3);
     assertTrue(DebeziumTypeConverter.convert(null, arr) == arr, "List passes through unchanged");
   }
 
-  /** to_jsonb parity for the element shapes: NULLs, numbers, booleans, and escaping. */
+  // ---------------------------------------------------------------------------------------
+  // PostgreSQL array -> jsonb parity.
+  //
+  // Schema Conversion maps a PostgreSQL <t>[] to jsonb (DSQL has no array type) and the Full
+  // Load converts on the SOURCE in SQL -- CAST(to_jsonb(col) AS text) -- so the bytes already
+  // in DSQL ARE PostgreSQL's own to_jsonb output. The sink must reproduce that text or the two
+  // write paths disagree and Validation's CHECKSUM (which applies to_jsonb(col)::text to BOTH
+  // ends, validation_sql kind array_json) mismatches every CDC-written row.
+  //
+  // EVERY expectedJson below is MEASURED output from a live PostgreSQL 17.11, not reasoning.
+  // pgExpression is the exact expression it was measured with, so the whole table is
+  // re-checkable against any live PostgreSQL: run
+  //
+  //     mvn -o test -Dtest=DebeziumTypeConverterTest
+  //     PGPASSWORD=… psql -h … -U … -d … -f target/pg_array_jsonb_parity.sql
+  //
+  // and the generated script prints one row per DIVERGENCE (zero rows == parity). See
+  // pgArrayJsonbExpectationsAreRecheckableAgainstLivePostgres below.
+  // ---------------------------------------------------------------------------------------
+
+  /** One measured parity case. */
+  private record ArrayCase(
+      String pgExpression, Schema elementSchema, java.util.List<?> value, String expectedJson) {}
+
+  private static Schema named(Schema base, String logicalName) {
+    return new SchemaBuilder(base.type()).name(logicalName).optional().build();
+  }
+
+  private static final Schema INT32 = Schema.OPTIONAL_INT32_SCHEMA;
+  private static final Schema INT64 = Schema.OPTIONAL_INT64_SCHEMA;
+  private static final Schema STRING = Schema.OPTIONAL_STRING_SCHEMA;
+  private static final Schema BOOL = Schema.OPTIONAL_BOOLEAN_SCHEMA;
+  private static final Schema FLOAT32 = Schema.OPTIONAL_FLOAT32_SCHEMA;
+  private static final Schema FLOAT64 = Schema.OPTIONAL_FLOAT64_SCHEMA;
+
+  private static java.util.List<ArrayCase> pgArrayJsonbCases() {
+    Schema microTimestamp = named(INT64, DebeziumTypeConverter.MICRO_TIMESTAMP);
+    Schema timestampMs = named(INT64, DebeziumTypeConverter.TIMESTAMP_MS);
+    Schema zonedTimestamp = named(STRING, DebeziumTypeConverter.ZONED_TIMESTAMP);
+    Schema date = named(INT32, DebeziumTypeConverter.DATE);
+    Schema microTime = named(INT64, DebeziumTypeConverter.MICRO_TIME);
+    Schema uuid = named(STRING, DebeziumTypeConverter.UUID_TYPE);
+    Schema json = named(STRING, DebeziumTypeConverter.JSON_TYPE);
+    Schema decimal = named(Schema.OPTIONAL_BYTES_SCHEMA, DebeziumTypeConverter.DECIMAL_TYPE);
+    return java.util.List.of(
+        // --- shapes that were already correct: pin them so the new dispatch cannot regress them
+        new ArrayCase("ARRAY[1,2,3]::int[]", INT32, java.util.List.of(1, 2, 3), "[1, 2, 3]"),
+        new ArrayCase("ARRAY[]::int[]", INT32, java.util.List.of(), "[]"),
+        new ArrayCase(
+            "ARRAY[1,NULL,3]::int[]", INT32, java.util.Arrays.asList(1, null, 3),
+            "[1, null, 3]"),
+        new ArrayCase(
+            "ARRAY[true,false,NULL]::bool[]", BOOL, java.util.Arrays.asList(true, false, null),
+            "[true, false, null]"),
+        new ArrayCase(
+            "ARRAY['a\"b', E'c\\\\d']::text[]", STRING, java.util.List.of("a\"b", "c\\d"),
+            "[\"a\\\"b\", \"c\\\\d\"]"),
+        new ArrayCase(
+            "ARRAY[E'a\\tb', E'c\\nd']::text[]", STRING, java.util.List.of("a\tb", "c\nd"),
+            "[\"a\\tb\", \"c\\nd\"]"),
+        new ArrayCase( // char(n) keeps its blank padding on both paths
+            "ARRAY['ab','cdefg']::char(5)[]", STRING, java.util.List.of("ab   ", "cdefg"),
+            "[\"ab   \", \"cdefg\"]"),
+        new ArrayCase(
+            "ARRAY['0a8a1f6e-1111-4222-8333-444455556666'::uuid]", uuid,
+            java.util.List.of("0a8a1f6e-1111-4222-8333-444455556666"),
+            "[\"0a8a1f6e-1111-4222-8333-444455556666\"]"),
+        new ArrayCase( // numeric(p,s): to_jsonb PRESERVES the declared scale
+            "ARRAY[1.5,2,3.456]::numeric(10,2)[]", decimal,
+            java.util.List.of(
+                new BigDecimal("1.50"), new BigDecimal("2.00"), new BigDecimal("3.46")),
+            "[1.50, 2.00, 3.46]"),
+
+        // --- float8/float4: shortest round-tripping decimal, printed PLAIN, non-finite QUOTED
+        new ArrayCase(
+            "ARRAY[1.0,0.1,1e30,1e-9]::float8[]", FLOAT64,
+            java.util.List.of(1.0d, 0.1d, 1e30d, 1e-9d),
+            "[1, 0.1, 1000000000000000000000000000000, 0.000000001]"),
+        new ArrayCase( // Double.toString gives 1.716943642359572E17 -> …200, PostgreSQL …180
+            "ARRAY[1.7169436423595718e17::float8]", FLOAT64,
+            java.util.List.of(1.7169436423595718e17d), "[171694364235957180]"),
+        new ArrayCase(
+            "ARRAY[0::float8,'-0'::float8]", FLOAT64, java.util.List.of(0.0d, -0.0d), "[0, 0]"),
+        new ArrayCase(
+            "ARRAY['NaN'::float8,'Infinity'::float8,'-Infinity'::float8]", FLOAT64,
+            java.util.List.of(
+                Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY),
+            "[\"NaN\", \"Infinity\", \"-Infinity\"]"),
+        new ArrayCase(
+            "ARRAY[1.0,0.1,3.4028235e38]::float4[]", FLOAT32,
+            java.util.List.of(1.0f, 0.1f, 3.4028235e38f),
+            "[1, 0.1, 340282350000000000000000000000000000000]"),
+        new ArrayCase( // Float.toString gives -1.2786838E8 -> …380, PostgreSQL …384
+            "ARRAY['-1.2786838e8'::float4]", FLOAT32, java.util.List.of(-1.2786838e8f),
+            "[-127868384]"),
+        new ArrayCase( // Float.MIN_VALUE: Float.toString says 1.4E-45, PostgreSQL says 1e-45
+            "ARRAY['1.4e-45'::float4]", FLOAT32, java.util.List.of(Float.MIN_VALUE),
+            "[0.000000000000000000000000000000000000000000001]"),
+
+        // --- temporal: to_jsonb writes a QUOTED ISO string, Debezium sends a raw Long/Integer
+        new ArrayCase(
+            "ARRAY['2026-01-02 03:04:05.678'::timestamp]", microTimestamp,
+            java.util.List.of(1767323045678000L), "[\"2026-01-02T03:04:05.678\"]"),
+        new ArrayCase( // a zero fraction is OMITTED, not printed as .000
+            "ARRAY['2026-01-02 03:04:05'::timestamp]", microTimestamp,
+            java.util.List.of(1767323045000000L), "[\"2026-01-02T03:04:05\"]"),
+        new ArrayCase( // trailing zeros are TRIMMED: .100 prints as .1
+            "ARRAY['2026-01-02 03:04:05.1'::timestamp]", microTimestamp,
+            java.util.List.of(1767323045100000L), "[\"2026-01-02T03:04:05.1\"]"),
+        new ArrayCase(
+            "ARRAY['2026-01-02 03:04:05.678901'::timestamp]", microTimestamp,
+            java.util.List.of(1767323045678901L), "[\"2026-01-02T03:04:05.678901\"]"),
+        new ArrayCase( // pre-epoch: the fraction must stay positive (floorDiv/floorMod)
+            "ARRAY['1969-12-31 23:59:59.5'::timestamp]", microTimestamp,
+            java.util.List.of(-500000L), "[\"1969-12-31T23:59:59.5\"]"),
+        new ArrayCase( // timestamp(0..3)[] arrives as io.debezium.time.Timestamp -> MILLIS
+            "ARRAY['2026-01-02 03:04:05.678'::timestamp(3)]", timestampMs,
+            java.util.List.of(1767323045678L), "[\"2026-01-02T03:04:05.678\"]"),
+        new ArrayCase(
+            "ARRAY['2026-01-02'::date]", date, java.util.List.of(20455), "[\"2026-01-02\"]"),
+        new ArrayCase(
+            "ARRAY['03:04:05.678'::time]", microTime, java.util.List.of(11045678000L),
+            "[\"03:04:05.678\"]"),
+        new ArrayCase(
+            "ARRAY['03:04:05'::time]", microTime, java.util.List.of(11045000000L),
+            "[\"03:04:05\"]"),
+        new ArrayCase("ARRAY['00:00:00'::time]", microTime, java.util.List.of(0L),
+            "[\"00:00:00\"]"),
+        new ArrayCase( // PostgreSQL prints the offset WITH a colon; Debezium prints a bare Z
+            "ARRAY['2026-01-02 03:04:05.678+00'::timestamptz]", zonedTimestamp,
+            java.util.List.of("2026-01-02T03:04:05.678Z"),
+            "[\"2026-01-02T03:04:05.678+00:00\"]"),
+        new ArrayCase(
+            "ARRAY['2026-01-02 03:04:05+00'::timestamptz]", zonedTimestamp,
+            java.util.List.of("2026-01-02T03:04:05Z"), "[\"2026-01-02T03:04:05+00:00\"]"),
+
+        // --- json[]/jsonb[]: to_jsonb EMBEDS the element JSON, it does not quote it.
+        // jsonb_out already hands Debezium the canonical text, so the bytes match exactly;
+        // for json[] the sink embeds the element's RAW text, which the target jsonb column
+        // parses to the SAME stored value (this is why the re-check compares through ::jsonb).
+        new ArrayCase(
+            "ARRAY['{\"b\":1, \"a\":2}'::jsonb]", json,
+            java.util.List.of("{\"a\": 2, \"b\": 1}"), "[{\"a\": 2, \"b\": 1}]"),
+        new ArrayCase(
+            "ARRAY['[1,2]'::jsonb,'{\"k\":\"v\"}'::jsonb]", json,
+            java.util.List.of("[1, 2]", "{\"k\": \"v\"}"), "[[1, 2], {\"k\": \"v\"}]"),
+        new ArrayCase( // a jsonb 'null' element is JSON null, not the string "null"
+            "ARRAY['42'::jsonb,'\"str\"'::jsonb,'null'::jsonb]", json,
+            java.util.List.of("42", "\"str\"", "null"), "[42, \"str\", null]"));
+  }
+
+  /** to_jsonb parity for every element shape the PostgreSQL source can deliver. */
   @Test
   void pgArrayJsonbRenderingMatchesPostgresForEveryElementShape() {
-    assertEquals(
-        "[\"a\", null, \"c\"]",
-        DebeziumTypeConverter.pgArrayAsJsonb(java.util.Arrays.asList("a", null, "c")).getValue(),
-        "a NULL element is JSON null, not the string \"null\"");
-    assertEquals(
-        "[1, 2, 3]",
-        DebeziumTypeConverter.pgArrayAsJsonb(java.util.List.of(1, 2, 3)).getValue(),
-        "numbers are bare, not quoted");
-    assertEquals(
-        "[true, false]",
-        DebeziumTypeConverter.pgArrayAsJsonb(java.util.List.of(true, false)).getValue());
-    // BigDecimal.toString() switches to scientific notation for a large exponent; to_jsonb
-    // never does, so a plain string is required or the two write paths diverge.
-    assertEquals(
-        "[1000]",
-        DebeziumTypeConverter.pgArrayAsJsonb(java.util.List.of(new BigDecimal("1E+3")))
-            .getValue());
-    // PostgreSQL's JSON output escapes these; anything else would not round-trip.
-    assertEquals(
-        "[\"a\\\"b\", \"c\\\\d\", \"e\\nf\", \"g\\th\"]",
-        DebeziumTypeConverter.pgArrayAsJsonb(
-                java.util.List.of("a\"b", "c\\d", "e\nf", "g\th"))
-            .getValue());
-    assertEquals("[]", DebeziumTypeConverter.pgArrayAsJsonb(java.util.List.of()).getValue());
+    for (ArrayCase c : pgArrayJsonbCases()) {
+      assertEquals(
+          c.expectedJson(),
+          DebeziumTypeConverter.pgArrayAsJsonb(
+                  c.value(), c.elementSchema())
+              .getValue(),
+          "to_jsonb(" + c.pgExpression() + ") measured on live PostgreSQL 17.11");
+    }
+  }
+
+  /**
+   * Emits the whole expectation table as a self-checking SQL script so the literals above can be
+   * re-verified against a LIVE PostgreSQL instead of only against themselves.
+   *
+   * <p>The comparison is the one Validation actually performs: the sink's text is what gets
+   * parsed into the jsonb column, so it is compared as {@code (rendered::jsonb)::text} against
+   * {@code to_jsonb(<expr>)::text} — the STORED bytes. (That is scale-preserving:
+   * {@code '[1.50]'::jsonb::text} is {@code [1.50]}, not {@code [1.5]}.) Running the script
+   * prints one row per divergence; zero rows means parity.
+   */
+  @Test
+  void pgArrayJsonbExpectationsAreRecheckableAgainstLivePostgres() throws java.io.IOException {
+    StringBuilder sql =
+        new StringBuilder(
+            "-- GENERATED by DebeziumTypeConverterTest. Zero rows == the sink matches to_jsonb.\n"
+                + "SET timezone='UTC'; SET datestyle='ISO'; SET intervalstyle='postgres';\n"
+                + "SELECT * FROM (VALUES\n");
+    java.util.List<ArrayCase> cases = pgArrayJsonbCases();
+    for (int i = 0; i < cases.size(); i++) {
+      ArrayCase c = cases.get(i);
+      String rendered =
+          DebeziumTypeConverter.pgArrayAsJsonb(c.value(), c.elementSchema()).getValue();
+      sql.append("  (")
+          .append(quote(c.pgExpression()))
+          .append(", (")
+          .append(quote(rendered))
+          .append("::jsonb)::text, to_jsonb(")
+          .append(c.pgExpression())
+          .append(")::text)")
+          .append(i == cases.size() - 1 ? "\n" : ",\n");
+    }
+    sql.append(") AS t(pg_expression, sink_stored, pg_to_jsonb)\n")
+        .append("WHERE sink_stored IS DISTINCT FROM pg_to_jsonb;\n");
+    java.nio.file.Path out = java.nio.file.Path.of("target", "pg_array_jsonb_parity.sql");
+    java.nio.file.Files.createDirectories(out.getParent());
+    java.nio.file.Files.writeString(out, sql.toString());
+    assertTrue(java.nio.file.Files.size(out) > 0, "parity script written to " + out.toAbsolutePath());
+  }
+
+  /** SQL single-quoted literal (standard_conforming_strings: a backslash is literal). */
+  private static String quote(String text) {
+    return "'" + text.replace("'", "''") + "'";
   }
 
   /**
    * An element type whose to_jsonb text cannot be reproduced must THROW, not guess.
    *
-   * <p>A best-effort {@code toString()} would write a value that silently differs from what
-   * the Full Load loaded -- and pass every count-based check. A dead-letter naming the type is
-   * recoverable; a wrong value that survives the checksum is not.
+   * <p>A best-effort rendering would write a value that silently differs from what the Full Load
+   * loaded -- and pass every count-based check. A dead-letter NAMING the type is recoverable; a
+   * wrong value that survives the checksum is not. Each case below is a shape the PostgreSQL
+   * connector really produces, and each message must name the PostgreSQL type, not just the
+   * Java class, so the DLQ entry is actionable.
    */
   @Test
   void anUnrenderableArrayElementDeadLettersInsteadOfGuessing() {
+    // timetz[]: to_jsonb keeps the SOURCE offset (["03:04:05.678+09"]) and Debezium's ZonedTime
+    // has already normalized to UTC and thrown that offset away -- unrecoverable, not a
+    // formatting problem, so it must not be approximated as "+00:00".
+    assertThrowsWith(
+        "timetz",
+        named(STRING, DebeziumTypeConverter.ZONED_TIME),
+        java.util.List.of("03:04:05.678Z"));
+    // numeric[] with no declared scale: Debezium stripTrailingZeros() the value before the sink
+    // sees it, so to_jsonb's 1.50 can never be rebuilt from the event's 1.5.
+    Schema variableScale =
+        SchemaBuilder.struct()
+            .name(DebeziumTypeConverter.VARIABLE_SCALE_DECIMAL)
+            .field("scale", Schema.INT32_SCHEMA)
+            .field("value", Schema.BYTES_SCHEMA)
+            .optional()
+            .build();
+    assertThrowsWith(
+        "numeric",
+        variableScale,
+        java.util.List.of(
+            new Struct(variableScale).put("scale", 1).put("value", new byte[] {15})));
+    // bytea[]: to_jsonb's spelling depends on the source's bytea_output GUC, absent from the event.
+    assertThrowsWith("bytea", Schema.OPTIONAL_BYTES_SCHEMA, java.util.List.of(new byte[] {1, 2}));
+    // infinity / BC: Debezium encodes both as ordinary epoch micros (infinity lands in 294247),
+    // while to_jsonb writes "infinity" / "0044-03-15T10:00:00 BC".
+    assertThrowsWith(
+        "0001..9999",
+        named(INT64, DebeziumTypeConverter.MICRO_TIMESTAMP),
+        java.util.List.of(Long.MAX_VALUE));
+    assertThrowsWith(
+        "0001..9999",
+        named(INT32, DebeziumTypeConverter.DATE),
+        java.util.List.of(-720000)); // 0001-01-01 BC-ward
+    // time '24:00:00' is a legal PostgreSQL value with no in-range micros-since-midnight form.
+    assertThrowsWith(
+        "24:00:00",
+        named(INT64, DebeziumTypeConverter.MICRO_TIME),
+        java.util.List.of(86_400L * 1_000_000L));
+    // A NAMED numeric logical type this sink has not been taught must NOT fall through to a bare
+    // JSON number -- that silent path is the whole defect. io.debezium.time.NanoTime is the real
+    // one PostgresValueConverter can emit (timestamp precision > 6).
+    assertThrowsWith(
+        "io.debezium.time.NanoTime",
+        named(INT64, "io.debezium.time.NanoTime"),
+        java.util.List.of(1L));
+    // A nested array still raises (Debezium's element converter nulls these out before the sink,
+    // so this is a defensive guard rather than a reachable path).
+    assertThrowsWith("array", INT32, java.util.List.of(java.util.List.of("nested")));
+  }
+
+  private static void assertThrowsWith(
+      String expectedInMessage, Schema elementSchema, java.util.List<?> value) {
     org.apache.kafka.connect.errors.DataException thrown =
         org.junit.jupiter.api.Assertions.assertThrows(
             org.apache.kafka.connect.errors.DataException.class,
-            () ->
-                DebeziumTypeConverter.pgArrayAsJsonb(
-                    java.util.List.of(java.util.List.of("nested"))));
-    assertTrue(thrown.getMessage().contains("array"), thrown.getMessage());
+            () -> DebeziumTypeConverter.pgArrayAsJsonb(value, elementSchema),
+            "must dead-letter rather than render an approximation");
+    assertTrue(
+        thrown.getMessage().contains(expectedInMessage),
+        "message must name " + expectedInMessage + " but was: " + thrown.getMessage());
   }
 
 }

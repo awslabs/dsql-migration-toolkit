@@ -537,4 +537,38 @@ class DebeziumEventsTest {
     assertEquals(value, my.values().get(my.columns().indexOf("tags")));
   }
 
+  @Test
+  void pgArrayElementSchemaReachesTheJsonbRenderer() {
+    // The plumbing that made the temporal fix possible: convertField must pass the ARRAY schema's
+    // valueSchema() -- the ELEMENT schema, carrying the Debezium logical-type name -- to the
+    // renderer. Without it the renderer saw only a raw Long and wrote a bare JSON number
+    // ([1767323045678000]) where to_jsonb writes a quoted ISO string. That was SILENT: valid
+    // jsonb, accepted by DSQL, and unequal to the Full Load bytes on every CDC-written row.
+    Schema microTimestamp =
+        new SchemaBuilder(Schema.Type.INT64)
+            .name(DebeziumTypeConverter.MICRO_TIMESTAMP)
+            .optional()
+            .build();
+    Schema seen = SchemaBuilder.array(microTimestamp).optional().build();
+    Schema row =
+        SchemaBuilder.struct().name("Row")
+            .field("id", Schema.INT64_SCHEMA).field("seen_at", seen).optional().build();
+    Schema env =
+        SchemaBuilder.struct().name("Envelope")
+            .field("op", Schema.STRING_SCHEMA).field("after", row).field("source", ENGINE_SOURCE)
+            .build();
+    Struct pgEnv =
+        new Struct(env).put("op", "c")
+            .put(
+                "after",
+                new Struct(row).put("id", 9L).put("seen_at", java.util.List.of(1767323045678000L)))
+            .put("source", engineSource("postgresql", "visits"));
+    ChangeEvent pg = DebeziumEvents.parse(record(key(9L), pgEnv, "dsqlcdc.app.visits"));
+    PGobject bound =
+        assertInstanceOf(PGobject.class, pg.values().get(pg.columns().indexOf("seen_at")));
+    // Measured on live PostgreSQL 17.11:
+    //   to_jsonb(ARRAY['2026-01-02 03:04:05.678'::timestamp]) -> ["2026-01-02T03:04:05.678"]
+    assertEquals("[\"2026-01-02T03:04:05.678\"]", bound.getValue());
+  }
+
 }

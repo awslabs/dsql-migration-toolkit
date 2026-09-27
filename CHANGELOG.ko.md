@@ -5,6 +5,21 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.555
+
+### 수정
+
+- **PostgreSQL CDC가 배열 컬럼을 Full Load가 적재한 것과 다른 형태로, 조용히 기록했습니다 — 모든 시간·JSON·부동소수 원소 타입에서.** v0.1.547의 sink(플러그인 v44)는 배열 컬럼을 `jsonb`로 바인딩해 dead-letter를 멈춘 것은 맞지만, 각 **원소**를 그 **Java 클래스**로 렌더했고, 이름 기반 타입 변환 **이전의 raw Debezium 값**에서 동작합니다. 배포된 `time.precision.mode=adaptive_time_microseconds`에서 `timestamp[]` 원소는 epoch 마이크로초 `Long`, `date[]`는 epoch 일수, `time[]`은 자정 이후 마이크로초로 도착하므로 전부 "숫자" 분기에 걸려, PostgreSQL `to_jsonb`가 인용된 ISO 문자열을 쓰는 자리에 **맨 JSON 숫자**가 기록됐습니다. 라이브 PostgreSQL 17.11 실측: `["2026-01-02T03:04:05.678"]` vs `[1767322445678000]`, `["2026-01-02"]` vs `[20455]`, `["03:04:05.678"]` vs `[11045678000]`. `timestamptz[]`는 `to_jsonb`의 `+00:00` 자리에 Debezium의 `Z`를, `json[]`/`jsonb[]`는 문서를 임베드하지 않고 **문자열로 인용**했으며, `float8[]`/`float4[]`는 Java `toString` 숫자를 썼습니다(PostgreSQL이 `[1]`·평문 숫자를 쓰는 자리에 `[1.0]`·`[1.0E30]`). 이 전부가 Aurora DSQL이 받아들이는 유효한 `jsonb`라서 쓰기는 **성공**했고 어디에도 드러나지 않았습니다 — Validation CHECKSUM만이 볼 수 있었고, 그때는 이미 타깃에 잘못된 바이트가 들어 있습니다. 이제 sink는 원소의 Debezium **논리 타입**으로 분기하므로 시간·JSON 경우가 정확히 렌더되고, 부동소수 렌더러는 PostgreSQL의 최단 왕복·비과학 표기를 재현합니다(퍼즈 검증: `float8`/`float4` 46,340개 중 46,340개가 컴파일된 sink를 통해 바이트 동일, 기대값은 PostgreSQL이 계산; 배열 사례 31개 중 31개도 바이트 동일, 기대값 역시 손으로 쓰지 않고 PostgreSQL이 계산).
+- **변경 이벤트에서 `to_jsonb` 텍스트를 복원할 수 없는 원소 타입은 근사하지 않고, PostgreSQL 타입명을 밝히며 dead-letter합니다.** dead-letter는 복구 가능하지만, 사용자가 볼 수 없는 잘못된 값은 복구 불가입니다. `timetz[]` — Debezium `ZonedTime`은 이미 UTC로 정규화하며 `to_jsonb`가 보존하는 오프셋을 버립니다(실측 `["03:04:05.678+09"]`, 세션 `TimeZone`에 영향 없음). 정밀도·스케일 미선언 `numeric[]` — Debezium이 sink 이전에 뒤 0을 제거하므로 `to_jsonb`가 출력하는 표시 스케일이 이미 사라졌습니다(PostgreSQL은 `1.50`, 이벤트는 `1.5`). `numeric(p,s)`로 선언하면 정확히 복제됩니다. `bytea[]` — 표기가 **소스**의 `bytea_output` 설정에 달렸고 이벤트가 그것을 전달하지 않습니다. 연도 0001–9999 범위를 벗어난 `date`/`timestamp`/`timestamptz` — Debezium이 `infinity`를 평범한 epoch 값으로 인코딩해 진짜 먼 미래 날짜와 구분되지 않습니다. 그리고 자정 이후 마이크로초 표현이 없는 `time '24:00:00'`.
+- **플러그인 `v44` → `v45`.** 이미 배포된 cdc-stack은 이 변경을 가져가지 못합니다: `Start CDC`는 플러그인을 재등록하지 않으므로 기존 파이프라인에는 **Delete CDC infrastructure** 후 **Deploy CDC infrastructure**가 필요합니다. MySQL 소스는 영향이 없고 그것이 증명 가능합니다 — 배열 분기는 PostgreSQL 소스 커넥터로 게이트되고, MySQL 값 변환기는 배열 스키마를 아예 만들지 않습니다.
+
+### 알려진 제약 (이번에 문서화, 새로 생긴 것 아님)
+
+- `interval[]`, `varbit[]`, `bit(n)[]`, `money[]`, `xml[]`, `point[]`, `name[]`은 **PostgreSQL CDC로 복제 자체가 불가능**합니다: Debezium PostgreSQL 커넥터가 스키마를 만들지 않아 sink가 보기 전에 필드가 변경 이벤트에서 사라집니다. Schema Conversion은 여전히 `jsonb`로 매핑하고 Full Load도 적재하므로, CDC로 들어온 행에서는 해당 컬럼이 NULL입니다.
+- 다차원 배열(`int[][]`)은 PostgreSQL이 `integer[]`로 보고하고 Debezium이 1차원으로 평탄화하면서 진짜 NULL과 구분되지 않는 `null` 원소를 보냅니다. 차원 정보는 소스에서만 알 수 있습니다.
+- `oid[]`는 `to_jsonb`가 `["42"]`(인용된 문자열)로 쓰지만 이름 없는 64비트 정수 배열로 도착해 `int8[]`과 구분되지 않습니다.
+- Full Load의 소스 세션이 `extra_float_digits`를 고정하지 않아, 기본값보다 낮게 설정된 소스는 sink가 이제 정확히 재현하는 `float8` 텍스트를 이동시킵니다.
+
 ## v0.1.554
 
 ### 수정
