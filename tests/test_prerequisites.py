@@ -1692,9 +1692,14 @@ def test_the_existence_check_grades_absence_coverage_and_dml() -> None:
     assert narrowed.status is PrerequisiteStatus.FAIL
     assert "INSERT/UPDATE/DELETE" in narrowed.detail
 
-    # A missing SLOT is only a WARN: such a start re-snapshots, so it costs a re-read, not
-    # correctness. Grading it FAIL would block the one route a Full-load-only operator has.
-    no_slot = verdict(slot_usable=False, slot_present_any_database=False)
+    # A missing SLOT is only a WARN **when this start re-snapshots**: it then costs a re-read,
+    # not correctness. Grading it FAIL would block the one route a Full-load-only operator has.
+    no_slot = check_cdc_replication_objects(
+        _pg_facts(slot_usable=False, slot_present_any_database=False),
+        _tabs("app.orders", "app.items"),
+        provisions_replication=False,
+        cdc_start_resnapshots=True,
+    )
     assert no_slot.status is PrerequisiteStatus.WARN
     assert no_slot.required is False
     # Both branches that lead to a re-snapshot share one cost paragraph, so the route is
@@ -1702,6 +1707,20 @@ def test_the_existence_check_grades_absence_coverage_and_dml() -> None:
     assert "Nothing is lost" in no_slot.remediation
     assert "read from the source a second time" in no_slot.remediation
     assert "DELETED on the source" in no_slot.remediation
+
+    # ...but the SAME missing slot in a ``never``-mode start is a FAIL, because that start does
+    # NOT re-snapshot: the connector would create a replacement slot at the current WAL and
+    # skip every change since the Full Load, silently, while reporting RUNNING. Reassuring the
+    # operator with the re-snapshot paragraph here would be a false promise, and leaving it
+    # non-blocking would let the billable MSK create happen before Start refuses anyway.
+    lost_slot = verdict(slot_usable=False, slot_present_any_database=False)
+    assert lost_slot.status is PrerequisiteStatus.FAIL
+    assert lost_slot.required is True
+    assert "snapshot.mode=never" in lost_slot.detail
+    assert "skip every change since the Full Load" in lost_slot.detail
+    assert "BEFORE deploying" in lost_slot.remediation
+    # The false reassurance must be gone from this branch.
+    assert "takes a fresh snapshot" not in (lost_slot.remediation or "")
 
     # Unread facts are UNKNOWN, never absent -- an INFO that cannot gate anything.
     unknown = verdict(publication_present=None)
@@ -1722,9 +1741,13 @@ def test_the_existence_check_is_gated_by_the_provisioners_own_predicate() -> Non
 
     src = inspect.getsource(dm)
     idx = src.index("request = PrerequisiteCheckRequest(")
-    window = src[max(0, idx - 900) : idx + 500]
+    window = src[max(0, idx - 900) : idx + 2200]
     assert "_pg_cdc_handoff_stack(" in window
-    assert "provisions_replication=_handoff_stack is not None" in window
+    # The stack predicate answers "is this the provisioning CONFIGURATION"; the watermark
+    # conjunct answers "has the consistency point not been passed yet". Without the second,
+    # the flag stayed True for the whole session, so a load that had already run -- or would
+    # never run -- still SKIPped the grading.
+    assert "_handoff_stack is not None and _wm_for_gate is None" in window
     # ...and NOT re-derived from the migration type, which is the drift this avoids.
     assert "provisions_replication=migration_state.migration_type" not in src
 

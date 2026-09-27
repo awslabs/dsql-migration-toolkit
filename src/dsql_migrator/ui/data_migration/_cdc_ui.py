@@ -3621,9 +3621,14 @@ def pg_objects_required_before_deploy(migration_state, job) -> bool:
 
     * a FRESH combined run has no watermark -> False, so the recommended
       deploy-the-infra-before-the-load flow is untouched;
-    * a combined run whose load DID provision carries ``slot_name`` -> False;
-    * a load that FINISHED WITHOUT a slot -> True: the state worth spending a source read on
-      before the spend, whichever tile is selected now.
+    * ANY run whose load has reached its consistency point -> True, whichever tile is
+      selected now. A recorded ``slot_name`` used to return False on the assumption that a
+      slot this run created is still there -- but a teardown DROPS it and an over-retained
+      one is INVALIDATED (``wal_status='lost'``), and that is the worst state to discover
+      late: ``snapshot.mode=never`` does not snapshot, so the connector would create a
+      replacement slot at the CURRENT WAL and skip every change since the load, silently.
+      Probing costs one read; not probing costs the ~5-minute billable MSK Serverless create
+      before the same refusal lands at Start.
 
     True selects the PROBE, not a verdict. Since v0.1.507 an absent publication under
     ``snapshot.mode=initial`` derives ``publication.autocreate.mode=filtered``, so
@@ -3650,7 +3655,7 @@ def pg_objects_required_before_deploy(migration_state, job) -> bool:
     if getattr(migration_state, "migration_type", None) is MigrationType.CDC_ONLY:
         return True
     watermark = _cdc_watermark(job)
-    return watermark is not None and not getattr(watermark, "slot_name", None)
+    return watermark is not None
 
 
 def _cdc_watermark(job):

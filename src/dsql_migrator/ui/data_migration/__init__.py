@@ -758,6 +758,11 @@ def build_data_migration_screen(
             _handoff_stack = _pg_cdc_handoff_stack(
                 migration_state, source_config, job_manager
             )
+            # The watermark decides whether the CONSISTENCY POINT has already been passed,
+            # and it is needed twice below, so resolve it once.
+            _wm_for_gate = _cdc_watermark(
+                _current_job(job_manager, getattr(migration_state, "job_id", None))
+            )
             request = PrerequisiteCheckRequest(
                 mode=mode,
                 tables=[table.name for table in tables],
@@ -765,7 +770,25 @@ def build_data_migration_screen(
                 # CDC as not-yet-supported (INFO) instead of running MySQL binlog
                 # checks that would falsely FAIL.
                 source_type=source_config.source_type,
-                provisions_replication=_handoff_stack is not None,
+                # ... AND the consistency point has not been passed yet. The stack predicate
+                # alone answers only "is this the provisioning CONFIGURATION"; it stays true
+                # for the whole session, so once the load has run it kept asserting a
+                # provisioning that already happened -- or never will. A watermark means the
+                # load has decided: it either created the objects (slot recorded) or never
+                # will (Full-load-only, then the type switched to add CDC). Either way the row
+                # must be GRADED against the source, because with the stack predicate alone
+                # ALL SIX grading states collapsed to SKIP -- including the two a re-snapshot
+                # cannot repair (a publication omitting a selected table; one narrowed to a
+                # subset of INSERT/UPDATE/DELETE), which are exactly the states where the
+                # connector reports RUNNING while replicating nothing. It also left
+                # _render_gapless_choice unreachable, since its trigger is a FAIL with
+                # resolvable_by_resnapshot. NO watermark still SKIPs, deliberately: there the
+                # tool cannot tell "the load is still coming" from "there will never be one",
+                # and guessing would re-block the deploy-the-infra-DURING-the-load flow the
+                # tool itself recommends (the v0.1.509/510 regression).
+                provisions_replication=(
+                    _handoff_stack is not None and _wm_for_gate is None
+                ),
                 # Will this start re-snapshot? Read off the EFFECTIVE snapshot mode --
                 # the same pure rule the connector config and the Deploy/Start gates use --
                 # not off the start mode alone. "manual" is only ONE of the two ways to end
@@ -780,11 +803,7 @@ def build_data_migration_screen(
                 cdc_start_resnapshots=(
                     source_config.source_type is SourceType.POSTGRES
                     and pg_snapshot_mode(
-                        _cdc_watermark(
-                            _current_job(
-                                job_manager, getattr(migration_state, "job_id", None)
-                            )
-                        ),
+                        _wm_for_gate,
                         force_initial_snapshot=(
                             migration_state.cdc_start_mode() == "manual"
                         ),

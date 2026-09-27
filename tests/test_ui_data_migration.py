@@ -25486,7 +25486,7 @@ def test_the_deploy_gate_blocks_a_failing_publication_check_but_nothing_softer()
         primary_key=["id"],
     )
 
-    def row(*, provisions, **facts_kw):
+    def row(*, provisions, resnapshots=False, **facts_kw):
         base = dict(
             checked_publication_name="dsqlmig_pub_x",
             checked_slot_name="dsqlmig_x",
@@ -25498,7 +25498,10 @@ def test_the_deploy_gate_blocks_a_failing_publication_check_but_nothing_softer()
         )
         base.update(facts_kw)
         return check_cdc_replication_objects(
-            PostgresCdcFacts(**base), [table], provisions_replication=provisions
+            PostgresCdcFacts(**base),
+            [table],
+            provisions_replication=provisions,
+            cdc_start_resnapshots=resnapshots,
         )
 
     def gate(result):
@@ -25530,11 +25533,23 @@ def test_the_deploy_gate_blocks_a_failing_publication_check_but_nothing_softer()
     assert row(provisions=True, publication_present=False, publication_tables=()).status \
         is PrerequisiteStatus.SKIP
     assert gate(row(provisions=True, publication_present=False, publication_tables=())) is None
-    #   WARN: only the slot is missing -> the start re-snapshots. Blocking would remove
-    #   the one route a Full-load-only operator has left.
-    slotless = row(provisions=False, slot_usable=False, slot_present_any_database=False)
+    #   WARN: only the slot is missing AND this start re-snapshots, so it costs a re-read and
+    #   not correctness. Blocking would remove the one route a Full-load-only operator has left.
+    slotless = row(
+        provisions=False,
+        resnapshots=True,
+        slot_usable=False,
+        slot_present_any_database=False,
+    )
     assert slotless.status is PrerequisiteStatus.WARN
     assert gate(slotless) is None
+    #   ...but the SAME missing slot in a ``never``-mode start DOES block: that start does not
+    #   re-snapshot, so the connector would create a replacement slot at the current WAL and
+    #   skip every change since the Full Load. Letting Deploy through here spends the billable
+    #   MSK create before Start refuses on the very same fact.
+    lost_slot = row(provisions=False, slot_usable=False, slot_present_any_database=False)
+    assert lost_slot.status is PrerequisiteStatus.FAIL
+    assert gate(lost_slot) is not None
     #   INFO: the catalog could not be read. Unreadable is not absent.
     assert gate(row(provisions=False, publication_present=None)) is None
     #   PASS.
@@ -26212,12 +26227,18 @@ def test_a_finished_load_with_no_slot_gates_the_spend_whatever_tile_is_selected(
         pg_objects_required_before_deploy(state(MigrationType.FULL_LOAD_AND_CDC), None)
         is False
     )
-    # A combined run whose load DID provision -> silent.
+    # A combined run whose load DID provision is ALSO probed. A recorded slot name used to
+    # return False on the assumption that a slot this run created is still on the source --
+    # but a teardown DROPS it and an over-retained one is INVALIDATED (wal_status='lost'),
+    # and that is the worst state to discover late: snapshot.mode=never does not snapshot, so
+    # the connector would create a replacement slot at the CURRENT WAL and skip every change
+    # since the load, silently. Probing costs one read; not probing costs the billable MSK
+    # create before the identical refusal lands at Start.
     assert (
         pg_objects_required_before_deploy(
             state(MigrationType.FULL_LOAD_AND_CDC), provisioned
         )
-        is False
+        is True
     )
     # CDC only always needs them, with or without a job.
     for job in (None, slotless, provisioned):

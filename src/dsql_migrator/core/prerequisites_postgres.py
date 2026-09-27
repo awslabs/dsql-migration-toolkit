@@ -931,6 +931,40 @@ def check_cdc_replication_objects(
             ),
         )
     if not facts.slot_usable:
+        if not cdc_start_resnapshots:
+            # snapshot.mode=never with the slot GONE is the one unusable-slot state that
+            # loses data, so it must FAIL rather than reassure. This run's watermark recorded
+            # a slot name -- which is why the mode is ``never`` -- but the slot is not on the
+            # source any more (a teardown drops it; an over-retained one is INVALIDATED with
+            # wal_status='lost'). A ``never`` start does NOT snapshot, so Debezium creates a
+            # replacement slot positioned at the CURRENT WAL and streams forward from there:
+            # every change between the Full Load's consistency point and that moment is
+            # skipped SILENTLY, with the connector reporting RUNNING. The re-snapshot
+            # reassurance below is false here -- there is no snapshot to fall back on -- so
+            # this row must block the spend, matching what ``pg_replication_objects_blocker``
+            # already refuses at Start.
+            return PrerequisiteResult(
+                check_id=PrerequisiteCheckId.CDC_REPLICATION_OBJECTS,
+                title=title,
+                status=PrerequisiteStatus.FAIL,
+                required=True,
+                detail=(
+                    f'Publication "{pub}" covers all {len(selected)} selected tables, but '
+                    f'replication slot "{slot}" -- the one this run\'s Full Load recorded -- '
+                    "is no longer on this database, so there is no WAL position to resume "
+                    "from. This start is configured snapshot.mode=never and would NOT "
+                    "re-snapshot: the connector would create a fresh slot at the current WAL "
+                    "position and skip every change since the Full Load, silently, while "
+                    "reporting RUNNING."
+                ),
+                remediation=(
+                    "Fix this BEFORE deploying the CDC infrastructure — MSK Serverless and "
+                    "both connectors are billed from creation. Re-run the Full Load under "
+                    '"Full load + CDC" to create a new slot at a fresh consistency point, '
+                    "or choose to re-snapshot every selected table instead (lossless, but "
+                    "it reads the source again). " + gapless_note.strip()
+                ),
+            )
         return PrerequisiteResult(
             check_id=PrerequisiteCheckId.CDC_REPLICATION_OBJECTS,
             title=title,
