@@ -4,6 +4,7 @@
 package dev.dsqlmigrator.connect;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -15,6 +16,7 @@ import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.junit.jupiter.api.Test;
+import org.postgresql.util.PGobject;
 
 class DebeziumEventsTest {
 
@@ -488,4 +490,51 @@ class DebeziumEventsTest {
     assertEquals(List.of("user_id", "id"), event.pkColumns());
     assertEquals(List.of(42L, 510L), event.pkValues());
   }
+
+  @Test
+  void pgArrayColumnBindsAsJsonbWhileMysqlIsUntouched() {
+    // THE live defect: Debezium builds array schemas with SchemaBuilder.array(...) and never
+    // NAMES them, so the name-keyed converter returned the List untouched and setObject handed
+    // pgjdbc a type it cannot map -- SQLSTATE 07006, permanent, so the record dead-lettered
+    // and the offset committed past it. Because an after-image carries every column, an UPDATE
+    // touching only an unrelated column died with it: five products.price updates were lost on
+    // a live Aurora PostgreSQL 17.7 run while the table still read
+    // src=15 tgt=15 missing=0 extra=0 -- an update that never lands changes no row count.
+    //
+    // The BYTES matter as much as the binding. The Full Load converts on the SOURCE in SQL
+    // (CAST(to_jsonb(col) AS text)), so DSQL already holds PostgreSQL's own to_jsonb output --
+    // verified live: ["audio", "wireless", "anc"], with a space after each comma. Render it any
+    // other way and Validation's checksum mismatches every CDC-written row.
+    Schema tags = SchemaBuilder.array(Schema.OPTIONAL_STRING_SCHEMA).optional().build();
+    Schema row =
+        SchemaBuilder.struct().name("Row")
+            .field("id", Schema.INT64_SCHEMA).field("tags", tags).optional().build();
+    Schema env =
+        SchemaBuilder.struct().name("Envelope")
+            .field("op", Schema.STRING_SCHEMA).field("after", row).field("source", ENGINE_SOURCE)
+            .build();
+    java.util.List<String> value = java.util.List.of("audio", "wireless", "anc");
+
+    Struct pgEnv =
+        new Struct(env).put("op", "u")
+            .put("after", new Struct(row).put("id", 5L).put("tags", value))
+            .put("source", engineSource("postgresql", "products"));
+    ChangeEvent pg = DebeziumEvents.parse(record(key(5L), pgEnv, "dsqlcdc.app.products"));
+    Object bound = pg.values().get(pg.columns().indexOf("tags"));
+    PGobject asJsonb =
+        assertInstanceOf(PGobject.class, bound, "a List cannot be bound by setObject");
+    assertEquals("jsonb", asJsonb.getType(), "the target column is jsonb (DSQL has no arrays)");
+    assertEquals("[\"audio\", \"wireless\", \"anc\"]", asJsonb.getValue());
+
+    // MySQL is provably untouched: its value converters emit no array schema at all (SET
+    // becomes a String, JSON becomes io.debezium.data.Json), so this branch is unreachable
+    // there -- and it is gated on the source connector regardless.
+    Struct myEnv =
+        new Struct(env).put("op", "u")
+            .put("after", new Struct(row).put("id", 5L).put("tags", value))
+            .put("source", engineSource("mysql", "products"));
+    ChangeEvent my = DebeziumEvents.parse(record(key(5L), myEnv, "dsqlcdc.app.products"));
+    assertEquals(value, my.values().get(my.columns().indexOf("tags")));
+  }
+
 }

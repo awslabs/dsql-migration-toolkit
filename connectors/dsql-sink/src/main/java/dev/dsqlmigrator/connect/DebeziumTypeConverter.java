@@ -298,6 +298,118 @@ final class DebeziumTypeConverter {
   }
 
   /**
+   * Bind a PostgreSQL ARRAY column as {@code jsonb}, matching what the Full Load stored.
+   *
+   * <p><b>The defect this fixes.</b> Schema Conversion substitutes a source {@code <t>[]} to
+   * {@code jsonb} because Aurora DSQL has no array type. Debezium delivers the value as a
+   * {@code java.util.List} under a {@code SchemaBuilder.array(...)} schema with NO logical
+   * name, so {@link #convert} returned it untouched and {@code PreparedStatement.setObject}
+   * handed pgjdbc a type it cannot map -- SQLSTATE <b>07006</b>, classified permanent, so the
+   * record was dead-lettered and the offset committed past it. Because an after-image always
+   * carries every column, an UPDATE that touched only an unrelated column died with it: on a
+   * live Aurora PostgreSQL 17.7 run five {@code products.price} updates were lost while the
+   * table still read {@code src=15 tgt=15 missing=0 extra=0}, because an update that never
+   * lands changes no row count.
+   *
+   * <p><b>Why this rendering.</b> The Full Load converts on the SOURCE, in SQL
+   * ({@code CAST(to_jsonb(col) AS text)}), so the bytes already in DSQL are PostgreSQL's own
+   * {@code to_jsonb} output. This must produce the SAME text or the two write paths would
+   * disagree and Validation's checksum would mismatch every CDC-written row: a JSON array,
+   * elements in order, {@code null} for a NULL element, strings quoted and escaped, numbers
+   * and booleans bare.
+   *
+   * <p><b>Throws rather than guesses.</b> An element type whose {@code to_jsonb} text this
+   * cannot reproduce byte-for-byte (bytea, a nested array, a composite) raises, so the record
+   * dead-letters with a NAMED reason instead of writing a value that silently differs from the
+   * loaded one. A visible gap is recoverable; a wrong value that passes the checksum is not.
+   */
+  static PGobject pgArrayAsJsonb(Object value) {
+    StringBuilder out = new StringBuilder("[");
+    boolean first = true;
+    for (Object element : (Iterable<?>) value) {
+      if (!first) {
+        out.append(", ");
+      }
+      first = false;
+      appendJsonbElement(out, element);
+    }
+    return pgObject("jsonb", out.append("]").toString());
+  }
+
+  /** Render ONE array element exactly as PostgreSQL's {@code to_jsonb} would. */
+  private static void appendJsonbElement(StringBuilder out, Object element) {
+    if (element == null) {
+      out.append("null");
+      return;
+    }
+    if (element instanceof Boolean) {
+      out.append(((Boolean) element) ? "true" : "false");
+      return;
+    }
+    if (element instanceof Number) {
+      // Integral and decimal types render as their plain text, which is what to_jsonb emits.
+      // BigDecimal.toString() can use scientific notation for a large exponent, which
+      // to_jsonb does not -- toPlainString keeps them identical.
+      out.append(
+          element instanceof BigDecimal
+              ? ((BigDecimal) element).toPlainString()
+              : element.toString());
+      return;
+    }
+    if (element instanceof CharSequence) {
+      appendJsonString(out, element.toString());
+      return;
+    }
+    // Deliberately NOT a best-effort toString(): see pgArrayAsJsonb. A byte[] would render
+    // as an object identity, a nested List as Java's "[a, b]" -- both silently unequal to
+    // what the Full Load wrote, which is worse than a dead-letter naming the type.
+    throw new DataException(
+        "Cannot bind a PostgreSQL array whose elements are "
+            + element.getClass().getName()
+            + ": this sink renders array columns as jsonb to match the Full Load, and the "
+            + "jsonb text for this element type cannot be reproduced exactly. Exclude the "
+            + "column from capture, or migrate it without CDC.");
+  }
+
+  /** Escape a string the way PostgreSQL's JSON output does. */
+  private static void appendJsonString(StringBuilder out, String text) {
+    out.append('"');
+    for (int i = 0; i < text.length(); i++) {
+      char c = text.charAt(i);
+      switch (c) {
+        case '"':
+          out.append("\\\"");
+          break;
+        case '\\':
+          out.append("\\\\");
+          break;
+        case '\b':
+          out.append("\\b");
+          break;
+        case '\f':
+          out.append("\\f");
+          break;
+        case '\n':
+          out.append("\\n");
+          break;
+        case '\r':
+          out.append("\\r");
+          break;
+        case '\t':
+          out.append("\\t");
+          break;
+        default:
+          if (c < 0x20) {
+            out.append(String.format("\\u%04x", (int) c));
+          } else {
+            out.append(c);
+          }
+      }
+    }
+    out.append('"');
+  }
+
+  /**
    * Wrap a value string in a {@code PGobject} of the given PostgreSQL type name so pgjdbc
    * binds it to that column type (rather than as {@code varchar}). Used for {@code json}
    * and {@code interval}, whose canonical text forms the server re-parses.

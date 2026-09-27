@@ -417,7 +417,32 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # and is never retried. Bumped because the sink ZIP's CONTENT changed: a live cdc-stack needs
 # Delete + Deploy infra to pick it up. Ships together with v42's null-key delete guard, so one
 # redeploy covers both.
-PLUGIN_VERSION = "v43"
+# v44: a PostgreSQL ARRAY column now binds as jsonb, matching what the Full Load stored.
+# Before this, EVERY insert and update for a table with an array column was lost. Schema
+# Conversion substitutes a source `<t>[]` to jsonb (DSQL has no array type), Debezium delivers
+# the value as a java.util.List under a SchemaBuilder.array(...) schema with NO logical name,
+# so the name-keyed converter passed it straight through and `setObject` handed pgjdbc a type
+# it cannot map -- SQLSTATE 07006, classified permanent, dead-lettered with the offset
+# committed past it. Because an after-image carries every column, an UPDATE that touched only
+# an unrelated column died with it: five `products.price` updates were lost on a live Aurora
+# PostgreSQL 17.7 run while the table still read src=15 tgt=15 missing=0 extra=0 -- an update
+# that never lands changes no row count, so only a checksum could see it.
+#
+# The rendering matches PostgreSQL's own `to_jsonb` text byte-for-byte (a JSON array, elements
+# in order, `null` for NULL, strings escaped, numbers/booleans bare) because the Full Load
+# converts on the SOURCE in SQL (`CAST(to_jsonb(col) AS text)`) -- so the bytes already in DSQL
+# ARE to_jsonb output, and anything else would make Validation's checksum mismatch every
+# CDC-written row. An element type whose to_jsonb text cannot be reproduced exactly (bytea, a
+# nested array, a composite) THROWS instead of guessing: a dead-letter naming the type is
+# recoverable, a wrong value that passes the checksum is not.
+#
+# MySQL is unaffected and provably so: its value converters emit no array schema at all (SET
+# becomes a String, JSON becomes io.debezium.data.Json), and the branch is gated on the source
+# connector regardless. Bumped because the sink ZIP's CONTENT changed: a live cdc-stack needs
+# Delete + Deploy infra to pick it up (Start CDC alone does not re-register the plugin). Until
+# it does, v0.1.550's classified 07006 banner is what makes the loss visible, and the repaired
+# checksum is what measures it.
+PLUGIN_VERSION = "v44"
 
 
 class S3ProvisionError(RuntimeError):

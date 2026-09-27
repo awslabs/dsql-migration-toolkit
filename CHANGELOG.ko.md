@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.552
+
+### 수정
+
+- **CDC 인프라 삭제가 아예 실패했습니다: `AttributeError: 'SecretValue' object has no attribute 'strip'`.** teardown은 복제 슬롯을 드롭하기 위해 세션 자신의 소스 자격증명을 읽습니다 — IAM 부여가 필요 없는 유일한 자격증명 경로입니다 — 그런데 `session.source_password`는 `SecretValue`이고, 이 타입의 존재 이유가 바로 **`str`처럼 동작하지 않는 것**입니다(`reveal()`만 노출해서 자격증명이 실수로 로그 줄에 보간되지 않게 합니다 — Property 7). 이를 str로 취급해 즉시 예외가 났고, 삭제 전체가 "CloudFormation 콘솔에서 스택을 직접 삭제해야 할 수 있습니다"로 실패했습니다. cdc-stack은 그대로 남고 **복제 슬롯도 소스 WAL을 계속 고정한** 채로요 — 그 자격증명 경로가 막으려고 추가된 바로 그 결과입니다. 라이브에서 보고됐습니다.
+- **…그리고 첫 번째가 가리고 있던, 같은 부류의 두 번째 버그.** `_drop_pg_source_replication`이 평문 `str` 비밀번호를 `build_pg_source_write_engine`에 넘기는데, 그 함수는 `SecretValue`를 받아 `reveal()`을 호출합니다 — 즉 보고된 에러만 고치면 `'SecretValue' has no attribute 'strip'`이 한 줄 뒤의 `'str' has no attribute 'reveal'`로 바뀌며 teardown은 똑같이 실패했을 겁니다. 둘을 함께 고쳤고, 테스트는 이제 양쪽이 공유하는 계약으로 **래퍼**(평문이 아니라)를 고정하며, 마스킹된 `repr`/`str`까지 단정해 Property 7이 리뷰가 아니라 구조로 성립하게 했습니다.
+- **PostgreSQL 배열 컬럼이 있는 테이블의 모든 insert·update를 CDC가 유실했습니다 — 싱크 수정(플러그인 `v44`).** v0.1.550이 이 손실을 보이고 측정 가능하게 만들었고, 이번이 실제 수정입니다. Debezium은 배열을 **logical name 없는** `SchemaBuilder.array(...)` 스키마의 `java.util.List`로 넘기므로, 이름 기반 변환기가 그대로 통과시키고 `setObject`가 pgjdbc에 매핑 불가 타입을 건넸습니다(SQLSTATE 07006, 영구). 이제 배열은 Schema Conversion이 만드는 타깃 컬럼에 맞춰 `jsonb`로 바인딩되고, 렌더링은 PostgreSQL 자신의 `to_jsonb` 텍스트와 **바이트 동일**합니다 — JSON 배열, 순서 유지, NULL 요소는 `null`, 문자열 이스케이프, 숫자·불린은 그대로. Full Load가 소스에서 SQL로 변환하므로(`CAST(to_jsonb(col) AS text)`) DSQL에 이미 들어 있는 바이트가 **곧** `to_jsonb` 출력이고, 다르게 렌더하면 Validation의 CHECKSUM이 모든 CDC 기록 행에서 불일치합니다. `to_jsonb` 텍스트를 정확히 재현할 수 없는 요소 타입(bytea, 중첩 배열, 복합 타입)은 **예외를 던집니다** — 타입을 명시한 dead-letter는 복구 가능하지만, CHECKSUM을 통과하는 잘못된 값은 아닙니다. MySQL은 영향이 없고 그것이 증명됩니다 — 값 변환기가 배열 스키마를 아예 내지 않으며, 분기 자체도 소스 커넥터로 게이트됩니다.
+
+  **라이브 cdc-stack은 이를 반영하려면 `Delete + Deploy CDC infrastructure`가 필요합니다** — Start CDC만으로는 플러그인이 재등록되지 않습니다. 그 전까지는 v0.1.550의 분류된 07006 배너가 손실을 보이게 하고, 수정된 CHECKSUM이 그것을 측정합니다. 또한 이 수정은 소급되지 않습니다: 이미 dead-letter된 행은 재전송되지 않으므로, 영향받은 테이블은 Full Load를 다시 돌려(멱등 `INSERT … ON CONFLICT`) 값을 현재화해야 합니다.
+
+### 추가
+
+- **배열 결함의 근원을 막는 가드: 플러그인 ZIP을 재빌드하지 않고 Java를 바꿔 배포하는 것.** 배포되는 싱크는 커밋된 ZIP이지 소스 트리가 아니고, 둘이 일치하는지 아무도 확인하지 않았습니다 — 그래서 v0.1.541이 Schema Conversion에 배열→jsonb 치환을 가르치고, 커넥터는 안 바꾸고, 모든 테스트를 통과하면서 싱크는 그 결과를 조용히 dead-letter할 수 있었습니다. 이제 ZIP의 컴파일된 클래스가 가져야 하는 각 동작에 대한 마커를 단정하고, 실패 메시지가 정확한 복구 절차를 안내합니다(`mvn -B -ntp package`, 재-zip, `PLUGIN_VERSION` 범프). 이전 ZIP을 대상으로 실행해 `STALE for: pg array -> jsonb`를 내는 것으로 검증했습니다. 재컴파일이 아니라 마커로 검사하는 것은 의도적입니다: 테스트 스위트에 Maven 툴체인을 요구하면 이 ZIP들을 커밋하는 이유인 "새로 clone해서 바로 배포" 원칙이 깨집니다.
+
 ## v0.1.551
 
 ### 수정

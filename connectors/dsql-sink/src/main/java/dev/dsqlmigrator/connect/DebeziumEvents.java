@@ -203,6 +203,19 @@ final class DebeziumEvents {
     if (pgSource && DebeziumTypeConverter.BITS_TYPE.equals(fieldSchema.name())) {
       return DebeziumTypeConverter.pgBitString(raw, fieldSchema);
     }
+    // A PostgreSQL ARRAY column. Schema Conversion stores it as jsonb (DSQL has no array
+    // type) and the Full Load wrote PostgreSQL's own to_jsonb text, so render the same --
+    // see DebeziumTypeConverter.pgArrayAsJsonb. Gated on ARRAY rather than on a schema NAME
+    // because Debezium builds these with SchemaBuilder.array(...) and never names them,
+    // which is precisely why convert() passed the List straight through to setObject and
+    // every write for the table dead-lettered with SQLSTATE 07006.
+    //
+    // MySQL is untouched: its value converters emit no array schema at all (SET becomes a
+    // String, JSON becomes io.debezium.data.Json), so this branch is unreachable there --
+    // and it is gated on pgSource regardless.
+    if (pgSource && fieldSchema.type() == Schema.Type.ARRAY && raw != null) {
+      return DebeziumTypeConverter.pgArrayAsJsonb(raw);
+    }
     return DebeziumTypeConverter.convert(fieldSchema.name(), raw);
   }
 

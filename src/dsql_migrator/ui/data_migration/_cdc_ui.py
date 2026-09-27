@@ -198,9 +198,23 @@ def _session_source_credentials(session) -> Optional[tuple[str, str]]:
         return None
     config = getattr(session, "source_config", None)
     password = getattr(session, "source_password", None)
-    if not (password or "").strip():
+    if password is None:
         return None
-    return (getattr(config, "username", "") or "", password)
+    # ``session.source_password`` is a :class:`~dsql_migrator.config.SecretValue`, whose whole
+    # point is that it does NOT behave like a str -- it exposes only ``reveal()`` so a
+    # credential cannot be interpolated into a log line or an f-string by accident (Property
+    # 7). Treating it as one here raised `'SecretValue' object has no attribute 'strip'` and
+    # FAILED THE WHOLE TEARDOWN: "Delete infrastructure failed … you may need to delete the
+    # stack from the CloudFormation console", leaving the cdc-stack up AND the replication
+    # slot pinning source WAL -- the exact outcome this function was added to prevent.
+    #
+    # ``reveal()`` is also what the return value needs: ``run_cdc_delete`` hands the tuple to
+    # ``build_pg_source_write_engine``, and it checks ``source_credentials[1].strip()`` before
+    # using it, so returning the wrapper would only move the same AttributeError downstream.
+    revealed = password.reveal() if hasattr(password, "reveal") else str(password)
+    if not (revealed or "").strip():
+        return None
+    return (getattr(config, "username", "") or "", revealed)
 
 
 def _cdc_stack_has_seeder_lambda(migration_state) -> Optional[bool]:

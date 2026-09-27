@@ -431,4 +431,52 @@ class DebeziumTypeConverterTest {
     java.util.List<Integer> arr = java.util.List.of(1, 2, 3);
     assertTrue(DebeziumTypeConverter.convert(null, arr) == arr, "List passes through unchanged");
   }
+
+  /** to_jsonb parity for the element shapes: NULLs, numbers, booleans, and escaping. */
+  @Test
+  void pgArrayJsonbRenderingMatchesPostgresForEveryElementShape() {
+    assertEquals(
+        "[\"a\", null, \"c\"]",
+        DebeziumTypeConverter.pgArrayAsJsonb(java.util.Arrays.asList("a", null, "c")).getValue(),
+        "a NULL element is JSON null, not the string \"null\"");
+    assertEquals(
+        "[1, 2, 3]",
+        DebeziumTypeConverter.pgArrayAsJsonb(java.util.List.of(1, 2, 3)).getValue(),
+        "numbers are bare, not quoted");
+    assertEquals(
+        "[true, false]",
+        DebeziumTypeConverter.pgArrayAsJsonb(java.util.List.of(true, false)).getValue());
+    // BigDecimal.toString() switches to scientific notation for a large exponent; to_jsonb
+    // never does, so a plain string is required or the two write paths diverge.
+    assertEquals(
+        "[1000]",
+        DebeziumTypeConverter.pgArrayAsJsonb(java.util.List.of(new BigDecimal("1E+3")))
+            .getValue());
+    // PostgreSQL's JSON output escapes these; anything else would not round-trip.
+    assertEquals(
+        "[\"a\\\"b\", \"c\\\\d\", \"e\\nf\", \"g\\th\"]",
+        DebeziumTypeConverter.pgArrayAsJsonb(
+                java.util.List.of("a\"b", "c\\d", "e\nf", "g\th"))
+            .getValue());
+    assertEquals("[]", DebeziumTypeConverter.pgArrayAsJsonb(java.util.List.of()).getValue());
+  }
+
+  /**
+   * An element type whose to_jsonb text cannot be reproduced must THROW, not guess.
+   *
+   * <p>A best-effort {@code toString()} would write a value that silently differs from what
+   * the Full Load loaded -- and pass every count-based check. A dead-letter naming the type is
+   * recoverable; a wrong value that survives the checksum is not.
+   */
+  @Test
+  void anUnrenderableArrayElementDeadLettersInsteadOfGuessing() {
+    org.apache.kafka.connect.errors.DataException thrown =
+        org.junit.jupiter.api.Assertions.assertThrows(
+            org.apache.kafka.connect.errors.DataException.class,
+            () ->
+                DebeziumTypeConverter.pgArrayAsJsonb(
+                    java.util.List.of(java.util.List.of("nested"))));
+    assertTrue(thrown.getMessage().contains("array"), thrown.getMessage());
+  }
+
 }

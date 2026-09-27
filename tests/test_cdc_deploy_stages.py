@@ -2048,9 +2048,20 @@ def test_the_teardown_slot_drop_uses_the_session_credentials_first(monkeypatch) 
     )
     assert ok is True
     assert used.get("dropped") is True
-    assert used["creds"] == ("app_user", "s3cret")
-    # Property 7: the password must never reach a log line.
+    username, password = used["creds"]
+    assert username == "app_user"
+    # The write engine takes a SecretValue and calls reveal() on it, so a plain str raised
+    # `'str' object has no attribute 'reveal'` and FAILED THE WHOLE TEARDOWN -- leaving the
+    # cdc-stack up and the replication slot still pinning source WAL. Asserting the wrapper
+    # (not the raw string) is what pins the contract both ends actually share.
+    from dsql_migrator.config import SecretValue
+
+    assert isinstance(password, SecretValue), type(password)
+    assert password.reveal() == "s3cret"
+    # Property 7: the password must never reach a log line -- and the wrapper is what makes
+    # that hold by construction, since its repr/str are masked.
     assert not any("s3cret" in m for m in logs), logs
+    assert "s3cret" not in f"{password}" and "s3cret" not in repr(password)
 
 
 def test_the_teardown_reports_whether_the_slot_survived() -> None:
@@ -2275,3 +2286,36 @@ def test_the_publication_repair_never_fails_a_start() -> None:
     )
     assert any("WARNING" in m for m in logs)
     assert any("publish_via_partition_root = true" in m for m in logs)
+
+
+def test_the_session_credential_helper_handles_the_secret_wrapper_it_is_given() -> None:
+    """The reported teardown failure: `'SecretValue' object has no attribute 'strip'`.
+
+    `session.source_password` is a SecretValue, whose whole point is that it does NOT behave
+    like a str -- it exposes only `reveal()` so a credential cannot be interpolated into a log
+    line by accident (Property 7). Treating it as one raised AttributeError and failed the
+    whole delete: "Delete infrastructure failed … you may need to delete the stack from the
+    CloudFormation console", leaving the cdc-stack up AND the replication slot pinning source
+    WAL -- the exact outcome this helper exists to prevent.
+    """
+    from types import SimpleNamespace
+
+    from dsql_migrator.config import SecretValue
+    from dsql_migrator.ui.data_migration._cdc_ui import _session_source_credentials
+
+    session = SimpleNamespace(
+        source_config=SimpleNamespace(username="app_user"),
+        source_password=SecretValue("s3cret"),
+    )
+    assert _session_source_credentials(session) == ("app_user", "s3cret")
+
+    # The fallbacks that must stay silent rather than raise: no session, no password, and a
+    # blank/whitespace password (a restored session whose password was not re-entered, or a
+    # Secrets-Manager-auth source) -- each returns None so the caller uses the secrets path.
+    assert _session_source_credentials(None) is None
+    assert _session_source_credentials(
+        SimpleNamespace(source_config=None, source_password=None)
+    ) is None
+    assert _session_source_credentials(
+        SimpleNamespace(source_config=None, source_password=SecretValue("   "))
+    ) is None

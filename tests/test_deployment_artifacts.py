@@ -2210,3 +2210,62 @@ def test_the_task_role_can_read_the_source_network_for_the_vpc_prefill(
         for a in actions
         if a.startswith("rds:")
     ), sorted(a for a in actions if a.startswith("rds:"))
+
+
+def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
+    """A Java change must not ship without rebuilding the plugin ZIP.
+
+    THE root cause of the v44 defect, in one sentence: v0.1.541 taught Schema Conversion to
+    substitute a PostgreSQL array to jsonb and shipped NO connector change, so the sink
+    received an array for the first time and dead-lettered every write for the table --
+    silently, because an UPDATE that never lands changes no row count.
+
+    The deployed sink is the committed ZIP, not the source tree (MSK Connect registers the
+    ZIP), and nothing checked that the two agree. The Lambda already has this guard
+    (`test_committed_zip_embeds_current_lambda_sources`); the sink did not, so a rebuilt
+    source with a stale ZIP would deploy the OLD behaviour while every unit test passed.
+
+    Checked by MARKER rather than by recompiling: a byte-for-byte comparison would need the
+    Maven toolchain (which the "a fresh git clone can deploy" principle deliberately does not
+    require -- that is why the ZIPs are committed at all). So this asserts that a distinctive
+    string from each behaviour the ZIP must carry is actually inside it. A behaviour whose
+    marker is missing means: run `mvn -B -ntp package`, re-zip, and bump PLUGIN_VERSION.
+    """
+    import io
+    import pathlib
+    import zipfile
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    zip_path = root / "connectors/plugins/dsql-sink-plugin.zip"
+    assert zip_path.is_file(), zip_path
+
+    # A jar is itself a DEFLATE-compressed ZIP, so its raw bytes carry no readable strings --
+    # the class entries have to be decompressed before a marker can be found in them.
+    chunks: list[bytes] = []
+    with zipfile.ZipFile(zip_path) as bundle:
+        jars = [n for n in bundle.namelist() if n.endswith(".jar")]
+        assert jars, bundle.namelist()
+        for name in jars:
+            with bundle.open(name) as raw, zipfile.ZipFile(io.BytesIO(raw.read())) as jar:
+                for entry in jar.namelist():
+                    if entry.endswith(".class"):
+                        chunks.append(jar.read(entry))
+    blob = b"".join(chunks)
+
+    # One marker per behaviour the ZIP must carry. Each is a literal this repo's Java source
+    # owns, so it can only be present if that source was compiled into the committed ZIP.
+    markers = {
+        # v44: PostgreSQL arrays bind as jsonb (the silent total-loss fix).
+        "pg array -> jsonb": b"renders array columns as jsonb",
+        # v43: the quarantine line carries the DML op, which is what tells a recoverable
+        # dead-letter (re-read the source) from an unrecoverable one (a lost DELETE).
+        "quarantine op tag": b"| op: ",
+    }
+    missing = [name for name, marker in markers.items() if marker not in blob]
+    assert not missing, (
+        "connectors/plugins/dsql-sink-plugin.zip is STALE for: "
+        + ", ".join(missing)
+        + ". Run `mvn -B -ntp package` in connectors/dsql-sink, re-zip "
+        "connectors/plugins/dsql-sink-plugin.zip, and bump PLUGIN_VERSION in "
+        "core/s3_provision.py (a live cdc-stack needs Delete + Deploy infra to pick it up)."
+    )

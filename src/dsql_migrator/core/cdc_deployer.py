@@ -56,6 +56,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Optional, Sequence
 
+from dsql_migrator.config import SecretValue
 from dsql_migrator.core import cdc_pg_slot
 from dsql_migrator.core.aws_session import BotoSessionLike, build_session
 from dsql_migrator.core.cdc import (
@@ -1627,7 +1628,22 @@ def _drop_pg_source_replication(
             if on_source_write is not None:
                 on_source_write(message)
 
-        engine = cdc_pg_slot.build_pg_source_write_engine(source_config, password)
+        # ``password`` here is a plain str -- it came from ``source_credentials`` or from
+        # ``resolve_source_secret``, both of which deal in strings -- but
+        # ``build_pg_source_write_engine`` takes a SecretValue and calls ``reveal()`` on it.
+        # Passing the str raised `'str' object has no attribute 'reveal'`, which FAILED THE
+        # TEARDOWN and left the cdc-stack up with its replication slot still pinning source
+        # WAL. It went unseen because a SECOND bug of the same family fired first
+        # (``_session_source_credentials`` called ``.strip()`` on the SecretValue), so fixing
+        # that one alone would only have swapped one AttributeError for the next.
+        # Wrap only a plain str: an already-wrapped SecretValue must pass through, because
+        # SecretValue's constructor REFUSES a non-str and double-wrapping raised TypeError --
+        # which the teardown's catch-all swallowed into "could not drop the slot", i.e. the
+        # same silent failure by another route.
+        engine = cdc_pg_slot.build_pg_source_write_engine(
+            source_config,
+            SecretValue(password) if isinstance(password, str) else password,
+        )
         try:
             with engine.connect() as connection:
                 cdc_pg_slot.deprovision_pg_replication(
