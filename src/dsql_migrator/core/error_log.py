@@ -27,8 +27,10 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import threading
-from typing import Literal, Protocol
+from datetime import datetime, timezone
+from typing import Literal, Optional, Protocol
 
 from dsql_migrator.core.models import DataErrorRecord, ErrorLogSummary
 
@@ -177,6 +179,40 @@ class ErrorLogStore:
         if fmt == "csv":
             return self._render_csv(records)
         return self._render_ndjson(records)
+
+    def render_json(
+        self,
+        records: list[DataErrorRecord],
+        *,
+        source: str = "",
+        stack: str = "",
+        exported_at: "Optional[datetime]" = None,
+    ) -> bytes:
+        """Serialize records as ONE indented JSON document (an envelope + a record array).
+
+        Distinct from :meth:`render_records`'s ``ndjson``, which is a stream of one object
+        per LINE: that is the right shape for appending or for a log pipeline, and the wrong
+        shape for the thing operators actually do with this file -- open it, or hand it to
+        `json.load` / `jq`. NDJSON is not valid JSON, so both of those fail on it.
+
+        The envelope carries only what a reader needs to interpret the array: which side
+        produced the records, which cdc-stack, when it was exported, and how many there are
+        (so a truncated download is detectable). Each record is the SAME model the NDJSON
+        form emits -- no field is added, removed, or reshaped, so nothing new reaches disk
+        and the credential-free guarantee is unchanged (Property 7: table / SQLSTATE /
+        reason / PK / the SQL TEMPLATE with ``?`` placeholders, never a row value).
+        """
+        payload = {
+            "schema": "dsql-migrator/error-log/v1",
+            "source": source or "unknown",
+            "stack": stack,
+            "exported_at": (
+                exported_at or datetime.now(timezone.utc)
+            ).isoformat().replace("+00:00", "Z"),
+            "record_count": len(records),
+            "records": [json.loads(record.model_dump_json()) for record in records],
+        }
+        return (json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
 
     @staticmethod
     def _render_ndjson(records: list[DataErrorRecord]) -> bytes:

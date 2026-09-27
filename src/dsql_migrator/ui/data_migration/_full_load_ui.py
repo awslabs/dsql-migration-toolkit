@@ -2701,9 +2701,14 @@ def _render_error_log(ui, migration_state, job: MigrationJob) -> None:
             try:
                 # Serialize the FILTERED records; render_log(job_id) would re-read the
                 # whole key and put CDC rows into a file labelled Full Load.
-                payload = migration_state.error_log.render_records(records)
+                # JSON, matching the CDC button beside it on this same step: two adjacent
+                # downloads in two different formats is a gratuitous difference, and NDJSON
+                # is not valid JSON so `json.load` fails on it.
+                payload = migration_state.error_log.render_json(
+                    records, source="full-load", stack=str(job_id)
+                )
                 ui.download.content(  # type: ignore[attr-defined]
-                    payload, f"error_log_{job_id}.ndjson", "application/x-ndjson"
+                    payload, f"error_log_{job_id}.json", "application/json"
                 )
             except Exception as exc:  # noqa: BLE001 - surface instead of silent
                 _LOGGER.exception("Failed to render/download error log")

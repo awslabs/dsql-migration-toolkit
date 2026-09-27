@@ -9579,7 +9579,17 @@ class _RecordingUi:
     def table(self, *_a, rows=None, columns=None, **_k):
         # Record the ROWS, not just that a table was drawn: the DLQ record table is
         # where a "filtered count over an unfiltered list" regression would show up.
-        self.tables.append({"rows": list(rows or []), "columns": list(columns or [])})
+        #
+        # ...and the remaining kwargs too. Dropping them is why a real reported bug was
+        # untestable: the DLQ table's page size was hardcoded with NO
+        # ``on_pagination_change``, so the operator's "Records per page" never reached Python
+        # and the next poll restored 10 -- and no assertion could see either half.
+        self.tables.append({
+            "rows": list(rows or []),
+            "columns": list(columns or []),
+            "pagination": _k.get("pagination"),
+            "on_pagination_change": _k.get("on_pagination_change"),
+        })
         for row in rows or []:
             for value in row.values():
                 if value is not None:
@@ -17270,7 +17280,16 @@ def test_cdc_download_payload_is_driven_by_the_buttons_own_handler() -> None:
 
     text = downloaded["payload"].decode()
     assert "product_media" not in text, "the CDC log must not contain Full Load rows"
-    assert text.count("\n") == 1, f"expected exactly one CDC record; got {text!r}"
+    # ONE JSON document (NDJSON is not valid JSON, so json.load / jq failed on it), and the
+    # envelope names WHICH side produced it and which cdc-stack -- a file labelled "CDC error
+    # log" is worth nothing if a reader cannot tell that from its contents.
+    import json as _json
+
+    doc = _json.loads(text)
+    assert doc["source"] == "cdc"
+    assert doc["stack"] == "dsql-cdc-stack"
+    assert doc["record_count"] == len(doc["records"]) == 1
+    assert doc["records"][0]["table"] == "ecommerce.orders"
 
 
 def test_full_load_pointer_is_rendered_by_the_dlq_panel() -> None:
@@ -17376,9 +17395,19 @@ def test_full_load_download_label_and_payload_exclude_cdc_rows() -> None:
     handlers = [b.on_click for b in ui.buttons if b.on_click is not None]
     assert handlers, "the download button must be wired"
     handlers[0]()
-    text = downloaded["payload"].decode()
-    assert "ecommerce.orders" not in text, "a Full Load log must not carry CDC rows"
-    assert text.count("\n") == 3
+    # ONE JSON document, not NDJSON: the two things an operator does with this file (open
+    # it, or feed it to json.load / jq) both fail on NDJSON, which is not valid JSON.
+    import json as _json
+
+    doc = _json.loads(downloaded["payload"].decode())
+    assert "ecommerce.orders" not in _json.dumps(doc), (
+        "a Full Load log must not carry CDC rows"
+    )
+    assert doc["source"] == "full-load"
+    assert doc["record_count"] == len(doc["records"]) == 3
+    assert doc["schema"].startswith("dsql-migrator/error-log/")
+    # Every record keeps the fields the NDJSON form carried -- nothing added, nothing lost.
+    assert {"table", "message", "occurred_at"} <= set(doc["records"][0])
 
 
 def test_full_load_latest_messages_ignores_cdc_records() -> None:
@@ -27991,3 +28020,106 @@ def test_a_vpc_prefill_that_cannot_run_says_why_instead_of_leaving_it_blank() ->
     assert "rds:DescribeDBInstances" in rendered, rendered
     # Amber, not gray: an AccessDenied here is a real, fixable gap in the deployment.
     assert any("text-amber-700" in c for c in classes_seen), classes_seen
+
+
+def test_dlq_record_table_pagination_and_sort_survive_the_poll_rebuild() -> None:
+    """Raising "Records per page" 10 -> 20 must not snap back within 5 seconds.
+
+    The reported symptom, and the exact shape the Full Load progress table already fixed
+    once. The DLQ table lives inside the ~5s poll refreshable, so a rebuilt ui.table resets
+    to whatever was hardcoded at build time -- and this one had no `on_pagination_change` at
+    all, so the browser's choice never reached Python. The same event carries the sort, so a
+    click on Time / Table / SQLSTATE reverted for the identical reason.
+    """
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import DataErrorRecord
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+
+    state = DataMigrationState()
+    state.job_id = "job-cdc"
+    for i in range(25):
+        state.error_log.record(
+            "job-cdc",
+            DataErrorRecord(
+                table="ecommerce.products",
+                error_code="07006",
+                message=f"quarantine record to DLQ target=ecommerce.products #{i}",
+                occurred_at=datetime(2026, 9, 26, 13, 36, i, tzinfo=timezone.utc),
+            ),
+        )
+
+    holder = {"page": 1, "rowsPerPage": 10, "sortBy": "when", "descending": True,
+              "filter": ""}
+
+    def render():
+        ui = _RecordingUi()
+        cm._render_cdc_dlq_records(ui, state, "job-cdc", page_state=holder)
+        return ui
+
+    first = render()
+    assert first.tables, "the record table must render"
+    assert first.tables[0]["pagination"]["rowsPerPage"] == 10
+
+    # The operator raises the page size and sorts by table -- Quasar sends both in ONE event.
+    handler = first.tables[0]["on_pagination_change"]
+    assert handler is not None, "without this the browser's choice never reaches Python"
+    handler(SimpleNamespace(value={"page": 2, "rowsPerPage": 20, "sortBy": "table",
+                                   "descending": False}))
+    assert holder["rowsPerPage"] == 20 and holder["sortBy"] == "table"
+
+    # ...and the next poll rebuild honours all of it.
+    second = render()
+    pagination = second.tables[0]["pagination"]
+    assert pagination["rowsPerPage"] == 20, "the page size snapped back"
+    assert pagination["page"] == 2
+    assert pagination["sortBy"] == "table" and pagination["descending"] is False
+
+    # A page past the end must clamp rather than render an empty table with no way back:
+    # the record list grows and can also be filtered.
+    holder.update({"page": 99, "rowsPerPage": 10})
+    assert render().tables[0]["pagination"]["page"] == 3  # 25 records / 10
+
+    # Quasar's "All" is rowsPerPage 0 -- it must not ceil-divide by zero.
+    holder.update({"page": 1, "rowsPerPage": 0})
+    assert render().tables[0]["pagination"]["rowsPerPage"] == 0
+
+    # With NO holder the table still renders (every existing positional caller keeps working).
+    plain = _RecordingUi()
+    cm._render_cdc_dlq_records(plain, state, "job-cdc")
+    assert plain.tables
+
+
+def test_the_dlq_reason_column_is_not_clipped() -> None:
+    """The whole dead-letter reason must be readable, not cut mid-identifier.
+
+    A reason carries the driver text, the PK, the operation AND the failing SQL template;
+    Quasar keeps every cell on one line and clips it unless `wrap-cells` is set, so the part
+    that names the failing column was exactly the part that disappeared. The Full Load
+    progress table already sets it.
+    """
+    from dsql_migrator.core.models import DataErrorRecord
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+
+    state = DataMigrationState()
+    state.job_id = "job-cdc"
+    long_reason = (
+        "quarantine record to DLQ target=ecommerce.products code=07006 - DLQ offset=19: "
+        "sqlstate=07006 Can't infer the SQL type to use for an instance of "
+        "java.util.ArrayList. | pk: id=5 | op: u | sql: INSERT INTO products (...) "
+        "ON CONFLICT (\"id\") DO UPDATE SET \"name\" = EXCLUDED.\"name\""
+    )
+    state.error_log.record(
+        "job-cdc",
+        DataErrorRecord(
+            table="ecommerce.products", error_code="07006", message=long_reason,
+            occurred_at=datetime(2026, 9, 26, tzinfo=timezone.utc),
+        ),
+    )
+    ui = _RecordingUi()
+    cm._render_cdc_dlq_records(ui, state, "job-cdc")
+    assert ui.table_elements, "the record table element must be captured"
+    props = " ".join(str(p) for p in ui.table_elements[0].props_seen)
+    assert "wrap-cells" in props, props
+    # ...and the row carries the reason in FULL -- nothing slices it on the way in.
+    assert ui.tables[0]["rows"][0]["message"] == long_reason

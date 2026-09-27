@@ -801,6 +801,21 @@ def _render_cdc_live_monitoring(
         else:
             card.set_visibility(False)  # type: ignore[attr-defined]
 
+    # The DLQ record table is rebuilt by every ~5s poll (it lives inside _cdc_live, which
+    # refresh() clears), so any pagination/sort/filter hardcoded at build time is restored on
+    # the next tick. This holder lives OUTSIDE the refreshable so the operator's choices
+    # survive the rebuild -- the same shape as the Full Load progress table's
+    # ``_progress_page`` (_full_load_ui.py), where the identical bug was fixed once already.
+    # If a later refactor moves it inside _cdc_live the bug returns silently, which is what
+    # the source-guard test pins.
+    _dlq_record_page = {
+        "page": 1,
+        "rowsPerPage": _DLQ_RECORD_PAGE_SIZE,
+        "sortBy": "when",
+        "descending": True,
+        "filter": "",
+    }
+
     @ui.refreshable
     def _cdc_live() -> None:  # type: ignore[misc]
         view = _cdc_status_view(migration_state, job_manager)
@@ -824,6 +839,7 @@ def _render_cdc_live_monitoring(
                 cdc_ai_opener=cdc_ai_opener,
                 lob_candidates_for=lob_candidates_for,
                 exclude_columns=exclude_columns,
+                page_state=_dlq_record_page,
             )
         else:
             controller = getattr(migration_state, "cdc_controller", None)
@@ -1702,6 +1718,7 @@ def _render_cdc_dlq_panel(
     cdc_ai_opener=None,
     lob_candidates_for=None,
     exclude_columns=None,
+    page_state=None,
 ) -> None:
     """Render the dead-letter queue as one cohesive, AWS-console-style card.
 
@@ -1809,7 +1826,7 @@ def _render_cdc_dlq_panel(
             block_reason=exclude_and_reload_block_reason,
             session=session,
         )
-        _render_cdc_dlq_records(ui, migration_state, log_key)
+        _render_cdc_dlq_records(ui, migration_state, log_key, page_state=page_state)
         if health.depth > 0:
             _render_cdc_error_download(ui, migration_state, log_key)
         # Resolve the Full Load job here so the pointer can follow the retry lineage
@@ -1920,7 +1937,7 @@ _DLQ_RECORD_LIST_LIMIT = 200
 # (a fixed, scrollable viewport) instead of an ever-growing wall of rows.
 _DLQ_RECORD_PAGE_SIZE = 10
 
-def _render_cdc_dlq_records(ui, migration_state, log_key: str) -> None:
+def _render_cdc_dlq_records(ui, migration_state, log_key: str, page_state=None) -> None:
     """List the individual quarantined records (time, table, SQLSTATE, reason).
 
     Reads the per-record rows already in the single
@@ -1967,6 +1984,43 @@ def _render_cdc_dlq_records(ui, migration_state, log_key: str) -> None:
     # snap a just-opened list shut. A paged ui.table keeps a fixed, scrollable
     # viewport so even hundreds of rows stay readable and visible.
     ui.label(caption).classes("text-xs font-medium text-gray-700 mt-1")  # type: ignore[attr-defined]
+    # Seeded from a holder that lives OUTSIDE the ~5s poll refreshable, and written back on
+    # change. Everything here used to be hardcoded with no ``on_pagination_change`` at all,
+    # so the browser's choice never reached Python and the next tick restored it: raising
+    # "Records per page" 10 -> 20 was undone within 5 seconds and the control looked broken.
+    # Quasar sends the sort in the same event, so a click on Time / Table / SQLSTATE snapped
+    # back for the identical reason. Same shape as the Full Load progress table's
+    # ``_progress_page`` (_full_load_ui.py), where this was fixed once already.
+    _per_page, _page = _DLQ_RECORD_PAGE_SIZE, 1
+    _sort_by, _descending = "when", True
+    _filter = ""
+    if isinstance(page_state, dict):
+        _per_page = int(page_state.get("rowsPerPage", _per_page))
+        # rowsPerPage == 0 is Quasar's "All": one page, and no ceil-div by zero.
+        _max_page = max(1, -(-len(rows) // _per_page)) if _per_page > 0 else 1
+        # Clamp: the record list GROWS and can also be filtered, so a saved page 3 can
+        # point past the end and would render an empty table with no way back.
+        _page = min(max(1, int(page_state.get("page", 1))), _max_page)
+        _sort_by = page_state.get("sortBy", _sort_by)
+        _descending = bool(page_state.get("descending", _descending))
+        _filter = str(page_state.get("filter") or "")
+
+    def _on_pagination_change(event: object) -> None:
+        if not isinstance(page_state, dict):
+            return
+        # Copy the four keys individually, never ``event.value`` wholesale: a stray
+        # ``rowsNumber`` flips QTable into server-side pagination mode, which would leave
+        # every page after the first empty.
+        value = getattr(event, "value", None) or {}
+        page_state["page"] = int(value.get("page", page_state.get("page", 1)))
+        page_state["rowsPerPage"] = int(
+            value.get("rowsPerPage", page_state.get("rowsPerPage", _DLQ_RECORD_PAGE_SIZE))
+        )
+        page_state["sortBy"] = value.get("sortBy", page_state.get("sortBy"))
+        page_state["descending"] = bool(
+            value.get("descending", page_state.get("descending"))
+        )
+
     table = ui.table(  # type: ignore[attr-defined]
         columns=[
             {"name": "when", "label": "Time", "field": "when", "align": "left",
@@ -1979,15 +2033,35 @@ def _render_cdc_dlq_records(ui, migration_state, log_key: str) -> None:
         ],
         rows=rows,
         row_key="message",
-        pagination={"rowsPerPage": _DLQ_RECORD_PAGE_SIZE, "sortBy": "when",
-                    "descending": True},
+        pagination={"rowsPerPage": _per_page, "page": _page,
+                    "sortBy": _sort_by, "descending": _descending},
+        on_pagination_change=_on_pagination_change,
     ).classes("w-full text-xs bg-white rounded-md")
+    # `wrap-cells` is what makes the Reason column show the WHOLE message. Without it Quasar
+    # keeps every cell on one line and clips it, so the part of a dead-letter reason that
+    # actually identifies the failure -- the driver text and the offending SQL -- was cut off
+    # exactly where it started to be useful. The Full Load progress table already sets it.
+    table.props('flat bordered dense wrap-cells')
     # A search box so a specific table/SQLSTATE/reason is findable in a large DLQ.
-    table.props('flat bordered dense')
     with table.add_slot("top-left"):  # type: ignore[attr-defined]
-        ui.input(placeholder="Filter records").props(  # type: ignore[attr-defined]
-            "dense clearable borderless"
-        ).bind_value(table, "filter")
+        def _on_filter(event: object) -> None:
+            # Ignore the bind-time None: NiceGUI's backward binding fires this handler once
+            # with no value, which would write "" straight over the saved filter.
+            value = getattr(event, "value", None)
+            if isinstance(page_state, dict) and value is not None:
+                page_state["filter"] = str(value)
+
+        _filter_input = ui.input(  # type: ignore[attr-defined]
+            placeholder="Filter records", on_change=_on_filter
+        ).props("dense clearable borderless")
+        _filter_input.bind_value(table, "filter")
+        # Seed AFTER bind_value, not via `value=`: NiceGUI's backward binding (table ->
+        # input) wins the initial synchronization, so a value passed to the constructor is
+        # wiped at bind time. Both the table and this input are rebuilt every poll, so
+        # without this a filter typed into a LIVE dead-letter queue -- the one situation the
+        # box exists for -- was erased within 5 seconds.
+        if _filter:
+            _filter_input.value = _filter
 
 def _render_cdc_error_download(ui, migration_state, log_key: str) -> None:
     """Offer the CDC-sourced error records as a download.
@@ -2006,9 +2080,16 @@ def _render_cdc_error_download(ui, migration_state, log_key: str) -> None:
         try:
             # Serialize the FILTERED records; render_log(log_key) would re-read the
             # whole key and put Full Load rows back into a file labelled CDC.
-            payload = migration_state.error_log.render_records(records)
+            # ONE JSON document, not NDJSON: NDJSON is not valid JSON, so the two things
+            # an operator actually does with this file -- open it, or feed it to
+            # json.load / jq -- both failed on the old form. Same records, same fields.
+            payload = migration_state.error_log.render_json(
+                records,
+                source="cdc",
+                stack=getattr(migration_state, "cdc_stack_name", "") or "",
+            )
             ui.download.content(  # type: ignore[attr-defined]
-                payload, f"cdc_error_log_{safe}.ndjson", "application/x-ndjson"
+                payload, f"cdc_error_log_{safe}.json", "application/json"
             )
         except Exception as exc:  # noqa: BLE001 - surface instead of silent
             _LOGGER.exception("Failed to render/download CDC error log")

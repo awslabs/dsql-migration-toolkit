@@ -46,10 +46,22 @@ from typing import Optional, Union
 # structured file never mixes with the human-readable terminal stream.
 ACTIVITY_LOGGER_NAME = "dsql_migrator.activity"
 
-# Cap for a sanitized ``detail``. Generous enough for the run-level roll-ups (which
-# list per-table reasons) while bounding an unbounded interpolation such as a full
-# GTID set or a driver message that concatenates a long statement.
-_MAX_DETAIL_CHARS = 500
+# Cap for a sanitized ``detail``. Bounds an unbounded interpolation (a full GTID set, or a
+# driver message that concatenates a whole statement) -- it is NOT there to keep entries
+# short, and at 500 it was cutting the one kind of entry that most needs to be complete.
+#
+# A dead-letter reason is the case that set this number: it carries the driver text, the PK,
+# the operation AND the failing SQL template, and 500 chars cut it mid-identifier inside the
+# ON CONFLICT clause -- exactly where it starts to say which column failed. Raised so a
+# realistic dead-letter line survives intact, and a truncation now SAYS how much it dropped
+# rather than trailing an anonymous "...", because a reader who cannot tell a complete
+# message from a clipped one has to distrust every one of them.
+#
+# The bound still matters and is still hard: this file is NDJSON with a size cap and rotated
+# backups (below), and one event must stay one line. A larger per-line budget therefore means
+# fewer events retained per segment -- the accepted trade, because an audit trail of
+# unreadable half-messages retains nothing useful.
+_MAX_DETAIL_CHARS = 2000
 
 # Rotation bounds for the activity-log file: cap each segment and keep a small
 # number of rotated backups so the on-disk audit trail -- and the in-memory
@@ -244,7 +256,12 @@ def _safe_detail(detail: Optional[str]) -> Optional[str]:
     first_line = text.splitlines()[0]
     collapsed = " ".join(first_line.split())
     if len(collapsed) > _MAX_DETAIL_CHARS:
-        collapsed = collapsed[: _MAX_DETAIL_CHARS - 3] + "..."
+        # Say what was dropped. A bare "..." leaves the reader unable to tell a complete
+        # message from a clipped one, so they have to distrust all of them -- and it hides
+        # that the missing part may be the half that names the failing column.
+        dropped = len(collapsed) - _MAX_DETAIL_CHARS
+        marker = f" … [+{dropped} chars truncated]"
+        collapsed = collapsed[: _MAX_DETAIL_CHARS - len(marker)] + marker
     return collapsed
 
 

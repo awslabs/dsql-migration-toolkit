@@ -5,6 +5,18 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.551
+
+### Fixed
+
+- **"Records per page" on the Quarantined-records table snapped back to 10 within five seconds.** The table lives inside the ~5s CDC poll refreshable, so a rebuilt `ui.table` restored whatever was hardcoded at build time — and this one had no `on_pagination_change` at all, so the browser's choice never reached Python. The page, the page size, the sort and the filter text now live in a holder OUTSIDE the refreshable and are written back on change, exactly as the Full Load progress table already did. Quasar sends the sort in the same event, so a click on Time / Table / SQLSTATE reverted for the identical reason and is fixed with it. The saved page is clamped (the record list grows, and can be filtered, so a saved page 3 could point past the end and render an empty table with no way back) and Quasar's "All" (`rowsPerPage` 0) no longer divides by zero. The filter is seeded AFTER `bind_value`, because NiceGUI's backward binding wins the initial synchronization and a value passed to the constructor is wiped at bind time — so typing a filter into a LIVE dead-letter queue, the one situation the box exists for, was erased on the next tick.
+- **The Reason column clipped the dead-letter message where it started to be useful.** Quasar keeps every cell on one line unless `wrap-cells` is set, so a reason carrying the driver text, the PK, the operation AND the failing SQL template was cut mid-identifier inside the `ON CONFLICT` clause — the part that names the failing column. The table now sets `wrap-cells`, as the Full Load progress table already did.
+- **The activity log truncated a dead-letter reason at 500 characters behind an anonymous "…".** That cap exists for a real reason — this file is NDJSON with a size cap and rotated backups, and one event must stay one line, so an unbounded interpolation (a full GTID set, a driver message carrying a whole statement) must not write an unbounded field. But 500 was cutting the one kind of entry that most needs to be complete. Raised to 2000, which fits a realistic dead-letter line intact, and a truncation now states how much it dropped (`… [+N chars truncated]`) instead of trailing a bare "…": a reader who cannot tell a complete message from a clipped one has to distrust every one of them. The trade is explicit — a larger per-line budget means fewer events retained per rotated segment.
+
+### Changed
+
+- **The error-log downloads are now a single JSON document instead of NDJSON.** NDJSON is one object per LINE, which is the right shape for a log pipeline and the wrong shape for what operators actually do with this file: open it, or hand it to `json.load` / `jq` — both of which fail, because NDJSON is not valid JSON. The file is now `{schema, source, stack, exported_at, record_count, records: [...]}`, where each record is the same model the NDJSON form emitted: no field added, removed, or reshaped, so nothing new reaches disk and the credential-free guarantee is unchanged (Property 7 — table / SQLSTATE / reason / PK / the SQL template with `?` placeholders, never a row value). The envelope names which side produced the records and which cdc-stack, so a file labelled "CDC error log" can be verified from its contents. Both the CDC and the Full Load buttons switch together: two adjacent downloads on the same step in two different formats is a gratuitous difference.
+
 ## v0.1.550
 
 ### Fixed

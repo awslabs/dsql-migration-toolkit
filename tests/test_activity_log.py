@@ -407,15 +407,49 @@ def test_detail_is_length_capped_and_whitespace_collapsed(tmp_path) -> None:
     assert _safe_detail("   ") is None
     assert _safe_detail("a\t\t b   c") == "a b c"
     long = _safe_detail("x" * (_MAX_DETAIL_CHARS + 200))
-    assert long is not None and len(long) == _MAX_DETAIL_CHARS and long.endswith("...")
+    # Still hard-bounded (this file is NDJSON with a size cap and one event per line)...
+    assert long is not None and len(long) == _MAX_DETAIL_CHARS
+    # ...but a truncation now SAYS how much it dropped. A bare "..." left the reader unable
+    # to tell a complete message from a clipped one, so they had to distrust all of them --
+    # and it hid that the missing half may be the part naming the failing column.
+    assert long.endswith("[+200 chars truncated]"), long[-40:]
+    # The cap must fit a realistic dead-letter reason intact: driver text + PK + operation +
+    # the failing SQL template. At 500 it cut mid-identifier inside the ON CONFLICT clause,
+    # exactly where the message starts to be diagnostic.
+    assert _MAX_DETAIL_CHARS >= 1500, _MAX_DETAIL_CHARS
+    realistic = (
+        "quarantine record to DLQ target=ecommerce.products code=07006 - DLQ offset=19: "
+        "sqlstate=07006 Can't infer the SQL type to use for an instance of "
+        "java.util.ArrayList. Use setObject() with an explicit Types value to specify the "
+        "type to use. | pk: id=5 | op: u | sql: INSERT INTO \"ecommerce\".\"products\" "
+        + ", ".join(f'"col{i}"' for i in range(12))
+        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (\"id\") DO UPDATE SET "
+        + ", ".join(f'"col{i}" = EXCLUDED."col{i}"' for i in range(12))
+    )
+    kept = _safe_detail(realistic)
+    assert kept == " ".join(realistic.split()), "a real dead-letter reason must survive whole"
+    assert "truncated]" not in kept
 
     path = tmp_path / "b.ndjson"
     configure_activity_file_log(path)
     log_activity(
         ActivityCategory.CDC, "start CDC connectors",
-        status=ActivityStatus.STARTED, detail="g" * 4000,
+        status=ActivityStatus.STARTED, detail="g" * 40_000,
     )
-    assert len(path.read_text()) < 4000
+    # The written line is bounded by the cap, not by the input: the point of this assertion
+    # is that an unbounded interpolation (a full GTID set, a driver message carrying a whole
+    # statement) cannot write an unbounded NDJSON line. Keyed to _MAX_DETAIL_CHARS plus room
+    # for the envelope, so raising the cap does not silently make this vacuous.
+    written = path.read_text()
+    assert written.count("\n") == 1, "one event must stay one line"
+    record = json.loads(written)
+    # Assert the DETAIL field, not the whole line: the envelope (and the human-readable
+    # message the renderer builds from it) also carry text, so a whole-line bound would be
+    # measuring the wrong thing. What matters is that an unbounded interpolation -- a full
+    # GTID set, a driver message carrying a whole statement -- cannot write an unbounded
+    # field, and that the reader is told it was cut.
+    assert len(record["detail"]) == _MAX_DETAIL_CHARS
+    assert record["detail"].endswith("chars truncated]")
 
 
 def test_warning_status_maps_to_the_warning_log_level() -> None:
