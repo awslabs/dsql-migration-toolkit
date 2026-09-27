@@ -3102,8 +3102,14 @@ async def _open_cdc_infra_dialog(
         await run.io_bound(_msk_seed_admission, migration_state, session)
         or MskSeedAdmission()
     )
-    # The COST gate. For a CDC-ONLY session, absent publication/slot means Start CDC cannot
-    # work, so refuse BEFORE the ~5-minute billable MSK Serverless create. ASYMMETRIC by
+    # The COST gate: refuse BEFORE the ~5-minute billable MSK Serverless create when the
+    # source's replication objects make Start CDC unusable. NOT "absent publication/slot" --
+    # since v0.1.507 an absent publication under ``snapshot.mode=initial`` derives
+    # ``publication.autocreate.mode=filtered`` and the connector's own DB user creates it, so
+    # absent+absent returns NO block (executed, in the CDC-only state too). What still blocks
+    # is an object that EXISTS and cannot be used -- a publication that omits a captured table
+    # or narrows its publish list, a name-colliding non-logical slot -- or an absent slot a
+    # ``never``-mode start would resume from. ASYMMETRIC by
     # migration type on purpose: in a Full-load-+-CDC run the objects legitimately do not
     # exist yet (the Full Load creates them), and deploying the infra first is the flow this
     # very card recommends -- so that case stays silent. It cannot strand anyone: the
@@ -3111,14 +3117,16 @@ async def _open_cdc_infra_dialog(
     # between the two steps simply turns the block off.
     pg_infra_block: Optional[tuple] = None
     # ``pg_objects_required`` is computed by the caller (which holds job_manager) and is
-    # deliberately NOT just "the type is CDC only". Switching the type to Full-load-+-CDC
-    # after a FINISHED Full-load-only run re-grades the existence row to SKIP -- its detail
-    # says "Full Load creates them for this run" -- so the prerequisite gate un-gates Deploy
-    # while the objects still do not exist. The operator pays for MSK Serverless and Start
-    # then refuses. Keying on the WATERMARK instead is precise: a fresh combined run has no
+    # deliberately NOT just "the type is CDC only": switching the type to Full-load-+-CDC
+    # after a FINISHED Full-load-only run re-grades the existence row to SKIP, so the
+    # prerequisite gate un-gates Deploy while the objects do not exist. Keying on the
+    # WATERMARK instead is precise about WHEN TO PROBE: a fresh combined run has no
     # watermark (so the recommended deploy-before-load flow is untouched), a combined run
     # whose load provisioned carries a slot_name (untouched), and a load that finished
-    # WITHOUT a slot is exactly the state that must block.
+    # WITHOUT a slot is the state worth spending a source read on. It decides only whether
+    # the probe RUNS, never the verdict: in that slotless state the effective mode is
+    # ``initial``, so absent objects do NOT block (executed) -- the probe bites only on an
+    # object that exists and cannot be used.
     if pg_objects_required:
         try:
             # Through the shared gate, so the operator's RECORDED re-snapshot decision is
@@ -3602,21 +3610,42 @@ def _probe_binlog_resume_gap(migration_state, job_manager, session) -> Optional[
 
 
 def pg_objects_required_before_deploy(migration_state, job) -> bool:
-    """Must CDC's publication/slot exist BEFORE the (billable) infrastructure is created?
+    """Should the source's replication objects be PROBED before the (billable) deploy?
 
     Pure, so the decision is testable without a dialog. Deliberately NOT just "the type is
     CDC only": switching the type to Full-load-+-CDC after a FINISHED Full-load-only run
-    re-grades the existence prerequisite to SKIP -- its detail says "Full Load creates them
-    for this run" -- so the prerequisite gate un-gates Deploy while the objects still do not
-    exist. The operator then pays for MSK Serverless and Start CDC refuses.
+    re-grades the existence prerequisite to SKIP -- its detail says this run's Full Load
+    creates them -- so the prerequisite gate un-gates Deploy while the objects do not exist.
 
     Keying on the WATERMARK is precise:
 
     * a FRESH combined run has no watermark -> False, so the recommended
       deploy-the-infra-before-the-load flow is untouched;
     * a combined run whose load DID provision carries ``slot_name`` -> False;
-    * a load that FINISHED WITHOUT a slot -> True, which is exactly the state that must be
-      gated, whichever tile is selected now.
+    * a load that FINISHED WITHOUT a slot -> True: the state worth spending a source read on
+      before the spend, whichever tile is selected now.
+
+    True selects the PROBE, not a verdict. Since v0.1.507 an absent publication under
+    ``snapshot.mode=initial`` derives ``publication.autocreate.mode=filtered``, so
+    :func:`_pg_objects_gate_block` returns None for absent publication + absent slot in every
+    state this returns True for -- including the slotless-watermark case above (executed). The
+    probe bites only on an object that EXISTS and cannot be used, or an absent slot a
+    ``never``-mode start would resume from.
+
+    RESIDUAL, deliberately NOT gated: a combined-tile session with NO watermark (the load has
+    not started) is not probed, so it can pay for MSK Serverless and only afterwards meet a
+    stale publication of the same derived name from a prior run. Extending the trigger there
+    was evaluated by execution and rejected: it prevents nothing in the absence case
+    (absent+absent does not block anyway), a table-set mismatch is REFUSED by the load's own
+    ``create_publication`` with the right remedy (it does not silently reconcile), a
+    same-named stale slot is dropped by ``provision_pg_replication`` (so blocking would
+    pre-empt a decision the load owns), and a block would carry this probe's Start-time
+    wording plus the dialog's 'start over as "Full load + CDC"' remedy -- meaningless when
+    that tile is already selected, i.e. the v0.1.509 dead end again. Collisions need a REUSED
+    cdc-stack name, so every first-run state is unaffected. (One real gap lives elsewhere and
+    must be fixed there: ``create_publication`` REUSES a matching-table-set publication
+    without grading its publish list, so an INSERT-only one left by a prior run is adopted
+    silently.)
     """
     if getattr(migration_state, "migration_type", None) is MigrationType.CDC_ONLY:
         return True

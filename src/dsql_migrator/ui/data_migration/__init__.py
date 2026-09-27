@@ -195,6 +195,7 @@ from dsql_migrator.ui.data_migration._models import (
     _MigrationTypeMeta,
     _MIGRATION_TYPE_META,
     migration_type_blurb,
+    migration_type_when,
     migration_type_requirements,
     migration_type_tradeoff,
     MigrationProgress,
@@ -3204,8 +3205,13 @@ def _render_migration_type_selector(
                 ui.label(  # type: ignore[attr-defined]
                     migration_type_blurb(mt, source_type)
                 ).classes("text-xs text-gray-600")
-                if meta.when:
-                    ui.label(meta.when).classes(  # type: ignore[attr-defined]
+                # The "choose this when…" cue. Source-aware for the same reason the blurb
+                # is: on PostgreSQL the CDC-only cue recommended this tile for an
+                # "already-loaded target", the one case it cannot attach to without a slot
+                # -- it re-snapshots instead.
+                when_cue = migration_type_when(mt, source_type)
+                if when_cue:
+                    ui.label(when_cue).classes(  # type: ignore[attr-defined]
                         "text-xs text-gray-700 font-medium mt-1"
                     )
                 if gated:
@@ -4352,6 +4358,7 @@ __all__ = [
     "source_supports_cdc",
     "prereq_mode_for_type",
     "migration_type_requirements",
+    "migration_type_when",
     "migration_type_tradeoff",
     "substeps_for_type",
     "resolve_active_substep_for_type",

@@ -757,9 +757,20 @@ def check_cdc_replication_objects(
     """Do CDC's publication + replication slot EXIST? Distinct from the PRIVILEGE check.
 
     ``provisions_replication`` is the whole non-regression guarantee. In "Full load + CDC"
-    the Full Load CREATES both at the snapshot point, so they are SUPPOSED to be absent
+    the Full Load CREATES both at the snapshot point, so they are EXPECTED to be absent
     beforehand -- this must read as SKIP there, never as a problem. Only a run that has to
     FIND them (a CDC-only start) is graded.
+
+    The SKIP detail states that CONDITIONALLY, and must keep doing so. Start CDC is reachable
+    under the combined tile with NO Full Load at all (nothing gates on the load), so a detail
+    asserting "the Full Load creates them for this run" is false for that session -- and "they
+    must not exist beforehand" was false even on the happy path, since ``create_publication``
+    REUSES a publication whose table set matches and ``provision_pg_replication`` DROPS a
+    same-named stale slot. Gating instead of re-wording is NOT available: with no watermark the
+    tool cannot tell "the load is still coming" from "there will never be one", and guessing
+    would re-block the deploy-the-infra-DURING-the-load flow the tool itself recommends
+    (v0.1.509/510). Start's own probe is the gate for that route; this row must not claim a
+    past or future fact it cannot know.
 
     Grading: an absent publication, or one that omits a selected table or narrows its
     publish list, is a FAIL -- each makes the connector either die at once or report
@@ -769,9 +780,12 @@ def check_cdc_replication_objects(
 
     ``cdc_start_resnapshots`` is the operator's recorded decision to re-snapshot
     (``publication.autocreate.mode=filtered`` + ``snapshot.mode=initial``). It re-grades the
-    two absences it genuinely repairs to a non-blocking INFO, which is what lets ONE
+    two absences it genuinely repairs to a non-blocking WARN, which is what lets ONE
     re-graded report clear every downstream gate at once instead of leaving a red FAIL
-    beside a button the operator has already been told how to unblock.
+    beside a button the operator has already been told how to unblock. It also splits the
+    final PASS: present objects mean nothing is MISSING, NOT that this start resumes from the
+    slot. ``pg_snapshot_mode`` keys ``never`` on the slot RECORDED on this run's watermark,
+    never on the slot found on the source, so only that branch may promise a resume.
     """
     title = "CDC's publication and replication slot exist on the source"
     if provisions_replication:
@@ -781,8 +795,10 @@ def check_cdc_replication_objects(
             status=PrerequisiteStatus.SKIP,
             required=True,
             detail=(
-                "Full Load creates the publication and replication slot at the snapshot "
-                "LSN for this run, so they must not exist beforehand."
+                "Not graded here: this run's Full Load creates the publication and "
+                "replication slot at its snapshot LSN, so absent is the expected state "
+                "until the load has run. Start CDC checks both again, so a start that "
+                "skips the load is still graded there."
             ),
         )
     pub = facts.checked_publication_name
@@ -931,6 +947,34 @@ def check_cdc_replication_objects(
                 + gapless_note.strip()
             ),
         )
+    if cdc_start_resnapshots:
+        # Nothing is MISSING -- but the slot's PRESENCE does not make this start a resume:
+        # ``pg_snapshot_mode`` keys ``never`` on the slot RECORDED on this run's watermark,
+        # not on the slot the probe FOUND, so this state ships ``snapshot.mode=initial`` and
+        # the old sentence promised a resume on the one row an operator reads to confirm the
+        # handoff. Still PASS, deliberately, and NOT the WARN the two absences above get:
+        # there is no object to create and nothing to fix, the cause-keyed disclosure and its
+        # remedy already render on the CDC start card (which, unlike this pure check, sees the
+        # committed offset and so can tell a resume from a re-snapshot instead of hedging),
+        # and the Deploy dialog withholds the same alarm from a stand-alone CDC-only start for
+        # exactly that calibration reason -- the cause which reaches this branch most often.
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.CDC_REPLICATION_OBJECTS,
+            title=title,
+            status=PrerequisiteStatus.PASS,
+            required=True,
+            detail=(
+                f'Publication "{pub}" covers all {len(selected)} selected tables and '
+                f'replication slot "{slot}" is present, so nothing this start needs is '
+                "missing from the source. It is still configured snapshot.mode=initial "
+                "rather than to resume from that slot: if this pipeline has already "
+                "streamed it continues from the offset committed on MSK, otherwise the "
+                "connector snapshots every selected table before any change streams. "
+                "Nothing is lost either way, but a first start reads the whole selection "
+                "through the streaming pipeline rather than the bulk loader. The CDC start "
+                "card resolves which of the two applies."
+            ),
+        )
     return PrerequisiteResult(
         check_id=PrerequisiteCheckId.CDC_REPLICATION_OBJECTS,
         title=title,
@@ -938,7 +982,9 @@ def check_cdc_replication_objects(
         required=True,
         detail=(
             f'Publication "{pub}" covers all {len(selected)} selected tables and '
-            f'replication slot "{slot}" is present, so CDC can resume from it.'
+            f'replication slot "{slot}" is present, and this start is configured '
+            "snapshot.mode=never, so CDC resumes from that slot without re-reading any "
+            "table."
         ),
     )
 

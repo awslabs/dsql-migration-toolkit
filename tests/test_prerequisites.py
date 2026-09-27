@@ -1649,6 +1649,13 @@ def test_the_existence_check_skips_in_the_mode_that_creates_the_objects() -> Non
     )
     assert result.status is PrerequisiteStatus.SKIP
     assert "Full Load creates" in result.detail
+    # ...but CONDITIONALLY. Start CDC is reachable under this tile with NO Full Load at all,
+    # so the row must not assert the load ran, nor that the objects "must not exist" (the
+    # load REUSES a matching publication and DROPS a same-named stale slot). It states the
+    # expected state and names the gate for the route that skips the load.
+    assert "expected state" in result.detail
+    assert "Start CDC" in result.detail
+    assert "must not exist" not in result.detail
     # required stays True so the row keeps its weight, but SKIP never gates progression.
     assert result.required is True
 
@@ -1890,6 +1897,45 @@ def test_accepting_the_resnapshot_regrades_only_what_it_repairs() -> None:
         still = row(resnap=True, **kw)
         assert still.status is PrerequisiteStatus.FAIL, kw
         assert still.resolvable_by_resnapshot is False, kw
+
+
+def test_a_present_slot_only_promises_a_resume_when_this_start_resumes() -> None:
+    """The PASS row must not say "CDC can resume from it" on a start that RE-SNAPSHOTS.
+
+    ``pg_snapshot_mode`` keys ``never`` on the slot RECORDED on this run's watermark, never
+    on the slot the probe FOUND on the source -- so "publication + slot present" is fully
+    reachable with ``snapshot.mode=initial``, and this row (the one an operator reads to
+    confirm the handoff) promised a resume on both. Both stay PASS: nothing on the source is
+    missing, and the cause-keyed disclosure with its remedy lives on the CDC start card,
+    which -- unlike this pure check -- can see the committed offset. So the TEXT is the whole
+    defect, and the text is what this pins.
+    """
+    from dsql_migrator.core.models import PrerequisiteStatus
+    from dsql_migrator.core.prerequisites_postgres import check_cdc_replication_objects
+
+    def row(resnap):
+        return check_cdc_replication_objects(
+            _pg_facts(), _tabs("app.orders"),
+            provisions_replication=False, cdc_start_resnapshots=resnap,
+        )
+
+    # snapshot.mode=never -- the one state that really does resume from the slot.
+    resume = row(False)
+    assert resume.status is PrerequisiteStatus.PASS
+    assert "snapshot.mode=never" in resume.detail
+    assert "without re-reading any table" in resume.detail
+
+    resnap = row(True)
+    # Still PASS (nothing on the source is missing, and the Deploy dialog deliberately does
+    # not alarm this state either) -- but the resume claim must be GONE and BOTH real
+    # outcomes named: a committed offset continues, a first start snapshots.
+    assert resnap.status is PrerequisiteStatus.PASS and resnap.required is True
+    assert "can resume from it" not in resnap.detail
+    assert "snapshot.mode=initial" in resnap.detail
+    assert "snapshots every selected table" in resnap.detail
+    assert "offset committed on MSK" in resnap.detail
+    # ...and it must not read as a failure.
+    assert "Nothing is lost either way" in resnap.detail
 
 
 def test_the_checker_forwards_the_resnapshot_decision() -> None:

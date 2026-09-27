@@ -26165,11 +26165,14 @@ def test_a_finished_load_with_no_slot_gates_the_spend_whatever_tile_is_selected(
     """The trap on the RECOMMENDED continuation route.
 
     Switching the type to "Full load + CDC" after a finished Full-load-only run re-grades the
-    existence prerequisite to SKIP -- its detail says "Full Load creates them for this run" --
-    so the prerequisite gate un-gates Deploy while the objects still do not exist. Deploy then
-    creates a billable MSK Serverless cluster and Start CDC refuses. EXECUTED against the
+    existence prerequisite to SKIP -- its detail says this run's Full Load creates them -- so
+    the prerequisite gate un-gates Deploy while the objects do not exist. EXECUTED against the
     prerequisite chain: `provisions_replication=True` turns the FAIL into a SKIP and
     `cdc_prerequisite_block_reason` returns None. So the cost gate cannot key on the tile.
+
+    What this pins is WHEN THE PROBE RUNS, not a verdict: absent objects in that state do not
+    block (the connector autocreates the publication under `snapshot.mode=initial`), which is
+    asserted by `test_the_probe_trigger_is_not_a_verdict_for_a_slotless_watermark`.
     """
     from types import SimpleNamespace
 
@@ -26539,6 +26542,75 @@ def test_the_tradeoff_note_is_only_for_full_load_only_on_postgres() -> None:
     assert migration_type_tradeoff(MigrationType.FULL_LOAD_ONLY) == ""
 
 
+def test_the_cdc_only_when_cue_is_engine_aware_and_mysql_is_byte_identical() -> None:
+    """The last engine-blind string on the tile promised "attach" where PG re-snapshots.
+
+    ``blurb`` / ``requirements`` / ``tradeoff`` were all made source-aware; ``when`` was not,
+    so a PostgreSQL operator read "Choose to resume/attach streaming to an already-loaded
+    target" on the one mode that, with no recorded slot, does not attach at all. MySQL's cue
+    is true (the connector is seeded from the watermark's binlog coordinates) and must stay
+    byte-identical.
+    """
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration import MigrationType, migration_type_when
+    from dsql_migrator.ui.data_migration._models import _MIGRATION_TYPE_META
+
+    # MySQL (and the no-engine default) is the untouched static baseline, for every type.
+    for mt in MigrationType:
+        baseline = _MIGRATION_TYPE_META[mt].when
+        assert migration_type_when(mt, SourceType.MYSQL) == baseline, mt
+        assert migration_type_when(mt) == baseline, mt
+
+    # Only CDC-only differs on PostgreSQL: the other two cues are true on both engines, and
+    # a redundant override would be noise.
+    for mt in (MigrationType.FULL_LOAD_ONLY, MigrationType.FULL_LOAD_AND_CDC):
+        assert (
+            migration_type_when(mt, SourceType.POSTGRES)
+            == _MIGRATION_TYPE_META[mt].when
+        ), mt
+
+    pg = migration_type_when(MigrationType.CDC_ONLY, SourceType.POSTGRES)
+    assert pg != _MIGRATION_TYPE_META[MigrationType.CDC_ONLY].when
+    # The false promise is gone...
+    assert "attach" not in pg
+    # ...and the cue points at the alternative, which is what a CUE (not the blurb, not the
+    # requirements note) is for.
+    assert "Full load + CDC" in pg
+
+
+def test_the_rendered_tile_shows_the_engine_aware_when_cue() -> None:
+    """Mutation-proven the same way the blurb was: the pure function is not the screen.
+
+    Reverting the tile to the static ``meta.when`` leaves the function test above green.
+    """
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration import (
+        DataMigrationState,
+        _render_migration_type_selector,
+    )
+
+    def tiles(source_type):
+        ui = _RecordingUi()
+        _render_migration_type_selector(
+            ui,
+            DataMigrationState(),
+            status=StepStatus.NOT_STARTED,
+            refresh=lambda: None,
+            locked=False,
+            source_type=source_type,
+        )
+        return " ".join(ui.texts)
+
+    pg = tiles(SourceType.POSTGRES)
+    my = tiles(SourceType.MYSQL)
+    assert "resume/attach streaming to an already-loaded target" in my
+    assert "resume/attach streaming to an already-loaded target" not in pg
+    assert "whose replication slot still exists" in pg
+    # The two cues that are true on both engines are still on the PostgreSQL screen.
+    assert "one-time copy or a maintenance-window cutover" in pg
+    assert "near-zero-downtime cutover" in pg
+
+
 def test_the_prerequisite_results_table_wraps_its_remediation_cells() -> None:
     """The longest remediation was the least visible.
 
@@ -26717,6 +26789,44 @@ def test_the_deploy_gate_honours_a_recorded_re_snapshot_decision(monkeypatch) ->
     fresh.set_selection(TableSelection(selected_tables=["app.orders"]))
     assert fresh.cdc_start_mode() == "auto"  # the default, not "manual"
     assert _cdc_ui._pg_objects_gate_block(fresh, session, inventory, None) is None
+
+
+def test_the_probe_trigger_is_not_a_verdict_for_a_slotless_watermark(monkeypatch) -> None:
+    """``pg_objects_required_before_deploy`` returning True does NOT mean Deploy blocks.
+
+    The docstrings used to claim the finished-"Full load only" state is one where "the
+    operator pays for MSK Serverless and Start CDC refuses". Since v0.1.507 it is not: that
+    watermark carries no slot, so the effective ``snapshot.mode`` is ``initial``, which
+    derives ``publication.autocreate.mode=filtered`` -- the connector's own DB user creates
+    the publication. Executed here so the stale claim cannot come back.
+    """
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import Watermark
+    from dsql_migrator.ui.data_migration import _cdc_ui
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    session, inventory = _pg_gate_fixture(
+        monkeypatch, publication_present=False, covered=[]
+    )
+    state = DataMigrationState()
+    state.cdc_stack_name = "dsql-cdc-stack"
+    state.set_selection(TableSelection(selected_tables=["app.orders"]))
+    slotless = Watermark(
+        snapshot_timestamp=datetime.now(timezone.utc), wal_lsn="3/AF012B8"
+    )
+
+    # The probe RUNS for this state ...
+    assert (
+        _cdc_ui.pg_objects_required_before_deploy(
+            SimpleNamespace(migration_type=MigrationType.FULL_LOAD_AND_CDC),
+            SimpleNamespace(status="DONE", watermark=slotless),
+        )
+        is True
+    )
+    # ... and returns NO block: the connector autocreates the publication.
+    assert _cdc_ui._pg_objects_gate_block(state, session, inventory, slotless) is None
 
 
 def test_the_deploy_and_start_gates_cannot_disagree(monkeypatch) -> None:

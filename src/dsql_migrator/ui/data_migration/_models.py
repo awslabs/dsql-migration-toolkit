@@ -2288,6 +2288,36 @@ def migration_type_blurb(
     return meta.blurb
 
 
+def migration_type_when(
+    mt: MigrationType, source_type: SourceType = SourceType.MYSQL
+) -> str:
+    """Source-aware "choose this when…" cue for a migration-type tile.
+
+    The last engine-blind string on the card. MySQL keeps the static baseline in
+    ``_MIGRATION_TYPE_META`` -- byte-identical, and true: a CDC-only start seeds the
+    connector from the watermark's binlog coordinates, so it really does attach to an
+    already-loaded target. On PostgreSQL that cue RECOMMENDED the tile for exactly the case
+    it cannot serve: with no replication slot recorded, CDC-only does not attach, it
+    re-snapshots every selected table through the streaming pipeline (much slower than the
+    bulk loader, and it never removes rows deleted on the source since the load). The cue is
+    the only string on the tile that makes a RECOMMENDATION, so it names the ALTERNATIVE --
+    the blurb already describes the behaviour and the requirements note already lists the
+    preconditions, and neither is restated here.
+
+    Only CDC-only differs. "Full load only" and "Full load + CDC" read the same on both
+    engines (their PostgreSQL consequences are carried by the tradeoff note and the blurb
+    respectively), so they keep the baseline rather than gaining a cue that says nothing
+    new. Pure.
+    """
+    meta = _MIGRATION_TYPE_META[mt]
+    if mt is not MigrationType.CDC_ONLY or source_type is not SourceType.POSTGRES:
+        return meta.when
+    return (
+        "Choose to resume a stream whose replication slot still exists; without one, "
+        "\"Full load + CDC\" re-loads faster than this mode's re-snapshot."
+    )
+
+
 def migration_type_requirements(
     mt: MigrationType, source_type: SourceType = SourceType.MYSQL
 ) -> str:
