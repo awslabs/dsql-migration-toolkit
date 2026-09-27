@@ -3019,3 +3019,50 @@ def test_jsonb_stays_value_compared_while_json_stays_excluded() -> None:
 
     assert _checksum_kind(ColumnDef(name="j", mysql_type="json")) == "json"
     assert _checksum_kind(ColumnDef(name="b", mysql_type="jsonb")) == "plain"
+
+
+def test_a_pg_array_column_checksums_equal_against_its_jsonb_target() -> None:
+    """The ONLY value-level detector must not false-mismatch a correctly-migrated array.
+
+    Schema Conversion substitutes a PostgreSQL `<t>[]` to jsonb (DSQL has no array type), so
+    the two ends hold the SAME data in different spellings. `_pg_checksum_expr` renders BOTH
+    ends with ONE expression, and a plain `::text` produced `{audio,wireless}` on the source
+    against `["audio", "wireless"]` on the target -- so a perfectly-migrated array table
+    MISMATCHED on every row. That buried a REAL lost update (an array column also makes the
+    sink dead-letter every write, SQLSTATE 07006) in systematic noise, and "the array table
+    always mismatches" would have re-silenced it permanently.
+
+    `to_jsonb(col)::text` serves both ends because `to_jsonb` is IDEMPOTENT on a jsonb input.
+    Verified live against the real source and the real DSQL target:
+        source text[]  ::text -> '{audio,wireless,anc}'   to_jsonb -> '["audio", "wireless", "anc"]'
+        target jsonb   ::text -> '["audio", "wireless", "anc"]'  to_jsonb -> (identical)
+    """
+    from dsql_migrator.core.models import ColumnDef
+    from dsql_migrator.core.validation_sql import _checksum_kind, _pg_checksum_expr
+
+    def rendered(source_type, target_type):
+        column = ColumnDef(
+            name="tags", mysql_type=source_type, nullable=True, target_type=target_type
+        )
+        expr = _pg_checksum_expr(column, True)
+        return _checksum_kind(column), (expr.as_string(None) if expr else None)
+
+    for source_type in ("text[]", "integer[]", "numeric[]"):
+        kind, expr = rendered(source_type, "jsonb")
+        assert kind == "array_json", source_type
+        assert expr == 'to_jsonb("tags")::text', source_type
+
+    # An UNRESOLVED applied type must also reach it: DSQL has no array type at all, so an
+    # array source column is jsonb on the target whether or not the DDL was readable. Leaving
+    # that on "plain" would strand exactly the table whose types could not be read.
+    for unresolved in (None, ""):
+        assert rendered("text[]", unresolved)[0] == "array_json", unresolved
+
+    # A DELIBERATE remap away from jsonb still wins -- the applied type is authoritative.
+    assert rendered("text[]", "text")[0] == "plain"
+
+    # And nothing else moves: a genuine source jsonb stays "plain" (both ends already emit
+    # the same canonical text via jsonb_out), json stays excluded, scalars are untouched.
+    assert rendered("jsonb", "jsonb") == ("plain", '"tags"::text')
+    assert rendered("json", "json")[1] is None
+    assert rendered("text", "text") == ("plain", '"tags"::text')

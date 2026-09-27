@@ -1103,10 +1103,36 @@ _DRIFT_LABELS: dict[str, tuple[str, str]] = {
         "it if a row is short; the leading key column must be one the application never "
         "updates",
     ),
+    # Neither a schema change nor a key-model conflict: the sink cannot BIND the value, so
+    # EVERY insert and update for the table dead-letters. Names the array cause because it is
+    # the one the tool itself creates (Schema Conversion substitutes an array to jsonb), and
+    # says plainly that the count-based signals cannot see it -- that is the whole reason this
+    # needed classifying.
+    "unbindable-value": (
+        "the sink cannot write one of this table's columns",
+        "Aurora DSQL never received the row: the sink could not bind one of its values "
+        "(SQLSTATE 07006), so EVERY insert and update for this table is being "
+        "dead-lettered for as long as the stream runs. The known cause is a source ARRAY "
+        "column: Schema Conversion stores it as jsonb (DSQL has no array type) and the Full "
+        "Load converts it correctly, but the change stream delivers it as a list the sink "
+        "cannot bind. Row COUNTS cannot see this — an update that never lands changes no "
+        "count — so run Validation (step 4), whose checksum does. Recovery: re-run the Full "
+        "Load for this table to bring its values current; the stream cannot catch up on its "
+        "own until the sink connector is upgraded",
+    ),
 }
 
 # Drift kinds that are NOT a source DDL change, so the banner must not call them one.
-_TARGET_SIDE_DRIFT_KINDS = frozenset({"missing-table", "unique-conflict"})
+_TARGET_SIDE_DRIFT_KINDS = frozenset(
+    {"missing-table", "unique-conflict", "unbindable-value"}
+)
+
+# ...and of THOSE, the ones where rows are CERTAINLY being lost right now, not merely at
+# risk. `error` rather than `warning` by the design system's own calibration (warning =
+# real but non-blocking): an unbindable value loses every write for the table until the
+# connector is replaced, and a missing target table loses every event for it. 23505 is
+# deliberately NOT here -- there a row only CAN end up missing.
+_CERTAIN_LOSS_DRIFT_KINDS = frozenset({"missing-table", "unbindable-value"})
 
 
 async def _open_add_column_dialog(ui, session, table: str, on_refresh=None) -> None:
@@ -1368,24 +1394,36 @@ def _render_cdc_schema_drift_banner(
     drift = getattr(status_view, "schema_drift", None) or []
     if not drift:
         return
-    # A missing TARGET table is not a source DDL change and is not merely "be aware":
-    # rows are being permanently lost right now, so it takes the error tone and its own
-    # header. Mixed drift reports the more severe of the two.
+    # THREE cases, not two. The old two-way split put every target-side kind under the
+    # "Target table missing — rows are being lost" header, which is false for 23505 (there a
+    # row only CAN end up missing) and was about to be false for 07006 as well. Mixed drift
+    # reports the most severe.
+    _kinds = {getattr(g, "kind", "") for g in drift}
     _target_side = [
         g for g in drift if getattr(g, "kind", "") in _TARGET_SIDE_DRIFT_KINDS
     ]
+    _certain_loss = bool(_kinds & _CERTAIN_LOSS_DRIFT_KINDS)
+    # `error` for certain ongoing loss AND for the target-side kinds generally: a row that
+    # may have vanished is not "be aware" either. `warning` is left to a source DDL change,
+    # which is recoverable by applying the DDL.
     _tone = "error" if _target_side else "warning"
+    if _certain_loss:
+        _header = (
+            "Rows are being lost — the sink cannot write this table"
+            if "unbindable-value" in _kinds
+            else "Target table missing — rows are being lost"
+        )
+    elif _target_side:
+        _header = "Rows may be missing from the target"
+    else:
+        _header = "Source schema change detected"
     bg, border, icon_color, _icon = NOTICE_STYLE.get(_tone, NOTICE_STYLE["info"])
     with ui.column().classes(  # type: ignore[attr-defined]
         f"w-full gap-1 rounded-md border {border} {bg} p-2"
     ):
         with ui.row().classes("w-full items-center gap-2 no-wrap"):  # type: ignore[attr-defined]
             ui.icon("schema").classes(f"{icon_color} text-lg")  # type: ignore[attr-defined]
-            ui.label(  # type: ignore[attr-defined]
-                "Target table missing — rows are being lost"
-                if _target_side
-                else "Source schema change detected"
-            ).classes("text-sm font-semibold text-gray-900")
+            ui.label(_header).classes("text-sm font-semibold text-gray-900")  # type: ignore[attr-defined]
             if cdc_ai_opener is not None:
                 ui.space()  # type: ignore[attr-defined]
                 _render_cdc_ai_button(

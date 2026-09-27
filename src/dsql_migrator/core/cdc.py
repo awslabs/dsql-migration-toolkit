@@ -472,6 +472,21 @@ class SchemaDriftKind(str, Enum):
     # dead-lettered with its offset committed; if the delete then lands, the row is gone from
     # the target with only an unclassified poison row to show for it.
     UNIQUE_CONFLICT = "unique-conflict"  # 23505 unique_violation
+    # 07006 invalid_parameter_type. Also not a schema change: the sink CANNOT BIND the value
+    # at all, so EVERY insert and update for the table dead-letters -- certain, ongoing,
+    # total row loss for as long as the stream runs. Classified because it was completely
+    # invisible: an UPDATE dead-letter changes no row count, so the table reads
+    # `src=15 tgt=15 missing=0 extra=0` while every value is stale, and under 50 records the
+    # DLQ badge stays quiet.
+    #
+    # Live cause, on Aurora PostgreSQL 17.7: a source ARRAY column. Schema Conversion
+    # substitutes `<t>[]` -> jsonb (DSQL has no array type), Debezium delivers the value as a
+    # java.util.ArrayList under a `SchemaBuilder.array(...)` schema with NO logical name, so
+    # the sink's converter passes it through untouched and `ps.setObject` hands pgjdbc a type
+    # it cannot map. The Full Load is unaffected because it converts on the SOURCE, in SQL
+    # (`CAST(to_jsonb(col) AS text)`), so only a str is ever bound -- the two write paths
+    # differ in exactly one place: WHERE the array becomes JSON.
+    UNBINDABLE_VALUE = "unbindable-value"  # 07006 invalid_parameter_type
 
 
 # SQLSTATE -> drift kind. Only STRUCTURAL rejections (tied to the row's column set
@@ -493,6 +508,7 @@ _DRIFT_BY_SQLSTATE: dict[str, SchemaDriftKind] = {
     "42P01": SchemaDriftKind.MISSING_TABLE,
     "3F000": SchemaDriftKind.MISSING_TABLE,
     "23505": SchemaDriftKind.UNIQUE_CONFLICT,
+    "07006": SchemaDriftKind.UNBINDABLE_VALUE,
 }
 
 

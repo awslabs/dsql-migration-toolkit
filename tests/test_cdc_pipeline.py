@@ -616,3 +616,173 @@ def test_source_drift_banner_keeps_its_warning_framing() -> None:
     assert "Source schema change detected" in blob
     assert "Target table missing" not in blob
     assert "Stop CDC and reload these tables" not in blob
+
+
+def test_07006_is_classified_so_a_total_row_loss_stops_being_invisible() -> None:
+    """SQLSTATE 07006 = the sink cannot BIND a value, so every write for the table is lost.
+
+    Live on Aurora PostgreSQL 17.7: a source ARRAY column. Schema Conversion substitutes
+    `<t>[]` -> jsonb (DSQL has no array type) and the Full Load converts it correctly in SQL
+    on the SOURCE, but the change stream delivers a java.util.ArrayList under a
+    `SchemaBuilder.array(...)` schema with no logical name, so the sink passes it through and
+    `ps.setObject` hands pgjdbc a type it cannot map. Permanent, so the record is
+    dead-lettered and the offset commits past it.
+
+    It was invisible three ways, which is why it needed classifying rather than just fixing:
+    an UPDATE dead-letter changes NO row count (the table reads src=15 tgt=15 missing=0
+    extra=0 while every value is stale), the record was unclassified so no banner named it,
+    and under 50 records the DLQ badge stays quiet.
+    """
+    from dsql_migrator.core.cdc import SchemaDriftKind, classify_schema_drift
+
+    assert classify_schema_drift("07006") is SchemaDriftKind.UNBINDABLE_VALUE
+    # A per-VALUE data exception must still NOT be drift -- that distinction is the reason
+    # the map is a map and not "anything that failed".
+    assert classify_schema_drift("22001") is None
+
+
+def test_the_unbindable_value_banner_states_certain_loss_and_the_real_remedy() -> None:
+    """error tone, its own header, and a remedy the operator can actually act on.
+
+    Calibration: this is CERTAIN, ONGOING, total loss for the table, so `error` -- the
+    design system reserves `warning` for a real but non-blocking issue. It must also not
+    claim a source DDL change (nothing changed on the source), must not borrow the
+    missing-table header, and must say that COUNTS cannot see it, because an operator
+    watching row counts has no other way to learn that.
+    """
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import SchemaDriftSummary
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+    from dsql_migrator.ui.design import NOTICE_STYLE
+
+    class _Ui:
+        def __init__(self):
+            self.texts: list[str] = []
+            self.classes_seen: list[str] = []
+
+        def _el(self):
+            outer = self
+
+            class _El:
+                def classes(self, *a, **k):
+                    for v in a:
+                        outer.classes_seen.append(str(v))
+                    for v in k.values():
+                        outer.classes_seen.append(str(v))
+                    return self
+
+                def props(self, *a, **k):
+                    return self
+
+                def tooltip(self, *a, **k):
+                    return self
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+            return _El()
+
+        def column(self, *a, **k):
+            return self._el()
+
+        def row(self, *a, **k):
+            return self._el()
+
+        def label(self, text="", *a, **k):
+            self.texts.append(str(text))
+            return self._el()
+
+        def icon(self, name="", *a, **k):
+            return self._el()
+
+        def button(self, text="", *a, **k):
+            self.texts.append(str(text))
+            return self._el()
+
+        def space(self, *a, **k):
+            return self._el()
+
+        def card(self, *a, **k):
+            return self._el()
+
+    ui = _Ui()
+    cm._render_cdc_schema_drift_banner(
+        ui,
+        SimpleNamespace(schema_drift=[
+            SchemaDriftSummary(table="ecommerce.products", kind="unbindable-value", count=5)
+        ]),
+        session=None,
+    )
+    blob = " ".join(ui.texts)
+    assert "the sink cannot write this table" in blob
+    # NOT a source change, and NOT the missing-table wording.
+    assert "Source schema change detected" not in blob
+    assert "Target table missing" not in blob
+    # The three facts the operator cannot get anywhere else.
+    assert "07006" in blob
+    assert "Row COUNTS cannot see this" in blob
+    assert "Validation (step 4)" in blob
+    assert "re-run the Full Load" in blob
+    assert "ecommerce.products" in blob
+    # error tone on the banner's OWN surface (the first classes string is the outer column).
+    assert NOTICE_STYLE["error"][1] in ui.classes_seen[0], ui.classes_seen[0]
+    assert NOTICE_STYLE["warning"][1] not in ui.classes_seen[0]
+
+
+def test_a_unique_conflict_no_longer_claims_the_target_table_is_missing() -> None:
+    """Pre-existing bug the three-way split fixes in passing.
+
+    `unique-conflict` sat in the target-side set, so 23505 rendered under "Target table
+    missing — rows are being lost" — false on both halves: the table is there, and a row
+    only CAN end up missing. It keeps the error tone (a vanished row is not "be aware") but
+    gets a header that is true.
+    """
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import SchemaDriftSummary
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+
+    captured: list[str] = []
+
+    class _Ui:
+        def _el(self):
+            class _El:
+                def classes(self, *a, **k):
+                    return self
+
+                def props(self, *a, **k):
+                    return self
+
+                def tooltip(self, *a, **k):
+                    return self
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+            return _El()
+
+        def __getattr__(self, _name):
+            def _f(text="", *a, **k):
+                if isinstance(text, str) and text:
+                    captured.append(text)
+                return self._el()
+            return _f
+
+    cm._render_cdc_schema_drift_banner(
+        _Ui(),
+        SimpleNamespace(schema_drift=[
+            SchemaDriftSummary(table="app.orders", kind="unique-conflict", count=2)
+        ]),
+        session=None,
+    )
+    blob = " ".join(captured)
+    assert "Rows may be missing from the target" in blob
+    assert "Target table missing" not in blob
+    assert "Source schema change detected" not in blob

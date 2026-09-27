@@ -260,6 +260,27 @@ def _checksum_kind(column: "ColumnDef") -> str:
         "timetz",
     ):
         return "timetz"
+    # A PostgreSQL ARRAY column whose target is jsonb. Schema Conversion substitutes
+    # `<t>[]` -> jsonb (DSQL has no array types; converter_postgres.py's
+    # `stripped.endswith("[]")` rule), so the two ends hold the SAME data in different
+    # spellings -- `{audio,wireless}` on the source, `["audio", "wireless"]` on the target.
+    # Rendered "plain", one `::text` produced those two strings and the column MISMATCHED on
+    # every row of a perfectly-migrated table, which buried a real lost update in systematic
+    # noise. `to_jsonb(col)::text` fixes it with ONE expression for BOTH ends, which is what
+    # this builder needs: `source_is_postgres` is true for the target render too, so nothing
+    # here can tell which end it is rendering. That works because `to_jsonb` is IDEMPOTENT on
+    # a jsonb input -- live-verified on the DSQL target and on PostgreSQL:
+    # `to_jsonb(ARRAY['a','b']::text[])::text` and `to_jsonb('["a","b"]'::jsonb)::text` both
+    # give `["a", "b"]`.
+    # Keyed on the SOURCE spelling, and accepting an EMPTY applied type: DSQL has no array
+    # type at all, so an array source column is jsonb on the target whether or not the
+    # applied DDL was resolvable for this table. Leaving the unresolved case on "plain" would
+    # put exactly the table whose types could not be read back into the false-mismatch it
+    # used to be in. A non-jsonb applied type (a deliberate remap to text) still wins.
+    _source_is_array = mysql_type.strip().rstrip(")").endswith("[]")
+    _applied_base = (applied or "").split("(", 1)[0].strip().lower()
+    if _source_is_array and _applied_base in ("jsonb", ""):
+        return "array_json"
     if applied:
         kind = applied.split("(", 1)[0].strip().lower()
     else:
@@ -365,6 +386,10 @@ def _pg_checksum_expr(
     kind = _checksum_kind(column)
     if kind == "binary":
         return sql.SQL("encode({col}, 'hex')").format(col=ident)
+    if kind == "array_json":
+        # ONE expression for both ends: the source's array becomes canonical jsonb text,
+        # and on the jsonb target to_jsonb is the identity. See _checksum_kind.
+        return sql.SQL("to_jsonb({col})::text").format(col=ident)
     if kind == "bit":
         return sql.SQL("{col}::text").format(col=ident)
     if kind == "boolean":
