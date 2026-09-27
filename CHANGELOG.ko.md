@@ -5,6 +5,24 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.556
+
+### 수정
+
+- **길이 없는 PostgreSQL `bit varying` 컬럼이 CDC sink 태스크를 곧바로 죽일 수 있었고, dead-letter 큐가 구조적으로 잡을 수 없었습니다 — 커넥터는 RUNNING을 보고하는데 복제는 멈췄습니다.** 이런 컬럼은 `atttypmod = -1`이라 Debezium `Bits` 스키마에 실제 컬럼 폭이 아닌 `length`가 실립니다. sink는 비트 문자열을 **그 선언 길이까지** 앞에 0을 채워 맞추므로 `String.repeat`에 수 기가바이트 배열을 요구했고, JVM이 `OutOfMemoryError: Requested array size exceeds VM limit`를 던졌습니다. `OutOfMemoryError`는 `Exception`이 아니라 **`Error`**이므로 `errors.tolerance=all`과 dead-letter 큐가 **보지 못합니다**: 태스크가 *"will not recover until manually restarted"*와 함께 죽고, 그 태스크가 담당한 Kafka 파티션 전체의 소비가 중단되며 복제가 정지했습니다. 2026-09-27 Aurora PostgreSQL 17.7 소스에서 실제 관측됐고, 커넥터 MCU를 올려도 일부 파티션만 진행되며 OOM이 계속 재발했습니다. 이제 sink는 Aurora DSQL의 문서화된 `character varying` 한계(65535 바이트)를 넘는 선언 길이를 **컬럼 타입과 조치 방법을 명시한 dead-letter**로 거부합니다 — 그보다 긴 비트 문자열은 어떤 경우에도 변환된 타깃 컬럼에 저장할 수 없으므로 타깃이 받아줄 값을 거부하는 일은 없고, 복구·건너뛰기 불가한 `Error`가 평범한 dead-letter로 바뀝니다. 음수 선언 길이도 같이 거부합니다. 해당 컬럼에 명시적 폭을 주거나(`bit varying(n)`), 캡처에서 제외하거나, 그 테이블은 Full Load만으로 이관하세요. **v0.1.555가 만든 결함이 아닙니다** — 이 코드는 그보다 앞서 있었고, v0.1.555의 배열 작업이 테스트 중 `varbit` 컬럼을 이 경로 앞에 놓았을 뿐입니다. 가드를 제거하면 테스트가 실패하는 게 아니라 **테스트 JVM이 동일한 메시지로 죽는** 테스트로 고정했습니다.
+- **플러그인 `v45` → `v46`.** 이미 배포된 cdc-stack은 가져가지 못합니다: `Start CDC`는 플러그인을 재등록하지 않으므로 기존 파이프라인에는 **Delete CDC infrastructure** 후 **Deploy CDC infrastructure**가 필요합니다.
+
+### 알려진 제약 (라이브 실측으로 v0.1.555 내용 정정)
+
+라이브 PostgreSQL 17.7 → MSK → Aurora DSQL 파이프라인에서 확인했습니다. 모두 **행은 도착하고 dead-letter도 나지 않으므로**, Validation의 CHECKSUM만이 차이를 드러냅니다:
+
+- **다차원 배열은 조용히 NULL로 평탄화됩니다.** 소스 `int[][]` `{{1,2},{3,4}}`(`to_jsonb`는 `[[1, 2], [3, 4]]`)가 `[null, null]`로 도착합니다.
+- **`NaN` 원소 하나가 numeric 배열 전체를 잃게 합니다.** `numeric[]`은 물론 `numeric(p,s)[]`에도 `NaN`이 있으면 소스 커넥터의 배열 읽기가 실패(`Failed to read value of array`)해 컬럼이 NULL로 도착합니다. v0.1.555는 이를 미검증으로 남기고 "null 원소를 전달"할 것으로 추정했는데, 실제는 그보다 나쁩니다.
+- **`bit(n)[]`는 "스키마가 만들어지지 않는 타입들"과 다른 그룹입니다.** 필드는 존재하고 소스 커넥터의 *변환*이 실패해(`Failed to properly convert data value ... Failed to read value of array`) 컬럼이 NULL로 도착합니다. v0.1.555는 이를 `interval[]`/`varbit[]`/`money[]`/`xml[]`/`point[]`/`name[]`와 한 묶음으로 적었지만 기전이 다릅니다.
+- 진짜 복제 불가인 6종은 **확인됐습니다**: `interval[]`, `varbit[]`, `money[]`, `xml[]`, `point[]`, `name[]`는 각각 `No converter found for column ... The column will not be part of change events for that table`를 남기고 NULL로 도착합니다. (`tsvector`도 동일.)
+- **소스에 컬럼을 추가하면 그 테이블의 복제가 전면 중단됩니다** — 타깃에 그 컬럼이 생길 때까지. sink는 after-image의 모든 필드를 INSERT에 나열하므로, DSQL 테이블에 없는 컬럼이 소스에 있으면 그 테이블의 **모든** 변경이 `42703`으로 dead-letter됩니다. 순서가 중요합니다: 추가는 타깃 먼저, 삭제는 소스 먼저.
+- 정상 동작 확인(조치 불필요): 시간 범위 가드는 BC 날짜·연도 10000 이상·`±infinity`에 대해 문제 값을 명시하며 정확히 발동하고, `inet[]`·`uuid[]`·`text[]`는 정확히 복제되며, 문제 배열 컬럼이 모두 NULL인 행은 정상 도착합니다(가드는 컬럼 단위가 아니라 **값 단위**).
+
 ## v0.1.555
 
 ### 수정

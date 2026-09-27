@@ -365,6 +365,26 @@ def stage_full_load(args) -> None:
     )
 
     inventory, wanted, tables = _introspect_tables()
+    # Convert every table and pass the results as ``table_conversions`` -- the SAME field
+    # the UI's Schema Conversion produces, and the ONLY source of the loader's APPLIED
+    # target types (``_full_load_engine`` reads them via ``parse_target_column_types``).
+    # Without it the engine still DROPs+recreates the target from its own conversion (so an
+    # array column IS created as jsonb) while the exporter reads the column UNCAST, and the
+    # load fails per type: `jsonb[]`/`json[]` with psycopg's "cannot adapt type 'dict'",
+    # every other array with 42804 "column is of type jsonb but expression is of type
+    # <t>[]". Reproduced on a live Aurora PostgreSQL 17.7 before this was added.
+    from dsql_migrator.core.converter import SchemaConverter, SchemaConvertOptions
+    converter = SchemaConverter(source_type=_source_config().source_type)
+    table_conversions: dict = {}
+    for tdef in tables:
+        conv = converter.convert_table(tdef, SchemaConvertOptions())
+        if conv.target_ddl.lstrip().upper().startswith("CREATE TABLE"):
+            table_conversions[tdef.name] = conv
+        else:
+            log(f"  [convert] skip {tdef.name}: no CREATE TABLE produced "
+                f"({conv.warnings[0].message if conv.warnings else 'n/a'})")
+    log(f"  Converted {len(table_conversions)}/{len(tables)} table(s) for the applied "
+        "target types.")
     inputs = DataMigrationInputs(
         source_config=_source_config(),
         source_password=_password(),
@@ -373,6 +393,7 @@ def stage_full_load(args) -> None:
         aws_profile=_profile(),
         replace_tables=frozenset(wanted),  # clean slate: DROP+recreate the target
         cdc_stack_name=STACK_NAME,          # -> engine provisions slot/publication + LSN
+        table_conversions=table_conversions,
     )
     migrator = default_migrator_factory(inputs)
     error_log = ErrorLogStore()
@@ -499,10 +520,35 @@ def stage_deploy_infra(args) -> None:
     # Networking identifiers come from env only (no committed defaults — this file is
     # tracked, so it must never embed real VPC/subnet IDs). Supply CDC_VPC_ID and
     # CDC_CONNECTOR_SUBNET_IDS for your own account/region.
+    # "VpcId only" deploy: resolve the connector networking the SAME way the UI does,
+    # via diagnose_cdc_network. Without this the owned-network params ship EMPTY and the
+    # stack rolls back on `Value () for parameter cidrBlock is invalid` (reproduced on a
+    # live us-east-1 VPC that has an IGW but no NAT) — MSK Connect gives its connectors no
+    # public IP, so they need either existing NAT-egress subnets or the private
+    # subnets + NAT the stack creates for itself.
+    _net_subnets = cfg("CDC_CONNECTOR_SUBNET_IDS")
+    _nat_public_subnet_id = _cidr_a = _cidr_b = _az_a = _az_b = ""
+    if not _net_subnets:
+        from dsql_migrator.core.ec2_metadata import build_ec2_client, diagnose_cdc_network
+        _diag = diagnose_cdc_network(build_ec2_client(_profile(), rg), cfg("CDC_VPC_ID"))
+        log(f"  network diagnosis: mode={_diag.mode} — {_diag.reason}")
+        if _diag.mode == "discovered":
+            _net_subnets = _diag.connector_subnet_ids or ""
+        elif _diag.mode == "create":
+            _nat_public_subnet_id = _diag.nat_public_subnet_id or ""
+            _cidr_a, _cidr_b = _diag.private_subnet_cidrs[0], _diag.private_subnet_cidrs[1]
+            _az_a, _az_b = _diag.availability_zones[0], _diag.availability_zones[1]
+        else:
+            raise SystemExit(f"ERROR: CDC networking blocked — {_diag.reason}")
     params = dispatch_cdc_infra_params(
         source_config, sink_config,
         vpc_id=cfg("CDC_VPC_ID"),
-        connector_subnet_ids=cfg("CDC_CONNECTOR_SUBNET_IDS"),
+        connector_subnet_ids=_net_subnets,
+        nat_public_subnet_id=_nat_public_subnet_id,
+        private_subnet_cidr_a=_cidr_a,
+        private_subnet_cidr_b=_cidr_b,
+        private_subnet_az_a=_az_a,
+        private_subnet_az_b=_az_b,
         source_db_security_group_id=cfg("CDC_SOURCE_DB_SECURITY_GROUP_ID", ""),
         # Artifact params are stamped by run_cdc_infra_deploy after it uploads the
         # committed connector plugins; pass empty here.

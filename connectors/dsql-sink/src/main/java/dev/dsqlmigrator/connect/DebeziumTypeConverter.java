@@ -244,6 +244,32 @@ final class DebeziumTypeConverter {
     }
     String bits = new java.math.BigInteger(1, be).toString(2);
     int length = bitLengthParam(schema, bits.length());
+    if (length < 0 || length > MAX_STORABLE_BIT_LENGTH) {
+      // The declared length is not a width this can pad TO, so refuse rather than allocate it.
+      // LIVE FAILURE this guard exists for (Aurora PostgreSQL 17.7, 2026-09-27): an unbounded
+      // `bit varying` column has atttypmod -1, so the Debezium schema carries a `length` that
+      // is not a real column width. Padding to it asked for a multi-gigabyte String and the
+      // JVM raised OutOfMemoryError("Requested array size exceeds VM limit") inside
+      // String.repeat -- and an OutOfMemoryError is an *Error*, not an Exception, so
+      // `errors.tolerance=all` and the dead-letter queue CANNOT catch it. The task died with
+      // "will not recover until manually restarted", every partition it owned stopped, and
+      // replication halted with the connector still reporting RUNNING at the MSK API (the tool
+      // does surface it: CloudWatch ErroredTaskCount folds RUNNING -> FAILED). Bounded at
+      // Aurora DSQL's documented `character varying` limit of 65535 bytes, because a bit string
+      // longer than that cannot be stored in the remodeled target column under any
+      // circumstances -- so this rejects nothing the target would have accepted, and it turns
+      // an unrecoverable, un-skippable Error into an ordinary dead-letter.
+      throw new DataException(
+          "Cannot render a PostgreSQL bit/bit varying value whose Debezium schema declares a "
+              + "length of "
+              + length
+              + " bits: that is not a storable column width (Aurora DSQL's character varying "
+              + "limit is 65535 bytes), and it is what an UNBOUNDED `bit varying` column "
+              + "reports. Give the column an explicit width (bit varying(n) with n <= "
+              + MAX_STORABLE_BIT_LENGTH
+              + "), exclude it from capture (column.exclude.list), or migrate the table with "
+              + "Full Load only.");
+    }
     if (bits.length() < length) {
       bits = "0".repeat(length - bits.length()) + bits;
     } else if (bits.length() > length) {
@@ -251,6 +277,14 @@ final class DebeziumTypeConverter {
     }
     return bits;
   }
+
+  /**
+   * The longest bit string the remodeled target column can hold, so a declared length beyond it
+   * is refused instead of allocated. Aurora DSQL's documented {@code character varying} limit is
+   * 65535 bytes and a bit string renders one ASCII character per bit, so a longer value cannot be
+   * stored regardless of this sink. See {@link #pgBitString} for the live OOM this bounds.
+   */
+  private static final int MAX_STORABLE_BIT_LENGTH = 65535;
 
   /** The declared bit {@code length} parameter of a Debezium Bits schema, or {@code fallback}. */
   private static int bitLengthParam(Schema schema, int fallback) {

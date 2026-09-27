@@ -472,7 +472,28 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # and MySQL's value converters emit no array schema at all. Bumped because the sink ZIP's
 # CONTENT changed: a live cdc-stack needs Delete + Deploy infra to pick it up (Start CDC alone
 # does not re-register the plugin).
-PLUGIN_VERSION = "v45"
+# v46: an UNBOUNDED PostgreSQL `bit varying` column could KILL the sink task outright, and the
+# dead-letter queue structurally could not catch it. Such a column has `atttypmod = -1`, so the
+# Debezium Bits schema carries a `length` that is not a real column width; `pgBitString` pads the
+# value with leading zeros UP TO that length, so it asked `String.repeat` for a multi-gigabyte
+# array and the JVM raised `OutOfMemoryError: Requested array size exceeds VM limit`. An
+# OutOfMemoryError is an **Error**, not an Exception, so `errors.tolerance=all` and the DLQ never
+# see it: the task died with "will not recover until manually restarted", every partition it owned
+# stopped, and replication halted -- while the MSK Connect API still reported the connector
+# RUNNING (the tool itself does surface it, folding CloudWatch ErroredTaskCount into RUNNING ->
+# FAILED). Live-observed on Aurora PostgreSQL 17.7 on 2026-09-27, and reproduced locally: with the
+# new bound removed the test JVM dies with the identical message instead of failing a test.
+# v46 refuses a declared length above Aurora DSQL's documented `character varying` limit (65535
+# bytes, verified against the service quotas page) with a DataException naming the column type and
+# the fix, because a bit string longer than that cannot be stored in the remodeled target column
+# under any circumstances -- so nothing the target would have accepted is rejected, and an
+# unrecoverable, un-skippable Error becomes an ordinary dead-letter. A negative declared length is
+# refused the same way. NOT introduced by v45: `pgBitString` predates it; v45's array work is what
+# put a `varbit` column in front of it during testing.
+#
+# Bumped because the sink ZIP's CONTENT changed: a live cdc-stack needs Delete + Deploy infra to
+# pick it up (Start CDC alone does not re-register the plugin).
+PLUGIN_VERSION = "v46"
 
 
 class S3ProvisionError(RuntimeError):

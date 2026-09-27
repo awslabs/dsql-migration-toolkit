@@ -5,6 +5,24 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.556
+
+### 修正
+
+- **長さ指定のない PostgreSQL `bit varying` 列が CDC シンクタスクを即座に落とし得ており、デッドレターキューは構造上それを捕捉できませんでした — コネクタは RUNNING を報告するのに複製は停止します。** この種の列は `atttypmod = -1` のため、Debezium の `Bits` スキーマには実際の列幅ではない `length` が載ります。シンクはビット文字列を**その宣言長まで**先頭ゼロで詰めるので、`String.repeat` に数ギガバイトの配列を要求し、JVM が `OutOfMemoryError: Requested array size exceeds VM limit` を投げました。`OutOfMemoryError` は `Exception` ではなく **`Error`** なので、`errors.tolerance=all` とデッドレターキューはこれを**見られません**: タスクは *"will not recover until manually restarted"* と共に死に、そのタスクが担当していた Kafka パーティションの消費がすべて止まり、複製が停止しました。2026-09-27 に Aurora PostgreSQL 17.7 ソースで実観測し、コネクタの MCU を上げても一部パーティションだけが進み OOM は再発し続けました。シンクは今後、Aurora DSQL が文書化する `character varying` の上限（65535 バイト）を超える宣言長を、**列の型と対処方法を明示したデッドレター**として拒否します — それより長いビット文字列は変換後のターゲット列にいかなる場合も格納できないため、ターゲットが受け入れる値を拒否することはなく、回復もスキップもできない `Error` が通常のデッドレターになります。負の宣言長も同様に拒否します。該当列に明示的な幅を与える（`bit varying(n)`）、キャプチャから除外する、あるいはそのテーブルは Full Load のみで移行してください。**v0.1.555 が生んだ欠陥ではありません** — このコードはそれより前から存在し、v0.1.555 の配列対応がテスト中に `varbit` 列をこの経路の前に置いただけです。ガードを外すとテストが失敗するのではなく**テスト JVM が同一のメッセージで死ぬ**テストで固定しました。
+- **プラグイン `v45` → `v46`。** 既に配備済みの cdc-stack は取り込みません: `Start CDC` はプラグインを再登録しないため、既存パイプラインには **Delete CDC infrastructure** の後に **Deploy CDC infrastructure** が必要です。
+
+### 既知の制約（ライブ実測により v0.1.555 の記述を訂正）
+
+稼働中の PostgreSQL 17.7 → MSK → Aurora DSQL パイプラインで確認しました。いずれも**行は到着しデッドレターも発生しない**ため、Validation の CHECKSUM だけが差分を明らかにします:
+
+- **多次元配列は静かに NULL へ平坦化されます。** ソースの `int[][]` `{{1,2},{3,4}}`（`to_jsonb` は `[[1, 2], [3, 4]]`）が `[null, null]` として到着します。
+- **`NaN` 要素が 1 つあると numeric 配列全体が失われます。** `numeric[]` はもちろん `numeric(p,s)[]` でも `NaN` があるとソースコネクタの配列読み取りが失敗し（`Failed to read value of array`）、列は NULL で到着します。v0.1.555 はこれを未検証として単なる `null` 要素と推定していましたが、実際はより悪いものです。
+- **`bit(n)[]` は「スキーマが生成されない型」とは別グループです。** フィールドは存在し、ソースコネクタの*変換*が失敗して（`Failed to properly convert data value ... Failed to read value of array`）列は NULL で到着します。v0.1.555 は `interval[]`/`varbit[]`/`money[]`/`xml[]`/`point[]`/`name[]` と同列に記載しましたが、機構が異なります。
+- 真に複製不能な 6 型は**確認済み**です: `interval[]`、`varbit[]`、`money[]`、`xml[]`、`point[]`、`name[]` はそれぞれ `No converter found for column ... The column will not be part of change events for that table` を記録し NULL で到着します。（`tsvector` も同様。）
+- **ソースに列を追加すると、そのテーブルの複製が完全に停止します** — ターゲットにその列ができるまで。シンクは after-image の全フィールドを INSERT に列挙するため、DSQL テーブルに無い列がソースにあると、そのテーブルの**すべての**変更が `42703` でデッドレターになります。順序が重要です: 追加はターゲットから、削除はソースから。
+- 正常動作を確認（対応不要）: 範囲外の時刻ガードは BC 日付・西暦 10000 以降・`±infinity` に対し問題の値を明示して正しく発火し、`inet[]`・`uuid[]`・`text[]` は正確に複製され、問題のある配列列がすべて NULL の行は正常に到着します（ガードは列単位ではなく**値単位**）。
+
 ## v0.1.555
 
 ### 修正

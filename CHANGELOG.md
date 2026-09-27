@@ -5,6 +5,24 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.556
+
+### Fixed
+
+- **An unbounded PostgreSQL `bit varying` column could KILL the CDC sink task outright, and the dead-letter queue structurally could not catch it — replication stopped while the connector still reported RUNNING.** Such a column has `atttypmod = -1`, so the Debezium `Bits` schema carries a `length` that is not a real column width. The sink pads a bit-string value with leading zeros **up to that declared length**, so it asked `String.repeat` for a multi-gigabyte array and the JVM raised `OutOfMemoryError: Requested array size exceeds VM limit`. An `OutOfMemoryError` is an **`Error`, not an `Exception`**, so `errors.tolerance=all` and the dead-letter queue never see it: the task died with *"will not recover until manually restarted"*, every Kafka partition it owned stopped being consumed, and replication halted. Live-observed on an Aurora PostgreSQL 17.7 source on 2026-09-27; raising the connector's MCU only let some partitions progress while the OOM kept recurring. The sink now refuses a declared length above Aurora DSQL's documented `character varying` limit (65535 bytes) with a dead-letter that names the column type and the fix — a bit string longer than that cannot be stored in the remodeled target column under any circumstances, so nothing the target would have accepted is rejected, and an unrecoverable, un-skippable `Error` becomes an ordinary dead-letter. A negative declared length is refused the same way. Give such a column an explicit width (`bit varying(n)`), exclude it from capture, or migrate that table with Full Load only. **Not introduced by v0.1.555** — this code predates it; v0.1.555's array work is what put a `varbit` column in front of it during testing. Pinned by a test that, with the bound removed, kills the test JVM with the identical message rather than merely failing.
+- **Plugin `v45` → `v46`.** A cdc-stack that is already deployed does NOT pick this up: `Start CDC` does not re-register the plugin, so an existing pipeline needs **Delete CDC infrastructure** then **Deploy CDC infrastructure**.
+
+### Known limitations (newly measured live, correcting the v0.1.555 notes)
+
+These were confirmed against a live PostgreSQL 17.7 → MSK → Aurora DSQL pipeline. In each case the row LANDS and nothing is dead-lettered, so only Validation's CHECKSUM surfaces the difference:
+
+- **A multi-dimensional array is silently flattened to NULLs.** Source `int[][]` `{{1,2},{3,4}}` (whose `to_jsonb` is `[[1, 2], [3, 4]]`) arrives as `[null, null]`.
+- **One `NaN` element loses the WHOLE numeric array.** A `numeric[]` or even a `numeric(p,s)[]` containing `NaN` fails the source connector's array read (`Failed to read value of array`) and the column arrives NULL. v0.1.555 recorded this as unverified and guessed a plain `null` element; it is worse than that.
+- **`bit(n)[]` is NOT in the same group as the "no schema built" types.** Its field IS present and the source connector's *conversion* fails (`Failed to properly convert data value ... Failed to read value of array`), so the column arrives NULL. v0.1.555 listed it alongside `interval[]`/`varbit[]`/`money[]`/`xml[]`/`point[]`/`name[]`, which are a different mechanism.
+- The six genuinely unreplicable array types are **confirmed**: `interval[]`, `varbit[]`, `money[]`, `xml[]`, `point[]`, `name[]` each log `No converter found for column ... The column will not be part of change events for that table` and arrive NULL. (`tsvector` behaves the same.)
+- **Adding a column to the source stops that table replicating entirely** until the target has it. The sink names every field of the after-image in its INSERT, so a source column the DSQL table lacks dead-letters **every** change to that table with `42703`. Order matters: ADD on the target first, DROP on the source first.
+- Confirmed WORKING, so no action needed: the out-of-range temporal guard fires correctly for BC dates, year ≥ 10000 and `±infinity`, naming the offending value; `inet[]`, `uuid[]` and `text[]` replicate exactly; and a row whose problematic array columns are all NULL lands normally (the guards are per-value, not per-column).
+
 ## v0.1.555
 
 ### Fixed

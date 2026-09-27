@@ -2255,6 +2255,11 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
     # One marker per behaviour the ZIP must carry. Each is a literal this repo's Java source
     # owns, so it can only be present if that source was compiled into the committed ZIP.
     markers = {
+        # v46: an unbounded `bit varying` column's declared length is REFUSED instead of
+        # allocated. Padding to it asked String.repeat for a multi-gigabyte array and the JVM
+        # raised OutOfMemoryError -- an Error, so errors.tolerance/the DLQ could not catch it and
+        # the sink task died permanently, halting replication.
+        "pg bit length bound": b"that is not a storable column width",
         # v45: each array ELEMENT is rendered from its Debezium LOGICAL TYPE, not its Java
         # class. v44 bound the array as jsonb but rendered elements by class, so a
         # timestamp[]/date[]/time[] element (a raw epoch Long/Integer on the wire) became a

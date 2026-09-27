@@ -424,6 +424,32 @@ class DebeziumTypeConverterTest {
   }
 
   @Test
+  void pgBitStringRefusesAnUnstorableDeclaredLengthInsteadOfAllocatingIt() {
+    // LIVE FAILURE, Aurora PostgreSQL 17.7 on 2026-09-27: an UNBOUNDED `bit varying` column has
+    // atttypmod -1, so the Debezium schema's `length` is not a real column width. Padding to it
+    // asked String.repeat for a multi-gigabyte array and the JVM raised
+    // OutOfMemoryError("Requested array size exceeds VM limit"). That is an *Error*, so
+    // errors.tolerance=all and the DLQ could not catch it: the sink task died with "will not
+    // recover until manually restarted" and replication stopped. It must be a DataException --
+    // an ordinary dead-letter -- so the pipeline survives one bad column.
+    org.apache.kafka.connect.errors.DataException boom =
+        org.junit.jupiter.api.Assertions.assertThrows(
+            org.apache.kafka.connect.errors.DataException.class,
+            () -> DebeziumTypeConverter.pgBitString(new byte[] {0x0F}, bitsSchema(Integer.MAX_VALUE)));
+    assertTrue(boom.getMessage().contains("bit varying"), boom.getMessage());
+    assertTrue(boom.getMessage().contains("65535"), boom.getMessage());
+    // A negative declared length is refused the same way (String.repeat would otherwise throw a
+    // less actionable IllegalArgumentException).
+    org.junit.jupiter.api.Assertions.assertThrows(
+        org.apache.kafka.connect.errors.DataException.class,
+        () -> DebeziumTypeConverter.pgBitString(new byte[] {0x0F}, bitsSchema(-1)));
+    // The bound is inclusive and a real width still pads exactly, so nothing storable regressed.
+    assertEquals("00001111", DebeziumTypeConverter.pgBitString(new byte[] {0x0F}, bitsSchema(8)));
+    assertEquals(
+        65535, ((String) DebeziumTypeConverter.pgBitString(new byte[] {0x0F}, bitsSchema(65535))).length());
+  }
+
+  @Test
   void arrayListPassesThroughUnchangedKnownGap() {
     // A PG array (a List, no logical schema name) hits convert()'s default branch and is
     // returned as-is. That is still the contract OF convert() -- but it is NOT what a real PG
