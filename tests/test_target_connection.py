@@ -198,8 +198,9 @@ def test_connect_pins_output_formatting_gucs_matching_source() -> None:
     # It must NOT pin lc_numeric: Aurora DSQL REJECTS lc_numeric as a startup/session GUC
     # ("FATAL: setting configuration parameter \"lc_numeric\" not supported"), so passing
     # it makes EVERY DSQL connection fail (regressed in v0.1.435, live-verified & fixed in
-    # v0.1.438). It is also unnecessary -- the checksum's numeric mask uses a literal '.'
-    # (not to_char's locale-aware 'D'), so the decimal point agrees without it.
+    # v0.1.438). It is also unnecessary -- the checksum renders a numeric as
+    # round(col, s)::text and numeric_out consults no locale, so the decimal point agrees
+    # without it.
     connect = _ConnectRecorder()
     _connector(connect=connect).connect()
     options = connect.connections[0].kwargs["options"]
@@ -207,6 +208,17 @@ def test_connect_pins_output_formatting_gucs_matching_source() -> None:
     assert "-c DateStyle=ISO" in options
     assert "-c IntervalStyle=postgres" in options
     assert "lc_numeric" not in options
+
+    # extra_float_digits is NOT merely belt-and-suspenders: Validation renders a PostgreSQL
+    # source's scalar real/double precision on BOTH ends as to_jsonb(col)::text, whose digit
+    # count this GUC controls. DSQL's default (1) and the source's pin (3) agree -- from
+    # PostgreSQL 12 on ANY value > 0 selects the same shortest-round-tripping text -- but a
+    # role-level ALTER ROLE ... SET to <= 0 truncates and would FALSE-MISMATCH every float
+    # column of every table. Live-measured on the DSQL target over 2000 random float8 + 2000
+    # random float4 values: the aggregate md5 equals the source's at 1 and at 3, and DIFFERS
+    # at 0 and at -5. Unlike lc_numeric, Aurora DSQL ACCEPTS it as a startup option and as a
+    # session SET (live-verified), so pinning it cannot break the connection.
+    assert "-c extra_float_digits=3" in options
 
 
 def test_admin_username_selects_admin_token_api() -> None:

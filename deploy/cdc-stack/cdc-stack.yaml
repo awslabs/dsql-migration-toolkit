@@ -2067,6 +2067,22 @@ Resources:
           Ref: PgPublicationAutocreateMode
         # Keep the slot on stop so a Stop/Start resumes gaplessly from its LSN.
         slot.drop.on.stop: "false"
+        # Emit TRUNCATE events. Debezium's `skipped.operations` DEFAULTS to "t" (verified in
+        # the shipped debezium-core-2.7.4.Final.jar: CommonConnectorConfig's SKIPPED_OPERATIONS
+        # is built `.withDefault("t")`, described as "By default, only truncate operations will
+        # be skipped"), and on PostgreSQL that default is applied in the pgoutput DECODER --
+        # PgOutputMessageDecoder.isTruncateEventsIncluded() -- so a source TRUNCATE produced NO
+        # record at all. Live-measured: TRUNCATE of a captured table left the source at 1 row
+        # and the target at 10, permanently, with a flat SourceRecordPollRate and not one
+        # `truncate` line in the connector log group. `none` un-skips truncate ONLY (c/u/d were
+        # never skipped, so this is the whole delta); the DSQL sink then dead-letters it with a
+        # named reason, because Aurora DSQL has no TRUNCATE and there is no correct apply --
+        # see DebeziumEvents.truncateNotApplicable and the `source-truncate` drift banner.
+        # Deliberately NOT set on the MySQL source connector above: MySQL CAN emit the same
+        # event (debezium-connector-binlog's BinlogStreamingChangeEventSource dispatches a
+        # TRUNCATE change record off the parsed DDL), but that path is unverified against a
+        # live MySQL source, so it keeps its byte-identical default.
+        skipped.operations: none
         topic.prefix:
           Ref: TopicPrefix
         table.include.list:

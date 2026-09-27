@@ -493,7 +493,38 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 #
 # Bumped because the sink ZIP's CONTENT changed: a live cdc-stack needs Delete + Deploy infra to
 # pick it up (Start CDC alone does not re-register the plugin).
-PLUGIN_VERSION = "v46"
+# v47: a source TRUNCATE on a captured table was replicated NOWHERE and surfaced NOWHERE.
+# Debezium's `skipped.operations` DEFAULTS to `t` -- read from the shipped jar itself
+# (`debezium-core-2.7.4.Final.jar`, the field's own description: "By default, only truncate
+# operations will be skipped") -- and the cdc-stack never set the key, so the source connector
+# produced no record at all. Live-measured on Aurora PostgreSQL 17.7 with a control INSERT on
+# either side: both controls produced a poll/write blip and reached the target, the TRUNCATE
+# minute produced 0.0 and zero log lines, and the table ended at source 1 row vs target 10 --
+# the truncated rows stay on the target permanently. (Validation DOES catch the result as
+# `extra=9`, so this was never a hole in the cut-over gate; what was missing was any signal at
+# CDC time.)
+#
+# The template now sets `skipped.operations: none` on the PostgreSQL source block so the event
+# is emitted, and the sink has an `op='t'` branch. The branch is why this is a PLUGIN bump and
+# not template-only: without it a truncate envelope (no after-image, no message key) fell into
+# the `after == null` path, reached buildDelete, found no key, and dead-lettered as "Cannot
+# build DELETE ... no primary key" -- loud about the wrong thing, so the operator could not
+# tell what happened. It now dead-letters with the TRUNCATE named, states that Aurora DSQL has
+# no TRUNCATE so there is no correct apply, that the target still holds the truncated rows, and
+# that the recovery is a DROP & RELOAD (an upsert-only reload cannot remove rows the source no
+# longer has). Verified the throw cannot kill the task: DsqlSinkTask.put catches DataException
+# and routes to the dead-letter reporter, which both sink variants always wire.
+#
+# MySQL is deliberately UNCHANGED, and that is a known gap rather than an absence: the MySQL
+# plugin ships `debezium-connector-binlog-2.7.4.Final.jar`, whose bytecode gates truncate
+# emission on the same `getSkippedOperations().contains(TRUNCATE)` default -- so a MySQL source
+# is blind the same way. The MySQL path is not verified against a live MySQL source, so its
+# block stays byte-identical and a test fences it; enabling it is a follow-up.
+#
+# Bumped because the sink ZIP's CONTENT changed. A live cdc-stack needs Delete + Deploy infra:
+# Start CDC does not re-register the plugin, and the `skipped.operations` change replaces the
+# source connector anyway, so both requirements are the same single redeploy.
+PLUGIN_VERSION = "v47"
 
 
 class S3ProvisionError(RuntimeError):

@@ -25,8 +25,11 @@ Design constraints this module enforces (they are not incidental):
   Adding ``NOT NULL`` without a default to a table that already has rows is
   rejected by the engine, and inventing a default would silently fabricate data
   for the rows CDC already applied. Existing rows therefore read NULL until the
-  operator backfills them (per-table Reload), while new change events carry the
-  real value.
+  operator backfills them -- which takes a Step 1 (Evaluation) refresh and then a
+  'Drop & reload', NOT a plain per-table Reload: that reads the stale Step-1 column
+  list (so it never even SELECTs the new column) and appends with SKIP_EXISTING (so it
+  never rewrites a primary key the target already has) -- while new change events carry
+  the real value.
 * **Never guess a type.** A source type that the converter cannot map is skipped
   and reported (:class:`SkippedColumn`), not approximated.
 * **One DDL per transaction.** Aurora DSQL rejects two DDL statements in one

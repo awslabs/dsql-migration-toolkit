@@ -1098,6 +1098,14 @@ class PrerequisiteCheckId(str, Enum):
     # rejected by PostgreSQL (its changes are never WAL-logged, so it can never be
     # replicated), which aborts the whole CREATE PUBLICATION.
     TABLE_REPLICABLE = "TABLE_REPLICABLE"
+    # Per-table, one level DOWN from TABLE_REPLICABLE: the table publishes fine, but a
+    # COLUMN's PostgreSQL type cannot survive the change-event hop -- either the sink
+    # cannot render it (so the whole row dead-letters) or Debezium drops/alters it (so the
+    # column arrives NULL or differently typed, which only a CHECKSUM can see). Full Load
+    # carries every one of these correctly, so the divergence exists ONLY on rows that
+    # arrive via CDC -- which is why it needs its own pre-deploy row instead of being
+    # discovered as a Validation mismatch after the billable MSK infrastructure exists.
+    COLUMN_REPLICABLE = "COLUMN_REPLICABLE"
     # Do CDC's publication and replication slot actually EXIST on the source? Distinct
     # from PUBLICATION_PRIVILEGE, which asks whether the user COULD create one: different
     # question, different remedy (grant vs. run the load / re-snapshot). Keeping them
@@ -1699,7 +1707,10 @@ class TableValidationResult(BaseModel):
     checksum_match: Optional[bool] = None
     matched: bool
     # Columns OMITTED from the CHECKSUM because no byte-identical cross-engine text form
-    # exists (FLOAT/DOUBLE and JSON). A difference confined to such a NON-KEY column is
+    # exists: JSON always, plus FLOAT/DOUBLE for a MySQL source only (a PostgreSQL
+    # source's floats are compared -- one to_jsonb expression renders both ends; see
+    # validation_sql._checksum_omits_column, the single definition of this set).
+    # A difference confined to such a NON-KEY column is
     # NOT detected by any mode (row count is invariant under an in-place edit; reconcile
     # compares PK presence, not values), so a CHECKSUM match means "every column EXCEPT
     # these was value-compared". Surfaced in the report/UI so it is not read as "every

@@ -279,6 +279,69 @@ _PG_TYPE_KINDS = {
 }
 
 
+# The columns PostgreSQL CDC cannot carry, for the selected tables -- ONE round trip,
+# catalog-only (pg_attribute / pg_class / pg_namespace / pg_type): no table scan, no lock,
+# so it keeps the source read-only. Read by ``probe_cdc_prerequisites`` and graded by
+# ``classify_uncarryable_cdc_column``; only the RAW discriminators are returned, so the type
+# policy stays in prerequisites_postgres.py next to the check that renders it.
+#
+# Why the catalog and not the existing inventory: ``format_type`` is the only type string
+# the inventory carries, and it is search_path-dependent (``money[]`` may be pg_catalog's or
+# a user enum's) while for a DOMAIN it is just the domain's NAME. The joins resolve both, by
+# OID:
+#   bt  -- a DOMAIN column resolved to its base type (the same idiom as
+#          _pg_enrich_columns' base_typ), so a domain over an array becomes the array.
+#   et  -- the ELEMENT of a TRUE array type. ``typcategory = 'A'`` alone is wrong in BOTH
+#          directions, hence the pairing with ``typelem <> 0``: point/box/lseg/line/name all
+#          carry a non-zero typelem while being category G/S, and a DOMAIN over an array is
+#          category 'A' with typelem = 0. (Verified on PostgreSQL 17.11.)
+#   ebt -- an array OF a domain resolved to the domain's base element type, so
+#          ``ttz_dom[]`` classifies as ``timetz[]``.
+# Known limit: ONE level of domain resolution, matching _pg_enrich_columns' precedent. A
+# domain over a domain resolves to a user-schema type, fails the pg_catalog filter and is
+# simply not flagged -- a miss, never a false alarm.
+#
+# ``attndims`` is deliberately NOT read. It is only the DECLARED dimensionality and
+# PostgreSQL enforces it in NEITHER direction -- live-verified on 17.11: a column declared
+# ``int[]`` (attndims=1) accepted and stored ``{{1,2},{3,4}}`` (array_ndims 2), while one
+# declared ``int[][]`` (attndims=2) stored a 1-D ``{9,8}``. A catalog-only
+# multi-dimensional check would therefore be both unsound and incomplete, so that case is
+# documentation only (detecting it for real needs a per-row ``array_ndims`` scan, which the
+# large-scale data-path stance rules out).
+_PG_CDC_UNCARRYABLE_COLUMNS_SQL = (
+    "SELECT n.nspname || '.' || c.relname AS qname, a.attname AS col, "
+    "pg_catalog.format_type(a.atttypid, a.atttypmod) AS declared_type, "
+    "(ebt.oid IS NOT NULL) AS is_array, "
+    "COALESCE(ebt.typname, bt.typname) AS base_name, "
+    # The element's modifier: on the ATTRIBUTE for a plain column, on the DOMAIN for a
+    # domain column. numeric(p,s)[] vs numeric[] is the only place it decides anything.
+    "CASE WHEN a.atttypmod <> -1 THEN a.atttypmod "
+    "     WHEN t.typtype = 'd' THEN t.typtypmod ELSE -1 END AS element_typmod "
+    "FROM pg_catalog.pg_attribute a "
+    "JOIN pg_catalog.pg_class c ON c.oid = a.attrelid "
+    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "JOIN pg_catalog.pg_type t ON t.oid = a.atttypid "
+    "JOIN pg_catalog.pg_type bt "
+    "  ON bt.oid = CASE WHEN t.typtype = 'd' THEN t.typbasetype ELSE t.oid END "
+    "LEFT JOIN pg_catalog.pg_type et "
+    "  ON bt.typcategory = 'A' AND bt.typelem <> 0 AND et.oid = bt.typelem "
+    "LEFT JOIN pg_catalog.pg_type ebt "
+    "  ON ebt.oid = CASE WHEN et.typtype = 'd' THEN et.typbasetype ELSE et.oid END "
+    "WHERE a.attnum > 0 AND NOT a.attisdropped "
+    "  AND n.nspname || '.' || c.relname = ANY(:names) "
+    # Built-in types ONLY (so a user enum named ``money`` is never matched), and the array
+    # and scalar candidate lists stay APART: scalar money/xml/point/interval/bit/varbit
+    # replicate fine, it is money[]/xml[]/... that do not.
+    "  AND ((ebt.oid IS NOT NULL "
+    "        AND ebt.typnamespace = 'pg_catalog'::regnamespace "
+    "        AND ebt.typname = ANY(:array_elements)) "
+    "    OR (ebt.oid IS NULL "
+    "        AND bt.typnamespace = 'pg_catalog'::regnamespace "
+    "        AND bt.typname = ANY(:scalars))) "
+    "ORDER BY qname, a.attnum"
+)
+
+
 def _pg_enrich_columns(connection: object, enrich_db: str, tables: list) -> None:
     """Overwrite each column's type with the EXACT ``format_type`` string + generated flag,
     and flag a serial/identity PRIMARY-KEY column as the table's ``auto_increment_column``.
@@ -578,15 +641,43 @@ class PostgresSourceDialect(SourceDialect):
         # Pin locale/format GUCs so the source renders text IDENTICALLY to the Aurora
         # DSQL target (whose defaults are exactly these: timezone/DateStyle=ISO,
         # IntervalStyle=postgres, lc_numeric=C). Validation reuses the target's PG
-        # checksum renderer, whose numeric to_char 'D' mask honors lc_numeric and whose
-        # date/interval ::text honor DateStyle/IntervalStyle -- so a source DB with a
-        # non-default locale (e.g. lc_numeric=de_DE -> '3,14') would otherwise produce a
-        # FALSE checksum MISMATCH on byte-identical data. Pinning also makes the Full Load
+        # checksum renderer, whose date/interval ::text honor DateStyle/IntervalStyle -- so a
+        # source DB with a non-default DateStyle/IntervalStyle would otherwise produce a FALSE
+        # checksum MISMATCH on byte-identical data. ``lc_numeric`` is belt-and-braces ONLY: the
+        # numeric checksum render is ``round(col, s)::text`` and numeric_out consults no locale,
+        # and even the fixed-width to_char mask it replaced used a LITERAL '.' rather than the
+        # locale-aware 'D' template -- so contrary to what this comment used to claim,
+        # lc_numeric never reached the numeric checksum. Kept so the source matches the
+        # target's own C default. Pinning also makes the Full Load
         # interval text cast (see select_column_sql) style-consistent. UTC also keeps
         # timestamp/timestamptz deterministic. psycopg passes these via libpq ``options``;
         # a read timeout bounds a stalled stream via ``statement_timeout`` (milliseconds).
+        #
+        # ``extra_float_digits=3`` is the fifth pin and it guards against DATA LOSS, not just
+        # a false mismatch. It controls how many significant digits float4/float8 render with
+        # in TEXT output, and the tool reads a float array as ``CAST(to_jsonb(col) AS text)``
+        # -- so a source that inherits a LOWERED value (RDS/Aurora accept -15..3, settable per
+        # parameter group or ``ALTER DATABASE/ROLE``, all dynamic) silently TRUNCATES the value
+        # on the way in. Measured on a live Aurora PostgreSQL 17.7: at ``extra_float_digits=0``
+        # a float4 already loses its 7th digit (1.0000001 -> 1); at -5,
+        # 12345.6789012345 renders ``[12345.6789]``; at -15, ``[10000]``. Worse, Validation's
+        # CHECKSUM renders the source with that SAME expression, so both ends agree on the
+        # truncated text and the loss reports as MATCH -- a checksum derived from the write
+        # path's own rendering can never detect that path's loss. (A row written by CDC carries
+        # the exact double from the sink, so before this pin the same table could FALSE-MATCH on
+        # Full-Loaded rows and FALSE-MISMATCH on CDC-written ones -- the two write paths
+        # diverged in opposite directions.)
+        #
+        # Pinning 3 does NOT have to match the target's own setting, and deliberately does not
+        # try to: from PostgreSQL 12 on, ANY ``extra_float_digits > 0`` selects the same
+        # "shortest text that round-trips exactly" output, so every positive value renders
+        # identically and only <= 0 truncates. Measured: the live Aurora DSQL target runs
+        # ``extra_float_digits = 1`` and renders ``to_jsonb(12345.6789012345::float8)`` as
+        # ``12345.6789012345`` -- byte-identical to this source at 3. 3 is simply the maximum,
+        # so it is the value that cannot be a truncation whatever the server default is.
         options = (
             "-c timezone=UTC -c datestyle=ISO -c intervalstyle=postgres -c lc_numeric=C"
+            " -c extra_float_digits=3"
         )
         connect_args: dict[str, object] = {
             "connect_timeout": SOURCE_CONNECT_TIMEOUT_SECONDS,
@@ -1051,7 +1142,13 @@ class PostgresSourceDialect(SourceDialect):
         # best-effort (each field None/False on any failure, so an under-privileged
         # source degrades to "unknown" rather than erroring the gate). All plain SHOW /
         # SELECT on system catalogs, so it passes the read-only guard.
-        from dsql_migrator.core.prerequisites_postgres import PostgresCdcFacts
+        from dsql_migrator.core.prerequisites_postgres import (
+            CDC_UNCARRYABLE_CANDIDATE_ARRAY_ELEMENTS,
+            CDC_UNCARRYABLE_CANDIDATE_SCALARS,
+            PostgresCdcFacts,
+            UncarryableCdcColumn,
+            classify_uncarryable_cdc_column,
+        )
 
         # ROLL BACK after a failed statement. All ~13 statements share one connection,
         # hence one implicit transaction: swallowing the exception without a rollback left
@@ -1137,6 +1234,8 @@ class PostgresSourceDialect(SourceDialect):
         identity_index_valid: dict[str, bool] = {}
         identity_index_is_primary: dict[str, bool] = {}
         unlogged: dict[str, bool] = {}
+        # None until the read SUCCEEDS -- an empty dict means "read, nothing offending".
+        uncarryable: Optional[dict[str, tuple]] = None
         not_owned: list[str] = []
         names = list(table_names)
         if names:
@@ -1187,6 +1286,43 @@ class PostgresSourceDialect(SourceDialect):
             )
             for r in leaves or ():
                 leaf_identity.setdefault(str(r[0]), {})[str(r[1])] = str(r[2])
+            # The columns CDC cannot carry: ONE catalog round trip for ALL selected
+            # tables (see _PG_CDC_UNCARRYABLE_COLUMNS_SQL). The type policy is the
+            # classifier's, so this only shapes rows into the fact. A failed read leaves
+            # the fact None -- "unknown", which the check degrades to INFO -- because an
+            # empty dict would claim every table is clean. (Degradation live-verified on
+            # PostgreSQL 17.11: with SELECT on pg_catalog.pg_type revoked the statement
+            # raises "permission denied for table pg_type", which _rows catches and
+            # rolls back so the LATER facts still read.)
+            carry_rows = _rows(
+                _PG_CDC_UNCARRYABLE_COLUMNS_SQL,
+                {
+                    "names": names,
+                    "array_elements": list(CDC_UNCARRYABLE_CANDIDATE_ARRAY_ELEMENTS),
+                    "scalars": list(CDC_UNCARRYABLE_CANDIDATE_SCALARS),
+                },
+            )
+            if carry_rows is not None:
+                found: dict[str, list] = {}
+                for r in carry_rows:
+                    reason = classify_uncarryable_cdc_column(
+                        is_array=bool(r[3]),
+                        base_type_name=str(r[4]) if r[4] is not None else None,
+                        element_typmod=int(r[5]),
+                    )
+                    # None = a candidate type that carries fine after all, today only
+                    # numeric(p,s)[]. Filtering server-side on the type NAME keeps the
+                    # query simple; the modifier rule lives in the pure classifier.
+                    if reason is None:
+                        continue
+                    found.setdefault(str(r[0]), []).append(
+                        UncarryableCdcColumn(
+                            column=str(r[1]),
+                            declared_type=str(r[2]),
+                            reason=reason,
+                        )
+                    )
+                uncarryable = {k: tuple(v) for k, v in found.items()}
         return PostgresCdcFacts(
             wal_level=str(wal_level) if wal_level is not None else None,
             is_superuser=is_super,
@@ -1216,6 +1352,7 @@ class PostgresSourceDialect(SourceDialect):
             identity_index_valid=identity_index_valid,
             identity_index_is_primary=identity_index_is_primary,
             unlogged=unlogged,
+            cdc_uncarryable_columns=uncarryable,
             has_database_create=_bool(
                 _scalar(
                     "SELECT pg_catalog.has_database_privilege("

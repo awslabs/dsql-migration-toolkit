@@ -18,7 +18,7 @@ module docstring for the cross-engine checksum-normalization rationale.
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import Mapping, Optional
 
 from psycopg import sql
 
@@ -176,39 +176,67 @@ def _numeric_render_scale(column: "ColumnDef", source_is_postgres: bool) -> int:
     return _decimal_scale(column.mysql_type)
 
 
-def _pg_numeric_mask(scale: int) -> str:
-    """A PG ``to_char`` numeric mask that emits a fixed ``scale`` decimal places.
+def has_numeric_checksum_column(table: TableDef) -> bool:
+    """Does ``table`` hold a column the CHECKSUM renders through ``round()``?
 
-    ``FM`` drops padding spaces; the integer part uses a long ``9...0`` run so any
-    magnitude renders without a leading placeholder space, and ``0`` digits force
-    a fixed fractional width matching MySQL ``CAST(col AS DECIMAL(65, scale))``.
-    Mirrors the MySQL side so equal decimals render byte-identically.
-
-    The integer run must be wide enough for the widest value the MySQL side can
-    render. That side casts to ``DECIMAL(65, scale)`` (MySQL's max precision) and
-    ``BIGINT UNSIGNED`` is stored as ``numeric(20, 0)`` on the target, so integer
-    magnitudes reach up to 65 digits. A too-short mask makes ``to_char`` emit the
-    overflow indicator (``#``...) instead of the digits, so a byte-identical value
-    would produce a spurious cross-engine checksum MISMATCH. A generous run of
-    ``9`` positions is safe: under ``FM`` the extra positions render nothing for
-    smaller magnitudes (``9`` suppresses non-significant leading digits), so the
-    output is identical to a tighter mask for every value that fits.
-
-    The fractional separator is a LITERAL ``'.'`` -- NOT ``to_char``'s locale-aware
-    ``'D'`` template. ``'D'`` renders whatever ``lc_numeric`` designates as the decimal
-    point (``','`` under e.g. ``de_DE``), and the DSQL TARGET connection does not pin
-    ``lc_numeric``; a role/cluster default other than ``C`` would then render a
-    byte-identical value as ``3,1400`` on the target vs ``3.1400`` on the (GUC-pinned)
-    source -- a FALSE checksum MISMATCH. ``'.'`` is invariant across every locale and the
-    MySQL side (``CAST ... DECIMAL``) always emits ``'.'``, so both engines agree without
-    depending on any session GUC.
+    ``numeric`` is the ONLY render family whose expression DISCARDS information: every
+    other kind casts losslessly (``::text``, ``encode(...,'hex')``, ``to_char(...'US')``),
+    while the numeric arm rounds to a FIXED scale on both engines
+    (:func:`_numeric_render_scale`). Used to scope the stale-scale check
+    (:func:`stale_numeric_render_scales`) to the only tables where a stale declared
+    scale can hide a difference, so a table with no numeric column costs no extra read.
     """
-    # 64 nines + a trailing zero = 65 integer digit positions, covering the full
-    # DECIMAL(65, 0) integer range (and thus BIGINT UNSIGNED's 20-digit max).
-    integer_part = "FM" + ("9" * 64) + "0"
-    if scale <= 0:
-        return integer_part
-    return integer_part + "." + ("0" * scale)
+    return any(_checksum_kind(column) == "numeric" for column in table.columns)
+
+
+def stale_numeric_render_scales(
+    table: TableDef,
+    fresh_types: "Mapping[str, str]",
+    source_is_postgres: bool,
+) -> "list[tuple[str, str, str]]":
+    """Numeric columns whose render scale disagrees with the CURRENT source type. Pure.
+
+    Returns ``[(column, inventory_type, fresh_type)]`` -- empty when every numeric
+    column still renders at the same scale.
+
+    Why this has to be checked. The numeric arm of :func:`_pg_checksum_expr` rounds
+    BOTH ends to :func:`_numeric_render_scale`, which is derived from
+    ``column.mysql_type`` -- the spelling captured at Step 1 (Evaluation) and then
+    persisted with the session. That rounding is DELIBERATE (a stored-scale /
+    trailing-zero difference, and DSQL's ``numeric(18,6)`` default for an unconstrained
+    source ``numeric``, must still compare equal) and is NOT removed here. But if the
+    source column's DECLARED scale changed after Step 1 -- e.g. ``ALTER ... TYPE
+    numeric(12,4)`` over a target still declared ``numeric(12,2)`` -- both ends get
+    rounded to the OLD scale 2 and the extra digits are discarded on BOTH sides, so
+    unequal data hashes EQUALLY. Measured on PostgreSQL 17.11 with this module's own
+    builder: source ``numeric(12,4)`` 1.2345/9.8765/5.0000 vs target ``numeric(12,2)``
+    1.23/9.88/5.00 both checksummed ``2909180158483770255`` (a MATCH over data that
+    differs in 2 of 3 rows); rendering from the FRESH types gave
+    ``2657482466277275930`` vs ``2909180158483770255``, i.e. the correct divergence.
+
+    ``fresh_types`` maps column name -> the source's CURRENT declared type, read from
+    the catalog at validation time in the SAME spelling Step 1 records (MySQL
+    ``COLUMN_TYPE``; PostgreSQL ``format_type(atttypid, atttypmod)``) -- verified
+    byte-identical across 151 columns / 28 tables on PostgreSQL 17.11, including
+    domains, enums, arrays, ``bit varying`` and ``interval day to second(3)``. Only
+    the derived SCALE is compared, never the raw strings, so a harmless spelling or
+    case difference can never raise a false alarm. A column missing from
+    ``fresh_types`` is skipped (nothing to compare against).
+    """
+    stale: list[tuple[str, str, str]] = []
+    for column in table.columns:
+        if _checksum_kind(column) != "numeric":
+            continue
+        fresh = fresh_types.get(column.name)
+        if not fresh or fresh == column.mysql_type:
+            continue
+        recorded = _numeric_render_scale(column, source_is_postgres)
+        current = _numeric_render_scale(
+            column.model_copy(update={"mysql_type": fresh}), source_is_postgres
+        )
+        if recorded != current:
+            stale.append((column.name, column.mysql_type, fresh))
+    return stale
 
 
 def _checksum_kind(column: "ColumnDef") -> str:
@@ -216,8 +244,10 @@ def _checksum_kind(column: "ColumnDef") -> str:
 
     Returns one of: ``"binary"`` (bytea/spatial WKB), ``"bit"`` (BIT(n) ->
     integer target), ``"boolean"``, ``"timestamp"`` / ``"timestamptz"`` /
-    ``"time"`` (temporal), ``"numeric"`` (DECIMAL), ``"float"`` (FLOAT/DOUBLE) and
-    ``"json"`` (both excluded from the checksum -- no byte-identical cross-engine
+    ``"time"`` (temporal), ``"numeric"`` (DECIMAL), ``"float"`` (FLOAT/DOUBLE --
+    rendered via ``to_jsonb`` for a PostgreSQL source, where one expression serves both
+    ends, and excluded for a MySQL source whose float text is not that text),
+    ``"json"`` (always excluded -- no byte-identical cross-engine
     text form), or ``"plain"`` (all safe types rendered by the engine's native text
     cast). Reuses the SAME converter classification the Full
     Load loader used to STORE the value (converter.map_mysql_type / the exporter's
@@ -324,8 +354,11 @@ def _mysql_checksum_expr(column: "ColumnDef") -> Optional[str]:
     Normalizes each divergent type to the SAME canonical text the PG side
     produces (see :func:`_pg_checksum_expr`). ``float`` and ``json`` return ``None``
     so FLOAT/DOUBLE and JSON are excluded (no byte-identical cross-engine text form
-    exists: floats have no exact decimal string, and JSON's whitespace/formatting
-    differs between MySQL's canonical form and the CDC sink's compact serialization).
+    exists: MySQL's float text keeps an exponent and only ~6 significant digits for a
+    FLOAT, and JSON's whitespace/formatting differs between MySQL's canonical form and
+    the CDC sink's compact serialization). This renderer is used ONLY for a MySQL
+    source, so the float omission is MySQL-only -- a PostgreSQL source's floats ARE
+    value-compared (see :func:`_pg_checksum_expr`).
     """
     ident = _quote_mysql_identifier(column.name)
     kind = _checksum_kind(column)
@@ -355,7 +388,9 @@ def _mysql_checksum_expr(column: "ColumnDef") -> Optional[str]:
         # Pin the canonical scale so a stored-scale/trailing-zero difference cannot
         # diverge. CAST(... AS DECIMAL(65, s)) prints a plain fixed-scale decimal
         # with NO grouping commas (FORMAT() would add them), matching the PG
-        # to_char(round(...)) side byte-for-byte.
+        # round(col, s)::text side byte-for-byte -- see the sweep recorded at that renderer:
+        # every in-range (value, scale) pair agrees, and the only old-vs-new divergence is the
+        # |round(v,s)| >= 10^65 overflow band, which MySQL cannot reach (DECIMAL caps at 65).
         scale = _decimal_scale(column.mysql_type)
         return f"CAST({ident} AS DECIMAL(65, {scale}))"
     if kind in ("float", "json"):
@@ -428,14 +463,104 @@ def _pg_checksum_expr(
         # numeric(20,0), an integer) does not wrongly gain 6 fractional digits on the
         # target while the MySQL source side stays at scale 0. See _numeric_render_scale.
         scale = _numeric_render_scale(column, source_is_postgres)
-        return sql.SQL("to_char(round({col}, {scale}), {mask})").format(
-            col=ident,
-            scale=sql.Literal(scale),
-            mask=sql.Literal(_pg_numeric_mask(scale)),
+        # Rendered MASK-FREE: round() pins the scale, then numeric_out (``::text``) emits
+        # the exact digits. NOT ``to_char(round(...), '<65 digit positions>')``: a FIXED-width
+        # mask makes BOTH PostgreSQL and Aurora DSQL emit the OVERFLOW indicator ('####...')
+        # for every |value| >= 10^65, so any two same-sign wide values hash EQUAL -- a
+        # confirmed FALSE MATCH, the worst defect class here (the cut-over gate reads this
+        # verdict). Measured with this builder's own SQL: two numeric(80,0) tables sharing
+        # ZERO equal 66-digit values BOTH checksummed 1738510059675055814 on the live DSQL
+        # target (and both the same value on local PG 17), while a 65-digit control diverged
+        # correctly; with this render they diverge (1135099206046739538 vs
+        # 2746917630161110524 -- identical on both engines). It is REACHABLE because
+        # converter_postgres passes numeric(80,0) / numeric(100,10) through unchanged (it
+        # clamps only above DSQL's documented precision maximum of 1000) and DSQL stores
+        # those digits exactly. No mask WIDTH fixes it either: a BARE ``numeric`` declares no
+        # precision at all, so there is nothing to size a mask from. The deleted mask's
+        # docstring blamed MySQL's DECIMAL(65, s) for the 65-digit width -- that rationale
+        # only ever covered a MySQL SOURCE (DECIMAL caps at precision 65, so a MySQL value
+        # can never reach the overflow range); a PostgreSQL source is not bounded that way.
+        #
+        # Switching is SAFE for an in-flight migration: it is byte-IDENTICAL to the old
+        # rendering for every value that did not overflow, so nothing starts false-MISMATCHing.
+        # Over 216 (value, scale) pairs -- negatives, zero, trailing zeros, scale 0, NEGATIVE
+        # scale, NaN, +/-Infinity, 10^64/10^65/10^66, a 1000-digit numeric(1000,500) -- run on
+        # local PG 17 AND the live DSQL target, the ONLY 31 divergences are exactly the
+        # |v| >= 10^65 overflow cases, and the two engines agree byte-for-byte on this form.
+        # Against the UNCHANGED MySQL side (``CAST(col AS DECIMAL(65, s))``) it is identical
+        # too, and a live ordinary numeric(30,4) DSQL table (15 values + a NULL) gave the same
+        # checksum 9423634626081600268 under both forms.
+        #
+        # The in-range equivalence was re-measured independently: a sweep of 114 (value, scale)
+        # pairs -- 19 values x 6 scales incl. 0, 2, 4, 6, 30 and NEGATIVE -2, covering 0, +/-1,
+        # 0.5, -0.00001, +/-18446744073709551615, NaN, 1e63..1e66 and 64/65/66-nine runs --
+        # differed old-vs-new in 31 pairs, and **every one of those 31 is |round(v,s)| >= 10^65**
+        # (differences below 10^65: ZERO). So the only behaviour this changed is the overflow
+        # band, which is exactly the false-MATCH band.
+        #
+        # It is locale-INDEPENDENT by construction -- numeric_out consults no locale, whereas
+        # to_char's mask templates are the only reason ``lc_numeric`` had to be reasoned about
+        # -- and CHEAPER: ~4-6x on 300k rows, with no extra scan and no per-row subquery
+        # (measured 251 ms with to_char vs 51 ms with ``::text`` on a local PG 17.11; the ratio
+        # is machine- and load-dependent, the direction is not).
+        return sql.SQL("round({col}, {scale})::text").format(
+            col=ident, scale=sql.Literal(scale),
         )
-    if kind in ("float", "json"):
+    if kind == "float":
+        # Scalar real/double precision are value-compared ONLY for a PostgreSQL source,
+        # where this ONE expression renders BOTH ends (like ``array_json``) so there is no
+        # cross-ENGINE text to reconcile -- only a cross-CLUSTER one, and ``to_jsonb`` of a
+        # float is ``float8out``'s shortest round-tripping decimal printed PLAIN. Measured
+        # byte-identical on 2000 random float8 + 2000 random float4 bit patterns (plus 0,
+        # -0.0, NaN, +/-Infinity, 5e-324, 1e-45, +/-MAX, the float4 denormal min and a
+        # 17-significant-digit value) stored in and re-read from local PostgreSQL 17.11 and
+        # the live Aurora DSQL target: one identical md5, 0/4000 value diffs.
+        #
+        # ``to_jsonb(col)::text`` and NOT ``col::text``, for two reasons:
+        #   - ``col::text`` renders a stored ``-0.0`` as ``-0`` (live-verified on BOTH
+        #     engines -- DSQL does keep the sign bit), but the CDC path CANNOT deliver one:
+        #     Kafka Connect's ``JsonConverter`` reads ``-0.0`` back through
+        #     ``BigDecimal.doubleValue()``, which has no signed zero, so the sink stores
+        #     ``+0.0``. A ``::text`` render would therefore FALSE-MISMATCH a CDC-written
+        #     ``-0.0`` against the source's ``-0`` while matching a Full-Loaded one -- the
+        #     two write paths diverging on the same value. ``to_jsonb`` renders both signed
+        #     zeros as ``0`` on both engines, so the comparison is immune to it.
+        #   - it is already this module's cross-engine float form (``array_json``) and the
+        #     PostgreSQL Full Load float-ARRAY read path, so there is one rule, not two.
+        # NaN / +/-Infinity render as the JSON strings "NaN" / "Infinity" / "-Infinity" on
+        # both engines, which is what makes the CDC sink's 0-for-a-special corruption
+        # (JsonConverter maps the wire's "NaN" through ``JsonNode.doubleValue()`` -> 0.0)
+        # a DETECTED mismatch instead of a silent one.
+        #
+        # A MySQL source stays EXCLUDED and must: MySQL's own float text is not this text
+        # (measured on Aurora MySQL 8.0.42 -- DOUBLE 1e30 -> "1e30" vs "1000...0", 1e15 ->
+        # "1e15" vs "1000000000000000", and FLOAT 1234567890123456.7 -> "1.23457e15", only
+        # ~6 significant digits), so including it would false-MISMATCH most real float data.
+        # MySQL also cannot STORE a float special at all (CAST rejects it, ERROR 1690) and
+        # normalizes -0.0 to 0, so a MySQL source has nothing here to detect.
+        if not source_is_postgres:
+            return None
+        return sql.SQL("to_jsonb({col})::text").format(col=ident)
+    if kind == "json":
         return None
     return sql.SQL("{col}::text").format(col=ident)
+
+
+def _checksum_omits_column(column: "ColumnDef", source_is_postgres: bool) -> bool:
+    """True when the CHECKSUM cannot value-compare ``column`` and leaves it out.
+
+    The SINGLE definition of that set, so the columns Validation DISCLOSES as
+    not-value-compared (``TableValidationResult.checksum_excluded_columns``) can never
+    drift from the columns the renderers actually omit. A drift either way is a
+    trust bug: naming a column that WAS compared is noise, and staying silent about
+    one that was NOT is the false-"every column verified" this disclosure exists to
+    prevent. Asked of the renderer that actually renders the SOURCE end (the PG one
+    for a PostgreSQL source, which renders both ends), so the answer is the renderers'
+    own, never a second hand-maintained list of type names.
+    """
+    if source_is_postgres:
+        return _pg_checksum_expr(column, True) is None
+    return _mysql_checksum_expr(column) is None
 
 
 # ---------------------------------------------------------------------------

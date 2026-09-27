@@ -67,6 +67,7 @@ from dsql_migrator.core.converter import (
     pg_preserved_generated_columns,
     parse_target_primary_key,
 )
+from dsql_migrator.core.cdc_schema_evolve import read_target_columns
 from dsql_migrator.core.schema_applier import (
     apply_foreign_key, recreate_table, validate_foreign_key,
 )
@@ -1211,8 +1212,13 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
                 _report_progress(progress_queue, (name, flush_l, flush_s))
 
         applied = args.inputs.table_conversions.get(table.name)
-        target_types = (
-            parse_target_column_types(applied.target_ddl) if applied else None
+        # Same deterministic fallback as the in-process path: the parent recreated this
+        # target from _derived_table_conversion when no applied conversion was carried in,
+        # so the read expressions must come from that same conversion.
+        target_types = parse_target_column_types(
+            applied.target_ddl
+            if applied
+            else _derived_table_conversion(args.inputs, args.table).target_ddl
         )
         # The target is ALREADY in its final shape here (the parent recreates every
         # replace table before submitting shards), so the LIVE catalog is the authority
@@ -1628,6 +1634,50 @@ def _drain_progress_queue(
             )
 
 
+# The dropped row's SQLSTATE decides which recovery is real, so the advice never guesses.
+# 54000 program_limit_exceeded is Aurora DSQL's 1 MiB per-column cap (live-measured:
+# "ProgramLimitExceeded: datatype limit greater than 1048576 bytes not supported for
+# bytea") and 22001 is a value longer than a declared varchar/char -- for THOSE two,
+# shrinking the source value (or dropping the column) is a real fix. 42804
+# datatype_mismatch is the opposite: the target column's type does not accept the type
+# this load sent -- live-reproduced as a PostgreSQL array column read UNCAST into a jsonb
+# target, 'column "ttz_arr" is of type jsonb but expression is of type time with time
+# zone[]' -- where the size wording sent the operator to shrink a value whose size is
+# irrelevant, on a source that is read-only anyway. Same split the CDC side already makes
+# (core.cdc: 42804 => TYPE_CHANGE, class 22 => ordinary bad data).
+_QUARANTINE_SIZE_SQLSTATES = frozenset({"54000", "22001"})
+
+
+def _quarantine_recovery_advice(error_code: object) -> str:
+    """The recovery clause for one permanently dropped row, matched to its SQLSTATE.
+
+    Pure and separate so each cause's wording can be asserted directly. Every load path
+    already carries the row's ``error_code`` to the audit entry (``QuarantineRecord`` keeps
+    it beside the value-free message), so nothing has to be inferred from the text.
+    """
+    code = str(error_code or "").strip().upper()
+    if code in _QUARANTINE_SIZE_SQLSTATES:
+        return (
+            "The rest of the table loaded; either reduce the source value and reload "
+            "this table, or -- if the value is legitimately too large -- use "
+            "\"Exclude column & reload\" to migrate the table without that column."
+        )
+    if code == "42804":
+        return (
+            "The rest of the table loaded. This is a TYPE mismatch, not a size "
+            "problem, so reducing the value cannot help: re-apply this table's "
+            "Schema Conversion (Step 2) so the load reads every column in its "
+            "target column's type, then reload this table -- or use \"Exclude "
+            "column & reload\" to migrate the table without that column."
+        )
+    return (
+        "The rest of the table loaded; the reason above is the target's own rejection "
+        "of this row -- fix that at the source or in this table's Schema Conversion "
+        "(Step 2) and reload this table, or use \"Exclude column & reload\" to "
+        "migrate the table without that column."
+    )
+
+
 def _log_quarantined_row(name: str, primary_key: object, message: object,
                          error_code: object = None) -> None:
     """Record one permanently-dropped row on the DURABLE activity log.
@@ -1648,16 +1698,16 @@ def _log_quarantined_row(name: str, primary_key: object, message: object,
         status=ActivityStatus.FAILURE,
         target=name,
         error_code=error_code,
-        # Names BOTH recoveries. "Fix the source value" is impossible on a read-only
-        # source, and impossible in principle when the value is legitimately over the
-        # 1 MiB cap -- which is the common case for this drop. Excluding the column is
-        # the tool's own answer there ("Exclude column & reload"), so omitting it left
-        # the audit trail advising the one thing that cannot be done.
+        # The SQLSTATE picks the advice (_quarantine_recovery_advice), and every branch
+        # still names a recovery that is possible on a READ-ONLY source -- which is why
+        # the size branch also names the tool's own answer ("Exclude column & reload").
+        # This text used to assert "the value is legitimately too large" for EVERY
+        # quarantined row, so a 42804 datatype_mismatch (live: a jsonb target column vs a
+        # timetz[] expression) was reported as an oversized value: a cause that cannot be
+        # acted on, instead of the type mismatch the message itself spells out.
         detail=(
-            f"row pk[{primary_key}] PERMANENTLY DROPPED: {message}. The rest of the "
-            "table loaded; either reduce the source value and reload this table, or -- "
-            "if the value is legitimately too large -- use \"Exclude column & reload\" "
-            "to migrate the table without that column."
+            f"row pk[{primary_key}] PERMANENTLY DROPPED: {message}. "
+            f"{_quarantine_recovery_advice(error_code)}"
         ),
     )
 
@@ -3127,21 +3177,24 @@ def incomplete_load_message(
 
     For a quarantine-only run all three recoveries are named, including
     ``"Exclude column & reload"``: "fix the source value" is impossible on a read-only
-    source and impossible in principle when the value is legitimately over DSQL's ~1 MiB
-    per-value cap, which is the usual cause of the drop.
+    source. What the wording must NOT do is name a cause -- this is a RUN-level string
+    covering every dropped row of every table, and the rows can be dropped for unrelated
+    reasons (DSQL's 1 MiB per-column cap 54000, a 42804 type mismatch, a constraint
+    violation). It used to assert "legitimately too large" for all of them; the per-row
+    reason is recorded exactly, per row, in the error log, so this points there.
     """
     if quarantine_only:
         guidance = (
-            f"{quarantined_rows} row(s) QUARANTINED (permanently dropped). Reduce the "
-            "value and re-run, or 'Exclude column & reload' if it is legitimately too "
-            "large, or 'Accept quarantined rows & continue'. See the error log."
+            f"{quarantined_rows} row(s) QUARANTINED (permanently dropped). Fix the "
+            "reason the error log gives and re-run, or 'Exclude column & reload' to "
+            "load without that column, or 'Accept quarantined rows & continue'."
         )
     elif quarantined_rows:
         guidance = (
             "some tables failed to load and "
-            f"{quarantined_rows} row(s) were quarantined; review the error log, then "
-            "'Retry failed tables', or 'Exclude column & reload' for a value that is "
-            "legitimately too large to store."
+            f"{quarantined_rows} row(s) were quarantined; review the error log for each "
+            "row's reason, then 'Retry failed tables', or 'Exclude column & reload' to "
+            "load a table without that column."
         )
     else:
         guidance = (
@@ -3174,9 +3227,10 @@ def _load_table_detail(
     skipped_note = f", {skipped:,} already on target (skipped)" if skipped else ""
     quarantine_note = f", {quarantined:,} quarantined" if quarantined else ""
     explanation = (
-        " -- quarantined rows were DROPPED (e.g. a value over DSQL's ~1 MiB per-value "
-        "limit); see the error log, then reload after reducing the source value or use "
-        '"Exclude column & reload" if the value is legitimately too large'
+        " -- quarantined rows were DROPPED; the error log and the per-row 'row "
+        "quarantined' activity entries name each row's primary key, the target's own "
+        "reason, and the recovery that matches it (reduce an oversized value, re-apply "
+        "Schema Conversion for a type mismatch, or 'Exclude column & reload')"
         if quarantined
         else ""
     )
@@ -3726,6 +3780,74 @@ def _names_in(haystack_lower: str, candidates: "Sequence[str]") -> bool:
     return False
 
 
+def _derived_table_conversion(
+    inputs: "DataMigrationInputs", table: TableDef
+) -> TableConversion:
+    """The DETERMINISTIC conversion for a table the run carries no APPLIED one for.
+
+    ``table_conversions`` is empty for a library/harness caller that never ran Schema
+    Conversion (the UI always runs it first, so this is unreachable there). Both halves of
+    such a load have to agree on the target shape: the DROP+recreate DDL and the SELECT
+    expressions that fill it. Only the recreator had a fallback, so with a PostgreSQL
+    source the target column WAS created as ``jsonb`` (DSQL has no array type) while the
+    read path passed ``target_types=None`` and read the column UNCAST -- every row then
+    failed 42804 ("column ... is of type jsonb but expression is of type date[]") and was
+    quarantined, or ``json[]``/``jsonb[]`` failed the table outright with psycopg's
+    "cannot adapt type 'dict'". Both sides now derive it here, which is what
+    ``DataMigrationInputs.table_conversions`` already documents ("a table absent here
+    falls back to the deterministic conversion / source-derived types"). Uses the SOURCE
+    engine's dialect, else a PostgreSQL-source table would be re-derived as MySQL DDL.
+    """
+    return SchemaConverter(
+        source_type=inputs.source_config.source_type
+    ).convert_table(table, SchemaConvertOptions())
+
+
+def _target_columns_the_conversion_would_drop(
+    inputs: "DataMigrationInputs", table_name: str, conversion: TableConversion
+) -> list[str]:
+    """Target columns a DROP+recreate from ``conversion`` would DESTROY, if any.
+
+    The replace path recreates the target from the APPLIED conversion, which is derived
+    from the Step 1 (Evaluation) inventory and is never re-introspected. So once the
+    operator has healed a CDC ADD COLUMN drift by putting the column on the target BY
+    HAND (the CDC monitor's "Fix target schema..." action), a Drop & reload silently
+    dropped it again -- measured live against Aurora DSQL: the recreator turned
+    ``['id', 'a', 'b']`` back into ``['id', 'a']``. After that CDC dead-letters every
+    change for the table again (42703), and the reload's own row counts look clean.
+
+    Compares column NAMES only, deliberately. Schema Conversion remaps types on the
+    tool's own advice (``money`` -> ``numeric``, an array -> ``jsonb``, ``inet`` ->
+    ``text``, a clamped scale/length), so any type comparison here would false-alarm
+    every migration that followed that advice; a name-only comparison cannot.
+
+    Returns ``[]`` -- i.e. no objection -- when the target table does not exist yet (a
+    normal first-run replace reads no columns) or when the applied DDL has no parseable
+    column list (``parse_target_column_types`` yields ``{}``): there is then nothing to
+    compare against, and ``recreate_table`` fails on that DDL by itself, which is the
+    clearer report.
+
+    Cost: ONE ``information_schema.columns`` read on ONE extra DSQL connection, per
+    REPLACED table only. Nothing scans a row; append loads pay nothing.
+    """
+    expected = parse_target_column_types(conversion.target_ddl)
+    if not expected:
+        return []
+    connection = DsqlConnector(
+        inputs.target_config, aws_profile=inputs.aws_profile
+    ).connect()
+    try:
+        current = read_target_columns(connection, table_name)
+    finally:
+        close = getattr(connection, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - best effort
+                pass
+    return [name for name in current if name not in expected]
+
+
 def _default_table_recreator(inputs: "DataMigrationInputs") -> TableRecreator:
     """Build the default DROP+recreate function for a run's target.
 
@@ -3744,11 +3866,32 @@ def _default_table_recreator(inputs: "DataMigrationInputs") -> TableRecreator:
         conversion = inputs.table_conversions.get(table.name)
         if conversion is None:
             # No applied conversion carried in (e.g. a table generated outside this
-            # session): re-derive deterministically with the SOURCE engine's dialect
-            # (else a PostgreSQL-source table would be re-derived as MySQL DDL).
-            conversion = SchemaConverter(
-                source_type=inputs.source_config.source_type
-            ).convert_table(table, SchemaConvertOptions())
+            # session): re-derive deterministically -- the SAME derivation the read path
+            # uses for its target column types, so the recreated table and the SELECT
+            # that fills it cannot disagree (see _derived_table_conversion).
+            conversion = _derived_table_conversion(inputs, table)
+        # REFUSE rather than silently destroy a column the conversion does not know
+        # about (see _target_columns_the_conversion_would_drop). The reachable case is
+        # the tool's own CDC drift recovery: the operator adds the source's new column to
+        # the target by hand, then reloads -- and the recreate dropped it again, leaving
+        # CDC dead-lettering and the table looking loaded.
+        dropped = _target_columns_the_conversion_would_drop(
+            inputs, table.name, conversion
+        )
+        if dropped:
+            raise FullLoadIncompleteError(
+                f"Table '{table.name}' was NOT reloaded: Aurora DSQL has column(s) "
+                + ", ".join(dropped)
+                + " that this migration's converted schema does not, so dropping and "
+                "recreating the table would destroy them. This is the state after you "
+                "heal a CDC schema drift by adding a column to the target by hand: the "
+                "conversion still comes from the Step 1 (Evaluation) inventory, which "
+                "predates the source change. Re-run Step 1 (Evaluation) to refresh the "
+                "inventory (and re-edit this table's DDL in Step 2 if you edited it "
+                "there), then reload -- the refreshed conversion recreates the column "
+                "AND the reload copies its data. To reload without the column instead, "
+                "drop it on the target first (ALTER TABLE ... DROP COLUMN)."
+            )
         connector = DsqlConnector(
             inputs.target_config, aws_profile=inputs.aws_profile
         )
@@ -4056,10 +4199,17 @@ class BatchedTableMigrator:
             )
         if generated_columns:
             table = apply_lob_exclusions(table, generated_columns)
-        target_types = (
-            parse_target_column_types(applied.target_ddl)
+        # No applied conversion (a library/harness caller) => derive the SAME conversion
+        # the recreator derives, rather than reading every column uncast: see
+        # _derived_table_conversion. ``applied`` stays None so the generated-column and
+        # target-PK decisions below are untouched. MySQL is unaffected (its dialect
+        # ignores target_type on read and ValueConverter derives identical kinds from
+        # map_mysql_type); on PostgreSQL this is what makes an array column read as
+        # to_jsonb text for the jsonb target the engine itself created.
+        target_types = parse_target_column_types(
+            applied.target_ddl
             if applied is not None
-            else None
+            else _derived_table_conversion(self._inputs, original_table).target_ddl
         )
         # The TARGET table's primary key, parsed from the APPLIED (possibly user- or
         # AI-edited) target DDL -- the single source of truth for the conflict key.

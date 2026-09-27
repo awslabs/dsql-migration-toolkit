@@ -1105,6 +1105,9 @@ _PREREQ_CATEGORY_BY_CHECK: dict[PrerequisiteCheckId, PrereqCategory] = {
     PrerequisiteCheckId.CDC_REPLICATION_OBJECTS: PrereqCategory.SOURCE_CONFIG,
     # Per-table, like REPLICA_IDENTITY below.
     PrerequisiteCheckId.TABLE_REPLICABLE: PrereqCategory.SCHEMA_TABLES,
+    # Per-table and per-COLUMN (which of this table's column types CDC cannot carry), so it
+    # belongs with the table rows and next to TABLE_REPLICABLE, not with the server settings.
+    PrerequisiteCheckId.COLUMN_REPLICABLE: PrereqCategory.SCHEMA_TABLES,
     PrerequisiteCheckId.TABLE_PRIMARY_KEY: PrereqCategory.SCHEMA_TABLES,
     PrerequisiteCheckId.TARGET_SCHEMA_READY: PrereqCategory.SCHEMA_TABLES,
     # Per-table, on the target and the source respectively -- the fallback already put

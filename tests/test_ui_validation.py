@@ -3680,6 +3680,43 @@ def test_apply_column_exclusions_drops_excluded_but_keeps_pk() -> None:
     assert "notes" not in [c.name for c in out2.columns]
 
 
+def test_the_validator_factory_hands_over_the_operators_excluded_columns(
+    monkeypatch,
+) -> None:
+    """The PRODUCTION factory must pass the exclusions, or every LOB run false-alarms.
+
+    ``_apply_column_exclusions`` above strips these columns from each ``TableDef``
+    before the comparison, so the validator's stale-inventory gate would otherwise see a
+    deliberately omitted column as one the Step-1 inventory never knew about and grade an
+    otherwise-clean table UNVERIFIED -- a false MISMATCH on every migration that used the
+    oversized-LOB exclusion. The gate takes them on ``Validator.__init__``, so this
+    factory is the ONLY place that wires them up: measured, deleting the keyword here
+    failed no test in the suite, which is why this one exists.
+    """
+    from dsql_migrator.ui import validation as uiv
+
+    captured: dict = {}
+
+    class _Recorder:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(uiv, "Validator", _Recorder)
+    inputs = ValidationInputs(
+        source_config=SourceConnectionConfig(host="db", database="app"),
+        source_password=SecretValue("pw"),
+        target_config=TargetConnectionConfig(
+            cluster_endpoint="cluster.dsql.example", region="us-east-1"
+        ),
+        inventory=_inventory(),
+        excluded_columns={"app.products": {"notes"}},
+    )
+
+    uiv._default_validator_factory(inputs)
+
+    assert captured["migration_excluded_columns"] == {"app.products": {"notes"}}
+
+
 # ---------------------------------------------------------------------------
 # Cancel copy: the stop is cooperative, so the running panel must say WHAT it is
 # waiting on instead of implying an immediate halt.
@@ -4725,7 +4762,14 @@ def test_readiness_match_label_is_mode_aware_and_discloses_uncompared_columns() 
     )
     cs_body = checksum.body()
     assert "Data identical" in cs_body
-    assert "FLOAT/DOUBLE and JSON columns are not value-compared" in cs_body
+    # Worded WITHOUT a type list: the omitted set is engine-dependent (a PostgreSQL source's
+    # float columns ARE value-compared via to_jsonb, a MySQL source's are not), so naming
+    # FLOAT/DOUBLE here would claim a PostgreSQL float column went unverified when it did not.
+    assert (
+        "Columns with no byte-identical cross-engine text form are not value-compared"
+        in cs_body
+    )
+    assert "FLOAT/DOUBLE" not in cs_body
 
 
 def test_verdict_says_what_is_outstanding_instead_of_review_the_failures() -> None:

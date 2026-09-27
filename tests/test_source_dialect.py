@@ -97,6 +97,15 @@ def test_postgres_dialect_engine_kwargs_pin_utc_and_optional_statement_timeout()
     assert "-c datestyle=ISO" in opts
     assert "-c intervalstyle=postgres" in opts
     assert "-c lc_numeric=C" in opts
+    # extra_float_digits guards DATA, not just the comparison. It controls how many
+    # significant digits float4/float8 render with in TEXT output, and a float array is read
+    # as CAST(to_jsonb(col) AS text) -- so a source inheriting a LOWERED value (RDS/Aurora
+    # accept -15..3) TRUNCATES on the way in. Measured on PostgreSQL 17.11: at -5,
+    # ARRAY[12345.6789012345::float8, 1.0000001::float4] renders [12345.6789, 1.000000119];
+    # at 3 it renders the full round-trippable [12345.6789012345, 1.0000001192092896].
+    # Validation's CHECKSUM renders the source with that SAME expression, so the loss would
+    # report as MATCH -- the pin is what stops a self-masking comparison.
+    assert "-c extra_float_digits=3" in opts
     assert "connect_timeout" in base["connect_args"]
     # No read timeout -> no per-statement cap and no keepalive tuning (zero overhead).
     assert "statement_timeout" not in base["connect_args"]["options"]

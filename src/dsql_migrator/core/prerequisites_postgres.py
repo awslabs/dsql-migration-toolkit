@@ -35,6 +35,122 @@ from dsql_migrator.core.models import (
 _USABLE_REPLICA_IDENTITY = frozenset({"d", "f", "i"})
 
 
+# --- Columns PostgreSQL CDC cannot carry -----------------------------------------------
+# Full Load loads every one of these CORRECTLY (the exporter reads
+# ``CAST(to_jsonb(col) AS text)``) and Schema Conversion maps every ``<t>[]`` to jsonb
+# (Aurora DSQL has no array type), so the divergence appears ONLY on rows that arrive via
+# CDC. A Debezium after-image carries every column, so the FIRST unrenderable one decides
+# the outcome for the whole row. Live-established on a PostgreSQL 17.7 -> MSK -> DSQL run;
+# until this check the operator learned it from a Validation CHECKSUM mismatch -- after the
+# billable MSK infrastructure existed and the target already held wrong data.
+#
+# The reason codes are the three CONSEQUENCES, because the consequence is what the operator
+# decides on and what the prerequisite row has to SAY. It is not what sets the grade: all
+# three are WARN / non-blocking, including the dead-lettering class -- see
+# :func:`check_columns_replicable` for why a FAIL here would block the Full Load that
+# carries these columns correctly, with no route in the UI to clear it.
+UNCARRYABLE_ROW_DEAD_LETTERS = "row_dead_letters"
+UNCARRYABLE_COLUMN_ARRIVES_NULL = "column_arrives_null"
+UNCARRYABLE_COLUMN_ARRIVES_WRONG = "column_arrives_wrong"
+
+# Keyed by the pg_catalog name of an ARRAY column's ELEMENT type (``_timetz`` -> timetz).
+# Built-in only: the probe's query requires ``typnamespace = 'pg_catalog'``, so a
+# user-defined type spelled ``money`` is never matched -- verified on PostgreSQL 17.11, a
+# ``cdcprobe.money[]`` enum column is not returned while a ``pg_catalog.money[]`` one is.
+# An array of a user-defined ENUM must NOT be listed here: enums arrive as plain strings
+# and replicate correctly.
+_CDC_UNCARRYABLE_ARRAY_ELEMENTS = {
+    # (A) the whole ROW dead-letters -- no row reaches the target at all, for EVERY change
+    # to that table, because the sink throws on the first unrenderable column.
+    #   timetz[]  -- Debezium's ZonedTime normalises to UTC and discards the offset that
+    #                to_jsonb preserves.
+    #   bytea[]   -- the spelling depends on the SOURCE's bytea_output GUC, which the
+    #                change event does not carry.
+    #   numeric[] -- ONLY when UNCONSTRAINED (see classify_uncarryable_cdc_column):
+    #                Debezium sends VariableScaleDecimal and stripTrailingZeros() has
+    #                already run, so the display scale is gone before the sink sees it.
+    "timetz": UNCARRYABLE_ROW_DEAD_LETTERS,
+    "bytea": UNCARRYABLE_ROW_DEAD_LETTERS,
+    "numeric": UNCARRYABLE_ROW_DEAD_LETTERS,
+    # (B) only that COLUMN is lost: the row lands, nothing dead-letters, and ONLY the
+    # Validation CHECKSUM can see it. Two mechanisms, one outcome (the column is NULL) --
+    # for interval/varbit/money/xml/point/name the SOURCE connector logs "No converter
+    # found for column ... The column will not be part of change events for that table"
+    # (established from the shipped Debezium 2.7.4 jar and confirmed live); for bit(n)[]
+    # the field IS present and the connector's CONVERSION fails ("Failed to properly
+    # convert data value ... Failed to read value of array").
+    "interval": UNCARRYABLE_COLUMN_ARRIVES_NULL,
+    "varbit": UNCARRYABLE_COLUMN_ARRIVES_NULL,
+    "bit": UNCARRYABLE_COLUMN_ARRIVES_NULL,
+    "money": UNCARRYABLE_COLUMN_ARRIVES_NULL,
+    "xml": UNCARRYABLE_COLUMN_ARRIVES_NULL,
+    "point": UNCARRYABLE_COLUMN_ARRIVES_NULL,
+    "name": UNCARRYABLE_COLUMN_ARRIVES_NULL,
+    # (B) but WRONG rather than absent: to_jsonb writes ["42"] (a quoted string) while the
+    # event carries an unnamed int64 array, so the target renders [42].
+    "oid": UNCARRYABLE_COLUMN_ARRIVES_WRONG,
+}
+
+# SCALAR types with the same problem. Deliberately tiny, and the shortness is the point:
+# scalar timetz / interval / money / xml / point / bit / varbit all have real Debezium
+# converters and replicate fine -- it is only their ARRAY forms above that do not -- so
+# listing them here would warn about columns that work.
+_CDC_UNCARRYABLE_SCALARS = {"tsvector": UNCARRYABLE_COLUMN_ARRIVES_NULL}
+
+# The candidate names the PROBE filters on server-side, so the query returns only columns
+# worth classifying instead of every column of every selected table. Derived from the maps
+# above rather than spelled out again, so the SQL filter cannot drift from the classifier.
+CDC_UNCARRYABLE_CANDIDATE_ARRAY_ELEMENTS = tuple(sorted(_CDC_UNCARRYABLE_ARRAY_ELEMENTS))
+CDC_UNCARRYABLE_CANDIDATE_SCALARS = tuple(sorted(_CDC_UNCARRYABLE_SCALARS))
+
+
+def classify_uncarryable_cdc_column(
+    *, is_array: bool, base_type_name: Optional[str], element_typmod: int
+) -> Optional[str]:
+    """Why CDC cannot carry this column, or ``None`` when it can.
+
+    Pure, so the whole type taxonomy is unit-testable without a PostgreSQL. Takes the raw
+    catalog discriminators the probe reads -- whether the column's effective type is an
+    array, the pg_catalog name of its element (or of the scalar itself), and the element's
+    ``atttypmod`` -- and applies the tables above.
+
+    ``numeric`` is the one type whose MODIFIER decides: ``numeric(p,s)[]`` carries fine
+    (Debezium sends a fixed-scale Decimal), while an UNCONSTRAINED ``numeric[]`` becomes a
+    VariableScaleDecimal whose display scale is already lost. Verified on PostgreSQL 17.11:
+    ``atttypmod`` is -1 for ``numeric[]``, 655366 for ``numeric(10,2)[]`` and 655364 for
+    ``numeric(10)[]`` -- and for a DOMAIN over ``numeric(10,2)[]`` the modifier sits on
+    ``pg_type.typtypmod``, which the probe's query folds in.
+
+    Deliberately silent on the DATA-DEPENDENT losses, which no catalog read can see: a
+    date/timestamp/timestamptz array element outside years 0001..9999 (incl. +/-infinity),
+    ``time '24:00:00'``, a NaN element in an otherwise-fine ``numeric(p,s)[]``, and a
+    multi-dimensional value (``attndims`` is only the DECLARED dimensionality and
+    PostgreSQL enforces it in neither direction -- see
+    ``_PG_CDC_UNCARRYABLE_COLUMNS_SQL``).
+    """
+    if not base_type_name:
+        return None
+    if not is_array:
+        return _CDC_UNCARRYABLE_SCALARS.get(base_type_name)
+    if base_type_name == "numeric" and element_typmod != -1:
+        return None
+    return _CDC_UNCARRYABLE_ARRAY_ELEMENTS.get(base_type_name)
+
+
+@dataclass(frozen=True)
+class UncarryableCdcColumn:
+    """One column of one table that PostgreSQL CDC cannot carry, and why.
+
+    ``declared_type`` is the source's own ``format_type`` spelling (e.g. ``time with time
+    zone[]``, or a domain's own name), so the prerequisite row can NAME the column and its
+    type instead of describing a category. ``reason`` is one of the ``UNCARRYABLE_*`` codes.
+    """
+
+    column: str
+    declared_type: str
+    reason: str
+
+
 @dataclass(frozen=True)
 class PostgresCdcFacts:
     """Read-only source facts for the PostgreSQL CDC prerequisite checks.
@@ -83,6 +199,14 @@ class PostgresCdcFacts:
     identity_index_is_primary: Mapping[str, bool] = field(default_factory=dict)
     # ``relpersistence='u'``: an UNLOGGED table cannot be published at all.
     unlogged: Mapping[str, bool] = field(default_factory=dict)
+    # Per selected table, the columns CDC cannot carry (see
+    # :func:`classify_uncarryable_cdc_column`). ``None`` -- NOT an empty dict -- means the
+    # catalog read failed, because the two are different answers: an absent/empty entry
+    # means "read, nothing offending" (PASS) while None means "unknown" and must degrade
+    # to a non-blocking INFO. The same tri-state discipline as the fields above: a defaulted
+    # {} would assert a clean bill of health nobody verified, and this is the only check
+    # that looks at column types at all, so nothing else would contradict it.
+    cdc_uncarryable_columns: Optional[Mapping[str, Sequence[UncarryableCdcColumn]]] = None
     # Whether the source user can CREATE a publication: CREATE on the database AND
     # ownership of every table to be published. ``tables_not_owned`` names the offenders
     # so the remediation is actionable rather than "permission denied".
@@ -597,6 +721,159 @@ def check_table_replicable(
     )
 
 
+_COLUMN_REPLICABLE_TITLE = "Every column's type can be carried by CDC"
+
+
+def _describe_columns(columns: "Sequence[UncarryableCdcColumn]") -> str:
+    """``\\`col\\` (type)`` for each column, in catalog order -- the house listing shape."""
+    return ", ".join(f"`{c.column}` ({c.declared_type})" for c in columns)
+
+
+def _is_are(columns: "Sequence[UncarryableCdcColumn]") -> str:
+    return "is" if len(columns) == 1 else "are"
+
+
+def _it_they(columns: "Sequence[UncarryableCdcColumn]") -> str:
+    return "it arrives" if len(columns) == 1 else "they arrive"
+
+
+def check_columns_replicable(
+    table: TableDef, facts: PostgresCdcFacts
+) -> Optional[PrerequisiteResult]:
+    """WARN when a column's type cannot survive the CDC hop, NAMING each column and type.
+
+    One level below :func:`check_table_replicable`: the table publishes fine, but
+    :func:`classify_uncarryable_cdc_column` found a column whose PostgreSQL type a Debezium
+    pgoutput event cannot carry to the jsonb target. Two consequences, and the row states
+    which applies because they read nothing alike -- "every change to this table
+    dead-letters" is not "this column arrives NULL".
+
+    Returns ``None`` when the table has no such column, deliberately: no per-table PASS.
+    The precedent is :func:`prerequisites.check_source_value_size`, the other non-blocking,
+    TYPE-CONDITIONAL per-table check ("a schema of ordinary columns adds no row to the
+    report") -- and it is the right one, because a clean table is the norm here. The
+    per-table PASS rows this module does emit (TABLE_REPLICABLE, REPLICA_IDENTITY) are
+    REQUIRED gates, where the PASS row is the evidence a blocking check cleared; a green
+    row on every table for a non-blocking check would bury the few tables that matter.
+    Unreadable facts still get their INFO row -- unknown is reported as unknown.
+
+    **WARN, not FAIL, and that is argued rather than lax** -- including for the
+    dead-lettering class, which loses every row of the table:
+
+    * A required FAIL would block the FULL LOAD, not just the deploy. Executed:
+      ``PrerequisiteReport.build`` sets ``can_proceed=False``, and
+      ``full_load_run_guard_reason`` ends in ``prerequisite_block_reason(report,
+      mode=CDC)`` -- the mode a "Full load + CDC" run checks -- so the Run button goes
+      dead. Full Load carries every one of these columns CORRECTLY (the exporter reads
+      ``CAST(to_jsonb(col) AS text)``), so a FAIL would stop the one operation that works.
+    * Nothing in the UI can clear it. Debezium's ``column.exclude.list`` is reachable only
+      through the oversized-LOB dialog (``lob_exclusion_candidates`` offers LOB-typed
+      columns only), and the capture set follows the run's table selection
+      (``_cdc_tables_for_config``), so for e.g. ``bytea[]`` the only routes are the
+      operator's own source DDL or dropping the table from the selection. A FAIL nobody
+      can clear from inside the tool is a dead end, not a gate.
+    * The consequence shape is ``SOURCE_VALUE_SIZE``'s, not ``TABLE_REPLICABLE``'s: rows
+      the target cannot store, dead-lettered VISIBLY, which that check grades WARN /
+      ``required=False`` as "a decision the operator owns". An UNLOGGED table, by contrast,
+      aborts the whole ``CREATE PUBLICATION`` for every other table too.
+    * The gap is recoverable: the table is correct after Full Load and correct again after
+      a reload with writes stopped -- specifically a **'Drop & reload'**, because an
+      append reload only inserts primary keys the target is missing and so cannot rewrite
+      the NULL a row already carries -- and Validation reports it meanwhile.
+
+    The silent class is WARN rather than INFO for the opposite reason: ``INFO`` means
+    expected / optional / no action needed, and a column that arrives NULL with no error is
+    none of those -- it fails the table's CHECKSUM, which the cut-over gate reads.
+    """
+    per_table = facts.cdc_uncarryable_columns
+    if per_table is None:
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.COLUMN_REPLICABLE,
+            title=_COLUMN_REPLICABLE_TITLE,
+            status=PrerequisiteStatus.INFO,
+            required=False,
+            target=table.name,
+            detail=(
+                "Could not read the table's column types, so it is unknown whether any "
+                "column holds a type CDC cannot carry."
+            ),
+            remediation=(
+                "Confirm the migration user can read pg_catalog (pg_attribute, pg_type), "
+                "then re-run the checks."
+            ),
+        )
+    found = list(per_table.get(table.name) or ())
+    if not found:
+        return None
+    fatal = [c for c in found if c.reason == UNCARRYABLE_ROW_DEAD_LETTERS]
+    nulled = [c for c in found if c.reason == UNCARRYABLE_COLUMN_ARRIVES_NULL]
+    wrong = [c for c in found if c.reason == UNCARRYABLE_COLUMN_ARRIVES_WRONG]
+
+    sentences: list[str] = []
+    if fatal:
+        sentences.append(
+            f"CDC cannot render {_describe_columns(fatal)} for the jsonb target column, and "
+            "a Debezium change event carries every column, so the sink rejects the whole "
+            "record: EVERY insert, update and delete on this table dead-letters (counted "
+            "on the CDC step's dead-letter panel) and nothing reaches the target. The "
+            "table stays exactly as Full Load left it."
+        )
+    # "Separately" because when the table already dead-letters, a column-level loss is a
+    # SECOND finding about the same table rather than a milder description of the first.
+    lead = "Separately, " if fatal else ""
+    if nulled:
+        sentences.append(
+            f"{lead}{_describe_columns(nulled)} {_is_are(nulled)} dropped from the change "
+            f"event, so {_it_they(nulled)} NULL on every row CDC delivers."
+        )
+        lead = ""
+    if wrong:
+        sentences.append(
+            f"{lead}{_describe_columns(wrong)} "
+            f"{'arrives' if len(wrong) == 1 else 'arrive'} with a different value than "
+            "Full Load writes for the same row."
+        )
+    if nulled or wrong:
+        sentences.append(
+            "That column-level loss is SILENT: the row lands, nothing is dead-lettered, "
+            "nothing is logged, and only a Validation CHECKSUM can see it."
+        )
+    sentences.append(
+        "Full Load itself carries all of these correctly -- it reads each value on the "
+        "source in the form the target column takes (jsonb for an array) -- so the "
+        "divergence exists only on rows that arrive via CDC."
+    )
+
+    # The one route that genuinely repairs the type on the source, offered only when it
+    # applies: numeric(p,s)[] carries fine, an unconstrained numeric[] does not.
+    numeric_route = (
+        "give an unconstrained numeric[] a precision and scale on the source "
+        "(numeric(p,s)[] IS carried), "
+        if any(c.declared_type.startswith("numeric[") for c in fatal)
+        else ""
+    )
+    return PrerequisiteResult(
+        check_id=PrerequisiteCheckId.COLUMN_REPLICABLE,
+        title=_COLUMN_REPLICABLE_TITLE,
+        status=PrerequisiteStatus.WARN,
+        required=False,
+        target=table.name,
+        detail=" ".join(sentences),
+        remediation=(
+            "Decide before the CDC infrastructure is created: "
+            + numeric_route
+            + "remodel the column on the source to a type CDC does carry (text / text[] "
+            "carries every one of these), or leave this table out of the selection and "
+            "migrate it with Full Load only -- the capture set follows the table "
+            "selection, so there is no per-table \"load but do not stream\" switch. "
+            "Accepting it is also a valid choice: every other table streams normally, "
+            "Validation will report this one as a mismatch, and the table is made correct "
+            "again by stopping writes to it and using the Full Load step's per-table "
+            "Reload before you cut over."
+        ),
+    )
+
+
 def check_publication_privilege(facts: PostgresCdcFacts) -> PrerequisiteResult:
     """FAIL when the source user cannot CREATE the publication CDC needs.
 
@@ -1060,6 +1337,9 @@ def check_postgres_cdc_prerequisites(
     for table in tables:
         results.append(check_table_replicable(table, facts))
         results.append(check_replica_identity(table, facts))
+        _columns = check_columns_replicable(table, facts)
+        if _columns is not None:
+            results.append(_columns)
         _covers = check_replica_identity_covers_key(
             table, facts, _keys.get(table.name) or ()
         )
@@ -1119,6 +1399,18 @@ _SKIPPED_TITLES: "tuple[tuple, ...]" = (
     (PrerequisiteCheckId.SOURCE_IS_WRITER, "Source is a writer (not a standby)"),
     (PrerequisiteCheckId.TABLE_REPLICABLE, "Table can be replicated (not UNLOGGED)"),
     (PrerequisiteCheckId.REPLICA_IDENTITY, "Table has a usable REPLICA IDENTITY"),
+    # Bespoke preview detail, for the same reason as the two rows above: this is the one
+    # requirement the mode itself REMOVES rather than defers. The bulk loader reads every
+    # column as jsonb, so a Full-load-only run has no such thing as an uncarryable column --
+    # which is exactly what an operator weighing "add CDC later" needs to know.
+    (
+        PrerequisiteCheckId.COLUMN_REPLICABLE,
+        _COLUMN_REPLICABLE_TITLE,
+        "Not applicable for this mode — Full Load carries every column type correctly (it "
+        "reads each value in the form the target column takes, e.g. an array as jsonb). "
+        "Some of those types cannot be carried by the CDC stream, so this is checked per "
+        "table once CDC is in scope.",
+    ),
 )
 
 
@@ -1149,6 +1441,13 @@ def postgres_cdc_prerequisites_skipped() -> list[PrerequisiteResult]:
 
 __all__ = [
     "PostgresCdcFacts",
+    "UncarryableCdcColumn",
+    "classify_uncarryable_cdc_column",
+    "CDC_UNCARRYABLE_CANDIDATE_ARRAY_ELEMENTS",
+    "CDC_UNCARRYABLE_CANDIDATE_SCALARS",
+    "UNCARRYABLE_ROW_DEAD_LETTERS",
+    "UNCARRYABLE_COLUMN_ARRIVES_NULL",
+    "UNCARRYABLE_COLUMN_ARRIVES_WRONG",
     "check_postgres_cdc_facts_unavailable",
     "postgres_cdc_prerequisites_skipped",
     "check_wal_level_logical",
@@ -1158,6 +1457,7 @@ __all__ = [
     "check_source_is_writer",
     "check_replica_identity",
     "check_table_replicable",
+    "check_columns_replicable",
     "check_publication_privilege",
     "check_cdc_replication_objects",
     "check_postgres_cdc_prerequisites",

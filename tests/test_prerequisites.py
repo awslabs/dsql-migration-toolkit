@@ -20,6 +20,7 @@ from dsql_migrator.core.models import (
     MigrationMode,
     PrerequisiteCheckId,
     PrerequisiteCheckRequest,
+    PrerequisiteReport,
     PrerequisiteStatus,
     SourceType,
     TableDef,
@@ -1151,6 +1152,10 @@ def _pg_facts_healthy(**over):
         max_slot_wal_keep_size_mb=-1,
         has_database_create=True,
         tables_not_owned=(),
+        # READ, and nothing offending -- the default has to be the healthy state, not the
+        # unreadable one (None), or every neighbouring test would silently exercise the
+        # degraded path and COLUMN_REPLICABLE would add an INFO row to each of them.
+        cdc_uncarryable_columns={},
     )
     base.update(over)
     return PostgresCdcFacts(**base)
@@ -1596,6 +1601,358 @@ def test_walsender_count_is_unknown_rather_than_a_false_zero() -> None:
         _Connection(monitor=True), []
     )
     assert sighted.used_wal_senders == 7
+
+
+# --- COLUMN_REPLICABLE facts: the columns PostgreSQL CDC cannot carry ----------
+# Full Load loads every one of these correctly (it reads CAST(to_jsonb(col) AS text)), so
+# the divergence exists ONLY on rows that arrive via CDC -- and until this fact existed the
+# operator learned it from a Validation CHECKSUM mismatch, after the billable MSK
+# infrastructure was already created. Every expectation below was executed against a real
+# PostgreSQL 17.11 before being written down.
+
+
+def test_classify_uncarryable_cdc_column_taxonomy() -> None:
+    """The pure classifier, over every shape verified on PostgreSQL 17.11.
+
+    The catalog inputs (is_array / the pg_catalog element name / the element atttypmod) are
+    exactly what the probe's one catalog query returns, so this pins the whole type
+    taxonomy without needing a PostgreSQL.
+    """
+    from dsql_migrator.core.prerequisites_postgres import (
+        UNCARRYABLE_COLUMN_ARRIVES_NULL,
+        UNCARRYABLE_COLUMN_ARRIVES_WRONG,
+        UNCARRYABLE_ROW_DEAD_LETTERS,
+        classify_uncarryable_cdc_column,
+    )
+
+    def _c(name, *, array=True, typmod=-1):
+        return classify_uncarryable_cdc_column(
+            is_array=array, base_type_name=name, element_typmod=typmod
+        )
+
+    # (A) the whole ROW dead-letters -- no row reaches the target for ANY change.
+    for elem in ("timetz", "bytea"):
+        assert _c(elem) == UNCARRYABLE_ROW_DEAD_LETTERS, elem
+    # numeric is the ONE type whose modifier decides. atttypmod values are the real ones:
+    # -1 for numeric[], 655366 for numeric(10,2)[], 655364 for numeric(10)[].
+    assert _c("numeric", typmod=-1) == UNCARRYABLE_ROW_DEAD_LETTERS
+    assert _c("numeric", typmod=655366) is None, "numeric(10,2)[] carries fine"
+    assert _c("numeric", typmod=655364) is None, "numeric(10)[] carries fine"
+
+    # (B) only that COLUMN is lost -- the row lands and ONLY a CHECKSUM can see it.
+    for elem in ("interval", "varbit", "bit", "money", "xml", "point", "name"):
+        assert _c(elem) == UNCARRYABLE_COLUMN_ARRIVES_NULL, elem
+    # bit(n)[] / varbit(n)[] fail the same way with a modifier present (atttypmod 4 / 8):
+    # the modifier is only consulted for numeric.
+    assert _c("bit", typmod=4) == UNCARRYABLE_COLUMN_ARRIVES_NULL
+    assert _c("varbit", typmod=8) == UNCARRYABLE_COLUMN_ARRIVES_NULL
+    # oid[] arrives WRONG rather than absent: to_jsonb writes ["42"], CDC renders [42].
+    assert _c("oid") == UNCARRYABLE_COLUMN_ARRIVES_WRONG
+    # tsvector is the only SCALAR with the problem.
+    assert _c("tsvector", array=False) == UNCARRYABLE_COLUMN_ARRIVES_NULL
+
+    # Types that carry FINE must not be flagged -- alarming on a normal state is the
+    # failure mode this check is one step away from.
+    for elem in ("int4", "text", "date", "timestamptz", "timestamp", "jsonb", "uuid"):
+        assert _c(elem) is None, elem
+    # A SCALAR timetz / interval / money / xml / point / bit / varbit all have real
+    # Debezium converters: it is only their ARRAY forms that do not.
+    for elem in ("timetz", "interval", "money", "xml", "point", "bit", "varbit", "bytea"):
+        assert _c(elem, array=False) is None, elem
+    # An array of a user-defined ENUM: the probe's pg_catalog filter yields no base name,
+    # so nothing is flagged. Enums arrive as plain strings and replicate correctly.
+    assert _c(None) is None
+
+
+def test_probe_reads_uncarryable_columns_in_one_round_trip() -> None:
+    """The probe turns the catalog rows into the per-table fact, and drops the non-offenders.
+
+    Also pins the ONE-round-trip property: a single statement covers every selected table.
+    """
+    from dsql_migrator.core.prerequisites_postgres import (
+        UNCARRYABLE_COLUMN_ARRIVES_NULL,
+        UNCARRYABLE_ROW_DEAD_LETTERS,
+    )
+    from dsql_migrator.core.source_dialect.postgres import PostgresSourceDialect
+
+    # (qname, column, declared_type, is_array, pg_catalog base name, element atttypmod) --
+    # verbatim shapes from the PostgreSQL 17.11 verification run.
+    rows = [
+        ("app.orders", "ttz_arr", "time with time zone[]", True, "timetz", -1),
+        ("app.orders", "num_arr", "numeric[]", True, "numeric", -1),
+        ("app.orders", "num_ps_arr", "numeric(10,2)[]", True, "numeric", 655366),
+        ("app.orders", "tsv", "tsvector", False, "tsvector", -1),
+        ("app.items", "iv_arr", "interval[]", True, "interval", -1),
+    ]
+
+    class _Conn:
+        def __init__(self) -> None:
+            self.uncarryable_statements = 0
+
+        def rollback(self) -> None:
+            pass
+
+        def execute(self, statement, params=None):
+            sql = str(statement)
+            if "typelem" in sql:
+                self.uncarryable_statements += 1
+            return _Res(sql)
+
+    class _Res:
+        def __init__(self, sql: str) -> None:
+            self._sql = sql
+
+        def scalar(self):
+            return None
+
+        def fetchall(self):
+            return rows if "typelem" in self._sql else []
+
+    conn = _Conn()
+    facts = PostgresSourceDialect().probe_cdc_prerequisites(
+        conn, ["app.orders", "app.items"]
+    )
+    assert conn.uncarryable_statements == 1, (
+        "the uncarryable-column facts must be ONE catalog round trip for all tables"
+    )
+    found = {
+        qname: [(c.column, c.declared_type, c.reason) for c in cols]
+        for qname, cols in (facts.cdc_uncarryable_columns or {}).items()
+    }
+    assert found == {
+        "app.orders": [
+            ("ttz_arr", "time with time zone[]", UNCARRYABLE_ROW_DEAD_LETTERS),
+            ("num_arr", "numeric[]", UNCARRYABLE_ROW_DEAD_LETTERS),
+            ("tsv", "tsvector", UNCARRYABLE_COLUMN_ARRIVES_NULL),
+        ],
+        "app.items": [("iv_arr", "interval[]", UNCARRYABLE_COLUMN_ARRIVES_NULL)],
+    }, "numeric(10,2)[] must be dropped -- it carries fine"
+
+
+def test_uncarryable_columns_fact_is_none_when_the_catalog_is_unreadable() -> None:
+    """An unreadable catalog must be "unknown" (-> INFO), never an empty "all clean" dict.
+
+    A defaulted {} would assert a clean bill of health nobody verified, and this is the only
+    check that reads column types at all, so nothing else would contradict it. Degradation
+    live-verified on PostgreSQL 17.11 -- with SELECT on pg_catalog.pg_type revoked the
+    statement raises "ERROR: permission denied for table pg_type".
+    """
+    from dsql_migrator.core.source_dialect.postgres import PostgresSourceDialect
+
+    class _Conn:
+        def __init__(self) -> None:
+            self.rollbacks = 0
+
+        def rollback(self) -> None:
+            self.rollbacks += 1
+
+        def execute(self, statement, params=None):
+            if "typelem" in str(statement):
+                raise RuntimeError("permission denied for table pg_type")
+            return _Res()
+
+    class _Res:
+        def scalar(self):
+            return None
+
+        def fetchall(self):
+            return []
+
+    conn = _Conn()
+    facts = PostgresSourceDialect().probe_cdc_prerequisites(conn, ["app.orders"])
+    assert facts.cdc_uncarryable_columns is None
+    assert conn.rollbacks >= 1, "an aborted transaction must be rolled back"
+
+    # And a SUCCESSFUL read that finds nothing is the OTHER answer: an empty mapping, on
+    # which the check emits no row at all. The two states must stay distinguishable.
+    class _Clean(_Conn):
+        def execute(self, statement, params=None):
+            return _Res()
+
+    clean = PostgresSourceDialect().probe_cdc_prerequisites(_Clean(), ["app.orders"])
+    assert clean.cdc_uncarryable_columns == {}
+
+
+def _uncarryable(*items):
+    """``{"app.orders": (UncarryableCdcColumn, ...)}`` from (column, type, reason) tuples."""
+    from dsql_migrator.core.prerequisites_postgres import UncarryableCdcColumn
+
+    return {
+        "app.orders": tuple(
+            UncarryableCdcColumn(column=c, declared_type=t, reason=r) for c, t, r in items
+        )
+    }
+
+
+def test_uncarryable_columns_name_the_column_the_type_and_the_consequence() -> None:
+    """The row has to distinguish "the whole table dead-letters" from "this column is NULL".
+
+    Both are graded WARN, so the TEXT is the only place the difference lands -- an operator
+    who reads "arrives NULL" when in fact no row of the table will reach the target at all
+    has been told the wrong thing.
+    """
+    from dsql_migrator.core.prerequisites_postgres import (
+        UNCARRYABLE_COLUMN_ARRIVES_NULL,
+        UNCARRYABLE_COLUMN_ARRIVES_WRONG,
+        UNCARRYABLE_ROW_DEAD_LETTERS,
+        check_columns_replicable,
+    )
+
+    fatal = check_columns_replicable(
+        _table("app.orders"),
+        _pg_facts_healthy(
+            cdc_uncarryable_columns=_uncarryable(
+                ("ttz_arr", "time with time zone[]", UNCARRYABLE_ROW_DEAD_LETTERS),
+                ("num_arr", "numeric[]", UNCARRYABLE_ROW_DEAD_LETTERS),
+            )
+        ),
+    )
+    assert fatal is not None
+    assert fatal.target == "app.orders", "per-table, like every other per-table row"
+    # The column AND its PostgreSQL type -- "an array column" would send the operator
+    # hunting through the schema.
+    assert "`ttz_arr` (time with time zone[])" in fatal.detail
+    assert "`num_arr` (numeric[])" in fatal.detail
+    assert "dead-letter" in fatal.detail, "the consequence, not just the mechanism"
+    # The one source-side repair that exists, offered only because numeric[] is present.
+    assert "numeric(p,s)[]" in fatal.remediation
+
+    lossy = check_columns_replicable(
+        _table("app.orders"),
+        _pg_facts_healthy(
+            cdc_uncarryable_columns=_uncarryable(
+                ("iv_arr", "interval[]", UNCARRYABLE_COLUMN_ARRIVES_NULL),
+                ("oid_arr", "oid[]", UNCARRYABLE_COLUMN_ARRIVES_WRONG),
+            )
+        ),
+    )
+    assert lossy is not None
+    assert "`iv_arr` (interval[])" in lossy.detail
+    assert "it arrives NULL on every row CDC delivers" in lossy.detail
+    assert "`oid_arr` (oid[])" in lossy.detail
+    assert "CHECKSUM" in lossy.detail, "silent loss: name the only surface that sees it"
+    assert "dead-letter" not in lossy.detail.split("SILENT")[0], (
+        "nothing dead-letters in this class -- saying so would misdiagnose it"
+    )
+    # No numeric column, so the numeric-only repair must not be advertised here.
+    assert "numeric(p,s)[]" not in lossy.remediation
+
+    # Both classes on one table: the dead-lettering one leads and the column-level ones are
+    # marked as a SEPARATE finding, not as a softer restatement of it.
+    both = check_columns_replicable(
+        _table("app.orders"),
+        _pg_facts_healthy(
+            cdc_uncarryable_columns=_uncarryable(
+                ("b_arr", "bytea[]", UNCARRYABLE_ROW_DEAD_LETTERS),
+                ("iv_arr", "interval[]", UNCARRYABLE_COLUMN_ARRIVES_NULL),
+                ("xml_arr", "xml[]", UNCARRYABLE_COLUMN_ARRIVES_NULL),
+            )
+        ),
+    )
+    assert both is not None
+    assert both.detail.startswith("CDC cannot render `b_arr` (bytea[])")
+    assert "Separately, `iv_arr` (interval[]), `xml_arr` (xml[]) are dropped" in both.detail
+    assert "they arrive NULL" in both.detail, "two columns -> plural"
+
+
+def test_uncarryable_columns_warn_and_do_not_block_the_deploy_or_the_full_load() -> None:
+    """WARN, not FAIL -- and the counterfactual is asserted, because it is the whole reason.
+
+    A required FAIL would set can_proceed=False, and full_load_run_guard_reason ends in
+    prerequisite_block_reason(report, mode=CDC) -- the mode a "Full load + CDC" run checks
+    -- so it would disable the FULL LOAD button. Full Load carries every one of these
+    columns correctly (CAST(to_jsonb(col) AS text)), and no route in the UI can clear the
+    finding (column.exclude.list is offered for oversized LOB columns only, and the capture
+    set follows the table selection), so a FAIL would be an unclearable dead end that stops
+    the one operation that works.
+    """
+    from dsql_migrator.core.prerequisites_postgres import (
+        UNCARRYABLE_ROW_DEAD_LETTERS,
+        check_columns_replicable,
+        check_postgres_cdc_prerequisites,
+    )
+    from dsql_migrator.ui.data_migration._models import (
+        cdc_prerequisite_block_reason,
+        prerequisite_block_reason,
+    )
+
+    facts = _pg_facts_healthy(
+        replica_identity={"app.orders": "d"},
+        unlogged={"app.orders": False},
+        cdc_uncarryable_columns=_uncarryable(
+            ("b_arr", "bytea[]", UNCARRYABLE_ROW_DEAD_LETTERS)
+        ),
+    )
+    row = check_columns_replicable(_table("app.orders"), facts)
+    assert row is not None
+    assert row.status is PrerequisiteStatus.WARN
+    assert row.required is False
+
+    results = check_postgres_cdc_prerequisites(facts, [_table("app.orders")])
+    assert [r for r in results if r.check_id is PrerequisiteCheckId.COLUMN_REPLICABLE] == [
+        row
+    ], "registered per table in the aggregate, exactly once"
+    report = PrerequisiteReport.build(mode=MigrationMode.CDC, results=results)
+    assert report.can_proceed is True
+    assert cdc_prerequisite_block_reason(report) is None, "Deploy stays reachable"
+    assert prerequisite_block_reason(report, mode=MigrationMode.CDC) is None
+
+    # The counterfactual: the same row graded as a required FAIL takes the Full Load with it.
+    blocking = PrerequisiteReport.build(
+        mode=MigrationMode.CDC,
+        results=[
+            r.model_copy(update={"status": PrerequisiteStatus.FAIL, "required": True})
+            if r.check_id is PrerequisiteCheckId.COLUMN_REPLICABLE
+            else r
+            for r in results
+        ],
+    )
+    assert prerequisite_block_reason(blocking, mode=MigrationMode.CDC) is not None
+    assert cdc_prerequisite_block_reason(blocking) is not None
+
+
+def test_a_clean_table_adds_no_row_but_an_unread_catalog_still_speaks() -> None:
+    """No per-table PASS: a clean table is the norm, and a green row per table buries the
+    few that matter. Precedent: check_source_value_size, the other non-blocking,
+    type-conditional per-table check. Unknown is still reported as unknown."""
+    from dsql_migrator.core.prerequisites_postgres import check_columns_replicable
+
+    assert (
+        check_columns_replicable(
+            _table("app.orders"), _pg_facts_healthy(cdc_uncarryable_columns={})
+        )
+        is None
+    )
+    # Read, offending columns found -- but on ANOTHER table. Still nothing to say here.
+    assert (
+        check_columns_replicable(
+            _table("app.items"),
+            _pg_facts_healthy(cdc_uncarryable_columns=_uncarryable(("x", "xml[]", "r"))),
+        )
+        is None
+    )
+    unknown = check_columns_replicable(
+        _table("app.orders"), _pg_facts_healthy(cdc_uncarryable_columns=None)
+    )
+    assert unknown is not None
+    assert unknown.status is PrerequisiteStatus.INFO and unknown.required is False
+    assert "pg_catalog" in unknown.remediation
+
+
+def test_the_full_load_only_preview_keeps_the_column_row() -> None:
+    """Full-Load-only previews what CDC will additionally require, so this row belongs --
+    and its preview detail says the mode REMOVES the requirement rather than defers it."""
+    from dsql_migrator.core.prerequisites_postgres import (
+        postgres_cdc_prerequisites_skipped,
+    )
+
+    row = next(
+        r
+        for r in postgres_cdc_prerequisites_skipped()
+        if r.check_id is PrerequisiteCheckId.COLUMN_REPLICABLE
+    )
+    assert row.status is PrerequisiteStatus.SKIP
+    assert "Full Load carries every column type correctly" in row.detail
 
 
 # --- CDC_REPLICATION_OBJECTS: existence, not privilege -------------------------

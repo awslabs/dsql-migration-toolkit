@@ -34,6 +34,7 @@ from dsql_migrator.core.models import (
     ColumnDef,
     ForeignKeyDef,
     SourceConnectionConfig,
+    SourceType,
     TableDef,
     TargetConnectionConfig,
     ValidationMode,
@@ -58,6 +59,7 @@ from dsql_migrator.core.validator import (
     build_pg_checksum_sql,
     build_pg_page_checksum_first_sql,
     build_pg_page_checksum_next_sql,
+    uncompared_source_columns,
 )
 
 FIXED_NOW = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
@@ -104,7 +106,13 @@ class _FakeSourceConnection:
         pk_tokens: Optional[dict[str, list[tuple]]] = None,
         pk_sets: Optional[dict[str, list[int]]] = None,
         gtid: object = None,
+        column_types: Optional[dict[str, dict[str, str]]] = None,
     ) -> None:
+        # {table: {column: CURRENT declared type}} answered for the catalog read the
+        # stale-numeric-scale gate issues (_source_declared_column_types). Empty (the
+        # default) returns NO rows, which is the documented "nothing to compare, no
+        # gate" case -- so every existing test is unaffected.
+        self._column_types = column_types or {}
         self._counts = counts or {}
         self._checksums = checksums or {}
         # {table: [(pk, token), ...]} for the row-diff pk-token SELECT.
@@ -131,6 +139,11 @@ class _FakeSourceConnection:
         upper = sql_text.upper()
         params = parameters or {}
 
+        # The stale-scale gate's catalog read: "{schema}.{name}" -> [(column, type)].
+        # Matched FIRST: it is the only statement carrying both params.
+        if "COLUMN_TYPE" in upper or "FORMAT_TYPE(" in upper:
+            table = f"{params.get('schema')}.{params.get('name')}"
+            return _FakeRowsResult(list(self._column_types.get(table, {}).items()))
         if "@@GLOBAL.GTID_EXECUTED" in upper:
             if isinstance(self._gtid, Exception):
                 raise self._gtid
@@ -830,6 +843,50 @@ def test_checksum_excluded_columns_are_recorded_and_surfaced() -> None:
         _SOURCE_CONFIG, _TARGET_CONFIG, [table], ValidationMode.ROW_COUNT
     )
     assert rc.items[0].checksum_excluded_columns == []
+
+
+def test_the_excluded_column_disclosure_is_source_engine_aware(monkeypatch) -> None:
+    """The disclosure must name exactly what the renderers omit -- which differs by engine.
+
+    A PostgreSQL source's scalar float columns ARE value-compared (one ``to_jsonb``
+    expression renders both ends), so naming them here would tell the operator a column was
+    unverified when it was -- and the inverse drift (staying silent about a column that was
+    NOT compared) is the false-"every column verified" this disclosure exists to prevent.
+    Both lists therefore come from ``_checksum_omits_column``, never from a second
+    hand-maintained list of type names.
+    """
+    import dsql_migrator.core.validator as v
+
+    def _metrics_table():
+        table = _table("metrics", columns=("id", "ratio", "meta"))
+        table.columns[1].mysql_type = "double precision"
+        table.columns[1].target_type = "double precision"
+        table.columns[2].mysql_type = "json"
+        table.columns[2].target_type = "json"
+        return table
+
+    source = _FakeSourceConnection(counts={"metrics": 2}, checksums={"metrics": "42"})
+    target = _FakeTargetConnection(counts={"metrics": 2}, checksums={"metrics": "42"})
+
+    # A PostgreSQL source: only the json column is omitted. (The PG source readers are
+    # stubbed because the fakes speak the MySQL shape; the disclosure is what is under test.)
+    monkeypatch.setattr(v, "_source_checksum_for", lambda d, c, t, ps, **k: "42")
+    monkeypatch.setattr(v, "_source_row_count_live", lambda d, c, t, ps, **k: 2)
+    pg_config = SourceConnectionConfig(
+        host="db.example.com", database="app", source_type=SourceType.POSTGRES
+    )
+    pg_report = _validator(source, target).validate(
+        pg_config, _TARGET_CONFIG, [_metrics_table()], ValidationMode.CHECKSUM
+    )
+    assert pg_report.items[0].checksum_excluded_columns == ["meta"]
+
+    # The SAME column shape on a MySQL source omits the float too (MySQL's float text is
+    # not PostgreSQL's to_jsonb text -- comparing them would false-MISMATCH).
+    monkeypatch.undo()
+    my_report = _validator(source, target).validate(
+        _SOURCE_CONFIG, _TARGET_CONFIG, [_metrics_table()], ValidationMode.CHECKSUM
+    )
+    assert my_report.items[0].checksum_excluded_columns == ["ratio", "meta"]
 
 
 def test_deliberate_data_mismatch_with_equal_counts_is_not_a_match() -> None:
@@ -1715,26 +1772,39 @@ def test_checksum_decimal_fixed_scale() -> None:
     assert "4" in pg_sql
 
 
-def test_numeric_mask_covers_full_decimal65_range() -> None:
-    # Regression: the mask integer run was 18 digits, but the MySQL side casts to
-    # DECIMAL(65, scale) and BIGINT UNSIGNED is stored as numeric(20, 0). A value
-    # like 18446744073709551615 (20 digits) overflowed the mask, making to_char
-    # emit '#' padding instead of the digits -> a spurious checksum MISMATCH on
-    # byte-identical data. The mask must span the full 65-digit integer range.
-    from dsql_migrator.core.validator import _pg_numeric_mask
+def test_pg_numeric_render_is_mask_free_and_cannot_overflow() -> None:
+    # Regression (FALSE MATCH -- the worst class here, the cut-over gate reads this
+    # verdict): the PG/DSQL numeric render used to_char(round(col, s), 'FM<64 nines>0'),
+    # a FIXED 65-digit integer mask. Both PostgreSQL and Aurora DSQL emit the OVERFLOW
+    # indicator ('####...') past it, so EVERY same-sign value >= 10^65 rendered to the
+    # same string: two numeric(80,0) tables sharing ZERO equal 66-digit values both
+    # checksummed 1738510059675055814 on local PG 17 AND on the live DSQL target, while a
+    # 65-digit control diverged correctly. It was reachable -- converter_postgres passes
+    # numeric(80,0)/numeric(100,10) through unchanged (it clamps only above DSQL's 1000
+    # precision maximum) -- and NO mask width fixes it, because a BARE ``numeric`` declares
+    # no precision to size one from. So the render must stay MASK-FREE: round() pins the
+    # scale and numeric_out emits the exact digits, which cannot overflow. This test is the
+    # loud guard: reintroducing any fixed-width mask fails here instead of silently
+    # collapsing wide values into an equal hash.
+    import dsql_migrator.core.validation_sql as validation_sql
+    from dsql_migrator.core.validator import _pg_checksum_expr
 
-    mask = _pg_numeric_mask(0)
-    integer_positions = sum(ch in "90" for ch in mask)
-    assert integer_positions >= 65
-    # BIGINT UNSIGNED max (20 digits) and DECIMAL(65,0) both fit.
-    assert integer_positions >= len("18446744073709551615")
-
-    scaled = _pg_numeric_mask(4)
-    # Fixed 4-digit fraction preserved, integer run unchanged. The separator is a
-    # LITERAL '.' (not the locale-aware 'D'), so the numeric facet is GUC-independent.
-    assert scaled.endswith(".0000")
-    assert "D" not in scaled  # no locale-aware decimal-point template
-    assert sum(ch == "9" for ch in scaled.split(".")[0]) >= 64
+    for spelling, scale in (
+        ("numeric(80,0)", 0),
+        ("numeric(100,10)", 10),
+        ("numeric(1000,500)", 500),
+        ("numeric(12,4)", 4),
+        ("numeric", 6),  # bare -> DSQL's default numeric(18,6) scale
+    ):
+        expr = _pg_checksum_expr(
+            ColumnDef(name="amount", mysql_type=spelling), source_is_postgres=True
+        ).as_string(None)
+        assert expr == f'round("amount", {scale})::text', spelling
+        # No fixed-width digit mask may come back -- that IS the overflow vector.
+        assert "to_char" not in expr, spelling
+        assert "9999" not in expr, spelling
+    # And the mask builder is gone, so it cannot be wired back in by accident.
+    assert not hasattr(validation_sql, "_pg_numeric_mask")
 
 
 def test_checksum_float_columns_excluded() -> None:
@@ -3066,3 +3136,350 @@ def test_a_pg_array_column_checksums_equal_against_its_jsonb_target() -> None:
     assert rendered("jsonb", "jsonb") == ("plain", '"tags"::text')
     assert rendered("json", "json")[1] is None
     assert rendered("text", "text") == ("plain", '"tags"::text')
+
+
+def test_a_pg_source_float_column_is_value_compared_via_to_jsonb() -> None:
+    """A PostgreSQL source's scalar real/double precision IS value-compared.
+
+    Floats used to be omitted from the CHECKSUM outright, which made a float divergence
+    invisible to the only value-level check there is -- and the CDC sink has exactly such a
+    divergence: Kafka Connect's JsonConverter serializes a float special as the JSON STRING
+    "NaN"/"Infinity"/"-Infinity" and reads it back through ``JsonNode.doubleValue()``, which
+    returns 0.0 for a non-numeric node, so the sink stores 0 (measured against
+    connect-json 3.7.0). Full Load stores the special correctly, so the two write paths
+    disagree with nothing to catch it.
+
+    A PostgreSQL source can be compared because ONE PG expression renders BOTH ends (as for
+    ``array_json``), so there is no cross-ENGINE text to reconcile. ``to_jsonb(col)::text``
+    (``float8out``'s shortest round-tripping decimal, printed plain) was measured
+    byte-identical over 2000 random float8 + 2000 random float4 bit patterns plus 0, -0.0,
+    NaN, +/-Infinity, 5e-324, 1e-45, +/-MAX and a 17-significant-digit value, stored in and
+    re-read from local PostgreSQL 17.11 and the live Aurora DSQL target (one identical md5,
+    0/4000 value diffs). End-to-end with ``build_pg_checksum_sql`` over 500 such rows: the
+    two clusters produced the same checksum; flipping NaN/+/-Infinity to 0 on the target (the
+    sink's corruption) MISMATCHED; flipping only -0.0 to +0.0 did NOT.
+
+    NOT ``col::text``: a stored -0.0 renders ``-0`` on BOTH engines (live-verified -- DSQL
+    keeps the sign bit), but the CDC path cannot deliver one (BigDecimal has no signed zero),
+    so ``::text`` would false-MISMATCH a CDC-written -0.0 while matching a Full-Loaded one.
+    ``to_jsonb`` renders both signed zeros as ``0``, so the comparison is immune to it.
+    """
+    from dsql_migrator.core.models import ColumnDef
+    from dsql_migrator.core.validation_sql import (
+        _checksum_kind,
+        _checksum_omits_column,
+        _mysql_checksum_expr,
+        _pg_checksum_expr,
+    )
+
+    for pg_type in ("real", "double precision"):
+        column = ColumnDef(name="ratio", mysql_type=pg_type, target_type=pg_type)
+        assert _checksum_kind(column) == "float", pg_type
+        expr = _pg_checksum_expr(column, True)
+        assert expr is not None and expr.as_string(None) == 'to_jsonb("ratio")::text'
+        assert _checksum_omits_column(column, True) is False, pg_type
+
+    # A MySQL source stays EXCLUDED and must: MySQL's own float text is not this text
+    # (measured on Aurora MySQL 8.0.42 -- DOUBLE 1e30 -> "1e30" vs to_jsonb's "1000...0",
+    # 1e15 -> "1e15", and FLOAT 1234567890123456.7 -> "1.23457e15", ~6 significant digits),
+    # so comparing them would false-MISMATCH most real float data. MySQL also cannot STORE
+    # a float special (CAST rejects it, ERROR 1690) and normalizes -0.0 to 0, so a MySQL
+    # source has nothing here to detect. Including floats for it would be a regression.
+    for mysql_type in ("float", "double", "float(10,2)"):
+        column = ColumnDef(name="ratio", mysql_type=mysql_type)
+        assert _checksum_kind(column) == "float", mysql_type
+        assert _mysql_checksum_expr(column) is None, mysql_type
+        assert _pg_checksum_expr(column, False) is None, mysql_type
+        assert _checksum_omits_column(column, False) is True, mysql_type
+
+    # JSON stays excluded for BOTH sources (MySQL's canonical spacing vs the sink's compact
+    # serialization); jsonb was never excluded and still is not.
+    json_column = ColumnDef(name="doc", mysql_type="json", target_type="json")
+    assert _checksum_omits_column(json_column, True) is True
+    assert _checksum_omits_column(json_column, False) is True
+
+
+# ---------------------------------------------------------------------------
+# Stale numeric render scale -> the table is UNVERIFIED, never a false MATCH
+# ---------------------------------------------------------------------------
+
+
+def test_stale_numeric_render_scale_detects_a_grown_source_scale() -> None:
+    """The measured false MATCH: the checksum rounds BOTH ends to the Step-1 scale.
+
+    Live on PostgreSQL 17.11 + Aurora DSQL with this module's own builder: an inventory
+    saying ``numeric(12,2)`` over a source now ``numeric(12,4)`` (1.2345/9.8765/5.0000)
+    and a target ``numeric(12,2)`` (1.23/9.88/5.00) BOTH checksummed
+    2909180158483770255 -- a MATCH over data differing in 2 of 3 rows. Rendering from
+    the fresh types diverged correctly (2657482466277275930 vs 2267313488618192296).
+    """
+    from dsql_migrator.core.validator import stale_numeric_render_scales
+
+    table = _table("t", columns=("id", "amt"))
+    table.columns[1].mysql_type = "numeric(12,2)"
+
+    stale = stale_numeric_render_scales(table, {"amt": "numeric(12,4)"}, True)
+    assert stale == [("amt", "numeric(12,2)", "numeric(12,4)")]
+    # A SHRUNK scale is stale too: the target still holds the extra digits the source
+    # has since dropped, and rounding to the new scale would hide exactly that.
+    table.columns[1].mysql_type = "numeric(12,4)"
+    assert stale_numeric_render_scales(table, {"amt": "numeric(12,2)"}, True)
+
+
+def test_stale_numeric_render_scale_ignores_everything_that_renders_the_same() -> None:
+    """No false alarm: only the DERIVED SCALE is compared, never the raw spelling.
+
+    The gate grades a table unverified, which blocks cut-over, so a benign difference
+    must never trip it: an unchanged column, a case/spacing difference, a
+    precision-only change, a non-numeric column, and a column absent from the fresh
+    read all render at the identical scale and are left alone. The deliberate
+    DSQL-``numeric(18,6)`` rule for a PostgreSQL bare ``numeric`` is likewise preserved
+    -- ``numeric`` and an explicit ``numeric(18,6)`` both render at scale 6 (live: a
+    bare source numeric vs its DSQL numeric(18,6) target checksummed
+    1769921147134601142 on both engines).
+    """
+    from dsql_migrator.core.validator import stale_numeric_render_scales
+
+    table = _table("t", columns=("id", "amt", "note"))
+    table.columns[1].mysql_type = "numeric(12,2)"
+    table.columns[2].mysql_type = "text"
+
+    assert stale_numeric_render_scales(table, {"amt": "numeric(12,2)"}, True) == []
+    assert stale_numeric_render_scales(table, {"amt": "NUMERIC(12, 2)"}, True) == []
+    assert stale_numeric_render_scales(table, {"amt": "numeric(20,2)"}, True) == []
+    assert stale_numeric_render_scales(table, {"note": "varchar(9)"}, True) == []
+    assert stale_numeric_render_scales(table, {}, True) == []
+
+    bare = _table("t", columns=("id", "amt"))
+    bare.columns[1].mysql_type = "numeric"
+    assert stale_numeric_render_scales(bare, {"amt": "numeric(18,6)"}, True) == []
+    # A MySQL source keeps its own rule: a paren-less type is scale 0, not DSQL's 6.
+    assert stale_numeric_render_scales(bare, {"amt": "numeric(18,6)"}, False) == [
+        ("amt", "numeric", "numeric(18,6)")
+    ]
+
+
+def test_has_numeric_checksum_column_scopes_the_extra_catalog_read() -> None:
+    from dsql_migrator.core.validator import has_numeric_checksum_column
+
+    assert has_numeric_checksum_column(_typed_table()) is True  # DECIMAL(10,4)
+    assert has_numeric_checksum_column(_table("orders")) is False
+
+
+def test_declared_column_types_read_is_parameterized_and_engine_specific() -> None:
+    """One catalog round trip, no scan, and no name interpolated into the SQL."""
+    from dsql_migrator.core.validator import _source_declared_column_types
+
+    connection = _FakeSourceConnection(column_types={"app.orders": {"amt": "decimal(9,2)"}})
+    assert _source_declared_column_types(
+        connection, "app.orders", source_is_postgres=False
+    ) == {"amt": "decimal(9,2)"}
+    assert "COLUMN_TYPE" in connection.executed[0]
+    assert "orders" not in connection.executed[0]  # bound, never interpolated
+
+    pg = _FakeSourceConnection(column_types={"app.orders": {"amt": "numeric(9,2)"}})
+    assert _source_declared_column_types(
+        pg, "app.orders", source_is_postgres=True
+    ) == {"amt": "numeric(9,2)"}
+    assert "format_type" in pg.executed[0]
+
+    # An UNqualified name issues NO query at all (both introspection modes qualify).
+    bare = _FakeSourceConnection()
+    assert _source_declared_column_types(bare, "orders", source_is_postgres=False) == {}
+    assert bare.executed == []
+
+
+def test_stale_numeric_scale_grades_the_table_unverified_instead_of_matching() -> None:
+    """End to end: the drifted table is reported as NOT compared, naming the column.
+
+    Reuses the existing per-table ``error`` (the representation every other
+    "could not be compared" case uses), so ``matched`` is False, the run counts an
+    errored table and cut-over stays blocked -- rather than the checksum rounding the
+    difference away and releasing the gate on a false MATCH.
+    """
+    table = _table("app.orders", columns=("id", "amt"))
+    table.columns[1].mysql_type = "decimal(12,2)"
+    source = _FakeSourceConnection(
+        counts={"app.orders": 3},
+        checksums={"app.orders": "555"},
+        column_types={"app.orders": {"amt": "decimal(12,4)"}},
+    )
+    target = _FakeTargetConnection(counts={"app.orders": 3}, checksums={"app.orders": "555"})
+
+    report = _validator(source, target).validate(
+        _SOURCE_CONFIG, _TARGET_CONFIG, [table], ValidationMode.CHECKSUM
+    )
+
+    item = report.items[0]
+    assert item.matched is False
+    assert report.is_match is False
+    assert item.error is not None
+    assert "'amt' was decimal(12,2), is now decimal(12,4)" in item.error
+    assert "Step 1 (Evaluation)" in item.error
+    assert item.error.startswith("The source column type changed")
+    # The untrustworthy table costs no scan: the gate runs before any count/checksum.
+    assert item.checksum_match is None
+    assert not any("COUNT(" in statement.upper() for statement in source.executed)
+
+
+def test_unchanged_numeric_scale_still_compares_and_matches() -> None:
+    """The control: an up-to-date inventory is compared exactly as before.
+
+    Live counterpart on PostgreSQL 17.11 + Aurora DSQL: source and target both
+    ``numeric(12,2)`` checksummed 2909180158483770255 on BOTH engines and reported
+    MATCH with the gate in place.
+    """
+    table = _table("app.orders", columns=("id", "amt"))
+    table.columns[1].mysql_type = "decimal(12,2)"
+    source = _FakeSourceConnection(
+        counts={"app.orders": 3},
+        checksums={"app.orders": "555"},
+        column_types={"app.orders": {"amt": "decimal(12,2)"}},
+    )
+    target = _FakeTargetConnection(counts={"app.orders": 3}, checksums={"app.orders": "555"})
+
+    report = _validator(source, target).validate(
+        _SOURCE_CONFIG, _TARGET_CONFIG, [table], ValidationMode.CHECKSUM
+    )
+    assert report.items[0].matched is True
+    assert report.items[0].error is None
+
+
+def test_stale_inventory_gate_costs_exactly_one_catalog_read_per_table() -> None:
+    """Cost: ONE catalog round trip per table per run -- in EVERY mode, no scan.
+
+    The read used to be issued only for a CHECKSUM-mode table with a numeric column
+    (the rounding could hide data only there). It is now unconditional because the SAME
+    read is what detects a source column the inventory never knew about -- which NO mode
+    can see, since both checksums render from the inventory's column list and an added
+    column changes no row count. Still one statement per table and still catalog-only:
+    keyed on schema+table, no row is scanned.
+    """
+    table = _table("app.orders", columns=("id", "amt"))
+    table.columns[1].mysql_type = "decimal(12,2)"
+    source = _FakeSourceConnection(
+        counts={"app.orders": 3},
+        checksums={"app.orders": "555"},
+        column_types={"app.orders": {"id": "int", "amt": "decimal(12,2)"}},
+    )
+    target = _FakeTargetConnection(counts={"app.orders": 3}, checksums={"app.orders": "555"})
+
+    rc = _validator(source, target).validate(
+        _SOURCE_CONFIG, _TARGET_CONFIG, [table], ValidationMode.ROW_COUNT
+    )
+    assert rc.items[0].matched is True
+    assert sum("COLUMN_TYPE" in statement for statement in source.executed) == 1
+
+    # A CHECKSUM table with no numeric column reads the catalog too -- and exactly once.
+    plain = _FakeSourceConnection(
+        counts={"app.orders": 1},
+        checksums={"app.orders": "7"},
+        column_types={"app.orders": {"id": "int", "name": "varchar(10)"}},
+    )
+    plain_target = _FakeTargetConnection(
+        counts={"app.orders": 1}, checksums={"app.orders": "7"}
+    )
+    report = _validator(plain, plain_target).validate(
+        _SOURCE_CONFIG,
+        _TARGET_CONFIG,
+        [_table("app.orders", columns=("id", "name"))],
+        ValidationMode.CHECKSUM,
+    )
+    assert report.items[0].matched is True
+    assert sum("COLUMN_TYPE" in statement for statement in plain.executed) == 1
+
+
+# ---------------------------------------------------------------------------
+# A source column the Step-1 inventory never knew about -> UNVERIFIED, not MATCH
+# ---------------------------------------------------------------------------
+
+
+def test_uncompared_source_columns_finds_only_the_invisible_direction() -> None:
+    """Pure: the set difference that no mode can see, minus the deliberate omissions.
+
+    Measured live (PostgreSQL 17.11 source + Aurora DSQL target, this module's own
+    builders): an inventory of ``['id','a']`` over a source that also has ``b`` made
+    BOTH checksums 987905485956210544 -- ``is_match=True`` -- while the target's ``b``
+    was NULL for every row. Rendering the fresh list diverged correctly
+    (943003607892099298 vs 935816152238645185).
+    """
+    table = _table("app.orders", columns=("id", "a"))
+
+    assert uncompared_source_columns(table, {"id": "int", "a": "text"}) == ()
+    assert uncompared_source_columns(table, {"id": "int", "a": "text", "b": "text"}) == (
+        "b",
+    )
+    # An operator-excluded column (oversized LOB) is legitimately uncompared and already
+    # disclosed by the report -- reporting it here would false-alarm every such run.
+    assert (
+        uncompared_source_columns(
+            table, {"id": "int", "a": "text", "big": "text"}, ("big",)
+        )
+        == ()
+    )
+    # The OTHER direction is never reported: the checksum render names the column, so
+    # the source query fails UndefinedColumn on its own (measured), and a partial
+    # catalog read must not be mistaken for a dropped column.
+    assert uncompared_source_columns(table, {"id": "int"}) == ()
+
+
+def test_source_added_column_grades_the_table_unverified_in_every_mode() -> None:
+    """End to end: the false MATCH becomes an unverified table that blocks cut-over.
+
+    Reuses the existing per-table ``error`` (the representation every other "could not
+    be compared" case uses), so ``matched`` is False, the report is not a match, and
+    ``cutover_release_state`` stays blocked on ``errored_tables``. ROW_COUNT is gated
+    too: an added column changes no count, so that mode is just as blind.
+    """
+    table = _table("app.orders", columns=("id", "amt"))
+    for mode in (ValidationMode.CHECKSUM, ValidationMode.ROW_COUNT):
+        source = _FakeSourceConnection(
+            counts={"app.orders": 3},
+            checksums={"app.orders": "555"},
+            column_types={
+                "app.orders": {"id": "int", "amt": "decimal(12,2)", "note": "text"}
+            },
+        )
+        target = _FakeTargetConnection(
+            counts={"app.orders": 3}, checksums={"app.orders": "555"}
+        )
+        report = _validator(source, target).validate(
+            _SOURCE_CONFIG, _TARGET_CONFIG, [table], mode
+        )
+        item = report.items[0]
+        assert item.matched is False
+        assert report.is_match is False
+        assert item.error is not None and "'note'" in item.error
+        assert "Step 1 (Evaluation)" in item.error
+        # Graded BEFORE anything is compared, so the untrustworthy table costs no scan.
+        assert not any("SUM" in statement for statement in source.executed)
+
+
+def test_migration_excluded_columns_keep_a_deliberate_omission_matching() -> None:
+    """The oversized-LOB exclusion must still MATCH -- it is an operator-chosen omission.
+
+    ``run_validation`` strips those columns from the ``TableDef`` before the comparison,
+    so the validator would otherwise see them as columns the inventory never knew about.
+    Verified live through ``run_validation`` against Aurora DSQL: with the exclusion
+    passed, a table whose ``big`` column holds no target data reports ``matched=True``
+    with ``migration_excluded_columns=['big']``; without it, the gate fires.
+    """
+    table = _table("app.orders", columns=("id", "amt"))
+    fresh = {"app.orders": {"id": "int", "amt": "decimal(12,2)", "big": "longtext"}}
+
+    def _run(excluded):
+        source = _FakeSourceConnection(
+            counts={"app.orders": 3}, checksums={"app.orders": "555"}, column_types=fresh
+        )
+        target = _FakeTargetConnection(
+            counts={"app.orders": 3}, checksums={"app.orders": "555"}
+        )
+        engine = _FakeSourceEngine(source)
+        return Validator(
+            source_engine_factory=lambda _conn: engine,
+            target_connection_factory=lambda _target: target,
+            migration_excluded_columns=excluded,
+        ).validate(_SOURCE_CONFIG, _TARGET_CONFIG, [table], ValidationMode.CHECKSUM)
+
+    assert _run({"app.orders": {"big"}}).items[0].matched is True
+    assert _run(None).items[0].error is not None

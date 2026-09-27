@@ -216,6 +216,17 @@ class DataMigrationState:
         # Identities of dead letters already written to the DURABLE activity log, so a
         # re-surfaced record is audited once (the write is append-only and permanent).
         self.cdc_dlq_audited_keys: set = set()
+        # Columns the SOURCE connector could not convert and therefore delivered as NULL
+        # (the row itself was applied). Sticky, and keyed by (table, column, type): the
+        # same value fails on every row that carries it, so the fact is "this column
+        # arrives NULL", never a count. Held HERE rather than on the controller because
+        # the controller is rebuilt on every CDC discovery probe. Deliberately separate
+        # from every cdc_dlq_* field above -- these rows were NOT quarantined and must
+        # never be added to the dead-letter depth a cut-over decision reads.
+        self.cdc_value_conversion_failures: list = []
+        # ...and the ones already written to the DURABLE activity log, so the 5 s poll
+        # writes one line per column, once (same guard as cdc_dlq_audited_keys).
+        self.cdc_value_conversion_audited_keys: set = set()
         # Outcome of the explicit "Apply foreign keys" action on this step:
         # (applied, skipped, failed), or None while it has not been run. Foreign keys are
         # no longer applied as part of the load (the orphan pre-check is O(child rows) and

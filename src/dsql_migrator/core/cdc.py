@@ -447,9 +447,13 @@ class SchemaDriftKind(str, Enum):
     matches the target -- DSQL rejects it with a telltale SQLSTATE and the sink
     quarantines the row to the DLQ. Mapping that SQLSTATE back to a drift kind lets
     the tool surface "the schema changed" instead of an opaque quarantine.
-    Detection only -- the recovery (manual target ALTER, then per-table Reload to
-    backfill missing rows) stays operator-driven (the tool never auto-alters the
-    target: Property 6, no silent schema mutation).
+    Detection only -- the recovery stays operator-driven (the tool never auto-alters the
+    target: Property 6, no silent schema mutation). That recovery is a manual target
+    ALTER to stop NEW rows being set aside, then, to backfill the ones already set aside,
+    re-run Step 1 (Evaluation) + stop CDC + reload the table with 'Drop & reload': the
+    Full Load's column list comes from the Step 1 inventory (so it would not even read
+    the new column) and an append reload never rewrites a primary key the target already
+    has, so a plain per-table Reload repairs neither half.
 
     Most kinds are SOURCE-side, but ``MISSING_TABLE`` is TARGET-side: the target table
     the sink writes to has gone away underneath a live stream. It is in this enum
@@ -487,6 +491,17 @@ class SchemaDriftKind(str, Enum):
     # (`CAST(to_jsonb(col) AS text)`), so only a str is ever bound -- the two write paths
     # differ in exactly one place: WHERE the array becomes JSON.
     UNBINDABLE_VALUE = "unbindable-value"  # 07006 invalid_parameter_type
+    # A source TRUNCATE. Not a schema change and not a target-side loss -- the OPPOSITE of
+    # every kind above: the target ends up with EXTRA rows, not missing ones. Classified
+    # because it is otherwise completely silent. Debezium's `skipped.operations` defaults to
+    # "t", so a source TRUNCATE produced no record at all (live-measured on PostgreSQL 17.7:
+    # source 1 row, target 10 rows, permanently, with a flat SourceRecordPollRate for that
+    # minute); the cdc-stack's PostgreSQL source now sets `skipped.operations: none`, and since
+    # Aurora DSQL has no TRUNCATE statement there is no correct apply, so the sink dead-letters
+    # the event by name (DebeziumEvents.truncateNotApplicable). This is what turns that single,
+    # sub-badge-threshold quarantine into a banner -- otherwise only Validation's row
+    # count/checksum would ever report it, after the cut-over decision was already being made.
+    SOURCE_TRUNCATE = "source-truncate"  # sink code SOURCE_TRUNCATE (no SQLSTATE)
 
 
 # SQLSTATE -> drift kind. Only STRUCTURAL rejections (tied to the row's column set
@@ -501,6 +516,13 @@ class SchemaDriftKind(str, Enum):
 # that table is dead-lettered with the offset committed and no retry -- a silent,
 # per-table data hole. Unmapped, it rendered as an ordinary poison row: no banner, and
 # under 50 records not even an amber DLQ badge.
+#
+# SOURCE_TRUNCATE is the one key that is NOT a SQLSTATE: the sink refuses a source TRUNCATE
+# before it sends anything to DSQL, so there is no server error and no SQLSTATE to report --
+# exactly like the oversized-value guard, whose synthetic OVERSIZED_VALUE_CODE is deliberately
+# left UNMAPPED here. This one IS mapped because the divergence it reports is real and
+# invisible to every other CDC-time surface. Both synthetic codes are non-5-character by
+# construction, so neither can ever collide with a real SQLSTATE.
 _DRIFT_BY_SQLSTATE: dict[str, SchemaDriftKind] = {
     "42703": SchemaDriftKind.ADD_COLUMN,
     "23502": SchemaDriftKind.DROP_COLUMN,
@@ -509,6 +531,7 @@ _DRIFT_BY_SQLSTATE: dict[str, SchemaDriftKind] = {
     "3F000": SchemaDriftKind.MISSING_TABLE,
     "23505": SchemaDriftKind.UNIQUE_CONFLICT,
     "07006": SchemaDriftKind.UNBINDABLE_VALUE,
+    "SOURCE_TRUNCATE": SchemaDriftKind.SOURCE_TRUNCATE,
 }
 
 

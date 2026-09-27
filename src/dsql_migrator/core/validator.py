@@ -12,9 +12,9 @@ and produces a :class:`~dsql_migrator.core.models.ValidationReport`
   :attr:`~dsql_migrator.core.models.ValidationMode.CHECKSUM` mode an
   order-independent per-table checksum is computed on both sides and compared, so
   a reported match means the data itself is equal FOR EVERY COMPARED COLUMN. Note
-  FLOAT/DOUBLE and JSON columns are NOT value-compared (no byte-identical
-  cross-engine form -- see the checksum note below); each table lists them in
-  ``checksum_excluded_columns`` so a match is not read as "every column verified".
+  JSON columns -- and, for a MySQL source only, FLOAT/DOUBLE -- are NOT value-compared
+  (no byte-identical cross-engine form -- see the checksum note below); each table lists
+  them in ``checksum_excluded_columns`` so a match is not read as "every column verified".
 - Optional orphan-record check (Requirement 6.3): Aurora DSQL now enforces foreign
   keys, and the tool re-creates them through the explicit "Apply foreign keys" action
   after the load (at cut over for a CDC migration) -- not automatically. This check is
@@ -58,13 +58,16 @@ NORMALIZED so equal data hashes equally on both sides: the NULL sentinel, bytea 
 spatial WKB, BIT(n), boolean, and the temporal (timestamp / timestamptz / time)
 and DECIMAL type-classes each render to the SAME canonical text on MySQL and
 PostgreSQL (driven by the same converter classification the Full Load loader used
-to STORE the value). The exceptions are FLOAT / DOUBLE and JSON: no byte-identical
-cross-engine text form exists (a float has no exact shortest-round-trip decimal and
-any fixed-precision rounding would degrade soundness for exact values; MySQL's
-canonical JSON differs from the CDC sink's compact serialization), so those columns
-are intentionally EXCLUDED from the checksum concatenation entirely
-(:func:`_checksum_kind` returns ``"float"``/``"json"`` and both renderers return
-``None`` for them). IMPORTANT: a difference confined to a NON-KEY float/double/json
+to STORE the value). The exceptions are JSON, and FLOAT / DOUBLE for a MySQL source
+only: no byte-identical cross-engine text form exists (MySQL's float text keeps an
+exponent and only ~6 significant digits for a FLOAT; MySQL's canonical JSON differs
+from the CDC sink's compact serialization), so those columns are intentionally
+EXCLUDED from the checksum concatenation entirely (:func:`_checksum_kind` returns
+``"float"``/``"json"`` and the renderers return ``None`` for them). A PostgreSQL
+source's scalar float columns ARE value-compared: there the ONE PG renderer produces
+both ends, so ``to_jsonb(col)::text`` -- measured byte-identical across 4000 random
+float8/float4 bit patterns and every special on PostgreSQL 17.11 and live Aurora DSQL
+-- compares them. IMPORTANT: a difference confined to a NON-KEY excluded column's
 value is therefore NOT detected by any mode -- the row count is unchanged by an
 in-place value edit and reconciliation compares primary-key presence, not values. To
 keep that honest rather than a silent blind spot, each :class:`TableValidationResult`
@@ -120,12 +123,12 @@ from dsql_migrator.core.validation_sql import (  # noqa: F401
     _INTEGER_BASE_TYPES,
     _NULL_SENTINEL,
     _checksum_kind,
+    _checksum_omits_column,
     _decimal_scale,
     _mysql_checksum_expr,
     _mysql_concat_term,
     _pg_checksum_expr,
     _pg_concat_term,
-    _pg_numeric_mask,
     _pg_table_identifier,
     _quote_mysql_identifier,
     _quote_mysql_table,
@@ -144,8 +147,10 @@ from dsql_migrator.core.validation_sql import (  # noqa: F401
     build_pg_pk_first_page_sql,
     build_pg_pk_next_page_sql,
     build_pg_pk_token_sql,
+    has_numeric_checksum_column,
     integer_pk_column,
     single_pk_column,
+    stale_numeric_render_scales,
 )
 
 
@@ -260,6 +265,172 @@ def _source_pk_tokens(
     statement = text(build_mysql_pk_token_sql(table, pk_column))
     result = connection.execute(statement, {"sample_size": sample_size})  # type: ignore[attr-defined]
     return {_norm_pk(row[0]): str(row[1]) for row in result}
+
+
+# The source's CURRENT declared column types for ONE table, in the SAME spelling Step 1
+# (Evaluation) records -- MySQL ``COLUMN_TYPE`` (not ``DATA_TYPE``: it keeps the
+# precision/scale/unsigned detail the render depends on, the same choice
+# ``introspector.enrich_columns`` makes) and PostgreSQL
+# ``format_type(atttypid, atttypmod)`` (the same expression ``_pg_enrich_columns`` and
+# ``cdc_schema_evolve.read_source_columns`` use). Catalog-only and keyed on
+# schema+table: no table scan, no lock, one round trip -- read inside the validation
+# snapshot, so it keeps the source read-only (Property 1).
+_MYSQL_COLUMN_TYPES_SQL = (
+    "SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.COLUMNS "
+    "WHERE TABLE_SCHEMA = :schema AND TABLE_NAME = :name"
+)
+_PG_COLUMN_TYPES_SQL = (
+    "SELECT a.attname, format_type(a.atttypid, a.atttypmod) "
+    "FROM pg_catalog.pg_attribute a "
+    "JOIN pg_catalog.pg_class c ON c.oid = a.attrelid "
+    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "WHERE c.relname = :name AND n.nspname = :schema "
+    "AND a.attnum > 0 AND NOT a.attisdropped"
+)
+
+
+def _source_declared_column_types(
+    connection: _SourceConnection, table_name: str, *, source_is_postgres: bool
+) -> dict[str, str]:
+    """Read ``{column: current declared type}`` for ``table_name`` from the source.
+
+    The ONE catalog read behind :func:`_stale_inventory_error`, serving BOTH of its
+    checks: the column-NAME set (a source column the Step-1 inventory never knew about,
+    which neither side would compare -- see :func:`uncompared_source_columns`) and the
+    numeric render scale (see
+    :func:`~dsql_migrator.core.validation_sql.stale_numeric_render_scales`). Both
+    introspection modes qualify every table as ``schema.object``
+    (``introspector._assemble_inventory``), so the name is split on the first dot; an
+    UNqualified name returns ``{}`` (nothing to compare, no gate) rather than guessing a
+    schema. An empty result for a qualified name (the table was renamed/dropped on the
+    source) also returns ``{}`` and is not treated as drift -- the very next statement
+    reads that table's row count and fails loudly on its own, which is the clearer
+    report.
+    """
+    schema, separator, name = table_name.partition(".")
+    if not (separator and schema and name):
+        return {}
+    statement = _PG_COLUMN_TYPES_SQL if source_is_postgres else _MYSQL_COLUMN_TYPES_SQL
+    result = connection.execute(  # type: ignore[attr-defined]
+        text(statement), {"schema": schema, "name": name}
+    )
+    return {str(row[0]): str(row[1]) for row in result}
+
+
+def uncompared_source_columns(
+    table: TableDef,
+    fresh_types: "Mapping[str, str]",
+    migration_excluded: "Iterable[str]" = (),
+) -> tuple[str, ...]:
+    """Source columns this validation compares on NEITHER side. Pure.
+
+    Both the source AND the target checksum are rendered from the SAME Step-1
+    (Evaluation) column list (``table.columns``), so a column ADDED on the source after
+    Step 1 is absent from both renders -- the two checksums agree over data that
+    differs, a FALSE MATCH that releases the cut-over gate (measured live: a PostgreSQL
+    17.11 source whose inventory said ``['id','a']`` checksummed 987905485956210544 on
+    both ends while the target's column ``b`` was NULL for every row; rendering the
+    fresh column list diverged correctly). Row counts cannot see it either -- an added
+    column changes no count -- so nothing in the report contradicts the match.
+
+    ``migration_excluded`` are the columns the OPERATOR chose to leave behind (the
+    oversized-LOB exclusion, ``ValidationInputs.excluded_columns``). ``run_validation``
+    strips those from ``table.columns`` before the Validator runs precisely so a column
+    with no target data cannot false-mismatch, so they are legitimately uncompared and
+    must NOT be reported here -- the finished report discloses them separately via
+    :func:`with_migration_excluded_columns`.
+
+    Only this direction is reported. A column the inventory has but the source no longer
+    does is already surfaced: the checksum render names it, so the SOURCE query fails
+    ``UndefinedColumn`` and the table is graded unverified by the per-table error path
+    (measured: ``'ProgrammingError: (psycopg.errors.UndefinedColumn) column "b" does not
+    exist'``). Reporting a subset difference in that direction would also false-alarm on
+    a partial catalog read, which this function must never do.
+    """
+    compared = {column.name for column in table.columns}
+    return tuple(
+        sorted(set(fresh_types) - compared - set(migration_excluded))
+    )
+
+
+def _stale_inventory_error(
+    connection: _SourceConnection,
+    table: TableDef,
+    mode: ValidationMode,
+    source_dialect: SourceDialect,
+    *,
+    migration_excluded: "Iterable[str]" = (),
+) -> Optional[str]:
+    """Why this table's comparison cannot be trusted, or ``None`` when it can.
+
+    Two ways the Step-1 (Evaluation) inventory -- which is persisted with the session and
+    NOT re-introspected -- can make the comparison lie, both closed by the SAME single
+    catalog read of the source's CURRENT columns:
+
+    1. **A column the inventory does not know about** (any mode). Both checksums render
+       from the inventory's column list, so a source-added column is compared by neither
+       end and row counts cannot see it either -- see
+       :func:`uncompared_source_columns`.
+    2. **A numeric column whose declared scale moved** (CHECKSUM only). The CHECKSUM
+       renders a ``numeric`` column by ROUNDING both ends to the scale declared at
+       Step 1. That rounding is deliberate and stays (a stored-scale / trailing-zero
+       difference, and DSQL's ``numeric(18,6)`` default, must still compare equal) -- but
+       a source column whose scale GREW has its extra digits rounded away on BOTH sides,
+       so unequal data hashes EQUALLY (measured; see
+       :func:`~dsql_migrator.core.validation_sql.stale_numeric_render_scales`).
+
+    Either way the table is graded UNVERIFIED using the existing per-table ``error``
+    field -- the representation every other "could not be compared" case already uses, so
+    ``matched`` is False, the run reports "N table(s) could not be compared", and
+    ``cutover_release_state`` stays ``blocked`` (it blocks on ``errored_tables``) until
+    the operator refreshes Step 1. Fail closed, never fail silent.
+
+    Cost: ONE catalog round trip per table per run, on the ALREADY-OPEN source
+    connection, keyed on schema+table -- no scan, no lock, no per-row work. It replaces
+    the read that was previously issued only for a CHECKSUM-mode table with a numeric
+    column; a CHECKSUM run of that shape therefore adds nothing, and every other run
+    adds exactly one catalog read per table (negligible beside the paged count/checksum
+    scans that same table already costs). An empty result -- the source user cannot read
+    the catalog, or the table was renamed/dropped -- adds no gate; the very next
+    statement reads that table and fails loudly on its own. A catalog read that RAISES
+    propagates to :meth:`Validator._validate_table` and grades the table unverified, so
+    a denied read fails closed.
+    """
+    source_is_postgres = _source_is_postgres(source_dialect)
+    fresh_types = _source_declared_column_types(
+        connection, table.name, source_is_postgres=source_is_postgres
+    )
+    if not fresh_types:
+        return None
+    uncompared = uncompared_source_columns(table, fresh_types, migration_excluded)
+    if uncompared:
+        names = ", ".join(f"'{name}'" for name in uncompared)
+        return (
+            "The source has column(s) the Step 1 (Evaluation) inventory does not know "
+            f"about, so NEITHER side compared them -- {names}. Both the source and the "
+            "target are rendered from the column list recorded at Evaluation, and a row "
+            "count cannot see an added column either, so a match here would be reported "
+            "over data that may differ entirely. Re-run Step 1 (Evaluation) to refresh "
+            "the inventory, make sure the target table has the column and its data, "
+            "then re-run Validation."
+        )
+    if mode is not ValidationMode.CHECKSUM or not has_numeric_checksum_column(table):
+        return None
+    stale = stale_numeric_render_scales(table, fresh_types, source_is_postgres)
+    if not stale:
+        return None
+    detail = "; ".join(
+        f"'{column}' was {recorded}, is now {current}"
+        for column, recorded, current in stale
+    )
+    return (
+        "The source column type changed since Step 1 (Evaluation), so the "
+        f"checksum cannot be trusted for this table -- {detail}. The checksum compares "
+        "both sides at the scale recorded at Evaluation, which would round the extra "
+        "digits away on BOTH ends and report a match over data that differs. Re-run "
+        "Step 1 (Evaluation) to refresh the inventory (and re-check the target column's "
+        "type in Step 2), then re-run Validation."
+    )
 
 
 def _source_gtid(connection: _SourceConnection) -> Optional[str]:
@@ -1040,6 +1211,7 @@ class Validator:
         target_connection_factory: Optional[TargetConnectionFactory] = None,
         row_diff_sample_size: int = 0,
         reconcile_page_size: int = _RECONCILE_PAGE_SIZE,
+        migration_excluded_columns: Optional[Mapping[str, "Iterable[str]"]] = None,
     ) -> None:
         """Create a validator with optional injected source/target factories.
 
@@ -1054,7 +1226,20 @@ class Validator:
         ``reconcile_page_size`` is the keyset page size used by the full PK-set
         reconciliation (Property 7: PK values only); kept injectable so a test can
         force multi-page streaming with a tiny table.
+
+        ``migration_excluded_columns`` ({table: column names}) are the columns the
+        OPERATOR chose to leave out of the migration (the oversized-LOB exclusion).
+        ``run_validation`` already strips them from each ``TableDef`` before the
+        comparison, so the validator would otherwise see them as source columns compared
+        by neither side; passing them here keeps :func:`uncompared_source_columns` from
+        false-alarming on a deliberate, already-disclosed omission. Taken at
+        construction (the factory has the run's inputs in hand) so it is set once and
+        read-only -- safe for the parallel path, and no fake validator signature changes.
         """
+        self._migration_excluded_columns: dict[str, frozenset[str]] = {
+            name: frozenset(columns)
+            for name, columns in (migration_excluded_columns or {}).items()
+        }
         self._source_engine_factory = source_engine_factory or _default_engine_factory
         self._target_connection_factory = (
             target_connection_factory or _default_target_connection_factory
@@ -1512,7 +1697,33 @@ class Validator:
         false equality); a count DISAGREEMENT still triggers the full deep checks
         so the exact diverging rows are found. Soundness is preserved: ``matched``
         only credits checks that actually ran.
+
+        Before anything is compared, a table whose Step-1 inventory has gone stale is
+        graded UNVERIFIED via the per-table ``error`` (see :func:`_stale_inventory_error`):
+        a source column the inventory does not know about is compared by NEITHER side
+        (and changes no row count), and a CHECKSUM numeric render scale that moved would
+        round a real difference away on both ends. Checked FIRST so the untrustworthy
+        table costs no scan at all.
         """
+        stale_inventory_error = _stale_inventory_error(
+            source_connection,
+            table,
+            mode,
+            source_dialect,
+            migration_excluded=self._migration_excluded_columns.get(
+                table.name, frozenset()
+            ),
+        )
+        if stale_inventory_error is not None:
+            return TableValidationResult(
+                table=table.name,
+                source_row_count=0,
+                target_row_count=0,
+                row_count_match=False,
+                matched=False,
+                error=stale_inventory_error,
+            )
+
         source_row_count = self._source_row_count(
             source_connection, table, watermark, source_dialect,
             self._reconcile_page_size,
@@ -1557,13 +1768,19 @@ class Validator:
             )
             checksum_match = source_checksum == target_checksum
             # Columns the checksum could not value-compare (no byte-identical
-            # cross-engine text form): FLOAT/DOUBLE and JSON. Recorded so a MATCH is
-            # surfaced as "every column EXCEPT these was value-compared" -- a non-key
-            # value diff confined to such a column is invisible to every mode.
+            # cross-engine text form): JSON always, and FLOAT/DOUBLE only for a MySQL
+            # source (a PostgreSQL source renders BOTH ends with the same to_jsonb
+            # expression, so its floats ARE compared). Asked of the renderers via
+            # _checksum_omits_column so this list cannot drift from what they omit.
+            # Recorded so a MATCH is surfaced as "every column EXCEPT these was
+            # value-compared" -- a non-key value diff confined to such a column is
+            # invisible to every mode.
             checksum_excluded_columns = [
                 column.name
                 for column in table.columns
-                if _checksum_kind(column) in ("float", "json")
+                if _checksum_omits_column(
+                    column, _source_is_postgres(source_dialect)
+                )
             ]
 
         # Full PK-set reconciliation (the "no mismatched records" check): stream
@@ -2067,10 +2284,11 @@ def render_text_report(report: ValidationReport) -> str:
         f"- {match_label}: {'yes' if report.is_match else 'NO'} "
         f"({sum(1 for i in report.items if i.matched)}/{len(report.items)} tables matched)"
     )
-    # Honesty caveat (Property 9): FLOAT/DOUBLE and JSON columns have no byte-identical
-    # cross-engine form, so the CHECKSUM omits them -- a difference confined to such a
-    # NON-KEY column is invisible to every mode. Surface them so "Data identical: yes" is
-    # read as "every column EXCEPT these", not "every column verified".
+    # Honesty caveat (Property 9): some columns have no byte-identical cross-engine form,
+    # so the CHECKSUM omits them -- a difference confined to such a NON-KEY column is
+    # invisible to every mode. Surface them so "Data identical: yes" is read as "every
+    # column EXCEPT these", not "every column verified". The set is engine-dependent (see
+    # _checksum_omits_column), so the line names the COLUMNS and not a type list.
     excluded_by_table = {
         item.table: item.checksum_excluded_columns
         for item in report.items
@@ -2081,7 +2299,7 @@ def render_text_report(report: ValidationReport) -> str:
             f"{table} ({', '.join(cols)})" for table, cols in excluded_by_table.items()
         )
         lines.append(
-            "- Columns NOT value-compared (FLOAT/DOUBLE/JSON -- no cross-engine form, "
+            "- Columns NOT value-compared (no byte-identical cross-engine form, "
             f"a non-key value diff there is undetected): {detail}"
         )
     # The operator's own exclusions: a permanent data gap, not a rendering limit, so it

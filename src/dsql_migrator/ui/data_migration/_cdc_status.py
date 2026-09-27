@@ -1470,6 +1470,33 @@ def _fetch_cdc_status(migration_state, tables=None):
             except Exception:  # noqa: BLE001 - advisory, never break the poll
                 bound = None
             migration_state.cdc_dlq_coverage_bound = bound
+    # Best-effort: SOURCE-connector value-conversion failures from the SAME log group --
+    # a column the connector could not convert and delivered as NULL. Deliberately NOT
+    # part of the returned tuple and NOT folded into dlq_errors: the row LANDED, so it
+    # must never touch the quarantine count. Merged onto the state here (as the DLQ
+    # cursor bookkeeping above is) because the signal is a sticky SET that must survive a
+    # poll which read nothing new and a controller rebuild; re-reading is idempotent, so
+    # unlike the DLQ count it needs no cursor seeding.
+    conv_reader = getattr(controller, "value_conversion_failures", None)
+    if callable(conv_reader) and stack_name:
+        from dsql_migrator.core.cdc_value_conversion import VALUE_CONVERSION_MAX_TRACKED
+
+        try:
+            fresh = list(conv_reader(f"/msk-connect/{stack_name}-cdc") or [])
+        except Exception:  # noqa: BLE001 - advisory, never break the poll
+            fresh = []
+        if fresh:
+            known = list(
+                getattr(migration_state, "cdc_value_conversion_failures", None) or []
+            )
+            seen_columns = {(f.table, f.column, f.type_name) for f in known}
+            for failure in fresh:
+                key = (failure.table, failure.column, failure.type_name)
+                if key in seen_columns or len(known) >= VALUE_CONVERSION_MAX_TRACKED:
+                    continue
+                seen_columns.add(key)
+                known.append(failure)
+            migration_state.cdc_value_conversion_failures = known
     return statuses, health, dlq_errors, applied_ops, lag_ms, lag_series
 
 
@@ -1991,6 +2018,38 @@ def _apply_cdc_status(migration_state, fetched) -> None:
                 "Treat it as a minimum when deciding to cut over."
             ),
         )
+    # Value-conversion failures (a column the SOURCE connector delivered as NULL) get ONE
+    # durable line each, the first time that column is seen. NOT written as a quarantine
+    # and never counted in the DLQ depth: the row was applied. WARNING, not FAILURE --
+    # nothing broke and the stream keeps running; the blocking verdict is Validation's
+    # (step 4) checksum, which is the only thing that can see this.
+    _conversions = getattr(migration_state, "cdc_value_conversion_failures", None) or []
+    if _conversions:
+        # Function-local, matching the other activity-log writes in this module.
+        from dsql_migrator.core.activity_log import (
+            ActivityCategory,
+            ActivityStatus,
+            log_activity,
+        )
+
+        _conv_audited = migration_state.cdc_value_conversion_audited_keys
+        for _failure in _conversions:
+            _ckey = (_failure.table, _failure.column, _failure.type_name)
+            if _ckey in _conv_audited:
+                continue
+            _conv_audited.add(_ckey)
+            log_activity(
+                ActivityCategory.CDC,
+                "column value arrived NULL (source connector could not convert it)",
+                status=ActivityStatus.WARNING,
+                target=_failure.table,
+                detail=(
+                    f"{_failure.qualified_column} (type {_failure.type_name}): the source "
+                    "connector could not convert the value and delivered the column as "
+                    "NULL. The row WAS applied, so this is not a quarantined record and "
+                    "no row count can see it -- Validation's checksum is what reports it."
+                ),
+            )
     # CDC-sourced records ONLY. The key is shared with the Full Load (it IS the Full
     # Load job id whenever one ran), so an unfiltered summary put batch-loader
     # quarantines into the DLQ card -- see is_cdc_error_record.

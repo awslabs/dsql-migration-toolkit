@@ -3797,6 +3797,10 @@ _CDC_ONLY_CHECK_IDS = frozenset(
         PrerequisiteCheckId.SOURCE_IS_WRITER,
         PrerequisiteCheckId.TABLE_REPLICABLE,
         PrerequisiteCheckId.REPLICA_IDENTITY,
+        # Emphatically CDC-only: Full Load reads every one of the column types this row
+        # names as jsonb and loads them correctly, so tagging it "Full load + CDC" would
+        # report the load as affected by a gap that exists only in the stream.
+        PrerequisiteCheckId.COLUMN_REPLICABLE,
         # SLOT_WAL_RETENTION had drifted out of this set, so the CDC-handoff WAL check --
         # the PostgreSQL counterpart of BINLOG_RETENTION, which IS listed -- was tagged
         # "Full load + CDC" on the combined panel even though only CDC needs it.

@@ -669,6 +669,65 @@ def _render_cdc_slot_health(ui, migration_state) -> None:
     render_notice(ui, tone=tone, header=headline, body=detail)
 
 
+# How many named columns the value-conversion notice lists inline before it tails off
+# with "+N more" -- the same treatment cdc_applied_rollup_detail gives a long per-table
+# list, so a pathological schema cannot turn one notice into a wall of text.
+_VALUE_CONVERSION_LIST_LIMIT = 12
+
+
+def _render_cdc_value_conversion_notice(ui, migration_state) -> None:
+    """Flag columns the SOURCE connector could not convert and delivered as NULL.
+
+    Distinct from the dead-letter panel BY CONSTRUCTION, and it has to stay that way:
+    the row was APPLIED, so nothing was quarantined, the DLQ depth does not (and must
+    not) include it, and "0 quarantined" is therefore not evidence that this did not
+    happen. Reads the sticky set the CDC poll merged onto the state (see
+    :mod:`dsql_migrator.core.cdc_value_conversion`) and renders NOTHING when it is empty,
+    so it is inert on a healthy stream and for a source that has never logged one -- the
+    same render-only-when-actionable rule the schema-drift banner and the slot-health
+    notice follow. ``error`` tone because a named column is silently wrong on the target
+    for every row CDC delivered, and it stays wrong until acted on; that is the same
+    calibration ``unbindable-value`` gets, not a "be aware". Pure render (no I/O).
+
+    Publishes no COUNT on purpose: the number of affected ROWS is not knowable from these
+    log lines, and a number that looks total but is a floor is worse than no number.
+    """
+    failures = list(
+        getattr(migration_state, "cdc_value_conversion_failures", None) or []
+    )
+    if not failures:
+        return
+    shown = ", ".join(
+        f"{failure.qualified_column} (type {failure.type_name})"
+        for failure in failures[:_VALUE_CONVERSION_LIST_LIMIT]
+    )
+    more = len(failures) - _VALUE_CONVERSION_LIST_LIMIT
+    if more > 0:
+        shown = f"{shown} (+{more} more)"
+    render_notice(
+        ui,
+        tone="error",
+        header="Column values are arriving empty — the source connector cannot convert them",
+        body=(
+            "The source connector could not convert these columns and delivered them as "
+            f"NULL, so the rows WERE applied with the column empty: {shown}. Nothing was "
+            "dead-lettered, so the dead-letter panel below does not count these rows and "
+            "no row count can see them — Validation (step 4) will report the table as a "
+            "checksum MISMATCH, and it is the only surface that can. Which rows are "
+            "affected is not recorded, and the problem is broader than the columns "
+            "listed: any value the connector cannot convert fails the same way, and this "
+            "list is only what it has logged so far. The change stream cannot carry these "
+            "columns at all, so reloading the table only helps once the stream is stopped "
+            "— at cut over, stop CDC, then reload the affected table(s) with "
+            "'Drop & reload' (an append reload cannot repair them: it only inserts "
+            "primary keys the target is missing, so a row already there keeps its empty "
+            "column), then re-run Validation; if it still reports a mismatch, the value "
+            "cannot be represented on the target as it stands and has to change at the "
+            "source."
+        ),
+    )
+
+
 def _render_cdc_live_monitoring(
     ui, migration_state, job_manager, session=None, cdc_ai_opener=None,
     ai_post_event=None,
@@ -829,6 +888,11 @@ def _render_cdc_live_monitoring(
             # PostgreSQL CDC: warn about source WAL pressure (the logical slot pinning
             # WAL) before the source disk fills. No-op for a MySQL source (no slot).
             _render_cdc_slot_health(ui, migration_state)
+            # A SIBLING of the dead-letter card, never inside it: these rows landed, so
+            # rendering them within a panel titled "poison records" would invite exactly
+            # the reading this signal exists to prevent. Above the card so an error-level
+            # integrity finding is not filed under a "0 quarantined" all-clear.
+            _render_cdc_value_conversion_notice(ui, migration_state)
             _render_cdc_dlq_panel(
                 ui,
                 migration_state,
@@ -1132,13 +1196,30 @@ _DRIFT_LABELS: dict[str, tuple[str, str]] = {
         "column: Schema Conversion stores it as jsonb (DSQL has no array type) and the Full "
         "Load converts it correctly, but the change stream delivers it as a list the sink "
         "cannot bind. Row COUNTS cannot see this — an update that never lands changes no "
-        "count — so run Validation (step 4), whose checksum does. Recovery: re-run the Full "
-        "Load for this table to bring its values current; the stream cannot catch up on its "
-        "own until the sink connector is upgraded",
+        "count — so run Validation (step 4), whose checksum does. Recovery: stop CDC and "
+        "reload this table with 'Drop & reload' to bring its values current (an append "
+        "reload cannot — it never rewrites a primary key the target already has); the "
+        "stream cannot catch up on its own until the sink connector is upgraded",
+    ),
+    # The only kind where the target ends up with EXTRA rows rather than missing ones, so it
+    # needs its own header and its own runbook line (an ALTER backfills nothing here). Says
+    # plainly that the divergence is permanent without action and that Validation is what
+    # measures it, because one dead letter per truncated table sits well under the DLQ badge's
+    # 50-record warn threshold and would otherwise pass unnoticed.
+    "source-truncate": (
+        "a source TRUNCATE was not replicated",
+        "the source truncated this table, but Aurora DSQL has no TRUNCATE statement, so there "
+        "is no correct apply and the sink quarantined the event rather than guessing. The "
+        "target still holds the rows the source dropped and will keep them until you act "
+        "(Validation, step 4, reports them as EXTRA rows). The stream itself is unaffected: "
+        "later inserts and updates keep flowing",
     ),
 }
 
 # Drift kinds that are NOT a source DDL change, so the banner must not call them one.
+# ``source-truncate`` is deliberately NOT here: it IS source-side, and this set's header and
+# stop-and-reload notice are both about a row going MISSING from the target, which is the
+# opposite of what a truncate leaves behind. It gets its own header + runbook line below.
 _TARGET_SIDE_DRIFT_KINDS = frozenset(
     {"missing-table", "unique-conflict", "unbindable-value"}
 )
@@ -1228,8 +1309,9 @@ async def _open_add_column_dialog(ui, session, table: str, on_refresh=None) -> N
         # The target already matches: the DLQ rows are still set aside, so point at
         # the backfill rather than implying there is nothing left to do.
         ui.notify(  # type: ignore[attr-defined]
-            f"{table}: the target already has every source column. Use per-table "
-            "Reload to backfill the dead-lettered rows.",
+            f"{table}: the target already has every source column. To backfill the "
+            "dead-lettered rows: re-run Step 1 (Evaluation), stop CDC, then reload this "
+            "table choosing 'Drop & reload'.",
             type="info",
         )
         return
@@ -1261,14 +1343,26 @@ async def _open_add_column_dialog(ui, session, table: str, on_refresh=None) -> N
                     "column by hand if you need it."
                 ),
             )
+        # The ORDERED runbook, not just "reload": measured, a plain per-table Reload
+        # repairs NEITHER half of this. Its SELECT list comes from the Step 1 inventory
+        # (so the new column is not even read), and it appends with SKIP_EXISTING (so a
+        # row already on the target is never rewritten). Same shape as the
+        # oversized-value runbook in assessment_strategist.
         render_notice(
             ui,
             tone="info",
-            header="After applying",
+            header="After applying: how to backfill the rows already set aside",
             body=(
-                "CDC resumes applying new changes for this table on its own. The rows "
-                "already dead-lettered are NOT replayed -- use per-table Reload to "
-                "backfill them."
+                "CDC resumes applying new changes for this table on its own, but the "
+                "rows already dead-lettered are NOT replayed. Backfilling them takes "
+                "four steps, in this order: (1) re-run Step 1 (Evaluation) — the Full "
+                "Load reads the column list captured there, which predates this source "
+                "change, so without a refresh it would not copy the new column at all; "
+                "(2) stop CDC; (3) reload this table on the Full Load step choosing "
+                "'Drop & reload' — a plain append reload only inserts primary keys the "
+                "target is missing, so it cannot fill the new column on rows that are "
+                "already there; (4) start CDC again. Then run Validation (step 4) to "
+                "confirm the table matches."
             ),
         )
 
@@ -1308,8 +1402,10 @@ async def _open_add_column_dialog(ui, session, table: str, on_refresh=None) -> N
                 )
             else:
                 ui.notify(  # type: ignore[attr-defined]
-                    f"Added {len(applied)} column(s) to {table}. Use per-table Reload "
-                    "to backfill the dead-lettered rows.",
+                    f"Added {len(applied)} column(s) to {table}. New changes apply "
+                    "again; to backfill the rows already set aside, re-run Step 1 "
+                    "(Evaluation), stop CDC, then reload this table choosing "
+                    "'Drop & reload'.",
                     type="positive",
                 )
             if on_refresh is not None:
@@ -1419,6 +1515,11 @@ def _render_cdc_schema_drift_banner(
         g for g in drift if getattr(g, "kind", "") in _TARGET_SIDE_DRIFT_KINDS
     ]
     _certain_loss = bool(_kinds & _CERTAIN_LOSS_DRIFT_KINDS)
+    # FOUR cases now: a source TRUNCATE is neither a DDL change nor a target-side loss, so it
+    # needs its own header and its own runbook line. Only when it is the ONLY kind present --
+    # mixed drift keeps the (more severe) DDL header, and the per-table line below still states
+    # the truncate in full.
+    _truncate_only = _kinds == {"source-truncate"}
     # `error` for certain ongoing loss AND for the target-side kinds generally: a row that
     # may have vanished is not "be aware" either. `warning` is left to a source DDL change,
     # which is recoverable by applying the DDL.
@@ -1431,6 +1532,12 @@ def _render_cdc_schema_drift_banner(
         )
     elif _target_side:
         _header = "Rows may be missing from the target"
+    elif _truncate_only:
+        # Not a schema change, so it must not be announced as one -- and the direction is the
+        # reverse of every other kind (extra rows on the target, not missing ones). Stays
+        # `warning` by the design system's calibration: real, but the stream keeps running and
+        # the cut-over gate already blocks on Validation's verdict.
+        _header = "Source TRUNCATE was not replicated"
     else:
         _header = "Source schema change detected"
     bg, border, icon_color, _icon = NOTICE_STYLE.get(_tone, NOTICE_STYLE["info"])
@@ -1473,12 +1580,28 @@ def _render_cdc_schema_drift_banner(
                             )
                         ),
                     ).props("flat dense no-caps size=sm color=primary")
-        # One shared runbook line: CDC cannot apply the DDL for you (Property 6).
+        # One shared runbook line: CDC cannot apply the DDL for you (Property 6). A TRUNCATE-only
+        # banner gets its OWN line: there is no DDL to apply and no set-aside row to backfill --
+        # the target has too MANY rows, and an upsert-only Reload cannot remove a row the source
+        # no longer has, so the remedy must name Drop & reload specifically.
         ui.label(  # type: ignore[attr-defined]
-            "CDC does not replicate DDL. Apply the matching change to the target "
-            "schema (e.g. ALTER TABLE), then use per-table Reload to backfill the "
-            "rows that were set aside. Stop CDC first if a column was dropped or "
-            "retyped, since those may require recreating the table."
+            (
+                "CDC cannot replicate a TRUNCATE (Aurora DSQL has no TRUNCATE statement). "
+                "Reload the table on the Full Load step with 'Drop & reload', which recreates "
+                "it and re-reads the source; a plain Reload upserts and so cannot remove the "
+                "stale rows. Run Validation (step 4) afterwards to confirm the extra rows are "
+                "gone."
+            )
+            if _truncate_only
+            else (
+                "CDC does not replicate DDL. Apply the matching change to the target "
+                "schema (e.g. ALTER TABLE) to stop new rows being set aside — then "
+                "backfill the ones already set aside: re-run Step 1 (Evaluation) so the "
+                "Full Load sees the changed column list, stop CDC, and reload the table "
+                "with 'Drop & reload'. A plain append reload cannot backfill them: it "
+                "only inserts primary keys the target is missing, so a row already there "
+                "keeps its old values. Run Validation (step 4) afterwards to confirm."
+            )
         ).classes("text-xs italic text-gray-600")
         if _target_side:
             # The recovery is different in kind: dead-lettered rows are NOT replayed and
@@ -1496,8 +1619,11 @@ def _render_cdc_schema_drift_banner(
                     "any rows applied before the table was dropped went with it. Stop "
                     "CDC, confirm the table exists on the target (re-apply Schema "
                     "Conversion if it does not), reload just that table on the Full Load "
-                    "step, then start CDC again. Validation (step 4) is what proves the "
-                    "gap is closed; this panel cannot."
+                    "step with 'Drop & reload', then start CDC again. It has to be "
+                    "'Drop & reload': an append reload only inserts primary keys the "
+                    "target is missing, so a row that IS on the target but holds a stale "
+                    "value (the 07006 and 23505 cases) is never rewritten. Validation "
+                    "(step 4) is what proves the gap is closed; this panel cannot."
                 ),
             )
 

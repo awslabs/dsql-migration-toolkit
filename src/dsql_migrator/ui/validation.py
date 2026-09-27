@@ -203,10 +203,16 @@ def _default_validator_factory(inputs: ValidationInputs) -> _ValidationRunner:
     default IAM-authenticated DSQL connector. The dev-only row-level diff sample
     size is read from config (default 0 == off), so a developer can enable it via
     ``DSQL_MIGRATOR_VALIDATE_ROW_DIFF_SAMPLE_SIZE`` without any code change.
+
+    The operator's migration-excluded columns are handed over too: the strip below
+    removes them from every ``TableDef``, so without this the stale-inventory gate would
+    see a deliberately omitted column as one the inventory never knew about and grade an
+    otherwise-clean table unverified.
     """
     return Validator(
         source_engine_factory=make_source_engine_factory(inputs.source_password),
         row_diff_sample_size=load_config().validate_row_diff_sample_size,
+        migration_excluded_columns=inputs.excluded_columns,
     )
 
 
@@ -5205,13 +5211,15 @@ def _render_readiness_checks(
     # CHECKSUM mode actually value-compares, so only it earns "Data identical".
     _is_checksum_mode = str(summary.mode).upper().endswith("CHECKSUM")
     _match_label = "Data identical" if _is_checksum_mode else "Row counts match"
-    # In CHECKSUM mode, FLOAT/DOUBLE and JSON columns have no byte-identical
-    # cross-engine text form and are EXCLUDED from the checksum. Disclose it so a
-    # "match" is not read as "every column value verified" (generic -- the per-table
-    # column types are not carried on the report).
+    # In CHECKSUM mode some columns have no byte-identical cross-engine text form and are
+    # EXCLUDED from the checksum. Disclose it so a "match" is not read as "every column
+    # value verified". Worded WITHOUT a type list: the set is engine-dependent (a
+    # PostgreSQL source's float columns ARE compared, a MySQL source's are not), so naming
+    # FLOAT/DOUBLE here would claim a PostgreSQL float column went unverified when it did
+    # not. The actual columns are named in the notice further down the page.
     _excluded_note = (
-        " FLOAT/DOUBLE and JSON columns are not value-compared (no byte-identical "
-        "cross-engine form); their row counts are still checked."
+        " Columns with no byte-identical cross-engine text form are not value-compared "
+        "(any are named below); their row counts are still checked."
         if _is_checksum_mode
         else ""
     )
@@ -5327,10 +5335,12 @@ def _render_readiness_checks(
         "text-xs text-gray-500"
     )
 
-    # Honesty caveat: FLOAT/DOUBLE and JSON columns have no byte-identical cross-engine
-    # form, so the checksum omits them -- a "Data identical" pass means every OTHER
-    # column was value-compared. Surfaced so the pass is not read as "every column
-    # verified" (a non-key value diff confined to such a column is undetected).
+    # Honesty caveat: some columns have no byte-identical cross-engine form, so the
+    # checksum omits them -- a "Data identical" pass means every OTHER column was
+    # value-compared. Surfaced so the pass is not read as "every column verified" (a
+    # non-key value diff confined to such a column is undetected). The set is engine-
+    # dependent (a PostgreSQL source's float columns ARE compared), so the wording names
+    # no type list -- ``detail`` names the actual columns.
     if summary.checksum_excluded_columns:
         detail = "; ".join(
             f"{table} ({', '.join(cols)})"
@@ -5341,10 +5351,10 @@ def _render_readiness_checks(
             tone="info",
             header="Some columns were not value-compared",
             body=(
-                "FLOAT/DOUBLE and JSON columns have no byte-identical cross-engine text "
-                "form, so the checksum omits them — a 'Data identical' result means every "
-                "OTHER column was value-compared, and a non-key value difference confined "
-                f"to one of these columns would not be detected. Omitted: {detail}."
+                "These columns have no byte-identical cross-engine text form, so the "
+                "checksum omits them — a 'Data identical' result means every OTHER column "
+                "was value-compared, and a non-key value difference confined to one of "
+                f"these columns would not be detected. Omitted: {detail}."
             ),
         )
 

@@ -330,12 +330,30 @@ class DsqlConnector:
             # locale-formatted text) and DDL is not locale-sensitive -- these GUCs only affect
             # OUTPUT text formatting.
             #
+            # extra_float_digits is the fourth pin, and unlike the other three it is NOT
+            # merely belt-and-suspenders: Validation renders a PostgreSQL source's scalar
+            # real/double precision on BOTH ends as ``to_jsonb(col)::text``, whose digit
+            # count this GUC controls. Aurora DSQL's default is 1 and the source pins 3 --
+            # equal output, because from PostgreSQL 12 on ANY value > 0 selects the same
+            # shortest-round-tripping text -- but a value <= 0 truncates, and a role-level
+            # ``ALTER ROLE ... SET extra_float_digits`` would then FALSE-MISMATCH every float
+            # column of every table. Live-measured on the DSQL target over 2000 random float8
+            # + 2000 random float4 values: the aggregate md5 is identical to the source at
+            # DSQL's 1 and at 3, and DIFFERS at 0 and at -5. Aurora DSQL accepts it both as a
+            # startup option and as a session SET (live-verified), so pinning is safe here.
+            #
             # NOTE: we deliberately do NOT pin lc_numeric here. Aurora DSQL REJECTS it as a
             # startup/session GUC ("FATAL: setting configuration parameter \"lc_numeric\" not
             # supported"), so passing it makes EVERY DSQL connection fail (live-verified). It is
-            # also unnecessary: the checksum's numeric mask uses a literal '.' (not to_char's
-            # locale-aware 'D'), so source and target agree on the decimal point without it.
-            options="-c TimeZone=UTC -c DateStyle=ISO -c IntervalStyle=postgres",
+            # also unnecessary: the checksum renders a numeric as ``round(col, s)::text`` and
+            # numeric_out consults no locale, so source and target agree on the decimal point
+            # without it (the fixed-width ``to_char`` mask this replaced already hard-coded a
+            # literal '.' rather than the locale-aware 'D' template, so lc_numeric never
+            # reached the numeric checksum either).
+            options=(
+                "-c TimeZone=UTC -c DateStyle=ISO -c IntervalStyle=postgres"
+                " -c extra_float_digits=3"
+            ),
             # Bound the TCP connect so an unreachable endpoint (wrong host, VPC the
             # tool can't egress to, security-group filtered) fails fast instead of
             # blocking the UI "Test connection" / prerequisite probe indefinitely on

@@ -731,6 +731,135 @@ def test_dlq_errors_first_read_uses_the_wide_initial_lookback() -> None:
     assert call[1]["startTime"] == now_ms - _DLQ_INITIAL_LOOKBACK_SECONDS * 1000
 
 
+# ---------------------------------------------------------------------------
+# value_conversion_failures: the SILENT per-column NULL (NOT a dead letter)
+# ---------------------------------------------------------------------------
+
+
+class _PatternAwareClient(_FakeClient):
+    """A logs client whose ``filter_log_events`` answer depends on the filterPattern.
+
+    The dead-letter read and the value-conversion read hit the SAME log group with
+    DIFFERENT patterns, so a pattern-blind fake cannot show that the two keep their own
+    read positions.
+    """
+
+    def __init__(self, by_pattern: dict[str, Any]):
+        super().__init__({})
+        self._by_pattern = by_pattern
+
+    def filter_log_events(self, **kwargs: Any) -> Any:
+        self.calls.append(("filter_log_events", kwargs))
+        pattern = str(kwargs.get("filterPattern", ""))
+        for needle, response in self._by_pattern.items():
+            if needle in pattern:
+                return response
+        return {}
+
+
+_CONV_LINE = (
+    "ERROR Failed to properly convert data value for '{col}' of type {type} "
+    "(io.debezium.relational.TableSchemaBuilder:279)"
+)
+
+
+def test_value_conversion_failures_returns_the_distinct_named_columns() -> None:
+    # The failure is logged PER ROW, so the same column repeats. The operator-facing fact
+    # is "this column arrives NULL" -- a SET, never a count.
+    client = _FakeClient(
+        {
+            "filter_log_events": {
+                "events": [
+                    {
+                        "timestamp": 1000,
+                        "message": _CONV_LINE.format(col="v.t.a", type="numeric"),
+                    },
+                    {
+                        "timestamp": 1100,
+                        "message": _CONV_LINE.format(col="v.t.a", type="numeric"),
+                    },
+                    {
+                        "timestamp": 1200,
+                        "message": _CONV_LINE.format(col="v.t.b", type="_bit"),
+                    },
+                    {"timestamp": 1300, "message": "routine INFO line"},
+                ],
+                # A continuation token must NOT be followed: one page per poll is this
+                # read's whole cost contract (the set converges over polls instead).
+                "nextToken": "more",
+            }
+        }
+    )
+    controller = _controller(client)
+    found = controller.value_conversion_failures("/msk-connect/x-cdc")
+    assert [(f.table, f.column, f.type_name) for f in found] == [
+        ("v.t", "a", "numeric"),
+        ("v.t", "b", "_bit"),
+    ]
+    reads = [c for c in client.calls if c[0] == "filter_log_events"]
+    assert len(reads) == 1, "exactly one CloudWatch call per poll"
+    assert "Failed to properly convert data value" in reads[0][1]["filterPattern"]
+    # The cursor advanced past the newest line read, so the next poll walks forward.
+    controller.value_conversion_failures("/msk-connect/x-cdc")
+    second = [c for c in client.calls if c[0] == "filter_log_events"][1]
+    assert second[1]["startTime"] == 1301
+
+
+def test_value_conversion_failures_fail_closed_on_access_error() -> None:
+    client = _FakeClient({}, raise_on="filter_log_events")
+    assert _controller(client).value_conversion_failures("/msk-connect/x-cdc") == []
+
+
+def test_the_two_log_reads_never_share_a_read_position() -> None:
+    """Each read keeps its OWN cursor, so neither can skip the other's lines.
+
+    ``dlq_errors`` keeps one cursor per log group and advances it to the newest event it
+    read. If the value-conversion read shared it, a conversion line -- logged per ROW, so
+    far more frequent, and emitted by a DIFFERENT connector's log stream -- would move the
+    cursor past dead-letter lines not yet ingested, undercounting the quarantines a
+    cut-over decision reads.
+    """
+    dlq_event = {
+        "eventId": "d1",
+        "timestamp": 5000,
+        "message": (
+            "Quarantined record to DLQ (topic=dsqlcdc.shop.orders, partition=0, "
+            "offset=42): apply failed (sqlstate=42804)"
+        ),
+    }
+    conv_event = {
+        "eventId": "c1",
+        "timestamp": 9000,
+        "message": _CONV_LINE.format(col="shop.orders.total", type="numeric"),
+    }
+    client = _PatternAwareClient(
+        {
+            "Quarantined record to DLQ": {"events": [dlq_event]},
+            "Failed to properly convert": {"events": [conv_event]},
+        }
+    )
+    controller = _controller(client)
+    now = datetime(2026, 9, 27, 12, 0, tzinfo=timezone.utc)
+    now_ms = int(now.timestamp() * 1000)
+
+    # The NEWER conversion line is read first -- the hazardous order.
+    assert controller.value_conversion_failures("/msk-connect/x-cdc", now=now)
+    # It wrote no DLQ read position (so nothing wrong is persisted to the session).
+    assert controller.dlq_cursor_state()[0] == {}
+    # ...and the dead-letter read still starts at its own wide first-read look-back and
+    # still surfaces the quarantine.
+    errors = controller.dlq_errors("/msk-connect/x-cdc", now=now)
+    assert [e.table for e in errors] == ["shop.orders"]
+    dlq_call = [
+        c for c in client.calls if "Quarantined" in str(c[1].get("filterPattern"))
+    ][0]
+    assert dlq_call[1]["startTime"] == now_ms - _DLQ_INITIAL_LOOKBACK_SECONDS * 1000
+    # And the reverse: the DLQ cursor (5001) must not become the conversion read's.
+    controller.value_conversion_failures("/msk-connect/x-cdc", now=now)
+    conv_calls = [c for c in client.calls if "convert" in str(c[1].get("filterPattern"))]
+    assert conv_calls[-1][1]["startTime"] == 9001
+
+
 def test_list_connectors_checked_separates_a_failed_read_from_an_empty_one() -> None:
     """The caller has to be able to tell "none exist" from "I cannot look".
 

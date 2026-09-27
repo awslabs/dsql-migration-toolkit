@@ -571,4 +571,58 @@ class DebeziumEventsTest {
     assertEquals("[\"2026-01-02T03:04:05.678\"]", bound.getValue());
   }
 
+  @Test
+  void sourceTruncateIsDeadLetteredByNameNotMistakenForADelete() {
+    // Measured live (PostgreSQL 17.7 -> MSK -> DSQL): a source TRUNCATE produced NO record at
+    // all, because Debezium's `skipped.operations` defaults to "t". With the PostgreSQL source
+    // connector set to `none` the record DOES arrive -- and it has no after-image, no
+    // before-image and NO MESSAGE KEY (Envelope.truncate sets only op/source/ts_*;
+    // PostgresChangeRecordEmitter.emitTruncateRecord passes a null key). It therefore fell
+    // through the `after == null` branch into buildDelete and dead-lettered as
+    // "no primary key in record key or before-image" -- loud, but naming the wrong problem.
+    Schema env =
+        SchemaBuilder.struct().name("Envelope")
+            .field("op", Schema.STRING_SCHEMA)
+            .field("before", ROW)
+            .field("after", ROW)
+            .field("source", ENGINE_SOURCE)
+            .build();
+    Struct truncate =
+        new Struct(env).put("op", "t").put("source", engineSource("postgresql", "arr_dlq"));
+    // No key and no key schema, exactly as the dispatcher builds it for a truncate.
+    DataException failure =
+        assertThrows(
+            DataException.class,
+            () -> DebeziumEvents.parse(record(null, truncate, "dsqlcdc.app.arr_dlq")));
+    String message = failure.getMessage();
+    // The leading phrase is the control plane's classification anchor (cdc_dlq's
+    // _SOURCE_TRUNCATE -> SOURCE_TRUNCATE_CODE -> the `source-truncate` drift banner), and the
+    // table is SCHEMA-QUALIFIED from source.schema/source.db like every other event.
+    assertTrue(message.startsWith("Cannot apply a source TRUNCATE of table app.arr_dlq"));
+    // ...and it must name the four facts an operator cannot recover without.
+    assertTrue(message.contains("no TRUNCATE statement"));
+    assertTrue(message.contains("still holds the rows"));
+    assertTrue(message.contains("Drop & reload"));
+    // NOT the delete wording it used to produce.
+    assertFalse(message.contains("no primary key"));
+  }
+
+  @Test
+  void aMysqlSourceIsUnaffectedBecauseNoTruncateEventIsEverEmitted() {
+    // Byte-identical MySQL behaviour: the cdc-stack leaves the MySQL source connector's
+    // `skipped.operations` at its "t" default, so op="t" never reaches the sink from MySQL and
+    // the branch above is unreachable there. Every op MySQL DOES emit is untouched -- asserted
+    // here rather than assumed, because the new branch sits on the hot parse path.
+    Struct ins =
+        new Struct(ENVELOPE).put("op", "c").put("after", row(1L, "Alice")).put("source", source("users"));
+    assertTrue(DebeziumEvents.parse(record(key(1L), ins, "dsqlcdc.app.users")).isInsert());
+    Struct upd =
+        new Struct(ENVELOPE).put("op", "u").put("after", row(1L, "Alicia")).put("source", source("users"));
+    assertTrue(DebeziumEvents.parse(record(key(1L), upd, "dsqlcdc.app.users")).isUpdate());
+    Struct del =
+        new Struct(ENVELOPE).put("op", "d").put("before", row(1L, "Alice")).put("source", source("users"));
+    assertTrue(DebeziumEvents.parse(record(key(1L), del, "dsqlcdc.app.users")).isDelete());
+    assertTrue(DebeziumEvents.parse(record(key(1L), null, "dsqlcdc.app.users")).isTombstone());
+  }
+
 }

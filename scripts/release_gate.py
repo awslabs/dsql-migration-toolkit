@@ -106,7 +106,7 @@ def check_dsql(roundtrip: bool) -> tuple[bool, str]:
         # Confirm the pinned output-formatting GUCs were ACCEPTED by the server (i.e. the
         # connection options string is valid for DSQL — a bad GUC would have failed connect).
         gucs = {}
-        for g in ("TimeZone", "DateStyle", "IntervalStyle"):
+        for g in ("TimeZone", "DateStyle", "IntervalStyle", "extra_float_digits"):
             cur.execute(f"SHOW {g}")
             gucs[g] = cur.fetchone()[0]
         detail = f"SELECT 1 ok; GUCs {gucs}"

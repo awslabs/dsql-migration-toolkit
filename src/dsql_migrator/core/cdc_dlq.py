@@ -78,6 +78,17 @@ _LOG4J_TAIL = re.compile(r"\s*\([\w.$]+:\d+\)\s*$")
 OVERSIZED_VALUE_CODE = "OVERSIZED_VALUE"
 _OVERSIZED = re.compile(r"exceeds DSQL's\s+\d+-byte limit", re.IGNORECASE)
 
+# The same shape for a source TRUNCATE: the sink refuses it before sending anything to DSQL, so
+# there is no server error and therefore no SQLSTATE. Unlike OVERSIZED_VALUE this code IS mapped
+# by classify_schema_drift (to SchemaDriftKind.SOURCE_TRUNCATE) -- a truncate leaves the target
+# holding rows the source no longer has, which nothing else surfaces at CDC time: one dead
+# letter per truncated table is far below the DLQ badge's 50-record warn threshold, so without
+# the drift banner the operator would not learn of it until Validation. Anchored on the sink's
+# exact leading phrase (DebeziumEvents.truncateNotApplicable) and only consulted when no
+# SQLSTATE was reported, so it can never reclassify a real server rejection.
+SOURCE_TRUNCATE_CODE = "SOURCE_TRUNCATE"
+_SOURCE_TRUNCATE = re.compile(r"Cannot apply a source TRUNCATE", re.IGNORECASE)
+
 # The reason may carry the sink's rendered SQL TEMPLATE (column names + `?`
 # placeholders, never values), so allow a longer message than a bare error string
 # while still bounding it so a pathological line can't bloat the error log.
@@ -162,6 +173,8 @@ def parse_dlq_log_message(
     error_code = code.group("state") if code else None
     if error_code is None and _OVERSIZED.search(reason):
         error_code = OVERSIZED_VALUE_CODE
+    if error_code is None and _SOURCE_TRUNCATE.search(reason):
+        error_code = SOURCE_TRUNCATE_CODE
     pk_match = _PK.search(reason)
     op_match = _OP.search(reason)
     op = None

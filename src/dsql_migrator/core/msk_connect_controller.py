@@ -33,6 +33,11 @@ from typing import Callable, Optional, Sequence
 from dsql_migrator.core.aws_session import BotoSessionLike, build_session
 from dsql_migrator.core.cdc import CdcConnectorError, ConnectorState, ConnectorStatus
 from dsql_migrator.core.cdc_dlq import parse_dlq_log_message
+from dsql_migrator.core.cdc_value_conversion import (
+    VALUE_CONVERSION_FILTER_PATTERN,
+    CdcValueConversionFailure,
+    parse_value_conversion_failure,
+)
 
 
 @dataclass
@@ -196,6 +201,12 @@ class MskConnectController:
         # {log_group: bool} for a read that hit the page cap.
         self._dlq_first_read_window_seconds: "dict[str, int]" = {}
         self._dlq_read_truncated: "dict[str, bool]" = {}
+        # SEPARATE read position for the value-conversion read (see
+        # value_conversion_failures). It reads the SAME log group with a different
+        # pattern, and sharing the DLQ cursor above would let the far more frequent
+        # conversion line advance it past a dead-letter line that had not been ingested
+        # yet -- undercounting the quarantines a cut-over decision reads.
+        self._conv_cursor_ms: "dict[str, int]" = {}
         # Short-TTL cache for _list_metric_dimensions, keyed on (stack, metric_name):
         # {key: (expiry_monotonic, dims)}. Collapses the 5 per-poll discovery passes
         # (and cross-poll re-discovery) so ListMetrics is not paged every 5 s for data
@@ -360,6 +371,74 @@ class MskConnectController:
         if len(seen) > 5000:
             self._dlq_seen_ids[log_group] = set(list(seen)[-2000:])
         return errors
+
+    def value_conversion_failures(
+        self,
+        log_group: str,
+        *,
+        now: Optional[datetime] = None,
+        limit: int = 200,
+        window_seconds: int = _DLQ_INITIAL_LOOKBACK_SECONDS,
+    ) -> "list[CdcValueConversionFailure]":
+        """Read SOURCE-connector value-conversion failures from the connector log group.
+
+        A source connector that cannot convert one column's value logs the column at
+        ERROR and delivers that field as NULL: the row LANDS, nothing is dead-lettered,
+        and no count-based signal can see it (see
+        :mod:`dsql_migrator.core.cdc_value_conversion`). This filters the same worker log
+        group :meth:`dlq_errors` reads for those lines and returns the distinct
+        ``(table, column, type)`` triples it saw, identifiers only. ``[]`` on any access
+        error (fail-closed), exactly like :meth:`dlq_errors`.
+
+        Deliberately NOT folded into :meth:`dlq_errors`, for three separate reasons:
+
+        * it must never become a :class:`CdcConnectorError`, because those are what the
+          DLQ depth counts -- these rows were APPLIED, so counting them would inflate
+          the quarantine number a cut-over decision turns on;
+        * it keeps its OWN cursor (``_conv_cursor_ms``), so neither read can move the
+          other's read position past lines the other has not returned (the two line
+          classes come from DIFFERENT connectors, hence different log streams with
+          independent ingestion lag);
+        * and it must not share the dead-letter read's page budget: a conversion failure
+          is logged PER ROW while a quarantine is rare, so a flood would have consumed
+          those pages and silently truncated the quarantine count -- in exactly the
+          situation this signal exists to detect.
+
+        ONE ``logs:FilterLogEvents`` call per invocation: the ``nextToken`` is
+        deliberately NOT followed, because the result is a SET rather than a count, so
+        walking one page forward per poll converges without an unbounded scan -- and a
+        value that fails once fails on every row that carries it. ``limit`` is generous
+        so a same-millisecond burst cannot be stepped over by the forward cursor.
+        """
+        now_dt = now or datetime.now(timezone.utc)
+        now_ms = int(now_dt.timestamp() * 1000)
+        cursor = self._conv_cursor_ms.get(log_group)
+        start_ms = cursor if cursor is not None else now_ms - window_seconds * 1000
+        try:
+            logs = self._client("logs")
+            response = logs.filter_log_events(
+                logGroupName=log_group,
+                startTime=start_ms,
+                filterPattern=VALUE_CONVERSION_FILTER_PATTERN,
+                limit=limit,
+            )
+        except Exception:  # noqa: BLE001 - advisory monitoring read, never crash
+            return []
+        found: "list[CdcValueConversionFailure]" = []
+        max_ts = cursor or 0
+        for event in list(response.get("events", []) or []):
+            record = parse_value_conversion_failure(str(event.get("message", "")))
+            # No eventId de-dup (unlike the DLQ read): a repeated triple is harmless
+            # because the caller merges into a set, so the read is idempotent by
+            # construction and needs no cross-session seeding.
+            if record is not None and record not in found:
+                found.append(record)
+            timestamp = event.get("timestamp")
+            if isinstance(timestamp, (int, float)) and timestamp > max_ts:
+                max_ts = int(timestamp)
+        if max_ts:
+            self._conv_cursor_ms[log_group] = max_ts + 1
+        return found
 
     # -- read-only ----------------------------------------------------------
 

@@ -1515,11 +1515,12 @@ def _quarantined_cell_tooltip(row: "FullLoadTableRow") -> str:
         return ""
     noun = "row was" if dropped == 1 else "rows were"
     return (
-        f"{dropped:,} {noun} permanently dropped — a value Aurora DSQL could not "
-        "store (e.g. over its ~1 MiB per-value limit). The rest of this table loaded "
-        "normally. See the quarantine panel below for each row's primary key and "
-        "reason; either reduce the source value and Reload this table, or use "
-        "\"Exclude column & reload\" if the value is legitimately too large to store."
+        f"{dropped:,} {noun} permanently dropped — Aurora DSQL rejected a value in "
+        "them (e.g. one over its ~1 MiB per-column limit, or a type the target column "
+        "cannot accept). The rest of this table loaded normally. See the quarantine "
+        "panel below for each row's primary key and the target's own reason, then "
+        "Reload this table once that is fixed, or use \"Exclude column & reload\" to "
+        "migrate the table without that column."
     )
 
 
@@ -2267,7 +2268,8 @@ def _render_full_load_progress(
     # Start over was the only escape left. The count is authoritative either way.
     if not quarantine_entries:
         quarantine_entries = [
-            (r.table, "a value exceeded a DSQL per-value limit")
+            (r.table, "the target rejected a value in this row (the reason is no "
+                      "longer in this session's error log)")
             for r in rows
             if (getattr(r, "rows_quarantined", 0) or 0) > 0
         ]
@@ -2289,7 +2291,8 @@ def _render_full_load_progress(
             ):
                 reason_text = (
                     "; ".join(reasons) if reasons
-                    else "a value exceeded a DSQL per-value limit"
+                    else ("the target rejected a value in this row (the reason is no "
+                          "longer in this session's error log)")
                 )
                 _quarantine_detail_row(
                     ui,
@@ -2625,10 +2628,11 @@ def _render_completeness_banner(
         )
     elif completeness.quarantined_rows:
         remedy = (
-            "The dropped rows are listed above with their reason: reduce the source "
-            "value(s) and Reload that table, use \"Exclude column & reload\" if a "
-            "value is legitimately too large to store, or accept the gap to continue "
-            "(Validation reports it)."
+            "The dropped rows are listed above with the target's own reason: fix that "
+            "(reduce an oversized source value, or re-apply this table's Schema "
+            "Conversion for a type mismatch) and Reload that table, use \"Exclude "
+            "column & reload\" to migrate it without that column, or accept the gap to "
+            "continue (Validation reports it)."
         )
     else:
         remedy = "Run Validation (Step 4) for a full row-count/checksum check."

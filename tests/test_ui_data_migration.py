@@ -10909,6 +10909,125 @@ def test_migrate_table_passes_applied_target_types_to_exporter() -> None:
     }
 
 
+def test_migrate_table_derives_target_types_when_the_run_carries_no_conversion() -> None:
+    """With no APPLIED conversion the read path used to send ``target_types=None``.
+
+    The engine still creates/holds the target from its own deterministic conversion -- which
+    maps a PostgreSQL array to ``jsonb``, because Aurora DSQL has no array type -- so a
+    ``None`` here read the column UNCAST and every row failed 42804 ("column ... is of type
+    jsonb but expression is of type text[]") and was quarantined, or, for ``jsonb[]``,
+    failed the whole table with psycopg's "cannot adapt type 'dict'". Unreachable from the
+    UI (Schema Conversion always runs first); a library/harness caller hits it.
+    """
+    import dataclasses
+
+    from dsql_migrator.core.models import SourceType
+
+    exporter = _FakeExporter(rows_by_table={"public.t": [{"id": 1}]})
+    table = TableDef(
+        name="public.t",
+        columns=[
+            ColumnDef(name="id", mysql_type="integer", nullable=False),
+            ColumnDef(name="tags", mysql_type="text[]", nullable=True),
+        ],
+        primary_key=["id"],
+    )
+    inputs = dataclasses.replace(
+        _inputs(),
+        source_config=SourceConnectionConfig(
+            host="db", database="app", source_type=SourceType.POSTGRES
+        ),
+        table_conversions={},
+    )
+    migrator = BatchedTableMigrator(
+        inputs,
+        exporter=exporter,  # type: ignore[arg-type]
+        watermark_capturer=_FakeWatermarkCapturer(_watermark()),  # type: ignore[arg-type]
+        importer_factory=lambda _i: _FakeImporter(),  # type: ignore[arg-type,return-value]
+    )
+
+    migrator.migrate_table(table)
+
+    assert exporter.target_types_by_table["public.t"]["tags"] == "jsonb", (
+        "the target column IS jsonb, so the read must be to_jsonb -- or every row is "
+        "quarantined with 42804"
+    )
+
+
+def test_the_recreator_and_the_read_path_share_one_derivation() -> None:
+    """One deterministic conversion, so the DDL and the SELECT that fills it cannot drift.
+
+    The trap was exactly a disagreement between the two halves of a conversion-less run:
+    the recreator had a fallback derivation, the read path had none.
+    """
+    import dataclasses
+
+    from dsql_migrator.core.converter import parse_target_column_types
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    table = TableDef(
+        name="public.t",
+        columns=[
+            ColumnDef(name="id", mysql_type="integer", nullable=False),
+            ColumnDef(name="tags", mysql_type="text[]", nullable=True),
+        ],
+        primary_key=["id"],
+    )
+    inputs = dataclasses.replace(
+        _inputs(),
+        source_config=SourceConnectionConfig(
+            host="db", database="app", source_type=SourceType.POSTGRES
+        ),
+        table_conversions={},
+    )
+
+    first = _engine._derived_table_conversion(inputs, table)
+    second = _engine._derived_table_conversion(inputs, table)
+    assert first.target_ddl == second.target_ddl, "must be deterministic"
+    # The types the read path now uses ARE the types of the DDL the recreator applies.
+    assert parse_target_column_types(first.target_ddl)["tags"] == "jsonb"
+
+
+def test_deriving_target_types_does_not_change_the_mysql_load() -> None:
+    """MySQL is unaffected: the derived kinds equal the source-derived ones, column by column.
+
+    ``ValueConverter`` treats ``target_types`` as a per-column override of
+    ``exporter._target_kind``, and MySQL's ``select_column_sql`` ignores ``target_type``
+    entirely -- so if the derived DDL agrees with ``_target_kind`` for every type, deriving
+    it is a no-op on a MySQL run and the fix is PostgreSQL-only in effect.
+    """
+    from dsql_migrator.core.converter import parse_target_column_types
+    from dsql_migrator.core.exporter import _target_kind
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    types = [
+        "int", "bigint unsigned", "tinyint(1)", "decimal(10,2)", "double", "bit(8)",
+        "char(10)", "varchar(255)", "text", "longtext", "varbinary(16)", "blob",
+        "date", "datetime(6)", "timestamp", "time(6)", "year", "json",
+        "enum('a','b')", "set('a','b')", "geometry",
+    ]
+    table = TableDef(
+        name="orders",
+        columns=[ColumnDef(name="id", mysql_type="int", nullable=False)]
+        + [
+            ColumnDef(name=f"c{i}", mysql_type=t, nullable=True)
+            for i, t in enumerate(types)
+        ],
+        primary_key=["id"],
+    )
+    derived = parse_target_column_types(
+        _engine._derived_table_conversion(_inputs(), table).target_ddl
+    )
+
+    for column in table.columns:
+        applied = derived.get(column.name)
+        assert applied is not None, column.mysql_type
+        assert applied.split("(", 1)[0].strip().lower() == _target_kind(
+            column.mysql_type
+        ), column.mysql_type
+
+
 def test_default_table_recreator_uses_applied_conversion(monkeypatch) -> None:
     # #3: a fresh/replace load recreates the target from the APPLIED (edited)
     # conversion -- preserving a user-remapped schema -- not a deterministic
@@ -10933,6 +11052,10 @@ def test_default_table_recreator_uses_applied_conversion(monkeypatch) -> None:
 
     monkeypatch.setattr(_engine, "recreate_table", fake_recreate_table)
     monkeypatch.setattr(_engine, "DsqlConnector", _FakeConnector)
+    # The recreate path now reads the target's CURRENT column names first, to refuse a
+    # recreate that would destroy a column the conversion does not know about. Here the
+    # target matches, so the read reports no extra column and the recreate proceeds.
+    monkeypatch.setattr(_engine, "read_target_columns", lambda connection, table: [])
 
     applied = TableConversion(
         table="orders",
@@ -10948,6 +11071,97 @@ def test_default_table_recreator_uses_applied_conversion(monkeypatch) -> None:
     assert captured["target_ddl"] == applied.target_ddl
     assert captured["schema_ddls"] == applied.schema_ddls
     assert index_ddls == applied.index_ddls
+
+
+# --- replace must not destroy a hand-added target column -------------------
+
+
+def _recreator_probe(monkeypatch, target_columns, *, applied_ddl):
+    """Build the real recreator with the DDL apply + the target read faked out.
+
+    Returns ``(recreator, calls)``, where ``calls`` records each ``recreate_table``
+    invocation -- so a test can assert the DROP+CREATE never ran.
+    """
+    import dataclasses
+
+    from dsql_migrator.core.converter import TableConversion
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    calls: list = []
+
+    class _FakeConnector:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def connect(self):
+            return None
+
+    monkeypatch.setattr(
+        _engine,
+        "recreate_table",
+        lambda schema_ddls, target_ddl, *, connection_factory: calls.append(target_ddl),
+    )
+    monkeypatch.setattr(_engine, "DsqlConnector", _FakeConnector)
+    monkeypatch.setattr(
+        _engine, "read_target_columns", lambda connection, table: list(target_columns)
+    )
+    applied = TableConversion(table="orders", target_ddl=applied_ddl)
+    inputs = dataclasses.replace(_inputs(), table_conversions={"orders": applied})
+    return _engine._default_table_recreator(inputs), calls
+
+
+def test_replace_refuses_when_target_has_a_column_the_conversion_lacks(
+    monkeypatch,
+) -> None:
+    # The drift-recovery trap: the operator ALTERed the target to add the source's new
+    # column, then reloaded -- and the recreate dropped it again (measured live against
+    # Aurora DSQL). Refuse instead, naming the column and the way forward.
+    from dsql_migrator.ui.data_migration._full_load_engine import (
+        FullLoadIncompleteError,
+    )
+
+    recreator, calls = _recreator_probe(
+        monkeypatch,
+        ["id", "active", "added_by_hand"],
+        applied_ddl='CREATE TABLE "orders" ("id" uuid PRIMARY KEY, "active" smallint)',
+    )
+    with pytest.raises(FullLoadIncompleteError) as excinfo:
+        recreator(_tables()[0])
+    message = str(excinfo.value)
+    assert "added_by_hand" in message
+    assert "Step 1" in message
+    # Fail closed: the DROP+CREATE must NOT have run.
+    assert calls == []
+
+
+def test_replace_proceeds_for_a_first_run_and_for_a_remapped_type(monkeypatch) -> None:
+    # Two no-false-alarm cases. (a) A first-run replace: the target does not exist, so
+    # the read returns no columns. (b) A deliberately remapped/clamped target type
+    # (boolean -> smallint, the tool's own advice) -- the check compares NAMES only, so
+    # it cannot object to a type.
+    ddl = 'CREATE TABLE "orders" ("id" uuid PRIMARY KEY, "active" smallint)'
+    recreator, calls = _recreator_probe(monkeypatch, [], applied_ddl=ddl)
+    recreator(_tables()[0])
+    assert calls == [ddl]
+
+    recreator, calls = _recreator_probe(
+        monkeypatch, ["id", "active"], applied_ddl=ddl
+    )
+    recreator(_tables()[0])
+    assert calls == [ddl]
+
+
+def test_replace_proceeds_when_the_applied_ddl_has_no_parseable_columns(
+    monkeypatch,
+) -> None:
+    # An unparseable applied DDL yields no column set to compare, so the check must not
+    # read every target column as "extra" and block every replace. recreate_table then
+    # fails on that DDL by itself, which is the clearer report.
+    recreator, calls = _recreator_probe(
+        monkeypatch, ["id", "active"], applied_ddl="-- manual reimplementation needed"
+    )
+    recreator(_tables()[0])
+    assert calls == ["-- manual reimplementation needed"]
 
 
 # --- accept-quarantined-rows override (_finalize_run) ----------------------
@@ -13431,6 +13645,78 @@ def test_each_quarantined_row_is_recorded_on_the_activity_log(monkeypatch) -> No
     assert "PERMANENTLY DROPPED" in entry["detail"]
     assert "1048576" in entry["detail"]  # the actual reason, not a generic label
     assert "rest of the table loaded" in entry["detail"]  # not a whole-table failure
+
+
+def test_quarantine_advice_follows_the_sqlstate_not_a_size_guess(monkeypatch) -> None:
+    """The audit entry hard-coded "the value is legitimately too large" for EVERY drop.
+
+    The poison-row path quarantines ANY non-retryable error that carries a SQLSTATE
+    (``batched_import._load_batch``: 40001 and class 08 re-raise as retryable, a missing
+    sqlstate re-raises, everything else is split down to one row and quarantined). So a
+    42804 datatype_mismatch lands here -- live-reproduced as a PostgreSQL ``timetz[]``
+    column read UNCAST into a jsonb target column ('column "ttz_arr" is of type jsonb but
+    expression is of type time with time zone[]') -- and the operator was told to shrink a
+    value whose size is irrelevant, on a source that is read-only anyway.
+    """
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    captured: list[str] = []
+    monkeypatch.setattr(
+        _engine, "log_activity",
+        lambda category, action, **kw: captured.append(kw.get("detail", "")),
+    )
+
+    _engine._log_quarantined_row(
+        "app.t", "id=1",
+        'column "ttz_arr" is of type jsonb but expression is of type time with time '
+        "zone[]",
+        "42804",
+    )
+    (mismatch,) = captured
+    assert "too large" not in mismatch, f"42804 is not a size problem: {mismatch}"
+    assert "TYPE mismatch" in mismatch
+    assert "Schema Conversion" in mismatch, "the type is fixed in Step 2, not on the row"
+    assert "Exclude column & reload" in mismatch
+
+    # The GENUINE size path keeps today's wording verbatim: 54000 is Aurora DSQL's
+    # documented 1 MiB per-column cap (live-measured as ProgramLimitExceeded).
+    captured.clear()
+    _engine._log_quarantined_row(
+        "app.t", "id=2",
+        "datatype limit greater than 1048576 bytes not supported for bytea", "54000",
+    )
+    (oversized,) = captured
+    assert "legitimately too large" in oversized, oversized
+    assert "1048576" in oversized
+
+    # Anything else: point at the target's own reason rather than inventing a cause.
+    captured.clear()
+    _engine._log_quarantined_row(
+        "app.t", "id=3", "duplicate key value violates unique constraint", "23505",
+    )
+    (other,) = captured
+    assert "too large" not in other, other
+    assert "the target's own rejection" in other
+
+
+def test_quarantine_advice_is_a_pure_function_of_the_sqlstate() -> None:
+    """Three causes, three advices -- and every one still names a workable recovery.
+
+    "Reduce the source value" is impossible on a read-only source, so no branch may be
+    left offering only that: each has to keep the tool's own answer ("Exclude column &
+    reload") and the fact that the rest of the table loaded.
+    """
+    from dsql_migrator.ui.data_migration._full_load_engine import (
+        _quarantine_recovery_advice as advice,
+    )
+
+    assert advice("54000") == advice("22001"), "both mean 'the value does not fit'"
+    assert advice("42804") != advice("54000")
+    assert advice(None) == advice("22P02"), "no code == an unclassified code"
+    for code in (None, "54000", "22001", "42804", "23505", "22003"):
+        text = advice(code)
+        assert "rest of the table loaded" in text, code
+        assert "Exclude column & reload" in text, code
 
 
 def test_every_load_path_logs_quarantined_rows(monkeypatch) -> None:
@@ -23934,6 +24220,39 @@ def test_every_quarantine_surface_offers_the_exclude_column_recovery() -> None:
         incomplete=1, total=2, quarantined_rows=2, quarantine_only=True
     )
     assert "Exclude column & reload" in run_level, run_level
+
+
+def test_aggregate_quarantine_surfaces_do_not_assert_a_cause() -> None:
+    """A run-level / per-table string covers many rows, so it must not name ONE cause.
+
+    Each of these four surfaces claimed the value was "legitimately too large", but they
+    are built from counts (``FullLoadTableRow`` / ``FullLoadCompleteness``) and can cover
+    rows dropped for unrelated reasons -- the 1 MiB per-column cap (54000), a 42804 type
+    mismatch, a constraint violation. The per-row activity entry carries the target's own
+    reason exactly, so these point there instead. The recovery must survive in all of them.
+    """
+    from dsql_migrator.ui.data_migration import _full_load_engine as fle
+    from dsql_migrator.ui.data_migration import _full_load_ui as flu
+    from dsql_migrator.ui.data_migration._models import FullLoadTableRow
+
+    surfaces = [
+        fle.incomplete_load_message(
+            incomplete=1, total=2, quarantined_rows=2, quarantine_only=True
+        ),
+        fle.incomplete_load_message(
+            incomplete=1, total=2, quarantined_rows=2, quarantine_only=False
+        ),
+        fle._load_table_detail(object(), "app.t", rows_loaded=10, quarantined=2),
+        flu._quarantined_cell_tooltip(
+            FullLoadTableRow(
+                table="app.t", state="DONE", rows_loaded=10, expected_rows=12,
+                attempts=1, errors=0, rows_quarantined=2,
+            )
+        ),
+    ]
+    for text in surfaces:
+        assert "legitimately too large" not in text, text
+        assert "Exclude column & reload" in text, text
 
 
 def test_run_level_quarantine_guidance_survives_the_persisted_error_cap() -> None:

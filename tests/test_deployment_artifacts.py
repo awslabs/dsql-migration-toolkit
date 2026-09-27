@@ -2255,6 +2255,12 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
     # One marker per behaviour the ZIP must carry. Each is a literal this repo's Java source
     # owns, so it can only be present if that source was compiled into the committed ZIP.
     markers = {
+        # v47: a source TRUNCATE is dead-lettered with the TRUNCATE NAMED. Without the
+        # sink's op='t' branch a truncate envelope (no after-image, no key) fell through to
+        # buildDelete and dead-lettered as "Cannot build DELETE ... no primary key" -- loud
+        # about the wrong thing. Pairs with `skipped.operations: none` on the PostgreSQL
+        # source block, which is what makes the event reach the sink at all.
+        "pg truncate named": b"has no TRUNCATE statement",
         # v46: an unbounded `bit varying` column's declared length is REFUSED instead of
         # allocated. Padding to it asked String.repeat for a multi-gigabyte array and the JVM
         # raised OutOfMemoryError -- an Error, so errors.tolerance/the DLQ could not catch it and

@@ -893,6 +893,10 @@ class _FakeUi:
         # to identify WHICH action, and guidance must not live only in a tooltip.
         self.buttons: list = []
         self.tooltips: list[str] = []
+        # Material icon names, so a test can pin a notice's TONE: render_notice picks the
+        # leading glyph from design.NOTICE_STYLE[tone], and an unrecorded icon made the
+        # tone -- the whole severity calibration -- invisible to every assertion.
+        self.icons: list[str] = []
 
     def _el(self):
         return _FakeEl(self)
@@ -906,7 +910,8 @@ class _FakeUi:
     def column(self, *_a, **_k):
         return self._el()
 
-    def icon(self, *_a, **_k):
+    def icon(self, name="", *_a, **_k):
+        self.icons.append(str(name))
         return self._el()
 
     def space(self, *_a, **_k):
@@ -1530,3 +1535,170 @@ def test_the_card_renders_nothing_without_an_in_app_action() -> None:
         ui, object(), "log", records=[_oversized_record("t", "id=1")]
     )
     assert ui.texts == []
+
+
+# ---------------------------------------------------------------------------
+# Source-connector value-conversion failures (a column delivered as NULL)
+# ---------------------------------------------------------------------------
+
+
+class _ConvController:
+    """Fake MskConnectController exposing only what the CDC poll needs."""
+
+    def __init__(self, failures):
+        self._failures = failures
+        self.reads = 0
+
+    def connector_statuses(self, _names):
+        from dsql_migrator.core.cdc import ConnectorState, ConnectorStatus
+
+        return [ConnectorStatus(name="sink", state=ConnectorState.RUNNING)]
+
+    def connector_health(self, _names):
+        return {"sink": ConnectorHealth(running_tasks=1, errored_tasks=0)}
+
+    def value_conversion_failures(self, log_group, **_kw):
+        assert log_group.startswith("/msk-connect/")
+        self.reads += 1
+        return list(self._failures)
+
+
+def _conv_failure(table="v45arr.arr_ok", column="vt_nan", type_name="numeric"):
+    from dsql_migrator.core.cdc_value_conversion import CdcValueConversionFailure
+
+    return CdcValueConversionFailure(table=table, column=column, type_name=type_name)
+
+
+def test_fetch_merges_value_conversion_failures_into_a_sticky_set() -> None:
+    from dsql_migrator.ui.data_migration import _fetch_cdc_status
+
+    state = DataMigrationState()
+    state.set_cdc_controller(_ConvController([_conv_failure(), _conv_failure()]))
+    state.set_cdc_connector_names(["sink"])
+
+    fetched = _fetch_cdc_status(state)
+    # The tuple shape is UNCHANGED -- the signal rides on the state, not on a 7th
+    # element, so every existing 6-way unpack of this function still works.
+    assert fetched is not None and len(fetched) == 6
+    assert fetched[2] == []  # and it is NOT a dead letter
+    assert [f.qualified_column for f in state.cdc_value_conversion_failures] == [
+        "v45arr.arr_ok.vt_nan"
+    ]
+    # A later poll re-reporting the same column does not grow the set: the same value
+    # fails on every row, so a count here would mean nothing.
+    _fetch_cdc_status(state)
+    assert len(state.cdc_value_conversion_failures) == 1
+
+
+def test_a_value_conversion_failure_is_never_counted_as_quarantined() -> None:
+    """THE regression this must not introduce: the row LANDED, so the DLQ depth must not move.
+
+    A fix that inflates the quarantine count would be worse than the blind spot it
+    closes -- that count is what the cut-over decision reads.
+    """
+    from dsql_migrator.ui.data_migration import _apply_cdc_status
+
+    state = DataMigrationState()
+    state.cdc_value_conversion_failures = [_conv_failure()]
+    _apply_cdc_status(state, ([], {}))
+    assert state.cdc_status_view is not None
+    assert state.cdc_status_view.dlq_depth == 0
+    assert state.cdc_status_view.schema_drift == []
+
+
+def test_the_value_conversion_audit_writes_one_durable_line_per_column() -> None:
+    # The poll runs every ~5 s and the activity log is append-only and permanent, so the
+    # line must be written once per column -- and must not read as a quarantine, since
+    # the log is what a cut-over reviewer counts.
+    import dsql_migrator.core.activity_log as real_log
+    from dsql_migrator.ui.data_migration import _apply_cdc_status
+
+    logged: list = []
+    state = DataMigrationState()
+    state.cdc_value_conversion_failures = [_conv_failure()]
+    original = real_log.log_activity
+    real_log.log_activity = lambda *a, **k: logged.append((a, k))  # type: ignore[assignment]
+    try:
+        _apply_cdc_status(state, ([], {}))
+        _apply_cdc_status(state, ([], {}))
+    finally:
+        real_log.log_activity = original  # type: ignore[assignment]
+    assert len(logged) == 1
+    args, kwargs = logged[0]
+    assert kwargs["status"] is real_log.ActivityStatus.WARNING
+    assert kwargs["target"] == "v45arr.arr_ok"
+    assert "vt_nan" in kwargs["detail"]
+    assert "quarantin" not in str(args[1]).lower()
+
+
+def test_the_value_conversion_notice_names_the_column_and_disowns_the_dlq_count() -> None:
+    from dsql_migrator.ui.data_migration._cdc_monitoring import (
+        _render_cdc_value_conversion_notice,
+    )
+
+    state = DataMigrationState()
+    quiet = _FakeUi()
+    _render_cdc_value_conversion_notice(quiet, state)
+    assert quiet.texts == []  # inert on a healthy stream / a source that never logged one
+
+    state.cdc_value_conversion_failures = [_conv_failure()]
+    ui = _FakeUi()
+    _render_cdc_value_conversion_notice(ui, state)
+    text = " ".join(ui.texts)
+    # NAMED (table.column + type): without that the operator cannot act at all.
+    assert "v45arr.arr_ok.vt_nan" in text and "numeric" in text
+    assert "NULL" in text  # the consequence
+    assert "dead-letter" in text  # ...and that this is NOT one
+    assert "Validation" in text  # the only surface that can see it
+    # The class is broader than the proven members, and the wording must say so.
+    assert "only what it has logged so far" in text
+    # ...and the TONE is `error`, not a "be aware": the named column is silently wrong on
+    # the target for every row CDC delivered and stays wrong until acted on, which will
+    # fail Validation and therefore blocks cut over. Pinned via the design system's own
+    # glyph table so the tone cannot be softened unnoticed.
+    from dsql_migrator.ui.design import NOTICE_STYLE
+
+    assert NOTICE_STYLE["error"][3] in ui.icons
+    assert NOTICE_STYLE["info"][3] not in ui.icons
+
+
+def test_start_over_clears_the_value_conversion_signal() -> None:
+    """Start over must not carry a prior migration's NULLed columns into the next one.
+
+    The sticky set is session state, not controller state (CDC discovery rebuilds the
+    controller on every probe), so ``reset_in_place`` -- which re-runs ``__init__`` on the
+    SAME object the builders captured -- is the only thing that clears it. Without the
+    ``__init__`` declarations the attributes would survive a reset and the next migration
+    would open with the previous one's findings.
+    """
+    from dsql_migrator.ui.data_migration import DataMigrationStore
+
+    store = DataMigrationStore()
+    state = store.get_or_create("s-conv")
+    state.cdc_value_conversion_failures = [_conv_failure()]
+    state.cdc_value_conversion_audited_keys.add(("v45arr.arr_ok", "vt_nan", "numeric"))
+
+    store.reset_in_place("s-conv")
+
+    assert store.get_or_create("s-conv") is state  # same captured instance
+    assert state.cdc_value_conversion_failures == []
+    assert state.cdc_value_conversion_audited_keys == set()
+
+
+def test_the_notice_is_wired_into_the_live_monitor_before_the_dlq_card() -> None:
+    """Without the call site the whole signal is dead code, so pin the wiring.
+
+    Source inspection, as the drift-banner wiring assertions do: the notice must be
+    invoked from the live CDC section, and BEFORE the dead-letter panel -- an error-level
+    integrity finding must not be filed under a "0 quarantined" all-clear, and it must
+    never render INSIDE a card about records that did NOT land.
+    """
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_monitoring
+
+    src = inspect.getsource(_cdc_monitoring._render_cdc_live_monitoring)
+    assert "_render_cdc_value_conversion_notice(ui, migration_state)" in src
+    assert src.index("_render_cdc_value_conversion_notice(ui, migration_state)") < src.index(
+        "            _render_cdc_dlq_panel("
+    )

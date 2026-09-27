@@ -27,7 +27,9 @@ import org.apache.kafka.connect.sink.SinkRecord;
  * {@code after}, {@code source}); a {@code null} value is a tombstone. Mapping:
  * {@code c/r/u} (or any op with an after-image) becomes an upsert from the
  * after-image; {@code d} and tombstones become a delete keyed by the PK
- * (falling back to the before-image when the message has no key).
+ * (falling back to the before-image when the message has no key); {@code t} (a source
+ * TRUNCATE) has no correct apply on Aurora DSQL and is dead-lettered by name (see
+ * {@link #truncateNotApplicable}).
  */
 final class DebeziumEvents {
 
@@ -87,6 +89,26 @@ final class DebeziumEvents {
     long sourceTsMs = optLong(source, "ts_ms");
     Struct after = optStruct(envelope, "after");
 
+    // A source TRUNCATE, BEFORE the after-image branch below -- it has no row image at all,
+    // so it would otherwise be mistaken for a delete. Verified against the SHIPPED jars
+    // (connectors/plugins/debezium-postgres-plugin.zip): the op code is "t"
+    // (io.debezium.data.Envelope$Operation.TRUNCATE in debezium-core-2.7.4.Final.jar),
+    // Envelope.truncate(source, ts) sets ONLY op/source/ts_ms/ts_us/ts_ns -- so both
+    // before and after are null -- and PostgresChangeRecordEmitter.emitTruncateRecord passes
+    // a null key, which EventDispatcher$StreamingChangeRecordReceiver turns into a record
+    // with a null keySchema AND a null key. pgoutput emits ONE such record per truncated
+    // table on that table's own topic, so `table` above already names the diverged table.
+    //
+    // Without this branch the record fell through `after == null` into buildDelete and
+    // dead-lettered as "no primary key in record key or before-image": loud, but naming the
+    // wrong problem, so the operator could not tell a TRUNCATE from a broken REPLICA
+    // IDENTITY. Unreachable unless the source connector is configured to emit truncates
+    // (Debezium's `skipped.operations` defaults to "t", i.e. truncate skipped), which the
+    // cdc-stack does only for the PostgreSQL source -- so this is inert for MySQL.
+    if ("t".equals(op)) {
+      throw truncateNotApplicable(table);
+    }
+
     if ("d".equals(op) || after == null) {
       if (pkColumns.isEmpty()) {
         // No message key: fall back to the before-image for the PK.
@@ -112,6 +134,37 @@ final class DebeziumEvents {
     return isInsert
         ? ChangeEvent.insert(table, columns, values, pkColumns, pkValues, sourceTsMs)
         : ChangeEvent.upsert(table, columns, values, pkColumns, pkValues, sourceTsMs);
+  }
+
+  /**
+   * The named dead-letter for a source {@code TRUNCATE} (op {@code t}).
+   *
+   * <p>Aurora DSQL has no {@code TRUNCATE} statement, so there is NO correct apply -- and the
+   * sink must not invent one: a blanket {@code DELETE FROM <table>} is unbounded (the 3,000
+   * row / 10 MiB per-transaction limits make it unexecutable on a large table) and would
+   * destroy target rows on the strength of a single un-keyed event. So the event is
+   * quarantined with its cause named, which is what the operator actually needs: the
+   * divergence is already created (the source dropped its rows, the target kept them) and the
+   * remedy is per-TABLE, not per-row.
+   *
+   * <p>The wording is load-bearing in two directions. It states what happened, that no apply
+   * exists, which way source and target now differ, and the recovery -- and it is also the
+   * string the control plane classifies on: {@code cdc_dlq.parse_dlq_log_message} matches
+   * "Cannot apply a source TRUNCATE" to assign the synthetic {@code SOURCE_TRUNCATE} code
+   * (there is no SQLSTATE -- nothing was sent to DSQL), which
+   * {@code cdc.classify_schema_drift} maps to the {@code source-truncate} banner kind. Keep
+   * the leading phrase byte-identical if this message is ever reworded.
+   */
+  private static DataException truncateNotApplicable(String table) {
+    return new DataException(
+        "Cannot apply a source TRUNCATE of table "
+            + table
+            + ": Aurora DSQL has no TRUNCATE statement, so there is no correct apply and this"
+            + " event is quarantined rather than guessed at. The target still holds the rows"
+            + " the source truncated, so the two now differ by exactly those rows (Validation"
+            + " reports them as extra). Recovery: reload this table on the Full Load step with"
+            + " 'Drop & reload', which recreates it and re-reads the source -- an upsert-only"
+            + " reload cannot remove rows the source no longer has.");
   }
 
   private static ChangeEvent buildDelete(

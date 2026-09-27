@@ -726,7 +726,10 @@ def test_the_unbindable_value_banner_states_certain_loss_and_the_real_remedy() -
     assert "07006" in blob
     assert "Row COUNTS cannot see this" in blob
     assert "Validation (step 4)" in blob
-    assert "re-run the Full Load" in blob
+    # The remedy must name 'Drop & reload': the rows ARE on the target carrying a stale
+    # value, and an append reload never rewrites a primary key the target already has.
+    assert "Drop & reload" in blob
+    assert "an append reload cannot" in blob
     assert "ecommerce.products" in blob
     # error tone on the banner's OWN surface (the first classes string is the outer column).
     assert NOTICE_STYLE["error"][1] in ui.classes_seen[0], ui.classes_seen[0]
