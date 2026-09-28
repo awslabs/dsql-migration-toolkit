@@ -5,6 +5,12 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.561
+
+### Added
+
+- **"Explain with AI" on every cut-over readiness check that is not green.** A `Failed` or `Heads-up` check in "Cut-over readiness" now carries the same action as a failing table in "Tables needing attention". The chat is grounded on that check's own label, status and the exact detail line shown, with the run's roll-up facts as context, and it keeps a separate conversation per check. `Passed` and `N/A` rows get no action — there is nothing to diagnose, and offering it there would dilute the rows that need attention. Shown only when AI Assist is on.
+
 ## v0.1.560
 
 Four fixes from reviewing a live PostgreSQL CDC run: the per-table AI button ignored which table you clicked, the identity-sequence re-sync could hand the application a duplicate key, the replication-slot panel showed a stale reading as live and pointed at a destructive fix, and the dead-letter guidance prescribed a repair the tool withholds while CDC runs.

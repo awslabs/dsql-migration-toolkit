@@ -4373,8 +4373,9 @@ def _render_result(
     """Render the cut-over readiness report: verdict, checks, then the details.
 
     ``diagnose_provider`` (when given -- AI Assist on) opens the AI chat drawer
-    for a mismatch; it is threaded to the verdict (run-level "Diagnose with AI")
-    and to the failing-tables section (per-table "Explain with AI").
+    for a mismatch; it is threaded to the verdict (run-level "Diagnose with AI"),
+    to the failing-tables section (per-table "Explain with AI") and to the cut-over
+    readiness checks (an "Explain with AI" on every check that is not green).
     ``restored`` shows a "restored from a saved session" note (the result was
     re-hydrated on reconnect, not run now), with its ``completed_at`` time, so a
     stale verdict prompts a re-validate. The go-path "how to cut over" runbook
@@ -4494,7 +4495,9 @@ def _render_result(
     # orphans, drift), so it reads as a final tally right before Export rather than a
     # preamble before the evidence exists on screen.
     with _section(ui, icon="fact_check", title="Cut-over readiness"):
-        _render_readiness_checks(ui, summary, drift)
+        _render_readiness_checks(
+            ui, summary, drift, diagnose_provider=diagnose_provider
+        )
     with _section(ui, icon="download", title="Export report"):
         _render_downloads(ui, report)
 
@@ -5233,7 +5236,11 @@ def _render_cutover_section(
 
 
 def _render_readiness_checks(
-    ui: object, summary: ValidationSummary, drift: DriftDisplay
+    ui: object,
+    summary: ValidationSummary,
+    drift: DriftDisplay,
+    *,
+    diagnose_provider=None,
 ) -> None:
     """Render the pre-cut-over checks as a compact, uniform pass/fail panel.
 
@@ -5241,7 +5248,23 @@ def _render_readiness_checks(
     2. No mismatched records -- full PK reconciliation (missing / extra rows).
     3. No table errors -- every table could be compared.
     4. No source drift -- the source has not advanced since the snapshot.
+
+    ``diagnose_provider`` (AI Assist on) gives every check that is NOT green an
+    "Explain with AI" action, grounded on that check's own label, status and the exact
+    detail line shown, plus the run's roll-up facts (see :func:`_readiness_explainer`).
     """
+
+    def _check(**kwargs) -> None:
+        # Every check row goes through here so each one is explainable from the SAME
+        # label + detail it renders -- the AI is grounded on exactly what the operator sees.
+        _render_check_row(
+            ui,
+            on_explain=_readiness_explainer(
+                diagnose_provider, summary, drift, kwargs["label"], kwargs["detail"]
+            ),
+            **kwargs,
+        )
+
     # Rows the migration is KNOWN to have dropped are not an unexplained difference, and
     # the readiness panel used to report them as one: two red "Failed" rows counting the
     # very rows the per-table entry beside them called "expected, not new data loss". That
@@ -5300,8 +5323,7 @@ def _render_readiness_checks(
         if _is_checksum_mode
         else ""
     )
-    _render_check_row(
-        ui,
+    _check(
         passed=summary.is_match,
         label=_match_label,
         detail=(
@@ -5328,8 +5350,7 @@ def _render_readiness_checks(
     #     a missing/extra row changes the sum and IS caught) -> the records are covered;
     #   * genuinely OFF (not requested) -> the quiet "turned off" note.
     if summary.reconcile_performed:
-        _render_check_row(
-            ui,
+        _check(
             passed=summary.inconsistent_tables == 0,
             label="No missing or extra records",
             detail=(
@@ -5341,8 +5362,7 @@ def _render_readiness_checks(
             warn_on_fail=fully_explained,
         )
     elif summary.reconcile_inapplicable_for_all and not _is_checksum_mode:
-        _render_check_row(
-            ui,
+        _check(
             passed=False,
             label="No missing or extra records",
             detail=(
@@ -5356,8 +5376,7 @@ def _render_readiness_checks(
             warn_on_fail=True,
         )
     elif summary.reconcile_inapplicable_for_all:
-        _render_check_row(
-            ui,
+        _check(
             passed=True,
             label="No missing or extra records",
             detail=(
@@ -5368,8 +5387,7 @@ def _render_readiness_checks(
             neutral=True,
         )
     else:
-        _render_check_row(
-            ui,
+        _check(
             passed=True,
             label="No missing or extra records",
             detail="Record-level reconciliation was turned off for this run.",
@@ -5377,8 +5395,7 @@ def _render_readiness_checks(
         )
 
     # Check 3: no table errors.
-    _render_check_row(
-        ui,
+    _check(
         passed=summary.errored_tables == 0,
         label="No table errors",
         detail=(
@@ -5392,16 +5409,14 @@ def _render_readiness_checks(
     # not a hard failure (it is expected under live CDC), so an advanced source is
     # a warning, an undeterminable/absent watermark is neutral.
     if not drift.available or not drift.determinable:
-        _render_check_row(
-            ui,
+        _check(
             passed=True,
             label="No source drift since snapshot",
             detail=drift.summary,
             neutral=True,
         )
     else:
-        _render_check_row(
-            ui,
+        _check(
             passed=not drift.drifted,
             label="No source drift since snapshot",
             detail=drift.summary,
@@ -5458,6 +5473,65 @@ def _render_readiness_checks(
         )
 
 
+
+def _readiness_explainer(diagnose_provider, summary, drift, label: str, detail: str):
+    """The "Explain with AI" opener for ONE cut-over readiness check, or ``None``.
+
+    ``None`` when AI Assist is off (no provider), so the row renders no action. The chat
+    is scoped to the RUN, not a table: every readiness check is a run-level roll-up (Data
+    identical spans all tables, drift is the source as a whole), so the run's facts are
+    the right context -- led by the check itself so the answer is about THIS check, not a
+    general run diagnosis. Each check gets its own ``scope_id`` so its conversation is
+    kept apart from the others and from the whole-run "Diagnose with AI".
+    """
+    if diagnose_provider is None:
+        return None
+
+    def _open(status: str) -> None:
+        diagnose_provider(
+            title="AI DBA",
+            subtitle=f"{label} · cut-over readiness",
+            first_question=(
+                f'The cut-over readiness check "{label}" is {status}. Why, does it '
+                "block cut-over, and exactly what should I do about it?"
+            ),
+            facts=_readiness_check_facts(label, status, detail, summary, drift),
+            scope="run",
+            scope_id=f"validation:readiness:{_readiness_slug(label)}",
+            chip=f"Readiness · {label}",
+        )
+
+    return _open
+
+
+def _readiness_slug(label: str) -> str:
+    """A stable, URL-safe id fragment for a readiness check label."""
+    return "-".join("".join(c if c.isalnum() else " " for c in label.lower()).split())
+
+
+def _readiness_check_facts(
+    label: str, status: str, detail: str, summary, drift
+) -> str:
+    """Credential-free facts for one readiness check's AI chat.
+
+    The check's own label, status and the EXACT detail line on screen come first, then the
+    run roll-up (:func:`_validation_run_facts`) as context. No row values (Property 7).
+    """
+    meaning = (
+        "red — a failed check"
+        if status == "Failed"
+        else "amber — flagged but non-blocking; it must be understood before cut-over"
+    )
+    return "\n".join(
+        [
+            f"Readiness check: {label}",
+            f"Status: {status} ({meaning})",
+            f"What the report states for this check: {detail}",
+            "Run context:",
+            _validation_run_facts(summary, drift),
+        ]
+    )
+
 def _render_check_row(
     ui: object,
     *,
@@ -5466,12 +5540,18 @@ def _render_check_row(
     detail: str,
     neutral: bool = False,
     warn_on_fail: bool = False,
+    on_explain=None,
 ) -> None:
     """Render one readiness check as an icon + bold label + status chip + detail.
 
     ``neutral`` renders a quiet "Not run / N/A" row; ``warn_on_fail`` renders a
     failed check as a non-blocking amber warning (used for drift) rather than a
     blocking red failure.
+
+    ``on_explain`` (AI Assist on) adds an "Explain with AI" action to a row that is NOT
+    green -- ``Failed`` or ``Heads-up`` -- and is called with that status word. A
+    ``Passed`` or ``N/A`` row never gets one: there is nothing to diagnose, and offering it
+    there would dilute the signal the action carries on the rows that do need attention.
     """
     if neutral:
         icon, color, tone, status = "remove_circle_outline", "grey-6", "neutral", "N/A"
@@ -5481,15 +5561,25 @@ def _render_check_row(
         icon, color, tone, status = "warning", "amber-6", "reconnect", "Heads-up"
     else:
         icon, color, tone, status = "cancel", "red-6", "bad", "Failed"
+    explainable = on_explain is not None and status in ("Failed", "Heads-up")
     with ui.row().classes("items-start gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
         ui.icon(icon, color=color).classes("text-lg mt-0.5")  # type: ignore[attr-defined]
         with ui.column().classes("gap-0 min-w-0 flex-1"):  # type: ignore[attr-defined]
-            with ui.row().classes("items-center gap-2 no-wrap"):  # type: ignore[attr-defined]
+            with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
                 ui.label(label).classes("text-sm font-semibold text-gray-900")  # type: ignore[attr-defined]
                 ui.label(status).classes(  # type: ignore[attr-defined]
                     "text-[10px] leading-tight border rounded px-2 py-0.5 "
                     + badge_classes(tone)
                 )
+                if explainable:
+                    # Same placement + style as the per-table "Explain with AI" in "Tables
+                    # needing attention", so the two read as one action.
+                    ui.space()  # type: ignore[attr-defined]
+                    ui.button(  # type: ignore[attr-defined]
+                        "Explain with AI",
+                        icon="auto_awesome",
+                        on_click=lambda _e=None, _s=status: on_explain(_s),
+                    ).props("flat dense no-caps size=sm color=indigo-6")
             ui.label(detail).classes("text-xs text-gray-600")  # type: ignore[attr-defined]
 
 

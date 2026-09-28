@@ -6202,6 +6202,77 @@ def test_cutover_ack_records_the_referential_integrity_outcome() -> None:
     assert "nothing to advance" in _cutover_integrity_detail(state2, 0)
 
 
+def _explain_clicks(ui) -> list:
+    return [cb for text, cb in ui.clicks if text == "Explain with AI"]
+
+
+def test_readiness_checks_offer_explain_with_ai_only_on_rows_that_are_not_green() -> None:
+    """Every Failed / Heads-up check gets "Explain with AI"; Passed / N/A never do.
+
+    Uses a real failing report (both tables fail) with reconciliation off and drift
+    advanced, so the panel holds exactly: Data identical = Failed, No missing or extra
+    records = N/A (turned off), No table errors = Passed, No source drift = Heads-up.
+    """
+    from dsql_migrator.ui.validation import _render_readiness_checks, summarize_validation
+
+    summary = summarize_validation(_failing_report_for_render())
+    opened: list[dict] = []
+    ui = _ScreenUi()
+    _render_readiness_checks(
+        ui, summary, _drift_advanced(), diagnose_provider=lambda **kw: opened.append(kw)
+    )
+    clicks = _explain_clicks(ui)
+    # Two non-green rows -> two actions (not four: Passed and N/A rows carry none).
+    assert len(clicks) == 2, [t for t, _ in ui.clicks]
+
+    clicks[0]()
+    first = opened[-1]
+    # Grounded on THIS check: its label, its status and the exact detail on screen.
+    assert first["subtitle"] == "Row counts match · cut-over readiness"
+    assert '"Row counts match" is Failed' in first["first_question"]
+    assert "Readiness check: Row counts match" in first["facts"]
+    assert "Status: Failed" in first["facts"]
+    assert "0/2 tables matched" in first["facts"]  # the detail line, verbatim
+    # ...with the run roll-up as context, scoped to the run (every check is run-level).
+    assert "Tables total: 2" in first["facts"]
+    assert first["scope"] == "run"
+
+    clicks[1]()
+    second = opened[-1]
+    assert "Status: Heads-up" in second["facts"]
+    assert "No source drift since snapshot" in second["first_question"]
+    # Each check keeps its own conversation, apart from the other and the whole-run chat.
+    assert first["scope_id"] != second["scope_id"]
+    assert first["scope_id"].startswith("validation:readiness:")
+    assert "validation:run" not in (first["scope_id"], second["scope_id"])
+
+
+def test_readiness_checks_render_no_ai_action_when_ai_is_off() -> None:
+    from dsql_migrator.ui.validation import _render_readiness_checks, summarize_validation
+
+    ui = _ScreenUi()
+    _render_readiness_checks(
+        ui, summarize_validation(_failing_report_for_render()), _drift_advanced()
+    )
+    assert _explain_clicks(ui) == []
+
+
+def test_result_page_threads_the_ai_opener_into_the_readiness_checks() -> None:
+    # Wiring: the helper is dead code unless _render_result hands it the provider.
+    from dsql_migrator.ui.validation import _render_result
+
+    opened: list[dict] = []
+    ui = _ScreenUi()
+    _render_result(
+        ui, _failing_report_for_render(),
+        diagnose_provider=lambda **kw: opened.append(kw),
+    )
+    for cb in _explain_clicks(ui):
+        cb()
+    readiness = [kw for kw in opened if kw["scope_id"].startswith("validation:readiness:")]
+    assert readiness, [kw["scope_id"] for kw in opened]
+
+
 def test_the_validation_chat_opener_forwards_the_table_to_the_strategist() -> None:
     """The opener closure must hand ``table`` on to ``stream_validation_chat``.
 
