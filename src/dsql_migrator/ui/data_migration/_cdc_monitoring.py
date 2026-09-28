@@ -802,9 +802,13 @@ def _render_cdc_live_monitoring(
         # saw NO stream-lag signal at all. Now the metric is always present when CDC is
         # running -- as a "caught up" line when there is nothing to trend.
         with ui.row().classes("items-center gap-1.5 no-wrap") as _lag_empty:  # type: ignore[attr-defined]
-            ui.icon("check_circle").classes("text-green-600 text-base")  # type: ignore[attr-defined]
+            # The sink emits ReplicationLagMs only WHILE APPLYING, so "no datapoint" is
+            # the absence of evidence, not evidence of zero lag -- and the same input is
+            # produced by a sink that has stopped applying entirely. Say what was observed.
+            ui.icon("remove_circle_outline").classes("text-sky-600 text-base")  # type: ignore[attr-defined]
             ui.label(  # type: ignore[attr-defined]
-                "Caught up — no replication lag in the recent window."
+                "No replication-lag datapoint in the recent window "
+                "— the sink reports lag only while it is applying."
             ).classes("text-sm text-gray-700")
         lag["empty"] = _lag_empty  # type: ignore[assignment]
         # The SAME "no datapoints" input means the opposite thing when the sink has
@@ -1016,9 +1020,13 @@ def _render_cdc_pipeline_health(
                     "text-gray-400 text-sm cursor-help"
                 ).tooltip(
                     "Whether changes are still streaming from the source to the "
-                    "target. When you quiesce the source for cutover, watch this "
-                    "drop to idle — the pipeline has drained. Rates are from "
-                    "CloudWatch (about the last few minutes)."
+                    "target. Rates are CloudWatch averages over about the last few "
+                    "minutes, and they bottom out at an idle FLOOR of 0.1 rec/s -- the "
+                    "shipped 5-minute heartbeat keeps them there. So reaching idle is "
+                    "NOT proof the pipeline has drained: roughly up to 6 changes a "
+                    "minute, and a sink that has stopped applying while the source "
+                    "still produces, both look the same inside that band. Quiesce the "
+                    "source, then confirm with Validation rather than with this line."
                 )
             _render_change_flow_status(ui, activity)
 
@@ -1036,10 +1044,20 @@ def _render_change_flow_status(ui, activity: "CdcActivitySummary") -> None:
 
     with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
         if activity.idle is True:
-            ui.icon("pause_circle", color="positive").classes("text-base")  # type: ignore[attr-defined]
-            ui.label("No changes flowing — pipeline idle").classes(  # type: ignore[attr-defined]
-                "text-sm text-gray-700"
-            )
+            # NOT green, and NOT "no changes". `idle` means both CloudWatch rates are at or
+            # below _CDC_IDLE_RATE_THRESHOLD (0.1 rec/s) -- a floor the shipped 5-minute
+            # heartbeat genuinely sits on, so it cannot be lowered. Inside that band a real
+            # change stream and a fully stalled sink are INDISTINGUISHABLE: measured live, 6
+            # change events in 72s gave source 0.06 rec/s and this line still rendered the
+            # strongest possible all-clear directly above its own gauge showing that rate.
+            # So the line states what was measured and what it cannot rule out, and the
+            # colour is neutral -- an operator timing cut-over must not read "drained" here.
+            ui.icon("pause_circle").classes("text-base text-sky-600")  # type: ignore[attr-defined]
+            ui.label(  # type: ignore[attr-defined]
+                "At or below the idle floor "
+                f"({_fmt(activity.source_poll_rate)} in, {_fmt(activity.sink_send_rate)} out)"
+                " — up to ~6 changes/min is indistinguishable from drained"
+            ).classes("text-sm text-gray-700")
         elif activity.sink_stall_confirmed:
             # Checked BEFORE the "streaming" branch: a stalled sink is not idle, so it
             # used to fall through to "Streaming — changes are flowing" — asserting the

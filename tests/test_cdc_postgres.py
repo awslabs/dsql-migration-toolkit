@@ -475,10 +475,33 @@ def test_read_replication_slot_health_is_postgres_only() -> None:
 
     pg = dialect_for(SourceType.POSTGRES)
     health = pg.read_replication_slot_health(
-        _Conn((True, "reserved", 12345, "0/16B3748", "0/16B3800")), "dsqlmig_s"
+        _Conn((True, "reserved", 12345, "0/16B3748", "0/16B3800", 1_048_576)), "dsqlmig_s"
     )
     assert health.exists and health.active and health.wal_status == "reserved"
     assert health.safe_wal_size == 12345 and health.restart_lsn == "0/16B3748"
+    # The bytes of WAL the slot is PINNING. The query already read restart_lsn and then
+    # never used it, so the tool could not say how much WAL a stopped CDC was holding --
+    # and at PostgreSQL's default max_slot_wal_keep_size = -1 there is no server-side
+    # reclaim, so an inactive slot pins it without bound until the slot is dropped.
+    assert health.retained_bytes == 1_048_576
+
+    # ...and the SQL actually ASKS for it. The assertions above run against a canned row, so
+    # without this the expression could be dropped from the SELECT and every test would
+    # still pass while the field silently went None -- the same shape as a fix neutralised
+    # by a probe that never asks the question.
+    captured: list[str] = []
+
+    class _Capturing(_Conn):  # type: ignore[misc]
+        def execute(self, statement, params=None):
+            captured.append(str(statement))
+            return _R(self._row)
+
+    pg.read_replication_slot_health(
+        _Capturing((True, "reserved", 1, "0/1", "0/2", 3)), "dsqlmig_s"
+    )
+    assert "pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)" in captured[0]
+    # One statement, one round trip: the retention is computed IN the existing read.
+    assert len(captured) == 1
     # 0 rows -> the slot does not exist.
     assert pg.read_replication_slot_health(_Conn(None), "dsqlmig_s").exists is False
 

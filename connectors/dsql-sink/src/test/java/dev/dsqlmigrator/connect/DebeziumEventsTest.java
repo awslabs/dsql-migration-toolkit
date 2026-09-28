@@ -572,6 +572,69 @@ class DebeziumEventsTest {
   }
 
   @Test
+  void aSourceNullIsBoundAsNullEvenWhenTheSchemaCarriesAColumnDefault() {
+    // Struct.get(Field) SUBSTITUTES the schema's default for a null slot (connect-api
+    // 3.7.0), and Debezium sets that default from the SOURCE COLUMN's own DEFAULT clause.
+    // So a genuine source NULL was written to the target as the default -- silently, with no
+    // error, no dead letter and no log line. Live-reproduced on Aurora PostgreSQL 17.7: a
+    // row whose column IS NULL landed on Aurora DSQL holding the default. BOTH engines.
+    Schema defaulted =
+        SchemaBuilder.struct()
+            .name("Row")
+            .field("id", Schema.INT64_SCHEMA)
+            .field("n", SchemaBuilder.int32().optional().defaultValue(7).build())
+            .optional()
+            .build();
+    Schema env =
+        SchemaBuilder.struct().name("Envelope")
+            .field("op", Schema.STRING_SCHEMA)
+            .field("before", defaulted)
+            .field("after", defaulted)
+            .field("source", SOURCE)
+            .build();
+    // The slot is left unset: exactly what Debezium produces for a source NULL.
+    Struct after = new Struct(defaulted).put("id", 1L);
+    Struct value =
+        new Struct(env).put("op", "c").put("after", after).put("source", source("t"));
+
+    ChangeEvent event = DebeziumEvents.parse(record(key(1L), value, "srv.app.t"));
+
+    int n = event.columns().indexOf("n");
+    assertTrue(n >= 0, "the column must still be part of the upsert");
+    org.junit.jupiter.api.Assertions.assertNull(
+        event.values().get(n), "a source NULL must bind NULL, not the schema default");
+    // Sanity: the sibling column is unaffected, so this is not a blanket null-out.
+    assertEquals(1L, event.values().get(event.columns().indexOf("id")));
+  }
+
+  @Test
+  void aDefaultedKeyColumnCannotFabricateADeleteKey() {
+    // The other half of the same defect, on the KEY path. A re-keyed table's KEY schema
+    // carries the source column's DEFAULT too, so Struct.get invented a non-NULL key
+    // component from a before-image that never had one: requireNoNullKeyComponent could
+    // NEVER fire, the DELETE went out with a fabricated key, applied to 0 ROWS, and was
+    // acknowledged -- the source row gone and the target's copy kept, with nothing to see.
+    Schema defaultedKey =
+        SchemaBuilder.struct()
+            .name("Key")
+            .field("id", Schema.INT64_SCHEMA)
+            .field("tenant", SchemaBuilder.string().optional().defaultValue("t0").build())
+            .build();
+    // `tenant` unset == the before-image did not carry it (REPLICA IDENTITY DEFAULT).
+    Struct k = new Struct(defaultedKey).put("id", 1L);
+    Struct value =
+        new Struct(ENVELOPE).put("op", "d").put("before", row(1L, "x")).put("source", source("t"));
+
+    DataException failure =
+        assertThrows(
+            DataException.class,
+            () -> DebeziumEvents.parse(record(k, value, "srv.app.t")));
+    // The EXISTING guard now fires, with its already-actionable remedy.
+    assertTrue(failure.getMessage().contains("tenant"), failure.getMessage());
+    assertTrue(failure.getMessage().contains("REPLICA IDENTITY FULL"), failure.getMessage());
+  }
+
+  @Test
   void sourceTruncateIsDeadLetteredByNameNotMistakenForADelete() {
     // Measured live (PostgreSQL 17.7 -> MSK -> DSQL): a source TRUNCATE produced NO record at
     // all, because Debezium's `skipped.operations` defaults to "t". With the PostgreSQL source

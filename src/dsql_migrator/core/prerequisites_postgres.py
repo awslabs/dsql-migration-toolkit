@@ -91,17 +91,33 @@ _CDC_UNCARRYABLE_ARRAY_ELEMENTS = {
     "oid": UNCARRYABLE_COLUMN_ARRIVES_WRONG,
 }
 
-# SCALAR types with the same problem. Deliberately tiny, and the shortness is the point:
-# scalar timetz / interval / money / xml / point / bit / varbit all have real Debezium
-# converters and replicate fine -- it is only their ARRAY forms above that do not -- so
-# listing them here would warn about columns that work.
+# SCALAR types with the same problem. Scalar timetz / interval / money / xml / point have
+# real Debezium converters and replicate fine -- it is only their ARRAY forms above that do
+# not -- so listing them here would warn about columns that work.
+#
+# ``bit`` / ``varbit`` are the exception and are NOT in this map: their outcome depends on
+# the DECLARED WIDTH, so they are handled by the length-aware arm in
+# :func:`classify_uncarryable_cdc_column`. An earlier version of this comment asserted that
+# scalar bit/varbit "replicate fine"; live measurement on Aurora PostgreSQL 17.7 refuted it
+# for three of the four width bands (see that function).
 _CDC_UNCARRYABLE_SCALARS = {"tsvector": UNCARRYABLE_COLUMN_ARRIVES_NULL}
+
+# The widest bit string the remodeled target column can hold. MUST stay equal to the sink's
+# own ``DebeziumTypeConverter.MAX_STORABLE_BIT_LENGTH`` (Aurora DSQL's documented
+# ``character varying`` limit): the sink REFUSES a declared length above it, so this is the
+# boundary between "dead-letters" and "arrives". Pinned by a test so the two cannot drift.
+_MAX_STORABLE_BIT_LENGTH = 65535
 
 # The candidate names the PROBE filters on server-side, so the query returns only columns
 # worth classifying instead of every column of every selected table. Derived from the maps
 # above rather than spelled out again, so the SQL filter cannot drift from the classifier.
 CDC_UNCARRYABLE_CANDIDATE_ARRAY_ELEMENTS = tuple(sorted(_CDC_UNCARRYABLE_ARRAY_ELEMENTS))
-CDC_UNCARRYABLE_CANDIDATE_SCALARS = tuple(sorted(_CDC_UNCARRYABLE_SCALARS))
+# ``bit``/``varbit`` are appended explicitly: they are not in the scalar MAP (their reason
+# depends on the declared width, see classify_uncarryable_cdc_column) but the probe must
+# still RETURN them, or the classifier never gets the chance to grade them.
+CDC_UNCARRYABLE_CANDIDATE_SCALARS = tuple(
+    sorted(set(_CDC_UNCARRYABLE_SCALARS) | {"bit", "varbit"})
+)
 
 
 def classify_uncarryable_cdc_column(
@@ -131,10 +147,48 @@ def classify_uncarryable_cdc_column(
     if not base_type_name:
         return None
     if not is_array:
+        if base_type_name in ("bit", "varbit"):
+            return _classify_scalar_bit_width(base_type_name, element_typmod)
         return _CDC_UNCARRYABLE_SCALARS.get(base_type_name)
     if base_type_name == "numeric" and element_typmod != -1:
         return None
     return _CDC_UNCARRYABLE_ARRAY_ELEMENTS.get(base_type_name)
+
+
+def _classify_scalar_bit_width(base_type_name: str, typmod: int) -> Optional[str]:
+    """Grade a SCALAR ``bit(n)`` / ``bit varying(n)`` by its declared width.
+
+    Three of the four width bands lose data, all live-measured on Aurora PostgreSQL 17.7
+    against the shipped sink, and NONE of them is fixable in the sink at any plugin version
+    -- which is why this has to be a prerequisite:
+
+    * **unbounded, or wider than 65535** -> the whole ROW dead-letters. An unbounded ``bit
+      varying`` has ``atttypmod = -1`` and Debezium reports its length as 2147483647, and
+      the sink refuses any declared length above
+      :data:`_MAX_STORABLE_BIT_LENGTH` (it once tried to pad to it and the JVM raised
+      ``OutOfMemoryError``, killing the task). ``bit varying(70000)`` dead-letters the same
+      way. This is the CORRECT sink behaviour -- the value cannot be stored -- so the fix
+      belongs here, telling the operator before the billable infrastructure exists.
+    * **width <= 1** (bare ``bit``, ``bit(1)``, ``bit varying(1)``) -> the column arrives
+      WRONG, silently: Debezium maps a 1-bit column to a Connect BOOLEAN, so the value
+      lands as ``true``/``false`` where the source (and Full Load) render ``1``/``0``. The
+      wire carries a bare boolean indistinguishable from a real PostgreSQL ``boolean``, so
+      the sink cannot recover the source type.
+    * **``bit varying(n)``, 2..65535** -> arrives WRONG when a value is SHORTER than ``n``:
+      the Bits payload carries no per-value length, so the sink left-pads to the declared
+      width (``bit varying(8)``: ``1010`` -> ``00001010``). An exactly-``n``-bit value round
+      trips, so this warns on a column whose values may all happen to be full width -- kept
+      because variable length is the entire purpose of ``varbit``, and the warning is
+      non-blocking and names the consequence.
+    * **``bit(n)``, 2..65535** -> exact. Fixed width means the padding IS the value.
+    """
+    if typmod == -1 or typmod > _MAX_STORABLE_BIT_LENGTH:
+        return UNCARRYABLE_ROW_DEAD_LETTERS
+    if typmod <= 1:
+        return UNCARRYABLE_COLUMN_ARRIVES_WRONG
+    if base_type_name == "varbit":
+        return UNCARRYABLE_COLUMN_ARRIVES_WRONG
+    return None
 
 
 @dataclass(frozen=True)
@@ -812,11 +866,13 @@ def check_columns_replicable(
     sentences: list[str] = []
     if fatal:
         sentences.append(
-            f"CDC cannot render {_describe_columns(fatal)} for the jsonb target column, and "
-            "a Debezium change event carries every column, so the sink rejects the whole "
-            "record: EVERY insert, update and delete on this table dead-letters (counted "
-            "on the CDC step's dead-letter panel) and nothing reaches the target. The "
-            "table stays exactly as Full Load left it."
+            f"CDC cannot render {_describe_columns(fatal)} for the remodeled target column, "
+            "and a Debezium change event carries every column, so the sink rejects the whole "
+            "record: every insert, update and delete that POPULATES this column dead-letters "
+            "(counted on the CDC step's dead-letter panel) and does not reach the target. A "
+            "row that leaves the column NULL still lands -- the sink's converter is only "
+            "reached for a non-NULL value, live-verified -- so this is not necessarily the "
+            "whole table."
         )
     # "Separately" because when the table already dead-letters, a column-level loss is a
     # SECOND finding about the same table rather than a milder description of the first.

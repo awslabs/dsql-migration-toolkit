@@ -5,6 +5,30 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.558
+
+同じ稼働中の PostgreSQL 17.7 → MSK → Aurora DSQL パイプラインから得た 5 件です。2 件は静かな CDC データ破損、1 件はテーブルを恒久的に検証不能にする問題、2 件は測定値と反対の内容を運用者に示していた画面です。
+
+### 修正 — 静かな CDC データ破損（プラグイン v47 → v48）
+
+- **シンクがソースが NULL を保持している位置に列の DEFAULT を書き込んでいました — 両方のソースエンジンで。** `Struct.get(Field)` は null スロットをスキーマの既定値に**置き換え**（connect-api 3.7.0 のバイトコードで確認）、Debezium の `TableSchemaBuilder` はその既定値を**ソース列自身の `DEFAULT` 句**から設定します。そのため DEFAULT を持つ nullable 列への CDC 書き込み NULL はすべて既定値として着地していました — 実機で再現: 列が `IS NULL` の行が既定値を保持して Aurora DSQL に到着し、エラーもデッドレターもログも一切なく、対照は正常でした（明示値は伝わり、省略時はソース自身の既定値）。Validation の CHECKSUM だけが捕捉し得ました。フィールド値は今後**そのまま**（`getWithoutDefault`）読まれます。Debezium シンクにとって正しい読み方である理由: レコードとスキーマは常に同じスキーマバージョン由来なので、null スロットはソース値が本当に NULL だという意味であり、しかも Debezium は値が既定値と**等しくても**実値を入れるため、動いていたものが壊れません。**PostgreSQL 限定の修正ではありません: MySQL も同様に誤っており、その挙動も変わります。**
+- **同じ置換が、キーを付け替えたテーブルで null キーの DELETE ガードを発火不能にしていました。** 付け替えたテーブルの**キースキーマにも**ソース既定値が載り、ソースコネクタは null キー要素で中断しません（`Failed to properly convert key value` を記録して継続）— そのため `Struct.get` が before-image に無かったキー要素を**捏造**しました。`requireNoNullKeyComponent` は**決して発火できず**、DELETE は架空のキーで送られ **0 行**に適用されて確認応答されました — ソース行は消え、ターゲットの複製は永久に残ります。スロットをそのまま読めば NULL が復元され、**既存の**ガードが実行可能な対処（`run ALTER TABLE <t> REPLICA IDENTITY FULL`）と共に発火します。新しいガードは追加していません — それが小さい変更で、易しい問いでした。
+- 既存の cdc-stack には **Delete + Deploy CDC infrastructure** が必要です — `Start CDC` はプラグインを再登録しません。
+
+### 修正 — そもそも検証できなかったテーブル
+
+- **PostgreSQL の `point`・`polygon`・`money` 列 1 つがテーブル全体のチェックサムを恒久的に失敗させていました。** `_checksum_kind` が PostgreSQL の列を **MySQL の空間型名の集合**で分類しており、MySQL の集合には `point` と `polygon` が含まれます — PostgreSQL も全く別の型に同じ名前を使います。その結果 PG の `point` が `binary` 種別に落ちて `encode(col, 'hex')` を描画し、これはソースの `point` にも text のターゲットにも存在しません: 実際の `run_validation` で `csum=None, ERROR=UndefinedFunction` として測定されました。`money` は同型で描画が違うだけ — ターゲットは numeric なので分岐は正しいものの、`round(money, integer)` も存在しません。Full Load は両方正しく移行するので**データはあるのに検証だけ不能**であり、カットオーバーのゲートは errored なテーブルで（正しく）ブロックするため、**恒久的な行き止まり**となって運用者を Fast sweep や ROW_COUNT へ押しやりました — 比較していない列について clean を報告できる唯一の経路です。空間型の分岐は MySQL 専用になり、解決できなかった PG のターゲット型は MySQL の型表ではなく Schema Conversion 自身の置換から導出され、numeric の分岐は `(col)::numeric` へキャストします（本物の numeric には no-op）。稼働中の PostgreSQL 17.11 と稼働中の DSQL で測定: ソース `('(1,2)'::point)::text` → `(1,2)`、ターゲット `('(1,2)'::text)::text` → 同一バイト、`money` は両方 `12.340000`。**MySQL ソースの移行で描画される SQL はバイト同一です** — キャストは PG ソースのフラグで制御しています。「等価」より「不変」のほうが守るのが安い性質だからです。
+
+### 修正 — 自らの測定値と矛盾していた画面
+
+- **CDC モニタが、生きた変更ストリームの上にも、完全に停止したシンクの上にも、最強の全クリアを描画していました。** idle の判定と停止検出はどちらも**同じ 0.1 rec/s のしきい値**に依存し同じ帯域で盲目になり、しかも配備済みの 5 分ハートビートがそこでソースレートの実際の床になるため、しきい値を下げることもできません。実機測定: 72 秒で変更 6 件 → ソース 0.06 rec/s のとき、UI は緑の *"No changes flowing — pipeline idle"* と *"Caught up — no replication lag"* を、**そのレートを表示する自分のゲージの真上に**描画しました。さらに悪いことに、ソースは生成し続けているのにシンクが**何も**適用していない全面的な複製停止も同じ帯域に入り、同一の緑を描画しました。カットオーバーの時期を判断するときに読むまさにその表示です。各行は今後**測定値と排除できないこと**を述べ（*"At or below the idle floor (0.06 rec/s in, 0.00 rec/s out) — up to ~6 changes/min is indistinguishable from drained"*）、ラグのカードは *"Caught up"* ではなく *"No replication-lag datapoint in the recent window — the sink reports lag only while it is applying"*、トーンは緑ではなく中立、ツールチップも idle を排出の証拠として提示しません。0.03 rec/s（= 実際の変更ストリーム）に *"pipeline idle"* を断定していたテストがそれ自体欠陥であり、今は正直な文言と**停止したシンク**のケースを固定します。
+- **Stop CDC は *"You can stop and restart as often as you like"* と述べていましたが、PostgreSQL では保持されたレプリケーションスロットが停止中ずっとソースの WAL を固定します。** コネクタ設定は意図的に `slot.drop.on.stop=false` です — それが位置が生き残る**理由**です — しかし非アクティブなスロットも `restart_lsn` 以降のすべての WAL セグメントを保持し、PostgreSQL の既定 `max_slot_wal_keep_size = -1`（稼働ソースで測定）ではサーバ側の回収が**まったくありません**。スロットの健全性を警告していた唯一の場所は、まさにこの状態で到達不能でした — CDC が**ストリーミング中のみ**描画されるためです。ダイアログは今後、PG 限定の段落でスロット・無制限の保持・それを解放する唯一の操作（Delete CDC infrastructure）を明示し、誘い文句は *"Restart as often as you like — but do not LEAVE it stopped."* に限定されます。MySQL の文言はバイト同一です: binlog の保持はソース自身の方針であり、このツールが握るスロットではありません。スロットの読み取りは**固定している WAL のバイト数**も報告します — すでに `restart_lsn` を読んで使っていなかった**既存の `SELECT` 1 回**の中で計算し、**恣意的なしきい値なしに**事実としてのみ提示します。ストリームが生きている間に保持バイトが増えるのは正常で、絶対的な警報線は推測を上限のように提示することになります。
+
+### 修正 — データ損失を「問題なし」と述べていた事前チェック
+
+- **CDC の列チェックが `bit`/`bit varying` の 3 つの宣言形を "carries fine" と述べていましたが、事実ではありません。** `bit`/`varbit` を**配列要素の場合のみ**問題とみなし、コメントはスカラーの bit/varbit が「正常に複製される」と断言していました。配布済みシンクに対する実機測定の結果、**4 つの幅の帯域のうち 3 つでデータが失われます**: **長さ未指定**（`atttypmod = -1`、Debezium は 2147483647 ビットと報告）または **65535 超**は、ターゲットが格納できない幅なのでシンクが拒否し**行全体がデッドレター**。**幅 ≤ 1**（素の `bit`、`bit(1)`、`bit varying(1)`）は Debezium が 1 ビット列を Connect の BOOLEAN にマッピングするため、ソースと Full Load が `1`/`0` を描画する位置に `true`/`false` として到着。**`bit varying(n)` の 2..65535** は Bits ペイロードに値ごとの長さが無いため、`n` より短い値が先頭にゼロを得ます。正確なのは n ≥ 2 の `bit(n)` だけです。**いずれもシンク側ではどのプラグインバージョンでも修正できません** — ワイヤは本物の PostgreSQL `boolean` と区別できない素のブール値を運び、バイト列には長さがありません — だからこそ事前チェックである必要があります。上限は Java ソースを読むテストでシンクの `MAX_STORABLE_BIT_LENGTH` に固定し、両者がずれないようにしました。旧挙動を**固定していたテスト**は削除しました。
+- **同じチェックがテーブル全損を過大に主張していました。** *"EVERY insert, update and delete on this table dead-letters … nothing reaches the target"* と述べていましたが、実機では問題の列を NULL のままにする行は**正常に着地**します — シンクの変換器は非 NULL 値にしか到達しません。今後は *"every insert, update and delete that POPULATES this column"* と述べ、必ずしもテーブル全体ではないことを明示するので、過大な阻害文言を根拠にテーブルをキャプチャ対象から丸ごと外す事態を防げます。（*"for the jsonb target column"* も、ターゲットが text であるスカラーには誤りでした。）
+
 ## v0.1.557
 
 稼働中の PostgreSQL 17.7 -> MSK -> Aurora DSQL パイプラインを実際に動かし、各発見を敵対的に検証して見つけた 8 件です。うち 5 件は **false MATCH** の経路 — データが違うのに Validation が同一と報告する — であり、カットオーバーのゲートはその判定を読みます。

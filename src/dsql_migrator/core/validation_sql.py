@@ -239,7 +239,7 @@ def stale_numeric_render_scales(
     return stale
 
 
-def _checksum_kind(column: "ColumnDef") -> str:
+def _checksum_kind(column: "ColumnDef", source_is_postgres: bool = False) -> str:
     """Classify ``column`` into the render family used by the checksum builders.
 
     Returns one of: ``"binary"`` (bytea/spatial WKB), ``"bit"`` (BIT(n) ->
@@ -257,7 +257,18 @@ def _checksum_kind(column: "ColumnDef") -> str:
     base = mysql_type.strip().lower().split("(", 1)[0].split()[0]
 
     # Spatial types map to bytea (WKB) and are read by the loader via ST_AsBinary.
-    if is_spatial_mysql_type(mysql_type):
+    #
+    # MySQL ONLY. ``is_spatial_mysql_type`` matches on the TYPE NAME, and MySQL's set
+    # includes ``point`` and ``polygon`` -- two names PostgreSQL also uses for entirely
+    # different types. Ungated, a PostgreSQL ``point`` column landed in kind ``binary`` and
+    # rendered ``encode(col, 'hex')``, which does not exist for ``point`` on the SOURCE
+    # (``function encode(point, unknown) does not exist``) NOR on the target, where the
+    # column is text. One such column poisoned the WHOLE table's checksum, so the table
+    # could never be verified at all -- reproduced end to end through the real
+    # ``run_validation`` (csum=None, ERROR=UndefinedFunction). PostgreSQL's own geometric
+    # types are remodelled to text by Schema Conversion, so they are handled by the
+    # textual-target rule below instead.
+    if not source_is_postgres and is_spatial_mysql_type(mysql_type):
         return "binary"
     # BIT(n) maps to an integer target; the loader decoded the big-endian bytes.
     if base == "bit":
@@ -313,12 +324,34 @@ def _checksum_kind(column: "ColumnDef") -> str:
         return "array_json"
     if applied:
         kind = applied.split("(", 1)[0].strip().lower()
+    elif source_is_postgres:
+        # A PostgreSQL source with no APPLIED type (the converted DDL did not parse for
+        # this table) must not fall through to MySQL's ``map_mysql_type`` table: that map
+        # knows nothing of PostgreSQL's own types, so ``point`` stayed uncheckummable and
+        # ``money`` -- whose real target is numeric -- rendered as ``plain``, a FALSE
+        # MISMATCH on every row ('$12.34' on the source vs '12.340000' on the target).
+        # ``substitute_pg_unsupported_type`` is the SAME function Schema Conversion used to
+        # choose the target, so this reproduces what the loader actually stored.
+        from dsql_migrator.core.converter_postgres import substitute_pg_unsupported_type
+
+        substituted, _reason = substitute_pg_unsupported_type(mysql_type)
+        kind = (substituted or mysql_type).split("(", 1)[0].strip().lower()
     else:
         try:
             target_type, _ = map_mysql_type(mysql_type)
         except ValueError:
             return "plain"
         kind = target_type.split("(", 1)[0].strip().lower()
+    # NOTE: no explicit "textual target -> plain" arm is needed. A PostgreSQL type that
+    # Schema Conversion remodelled to a textual target derives ``kind == "text"`` just
+    # above, which falls through every branch below to the ``plain`` default -- and
+    # ``plain`` renders ``(col)::text``, byte-identical to what the loader stored
+    # (``CAST(col AS text)``, see source_dialect/postgres.py). An earlier draft added such
+    # an arm; it was removed after a mutation check proved it changed nothing for
+    # point/polygon/xml/tsvector/inet/cidr. The behaviour that actually matters is the
+    # PG-gated spatial arm above (which stops ``point`` being mistaken for MySQL's spatial
+    # ``point``) and the substitution-derived fallback (which stops ``money`` rendering as
+    # plain text when its target is numeric).
     if kind == "bytea":
         return "binary"
     if kind == "boolean":
@@ -418,7 +451,7 @@ def _pg_checksum_expr(
     :func:`_numeric_render_scale`).
     """
     ident = sql.Identifier(column.name)
-    kind = _checksum_kind(column)
+    kind = _checksum_kind(column, source_is_postgres)
     if kind == "binary":
         return sql.SQL("encode({col}, 'hex')").format(col=ident)
     if kind == "array_json":
@@ -503,6 +536,18 @@ def _pg_checksum_expr(
         # -- and CHEAPER: ~4-6x on 300k rows, with no extra scan and no per-row subquery
         # (measured 251 ms with to_char vs 51 ms with ``::text`` on a local PG 17.11; the ratio
         # is machine- and load-dependent, the direction is not).
+        # ``(col)::numeric`` is a NO-OP for a real numeric and is what makes a PostgreSQL
+        # ``money`` source checksummable at all: its target IS numeric (so this arm is
+        # right), but ``round(money, integer)`` does not exist, and that one column crashed
+        # the WHOLE table's checksum. The loader stored ``CAST(col AS numeric)`` for exactly
+        # this column, so the cast reproduces the stored value rather than reinterpreting
+        # it. Gated on the PG-source flag purely to keep a MySQL-source migration's
+        # rendered SQL byte-identical -- the cast would be a harmless no-op there too, but
+        # "unchanged" is a cheaper property to defend than "equivalent".
+        if source_is_postgres:
+            return sql.SQL("round(({col})::numeric, {scale})::text").format(
+                col=ident, scale=sql.Literal(scale),
+            )
         return sql.SQL("round({col}, {scale})::text").format(
             col=ident, scale=sql.Literal(scale),
         )

@@ -1799,7 +1799,10 @@ def test_pg_numeric_render_is_mask_free_and_cannot_overflow() -> None:
         expr = _pg_checksum_expr(
             ColumnDef(name="amount", mysql_type=spelling), source_is_postgres=True
         ).as_string(None)
-        assert expr == f'round("amount", {scale})::text', spelling
+        # The ``(col)::numeric`` is a no-op here and is gated on the PG-source flag: it is
+        # what makes a PostgreSQL ``money`` column checksummable, since round(money, int)
+        # does not exist and that one column crashed the whole table's checksum.
+        assert expr == f'round(("amount")::numeric, {scale})::text', spelling
         # No fixed-width digit mask may come back -- that IS the overflow vector.
         assert "to_char" not in expr, spelling
         assert "9999" not in expr, spelling
@@ -2677,14 +2680,59 @@ def test_pg_checksum_unconstrained_numeric_rounds_to_dsql_default_scale() -> Non
     # A PostgreSQL source passes source_is_postgres=True (both the DSQL target and the PG
     # source render with it), so a bare numeric compares at DSQL's default scale 6.
     rendered = build_pg_checksum_sql(table, source_is_postgres=True).as_string(None)
-    assert 'round("unconstrained", 6)' in rendered          # DSQL default scale, not 0
-    assert 'round("scaled", 2)' in rendered                 # declared scale kept
+    assert 'round(("unconstrained")::numeric, 6)' in rendered   # DSQL default scale, not 0
+    assert 'round(("scaled")::numeric, 2)' in rendered          # declared scale kept
     # Without the PG-source flag (the DEFAULT -- e.g. the DSQL target of a MySQL-source
     # migration) the scale-6 rule must NOT fire: a bare numeric renders at its declared
     # scale 0, matching the MySQL source side. This is the B1 regression guard.
     rendered_mysql = build_pg_checksum_sql(table).as_string(None)
     assert 'round("unconstrained", 0)' in rendered_mysql
-    assert 'round("unconstrained", 6)' not in rendered_mysql
+    assert 'round(("unconstrained")::numeric, 6)' not in rendered_mysql
+    # ...and the MySQL-source render is byte-identical to before: no cast at all.
+    assert '::numeric, 0)' not in rendered_mysql
+
+
+def test_pg_point_money_and_xml_are_checksummable_for_a_postgres_source() -> None:
+    """A PG source's remodelled types must render, not crash the whole table's checksum.
+
+    ``_checksum_kind`` classified a PostgreSQL column through MySQL's SPATIAL NAME SET --
+    and MySQL's set contains ``point`` and ``polygon``, two names PostgreSQL also uses for
+    entirely different types. So a PG ``point`` landed in kind ``binary`` and rendered
+    ``encode(col, 'hex')``, which exists for neither the source ``point`` nor the text
+    target: measured through the real ``run_validation`` as ``csum=None,
+    ERROR=UndefinedFunction``. One such column poisons the ENTIRE table's checksum, so the
+    table could never be verified -- and the cut-over gate blocks on an errored table
+    (correctly), making it a permanent dead end that pushes the operator toward Fast sweep
+    or ROW_COUNT, the one path that can report clean over an uncompared column.
+
+    ``money`` is the same shape with a different render: its target IS numeric so the
+    ``numeric`` arm is right, but ``round(money, integer)`` does not exist either.
+
+    The fix is ONE rule, not a name list: when Schema Conversion remodelled a PG type to a
+    TEXTUAL target, the loader stored the value's canonical source text, so the checksum
+    renders exactly that. Verified on a live PostgreSQL 17.11 and the live Aurora DSQL
+    target: ``('(1,2)'::point)::text`` -> ``(1,2)`` and ``('(1,2)'::text)::text`` -> the
+    same bytes; ``round(('$12.34'::money)::numeric, 6)::text`` -> ``12.340000`` matching
+    the target's ``round((12.34::numeric)::numeric, 6)::text``.
+    """
+    from dsql_migrator.core.models import ColumnDef
+    from dsql_migrator.core.validation_sql import _checksum_kind, _pg_checksum_expr
+
+    for spelling in ("point", "polygon", "xml", "tsvector"):
+        col = ColumnDef(name="c", mysql_type=spelling)
+        assert _checksum_kind(col, True) == "plain", spelling
+        rendered = _pg_checksum_expr(col, source_is_postgres=True).as_string(None)
+        assert rendered == '"c"::text', (spelling, rendered)
+        # A MySQL source is untouched: point/polygon there really ARE spatial -> binary.
+        if spelling in ("point", "polygon"):
+            assert _checksum_kind(col, False) == "binary", spelling
+
+    money = ColumnDef(name="amt", mysql_type="money")
+    assert _checksum_kind(money, True) == "numeric"
+    assert (
+        _pg_checksum_expr(money, source_is_postgres=True).as_string(None)
+        == 'round(("amt")::numeric, 6)::text'
+    )
 
 
 def test_pg_checksum_bigint_unsigned_scale_matches_mysql_source() -> None:

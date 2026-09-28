@@ -229,6 +229,36 @@ final class DebeziumEvents {
     return ChangeEvent.tombstone(table, pkColumns, pkValues, 0L);
   }
 
+  /**
+   * Read one field's RAW value without letting the schema's default stand in for a NULL.
+   *
+   * <p>{@code Struct.get(Field)} SUBSTITUTES the schema's default value when the slot is
+   * null (verified in connect-api 3.7.0's bytecode), and Debezium's
+   * {@code TableSchemaBuilder.addField} sets that default from the SOURCE COLUMN's own
+   * {@code DEFAULT} clause. So for any nullable column that has a default, a genuine source
+   * NULL arrived here as the default and was written to the target as though the row held
+   * it -- with no error, no dead letter and no log line. Live-reproduced on Aurora
+   * PostgreSQL 17.7: a row whose column IS NULL landed on Aurora DSQL holding the default.
+   * This affected BOTH source engines.
+   *
+   * <p>{@code getWithoutDefault} returns the slot verbatim. It is the correct reading for a
+   * Debezium sink because the record and its schema always come from the same schema
+   * version, so a null slot means the source value genuinely IS NULL -- and Debezium puts
+   * the real value even when it happens to EQUAL the default, so nothing that used to work
+   * starts failing. It cannot throw for a field obtained from {@code struct.schema()
+   * .fields()}, which is the only way this is called.
+   *
+   * <p>This also fixes the KEY path. A re-keyed table's key schema carries the same source
+   * default, so {@code Struct.get} fabricated a non-NULL key component out of a before-image
+   * that never had one: {@link #requireNoNullKeyComponent} could never fire, and the DELETE
+   * went out with an invented key, applied to 0 rows and was acknowledged -- the source row
+   * gone, the target's copy kept. Reading the slot verbatim restores the NULL, so that
+   * existing guard fires and dead-letters with its already-actionable message.
+   */
+  private static Object rawFieldValue(Struct struct, Field field) {
+    return struct.getWithoutDefault(field.name());
+  }
+
   private static void extractStruct(
       Object maybeStruct, List<String> names, List<Object> values, boolean pgSource) {
     if (!(maybeStruct instanceof Struct struct)) {
@@ -239,7 +269,7 @@ final class DebeziumEvents {
       // Convert the Debezium-encoded value to its canonical DSQL-target form
       // (e.g. MicroTimestamp Long -> java.sql.Timestamp) so it matches the Full
       // Load bulk loader's encoding before it is bound.
-      values.add(convertField(field, struct.get(field), pgSource));
+      values.add(convertField(field, rawFieldValue(struct, field), pgSource));
     }
   }
 
@@ -317,7 +347,7 @@ final class DebeziumEvents {
       return;
     }
     for (Field field : struct.schema().fields()) {
-      Object raw = struct.get(field);
+      Object raw = rawFieldValue(struct, field);
       if (dropToastPlaceholder && isToastPlaceholder(raw)) {
         continue; // unchanged TOAST value: omit so the existing target value is kept
       }

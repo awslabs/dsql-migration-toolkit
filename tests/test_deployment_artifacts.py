@@ -2255,6 +2255,11 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
     # One marker per behaviour the ZIP must carry. Each is a literal this repo's Java source
     # owns, so it can only be present if that source was compiled into the committed ZIP.
     markers = {
+        # v48: field values are read VERBATIM. Struct.get(Field) substitutes the schema's
+        # default for a null slot, and Debezium sets that default from the source column's
+        # DEFAULT clause -- so a source NULL was written to the target as the default, and a
+        # defaulted KEY column fabricated a delete key that matched 0 rows. Both engines.
+        "verbatim field read": b"getWithoutDefault",
         # v47: a source TRUNCATE is dead-lettered with the TRUNCATE NAMED. Without the
         # sink's op='t' branch a truncate envelope (no after-image, no key) fell through to
         # buildDelete and dead-lettered as "Cannot build DELETE ... no primary key" -- loud

@@ -1441,7 +1441,15 @@ class PostgresSourceDialect(SourceDialect):
             row = connection.execute(  # type: ignore[attr-defined]
                 text(
                     "SELECT active, wal_status, safe_wal_size, "
-                    "restart_lsn::text, confirmed_flush_lsn::text "
+                    "restart_lsn::text, confirmed_flush_lsn::text, "
+                    # How much WAL this slot is PINNING right now. The query already read
+                    # restart_lsn and then never used it: the slot holds every segment from
+                    # there forward, and at PostgreSQL's DEFAULT max_slot_wal_keep_size = -1
+                    # (measured on the live source) there is no server-side reclaim at all,
+                    # so an inactive slot pins WAL without bound until it is dropped. Still
+                    # one plain SELECT over a catalog view plus an LSN subtraction -- no
+                    # scan, no lock, no extra round trip.
+                    "pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint "
                     "FROM pg_replication_slots WHERE slot_name = :name"
                 ),
                 {"name": slot_name},
@@ -1465,6 +1473,7 @@ class PostgresSourceDialect(SourceDialect):
             safe_wal_size=_int(row[2]),
             restart_lsn=str(row[3]) if row[3] is not None else None,
             confirmed_flush_lsn=str(row[4]) if row[4] is not None else None,
+            retained_bytes=_int(row[5]),
         )
 
 

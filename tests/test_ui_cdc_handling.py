@@ -716,8 +716,58 @@ def test_change_flow_shows_idle_for_a_drained_pipeline() -> None:
         ),
     )
     text = " ".join(ui.texts)
-    assert "pipeline idle" in text
+    # The rate that reaches this branch is 0.03 rec/s -- which is a REAL change stream, not
+    # a drained one: measured live, 6 change events in 72s produced source 0.06 rec/s and
+    # landed here. So the line must NOT assert absence. It states the measured rates and the
+    # limit of what they can rule out; the words that used to be here ("No changes flowing",
+    # "pipeline idle") were the all-clear an operator reads when timing cut-over.
+    assert "At or below the idle floor" in text
+    assert "0.03 rec/s in" in text
+    assert "indistinguishable from drained" in text
+    assert "No changes flowing" not in text
     assert "Sink stalled" not in text
+
+    # THE DANGEROUS CASE, and the reason the copy fix exists: a source still producing while
+    # the sink applies NOTHING -- a total replication outage -- falls in the same band, so
+    # `sink_stalled` is False and this identical line renders. It must not read as drained.
+    ui2 = _RecordingUi()
+    _render_change_flow_status(
+        ui2,
+        cdc_activity_summary(
+            {
+                "src": ConnectorHealth(poll_rate=0.0833),  # ~5 changes/min
+                "sink": ConnectorHealth(send_rate=0.0),  # nothing applied at all
+            }
+        ),
+    )
+    stalled_band = " ".join(ui2.texts)
+    assert "At or below the idle floor" in stalled_band
+    assert "indistinguishable from drained" in stalled_band
+    assert "No changes flowing" not in stalled_band
+
+
+def test_the_idle_line_and_the_empty_lag_line_are_not_green_all_clears() -> None:
+    """Tone is severity, not decoration: neither line may read as the strongest all-clear.
+
+    Both used to: the idle icon was ``color="positive"`` and the empty-lag row was a green
+    ``check_circle`` labelled "Caught up — no replication lag". Each is rendered from the
+    ABSENCE of a datapoint, and the same absence is produced by a sink that has stopped
+    applying entirely -- so a total replication outage was shown in green.
+    """
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_monitoring
+
+    # Both lines live inside an element tree the CDC doubles do not reproduce, so they are
+    # pinned at the source -- the same way this repo pins other render-site properties.
+    src = inspect.getsource(_cdc_monitoring)
+    # The idle icon must not carry the Quasar `positive` tone.
+    assert 'ui.icon("pause_circle", color="positive")' not in src
+    assert 'ui.icon("pause_circle").classes("text-base text-sky-600")' in src
+    # "no datapoint" must not be rendered as "no lag", and not in green.
+    assert "No replication-lag datapoint in the recent window " in src
+    assert "Caught up — no replication lag" not in src
+    assert 'ui.icon("check_circle").classes("text-green-600 text-base")' not in src
 
 
 # ---------------------------------------------------------------------------
@@ -806,7 +856,7 @@ def test_refresh_pg_slot_health_reads_for_pg_and_noops_for_mysql() -> None:
     _refresh_pg_slot_health(
         pg_state,
         SourceConnectionConfig(source_type=SourceType.POSTGRES, host="pg", database="app"),
-        _Conn((True, "reserved", 999, "0/16B3748", "0/16B3800")),
+        _Conn((True, "reserved", 999, "0/16B3748", "0/16B3800", 184_320)),
     )
     from dsql_migrator.core.cdc_pg_slot import pg_slot_name
 

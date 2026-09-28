@@ -498,6 +498,11 @@ class SlotHealth:
     safe_wal_size: Optional[int] = None
     restart_lsn: Optional[str] = None
     confirmed_flush_lsn: Optional[str] = None
+    # Bytes of WAL the slot is pinning (pg_current_wal_lsn - restart_lsn). Reported as a
+    # FACT, never graded against an invented threshold: retained bytes growing while the
+    # stream is live is normal (measured), so an absolute alarm level would be a guess
+    # presented to the operator as a limit. The tone still keys on `active` / `wal_status`.
+    retained_bytes: Optional[int] = None
 
 
 def classify_slot_health(health: Optional[SlotHealth]) -> tuple[str, str, str]:

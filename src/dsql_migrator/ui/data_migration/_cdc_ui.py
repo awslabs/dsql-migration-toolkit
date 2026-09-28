@@ -1976,6 +1976,7 @@ def _render_cdc_partial_actions(
             ui, migration_state,
             lambda: _start_cdc_stop(ui, migration_state, job_manager, refresh, session=session),
             partial=True,
+            session=session,
         )
 
     def _retry() -> None:
@@ -2264,6 +2265,7 @@ def _render_cdc_running_actions(
         _open_cdc_stop_dialog(
             ui, migration_state,
             lambda: _start_cdc_stop(ui, migration_state, job_manager, refresh, session=session),
+            session=session,
         )
 
     ui.button(  # type: ignore[attr-defined]
@@ -4269,7 +4271,9 @@ async def _open_cdc_start_dialog(
             _render_pg_block()
     dialog.open()
 
-def _open_cdc_stop_dialog(ui, migration_state, on_confirm, *, partial: bool = False) -> None:
+def _open_cdc_stop_dialog(
+    ui, migration_state, on_confirm, *, partial: bool = False, session=None
+) -> None:
     """Confirm dialog before removing the CDC connectors.
 
     The same backend action (delete the connectors) serves two situations, so the
@@ -4302,9 +4306,28 @@ def _open_cdc_stop_dialog(ui, migration_state, on_confirm, *, partial: bool = Fa
             "deleting the connectors — but MSK, the VPC wiring and the plugins are kept, "
             "and so is the recorded stream position. Start CDC re-creates the connectors "
             "and continues from exactly where streaming stopped: no gap, nothing "
-            "re-applied, and no Full Load or start point needed again. You can stop and "
-            "restart as often as you like."
+            "re-applied, and no Full Load or start point needed again. Restart as often "
+            "as you like — but do not LEAVE it stopped."
         )
+        if _cdc_source_type(session) is SourceType.POSTGRES:
+            # WHY the position survives is also why the source keeps paying for it: the
+            # connector config sets slot.drop.on.stop=false, so the replication slot stays
+            # behind with no consumer attached -- and an inactive slot still pins every WAL
+            # segment written from its restart_lsn forward. At PostgreSQL's DEFAULT
+            # max_slot_wal_keep_size = -1 (measured on a live Aurora PostgreSQL source)
+            # there is NO server-side reclaim, so that retention is unbounded until the
+            # slot is dropped, which only Delete CDC infrastructure does. The old wording
+            # ("You can stop and restart as often as you like") said nothing about any of
+            # it, and the one place the tool warned about slot health was unreachable in
+            # exactly this state -- it renders only while CDC is streaming.
+            body += (
+                " On PostgreSQL the recorded position IS a replication slot, and the slot "
+                "is deliberately kept — so while CDC is stopped the source retains every "
+                "WAL segment the slot still needs. PostgreSQL does not reclaim it on its "
+                "own at the default max_slot_wal_keep_size, so source disk keeps growing "
+                "for as long as you stay stopped. Restarting drains it; if you are done, "
+                "use Delete CDC infrastructure, which drops the slot."
+            )
         confirm_label = "Stop CDC"
     with ui.dialog() as dialog, ui.card().classes("gap-2").style("min-width: 460px"):  # type: ignore[attr-defined]
         ui.label(title).classes("text-lg font-semibold")  # type: ignore[attr-defined]

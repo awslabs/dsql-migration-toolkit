@@ -524,7 +524,39 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # Bumped because the sink ZIP's CONTENT changed. A live cdc-stack needs Delete + Deploy infra:
 # Start CDC does not re-register the plugin, and the `skipped.operations` change replaces the
 # source connector anyway, so both requirements are the same single redeploy.
-PLUGIN_VERSION = "v47"
+# v48: the sink wrote a column's DEFAULT where the source held NULL -- silent CDC data
+# corruption, on BOTH source engines, with no error, no dead letter and no log line.
+# ``Struct.get(Field)`` SUBSTITUTES the schema's default value for a null slot (verified in
+# connect-api 3.7.0's bytecode), and Debezium's ``TableSchemaBuilder.addField`` sets that
+# default from the SOURCE COLUMN's own ``DEFAULT`` clause. So every CDC-written NULL in a
+# nullable defaulted column landed as the default instead. Live-reproduced on Aurora
+# PostgreSQL 17.7: a row whose column IS NULL arrived on Aurora DSQL holding the default,
+# while the controls behaved (an explicit value carried; an omitted column took the source's
+# own default). Only Validation's CHECKSUM could ever have caught it.
+#
+# The SAME substitution defeated the null-key DELETE guard on a re-keyed table. A re-keyed
+# table's KEY schema carries the source default too, so ``Struct.get`` fabricated a non-NULL
+# key component out of a before-image that never had one (the source connector does not
+# abort on a null key component -- it logs "Failed to properly convert key value" and
+# continues). ``requireNoNullKeyComponent`` could therefore NEVER fire: the DELETE went out
+# with an invented key, applied to 0 ROWS, and was acknowledged -- the source row gone and
+# the target's copy kept forever.
+#
+# Both are fixed by reading the slot VERBATIM (``getWithoutDefault``) at the two
+# value-reading call sites, via ``DebeziumEvents.rawFieldValue``. That is the correct
+# reading for a Debezium sink because a record and its schema always come from the same
+# schema version, so a null slot means the source value genuinely IS NULL -- and Debezium
+# puts the real value even when it EQUALS the default, so nothing that worked starts
+# failing. The three remaining ``struct.get`` sites read envelope METADATA (op / ts_ms) and
+# are deliberately left alone. The key fix needs no new guard: restoring the NULL makes the
+# EXISTING one fire, with its already-actionable "run ALTER TABLE <t> REPLICA IDENTITY FULL".
+#
+# NOT a PostgreSQL-only fix, and the usual "MySQL byte-identical" note does NOT apply here:
+# MySQL was equally wrong, and its behaviour changes too.
+#
+# Bumped because the sink ZIP's CONTENT changed. A live cdc-stack needs Delete + Deploy
+# infra: Start CDC alone does not re-register the plugin.
+PLUGIN_VERSION = "v48"
 
 
 class S3ProvisionError(RuntimeError):

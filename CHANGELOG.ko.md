@@ -5,6 +5,30 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.558
+
+같은 라이브 PostgreSQL 17.7 → MSK → Aurora DSQL 파이프라인에서 나온 5건입니다. 둘은 조용한 CDC 데이터 손상, 하나는 테이블을 영구히 검증할 수 없게 만드는 문제, 둘은 측정값과 반대되는 내용을 운영자에게 보여주던 화면입니다.
+
+### 수정 — 조용한 CDC 데이터 손상 (플러그인 v47 → v48)
+
+- **sink가 소스가 NULL을 담은 자리에 컬럼 DEFAULT를 썼습니다 — 양쪽 소스 엔진 모두.** `Struct.get(Field)`는 빈 슬롯을 스키마 DEFAULT로 **치환**하고(connect-api 3.7.0 바이트코드로 확인), Debezium의 `TableSchemaBuilder`는 그 DEFAULT를 **소스 컬럼의 `DEFAULT` 절**에서 채웁니다. 그래서 DEFAULT가 있는 nullable 컬럼의 모든 CDC 기록 NULL이 DEFAULT로 들어갔습니다 — 라이브 재현: 컬럼이 `IS NULL`인 행이 DSQL에 DEFAULT를 담고 도착했고, 에러·dead letter·로그가 전혀 없었으며, 대조군은 정상이었습니다(명시값은 전달, 생략 시 소스 자신의 DEFAULT). Validation CHECKSUM만이 잡을 수 있었습니다. 이제 필드 값을 **그대로**(`getWithoutDefault`) 읽습니다. Debezium sink에서 올바른 읽기인 이유: 레코드와 스키마가 항상 같은 스키마 버전에서 오므로 빈 슬롯은 소스 값이 진짜 NULL이라는 뜻이고, Debezium은 값이 DEFAULT와 **같아도** 실제 값을 넣으므로 잘 되던 것이 깨지지 않습니다. **PostgreSQL 전용 수정이 아닙니다: MySQL도 똑같이 틀렸고 함께 동작이 바뀝니다.**
+- **같은 치환이 재키된 테이블에서 null-key DELETE 가드를 발동 불가로 만들었습니다.** 재키된 테이블의 **KEY 스키마도** 소스 DEFAULT를 나르고, 소스 커넥터는 null 키 성분에 중단하지 않습니다(`Failed to properly convert key value`를 남기고 계속) — 그래서 `Struct.get`이 before-image에 없던 키 성분을 **조작**했습니다. `requireNoNullKeyComponent`는 **절대 발동할 수 없었고**, DELETE가 가짜 키로 나가 **0행**에 적용되고 ack됐습니다 — 소스 행은 사라지고 타깃 사본은 영구 잔존. 슬롯을 그대로 읽으면 NULL이 복원되어 **기존 가드가** 이미 실행 가능한 구제책(`run ALTER TABLE <t> REPLICA IDENTITY FULL`)과 함께 발동합니다. 새 가드는 만들지 않았습니다 — 그게 더 작은 변경이고 더 쉬운 질문이었습니다.
+- 기존 cdc-stack에는 **Delete + Deploy CDC infrastructure**가 필요합니다 — `Start CDC`는 플러그인을 재등록하지 않습니다.
+
+### 수정 — 아예 검증할 수 없던 테이블
+
+- **PostgreSQL `point`·`polygon`·`money` 컬럼 하나가 테이블 전체의 체크섬을 영구히 실패시켰습니다.** `_checksum_kind`가 PostgreSQL 컬럼을 **MySQL의 spatial 이름 집합**으로 분류했고, MySQL 집합에는 `point`와 `polygon`이 있습니다 — PostgreSQL도 전혀 다른 타입에 같은 이름을 씁니다. 그래서 PG `point`가 `binary` 종류로 떨어져 `encode(col, 'hex')`를 렌더했고, 이는 소스 `point`에도 text 타깃에도 없는 함수입니다: 실제 `run_validation`으로 `csum=None, ERROR=UndefinedFunction`으로 측정됐습니다. `money`는 같은 형태의 다른 렌더 — 타깃이 numeric이라 분기는 맞지만 `round(money, integer)`도 없습니다. Full Load는 둘 다 정확히 이관하므로 **데이터는 있는데 검증만 불가능**했고, cut-over 게이트가 errored 테이블에 (올바르게) 차단하므로 **영구 막다른 길**이 되어 운영자를 Fast sweep이나 ROW_COUNT로 밀었습니다 — 비교하지 않은 컬럼에 대해 clean을 보고할 수 있는 유일한 경로입니다. 이제 spatial 분기는 MySQL 전용이고, 해석되지 않은 PG 타깃 타입은 MySQL 타입 맵 대신 Schema Conversion 자신의 치환에서 파생되며, numeric 분기는 `(col)::numeric`으로 캐스트합니다(진짜 numeric에는 no-op). 라이브 PostgreSQL 17.11과 라이브 DSQL에서 측정: 소스 `('(1,2)'::point)::text` → `(1,2)`, 타깃 `('(1,2)'::text)::text` → 동일 바이트; `money`는 양쪽 `12.340000`. **MySQL 소스 마이그레이션의 렌더 SQL은 바이트 동일합니다** — 캐스트를 PG 소스로 게이트했습니다. "동등"보다 "불변"이 지키기 싼 속성입니다.
+
+### 수정 — 자기 측정값과 모순되던 화면
+
+- **CDC 모니터가 살아있는 변경 스트림과 완전히 멈춘 sink 위에 가장 강한 all-clear를 렌더했습니다.** idle 판정과 stall 탐지가 **같은 0.1 rec/s 임계값**에 걸려 같은 대역에서 함께 멀고, 배포된 5분 heartbeat가 거기서 source rate의 실제 바닥이라 임계값을 낮출 수도 없습니다. 라이브 측정: 72초에 변경 6건 → source 0.06 rec/s인데 UI는 초록 *"No changes flowing — pipeline idle"* 과 *"Caught up — no replication lag"* 를 **그 rate를 보여주는 자기 게이지 바로 위에** 렌더했습니다. 더 나쁜 건, 소스는 생산 중인데 sink가 **아무것도** 적용하지 않는 전면 복제 중단도 같은 대역에 들어가 동일한 초록을 렌더했다는 점입니다. cut-over 타이밍을 정할 때 읽는 바로 그 표시입니다. 이제 각 줄이 **측정값과 배제할 수 없는 것**을 말하고(*"At or below the idle floor (0.06 rec/s in, 0.00 rec/s out) — up to ~6 changes/min is indistinguishable from drained"*), lag 카드는 *"Caught up"* 대신 *"No replication-lag datapoint in the recent window — the sink reports lag only while it is applying"*, 톤은 초록이 아닌 중립, 툴팁도 idle을 배수의 증거로 제시하지 않습니다. 0.03 rec/s(= 실제 변경 스트림)에 *"pipeline idle"* 을 단정했던 테스트가 그 자체로 결함이었고, 이제 정직한 문구와 **정지한 sink** 사례를 고정합니다.
+- **Stop CDC가 *"You can stop and restart as often as you like"* 라고 했지만, PostgreSQL에서는 유지된 복제 슬롯이 멈춰 있는 동안 소스 WAL을 계속 고정합니다.** 커넥터 설정이 의도적으로 `slot.drop.on.stop=false`입니다 — 그게 위치가 살아남는 **이유**입니다 — 그러나 비활성 슬롯도 `restart_lsn` 이후 모든 WAL 세그먼트를 보유하며, PostgreSQL 기본값 `max_slot_wal_keep_size = -1`(라이브 소스에서 측정)에서는 서버 측 회수가 **전혀 없습니다**. 슬롯 상태를 경고하던 유일한 자리는 정확히 이 상태에서 도달 불가였습니다 — CDC가 **스트리밍 중일 때만** 렌더되기 때문입니다. 이제 다이얼로그가 PG 한정 문단으로 슬롯·무한 보유·이를 해제하는 유일한 조치(Delete CDC infrastructure)를 명시하고, 초대 문구는 *"Restart as often as you like — but do not LEAVE it stopped."* 로 한정됩니다. MySQL 문구는 바이트 동일입니다: binlog 보유는 소스 자신의 정책이고 이 툴이 쥔 슬롯이 아닙니다. 슬롯 읽기는 이제 **고정 중인 WAL 바이트**도 보고합니다 — 이미 `restart_lsn`을 읽고 쓰지 않던 **기존 `SELECT` 한 번** 안에서 계산하며, **임의 임계값 없이** 사실로만 제시합니다. 스트림이 살아있는 동안 보유 바이트가 늘어나는 것은 정상이고, 절대 경보선은 추측을 한계처럼 제시하는 일이 됩니다.
+
+### 수정 — 데이터 손실을 "괜찮다"고 말하던 사전 점검
+
+- **CDC 컬럼 점검이 `bit`/`bit varying` 세 선언 형태를 "carries fine"이라고 말했지만 사실이 아닙니다.** `bit`/`varbit`를 **배열 원소일 때만** 문제로 봤고, 주석은 스칼라 bit/varbit가 "정상 복제된다"고 단언했습니다. 배포된 sink를 상대로 라이브 측정한 결과 **네 폭 대역 중 셋이 데이터를 잃습니다**: **길이 미지정**(`atttypmod = -1`, Debezium이 2147483647비트로 보고) 또는 **65535 초과**는 타깃이 저장할 수 없는 폭이라 sink가 거부해 **행 전체가 dead-letter**; **폭 ≤ 1**(맨 `bit`, `bit(1)`, `bit varying(1)`)은 Debezium이 1비트 컬럼을 Connect BOOLEAN으로 매핑해 소스와 Full Load가 `1`/`0`을 렌더하는 자리에 `true`/`false`로 도착; **`bit varying(n)` 2..65535**는 Bits 페이로드에 값별 길이가 없어 `n`보다 짧은 값이 앞에 0을 얻습니다. n ≥ 2인 `bit(n)`만 정확합니다. **어느 것도 sink에서는 어떤 플러그인 버전으로도 고칠 수 없습니다** — 와이어가 실제 PostgreSQL `boolean`과 구분되지 않는 맨 boolean을 나르고, 바이트에 길이가 없습니다 — 그래서 사전 점검이어야 합니다. 상한은 Java 소스를 읽는 테스트로 sink의 `MAX_STORABLE_BIT_LENGTH`에 고정해 둘이 드리프트할 수 없게 했습니다. 옛 동작을 **고정하고 있던 테스트**는 제거했습니다.
+- **같은 점검이 테이블 전체 손실을 과장했습니다.** *"EVERY insert, update and delete on this table dead-letters … nothing reaches the target"* 라고 했지만, 라이브에서 문제 컬럼을 NULL로 두는 행은 **정상 착륙**합니다 — sink의 변환기는 non-NULL 값에만 도달합니다. 이제 *"every insert, update and delete that POPULATES this column"* 이라고 하고 테이블 전체가 아닐 수 있음을 명시해, 과장된 차단 문구 때문에 캡처에서 테이블을 통째로 빼는 일을 막습니다. (*"for the jsonb target column"* 도 타깃이 text인 스칼라에는 틀렸습니다.)
+
 ## v0.1.557
 
 라이브 PostgreSQL 17.7 -> MSK -> Aurora DSQL 파이프라인을 실제로 돌리고 각 발견을 적대적으로 검증해 찾은 8건입니다. 그중 다섯은 **false MATCH** 경로 — 데이터가 다른데 Validation이 동일하다고 보고하는 것 — 이고, cut-over 게이트가 그 판정을 읽습니다.

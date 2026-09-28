@@ -1655,13 +1655,67 @@ def test_classify_uncarryable_cdc_column_taxonomy() -> None:
     # failure mode this check is one step away from.
     for elem in ("int4", "text", "date", "timestamptz", "timestamp", "jsonb", "uuid"):
         assert _c(elem) is None, elem
-    # A SCALAR timetz / interval / money / xml / point / bit / varbit all have real
-    # Debezium converters: it is only their ARRAY forms that do not.
-    for elem in ("timetz", "interval", "money", "xml", "point", "bit", "varbit", "bytea"):
+    # A SCALAR timetz / interval / money / xml / point has a real Debezium converter: it is
+    # only their ARRAY forms that do not.
+    for elem in ("timetz", "interval", "money", "xml", "point", "bytea"):
         assert _c(elem, array=False) is None, elem
+    # bit / varbit are NOT in that list -- this assertion used to PIN THE BUG. Live-measured
+    # on Aurora PostgreSQL 17.7 against the shipped sink, three of the four width bands lose
+    # data and none is fixable in the sink at any plugin version:
+    #   unbounded (atttypmod -1, Debezium reports 2147483647 bits) or wider than 65535
+    #     -> the sink REFUSES it, so the whole row dead-letters;
+    #   width <= 1 -> Debezium maps it to a Connect BOOLEAN, so it lands as 'true'/'false'
+    #     where the source and Full Load render '1'/'0';
+    #   bit varying(n), 2..65535 -> a value SHORTER than n gains leading zeros, because the
+    #     Bits payload carries no per-value length;
+    #   bit(n), 2..65535 -> exact, because fixed width means the padding IS the value.
+    for base in ("bit", "varbit"):
+        assert _c(base, array=False, typmod=-1) == UNCARRYABLE_ROW_DEAD_LETTERS, base
+        assert _c(base, array=False, typmod=70000) == UNCARRYABLE_ROW_DEAD_LETTERS, base
+        assert _c(base, array=False, typmod=1) == UNCARRYABLE_COLUMN_ARRIVES_WRONG, base
+    assert _c("varbit", array=False, typmod=8) == UNCARRYABLE_COLUMN_ARRIVES_WRONG
+    assert _c("bit", array=False, typmod=8) is None
+    assert _c("bit", array=False, typmod=65535) is None
+    # The bound MUST equal the sink's own MAX_STORABLE_BIT_LENGTH or the two drift apart and
+    # the prerequisite starts disagreeing with what the sink actually does.
+    from dsql_migrator.core.prerequisites_postgres import _MAX_STORABLE_BIT_LENGTH
+    import pathlib as _p
+
+    java = _p.Path(__file__).resolve().parents[1] / (
+        "connectors/dsql-sink/src/main/java/dev/dsqlmigrator/connect/"
+        "DebeziumTypeConverter.java"
+    )
+    assert f"MAX_STORABLE_BIT_LENGTH = {_MAX_STORABLE_BIT_LENGTH};" in java.read_text()
     # An array of a user-defined ENUM: the probe's pg_catalog filter yields no base name,
     # so nothing is flagged. Enums arrive as plain strings and replicate correctly.
     assert _c(None) is None
+
+
+def test_the_probe_asks_for_scalar_bit_and_varbit_or_the_classifier_never_runs() -> None:
+    """The SQL filter must return bit/varbit, or the width grading above is dead code.
+
+    ``CDC_UNCARRYABLE_CANDIDATE_SCALARS`` is what the probe filters on server-side, and it
+    is derived from ``_CDC_UNCARRYABLE_SCALARS`` -- which deliberately does NOT contain
+    bit/varbit, because their reason depends on the declared width rather than the name. So
+    they have to be added to the candidate tuple explicitly. Measured: dropping them from
+    the tuple failed no other test in the suite, which is exactly how a fix gets silently
+    neutralised -- the classifier keeps returning the right answer for a question the probe
+    never asks.
+    """
+    import inspect
+
+    from dsql_migrator.core import source_dialect
+    from dsql_migrator.core.prerequisites_postgres import (
+        CDC_UNCARRYABLE_CANDIDATE_SCALARS,
+    )
+
+    assert "bit" in CDC_UNCARRYABLE_CANDIDATE_SCALARS
+    assert "varbit" in CDC_UNCARRYABLE_CANDIDATE_SCALARS
+    # ...and the probe BINDS that very tuple, so the filter cannot drift from the
+    # classifier: the dialect passes it as the query's ``scalars`` parameter rather than
+    # spelling a list of names into the SQL.
+    src = inspect.getsource(source_dialect.postgres)
+    assert '"scalars": list(CDC_UNCARRYABLE_CANDIDATE_SCALARS)' in src
 
 
 def test_probe_reads_uncarryable_columns_in_one_round_trip() -> None:

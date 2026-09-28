@@ -16505,7 +16505,43 @@ def test_stop_dialog_promises_the_position_survives() -> None:
     assert "the recorded stream position" in blob
     assert "continues from exactly where streaming stopped" in blob
     assert "no Full Load or start point needed again" in blob
-    assert "stop and restart as often as you like" in blob
+    # "You can stop and restart as often as you like" was true about the POSITION and
+    # silent about the price: on PostgreSQL the position IS a replication slot, kept on
+    # purpose (slot.drop.on.stop=false), and an inactive slot pins every WAL segment it
+    # still needs -- with NO server-side reclaim at PostgreSQL's default
+    # max_slot_wal_keep_size = -1. So the invitation is now bounded.
+    assert "Restart as often as you like — but do not LEAVE it stopped" in blob
+    assert "stop and restart as often as you like" not in blob
+    # A MySQL source (the default here) must NOT get the slot paragraph: binlog retention
+    # is the source's own policy, not a slot this tool holds.
+    assert "replication slot" not in blob
+
+
+def test_stop_dialog_warns_a_postgres_source_that_the_slot_keeps_pinning_wal() -> None:
+    """The one place this could be said was unreachable in exactly this state.
+
+    ``_render_cdc_slot_health`` renders only while CDC is STREAMING, so the moment the
+    operator stops -- which is when the retention starts accruing -- the warning is gone.
+    The dialog is where the decision is made, so the dialog has to carry it.
+    """
+    from dsql_migrator.core.models import SourceConnectionConfig, SourceType
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    class _PgSession:
+        source_config = SourceConnectionConfig(
+            host="db", database="app", source_type=SourceType.POSTGRES
+        )
+
+    ui = _RecordingUi()
+    _cdc_ui._open_cdc_stop_dialog(
+        ui, DataMigrationState(), lambda: None, session=_PgSession()
+    )
+    blob = " ".join(ui.texts)
+    assert "the recorded position IS a replication slot" in blob
+    assert "retains every WAL segment" in blob
+    assert "max_slot_wal_keep_size" in blob
+    # ...and it names the only action that actually releases it.
+    assert "Delete CDC infrastructure, which drops the slot" in blob
 
 
 # ---------------------------------------------------------------------------
