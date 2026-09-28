@@ -517,6 +517,67 @@ def test_build_validation_chat_system_grounds_on_facts_and_recovery() -> None:
     assert "USE ANY TOOLS" in system
 
 
+def test_build_validation_chat_system_binds_the_answer_to_the_named_table() -> None:
+    """``scope="table"`` alone does NOT confine the answer -- ``table`` is what does.
+
+    The chat is handed run-wide tools (``get_validation_summary``,
+    ``list_validation_mismatches``) that take no table argument and return EVERY
+    validated table, and the prompt tells the model to use them. Live-observed with 7
+    failing tables: the per-table "Explain with AI" button answered about all of them,
+    because nothing in the prompt named the clicked table or forbade reporting the
+    others.
+    """
+    from dsql_migrator.core.assessment_strategist import build_validation_chat_system
+
+    facts = "Table: ecommerce.orders\nSource row count: 511\nTarget row count: 508"
+    scoped = build_validation_chat_system(
+        facts, scope="table", table="ecommerce.orders"
+    )
+    # The subject is NAMED, and naming it is an instruction rather than a noun phrase.
+    assert "ecommerce.orders" in scoped
+    assert "ONLY that table" in scoped
+    # Run-wide tool output stays usable as CONTEXT -- that is how a table-specific cause
+    # is told from a pipeline-wide one -- but reporting the other tables is forbidden.
+    assert "context for" in scoped
+    assert "do NOT report findings" in scoped
+    # The restriction must come BEFORE the paragraph that hands over the tools,
+    # otherwise it reads as an exception to them instead of framing them.
+    assert scoped.index("ONLY that table") < scoped.index("USE ANY TOOLS")
+
+    # Omitting `table` leaves the prompt byte-identical, so the run-scope caller and
+    # every existing caller are provably unaffected by this change.
+    assert build_validation_chat_system(facts, scope="table") == (
+        build_validation_chat_system(facts, scope="table", table=None)
+    )
+    unscoped = build_validation_chat_system(facts, scope="table")
+    assert "ONLY that table" not in unscoped
+    # A run-scope chat is never restricted, even if a table name is passed by mistake.
+    run = build_validation_chat_system(facts, scope="run", table="ecommerce.orders")
+    assert "ONLY that table" not in run
+
+
+def test_stream_validation_chat_passes_the_table_through_to_the_prompt() -> None:
+    # The UI's per-table opener sets `table`; it must reach the system prompt, or the
+    # restriction silently does nothing and the bug returns.
+    from dsql_migrator.core.assessment_strategist import AssessmentStrategist
+
+    seen: dict = {}
+
+    class _S(AssessmentStrategist):
+        def stream_chat(self, system, messages, on_delta):  # type: ignore[override]
+            seen["system"] = system
+            return None
+
+    s = _S.__new__(_S)
+    s._source_engine = "PostgreSQL"  # type: ignore[attr-defined]
+    s.stream_validation_chat(
+        "Table: ecommerce.orders", [], lambda _d: None,
+        scope="table", table="ecommerce.orders",
+    )
+    assert "ecommerce.orders" in seen["system"]
+    assert "ONLY that table" in seen["system"]
+
+
 def test_stream_validation_chat_routes_to_tool_chat_when_tools_given() -> None:
     # With tools + execute, a mismatch chat runs the agentic tool loop so it can
     # look up the real converted DDL / target schema / counts to root-cause the

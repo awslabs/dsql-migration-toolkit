@@ -341,6 +341,45 @@ def run_validation(
     )
 
 
+_IDENTITY_DEFER_TABLE_SAMPLE = 5
+
+
+def identity_sync_deferred_tables(report: "ValidationReport") -> tuple[str, ...]:
+    """Tables this report PROVES the target is behind on, in report order.
+
+    ``resync_identity_sequences`` sets each sequence to the TARGET's ``MAX(pk) + 1``,
+    and its whole correctness argument is its documented precondition: it runs "once
+    CDC has drained and the source is frozen". When the target is BEHIND, that value
+    is an id the source has ALREADY used and CDC is still going to deliver -- so the
+    sync hands the application the very duplicate key it exists to prevent.
+
+    Live-observed: a run with the writer still going and CDC stopped logged SUCCESS
+    while advancing ``orders`` to ``RESTART WITH 521`` in the same report that listed
+    ``missing on target: 521, 522, 523, 524``. The evidence was already computed and
+    simply not consulted.
+
+    "Behind" is deliberately the narrow, POSITIVE evidence rather than
+    ``not summary.is_match``: a checksum-only divergence (equal counts, no missing
+    rows) leaves ``MAX(pk)`` correct, so the sync is still right there and skipping it
+    would lose a real safeguard. Two signals, either sufficient:
+
+    * ``reconcile.missing_on_target > 0`` -- rows exist on the source and not the
+      target. Exact, but only available when reconciliation ran.
+    * ``source_row_count > target_row_count`` -- the count-only signal, so ROW_COUNT
+      mode (no reconciliation) is covered too.
+
+    Returns ``()`` when nothing shows the target behind, i.e. the sync may run. Pure;
+    value-free (table names and counts only, never rows).
+    """
+    behind: list[str] = []
+    for item in getattr(report, "items", ()) or ():
+        rec = getattr(item, "reconcile", None)
+        missing = int(getattr(rec, "missing_on_target", 0) or 0) if rec else 0
+        if missing > 0 or item.source_row_count > item.target_row_count:
+            behind.append(item.table)
+    return tuple(behind)
+
+
 def resync_identity_sequences(
     target_config: TargetConnectionConfig,
     table_names: "Sequence[str]",
@@ -2307,13 +2346,46 @@ def build_validation_screen(
             # step just before cut-over (after CDC drains), so closing it here is the
             # right moment. Read-only comparison stays read-only; this is a separate,
             # reported target write that never fails the report.
-            advanced, failed = resync_identity_sequences(
-                target_config,
-                [table.name for table in scoped_tables],
-                aws_profile=session.aws_profile,
-                sync=sync_sequences,
-            )
-            validation_state.set_identity_sync(advanced, failed)
+            #
+            # DEFER when this very report shows the target BEHIND the source. Running
+            # here is only correct once CDC has drained; on a lagging target MAX(pk)+1
+            # is an id the source already used and CDC has yet to deliver, so the sync
+            # would CREATE the collision it prevents (see
+            # identity_sync_deferred_tables). Cut over re-runs the sync, which is the
+            # real guarantee point -- so deferring loses nothing, whereas advancing on a
+            # lagging target both writes a bad value and logs SUCCESS claiming the
+            # application's first insert cannot collide.
+            _behind = identity_sync_deferred_tables(result)
+            if _behind:
+                # None (not {}) == "did not run": {} means "ran, nothing to advance",
+                # which the readiness panel would read as a completed safeguard.
+                validation_state.set_identity_sync(None, None)
+                _behind_detail = ", ".join(_behind[:_IDENTITY_DEFER_TABLE_SAMPLE]) + (
+                    " (+more)" if len(_behind) > _IDENTITY_DEFER_TABLE_SAMPLE else ""
+                )
+                log_activity(
+                    ActivityCategory.VALIDATION,
+                    "identity sequence re-sync deferred to cut-over",
+                    status=ActivityStatus.WARNING,
+                    detail=(
+                        f"Skipped: {len(_behind)} table(s) show the target BEHIND the "
+                        f"source, so advancing a sequence to the target's MAX(pk)+1 "
+                        f"would claim an id the source has already used and CDC has yet "
+                        f"to apply — the duplicate key this step prevents. Let CDC "
+                        f"drain (or re-run Full Load for a standing gap), re-validate, "
+                        f"and the sync runs; Cut over re-runs it either way. "
+                        f"Behind: {_behind_detail}"
+                    ),
+                )
+                advanced, failed = {}, {}
+            else:
+                advanced, failed = resync_identity_sequences(
+                    target_config,
+                    [table.name for table in scoped_tables],
+                    aws_profile=session.aws_profile,
+                    sync=sync_sequences,
+                )
+                validation_state.set_identity_sync(advanced, failed)
             if advanced:
                 detail = ", ".join(
                     f"{name} -> RESTART WITH {value}"
@@ -2683,7 +2755,7 @@ def build_validation_screen(
                     # persistent app-wide AI panel; no-op when it is not wired (tests).
                     def diagnose_provider(  # noqa: E731 - small bound opener
                         *, title, subtitle, first_question, facts, scope,
-                        scope_id, chip,
+                        scope_id, chip, table=None,
                     ):
                         if open_ai_scope is None:
                             return
@@ -2696,6 +2768,11 @@ def build_validation_screen(
                             streamer=lambda messages, on_delta: (
                                 strategist.stream_validation_chat(
                                     facts, messages, on_delta, scope=scope,
+                                    # NAMES the subject for a per-table chat. Required,
+                                    # not cosmetic: the tools below are run-wide and take
+                                    # no table argument, so without this the per-table
+                                    # button answered about EVERY mismatched table.
+                                    table=table,
                                     # The shared read-only tools let the chat root-cause
                                     # a divergence against the real converted DDL / target
                                     # schema / live counts, not just the frozen facts.
@@ -5525,6 +5602,9 @@ def _render_failing_table(
                             ),
                             facts=_validation_table_facts(_it),
                             scope="table",
+                            # Without this the run-wide tools make the answer cover
+                            # every mismatched table, not the one that was clicked.
+                            table=_it.table,
                             scope_id=f"validation:{_it.table}",
                             chip=f"Validation · {_it.table}",
                         ),

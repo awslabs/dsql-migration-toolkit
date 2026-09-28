@@ -5,6 +5,28 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.560
+
+Four fixes from reviewing a live PostgreSQL CDC run: the per-table AI button ignored which table you clicked, the identity-sequence re-sync could hand the application a duplicate key, the replication-slot panel showed a stale reading as live and pointed at a destructive fix, and the dead-letter guidance prescribed a repair the tool withholds while CDC runs.
+
+### Fixed
+
+- **"Explain with AI" on one failing table answered about ALL of them.** The per-table button in "Tables needing attention" passed the right single-table facts, but the chat is also handed run-wide tools (`get_validation_summary`, `list_validation_mismatches`) that take no table argument and return every validated table — and the system prompt told the model to use them while never naming the clicked table or forbidding it from reporting the others. `scope="table"` only picked a framing noun, so the per-table and whole-run answers came out effectively the same. Live-observed with 7 failing tables. The prompt now NAMES the subject and restricts the answer to it, with run-wide tool output allowed as context only (telling a table-specific cause from a pipeline-wide one) — placed BEFORE the paragraph that hands over the tools, so it frames their use rather than reading as an exception to it. Omitting the new argument leaves the prompt byte-identical, so the whole-run caller is provably unaffected.
+
+  This mattered beyond cosmetics: a real value divergence on one table was explained away by reasoning drawn from the other tables' findings.
+
+- **The post-validation identity-sequence re-sync now DEFERS when the target is behind.** The sync sets each sequence to the target's `MAX(pk) + 1`, and its whole correctness argument is its documented precondition — it runs "once CDC has drained and the source is frozen". Nothing checked that. Live-observed: a run with the writer still going and CDC stopped logged **SUCCESS**, claiming "the application's first insert after cut-over cannot collide", while advancing `orders` to `RESTART WITH 521` in the same report that listed `521, 522, 523, 524` as missing on the target — so the app's first insert would have collided with the CDC row still to be delivered. Four of seven sequences landed on ids the source had already used. The evidence was already computed and simply not consulted.
+
+  It now skips when the report itself proves the target is behind, and records that as a WARNING naming the tables and what unblocks it. Cut over re-runs the sync, so deferring loses nothing.
+
+  "Behind" is deliberately narrow, POSITIVE evidence rather than "the run did not match": a checksum-only divergence (equal counts, nothing missing) leaves `MAX(pk)` correct, so the sync still runs there — skipping it would drop a real safeguard. Two signals, either sufficient: `missing_on_target > 0` (exact, when reconciliation ran) or `source_row_count > target_row_count` (so ROW_COUNT mode is covered too).
+
+- **The replication-slot panel presented a stale reading as live — and pointed at a destructive fix.** The slot is read only when you refresh the source/target counts, but the panel re-renders on every 5-second CDC tick, with no read time and no reset on Stop/Start CDC. Live-observed: counts refreshed while CDC was stopped captured `active=False`; after Start CDC the panel kept saying "Replication slot has no consumer" while the real slot was `active=True` and draining 15 MB of retained WAL. The snapshot is now dropped when the pipeline starts or stops (a reading from the other state describes a consumer that no longer exists, or did not yet), and the panel states when the slot was read and how to re-read it.
+
+  The advice itself was also wrong: "Resume CDC, or delete the CDC infrastructure to drop the slot" offered two remedies as equals, and the second drops the slot together with every change it is still holding for the target — the exact backlog a restart replays, unrecoverable afterwards. It now leads with Start CDC, and names deletion only for abandoning the CDC run, with what it destroys.
+
+- **The dead-letter guidance prescribed a repair the tool refuses while CDC runs.** "Confirm the effect of these drops in Validation" said missing rows are fixed by a reload and extra rows need the table "dropped and reloaded" — but that card is only on screen while the sink streams, and in exactly that state Full Load does not offer the drop-and-recreate option at all and warns that re-running collides with the live pipeline. Two screens contradicted each other. It now states that both repairs need Stop CDC first, and why the option is missing.
+
 ## v0.1.559
 
 A live re-check of v0.1.558's own fix found it inert, and the real cause two layers higher. It took two live rounds to pin down, so the mechanism is written out in full below.

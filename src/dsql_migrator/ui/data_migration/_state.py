@@ -312,6 +312,10 @@ class DataMigrationState:
         # for a MySQL source (which has no slot). Stored untyped to avoid importing the
         # PG-only model here.
         self.cdc_slot_health = None
+        # When cdc_slot_health was READ (UTC). The slot is read only on the consistency-view
+        # refresh -- never on the 5 s CDC poll -- so the panel re-renders a SNAPSHOT every
+        # tick. Without the time it was presented as live state (see set_cdc_slot_health).
+        self.cdc_slot_health_at: Optional[datetime] = None
         # Rolling replication-lag series backing the live "Stream lag" chart:
         # [(epoch_seconds, max_lag_ms), ...], bounded to ~15 min. Hybrid — seeded once
         # from CloudWatch's 1-minute history (survives a reload) then extended by each
@@ -794,6 +798,7 @@ class DataMigrationState:
             self.cdc_replication_lag_series = []
             # Slot health belongs to the previously-targeted stack's slot.
             self.cdc_slot_health = None
+            self.cdc_slot_health_at = None
         return True
 
     def append_cdc_deploy_log(self, when: datetime, message: str) -> None:
@@ -891,9 +896,20 @@ class DataMigrationState:
         ``health`` is a :class:`~dsql_migrator.core.cdc_postgres.SlotHealth` (or ``None``
         when unknown / not a PostgreSQL source). Thread-safe: written from the read-only
         source-read worker, read by the render on the loop.
+
+        Stamps the read time. The slot is read only when the operator refreshes the
+        source/target counts, but the panel re-renders on every 5 s CDC tick, so a
+        snapshot outlives the state it described. Live-observed: counts refreshed while CDC
+        was stopped captured ``active=False``; after Start CDC the panel kept saying
+        "Replication slot has no consumer" -- and advising deletion of the CDC
+        infrastructure -- while the real slot was ``active=True`` and draining its
+        backlog. The time lets the panel say what it is actually showing.
         """
         with self._lock:
             self.cdc_slot_health = health
+            self.cdc_slot_health_at = (
+                datetime.now(timezone.utc) if health is not None else None
+            )
 
     def set_cdc_ops_window_start(self, ts: "Optional[datetime]") -> None:
         """Pin the start of the window the per-table applied-ops (I/U/D) are summed over.
@@ -964,9 +980,24 @@ class DataMigrationState:
             self.cdc_replication_lag_series = buf
 
     def set_cdc_connector_running_names(self, names: Sequence[str]) -> None:
-        """Record which of my connectors are RUNNING (vs still provisioning)."""
+        """Record which of my connectors are RUNNING (vs still provisioning).
+
+        Also INVALIDATES the replication-slot snapshot when the pipeline starts or stops
+        (none running <-> some running). A slot read taken in the other pipeline state
+        describes a consumer that no longer exists -- or one that did not exist yet -- so
+        showing it is not "slightly old", it is the opposite of the truth: after a
+        restart a stopped-time read says "no consumer" and steers toward deleting the
+        infrastructure, which would drop the slot and the changes it is still holding.
+        Clearing it leaves the panel silent (unknown) until the next source read, which is
+        honest. A failed MSK read never reaches here (the caller leaves the names
+        untouched), so an outage cannot fake a transition.
+        """
         with self._lock:
-            self.cdc_connector_running_names = [n for n in names if n]
+            new = [n for n in names if n]
+            if bool(new) != bool(self.cdc_connector_running_names):
+                self.cdc_slot_health = None
+                self.cdc_slot_health_at = None
+            self.cdc_connector_running_names = new
 
     def set_row_counts(
         self,

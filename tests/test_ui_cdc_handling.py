@@ -824,6 +824,66 @@ def test_render_cdc_slot_health_panel() -> None:
     assert any("healthy" in t.lower() for t in ui4.texts), ui4.texts
 
 
+def test_slot_snapshot_is_invalidated_when_the_pipeline_starts_or_stops() -> None:
+    """A slot read taken in the OTHER pipeline state must never be shown.
+
+    The slot is read only on the source/target counts refresh, but the panel renders every
+    5 s tick. Live-observed: counts refreshed while CDC was stopped captured
+    ``active=False``; after Start CDC the panel kept saying "Replication slot has no
+    consumer" -- advising deletion of the CDC infrastructure -- while the real slot was
+    ``active=True`` and draining its backlog.
+    """
+    from dsql_migrator.core.cdc_postgres import SlotHealth
+    from dsql_migrator.ui.data_migration import DataMigrationState
+
+    state = DataMigrationState()
+    stopped_read = SlotHealth("s", exists=True, active=False, wal_status="reserved")
+
+    # Read while stopped (nothing running), then CDC starts -> the snapshot is dropped.
+    state.set_cdc_connector_running_names([])
+    state.set_cdc_slot_health(stopped_read)
+    assert state.cdc_slot_health is stopped_read and state.cdc_slot_health_at is not None
+    state.set_cdc_connector_running_names(["x-debezium-source", "x-dsql-sink"])
+    assert state.cdc_slot_health is None
+    assert state.cdc_slot_health_at is None
+
+    # A read while running SURVIVES further polls in the same state -- the invalidation is
+    # on the transition, not on every tick (else the panel could never show anything).
+    live = SlotHealth("s", exists=True, active=True, wal_status="reserved")
+    state.set_cdc_slot_health(live)
+    state.set_cdc_connector_running_names(["x-debezium-source", "x-dsql-sink"])
+    assert state.cdc_slot_health is live
+
+    # ...and is dropped again when the pipeline stops.
+    state.set_cdc_connector_running_names([])
+    assert state.cdc_slot_health is None
+
+
+def test_slot_health_panel_states_when_the_slot_was_read() -> None:
+    # The snapshot must not read as live state: the panel names the read time and how to
+    # re-read it.
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.cdc_postgres import SlotHealth
+    from dsql_migrator.ui.data_migration._cdc_monitoring import _render_cdc_slot_health
+    from tests.test_ui_data_migration import _RecordingUi
+
+    ui = _RecordingUi()
+    _render_cdc_slot_health(
+        ui,
+        SimpleNamespace(
+            cdc_slot_health=SlotHealth(
+                "s", exists=True, active=True, wal_status="reserved", safe_wal_size=1000
+            ),
+            cdc_slot_health_at=datetime(2026, 9, 28, 7, 5, 9, tzinfo=timezone.utc),
+        ),
+    )
+    blob = " ".join(ui.texts)
+    assert "Slot read at 07:05:09 UTC" in blob
+    assert "refresh the source/target counts" in blob
+
+
 def test_refresh_pg_slot_health_reads_for_pg_and_noops_for_mysql() -> None:
     from dsql_migrator.core.models import SourceConnectionConfig, SourceType
     from dsql_migrator.ui.data_migration._cdc_status import _refresh_pg_slot_health
@@ -1445,6 +1505,16 @@ def test_the_dlq_panel_points_at_validation_and_names_the_blind_spot() -> None:
     assert "EXTRA on the target" in body and "dropped delete" in body
     # The extra-row case must say a reload cannot fix it -- that is the whole distinction.
     assert "reload cannot" in body
+    # It must name the PRECONDITION for both repairs. This card is only on screen while the
+    # sink streams, and in that state _full_load_ui does NOT create the DROP+recreate radio
+    # and warns that re-running Full Load collides with the live pipeline -- so prescribing
+    # "drop and reload" without "Stop CDC first" sent the operator after a button the tool
+    # deliberately withholds, with the two screens contradicting each other.
+    assert "Stop CDC first" in body
+    assert "drop-and-recreate option is not offered" in body
+    # And it must not promise an unconditional repair: even the append-mode reload has to be
+    # confirmed past that collision warning.
+    assert "a reload fixes them" not in body
     # The blind spot, including that the DEFAULT mode is the one that misses it.
     assert "CHECKSUM" in body
     assert "row-count mode cannot see it" in body

@@ -1502,7 +1502,7 @@ def test_background_run_cancel_maps_to_cancelled_and_no_result() -> None:
 
 
 def _build_runner_with_session(
-    *, source_verified: bool, target_verified: bool, sync_sequences=None
+    *, source_verified: bool, target_verified: bool, sync_sequences=None, report=None
 ):
     """Build the validation screen over real stores with a seeded session.
 
@@ -1510,7 +1510,9 @@ def _build_runner_with_session(
     and assert whether a job was submitted. A fake validator is injected so a run,
     if it were (wrongly) started, would not touch a real database. ``sync_sequences``
     (when given) injects a fake identity-sequence sync so the post-run re-sync path is
-    exercised without a DSQL connection.
+    exercised without a DSQL connection. ``report`` overrides the comparison result the
+    fake validator returns, so a test can drive the run with a target that is BEHIND
+    the source (the identity-sync deferral path).
     """
     from dsql_migrator.core.models import AssessmentReport, TargetInventory
     from dsql_migrator.ui.evaluation import EvaluationResult, EvaluationStore
@@ -1553,7 +1555,9 @@ def _build_runner_with_session(
         eval_store=eval_store,
         migration_store=migration_store,
         validation_store=validation_store,
-        validator_factory=lambda _i: _FakeValidator(_report()),
+        validator_factory=lambda _i: _FakeValidator(
+            _report() if report is None else report
+        ),
         sync_sequences=sync_sequences,
     )
     return runner, validation_store.get_or_create(session_id), manager
@@ -1619,6 +1623,109 @@ def test_validation_run_resyncs_identity_sequences_and_records_outcome() -> None
     # tables are recorded -- the None (non-identity) table is dropped.
     assert seen.get("tables")  # the sync was invoked with the scoped tables
     assert advanced == {"orders": 1501, "order_items": 1502}
+
+
+def test_identity_sync_deferred_tables_reports_only_a_behind_target() -> None:
+    """Only POSITIVE evidence the target is behind defers the sync -- not any mismatch.
+
+    ``MAX(pk) + 1`` is wrong exactly when the source holds ids the target does not, so a
+    checksum-only divergence (equal counts, nothing missing) must still let the sync run
+    -- skipping it there would drop a real safeguard.
+    """
+    from dsql_migrator.core.models import (
+        ReconcileResult, TableValidationResult, ValidationMode, ValidationReport,
+    )
+    from dsql_migrator.ui.validation import identity_sync_deferred_tables
+
+    def _rep(items):
+        return ValidationReport.build(mode=ValidationMode.CHECKSUM, items=items)
+
+    # Count deficit alone (ROW_COUNT mode, no reconciliation) is enough.
+    assert identity_sync_deferred_tables(_rep([
+        TableValidationResult(
+            table="orders", source_row_count=511, target_row_count=508,
+            row_count_match=False, matched=False,
+        ),
+    ])) == ("orders",)
+
+    # missing_on_target alone is enough even when the COUNTS happen to agree (a
+    # simultaneous unapplied delete can mask the deficit -- live-seen on order_items,
+    # where the target held MORE rows than the source yet was missing the newest ids).
+    assert identity_sync_deferred_tables(_rep([
+        TableValidationResult(
+            table="order_items", source_row_count=1470, target_row_count=1472,
+            row_count_match=False, matched=False,
+            reconcile=ReconcileResult(
+                pk_column="id", source_count=1470, target_count=1472,
+                missing_on_target=5, extra_on_target=7,
+            ),
+        ),
+    ])) == ("order_items",)
+
+    # Checksum-only divergence: counts equal, nothing missing -> MAX(pk) is correct,
+    # so the sync must NOT be deferred.
+    assert identity_sync_deferred_tables(_rep([
+        TableValidationResult(
+            table="products", source_row_count=15, target_row_count=15,
+            row_count_match=True, matched=False, checksum_match=False,
+            reconcile=ReconcileResult(
+                pk_column="id", source_count=15, target_count=15,
+                missing_on_target=0, extra_on_target=0,
+            ),
+        ),
+    ])) == ()
+
+    # A clean report defers nothing.
+    assert identity_sync_deferred_tables(_report()) == ()
+
+
+def test_validation_run_defers_identity_sync_when_target_is_behind(monkeypatch) -> None:
+    """A lagging target must NOT get its sequences advanced to its own MAX(pk) + 1.
+
+    Live-observed failure this pins: with the source still being written and CDC
+    stopped, the run logged an identity-sync SUCCESS claiming "the application's first
+    insert after cut-over cannot collide" while setting ``orders`` to ``RESTART WITH
+    521`` -- in the same report that listed 521-524 as missing on the target. The sync
+    must be skipped and the skip recorded, leaving cut over (which re-runs it) as the
+    guarantee point.
+    """
+    from dsql_migrator.core.activity_log import ActivityStatus
+    from dsql_migrator.ui import validation as _v
+
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        _v, "log_activity",
+        lambda category, action, **kw: captured.append({"action": action, **kw}),
+    )
+
+    called: list[object] = []
+
+    def _spy(table_names, *, connection_factory):
+        called.append(table_names)
+        return {"orders": 10}
+
+    # matched=False -> orders source 10 / target 9: the target is behind.
+    runner, state, manager = _build_runner_with_session(
+        source_verified=True, target_verified=True, sync_sequences=_spy,
+        report=_report(matched=False),
+    )
+    runner()
+    assert manager.wait(state.job_id, timeout=5.0) is True
+
+    # The sync never ran, and the state says "not run" (None) rather than "ran with
+    # nothing to advance" ({}), which the readiness panel would read as a done safeguard.
+    assert called == []
+    assert state.identity_sync is None
+
+    deferred = [e for e in captured if "deferred" in e["action"]]
+    assert len(deferred) == 1, [e["action"] for e in captured]
+    assert deferred[0]["status"] is ActivityStatus.WARNING
+    detail = deferred[0]["detail"]
+    assert "orders" in detail and "BEHIND" in detail
+    # It must say what unblocks it, and that cut over still covers the case.
+    assert "drain" in detail.lower() and "cut over" in detail.lower()
+    # And no SUCCESS line may claim the sequences were advanced.
+    assert not [e for e in captured if e["action"] == "identity sequences re-synced"]
 
 
 def test_validation_run_logs_started_and_verdict(monkeypatch) -> None:
@@ -3105,6 +3212,40 @@ def test_failing_tables_render_recheck_actions_and_invoke_provider() -> None:
     row = next(cb for text, cb in ui.buttons if text == "Re-check")
     row()
     assert called[-1] == ["orders"]
+
+
+def test_failing_table_ai_button_scopes_the_chat_to_its_own_table() -> None:
+    """The per-table "Explain with AI" button must NAME its table to the opener.
+
+    Live-observed: clicking it on one of 7 failing tables returned an answer covering
+    ALL of them. The chat is handed run-wide tools that take no table argument, so the
+    single-table ``facts`` block alone does not confine the answer -- the table has to be
+    passed so the system prompt can restrict it. This pins the wiring: without
+    ``table=``, the prompt-side restriction is never triggered and the bug returns
+    silently (no other test fails).
+    """
+    from dsql_migrator.ui.validation import _render_failing_tables
+
+    report = _failing_report_for_render()
+    opened: list[dict] = []
+    ui = _RecheckUi()
+    _render_failing_tables(
+        ui,
+        report,
+        summarize_validation(report),
+        diagnose_provider=lambda **kw: opened.append(kw),
+    )
+    buttons = [cb for text, cb in ui.buttons if text == "Explain with AI"]
+    assert len(buttons) == 2  # one per failing table
+    buttons[0]()
+    assert opened[-1]["scope"] == "table"
+    # The clicked table, not just the scope word -- and the facts/scope_id agree with it.
+    assert opened[-1]["table"] == "orders"
+    assert opened[-1]["scope_id"] == "validation:orders"
+    assert "Table: orders" in opened[-1]["facts"]
+    # The second row names ITS table, so the value is per-row and not a captured constant.
+    buttons[1]()
+    assert opened[-1]["table"] == "customers"
 
 
 def test_failing_tables_show_busy_row_instead_of_action_while_rechecking() -> None:
@@ -6059,6 +6200,27 @@ def test_cutover_ack_records_the_referential_integrity_outcome() -> None:
     state2 = ValidationState()
     state2.set_cutover_identity_sync({}, None)
     assert "nothing to advance" in _cutover_integrity_detail(state2, 0)
+
+
+def test_the_validation_chat_opener_forwards_the_table_to_the_strategist() -> None:
+    """The opener closure must hand ``table`` on to ``stream_validation_chat``.
+
+    The per-table button passes it and the prompt builder uses it, but the closure in
+    between is only reachable through a live NiceGUI render -- so dropping it there
+    fails NO behavioural test while completely restoring the bug (the chat answers about
+    every mismatched table again). Guarded at the source for that reason.
+    """
+    import inspect
+
+    from dsql_migrator.ui import validation as val
+
+    src = inspect.getsource(val.build_validation_screen)
+    opener = src[src.index("def diagnose_provider"):]
+    # The kwarg is accepted...
+    assert "table=None," in opener.split("):")[0]
+    # ...and forwarded into the strategist call, not just swallowed.
+    call = opener[opener.index("stream_validation_chat"):]
+    assert "table=table," in call.split(")")[0] + ")"
 
 
 def test_the_ack_and_waiver_are_wired_to_the_log() -> None:

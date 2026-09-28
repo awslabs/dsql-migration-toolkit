@@ -546,8 +546,15 @@ def classify_slot_health(health: Optional[SlotHealth]) -> tuple[str, str, str]:
         return (
             "warning",
             "Replication slot has no consumer",
+            # The two remedies are NOT alternatives of equal weight, and offering them as
+            # "X, or Y" invited the destructive one: deleting the CDC infrastructure drops
+            # the slot, and with it every change the slot is holding for the target -- the
+            # exact backlog a restart would have replayed. Live-seen with a stale reading
+            # while CDC was in fact running and draining 15 MB of retained WAL.
             "CDC is not attached to the slot, so the source keeps accumulating WAL for "
-            "it. Resume CDC, or delete the CDC infrastructure to drop the slot.",
+            "it. Start CDC to consume it. Delete the CDC infrastructure only if you are "
+            "abandoning this CDC run: that drops the slot AND every change it is still "
+            "holding for the target, which cannot be recovered afterwards.",
         )
     return (
         "success",

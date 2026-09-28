@@ -666,6 +666,17 @@ def _render_cdc_slot_health(ui, migration_state) -> None:
     from dsql_migrator.core.cdc_postgres import classify_slot_health
 
     tone, headline, detail = classify_slot_health(health)
+    # Say WHEN it was read. The slot is read only on the source/target counts refresh, yet
+    # this renders every 5 s tick -- so without the time a snapshot read as live state (a
+    # stopped-time "no consumer" kept showing after Start CDC while the real slot was
+    # active). State invalidates the snapshot on a pipeline start/stop; the time covers the
+    # rest (the slot's WAL figures move while the pipeline state does not).
+    read_at = getattr(migration_state, "cdc_slot_health_at", None)
+    if read_at is not None:
+        detail = (
+            f"{detail} (Slot read at {read_at.strftime('%H:%M:%S')} UTC — refresh the "
+            "source/target counts to re-read it.)"
+        )
     render_notice(ui, tone=tone, header=headline, body=detail)
 
 
@@ -2056,6 +2067,19 @@ def _render_cdc_dlq_breakdown(ui, status_view: LoadStatusView) -> None:
     # so on a default run nothing catches it. CHECKSUM does, except on columns it excludes
     # (json / floating point). Telling the operator to run CHECKSUM is the difference between
     # "verified" and "assumed".
+    #
+    # "Stop CDC first" is part of the RECOVERY, not a footnote. This card is only on screen
+    # while the sink is streaming (that is what fills the DLQ), and in exactly that state
+    # _full_load_ui refuses the repair this text used to prescribe: the DROP+recreate radio is
+    # NOT CREATED while CDC is live (its condition is `tables_with_data_now and not
+    # cdc_live_now`), and Full Load itself renders an error notice -- "Re-running Full Load now
+    # will collide with the live pipeline ... Stop CDC first" -- leaving only a negative
+    # "Re-run anyway (CDC is live)". So the old wording sent the operator to look for a button
+    # the tool deliberately withholds: two screens of the same app contradicting each other,
+    # one saying "drop and reload that table" and the other "do not do this while CDC runs".
+    # Stating the precondition here is the fix; "a reload fixes them" is also softened to
+    # "reload that table to backfill it" because even the append-mode reload has to be
+    # confirmed past that collision warning.
     render_notice(
         ui,
         tone="info",
@@ -2064,12 +2088,14 @@ def _render_cdc_dlq_breakdown(ui, status_view: LoadStatusView) -> None:
         body=(
             "A dead-lettered record is a row the stream did NOT apply; Validation is what "
             "shows the consequence on the target. Re-run it for the tables above and read "
-            "the record-level result: rows MISSING on the target are a dropped insert (a "
-            "reload fixes them), rows EXTRA on the target are a dropped delete (a reload "
-            "cannot — that table must be dropped and reloaded, or the row deleted). Run it "
-            "in CHECKSUM mode: a dropped UPDATE changes no row count, so the default "
-            "row-count mode cannot see it, and even CHECKSUM skips json and floating-point "
-            "columns."
+            "the record-level result: rows MISSING on the target are a dropped insert "
+            "(reload that table to backfill it), rows EXTRA on the target are a dropped "
+            "delete (a reload cannot remove it — the table must be dropped and reloaded, or "
+            "the row deleted by hand). Both repairs need Stop CDC first: while the sink is "
+            "streaming, Full Load collides with it and the drop-and-recreate option is not "
+            "offered at all. Run Validation in CHECKSUM mode: a dropped UPDATE changes no "
+            "row count, so the default row-count mode cannot see it, and even CHECKSUM skips "
+            "json and floating-point columns."
         ),
     )
 

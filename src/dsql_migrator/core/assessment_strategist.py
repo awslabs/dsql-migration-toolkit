@@ -746,7 +746,11 @@ def _validation_recovery_context(source_engine: str = "MySQL") -> str:
 
 
 def build_validation_chat_system(
-    facts: str, *, scope: str = "table", source_engine: str = "MySQL"
+    facts: str,
+    *,
+    scope: str = "table",
+    source_engine: str = "MySQL",
+    table: Optional[str] = None,
 ) -> str:
     """Build the system grounding for a chat about a validation MISMATCH.
 
@@ -754,16 +758,47 @@ def build_validation_chat_system(
     deterministic validation result (row counts, count/checksum match, a
     missing/extra SUMMARY -- counts and PK ranges, never full row data -- and
     drift / CDC-active signals). ``scope`` is ``"table"`` for a single failing
-    table or ``"run"`` for the whole report; it only tunes the framing sentence.
+    table or ``"run"`` for the whole report.
     The model is told these facts are authoritative and is pointed at this tool's
     Full Load + CDC recovery model, so its advice (re-run to backfill a standing
     gap, or quiesce/stop CDC before a cut-over check) matches what the tool can
     actually do. It must stay on the topic of explaining/fixing THIS mismatch.
+
+    ``table`` NAMES the subject of a ``scope="table"`` chat and is what actually
+    BINDS the answer to it. ``scope`` alone does not: it only picks the framing noun,
+    and the single-table ``facts`` block is one grounding paragraph competing with
+    run-wide TOOL RESULTS. The tools this chat is given (``get_validation_summary``,
+    ``list_validation_mismatches``) take no table argument and return EVERY validated
+    table, and the prompt invites their use below -- so without an explicit
+    restriction the model answered the per-table "Explain with AI" button by
+    reporting on all mismatched tables. Live-observed with 7 failing tables: the
+    per-table and whole-run answers were effectively the same. Passing ``table``
+    adds that restriction; omitting it leaves the prompt byte-identical to before,
+    so the run-scope caller is unaffected.
     """
     subject = (
         "one table that did NOT match"
         if scope == "table"
         else "a validation run with mismatches"
+    )
+    scoped = scope == "table" and bool(table)
+    if scoped:
+        subject += f": `{table}`"
+    # Imperative and placed BEFORE the "help with the wider migration" paragraph, so the
+    # restriction frames how those tools may be used rather than reading as an exception
+    # to them. Run-wide tool output is still allowed as CONTEXT -- telling a
+    # table-specific cause from a pipeline-wide one is exactly what it is good for -- but
+    # reporting the other tables is not.
+    restriction = (
+        (
+            f"THE SUBJECT IS `{table}`. Explain and fix ONLY that table. The tools you "
+            "have return run-wide data covering every validated table: use it solely as "
+            f"context for `{table}` -- for example to tell a cause specific to this "
+            "table from one affecting the whole pipeline -- and do NOT report findings, "
+            "lists or summaries for the OTHER tables unless the user asks about them.\n\n"
+        )
+        if scoped
+        else ""
     )
     return (
         "You are a senior AWS database migration engineer chatting with a teammate "
@@ -774,6 +809,7 @@ def build_validation_chat_system(
         "GitHub-flavored Markdown is fine (a short list, a little emphasis, a fenced "
         "code block for any SQL/commands) but keep it reading like a natural reply. "
         "Be specific and concise, and give a concrete next action.\n\n"
+        f"{restriction}"
         "Your focus is resolving THIS validation mismatch (root cause, whether it is "
         "lag vs a standing gap vs extra rows, and the recovery steps), but you are "
         "also this migration's assistant. If the user asks about the WIDER migration "
@@ -1558,6 +1594,7 @@ class AssessmentStrategist:
         on_delta: Callable[[str], None],
         *,
         scope: str = "table",
+        table: Optional[str] = None,
         tools: Optional[Sequence[Mapping[str, Any]]] = None,
         execute: Optional[Callable[[str, Mapping[str, Any]], str]] = None,
     ) -> "ObjectGuidanceOutcome":
@@ -1572,9 +1609,12 @@ class AssessmentStrategist:
         When ``tools`` + ``execute`` are supplied, the turn runs through
         :meth:`tool_chat`, so the mismatch chat can also look up the real
         converted DDL / target schema / row counts to root-cause the divergence.
+        Those tools return RUN-WIDE data, so a ``scope="table"`` caller must also
+        pass ``table`` -- that is what confines the answer to it (see
+        :func:`build_validation_chat_system`).
         """
         system = build_validation_chat_system(
-            facts, scope=scope, source_engine=self._source_engine
+            facts, scope=scope, source_engine=self._source_engine, table=table
         )
         if tools is not None and execute is not None:
             return self.tool_chat(

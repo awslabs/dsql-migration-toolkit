@@ -449,6 +449,27 @@ def test_classify_slot_health_tones() -> None:
     )[0] == "success"
 
 
+def test_no_consumer_advice_does_not_offer_deletion_as_an_equal_alternative() -> None:
+    """"Resume CDC, or delete the CDC infrastructure" steered toward data loss.
+
+    Deleting the infrastructure drops the slot and every change it is still holding for
+    the target -- the backlog a restart would replay. Live-seen on a stale reading while
+    CDC was actually running and draining 15 MB of retained WAL. The advice must lead
+    with Start CDC and state what deletion destroys.
+    """
+    from dsql_migrator.core.cdc_postgres import SlotHealth, classify_slot_health
+
+    _tone, _head, detail = classify_slot_health(
+        SlotHealth("s", exists=True, active=False, wal_status="reserved")
+    )
+    assert "Start CDC to consume it" in detail
+    assert "only if you are abandoning this CDC run" in detail
+    assert "every change it is still holding" in detail
+    assert "Resume CDC, or delete" not in detail
+    # Start CDC comes first -- it is the default remedy, not one of two.
+    assert detail.index("Start CDC") < detail.index("Delete the CDC infrastructure")
+
+
 def test_read_replication_slot_health_is_postgres_only() -> None:
     from sqlalchemy import text  # noqa: F401 - documents the SELECT the fake matches
     from dsql_migrator.core.source_dialect import dialect_for
