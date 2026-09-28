@@ -220,11 +220,12 @@ def count_source_rows(
 ) -> dict[str, Optional[int]]:
     """Return an exact ``COUNT(*)`` per source table over one connection (read-only).
 
-    Used by the per-table migration-status view to show the live source row count
-    beside the target count so the operator can watch CDC converge. A table that
-    errors (missing / no access) maps to ``None`` (unknown) rather than 0, so it is
-    distinguishable from a genuinely empty table. Exact counts scan the table, so
-    callers gate this behind an explicit user action (not an auto-poll).
+    NOT used by the per-table migration-status view: that view reads the scan-free
+    :func:`estimate_source_rows` instead, because this scans every table and the
+    "Refresh counts" button runs against a live production source (exact counts belong
+    to Validation). Kept for callers that explicitly need an exact source count. A
+    table that errors (missing / no access) maps to ``None`` (unknown) rather than 0, so
+    it is distinguishable from a genuinely empty table.
     """
     counts: dict[str, Optional[int]] = {}
     for table in tables:

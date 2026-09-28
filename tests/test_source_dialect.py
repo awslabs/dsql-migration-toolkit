@@ -580,6 +580,44 @@ def test_postgres_estimate_row_counts_uses_pg_class_reltuples() -> None:
     assert "relkind" in conn.estimate_sql
 
 
+def test_postgres_estimate_stats_at_distinguishes_never_analyzed_from_unknown() -> None:
+    """How old the estimate is: last (auto-)ANALYZE, from the statistics view, no scan.
+
+    ``None`` = the table exists but was NEVER analyzed (the state behind a blank
+    estimate, so the UI can label it); a table the catalog does not have is ABSENT
+    (unknown) -- it must not be reported as "never analyzed".
+    """
+    from datetime import datetime, timezone
+
+    when = datetime(2026, 9, 24, 22, 22, tzinfo=timezone.utc)
+    conn = _FakeEstimateConnection(
+        "public", [("public", "orders", when), ("public", "fresh", None)]
+    )
+    out = dialect_for(SourceType.POSTGRES).estimate_stats_at(
+        conn, ["orders", "fresh", "absent"]
+    )
+    assert out == {"orders": when, "fresh": None}
+    assert "absent" not in out
+    sql = conn.estimate_sql
+    # Both analyze paths count (manual ANALYZE and autovacuum's), NULL-tolerant -- in
+    # BOTH branches: the ordinary-table read and the partitioned-parent leaf walk.
+    assert sql.count("GREATEST(s.last_analyze, s.last_autoanalyze)") == 2
+    assert "pg_stat_all_tables" in sql
+    # A partitioned parent keeps no stats of its own -- read its leaves, exactly as the
+    # estimate itself sums leaf reltuples.
+    assert "pg_partition_tree" in sql and "isleaf" in sql
+    assert "count(" not in sql.lower()  # never a scan
+
+
+def test_mysql_estimate_stats_at_is_unknown_not_never_analyzed() -> None:
+    # InnoDB's stats time lives in mysql.innodb_table_stats, normally unreadable by a
+    # least-privilege migration user, so MySQL reports nothing rather than guessing --
+    # and issues no query at all.
+    conn = _FakeEstimateConnection("shop", [("shop", "orders", None)])
+    assert dialect_for(SourceType.MYSQL).estimate_stats_at(conn, ["orders"]) == {}
+    assert conn.estimate_sql == ""
+
+
 def test_estimate_row_counts_empty_tables_short_circuits() -> None:
     conn = _FakeEstimateConnection("public", [])
     assert dialect_for(SourceType.POSTGRES).estimate_row_counts(conn, []) == {}

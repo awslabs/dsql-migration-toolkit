@@ -11,6 +11,11 @@ All notable changes to this project are recorded here. This project follows
 
 - **"Explain with AI" on every cut-over readiness check that is not green.** A `Failed` or `Heads-up` check in "Cut-over readiness" now carries the same action as a failing table in "Tables needing attention". The chat is grounded on that check's own label, status and the exact detail line shown, with the run's roll-up facts as context, and it keeps a separate conversation per check. `Passed` and `N/A` rows get no action — there is nothing to diagnose, and offering it there would dilute the rows that need attention. Shown only when AI Assist is on.
 
+### Changed
+
+- **"Source rows (est.)" now says what the estimate is and how old it is.** The per-table migration status reads the source as a scan-free catalog estimate (never a `COUNT(*)` against the live production source — only the target is counted exactly), but nothing on screen explained why it differed from the target. On a PostgreSQL source each value now carries its last-ANALYZE time on hover, and a table PostgreSQL has never analyzed reads **not analyzed** instead of a bare dash. Live-measured on Aurora PostgreSQL 17: `users` showed 100 against a true 108 because its statistics were four days old, `inventory` 62 against 66 from an ANALYZE taken before later writes, and three small tables had never been analyzed at all. The column's header tooltip is now worded for the source engine — it described only MySQL's `information_schema`/InnoDB sampling even on PostgreSQL, where the figure is the planner's `pg_class.reltuples`. The last-analyze time comes from `pg_stat_all_tables` (a statistics-view read, no scan) and a failure to read it can never cost the counts. MySQL keeps InnoDB's statistics time in `mysql.innodb_table_stats`, which a least-privilege migration user normally cannot read, so a MySQL source shows the estimate without a time.
+- Corrected three code comments that said this refresh runs `COUNT(*)` on the source.
+
 ## v0.1.560
 
 Four fixes from reviewing a live PostgreSQL CDC run: the per-table AI button ignored which table you clicked, the identity-sequence re-sync could hand the application a duplicate key, the replication-slot panel showed a stale reading as live and pointed at a destructive fix, and the dead-letter guidance prescribed a repair the tool withholds while CDC runs.

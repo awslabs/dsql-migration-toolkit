@@ -316,6 +316,11 @@ class DataMigrationState:
         # refresh -- never on the 5 s CDC poll -- so the panel re-renders a SNAPSHOT every
         # tick. Without the time it was presented as live state (see set_cdc_slot_health).
         self.cdc_slot_health_at: Optional[datetime] = None
+        # When each table's SOURCE row estimate was last refreshed (UTC): table ->
+        # datetime, or None when its statistics were never refreshed (PostgreSQL
+        # reltuples = -1, the state behind a blank estimate). A table absent from the map
+        # is unknown -- a MySQL source, or the read failed. Display-only metadata.
+        self.source_estimate_stats_at: dict[str, Optional[datetime]] = {}
         # Rolling replication-lag series backing the live "Stream lag" chart:
         # [(epoch_seconds, max_lag_ms), ...], bounded to ~15 min. Hybrid — seeded once
         # from CloudWatch's 1-minute history (survives a reload) then extended by each
@@ -1020,6 +1025,18 @@ class DataMigrationState:
             self.row_max_pk_source = dict(source_max_pk or {})
             self.row_max_pk_target = dict(target_max_pk or {})
             self.row_counts_fetched_at = fetched_at
+
+    def set_source_estimate_stats_at(
+        self, stats_at: "Mapping[str, Optional[datetime]]"
+    ) -> None:
+        """Record when each table's source row ESTIMATE was last refreshed.
+
+        Written by the counts-refresh worker alongside the estimate itself, so the status
+        view can say how old the estimate is and label a never-analyzed table instead of
+        showing a bare dash. Thread-safe (worker writes, render reads).
+        """
+        with self._lock:
+            self.source_estimate_stats_at = dict(stats_at)
 
     def set_tables_with_data(self, names: frozenset[str]) -> None:
         """Record the selected target tables the probe found already holding rows."""

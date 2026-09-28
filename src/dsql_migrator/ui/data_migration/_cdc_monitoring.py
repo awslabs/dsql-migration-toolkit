@@ -17,7 +17,7 @@ unchanged.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Optional
 
 from dsql_migrator.core.activity_log import ActivityStatus
@@ -42,6 +42,7 @@ from dsql_migrator.ui.data_migration._models import (
     lob_exclusion_candidates,
     per_table_counts_notice_body,
     scope_lob_candidates,
+    session_source_type,
 )
 from dsql_migrator.ui.data_migration._cdc_status import (
     _CDC_TONE_STYLE,
@@ -97,6 +98,70 @@ _CONSISTENCY_LEGEND_HELP = (
 )
 
 
+def _source_estimate_header_tip(source_type) -> str:
+    """The "Source rows (est.)" header tooltip, worded for the SOURCE ENGINE.
+
+    The figure comes from a different catalog on each engine, refreshed by a different
+    mechanism, and the tooltip used to describe only MySQL's ("information_schema ...
+    InnoDB index sampling") -- wrong on a PostgreSQL source, where it is the planner's
+    ``pg_class.reltuples`` and goes stale until the next ANALYZE.
+    """
+    exact_hint = "For an exact source-vs-target comparison, run Validation (step 4)."
+    if source_type == SourceType.POSTGRES:
+        return (
+            "Approximate row count from PostgreSQL's planner statistics "
+            "(pg_class.reltuples) — a scan-free ESTIMATE, so this view never runs a "
+            "COUNT(*) full scan against your live source. It is refreshed only by "
+            "ANALYZE or autovacuum's auto-analyze (by default after 50 rows plus 10% of "
+            "the table change), so rows written since then are not in it, and a table "
+            "that has never been analyzed shows “not analyzed”. Hover a value for when "
+            "it was last analyzed. " + exact_hint
+        )
+    return (
+        "Approximate row count from the source's information_schema — a scan-free "
+        "ESTIMATE, so this view never runs a COUNT(*) full scan against your live "
+        "source. InnoDB derives it from index sampling and recalculates it after about "
+        "10% of the table changes (or on ANALYZE TABLE), so it commonly differs from the "
+        "true count by several percent (more on a large table) and often UNDERCOUNTS — "
+        "a target that slightly exceeds it is normal, not data duplication. " + exact_hint
+    )
+
+
+def _source_estimate_cell(
+    estimate: "Optional[int]",
+    *,
+    exact: bool,
+    stats_at: "Mapping[str, Optional[datetime]]",
+    table: str,
+) -> "tuple[str, str]":
+    """``(label, tooltip)`` for one table's source-rows cell. Pure.
+
+    ``stats_at`` is when each estimate was last refreshed; a table present with ``None``
+    was NEVER analyzed, which is why its estimate is blank -- so it is labelled instead of
+    showing a bare dash that reads like a failed read. A table absent from ``stats_at`` is
+    unknown (MySQL, or the read failed) and keeps the plain rendering.
+    """
+    if estimate is None:
+        if table in stats_at and stats_at[table] is None:
+            return (
+                "not analyzed",
+                "PostgreSQL has not analyzed this table yet, so it has no row estimate. "
+                "Autovacuum analyzes it once enough rows change (by default 50 plus 10% "
+                "of the table). Validation (step 4) counts it exactly.",
+            )
+        return "—", ""
+    label = f"{estimate:,}" + (" (exact)" if exact else "")
+    analyzed = stats_at.get(table)
+    if analyzed is not None and not exact:
+        return (
+            label,
+            f"Planner estimate from the last ANALYZE at "
+            f"{analyzed.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC — rows "
+            "written since then are not in it.",
+        )
+    return label, ""
+
+
 def _render_migration_table_status(
     ui, migration_state, job_manager, session, *, inventory=None
 ) -> None:
@@ -109,9 +174,10 @@ def _render_migration_table_status(
     target. The per-op **Inserts / Updates / Deletes** columns are fed scan-free by the
     sink's own ``InsertsApplied`` / ``UpdatesApplied`` / ``DeletesApplied`` CloudWatch
     metrics (DMS-style cumulative counters, refreshed each CDC poll), so they need no
-    COUNT(*). The source/target-count columns still come from
-    a direct COUNT(*) on each side, which scans the source, so those remain an
-    explicit "Refresh counts" action (not an auto-poll).
+    COUNT(*). The source/target-count columns are an explicit "Refresh counts" action
+    (not an auto-poll): the TARGET is an exact COUNT(*), while the SOURCE is a scan-free
+    catalog ESTIMATE plus an index-only MAX(pk) -- never a COUNT(*) against the live
+    production source (see _fetch_migration_row_counts).
 
     Rendered only once CDC has actually STARTED. It used to appear as soon as the CDC
     sub-step did -- i.e. during the ~15-20 min infrastructure create -- where every
@@ -247,14 +313,18 @@ def _render_migration_table_status(
                 "gap": "rows missing",
                 "unknown": "refresh to check",
             }
+            _stats_at = dict(getattr(migration_state, "source_estimate_stats_at", {}) or {})
             table_rows = []
             for r in rows_model:
                 # The header already says "(est.)" (the normal case), so only the
                 # UNUSUAL case is marked per-cell: an EXACT source count, which is
                 # worth flagging because it makes the row's verdict authoritative.
-                source_label = _fmt(r.source_rows)
-                if not r.source_estimate and r.source_rows is not None:
-                    source_label += " (exact)"
+                source_label, source_tip = _source_estimate_cell(
+                    r.source_rows,
+                    exact=not r.source_estimate,
+                    stats_at=_stats_at,
+                    table=r.table,
+                )
                 # Stream lag: prefer the sink's TIME-based end-to-end lag
                 # (ReplicationLagMs = apply time − source commit time) — accurate and
                 # PK-agnostic. Fall back to the MAX(pk) leading-edge check (caught up /
@@ -293,6 +363,7 @@ def _render_migration_table_status(
                         "upd": _fmt_count(r.cdc_updates),
                         "del": _fmt_count(r.cdc_deletes),
                         "source": source_label,
+                        "source_tip": source_tip,
                         "target": _fmt(r.target_rows),
                         "stream": stream,
                         "dlq": _fmt(r.dlq_count) if r.dlq_count else "0",
@@ -355,6 +426,20 @@ def _render_migration_table_status(
             _op_cell("ins", "text-green-700")
             _op_cell("upd", "text-sky-700")
             _op_cell("del", "text-red-700")
+            # Source rows: the estimate plus, when known, WHEN it was taken (a hover
+            # tooltip, so the column stays as narrow as the rest of this 11-column table).
+            table.add_slot(
+                "body-cell-source",
+                r"""
+                <q-td :props="props">
+                  <span :class="props.value === 'not analyzed' ? 'text-grey-6' : ''">
+                    {{ props.value }}
+                    <q-tooltip v-if="props.row.source_tip" class="text-body2"
+                      style="max-width:340px">{{ props.row.source_tip }}</q-tooltip>
+                  </span>
+                </q-td>
+                """,
+            )
             # Color the consistency verdict (green=consistent, red=quarantined/gap,
             # amber=behind, grey=unknown) so a problem is obvious at a glance.
             table.add_slot(
@@ -399,13 +484,9 @@ def _render_migration_table_status(
             )
             _hdr_info(
                 "source",
-                "Approximate row count from the source's information_schema — a "
-                "scan-free ESTIMATE, so this view never runs a COUNT(*) full scan "
-                "against your live source. InnoDB derives it from index sampling, so "
-                "it commonly differs from the true count by several percent (more on "
-                "a large table) and often UNDERCOUNTS — a target that slightly "
-                "exceeds it is normal, not data duplication. For an exact "
-                "source-vs-target comparison, run Validation (step 4).",
+                # session_source_type, not source_config: after a restore the live
+                # config can be empty while the engine is still known.
+                _source_estimate_header_tip(session_source_type(session)),
             )
             _hdr_info(
                 "consistency",
@@ -431,8 +512,9 @@ def _render_migration_table_status(
                 ui.timer(_CDC_POLL_INTERVAL_SECONDS, _status_table)  # type: ignore[attr-defined]
 
         async def _refresh_counts() -> None:
-            # The source/target counts are a direct COUNT(*)/MAX(pk) on each side and
-            # can take seconds on a large source, so give clear in-progress feedback:
+            # The refresh reads the source estimate + MAX(pk) and the target's exact
+            # COUNT(*)/MAX(pk); the target count can take seconds on a large table, so
+            # give clear in-progress feedback:
             # the button is disabled and relabelled "Refreshing…" (its text stays
             # legible -- we do NOT use Quasar `loading`, which replaces the label
             # with a bare spinner), and an ongoing top notification carries the

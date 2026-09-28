@@ -1822,3 +1822,126 @@ def test_the_notice_is_wired_into_the_live_monitor_before_the_dlq_card() -> None
     assert src.index("_render_cdc_value_conversion_notice(ui, migration_state)") < src.index(
         "            _render_cdc_dlq_panel("
     )
+
+
+# ---------------------------------------------------------------------------
+# Source rows (est.): say what the estimate is and how old it is
+# ---------------------------------------------------------------------------
+
+
+def test_source_estimate_cell_labels_never_analyzed_and_dates_the_rest() -> None:
+    from datetime import datetime, timezone
+
+    from dsql_migrator.ui.data_migration._cdc_monitoring import _source_estimate_cell
+
+    when = datetime(2026, 9, 24, 22, 22, tzinfo=timezone.utc)
+    stats = {"users": when, "products": None}
+
+    # Never analyzed (present with None): labelled, not a bare dash that reads as a failure.
+    label, tip = _source_estimate_cell(None, exact=False, stats_at=stats, table="products")
+    assert label == "not analyzed"
+    assert "has not analyzed this table yet" in tip and "Validation" in tip
+
+    # Analyzed: the number, plus WHEN -- live-seen: users read 100 vs a true 108 because
+    # its last ANALYZE was four days old.
+    label, tip = _source_estimate_cell(100, exact=False, stats_at=stats, table="users")
+    assert label == "100"
+    assert "2026-09-24 22:22 UTC" in tip and "not in it" in tip
+
+    # Unknown (absent: MySQL, or the read failed): the plain rendering, no invented label.
+    assert _source_estimate_cell(None, exact=False, stats_at=stats, table="x") == ("—", "")
+    assert _source_estimate_cell(7, exact=False, stats_at={}, table="x") == ("7", "")
+
+    # An EXACT count keeps its marker and needs no staleness note.
+    assert _source_estimate_cell(9, exact=True, stats_at=stats, table="users") == (
+        "9 (exact)", ""
+    )
+
+
+def test_source_estimate_header_tip_is_worded_for_the_source_engine() -> None:
+    # It described only MySQL ("information_schema ... InnoDB") even on a PostgreSQL
+    # source, where the figure is pg_class.reltuples and goes stale until ANALYZE.
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration._cdc_monitoring import _source_estimate_header_tip
+
+    pg = _source_estimate_header_tip(SourceType.POSTGRES)
+    assert "pg_class.reltuples" in pg and "ANALYZE" in pg and "not analyzed" in pg
+    assert "information_schema" not in pg and "InnoDB" not in pg
+
+    my = _source_estimate_header_tip(SourceType.MYSQL)
+    assert "information_schema" in my and "InnoDB" in my
+    assert "pg_class" not in my
+    for tip in (pg, my):
+        assert "never runs a COUNT(*)" in tip and "Validation (step 4)" in tip
+
+
+def _fetch_with_fake_source(monkeypatch, stats_behaviour):
+    """Drive _fetch_migration_row_counts over a fake source; no DB, no AWS."""
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    import dsql_migrator.core.source_dialect as sd
+    import dsql_migrator.core.watermark as wm
+    from dsql_migrator.ui.data_migration import DataMigrationState
+    from dsql_migrator.ui.data_migration import _cdc_status
+
+    class _Engine:
+        @contextmanager
+        def connect(self):
+            yield object()
+
+    class _Dialect:
+        def estimate_stats_at(self, connection, tables):
+            return stats_behaviour(tables)
+
+    monkeypatch.setattr(_cdc_status, "make_source_engine_factory", lambda _pw: lambda _c: _Engine())
+    monkeypatch.setattr(sd, "dialect_for", lambda _t: _Dialect())
+    monkeypatch.setattr(wm, "estimate_source_rows", lambda c, t, d: {n: 5 for n in t})
+    monkeypatch.setattr(wm, "max_pk_source", lambda c, p, d: {})
+    session = SimpleNamespace(
+        source_config=SimpleNamespace(source_type=None),
+        source_password=object(),
+        has_source=lambda: True,
+        has_target=lambda: False,
+        target_config=None,
+    )
+    state = DataMigrationState()
+    out = _cdc_status._fetch_migration_row_counts(state, session, ["t1"])
+    return state, out
+
+
+def test_counts_refresh_records_when_each_estimate_was_taken(monkeypatch) -> None:
+    from datetime import datetime, timezone
+
+    when = datetime(2026, 9, 28, 6, 45, tzinfo=timezone.utc)
+    state, out = _fetch_with_fake_source(monkeypatch, lambda tables: {"t1": when})
+    source_counts, *_rest, source_available = out
+    assert source_counts == {"t1": 5} and source_available is True
+    assert state.source_estimate_stats_at == {"t1": when}
+
+
+def test_a_failing_stats_read_never_costs_the_counts(monkeypatch) -> None:
+    # Display-only metadata: if it raises, the estimate and MAX(pk) must still land.
+    def _boom(_tables):
+        raise RuntimeError("permission denied for pg_stat_all_tables")
+
+    state, out = _fetch_with_fake_source(monkeypatch, _boom)
+    source_counts, *_rest, source_available = out
+    assert source_counts == {"t1": 5} and source_available is True
+    assert state.source_estimate_stats_at == {}
+
+
+def test_status_table_renders_the_estimate_label_age_and_engine_tip() -> None:
+    # Wiring: the helpers are dead code unless the status table uses them. The table is
+    # built inside a live NiceGUI render (timers, slots), so it is guarded at the source.
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as m
+
+    src = inspect.getsource(m._render_migration_table_status)
+    assert "_source_estimate_cell(" in src
+    assert "source_estimate_stats_at" in src  # the age comes from the refresh, via state
+    assert '"source_tip": source_tip' in src
+    assert '"body-cell-source"' in src and "props.row.source_tip" in src
+    # Engine read through the restore-aware helper, never a raw source_config getattr.
+    assert "_source_estimate_header_tip(session_source_type(session))" in src

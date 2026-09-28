@@ -11,6 +11,11 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 
 - **green이 아닌 모든 cut-over readiness 항목에 "Explain with AI"가 추가되었습니다.** "Cut-over readiness"에서 `Failed` 또는 `Heads-up`인 항목에, "Tables needing attention"의 실패 테이블과 같은 버튼이 생깁니다. 채팅은 해당 항목의 이름, 상태, 화면에 표시된 설명 문구를 그대로 근거로 삼고, 런 전체 요약 수치를 맥락으로 함께 받으며, 항목마다 대화가 따로 유지됩니다. `Passed`와 `N/A` 항목에는 버튼이 없습니다 — 진단할 것이 없고, 그런 곳에까지 버튼이 있으면 주의가 필요한 항목의 신호가 흐려지기 때문입니다. AI Assist가 켜져 있을 때만 표시됩니다.
 
+### 변경
+
+- **"Source rows (est.)"가 이제 추정치의 근거와 시점을 알려줍니다.** 테이블별 마이그레이션 상태는 소스를 스캔 없는 카탈로그 추정치로 읽습니다(라이브 운영 소스에 `COUNT(*)`를 실행하지 않으며, 정확히 세는 쪽은 타깃뿐입니다). 그런데 타깃과 숫자가 왜 다른지 화면 어디에도 설명이 없었습니다. PostgreSQL 소스에서는 이제 각 값에 마우스를 올리면 마지막 ANALYZE 시각이 보이고, 한 번도 ANALYZE되지 않은 테이블은 대시 대신 **not analyzed**로 표시됩니다. Aurora PostgreSQL 17에서 실측한 결과: `users`는 통계가 4일 전 것이라 실제 108행이 100으로 보였고, `inventory`는 이후 쓰기 이전에 수행된 ANALYZE 기준이라 66행이 62로 보였으며, 작은 테이블 3개는 아예 ANALYZE된 적이 없었습니다. 열 헤더 툴팁도 소스 엔진에 맞게 바뀌었습니다. 이전에는 PostgreSQL에서도 MySQL의 `information_schema`/InnoDB 샘플링만 설명했는데, PostgreSQL에서 이 값은 플래너의 `pg_class.reltuples`입니다. 마지막 ANALYZE 시각은 `pg_stat_all_tables`(통계 뷰 조회, 스캔 없음)에서 읽으며, 이 조회가 실패해도 행 수 자체는 영향을 받지 않습니다. MySQL은 InnoDB 통계 시각을 `mysql.innodb_table_stats`에 두는데 최소 권한 마이그레이션 사용자는 보통 이를 읽을 수 없으므로, MySQL 소스에서는 시각 없이 추정치만 표시합니다.
+- 이 새로고침이 소스에 `COUNT(*)`를 실행한다고 잘못 적혀 있던 코드 주석 3곳을 바로잡았습니다.
+
 ## v0.1.560
 
 라이브 PostgreSQL CDC 실행을 리뷰하다 찾은 네 건입니다. 테이블별 AI 버튼이 클릭한 테이블을 무시했고, identity 시퀀스 재동기화가 애플리케이션에 중복 키를 넘겨줄 수 있었으며, 복제 슬롯 패널이 오래된 값을 실시간처럼 보여주며 파괴적인 조치를 권했고, 데드레터 안내가 CDC 실행 중에는 도구가 막아 둔 복구 방법을 처방했습니다.

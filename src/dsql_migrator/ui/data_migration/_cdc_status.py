@@ -357,7 +357,11 @@ def _refresh_pg_slot_health(migration_state, source_config, connection) -> None:
 
 
 def _fetch_migration_row_counts(migration_state, session, table_names, inventory=None):
-    """Read source/target ``COUNT(*)`` and ``MAX(pk)`` per table (BLOCKING, read-only).
+    """Read the source row ESTIMATE, the exact target ``COUNT(*)``, and ``MAX(pk)`` per table.
+
+    BLOCKING, read-only. The source side is deliberately NOT a ``COUNT(*)``: a scan-free
+    catalog estimate (see below) plus an index-only ``MAX(pk)``, because this runs on an
+    operator click against a live production source. Only the TARGET is counted exactly.
 
     Runs on a worker thread (the caller uses ``run.io_bound``). Source uses the
     same read-only source engine the loader uses; target uses the DSQL IAM
@@ -408,6 +412,15 @@ def _fetch_migration_row_counts(migration_state, session, table_names, inventory
             with engine.connect() as connection:
                 source_counts = estimate_source_rows(connection, list(table_names), dialect)
                 source_max_pk = max_pk_source(connection, pk_by_table, dialect)
+                # How old each estimate is (PostgreSQL: last ANALYZE / auto-analyze, a
+                # statistics-view read -- no scan). Display-only, so it can never cost the
+                # counts: any failure leaves the previous value untouched.
+                try:
+                    migration_state.set_source_estimate_stats_at(
+                        dialect.estimate_stats_at(connection, list(table_names))
+                    )
+                except Exception:  # noqa: BLE001 - display metadata only
+                    pass
                 # PostgreSQL CDC only: piggyback the source read-only connection to read
                 # the replication slot's WAL-retention health (a cheap pg_replication_slots
                 # SELECT), so the monitor can warn about WAL pressure before the source

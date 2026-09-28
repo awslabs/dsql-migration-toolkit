@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING, Optional, Sequence
 from dsql_migrator.core.models import SourceType
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from dsql_migrator.core.cdc_postgres import SlotHealth
     from dsql_migrator.core.prerequisites_postgres import PostgresCdcFacts
 
@@ -70,6 +72,7 @@ def estimate_row_counts_query(
     estimate_column: str,
     extra_filter: str = "",
     parse_estimate=lambda value: int(value) if value is not None else None,
+    only_found: bool = False,
 ) -> "dict[str, Optional[int]]":
     """Scan-free per-table row ESTIMATE, keyed exactly as ``tables`` was passed.
 
@@ -83,6 +86,11 @@ def estimate_row_counts_query(
     ``extra_filter`` (e.g. PostgreSQL ``c.relkind IN ('r','p')``), and ``parse_estimate``
     (e.g. map PostgreSQL's never-analyzed ``-1`` to ``None``). Column names come from the
     dialect (never user input), so the interpolation is injection-safe; values bind.
+
+    ``only_found`` returns ONLY the tables the catalog matched, instead of mapping every
+    requested name to ``None`` up front. For a caller whose ``None`` VALUE already means
+    something (``estimate_stats_at``: "present, statistics never refreshed"), a missing
+    table has to stay distinguishable from that, so it is left out rather than conflated.
     """
     from sqlalchemy import text
 
@@ -112,7 +120,7 @@ def estimate_row_counts_query(
         params[f"t{index}"] = obj
         clauses.append(f"({schema_column} = :s{index} AND {table_column} = :t{index})")
 
-    out: dict[str, Optional[int]] = {name: None for name in tables}
+    out: dict[str, Optional[int]] = {} if only_found else {name: None for name in tables}
     if not clauses:
         return out
     where = " OR ".join(clauses)
@@ -338,6 +346,24 @@ class SourceDialect(ABC):
         PostgreSQL reads ``pg_class.reltuples``. Typically implemented via
         :func:`estimate_row_counts_query`.
         """
+
+    def estimate_stats_at(
+        self, connection: object, tables: list[str]
+    ) -> "dict[str, Optional[datetime]]":
+        """When each table's row ESTIMATE was last refreshed, scan-free (best effort).
+
+        Tells the operator how old the :meth:`estimate_row_counts` figure is: an
+        estimate from an hour-old ANALYZE on a table that has since been written to is
+        expected to be off. Keyed as passed. The value is the refresh time (UTC), or
+        ``None`` when the table is known but its statistics were NEVER refreshed -- the
+        state behind a blank estimate -- and a table ABSENT from the result is unknown.
+
+        The default returns ``{}`` (unknown for every table). MySQL keeps InnoDB's
+        statistics time in ``mysql.innodb_table_stats``, which a least-privilege
+        read-only migration user normally cannot read, so it does not override this.
+        Never raises: this is display metadata and must not fail the counts refresh.
+        """
+        return {}
 
     @abstractmethod
     def probe_versions(self, connection: object) -> SourceVersions:

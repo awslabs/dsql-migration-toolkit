@@ -14,6 +14,7 @@ pass-through :class:`PostgresValueConverter`.
 from __future__ import annotations
 
 import re
+from datetime import datetime  # noqa: F401 - referenced by string annotations
 from typing import Optional
 
 from sqlalchemy import text
@@ -999,6 +1000,41 @@ class PostgresSourceDialect(SourceDialect):
             parse_estimate=lambda value: (
                 None if value is None or int(value) < 0 else int(value)
             ),
+        )
+
+    def estimate_stats_at(
+        self, connection: object, tables: list[str]
+    ) -> "dict[str, Optional[datetime]]":
+        # When reltuples was last refreshed: the later of the manual and the automatic
+        # ANALYZE, from the cumulative-statistics view -- in-memory counters, no table
+        # scan. GREATEST ignores NULLs in PostgreSQL, so a table analyzed only one way still
+        # reports that time; both NULL -> never analyzed -> None, which is exactly the
+        # state behind a reltuples of -1 (the blank estimate). A partitioned PARENT keeps
+        # no statistics of its own, and estimate_row_counts sums its LEAVES, so the time
+        # here is the most recent leaf analyze, over the same pg_partition_tree walk.
+        # only_found: a table the catalog does not have is UNKNOWN (absent), not "never
+        # analyzed" -- the UI labels only the latter.
+        return estimate_row_counts_query(
+            connection,
+            tables,
+            current_schema_sql="SELECT current_schema()",
+            select_from="FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace",
+            schema_column="n.nspname",
+            table_column="c.relname",
+            estimate_column=(
+                "CASE WHEN c.relkind = 'p' THEN ("
+                "  SELECT max(GREATEST(s.last_analyze, s.last_autoanalyze))"
+                "  FROM pg_catalog.pg_partition_tree(c.oid) t"
+                "  JOIN pg_catalog.pg_stat_all_tables s ON s.relid = t.relid"
+                "  WHERE t.isleaf"
+                ") ELSE ("
+                "  SELECT GREATEST(s.last_analyze, s.last_autoanalyze)"
+                "  FROM pg_catalog.pg_stat_all_tables s WHERE s.relid = c.oid"
+                ") END"
+            ),
+            extra_filter="c.relkind IN ('r', 'p')",
+            parse_estimate=lambda value: value,
+            only_found=True,
         )
 
     def probe_versions(self, connection: object) -> SourceVersions:
