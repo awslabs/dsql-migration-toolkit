@@ -5496,7 +5496,9 @@ def _readiness_explainer(diagnose_provider, summary, drift, label: str, detail: 
                 "block cut-over, and exactly what should I do about it?"
             ),
             facts=_readiness_check_facts(label, status, detail, summary, drift),
-            scope="run",
+            # Its own scope, not "run": a check can be amber on a run where every table
+            # matched, and the "run" prompt presumes a mismatch to resolve.
+            scope="readiness",
             scope_id=f"validation:readiness:{_readiness_slug(label)}",
             chip=f"Readiness · {label}",
         )
@@ -5517,20 +5519,32 @@ def _readiness_check_facts(
     The check's own label, status and the EXACT detail line on screen come first, then the
     run roll-up (:func:`_validation_run_facts`) as context. No row values (Property 7).
     """
-    meaning = (
-        "red — a failed check"
-        if status == "Failed"
-        else "amber — flagged but non-blocking; it must be understood before cut-over"
-    )
-    return "\n".join(
-        [
-            f"Readiness check: {label}",
-            f"Status: {status} ({meaning})",
-            f"What the report states for this check: {detail}",
-            "Run context:",
-            _validation_run_facts(summary, drift),
-        ]
-    )
+    # The chip colour is NOT the go/no-go: an amber "Heads-up" can still close the cut-over
+    # gate (a difference fully explained by rows the migration dropped leaves the run a
+    # mismatch), so the facts state the run's actual readiness instead of implying
+    # "amber = non-blocking" -- that premise was false and the seed question asks exactly
+    # "does it block cut-over".
+    meaning = "red — a failed check" if status == "Failed" else "amber — flagged for review"
+    lines = [
+        f"Readiness check: {label}",
+        f"Status: {status} ({meaning})",
+        f"What the report states for this check: {detail}",
+        "Overall cut-over readiness for this run: "
+        + ("READY" if summary.ready_for_cutover else "NOT ready"),
+    ]
+    # When the whole difference is rows the migration already dropped, the per-check detail
+    # omits that cause (a lead-in above the checks states it once), so the chat would get
+    # an amber check with no reason. Carry it explicitly.
+    if summary.quarantine_explained_tables:
+        lines.append(
+            "Rows the migration knowingly dropped (quarantined, e.g. over DSQL's 1 MiB "
+            f"per-value limit): {summary.quarantine_explained_rows} in "
+            f"{', '.join(summary.quarantine_explained_tables)}; for "
+            f"{'every' if summary.unexplained_mismatched_tables == 0 else 'some'} "
+            "affected table the difference is exactly those rows."
+        )
+    lines += ["Run context:", _validation_run_facts(summary, drift)]
+    return "\n".join(lines)
 
 def _render_check_row(
     ui: object,

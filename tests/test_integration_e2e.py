@@ -634,3 +634,65 @@ def test_converted_artifacts_execute_on_postgres16() -> None:
         with connection.cursor() as cursor:
             cursor.execute('DROP TABLE IF EXISTS "customers"')
         connection.close()
+
+
+@pytest.mark.integration
+@_REQUIRE_INTEGRATION
+def test_estimate_stats_at_executes_on_postgres_and_dates_partitions_honestly() -> None:
+    """The estimate-age SQL actually RUNS on PostgreSQL, and its partition rule holds.
+
+    The unit tests only string-match the SQL against a fake connection that never executes
+    it, and the helper swallows execution errors, so a broken query would fail silently.
+    Here: an un-analyzed table is None; after ANALYZE it is a time; a partitioned parent is
+    None while ANY leaf is un-analyzed, then its OLDEST leaf's time once all are.
+
+    Requires ``RUN_INTEGRATION_TESTS=1`` and ``DSQL_MIGRATOR_TEST_PG_DSN``.
+    """
+    dsn = os.environ.get("DSQL_MIGRATOR_TEST_PG_DSN")
+    if not dsn:
+        pytest.skip("set DSQL_MIGRATOR_TEST_PG_DSN to a reachable PostgreSQL DSN")
+    try:
+        from sqlalchemy import create_engine
+    except ImportError:  # pragma: no cover
+        pytest.skip("sqlalchemy is not available")
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.core.source_dialect import dialect_for
+
+    url = dsn if dsn.startswith("postgresql") else f"postgresql+psycopg://{dsn}"
+    try:
+        engine = create_engine(url.replace("postgresql://", "postgresql+psycopg://", 1))
+        admin = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+    except Exception as exc:  # noqa: BLE001 - environment not ready -> skip
+        pytest.skip(f"PostgreSQL not reachable: {exc}")
+    from sqlalchemy import text
+
+    dialect = dialect_for(SourceType.POSTGRES)
+    try:
+        admin.execute(text("DROP SCHEMA IF EXISTS est_age_it CASCADE"))
+        admin.execute(text("CREATE SCHEMA est_age_it"))
+        admin.execute(text("CREATE TABLE est_age_it.plain (id int PRIMARY KEY)"))
+        admin.execute(text(
+            "CREATE TABLE est_age_it.parted (id int, k int) PARTITION BY RANGE (k)"))
+        admin.execute(text("CREATE TABLE est_age_it.p1 PARTITION OF est_age_it.parted FOR VALUES FROM (0) TO (10)"))
+        admin.execute(text("CREATE TABLE est_age_it.p2 PARTITION OF est_age_it.parted FOR VALUES FROM (10) TO (20)"))
+        names = ["est_age_it.plain", "est_age_it.parted", "est_age_it.missing"]
+
+        out = dialect.estimate_stats_at(admin, names)
+        assert out.get("est_age_it.plain", "absent") is None     # present, never analyzed
+        assert out.get("est_age_it.parted", "absent") is None    # no leaf analyzed
+        assert "est_age_it.missing" not in out                    # unknown, not "never"
+
+        admin.execute(text("ANALYZE est_age_it.plain"))
+        admin.execute(text("ANALYZE est_age_it.p1"))
+        out = dialect.estimate_stats_at(admin, names)
+        assert out["est_age_it.plain"] is not None
+        assert out["est_age_it.parted"] is None                   # p2 still never analyzed
+
+        admin.execute(text("ANALYZE est_age_it.p2"))
+        out = dialect.estimate_stats_at(admin, names)
+        p1 = admin.execute(text("SELECT pg_stat_get_last_analyze_time('est_age_it.p1'::regclass)")).scalar()
+        assert out["est_age_it.parted"] == p1                     # the OLDEST leaf
+    finally:
+        admin.execute(text("DROP SCHEMA IF EXISTS est_age_it CASCADE"))
+        admin.close()
+        engine.dispose()

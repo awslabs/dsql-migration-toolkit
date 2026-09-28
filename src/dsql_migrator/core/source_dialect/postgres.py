@@ -1005,15 +1005,30 @@ class PostgresSourceDialect(SourceDialect):
     def estimate_stats_at(
         self, connection: object, tables: list[str]
     ) -> "dict[str, Optional[datetime]]":
-        # When reltuples was last refreshed: the later of the manual and the automatic
-        # ANALYZE, from the cumulative-statistics view -- in-memory counters, no table
-        # scan. GREATEST ignores NULLs in PostgreSQL, so a table analyzed only one way still
-        # reports that time; both NULL -> never analyzed -> None, which is exactly the
-        # state behind a reltuples of -1 (the blank estimate). A partitioned PARENT keeps
-        # no statistics of its own, and estimate_row_counts sums its LEAVES, so the time
-        # here is the most recent leaf analyze, over the same pg_partition_tree walk.
+        # When reltuples was last refreshed. ANALYZE, VACUUM (manual or autovacuum) and
+        # CREATE INDEX all rewrite pg_class.reltuples; the first two are timestamped, so
+        # the time is the latest of the four ANALYZE/VACUUM stamps (CREATE INDEX is not
+        # recorded -- the true figure can only be NEWER than the time shown, never older).
+        # GREATEST ignores NULLs in PostgreSQL; all NULL -> None.
+        #
+        # Read through the per-OID pg_stat_get_*_time() functions, NOT the
+        # pg_stat_all_tables view: that view is GROUP BY-built and cannot be flattened, so
+        # joining it per partitioned parent evaluated the whole view (every relation) once
+        # per parent -- O(parents x relations) catalog work on a large schema.
+        #
+        # A partitioned PARENT keeps no statistics of its own, and estimate_row_counts sums
+        # its LEAVES, so the parent's age is its OLDEST leaf (the least current part of the
+        # summed figure) -- and NULL if ANY leaf has never been refreshed, because that
+        # leaf's rows are missing from the sum entirely and no single time describes it.
+        # Reporting the newest leaf (max) made a partly-counted estimate look fresh.
         # only_found: a table the catalog does not have is UNKNOWN (absent), not "never
         # analyzed" -- the UI labels only the latter.
+        stamp = (
+            "GREATEST(pg_catalog.pg_stat_get_last_analyze_time({oid}),"
+            " pg_catalog.pg_stat_get_last_autoanalyze_time({oid}),"
+            " pg_catalog.pg_stat_get_last_vacuum_time({oid}),"
+            " pg_catalog.pg_stat_get_last_autovacuum_time({oid}))"
+        )
         return estimate_row_counts_query(
             connection,
             tables,
@@ -1023,14 +1038,10 @@ class PostgresSourceDialect(SourceDialect):
             table_column="c.relname",
             estimate_column=(
                 "CASE WHEN c.relkind = 'p' THEN ("
-                "  SELECT max(GREATEST(s.last_analyze, s.last_autoanalyze))"
-                "  FROM pg_catalog.pg_partition_tree(c.oid) t"
-                "  JOIN pg_catalog.pg_stat_all_tables s ON s.relid = t.relid"
-                "  WHERE t.isleaf"
-                ") ELSE ("
-                "  SELECT GREATEST(s.last_analyze, s.last_autoanalyze)"
-                "  FROM pg_catalog.pg_stat_all_tables s WHERE s.relid = c.oid"
-                ") END"
+                "  SELECT CASE WHEN bool_or(x.at IS NULL) THEN NULL ELSE min(x.at) END"
+                "  FROM (SELECT " + stamp.format(oid="t.relid") + " AS at"
+                "        FROM pg_catalog.pg_partition_tree(c.oid) t WHERE t.isleaf) x"
+                ") ELSE " + stamp.format(oid="c.oid") + " END"
             ),
             extra_filter="c.relkind IN ('r', 'p')",
             parse_estimate=lambda value: value,

@@ -599,12 +599,16 @@ def test_postgres_estimate_stats_at_distinguishes_never_analyzed_from_unknown() 
     assert out == {"orders": when, "fresh": None}
     assert "absent" not in out
     sql = conn.estimate_sql
-    # Both analyze paths count (manual ANALYZE and autovacuum's), NULL-tolerant -- in
-    # BOTH branches: the ordinary-table read and the partitioned-parent leaf walk.
-    assert sql.count("GREATEST(s.last_analyze, s.last_autoanalyze)") == 2
-    assert "pg_stat_all_tables" in sql
-    # A partitioned parent keeps no stats of its own -- read its leaves, exactly as the
-    # estimate itself sums leaf reltuples.
+    # ANALYZE and VACUUM (manual + auto) all refresh reltuples, so all four stamps count,
+    # in BOTH branches (ordinary table and each leaf of a partitioned parent).
+    for fn in ("analyze", "autoanalyze", "vacuum", "autovacuum"):
+        assert sql.count(f"pg_stat_get_last_{fn}_time(") == 2, fn
+    # Per-OID functions, never the GROUP BY-built view (evaluated whole per parent).
+    assert "pg_stat_all_tables" not in sql
+    # A partitioned parent is as current as its OLDEST leaf, and unknown if ANY leaf
+    # was never refreshed -- the newest leaf (max) made a partly-counted sum look fresh.
+    assert "min(x.at)" in sql and "bool_or(x.at IS NULL)" in sql
+    assert "max(" not in sql
     assert "pg_partition_tree" in sql and "isleaf" in sql
     assert "count(" not in sql.lower()  # never a scan
 

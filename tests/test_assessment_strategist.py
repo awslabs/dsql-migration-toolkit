@@ -556,6 +556,23 @@ def test_build_validation_chat_system_binds_the_answer_to_the_named_table() -> N
     assert "ONLY that table" not in run
 
 
+def test_readiness_scope_does_not_presume_a_mismatch() -> None:
+    """A readiness check can be amber on a run where EVERY table matched (drift under live
+    CDC), so its prompt must not tell the model to resolve a mismatch -- that contradicted
+    the facts it is told never to contradict ("mismatched: 0")."""
+    from dsql_migrator.core.assessment_strategist import build_validation_chat_system
+
+    r = build_validation_chat_system("Matched: 20; mismatched: 0", scope="readiness")
+    assert "one cut-over readiness check that is not green" in r
+    assert "explaining THIS readiness check" in r
+    assert "Do not assume any table mismatched" in r
+    assert "resolving THIS validation mismatch" not in r
+    assert "diverged" not in r
+    # The other scopes keep their mismatch framing.
+    assert "resolving THIS validation mismatch" in build_validation_chat_system("F", scope="run")
+    assert "diverged" in build_validation_chat_system("F", scope="table")
+
+
 def test_stream_validation_chat_passes_the_table_through_to_the_prompt() -> None:
     # The UI's per-table opener sets `table`; it must reach the system prompt, or the
     # restriction silently does nothing and the bug returns.

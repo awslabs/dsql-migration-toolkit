@@ -6217,9 +6217,20 @@ def test_readiness_checks_offer_explain_with_ai_only_on_rows_that_are_not_green(
 
     summary = summarize_validation(_failing_report_for_render())
     opened: list[dict] = []
+
+    # Same keyword-only signature as the real opener in build_validation_screen (no
+    # **kwargs), so an unexpected or missing keyword fails here instead of at click time.
+    def _strict_provider(
+        *, title, subtitle, first_question, facts, scope, scope_id, chip, table=None
+    ):
+        opened.append(dict(
+            title=title, subtitle=subtitle, first_question=first_question, facts=facts,
+            scope=scope, scope_id=scope_id, chip=chip, table=table,
+        ))
+
     ui = _ScreenUi()
     _render_readiness_checks(
-        ui, summary, _drift_advanced(), diagnose_provider=lambda **kw: opened.append(kw)
+        ui, summary, _drift_advanced(), diagnose_provider=_strict_provider
     )
     clicks = _explain_clicks(ui)
     # Two non-green rows -> two actions (not four: Passed and N/A rows carry none).
@@ -6233,13 +6244,19 @@ def test_readiness_checks_offer_explain_with_ai_only_on_rows_that_are_not_green(
     assert "Readiness check: Row counts match" in first["facts"]
     assert "Status: Failed" in first["facts"]
     assert "0/2 tables matched" in first["facts"]  # the detail line, verbatim
-    # ...with the run roll-up as context, scoped to the run (every check is run-level).
+    # ...with the run roll-up as context, in its OWN scope: a check can be amber on a run
+    # where every table matched, and the "run" prompt presumes a mismatch to resolve.
     assert "Tables total: 2" in first["facts"]
-    assert first["scope"] == "run"
+    assert first["scope"] == "readiness"
+    # The chip colour is not the go/no-go, so the facts state the actual readiness and
+    # never claim amber means non-blocking.
+    assert "Overall cut-over readiness for this run: NOT ready" in first["facts"]
+    assert "non-blocking" not in first["facts"]
+    assert "Status: Failed (red — a failed check)" in first["facts"]
 
     clicks[1]()
     second = opened[-1]
-    assert "Status: Heads-up" in second["facts"]
+    assert "Status: Heads-up (amber — flagged for review)" in second["facts"]
     assert "No source drift since snapshot" in second["first_question"]
     # Each check keeps its own conversation, apart from the other and the whole-run chat.
     assert first["scope_id"] != second["scope_id"]
@@ -6620,3 +6637,22 @@ def test_the_cutover_ack_passes_both_ambiguity_predicates() -> None:
     src = inspect.getsource(val)
     assert "inputs_missing=_cutover_gate_inputs_missing(" in src
     assert "fks_stripped=_cutover_foreign_keys_stripped(" in src
+
+
+def test_readiness_facts_carry_the_known_dropped_rows_cause() -> None:
+    # When the whole gap is rows the migration dropped, the check's detail omits the cause
+    # (a lead-in states it once), so the chat would see an amber check with no reason.
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.validation import _readiness_check_facts, summarize_validation
+
+    base = summarize_validation(_failing_report_for_render())
+    summary = SimpleNamespace(**{
+        **{k: getattr(base, k) for k in base.__dataclass_fields__},
+        "quarantine_explained_tables": ("ecommerce.product_media",),
+        "quarantine_explained_rows": 3,
+    })
+    summary.unexplained_mismatched_tables = 0
+    facts = _readiness_check_facts("Data identical", "Heads-up", "d", summary, _drift_na())
+    assert "knowingly dropped" in facts and "3 in ecommerce.product_media" in facts
+    assert "every affected table" in facts

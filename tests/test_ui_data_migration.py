@@ -28609,3 +28609,39 @@ def test_the_dlq_reason_column_is_not_clipped() -> None:
     assert "wrap-cells" in props, props
     # ...and the row carries the reason in FULL -- nothing slices it on the way in.
     assert ui.tables[0]["rows"][0]["message"] == long_reason
+
+
+def test_per_table_status_renders_the_source_estimate_label_and_age() -> None:
+    """Behavioural wiring for the source cell: real render, real rows (not a source grep).
+
+    The age comes from the counts refresh via state; a never-analyzed table is labelled.
+    """
+    from datetime import datetime, timezone
+
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"  # load-bearing: the table set comes from the job
+    when = datetime(2026, 9, 28, 6, 45, tzinfo=timezone.utc)
+    state.set_row_counts(
+        source={"ecommerce.product_media": 62},
+        target={"ecommerce.product_media": 66},
+        fetched_at=when,
+    )
+    state.set_source_estimate_stats_at({"ecommerce.product_media": when})
+    ui = _render_cdc_per_table(state)
+    row = next(r for t in ui.tables for r in t["rows"] if r.get("table") == "ecommerce.product_media")
+    assert row["source"] == "62"
+    assert "2026-09-28 06:45 UTC" in row["source_tip"]
+
+    # Never analyzed: no estimate, present with None -> labelled, not a dash.
+    state2 = DataMigrationState()
+    state2.job_id = "job-fullload-1"
+    state2.set_row_counts(
+        source={"ecommerce.product_media": None},
+        target={"ecommerce.product_media": 25},
+        fetched_at=when,
+    )
+    state2.set_source_estimate_stats_at({"ecommerce.product_media": None})
+    ui2 = _render_cdc_per_table(state2)
+    row2 = next(r for t in ui2.tables for r in t["rows"] if r.get("table") == "ecommerce.product_media")
+    assert row2["source"] == "not analyzed"
+    assert row2["source_tip"]

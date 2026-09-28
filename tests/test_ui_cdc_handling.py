@@ -1837,16 +1837,25 @@ def test_source_estimate_cell_labels_never_analyzed_and_dates_the_rest() -> None
     when = datetime(2026, 9, 24, 22, 22, tzinfo=timezone.utc)
     stats = {"users": when, "products": None}
 
-    # Never analyzed (present with None): labelled, not a bare dash that reads as a failure.
+    # Never analyzed (present with None, no estimate): labelled, not a bare dash that
+    # reads as a failed read.
     label, tip = _source_estimate_cell(None, exact=False, stats_at=stats, table="products")
     assert label == "not analyzed"
-    assert "has not analyzed this table yet" in tip and "Validation" in tip
+    assert "never been analyzed or vacuumed" in tip and "Validation" in tip
 
-    # Analyzed: the number, plus WHEN -- live-seen: users read 100 vs a true 108 because
-    # its last ANALYZE was four days old.
+    # Refreshed: the number, plus WHEN -- live-seen: users read 100 vs a true 108 because
+    # its statistics were four days old.
     label, tip = _source_estimate_cell(100, exact=False, stats_at=stats, table="users")
     assert label == "100"
-    assert "2026-09-24 22:22 UTC" in tip and "not in it" in tip
+    assert "2026-09-24 22:22 UTC" in tip and "may not be in it" in tip
+    assert "least recently refreshed partition" in tip
+
+    # An estimate with NO time covering it (a partitioned table with a never-analyzed
+    # leaf: live order_events read 600 vs 638) must not be dated -- its age is unknown.
+    label, tip = _source_estimate_cell(600, exact=False, stats_at=stats, table="products")
+    assert label == "600"
+    assert "is unknown" in tip and "partition that has never been analyzed" in tip
+    assert "UTC" not in tip
 
     # Unknown (absent: MySQL, or the read failed): the plain rendering, no invented label.
     assert _source_estimate_cell(None, exact=False, stats_at=stats, table="x") == ("—", "")
@@ -1870,7 +1879,12 @@ def test_source_estimate_header_tip_is_worded_for_the_source_engine() -> None:
 
     my = _source_estimate_header_tip(SourceType.MYSQL)
     assert "information_schema" in my and "InnoDB" in my
+    assert "information_schema_stats_expiry" in my  # MySQL 8.0+ caches TABLE_ROWS
     assert "pg_class" not in my
+    # PostgreSQL: VACUUM refreshes reltuples too, and no platform-specific thresholds
+    # are quoted (RDS/Aurora ship different autovacuum defaults).
+    assert "VACUUM" in pg
+    assert "50 rows" not in pg and "10%" not in pg
     for tip in (pg, my):
         assert "never runs a COUNT(*)" in tip and "Validation (step 4)" in tip
 
@@ -1945,3 +1959,52 @@ def test_status_table_renders_the_estimate_label_age_and_engine_tip() -> None:
     assert '"body-cell-source"' in src and "props.row.source_tip" in src
     # Engine read through the restore-aware helper, never a raw source_config getattr.
     assert "_source_estimate_header_tip(session_source_type(session))" in src
+
+
+def test_estimate_age_is_read_after_slot_health_so_it_cannot_poison_it(monkeypatch) -> None:
+    # The source connection is not autocommit and a server-side error in the estimate
+    # helper is swallowed WITHOUT a rollback, leaving the transaction aborted. Run before the
+    # slot-health read, one failure silently failed that read too (InFailedSqlTransaction).
+    from dsql_migrator.ui.data_migration import _cdc_status
+
+    order: list[str] = []
+    monkeypatch.setattr(
+        _cdc_status, "_refresh_pg_slot_health", lambda *a, **k: order.append("slot")
+    )
+
+    def _stats(tables):
+        order.append("stats")
+        return {}
+
+    _fetch_with_fake_source(monkeypatch, _stats)
+    assert order == ["slot", "stats"]
+
+
+def test_estimate_age_is_cleared_when_the_source_cannot_be_read(monkeypatch) -> None:
+    # A refresh that cannot read the source falls back to the Full Load watermark figure;
+    # keeping the previous refresh's ANALYZE times would date that different figure.
+    from contextlib import contextmanager
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.data_migration import DataMigrationState, _cdc_status
+
+    class _DeadEngine:
+        @contextmanager
+        def connect(self):
+            raise OSError("source unreachable")
+            yield  # pragma: no cover
+
+    monkeypatch.setattr(_cdc_status, "make_source_engine_factory", lambda _pw: lambda _c: _DeadEngine())
+    state = DataMigrationState()
+    state.set_source_estimate_stats_at({"t1": datetime(2026, 9, 1, tzinfo=timezone.utc)})
+    session = SimpleNamespace(
+        source_config=SimpleNamespace(source_type=None),
+        source_password=object(),
+        has_source=lambda: True,
+        has_target=lambda: False,
+        target_config=None,
+    )
+    *_counts, source_available = _cdc_status._fetch_migration_row_counts(state, session, ["t1"])
+    assert source_available is False
+    assert state.source_estimate_stats_at == {}

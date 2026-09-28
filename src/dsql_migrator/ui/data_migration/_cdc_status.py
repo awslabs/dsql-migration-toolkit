@@ -387,6 +387,7 @@ def _fetch_migration_row_counts(migration_state, session, table_names, inventory
     # source columns stay blank and the UI must say WHY (re-enter the source
     # connection), instead of silently showing a dash that looks like a bug.
     source_available = False
+    stats_at: dict = {}
     # Source side (MySQL): a scan-free row ESTIMATE (information_schema) + an
     # index-only MAX(pk). Both are negligible-load even on large-scale tables, so the
     # consistency view never runs a COUNT(*) full scan against the live production
@@ -412,23 +413,29 @@ def _fetch_migration_row_counts(migration_state, session, table_names, inventory
             with engine.connect() as connection:
                 source_counts = estimate_source_rows(connection, list(table_names), dialect)
                 source_max_pk = max_pk_source(connection, pk_by_table, dialect)
-                # How old each estimate is (PostgreSQL: last ANALYZE / auto-analyze, a
-                # statistics-view read -- no scan). Display-only, so it can never cost the
-                # counts: any failure leaves the previous value untouched.
-                try:
-                    migration_state.set_source_estimate_stats_at(
-                        dialect.estimate_stats_at(connection, list(table_names))
-                    )
-                except Exception:  # noqa: BLE001 - display metadata only
-                    pass
                 # PostgreSQL CDC only: piggyback the source read-only connection to read
                 # the replication slot's WAL-retention health (a cheap pg_replication_slots
                 # SELECT), so the monitor can warn about WAL pressure before the source
                 # disk fills. Best-effort; MySQL's dialect returns None (no slot).
                 _refresh_pg_slot_health(migration_state, source_config, connection)
+                # How old each estimate is (PostgreSQL: last ANALYZE/VACUUM stamps via the
+                # per-OID statistics functions -- no scan). Deliberately the LAST read on
+                # this connection: the connection is not autocommit and a server-side error
+                # is swallowed without a rollback, which leaves the transaction ABORTED --
+                # run earlier, one failure here would silently have failed the slot-health
+                # read after it (InFailedSqlTransaction). Display-only, so it can never cost
+                # the counts either.
+                try:
+                    stats_at = dict(dialect.estimate_stats_at(connection, list(table_names)))
+                except Exception:  # noqa: BLE001 - display metadata only
+                    stats_at = {}
             source_available = True
     except Exception:  # noqa: BLE001 - read-only best effort; keep None on failure
         pass
+    # ALWAYS replaced, including with {} when the source could not be read this time: the
+    # counts view then falls back to the Full Load watermark figure, and keeping the previous
+    # refresh's ANALYZE times would date that different figure with a time it never had.
+    migration_state.set_source_estimate_stats_at(stats_at)
     # Target side (DSQL): IAM connector, exact COUNT(*) + MAX(pk) per table.
     try:
         from dsql_migrator.core.target_introspector import max_pk_target

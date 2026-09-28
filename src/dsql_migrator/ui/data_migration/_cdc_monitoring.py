@@ -104,26 +104,28 @@ def _source_estimate_header_tip(source_type) -> str:
     The figure comes from a different catalog on each engine, refreshed by a different
     mechanism, and the tooltip used to describe only MySQL's ("information_schema ...
     InnoDB index sampling") -- wrong on a PostgreSQL source, where it is the planner's
-    ``pg_class.reltuples`` and goes stale until the next ANALYZE.
+    ``pg_class.reltuples``. Deliberately quotes no autovacuum/InnoDB thresholds: they
+    are configurable and differ by platform (RDS/Aurora ship their own defaults), so a
+    number here would be wrong on some sources.
     """
     exact_hint = "For an exact source-vs-target comparison, run Validation (step 4)."
     if source_type == SourceType.POSTGRES:
         return (
             "Approximate row count from PostgreSQL's planner statistics "
             "(pg_class.reltuples) — a scan-free ESTIMATE, so this view never runs a "
-            "COUNT(*) full scan against your live source. It is refreshed only by "
-            "ANALYZE or autovacuum's auto-analyze (by default after 50 rows plus 10% of "
-            "the table change), so rows written since then are not in it, and a table "
-            "that has never been analyzed shows “not analyzed”. Hover a value for when "
-            "it was last analyzed. " + exact_hint
+            "COUNT(*) full scan against your live source. It is only as current as the "
+            "last ANALYZE, VACUUM (manual or autovacuum) or CREATE INDEX on the table, so "
+            "rows written since then are not in it; a table with no statistics yet shows "
+            "“not analyzed”. Hover a value for when it was last refreshed. " + exact_hint
         )
     return (
         "Approximate row count from the source's information_schema — a scan-free "
         "ESTIMATE, so this view never runs a COUNT(*) full scan against your live "
-        "source. InnoDB derives it from index sampling and recalculates it after about "
-        "10% of the table changes (or on ANALYZE TABLE), so it commonly differs from the "
-        "true count by several percent (more on a large table) and often UNDERCOUNTS — "
-        "a target that slightly exceeds it is normal, not data duplication. " + exact_hint
+        "source. InnoDB derives it from index sampling, and MySQL 8.0+ also caches it "
+        "for information_schema_stats_expiry (24 hours by default), so it commonly "
+        "differs from the true count by several percent (more on a large table) and "
+        "often UNDERCOUNTS — a target that slightly exceeds it is normal, not data "
+        "duplication. ANALYZE TABLE refreshes it. " + exact_hint
     )
 
 
@@ -136,30 +138,43 @@ def _source_estimate_cell(
 ) -> "tuple[str, str]":
     """``(label, tooltip)`` for one table's source-rows cell. Pure.
 
-    ``stats_at`` is when each estimate was last refreshed; a table present with ``None``
-    was NEVER analyzed, which is why its estimate is blank -- so it is labelled instead of
-    showing a bare dash that reads like a failed read. A table absent from ``stats_at`` is
-    unknown (MySQL, or the read failed) and keeps the plain rendering.
+    ``stats_at`` is when each estimate was last refreshed (see
+    ``SourceDialect.estimate_stats_at``). A table present with ``None`` has no recorded
+    ANALYZE/VACUUM time covering its whole estimate; a table ABSENT is unknown (MySQL, or
+    the read failed) and keeps the plain rendering -- nothing is invented for it.
     """
+    known = table in stats_at
+    refreshed = stats_at.get(table)
     if estimate is None:
-        if table in stats_at and stats_at[table] is None:
+        if known and refreshed is None:
             return (
                 "not analyzed",
-                "PostgreSQL has not analyzed this table yet, so it has no row estimate. "
-                "Autovacuum analyzes it once enough rows change (by default 50 plus 10% "
-                "of the table). Validation (step 4) counts it exactly.",
+                "PostgreSQL has no statistics for this table yet (it has never been "
+                "analyzed or vacuumed), so there is no row estimate. Autovacuum will "
+                "analyze it once enough of its rows change. Validation (step 4) counts "
+                "it exactly.",
             )
         return "—", ""
     label = f"{estimate:,}" + (" (exact)" if exact else "")
-    analyzed = stats_at.get(table)
-    if analyzed is not None and not exact:
+    if exact or not known:
+        return label, ""
+    if refreshed is None:
+        # An estimate exists but no single refresh time covers it: a partition that was
+        # never analyzed (its rows are missing from the summed figure), or a PostgreSQL 13
+        # table that was never analyzed and reads 0. Say so rather than date it.
         return (
             label,
-            f"Planner estimate from the last ANALYZE at "
-            f"{analyzed.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC — rows "
-            "written since then are not in it.",
+            "How current this estimate is, is unknown: no ANALYZE or VACUUM time covers "
+            "all of it (for example a partition that has never been analyzed, whose rows "
+            "are then missing from it). Validation (step 4) counts it exactly.",
         )
-    return label, ""
+    return (
+        label,
+        "Planner estimate last refreshed by ANALYZE or VACUUM at "
+        f"{refreshed.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC (for a "
+        "partitioned table, its least recently refreshed partition) — rows written "
+        "since then may not be in it.",
+    )
 
 
 def _render_migration_table_status(

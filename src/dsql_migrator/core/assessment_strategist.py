@@ -779,6 +779,8 @@ def build_validation_chat_system(
     subject = (
         "one table that did NOT match"
         if scope == "table"
+        else "one cut-over readiness check that is not green"
+        if scope == "readiness"
         else "a validation run with mismatches"
     )
     scoped = scope == "table" and bool(table)
@@ -800,18 +802,37 @@ def build_validation_chat_system(
         if scoped
         else ""
     )
+    readiness = scope == "readiness"
+    # The opening and the focus paragraph presume a DIVERGENCE for "table"/"run" -- both are
+    # only reachable on a no-go. A readiness check can be amber on a run where EVERY table
+    # matched (source drift under live CDC; reconciliation that could not run), so that
+    # scope gets its own framing instead: the "run" one told the model to resolve a mismatch
+    # while the facts it must never contradict said "mismatched: 0". The other scopes keep
+    # their text byte for byte.
+    goal = (
+        "explain what this check means here and exactly what to do about it"
+        if readiness
+        else "explain WHY it likely diverged and exactly HOW to fix it"
+    )
+    focus = (
+        "Your focus is explaining THIS readiness check: what it measures, why it is not "
+        "green here, whether the facts say cut-over is ready, and exactly what to do "
+        "next. Do not assume any table mismatched unless the facts say so"
+        if readiness
+        else "Your focus is resolving THIS validation mismatch (root cause, whether it is "
+        "lag vs a standing gap vs extra rows, and the recovery steps)"
+    )
     return (
         "You are a senior AWS database migration engineer chatting with a teammate "
         f"who just validated a {source_engine} -> Amazon Aurora DSQL migration and is "
-        f"looking at {subject}. Answer naturally and conversationally — explain WHY it "
-        "likely diverged and exactly HOW to fix it, in a friendly, helpful tone, "
+        f"looking at {subject}. Answer naturally and conversationally — {goal}, in a "
+        "friendly, helpful tone, "
         "answering follow-ups in context. Do NOT use a rigid template. Light "
         "GitHub-flavored Markdown is fine (a short list, a little emphasis, a fenced "
         "code block for any SQL/commands) but keep it reading like a natural reply. "
         "Be specific and concise, and give a concrete next action.\n\n"
         f"{restriction}"
-        "Your focus is resolving THIS validation mismatch (root cause, whether it is "
-        "lag vs a standing gap vs extra rows, and the recovery steps), but you are "
+        f"{focus}, but you are "
         "also this migration's assistant. If the user asks about the WIDER migration "
         "-- the converted DDL for the affected table, the assessment, load status, "
         "other tables -- help them: USE ANY TOOLS you have to look up the real data "
