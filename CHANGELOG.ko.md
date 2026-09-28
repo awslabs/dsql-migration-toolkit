@@ -5,6 +5,38 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.559
+
+v0.1.558에서 적용한 수정이 실제로는 동작하지 않음을 라이브 재검증으로 확인하고, 두 단계 위에 있던 진짜 원인을 찾아 고쳤습니다. 원인 규명에 라이브 검증 두 번이 필요했던 사안이라 메커니즘을 아래에 모두 적어 둡니다.
+
+### 수정 — 조용한 CDC 데이터 손상, 나머지 전부 (플러그인 v48 → v50)
+
+- **CDC가 기록한 NULL이 원본 컬럼의 DEFAULT 값으로 타깃에 저장되었고, v0.1.558의 수정으로는 막을 수 없었습니다.** v48 싱크 플러그인이 등록되어 RUNNING 상태인데도 `n int DEFAULT 7` 컬럼에 NULL을 쓰는 CDC insert/update가 Aurora DSQL에는 여전히 `7`로 도착했습니다. 원인은 Kafka의 `JsonConverter`입니다. `replace.null.with.default`가 true일 때 **양방향 모두** null을 필드 스키마의 기본값으로 치환하며, true가 바로 그 기본값입니다.
+
+  ```java
+  직렬화   convertToJson:    if (value == null)
+                               if (schema.defaultValue() != null && replaceNullWithDefault())
+                                 return convertToJson(schema, schema.defaultValue());
+  역직렬화 convertToConnect: if (jsonValue.isNull())
+                               if (schema.defaultValue() != null && replaceNullWithDefault())
+                                 return schema.defaultValue();
+  ```
+
+  둘 다 connect-json 3.7.0 바이트코드로 확인했고, 라이브 MSK Connect 워커 로그에도 `Kafka version: 3.7.0`과 플래그가 `true`로 찍혀 있었습니다. Debezium은 이 필드 기본값을 원본 컬럼의 `DEFAULT` 절에서 채우므로, `DEFAULT <x>`로 선언된 컬럼이라면 NULL을 쓰는 모든 CDC insert/update가 `<x>`로 바뀌었습니다. 그러면 싱크는 원본이 NULL인 자리에 기본값을 충실히 기록합니다. 오류도, 데드레터도, 로그도 없습니다. 잡아낼 수 있었던 것은 Validation의 CHECKSUM뿐입니다. **PostgreSQL 전용 문제가 아니며 MySQL도 똑같이 영향을 받았습니다.**
+
+  이제 두 워커 설정 모두 `key.converter.replace.null.with.default=false`와 `value.converter.replace.null.with.default=false`를 고정합니다.
+
+- **관여하는 계층이 세 개이고 어느 하나도 불필요하지 않습니다.** 앞선 두 번의 시도가 놓친 지점이 바로 이것입니다.
+  1. **소스 워커 컨버터** — 직렬화 경로가 치환하므로 기본값이 이미 전송 JSON에 구워져 나갔고, NULL은 소스 커넥터를 떠난 적조차 없었습니다. 싱크만 고정하는 것으로는 해결되지 않음을 라이브로 확인했습니다. "소스 커넥터는 직렬화만 하니 전송 데이터는 온전하다"는 판단이 틀렸습니다. Struct 슬롯을 읽으면 진짜 null이 나오지만, 그 뒤 `convertToJson`이 **나가는 길에** 기본값을 다시 넣습니다.
+  2. **싱크 워커 컨버터** — 그러지 않으면 전송된 null이 들어오는 길에 다시 기본값으로 바뀝니다.
+  3. **싱크 jar의 읽기** (v0.1.558의 `getWithoutDefault`) — 그러지 않으면 `Struct.get(Field)`가 읽는 시점에 기본값을 세 번째로 치환합니다.
+
+  실제 jar로 오프라인 검증했습니다. 플래그가 `true`면 `getWithoutDefault`가 **이미** 기본값을 반환하므로 v48 변경 단독으로는 효과가 없습니다. `false`면 `getWithoutDefault`는 null을, `get(Field)`는 여전히 기본값을 반환하므로 플래그를 고친 뒤에는 v48 변경이 반드시 필요합니다.
+
+- KEY 컨버터도 같은 이유로 고정합니다. 재키(re-key)된 테이블의 키 스키마는 같은 원본 기본값을 지니므로, 추가된 키 컬럼을 담지 않은 DELETE before-image가 실제로는 null인 값을 non-NULL로 **조작**당했습니다. 고정하면 키가 원본 그대로 전달됩니다. 다만 이것으로 얻지 못하는 것도 라이브로 확인했습니다. 재키된 테이블을 `REPLICA IDENTITY DEFAULT`로 바꾸면 DELETE는 싱크에 아예 도달하지 않고 로그 한 줄 없이 상류에서 버려집니다. 즉 싱크의 null 키 가드는 이 경로에서는 동작할 기회가 없으며, 해당 구성을 **차단하는 사전 점검**이 실제 보호 수단입니다.
+
+- 싱크 ZIP 내용이 v48과 바이트 단위로 동일하지만 플러그인 버전을 올립니다. `PluginVersion`이 커스텀 이름을 가진 불변 리소스 `AWS::KafkaConnect::WorkerConfiguration`의 이름을 결정하므로, 이름 충돌 없이 교체할 수 있는 유일한 수단이 버전 범프입니다. 다른 플러그인 버전 범프와 마찬가지로 **운영 중인 CDC 스택은 Delete + Deploy infrastructure가 필요합니다.**
+
 ## v0.1.558
 
 같은 라이브 PostgreSQL 17.7 → MSK → Aurora DSQL 파이프라인에서 나온 5건입니다. 둘은 조용한 CDC 데이터 손상, 하나는 테이블을 영구히 검증할 수 없게 만드는 문제, 둘은 측정값과 반대되는 내용을 운영자에게 보여주던 화면입니다.

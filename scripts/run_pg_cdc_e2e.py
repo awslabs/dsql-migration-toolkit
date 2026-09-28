@@ -373,16 +373,7 @@ def stage_full_load(args) -> None:
     # load fails per type: `jsonb[]`/`json[]` with psycopg's "cannot adapt type 'dict'",
     # every other array with 42804 "column is of type jsonb but expression is of type
     # <t>[]". Reproduced on a live Aurora PostgreSQL 17.7 before this was added.
-    from dsql_migrator.core.converter import SchemaConverter, SchemaConvertOptions
-    converter = SchemaConverter(source_type=_source_config().source_type)
-    table_conversions: dict = {}
-    for tdef in tables:
-        conv = converter.convert_table(tdef, SchemaConvertOptions())
-        if conv.target_ddl.lstrip().upper().startswith("CREATE TABLE"):
-            table_conversions[tdef.name] = conv
-        else:
-            log(f"  [convert] skip {tdef.name}: no CREATE TABLE produced "
-                f"({conv.warnings[0].message if conv.warnings else 'n/a'})")
+    table_conversions = _table_conversions(tables, verbose=True)
     log(f"  Converted {len(table_conversions)}/{len(tables)} table(s) for the applied "
         "target types.")
     inputs = DataMigrationInputs(
@@ -442,6 +433,48 @@ def stage_full_load(args) -> None:
 # --------------------------------------------------------------------------- #
 # Shared: build the PG source + sink configs via the tool's dispatch
 # --------------------------------------------------------------------------- #
+def _table_conversions(tables, verbose: bool = False) -> dict:
+    """Convert every table and return ``{name: TableConversion}`` -- the SAME field the
+    UI's Schema Conversion produces, and the ONLY source of the loader's APPLIED target
+    types (``_full_load_engine`` reads them via ``parse_target_column_types``). Without
+    it the engine still DROPs+recreates the target from its own conversion (so an array
+    column IS created as jsonb) while the exporter reads the column UNCAST, and the load
+    fails per type: ``jsonb[]``/``json[]`` with psycopg's "cannot adapt type 'dict'",
+    every other array with 42804 "column is of type jsonb but expression is of type
+    <t>[]". Reproduced on a live Aurora PostgreSQL 17.7 before this was added.
+
+    ``CDC_COMPOSITE_LEADING=<col>``: convert any table that HAS that column with the
+    COMPOSITE_KEY strategy, so the target primary key becomes ``(<col>, <source pk>)``.
+    Both Full Load (target DDL) and Start CDC (``message.key.columns``, derived from this
+    same DDL by ``composite_key_columns_for_cdc``) must see it, or the target is re-keyed
+    while the change record stays keyed on the source PK. Tables without the column keep
+    their own key.
+    """
+    from dsql_migrator.core.converter import (
+        PrimaryKeyStrategy, SchemaConverter, SchemaConvertOptions,
+    )
+
+    converter = SchemaConverter(source_type=_source_config().source_type)
+    leading = cfg("CDC_COMPOSITE_LEADING", "")
+    conversions: dict = {}
+    for tdef in tables:
+        opts = SchemaConvertOptions()
+        if leading and any(c.name == leading for c in tdef.columns):
+            opts = SchemaConvertOptions(
+                primary_key_strategy=PrimaryKeyStrategy.COMPOSITE_KEY,
+                composite_leading_column=leading,
+            )
+            if verbose:
+                log(f"  [re-key] {tdef.name}: composite leading column '{leading}'")
+        conv = converter.convert_table(tdef, opts)
+        if conv.target_ddl.lstrip().upper().startswith("CREATE TABLE"):
+            conversions[tdef.name] = conv
+        elif verbose:
+            log(f"  [convert] skip {tdef.name}: no CREATE TABLE produced "
+                f"({conv.warnings[0].message if conv.warnings else 'n/a'})")
+    return conversions
+
+
 def _build_pg_configs(allow_empty_sink):
     """Return (pg_source_config, sink_config, tables) built via the tool's dispatch."""
     from dsql_migrator.core.cdc import CDC_DEFAULT_DLQ_TOPIC, CdcPipelineOrchestrator
@@ -457,6 +490,17 @@ def _build_pg_configs(allow_empty_sink):
         database=cfg("DB_NAME", "postgres"),
         stack_name=STACK_NAME,
     )
+    # Composite-PK re-key: derive {db.table: [target key cols]} from the APPLIED target
+    # DDL exactly as the UI does, and put it on the SOURCE config -- build_cdc_stack_params
+    # reads source_config.message_key_columns for the MessageKeyColumns stack param. Without
+    # this the target is re-keyed on (leading, id) while Debezium keeps keying the record on
+    # the source PK, so the sink's ON CONFLICT / DELETE key does not match the target key.
+    from dsql_migrator.core.cdc import composite_key_columns_for_cdc
+
+    rekey = composite_key_columns_for_cdc(tables, _table_conversions(tables))
+    if rekey:
+        source_config = source_config.model_copy(update={"message_key_columns": rekey})
+        log(f"  [re-key] message.key.columns: {rekey}")
     sink_config = CdcPipelineOrchestrator().build_sink_config(
         "postgres-sink", tables, CDC_DEFAULT_DLQ_TOPIC, allow_empty=allow_empty_sink,
     )

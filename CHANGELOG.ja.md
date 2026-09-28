@@ -5,6 +5,38 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.559
+
+v0.1.558 で入れた修正がライブ再検証では効いていないことが判明し、二段上にあった真の原因を修正しました。原因の特定にライブ検証が二度必要だった事案なので、仕組みを以下にすべて記します。
+
+### 修正 — 静かな CDC データ破損、その残りすべて (プラグイン v48 → v50)
+
+- **CDC が書き込んだ NULL がソース列の DEFAULT 値としてターゲットに保存され、v0.1.558 の修正では防げませんでした。** v48 のシンクプラグインが登録され RUNNING の状態でも、`n int DEFAULT 7` に NULL を書き込む CDC の insert/update は Aurora DSQL には `7` として到着しました。原因は Kafka の `JsonConverter` です。`replace.null.with.default` が true のとき **双方向ともに** null をフィールドスキーマの既定値へ置き換え、その true がデフォルト値です。
+
+  ```java
+  シリアル化   convertToJson:    if (value == null)
+                                  if (schema.defaultValue() != null && replaceNullWithDefault())
+                                    return convertToJson(schema, schema.defaultValue());
+  逆シリアル化 convertToConnect: if (jsonValue.isNull())
+                                  if (schema.defaultValue() != null && replaceNullWithDefault())
+                                    return schema.defaultValue();
+  ```
+
+  いずれも connect-json 3.7.0 のバイトコードで確認し、ライブの MSK Connect ワーカーのログにも `Kafka version: 3.7.0` とフラグが `true` で出ていました。Debezium はこのフィールド既定値をソース列の `DEFAULT` 句から埋めるため、`DEFAULT <x>` と宣言された列では NULL を書く CDC の insert/update がすべて `<x>` に変わりました。するとシンクはソースが NULL の箇所に既定値を忠実に書き込みます。エラーもデッドレターもログもありません。検出できたのは Validation の CHECKSUM だけでした。**PostgreSQL 固有ではなく、MySQL も同様に影響を受けていました。**
+
+  両方のワーカー設定で `key.converter.replace.null.with.default=false` と `value.converter.replace.null.with.default=false` を固定します。
+
+- **関わる層は三つあり、どれも省けません。** 先の二度の試みが見落としたのはまさにここです。
+  1. **ソースワーカーのコンバータ** — シリアル化経路が置き換えるため、既定値はすでに送信 JSON に焼き込まれ、NULL はソースコネクタを出てすらいませんでした。シンクのみの固定では直らないことをライブで確認しました。「ソースコネクタはシリアル化しかしないので送信データは無傷」という判断が誤りでした。Struct のスロットを読めば本物の null が返りますが、その後 `convertToJson` が**出ていく途中で**既定値を戻します。
+  2. **シンクワーカーのコンバータ** — さもなければ送信された null が入ってくる途中で既定値に戻ります。
+  3. **シンク jar の読み取り** (v0.1.558 の `getWithoutDefault`) — さもなければ `Struct.get(Field)` が読み取り時点で三度目の置き換えを行います。
+
+  実際の jar でオフライン検証しました。フラグが `true` なら `getWithoutDefault` は**すでに**既定値を返すため v48 の変更だけでは無効です。`false` なら `getWithoutDefault` は null を、`get(Field)` は依然として既定値を返すため、フラグ修正後は v48 の変更が必須です。
+
+- KEY コンバータも同じ理由で固定します。再キー化されたテーブルのキースキーマは同じソース既定値を持つため、追加されたキー列を含まない DELETE の before-image が、実際には null の値を non-NULL に**捏造**されていました。固定すればキーは忠実に渡ります。ただしこれで得られないこともライブで確認しました。再キー化されたテーブルを `REPLICA IDENTITY DEFAULT` に切り替えると、DELETE はシンクに到達せずログ一行もなく上流で破棄されます。つまりシンクの null キーガードはこの経路では働く機会がなく、その構成を**ブロックする事前チェック**が実際の保護です。
+
+- シンク ZIP の内容は v48 とバイト単位で同一ですが、プラグインバージョンを上げます。`PluginVersion` はカスタム名を持つ不変リソース `AWS::KafkaConnect::WorkerConfiguration` の名前を決めるため、名前衝突なしに置き換えられる唯一の手段がバージョン更新です。他のプラグインバージョン更新と同様に、**稼働中の CDC スタックには Delete + Deploy infrastructure が必要です。**
+
 ## v0.1.558
 
 同じ稼働中の PostgreSQL 17.7 → MSK → Aurora DSQL パイプラインから得た 5 件です。2 件は静かな CDC データ破損、1 件はテーブルを恒久的に検証不能にする問題、2 件は測定値と反対の内容を運用者に示していた画面です。

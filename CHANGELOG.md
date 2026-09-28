@@ -5,6 +5,38 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.559
+
+A live re-check of v0.1.558's own fix found it inert, and the real cause two layers higher. It took two live rounds to pin down, so the mechanism is written out in full below.
+
+### Fixed — silent CDC data corruption, the rest of it (plugin v48 → v50)
+
+- **A CDC-written NULL landed on the target as the source column's DEFAULT — and v0.1.558's fix could not have stopped it.** With the v48 sink plugin registered and RUNNING, a CDC insert/update writing NULL into `n int DEFAULT 7` still arrived on Aurora DSQL as `7`. The cause is Kafka's `JsonConverter`, which substitutes a field's schema default for a null in **both** directions when `replace.null.with.default` is true — and true is its default:
+
+  ```java
+  SERIALIZE   convertToJson:    if (value == null)
+                                  if (schema.defaultValue() != null && replaceNullWithDefault())
+                                    return convertToJson(schema, schema.defaultValue());
+  DESERIALIZE convertToConnect: if (jsonValue.isNull())
+                                  if (schema.defaultValue() != null && replaceNullWithDefault())
+                                    return schema.defaultValue();
+  ```
+
+  Both verified in connect-json 3.7.0's bytecode; the live MSK Connect worker logged `Kafka version: 3.7.0` and dumped the flag as `true`. Debezium populates that field default from the SOURCE COLUMN's `DEFAULT` clause, so for any column declared `DEFAULT <x>`, every CDC insert/update writing NULL became `<x>`. The sink then faithfully wrote the default where the source holds NULL — no error, no dead letter, no log line. Only Validation's CHECKSUM could ever have caught it. **Not PostgreSQL-only: MySQL was equally affected.**
+
+  Both worker configurations now pin `key.converter.replace.null.with.default=false` and `value.converter.replace.null.with.default=false`.
+
+- **Three layers are involved and none is redundant** — which is exactly why the first two attempts missed:
+  1. **source worker converters** — the serialize path substitutes, so the default was baked into the JSON on the wire and the NULL never left the source connector. Pinning only the sink was live-verified **not** to fix it. "A source connector only serializes, so the wire is clean" is wrong: reading the Struct slot returns the real null, and `convertToJson` then puts the default back on the way *out*.
+  2. **sink worker converters** — otherwise a wire null is turned back into the default on the way in.
+  3. **the sink jar's read** (v0.1.558's `getWithoutDefault`) — otherwise `Struct.get(Field)` substitutes the default a third time at the read itself.
+
+  Proven against the real jars offline: with the flag `true`, `getWithoutDefault` **already** returns the default, so the v48 change alone is inert; with it `false`, `getWithoutDefault` returns null while `get(Field)` still returns the default, so the v48 change is required once the flags are fixed.
+
+- The KEY converters are pinned for the same reason: a re-keyed table's key schema carries the same source default, so a DELETE before-image that does not carry the added key column got a **fabricated** non-NULL key component instead of the null it really is. With the pin the key is faithful. What this does *not* buy, live-verified: on a re-keyed table switched to `REPLICA IDENTITY DEFAULT` the DELETE never reaches the sink at all — it is dropped upstream with no log line — so the sink's null-key guard is a backstop that path does not exercise. The prerequisite check that **blocks** that configuration is the actual protection.
+
+- The plugin version is bumped even though the sink ZIP is byte-identical to v48: `PluginVersion` names the custom-named, immutable `AWS::KafkaConnect::WorkerConfiguration`, so the bump is the only vehicle that can replace it without a name clash. **A live CDC stack needs Delete + Deploy infrastructure**, as for any plugin-version bump.
+
 ## v0.1.558
 
 Five more fixes from the same live PostgreSQL 17.7 → MSK → Aurora DSQL pipeline. Two were silent CDC data corruption, one was a table that could never be validated at all, and two were screens telling the operator the opposite of what was measured.

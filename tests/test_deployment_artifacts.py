@@ -1022,6 +1022,36 @@ def test_cdc_stack_uses_json_converter_not_glue(cdc_template: dict) -> None:
         assert "schemaregistry" not in text.lower(), cfg_name
 
 
+def test_cdc_worker_configs_disable_null_to_default_replacement(
+    cdc_template: dict,
+) -> None:
+    """Neither worker's converters may swap a null for the field's schema default.
+
+    Kafka's ``JsonConverter`` substitutes ``schema.defaultValue()`` for a null in BOTH
+    directions when ``replace.null.with.default`` is true -- and true is its default.
+    Debezium sets that field default from the SOURCE COLUMN's ``DEFAULT`` clause, so
+    leaving the flag alone silently wrote the column's default wherever CDC wrote NULL, on
+    both source engines, with no error and no dead letter (live-reproduced: ``n int DEFAULT
+    7`` set to NULL by CDC landed on Aurora DSQL as 7).
+
+    BOTH worker configs are asserted, and the source one is the easy miss: a source
+    connector only SERIALIZES, but the serialize path (``convertToJson``) substitutes too,
+    so the default was baked into the JSON on the wire and the NULL never left the source
+    connector. Pinning only the sink was live-verified NOT to fix it. The KEY converters
+    matter for a re-keyed table, where a fabricated non-NULL key component stopped the
+    sink's null-key DELETE guard from ever firing.
+    """
+    resources = cdc_template["Resources"]
+    for cfg_name in ("WorkerConfiguration", "SinkWorkerConfiguration"):
+        body = json.dumps(resources[cfg_name]["Properties"]["PropertiesFileContent"])
+        for prefix in ("key", "value"):
+            assert (
+                f"{prefix}.converter.replace.null.with.default=false" in body
+            ), f"{cfg_name}/{prefix}"
+        # Never the substituting value -- an explicit `=true` reintroduces the corruption.
+        assert "replace.null.with.default=true" not in body, cfg_name
+
+
 def test_cdc_stack_worker_configs_shrink_internal_topic_partitions(
     cdc_template: dict,
 ) -> None:

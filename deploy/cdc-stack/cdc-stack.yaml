@@ -1324,6 +1324,43 @@ Resources:
                   StringEquals:
                     cloudwatch:namespace: MysqlDsqlMigrator/CDC
 
+  # replace.null.with.default=false on BOTH worker configs -- SILENT DATA CORRUPTION IF UNSET.
+  # Kafka's JsonConverter substitutes the field's schema DEFAULT for a null in BOTH directions
+  # when this flag is true, which is its default (verified in connect-json 3.7.0's bytecode;
+  # the live MSK Connect worker logs "Kafka version: 3.7.0" and dumped the flag as true):
+  #   SERIALIZE   convertToJson:    if (value == null)
+  #                                   if (schema.defaultValue() != null && replaceNullWithDefault())
+  #                                     return convertToJson(schema, schema.defaultValue());
+  #   DESERIALIZE convertToConnect: if (jsonValue.isNull())
+  #                                   if (schema.defaultValue() != null && replaceNullWithDefault())
+  #                                     return schema.defaultValue();
+  # Debezium populates that field default from the SOURCE COLUMN's DEFAULT clause, so for any
+  # column declared `DEFAULT <x>` every CDC insert/update writing NULL was turned into <x> --
+  # the sink then faithfully wrote the DEFAULT where the source has NULL, with no error, no dead
+  # letter and no log line. Live-reproduced on Aurora PostgreSQL 17.7 (`n int DEFAULT 7` set to
+  # NULL by CDC landed as 7 on Aurora DSQL); it affects BOTH source engines and is invisible
+  # until Validation's CHECKSUM mismatches.
+  #
+  # BOTH worker configs need it, and that is the part that is easy to get wrong. The SOURCE
+  # worker only serializes -- but the SERIALIZE path substitutes too, so the default was baked
+  # into the JSON on the wire and the NULL never even left the source connector. Pinning only
+  # the sink was live-verified NOT to fix it. The sink needs it as well, because a wire null
+  # would otherwise be turned back into the default on the way in.
+  #
+  # A THIRD layer is required and lives in the sink jar: with both flags off the null survives
+  # into the sink's Struct, where `Struct.get(Field)` would substitute the same default yet
+  # again, so the sink reads slots with `getWithoutDefault` (DebeziumEvents.rawFieldValue,
+  # plugin v48). NONE of the three alone is sufficient.
+  #
+  # The KEY converters are pinned for the same reason: a re-keyed table's key schema carries the
+  # same source default, so a DELETE before-image that does not carry the added key column got a
+  # FABRICATED non-NULL key component instead of the null it really is. With the pin the key is
+  # faithful (offline-proven against the real jars). Note what this does NOT buy: live-verified on
+  # a re-keyed table switched to REPLICA IDENTITY DEFAULT, the DELETE never reaches the sink at
+  # all -- it is dropped upstream with no log line -- so the sink's null-key guard is a backstop
+  # that path does not exercise. The prerequisite check that BLOCKS that configuration is the
+  # actual protection; the guard only covers a record that does arrive.
+  #
   # --- Worker configuration: source connector (converters + Secrets Manager provider) ---
   # MSK Connect requires key.converter/value.converter in every WorkerConfiguration
   # (gotcha #1). We use the built-in JSON converter with schemas.enable=true (the
@@ -1368,14 +1405,16 @@ Resources:
       # worker config be swapped via a normal update_stack, same as the plugins.
       Name:
         Fn::Sub: ${AWS::StackName}-source-worker-config-${PluginVersion}
-      Description: JSON converters (schemas.enable=true), Secrets Manager config provider, and H13 producer limit for the Debezium source connector.
+      Description: JSON converters (schemas.enable=true, replace.null.with.default=false so a NULL is SERIALIZED as null and not as the source column DEFAULT), Secrets Manager config provider, and H13 producer limit for the Debezium source connector.
       PropertiesFileContent:
         Fn::Base64:
           Fn::Sub: |
             key.converter=org.apache.kafka.connect.json.JsonConverter
             key.converter.schemas.enable=true
+            key.converter.replace.null.with.default=false
             value.converter=org.apache.kafka.connect.json.JsonConverter
             value.converter.schemas.enable=true
+            value.converter.replace.null.with.default=false
             config.providers=secretsManager
             config.providers.secretsManager.class=com.amazonaws.kafka.config.providers.SecretsManagerConfigProvider
             config.providers.secretsManager.param.region=${AWS::Region}
@@ -1413,6 +1452,12 @@ Resources:
   # list). What MSK Connect does NOT support is the per-CONNECTOR ".override." form,
   # because it excludes connector.client.config.override.policy -- that is why these
   # live in the worker config and not in the connector config.
+  #
+  # replace.null.with.default=false (key AND value) -- see the full rationale on the source
+  # WorkerConfiguration above. This is the DESERIALIZE side: without it a wire null is turned
+  # back into the field's schema default on the way into the sink. Required together with the
+  # same pin on the SOURCE worker (the serialize side, which is where the NULL was actually
+  # lost) and with the sink jar's `getWithoutDefault` read.
   SinkWorkerConfiguration:
     Type: AWS::KafkaConnect::WorkerConfiguration
     Properties:
@@ -1420,14 +1465,16 @@ Resources:
       # WorkerConfiguration above) so an update can replace it without a name clash.
       Name:
         Fn::Sub: ${AWS::StackName}-sink-worker-config-${PluginVersion}
-      Description: JSON converters (schemas.enable=true), H13 consumer/producer fetch limits, and the consumer poll/session timeouts a slow DSQL apply needs. No Secrets Manager provider (not bundled in the sink jar).
+      Description: JSON converters (schemas.enable=true, replace.null.with.default=false so a CDC NULL is not turned into the source column DEFAULT), H13 consumer/producer fetch limits, and the consumer poll/session timeouts a slow DSQL apply needs. No Secrets Manager provider (not bundled in the sink jar).
       PropertiesFileContent:
         Fn::Base64:
           Fn::Sub: |
             key.converter=org.apache.kafka.connect.json.JsonConverter
             key.converter.schemas.enable=true
+            key.converter.replace.null.with.default=false
             value.converter=org.apache.kafka.connect.json.JsonConverter
             value.converter.schemas.enable=true
+            value.converter.replace.null.with.default=false
             consumer.max.partition.fetch.bytes=${MaxMessageBytes}
             consumer.fetch.max.bytes=${MaxMessageBytes}
             consumer.max.poll.records=${SinkMaxPollRecords}

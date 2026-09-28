@@ -534,13 +534,13 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # while the controls behaved (an explicit value carried; an omitted column took the source's
 # own default). Only Validation's CHECKSUM could ever have caught it.
 #
-# The SAME substitution defeated the null-key DELETE guard on a re-keyed table. A re-keyed
-# table's KEY schema carries the source default too, so ``Struct.get`` fabricated a non-NULL
-# key component out of a before-image that never had one (the source connector does not
-# abort on a null key component -- it logs "Failed to properly convert key value" and
-# continues). ``requireNoNullKeyComponent`` could therefore NEVER fire: the DELETE went out
-# with an invented key, applied to 0 ROWS, and was acknowledged -- the source row gone and
-# the target's copy kept forever.
+# The SAME substitution fabricated a non-NULL KEY component on a re-keyed table, because a
+# re-keyed table's KEY schema carries the source default too. Reading the slot verbatim makes
+# the key faithful. Live follow-up (v50) narrowed what that buys: on a re-keyed table switched
+# to REPLICA IDENTITY DEFAULT the DELETE never reaches the sink at all -- it is dropped
+# upstream with no log line -- so ``requireNoNullKeyComponent`` is a backstop that path does
+# not exercise, and the prerequisite check that BLOCKS the configuration is the real
+# protection. The guard still covers a record that does arrive with a null key component.
 #
 # Both are fixed by reading the slot VERBATIM (``getWithoutDefault``) at the two
 # value-reading call sites, via ``DebeziumEvents.rawFieldValue``. That is the correct
@@ -556,7 +556,47 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 #
 # Bumped because the sink ZIP's CONTENT changed. A live cdc-stack needs Delete + Deploy
 # infra: Start CDC alone does not re-register the plugin.
-PLUGIN_VERSION = "v48"
+# v49: v48 was NECESSARY BUT INERT on its own, and the live check proved it -- with the v48
+# plugin registered and RUNNING, a CDC insert/update writing NULL into `n int DEFAULT 7`
+# STILL landed on Aurora DSQL as 7. The defect is a layer ABOVE the sink: the worker's
+# ``JsonConverter`` destroys the NULL while DESERIALIZING, so the Struct handed to
+# ``DebeziumEvents`` already held the default and no sink-side read could recover it.
+#   convertToConnect: if (jsonValue.isNull())
+#                       if (schema.defaultValue() != null && config.replaceNullWithDefault())
+#                         return schema.defaultValue();
+# ``replace.null.with.default`` DEFAULTS TO TRUE, and JsonConverter substitutes in BOTH
+# directions -- which is the part that took two live rounds to pin down:
+#   SERIALIZE   convertToJson:    if (value == null)
+#                                   if (schema.defaultValue() != null && replaceNullWithDefault())
+#                                     return convertToJson(schema, schema.defaultValue());
+#   DESERIALIZE convertToConnect: if (jsonValue.isNull())
+#                                   if (schema.defaultValue() != null && replaceNullWithDefault())
+#                                     return schema.defaultValue();
+# Both verified in connect-json 3.7.0's bytecode; the live MSK Connect worker logged
+# "Kafka version: 3.7.0" and dumped the flag as true.
+#
+# So the fix needs the flag on BOTH worker configs, and pinning only the SINK was
+# live-verified NOT to be enough (the default still landed). The SOURCE worker only
+# serializes -- but the SERIALIZE path substitutes too, so the default was baked into the
+# JSON on the wire and the NULL never left the source connector at all. Reading the Struct
+# slot with ``getWithoutDefault`` there returns the real null, and then ``convertToJson``
+# puts the default back on the way OUT; that is why "serialize uses getWithoutDefault, so
+# the wire is clean" is wrong.
+#
+# THREE layers, none redundant:
+#   1. source worker converters -- do not substitute on serialize (the null reaches Kafka)
+#   2. sink worker converters   -- do not substitute on deserialize (the null reaches the Struct)
+#   3. this plugin's v48 read   -- ``getWithoutDefault``, so ``Struct.get(Field)`` does not
+#      substitute the default a third time at the read itself
+# Proven with the real jars offline: with the flag true, ``getWithoutDefault`` already returns
+# the default (v48 alone is INERT); with it false, ``getWithoutDefault`` returns null while
+# ``get(Field)`` still returns the default (so v48 is required once the flags are fixed).
+#
+# Bumped even though the sink ZIP is byte-identical to v48: ``PluginVersion`` is what names
+# the custom-named, immutable ``AWS::KafkaConnect::WorkerConfiguration``, so the bump is the
+# only vehicle that can replace it without a name clash. A live cdc-stack therefore needs
+# Delete + Deploy infra, as for any other plugin-version bump.
+PLUGIN_VERSION = "v50"
 
 
 class S3ProvisionError(RuntimeError):
