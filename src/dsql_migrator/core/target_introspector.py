@@ -28,7 +28,8 @@ Design seams:
 
 from __future__ import annotations
 
-from typing import Any, Callable, Mapping, Optional, Protocol, Sequence, Union
+from dataclasses import dataclass
+from typing import Any, Callable, Collection, Mapping, Optional, Protocol, Sequence, Union
 
 from dsql_migrator.core.models import (
     TargetColumnDef,
@@ -665,6 +666,184 @@ def target_primary_keys(
     return result
 
 
+@dataclass(frozen=True)
+class ColumnNullFacts:
+    """One live target column as the exclusion overlay sees it.
+
+    ``default_expr`` is ``pg_get_expr`` of its DEFAULT, verbatim (P0 F4: it round-trips
+    through DROP/SET DEFAULT), and always ``None`` for a GENERATED column, whose
+    ``pg_attrdef`` entry is the generation expression, not a DEFAULT.
+    """
+
+    not_null: bool
+    default_expr: Optional[str]
+    identity: bool = False
+    generated: bool = False
+
+    @property
+    def computed(self) -> bool:
+        """Aurora DSQL computes the value (identity / generated): never overlaid."""
+        return self.identity or self.generated
+
+
+@dataclass(frozen=True)
+class TableOverlayFacts:
+    """A live target table's overlay facts.
+
+    ``has_rows`` is ``None`` when the row probe was not requested; ``primary_key`` is
+    ``None`` when not requested and ``()`` when requested for a table without one. A
+    column mapped to ``None`` is absent live.
+    """
+
+    exists: bool
+    has_rows: Optional[bool]
+    primary_key: "Optional[tuple[str, ...]]"
+    columns: "Mapping[str, Optional[ColumnNullFacts]]"
+
+
+def _relation_predicate(table_name: str) -> "tuple[str, dict[str, object]]":
+    """The WHERE clause that resolves ``table_name`` exactly as the loader's INSERT does.
+
+    ``schema.table`` (split on the FIRST dot, as :func:`_table_identifier`) names that
+    relation; a bare name resolves through the search_path (``pg_table_is_visible``) --
+    the same relation an unqualified INSERT or ALTER addresses. NOT the all-user-schemas
+    rule of :func:`target_foreign_keys`, which could describe a different relation.
+    """
+    schema, _, relname = table_name.partition(".")
+    if relname:
+        return "n.nspname = %(schema)s AND c.relname = %(table)s", {
+            "schema": schema,
+            "table": relname,
+        }
+    return "c.relname = %(table)s AND pg_catalog.pg_table_is_visible(c.oid)", {
+        "table": table_name
+    }
+
+
+def read_overlay_column_facts(
+    connection: Any, table_name: str, columns: Sequence[str]
+) -> "tuple[bool, dict[str, Optional[ColumnNullFacts]]]":
+    """``(table exists, {column: facts or None})`` in ONE catalog statement. RAISES.
+
+    Bound parameters only (no identifier in the SQL text). ``attname`` is matched EXACTLY
+    against the verbatim source name the loader writes. It raises on any error on
+    purpose: the overlay unit needs the exception to retry a 40001 and to replay a lost
+    connection (``core.schema_applier.apply_exclusion_overlay``).
+    """
+    where, params = _relation_predicate(table_name)
+    params = {**params, "columns": list(columns)}
+    statement = (
+        "SELECT a.attname, a.attnotnull, a.attidentity, a.attgenerated, "
+        "pg_catalog.pg_get_expr(d.adbin, d.adrelid) "
+        "FROM pg_catalog.pg_class c "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        "LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 "
+        "AND NOT a.attisdropped AND a.attname = ANY(%(columns)s) "
+        "LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum "
+        f"WHERE {where}"
+    )
+    cursor = connection.cursor()
+    try:
+        cursor.execute(statement, params)
+        rows = cursor.fetchall()
+    finally:
+        _safe_close(cursor)
+    facts: dict[str, Optional[ColumnNullFacts]] = {column: None for column in columns}
+    if not rows:
+        return False, facts
+    for attname, notnull, identity, generated, default_expr in rows:
+        if attname is None:
+            continue  # the table exists; none of the asked columns does
+        is_generated = bool(generated) and str(generated) != ""
+        facts[str(attname)] = ColumnNullFacts(
+            not_null=bool(notnull),
+            default_expr=None if is_generated else (
+                None if default_expr is None else str(default_expr)
+            ),
+            identity=str(identity or "") in ("a", "d"),
+            generated=is_generated,
+        )
+    return True, facts
+
+
+def target_overlay_facts(
+    table_names: Sequence[str],
+    columns_by_table: "Mapping[str, Sequence[str]]",
+    *,
+    connection_factory: Callable[[], Any],
+    probe_rows: bool = True,
+    primary_key_tables: "Collection[str]" = frozenset(),
+) -> "dict[str, Optional[TableOverlayFacts]]":
+    """Each table's overlay facts over ONE connection; ``None`` = unknown.
+
+    A connect failure makes every table unknown; a per-table error makes only that table
+    unknown (best-effort rollback, then the next table). An absent table is
+    ``exists=False`` with every column ``None``. ``probe_rows`` adds one ``SELECT 1 ...
+    LIMIT 1`` per existing table; ``primary_key_tables`` adds one key read each. The
+    connection is closed in a ``finally`` and never reused after an ALTER (P0 F6).
+    """
+    try:
+        connection = connection_factory()
+    except Exception:  # noqa: BLE001 - cannot connect -> every table unknown
+        return {name: None for name in table_names}
+    from psycopg import sql
+
+    wanted_pk = set(primary_key_tables)
+    result: dict[str, Optional[TableOverlayFacts]] = {}
+    try:
+        for name in table_names:
+            try:
+                exists, columns = read_overlay_column_facts(
+                    connection, name, list(columns_by_table.get(name, ()))
+                )
+                if not exists:
+                    result[name] = TableOverlayFacts(False, False, None, columns)
+                    continue
+                has_rows: Optional[bool] = None
+                if probe_rows:
+                    cursor = connection.cursor()
+                    try:
+                        cursor.execute(
+                            sql.SQL("SELECT 1 FROM {table} LIMIT 1").format(
+                                table=_table_identifier(name)
+                            )
+                        )
+                        has_rows = cursor.fetchone() is not None
+                    finally:
+                        _safe_close(cursor)
+                primary_key: Optional[tuple[str, ...]] = None
+                if name in wanted_pk:
+                    where, params = _relation_predicate(name)
+                    cursor = connection.cursor()
+                    try:
+                        cursor.execute(
+                            "SELECT a.attname FROM pg_catalog.pg_class c "
+                            "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                            "JOIN pg_catalog.pg_index ix ON ix.indrelid = c.oid "
+                            "AND ix.indisprimary "
+                            "JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) "
+                            "ON TRUE JOIN pg_catalog.pg_attribute a "
+                            "ON a.attrelid = c.oid AND a.attnum = k.attnum "
+                            f"WHERE {where} AND k.ord <= ix.indnkeyatts ORDER BY k.ord",
+                            params,
+                        )
+                        primary_key = tuple(
+                            str(row[0]) for row in cursor.fetchall() if row and row[0]
+                        )
+                    finally:
+                        _safe_close(cursor)
+                result[name] = TableOverlayFacts(True, has_rows, primary_key, columns)
+            except Exception:  # noqa: BLE001 - this table unknown; keep reading the rest
+                result[name] = None
+                try:
+                    connection.rollback()
+                except Exception:  # noqa: BLE001 - best effort
+                    pass
+    finally:
+        _safe_close(connection)
+    return result
+
+
 def target_foreign_keys(
     table_names: Sequence[str],
     *,
@@ -1182,6 +1361,10 @@ def partition_identity_sync(
 
 
 __all__ = [
+    "ColumnNullFacts",
+    "TableOverlayFacts",
+    "read_overlay_column_facts",
+    "target_overlay_facts",
     "TargetIntrospector",
     "ConnectorFactory",
     "build_inventory",

@@ -2013,3 +2013,71 @@ def test_a_client_side_psycopg_error_is_not_retried_as_transient() -> None:
     err = psycopg.OperationalError("boom")
     err.sqlstate = "08006"
     assert is_transient_connection_error(err)
+
+
+# ---------------------------------------------------------------------------
+# P0 F6 pins: a connection used BEFORE an overlay ALTER gets ONE OC001 on its next
+# statement. The loader absorbs it with no change: the lease discards the connection and
+# the batch's OCC retry leases a fresh one. A failing pin is a loader gap to report.
+# ---------------------------------------------------------------------------
+
+
+class _StaleAfterAlterConnection(_FakeConnection):
+    """Raises OC001 once when the schema changed since this connection's last statement."""
+
+    def __init__(self, store: _FakeStore, columns: list[str], key_columns: list[str]) -> None:
+        super().__init__(store, columns, key_columns)
+        self.seen_epoch: Optional[int] = None
+        self.raised_oc001 = False
+
+    def handle_execute(self, query, params, cursor) -> None:
+        store = self._store
+        with store.lock:
+            if self.raised_oc001:
+                store.reused_stale += 1  # type: ignore[attr-defined]
+            stale = self.seen_epoch is not None and self.seen_epoch < store.epoch  # type: ignore[attr-defined]
+            self.seen_epoch = store.epoch  # type: ignore[attr-defined]
+            if stale:
+                store.oc001 += 1  # type: ignore[attr-defined]
+                self.raised_oc001 = True
+        if stale:
+            error = _FakeSerializationFailure()
+            error.args = ("schema has been updated by another transaction (OC001)",)
+            raise error
+        super().handle_execute(query, params, cursor)
+        with store.lock:
+            store.statements += 1  # type: ignore[attr-defined]
+            if store.statements == store.alter_after:  # type: ignore[attr-defined]
+                store.epoch += 1  # type: ignore[attr-defined]  # the overlay ALTER commits
+
+
+@pytest.mark.parametrize(
+    "mode", [OnConflictMode.DO_NOTHING, OnConflictMode.NONE, OnConflictMode.SKIP_EXISTING]
+)
+def test_f6_one_oc001_per_pre_touched_connection_is_absorbed(mode) -> None:
+    store = _FakeStore()
+    store.epoch, store.oc001, store.statements, store.alter_after = 0, 0, 0, 2  # type: ignore[attr-defined]
+    store.reused_stale = 0  # type: ignore[attr-defined]
+    created: list[_StaleAfterAlterConnection] = []
+
+    def factory() -> _StaleAfterAlterConnection:
+        with store.lock:
+            store.connections_created += 1
+        created.append(_StaleAfterAlterConnection(store, ["id", "name"], ["id"]))
+        return created[-1]
+
+    importer = BatchedImporter(
+        BatchedImportOptions(on_conflict=mode, batch_size=5, parallelism=2),
+        connection_factory=factory,
+        occ_max_attempts=5,
+        occ_base_delay=0.0,
+        sleep=_no_sleep,
+        jitter=_zero_jitter,
+    )
+    result = importer.import_rows(_rows(40), _table())
+
+    assert result.failures == 0 and result.rows_loaded == 40, mode
+    assert sorted(store.rows) == [(i,) for i in range(40)]  # nothing lost, nothing doubled
+    assert 1 <= store.oc001 <= 2, mode  # at most one per pre-touched connection (parallelism 2)
+    assert len(created) == 2 + store.oc001  # each stale one replaced by exactly one fresh one
+    assert store.reused_stale == 0  # a connection that raised OC001 was discarded, never reused

@@ -45,7 +45,7 @@ from __future__ import annotations
 import random
 import re
 import time
-from typing import Any, Callable, Optional, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Protocol, Sequence
 
 from psycopg import sql
 
@@ -65,6 +65,9 @@ from dsql_migrator.core.occ import (
     with_occ_retry,
 )
 from dsql_migrator.core.target_connection import is_transient_connection_error
+
+if TYPE_CHECKING:
+    from dsql_migrator.core.target_introspector import ColumnNullFacts
 
 
 # getaddrinfo failures for a host that does not exist (a typo'd or deleted DSQL endpoint).
@@ -584,6 +587,54 @@ def _run_ddls_reconnecting(
     message reads as a harmless retryable hiccup and the loss goes unnoticed).
     """
     statements = list(statements)
+
+    def _body(connection, run_one, _retry_read) -> None:
+        for index, statement in enumerate(statements):
+            is_recreate = recreated is not None and index == len(statements) - 1
+            try:
+                run_one(connection, statement)
+            except Exception as exc:  # noqa: BLE001 - re-raised (loud for a lost object)
+                if (
+                    is_recreate
+                    and not isinstance(exc, SchemaApplyError)
+                    and not is_transient_connection_error(exc)
+                ):
+                    raise SchemaApplyError(
+                        f"{recreated.kind} {recreated.name} was DROPPED but could not be "
+                        "recreated, so it no longer exists on the target. Fix the CREATE "
+                        f"DDL and re-apply to restore it. Underlying error: {exc}"
+                    ) from exc
+                raise
+
+    _run_unit_reconnecting(
+        connection_factory,
+        _body,
+        occ_max_attempts=occ_max_attempts,
+        occ_base_delay=occ_base_delay,
+        sleep=sleep,
+        jitter=jitter,
+    )
+
+
+def _run_unit_reconnecting(
+    connection_factory: ConnectionFactory,
+    body,
+    *,
+    occ_max_attempts: int,
+    occ_base_delay: float,
+    sleep: SleepFunc,
+    jitter: JitterFunc,
+):
+    """Run ``body(connection, run_one, retry_read)`` as ONE reconnecting unit; return its value.
+
+    Each attempt opens a FRESH connection (closed in a ``finally``). ``run_one(connection,
+    statement)`` executes one DDL with its own 40001 (OC000/OC001) retry; ``retry_read(fn)``
+    runs ``fn(connection)`` under the same 40001 retry (for the catalog reads the overlay
+    and the restore do inside the unit). Only a transient CONNECTION failure (SQLSTATE class
+    ``08`` / no SQLSTATE, not a permanent connect error) replays the whole unit on a new
+    connection -- so the body must be replay-safe; a :class:`SchemaApplyError` is terminal
+    and never replayed. The same nested budgets :func:`_run_ddls_reconnecting` always used.
+    """
     run_one = with_occ_retry(
         max_attempts=occ_max_attempts,
         base_delay=occ_base_delay,
@@ -591,31 +642,24 @@ def _run_ddls_reconnecting(
         jitter=jitter,
     )(_execute_single_ddl)
 
-    def _unit() -> None:
+    def _unit():
         connection = connection_factory()
         try:
-            for index, statement in enumerate(statements):
-                is_recreate = recreated is not None and index == len(statements) - 1
-                try:
-                    run_one(connection, statement)
-                except Exception as exc:  # noqa: BLE001 - re-raised (loud for a lost object)
-                    if (
-                        is_recreate
-                        and not isinstance(exc, SchemaApplyError)
-                        and not is_transient_connection_error(exc)
-                    ):
-                        raise SchemaApplyError(
-                            f"{recreated.kind} {recreated.name} was DROPPED but could not be "
-                            "recreated, so it no longer exists on the target. Fix the CREATE "
-                            f"DDL and re-apply to restore it. Underlying error: {exc}"
-                        ) from exc
-                    raise
+            def retry_read(fn):
+                return with_occ_retry(
+                    max_attempts=occ_max_attempts,
+                    base_delay=occ_base_delay,
+                    sleep=sleep,
+                    jitter=jitter,
+                )(fn)(connection)
+
+            return body(connection, run_one, retry_read)
         finally:
             _safe_close(connection)
 
     # Only a transient CONNECTION failure replays the unit; a SchemaApplyError (parse/schema
     # limit/dependency/dropped-not-recreated) is terminal and must never be retried.
-    with_occ_retry(
+    return with_occ_retry(
         max_attempts=occ_max_attempts,
         base_delay=occ_base_delay,
         sleep=sleep,
@@ -982,9 +1026,389 @@ def _safe_close(closeable: Any) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Column-exclusion overlay (P2): DROP NOT NULL, then DROP DEFAULT; and the cut-over restore
+# ---------------------------------------------------------------------------
+#
+# Settled live on Aurora DSQL (P0 F1-F12, P2 LIVE 1): both ALTERs are synchronous O(1)
+# metadata changes (no sys.jobs row, no poll), accepted while any index build -- a
+# multi-column UNIQUE one included -- is submitted or processing; they are idempotent (F10),
+# so a 40001 retry or a whole-unit replay after a lost reply is safe; concurrent DDL on
+# different tables fails 40001 (F8), so callers run the units SERIALLY; and DROP NOT NULL
+# must come BEFORE DROP DEFAULT (F9: the reverse order made concurrent writers that omit the
+# column store the DEFAULT into a still-NOT-NULL column, 67 x 23502).
+
+
+class OverlayRefusedError(SchemaApplyError):
+    """The overlay (or a restore) refused a column before any statement ran."""
+
+
+class OverlayVerifyError(SchemaApplyError):
+    """The read-back after the overlay (or a restore) does not show the intended state."""
+
+
+_COMPUTED_REFUSAL = "Computed by Aurora DSQL; never written."
+
+
+class OverlayStatement:
+    """One overlay ALTER: ``action`` is ``DROP NOT NULL`` or ``DROP DEFAULT``."""
+
+    __slots__ = ("column", "action", "statement")
+
+    def __init__(self, column: str, action: str, statement: "sql.Composed") -> None:
+        self.column = column
+        self.action = action
+        self.statement = statement
+
+    def text(self) -> str:
+        """The statement as shown to the operator (identifiers quoted)."""
+        return self.statement.as_string(None)
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"OverlayStatement({self.column!r}, {self.action!r})"
+
+
+def build_overlay_statements(
+    table_name: str, facts: "Mapping[str, Optional[ColumnNullFacts]]"
+) -> "list[OverlayStatement]":
+    """THE statement builder: per column (sorted), DROP NOT NULL, then DROP DEFAULT.
+
+    Only what the facts still need: a nullable column gets no DROP NOT NULL, a column with
+    no DEFAULT no DROP DEFAULT; an absent (``None``) column nothing. A column Aurora DSQL
+    computes raises :class:`OverlayRefusedError` (the rule's B4 backstop). Fed live facts by
+    the overlay and both Start dialogs, and the applied DDL's facts (:func:`ddl_column_facts`)
+    by the exclusion popup, so every surface shows the statements that would run.
+    """
+    from dsql_migrator.core.validation_sql import _pg_table_identifier
+
+    table = _pg_table_identifier(table_name)
+    out: list[OverlayStatement] = []
+    for column in sorted(facts):
+        column_facts = facts[column]
+        if column_facts is None:
+            continue
+        if column_facts.computed:
+            raise OverlayRefusedError(f"{table_name}.{column}: {_COMPUTED_REFUSAL}")
+        ident = sql.Identifier(column)
+        if column_facts.not_null:
+            out.append(OverlayStatement(column, "DROP NOT NULL", sql.SQL(
+                "ALTER TABLE {t} ALTER COLUMN {c} DROP NOT NULL").format(t=table, c=ident)))
+        if column_facts.default_expr is not None:
+            out.append(OverlayStatement(column, "DROP DEFAULT", sql.SQL(
+                "ALTER TABLE {t} ALTER COLUMN {c} DROP DEFAULT").format(t=table, c=ident)))
+    return out
+
+
+def ddl_column_facts(
+    create_ddl: str, columns: "Sequence[str]"
+) -> "dict[str, Optional[ColumnNullFacts]]":
+    """The facts :func:`build_overlay_statements` needs, read from an applied DDL."""
+    from dsql_migrator.core.converter import (
+        parse_target_column_constraints,
+        parse_target_generated_columns,
+    )
+    from dsql_migrator.core.target_introspector import ColumnNullFacts
+
+    constraints = parse_target_column_constraints(create_ddl)
+    generated = parse_target_generated_columns(create_ddl)
+    out: dict[str, Optional[ColumnNullFacts]] = {}
+    for column in columns:
+        if column not in constraints:
+            out[column] = None
+            continue
+        not_null, default_sql = constraints[column]
+        out[column] = ColumnNullFacts(
+            not_null=not_null,
+            default_expr=None if column in generated else default_sql,
+            identity=False,
+            generated=column in generated,
+        )
+    return out
+
+
+class OverlayOutcome:
+    """What one table's overlay unit did.
+
+    ``dropped_defaults`` maps each column whose DEFAULT this unit dropped to the pre-ALTER
+    expression (what the ledger records and cut over restores).
+    """
+
+    __slots__ = ("dropped_not_null", "dropped_defaults", "already_ok")
+
+    def __init__(self, dropped_not_null, dropped_defaults, already_ok) -> None:
+        self.dropped_not_null: tuple[str, ...] = tuple(dropped_not_null)
+        self.dropped_defaults: dict[str, str] = dict(dropped_defaults)
+        self.already_ok: tuple[str, ...] = tuple(already_ok)
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, OverlayOutcome) and (
+            self.dropped_not_null, self.dropped_defaults, self.already_ok
+        ) == (other.dropped_not_null, other.dropped_defaults, other.already_ok)
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return (
+            f"OverlayOutcome(dropped_not_null={self.dropped_not_null}, "
+            f"dropped_defaults={self.dropped_defaults}, already_ok={self.already_ok})"
+        )
+
+
+def _backstop(table_name: str, facts) -> None:
+    for column, column_facts in facts.items():
+        if column_facts is not None and column_facts.computed:
+            raise OverlayRefusedError(f"{table_name}.{column}: {_COMPUTED_REFUSAL}")
+
+
+def apply_exclusion_overlay(
+    table_name: str,
+    planned: "Mapping[str, Optional[ColumnNullFacts]]",
+    *,
+    expected_defaults: "Optional[Mapping[str, Optional[str]]]" = None,
+    connection_factory: ConnectionFactory,
+    occ_max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    occ_base_delay: float = DEFAULT_BASE_DELAY_SECONDS,
+    sleep: SleepFunc = time.sleep,
+    jitter: JitterFunc = random.random,
+) -> OverlayOutcome:
+    """Make ``planned``'s present columns nullable with no DEFAULT, as ONE unit.
+
+    ``planned`` is the caller's pre-ALTER facts (``None`` = absent live: skipped).
+    ``expected_defaults`` maps a column to the DEFAULT the ledger recorded for it (``None``
+    = recorded as having none); ``None`` skips the check. Steps:
+
+    1. the backstop, before any connect -- a computed column raises
+       :class:`OverlayRefusedError`;
+    2. nothing to issue by ``planned`` (every present column already nullable with no
+       DEFAULT): return at once, with NO connection;
+    3. otherwise one reconnecting unit on a fresh connection. EVERY attempt first re-reads
+       the live facts on its own connection (a lost reply replays safely, F10) and refuses
+       before ANY ALTER of that attempt when a live DEFAULT is not the recorded one -- the
+       DEFAULT it would drop was never recorded, so cut over could not put it back. It then
+       issues what the live catalog still needs, one statement per autocommit transaction
+       with 40001 retried per statement, and does ONE read-back on the SAME connection: any
+       present column still NOT NULL, still with a DEFAULT, or gone raises
+       :class:`OverlayVerifyError`. No poll, no sleep, no sys.jobs.
+
+    Every other error propagates (the caller fails the table).
+    """
+    from dsql_migrator.core.target_introspector import read_overlay_column_facts
+
+    _backstop(table_name, planned)
+    present = sorted(c for c, f in planned.items() if f is not None)
+    if not build_overlay_statements(table_name, planned):
+        return OverlayOutcome((), {}, present)
+
+    issued_not_null: list[str] = []
+    issued_defaults: dict[str, str] = {}
+
+    def _read(conn):
+        return read_overlay_column_facts(conn, table_name, present)
+
+    def _body(connection, run_one, retry_read):
+        _exists, facts = retry_read(_read)
+        _backstop(table_name, facts)
+        if expected_defaults is not None:
+            _refuse_unrecorded_defaults(table_name, facts, expected_defaults, issued_not_null,
+                                        issued_defaults)
+        for statement in build_overlay_statements(table_name, facts):
+            # Counted BEFORE it runs: a lost reply may still have committed it, and the
+            # replay's re-read then finds nothing left to issue for it.
+            if statement.action == "DROP NOT NULL":
+                issued_not_null.append(statement.column)
+            else:
+                # What THIS statement drops: the live facts it was built from.
+                issued_defaults[statement.column] = facts[statement.column].default_expr  # type: ignore[union-attr]
+            run_one(connection, statement.statement)
+        exists, after = retry_read(_read)
+        remaining = []
+        for column in present:
+            live = after.get(column)
+            if not exists or live is None:
+                remaining.append(f"{column} (gone)")
+            elif live.not_null:
+                remaining.append(f"{column} (still NOT NULL)")
+            elif live.default_expr is not None:
+                remaining.append(f"{column} (still DEFAULT {live.default_expr})")
+        if remaining:
+            raise OverlayVerifyError(
+                f"{table_name}: the overlay did not take effect for "
+                + ", ".join(remaining)
+            )
+        return None
+
+    _run_unit_reconnecting(
+        connection_factory,
+        _body,
+        occ_max_attempts=occ_max_attempts,
+        occ_base_delay=occ_base_delay,
+        sleep=sleep,
+        jitter=jitter,
+    )
+    done = set(issued_not_null) | set(issued_defaults)
+    return OverlayOutcome(
+        sorted(dict.fromkeys(issued_not_null)),
+        issued_defaults,
+        [c for c in present if c not in done],
+    )
+
+
+def _refuse_unrecorded_defaults(table_name, facts, expected, issued_not_null, issued_defaults):
+    """Raise before any ALTER when a live DEFAULT is not the one the ledger recorded."""
+    mismatched = [
+        f"{column} (live DEFAULT {live.default_expr}, recorded "
+        f"{'none' if expected.get(column) is None else expected.get(column)})"
+        for column, live in sorted(facts.items())
+        if live is not None
+        and live.default_expr is not None
+        and live.default_expr != expected.get(column)
+    ]
+    if not mismatched:
+        return
+    earlier = [f"{c} DROP NOT NULL" for c in dict.fromkeys(issued_not_null)] + [
+        f"{c} DROP DEFAULT" for c in issued_defaults
+    ]
+    changed = (
+        "nothing was changed on this table"
+        if not earlier
+        else "an earlier attempt already issued " + ", ".join(earlier)
+    )
+    raise OverlayRefusedError(
+        f"{table_name}: the DEFAULT to drop is not the recorded one for "
+        + ", ".join(mismatched)
+        + f"; {changed}. Re-run to record the current DEFAULT first."
+    )
+
+
+def is_single_sql_expression(expr: str) -> bool:
+    """True when ``expr`` is ONE SQL expression, safe to splice into a SET DEFAULT.
+
+    Scans with quote state ('...' with the '' escape, "..." with the "" escape) and refuses
+    an empty text, a ``;`` outside quotes, a comment opener (``--`` / ``/*``) outside
+    quotes, and any dollar-quote opener. The text comes from ``pg_get_expr`` (the ledger)
+    and is still checked, because the restore executes it.
+    """
+    text = (expr or "").strip()
+    if not text:
+        return False
+    quote: Optional[str] = None
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == quote:
+                if i + 1 < len(text) and text[i + 1] == quote:
+                    i += 2
+                    continue
+                quote = None
+        else:
+            if ch in ("'", '"'):
+                quote = ch
+            elif ch == ";":
+                return False
+            elif text.startswith("--", i) or text.startswith("/*", i):
+                return False
+            elif ch == "$" and re.match(r"\$[A-Za-z_]*\$", text[i:]):
+                return False
+        i += 1
+    return quote is None
+
+
+class RestoreOutcome:
+    """``status``: restored (this unit set it) | done (already equal) | diverged | gone."""
+
+    __slots__ = ("status", "live_default")
+
+    def __init__(self, status: str, live_default: Optional[str]) -> None:
+        self.status = status
+        self.live_default = live_default
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, RestoreOutcome) and (
+            self.status, self.live_default) == (other.status, other.live_default)
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"RestoreOutcome({self.status!r}, {self.live_default!r})"
+
+
+def restore_column_default(
+    table_name: str,
+    column: str,
+    expr: str,
+    *,
+    connection_factory: ConnectionFactory,
+    occ_max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    occ_base_delay: float = DEFAULT_BASE_DELAY_SECONDS,
+    sleep: SleepFunc = time.sleep,
+    jitter: JitterFunc = random.random,
+) -> RestoreOutcome:
+    """Put back ONE dropped DEFAULT at cut over (``SET DEFAULT`` affects new rows only, F12).
+
+    Refused before any connect unless ``expr`` is a single expression. Then one
+    reconnecting unit whose EVERY attempt first re-reads the live column: absent -> gone;
+    computed -> refused; the same DEFAULT live -> done (or restored, if an earlier attempt of
+    THIS unit set it and only the reply was lost); a different DEFAULT live -> diverged, never
+    overwritten; no DEFAULT -> ``SET DEFAULT expr`` and a read-back on the same connection
+    that must round-trip byte-identically (F4), else :class:`OverlayVerifyError`.
+    """
+    from dsql_migrator.core.target_introspector import read_overlay_column_facts
+    from dsql_migrator.core.validation_sql import _pg_table_identifier
+
+    if not is_single_sql_expression(expr):
+        raise OverlayRefusedError(
+            f"{table_name}.{column}: the recorded DEFAULT is not a single expression, so "
+            "it is not restored automatically; run SET DEFAULT by hand."
+        )
+    issued = {"set": False}
+
+    def _read(conn):
+        return read_overlay_column_facts(conn, table_name, [column])
+
+    def _body(connection, run_one, retry_read):
+        exists, facts = retry_read(_read)
+        live = facts.get(column) if exists else None
+        if live is None:
+            return RestoreOutcome("gone", None)
+        if live.computed:
+            raise OverlayRefusedError(f"{table_name}.{column}: {_COMPUTED_REFUSAL}")
+        if live.default_expr is not None:
+            if live.default_expr == expr:
+                return RestoreOutcome("restored" if issued["set"] else "done", expr)
+            return RestoreOutcome("diverged", live.default_expr)
+        issued["set"] = True
+        run_one(connection, sql.SQL("ALTER TABLE {t} ALTER COLUMN {c} SET DEFAULT ").format(
+            t=_pg_table_identifier(table_name), c=sql.Identifier(column)) + sql.SQL(expr))
+        exists, facts = retry_read(_read)
+        after = facts.get(column) if exists else None
+        if after is None or after.default_expr != expr:
+            raise OverlayVerifyError(
+                f"{table_name}.{column}: the restored DEFAULT does not round-trip "
+                f"(set {expr!r}, read back "
+                f"{None if after is None else after.default_expr!r})."
+            )
+        return RestoreOutcome("restored", expr)
+
+    return _run_unit_reconnecting(
+        connection_factory,
+        _body,
+        occ_max_attempts=occ_max_attempts,
+        occ_base_delay=occ_base_delay,
+        sleep=sleep,
+        jitter=jitter,
+    )
+
+
 __all__ = [
     "SchemaApplier",
     "SchemaApplyError",
+    "OverlayRefusedError",
+    "OverlayVerifyError",
+    "OverlayStatement",
+    "OverlayOutcome",
+    "RestoreOutcome",
+    "build_overlay_statements",
+    "ddl_column_facts",
+    "apply_exclusion_overlay",
+    "is_single_sql_expression",
+    "restore_column_default",
     "ConnectionFactory",
     "parse_create_object",
     "recreate_table",
