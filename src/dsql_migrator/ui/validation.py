@@ -81,6 +81,10 @@ from dsql_migrator.core.validator import (
 )
 from dsql_migrator.core.validator import export_report as export_validation_report
 from dsql_migrator.ui.ai_assist import ai_is_usable
+from dsql_migrator.ui.cutover_defaults import (
+    CutoverDefaultsSnapshot,
+    CutoverRestoreOutcome,
+)
 from dsql_migrator.ui.connect import make_source_engine_factory
 from dsql_migrator.ui.data_migration import DataMigrationStore
 from dsql_migrator.ui.data_migration._models import effective_lob_exclusions
@@ -1746,7 +1750,8 @@ class ValidationState:
         # moment, and a session restored hours later must not still assert that writes are
         # frozen. It therefore dies with the process, and is cleared here on every event
         # that could make it stale (a new verdict, a re-run, a target-schema replace,
-        # Start over).
+        # Start over, a CDC start or retry -- ``note_cdc_start`` -- and a cut-over DEFAULT
+        # restore refused by its settle check). It also gates that restore.
         self.cutover_cdc_drained_confirmed: bool = False
         self._result: Optional[ValidationReport] = None
         self._error: Optional[str] = None
@@ -1829,6 +1834,15 @@ class ValidationState:
         # (settled, total) published by the pass itself, so a render during the pass says
         # how far it has got instead of looking un-run.
         self._cutover_fk_apply_progress: Optional[tuple[int, int]] = None
+        # The cut-over DEFAULT restore (column exclusions): the live status read in the
+        # background (ledger x target catalog) so a render does no store I/O, guarded by a
+        # generation so a fill that raced an invalidation is dropped; the restore job and
+        # its outcome. Session-only, never snapshotted (a claim about the live target).
+        self._cutover_defaults: "Optional[CutoverDefaultsSnapshot]" = None
+        self._cutover_defaults_generation: int = 0
+        self._cutover_defaults_filling: bool = False
+        self._cutover_default_restore_job_id: Optional[str] = None
+        self._cutover_default_restore_outcome: "Optional[CutoverRestoreOutcome]" = None
 
     def clear_cutover_outcomes(self) -> None:
         """Forget every cut-over foreign-key outcome, under ONE lock acquisition.
@@ -1850,6 +1864,10 @@ class ValidationState:
             # The target's tables were just dropped and recreated, so whatever the
             # operator attested about a drained stream belongs to the previous schema.
             self.cutover_cdc_drained_confirmed = False
+            # The recreate brought the DEFAULTs back: re-read. The running restore job id
+            # is kept, so the reverse gate still sees it.
+            self._cutover_default_restore_outcome = None
+            self._invalidate_cutover_defaults_locked()
 
     def set_cutover_cdc_drained_confirmed(self, confirmed: bool) -> None:
         """Latch the operator's "source frozen, CDC drained to zero lag" attestation.
@@ -1862,12 +1880,94 @@ class ValidationState:
             self.cutover_cdc_drained_confirmed = bool(confirmed)
 
     def note_cdc_start(self) -> None:
-        """CDC starts (or tried to): an attestation that it had drained is stale.
+        """CDC starts (or tried to): an attestation that it had drained is stale, and the
+        DEFAULT status is re-read (a Start CDC re-drops a restored DEFAULT).
 
         Called from the Start CDC job (submit and its ``finally``), on any thread.
         """
         with self._lock:
             self.cutover_cdc_drained_confirmed = False
+            self._invalidate_cutover_defaults_locked()
+
+    # -- cut-over DEFAULT restore -------------------------------------------------
+
+    def _invalidate_cutover_defaults_locked(self) -> None:
+        self._cutover_defaults_generation += 1
+        self._cutover_defaults = None
+
+    @property
+    def cutover_defaults(self) -> "Optional[CutoverDefaultsSnapshot]":
+        with self._lock:
+            return self._cutover_defaults
+
+    @property
+    def cutover_defaults_filling(self) -> bool:
+        with self._lock:
+            return self._cutover_defaults_filling
+
+    def begin_cutover_defaults_fill(self) -> Optional[int]:
+        """Start a fill (single flight): its generation, or ``None`` while one runs."""
+        with self._lock:
+            if self._cutover_defaults_filling:
+                return None
+            self._cutover_defaults_filling = True
+            return self._cutover_defaults_generation
+
+    def finish_cutover_defaults_fill(
+        self, snapshot: "Optional[CutoverDefaultsSnapshot]", generation: int
+    ) -> bool:
+        """End a fill; store its snapshot only if nothing invalidated it meanwhile."""
+        with self._lock:
+            self._cutover_defaults_filling = False
+            if snapshot is None or generation != self._cutover_defaults_generation:
+                return False
+            self._cutover_defaults = snapshot
+            return True
+
+    def invalidate_cutover_defaults(self) -> None:
+        with self._lock:
+            self._invalidate_cutover_defaults_locked()
+
+    def cutover_defaults_stale(self, fill_key: object, now_monotonic: float) -> bool:
+        """No snapshot, one for other inputs, or one older than the TTL."""
+        from dsql_migrator.ui.cutover_defaults import CUTOVER_DEFAULTS_TTL_SECONDS
+
+        with self._lock:
+            snap = self._cutover_defaults
+            if snap is None or snap.fill_key != fill_key:
+                return True
+            return now_monotonic - snap.filled_monotonic > CUTOVER_DEFAULTS_TTL_SECONDS
+
+    def set_cutover_default_restore_job(self, job_id: Optional[str]) -> None:
+        with self._lock:
+            self._cutover_default_restore_job_id = job_id
+
+    @property
+    def cutover_default_restore_job_id(self) -> Optional[str]:
+        with self._lock:
+            return self._cutover_default_restore_job_id
+
+    def set_cutover_default_restore_outcome(
+        self, outcome: "Optional[CutoverRestoreOutcome]"
+    ) -> None:
+        with self._lock:
+            self._cutover_default_restore_outcome = outcome
+
+    @property
+    def cutover_default_restore_outcome(self) -> "Optional[CutoverRestoreOutcome]":
+        with self._lock:
+            return self._cutover_default_restore_outcome
+
+    def cutover_default_restore_in_flight(self, job_manager: Optional[JobManager]) -> bool:
+        """Whether the restore job is PENDING or RUNNING (an unknown id is not)."""
+        job_id = self.cutover_default_restore_job_id
+        if not job_id or job_manager is None:
+            return False
+        try:
+            status = getattr(job_manager.get_status(job_id), "status", None)
+        except JobNotFoundError:
+            return False
+        return status in ("PENDING", "RUNNING")
 
     def set_cutover_fk_apply_job(self, job_id: Optional[str]) -> None:
         """Record the submitted cut-over foreign-key apply job (re-entrancy guard)."""
@@ -2038,6 +2138,8 @@ class ValidationState:
             # A new comparison means the source was read again, so a freeze/drain
             # attestation made before it no longer describes the current state.
             self.cutover_cdc_drained_confirmed = False
+            self._cutover_default_restore_outcome = None
+            self._invalidate_cutover_defaults_locked()
 
     def set_identity_sync(
         self,
@@ -2187,6 +2289,8 @@ class ValidationState:
             self._cutover_fk_apply_progress = None
             self.proceed_without_foreign_keys = False
             self.cutover_cdc_drained_confirmed = False
+            self._cutover_default_restore_outcome = None
+            self._invalidate_cutover_defaults_locked()
 
 
 @dataclass
@@ -2237,6 +2341,57 @@ class ValidationStore:
 
 # How often the screen polls the background validation job (seconds).
 _POLL_INTERVAL_SECONDS = 0.5
+
+
+def session_exclusion_split(
+    migration_state, session, inv: "SourceInventory", conv_state, job_manager,
+) -> "tuple[dict[str, frozenset[str]], dict[str, frozenset[str]], dict[str, frozenset[str]]]":
+    """``(omitted, overlay, legacy)``: the EFFECTIVE exclusion set (key columns
+    dropped) Full Load and CDC used, and its split into the columns the tool writes as
+    NULL and the legacy entries (their rows take the target DEFAULT).
+
+    Judged against the applied conversion the Data Migration render recorded; a
+    RESTORED session can reach Validation before any such render, and without the
+    applied DDL a Schema Conversion composite key's leading column would not be
+    recognised as a key -- Validation would then skip a column Full Load loaded. So
+    that case derives the applied conversion from the Schema Conversion state here.
+    Validation can be the first screen a restored session renders, so a pending
+    legacy classification is settled first (pending entries count as legacy).
+    """
+    from dsql_migrator.ui.data_migration._models import (
+        classify_restored_exclusions,
+        legacy_lob_exclusions,
+        overlay_lob_exclusions,
+    )
+
+    try:
+        classify_restored_exclusions(migration_state, job_manager)
+    except Exception:  # noqa: BLE001 - still pending = legacy, the safe reading
+        pass
+    applied = None
+    preserve = None
+    getter = getattr(migration_state, "applied_conversions", None)
+    recorded = getter()[0] if callable(getter) else {}
+    if not recorded and conv_state is not None:
+        try:
+            from dsql_migrator.core.converter import SchemaConverter
+            from dsql_migrator.ui.data_migration._models import session_source_type
+            from dsql_migrator.ui.schema_conversion import applied_table_conversions
+
+            applied = applied_table_conversions(
+                SchemaConverter(source_type=session_source_type(session)).convert(inv),
+                conv_state.edited_target_ddls,
+                preserve_foreign_keys=conv_state.preserve_foreign_keys,
+            )
+            preserve = conv_state.preserve_foreign_keys
+        except Exception:  # noqa: BLE001 - fall back to the recorded / source facts
+            applied = None
+    kwargs = {"applied_conversions": applied, "preserve_foreign_keys": preserve}
+    return (
+        effective_lob_exclusions(migration_state, inv, **kwargs),
+        overlay_lob_exclusions(migration_state, inv, **kwargs),
+        legacy_lob_exclusions(migration_state, inv, **kwargs),
+    )
 
 
 def build_validation_screen(
@@ -2348,52 +2503,8 @@ def build_validation_screen(
     def _exclusion_split(
         inv: "SourceInventory",
     ) -> "tuple[dict[str, frozenset[str]], dict[str, frozenset[str]], dict[str, frozenset[str]]]":
-        """``(omitted, overlay, legacy)``: the EFFECTIVE exclusion set (key columns
-        dropped) Full Load and CDC used, and its split into the columns the tool writes as
-        NULL and the legacy entries (their rows take the target DEFAULT).
-
-        Judged against the applied conversion the Data Migration render recorded; a
-        RESTORED session can reach Validation before any such render, and without the
-        applied DDL a Schema Conversion composite key's leading column would not be
-        recognised as a key -- Validation would then skip a column Full Load loaded. So
-        that case derives the applied conversion from the Schema Conversion state here.
-        Validation can be the first screen a restored session renders, so a pending
-        legacy classification is settled first (pending entries count as legacy).
-        """
-        from dsql_migrator.ui.data_migration._models import (
-            classify_restored_exclusions,
-            legacy_lob_exclusions,
-            overlay_lob_exclusions,
-        )
-
-        try:
-            classify_restored_exclusions(migration_state, job_manager)
-        except Exception:  # noqa: BLE001 - still pending = legacy, the safe reading
-            pass
-        applied = None
-        preserve = None
-        getter = getattr(migration_state, "applied_conversions", None)
-        recorded = getter()[0] if callable(getter) else {}
-        if not recorded and conv_state is not None:
-            try:
-                from dsql_migrator.core.converter import SchemaConverter
-                from dsql_migrator.ui.data_migration._models import session_source_type
-                from dsql_migrator.ui.schema_conversion import applied_table_conversions
-
-                applied = applied_table_conversions(
-                    SchemaConverter(source_type=session_source_type(session)).convert(inv),
-                    conv_state.edited_target_ddls,
-                    preserve_foreign_keys=conv_state.preserve_foreign_keys,
-                )
-                preserve = conv_state.preserve_foreign_keys
-            except Exception:  # noqa: BLE001 - fall back to the recorded / source facts
-                applied = None
-        kwargs = {"applied_conversions": applied, "preserve_foreign_keys": preserve}
-        return (
-            effective_lob_exclusions(migration_state, inv, **kwargs),
-            overlay_lob_exclusions(migration_state, inv, **kwargs),
-            legacy_lob_exclusions(migration_state, inv, **kwargs),
-        )
+        """See :func:`session_exclusion_split` (the one split cut over reads as well)."""
+        return session_exclusion_split(migration_state, session, inv, conv_state, job_manager)
 
     def _proof_candidates(
         split: "tuple[dict, dict, dict]", names: "Iterable[str]"
@@ -3318,6 +3429,268 @@ def _run_cutover_identity_sync(
         _work()
 
 
+def _job_live(job_manager: "Optional[JobManager]", job_id: Optional[str]) -> bool:
+    """Whether ``job_id`` is PENDING or RUNNING (unknown / no manager: not live)."""
+    if not job_id or job_manager is None:
+        return False
+    try:
+        return getattr(job_manager.get_status(job_id), "status", None) in ("PENDING", "RUNNING")
+    except Exception:  # noqa: BLE001 - an unknown id is not a live job
+        return False
+
+
+def cutover_job_block(migration_state, job_manager: "Optional[JobManager]") -> Optional[str]:
+    """Why a cut-over DEFAULT restore (or, under CDC, the FK apply) must wait: a Full Load
+    or a Start CDC job is pending or running -- it (re)drops the DEFAULTs. ``None`` else."""
+    if migration_state is None:
+        return None
+    if _job_live(job_manager, getattr(migration_state, "job_id", None)):
+        return "off while a Full Load runs"
+    if getattr(migration_state, "cdc_action_kind", None) == "start" and _job_live(
+        job_manager, getattr(migration_state, "cdc_deploy_job_id", None)
+    ):
+        return "off while Start CDC runs"
+    return None
+
+
+def _fill_cutover_defaults(
+    session: object,
+    migration_state,
+    conv_state,
+    inventory,
+    overlay_ledger,
+    job_manager: "Optional[JobManager]",
+    *,
+    fill_key: object,
+    generation: int,
+    facts_reader: "Optional[Callable[..., Mapping[str, Any]]]" = None,
+) -> "CutoverDefaultsSnapshot":
+    """The background cache fill (worker thread): ledger x ONE bulk catalog read x the
+    current effective DDL and the still-excluded set. Never raises."""
+    from dsql_migrator.core.overlay_ledger import overlay_ledger_key
+    from dsql_migrator.ui.cutover_defaults import read_cutover_defaults
+    from dsql_migrator.ui.data_migration._models import (
+        effective_target_ddls,
+        session_source_type,
+    )
+
+    target = getattr(session, "target_config", None)
+    aws_profile = getattr(session, "aws_profile", None)
+
+    def _facts(names, columns):
+        if facts_reader is not None:
+            return facts_reader(names, columns)
+        from dsql_migrator.core.target_connection import DsqlConnector
+        from dsql_migrator.core.target_introspector import target_overlay_facts
+
+        return target_overlay_facts(
+            names, columns,
+            connection_factory=DsqlConnector(target, aws_profile=aws_profile).connect,
+            probe_rows=False,
+        )
+
+    mark = getattr(migration_state, "mark_overlay_ledger_in_use", None)
+    return read_cutover_defaults(
+        ledger=overlay_ledger,
+        ledger_key=overlay_ledger_key(target),
+        read_facts=_facts,
+        current_ddls=lambda: effective_target_ddls(
+            inventory, conv_state, session_source_type(session)
+        ),
+        still_excluded=lambda: session_exclusion_split(
+            migration_state, session, inventory, conv_state, job_manager
+        )[1],
+        on_record_found=mark if callable(mark) else None,
+        fill_key=fill_key,
+        generation=generation,
+    )
+
+
+def _cutover_fill_key(
+    session: object, migration_state, validation_state: "ValidationState", conv_state,
+    job_manager: "Optional[JobManager]",
+) -> object:
+    """What the cut-over DEFAULT status depends on: a change refills the cache."""
+    from dsql_migrator.core.overlay_ledger import overlay_ledger_key
+
+    def _term(job_id: Optional[str]) -> tuple:
+        return (job_id, bool(job_id) and not _job_live(job_manager, job_id))
+
+    getter = getattr(migration_state, "lob_exclusions", None)
+    stored = getter() if callable(getter) else {}
+    return (
+        overlay_ledger_key(session.target_config),  # type: ignore[attr-defined]
+        _term(getattr(migration_state, "job_id", None)),
+        _term(
+            getattr(migration_state, "cdc_deploy_job_id", None)
+            if getattr(migration_state, "cdc_action_kind", None) == "start"
+            else None
+        ),
+        _term(validation_state.cutover_default_restore_job_id),
+        tuple(sorted((getattr(conv_state, "edited_target_ddls", None) or {}).items())),
+        getattr(conv_state, "preserve_foreign_keys", None),
+        tuple(sorted((t, tuple(sorted(c))) for t, c in (stored or {}).items())),
+    )
+
+
+def _log_cutover_restore(outcome: "CutoverRestoreOutcome") -> None:
+    """The activity lines of one restore job (value-free: statements are schema text)."""
+    if outcome.refused:
+        log_activity(
+            ActivityCategory.VALIDATION,
+            "excluded-column DEFAULTs not restored (cut-over)",
+            status=ActivityStatus.WARNING,
+            detail=outcome.refused,
+        )
+        return
+    if outcome.restored or outcome.already_done or outcome.gone:
+        log_activity(
+            ActivityCategory.VALIDATION,
+            "excluded-column DEFAULTs restored (cut-over)",
+            status=ActivityStatus.SUCCESS,
+            detail=(
+                f"{len(outcome.restored)} restored"
+                + (f", {len(outcome.already_done)} already in place" if outcome.already_done else "")
+                + (f", {len(outcome.gone)} no longer on the target" if outcome.gone else "")
+                + (f"; ran: {' '.join(outcome.statements)}" if outcome.statements else "")
+                + "; migrated rows stay NULL (a DEFAULT applies to new inserts only)"
+            ),
+        )
+    if outcome.diverged:
+        log_activity(
+            ActivityCategory.VALIDATION,
+            "excluded-column DEFAULTs left as they are (cut-over)",
+            status=ActivityStatus.INFO,
+            detail=(
+                "a different DEFAULT is set on Aurora DSQL, never overwritten: "
+                + ", ".join(outcome.diverged)
+            ),
+        )
+    if outcome.failed:
+        log_activity(
+            ActivityCategory.VALIDATION,
+            "excluded-column DEFAULT restore failed (cut-over)",
+            status=ActivityStatus.FAILURE,
+            detail="; ".join(f"{name}: {reason}" for name, reason in sorted(outcome.failed.items())),
+        )
+    if outcome.ledger_warning:
+        log_activity(
+            ActivityCategory.VALIDATION,
+            "excluded-column DEFAULT record not updated (cut-over)",
+            status=ActivityStatus.WARNING,
+            detail=outcome.ledger_warning,
+        )
+
+
+def _run_cutover_default_restore(
+    session: object,
+    validation_state: "ValidationState",
+    migration_state,
+    *,
+    request: "Optional[tuple[str, str]]",
+    overlay_ledger,
+    job_manager: "Optional[JobManager]",
+    refresh: Callable[[], None],
+    notify: Callable[..., None],
+    settle_probe: "Optional[Callable[[], Optional[str]]]" = None,
+    restore: "Optional[Callable[..., Any]]" = None,
+    connection_factory: "Optional[Callable[[], Any]]" = None,
+) -> None:
+    """[Restore DEFAULTs] (``request`` None: the automatic list) or one row's [Restore].
+
+    Every gate is re-read HERE, at click time, never taken from the render (a second tab
+    with an old render must not submit after a CDC start cleared the attestation): no
+    Full Load / Start CDC job pending or running, no restore running, under CDC the drained
+    attestation, and a loaded status. Then ONE background job (see
+    :func:`~dsql_migrator.ui.cutover_defaults.run_cutover_default_restore`).
+    """
+    from dsql_migrator.core.overlay_ledger import overlay_ledger_key
+    from dsql_migrator.core.schema_applier import restore_column_default
+    from dsql_migrator.ui.cutover_defaults import (
+        CutoverRestoreOutcome,
+        cutover_settle_probe,
+        run_cutover_default_restore,
+    )
+
+    def _refuse(message: str) -> None:
+        notify(message, type="warning")
+        refresh()
+
+    block = cutover_job_block(migration_state, job_manager)
+    if block:
+        return _refuse(f"Restoring DEFAULTs is {block}; try again when it finishes.")
+    if validation_state.cutover_default_restore_in_flight(job_manager):
+        return _refuse("The DEFAULTs are already being restored.")
+    cdc = _cdc_in_use(session)
+    if cdc and not validation_state.cutover_cdc_drained_confirmed:
+        return _refuse(
+            "Confirm first that source writes are frozen and CDC has drained to zero lag."
+        )
+    snap = validation_state.cutover_defaults
+    target = getattr(session, "target_config", None)
+    if snap is None or snap.state != "loaded" or target is None or overlay_ledger is None:
+        return _refuse("The DEFAULT status is not loaded; check again.")
+    if request is None:
+        items = list(snap.auto_items) + [i for i in snap.gone_items if i.executable]
+        if not snap.auto_items:
+            return _refuse("No DEFAULT can be restored automatically.")
+    else:
+        items = [
+            i for i in snap.items
+            if (i.table, i.column) == tuple(request) and i.status == "pending" and i.executable
+        ]
+        if not items:
+            return _refuse("That DEFAULT is no longer pending; check again.")
+    aws_profile = getattr(session, "aws_profile", None)
+
+    def _connect():
+        if connection_factory is not None:
+            return connection_factory()
+        from dsql_migrator.core.target_connection import DsqlConnector
+
+        return DsqlConnector(target, aws_profile=aws_profile).connect()
+
+    probe = settle_probe
+    if probe is None and cdc:
+        def probe() -> Optional[str]:
+            return cutover_settle_probe(
+                region=getattr(target, "region", ""),
+                stack_name=getattr(migration_state, "cdc_stack_name", ""),
+                aws_profile=aws_profile,
+                assume_role_arn=getattr(migration_state, "cdc_deploy_role_arn", None),
+            )
+
+    key = overlay_ledger_key(target)
+
+    def _work(handle: object = None) -> None:
+        try:
+            outcome = run_cutover_default_restore(
+                handle, items=items, ledger=overlay_ledger, ledger_key=key,
+                restore=restore or restore_column_default, connection_factory=_connect,
+                settle_probe=probe if cdc else None,
+            )
+        except Exception as exc:  # noqa: BLE001 - reported, never a silent success
+            outcome = CutoverRestoreOutcome(
+                refused=f"not restored: {_safe_restore_error(exc)}"
+            )
+        if outcome.refused_by_settle:
+            validation_state.set_cutover_cdc_drained_confirmed(False)
+        _log_cutover_restore(outcome)
+        validation_state.set_cutover_default_restore_outcome(outcome)
+        validation_state.invalidate_cutover_defaults()
+        refresh()
+
+    if job_manager is None:
+        _work()
+        return
+    validation_state.set_cutover_default_restore_job(job_manager.submit(_work))
+
+
+def _safe_restore_error(exc: BaseException) -> str:
+    text = str(exc).strip().splitlines()
+    return text[0] if text else type(exc).__name__
+
+
 def _cutover_pending_foreign_keys(
     session: object,
     eval_store: "Optional[EvaluationStore]",
@@ -3635,6 +4008,11 @@ def build_cutover_screen(
     # grounding at all. Keeping a chat that sounds authoritative about a cut over while
     # missing that is worse than not offering one.
     ai_post_event: "Optional[Callable[..., object]]" = None,
+    # The column-exclusion DEFAULT restore: the Data Migration state (jobs, CDC stack,
+    # exclusions) and the overlay ledger handle. None: no restore block (as before).
+    migration_store: "Optional[DataMigrationStore]" = None,
+    overlay_ledger: "Optional[object]" = None,
+    overlay_facts_reader: "Optional[Callable[..., Mapping[str, Any]]]" = None,
 ) -> tuple[Callable[[Callable[[], None]], None], Callable[[], None]]:
     """Build the Cut over step (step 6), returning ``(content_builder, runner)``.
 
@@ -3653,6 +4031,54 @@ def build_cutover_screen(
 
     session = store.get_or_create(session_id)
     validation_state = validation_store.get_or_create(session_id)
+    migration_state = (
+        migration_store.get_or_create(session_id) if migration_store is not None else None
+    )
+
+    def _schedule_cutover_defaults_fill(refresh: Callable[[], None]) -> None:
+        """Refill the DEFAULT status in the background when its inputs changed (or it
+        aged past the TTL). The render itself does no store I/O."""
+        if (
+            overlay_ledger is None
+            or migration_state is None
+            or getattr(session, "target_config", None) is None
+        ):
+            return
+        import time as _time
+
+        conv_state = conversion_store.get(session_id) if conversion_store is not None else None
+        eval_result = (
+            eval_store.get_or_create(session_id).result if eval_store is not None else None
+        )
+        inventory = eval_result.inventory if eval_result is not None else None
+        try:
+            key = _cutover_fill_key(
+                session, migration_state, validation_state, conv_state, job_manager
+            )
+        except Exception:  # noqa: BLE001 - no key, no fill (the block says "checking")
+            return
+        if not validation_state.cutover_defaults_stale(key, _time.monotonic()):
+            return
+        generation = validation_state.begin_cutover_defaults_fill()
+        if generation is None:
+            return  # a fill is already running
+
+        async def _fill() -> None:
+            from nicegui import run
+
+            snap = None
+            try:
+                snap = await run.io_bound(
+                    _fill_cutover_defaults, session, migration_state, conv_state,
+                    inventory, overlay_ledger, job_manager,
+                    fill_key=key, generation=generation, facts_reader=overlay_facts_reader,
+                )
+            finally:
+                stored = validation_state.finish_cutover_defaults_fill(snap, generation)
+            if stored:
+                refresh()
+
+        ui.timer(0.05, _fill, once=True)
 
     def runner() -> None:
         # No job: mark DONE as the user's acknowledgement that they've cut over.
@@ -3764,6 +4190,20 @@ def build_cutover_screen(
         # For a CDC migration, foreign keys were deferred during the stream; the runbook's
         # "Apply foreign keys" button runs them at cut over (after the final drain).
         def _fk_apply_provider() -> None:
+            # Re-read at click, never trusted from the render: a second tab drawn before
+            # a CDC start cleared the attestation must not apply foreign keys.
+            if _cdc_in_use(session):
+                _block = cutover_job_block(migration_state, job_manager)
+                if _block or not validation_state.cutover_cdc_drained_confirmed:
+                    ui.notify(  # type: ignore[attr-defined]
+                        f"Applying foreign keys is {_block}; try again when it finishes."
+                        if _block
+                        else "Confirm first that source writes are frozen and CDC has "
+                        "drained to zero lag.",
+                        type="warning",
+                    )
+                    refresh()
+                    return
             _run_cutover_foreign_keys(
                 session, validation_state,
                 eval_store=eval_store, conversion_store=conversion_store,
@@ -3912,6 +4352,8 @@ def build_cutover_screen(
                 ),
             )
 
+        # The excluded columns' DEFAULT status for the runbook below (background read).
+        _schedule_cutover_defaults_fill(refresh)
         # Go path: the verdict is clean — show the tailored runbook + an explicit
         # acknowledgement that marks the step (and the whole journey) Done. The runbook
         # includes an explicit "Sync identity sequences" action (an operator step, not a

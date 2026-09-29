@@ -83,6 +83,7 @@ from dsql_migrator.core.table_selection import (
 from dsql_migrator.ui.data_migration._models import (
     MigrationType,
     classify_restored_exclusions,
+    cutover_restore_block_reason,
     _BROKER_MESSAGE_LIMIT_MIB,
     _DSQL_VALUE_LIMIT_MIB,
     assess_dlq_health,
@@ -5072,6 +5073,13 @@ def _start_cdc_deploy(
     """Build connector params and submit the two-pass Start CDC as a background job."""
     from dsql_migrator.core.cdc_deployer import build_cdc_stack_deployer, run_cdc_start
 
+    # A running cut-over DEFAULT restore: Start CDC would drop those DEFAULTs again.
+    _restore_block = cutover_restore_block_reason(migration_state)
+    if _restore_block:
+        render_notice(
+            ui, tone="error", header="Start CDC is waiting for cut over", body=_restore_block
+        )
+        return
     # Settle a restored pre-overlay session's exclusions before any set is read.
     classify_restored_exclusions(migration_state, job_manager)
     job = _current_job(job_manager, migration_state.job_id)

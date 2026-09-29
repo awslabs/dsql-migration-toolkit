@@ -250,6 +250,8 @@ from dsql_migrator.ui.data_migration._models import (
     CAPTURE_SIZE_REMEDY_UNLOCKED,
     capture_ambiguity_warning,
     make_lob_candidates_for,
+    cutover_restore_block_reason,
+    effective_target_ddls,
     session_source_type,
     scope_lob_candidates,
     format_column_exclude_list,
@@ -413,18 +415,11 @@ def build_data_migration_screen(
     conv_state = conv_store.get_or_create(session_id)
 
     def _effective_target_ddls(inventory_now) -> "Optional[dict[str, str]]":
-        """The applied target DDL per table, from the same inputs the runner uses; called on
-        a job thread (it converts the whole inventory). None when anything is missing."""
-        source = getattr(session, "source_config", None)
-        if inventory_now is None or source is None:
-            return None
-        edited = dict(conv_store.get_or_create(session_id).edited_target_ddls or {})
-        applied = applied_table_conversions(
-            SchemaConverter(source_type=source.source_type).convert(inventory_now),
-            edited,
-            preserve_foreign_keys=conv_store.get_or_create(session_id).preserve_foreign_keys,
+        """The applied target DDL per table (see ``effective_target_ddls``); called on a
+        job thread (it converts the whole inventory). None when anything is missing."""
+        return effective_target_ddls(
+            inventory_now, conv_store.get_or_create(session_id), session_source_type(session)
         )
-        return {name: conversion.target_ddl for name, conversion in applied.items()}
 
     # Builder-time handles (kept across Start over): the effective DDL provider the
     # Start CDC overlay records against, and the notification that CDC starts (the
@@ -432,6 +427,14 @@ def build_data_migration_screen(
     migration_state.effective_target_ddls = _effective_target_ddls
     migration_state.on_cdc_start = (
         (lambda: validation_store.get_or_create(session_id).note_cdc_start())
+        if validation_store is not None
+        else None
+    )
+    # Whether cut over is restoring DEFAULTs right now (the reverse gate on every job
+    # that would drop them again). Duck-typed: data_migration never imports ui.validation.
+    migration_state.cutover_restore_in_flight = (
+        (lambda: validation_store.get_or_create(session_id).cutover_default_restore_in_flight(
+            job_manager))
         if validation_store is not None
         else None
     )
@@ -493,6 +496,11 @@ def build_data_migration_screen(
         )
         if _exclusion_block:
             migration_state.set_error(_exclusion_block)
+            return
+        # A running cut-over DEFAULT restore: this load would drop those DEFAULTs again.
+        _restore_block = cutover_restore_block_reason(migration_state)
+        if _restore_block:
+            migration_state.set_error(_restore_block)
             return
         if not session.has_source():
             migration_state.set_error(
@@ -1555,6 +1563,10 @@ def build_data_migration_screen(
                 # via per-table Reload), reusing the original watermark. Works for a
                 # DONE table too (e.g. reloading a quarantine table after fixing the
                 # source value), since it re-seeds exactly those chunks.
+                _restore_block = cutover_restore_block_reason(migration_state)
+                if _restore_block:
+                    ui.notify(_restore_block, type="warning", position="top")
+                    return
                 current = _current_job(job_manager, migration_state.job_id)
                 if current is None:
                     ui.notify(

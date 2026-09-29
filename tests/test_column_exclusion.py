@@ -567,8 +567,7 @@ def test_validation_recognises_a_composite_key_after_a_restore(monkeypatch):
 
     import dsql_migrator.ui.validation as validation
 
-    src = inspect.getsource(validation.build_validation_screen)
-    body = src[src.index("def _exclusion_split("):src.index("def _proof_candidates(")]
+    body = inspect.getsource(validation.session_exclusion_split)
     # Only when nothing is recorded, and with the Schema Conversion state's own inputs.
     assert "if not recorded and conv_state is not None:" in body
     assert "conv_state.edited_target_ddls" in body and "conv_state.preserve_foreign_keys" in body

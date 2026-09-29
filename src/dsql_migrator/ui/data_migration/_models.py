@@ -1507,6 +1507,51 @@ def preselect_lob_columns_for_reason(
     return tuple(matched)
 
 
+def effective_target_ddls(inventory, conv_state, source_type) -> "Optional[dict[str, str]]":
+    """The applied target DDL per table, from the SAME inputs the Full Load runner converts
+    with (inventory + Schema Conversion edits and toggle). ``None`` when either is missing.
+
+    The ONE text source the overlay records against and cut over compares with (a DDL
+    digest only matches byte-identical text), so every caller passes
+    :func:`session_source_type` -- a MySQL fallback would convert a restored PostgreSQL
+    session's DDL differently. Called on job threads: the edits are copied first.
+    """
+    if inventory is None or not getattr(inventory, "tables", None) or conv_state is None:
+        return None
+    from dsql_migrator.core.converter import SchemaConverter
+    from dsql_migrator.ui.schema_conversion import applied_table_conversions
+
+    edited = dict(getattr(conv_state, "edited_target_ddls", None) or {})
+    applied = applied_table_conversions(
+        SchemaConverter(source_type=source_type).convert(inventory),
+        edited,
+        preserve_foreign_keys=getattr(conv_state, "preserve_foreign_keys", True),
+    )
+    return {name: conversion.target_ddl for name, conversion in applied.items()}
+
+
+CUTOVER_RESTORE_BLOCK_TEXT = (
+    "Cut over is restoring the excluded columns' DEFAULTs. Wait for it to finish, then "
+    "start again."
+)
+
+
+def cutover_restore_block_reason(migration_state) -> "Optional[str]":
+    """Why a job that (re)drops excluded columns' DEFAULTs must not start now, or ``None``.
+
+    A Full Load, a reload or Start CDC re-applies the overlay (DROP DEFAULT) on the very
+    columns a running cut-over restore is setting, and a DEFAULT set halfway through a
+    load gives the remaining batches that DEFAULT instead of NULL. The callable is wired
+    by the builder (None without a Validation store: never refuses).
+    """
+    fn = getattr(migration_state, "cutover_restore_in_flight", None)
+    try:
+        running = bool(fn()) if callable(fn) else False
+    except Exception:  # noqa: BLE001 - an unreadable job state never blocks a start
+        running = False
+    return CUTOVER_RESTORE_BLOCK_TEXT if running else None
+
+
 def session_source_type(session) -> SourceType:
     """The session's source engine, falling back to the RESTORED hint, then MySQL.
 

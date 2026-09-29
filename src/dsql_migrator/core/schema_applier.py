@@ -1337,6 +1337,21 @@ def is_single_sql_expression(expr: str) -> bool:
     return quote is None and depth == 0
 
 
+def restore_default_statement(table_name: str, column: str, expr: str) -> sql.Composed:
+    """THE ``ALTER TABLE .. ALTER COLUMN .. SET DEFAULT (expr)`` a cut-over restore runs
+    (and shows). Parenthesized, so any text the single-expression scan missed is a syntax
+    error rather than a second subcommand; PostgreSQL does not keep the parentheses."""
+    from dsql_migrator.core.validation_sql import _pg_table_identifier
+
+    return (
+        sql.SQL("ALTER TABLE {t} ALTER COLUMN {c} SET DEFAULT (").format(
+            t=_pg_table_identifier(table_name), c=sql.Identifier(column)
+        )
+        + sql.SQL(expr)
+        + sql.SQL(")")
+    )
+
+
 class RestoreOutcome:
     """``status``: restored (this unit set it) | done (already equal) | diverged | gone."""
 
@@ -1375,7 +1390,6 @@ def restore_column_default(
     that must round-trip byte-identically (F4), else :class:`OverlayVerifyError`.
     """
     from dsql_migrator.core.target_introspector import read_overlay_column_facts
-    from dsql_migrator.core.validation_sql import _pg_table_identifier
 
     if not is_single_sql_expression(expr):
         raise OverlayRefusedError(
@@ -1399,12 +1413,9 @@ def restore_column_default(
                 return RestoreOutcome("restored" if issued["set"] else "done", expr)
             return RestoreOutcome("diverged", live.default_expr)
         issued["set"] = True
-        # Parenthesized as well, so any text the scan missed is a syntax error rather than
-        # a second subcommand; PostgreSQL does not keep the parentheses (the read-back
-        # below still compares byte-identically).
-        run_one(connection, sql.SQL("ALTER TABLE {t} ALTER COLUMN {c} SET DEFAULT (").format(
-            t=_pg_table_identifier(table_name), c=sql.Identifier(column))
-            + sql.SQL(expr) + sql.SQL(")"))
+        # The read-back below still compares byte-identically (PostgreSQL drops the
+        # parentheses the statement adds).
+        run_one(connection, restore_default_statement(table_name, column, expr))
         exists, facts = retry_read(_read)
         after = facts.get(column) if exists else None
         if after is None or after.default_expr != expr:
@@ -1438,6 +1449,7 @@ __all__ = [
     "apply_exclusion_overlay",
     "is_single_sql_expression",
     "restore_column_default",
+    "restore_default_statement",
     "ConnectionFactory",
     "parse_create_object",
     "recreate_table",

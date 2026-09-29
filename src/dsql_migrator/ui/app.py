@@ -597,6 +597,10 @@ def build_page(
         # did not read as grounded in the actual migration, and the one fact that decides
         # GO/HOLD here -- the foreign-key state -- was never in its grounding.
         ai_post_event=_ai_post_event,
+        # The column-exclusion DEFAULT restore reads the Data Migration state and the
+        # overlay ledger (the record of the DEFAULTs the overlay dropped).
+        migration_store=DATA_MIGRATION_STORE,
+        overlay_ledger=OVERLAY_LEDGER,
     )
     # Optional tool (not a workflow step): the Query Playground — convert a MySQL
     # statement to DSQL and non-destructively test whether it runs on the target.
