@@ -189,7 +189,8 @@ def plan_ledger_record(
     (d) recreated or empty: the current set with ``empty_when_applied``; an append with the
         same set digest keeps ``empty_when_applied`` (never downgraded); a different or new
         set on an append (only under the cdc_coexisting / legacy exemption) is not empty;
-    (e) no entries and an empty current set: DELETE the record.
+    (e) no entries and an empty current set: DELETE the record (unchanged when there is
+        none -- no store write).
 
     ``reincluded`` (:func:`reincluded_columns`) names the recorded set's columns this run
     WRITES values into on a table that keeps its rows (the exempt append under an empty
@@ -240,6 +241,10 @@ def plan_ledger_record(
     else:
         set_columns, digest, empty = current, digest_now, False
     if not columns and not current:
+        # Nothing to delete when there is no record: no store write (a failing write
+        # must never block a run that needed no record at all).
+        if existing is None:
+            return LedgerDecision("unchanged", None)
         return LedgerDecision("delete", None)
     return LedgerDecision(
         "write",

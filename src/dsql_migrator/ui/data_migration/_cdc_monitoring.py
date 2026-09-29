@@ -1910,7 +1910,8 @@ def _render_cdc_oversized_recovery(
                 body=(
                     "The exclusion is migration-wide: the Full Load, the prerequisite checks "
                     "and the Validation comparison all stop covering this column too, and it "
-                    "is empty (NULL) in every row the tool writes. Rows already dropped are "
+                    "is empty (NULL) in every row the tool inserts (a row already on Aurora "
+                    "DSQL keeps what it holds there). Rows already dropped are "
                     "NOT recovered by excluding the column — do the steps below, in this "
                     "order."
                 ),
@@ -3079,8 +3080,9 @@ def _render_cdc_lob_exclusion_panel(
             ui.label(  # type: ignore[attr-defined]
                 f"These {lob_noun} can hold values over the Aurora DSQL "
                 f"{_DSQL_VALUE_LIMIT_MIB} MiB limit. Ticking one excludes it from this "
-                "migration: it is NULL in every row the tool writes (the Full Load and, "
-                "if CDC is used, the stream), because before the first write the tool "
+                "migration: it is NULL in every row the tool inserts (the Full Load and, "
+                "if CDC is used, the stream; a row already on Aurora DSQL keeps what it "
+                "holds there), because before the first write the tool "
                 "drops its NOT NULL (one-way) and its DEFAULT (restored at Cut over) on "
                 "Aurora DSQL. Leave a column ticked-off to load it normally; any single "
                 "value that then exceeds the limit is quarantined per-row instead. "

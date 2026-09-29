@@ -204,15 +204,17 @@ def test_an_unknown_catalog_blocks(which):
     assert _alters(db) == []
 
 
-def test_an_unreadable_ledger_blocks_only_with_overlay_columns():
+def test_an_unreadable_ledger_blocks_with_overlay_columns_or_a_session_that_used_it():
+    # As the Full Load: a table CDC now writes values into could otherwise keep a record
+    # saying it is NULL in every row.
     db = _catalog(["t0"])
     ledger = InMemoryOverlayLedger()
     ledger.read = lambda k: LedgerRead("unreadable", {}, "AccessDenied")
     with pytest.raises(StartCdcOverlayBlocked, match="could not be read"):
         _run(db, ledger, overlay={"t0": frozenset({"c"})})
-    log = _run(db, ledger, overlay={}, in_use=True)
-    assert [e for e in log.events if e[0] == "overlay record not read" and e[1] == "warning"]
-    assert _alters(db) == []
+    with pytest.raises(StartCdcOverlayBlocked, match="could not be read"):
+        _run(db, ledger, overlay={}, in_use=True)
+    assert _alters(db) == [] and db.connects == 0
 
 
 def test_no_ledger_handle_with_overlay_columns_blocks():
@@ -334,15 +336,16 @@ def test_the_budget_is_one_facts_connection_one_read_and_one_write():
 
 
 def test_the_dialog_probe_lists_the_statements_or_says_it_cannot():
-    db = _catalog(["t0"])
-    statements = probe_cdc_overlay_changes({"t0": {"c"}}, connection_factory=db.connect)
-    assert [s.action for s in statements] == ["DROP NOT NULL", "DROP DEFAULT"]
+    db = _catalog(["t0", "t1"], rows={"t1": True})
+    preview = probe_cdc_overlay_changes({"t0": {"c"}, "t1": {"c"}}, connection_factory=db.connect)
+    assert [s.action for s in preview.statements] == ["DROP NOT NULL", "DROP DEFAULT"] * 2
+    assert preview.tables_with_rows == ("t1",)
     with pytest.raises(OverlayFactsUnknown):
         probe_cdc_overlay_changes({"t0": {"c"}}, connection_factory=None)
     with pytest.raises(OverlayFactsUnknown):
         probe_cdc_overlay_changes({"t0": {"c"}}, connection_factory=db.connect,
                                   facts_reader=lambda names, cols, **kw: {n: None for n in names})
-    assert probe_cdc_overlay_changes({}, connection_factory=None) == []
+    assert probe_cdc_overlay_changes({}, connection_factory=None).statements == []
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +354,7 @@ def test_the_dialog_probe_lists_the_statements_or_says_it_cannot():
 
 
 def _drive_start_cdc(monkeypatch, *, overlay_raises=False, run_raises=False, backstop_raises=False,
-                     exclude=False, cancel_in_overlay=False):
+                     exclude=False, cancel_in_overlay=False, swap_target=False):
     import dsql_migrator.config as _config
     import dsql_migrator.core.cdc_deployer as _dep
     import dsql_migrator.ui.data_migration._cdc_ui as _cdcui
@@ -435,6 +438,9 @@ def _drive_start_cdc(monkeypatch, *, overlay_raises=False, run_raises=False, bac
     jm = _JM()
     _cdcui._start_cdc_deploy(SimpleNamespace(notify=lambda *a, **k: None), state, jm, lambda: None,
                              inventory=inventory, session=session)
+    if swap_target:
+        session.target_config = SimpleNamespace(region="us-east-1", cluster_endpoint="other.dsql.amazonaws.com",
+                                                database="postgres", username="admin")
     error = None
     try:
         jm.work(SimpleNamespace(cancelled=False))
@@ -552,3 +558,89 @@ def test_a_full_load_and_cdc_start_dialog_makes_no_overlay_read(monkeypatch):
     ui, calls, _mt = _drive_cdc_dialog(monkeypatch, migration_type=MigrationType.FULL_LOAD_AND_CDC,
                                        probe=lambda: [])
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (P2-13 adversarial review)
+# ---------------------------------------------------------------------------
+
+
+def test_a_cdc_start_clears_the_real_cut_over_drained_attestation():
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+    from dsql_migrator.core.job_manager import JobManager
+    from dsql_migrator.ui.data_migration import DataMigrationStore, build_data_migration_screen
+    from dsql_migrator.ui.evaluation import EvaluationStore
+    from dsql_migrator.ui.schema_conversion import SchemaConversionStore
+    from dsql_migrator.ui.session import SessionStore
+    from dsql_migrator.ui.validation import ValidationStore
+
+    migration_store, validation_store = DataMigrationStore(), ValidationStore()
+    build_data_migration_screen(
+        SessionStore(), "s1", job_manager=JobManager(), eval_store=EvaluationStore(),
+        migration_store=migration_store, conv_store=SchemaConversionStore(), validation_store=validation_store)
+    vstate = validation_store.get_or_create("s1")
+    vstate.set_cutover_cdc_drained_confirmed(True)
+    cdc_ui._note_cdc_start(migration_store.get_or_create("s1"))
+    assert vstate.cutover_cdc_drained_confirmed is False
+
+
+def test_the_overlay_connects_to_the_target_the_start_was_prepared_for(monkeypatch):
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+    from dsql_migrator.ui.data_migration import DataMigrationState
+
+    seen = []
+    monkeypatch.setattr(cdc_ui, "_dsql_connect_for", lambda target, profile: (lambda: seen.append(target)))
+    a = SimpleNamespace(cluster_endpoint="a.dsql", database="postgres", region="us-east-1")
+    session = SimpleNamespace(target_config=a, aws_profile=None)
+    plan = cdc_ui._start_cdc_overlay_plan(DataMigrationState(), None, [], session, a)
+    session.target_config = SimpleNamespace(cluster_endpoint="b.dsql", database="postgres", region="us-east-1")
+    plan["connection_factory"]()
+    assert seen == [a]
+
+
+def test_a_target_changed_after_the_click_blocks_before_anything(monkeypatch):
+    order, error = _drive_start_cdc(monkeypatch, swap_target=True)
+    assert error is not None and "target changed" in str(error)
+    assert "fk" not in order and "overlay" not in order and "deployer" not in order
+    assert order[-1] == "on_cdc_start"
+
+
+def test_an_absent_overlay_column_with_no_record_writes_nothing():
+    db = FakeDb({"t0": {"id": {"notnull": True, "default": None}}}, rows={"t0": True})
+    ledger = InMemoryOverlayLedger()
+    ledger.merge_tables = lambda k, m: (_ for _ in ()).throw(OverlayLedgerError("SlowDown"))
+    for _ in range(2):
+        _run(db, ledger, overlay={"t0": frozenset({"gone"})})
+    assert _alters(db) == [] and ledger.read(KEY).tables == {}
+
+
+def test_a_delete_of_no_record_is_unchanged():
+    from dsql_migrator.core.overlay_ledger import plan_ledger_record
+
+    decision = plan_ledger_record(None, table="t", overlay_facts={}, has_rows=False, just_recreated=False,
+                                  effective_ddl=None, now=T0)
+    assert decision.kind == "unchanged" and decision.record is None
+    existing = _record("t", columns=())
+    existing = existing.model_copy(update={"columns": []})
+    assert plan_ledger_record(existing, table="t", overlay_facts={}, has_rows=False, just_recreated=False,
+                              effective_ddl=None, now=T0).kind == "delete"
+
+
+def test_streaming_onto_rows_not_loaded_with_the_set_warns():
+    db = _catalog(["t0"], rows={"t0": True})
+    log = _run(db, InMemoryOverlayLedger(), overlay={"t0": frozenset({"c"})})
+    warned = [e for e in log.events if e[0] == "overlay append" and e[1] == "warning"]
+    assert warned and "streamed anyway" in warned[0][2] and "keep what they hold in c" in warned[0][2]
+    empty = _run(_catalog(["t1"]), InMemoryOverlayLedger(), overlay={"t1": frozenset({"c"})})
+    assert not [e for e in empty.events if e[0] == "overlay append"]
+
+
+def test_the_dialog_says_which_tables_keep_their_values(monkeypatch):
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+    from dsql_migrator.ui.data_migration._cdc_overlay import CdcOverlayPreview
+
+    notices = []
+    monkeypatch.setattr(cdc_ui, "_render_notice", lambda _ui, **kw: notices.append(kw))
+    cdc_ui._render_cdc_overlay_changes(SimpleNamespace(), CdcOverlayPreview([], ("app.t",)))
+    assert notices and notices[0]["tone"] == "info"
+    assert "Rows already in app.t keep what they hold" in notices[0]["body"]

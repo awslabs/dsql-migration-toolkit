@@ -4736,8 +4736,8 @@ def _has_captured_overlay(migration_state, inventory, captured) -> bool:
 
 def _render_cdc_overlay_changes(ui, overlay_changes) -> None:
     """The CDC-only Start dialog's overlay notice: the exact ALTERs in run order, or that
-    the target could not be read (the job then reads it itself). Nothing when nothing is
-    excluded."""
+    the target could not be read (the job then reads it itself), and which tables keep
+    the values they already hold. Nothing when nothing is excluded."""
     if overlay_changes is None:
         return
     if overlay_changes is _OVERLAY_UNREAD:
@@ -4752,8 +4752,19 @@ def _render_cdc_overlay_changes(ui, overlay_changes) -> None:
             ),
         )
         return
-    statements = list(overlay_changes or ())
+    statements = list(getattr(overlay_changes, "statements", ()) or ())
+    with_rows = tuple(getattr(overlay_changes, "tables_with_rows", ()) or ())
+    kept = (
+        f"Rows already in {', '.join(with_rows)} keep what they hold in the excluded "
+        "columns: CDC never writes them."
+        if with_rows
+        else ""
+    )
     if not statements:
+        if kept:
+            _render_notice(
+                ui, tone="info", header="Excluded columns on Aurora DSQL", body=kept
+            )
         return
     n_not_null = sum(1 for st in statements if st.action == "DROP NOT NULL")
     n_default = sum(1 for st in statements if st.action == "DROP DEFAULT")
@@ -4768,8 +4779,9 @@ def _render_cdc_overlay_changes(ui, overlay_changes) -> None:
         icon="table_chart",
         header="Aurora DSQL changes when CDC starts: " + ", ".join(parts),
         body=(
-            "They run before any connector is created, so every row CDC writes holds NULL "
+            "They run before any connector is created, so every row CDC inserts holds NULL "
             "in the excluded columns. Aurora DSQL cannot add NOT NULL back in place."
+            + (f" {kept}" if kept else "")
         ),
     )
     with ui.expansion("show statements").classes("w-full text-xs"):  # type: ignore[attr-defined]
@@ -4821,15 +4833,34 @@ def _start_cdc_overlay_plan(migration_state, inventory, tables_for_config, sessi
         "ledger": ledger,
         "ledger_key": ledger_key,
         "ledger_in_use": bool(getattr(migration_state, "overlay_ledger_in_use", False)),
-        # Lazy: the connector is built on the job thread, only if the overlay needs it.
+        # Lazy: the connector is built on the job thread, only if the overlay needs it --
+        # and bound to the SAME target the ledger key and the sink parameters name, so a
+        # target changed on Connect meanwhile can never be the one ALTERed.
         "connection_factory": (
-            (lambda: _cdc_fk_connection_factory(session)())
-            if getattr(session, "target_config", None) is not None
+            (lambda: _dsql_connect_for(target, getattr(session, "aws_profile", None))())
+            if target is not None
             else None
         ),
         "effective_target_ddls": (lambda: ddls(inventory)) if callable(ddls) else (lambda: None),
         "log": _log_cdc_event,
     }
+
+
+def _dsql_connect_for(target, aws_profile):
+    """``DsqlConnector(target).connect`` for one fixed target (built when called)."""
+    from dsql_migrator.core.target_connection import DsqlConnector
+
+    return DsqlConnector(target, aws_profile=aws_profile).connect
+
+
+def _same_target(a, b) -> bool:
+    """The same Aurora DSQL cluster and database (the identity a Start CDC acts on)."""
+    if a is None or b is None:
+        return a is b
+    return all(
+        getattr(a, field, None) == getattr(b, field, None)
+        for field in ("cluster_endpoint", "database", "region")
+    )
 
 
 def _apply_start_cdc_overlay(handle, **plan) -> None:
@@ -5291,6 +5322,14 @@ def _start_cdc_deploy(
         # job's worker thread -- NEVER on the NiceGUI event loop. On Fargate one asyncio
         # loop serves every browser session, so a blocking call on it freezes them all;
         # the sibling _start_cdc_infra_deploy offloads for exactly this reason.
+        # The target this Start was prepared for (ledger key, sink parameters, overlay)
+        # must still be the session's: a target changed on Connect after the click would
+        # otherwise be checked and ALTERed while the connectors stream to the old one.
+        if not _same_target(getattr(session, "target_config", None), target):
+            raise RuntimeError(
+                "Start CDC blocked: the Aurora DSQL target changed after Start CDC was "
+                "clicked. Nothing was changed; start CDC again."
+            )
         # BACKSTOP for the foreign-key precondition, re-checked on the worker thread
         # right before anything is created. The Start dialog already blocks on this, but
         # "Retry CDC" (_render_cdc_partial_actions) calls this job with NO dialog, and a

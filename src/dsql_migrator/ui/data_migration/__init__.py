@@ -428,10 +428,10 @@ def build_data_migration_screen(
 
     # Builder-time handles (kept across Start over): the effective DDL provider the
     # Start CDC overlay records against, and the notification that CDC starts (the
-    # cut-over DEFAULT-restore attestation is stale then).
+    # cut-over "CDC drained" attestation is stale then).
     migration_state.effective_target_ddls = _effective_target_ddls
     migration_state.on_cdc_start = (
-        (lambda: getattr(validation_store.get_or_create(session_id), "note_cdc_start", lambda: None)())
+        (lambda: validation_store.get_or_create(session_id).note_cdc_start())
         if validation_store is not None
         else None
     )

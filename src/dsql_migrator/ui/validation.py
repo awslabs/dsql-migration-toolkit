@@ -1847,6 +1847,14 @@ class ValidationState:
         with self._lock:
             self.cutover_cdc_drained_confirmed = bool(confirmed)
 
+    def note_cdc_start(self) -> None:
+        """CDC starts (or tried to): an attestation that it had drained is stale.
+
+        Called from the Start CDC job (submit and its ``finally``), on any thread.
+        """
+        with self._lock:
+            self.cutover_cdc_drained_confirmed = False
+
     def set_cutover_fk_apply_job(self, job_id: Optional[str]) -> None:
         """Record the submitted cut-over foreign-key apply job (re-entrancy guard)."""
         with self._lock:
