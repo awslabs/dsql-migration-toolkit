@@ -628,3 +628,27 @@ def test_the_ascii_fold_matches_the_reference_and_the_ambiguity_map_is_skipped_w
     plain = [TableDef(name="shop.t", primary_key=[], columns=[ColumnDef(name="a", mysql_type="text")])]
     assert cdc.column_exclude_ambiguous_entries({"shop.t": ["a"]}, plain) == {}
     assert cdc.column_exclude_ambiguous_entries({}, plain) == {}
+
+
+def test_the_picker_lock_names_cdc_when_cdc_alone_promoted_the_step():
+    """Round 5: the lock stays (the set was committed); only its false cause changes."""
+    from dsql_migrator.core.models import StepStatus
+    from dsql_migrator.ui.data_migration import selection_lock_reason, table_set_lock_reason
+
+    cdc_only = _state(MigrationType.CDC_ONLY)
+    reason = selection_lock_reason(cdc_only, _StubJobManager({}), status=StepStatus.DONE,
+                                   migration_type=MigrationType.CDC_ONLY, has_job=False)
+    assert reason.startswith("Locked — CDC has already streamed this table set.")
+    assert "a Full Load has already run" not in reason
+    # A recorded Full Load keeps the Full Load text (live job or pruned record alike).
+    loaded = _state(job_id="job-1")
+    for has_job in (True, False):
+        text = selection_lock_reason(loaded, _StubJobManager({}), status=StepStatus.DONE,
+                                     migration_type=MigrationType.FULL_LOAD_AND_CDC, has_job=has_job)
+        assert "a Full Load has already run" in text
+    # The generated-overflow remedy reuses it through table_set_lock_reason.
+    from dsql_migrator.ui.workflow import WorkflowState, WorkflowStep, with_status
+
+    session = SimpleNamespace(workflow=with_status(WorkflowState(), WorkflowStep.FULL_LOAD, StepStatus.DONE))
+    assert table_set_lock_reason(cdc_only, _StubJobManager({}), session).startswith(
+        "Locked — CDC has already streamed")

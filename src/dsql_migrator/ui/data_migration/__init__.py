@@ -3208,6 +3208,20 @@ def selection_lock_reason(
     render and unit-testable.
     """
     if has_job or status is StepStatus.DONE:
+        # The FULL_LOAD step is ALSO promoted to DONE by CDC alone once it streams
+        # (data_migration_step_after_cdc). The lock is right either way -- the set was
+        # committed -- but with no recorded Full Load (no job, no job_id) the cause is CDC,
+        # and saying "a Full Load has already run" is false for a CDC-only session. (Full
+        # load only has no CDC to promote the step, so a Full Load is its only cause.)
+        if (
+            not has_job
+            and getattr(migration_state, "job_id", None) is None
+            and migration_type is not MigrationType.FULL_LOAD_ONLY
+        ):
+            return (
+                "Locked — CDC has already streamed this table set. Use 'Start over' "
+                "to migrate a different set of tables."
+            )
         return (
             "Locked — a Full Load has already run for this table set. Use 'Start over' "
             "to migrate a different set of tables."
