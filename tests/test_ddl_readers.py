@@ -89,7 +89,13 @@ def test_the_replace_path_now_loads_a_column_whose_default_says_generated():
 
 def test_a_named_primary_key_is_read_and_protects_its_columns():
     ddl = 'CREATE TABLE "shop"."orders" ("tenant" TEXT, "id" INT, "note" TEXT, CONSTRAINT "pk_o" PRIMARY KEY ("tenant", "id"))'
-    assert parse_target_primary_key(ddl) == ["tenant", "id"]
+    # The loader / CDC re-key keep the 0.1.561 reading (a named key is "unknown" there, so a
+    # deployed pipeline's MessageKeyColumns cannot change); the exclusion rule reads it.
+    assert parse_target_primary_key(ddl) == []
+    assert parse_target_primary_key(ddl, for_exclusion=True) == ["tenant", "id"]
+    unquoted = 'CREATE TABLE t (id BIGINT, CONSTRAINT PK_ORDERS PRIMARY KEY (ID))'
+    assert parse_target_primary_key(unquoted, for_exclusion=True) == ["id"]  # folded
+    assert parse_target_primary_key('CREATE TABLE t (ID INT PRIMARY KEY)') == ["ID"]  # as 0.1.561
     orders = TableDef(name="shop.orders", columns=[ColumnDef(name=c, mysql_type="text") for c in ("tenant", "id", "note")],
                       primary_key=["id"])
     ctx = build_exclusion_context(SourceInventory(tables=[orders]),

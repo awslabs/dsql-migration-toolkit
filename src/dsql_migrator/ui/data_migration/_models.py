@@ -1860,16 +1860,26 @@ def missing_column_block_reason(
     pairs = [f"{table}.{column}" for table, cols in missing.items() for column in cols]
     shown = ", ".join(pairs[:3]) + (f" and {len(pairs) - 3} more" if len(pairs) > 3 else "")
     many = len(pairs) > 1
+    them = "them" if many else "it"
+    mtype = getattr(getattr(migration_state, "migration_type", None), "value", "")
+    consequence = (
+        f"CDC would dead-letter every change to {them}"
+        if mtype == "cdc_only"
+        else f"the load would fail on {them} and CDC would dead-letter every change to {them}"
+        if mtype == "full_load_and_cdc"
+        else f"the load would fail on {them}"
+    )
     return (
         f"{shown} {'are' if many else 'is'} not in your Aurora DSQL table"
-        f"{'s' if len(missing) > 1 else ''}; the load would fail on "
-        f"{'them' if many else 'it'} (42703, undefined column). Add "
-        f"{'them' if many else 'it'} back to the target DDL in Schema Conversion. "
+        f"{'s' if len(missing) > 1 else ''}; {consequence} (42703, undefined column). "
+        f"Add {them} back to the target DDL in Schema Conversion. "
         "Columns are never dropped from a migration automatically."
     )
 
 
-def stored_exclusion_block_reason(issues) -> "Optional[str]":
+def stored_exclusion_block_reason(
+    issues, *, where: str = "in 'Oversized LOB columns' above"
+) -> "Optional[str]":
     """The gate text for stored-entry ERRORs, or ``None`` when nothing blocks.
 
     "Above" holds on every gated button: the card renders under the table picker, above
@@ -1887,7 +1897,7 @@ def stored_exclusion_block_reason(issues) -> "Optional[str]":
     return (
         f"{len(errors)} saved column exclusion{'s' if many else ''} no longer "
         f"appl{'y' if many else 'ies'}: {shown}{more} Remove {'them' if many else 'it'} "
-        "in 'Oversized LOB columns' above first."
+        f"{where} first."
     )
 
 
@@ -1963,6 +1973,11 @@ class CdcCaptureExclusions:
     sent: str
     error: "Optional[str]" = None
     inexact: "tuple[str, ...]" = ()
+    # Bytes the automatically added generated columns ALONE need: over the limit, fewer
+    # operator exclusions cannot fix a size refusal.
+    generated_bytes: int = 0
+    # Excluded names Debezium cannot tell apart from another captured column.
+    ambiguous: "Mapping[str, list[str]]" = field(default_factory=dict)
 
 
 def cdc_capture_exclusions(
@@ -1972,20 +1987,28 @@ def cdc_capture_exclusions(
     from dsql_migrator.core.cdc import (
         CDC_PARAMETER_BYTE_LIMIT,
         choose_column_exclude_value,
+        column_exclude_ambiguous_entries,
         column_exclude_inexact_entries,
         format_column_exclude_value,
     )
     from dsql_migrator.core.converter import pg_preserved_generated_columns
 
     captured = list(captured_tables or ())
+    captured_names = {t.name for t in captured}
+    # Only the CAPTURED tables' exclusions: an entry on a table outside table.include.list
+    # is inert, the card does not show it, and counting it made a size refusal whose
+    # "exclude fewer" remedy could not be followed. (The legacy value below is untouched.)
     merged: dict[str, set[str]] = {
         table: set(cols)
         for table, cols in effective_lob_exclusions(migration_state, inventory).items()
+        if table in captured_names
     }
+    generated: dict[str, list[str]] = {}
     for table in captured:
         preserved = [c.name for c in pg_preserved_generated_columns(table)]
         if preserved:
             merged.setdefault(table.name, set()).update(preserved)
+            generated[table.name] = sorted(preserved)
     structured = {t: sorted(c) for t, c in sorted(merged.items()) if c}
     value = format_column_exclude_value(structured, captured)
     legacy_columns = cdc_excluded_columns(migration_state.lob_exclusions(), inventory)
@@ -2010,7 +2033,28 @@ def cdc_capture_exclusions(
                 f"configuration, over CloudFormation's {CDC_PARAMETER_BYTE_LIMIT:,}-byte "
                 "limit for one parameter."
             )
-    return CdcCaptureExclusions(structured, value, legacy, sent, error, inexact)
+    generated_bytes = (
+        len(format_column_exclude_value(generated, captured).encode("utf-8"))
+        if error and generated
+        else 0
+    )
+    ambiguous = column_exclude_ambiguous_entries(structured, captured)
+    return CdcCaptureExclusions(
+        structured, value, legacy, sent, error, inexact, generated_bytes, ambiguous
+    )
+
+
+def capture_ambiguity_warning(capture: "CdcCaptureExclusions") -> "Optional[str]":
+    """The warning for excluded names Debezium cannot separate from another column."""
+    if not capture.ambiguous:
+        return None
+    pairs = [f"{name} (also drops {', '.join(others)})" for name, others in capture.ambiguous.items()]
+    return (
+        "Debezium names these the same as another captured column, so excluding one "
+        "also drops the other at capture: " + "; ".join(pairs[:3])
+        + (f" and {len(pairs) - 3} more" if len(pairs) > 3 else "")
+        + ". No escaping can tell them apart; rename one, or keep both excluded."
+    )
 
 
 # The remedy for a capture-size refusal while the exclusion card is still editable.

@@ -74,6 +74,7 @@ from dsql_migrator.core.activity_log import (
     log_activity,
 )
 from dsql_migrator.core.cdc import (
+    CDC_PARAMETER_BYTE_LIMIT,
     CdcPipelineOrchestrator,
     composite_key_columns_for_cdc,
 )
@@ -242,6 +243,7 @@ from dsql_migrator.ui.data_migration._models import (
     ExclusionInputs,
     live_target_columns_of,
     CAPTURE_SIZE_REMEDY_UNLOCKED,
+    capture_ambiguity_warning,
     make_lob_candidates_for,
     session_source_type,
     scope_lob_candidates,
@@ -1336,6 +1338,9 @@ def build_data_migration_screen(
                     # set), so the post-lock copy names the real cause and its remedy.
                     after_lock_note=exclusion_after_lock_note(
                         migration_state, job_manager
+                    ),
+                    capture_notices=capture_pre_load_notices(
+                        migration_state, job_manager, inventory
                     ),
                     # Fall back to the SELECTION lock's reason when the LOB clause has
                     # none: the `locked` flag is an OR, so any contributor without a
@@ -2726,20 +2731,59 @@ def data_migration_exclusion_block(
     blocked = stored_exclusion_block_reason(
         stored_exclusion_issues(migration_state, inventory, committed=committed)
     ) or missing_column_block_reason(migration_state, inventory, job_manager=job_manager)
-    if blocked or committed or migration_state.migration_type is not (
-        MigrationType.FULL_LOAD_AND_CDC
+    if (
+        blocked
+        or getattr(migration_state, "job_id", None) is not None
+        or migration_state.migration_type is not MigrationType.FULL_LOAD_AND_CDC
     ):
         return blocked
-    # Full load + CDC: the capture list must fit the CDC stack's one parameter, and the
-    # load is the last point at which the exclusions can still change -- afterwards the
-    # card locks and Deploy would refuse with nothing left to fix.
+    # Full load + CDC, before any load: the capture list must fit the CDC stack's one
+    # parameter, and this is the last point at which the exclusions can still change --
+    # afterwards Deploy / Start CDC would refuse with only Start over left. Judged even
+    # when a stack (deployed early, or attached) already locks the card: the remedy is
+    # then the lock's own (delete, change, redeploy), which is still possible pre-load.
+    capture = _pre_load_capture(migration_state, inventory)
+    if capture is None or not capture.error:
+        return None
+    # When the generated columns alone exceed the limit, no exclusion change fixes it and
+    # 0.1.561 let this load run: warn on the card (capture_pre_load_notices), do not hold.
+    if capture.generated_bytes > CDC_PARAMETER_BYTE_LIMIT:
+        return None
+    return capture_error_with_remedy(migration_state, job_manager, capture)
+
+
+def _pre_load_capture(migration_state, inventory):
+    """The capture exclusions CDC will send after this migration's Full Load, or None."""
+    if inventory is None or not getattr(inventory, "tables", None):
+        return None
     scope = exclusion_scope(migration_state)
-    tables = [
-        t for t in (getattr(inventory, "tables", None) or ())
-        if scope is None or t.name in set(scope)
-    ]
-    error = cdc_capture_exclusions(migration_state, inventory, tables).error
-    return f"{error} {CAPTURE_SIZE_REMEDY_UNLOCKED}" if error else None
+    wanted = None if scope is None else set(scope)
+    tables = [t for t in inventory.tables if wanted is None or t.name in wanted]
+    return cdc_capture_exclusions(migration_state, inventory, tables)
+
+
+def capture_pre_load_notices(migration_state, job_manager, inventory) -> list[str]:
+    """Non-blocking CDC capture warnings for the Full Load screen's exclusion card.
+
+    Full load + CDC before any load: the generated columns alone exceed the capture limit
+    (Deploy will refuse; the true remedy is to capture fewer tables, still possible now),
+    and names Debezium cannot tell apart from another captured column.
+    """
+    if (
+        migration_state.migration_type is not MigrationType.FULL_LOAD_AND_CDC
+        or getattr(migration_state, "job_id", None) is not None
+    ):
+        return []
+    capture = _pre_load_capture(migration_state, inventory)
+    if capture is None:
+        return []
+    notes: list[str] = []
+    if capture.error and capture.generated_bytes > CDC_PARAMETER_BYTE_LIMIT:
+        notes.append(capture_error_with_remedy(migration_state, job_manager, capture))
+    ambiguity = capture_ambiguity_warning(capture)
+    if ambiguity:
+        notes.append(ambiguity)
+    return notes
 
 
 def full_load_run_guard_reason(
@@ -3313,10 +3357,17 @@ def _render_cdc_existing_infra_banner(
                 "straight to monitoring in the CDC step."
             ),
         )
-        # The SAME attach row as the CDC step (gated on the saved column exclusions).
+        # The SAME attach row as the CDC step (gated on the saved column exclusions). The
+        # exclusion card is BELOW this banner for a type with a Full Load, and inside the
+        # CDC sub-step for CDC only -- say so, not "above".
         _render_cdc_attach_row(
             ui, migration_state, job_manager, refresh, in_scope,
             inventory=inventory, session=session,
+            where=(
+                "in 'Oversized LOB columns' on the CDC step"
+                if migration_state.migration_type is MigrationType.CDC_ONLY
+                else "in 'Oversized LOB columns' below"
+            ),
         )
 
 
@@ -4727,6 +4778,7 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     lob_exclusion_lock,
     exclusion_lock_state,
     exclusion_after_lock_note,
+    capture_error_with_remedy,
     cdc_stack_being_deleted,
     cdc_delete_eta,
     _render_cdc_manual_inputs,

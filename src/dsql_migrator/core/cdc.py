@@ -1615,13 +1615,19 @@ def _cdc_entry(parts: "Sequence[str]") -> str:
     return _cdc_escape_edges("\\.".join(_cdc_escape_part(p) for p in parts))
 
 
+def _cdc_ascii_fold(text: str) -> str:
+    """Case-fold the way Debezium's pattern does: ``CASE_INSENSITIVE`` without
+    ``UNICODE_CASE`` folds ASCII only (verified on 2.7.4: ``É`` does not match ``é``)."""
+    return "".join(chr(ord(ch) + 32) if "A" <= ch <= "Z" else ch for ch in text)
+
+
 def _cdc_case_collisions(captured: "Sequence[TableDef]") -> "dict[str, set[str]]":
-    """``lower(db.table.column)`` -> the captured names spelled that way ignoring case."""
+    """``fold(db.table.column)`` -> the captured names spelled that way ignoring case."""
     seen: dict[str, set[str]] = {}
     for table in captured:
         for column in table.columns:
             qualified = f"{table.name}.{column.name}"
-            seen.setdefault(qualified.lower(), set()).add(qualified)
+            seen.setdefault(_cdc_ascii_fold(qualified), set()).add(qualified)
     return seen
 
 
@@ -1635,11 +1641,14 @@ def _cdc_needs_case(qualified: str, collisions: "Mapping[str, set[str]]") -> boo
     exclusion on a deselected table). ``(?-i)`` on an exact name can only narrow the match
     to that one column; every other entry stays byte-identical.
     """
-    return bool(collisions.get(qualified.lower(), set()) - {qualified})
+    return bool(collisions.get(_cdc_ascii_fold(qualified), set()) - {qualified})
 
 
 def split_column_exclude_value(value: str) -> list[str]:
-    """Split a ColumnExcludeList value into entries, honouring ``\\,`` (an escaped comma)."""
+    """Split a ColumnExcludeList value into entries, honouring ``\\,`` (an escaped comma).
+
+    Exact inverse of ``",".join``: ``",".join(split_column_exclude_value(v)) == v``.
+    """
     entries: list[str] = []
     buf: list[str] = []
     i = 0
@@ -1656,7 +1665,9 @@ def split_column_exclude_value(value: str) -> list[str]:
             buf.append(ch)
         i += 1
     entries.append("".join(buf))
-    return [e for e in entries if e]
+    # Empty entries are KEPT (a legacy value for a name ending in ',' has one), so
+    # ",".join(split(v)) == v for every value -- the preview equals what is sent.
+    return entries if value else []
 
 
 def format_column_exclude_value(
@@ -1748,6 +1759,33 @@ def column_exclude_inexact_entries(
             ):
                 inexact.append(qualified)
     return inexact
+
+
+def column_exclude_ambiguous_entries(
+    columns: "Mapping[str, Sequence[str]]",
+    captured: "Sequence[TableDef]" = (),
+) -> "dict[str, list[str]]":
+    """Excluded names Debezium cannot tell apart from ANOTHER captured column.
+
+    Debezium matches each entry against ``db.table.column`` joined with '.', so
+    ``shop.t`` + ``a.b`` and ``shop.t.a`` + ``b`` are the SAME string and every entry that
+    drops one drops the other -- verified on 2.7.4. Names that differ in any letter's case
+    are separated by ``(?-i)``, so only an exactly equal joined string is ambiguous. No
+    escaping can separate those; the caller warns. ``{excluded: [also dropped, ...]}``.
+    """
+    joined: dict[str, set[tuple[str, str]]] = {}
+    for table in captured:
+        for column in table.columns:
+            joined.setdefault(f"{table.name}.{column.name}", set()).add(
+                (table.name, column.name)
+            )
+    out: dict[str, list[str]] = {}
+    for table in sorted(columns):
+        for column in sorted(columns[table]):
+            others = joined.get(f"{table}.{column}", set()) - {(table, column)}
+            if others:
+                out[f"{table}.{column}"] = sorted(f"{t} / {c}" for t, c in others)
+    return out
 
 
 def _parse_message_key_columns(value: str) -> "dict[str, list[str]]":

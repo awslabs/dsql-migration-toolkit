@@ -124,7 +124,10 @@ def _ddl_key_facts(ddl: str) -> "tuple[tuple[str, ...], frozenset[str]]":
         parse_target_primary_key,
     )
 
-    return tuple(parse_target_primary_key(ddl)), frozenset(parse_target_generated_columns(ddl))
+    return (
+        tuple(parse_target_primary_key(ddl, for_exclusion=True)),
+        frozenset(parse_target_generated_columns(ddl)),
+    )
 
 
 # The FK pass applies each ``conv.foreign_key_ddls`` statement (an ``ALTER TABLE ... ADD
@@ -134,9 +137,12 @@ def _ddl_key_facts(ddl: str) -> "tuple[tuple[str, ...], frozenset[str]]":
 _FK_NAME_RE = re.compile(
     r'ADD\s+CONSTRAINT\s+("(?:[^"]|"")+"|[^\s("]+)\s+FOREIGN\s+KEY', re.IGNORECASE
 )
-_IDENT = r'"(?:[^"]|"")+"|[^\s(".,]+'
+_IDENT = r'"(?:[^"]|"")+"|[^\s(".,)]+'
+# The column list is matched identifier by identifier, so a quoted name containing ')'
+# (e.g. "code)x") is not cut short.
 _FK_REFERENCES_RE = re.compile(
-    rf"REFERENCES\s+((?:{_IDENT})(?:\s*\.\s*(?:{_IDENT}))?)\s*\(([^)]*)\)",
+    rf"REFERENCES\s+((?:{_IDENT})(?:\s*\.\s*(?:{_IDENT}))?)"
+    rf"\s*\(\s*((?:{_IDENT})(?:\s*,\s*(?:{_IDENT}))*)\s*\)",
     re.IGNORECASE,
 )
 

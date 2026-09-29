@@ -2540,10 +2540,42 @@ def exclusion_after_lock_note(migration_state, job_manager) -> str:
             "The CDC infrastructure is being created with this set; to change it, wait "
             "for it to finish, then delete it on the CDC step."
         )
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    if getattr(migration_state, "migration_type", None) is MigrationType.FULL_LOAD_ONLY:
+        return (
+            "The CDC infrastructure was deployed with this set; to change it, switch the "
+            "migration type to Full load + CDC and delete the CDC infrastructure on its "
+            "CDC step first (Full load only has no CDC step)."
+        )
     return (
         "The CDC infrastructure was deployed with this set; to change it, delete the CDC "
         "infrastructure on the CDC step first."
     )
+
+
+def capture_error_with_remedy(migration_state, job_manager, capture) -> str:
+    """A capture-size refusal plus the remedy that is TRUE for its cause and the state.
+
+    If the generated columns Aurora DSQL computes -- added automatically, never the
+    operator's choice -- alone exceed the limit, fewer exclusions cannot fix it: capture
+    fewer tables per CDC pipeline, or use Full load only. Otherwise, while the exclusion
+    card is editable: exclude fewer columns there; once it is locked, the lock's own
+    cause-and-remedy text.
+    """
+    from dsql_migrator.core.cdc import CDC_PARAMETER_BYTE_LIMIT
+    from dsql_migrator.ui.data_migration._models import CAPTURE_SIZE_REMEDY_UNLOCKED
+
+    if capture.generated_bytes > CDC_PARAMETER_BYTE_LIMIT:
+        return (
+            f"{capture.error} The generated columns Aurora DSQL computes -- which CDC "
+            f"must not stream -- alone need {capture.generated_bytes:,} bytes, so "
+            "excluding fewer columns cannot fix it: capture fewer tables in this CDC "
+            "pipeline (deselect tables in the table picker; once a Full Load has run that "
+            "needs Start over), or use Full load only."
+        )
+    lock = exclusion_lock_state(migration_state, job_manager)
+    return f"{capture.error} {lock.reason if lock.locked else CAPTURE_SIZE_REMEDY_UNLOCKED}"
 
 
 @dataclass(frozen=True)
@@ -2817,7 +2849,7 @@ def exclude_and_reload_block_reason(migration_state, job_manager) -> "Optional[s
             f"{first} Its connectors already committed offsets using the current "
             "excluded-column set, so changing it now would make the rows already streamed "
             "inconsistent with everything after. Once no CDC infrastructure is deployed, "
-            "this action is offered again on the CDC step."
+            "this action is available again."
         )
     if cdc_infra_deploy_in_flight(migration_state, job_manager):
         return (
@@ -2828,7 +2860,7 @@ def exclude_and_reload_block_reason(migration_state, job_manager) -> "Optional[s
         return (
             "The CDC infrastructure is deployed and its capture configuration already "
             "carries the current excluded columns. Delete the CDC infrastructure first, "
-            "or Full Load would skip a column CDC keeps capturing; this action is offered "
+            "or Full Load would skip a column CDC keeps capturing; this action is available "
             "again once it is gone."
         )
     return None
@@ -2943,6 +2975,7 @@ def _render_cdc_lob_exclusion_panel(
     source_type: SourceType = SourceType.MYSQL,
     capture_preview: Optional[str] = None,
     after_lock_note: str = "The data already moved under this set, so it is left as it is.",
+    capture_notices: "Sequence[str]" = (),
 ) -> None:
     """Render the explicit, opt-in oversized-LOB column exclusion (H13).
 
@@ -2977,6 +3010,13 @@ def _render_cdc_lob_exclusion_panel(
         stored_selection=migration_state.selection.selected_tables,
     )
     selection = migration_state.lob_exclusions()
+    # CDC capture facts the operator should know before the load (not blocking): the
+    # generated columns alone exceed the capture limit, or two captured columns share a
+    # name Debezium cannot tell apart. Computed by the caller with the builders' helper.
+    for _notice in capture_notices:
+        render_notice(
+            ui, tone="warning", header="CDC capture needs attention", body=_notice
+        )
     # Saved entries the exclusion rule rejects, judged with THIS card's lock: while it is
     # unlocked they block the gated buttons, and this is where they are removed -- above
     # the "no candidates" return, since an entry for a key column or a dropped column is

@@ -95,6 +95,7 @@ from dsql_migrator.ui.data_migration._models import (
     missing_column_block_reason,
     cdc_capture_exclusions,
     CAPTURE_SIZE_REMEDY_UNLOCKED,
+    capture_ambiguity_warning,
     stored_exclusion_block_reason,
     stored_exclusion_issues,
     format_column_exclude_list,
@@ -2283,7 +2284,7 @@ def _render_cdc_start_button(
         _cdc_tables_for_config(migration_state, inventory, watermark),
     )
     _capture_error = (
-        _capture_error_with_remedy(migration_state, job_manager, _capture.error)
+        capture_error_with_remedy(migration_state, job_manager, _capture)
         if _capture.error
         else None
     )
@@ -2294,6 +2295,9 @@ def _render_cdc_start_button(
             header="The excluded columns cannot be sent to CDC",
             body=_capture_error,
         )
+    _ambiguity = capture_ambiguity_warning(_capture)
+    if _ambiguity:
+        render_notice(ui, tone="warning", header="CDC capture needs attention", body=_ambiguity)
     if _capture.inexact:
         _names = ", ".join(_capture.inexact[:5]) + (
             f" and {len(_capture.inexact) - 5} more" if len(_capture.inexact) > 5 else ""
@@ -2532,19 +2536,30 @@ def _render_cdc_infra_prep_section(
 
 
 def _render_cdc_attach_row(
-    ui, migration_state, job_manager, refresh, in_scope, *, inventory=None, session=None
+    ui,
+    migration_state,
+    job_manager,
+    refresh,
+    in_scope,
+    *,
+    inventory=None,
+    session=None,
+    where: str = "in 'Oversized LOB columns' above",
 ) -> None:
     """The "Attach to <stack>" buttons -- ONE implementation for every surface offering them.
 
     Attaching locks the exclusion card (the stack now holds the capture list), so a saved
     exclusion that no longer applies must be removed FIRST: same gate as Deploy, shown on
     the disabled button and re-checked at click time in case the state moved since this
-    render. The capture-size check is NOT applied here: the adopted stack's own deployed
-    value decides what Start sends (the chooser), and Start judges it then. The plan-level
-    banner and the CDC step's adopt panel both call this, so they cannot drift apart.
+    render. Neither the capture-size nor the 42703 check applies here: attaching moves no
+    data and changes no DDL, and the adopted stack's own deployed value decides what Start
+    sends (the chooser). ``where`` names where the card with the Remove is from THIS
+    surface. The plan-level banner and the CDC step's adopt panel both call this, so they
+    cannot drift apart.
     """
     _attach_block = _stored_exclusion_deploy_block(
-        migration_state, job_manager, inventory, session, include_capture=False
+        migration_state, job_manager, inventory, session,
+        include_capture=False, include_missing=False, where=where,
     )
     if _attach_block:
         render_notice(
@@ -2558,7 +2573,7 @@ def _render_cdc_attach_row(
             def _adopt(_name=name) -> None:
                 _now = _stored_exclusion_deploy_block(
                     migration_state, job_manager, inventory, session,
-                    include_capture=False,
+                    include_capture=False, include_missing=False, where=where,
                 )
                 if _now:
                     ui.notify(_now, type="warning", position="top")
@@ -2805,19 +2820,27 @@ def _render_cdc_infra_deploy_action(
         return
     # A saved column exclusion that no longer applies would be baked into the stack's
     # ColumnExcludeList and lock the card, so this is its last chance to be removed.
-    _exclusion_block = _stored_exclusion_deploy_block(
+    _exclusion_notice = _deploy_block_notice(
         migration_state, job_manager, inventory, session
     )
-    if _exclusion_block:
+    if _exclusion_notice:
         deploy_btn.props("disable")
-        deploy_btn.tooltip(_exclusion_block)
+        deploy_btn.tooltip(_exclusion_notice[1])
         render_notice(
-            ui,
-            tone="error",
-            header="Remove the saved column exclusions that no longer apply",
-            body=_exclusion_block,
+            ui, tone="error", header=_exclusion_notice[0], body=_exclusion_notice[1]
         )
         return
+    # Not blocking: excluded names Debezium cannot tell apart from another column.
+    _job_now = _current_job(job_manager, getattr(migration_state, "job_id", None))
+    _ambiguity = capture_ambiguity_warning(
+        cdc_capture_exclusions(
+            migration_state,
+            inventory,
+            _cdc_tables_for_config(migration_state, inventory, _cdc_watermark(_job_now)),
+        )
+    )
+    if _ambiguity:
+        render_notice(ui, tone="warning", header="CDC capture needs attention", body=_ambiguity)
 
     # VpcId is the one input the operator may still have to CHOOSE (subnets/NAT, the plugin
     # bucket, the DSQL cluster ARN, the source host and its secret are all resolved at deploy
@@ -2838,50 +2861,68 @@ def _render_cdc_infra_deploy_action(
     _gate["hint"] = inline_hint(ui, "", tone="info")
     _sync_gate()
 
-def _capture_error_with_remedy(migration_state, job_manager, error: str) -> str:
-    """A capture-size refusal plus the remedy that is TRUE in the current state.
-
-    While the exclusion card is editable: exclude fewer columns there. Once it is locked
-    (a Full Load committed data, or a stack holds the set) that remedy is impossible, so
-    the lock's own cause-and-remedy text is appended instead.
-    """
-    lock = exclusion_lock_state(migration_state, job_manager)
-    return f"{error} {lock.reason if lock.locked else CAPTURE_SIZE_REMEDY_UNLOCKED}"
-
-
-def _stored_exclusion_deploy_block(
-    migration_state, job_manager, inventory, session, *, include_capture: bool = True
+def _deploy_block_notice(
+    migration_state,
+    job_manager,
+    inventory,
+    session,
+    *,
+    include_capture: bool = True,
+    include_missing: bool = True,
+    where: str = "in 'Oversized LOB columns' above",
 ):
-    """The column-exclusion gate for Deploy CDC infrastructure AND Attach, or ``None``.
+    """``(header, body)`` of what holds Deploy CDC infrastructure (or Attach), or ``None``.
 
-    Judged with the LOB card's own lock (``exclusion_card_locked``, the one definition the
-    card and every gate share) over the tables the last render resolved
-    (``exclusion_scope``), so an ERROR here always has an unlocked card -- rendered above
-    this button on either screen -- offering its Remove. Attach needs it as much as Deploy:
-    attaching to an existing stack locks the card, so it is the last point at which a saved
-    exclusion that no longer applies can still be removed. Start CDC carries no such gate:
-    it is offered only once a stack exists, where the card is locked.
+    In order, each with its own header:
 
-    It also holds on a source column the target certainly lacks (the sink would
-    dead-letter every change to it, 42703) -- not tied to the lock, because its remedy is
-    Schema Conversion -- and, unless ``include_capture`` is False, when the capture
-    exclusions exceed CloudFormation's parameter limit (with the remedy true in the state).
+    * a saved exclusion that no longer applies -- judged with the LOB card's own lock
+      (``exclusion_card_locked``) over the resolved tables, so an ERROR here always has an
+      unlocked card offering its Remove (``where`` says where that card is from the button:
+      above it on the CDC step, below the plan-level banner, on the CDC step for CDC only);
+    * unless ``include_missing`` is False, a source column the target certainly lacks
+      (42703) -- not tied to the lock, its remedy is Schema Conversion;
+    * unless ``include_capture`` is False, capture exclusions over CloudFormation's
+      parameter limit, with the remedy true for the cause and the state.
+
+    Attach passes ``include_missing=False, include_capture=False``: attaching moves no data
+    and changes no DDL; it only locks the card, so only the saved-entry check applies.
+    Start CDC carries no saved-entry gate: it is offered only once a stack exists, where
+    the card is locked.
     """
     from dsql_migrator.ui.data_migration import exclusion_card_locked
 
     locked = exclusion_card_locked(migration_state, job_manager, session)
-    blocked = stored_exclusion_block_reason(
-        stored_exclusion_issues(migration_state, inventory, committed=locked)
-    ) or missing_column_block_reason(migration_state, inventory, job_manager=job_manager)
-    if blocked or not include_capture:
-        return blocked
+    stored = stored_exclusion_block_reason(
+        stored_exclusion_issues(migration_state, inventory, committed=locked), where=where
+    )
+    if stored:
+        return "Remove the saved column exclusions that no longer apply", stored
+    if include_missing:
+        missing = missing_column_block_reason(
+            migration_state, inventory, job_manager=job_manager
+        )
+        if missing:
+            return "A source column is missing from the Aurora DSQL table", missing
+    if not include_capture:
+        return None
     _job = _current_job(job_manager, getattr(migration_state, "job_id", None))
-    _error = cdc_capture_exclusions(
+    capture = cdc_capture_exclusions(
         migration_state,
         inventory,
         _cdc_tables_for_config(migration_state, inventory, _cdc_watermark(_job)),
-    ).error
-    return _capture_error_with_remedy(migration_state, job_manager, _error) if _error else None
+    )
+    if capture.error:
+        return (
+            "The excluded columns do not fit the CDC capture configuration",
+            capture_error_with_remedy(migration_state, job_manager, capture),
+        )
+    return None
+
+
+def _stored_exclusion_deploy_block(migration_state, job_manager, inventory, session, **kwargs):
+    """The body of :func:`_deploy_block_notice`, or ``None`` (the text-only form)."""
+    notice = _deploy_block_notice(migration_state, job_manager, inventory, session, **kwargs)
+    return None if notice is None else notice[1]
 
 
 def _render_cdc_least_privilege_note(ui, *, session=None) -> None:
@@ -4863,7 +4904,7 @@ def _start_cdc_deploy(
             ui,
             tone="error",
             header="The excluded columns cannot be sent to CDC",
-            body=_capture_error_with_remedy(migration_state, job_manager, _capture.error),
+            body=capture_error_with_remedy(migration_state, job_manager, _capture),
         )
         return
     # Judged on the STRUCTURED set: the formatted entries are escaped / case-flagged /
@@ -5419,7 +5460,7 @@ async def _start_cdc_infra_deploy(
     exclude_list = split_column_exclude_value(_capture.value) or None
     if _capture.error:
         ui.notify(
-            _capture_error_with_remedy(migration_state, job_manager, _capture.error),
+            capture_error_with_remedy(migration_state, job_manager, _capture),
             type="negative",
             position="top",
         )
@@ -5984,6 +6025,7 @@ from dsql_migrator.ui.data_migration._cdc_monitoring import (  # noqa: E402,F401
     exclude_and_reload_block_reason,
     exclusion_lock_state,
     exclusion_after_lock_note,
+    capture_error_with_remedy,
     cdc_stack_being_deleted,
     cdc_delete_eta,
     _render_cdc_oversized_recovery_without_monitoring,

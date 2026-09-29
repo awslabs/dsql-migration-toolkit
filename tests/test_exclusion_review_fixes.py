@@ -128,8 +128,11 @@ def test_a_capture_list_over_4_kib_holds_the_load_while_it_can_still_be_fixed():
 def test_once_locked_the_capture_refusal_names_the_lock_remedy_not_exclude_fewer():
     from dsql_migrator.ui.data_migration._cdc_ui import _stored_exclusion_deploy_block
 
+    from dsql_migrator.core.table_selection import TableSelection
+
     inv, entries = _wide()
     state = _state(entries=entries, job_id="job-1")
+    state.set_selection(TableSelection(selected_tables=[t.name for t in inv.tables]))
     block = _stored_exclusion_deploy_block(state, _StubJobManager({"job-1": _StubJob("COMPLETED")}), inv, None)
     assert "4,096-byte" in block and "Start over" in block and "Exclude fewer" not in block
     # Attach does not judge capture size (the adopted stack's value decides at Start).
@@ -338,3 +341,168 @@ def test_the_after_lock_note_matches_the_cause():
     deployed = _state()
     deployed.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
     assert "delete the CDC infrastructure on the CDC step first" in exclusion_after_lock_note(deployed, jm)
+
+
+# ---------------------------------------------------------------------------
+# Round 3 (verification of the review fixes)
+# ---------------------------------------------------------------------------
+
+
+def _pg_gen_tables(n=100):
+    return SourceInventory(tables=[TableDef(
+        name=f"public.customer_order_line_{i:04d}", primary_key=["id"],
+        columns=[ColumnDef(name="id", mysql_type="integer"), ColumnDef(name="amount", mysql_type="numeric"),
+                 ColumnDef(name=f"amount_with_tax_{i:04d}", mysql_type="numeric", generated=True,
+                           generated_kind="STORED", generated_expression="(amount * 1.1)")])
+        for i in range(n)])
+
+
+def test_generated_columns_alone_over_the_limit_do_not_hold_the_load_and_say_why():
+    from dsql_migrator.ui.data_migration import capture_pre_load_notices, data_migration_exclusion_block
+    from dsql_migrator.ui.data_migration._cdc_ui import _deploy_block_notice
+
+    inv = _pg_gen_tables()
+    state = _state()  # Full load + CDC, NO saved exclusions
+    # 0.1.561 let this load run; no exclusion change could fix it -> no hold ...
+    assert data_migration_exclusion_block(state, _StubJobManager({}), None, inv) is None
+    # ... but the card warns before the load, with a remedy that can be followed.
+    (note,) = capture_pre_load_notices(state, _StubJobManager({}), inv)
+    assert "generated columns Aurora DSQL computes" in note and "capture fewer tables" in note
+    assert "Exclude fewer" not in note
+    from dsql_migrator.core.table_selection import TableSelection
+
+    state.set_selection(TableSelection(selected_tables=[t.name for t in inv.tables]))
+    header, body = _deploy_block_notice(state, _StubJobManager({}), inv, None)
+    assert header == "The excluded columns do not fit the CDC capture configuration"
+    assert "capture fewer tables" in body and "Exclude fewer" not in body
+
+
+def test_exclusions_on_deselected_tables_are_not_counted_in_the_capture_list():
+    from dsql_migrator.ui.data_migration._models import cdc_capture_exclusions
+
+    inv, entries = _wide()
+    state = _state(entries=entries)
+    captured = inv.tables[:1]
+    cx = cdc_capture_exclusions(state, inv, captured)
+    assert cx.error is None and list(cx.structured) == [captured[0].name]
+    # The legacy (0.1.561) value is untouched: it still carries every stored entry.
+    assert cx.legacy.count(",") == len(entries) - 1
+
+
+def test_a_stack_lock_before_the_load_still_holds_an_oversized_capture_list():
+    """Attaching (or deploying early) locked the card before the load; the load is still
+    the last point to fix the list, with the lock's own remedy."""
+    from dsql_migrator.ui.data_migration import data_migration_exclusion_block
+
+    inv, entries = _wide()
+    state = _state(entries=entries)
+    state.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
+    block = data_migration_exclusion_block(state, _StubJobManager({}), None, inv)
+    assert block and "4,096-byte" in block and "delete the CDC infrastructure" in block
+    assert "Exclude fewer" not in block
+
+
+def test_attach_is_not_held_by_a_missing_column_and_deploy_names_each_reason():
+    from dsql_migrator.ui.data_migration._cdc_ui import _deploy_block_notice, _render_cdc_attach_row
+    from dsql_migrator.ui.data_migration._models import ExclusionInputs
+
+    inv = SourceInventory(tables=[_t("shop.docs", ["id", "body", "note"])])
+    ddl = {"shop.docs": SimpleNamespace(target_ddl='CREATE TABLE "shop"."docs" ("id" INT PRIMARY KEY, "body" TEXT)',
+                                        foreign_key_ddls=[], preserved_foreign_keys=[])}
+    state = _state(MigrationType.CDC_ONLY)
+    state.set_exclusion_inputs_resolver(lambda: ExclusionInputs(["shop.docs"], ddl, True, None))
+    ui = _RecordingUi()
+    _render_cdc_attach_row(ui, state, _StubJobManager({}), lambda: None, [("dsql-cdc-old", "UPDATE_COMPLETE")],
+                           inventory=inv)
+    (attach,) = [b for b in ui.buttons if b.text == "Attach to dsql-cdc-old"]
+    assert "disable" not in attach.props_seen
+    header, body = _deploy_block_notice(state, _StubJobManager({}), inv, None)
+    assert header == "A source column is missing from the Aurora DSQL table"
+    assert "CDC would dead-letter every change to it" in body and "the load would fail" not in body
+
+
+def test_the_banner_attach_gate_points_where_the_card_really_is():
+    from dsql_migrator.ui.data_migration import _render_cdc_existing_infra_banner
+
+    inv = SourceInventory(tables=[_t("shop.docs", ["id", "body"])])
+    for mtype, where in ((MigrationType.CDC_ONLY, "on the CDC step"), (MigrationType.FULL_LOAD_AND_CDC, "below")):
+        state = _state(mtype, entries=[("shop.docs", "id")])
+        state.set_cdc_other_stacks([("dsql-cdc-old", "CREATE_COMPLETE")])
+        ui = _RecordingUi()
+        _render_cdc_existing_infra_banner(ui, state, lambda: None, job_manager=_StubJobManager({}),
+                                          inventory=inv, session=None)
+        joined = " ".join(ui.texts)
+        assert f"in 'Oversized LOB columns' {where} first" in joined and "above first" not in joined, mtype
+
+
+def test_full_load_only_after_lock_note_names_the_type_switch():
+    only = _state(MigrationType.FULL_LOAD_ONLY)
+    only.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
+    note = exclusion_after_lock_note(only, _StubJobManager({}))
+    assert "switch the migration type to Full load + CDC" in note
+
+
+def test_the_reload_tooltip_does_not_send_the_full_load_route_to_the_cdc_step():
+    from dsql_migrator.ui.data_migration._cdc_monitoring import exclude_and_reload_block_reason
+
+    state = _state()
+    state.set_cdc_stack_phase("running", status="UPDATE_COMPLETE")
+    reason = exclude_and_reload_block_reason(state, _StubJobManager({}))
+    assert "this action is available again" in reason and "on the CDC step." not in reason
+
+
+def test_preview_equals_sent_for_a_legacy_value_with_an_empty_entry():
+    from dsql_migrator.core.cdc import split_column_exclude_value
+
+    for value in ("shop.t.a,,shop.t.b", r"shop\.t\.a\,b,shop.t.c", "", "shop.t.a"):
+        assert ",".join(split_column_exclude_value(value)) == value, value
+
+
+def test_non_ascii_letters_are_not_case_twins_for_debezium():
+    from dsql_migrator.core.cdc import column_exclude_inexact_entries, format_column_exclude_value
+
+    captured = [TableDef(name="shop.t", primary_key=[], columns=[ColumnDef(name=c, mysql_type="text")
+                                                                 for c in ("É", "é", "k", "K")])]
+    assert format_column_exclude_value({"shop.t": ["É"]}, captured) == "shop.t.É"
+    assert column_exclude_inexact_entries({"shop.t": ["É"]}, captured) == []
+    assert format_column_exclude_value({"shop.t": ["k"]}, captured) == "(?-i)shop.t.k"  # ASCII twin
+
+
+def test_names_debezium_cannot_separate_are_warned_about():
+    from dsql_migrator.ui.data_migration._models import capture_ambiguity_warning, cdc_capture_exclusions
+
+    inv = SourceInventory(tables=[TableDef(name="shop.t", primary_key=["id"], columns=[
+        ColumnDef(name="id", mysql_type="int"), ColumnDef(name="a.b", mysql_type="text")]),
+        TableDef(name="shop.t.a", primary_key=["id"], columns=[
+            ColumnDef(name="id", mysql_type="int"), ColumnDef(name="b", mysql_type="text")])])
+    state = _state(entries=[("shop.t", "a.b")])
+    warning = capture_ambiguity_warning(cdc_capture_exclusions(state, inv, inv.tables))
+    assert warning and "shop.t.a.b (also drops shop.t.a / b)" in warning
+    assert capture_ambiguity_warning(cdc_capture_exclusions(_state(), inv, inv.tables)) is None
+
+
+def test_a_quoted_referenced_column_with_a_paren_still_blocks_b3():
+    from dsql_migrator.core.column_exclusion import B3, build_exclusion_context, column_exclusion_verdict
+    from dsql_migrator.core.models import ForeignKeyDef
+
+    parent = TableDef(name="shop.parent", primary_key=["id"], columns=[
+        ColumnDef(name="id", mysql_type="int"), ColumnDef(name="code)x", mysql_type="text")])
+    child = TableDef(name="shop.child", primary_key=["id"], columns=[
+        ColumnDef(name="id", mysql_type="int"), ColumnDef(name="pc", mysql_type="text")],
+        foreign_keys=[ForeignKeyDef(name="fk_c", columns=["pc"], referenced_table="shop.parent",
+                                    referenced_columns=["code)x"])])
+    ddl = 'ALTER TABLE "shop"."child" ADD CONSTRAINT "fk_c" FOREIGN KEY ("pc") REFERENCES "shop"."parent" ("code)x") NOT VALID'
+    ctx = build_exclusion_context(SourceInventory(tables=[parent, child]), {"shop.child": SimpleNamespace(
+        target_ddl="CREATE TABLE x (id INT)", foreign_key_ddls=[ddl], preserved_foreign_keys=[])})
+    assert {f.code for f in column_exclusion_verdict("shop.parent", "code)x", ctx).findings} == {B3}
+
+
+def test_a_named_pk_does_not_change_the_cdc_rekey_of_a_deployed_pipeline():
+    from dsql_migrator.core.cdc import composite_key_columns_for_cdc
+
+    orders = TableDef(name="shop.orders", primary_key=["id"], columns=[
+        ColumnDef(name="tenant_id", mysql_type="bigint"), ColumnDef(name="id", mysql_type="bigint")])
+    applied = {"shop.orders": SimpleNamespace(target_ddl=(
+        'CREATE TABLE "shop"."orders" ("tenant_id" BIGINT NOT NULL, "id" BIGINT NOT NULL, '
+        'CONSTRAINT orders_pk PRIMARY KEY ("tenant_id", "id"))'))}
+    assert composite_key_columns_for_cdc([orders], applied) == {}  # as 0.1.561

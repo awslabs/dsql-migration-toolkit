@@ -954,6 +954,16 @@ def parse_target_column_names(create_ddl: str) -> "Optional[frozenset[str]]":
     return frozenset(names) if names else None
 
 
+def _folded_name(node) -> str:
+    """An identifier node's name as PostgreSQL stores it (quoted as written, else folded)."""
+    name = getattr(node, "name", "") or ""
+    quoted = isinstance(node, exp.Identifier) and bool(getattr(node, "quoted", False))
+    if isinstance(node, exp.Column):
+        ident = node.this
+        quoted = isinstance(ident, exp.Identifier) and bool(ident.quoted)
+    return name if quoted else fold_identifier(name)
+
+
 def fold_identifier(name: str) -> str:
     """Fold an UNQUOTED identifier the way PostgreSQL does: ASCII A-Z only.
 
@@ -1027,7 +1037,7 @@ def parse_target_generated_columns(create_ddl: str) -> set[str]:
 _GENERATED_CLAUSE_RE = re.compile(r"\s*GENERATED\s+ALWAYS\s+AS\s*\(", re.IGNORECASE)
 
 
-def parse_target_primary_key(create_ddl: str) -> list[str]:
+def parse_target_primary_key(create_ddl: str, *, for_exclusion: bool = False) -> list[str]:
     """Return the PRIMARY KEY column names (in key order) from a CREATE TABLE DDL.
 
     Parses an applied/edited DSQL (PostgreSQL) ``CREATE TABLE`` and extracts the
@@ -1042,6 +1052,12 @@ def parse_target_primary_key(create_ddl: str) -> list[str]:
     must NOT silently substitute the source PK for a table the user opted into a
     changed (composite) key; it should require the target PK explicitly and fail
     loudly on disagreement (see the Full Load engine wiring).
+
+    ``for_exclusion`` (the column-exclusion rule only) also reads a NAMED
+    ``CONSTRAINT x PRIMARY KEY (...)`` and folds unquoted names as PostgreSQL does, so B2
+    protects the real key columns of an edited DDL. The default -- the loader, the CDC
+    re-key -- is byte-identical to 0.1.561: recognising a named key there would change a
+    deployed pipeline's MessageKeyColumns and turn a same-key edit into a "changed key".
     """
     try:
         # Same identity-clause strip as the sibling parsers: without it a table
@@ -1064,18 +1080,24 @@ def parse_target_primary_key(create_ddl: str) -> list[str]:
                 [e]
                 if isinstance(e, exp.PrimaryKey)
                 else [x for x in e.expressions if isinstance(x, exp.PrimaryKey)]
-                if isinstance(e, exp.Constraint)
+                if for_exclusion and isinstance(e, exp.Constraint)
                 else []
             )
             for key in keys:
-                cols = [c.name for c in key.expressions if c.name]
+                cols = [
+                    _folded_name(c) if for_exclusion else c.name
+                    for c in key.expressions
+                    if c.name
+                ]
                 if cols:
                     return cols
     # Inline: col <type> PRIMARY KEY (single-column key on a ColumnDef).
     for column_def in parsed.find_all(exp.ColumnDef):
         for _ in column_def.find_all(exp.PrimaryKeyColumnConstraint):
             if column_def.name:
-                return [column_def.name]
+                return [
+                    _folded_name(column_def.this) if for_exclusion else column_def.name
+                ]
     return []
 
 
