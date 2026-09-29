@@ -1840,7 +1840,11 @@ class ValidationState:
         # its outcome. Session-only, never snapshotted (a claim about the live target).
         self._cutover_defaults: "Optional[CutoverDefaultsSnapshot]" = None
         self._cutover_defaults_generation: int = 0
-        self._cutover_defaults_filling: bool = False
+        # The generation a running fill is for (None: none runs) and when it started: a
+        # fill for an older generation never blocks a new one, and a claim older than
+        # the watchdog bound is re-taken (a hung read never pins "checking").
+        self._cutover_defaults_filling_gen: Optional[int] = None
+        self._cutover_defaults_fill_started: float = 0.0
         self._cutover_default_restore_job_id: Optional[str] = None
         self._cutover_default_restore_outcome: "Optional[CutoverRestoreOutcome]" = None
 
@@ -1900,17 +1904,36 @@ class ValidationState:
         with self._lock:
             return self._cutover_defaults
 
+    def _filling_locked(self, now_monotonic: float) -> bool:
+        from dsql_migrator.ui.cutover_defaults import CUTOVER_DEFAULTS_TTL_SECONDS
+
+        return (
+            self._cutover_defaults_filling_gen == self._cutover_defaults_generation
+            and now_monotonic - self._cutover_defaults_fill_started
+            <= 2 * CUTOVER_DEFAULTS_TTL_SECONDS
+        )
+
     @property
     def cutover_defaults_filling(self) -> bool:
-        with self._lock:
-            return self._cutover_defaults_filling
+        """A fill for the CURRENT inputs is running."""
+        import time as _time
 
-    def begin_cutover_defaults_fill(self) -> Optional[int]:
-        """Start a fill (single flight): its generation, or ``None`` while one runs."""
         with self._lock:
-            if self._cutover_defaults_filling:
+            return self._filling_locked(_time.monotonic())
+
+    def begin_cutover_defaults_fill(
+        self, now_monotonic: Optional[float] = None
+    ) -> Optional[int]:
+        """Claim the fill of the current generation (single flight): its generation, or
+        ``None`` while a fill for it runs. Claimed by the fill itself, when it runs."""
+        import time as _time
+
+        now = _time.monotonic() if now_monotonic is None else now_monotonic
+        with self._lock:
+            if self._filling_locked(now):
                 return None
-            self._cutover_defaults_filling = True
+            self._cutover_defaults_filling_gen = self._cutover_defaults_generation
+            self._cutover_defaults_fill_started = now
             return self._cutover_defaults_generation
 
     def finish_cutover_defaults_fill(
@@ -1918,7 +1941,8 @@ class ValidationState:
     ) -> bool:
         """End a fill; store its snapshot only if nothing invalidated it meanwhile."""
         with self._lock:
-            self._cutover_defaults_filling = False
+            if self._cutover_defaults_filling_gen == generation:
+                self._cutover_defaults_filling_gen = None
             if snapshot is None or generation != self._cutover_defaults_generation:
                 return False
             self._cutover_defaults = snapshot
@@ -3543,6 +3567,16 @@ def _log_cutover_restore(outcome: "CutoverRestoreOutcome") -> None:
             detail=outcome.refused,
         )
         return
+    if outcome.skipped:
+        log_activity(
+            ActivityCategory.VALIDATION,
+            "excluded-column DEFAULTs not restored (cut-over)",
+            status=ActivityStatus.WARNING,
+            detail=(
+                f"{len(outcome.skipped)} skipped: their record changed since the status "
+                "was read; check again and retry: " + ", ".join(outcome.skipped)
+            ),
+        )
     if outcome.restored or outcome.already_done or outcome.gone:
         log_activity(
             ActivityCategory.VALIDATION,
@@ -3595,6 +3629,7 @@ def _run_cutover_default_restore(
     settle_probe: "Optional[Callable[[], Optional[str]]]" = None,
     restore: "Optional[Callable[..., Any]]" = None,
     connection_factory: "Optional[Callable[[], Any]]" = None,
+    fill_key_now: "Optional[Callable[[], object]]" = None,
 ) -> None:
     """[Restore DEFAULTs] (``request`` None: the automatic list) or one row's [Restore].
 
@@ -3630,6 +3665,18 @@ def _run_cutover_default_restore(
     target = getattr(session, "target_config", None)
     if snap is None or snap.state != "loaded" or target is None or overlay_ledger is None:
         return _refuse("The DEFAULT status is not loaded; check again.")
+    # The list is only as good as the inputs it was classified with: a DDL edit or an
+    # exclusion change in another tab since then re-classifies it (auto -> manual).
+    if fill_key_now is not None:
+        try:
+            current = fill_key_now()
+        except Exception:  # noqa: BLE001 - unknown inputs: re-read
+            current = object()
+        if current != snap.fill_key:
+            validation_state.invalidate_cutover_defaults()
+            return _refuse(
+                "The DEFAULT status changed since this screen was drawn; check again."
+            )
     if request is None:
         items = list(snap.auto_items) + [i for i in snap.gone_items if i.executable]
         if not snap.auto_items:
@@ -4059,13 +4106,20 @@ def build_cutover_screen(
             return
         if not validation_state.cutover_defaults_stale(key, _time.monotonic()):
             return
-        generation = validation_state.begin_cutover_defaults_fill()
-        if generation is None:
-            return  # a fill is already running
+        if validation_state.cutover_defaults_filling:
+            return  # a fill for these inputs is already running
 
         async def _fill() -> None:
             from nicegui import run
 
+            # Claimed HERE, when the fill runs: a timer deleted before it fires (a
+            # refresh, a reload) then never holds the claim, and every render that
+            # finds the cache stale can arm a replacement.
+            if not validation_state.cutover_defaults_stale(key, _time.monotonic()):
+                return  # an earlier timer's fill already landed
+            generation = validation_state.begin_cutover_defaults_fill()
+            if generation is None:
+                return
             snap = None
             try:
                 snap = await run.io_bound(
@@ -4075,8 +4129,13 @@ def build_cutover_screen(
                 )
             finally:
                 stored = validation_state.finish_cutover_defaults_fill(snap, generation)
-            if stored:
-                refresh()
+            # A result dropped because the inputs moved meanwhile: re-render, so the
+            # render arms a fill for the new inputs (it stores, so this cannot loop).
+            if stored or (snap is not None and validation_state.cutover_defaults is None):
+                try:
+                    refresh()
+                except Exception:  # noqa: BLE001 - the page went away
+                    pass
 
         ui.timer(0.05, _fill, once=True)
 
@@ -4086,8 +4145,11 @@ def build_cutover_screen(
         if overlay_ledger is None or migration_state is None:
             return
         snap = validation_state.cutover_defaults
+        uses_ledger = bool(getattr(migration_state, "overlay_ledger_in_use", False)) or bool(
+            effective_lob_exclusions(migration_state, None)
+        )
         if snap is None or snap.state != "loaded":
-            if snap is None and not getattr(migration_state, "overlay_ledger_in_use", False):
+            if not uses_ledger:
                 return  # the session never used the record: nothing can be owed
             log_activity(
                 ActivityCategory.VALIDATION,
@@ -4392,7 +4454,16 @@ def build_cutover_screen(
             and migration_state is not None
             and getattr(session, "target_config", None) is not None
         )
+        # Only a session that uses the record sees its state (as the Full Load: an
+        # unreadable ledger matters only to a session that uses it). A readable fill
+        # that finds records marks the session, so owed DEFAULTs still surface.
+        _uses_ledger = _defaults_on and (
+            bool(getattr(migration_state, "overlay_ledger_in_use", False))
+            or bool(effective_lob_exclusions(migration_state, None))
+        )
         _defaults = validation_state.cutover_defaults if _defaults_on else None
+        if _defaults is not None and not _uses_ledger and _defaults.state != "loaded":
+            _defaults = None
         _restore_block = cutover_job_block(migration_state, job_manager) if _defaults_on else None
         _restore_running = (
             validation_state.cutover_default_restore_in_flight(job_manager)
@@ -4403,11 +4474,19 @@ def build_cutover_screen(
         # area below, so the one checkbox enables every one of them.
         _drained_gated: list = []
 
+        def _fill_key_now() -> object:
+            return _cutover_fill_key(
+                session, migration_state, validation_state,
+                conversion_store.get(session_id) if conversion_store is not None else None,
+                job_manager,
+            )
+
         def _restore_provider(request: "Optional[tuple[str, str]]" = None) -> None:
             _run_cutover_default_restore(
                 session, validation_state, migration_state, request=request,
                 overlay_ledger=overlay_ledger, job_manager=job_manager, refresh=refresh,
                 notify=ui.notify,  # type: ignore[attr-defined]
+                fill_key_now=_fill_key_now,
             )
 
         def _recheck_defaults() -> None:
@@ -4434,7 +4513,7 @@ def build_cutover_screen(
             on_cdc_drained_change=validation_state.set_cutover_cdc_drained_confirmed,
             inputs_unknown=_gate_inputs_unknown,
             default_restore=_defaults,
-            defaults_checking=_defaults_on and _defaults is None,
+            defaults_checking=_uses_ledger and _defaults is None,
             restore_provider=_restore_provider if _defaults_on else None,
             restore_job_block=_restore_block,
             restore_running=_restore_running,
@@ -4545,16 +4624,25 @@ def build_cutover_screen(
                             else f"{_defaults.unknown} excluded column(s) could not be "
                             "checked on Aurora DSQL"
                         ),
-                        body=(
-                            "Your application's inserts will store NULL there where the "
-                            "source would have used a DEFAULT. "
-                            + (
-                                "Restore them now, or decide on the columns listed under "
-                                "\"Needs your decision\" above."
-                                if _defaults.auto_items
-                                else "Decide on the columns listed under \"Needs your "
+                        body=" ".join(
+                            part
+                            for part in (
+                                "Your application's inserts will store NULL there where "
+                                "the source would have used a DEFAULT."
+                                if _defaults.pending
+                                else "",
+                                "Restore them now." if _defaults.auto_items else "",
+                                "Decide on the columns listed under \"Needs your "
                                 "decision\" above."
+                                if _defaults.manual_items
+                                else "",
+                                f"{_defaults.unknown} column(s) could not be read on Aurora "
+                                "DSQL, so the tool cannot tell whether their DEFAULT is "
+                                "back; use \"Check again\" above before you repoint."
+                                if _defaults.unknown
+                                else "",
                             )
+                            if part
                         ),
                     )
                     if _defaults.auto_items:
@@ -4570,7 +4658,7 @@ def build_cutover_screen(
                         ):
                             _fin_btn.props("disable")
                         _drained_gated.append((_fin_btn, _fin_other))
-                elif _defaults_on and _defaults is None:
+                elif _uses_ledger and _defaults is None:
                     inline_hint(
                         ui,
                         "Checking whether the excluded columns' DEFAULTs are back on "
@@ -6289,6 +6377,7 @@ def _render_cutover_defaults_block(
                     ui.label(  # type: ignore[attr-defined]
                         "Excluded-column DEFAULTs: checking Aurora DSQL"
                     ).classes("text-sm text-gray-700")
+                    _recheck_button()
             return
         if snap.state == "ledger_unreadable":
             _render_check_row(
@@ -6381,6 +6470,17 @@ def _render_cutover_defaults_block(
                             f"{restore_outcome.failed_statements.get(name, '')}"
                             for name, reason in sorted(restore_outcome.failed.items())
                         )
+                    ),
+                )
+            if restore_outcome.skipped:
+                render_notice(
+                    ui,
+                    tone="warning",
+                    header=f"{len(restore_outcome.skipped)} DEFAULT(s) not restored",
+                    body=(
+                        "Their record changed since this screen was drawn (for example a "
+                        "reload recorded them again). Check the list below and restore "
+                        "again: " + ", ".join(restore_outcome.skipped) + "."
                     ),
                 )
             if restore_outcome.ledger_warning:

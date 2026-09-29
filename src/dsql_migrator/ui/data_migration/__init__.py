@@ -1794,7 +1794,12 @@ def build_data_migration_screen(
                 Refused while a CDC pipeline already owns the excluded-column set (see
                 :func:`exclude_and_reload_block_reason`).
                 """
-                blocked = exclude_and_reload_block_reason(migration_state, job_manager)
+                # Every refusal BEFORE anything is written: a cut-over DEFAULT restore
+                # in flight would otherwise leave a recorded exclusion and a pinned
+                # reload with no load submitted.
+                blocked = exclude_and_reload_block_reason(
+                    migration_state, job_manager
+                ) or cutover_restore_block_reason(migration_state)
                 if blocked:
                     ui.notify(blocked, type="warning", position="top")
                     return

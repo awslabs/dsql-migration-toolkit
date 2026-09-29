@@ -766,11 +766,15 @@ def test_the_render_does_no_store_io_and_one_fill_lands_the_cache(monkeypatch):
     s.render()
     (callback,) = s.ui.timers
     assert s.state.cutover_defaults is None
-    s.render()
-    assert s.ui.timers == []  # a fill is already running: none scheduled
+    s.render()  # before the first timer fires: arms another (the claim is in the fill)
+    (late,) = s.ui.timers
     ledger.armed = False  # the fill itself runs off the render
+    reads = []
+    real = ledger.read
+    ledger.read = lambda k: reads.append(k) or real(k)
     s.run(callback)
-    assert s.state.cutover_defaults.state == "loaded" and s.refreshes == [1]
+    s.run(late)  # the fill already landed: no second read
+    assert s.state.cutover_defaults.state == "loaded" and s.refreshes == [1] and len(reads) == 1
     assert s.mstate.overlay_ledger_in_use is True  # a record marks the session
     ledger.armed = True
     s.render()
@@ -807,3 +811,101 @@ def test_a_stale_tab_cannot_apply_foreign_keys_after_a_cdc_start(monkeypatch):
     s.state.set_cutover_cdc_drained_confirmed(True)
     clicks[0]()
     assert s.applied == [1]
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (P2-15/16 adversarial review)
+# ---------------------------------------------------------------------------
+
+
+def test_a_timer_dropped_before_it_fires_never_leaks_the_claim(monkeypatch):
+    ledger = InMemoryOverlayLedger()
+    s = _screen(monkeypatch, ledger=ledger)
+    s.render()
+    assert len(s.ui.timers) == 1  # dropped: a refresh deleted it before it fired
+    s.render()
+    (callback,) = s.ui.timers  # a replacement is armed
+    s.run(callback)
+    assert s.state.cutover_defaults is not None and s.state.cutover_defaults.state == "loaded"
+
+
+def test_an_invalidation_during_a_fill_arms_a_fill_for_the_new_inputs(monkeypatch):
+    state = _vstate()
+    old = state.begin_cutover_defaults_fill()
+    state.invalidate_cutover_defaults()  # e.g. Check again while the read runs
+    assert state.cutover_defaults_filling is False  # the running fill is for old inputs
+    new = state.begin_cutover_defaults_fill()
+    assert new is not None and new != old
+    assert state.finish_cutover_defaults_fill(CutoverDefaultsSnapshot(state="loaded"), old) is False
+    assert state.cutover_defaults_filling is True  # the old fill did not release the new claim
+    assert state.finish_cutover_defaults_fill(CutoverDefaultsSnapshot(state="loaded"), new) is True
+
+
+def test_a_dropped_result_re_renders_so_a_new_fill_is_armed(monkeypatch):
+    ledger = InMemoryOverlayLedger()
+    s = _screen(monkeypatch, ledger=ledger)
+    s.render()
+    (callback,) = s.ui.timers
+    real = ledger.read
+
+    def _read_then_invalidate(key):
+        s.state.invalidate_cutover_defaults()  # the inputs moved during the read
+        return real(key)
+
+    ledger.read = _read_then_invalidate
+    s.run(callback)
+    assert s.state.cutover_defaults is None and s.refreshes == [1]  # re-rendered
+    ledger.read = real
+    s.render()
+    (again,) = s.ui.timers
+    s.run(again)
+    assert s.state.cutover_defaults.state == "loaded"
+
+
+def test_a_hung_fill_claim_is_re_taken_after_the_watchdog_bound():
+    state = _vstate()
+    assert state.begin_cutover_defaults_fill(now_monotonic=100.0) is not None
+    assert state.begin_cutover_defaults_fill(now_monotonic=110.0) is None
+    assert state.begin_cutover_defaults_fill(now_monotonic=100.0 + 2 * cd.CUTOVER_DEFAULTS_TTL_SECONDS + 1) \
+        is not None
+
+
+def test_exclude_and_reload_checks_the_reverse_gate_before_writing_anything():
+    import ast
+    import inspect
+
+    import dsql_migrator.ui.data_migration as dm
+
+    tree = ast.parse(inspect.getsource(dm.build_data_migration_screen))
+    (fn,) = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "exclude_lob_and_reload"]
+    calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
+    gate = min(c.lineno for c in calls if getattr(c.func, "id", None) == "cutover_restore_block_reason")
+    writes = [c.lineno for c in calls if getattr(c.func, "attr", None) in ("set_lob_exclusion", "set_replace_targets")]
+    assert writes and gate < min(writes)
+
+
+def test_the_not_single_expression_reason_is_stated_once():
+    o = "f(1), 2"
+    by, _n = _classify([_entry("a", o)])  # (A) holds, but it is not one expression
+    assert by["a"].reason == cd.NOT_EXECUTABLE_REASON.format(o=o)
+    by, _n = _classify([_entry("a", o)], excluded={"app.t": []})
+    assert by["a"].reason.count(cd.NOT_EXECUTABLE_REASON.format(o=o)) == 1
+    assert by["a"].reason.startswith(NOT_EXCLUDED_REASON.format(o=o))
+
+
+def test_a_stale_tab_click_after_the_inputs_changed_restores_nothing():
+    import dsql_migrator.ui.validation as uiv
+
+    state = _vstate()
+    ledger = InMemoryOverlayLedger()
+    items = _items(ledger, ("a", "'x'::character varying"))
+    gen = state.begin_cutover_defaults_fill()
+    state.finish_cutover_defaults_fill(CutoverDefaultsSnapshot(state="loaded", items=tuple(items), fill_key="k1"), gen)
+    jobs, notes = _Jobs(), []
+    uiv._run_cutover_default_restore(
+        SimpleNamespace(target_config=TARGET, aws_profile=None), state,
+        SimpleNamespace(job_id=None, cdc_action_kind=None, cdc_deploy_job_id=None),
+        request=None, overlay_ledger=ledger, job_manager=jobs, refresh=lambda: None,
+        notify=lambda m, **k: notes.append(m), restore=_Restore(), fill_key_now=lambda: "k2")
+    assert jobs.submitted == [] and "changed since this screen was drawn" in notes[0]
+    assert state.cutover_defaults is None  # re-read

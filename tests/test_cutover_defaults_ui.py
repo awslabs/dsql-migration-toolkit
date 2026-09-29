@@ -213,7 +213,7 @@ def test_the_outcome_shows_the_refusal_and_each_failed_statement():
 # ---------------------------------------------------------------------------
 
 
-def _screen(monkeypatch, *, snap, cdc=True, drained=False, in_use=True):
+def _screen(monkeypatch, *, snap, cdc=True, drained=False, in_use=True, exclude=False):
     import sys
     import types
 
@@ -244,6 +244,8 @@ def _screen(monkeypatch, *, snap, cdc=True, drained=False, in_use=True):
         table="app.t", source_row_count=1, target_row_count=1, row_count_match=True, matched=True)]))
     if in_use:
         mstore.get_or_create("s1").mark_overlay_ledger_in_use()
+    if exclude:
+        mstore.get_or_create("s1").set_lob_exclusion("app.t", "c", True)
     if snap is not None:
         import time
 
@@ -296,3 +298,62 @@ def test_a_session_that_never_used_the_record_logs_nothing(monkeypatch):
     _ui, runner, logged = _screen(monkeypatch, snap=None, cdc=False, in_use=False)
     runner()
     assert not [a for a, _kw in logged if a == "excluded-column DEFAULTs not restored at cut over"]
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (P2-15/16 adversarial review)
+# ---------------------------------------------------------------------------
+
+
+def test_the_checking_state_offers_check_again():
+    from dsql_migrator.ui.validation import _render_cutover_defaults_block
+
+    ui = _Ui()
+    rechecked = []
+    _render_cutover_defaults_block(
+        ui, None, checking=True, cdc_in_use=False, drained={"ok": True}, gated=[], restore_provider=None,
+        restore_job_block=None, restore_running=False, restore_outcome=None,
+        on_recheck=lambda: rechecked.append(1))
+    ui.by("Check again")[0].on_click()
+    assert rechecked == [1]
+
+
+def test_an_all_skipped_restore_is_reported(monkeypatch):
+    import dsql_migrator.ui.validation as uiv
+
+    logged = []
+    monkeypatch.setattr(uiv, "log_activity", lambda cat, action, **kw: logged.append((action, kw)))
+    outcome = CutoverRestoreOutcome(skipped=("app.t.a",))
+    uiv._log_cutover_restore(outcome)
+    assert [(a, kw["status"]) for a, kw in logged] == [
+        ("excluded-column DEFAULTs not restored (cut-over)", uiv.ActivityStatus.WARNING)]
+    assert "app.t.a" in logged[0][1]["detail"]
+    ui = _Ui()
+    _l, notices = _render(ui, snap=_snap(_item("a")), outcome=outcome)
+    assert any(n["header"] == "1 DEFAULT(s) not restored" and "record changed" in n["body"] for n in notices)
+
+
+def test_a_session_that_never_excluded_sees_nothing_of_an_unreadable_record(monkeypatch):
+    for in_use, excluded in ((False, False), (True, False), (False, True)):
+        ui, runner, logged = _screen(monkeypatch, snap=CutoverDefaultsSnapshot(state="ledger_unreadable"),
+                                     cdc=False, in_use=in_use, exclude=excluded)
+        shown = "record of dropped DEFAULTs could not be read" in ui.body()
+        runner()
+        warned = [a for a, _kw in logged if a == "excluded-column DEFAULTs not restored at cut over"]
+        uses = in_use or excluded
+        assert shown is uses and bool(warned) is uses, (in_use, excluded)
+    ui, _runner, _logged = _screen(monkeypatch, snap=None, cdc=False, in_use=False)
+    assert "checking Aurora DSQL" not in ui.body() and "Checking whether" not in ui.body()
+
+
+def test_the_finish_body_names_only_what_the_block_shows(monkeypatch):
+    unknown = _item("a", status="unknown", auto=False)
+    ui, _r, _l = _screen(monkeypatch, snap=_snap(unknown), cdc=False)
+    body = ui.body()
+    assert "1 excluded column(s) could not be checked on Aurora DSQL" in body
+    assert "Needs your decision" not in body and "will store NULL" not in body and "Check again" in body
+    ui, _r, _l = _screen(monkeypatch, snap=_snap(_item("a")), cdc=False)
+    body = ui.body()
+    assert "Restore them now." in body and "Needs your decision" not in body and "will store NULL" in body
+    ui, _r, _l = _screen(monkeypatch, snap=_snap(_item("m", auto=False, reason="r")), cdc=False)
+    assert 'Decide on the columns listed under "Needs your decision" above.' in ui.body()

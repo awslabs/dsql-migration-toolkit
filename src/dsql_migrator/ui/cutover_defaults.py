@@ -285,14 +285,12 @@ def classify_cutover_defaults(
                 if column not in excluded:
                     reason = NOT_EXCLUDED_REASON.format(o=o)
                 elif _auto_ok(entry, table, column, current_ddls):
-                    if executable:
-                        auto = True
-                    else:
-                        reason = NOT_EXECUTABLE_REASON.format(o=o)
+                    auto = executable
                 else:
                     reason = _manual_reason(entry, table, column, current_ddls)
-                if reason is not None and not executable:
-                    reason = f"{reason} {NOT_EXECUTABLE_REASON.format(o=o)}"
+                if not executable:
+                    suffix = NOT_EXECUTABLE_REASON.format(o=o)
+                    reason = f"{reason} {suffix}" if reason else suffix
             items.append(
                 CutoverDefaultItem(
                     table=table,
