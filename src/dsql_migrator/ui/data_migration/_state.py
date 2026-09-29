@@ -170,6 +170,14 @@ class DataMigrationState:
         # -- no sink change needed. Empty => every table keys on its source PK.
         self._cdc_message_key_columns: dict[str, list[str]] = {}
         self._cdc_preserved_foreign_keys: dict[str, list[str]] = {}
+        # The APPLIED Schema Conversion (table -> TableConversion, user edits honoured) and
+        # the foreign-key toggle, recomputed on each Data Migration render like the two maps
+        # above, so the column-exclusion rule (core/column_exclusion.py) judges a column
+        # against the SAME target DDL on every path -- including the CDC builders and
+        # Validation, which do not hold the Schema Conversion state. Transient: never
+        # persisted; a restored session has it again after its first render.
+        self._applied_conversions: dict[str, object] = {}
+        self._preserve_foreign_keys: bool = True
         # How the operator chose the CDC start point: "auto" (gapless from the
         # Full Load watermark) or "manual" (an explicit GTID / binlog position).
         # An explicit mode (vs. inferring it from whether an override is set)
@@ -503,6 +511,19 @@ class DataMigrationState:
             self._cdc_preserved_foreign_keys = {
                 table: list(names) for table, names in preserved_foreign_keys.items()
             }
+
+    def set_applied_conversions(
+        self, applied: "dict[str, object]", *, preserve_foreign_keys: bool
+    ) -> None:
+        """Record the applied Schema Conversion for the exclusion rule (see __init__)."""
+        with self._lock:
+            self._applied_conversions = dict(applied)
+            self._preserve_foreign_keys = bool(preserve_foreign_keys)
+
+    def applied_conversions(self) -> "tuple[dict[str, object], bool]":
+        """``(applied conversions, preserve_foreign_keys)`` from the last render."""
+        with self._lock:
+            return dict(self._applied_conversions), self._preserve_foreign_keys
 
     def cdc_preserved_foreign_keys(self) -> "dict[str, list[str]]":
         """Return a copy of the FK constraint names this migration owns."""

@@ -1608,6 +1608,144 @@ def scope_lob_candidates(
     return [c for c in candidates if c.table in stored]
 
 
+def exclusion_context_for(
+    migration_state,
+    inventory,
+    *,
+    applied_conversions: "Optional[Mapping[str, object]]" = None,
+    preserve_foreign_keys: "Optional[bool]" = None,
+    selected_tables: "Optional[Sequence[str]]" = None,
+    focus_tables: "Optional[Iterable[str]]" = None,
+):
+    """The :class:`~dsql_migrator.core.column_exclusion.ExclusionContext` for this session.
+
+    ``applied_conversions`` / ``preserve_foreign_keys`` default to what the last Data
+    Migration render recorded (``DataMigrationState.set_applied_conversions``), so the CDC
+    builders and Validation -- which do not hold the Schema Conversion state -- judge a
+    column against the same applied target DDL as Full Load. Before any render (a restored
+    session) that record is empty and the rule falls back to the source schema plus the
+    stored ``message.key.columns`` map, which is itself derived from the applied DDL.
+    """
+    from dsql_migrator.core.column_exclusion import build_exclusion_context
+
+    getter = getattr(migration_state, "applied_conversions", None)
+    cached, cached_preserve = getter() if callable(getter) else ({}, True)
+    mkc_getter = getattr(migration_state, "cdc_message_key_columns", None)
+    return build_exclusion_context(
+        inventory,
+        cached if applied_conversions is None else applied_conversions,
+        message_key_columns=mkc_getter() if callable(mkc_getter) else None,
+        preserve_foreign_keys=(
+            cached_preserve if preserve_foreign_keys is None else preserve_foreign_keys
+        ),
+        selected_tables=selected_tables,
+        focus_tables=focus_tables,
+    )
+
+
+def effective_lob_exclusions(
+    migration_state,
+    inventory,
+    *,
+    applied_conversions: "Optional[Mapping[str, object]]" = None,
+    preserve_foreign_keys: "Optional[bool]" = None,
+) -> "dict[str, frozenset[str]]":
+    """The exclusion set EVERY path uses: the stored set minus key columns (B1/B2).
+
+    One answer for Full Load, the CDC ``column.exclude.list`` and Validation, so the paths
+    can no longer disagree. Before this, the stored set went to each path raw: Full Load
+    silently skipped a source-PK entry (``apply_lob_exclusions``) while the CDC path sent
+    it to Debezium, and a Schema Conversion composite key's leading column was not
+    protected on either path (the importer reads every target-key column from each row).
+    A valid set passes through unchanged, so every normal session behaves exactly as
+    before. With no inventory there is nothing to judge against, and the stored set is
+    returned as-is (the paths that need an inventory refuse to run without one).
+    """
+    stored = migration_state.lob_exclusions()
+    if inventory is None or not getattr(inventory, "tables", None):
+        return {table: frozenset(cols) for table, cols in stored.items() if cols}
+    from dsql_migrator.core.column_exclusion import effective_exclusions
+
+    ctx = exclusion_context_for(
+        migration_state,
+        inventory,
+        applied_conversions=applied_conversions,
+        preserve_foreign_keys=preserve_foreign_keys,
+        focus_tables=stored.keys(),
+    )
+    return dict(effective_exclusions(stored, ctx).columns)
+
+
+def stored_exclusion_issues(
+    migration_state,
+    inventory,
+    *,
+    committed: bool,
+    selected_tables: "Optional[Sequence[str]]" = None,
+):
+    """Judge the STORED exclusions (see ``column_exclusion.check_stored_exclusions``).
+
+    ``committed`` must be the exclusion card's own ``locked`` flag. Before it locks, a
+    blocked or vanished entry is an ERROR that holds Start Full Load, Deploy CDC
+    infrastructure and Start CDC -- and the card, being unlocked, offers the Remove that
+    the gate names. Once it locks (data moved, or the set was handed to the CDC pipeline)
+    the same entry is only a warning: blocking there would point at a Remove the frozen
+    card cannot perform.
+
+    ``selected_tables`` (the tables this migration moves) scopes the check: an entry on a
+    source table that is NOT selected affects nothing and is ignored, while an entry on a
+    table that is no longer in the source at all is still reported -- its table may have
+    been renamed, and the exclusion the user asked for would silently lapse. ``None``
+    falls back to the stored selection (pinned by the prerequisite checks, which every
+    gated button requires first), and to every table when that is still empty -- so the
+    card and the gate it serves judge the same scope and the gate can never name an
+    entry the card does not list. Empty with no stored entries or no inventory.
+    """
+    stored = migration_state.lob_exclusions()
+    if not stored or inventory is None or not getattr(inventory, "tables", None):
+        return ()
+    from dsql_migrator.core.column_exclusion import check_stored_exclusions
+
+    if selected_tables is None:
+        selection = getattr(migration_state, "selection", None)
+        selected_tables = list(getattr(selection, "selected_tables", None) or ()) or None
+    if selected_tables is not None:
+        known = {t.name for t in inventory.tables}
+        selected = set(selected_tables)
+        stored = {t: c for t, c in stored.items() if t in selected or t not in known}
+        if not stored:
+            return ()
+    ctx = exclusion_context_for(
+        migration_state,
+        inventory,
+        selected_tables=selected_tables,
+        focus_tables=stored.keys(),
+    )
+    return check_stored_exclusions(stored, ctx, committed=committed)
+
+
+def stored_exclusion_block_reason(issues) -> "Optional[str]":
+    """The gate text for stored-entry ERRORs, or ``None`` when nothing blocks.
+
+    "Above" holds on every gated button: the card renders under the table picker, above
+    all sub-steps, for a type with a Full Load, and above Deploy inside the CDC sub-step
+    for CDC only.
+    """
+    from dsql_migrator.core.column_exclusion import IssueSeverity
+
+    errors = [i for i in issues if i.severity is IssueSeverity.ERROR]
+    if not errors:
+        return None
+    shown = " ".join(i.message for i in errors[:3])  # each message ends with a period
+    more = f" And {len(errors) - 3} more." if len(errors) > 3 else ""
+    many = len(errors) > 1
+    return (
+        f"{len(errors)} saved column exclusion{'s' if many else ''} no longer "
+        f"appl{'y' if many else 'ies'}: {shown}{more} Remove {'them' if many else 'it'} "
+        "in 'Oversized LOB columns' above first."
+    )
+
+
 def cdc_excluded_columns(
     lob_exclusions: "Mapping[str, Sequence[str]]",
     inventory: object,

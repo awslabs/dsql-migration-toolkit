@@ -80,6 +80,7 @@ from dsql_migrator.core.validator import export_report as export_validation_repo
 from dsql_migrator.ui.ai_assist import ai_is_usable
 from dsql_migrator.ui.connect import make_source_engine_factory
 from dsql_migrator.ui.data_migration import DataMigrationStore
+from dsql_migrator.ui.data_migration._models import effective_lob_exclusions
 from dsql_migrator.ui.design import (
     badge_classes,
     chip_group_quasar_color,
@@ -2204,10 +2205,11 @@ def build_validation_screen(
             deep_only_on_count_mismatch=(
                 validation_state.deep_only_on_count_mismatch
             ),
-            # Skip columns the migration excluded (CDC oversized-LOB exclusion), so a
-            # column that was never written to the target can't cause a false checksum
-            # mismatch. Empty for a migration that excluded nothing.
-            excluded_columns=migration_state.lob_exclusions(),
+            # Skip columns the migration excluded, so a column that was never written to
+            # the target can't cause a false checksum mismatch. The EFFECTIVE set (key
+            # columns dropped), the same one Full Load and CDC use. Empty for a migration
+            # that excluded nothing.
+            excluded_columns=effective_lob_exclusions(migration_state, scoped_inventory),
             quarantined_by_table=_migration_quarantined(),
             # Applied target types so a CHECKSUM honors a Schema-Conversion remap.
             target_types=_applied_target_types(scoped_inventory),
@@ -2486,7 +2488,7 @@ def build_validation_screen(
             reconcile=options.reconcile,
             # Always deep-check a re-check (see docstring).
             deep_only_on_count_mismatch=False,
-            excluded_columns=migration_state.lob_exclusions(),
+            excluded_columns=effective_lob_exclusions(migration_state, inventory),
             quarantined_by_table=_migration_quarantined(),
             # Applied target types so a CHECKSUM honors a Schema-Conversion remap.
             target_types=_applied_target_types(

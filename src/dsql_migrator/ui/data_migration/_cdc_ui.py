@@ -90,6 +90,9 @@ from dsql_migrator.ui.data_migration._models import (
     connector_health_rows,
     connector_role_label,
     cdc_excluded_columns,
+    effective_lob_exclusions,
+    stored_exclusion_block_reason,
+    stored_exclusion_issues,
     format_column_exclude_list,
     format_duration,
     lob_exclusion_candidates,
@@ -624,7 +627,8 @@ def _render_cdc_source_config_card(
     # Build the connector config (pure -- no AWS calls). Restrict the table list
     # to what the watermark covered when inventory + watermark exist; otherwise
     # fall back to the user's confirmed selection (manual seed).
-    exclusions = migration_state.lob_exclusions()
+    # The EFFECTIVE set (key columns dropped), the same one Full Load and Validation use.
+    exclusions = effective_lob_exclusions(migration_state, inventory)
     # Union in the columns the TARGET computes: DSQL rejects a write that supplies a value
     # for a preserved STORED generated column, and the sink dead-letters that permanently.
     exclude_value = format_column_exclude_list(
@@ -2692,6 +2696,21 @@ def _render_cdc_infra_deploy_action(
             body=_prereq_block,
         )
         return
+    # A saved column exclusion that no longer applies would be baked into the stack's
+    # ColumnExcludeList and lock the card, so this is its last chance to be removed.
+    _exclusion_block = _stored_exclusion_deploy_block(
+        migration_state, job_manager, inventory, session
+    )
+    if _exclusion_block:
+        deploy_btn.props("disable")
+        deploy_btn.tooltip(_exclusion_block)
+        render_notice(
+            ui,
+            tone="error",
+            header="Remove the saved column exclusions that no longer apply",
+            body=_exclusion_block,
+        )
+        return
 
     # VpcId is the one input the operator may still have to CHOOSE (subnets/NAT, the plugin
     # bucket, the DSQL cluster ARN, the source host and its secret are all resolved at deploy
@@ -2711,6 +2730,31 @@ def _render_cdc_infra_deploy_action(
     _gate["button"] = deploy_btn
     _gate["hint"] = inline_hint(ui, "", tone="info")
     _sync_gate()
+
+def _stored_exclusion_deploy_block(migration_state, job_manager, inventory, session):
+    """The stored-entry gate for Deploy CDC infrastructure, or ``None``.
+
+    Judged with the LOB card's own lock -- a Full Load that committed data (its job id,
+    or the step reached DONE: the CDC-only copy's clause) or a CDC pipeline already
+    holding the set -- so an ERROR here always has an unlocked card, rendered above this
+    button on either screen, offering its Remove. Start CDC carries no such gate: it is
+    offered only once a stack exists, where the card is locked and the entry is reported
+    there as a warning instead.
+    """
+    from dsql_migrator.ui.workflow import WorkflowStep, get_status
+
+    workflow = getattr(session, "workflow", None)
+    full_load_committed = getattr(migration_state, "job_id", None) is not None or (
+        workflow is not None
+        and get_status(workflow, WorkflowStep.FULL_LOAD) is StepStatus.DONE
+    )
+    locked, _reason = lob_exclusion_lock(
+        migration_state, job_manager, full_load_committed=full_load_committed
+    )
+    return stored_exclusion_block_reason(
+        stored_exclusion_issues(migration_state, inventory, committed=locked)
+    )
+
 
 def _render_cdc_least_privilege_note(ui, *, session=None) -> None:
     """Recommend a dedicated least-privilege CDC source user before deploy.
@@ -4653,7 +4697,8 @@ def _start_cdc_deploy(
     job = _current_job(job_manager, migration_state.job_id)
     watermark = _cdc_watermark(job)
     override = migration_state.cdc_start_override()
-    exclusions = migration_state.lob_exclusions()
+    # The EFFECTIVE set (key columns dropped), the same one Full Load and Validation use.
+    exclusions = effective_lob_exclusions(migration_state, inventory)
     # Union in the columns the TARGET computes: DSQL rejects a write that supplies a value
     # for a preserved STORED generated column, and the sink dead-letters that permanently.
     exclude_value = format_column_exclude_list(
@@ -5201,7 +5246,8 @@ async def _start_cdc_infra_deploy(
     job = _current_job(job_manager, migration_state.job_id)
     watermark = _cdc_watermark(job)
     override = migration_state.cdc_start_override()
-    exclusions = migration_state.lob_exclusions()
+    # The EFFECTIVE set (key columns dropped), the same one Full Load and Validation use.
+    exclusions = effective_lob_exclusions(migration_state, inventory)
     # Union in the columns the TARGET computes: DSQL rejects a write that supplies a value
     # for a preserved STORED generated column, and the sink dead-letters that permanently.
     exclude_value = format_column_exclude_list(

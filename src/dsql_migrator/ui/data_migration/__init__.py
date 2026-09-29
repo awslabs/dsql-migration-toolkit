@@ -232,6 +232,9 @@ from dsql_migrator.ui.data_migration._models import (
     format_watermark,
     LobExclusionCandidate,
     lob_exclusion_candidates,
+    effective_lob_exclusions,
+    stored_exclusion_block_reason,
+    stored_exclusion_issues,
     make_lob_candidates_for,
     session_source_type,
     scope_lob_candidates,
@@ -454,6 +457,11 @@ def build_data_migration_screen(
         _conversion = SchemaConverter(
             source_type=source_config.source_type
         ).convert(inventory)
+        _applied_conversions = applied_table_conversions(
+            _conversion,
+            conv_state.edited_target_ddls,
+            preserve_foreign_keys=conv_state.preserve_foreign_keys,
+        )
         inputs = DataMigrationInputs(
             source_config=source_config,
             source_password=session.source_password,
@@ -480,23 +488,21 @@ def build_data_migration_screen(
             # cdc_stack_name both miss (else FKs applied at load end -> 23503 dead-letters).
             is_cdc_migration=migration_state.migration_type
             is MigrationType.FULL_LOAD_AND_CDC,
-            table_conversions=applied_table_conversions(
-                _conversion,
-                conv_state.edited_target_ddls,
-                preserve_foreign_keys=conv_state.preserve_foreign_keys,
-            ),
+            table_conversions=_applied_conversions,
             # Converted view DDLs so a "drop & reload" run can pre-drop / recreate
             # views that depend on a replaced table (else the DROP is blocked).
             dependent_view_ddls=applied_view_ddls(
                 _conversion, conv_state.edited_target_ddls
             ),
-            # The migration-wide oversized-LOB exclusion: drops these columns from
-            # the Full Load INSERT list too (the same selection that feeds CDC's
-            # column.exclude.list, so the two paths stay in lockstep).
-            excluded_lob_columns={
-                table: frozenset(columns)
-                for table, columns in migration_state.lob_exclusions().items()
-            },
+            # The migration-wide column exclusion: drops these columns from the Full
+            # Load INSERT list too. The EFFECTIVE set (key columns dropped), the same one
+            # CDC's column.exclude.list and Validation read, so the paths stay in lockstep.
+            excluded_lob_columns=effective_lob_exclusions(
+                migration_state,
+                inventory,
+                applied_conversions=_applied_conversions,
+                preserve_foreign_keys=conv_state.preserve_foreign_keys,
+            ),
         )
         # Full Load runs over the tables the user selected in the picker. A
         # table is migratable when it has a target table to load into: either its
@@ -672,6 +678,12 @@ def build_data_migration_screen(
             migration_state.set_cdc_message_key_columns(
                 composite_key_columns_for_cdc(inventory.tables, _applied)
             )
+            # ... and the applied conversion itself, for the column-exclusion rule: the
+            # CDC builders and Validation judge a column against this same target DDL
+            # (a Schema Conversion composite key, a preserved generated column).
+            migration_state.set_applied_conversions(
+                _applied, preserve_foreign_keys=conv_state.preserve_foreign_keys
+            )
             # Which FK constraints THIS migration OWNS, for the CDC-start precondition:
             # an enforced FK on the target dead-letters out-of-order child rows (23503),
             # so it must be removed before streaming -- but only ours, which cut over
@@ -837,11 +849,24 @@ def build_data_migration_screen(
             migration_state.set_prereq_running(mode)
             refresh()
             try:
-                # Feed the migration-wide LOB exclusion into the gate so a column
-                # excluded from the load is judged against the target as it will be
-                # written: an excluded NOT NULL/no-default target column FAILs
-                # loadability here instead of failing every batch mid-load.
-                _prereq_exclusions = migration_state.lob_exclusions()
+                # Feed the migration-wide exclusion into the gate so a column excluded
+                # from the load is judged against the target as it will be written: an
+                # excluded NOT NULL/no-default target column FAILs loadability here
+                # instead of failing every batch mid-load. The EFFECTIVE set -- the same
+                # one the Full Load inputs use -- so the gate never judges a key column
+                # the load would keep (effective_lob_exclusions).
+                _prereq_exclusions = effective_lob_exclusions(
+                    migration_state,
+                    inventory,
+                    applied_conversions=applied_table_conversions(
+                        SchemaConverter(
+                            source_type=session_source_type(session)
+                        ).convert(inventory),
+                        conv_state.edited_target_ddls,
+                        preserve_foreign_keys=conv_state.preserve_foreign_keys,
+                    ),
+                    preserve_foreign_keys=conv_state.preserve_foreign_keys,
+                )
                 # The oversized-LOB columns to ask the per-value SIZE question about.
                 # Derived here, from the same helper that drives the Evaluation finding
                 # and the exclusion picker, because it lives in this UI layer and the
@@ -1257,6 +1282,11 @@ def build_data_migration_screen(
                     conv_state.ticked_node_ids,
                 ),
             )
+            _lob_locked, _lob_reason = lob_exclusion_lock(
+                migration_state,
+                job_manager,
+                full_load_committed=(job is not None or status is StepStatus.DONE),
+            )
             if migration_type is not MigrationType.CDC_ONLY:
                 # The LOB tick boxes are frozen by the same lock as the table picker, but
                 # they need the LOB-SPECIFIC reason: the picker's copy only talks about
@@ -1268,11 +1298,6 @@ def build_data_migration_screen(
                 # NO explanation at all -- the "silent frozen box reads as a bug" state
                 # that panel's own comment says must never happen. lob_exclusion_lock
                 # already writes the right sentence for each cause; reuse it.
-                _lob_locked, _lob_reason = lob_exclusion_lock(
-                    migration_state,
-                    job_manager,
-                    full_load_committed=(job is not None or status is StepStatus.DONE),
-                )
                 _render_cdc_lob_exclusion_panel(
                     ui,
                     migration_state,
@@ -1294,11 +1319,30 @@ def build_data_migration_screen(
             # both survive a session restore) is proof its prerequisites passed at
             # start time, so a missing in-memory report (not persisted across a
             # reconnect) must not re-lock the re-run button.
+            # A saved exclusion that no longer applies (a key column, a column another
+            # selected table's foreign key references, a column the source dropped) holds
+            # Continue and Start Full Load while the card above can still remove it --
+            # judged with the card's own lock, so the gate never names a Remove the frozen
+            # card cannot perform. CDC only has no card here (its copy is inside the CDC
+            # sub-step, which this Continue leads to), so its Deploy button carries it.
+            _exclusion_block = (
+                None
+                if migration_type is MigrationType.CDC_ONLY
+                else stored_exclusion_block_reason(
+                    stored_exclusion_issues(
+                        migration_state,
+                        inventory,
+                        committed=selection_locked or _lob_locked,
+                        selected_tables=selected_names,
+                    )
+                )
+            )
             guard_reason = full_load_run_guard_reason(
                 migration_state,
                 inventory,
                 prereq_mode=prereq_mode,
                 has_run=job is not None or status is StepStatus.DONE,
+                exclusion_block=_exclusion_block,
             )
             active = resolve_active_substep_for_type(
                 migration_state.active_substep,
@@ -1465,6 +1509,11 @@ def build_data_migration_screen(
                 _retry_conversion = SchemaConverter(
                     source_type=source_config.source_type
                 ).convert(inventory)
+                _applied_retry_conversion = applied_table_conversions(
+                    _retry_conversion,
+                    conv_state.edited_target_ddls,
+                    preserve_foreign_keys=conv_state.preserve_foreign_keys,
+                )
                 retry_inputs = DataMigrationInputs(
                     source_config=source_config,
                     source_password=session.source_password,
@@ -1476,19 +1525,18 @@ def build_data_migration_screen(
                     cdc_coexisting=retry_cdc_coexisting,
                     is_cdc_migration=migration_state.migration_type
                     is MigrationType.FULL_LOAD_AND_CDC,
-                    table_conversions=applied_table_conversions(
-                        _retry_conversion,
-                        conv_state.edited_target_ddls,
-                        preserve_foreign_keys=conv_state.preserve_foreign_keys,
-                    ),
+                    table_conversions=_applied_retry_conversion,
                     dependent_view_ddls=applied_view_ddls(
                         _retry_conversion,
                         conv_state.edited_target_ddls,
                     ),
-                    excluded_lob_columns={
-                        table: frozenset(columns)
-                        for table, columns in migration_state.lob_exclusions().items()
-                    },
+                    # The EFFECTIVE set (key columns dropped): see effective_lob_exclusions.
+                    excluded_lob_columns=effective_lob_exclusions(
+                        migration_state,
+                        inventory,
+                        applied_conversions=_applied_retry_conversion,
+                        preserve_foreign_keys=conv_state.preserve_foreign_keys,
+                    ),
                 )
                 retry_tables = TableSelector().resolve(
                     inventory, TableSelection(selected_tables=names)
@@ -1739,6 +1787,11 @@ def build_data_migration_screen(
                 _tgt = session.target_config
                 _inv = _inventory()
                 _conv = SchemaConverter(source_type=_src.source_type).convert(_inv)
+                _applied_conv = applied_table_conversions(
+                    _conv,
+                    conv_state.edited_target_ddls,
+                    preserve_foreign_keys=conv_state.preserve_foreign_keys,
+                )
                 return DataMigrationInputs(
                     source_config=_src,
                     source_password=session.source_password,
@@ -1748,15 +1801,14 @@ def build_data_migration_screen(
                     replace_tables=frozenset(),      # no data movement: DDL only
                     is_cdc_migration=migration_state.migration_type
                     is MigrationType.FULL_LOAD_AND_CDC,
-                    table_conversions=applied_table_conversions(
-                        _conv,
-                        conv_state.edited_target_ddls,
+                    table_conversions=_applied_conv,
+                    # The EFFECTIVE set (key columns dropped): see effective_lob_exclusions.
+                    excluded_lob_columns=effective_lob_exclusions(
+                        migration_state,
+                        _inv,
+                        applied_conversions=_applied_conv,
                         preserve_foreign_keys=conv_state.preserve_foreign_keys,
                     ),
-                    excluded_lob_columns={
-                        table: frozenset(columns)
-                        for table, columns in migration_state.lob_exclusions().items()
-                    },
                 )
 
             def fk_pending_count() -> int:
@@ -2516,6 +2568,7 @@ def full_load_run_guard_reason(
     *,
     prereq_mode: MigrationMode = MigrationMode.FULL_LOAD,
     has_run: bool = False,
+    exclusion_block: Optional[str] = None,
 ) -> Optional[str]:
     """Return a disable reason for the Data Migration Run button, or ``None``.
 
@@ -2557,9 +2610,15 @@ def full_load_run_guard_reason(
     prompt. Either way the run stays gated until the read-only checks are re-run
     (the connection was re-established on reconnect, so the old result can't be
     trusted).
+
+    ``exclusion_block`` is the stored-entry gate (``stored_exclusion_block_reason``): a
+    saved column exclusion that no longer applies holds the run while the LOB card can
+    still remove it. It is independent of the report, so it comes first.
     """
     if inventory is None or not inventory.tables:
         return "Run Step 1 (Evaluation) first to introspect the source schema."
+    if exclusion_block:
+        return exclusion_block
     report = state.get_prereq_report(prereq_mode)
     if report is None:
         # Only excuse the absent report when the completed run was gated by THIS

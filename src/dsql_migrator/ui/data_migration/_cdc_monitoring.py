@@ -43,6 +43,7 @@ from dsql_migrator.ui.data_migration._models import (
     per_table_counts_notice_body,
     scope_lob_candidates,
     session_source_type,
+    stored_exclusion_issues,
 )
 from dsql_migrator.ui.data_migration._cdc_status import (
     _CDC_TONE_STYLE,
@@ -2575,6 +2576,21 @@ def _render_cdc_lob_exclusion_panel(
         stored_selection=migration_state.selection.selected_tables,
     )
     selection = migration_state.lob_exclusions()
+    # Saved entries the exclusion rule rejects, judged with THIS card's lock: while it is
+    # unlocked they block the gated buttons, and this is where they are removed -- above
+    # the "no candidates" return, since an entry for a key column or a dropped column is
+    # never a candidate and would otherwise have no Remove anywhere.
+    _render_stored_exclusion_issues(
+        ui,
+        migration_state,
+        stored_exclusion_issues(
+            migration_state,
+            inventory,
+            committed=locked,
+            selected_tables=selected_tables,
+        ),
+        refresh,
+    )
     if not candidates:
         # Nothing to exclude -> a lightweight info notice, not a heavy settings card.
         render_notice(
@@ -2662,6 +2678,60 @@ def _render_cdc_lob_exclusion_panel(
                         "text-xs text-gray-500"
                     )
                     ui.label(exclude_value).classes("text-xs font-mono")  # type: ignore[attr-defined]
+
+def _render_stored_exclusion_issues(ui, migration_state, issues, refresh) -> None:
+    """List saved exclusions that no longer apply; ERROR entries get a Remove button.
+
+    An ERROR exists only while the card is unlocked (see ``stored_exclusion_issues``), so
+    the Remove is always actionable. After the lock the same entries are WARNING / INFO:
+    the data already moved under this set, and a key column is migrated regardless.
+    """
+    from dsql_migrator.core.column_exclusion import IssueSeverity
+
+    errors = [i for i in issues if i.severity is IssueSeverity.ERROR]
+    warnings = [i for i in issues if i.severity is IssueSeverity.WARNING]
+    infos = [i for i in issues if i.severity is IssueSeverity.INFO]
+    if errors:
+        render_notice(
+            ui,
+            tone="error",
+            header=(
+                f"{len(errors)} saved column exclusion"
+                f"{'s' if len(errors) > 1 else ''} to remove"
+            ),
+            body="They no longer apply to this migration, which waits until they are removed.",
+        )
+        for issue in errors:
+            with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
+                inline_hint(ui, issue.message, tone="error").classes("flex-1 min-w-0")  # type: ignore[attr-defined]
+
+                def _remove(_table=issue.table, _column=issue.column) -> None:
+                    migration_state.set_lob_exclusion(_table, _column, False)
+                    if callable(refresh):
+                        refresh()
+
+                ui.button("Remove", on_click=_remove, icon="delete").props(  # type: ignore[attr-defined]
+                    "flat dense color=negative"
+                )
+    if warnings:
+        render_notice(
+            ui,
+            tone="warning",
+            header="Some saved column exclusions do not apply",
+            body=(
+                " ".join(i.message for i in warnings)
+                + " The data already moved under this set, so it is left as it is; "
+                "key columns are always migrated."
+            ),
+        )
+    if infos:
+        render_notice(
+            ui,
+            tone="info",
+            header="Already omitted",
+            body=" ".join(i.message for i in infos),
+        )
+
 
 def _render_cdc_handling_panel(ui) -> None:
     """Render the CDC behavior & limits section: what's handled vs. what to watch.

@@ -28645,3 +28645,110 @@ def test_per_table_status_renders_the_source_estimate_label_and_age() -> None:
     row2 = next(r for t in ui2.tables for r in t["rows"] if r.get("table") == "ecommerce.product_media")
     assert row2["source"] == "not analyzed"
     assert row2["source_tip"]
+
+
+# ---------------------------------------------------------------------------
+# Stored-entry gate (column exclusion): Deploy is held and the card offers the Remove
+# ---------------------------------------------------------------------------
+
+
+def _exclusion_inventory():
+    return SourceInventory(
+        tables=[
+            TableDef(
+                name="docs",
+                columns=[
+                    ColumnDef(name="id", mysql_type="int", nullable=False),
+                    ColumnDef(name="payload", mysql_type="longtext"),
+                ],
+                primary_key=["id"],
+            )
+        ]
+    )
+
+
+def test_deploy_is_held_by_a_saved_exclusion_that_no_longer_applies() -> None:
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    def _render(state):
+        ui = _GateUi()
+        _cdc_ui._render_cdc_infra_deploy_action(
+            ui, state, _StubJobManager({}), lambda: None,
+            inventory=_exclusion_inventory(), session=None,
+        )
+        return ui
+
+    state = _cdc_state_ready_for_deploy()
+    state.set_cdc_infra_inputs({"vpc_id": "vpc-0123456789abcdef0"})
+    state.set_lob_exclusion("docs", "id", True)  # a primary key: never excludable
+    held = _render(state)
+    assert held.deploy_button().enabled is False
+    joined = " ".join(held.texts)
+    assert "docs.id cannot be excluded" in joined
+    assert "Oversized LOB columns' above" in joined
+
+    # Once data has moved under the set (a Full Load job exists) the card is locked, so the
+    # gate must not name a Remove it cannot perform: it stops blocking.
+    state.job_id = "job-1"
+    assert _render(state).deploy_button().enabled is True
+    # And a valid set never blocks.
+    fresh = _cdc_state_ready_for_deploy()
+    fresh.set_cdc_infra_inputs({"vpc_id": "vpc-0123456789abcdef0"})
+    fresh.set_lob_exclusion("docs", "payload", True)
+    assert _render(fresh).deploy_button().enabled is True
+
+
+def test_lob_card_lists_a_blocked_saved_entry_with_a_working_remove() -> None:
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    state = DataMigrationState()
+    state.set_lob_exclusion("docs", "id", True)
+    refreshed: list = []
+    ui = _RecordingUi()
+    _cdc_ui._render_cdc_lob_exclusion_panel(
+        ui, state, _exclusion_inventory(), lambda: refreshed.append(1),
+        locked=False, migration_wide=True,
+    )
+    joined = " ".join(ui.texts)
+    assert "1 saved column exclusion to remove" in joined
+    assert "docs.id cannot be excluded" in joined
+    remove = next(b for b in ui.buttons if b.text == "Remove")
+    remove.on_click()
+    assert state.lob_exclusions() == {}
+    assert refreshed == [1]
+
+    # Locked: reported, not removable (the lock's own remedy applies).
+    state.set_lob_exclusion("docs", "id", True)
+    locked = _RecordingUi()
+    _cdc_ui._render_cdc_lob_exclusion_panel(
+        locked, state, _exclusion_inventory(), lambda: None,
+        locked=True, lock_reason="Locked.", migration_wide=True,
+    )
+    assert not [b for b in locked.buttons if b.text == "Remove"]
+    assert "left as it is" in " ".join(locked.texts)
+
+
+def test_lob_card_still_offers_the_remove_when_nothing_is_a_candidate() -> None:
+    # A key or vanished column is never a LOB candidate, so the "no oversized LOB columns"
+    # early return used to leave such an entry with no Remove anywhere.
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    inventory = SourceInventory(
+        tables=[
+            TableDef(
+                name="plain",
+                columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+                primary_key=["id"],
+            )
+        ]
+    )
+    state = DataMigrationState()
+    state.set_lob_exclusion("plain", "gone", True)
+    ui = _RecordingUi()
+    _cdc_ui._render_cdc_lob_exclusion_panel(
+        ui, state, inventory, lambda: None, locked=False, migration_wide=True
+    )
+    joined = " ".join(ui.texts)
+    assert "No oversized LOB columns" in joined
+    assert "plain.gone" in joined
+    assert [b for b in ui.buttons if b.text == "Remove"]
