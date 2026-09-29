@@ -954,6 +954,53 @@ def parse_target_column_names(create_ddl: str) -> "Optional[frozenset[str]]":
     return frozenset(names) if names else None
 
 
+def parse_target_column_constraints(
+    create_ddl: str,
+) -> "dict[str, tuple[bool, Optional[str]]]":
+    """``{column: (not_null, default_sql)}`` of an applied CREATE TABLE. Read-only.
+
+    The overlay's view of the APPLIED DDL (P0: the overlay drops NOT NULL, then DEFAULT):
+    ``not_null`` is a ``NOT NULL`` or an inline ``PRIMARY KEY``; ``default_sql`` is the
+    DEFAULT expression rendered by sqlglot (``None`` without one, and for a GENERATED
+    column -- a computed column has no DEFAULT). Keys are the names as PostgreSQL stores
+    them (quoted as written, unquoted folded; :func:`parse_target_column_names`). An
+    unparseable or non-CREATE text gives ``{}`` ("unknown"), like
+    :func:`parse_target_column_types`. The converter's output is unchanged.
+
+    ``default_sql`` is sqlglot's rendering: a sqlglot upgrade that renders a DEFAULT
+    differently can only turn an automatic comparison into a manual one (never a wrong
+    automatic restore), because both sides of every comparison go through this reader.
+    Cached by DDL text; the returned dict is a fresh copy each call.
+    """
+    return dict(_column_constraints(create_ddl or ""))
+
+
+@lru_cache(maxsize=4096)
+def _column_constraints(create_ddl: str) -> "tuple[tuple[str, tuple[bool, Optional[str]]], ...]":
+    try:
+        parsed = sqlglot.parse_one(_IDENTITY_CLAUSE_RE.sub("", create_ddl), read="postgres")
+    except Exception:  # noqa: BLE001 - unparseable DDL -> unknown
+        return ()
+    if not isinstance(parsed, exp.Create):
+        return ()
+    out: list[tuple[str, tuple[bool, Optional[str]]]] = []
+    for column_def in parsed.find_all(exp.ColumnDef):
+        if not column_def.name:
+            continue
+        not_null = False
+        default_sql: Optional[str] = None
+        for constraint in column_def.args.get("constraints") or []:
+            kind = constraint.args.get("kind")
+            if isinstance(kind, exp.NotNullColumnConstraint) and not kind.args.get("allow_null"):
+                not_null = True
+            elif isinstance(kind, exp.PrimaryKeyColumnConstraint):
+                not_null = True
+            elif isinstance(kind, exp.DefaultColumnConstraint) and kind.this is not None:
+                default_sql = kind.this.sql(dialect="postgres")
+        out.append((_folded_name(column_def.this), (not_null, default_sql)))
+    return tuple(out)
+
+
 def _folded_name(node) -> str:
     """An identifier node's name as PostgreSQL stores it (quoted as written, else folded)."""
     name = getattr(node, "name", "") or ""
@@ -1035,6 +1082,49 @@ def parse_target_generated_columns(create_ddl: str) -> set[str]:
 
 # The raw-text shape of a stored generated column clause (anchored: see above).
 _GENERATED_CLAUSE_RE = re.compile(r"\s*GENERATED\s+ALWAYS\s+AS\s*\(", re.IGNORECASE)
+
+# The identity clause with its option list captured separately, so the options (which
+# sqlglot cannot parse) can be dropped while the clause itself stays readable.
+_IDENTITY_OPTIONS_RE = re.compile(
+    r"(GENERATED\s+(?:ALWAYS|BY\s+DEFAULT)\s+AS\s+IDENTITY)\s*(?:\([^)]*\))?",
+    re.IGNORECASE,
+)
+
+
+@lru_cache(maxsize=4096)
+def parse_target_identity_columns(create_ddl: str) -> frozenset[str]:
+    """The IDENTITY columns of an applied CREATE TABLE, named as PostgreSQL stores them.
+
+    The column-exclusion rule reads this: an identity column outside the key is B4,
+    because dropping a DEFAULT cannot make it NULL. The option list is removed first
+    (sqlglot raises on CACHE); the clause itself parses. An unparseable or non-CREATE
+    text gives an empty set, and the live read at the overlay stays the backstop.
+    """
+    try:
+        parsed = sqlglot.parse_one(
+            _IDENTITY_OPTIONS_RE.sub(r"\1", create_ddl or ""), read="postgres"
+        )
+    except Exception:  # noqa: BLE001 - unparseable DDL -> unknown (empty)
+        return frozenset()
+    if not isinstance(parsed, exp.Create):
+        return frozenset()
+    return frozenset(
+        _folded_name(column_def.this)
+        for column_def in parsed.find_all(exp.ColumnDef)
+        if column_def.name
+        and any(
+            _is_identity(c.args.get("kind")) for c in column_def.args.get("constraints") or []
+        )
+    )
+
+
+def _is_identity(kind) -> bool:
+    # sqlglot also parses ``GENERATED ALWAYS AS (expr)`` (no STORED) into this class, with
+    # the expression attached; only the expression-less form is an identity.
+    return (
+        isinstance(kind, exp.GeneratedAsIdentityColumnConstraint)
+        and kind.args.get("expression") is None
+    )
 
 
 def parse_target_primary_key(create_ddl: str, *, for_exclusion: bool = False) -> list[str]:
@@ -4573,7 +4663,9 @@ __all__ = [
     "map_data_type",
     "map_mysql_type",
     "build_source_table_ddl",
+    "parse_target_column_constraints",
     "parse_target_column_types",
+    "parse_target_identity_columns",
     "parse_target_primary_key",
     "CompositeKeyError",
     "validate_composite_leading_column",

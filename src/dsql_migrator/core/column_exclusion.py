@@ -24,7 +24,9 @@ BLOCKED columns (never excludable; the reason is always shown):
   while foreign keys are preserved): every child row would become an orphan and the
   constraint could not be added.
 * **B4** a column Aurora DSQL computes (a preserved ``GENERATED ... STORED`` column):
-  it is never written anyway, so excluding it means nothing.
+  it is never written anyway, so excluding it means nothing. A non-key IDENTITY column
+  counts too: an omitted one would get the next identity value rather than NULL, because
+  dropping a DEFAULT cannot make an identity column NULL.
 
 B1/B2 entries are always DROPPED from the effective set (before and after data moved),
 because keeping them would break the load or the stream. B3/B4 block a stored entry only
@@ -99,7 +101,8 @@ class ExclusionContext:
     """What the predicate needs to know about the migration, built once per render/gate.
 
     ``target_pk`` / ``generated`` come from the APPLIED target DDL (Schema Conversion,
-    edits honoured); ``message_key_columns`` is the CDC re-key map; ``fk_referenced`` maps
+    edits honoured; ``generated`` is every B4 column, non-key identity included);
+    ``message_key_columns`` is the CDC re-key map; ``fk_referenced`` maps
     a parent table to ``{column: ("child.fk_name", ...)}`` for the preserved foreign keys
     of SELECTED child tables (empty when foreign keys are stripped).
     """
@@ -113,21 +116,22 @@ class ExclusionContext:
 
 @lru_cache(maxsize=4096)
 def _ddl_key_facts(ddl: str) -> "tuple[tuple[str, ...], frozenset[str]]":
-    """(target primary key, generated columns) of an applied CREATE TABLE, cached by text.
+    """(target primary key, B4 columns) of an applied CREATE TABLE, cached by text.
 
-    Two sqlglot parses per table; the context is built on every render (the card, the
-    gates, the recovery routes), so without the cache a 1,000-table page re-parsed the same
-    DDL many times per render.
+    The B4 set is the generated columns plus the identity columns outside the key (an
+    identity key column is already B2). Three sqlglot parses per table; the context is
+    built on every render (the card, the gates, the recovery routes), so without the cache
+    a 1,000-table page re-parsed the same DDL many times per render.
     """
     from dsql_migrator.core.converter import (
         parse_target_generated_columns,
+        parse_target_identity_columns,
         parse_target_primary_key,
     )
 
-    return (
-        tuple(parse_target_primary_key(ddl, for_exclusion=True)),
-        frozenset(parse_target_generated_columns(ddl)),
-    )
+    pk = tuple(parse_target_primary_key(ddl, for_exclusion=True))
+    identity = parse_target_identity_columns(ddl) - set(pk)
+    return pk, frozenset(parse_target_generated_columns(ddl)) | identity
 
 
 # The FK pass applies each ``conv.foreign_key_ddls`` statement (an ``ALTER TABLE ... ADD
@@ -381,6 +385,22 @@ def missing_target_columns(
     return missing
 
 
+def set_digest(columns: Iterable[str]) -> str:
+    """A stable fingerprint of an exclusion COLUMN SET (the overlay ledger's key field).
+
+    ``sha256("v1|" + NUL-joined sorted distinct names)``: NUL cannot occur in a PostgreSQL
+    or MySQL identifier, so two different sets can never collide; never Python ``hash()``
+    (salted per process). The empty set is ``sha256("v1|")``. The names are hashed
+    verbatim -- the source names the loader quotes. FROZEN: every ledger record carries
+    this value, so changing the encoding would make every recorded table mismatch.
+    """
+    import hashlib
+
+    return hashlib.sha256(
+        ("v1|" + "\x00".join(sorted(set(columns)))).encode("utf-8")
+    ).hexdigest()
+
+
 class IssueSeverity(Enum):
     ERROR = "error"      # blocks Start Full Load, Deploy infrastructure and Start CDC
     WARNING = "warning"  # shown; does not block
@@ -463,4 +483,5 @@ __all__ = [
     "column_exclusion_verdict",
     "effective_exclusions",
     "missing_target_columns",
+    "set_digest",
 ]
