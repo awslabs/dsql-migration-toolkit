@@ -1545,6 +1545,178 @@ class CdcStackParams(BaseModel):
     placeholders: list[tuple[str, str]]
     stack_name: str
     topic_prefix: str
+    # The 0.1.561 ColumnExcludeList for the same selection, when the caller computed one.
+    # Start CDC keeps it instead of ``filled``'s value when the DEPLOYED stack carries
+    # exactly it, so an existing pipeline's capture list stays byte-identical
+    # (see :func:`choose_column_exclude_value`). ``None``: always send ``filled``'s value.
+    column_exclude_legacy: Optional[str] = None
+
+
+# CloudFormation caps one parameter VALUE at 4,096 bytes, and ColumnExcludeList is one
+# parameter (then Debezium column.exclude.list), so the whole capture exclusion must fit.
+CDC_PARAMETER_BYTE_LIMIT = 4096
+
+# Regex metacharacters Debezium would interpret inside a column.exclude.list name part.
+_CDC_REGEX_META = frozenset("\\^$.|?*+()[]{}")
+
+
+def _cdc_escape_part(part: str) -> str:
+    return "".join("\\" + ch if ch in _CDC_REGEX_META else ch for ch in part)
+
+
+def _cdc_case_twins(captured: "Sequence[TableDef]") -> "set[str]":
+    """Captured ``db.table.column`` names that another captured column matches ignoring case.
+
+    Debezium compiles each column.exclude.list entry CASE-INSENSITIVELY and matches the
+    whole ``db.table.column`` (``Strings.setOfRegex(pattern, CASE_INSENSITIVE)`` +
+    ``Matcher.matches()`` in debezium-core 2.7.4), so ``shop.T.note`` also drops
+    ``shop.t.note`` -- whether the twin is in the db, the table or the column part. An
+    entry for a name in this set gets ``(?-i)``, which on an exact name can only narrow the
+    match to that one column; every other entry is left byte-identical.
+    """
+    seen: dict[str, set[str]] = {}
+    for table in captured:
+        for column in table.columns:
+            qualified = f"{table.name}.{column.name}"
+            seen.setdefault(qualified.lower(), set()).add(qualified)
+    return {q for group in seen.values() if len(group) > 1 for q in group}
+
+
+def format_column_exclude_value(
+    columns: "Mapping[str, Sequence[str]]",
+    captured: "Sequence[TableDef]" = (),
+) -> str:
+    """The ColumnExcludeList value (0.1.562+): each entry matches exactly one column.
+
+    ``columns`` maps ``db.table`` (``schema.table`` on PostgreSQL) to its excluded column
+    names. Debezium reads every entry as an anchored, case-insensitive REGEX, which the
+    0.1.561 form (:func:`~dsql_migrator.ui.data_migration._models.format_column_exclude_list`,
+    kept verbatim as the legacy form) ignored: a ``$`` in a name made the entry match
+    nothing, a ``.`` matched any character, and a case twin was dropped along with it.
+
+    * regex metacharacters are escaped INSIDE each part; the separator dots stay, so a
+      plain name's entry is byte-identical to the legacy form;
+    * ``(?-i)`` is prefixed when another ``captured`` column has the same qualified name
+      ignoring case (a twin in the db, table or column part);
+    * only when that plain form exceeds :data:`CDC_PARAMETER_BYTE_LIMIT`, the equivalent
+      COMPACT form is returned: tables of one db with the SAME column set collapse into
+      ``db\\.(?:t1|t2)\\.(?:c1|c2)`` -- exact, because every member has exactly that set.
+
+    Sorted and deterministic. Empty input -> ``""``.
+    """
+    twins = _cdc_case_twins(list(captured))
+
+    def _needs_case(table: str, cols) -> bool:
+        return any(f"{table}.{c}" in twins for c in cols)
+
+    def _prefix(table: str, cols, entry: str) -> str:
+        return ("(?-i)" + entry) if _needs_case(table, cols) else entry
+
+    def _qualified(table: str) -> list[str]:
+        db, _, tbl = table.partition(".")
+        return [_cdc_escape_part(db)] + ([_cdc_escape_part(tbl)] if tbl else [])
+
+    plain: list[str] = []
+    for table in sorted(columns):
+        for column in sorted(columns[table]):
+            entry = ".".join(_qualified(table) + [_cdc_escape_part(column)])
+            plain.append(_prefix(table, [column], entry))
+    value = ",".join(plain)
+    if len(value.encode("utf-8")) <= CDC_PARAMETER_BYTE_LIMIT:
+        return value
+
+    def _alt(items) -> str:
+        escaped = [_cdc_escape_part(i) for i in items]
+        return escaped[0] if len(escaped) == 1 else "(?:" + "|".join(escaped) + ")"
+
+    # Group qualified tables by (db, exact column set); an unqualified name stays alone.
+    groups: dict[tuple[str, tuple[str, ...]], list[str]] = {}
+    singles: list[tuple[str, tuple[str, ...]]] = []
+    for table in sorted(columns):
+        cols = tuple(sorted(columns[table]))
+        if not cols:
+            continue
+        db, _, tbl = table.partition(".")
+        if tbl:
+            groups.setdefault((db, cols), []).append(tbl)
+        else:
+            singles.append((table, cols))
+    compact: list[tuple[str, str]] = []
+    for (db, cols), tbls in groups.items():
+        entry = "\\.".join([_cdc_escape_part(db), _alt(tbls), _alt(cols)])
+        needs = any(_needs_case(f"{db}.{t}", cols) for t in tbls)
+        compact.append((f"{db}.{tbls[0]}", ("(?-i)" + entry) if needs else entry))
+    for table, cols in singles:
+        entry = "\\.".join([_cdc_escape_part(table), _alt(cols)])
+        compact.append((table, _prefix(table, cols, entry)))
+    return ",".join(entry for _key, entry in sorted(compact))
+
+
+def column_exclude_inexact_entries(
+    columns: "Mapping[str, Sequence[str]]",
+    captured: "Sequence[TableDef]" = (),
+) -> list[str]:
+    """``db.table.column`` names whose 0.1.561 (unescaped) entry was not an exact match.
+
+    A regex character in a part, or a case twin, makes the legacy entry match nothing or
+    more than the one column. Used to warn when a stack deployed with the legacy form is
+    KEPT on it (:func:`choose_column_exclude_value`). Sorted.
+    """
+    twins = _cdc_case_twins(list(captured))
+    inexact: list[str] = []
+    for table in sorted(columns):
+        for column in sorted(columns[table]):
+            parts = [p for p in (*table.partition(".")[::2], column) if p]
+            qualified = f"{table}.{column}"
+            if any(_cdc_escape_part(p) != p for p in parts) or qualified in twins:
+                inexact.append(qualified)
+    return inexact
+
+
+def choose_column_exclude_value(
+    new_value: str, legacy_value: "Optional[str]", deployed_value: "Optional[str]"
+) -> str:
+    """Which ColumnExcludeList to send: the legacy form ONLY to a stack deployed with it.
+
+    A stack whose deployed value equals the 0.1.561 form keeps it byte-for-byte, so a
+    RUNNING pipeline gets no connector update from this release (``config_changed`` stays
+    False). Every other case -- no stack yet, a stack deployed by 0.1.562+, a selection
+    that changed since -- gets the exact-match form. Pure.
+    """
+    if (
+        legacy_value is not None
+        and deployed_value is not None
+        and deployed_value == legacy_value
+    ):
+        return legacy_value
+    return new_value
+
+
+def apply_column_exclude_chooser(
+    params: "CdcStackParams", deployed_parameters: "Optional[Mapping[str, object]]"
+) -> "CdcStackParams":
+    """``params`` with ColumnExcludeList chosen against the DEPLOYED stack's value."""
+    if params.column_exclude_legacy is None or deployed_parameters is None:
+        return params
+    if "ColumnExcludeList" not in deployed_parameters:
+        return params
+    filled = dict(params.filled)
+    if "ColumnExcludeList" not in filled:
+        return params
+    chosen = choose_column_exclude_value(
+        filled["ColumnExcludeList"],
+        params.column_exclude_legacy,
+        str(deployed_parameters.get("ColumnExcludeList") or ""),
+    )
+    if chosen == filled["ColumnExcludeList"]:
+        return params
+    return params.model_copy(
+        update={
+            "filled": [
+                (k, chosen if k == "ColumnExcludeList" else v) for k, v in params.filled
+            ]
+        }
+    )
 
 
 # The cdc-stack watermark parameter keys, in template order. Exposed so the UI /

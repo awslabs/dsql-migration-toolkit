@@ -167,8 +167,15 @@ def test_every_path_reads_the_effective_set_not_the_raw_one():
     assert init.count("excluded_lob_columns=effective_lob_exclusions(") == 3
     assert init.count(raw) == 0  # the run guard reads state.lob_exclusions() on its own name
     assert "_prereq_exclusions = effective_lob_exclusions(" in init
-    for path in (root / "_cdc_ui.py", ui / "validation.py"):
-        assert "effective_lob_exclusions(migration_state" in path.read_text(encoding="utf-8"), path
+    assert "effective_lob_exclusions(migration_state" in (ui / "validation.py").read_text(
+        encoding="utf-8")
+    # CDC: every builder, the Start/Deploy gates and the CDC-only preview go through the ONE
+    # helper (effective set + captured generated columns + the chooser); none formats alone.
+    cdc = (root / "_cdc_ui.py").read_text(encoding="utf-8")
+    assert cdc.count("cdc_capture_exclusions(migration_state, inventory, tables_for_config)") == 3
+    assert "format_column_exclude_list(" not in cdc and "cdc_excluded_columns(" not in cdc
+    assert "format_column_exclude_list(" not in (root / "_cdc_monitoring.py").read_text(
+        encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------

@@ -1063,6 +1063,16 @@ def _probe_cdc_stack_phase(migration_state, session) -> None:
         if discovery is not None
         else None
     )
+    # The DEPLOYED ColumnExcludeList, from the SAME describe, so the preview can show what
+    # Start CDC will send (a stack on the 0.1.561 form keeps it byte-for-byte).
+    _deployed_params = (
+        getattr(discovery, "current_parameters", None) if discovery is not None else None
+    )
+    migration_state.set_cdc_deployed_column_exclude_list(
+        _deployed_params.get("ColumnExcludeList")
+        if _deployed_params and "ColumnExcludeList" in _deployed_params
+        else None
+    )
     # Also read each ATTACH CANDIDATE's replicated table set, so the attach offer can be
     # withheld when the pipeline does not cover what this session loaded. ``list_stacks``
     # returns no parameters, so this needs one describe per candidate -- bounded by the

@@ -16148,6 +16148,10 @@ def test_start_cdc_shows_the_table_set_plainly_with_the_why_on_hover() -> None:
     class _Table:
         def __init__(self, name):
             self.name = name
+            # A real TableDef always has both; the Start render reads them to build the
+            # capture exclusions (generated columns of the captured tables).
+            self.columns = []
+            self.primary_key = []
 
     class _Inventory:
         def __init__(self, tables):

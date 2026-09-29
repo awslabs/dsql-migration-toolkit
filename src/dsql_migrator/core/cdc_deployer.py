@@ -65,6 +65,7 @@ from dsql_migrator.core.cdc import (
     CDC_WATERMARK_PARAM_KEYS,
     CdcInfraParams,
     CdcStackParams,
+    apply_column_exclude_chooser,
     build_watermark_params,
     cdc_expected_connector_names,
 )
@@ -1239,6 +1240,9 @@ def run_cdc_start(
         driver.stage("discover_stack", "IN_PROGRESS")
         driver.log(f"Discovering cdc-stack '{stack_name}'…")
         discovery = deployer.discover_stack(stack_name)
+        # A stack deployed with the 0.1.561 ColumnExcludeList keeps it byte-for-byte, so
+        # a running pipeline is not updated by this release; judged against THIS describe.
+        params = apply_column_exclude_chooser(params, discovery.current_parameters)
         driver.stage("discover_stack", "DONE")
 
         # 2. validate connector params

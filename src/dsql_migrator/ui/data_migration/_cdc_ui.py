@@ -92,6 +92,7 @@ from dsql_migrator.ui.data_migration._models import (
     cdc_excluded_columns,
     effective_lob_exclusions,
     missing_column_block_reason,
+    cdc_capture_exclusions,
     stored_exclusion_block_reason,
     stored_exclusion_issues,
     format_column_exclude_list,
@@ -451,6 +452,19 @@ def _render_cdc_step(
             locked=lob_locked,
             lock_reason=lob_lock_reason,
             source_type=_cdc_source_type(session),
+            # What Start CDC will SEND (preview == sent): the effective set plus the
+            # captured tables' generated columns, in the form the chooser picks.
+            capture_preview=cdc_capture_exclusions(
+                migration_state,
+                inventory,
+                _cdc_tables_for_config(
+                    migration_state,
+                    inventory,
+                    _cdc_watermark(
+                        _current_job(job_manager, getattr(migration_state, "job_id", None))
+                    ),
+                ),
+            ).sent,
         )
 
     # 4. START: actually deploy the connectors (cloudformation update_stack) and
@@ -628,15 +642,13 @@ def _render_cdc_source_config_card(
     # Build the connector config (pure -- no AWS calls). Restrict the table list
     # to what the watermark covered when inventory + watermark exist; otherwise
     # fall back to the user's confirmed selection (manual seed).
-    # The EFFECTIVE set (key columns dropped), the same one Full Load and Validation use.
-    exclusions = effective_lob_exclusions(migration_state, inventory)
-    # Union in the columns the TARGET computes: DSQL rejects a write that supplies a value
-    # for a preserved STORED generated column, and the sink dead-letters that permanently.
-    exclude_value = format_column_exclude_list(
-        cdc_excluded_columns(exclusions, inventory)
-    )
-    exclude_list = exclude_value.split(",") if exclude_value else None
     tables_for_config = _cdc_tables_for_config(migration_state, inventory, watermark)
+    # ONE computation for the preview, Start and Deploy (cdc_capture_exclusions): the
+    # EFFECTIVE set (key columns dropped) plus the STORED generated columns of the captured
+    # tables -- DSQL rejects a write to one (428C9) and the sink dead-letters it.
+    _capture = cdc_capture_exclusions(migration_state, inventory, tables_for_config)
+    # The preview shows what Start CDC will SEND (a stack on the 0.1.561 form keeps it).
+    exclude_list = _capture.sent.split(",") if _capture.sent else None
     _resume_override, _force_initial_snapshot = _cdc_resume_signal(migration_state, session)
 
     # A CDC sink needs at least one table: with none selected the sink topic list
@@ -2246,12 +2258,47 @@ def _render_cdc_start_button(
             body=prereq_block,
         )
 
+    # The capture exclusions Start would send: refused when they cannot be carried (a
+    # comma in a name, over CloudFormation's 4,096-byte parameter) -- say so before the
+    # click -- and flagged when a stack kept on the 0.1.561 form never matched some names.
+    _capture = cdc_capture_exclusions(
+        migration_state,
+        inventory,
+        _cdc_tables_for_config(migration_state, inventory, watermark),
+    )
+    if _capture.error and not prereq_block:
+        render_notice(
+            ui,
+            tone="error",
+            header="The excluded columns cannot be sent to CDC",
+            body=_capture.error,
+        )
+    if _capture.inexact:
+        _names = ", ".join(_capture.inexact[:5]) + (
+            f" and {len(_capture.inexact) - 5} more" if len(_capture.inexact) > 5 else ""
+        )
+        render_notice(
+            ui,
+            tone="warning",
+            header="The deployed CDC stack may not exclude these columns exactly",
+            body=(
+                f"{_names}: the stack was deployed by a version that sent each exclusion "
+                "as an unescaped pattern, and a regex character or a same-name column "
+                "differing only in case makes it match nothing or more than that "
+                "column. It is kept as deployed so a running pipeline is not changed. "
+                "To match exactly, delete the CDC infrastructure and deploy it again."
+            ),
+        )
+
     start_btn = ui.button(  # type: ignore[attr-defined]
         "Start CDC", on_click=_confirm, icon="play_arrow"
     ).props("color=primary")
     if prereq_block:
         start_btn.props("disable")
         start_btn.tooltip(prereq_block)
+    elif _capture.error:
+        start_btn.props("disable")
+        start_btn.tooltip(_capture.error)
     elif not ready:
         start_btn.props("disable")
         ui.label(  # type: ignore[attr-defined]
@@ -2743,7 +2790,8 @@ def _stored_exclusion_deploy_block(migration_state, job_manager, inventory, sess
     there as a warning instead.
 
     Before the lock it also holds Deploy on a source column the applied target DDL lacks:
-    the sink would dead-letter every change to it (42703).
+    the sink would dead-letter every change to it (42703). And it always holds Deploy when
+    the capture exclusions cannot be carried at all (``CdcCaptureExclusions.error``).
     """
     from dsql_migrator.ui.workflow import WorkflowStep, get_status
 
@@ -2755,9 +2803,17 @@ def _stored_exclusion_deploy_block(migration_state, job_manager, inventory, sess
     locked, _reason = lob_exclusion_lock(
         migration_state, job_manager, full_load_committed=full_load_committed
     )
-    return stored_exclusion_block_reason(
+    blocked = stored_exclusion_block_reason(
         stored_exclusion_issues(migration_state, inventory, committed=locked)
     ) or (None if locked else missing_column_block_reason(migration_state, inventory))
+    if blocked:
+        return blocked
+    _job = _current_job(job_manager, getattr(migration_state, "job_id", None))
+    return cdc_capture_exclusions(
+        migration_state,
+        inventory,
+        _cdc_tables_for_config(migration_state, inventory, _cdc_watermark(_job)),
+    ).error
 
 
 def _render_cdc_least_privilege_note(ui, *, session=None) -> None:
@@ -4701,15 +4757,14 @@ def _start_cdc_deploy(
     job = _current_job(job_manager, migration_state.job_id)
     watermark = _cdc_watermark(job)
     override = migration_state.cdc_start_override()
-    # The EFFECTIVE set (key columns dropped), the same one Full Load and Validation use.
-    exclusions = effective_lob_exclusions(migration_state, inventory)
-    # Union in the columns the TARGET computes: DSQL rejects a write that supplies a value
-    # for a preserved STORED generated column, and the sink dead-letters that permanently.
-    exclude_value = format_column_exclude_list(
-        cdc_excluded_columns(exclusions, inventory)
-    )
-    exclude_list = exclude_value.split(",") if exclude_value else None
     tables_for_config = _cdc_tables_for_config(migration_state, inventory, watermark)
+    # ONE computation for the preview, Start and Deploy (cdc_capture_exclusions): the
+    # EFFECTIVE set (key columns dropped) plus the STORED generated columns of the captured
+    # tables -- DSQL rejects a write to one (428C9) and the sink dead-letters it.
+    _capture = cdc_capture_exclusions(migration_state, inventory, tables_for_config)
+    # The exact-match form; Start CDC re-chooses against the LIVE stack's value
+    # (core.cdc.apply_column_exclude_chooser), Deploy has no stack to keep.
+    exclude_list = _capture.value.split(",") if _capture.value else None
     _resume_override, _force_initial_snapshot = _cdc_resume_signal(migration_state, session)
     mode = migration_state.cdc_start_mode()
     # Guard: a CDC sink requires at least one table (empty -> SinkTopics="" ->
@@ -4735,8 +4790,19 @@ def _start_cdc_deploy(
         for table, cols in migration_state.cdc_message_key_columns().items()
         if table in selected_names
     }
+    if _capture.error:
+        render_notice(
+            ui,
+            tone="error",
+            header="The excluded columns cannot be sent to CDC",
+            body=_capture.error,
+        )
+        return
+    # Judged on the STRUCTURED set: the formatted entries are escaped / case-flagged /
+    # grouped, so comparing strings against them would miss an excluded key column.
     bad_key_cols = composite_cdc_excluded_key_columns(
-        message_key_columns, exclude_list or []
+        message_key_columns,
+        [f"{t}.{c}" for t, cols in _capture.structured.items() for c in cols],
     )
     if bad_key_cols:
         render_notice(
@@ -4874,6 +4940,7 @@ def _start_cdc_deploy(
         topic_prefix=CDC_DEFAULT_TOPIC_PREFIX,
         sink_mcu_count=_sink_mcu_count(),
     )
+    params = params.model_copy(update={"column_exclude_legacy": _capture.legacy})
     migration_state.clear_cdc_deploy_log()
     stack_name = migration_state.cdc_stack_name
     aws_profile = getattr(session, "aws_profile", None)
@@ -4977,7 +5044,9 @@ def _start_cdc_deploy(
         mode=mode,
         source_type=_cdc_source_type(session),
         force_snapshot=_force_initial_snapshot,
-        exclusions=exclusions,
+        # The operator's (effective) exclusions only -- "oversized LOB" in the detail; the
+        # generated columns the capture also drops are not the operator's choice.
+        exclusions=effective_lob_exclusions(migration_state, inventory),
     )
     job_id = job_manager.submit(
         _logged_cdc_lifecycle(_action, detail=_detail, work=work)
@@ -5250,15 +5319,17 @@ async def _start_cdc_infra_deploy(
     job = _current_job(job_manager, migration_state.job_id)
     watermark = _cdc_watermark(job)
     override = migration_state.cdc_start_override()
-    # The EFFECTIVE set (key columns dropped), the same one Full Load and Validation use.
-    exclusions = effective_lob_exclusions(migration_state, inventory)
-    # Union in the columns the TARGET computes: DSQL rejects a write that supplies a value
-    # for a preserved STORED generated column, and the sink dead-letters that permanently.
-    exclude_value = format_column_exclude_list(
-        cdc_excluded_columns(exclusions, inventory)
-    )
-    exclude_list = exclude_value.split(",") if exclude_value else None
     tables_for_config = _cdc_tables_for_config(migration_state, inventory, watermark)
+    # ONE computation for the preview, Start and Deploy (cdc_capture_exclusions): the
+    # EFFECTIVE set (key columns dropped) plus the STORED generated columns of the captured
+    # tables -- DSQL rejects a write to one (428C9) and the sink dead-letters it.
+    _capture = cdc_capture_exclusions(migration_state, inventory, tables_for_config)
+    # The exact-match form; Start CDC re-chooses against the LIVE stack's value
+    # (core.cdc.apply_column_exclude_chooser), Deploy has no stack to keep.
+    exclude_list = _capture.value.split(",") if _capture.value else None
+    if _capture.error:
+        ui.notify(_capture.error, type="negative", position="top")
+        return
     _resume_override, _force_initial_snapshot = _cdc_resume_signal(migration_state, session)
     mode = migration_state.cdc_start_mode()
     source_config = dispatch_source_config(

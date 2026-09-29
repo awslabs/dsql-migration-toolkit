@@ -1889,6 +1889,83 @@ def format_column_exclude_list(
     return ",".join(entries)
 
 
+@dataclass(frozen=True)
+class CdcCaptureExclusions:
+    """Everything the CDC surfaces need about ``column.exclude.list``, from ONE computation.
+
+    ``structured`` is ``{db.table: [columns]}``: the EFFECTIVE exclusion set plus the
+    STORED generated columns of the CAPTURED tables. ``value`` is its exact-match form
+    (``core.cdc.format_column_exclude_value``) and ``legacy`` the exact 0.1.561 value for
+    the same session (raw stored set, every inventory table's generated columns, the
+    unescaped formatter). ``sent`` is what Start CDC sends against the stack recorded by
+    the last discovery -- the preview shows it, so preview == sent. ``error`` blocks
+    Deploy and Start (a comma in a name, or over CloudFormation's 4,096-byte parameter);
+    ``inexact`` lists the names a stack KEPT on the legacy form does not match exactly.
+    """
+
+    structured: "dict[str, list[str]]"
+    value: str
+    legacy: str
+    sent: str
+    error: "Optional[str]" = None
+    inexact: "tuple[str, ...]" = ()
+
+
+def cdc_capture_exclusions(
+    migration_state, inventory, captured_tables: "Sequence[object]"
+) -> CdcCaptureExclusions:
+    """Build :class:`CdcCaptureExclusions` for the tables CDC captures (see there)."""
+    from dsql_migrator.core.cdc import (
+        CDC_PARAMETER_BYTE_LIMIT,
+        choose_column_exclude_value,
+        column_exclude_inexact_entries,
+        format_column_exclude_value,
+    )
+    from dsql_migrator.core.converter import pg_preserved_generated_columns
+
+    captured = list(captured_tables or ())
+    merged: dict[str, set[str]] = {
+        table: set(cols)
+        for table, cols in effective_lob_exclusions(migration_state, inventory).items()
+    }
+    for table in captured:
+        preserved = [c.name for c in pg_preserved_generated_columns(table)]
+        if preserved:
+            merged.setdefault(table.name, set()).update(preserved)
+    structured = {t: sorted(c) for t, c in sorted(merged.items()) if c}
+    value = format_column_exclude_value(structured, captured)
+    legacy_columns = cdc_excluded_columns(migration_state.lob_exclusions(), inventory)
+    legacy = format_column_exclude_list(legacy_columns)
+    deployed = getattr(migration_state, "cdc_deployed_column_exclude_list", None)
+    sent = choose_column_exclude_value(value, legacy, deployed)
+    error: "Optional[str]" = None
+    inexact: "tuple[str, ...]" = ()
+    if deployed is not None and sent == deployed:
+        # Exactly what the stack already carries: nothing new to refuse (0.1.561 accepted
+        # it), but a legacy value may not match its names exactly -- say so.
+        if sent == legacy:
+            inexact = tuple(column_exclude_inexact_entries(legacy_columns, captured))
+    else:
+        commas = [
+            f"{t}.{c}" for t, cols in structured.items() for c in cols if "," in f"{t}.{c}"
+        ]
+        size = len(sent.encode("utf-8"))
+        if commas:
+            error = (
+                f"{', '.join(commas[:3])}: a comma in a name cannot be carried in the CDC "
+                "capture list, which is comma-separated. Remove this exclusion before "
+                "deploying or starting CDC."
+            )
+        elif size > CDC_PARAMETER_BYTE_LIMIT:
+            error = (
+                f"The column exclusions need {size:,} bytes in the CDC capture "
+                f"configuration, over CloudFormation's {CDC_PARAMETER_BYTE_LIMIT:,}-byte "
+                "limit for one parameter. Exclude fewer columns before deploying or "
+                "starting CDC."
+            )
+    return CdcCaptureExclusions(structured, value, legacy, sent, error, inexact)
+
+
 # DSQL caps a single value at 1 MiB and the MSK Serverless broker caps a message
 # at 8 MiB; the Kafka *client* default is 1 MiB (spike H13). Used for display.
 _DSQL_VALUE_LIMIT_MIB = 1

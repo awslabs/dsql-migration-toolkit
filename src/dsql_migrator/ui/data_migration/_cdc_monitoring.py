@@ -2545,6 +2545,7 @@ def _render_cdc_lob_exclusion_panel(
     migration_wide: bool = False,
     selected_tables: Optional[Sequence[str]] = None,
     source_type: SourceType = SourceType.MYSQL,
+    capture_preview: Optional[str] = None,
 ) -> None:
     """Render the explicit, opt-in oversized-LOB column exclusion (H13).
 
@@ -2692,10 +2693,11 @@ def _render_cdc_lob_exclusion_panel(
         # show it only in the CDC context. On the Full Load screen the same
         # selection just means "not written", so the raw connector value would be
         # noise there.
+        # ``capture_preview`` is the value Start CDC will send, computed by the caller with
+        # the builders' own helper (cdc_capture_exclusions) -- not re-derived from the raw
+        # stored set here, which showed key columns and missed the generated columns.
         if not migration_wide:
-            exclude_value = format_column_exclude_list(
-                {table: sorted(cols) for table, cols in selection.items()}
-            )
+            exclude_value = capture_preview or ""
             if exclude_value:
                 with ui.row().classes("items-center gap-1 no-wrap flex-wrap"):  # type: ignore[attr-defined]
                     ui.label("column.exclude.list:").classes(  # type: ignore[attr-defined]

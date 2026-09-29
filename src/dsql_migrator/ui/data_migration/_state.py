@@ -274,6 +274,11 @@ class DataMigrationState:
         # ``cdc_deployer._drop_pg_source_replication``). Empty when no stack / no param.
         # Transient/session-only.
         self.cdc_deployed_slot_name: Optional[str] = None
+        # The DEPLOYED stack's ColumnExcludeList, from the same phase probe. ``None`` when
+        # there is no stack (or no such parameter); ``""`` is a real, empty value. Lets the
+        # preview show what Start CDC will send: a stack deployed with the 0.1.561 form
+        # keeps it (core.cdc.choose_column_exclude_value). Transient/session-only.
+        self.cdc_deployed_column_exclude_list: Optional[str] = None
         self.cdc_activity: Optional["CdcActivitySummary"] = None
         # Per-table source/target row counts for the migration-status view, fetched
         # on demand (a direct COUNT(*) on each side -- read-only but adds source
@@ -814,6 +819,7 @@ class DataMigrationState:
             # Belongs to the previously-targeted stack; the fresh probe repopulates.
             self.cdc_reconciled_table_names = []
             self.cdc_deployed_slot_name = None
+            self.cdc_deployed_column_exclude_list = None
             # Applied-ops + replication-lag metrics are per-stack too; drop them so the
             # adopted stack's poll repopulates rather than showing the prior stack's.
             self.cdc_applied_ops_by_table = {}
@@ -894,6 +900,11 @@ class DataMigrationState:
         with self._lock:
             cleaned = (slot_name or "").strip()
             self.cdc_deployed_slot_name = cleaned or None
+
+    def set_cdc_deployed_column_exclude_list(self, value: Optional[str]) -> None:
+        """Record the DEPLOYED stack's ColumnExcludeList (``None``: no stack/param)."""
+        with self._lock:
+            self.cdc_deployed_column_exclude_list = None if value is None else str(value)
 
     def set_cdc_applied_ops_by_table(
         self, applied_ops: "dict[str, dict[str, int]]"
