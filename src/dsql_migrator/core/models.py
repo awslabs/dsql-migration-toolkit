@@ -1764,6 +1764,27 @@ class TableValidationResult(BaseModel):
     # tool already had. Never changes ``matched`` -- the rows really are absent -- it
     # only explains WHY, so an expected gap is distinguishable from unexplained loss.
     rows_quarantined: int = Field(default=0, ge=0)
+    # The column-exclusion NULL proof, counted in the SAME target pass that produces
+    # ``target_row_count`` (no extra scan). ``excluded_nonnull_counts``: per excluded
+    # column the tool writes as NULL, the rows holding a value there (expected 0).
+    # ``legacy_nonnull_counts``: per legacy entry (excluded before the NULL overlay; its
+    # rows take the target DEFAULT) -- information only, never a mismatch. Both empty
+    # when the table has no such column.
+    excluded_nonnull_counts: dict[str, int] = Field(default_factory=dict)
+    legacy_nonnull_counts: dict[str, int] = Field(default_factory=dict)
+    # "complete" -- the counts above cover every row; "not_determined" -- they do not
+    # (``proof_reason``: query_error | catalog_unreadable | table_error | incomplete);
+    # None -- no proof column for this table.
+    proof_state: Optional[Literal["complete", "not_determined"]] = None
+    proof_reason: Optional[
+        Literal["query_error", "catalog_unreadable", "table_error", "incomplete"]
+    ] = None
+    # True when a complete proof found values in a NULL column under a policy that
+    # makes that a mismatch (a Full Load type); ``matched`` is then False.
+    excluded_values_block: bool = False
+    # Excluded columns not on the Aurora DSQL table at all (nothing was written there);
+    # never named in any SQL.
+    proof_absent_columns: list[str] = Field(default_factory=list)
 
     @property
     def deficit(self) -> int:
@@ -1783,6 +1804,8 @@ class TableValidationResult(BaseModel):
             not self.matched
             and self.rows_quarantined > 0
             and self.deficit == self.rows_quarantined
+            # Values in an excluded column are not explained by dropped rows.
+            and not self.excluded_values_block
         )
 
 

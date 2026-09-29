@@ -18,7 +18,7 @@ module docstring for the cross-engine checksum-normalization rationale.
 from __future__ import annotations
 
 import re
-from typing import Mapping, Optional
+from typing import Mapping, Optional, Sequence
 
 from psycopg import sql
 
@@ -794,39 +794,97 @@ def build_mysql_pk_next_page_sql(table: TableDef, pk_column: str) -> str:
     )
 
 
+def _nonnull_flags(nonnull_columns: Sequence[str]) -> sql.Composable:
+    """``, (c1 IS NOT NULL), (c2 IS NOT NULL)`` -- one boolean per proof column."""
+    return sql.SQL("").join(
+        sql.SQL(", ({} IS NOT NULL)").format(sql.Identifier(column))
+        for column in nonnull_columns
+    )
+
+
 def build_pg_pk_first_page_sql(
-    table: TableDef, pk_column: str, page_size: int
+    table: TableDef, pk_column: str, page_size: int,
+    nonnull_columns: Sequence[str] = (),
 ) -> sql.Composed:
     """First keyset page of target primary keys (ascending, bounded by ``page_size``).
 
     Identifiers compose with :class:`psycopg.sql.Identifier` and the bound is a
     :class:`psycopg.sql.Literal` so nothing can break out of the SQL (Req 9.4).
+
+    ``nonnull_columns`` (TARGET ONLY -- never passed on the PostgreSQL-source shim) adds
+    one ``(c IS NOT NULL)`` boolean per excluded column after the key, so the SAME page
+    that counts the rows also proves the excluded columns NULL. Empty: the statement is
+    byte-identical to the one without the proof.
     """
+    if not nonnull_columns:
+        return sql.SQL(
+            "SELECT {pk} AS pk FROM {table} ORDER BY {pk} LIMIT {limit}"
+        ).format(
+            pk=sql.Identifier(pk_column),
+            table=_pg_table_identifier(table.name),
+            limit=sql.Literal(page_size),
+        )
     return sql.SQL(
-        "SELECT {pk} AS pk FROM {table} ORDER BY {pk} LIMIT {limit}"
+        "SELECT {pk} AS pk{flags} FROM {table} ORDER BY {pk} LIMIT {limit}"
     ).format(
         pk=sql.Identifier(pk_column),
+        flags=_nonnull_flags(nonnull_columns),
         table=_pg_table_identifier(table.name),
         limit=sql.Literal(page_size),
     )
 
 
 def build_pg_pk_next_page_sql(
-    table: TableDef, pk_column: str, page_size: int
+    table: TableDef, pk_column: str, page_size: int,
+    nonnull_columns: Sequence[str] = (),
 ) -> sql.Composed:
     """Subsequent keyset page of target primary keys after the ``last`` placeholder.
 
     The keyset value is bound as a query parameter (``%(last)s``) at execute time,
     so a billion-row table reuses one prepared statement across all pages.
+    ``nonnull_columns``: as :func:`build_pg_pk_first_page_sql` (TARGET ONLY).
     """
+    if not nonnull_columns:
+        return sql.SQL(
+            "SELECT {pk} AS pk FROM {table} WHERE {pk} > {last} "
+            "ORDER BY {pk} LIMIT {limit}"
+        ).format(
+            pk=sql.Identifier(pk_column),
+            table=_pg_table_identifier(table.name),
+            last=sql.Placeholder("last"),
+            limit=sql.Literal(page_size),
+        )
     return sql.SQL(
-        "SELECT {pk} AS pk FROM {table} WHERE {pk} > {last} "
+        "SELECT {pk} AS pk{flags} FROM {table} WHERE {pk} > {last} "
         "ORDER BY {pk} LIMIT {limit}"
     ).format(
         pk=sql.Identifier(pk_column),
+        flags=_nonnull_flags(nonnull_columns),
         table=_pg_table_identifier(table.name),
         last=sql.Placeholder("last"),
         limit=sql.Literal(page_size),
+    )
+
+
+def build_pg_count_sql(
+    table_name: str, nonnull_columns: Sequence[str] = ()
+) -> sql.Composed:
+    """``SELECT COUNT(*)[, COUNT(c1), ...] FROM table`` (TARGET ONLY).
+
+    The composite/missing-PK count fallback. Each ``COUNT(c)`` counts the rows holding a
+    value in an excluded column (the NULL proof) in the same scan as the row count.
+    Empty: byte-identical to the plain row count.
+    """
+    if not nonnull_columns:
+        return sql.SQL("SELECT COUNT(*) FROM {table}").format(
+            table=_pg_table_identifier(table_name)
+        )
+    return sql.SQL("SELECT COUNT(*){counts} FROM {table}").format(
+        counts=sql.SQL("").join(
+            sql.SQL(", COUNT({})").format(sql.Identifier(column))
+            for column in nonnull_columns
+        ),
+        table=_pg_table_identifier(table_name),
     )
 
 

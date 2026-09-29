@@ -81,6 +81,7 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Protocol
 
 from psycopg import sql
@@ -88,6 +89,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from dsql_migrator.core.introspector import _default_engine_factory
+from dsql_migrator.core.occ import is_occ_conflict
 from dsql_migrator.core.models import (
     ColumnDef,
     DriftReport,
@@ -140,6 +142,7 @@ from dsql_migrator.core.validation_sql import (  # noqa: F401
     build_mysql_pk_token_sql,
     build_orphan_count_sql,
     build_pg_checksum_sql,
+    build_pg_count_sql,
     build_pg_orphan_page_first_sql,
     build_pg_orphan_page_next_sql,
     build_pg_page_checksum_first_sql,
@@ -618,23 +621,77 @@ def _target_scalar(connection: Any, statement: Any) -> object:
     return row[0]
 
 
-def _target_count(connection: Any, table_name: str) -> int:
+@dataclass
+class _NullProofAccumulator:
+    """The column-exclusion NULL proof of ONE table, filled by the target count pass.
+
+    ``columns`` is the SQL order (the excluded columns the tool writes as NULL first,
+    then the legacy ones, whose rows take the target DEFAULT); ``counts[i]`` is the
+    number of rows holding a value in ``columns[i]``. ``complete`` is set only at the
+    natural end of the pass, so a pass that stopped early never reads as a proof.
+    ``failed`` is set when a proof-bearing target statement raised.
+    """
+
+    columns: tuple[str, ...]
+    legacy: frozenset[str]
+    counts: list[int] = field(default_factory=list)
+    complete: bool = False
+    failed: Optional[BaseException] = None
+    retried: bool = False
+    reason: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if not self.counts:
+            self.counts = [0] * len(self.columns)
+
+    def reset(self) -> None:
+        self.counts = [0] * len(self.columns)
+        self.complete = False
+        self.failed = None
+
+    def add_page(self, rows: Any) -> None:
+        for index in range(len(self.columns)):
+            self.counts[index] += sum(1 for row in rows if row[index + 1])
+
+
+def _target_count(
+    connection: Any, table_name: str,
+    proof: Optional[_NullProofAccumulator] = None,
+) -> int:
     """Return ``COUNT(*)`` for a target table (read-only ``SELECT``).
 
     A single unbounded scan: used ONLY as the fallback for a composite/missing PK
     (see :func:`_bounded_target_count`); on a very large such table it can still hit
-    Aurora DSQL's 300s transaction limit -- a documented residual gap.
+    Aurora DSQL's 300s transaction limit -- a documented residual gap. With ``proof``
+    the same scan also counts ``COUNT(c)`` per excluded column.
     """
-    statement = sql.SQL("SELECT COUNT(*) FROM {table}").format(
-        table=_pg_table_identifier(table_name)
-    )
-    value = _target_scalar(connection, statement)
-    return int(value) if value is not None else 0
+    if proof is None:
+        statement = sql.SQL("SELECT COUNT(*) FROM {table}").format(
+            table=_pg_table_identifier(table_name)
+        )
+        value = _target_scalar(connection, statement)
+        return int(value) if value is not None else 0
+    cursor = connection.cursor()
+    try:
+        cursor.execute(build_pg_count_sql(table_name, proof.columns))
+        row = cursor.fetchone()
+    except Exception as exc:
+        proof.failed = exc
+        raise
+    finally:
+        _safe_close(cursor)
+    if row is None:
+        proof.complete = True
+        return 0
+    proof.counts = [int(value or 0) for value in row[1:]]
+    proof.complete = True
+    return int(row[0]) if row[0] is not None else 0
 
 
 def _target_count_keyset(
     connection: Any, table: TableDef, pk_column: str, page_size: int,
     on_page: Optional[Callable[[], None]] = None,
+    proof: Optional[_NullProofAccumulator] = None,
 ) -> int:
     """Exact target row count via BOUNDED keyset paging on a single-column PK.
 
@@ -645,9 +702,12 @@ def _target_count_keyset(
     stream reconciliation uses) and sums the per-page row counts, so every statement
     stays well under the limit and memory stays at one page. Reads only the PK column
     (Property 7); works for any orderable single-column PK (int/uuid/varchar/binary).
+    With ``proof`` each page also carries one ``(c IS NOT NULL)`` flag per excluded
+    column (never a value), summed into the proof.
     """
-    first_sql = build_pg_pk_first_page_sql(table, pk_column, page_size)
-    next_sql = build_pg_pk_next_page_sql(table, pk_column, page_size)
+    columns = proof.columns if proof is not None else ()
+    first_sql = build_pg_pk_first_page_sql(table, pk_column, page_size, columns)
+    next_sql = build_pg_pk_next_page_sql(table, pk_column, page_size, columns)
     total = 0
     last: object = None
     while True:
@@ -660,10 +720,18 @@ def _target_count_keyset(
             else:
                 cursor.execute(next_sql, {"last": last})
             rows = cursor.fetchall()
+        except Exception as exc:
+            if proof is not None:
+                proof.failed = exc
+            raise
         finally:
             _safe_close(cursor)
         total += len(rows)
+        if proof is not None:
+            proof.add_page(rows)
         if len(rows) < page_size:
+            if proof is not None:
+                proof.complete = True
             return total
         last = rows[-1][0]
 
@@ -671,19 +739,20 @@ def _target_count_keyset(
 def _bounded_target_count(
     connection: Any, table: TableDef, page_size: int,
     on_page: Optional[Callable[[], None]] = None,
+    proof: Optional[_NullProofAccumulator] = None,
 ) -> int:
     """Target row count, bounded (keyset) for a single-column PK; ``COUNT(*)`` else.
 
     A composite/missing PK has no single keyset column, so it falls back to the
     unbounded ``COUNT(*)`` (which can still time out on a very large composite-PK
-    table -- a residual gap not covered here).
+    table -- a residual gap not covered here). ``proof`` rides on either branch.
     """
     pk_column = single_pk_column(table)
     if pk_column is not None:
         return _target_count_keyset(
-            connection, table, pk_column, page_size, on_page=on_page
+            connection, table, pk_column, page_size, on_page=on_page, proof=proof
         )
-    return _target_count(connection, table.name)
+    return _target_count(connection, table.name, proof=proof)
 
 
 def _target_checksum(
@@ -899,14 +968,17 @@ def _iter_source_pks(
 def _iter_target_pks(
     connection: Any, table: TableDef, pk_column: str, page_size: int,
     on_page: Optional[Callable[[], None]] = None,
+    proof: Optional[_NullProofAccumulator] = None,
 ) -> "Iterator[int]":
     """Yield every target PK in ascending order via bounded keyset pagination.
 
     Mirrors :func:`_iter_source_pks` on the psycopg target: one bounded page per
-    round-trip, keyset-advanced, so a billion-row table never lands in RAM.
+    round-trip, keyset-advanced, so a billion-row table never lands in RAM. ``proof``
+    (TARGET ONLY) is completed only when the consumer exhausts the stream.
     """
-    first_sql = build_pg_pk_first_page_sql(table, pk_column, page_size)
-    next_sql = build_pg_pk_next_page_sql(table, pk_column, page_size)
+    columns = proof.columns if proof is not None else ()
+    first_sql = build_pg_pk_first_page_sql(table, pk_column, page_size, columns)
+    next_sql = build_pg_pk_next_page_sql(table, pk_column, page_size, columns)
     last: object = None
     while True:
         if on_page is not None:
@@ -918,12 +990,20 @@ def _iter_target_pks(
             else:
                 cursor.execute(next_sql, {"last": last})
             rows = cursor.fetchall()
+        except Exception as exc:
+            if proof is not None:
+                proof.failed = exc
+            raise
         finally:
             _safe_close(cursor)
+        if proof is not None:
+            proof.add_page(rows)
         for row in rows:
             last = row[0]
             yield int(row[0])
         if len(rows) < page_size:
+            if proof is not None:
+                proof.complete = True
             return
 
 
@@ -952,6 +1032,7 @@ def _source_row_count_live(
     """Exact live source count: PG keyset-bounds it (single PK) like the target; MySQL
     (no per-txn limit) uses a plain ``COUNT(*)`` as before."""
     if _source_is_postgres(dialect):
+        # Never a NULL proof here: the proof columns are TARGET ONLY.
         return _bounded_target_count(
             PgSourceConnection(connection), table, page_size, on_page=on_page
         )
@@ -989,6 +1070,7 @@ def _iter_source_pks_for(
     on_page: Optional[Callable[[], None]] = None,
 ) -> "Iterator[int]":
     if _source_is_postgres(dialect):
+        # Never a NULL proof here: the proof columns are TARGET ONLY.
         return _iter_target_pks(
             PgSourceConnection(connection), table, pk_column, page_size,
             on_page=on_page,
@@ -1212,6 +1294,9 @@ class Validator:
         row_diff_sample_size: int = 0,
         reconcile_page_size: int = _RECONCILE_PAGE_SIZE,
         migration_excluded_columns: Optional[Mapping[str, "Iterable[str]"]] = None,
+        null_proof_columns: Optional[Mapping[str, "Iterable[str]"]] = None,
+        legacy_proof_columns: Optional[Mapping[str, "Iterable[str]"]] = None,
+        null_proof_blocks_match: bool = False,
     ) -> None:
         """Create a validator with optional injected source/target factories.
 
@@ -1235,11 +1320,29 @@ class Validator:
         false-alarming on a deliberate, already-disclosed omission. Taken at
         construction (the factory has the run's inputs in hand) so it is set once and
         read-only -- safe for the parallel path, and no fake validator signature changes.
+
+        ``null_proof_columns`` ({table: column names}) are the excluded columns the tool
+        writes as NULL and that exist on the target; ``legacy_proof_columns`` the legacy
+        entries (rows take the target DEFAULT). The target pass that produces each
+        table's row count also counts the rows holding a value there (TARGET ONLY, no
+        extra scan). With ``null_proof_blocks_match`` (a Full Load type) a value in a
+        NULL column makes the table not matched; legacy counts never do.
         """
         self._migration_excluded_columns: dict[str, frozenset[str]] = {
             name: frozenset(columns)
             for name, columns in (migration_excluded_columns or {}).items()
         }
+        self._null_proof_columns: dict[str, tuple[str, ...]] = {
+            name: tuple(sorted(set(columns)))
+            for name, columns in (null_proof_columns or {}).items()
+            if columns
+        }
+        self._legacy_proof_columns: dict[str, tuple[str, ...]] = {
+            name: tuple(sorted(set(columns)))
+            for name, columns in (legacy_proof_columns or {}).items()
+            if columns
+        }
+        self._null_proof_blocks_match = bool(null_proof_blocks_match)
         self._source_engine_factory = source_engine_factory or _default_engine_factory
         self._target_connection_factory = (
             target_connection_factory or _default_target_connection_factory
@@ -1669,7 +1772,77 @@ class Validator:
                 row_count_match=False,
                 matched=False,
                 error=_safe_error_message(exc),
+                **self._proof_not_determined(table, "table_error"),
             )
+
+    def _proof_for(self, table: TableDef) -> Optional[_NullProofAccumulator]:
+        """A fresh NULL-proof accumulator for ``table``, or ``None`` without proof columns."""
+        overlay = self._null_proof_columns.get(table.name, ())
+        legacy = tuple(
+            c for c in self._legacy_proof_columns.get(table.name, ()) if c not in overlay
+        )
+        if not overlay and not legacy:
+            return None
+        return _NullProofAccumulator(columns=overlay + legacy, legacy=frozenset(legacy))
+
+    def _proof_not_determined(self, table: TableDef, reason: str) -> dict:
+        if self._proof_for(table) is None:
+            return {}
+        return {"proof_state": "not_determined", "proof_reason": reason}
+
+    @staticmethod
+    def _with_proof_fallback(
+        run: Callable[[Optional[_NullProofAccumulator]], Any],
+        proof: Optional[_NullProofAccumulator],
+    ) -> Any:
+        """Run the ONE proof-bearing target pass, isolating a proof failure.
+
+        A failure of a proof-bearing statement never costs the row count or the
+        verdict: one ``40001`` (a connection that touched the table before a
+        concurrent overlay/restore ALTER gets exactly one schema conflict) re-runs the
+        pass with the proof; any other failure re-runs it once WITHOUT the proof, which
+        supplies the count, and the proof is "not determined". A failure the proof did
+        not cause (source side, cancel) propagates unchanged.
+        """
+        if proof is None:
+            return run(None)
+        while True:
+            try:
+                return run(proof)
+            except ValidationCancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001 - classified below
+                if proof.failed is None:
+                    raise
+                if is_occ_conflict(exc) and not proof.retried:
+                    proof.retried = True
+                    proof.reset()
+                    continue
+                proof.reset()
+                proof.reason = "query_error"
+                return run(None)
+
+    def _proof_fields(self, proof: Optional[_NullProofAccumulator]) -> dict:
+        """The result's proof fields; ``excluded_values_block`` per the policy."""
+        if proof is None:
+            return {}
+        if proof.reason is None and not proof.complete:
+            proof.reason = "incomplete"
+        if proof.reason is not None:
+            return {"proof_state": "not_determined", "proof_reason": proof.reason}
+        overlay_counts = {
+            c: n for c, n in zip(proof.columns, proof.counts) if c not in proof.legacy
+        }
+        legacy_counts = {
+            c: n for c, n in zip(proof.columns, proof.counts) if c in proof.legacy
+        }
+        return {
+            "excluded_nonnull_counts": overlay_counts,
+            "legacy_nonnull_counts": legacy_counts,
+            "proof_state": "complete",
+            "excluded_values_block": self._null_proof_blocks_match
+            and any(n > 0 for n in overlay_counts.values()),
+        }
 
     def _compare_table(
         self,
@@ -1722,6 +1895,7 @@ class Validator:
                 row_count_match=False,
                 matched=False,
                 error=stale_inventory_error,
+                **self._proof_not_determined(table, "table_error"),
             )
 
         source_row_count = self._source_row_count(
@@ -1737,12 +1911,21 @@ class Validator:
         # for a composite/missing PK. In deep-only mode the count is needed UP FRONT to
         # decide whether to run the deep checks; otherwise it is deferred to after
         # reconcile so reconcile's count is reused with no second scan.
+        #
+        # The column-exclusion NULL proof rides on EXACTLY the one pass that produces
+        # ``target_row_count`` (the up-front count in deep-only mode, else reconcile's
+        # target stream, else the deferred count) -- never on the checksum -- so it adds
+        # no target pass.
+        proof = self._proof_for(table)
         target_row_count: Optional[int] = None
         row_count_match: Optional[bool] = None
         if deep_only_on_count_mismatch:
-            target_row_count = _bounded_target_count(
-                target_connection, table, self._reconcile_page_size,
-                on_page=self._page,
+            target_row_count = self._with_proof_fallback(
+                lambda acc: _bounded_target_count(
+                    target_connection, table, self._reconcile_page_size,
+                    on_page=self._page, proof=acc,
+                ),
+                proof,
             )
             row_count_match = source_row_count == target_row_count
 
@@ -1792,17 +1975,22 @@ class Validator:
         if reconcile and run_deep:
             pk_column = integer_pk_column(table)
             if pk_column is not None:
-                reconcile_result = reconcile_pk_streams(
-                    pk_column,
-                    _iter_source_pks_for(
-                        source_dialect, source_connection, table, pk_column,
-                        self._reconcile_page_size, on_page=self._page,
+                # A proof failure re-creates BOTH streams: the source re-reads the same
+                # consistent snapshot (buffered pages), the target without the proof.
+                reconcile_result = self._with_proof_fallback(
+                    lambda acc: reconcile_pk_streams(
+                        pk_column,
+                        _iter_source_pks_for(
+                            source_dialect, source_connection, table, pk_column,
+                            self._reconcile_page_size, on_page=self._page,
+                        ),
+                        _iter_target_pks(
+                            target_connection, table, pk_column,
+                            self._reconcile_page_size, on_page=self._page, proof=acc,
+                        ),
+                        should_cancel=should_cancel,
                     ),
-                    _iter_target_pks(
-                        target_connection, table, pk_column,
-                        self._reconcile_page_size, on_page=self._page,
-                    ),
-                    should_cancel=should_cancel,
+                    None if deep_only_on_count_mismatch else proof,
                 )
 
         # Default path: the target count was deferred so it could reuse reconcile's
@@ -1813,17 +2001,22 @@ class Validator:
             target_row_count = (
                 reconcile_result.target_count
                 if reconcile_result is not None
-                else _bounded_target_count(
-                    target_connection, table, self._reconcile_page_size,
-                    on_page=self._page,
+                else self._with_proof_fallback(
+                    lambda acc: _bounded_target_count(
+                        target_connection, table, self._reconcile_page_size,
+                        on_page=self._page, proof=acc,
+                    ),
+                    proof,
                 )
             )
             row_count_match = source_row_count == target_row_count
 
+        proof_fields = self._proof_fields(proof)
         matched = (
             row_count_match
             and (checksum_match is not False)
             and (reconcile_result is None or reconcile_result.consistent)
+            and not proof_fields.get("excluded_values_block", False)
         )
 
         # Dev-only diagnostic: for a table that did NOT match, sample which PKs
@@ -1854,6 +2047,7 @@ class Validator:
             # row-count match must not be released as a clean, record-verified pass.
             reconcile_applicable=integer_pk_column(table) is not None,
             deep_checks_skipped=not run_deep,
+            **proof_fields,
         )
 
     @staticmethod
@@ -2025,6 +2219,35 @@ def with_migration_excluded_columns(
     return report.model_copy(update={"items": updated})
 
 
+def with_null_proof_metadata(
+    report: ValidationReport,
+    *,
+    absent: Optional[Mapping[str, "Iterable[str]"]] = None,
+    unknown: "Iterable[str]" = (),
+) -> ValidationReport:
+    """Stamp what the live catalog read found BEFORE the comparison onto a report.
+
+    ``absent``: excluded columns not on the Aurora DSQL table (never named in any SQL,
+    nothing was written there). ``unknown``: tables whose catalog could not be read, so
+    their excluded columns were not proven -- "not determined" (catalog_unreadable)
+    unless the comparison already recorded a proof state. Never touches ``matched``.
+    """
+    absent = {t: sorted(c) for t, c in (absent or {}).items() if c}
+    unknown = set(unknown)
+    if not absent and not unknown:
+        return report
+    updated = []
+    for item in report.items:
+        update: dict = {}
+        if item.table in absent:
+            update["proof_absent_columns"] = absent[item.table]
+        if item.table in unknown and item.proof_state is None:
+            update["proof_state"] = "not_determined"
+            update["proof_reason"] = "catalog_unreadable"
+        updated.append(item.model_copy(update=update) if update else item)
+    return report.model_copy(update={"items": updated})
+
+
 def _build_drift(
     watermark: Optional[Watermark],
     current_gtid: Optional[str],
@@ -2175,6 +2398,9 @@ def _render_table_line(item: TableValidationResult) -> str:
             f"records {'consistent' if reconcile.consistent else 'INCONSISTENT'} "
             f"(missing={reconcile.missing_on_target}, extra={reconcile.extra_on_target})"
         )
+    proof = _proof_line(item)
+    if proof:
+        parts.append(proof)
     parts.append(f"[{verdict}]")
     line = ", ".join(parts)
 
@@ -2214,6 +2440,33 @@ def _render_table_line(item: TableValidationResult) -> str:
     return line
 
 
+_PROOF_REASON_TEXT = {
+    "query_error": "the count with the NULL check failed; the row count was taken without it",
+    "catalog_unreadable": "the Aurora DSQL catalog could not be read",
+    "table_error": "the table could not be compared",
+    "incomplete": "the target pass did not cover every row",
+}
+
+
+def proof_reason_text(reason: Optional[str]) -> str:
+    """Why a NULL proof is not determined, in words (never "stopped": a stop discards the run)."""
+    return _PROOF_REASON_TEXT.get(reason or "", "unknown reason")
+
+
+def _proof_line(item: TableValidationResult) -> str:
+    """The per-table NULL-proof clause of the text report ('' without proof columns)."""
+    if item.proof_state == "not_determined":
+        return f"excluded proof: not determined ({proof_reason_text(item.proof_reason)})"
+    if item.proof_state != "complete":
+        return ""
+    values = {c: n for c, n in item.excluded_nonnull_counts.items() if n}
+    if values:
+        return "excluded VALUES: " + ", ".join(f"{c}={n}" for c, n in sorted(values.items()))
+    if item.excluded_nonnull_counts:
+        return "excluded NULL: proven"
+    return ""
+
+
 def _render_drift_lines(drift: Optional[DriftReport]) -> list[str]:
     """Render the drift-since-watermark section as readable text lines.
 
@@ -2248,6 +2501,53 @@ def _render_drift_lines(drift: Optional[DriftReport]) -> list[str]:
         f"- Drifted: {'yes' if drift.drifted else 'no'}",
         f"- {drift.detail}",
     ]
+
+
+def _render_proof_lines(report: ValidationReport) -> list[str]:
+    """The NULL-proof sub-lines under the excluded-columns line of the text report."""
+    proven: list[str] = []
+    values: list[str] = []
+    undetermined: list[str] = []
+    legacy: list[str] = []
+    absent: list[str] = []
+    for item in report.items:
+        if item.proof_state == "complete":
+            found = {c: n for c, n in item.excluded_nonnull_counts.items() if n}
+            if found:
+                values.append(
+                    f"{item.table} (" + ", ".join(
+                        f"{c}: {n} rows" for c, n in sorted(found.items())
+                    ) + ")"
+                )
+            elif item.excluded_nonnull_counts:
+                proven.append(f"{item.table} ({', '.join(sorted(item.excluded_nonnull_counts))})")
+            if item.legacy_nonnull_counts:
+                legacy.append(
+                    f"{item.table} (" + ", ".join(
+                        f"{c}: {n} non-NULL" for c, n in sorted(item.legacy_nonnull_counts.items())
+                    ) + ")"
+                )
+        elif item.proof_state == "not_determined":
+            undetermined.append(f"{item.table} ({proof_reason_text(item.proof_reason)})")
+        if item.proof_absent_columns:
+            absent.append(f"{item.table} ({', '.join(item.proof_absent_columns)})")
+    lines = []
+    if proven:
+        lines.append(f"  - NULL in every row (proven): {'; '.join(proven)}")
+    if values:
+        lines.append(f"  - HOLD VALUES (expected NULL): {'; '.join(values)}")
+    if undetermined:
+        lines.append(f"  - NULL proof not determined: {'; '.join(undetermined)}")
+    if legacy:
+        lines.append(
+            "  - Excluded before the NULL overlay (rows hold the target DEFAULT): "
+            f"{'; '.join(legacy)}"
+        )
+    if absent:
+        lines.append(
+            f"  - Not on the Aurora DSQL table (nothing written): {'; '.join(absent)}"
+        )
+    return lines
 
 
 def render_text_report(report: ValidationReport) -> str:
@@ -2317,9 +2617,10 @@ def render_text_report(report: ValidationReport) -> str:
             for table, cols in migration_excluded.items()
         )
         lines.append(
-            "- Columns EXCLUDED from the migration (holds no data on the target, so "
-            f"not validated either): {detail}"
+            "- Columns EXCLUDED from the migration (not written by the tool, so not "
+            f"value-compared): {detail}"
         )
+        lines.extend(_render_proof_lines(report))
     # Tables that reconciliation was REQUESTED for but could not cover (composite /
     # non-integer PK, not errored, not fast-sweep-skipped): compared by count/checksum
     # only. Computed INLINE here -- core must not import the UI's ``reconcile_skipped_

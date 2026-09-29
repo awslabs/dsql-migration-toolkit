@@ -42,9 +42,10 @@ render helpers touch NiceGUI.
 from __future__ import annotations
 
 import threading
+import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Mapping, Optional, Protocol, Sequence
+from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Sequence
 
 from dsql_migrator.config import SecretValue, load_config
 from dsql_migrator.core.activity_log import (
@@ -74,7 +75,9 @@ from dsql_migrator.core.table_selection import TableSelectionError, TableSelecto
 from dsql_migrator.core.validator import (
     ValidationCancelled,
     Validator,
+    proof_reason_text,
     with_migration_excluded_columns,
+    with_null_proof_metadata,
 )
 from dsql_migrator.core.validator import export_report as export_validation_report
 from dsql_migrator.ui.ai_assist import ai_is_usable
@@ -190,6 +193,19 @@ class ValidationInputs:
     # smallint). Empty (default) uses the source-derived default mapping. run_validation
     # stamps these onto each column's ``target_type`` before comparing.
     target_types: dict[str, dict[str, str]] = field(default_factory=dict)
+    # The column-exclusion NULL proof (TARGET ONLY), from ONE live catalog read in the
+    # job (see :func:`live_proof_columns`): the excluded columns the tool writes as NULL
+    # and the legacy entries (rows take the target DEFAULT) that exist on the target and
+    # are not computed there. The target pass that produces each row count also counts
+    # the rows holding a value in them. ``null_proof_blocks_match``: a value in a NULL
+    # column makes the table not matched (see :func:`proof_blocks_match`).
+    null_proof_columns: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    legacy_proof_columns: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    null_proof_blocks_match: bool = False
+    # Excluded columns not on the Aurora DSQL table, and tables whose catalog could not
+    # be read -- stamped on the report, never named in any SQL.
+    proof_absent_columns: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    proof_unknown_tables: frozenset[str] = frozenset()
 
 
 # Builds a :class:`_ValidationRunner` bound to the run's inputs.
@@ -214,7 +230,69 @@ def _default_validator_factory(inputs: ValidationInputs) -> _ValidationRunner:
         source_engine_factory=make_source_engine_factory(inputs.source_password),
         row_diff_sample_size=load_config().validate_row_diff_sample_size,
         migration_excluded_columns=inputs.excluded_columns,
+        null_proof_columns=inputs.null_proof_columns,
+        legacy_proof_columns=inputs.legacy_proof_columns,
+        null_proof_blocks_match=inputs.null_proof_blocks_match,
     )
+
+
+def live_proof_columns(
+    overlay: "Mapping[str, Iterable[str]]",
+    legacy: "Mapping[str, Iterable[str]]",
+    facts: "Mapping[str, Any]",
+) -> "tuple[dict[str, tuple[str, ...]], dict[str, tuple[str, ...]], dict[str, tuple[str, ...]], frozenset[str]]":
+    """Split the proof candidates by what the live Aurora DSQL catalog holds. Pure.
+
+    Returns ``(null_proof, legacy_proof, absent, unknown)``. A table whose facts are
+    unknown (``None``, or missing) never enters SQL; a table that does not exist makes
+    every candidate absent, as does a column the table lacks ("not on the Aurora DSQL
+    table"); a column Aurora DSQL computes (generated / identity) is omit-only and is
+    dropped. Everything else goes to its set.
+    """
+    null_proof: dict[str, tuple[str, ...]] = {}
+    legacy_proof: dict[str, tuple[str, ...]] = {}
+    absent: dict[str, tuple[str, ...]] = {}
+    unknown: set[str] = set()
+    for table in sorted(set(overlay) | set(legacy)):
+        wanted = {"overlay": set(overlay.get(table, ()) or ()),
+                  "legacy": set(legacy.get(table, ()) or ()) - set(overlay.get(table, ()) or ())}
+        if not wanted["overlay"] and not wanted["legacy"]:
+            continue
+        table_facts = facts.get(table)
+        if table_facts is None:
+            unknown.add(table)
+            continue
+        gone: list[str] = []
+        for kind, target in (("overlay", null_proof), ("legacy", legacy_proof)):
+            kept: list[str] = []
+            for column in sorted(wanted[kind]):
+                column_facts = (
+                    table_facts.columns.get(column) if table_facts.exists else None
+                )
+                if column_facts is None:
+                    gone.append(column)
+                elif not column_facts.computed:
+                    kept.append(column)
+            if kept:
+                target[table] = tuple(kept)
+        if gone:
+            absent[table] = tuple(sorted(gone))
+    return null_proof, legacy_proof, absent, frozenset(unknown)
+
+
+def proof_blocks_match(migration_state) -> bool:
+    """Whether a value in an excluded NULL column makes a table NOT matched. Pure.
+
+    True for a Full Load type, and for a CDC-only session in which a Full Load ran
+    anyway (``job_id`` set: the tool wrote rows there). A CDC-only migration onto a
+    pre-populated target only warns: rows that were on Aurora DSQL before CDC started
+    keep their values, because CDC never writes an excluded column.
+    """
+    from dsql_migrator.ui.data_migration import MigrationType
+
+    if getattr(migration_state, "migration_type", None) is not MigrationType.CDC_ONLY:
+        return True
+    return getattr(migration_state, "job_id", None) is not None
 
 
 def _apply_column_exclusions(
@@ -323,22 +401,26 @@ def run_validation(
     # the comparison correct, but it also erases the only evidence that a column was
     # left behind, so without this the report claims "Data identical: yes" with no
     # mention of a column that holds no target data at all.
-    return with_migration_excluded_columns(
-        validator.validate(
-            inputs.source_config,
-            inputs.target_config,
-            tables,
-            inputs.mode,
-            watermark=inputs.watermark,
-            check_orphans=inputs.check_orphans,
-            reconcile=inputs.reconcile,
-            should_cancel=should_cancel,
-            on_progress=on_progress,
-            max_workers=workers,
-            deep_only_on_count_mismatch=deep_only_on_count_mismatch,
-            quarantined_by_table=inputs.quarantined_by_table,
+    return with_null_proof_metadata(
+        with_migration_excluded_columns(
+            validator.validate(
+                inputs.source_config,
+                inputs.target_config,
+                tables,
+                inputs.mode,
+                watermark=inputs.watermark,
+                check_orphans=inputs.check_orphans,
+                reconcile=inputs.reconcile,
+                should_cancel=should_cancel,
+                on_progress=on_progress,
+                max_workers=workers,
+                deep_only_on_count_mismatch=deep_only_on_count_mismatch,
+                quarantined_by_table=inputs.quarantined_by_table,
+            ),
+            inputs.excluded_columns,
         ),
-        inputs.excluded_columns,
+        absent=inputs.proof_absent_columns,
+        unknown=inputs.proof_unknown_tables,
     )
 
 
@@ -597,6 +679,21 @@ class ValidationSummary:
     # Tables reconciliation was REQUESTED for but could NOT cover (composite/non-integer
     # PK), compared by count/checksum only (== ``reconcile_skipped_tables(report)``).
     reconcile_inapplicable_tables: tuple[str, ...] = ()
+    # The column-exclusion NULL proof (see ``TableValidationResult.excluded_nonnull_counts``):
+    # tables whose excluded columns are proven NULL in every row; values found where a
+    # Full Load type makes that a mismatch (``excluded_values``) or where it only warns
+    # (CDC only, ``excluded_values_warned``); proofs not determined (table -> reason);
+    # legacy entries (rows take the target DEFAULT) with their non-NULL counts; and
+    # excluded columns not on the Aurora DSQL table.
+    null_proven: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    excluded_values: dict[str, dict[str, int]] = field(default_factory=dict)
+    excluded_values_warned: dict[str, dict[str, int]] = field(default_factory=dict)
+    proof_not_determined: dict[str, str] = field(default_factory=dict)
+    legacy_values: dict[str, dict[str, int]] = field(default_factory=dict)
+    proof_absent: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # Tables that failed ONLY because an excluded column holds values (every other check
+    # passed): the reload runbook's "backfill" cannot fix them.
+    excluded_values_only_tables: tuple[str, ...] = ()
 
     @property
     def reconcile_inapplicable_for_all(self) -> bool:
@@ -801,6 +898,93 @@ def summarize_validation(report: ValidationReport) -> ValidationSummary:
         },
         reconcile_requested=_reconcile_was_requested(report),
         reconcile_inapplicable_tables=reconcile_skipped_tables(report),
+        **_proof_summary(report),
+    )
+
+
+def _proof_summary(report: ValidationReport) -> dict:
+    """The NULL-proof roll-up of ``report`` for :class:`ValidationSummary`. Pure."""
+    null_proven: dict[str, tuple[str, ...]] = {}
+    blocking: dict[str, dict[str, int]] = {}
+    warned: dict[str, dict[str, int]] = {}
+    undetermined: dict[str, str] = {}
+    legacy: dict[str, dict[str, int]] = {}
+    absent: dict[str, tuple[str, ...]] = {}
+    only: list[str] = []
+    for item in report.items:
+        if item.proof_absent_columns:
+            absent[item.table] = tuple(item.proof_absent_columns)
+        if item.proof_state == "not_determined":
+            undetermined[item.table] = item.proof_reason or ""
+            continue
+        if item.proof_state != "complete":
+            continue
+        values = {c: n for c, n in item.excluded_nonnull_counts.items() if n}
+        if values and item.excluded_values_block:
+            blocking[item.table] = values
+            if (
+                item.error is None
+                and item.row_count_match
+                and item.checksum_match is not False
+                and (item.reconcile is None or item.reconcile.consistent)
+            ):
+                only.append(item.table)
+        elif values:
+            warned[item.table] = values
+        elif item.excluded_nonnull_counts:
+            null_proven[item.table] = tuple(sorted(item.excluded_nonnull_counts))
+        if item.legacy_nonnull_counts:
+            legacy[item.table] = dict(item.legacy_nonnull_counts)
+    return {
+        "null_proven": null_proven,
+        "excluded_values": blocking,
+        "excluded_values_warned": warned,
+        "proof_not_determined": undetermined,
+        "legacy_values": legacy,
+        "proof_absent": absent,
+        "excluded_values_only_tables": tuple(only),
+    }
+
+
+def excluded_values_remedy(migration_state, job_manager) -> str:
+    """How to clear values found in an excluded NULL column, for THIS session. Pure-ish
+    (reads the job record). Names only actions the tool offers today."""
+    from dsql_migrator.ui.data_migration import MigrationType
+    from dsql_migrator.ui.data_migration._cdc_state import cdc_streaming_started
+
+    job_id = getattr(migration_state, "job_id", None)
+    cdc_only = getattr(migration_state, "migration_type", None) is MigrationType.CDC_ONLY
+    if cdc_only and job_id is None:
+        return (
+            "Rows that were on Aurora DSQL before CDC started keep their values: CDC "
+            "never writes an excluded column. To hold NULL there, migrate the table "
+            "with a Full load + CDC migration and choose Drop & reload for it."
+        )
+    try:
+        streaming = bool(cdc_streaming_started(migration_state, job_manager))
+    except Exception:  # noqa: BLE001 - unknown: name the safe order
+        streaming = True
+    if streaming:
+        return (
+            "A table cannot be dropped while CDC streams to it: delete the CDC "
+            "infrastructure, reload the table on the Full Load step with Drop & reload, "
+            "then deploy and start CDC again."
+        )
+    if job_id is not None:
+        from dsql_migrator.core.job_manager import JobNotFoundError
+
+        try:
+            job_manager.get_status(job_id)
+        except JobNotFoundError:
+            return (
+                "The Full Load job record is gone, so the table cannot be reloaded from "
+                "this session: Start over, then migrate it again."
+            )
+        except Exception:  # noqa: BLE001 - fall through to the usual path
+            pass
+    return (
+        "Reload the table on the Full Load step ('Reload specific tables…') and choose "
+        "Drop & reload (an append keeps the stored values)."
     )
 
 
@@ -925,6 +1109,22 @@ def _bounded_names(names: "Sequence[str]", limit: int = 6) -> str:
     return shown + (f" (+{len(names) - limit} more)" if len(names) > limit else "")
 
 
+def _proof_clause(summary: "ValidationSummary") -> str:
+    """The NULL-proof state in a few words, for the bounded log caveat."""
+    parts = []
+    if summary.excluded_values:
+        parts.append(f"VALUES found in {len(summary.excluded_values)} table(s)")
+    if summary.excluded_values_warned:
+        parts.append(f"values from before CDC in {len(summary.excluded_values_warned)} table(s)")
+    if summary.proof_not_determined:
+        parts.append(f"NULL not determined for {len(summary.proof_not_determined)} table(s)")
+    if summary.legacy_values:
+        parts.append(f"{len(summary.legacy_values)} table(s) keep the target DEFAULT (earlier version)")
+    if summary.null_proven:
+        parts.append(f"NULL proven in {len(summary.null_proven)} table(s)")
+    return ", ".join(parts) if parts else "NULL not proven"
+
+
 def verdict_evidence_caveats(
     summary: "ValidationSummary", report: ValidationReport
 ) -> str:
@@ -959,8 +1159,9 @@ def verdict_evidence_caveats(
         )
         more = len(summary.migration_excluded_columns) - 4
         parts.append(
-            "columns EXCLUDED from the migration (hold no data on the target, so not "
-            f"validated): {detail}" + (f" (+{more} more table(s))" if more > 0 else "")
+            "columns EXCLUDED from the migration (not written, so not value-compared; "
+            f"{_proof_clause(summary)}): {detail}"
+            + (f" (+{more} more table(s))" if more > 0 else "")
         )
     # Fast sweep: equal counts meant the checksum/reconcile never ran for these tables,
     # so the verdict's own mode label over-states what was actually compared.
@@ -2032,6 +2233,7 @@ def build_validation_screen(
     ai_post_event: "Optional[Callable[..., object]]" = None,
     ai_tools: "Optional[Sequence[Mapping[str, object]]]" = None,
     ai_tool_execute: "Optional[Callable[[str, Mapping[str, object]], str]]" = None,
+    overlay_facts_reader: "Optional[Callable[..., Mapping[str, Any]]]" = None,
 ) -> tuple[Callable[[Callable[[], None]], None], Callable[[], None]]:
     """Build the Validation screen, returning ``(content_builder, runner)``.
 
@@ -2121,15 +2323,31 @@ def build_validation_screen(
         except Exception:  # noqa: BLE001 - never let target-type resolution break a run
             return {}
 
-    def _excluded_columns(inv: "SourceInventory") -> "dict[str, frozenset[str]]":
-        """The EFFECTIVE exclusion set (key columns dropped) Full Load and CDC used.
+    def _exclusion_split(
+        inv: "SourceInventory",
+    ) -> "tuple[dict[str, frozenset[str]], dict[str, frozenset[str]], dict[str, frozenset[str]]]":
+        """``(omitted, overlay, legacy)``: the EFFECTIVE exclusion set (key columns
+        dropped) Full Load and CDC used, and its split into the columns the tool writes as
+        NULL and the legacy entries (their rows take the target DEFAULT).
 
         Judged against the applied conversion the Data Migration render recorded; a
         RESTORED session can reach Validation before any such render, and without the
         applied DDL a Schema Conversion composite key's leading column would not be
         recognised as a key -- Validation would then skip a column Full Load loaded. So
         that case derives the applied conversion from the Schema Conversion state here.
+        Validation can be the first screen a restored session renders, so a pending
+        legacy classification is settled first (pending entries count as legacy).
         """
+        from dsql_migrator.ui.data_migration._models import (
+            classify_restored_exclusions,
+            legacy_lob_exclusions,
+            overlay_lob_exclusions,
+        )
+
+        try:
+            classify_restored_exclusions(migration_state, job_manager)
+        except Exception:  # noqa: BLE001 - still pending = legacy, the safe reading
+            pass
         applied = None
         preserve = None
         getter = getattr(migration_state, "applied_conversions", None)
@@ -2148,8 +2366,67 @@ def build_validation_screen(
                 preserve = conv_state.preserve_foreign_keys
             except Exception:  # noqa: BLE001 - fall back to the recorded / source facts
                 applied = None
-        return effective_lob_exclusions(
-            migration_state, inv, applied_conversions=applied, preserve_foreign_keys=preserve
+        kwargs = {"applied_conversions": applied, "preserve_foreign_keys": preserve}
+        return (
+            effective_lob_exclusions(migration_state, inv, **kwargs),
+            overlay_lob_exclusions(migration_state, inv, **kwargs),
+            legacy_lob_exclusions(migration_state, inv, **kwargs),
+        )
+
+    def _proof_candidates(
+        split: "tuple[dict, dict, dict]", names: "Iterable[str]"
+    ) -> "tuple[dict[str, frozenset[str]], dict[str, frozenset[str]]]":
+        """The overlay / legacy proof candidates of the validated tables only."""
+        wanted = set(names)
+        _omitted, overlay, legacy = split
+        return (
+            {t: c for t, c in overlay.items() if t in wanted and c},
+            {t: c for t, c in legacy.items() if t in wanted and c},
+        )
+
+    def _read_overlay_facts(names, columns) -> "Mapping[str, Any]":
+        if overlay_facts_reader is not None:
+            return overlay_facts_reader(names, columns)
+        from dsql_migrator.core.target_connection import DsqlConnector
+        from dsql_migrator.core.target_introspector import target_overlay_facts
+
+        target_config = session.target_config
+        return target_overlay_facts(
+            names,
+            columns,
+            connection_factory=DsqlConnector(
+                target_config, aws_profile=session.aws_profile
+            ).connect,
+            probe_rows=False,
+        )
+
+    def _with_live_proof(
+        inputs: ValidationInputs, overlay_c, legacy_c, handle: object
+    ) -> ValidationInputs:
+        """ONE live catalog read for the proof candidates (none without any), on the
+        job thread; its outcome narrows the proof to what exists on the target."""
+        if not overlay_c and not legacy_c:
+            return inputs
+        names = sorted(set(overlay_c) | set(legacy_c))
+        columns = {
+            t: sorted(set(overlay_c.get(t, ())) | set(legacy_c.get(t, ()))) for t in names
+        }
+        try:
+            facts = _read_overlay_facts(names, columns) or {}
+        except Exception:  # noqa: BLE001 - every table unknown: never enters SQL
+            facts = {}
+        _beat = getattr(handle, "heartbeat", None)
+        if callable(_beat):
+            _beat()
+        null_proof, legacy_proof, absent, unknown = live_proof_columns(
+            overlay_c, legacy_c, facts
+        )
+        return dataclasses.replace(
+            inputs,
+            null_proof_columns=null_proof,
+            legacy_proof_columns=legacy_proof,
+            proof_absent_columns=absent,
+            proof_unknown_tables=unknown,
         )
 
     def _run_prerequisite_error() -> Optional[str]:
@@ -2224,6 +2501,10 @@ def build_validation_screen(
         target_config = session.target_config
         assert source_config is not None  # guaranteed by has_source()
         assert target_config is not None  # guaranteed by has_target()
+        _split = _exclusion_split(scoped_inventory)
+        proof_overlay, proof_legacy = _proof_candidates(
+            _split, (t.name for t in scoped_tables)
+        )
         inputs = ValidationInputs(
             source_config=source_config,
             source_password=session.source_password,
@@ -2240,10 +2521,11 @@ def build_validation_screen(
             # the target can't cause a false checksum mismatch. The EFFECTIVE set (key
             # columns dropped), the same one Full Load and CDC use. Empty for a migration
             # that excluded nothing.
-            excluded_columns=_excluded_columns(scoped_inventory),
+            excluded_columns=_split[0],
             quarantined_by_table=_migration_quarantined(),
             # Applied target types so a CHECKSUM honors a Schema-Conversion remap.
             target_types=_applied_target_types(scoped_inventory),
+            null_proof_blocks_match=proof_blocks_match(migration_state),
         )
 
         validation_state.clear_outputs()
@@ -2296,7 +2578,7 @@ def build_validation_screen(
 
             try:
                 result = run_validation(
-                    inputs,
+                    _with_live_proof(inputs, proof_overlay, proof_legacy, handle),
                     validator_factory=validator_factory,
                     should_cancel=lambda: bool(getattr(handle, "cancelled", False)),
                     on_progress=_progress,
@@ -2508,6 +2790,8 @@ def build_validation_screen(
         target_config = session.target_config
         assert source_config is not None  # guaranteed by the gate
         assert target_config is not None  # guaranteed by the gate
+        _split = _exclusion_split(inventory)
+        proof_overlay, proof_legacy = _proof_candidates(_split, (t.name for t in scoped))
         inputs = ValidationInputs(
             source_config=source_config,
             source_password=session.source_password,
@@ -2519,12 +2803,13 @@ def build_validation_screen(
             reconcile=options.reconcile,
             # Always deep-check a re-check (see docstring).
             deep_only_on_count_mismatch=False,
-            excluded_columns=_excluded_columns(inventory),
+            excluded_columns=_split[0],
             quarantined_by_table=_migration_quarantined(),
             # Applied target types so a CHECKSUM honors a Schema-Conversion remap.
             target_types=_applied_target_types(
                 inventory.model_copy(update={"tables": scoped})
             ),
+            null_proof_blocks_match=proof_blocks_match(migration_state),
         )
 
         validation_state.start_recheck([t.name for t in scoped])
@@ -2533,7 +2818,7 @@ def build_validation_screen(
         def work(handle: object) -> None:
             try:
                 fresh = run_validation(
-                    inputs,
+                    _with_live_proof(inputs, proof_overlay, proof_legacy, handle),
                     validator_factory=validator_factory,
                     should_cancel=lambda: bool(getattr(handle, "cancelled", False)),
                     # The same liveness seam the full run passes. A re-check is typically
@@ -2557,6 +2842,12 @@ def build_validation_screen(
             )
 
         validation_state.job_id = job_manager.submit(work)
+
+    def _excluded_values_remedy_safe() -> str:
+        try:
+            return excluded_values_remedy(migration_state, job_manager)
+        except Exception:  # noqa: BLE001 - the notice still names the values
+            return ""
 
     def content(refresh: Callable[[], None]) -> None:
         status = get_status(session.workflow, WorkflowStep.VALIDATION)
@@ -2845,6 +3136,15 @@ def build_validation_screen(
                     cdc_in_use=_cdc_in_use(session),
                     identity_sync=validation_state.identity_sync,
                     identity_sync_failed=validation_state.identity_sync_failed,
+                    excluded_values_remedy=(
+                        _excluded_values_remedy_safe()
+                        if any(
+                            item.excluded_nonnull_counts
+                            and any(item.excluded_nonnull_counts.values())
+                            for item in result.items
+                        )
+                        else ""
+                    ),
                 )
                 if busy:
                     _install_recheck_poll_timer(
@@ -4402,6 +4702,7 @@ def _render_result(
     cdc_in_use: bool = False,
     identity_sync: "Optional[dict[str, int]]" = None,
     identity_sync_failed: "Optional[dict[str, str]]" = None,
+    excluded_values_remedy: str = "",
 ) -> None:
     """Render the cut-over readiness report: verdict, checks, then the details.
 
@@ -4504,7 +4805,8 @@ def _render_result(
     # arrive before its own justification.
     if not summary.ready_for_cutover:
         _render_recovery_section(
-            ui, summary, drift, diagnose_provider=diagnose_provider
+            ui, summary, drift, diagnose_provider=diagnose_provider,
+            excluded_values_remedy=excluded_values_remedy,
         )
     _render_failing_tables(
         ui, report, summary, drift,
@@ -4529,7 +4831,8 @@ def _render_result(
     # preamble before the evidence exists on screen.
     with _section(ui, icon="fact_check", title="Cut-over readiness"):
         _render_readiness_checks(
-            ui, summary, drift, diagnose_provider=diagnose_provider
+            ui, summary, drift, diagnose_provider=diagnose_provider,
+            excluded_values_remedy=excluded_values_remedy,
         )
     with _section(ui, icon="download", title="Export report"):
         _render_downloads(ui, report)
@@ -4629,6 +4932,16 @@ def _render_verdict(
             caveats.append(
                 "the source has advanced since the snapshot — expected under live "
                 "CDC, but re-verify before cut-over if CDC is not running"
+            )
+        if summary.excluded_values_warned:
+            caveats.append(
+                f"{len(summary.excluded_values_warned)} table(s) hold values in an "
+                "excluded column (rows that were on Aurora DSQL before CDC started)"
+            )
+        if summary.proof_not_determined:
+            caveats.append(
+                "that the excluded columns are NULL was not determined for "
+                f"{len(summary.proof_not_determined)} table(s)"
             )
         if caveats:
             body += " Note: " + "; ".join(caveats) + "."
@@ -4740,6 +5053,7 @@ _FACTS_PK_SAMPLE = 5
 def _render_recovery_section(
     ui: object, summary: ValidationSummary, drift: DriftDisplay, *,
     diagnose_provider=None,
+    excluded_values_remedy: str = "",
 ) -> None:
     """Render the mismatch-recovery guidance as its OWN titled section card.
 
@@ -4772,8 +5086,18 @@ def _render_recovery_section(
     # v0.1.256 made for the banner header, so the two screens speak with one voice.
     _title = "Acknowledge the known gap" if fully_explained else "How to recover"
     _icon = "fact_check" if fully_explained else "build"
+    # Values in an excluded column cannot be "backfilled": the reload below is an
+    # idempotent append, which keeps a stored value. Their own branch, and when they are
+    # the ONLY finding, the only one.
+    values_only = bool(summary.excluded_values_only_tables) and set(
+        summary.failed_tables
+    ) <= set(summary.excluded_values_only_tables)
     with _section(ui, icon=_icon, title=_title):  # type: ignore[misc]
-        if fully_explained:
+        if summary.excluded_values:
+            _render_excluded_values_recovery(ui, summary, excluded_values_remedy)
+        if values_only:
+            pass  # the reload runbooks below cannot clear a stored value
+        elif fully_explained:
             render_notice(
                 ui,
                 tone="info",
@@ -4897,6 +5221,33 @@ def _render_recovery_section(
                         chip="Validation · run",
                     ),
                 ).props("color=primary outline no-caps")
+
+
+def _render_excluded_values_recovery(
+    ui: object, summary: ValidationSummary, remedy: str
+) -> None:
+    """The recovery for values found in an excluded NULL column (never "backfill")."""
+    detail = "; ".join(
+        f"{table} ({', '.join(f'{c}: {n:,} rows' for c, n in sorted(cols.items()))})"
+        for table, cols in summary.excluded_values.items()
+    )
+    render_notice(
+        ui,
+        tone="error",
+        header="Excluded columns hold values: reload those tables with Drop & reload",
+        body=" ".join(
+            part
+            for part in (
+                "These columns are excluded, so every row the tool writes holds NULL "
+                "there; values mean the rows were appended over data already on the "
+                "table. Re-running the Full Load does not clear them: an append keeps "
+                "a stored value.",
+                remedy,
+                f"Found: {detail}.",
+            )
+            if part
+        ),
+    )
 
 
 def _render_cutover_section(
@@ -5274,6 +5625,7 @@ def _render_readiness_checks(
     drift: DriftDisplay,
     *,
     diagnose_provider=None,
+    excluded_values_remedy: str = "",
 ) -> None:
     """Render the pre-cut-over checks as a compact, uniform pass/fail panel.
 
@@ -5367,6 +5719,12 @@ def _render_readiness_checks(
                 else ""
             )
             + f" (mode: {summary.mode})."
+            + (
+                f" ({len(summary.excluded_values_only_tables)} only because an excluded "
+                "column holds values.)"
+                if summary.excluded_values_only_tables
+                else ""
+            )
             + explained_note
             + _excluded_note
         ),
@@ -5489,22 +5847,95 @@ def _render_readiness_checks(
     # sign-off artifact and a reviewer who did not tick the box has no other way to see
     # the gap; warning tone because, unlike a rendering limit, it is a permanent loss.
     if summary.migration_excluded_columns:
-        detail = "; ".join(
-            f"{table} ({', '.join(cols)})"
-            for table, cols in summary.migration_excluded_columns.items()
-        )
-        render_notice(
-            ui,
-            tone="warning",
-            header="Some columns were excluded from the migration",
-            body=(
-                "These columns were deliberately left out of the load, so they hold no "
-                "data on the target and validation skipped them — a match here says "
-                "nothing about them. Re-including a column needs a reload of its table. "
-                f"Excluded: {detail}."
-            ),
-        )
+        _render_null_proof_notice(ui, summary, excluded_values_remedy)
 
+
+
+def null_proof_lines(
+    summary: ValidationSummary, remedy: str = ""
+) -> "tuple[str, str, list[str]]":
+    """``(tone, header, lines)`` of the excluded-columns notice. Pure.
+
+    One line per finding, worst tone wins (error, then warning, then info): values in a
+    NULL column (a mismatch for a Full Load type), values CDC-only only warns about,
+    legacy entries (their rows take the target DEFAULT), proofs not determined and
+    columns not on the Aurora DSQL table; plus the proven-NULL line.
+    """
+    lines: list[str] = []
+    tone = "info"
+    if summary.excluded_values:
+        tone = "error"
+        for table, cols in summary.excluded_values.items():
+            for column, n in sorted(cols.items()):
+                lines.append(
+                    f"{table}: {n:,} row(s) hold a value in {column} (expected NULL). "
+                    "Usually rows appended over existing data."
+                )
+        if remedy:
+            lines.append(remedy)
+    if summary.excluded_values_warned:
+        tone = "error" if tone == "error" else "warning"
+        for table, cols in summary.excluded_values_warned.items():
+            for column, n in sorted(cols.items()):
+                lines.append(f"{table}: {n:,} row(s) hold a value in {column}.")
+        if remedy and not summary.excluded_values:
+            lines.append(remedy)
+    if summary.null_proven:
+        n_cols = sum(len(c) for c in summary.null_proven.values())
+        lines.append(
+            f"{n_cols} column(s) in {len(summary.null_proven)} table(s) are NULL in every "
+            "row (counted in the target row-count pass): "
+            + "; ".join(f"{t} ({', '.join(c)})" for t, c in summary.null_proven.items())
+            + "."
+        )
+    for table, cols in summary.legacy_values.items():
+        for column, n in sorted(cols.items()):
+            lines.append(
+                f"{table}.{column}: excluded in a session from an earlier version; its "
+                f"rows take the target DEFAULT ({n:,} non-NULL). To load it as NULL, "
+                "Start over and exclude it again."
+            )
+    for table, reason in summary.proof_not_determined.items():
+        lines.append(
+            f"{table}: whether the excluded columns are NULL was not determined "
+            f"({proof_reason_text(reason)})."
+        )
+    for table, cols in summary.proof_absent.items():
+        lines.append(
+            f"{table} ({', '.join(cols)}): not on the Aurora DSQL table; nothing was "
+            "written."
+        )
+    if tone == "error":
+        header = "Excluded columns hold values on Aurora DSQL"
+    elif tone == "warning":
+        header = "Excluded columns hold values from before CDC started"
+    elif summary.null_proven and not (
+        summary.legacy_values or summary.proof_not_determined
+    ):
+        header = "Excluded columns are NULL on Aurora DSQL"
+    else:
+        header = "Some columns were excluded from the migration"
+    return tone, header, lines
+
+
+def _render_null_proof_notice(
+    ui: object, summary: ValidationSummary, remedy: str
+) -> None:
+    """The excluded-columns notice: what was not written, and the NULL proof."""
+    tone, header, lines = null_proof_lines(summary, remedy)
+    detail = "; ".join(
+        f"{table} ({', '.join(cols)})"
+        for table, cols in summary.migration_excluded_columns.items()
+    )
+    render_notice(
+        ui,
+        tone=tone,
+        header=header,
+        body=(
+            "These columns are not written by the tool, so they are not value-compared. "
+            f"Excluded: {detail}. " + " ".join(lines)
+        ).strip(),
+    )
 
 
 def _readiness_explainer(diagnose_provider, summary, drift, label: str, detail: str):
@@ -5780,6 +6211,17 @@ def _validation_table_facts(item: TableValidationResult) -> str:
             "Deep checks (checksum / reconciliation) were skipped (fast sweep, "
             "counts matched)."
         )
+    if item.proof_state == "complete" and item.excluded_nonnull_counts:
+        lines.append(
+            "Excluded columns, rows holding a value (expected 0): "
+            + ", ".join(f"{c}={n}" for c, n in sorted(item.excluded_nonnull_counts.items()))
+            + (" (a mismatch for this migration type)" if item.excluded_values_block else "")
+        )
+    elif item.proof_state == "not_determined":
+        lines.append(
+            "Excluded columns NULL: not determined "
+            f"({proof_reason_text(item.proof_reason)})."
+        )
     rec = item.reconcile
     if rec is not None:
         lines.append(
@@ -5816,6 +6258,8 @@ def _validation_run_facts(summary: ValidationSummary, drift: DriftDisplay) -> st
         shown = ", ".join(summary.failed_tables[:10])
         more = "" if len(summary.failed_tables) <= 10 else " …(more)"
         lines.append(f"Failing tables: {shown}{more}")
+    if summary.migration_excluded_columns:
+        lines.append(f"Excluded columns: {_proof_clause(summary)}")
     if drift.available:
         if not drift.determinable:
             lines.append(
@@ -5865,6 +6309,13 @@ def _failure_reasons(item: TableValidationResult) -> list[str]:
             )
     if item.checksum_match is False:
         reasons.append("Checksum differs (row counts equal, but data is not).")
+    if item.excluded_values_block:
+        values = ", ".join(
+            f"{c} ({n:,} rows)" for c, n in sorted(item.excluded_nonnull_counts.items()) if n
+        )
+        reasons.append(
+            f"Excluded column(s) hold values, expected NULL in every row: {values}."
+        )
     reconcile = item.reconcile
     if reconcile is not None and not reconcile.consistent:
         reasons.append(
@@ -5967,7 +6418,17 @@ def _render_tables(
         {"name": "result", "label": "Result", "field": "result_sort",
          "sortable": True},
     ]
+    # The excluded-columns proof, only when some table carries one (a render without
+    # exclusions is unchanged).
+    has_proof = any(
+        item.proof_state is not None or item.proof_absent_columns for item in report.items
+    )
+    if has_proof:
+        columns.insert(-1, {"name": "excluded", "label": "Excluded", "field": "excluded"})
     rows = [_table_row(item) for item in report.items]
+    if has_proof:
+        for row, item in zip(rows, report.items):
+            row["excluded"] = _excluded_cell(item)
     table = ui.table(  # type: ignore[attr-defined]
         columns=columns,
         rows=rows,
@@ -5991,6 +6452,17 @@ def _render_tables(
     for col in ("row_count", "checksum"):
         table.add_slot(  # type: ignore[attr-defined]
             f"body-cell-{col}",
+            r"""
+            <q-td :props="props">
+              <q-badge v-if="props.value && props.value.text"
+                       :color="props.value.color" :label="props.value.text" />
+              <span v-else>—</span>
+            </q-td>
+            """,
+        )
+    if has_proof:
+        table.add_slot(  # type: ignore[attr-defined]
+            "body-cell-excluded",
             r"""
             <q-td :props="props">
               <q-badge v-if="props.value && props.value.text"
@@ -6110,6 +6582,23 @@ def _table_row(item: TableValidationResult) -> dict[str, object]:
         ),
         "result_sort": 1 if item.matched else 0,
     }
+
+
+def _excluded_cell(item: TableValidationResult) -> object:
+    """The per-table excluded-columns proof badge (``None`` renders as a dash)."""
+    if item.proof_state == "not_determined":
+        return _cell("not determined", "neutral")
+    if item.proof_state == "complete":
+        values = sum(item.excluded_nonnull_counts.values())
+        if values:
+            return _cell(
+                f"{values:,} non-NULL", "bad" if item.excluded_values_block else "neutral"
+            )
+        if item.excluded_nonnull_counts:
+            return _cell("NULL", "ok")
+        if item.legacy_nonnull_counts:
+            return _cell("DEFAULT (legacy)", "neutral")
+    return None
 
 
 def _reconcile_cell(item: TableValidationResult, which: str) -> object:

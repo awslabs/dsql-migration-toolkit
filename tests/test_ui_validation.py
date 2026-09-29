@@ -6531,7 +6531,8 @@ def test_an_excluded_column_is_disclosed_on_the_verdict_itself() -> None:
     caveat = verdict_evidence_caveats(summarize_validation(report), report)
     assert "EXCLUDED" in caveat, caveat
     assert "product_media (content)" in caveat, caveat
-    assert "hold no data on the target" in caveat, caveat
+    assert "not written, so not value-compared" in caveat, caveat
+    assert "NULL not proven" in caveat, caveat  # a report without a proof says so
 
 
 def test_the_caveat_is_bounded_so_it_survives_the_detail_truncation() -> None:

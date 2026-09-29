@@ -182,8 +182,11 @@ def test_every_path_reads_the_effective_set_not_the_raw_one():
     assert init.count(raw) == 0  # the run guard reads state.lob_exclusions() on its own name
     assert "_prereq_exclusions = effective_lob_exclusions(" in init
     val = (ui / "validation.py").read_text(encoding="utf-8")
-    assert val.count("excluded_columns=_excluded_columns(") == 2
-    assert "return effective_lob_exclusions(\n            migration_state, inv," in val
+    # Both builders (run and re-check) take the omitted set from the ONE split, which
+    # starts from the effective set.
+    assert val.count("excluded_columns=_split[0]") == 2
+    assert val.count("_split = _exclusion_split(") == 2
+    assert "effective_lob_exclusions(migration_state, inv, **kwargs)," in val
     # CDC: every builder, the Start/Deploy gates and the CDC-only preview go through the ONE
     # helper (effective set + captured generated columns + the chooser); none formats alone.
     cdc = (root / "_cdc_ui.py").read_text(encoding="utf-8")
@@ -565,7 +568,7 @@ def test_validation_recognises_a_composite_key_after_a_restore(monkeypatch):
     import dsql_migrator.ui.validation as validation
 
     src = inspect.getsource(validation.build_validation_screen)
-    body = src[src.index("def _excluded_columns("):src.index("def _run_prerequisite_error(")]
+    body = src[src.index("def _exclusion_split("):src.index("def _proof_candidates(")]
     # Only when nothing is recorded, and with the Schema Conversion state's own inputs.
     assert "if not recorded and conv_state is not None:" in body
     assert "conv_state.edited_target_ddls" in body and "conv_state.preserve_foreign_keys" in body
