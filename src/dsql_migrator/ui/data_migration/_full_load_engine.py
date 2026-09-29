@@ -69,7 +69,18 @@ from dsql_migrator.core.converter import (
 )
 from dsql_migrator.core.cdc_schema_evolve import read_target_columns
 from dsql_migrator.core.schema_applier import (
-    apply_foreign_key, recreate_table, validate_foreign_key,
+    OverlayRefusedError, apply_foreign_key, build_overlay_statements, recreate_table,
+    validate_foreign_key,
+)
+from dsql_migrator.core.overlay_ledger import (
+    LedgerDecision,
+    OverlayLedgerError,
+    OverlayLedgerUnavailableError,
+    OverlayLedgerView,
+    append_refusal,
+    overlay_ledger_key,
+    plan_ledger_record,
+    reincluded_columns,
 )
 from dsql_migrator.core.validation_sql import (
     build_orphan_count_sql,
@@ -417,6 +428,14 @@ def _record_recreated(job: MigrationJob, name: str) -> None:
     source-drop retry recreates the same table again)."""
     if name not in job.recreated_tables:
         job.recreated_tables.append(name)
+
+
+def _overlay_set(inputs: "DataMigrationInputs", table_name: str) -> frozenset[str]:
+    """The columns of ``table_name`` this run overlays (made nullable with no DEFAULT):
+    the operator's non-legacy exclusions, always within the excluded set."""
+    return frozenset(inputs.overlay_columns.get(table_name, ())) & frozenset(
+        inputs.excluded_lob_columns.get(table_name, ())
+    )
 
 
 def _advance_chunk_rows(
@@ -1322,6 +1341,10 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             )
         if generated_columns:
             table = apply_lob_exclusions(table, generated_columns)
+        # The parent overlaid this table; confirm it before the shard's first write.
+        _assert_overlay_in_place(
+            name, _overlay_set(args.inputs, name), facts_reader=migrator.overlay_facts
+        )
         _is_cancelled = lambda: (  # noqa: E731 - shared by the load + its retry
             cancel_event is not None and cancel_event.is_set()
         )
@@ -1801,6 +1824,40 @@ def _log_quarantined_row(name: str, primary_key: object, message: object,
     )
 
 
+def _assert_overlay_in_place(
+    table_name: str,
+    overlay_columns: "Iterable[str]",
+    *,
+    facts_reader: Callable[..., Any],
+) -> None:
+    """Refuse the table's first write unless every live overlay column is nullable with no
+    DEFAULT on Aurora DSQL (one facts read). Live generated / identity columns are
+    omit-only and skipped. Runs on every path: parent thread, worker and pre-recreated."""
+    columns = sorted(overlay_columns)
+    if not columns:
+        return
+    facts = facts_reader([table_name], {table_name: columns}, probe_rows=False)
+    table_facts = facts.get(table_name) if facts else None
+    if table_facts is None:
+        raise OverlayNotInPlaceError(
+            f"could not confirm that the excluded columns of {table_name} are nullable "
+            "with no DEFAULT on Aurora DSQL; nothing was written"
+        )
+    remaining = [
+        column
+        for column in columns
+        if (live := table_facts.columns.get(column)) is not None
+        and not live.computed
+        and (live.not_null or live.default_expr is not None)
+    ]
+    if remaining:
+        raise OverlayNotInPlaceError(
+            f"{', '.join(remaining)} of {table_name} still NOT NULL or with a DEFAULT on "
+            "Aurora DSQL, so its rows would not hold NULL there; nothing was written. "
+            "Retry unfinished re-applies the change."
+        )
+
+
 def _record_index_failures(
     error_log: ErrorLogStore, job_id: str, table_name: str, failures
 ) -> None:
@@ -2035,7 +2092,9 @@ def _migrate_one_table(
         # back to the DSQL target-side hint (OCC exhaustion, per-table limit, constraint
         # / data rejection) so a target failure also explains what to do next, not just
         # the bare driver text.
-        hint = (
+        # An overlay failure is target-side and says what to do itself; its copied
+        # SQLSTATE (possibly class 08) must not earn a "source connection lost" hint.
+        hint = None if isinstance(exc, OverlayRunError) else (
             source_error_hint(
                 exc, getattr(migrator, "source_type", SourceType.MYSQL)
             )
@@ -2985,6 +3044,85 @@ def _heartbeat_of(handle: "Optional[JobHandle]") -> Callable[[], None]:
     return beat
 
 
+def _run_overlay_tables(inputs: "DataMigrationInputs", tables: Sequence[TableDef]) -> set[str]:
+    return {table.name for table in tables if _overlay_set(inputs, table.name)}
+
+
+def _require_overlay_ledger(migrator: DataMigrator, tables: Sequence[TableDef]) -> None:
+    """Refuse the run before anything happens (no watermark, no replication slot, no
+    pre-drop) when it has overlay columns but no ledger to record their DEFAULTs in."""
+    base = getattr(migrator, "_inputs", None)
+    if not isinstance(base, DataMigrationInputs) or base.overlay_ledger is not None:
+        return
+    if _run_overlay_tables(base, tables):
+        raise OverlayLedgerReadError(
+            "no overlay ledger configured, so the DEFAULTs of the excluded columns could "
+            "not be recorded"
+        )
+
+
+def _open_run_ledger_view(
+    migrator: DataMigrator, tables: Sequence[TableDef], *, handle: JobHandle
+) -> None:
+    """Step 0: the run's ONE ledger read, then bind the run's inputs to the migrator.
+
+    A run with no overlay columns and no ledger records never touches the ledger (0.1.561
+    behaviour). Readable (present or absent): the inputs gain the run's ledger view.
+    Unreadable: the overlay tables leave ``replace_tables`` (nothing about them may be
+    dropped or recreated) and each fails closed at its first statement; ONE warning names
+    the tables the run still reloads. Either way every recreate is noted on the job.
+    """
+    base = getattr(migrator, "_inputs", None)
+    if not isinstance(base, DataMigrationInputs):
+        return
+    overlay_tables = _run_overlay_tables(base, tables)
+    if not overlay_tables and not base.overlay_ledger_in_use:
+        return
+    store = base.overlay_ledger
+    if store is None:
+        _require_overlay_ledger(migrator, tables)
+        return
+    key = overlay_ledger_key(base.target_config)
+    read = store.read(key)
+
+    def _on_recreated(name: str) -> None:
+        handle.update(lambda job, n=name: _record_recreated(job, n))
+
+    if read.status == "unreadable":
+        run_inputs = replace(
+            base,
+            replace_tables=frozenset(base.replace_tables - overlay_tables),
+            overlay_record=None,
+            overlay_ledger_status="unreadable",
+            on_table_recreated=_on_recreated,
+        )
+        still_reloaded = sorted(run_inputs.replace_tables & {t.name for t in tables})
+        log_activity(
+            ActivityCategory.FULL_LOAD,
+            "overlay ledger unreadable",
+            status=ActivityStatus.WARNING,
+            detail=(
+                f"the record of dropped DEFAULTs could not be read ({read.error}); tables "
+                "with excluded columns are not changed and fail: "
+                + (", ".join(sorted(overlay_tables)) or "none")
+                + ". Still reloaded: "
+                + (", ".join(still_reloaded) or "none")
+                + " -- if one of them had columns excluded in an earlier run, choose Drop & "
+                "reload for it again once the record can be read"
+            ),
+        )
+    else:
+        run_inputs = replace(
+            base,
+            overlay_record=OverlayLedgerView(store, key, read),
+            overlay_ledger_status=read.status,
+            on_table_recreated=_on_recreated,
+        )
+    bind = getattr(migrator, "bind_run_inputs", None)
+    if callable(bind):
+        bind(run_inputs)
+
+
 def _predrop_blocking_foreign_keys(migrator: DataMigrator) -> None:
     """Call the migrator's blocking-FK pre-drop, if it supports one (else no-op).
 
@@ -3157,16 +3295,31 @@ def _log_excluded_lob_columns(
     for table_name in sorted(inputs.excluded_lob_columns):
         if scope is not None and table_name not in scope:
             continue
+        overlay = _overlay_set(inputs, table_name)
+        legacy = frozenset(getattr(inputs, "legacy_exclusions", {}).get(table_name, ()))
         for column in sorted(inputs.excluded_lob_columns[table_name]):
+            if column in overlay:
+                detail = (
+                    "excluded from the load by the user; the column is made nullable with "
+                    "no DEFAULT on the target before the load, so every row stores NULL "
+                    "(its data is not migrated; the DEFAULT is restored at cut over)"
+                )
+            elif column in legacy:
+                detail = (
+                    "excluded in a session from an earlier version: omitted from the load "
+                    "only, the target column is not altered (rows take its DEFAULT, or NULL)"
+                )
+            else:
+                detail = (
+                    "oversized LOB column excluded from the load by user; the column "
+                    "is left NULL on the target (its data is not migrated)"
+                )
             log_activity(
                 ActivityCategory.FULL_LOAD,
                 "column excluded",
                 status=ActivityStatus.INFO,
                 target=f"{table_name}.{column}",
-                detail=(
-                    "oversized LOB column excluded from the load by user; the column "
-                    "is left NULL on the target (its data is not migrated)"
-                ),
+                detail=detail,
             )
 
 
@@ -3346,7 +3499,18 @@ def _lob_excluded_note(migrator: "DataMigrator", table_name: str) -> str:
     )
     if not excluded:
         return ""
-    return f" ({len(excluded)} column(s) excluded: {', '.join(excluded)})"
+    overlay = (
+        sorted(_overlay_set(inputs, table_name))
+        if isinstance(inputs, DataMigrationInputs)
+        else []
+    )
+    if not overlay:
+        null_note = ""
+    elif overlay == excluded:
+        null_note = "; loaded as NULL"
+    else:
+        null_note = f"; loaded as NULL: {', '.join(overlay)}"
+    return f" ({len(excluded)} column(s) excluded: {', '.join(excluded)}{null_note})"
 
 
 def run_full_load(
@@ -3412,6 +3576,10 @@ def run_full_load(
     # carry row values in here (Property 7). Re-raised unchanged: the JobManager still marks
     # the job FAILED and the UI still shows the error.
     try:
+        # First, before the watermark: a PostgreSQL Full Load + CDC run creates its source
+        # replication slot while capturing it, and a run that cannot record its overlay
+        # must not leave one behind.
+        _require_overlay_ledger(migrator, tables)
         watermark = migrator.capture_watermark(tables)
         handle.update(lambda job: setattr(job, "watermark", watermark))
         # inputs is Optional here; fall back to MySQL when absent (matches the default).
@@ -3421,6 +3589,9 @@ def run_full_load(
                 getattr(inputs, "source_config", None), "source_type", SourceType.MYSQL
             ),
         )
+        # The run's one ledger read, before the pre-drops: an unreadable ledger takes the
+        # overlay tables out of replace_tables, so nothing of theirs is dropped.
+        _open_run_ledger_view(migrator, tables, handle=handle)
 
         # On a "drop & reload" run, drop views that depend on the replaced tables
         # BEFORE the per-table DROP+recreate (a view can span several tables loaded in
@@ -3668,6 +3839,9 @@ def run_full_load_retry(
             ),
         )
 
+    # Step 0, as in run_full_load: the one ledger read, before the pre-drops.
+    _require_overlay_ledger(migrator, tables_to_retry)
+    _open_run_ledger_view(migrator, tables_to_retry, handle=handle)
     # Same run-level view pre-drop / recreate as run_full_load, so a retry that
     # DROP+recreates a table whose view dependency blocked the first attempt now
     # succeeds instead of silently skip-loading over stale rows.
@@ -4099,6 +4273,267 @@ def _default_table_recreator(inputs: "DataMigrationInputs") -> TableRecreator:
     return recreate
 
 
+def _first_line(exc: BaseException) -> str:
+    text = str(exc).strip().splitlines()
+    return f"{type(exc).__name__}: {text[0] if text else ''}".rstrip(": ")
+
+
+def _live_overlay(table_facts, overlay: "Iterable[str]"):
+    """``(live, computed)``: the overlay columns present live and not computed (their
+    pre-ALTER facts), and those Aurora DSQL computes (omit-only, never ALTERed)."""
+    live: dict[str, Any] = {}
+    computed: list[str] = []
+    for column in sorted(overlay):
+        facts = table_facts.columns.get(column)
+        if facts is None:
+            continue
+        if facts.computed:
+            computed.append(column)
+        else:
+            live[column] = facts
+    return live, computed
+
+
+def _log_omit_only(table_name: str, computed: "Sequence[str]") -> None:
+    for column in computed:
+        log_activity(
+            ActivityCategory.FULL_LOAD,
+            "column excluded",
+            status=ActivityStatus.INFO,
+            target=f"{table_name}.{column}",
+            detail="computed by Aurora DSQL: omitted from the load and not altered",
+        )
+
+
+def _overlay_plan_detail(live: "Mapping[str, Any]") -> str:
+    """The exact changes, with each DEFAULT that will be dropped (recorded for cut over)."""
+    parts = []
+    for column in sorted(live):
+        facts = live[column]
+        steps = []
+        if facts.not_null:
+            steps.append("DROP NOT NULL")
+        if facts.default_expr is not None:
+            steps.append(f"DROP DEFAULT (was {facts.default_expr})")
+        if steps:
+            parts.append(f"{column}: {', '.join(steps)}")
+    return "; ".join(parts)
+
+
+def _run_overlay_unit(migrator, table_name: str, live, expected_defaults) -> None:
+    """Run the table's overlay unit through the migrator seam; every failure is an
+    :class:`OverlayRunError`, so only this table fails."""
+    try:
+        outcome = migrator.apply_overlay(
+            table_name, live, expected_defaults=expected_defaults
+        )
+    except OverlayRunError:
+        raise
+    except OverlayRefusedError as exc:
+        raise OverlayRecordMismatchError(
+            f"{exc}; the table was not loaded", cause=exc
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - this table fails closed
+        raise OverlayNotInPlaceError(
+            f"could not make the excluded columns of {table_name} nullable with no "
+            f"DEFAULT on Aurora DSQL ({_first_line(exc)}); nothing was loaded",
+            cause=exc,
+        ) from exc
+    log_activity(
+        ActivityCategory.FULL_LOAD,
+        "overlay applied",
+        status=ActivityStatus.SUCCESS,
+        target=table_name,
+        detail=(
+            f"nullable: {', '.join(getattr(outcome, 'dropped_not_null', ()) or ()) or 'none'}; "
+            "DEFAULT dropped: "
+            + (", ".join(sorted(getattr(outcome, "dropped_defaults", {}) or {})) or "none")
+        ),
+    )
+
+
+def _overlay_write_and_apply(
+    migrator, inputs: "DataMigrationInputs", table: TableDef, overlay: "frozenset[str]",
+    *, just_recreated: bool,
+) -> None:
+    """WRITER mode (the parent, which holds the run's ledger view).
+
+    One fresh facts read; on an append the shared reload verdict (``append_refusal``,
+    exempt while CDC coexists or for legacy entries, with a WARNING); the record update
+    (``plan_ledger_record``) merged into the ledger against a fresh read BEFORE any ALTER;
+    then the unit, which drops only DEFAULTs equal to what was just recorded.
+    """
+    name = table.name
+    view = inputs.overlay_record
+    record = view.record(name)
+    asked = sorted(set(overlay) | set(record.set_columns if record else ()))
+    facts = migrator.overlay_facts([name], {name: asked}, probe_rows=not just_recreated)
+    table_facts = facts.get(name) if facts else None
+    if table_facts is None:
+        raise OverlayCatalogError(
+            f"cannot read the recreated table's DEFAULTs of {name} on Aurora DSQL; nothing "
+            "was altered"
+            if just_recreated
+            else f"could not read the Aurora DSQL catalog of {name}; nothing was changed on it"
+        )
+    if not table_facts.exists:
+        return  # nothing to overlay; the load itself reports the missing table
+    live, computed = _live_overlay(table_facts, overlay)
+    _log_omit_only(name, computed)
+    has_rows = False if just_recreated else bool(table_facts.has_rows)
+    present_live = [c for c in (record.set_columns if record else ()) if table_facts.columns.get(c)]
+    omitted = sorted(set(inputs.excluded_lob_columns.get(name, ())) | set(computed))
+    if not just_recreated:
+        refusal = append_refusal(
+            record, has_rows=has_rows, exempt=False, overlay_present=sorted(live),
+            present_live=present_live, omitted=omitted,
+        )
+        if refusal is not None:
+            reason = (
+                "CDC is streaming into it"
+                if inputs.cdc_coexisting
+                else "it has exclusions from an earlier version"
+                if inputs.legacy_exclusions.get(name)
+                else None
+            )
+            if reason is None:
+                raise OverlayNeedsReloadError(
+                    f"{name} {refusal.text()}; nothing was changed on it"
+                )
+            log_activity(
+                ActivityCategory.FULL_LOAD,
+                "overlay append",
+                status=ActivityStatus.WARNING,
+                target=name,
+                detail=(
+                    f"{refusal.text()} -- appended anyway because {reason}; rows already "
+                    f"in the table keep what they hold in {', '.join(refusal.columns)}"
+                ),
+            )
+    reincluded = reincluded_columns(record, present_live=present_live, omitted=omitted)
+    ddl = _effective_target_ddl(inputs, table)
+    now = datetime.now(timezone.utc)
+
+    def _merge(existing):
+        decision = plan_ledger_record(
+            existing, table=name, overlay_facts=live, has_rows=has_rows,
+            just_recreated=just_recreated, effective_ddl=ddl, now=now,
+            reincluded=reincluded,
+        )
+        if (
+            decision.kind == "write"
+            and existing is not None
+            and decision.record.model_copy(update={"applied_at": existing.applied_at})
+            == existing
+        ):
+            return LedgerDecision("unchanged", existing)
+        return decision
+
+    planned = build_overlay_statements(name, live)
+    if planned:
+        # Written BEFORE the record, so the audit trail names the exact originals even
+        # when the record write then fails.
+        log_activity(
+            ActivityCategory.FULL_LOAD,
+            "overlay planned",
+            status=ActivityStatus.INFO,
+            target=name,
+            detail=(
+                f"{_overlay_plan_detail(live)}; the dropped DEFAULTs are recorded first "
+                "and restored at cut over"
+            ),
+        )
+    try:
+        view.merge({name: _merge})
+    except OverlayLedgerError as exc:
+        if just_recreated:
+            text = (
+                f"cannot record the DEFAULTs of {name} before dropping them; nothing was "
+                "altered. The table was recreated empty; Retry unfinished recreates and "
+                "loads it"
+            )
+        elif planned:
+            text = (
+                f"cannot record the DEFAULTs of {name} before dropping them; nothing was "
+                "changed on it"
+            )
+        else:
+            text = (
+                f"cannot update the record of dropped DEFAULTs for {name}; nothing was "
+                "altered"
+            )
+        raise OverlayLedgerWriteError(f"{text} ({_first_line(exc)})", cause=exc) from exc
+    if planned:
+        after = view.record(name)
+        expected = {
+            column: (
+                after.column(column).original_default
+                if after is not None and after.column(column) is not None
+                else None
+            )
+            for column in live
+        }
+        _run_overlay_unit(migrator, name, live, expected)
+
+
+def _overlay_verify_recorded(
+    migrator, inputs: "DataMigrationInputs", table: TableDef, overlay: "frozenset[str]",
+) -> None:
+    """VERIFY-RECORDED mode (a worker's own recreate on a source-drop retry): compare the
+    recreated DEFAULTs with those the parent recorded BEFORE any ALTER; only an exact
+    match runs the unit (which re-checks on every attempt)."""
+    name = table.name
+    facts = migrator.overlay_facts([name], {name: sorted(overlay)}, probe_rows=False)
+    table_facts = facts.get(name) if facts else None
+    if table_facts is None:
+        raise OverlayCatalogError(
+            f"cannot read the recreated table's DEFAULTs of {name} on Aurora DSQL; nothing "
+            "was altered"
+        )
+    live, computed = _live_overlay(table_facts, overlay)
+    _log_omit_only(name, computed)
+    recorded = dict(inputs.overlay_recorded_defaults.get(name, {}) or {})
+    for column in sorted(live):
+        live_default = live[column].default_expr
+        if live_default is not None and recorded.get(column) != live_default:
+            raise OverlayRecordMismatchError(
+                f"the recreated DEFAULT of {column} is {live_default}, not the "
+                f"{recorded.get(column) or 'none'} recorded before the load; nothing was "
+                "altered. Retry unfinished re-records it and reloads the table"
+            )
+    if build_overlay_statements(name, live):
+        _run_overlay_unit(
+            migrator, name, live, {column: recorded.get(column) for column in live}
+        )
+
+
+def recreate_then_overlay(
+    base: TableRecreator, *, current_inputs: Callable[[], "DataMigrationInputs"], migrator,
+) -> TableRecreator:
+    """Wrap the base recreator so every recreate is followed, in the same process, by the
+    table's overlay before its first row: WRITER mode where the run's ledger view is
+    present (the parent), VERIFY-RECORDED mode in a worker. A table with neither overlay
+    columns nor a record costs nothing extra (0.1.561 parity)."""
+
+    def recreate(table: TableDef) -> list[str]:
+        index_ddls = base(table)
+        inputs = current_inputs()
+        if inputs.on_table_recreated is not None:
+            inputs.on_table_recreated(table.name)
+        overlay = _overlay_set(inputs, table.name)
+        view = inputs.overlay_record
+        record = view.record(table.name) if view is not None else None
+        if not overlay and record is None:
+            return index_ddls
+        if view is not None:
+            _overlay_write_and_apply(migrator, inputs, table, overlay, just_recreated=True)
+        elif overlay:
+            _overlay_verify_recorded(migrator, inputs, table, overlay)
+        return index_ddls
+
+    return recreate
+
+
 class BatchedTableMigrator:
     """In-process :class:`DataMigrator`: stream source rows and batch-load DSQL.
 
@@ -4159,7 +4594,12 @@ class BatchedTableMigrator:
             engine_factory=make_source_engine_factory(inputs.source_password)
         )
         self._importer_factory = importer_factory
+        # The BASE recreator (the process pre-pass calls it directly); the thread path and a
+        # worker's own recreate go through the overlaying wrapper.
         self._table_recreator = table_recreator or _default_table_recreator(inputs)
+        self._overlaying_recreator = recreate_then_overlay(
+            self._table_recreator, current_inputs=lambda: self._inputs, migrator=self
+        )
         # Post-load completeness verifier for clean-replace loads (injectable for
         # tests). Defaults to a read-only target COUNT(*).
         self._target_counter = target_counter or self._default_count_target_rows
@@ -4404,6 +4844,12 @@ class BatchedTableMigrator:
         # dropping the column from the load must not drop it from the target schema
         # (that would diverge from CDC and from the schema the user applied in Step
         # 2), so the recreator is always handed the unfiltered table.
+        # The excluded columns this run makes nullable with no DEFAULT (the overlay). With
+        # an unreadable ledger such a table is not touched at all: no recreate, no ALTER,
+        # no row (its dropped DEFAULTs could not be recorded).
+        overlay = _overlay_set(self._inputs, table.name)
+        if overlay and self._inputs.overlay_ledger_status == "unreadable":
+            raise OverlayLedgerReadError(OverlayLedgerUnavailableError.MESSAGE)
         original_table = table
         table = apply_lob_exclusions(
             table, self._inputs.excluded_lob_columns.get(table.name)
@@ -4476,7 +4922,10 @@ class BatchedTableMigrator:
         )
         # A CHANGED target PK on an EMPTY target is promoted to the replace path (see
         # _needs_empty_target_promotion; the probes stay lazy).
-        if _needs_empty_target_promotion(
+        # A process worker never promotes an overlay table: the parent decided that (and
+        # overlaid it) before submitting it.
+        worker_overlay_table = bool(overlay) and self._inputs.overlay_record is None
+        if not worker_overlay_table and _needs_empty_target_promotion(
             target_key_columns=target_key_columns,
             source_pk=table.primary_key,
             is_replace=is_replace,
@@ -4570,8 +5019,9 @@ class BatchedTableMigrator:
             else:
                 # Recreate from the UNFILTERED table so the target keeps the excluded
                 # column (only its data is skipped, matching CDC); the fallback
-                # deterministic conversion would otherwise omit a dropped column.
-                index_ddls = self._table_recreator(original_table)
+                # deterministic conversion would otherwise omit a dropped column. The
+                # overlaying wrapper then makes the excluded columns NULL-only.
+                index_ddls = self._overlaying_recreator(original_table)
             # Clean load into a freshly-emptied target: plain INSERT (no ON
             # CONFLICT) -- DSQL never silently drops a non-conflicting row. The
             # target was just recreated from the applied DDL, so target_key_columns
@@ -4656,6 +5106,16 @@ class BatchedTableMigrator:
         load_job = (
             resume_job if load_on_conflict is OnConflictMode.SKIP_EXISTING else None
         )
+        view = self._inputs.overlay_record
+        if not is_replace and view is not None and (overlay or view.record(table.name)):
+            # The parent thread path appends in place: verdict, record, then the unit.
+            _overlay_write_and_apply(
+                self, self._inputs, original_table, overlay, just_recreated=False
+            )
+        if overlay:
+            _assert_overlay_in_place(
+                table.name, overlay, facts_reader=self.overlay_facts
+            )
         importer = self._importer_factory(self._inputs)
         try:
             result = importer.import_rows(
