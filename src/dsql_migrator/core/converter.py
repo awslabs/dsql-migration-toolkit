@@ -894,7 +894,7 @@ def parse_target_column_types(create_ddl: str) -> dict[str, str]:
     # case when a PostgreSQL identity key started defaulting to an identity target.
     try:
         parsed = sqlglot.parse_one(
-            _IDENTITY_CLAUSE_RE.sub("", create_ddl or ""), read="postgres"
+            _strip_identity_clauses(create_ddl), read="postgres"
         )
     except Exception:  # noqa: BLE001 - unparseable DDL -> no overrides (safe default)
         return {}
@@ -919,6 +919,42 @@ _IDENTITY_CLAUSE_RE = re.compile(
 )
 
 
+def _sub_outside_quotes(pattern: "re.Pattern[str]", repl: str, text: str) -> str:
+    """``pattern.sub(repl, ...)`` applied only OUTSIDE '...' literals and "..." identifiers.
+
+    The identity strip must not rewrite a string literal: a DEFAULT whose text reads
+    'GENERATED ALWAYS AS IDENTITY (x)' would otherwise read back as '' and compare equal
+    to a DDL that declares DEFAULT ''. Doubled quotes are the escape inside either kind;
+    an unterminated quote leaves the rest of the text untouched.
+    """
+    out: list[str] = []
+    start = i = 0
+    n = len(text)
+    while i < n:
+        quote = text[i]
+        if quote not in ("'", '"'):
+            i += 1
+            continue
+        out.append(pattern.sub(repl, text[start:i]))
+        j = i + 1
+        while j < n:
+            if text[j] == quote:
+                if j + 1 < n and text[j + 1] == quote:
+                    j += 2
+                    continue
+                break
+            j += 1
+        out.append(text[i : j + 1])
+        start = i = j + 1
+    out.append(pattern.sub(repl, text[start:]))
+    return "".join(out)
+
+
+def _strip_identity_clauses(create_ddl: str) -> str:
+    """The DDL with every identity clause removed (outside quotes; see above)."""
+    return _sub_outside_quotes(_IDENTITY_CLAUSE_RE, "", create_ddl or "")
+
+
 @lru_cache(maxsize=4096)
 def parse_target_column_names(create_ddl: str) -> "Optional[frozenset[str]]":
     """The column names of an applied CREATE TABLE, folded the way PostgreSQL folds them.
@@ -937,7 +973,7 @@ def parse_target_column_names(create_ddl: str) -> "Optional[frozenset[str]]":
     """
     try:
         parsed = sqlglot.parse_one(
-            _IDENTITY_CLAUSE_RE.sub("", create_ddl or ""), read="postgres"
+            _strip_identity_clauses(create_ddl), read="postgres"
         )
     except Exception:  # noqa: BLE001 - unparseable DDL -> unknown
         return None
@@ -978,7 +1014,7 @@ def parse_target_column_constraints(
 @lru_cache(maxsize=4096)
 def _column_constraints(create_ddl: str) -> "tuple[tuple[str, tuple[bool, Optional[str]]], ...]":
     try:
-        parsed = sqlglot.parse_one(_IDENTITY_CLAUSE_RE.sub("", create_ddl), read="postgres")
+        parsed = sqlglot.parse_one(_strip_identity_clauses(create_ddl), read="postgres")
     except Exception:  # noqa: BLE001 - unparseable DDL -> unknown
         return ()
     if not isinstance(parsed, exp.Create):
@@ -1020,7 +1056,7 @@ def fold_identifier(name: str) -> str:
     return "".join(chr(ord(ch) + 32) if "A" <= ch <= "Z" else ch for ch in name)
 
 
-def parse_target_generated_columns(create_ddl: str) -> set[str]:
+def parse_target_generated_columns(create_ddl: str, *, folded: bool = False) -> set[str]:
     """Return the names of GENERATED ... STORED columns in an applied CREATE TABLE DDL.
 
     The third applied-DDL reader beside :func:`parse_target_column_types` and
@@ -1037,6 +1073,11 @@ def parse_target_generated_columns(create_ddl: str) -> set[str]:
     An unparseable DDL yields an EMPTY set deliberately -- "unknown" must mean "send the
     column" (which fails loudly) rather than "skip it" (which would write NULL into an
     ordinary column and only surface much later as a Validation mismatch).
+
+    Names are as written by default (the loader's reading, unchanged); ``folded`` names
+    them as PostgreSQL stores them (quoted as written, unquoted folded), which is how the
+    column-exclusion rule and the overlay's DDL facts compare, beside the other folded
+    readers.
     """
     # Strip the identity clause FIRST. sqlglot cannot parse the CACHE option (which is
     # exactly why the identity is injected as raw text -- see _apply_pk_strategy), so any
@@ -1044,7 +1085,7 @@ def parse_target_generated_columns(create_ddl: str) -> set[str]:
     # generated columns" for precisely the tables most likely to have one, and the loader
     # would then send the value and quarantine every row (428C9). The pattern is the tool's
     # own fixed emission, so removing it is safe and keeps the rest of the DDL intact.
-    stripped = _IDENTITY_CLAUSE_RE.sub("", create_ddl or "")
+    stripped = _strip_identity_clauses(create_ddl)
     try:
         parsed = sqlglot.parse_one(stripped, read="postgres")
     except Exception:  # noqa: BLE001 - unparseable DDL -> unknown (send the column)
@@ -1075,7 +1116,7 @@ def parse_target_generated_columns(create_ddl: str) -> set[str]:
                 )
                 and _GENERATED_CLAUSE_RE.match(constraint.sql(dialect="postgres"))
             ):
-                generated.add(name)
+                generated.add(_folded_name(column_def.this) if folded else name)
                 break
     return generated
 
@@ -1102,7 +1143,9 @@ def parse_target_identity_columns(create_ddl: str) -> frozenset[str]:
     """
     try:
         parsed = sqlglot.parse_one(
-            _IDENTITY_OPTIONS_RE.sub(r"\1", create_ddl or ""), read="postgres"
+            # "\1 " keeps a separator: "(CACHE 1)NOT NULL" must not become "IDENTITYNOT".
+            _sub_outside_quotes(_IDENTITY_OPTIONS_RE, r"\1 ", create_ddl or ""),
+            read="postgres",
         )
     except Exception:  # noqa: BLE001 - unparseable DDL -> unknown (empty)
         return frozenset()
@@ -1154,7 +1197,7 @@ def parse_target_primary_key(create_ddl: str, *, for_exclusion: bool = False) ->
         # whose target key is an identity column reported NO primary key, so the
         # loader fell back to the source key for its ON CONFLICT target.
         parsed = sqlglot.parse_one(
-            _IDENTITY_CLAUSE_RE.sub("", create_ddl or ""), read="postgres"
+            _strip_identity_clauses(create_ddl), read="postgres"
         )
     except Exception:  # noqa: BLE001 - unparseable DDL -> unknown (empty list)
         return []

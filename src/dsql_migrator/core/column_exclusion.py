@@ -131,7 +131,8 @@ def _ddl_key_facts(ddl: str) -> "tuple[tuple[str, ...], frozenset[str]]":
 
     pk = tuple(parse_target_primary_key(ddl, for_exclusion=True))
     identity = parse_target_identity_columns(ddl) - set(pk)
-    return pk, frozenset(parse_target_generated_columns(ddl)) | identity
+    # Folded like the other two readers: the names PostgreSQL stores.
+    return pk, frozenset(parse_target_generated_columns(ddl, folded=True)) | identity
 
 
 # The FK pass applies each ``conv.foreign_key_ddls`` statement (an ``ALTER TABLE ... ADD

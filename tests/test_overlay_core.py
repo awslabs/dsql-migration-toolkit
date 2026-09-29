@@ -51,10 +51,16 @@ class Denied(Exception):
     sqlstate = "42501"
 
 
+def _stored(name):
+    """The catalog's form of an identifier: UTF-8 cut to 63 bytes (NAMEDATALEN)."""
+    return name.encode("utf-8")[:63].decode("utf-8", errors="ignore")
+
+
 class FakeDb:
     def __init__(self, tables, rows=None):
         # tables: {"shop.t": {"col": {"notnull": bool, "default": str|None, "identity": "", "generated": ""}}}
-        self.tables = {t: {c: dict({"identity": "", "generated": ""}, **v) for c, v in cols.items()}
+        # Column names are stored as the catalog stores them (cut to 63 bytes).
+        self.tables = {t: {_stored(c): dict({"identity": "", "generated": ""}, **v) for c, v in cols.items()}
                        for t, cols in tables.items()}
         self.rows = rows or {}
         self.pks = {}
@@ -119,9 +125,11 @@ class FakeCursor:
             if table is None:
                 self._rows = []
             else:
+                # attname = ANY(name[]): each parameter is cut to 63 bytes like the catalog.
+                asked = {_stored(c) for c in params["columns"]}
                 hits = [(c, table[c]["notnull"], table[c]["identity"], table[c]["generated"],
                          table[c]["default"] if not table[c]["generated"] else "(gen expr)")
-                        for c in params["columns"] if c in table]
+                        for c in table if c in asked]
                 self._rows = hits or [(None, None, None, None, None)]
         elif text.startswith("SELECT 1 FROM"):
             name = ".".join(re.findall(r'"([^"]+)"', text))
@@ -130,14 +138,18 @@ class FakeCursor:
             m = re.match(r'ALTER TABLE ((?:"[^"]+"\.)?"[^"]+") ALTER COLUMN "([^"]+)" (DROP NOT NULL|DROP DEFAULT|SET DEFAULT (.*))$', text)
             assert m, text
             name = ".".join(re.findall(r'"([^"]+)"', m.group(1)))
-            col = db.tables[name][m.group(2)]
+            col = db.tables[name][_stored(m.group(2))]
             if not db.ignore_alters:
                 if m.group(3) == "DROP NOT NULL":
                     col["notnull"] = False
                 elif m.group(3) == "DROP DEFAULT":
                     col["default"] = None
                 else:
-                    col["default"] = db.store_default_as or m.group(4)
+                    # PostgreSQL keeps the expression, not the parentheses around it.
+                    expr = m.group(4)
+                    if expr.startswith("(") and expr.endswith(")"):
+                        expr = expr[1:-1]
+                    col["default"] = db.store_default_as or expr
         self._fire(text, "after")
 
     def fetchall(self):
@@ -445,3 +457,94 @@ def test_restore_never_overwrites_refuses_unsafe_text_and_detects_a_bad_round_tr
     comp = _db(body={"notnull": False, "default": None, "generated": "s"})
     with pytest.raises(OverlayRefusedError):
         restore_column_default("shop.docs", "body", "1", connection_factory=comp.connect, **NO_SLEEP)
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (P2-01..04 verification)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("expr", [
+    "'x'::text, DROP COLUMN secret",                       # a second ALTER TABLE subcommand
+    "E'\\'';DROP TABLE t;SELECT E'\\''",                   # a backslash escape shifts the quote parity
+    "E'\\'';COMMIT;DROP TABLE t;SELECT E'\\''",
+    "$a1$'$a1$;DROP TABLE t;SELECT $a1$'$a1$",             # a dollar tag with a digit
+    "x) , DROP COLUMN s, ALTER c SET DEFAULT (1",          # closes the wrapping parenthesis
+    "'a\\b'::text", "$1", "(1", "1)", "'open",
+])
+def test_restore_refuses_every_splice_before_connecting(expr):
+    db = _db(body={"notnull": False, "default": None})
+    with pytest.raises(OverlayRefusedError, match="not a single expression"):
+        restore_column_default("shop.docs", "body", expr, connection_factory=db.connect, **NO_SLEEP)
+    assert db.connects == 0
+
+
+@pytest.mark.parametrize("expr", [
+    "'a;b'::text", "now()", "nextval('s'::regclass)", "'{1,2}'::integer[]", "ROW(1, 2)",
+    "'x'::character varying", "ARRAY[1, 2]", "(0)::numeric(10,2)", "'it''s'::text", "'$5'::text",
+])
+def test_real_pg_get_expr_text_is_restored_inside_parentheses(expr):
+    db = _db(body={"notnull": False, "default": None})
+    assert restore_column_default("shop.docs", "body", expr, connection_factory=db.connect, **NO_SLEEP).status == "restored"
+    sets = [t for _c, t in db.log if "SET DEFAULT" in t]
+    assert sets == [f'ALTER TABLE "shop"."docs" ALTER COLUMN "body" SET DEFAULT ({expr})']
+
+
+LONG = "customer_shipping_address_line_two_normalized_for_geo_lookup_v22"  # 64 bytes
+WIDE = "é" * 32  # 64 bytes; the cut falls inside a character
+
+
+def test_a_name_over_63_bytes_is_keyed_by_the_asked_name():
+    assert len(LONG.encode()) == 64 and len(WIDE.encode()) == 64
+    db = _db(**{LONG: {"notnull": True, "default": "'x'::text"}, WIDE: {"notnull": False, "default": "0"}})
+    facts = target_overlay_facts(["shop.docs"], {"shop.docs": [LONG, WIDE]}, connection_factory=db.connect,
+                                 probe_rows=False)["shop.docs"]
+    assert set(facts.columns) == {LONG, WIDE}  # no stray truncated key
+    assert facts.columns[LONG] == F(True, "'x'::text") and facts.columns[WIDE] == F(False, "0")
+    out = apply_exclusion_overlay("shop.docs", facts.columns, connection_factory=db.connect, **NO_SLEEP)
+    assert out.dropped_defaults == {LONG: "'x'::text", WIDE: "0"} and out.dropped_not_null == (LONG,)
+    assert restore_column_default("shop.docs", LONG, "'x'::text", connection_factory=db.connect, **NO_SLEEP).status == "restored"
+
+
+def test_two_asked_names_the_catalog_stores_as_one_make_the_table_unknown():
+    twin = LONG[:-1] + "3"  # the same first 63 bytes
+    db = _db(**{LONG: {"notnull": True, "default": None}})
+    assert target_overlay_facts(["shop.docs"], {"shop.docs": [LONG, twin]}, connection_factory=db.connect,
+                                probe_rows=False) == {"shop.docs": None}
+
+
+def test_facts_retry_one_occ_and_reconnect_a_lost_connection():
+    tables = {f"shop.t{i}": {"c": {"notnull": False, "default": None}} for i in range(4)}
+    db = FakeDb(tables, rows={name: True for name in tables})
+    db.fault(r'SELECT 1 FROM "shop"."t1"', Occ())
+    facts = target_overlay_facts(list(tables), {n: ["c"] for n in tables}, connection_factory=db.connect,
+                                 sleep=lambda _s: None)
+    assert all(facts[n] is not None for n in tables) and db.connects == 1
+
+    db = FakeDb(tables, rows={name: True for name in tables})
+    db.fault(r'SELECT 1 FROM "shop"."t1"', Conn08())
+    facts = target_overlay_facts(list(tables), {n: ["c"] for n in tables}, connection_factory=db.connect,
+                                 sleep=lambda _s: None)
+    assert all(facts[n] is not None for n in tables) and db.connects == 2
+
+    db = FakeDb(tables, rows={name: True for name in tables})
+    db.fault(r'SELECT 1 FROM "shop"."t[123]"', Conn08(), times=99)
+    facts = target_overlay_facts(list(tables), {n: ["c"] for n in tables}, connection_factory=db.connect,
+                                 sleep=lambda _s: None)
+    assert facts["shop.t0"] is not None and [facts[f"shop.t{i}"] for i in (1, 2, 3)] == [None, None, None]
+    assert db.connects == 3  # the first connection + the two bounded reconnects
+
+
+def test_ddl_facts_refuse_identity_and_unquoted_generated_like_the_live_read():
+    for column_sql in ('"seq" BIGINT NOT NULL GENERATED BY DEFAULT AS IDENTITY (CACHE 65536)',
+                       '"seq" BIGINT GENERATED ALWAYS AS IDENTITY (CACHE 1)'):
+        ddl = f'CREATE TABLE "shop"."t" ("id" BIGINT PRIMARY KEY, {column_sql}, "x" INT)'
+        facts = ddl_column_facts(ddl, ["seq"])
+        assert facts["seq"].identity and facts["seq"].not_null and facts["seq"].computed
+        with pytest.raises(OverlayRefusedError):
+            build_overlay_statements("shop.t", facts)
+    ddl = 'CREATE TABLE "app"."t" ("id" INT PRIMARY KEY, "a" INT, Total INT GENERATED ALWAYS AS (a * 2) STORED)'
+    assert ddl_column_facts(ddl, ["total"])["total"].generated
+    with pytest.raises(OverlayRefusedError):
+        build_overlay_statements("app.t", ddl_column_facts(ddl, ["total"]))
+    assert ddl_column_facts("garbage(", ["a"]) is None  # unknown, never "nothing to do"

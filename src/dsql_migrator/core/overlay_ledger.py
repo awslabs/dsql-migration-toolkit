@@ -170,6 +170,7 @@ def plan_ledger_record(
     just_recreated: bool,
     effective_ddl: Optional[str],
     now: datetime,
+    reincluded: "Sequence[str]" = (),
 ) -> LedgerDecision:
     """THE rule for what a table's record becomes when the overlay (or a reconcile) runs.
 
@@ -189,8 +190,21 @@ def plan_ledger_record(
         same set digest keeps ``empty_when_applied`` (never downgraded); a different or new
         set on an append (only under the cdc_coexisting / legacy exemption) is not empty;
     (e) no entries and an empty current set: DELETE the record.
+
+    ``reincluded`` (:func:`reincluded_columns`) names the recorded set's columns this run
+    WRITES values into on a table that keeps its rows (the exempt append under an empty
+    set): the table no longer holds NULL there in every row, so the recorded-only path of
+    (a) clears ``empty_when_applied`` instead of leaving the record unchanged, and keeps
+    the set, so a later non-exempt run is still refused. (With overlay columns the set
+    differs from the recorded one, and (d) already records it as not empty.)
     """
+    downgrade = bool(reincluded) and has_rows and not just_recreated
     if not overlay_facts and existing is not None and has_rows and not just_recreated:
+        if downgrade and existing.empty_when_applied:
+            return LedgerDecision(
+                "write",
+                existing.model_copy(update={"empty_when_applied": False, "applied_at": now}),
+            )
         return LedgerDecision("unchanged", existing)
     old = {c.column: c for c in (existing.columns if existing else [])}
     columns: dict[str, OverlayLedgerColumn] = {}
@@ -199,7 +213,8 @@ def plan_ledger_record(
             columns[name] = entry  # (c) still dropped, still owed at cut over
     for name in sorted(overlay_facts):
         facts = overlay_facts[name]
-        prior = old.get(name)
+        # A recreated table starts over: the dropped table's entry says nothing about it.
+        prior = None if just_recreated else old.get(name)
         if facts.default_expr is not None:
             digest, state, default = recorded_ddl_fields(effective_ddl, name)
             columns[name] = OverlayLedgerColumn(
@@ -210,7 +225,7 @@ def plan_ledger_record(
                 recorded_ddl_default=default,
                 dropped_not_null=(prior.dropped_not_null if prior else False) or facts.not_null,
             )
-        elif prior is not None and not just_recreated:
+        elif prior is not None:
             columns[name] = prior.model_copy(
                 update={"dropped_not_null": prior.dropped_not_null or facts.not_null}
             )
@@ -264,15 +279,23 @@ def reincluded_columns(
 
 
 APPEND_REFUSAL_TEXT = "needs Drop & reload: {columns} hold NULL from an earlier exclusion set"
+APPEND_OVERLAY_REFUSAL_TEXT = (
+    "needs Drop & reload: the rows already in this table were not all loaded with "
+    "{columns} excluded, so appending would mix NULL with stored values"
+)
 
 
 @dataclass(frozen=True)
 class AppendRefusal:
+    """``overlay``: the current set's rows would not all hold NULL; ``reincluded``: the
+    last set's columns hold NULL where this run would write values."""
+
     kind: Literal["overlay", "reincluded"]
     columns: "tuple[str, ...]"
 
     def text(self) -> str:
-        return APPEND_REFUSAL_TEXT.format(columns=", ".join(self.columns))
+        template = APPEND_OVERLAY_REFUSAL_TEXT if self.kind == "overlay" else APPEND_REFUSAL_TEXT
+        return template.format(columns=", ".join(self.columns))
 
 
 def append_refusal(
@@ -672,7 +695,13 @@ class SqliteOverlayLedger:
                                     )
                             self._conn.execute("COMMIT")
                         except BaseException:
-                            self._conn.execute("ROLLBACK")
+                            # SQLite rolls back by itself on some errors (disk full, I/O):
+                            # a second ROLLBACK would then raise and hide the real error.
+                            if self._conn.in_transaction:
+                                try:
+                                    self._conn.execute("ROLLBACK")
+                                except Exception:  # noqa: BLE001 - keep the original error
+                                    pass
                             raise
                     if not updates:
                         return {name: current.get(name) for name in merges}
@@ -735,6 +764,7 @@ class OverlayLedgerView:
 
 
 __all__ = [
+    "APPEND_OVERLAY_REFUSAL_TEXT",
     "APPEND_REFUSAL_TEXT",
     "AppendRefusal",
     "InMemoryOverlayLedger",

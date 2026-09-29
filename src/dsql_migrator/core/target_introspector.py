@@ -28,6 +28,7 @@ Design seams:
 
 from __future__ import annotations
 
+import time as _time
 from dataclasses import dataclass
 from typing import Any, Callable, Collection, Mapping, Optional, Protocol, Sequence, Union
 
@@ -720,18 +721,41 @@ def _relation_predicate(table_name: str) -> "tuple[str, dict[str, object]]":
     }
 
 
+# PostgreSQL (and Aurora DSQL) stores an identifier cut to NAMEDATALEN-1 bytes.
+_PG_NAME_MAX_BYTES = 63
+
+
+def pg_stored_name(name: str) -> str:
+    """``name`` as the catalog stores it: UTF-8 cut to 63 bytes on a character boundary
+    (PostgreSQL's pg_mbcliplen). A DDL or DML naming the long form reaches this column."""
+    raw = name.encode("utf-8")
+    if len(raw) <= _PG_NAME_MAX_BYTES:
+        return name
+    return raw[:_PG_NAME_MAX_BYTES].decode("utf-8", errors="ignore")
+
+
 def read_overlay_column_facts(
     connection: Any, table_name: str, columns: Sequence[str]
 ) -> "tuple[bool, dict[str, Optional[ColumnNullFacts]]]":
     """``(table exists, {column: facts or None})`` in ONE catalog statement. RAISES.
 
-    Bound parameters only (no identifier in the SQL text). ``attname`` is matched EXACTLY
-    against the verbatim source name the loader writes. It raises on any error on
-    purpose: the overlay unit needs the exception to retry a 40001 and to replay a lost
-    connection (``core.schema_applier.apply_exclusion_overlay``).
+    Bound parameters only (no identifier in the SQL text). The result is keyed by the
+    names ASKED for, each matched EXACTLY against its stored form (:func:`pg_stored_name`:
+    a name over 63 bytes is stored cut, and the loader's INSERT and the ALTER reach it
+    that way); two asked names that the catalog would store as one raise. It raises on
+    any error on purpose: the overlay unit needs the exception to retry a 40001 and to
+    replay a lost connection (``core.schema_applier.apply_exclusion_overlay``).
     """
+    by_stored: dict[str, str] = {}
+    for column in columns:
+        stored = pg_stored_name(column)
+        if by_stored.setdefault(stored, column) != column:
+            raise ValueError(
+                f"{table_name}: columns {by_stored[stored]!r} and {column!r} are the same "
+                "column on Aurora DSQL (identifiers are cut to 63 bytes)"
+            )
     where, params = _relation_predicate(table_name)
-    params = {**params, "columns": list(columns)}
+    params = {**params, "columns": list(by_stored)}
     statement = (
         "SELECT a.attname, a.attnotnull, a.attidentity, a.attgenerated, "
         "pg_catalog.pg_get_expr(d.adbin, d.adrelid) "
@@ -752,10 +776,11 @@ def read_overlay_column_facts(
     if not rows:
         return False, facts
     for attname, notnull, identity, generated, default_expr in rows:
-        if attname is None:
+        asked = None if attname is None else by_stored.get(str(attname))
+        if asked is None:
             continue  # the table exists; none of the asked columns does
         is_generated = bool(generated) and str(generated) != ""
-        facts[str(attname)] = ColumnNullFacts(
+        facts[asked] = ColumnNullFacts(
             not_null=bool(notnull),
             default_expr=None if is_generated else (
                 None if default_expr is None else str(default_expr)
@@ -766,6 +791,13 @@ def read_overlay_column_facts(
     return True, facts
 
 
+# One OC001 on a connection used before a DDL (P0 F6) or a dropped socket must not make a
+# table "unknown" (its load would then fail closed for nothing): each table's reads retry a
+# 40001 on the same connection, and a lost connection is replaced a bounded number of times.
+_FACTS_OCC_ATTEMPTS = 3
+_FACTS_RECONNECTS = 2
+
+
 def target_overlay_facts(
     table_names: Sequence[str],
     columns_by_table: "Mapping[str, Sequence[str]]",
@@ -773,74 +805,115 @@ def target_overlay_facts(
     connection_factory: Callable[[], Any],
     probe_rows: bool = True,
     primary_key_tables: "Collection[str]" = frozenset(),
+    sleep: Callable[[float], None] = _time.sleep,
 ) -> "dict[str, Optional[TableOverlayFacts]]":
     """Each table's overlay facts over ONE connection; ``None`` = unknown.
 
-    A connect failure makes every table unknown; a per-table error makes only that table
-    unknown (best-effort rollback, then the next table). An absent table is
-    ``exists=False`` with every column ``None``. ``probe_rows`` adds one ``SELECT 1 ...
-    LIMIT 1`` per existing table; ``primary_key_tables`` adds one key read each. The
-    connection is closed in a ``finally`` and never reused after an ALTER (P0 F6).
+    Every read is idempotent: a 40001 is retried on the same connection, and a transient
+    connection loss reconnects (at most twice per call) and re-reads that table. A table
+    whose reads still fail -- or any non-transient error, e.g. 42501 -- is unknown (best-
+    effort rollback, then the next table); a connection that cannot be restored makes that
+    table and every later one unknown, as a connect failure makes every table unknown. An
+    absent table is ``exists=False`` with every column ``None``. ``probe_rows`` adds one
+    ``SELECT 1 ... LIMIT 1`` per existing table; ``primary_key_tables`` adds one key read
+    each. The connection is closed in a ``finally`` and never reused after an ALTER (P0 F6).
     """
+    from psycopg import sql
+
+    from dsql_migrator.core.occ import with_occ_retry
+    from dsql_migrator.core.target_connection import is_transient_connection_error
+
     try:
         connection = connection_factory()
     except Exception:  # noqa: BLE001 - cannot connect -> every table unknown
         return {name: None for name in table_names}
-    from psycopg import sql
 
     wanted_pk = set(primary_key_tables)
+
+    def _read_table(conn: Any, name: str) -> TableOverlayFacts:
+        exists, columns = read_overlay_column_facts(
+            conn, name, list(columns_by_table.get(name, ()))
+        )
+        if not exists:
+            return TableOverlayFacts(False, False, None, columns)
+        has_rows: Optional[bool] = None
+        if probe_rows:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    sql.SQL("SELECT 1 FROM {table} LIMIT 1").format(
+                        table=_table_identifier(name)
+                    )
+                )
+                has_rows = cursor.fetchone() is not None
+            finally:
+                _safe_close(cursor)
+        primary_key: Optional[tuple[str, ...]] = None
+        if name in wanted_pk:
+            where, params = _relation_predicate(name)
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    "SELECT a.attname FROM pg_catalog.pg_class c "
+                    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                    "JOIN pg_catalog.pg_index ix ON ix.indrelid = c.oid "
+                    "AND ix.indisprimary "
+                    "JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) "
+                    "ON TRUE JOIN pg_catalog.pg_attribute a "
+                    "ON a.attrelid = c.oid AND a.attnum = k.attnum "
+                    f"WHERE {where} AND k.ord <= ix.indnkeyatts ORDER BY k.ord",
+                    params,
+                )
+                primary_key = tuple(
+                    str(row[0]) for row in cursor.fetchall() if row and row[0]
+                )
+            finally:
+                _safe_close(cursor)
+        return TableOverlayFacts(True, has_rows, primary_key, columns)
+
+    def _rollback(conn: Any) -> None:
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001 - best effort
+            pass
+
+    def _attempt(conn: Any, name: str) -> TableOverlayFacts:
+        try:
+            return _read_table(conn, name)
+        except Exception:
+            _rollback(conn)
+            raise
+
+    retrying = with_occ_retry(
+        max_attempts=_FACTS_OCC_ATTEMPTS, base_delay=0.05, sleep=sleep
+    )(_attempt)
     result: dict[str, Optional[TableOverlayFacts]] = {}
+    reconnects = 0
     try:
         for name in table_names:
-            try:
-                exists, columns = read_overlay_column_facts(
-                    connection, name, list(columns_by_table.get(name, ()))
-                )
-                if not exists:
-                    result[name] = TableOverlayFacts(False, False, None, columns)
-                    continue
-                has_rows: Optional[bool] = None
-                if probe_rows:
-                    cursor = connection.cursor()
-                    try:
-                        cursor.execute(
-                            sql.SQL("SELECT 1 FROM {table} LIMIT 1").format(
-                                table=_table_identifier(name)
-                            )
-                        )
-                        has_rows = cursor.fetchone() is not None
-                    finally:
-                        _safe_close(cursor)
-                primary_key: Optional[tuple[str, ...]] = None
-                if name in wanted_pk:
-                    where, params = _relation_predicate(name)
-                    cursor = connection.cursor()
-                    try:
-                        cursor.execute(
-                            "SELECT a.attname FROM pg_catalog.pg_class c "
-                            "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
-                            "JOIN pg_catalog.pg_index ix ON ix.indrelid = c.oid "
-                            "AND ix.indisprimary "
-                            "JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) "
-                            "ON TRUE JOIN pg_catalog.pg_attribute a "
-                            "ON a.attrelid = c.oid AND a.attnum = k.attnum "
-                            f"WHERE {where} AND k.ord <= ix.indnkeyatts ORDER BY k.ord",
-                            params,
-                        )
-                        primary_key = tuple(
-                            str(row[0]) for row in cursor.fetchall() if row and row[0]
-                        )
-                    finally:
-                        _safe_close(cursor)
-                result[name] = TableOverlayFacts(True, has_rows, primary_key, columns)
-            except Exception:  # noqa: BLE001 - this table unknown; keep reading the rest
-                result[name] = None
+            while True:
+                if connection is None:  # lost for good: every later table is unknown
+                    result[name] = None
+                    break
                 try:
-                    connection.rollback()
-                except Exception:  # noqa: BLE001 - best effort
-                    pass
+                    result[name] = retrying(connection, name)
+                    break
+                except Exception as exc:  # noqa: BLE001 - classify, then this table unknown
+                    if not is_transient_connection_error(exc):
+                        result[name] = None
+                        break
+                    _safe_close(connection)
+                    connection = None
+                    if reconnects >= _FACTS_RECONNECTS:
+                        continue
+                    reconnects += 1
+                    try:
+                        connection = connection_factory()
+                    except Exception:  # noqa: BLE001 - cannot reconnect
+                        connection = None
     finally:
-        _safe_close(connection)
+        if connection is not None:
+            _safe_close(connection)
     return result
 
 
@@ -1363,6 +1436,7 @@ def partition_identity_sync(
 __all__ = [
     "ColumnNullFacts",
     "TableOverlayFacts",
+    "pg_stored_name",
     "read_overlay_column_facts",
     "target_overlay_facts",
     "TargetIntrospector",

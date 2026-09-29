@@ -1101,27 +1101,39 @@ def build_overlay_statements(
 
 def ddl_column_facts(
     create_ddl: str, columns: "Sequence[str]"
-) -> "dict[str, Optional[ColumnNullFacts]]":
-    """The facts :func:`build_overlay_statements` needs, read from an applied DDL."""
+) -> "Optional[dict[str, Optional[ColumnNullFacts]]]":
+    """The facts :func:`build_overlay_statements` needs, read from an applied DDL.
+
+    Marks identity and generated columns as the live read does (an identity column is
+    implicitly NOT NULL and has no DEFAULT), so the preview refuses exactly what the live
+    overlay refuses. ``None`` when the DDL cannot be read ("unknown", never "nothing to
+    do"); an inner ``None`` is a column the DDL does not declare.
+    """
     from dsql_migrator.core.converter import (
         parse_target_column_constraints,
         parse_target_generated_columns,
+        parse_target_identity_columns,
     )
     from dsql_migrator.core.target_introspector import ColumnNullFacts
 
     constraints = parse_target_column_constraints(create_ddl)
-    generated = parse_target_generated_columns(create_ddl)
+    if not constraints:
+        return None
+    generated = parse_target_generated_columns(create_ddl, folded=True)
+    identity = parse_target_identity_columns(create_ddl)
     out: dict[str, Optional[ColumnNullFacts]] = {}
     for column in columns:
         if column not in constraints:
             out[column] = None
             continue
         not_null, default_sql = constraints[column]
+        is_identity = column in identity
+        is_generated = column in generated
         out[column] = ColumnNullFacts(
-            not_null=not_null,
-            default_expr=None if column in generated else default_sql,
-            identity=False,
-            generated=column in generated,
+            not_null=not_null or is_identity,
+            default_expr=None if (is_generated or is_identity) else default_sql,
+            identity=is_identity,
+            generated=is_generated,
         )
     return out
 
@@ -1281,15 +1293,25 @@ def _refuse_unrecorded_defaults(table_name, facts, expected, issued_not_null, is
 def is_single_sql_expression(expr: str) -> bool:
     """True when ``expr`` is ONE SQL expression, safe to splice into a SET DEFAULT.
 
-    Scans with quote state ('...' with the '' escape, "..." with the "" escape) and refuses
-    an empty text, a ``;`` outside quotes, a comment opener (``--`` / ``/*``) outside
-    quotes, and any dollar-quote opener. The text comes from ``pg_get_expr`` (the ledger)
-    and is still checked, because the restore executes it.
+    The text comes from ``pg_get_expr`` (the ledger) and is still checked, because the
+    restore executes it and the ledger is a file anyone with the bucket or the state file
+    can edit. The scan is exact because it refuses everything that could make its quote
+    tracking wrong, none of which ``pg_get_expr`` emits:
+
+    * any backslash (an E'...' escape, a U&'...' escape);
+    * any ``$`` outside quotes (a dollar-quoted body, a ``$1``);
+    * ``;``, ``--`` or ``/*`` outside quotes;
+    * a ``,`` outside every bracket (a second ALTER TABLE subcommand), and an unbalanced
+      ``(`` / ``[``;
+    * an empty text or an unterminated quote.
+
+    Quotes are '...' and "..." with the doubled-quote escape.
     """
     text = (expr or "").strip()
-    if not text:
+    if not text or "\\" in text:
         return False
     quote: Optional[str] = None
+    depth = 0
     i = 0
     while i < len(text):
         ch = text[i]
@@ -1299,17 +1321,20 @@ def is_single_sql_expression(expr: str) -> bool:
                     i += 2
                     continue
                 quote = None
-        else:
-            if ch in ("'", '"'):
-                quote = ch
-            elif ch == ";":
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch in ("(", "["):
+            depth += 1
+        elif ch in (")", "]"):
+            depth -= 1
+            if depth < 0:
                 return False
-            elif text.startswith("--", i) or text.startswith("/*", i):
-                return False
-            elif ch == "$" and re.match(r"\$[A-Za-z_]*\$", text[i:]):
-                return False
+        elif ch in (";", "$") or (ch == "," and depth == 0):
+            return False
+        elif text.startswith("--", i) or text.startswith("/*", i):
+            return False
         i += 1
-    return quote is None
+    return quote is None and depth == 0
 
 
 class RestoreOutcome:
@@ -1374,8 +1399,12 @@ def restore_column_default(
                 return RestoreOutcome("restored" if issued["set"] else "done", expr)
             return RestoreOutcome("diverged", live.default_expr)
         issued["set"] = True
-        run_one(connection, sql.SQL("ALTER TABLE {t} ALTER COLUMN {c} SET DEFAULT ").format(
-            t=_pg_table_identifier(table_name), c=sql.Identifier(column)) + sql.SQL(expr))
+        # Parenthesized as well, so any text the scan missed is a syntax error rather than
+        # a second subcommand; PostgreSQL does not keep the parentheses (the read-back
+        # below still compares byte-identically).
+        run_one(connection, sql.SQL("ALTER TABLE {t} ALTER COLUMN {c} SET DEFAULT (").format(
+            t=_pg_table_identifier(table_name), c=sql.Identifier(column))
+            + sql.SQL(expr) + sql.SQL(")"))
         exists, facts = retry_read(_read)
         after = facts.get(column) if exists else None
         if after is None or after.default_expr != expr:

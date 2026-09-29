@@ -18,6 +18,7 @@ from pydantic import ValidationError
 from dsql_migrator.core.column_exclusion import set_digest
 from dsql_migrator.core.models import TargetConnectionConfig
 from dsql_migrator.core.overlay_ledger import (
+    APPEND_OVERLAY_REFUSAL_TEXT,
     APPEND_REFUSAL_TEXT,
     LEDGER_PREFIX,
     InMemoryOverlayLedger,
@@ -53,9 +54,10 @@ DDL2 = "CREATE TABLE shop.docs (id INT PRIMARY KEY, a TEXT NOT NULL, b TEXT DEFA
 NO_SLEEP = {"sleep": lambda _s: None}
 
 
-def _plan(existing, facts, *, has_rows=True, just_recreated=False, ddl=DDL1, now=T1):
+def _plan(existing, facts, *, has_rows=True, just_recreated=False, ddl=DDL1, now=T1, reincluded=()):
     return plan_ledger_record(existing, table="shop.docs", overlay_facts=facts, has_rows=has_rows,
-                              just_recreated=just_recreated, effective_ddl=ddl, now=now)
+                              just_recreated=just_recreated, effective_ddl=ddl, now=now,
+                              reincluded=reincluded)
 
 
 def _rec(**cols):
@@ -443,3 +445,50 @@ def test_sqlite_session_delete_and_prune_leave_the_ledger_rows(tmp_path):
     sessions.delete("s1")
     sessions.prune(0)
     assert ledger.read("k").tables["shop.docs"] == _rec(a="1")
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (P2-01..04 verification)
+# ---------------------------------------------------------------------------
+
+
+def test_an_exempt_append_that_writes_values_into_the_last_set_downgrades_the_record():
+    run1 = _plan(None, {"a": F(True, "'x'::text")}, has_rows=False).record
+    assert run1.empty_when_applied
+    # Run 2: 'a' re-included, the table exempt (cdc_coexisting / legacy): its append writes values.
+    back = reincluded_columns(run1, present_live=["a", "b"], omitted=[])
+    assert back == ("a",)
+    run2 = _plan(run1, {}, has_rows=True, reincluded=back)
+    assert run2.kind == "write" and run2.record.empty_when_applied is False
+    assert run2.record.set_columns == ["a"] and run2.record.columns == run1.columns  # set kept
+    # Run 3: 'a' excluded again, not exempt -> refused (the rows are a mix of values and NULL).
+    assert _refusal(run2.record, ["a"], ["a", "b"], ["a"]).kind == "overlay"
+    # A recorded-only table this run does not write stays unchanged.
+    assert _plan(run1, {}, has_rows=True).kind == "unchanged"
+    # A table with no rows, or recreated, is not downgraded (it holds NULL everywhere again).
+    assert _plan(run1, {"a": F(False, None)}, has_rows=False, reincluded=("a",)).record.empty_when_applied
+
+
+def test_a_recreated_table_does_not_inherit_the_dropped_tables_not_null():
+    prior = _rec(a="'x'::text")  # dropped_not_null=True from the old table
+    fresh = _plan(prior, {"a": F(False, "'y'::text")}, has_rows=False, just_recreated=True).record.column("a")
+    assert fresh.dropped_not_null is False and fresh.original_default == "'y'::text"
+    kept = _plan(prior, {"a": F(False, "'y'::text")}, has_rows=True, just_recreated=False).record.column("a")
+    assert kept.dropped_not_null is True  # the earlier overlay's DROP NOT NULL is still in force
+
+
+def test_sqlite_keeps_the_real_error_when_sqlite_rolled_back_by_itself(tmp_path):
+    lite = SqliteOverlayLedger(str(tmp_path / "s.sqlite"), max_attempts=1, **NO_SLEEP)
+    lite._conn.execute(
+        "CREATE TRIGGER full BEFORE INSERT ON overlay_ledger BEGIN SELECT RAISE(ROLLBACK, 'disk full'); END")
+    with pytest.raises(OverlayLedgerError, match="disk full"):
+        lite.put_tables("k", {"shop.a": _rec(a="1")})
+    assert lite._conn.in_transaction is False and lite.read("k").status == "absent"
+
+
+def test_refusal_text_is_true_for_each_kind():
+    overlay = _refusal(None, ["a"])
+    assert overlay.text() == APPEND_OVERLAY_REFUSAL_TEXT.format(columns="a")
+    assert "hold NULL from an earlier" not in overlay.text()
+    back = _refusal(_rec(a="'x'::text"), [], present_live=["a"], omitted=[])
+    assert back.text() == APPEND_REFUSAL_TEXT.format(columns="a")
