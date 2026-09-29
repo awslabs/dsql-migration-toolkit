@@ -182,6 +182,10 @@ from dsql_migrator.ui.data_migration._full_load_engine import (
 # package's public import surface is unchanged.
 from dsql_migrator.ui.data_migration._models import (
     MigrationType,
+    RestoredExclusionFacts,
+    classify_restored_exclusions,
+    legacy_lob_exclusions,
+    overlay_lob_exclusions,
     _CDC_MIGRATION_TYPES,
     _SUBSTEPS,
     source_supports_cdc,
@@ -2750,6 +2754,9 @@ def data_migration_exclusion_block(
     target DDL lacks (42703). ``None`` for CDC only, whose card sits inside the CDC sub-step
     that Continue leads to -- its Deploy/Attach buttons carry the same gate there.
     """
+    # The first gate: settle a restored pre-overlay session's exclusions before any set
+    # is read (a safety net for callers that restored without the app).
+    classify_restored_exclusions(migration_state, job_manager)
     if migration_state.migration_type is MigrationType.CDC_ONLY:
         return None
     committed = exclusion_card_locked(migration_state, job_manager, session)
@@ -4710,6 +4717,10 @@ __all__ = [
     "quarantined_rows_by_table",
     "recreated_unfinished",
     "unsettled_table_names",
+    "RestoredExclusionFacts",
+    "classify_restored_exclusions",
+    "legacy_lob_exclusions",
+    "overlay_lob_exclusions",
     "full_load_completeness",
     "FullLoadCompleteness",
     "build_migration_table_status",

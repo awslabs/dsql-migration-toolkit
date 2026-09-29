@@ -120,6 +120,17 @@ class SessionSnapshot(BaseModel):
     # LOB exclusions flattened to "table:column" strings (stable, sorted).
     cdc_lob_exclusions: list[str] = Field(default_factory=list)
     cdc_connector_names: list[str] = Field(default_factory=list)
+    # The exclusion semantics the entries above were written under
+    # (core.column_exclusion.EXCLUSION_SEMANTICS_VERSION). None = written before the NULL
+    # overlay (or its classification was still pending): the entries are classified by
+    # evidence of writes on restore.
+    exclusion_semantics: Optional[int] = None
+    # The entries classified legacy (omitted only, never ALTERed), "table:column" like
+    # cdc_lob_exclusions; never re-derived once stamped.
+    legacy_column_exclusions: list[str] = Field(default_factory=list)
+    # True once the session used the overlay ledger (a table can owe a DEFAULT at cut
+    # over even with no exclusion left). Cleared only by Start over.
+    overlay_ledger_in_use: bool = False
     # The in-flight (or just-finished) CDC lifecycle job (deploy-infra / start /
     # stop / delete) and which operation it is, so a reconnecting session can keep
     # showing that job's ordered stages instead of dropping them on a restart. The

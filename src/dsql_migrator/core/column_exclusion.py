@@ -81,6 +81,12 @@ B4 = "B4"  # computed by Aurora DSQL
 # Codes whose entries are dropped from the effective set on every path, always.
 ALWAYS_DROPPED = frozenset({B1, B2})
 
+# The exclusion semantics a session snapshot is written under. 1 (0.1.562): an excluded
+# column is NULL on the target through the overlay (DROP NOT NULL, DROP DEFAULT). A
+# snapshot without it predates the overlay; its entries are classified by evidence of
+# writes (legacy = omitted only, never ALTERed).
+EXCLUSION_SEMANTICS_VERSION = 1
+
 _MESSAGES = {
     B1: "Primary key: needed to read, de-duplicate and replicate rows.",
     B2: "Part of the target primary key chosen in Schema Conversion.",
@@ -466,6 +472,7 @@ def check_stored_exclusions(
 
 
 __all__ = [
+    "EXCLUSION_SEMANTICS_VERSION",
     "ALWAYS_DROPPED",
     "B1",
     "B2",

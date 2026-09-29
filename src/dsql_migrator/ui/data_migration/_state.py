@@ -20,9 +20,9 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 from dsql_migrator.core.cdc import (
     CDC_DEFAULT_STACK_NAME,
@@ -153,6 +153,11 @@ class DataMigrationState:
         # each first, for a clean fresh load). Stored so a retry / per-table
         # Reload follows the SAME choice instead of silently reverting to append.
         self._reload_mode: str = "append"
+        # Tables the Start dialog FORCES to Drop & reload for the NULL contract (table ->
+        # one-line reason). Transient: re-derived at every probe, consumed when the run's
+        # inputs are built, never persisted (its durable remainder is the job's
+        # recreated_tables).
+        self._exclusion_forced_replace: dict[str, str] = {}
         # One-shot flag: open the Full Load confirm dialog on the next render
         # (set after the async non-empty-target check completes).
         self.pending_full_load_confirm: bool = False
@@ -166,6 +171,17 @@ class DataMigrationState:
         # silent partial data across the gapless handoff. An explicit, opt-in choice
         # (no silent data loss); nothing is excluded unless the user ticks it.
         self._excluded_lob_columns: dict[str, set[str]] = {}
+        # Exclusions restored from a session written before the NULL overlay (0.1.561)
+        # whose data already moved under the old semantics: omitted only, never ALTERed.
+        # Always a subset of _excluded_lob_columns. Persisted with the semantics stamp.
+        self._legacy_exclusions: dict[str, set[str]] = {}
+        # While a restored pre-overlay session is not yet classified (no evidence either
+        # way yet), its entries behave as legacy. Transient.
+        self._restored_exclusion_facts: Optional[object] = None
+        # True once this session used the overlay ledger (an operator exclusion, or a
+        # ledger read that found a record): a table can owe a DEFAULT even with no
+        # exclusion left. Persisted; cleared only by Start over.
+        self._overlay_ledger_in_use: bool = False
         # Composite-PK record-key override for CDC, keyed by db.table -> target key
         # columns [leading, pk...]. Set from the applied Schema Conversion when a
         # table's DSQL target has a composite key, so Debezium re-keys the change
@@ -467,6 +483,13 @@ class DataMigrationState:
         # Optional customer-managed KMS key id for the tool-created source secret
         # (process config, threaded at screen-build time). None -> default key.
         self.cdc_secret_kms_key_id: Optional[str] = None
+        # Builder-time handles (not user state, never persisted; they outlive Start over,
+        # see reset_in_place): the overlay-ledger store, the current effective target DDL
+        # provider, the Start CDC notification, and the cut-over restore probe.
+        self.overlay_ledger: Optional[object] = None
+        self.effective_target_ddls: Optional[Callable[[], Optional[dict]]] = None
+        self.on_cdc_start: Optional[Callable[[], None]] = None
+        self.cutover_restore_in_flight: Optional[Callable[[], bool]] = None
         # Which CDC activity events have already been mirrored into the AI feed, per CDC
         # log key, so the ~5s monitor poll announces each transition ONCE. Lives HERE (not
         # in a module dict) so Start over's ``reset_in_place`` -> ``__init__`` clears it;
@@ -477,16 +500,113 @@ class DataMigrationState:
         """Toggle whether one oversized-LOB column is excluded from the migration.
 
         The selection is migration-wide (H13): it drops the column from both the
-        Full Load INSERT list and CDC capture, so the two paths never disagree.
+        Full Load INSERT list and CDC capture, so the two paths never disagree. This is
+        the OPERATOR path: an exclusion made here is a new-semantics (overlay) entry, so
+        it marks the ledger in use; un-ticking a legacy entry drops its legacy mark (a
+        re-tick makes it an overlay entry). The in-use mark is never cleared here.
         """
         with self._lock:
             current = self._excluded_lob_columns.setdefault(table, set())
             if exclude:
                 current.add(column)
+                self._overlay_ledger_in_use = True
             else:
                 current.discard(column)
                 if not current:
                     self._excluded_lob_columns.pop(table, None)
+            legacy = self._legacy_exclusions.get(table)
+            if legacy is not None:
+                legacy.discard(column)
+                if not legacy:
+                    self._legacy_exclusions.pop(table, None)
+            facts = self._restored_exclusion_facts
+            if facts is not None and (table, column) in facts.entries:
+                self._restored_exclusion_facts = replace(
+                    facts, entries=frozenset(facts.entries - {(table, column)})
+                )
+
+    def restore_lob_exclusion(self, table: str, column: str) -> None:
+        """Restore one stored exclusion from a snapshot (no operator semantics)."""
+        with self._lock:
+            self._excluded_lob_columns.setdefault(table, set()).add(column)
+
+    def legacy_exclusions(self) -> dict[str, frozenset[str]]:
+        """The omit-only entries: the classified legacy set UNION a still-pending
+        classification's entries (pending behaves as legacy), within the stored set."""
+        with self._lock:
+            merged: dict[str, set[str]] = {t: set(c) for t, c in self._legacy_exclusions.items()}
+            facts = self._restored_exclusion_facts
+            if facts is not None:
+                for table, column in facts.entries:
+                    merged.setdefault(table, set()).add(column)
+            out: dict[str, frozenset[str]] = {}
+            for table, columns in merged.items():
+                kept = columns & self._excluded_lob_columns.get(table, set())
+                if kept:
+                    out[table] = frozenset(kept)
+            return out
+
+    def final_legacy_exclusions(self) -> dict[str, frozenset[str]]:
+        """The classified legacy set only (what the snapshot stamps)."""
+        with self._lock:
+            return {
+                t: frozenset(c & self._excluded_lob_columns.get(t, set()))
+                for t, c in self._legacy_exclusions.items()
+                if c & self._excluded_lob_columns.get(t, set())
+            }
+
+    def exclusion_classification_pending(self) -> bool:
+        with self._lock:
+            return self._restored_exclusion_facts is not None
+
+    def restored_exclusion_facts(self) -> Optional[object]:
+        with self._lock:
+            return self._restored_exclusion_facts
+
+    def set_restored_exclusion_facts(self, facts: Optional[object]) -> None:
+        with self._lock:
+            self._restored_exclusion_facts = facts
+
+    def finalize_exclusion_classification(self, *, legacy: bool) -> None:
+        """Settle a pending classification: legacy keeps the restored entries omit-only;
+        an upgrade makes them overlay entries (and so marks the ledger in use)."""
+        with self._lock:
+            facts = self._restored_exclusion_facts
+            if facts is None:
+                return
+            if legacy:
+                self._legacy_exclusions = {}
+                for table, column in facts.entries:
+                    if column in self._excluded_lob_columns.get(table, set()):
+                        self._legacy_exclusions.setdefault(table, set()).add(column)
+            else:
+                self._legacy_exclusions = {}
+                if facts.entries:
+                    self._overlay_ledger_in_use = True
+            self._restored_exclusion_facts = None
+
+    def restore_legacy_exclusions(self, flat: "Sequence[str]") -> None:
+        """Restore the stamped legacy list (``"table:column"``), within the stored set."""
+        with self._lock:
+            self._legacy_exclusions = {}
+            for entry in flat or ():
+                table, sep, column = entry.partition(":")
+                if sep and table and column and column in self._excluded_lob_columns.get(table, set()):
+                    self._legacy_exclusions.setdefault(table, set()).add(column)
+
+    @property
+    def overlay_ledger_in_use(self) -> bool:
+        with self._lock:
+            return self._overlay_ledger_in_use
+
+    def mark_overlay_ledger_in_use(self) -> None:
+        """A UI ledger read found a record for this target."""
+        with self._lock:
+            self._overlay_ledger_in_use = True
+
+    def restore_overlay_ledger_in_use(self, value: bool) -> None:
+        with self._lock:
+            self._overlay_ledger_in_use = bool(value)
 
     def lob_exclusions(self) -> dict[str, set[str]]:
         """Return a copy of the per-table excluded-LOB-column selection (H13)."""
@@ -1201,11 +1321,37 @@ class DataMigrationState:
     def replace_targets(self) -> frozenset[str]:
         """Return the tables that will be DROPped & recreated on the next run.
 
-        Derived: the pre-existing tables when the run-wide choice is ``"drop"``,
-        else empty (append keeps existing rows). This is the run's replace set.
+        Derived: the pre-existing tables when the run-wide choice is ``"drop"`` (else
+        none: append keeps existing rows), plus the tables the Start dialog forced to
+        Drop & reload for the NULL contract. This is the run's replace set.
         """
         with self._lock:
-            return self._tables_with_data if self._reload_mode == "drop" else frozenset()
+            return self._replace_union()
+
+    def _replace_union(self) -> frozenset[str]:
+        base = self._tables_with_data if self._reload_mode == "drop" else frozenset()
+        return frozenset(base) | frozenset(self._exclusion_forced_replace)
+
+    def take_replace_targets(self) -> frozenset[str]:
+        """The replace set for the run being built, consuming ONLY the forced set: the
+        operator's own drop choice stays, so a retry / per-table Reload honours it."""
+        with self._lock:
+            union = self._replace_union()
+            self._exclusion_forced_replace = {}
+            return union
+
+    @property
+    def exclusion_forced_replace(self) -> dict[str, str]:
+        with self._lock:
+            return dict(self._exclusion_forced_replace)
+
+    def set_exclusion_forced_replace(self, forced: "Mapping[str, str]") -> None:
+        with self._lock:
+            self._exclusion_forced_replace = dict(forced)
+
+    def clear_exclusion_forced_replace(self) -> None:
+        with self._lock:
+            self._exclusion_forced_replace = {}
 
     def set_selection(self, selection: TableSelection) -> None:
         """Replace the table selection for the sub-flow (marks it user-touched)."""
@@ -1457,12 +1603,23 @@ class DataMigrationStore:
             # dead code in production, reachable only from tests that seed the queue.
             teardown_queue = list(getattr(state, "cdc_teardown_queue", []) or [])
             teardown_done = dict(getattr(state, "cdc_teardown_done", {}) or {})
+            # Builder-time handles (the ledger store and three callables), set once when
+            # the screen is built -- the builder does not re-run after Start over.
+            handles = {
+                name: getattr(state, name, None)
+                for name in (
+                    "overlay_ledger", "effective_target_ddls", "on_cdc_start",
+                    "cutover_restore_in_flight",
+                )
+            }
             state.__init__()  # type: ignore[misc]  # re-run init on the same object
             if bound is not None:
                 state.bind_session(bound)
             # Deploy-time config, not user state -- it must outlive Start over.
             state.cdc_deploy_role_arn = deploy_role_arn
             state.cdc_secret_kms_key_id = secret_kms_key_id
+            for name, value in handles.items():
+                setattr(state, name, value)
             if teardown[0] is not None:
                 state.set_cdc_teardown(
                     teardown[0], kind=teardown[1], stack=teardown[2], ctx=teardown[3]

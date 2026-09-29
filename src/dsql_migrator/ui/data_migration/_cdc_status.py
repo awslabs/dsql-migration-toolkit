@@ -1113,6 +1113,26 @@ def _list_connectors_checked(controller) -> "tuple[bool, list]":
 
 
 def _ensure_cdc_controller(migration_state, session) -> None:
+    """Wire the read-only MSK Connect controller, probe stack phase, detect connectors
+    (see :func:`_discover_cdc_controller`), then -- whatever the probe did -- settle a
+    restored pre-overlay session's exclusion semantics if it is still pending (the probe
+    is its stage-2 evidence). Never raises for the classification."""
+    try:
+        _discover_cdc_controller(migration_state, session)
+    finally:
+        pending = getattr(migration_state, "exclusion_classification_pending", None)
+        if callable(pending) and pending():
+            try:
+                from dsql_migrator.ui.data_migration._models import (
+                    classify_restored_exclusions,
+                )
+
+                classify_restored_exclusions(migration_state)
+            except Exception:  # noqa: BLE001 - classification is best-effort here
+                _logger.warning("Exclusion classification after the CDC probe failed", exc_info=True)
+
+
+def _discover_cdc_controller(migration_state, session) -> None:
     """Wire the read-only MSK Connect controller, probe stack phase, detect connectors.
 
     Builds the controller from the session's target region + AWS profile and

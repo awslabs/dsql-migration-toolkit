@@ -1736,6 +1736,149 @@ def effective_lob_exclusions(
     return dict(effective_exclusions(stored, ctx).columns)
 
 
+@dataclass(frozen=True)
+class RestoredExclusionFacts:
+    """What a pre-overlay snapshot said about its exclusions, kept until they are
+    classified (legacy = data already moved under the old semantics)."""
+
+    entries: "frozenset[tuple[str, str]]"
+    job_id: Optional[str]
+    connector_names: "tuple[str, ...]"
+    cdc_started: bool
+    stack_possible: bool
+    # True once stage 1 (the job evidence) found nothing and only the CDC probe can
+    # decide; stage 2 never runs before it.
+    stage1_passed: bool = False
+
+
+def classify_restored_exclusions(migration_state, job_manager=None) -> "Optional[bool]":
+    """Classify a restored pre-overlay session's exclusions ONLY on evidence of writes.
+
+    ``True`` legacy (omit-only), ``False`` upgraded (overlay entries), ``None`` still
+    pending (behaves as legacy). Idempotent; reads jobs only.
+
+    Stage 1 (needs ``job_manager``): legacy when the Full Load job is missing (a pruned
+    record is not proof of nothing), holds a chunk that left PENDING or loaded rows, or
+    the snapshot names connectors or a CDC start. With none of that and no possible CDC
+    stack, upgrade. Stage 2 (state only, once the CDC probe has landed): legacy when CDC
+    started, connectors are known, a different Full Load job ran meanwhile, an offset is
+    committed or the stack is running; upgrade when the stack is absent or infra-only
+    with no committed offset; otherwise still pending. Infra inputs and an infra deploy
+    are never evidence.
+    """
+    pending = getattr(migration_state, "exclusion_classification_pending", None)
+    if not callable(pending) or not pending():
+        return None
+    facts = migration_state.restored_exclusion_facts()
+    if facts is None:
+        return None
+
+    def _settle(legacy: bool) -> bool:
+        migration_state.finalize_exclusion_classification(legacy=legacy)
+        return legacy
+
+    if job_manager is not None:
+        if facts.job_id is not None:
+            from dsql_migrator.core.job_manager import JobNotFoundError
+
+            try:
+                job = job_manager.get_status(facts.job_id)
+            except JobNotFoundError:
+                job = None
+            if job is None:
+                return _settle(True)
+            if any(
+                chunk.status != "PENDING" or (chunk.rows_loaded or 0) > 0
+                for chunk in getattr(job, "chunks", ()) or ()
+            ):
+                return _settle(True)
+        if facts.connector_names or facts.cdc_started:
+            return _settle(True)
+        if not facts.stack_possible:
+            return _settle(False)
+        if not facts.stage1_passed:
+            from dataclasses import replace as _replace
+
+            facts = _replace(facts, stage1_passed=True)
+            migration_state.set_restored_exclusion_facts(facts)
+    if not facts.stage1_passed:
+        return None  # the job evidence has not been judged yet
+    # Stage 2: what this session's own probe and runs have seen since the restore.
+    if (
+        getattr(migration_state, "cdc_ops_window_start", None) is not None
+        or getattr(migration_state, "cdc_connector_names", None)
+        or getattr(migration_state, "job_id", None) != facts.job_id
+        or getattr(migration_state, "cdc_has_committed_offset", False)
+    ):
+        return _settle(True)
+    if not getattr(migration_state, "cdc_stack_phase_checked", False):
+        return None
+    phase = getattr(migration_state, "cdc_stack_phase", None)
+    if phase == "running":
+        return _settle(True)
+    if phase in ("absent", "infra"):
+        return _settle(False)
+    return None
+
+
+def legacy_lob_exclusions(
+    migration_state,
+    inventory,
+    *,
+    applied_conversions: "Optional[Mapping[str, object]]" = None,
+    preserve_foreign_keys: "Optional[bool]" = None,
+) -> "dict[str, frozenset[str]]":
+    """The omit-only entries (legacy, and a still-pending classification) within the
+    effective set, so a key column (B1/B2) is never among them."""
+    effective = effective_lob_exclusions(
+        migration_state, inventory, applied_conversions=applied_conversions,
+        preserve_foreign_keys=preserve_foreign_keys,
+    )
+    getter = getattr(migration_state, "legacy_exclusions", None)
+    legacy = getter() if callable(getter) else {}
+    out = {t: frozenset(effective.get(t, frozenset()) & cols) for t, cols in legacy.items()}
+    return {t: cols for t, cols in out.items() if cols}
+
+
+def overlay_lob_exclusions(
+    migration_state,
+    inventory,
+    *,
+    applied_conversions: "Optional[Mapping[str, object]]" = None,
+    preserve_foreign_keys: "Optional[bool]" = None,
+) -> "dict[str, frozenset[str]]":
+    """THE overlay set: the effective set minus legacy / pending entries minus the columns
+    Aurora DSQL computes (B4 by the applied DDL). The CANDIDATE set: the run further skips
+    columns absent live and live-computed ones.
+
+    Contract: omitted = ``effective_lob_exclusions`` (unchanged); overlay = this; legacy =
+    omitted - overlay - computed. A legacy-only table has no overlay column, so it is
+    never forced to reload and appends with a warning.
+    """
+    effective = effective_lob_exclusions(
+        migration_state, inventory, applied_conversions=applied_conversions,
+        preserve_foreign_keys=preserve_foreign_keys,
+    )
+    if not effective:
+        return {}
+    getter = getattr(migration_state, "legacy_exclusions", None)
+    legacy = getter() if callable(getter) else {}
+    generated: "Mapping[str, frozenset[str]]" = {}
+    if inventory is not None and getattr(inventory, "tables", None):
+        generated = exclusion_context_for(
+            migration_state, inventory, applied_conversions=applied_conversions,
+            preserve_foreign_keys=preserve_foreign_keys, focus_tables=effective.keys(),
+        ).generated
+    out: dict[str, frozenset[str]] = {}
+    for table, columns in effective.items():
+        kept = frozenset(columns) - frozenset(legacy.get(table, ())) - frozenset(
+            generated.get(table, ())
+        )
+        if kept:
+            out[table] = kept
+    return out
+
+
 def stored_exclusion_issues(
     migration_state,
     inventory,

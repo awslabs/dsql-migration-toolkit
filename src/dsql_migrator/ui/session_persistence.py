@@ -86,11 +86,88 @@ def _restore_prereq_gated_mode(migration_state: object, raw: Optional[str]) -> N
 
 
 def _restore_lob_exclusions(migration_state: object, flat: list) -> None:
-    """Restore ``"table:column"`` strings onto the state's LOB exclusions."""
+    """Restore ``"table:column"`` strings onto the state's LOB exclusions.
+
+    Through the RAW store (no operator semantics): a restore must not mark the overlay
+    ledger in use, and the entries' semantics are settled from the stamp afterwards.
+    """
+    restore = getattr(migration_state, "restore_lob_exclusion", None)
     for entry in flat or []:
         table, sep, column = entry.partition(":")
         if sep and table and column:
-            migration_state.set_lob_exclusion(table, column, True)  # type: ignore[attr-defined]
+            if callable(restore):
+                restore(table, column)
+            else:
+                migration_state.set_lob_exclusion(table, column, True)  # type: ignore[attr-defined]
+
+
+def _restore_exclusion_semantics(
+    snapshot: SessionSnapshot, migration_state: object, job_manager: object
+) -> None:
+    """Settle what the restored exclusions mean (after they were restored).
+
+    Stamped (1): the legacy list verbatim, no classification. Unstamped with entries (a
+    pre-overlay session): pending until classified by evidence of writes, judged against
+    the job store now when one is given. Any other stamp (a future build): every entry
+    omit-only, the conservative reading.
+    """
+    from dsql_migrator.core.column_exclusion import EXCLUSION_SEMANTICS_VERSION
+    from dsql_migrator.ui.data_migration._models import (
+        RestoredExclusionFacts,
+        classify_restored_exclusions,
+    )
+
+    if not hasattr(migration_state, "restore_overlay_ledger_in_use"):
+        return
+    migration_state.restore_overlay_ledger_in_use(snapshot.overlay_ledger_in_use)  # type: ignore[attr-defined]
+    if snapshot.exclusion_semantics == EXCLUSION_SEMANTICS_VERSION:
+        migration_state.restore_legacy_exclusions(snapshot.legacy_column_exclusions)  # type: ignore[attr-defined]
+        return
+    if not snapshot.cdc_lob_exclusions:
+        return
+    if snapshot.exclusion_semantics is not None:
+        migration_state.restore_legacy_exclusions(snapshot.cdc_lob_exclusions)  # type: ignore[attr-defined]
+        return
+    entries = frozenset(
+        (table, column)
+        for table, sep, column in (e.partition(":") for e in snapshot.cdc_lob_exclusions)
+        if sep and table and column
+    )
+    stack_possible = (
+        snapshot.migration_type in ("cdc_only", "full_load_and_cdc")
+        or bool(snapshot.cdc_deploy_job_id)
+        or bool(snapshot.cdc_action_kind)
+    )
+    migration_state.set_restored_exclusion_facts(  # type: ignore[attr-defined]
+        RestoredExclusionFacts(
+            entries=entries,
+            job_id=snapshot.migration_job_id,
+            # The RAW list, even for a finished Stop / Delete: connectors existed.
+            connector_names=tuple(snapshot.cdc_connector_names or ()),
+            cdc_started=snapshot.cdc_ops_window_start is not None,
+            stack_possible=stack_possible,
+        )
+    )
+    if job_manager is not None:
+        classify_restored_exclusions(migration_state, job_manager)
+
+
+def _exclusion_semantics_version() -> int:
+    from dsql_migrator.core.column_exclusion import EXCLUSION_SEMANTICS_VERSION
+
+    return EXCLUSION_SEMANTICS_VERSION
+
+
+def _exclusion_semantics_sig(migration_state: object) -> tuple:
+    """Cheap dirty-check part: finalizing a classification, a legacy-set change or the
+    in-use flag flipping must be saved."""
+    pending = getattr(migration_state, "exclusion_classification_pending", lambda: False)()
+    legacy = getattr(migration_state, "final_legacy_exclusions", dict)()
+    return (
+        bool(pending),
+        tuple(_flatten_lob_exclusions(legacy)),
+        bool(getattr(migration_state, "overlay_ledger_in_use", False)),
+    )
 
 
 def capture_session_snapshot(
@@ -137,6 +214,15 @@ def capture_session_snapshot(
         cdc_lob_exclusions=_flatten_lob_exclusions(
             migration_state.lob_exclusions()  # type: ignore[attr-defined]
         ),
+        exclusion_semantics=(
+            None
+            if getattr(migration_state, "exclusion_classification_pending", lambda: False)()
+            else _exclusion_semantics_version()
+        ),
+        legacy_column_exclusions=_flatten_lob_exclusions(
+            getattr(migration_state, "final_legacy_exclusions", dict)()
+        ),
+        overlay_ledger_in_use=bool(getattr(migration_state, "overlay_ledger_in_use", False)),
         cdc_connector_names=list(
             getattr(migration_state, "cdc_connector_names", []) or []
         ),
@@ -276,6 +362,8 @@ def apply_session_snapshot(
     conv_state: object,
     migration_state: object,
     validation_state: object = None,
+    *,
+    job_manager: object = None,
 ) -> None:
     """Restore a :class:`SessionSnapshot` onto the live (fresh) session state.
 
@@ -492,6 +580,7 @@ def apply_session_snapshot(
         snapshot.cdc_start_mode or "auto"
     )
     _restore_lob_exclusions(migration_state, snapshot.cdc_lob_exclusions)
+    _restore_exclusion_semantics(snapshot, migration_state, job_manager)
     # A COMPLETED teardown (Stop / Delete) leaves NO live connectors and no operation
     # worth resume-displaying. Restoring its stale connector names or its finished
     # lifecycle-job link on RECONNECT makes the CDC card cling to that prior state --
@@ -758,6 +847,7 @@ def session_signature(
         migration_state._cdc_start_binlog_file,  # type: ignore[attr-defined]
         migration_state._cdc_start_binlog_pos,  # type: ignore[attr-defined]
         lob_sig,
+        _exclusion_semantics_sig(migration_state),
         # Reconnect-relevant fields so a change to any of them triggers a save.
         getattr(session, "active_view", None),  # type: ignore[attr-defined]
         getattr(session, "workflow_unlocked", lambda: False)(),  # type: ignore[attr-defined]

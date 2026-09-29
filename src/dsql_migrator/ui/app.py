@@ -698,7 +698,10 @@ def build_page(
             _snapshot = SESSION_STATE_STORE.load(session_id)
             if _snapshot is not None:
                 apply_session_snapshot(
-                    _snapshot, _session, _eval, _conv, _mig, _val
+                    _snapshot, _session, _eval, _conv, _mig, _val,
+                    # The restored exclusions' semantics are judged against the job
+                    # evidence (a pre-overlay session's rows may already have moved).
+                    job_manager=JOB_MANAGER,
                 )
                 # Back-compat: CDC was folded into the unified Data Migration nav
                 # step (WorkflowStep.FULL_LOAD). A session saved while viewing the
