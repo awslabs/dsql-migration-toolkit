@@ -413,12 +413,34 @@ class _RaisingStore:
         raise AssertionError(f"the ledger must not be touched ({name})")
 
 
-def test_a_run_without_exclusions_never_touches_the_ledger(events):
-    rig = _Rig(excluded={}, overlay={}, ledger=_RaisingStore())
-    bound = []
-    rig.migrator.bind_run_inputs = lambda i: bound.append(i)
-    assert rig.run() == {"docs": "DONE", "plain": "DONE"}
-    assert bound == [] and rig.facts_calls == [] and rig.applied == []
+def test_a_run_without_exclusions_reads_the_ledger_once_and_is_otherwise_unchanged(events):
+    # One read (an earlier session may have left records for this target); with nothing
+    # recorded -- or an unreadable / raising store -- the run is exactly as before.
+    for store in ("empty", "raising"):
+        rig = _Rig(excluded={}, overlay={}, ledger=_RaisingStore() if store == "raising" else "memory")
+        reads = []
+        if store == "empty":
+            real = rig.store.read
+            rig.store.read = lambda key: reads.append(key) or real(key)
+        bound = []
+        rig.migrator.bind_run_inputs = lambda i: bound.append(i)
+        assert rig.run() == {"docs": "DONE", "plain": "DONE"}, store
+        assert bound == [] and rig.facts_calls == [] and rig.applied == [], store
+        assert rig.job.recreated_tables == []
+        if store == "empty":
+            assert len(reads) == 1 and rig.store.blobs == {}
+
+
+def test_a_record_left_by_an_earlier_session_is_checked_even_without_exclusions(events):
+    # Review fix: the page-header Run of a fresh session (no exclusions, never used the
+    # ledger) must not append values into rows an earlier exclusion left NULL.
+    rig = _Rig(excluded={}, overlay={}, rows={"docs": True, "plain": True})
+    _seed_record(rig)
+    marked = []
+    rig.migrator.bind_run_inputs(dataclasses.replace(rig.inputs, on_overlay_ledger_used=lambda: marked.append(1)))
+    rig.inputs = rig.migrator._inputs
+    assert rig.run() == {"docs": "FAILED", "plain": "DONE"}
+    assert "hold NULL from an earlier exclusion set" in rig.messages() and marked == [1]
 
 
 def test_records_in_use_without_overlay_columns_read_once_and_write_nothing(events):
@@ -1098,11 +1120,16 @@ def _squash(src):
 
 def test_the_start_and_retry_builders_pass_the_overlay_inputs_and_consume_the_forced_set():
     src = _squash(inspect.getsource(dm.build_data_migration_screen))
-    assert src.count("**_overlay_inputs(") == 2  # the Start and retry builders
-    assert "replace_tables=migration_state.take_replace_targets()," in src
-    assert "taken_replace = migration_state.take_replace_targets()" in src
+    assert src.count("_overlay_inputs(") == 2  # the Start and retry builders
+    assert "_run_replace, _disclosed = migration_state.take_run_choice()" in src
+    assert "replace_tables=_run_replace," in src
+    assert "conv_state.preserve_foreign_keys, tables=names, )" in src  # scoped to the run's tables
+    assert "taken_replace, retry_disclosed = migration_state.take_run_choice()" in src
     assert "frozenset(taken_replace | set(recreated_unfinished(current))) & set(names)" in src
     assert "prior_recreated_tables=prior_recreated," in src
+    # Marked just before each submit, not while the inputs are built.
+    assert src.count("_mark_overlay_use(migration_state, inputs.overlay_columns) migration_state.job_id = job_manager.submit(work)") == 1
+    assert src.count("_mark_overlay_use(migration_state, retry_inputs.overlay_columns) migration_state.job_id = job_manager.submit(work)") == 1
     fk_builder = src[src.index("def _fk_apply_inputs"):src.index("fk_inputs = _fk_apply_inputs()")]
     assert "_overlay_inputs" not in fk_builder  # loads nothing, no ledger
 
@@ -1120,8 +1147,12 @@ def test_overlay_inputs_are_the_overlay_legacy_sets_and_the_ledger_handle():
                            SessionConnectionState(), EvaluationState(), SchemaConversionState(), state)
     state.overlay_ledger = handle = object()
     got = dm._overlay_inputs(state, SourceInventory(tables=[DOCS]), None, True)
-    assert got == {"overlay_columns": {"docs": frozenset({"body"})}, "legacy_exclusions": {"docs": frozenset({"note"})},
-                   "overlay_ledger": handle, "overlay_ledger_in_use": True}  # a run that overlays marks it
+    assert got["overlay_columns"] == {"docs": frozenset({"body"})}
+    assert got["legacy_exclusions"] == {"docs": frozenset({"note"})}
+    assert got["overlay_ledger"] is handle and got["overlay_ledger_in_use"] is True  # this run overlays
+    assert got["on_overlay_ledger_used"] == state.mark_overlay_ledger_in_use
+    assert state.overlay_ledger_in_use is False  # building inputs marks nothing; the submit does
+    assert dm._overlay_inputs(state, SourceInventory(tables=[DOCS]), None, True, tables=["other"])["overlay_columns"] == {}
 
 
 def test_the_app_builds_the_ledger_beside_the_session_state_without_io(tmp_path):

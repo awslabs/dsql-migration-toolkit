@@ -218,7 +218,9 @@ def test_the_in_use_flag_is_set_by_a_run_that_overlays_not_by_a_tick():
     state.set_lob_exclusion("app.t", "d", False)
     assert state.overlay_ledger_in_use is False  # a tick and an untick: nothing recorded
     state.set_lob_exclusion("app.t", "d", True)
-    dm._overlay_inputs(state, inventory, None, True)  # a run that overlays d is built
+    fields = dm._overlay_inputs(state, inventory, None, True)  # a run that overlays d is built...
+    assert state.overlay_ledger_in_use is False
+    dm._mark_overlay_use(state, fields["overlay_columns"])  # ...and submitted
     assert state.overlay_ledger_in_use
     state.set_lob_exclusion("app.t", "d", False)
     state.set_lob_exclusion("app.t", "c", False)
@@ -256,6 +258,11 @@ def test_the_forced_set_joins_the_replace_set_and_is_consumed_alone():
     assert state.replace_targets == frozenset({"b"})  # append mode: only the forced one
     state.set_reload_mode("drop")
     assert state.replace_targets == frozenset({"a", "b"})
+    # Unconfirmed (a dialog lost to a reload or disconnect): the forced set is dropped.
+    assert state.take_replace_targets() == frozenset({"a"})
+    assert state.exclusion_forced_replace == {}
+    state.set_exclusion_forced_replace({"b": "needs Drop & reload"})
+    state.confirm_exclusion_forced_replace()
     assert state.take_replace_targets() == frozenset({"a", "b"})
     assert state.exclusion_forced_replace == {} and state.tables_with_data == frozenset({"a"})
     assert state.reload_mode == "drop" and state.replace_targets == frozenset({"a"})

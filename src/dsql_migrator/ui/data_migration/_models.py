@@ -1867,8 +1867,25 @@ def exclusion_forced_replace(
             continue
         table_facts = facts.get(table)
         refusal = None
+        if table in unfinished and not cdc_coexisting:
+            # Reloading it needs no facts: it was recreated and not finished, so its rows
+            # are the tool's own partial load and its indexes were never built.
+            forced[table] = (
+                "recreated by the last run and not finished; it is dropped and reloaded "
+                "so its indexes are built"
+            )
+            if overlay:
+                null_columns[table] = tuple(sorted(overlay))
+            continue
         if overlay or record is not None:
             if table_facts is None:
+                if cdc_coexisting and table in unfinished:
+                    ddls = list(index_ddls_for(table) or ())
+                    warnings[table] = (
+                        f"{table} was recreated by the last run and not finished; while CDC "
+                        "streams it is appended, so its indexes are not built: "
+                        + ("; ".join(ddls) if ddls else "none recorded")
+                    )
                 undecided.append(table)
                 if overlay:
                     null_columns[table] = tuple(sorted(overlay))
@@ -1907,12 +1924,7 @@ def exclusion_forced_replace(
                     + ("; ".join(ddls) if ddls else "none recorded")
                 )
             continue
-        if table in unfinished:
-            forced[table] = (
-                "recreated by the last run and not finished; it is dropped and reloaded "
-                "so its indexes are built"
-            )
-        elif refusal is not None and refusal.kind == "reincluded":
+        if refusal is not None and refusal.kind == "reincluded":
             forced[table] = (
                 f"{', '.join(refusal.columns)} hold NULL from an earlier exclusion set; it "
                 "is dropped and reloaded so they get their source values"

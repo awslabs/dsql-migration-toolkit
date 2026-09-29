@@ -22,7 +22,7 @@ import logging
 import threading
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Callable, Mapping, Optional, Sequence
+from typing import Callable, Iterable, Mapping, Optional, Sequence
 
 from dsql_migrator.core.cdc import (
     CDC_DEFAULT_STACK_NAME,
@@ -159,6 +159,14 @@ class DataMigrationState:
         # inputs are built, never persisted (its durable remainder is the job's
         # recreated_tables).
         self._exclusion_forced_replace: dict[str, str] = {}
+        # Set by the Start dialog's confirm only: a forced set (and the overlay the dialog
+        # disclosed) counts for the run being built only after the operator confirmed it,
+        # so a dialog lost to a reload or disconnect leaves nothing a later run could take.
+        self._exclusion_forced_confirmed: bool = False
+        # What the dialog disclosed would be overlaid ({table: columns}); the run refuses to
+        # start with a different set (a classification that settled meanwhile) and asks
+        # for the dialog again.
+        self._overlay_disclosed: Optional[dict[str, frozenset[str]]] = None
         # One-shot flag: open the Full Load confirm dialog on the next render
         # (set after the async non-empty-target check completes).
         self.pending_full_load_confirm: bool = False
@@ -1332,12 +1340,35 @@ class DataMigrationState:
         return frozenset(base) | frozenset(self._exclusion_forced_replace)
 
     def take_replace_targets(self) -> frozenset[str]:
-        """The replace set for the run being built, consuming ONLY the forced set: the
-        operator's own drop choice stays, so a retry / per-table Reload honours it."""
+        """The replace set for the run being built (see :meth:`take_run_choice`)."""
+        return self.take_run_choice()[0]
+
+    def take_run_choice(self) -> "tuple[frozenset[str], Optional[dict[str, frozenset[str]]]]":
+        """``(replace set, disclosed overlay)`` for the run being built; consumes the
+        Start dialog's forced set and pin, never the operator's own drop choice (a retry /
+        per-table Reload honours it). The forced set and the pin count only when the
+        dialog's confirm handed them over; otherwise the pin is ``None``."""
         with self._lock:
-            union = self._replace_union()
+            base = self._tables_with_data if self._reload_mode == "drop" else frozenset()
+            confirmed = self._exclusion_forced_confirmed
+            forced = frozenset(self._exclusion_forced_replace) if confirmed else frozenset()
+            pinned = self._overlay_disclosed if confirmed else None
             self._exclusion_forced_replace = {}
-            return union
+            self._exclusion_forced_confirmed = False
+            self._overlay_disclosed = None
+            return frozenset(base) | forced, pinned
+
+    def confirm_exclusion_forced_replace(self) -> None:
+        """The Start dialog's confirm: its forced set and disclosed overlay now count."""
+        with self._lock:
+            self._exclusion_forced_confirmed = True
+
+    def set_overlay_disclosed(self, disclosed: "Optional[Mapping[str, Iterable[str]]]") -> None:
+        with self._lock:
+            self._overlay_disclosed = (
+                None if disclosed is None
+                else {t: frozenset(c) for t, c in disclosed.items() if c}
+            )
 
     @property
     def exclusion_forced_replace(self) -> dict[str, str]:
@@ -1351,6 +1382,8 @@ class DataMigrationState:
     def clear_exclusion_forced_replace(self) -> None:
         with self._lock:
             self._exclusion_forced_replace = {}
+            self._exclusion_forced_confirmed = False
+            self._overlay_disclosed = None
 
     def set_selection(self, selection: TableSelection) -> None:
         """Replace the table selection for the sub-flow (marks it user-touched)."""

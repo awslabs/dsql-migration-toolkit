@@ -63,6 +63,7 @@ stream -> batch-insert -> verify pipeline. Do NOT split Full Load further just t
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -499,6 +500,7 @@ def build_data_migration_screen(
             conv_state.edited_target_ddls,
             preserve_foreign_keys=conv_state.preserve_foreign_keys,
         )
+        _run_replace, _disclosed = migration_state.take_run_choice()
         inputs = DataMigrationInputs(
             source_config=source_config,
             source_password=session.source_password,
@@ -506,8 +508,8 @@ def build_data_migration_screen(
             inventory=inventory,
             aws_profile=session.aws_profile,
             staging_bucket=staging_bucket,
-            # The run's replace set; consumes the Start dialog's forced Drop & reload set.
-            replace_tables=migration_state.take_replace_targets(),
+            # The run's replace set; consumes the Start dialog's confirmed forced set.
+            replace_tables=_run_replace,
             # Only suppress DROP+recreate when CDC is ACTIVELY STREAMING into the
             # target (a DROP would race the live sink). Before CDC starts -- even in
             # the Full load + CDC pattern -- a re-run still drops+recreates the
@@ -541,10 +543,6 @@ def build_data_migration_screen(
                 applied_conversions=_applied_conversions,
                 preserve_foreign_keys=conv_state.preserve_foreign_keys,
             ),
-            **_overlay_inputs(
-                migration_state, inventory, _applied_conversions,
-                conv_state.preserve_foreign_keys,
-            ),
         )
         # Full Load runs over the tables the user selected in the picker. A
         # table is migratable when it has a target table to load into: either its
@@ -575,6 +573,21 @@ def build_data_migration_screen(
         if not names:
             migration_state.set_error("Select at least one table to migrate.")
             return
+        # The overlay of exactly the tables this run loads -- and it must be what the
+        # Start dialog disclosed, if the run came from one.
+        _overlay_fields = _overlay_inputs(
+            migration_state, inventory, _applied_conversions,
+            conv_state.preserve_foreign_keys, tables=names,
+        )
+        if _disclosed_differs(_disclosed, _overlay_fields["overlay_columns"], names):
+            migration_state.set_error(
+                "The excluded-column changes were re-evaluated after the dialog opened "
+                "(a restored session's exclusions were classified); review them and "
+                "start again."
+            )
+            migration_state.pending_full_load_confirm = True
+            return
+        inputs = dataclasses.replace(inputs, **_overlay_fields)
         tables = TableSelector().resolve(
             inventory, TableSelection(selected_tables=names)
         )
@@ -630,6 +643,7 @@ def build_data_migration_screen(
                 inputs=inputs,
             )
 
+        _mark_overlay_use(migration_state, inputs.overlay_columns)
         migration_state.job_id = job_manager.submit(work)
         # Mirror the Full Load start into the AI activity feed (deterministic; the
         # completion event is posted from the live poll as the job reaches a terminal
@@ -926,7 +940,13 @@ def build_data_migration_screen(
                 }
                 # The excluded columns the load's overlay makes nullable: never
                 # unfillable. Legacy (omit-only) entries are judged as before.
-                _prereq_overlay = overlay_lob_exclusions(migration_state, inventory)
+                # CDC only: no Full Load overlays the table before CDC's first write, so
+                # the overlay cannot make an excluded column loadable there.
+                _prereq_overlay = (
+                    {}
+                    if migration_state.migration_type is MigrationType.CDC_ONLY
+                    else overlay_lob_exclusions(migration_state, inventory)
+                )
                 report = await run.io_bound(
                     lambda: checker.check(
                         request,
@@ -1545,9 +1565,9 @@ def build_data_migration_screen(
                 retry_cdc_coexisting = cdc_streaming_started(
                     migration_state, job_manager
                 )
-                # Consume the Start dialog's forced set whatever happens next (it is
-                # re-derived at every probe).
-                taken_replace = migration_state.take_replace_targets()
+                # Consume the Start dialog's confirmed forced set and pin whatever happens
+                # next (they are re-derived at every probe).
+                taken_replace, retry_disclosed = migration_state.take_run_choice()
                 # Carry the run-wide reload choice onto the retry: if the user chose
                 # "Drop & reload", a table being retried must be recreated on the
                 # RE-run too, not left to skip-existing over the stale rows --
@@ -1609,9 +1629,17 @@ def build_data_migration_screen(
                     ),
                     **_overlay_inputs(
                         migration_state, inventory, _applied_retry_conversion,
-                        conv_state.preserve_foreign_keys,
+                        conv_state.preserve_foreign_keys, tables=names,
                     ),
                 )
+                if _disclosed_differs(retry_disclosed, retry_inputs.overlay_columns, names):
+                    migration_state.set_error(
+                        "The excluded-column changes were re-evaluated after the dialog "
+                        "opened (a restored session's exclusions were classified); review "
+                        "them and reload again."
+                    )
+                    refresh()
+                    return
                 retry_tables = TableSelector().resolve(
                     inventory, TableSelection(selected_tables=names)
                 )
@@ -1653,6 +1681,7 @@ def build_data_migration_screen(
                         inputs=retry_inputs,
                     )
 
+                _mark_overlay_use(migration_state, retry_inputs.overlay_columns)
                 migration_state.job_id = job_manager.submit(work)
                 ui.notify(
                     f"Retrying {len(names)} table(s) — progress below.",
@@ -2617,6 +2646,8 @@ def build_data_migration_screen(
             migration_state.set_active_substep("full_load")
             migration_state.pending_full_load_confirm = True
             return
+        # A direct run never takes a forced set a lost dialog left behind.
+        migration_state.clear_exclusion_forced_replace()
         runner()
 
     return content, header_runner
@@ -2808,31 +2839,55 @@ def table_set_lock_reason(migration_state, job_manager, session) -> Optional[str
     )
 
 
-def _overlay_inputs(migration_state, inventory, applied_conversions, preserve_foreign_keys) -> dict:
-    """The column-exclusion overlay fields of a load's DataMigrationInputs: THE overlay set
-    (the columns made nullable with no DEFAULT), the omit-only legacy set, the ledger
-    handle and whether the session has used it. One place for the Start and retry
-    builders, so both runs overlay the same columns."""
-    overlay = overlay_lob_exclusions(
+def _overlay_inputs(
+    migration_state, inventory, applied_conversions, preserve_foreign_keys, *, tables=None,
+) -> dict:
+    """The column-exclusion overlay fields of a load's DataMigrationInputs, scoped to the
+    run's ``tables``: THE overlay set (the columns made nullable with no DEFAULT), the
+    omit-only legacy set, the ledger handle, whether the session uses it (or this run
+    will), and the engine's callback for a ledger read that finds records. One place for
+    the Start and retry builders, so both runs overlay the same columns."""
+    scope = None if tables is None else set(tables)
+
+    def _scoped(sets):
+        return {t: c for t, c in sets.items() if scope is None or t in scope}
+
+    overlay = _scoped(overlay_lob_exclusions(
         migration_state, inventory, applied_conversions=applied_conversions,
         preserve_foreign_keys=preserve_foreign_keys,
-    )
-    if overlay:
-        # A run that overlays is what can leave a record behind (a dropped DEFAULT, rows
-        # holding NULL): from now on this session's runs consult the ledger. Marked here,
-        # before the job is submitted, so the next snapshot save carries it.
+    ))
+    mark = getattr(migration_state, "mark_overlay_ledger_in_use", None)
+    return {
+        "overlay_columns": overlay,
+        "legacy_exclusions": _scoped(legacy_lob_exclusions(
+            migration_state, inventory, applied_conversions=applied_conversions,
+            preserve_foreign_keys=preserve_foreign_keys,
+        )),
+        "overlay_ledger": getattr(migration_state, "overlay_ledger", None),
+        "overlay_ledger_in_use": bool(getattr(migration_state, "overlay_ledger_in_use", False))
+        or bool(overlay),
+        "on_overlay_ledger_used": mark if callable(mark) else None,
+    }
+
+
+def _disclosed_differs(disclosed, overlay_columns, tables) -> bool:
+    """Whether a confirmed dialog disclosed a different overlay than the run would apply
+    (a restored classification that settled after the dialog opened)."""
+    if disclosed is None:
+        return False
+    scope = set(tables)
+    shown = {t: frozenset(c) for t, c in disclosed.items() if t in scope and c}
+    will = {t: frozenset(c) for t, c in overlay_columns.items() if t in scope and c}
+    return shown != will
+
+
+def _mark_overlay_use(migration_state, overlay_columns) -> None:
+    """Just before a run that overlays is submitted: from now on the session's runs consult
+    the ledger (the run may leave a record behind)."""
+    if overlay_columns:
         mark = getattr(migration_state, "mark_overlay_ledger_in_use", None)
         if callable(mark):
             mark()
-    return {
-        "overlay_columns": overlay,
-        "legacy_exclusions": legacy_lob_exclusions(
-            migration_state, inventory, applied_conversions=applied_conversions,
-            preserve_foreign_keys=preserve_foreign_keys,
-        ),
-        "overlay_ledger": getattr(migration_state, "overlay_ledger", None),
-        "overlay_ledger_in_use": bool(getattr(migration_state, "overlay_ledger_in_use", False)),
-    }
 
 
 @dataclass(frozen=True)

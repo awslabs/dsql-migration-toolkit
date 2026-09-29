@@ -220,7 +220,8 @@ class _DialogUi(_ConfirmDialogUi):
 
 
 def _open(monkeypatch, *, state=None, view=None, ledger=None, facts=None, rows=(PAGES,), probe_raises=False,
-          cdc=False, tables=(PAGES,), order=None):
+          cdc=False, tables=(PAGES,), order=None, job=None, status=None, click="Start", retry_tables=None,
+          present=None):
     import nicegui.context as ctxobj
     import nicegui.run as nrun
 
@@ -250,7 +251,8 @@ def _open(monkeypatch, *, state=None, view=None, ledger=None, facts=None, rows=(
 
     monkeypatch.setattr(fl, "tables_with_rows", _rows)
     monkeypatch.setattr(fl, "target_primary_keys", lambda names, **k: {n: ["id"] for n in names})
-    monkeypatch.setattr(fl, "tables_present", lambda names, **k: list(names))
+    monkeypatch.setattr(fl, "tables_present",
+                        lambda names, **k: [n for n in names if present is None or n in present])
     facts_calls = []
 
     def _facts_read(names, cols, **_k):
@@ -282,7 +284,8 @@ def _open(monkeypatch, *, state=None, view=None, ledger=None, facts=None, rows=(
             return None
 
     dm._render_full_load_step(
-        ui, state, _NoJobs(), _StubSession(), job=None, status=StepStatus.NOT_STARTED, selected_names=list(tables),
+        ui, state, _NoJobs(), _StubSession(), job=job, status=status or StepStatus.NOT_STARTED,
+        selected_names=list(tables), retry_tables=retry_tables,
         guard_reason=None, start_full_load=lambda: started.append(state.take_replace_targets()),
         retry_failed_load=lambda *a: None, reload_table=lambda *a: None,
         accept_quarantine_and_continue=lambda *a: None, stop_full_load=lambda *a: None, refresh=lambda *a: None,
@@ -290,7 +293,7 @@ def _open(monkeypatch, *, state=None, view=None, ledger=None, facts=None, rows=(
         overlay_ledger_read=_ledger_read if ledger is not None or ledger is None and view is not None else None,
         exclusion_overlay_view=(lambda _t: view) if view is not None else None,
     )
-    start = [h for (label, h) in ui.handlers if "Start" in label]
+    start = [h for (label, h) in ui.handlers if click in label]
     asyncio.run(start[0]())
     return SimpleNamespace(ui=ui, state=state, reads=reads, facts_calls=facts_calls, started=started, order=order)
 
@@ -424,7 +427,8 @@ def test_the_header_run_asks_for_the_dialog_only_when_the_overlay_is_in_play():
     src = " ".join(inspect.getsource(dm.build_data_migration_screen).split())
     assert "return content, header_runner" in src
     assert "if overlay_in_play(migration_state, _inventory()): migration_state.set_active_substep(\"full_load\") " \
-           "migration_state.pending_full_load_confirm = True return runner()" in src
+           "migration_state.pending_full_load_confirm = True return" in src
+    assert "migration_state.clear_exclusion_forced_replace() runner() return content, header_runner" in src
     inventory = SourceInventory(tables=[TableDef(name=PAGES, primary_key=["id"], columns=[
         ColumnDef(name="id", mysql_type="int", nullable=False), ColumnDef(name="summary", mysql_type="text")])])
     state = DataMigrationState()
@@ -472,3 +476,72 @@ def test_a_pending_confirm_opens_the_start_dialog_once(monkeypatch):
         reload_table=lambda *a: None, accept_quarantine_and_continue=lambda *a: None,
         stop_full_load=lambda *a: None, refresh=lambda *a: None, schema_recreate_candidates=lambda: [])
     assert ui.opened == 1 and state.pending_full_load_confirm is False
+
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (P2-10..12 verification)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("failure", ["probe", "facts"])
+def test_a_recreated_unfinished_table_is_forced_even_when_the_target_cannot_be_read(monkeypatch, failure):
+    ctx = _open(monkeypatch, view=_view(unfinished=(PAGES,)), ledger=LedgerRead("present", {PAGES: _record()}),
+                probe_raises=failure == "probe", facts={PAGES: None} if failure == "facts" else None)
+    assert PAGES in ctx.state.exclusion_forced_replace
+    assert "recreated by the last run and not finished" in ctx.state.exclusion_forced_replace[PAGES]
+    assert ctx.ui.start().text == "Drop 1 table, recreate and load" and ctx.ui.start().color == "negative"
+
+
+def test_the_checklist_scopes_the_forced_label_to_the_ticked_tables(monkeypatch):
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+
+    other = "shop.other"
+    job = MigrationJob(job_id="j1", status="DONE", progress_pct=100.0, chunks=[
+        ChunkState(chunk_id=other, status="DONE", rows_loaded=5, attempts=1),
+        ChunkState(chunk_id=PAGES, status="DONE", rows_loaded=3, attempts=1)])
+    ctx = _open(monkeypatch, view=_view(), ledger=LedgerRead("absent"), rows=(PAGES, other), tables=(other, PAGES),
+                facts={PAGES: _facts(summary=SUMMARY)}, job=job, status=StepStatus.DONE,
+                retry_tables=lambda names: None, click="Reload specific tables")
+    assert ctx.state.exclusion_forced_replace.keys() == {PAGES}
+    # Nothing ticked: no table is dropped, so the label is not a red "Drop 0 tables".
+    assert ctx.ui.start().text == "Append and load" and ctx.ui.start().color == "primary"
+    assert "will be dropped and reloaded" not in _body(ctx.ui)  # the forced notice follows the ticks
+    toggles_by_order = ctx.ui.checkbox_handlers
+    toggles_by_order[0](SimpleNamespace(value=True))  # tick shop.other only
+    assert ctx.ui.start().text == "Append and load"
+    toggles_by_order[1](SimpleNamespace(value=True))  # tick the forced table too
+    assert ctx.ui.start().text == "Drop 1 table, recreate and load" and ctx.ui.start().color == "negative"
+
+
+def test_a_missing_table_notice_does_not_point_at_a_radio_that_is_not_drawn(monkeypatch):
+    missing = "shop.missing"
+    ctx = _open(monkeypatch, view=_view(), ledger=LedgerRead("absent"), rows=(PAGES,), tables=(PAGES, missing),
+                present={PAGES}, facts={PAGES: _facts(summary=SUMMARY)})
+    assert ctx.ui.radios == [] and "choose 'Drop & reload' below" not in _body(ctx.ui)
+    assert "1 selected table do not exist on the target" in _body(ctx.ui)
+
+
+def test_the_dialog_pins_what_it_disclosed_and_only_a_confirm_hands_it_over(monkeypatch):
+    ctx = _open(monkeypatch, view=_view(), ledger=LedgerRead("absent"), facts={PAGES: _facts(summary=SUMMARY)})
+    state = ctx.state
+    assert state.take_run_choice() == (frozenset(), None)  # not confirmed: nothing counts
+    ctx = _open(monkeypatch, view=_view(), ledger=LedgerRead("absent"), facts={PAGES: _facts(summary=SUMMARY)})
+    ctx.state.confirm_exclusion_forced_replace()
+    assert ctx.state.take_run_choice() == (frozenset({PAGES}), {PAGES: frozenset({"summary"})})
+    assert ctx.state.take_run_choice() == (frozenset(), None)  # consumed
+
+
+def test_a_different_overlay_than_the_dialog_disclosed_stops_the_run():
+    assert dm._disclosed_differs({PAGES: {"summary"}}, {PAGES: frozenset({"summary"})}, [PAGES]) is False
+    assert dm._disclosed_differs({}, {PAGES: frozenset({"summary"})}, [PAGES]) is True  # settled after the dialog
+    assert dm._disclosed_differs(None, {PAGES: frozenset({"summary"})}, [PAGES]) is False  # no dialog: nothing pinned
+    assert dm._disclosed_differs({"shop.elsewhere": {"x"}}, {}, [PAGES]) is False  # outside the run
+
+
+def test_cdc_only_prerequisites_do_not_count_an_overlay_that_never_runs():
+    import inspect
+
+    src = " ".join(inspect.getsource(dm.build_data_migration_screen).split())
+    assert ("_prereq_overlay = ( {} if migration_state.migration_type is MigrationType.CDC_ONLY "
+            "else overlay_lob_exclusions(migration_state, inventory) )") in src

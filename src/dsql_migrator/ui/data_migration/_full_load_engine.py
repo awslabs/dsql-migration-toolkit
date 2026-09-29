@@ -74,6 +74,7 @@ from dsql_migrator.core.schema_applier import (
 )
 from dsql_migrator.core.overlay_ledger import (
     LedgerDecision,
+    LedgerRead,
     OverlayLedgerError,
     OverlayLedgerUnavailableError,
     OverlayLedgerView,
@@ -218,6 +219,10 @@ class DataMigrationInputs:
     overlay_ledger_status: Optional[str] = None
     # Called with a table name each time the parent DROP+recreates it; parent-only.
     on_table_recreated: Optional[Callable[[str], None]] = None
+    # Called when the run's ledger read finds records for this target, so the session
+    # consults the ledger from then on (and the page-header Run opens the dialog);
+    # parent-only.
+    on_overlay_ledger_used: Optional[Callable[[], None]] = None
 
 
 @dataclass(frozen=True)
@@ -851,6 +856,7 @@ def _slim_worker_inputs(
         overlay_record=None,
         overlay_ledger_status=None,
         on_table_recreated=None,
+        on_overlay_ledger_used=None,
     )
 
 
@@ -3449,14 +3455,36 @@ def _open_run_ledger_view(
     if not isinstance(base, DataMigrationInputs):
         return
     overlay_tables = _run_overlay_tables(base, tables)
-    if not overlay_tables and not base.overlay_ledger_in_use:
-        return
     store = base.overlay_ledger
     if store is None:
         _require_overlay_ledger(migrator, tables)
         return
     key = overlay_ledger_key(base.target_config)
-    read = store.read(key)
+    try:
+        read = store.read(key)
+    except Exception as exc:  # noqa: BLE001 - the contract says never; unknown if it does
+        read = LedgerRead("unreadable", {}, f"{type(exc).__name__}: {exc}")
+    # A run with no overlay tables, in a session that never used the ledger, reads it once
+    # anyway: an earlier session (or Start over) may have left records for this target,
+    # and an append must not mix values into rows that hold NULL. Nothing recorded (or an
+    # unreadable read) leaves such a run exactly as before.
+    if not overlay_tables and not base.overlay_ledger_in_use:
+        run_names = {t.name for t in tables}
+        if read.status != "present" or not (set(read.tables) & run_names):
+            if read.status == "unreadable":
+                _LOGGER.warning("Overlay ledger unreadable (%s); no exclusions in this run", read.error)
+            return
+        if base.on_overlay_ledger_used is not None:
+            try:
+                base.on_overlay_ledger_used()
+            except Exception:  # noqa: BLE001 - a UI mark must never fail the run
+                _LOGGER.warning("Could not mark the overlay ledger in use", exc_info=True)
+        base = replace(base, overlay_ledger_in_use=True)
+    elif read.status == "present" and read.tables and base.on_overlay_ledger_used is not None:
+        try:
+            base.on_overlay_ledger_used()
+        except Exception:  # noqa: BLE001 - a UI mark must never fail the run
+            _LOGGER.warning("Could not mark the overlay ledger in use", exc_info=True)
 
     def _on_recreated(name: str) -> None:
         handle.update(lambda job, n=name: _record_recreated(job, n))
