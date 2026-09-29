@@ -71,6 +71,9 @@ Usage (from repo root):
     .venv/bin/python scripts/run_pg_cdc_e2e.py --yes                # run all stages
     .venv/bin/python scripts/run_pg_cdc_e2e.py --yes --from-stage deploy-infra
     .venv/bin/python scripts/run_pg_cdc_e2e.py --yes --only teardown
+    .venv/bin/python scripts/run_pg_cdc_e2e.py --yes --exclude-columns t_orders.note
+        # excluded columns load/stream as NULL (overlay; local ledger of dropped DEFAULTs);
+        # pass the SAME --exclude-columns to every stage (infra, start, validate)
 
 This is an operational utility (NOT shipped in the app), kept alongside
 ``run_e2e_migration.py``. It writes to the source (slot/publication + workload),
@@ -88,6 +91,7 @@ from datetime import datetime, timezone
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "src"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # for _exclusion_harness
 
 # The cdc-stack CloudFormation template (staged into the plugin bucket by the deployer;
 # too large for CloudFormation's 51,200-byte inline --template-body limit).
@@ -376,6 +380,16 @@ def stage_full_load(args) -> None:
     table_conversions = _table_conversions(tables, verbose=True)
     log(f"  Converted {len(table_conversions)}/{len(tables)} table(s) for the applied "
         "target types.")
+    from _exclusion_harness import check_exclusions, local_overlay_ledger, overlay_input_fields
+
+    excluded = getattr(args, "excluded", {}) or {}
+    problems = check_exclusions(excluded, tables)
+    if problems:
+        raise SystemExit("ERROR: --exclude-columns: " + "; ".join(problems))
+    if excluded:
+        log("  excluded (NULL on Aurora DSQL): "
+            + "; ".join(f"{t} ({', '.join(sorted(c))})" for t, c in sorted(excluded.items()))
+            + f"; overlay ledger -> {args.overlay_ledger}")
     inputs = DataMigrationInputs(
         source_config=_source_config(),
         source_password=_password(),
@@ -385,6 +399,9 @@ def stage_full_load(args) -> None:
         replace_tables=frozenset(wanted),  # clean slate: DROP+recreate the target
         cdc_stack_name=STACK_NAME,          # -> engine provisions slot/publication + LSN
         table_conversions=table_conversions,
+        **overlay_input_fields(
+            excluded, local_overlay_ledger(args.overlay_ledger) if excluded else None
+        ),
     )
     migrator = default_migrator_factory(inputs)
     error_log = ErrorLogStore()
@@ -475,20 +492,26 @@ def _table_conversions(tables, verbose: bool = False) -> dict:
     return conversions
 
 
-def _build_pg_configs(allow_empty_sink):
-    """Return (pg_source_config, sink_config, tables) built via the tool's dispatch."""
+def _build_pg_configs(allow_empty_sink, excluded=None):
+    """Return (pg_source_config, sink_config, tables) built via the tool's dispatch.
+
+    ``excluded`` ({table: columns}) becomes the connector's ``column.exclude.list``,
+    formatted as the UI sends it."""
     from dsql_migrator.core.cdc import CDC_DEFAULT_DLQ_TOPIC, CdcPipelineOrchestrator
     from dsql_migrator.core.cdc_postgres import dispatch_source_config
     from dsql_migrator.core.models import SourceType
 
     _inventory, _wanted, tables = _introspect_tables()
     watermark = _load_watermark()
+    from _exclusion_harness import cdc_column_exclude_list
+
     source_config = dispatch_source_config(
         SourceType.POSTGRES,
         tables,
         watermark,
         database=cfg("DB_NAME", "postgres"),
         stack_name=STACK_NAME,
+        column_exclude_list=cdc_column_exclude_list(excluded or {}, tables),
     )
     # Composite-PK re-key: derive {db.table: [target key cols]} from the APPLIED target
     # DDL exactly as the UI does, and put it on the SOURCE config -- build_cdc_stack_params
@@ -536,7 +559,8 @@ def stage_deploy_infra(args) -> None:
     from dsql_migrator.core.secrets import cdc_source_secret_name, ensure_source_secret
 
     rg = region()
-    source_config, sink_config, tables, watermark = _build_pg_configs(allow_empty_sink=True)
+    source_config, sink_config, tables, watermark = _build_pg_configs(
+        allow_empty_sink=True, excluded=getattr(args, "excluded", None))
 
     dsql_client = build_dsql_client(_profile(), rg)
     dsql_cluster_arn = fetch_dsql_cluster_arn(dsql_client, cfg("TARGET_ENDPOINT"))
@@ -755,7 +779,8 @@ def stage_start_cdc(args) -> None:
         "MUST run from INSIDE the cdc-stack VPC (needs the 'cdc-external' extra and "
         "DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR set at deploy-infra time).")
 
-    source_config, sink_config, tables, watermark = _build_pg_configs(allow_empty_sink=False)
+    source_config, sink_config, tables, watermark = _build_pg_configs(
+        allow_empty_sink=False, excluded=getattr(args, "excluded", None))
     params = dispatch_cdc_stack_params(
         source_config, sink_config,
         target_endpoint=cfg("TARGET_ENDPOINT"),
@@ -768,7 +793,33 @@ def stage_start_cdc(args) -> None:
     deployer = _deployer()
     log(f"Starting CDC on '{STACK_NAME}' (PG source, SeedMode=External) …")
 
+    excluded = getattr(args, "excluded", {}) or {}
+
     def work(handle) -> None:
+        if excluded:
+            # The product's own Start CDC overlay, before any connector: every excluded
+            # column nullable with no DEFAULT (a verified no-op after the Full Load did it).
+            from _exclusion_harness import local_overlay_ledger
+            from dsql_migrator.core.overlay_ledger import overlay_ledger_key
+            from dsql_migrator.core.target_connection import DsqlConnector
+            from dsql_migrator.ui.data_migration._cdc_overlay import apply_start_cdc_overlay
+
+            conversions = _table_conversions(tables)
+            apply_start_cdc_overlay(
+                handle,
+                overlay_by_table=excluded,
+                captured=[t.name for t in tables],
+                excluded_by_table=excluded,
+                source_columns_for=lambda name: [
+                    c.name for t in tables if t.name == name for c in t.columns],
+                ledger=local_overlay_ledger(args.overlay_ledger),
+                ledger_key=overlay_ledger_key(_target_config()),
+                ledger_in_use=True,
+                connection_factory=DsqlConnector(
+                    _target_config(), aws_profile=_profile()).connect,
+                effective_target_ddls=lambda: {n: c.target_ddl for n, c in conversions.items()},
+                log=lambda action, **kw: log(f"  [overlay] {action}: {kw.get('detail', '')}"),
+            )
         run_cdc_start(
             handle,
             stack_name=STACK_NAME,
@@ -835,6 +886,23 @@ def stage_validate(args) -> None:
 
     inventory, _wanted, tables = _introspect_tables()
     val_inventory = inventory.model_copy(update={"tables": tables})
+    excluded = getattr(args, "excluded", {}) or {}
+    proof: dict = {}
+    if excluded:
+        # The same ONE live catalog read the Validation screen makes: absent / computed
+        # columns never enter the proof SQL.
+        from dsql_migrator.core.target_connection import DsqlConnector
+        from dsql_migrator.core.target_introspector import target_overlay_facts
+        from dsql_migrator.ui.validation import live_proof_columns
+
+        facts = target_overlay_facts(
+            sorted(excluded), {t: sorted(c) for t, c in excluded.items()},
+            connection_factory=DsqlConnector(_target_config(), aws_profile=_profile()).connect,
+            probe_rows=False,
+        )
+        null_proof, _legacy, absent, unknown = live_proof_columns(excluded, {}, facts)
+        proof = {"null_proof_columns": null_proof, "proof_absent_columns": absent,
+                 "proof_unknown_tables": unknown, "null_proof_blocks_match": True}
     vinputs = ValidationInputs(
         source_config=_source_config(),
         source_password=_password(),
@@ -843,6 +911,8 @@ def stage_validate(args) -> None:
         mode=ValidationMode.CHECKSUM,
         reconcile=True,
         check_orphans=False,
+        excluded_columns={t: set(c) for t, c in excluded.items()},
+        **proof,
     )
     report = run_validation(vinputs)
     ok = True
@@ -852,8 +922,12 @@ def stage_validate(args) -> None:
         recon = (f" missing={rc.missing_on_target} extra={rc.extra_on_target}"
                  if rc else "")
         verdict = "MATCH" if item.matched else "MISMATCH"
+        null_proof = (
+            f" NULL-proof={item.proof_state}:{item.excluded_nonnull_counts}"
+            if item.proof_state else ""
+        )
         log(f"  {bare:<16} {verdict:<9} src={item.source_row_count} "
-            f"tgt={item.target_row_count} csum={item.checksum_match}{recon}"
+            f"tgt={item.target_row_count} csum={item.checksum_match}{recon}{null_proof}"
             + (f"  ERROR={item.error}" if item.error else ""))
         ok = ok and item.matched
     log(f"Validation verdict: {'MATCH (converged)' if ok else 'MISMATCH'} "
@@ -930,7 +1004,19 @@ def main() -> int:
                     help="seconds to await wal_level=logical (0 = check once)")
     ap.add_argument("--workload-rows", type=int, default=5,
                     help="INSERT rows for the workload stage")
+    from _exclusion_harness import DEFAULT_LEDGER_PATH, parse_exclude_columns
+
+    ap.add_argument("--exclude-columns", action="append", default=[],
+                    help="table.col[,table.col...]: excluded, NULL on Aurora DSQL "
+                    "(repeatable; pass the same set to every stage)")
+    ap.add_argument("--overlay-ledger", default=DEFAULT_LEDGER_PATH,
+                    help="local SQLite ledger of dropped DEFAULTs (with --exclude-columns)")
     args = ap.parse_args()
+    try:
+        args.excluded = parse_exclude_columns(args.exclude_columns, schema=SCHEMA)
+    except ValueError as exc:
+        log(f"ERROR: {exc}")
+        return 2
 
     order = list(STAGES)
     if args.only:
@@ -938,7 +1024,8 @@ def main() -> int:
     else:
         selected = order[order.index(args.from_stage):]
 
-    log(f"PG CDC E2E — schema={SCHEMA} stack={STACK_NAME} region={region()} tables={TABLES}")
+    log(f"PG CDC E2E — schema={SCHEMA} stack={STACK_NAME} region={region()} tables={TABLES}"
+        + (f" excluded={ {t: sorted(c) for t, c in args.excluded.items()} }" if args.excluded else ""))
     log(f"Stages: {', '.join(selected)}  (yes={args.yes})")
     if args.plan or not args.yes:
         log("[plan] re-run with --yes to execute. Side-effecting stages: drop-target, "
