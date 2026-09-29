@@ -97,6 +97,33 @@ DEFAULT_BATCH_SIZE = 5000
 _TXN_CONTROL_EXEC_OPTS = {"stream_results": False}
 
 
+def source_connection_lost(exc: BaseException, connection: object) -> bool:
+    """Whether ``exc`` left ``connection`` unusable (SQLAlchemy invalidated it on a
+    detected disconnect). A best-effort read must NOT swallow that: every later
+    statement on the connection would raise a context-less PendingRollbackError that
+    no longer says the source connection was lost."""
+    return bool(getattr(exc, "connection_invalidated", False)) or bool(
+        getattr(connection, "invalidated", False)
+    )
+
+
+def _end_snapshot_after_failure(connection) -> None:
+    """End the snapshot after the read FAILED (or was closed early), best effort.
+
+    The COMMIT runs on the same connection, and when the failure was a lost source
+    connection that connection is invalidated: the COMMIT then raises too (SQLAlchemy's
+    PendingRollbackError). Raised from a ``finally`` it REPLACED the lost-connection
+    error, so the Full Load's source-retry classifier saw a non-transient error and
+    failed the table instead of re-reading it from a fresh snapshot. So here the COMMIT
+    failure is swallowed and the original error propagates. (A dead connection's
+    snapshot ended with it anyway.)
+    """
+    try:
+        connection.execute(text(COMMIT), execution_options=_TXN_CONTROL_EXEC_OPTS)
+    except Exception:  # noqa: BLE001 - never mask the error that is propagating
+        pass
+
+
 class ExportError(RuntimeError):
     """Base error for failures while exporting a source table."""
 
@@ -571,12 +598,18 @@ def _read_threads_running(connection: _Connection) -> Optional[int]:
     (Property 1), and works inside the export's consistent-snapshot transaction. Any
     failure or malformed value returns ``None`` so a broken status read can NEVER
     stall the load (fail-open) -- the governor treats ``None`` as "don't throttle".
+    The one exception is a LOST connection (:func:`source_connection_lost`): that error
+    is raised, so the load's source retry sees the real lost-connection error.
     """
     try:
         row = connection.execute(
             text("SHOW GLOBAL STATUS LIKE 'Threads_running'")
         ).first()  # type: ignore[attr-defined]
-    except Exception:  # noqa: BLE001 - best-effort; never fail the load on a status read
+    except Exception as exc:  # noqa: BLE001 - best-effort; never fail the load on a status read
+        # Fail-open only on a LIVE connection: a lost one would fail the next page read
+        # anyway, as an error that no longer says so -- raise the real one instead.
+        if source_connection_lost(exc, connection):
+            raise
         return None
     if row is None:
         return None
@@ -694,7 +727,8 @@ class SourceLoadGovernor:
         Returns promptly when the metric is at/below the ceiling, when the ceiling
         is unset, on a status-read failure (fail-open), or when ``should_cancel``
         fires (the caller re-polls it and raises :class:`ExportCancelled`). Never
-        raises -- throttling must never itself fail the load.
+        raises -- throttling must never itself fail the load -- except to pass on a LOST
+        source connection's own error (the next page read would fail anyway).
         """
         if self._ceiling is None:
             return
@@ -1107,10 +1141,12 @@ class TableExporter:
                         target_types=target_types,
                     ):
                         yield converter.convert_row(raw)
-                finally:
-                    snapshot.execute(
-                        text(COMMIT), execution_options=_TXN_CONTROL_EXEC_OPTS
-                    )
+                except BaseException:  # incl. GeneratorExit: the consumer stopped early
+                    _end_snapshot_after_failure(snapshot)
+                    raise
+                snapshot.execute(
+                    text(COMMIT), execution_options=_TXN_CONTROL_EXEC_OPTS
+                )
         finally:
             engine.dispose()
 
@@ -1146,10 +1182,12 @@ def export_rows(
         ):
             writer.write_row(value_converter.convert_row(row))
             rows_exported += 1
-    finally:
-        connection.execute(
-            text(COMMIT), execution_options=_TXN_CONTROL_EXEC_OPTS
-        )
+    except BaseException:
+        _end_snapshot_after_failure(connection)
+        raise
+    connection.execute(
+        text(COMMIT), execution_options=_TXN_CONTROL_EXEC_OPTS
+    )
     return rows_exported
 
 

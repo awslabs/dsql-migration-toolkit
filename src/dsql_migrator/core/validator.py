@@ -1527,7 +1527,12 @@ class Validator:
                     finally:
                         _safe_close(target_connection)
                 finally:
-                    source_connection.execute(text(COMMIT))
+                    # A lost source connection ended its snapshot with it: a COMMIT
+                    # there raises PendingRollbackError, which would discard every
+                    # table's result (or replace the error / the Stop that is
+                    # propagating) -- the per-table errors already say what happened.
+                    if not getattr(source_connection, "invalidated", False):
+                        source_connection.execute(text(COMMIT))
         finally:
             source_engine.dispose()
 
@@ -1690,7 +1695,12 @@ class Validator:
                     finally:
                         _safe_close(target_connection)
                 finally:
-                    source_connection.execute(text(COMMIT))
+                    # A lost source connection ended its snapshot with it: a COMMIT
+                    # there raises PendingRollbackError, which would discard every
+                    # table's result (or replace the error / the Stop that is
+                    # propagating) -- the per-table errors already say what happened.
+                    if not getattr(source_connection, "invalidated", False):
+                        source_connection.execute(text(COMMIT))
         finally:
             source_engine.dispose()
         return item, orphans

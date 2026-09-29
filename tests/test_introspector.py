@@ -1425,3 +1425,23 @@ def test_postgres_introspection_keeps_the_user_defined_TYPE_KIND_and_enum_labels
     # "(a user-defined b type)" next to every ordinary column in the finding.
     assert by_name["note"].type_kind is None
     assert "NULLIF(t.typtype, 'b')" in connection.sql, connection.sql
+
+
+def test_a_pending_rollback_error_is_judged_by_the_disconnect_behind_it():
+    # SQLAlchemy raises PendingRollbackError on a connection an earlier disconnect
+    # invalidated; it is transient exactly when that earlier error was.
+    from sqlalchemy.exc import PendingRollbackError
+
+    from dsql_migrator.core.introspector import is_source_transient_error
+
+    after_drop = PendingRollbackError("Can't reconnect until invalid transaction is rolled back.")
+    after_drop.__context__ = _pymysql_operational(2013, "Lost connection to MySQL server during query")
+    assert is_source_transient_error(after_drop) is True
+    after_bad_sql = PendingRollbackError("Can't reconnect until invalid transaction is rolled back.")
+    after_bad_sql.__context__ = _pymysql_operational(1054, "Unknown column 'x'")
+    assert is_source_transient_error(after_bad_sql) is False
+    # Only PendingRollbackError looks behind itself: any other error with a transient
+    # context stays non-transient (a data error raised while handling a drop).
+    other = ValueError("bad value")
+    other.__context__ = _pymysql_operational(2013, "Lost connection")
+    assert is_source_transient_error(other) is False

@@ -1175,7 +1175,12 @@ class PostgresSourceDialect(SourceDialect):
             value = connection.execute(  # type: ignore[attr-defined]
                 text("SELECT count(*) FROM pg_stat_activity WHERE state = 'active'")
             ).scalar()
-        except Exception:  # noqa: BLE001 - best-effort; never fail the load on a probe
+        except Exception as exc:  # noqa: BLE001 - best-effort; never fail the load on a probe
+            # Fail-open only on a LIVE connection (see exporter.source_connection_lost).
+            from dsql_migrator.core.exporter import source_connection_lost
+
+            if source_connection_lost(exc, connection):
+                raise
             return None
         try:
             return int(value) if value is not None else None

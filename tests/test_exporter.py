@@ -1454,3 +1454,208 @@ def test_governor_reading_expires_after_the_ttl() -> None:
     governor.throttle()
     assert conn.status_reads > 1, "the cached reading never expired"
     assert sleeps, "the fresh over-ceiling reading (999) must pause the reader"
+
+
+# ---------------------------------------------------------------------------
+# A source connection lost mid-read must surface AS a lost connection (LIVE 3)
+# ---------------------------------------------------------------------------
+
+
+class _DyingConnection(_FakeConnection):
+    """The source connection dies during page ``die_on_page``: that read raises a lost
+    connection (2013) and every later statement -- the snapshot COMMIT included -- raises
+    what SQLAlchemy raises on an invalidated connection (PendingRollbackError)."""
+
+    def __init__(self, rows, die_on_page=2):
+        super().__init__(rows)
+        self._die_on = die_on_page
+        self.dead = False
+
+    def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
+        from sqlalchemy.exc import OperationalError, PendingRollbackError
+
+        if self.dead:
+            raise PendingRollbackError("Can't reconnect until invalid transaction is rolled back.")
+        upper = str(statement).strip().upper()
+        if upper.startswith("SELECT") and self.page_queries + 1 == self._die_on:
+            self.dead = True
+            raise OperationalError("SELECT ...", {}, _pymysql_lost())
+        return super().execute(statement, parameters, execution_options)
+
+
+def _pymysql_lost():
+    import pymysql
+
+    return pymysql.err.OperationalError(2013, "Lost connection to MySQL server during query")
+
+
+def test_a_lost_source_connection_mid_stream_raises_the_lost_connection_not_the_commit():
+    # The snapshot COMMIT on the dead connection used to REPLACE the original error, so
+    # the source-retry classifier saw PendingRollbackError and failed the table instead of
+    # re-reading it from a fresh snapshot.
+    from dsql_migrator.core.introspector import is_source_transient_error
+
+    rows = [{"id": i, "name": f"n{i}"} for i in range(1, 8)]
+    conn = _DyingConnection(rows, die_on_page=2)
+    exporter = TableExporter(engine_factory=lambda _cfg: _FakeEngine(conn), batch_size=3)
+    with pytest.raises(Exception) as raised:
+        list(exporter.stream_converted_rows(_source_config(), _simple_table()))
+    assert type(raised.value).__name__ == "OperationalError"
+    assert is_source_transient_error(raised.value) is True
+
+
+def test_export_rows_keeps_the_lost_connection_too():
+    from dsql_migrator.core.exporter import export_rows
+
+    rows = [{"id": i, "name": f"n{i}"} for i in range(1, 8)]
+    conn = _DyingConnection(rows, die_on_page=2)
+
+    class _Writer:
+        def write_header(self, _cols):
+            pass
+
+        def write_row(self, _row):
+            pass
+
+    with pytest.raises(Exception) as raised:
+        export_rows(conn, _simple_table(), _Writer(), batch_size=3)
+    assert type(raised.value).__name__ == "OperationalError"
+
+
+def test_a_normal_and_a_closed_stream_still_commit_the_snapshot():
+    rows = [{"id": i, "name": f"n{i}"} for i in range(1, 5)]
+    conn = _FakeConnection(rows)
+    exporter = TableExporter(engine_factory=lambda _cfg: _FakeEngine(conn), batch_size=2)
+    assert len(list(exporter.stream_converted_rows(_source_config(), _simple_table()))) == 4
+    assert [s for s, _ in conn.executed][-1].strip().upper().startswith("COMMIT")
+    conn2 = _FakeConnection(rows)
+    gen = TableExporter(engine_factory=lambda _cfg: _FakeEngine(conn2), batch_size=2).stream_converted_rows(
+        _source_config(), _simple_table())
+    next(gen)
+    gen.close()  # the consumer stopped early: the snapshot still ends
+    assert [s for s, _ in conn2.executed][-1].strip().upper().startswith("COMMIT")
+
+
+class _GovernedDyingConnection(_FakeConnection):
+    """The connection dies at the governor's status read (the first statement to reach
+    the dead socket between pages): that read raises a disconnect SQLAlchemy flags
+    ``connection_invalidated``; every later statement raises a context-less
+    PendingRollbackError, as a real invalidated Connection does."""
+
+    def __init__(self, rows, die_at_status_read=2):
+        super().__init__(rows, threads_running=[1])
+        self._die_at = die_at_status_read
+        self.dead = False
+        self.invalidated = False
+
+    def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
+        from sqlalchemy.exc import OperationalError, PendingRollbackError
+
+        if self.dead:
+            raise PendingRollbackError("Can't reconnect until invalid transaction is rolled back.")
+        if "THREADS_RUNNING" in str(statement).upper() and self.status_reads + 1 == self._die_at:
+            self.status_reads += 1
+            self.dead = self.invalidated = True
+            raise OperationalError("SHOW GLOBAL STATUS", {}, _pymysql_lost(), connection_invalidated=True)
+        return super().execute(statement, parameters, execution_options)
+
+
+def test_a_drop_first_seen_by_the_governor_still_reads_as_a_lost_connection(monkeypatch):
+    import dsql_migrator.core.exporter as exporter_mod
+    from dsql_migrator.core.introspector import is_source_transient_error
+
+    monkeypatch.setattr(exporter_mod, "_wall_sleep", lambda _s: None)
+    rows = [{"id": i, "name": f"n{i}"} for i in range(1, 9)]
+    conn = _GovernedDyingConnection(rows, die_at_status_read=1)
+    exporter = TableExporter(engine_factory=lambda _cfg: _FakeEngine(conn), batch_size=3,
+                             max_source_threads_running=10)
+    with pytest.raises(Exception) as raised:
+        list(exporter.stream_converted_rows(_source_config(), _simple_table()))
+    assert type(raised.value).__name__ == "OperationalError", type(raised.value)
+    assert is_source_transient_error(raised.value) is True
+
+
+def test_the_status_reads_fail_open_only_on_a_live_connection():
+    from sqlalchemy.exc import OperationalError
+
+    from dsql_migrator.core.exporter import _read_threads_running
+    from dsql_migrator.core.source_dialect import dialect_for
+
+    class _Conn:
+        def __init__(self, exc, invalidated=False):
+            self._exc, self.invalidated = exc, invalidated
+
+        def execute(self, *_a, **_k):
+            raise self._exc
+
+    denied = RuntimeError("SHOW denied")
+    assert _read_threads_running(_Conn(denied)) is None  # fail-open, as before
+    lost = OperationalError("SHOW", {}, _pymysql_lost(), connection_invalidated=True)
+    with pytest.raises(OperationalError):
+        _read_threads_running(_Conn(lost))
+    pg = dialect_for(SourceType.POSTGRES)
+    assert pg.read_active_query_count(_Conn(denied)) is None
+    with pytest.raises(RuntimeError):
+        pg.read_active_query_count(_Conn(RuntimeError("gone"), invalidated=True))
+
+
+def test_a_cancelled_or_failed_read_on_a_live_connection_still_ends_its_snapshot():
+    from dsql_migrator.core.exporter import ExportCancelled, export_rows
+
+    rows = [{"id": i, "name": f"n{i}"} for i in range(1, 8)]
+    conn = _FakeConnection(rows)
+    with pytest.raises(ExportCancelled):
+        list(TableExporter(engine_factory=lambda _c: _FakeEngine(conn), batch_size=2).stream_converted_rows(
+            _source_config(), _simple_table(), should_cancel=lambda: conn.page_queries >= 1))
+    assert [s for s, _ in conn.executed][-1].strip().upper().startswith("COMMIT")
+
+    class _Boom(Exception):
+        pass
+
+    class _Writer:
+        def write_header(self, _cols):
+            pass
+
+        def write_row(self, _row):
+            raise _Boom()
+
+    conn2 = _FakeConnection(rows)
+    with pytest.raises(_Boom):
+        export_rows(conn2, _simple_table(), _Writer(), batch_size=2)
+    assert [s for s, _ in conn2.executed][-1].strip().upper().startswith("COMMIT")
+
+    class _CommitFails(_FakeConnection):
+        def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
+            if str(statement).strip().upper().startswith("COMMIT"):
+                raise RuntimeError("commit failed")
+            return super().execute(statement, parameters, execution_options)
+
+    with pytest.raises(_Boom):  # the original error, never the COMMIT's
+        export_rows(_CommitFails(rows), _simple_table(), _Writer(), batch_size=2)
+
+
+def test_a_commit_failure_after_a_complete_read_still_surfaces():
+    from sqlalchemy.exc import OperationalError
+
+    from dsql_migrator.core.exporter import export_rows
+
+    class _CommitLost(_FakeConnection):
+        def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
+            if str(statement).strip().upper().startswith("COMMIT"):
+                raise OperationalError("COMMIT", {}, _pymysql_lost())
+            return super().execute(statement, parameters, execution_options)
+
+    class _Writer:
+        def write_header(self, _cols):
+            pass
+
+        def write_row(self, _row):
+            pass
+
+    rows = [{"id": i, "name": f"n{i}"} for i in range(1, 4)]
+    with pytest.raises(OperationalError):
+        export_rows(_CommitLost(rows), _simple_table(), _Writer(), batch_size=2)
+    conn = _CommitLost(rows)
+    with pytest.raises(OperationalError):
+        list(TableExporter(engine_factory=lambda _c: _FakeEngine(conn), batch_size=2).stream_converted_rows(
+            _source_config(), _simple_table()))

@@ -6,6 +6,7 @@ columns on the ONE target pass that produces the row count, the isolated fallbac
 verdict policy and the report."""
 
 import re
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import pytest
@@ -433,3 +434,77 @@ def test_a_lost_connection_during_the_proof_is_retried_with_the_proof_never_with
     lost = run(99)
     assert lost.error is not None and lost.matched is False
     assert lost.proof_reason == "table_error"  # never "query_error" with a released table
+
+
+def test_a_lost_source_connection_keeps_the_validation_report():
+    # The snapshot COMMIT on the invalidated connection used to raise PendingRollbackError
+    # out of validate(), discarding every table's result.
+    import pymysql
+    from sqlalchemy.exc import OperationalError, PendingRollbackError
+
+    class _Dying(_FakeSourceConnection):
+        invalidated = False
+
+        def execute(self, statement, parameters=None):
+            if self.invalidated:
+                raise PendingRollbackError("Can't reconnect until invalid transaction is rolled back.")
+            if "`drop_me`" in str(statement) and str(statement).upper().startswith("SELECT"):
+                self.invalidated = True
+                raise OperationalError("SELECT", {}, pymysql.err.OperationalError(2013, "Lost connection"))
+            return super().execute(statement, parameters)
+
+    source = _Dying(counts={"orders": 2, "drop_me": 2, "later": 2})
+    target = _ProofTarget(counts={"orders": 2, "drop_me": 2, "later": 2})
+    report = _validator(source, target).validate(
+        _SOURCE_CONFIG, _TARGET_CONFIG, [_table("orders"), _table("drop_me"), _table("later")])
+    by = {i.table: i for i in report.items}
+    assert by["orders"].matched and by["drop_me"].error and by["later"].error
+    assert not any("COMMIT" in s.upper() for s in source.executed[-1:])  # never on the dead connection
+
+
+def test_a_lost_connection_during_watermark_capture_never_yields_a_watermark():
+    import pymysql
+    from sqlalchemy.exc import OperationalError, PendingRollbackError
+
+    from dsql_migrator.core.watermark import capture_watermark
+
+    class _Conn:
+        invalidated = False
+
+        def execute(self, statement, *a, **k):
+            text = str(statement).upper()
+            if self.invalidated:
+                raise PendingRollbackError("Can't reconnect until invalid transaction is rolled back.")
+            if "START TRANSACTION" in text:
+                return SimpleNamespace(first=lambda: None, fetchall=lambda: [], scalar=lambda: None)
+            self.invalidated = True
+            raise OperationalError("SHOW", {}, pymysql.err.OperationalError(2013, "Lost connection"))
+
+    # Its readers degrade to None by design, so the capture must still FAIL on a lost
+    # connection -- never return a watermark without coordinates.
+    with pytest.raises(Exception):
+        capture_watermark(_Conn(), ["t"])
+
+
+def test_a_lost_source_connection_keeps_the_parallel_validation_report():
+    import pymysql
+    from sqlalchemy.exc import OperationalError, PendingRollbackError
+
+    class _Dying(_FakeSourceConnection):
+        invalidated = False
+
+        def execute(self, statement, parameters=None):
+            if self.invalidated:
+                raise PendingRollbackError("Can't reconnect until invalid transaction is rolled back.")
+            if "`drop_me`" in str(statement) and str(statement).upper().startswith("SELECT"):
+                self.invalidated = True
+                raise OperationalError("SELECT", {}, pymysql.err.OperationalError(2013, "Lost connection"))
+            return super().execute(statement, parameters)
+
+    counts = {"orders": 2, "drop_me": 2}
+    validator = Validator(
+        source_engine_factory=lambda _c: _FakeSourceEngine(_Dying(counts=dict(counts))),
+        target_connection_factory=lambda _t: _ProofTarget(counts=dict(counts)))
+    report = validator.validate(_SOURCE_CONFIG, _TARGET_CONFIG, [_table("orders"), _table("drop_me")], max_workers=2)
+    by = {i.table: i for i in report.items}
+    assert by["orders"].matched and by["drop_me"].error

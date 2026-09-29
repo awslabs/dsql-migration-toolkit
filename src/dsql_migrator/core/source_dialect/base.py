@@ -448,7 +448,8 @@ class SourceDialect(ABC):
         inside the export's open snapshot transaction -- a MySQL ``SHOW`` run on a
         PostgreSQL source is a syntax error that would ABORT that transaction and fail
         every subsequent page read. Best effort: any failure returns ``None`` so the
-        governor fails open (treats it as "don't throttle") and never stalls the load.
+        governor fails open (treats it as "don't throttle") and never stalls the load --
+        except on a LOST connection, whose error is raised so the source retry sees it.
         """
 
     @abstractmethod

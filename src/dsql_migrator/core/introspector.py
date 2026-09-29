@@ -140,6 +140,11 @@ def _mysql_source_transient(exc: BaseException) -> bool:
     cause = getattr(exc, "__cause__", None)
     if cause is not None and cause is not exc:
         candidates.append(cause)
+    # SQLAlchemy raises PendingRollbackError on a connection an EARLIER error invalidated;
+    # it is recoverable exactly when that earlier error (its context) was. Only this type
+    # looks behind itself: any other error raised while handling a drop stays non-transient.
+    if type(exc).__name__ == "PendingRollbackError" and exc.__context__ is not None:
+        return _mysql_source_transient(exc.__context__)
 
     for candidate in candidates:
         # PyMySQL raises OperationalError(code, message) -- the code is args[0].
