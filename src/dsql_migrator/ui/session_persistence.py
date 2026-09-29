@@ -128,11 +128,22 @@ def _restore_exclusion_semantics(
     if snapshot.exclusion_semantics is not None:
         migration_state.restore_legacy_exclusions(snapshot.cdc_lob_exclusions)  # type: ignore[attr-defined]
         return
+    # A snapshot saved while a classification was pending names exactly its candidates;
+    # an entry ticked since is an overlay entry. A genuine pre-overlay snapshot has none:
+    # every entry is a candidate.
+    candidates = (
+        snapshot.pending_legacy_candidates
+        if snapshot.pending_legacy_candidates is not None
+        else snapshot.cdc_lob_exclusions
+    )
+    stored = set(snapshot.cdc_lob_exclusions)
     entries = frozenset(
         (table, column)
-        for table, sep, column in (e.partition(":") for e in snapshot.cdc_lob_exclusions)
+        for table, sep, column in (e.partition(":") for e in candidates if e in stored)
         if sep and table and column
     )
+    if not entries:
+        return
     stack_possible = (
         snapshot.migration_type in ("cdc_only", "full_load_and_cdc")
         or bool(snapshot.cdc_deploy_job_id)
@@ -158,6 +169,21 @@ def _exclusion_semantics_version() -> int:
     return EXCLUSION_SEMANTICS_VERSION
 
 
+def _pending_legacy_candidates(migration_state: object) -> "Optional[list[str]]":
+    """The restored pre-overlay entries still awaiting classification, flattened; None
+    when nothing is pending."""
+    pending = getattr(migration_state, "exclusion_classification_pending", lambda: False)()
+    if not pending:
+        return None
+    facts = migration_state.restored_exclusion_facts()  # type: ignore[attr-defined]
+    stored = migration_state.lob_exclusions()  # type: ignore[attr-defined]
+    return sorted(
+        f"{table}:{column}"
+        for table, column in (getattr(facts, "entries", ()) or ())
+        if column in stored.get(table, set())
+    )
+
+
 def _exclusion_semantics_sig(migration_state: object) -> tuple:
     """Cheap dirty-check part: finalizing a classification, a legacy-set change or the
     in-use flag flipping must be saved."""
@@ -167,6 +193,7 @@ def _exclusion_semantics_sig(migration_state: object) -> tuple:
         bool(pending),
         tuple(_flatten_lob_exclusions(legacy)),
         bool(getattr(migration_state, "overlay_ledger_in_use", False)),
+        tuple(_pending_legacy_candidates(migration_state) or ()),
     )
 
 
@@ -223,6 +250,7 @@ def capture_session_snapshot(
             getattr(migration_state, "final_legacy_exclusions", dict)()
         ),
         overlay_ledger_in_use=bool(getattr(migration_state, "overlay_ledger_in_use", False)),
+        pending_legacy_candidates=_pending_legacy_candidates(migration_state),
         cdc_connector_names=list(
             getattr(migration_state, "cdc_connector_names", []) or []
         ),

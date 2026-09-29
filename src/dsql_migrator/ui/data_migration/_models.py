@@ -1723,6 +1723,18 @@ class RestoredExclusionFacts:
     stage1_passed: bool = False
 
 
+def _chunk_moved(chunk) -> bool:
+    """Evidence a Full Load chunk wrote (or tried to write) rows: it left PENDING, was
+    attempted, or counted loaded / skipped / quarantined rows."""
+    return (
+        getattr(chunk, "status", "PENDING") != "PENDING"
+        or (getattr(chunk, "attempts", 0) or 0) > 0
+        or (getattr(chunk, "rows_loaded", 0) or 0) > 0
+        or (getattr(chunk, "rows_skipped", 0) or 0) > 0
+        or (getattr(chunk, "rows_quarantined", 0) or 0) > 0
+    )
+
+
 def classify_restored_exclusions(migration_state, job_manager=None) -> "Optional[bool]":
     """Classify a restored pre-overlay session's exclusions ONLY on evidence of writes.
 
@@ -1759,11 +1771,20 @@ def classify_restored_exclusions(migration_state, job_manager=None) -> "Optional
                 job = None
             if job is None:
                 return _settle(True)
-            if any(
-                chunk.status != "PENDING" or (chunk.rows_loaded or 0) > 0
-                for chunk in getattr(job, "chunks", ()) or ()
-            ):
+            if any(_chunk_moved(chunk) for chunk in getattr(job, "chunks", ()) or ()):
                 return _settle(True)
+            # The newest job can be all PENDING (a retry re-seeds its chunks, a run that
+            # ended before its first table leaves them untouched) while an earlier run
+            # of the lineage moved rows: look at every job the store knows for these
+            # tables before calling it clean.
+            tables = {table for table, _column in facts.entries}
+            lister = getattr(job_manager, "list_jobs", None)
+            for other in (lister() if callable(lister) else ()) or ():
+                if any(
+                    chunk.chunk_id in tables and _chunk_moved(chunk)
+                    for chunk in getattr(other, "chunks", ()) or ()
+                ):
+                    return _settle(True)
         if facts.connector_names or facts.cdc_started:
             return _settle(True)
         if not facts.stack_possible:

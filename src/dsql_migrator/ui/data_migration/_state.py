@@ -502,15 +502,14 @@ class DataMigrationState:
 
         The selection is migration-wide (H13): it drops the column from both the
         Full Load INSERT list and CDC capture, so the two paths never disagree. This is
-        the OPERATOR path: an exclusion made here is a new-semantics (overlay) entry, so
-        it marks the ledger in use; un-ticking a legacy entry drops its legacy mark (a
-        re-tick makes it an overlay entry). The in-use mark is never cleared here.
+        the OPERATOR path: an exclusion made here is a new-semantics (overlay) entry;
+        un-ticking a legacy entry drops its legacy mark (a re-tick makes it an overlay
+        entry). A tick alone does not mark the ledger in use -- a run that overlays does.
         """
         with self._lock:
             current = self._excluded_lob_columns.setdefault(table, set())
             if exclude:
                 current.add(column)
-                self._overlay_ledger_in_use = True
             else:
                 current.discard(column)
                 if not current:
@@ -570,7 +569,8 @@ class DataMigrationState:
 
     def finalize_exclusion_classification(self, *, legacy: bool) -> None:
         """Settle a pending classification: legacy keeps the restored entries omit-only;
-        an upgrade makes them overlay entries (and so marks the ledger in use)."""
+        an upgrade makes them overlay entries (the first run that overlays them marks the
+        ledger in use)."""
         with self._lock:
             facts = self._restored_exclusion_facts
             if facts is None:
@@ -582,8 +582,6 @@ class DataMigrationState:
                         self._legacy_exclusions.setdefault(table, set()).add(column)
             else:
                 self._legacy_exclusions = {}
-                if facts.entries:
-                    self._overlay_ledger_in_use = True
             self._restored_exclusion_facts = None
 
     def restore_legacy_exclusions(self, flat: "Sequence[str]") -> None:

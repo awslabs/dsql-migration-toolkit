@@ -432,7 +432,9 @@ def test_the_header_run_asks_for_the_dialog_only_when_the_overlay_is_in_play():
     state.set_lob_exclusion(PAGES, "summary", True)
     assert dm.overlay_in_play(state, inventory) is True
     state.set_lob_exclusion(PAGES, "summary", False)
-    assert dm.overlay_in_play(state, inventory) is True  # the ledger may still hold a record
+    assert dm.overlay_in_play(state, inventory) is False  # a tick alone leaves nothing behind
+    state.mark_overlay_ledger_in_use()  # a run overlaid (or a ledger read found a record)
+    assert dm.overlay_in_play(state, inventory) is True
 
 
 def test_a_pending_confirm_opens_the_start_dialog_once(monkeypatch):

@@ -2347,11 +2347,13 @@ class _OverlayPrepass:
                 if _blocked_by_unreadable_ledger(inputs, table.name):
                     self._fail(table.name, OverlayLedgerUnavailableError.MESSAGE)
             return
-        # Step 1: ONE facts read.
+        # Step 1: ONE facts read, of the tables promotion and the verdict need -- the
+        # append tables. A replace table is read after its recreate (step 5); reading it
+        # here would fail it on a transient error for facts nobody uses.
         read = [
             t for t in self._tables
-            if t.name in self.overlay
-            or (t.name in self.recorded_only and not self._is_replace(t.name))
+            if not self._is_replace(t.name)
+            and (t.name in self.overlay or t.name in self.recorded_only)
         ]
         if read:
             columns = {
@@ -2450,6 +2452,8 @@ class _OverlayPrepass:
         view = inputs.overlay_record
         if view is None:
             return  # unreadable: the overlay tables already failed
+        if self._handle.cancelled:
+            return  # a Stop: record nothing for tables the run did not get to
         # Step 5: ONE facts read of the recreated overlay tables.
         again = [
             t for t in self._tables
@@ -2483,6 +2487,8 @@ class _OverlayPrepass:
             if not self._alive(name) or (name not in self.overlay and name not in self.recorded_only):
                 continue
             just_recreated = name in recreated_names
+            if self._is_replace(name) and not just_recreated:
+                continue  # a replace table the recreate loop did not reach
             if name in self.overlay:
                 table_facts = recreated_facts[name] if just_recreated else self._facts.get(name)
                 if table_facts is None or not table_facts.exists:

@@ -744,7 +744,8 @@ def test_process_prepass_fails_only_the_failing_table_counted_once(monkeypatch, 
     replace = {"docs"} if where in ("step4-recreate", "step5-unknown", "step6-alter") else set()
     rig = _ProcRig(monkeypatch, replace=replace, rows={"docs": where == "step3-rows"})
     if where in ("step1-unknown", "step5-unknown"):
-        rig.migrator._overlay_facts_reader = _faulty_facts(rig, on_call=1 if where == "step1-unknown" else 2)
+        # A replace table is first read after its recreate (step 5), so that is call 1 too.
+        rig.migrator._overlay_facts_reader = _faulty_facts(rig, on_call=1)
     elif where == "step1-raise":
         rig.migrator._overlay_facts_reader = lambda *a, **k: (_ for _ in ()).throw(Conn08e())
     elif where == "step2-undecidable":
@@ -1120,7 +1121,7 @@ def test_overlay_inputs_are_the_overlay_legacy_sets_and_the_ledger_handle():
     state.overlay_ledger = handle = object()
     got = dm._overlay_inputs(state, SourceInventory(tables=[DOCS]), None, True)
     assert got == {"overlay_columns": {"docs": frozenset({"body"})}, "legacy_exclusions": {"docs": frozenset({"note"})},
-                   "overlay_ledger": handle, "overlay_ledger_in_use": False}
+                   "overlay_ledger": handle, "overlay_ledger_in_use": True}  # a run that overlays marks it
 
 
 def test_the_app_builds_the_ledger_beside_the_session_state_without_io(tmp_path):
@@ -1172,3 +1173,36 @@ def test_a_legacy_session_makes_no_alter_and_no_ledger_write(events):
                legacy={"docs": frozenset({"body"})}, ledger=_RaisingStore())
     assert rig.run() == {"docs": "DONE"} and rig.alters() == []
     assert rig.importer.calls == [("docs", OnConflictMode.SKIP_EXISTING, ["id", "note"])]  # still omitted
+
+
+
+def test_a_stop_before_a_replace_table_is_recreated_records_nothing_for_it(monkeypatch, events):
+    FRESH["t2"] = {"id": {"notnull": True, "default": None}, "c": {"notnull": True, "default": "'v'::text"}}
+    try:
+        t2 = TableDef(name="t2", primary_key=["id"], columns=[ColumnDef(name="id", mysql_type="int", nullable=False),
+                                                               ColumnDef(name="c", mysql_type="text")])
+        rig = _ProcRig(monkeypatch, tables=(DOCS, t2), replace={"docs", "t2"}, rows={"docs": True, "t2": True},
+                       excluded={"docs": frozenset({"body"}), "t2": frozenset({"c"})})
+        stopped = {"v": False}
+        real_recreate = rig._recreate
+
+        def recreate(table):
+            out = real_recreate(table)
+            stopped["v"] = True  # the operator presses Stop right after the first recreate
+            return out
+
+        rig.migrator._table_recreator = recreate
+        real_update = None
+
+        from dsql_migrator.core.job_manager import JobHandle
+        monkeypatch.setattr(JobHandle, "cancelled", property(lambda self: stopped["v"]))
+        rig.run()
+        assert rig.recreated == ["docs"] and rig.record("t2") is None and rig.alters() == []
+    finally:
+        FRESH.pop("t2", None)
+
+
+def test_a_replace_overlay_table_is_not_read_before_its_recreate(monkeypatch, events):
+    rig = _ProcRig(monkeypatch, tables=(DOCS,), replace={"docs"}, rows={"docs": True})
+    assert rig.run() == {"docs": "DONE"}
+    assert rig.facts_calls[0] == (["docs"], False)  # the first read is step 5's, after the recreate

@@ -131,6 +131,11 @@ class SessionSnapshot(BaseModel):
     # True once the session used the overlay ledger (a table can owe a DEFAULT at cut
     # over even with no exclusion left). Cleared only by Start over.
     overlay_ledger_in_use: bool = False
+    # While a restored pre-overlay session's classification is still pending: exactly the
+    # entries that came from that old snapshot ("table:column"). An exclusion ticked since
+    # is a new-semantics entry and must not become a legacy candidate on the next restore.
+    # None = not pending (or a genuine pre-overlay snapshot, where every entry is one).
+    pending_legacy_candidates: Optional[list[str]] = None
     # The in-flight (or just-finished) CDC lifecycle job (deploy-infra / start /
     # stop / delete) and which operation it is, so a reconnecting session can keep
     # showing that job's ordered stages instead of dropping them on a restart. The

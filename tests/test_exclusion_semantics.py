@@ -134,7 +134,9 @@ def test_only_infra_inputs_upgrade_a_full_load_only_session_at_restore():
     restored = _restore(_old(migration_type="full_load_only", migration_job_id=None,
                              cdc_infra_inputs={"VpcId": "vpc-1"}), _Jobs())
     assert restored.legacy_exclusions() == {} and not restored.exclusion_classification_pending()
-    assert restored.overlay_ledger_in_use is True  # upgraded entries are saved exclusions under the overlay
+    # Upgraded entries are overlay entries; the first run that overlays them marks the
+    # ledger in use (nothing was recorded yet).
+    assert restored.overlay_ledger_in_use is False
 
 
 def test_a_possible_cdc_stack_waits_for_the_probe_and_pending_behaves_as_legacy():
@@ -149,7 +151,7 @@ def test_a_possible_cdc_stack_waits_for_the_probe_and_pending_behaves_as_legacy(
     # Infra only, no committed offset: nothing was written -> upgrade.
     restored.set_cdc_stack_phase("infra")
     assert classify_restored_exclusions(restored) is False
-    assert restored.legacy_exclusions() == {} and restored.overlay_ledger_in_use
+    assert restored.legacy_exclusions() == {}
 
 
 @pytest.mark.parametrize("evidence", ["committed", "running", "cdc_started", "new_job"])
@@ -205,20 +207,27 @@ def test_the_cdc_probe_settles_a_pending_classification(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_the_in_use_flag_is_set_by_an_operator_exclusion_and_only_cleared_by_start_over():
+def test_the_in_use_flag_is_set_by_a_run_that_overlays_not_by_a_tick():
+    import dsql_migrator.ui.data_migration as dm
+
+    inventory = _inventory()
     state = DataMigrationState()
     state.restore_lob_exclusion("app.t", "c")
-    assert state.overlay_ledger_in_use is False  # a restore is not an operator exclusion
+    assert state.overlay_ledger_in_use is False  # a restore is not a use
     state.set_lob_exclusion("app.t", "d", True)
+    state.set_lob_exclusion("app.t", "d", False)
+    assert state.overlay_ledger_in_use is False  # a tick and an untick: nothing recorded
+    state.set_lob_exclusion("app.t", "d", True)
+    dm._overlay_inputs(state, inventory, None, True)  # a run that overlays d is built
     assert state.overlay_ledger_in_use
     state.set_lob_exclusion("app.t", "d", False)
     state.set_lob_exclusion("app.t", "c", False)
-    assert state.overlay_ledger_in_use  # a table can still owe a DEFAULT
+    assert state.overlay_ledger_in_use  # that run may have left a record
     snap = _capture(state)
     assert snap.overlay_ledger_in_use and _restore(snap).overlay_ledger_in_use
     store = DataMigrationStore()
     live = store.get_or_create("s1")
-    live.set_lob_exclusion("app.t", "c", True)
+    live.mark_overlay_ledger_in_use()
     store.reset_in_place("s1")
     assert live.overlay_ledger_in_use is False
 
@@ -228,7 +237,7 @@ def test_unticking_a_legacy_entry_drops_its_mark_and_a_retick_makes_it_an_overla
     restored.set_lob_exclusion("app.t", "c", False)
     assert restored.legacy_exclusions() == {} and restored.lob_exclusions() == {}
     restored.set_lob_exclusion("app.t", "c", True)
-    assert restored.legacy_exclusions() == {} and restored.overlay_ledger_in_use
+    assert restored.legacy_exclusions() == {} and restored.lob_exclusions() == {"app.t": {"c"}}
 
 
 def test_the_signature_moves_on_finalization_legacy_and_the_flag():
@@ -305,3 +314,35 @@ def test_the_capture_list_is_byte_identical_whatever_the_classification():
         capture = cdc_capture_exclusions(_restore(snap, _Jobs()), inventory, inventory.tables)
         values.append((capture.value, capture.sent, tuple(sorted(capture.structured.items()))))
     assert values[0] == values[1] == values[2]
+
+
+
+def test_a_pending_session_saved_again_keeps_only_its_restored_candidates():
+    # Review fix: a re-save while pending must not turn the operator's NEW ticks into
+    # legacy candidates on the next restore.
+    restored = _restore(_old(migration_type="full_load_and_cdc"), _Jobs())
+    assert restored.exclusion_classification_pending()
+    restored.set_lob_exclusion("app.t", "d", True)
+    snap = SessionSnapshot.model_validate_json(_capture(restored).model_dump_json())
+    assert snap.exclusion_semantics is None and snap.pending_legacy_candidates == ["app.t:c"]
+    again = _restore(snap, _Jobs())
+    assert again.legacy_exclusions() == {"app.t": frozenset({"c"})}  # d stays an overlay entry
+    again.set_cdc_stack_phase("running")
+    assert classify_restored_exclusions(again) is True
+    assert again.final_legacy_exclusions() == {"app.t": frozenset({"c"})}
+
+
+def test_an_earlier_run_of_the_lineage_is_evidence_even_when_the_newest_job_is_all_pending():
+    j1 = MigrationJob(job_id="J1", chunks=[ChunkState(chunk_id="app.t", status="DONE", rows_loaded=100)])
+    j2 = MigrationJob(job_id="J2", chunks=[ChunkState(chunk_id="app.t", status="PENDING")])
+
+    class _Listing(_Jobs):
+        def list_jobs(self):
+            return list(self.jobs.values())
+
+    restored = _restore(_old(migration_type="full_load_only", migration_job_id="J2"), _Listing({"J1": j1, "J2": j2}))
+    assert restored.legacy_exclusions() == {"app.t": frozenset({"c"})}
+    # A retry-seeded chunk (PENDING, rows 0, attempts kept) is evidence on its own.
+    j3 = MigrationJob(job_id="J3", chunks=[ChunkState(chunk_id="app.t", status="PENDING", attempts=1)])
+    restored = _restore(_old(migration_type="full_load_only", migration_job_id="J3"), _Jobs({"J3": j3}))
+    assert restored.legacy_exclusions() == {"app.t": frozenset({"c"})}

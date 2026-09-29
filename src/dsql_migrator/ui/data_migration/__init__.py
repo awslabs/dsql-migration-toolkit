@@ -2091,7 +2091,10 @@ def build_data_migration_screen(
             # existing pipeline) is gone and the user can pay for a second cluster.
             # Sub-steps render in order (Prerequisites -> Full Load -> CDC), so arming
             # after them would leave the first pass with an unprobed state.
-            if has_cdc:
+            # Also while a restored pre-overlay session's exclusions are still being
+            # classified: the read-only probe is their stage-2 evidence, and a Full-load-
+            # only screen would otherwise never run it.
+            if has_cdc or migration_state.exclusion_classification_pending():
                 import time as _disc_time
                 from nicegui import run as _disc_run
 
@@ -2810,11 +2813,19 @@ def _overlay_inputs(migration_state, inventory, applied_conversions, preserve_fo
     (the columns made nullable with no DEFAULT), the omit-only legacy set, the ledger
     handle and whether the session has used it. One place for the Start and retry
     builders, so both runs overlay the same columns."""
+    overlay = overlay_lob_exclusions(
+        migration_state, inventory, applied_conversions=applied_conversions,
+        preserve_foreign_keys=preserve_foreign_keys,
+    )
+    if overlay:
+        # A run that overlays is what can leave a record behind (a dropped DEFAULT, rows
+        # holding NULL): from now on this session's runs consult the ledger. Marked here,
+        # before the job is submitted, so the next snapshot save carries it.
+        mark = getattr(migration_state, "mark_overlay_ledger_in_use", None)
+        if callable(mark):
+            mark()
     return {
-        "overlay_columns": overlay_lob_exclusions(
-            migration_state, inventory, applied_conversions=applied_conversions,
-            preserve_foreign_keys=preserve_foreign_keys,
-        ),
+        "overlay_columns": overlay,
         "legacy_exclusions": legacy_lob_exclusions(
             migration_state, inventory, applied_conversions=applied_conversions,
             preserve_foreign_keys=preserve_foreign_keys,
