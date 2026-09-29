@@ -494,24 +494,26 @@ def test_missing_column_block_reason_uses_the_recorded_conversion_and_effective_
     assert missing_column_block_reason(state, INV, selected_tables=["shop.orders"]) is None
 
 
-def test_deploy_gate_blocks_a_missing_column_only_before_the_lock():
+def test_deploy_gate_blocks_a_certain_missing_column_whatever_the_lock():
+    """42703's remedy is Schema Conversion, which no lock blocks -- so it is not tied to the
+    exclusion card's lock; it is skipped only while CDC streams."""
     from dsql_migrator.ui.data_migration._cdc_ui import _stored_exclusion_deploy_block
 
-    from tests.test_ui_data_migration import _StubJobManager
+    from tests.test_ui_data_migration import _StubJob, _StubJobManager
 
     state = _state_with([])
     state.set_applied_conversions(
         {"shop.users": SimpleNamespace(target_ddl='CREATE TABLE u ("id" INT PRIMARY KEY, "email" TEXT)')},
         preserve_foreign_keys=True,
     )
-    assert "shop.users.bio is not in your Aurora DSQL table" in _stored_exclusion_deploy_block(
-        state, _StubJobManager({}), INV, None)
-    from tests.test_ui_data_migration import _StubJob
-
-    state.job_id = "job-1"  # data moved: the card is locked, the gate no longer blocks
+    msg = "shop.users.bio is not in your Aurora DSQL table"
+    assert msg in _stored_exclusion_deploy_block(state, _StubJobManager({}), INV, None)
+    state.job_id = "job-1"  # the card is locked -- the 42703 gate still holds
+    assert msg in _stored_exclusion_deploy_block(
+        state, _StubJobManager({"job-1": _StubJob("COMPLETED")}), INV, None)
+    state.set_cdc_stack_phase("running", status="UPDATE_COMPLETE")  # streaming: skipped
     assert _stored_exclusion_deploy_block(
         state, _StubJobManager({"job-1": _StubJob("COMPLETED")}), INV, None) is None
-
 
 def test_memory_pressure_copy_does_not_offer_a_locked_exclusion_mid_load():
     """The warning fires DURING a load, when the exclusion card is already locked."""
@@ -589,29 +591,25 @@ def _session(status=None):
     return SimpleNamespace(workflow=wf)
 
 
-def test_exclusion_card_locked_matches_each_cards_own_lock():
+def test_exclusion_card_locked_keys_on_the_recorded_full_load_not_the_step():
     from dsql_migrator.core.models import StepStatus
     from dsql_migrator.ui.data_migration import MigrationType, exclusion_card_locked
 
     from tests.test_ui_data_migration import _StubJob, _StubJobManager
 
-    state = _state_with([])
-    state.migration_type = MigrationType.FULL_LOAD_AND_CDC
     empty = _StubJobManager({})
-    assert exclusion_card_locked(state, empty, _session()) is False
-    state.job_id = "job-1"
-    # A live job (or the step DONE) locks the Full Load card; a PRUNED job id does not.
-    assert exclusion_card_locked(state, _StubJobManager({"job-1": _StubJob("COMPLETED")}), _session())
-    assert exclusion_card_locked(state, empty, _session(StepStatus.FAILED)) is False
-    assert exclusion_card_locked(state, empty, _session(StepStatus.DONE))
-    # CDC only: its card locks on the recorded job id itself (the load ran under another type).
-    state.migration_type = MigrationType.CDC_ONLY
-    assert exclusion_card_locked(state, empty, _session())
-    # A deployed stack locks both.
+    for mtype in (MigrationType.FULL_LOAD_AND_CDC, MigrationType.CDC_ONLY):
+        state = _state_with([])
+        state.migration_type = mtype
+        # CDC alone promotes the FULL_LOAD step to DONE: that is NOT a committed Full Load.
+        assert exclusion_card_locked(state, empty, _session(StepStatus.DONE)) is False, mtype
+        state.job_id = "job-1"
+        # A recorded Full Load locks, whether or not its job record survived.
+        assert exclusion_card_locked(state, empty, _session()), mtype
+        assert exclusion_card_locked(state, _StubJobManager({"job-1": _StubJob("COMPLETED")}), None)
     fresh = _state_with([])
     fresh.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
-    assert exclusion_card_locked(fresh, empty, _session())
-
+    assert exclusion_card_locked(fresh, empty, _session())  # a stack locks too
 
 def test_every_gate_judges_the_tables_the_render_resolved():
     from tests.test_ui_data_migration import _StubJobManager
@@ -664,12 +662,15 @@ def test_post_lock_copy_names_the_real_cause_and_what_each_entry_does():
     assert after[("shop.orders", "total2")].severity is IssueSeverity.INFO
 
     state = _state_with([("shop.users", "id")])
-    for data_moved, expected in ((True, "already moved under this set"),
-                                 (False, "delete the CDC infrastructure on the CDC step first")):
+    for note, expected in (("The data already moved under this set, so it is left as it is.",
+                            "already moved under this set"),
+                           ("The CDC infrastructure was deployed with this set; to change it, "
+                            "delete the CDC infrastructure on the CDC step first.",
+                            "delete the CDC infrastructure on the CDC step first")):
         ui = _RecordingUi()
         _cdc_ui._render_cdc_lob_exclusion_panel(
             ui, state, INV, lambda: None, locked=True, lock_reason="Locked.",
-            migration_wide=True, data_moved=data_moved)
+            migration_wide=True, after_lock_note=note)
         joined = " ".join(ui.texts)
         assert expected in joined, (data_moved, joined)
         assert "1 saved column exclusion does not apply as saved" in joined

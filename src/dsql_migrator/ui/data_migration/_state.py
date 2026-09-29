@@ -18,6 +18,7 @@ unchanged.
 
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -37,6 +38,8 @@ from dsql_migrator.core.models import (
 
 from dsql_migrator.ui.data_migration._models import MigrationType
 from dsql_migrator.ui.data_migration._cdc_status import CdcActivitySummary
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class DataMigrationState:
@@ -184,6 +187,13 @@ class DataMigrationState:
         # (``_models.exclusion_scope``); the stored ``selection`` alone is the empty "= all"
         # default until the picker is touched. Transient, like the two above.
         self._resolved_selection: "Optional[list[str]]" = None
+        # The render's LIVE source for the three facts above (resolved selection, applied
+        # conversion, live target columns): a function the Data Migration screen registers,
+        # so every gate -- including the page header's Run, evaluated BEFORE the content
+        # records anything, and a click right after a picker tick with no re-render --
+        # judges the current inputs, not the previous render's snapshot. The recorded
+        # values stay the fallback (no screen built yet: a restored session, a test).
+        self._exclusion_inputs_resolver = None
         # How the operator chose the CDC start point: "auto" (gapless from the
         # Full Load watermark) or "manual" (an explicit GTID / binlog position).
         # An explicit mode (vs. inferring it from whether an override is set)
@@ -531,10 +541,37 @@ class DataMigrationState:
             self._applied_conversions = dict(applied)
             self._preserve_foreign_keys = bool(preserve_foreign_keys)
 
-    def applied_conversions(self) -> "tuple[dict[str, object], bool]":
-        """``(applied conversions, preserve_foreign_keys)`` from the last render."""
+    def applied_conversions(self) -> "tuple[Mapping[str, object], bool]":
+        """``(applied conversions, preserve_foreign_keys)``: live, else the last render's."""
+        inputs = self.exclusion_inputs()
+        if inputs is not None:
+            return inputs.applied, inputs.preserve_foreign_keys
         with self._lock:
             return dict(self._applied_conversions), self._preserve_foreign_keys
+
+    def set_exclusion_inputs_resolver(self, resolver) -> None:
+        """Register the screen's live exclusion-inputs function (see the attribute)."""
+        with self._lock:
+            self._exclusion_inputs_resolver = resolver
+
+    def exclusion_inputs(self):
+        """The live exclusion inputs, or ``None`` (no resolver, or it cannot resolve).
+
+        Called OUTSIDE the state lock: the resolver reads this state itself.
+        """
+        resolver = self._exclusion_inputs_resolver
+        if resolver is None:
+            return None
+        try:
+            return resolver()
+        except Exception:  # noqa: BLE001 - a gate must fall back, never crash a render
+            _LOGGER.warning("exclusion inputs could not be resolved", exc_info=True)
+            return None
+
+    def live_target_columns(self) -> "Optional[Mapping[str, frozenset[str]]]":
+        """Each live target table's columns (from the target catalog), or ``None``."""
+        inputs = self.exclusion_inputs()
+        return None if inputs is None else inputs.live_columns
 
     def set_resolved_selection(self, names: "Sequence[str]") -> None:
         """Record the table selection the render resolved (see ``_resolved_selection``)."""
@@ -542,7 +579,10 @@ class DataMigrationState:
             self._resolved_selection = list(names)
 
     def resolved_selection(self) -> "Optional[list[str]]":
-        """The last render's resolved table selection, or ``None`` before any render."""
+        """The resolved table selection: live, else the last render's, else ``None``."""
+        inputs = self.exclusion_inputs()
+        if inputs is not None:
+            return list(inputs.selected)
         with self._lock:
             return None if self._resolved_selection is None else list(self._resolved_selection)
 

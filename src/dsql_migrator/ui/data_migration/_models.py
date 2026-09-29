@@ -1626,6 +1626,33 @@ def scope_lob_candidates(
     return [c for c in candidates if c.table in stored]
 
 
+@dataclass(frozen=True)
+class ExclusionInputs:
+    """What every exclusion gate judges, resolved LIVE by the Data Migration screen.
+
+    ``selected`` -- the tables the migration moves (the picker, else the Schema Conversion
+    default); ``applied`` -- the applied conversion (edits honoured); ``live_columns`` --
+    each existing target table's columns from the target catalog (``None`` when there is
+    no current catalog).
+    """
+
+    selected: "list[str]"
+    applied: "Mapping[str, object]"
+    preserve_foreign_keys: bool
+    live_columns: "Optional[Mapping[str, frozenset[str]]]" = None
+
+
+def live_target_columns_of(target_inventory) -> "Optional[dict[str, frozenset[str]]]":
+    """``{schema.table: column names}`` of the target catalog's tables, or ``None``."""
+    if target_inventory is None:
+        return None
+    return {
+        f"{rel.schema_name}.{rel.name}": frozenset(c.name for c in rel.columns)
+        for schema in getattr(target_inventory, "schemas", None) or ()
+        for rel in getattr(schema, "tables", None) or ()
+    }
+
+
 def exclusion_context_for(
     migration_state,
     inventory,
@@ -1787,16 +1814,27 @@ def missing_column_block_reason(
     inventory,
     *,
     selected_tables: "Optional[Sequence[str]]" = None,
+    job_manager=None,
 ) -> "Optional[str]":
-    """The gate text for source columns the applied target DDL lacks, or ``None``.
+    """The gate text for source columns the load would fail on (42703), or ``None``.
 
     Judged over the tables this migration moves (``selected_tables``, else
-    :func:`exclusion_scope`, else every table) against the applied conversion the last
-    render recorded, minus the EFFECTIVE exclusions -- an excluded column is not written,
-    so it is not a problem. Unknown (no recorded conversion yet) means no claim.
+    :func:`exclusion_scope`, else every table) against the applied conversion, minus the
+    EFFECTIVE exclusions -- an excluded column is not written, so it is not a problem.
+    Only a CERTAIN failure is reported: a column the applied DDL lacks is let through when
+    the live target table (from the target catalog) still has it, because an append into
+    that table succeeds -- as it did in 0.1.561 -- whatever an unapplied edit says. Not
+    tied to the exclusion card's lock (the remedy is Schema Conversion, which a stack does
+    not block); skipped while CDC streams (Schema Conversion Apply and Start Full Load are
+    held then anyway). Unknown (no conversion yet) means no claim.
     """
     if inventory is None or not getattr(inventory, "tables", None):
         return None
+    if job_manager is not None:
+        from dsql_migrator.ui.data_migration._cdc_state import cdc_streaming_started
+
+        if cdc_streaming_started(migration_state, job_manager):
+            return None
     getter = getattr(migration_state, "applied_conversions", None)
     applied, _preserve = getter() if callable(getter) else ({}, True)
     if not applied:
@@ -1809,6 +1847,14 @@ def missing_column_block_reason(
     missing = missing_target_columns(
         tables, applied, effective_lob_exclusions(migration_state, inventory)
     )
+    live_getter = getattr(migration_state, "live_target_columns", None)
+    live = live_getter() if callable(live_getter) else None
+    if live:
+        missing = {
+            table: kept
+            for table, cols in missing.items()
+            if (kept := tuple(c for c in cols if c not in live.get(table, frozenset())))
+        }
     if not missing:
         return None
     pairs = [f"{table}.{column}" for table, cols in missing.items() for column in cols]
@@ -1904,9 +1950,11 @@ class CdcCaptureExclusions:
     (``core.cdc.format_column_exclude_value``) and ``legacy`` the exact 0.1.561 value for
     the same session (raw stored set, every inventory table's generated columns, the
     unescaped formatter). ``sent`` is what Start CDC sends against the stack recorded by
-    the last discovery -- the preview shows it, so preview == sent. ``error`` blocks
-    Deploy and Start (a comma in a name, or over CloudFormation's 4,096-byte parameter);
-    ``inexact`` lists the names a stack KEPT on the legacy form does not match exactly.
+    the last discovery -- the preview shows it, so preview == sent. ``error`` (the value is
+    over CloudFormation's 4,096-byte parameter; never for a value the stack already
+    carries) blocks Deploy, Start CDC and -- for Full load + CDC -- Start Full Load, each
+    with the remedy true in its state; ``inexact`` lists the names a stack KEPT on the
+    legacy form does not match exactly.
     """
 
     structured: "dict[str, list[str]]"
@@ -1952,24 +2000,23 @@ def cdc_capture_exclusions(
         if sent == legacy:
             inexact = tuple(column_exclude_inexact_entries(legacy_columns, captured))
     else:
-        commas = [
-            f"{t}.{c}" for t, cols in structured.items() for c in cols if "," in f"{t}.{c}"
-        ]
+        # A comma in a name is carried escaped (\\,), so only the size can refuse. The
+        # text states the FACT; each caller appends the remedy that is true in its state
+        # (fewer exclusions while the card is editable, the lock's own remedy otherwise).
         size = len(sent.encode("utf-8"))
-        if commas:
-            error = (
-                f"{', '.join(commas[:3])}: a comma in a name cannot be carried in the CDC "
-                "capture list, which is comma-separated. Remove this exclusion before "
-                "deploying or starting CDC."
-            )
-        elif size > CDC_PARAMETER_BYTE_LIMIT:
+        if size > CDC_PARAMETER_BYTE_LIMIT:
             error = (
                 f"The column exclusions need {size:,} bytes in the CDC capture "
                 f"configuration, over CloudFormation's {CDC_PARAMETER_BYTE_LIMIT:,}-byte "
-                "limit for one parameter. Exclude fewer columns before deploying or "
-                "starting CDC."
+                "limit for one parameter."
             )
     return CdcCaptureExclusions(structured, value, legacy, sent, error, inexact)
+
+
+# The remedy for a capture-size refusal while the exclusion card is still editable.
+CAPTURE_SIZE_REMEDY_UNLOCKED = (
+    "Exclude fewer columns under 'Oversized LOB columns' above first."
+)
 
 
 # DSQL caps a single value at 1 MiB and the MSK Serverless broker caps a message

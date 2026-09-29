@@ -36,15 +36,20 @@ def _t(name, cols, pk=("id",), generated=()):
 def _debezium_excludes(value, qualified):
     """Would Debezium drop ``db.table.column`` given this ColumnExcludeList value?
 
-    Java accepts a leading global ``(?-i)``; Python only the scoped ``(?-i:...)``, which
-    means the same thing for a whole-entry prefix.
+    Emulates debezium-core 2.7.4: the list is split on UNESCAPED commas, each entry is
+    ``String.trim()``-ed, then compiled CASE_INSENSITIVE and fully matched. Java accepts a
+    leading global ``(?-i)``; Python only the scoped ``(?-i:...)``, which means the same
+    thing for a whole-entry prefix. (The same cases were checked against the real jar.)
     """
+    from dsql_migrator.core.cdc import split_column_exclude_value
+
     def _py(entry):
+        entry = entry.strip(" \t\r\n\x00\x0b\x0c")
         return f"(?-i:{entry[5:]})" if entry.startswith("(?-i)") else entry
 
     return any(
         re.fullmatch(_py(entry), qualified, re.IGNORECASE)
-        for entry in value.split(",") if entry
+        for entry in split_column_exclude_value(value)
     )
 
 
@@ -61,7 +66,9 @@ def test_metacharacters_are_escaped_so_each_entry_matches_exactly_its_column():
     cols = {"shop.docs": ["col$1", "a.b", "x(y"]}
     captured = [_t("shop.docs", ["id", "col$1", "a.b", "aXb", "x(y"])]
     value = format_column_exclude_value(cols, captured)
-    assert value == r"shop.docs.a\.b,shop.docs.col\$1,shop.docs.x\(y"
+    # A non-plain entry escapes its separators too: 'shop.docs.a\.b' would also drop
+    # 'shop.docs_a.b' (the separator dot is any character) -- verified on 2.7.4.
+    assert value == r"shop\.docs\.a\.b,shop\.docs\.col\$1,shop\.docs\.x\(y"
     for name in ("col$1", "a.b", "x(y"):
         assert _debezium_excludes(value, f"shop.docs.{name}"), name
     assert not _debezium_excludes(value, "shop.docs.aXb")  # '.' no longer matches any char
@@ -190,20 +197,24 @@ def test_a_stack_on_the_legacy_form_keeps_it_and_its_inexact_names_are_flagged()
     inv = SourceInventory(tables=[_t("shop.docs", ["id", "col$1"])])
     legacy = "shop.docs.col$1"
     cx = cdc_capture_exclusions(_state([("shop.docs", "col$1")], deployed=legacy), inv, inv.tables)
-    assert cx.sent == legacy and cx.value == r"shop.docs.col\$1"
+    assert cx.sent == legacy and cx.value == r"shop\.docs\.col\$1"
     assert cx.inexact == ("shop.docs.col$1",) and cx.error is None
     # Any other deployed value -> the exact form, no warning.
     other = cdc_capture_exclusions(_state([("shop.docs", "col$1")], deployed=""), inv, inv.tables)
     assert other.sent == other.value and other.inexact == ()
 
 
-def test_guards_block_a_comma_and_an_oversized_value_but_never_what_is_deployed():
+def test_a_comma_is_carried_escaped_and_only_the_size_refuses():
     from dsql_migrator.ui.data_migration._models import cdc_capture_exclusions
 
-    inv = SourceInventory(tables=[_t("shop.docs", ["id", "a,b"])])
+    # Debezium's splitter reads '\\,' as a literal comma, so a comma in a name is carried
+    # exactly -- including a PG generated column the operator never excluded.
+    inv = SourceInventory(tables=[_t("shop.docs", ["id", "a,b", "a", "b"])])
     cx = cdc_capture_exclusions(_state([("shop.docs", "a,b")]), inv, inv.tables)
-    assert cx.error and "comma" in cx.error
-    # Byte-identical to a deployed legacy value: 0.1.561 already carries it, not refused now.
+    assert cx.error is None and cx.value == r"shop\.docs\.a\,b"
+    assert _debezium_excludes(cx.value, "shop.docs.a,b")
+    assert not _debezium_excludes(cx.value, "shop.docs.a") and not _debezium_excludes(cx.value, "shop.docs.b")
+    # Byte-identical to a deployed legacy value: kept, never refused.
     kept = cdc_capture_exclusions(_state([("shop.docs", "a,b")], deployed="shop.docs.a,b"), inv, inv.tables)
     assert kept.error is None and kept.sent == "shop.docs.a,b"
 
@@ -211,7 +222,26 @@ def test_guards_block_a_comma_and_an_oversized_value_but_never_what_is_deployed(
     wide = SourceInventory(tables=[_t(f"shop.t{i}", ["id", many[i]]) for i in range(200)])
     big = cdc_capture_exclusions(
         _state([(f"shop.t{i}", many[i]) for i in range(200)]), wide, wide.tables)
+    # The FACT only; each caller appends the remedy true in its state.
     assert big.error and "4,096-byte" in big.error and f"{len(big.sent.encode()):,} bytes" in big.error
+    assert "Exclude fewer" not in big.error
+
+
+def test_edge_whitespace_is_escaped_because_debezium_trims_each_entry():
+    names = [" lead", "lead", "trail ", "trail"]
+    inv = [_t("shop.docs", ["id", *names])]
+    value = format_column_exclude_value({"shop.docs": [" lead", "trail "]}, inv)
+    assert value == r"shop.docs. lead,shop\.docs\.trail\u0020"  # inner space: not an edge
+    assert _debezium_excludes(value, "shop.docs.trail ") and not _debezium_excludes(value, "shop.docs.trail")
+    assert _debezium_excludes(value, "shop.docs. lead") and not _debezium_excludes(value, "shop.docs.lead")
+    lead_schema = format_column_exclude_value({" sp.t": ["c"]}, [_t(" sp.t", ["id", "c"]), _t("sp.t", ["id", "c"])])
+    assert lead_schema == r"\u0020sp\.t\.c" and not _debezium_excludes(lead_schema, "sp.t.c")
+
+
+def test_a_case_twin_of_an_uncaptured_excluded_table_is_protected():
+    # The excluded table is deselected (not captured); its twin IS captured.
+    value = format_column_exclude_value({"Shop.T": ["note"]}, [_t("shop.t", ["id", "note"])])
+    assert value == "(?-i)Shop.T.note" and not _debezium_excludes(value, "shop.t.note")
 
 
 def test_every_cdc_surface_shows_what_start_sends():
@@ -222,8 +252,8 @@ def test_every_cdc_surface_shows_what_start_sends():
 
     src = inspect.getsource(_cdc_ui)
     # Preview: the SENT value. Start/Deploy: the exact form, Start with the legacy attached.
-    assert 'exclude_list = _capture.sent.split(",") if _capture.sent else None' in src
-    assert src.count('exclude_list = _capture.value.split(",") if _capture.value else None') == 2
+    assert "exclude_list = split_column_exclude_value(_capture.sent) or None" in src
+    assert src.count("exclude_list = split_column_exclude_value(_capture.value) or None") == 2
     assert 'params = params.model_copy(update={"column_exclude_legacy": _capture.legacy})' in src
     assert "capture_preview=cdc_capture_exclusions(" in src
 

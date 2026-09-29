@@ -237,6 +237,11 @@ from dsql_migrator.ui.data_migration._models import (
     stored_exclusion_issues,
     exclusion_refusal,
     missing_column_block_reason,
+    cdc_capture_exclusions,
+    exclusion_scope,
+    ExclusionInputs,
+    live_target_columns_of,
+    CAPTURE_SIZE_REMEDY_UNLOCKED,
     make_lob_candidates_for,
     session_source_type,
     scope_lob_candidates,
@@ -420,6 +425,17 @@ def build_data_migration_screen(
         ):
             return None
         return result.target_inventory
+
+    # The live exclusion inputs every gate reads (see make_exclusion_inputs_resolver);
+    # built once per screen so its memo survives renders.
+    _exclusion_resolver = make_exclusion_inputs_resolver(
+        migration_state,
+        inventory_fn=_inventory,
+        target_inventory_fn=_target_inventory,
+        conv_state=conv_state,
+        session=session,
+    )
+    migration_state.set_exclusion_inputs_resolver(_exclusion_resolver)
 
     def _assessment():
         """The Step 1 (Evaluation) compatibility report, or None if it hasn't run."""
@@ -659,6 +675,9 @@ def build_data_migration_screen(
             )
             status = promoted
         inventory = _inventory()
+        # The live source of what every exclusion gate judges (selection, applied DDL,
+        # target columns) -- registered before anything below reads it.
+        migration_state.set_exclusion_inputs_resolver(_exclusion_resolver)
 
         # Composite-PK CDC re-key: when a table's applied Schema Conversion gave it
         # a composite target key, Debezium must key its change record on those same
@@ -693,6 +712,11 @@ def build_data_migration_screen(
             # (a Schema Conversion composite key, a preserved generated column).
             migration_state.set_applied_conversions(
                 _applied, preserve_foreign_keys=conv_state.preserve_foreign_keys
+            )
+            # ... and seed the live resolver with it, so the gates reuse THIS conversion
+            # instead of converting again.
+            _exclusion_resolver.seed(
+                inventory, _conversion_signature(conv_state, session), _applied
             )
             # Which FK constraints THIS migration OWNS, for the CDC-start precondition:
             # an enforced FK on the target dead-letters out-of-order child rows (23503),
@@ -982,7 +1006,10 @@ def build_data_migration_screen(
             # type -- so they can ATTACH instead of navigating to the deep CDC substep
             # only to find a duplicate-deploy risk (a second, costly MSK cluster).
             if "cdc" in substeps_for_type(migration_type):
-                _render_cdc_existing_infra_banner(ui, migration_state, refresh)
+                _render_cdc_existing_infra_banner(
+                    ui, migration_state, refresh,
+                    job_manager=job_manager, inventory=inventory, session=session,
+                )
                 # Surface the CDC-specific Evaluation finding right where CDC is
                 # chosen. The assessment already detects FK cascades that CDC cannot
                 # replicate (they never reach the binary log), but that finding lived
@@ -1269,24 +1296,16 @@ def build_data_migration_screen(
             # Schema Conversion only pre-ticks the picker (``migration_state.selection``
             # stays the empty "= all" default until touched), so passing the raw
             # selection used to list LOB columns from every schema.
-            migratable = migratable_table_names(
-                inventory, conv_state.generated_node_ids, _target_inventory()
+            # The same formula the live exclusion inputs use (resolve_migration_selection).
+            selected_names = resolve_migration_selection(
+                inventory, conv_state, migration_state, _target_inventory()
             )
-            selected_names = effective_migration_selection(
-                migratable,
-                migration_state.selection,
-                touched=migration_state.selection_touched,
-                default=default_migration_selection(
-                    inventory,
-                    conv_state.generated_node_ids,
-                    _target_inventory(),
-                    conv_state.ticked_node_ids,
-                ),
-            )
+            # job_id, not the FULL_LOAD step: CDC alone promotes that step to DONE (see
+            # exclusion_card_locked, which this reason must agree with).
             _lob_locked, _lob_reason = lob_exclusion_lock(
                 migration_state,
                 job_manager,
-                full_load_committed=(job is not None or status is StepStatus.DONE),
+                full_load_committed=getattr(migration_state, "job_id", None) is not None,
             )
             # Every exclusion gate (this screen, the header Run, Deploy, Attach) judges the
             # tables THIS render resolved -- the same set the card below is given.
@@ -1315,11 +1334,8 @@ def build_data_migration_screen(
                     locked=_exclusions_committed,
                     # Whether the lock means data moved (vs a stack that merely holds the
                     # set), so the post-lock copy names the real cause and its remedy.
-                    data_moved=(
-                        job is not None
-                        or status is StepStatus.DONE
-                        or cdc_streaming_started(migration_state, job_manager)
-                        or bool(getattr(migration_state, "cdc_has_committed_offset", False))
+                    after_lock_note=exclusion_after_lock_note(
+                        migration_state, job_manager
                     ),
                     # Fall back to the SELECTION lock's reason when the LOB clause has
                     # none: the `locked` flag is an OR, so any contributor without a
@@ -2589,43 +2605,107 @@ def prerequisites_section_expanded(
     return active_substep == "prerequisites" or running or not done
 
 
-def exclusion_card_locked(migration_state, job_manager, session) -> bool:
+def resolve_migration_selection(
+    inventory, conv_state, migration_state, target_inventory
+) -> list[str]:
+    """The tables a Full Load will migrate: the picker, else the Schema Conversion default.
+
+    ONE formula for the screen (the card, the picker's confirmation) and the live
+    exclusion inputs every gate reads (:func:`make_exclusion_inputs_resolver`).
+    """
+    migratable = migratable_table_names(
+        inventory, conv_state.generated_node_ids, target_inventory
+    )
+    return effective_migration_selection(
+        migratable,
+        migration_state.selection,
+        touched=migration_state.selection_touched,
+        default=default_migration_selection(
+            inventory,
+            conv_state.generated_node_ids,
+            target_inventory,
+            conv_state.ticked_node_ids,
+        ),
+    )
+
+
+def _conversion_signature(conv_state, session) -> tuple:
+    return (
+        session_source_type(session),
+        tuple(sorted((getattr(conv_state, "edited_target_ddls", None) or {}).items())),
+        bool(getattr(conv_state, "preserve_foreign_keys", True)),
+    )
+
+
+def make_exclusion_inputs_resolver(
+    migration_state, *, inventory_fn, target_inventory_fn, conv_state, session
+):
+    """The live source of :class:`ExclusionInputs` the screen registers on the state.
+
+    The selection is resolved on every call (cheap), so a picker tick reaches the gates
+    without a re-render. The applied conversion -- a full-inventory convert, ~1 s at 1,000
+    tables -- is memoized on the inventory OBJECT (held, so a reused ``id`` can never serve
+    a stale result) plus a signature of the edits, the engine and the FK toggle; the render
+    ``seed``s it with the conversion it computes anyway, so nothing is converted twice.
+    """
+    memo: dict = {}
+
+    def seed(inventory, signature, applied) -> None:
+        memo.update(inventory=inventory, signature=signature, applied=applied)
+
+    def resolve():
+        inventory = inventory_fn()
+        if inventory is None or not getattr(inventory, "tables", None):
+            return None
+        target_inventory = target_inventory_fn()
+        signature = _conversion_signature(conv_state, session)
+        if memo.get("inventory") is not inventory or memo.get("signature") != signature:
+            conversion = SchemaConverter(source_type=signature[0]).convert(inventory)
+            seed(
+                inventory,
+                signature,
+                applied_table_conversions(
+                    conversion,
+                    conv_state.edited_target_ddls,
+                    preserve_foreign_keys=conv_state.preserve_foreign_keys,
+                ),
+            )
+        if "target" not in memo or memo["target"] is not target_inventory:
+            memo.update(
+                target=target_inventory, live=live_target_columns_of(target_inventory)
+            )
+        return ExclusionInputs(
+            selected=resolve_migration_selection(
+                inventory, conv_state, migration_state, target_inventory
+            ),
+            applied=memo["applied"],
+            preserve_foreign_keys=bool(conv_state.preserve_foreign_keys),
+            live_columns=memo["live"],
+        )
+
+    resolve.seed = seed  # type: ignore[attr-defined]
+    return resolve
+
+
+def exclusion_card_locked(migration_state, job_manager, session=None) -> bool:
     """The oversized-LOB card's own ``locked`` flag, for every migration type.
 
     The ONE definition the card and every gate that names its Remove share, so a gate can
     never hold a button on an entry the frozen card cannot remove (a dead end), nor let a
-    button through while the unlocked card shows the entry as blocking. For a type with a
-    Full Load it is the Full Load screen's card lock (the table-picker lock OR
-    ``lob_exclusion_lock`` with the live job / step DONE); for CDC only, the CDC step's copy
-    (``lob_exclusion_lock`` with step DONE or a recorded job id).
+    button through while the unlocked card shows the entry as blocking.
+
+    "A Full Load committed data under this set" is ``job_id`` being set -- persisted,
+    surviving a pruned job record and a type switch, cleared only by Start over -- and NOT
+    the FULL_LOAD step being DONE: CDC alone promotes that step to DONE once it streams
+    (``data_migration_step_after_cdc``), so keying on it left every CDC-only session that
+    had streamed locked after its stack was deleted, with a false "a Full Load already
+    loaded data" and no way to change the columns. ``session`` is accepted for callers'
+    symmetry and unused.
     """
-    workflow = getattr(session, "workflow", None)
-    status = get_status(workflow, WorkflowStep.FULL_LOAD) if workflow is not None else None
-    job = _current_job(job_manager, getattr(migration_state, "job_id", None))
-    migration_type = migration_state.migration_type
-    if migration_type is MigrationType.CDC_ONLY:
-        return lob_exclusion_lock(
-            migration_state,
-            job_manager,
-            full_load_committed=(
-                status is StepStatus.DONE
-                or getattr(migration_state, "job_id", None) is not None
-            ),
-        )[0]
-    selection_locked = (
-        selection_lock_reason(
-            migration_state,
-            job_manager,
-            status=status,
-            migration_type=migration_type,
-            has_job=job is not None,
-        )
-        is not None
-    )
-    return selection_locked or lob_exclusion_lock(
+    return lob_exclusion_lock(
         migration_state,
         job_manager,
-        full_load_committed=(job is not None or status is StepStatus.DONE),
+        full_load_committed=getattr(migration_state, "job_id", None) is not None,
     )[0]
 
 
@@ -2643,9 +2723,23 @@ def data_migration_exclusion_block(
     if migration_state.migration_type is MigrationType.CDC_ONLY:
         return None
     committed = exclusion_card_locked(migration_state, job_manager, session)
-    return stored_exclusion_block_reason(
+    blocked = stored_exclusion_block_reason(
         stored_exclusion_issues(migration_state, inventory, committed=committed)
-    ) or (None if committed else missing_column_block_reason(migration_state, inventory))
+    ) or missing_column_block_reason(migration_state, inventory, job_manager=job_manager)
+    if blocked or committed or migration_state.migration_type is not (
+        MigrationType.FULL_LOAD_AND_CDC
+    ):
+        return blocked
+    # Full load + CDC: the capture list must fit the CDC stack's one parameter, and the
+    # load is the last point at which the exclusions can still change -- afterwards the
+    # card locks and Deploy would refuse with nothing left to fix.
+    scope = exclusion_scope(migration_state)
+    tables = [
+        t for t in (getattr(inventory, "tables", None) or ())
+        if scope is None or t.name in set(scope)
+    ]
+    error = cdc_capture_exclusions(migration_state, inventory, tables).error
+    return f"{error} {CAPTURE_SIZE_REMEDY_UNLOCKED}" if error else None
 
 
 def full_load_run_guard_reason(
@@ -3098,7 +3192,9 @@ def _cdc_stack_being_deleted(migration_state, job_manager) -> bool:
     )
 
 
-def _render_cdc_existing_infra_banner(ui, migration_state, refresh) -> None:
+def _render_cdc_existing_infra_banner(
+    ui, migration_state, refresh, *, job_manager=None, inventory=None, session=None
+) -> None:
     """Plan-level banner: existing CDC infrastructure was found in the account under a
     name this (reset) session does not target -- offer to ATTACH here, next to the
     migration-type choice, so the user need not reach the deep CDC substep to avoid a
@@ -3217,14 +3313,11 @@ def _render_cdc_existing_infra_banner(ui, migration_state, refresh) -> None:
                 "straight to monitoring in the CDC step."
             ),
         )
-        with ui.row().classes("items-center gap-2 flex-wrap"):  # type: ignore[attr-defined]
-            for name, _status in in_scope:
-                def _adopt(_name=name) -> None:
-                    if migration_state.adopt_cdc_stack(_name):
-                        refresh()
-                ui.button(  # type: ignore[attr-defined]
-                    f"Attach to {name}", on_click=_adopt, icon="link"
-                ).props("color=primary")
+        # The SAME attach row as the CDC step (gated on the saved column exclusions).
+        _render_cdc_attach_row(
+            ui, migration_state, job_manager, refresh, in_scope,
+            inventory=inventory, session=session,
+        )
 
 
 def _pg_cdc_handoff_stack(migration_state, source_config, job_manager):
@@ -4530,6 +4623,8 @@ __all__ = [
     "full_load_run_guard_reason",
     "data_migration_exclusion_block",
     "exclusion_card_locked",
+    "make_exclusion_inputs_resolver",
+    "resolve_migration_selection",
     "full_load_progress_caption",
     "generated_table_names",
     "target_existing_table_names",
@@ -4623,6 +4718,7 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     _render_cdc_infra_deploy_action,
     _render_cdc_infra_form,
     _render_cdc_infra_prep_section,
+    _render_cdc_attach_row,
     cdc_infra_prep_state,
     _render_cdc_least_privilege_note,
     _render_cdc_live_monitoring,
@@ -4630,6 +4726,7 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     exclude_and_reload_block_reason,
     lob_exclusion_lock,
     exclusion_lock_state,
+    exclusion_after_lock_note,
     cdc_stack_being_deleted,
     cdc_delete_eta,
     _render_cdc_manual_inputs,

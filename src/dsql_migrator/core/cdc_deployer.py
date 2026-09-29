@@ -67,6 +67,7 @@ from dsql_migrator.core.cdc import (
     CdcStackParams,
     apply_column_exclude_chooser,
     build_watermark_params,
+    legacy_column_exclude_key_conflicts,
     cdc_expected_connector_names,
 )
 from dsql_migrator.core.models import (
@@ -1250,6 +1251,18 @@ def run_cdc_start(
         bad = [k for k, v in params.filled if str(v).startswith(CDC_PLACEHOLDER_PREFIX)]
         if bad:
             raise CdcDeployError(f"Unfilled values in connector parameters: {bad}")
+        # Backstop for the chooser: a KEPT 0.1.561 ColumnExcludeList may still exclude a
+        # composite key column, which 0.1.561 refused to start with (Debezium cannot build
+        # the record key). Covers Retry CDC and a UI that judged a stale deployed value.
+        _legacy_keys = legacy_column_exclude_key_conflicts(params)
+        if _legacy_keys:
+            raise CdcDeployError(
+                "The deployed CDC stack keeps the capture list it was deployed with, which "
+                "excludes these composite primary-key columns, so Debezium cannot build "
+                f"the record key: {', '.join(_legacy_keys)}. No connectors were changed. "
+                "Delete the CDC infrastructure on the CDC step, then deploy it again and "
+                "Start CDC: a new stack gets a capture list without key columns."
+            )
         driver.stage("validate_params", "DONE")
 
         if driver.cancelled:

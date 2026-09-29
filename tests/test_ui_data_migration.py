@@ -19663,7 +19663,9 @@ def test_lob_card_on_the_full_load_screen_explains_its_own_lock() -> None:
     )
     src = inspect.getsource(_dm.build_data_migration_screen)
     assert "lob_exclusion_lock(" in src
-    assert "lock_reason=_lob_reason" in src
+    # The strict-order cause (exclusion_lock_state) first, the LOB-specific reason next.
+    flat = " ".join(src.split())
+    assert "exclusion_lock_state(migration_state, job_manager).reason or _lob_reason" in flat
 
     # And that reason actually addresses a column change + names the escape hatch.
     state = DataMigrationState()
@@ -20023,7 +20025,8 @@ def test_exclude_and_reload_refused_while_cdc_streams(monkeypatch) -> None:
 
     monkeypatch.setattr(cm, "cdc_streaming_started", lambda *a, **k: True)
     reason = cm.exclude_and_reload_block_reason(DataMigrationState(), None)
-    assert reason and "stop CDC first" in reason
+    # Stop alone is not a complete remedy: a stopped stack keeps the set and its offsets.
+    assert reason and "stop CDC, then delete the CDC infrastructure" in reason
 
 
 def _quar_render_ui():
@@ -23687,8 +23690,11 @@ def test_the_lob_panel_is_never_locked_without_a_reason() -> None:
         assert reason, f"locked with no reason for {status}"
 
     # And the caller falls back to the selection lock's reason for ANY future contributor.
-    src = inspect.getsource(dm)
-    assert "lock_reason=_lob_reason or selection_lock," in src
+    src = " ".join(inspect.getsource(dm).split())
+    assert (
+        "exclusion_lock_state(migration_state, job_manager).reason or _lob_reason "
+        "or selection_lock" in src
+    )
 
 
 def test_start_cdc_logs_the_resume_point_through_the_real_ui_path(monkeypatch) -> None:
@@ -28695,9 +28701,9 @@ def test_deploy_is_held_by_a_saved_exclusion_that_no_longer_applies() -> None:
     # gate must not name a Remove it cannot perform: it stops blocking.
     state.job_id = "job-1"
     assert _render(state, {"job-1": _StubJob("COMPLETED")}).deploy_button().enabled is True
-    # A job id whose record is GONE (pruned) does not lock the Full Load card, so the gate
-    # keeps holding -- the card still shows the entry with its Remove.
-    assert _render(state).deploy_button().enabled is False
+    # A recorded Full Load locks the card whether or not its job record survived (the
+    # data really moved), so the gate stops blocking there too -- card and gate agree.
+    assert _render(state).deploy_button().enabled is True
     # And a valid set never blocks.
     fresh = _cdc_state_ready_for_deploy()
     fresh.set_cdc_infra_inputs({"vpc_id": "vpc-0123456789abcdef0"})

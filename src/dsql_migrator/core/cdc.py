@@ -1556,30 +1556,107 @@ class CdcStackParams(BaseModel):
 # parameter (then Debezium column.exclude.list), so the whole capture exclusion must fit.
 CDC_PARAMETER_BYTE_LIMIT = 4096
 
-# Regex metacharacters Debezium would interpret inside a column.exclude.list name part.
-_CDC_REGEX_META = frozenset("\\^$.|?*+()[]{}")
+# What Debezium would interpret inside a column.exclude.list name part: the regex
+# metacharacters, and ',' -- the list separator, which its splitter (RegExSplitter) reads
+# as a literal comma when escaped. Verified against the bundled debezium-core 2.7.4.
+_CDC_REGEX_META = frozenset("\\^$.|?*+()[]{},")
 
 
 def _cdc_escape_part(part: str) -> str:
     return "".join("\\" + ch if ch in _CDC_REGEX_META else ch for ch in part)
 
 
-def _cdc_case_twins(captured: "Sequence[TableDef]") -> "set[str]":
-    """Captured ``db.table.column`` names that another captured column matches ignoring case.
+def _cdc_trimmed(ch: str) -> bool:
+    """Would Java's ``String.trim()`` (applied to each list entry) remove ``ch``?"""
+    return ord(ch) <= 0x20
 
-    Debezium compiles each column.exclude.list entry CASE-INSENSITIVELY and matches the
-    whole ``db.table.column`` (``Strings.setOfRegex(pattern, CASE_INSENSITIVE)`` +
-    ``Matcher.matches()`` in debezium-core 2.7.4), so ``shop.T.note`` also drops
-    ``shop.t.note`` -- whether the twin is in the db, the table or the column part. An
-    entry for a name in this set gets ``(?-i)``, which on an exact name can only narrow the
-    match to that one column; every other entry is left byte-identical.
+
+def _cdc_escape_edges(entry: str) -> str:
+    """Escape the characters Debezium would TRIM off the ends of an entry.
+
+    A name part with leading/trailing whitespace was otherwise not excluded (the trimmed
+    pattern names a different column), and a same-name column without it was.
     """
+    start, end = 0, len(entry)
+    while start < end and _cdc_trimmed(entry[start]):
+        start += 1
+    while end > start and _cdc_trimmed(entry[end - 1]):
+        end -= 1
+    if start == 0 and end == len(entry):
+        return entry
+
+    def _u(text: str) -> str:
+        return "".join(f"\\u{ord(ch):04x}" for ch in text)
+
+    return _u(entry[:start]) + entry[start:end] + _u(entry[end:])
+
+
+def _cdc_parts(table: str, column: str) -> list[str]:
+    db, _, tbl = table.partition(".")
+    return [db] + ([tbl] if tbl else []) + [column]
+
+
+def _cdc_is_plain(parts: "Sequence[str]") -> bool:
+    """True when the unescaped 0.1.561 entry for these parts already matches exactly them."""
+    return (
+        all(_cdc_escape_part(p) == p for p in parts)
+        and bool(parts)
+        and not (parts[0][:1] and _cdc_trimmed(parts[0][0]))
+        and not (parts[-1][-1:] and _cdc_trimmed(parts[-1][-1]))
+    )
+
+
+def _cdc_entry(parts: "Sequence[str]") -> str:
+    """One exact entry. A plain name keeps bare separator dots (byte-identical to 0.1.561);
+    any other entry escapes its separators too, or a '.' inside a part would also match
+    across a separator (``shop.t.a\\.b`` drops ``shop.t_a.b`` -- verified on 2.7.4)."""
+    if _cdc_is_plain(parts):
+        return ".".join(parts)
+    return _cdc_escape_edges("\\.".join(_cdc_escape_part(p) for p in parts))
+
+
+def _cdc_case_collisions(captured: "Sequence[TableDef]") -> "dict[str, set[str]]":
+    """``lower(db.table.column)`` -> the captured names spelled that way ignoring case."""
     seen: dict[str, set[str]] = {}
     for table in captured:
         for column in table.columns:
             qualified = f"{table.name}.{column.name}"
             seen.setdefault(qualified.lower(), set()).add(qualified)
-    return {q for group in seen.values() if len(group) > 1 for q in group}
+    return seen
+
+
+def _cdc_needs_case(qualified: str, collisions: "Mapping[str, set[str]]") -> bool:
+    """Does a DIFFERENT captured column match this name ignoring case?
+
+    Debezium compiles each entry CASE-INSENSITIVELY and matches the whole
+    ``db.table.column`` (``Strings.setOfRegex(pattern, CASE_INSENSITIVE)`` +
+    ``Matcher.matches()``), so ``shop.T.note`` also drops ``shop.t.note`` -- whatever part
+    the twin is in, and also when the EXCLUDED table itself is not captured (a saved
+    exclusion on a deselected table). ``(?-i)`` on an exact name can only narrow the match
+    to that one column; every other entry stays byte-identical.
+    """
+    return bool(collisions.get(qualified.lower(), set()) - {qualified})
+
+
+def split_column_exclude_value(value: str) -> list[str]:
+    """Split a ColumnExcludeList value into entries, honouring ``\\,`` (an escaped comma)."""
+    entries: list[str] = []
+    buf: list[str] = []
+    i = 0
+    while i < len(value):
+        ch = value[i]
+        if ch == "\\" and i + 1 < len(value):
+            buf.append(value[i : i + 2])
+            i += 2
+            continue
+        if ch == ",":
+            entries.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    entries.append("".join(buf))
+    return [e for e in entries if e]
 
 
 def format_column_exclude_value(
@@ -1589,38 +1666,35 @@ def format_column_exclude_value(
     """The ColumnExcludeList value (0.1.562+): each entry matches exactly one column.
 
     ``columns`` maps ``db.table`` (``schema.table`` on PostgreSQL) to its excluded column
-    names. Debezium reads every entry as an anchored, case-insensitive REGEX, which the
-    0.1.561 form (:func:`~dsql_migrator.ui.data_migration._models.format_column_exclude_list`,
-    kept verbatim as the legacy form) ignored: a ``$`` in a name made the entry match
-    nothing, a ``.`` matched any character, and a case twin was dropped along with it.
+    names. Debezium reads every entry as an anchored, case-insensitive REGEX, trims it, and
+    splits the list on unescaped commas, which the 0.1.561 form
+    (:func:`~dsql_migrator.ui.data_migration._models.format_column_exclude_list`, kept
+    verbatim as the legacy form) ignored: a ``$`` made the entry match nothing, a ``.``
+    matched any character, a comma split the name, edge whitespace was trimmed away, and a
+    case twin was dropped along with it. So:
 
-    * regex metacharacters are escaped INSIDE each part; the separator dots stay, so a
-      plain name's entry is byte-identical to the legacy form;
+    * a plain name's entry is byte-identical to the legacy form;
+    * any other entry escapes each part (``\\,`` for a comma), its separators, and the
+      characters trimming would remove (``\\u0020``);
     * ``(?-i)`` is prefixed when another ``captured`` column has the same qualified name
-      ignoring case (a twin in the db, table or column part);
+      ignoring case;
     * only when that plain form exceeds :data:`CDC_PARAMETER_BYTE_LIMIT`, the equivalent
       COMPACT form is returned: tables of one db with the SAME column set collapse into
       ``db\\.(?:t1|t2)\\.(?:c1|c2)`` -- exact, because every member has exactly that set.
 
-    Sorted and deterministic. Empty input -> ``""``.
+    Sorted and deterministic. Empty input -> ``""``. Every escape above was verified
+    against the bundled debezium-core 2.7.4 ``ColumnNameFilterFactory``.
     """
-    twins = _cdc_case_twins(list(captured))
+    collisions = _cdc_case_collisions(list(captured))
 
     def _needs_case(table: str, cols) -> bool:
-        return any(f"{table}.{c}" in twins for c in cols)
-
-    def _prefix(table: str, cols, entry: str) -> str:
-        return ("(?-i)" + entry) if _needs_case(table, cols) else entry
-
-    def _qualified(table: str) -> list[str]:
-        db, _, tbl = table.partition(".")
-        return [_cdc_escape_part(db)] + ([_cdc_escape_part(tbl)] if tbl else [])
+        return any(_cdc_needs_case(f"{table}.{c}", collisions) for c in cols)
 
     plain: list[str] = []
     for table in sorted(columns):
         for column in sorted(columns[table]):
-            entry = ".".join(_qualified(table) + [_cdc_escape_part(column)])
-            plain.append(_prefix(table, [column], entry))
+            entry = _cdc_entry(_cdc_parts(table, column))
+            plain.append(("(?-i)" + entry) if _needs_case(table, [column]) else entry)
     value = ",".join(plain)
     if len(value.encode("utf-8")) <= CDC_PARAMETER_BYTE_LIMIT:
         return value
@@ -1643,12 +1717,14 @@ def format_column_exclude_value(
             singles.append((table, cols))
     compact: list[tuple[str, str]] = []
     for (db, cols), tbls in groups.items():
-        entry = "\\.".join([_cdc_escape_part(db), _alt(tbls), _alt(cols)])
+        entry = _cdc_escape_edges(
+            "\\.".join([_cdc_escape_part(db), _alt(tbls), _alt(cols)])
+        )
         needs = any(_needs_case(f"{db}.{t}", cols) for t in tbls)
         compact.append((f"{db}.{tbls[0]}", ("(?-i)" + entry) if needs else entry))
     for table, cols in singles:
-        entry = "\\.".join([_cdc_escape_part(table), _alt(cols)])
-        compact.append((table, _prefix(table, cols, entry)))
+        entry = _cdc_escape_edges("\\.".join([_cdc_escape_part(table), _alt(cols)]))
+        compact.append((table, ("(?-i)" + entry) if _needs_case(table, cols) else entry))
     return ",".join(entry for _key, entry in sorted(compact))
 
 
@@ -1658,19 +1734,49 @@ def column_exclude_inexact_entries(
 ) -> list[str]:
     """``db.table.column`` names whose 0.1.561 (unescaped) entry was not an exact match.
 
-    A regex character in a part, or a case twin, makes the legacy entry match nothing or
-    more than the one column. Used to warn when a stack deployed with the legacy form is
-    KEPT on it (:func:`choose_column_exclude_value`). Sorted.
+    A regex character or comma in a part, edge whitespace, or a case twin makes the legacy
+    entry match nothing or more than the one column. Used to warn when a stack deployed
+    with the legacy form is KEPT on it (:func:`choose_column_exclude_value`). Sorted.
     """
-    twins = _cdc_case_twins(list(captured))
+    collisions = _cdc_case_collisions(list(captured))
     inexact: list[str] = []
     for table in sorted(columns):
         for column in sorted(columns[table]):
-            parts = [p for p in (*table.partition(".")[::2], column) if p]
             qualified = f"{table}.{column}"
-            if any(_cdc_escape_part(p) != p for p in parts) or qualified in twins:
+            if not _cdc_is_plain(_cdc_parts(table, column)) or _cdc_needs_case(
+                qualified, collisions
+            ):
                 inexact.append(qualified)
     return inexact
+
+
+def _parse_message_key_columns(value: str) -> "dict[str, list[str]]":
+    """Inverse of :func:`format_message_key_columns` (``db\\.t:c1,c2;...``)."""
+    keys: dict[str, list[str]] = {}
+    for item in (value or "").split(";"):
+        pattern, sep, cols = item.partition(":")
+        if sep and pattern:
+            keys[pattern.replace("\\.", ".")] = [c for c in cols.split(",") if c]
+    return keys
+
+
+def legacy_column_exclude_key_conflicts(params: "CdcStackParams") -> list[str]:
+    """Composite key columns a KEPT 0.1.561 ColumnExcludeList still excludes at capture.
+
+    The exact form never contains a key column (the effective set drops B1/B2), but the
+    chooser can keep a legacy value that does -- and 0.1.561 refused to Start with it,
+    because Debezium cannot build the record key. Empty unless the legacy value is sent.
+    """
+    filled = dict(params.filled)
+    value = filled.get("ColumnExcludeList", "")
+    if params.column_exclude_legacy is None or value != params.column_exclude_legacy:
+        return []
+    entries = {e for e in value.split(",") if e}
+    keys = _parse_message_key_columns(filled.get("MessageKeyColumns", ""))
+    return sorted(
+        f"{table}.{col}" for table, cols in keys.items() for col in cols
+        if f"{table}.{col}" in entries
+    )
 
 
 def choose_column_exclude_value(
