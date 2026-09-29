@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Iterable, Mapping, Optional, Sequence
+from typing import Callable, Iterable, Mapping, Optional, Sequence
 
 from dsql_migrator.core.assessor import (
     _OVERSIZED_LOB_BASES,
@@ -1791,6 +1791,117 @@ def classify_restored_exclusions(migration_state, job_manager=None) -> "Optional
     if phase in ("absent", "infra"):
         return _settle(False)
     return None
+
+
+@dataclass(frozen=True)
+class ForcedReplaceView:
+    """What the Start dialog learned about the column-exclusion overlay.
+
+    ``forced``: table -> why it is dropped and reloaded (the NULL contract needs it);
+    ``appended_warnings``: table -> why a table that would be forced is appended anyway
+    (CDC is streaming into it); ``undecided``: tables whose target could not be read (never
+    forced -- the engine then refuses them if needed); ``null_columns``: table -> the
+    columns that load as NULL.
+    """
+
+    forced: "dict[str, str]"
+    appended_warnings: "dict[str, str]"
+    undecided: "tuple[str, ...]"
+    null_columns: "dict[str, tuple[str, ...]]"
+
+
+def exclusion_forced_replace(
+    action_tables: "Sequence[str]",
+    *,
+    overlay_by_table: "Mapping[str, Iterable[str]]",
+    excluded_by_table: "Mapping[str, Iterable[str]]",
+    source_columns_for: "Callable[[str], Sequence[str]]",
+    facts: "Mapping[str, object]",
+    ledger_tables: "Mapping[str, object]",
+    cdc_coexisting: bool,
+    recreated_unfinished: "Iterable[str]",
+    index_ddls_for: "Callable[[str], Sequence[str]]",
+) -> ForcedReplaceView:
+    """Which action tables the Start dialog must drop and reload, and why.
+
+    Per table, in order: an overlay or recorded table whose target facts are unknown is
+    UNDECIDED (never forced). Otherwise the one shared verdict
+    (``core.overlay_ledger.append_verdict``, the engine's own check) decides whether an
+    append would break the NULL contract; a table the tool recreated and did not finish
+    (``recreated_unfinished``) is reloaded so its indexes are built. While CDC streams
+    nothing is forced: each such table is appended with a warning. Live computed columns
+    are omit-only and never force.
+    """
+    from dsql_migrator.core.overlay_ledger import append_verdict
+
+    unfinished = set(recreated_unfinished or ())
+    forced: dict[str, str] = {}
+    warnings: dict[str, str] = {}
+    undecided: list[str] = []
+    null_columns: dict[str, tuple[str, ...]] = {}
+    for table in action_tables:
+        overlay = frozenset(overlay_by_table.get(table, ()) or ())
+        record = ledger_tables.get(table)
+        if not overlay and record is None and table not in unfinished:
+            continue
+        table_facts = facts.get(table)
+        refusal = None
+        if overlay or record is not None:
+            if table_facts is None:
+                undecided.append(table)
+                if overlay:
+                    null_columns[table] = tuple(sorted(overlay))
+                continue
+            live = sorted(
+                c for c in overlay
+                if (f := table_facts.columns.get(c)) is not None and not f.computed
+            )
+            computed = sorted(
+                c for c in overlay
+                if (f := table_facts.columns.get(c)) is not None and f.computed
+            )
+            if live:
+                null_columns[table] = tuple(live)
+            if getattr(table_facts, "exists", True):
+                refusal, _reincluded = append_verdict(
+                    record,
+                    table_facts=table_facts,
+                    overlay_live=live,
+                    computed=computed,
+                    excluded=tuple(excluded_by_table.get(table, ()) or ()),
+                    source_columns=tuple(source_columns_for(table) or ()),
+                )
+        if cdc_coexisting:
+            if refusal is not None:
+                warnings[table] = (
+                    f"{table} cannot be dropped while CDC streams: existing rows keep "
+                    f"their values in {', '.join(refusal.columns)}; Validation will count "
+                    "them."
+                )
+            elif table in unfinished:
+                ddls = list(index_ddls_for(table) or ())
+                warnings[table] = (
+                    f"{table} was recreated by the last run and not finished; while CDC "
+                    "streams it is appended, so its indexes are not built: "
+                    + ("; ".join(ddls) if ddls else "none recorded")
+                )
+            continue
+        if table in unfinished:
+            forced[table] = (
+                "recreated by the last run and not finished; it is dropped and reloaded "
+                "so its indexes are built"
+            )
+        elif refusal is not None and refusal.kind == "reincluded":
+            forced[table] = (
+                f"{', '.join(refusal.columns)} hold NULL from an earlier exclusion set; it "
+                "is dropped and reloaded so they get their source values"
+            )
+        elif refusal is not None:
+            forced[table] = (
+                "already holds rows with a different exclusion set (or none recorded); it "
+                f"is dropped and reloaded so every row is NULL in {', '.join(refusal.columns)}"
+            )
+    return ForcedReplaceView(forced, warnings, tuple(undecided), null_columns)
 
 
 def legacy_lob_exclusions(

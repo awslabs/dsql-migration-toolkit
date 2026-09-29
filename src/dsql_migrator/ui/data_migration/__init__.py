@@ -2332,6 +2332,10 @@ def build_data_migration_screen(
 
                 # --- Full Load -------------------------------------------------
                 if has_full_load:
+                    _overlay_providers = make_overlay_dialog_providers(
+                        migration_state, job_manager, session, _inventory
+                    )
+
                     def _full_load_body():
                         _render_full_load_step(
                             ui,
@@ -2415,6 +2419,11 @@ def build_data_migration_screen(
                                 # Cached by the pre-dialog probe, so no target I/O here.
                                 target_keys=migration_state.target_primary_keys,
                             ),
+                            # The column-exclusion overlay: the dialog reads the ledger
+                            # (off the loop) and learns which tables must be dropped and
+                            # reloaded, and which ALTERs run, before the operator starts.
+                            overlay_ledger_read=_overlay_providers[0],
+                            exclusion_overlay_view=_overlay_providers[1],
                         )
                         with ui.row().classes(
                             "!flex w-full justify-between items-center"
@@ -2595,7 +2604,28 @@ def build_data_migration_screen(
                         render_body=_cdc_body,
                     )
 
-    return content, runner
+    def header_runner() -> None:
+        """The page header's Run. With exclusions or ledger records in play, the run goes
+        through the Start dialog -- it discloses the one-way DROP NOT NULL, the dropped
+        DEFAULTs and any forced Drop & reload before anything happens -- so this only asks
+        the Full Load step to open it. Otherwise it runs directly, as before."""
+        classify_restored_exclusions(migration_state, job_manager)
+        if overlay_in_play(migration_state, _inventory()):
+            migration_state.set_active_substep("full_load")
+            migration_state.pending_full_load_confirm = True
+            return
+        runner()
+
+    return content, header_runner
+
+
+def overlay_in_play(migration_state, inventory) -> bool:
+    """Whether a Full Load of this session involves the column-exclusion overlay: an
+    overlay column is excluded, or the session has used the ledger (a table can owe a
+    DEFAULT or hold NULL under an earlier set)."""
+    if bool(getattr(migration_state, "overlay_ledger_in_use", False)):
+        return True
+    return bool(overlay_lob_exclusions(migration_state, inventory))
 
 
 def full_load_error_migration_context(
@@ -2792,6 +2822,73 @@ def _overlay_inputs(migration_state, inventory, applied_conversions, preserve_fo
         "overlay_ledger": getattr(migration_state, "overlay_ledger", None),
         "overlay_ledger_in_use": bool(getattr(migration_state, "overlay_ledger_in_use", False)),
     }
+
+
+@dataclass(frozen=True)
+class OverlayDialogView:
+    """What the Start dialog needs about the overlay, computed on the loop with no I/O."""
+
+    overlay_by_table: "Mapping[str, frozenset[str]]"
+    excluded_by_table: "Mapping[str, frozenset[str]]"
+    source_columns_for: "Callable[[str], Sequence[str]]"
+    ddl_facts_for: "Callable[[str], Optional[dict]]"
+    index_ddls_for: "Callable[[str], Sequence[str]]"
+    recreated_unfinished: "frozenset[str]"
+
+
+def make_overlay_dialog_providers(migration_state, job_manager, session, inventory_fn):
+    """``(ledger_read, overlay_view)`` for the Start dialog.
+
+    ``ledger_read`` is BLOCKING (run it off the loop): the ledger record of the connected
+    target, or ``None`` when no ledger is configured. ``overlay_view(action_tables)`` is
+    cheap: the overlay / excluded sets, the applied DDL's facts and index DDLs (from the
+    conversion the render recorded) and the tables the tool recreated and did not finish.
+    """
+    from dsql_migrator.core.overlay_ledger import overlay_ledger_key
+    from dsql_migrator.core.schema_applier import ddl_column_facts
+
+    def ledger_read():
+        ledger = getattr(migration_state, "overlay_ledger", None)
+        if ledger is None:
+            return None
+        target = getattr(session, "target_config", None)
+        if target is None:
+            raise RuntimeError("no target connection to read the overlay ledger for")
+        return ledger.read(overlay_ledger_key(target))
+
+    def overlay_view(action_tables):
+        inventory = inventory_fn()
+        wanted = set(action_tables)
+        overlay = {
+            t: c for t, c in overlay_lob_exclusions(migration_state, inventory).items()
+            if t in wanted
+        }
+        excluded = {
+            t: c for t, c in effective_lob_exclusions(migration_state, inventory).items()
+            if t in wanted
+        }
+        tables = {t.name: t for t in (getattr(inventory, "tables", None) or ())}
+        applied, _preserve = migration_state.applied_conversions()
+
+        def source_columns_for(name):
+            table = tables.get(name)
+            return [c.name for c in table.columns] if table is not None else []
+
+        def ddl_facts_for(name):
+            conversion = applied.get(name)
+            ddl = getattr(conversion, "target_ddl", None)
+            return ddl_column_facts(ddl, sorted(overlay.get(name, ()))) if ddl else None
+
+        def index_ddls_for(name):
+            return list(getattr(applied.get(name), "index_ddls", None) or ())
+
+        current = _current_job(job_manager, getattr(migration_state, "job_id", None))
+        unfinished = frozenset(recreated_unfinished(current)) & wanted if current else frozenset()
+        return OverlayDialogView(
+            overlay, excluded, source_columns_for, ddl_facts_for, index_ddls_for, unfinished,
+        )
+
+    return ledger_read, overlay_view
 
 
 def data_migration_exclusion_block(
@@ -4786,6 +4883,9 @@ __all__ = [
     "format_error_summary",
     "full_load_run_guard_reason",
     "prereq_exclusion_change_hint",
+    "OverlayDialogView",
+    "make_overlay_dialog_providers",
+    "overlay_in_play",
     "data_migration_exclusion_block",
     "exclusion_card_locked",
     "table_set_lock_reason",

@@ -77,10 +77,9 @@ from dsql_migrator.core.overlay_ledger import (
     OverlayLedgerError,
     OverlayLedgerUnavailableError,
     OverlayLedgerView,
-    append_refusal,
+    append_verdict,
     overlay_ledger_key,
     plan_ledger_record,
-    reincluded_columns,
 )
 from dsql_migrator.core.validation_sql import (
     build_orphan_count_sql,
@@ -4758,34 +4757,18 @@ def _run_overlay_unit(migrator, table_name: str, live, expected_defaults) -> Non
 def _append_verdict(
     inputs: "DataMigrationInputs", table: TableDef, table_facts, record, live, computed,
 ):
-    """The shared reload verdict for an append into a table that keeps its rows.
-
-    ``(refusal, exemption, reincluded)``: ``refusal`` is ``append_refusal``'s answer
-    (``None`` = the append keeps the NULL contract); ``exemption`` names why a refused
-    table still appends -- only while CDC streams into it, where Drop & reload does not
-    exist -- else ``None``; ``reincluded`` is what the record update needs. A recorded
-    column the load cannot write (gone from the source, or computed on the target) is
-    not re-included: its new rows land NULL like the old ones.
-    """
-    name = table.name
-    recorded = record.set_columns if record else ()
-    source_columns = {column.name for column in table.columns}
-    not_written = {
-        column
-        for column in recorded
-        if column not in source_columns
-        or ((facts := table_facts.columns.get(column)) is not None and facts.computed)
-    }
-    present_live = [c for c in recorded if table_facts.columns.get(c)]
-    omitted = sorted(
-        set(inputs.excluded_lob_columns.get(name, ())) | set(computed) | not_written
-    )
-    refusal = append_refusal(
-        record, has_rows=bool(table_facts.has_rows), exempt=False,
-        overlay_present=sorted(live), present_live=present_live, omitted=omitted,
+    """``(refusal, exemption, reincluded)`` through the one shared verdict
+    (``core.overlay_ledger.append_verdict``); ``exemption`` names why a refused table
+    still appends -- only while CDC streams into it, where Drop & reload does not exist."""
+    refusal, reincluded = append_verdict(
+        record,
+        table_facts=table_facts,
+        overlay_live=sorted(live),
+        computed=computed,
+        excluded=inputs.excluded_lob_columns.get(table.name, ()),
+        source_columns=[column.name for column in table.columns],
     )
     exemption = "CDC is streaming into it" if inputs.cdc_coexisting else None
-    reincluded = reincluded_columns(record, present_live=present_live, omitted=omitted)
     return refusal, exemption, reincluded
 
 

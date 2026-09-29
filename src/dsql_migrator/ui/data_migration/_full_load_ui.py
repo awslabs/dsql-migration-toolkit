@@ -29,7 +29,9 @@ from dsql_migrator.core.models import (
     StepStatus,
 )
 from dsql_migrator.core.target_connection import DsqlConnector
+from dsql_migrator.core.schema_applier import OverlayRefusedError, build_overlay_statements
 from dsql_migrator.core.target_introspector import (
+    target_overlay_facts,
     target_primary_keys,
     tables_present,
     tables_with_rows,
@@ -52,6 +54,7 @@ from dsql_migrator.ui.data_migration._models import (
     format_table_timing,
     format_watermark,
     full_load_completeness,
+    exclusion_forced_replace,
     summarize_table_states,
     unsettled_table_names,
 )
@@ -282,6 +285,145 @@ def format_selected_workloads(names: Sequence[str]) -> str:
     return f"{count} {noun} selected for Full Load"
 
 
+def _overlay_statement_facts(view, facts, name, *, from_ddl):
+    """The facts one table's overlay statements are built from: the applied DDL for a
+    table this run recreates (or when the target could not be read), else the live
+    catalog. Columns Aurora DSQL computes are omit-only and left out."""
+    overlay = sorted(view.overlay_by_table.get(name, ()))
+    if from_ddl or facts is None or facts.get(name) is None:
+        chosen = view.ddl_facts_for(name) or {}
+    else:
+        chosen = {c: facts[name].columns.get(c) for c in overlay}
+    return {c: f for c, f in chosen.items() if c in overlay and f is not None and not f.computed}
+
+
+def _render_overlay_blocks(
+    ui, ov, *, action_tables, forced, recreate_now, radio_tables, cdc_live_now, dialog,
+    on_retry, reload_mode, on_refreshable,
+) -> None:
+    """The Start dialog's column-exclusion blocks (only what applies is drawn):
+    the unreadable-record error with [Retry], the could-not-read-the-target warning, the
+    NULL line, the exact ALTERs, the forced tables with their reasons, and the CDC-live
+    append warnings."""
+    view = ov.get("view")
+    outcome = ov.get("outcome")
+    facts = ov.get("facts")
+    if ov.get("ledger_error"):
+        render_notice(
+            ui,
+            tone="error",
+            header="Could not read the record of excluded-column changes",
+            body=(
+                "The tool records the DEFAULTs it drops on this Aurora DSQL target, and "
+                "which tables were loaded under which exclusion set. That record could "
+                "not be read, so Start is disabled. Nothing was changed; retry."
+            ),
+        )
+        if on_retry is not None:
+            async def _retry() -> None:
+                dialog.close()
+                await on_retry()
+
+            ui.button("Retry", on_click=_retry, icon="refresh").props("flat color=primary")
+        return
+    undecided = list(getattr(outcome, "undecided", ()) or ())
+    if ov.get("probe_failed") or undecided:
+        named = f" ({', '.join(undecided)})" if undecided else ""
+        render_notice(
+            ui,
+            tone="warning",
+            header="Could not read the Aurora DSQL target",
+            body=(
+                f"No table is listed for Drop & reload here{named}. A table that holds "
+                "rows under another exclusion set fails \"needs Drop & reload\" when the "
+                "load starts instead of being appended."
+            ),
+        )
+    null_columns = dict(getattr(outcome, "null_columns", {}) or {}) if outcome else {}
+    if not null_columns and view is not None:
+        null_columns = {t: tuple(sorted(c)) for t, c in view.overlay_by_table.items() if c}
+    if null_columns:
+        n_cols = sum(len(c) for c in null_columns.values())
+        inline_hint(
+            ui,
+            f"{n_cols} column{'s' if n_cols != 1 else ''} in {len(null_columns)} "
+            f"table{'s' if len(null_columns) != 1 else ''} will load as NULL",
+            tone="neutral",
+            classes="text-sm",
+        )
+        with ui.expansion("show columns").classes("w-full text-xs"):
+            for table in sorted(null_columns):
+                for column in null_columns[table]:
+                    ui.label(f"{table}.{column}").classes("text-xs font-mono")
+
+    def _changes(mode: str = reload_mode) -> None:
+        if view is None:
+            return
+        recreated = set(forced) | set(recreate_now) | (
+            set(radio_tables) if mode == "drop" and not cdc_live_now else set()
+        )
+        statements = []
+        for table in action_tables:
+            if table not in view.overlay_by_table:
+                continue
+            chosen = _overlay_statement_facts(
+                view, facts, table, from_ddl=table in recreated or bool(ov.get("probe_failed"))
+            )
+            try:
+                statements.extend(build_overlay_statements(table, chosen))
+            except OverlayRefusedError:  # computed columns were filtered; defensive
+                continue
+        if not statements:
+            return
+        n_not_null = sum(1 for st in statements if st.action == "DROP NOT NULL")
+        n_default = sum(1 for st in statements if st.action == "DROP DEFAULT")
+        parts = []
+        if n_not_null:
+            parts.append(f"{n_not_null} x DROP NOT NULL (one-way)")
+        if n_default:
+            parts.append(f"{n_default} x DROP DEFAULT (restored at Cut over)")
+        render_notice(
+            ui,
+            tone="warning",
+            header="Aurora DSQL changes before loading: " + ", ".join(parts),
+            body=(
+                "Each excluded column is made nullable with no DEFAULT before its table's "
+                "first row, so every row stores NULL there."
+                + (
+                    " The target could not be read, so these follow the applied Schema "
+                    "Conversion; only what the target still needs is run."
+                    if ov.get("probe_failed")
+                    else ""
+                )
+            ),
+        )
+        with ui.expansion("show statements").classes("w-full text-xs"):
+            for statement in statements:
+                ui.label(statement.text()).classes("text-xs font-mono break-all")
+
+    refreshable = ui.refreshable(_changes)
+    refreshable()
+    on_refreshable(lambda mode: refreshable.refresh(mode))
+    if forced:
+        render_notice(
+            ui,
+            tone="error",
+            header=(
+                f"{len(forced)} table{'s' if len(forced) != 1 else ''} will be dropped and "
+                "reloaded"
+            ),
+            body=" ".join(f"{table}: {reason}." for table, reason in forced.items()),
+        )
+    warnings = dict(getattr(outcome, "appended_warnings", {}) or {}) if outcome else {}
+    if cdc_live_now and warnings:
+        render_notice(
+            ui,
+            tone="warning",
+            header="Existing rows keep their values while CDC streams",
+            body=" ".join(warnings.values()),
+        )
+
+
 def _render_full_load_step(
     ui,
     migration_state,
@@ -325,6 +467,11 @@ def _render_full_load_step(
     foreign_keys_running: Optional[Callable[[], bool]] = None,
     foreign_keys_progress: Optional[Callable[[], Optional[tuple]]] = None,
     cancel_foreign_keys: Optional[Callable[[], None]] = None,
+    # The column-exclusion overlay (see make_overlay_dialog_providers): a BLOCKING ledger
+    # read of the connected target, and a cheap view of the overlay / excluded sets and the
+    # applied DDL. None (library callers, test doubles) keeps the previous dialog.
+    overlay_ledger_read: Optional[Callable[[], object]] = None,
+    exclusion_overlay_view: Optional[Callable[[Sequence[str]], object]] = None,
 ) -> None:
     """Render the Full Load step: confirm the selected workloads, then run it.
 
@@ -368,7 +515,7 @@ def _render_full_load_step(
 
     def _open_confirm_dialog_now(
         *, action_tables, on_confirm, title, table_reasons=None,
-        preselect=True, checklist_hint=None,
+        preselect=True, checklist_hint=None, overlay=None, on_retry=None,
     ) -> None:
         """Build + open the Full-Load confirm dialog in the TOP-LEVEL client.
 
@@ -428,6 +575,14 @@ def _render_full_load_step(
         recreate_now = (
             [] if cdc_live_now else [n for n in _candidates if n in set(action_tables)]
         )
+        # The column-exclusion overlay (None -> the previous dialog, unchanged).
+        _ov = overlay or {}
+        _outcome = _ov.get("outcome")
+        forced = dict(getattr(_outcome, "forced", {}) or {}) if not cdc_live_now else {}
+        ledger_error = bool(_ov.get("ledger_error"))
+        # The populated tables the operator still CHOOSES for (the forced ones are not a
+        # choice: the NULL contract needs them dropped and reloaded).
+        radio_tables = [n for n in tables_with_data_now if n not in forced]
         # Selected tables that are genuinely MISSING on the target AND that this run
         # will NOT create -> an append would fail each (relation does not exist), and if
         # the user then starts CDC that table is a standing gap CDC never backfills. A
@@ -444,7 +599,7 @@ def _render_full_load_step(
                 set(action_tables)
                 if (migration_state.reload_mode == "drop" and not cdc_live_now)
                 else set(recreate_now)
-            )
+            ) | set(forced)
             missing_uncreated = [
                 n for n in action_tables
                 if n not in _present and n not in _will_create
@@ -455,9 +610,21 @@ def _render_full_load_step(
         # A scoped reload starts EMPTY: its action set is every loaded table, so
         # pre-checking would arm a full re-load from a button that says "specific".
         checked: set = set(action_tables) if preselect else set()
+        # The overlay's changes section re-renders when the reload choice flips.
+        _changes: dict = {}
+
+        # Set BEFORE close() on confirm, so the close handler below can tell a confirm
+        # (the run consumes the forced set) from Cancel / Esc / a backdrop click / Retry
+        # (the forced set is dropped: it is re-derived at every probe).
+        confirmed = {"v": False}
 
         def _build() -> None:
             with ui.dialog() as confirm_dialog, ui.card().classes("min-w-[360px]"):
+                def _on_close(e: object) -> None:
+                    if not bool(getattr(e, "value", True)) and not confirmed["v"]:
+                        migration_state.clear_exclusion_forced_replace()
+
+                confirm_dialog.on_value_change(_on_close)
                 ui.label(title).classes("text-lg font-semibold")
                 ui.label(
                     f"{format_selected_workloads(action_tables)}. The target "
@@ -511,6 +678,14 @@ def _render_full_load_step(
                             "new snapshot."
                         ),
                     )
+                if overlay is not None:
+                    _render_overlay_blocks(
+                        ui, _ov, action_tables=action_tables, forced=forced,
+                        recreate_now=recreate_now, radio_tables=radio_tables,
+                        cdc_live_now=cdc_live_now, dialog=confirm_dialog,
+                        on_retry=on_retry, reload_mode=migration_state.reload_mode,
+                        on_refreshable=lambda fn: _changes.update({"refresh": fn}),
+                    )
                 # Retry-failed: a checklist (all pre-checked) with each table's
                 # failure reason, so the user can uncheck tables not ready to retry
                 # and retry only the rest. Other actions just show badges.
@@ -531,7 +706,7 @@ def _render_full_load_step(
                                     checked.add(n)
                                 else:
                                     checked.discard(n)
-                                _sync_confirm_enabled()
+                                _sync_label()
 
                             with ui.row().classes("items-start gap-2 no-wrap w-full"):
                                 ui.checkbox(
@@ -584,16 +759,16 @@ def _render_full_load_step(
                 # let the user choose the run-wide behavior: append (keep existing
                 # rows, load only the missing ones -- the non-destructive default)
                 # or drop & reload (DROP+recreate each first, for a clean load).
-                if tables_with_data_now and not cdc_live_now:
+                if radio_tables and not cdc_live_now:
                     with ui.card().classes(
                         "w-full bg-amber-50 border border-amber-200 gap-2"
                     ):
                         ui.label(
-                            f"{len(tables_with_data_now)} selected table(s) already "
+                            f"{len(radio_tables)} selected table(s) already "
                             "contain data on the target. Choose how to load them:"
                         ).classes("text-sm text-gray-800")
                         with ui.row().classes("items-center gap-1 flex-wrap"):
-                            for name in tables_with_data_now:
+                            for name in radio_tables:
                                 ui.badge(name).props("color=amber-8 outline")
                         reload_choice = ui.radio(
                             {
@@ -621,6 +796,9 @@ def _render_full_load_step(
                 def _confirm() -> None:
                     if selectable and not checked:
                         return  # guard: nothing selected (button is also disabled)
+                    if ledger_error:
+                        return  # guard: the record could not be read (button disabled)
+                    confirmed["v"] = True
                     confirm_dialog.close()
                     # Retry-failed passes the checked subset (in the original order);
                     # every other action calls on_confirm with no arguments.
@@ -632,52 +810,64 @@ def _render_full_load_step(
 
                 with ui.row().classes("justify-end w-full gap-2"):
                     ui.button("Cancel", on_click=confirm_dialog.close).props("flat")
-                    if cdc_live_now:
-                        confirm_label = "Re-run anyway (CDC is live)"
-                    elif tables_with_data_now:
-                        # The button label + color follow the current choice so a
-                        # destructive drop reads as destructive.
-                        drop_chosen = migration_state.reload_mode == "drop"
-                        confirm_label = (
-                            "Drop, recreate and load" if drop_chosen
-                            else "Append and load"
-                        )
-                    elif recreate_now:
-                        # Name the DDL step in the button too, so the action is visible
-                        # without relying on the notice above being read. Stays
-                        # primary-coloured: these targets are empty, so nothing is lost.
-                        confirm_label = "Recreate and load"
-                    else:
-                        confirm_label = "Confirm and start"
-                    confirm_color = (
-                        "negative"
-                        if (cdc_live_now or (tables_with_data_now
-                                             and migration_state.reload_mode == "drop"))
-                        else "primary"
+                    def _label_and_color(mode: str) -> "tuple[str, str]":
+                        drop_chosen = mode == "drop"
+                        if cdc_live_now:
+                            return "Re-run anyway (CDC is live)", "negative"
+                        if forced:
+                            # The NULL contract drops these whatever the radio says, so
+                            # the button counts every table this run will DROP.
+                            drop_set = set(forced) | (set(radio_tables) if drop_chosen else set())
+                            if selectable:
+                                drop_set &= checked
+                            count = len(drop_set)
+                            return (
+                                f"Drop {count} table{'s' if count != 1 else ''}, "
+                                "recreate and load",
+                                "negative",
+                            )
+                        if radio_tables:
+                            # The button label + color follow the current choice so a
+                            # destructive drop reads as destructive.
+                            return (
+                                ("Drop, recreate and load", "negative") if drop_chosen
+                                else ("Append and load", "primary")
+                            )
+                        if recreate_now:
+                            # Name the DDL step in the button too, so the action is
+                            # visible without relying on the notice above being read.
+                            # Stays primary-coloured: these targets are empty.
+                            return "Recreate and load", "primary"
+                        return "Confirm and start", "primary"
+
+                    confirm_label, confirm_color = _label_and_color(
+                        migration_state.reload_mode
                     )
                     start_btn = ui.button(confirm_label, on_click=_confirm).props(
                         f"color={confirm_color}"
                     )
 
-                    def _sync_confirm_enabled() -> None:
-                        # Disable confirm when the retry checklist has nothing ticked.
-                        if selectable and not checked:
+                    def _sync_label(e: object = None) -> None:
+                        # One place for the label, colour and enabled state: the radio
+                        # change and every checklist toggle call it.
+                        mode = (
+                            str(getattr(e, "value", "append"))
+                            if e is not None and hasattr(e, "value")
+                            else migration_state.reload_mode
+                        )
+                        text, color = _label_and_color(mode)
+                        start_btn.set_text(text)
+                        start_btn.props(f"color={color}")
+                        # Disabled when the retry checklist has nothing ticked, or the
+                        # record of excluded-column changes could not be read.
+                        if (selectable and not checked) or ledger_error:
                             start_btn.disable()
                         else:
                             start_btn.enable()
+                        if e is not None and _changes.get("refresh") is not None:
+                            _changes["refresh"](mode)
 
-                    _sync_confirm_enabled()
-                    # The label/color depend on the radio; re-render them on change
-                    # so switching Drop<->Append updates the button immediately.
-                    def _sync_btn(e: object) -> None:
-                        drop_now = str(getattr(e, "value", "append")) == "drop"
-                        start_btn.set_text(
-                            "Drop, recreate and load" if drop_now
-                            else "Append and load"
-                        )
-                        start_btn.props(
-                            f"color={'negative' if drop_now else 'primary'}"
-                        )
+                    _sync_label()
                     # Guard must MATCH the radio's creation condition above
                     # (`tables_with_data_now and not cdc_live_now`). With CDC live the
                     # radio is never created -- replace is disabled while a sink streams --
@@ -685,8 +875,8 @@ def _render_full_load_step(
                     # the whole confirm dialog failed to open. Reachable today from the
                     # per-table Reload and "Retry unfinished tables" whenever CDC is
                     # streaming and the probed table already holds target rows.
-                    if tables_with_data_now and not cdc_live_now:
-                        reload_choice.on_value_change(_sync_btn)
+                    if radio_tables and not cdc_live_now:
+                        reload_choice.on_value_change(_sync_label)
             # Open on the NEXT tick, not this one. The dialog element was just
             # created; opening it in the same update batches "create element" and
             # "value=True" into one client message, and Quasar's QDialog needs the
@@ -763,11 +953,54 @@ def _render_full_load_step(
             migration_state.set_tables_with_data(frozenset())
             migration_state.set_target_primary_keys({})
             migration_state.set_reload_mode("append")
+            migration_state.clear_exclusion_forced_replace()
             target_config = getattr(session, "target_config", None)
+            # The column-exclusion overlay: its own ledger read, off the loop and BEFORE the
+            # target probe, so a record for this target marks the session as using the
+            # ledger even when the probe then fails (the engine then checks it).
+            view = (
+                exclusion_overlay_view(action_tables)
+                if exclusion_overlay_view is not None and action_tables
+                else None
+            )
+            ledger_configured = False
+            ledger_error = False
+            ledger_tables: dict = {}
+            if target_config is not None and action_tables and overlay_ledger_read is not None:
+                from nicegui import run
+
+                try:
+                    ledger = await run.io_bound(overlay_ledger_read)
+                    ledger_configured = ledger is not None
+                except Exception:  # noqa: BLE001 - unknown is not "no record"
+                    ledger, ledger_configured = None, True
+                status = getattr(ledger, "status", None) if ledger is not None else (
+                    "unknown" if ledger_configured else None
+                )
+                if ledger_configured:
+                    ledger_error = status not in ("present", "absent")
+                    if status == "present":
+                        ledger_tables = dict(getattr(ledger, "tables", {}) or {})
+                        if ledger_tables:
+                            migration_state.mark_overlay_ledger_in_use()
+            # An unreadable record only matters to a session that uses the ledger (the
+            # engine refuses exactly those runs); any other session keeps its dialog.
+            overlay_active = ledger_configured and view is not None and (
+                bool(view.overlay_by_table) or bool(ledger_tables)
+                or bool(view.recreated_unfinished)
+                or (ledger_error and bool(getattr(migration_state, "overlay_ledger_in_use", False)))
+            )
+            read_tables = sorted(
+                t for t in action_tables
+                if overlay_active and not ledger_error
+                and (t in view.overlay_by_table or t in ledger_tables)
+            )
+            facts: Optional[dict] = {}
+            probe_failed = False
             if target_config is not None and action_tables:
                 from nicegui import run
 
-                def _probe() -> tuple[frozenset[str], dict, frozenset[str]]:
+                def _probe() -> tuple[frozenset[str], dict, frozenset[str], dict]:
                     connector = DsqlConnector(
                         target_config, aws_profile=session.aws_profile
                     )
@@ -794,10 +1027,27 @@ def _render_full_load_step(
                     present = frozenset(
                         tables_present(names, connection_factory=connector.connect)
                     )
-                    return found, keys, present
+                    # The overlay facts, ONE read over the overlay columns and every
+                    # recorded set column -- only when an action table needs them.
+                    overlay_facts = (
+                        target_overlay_facts(
+                            read_tables,
+                            {
+                                t: sorted(
+                                    set(view.overlay_by_table.get(t, ()))
+                                    | set(getattr(ledger_tables.get(t), "set_columns", ()) or ())
+                                )
+                                for t in read_tables
+                            },
+                            connection_factory=connector.connect,
+                        )
+                        if read_tables
+                        else {}
+                    )
+                    return found, keys, present, overlay_facts
 
                 try:
-                    found, keys, present = await run.io_bound(_probe)
+                    found, keys, present, facts = await run.io_bound(_probe)
                     migration_state.set_tables_with_data(found)
                     migration_state.set_target_primary_keys(keys)
                     migration_state.set_target_tables_present(present)
@@ -809,6 +1059,35 @@ def _render_full_load_step(
                     # None (not empty): "could not read the target", so the dialog must
                     # NOT warn that every table is missing -- stay conservative.
                     migration_state.set_target_tables_present(None)
+                    facts, probe_failed = None, True
+            overlay_info = None
+            if overlay_active:
+                outcome = None
+                if not ledger_error and not probe_failed:
+                    outcome = exclusion_forced_replace(
+                        action_tables,
+                        overlay_by_table=view.overlay_by_table,
+                        excluded_by_table=view.excluded_by_table,
+                        source_columns_for=view.source_columns_for,
+                        facts=facts or {},
+                        ledger_tables=ledger_tables,
+                        cdc_coexisting=cdc_streaming_started(migration_state, job_manager),
+                        recreated_unfinished=view.recreated_unfinished,
+                        index_ddls_for=view.index_ddls_for,
+                    )
+                    migration_state.set_exclusion_forced_replace(outcome.forced)
+                overlay_info = {
+                    "outcome": outcome, "ledger_error": ledger_error,
+                    "probe_failed": probe_failed, "facts": facts, "view": view,
+                }
+
+            async def _retry() -> None:
+                await _open_full_load_confirm(
+                    None, probe_tables=action_tables, on_confirm=confirm_action,
+                    title=title, table_reasons=table_reasons, preselect=preselect,
+                    checklist_hint=checklist_hint,
+                )
+
             _open_confirm_dialog_now(
                 action_tables=action_tables,
                 on_confirm=confirm_action,
@@ -816,6 +1095,8 @@ def _render_full_load_step(
                 table_reasons=table_reasons,
                 preselect=preselect,
                 checklist_hint=checklist_hint,
+                overlay=overlay_info,
+                on_retry=_retry,
             )
         finally:
             _confirm_busy["value"] = False
@@ -828,6 +1109,12 @@ def _render_full_load_step(
                     btn.enable()
                 except Exception:  # noqa: BLE001
                     pass
+
+    # The page header's Run asked for the Start dialog (exclusions or ledger records are
+    # in play, so the run must disclose its target changes first): open it once.
+    if getattr(migration_state, "pending_full_load_confirm", False):
+        migration_state.pending_full_load_confirm = False
+        ui.timer(0.1, _open_full_load_confirm, once=True)
 
     async def _open_reload_confirm(table_name: str, event: object = None) -> None:
         """Per-table Reload -> the same probe + Drop-vs-Append confirm dialog.

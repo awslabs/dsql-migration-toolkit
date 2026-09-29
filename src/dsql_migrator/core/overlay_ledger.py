@@ -325,6 +325,42 @@ def append_refusal(
     return None
 
 
+def append_verdict(
+    record: Optional[OverlayLedgerTable],
+    *,
+    table_facts,
+    overlay_live: "Sequence[str]",
+    computed: "Sequence[str]",
+    excluded: "Sequence[str]",
+    source_columns: "Sequence[str]",
+) -> "tuple[Optional[AppendRefusal], tuple[str, ...]]":
+    """``(refusal, reincluded)`` for appending into a table that keeps its rows.
+
+    THE verdict the Start dialog's forced set and the engine's fail-closed check both
+    call (the caller decides the CDC-coexisting exemption). ``table_facts`` is the table's
+    live facts (``has_rows`` and per-column presence); ``overlay_live`` the overlay columns
+    present live and not computed; ``computed`` the overlay columns Aurora DSQL computes;
+    ``excluded`` every column this run omits; ``source_columns`` the columns the source
+    table has. A recorded column the load cannot write (gone from the source, or computed
+    on the target) is not re-included: its new rows land NULL like the old ones.
+    """
+    recorded = record.set_columns if record else ()
+    sources = set(source_columns)
+    not_written = {
+        column
+        for column in recorded
+        if column not in sources
+        or ((facts := table_facts.columns.get(column)) is not None and facts.computed)
+    }
+    present_live = [c for c in recorded if table_facts.columns.get(c)]
+    omitted = sorted(set(excluded) | set(computed) | not_written)
+    refusal = append_refusal(
+        record, has_rows=bool(table_facts.has_rows), exempt=False,
+        overlay_present=sorted(overlay_live), present_live=present_live, omitted=omitted,
+    )
+    return refusal, reincluded_columns(record, present_live=present_live, omitted=omitted)
+
+
 def recorded_default_mismatches(
     facts: "Mapping[str, Optional[ColumnNullFacts]]",
     overlay_columns: "Sequence[str]",
@@ -785,6 +821,7 @@ __all__ = [
     "SqliteOverlayLedger",
     "append_accepted",
     "append_refusal",
+    "append_verdict",
     "apply_restore_results",
     "ddl_digest",
     "ledger_lock",
