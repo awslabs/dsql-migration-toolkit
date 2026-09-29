@@ -191,10 +191,15 @@ class SessionSourceProbe:
             with engine.connect() as connection:
                 self._apply_statement_timeout(connection, timeout_seconds, is_postgres)
                 for index, name in enumerate(columns):
-                    if index:
-                        self._end_column_transaction(
-                            connection, timeout_seconds, is_postgres
-                        )
+                    # If the previous column's transaction cannot be ended (the rollback
+                    # itself failed -- a dropped connection), STOP: the next statement
+                    # could run on a fresh connection without the cap, an unbounded scan
+                    # of the source. The remaining columns are simply not measured, which
+                    # the caller reports as not-determined, never as a pass.
+                    if index and not self._end_column_transaction(
+                        connection, timeout_seconds, is_postgres
+                    ):
+                        break
                     measured = self._measured_expression(
                         length_fn, quote(name), (column_types or {}).get(name, "")
                     )
@@ -224,17 +229,19 @@ class SessionSourceProbe:
 
     def _end_column_transaction(
         self, connection: object, timeout_seconds: float, is_postgres: bool
-    ) -> None:
+    ) -> bool:
         """End one column's implicit transaction and re-arm the cap for the next.
 
         ``SET LOCAL`` is scoped to the transaction being rolled back, so the cap has to be
-        re-applied or the remaining columns would run unbounded. Best effort, like the cap.
+        re-applied or the remaining columns would run unbounded. Returns False when the
+        rollback itself fails, so the caller stops instead of measuring uncapped.
         """
         try:
             connection.rollback()  # type: ignore[attr-defined]
-            self._apply_statement_timeout(connection, timeout_seconds, is_postgres)
-        except Exception:  # noqa: BLE001 - best effort, like the timeout
-            pass
+        except Exception:  # noqa: BLE001 - the connection is gone; stop measuring
+            return False
+        self._apply_statement_timeout(connection, timeout_seconds, is_postgres)
+        return True
 
     @staticmethod
     def _measured_expression(length_fn: str, quoted: str, column_type: str) -> str:

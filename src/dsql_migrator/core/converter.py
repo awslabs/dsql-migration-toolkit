@@ -923,7 +923,8 @@ _IDENTITY_CLAUSE_RE = re.compile(
 def parse_target_column_names(create_ddl: str) -> "Optional[frozenset[str]]":
     """The column names of an applied CREATE TABLE, folded the way PostgreSQL folds them.
 
-    A quoted identifier keeps its case and an unquoted one folds to lower case, so this is
+    A quoted identifier keeps its case and an unquoted one folds to lower case (ASCII only,
+    :func:`fold_identifier`), so this is
     the set of names the Full Load INSERT -- which always QUOTES the source column names
     (``sql.Identifier``) -- will actually find. :func:`parse_target_column_types` keeps
     unquoted names as written, which is right for its type lookup but would call a source
@@ -949,8 +950,17 @@ def parse_target_column_names(create_ddl: str) -> "Optional[frozenset[str]]":
         if not name:
             continue
         quoted = bool(getattr(ident, "quoted", False)) if isinstance(ident, exp.Identifier) else False
-        names.add(name if quoted else name.lower())
+        names.add(name if quoted else fold_identifier(name))
     return frozenset(names) if names else None
+
+
+def fold_identifier(name: str) -> str:
+    """Fold an UNQUOTED identifier the way PostgreSQL does: ASCII A-Z only.
+
+    ``str.lower()`` also lowercases non-ASCII letters (``É`` -> ``é``), which PostgreSQL
+    leaves as written, so it would name a column the target does not have.
+    """
+    return "".join(chr(ord(ch) + 32) if "A" <= ch <= "Z" else ch for ch in name)
 
 
 def parse_target_generated_columns(create_ddl: str) -> set[str]:
@@ -990,17 +1000,31 @@ def parse_target_generated_columns(create_ddl: str) -> set[str]:
         if not name:
             continue
         for constraint in column_def.args.get("constraints") or []:
-            # The clause is INJECTED as raw text (see _apply_pg_generated_columns), so it
-            # comes back as an exp.Var rather than a ComputedColumnConstraint -- match on
-            # the rendered text, which covers BOTH shapes (a hand-edited DDL that sqlglot
-            # parsed structurally, and the tool's own injected string).
-            rendered = constraint.sql(dialect="postgres").upper()
-            # No IDENTITY test needed: _IDENTITY_CLAUSE_RE already removed every identity
-            # clause from the text before it was parsed, so one cannot reach this loop.
-            if "GENERATED" in rendered and "AS" in rendered:
+            # STRUCTURE, not a substring. Re-parsed DDL text -- the tool's own output and
+            # a hand edit alike -- yields a ComputedColumnConstraint for every real
+            # ``GENERATED ALWAYS AS (expr) STORED`` (verified over the pg_get_expr shapes
+            # that break sqlglot's rendering). A clause that reaches here as raw text (the
+            # in-tree injection of _apply_pg_generated_columns renders as an exp.Var) is
+            # matched by an ANCHORED pattern. The old test -- "GENERATED" and "AS" anywhere
+            # in the rendered constraint -- also matched DEFAULT CAST('Auto-generated' AS
+            # TEXT) and a CHECK over an enum value 'generated', so the loader OMITTED an
+            # ordinary column and every recreated row got its DEFAULT instead of the source
+            # value. No IDENTITY test is needed: _IDENTITY_CLAUSE_RE already removed every
+            # identity clause from the text before it was parsed.
+            kind = constraint.args.get("kind")
+            if isinstance(kind, exp.ComputedColumnConstraint) or (
+                not isinstance(
+                    kind, (exp.DefaultColumnConstraint, exp.CheckColumnConstraint)
+                )
+                and _GENERATED_CLAUSE_RE.match(constraint.sql(dialect="postgres"))
+            ):
                 generated.add(name)
                 break
     return generated
+
+
+# The raw-text shape of a stored generated column clause (anchored: see above).
+_GENERATED_CLAUSE_RE = re.compile(r"\s*GENERATED\s+ALWAYS\s+AS\s*\(", re.IGNORECASE)
 
 
 def parse_target_primary_key(create_ddl: str) -> list[str]:
@@ -1034,8 +1058,17 @@ def parse_target_primary_key(create_ddl: str) -> list[str]:
     # expressions (the same list that holds the ColumnDefs).
     for schema in parsed.find_all(exp.Schema):
         for e in schema.expressions:
-            if isinstance(e, exp.PrimaryKey):
-                cols = [c.name for c in e.expressions if c.name]
+            # ``CONSTRAINT pk_t PRIMARY KEY (a, b)`` (a named key, as an edited DDL often
+            # writes it) arrives wrapped in an exp.Constraint; unnamed, it is bare.
+            keys = (
+                [e]
+                if isinstance(e, exp.PrimaryKey)
+                else [x for x in e.expressions if isinstance(x, exp.PrimaryKey)]
+                if isinstance(e, exp.Constraint)
+                else []
+            )
+            for key in keys:
+                cols = [c.name for c in key.expressions if c.name]
                 if cols:
                     return cols
     # Inline: col <type> PRIMARY KEY (single-column key on a ColumnDef).

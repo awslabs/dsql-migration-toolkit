@@ -142,41 +142,58 @@ _FK_REFERENCES_RE = re.compile(
 
 
 def _unquote(identifier: str) -> str:
+    """A quoted identifier as written; an unquoted one folded as PostgreSQL folds it."""
+    from dsql_migrator.core.converter import fold_identifier
+
     identifier = identifier.strip()
     if identifier.startswith('"') and identifier.endswith('"'):
         return identifier[1:-1].replace('""', '"')
-    return identifier.lower()
+    return fold_identifier(identifier)
 
 
-def _applied_foreign_keys(child, conversion) -> "list[tuple[str, str, list[str]]]":
+def _applied_foreign_keys(
+    child, conversion, known_tables: "Optional[Iterable[str]]" = None
+) -> "list[tuple[str, str, list[str]]]":
     """``(constraint, referenced table, referenced columns)`` the FK pass will ADD.
 
     Read from the applied ``foreign_key_ddls`` -- the statements the pass actually runs,
     already empty when foreign keys are stripped -- so an FK deleted from an edited script
-    no longer blocks, and one ADDED to it does. A statement whose REFERENCES clause cannot
-    be read is skipped (no claim), never guessed.
+    no longer blocks, and one ADDED to it does. The REFERENCES clause of each statement
+    decides, because that text is what executes: an edit that keeps a constraint's NAME
+    but changes its columns follows the edit. The source FK of the same name is used only
+    when the clause cannot be read; a statement readable neither way is skipped (no claim).
+
+    A one-part parent name resolves the way the FK pass's connection does with DSQL's
+    default ``search_path`` ("$user", public): to ``public.<name>`` when that table is
+    migrated (``known_tables``); otherwise it is not one of this migration's tables and
+    makes no claim.
     """
     by_name = {
         fk.name: fk
         for fk in (
-            list(getattr(conversion, "preserved_foreign_keys", None) or ())
-            + list(getattr(child, "foreign_keys", None) or ())
+            list(getattr(child, "foreign_keys", None) or ())
+            + list(getattr(conversion, "preserved_foreign_keys", None) or ())
         )
     }
+    known = set(known_tables or ())
     found: list[tuple[str, str, list[str]]] = []
     for ddl in getattr(conversion, "foreign_key_ddls", None) or ():
         name_match = _FK_NAME_RE.search(ddl)
         name = _unquote(name_match.group(1)) if name_match else ""
-        known = by_name.get(name) if name else None
-        if known is not None:
-            found.append((name, known.referenced_table, list(known.referenced_columns)))
-            continue
         ref = _FK_REFERENCES_RE.search(ddl)
-        if not ref:
+        if ref:
+            parts = [_unquote(part) for part in re.findall(_IDENT, ref.group(1))]
+            table = ".".join(parts)
+            if len(parts) == 1:
+                table = f"public.{parts[0]}"
+                if table not in known:
+                    continue
+            columns = [_unquote(c) for c in re.findall(_IDENT, ref.group(2))]
+            found.append((name or "unnamed", table, columns))
             continue
-        table = ".".join(_unquote(part) for part in re.findall(_IDENT, ref.group(1)))
-        columns = [_unquote(c) for c in re.findall(_IDENT, ref.group(2))]
-        found.append((name or "unnamed", table, columns))
+        source_fk = by_name.get(name) if name else None
+        if source_fk is not None:
+            found.append((name, source_fk.referenced_table, list(source_fk.referenced_columns)))
     return found
 
 
@@ -236,7 +253,7 @@ def build_exclusion_context(
         conversion = conversions.get(child_name)
         if conversion is not None:
             # What the FK pass will actually ADD (empty when foreign keys are stripped).
-            fks = _applied_foreign_keys(child, conversion)
+            fks = _applied_foreign_keys(child, conversion, tables)
         elif preserve_foreign_keys:
             fks = [
                 (fk.name, fk.referenced_table, list(fk.referenced_columns))
