@@ -408,3 +408,28 @@ def test_the_text_report_names_the_proof():
                                            "excluded_nonnull_counts": {}})]})
     text = render_text_report(undetermined)
     assert "excluded proof: not determined" in text and "stopped" not in text
+
+
+class _Lost(Exception):
+    sqlstate = "08006"
+
+
+def test_a_lost_connection_during_the_proof_is_retried_with_the_proof_never_without_it(monkeypatch):
+    # A connection failure is not caused by the proof: dropping the proof would only lose
+    # it (and could release a table whose excluded column holds values).
+    monkeypatch.setattr(v.time, "sleep", lambda _s: None)
+    attempts = v._TARGET_RECONNECT_MAX_ATTEMPTS
+
+    def run(times):
+        source = _FakeSourceConnection(counts={"orders": 5})
+        target = _ProofTarget(counts={"orders": 5}, values={"orders": {"c": {1, 2}}}, fail=_Lost("reset"),
+                              fail_times=times)
+        return _validator(source, target, overlay={"orders": ["c"]}).validate(
+            _SOURCE_CONFIG, _TARGET_CONFIG, [_table("orders")]).items[0]
+
+    recovered = run(attempts)  # the reconnect budget of one pass, then it works
+    assert recovered.proof_state == "complete" and recovered.excluded_values_block is True
+    assert recovered.matched is False
+    lost = run(99)
+    assert lost.error is not None and lost.matched is False
+    assert lost.proof_reason == "table_error"  # never "query_error" with a released table

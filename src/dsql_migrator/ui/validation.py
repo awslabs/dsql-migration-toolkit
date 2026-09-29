@@ -960,16 +960,6 @@ def excluded_values_remedy(migration_state, job_manager) -> str:
             "never writes an excluded column. To hold NULL there, migrate the table "
             "with a Full load + CDC migration and choose Drop & reload for it."
         )
-    try:
-        streaming = bool(cdc_streaming_started(migration_state, job_manager))
-    except Exception:  # noqa: BLE001 - unknown: name the safe order
-        streaming = True
-    if streaming:
-        return (
-            "A table cannot be dropped while CDC streams to it: delete the CDC "
-            "infrastructure, reload the table on the Full Load step with Drop & reload, "
-            "then deploy and start CDC again."
-        )
     if job_id is not None:
         from dsql_migrator.core.job_manager import JobNotFoundError
 
@@ -982,10 +972,34 @@ def excluded_values_remedy(migration_state, job_manager) -> str:
             )
         except Exception:  # noqa: BLE001 - fall through to the usual path
             pass
-    return (
-        "Reload the table on the Full Load step ('Reload specific tables…') and choose "
-        "Drop & reload (an append keeps the stored values)."
+    try:
+        streaming = bool(cdc_streaming_started(migration_state, job_manager))
+    except Exception:  # noqa: BLE001 - unknown: name the safe order
+        streaming = True
+    # The Full Load step exists only for a Full load type; CDC-only reaches it by a type
+    # switch (the type is locked while CDC streams, so after Stop CDC).
+    switch = (
+        "set Migration type to Full load + CDC at the top of the Data Migration step, "
+        if cdc_only
+        else ""
     )
+    reload = (
+        "reload the table on the Full Load step ('Reload specific tables…') and choose "
+        "Drop & reload (an append keeps the stored values)"
+    )
+    if streaming:
+        from dsql_migrator.ui.data_migration._cdc_monitoring import _stop_then
+
+        return (
+            "A table cannot be dropped while CDC streams to it: "
+            + _stop_then(migration_state, job_manager)
+            + switch
+            + reload
+            + ", then Start CDC again (the excluded columns are unchanged, so the CDC "
+            "infrastructure stays)."
+        )
+    text = switch + reload + "."
+    return text[0].upper() + text[1:]
 
 
 # Sentinel string shown for the as-of when validation ran against the live source.
@@ -5097,15 +5111,22 @@ def _render_recovery_section(
     # Values in an excluded column cannot be "backfilled": the reload below is an
     # idempotent append, which keeps a stored value. Their own branch, and when they are
     # the ONLY finding, the only one.
-    values_only = bool(summary.excluded_values_only_tables) and set(
-        summary.failed_tables
-    ) <= set(summary.excluded_values_only_tables)
+    # The branch below is chosen by the OTHER failing tables: a values-only table must
+    # not make rows already known to be dropped read as an unexplained gap.
+    rest = set(summary.failed_tables) - set(summary.excluded_values_only_tables)
+    values_only = bool(summary.excluded_values_only_tables) and not rest
+    rest_explained = (
+        bool(summary.excluded_values_only_tables)
+        and bool(rest)
+        and rest <= set(summary.quarantine_explained_tables)
+        and not summary.errored_tables
+    )
     with _section(ui, icon=_icon, title=_title):  # type: ignore[misc]
         if summary.excluded_values:
             _render_excluded_values_recovery(ui, summary, excluded_values_remedy)
         if values_only:
             pass  # the reload runbooks below cannot clear a stored value
-        elif fully_explained:
+        elif fully_explained or rest_explained:
             render_notice(
                 ui,
                 tone="info",

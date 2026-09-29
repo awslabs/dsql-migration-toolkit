@@ -1802,7 +1802,10 @@ class Validator:
         concurrent overlay/restore ALTER gets exactly one schema conflict) re-runs the
         pass with the proof; any other failure re-runs it once WITHOUT the proof, which
         supplies the count, and the proof is "not determined". A failure the proof did
-        not cause (source side, cancel) propagates unchanged.
+        not cause propagates unchanged: the source side, a cancel, and a lost target
+        connection (the proof is not its cause, so dropping the proof would only lose
+        it) -- which gets the same one retry WITH the proof, then errors the table as it
+        does without exclusions.
         """
         if proof is None:
             return run(None)
@@ -1814,10 +1817,13 @@ class Validator:
             except Exception as exc:  # noqa: BLE001 - classified below
                 if proof.failed is None:
                     raise
-                if is_occ_conflict(exc) and not proof.retried:
+                transient = is_transient_connection_error(exc)
+                if (is_occ_conflict(exc) or transient) and not proof.retried:
                     proof.retried = True
                     proof.reset()
                     continue
+                if transient:
+                    raise
                 proof.reset()
                 proof.reason = "query_error"
                 return run(None)

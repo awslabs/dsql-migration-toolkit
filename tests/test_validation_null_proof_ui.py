@@ -444,19 +444,46 @@ class _Jobs:
         return SimpleNamespace(status="DONE", chunks=[])
 
 
-@pytest.mark.parametrize("mtype,job_id,known,streaming,expect", [
-    (MigrationType.FULL_LOAD_ONLY, "j", {"j"}, False, "Reload specific tables"),
-    (MigrationType.FULL_LOAD_AND_CDC, "j", {"j"}, True, "delete the CDC infrastructure"),
-    (MigrationType.FULL_LOAD_ONLY, "j", set(), False, "Start over"),
-    (MigrationType.CDC_ONLY, None, set(), False, "before CDC started"),
-    (MigrationType.CDC_ONLY, "j", {"j"}, False, "Reload specific tables"),
+@pytest.mark.parametrize("mtype,job_id,known,streaming,stopping,expect,absent", [
+    (MigrationType.FULL_LOAD_ONLY, "j", {"j"}, False, False, "Reload specific tables", "Migration type"),
+    # Stop CDC is enough (the excluded set is unchanged): never delete the infrastructure.
+    (MigrationType.FULL_LOAD_AND_CDC, "j", {"j"}, True, False, "Stop CDC, then reload the table",
+     "delete the CDC infrastructure"),
+    (MigrationType.FULL_LOAD_AND_CDC, "j", {"j"}, True, True, "wait for the Stop CDC that is running",
+     "delete"),
+    (MigrationType.FULL_LOAD_ONLY, "j", set(), False, False, "Start over", "Reload specific"),
+    (MigrationType.FULL_LOAD_AND_CDC, "j", set(), True, False, "Start over", "Stop CDC"),
+    (MigrationType.CDC_ONLY, None, set(), False, False, "before CDC started", "Reload specific"),
+    # CDC only has no Full Load step: the remedy names the type switch that shows it.
+    (MigrationType.CDC_ONLY, "j", {"j"}, False, False, "Set Migration type to Full load + CDC", "Stop CDC"),
+    (MigrationType.CDC_ONLY, "j", {"j"}, True, False, "Stop CDC, then set Migration type to Full load + CDC",
+     "delete"),
 ])
-def test_the_remedy_matrix(monkeypatch, mtype, job_id, known, streaming, expect):
+def test_the_remedy_matrix(monkeypatch, mtype, job_id, known, streaming, stopping, expect, absent):
+    import dsql_migrator.ui.data_migration._cdc_monitoring as cdc_monitoring
     import dsql_migrator.ui.data_migration._cdc_state as cdc_state
 
     monkeypatch.setattr(cdc_state, "cdc_streaming_started", lambda *_a, **_k: streaming)
+    monkeypatch.setattr(cdc_monitoring, "cdc_stop_in_flight", lambda *_a, **_k: stopping)
     text = excluded_values_remedy(SimpleNamespace(migration_type=mtype, job_id=job_id), _Jobs(known))
-    assert expect in text
+    assert expect in text and absent not in text, text
+    assert "Reload specific tables" in text or "Start over" in text or "before CDC started" in text
+
+
+def test_values_only_plus_known_dropped_rows_never_advise_backfill(monkeypatch):
+    notices, labels = [], []
+    monkeypatch.setattr(uiv, "render_notice", lambda ui, **kw: notices.append(kw))
+    dropped = TableValidationResult(table="q", source_row_count=5, target_row_count=4, row_count_match=False,
+                                    matched=False, rows_quarantined=1)
+    summary, report = _summary(_item("a", counts={"c": 3}, block=True), dropped)
+    assert summary.quarantine_explained_tables == ("q",) and summary.excluded_values_only_tables == ("a",)
+    ui = _Ui()
+    uiv._render_recovery_section(ui, summary, uiv.format_drift(report))
+    headers = [n["header"] for n in notices]
+    assert any("Drop & reload" in h for h in headers)
+    assert any("can't be stored as-is" in h for h in headers)
+    assert not any("backfill" in h.lower() for h in headers)
+    assert not any("Stop CDC" in t for t in ui.texts)
 
 
 def test_values_in_an_excluded_column_block_a_quarantine_acceptance():
