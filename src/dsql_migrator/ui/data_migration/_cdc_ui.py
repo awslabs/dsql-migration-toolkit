@@ -450,7 +450,9 @@ def _render_cdc_step(
             inventory,
             refresh,
             locked=lob_locked,
-            lock_reason=lob_lock_reason,
+            # The strict-order cause and its TRUE remedy (exclusion_lock_state) first.
+            lock_reason=exclusion_lock_state(migration_state, job_manager).reason
+            or lob_lock_reason,
             # Whether the lock means data moved (vs a stack that merely holds the set),
             # so the post-lock copy names the real cause and its remedy.
             data_moved=(
@@ -5911,5 +5913,8 @@ from dsql_migrator.ui.data_migration._cdc_monitoring import (  # noqa: E402,F401
     _render_full_load_quarantine_pointer,
     _render_migration_table_status,
     exclude_and_reload_block_reason,
+    exclusion_lock_state,
+    cdc_stack_being_deleted,
+    cdc_delete_eta,
     lob_exclusion_lock,
 )

@@ -1327,7 +1327,13 @@ def build_data_migration_screen(
                     # only draws the text `if locked and lock_reason`). Adding "unstable"
                     # to lob_exclusion_lock closed today's instance; this closes the
                     # CLASS, so the next contributor cannot reopen it.
-                    lock_reason=_lob_reason or selection_lock,
+                    # The strict-order cause and its TRUE remedy first; the legacy
+                    # texts only for a lock that function does not model.
+                    lock_reason=(
+                        exclusion_lock_state(migration_state, job_manager).reason
+                        or _lob_reason
+                        or selection_lock
+                    ),
                     migration_wide=True,
                     selected_tables=selected_names,
                     source_type=session_source_type(session),
@@ -3034,9 +3040,20 @@ def selection_lock_reason(
             "to migrate a different set of tables."
         )
     if cdc_streaming_started(migration_state, job_manager):
+        # A running Delete makes cdc_streaming_started True too: say it is a wait, not
+        # "stop CDC". Nested HERE (not above the clause) so a restored DELETE_IN_PROGRESS
+        # with no live connectors still reaches the infra clause below, which unlocks.
+        if cdc_stack_being_deleted(migration_state, job_manager):
+            estimate, _why = cdc_delete_eta(migration_state)
+            return (
+                f"Locked while the CDC infrastructure is being deleted (a cdc-stack delete "
+                f"takes {estimate}). Wait for the deletion to finish before changing the "
+                "table set."
+            )
         return (
             "Locked — CDC is running and its source connector streams a fixed table "
-            "set. To change it, stop CDC on the CDC step first."
+            "set. To change it, stop CDC, then delete the CDC infrastructure on the CDC "
+            "step."
         )
     # cdc_infra_prep_state folds EVERY non-stable stack status into "ready", so a stack
     # being TORN DOWN reached this clause and the remedy read "delete the CDC
@@ -4612,6 +4629,9 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     _render_cdc_lob_exclusion_panel,
     exclude_and_reload_block_reason,
     lob_exclusion_lock,
+    exclusion_lock_state,
+    cdc_stack_being_deleted,
+    cdc_delete_eta,
     _render_cdc_manual_inputs,
     _render_cdc_params_file,
     _render_cdc_partial_actions,

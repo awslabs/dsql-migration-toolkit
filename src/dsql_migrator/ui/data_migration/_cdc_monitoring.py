@@ -16,6 +16,7 @@ unchanged.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from collections.abc import Mapping, Sequence
 from typing import Optional
@@ -25,6 +26,7 @@ from dsql_migrator.core.models import LoadStatusView, SourceInventory, SourceTyp
 from dsql_migrator.ui.data_migration._cdc_state import (
     _CDC_POLL_INTERVAL_SECONDS,
     _cdc_is_streaming,
+    cdc_delete_in_flight,
     cdc_infra_deploy_in_flight,
     cdc_monitoring_visible,
     cdc_pipeline_live,
@@ -60,6 +62,7 @@ from dsql_migrator.ui.data_migration._cdc_status import (
     cdc_dlq_summary,
     cdc_error_log_key,
     is_cdc_error_record,
+    is_stack_teardown_status,
 )
 from dsql_migrator.ui.data_migration._full_load_ui import _quarantine_detail_row
 from dsql_migrator.ui.design import (
@@ -1621,7 +1624,12 @@ def _render_cdc_ai_button(ui, on_click, tooltip: str) -> None:
 
 
 def _render_cdc_schema_drift_banner(
-    ui, status_view: LoadStatusView, session=None, on_refresh=None, cdc_ai_opener=None
+    ui,
+    status_view: LoadStatusView,
+    session=None,
+    on_refresh=None,
+    cdc_ai_opener=None,
+    saved_exclusions: "Optional[Mapping[str, object]]" = None,
 ) -> None:
     """Flag source DDL the target has not caught up to (from the classified DLQ).
 
@@ -1691,6 +1699,18 @@ def _render_cdc_schema_drift_banner(
                 group.kind, (group.kind, "the source schema changed")
             )
             noun = "record" if group.count == 1 else "records"
+            # 23502 is ALSO what an excluded column produces when the target still
+            # requires it (NOT NULL, no DEFAULT): capture drops it from the event, so the
+            # sink sends no value. Say so for a table with saved exclusions, rather than
+            # only blaming a source DDL change that may never have happened.
+            _excluded = sorted((saved_exclusions or {}).get(group.table) or ())
+            if group.kind == "drop-column" and _excluded:
+                why = (
+                    f"{why}; or, since this table has saved column exclusions "
+                    f"({', '.join(_excluded)}), an excluded column the target still "
+                    "requires (NOT NULL, no DEFAULT) — it is not sent, so the same "
+                    "rejection follows"
+                )
             with ui.row().classes("w-full items-center gap-2"):  # type: ignore[attr-defined]
                 ui.label(  # type: ignore[attr-defined]
                     f"{group.table}: {label} — {why}. {group.count} {noun} dead-lettered."
@@ -1890,8 +1910,8 @@ def _render_cdc_oversized_recovery(
                 body=(
                     "The exclusion is migration-wide: the Full Load, the prerequisite checks "
                     "and the Validation comparison all stop covering this column too, and it "
-                    "arrives NULL for every row. Rows already dropped are NOT recovered by "
-                    "excluding the column — do the four steps below, in this order."
+                    "is no longer written for any row. Rows already dropped are NOT "
+                    "recovered by excluding the column — do the steps below, in this order."
                 ),
             )
             ui.label(  # type: ignore[attr-defined]
@@ -1919,17 +1939,10 @@ def _render_cdc_oversized_recovery(
             # it, and why the button that opens this dialog is disabled until CDC is stopped. A
             # reload under a live sink is separately forced into APPEND mode, so the rows
             # already on the target would keep the old column set too.
+            # The steps follow the REAL state (dlq_exclusion_runbook): this dialog opens only
+            # once no CDC infrastructure exists, and CDC only has no Full Load step.
             for index, step in enumerate(
-                (
-                    "Stop CDC (CDC step → Stop CDC) — its connectors committed offsets "
-                    "under the current column set.",
-                    "Exclude the column (this dialog).",
-                    "Reload this table from the Full Load step, choosing DROP so it is "
-                    "recreated without the column.",
-                    "Start CDC again — it re-sends the new capture config and resumes from "
-                    "the new snapshot point.",
-                ),
-                start=1,
+                dlq_exclusion_runbook(migration_state, job_manager), start=1
             ):
                 with ui.row().classes("items-start gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
                     ui.badge(str(index)).props("color=grey-7 outline")  # type: ignore[attr-defined]
@@ -2066,6 +2079,7 @@ def _render_cdc_dlq_panel(
         _render_cdc_schema_drift_banner(
             ui, status_view, session=session, on_refresh=on_refresh,
             cdc_ai_opener=cdc_ai_opener,
+            saved_exclusions=migration_state.lob_exclusions(),
         )
         _render_cdc_dlq_breakdown(ui, status_view)
         # CDC commonly has no Full Load job_id this session, so key the record list /
@@ -2396,6 +2410,261 @@ _EXCLUSION_BAKED_PHASES = (
 )
 
 
+def cdc_stack_being_deleted(migration_state, job_manager) -> bool:
+    """True while this session's cdc-stack is being DELETED (an expected wait, not a lock).
+
+    Either an in-session delete job is PENDING/RUNNING (:func:`cdc_delete_in_flight`), or
+    the probed stack reports ``DELETE_IN_PROGRESS`` (a restored session sees it that way).
+    Every exclusion lock checks this BEFORE its streaming / stack clauses: a delete job
+    makes ``cdc_streaming_started`` True and a deleting stack is phase "unstable", so those
+    clauses would otherwise tell the operator to start the Delete that is already running.
+    Not this: a FAILED delete (retrying the Delete is right) or a Stop (the stack stays).
+    """
+    return cdc_delete_in_flight(migration_state, job_manager) or is_stack_teardown_status(
+        getattr(migration_state, "cdc_stack_phase_status", None)
+    )
+
+
+def cdc_delete_eta(migration_state) -> "tuple[str, str]":
+    """``(estimate, why)`` for a cdc-stack delete, engine-aware (see core.cdc).
+
+    A PostgreSQL session (live or restored) has no seeder Lambda; a MySQL one is assumed to
+    (the conservative default -- the host seed mode is not read on a render path); an
+    unknown engine gets the covering range.
+    """
+    from dsql_migrator.core.cdc import (
+        cdc_teardown_estimate,
+        cdc_teardown_reason,
+        stack_has_seeder_lambda,
+    )
+
+    session = getattr(migration_state, "_session", None)
+    seeder: "Optional[bool]" = None
+    if session is not None:
+        engine = session_source_type(session)
+        seeder = None if engine is None else stack_has_seeder_lambda(engine, None)
+    return (
+        cdc_teardown_estimate(has_seeder_lambda=seeder),
+        cdc_teardown_reason(has_seeder_lambda=seeder),
+    )
+
+
+def _deleting_text(migration_state, what: str) -> str:
+    estimate, _why = cdc_delete_eta(migration_state)
+    return (
+        f"Locked while the CDC infrastructure is being deleted (a cdc-stack delete takes "
+        f"{estimate}). Wait for the deletion to finish before changing {what}."
+    )
+
+
+@dataclass(frozen=True)
+class ExclusionLockState:
+    """Why the column exclusions are fixed right now, in the ONE strict order.
+
+    ``tier``: 0 the CDC infrastructure is being deleted (info: an expected wait, no
+    remedy), 1 it is being created, 2 CDC is streaming or a stack holds the set, 3 a Full
+    Load committed data with it and no stack exists; ``None`` = not locked. ``reason`` is the
+    whole user-facing text, remedy included; ``tone`` its severity.
+    """
+
+    tier: "Optional[int]"
+    reason: "Optional[str]" = None
+    tone: str = "neutral"
+
+    @property
+    def locked(self) -> bool:
+        return self.tier is not None
+
+
+def exclusion_lock_state(migration_state, job_manager) -> ExclusionLockState:
+    """The exclusion lock's cause and its TRUE remedy, checked in strict order.
+
+    Order matters because the naive OR answered with the wrong remedy: the Full Load clause
+    (Start over) used to win over a stack that must be deleted first, and a running Delete
+    reached the streaming / stack clauses, which then offered that very Delete. So:
+    0 deleting > 1 creating > 2 streaming or stack > 3 Full Load committed.
+
+    The remedy then depends on whether a Full Load committed data (``job_id`` set: it
+    survives a pruned job record and a type switch; the FULL_LOAD step is not used, since
+    CDC alone promotes it to DONE) and on the migration type and engine. It never offers
+    "Stop CDC" as a complete remedy (a stopped stack keeps these exclusions and its
+    offsets), never a Manual start point as a way around a gap, and names only actions this
+    version has. Pure apart from job-status reads; no AWS I/O.
+    """
+    if cdc_stack_being_deleted(migration_state, job_manager):
+        estimate, why = cdc_delete_eta(migration_state)
+        return ExclusionLockState(
+            0,
+            "The CDC infrastructure is being deleted. This is in progress, not stuck: a "
+            f"cdc-stack delete takes {estimate} because {why}. Wait for the deletion to "
+            "finish before changing these exclusions.",
+            tone="info",
+        )
+    if cdc_infra_deploy_in_flight(migration_state, job_manager):
+        return ExclusionLockState(
+            1,
+            "Locked while the CDC infrastructure is being created — the excluded columns "
+            "were submitted with it. Wait for it to finish, then delete it on the CDC step "
+            "to change them.",
+        )
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    migration_type = getattr(migration_state, "migration_type", None)
+    job_id = getattr(migration_state, "job_id", None)
+    job_found = _current_job(job_manager, job_id) is not None if job_id else False
+    streaming = cdc_streaming_started(migration_state, job_manager)
+    has_streamed = streaming or bool(getattr(migration_state, "cdc_has_committed_offset", False))
+    stack = streaming or (
+        getattr(migration_state, "cdc_stack_phase", None) in _EXCLUSION_BAKED_PHASES
+    )
+    session = getattr(migration_state, "_session", None)
+    engine = session_source_type(session) if session is not None else None
+    reload_hint = (
+        " A table whose rows were quarantined can still be reloaded without the column "
+        "with its 'Exclude column & reload' once no CDC infrastructure is deployed."
+        if migration_type is not MigrationType.CDC_ONLY
+        else ""
+    )
+    if stack:
+        held = (
+            "Locked — CDC is streaming, and its source connector was started with these "
+            "excluded columns."
+            if streaming
+            else "Locked — the CDC infrastructure is deployed with these excluded columns."
+        )
+        delete = (
+            "delete the CDC infrastructure on the CDC step (Stop CDC alone is not enough: a "
+            "stopped stack keeps these exclusions and its offsets)"
+            if migration_type is not MigrationType.FULL_LOAD_ONLY
+            else "switch the migration type to Full load + CDC and delete the CDC "
+            "infrastructure on its CDC step (Full load only has no CDC step to delete it "
+            "from)"
+        )
+        if streaming:
+            delete = "Stop CDC, then " + delete
+        if job_id is not None:
+            # R1 / R1b: a Full Load committed data with this set -- the delete does not
+            # release it in this version; Start over does.
+            return ExclusionLockState(
+                2,
+                f"{held} A Full Load also loaded data with them, so they are fixed for this "
+                f"migration. To migrate a different column set, {delete}, then use Start "
+                f"over.{reload_hint}",
+            )
+        if migration_type is MigrationType.CDC_ONLY:
+            # R2: no Full Load; the delete takes the stream position with it.
+            if engine is SourceType.POSTGRES:
+                cost = (
+                    " The next Start CDC re-creates the publication and snapshots the "
+                    "captured tables again; a row already on Aurora DSQL that the source "
+                    "has since deleted stays there."
+                )
+            elif has_streamed:
+                cost = (
+                    " Deleting it also deletes the stream position and the MSK topics: the "
+                    "next Start CDC begins at the source's current position, so changes to "
+                    "the captured tables after the last one Aurora DSQL applied are NOT "
+                    "replicated. If they were written in that window, re-copy them: after "
+                    "the delete, switch the migration type to Full load + CDC and run its "
+                    "Full Load with Drop & reload for the tables that hold rows."
+                )
+            else:
+                cost = (
+                    " Start CDC then begins at the source's current position, as the first "
+                    "Start would have."
+                )
+            return ExclusionLockState(
+                2,
+                f"{held} To change them, {delete}, change the excluded columns here, then "
+                f"deploy it again and Start CDC.{cost} Rows already on Aurora DSQL keep "
+                "their values in newly excluded columns.",
+            )
+        # R3: a Full Load type, no Full Load has run yet.
+        again = (
+            "deploy it again (it can overlap the load), then Start Full Load"
+            if migration_type is not MigrationType.FULL_LOAD_ONLY
+            else "switch back to Full load only, then Start Full Load"
+        )
+        rows = (
+            " The captured tables already hold rows: choose Drop & reload in the Start "
+            "Full Load dialog for them."
+            if has_streamed
+            else ""
+        )
+        return ExclusionLockState(
+            2,
+            f"{held} To change them, {delete}, change the excluded columns, then {again}. "
+            f"No Full Load has run, so nothing needs reloading.{rows}",
+        )
+    if job_id is not None:
+        # R4: no stack, a Full Load committed data with this set.
+        if not job_found:
+            return ExclusionLockState(
+                3,
+                "Locked — a Full Load has already loaded data using this exclusion set, and "
+                "the record of that run is no longer available. To migrate a different "
+                "column set, use Start over.",
+            )
+        return ExclusionLockState(
+            3,
+            "Locked — a Full Load has already loaded data using this exclusion set, so the "
+            "excluded columns are fixed for this migration (changing them now would leave "
+            "the already-loaded rows inconsistent with what CDC captures). To migrate a "
+            f"different column set, use Start over.{reload_hint}",
+        )
+    return ExclusionLockState(None)
+
+
+def dlq_exclusion_runbook(migration_state, job_manager) -> "list[str]":
+    """The numbered steps the CDC dead-letter "Exclude column..." dialog shows.
+
+    The dialog opens only when :func:`exclude_and_reload_block_reason` allows it -- no CDC
+    infrastructure deployed, being created or being deleted, nothing streaming -- so the
+    steps start from there: "Stop CDC" is not one of them (a stopped stack keeps the old
+    set and blocks the exclusion), and a CDC-only migration is never sent to a Full Load
+    step it does not have. Only actions this version has are named.
+    """
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    migration_type = getattr(migration_state, "migration_type", None)
+    job_id = getattr(migration_state, "job_id", None)
+    job_found = _current_job(job_manager, job_id) is not None if job_id else False
+    session = getattr(migration_state, "_session", None)
+    engine = session_source_type(session) if session is not None else None
+    steps = ["Exclude the column (this dialog)."]
+    if migration_type is MigrationType.CDC_ONLY:
+        steps.append("Deploy the CDC infrastructure again.")
+        if engine is SourceType.POSTGRES:
+            steps.append(
+                "Start CDC — it re-creates the publication and snapshots the captured "
+                "tables again."
+            )
+        else:
+            steps.append(
+                "Start CDC — it begins at the source's current position (the stream "
+                "position went with the deleted infrastructure), so changes to this table "
+                "in between are not replicated."
+            )
+        return steps
+    if job_found:
+        steps.append(
+            "Reload this table from the Full Load step with Drop & reload: it is "
+            "recreated from its target DDL and the column is no longer written."
+        )
+    elif job_id is not None:
+        steps.append(
+            "The record of the last Full Load run is no longer available, so this table "
+            "cannot be reloaded from here: use Start over to reload it."
+        )
+    else:
+        steps.append(
+            "Start Full Load, choosing Drop & reload for this table if it holds rows."
+        )
+    steps.append("Deploy the CDC infrastructure again.")
+    steps.append("Start CDC.")
+    return steps
+
+
 def exclude_and_reload_block_reason(migration_state, job_manager) -> "Optional[str]":
     """Why the bundled "exclude this LOB column and reload the table" action is refused.
 
@@ -2423,11 +2692,19 @@ def exclude_and_reload_block_reason(migration_state, job_manager) -> "Optional[s
 
     Pure apart from the job-status reads the CDC helpers already do; no AWS I/O.
     """
+    if cdc_stack_being_deleted(migration_state, job_manager):
+        estimate, _why = cdc_delete_eta(migration_state)
+        return (
+            f"The CDC infrastructure is being deleted (a cdc-stack delete takes "
+            f"{estimate}). Wait for the deletion to finish, then exclude the column and "
+            "reload the table."
+        )
     if cdc_streaming_started(migration_state, job_manager):
         return (
-            "CDC is streaming — stop CDC first. Its connectors already committed "
-            "offsets using the current excluded-column set, so changing it now would "
-            "make the rows already streamed inconsistent with everything after."
+            "CDC is streaming — stop CDC, then delete the CDC infrastructure. Its "
+            "connectors already committed offsets using the current excluded-column set, "
+            "so changing it now would make the rows already streamed inconsistent with "
+            "everything after."
         )
     if cdc_infra_deploy_in_flight(migration_state, job_manager):
         return (
@@ -2495,10 +2772,14 @@ def lob_exclusion_lock(
             "un-excluded column would be NULL on loaded rows but populated on later "
             "changes, or vice versa). To migrate a different column set, use 'Start over'."
         )
+    if cdc_stack_being_deleted(migration_state, job_manager):
+        return True, _deleting_text(migration_state, "the excluded columns")
     if cdc_streaming_started(migration_state, job_manager):
         return True, (
-            "Locked — the excluded columns were handed to the source connector when "
-            "CDC started. Stop CDC to change them."
+            "Locked — CDC is streaming, and its source connector was started with these "
+            "excluded columns. To change them, Stop CDC, then delete the CDC "
+            "infrastructure on the CDC step (a stopped stack keeps these exclusions and "
+            "its offsets), then redeploy and start CDC."
         )
     # An infra create is in flight: the parameter went out with the stack, but the
     # operator was just here choosing, so say what happened.
