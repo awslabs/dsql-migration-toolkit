@@ -1744,10 +1744,16 @@ def stored_exclusion_issues(
 def exclusion_scope(migration_state) -> "Optional[list[str]]":
     """The tables the exclusion rule treats as migrated when the caller has no resolved set.
 
-    The stored selection (pinned by the prerequisite checks), or ``None`` -- every table --
-    while it is still the empty "= all" default. One definition, so the card, the gates and
-    the recovery actions judge B3 (a selected child's foreign key) over the same tables.
+    The selection the last Data Migration render RESOLVED (the same ``selected_names`` the
+    Full Load card is given -- an explicit "unselect all" stays ``[]``); before any render,
+    the stored selection, or ``None`` -- every table -- while that is still the empty
+    "= all" default. One definition, so the card, every gate (Continue, Start Full Load,
+    the header Run, Deploy, Attach) and the recovery actions judge the same tables.
     """
+    getter = getattr(migration_state, "resolved_selection", None)
+    resolved = getter() if callable(getter) else None
+    if resolved is not None:
+        return resolved
     selection = getattr(migration_state, "selection", None)
     return list(getattr(selection, "selected_tables", None) or ()) or None
 

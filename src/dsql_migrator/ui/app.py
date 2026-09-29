@@ -53,6 +53,7 @@ from dsql_migrator.ui.data_migration import (
     build_data_migration_screen,
     cdc_evidence_unverified,
     cdc_streaming_started,
+    data_migration_exclusion_block,
     full_load_run_guard_reason,
     prereq_mode_for_type,
 )
@@ -636,6 +637,14 @@ def build_page(
             migration_state,
             inventory,
             prereq_mode=prereq_mode_for_type(migration_state.migration_type),
+            # The same column-exclusion gate the in-content Start carries, so the header
+            # Run cannot start a load the Data Migration screen holds.
+            exclusion_block=data_migration_exclusion_block(
+                migration_state,
+                JOB_MANAGER,
+                SESSION_STORE.get_or_create(session_id),
+                inventory,
+            ),
         )
 
     # Resume support (Property 4): restore this session's persisted snapshot once

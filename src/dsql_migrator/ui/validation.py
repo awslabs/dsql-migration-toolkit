@@ -2121,6 +2121,37 @@ def build_validation_screen(
         except Exception:  # noqa: BLE001 - never let target-type resolution break a run
             return {}
 
+    def _excluded_columns(inv: "SourceInventory") -> "dict[str, frozenset[str]]":
+        """The EFFECTIVE exclusion set (key columns dropped) Full Load and CDC used.
+
+        Judged against the applied conversion the Data Migration render recorded; a
+        RESTORED session can reach Validation before any such render, and without the
+        applied DDL a Schema Conversion composite key's leading column would not be
+        recognised as a key -- Validation would then skip a column Full Load loaded. So
+        that case derives the applied conversion from the Schema Conversion state here.
+        """
+        applied = None
+        preserve = None
+        getter = getattr(migration_state, "applied_conversions", None)
+        recorded = getter()[0] if callable(getter) else {}
+        if not recorded and conv_state is not None:
+            try:
+                from dsql_migrator.core.converter import SchemaConverter
+                from dsql_migrator.ui.data_migration._models import session_source_type
+                from dsql_migrator.ui.schema_conversion import applied_table_conversions
+
+                applied = applied_table_conversions(
+                    SchemaConverter(source_type=session_source_type(session)).convert(inv),
+                    conv_state.edited_target_ddls,
+                    preserve_foreign_keys=conv_state.preserve_foreign_keys,
+                )
+                preserve = conv_state.preserve_foreign_keys
+            except Exception:  # noqa: BLE001 - fall back to the recorded / source facts
+                applied = None
+        return effective_lob_exclusions(
+            migration_state, inv, applied_conversions=applied, preserve_foreign_keys=preserve
+        )
+
     def _run_prerequisite_error() -> Optional[str]:
         """Return why a comparison cannot start right now, or ``None`` if it can.
 
@@ -2209,7 +2240,7 @@ def build_validation_screen(
             # the target can't cause a false checksum mismatch. The EFFECTIVE set (key
             # columns dropped), the same one Full Load and CDC use. Empty for a migration
             # that excluded nothing.
-            excluded_columns=effective_lob_exclusions(migration_state, scoped_inventory),
+            excluded_columns=_excluded_columns(scoped_inventory),
             quarantined_by_table=_migration_quarantined(),
             # Applied target types so a CHECKSUM honors a Schema-Conversion remap.
             target_types=_applied_target_types(scoped_inventory),
@@ -2488,7 +2519,7 @@ def build_validation_screen(
             reconcile=options.reconcile,
             # Always deep-check a re-check (see docstring).
             deep_only_on_count_mismatch=False,
-            excluded_columns=effective_lob_exclusions(migration_state, inventory),
+            excluded_columns=_excluded_columns(inventory),
             quarantined_by_table=_migration_quarantined(),
             # Applied target types so a CHECKSUM honors a Schema-Conversion remap.
             target_types=_applied_target_types(

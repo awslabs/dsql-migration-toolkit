@@ -2546,6 +2546,7 @@ def _render_cdc_lob_exclusion_panel(
     selected_tables: Optional[Sequence[str]] = None,
     source_type: SourceType = SourceType.MYSQL,
     capture_preview: Optional[str] = None,
+    data_moved: bool = True,
 ) -> None:
     """Render the explicit, opt-in oversized-LOB column exclusion (H13).
 
@@ -2594,6 +2595,7 @@ def _render_cdc_lob_exclusion_panel(
             selected_tables=selected_tables,
         ),
         refresh,
+        data_moved=data_moved,
     )
     if not candidates:
         # Nothing to exclude -> a lightweight info notice, not a heavy settings card.
@@ -2705,12 +2707,15 @@ def _render_cdc_lob_exclusion_panel(
                     )
                     ui.label(exclude_value).classes("text-xs font-mono")  # type: ignore[attr-defined]
 
-def _render_stored_exclusion_issues(ui, migration_state, issues, refresh) -> None:
+def _render_stored_exclusion_issues(
+    ui, migration_state, issues, refresh, *, data_moved: bool = True
+) -> None:
     """List saved exclusions that no longer apply; ERROR entries get a Remove button.
 
     An ERROR exists only while the card is unlocked (see ``stored_exclusion_issues``), so
-    the Remove is always actionable. After the lock the same entries are WARNING / INFO:
-    the data already moved under this set, and a key column is migrated regardless.
+    the Remove is always actionable. After the lock the same entries are WARNING / INFO,
+    and the copy names the lock's real cause: ``data_moved`` (a Full Load committed or CDC
+    has streamed) versus a CDC stack that merely holds the set, which deleting it releases.
     """
     from dsql_migrator.core.column_exclusion import IssueSeverity
 
@@ -2740,14 +2745,22 @@ def _render_stored_exclusion_issues(ui, migration_state, issues, refresh) -> Non
                     "flat dense color=negative"
                 )
     if warnings:
+        many = len(warnings) > 1
         render_notice(
             ui,
             tone="warning",
-            header="Some saved column exclusions do not apply",
+            header=(
+                f"{len(warnings)} saved column exclusion{'s' if many else ''} "
+                f"{'do' if many else 'does'} not apply as saved"
+            ),
             body=(
                 " ".join(i.message for i in warnings)
-                + " The data already moved under this set, so it is left as it is; "
-                "key columns are always migrated."
+                + (
+                    " The data already moved under this set, so it is left as it is."
+                    if data_moved
+                    else " The CDC infrastructure was deployed with this set; to change "
+                    "it, delete the CDC infrastructure on the CDC step first."
+                )
             ),
         )
     if infos:

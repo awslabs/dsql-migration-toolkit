@@ -434,6 +434,14 @@ def build_data_migration_screen(
                 "then start the data migration."
             )
             return
+        # Defense in depth: whatever button reached here, a column-exclusion block the
+        # guards show must also stop the start itself.
+        _exclusion_block = data_migration_exclusion_block(
+            migration_state, job_manager, session, inventory
+        )
+        if _exclusion_block:
+            migration_state.set_error(_exclusion_block)
+            return
         if not session.has_source():
             migration_state.set_error(
                 "Configure and test the source connection first, then start the "
@@ -857,18 +865,9 @@ def build_data_migration_screen(
                 # instead of failing every batch mid-load. The EFFECTIVE set -- the same
                 # one the Full Load inputs use -- so the gate never judges a key column
                 # the load would keep (effective_lob_exclusions).
-                _prereq_exclusions = effective_lob_exclusions(
-                    migration_state,
-                    inventory,
-                    applied_conversions=applied_table_conversions(
-                        SchemaConverter(
-                            source_type=session_source_type(session)
-                        ).convert(inventory),
-                        conv_state.edited_target_ddls,
-                        preserve_foreign_keys=conv_state.preserve_foreign_keys,
-                    ),
-                    preserve_foreign_keys=conv_state.preserve_foreign_keys,
-                )
+                # The conversion the render just recorded -- not a fresh full-inventory
+                # convert on the event loop for every click of Run checks.
+                _prereq_exclusions = effective_lob_exclusions(migration_state, inventory)
                 # The oversized-LOB columns to ask the per-value SIZE question about.
                 # Derived here, from the same helper that drives the Evaluation finding
                 # and the exclusion picker, because it lives in this UI layer and the
@@ -1289,6 +1288,12 @@ def build_data_migration_screen(
                 job_manager,
                 full_load_committed=(job is not None or status is StepStatus.DONE),
             )
+            # Every exclusion gate (this screen, the header Run, Deploy, Attach) judges the
+            # tables THIS render resolved -- the same set the card below is given.
+            migration_state.set_resolved_selection(selected_names)
+            _exclusions_committed = exclusion_card_locked(
+                migration_state, job_manager, session
+            )
             if migration_type is not MigrationType.CDC_ONLY:
                 # The LOB tick boxes are frozen by the same lock as the table picker, but
                 # they need the LOB-SPECIFIC reason: the picker's copy only talks about
@@ -1305,7 +1310,17 @@ def build_data_migration_screen(
                     migration_state,
                     inventory,
                     refresh,
-                    locked=selection_locked or _lob_locked,
+                    # == selection_locked or _lob_locked, via the ONE definition the gates
+                    # share (exclusion_card_locked).
+                    locked=_exclusions_committed,
+                    # Whether the lock means data moved (vs a stack that merely holds the
+                    # set), so the post-lock copy names the real cause and its remedy.
+                    data_moved=(
+                        job is not None
+                        or status is StepStatus.DONE
+                        or cdc_streaming_started(migration_state, job_manager)
+                        or bool(getattr(migration_state, "cdc_has_committed_offset", False))
+                    ),
                     # Fall back to the SELECTION lock's reason when the LOB clause has
                     # none: the `locked` flag is an OR, so any contributor without a
                     # reason renders a frozen card with nothing explaining it (the panel
@@ -1323,31 +1338,11 @@ def build_data_migration_screen(
             # reconnect) must not re-lock the re-run button.
             # A saved exclusion that no longer applies (a key column, a column another
             # selected table's foreign key references, a column the source dropped) holds
-            # Continue and Start Full Load while the card above can still remove it --
-            # judged with the card's own lock, so the gate never names a Remove the frozen
-            # card cannot perform. CDC only has no card here (its copy is inside the CDC
-            # sub-step, which this Continue leads to), so its Deploy button carries it.
-            # Before the lock, a source column the applied target DDL lacks holds them too:
-            # the load would fail on it (42703), and it is never excluded silently.
-            _exclusions_committed = selection_locked or _lob_locked
-            _exclusion_block = (
-                None
-                if migration_type is MigrationType.CDC_ONLY
-                else stored_exclusion_block_reason(
-                    stored_exclusion_issues(
-                        migration_state,
-                        inventory,
-                        committed=_exclusions_committed,
-                        selected_tables=selected_names,
-                    )
-                )
-                or (
-                    None
-                    if _exclusions_committed
-                    else missing_column_block_reason(
-                        migration_state, inventory, selected_tables=selected_names
-                    )
-                )
+            # Continue and Start Full Load while the card above can still remove it; so
+            # does a source column the applied target DDL lacks (42703). The same helper
+            # guards the header Run and runner(), so no entry point disagrees.
+            _exclusion_block = data_migration_exclusion_block(
+                migration_state, job_manager, session, inventory
             )
             guard_reason = full_load_run_guard_reason(
                 migration_state,
@@ -2586,6 +2581,65 @@ def prerequisites_section_expanded(
     the section and hide the running spinner / results. NiceGUI-agnostic for tests.
     """
     return active_substep == "prerequisites" or running or not done
+
+
+def exclusion_card_locked(migration_state, job_manager, session) -> bool:
+    """The oversized-LOB card's own ``locked`` flag, for every migration type.
+
+    The ONE definition the card and every gate that names its Remove share, so a gate can
+    never hold a button on an entry the frozen card cannot remove (a dead end), nor let a
+    button through while the unlocked card shows the entry as blocking. For a type with a
+    Full Load it is the Full Load screen's card lock (the table-picker lock OR
+    ``lob_exclusion_lock`` with the live job / step DONE); for CDC only, the CDC step's copy
+    (``lob_exclusion_lock`` with step DONE or a recorded job id).
+    """
+    workflow = getattr(session, "workflow", None)
+    status = get_status(workflow, WorkflowStep.FULL_LOAD) if workflow is not None else None
+    job = _current_job(job_manager, getattr(migration_state, "job_id", None))
+    migration_type = migration_state.migration_type
+    if migration_type is MigrationType.CDC_ONLY:
+        return lob_exclusion_lock(
+            migration_state,
+            job_manager,
+            full_load_committed=(
+                status is StepStatus.DONE
+                or getattr(migration_state, "job_id", None) is not None
+            ),
+        )[0]
+    selection_locked = (
+        selection_lock_reason(
+            migration_state,
+            job_manager,
+            status=status,
+            migration_type=migration_type,
+            has_job=job is not None,
+        )
+        is not None
+    )
+    return selection_locked or lob_exclusion_lock(
+        migration_state,
+        job_manager,
+        full_load_committed=(job is not None or status is StepStatus.DONE),
+    )[0]
+
+
+def data_migration_exclusion_block(
+    migration_state, job_manager, session, inventory
+) -> Optional[str]:
+    """The column-exclusion gate for Continue / Start Full Load, from EVERY entry point.
+
+    The in-content guard, the page header's Run (``app.data_migration_run_guard``) and
+    ``runner()`` itself all read this, so none can start a load the others hold. Before the
+    card locks: a saved exclusion that no longer applies, then a source column the applied
+    target DDL lacks (42703). ``None`` for CDC only, whose card sits inside the CDC sub-step
+    that Continue leads to -- its Deploy/Attach buttons carry the same gate there.
+    """
+    if migration_state.migration_type is MigrationType.CDC_ONLY:
+        return None
+    committed = exclusion_card_locked(migration_state, job_manager, session)
+    return stored_exclusion_block_reason(
+        stored_exclusion_issues(migration_state, inventory, committed=committed)
+    ) or (None if committed else missing_column_block_reason(migration_state, inventory))
 
 
 def full_load_run_guard_reason(
@@ -4457,6 +4511,8 @@ __all__ = [
     "PrereqCategoryGroup",
     "format_error_summary",
     "full_load_run_guard_reason",
+    "data_migration_exclusion_block",
+    "exclusion_card_locked",
     "full_load_progress_caption",
     "generated_table_names",
     "target_existing_table_names",

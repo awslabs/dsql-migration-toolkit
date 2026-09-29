@@ -37,8 +37,10 @@ passes it in.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import lru_cache
 from typing import TYPE_CHECKING, Iterable, Mapping, Optional
 
 if TYPE_CHECKING:
@@ -109,6 +111,75 @@ class ExclusionContext:
     fk_referenced: Mapping[str, Mapping[str, tuple[str, ...]]] = field(default_factory=dict)
 
 
+@lru_cache(maxsize=4096)
+def _ddl_key_facts(ddl: str) -> "tuple[tuple[str, ...], frozenset[str]]":
+    """(target primary key, generated columns) of an applied CREATE TABLE, cached by text.
+
+    Two sqlglot parses per table; the context is built on every render (the card, the
+    gates, the recovery routes), so without the cache a 1,000-table page re-parsed the same
+    DDL many times per render.
+    """
+    from dsql_migrator.core.converter import (
+        parse_target_generated_columns,
+        parse_target_primary_key,
+    )
+
+    return tuple(parse_target_primary_key(ddl)), frozenset(parse_target_generated_columns(ddl))
+
+
+# The FK pass applies each ``conv.foreign_key_ddls`` statement (an ``ALTER TABLE ... ADD
+# CONSTRAINT <name> FOREIGN KEY (...) REFERENCES <table> (<cols>) NOT VALID``); these read
+# its constraint name and REFERENCES clause. The name pattern mirrors the Full Load
+# engine's ``_FK_CONSTRAINT_NAME_RE`` (core must not import the UI layer).
+_FK_NAME_RE = re.compile(
+    r'ADD\s+CONSTRAINT\s+("(?:[^"]|"")+"|[^\s("]+)\s+FOREIGN\s+KEY', re.IGNORECASE
+)
+_IDENT = r'"(?:[^"]|"")+"|[^\s(".,]+'
+_FK_REFERENCES_RE = re.compile(
+    rf"REFERENCES\s+((?:{_IDENT})(?:\s*\.\s*(?:{_IDENT}))?)\s*\(([^)]*)\)",
+    re.IGNORECASE,
+)
+
+
+def _unquote(identifier: str) -> str:
+    identifier = identifier.strip()
+    if identifier.startswith('"') and identifier.endswith('"'):
+        return identifier[1:-1].replace('""', '"')
+    return identifier.lower()
+
+
+def _applied_foreign_keys(child, conversion) -> "list[tuple[str, str, list[str]]]":
+    """``(constraint, referenced table, referenced columns)`` the FK pass will ADD.
+
+    Read from the applied ``foreign_key_ddls`` -- the statements the pass actually runs,
+    already empty when foreign keys are stripped -- so an FK deleted from an edited script
+    no longer blocks, and one ADDED to it does. A statement whose REFERENCES clause cannot
+    be read is skipped (no claim), never guessed.
+    """
+    by_name = {
+        fk.name: fk
+        for fk in (
+            list(getattr(conversion, "preserved_foreign_keys", None) or ())
+            + list(getattr(child, "foreign_keys", None) or ())
+        )
+    }
+    found: list[tuple[str, str, list[str]]] = []
+    for ddl in getattr(conversion, "foreign_key_ddls", None) or ():
+        name_match = _FK_NAME_RE.search(ddl)
+        name = _unquote(name_match.group(1)) if name_match else ""
+        known = by_name.get(name) if name else None
+        if known is not None:
+            found.append((name, known.referenced_table, list(known.referenced_columns)))
+            continue
+        ref = _FK_REFERENCES_RE.search(ddl)
+        if not ref:
+            continue
+        table = ".".join(_unquote(part) for part in re.findall(_IDENT, ref.group(1)))
+        columns = [_unquote(c) for c in re.findall(_IDENT, ref.group(2))]
+        found.append((name or "unnamed", table, columns))
+    return found
+
+
 def build_exclusion_context(
     inventory: "Optional[SourceInventory]",
     applied_conversions: "Optional[Mapping[str, object]]" = None,
@@ -132,11 +203,7 @@ def build_exclusion_context(
     parsing every applied CREATE TABLE of a 1,000-table schema each time would stall the
     page; a table outside the focus simply has no B2/B4 facts. ``None`` parses all.
     """
-    from dsql_migrator.core.converter import (
-        parse_target_generated_columns,
-        parse_target_primary_key,
-        pg_preserved_generated_columns,
-    )
+    from dsql_migrator.core.converter import pg_preserved_generated_columns
 
     tables = {t.name: t for t in (getattr(inventory, "tables", None) or ())}
     conversions = applied_conversions or {}
@@ -146,11 +213,17 @@ def build_exclusion_context(
     for name in focus:
         table = tables[name]
         ddl = getattr(conversions.get(name), "target_ddl", None) or ""
-        pk = parse_target_primary_key(ddl) if ddl else []
+        if ddl:
+            pk, gen = _ddl_key_facts(ddl)
+        else:
+            # No applied DDL (a restored session before its first render): the source's
+            # preserved STORED generated columns are what the conversion would emit. With
+            # a DDL, the DDL alone decides -- an edit that removed the GENERATED clause
+            # made the column ordinary, and excludable.
+            pk = ()
+            gen = frozenset(c.name for c in pg_preserved_generated_columns(table))
         if pk:
             target_pk[name] = frozenset(pk)
-        gen = set(parse_target_generated_columns(ddl)) if ddl else set()
-        gen.update(c.name for c in pg_preserved_generated_columns(table))
         if gen:
             generated[name] = frozenset(gen)
     mkc = {
@@ -158,13 +231,23 @@ def build_exclusion_context(
     }
     selected = set(tables) if selected_tables is None else set(selected_tables)
     fk_ref: dict[str, dict[str, list[str]]] = {}
-    if preserve_foreign_keys:
-        for child_name in selected:
-            child = tables.get(child_name)
-            for fk in getattr(child, "foreign_keys", None) or ():
-                label = f"{child_name}.{fk.name}"
-                for col in fk.referenced_columns:
-                    fk_ref.setdefault(fk.referenced_table, {}).setdefault(col, []).append(label)
+    for child_name in selected:
+        child = tables.get(child_name)
+        conversion = conversions.get(child_name)
+        if conversion is not None:
+            # What the FK pass will actually ADD (empty when foreign keys are stripped).
+            fks = _applied_foreign_keys(child, conversion)
+        elif preserve_foreign_keys:
+            fks = [
+                (fk.name, fk.referenced_table, list(fk.referenced_columns))
+                for fk in getattr(child, "foreign_keys", None) or ()
+            ]
+        else:
+            fks = []
+        for fk_name, referenced_table, referenced_columns in fks:
+            label = f"{child_name}.{fk_name}"
+            for col in referenced_columns:
+                fk_ref.setdefault(referenced_table, {}).setdefault(col, []).append(label)
     return ExclusionContext(
         tables=tables,
         target_pk=target_pk,
@@ -324,16 +407,17 @@ def check_stored_exclusions(
                 continue
             codes = {f.code for f in verdict.findings}
             reason = " ".join(f.message for f in verdict.findings)
-            if committed and codes == {B4}:
-                severity = IssueSeverity.INFO
-                reason = "Computed by Aurora DSQL; already omitted."
+            if not committed:
+                severity, text = IssueSeverity.ERROR, f"{table}.{column} cannot be excluded: {reason}"
+            elif codes & ALWAYS_DROPPED:
+                # Dropped from the effective set on every path, so it IS migrated.
+                severity, text = IssueSeverity.WARNING, f"{table}.{column} is still migrated: {reason}"
+            elif codes == {B4}:
+                severity, text = IssueSeverity.INFO, f"{table}.{column}: computed by Aurora DSQL; already omitted."
             else:
-                severity = IssueSeverity.WARNING if committed else IssueSeverity.ERROR
-            issues.append(
-                StoredEntryIssue(
-                    table, column, severity, f"{table}.{column} cannot be excluded: {reason}"
-                )
-            )
+                # B3 is kept in the effective set once the set is baked in: it IS excluded.
+                severity, text = IssueSeverity.WARNING, f"{table}.{column} stays excluded, but: {reason}"
+            issues.append(StoredEntryIssue(table, column, severity, text))
     return tuple(issues)
 
 

@@ -451,6 +451,13 @@ def _render_cdc_step(
             refresh,
             locked=lob_locked,
             lock_reason=lob_lock_reason,
+            # Whether the lock means data moved (vs a stack that merely holds the set),
+            # so the post-lock copy names the real cause and its remedy.
+            data_moved=(
+                full_load_committed
+                or cdc_streaming_started(migration_state, job_manager)
+                or bool(getattr(migration_state, "cdc_has_committed_offset", False))
+            ),
             source_type=_cdc_source_type(session),
             # What Start CDC will SEND (preview == sent): the effective set plus the
             # captured tables' generated columns, in the form the chooser picks.
@@ -2618,14 +2625,36 @@ def _render_cdc_adopt_or_deploy_choice(
                 "straight to monitoring)."
             ),
         )
+        # Attaching locks the exclusion card (the stack now holds the capture list), so a
+        # saved exclusion that no longer applies must be removed FIRST -- same gate as
+        # Deploy, re-checked at click time in case the state moved since this render.
+        _attach_block = _stored_exclusion_deploy_block(
+            migration_state, job_manager, inventory, session
+        )
+        if _attach_block:
+            render_notice(
+                ui,
+                tone="error",
+                header="Remove the saved column exclusions that no longer apply",
+                body=_attach_block,
+            )
         with ui.row().classes("items-center gap-2 flex-wrap w-full"):  # type: ignore[attr-defined]
             for name, _status in in_scope:
                 def _adopt(_name=name) -> None:
+                    _now = _stored_exclusion_deploy_block(
+                        migration_state, job_manager, inventory, session
+                    )
+                    if _now:
+                        ui.notify(_now, type="warning", position="top")
+                        return
                     if migration_state.adopt_cdc_stack(_name):
                         refresh()
-                ui.button(  # type: ignore[attr-defined]
+                _attach_btn = ui.button(  # type: ignore[attr-defined]
                     f"Attach to {name}", on_click=_adopt, icon="link"
                 ).props("color=primary")
+                if _attach_block:
+                    _attach_btn.props("disable")
+                    _attach_btn.tooltip(_attach_block)
 
     # Present the deploy path according to whether attaching is actually an option.
     #
@@ -2780,29 +2809,23 @@ def _render_cdc_infra_deploy_action(
     _sync_gate()
 
 def _stored_exclusion_deploy_block(migration_state, job_manager, inventory, session):
-    """The stored-entry gate for Deploy CDC infrastructure, or ``None``.
+    """The column-exclusion gate for Deploy CDC infrastructure AND Attach, or ``None``.
 
-    Judged with the LOB card's own lock -- a Full Load that committed data (its job id,
-    or the step reached DONE: the CDC-only copy's clause) or a CDC pipeline already
-    holding the set -- so an ERROR here always has an unlocked card, rendered above this
-    button on either screen, offering its Remove. Start CDC carries no such gate: it is
-    offered only once a stack exists, where the card is locked and the entry is reported
-    there as a warning instead.
+    Judged with the LOB card's own lock (``exclusion_card_locked``, the one definition the
+    card and every gate share) over the tables the last render resolved
+    (``exclusion_scope``), so an ERROR here always has an unlocked card -- rendered above
+    this button on either screen -- offering its Remove. Attach needs it as much as Deploy:
+    attaching to an existing stack locks the card, so it is the last point at which a saved
+    exclusion that no longer applies can still be removed. Start CDC carries no such gate:
+    it is offered only once a stack exists, where the card is locked.
 
-    Before the lock it also holds Deploy on a source column the applied target DDL lacks:
-    the sink would dead-letter every change to it (42703). And it always holds Deploy when
-    the capture exclusions cannot be carried at all (``CdcCaptureExclusions.error``).
+    Before the lock it also holds on a source column the applied target DDL lacks (the sink
+    would dead-letter every change to it, 42703), and it always holds when the capture
+    exclusions cannot be carried at all (``CdcCaptureExclusions.error``).
     """
-    from dsql_migrator.ui.workflow import WorkflowStep, get_status
+    from dsql_migrator.ui.data_migration import exclusion_card_locked
 
-    workflow = getattr(session, "workflow", None)
-    full_load_committed = getattr(migration_state, "job_id", None) is not None or (
-        workflow is not None
-        and get_status(workflow, WorkflowStep.FULL_LOAD) is StepStatus.DONE
-    )
-    locked, _reason = lob_exclusion_lock(
-        migration_state, job_manager, full_load_committed=full_load_committed
-    )
+    locked = exclusion_card_locked(migration_state, job_manager, session)
     blocked = stored_exclusion_block_reason(
         stored_exclusion_issues(migration_state, inventory, committed=locked)
     ) or (None if locked else missing_column_block_reason(migration_state, inventory))

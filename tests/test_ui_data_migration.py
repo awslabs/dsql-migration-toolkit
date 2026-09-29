@@ -28674,10 +28674,10 @@ def _exclusion_inventory():
 def test_deploy_is_held_by_a_saved_exclusion_that_no_longer_applies() -> None:
     from dsql_migrator.ui.data_migration import _cdc_ui
 
-    def _render(state):
+    def _render(state, jobs=None):
         ui = _GateUi()
         _cdc_ui._render_cdc_infra_deploy_action(
-            ui, state, _StubJobManager({}), lambda: None,
+            ui, state, _StubJobManager(jobs or {}), lambda: None,
             inventory=_exclusion_inventory(), session=None,
         )
         return ui
@@ -28694,7 +28694,10 @@ def test_deploy_is_held_by_a_saved_exclusion_that_no_longer_applies() -> None:
     # Once data has moved under the set (a Full Load job exists) the card is locked, so the
     # gate must not name a Remove it cannot perform: it stops blocking.
     state.job_id = "job-1"
-    assert _render(state).deploy_button().enabled is True
+    assert _render(state, {"job-1": _StubJob("COMPLETED")}).deploy_button().enabled is True
+    # A job id whose record is GONE (pruned) does not lock the Full Load card, so the gate
+    # keeps holding -- the card still shows the entry with its Remove.
+    assert _render(state).deploy_button().enabled is False
     # And a valid set never blocks.
     fresh = _cdc_state_ready_for_deploy()
     fresh.set_cdc_infra_inputs({"vpc_id": "vpc-0123456789abcdef0"})

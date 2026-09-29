@@ -178,6 +178,12 @@ class DataMigrationState:
         # persisted; a restored session has it again after its first render.
         self._applied_conversions: dict[str, object] = {}
         self._preserve_foreign_keys: bool = True
+        # The table selection that render RESOLVED (effective_migration_selection: the
+        # picker, else the Schema Conversion default) -- ``None`` before any render. The
+        # exclusion card, its gates and the recovery actions judge the same tables with it
+        # (``_models.exclusion_scope``); the stored ``selection`` alone is the empty "= all"
+        # default until the picker is touched. Transient, like the two above.
+        self._resolved_selection: "Optional[list[str]]" = None
         # How the operator chose the CDC start point: "auto" (gapless from the
         # Full Load watermark) or "manual" (an explicit GTID / binlog position).
         # An explicit mode (vs. inferring it from whether an override is set)
@@ -529,6 +535,16 @@ class DataMigrationState:
         """``(applied conversions, preserve_foreign_keys)`` from the last render."""
         with self._lock:
             return dict(self._applied_conversions), self._preserve_foreign_keys
+
+    def set_resolved_selection(self, names: "Sequence[str]") -> None:
+        """Record the table selection the render resolved (see ``_resolved_selection``)."""
+        with self._lock:
+            self._resolved_selection = list(names)
+
+    def resolved_selection(self) -> "Optional[list[str]]":
+        """The last render's resolved table selection, or ``None`` before any render."""
+        with self._lock:
+            return None if self._resolved_selection is None else list(self._resolved_selection)
 
     def cdc_preserved_foreign_keys(self) -> "dict[str, list[str]]":
         """Return a copy of the FK constraint names this migration owns."""

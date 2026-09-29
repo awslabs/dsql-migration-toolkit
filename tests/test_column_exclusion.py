@@ -38,13 +38,27 @@ CHILD = _t(
                        referenced_table="shop.users", referenced_columns=["email"])],
 )
 INV = SourceInventory(tables=[PARENT, CHILD])
+_ORDERS_DDL = (
+    'CREATE TABLE "shop"."orders" ("id" INT NOT NULL, "tenant" TEXT NOT NULL, '
+    '"user_email" TEXT, "note" TEXT, "total2" INT GENERATED ALWAYS AS (id * 2) STORED, '
+    'PRIMARY KEY ("tenant", "id"))'
+)
+_FK_DDL = (
+    'ALTER TABLE "shop"."orders" ADD CONSTRAINT "fk_user" FOREIGN KEY ("user_email") '
+    'REFERENCES "shop"."users" ("email") NOT VALID'
+)
 APPLIED = {
-    # Schema Conversion re-keyed orders on (tenant, id) and kept a generated column.
-    "shop.orders": SimpleNamespace(target_ddl=(
-        'CREATE TABLE "shop"."orders" ("id" INT NOT NULL, "tenant" TEXT NOT NULL, '
-        '"user_email" TEXT, "note" TEXT, "total2" INT GENERATED ALWAYS AS (id * 2) STORED, '
-        'PRIMARY KEY ("tenant", "id"))'
-    )),
+    # Schema Conversion re-keyed orders on (tenant, id), kept a generated column, and the
+    # FK pass will add fk_user -- the shape applied_table_conversions returns.
+    "shop.orders": SimpleNamespace(
+        target_ddl=_ORDERS_DDL, foreign_key_ddls=[_FK_DDL],
+        preserved_foreign_keys=list(CHILD.foreign_keys)),
+}
+# The same with "Preserve foreign keys" off: applied_table_conversions empties the DDLs.
+APPLIED_NO_FK = {
+    "shop.orders": SimpleNamespace(
+        target_ddl=_ORDERS_DDL, foreign_key_ddls=[],
+        preserved_foreign_keys=list(CHILD.foreign_keys)),
 }
 
 
@@ -75,7 +89,7 @@ def test_b2_also_comes_from_the_cdc_rekey_map_without_applied_ddl():
 
 
 def test_b3_only_while_fks_are_preserved_and_only_for_selected_children():
-    stripped = build_exclusion_context(INV, APPLIED, preserve_foreign_keys=False)
+    stripped = build_exclusion_context(INV, APPLIED_NO_FK, preserve_foreign_keys=False)
     assert not column_exclusion_verdict("shop.users", "email", stripped).blocked
     unselected_child = build_exclusion_context(INV, APPLIED, selected_tables=["shop.users"])
     assert not column_exclusion_verdict("shop.users", "email", unselected_child).blocked
@@ -167,8 +181,9 @@ def test_every_path_reads_the_effective_set_not_the_raw_one():
     assert init.count("excluded_lob_columns=effective_lob_exclusions(") == 3
     assert init.count(raw) == 0  # the run guard reads state.lob_exclusions() on its own name
     assert "_prereq_exclusions = effective_lob_exclusions(" in init
-    assert "effective_lob_exclusions(migration_state" in (ui / "validation.py").read_text(
-        encoding="utf-8")
+    val = (ui / "validation.py").read_text(encoding="utf-8")
+    assert val.count("excluded_columns=_excluded_columns(") == 2
+    assert "return effective_lob_exclusions(\n            migration_state, inv," in val
     # CDC: every builder, the Start/Deploy gates and the CDC-only preview go through the ONE
     # helper (effective set + captured generated columns + the chooser); none formats alone.
     cdc = (root / "_cdc_ui.py").read_text(encoding="utf-8")
@@ -225,7 +240,7 @@ def test_every_path_judges_against_the_recorded_applied_conversion():
     assert effective_lob_exclusions(state, INV)["shop.orders"] == frozenset({"tenant", "note"})
     # The render records the applied conversion; a path that holds no Schema Conversion
     # state (CDC builders, Validation) now drops the composite key's leading column too.
-    state.set_applied_conversions(APPLIED, preserve_foreign_keys=False)
+    state.set_applied_conversions(APPLIED_NO_FK, preserve_foreign_keys=False)
     assert effective_lob_exclusions(state, INV)["shop.orders"] == frozenset({"note"})
     # The recorded FK toggle reaches B3: with FKs stripped, users.email is excludable.
     issues = {(i.table, i.column) for i in stored_exclusion_issues(state, INV, committed=False)}
@@ -270,20 +285,22 @@ def test_full_load_guard_puts_the_stored_entry_gate_first():
 def test_screen_wires_the_gate_with_the_cards_own_lock_and_records_the_conversion():
     """``content()`` is not rendered by the unit suite, so pin its wiring structurally.
 
-    The gate's ``committed`` must be the SAME expression as the card's ``locked``: if they
-    drift, the guard can name a Remove the frozen card does not offer (a dead end), or the
-    card can offer a Remove for an entry the gate never blocks on.
+    The card's ``locked`` must come from the SAME helper every gate uses
+    (``exclusion_card_locked``); the in-content guard, the header Run and ``runner()`` must
+    all read ``data_migration_exclusion_block``; and the render must record what the gates
+    judge against (the resolved selection and the applied conversion).
     """
     import ast
     import inspect
 
+    import dsql_migrator.ui.app as app
     import dsql_migrator.ui.data_migration as dm
 
     tree = ast.parse(inspect.getsource(dm.build_data_migration_screen))
 
-    def _calls(name):
+    def _calls(name, t=tree):
         return [
-            n for n in ast.walk(tree)
+            n for n in ast.walk(t)
             if isinstance(n, ast.Call) and getattr(n.func, "id", getattr(n.func, "attr", None)) == name
         ]
 
@@ -291,22 +308,27 @@ def test_screen_wires_the_gate_with_the_cards_own_lock_and_records_the_conversio
         return next(ast.unparse(k.value) for k in call.keywords if k.arg == key)
 
     (panel,) = _calls("_render_cdc_lob_exclusion_panel")
-    (issues,) = _calls("stored_exclusion_issues")
-    assert _kw(panel, "locked") == "selection_locked or _lob_locked"
+    assert _kw(panel, "locked") == "_exclusions_committed"
+    assert _kw(panel, "selected_tables") == "selected_names"
     (assign,) = [
         n for n in ast.walk(tree)
         if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "_exclusions_committed"
     ]
-    assert ast.unparse(assign.value) == _kw(panel, "locked")
-    assert _kw(issues, "committed") == "_exclusions_committed"
-    (missing,) = _calls("missing_column_block_reason")
-    assert _kw(missing, "selected_tables") == "selected_names"
-    assert _kw(panel, "selected_tables") == _kw(issues, "selected_tables") == "selected_names"
+    assert ast.unparse(assign.value) == "exclusion_card_locked(migration_state, job_manager, session)"
+    (record_sel,) = _calls("set_resolved_selection")
+    assert ast.unparse(record_sel.args[0]) == "selected_names"
+    # In-content guard + runner() defense in depth.
+    assert len(_calls("data_migration_exclusion_block")) == 2
     (guard,) = _calls("full_load_run_guard_reason")
     assert _kw(guard, "exclusion_block") == "_exclusion_block"
     (record,) = _calls("set_applied_conversions")
     assert ast.unparse(record.args[0]) == "_applied"
     assert _kw(record, "preserve_foreign_keys") == "conv_state.preserve_foreign_keys"
+    # The page header's Run reads the same gate.
+    app_tree = ast.parse(inspect.getsource(app))
+    header = [c for c in _calls("full_load_run_guard_reason", app_tree)]
+    assert header and all(
+        "data_migration_exclusion_block(" in _kw(c, "exclusion_block") for c in header)
 
 
 # ---------------------------------------------------------------------------
@@ -484,8 +506,11 @@ def test_deploy_gate_blocks_a_missing_column_only_before_the_lock():
     )
     assert "shop.users.bio is not in your Aurora DSQL table" in _stored_exclusion_deploy_block(
         state, _StubJobManager({}), INV, None)
+    from tests.test_ui_data_migration import _StubJob
+
     state.job_id = "job-1"  # data moved: the card is locked, the gate no longer blocks
-    assert _stored_exclusion_deploy_block(state, _StubJobManager({}), INV, None) is None
+    assert _stored_exclusion_deploy_block(
+        state, _StubJobManager({"job-1": _StubJob("COMPLETED")}), INV, None) is None
 
 
 def test_memory_pressure_copy_does_not_offer_a_locked_exclusion_mid_load():
@@ -499,3 +524,179 @@ def test_memory_pressure_copy_does_not_offer_a_locked_exclusion_mid_load():
     # (the activity-log copy splits the sentence across two adjacent literals)
     assert src.count("only before a load; the choice") == 2
     assert src.count("locks once a Full Load has run.") == 2
+
+
+def test_b3_and_b4_follow_the_edited_script_not_the_source():
+    """An FK removed from the edited script no longer blocks; one ADDED to it does; a
+    GENERATED clause removed by an edit leaves an ordinary, excludable column."""
+    edited = {"shop.orders": SimpleNamespace(
+        target_ddl=_ORDERS_DDL.replace(" GENERATED ALWAYS AS (id * 2) STORED", ""),
+        foreign_key_ddls=[  # fk_user deleted; a new FK on note -> users.bio added
+            'ALTER TABLE "shop"."orders" ADD CONSTRAINT "fk_bio" FOREIGN KEY ("note") '
+            'REFERENCES "shop"."users" ("bio") NOT VALID'],
+        preserved_foreign_keys=list(CHILD.foreign_keys))}
+    ctx = build_exclusion_context(INV, edited)
+    assert not column_exclusion_verdict("shop.users", "email", ctx).blocked
+    bio = column_exclusion_verdict("shop.users", "bio", ctx)
+    assert _codes(bio) == {B3} and "shop.orders.fk_bio" in bio.findings[0].message
+    assert not column_exclusion_verdict("shop.orders", "total2", ctx).blocked
+    # Unquoted / unqualified REFERENCES spellings resolve the same way PostgreSQL does.
+    unquoted = {"shop.orders": SimpleNamespace(
+        target_ddl=_ORDERS_DDL, preserved_foreign_keys=[],
+        foreign_key_ddls=['ALTER TABLE shop.orders ADD CONSTRAINT fk2 FOREIGN KEY (note) '
+                          'REFERENCES shop.Users (BIO, "Email") NOT VALID'])}
+    ctx2 = build_exclusion_context(
+        SourceInventory(tables=[_t("shop.users", ["id", "bio", "Email"]), CHILD]), unquoted)
+    assert _codes(column_exclusion_verdict("shop.users", "bio", ctx2)) == {B3}
+    assert _codes(column_exclusion_verdict("shop.users", "Email", ctx2)) == {B3}
+    # A statement whose REFERENCES cannot be read makes no claim.
+    garbled = {"shop.orders": SimpleNamespace(target_ddl=_ORDERS_DDL, preserved_foreign_keys=[],
+                                              foreign_key_ddls=["ALTER TABLE x ADD CONSTRAINT y FOREIGN KEY"])}
+    assert not column_exclusion_verdict("shop.users", "email", build_exclusion_context(INV, garbled)).blocked
+
+
+def test_validation_recognises_a_composite_key_after_a_restore(monkeypatch):
+    """A restored session reaching Validation before any Data Migration render has no
+    recorded conversion; the effective set must still drop the composite key's column."""
+    import inspect
+
+    import dsql_migrator.ui.validation as validation
+
+    src = inspect.getsource(validation.build_validation_screen)
+    body = src[src.index("def _excluded_columns("):src.index("def _run_prerequisite_error(")]
+    # Only when nothing is recorded, and with the Schema Conversion state's own inputs.
+    assert "if not recorded and conv_state is not None:" in body
+    assert "conv_state.edited_target_ddls" in body and "conv_state.preserve_foreign_keys" in body
+    # The shape it relies on: an explicit applied conversion drops B2 with no recorded state.
+    from dsql_migrator.ui.data_migration._models import effective_lob_exclusions
+
+    state = _state_with([("shop.orders", "tenant"), ("shop.orders", "note")])
+    assert effective_lob_exclusions(state, INV)["shop.orders"] == frozenset({"tenant", "note"})
+    assert effective_lob_exclusions(state, INV, applied_conversions=APPLIED)["shop.orders"] == frozenset({"note"})
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: one lock, one scope, every entry point, honest post-lock copy
+# ---------------------------------------------------------------------------
+
+
+def _session(status=None):
+    from dsql_migrator.ui.workflow import WorkflowStep, with_status, WorkflowState
+
+    wf = WorkflowState()
+    if status is not None:
+        wf = with_status(wf, WorkflowStep.FULL_LOAD, status)
+    return SimpleNamespace(workflow=wf)
+
+
+def test_exclusion_card_locked_matches_each_cards_own_lock():
+    from dsql_migrator.core.models import StepStatus
+    from dsql_migrator.ui.data_migration import MigrationType, exclusion_card_locked
+
+    from tests.test_ui_data_migration import _StubJob, _StubJobManager
+
+    state = _state_with([])
+    state.migration_type = MigrationType.FULL_LOAD_AND_CDC
+    empty = _StubJobManager({})
+    assert exclusion_card_locked(state, empty, _session()) is False
+    state.job_id = "job-1"
+    # A live job (or the step DONE) locks the Full Load card; a PRUNED job id does not.
+    assert exclusion_card_locked(state, _StubJobManager({"job-1": _StubJob("COMPLETED")}), _session())
+    assert exclusion_card_locked(state, empty, _session(StepStatus.FAILED)) is False
+    assert exclusion_card_locked(state, empty, _session(StepStatus.DONE))
+    # CDC only: its card locks on the recorded job id itself (the load ran under another type).
+    state.migration_type = MigrationType.CDC_ONLY
+    assert exclusion_card_locked(state, empty, _session())
+    # A deployed stack locks both.
+    fresh = _state_with([])
+    fresh.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
+    assert exclusion_card_locked(fresh, empty, _session())
+
+
+def test_every_gate_judges_the_tables_the_render_resolved():
+    from tests.test_ui_data_migration import _StubJobManager
+    from dsql_migrator.ui.data_migration._cdc_ui import _stored_exclusion_deploy_block
+
+    state = _state_with([("shop.users", "id")])
+    assert _stored_exclusion_deploy_block(state, _StubJobManager({}), INV, None)
+    state.set_resolved_selection(["shop.orders"])  # users not migrated: its entry is inert
+    assert _stored_exclusion_deploy_block(state, _StubJobManager({}), INV, None) is None
+    state.set_resolved_selection([])  # an explicit "unselect all" judges nothing
+    assert _stored_exclusion_deploy_block(state, _StubJobManager({}), INV, None) is None
+
+
+def test_attach_is_held_like_deploy_and_refuses_at_click_time():
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    from tests.test_ui_data_migration import _RecordingUi, _StubJobManager
+
+    state = _state_with([("shop.users", "id")])
+    state.set_cdc_other_stacks([("dsql-cdc-old", "CREATE_COMPLETE")])
+    ui = _RecordingUi()
+    _cdc_ui._render_cdc_adopt_or_deploy_choice(
+        ui, state, _StubJobManager({}), lambda: None, [("dsql-cdc-old", "CREATE_COMPLETE")],
+        inventory=INV, session=None)
+    (attach,) = [b for b in ui.buttons if b.text == "Attach to dsql-cdc-old"]
+    assert "disable" in attach.props_seen
+    assert "shop.users.id cannot be excluded" in " ".join(ui.texts)
+    attach.on_click()  # a stale enabled button must still refuse
+    assert state.cdc_stack_name != "dsql-cdc-old"
+    # Nothing to remove -> Attach offered normally.
+    clean = _state_with([])
+    ui2 = _RecordingUi()
+    _cdc_ui._render_cdc_adopt_or_deploy_choice(
+        ui2, clean, _StubJobManager({}), lambda: None, [("dsql-cdc-old", "CREATE_COMPLETE")],
+        inventory=INV, session=None)
+    (ok,) = [b for b in ui2.buttons if b.text == "Attach to dsql-cdc-old"]
+    assert "disable" not in ok.props_seen
+
+
+def test_post_lock_copy_names_the_real_cause_and_what_each_entry_does():
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    from tests.test_ui_data_migration import _RecordingUi
+
+    stored = {"shop.users": {"id", "email"}, "shop.orders": {"total2"}}
+    ctx = build_exclusion_context(INV, APPLIED)
+    after = {(i.table, i.column): i for i in check_stored_exclusions(stored, ctx, committed=True)}
+    assert after[("shop.users", "id")].message.startswith("shop.users.id is still migrated:")
+    assert after[("shop.users", "email")].message.startswith("shop.users.email stays excluded, but:")
+    assert after[("shop.orders", "total2")].severity is IssueSeverity.INFO
+
+    state = _state_with([("shop.users", "id")])
+    for data_moved, expected in ((True, "already moved under this set"),
+                                 (False, "delete the CDC infrastructure on the CDC step first")):
+        ui = _RecordingUi()
+        _cdc_ui._render_cdc_lob_exclusion_panel(
+            ui, state, INV, lambda: None, locked=True, lock_reason="Locked.",
+            migration_wide=True, data_moved=data_moved)
+        joined = " ".join(ui.texts)
+        assert expected in joined, (data_moved, joined)
+        assert "1 saved column exclusion does not apply as saved" in joined
+
+
+def test_the_context_parses_each_ddl_once_across_renders():
+    from dsql_migrator.core import column_exclusion as ce
+
+    ce._ddl_key_facts.cache_clear()
+    for _ in range(5):
+        build_exclusion_context(INV, APPLIED)
+    info = ce._ddl_key_facts.cache_info()
+    assert info.misses == 1 and info.hits == 4
+
+
+def test_an_edit_that_drops_the_generated_clause_makes_a_pg_generated_column_excludable():
+    src_table = TableDef(
+        name="app.items",
+        columns=[ColumnDef(name="id", mysql_type="integer"),
+                 ColumnDef(name="doubled", mysql_type="integer", generated=True,
+                           generated_kind="STORED", generated_expression="id * 2")],
+        primary_key=["id"])
+    inv = SourceInventory(tables=[src_table])
+    # No applied DDL (restored session): the source says DSQL will compute it -> B4.
+    assert _codes(column_exclusion_verdict("app.items", "doubled", build_exclusion_context(inv))) == {B4}
+    # The applied (edited) DDL made it an ordinary column: the DDL alone decides.
+    edited = {"app.items": SimpleNamespace(
+        target_ddl='CREATE TABLE "app"."items" ("id" INTEGER PRIMARY KEY, "doubled" INTEGER)',
+        foreign_key_ddls=[], preserved_foreign_keys=[])}
+    assert not column_exclusion_verdict("app.items", "doubled", build_exclusion_context(inv, edited)).blocked
