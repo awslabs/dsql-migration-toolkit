@@ -1315,6 +1315,14 @@ def build_data_migration_screen(
             _exclusions_committed = exclusion_card_locked(
                 migration_state, job_manager, session
             )
+            # The capture list CDC will send after this load: computed ONCE per render for
+            # both the Continue/Start hold and the card's notices (Full load + CDC only).
+            _pre_load_capture_now = (
+                _pre_load_capture(migration_state, inventory)
+                if migration_type is MigrationType.FULL_LOAD_AND_CDC
+                and getattr(migration_state, "job_id", None) is None
+                else None
+            )
             if migration_type is not MigrationType.CDC_ONLY:
                 # The LOB tick boxes are frozen by the same lock as the table picker, but
                 # they need the LOB-SPECIFIC reason: the picker's copy only talks about
@@ -1340,7 +1348,8 @@ def build_data_migration_screen(
                         migration_state, job_manager
                     ),
                     capture_notices=capture_pre_load_notices(
-                        migration_state, job_manager, inventory
+                        migration_state, job_manager, inventory,
+                        session=session, capture=_pre_load_capture_now,
                     ),
                     # Fall back to the SELECTION lock's reason when the LOB clause has
                     # none: the `locked` flag is an OR, so any contributor without a
@@ -1369,7 +1378,8 @@ def build_data_migration_screen(
             # does a source column the applied target DDL lacks (42703). The same helper
             # guards the header Run and runner(), so no entry point disagrees.
             _exclusion_block = data_migration_exclusion_block(
-                migration_state, job_manager, session, inventory
+                migration_state, job_manager, session, inventory,
+                capture=_pre_load_capture_now,
             )
             guard_reason = full_load_run_guard_reason(
                 migration_state,
@@ -2714,8 +2724,22 @@ def exclusion_card_locked(migration_state, job_manager, session=None) -> bool:
     )[0]
 
 
+def table_set_lock_reason(migration_state, job_manager, session) -> Optional[str]:
+    """The table picker's own lock reason (``selection_lock_reason``) for this session."""
+    workflow = getattr(session, "workflow", None)
+    status = get_status(workflow, WorkflowStep.FULL_LOAD) if workflow is not None else None
+    job = _current_job(job_manager, getattr(migration_state, "job_id", None))
+    return selection_lock_reason(
+        migration_state,
+        job_manager,
+        status=status,
+        migration_type=migration_state.migration_type,
+        has_job=job is not None,
+    )
+
+
 def data_migration_exclusion_block(
-    migration_state, job_manager, session, inventory
+    migration_state, job_manager, session, inventory, *, capture=None
 ) -> Optional[str]:
     """The column-exclusion gate for Continue / Start Full Load, from EVERY entry point.
 
@@ -2742,7 +2766,8 @@ def data_migration_exclusion_block(
     # afterwards Deploy / Start CDC would refuse with only Start over left. Judged even
     # when a stack (deployed early, or attached) already locks the card: the remedy is
     # then the lock's own (delete, change, redeploy), which is still possible pre-load.
-    capture = _pre_load_capture(migration_state, inventory)
+    if capture is None:
+        capture = _pre_load_capture(migration_state, inventory)
     if capture is None or not capture.error:
         return None
     # When the generated columns alone exceed the limit, no exclusion change fixes it and
@@ -2762,7 +2787,9 @@ def _pre_load_capture(migration_state, inventory):
     return cdc_capture_exclusions(migration_state, inventory, tables)
 
 
-def capture_pre_load_notices(migration_state, job_manager, inventory) -> list[str]:
+def capture_pre_load_notices(
+    migration_state, job_manager, inventory, *, session=None, capture=None
+) -> list[str]:
     """Non-blocking CDC capture warnings for the Full Load screen's exclusion card.
 
     Full load + CDC before any load: the generated columns alone exceed the capture limit
@@ -2774,12 +2801,20 @@ def capture_pre_load_notices(migration_state, job_manager, inventory) -> list[st
         or getattr(migration_state, "job_id", None) is not None
     ):
         return []
-    capture = _pre_load_capture(migration_state, inventory)
+    if capture is None:
+        capture = _pre_load_capture(migration_state, inventory)
     if capture is None:
         return []
     notes: list[str] = []
     if capture.error and capture.generated_bytes > CDC_PARAMETER_BYTE_LIMIT:
-        notes.append(capture_error_with_remedy(migration_state, job_manager, capture))
+        notes.append(
+            capture_error_with_remedy(
+                migration_state,
+                job_manager,
+                capture,
+                table_lock=table_set_lock_reason(migration_state, job_manager, session),
+            )
+        )
     ambiguity = capture_ambiguity_warning(capture)
     if ambiguity:
         notes.append(ambiguity)
@@ -4674,6 +4709,7 @@ __all__ = [
     "full_load_run_guard_reason",
     "data_migration_exclusion_block",
     "exclusion_card_locked",
+    "table_set_lock_reason",
     "make_exclusion_inputs_resolver",
     "resolve_migration_selection",
     "full_load_progress_caption",

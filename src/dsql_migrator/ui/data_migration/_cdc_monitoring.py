@@ -2554,14 +2554,18 @@ def exclusion_after_lock_note(migration_state, job_manager) -> str:
     )
 
 
-def capture_error_with_remedy(migration_state, job_manager, capture) -> str:
+def capture_error_with_remedy(
+    migration_state, job_manager, capture, *, table_lock: "Optional[str]" = None
+) -> str:
     """A capture-size refusal plus the remedy that is TRUE for its cause and the state.
 
     If the generated columns Aurora DSQL computes -- added automatically, never the
     operator's choice -- alone exceed the limit, fewer exclusions cannot fix it: capture
-    fewer tables per CDC pipeline, or use Full load only. Otherwise, while the exclusion
-    card is editable: exclude fewer columns there; once it is locked, the lock's own
-    cause-and-remedy text.
+    fewer tables per CDC pipeline, or use Full load only. How to capture fewer tables
+    depends on the table picker: ``table_lock`` is its own lock reason (a Full Load ran,
+    CDC streams, a stack holds the set, ...), whose remedy is appended verbatim; with no
+    lock, deselect tables. Otherwise, while the exclusion card is editable: exclude fewer
+    columns there; once it is locked, the lock's own cause-and-remedy text.
     """
     from dsql_migrator.core.cdc import CDC_PARAMETER_BYTE_LIMIT
     from dsql_migrator.ui.data_migration._models import CAPTURE_SIZE_REMEDY_UNLOCKED
@@ -2571,8 +2575,12 @@ def capture_error_with_remedy(migration_state, job_manager, capture) -> str:
             f"{capture.error} The generated columns Aurora DSQL computes -- which CDC "
             f"must not stream -- alone need {capture.generated_bytes:,} bytes, so "
             "excluding fewer columns cannot fix it: capture fewer tables in this CDC "
-            "pipeline (deselect tables in the table picker; once a Full Load has run that "
-            "needs Start over), or use Full load only."
+            "pipeline, or use Full load only. "
+            + (
+                f"The table picker is locked. {table_lock}"
+                if table_lock
+                else "Deselect tables in the table picker."
+            )
         )
     lock = exclusion_lock_state(migration_state, job_manager)
     return f"{capture.error} {lock.reason if lock.locked else CAPTURE_SIZE_REMEDY_UNLOCKED}"
@@ -2857,11 +2865,18 @@ def exclude_and_reload_block_reason(migration_state, job_manager) -> "Optional[s
             "submitted with it. Wait for it to finish, then delete it to re-scope."
         )
     if getattr(migration_state, "cdc_stack_phase", None) in _EXCLUSION_BAKED_PHASES:
+        from dsql_migrator.ui.data_migration._models import MigrationType
+
+        how = (
+            "Delete the CDC infrastructure first (switch the migration type to Full load + "
+            "CDC and delete it on its CDC step -- Full load only has no CDC step)"
+            if getattr(migration_state, "migration_type", None) is MigrationType.FULL_LOAD_ONLY
+            else "Delete the CDC infrastructure first"
+        )
         return (
             "The CDC infrastructure is deployed and its capture configuration already "
-            "carries the current excluded columns. Delete the CDC infrastructure first, "
-            "or Full Load would skip a column CDC keeps capturing; this action is available "
-            "again once it is gone."
+            f"carries the current excluded columns. {how}, or Full Load would skip a column "
+            "CDC keeps capturing; this action is available again once it is gone."
         )
     return None
 

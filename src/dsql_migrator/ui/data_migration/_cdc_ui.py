@@ -2284,10 +2284,27 @@ def _render_cdc_start_button(
         _cdc_tables_for_config(migration_state, inventory, watermark),
     )
     _capture_error = (
-        capture_error_with_remedy(migration_state, job_manager, _capture)
+        capture_error_with_remedy(
+            migration_state, job_manager, _capture,
+            table_lock=_table_lock(migration_state, job_manager, session),
+        )
         if _capture.error
         else None
     )
+    # A source column the target certainly lacks: the sink would dead-letter every change
+    # to it (42703). Checked HERE as well as at Deploy, because Attach (which moves no data)
+    # does not check it and the DDL can change between Deploy and Start. Not tied to any
+    # lock: its remedy is Schema Conversion; it is skipped once CDC streams.
+    _missing = missing_column_block_reason(
+        migration_state, inventory, job_manager=job_manager
+    )
+    if _missing and not prereq_block and not _capture_error:
+        render_notice(
+            ui,
+            tone="error",
+            header="A source column is missing from the Aurora DSQL table",
+            body=_missing,
+        )
     if _capture_error and not prereq_block:
         render_notice(
             ui,
@@ -2324,6 +2341,9 @@ def _render_cdc_start_button(
     elif _capture_error:
         start_btn.props("disable")
         start_btn.tooltip(_capture_error)
+    elif _missing:
+        start_btn.props("disable")
+        start_btn.tooltip(_missing)
     elif not ready:
         start_btn.props("disable")
         ui.label(  # type: ignore[attr-defined]
@@ -2820,8 +2840,9 @@ def _render_cdc_infra_deploy_action(
         return
     # A saved column exclusion that no longer applies would be baked into the stack's
     # ColumnExcludeList and lock the card, so this is its last chance to be removed.
+    _deploy_capture_now = _deploy_capture(migration_state, job_manager, inventory)
     _exclusion_notice = _deploy_block_notice(
-        migration_state, job_manager, inventory, session
+        migration_state, job_manager, inventory, session, capture=_deploy_capture_now
     )
     if _exclusion_notice:
         deploy_btn.props("disable")
@@ -2831,14 +2852,7 @@ def _render_cdc_infra_deploy_action(
         )
         return
     # Not blocking: excluded names Debezium cannot tell apart from another column.
-    _job_now = _current_job(job_manager, getattr(migration_state, "job_id", None))
-    _ambiguity = capture_ambiguity_warning(
-        cdc_capture_exclusions(
-            migration_state,
-            inventory,
-            _cdc_tables_for_config(migration_state, inventory, _cdc_watermark(_job_now)),
-        )
-    )
+    _ambiguity = capture_ambiguity_warning(_deploy_capture_now)
     if _ambiguity:
         render_notice(ui, tone="warning", header="CDC capture needs attention", body=_ambiguity)
 
@@ -2870,6 +2884,7 @@ def _deploy_block_notice(
     include_capture: bool = True,
     include_missing: bool = True,
     where: str = "in 'Oversized LOB columns' above",
+    capture=None,
 ):
     """``(header, body)`` of what holds Deploy CDC infrastructure (or Attach), or ``None``.
 
@@ -2905,18 +2920,34 @@ def _deploy_block_notice(
             return "A source column is missing from the Aurora DSQL table", missing
     if not include_capture:
         return None
+    if capture is None:
+        capture = _deploy_capture(migration_state, job_manager, inventory)
+    if capture.error:
+        return (
+            "The excluded columns do not fit the CDC capture configuration",
+            capture_error_with_remedy(
+                migration_state, job_manager, capture,
+                table_lock=_table_lock(migration_state, job_manager, session),
+            ),
+        )
+    return None
+
+
+def _deploy_capture(migration_state, job_manager, inventory):
+    """The capture exclusions a Deploy / Start would send now."""
     _job = _current_job(job_manager, getattr(migration_state, "job_id", None))
-    capture = cdc_capture_exclusions(
+    return cdc_capture_exclusions(
         migration_state,
         inventory,
         _cdc_tables_for_config(migration_state, inventory, _cdc_watermark(_job)),
     )
-    if capture.error:
-        return (
-            "The excluded columns do not fit the CDC capture configuration",
-            capture_error_with_remedy(migration_state, job_manager, capture),
-        )
-    return None
+
+
+def _table_lock(migration_state, job_manager, session):
+    """The table picker's lock reason (late import: __init__ imports this module)."""
+    from dsql_migrator.ui.data_migration import table_set_lock_reason
+
+    return table_set_lock_reason(migration_state, job_manager, session)
 
 
 def _stored_exclusion_deploy_block(migration_state, job_manager, inventory, session, **kwargs):
@@ -4904,7 +4935,21 @@ def _start_cdc_deploy(
             ui,
             tone="error",
             header="The excluded columns cannot be sent to CDC",
-            body=capture_error_with_remedy(migration_state, job_manager, _capture),
+            body=capture_error_with_remedy(
+                migration_state, job_manager, _capture,
+                table_lock=_table_lock(migration_state, job_manager, session),
+            ),
+        )
+        return
+    _missing = missing_column_block_reason(
+        migration_state, inventory, job_manager=job_manager
+    )
+    if _missing:
+        render_notice(
+            ui,
+            tone="error",
+            header="A source column is missing from the Aurora DSQL table",
+            body=_missing,
         )
         return
     # Judged on the STRUCTURED set: the formatted entries are escaped / case-flagged /
@@ -5460,7 +5505,10 @@ async def _start_cdc_infra_deploy(
     exclude_list = split_column_exclude_value(_capture.value) or None
     if _capture.error:
         ui.notify(
-            capture_error_with_remedy(migration_state, job_manager, _capture),
+            capture_error_with_remedy(
+                migration_state, job_manager, _capture,
+                table_lock=_table_lock(migration_state, job_manager, session),
+            ),
             type="negative",
             position="top",
         )

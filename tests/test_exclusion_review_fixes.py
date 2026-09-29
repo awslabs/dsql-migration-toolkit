@@ -506,3 +506,125 @@ def test_a_named_pk_does_not_change_the_cdc_rekey_of_a_deployed_pipeline():
         'CREATE TABLE "shop"."orders" ("tenant_id" BIGINT NOT NULL, "id" BIGINT NOT NULL, '
         'CONSTRAINT orders_pk PRIMARY KEY ("tenant_id", "id"))'))}
     assert composite_key_columns_for_cdc([orders], applied) == {}  # as 0.1.561
+
+
+# ---------------------------------------------------------------------------
+# Round 4 (verification of 435a94b)
+# ---------------------------------------------------------------------------
+
+
+def _missing_col_state(mtype=MigrationType.CDC_ONLY):
+    from dsql_migrator.core.models import MigrationMode
+    from dsql_migrator.ui.data_migration._models import ExclusionInputs
+
+    inv = SourceInventory(tables=[_t("shop.docs", ["id", "body", "note"])])
+    ddl = {"shop.docs": SimpleNamespace(target_ddl='CREATE TABLE "shop"."docs" ("id" INT PRIMARY KEY, "body" TEXT)',
+                                        foreign_key_ddls=[], preserved_foreign_keys=[])}
+    state = _state(mtype)
+    state.set_exclusion_inputs_resolver(lambda: ExclusionInputs(["shop.docs"], ddl, True, None))
+    state.set_prereq_gated_mode(MigrationMode.CDC)
+    return state, inv
+
+
+def test_start_cdc_holds_on_a_missing_target_column_whatever_route_led_there():
+    """Attach does not check 42703 (it moves no data), so Start CDC must."""
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    state, inv = _missing_col_state()
+    state.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")  # e.g. just attached
+    # READY otherwise (it resumes from its committed offset), so only 42703 can hold it.
+    state.set_cdc_has_committed_offset(True)
+    ui = _RecordingUi()
+    _cdc_ui._render_cdc_start_button(ui, state, _StubJobManager({}), lambda: None, inventory=inv, session=None)
+    joined = " ".join(ui.texts)
+    assert "A source column is missing from the Aurora DSQL table" in joined
+    (start,) = [b for b in ui.buttons if b.text == "Start CDC"]
+    assert "disable" in " ".join(start.props_seen)
+    assert any("42703" in t for t in ui.tooltips)
+    # Control: with the column present the same ready state is startable.
+    ok, inv_ok = _missing_col_state()
+    ok.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
+    ok.set_cdc_has_committed_offset(True)
+    ui_ok = _RecordingUi()
+    _cdc_ui._render_cdc_start_button(ui_ok, ok, _StubJobManager({}), lambda: None,
+                                     inventory=SourceInventory(tables=[_t("shop.docs", ["id", "body"])]), session=None)
+    (start_ok,) = [b for b in ui_ok.buttons if b.text == "Start CDC"]
+    assert "disable" not in " ".join(start_ok.props_seen)
+    # Once CDC streams the check is skipped (Schema Conversion Apply is held then anyway).
+    state.set_cdc_stack_phase("running", status="UPDATE_COMPLETE")
+    from dsql_migrator.ui.data_migration._models import missing_column_block_reason
+
+    assert missing_column_block_reason(state, inv, job_manager=_StubJobManager({})) is None
+
+
+def test_start_cdc_refuses_a_missing_target_column_at_click_time(monkeypatch):
+    import dsql_migrator.ui.data_migration._cdc_ui as cdcui
+    from dsql_migrator.core.table_selection import TableSelection
+
+    state, inv = _missing_col_state()
+    state.set_selection(TableSelection(selected_tables=["shop.docs"]))
+    notices: list = []
+    monkeypatch.setattr(cdcui, "render_notice", lambda ui, **kw: notices.append(kw))
+    submitted: list = []
+    jm = SimpleNamespace(get_status=lambda _j: (_ for _ in ()).throw(KeyError(_j)),
+                         submit=lambda w: submitted.append(w) or "job")
+    cdcui._start_cdc_deploy(SimpleNamespace(notify=lambda *a, **k: None), state, jm, lambda: None,
+                            inventory=inv, session=SimpleNamespace(source_config=None, target_config=None,
+                                                                   aws_profile=None, restored_source_type=None,
+                                                                   source_password=None))
+    assert any(n.get("header") == "A source column is missing from the Aurora DSQL table" for n in notices)
+    assert not submitted
+
+
+def test_the_generated_overflow_remedy_follows_the_table_pickers_lock():
+    from dsql_migrator.core.table_selection import TableSelection
+    from dsql_migrator.ui.data_migration import capture_pre_load_notices
+    from dsql_migrator.ui.data_migration._cdc_monitoring import capture_error_with_remedy
+    from dsql_migrator.ui.data_migration._models import cdc_capture_exclusions
+
+    inv = _pg_gen_tables()
+    state = _state()
+    state.set_selection(TableSelection(selected_tables=[t.name for t in inv.tables]))
+    capture = cdc_capture_exclusions(state, inv, inv.tables)
+    free = capture_error_with_remedy(state, _StubJobManager({}), capture)
+    assert "Deselect tables in the table picker." in free
+    locked = capture_error_with_remedy(state, _StubJobManager({}), capture, table_lock="Locked — X.")
+    assert "The table picker is locked. Locked — X." in locked and "Deselect tables" not in locked
+    # Real lock: a stack deployed early holds the picker -> its own remedy (delete the stack).
+    state.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
+    (note,) = capture_pre_load_notices(state, _StubJobManager({}), inv, session=SimpleNamespace(workflow=None))
+    assert "The table picker is locked." in note and "delete the CDC infrastructure" in note
+    assert "Deselect tables in the table picker." not in note
+
+
+def test_no_ambiguity_warning_when_both_same_named_columns_are_excluded():
+    from dsql_migrator.ui.data_migration._models import capture_ambiguity_warning, cdc_capture_exclusions
+
+    inv = SourceInventory(tables=[TableDef(name="shop.t", primary_key=["id"], columns=[
+        ColumnDef(name="id", mysql_type="int"), ColumnDef(name="a.b", mysql_type="text")]),
+        TableDef(name="shop.t.a", primary_key=["id"], columns=[
+            ColumnDef(name="id", mysql_type="int"), ColumnDef(name="b", mysql_type="text")])])
+    both = _state(entries=[("shop.t", "a.b"), ("shop.t.a", "b")])
+    assert capture_ambiguity_warning(cdc_capture_exclusions(both, inv, inv.tables)) is None
+
+
+def test_full_load_only_reload_tooltip_names_the_type_switch():
+    from dsql_migrator.ui.data_migration._cdc_monitoring import exclude_and_reload_block_reason
+
+    only = _state(MigrationType.FULL_LOAD_ONLY)
+    only.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
+    assert "switch the migration type to Full load + CDC" in exclude_and_reload_block_reason(only, _StubJobManager({}))
+    both = _state()
+    both.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
+    assert "switch the migration type" not in exclude_and_reload_block_reason(both, _StubJobManager({}))
+
+
+def test_the_ascii_fold_matches_the_reference_and_the_ambiguity_map_is_skipped_without_dots():
+    from dsql_migrator.core import cdc
+
+    for text in ("Shop.T.Note", "ÉTAT.Kelvin", "abc", "", "Ωmega.X", "MiXeD_1.Ä"):
+        ref = "".join(chr(ord(ch) + 32) if "A" <= ch <= "Z" else ch for ch in text)
+        assert cdc._cdc_ascii_fold(text) == ref, text
+    plain = [TableDef(name="shop.t", primary_key=[], columns=[ColumnDef(name="a", mysql_type="text")])]
+    assert cdc.column_exclude_ambiguous_entries({"shop.t": ["a"]}, plain) == {}
+    assert cdc.column_exclude_ambiguous_entries({}, plain) == {}

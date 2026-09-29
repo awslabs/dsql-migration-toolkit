@@ -1615,10 +1615,15 @@ def _cdc_entry(parts: "Sequence[str]") -> str:
     return _cdc_escape_edges("\\.".join(_cdc_escape_part(p) for p in parts))
 
 
+_ASCII_LOWER = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"
+)
+
+
 def _cdc_ascii_fold(text: str) -> str:
     """Case-fold the way Debezium's pattern does: ``CASE_INSENSITIVE`` without
     ``UNICODE_CASE`` folds ASCII only (verified on 2.7.4: ``É`` does not match ``é``)."""
-    return "".join(chr(ord(ch) + 32) if "A" <= ch <= "Z" else ch for ch in text)
+    return text.lower() if text.isascii() else text.translate(_ASCII_LOWER)
 
 
 def _cdc_case_collisions(captured: "Sequence[TableDef]") -> "dict[str, set[str]]":
@@ -1773,16 +1778,26 @@ def column_exclude_ambiguous_entries(
     are separated by ``(?-i)``, so only an exactly equal joined string is ambiguous. No
     escaping can separate those; the caller warns. ``{excluded: [also dropped, ...]}``.
     """
+    if not columns:
+        return {}
+    # Two different (table, column) pairs can only join to the same string when a part
+    # itself contains '.', so skip the map entirely in the (usual) case where none does.
+    if not any(
+        t.name.count(".") > 1 or any("." in c.name for c in t.columns) for t in captured
+    ):
+        return {}
     joined: dict[str, set[tuple[str, str]]] = {}
     for table in captured:
         for column in table.columns:
             joined.setdefault(f"{table.name}.{column.name}", set()).add(
                 (table.name, column.name)
             )
+    # A same-named column that is ALSO excluded is not an unintended drop.
+    excluded = {(t, c) for t, cols in columns.items() for c in cols}
     out: dict[str, list[str]] = {}
     for table in sorted(columns):
         for column in sorted(columns[table]):
-            others = joined.get(f"{table}.{column}", set()) - {(table, column)}
+            others = joined.get(f"{table}.{column}", set()) - excluded
             if others:
                 out[f"{table}.{column}"] = sorted(f"{t} / {c}" for t, c in others)
     return out
