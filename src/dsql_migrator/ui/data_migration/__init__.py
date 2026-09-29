@@ -412,6 +412,30 @@ def build_data_migration_screen(
     eval_state = eval_store.get_or_create(session_id)
     conv_state = conv_store.get_or_create(session_id)
 
+    def _effective_target_ddls(inventory_now) -> "Optional[dict[str, str]]":
+        """The applied target DDL per table, from the same inputs the runner uses; called on
+        a job thread (it converts the whole inventory). None when anything is missing."""
+        source = getattr(session, "source_config", None)
+        if inventory_now is None or source is None:
+            return None
+        edited = dict(conv_store.get_or_create(session_id).edited_target_ddls or {})
+        applied = applied_table_conversions(
+            SchemaConverter(source_type=source.source_type).convert(inventory_now),
+            edited,
+            preserve_foreign_keys=conv_store.get_or_create(session_id).preserve_foreign_keys,
+        )
+        return {name: conversion.target_ddl for name, conversion in applied.items()}
+
+    # Builder-time handles (kept across Start over): the effective DDL provider the
+    # Start CDC overlay records against, and the notification that CDC starts (the
+    # cut-over DEFAULT-restore attestation is stale then).
+    migration_state.effective_target_ddls = _effective_target_ddls
+    migration_state.on_cdc_start = (
+        (lambda: getattr(validation_store.get_or_create(session_id), "note_cdc_start", lambda: None)())
+        if validation_store is not None
+        else None
+    )
+
     def _inventory() -> Optional[SourceInventory]:
         result = eval_state.result
         return result.inventory if result is not None else None
@@ -940,13 +964,9 @@ def build_data_migration_screen(
                 }
                 # The excluded columns the load's overlay makes nullable: never
                 # unfillable. Legacy (omit-only) entries are judged as before.
-                # CDC only: no Full Load overlays the table before CDC's first write, so
-                # the overlay cannot make an excluded column loadable there.
-                _prereq_overlay = (
-                    {}
-                    if migration_state.migration_type is MigrationType.CDC_ONLY
-                    else overlay_lob_exclusions(migration_state, inventory)
-                )
+                # Every type: the Full Load pre-pass, and Start CDC for CDC only, make an
+                # overlay column nullable with no DEFAULT before the first write.
+                _prereq_overlay = overlay_lob_exclusions(migration_state, inventory)
                 report = await run.io_bound(
                     lambda: checker.check(
                         request,

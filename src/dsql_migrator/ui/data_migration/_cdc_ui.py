@@ -17,6 +17,8 @@ migration-type lock helper stay in ``__init__``.
 
 from __future__ import annotations
 
+import logging
+
 import inspect
 
 from dataclasses import (
@@ -80,6 +82,7 @@ from dsql_migrator.core.table_selection import (
 )
 from dsql_migrator.ui.data_migration._models import (
     MigrationType,
+    classify_restored_exclusions,
     _BROKER_MESSAGE_LIMIT_MIB,
     _DSQL_VALUE_LIMIT_MIB,
     assess_dlq_health,
@@ -4239,6 +4242,7 @@ async def _open_cdc_start_dialog(
     """
     stack_name = getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
     conn_blocker = cdc_deploy_connection_blocker(session)
+    overlay_changes: object = None
     binlog_gap: Optional[str] = None
     fk_block = None
     pg_objects_block: Optional[tuple] = None
@@ -4275,6 +4279,19 @@ async def _open_cdc_start_dialog(
                 )
             if probed is not None and probed.blocking:
                 fk_block = probed
+            # CDC only: list the overlay ALTERs Start CDC runs before any connector (one
+            # live read). Full load + CDC reads nothing here: after the load they are
+            # live, and the job verifies anyway. Never gates Start.
+            if getattr(migration_state, "migration_type", None) is MigrationType.CDC_ONLY and inventory is not None:
+                _captured = _cdc_tables_for_config(migration_state, inventory, _wm)
+                if _captured and _has_captured_overlay(migration_state, inventory, _captured):
+                    try:
+                        overlay_changes = await run.io_bound(
+                            _probe_cdc_overlay_changes,
+                            migration_state, session, inventory, _captured,
+                        )
+                    except Exception:  # noqa: BLE001 - unknown: the job re-reads and blocks
+                        overlay_changes = _OVERLAY_UNREAD
         # The PostgreSQL publication/slot precondition. Checked HERE, before the operator
         # pays: starting without it deploys both connectors and the Debezium task dies on
         # "Publication autocreation is disabled" -- after the cdc-stack update. Blocking
@@ -4311,6 +4328,7 @@ async def _open_cdc_start_dialog(
                 header="The snapshot's binary log has been purged",
                 body=binlog_gap,
             )
+        _render_cdc_overlay_changes(ui, overlay_changes)
         # The PostgreSQL publication/slot block, with its remedy in the SAME dialog (same
         # shape as the FK slot below): a block whose only advice is "re-run the whole Full
         # Load" is a dead end, and the pre-flight results just computed would be thrown
@@ -4705,6 +4723,135 @@ def _sink_mcu_count() -> int:
         return CDC_DEFAULT_SINK_MCU_COUNT
 
 
+# The CDC Start dialog could not read the target for the overlay statements.
+_OVERLAY_UNREAD = object()
+
+
+def _has_captured_overlay(migration_state, inventory, captured) -> bool:
+    from dsql_migrator.ui.data_migration._models import overlay_lob_exclusions
+
+    wanted = {t.name for t in captured}
+    return any(t in wanted for t in overlay_lob_exclusions(migration_state, inventory))
+
+
+def _render_cdc_overlay_changes(ui, overlay_changes) -> None:
+    """The CDC-only Start dialog's overlay notice: the exact ALTERs in run order, or that
+    the target could not be read (the job then reads it itself). Nothing when nothing is
+    excluded."""
+    if overlay_changes is None:
+        return
+    if overlay_changes is _OVERLAY_UNREAD:
+        _render_notice(
+            ui,
+            tone="warning",
+            header="Could not read the Aurora DSQL target",
+            body=(
+                "The changes to the excluded columns cannot be listed here. Start CDC "
+                "reads the target itself before creating any connector and stops, "
+                "changing nothing, if it cannot make them."
+            ),
+        )
+        return
+    statements = list(overlay_changes or ())
+    if not statements:
+        return
+    n_not_null = sum(1 for st in statements if st.action == "DROP NOT NULL")
+    n_default = sum(1 for st in statements if st.action == "DROP DEFAULT")
+    parts = []
+    if n_not_null:
+        parts.append(f"{n_not_null} x DROP NOT NULL (one-way)")
+    if n_default:
+        parts.append(f"{n_default} x DROP DEFAULT (restored at Cut over)")
+    _render_notice(
+        ui,
+        tone="warning",
+        icon="table_chart",
+        header="Aurora DSQL changes when CDC starts: " + ", ".join(parts),
+        body=(
+            "They run before any connector is created, so every row CDC writes holds NULL "
+            "in the excluded columns. Aurora DSQL cannot add NOT NULL back in place."
+        ),
+    )
+    with ui.expansion("show statements").classes("w-full text-xs"):  # type: ignore[attr-defined]
+        for statement in statements:
+            ui.label(statement.text()).classes("text-xs font-mono break-all")  # type: ignore[attr-defined]
+
+
+def _note_cdc_start(migration_state) -> None:
+    """Tell the cut-over area that CDC starts (or tried to): a drained attestation made
+    before is stale. Best effort; absent without a Validation store."""
+    callback = getattr(migration_state, "on_cdc_start", None)
+    if callable(callback):
+        try:
+            callback()
+        except Exception:  # noqa: BLE001 - never fail a Start on a UI notification
+            logging.getLogger(__name__).warning("on_cdc_start notification failed", exc_info=True)
+
+
+def _start_cdc_overlay_plan(migration_state, inventory, tables_for_config, session, target) -> dict:
+    """The Start CDC overlay's inputs, computed on the loop with no I/O."""
+    from dsql_migrator.core.overlay_ledger import overlay_ledger_key
+    from dsql_migrator.ui.data_migration._models import (
+        effective_lob_exclusions,
+        overlay_lob_exclusions,
+    )
+
+    captured = [t.name for t in tables_for_config]
+    wanted = set(captured)
+    overlay = {
+        t: c for t, c in overlay_lob_exclusions(migration_state, inventory).items() if t in wanted
+    }
+    excluded = {
+        t: c for t, c in effective_lob_exclusions(migration_state, inventory).items() if t in wanted
+    }
+    sources = {t.name: [c.name for c in t.columns] for t in tables_for_config}
+    ddls = getattr(migration_state, "effective_target_ddls", None)
+    ledger = getattr(migration_state, "overlay_ledger", None)
+    ledger_key = None
+    if ledger is not None and target is not None:
+        try:
+            ledger_key = overlay_ledger_key(target)
+        except Exception:  # noqa: BLE001 - no key -> the overlay blocks if it needs one
+            ledger_key = None
+    return {
+        "overlay_by_table": overlay,
+        "captured": captured,
+        "excluded_by_table": excluded,
+        "source_columns_for": lambda name: sources.get(name, []),
+        "ledger": ledger,
+        "ledger_key": ledger_key,
+        "ledger_in_use": bool(getattr(migration_state, "overlay_ledger_in_use", False)),
+        # Lazy: the connector is built on the job thread, only if the overlay needs it.
+        "connection_factory": (
+            (lambda: _cdc_fk_connection_factory(session)())
+            if getattr(session, "target_config", None) is not None
+            else None
+        ),
+        "effective_target_ddls": (lambda: ddls(inventory)) if callable(ddls) else (lambda: None),
+        "log": _log_cdc_event,
+    }
+
+
+def _apply_start_cdc_overlay(handle, **plan) -> None:
+    from dsql_migrator.ui.data_migration._cdc_overlay import apply_start_cdc_overlay
+
+    apply_start_cdc_overlay(handle, **plan)
+
+
+def _probe_cdc_overlay_changes(migration_state, session, inventory, tables_for_config):
+    """The overlay statements a CDC-only Start will run (one live read). BLOCKING."""
+    from dsql_migrator.ui.data_migration._cdc_overlay import probe_cdc_overlay_changes
+    from dsql_migrator.ui.data_migration._models import overlay_lob_exclusions
+
+    wanted = {t.name for t in tables_for_config}
+    overlay = {
+        t: c for t, c in overlay_lob_exclusions(migration_state, inventory).items() if t in wanted
+    }
+    return probe_cdc_overlay_changes(
+        overlay, connection_factory=_cdc_fk_connection_factory(session)
+    )
+
+
 def _cdc_fk_connection_factory(session):
     """Return a fresh-DSQL-connection factory for the target, or ``None``.
 
@@ -4894,6 +5041,8 @@ def _start_cdc_deploy(
     """Build connector params and submit the two-pass Start CDC as a background job."""
     from dsql_migrator.core.cdc_deployer import build_cdc_stack_deployer, run_cdc_start
 
+    # Settle a restored pre-overlay session's exclusions before any set is read.
+    classify_restored_exclusions(migration_state, job_manager)
     job = _current_job(job_manager, migration_state.job_id)
     watermark = _cdc_watermark(job)
     override = migration_state.cdc_start_override()
@@ -5121,8 +5270,22 @@ def _start_cdc_deploy(
     stack_name = migration_state.cdc_stack_name
     aws_profile = getattr(session, "aws_profile", None)
     assume_role_arn = getattr(migration_state, "cdc_deploy_role_arn", None)
+    # The column-exclusion overlay, prepared on the loop (no I/O): the captured tables'
+    # overlay columns (legacy entries are omit-only), the ledger handle and its key, the
+    # effective target DDL provider (called on the job thread only), and a connection
+    # factory for the target.
+    _overlay_plan = _start_cdc_overlay_plan(
+        migration_state, inventory, tables_for_config, session, target
+    )
 
     def work(handle) -> None:
+        try:
+            _work(handle)
+        finally:
+            # The cut-over restore attestation is stale once CDC starts (or tries to).
+            _note_cdc_start(migration_state)
+
+    def _work(handle) -> None:
         # Everything blocking (the deploy-role AssumeRole in the deployer build, the STS
         # account lookup, the ~50 KiB template read, the config load) runs HERE on the
         # job's worker thread -- NEVER on the NiceGUI event loop. On Fargate one asyncio
@@ -5166,6 +5329,13 @@ def _start_cdc_deploy(
                 detail=_pg_block[1],
             )
             raise RuntimeError(f"Start CDC blocked: {_pg_block[0]}. {_pg_block[1]}")
+        # The column-exclusion overlay: every captured excluded column nullable with no
+        # DEFAULT (recorded first) BEFORE any connector is created or changed, so every row
+        # CDC writes holds NULL there. Covers Retry CDC and a re-Start after Stop; a no-op
+        # after a Full Load that already overlaid. Blocks the Start on any failure.
+        _apply_start_cdc_overlay(handle, **_overlay_plan)
+        if getattr(handle, "cancelled", False):
+            return
         deployer = build_cdc_stack_deployer(
             region, aws_profile=aws_profile, assume_role_arn=assume_role_arn
         )
@@ -5224,6 +5394,11 @@ def _start_cdc_deploy(
         # generated columns the capture also drops are not the operator's choice.
         exclusions=effective_lob_exclusions(migration_state, inventory),
     )
+    if _overlay_plan["overlay_by_table"]:
+        _mark = getattr(migration_state, "mark_overlay_ledger_in_use", None)
+        if callable(_mark):
+            _mark()
+    _note_cdc_start(migration_state)
     job_id = job_manager.submit(
         _logged_cdc_lifecycle(_action, detail=_detail, work=work)
     )

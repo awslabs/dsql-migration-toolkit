@@ -539,9 +539,10 @@ def test_a_different_overlay_than_the_dialog_disclosed_stops_the_run():
     assert dm._disclosed_differs({"shop.elsewhere": {"x"}}, {}, [PAGES]) is False  # outside the run
 
 
-def test_cdc_only_prerequisites_do_not_count_an_overlay_that_never_runs():
+def test_every_type_counts_the_overlay_in_the_prerequisites():
+    # P2-13: Start CDC overlays a CDC-only migration before any connector, like the Full
+    # Load pre-pass, so an excluded NOT NULL column is loadable for every type.
     import inspect
 
     src = " ".join(inspect.getsource(dm.build_data_migration_screen).split())
-    assert ("_prereq_overlay = ( {} if migration_state.migration_type is MigrationType.CDC_ONLY "
-            "else overlay_lob_exclusions(migration_state, inventory) )") in src
+    assert "_prereq_overlay = overlay_lob_exclusions(migration_state, inventory)" in src

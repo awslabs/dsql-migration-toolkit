@@ -144,7 +144,7 @@ def test_the_dead_letter_runbook_follows_the_real_state():
     fl = _state(job_id="job-1")
     steps = dlq_exclusion_runbook(fl, _StubJobManager({"job-1": _StubJob("COMPLETED")}))
     assert steps[0] == "Exclude the column (this dialog)."
-    assert "Drop & reload" in steps[1] and "no longer written" in steps[1]
+    assert "Drop & reload" in steps[1] and "empty (NULL) in every row" in steps[1]
     assert steps[-2:] == ["Deploy the CDC infrastructure again.", "Start CDC."]
     assert not any("Stop CDC" in s for s in steps)  # the dialog opens only with no stack
     pruned = dlq_exclusion_runbook(fl, _StubJobManager({}))
