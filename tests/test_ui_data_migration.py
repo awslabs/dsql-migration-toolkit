@@ -10463,47 +10463,41 @@ def test_run_guard_blocks_on_a_table_added_after_the_checks_but_not_on_a_removal
     assert "never checked" in reason
 
 
-def test_lob_exclusion_scope_gap_flags_newly_excluded_but_not_unexcluded() -> None:
-    # Asymmetric, mirroring prereq_scope_gap: excluding a column AFTER the checks is a
-    # gap (it could flip loadability to FAIL unseen); un-excluding one only adds a
-    # checked column back, so it is not a gap.
-    from dsql_migrator.ui.data_migration._models import lob_exclusion_scope_gap
+def test_a_column_excluded_after_the_checks_no_longer_blocks_and_gets_a_neutral_hint() -> None:
+    # P2: the load's overlay makes a newly excluded column nullable with no DEFAULT before
+    # the first write, so it can no longer turn a passed loadability check into a mid-load
+    # 23502. The run guard does not block; the screen notes the change instead.
+    from dsql_migrator.ui.data_migration import prereq_exclusion_change_hint
 
-    checked = {"orders": frozenset({"notes"})}
-    # Same selection -> no gap.
-    assert lob_exclusion_scope_gap(checked, {"orders": frozenset({"notes"})}) == []
-    # Un-excluded 'notes' -> not a gap (column added back to the checked load).
-    assert lob_exclusion_scope_gap(checked, {}) == []
-    # Newly excluded 'blob' (a different table too) -> both are gaps, sorted+qualified.
-    assert lob_exclusion_scope_gap(
-        checked, {"orders": frozenset({"notes", "blob"}), "docs": frozenset({"body"})}
-    ) == ["docs.body", "orders.blob"]
-
-
-def test_run_guard_blocks_when_a_column_is_excluded_after_the_checks() -> None:
-    # End-to-end: the checks ran with no exclusion (report PASSes); excluding a column
-    # afterwards must block the run and name the column, because the reduced column set
-    # was never re-verified against the target's requirements. Un-excluding is fine.
     state = DataMigrationState()
     state.set_selection(TableSelection(selected_tables=["orders"]))
-    # Checks ran against NO exclusion.
     state.set_prereq_report(MigrationMode.FULL_LOAD, _fl_report("orders"))
     assert full_load_run_guard_reason(state, _inventory()) is None
+    assert prereq_exclusion_change_hint(state, MigrationMode.FULL_LOAD) is None
 
-    # Exclude a column after the checks -> blocked, message names it.
     state.set_lob_exclusion("orders", "big_blob", True)
-    reason = full_load_run_guard_reason(state, _inventory())
-    assert reason is not None
-    assert "orders.big_blob" in reason
-    assert "excluded after the checks" in reason
+    assert full_load_run_guard_reason(state, _inventory()) is None
+    hint = prereq_exclusion_change_hint(state, MigrationMode.FULL_LOAD)
+    at = state.prereq_report_checked_at(MigrationMode.FULL_LOAD).strftime("%H:%M")
+    assert hint == (f"Exclusions changed since these checks ran at {at} UTC; size results "
+                    "describe the earlier set.")
 
-    # Re-running the checks with the exclusion in place clears the gap.
+    # Re-running the checks with the exclusion in place clears the hint.
     state.set_prereq_report(MigrationMode.FULL_LOAD, _fl_report("orders"))
+    assert prereq_exclusion_change_hint(state, MigrationMode.FULL_LOAD) is None
+    # Removing it again is a change too (the size results covered the other set).
+    state.set_lob_exclusion("orders", "big_blob", False)
+    assert prereq_exclusion_change_hint(state, MigrationMode.FULL_LOAD) is not None
     assert full_load_run_guard_reason(state, _inventory()) is None
 
-    # Removing the exclusion after that is not a gap either (column added back).
-    state.set_lob_exclusion("orders", "big_blob", False)
-    assert full_load_run_guard_reason(state, _inventory()) is None
+
+def test_adding_a_table_after_the_checks_still_blocks() -> None:
+    state = DataMigrationState()
+    state.set_selection(TableSelection(selected_tables=["orders"]))
+    state.set_prereq_report(MigrationMode.FULL_LOAD, _fl_report("orders"))
+    state.set_selection(TableSelection(selected_tables=["orders", "customers"]))
+    reason = full_load_run_guard_reason(state, _inventory())
+    assert reason is not None and "customers" in reason and "never checked" in reason
 
 
 def test_apply_cdc_status_logs_dlq_events_to_activity_log() -> None:

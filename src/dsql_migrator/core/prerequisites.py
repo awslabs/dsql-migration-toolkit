@@ -424,7 +424,10 @@ def check_target_schema_ready(table: TableDef, exists: bool) -> PrerequisiteResu
 
 
 def check_target_columns_loadable(
-    table: TableDef, target_required_without_default: Optional[Sequence[str]]
+    table: TableDef,
+    target_required_without_default: Optional[Sequence[str]],
+    *,
+    overlay_nullable: "Iterable[str]" = (),
 ) -> PrerequisiteResult:
     """FAIL when a target column is value-required but the source can't fill it.
 
@@ -446,6 +449,10 @@ def check_target_columns_loadable(
 
     Nullable or defaulted extra columns are deliberately NOT flagged: verified on a
     live DSQL cluster, the load succeeds and they take NULL or their default.
+
+    ``overlay_nullable`` are the excluded columns the load's overlay makes nullable with
+    no DEFAULT before the first write, so they are never unfillable. A legacy (omit-only)
+    exclusion is not among them and is judged exactly as before.
     """
     if target_required_without_default is None:
         # Unknown target (missing/unreadable) -> not this check's failure to own.
@@ -459,17 +466,32 @@ def check_target_columns_loadable(
             remediation="",
         )
     source_columns = {column.name for column in table.columns}
+    nullable_by_overlay = set(overlay_nullable)
     unfillable = [
-        name for name in target_required_without_default if name not in source_columns
+        name
+        for name in target_required_without_default
+        if name not in source_columns and name not in nullable_by_overlay
     ]
     if not unfillable:
+        overlaid = sorted(
+            name for name in target_required_without_default if name in nullable_by_overlay
+        )
         return PrerequisiteResult(
             check_id=PrerequisiteCheckId.TARGET_COLUMNS_LOADABLE,
             title="Target columns can be loaded from the source",
             status=PrerequisiteStatus.PASS,
             required=True,
             target=table.name,
-            detail="Every value-required target column is present on the source.",
+            detail=(
+                "Every value-required target column is present on the source"
+                + (
+                    "; the excluded "
+                    + ", ".join(f"`{name}`" for name in overlaid)
+                    + " will be made nullable before the load, so their rows store NULL."
+                    if overlaid
+                    else "."
+                )
+            ),
             remediation="",
         )
     listed = ", ".join(f"`{name}`" for name in unfillable)
@@ -1026,6 +1048,7 @@ class PrerequisiteChecker:
         tables: Sequence[TableDef],
         excluded_columns: Optional[Mapping[str, Iterable[str]]] = None,
         lob_columns: Optional[Mapping[str, Sequence[str]]] = None,
+        overlay_columns: Optional[Mapping[str, Iterable[str]]] = None,
     ) -> PrerequisiteReport:
         """Run all checks for ``request.mode`` over the resolved ``tables``.
 
@@ -1044,6 +1067,10 @@ class PrerequisiteChecker:
         filled) instead of passing here and failing every batch mid-load. A PK is
         never excluded (the filter guards), so ``check_table_primary_key`` is
         unaffected. Empty/omitted => no filtering (the common case).
+
+        ``overlay_columns`` (optional, table name -> column names) are the excluded
+        columns the load's overlay makes nullable with no DEFAULT; loadability never
+        counts them as unfillable. A legacy (omit-only) exclusion is not among them.
 
         ``lob_columns`` (optional, table name -> column names) are the oversized-LOB
         candidates to ask the per-value size question about. Supplied by the caller
@@ -1129,7 +1156,11 @@ class PrerequisiteChecker:
                 else None
             )
             results.append(
-                check_target_columns_loadable(eff_table, required_without_default)
+                check_target_columns_loadable(
+                    eff_table,
+                    required_without_default,
+                    overlay_nullable=(overlay_columns or {}).get(table.name, ()),
+                )
             )
 
         # CDC-only checks (SKIP in Full Load).

@@ -795,6 +795,17 @@ def test_excluding_a_notnull_target_column_flips_loadable_to_fail() -> None:
     assert "blob_doc" in result.detail
     assert excluded.can_proceed is False
 
+    # P2: the same exclusion as an OVERLAY column (the load makes it nullable with no
+    # DEFAULT before the first write) is loadable; the FAIL above is the legacy reading.
+    overlaid = checker.check(
+        request,
+        tables=[table],
+        excluded_columns={"app.docs": ["blob_doc"]},
+        overlay_columns={"app.docs": ["blob_doc"]},
+    )
+    result = _result(overlaid, PrerequisiteCheckId.TARGET_COLUMNS_LOADABLE, "app.docs")
+    assert result.status is PrerequisiteStatus.PASS and overlaid.can_proceed is True
+
 
 def test_excluding_a_nullable_column_stays_loadable() -> None:
     # A nullable/defaulted target column is never in required_without_default, so

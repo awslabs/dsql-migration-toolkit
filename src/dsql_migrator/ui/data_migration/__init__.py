@@ -221,7 +221,6 @@ from dsql_migrator.ui.data_migration._models import (
     _LOAD_STATE_ORDER,
     summarize_table_states,
     prereq_scope_gap,
-    lob_exclusion_scope_gap,
     schema_recreate_tables,
     prerequisite_block_reason,
     resnapshot_resolvable_failures,
@@ -925,12 +924,16 @@ def build_data_migration_screen(
                         or ()
                     )
                 }
+                # The excluded columns the load's overlay makes nullable: never
+                # unfillable. Legacy (omit-only) entries are judged as before.
+                _prereq_overlay = overlay_lob_exclusions(migration_state, inventory)
                 report = await run.io_bound(
                     lambda: checker.check(
                         request,
                         tables=tables,
                         excluded_columns=_prereq_exclusions,
                         lob_columns=_prereq_lob_columns,
+                        overlay_columns=_prereq_overlay,
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - surface as inline feedback
@@ -2277,6 +2280,11 @@ def build_data_migration_screen(
                             inline_hint(
                                 ui, guard_reason, tone="warning", classes="text-sm"
                             )
+                    _exclusion_hint = prereq_exclusion_change_hint(
+                        migration_state, prereq_mode
+                    )
+                    if _exclusion_hint:
+                        inline_hint(ui, _exclusion_hint, tone="info", classes="text-sm")
                     # CDC infrastructure prep, offered HERE (bottom of Prerequisites)
                     # rather than only deep inside the CDC sub-step: the ~15-20 min MSK
                     # create should overlap the Full Load, so it must be reachable
@@ -2966,33 +2974,33 @@ def full_load_run_guard_reason(
             f"{'were' if len(added) > 1 else 'was'} added to the selection after the "
             "checks ran, so they were never checked."
         )
-    # Same idea for the LOB exclusion: a column excluded AFTER the checks removes it
-    # from the load's column set, so a NOT NULL/no-default target column could turn
-    # the passed loadability check into a mid-load failure the stale report can't
-    # show. Block until the checks are re-run against the new exclusion. Asymmetric:
-    # un-excluding a column only adds it back to the (already-checked) load, so it is
-    # not a gap. Scoped to the mode the report is for (the exclusion is migration-wide).
-    newly_excluded = lob_exclusion_scope_gap(
-        state.prereq_report_lob_exclusions(prereq_mode),
-        {
-            table: frozenset(cols)
-            for table, cols in state.lob_exclusions().items()
-        },
-    )
-    if newly_excluded:
-        listed = ", ".join(newly_excluded[:3]) + (
-            " and more" if len(newly_excluded) > 3 else ""
-        )
-        return (
-            f"Re-run the prerequisite checks — {listed} "
-            f"{'were' if len(newly_excluded) > 1 else 'was'} excluded after the checks "
-            "ran, so the target's requirements were never re-verified against the "
-            "reduced column set."
-        )
+    # A column excluded AFTER the checks no longer blocks: the load's overlay makes it
+    # nullable with no DEFAULT before the first write, so it cannot turn a passed
+    # loadability check into a mid-load 23502. The screen shows a neutral hint instead
+    # (prereq_exclusion_change_hint): the size results describe the earlier set.
     # Pass the mode so the reason names the action it gates: on this screen "before
     # running" could mean the Full Load, the billable CDC infrastructure deploy or Start
     # CDC, and the operator cannot tell which is held.
     return prerequisite_block_reason(report, mode=prereq_mode)
+
+
+def prereq_exclusion_change_hint(state, prereq_mode) -> Optional[str]:
+    """A neutral note when the exclusions changed after the prerequisite checks ran (the
+    size results describe the earlier set), else ``None``. Never blocking: the overlay
+    keeps a newly excluded column loadable."""
+    getter = getattr(state, "get_prereq_report", None)
+    if not callable(getter) or getter(prereq_mode) is None:
+        return None
+    checked = state.prereq_report_lob_exclusions(prereq_mode)
+    current = {t: frozenset(c) for t, c in state.lob_exclusions().items() if c}
+    if {t: c for t, c in checked.items() if c} == current:
+        return None
+    at = state.prereq_report_checked_at(prereq_mode)
+    when = f" at {at.strftime('%H:%M')} UTC" if at is not None else ""
+    return (
+        f"Exclusions changed since these checks ran{when}; size results describe the "
+        "earlier set."
+    )
 
 
 def _split_migration_schema(name: str) -> tuple[str, str]:
@@ -4777,6 +4785,7 @@ __all__ = [
     "PrereqCategoryGroup",
     "format_error_summary",
     "full_load_run_guard_reason",
+    "prereq_exclusion_change_hint",
     "data_migration_exclusion_block",
     "exclusion_card_locked",
     "table_set_lock_reason",

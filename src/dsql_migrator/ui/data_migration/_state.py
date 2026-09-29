@@ -114,6 +114,7 @@ class DataMigrationState:
         # The LOB exclusion each mode's report was checked against, so the run guard
         # can block a load whose exclusion changed after the checks (the exclusion
         # analogue of a late table add caught by prereq_scope_gap). Keyed by mode.
+        self._prereq_report_checked_at: dict[MigrationMode, datetime] = {}
         self._prereq_report_lob_exclusions: dict[
             MigrationMode, dict[str, frozenset[str]]
         ] = {}
@@ -1431,6 +1432,7 @@ class DataMigrationState:
         """
         with self._lock:
             self._prereq_reports[mode] = report
+            self._prereq_report_checked_at[mode] = datetime.now(timezone.utc)
             self._prereq_report_lob_exclusions[mode] = {
                 table: frozenset(cols)
                 for table, cols in self._excluded_lob_columns.items()
@@ -1440,6 +1442,11 @@ class DataMigrationState:
         """Return the last prerequisite report for ``mode``, if any."""
         with self._lock:
             return self._prereq_reports.get(mode)
+
+    def prereq_report_checked_at(self, mode: MigrationMode) -> Optional[datetime]:
+        """When the last ``mode`` report was recorded (UTC), or ``None``."""
+        with self._lock:
+            return self._prereq_report_checked_at.get(mode)
 
     def prereq_report_lob_exclusions(
         self, mode: MigrationMode
