@@ -1491,8 +1491,9 @@ class _MemoryPressureLogger:
                 "Full Load memory pressure: %.0f MiB (%.0f%% of the %.0f MiB task "
                 "limit)%s -- approaching the Fargate hard limit; an OOM kill would stop "
                 "the task with no further log. Reduce full_load_table_parallelism / "
-                "full_load_batch_parallelism, exclude oversized-LOB columns, or redeploy "
-                "the task with more memory.",
+                "full_load_batch_parallelism or redeploy the task with more memory; "
+                "excluding large LOB columns ('Oversized LOB columns') also lowers it, but "
+                "only before a load; the choice locks once a Full Load has run.",
                 used_mib, frac * 100, limit / (1024 * 1024), suffix,
             )
             # Also record it on the DURABLE activity log so it surfaces in the UI's
@@ -1510,8 +1511,10 @@ class _MemoryPressureLogger:
                     f"{limit / (1024 * 1024):.0f} MiB task limit ({used_mib:.0f} MiB)"
                     f"{suffix} — approaching the Fargate hard limit, beyond which an OOM "
                     "kill stops the task with no further log. Lower "
-                    "full_load_table_parallelism / full_load_batch_parallelism, exclude "
-                    "oversized-LOB columns, or redeploy the task with more memory."
+                    "full_load_table_parallelism / full_load_batch_parallelism or redeploy "
+                    "the task with more memory; excluding large LOB columns ('Oversized "
+                    "LOB columns') also lowers it, but only before a load; the choice "
+                    "locks once a Full Load has run."
                 ),
             )
         elif self._warned and frac < _MEM_WARN_REARM_FRACTION:

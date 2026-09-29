@@ -479,3 +479,16 @@ def test_deploy_gate_blocks_a_missing_column_only_before_the_lock():
         state, _StubJobManager({}), INV, None)
     state.job_id = "job-1"  # data moved: the card is locked, the gate no longer blocks
     assert _stored_exclusion_deploy_block(state, _StubJobManager({}), INV, None) is None
+
+
+def test_memory_pressure_copy_does_not_offer_a_locked_exclusion_mid_load():
+    """The warning fires DURING a load, when the exclusion card is already locked."""
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _full_load_engine
+
+    src = inspect.getsource(_full_load_engine)
+    assert "exclude oversized-LOB columns, or" not in src
+    # (the activity-log copy splits the sentence across two adjacent literals)
+    assert src.count("only before a load; the choice") == 2
+    assert src.count("locks once a Full Load has run.") == 2

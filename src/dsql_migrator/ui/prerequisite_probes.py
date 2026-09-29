@@ -138,11 +138,17 @@ class SessionSourceProbe:
         * a per-statement timeout, so proving the ABSENCE of an offender on a very large
           table cannot stall the gate; a timeout returns ``None`` ("not determined"),
           never a pass.
-        * one statement per column, ROLLED BACK on failure so the next column still runs.
-          Without the rollback the claim was false on PostgreSQL: a failed statement
-          aborts the transaction, so the FIRST failing column made every later one fail
-          with ``InFailedSqlTransaction`` -- and an unmeasured column used to be reported
-          inside a green PASS.
+        * one statement per column, each in its OWN transaction: the implicit transaction
+          is ended (rolled back, the cap re-applied) before the next column, whether the
+          previous statement failed or not. A failure must end it -- on PostgreSQL a failed
+          statement aborts the transaction, so the FIRST failing column used to make every
+          later one fail with ``InFailedSqlTransaction`` and an unmeasured column was
+          reported inside a green PASS. A success must end it too: on MySQL the implicit
+          REPEATABLE READ transaction otherwise holds one read view across all of a table's
+          columns (up to one timeout each), pinning purge on the customer's source.
+
+        The engine is built for this call and DISPOSED when it returns, so the pool's
+        connection to the source is closed rather than left to garbage collection.
 
         ``octet_length`` has no json/jsonb overload (verified: ``function
         octet_length(jsonb) does not exist``), which is exactly how that cascade started, so
@@ -184,7 +190,11 @@ class SessionSourceProbe:
         try:
             with engine.connect() as connection:
                 self._apply_statement_timeout(connection, timeout_seconds, is_postgres)
-                for name in columns:
+                for index, name in enumerate(columns):
+                    if index:
+                        self._end_column_transaction(
+                            connection, timeout_seconds, is_postgres
+                        )
                     measured = self._measured_expression(
                         length_fn, quote(name), (column_types or {}).get(name, "")
                     )
@@ -198,25 +208,33 @@ class SessionSourceProbe:
                     try:
                         row = connection.execute(statement).first()
                     except Exception:  # noqa: BLE001 - one column's failure only
-                        # MUST roll back: on PostgreSQL the failed statement leaves the
-                        # transaction aborted, so without this every REMAINING column fails
-                        # too and silently goes unmeasured.
-                        try:
-                            connection.rollback()  # type: ignore[attr-defined]
-                            # SET LOCAL is scoped to the rolled-back transaction, so the
-                            # cap has to be re-applied or the remaining columns run
-                            # unbounded.
-                            self._apply_statement_timeout(
-                                connection, timeout_seconds, is_postgres
-                            )
-                        except Exception:  # noqa: BLE001 - best effort, like the timeout
-                            pass
+                        # The next iteration ends this (aborted, on PostgreSQL)
+                        # transaction before measuring anything else.
                         continue
                     if row is not None:
                         answer[name] = bool(row[0])
         except Exception:  # noqa: BLE001 - advisory read; never break the gate
             return answer or None
+        finally:
+            try:
+                engine.dispose()
+            except Exception:  # noqa: BLE001 - best effort; the answer stands
+                pass
         return answer or None
+
+    def _end_column_transaction(
+        self, connection: object, timeout_seconds: float, is_postgres: bool
+    ) -> None:
+        """End one column's implicit transaction and re-arm the cap for the next.
+
+        ``SET LOCAL`` is scoped to the transaction being rolled back, so the cap has to be
+        re-applied or the remaining columns would run unbounded. Best effort, like the cap.
+        """
+        try:
+            connection.rollback()  # type: ignore[attr-defined]
+            self._apply_statement_timeout(connection, timeout_seconds, is_postgres)
+        except Exception:  # noqa: BLE001 - best effort, like the timeout
+            pass
 
     @staticmethod
     def _measured_expression(length_fn: str, quoted: str, column_type: str) -> str:

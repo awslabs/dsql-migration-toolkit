@@ -573,3 +573,43 @@ def test_each_column_is_probed_against_its_own_type_limit() -> None:
     )
     bound = [b.get("limit") for b in conn.bound]
     assert bound == [1024 * 1024, 65535], bound
+
+
+def test_each_column_runs_in_its_own_transaction_and_the_engine_is_disposed() -> None:
+    """MySQL must not hold one REPEATABLE READ view across a table's columns.
+
+    The implicit transaction used to be ended only after a FAILED column, so a table whose
+    columns all succeeded was measured inside one transaction -- up to one timeout per
+    column with a read view pinning purge on the customer's source. And the per-call engine
+    was never disposed, leaving its pooled connection to garbage collection.
+    """
+    from dsql_migrator.core.models import SourceType
+
+    conn = _SizeProbeConn(set())
+    probe = _size_probe(SourceType.MYSQL, conn)
+    disposed: list = []
+
+    class _Engine:
+        def connect(self):
+            return conn
+
+        def dispose(self):
+            disposed.append(True)
+
+    probe._engine_factory = lambda _cfg: _Engine()  # type: ignore[assignment]
+    answer = probe.oversized_values(
+        "shop.docs", ["a", "b", "c"], limit_bytes=1024 * 1024, timeout_seconds=5.0
+    )
+    assert answer == {"a": False, "b": False, "c": False}
+    # Ended BETWEEN columns (the last one ends with the connection), cap re-armed each time.
+    assert conn.rollbacks == 2, conn.rollbacks
+    assert sum("MAX_EXECUTION_TIME" in sql for sql in conn.statements) == 3, conn.statements
+    assert disposed == [True]
+
+    # Disposed on the failure path too.
+    failing = _SizeProbeConn(set(), fail={"a"})
+    probe._engine_factory = lambda _cfg: type(  # type: ignore[assignment]
+        "_E", (), {"connect": lambda self: failing, "dispose": lambda self: disposed.append(True)}
+    )()
+    probe.oversized_values("shop.docs", ["a"], limit_bytes=1, timeout_seconds=5.0)
+    assert disposed == [True, True]
