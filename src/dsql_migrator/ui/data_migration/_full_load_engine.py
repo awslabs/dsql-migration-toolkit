@@ -2251,6 +2251,317 @@ def _close_shared_snapshot(engine, conn) -> None:
                 engine.dispose()
 
 
+def _record_prepass_failure(
+    handle: JobHandle, job_id: str, error_log: ErrorLogStore, migrator: "DataMigrator",
+    name: str, reason: Optional[str], exc: Optional[BaseException],
+) -> None:
+    """Record a table the pre-pass failed exactly as a worker's FAILED result is recorded:
+    one error-log record, one 'load table' FAILURE line, the chunk FAILED."""
+    if reason:
+        message = reason
+    else:
+        message = safe_error_message(exc) if exc is not None else "failed before loading"
+        hint = None if isinstance(exc, OverlayRunError) or exc is None else (
+            source_error_hint(exc, getattr(migrator, "source_type", SourceType.MYSQL))
+            or target_error_hint(exc)
+        )
+        if hint:
+            message = f"{message} — {hint}"
+    code = _error_code(exc) if exc is not None else None
+    error_log.record(
+        job_id,
+        DataErrorRecord(
+            table=name, chunk_id=name, error_code=code, message=message,
+            occurred_at=datetime.now(timezone.utc),
+        ),
+    )
+    log_activity(
+        ActivityCategory.FULL_LOAD,
+        "load table",
+        status=ActivityStatus.FAILURE,
+        target=name,
+        error_code=code,
+        detail=message,
+        exc=exc,
+    )
+    handle.update(lambda job, n=name: _fail_chunk(job, n))
+
+
+class _OverlayPrepass:
+    """The process path's overlay pre-pass (the parent, before any worker starts).
+
+    Active only for a run whose ledger view is installed (or unreadable) AND that holds an
+    overlay table or a recorded table; every other run keeps the previous behaviour.
+    Table classes: overlay (non-legacy exclusions), recorded-only (a ledger record, no
+    overlay columns) and plain. Before planning: fail every overlay table on an unreadable
+    ledger; ONE facts read over the overlay and recorded-only append tables; promote an
+    empty overlay append table whose applied key differs (it becomes a replace table); the
+    shared reload verdict. After the (isolated) recreate loop: ONE facts read of the
+    recreated overlay tables, ONE ledger batch recorded BEFORE any ALTER, the recorded
+    DEFAULTs bound for the workers, then the units strictly serially. A table that fails
+    any step is withheld from submission through ``fail``.
+    """
+
+    def __init__(self, migrator, tables: Sequence[TableDef], *, handle: JobHandle, fail, withheld: set) -> None:
+        self._m = migrator
+        self._tables = list(tables)
+        self._handle = handle
+        self._fail = fail
+        self._withheld = withheld
+        self.overlay: dict[str, frozenset[str]] = {}
+        self.recorded_only: set[str] = set()
+        self._facts: dict[str, Any] = {}
+
+    @staticmethod
+    def start(migrator, tables: Sequence[TableDef], *, handle: JobHandle, fail, withheld: set):
+        inputs = getattr(migrator, "_inputs", None)
+        if not isinstance(inputs, DataMigrationInputs):
+            return None
+        view = inputs.overlay_record
+        if view is None and inputs.overlay_ledger_status != "unreadable":
+            return None
+        names = [table.name for table in tables]
+        if not any(_overlay_set(inputs, n) for n in names) and not (
+            view is not None and any(view.record(n) is not None for n in names)
+        ):
+            return None
+        return _OverlayPrepass(migrator, tables, handle=handle, fail=fail, withheld=withheld)
+
+    def _alive(self, name: str) -> bool:
+        return name not in self._withheld
+
+    def _is_replace(self, name: str) -> bool:
+        inputs = self._m._inputs
+        return not inputs.cdc_coexisting and name in inputs.replace_tables
+
+    def before_planning(self) -> None:
+        inputs = self._m._inputs
+        view = inputs.overlay_record
+        for table in self._tables:
+            overlay = _overlay_set(inputs, table.name)
+            if overlay:
+                self.overlay[table.name] = overlay
+            elif view is not None and view.record(table.name) is not None:
+                self.recorded_only.add(table.name)
+        if inputs.overlay_ledger_status == "unreadable":
+            for name in self.overlay:
+                self._fail(name, OverlayLedgerUnavailableError.MESSAGE)
+            return
+        # Step 1: ONE facts read.
+        read = [
+            t for t in self._tables
+            if t.name in self.overlay
+            or (t.name in self.recorded_only and not self._is_replace(t.name))
+        ]
+        if read:
+            columns = {
+                t.name: sorted(
+                    set(self.overlay.get(t.name, ()))
+                    | set(view.record(t.name).set_columns if view.record(t.name) else ())
+                )
+                for t in read
+            }
+            key_tables = {t.name for t in read if self._changed_key(t)}
+            try:
+                facts = self._m.overlay_facts(
+                    [t.name for t in read], columns, probe_rows=True,
+                    primary_key_tables=key_tables,
+                )
+            except Exception:  # noqa: BLE001 - every read table unknown
+                facts = {}
+            for t in read:
+                table_facts = (facts or {}).get(t.name)
+                if table_facts is None:
+                    self._fail(
+                        t.name,
+                        f"could not read the Aurora DSQL catalog of {t.name}; nothing was "
+                        "changed on it",
+                    )
+                else:
+                    self._facts[t.name] = table_facts
+            self._handle.heartbeat()
+        # Step 2: promote an empty overlay append table whose applied key differs.
+        promoted: list[str] = []
+        for t in self._tables:
+            if t.name not in self.overlay or self._is_replace(t.name) or not self._alive(t.name):
+                continue
+            table_facts = self._facts[t.name]
+            if _needs_empty_target_promotion(
+                target_key_columns=self._target_key(t),
+                source_pk=t.primary_key,
+                is_replace=False,
+                cdc_coexisting=inputs.cdc_coexisting,
+                pre_recreated=False,
+                target_is_empty=lambda f=table_facts: bool(f.exists) and not f.has_rows,
+                live_key=lambda f=table_facts: (
+                    None if f.primary_key is None else list(f.primary_key)
+                ),
+            ):
+                promoted.append(t.name)
+        if promoted:
+            self._m.bind_run_inputs(
+                replace(inputs, replace_tables=frozenset(inputs.replace_tables | set(promoted)))
+            )
+            for name in promoted:
+                log_activity(
+                    ActivityCategory.FULL_LOAD,
+                    "load table",
+                    status=ActivityStatus.INFO,
+                    target=name,
+                    detail="empty, applied key differs: recreated from the applied DDL",
+                )
+        # Step 3: the shared reload verdict for every surviving append table.
+        inputs = self._m._inputs
+        for t in self._tables:
+            if (
+                t.name not in self._facts
+                or self._is_replace(t.name)
+                or not self._alive(t.name)
+                or not self._facts[t.name].exists
+            ):
+                continue
+            table_facts = self._facts[t.name]
+            live, computed = _live_overlay(table_facts, self.overlay.get(t.name, ()))
+            refusal, exemption, _reincluded = _append_verdict(
+                inputs, t.name, table_facts, view.record(t.name), live, computed
+            )
+            if refusal is None:
+                continue
+            if exemption is None:
+                self._fail(t.name, f"{t.name} {refusal.text()}; nothing was changed on it")
+            else:
+                _log_exempt_append(t.name, refusal, exemption)
+
+    def _target_key(self, table: TableDef) -> Optional[list[str]]:
+        applied = self._m._inputs.table_conversions.get(table.name)
+        return (parse_target_primary_key(applied.target_ddl) if applied is not None else []) or None
+
+    def _changed_key(self, table: TableDef) -> bool:
+        key = self._target_key(table)
+        return bool(key) and key != list(table.primary_key)
+
+    def recreated(self, name: str) -> None:
+        callback = self._m._inputs.on_table_recreated
+        if callback is not None:
+            callback(name)
+
+    def after_recreate(self, recreated_names: "set[str]") -> None:
+        inputs = self._m._inputs
+        view = inputs.overlay_record
+        if view is None:
+            return  # unreadable: the overlay tables already failed
+        # Step 5: ONE facts read of the recreated overlay tables.
+        again = [
+            t for t in self._tables
+            if t.name in self.overlay and t.name in recreated_names and self._alive(t.name)
+        ]
+        recreated_facts: dict[str, Any] = {}
+        if again:
+            try:
+                recreated_facts = self._m.overlay_facts(
+                    [t.name for t in again],
+                    {t.name: sorted(self.overlay[t.name]) for t in again},
+                    probe_rows=False,
+                ) or {}
+            except Exception:  # noqa: BLE001 - every recreated table unknown
+                recreated_facts = {}
+            for t in again:
+                if recreated_facts.get(t.name) is None:
+                    self._fail(
+                        t.name,
+                        f"cannot read the recreated table's DEFAULTs of {t.name} on Aurora "
+                        "DSQL; nothing was altered. The table was recreated empty; Retry "
+                        "unfinished recreates and loads it",
+                    )
+            self._handle.heartbeat()
+        # The ONE ledger batch, recorded BEFORE any ALTER.
+        now = datetime.now(timezone.utc)
+        merges: dict[str, Any] = {}
+        units: list[tuple[str, dict]] = []
+        for t in self._tables:
+            name = t.name
+            if not self._alive(name) or (name not in self.overlay and name not in self.recorded_only):
+                continue
+            just_recreated = name in recreated_names
+            if name in self.overlay:
+                table_facts = recreated_facts[name] if just_recreated else self._facts.get(name)
+                if table_facts is None or not table_facts.exists:
+                    continue
+                live, computed = _live_overlay(table_facts, self.overlay[name])
+                _log_omit_only(name, computed)
+            else:
+                table_facts = None if just_recreated else self._facts.get(name)
+                if not just_recreated and table_facts is None:
+                    continue  # a recorded-only replace table that was not recreated
+                live, computed = {}, []
+            has_rows = (not just_recreated) and bool(table_facts is not None and table_facts.has_rows)
+            reincluded: "tuple[str, ...]" = ()
+            if table_facts is not None and not just_recreated:
+                _refusal, _exemption, reincluded = _append_verdict(
+                    inputs, name, table_facts, view.record(name), live, computed
+                )
+            if name in self.recorded_only and has_rows and not reincluded:
+                continue  # rule (a): unchanged, never batched
+            merges[name] = _plan_record_merge(
+                inputs, t, live, has_rows=has_rows, just_recreated=just_recreated,
+                reincluded=reincluded, now=now,
+            )
+            if build_overlay_statements(name, live):
+                _log_overlay_planned(name, live)
+                units.append((name, live))
+        if merges:
+            try:
+                view.merge(merges)
+            except OverlayLedgerError as exc:
+                for name in merges:
+                    suffix = (
+                        ". The table was recreated empty; Retry unfinished recreates and "
+                        "loads it"
+                        if name in recreated_names
+                        else ""
+                    )
+                    text = (
+                        f"cannot record the DEFAULTs of {name} before dropping them; "
+                        "nothing was altered"
+                        if name in self.overlay
+                        else f"cannot record the change to the exclusion record of {name}; "
+                        "nothing was loaded"
+                    )
+                    self._fail(name, f"{text}{suffix} ({_first_line(exc)})")
+                return
+        # The workers of the recreated overlay tables verify against what was recorded.
+        recorded_defaults = {
+            name: {
+                column: default
+                for column, default in _recorded_expected(view, name, live).items()
+                if live[column].default_expr is not None and default is not None
+            }
+            for name, live in units
+            if name in recreated_names
+        }
+        if recorded_defaults:
+            self._m.bind_run_inputs(
+                replace(
+                    self._m._inputs,
+                    overlay_recorded_defaults={
+                        **self._m._inputs.overlay_recorded_defaults, **recorded_defaults
+                    },
+                )
+            )
+        # Step 6: the units, strictly serially (concurrent DDL fails 40001, F8).
+        for name, live in units:
+            if self._handle.cancelled:
+                break
+            if not self._alive(name):
+                continue
+            try:
+                _run_overlay_unit(self._m, name, live, _recorded_expected(view, name, live))
+            except Exception as exc:  # noqa: BLE001 - this table fails, the rest load
+                self._fail(name, None, exc)
+            finally:
+                self._handle.heartbeat()
+
+
 def _migrate_tables_in_parallel(
     handle: JobHandle,
     job_id: str,
@@ -2284,6 +2595,18 @@ def _migrate_tables_in_parallel(
             real_failed += 1
         elif outcome is _TableLoadOutcome.QUARANTINED:
             quarantined += 1
+
+    # Tables the overlay pre-pass failed: recorded once, never submitted.
+    withheld: set[str] = set()
+
+    def _fail_prepass_table(
+        name: str, reason: Optional[str] = None, exc: Optional[BaseException] = None
+    ) -> None:
+        if name in withheld:
+            return
+        _record_prepass_failure(handle, job_id, error_log, migrator, name, reason, exc)
+        _tally(_TableLoadOutcome.FAILED)
+        withheld.add(name)
 
     # Operator-tunable table-level parallelism (default FULL_LOAD_TABLE_PARALLELISM),
     # bounded by the table count.
@@ -2342,8 +2665,18 @@ def _migrate_tables_in_parallel(
             1, min(cfg.full_load_reader_shards, _MAX_SOURCE_READERS // tp)
         )
 
+        # The overlay pre-pass (None for a run without exclusions or records).
+        prepass = _OverlayPrepass.start(
+            migrator, tables, handle=handle, fail=_fail_prepass_table, withheld=withheld
+        )
+        if prepass is not None:
+            prepass.before_planning()
+
         work_units: list[tuple] = []  # ("table", table) or ("shard", table, lo, hi, idx)
         for table in tables:
+            if table.name in withheld:
+                work_units.append(("table", table))  # skipped at submission
+                continue
             table_is_replace = (
                 not migrator._inputs.cdc_coexisting
                 and table.name in migrator._inputs.replace_tables
@@ -2398,21 +2731,36 @@ def _migrate_tables_in_parallel(
         replace_index_ddls: dict[str, list[str]] = {}
         for wu in work_units:
             tbl = wu[1]
-            if tbl.name in recreated_names:
+            if tbl.name in recreated_names or tbl.name in withheld:
                 continue
             is_replace = (
                 not migrator._inputs.cdc_coexisting
                 and tbl.name in migrator._inputs.replace_tables
             )
             if is_replace:
-                replace_index_ddls[tbl.name] = table_recreator(tbl)
+                if prepass is not None and handle.cancelled:
+                    break  # the rest stay PENDING and are settled as unfinished
+                try:
+                    replace_index_ddls[tbl.name] = table_recreator(tbl)
+                except Exception as exc:  # noqa: BLE001 - see below
+                    # A run with the overlay pre-pass fails only this table; any other run
+                    # keeps the previous behaviour (a recreate failure aborts the run).
+                    if prepass is None:
+                        raise
+                    _fail_prepass_table(tbl.name, exc=exc)
+                    continue
+                finally:
+                    # The drain thread that owns liveness has not started yet, and this
+                    # loop is one fresh DSQL connect + DDL per table -- a few hundred
+                    # REPLACE tables therefore crossed the 900 s stall window BEFORE a single
+                    # row loaded and the watchdog failed a healthy run. A recreated table is
+                    # a real unit of work, so stamping here cannot mask a wedged connect.
+                    handle.heartbeat()
                 recreated_names.add(tbl.name)
-                # The drain thread that owns liveness has not started yet, and this loop is
-                # one fresh DSQL connect + DDL per table -- a few hundred REPLACE tables
-                # therefore crossed the 900 s stall window BEFORE a single row loaded and
-                # the watchdog failed a healthy run. A recreated table is a real unit of
-                # work, so stamping here cannot mask a wedged connect.
-                handle.heartbeat()
+                if prepass is not None:
+                    prepass.recreated(tbl.name)
+        if prepass is not None:
+            prepass.after_recreate(recreated_names)
 
         ctx = multiprocessing.get_context("spawn")
         progress_queue: multiprocessing.Queue = ctx.Queue()
@@ -2437,7 +2785,9 @@ def _migrate_tables_in_parallel(
         shared_snapshot_id: Optional[str] = None
 
         try:
-            if _shared_snapshot and any(wu[0] == "shard" for wu in work_units):
+            if _shared_snapshot and any(
+                wu[0] == "shard" and wu[1].name not in withheld for wu in work_units
+            ):
                 _anchor_engine, _anchor_conn, shared_snapshot_id = _open_shared_snapshot(
                     migrator, _shard_dialect
                 )
@@ -2452,6 +2802,8 @@ def _migrate_tables_in_parallel(
                 for wu in work_units:
                     if handle.cancelled:
                         break
+                    if wu[1].name in withheld:
+                        continue  # failed in the overlay pre-pass; never submitted
                     if submission_idx > 0:
                         _time.sleep(_PROCESS_LAUNCH_STAGGER_SECONDS)
                     submission_idx += 1
@@ -3676,6 +4028,7 @@ def _seed_retry_chunks(
     *,
     prior_job_id: Optional[str] = None,
     prior_table_error_job_ids: Optional[dict] = None,
+    prior_recreated_tables: "Optional[Sequence[str]]" = None,
 ) -> None:
     """Seed a retry job from the prior run, resetting only the failed chunks.
 
@@ -3709,6 +4062,13 @@ def _seed_retry_chunks(
         prior_job_id=prior_job_id,
         inherited=prior_table_error_job_ids,
     )
+    # Every table the lineage recreated that has not finished stays recorded (whether or
+    # not this retry re-runs it), so a later Retry unfinished recreates it again; this
+    # run's own recreates are appended as they happen.
+    unfinished = {prior.chunk_id for prior in prior_chunks if prior.status != "DONE"}
+    job.recreated_tables = [
+        name for name in dict.fromkeys(prior_recreated_tables or ()) if name in unfinished
+    ]
     _recompute_progress(job)
 
 
@@ -3784,6 +4144,9 @@ def run_full_load_retry(
     # _seed_retry_chunks). Defaulted: an omitting caller just gets the old behavior.
     prior_job_id: Optional[str] = None,
     prior_table_error_job_ids: Optional[dict] = None,
+    # The prior job's recreated_tables (see _seed_retry_chunks). Defaulted: an omitting
+    # caller just gets the old behaviour.
+    prior_recreated_tables: "Optional[Sequence[str]]" = None,
     # See run_full_load: needed for the post-load identity-sequence sync. A retry that
     # COMPLETES the load is exactly when the sync must run -- the first attempt's
     # finalize skipped it (the run was incomplete), so without this the sequence stays
@@ -3811,6 +4174,7 @@ def run_full_load_retry(
             job, prior_chunks, retry_names,
             prior_job_id=prior_job_id,
             prior_table_error_job_ids=prior_table_error_job_ids,
+            prior_recreated_tables=prior_recreated_tables,
         )
     )
     # A retry had NO run-level line at all, so the most common replace-one-table case --
@@ -4352,16 +4716,108 @@ def _run_overlay_unit(migrator, table_name: str, live, expected_defaults) -> Non
     )
 
 
+def _append_verdict(inputs: "DataMigrationInputs", name: str, table_facts, record, live, computed):
+    """The shared reload verdict for an append into a table that keeps its rows.
+
+    ``(refusal, exemption)``: ``refusal`` is ``append_refusal``'s answer (``None`` = the
+    append keeps the NULL contract); ``exemption`` names why a refused table still appends
+    (CDC streaming into it, or exclusions from an earlier version), else ``None``. Also
+    returns the re-included columns the record update needs.
+    """
+    present_live = [c for c in (record.set_columns if record else ()) if table_facts.columns.get(c)]
+    omitted = sorted(set(inputs.excluded_lob_columns.get(name, ())) | set(computed))
+    refusal = append_refusal(
+        record, has_rows=bool(table_facts.has_rows), exempt=False,
+        overlay_present=sorted(live), present_live=present_live, omitted=omitted,
+    )
+    exemption = (
+        "CDC is streaming into it"
+        if inputs.cdc_coexisting
+        else "it has exclusions from an earlier version"
+        if inputs.legacy_exclusions.get(name)
+        else None
+    )
+    reincluded = reincluded_columns(record, present_live=present_live, omitted=omitted)
+    return refusal, exemption, reincluded
+
+
+def _log_exempt_append(name: str, refusal, exemption: str) -> None:
+    log_activity(
+        ActivityCategory.FULL_LOAD,
+        "overlay append",
+        status=ActivityStatus.WARNING,
+        target=name,
+        detail=(
+            f"{refusal.text()} -- appended anyway because {exemption}; rows already in the "
+            f"table keep what they hold in {', '.join(refusal.columns)}"
+        ),
+    )
+
+
+def _plan_record_merge(
+    inputs: "DataMigrationInputs", table: TableDef, live, *, has_rows: bool,
+    just_recreated: bool, reincluded, now: datetime,
+):
+    """The ledger merge for one table (``plan_ledger_record`` against the FRESH record);
+    an update identical to the stored record, ``applied_at`` aside, is ``unchanged``."""
+    ddl = _effective_target_ddl(inputs, table)
+
+    def _merge(existing):
+        decision = plan_ledger_record(
+            existing, table=table.name, overlay_facts=live, has_rows=has_rows,
+            just_recreated=just_recreated, effective_ddl=ddl, now=now,
+            reincluded=reincluded,
+        )
+        if (
+            decision.kind == "write"
+            and existing is not None
+            and decision.record.model_copy(update={"applied_at": existing.applied_at})
+            == existing
+        ):
+            return LedgerDecision("unchanged", existing)
+        return decision
+
+    return _merge
+
+
+def _log_overlay_planned(name: str, live) -> None:
+    # Written BEFORE the record, so the audit trail names the exact originals even when
+    # the record write then fails.
+    log_activity(
+        ActivityCategory.FULL_LOAD,
+        "overlay planned",
+        status=ActivityStatus.INFO,
+        target=name,
+        detail=(
+            f"{_overlay_plan_detail(live)}; the dropped DEFAULTs are recorded first and "
+            "restored at cut over"
+        ),
+    )
+
+
+def _recorded_expected(view, name: str, live) -> dict:
+    """The DEFAULT the ledger now holds for each live overlay column (what the unit may
+    drop)."""
+    after = view.record(name) if view is not None else None
+    return {
+        column: (
+            after.column(column).original_default
+            if after is not None and after.column(column) is not None
+            else None
+        )
+        for column in live
+    }
+
+
 def _overlay_write_and_apply(
     migrator, inputs: "DataMigrationInputs", table: TableDef, overlay: "frozenset[str]",
     *, just_recreated: bool,
 ) -> None:
-    """WRITER mode (the parent, which holds the run's ledger view).
+    """WRITER mode (the parent thread path, which holds the run's ledger view).
 
-    One fresh facts read; on an append the shared reload verdict (``append_refusal``,
-    exempt while CDC coexists or for legacy entries, with a WARNING); the record update
-    (``plan_ledger_record``) merged into the ledger against a fresh read BEFORE any ALTER;
-    then the unit, which drops only DEFAULTs equal to what was just recorded.
+    One fresh facts read; on an append the shared reload verdict (``_append_verdict``);
+    the record update merged into the ledger against a fresh read BEFORE any ALTER; then
+    the unit, which drops only DEFAULTs equal to what was just recorded.
     """
     name = table.name
     view = inputs.overlay_record
@@ -4380,71 +4836,26 @@ def _overlay_write_and_apply(
         return  # nothing to overlay; the load itself reports the missing table
     live, computed = _live_overlay(table_facts, overlay)
     _log_omit_only(name, computed)
-    has_rows = False if just_recreated else bool(table_facts.has_rows)
-    present_live = [c for c in (record.set_columns if record else ()) if table_facts.columns.get(c)]
-    omitted = sorted(set(inputs.excluded_lob_columns.get(name, ())) | set(computed))
+    reincluded: "tuple[str, ...]" = ()
     if not just_recreated:
-        refusal = append_refusal(
-            record, has_rows=has_rows, exempt=False, overlay_present=sorted(live),
-            present_live=present_live, omitted=omitted,
+        refusal, exemption, reincluded = _append_verdict(
+            inputs, name, table_facts, record, live, computed
         )
         if refusal is not None:
-            reason = (
-                "CDC is streaming into it"
-                if inputs.cdc_coexisting
-                else "it has exclusions from an earlier version"
-                if inputs.legacy_exclusions.get(name)
-                else None
-            )
-            if reason is None:
+            if exemption is None:
                 raise OverlayNeedsReloadError(
                     f"{name} {refusal.text()}; nothing was changed on it"
                 )
-            log_activity(
-                ActivityCategory.FULL_LOAD,
-                "overlay append",
-                status=ActivityStatus.WARNING,
-                target=name,
-                detail=(
-                    f"{refusal.text()} -- appended anyway because {reason}; rows already "
-                    f"in the table keep what they hold in {', '.join(refusal.columns)}"
-                ),
-            )
-    reincluded = reincluded_columns(record, present_live=present_live, omitted=omitted)
-    ddl = _effective_target_ddl(inputs, table)
-    now = datetime.now(timezone.utc)
-
-    def _merge(existing):
-        decision = plan_ledger_record(
-            existing, table=name, overlay_facts=live, has_rows=has_rows,
-            just_recreated=just_recreated, effective_ddl=ddl, now=now,
-            reincluded=reincluded,
-        )
-        if (
-            decision.kind == "write"
-            and existing is not None
-            and decision.record.model_copy(update={"applied_at": existing.applied_at})
-            == existing
-        ):
-            return LedgerDecision("unchanged", existing)
-        return decision
-
+            _log_exempt_append(name, refusal, exemption)
+    merge = _plan_record_merge(
+        inputs, table, live, has_rows=(not just_recreated) and bool(table_facts.has_rows),
+        just_recreated=just_recreated, reincluded=reincluded, now=datetime.now(timezone.utc),
+    )
     planned = build_overlay_statements(name, live)
     if planned:
-        # Written BEFORE the record, so the audit trail names the exact originals even
-        # when the record write then fails.
-        log_activity(
-            ActivityCategory.FULL_LOAD,
-            "overlay planned",
-            status=ActivityStatus.INFO,
-            target=name,
-            detail=(
-                f"{_overlay_plan_detail(live)}; the dropped DEFAULTs are recorded first "
-                "and restored at cut over"
-            ),
-        )
+        _log_overlay_planned(name, live)
     try:
-        view.merge({name: _merge})
+        view.merge({name: merge})
     except OverlayLedgerError as exc:
         if just_recreated:
             text = (
@@ -4464,16 +4875,7 @@ def _overlay_write_and_apply(
             )
         raise OverlayLedgerWriteError(f"{text} ({_first_line(exc)})", cause=exc) from exc
     if planned:
-        after = view.record(name)
-        expected = {
-            column: (
-                after.column(column).original_default
-                if after is not None and after.column(column) is not None
-                else None
-            )
-            for column in live
-        }
-        _run_overlay_unit(migrator, name, live, expected)
+        _run_overlay_unit(migrator, name, live, _recorded_expected(view, name, live))
 
 
 def _overlay_verify_recorded(

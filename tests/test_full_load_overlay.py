@@ -265,6 +265,7 @@ def test_a_class_08_overlay_error_is_not_retried_as_a_source_drop(monkeypatch):
 # ---------------------------------------------------------------------------
 
 import copy  # noqa: E402
+from datetime import datetime, timezone  # noqa: E402
 
 from dsql_migrator.core.error_log import ErrorLogStore  # noqa: E402
 from dsql_migrator.core.job_manager import JobManager  # noqa: E402
@@ -314,6 +315,8 @@ class _Importer:
                     should_cancel=None, on_conflict=None, shard_sources=None, key_columns=None):
         rows = list(rows)
         self.calls.append((table.name, on_conflict, [c.name for c in table.columns]))
+        self.index_ddls = getattr(self, "index_ddls", {})
+        self.index_ddls[table.name] = index_ddls
         self.db.rows[table.name] = True
         return BatchedImportResult(rows_loaded=len(rows))
 
@@ -636,3 +639,374 @@ def test_an_overlay_failure_never_earns_a_source_connection_hint(events):
     (record,) = error_log.records(job_id)
     assert record.error_code == "08006" and "cannot read the overlay columns" in record.message
     assert "connection dropped" not in record.message and "failover" not in record.message
+
+
+# ---------------------------------------------------------------------------
+# P2-07/08: the process-path pre-pass (driven through run_full_load, workers inline)
+# ---------------------------------------------------------------------------
+
+import concurrent.futures  # noqa: E402
+
+from dsql_migrator.core.column_exclusion import set_digest  # noqa: E402
+from dsql_migrator.core.converter import TableConversion  # noqa: E402
+from dsql_migrator.core.overlay_ledger import OverlayLedgerColumn, OverlayLedgerTable  # noqa: E402
+from dsql_migrator.ui.data_migration._full_load_engine import _seed_retry_chunks  # noqa: E402
+
+from tests.test_overlay_core import Denied  # noqa: E402
+
+
+class _InlineExecutor:
+    """ProcessPoolExecutor stand-in: runs each worker function inline, in submission order."""
+
+    submitted: list = []
+
+    def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=()):
+        assert max_workers and max_workers >= 1
+        if initializer is not None:
+            initializer(*initargs)
+
+    def submit(self, fn, *args):
+        _InlineExecutor.submitted.append(args[0].table.name)
+        future = concurrent.futures.Future()
+        try:
+            future.set_result(fn(*args))
+        except BaseException as exc:  # noqa: BLE001
+            future.set_exception(exc)
+        return future
+
+    def shutdown(self, wait=True, cancel_futures=False):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _ProcRig(_Rig):
+    """The rig on the PROCESS path: a BatchedTableMigrator subclass the workers rebuild
+    from their slimmed inputs (so they get the same fake catalog and seams)."""
+
+    def __init__(self, monkeypatch, **kw):
+        super().__init__(**kw)
+        rig = self
+        self.worker_inputs = []
+
+        class RigMigrator(BatchedTableMigrator):
+            def __init__(self, inputs, **_ignored):
+                rig.worker_inputs.append(inputs)
+                super().__init__(
+                    inputs,
+                    exporter=_FakeExporter({"docs": [{"id": 1, "body": "b", "note": "n"}], "plain": [{"id": 1}],
+                                            **{f"t{i}": [{"id": 1}] for i in range(60)}}),
+                    watermark_capturer=_FakeWatermarkCapturer(_watermark()),
+                    importer_factory=lambda _i: rig.importer,
+                    table_recreator=rig._recreate,
+                    target_counter=lambda t: None,
+                    target_pk_reader=lambda t: list(t.primary_key),
+                    target_generated_reader=lambda t: set(),
+                    overlay_facts_reader=rig._facts,
+                    overlay_applier=rig._apply,
+                )
+
+        monkeypatch.setattr(engine, "BatchedTableMigrator", RigMigrator)
+        monkeypatch.setattr(engine, "ProcessPoolExecutor", _InlineExecutor)
+        monkeypatch.setattr(engine, "_PROCESS_LAUNCH_STAGGER_SECONDS", 0)
+        monkeypatch.setattr(engine, "_worker_progress_queue", None)
+        monkeypatch.setattr(engine, "_worker_cancel_event", None)
+        monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM", "2")
+        monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS", "1")
+        _InlineExecutor.submitted = []
+        self.worker_inputs.clear()
+        self.migrator = RigMigrator(self.inputs)
+        self.worker_inputs.clear()
+
+
+def _failures_for(events, name):
+    return [e for e in events if e[0] == "load table" and e[1] == "failure" and e[2] == name]
+
+
+def _faulty_facts(rig, *, on_call):
+    calls = {"n": 0}
+    real = rig._facts
+
+    def facts(inputs, names, cols, **kw):
+        calls["n"] += 1
+        if calls["n"] == on_call:
+            return {n: None for n in names} if on_call != "raise" else None
+        return real(inputs, names, cols, **kw)
+
+    return facts
+
+
+@pytest.mark.parametrize("where", ["step1-unknown", "step1-raise", "step2-undecidable", "step3-rows",
+                                   "step4-recreate", "step5-unknown", "step6-alter"])
+def test_process_prepass_fails_only_the_failing_table_counted_once(monkeypatch, events, where):
+    replace = {"docs"} if where in ("step4-recreate", "step5-unknown", "step6-alter") else set()
+    rig = _ProcRig(monkeypatch, replace=replace, rows={"docs": where == "step3-rows"})
+    if where in ("step1-unknown", "step5-unknown"):
+        rig.migrator._overlay_facts_reader = _faulty_facts(rig, on_call=1 if where == "step1-unknown" else 2)
+    elif where == "step1-raise":
+        rig.migrator._overlay_facts_reader = lambda *a, **k: (_ for _ in ()).throw(Conn08e())
+    elif where == "step2-undecidable":
+        conv = TableConversion(table="docs", target_ddl='CREATE TABLE "docs" ("id" INT, "note" TEXT, "body" TEXT, PRIMARY KEY ("note", "id"))')
+        rig.migrator.bind_run_inputs(dataclasses.replace(rig.inputs, table_conversions={"docs": conv}))
+        rig.inputs = rig.migrator._inputs
+        rig.migrator._overlay_facts_reader = _faulty_facts(rig, on_call=1)
+    elif where == "step4-recreate":
+        def boom(table):
+            raise RuntimeError("cannot drop table docs because other objects depend on it")
+        rig.migrator._table_recreator = boom
+    elif where == "step6-alter":
+        rig.db.fault(r"DROP NOT NULL", Denied())
+    states = rig.run()
+    assert states == {"docs": "FAILED", "plain": "DONE"}, (where, rig.messages())
+    records = [r for r in rig.error_log.records(rig.job.job_id) if r.table == "docs"]
+    assert len(records) == 1 and records[0].occurred_at is not None, where
+    assert len(_failures_for(events, "docs")) == 1, where
+    assert "1 of 2 table(s) did not fully load" in rig.error
+    assert "docs" not in _InlineExecutor.submitted and "plain" in _InlineExecutor.submitted
+    if where == "step2-undecidable":
+        assert rig.recreated == []
+    if where == "step5-unknown":
+        assert rig.record() is None and rig.alters() == [] and rig.job.recreated_tables == ["docs"]
+    if where == "step6-alter":
+        assert records[0].error_code == "42501" and rig.job.recreated_tables == ["docs"]
+
+
+class Conn08e(Exception):
+    sqlstate = "08006"
+
+
+def test_when_every_table_fails_in_the_prepass_the_pool_is_still_well_formed(monkeypatch, events):
+    rig = _ProcRig(monkeypatch, tables=(DOCS,), rows={"docs": True})  # needs Drop & reload
+    assert rig.run() == {"docs": "FAILED"}
+    assert "1 of 1 table(s) did not fully load" in rig.error and _InlineExecutor.submitted == []
+
+
+def test_process_path_records_overlays_serially_then_submits(monkeypatch, events):
+    rig = _ProcRig(monkeypatch, replace={"docs"})
+    merges = []
+    real_merge = rig.store.merge_tables
+    rig.store.merge_tables = lambda key, m: merges.append(sorted(m)) or real_merge(key, m)
+    order = []
+    real_apply = rig._apply
+
+    def apply(inputs, name, planned, **kw):
+        order.append(("alter", name))
+        return real_apply(inputs, name, planned, **kw)
+
+    rig.migrator._overlay_applier = apply
+    real_submit = _InlineExecutor.submit
+    monkeypatch.setattr(_InlineExecutor, "submit", lambda self, fn, *a: order.append(("submit", a[0].table.name)) or real_submit(self, fn, *a))
+    assert rig.run() == {"docs": "DONE", "plain": "DONE"}
+    assert merges == [["docs"]]  # ONE batch, before any ALTER
+    assert rig.alters() == ['"body" DROP NOT NULL', '"body" DROP DEFAULT']
+    assert order.index(("alter", "docs")) < min(i for i, e in enumerate(order) if e[0] == "submit")
+    assert rig.record().column("body").original_default == "'x'::text"
+    assert rig.job.recreated_tables == ["docs"]
+    docs_worker = [i for i in rig.worker_inputs if "docs" in i.excluded_lob_columns][0]
+    assert dict(docs_worker.overlay_recorded_defaults) == {"docs": {"body": "'x'::text"}}
+    assert docs_worker.overlay_record is None  # a worker never writes the ledger
+    assert ("docs", OnConflictMode.NONE, ["id", "note"]) in rig.importer.calls
+
+
+def test_the_serial_pin_holds_across_tables(monkeypatch, events):
+    tables = [TableDef(name=f"t{i}", primary_key=["id"], columns=[ColumnDef(name="id", mysql_type="int", nullable=False),
+                                                                  ColumnDef(name="c", mysql_type="text", nullable=False)])
+              for i in range(5)]
+    for t in tables:
+        FRESH[t.name] = {"id": {"notnull": True, "default": None}, "c": {"notnull": True, "default": "'v'::text"}}
+    try:
+        overlay = {t.name: frozenset({"c"}) for t in tables}
+        rig = _ProcRig(monkeypatch, tables=tables, excluded=overlay, replace={t.name for t in tables})
+        rig.db.fault(r'"t1" ALTER COLUMN "c" DROP NOT NULL', Occ())
+        inflight = {"now": 0, "max": 0}
+        real_apply = rig._apply
+
+        def apply(inputs, name, planned, **kw):
+            inflight["now"] += 1
+            inflight["max"] = max(inflight["max"], inflight["now"])
+            try:
+                return real_apply(inputs, name, planned, **kw)
+            finally:
+                inflight["now"] -= 1
+
+        rig.migrator._overlay_applier = apply
+        assert set(rig.run().values()) == {"DONE"}
+        assert inflight["max"] == 1
+        per_table = [t.split(" ALTER COLUMN ")[0] + " " + t.split(" ALTER COLUMN ")[1]
+                     for _c, t in rig.db.log if t.startswith("ALTER TABLE")]
+        assert per_table == [f'ALTER TABLE "t{i}" "c" {a}' for i in range(5)
+                             for a in (["DROP NOT NULL", "DROP NOT NULL", "DROP DEFAULT"] if i == 1 else ["DROP NOT NULL", "DROP DEFAULT"])]
+    finally:
+        for t in tables:
+            FRESH.pop(t.name, None)
+
+
+from tests.test_overlay_core import Occ  # noqa: E402
+
+
+def test_a_failing_batch_alters_nothing_and_fails_what_it_carried(monkeypatch, events):
+    key = overlay_ledger_key(TargetConnectionConfig(cluster_endpoint="c.dsql.example", region="us-east-1"))
+    rig = _ProcRig(monkeypatch, replace={"docs", "plain"}, excluded={"docs": frozenset({"body"})})
+    owed = OverlayLedgerTable(table="plain", set_digest="d", set_columns=["gone"], empty_when_applied=True,
+                              applied_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+                              columns=[OverlayLedgerColumn(column="gone", original_default="'g'::text")])
+    rig.store.put_tables(key, {"plain": owed})
+    rig.store.merge_tables = lambda k, m: (_ for _ in ()).throw(OverlayLedgerError("AccessDenied"))
+    assert rig.run() == {"docs": "FAILED", "plain": "FAILED"}
+    assert rig.alters() == [] and rig.applied == [] and rig.importer.calls == []
+    text = rig.messages()
+    assert "cannot record the DEFAULTs of docs before dropping them; nothing was altered" in text
+    assert "cannot record the change to the exclusion record of plain; nothing was loaded" in text
+    assert "recreated empty; Retry unfinished recreates and loads it" in text
+
+
+def test_a_recreated_record_only_table_is_deleted_before_its_first_write(monkeypatch, events):
+    key = overlay_ledger_key(TargetConnectionConfig(cluster_endpoint="c.dsql.example", region="us-east-1"))
+    rig = _ProcRig(monkeypatch, replace={"plain"}, excluded={}, in_use=True)
+    owed = OverlayLedgerTable(table="plain", set_digest="d", set_columns=["gone"], empty_when_applied=True,
+                              applied_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+                              columns=[OverlayLedgerColumn(column="gone", original_default="'g'::text")])
+    rig.store.put_tables(key, {"plain": owed})
+    order = []
+    real_merge = rig.store.merge_tables
+    rig.store.merge_tables = lambda k, m: order.append("ledger") or real_merge(k, m)
+    real_import = rig.importer.import_rows
+    rig.importer.import_rows = lambda rows, table, **kw: order.append("import") or real_import(rows, table, **kw)
+    assert rig.run([PLAIN]) == {"plain": "DONE"}
+    assert rig.record("plain") is None and order.index("ledger") < order.index("import")
+
+
+def test_an_unreadable_ledger_on_the_process_path_never_recreates_the_overlay_table(monkeypatch, events):
+    rig = _ProcRig(monkeypatch, replace={"docs", "plain"})
+    rig.store.read = lambda key: LedgerRead("unreadable", {}, "AccessDenied")
+    assert rig.run() == {"docs": "FAILED", "plain": "DONE"}
+    assert rig.recreated == ["plain"] and rig.alters() == []
+    assert "cannot read the record of dropped DEFAULTs; nothing was changed on this table" in rig.messages()
+    assert len(_failures_for(events, "docs")) == 1
+
+
+def test_the_prepass_budget_is_constant_in_connections(monkeypatch, events):
+    tables = [TableDef(name=f"t{i}", primary_key=["id"], columns=[ColumnDef(name="id", mysql_type="int", nullable=False),
+                                                                  ColumnDef(name="c", mysql_type="text")])
+              for i in range(50)]
+    for t in tables:
+        FRESH[t.name] = {"id": {"notnull": True, "default": None}, "c": {"notnull": False, "default": None}}
+    try:
+        rig = _ProcRig(monkeypatch, tables=tables, excluded={t.name: frozenset({"c"}) for t in tables})
+        at_submit = {}
+        real_submit = _InlineExecutor.submit
+        monkeypatch.setattr(_InlineExecutor, "submit", lambda self, fn, *a: at_submit.setdefault("connects", rig.db.connects) and real_submit(self, fn, *a) or real_submit(self, fn, *a))
+        merges = []
+        real_merge = rig.store.merge_tables
+        rig.store.merge_tables = lambda k, m: merges.append(len(m)) or real_merge(k, m)
+        assert set(rig.run().values()) == {"DONE"}
+        assert at_submit["connects"] == 1  # the one step-1 read for 50 tables
+        assert merges == [50] and rig.applied == []
+    finally:
+        for t in tables:
+            FRESH.pop(t.name, None)
+
+
+def test_retry_seeding_keeps_every_unfinished_recreate():
+    prior = [ChunkState(chunk_id="a", status="FAILED"), ChunkState(chunk_id="b", status="PENDING"),
+             ChunkState(chunk_id="c", status="DONE")]
+    job = MigrationJob(job_id="r1")
+    _seed_retry_chunks(job, prior, {"a"}, prior_recreated_tables=["a", "b", "c", "b", "zz"])
+    assert job.recreated_tables == ["a", "b"]  # b is withheld from this retry but kept
+    job2 = MigrationJob(job_id="r0")
+    _seed_retry_chunks(job2, prior, {"a"})
+    assert job2.recreated_tables == []
+
+
+def test_the_parent_promotes_an_empty_overlay_table_whose_key_changed(monkeypatch, events):
+    conv = TableConversion(
+        table="docs",
+        target_ddl='CREATE TABLE "docs" ("id" INT NOT NULL, "body" TEXT NOT NULL DEFAULT \'x\', "note" TEXT NOT NULL, PRIMARY KEY ("note", "id"))',
+        index_ddls=['CREATE UNIQUE INDEX ASYNC docs_u ON "docs" ("body")'])
+    rig = _ProcRig(monkeypatch, rows={"docs": False})
+    rig.migrator.bind_run_inputs(dataclasses.replace(rig.inputs, table_conversions={"docs": conv}))
+    rig.inputs = rig.migrator._inputs
+    rig.db.pks["docs"] = ["id"]  # the live key is still the source key
+    states = rig.run()
+    assert states == {"docs": "DONE", "plain": "DONE"}, rig.messages()
+    assert "docs" in rig.migrator._inputs.replace_tables and rig.recreated == ["docs"]
+    assert rig.alters() == ['"body" DROP NOT NULL', '"body" DROP DEFAULT']
+    assert ("docs", OnConflictMode.NONE, ["id", "note"]) in rig.importer.calls
+    assert rig.importer.index_ddls["docs"] == ['CREATE UNIQUE INDEX ASYNC docs_u ON "docs" ("body")']
+    assert [e for e in events if e[2] == "docs" and "applied key differs" in e[3]]
+
+
+def test_a_run_without_exclusions_keeps_the_recreate_abort(monkeypatch, events):
+    # Decision 1: per-table isolation only with the overlay pre-pass; otherwise 0.1.561.
+    rig = _ProcRig(monkeypatch, replace={"plain"}, excluded={}, overlay={}, ledger=_RaisingStore())
+
+    def boom(table):
+        raise RuntimeError("cannot drop table plain because other objects depend on it")
+
+    rig.migrator._table_recreator = boom
+    states = rig.run([DOCS, PLAIN])
+    assert rig.job.status == "FAILED" and "cannot drop table plain" in rig.error
+    assert _InlineExecutor.submitted == [] and set(states.values()) <= {"PENDING", "FAILED"}
+    assert [e for e in events if e[0] == "run failed"]
+
+
+def test_a_recorded_only_append_with_rows_is_never_batched_and_loads_when_the_batch_fails(monkeypatch, events):
+    key = overlay_ledger_key(TargetConnectionConfig(cluster_endpoint="c.dsql.example", region="us-east-1"))
+    rig = _ProcRig(monkeypatch, rows={"docs": False, "plain": True})
+    owed = OverlayLedgerTable(table="plain", set_digest="d", set_columns=["gone"], empty_when_applied=True,
+                              applied_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+                              columns=[OverlayLedgerColumn(column="gone", original_default="'g'::text")])
+    rig.store.put_tables(key, {"plain": owed})
+    batches = []
+    rig.store.merge_tables = lambda k, m: batches.append(sorted(m)) or (_ for _ in ()).throw(OverlayLedgerError("AccessDenied"))
+    assert rig.run() == {"docs": "FAILED", "plain": "DONE"}
+    assert batches == [["docs"]] and rig.applied == []
+
+
+def test_a_worker_source_drop_recreates_verifies_the_recorded_default_and_loads(monkeypatch, events):
+    class _Lost(Exception):
+        pass
+
+    rig = _ProcRig(monkeypatch, replace={"docs"})
+    monkeypatch.setattr(engine._time, "sleep", lambda _s: None)
+    real_import = rig.importer.import_rows
+    state = {"first": True}
+
+    def flaky(rows, table, **kw):
+        out = real_import(rows, table, **kw)
+        if table.name == "docs" and state["first"]:
+            state["first"] = False
+            raise _Lost(2013, "Lost connection to MySQL server during query")
+        return out
+
+    rig.importer.import_rows = flaky
+    assert rig.run([DOCS]) == {"docs": "DONE"}, rig.messages()
+    assert rig.recreated == ["docs", "docs"]  # the parent, then the worker's own retry
+    # Parent overlay, then the worker's VERIFY-RECORDED overlay after its own recreate.
+    assert rig.alters() == ['"body" DROP NOT NULL', '"body" DROP DEFAULT'] * 2
+    assert [a[1] for a in rig.applied] == [{"body": "'x'::text"}, {"body": "'x'::text"}]
+
+
+def test_a_cdc_coexisting_run_drops_a_restored_default_before_its_first_write(monkeypatch, events):
+    key = overlay_ledger_key(TargetConnectionConfig(cluster_endpoint="c.dsql.example", region="us-east-1"))
+    rig = _ProcRig(monkeypatch, rows={"docs": True}, cdc=True, tables=(DOCS,))
+    rig.db.tables["docs"]["body"]["notnull"] = False  # an earlier overlay dropped NOT NULL
+    record = OverlayLedgerTable(
+        table="docs", set_digest=set_digest(["body"]),
+        set_columns=["body"], empty_when_applied=True, applied_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        columns=[OverlayLedgerColumn(column="body", original_default="'x'::text", dropped_not_null=True,
+                                     restored_at=datetime(2026, 9, 2, tzinfo=timezone.utc))])
+    rig.store.put_tables(key, {"docs": record})
+    order = []
+    real_import = rig.importer.import_rows
+    rig.importer.import_rows = lambda rows, table, **kw: order.append("import") or real_import(rows, table, **kw)
+    real_apply = rig._apply
+    rig.migrator._overlay_applier = lambda *a, **k: order.append("alter") or real_apply(*a, **k)
+    assert rig.run() == {"docs": "DONE"}, rig.messages()
+    assert rig.alters() == ['"body" DROP DEFAULT'] and order == ["alter", "import"]
+    after = rig.record().column("body")
+    assert after.original_default == "'x'::text" and after.restored_at is None  # owed again

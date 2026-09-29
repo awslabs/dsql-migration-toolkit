@@ -117,7 +117,7 @@ class FakeCursor:
         db.log.append((self.conn.cid, text))
         self._fire(text, "before")
         if "ix.indisprimary" in text:
-            name = f"{params['schema']}.{params['table']}"
+            name = f"{params['schema']}.{params['table']}" if "schema" in params else params["table"]
             self._rows = [(c,) for c in db.pks.get(name, [])]
         elif "pg_catalog.pg_attribute a ON" in text:
             name = f"{params['schema']}.{params['table']}" if "schema" in params else params["table"]
