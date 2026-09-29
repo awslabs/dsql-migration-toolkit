@@ -441,10 +441,8 @@ def test_overlay_columns_without_a_ledger_fail_before_the_watermark(events):
         rig.run(retry_prior=[] if retry else None)
         assert rig.job.status == "FAILED" and "no overlay ledger configured" in rig.error
         assert hooks == [] and rig.applied == [] and rig.importer.calls == []
-        if not retry:
-            assert [e for e in events if e[0] == "run failed"] and \
-                len([e for e in events if e[0] == "run failed"]) == 1
-            assert "BEFORE any table was loaded" in [e for e in events if e[0] == "run failed"][0][3]
+        terminal = [e for e in events if e[0] == ("retry failed" if retry else "run failed")]
+        assert len(terminal) == 1 and "BEFORE any table was" in terminal[0][3]
 
 
 def test_the_ledger_is_read_before_the_pre_drops_in_both_run_paths(events):
@@ -470,7 +468,7 @@ def test_an_unreadable_ledger_fails_only_the_overlay_tables_and_keeps_them_out_o
     assert [c[0] for c in rig.importer.calls] == ["plain"]
     assert "cannot read the record of dropped DEFAULTs; nothing was changed on this table" in rig.messages()
     warnings = [e for e in events if e[0] == "overlay ledger unreadable"]
-    assert len(warnings) == 1 and "docs" in warnings[0][3] and "Still reloaded: plain" in warnings[0][3]
+    assert len(warnings) == 1 and "fail: docs." in warnings[0][3]
     assert not [e for e in events if e[0] == "run failed"]
 
 
@@ -800,7 +798,8 @@ def test_process_path_records_overlays_serially_then_submits(monkeypatch, events
     rig.migrator._overlay_applier = apply
     real_submit = _InlineExecutor.submit
     monkeypatch.setattr(_InlineExecutor, "submit", lambda self, fn, *a: order.append(("submit", a[0].table.name)) or real_submit(self, fn, *a))
-    assert rig.run() == {"docs": "DONE", "plain": "DONE"}
+    states = rig.run()
+    assert states == {"docs": "DONE", "plain": "DONE"}, rig.error
     assert merges == [["docs"]]  # ONE batch, before any ALTER
     assert rig.alters() == ['"body" DROP NOT NULL', '"body" DROP DEFAULT']
     assert order.index(("alter", "docs")) < min(i for i, e in enumerate(order) if e[0] == "submit")
@@ -1010,3 +1009,74 @@ def test_a_cdc_coexisting_run_drops_a_restored_default_before_its_first_write(mo
     assert rig.alters() == ['"body" DROP DEFAULT'] and order == ["alter", "import"]
     after = rig.record().column("body")
     assert after.original_default == "'x'::text" and after.restored_at is None  # owed again
+
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (P2-05/06 verification)
+# ---------------------------------------------------------------------------
+
+
+def _seed_record(rig, table="docs", columns=("body",), empty=True):
+    key = overlay_ledger_key(rig.inputs.target_config)
+    rig.store.put_tables(key, {table: OverlayLedgerTable(
+        table=table, set_digest=set_digest(list(columns)), set_columns=list(columns), empty_when_applied=empty,
+        applied_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        columns=[OverlayLedgerColumn(column=c, original_default="'x'::text", dropped_not_null=True) for c in columns])})
+
+
+@pytest.mark.parametrize("path", ["thread", "process"])
+def test_an_unreadable_ledger_blocks_every_table_of_a_session_that_used_it(monkeypatch, events, path):
+    kw = dict(excluded={}, overlay={}, in_use=True, rows={"docs": True, "plain": True}, replace={"plain"})
+    rig = _ProcRig(monkeypatch, **kw) if path == "process" else _Rig(**kw)
+    rig.store.read = lambda key: LedgerRead("unreadable", {}, "AccessDenied")
+    assert rig.run() == {"docs": "FAILED", "plain": "FAILED"}
+    assert rig.importer.calls == [] and rig.recreated == []  # docs may hold NULL rows; nothing is touched
+    (warning,) = [e for e in events if e[0] == "overlay ledger unreadable"]
+    assert "fail: docs, plain." in warning[3]
+
+
+def test_a_recorded_column_the_load_cannot_write_is_not_re_included(events):
+    # (a) the source no longer has it; (b) the target computes it. New rows land NULL like the old.
+    source_dropped = TableDef(name="docs", primary_key=["id"], columns=[
+        ColumnDef(name="id", mysql_type="int", nullable=False), ColumnDef(name="note", mysql_type="text")])
+    rig = _Rig(tables=(source_dropped,), excluded={}, overlay={}, in_use=True, rows={"docs": True})
+    _seed_record(rig)
+    assert rig.run() == {"docs": "DONE"}, rig.messages()
+    rig = _Rig(tables=(DOCS,), excluded={}, overlay={}, in_use=True, rows={"docs": True})
+    _seed_record(rig)
+    rig.db.tables["docs"]["body"]["generated"] = "s"
+    rig.migrator._target_generated_reader = lambda t: {"body"}
+    assert rig.run() == {"docs": "DONE"}, rig.messages()
+    # Control: truly re-included (the source has it, the target does not compute it) -> refused.
+    rig = _Rig(tables=(DOCS,), excluded={}, overlay={}, in_use=True, rows={"docs": True})
+    _seed_record(rig)
+    assert rig.run() == {"docs": "FAILED"} and "hold NULL from an earlier exclusion set" in rig.messages()
+
+
+@pytest.mark.parametrize("path", ["thread", "process"])
+def test_a_legacy_entry_does_not_exempt_a_new_overlay_column_from_the_reload_verdict(monkeypatch, events, path):
+    kw = dict(tables=(DOCS,), rows={"docs": True}, excluded={"docs": frozenset({"body", "note"})},
+              overlay={"docs": frozenset({"body"})}, legacy={"docs": frozenset({"note"})})
+    rig = _ProcRig(monkeypatch, **kw) if path == "process" else _Rig(**kw)
+    assert rig.run() == {"docs": "FAILED"}
+    assert "needs Drop & reload" in rig.messages() and rig.alters() == [] and rig.importer.calls == []
+    assert rig.record() is None
+
+
+def test_a_failed_record_update_on_a_recreated_table_without_exclusions_says_what_failed(events):
+    rig = _Rig(tables=(DOCS,), excluded={}, overlay={}, in_use=True, replace={"docs"})
+    _seed_record(rig)
+    rig.store.merge_tables = lambda key, merges: (_ for _ in ()).throw(OverlayLedgerError("AccessDenied"))
+    assert rig.run() == {"docs": "FAILED"}
+    text = rig.messages()
+    assert "cannot update the exclusion record of docs after recreating it" in text
+    assert "before dropping them" not in text
+
+
+def test_a_computed_overlay_column_is_not_reported_loaded_as_null(events):
+    rig = _Rig(tables=(DOCS,), rows={"docs": False})
+    rig.db.tables["docs"]["body"]["generated"] = "s"
+    assert rig.run() == {"docs": "DONE"} and rig.alters() == []
+    (line,) = [e for e in events if e[0] == "load table" and e[2] == "docs"]
+    assert "loaded as NULL" not in line[3] and "excluded: body" in line[3]

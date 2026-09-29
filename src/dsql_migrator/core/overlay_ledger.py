@@ -311,7 +311,9 @@ def append_refusal(
 
     The ONE predicate for the Start dialog's forced Drop & reload and the engine's
     fail-closed check, so both exempt and refuse the same tables. ``exempt`` is
-    cdc_coexisting or a legacy entry: the caller appends and warns instead.
+    cdc_coexisting (Drop & reload does not exist while the sink streams): the caller
+    appends and warns instead. A legacy entry is no exemption -- a refusal never names a
+    legacy column, so exempting on one would only hide a refusal for another column.
     """
     if not has_rows or exempt:
         return None
