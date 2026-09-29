@@ -988,6 +988,12 @@ class MigrationJob(BaseModel):
     # survives job pruning. Empty on a first run -> readers fall back to ``job_id``, i.e.
     # the pre-existing behavior. Additive + defaulted so persisted snapshots deserialize.
     table_error_job_ids: dict[str, str] = Field(default_factory=dict)
+    # Tables the tool DROP+recreated in this job lineage (the column-exclusion pre-pass
+    # and the parent thread-path recreator): a retry must re-run such a table's overlay
+    # before it loads. Additive + defaulted so persisted snapshots deserialize, and left
+    # OUT of the payload while empty, so a job that recreated nothing still loads on an
+    # older build (this model is extra="forbid").
+    recreated_tables: list[str] = Field(default_factory=list, exclude_if=lambda v: not v)
     watermark: Optional[Watermark] = Field(
         default=None,
         description=(

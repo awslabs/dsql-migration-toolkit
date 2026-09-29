@@ -185,6 +185,29 @@ class DataMigrationInputs:
     # excluded (candidates exclude PKs; the engine also guards). Empty => nothing
     # is dropped (the default; oversized rows are quarantined per-row instead).
     excluded_lob_columns: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    # --- Column-exclusion overlay (the excluded columns land NULL) -----------------
+    # The operator (non-legacy) exclusions to OVERLAY: each column is made nullable with
+    # no DEFAULT on the target before the table's first write. Always read as the
+    # intersection with ``excluded_lob_columns``; a legacy entry is omit-only.
+    overlay_columns: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    # Exclusions restored from a 0.1.561 session: omitted only, never ALTERed.
+    legacy_exclusions: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    # Parent-filled for recreated overlay tables: {table: {column: the pg_get_expr text
+    # this run recorded}}. A worker's own recreate (source-drop retry) must find exactly
+    # these DEFAULTs before it ALTERs anything.
+    overlay_recorded_defaults: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    # The overlay ledger store (core.overlay_ledger); parent-only.
+    overlay_ledger: Optional[object] = None
+    # The run's OverlayLedgerView (core.overlay_ledger), installed by the pre-loop step;
+    # parent-only (it holds a lock and is never pickled into a worker).
+    overlay_record: Optional[object] = None
+    # True when the ledger holds records for this target (a table can owe a DEFAULT even
+    # with no exclusion in this run).
+    overlay_ledger_in_use: bool = False
+    # "present" / "absent" / "unreadable" as the pre-loop step read it; parent-only.
+    overlay_ledger_status: Optional[str] = None
+    # Called with a table name each time the parent DROP+recreates it; parent-only.
+    on_table_recreated: Optional[Callable[[str], None]] = None
 
 
 @dataclass(frozen=True)
@@ -389,6 +412,13 @@ def _fail_chunk(job: MigrationJob, chunk_id: str) -> None:
     _recompute_progress(job)
 
 
+def _record_recreated(job: MigrationJob, name: str) -> None:
+    """Note that the tool DROP+recreated ``name`` in this job (idempotent: a thread-path
+    source-drop retry recreates the same table again)."""
+    if name not in job.recreated_tables:
+        job.recreated_tables.append(name)
+
+
 def _advance_chunk_rows(
     job: MigrationJob, chunk_id: str, delta_loaded: int, delta_skipped: int = 0
 ) -> None:
@@ -588,6 +618,45 @@ class FullLoadIncompleteError(RuntimeError):
     """
 
 
+class OverlayRunError(FullLoadIncompleteError):
+    """A table's column-exclusion overlay could not be made safe, so the table fails
+    closed BEFORE its first write (the other tables continue).
+
+    Never a source-connection drop: both source-retry loops re-raise it before their
+    transient classification, so an exhausted overlay unit (whose wrapped DSQL error may
+    carry a class-08 SQLSTATE) is not re-entered under a misleading "source connection
+    lost" line. ``sqlstate`` is copied from ``cause`` so the error log keeps the code.
+    """
+
+    def __init__(self, message: str, *, cause: Optional[BaseException] = None) -> None:
+        super().__init__(message)
+        self.sqlstate = getattr(cause, "sqlstate", None)
+
+
+class OverlayCatalogError(OverlayRunError):
+    """The target catalog could not be read for the overlay columns."""
+
+
+class OverlayLedgerReadError(OverlayRunError):
+    """The overlay ledger could not be read, so the table is not touched."""
+
+
+class OverlayLedgerWriteError(OverlayRunError):
+    """The DEFAULTs to drop could not be recorded, so nothing was altered."""
+
+
+class OverlayRecordMismatchError(OverlayRunError):
+    """A recreated table's DEFAULT is not the one recorded before the load."""
+
+
+class OverlayNotInPlaceError(OverlayRunError):
+    """An overlay column is still NOT NULL or still has a DEFAULT before the load."""
+
+
+class OverlayNeedsReloadError(OverlayRunError):
+    """Appending would break the NULL contract; the table needs Drop & reload."""
+
+
 def _fail_unfinished_chunks(job: MigrationJob) -> None:
     """Mark every non-``DONE`` chunk ``FAILED`` after a stop (so retry resumes).
 
@@ -741,14 +810,29 @@ def _slim_worker_inputs(
     in the worker/migrator path. Pickling the full ``SourceInventory`` + every table's DDL
     into EACH of N worker submissions is O(tables^2) serialization/IPC (seconds-to-minutes of
     parent-side pickling at a few thousand tables). Slim both to this one table so a many-
-    table migration is O(tables); the small fields (connection configs, flags, excluded-LOB
-    map, view DDLs) are preserved unchanged.
+    table migration is O(tables). The per-table exclusion maps are slimmed to this table
+    too, and the parent-only overlay fields (the ledger store, the run view, its status and
+    the recreate callback) are dropped: they hold locks and clients that cannot be pickled,
+    and a worker never writes the ledger. The small fields (connection configs, flags, view
+    DDLs) are preserved unchanged.
     """
     conv = inputs.table_conversions.get(table_name)
+
+    def _one(mapping):
+        return {table_name: mapping[table_name]} if table_name in mapping else {}
+
     return replace(
         inputs,
         inventory=SourceInventory(),
         table_conversions=({table_name: conv} if conv is not None else {}),
+        excluded_lob_columns=_one(inputs.excluded_lob_columns),
+        overlay_columns=_one(inputs.overlay_columns),
+        legacy_exclusions=_one(inputs.legacy_exclusions),
+        overlay_recorded_defaults=_one(inputs.overlay_recorded_defaults),
+        overlay_ledger=None,
+        overlay_record=None,
+        overlay_ledger_status=None,
+        on_table_recreated=None,
     )
 
 
@@ -936,6 +1020,8 @@ def _retry_source_drops_in_process(
             raise
         except ExportCancelled:
             raise
+        except OverlayRunError:
+            raise  # a target-side overlay failure, never a source drop
         except Exception as exc:  # noqa: BLE001 - classify transient vs permanent
             if attempt >= attempts or not is_source_transient_error(exc, source_type):
                 raise
@@ -1798,6 +1884,8 @@ def _migrate_table_with_source_retry(
             )
         except _FullLoadStopped:
             raise  # a user stop is not a failure to retry
+        except OverlayRunError:
+            raise  # a target-side overlay failure, never a source drop
         except Exception as exc:  # noqa: BLE001 - classify transient vs permanent
             # A fake migrator (tests) may not expose source_type; default to MySQL,
             # matching the doubles' simulated source.
@@ -3851,6 +3939,115 @@ def _target_columns_the_conversion_would_drop(
     return [name for name in current if name not in expected]
 
 
+def _effective_conversion(inputs: "DataMigrationInputs", table: TableDef) -> TableConversion:
+    """The conversion a recreate runs: the APPLIED one, else the deterministic one.
+
+    A table with no applied conversion carried in (e.g. a table generated outside this
+    session) is re-derived deterministically -- the SAME derivation the read path uses
+    for its target column types, so the recreated table and the SELECT that fills it
+    cannot disagree (see _derived_table_conversion).
+    """
+    conversion = inputs.table_conversions.get(table.name)
+    if conversion is None:
+        conversion = _derived_table_conversion(inputs, table)
+    return conversion
+
+
+def _effective_target_ddl(inputs: "DataMigrationInputs", table: TableDef) -> str:
+    """The CREATE TABLE text a recreate runs (the overlay ledger records against it)."""
+    return _effective_conversion(inputs, table).target_ddl
+
+
+def _default_overlay_facts_reader(
+    inputs: "DataMigrationInputs",
+    table_names: Sequence[str],
+    columns_by_table: Mapping[str, Sequence[str]],
+    *,
+    probe_rows: bool,
+    primary_key_tables: "frozenset[str] | set[str]" = frozenset(),
+):
+    """The overlay facts of ``table_names`` on this run's target (one connection)."""
+    from dsql_migrator.core.target_introspector import target_overlay_facts
+
+    connector = DsqlConnector(inputs.target_config, aws_profile=inputs.aws_profile)
+    return target_overlay_facts(
+        table_names,
+        columns_by_table,
+        connection_factory=connector.connect,
+        probe_rows=probe_rows,
+        primary_key_tables=primary_key_tables,
+    )
+
+
+def _default_overlay_applier(
+    inputs: "DataMigrationInputs",
+    table_name: str,
+    planned: Mapping[str, object],
+    *,
+    expected_defaults: Optional[Mapping[str, Optional[str]]] = None,
+):
+    """Run one table's overlay unit on this run's target."""
+    from dsql_migrator.core.schema_applier import apply_exclusion_overlay
+
+    connector = DsqlConnector(inputs.target_config, aws_profile=inputs.aws_profile)
+    return apply_exclusion_overlay(
+        table_name,
+        planned,  # type: ignore[arg-type]
+        expected_defaults=expected_defaults,
+        connection_factory=connector.connect,
+    )
+
+
+def _needs_empty_target_promotion(
+    *,
+    target_key_columns: Optional[list[str]],
+    source_pk: Sequence[str],
+    is_replace: bool,
+    cdc_coexisting: bool,
+    pre_recreated: bool,
+    target_is_empty: Callable[[], bool],
+    live_key: Callable[[], Optional[list[str]]],
+) -> bool:
+    """Whether an append table must be promoted to the replace path.
+
+    A CHANGED target PK (e.g. the composite (leading, id) recommended to avoid hot
+    partitions) is a SCHEMA change, so it can only be honored by creating the target
+    from the applied DDL -- appending cannot retrofit a key onto an existing table. When
+    the target is EMPTY, recreating it is non-destructive (there is nothing to lose), so
+    promote this table to the replace path and give the user the schema they actually
+    chose.
+
+    Without this the load "succeeded" into whatever shape the target happened to have:
+    an empty table still carrying the OLD single-column key accepted all the rows, so
+    the user believed they had the hot-partition remedy while the table was in fact
+    keyed the old way -- and now populated, so correcting it required a destructive
+    reload. Silently loading data in the wrong shape is worse than either refusing or
+    recreating.
+
+    ...unless the empty target ALREADY carries that key -- the normal state right after
+    "Apply all to target" in Step 2. Recreating it would DROP and CREATE the identical
+    table to "apply" a key it already has: a wasted DDL round trip (DSQL permits one DDL
+    per transaction) that the confirm dialog has to announce as a recreate, which reads
+    as a contradiction. Only an EQUAL key skips the promotion; a key that cannot be read
+    (None) is unknown, not safe, so it still recreates -- matching the append path, which
+    refuses rather than assumes when the catalog won't answer.
+
+    The probes are LAZY and run in this order, only once every cheap condition holds.
+    ``target_key_columns`` is the LOADER's reading of the applied DDL
+    (``parse_target_primary_key(ddl)``), never the exclusion rule's.
+    """
+    if (
+        not is_replace
+        and not cdc_coexisting
+        and target_key_columns
+        and target_key_columns != list(source_pk)
+        and not pre_recreated
+        and target_is_empty()
+    ):
+        return live_key() != target_key_columns
+    return False
+
+
 def _default_table_recreator(inputs: "DataMigrationInputs") -> TableRecreator:
     """Build the default DROP+recreate function for a run's target.
 
@@ -3866,13 +4063,7 @@ def _default_table_recreator(inputs: "DataMigrationInputs") -> TableRecreator:
     """
 
     def recreate(table: TableDef) -> list[str]:
-        conversion = inputs.table_conversions.get(table.name)
-        if conversion is None:
-            # No applied conversion carried in (e.g. a table generated outside this
-            # session): re-derive deterministically -- the SAME derivation the read path
-            # uses for its target column types, so the recreated table and the SELECT
-            # that fills it cannot disagree (see _derived_table_conversion).
-            conversion = _derived_table_conversion(inputs, table)
+        conversion = _effective_conversion(inputs, table)
         # REFUSE rather than silently destroy a column the conversion does not know
         # about (see _target_columns_the_conversion_would_drop). The reachable case is
         # the tool's own CDC drift recovery: the operator adds the source's new column to
@@ -3937,9 +4128,16 @@ class BatchedTableMigrator:
         target_generated_reader: Optional[
             Callable[[TableDef], Optional[set[str]]]
         ] = None,
+        overlay_facts_reader: Optional[Callable[..., Any]] = None,
+        overlay_applier: Optional[Callable[..., Any]] = None,
     ) -> None:
         """Build a migrator bound to one run's ``inputs``."""
         self._inputs = inputs
+        # Column-exclusion overlay seams (injectable for tests). None resolves the module
+        # defaults at CALL time, so a test can monkeypatch them for a worker that builds
+        # its own migrator with defaults.
+        self._overlay_facts_reader = overlay_facts_reader
+        self._overlay_applier = overlay_applier
         # The Full Load stream opts into a per-socket read timeout so a
         # connected-but-stalled source read (a large table's page that never
         # returns) fails the table -- making it retryable -- instead of hanging
@@ -3980,6 +4178,45 @@ class BatchedTableMigrator:
         """The source engine this migrator reads (drives engine-specific source-error
         classification / hints on the retry path)."""
         return self._inputs.source_config.source_type
+
+    def bind_run_inputs(self, run_inputs: "DataMigrationInputs") -> None:
+        """Adopt the run's inputs (the pre-loop step adds the ledger view and the tables
+        it removed from ``replace_tables``).
+
+        Only ``self._inputs`` changes: the exporter, the importer factory and the base
+        recreator are not rebuilt. The base recreator closes over the construction-time
+        ``table_conversions`` and ``target_config``, which the pre-loop step never
+        changes.
+        """
+        self._inputs = run_inputs
+
+    def overlay_facts(
+        self,
+        table_names: Sequence[str],
+        columns_by_table: Mapping[str, Sequence[str]],
+        *,
+        probe_rows: bool,
+        primary_key_tables: "frozenset[str] | set[str]" = frozenset(),
+    ):
+        """The overlay facts of ``table_names`` (``core.target_introspector``)."""
+        reader = self._overlay_facts_reader or _default_overlay_facts_reader
+        return reader(
+            self._inputs, table_names, columns_by_table,
+            probe_rows=probe_rows, primary_key_tables=primary_key_tables,
+        )
+
+    def apply_overlay(
+        self,
+        table_name: str,
+        planned: Mapping[str, object],
+        *,
+        expected_defaults: Optional[Mapping[str, Optional[str]]] = None,
+    ):
+        """Run one table's overlay unit (``core.schema_applier``)."""
+        applier = self._overlay_applier or _default_overlay_applier
+        return applier(
+            self._inputs, table_name, planned, expected_defaults=expected_defaults
+        )
 
     def capture_watermark(self, tables: Sequence[TableDef]) -> Watermark:
         """Capture the export consistency point for the selected ``tables``.
@@ -4237,37 +4474,18 @@ class BatchedTableMigrator:
             not self._inputs.cdc_coexisting
             and table.name in self._inputs.replace_tables
         )
-        # A CHANGED target PK (e.g. the composite (leading, id) recommended to avoid
-        # hot partitions) is a SCHEMA change, so it can only be honored by creating
-        # the target from the applied DDL -- appending cannot retrofit a key onto an
-        # existing table. When the target is EMPTY, recreating it is non-destructive
-        # (there is nothing to lose), so promote this table to the replace path and
-        # give the user the schema they actually chose.
-        #
-        # Without this the load "succeeded" into whatever shape the target happened to
-        # have: an empty table still carrying the OLD single-column key accepted all
-        # the rows, so the user believed they had the hot-partition remedy while the
-        # table was in fact keyed the old way -- and now populated, so correcting it
-        # required a destructive reload. Silently loading data in the wrong shape is
-        # worse than either refusing or recreating.
-        if (
-            not is_replace
-            and not self._inputs.cdc_coexisting
-            and target_key_columns
-            and target_key_columns != list(table.primary_key)
-            and not pre_recreated
-            and self._target_counter(table) == 0
+        # A CHANGED target PK on an EMPTY target is promoted to the replace path (see
+        # _needs_empty_target_promotion; the probes stay lazy).
+        if _needs_empty_target_promotion(
+            target_key_columns=target_key_columns,
+            source_pk=table.primary_key,
+            is_replace=is_replace,
+            cdc_coexisting=self._inputs.cdc_coexisting,
+            pre_recreated=pre_recreated,
+            target_is_empty=lambda: self._target_counter(table) == 0,
+            live_key=lambda: self._target_pk_reader(table),
         ):
-            # ...unless the empty target ALREADY carries that key -- the normal state
-            # right after "Apply all to target" in Step 2. Recreating it would DROP and
-            # CREATE the identical table to "apply" a key it already has: a wasted DDL
-            # round trip (DSQL permits one DDL per transaction) that the confirm dialog
-            # has to announce as a recreate, which reads as a contradiction. Only an
-            # EQUAL key skips the promotion; a key that cannot be read (None) is
-            # unknown, not safe, so it still recreates -- matching the append path
-            # below, which refuses rather than assumes when the catalog won't answer.
-            if self._target_pk_reader(table) != target_key_columns:
-                is_replace = True
+            is_replace = True
 
         # Reader range sharding: for a LARGE single-integer-PK table, split the read
         # into K disjoint PK ranges streamed concurrently (each its own snapshot), so

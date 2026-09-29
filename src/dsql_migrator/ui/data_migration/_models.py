@@ -324,6 +324,21 @@ def unsettled_table_names(job: MigrationJob) -> list[str]:
     return [chunk.chunk_id for chunk in job.chunks if chunk.status != "DONE"]
 
 
+def recreated_unfinished(job: MigrationJob) -> list[str]:
+    """Tables the tool DROP+recreated in this job lineage that did not finish.
+
+    Such a table holds no rows (or a partial load) and its overlay must be re-run
+    before it loads again, so a retry re-runs it as a recreate. De-duplicated, in
+    recorded order; an entry with no chunk in this job is not unfinished work here.
+    """
+    status = {chunk.chunk_id: chunk.status for chunk in job.chunks}
+    return [
+        name
+        for name in dict.fromkeys(getattr(job, "recreated_tables", None) or ())
+        if name in status and status[name] != "DONE"
+    ]
+
+
 def format_duration(seconds: float) -> str:
     """Format a duration in seconds as a compact ``Hh Mm``/``Mm Ss``/``Ss`` string."""
     total = int(max(0, round(seconds)))
