@@ -4080,6 +4080,38 @@ def build_cutover_screen(
 
         ui.timer(0.05, _fill, once=True)
 
+    def _log_cut_over_with_pending_defaults() -> None:
+        """At the acknowledgement: DEFAULTs still owed are a WARNING, never a block.
+        Reads the cached status only (no I/O)."""
+        if overlay_ledger is None or migration_state is None:
+            return
+        snap = validation_state.cutover_defaults
+        if snap is None or snap.state != "loaded":
+            if snap is None and not getattr(migration_state, "overlay_ledger_in_use", False):
+                return  # the session never used the record: nothing can be owed
+            log_activity(
+                ActivityCategory.VALIDATION,
+                "excluded-column DEFAULTs not restored at cut over",
+                status=ActivityStatus.WARNING,
+                detail=(
+                    "cut over before the tool could confirm the excluded columns' "
+                    f"DEFAULTs ({snap.state if snap is not None else 'not checked'})"
+                ),
+            )
+            return
+        owed = [i for i in snap.items if i.status in ("pending", "unknown")]
+        if not owed:
+            return
+        shown = ", ".join(
+            f"{i.table}.{i.column} DEFAULT {i.original_default}" for i in owed[:8]
+        ) + (f" (+{len(owed) - 8} more)" if len(owed) > 8 else "")
+        log_activity(
+            ActivityCategory.VALIDATION,
+            "excluded-column DEFAULTs not restored at cut over",
+            status=ActivityStatus.WARNING,
+            detail=f"cut over with {len(owed)} DEFAULTs not restored: {shown}",
+        )
+
     def runner() -> None:
         # No job: mark DONE as the user's acknowledgement that they've cut over.
         session.set_workflow(
@@ -4141,6 +4173,7 @@ def build_cutover_screen(
                 )
             ),
         )
+        _log_cut_over_with_pending_defaults()
         if ai_post_event is not None:
             ai_post_event(
                 text=(
@@ -4354,6 +4387,33 @@ def build_cutover_screen(
 
         # The excluded columns' DEFAULT status for the runbook below (background read).
         _schedule_cutover_defaults_fill(refresh)
+        _defaults_on = (
+            overlay_ledger is not None
+            and migration_state is not None
+            and getattr(session, "target_config", None) is not None
+        )
+        _defaults = validation_state.cutover_defaults if _defaults_on else None
+        _restore_block = cutover_job_block(migration_state, job_manager) if _defaults_on else None
+        _restore_running = (
+            validation_state.cutover_default_restore_in_flight(job_manager)
+            if _defaults_on
+            else False
+        )
+        # One registry of the drained-gated buttons, shared by the runbook and the Finish
+        # area below, so the one checkbox enables every one of them.
+        _drained_gated: list = []
+
+        def _restore_provider(request: "Optional[tuple[str, str]]" = None) -> None:
+            _run_cutover_default_restore(
+                session, validation_state, migration_state, request=request,
+                overlay_ledger=overlay_ledger, job_manager=job_manager, refresh=refresh,
+                notify=ui.notify,  # type: ignore[attr-defined]
+            )
+
+        def _recheck_defaults() -> None:
+            validation_state.invalidate_cutover_defaults()
+            refresh()
+
         # Go path: the verdict is clean — show the tailored runbook + an explicit
         # acknowledgement that marks the step (and the whole journey) Done. The runbook
         # includes an explicit "Sync identity sequences" action (an operator step, not a
@@ -4373,6 +4433,14 @@ def build_cutover_screen(
             cdc_drained_confirmed=validation_state.cutover_cdc_drained_confirmed,
             on_cdc_drained_change=validation_state.set_cutover_cdc_drained_confirmed,
             inputs_unknown=_gate_inputs_unknown,
+            default_restore=_defaults,
+            defaults_checking=_defaults_on and _defaults is None,
+            restore_provider=_restore_provider if _defaults_on else None,
+            restore_job_block=_restore_block,
+            restore_running=_restore_running,
+            restore_outcome=validation_state.cutover_default_restore_outcome,
+            on_recheck_defaults=_recheck_defaults,
+            drained_gated=_drained_gated,
         )
 
         done = get_status(session.workflow, WorkflowStep.CUT_OVER) is StepStatus.DONE
@@ -4463,6 +4531,52 @@ def build_cutover_screen(
                         icon="link_off",
                         on_click=_proceed_without_fks,
                     ).props("no-caps color=warning outline")
+                # DEFAULTs still owed: a warning with the action, never a block (the
+                # acknowledgement logs it). Applications inserting without the column
+                # would store NULL where the source had a DEFAULT.
+                if _defaults is not None and _defaults.state == "loaded" and _defaults.outstanding:
+                    render_notice(
+                        ui,
+                        tone="warning",
+                        header=(
+                            f"{_defaults.pending} excluded column(s) still have no DEFAULT "
+                            "on Aurora DSQL"
+                            if _defaults.pending
+                            else f"{_defaults.unknown} excluded column(s) could not be "
+                            "checked on Aurora DSQL"
+                        ),
+                        body=(
+                            "Your application's inserts will store NULL there where the "
+                            "source would have used a DEFAULT. "
+                            + (
+                                "Restore them now, or decide on the columns listed under "
+                                "\"Needs your decision\" above."
+                                if _defaults.auto_items
+                                else "Decide on the columns listed under \"Needs your "
+                                "decision\" above."
+                            )
+                        ),
+                    )
+                    if _defaults.auto_items:
+                        _fin_btn = ui.button(  # type: ignore[attr-defined]
+                            "Restore DEFAULTs",
+                            icon="settings_backup_restore",
+                            on_click=lambda: _restore_provider(None),
+                        ).props("color=primary outline no-caps")
+                        _fin_other = bool(_restore_block) or _restore_running
+                        if _fin_other or (
+                            _cdc_in_use(session)
+                            and not validation_state.cutover_cdc_drained_confirmed
+                        ):
+                            _fin_btn.props("disable")
+                        _drained_gated.append((_fin_btn, _fin_other))
+                elif _defaults_on and _defaults is None:
+                    inline_hint(
+                        ui,
+                        "Checking whether the excluded columns' DEFAULTs are back on "
+                        "Aurora DSQL.",
+                        tone="info",
+                    )
                 ui.label(  # type: ignore[attr-defined]
                     "When your application is live on DSQL and smoke-tested, mark "
                     "the cut-over complete to finish the migration journey."
@@ -5735,6 +5849,14 @@ def _render_cutover_section(
     cdc_drained_confirmed: bool = False,
     on_cdc_drained_change: "Optional[Callable[[bool], None]]" = None,
     inputs_unknown: bool = False,
+    default_restore: "Optional[CutoverDefaultsSnapshot]" = None,
+    defaults_checking: bool = False,
+    restore_provider: "Optional[Callable[[Optional[tuple[str, str]]], None]]" = None,
+    restore_job_block: Optional[str] = None,
+    restore_running: bool = False,
+    restore_outcome: "Optional[CutoverRestoreOutcome]" = None,
+    on_recheck_defaults: "Optional[Callable[[], None]]" = None,
+    drained_gated: "Optional[list]" = None,
 ) -> None:
     """Render the go-path cut-over runbook as its OWN titled section card.
 
@@ -5763,6 +5885,14 @@ def _render_cutover_section(
     the idempotent apply to complete any FK skipped/failed at load end (FIX 9). For a CDC
     migration the Apply button is gated behind an explicit "CDC has drained" confirmation
     checkbox (FIX 2) — applying mid-stream would dead-letter 23503 violations.
+
+    That checkbox is ONE for the whole section: it renders under CDC whenever the FK
+    block renders or DEFAULT restores are pending, and its toggle enables every
+    drained-gated button registered in ``drained_gated`` (``(button, other_blocked)``:
+    Apply foreign keys, [Restore DEFAULTs], each per-row [Restore], and the finish-area
+    [Restore DEFAULTs]) -- never one disabled for another reason -- without a refresh.
+    ``default_restore`` is the background-read DEFAULT status (``defaults_checking``
+    while it loads); see :func:`_render_cutover_defaults_block`.
     """
     with _section(ui, icon="rocket_launch", title="How to cut over"):  # type: ignore[misc]
         render_notice(
@@ -5857,6 +5987,43 @@ def _render_cutover_section(
                 ),
             )
 
+        # ONE drained attestation for every action below that must wait for CDC to drain
+        # (the FK ADD CONSTRAINT pass, the DEFAULT restores). Latched on ValidationState;
+        # each gated button registers with its OWN other-block flag, so a tick never
+        # enables a button that is disabled for another reason.
+        _fk_block = fk_apply_provider is not None and fk_pending_count > 0
+        _restores_pending = (
+            default_restore is not None
+            and default_restore.state == "loaded"
+            and default_restore.pending > 0
+        )
+        _drained = {"ok": (not cdc_in_use) or bool(cdc_drained_confirmed)}
+        _gated: list = drained_gated if drained_gated is not None else []
+
+        def _apply_drained_gate() -> None:
+            for _btn, _other_blocked in list(_gated):
+                if _drained["ok"] and not _other_blocked:
+                    _btn.props(remove="disable")
+                else:
+                    _btn.props("disable")
+
+        if cdc_in_use and (_fk_block or _restores_pending):
+            def _drained_toggle(event: object) -> None:
+                _drained["ok"] = bool(getattr(event, "value", False))
+                # Latch it so the next render starts from the operator's answer.
+                # Deliberately no refresh() here: the gated buttons are flipped directly,
+                # and refreshing would rebuild the whole section on every tick.
+                if on_cdc_drained_change is not None:
+                    on_cdc_drained_change(_drained["ok"])
+                _apply_drained_gate()
+
+            ui.checkbox(  # type: ignore[attr-defined]
+                "I have frozen source writes, both CDC connectors are RUNNING, and CDC "
+                "has drained to zero lag",
+                value=bool(cdc_drained_confirmed),
+                on_change=_drained_toggle,
+            ).props("dense")
+
         # Explicit foreign-key apply. For a CDC migration the FK ADD CONSTRAINTs were
         # DEFERRED during the stream (they must not exist while the sink applies rows out
         # of parent-before-child order — an FK violation would be dead-lettered), so this
@@ -5866,7 +6033,7 @@ def _render_cutover_section(
         # (idempotent) action is re-offered to complete them and surface the result
         # (FIX 9). Orphan-gated + best effort, idempotent (safe to re-click). Shown
         # whenever the schema has foreign keys to (re)apply.
-        if fk_apply_provider is not None and fk_pending_count > 0:
+        if _fk_block:
             with ui.column().classes(  # type: ignore[attr-defined]
                 "w-full gap-1 mt-1 pt-2 border-t border-gray-100"
             ):
@@ -5907,48 +6074,14 @@ def _render_cutover_section(
 
                 # The ADD CONSTRAINT pass must run ONLY after CDC has drained: applying it
                 # while the sink still streams out-of-order rows dead-letters 23503
-                # violations. This screen does not poll MSK, so gate the CDC apply on an
-                # explicit operator confirmation — the Apply button stays disabled until
-                # the checkbox is ticked (FIX 2). A Full-Load-only re-apply has no live
-                # stream, so it is never gated (pre-confirmed). The button element is held
-                # in a tiny mutable box so the confirmation toggle (rendered above it) can
-                # enable/disable it without a forward reference.
-                #
-                # The tick itself is LATCHED on ValidationState (``cdc_drained_confirmed``),
-                # not in this render: the box used to be the gate's only memory, so every
-                # refresh -- the apply's own completion refresh included -- cleared the
-                # checkbox and re-disabled the button, forcing a re-tick before the
-                # idempotent retry this screen recommends for skipped/failed keys.
-                _fk_confirmed = {"ok": (not cdc_in_use) or bool(cdc_drained_confirmed)}
-                _fk_btn_box: "dict[str, Any]" = {}
-
+                # violations. This screen does not poll MSK, so the CDC apply is gated on
+                # the shared attestation above (FIX 2) -- latched on ValidationState, so a
+                # refresh (the apply's own completion refresh included) keeps the answer.
+                # A Full-Load-only re-apply has no live stream, so it is never gated.
                 def _fk_apply_clicked() -> None:
-                    if not _fk_confirmed["ok"]:
+                    if cdc_in_use and not _drained["ok"]:
                         return  # gated: CDC has not been confirmed drained
                     fk_apply_provider()
-
-                if cdc_in_use:
-                    def _fk_confirm_toggle(event: object) -> None:
-                        _fk_confirmed["ok"] = bool(getattr(event, "value", False))
-                        # Latch it so the next render starts from the operator's answer.
-                        # Deliberately no refresh() here: the button props are flipped
-                        # directly below, and refreshing would rebuild the whole section
-                        # on every tick.
-                        if on_cdc_drained_change is not None:
-                            on_cdc_drained_change(_fk_confirmed["ok"])
-                        _btn = _fk_btn_box.get("btn")
-                        if _btn is None:
-                            return
-                        if _fk_confirmed["ok"]:
-                            _btn.props(remove="disable")
-                        else:
-                            _btn.props("disable")
-
-                    ui.checkbox(  # type: ignore[attr-defined]
-                        "I have frozen source writes and CDC has drained to zero lag",
-                        value=bool(cdc_drained_confirmed),
-                        on_change=_fk_confirm_toggle,
-                    ).props("dense")
 
                 with ui.row().classes("items-center gap-3 mt-1"):  # type: ignore[attr-defined]
                     _fk_apply_btn = ui.button(  # type: ignore[attr-defined]
@@ -5959,11 +6092,11 @@ def _render_cutover_section(
                     if cdc_in_use:
                         # Enabled only once the operator confirms CDC has drained -- but a
                         # latched confirmation must not be re-disabled on re-render, or the
-                        # tick would show ticked next to a dead button. Register the button
-                        # either way so a LATER un-tick still disables it.
-                        if not _fk_confirmed["ok"]:
+                        # tick would show ticked next to a dead button. Registered either
+                        # way so a LATER un-tick still disables it.
+                        if not _drained["ok"]:
                             _fk_apply_btn.props("disable")
-                        _fk_btn_box["btn"] = _fk_apply_btn
+                        _gated.append((_fk_apply_btn, False))
                     if fk_apply_result is not None:
                         _applied, _skipped, _failed = fk_apply_result
                         if _failed == 0 and _skipped == 0:
@@ -5999,6 +6132,14 @@ def _render_cutover_section(
                             "the target until every foreign key is applied."
                         ),
                     )
+
+        if default_restore is not None or defaults_checking:
+            _render_cutover_defaults_block(
+                ui, default_restore, checking=defaults_checking, cdc_in_use=cdc_in_use,
+                drained=_drained, gated=_gated, restore_provider=restore_provider,
+                restore_job_block=restore_job_block, restore_running=restore_running,
+                restore_outcome=restore_outcome, on_recheck=on_recheck_defaults,
+            )
 
         # Explicit identity-sequence sync: an OPERATOR ACTION, not a render side-effect.
         # Identity (AUTO_INCREMENT) keys are loaded/replicated with explicit ids, which do
@@ -6088,6 +6229,219 @@ def _render_cutover_section(
                 "so rolling back then means reconciling them yourself first."
             ),
         )
+
+
+def _restore_hint(
+    *, cdc_in_use: bool, restore_job_block: Optional[str], restore_running: bool,
+    has_auto: bool,
+) -> str:
+    """Why [Restore DEFAULTs] is (or may be) disabled, in one line."""
+    if restore_running:
+        return "Restoring the DEFAULTs…"
+    if restore_job_block:
+        return f"Restore is {restore_job_block}."
+    if not has_auto:
+        return "Nothing to restore automatically; decide on the columns below."
+    return (
+        "Off while a load or Start CDC runs. With CDC: after you confirm above that CDC "
+        "has drained."
+        if cdc_in_use
+        else "Off while a load or Start CDC runs."
+    )
+
+
+def _render_cutover_defaults_block(
+    ui: object,
+    snap: "Optional[CutoverDefaultsSnapshot]",
+    *,
+    checking: bool,
+    cdc_in_use: bool,
+    drained: "dict[str, bool]",
+    gated: list,
+    restore_provider: "Optional[Callable[[Optional[tuple[str, str]]], None]]",
+    restore_job_block: Optional[str],
+    restore_running: bool,
+    restore_outcome: "Optional[CutoverRestoreOutcome]",
+    on_recheck: "Optional[Callable[[], None]]",
+) -> None:
+    """The excluded columns' DEFAULTs to put back before repointing (no I/O here).
+
+    Modelled on "Before you repoint: sync identity sequences": the check row, the exact
+    statements, [Restore DEFAULTs], the columns that need a decision (each with its
+    reason, statement and its own [Restore]), what is left as it is, and which columns
+    stay nullable. A DEFAULT affects new inserts only, so migrated rows stay NULL.
+    """
+    from dsql_migrator.ui.design import CODE_SURFACE_CLASSES
+
+    def _recheck_button() -> None:
+        if on_recheck is not None:
+            ui.button(  # type: ignore[attr-defined]
+                "Check again", icon="refresh", on_click=lambda: on_recheck(),
+            ).props("flat dense no-caps color=primary")
+
+    with ui.column().classes(  # type: ignore[attr-defined]
+        "w-full gap-1 mt-1 pt-2 border-t border-gray-100"
+    ):
+        if snap is None:
+            if checking:
+                with ui.row().classes("items-center gap-2 no-wrap"):  # type: ignore[attr-defined]
+                    ui.spinner(size="sm")  # type: ignore[attr-defined]
+                    ui.label(  # type: ignore[attr-defined]
+                        "Excluded-column DEFAULTs: checking Aurora DSQL"
+                    ).classes("text-sm text-gray-700")
+            return
+        if snap.state == "ledger_unreadable":
+            _render_check_row(
+                ui, passed=False, warn_on_fail=True,
+                label="Excluded-column DEFAULTs",
+                detail=(
+                    "The record of dropped DEFAULTs could not be read, so the tool cannot "
+                    "say which excluded columns still need their DEFAULT back."
+                ),
+            )
+            _recheck_button()
+            return
+        if snap.state == "target_unreadable":
+            _render_check_row(
+                ui, passed=False, warn_on_fail=True,
+                label="Excluded-column DEFAULTs",
+                detail="Could not read Aurora DSQL's catalog to check them.",
+            )
+            _recheck_button()
+            return
+        if not snap.items and not snap.nullable:
+            return
+        stamp = snap.checked_at.strftime("%H:%M UTC") if snap.checked_at else "just now"
+        if snap.items:
+            _render_check_row(
+                ui, passed=snap.outstanding == 0, warn_on_fail=True,
+                label=f"Excluded-column DEFAULTs restored: {snap.restored} of {snap.total}",
+                detail=f"checked {stamp}",
+            )
+        pending = snap.pending
+        if pending:
+            ui.label(  # type: ignore[attr-defined]
+                "Before you repoint: restore DEFAULTs on "
+                f"{pending} excluded column{'s' if pending != 1 else ''}"
+            ).classes("text-sm font-semibold text-gray-900")
+            ui.label(  # type: ignore[attr-defined]
+                "The migration dropped these so excluded columns load as NULL. Restoring "
+                "affects new inserts only; migrated rows stay NULL."
+            ).classes("text-xs text-gray-600 leading-snug")
+            if cdc_in_use:
+                ui.label(  # type: ignore[attr-defined]
+                    "Tick the confirmation above only once both connectors are RUNNING and "
+                    "caught up. A DEFAULT restored before a connector finishes its snapshot "
+                    "or replay gives those rows the DEFAULT."
+                ).classes("text-xs text-gray-600 leading-snug")
+        auto = snap.auto_items
+        blocked_elsewhere = bool(restore_job_block) or restore_running
+        if auto:
+            with ui.column().classes(  # type: ignore[attr-defined]
+                f"w-full gap-0 p-2 {CODE_SURFACE_CLASSES}"
+            ):
+                for item in auto:
+                    ui.label(item.statement).classes(  # type: ignore[attr-defined]
+                        "text-xs font-mono break-all text-gray-800"
+                    )
+        if pending:
+            with ui.row().classes("items-center gap-3 mt-1"):  # type: ignore[attr-defined]
+                _btn = ui.button(  # type: ignore[attr-defined]
+                    "Restore DEFAULTs",
+                    icon="settings_backup_restore",
+                    on_click=lambda: restore_provider(None) if restore_provider else None,
+                ).props("color=primary outline no-caps")
+                other = blocked_elsewhere or not auto or restore_provider is None
+                if other or not drained["ok"]:
+                    _btn.props("disable")
+                gated.append((_btn, other))
+                inline_hint(
+                    ui,
+                    _restore_hint(
+                        cdc_in_use=cdc_in_use, restore_job_block=restore_job_block,
+                        restore_running=restore_running, has_auto=bool(auto),
+                    ),
+                    tone="info",
+                )
+        if restore_outcome is not None:
+            if restore_outcome.refused:
+                render_notice(
+                    ui, tone="warning", header="DEFAULTs not restored",
+                    body=restore_outcome.refused,
+                )
+            if restore_outcome.failed:
+                render_notice(
+                    ui,
+                    tone="warning",
+                    header=f"{len(restore_outcome.failed)} DEFAULT(s) could not be restored",
+                    body=(
+                        "Run these statements yourself, or try again: "
+                        + " ".join(
+                            f"{name} ({reason}): "
+                            f"{restore_outcome.failed_statements.get(name, '')}"
+                            for name, reason in sorted(restore_outcome.failed.items())
+                        )
+                    ),
+                )
+            if restore_outcome.ledger_warning:
+                inline_hint(ui, restore_outcome.ledger_warning + ".", tone="warning")
+        manual = snap.manual_items
+        if manual:
+            ui.label(  # type: ignore[attr-defined]
+                f"Needs your decision ({len(manual)}):"
+            ).classes("text-sm font-semibold text-gray-900 mt-1")
+            for item in manual:
+                with ui.column().classes("w-full gap-0 pl-2"):  # type: ignore[attr-defined]
+                    ui.label(  # type: ignore[attr-defined]
+                        f"{item.table}.{item.column}  DEFAULT {item.original_default}"
+                    ).classes("text-xs font-mono text-gray-800 break-all")
+                    ui.label(item.reason or "").classes(  # type: ignore[attr-defined]
+                        "text-xs text-gray-600 leading-snug"
+                    )
+                    ui.label(item.statement).classes(  # type: ignore[attr-defined]
+                        "text-xs font-mono text-gray-500 break-all"
+                    )
+                    if item.executable:
+                        _row_btn = ui.button(  # type: ignore[attr-defined]
+                            "Restore",
+                            on_click=lambda _e=None, _k=(item.table, item.column): (
+                                restore_provider(_k) if restore_provider else None
+                            ),
+                        ).props("outline dense no-caps size=sm color=primary")
+                        _row_other = blocked_elsewhere or restore_provider is None
+                        if _row_other or not drained["ok"]:
+                            _row_btn.props("disable")
+                        gated.append((_row_btn, _row_other))
+                    else:
+                        inline_hint(ui, "Run this statement yourself.", tone="info")
+        unknown = [i for i in snap.items if i.status == "unknown"]
+        if unknown:
+            inline_hint(
+                ui,
+                "Could not check "
+                + ", ".join(f"{i.table}.{i.column}" for i in unknown)
+                + " on Aurora DSQL.",
+                tone="warning",
+            )
+            _recheck_button()
+        diverged = snap.diverged_items
+        if diverged:
+            inline_hint(
+                ui,
+                "Left as they are (a different DEFAULT is set on Aurora DSQL): "
+                + ", ".join(
+                    f"{i.table}.{i.column} ({i.live_default})" for i in diverged
+                )
+                + ".",
+                tone="info",
+            )
+        if snap.nullable:
+            inline_hint(
+                ui,
+                f"{len(snap.nullable)} excluded column(s) stay nullable (Aurora DSQL "
+                "cannot add NOT NULL back in place): " + ", ".join(snap.nullable) + ".",
+                tone="info",
+            )
 
 
 def _render_readiness_checks(
