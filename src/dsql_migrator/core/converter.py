@@ -68,6 +68,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from enum import Enum
 from typing import Optional
 
@@ -916,6 +917,40 @@ _IDENTITY_CLAUSE_RE = re.compile(
     r"GENERATED\s+(?:ALWAYS|BY\s+DEFAULT)\s+AS\s+IDENTITY\s*(?:\([^)]*\))?",
     re.IGNORECASE,
 )
+
+
+@lru_cache(maxsize=4096)
+def parse_target_column_names(create_ddl: str) -> "Optional[frozenset[str]]":
+    """The column names of an applied CREATE TABLE, folded the way PostgreSQL folds them.
+
+    A quoted identifier keeps its case and an unquoted one folds to lower case, so this is
+    the set of names the Full Load INSERT -- which always QUOTES the source column names
+    (``sql.Identifier``) -- will actually find. :func:`parse_target_column_types` keeps
+    unquoted names as written, which is right for its type lookup but would call a source
+    ``username`` missing from an edited ``USERNAME text`` that PostgreSQL stores as
+    ``username``.
+
+    ``None`` when the DDL is not a parseable ``CREATE TABLE``: "unknown", so a caller must
+    not claim a column is missing. Cached by DDL text because the column-exclusion gate
+    runs on every render (the DDL of a table rarely changes between renders).
+    """
+    try:
+        parsed = sqlglot.parse_one(
+            _IDENTITY_CLAUSE_RE.sub("", create_ddl or ""), read="postgres"
+        )
+    except Exception:  # noqa: BLE001 - unparseable DDL -> unknown
+        return None
+    if not isinstance(parsed, exp.Create):
+        return None
+    names: set[str] = set()
+    for column_def in parsed.find_all(exp.ColumnDef):
+        ident = column_def.this
+        name = column_def.name
+        if not name:
+            continue
+        quoted = bool(getattr(ident, "quoted", False)) if isinstance(ident, exp.Identifier) else False
+        names.add(name if quoted else name.lower())
+    return frozenset(names) if names else None
 
 
 def parse_target_generated_columns(create_ddl: str) -> set[str]:

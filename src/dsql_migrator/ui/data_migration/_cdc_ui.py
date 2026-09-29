@@ -91,6 +91,7 @@ from dsql_migrator.ui.data_migration._models import (
     connector_role_label,
     cdc_excluded_columns,
     effective_lob_exclusions,
+    missing_column_block_reason,
     stored_exclusion_block_reason,
     stored_exclusion_issues,
     format_column_exclude_list,
@@ -2740,6 +2741,9 @@ def _stored_exclusion_deploy_block(migration_state, job_manager, inventory, sess
     button on either screen, offering its Remove. Start CDC carries no such gate: it is
     offered only once a stack exists, where the card is locked and the entry is reported
     there as a warning instead.
+
+    Before the lock it also holds Deploy on a source column the applied target DDL lacks:
+    the sink would dead-letter every change to it (42703).
     """
     from dsql_migrator.ui.workflow import WorkflowStep, get_status
 
@@ -2753,7 +2757,7 @@ def _stored_exclusion_deploy_block(migration_state, job_manager, inventory, sess
     )
     return stored_exclusion_block_reason(
         stored_exclusion_issues(migration_state, inventory, committed=locked)
-    )
+    ) or (None if locked else missing_column_block_reason(migration_state, inventory))
 
 
 def _render_cdc_least_privilege_note(ui, *, session=None) -> None:

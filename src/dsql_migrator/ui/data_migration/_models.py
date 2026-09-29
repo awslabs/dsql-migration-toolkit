@@ -1776,6 +1776,47 @@ def exclusion_refusal(migration_state, inventory, table_name: str, columns) -> "
     return " ".join(i.message for i in issues) + " Nothing was changed."
 
 
+def missing_column_block_reason(
+    migration_state,
+    inventory,
+    *,
+    selected_tables: "Optional[Sequence[str]]" = None,
+) -> "Optional[str]":
+    """The gate text for source columns the applied target DDL lacks, or ``None``.
+
+    Judged over the tables this migration moves (``selected_tables``, else
+    :func:`exclusion_scope`, else every table) against the applied conversion the last
+    render recorded, minus the EFFECTIVE exclusions -- an excluded column is not written,
+    so it is not a problem. Unknown (no recorded conversion yet) means no claim.
+    """
+    if inventory is None or not getattr(inventory, "tables", None):
+        return None
+    getter = getattr(migration_state, "applied_conversions", None)
+    applied, _preserve = getter() if callable(getter) else ({}, True)
+    if not applied:
+        return None
+    from dsql_migrator.core.column_exclusion import missing_target_columns
+
+    scope = selected_tables if selected_tables is not None else exclusion_scope(migration_state)
+    wanted = None if scope is None else set(scope)
+    tables = [t for t in inventory.tables if wanted is None or t.name in wanted]
+    missing = missing_target_columns(
+        tables, applied, effective_lob_exclusions(migration_state, inventory)
+    )
+    if not missing:
+        return None
+    pairs = [f"{table}.{column}" for table, cols in missing.items() for column in cols]
+    shown = ", ".join(pairs[:3]) + (f" and {len(pairs) - 3} more" if len(pairs) > 3 else "")
+    many = len(pairs) > 1
+    return (
+        f"{shown} {'are' if many else 'is'} not in your Aurora DSQL table"
+        f"{'s' if len(missing) > 1 else ''}; the load would fail on "
+        f"{'them' if many else 'it'} (42703, undefined column). Add "
+        f"{'them' if many else 'it'} back to the target DDL in Schema Conversion. "
+        "Columns are never dropped from a migration automatically."
+    )
+
+
 def stored_exclusion_block_reason(issues) -> "Optional[str]":
     """The gate text for stored-entry ERRORs, or ``None`` when nothing blocks.
 

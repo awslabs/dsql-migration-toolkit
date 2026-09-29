@@ -238,6 +238,43 @@ def effective_exclusions(
     return EffectiveExclusions(kept, tuple(dropped))
 
 
+def missing_target_columns(
+    tables: "Iterable[TableDef]",
+    applied_conversions: "Optional[Mapping[str, object]]",
+    excluded: "Optional[Mapping[str, Iterable[str]]]" = None,
+) -> dict[str, tuple[str, ...]]:
+    """Source columns the load would still write that the applied target DDL lacks.
+
+    The Full Load INSERT names every source column that is not excluded (and not computed
+    by the target, which the DDL then declares anyway), so a column removed from the target
+    DDL in Schema Conversion -- and not excluded -- fails every batch with 42703 (undefined
+    column), and CDC dead-letters every change to it. It is NEVER excluded automatically:
+    silently dropping data the user did not choose to drop is exactly what the explicit
+    exclusion exists to prevent.
+
+    ``tables`` are the tables the migration moves; a table without an applied conversion,
+    or whose DDL does not parse, is unknown and never reported. Order follows ``tables``.
+    """
+    from dsql_migrator.core.converter import parse_target_column_names
+
+    conversions = applied_conversions or {}
+    skip = {t: set(cols) for t, cols in (excluded or {}).items()}
+    missing: dict[str, tuple[str, ...]] = {}
+    for table in tables:
+        ddl = getattr(conversions.get(table.name), "target_ddl", None)
+        target = parse_target_column_names(ddl) if ddl else None
+        if not target:
+            continue
+        gone = tuple(
+            c.name
+            for c in table.columns
+            if c.name not in target and c.name not in skip.get(table.name, ())
+        )
+        if gone:
+            missing[table.name] = gone
+    return missing
+
+
 class IssueSeverity(Enum):
     ERROR = "error"      # blocks Start Full Load, Deploy infrastructure and Start CDC
     WARNING = "warning"  # shown; does not block
@@ -318,4 +355,5 @@ __all__ = [
     "check_stored_exclusions",
     "column_exclusion_verdict",
     "effective_exclusions",
+    "missing_target_columns",
 ]

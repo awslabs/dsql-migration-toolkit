@@ -236,6 +236,7 @@ from dsql_migrator.ui.data_migration._models import (
     stored_exclusion_block_reason,
     stored_exclusion_issues,
     exclusion_refusal,
+    missing_column_block_reason,
     make_lob_candidates_for,
     session_source_type,
     scope_lob_candidates,
@@ -1326,6 +1327,9 @@ def build_data_migration_screen(
             # judged with the card's own lock, so the gate never names a Remove the frozen
             # card cannot perform. CDC only has no card here (its copy is inside the CDC
             # sub-step, which this Continue leads to), so its Deploy button carries it.
+            # Before the lock, a source column the applied target DDL lacks holds them too:
+            # the load would fail on it (42703), and it is never excluded silently.
+            _exclusions_committed = selection_locked or _lob_locked
             _exclusion_block = (
                 None
                 if migration_type is MigrationType.CDC_ONLY
@@ -1333,8 +1337,15 @@ def build_data_migration_screen(
                     stored_exclusion_issues(
                         migration_state,
                         inventory,
-                        committed=selection_locked or _lob_locked,
+                        committed=_exclusions_committed,
                         selected_tables=selected_names,
+                    )
+                )
+                or (
+                    None
+                    if _exclusions_committed
+                    else missing_column_block_reason(
+                        migration_state, inventory, selected_tables=selected_names
                     )
                 )
             )
