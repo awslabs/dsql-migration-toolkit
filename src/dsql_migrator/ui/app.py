@@ -172,6 +172,10 @@ JOB_MANAGER.set_stall_listener(_log_stalled_job)
 # on every poll).
 SESSION_STATE_STORE: object | None = None
 _LAST_SESSION_SIGNATURE: dict[str, tuple] = {}
+# The column-exclusion overlay ledger (core.overlay_ledger), keyed by TARGET: which
+# DEFAULTs the overlay dropped, restored at cut over. Attached in main() beside the
+# session store (same bucket / file); it deliberately outlives Start over.
+OVERLAY_LEDGER: object | None = None
 
 # Retention caps to bound durable-store growth across many migrations: keep the
 # most recent N completed jobs and N session snapshots; resumable/active jobs are
@@ -549,6 +553,7 @@ def build_page(
         cdc_deploy_role_arn=config.cdc_deploy_role_arn,
         cdc_secret_kms_key_id=config.cdc_secret_kms_key_id,
         validation_store=VALIDATION_STORE,
+        overlay_ledger=OVERLAY_LEDGER,
         open_ai_scope=_open_ai_scope,
         ai_post_event=_ai_post_event,
         # The per-failed-table diagnosis chat can look up the real converted DDL /
@@ -1788,6 +1793,18 @@ def _render_activity_log_controls(activity_log_path: str) -> None:
         )
 
 
+
+def _build_overlay_ledger(config, s3_cls, sqlite_cls):
+    """The overlay ledger for this deployment: S3 with a session-state bucket (durable
+    across a task replacement), else the local SQLite session-state file."""
+    if config.session_state_bucket:
+        return s3_cls(
+            config.session_state_bucket,
+            region=config.aws_region,
+            aws_profile=config.aws_profile,
+        )
+    return sqlite_cls(config.session_state_path)
+
 def main() -> None:
     """Configure and launch the NiceGUI application."""
     import secrets as _secrets
@@ -1899,7 +1916,8 @@ def main() -> None:
     # Durable per-session state (resumability, Property 4): persist each
     # session's non-secret workbench state so a reconnecting browser resumes
     # where it left off after a restart.
-    global SESSION_STATE_STORE
+    global SESSION_STATE_STORE, OVERLAY_LEDGER
+    from dsql_migrator.core.overlay_ledger import S3OverlayLedger, SqliteOverlayLedger
     from dsql_migrator.core.session_state_store import (
         S3SessionStateStore,
         SqliteSessionStateStore,
@@ -1920,6 +1938,9 @@ def main() -> None:
     else:
         SESSION_STATE_STORE = SqliteSessionStateStore(config.session_state_path)
     SESSION_STATE_STORE.prune(_KEEP_SESSIONS)
+    # The overlay ledger lives beside the session state (its own S3 prefix / SQLite
+    # table, outside both stores' prunes). No I/O until a run reads it.
+    OVERLAY_LEDGER = _build_overlay_ledger(config, S3OverlayLedger, SqliteOverlayLedger)
 
     # Dev convenience: prefill the Connect form from the local .env / environment
     # (gitignored). os.environ takes precedence over the .env file. Source fields

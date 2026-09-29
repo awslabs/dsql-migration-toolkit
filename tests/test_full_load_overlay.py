@@ -1080,3 +1080,95 @@ def test_a_computed_overlay_column_is_not_reported_loaded_as_null(events):
     assert rig.run() == {"docs": "DONE"} and rig.alters() == []
     (line,) = [e for e in events if e[0] == "load table" and e[2] == "docs"]
     assert "loaded as NULL" not in line[3] and "excluded: body" in line[3]
+
+
+# ---------------------------------------------------------------------------
+# P2-10: activation (the builders pass the overlay inputs; the app builds the ledger)
+# ---------------------------------------------------------------------------
+
+import inspect  # noqa: E402
+
+import dsql_migrator.ui.data_migration as dm  # noqa: E402
+
+
+def _squash(src):
+    return " ".join(src.split())
+
+
+def test_the_start_and_retry_builders_pass_the_overlay_inputs_and_consume_the_forced_set():
+    src = _squash(inspect.getsource(dm.build_data_migration_screen))
+    assert src.count("**_overlay_inputs(") == 2  # the Start and retry builders
+    assert "replace_tables=migration_state.take_replace_targets()," in src
+    assert "taken_replace = migration_state.take_replace_targets()" in src
+    assert "frozenset(taken_replace | set(recreated_unfinished(current))) & set(names)" in src
+    assert "prior_recreated_tables=prior_recreated," in src
+    fk_builder = src[src.index("def _fk_apply_inputs"):src.index("fk_inputs = _fk_apply_inputs()")]
+    assert "_overlay_inputs" not in fk_builder  # loads nothing, no ledger
+
+
+def test_overlay_inputs_are_the_overlay_legacy_sets_and_the_ledger_handle():
+    from dsql_migrator.core.session_state_store import SessionSnapshot
+    from dsql_migrator.ui.evaluation import EvaluationState
+    from dsql_migrator.ui.schema_conversion import SchemaConversionState
+    from dsql_migrator.ui.session import SessionConnectionState
+    from dsql_migrator.ui.session_persistence import apply_session_snapshot
+
+    state = dm.DataMigrationState()
+    apply_session_snapshot(SessionSnapshot(session_id="s", cdc_lob_exclusions=["docs:body", "docs:note"],
+                                           exclusion_semantics=1, legacy_column_exclusions=["docs:note"]),
+                           SessionConnectionState(), EvaluationState(), SchemaConversionState(), state)
+    state.overlay_ledger = handle = object()
+    got = dm._overlay_inputs(state, SourceInventory(tables=[DOCS]), None, True)
+    assert got == {"overlay_columns": {"docs": frozenset({"body"})}, "legacy_exclusions": {"docs": frozenset({"note"})},
+                   "overlay_ledger": handle, "overlay_ledger_in_use": False}
+
+
+def test_the_app_builds_the_ledger_beside_the_session_state_without_io(tmp_path):
+    import types
+
+    from dsql_migrator.core.overlay_ledger import S3OverlayLedger
+    from dsql_migrator.ui import app
+
+    s3 = app._build_overlay_ledger(types.SimpleNamespace(session_state_bucket="b", aws_region="us-east-1",
+                                                         aws_profile=None, session_state_path=None),
+                                   S3OverlayLedger, SqliteOverlayLedger)
+    assert isinstance(s3, S3OverlayLedger) and s3._client is None  # lazy: no S3 call at construction
+    lite = app._build_overlay_ledger(types.SimpleNamespace(session_state_bucket=None, aws_region=None,
+                                                           aws_profile=None, session_state_path=str(tmp_path / "s.db")),
+                                     S3OverlayLedger, SqliteOverlayLedger)
+    assert isinstance(lite, SqliteOverlayLedger)
+    reset = inspect.getsource(app.build_page) if hasattr(app, "build_page") else inspect.getsource(app)
+    body = reset[reset.index("def _reset_session"):]
+    body = body[:body.index("\n    def ", 1)] if "\n    def " in body[1:] else body
+    assert "OVERLAY_LEDGER" not in body and "ledger" not in body.lower()  # Start over never touches it
+
+
+@pytest.mark.parametrize("path", ["thread", "process"])
+def test_the_bundled_exclude_and_reload_lands_null(monkeypatch, events, path):
+    # exclude_lob_and_reload -> _run_retry_for -> run_full_load_retry on a NOT NULL DEFAULT column.
+    kw = dict(replace={"docs"}, rows={"docs": True}, tables=(DOCS,))
+    rig = _ProcRig(monkeypatch, **kw) if path == "process" else _Rig(**kw)
+    order = []
+    real_import = rig.importer.import_rows
+    rig.importer.import_rows = lambda rows, table, **k: order.append(("import", rig.alters())) or real_import(rows, table, **k)
+    prior = [ChunkState(chunk_id="docs", status="FAILED")]
+    assert rig.run([DOCS], retry_prior=prior) == {"docs": "DONE"}, rig.messages()
+    assert rig.recreated == ["docs"]
+    assert order == [("import", ['"body" DROP NOT NULL', '"body" DROP DEFAULT'])]  # overlaid BEFORE the write
+
+
+def test_an_excluded_not_null_column_without_a_default_loads(events):
+    FRESH["docs"]["note"] = {"notnull": True, "default": None}
+    try:
+        rig = _Rig(tables=(DOCS,), rows={"docs": False}, excluded={"docs": frozenset({"note"})})
+        assert rig.run() == {"docs": "DONE"}
+        assert rig.alters() == ['"note" DROP NOT NULL']  # the P1 "moot gate": no 23502 possible
+    finally:
+        FRESH["docs"]["note"] = {"notnull": False, "default": None}
+
+
+def test_a_legacy_session_makes_no_alter_and_no_ledger_write(events):
+    rig = _Rig(tables=(DOCS,), rows={"docs": True}, excluded={"docs": frozenset({"body"})}, overlay={},
+               legacy={"docs": frozenset({"body"})}, ledger=_RaisingStore())
+    assert rig.run() == {"docs": "DONE"} and rig.alters() == []
+    assert rig.importer.calls == [("docs", OnConflictMode.SKIP_EXISTING, ["id", "note"])]  # still omitted
