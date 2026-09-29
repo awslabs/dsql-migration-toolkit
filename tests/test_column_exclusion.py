@@ -292,3 +292,114 @@ def test_screen_wires_the_gate_with_the_cards_own_lock_and_records_the_conversio
     (record,) = _calls("set_applied_conversions")
     assert ast.unparse(record.args[0]) == "_applied"
     assert _kw(record, "preserve_foreign_keys") == "conv_state.preserve_foreign_keys"
+
+
+# ---------------------------------------------------------------------------
+# The recovery routes and the card: a refused column is never offered, never written
+# ---------------------------------------------------------------------------
+
+
+def _lob_inventory():
+    from dsql_migrator.core.models import SourceType  # noqa: F401  (engine via _Mysql)
+
+    docs = TableDef(
+        name="shop.docs",
+        columns=[ColumnDef(name=c, mysql_type=("int" if c == "id" else "longtext"))
+                 for c in ("id", "tenant", "body", "summary", "ref")],
+        primary_key=["id"],
+    )
+    notes = TableDef(
+        name="shop.notes",
+        columns=[ColumnDef(name="id", mysql_type="int"), ColumnDef(name="doc_ref", mysql_type="longtext")],
+        primary_key=["id"],
+        foreign_keys=[ForeignKeyDef(name="fk_doc", columns=["doc_ref"],
+                                    referenced_table="shop.docs", referenced_columns=["ref"])],
+    )
+    applied = {"shop.docs": SimpleNamespace(target_ddl=(
+        'CREATE TABLE "shop"."docs" ("id" INT NOT NULL, "tenant" TEXT NOT NULL, "body" TEXT, '
+        '"summary" TEXT GENERATED ALWAYS AS (left(body, 10)) STORED, "ref" TEXT, '
+        'PRIMARY KEY ("tenant", "id"))'))}
+    return SourceInventory(tables=[docs, notes]), applied
+
+
+class _Mysql:
+    source_config = None
+
+    def __init__(self):
+        from dsql_migrator.core.models import SourceType
+
+        self.restored_source_type = SourceType.MYSQL
+
+
+def test_recovery_candidates_drop_every_refused_column():
+    from dsql_migrator.ui.data_migration._models import make_lob_candidates_for
+
+    inv, applied = _lob_inventory()
+    state = _state_with([])
+    # Without the state (the old two-argument call) every LOB column is offered.
+    assert {c for c, _ in make_lob_candidates_for(inv, _Mysql())("shop.docs")} == {
+        "tenant", "body", "summary", "ref"}
+    state.set_applied_conversions(applied, preserve_foreign_keys=True)
+    # With it: the composite key's leading column (B2), the generated column (B4) and the
+    # FK-referenced column (B3) are gone -- only the plain column can be excluded & reloaded.
+    assert make_lob_candidates_for(inv, _Mysql(), state)("shop.docs") == (("body", "longtext"),)
+    # B3 follows the FK toggle.
+    state.set_applied_conversions(applied, preserve_foreign_keys=False)
+    assert {c for c, _ in make_lob_candidates_for(inv, _Mysql(), state)("shop.docs")} == {"body", "ref"}
+
+
+def test_click_time_refusal_writes_nothing_for_a_refused_column():
+    from dsql_migrator.ui.data_migration._models import exclusion_refusal
+
+    inv, applied = _lob_inventory()
+    state = _state_with([])
+    state.set_applied_conversions(applied, preserve_foreign_keys=True)
+    refused = exclusion_refusal(state, inv, "shop.docs", ["body", "tenant"])
+    assert "shop.docs.tenant cannot be excluded" in refused and refused.endswith("Nothing was changed.")
+    assert "shop.docs.body" not in refused  # the plain column is not the problem
+    assert "no longer" not in refused and "not in the source schema" in exclusion_refusal(
+        state, inv, "shop.docs", ["gone"])
+    assert exclusion_refusal(state, inv, "shop.docs", ["body"]) is None
+    assert exclusion_refusal(state, None, "shop.docs", ["tenant"]) is None
+    assert exclusion_refusal(state, inv, "shop.docs", []) is None
+
+
+def test_both_recovery_actions_check_the_rule_before_writing():
+    """The two actions are closures inside ``build_data_migration_screen``; pin the order."""
+    import ast
+    import inspect
+
+    import dsql_migrator.ui.data_migration as dm
+
+    tree = ast.parse(inspect.getsource(dm.build_data_migration_screen))
+    for name in ("exclude_lob_and_reload", "exclude_cdc_capture_columns"):
+        (fn,) = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name]
+        calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
+        refusal = min(c.lineno for c in calls if getattr(c.func, "id", None) == "exclusion_refusal")
+        write = min(c.lineno for c in calls if getattr(c.func, "attr", None) == "set_lob_exclusion")
+        assert refusal < write, name
+        (guard,) = [n for n in ast.walk(fn) if isinstance(n, ast.If) and ast.unparse(n.test) == "refused"]
+        assert any(isinstance(b, ast.Return) for b in guard.body), name
+    assert "make_lob_candidates_for(inventory, session, migration_state)" in inspect.getsource(
+        dm.build_data_migration_screen)
+
+
+def test_card_refuses_a_blocked_candidate_but_lets_a_ticked_one_be_cleared():
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    from tests.test_ui_data_migration import _RecordingUi
+
+    inv, applied = _lob_inventory()
+    state = _state_with([("shop.docs", "summary")])
+    state.set_applied_conversions(applied, preserve_foreign_keys=True)
+    ui = _RecordingUi()
+    _cdc_ui._render_cdc_lob_exclusion_panel(
+        ui, state, inv, lambda: None, locked=False, migration_wide=True)
+    boxes = {b.label: b for b in ui.checkboxes}
+    assert boxes["shop.docs.body"].enabled and boxes["shop.docs.body"].on_change
+    for refused in ("shop.docs.tenant", "shop.docs.ref"):
+        assert not boxes[refused].enabled and boxes[refused].on_change is None, refused
+    # Already ticked (a saved B4 entry): still clearable from its box.
+    assert boxes["shop.docs.summary"].enabled and boxes["shop.docs.summary"].on_change
+    joined = " ".join(ui.texts)
+    assert "Part of the target primary key" in joined and "Referenced by shop.notes.fk_doc" in joined

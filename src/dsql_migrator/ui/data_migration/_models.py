@@ -1538,7 +1538,7 @@ def session_source_type(session) -> SourceType:
     return getattr(session, "restored_source_type", None) or SourceType.MYSQL
 
 
-def make_lob_candidates_for(inventory, session):
+def make_lob_candidates_for(inventory, session, migration_state=None):
     """Build the post-quarantine LOB picker's candidate lookup for one session.
 
     Module-level, not a closure inside the page builder, so it can be TESTED. It used to be
@@ -1552,6 +1552,11 @@ def make_lob_candidates_for(inventory, session):
     type (``bytea``/``text``) rather than the column, and the source type is what maps back
     to it. :class:`LobExclusionCandidate` carries names only, so the types come from the
     inventory here.
+
+    With ``migration_state`` the lookup also drops every column the exclusion rule refuses
+    (a composite target key, a column a preserved foreign key references, a column Aurora
+    DSQL computes), so neither recovery route offers an "Exclude & reload" that the rule
+    would then refuse -- or, before the rule existed, accept and break the reload.
     """
 
     def lob_candidates_for(table_name: str):
@@ -1574,6 +1579,19 @@ def make_lob_candidates_for(inventory, session):
                 or ()
             )
         }.get(table_name, set())
+        if allowed and migration_state is not None:
+            from dsql_migrator.core.column_exclusion import column_exclusion_verdict
+
+            ctx = exclusion_context_for(
+                migration_state,
+                inventory,
+                selected_tables=exclusion_scope(migration_state),
+                focus_tables=[table_name],
+            )
+            allowed = {
+                c for c in allowed
+                if not column_exclusion_verdict(table_name, c, ctx).blocked
+            }
         return tuple(
             (col.name, col.mysql_type) for col in table.columns if col.name in allowed
         )
@@ -1707,8 +1725,7 @@ def stored_exclusion_issues(
     from dsql_migrator.core.column_exclusion import check_stored_exclusions
 
     if selected_tables is None:
-        selection = getattr(migration_state, "selection", None)
-        selected_tables = list(getattr(selection, "selected_tables", None) or ()) or None
+        selected_tables = exclusion_scope(migration_state)
     if selected_tables is not None:
         known = {t.name for t in inventory.tables}
         selected = set(selected_tables)
@@ -1722,6 +1739,41 @@ def stored_exclusion_issues(
         focus_tables=stored.keys(),
     )
     return check_stored_exclusions(stored, ctx, committed=committed)
+
+
+def exclusion_scope(migration_state) -> "Optional[list[str]]":
+    """The tables the exclusion rule treats as migrated when the caller has no resolved set.
+
+    The stored selection (pinned by the prerequisite checks), or ``None`` -- every table --
+    while it is still the empty "= all" default. One definition, so the card, the gates and
+    the recovery actions judge B3 (a selected child's foreign key) over the same tables.
+    """
+    selection = getattr(migration_state, "selection", None)
+    return list(getattr(selection, "selected_tables", None) or ()) or None
+
+
+def exclusion_refusal(migration_state, inventory, table_name: str, columns) -> "Optional[str]":
+    """Why the rule refuses to exclude ``columns`` of ``table_name``, or ``None``.
+
+    The click-time check for the two recovery actions (Full Load quarantine "Exclude &
+    reload", CDC dead-letter "Exclude at capture"), which write the exclusion directly and
+    never pass a prerequisite check: a refused column (or one the source no longer has) is
+    reported and NOTHING is written. With no inventory there is nothing to judge against.
+    """
+    if not columns or inventory is None or not getattr(inventory, "tables", None):
+        return None
+    from dsql_migrator.core.column_exclusion import check_stored_exclusions
+
+    ctx = exclusion_context_for(
+        migration_state,
+        inventory,
+        selected_tables=exclusion_scope(migration_state),
+        focus_tables=[table_name],
+    )
+    issues = check_stored_exclusions({table_name: set(columns)}, ctx, committed=False)
+    if not issues:
+        return None
+    return " ".join(i.message for i in issues) + " Nothing was changed."
 
 
 def stored_exclusion_block_reason(issues) -> "Optional[str]":

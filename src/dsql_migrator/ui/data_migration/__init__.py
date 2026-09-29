@@ -235,6 +235,7 @@ from dsql_migrator.ui.data_migration._models import (
     effective_lob_exclusions,
     stored_exclusion_block_reason,
     stored_exclusion_issues,
+    exclusion_refusal,
     make_lob_candidates_for,
     session_source_type,
     scope_lob_candidates,
@@ -1604,7 +1605,7 @@ def build_data_migration_screen(
             # Built by a module-level factory so the real body is TESTABLE: as a
             # closure it was unreachable from any test, which is how an engine-unaware
             # call inside it shipped.
-            lob_candidates_for = make_lob_candidates_for(inventory, session)
+            lob_candidates_for = make_lob_candidates_for(inventory, session, migration_state)
 
             def exclude_cdc_capture_columns(
                 table_name: str, columns: Sequence[str]
@@ -1623,6 +1624,13 @@ def build_data_migration_screen(
                     ui.notify(blocked, type="warning", position="top")
                     return
                 if not columns:
+                    return
+                # The rule, at click time: this writes the exclusion directly and never
+                # passes a prerequisite check, so a key, FK-referenced or generated
+                # column must be refused here (nothing is written).
+                refused = exclusion_refusal(migration_state, inventory, table_name, columns)
+                if refused:
+                    ui.notify(refused, type="warning", position="top")
                     return
                 for column in columns:
                     migration_state.set_lob_exclusion(table_name, column, True)
@@ -1655,6 +1663,13 @@ def build_data_migration_screen(
                     ui.notify(blocked, type="warning", position="top")
                     return
                 if not columns:
+                    return
+                # The rule, at click time: this writes the exclusion directly and never
+                # passes a prerequisite check, so a key, FK-referenced or generated
+                # column must be refused here (nothing is written).
+                refused = exclusion_refusal(migration_state, inventory, table_name, columns)
+                if refused:
+                    ui.notify(refused, type="warning", position="top")
                     return
                 for column in columns:
                     migration_state.set_lob_exclusion(table_name, column, True)

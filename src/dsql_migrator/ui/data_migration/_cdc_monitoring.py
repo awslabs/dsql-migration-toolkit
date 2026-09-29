@@ -42,9 +42,12 @@ from dsql_migrator.ui.data_migration._models import (
     lob_exclusion_candidates,
     per_table_counts_notice_body,
     scope_lob_candidates,
+    exclusion_context_for,
+    exclusion_scope,
     session_source_type,
     stored_exclusion_issues,
 )
+from dsql_migrator.core.column_exclusion import column_exclusion_verdict
 from dsql_migrator.ui.data_migration._cdc_status import (
     _CDC_TONE_STYLE,
     _apply_cdc_status,
@@ -2642,9 +2645,24 @@ def _render_cdc_lob_exclusion_panel(
         # frozen and how to change them (a silent frozen box reads as a bug).
         if locked and lock_reason:
             inline_hint(ui, lock_reason, tone="neutral")  # type: ignore[attr-defined]
+        # The rule decides which candidates may be ticked: a column in the target key
+        # Schema Conversion chose, one a preserved foreign key references, or one Aurora
+        # DSQL computes is shown with its reason and cannot be ticked. (An entry that is
+        # already ticked keeps a live box so it can be cleared; the list above says why.)
+        _ctx = exclusion_context_for(
+            migration_state,
+            inventory,
+            selected_tables=(
+                selected_tables
+                if selected_tables is not None
+                else exclusion_scope(migration_state)
+            ),
+            focus_tables=[c.table for c in candidates],
+        )
         for candidate in candidates:
             excluded = selection.get(candidate.table, set())
             for column in candidate.columns:
+                _verdict = column_exclusion_verdict(candidate.table, column, _ctx)
                 def _toggle(
                     event, _table=candidate.table, _column=column
                 ) -> None:
@@ -2654,11 +2672,17 @@ def _render_cdc_lob_exclusion_panel(
                     if callable(refresh):
                         refresh()
 
+                _refused = _verdict.blocked and column not in excluded
                 _box = ui.checkbox(  # type: ignore[attr-defined]
                     f"{candidate.table}.{column}",
                     value=column in excluded,
-                    on_change=None if locked else _toggle,
+                    on_change=None if locked or _refused else _toggle,
                 ).props("dense")
+                if _refused and not locked:
+                    _box.disable()
+                    inline_hint(  # type: ignore[attr-defined]
+                        ui, " ".join(f.message for f in _verdict.findings), tone="neutral"
+                    )
                 if locked:
                     # disable() greys the box AND stops the click, so the visual state
                     # and the actual behaviour agree -- greying alone would still let
