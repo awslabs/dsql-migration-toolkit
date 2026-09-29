@@ -3586,7 +3586,13 @@ def _log_cutover_restore(outcome: "CutoverRestoreOutcome") -> None:
                 f"{len(outcome.restored)} restored"
                 + (f", {len(outcome.already_done)} already in place" if outcome.already_done else "")
                 + (f", {len(outcome.gone)} no longer on the target" if outcome.gone else "")
-                + (f"; ran: {' '.join(outcome.statements)}" if outcome.statements else "")
+                # Each statement ends in its own ';': drop the last so the clause separator
+                # below does not double it.
+                + (
+                    f"; ran: {' '.join(outcome.statements).rstrip().rstrip(';')}"
+                    if outcome.statements
+                    else ""
+                )
                 + "; migrated rows stay NULL (a DEFAULT applies to new inserts only)"
             ),
         )

@@ -333,6 +333,23 @@ def test_an_all_skipped_restore_is_reported(monkeypatch):
     assert any(n["header"] == "1 DEFAULT(s) not restored" and "record changed" in n["body"] for n in notices)
 
 
+def test_the_restored_line_names_each_statement_once_terminated(monkeypatch):
+    """Each statement carries its own ';' (the block shows them so): the activity line
+    must not double it before the next clause (live: '...::text);; migrated rows')."""
+    import dsql_migrator.ui.validation as uiv
+
+    logged = []
+    monkeypatch.setattr(uiv, "log_activity", lambda cat, action, **kw: logged.append((action, kw)))
+    uiv._log_cutover_restore(CutoverRestoreOutcome(
+        restored=("app.t.a", "app.t.b"),
+        statements=('ALTER TABLE "app"."t" ALTER COLUMN "a" SET DEFAULT (0);',
+                    'ALTER TABLE "app"."t" ALTER COLUMN "b" SET DEFAULT (1);')))
+    detail = logged[0][1]["detail"]
+    assert ";;" not in detail
+    assert ('ran: ALTER TABLE "app"."t" ALTER COLUMN "a" SET DEFAULT (0); '
+            'ALTER TABLE "app"."t" ALTER COLUMN "b" SET DEFAULT (1); migrated rows stay NULL') in detail
+
+
 def test_a_session_that_never_excluded_sees_nothing_of_an_unreadable_record(monkeypatch):
     for in_use, excluded in ((False, False), (True, False), (False, True)):
         ui, runner, logged = _screen(monkeypatch, snap=CutoverDefaultsSnapshot(state="ledger_unreadable"),
