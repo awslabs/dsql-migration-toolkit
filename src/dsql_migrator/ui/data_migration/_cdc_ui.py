@@ -619,9 +619,7 @@ def _render_cdc_source_config_card(
     # there is no start point left to choose. Without this the card contradicted the
     # button beneath it: "Action needed" / "needs a Full Load watermark" while Start CDC
     # was enabled and would have worked.
-    resumes_from_offset = bool(
-        getattr(migration_state, "cdc_has_committed_offset", False)
-    )
+    resumes_from_offset = cdc_start_resumes(migration_state, watermark, source_type)
     _render_cdc_start_point_card(
         ui,
         migration_state,
@@ -1457,6 +1455,7 @@ def _cdc_start_detail(
     source_type: object,
     force_snapshot: bool = False,
     exclusions: Optional[Mapping[str, object]] = None,
+    resumes: bool = False,
 ) -> str:
     """The audit detail for a CDC start: where the stream resumes FROM, and how.
 
@@ -1472,7 +1471,13 @@ def _cdc_start_detail(
     from dsql_migrator.ui.data_migration._full_load_engine import watermark_coordinate
 
     parts = [f"stack {stack_name}"]
-    if watermark is not None:
+    if resumes and source_type is not SourceType.POSTGRES:
+        # See cdc_start_resumes: nothing new is seeded, so the committed offset decides.
+        parts.append(
+            "start point: the committed stream position on MSK (this stack streamed "
+            "before; it continues where streaming stopped)"
+        )
+    elif watermark is not None:
         # "gapless" is a claim about the SLOT, not about merely HAVING a watermark. A
         # PostgreSQL Full-load-only watermark carries a WAL LSN and no slot, so nothing can
         # resume from it and the connector re-snapshots instead -- certifying that start as
@@ -2054,7 +2059,8 @@ def _render_cdc_start_button(
     # offset is already committed to the source connector's offsets topic -- which is
     # pinned to a fixed name and survives a Stop (a Stop only deletes the connectors) --
     # and the seeder skips re-seeding an offset that is at/past the watermark. So
-    # streaming resumes exactly where it stopped.
+    # streaming resumes exactly where it stopped -- unless a newer watermark (a Full Load
+    # run after the Stop) moves it forward; cdc_start_resumes tells the two apart.
     #
     # Gating `ready` on a watermark alone was wrong here, and wrong in the case that
     # matters most: the watermark is read off the Full Load JOB record, so after an app
@@ -2063,8 +2069,8 @@ def _render_cdc_start_button(
     # could resume perfectly. The operator was pushed toward re-entering coordinates by
     # hand, or worse, re-running the Full Load, to recover something the connector had
     # not lost.
-    resumes_from_offset = bool(
-        getattr(migration_state, "cdc_has_committed_offset", False)
+    resumes_from_offset = cdc_start_resumes(
+        migration_state, watermark, _cdc_source_type(session)
     )
     # A PostgreSQL start that RE-SNAPSHOTS needs no prior start point: it is a resolved
     # start on its own (snapshot.mode=initial, the connector creates its own slot). Keyed on
@@ -3932,6 +3938,26 @@ def _cdc_watermark(job):
     return wm
 
 
+def cdc_start_resumes(migration_state, watermark, source_type) -> bool:
+    """Will Start CDC RESUME the stack's committed offset, rather than seed ``watermark``? Pure.
+
+    Start always offers the job's watermark to the offset seeder, which moves the committed
+    offset FORWARD to it unless the offset is already at/past it (seeder.py no-clobber).
+    A stopped stack's offset is at/past the watermark it was last seeded from, so only a
+    DIFFERENT seedable watermark -- a Full Load run after streaming stopped -- changes
+    where streaming begins. PostgreSQL is unchanged.
+    """
+    if not getattr(migration_state, "cdc_has_committed_offset", False):
+        return False
+    if source_type is SourceType.POSTGRES:
+        return True
+    f = getattr(watermark, "binlog_file", None) if watermark is not None else None
+    p = getattr(watermark, "binlog_position", None) if watermark is not None else None
+    if not f or p is None:
+        return True
+    return (str(f), str(int(p))) == getattr(migration_state, "cdc_deployed_watermark", None)
+
+
 def pg_start_resnapshots(watermark, *, source_type, start_mode: str) -> bool:
     """Will this PostgreSQL start RE-READ every captured table? Pure.
 
@@ -5437,6 +5463,7 @@ def _start_cdc_deploy(
         mode=mode,
         source_type=_cdc_source_type(session),
         force_snapshot=_force_initial_snapshot,
+        resumes=cdc_start_resumes(migration_state, watermark, _cdc_source_type(session)),
         # The operator's (effective) exclusions only -- "oversized LOB" in the detail; the
         # generated columns the capture also drops are not the operator's choice.
         exclusions=effective_lob_exclusions(migration_state, inventory),

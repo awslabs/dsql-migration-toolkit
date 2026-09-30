@@ -320,6 +320,9 @@ class DataMigrationState:
         # preview show what Start CDC will send: a stack deployed with the 0.1.561 form
         # keeps it (core.cdc.choose_column_exclude_value). Transient/session-only.
         self.cdc_deployed_column_exclude_list: Optional[str] = None
+        # The binlog (file, pos) the stack's LAST Start offered the offset seeder, from the
+        # same phase probe (Stop carries Watermark* forward). None: no stack / no seed.
+        self.cdc_deployed_watermark: Optional[tuple[str, str]] = None
         self.cdc_activity: Optional["CdcActivitySummary"] = None
         # Per-table source/target row counts for the migration-status view, fetched
         # on demand (a direct COUNT(*) on each side -- read-only but adds source
@@ -1003,6 +1006,7 @@ class DataMigrationState:
             self.cdc_reconciled_table_names = []
             self.cdc_deployed_slot_name = None
             self.cdc_deployed_column_exclude_list = None
+            self.cdc_deployed_watermark = None
             # Applied-ops + replication-lag metrics are per-stack too; drop them so the
             # adopted stack's poll repopulates rather than showing the prior stack's.
             self.cdc_applied_ops_by_table = {}
@@ -1088,6 +1092,11 @@ class DataMigrationState:
         """Record the DEPLOYED stack's ColumnExcludeList (``None``: no stack/param)."""
         with self._lock:
             self.cdc_deployed_column_exclude_list = None if value is None else str(value)
+
+    def set_cdc_deployed_watermark(self, value: Optional[tuple[str, str]]) -> None:
+        """Record the binlog (file, pos) the deployed stack was last started from."""
+        with self._lock:
+            self.cdc_deployed_watermark = tuple(value) if value else None  # type: ignore[assignment]
 
     def set_cdc_applied_ops_by_table(
         self, applied_ops: "dict[str, dict[str, int]]"

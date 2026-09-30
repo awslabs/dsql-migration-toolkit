@@ -970,9 +970,12 @@ def cdc_has_committed_offset(parameters: "Optional[Mapping[str, str]]") -> bool:
     ``MskBootstrapServers``, which deletes the two connectors and leaves MSK, the topics
     and the seeder Lambda in place. On the next Start the seeder reads that offset and
     SKIPS the seed when it is at/past the watermark (``seeder.py`` no-clobber guard), so
-    streaming resumes exactly where it stopped. A watermark is only ever needed for the
-    FIRST start, when the offsets topic is empty and the connector would otherwise begin
-    at the source's current binlog and silently lose everything since the Full Load.
+    streaming resumes exactly where it stopped -- unless a NEWER watermark is offered (a
+    Full Load run after the Stop): the seeder then moves the offset forward to it, which
+    is why "committed" alone does not mean "resumes" (see ``cdc_start_resumes``). A
+    watermark is otherwise needed only for the FIRST start, when the offsets topic is
+    empty and the connector would begin at the source's current binlog and silently lose
+    everything since the Full Load.
 
     The signal is ``DeploySink == "true"`` while the bootstrap is blank, and it is
     unambiguous because of how the two writes differ: the infra create pins
@@ -989,6 +992,21 @@ def cdc_has_committed_offset(parameters: "Optional[Mapping[str, str]]") -> bool:
     bootstrap = str(params.get("MskBootstrapServers", "") or "").strip()
     deploy_sink = str(params.get("DeploySink", "") or "").strip().lower()
     return not bootstrap and deploy_sink == "true"
+
+
+def cdc_deployed_watermark(
+    parameters: "Optional[Mapping[str, str]]",
+) -> "Optional[tuple[str, str]]":
+    """The binlog (file, pos) the stack's LAST Start offered the seeder, or None. Pure.
+
+    Start writes Watermark* (blank without a watermark) and Stop carries them forward as
+    UsePreviousValue, so on a stopped stack this is the watermark its committed offset
+    was seeded from -- the connector began there and only advanced past it.
+    """
+    params = parameters or {}
+    f = str(params.get("WatermarkBinlogFile", "") or "").strip()
+    p = str(params.get("WatermarkBinlogPos", "") or "").strip()
+    return (f, p) if f and p else None
 
 
 def _probe_cdc_stack_phase(migration_state, session) -> None:
@@ -1041,6 +1059,9 @@ def _probe_cdc_stack_phase(migration_state, session) -> None:
     # can never disagree about the stack they describe.
     migration_state.set_cdc_has_committed_offset(
         cdc_has_committed_offset(getattr(discovery, "current_parameters", None))
+    )
+    migration_state.set_cdc_deployed_watermark(
+        cdc_deployed_watermark(getattr(discovery, "current_parameters", None))
     )
     # Reconcile the replicated table set from the live stack's TableIncludeList
     # (source connector's table.include.list = each table's ``.name``), so an
