@@ -3048,3 +3048,51 @@ def test_expression_defaults_that_are_not_one_plain_string_literal_are_still_dro
 def test_null_expression_default_is_never_emitted_as_the_string_null(mysql_type):
     result = _convert_table(_single_column_table("t", mysql_type, default="NULL", default_is_expression=True))
     assert "DEFAULT 'NULL'" not in result.target_ddl
+
+
+@pytest.mark.parametrize("mysql_type, default", [
+    ("ENUM('0','1')", "1"),              # a number is an INDEX into the members
+    ("SET('a','b')", "3"),               # a bitmask
+    ("SET('a','b')", "_utf8mb4\\'b,a\\'"),  # MySQL reorders the members
+    ("YEAR", "70"),                      # 70 -> 1970
+    ("BINARY(16)", "0x00"),              # zero-padded to 16 bytes
+    ("DATETIME", "20200101.5"),          # a decimal on a temporal target
+    ("DATE", "20200101"),
+])
+def test_expression_defaults_mysql_coerces_differently_are_still_dropped(mysql_type, default):
+    """Review of 145571d: an expression default is stored UNCOERCED and coerced at every
+    INSERT, so these would be silently wrong if carried as the bare literal."""
+    result = _convert_table(_single_column_table("t", mysql_type, nullable=False, default=default,
+                                                 default_is_expression=True))
+    col_line = next(l for l in result.target_ddl.splitlines() if '"value"' in l)
+    assert "DEFAULT" not in col_line, result.target_ddl
+    assert [w for w in result.warnings if "no Aurora DSQL equivalent" in w.message]
+
+
+@pytest.mark.parametrize("mysql_type, default, expected", [
+    ("VARCHAR(10)", "", "DEFAULT ''"),     # the common `NOT NULL DEFAULT ''` (I_S: '')
+    ("CHAR(3)", "", "DEFAULT ''"),
+    ("VARCHAR(10)", " ", "DEFAULT ' '"),
+    ("VARCHAR(10)", "a ", "DEFAULT 'a '"),  # trailing space kept (VARCHAR keeps it)
+    ("TEXT", "", None),                    # MySQL has no literal TEXT default; nothing changes
+])
+def test_an_empty_or_spaced_literal_default_on_a_text_column_is_carried_exactly(mysql_type, default, expected):
+    """Review of 145571d (pre-existing): I_S reports DEFAULT '' as the empty string, which
+    the converter read as 'no default' -- a NOT NULL VARCHAR then rejected every insert that
+    omitted it after cut over, with no warning. Whitespace was stripped too."""
+    import sqlglot
+
+    result = _convert_table(_single_column_table("t", mysql_type, nullable=False, default=default))
+    col_line = next(l for l in result.target_ddl.splitlines() if '"value"' in l)
+    if expected is None:
+        return
+    assert f"NOT NULL {expected}" in col_line, result.target_ddl
+    sqlglot.parse_one(result.target_ddl, read="postgres")
+    assert not [w for w in result.warnings if "default" in w.message.lower() and w.column_name == "value"]
+
+
+@pytest.mark.parametrize("mysql_type", ["INT", "DATE", "DECIMAL(10,2)"])
+def test_an_empty_default_on_a_non_text_column_still_emits_nothing(mysql_type):
+    result = _convert_table(_single_column_table("t", mysql_type, nullable=False, default=""))
+    col_line = next(l for l in result.target_ddl.splitlines() if '"value"' in l)
+    assert "DEFAULT" not in col_line

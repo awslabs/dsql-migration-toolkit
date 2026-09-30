@@ -1142,11 +1142,14 @@ def build_data_migration_screen(
                 # showing the shared full_load value was worse -- a restored session
                 # that had once run a Full Load came back reading "CDC: DONE" with CDC
                 # never having run, because the whole workflow is persisted.
+                _cdc_live = cdc_pipeline_live(migration_state)
                 _badge_label, _badge_status = migration_status_badge(
                     migration_type,
-                    full_load_status=full_load_phase,
+                    # While CDC streams the combined type's badge reads "CDC" and shows
+                    # the (promoted) step; otherwise it names the Full Load phase.
+                    full_load_status=status if _cdc_live else full_load_phase,
                     cdc_status=get_status(session.workflow, WorkflowStep.CDC),
-                    cdc_streaming=cdc_pipeline_live(migration_state),
+                    cdc_streaming=_cdc_live,
                 )
                 ui.badge(
                     "{}: {}".format(_badge_label, _badge_status.value)

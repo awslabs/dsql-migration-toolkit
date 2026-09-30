@@ -1518,6 +1518,26 @@ _INTEGER_TARGET_BASES = frozenset(
 _BIT_HEX_LITERAL_RE = re.compile(r"(?i)^(?:b'([01]*)'|x'([0-9a-f]*)'|0x([0-9a-f]+))$")
 
 
+# MySQL source types whose value an expression default's number / hex literal keeps as
+# written (see _column_default_sql): the numeric family and BIT, the text family (a number
+# becomes its decimal text), and the VARIABLE-width binary family (no zero padding).
+_NUMERIC_SOURCE_BASES = frozenset({
+    "tinyint", "smallint", "mediumint", "int", "integer", "bigint", "decimal", "numeric",
+    "dec", "fixed", "float", "double", "real", "bit", "bool", "boolean",
+})
+_TEXT_SOURCE_BASES = frozenset({
+    "char", "varchar", "tinytext", "text", "mediumtext", "longtext",
+})
+_VARIABLE_BINARY_SOURCE_BASES = frozenset({
+    "varbinary", "tinyblob", "blob", "mediumblob", "longblob",
+})
+
+def _mysql_source_base(mysql_type: "Optional[str]") -> str:
+    """``"int unsigned"`` / ``"decimal(10,2)"`` -> ``"int"`` / ``"decimal"``."""
+    words = (mysql_type or "").strip().lower().split("(", 1)[0].split()
+    return words[0] if words else ""
+
+
 # ONE charset-introduced string literal, as information_schema reports a MySQL 8
 # ``DEFAULT ('x')``: ``_utf8mb4\'x\'`` (an extra escape layer) or ``_utf8mb4'x'``.
 _INTRODUCER_LITERAL_RE = re.compile(r"_([A-Za-z0-9]+)(\\?')(.*)\2", re.DOTALL)
@@ -1704,17 +1724,25 @@ def _column_default_sql(
     * **zero/invalid temporal default** on a date/time/timestamp target (``'0000-00-00'``,
       ``'0000-00-00 00:00:00'``, a bare ``0``) -> dropped with a warning (DSQL rejects it).
     """
-    raw = (column.default or "").strip()
+    if column.default is None or column.generated:
+        return None, None  # no default / a computed value (a default cannot apply)
+    target = (target_type or "").strip().lower()
+    if not column.default_is_expression and target.startswith(_TEXTUAL_TARGET_PREFIXES):
+        # A textual literal is carried EXACTLY: information_schema reports it unquoted, so
+        # ``DEFAULT ''`` arrives as '' (read as "no default" -- a NOT NULL VARCHAR then
+        # rejected every insert omitting it) and ``'a '`` keeps its space.
+        exact = column.default
+        if enum_values is None or exact.strip() in enum_values:
+            if not exact.strip() or exact != exact.strip():
+                return "'" + exact.replace("\\", "\\\\").replace("'", "''") + "'", None
+    raw = column.default.strip()
     if not raw:
         return None, None
-    if column.generated:
-        return None, None  # computed value; a default cannot apply
 
     raw = _strip_on_update(raw)
     if not raw:
         return None, None
 
-    target = (target_type or "").strip().lower()
     is_boolean_target = target.startswith("bool")
 
     # --- expression defaults -------------------------------------------------------
@@ -1758,25 +1786,35 @@ def _column_default_sql(
             return translated, None
         # ONE plain literal, the only way MySQL 8 allows a TEXT/BLOB/JSON default at all:
         # the same default as the bare literal, so it takes the literal rules below.
+        # An expression default is stored UNCOERCED and coerced at every INSERT, so it is the
+        # bare literal's default only where MySQL keeps the value as written: not for ENUM (a
+        # number is an index), SET (a bitmask; members reordered), YEAR (70 -> 1970) or a
+        # fixed-width BINARY(n) (zero-padded).
+        source_base = _mysql_source_base(column.mysql_type)
         literal = _introducer_string_literal(expression)
         if (
             literal is not None
             and target.startswith(_TEXTUAL_TARGET_PREFIXES)
+            and source_base != "set"
             and (enum_values is None or literal in enum_values)
         ):
             # _quote_default_literal's escaping WITHOUT its strip(): DEFAULT (' ') is ' '.
             return "'" + literal.replace("\\", "\\\\").replace("'", "''") + "'", None
         expr_target_base = target.split("(", 1)[0].strip()
         bit_hex = _parse_bit_hex_literal(expression)
-        if (
-            re.fullmatch(r"[+-]?\d+(\.\d+)?", expression)
-            and expr_target_base not in ("bytea", "json", "jsonb")
-        ) or (
+        number_ok = (
+            source_base in _NUMERIC_SOURCE_BASES
+            or (source_base in _TEXT_SOURCE_BASES and target.startswith(_TEXTUAL_TARGET_PREFIXES))
+        ) and expr_target_base not in ("bytea", "json", "jsonb") and not expr_target_base.startswith(
+            _TEMPORAL_TARGET_PREFIXES
+        )
+        hex_ok = (source_base in _NUMERIC_SOURCE_BASES and expr_target_base in _INTEGER_TARGET_BASES) or (
+            source_base in _VARIABLE_BINARY_SOURCE_BASES and expr_target_base == "bytea"
+        )
+        if (re.fullmatch(r"[+-]?\d+(\.\d+)?", expression) and number_ok) or (
             bit_hex is not None
-            and (
-                expr_target_base in _INTEGER_TARGET_BASES
-                or (expr_target_base == "bytea" and bit_hex[1] is not None)
-            )
+            and hex_ok
+            and (expr_target_base != "bytea" or bit_hex[1] is not None)
         ):
             return _column_default_sql(
                 column.model_copy(update={"default": expression, "default_is_expression": False}),
@@ -1867,7 +1905,8 @@ def _resolve_column_default(
     # nothing -- return before the type re-parse below. map_mysql_type parses the type via
     # sqlglot, so without this guard a wide table with no defaults pays one wasted parse per
     # column, twice (build pass + warning pass).
-    if column.generated or not (column.default or "").strip():
+    # ``None`` is "no default"; the EMPTY string is a real one (``DEFAULT ''`` reports '').
+    if column.generated or column.default is None:
         return None, None
     try:
         target_type, _mapping_warning = map_mysql_type(column.mysql_type)
@@ -4246,7 +4285,7 @@ class SchemaConverter:
         # INSERT that omits the column succeeds on MySQL and is REJECTED on the target),
         # whereas a nullable column merely starts defaulting to NULL.
         for column in (() if is_postgres else table.columns):
-            if not column.default or column.generated:
+            if column.default is None or column.generated:
                 continue
             if column.name == table.auto_increment_column:
                 continue

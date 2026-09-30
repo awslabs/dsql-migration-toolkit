@@ -29033,7 +29033,8 @@ def test_full_load_surfaces_read_the_full_load_phase_not_the_shared_step() -> No
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
     badge = [c for c in calls if getattr(c.func, "id", None) == "migration_status_badge"]
     assert badge and all(
-        ast.unparse(k.value) == "full_load_phase" for c in badge for k in c.keywords if k.arg == "full_load_status"
+        ast.unparse(k.value) == "status if _cdc_live else full_load_phase"
+        for c in badge for k in c.keywords if k.arg == "full_load_status"
     )
     resolver = [c for c in calls if getattr(c.func, "id", None) == "resolve_active_substep_for_type"]
     assert resolver and all(
@@ -29271,3 +29272,18 @@ def test_thread_path_source_reread_line_is_unchanged(monkeypatch) -> None:
         "source connection lost (attempt 1/3) — likely an Aurora failover; re-reading this "
         "table from a fresh snapshot in 15s. Already-written rows are skipped (idempotent), "
         "so no duplicates.")
+
+
+def test_a_streaming_combined_session_without_a_full_load_reads_cdc_done() -> None:
+    """Review of f4e1e36: while CDC streams, the combined badge is labelled CDC and must show
+    the promoted step (CDC: DONE), not the Full Load phase (NOT_STARTED)."""
+    from dsql_migrator.ui.data_migration import MigrationType, migration_status_badge
+    from dsql_migrator.ui.data_migration._full_load_engine import full_load_phase_status
+    from dsql_migrator.ui.workflow import StepStatus
+
+    status = StepStatus.DONE  # promoted by the stream
+    phase = full_load_phase_status(status, full_load_ran=False)
+    live = True
+    assert migration_status_badge(
+        MigrationType.FULL_LOAD_AND_CDC, full_load_status=status if live else phase,
+        cdc_status=StepStatus.NOT_STARTED, cdc_streaming=live) == ("CDC", StepStatus.DONE)
