@@ -4031,12 +4031,16 @@ def _run_cutover_foreign_keys(
             conv_state.edited_target_ddls,
             preserve_foreign_keys=conv_state.preserve_foreign_keys,
         )
-        from dsql_migrator.ui.data_migration._full_load_engine import foreign_keys_in_scope
+        from dsql_migrator.ui.data_migration._full_load_engine import (
+            foreign_keys_in_scope,
+            foreign_keys_pointing_in,
+        )
 
         applied = foreign_keys_in_scope(applied, scope)
         connect = DsqlConnector(target_config, aws_profile=aws_profile).connect
         result = apply_preserved_foreign_keys(
             applied, connect, child_pk_columns=child_pk_columns_for(inventory),
+            skip_if_absent=foreign_keys_pointing_in(applied, scope),
             # Publish per-FK progress so a render during the pass reports how far it has
             # got. The pass can run for minutes and said nothing at all before.
             on_progress=validation_state.set_cutover_fk_apply_progress,

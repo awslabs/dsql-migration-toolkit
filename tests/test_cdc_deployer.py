@@ -1057,3 +1057,21 @@ def test_no_user_visible_copy_still_promises_a_15_20_minute_create() -> None:
     assert not offenders, "stale create estimate in operator-visible copy:\n" + "\n".join(
         offenders
     )
+
+
+def test_stack_has_resource_reads_the_stacks_logical_ids() -> None:
+    class _C:
+        def __init__(self, resources=None, fail=False):
+            self.resources, self.fail = resources or [], fail
+
+        def describe_stack_resources(self, StackName):
+            if self.fail:
+                raise RuntimeError("AccessDenied")
+            return {"StackResources": [{"LogicalResourceId": r} for r in self.resources]}
+
+    dep = CdcStackDeployer("us-east-1", session=_FakeSession(_C(["MskCluster", "ConnectorBastionDiagnosticsIngress"])))
+    assert dep.stack_has_resource("s", "ConnectorBastionDiagnosticsIngress") is True
+    dep = CdcStackDeployer("us-east-1", session=_FakeSession(_C(["MskCluster"])))
+    assert dep.stack_has_resource("s", "ConnectorBastionDiagnosticsIngress") is False
+    dep = CdcStackDeployer("us-east-1", session=_FakeSession(_C(fail=True)))
+    assert dep.stack_has_resource("s", "ConnectorBastionDiagnosticsIngress") is None

@@ -958,6 +958,30 @@ def run_cdc_infra_deploy(
         raise
 
 
+# The dev-bastion range an UNCONDITIONAL 9098 ingress admitted on every cdc-stack deployed
+# before that rule was removed (ConnectorBastionDiagnosticsIngress). Such a stack keeps the
+# rule until a Start updates its template -- and the admission gate runs BEFORE that update.
+_LEGACY_BASTION_CIDR = "172.31.0.0/20"
+_LEGACY_BASTION_RULE = "ConnectorBastionDiagnosticsIngress"
+
+
+def _legacy_bastion_may_admit(deployer: object, stack_name: str, own_ip: str) -> bool:
+    """Whether a pre-removal stack's legacy bastion rule may admit ``own_ip``: the address
+    is in its range and the stack still has (or may have: unreadable) that resource."""
+    from dsql_migrator.core.ec2_metadata import cidr_contains
+
+    if not cidr_contains(_LEGACY_BASTION_CIDR, own_ip):
+        return False
+    probe = getattr(deployer, "stack_has_resource", None)
+    if not callable(probe):
+        return True  # cannot tell: not a certainty, so do not refuse
+    try:
+        has = probe(stack_name, _LEGACY_BASTION_RULE)
+    except Exception:  # noqa: BLE001 - unreadable: not a certainty
+        return True
+    return has is not False
+
+
 def _run_external_seed(
     *,
     stack_name: str,
@@ -969,6 +993,7 @@ def _run_external_seed(
     src_name: str,
     driver: "_StageDriver",
     seed_fn: Optional[Callable[..., str]] = None,
+    deployer: object = None,
 ) -> None:
     """Do the CDC Kafka prep in-process for SeedMode=External (the Lambda-free path).
 
@@ -1028,15 +1053,18 @@ def _run_external_seed(
         and own_ip
         and admitted != attested
         and not cidr_contains(admitted, own_ip)
+        and not _legacy_bastion_may_admit(deployer, stack_name, own_ip)
     ):
         raise CdcDeployError(
             f"The cdc-stack '{stack_name}' admits {admitted} on MSK port 9098 and this "
             f"app's address {own_ip} is not in it, so the in-process CDC seed could not "
-            "reach MSK. Add a TCP 9098 inbound rule for this app's range to the "
-            f"cdc-stack's ConnectorSecurityGroup (CloudFormation -> {stack_name} -> "
-            "Resources) and start again, or start CDC from the host whose network the "
-            "stack admits. HostSubnetCidr itself is fixed when the stack is created, so "
-            "changing THAT needs a delete and re-deploy. No connectors were created."
+            "reach MSK. Start CDC from the host whose network the stack admits; or add a "
+            "TCP 9098 inbound rule for this app's range to the cdc-stack's "
+            f"ConnectorSecurityGroup (CloudFormation -> {stack_name} -> Resources) AND "
+            f"set DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR={admitted} on this app to attest "
+            "it, then restart the app and Start CDC. HostSubnetCidr itself is fixed "
+            "when the stack is created, so changing THAT needs a delete and re-deploy. "
+            "No connectors were created."
         )
     # Prefer the freshly-computed connector params; fall back to the values the
     # stack already carries (the partition plan + MaxMessageBytes are set at create
@@ -1402,6 +1430,7 @@ def run_cdc_start(
                     src_name=src_name,
                     driver=driver,
                     seed_fn=seed_fn,
+                    deployer=deployer,
                 )
             changed = deployer.submit_update(
                 stack_name, start_pass, template_body=template_body

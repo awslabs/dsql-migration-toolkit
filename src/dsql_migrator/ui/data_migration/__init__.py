@@ -171,6 +171,7 @@ from dsql_migrator.ui.data_migration._full_load_engine import (
     job_status_to_step_status,
     data_migration_step_after_cdc,
     foreign_keys_in_scope,
+    foreign_keys_pointing_in,
     full_load_phase_status,
     reconcile_full_load_step,
     ImporterFactory,
@@ -1966,6 +1967,12 @@ def build_data_migration_screen(
                     conv_state.edited_target_ddls,
                     preserve_foreign_keys=conv_state.preserve_foreign_keys,
                 )
+                # The migration's keys (a key is on its child) plus keys INTO it from an
+                # unselected child -- the ones a replace pre-drop or the CDC precondition
+                # may have removed. The pinned selection, not the live picker: a stale
+                # target inventory must not hide pending keys.
+                _fk_tables = getattr(migration_state.selection, "selected_tables", None)
+                _fk_scoped = foreign_keys_in_scope(_applied_conv, _fk_tables)
                 return DataMigrationInputs(
                     source_config=_src,
                     source_password=session.source_password,
@@ -1978,10 +1985,8 @@ def build_data_migration_screen(
                     # Only the migrated tables' keys (a key is on its child): a table the
                     # migration never loaded is not altered. The pinned selection, not the
                     # live picker: a stale target inventory must not hide pending keys.
-                    table_conversions=foreign_keys_in_scope(
-                        _applied_conv,
-                        getattr(migration_state.selection, "selected_tables", None),
-                    ),
+                    table_conversions=_fk_scoped,
+                    fk_optional_tables=foreign_keys_pointing_in(_fk_scoped, _fk_tables),
                     # The EFFECTIVE set (key columns dropped): see effective_lob_exclusions.
                     excluded_lob_columns=effective_lob_exclusions(
                         migration_state,

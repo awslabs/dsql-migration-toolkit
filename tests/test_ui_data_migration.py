@@ -29160,7 +29160,9 @@ def test_the_data_migration_fk_action_is_scoped_to_the_migration_selection() -> 
     src = " ".join(inspect.getsource(dm.build_data_migration_screen).split())
     start = src.index("def _fk_apply_inputs")
     seg = src[start:src.index("def ", start + 10)]
-    assert "table_conversions=foreign_keys_in_scope( _applied_conv," in seg
+    assert "_fk_scoped = foreign_keys_in_scope(_applied_conv, _fk_tables)" in seg
+    assert "table_conversions=_fk_scoped" in seg
+    assert "fk_optional_tables=foreign_keys_pointing_in(_fk_scoped, _fk_tables)" in seg
     assert "migration_state.selection" in seg
     assert "applied_conversions=_applied_conv" in seg
 
@@ -29287,3 +29289,103 @@ def test_a_streaming_combined_session_without_a_full_load_reads_cdc_done() -> No
     assert migration_status_badge(
         MigrationType.FULL_LOAD_AND_CDC, full_load_status=status if live else phase,
         cdc_status=StepStatus.NOT_STARTED, cdc_streaming=live) == ("CDC", StepStatus.DONE)
+
+
+def test_probe_binlog_resume_gap_is_silent_on_a_real_resume(monkeypatch) -> None:
+    """Review of 0efe952: a restart that RESUMES (same watermark as the stack last started
+    from; the seeder does not rewind) starts at the committed offset, so a purged watermark
+    log must not raise 'a gapless resume is no longer possible -- re-run the Full Load'."""
+    from types import SimpleNamespace
+
+    import dsql_migrator.core.watermark as _wm
+    import dsql_migrator.ui.connect as _connect
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration._cdc_ui import _probe_binlog_resume_gap
+
+    class _Engine:
+        def connect(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def dispose(self):
+            pass
+
+    monkeypatch.setattr(_connect, "make_source_engine_factory", lambda _pw, **_k: (lambda _src: _Engine()))
+    monkeypatch.setattr(_wm, "list_binary_logs", lambda _conn: ["mysql-bin.000200"])  # 000123 purged
+    session = SimpleNamespace(source_config=SimpleNamespace(source_type=SourceType.MYSQL), source_password=None)
+    job = MigrationJob(job_id="j1")
+    job.watermark = _watermark()  # mysql-bin.000123
+    jm = _StubJobManager({"j1": job})
+    state = DataMigrationState()
+    state.job_id = "j1"
+    state.set_cdc_has_committed_offset(True)
+    state.set_cdc_deployed_watermark((job.watermark.binlog_file, str(job.watermark.binlog_position)))
+    assert _probe_binlog_resume_gap(state, jm, session) is None
+    state.set_cdc_has_committed_offset(False)  # a first start: the seed IS the start point
+    assert _probe_binlog_resume_gap(state, jm, session) is not None
+
+
+# --- review of d813cdb: the FK round trip stays closed ------------------------------
+
+
+def _fk_conv_named(table, fks):
+    """A TableConversion with one rendered ADD CONSTRAINT per (name, referenced_table)."""
+    from dsql_migrator.core.converter import TableConversion
+    from dsql_migrator.core.models import ForeignKeyDef
+
+    return TableConversion(
+        table=table, target_ddl=f'CREATE TABLE "{table}" (id INT)',
+        foreign_key_ddls=[f'ALTER TABLE "{table}" ADD CONSTRAINT "{n}" FOREIGN KEY ("x") REFERENCES "{r}" ("id") NOT VALID'
+                          for n, r in fks],
+        preserved_foreign_keys=[ForeignKeyDef(name=n, columns=["x"], referenced_table=r, referenced_columns=["id"])
+                                for n, r in fks])
+
+
+def test_a_key_pointing_into_the_migration_stays_in_scope() -> None:
+    """A replace pre-drop / the CDC FK precondition drop an UNSELECTED child's key that
+    references a MIGRATED parent, promising its re-creation: that key is in scope (and only
+    that key of the child); a key between two unselected tables is not."""
+    from dsql_migrator.ui.data_migration._full_load_engine import (
+        foreign_keys_in_scope,
+        foreign_keys_pointing_in,
+    )
+
+    conv = {
+        "shop.customers": _fk_conv_named("shop.customers", []),
+        "shop.addresses": _fk_conv_named("shop.addresses", [("fk_addr_cust", "shop.customers"), ("fk_addr_zone", "shop.zones")]),
+        "shop.zones": _fk_conv_named("shop.zones", []),
+        "shop.child": _fk_conv_named("shop.child", [("fk_child_parent", "shop.parent")]),
+    }
+    scoped = foreign_keys_in_scope(conv, ["shop.customers"])
+    assert set(scoped) == {"shop.customers", "shop.addresses"}
+    assert [d.split('CONSTRAINT "')[1].split('"')[0] for d in scoped["shop.addresses"].foreign_key_ddls] == ["fk_addr_cust"]
+    assert foreign_keys_pointing_in(scoped, ["shop.customers"]) == frozenset({"shop.addresses"})
+    assert "shop.child" not in scoped  # the LIVE 8 finding: an unrelated pair stays out
+
+
+def test_the_apply_skips_an_absent_pointing_in_child_silently_but_not_a_migrated_one(monkeypatch) -> None:
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    conv = {
+        "shop.customers": _fk_conv_named("shop.customers", [("fk_cust_region", "shop.regions")]),
+        "shop.addresses": _fk_conv_named("shop.addresses", [("fk_addr_cust", "shop.customers")]),
+    }
+    present = {"shop.customers": True, "shop.addresses": False}
+    monkeypatch.setattr(engine, "_target_table_present", lambda _cf, name: present[name])
+    seen = []
+    monkeypatch.setattr(engine, "_pregate_orphans",
+                        lambda *a, **k: (seen.append(a), 0)[1], raising=False)
+    kept = engine._drop_absent_optional_children(conv, lambda: object(), frozenset({"shop.addresses"}))
+    assert set(kept) == {"shop.customers"}  # the absent pointing-in child: nothing to re-create
+    present["shop.addresses"] = True
+    kept = engine._drop_absent_optional_children(conv, lambda: object(), frozenset({"shop.addresses"}))
+    assert set(kept) == {"shop.customers", "shop.addresses"}
+    # a MIGRATED child is never dropped by this (it must fail loudly if absent)
+    present["shop.customers"] = False
+    kept = engine._drop_absent_optional_children(conv, lambda: object(), frozenset({"shop.addresses"}))
+    assert "shop.customers" in kept

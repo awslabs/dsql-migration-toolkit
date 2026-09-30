@@ -6747,4 +6747,4 @@ def test_cutover_screen_scopes_every_foreign_key_count_to_the_migration_selectio
     from dsql_migrator.ui.validation import build_cutover_screen
 
     src = inspect.getsource(build_cutover_screen)
-    assert src.count("migration_state=migration_state") >= 3
+    assert src.count("migration_state=migration_state") >= 4  # ack, provider, count, identity

@@ -1817,10 +1817,11 @@ def test_external_seed_refuses_only_when_the_stack_admits_a_different_network(
 def test_external_seed_refuses_a_default_vpc_host_the_stack_does_not_admit(monkeypatch) -> None:
     """The removed bastion rule no longer counts as an admission path: a host in
     172.31.0.0/20 that the stack's HostSubnetCidr does not contain is refused up front."""
-    monkeypatch.delenv("DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR", raising=False)
     seed_calls: list[dict] = []
     with pytest.raises(CdcDeployError) as exc:
-        _run_start_external_with_admitted("10.0.0.0/16", "172.31.5.9", monkeypatch, seed_calls)
+        # A stack deployed after the rule's removal: it has no legacy bastion resource.
+        _run_start_external_with_resources("10.0.0.0/16", "172.31.5.9", monkeypatch, seed_calls,
+                                           resources=lambda lid: False)
     msg = str(exc.value)
     assert "10.0.0.0/16" in msg and "172.31.5.9" in msg
     assert seed_calls == []
@@ -2390,3 +2391,44 @@ def test_the_session_credential_helper_handles_the_secret_wrapper_it_is_given() 
     assert _session_source_credentials(
         SimpleNamespace(source_config=None, source_password=SecretValue("   "))
     ) is None
+
+
+def _run_start_external_with_resources(admitted, own_ip, monkeypatch, seed_calls, *, resources):
+    import dsql_migrator.core.ec2_metadata as _em
+
+    monkeypatch.setattr(_em, "local_ipv4", lambda: own_ip)
+    monkeypatch.delenv("DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR", raising=False)
+    deployer = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]},
+        discovery_params={"HostSubnetCidr": admitted},
+    )
+    deployer.stack_has_resource = lambda _stack, logical_id: resources(logical_id)
+    _run_start_external(_FakeHandle(), deployer, seed_calls)
+    return deployer
+
+
+def test_a_stack_still_carrying_the_legacy_bastion_rule_admits_that_range(monkeypatch) -> None:
+    """Review of 3dd968e: a stack deployed BEFORE the rule was removed still admits
+    172.31.0.0/20 until a Start updates its template -- and the gate runs BEFORE that
+    update, so refusing there would wedge every Start."""
+    seed_calls: list[dict] = []
+    _run_start_external_with_resources("172.31.16.0/20", "172.31.5.9", monkeypatch, seed_calls,
+                                       resources=lambda lid: lid == "ConnectorBastionDiagnosticsIngress")
+    assert len(seed_calls) == 1
+    # Unreadable resources (None): not a certainty -> proceed (the gate refuses only on one).
+    seed_calls.clear()
+    _run_start_external_with_resources("172.31.16.0/20", "172.31.5.9", monkeypatch, seed_calls,
+                                       resources=lambda lid: None)
+    assert len(seed_calls) == 1
+
+
+def test_a_stack_without_the_legacy_rule_refuses_with_a_remedy_that_works(monkeypatch) -> None:
+    seed_calls: list[dict] = []
+    with pytest.raises(CdcDeployError) as exc:
+        _run_start_external_with_resources("172.31.16.0/20", "172.31.5.9", monkeypatch, seed_calls,
+                                           resources=lambda lid: False)
+    msg = str(exc.value)
+    assert seed_calls == []
+    # The only in-app bypass the gate honours is the attestation; name it.
+    assert "DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR=172.31.16.0/20" in msg
+    assert "start again" not in msg

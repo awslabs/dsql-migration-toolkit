@@ -3967,6 +3967,10 @@ def _probe_binlog_resume_gap(migration_state, job_manager, session) -> Optional[
     watermark_file = getattr(seed, "binlog_file", None)
     if not watermark_file:
         return None
+    # A real RESUME starts at the committed offset (the seeder does not rewind to the seed),
+    # so the seed's log being purged says nothing about this Start.
+    if cdc_start_resumes(migration_state, seed, _cdc_source_type(session)):
+        return None
     source_config = getattr(session, "source_config", None)
     if source_config is None:
         return None

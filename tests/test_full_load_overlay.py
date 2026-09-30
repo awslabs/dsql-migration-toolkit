@@ -387,7 +387,7 @@ class _Rig:
         else:
             job_id = manager.submit(lambda h: run_full_load_retry(h, retry_prior, tables, migrator=self.migrator,
                                                                   error_log=error_log, inputs=self.inputs))
-        assert manager.wait(job_id, timeout=10.0)
+        assert manager.wait(job_id, timeout=60.0)  # an upper bound: a loaded CI host was slower than 10 s
         self.job, self.error, self.error_log = manager.get_status(job_id), manager.get_error(job_id), error_log
         return {c.chunk_id: c.status for c in self.job.chunks}
 

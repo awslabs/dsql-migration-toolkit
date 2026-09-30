@@ -175,6 +175,17 @@ class CdcStackDeployer:
         )
         return {"TemplateURL": url}
 
+    def stack_has_resource(self, stack_name: str, logical_id: str) -> Optional[bool]:
+        """Whether the deployed stack has the logical resource ``logical_id`` (read-only);
+        ``None`` when the resources cannot be read."""
+        try:
+            resources = self._client("cloudformation").describe_stack_resources(
+                StackName=stack_name
+            ).get("StackResources", []) or []
+        except Exception:  # noqa: BLE001 - unreadable: the caller decides
+            return None
+        return any(r.get("LogicalResourceId") == logical_id for r in resources)
+
     def discover_stack(self, stack_name: str) -> CdcStackDiscovery:
         """Read the stack's status + current parameters, validating preconditions.
 

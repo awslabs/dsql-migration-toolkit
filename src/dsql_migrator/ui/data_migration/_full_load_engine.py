@@ -196,6 +196,9 @@ class DataMigrationInputs:
     # excluded (candidates exclude PKs; the engine also guards). Empty => nothing
     # is dropped (the default; oversized rows are quarantined per-row instead).
     excluded_lob_columns: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    # The FK action only: unselected children kept for a key into the migration
+    # (foreign_keys_pointing_in) -- skipped when absent on the target.
+    fk_optional_tables: frozenset[str] = frozenset()
     # --- Column-exclusion overlay (the excluded columns land NULL) -----------------
     # The operator (non-legacy) exclusions to OVERLAY: each column is made nullable with
     # no DEFAULT on the target before the table's first write. Always read as the
@@ -5976,6 +5979,7 @@ class BatchedTableMigrator:
             heartbeat=heartbeat,
             should_cancel=should_cancel,
             on_progress=on_progress,
+            skip_if_absent=frozenset(getattr(self._inputs, "fk_optional_tables", ()) or ()),
         )
 
     def _view_connection_factory(self):
@@ -6028,6 +6032,10 @@ def apply_preserved_foreign_keys(
     # "(cut-over)" under VALIDATION, so the two halves of one operator action were
     # recorded differently. Still ONE log call -- only its category and label vary.
     origin: str = "post-load",
+    # Unselected children kept for a key INTO the migration (foreign_keys_pointing_in):
+    # when one is not on the target there is nothing to re-create, so it is left out
+    # instead of failing its orphan pre-check.
+    skip_if_absent: "frozenset[str]" = frozenset(),
 ) -> tuple[int, int, int]:
     """Re-create preserved foreign keys as post-load ``ADD CONSTRAINT``, orphan-gated.
 
@@ -6062,6 +6070,10 @@ def apply_preserved_foreign_keys(
     index_state_cache: dict = {}
     _beat = heartbeat if callable(heartbeat) else (lambda: None)
     _stopped = should_cancel if callable(should_cancel) else (lambda: False)
+    if skip_if_absent:
+        table_conversions = _drop_absent_optional_children(
+            table_conversions, connection_factory, skip_if_absent
+        )
     for table_name, conv in table_conversions.items():
         by_name = {fk.name: fk for fk in conv.preserved_foreign_keys}
         for add_ddl in conv.foreign_key_ddls:
@@ -6388,13 +6400,75 @@ def foreign_keys_blocking_replace(
 
 
 def foreign_keys_in_scope(table_conversions, tables):
-    """The conversions whose foreign keys are the MIGRATION's: those of the migrated child
-    tables (a key is on its child). ``tables`` empty or ``None`` (no selection recorded)
-    keeps every table -- the previous behaviour. Pure."""
+    """The conversions whose foreign keys are the MIGRATION's. Pure.
+
+    A migrated (selected) table keeps all its keys. An UNSELECTED table keeps only its keys
+    that reference a migrated table: those are exactly the ones this migration may have
+    dropped -- a Drop & reload of the parent pre-drops them, the CDC FK precondition removes
+    them -- each promising they are re-created by 'Apply foreign keys'. A key between two
+    unselected tables is out of scope (the migration never touches either). ``tables``
+    empty or ``None`` (no selection recorded) keeps every table -- the previous behaviour.
+    """
     keep = set(tables or ())
     if not keep:
         return dict(table_conversions or {})
-    return {n: c for n, c in (table_conversions or {}).items() if n in keep}
+    scoped = {}
+    for name, conv in (table_conversions or {}).items():
+        if name in keep:
+            scoped[name] = conv
+            continue
+        by_name = {fk.name: fk for fk in getattr(conv, "preserved_foreign_keys", ()) or ()}
+        pointing_in = [
+            ddl
+            for ddl in getattr(conv, "foreign_key_ddls", ()) or ()
+            if getattr(by_name.get(_constraint_name_from_ddl(ddl) or ""), "referenced_table", None)
+            in keep
+        ]
+        if pointing_in:
+            scoped[name] = conv.model_copy(update={"foreign_key_ddls": pointing_in})
+    return scoped
+
+
+def foreign_keys_pointing_in(scoped_conversions, tables) -> frozenset:
+    """The unselected children :func:`foreign_keys_in_scope` kept for a key into the
+    migration: they may legitimately be absent on the target (nothing to re-create)."""
+    keep = set(tables or ())
+    if not keep:
+        return frozenset()
+    return frozenset(n for n in (scoped_conversions or {}) if n not in keep)
+
+
+def _target_table_present(connection_factory, table_name: str) -> bool:
+    """Whether ``table_name`` exists on the target (one catalog read); True when unknown."""
+    from dsql_migrator.core.target_introspector import read_overlay_column_facts
+
+    try:
+        conn = connection_factory()
+    except Exception:  # noqa: BLE001 - unknown: let the pass decide as before
+        return True
+    try:
+        exists, _facts = read_overlay_column_facts(conn, table_name, [])
+        return bool(exists)
+    except Exception:  # noqa: BLE001 - unknown
+        return True
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _drop_absent_optional_children(table_conversions, connection_factory, optional):
+    """``table_conversions`` without the OPTIONAL children (keys into the migration from an
+    unselected table) that are not on the target: nothing to re-create there. A migrated
+    table is never dropped here -- an absent one still fails loudly in the pass."""
+    if not optional:
+        return dict(table_conversions)
+    return {
+        name: conv
+        for name, conv in table_conversions.items()
+        if name not in optional or _target_table_present(connection_factory, name)
+    }
 
 
 def pending_foreign_key_count(migrator: DataMigrator, tables=None) -> int:
