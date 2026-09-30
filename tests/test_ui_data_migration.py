@@ -28759,3 +28759,94 @@ def test_lob_card_still_offers_the_remove_when_nothing_is_a_candidate() -> None:
     assert "No oversized LOB columns" in joined
     assert "plain.gone" in joined
     assert [b for b in ui.buttons if b.text == "Remove"]
+
+
+# ---------------------------------------------------------------------------
+# The Full Load phase vs the shared Data Migration step (LIVE 4/5, 2026-09-30)
+# ---------------------------------------------------------------------------
+
+
+def test_full_load_phase_is_not_done_when_only_cdc_promoted_the_step() -> None:
+    """CDC only promotes the Data Migration step to DONE while streaming (so Validation
+    opens); after a switch to a Full Load type that DONE must not read as a Full Load."""
+    from dsql_migrator.ui.data_migration._full_load_engine import full_load_phase_status
+    from dsql_migrator.ui.workflow import StepStatus
+
+    assert full_load_phase_status(StepStatus.DONE, full_load_ran=False) is StepStatus.NOT_STARTED
+
+
+def test_full_load_phase_status_is_identity_whenever_a_full_load_ran() -> None:
+    from dsql_migrator.ui.data_migration._full_load_engine import full_load_phase_status
+    from dsql_migrator.ui.workflow import StepStatus
+
+    for s in StepStatus:
+        assert full_load_phase_status(s, full_load_ran=True) is s
+        if s is not StepStatus.DONE:
+            assert full_load_phase_status(s, full_load_ran=False) is s
+
+
+def test_cdc_only_stream_stop_then_combined_reports_no_full_load() -> None:
+    from dsql_migrator.ui.data_migration import MigrationType, migration_status_badge
+    from dsql_migrator.ui.data_migration._full_load_engine import (
+        data_migration_step_after_cdc,
+        full_load_phase_status,
+    )
+    from dsql_migrator.ui.data_migration._models import resolve_active_substep_for_type
+    from dsql_migrator.ui.workflow import StepStatus
+
+    promoted = data_migration_step_after_cdc(StepStatus.NOT_STARTED, cdc_streaming=True)
+    assert promoted is StepStatus.DONE
+    assert data_migration_step_after_cdc(promoted, cdc_streaming=False) is None  # sticky
+    phase = full_load_phase_status(promoted, full_load_ran=False)
+    assert migration_status_badge(
+        MigrationType.FULL_LOAD_AND_CDC, full_load_status=phase, cdc_status=StepStatus.NOT_STARTED
+    ) == ("Full Load", StepStatus.NOT_STARTED)
+    assert resolve_active_substep_for_type(
+        None, migration_type=MigrationType.FULL_LOAD_AND_CDC, has_job=False,
+        full_load_done=phase is StepStatus.DONE,
+    ) == "prerequisites"
+
+
+def _screen_builder_source():
+    import ast
+    import inspect
+
+    import dsql_migrator.ui.data_migration as dm
+
+    return ast.parse(inspect.getsource(dm.build_data_migration_screen))
+
+
+def test_full_load_surfaces_read_the_full_load_phase_not_the_shared_step() -> None:
+    """The badge, the sub-step resolver and check, the 'Full Load complete' hint and the
+    Full-load-only 'CDC next?' notice read the Full Load PHASE; the step itself (the
+    Validation gate, the write-backs) keeps reading ``status``."""
+    import ast
+
+    tree = _screen_builder_source()
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+    badge = [c for c in calls if getattr(c.func, "id", None) == "migration_status_badge"]
+    assert badge and all(
+        ast.unparse(k.value) == "full_load_phase" for c in badge for k in c.keywords if k.arg == "full_load_status"
+    )
+    resolver = [c for c in calls if getattr(c.func, "id", None) == "resolve_active_substep_for_type"]
+    assert resolver and all(
+        "full_load_phase" in ast.unparse(k.value) for c in resolver for k in c.keywords if k.arg == "full_load_done"
+    )
+    assigns = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+               and any(getattr(t, "id", None) == "full_load_done" for t in n.targets)]
+    assert assigns and all("full_load_phase" in ast.unparse(a.value) for a in assigns)
+    # the two notices are guarded by the phase, not by the shared step
+    for text_marker in ("Full Load complete -- review", "want continuous"):
+        guards = [n for n in ast.walk(tree) if isinstance(n, ast.If) and text_marker in ast.unparse(n)
+                  and not any(text_marker in ast.unparse(x) for x in ast.walk(n) if isinstance(x, ast.If) and x is not n)]
+        assert guards, text_marker
+        assert all("status is StepStatus.DONE" not in ast.unparse(g.test) for g in guards), text_marker
+
+
+def test_full_load_phase_is_keyed_on_job_id() -> None:
+    import ast
+
+    tree = _screen_builder_source()
+    calls = [ast.unparse(n) for n in ast.walk(tree) if isinstance(n, ast.Call)
+             and getattr(n.func, "id", None) == "full_load_phase_status"]
+    assert calls == ["full_load_phase_status(status, full_load_ran=migration_state.job_id is not None)"]

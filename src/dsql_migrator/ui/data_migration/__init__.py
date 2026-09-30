@@ -170,6 +170,7 @@ from dsql_migrator.ui.data_migration._full_load_engine import (
     run_data_migration,
     job_status_to_step_status,
     data_migration_step_after_cdc,
+    full_load_phase_status,
     reconcile_full_load_step,
     ImporterFactory,
     _default_importer_factory,
@@ -736,6 +737,9 @@ def build_data_migration_screen(
                 with_status(session.workflow, WorkflowStep.FULL_LOAD, promoted)
             )
             status = promoted
+        # The Full Load PHASE (what the Full Load surfaces show), apart from the shared
+        # step a streaming CDC-only run promoted; ``status`` keeps gating and writes.
+        full_load_phase = full_load_phase_status(status, full_load_ran=migration_state.job_id is not None)
         inventory = _inventory()
         # The live source of what every exclusion gate judges (selection, applied DDL,
         # target columns) -- registered before anything below reads it.
@@ -1129,7 +1133,7 @@ def build_data_migration_screen(
                 # never having run, because the whole workflow is persisted.
                 _badge_label, _badge_status = migration_status_badge(
                     migration_type,
-                    full_load_status=status,
+                    full_load_status=full_load_phase,
                     cdc_status=get_status(session.workflow, WorkflowStep.CDC),
                     cdc_streaming=cdc_pipeline_live(migration_state),
                 )
@@ -1458,7 +1462,7 @@ def build_data_migration_screen(
                 migration_state.active_substep,
                 migration_type=migration_type,
                 has_job=job is not None,
-                full_load_done=status is StepStatus.DONE,
+                full_load_done=full_load_phase is StepStatus.DONE,
             )
             # Pin the view to CDC once connectors have actually been deployed. The
             # sub-step resolver falls back to full_load/prerequisites when no explicit
@@ -1523,7 +1527,7 @@ def build_data_migration_screen(
             # their checks pass (guard cleared); Full Load once its workflow step is
             # DONE; CDC once the stream has started.
             prereq_done = guard_reason is None
-            full_load_done = status is StepStatus.DONE
+            full_load_done = full_load_phase is StepStatus.DONE
             cdc_started = cdc_streaming_started(migration_state, job_manager)
 
             def go(substep: str) -> None:
@@ -2504,7 +2508,7 @@ def build_data_migration_screen(
                             ).props("color=primary outline")
                             if has_cdc:
                                 with ui.row().classes("items-center gap-2"):
-                                    if status is StepStatus.DONE:
+                                    if full_load_phase is StepStatus.DONE:
                                         inline_hint(
                                             ui,
                                             "Full Load complete -- review the results "
@@ -2536,7 +2540,7 @@ def build_data_migration_screen(
                                         ui.button(
                                             "Continue to CDC", icon="arrow_forward"
                                         ).props("color=primary").props("disable")
-                            elif status is StepStatus.DONE:
+                            elif full_load_phase is StepStatus.DONE:
                                 # Full-load-ONLY finished: the type has no CDC phase,
                                 # so there is no "Continue to CDC" button. A user who
                                 # now wants to keep the target in sync must switch the

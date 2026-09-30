@@ -4384,6 +4384,22 @@ def data_migration_step_after_cdc(
     return StepStatus.DONE
 
 
+def full_load_phase_status(step_status: StepStatus, *, full_load_ran: bool) -> StepStatus:
+    """The Full Load PHASE's status, read from the shared Data Migration step.
+
+    ``WorkflowStep.FULL_LOAD`` is both the whole Data Migration step (the Validation gate)
+    and what the Full Load surfaces read as "the Full Load finished". A streaming CDC-only
+    run promotes it to ``DONE`` (:func:`data_migration_step_after_cdc`) without any Full
+    Load, and the promotion is sticky -- so after a switch to a Full Load type the badge,
+    the sub-step check and "Full Load complete / Continue to CDC" claimed a Full Load that
+    never ran. ``full_load_ran`` (the session has a Full Load job) tells the two apart;
+    every other status passes through unchanged.
+    """
+    if step_status is StepStatus.DONE and not full_load_ran:
+        return StepStatus.NOT_STARTED
+    return step_status
+
+
 # ---------------------------------------------------------------------------
 # In-process Data Migrator: read-only export stream -> batched INSERT load
 # ---------------------------------------------------------------------------
