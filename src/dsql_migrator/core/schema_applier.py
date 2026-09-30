@@ -1298,7 +1298,12 @@ def is_single_sql_expression(expr: str) -> bool:
     can edit. The scan is exact because it refuses everything that could make its quote
     tracking wrong, none of which ``pg_get_expr`` emits:
 
-    * any backslash (an E'...' escape, a U&'...' escape);
+    * a backslash anywhere but inside a PLAIN '...' literal: outside quotes, in a "..."
+      identifier, and in a prefixed literal (E'...', U&'...', B'...', X'...') it could
+      start an escape. Inside a plain literal it is an ordinary character under
+      ``standard_conforming_strings`` (which :func:`restore_column_default` checks on its
+      own connection before running such a text), and ``pg_get_expr`` prints every bytea
+      constant that way ('\\x00'::bytea);
     * any ``$`` outside quotes (a dollar-quoted body, a ``$1``);
     * ``;``, ``--`` or ``/*`` outside quotes;
     * a ``,`` outside every bracket (a second ALTER TABLE subcommand), and an unbalanced
@@ -1308,21 +1313,38 @@ def is_single_sql_expression(expr: str) -> bool:
     Quotes are '...' and "..." with the doubled-quote escape.
     """
     text = (expr or "").strip()
-    if not text or "\\" in text:
+    if not text:
         return False
     quote: Optional[str] = None
+    plain = False  # the open quote is a '...' literal with no E / U& / B / X prefix
+    # Where the last '...' literal closed, and whether it was plain: a quote after
+    # whitespace holding a newline CONTINUES that literal in PostgreSQL's lexer, in the
+    # same (escape) mode, so it inherits instead of being judged by the char before it.
+    closed_at, closed_plain = -1, False
     depth = 0
     i = 0
     while i < len(text):
         ch = text[i]
         if quote:
+            if ch == "\\" and not plain:
+                return False
             if ch == quote:
                 if i + 1 < len(text) and text[i + 1] == quote:
                     i += 2
                     continue
+                if quote == "'":
+                    closed_at, closed_plain = i + 1, plain
                 quote = None
         elif ch in ("'", '"'):
             quote = ch
+            gap = text[closed_at:i] if closed_at >= 0 else None
+            if ch == "'" and gap is not None and gap.strip() == "" and ("\n" in gap or "\r" in gap):
+                plain = closed_plain
+            else:
+                before = text[i - 1] if i else " "
+                plain = ch == "'" and not (before.isalnum() or before in "_&$")
+        elif ch == "\\":
+            return False
         elif ch in ("(", "["):
             depth += 1
         elif ch in (")", "]"):
@@ -1401,6 +1423,15 @@ def restore_column_default(
     def _read(conn):
         return read_overlay_column_facts(conn, table_name, [column])
 
+    def _standard_strings(conn):
+        cur = conn.cursor()
+        try:
+            cur.execute("SHOW standard_conforming_strings")
+            row = cur.fetchone()
+        finally:
+            cur.close()
+        return str(row[0]).strip().lower() if row else ""
+
     def _body(connection, run_one, retry_read):
         exists, facts = retry_read(_read)
         live = facts.get(column) if exists else None
@@ -1412,6 +1443,14 @@ def restore_column_default(
             if live.default_expr == expr:
                 return RestoreOutcome("restored" if issued["set"] else "done", expr)
             return RestoreOutcome("diverged", live.default_expr)
+        if "\\" in expr and retry_read(_standard_strings) != "on":
+            # Off, a backslash in a plain '...' opens an escape: the scan's quote tracking
+            # no longer holds, so the text is not run.
+            raise OverlayRefusedError(
+                f"{table_name}.{column}: the recorded DEFAULT holds a backslash and "
+                "standard_conforming_strings is off on this connection, so it is not "
+                "restored automatically; run SET DEFAULT by hand."
+            )
         issued["set"] = True
         # The read-back below still compares byte-identically (PostgreSQL drops the
         # parentheses the statement adds).

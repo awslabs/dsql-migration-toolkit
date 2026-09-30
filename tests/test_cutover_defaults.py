@@ -893,6 +893,16 @@ def test_the_not_single_expression_reason_is_stated_once():
     assert by["a"].reason.startswith(NOT_EXCLUDED_REASON.format(o=o))
 
 
+def test_a_bytea_default_is_one_expression_and_restored_automatically():
+    """pg_get_expr prints every bytea constant in hex ('\\x..'::bytea); the backslash is
+    inside a plain literal, so it is executable and (A) makes it automatic (live: LIVE 4)."""
+    for o in ("'\\x00'::bytea", "'\\x'::bytea"):
+        by, _n = _classify([_entry("a", o)])
+        assert by["a"].executable and by["a"].auto and by["a"].reason is None, (o, by["a"])
+    by, _n = _classify([_entry("a", "E'\\x00'::bytea")])  # a prefixed literal still is not
+    assert not by["a"].executable and not by["a"].auto
+
+
 def test_a_stale_tab_click_after_the_inputs_changed_restores_nothing():
     import dsql_migrator.ui.validation as uiv
 

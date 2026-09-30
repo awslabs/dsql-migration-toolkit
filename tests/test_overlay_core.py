@@ -69,6 +69,7 @@ class FakeDb:
         self.faults = []  # [pattern, exception, remaining, when ('before'|'after'), skip]
         self.ignore_alters = False  # an ALTER that "succeeds" but changes nothing
         self.store_default_as = None  # a SET DEFAULT that stores a different text
+        self.standard_conforming_strings = "on"  # the PostgreSQL 16 (and Aurora DSQL) default
 
     def fault(self, pattern, exc, times=1, when="before", skip=0):
         self.faults.append([re.compile(pattern), exc, times, when, skip])
@@ -131,6 +132,9 @@ class FakeCursor:
                          table[c]["default"] if not table[c]["generated"] else "(gen expr)")
                         for c in table if c in asked]
                 self._rows = hits or [(None, None, None, None, None)]
+        elif text == "SHOW standard_conforming_strings":
+            value = db.standard_conforming_strings
+            self._rows = [] if value is None else [(value,)]  # None: the read returns no row
         elif text.startswith("SELECT 1 FROM"):
             name = ".".join(re.findall(r'"([^"]+)"', text))
             self._rows = [(1,)] if db.rows.get(name) else []
@@ -470,7 +474,13 @@ def test_restore_never_overwrites_refuses_unsafe_text_and_detects_a_bad_round_tr
     "E'\\'';COMMIT;DROP TABLE t;SELECT E'\\''",
     "$a1$'$a1$;DROP TABLE t;SELECT $a1$'$a1$",             # a dollar tag with a digit
     "x) , DROP COLUMN s, ALTER c SET DEFAULT (1",          # closes the wrapping parenthesis
-    "'a\\b'::text", "$1", "(1", "1)", "'open",
+    "$1", "(1", "1)", "'open",
+    # A backslash only inside a PLAIN '...' literal: every prefixed literal, a quoted
+    # identifier and bare text keep refusing it.
+    "E'\\x00'::bytea", "e'a\\b'::text", "U&'\\0061'", "u&'\\0061'", "B'1'::bit || E'\\\\'",
+    "'a'::text || \\x", "\"a\\b\"", "x'\\ff'",
+    # A literal continued across a newline keeps the FIRST segment's escape mode.
+    "E'a'\n'\\''", "E'a' \n\t '\\x'", "U&'a'\r\n'\\0061'", "e'a'\n\n'b'\n'\\'",
 ])
 def test_restore_refuses_every_splice_before_connecting(expr):
     db = _db(body={"notnull": False, "default": None})
@@ -488,6 +498,59 @@ def test_real_pg_get_expr_text_is_restored_inside_parentheses(expr):
     assert restore_column_default("shop.docs", "body", expr, connection_factory=db.connect, **NO_SLEEP).status == "restored"
     sets = [t for _c, t in db.log if "SET DEFAULT" in t]
     assert sets == [f'ALTER TABLE "shop"."docs" ALTER COLUMN "body" SET DEFAULT ({expr})']
+
+
+@pytest.mark.parametrize("expr", ["'\\x00'::bytea", "'\\x'::bytea", "'\\xdeadbeef'::bytea", "'a\\b'::text",
+                                  "'\\'::text", "('\\x00'::bytea)"])
+def test_a_backslash_in_a_plain_literal_is_restored_under_standard_strings(expr):
+    """pg_get_expr prints EVERY bytea constant in hex ('\\x..'::bytea). With
+    standard_conforming_strings on (checked on the restore's own connection), a backslash
+    inside a plain '...' is an ordinary character, so the quote tracking stays exact."""
+    db = _db(body={"notnull": False, "default": None})
+    assert restore_column_default("shop.docs", "body", expr, connection_factory=db.connect, **NO_SLEEP).status == "restored"
+    texts = [t for _c, t in db.log]
+    assert "SHOW standard_conforming_strings" in texts
+    assert texts.index("SHOW standard_conforming_strings") < next(i for i, t in enumerate(texts) if "SET DEFAULT" in t)
+    # ... on the SAME connection that runs the SET
+    (show_cid,) = {c for c, t in db.log if t == "SHOW standard_conforming_strings"}
+    (set_cid,) = {c for c, t in db.log if "SET DEFAULT" in t}
+    assert show_cid == set_cid
+    assert db.tables["shop.docs"]["body"]["default"] == expr
+
+
+def test_a_plain_literal_continued_across_a_newline_stays_plain():
+    from dsql_migrator.core.schema_applier import is_single_sql_expression
+
+    for expr in ("'\\x00'\n'00'::bytea", "'a'\n'\\b'::text", "'a' '\\b'::text"):
+        assert is_single_sql_expression(expr), expr
+
+
+@pytest.mark.parametrize("value", ["off", "OFF", "", None])
+def test_a_backslash_literal_is_refused_unless_standard_strings_read_on(value):
+    """Off (or unreadable), '\\' would open an escape and shift the quote parity:
+    refused, nothing set."""
+    db = _db(body={"notnull": False, "default": None})
+    db.standard_conforming_strings = value
+    if value is None:
+        db.fault("^SHOW standard_conforming_strings$", RuntimeError("never raised"), times=0)
+    with pytest.raises(OverlayRefusedError, match="standard_conforming_strings"):
+        restore_column_default("shop.docs", "body", "'\\x00'::bytea", connection_factory=db.connect, **NO_SLEEP)
+    assert not [t for _c, t in db.log if "SET DEFAULT" in t]
+    assert db.tables["shop.docs"]["body"]["default"] is None
+
+
+def test_a_lost_set_reply_for_a_backslash_text_replays_without_a_second_set():
+    db = _db(body={"notnull": False, "default": None})
+    db.fault(r"SET DEFAULT", Conn08(), when="after")
+    out = restore_column_default("shop.docs", "body", "'\\x00'::bytea", connection_factory=db.connect, **NO_SLEEP)
+    assert out.status == "restored"
+    assert len([t for _c, t in db.log if "SET DEFAULT" in t]) == 1
+
+
+def test_an_expression_without_a_backslash_needs_no_extra_read():
+    db = _db(body={"notnull": False, "default": None})
+    restore_column_default("shop.docs", "body", "'x'::text", connection_factory=db.connect, **NO_SLEEP)
+    assert "SHOW standard_conforming_strings" not in [t for _c, t in db.log]
 
 
 LONG = "customer_shipping_address_line_two_normalized_for_geo_lookup_v22"  # 64 bytes
