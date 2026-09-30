@@ -21293,9 +21293,12 @@ def test_a_retry_resyncs_the_identity_sequence_for_every_loaded_table() -> None:
     # The retry entry point must hand it the WHOLE prior chunk set, not retry_names.
     retry_src = inspect.getsource(_engine.run_full_load_retry)
     assert "sync_table_names=" in retry_src
-    assert "prior_chunks" in retry_src.split("sync_table_names=")[1][:200], (
-        "the retry still narrows the identity sync to the retried tables"
-    )
+    # (hoisted: the same whole-run list also scopes the FK count)
+    passed = retry_src.split("sync_table_names=")[1][:200]
+    assert "prior_chunks" in passed or (
+        passed.startswith("_run_tables")
+        and "_run_tables = [chunk.chunk_id for chunk in prior_chunks]" in retry_src
+    ), "the retry still narrows the identity sync to the retried tables"
 
 
 def test_the_orphan_pre_gate_reports_liveness_per_page() -> None:
@@ -28906,3 +28909,74 @@ def test_lob_panel_column_exclude_preview_wraps_inside_the_card() -> None:
         capture_preview=value)
     hits = [c for t, c in recorded if t == value]
     assert len(hits) == 1 and "wrap-anywhere" in hits[0] and "break-all" not in hits[0], recorded
+
+
+def test_foreign_keys_in_scope_keeps_only_migrated_child_tables() -> None:
+    from dsql_migrator.ui.data_migration._full_load_engine import foreign_keys_in_scope
+
+    conv = {"orders": "O", "sc_only_child": "C", "sc_only_parent": "P"}
+    assert foreign_keys_in_scope(conv, ["orders"]) == {"orders": "O"}
+    assert foreign_keys_in_scope(conv, None) == conv and foreign_keys_in_scope(conv, []) == conv
+    assert foreign_keys_in_scope(conv, ["sc_only_child"]) == {"sc_only_child": "C"}  # parent out of scope
+    assert foreign_keys_in_scope(conv, ["orders", "gone"]) == {"orders": "O"}
+
+
+def test_pending_foreign_key_count_counts_only_the_runs_tables() -> None:
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.data_migration._full_load_engine import pending_foreign_key_count
+
+    conv = {"a": SimpleNamespace(foreign_key_ddls=["fk1"]), "b": SimpleNamespace(foreign_key_ddls=["fk2"])}
+    plain = SimpleNamespace(_inputs=SimpleNamespace(table_conversions=conv, is_cdc_migration=False,
+                                                    cdc_coexisting=False, cdc_stack_name=None))
+    assert pending_foreign_key_count(plain, ["a"]) == 1
+    assert pending_foreign_key_count(plain, None) == 2 and pending_foreign_key_count(plain) == 2
+    cdc = SimpleNamespace(_inputs=SimpleNamespace(table_conversions=conv, is_cdc_migration=True,
+                                                  cdc_coexisting=False, cdc_stack_name=None))
+    assert pending_foreign_key_count(cdc, ["a"]) == 0
+
+
+def test_the_run_summary_counts_foreign_keys_over_the_runs_tables() -> None:
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _full_load_engine as engine
+
+    assert "pending_foreign_key_count(migrator, table_names)" in inspect.getsource(engine.run_full_load)
+    retry = inspect.getsource(engine.run_full_load_retry)
+    assert "pending_foreign_key_count(migrator, _run_tables)" in retry
+    assert "sync_table_names=_run_tables" in retry
+
+
+def test_the_data_migration_fk_action_is_scoped_to_the_migration_selection() -> None:
+    import inspect
+
+    import dsql_migrator.ui.data_migration as dm
+
+    src = " ".join(inspect.getsource(dm.build_data_migration_screen).split())
+    start = src.index("def _fk_apply_inputs")
+    seg = src[start:src.index("def ", start + 10)]
+    assert "table_conversions=foreign_keys_in_scope( _applied_conv," in seg
+    assert "migration_state.selection" in seg
+    assert "applied_conversions=_applied_conv" in seg
+
+
+def test_cdc_cascade_gap_tables_names_only_selected_tables() -> None:
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.data_migration._models import _FK_CASCADE_CDC_RULE_ID, cdc_cascade_gap_tables
+
+    report = SimpleNamespace(items=[SimpleNamespace(rule_id=_FK_CASCADE_CDC_RULE_ID, object_name=n)
+                                    for n in ("shop.orders", "shop.addresses")])
+    assert cdc_cascade_gap_tables(report, tables=["shop.addresses"]) == ["shop.addresses"]
+    assert cdc_cascade_gap_tables(report, tables=None) == ["shop.addresses", "shop.orders"]
+    assert cdc_cascade_gap_tables(report, tables=[]) == ["shop.addresses", "shop.orders"]
+
+
+def test_cdc_cascade_notice_is_scoped_to_the_resolved_selection() -> None:
+    import inspect
+
+    import dsql_migrator.ui.data_migration as dm
+
+    src = " ".join(inspect.getsource(dm.build_data_migration_screen).split())
+    i = src.index("_cascade_tables = cdc_cascade_gap_tables(")
+    assert "tables=" in src[i:i + 400] and "resolve_migration_selection(" in src[i:i + 400]

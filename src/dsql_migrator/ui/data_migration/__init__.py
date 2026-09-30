@@ -170,6 +170,7 @@ from dsql_migrator.ui.data_migration._full_load_engine import (
     run_data_migration,
     job_status_to_step_status,
     data_migration_step_after_cdc,
+    foreign_keys_in_scope,
     full_load_phase_status,
     reconcile_full_load_step,
     ImporterFactory,
@@ -1088,7 +1089,17 @@ def build_data_migration_screen(
                 # only in the Evaluation report -- read BEFORE the user knew whether
                 # CDC was in scope. Its own guidance starts with "Before starting
                 # CDC", so this is the moment it is actionable.
-                _cascade_tables = cdc_cascade_gap_tables(_assessment())
+                # Only the tables this migration moves: CDC never captures the others.
+                _cascade_tables = cdc_cascade_gap_tables(
+                    _assessment(),
+                    tables=(
+                        resolve_migration_selection(
+                            inventory, conv_state, migration_state, _target_inventory()
+                        )
+                        if inventory is not None
+                        else None
+                    ),
+                )
                 if _cascade_tables:
                     _listed = ", ".join(_cascade_tables[:6]) + (
                         f" +{len(_cascade_tables) - 6} more"
@@ -1961,7 +1972,13 @@ def build_data_migration_screen(
                     replace_tables=frozenset(),      # no data movement: DDL only
                     is_cdc_migration=migration_state.migration_type
                     is MigrationType.FULL_LOAD_AND_CDC,
-                    table_conversions=_applied_conv,
+                    # Only the migrated tables' keys (a key is on its child): a table the
+                    # migration never loaded is not altered. The pinned selection, not the
+                    # live picker: a stale target inventory must not hide pending keys.
+                    table_conversions=foreign_keys_in_scope(
+                        _applied_conv,
+                        getattr(migration_state.selection, "selected_tables", None),
+                    ),
                     # The EFFECTIVE set (key columns dropped): see effective_lob_exclusions.
                     excluded_lob_columns=effective_lob_exclusions(
                         migration_state,

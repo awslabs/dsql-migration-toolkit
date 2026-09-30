@@ -5293,6 +5293,19 @@ def test_cutover_pending_identity_tables_counts_identity_strategy_tables() -> No
     assert _cutover_pending_identity_tables(
         session, eval_store, identity_store, "s"
     ) == 1
+    # Scoped to the migrated selection like the FK count: an identity table the
+    # migration never loaded is not "pending" (the sync only reaches validated tables).
+    from dsql_migrator.core.models import TableSelection
+
+    def _ms(tables):
+        return SimpleNamespace(selection=TableSelection(selected_tables=tables))
+
+    assert _cutover_pending_identity_tables(
+        session, eval_store, identity_store, "s", migration_state=_ms(["lookup"])
+    ) == 0
+    assert _cutover_pending_identity_tables(
+        session, eval_store, identity_store, "s", migration_state=_ms(["orders"])
+    ) == 1
 
     # No conversion / eval state -> 0 (guarded).
     assert _cutover_pending_identity_tables(session, None, identity_store, "s") == 0
@@ -6657,3 +6670,81 @@ def test_readiness_facts_carry_the_known_dropped_rows_cause() -> None:
     facts = _readiness_check_facts("Data identical", "Heads-up", "d", summary, _drift_na())
     assert "knowingly dropped" in facts and "3 in ecommerce.product_media" in facts
     assert "every affected table" in facts
+
+
+# --- FK scope = the migrated selection (LIVE 8 / 4-5: 'this schema has 1 preserved
+# foreign key' for a migration whose tables have none) ---------------------------------
+
+
+def _fk_scope_stores(inv):
+    from types import SimpleNamespace
+
+    eval_store = SimpleNamespace(get_or_create=lambda sid: SimpleNamespace(result=SimpleNamespace(inventory=inv)))
+    conv_store = SimpleNamespace(get=lambda sid: SimpleNamespace(preserve_foreign_keys=True, edited_target_ddls={}))
+    return eval_store, conv_store
+
+
+def _fk_scope_inventory():
+    from dsql_migrator.core.models import ColumnDef
+
+    inv = _fk_inventory()  # orders(uid) -> users
+    from dsql_migrator.core.models import TableDef
+
+    inv.tables.append(TableDef(name="plain", columns=[ColumnDef(name="id", mysql_type="int")], primary_key=["id"]))
+    return inv
+
+
+def test_cutover_pending_foreign_keys_counts_only_the_migrated_selection() -> None:
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import TableSelection
+    from dsql_migrator.ui.validation import _cutover_pending_foreign_keys
+
+    session = SimpleNamespace(source_config=None)
+    eval_store, conv_store = _fk_scope_stores(_fk_scope_inventory())
+
+    def ms(tables):
+        return SimpleNamespace(selection=TableSelection(selected_tables=tables))
+
+    assert _cutover_pending_foreign_keys(session, eval_store, conv_store, "s", migration_state=ms(["plain"])) == 0
+    assert _cutover_pending_foreign_keys(session, eval_store, conv_store, "s", migration_state=ms(["orders"])) == 1
+    assert _cutover_pending_foreign_keys(session, eval_store, conv_store, "s", migration_state=ms([])) == 1
+    assert _cutover_pending_foreign_keys(session, eval_store, conv_store, "s") == 1
+
+
+def test_run_cutover_foreign_keys_never_alters_a_table_outside_the_selection(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+    from dsql_migrator.core.models import (
+        SourceConnectionConfig, SourceType, TableSelection, TargetConnectionConfig,
+    )
+    from dsql_migrator.ui.validation import ValidationState, _run_cutover_foreign_keys
+
+    eval_store, conv_store = _fk_scope_stores(_fk_scope_inventory())
+    session = SimpleNamespace(
+        target_config=TargetConnectionConfig(cluster_endpoint="c.dsql.us-east-1.on.aws", region="us-east-1"),
+        aws_profile=None, source_config=SourceConnectionConfig(host="h", database="d", source_type=SourceType.MYSQL))
+    captured = []
+
+    def _fake_apply(conversions, connection_factory, child_pk_columns=None, **_kw):
+        captured.append(sorted(t for t, c in conversions.items() if c.foreign_key_ddls))
+        return (len(captured[-1]), 0, 0)
+
+    monkeypatch.setattr(engine, "apply_preserved_foreign_keys", _fake_apply)
+    monkeypatch.setattr("dsql_migrator.core.target_connection.DsqlConnector",
+                        lambda *a, **k: SimpleNamespace(connect=lambda: object()))
+    for tables, expected in ((["plain"], []), (["plain", "orders"], ["orders"]), (None, ["orders"])):
+        ms = None if tables is None else SimpleNamespace(selection=TableSelection(selected_tables=tables))
+        _run_cutover_foreign_keys(session, ValidationState(), eval_store=eval_store, conversion_store=conv_store,
+                                  session_id="s", job_manager=None, refresh=lambda: None, migration_state=ms)
+        assert captured[-1] == expected, (tables, captured)
+
+
+def test_cutover_screen_scopes_every_foreign_key_count_to_the_migration_selection() -> None:
+    import inspect
+
+    from dsql_migrator.ui.validation import build_cutover_screen
+
+    src = inspect.getsource(build_cutover_screen)
+    assert src.count("migration_state=migration_state") >= 3

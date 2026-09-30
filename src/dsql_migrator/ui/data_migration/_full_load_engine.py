@@ -4057,7 +4057,7 @@ def run_full_load(
     # `ALTER TABLE ASYNC ... VALIDATE CONSTRAINT` is unobservable on DSQL (live-verified --
     # convalidated stays false, no sys.jobs row, and a synchronous VALIDATE is
     # FeatureNotSupported).
-    _fk_pending = pending_foreign_key_count(migrator)
+    _fk_pending = pending_foreign_key_count(migrator, table_names)
     _finalize_run(
         handle,
         job_id,
@@ -4281,7 +4281,10 @@ def run_full_load_retry(
         handle, job_id, tables_to_retry, migrator, error_log
     )
     _recreate_dependent_views(migrator)
-    _fk_pending = pending_foreign_key_count(migrator)   # see run_full_load
+    # The whole run's tables (a retry completes the run): the identity sync and the FK
+    # count both cover what the run loaded, not just the retried subset.
+    _run_tables = [chunk.chunk_id for chunk in prior_chunks] or list(retry_names)
+    _fk_pending = pending_foreign_key_count(migrator, _run_tables)   # see run_full_load
     _finalize_run(
         handle,
         job_id,
@@ -4294,9 +4297,7 @@ def run_full_load_retry(
         # every table that succeeded on the FIRST attempt with its DSQL sequence still at
         # its start value while its rows already occupied those values, and the first
         # application insert after cut over could fail with a duplicate key.
-        sync_table_names=[
-            chunk.chunk_id for chunk in prior_chunks
-        ] or list(retry_names),
+        sync_table_names=_run_tables,
         foreign_keys_pending=_fk_pending,
         accept_quarantined_rows=accept_quarantined_rows,
         accepted_quarantine_rows=accepted_quarantine_rows,
@@ -6360,13 +6361,25 @@ def foreign_keys_blocking_replace(
     return sorted(blocking)
 
 
-def pending_foreign_key_count(migrator: DataMigrator) -> int:
+def foreign_keys_in_scope(table_conversions, tables):
+    """The conversions whose foreign keys are the MIGRATION's: those of the migrated child
+    tables (a key is on its child). ``tables`` empty or ``None`` (no selection recorded)
+    keeps every table -- the previous behaviour. Pure."""
+    keep = set(tables or ())
+    if not keep:
+        return dict(table_conversions or {})
+    return {n: c for n, c in (table_conversions or {}).items() if n in keep}
+
+
+def pending_foreign_key_count(migrator: DataMigrator, tables=None) -> int:
     """How many preserved foreign keys this run still has to apply (no DB access).
 
     Counts the SAME rendered ``foreign_key_ddls`` :func:`apply_preserved_foreign_keys`
     would iterate, so the Data Migration step's "Apply foreign keys" action shows the same
-    number the action will work through. Zero when FK preservation is off, when the source
-    has none, or for a CDC migration (those are applied at cut over instead).
+    number the action will work through -- over the run's ``tables``
+    (:func:`foreign_keys_in_scope`; ``None``: every table). Zero when FK preservation is
+    off, when the source has none, or for a CDC migration (those are applied at cut over
+    instead).
     """
     inputs = getattr(migrator, "_inputs", None)
     if inputs is None:
@@ -6379,7 +6392,9 @@ def pending_foreign_key_count(migrator: DataMigrator) -> int:
         return 0
     return sum(
         len(conv.foreign_key_ddls or ())
-        for conv in (getattr(inputs, "table_conversions", None) or {}).values()
+        for conv in foreign_keys_in_scope(
+            getattr(inputs, "table_conversions", None) or {}, tables
+        ).values()
     )
 
 

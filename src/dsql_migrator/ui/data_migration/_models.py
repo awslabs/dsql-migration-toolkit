@@ -3125,7 +3125,7 @@ def migration_type_tradeoff(
 _FK_CASCADE_CDC_RULE_ID = "FK_CASCADE_CDC_GAP"
 
 
-def cdc_cascade_gap_tables(assessment: object) -> list[str]:
+def cdc_cascade_gap_tables(assessment: object, tables=None) -> list[str]:
     """Return the tables whose FK cascades CDC cannot replicate (sorted, de-duped).
 
     The deterministic assessment already detects this at Evaluation time, but the
@@ -3137,7 +3137,8 @@ def cdc_cascade_gap_tables(assessment: object) -> list[str]:
 
     Accepts any object exposing ``items`` (the real ``AssessmentReport`` or a test
     double) and degrades to ``[]`` when absent/unreadable, so a decorative surface can
-    never break the screen. Pure.
+    never break the screen. ``tables`` (the migrated selection) keeps only those: CDC
+    captures nothing else; empty or ``None`` keeps every finding. Pure.
     """
     items = getattr(assessment, "items", None) or []
     names: list[str] = []
@@ -3147,6 +3148,9 @@ def cdc_cascade_gap_tables(assessment: object) -> list[str]:
         name = getattr(item, "object_name", None)
         if name and name not in names:
             names.append(str(name))
+    if tables:
+        keep = set(tables)
+        names = [n for n in names if n in keep]
     return sorted(names)
 
 

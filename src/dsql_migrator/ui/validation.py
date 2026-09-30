@@ -3749,6 +3749,8 @@ def _cutover_pending_foreign_keys(
     eval_store: "Optional[EvaluationStore]",
     conversion_store: "Optional[Any]",
     session_id: str,
+    *,
+    migration_state: object = None,
 ) -> int:
     """Count foreign keys still to apply at cut over.
 
@@ -3787,7 +3789,24 @@ def _cutover_pending_foreign_keys(
         conv_state.edited_target_ddls,
         preserve_foreign_keys=conv_state.preserve_foreign_keys,
     )
+    # Only the migrated tables' keys (the apply below is scoped the same way).
+    applied = _in_migration_scope(applied, migration_state)
     return sum(len(conv.foreign_key_ddls) for conv in applied.values())
+
+
+def _migrated_tables(migration_state: object) -> "Optional[list[str]]":
+    """The recorded migration selection (``None``/empty: every table, as before)."""
+    selection = getattr(migration_state, "selection", None)
+    tables = getattr(selection, "selected_tables", None)
+    return list(tables) if tables else None
+
+
+def _in_migration_scope(table_conversions, migration_state: object):
+    """The conversions of the migrated tables only (see ``foreign_keys_in_scope``: a key is
+    on its child); no recorded selection keeps every table."""
+    from dsql_migrator.ui.data_migration._full_load_engine import foreign_keys_in_scope
+
+    return foreign_keys_in_scope(table_conversions, _migrated_tables(migration_state))
 
 
 def _cutover_foreign_keys_stripped(
@@ -3901,6 +3920,8 @@ def _cutover_pending_identity_tables(
     eval_store: "Optional[EvaluationStore]",
     conversion_store: "Optional[Any]",
     session_id: str,
+    *,
+    migration_state: object = None,
 ) -> int:
     """Count tables converted to a server-generated (IDENTITY) primary key.
 
@@ -3940,6 +3961,8 @@ def _cutover_pending_identity_tables(
         conv_state.edited_target_ddls,
         preserve_foreign_keys=conv_state.preserve_foreign_keys,
     )
+    # Only the migrated tables (the FK count is scoped the same way).
+    applied = _in_migration_scope(applied, migration_state)
     by_name = {table.name: table for table in inventory.tables}
     return sum(
         1
@@ -3957,6 +3980,7 @@ def _run_cutover_foreign_keys(
     session_id: str = "",
     job_manager: "Optional[JobManager]" = None,
     refresh: "Optional[Callable[[], None]]" = None,
+    migration_state: object = None,
 ) -> None:
     """Apply preserved foreign keys on Aurora DSQL at cut over (operator action).
 
@@ -3984,6 +4008,9 @@ def _run_cutover_foreign_keys(
             refresh()
         return
     aws_profile = getattr(session, "aws_profile", None)
+    # Read at submit time: only the migrated tables' keys are added (a table the migration
+    # never loaded is not altered, nor counted as pending).
+    scope = _migrated_tables(migration_state)
 
     def _work(_handle: object = None) -> None:
         from dsql_migrator.core.converter import SchemaConverter
@@ -4004,6 +4031,9 @@ def _run_cutover_foreign_keys(
             conv_state.edited_target_ddls,
             preserve_foreign_keys=conv_state.preserve_foreign_keys,
         )
+        from dsql_migrator.ui.data_migration._full_load_engine import foreign_keys_in_scope
+
+        applied = foreign_keys_in_scope(applied, scope)
         connect = DsqlConnector(target_config, aws_profile=aws_profile).connect
         result = apply_preserved_foreign_keys(
             applied, connect, child_pk_columns=child_pk_columns_for(inventory),
@@ -4218,7 +4248,8 @@ def build_cutover_screen(
                 + _cutover_integrity_detail(
                     validation_state,
                     _cutover_pending_foreign_keys(
-                        session, eval_store, conversion_store, session_id
+                        session, eval_store, conversion_store, session_id,
+                        migration_state=migration_state,
                     ),
                     inputs_missing=_cutover_gate_inputs_missing(
                         eval_store, conversion_store, session_id
@@ -4309,13 +4340,16 @@ def build_cutover_screen(
                 session, validation_state,
                 eval_store=eval_store, conversion_store=conversion_store,
                 session_id=session_id, job_manager=job_manager, refresh=refresh,
+                migration_state=migration_state,
             )
 
         _fk_pending = _cutover_pending_foreign_keys(
-            session, eval_store, conversion_store, session_id
+            session, eval_store, conversion_store, session_id,
+            migration_state=migration_state,
         )
         _identity_pending = _cutover_pending_identity_tables(
-            session, eval_store, conversion_store, session_id
+            session, eval_store, conversion_store, session_id,
+            migration_state=migration_state,
         )
         # Both counts above are 0 when their schema inputs are missing, and 0 hides the
         # action. Distinguish "nothing to apply" from "can't tell" so a session without
