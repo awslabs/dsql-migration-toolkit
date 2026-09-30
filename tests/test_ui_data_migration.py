@@ -3709,6 +3709,33 @@ def _run_start_cdc_capture_seed_mode(
     defaults to True (an equipped app stack) so these tests keep exercising the seed-mode
     derivation; the un-equipped case is a blocking refusal covered separately.
     """
+    run = _run_start_cdc_capture(
+        monkeypatch,
+        source_type=source_type,
+        host_seed_mode=host_seed_mode,
+        msk_access=msk_access,
+    )
+    return run["kwargs"].get("seed_mode"), run["notices"], run["submitted"]
+
+
+def _run_start_cdc_capture(
+    monkeypatch,
+    *,
+    source_type,
+    host_seed_mode="lambda",
+    msk_access=True,
+    start_mode=None,
+    manual_binlog=None,
+    manual_gtid=None,
+    job_watermark=None,
+):
+    """Drive _start_cdc_deploy end to end (running the submitted job body) and capture it.
+
+    Returns ``{"kwargs": run_cdc_start's kwargs, "notices": rendered notices, "submitted":
+    whether a job was submitted, "details": the activity-log details}``. ``start_mode`` /
+    ``manual_binlog`` (``(file, pos)``) / ``manual_gtid`` set the CDC start point;
+    ``job_watermark`` is the Full Load job's watermark (a DONE job).
+    """
     from types import SimpleNamespace
 
     import dsql_migrator.config as _config
@@ -3717,6 +3744,7 @@ def _run_start_cdc_capture_seed_mode(
     from dsql_migrator.core.models import SourceType
 
     captured = {}
+    details: list = []
 
     class _Deployer:
         template_s3_bucket = ""
@@ -3727,12 +3755,14 @@ def _run_start_cdc_capture_seed_mode(
             )
 
     def _run(*_a, **kw):
-        captured["seed_mode"] = kw.get("seed_mode")
+        captured.update(kw)
 
     monkeypatch.setattr(_dep, "build_cdc_stack_deployer", lambda *a, **k: _Deployer())
     monkeypatch.setattr(_dep, "run_cdc_start", _run)
     monkeypatch.setattr(_cdcui, "_read_cdc_template_body", lambda: "TEMPLATE-BODY")
-    monkeypatch.setattr(_cdcui, "_log_cdc_event", lambda *a, **k: None)
+    monkeypatch.setattr(
+        _cdcui, "_log_cdc_event", lambda *a, **k: details.append(k.get("detail"))
+    )
     # The FK precondition is fail-closed and this fake session has no readable target
     # catalog, so stub it "clean" -- these tests are about seed mode / job deferral, and
     # the gate itself is covered by test_cdc_start_*_foreign_key* below.
@@ -3764,6 +3794,15 @@ def _run_start_cdc_capture_seed_mode(
             self.work = work
             return "job-1"
 
+        def get_status(self, job_id):
+            if job_id == "fl-job" and job_watermark is not None:
+                return SimpleNamespace(
+                    job_id="fl-job", watermark=job_watermark, status="DONE"
+                )
+            from dsql_migrator.core.job_manager import JobNotFoundError
+
+            raise JobNotFoundError(job_id)
+
     class _Ui:
         def notify(self, *_a, **_k):
             return None
@@ -3787,6 +3826,13 @@ def _run_start_cdc_capture_seed_mode(
     )
     state = DataMigrationState()
     state.set_selection(TableSelection(selected_tables=["orders"]))
+    if job_watermark is not None:
+        state.job_id = "fl-job"
+    if start_mode is not None:
+        state.set_cdc_start_mode(start_mode)
+    if manual_binlog is not None or manual_gtid is not None:
+        f, p = manual_binlog if manual_binlog is not None else (None, None)
+        state.set_cdc_start_position(gtid=manual_gtid, binlog_file=f, binlog_pos=p)
 
     jm = _SubmitOnlyJM()
     _cdcui._start_cdc_deploy(
@@ -3796,7 +3842,12 @@ def _run_start_cdc_capture_seed_mode(
     # `submitted` rather than by an assertion buried in this helper.
     if jm.work is not None:
         jm.work(SimpleNamespace())
-    return captured.get("seed_mode"), notices, jm.work is not None
+    return {
+        "kwargs": captured,
+        "notices": notices,
+        "submitted": jm.work is not None,
+        "details": details,
+    }
 
 
 def _seed_blocker_notices(notices):
@@ -3885,6 +3936,125 @@ def test_start_cdc_deploy_keeps_host_seed_mode_for_mysql(monkeypatch) -> None:
     assert seed_mode == "lambda"
     assert submitted
     assert not _seed_blocker_notices(notices)
+
+
+# ---------------------------------------------------------------------------
+# Start CDC: a MySQL Manual start point is really SEEDED (it never was)
+# ---------------------------------------------------------------------------
+
+_MANUAL = ("mysql-bin.000042", 1234)
+
+
+def _job_wm(file="mysql-bin.000050", pos=999):
+    return Watermark(
+        binlog_file=file,
+        binlog_position=pos,
+        gtid_executed="3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5",
+        snapshot_timestamp=datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
+    )
+
+
+@pytest.mark.parametrize("host_seed_mode", ["lambda", "external"])
+def test_start_cdc_seeds_a_manual_binlog_start_point(monkeypatch, host_seed_mode) -> None:
+    # The defect: the card said "Start point set", the preview "binlog (start) = F:P", but
+    # Start passed only the (absent) Full Load watermark, so the seeder never saw F:P and
+    # Debezium began at the CURRENT binlog -- every change since F:P silently lost.
+    from dsql_migrator.core.cdc import build_watermark_params
+    from dsql_migrator.core.models import SourceType
+
+    run = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.MYSQL, host_seed_mode=host_seed_mode,
+        start_mode="manual", manual_binlog=_MANUAL,
+    )
+    assert run["submitted"]
+    kw = run["kwargs"]
+    seed = kw["watermark"]
+    assert (seed.binlog_file, seed.binlog_position) == _MANUAL
+    assert seed.gtid_executed is None  # file:pos only (gtid.source.excludes '.*')
+    assert kw["seed_origin"] == "manual"
+    params = dict(build_watermark_params(seed))
+    assert params["WatermarkBinlogFile"] == "mysql-bin.000042"
+    assert params["WatermarkBinlogPos"] == "1234"
+    # A seeded offset needs recovery (schema_only + an offset dies "history topic missing").
+    assert dict(kw["params"].filled)["SnapshotMode"] == "recovery"
+    detail = run["details"][0]
+    assert "Manual start point" in detail
+    assert "binlog mysql-bin.000042:1234" in detail
+    assert "CURRENT position" not in detail
+
+
+def test_start_cdc_manual_point_beats_the_full_load_watermark(monkeypatch) -> None:
+    # Full load + CDC with a Manual point: the card and preview show the Manual point as
+    # the start, so that is what is seeded -- not the job watermark.
+    from dsql_migrator.core.models import SourceType
+
+    run = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.MYSQL, start_mode="manual",
+        manual_binlog=("mysql-bin.000040", 4), job_watermark=_job_wm(),
+    )
+    seed = run["kwargs"]["watermark"]
+    assert (seed.binlog_file, seed.binlog_position) == ("mysql-bin.000040", 4)
+    assert dict(run["kwargs"]["params"].filled)["SnapshotMode"] == "recovery"
+    # Automatic still seeds the job watermark, exactly as before.
+    auto = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.MYSQL, start_mode="auto",
+        manual_binlog=("mysql-bin.000040", 4), job_watermark=_job_wm(),
+    )
+    assert auto["kwargs"]["watermark"] == _job_wm()
+    assert auto["kwargs"]["seed_origin"] == "full_load"
+
+
+def test_start_cdc_gtid_only_manual_never_falls_back_to_the_job_watermark(
+    monkeypatch,
+) -> None:
+    # A GTID set alone cannot seed (both seeders key on file:pos). Start (reachable via
+    # Retry CDC, which has no readiness gate) must NOT quietly seed the job watermark
+    # instead of what the operator chose -- and the config must agree: no seed, so no
+    # recovery (recovery with no seeded offset fails the task or resumes from now).
+    from dsql_migrator.core.models import SourceType
+
+    run = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.MYSQL, start_mode="manual",
+        manual_gtid="3E11FA47-71CA-11E1-9E33-C80AA9429562:1-100",
+        job_watermark=_job_wm(),
+    )
+    assert run["kwargs"]["watermark"] is None
+    assert run["kwargs"]["seed_origin"] == "manual_unseedable"
+    assert dict(run["kwargs"]["params"].filled)["SnapshotMode"] == "schema_only"
+    assert "no binlog file:position to seed" in run["details"][0]
+
+
+def test_start_cdc_postgres_keeps_the_job_watermark_under_manual(monkeypatch) -> None:
+    # PostgreSQL Manual = re-snapshot; nothing to seed, the job watermark passes unchanged.
+    from dsql_migrator.core.models import SourceType
+
+    pg_wm = Watermark(
+        wal_lsn="0/16B3748", snapshot_timestamp=datetime(2026, 1, 2, tzinfo=timezone.utc)
+    )
+    run = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.POSTGRES, start_mode="manual",
+        manual_binlog=_MANUAL, job_watermark=pg_wm,
+    )
+    assert run["submitted"]
+    assert run["kwargs"]["watermark"] == pg_wm
+    assert run["kwargs"]["seed_origin"] == "full_load"
+
+
+def test_cdc_resume_signal_requires_a_seedable_manual_point() -> None:
+    # A GTID-only Manual entry is not an override (it seeds nothing); a binlog one is.
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    state = DataMigrationState()
+    state.set_cdc_start_mode("manual")
+    state.set_cdc_start_position(gtid="3E11FA47-71CA-11E1-9E33-C80AA9429562:1-100")
+    session = SimpleNamespace(source_config=SimpleNamespace(source_type=SourceType.MYSQL))
+    assert _cdc_ui._cdc_resume_signal(state, session) == (None, False)
+    state.set_cdc_start_position(binlog_file="mysql-bin.000042", binlog_pos=1234)
+    override, _ = _cdc_ui._cdc_resume_signal(state, session)
+    assert (override.binlog_file, override.binlog_position) == _MANUAL
 
 
 # ---------------------------------------------------------------------------
@@ -5900,33 +6070,67 @@ def test_sidebar_run_guard_derives_prereq_mode_from_the_migration_type() -> None
         )
 
 
-def test_probe_binlog_resume_gap_skips_a_manual_start_point() -> None:
-    # A manual start position overrides the watermark, so the watermark's log being
-    # purged is not what CDC will resume from -- warning about it would be wrong.
+def test_probe_binlog_resume_gap_checks_the_file_start_will_seed(monkeypatch) -> None:
+    # A Manual start point is now SEEDED, so ITS binary log is the one that must still be
+    # on the source -- not the job watermark's. (It used to skip Manual entirely, which was
+    # consistent only with Manual never being seeded.)
+    from types import SimpleNamespace
+
+    import dsql_migrator.core.watermark as _wm
+    import dsql_migrator.ui.connect as _connect
+    from dsql_migrator.core.models import SourceType
     from dsql_migrator.ui.data_migration._cdc_ui import _probe_binlog_resume_gap
 
-    state = DataMigrationState()
-    state.set_cdc_start_mode("manual")
-    state.set_cdc_start_position(binlog_file="mysql-bin.000099", binlog_pos=4)
-    assert state.cdc_start_override() is not None
+    class _Engine:
+        def connect(self):
+            return self
 
-    # A job whose watermark points at a long-purged log. The manual override wins, so
-    # the probe must return None -- and must do so WITHOUT touching the source (the
-    # session double below would raise if it were used).
-    class _ExplodingSession:
-        @property
-        def source_config(self):  # pragma: no cover - must never be reached
-            raise AssertionError("manual start point must skip the source probe")
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def dispose(self):
+            pass
+
+    retained = ["mysql-bin.000100", "mysql-bin.000123"]
+    monkeypatch.setattr(
+        _connect, "make_source_engine_factory", lambda _pw, **_k: (lambda _src: _Engine())
+    )
+    monkeypatch.setattr(_wm, "list_binary_logs", lambda _conn: list(retained))
+    session = SimpleNamespace(
+        source_config=SimpleNamespace(source_type=SourceType.MYSQL), source_password=None
+    )
 
     job = MigrationJob(job_id="j1")
-    job.watermark = _watermark()
+    job.watermark = _watermark()  # mysql-bin.000123 -- still retained
+    jm = _StubJobManager({"j1": job})
+    state = DataMigrationState()
     state.job_id = "j1"
-    assert (
-        _probe_binlog_resume_gap(
-            state, _StubJobManager({"j1": job}), _ExplodingSession()
-        )
-        is None
-    )
+    state.set_cdc_start_mode("manual")
+    state.set_cdc_start_position(binlog_file="mysql-bin.000099", binlog_pos=4)
+
+    reason = _probe_binlog_resume_gap(state, jm, session)
+    assert reason is not None
+    assert "mysql-bin.000099" in reason  # the Manual point's log, which is purged
+    assert "Manual start point" in reason
+    assert "Full Load watermark" not in reason  # not the Full Load wording
+    assert "mysql-bin.000100" in reason  # names the oldest log still kept
+
+    # A Manual point in a retained log: nothing to warn about.
+    state.set_cdc_start_position(binlog_file="mysql-bin.000100", binlog_pos=4)
+    assert _probe_binlog_resume_gap(state, jm, session) is None
+    # A GTID-only Manual entry seeds nothing, so there is no file to check.
+    state.set_cdc_start_position(gtid="3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5")
+    assert _probe_binlog_resume_gap(state, jm, session) is None
+    # Automatic still checks the job watermark's file (retained -> None; purged -> reason).
+    state.set_cdc_start_mode("auto")
+    assert _probe_binlog_resume_gap(state, jm, session) is None
+    retained[:] = ["mysql-bin.000200"]
+    auto_reason = _probe_binlog_resume_gap(state, jm, session)
+    assert auto_reason is not None and "mysql-bin.000123" in auto_reason
+    assert "Full Load watermark" in auto_reason
 
 
 def test_full_load_error_migration_context_describes_situation() -> None:

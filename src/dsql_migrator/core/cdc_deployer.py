@@ -1174,6 +1174,7 @@ def run_cdc_start(
     deployer: CdcStackDeployer,
     on_log: Callable[[datetime, str], None],
     watermark: Optional[Watermark] = None,
+    seed_origin: str = "full_load",
     template_body: Optional[str] = None,
     connector_timeout_seconds: float = 2700.0,
     poll_interval_seconds: float = 15.0,
@@ -1216,10 +1217,13 @@ def run_cdc_start(
     reaches RUNNING/FAILED, so the full timeout is only ever consumed when the
     connector genuinely never settles.
 
-    ``watermark`` (the Full Load consistency point) drives the automatic gapless
-    offset seed: its binlog coordinates are passed as the cdc-stack Watermark*
-    parameters on the SOURCE pass only, so the in-VPC seeder Lambda creates +
-    seeds the connect-offsets record before the source connector is created. The
+    ``watermark`` is the start offset offered to the seeder -- the Full Load
+    consistency point, or an operator's Manual binlog file:position
+    (:func:`~dsql_migrator.core.cdc.cdc_seed_watermark`); ``seed_origin`` names which
+    (``"full_load"`` / ``"manual"``) for the deploy log. Its binlog coordinates are
+    passed as the cdc-stack Watermark* parameters on the SOURCE pass only, so the
+    in-VPC seeder Lambda creates + seeds the connect-offsets record before the
+    source connector is created (SeedMode=External seeds it in-process). The
     Watermark* params are deliberately kept OUT of the config-changed comparison
     and the shared connector overrides, so a watermark-only change never forces an
     already-RUNNING source connector to be torn down and rebuilt (the seed is a
@@ -1309,9 +1313,16 @@ def run_cdc_start(
         # (a create-time seed concern). Blank/absent watermark -> SeedOffset false.
         watermark_overrides = build_watermark_params(watermark)
         if watermark is not None and watermark.binlog_file:
+            # Neutral wording: the seeders never rewind a committed offset (no-clobber),
+            # so on a restart the offered offset may legitimately not be applied.
+            _origin = {
+                "full_load": "Full Load watermark",
+                "manual": "Manual start point",
+            }.get(seed_origin, seed_origin)
             driver.log(
-                "Seeding gapless CDC start offset from the Full Load watermark "
-                f"({watermark.binlog_file}:{watermark.binlog_position})."
+                f"Offering CDC start offset {watermark.binlog_file}:"
+                f"{watermark.binlog_position} ({_origin}) to the seeder; not applied if "
+                "the committed offset is already at/past it."
             )
 
         # Has the desired connector configuration (notably the table set ->

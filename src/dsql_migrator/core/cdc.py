@@ -1144,34 +1144,38 @@ class CdcPipelineOrchestrator:
 
         ``snapshot_mode`` is chosen automatically:
 
-        - **Gapless (watermark) path:** ``recovery`` — Debezium rebuilds its
-          schema-history from the live DB (without re-reading rows) and resumes
-          from the seeded offset. Chosen ONLY when the watermark can actually seed
-          that offset (:meth:`CdcResumePoint.can_seed_offset` — binlog ``file`` +
-          ``pos`` present), because ``recovery`` needs a seeded ``connect-offsets``
-          entry to resume from; the schema-history topic need NOT pre-exist —
-          ``recovery`` rebuilds it from the live source (verified in the Seoul E2E:
-          "Snapshot step 6 - Persisting schema history" then "Snapshot step 7 -
-          Skipping snapshotting of data").
-        - **Non-seedable / manual override path:** ``schema_only`` — Debezium
-          reads the current source schema from scratch and begins streaming from
-          the current position. Safe for a brand-new connector with no
-          pre-existing schema-history topic. Used for a manual override (CDC-only,
-          no Full Load) AND for a watermark that cannot seed an offset (e.g.
-          GTID-only, when ``SHOW MASTER STATUS`` was restricted): choosing
-          ``recovery`` there would leave the connector in recovery with no seeded
-          offset — a task-start failure or a silent resume from the live binlog.
+        - **Seeded path:** ``recovery`` — Debezium rebuilds its schema-history
+          from the live DB (without re-reading rows) and resumes from the seeded
+          offset. Chosen whenever the resume point — the watermark, or a Manual
+          ``resume_override`` — can actually seed that offset
+          (:meth:`CdcResumePoint.can_seed_offset` — binlog ``file`` + ``pos``
+          present), because ``recovery`` needs a seeded ``connect-offsets`` entry to
+          resume from; the schema-history topic need NOT pre-exist — ``recovery``
+          rebuilds it from the live source (verified in the Seoul E2E: "Snapshot
+          step 6 - Persisting schema history" then "Snapshot step 7 - Skipping
+          snapshotting of data").
+        - **Non-seedable path:** ``schema_only`` — Debezium reads the current
+          source schema from scratch and begins streaming from the current
+          position. Safe for a brand-new connector with no pre-existing
+          schema-history topic. Used when nothing can seed an offset: no
+          coordinates, or a GTID set without a binlog file:position (a GTID-only
+          watermark when ``SHOW MASTER STATUS`` was restricted, or a GTID-only
+          Manual entry): choosing ``recovery`` there would leave the connector in
+          recovery with no seeded offset — a task-start failure or a silent resume
+          from the live binlog.
 
         ``column_exclude_list`` (optional) names fully-qualified columns
         (``db.table.column``) to drop at capture via Debezium
         ``column.exclude.list`` -- oversized LOB columns the user opted to exclude
         (spike H13); it flows to the cdc-stack ``ColumnExcludeList`` parameter.
 
-        ``resume_override`` (optional) supplies an explicit start position the
-        user entered in the UI (a GTID set or binlog ``file:position``). When
-        given it takes precedence over the watermark, so CDC can be seeded when no
-        Full Load watermark exists in this session or when the operator needs a
-        custom offset. When ``None`` the gapless watermark path is used.
+        ``resume_override`` (optional) is the Manual start position the operator
+        entered in the UI. When given it takes precedence over the watermark, so CDC
+        can be seeded when no Full Load watermark exists in this session or when the
+        operator needs a custom offset. Only its binlog ``file:position`` is seeded
+        (:func:`cdc_seed_watermark`), so ``start_gtid`` is not reported for an
+        override: the config states exactly what is seeded. When ``None`` the
+        gapless watermark path is used.
 
         ``message_key_columns`` (optional) maps ``{db.table: [target key cols]}``
         for tables whose DSQL target has a composite primary key; Debezium then
@@ -1190,33 +1194,30 @@ class CdcPipelineOrchestrator:
         # that topic need not pre-exist. (schema_only with a seeded offset but no
         # schema-history dies at task start: "The db history topic is missing".)
         # schema_only: reads the current source schema from scratch and starts
-        # streaming from the given binlog position. Safe for a brand-new connector
-        # with no pre-existing schema-history topic (the Manual/CDC-only path).
+        # streaming from the CURRENT binlog position. Safe for a brand-new connector
+        # with no pre-existing schema-history topic (the nothing-to-seed path).
         #
-        # Use recovery ONLY when the watermark can actually SEED an offset AND no
-        # manual override is active -- that's the gapless path where the offset
-        # seeder prepared the connect-offsets entry recovery resumes from. The gate
-        # MUST match the seeder's own precondition (can_seed_offset == binlog
-        # file+pos present): the seeder REJECTS a watermark without binlog
-        # coordinates and build_watermark_params then returns empty, so the seeder
-        # is skipped. A GTID-only watermark (SHOW MASTER STATUS restricted but
-        # @@GLOBAL.gtid_executed readable) has no binlog file:pos, so choosing
+        # Use recovery whenever the resume point can actually SEED an offset -- the
+        # Full Load watermark OR a Manual binlog file:position, both of which Start
+        # CDC offers the seeder (cdc_seed_watermark). The gate MUST match the
+        # seeder's own precondition (can_seed_offset == binlog file+pos present):
+        # the seeder REJECTS a point without binlog coordinates and
+        # build_watermark_params then returns empty, so the seeder is skipped. A
+        # GTID-only point (SHOW MASTER STATUS restricted but @@GLOBAL.gtid_executed
+        # readable, or a GTID-only Manual entry) has no binlog file:pos, so choosing
         # recovery there yields recovery-with-NO-seeded-offset -- which either fails
-        # the source task at start or silently resumes from the CURRENT binlog
-        # (losing the Full-Load-window changes). Falling back to schema_only starts
-        # the connector cleanly; the gapless-from-Full-Load promise was never
-        # achievable for such a watermark anyway (the UI surfaces that separately).
-        has_real_watermark = (
-            resume_override is None
-            and watermark is not None
-            and resume.can_seed_offset()
-        )
-        mode = "recovery" if has_real_watermark else "schema_only"
+        # the source task at start or silently resumes from the CURRENT binlog.
+        # Falling back to schema_only starts the connector cleanly; the UI refuses
+        # such a Manual entry and discloses such a watermark separately.
+        mode = "recovery" if resume.can_seed_offset() else "schema_only"
         return DebeziumSourceConfig(
             name=name,
             table_include_list=[table.name for table in tables],
             snapshot_mode=mode,
-            start_gtid=resume.gtid_executed,
+            # A Manual override seeds its file:position only (the connector runs
+            # gtid.source.excludes '.*'), so report no GTID for it: the preview must
+            # print exactly what is seeded.
+            start_gtid=resume.gtid_executed if resume_override is None else None,
             start_binlog_file=resume.binlog_file,
             start_binlog_pos=resume.binlog_position,
             column_exclude_list=list(column_exclude_list or []),
@@ -1902,6 +1903,41 @@ def build_watermark_params(
         ("WatermarkGtids", watermark.gtid_executed or ""),
         ("WatermarkTsSec", str(ts_sec)),
     ]
+
+
+def cdc_seed_watermark(
+    job_watermark: Optional[Watermark],
+    override: Optional[CdcResumePoint],
+    *,
+    now: datetime,
+) -> tuple[Optional[Watermark], str]:
+    """The ``(watermark, origin)`` a MySQL Start CDC offers the offset seeder. Pure.
+
+    - No Manual start point (``override is None``) -> the Full Load job watermark,
+      origin ``"full_load"`` (unchanged; it may itself be ``None``).
+    - A Manual point with a binlog ``file:position`` -> that position, origin
+      ``"manual"``. It beats the job watermark: it is what the start-point card and
+      the connector-config preview already show. Only ``file:position`` is carried
+      (``gtid_executed=None``): both seeders key the offset on file+pos and the
+      connector runs ``gtid.source.excludes '.*'``. ``now`` stamps the offset's
+      ``ts_sec``.
+    - A Manual point without a ``file:position`` (a GTID set alone) -> ``None``,
+      origin ``"manual_unseedable"``. Never falls back to the job watermark or to
+      "now": the operator chose Manual, so neither is what they asked for.
+    """
+    if override is None:
+        return job_watermark, "full_load"
+    if override.can_seed_offset():
+        return (
+            Watermark(
+                binlog_file=override.binlog_file,
+                binlog_position=override.binlog_position,
+                gtid_executed=None,
+                snapshot_timestamp=now,
+            ),
+            "manual",
+        )
+    return None, "manual_unseedable"
 
 
 def build_cdc_stack_params(

@@ -926,7 +926,7 @@ def test_refresh_pg_slot_health_reads_for_pg_and_noops_for_mysql() -> None:
 
 
 def test_cdc_resume_signal_is_engine_aware() -> None:
-    # The shared CDC start signal differs by engine: MySQL Manual seeds a GTID/binlog
+    # The shared CDC start signal differs by engine: MySQL Manual seeds a binlog
     # resume_override; PostgreSQL Manual has no coordinate and instead re-snapshots
     # (force_initial_snapshot), because Debezium PG resumes only from the slot.
     from types import SimpleNamespace
@@ -948,13 +948,16 @@ def test_cdc_resume_signal_is_engine_aware() -> None:
     state.set_cdc_start_mode("auto")
     assert _cdc_resume_signal(state, pg) == (None, False)
 
-    # MySQL: force_initial_snapshot is never set. A Manual GTID becomes the resume_override.
+    # MySQL: force_initial_snapshot is never set. A Manual binlog file:position becomes the
+    # resume_override (it is what Start seeds); a GTID set alone seeds nothing, so it is not.
     my = _session(SourceType.MYSQL)
     state.set_cdc_start_mode("manual")
     state.set_cdc_start_position(gtid="3E11FA47-71CA-11E1-9E33-C80AA9429562:1-100")
+    assert _cdc_resume_signal(state, my) == (None, False)
+    state.set_cdc_start_position(binlog_file="mysql-bin.000042", binlog_pos=1234)
     override, force = _cdc_resume_signal(state, my)
     assert force is False
-    assert override is not None and override.gtid_executed
+    assert override is not None and override.can_seed_offset()
     # MySQL Manual with nothing entered -> no override (nothing to seed).
     state.set_cdc_start_position(gtid=None, binlog_file=None, binlog_pos=None)
     assert _cdc_resume_signal(state, my) == (None, False)

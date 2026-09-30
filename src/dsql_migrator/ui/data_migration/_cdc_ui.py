@@ -44,6 +44,7 @@ from dsql_migrator.core.cdc import (
     MskSeedAdmission,
     build_cdc_stack_name,
     cdc_expected_connector_names,
+    cdc_seed_watermark,
     composite_cdc_excluded_key_columns,
     split_column_exclude_value,
     cdc_stack_name_suffix,
@@ -53,6 +54,7 @@ from dsql_migrator.core.cdc_coords import (
     parse_binlog_coordinate,
     validate_gtid,
 )
+from dsql_migrator.core.cdc_kafka_prep import offset_already_at_or_past
 from dsql_migrator.core.job_manager import (
     JobNotFoundError,
     is_interrupted_by_restart,
@@ -276,9 +278,12 @@ def _cdc_resume_signal(migration_state, session):
     Returns ``(resume_override, force_initial_snapshot)`` so every ``dispatch_source_config``
     call site stays consistent:
 
-    - **MySQL** -- a Manual choice supplies a GTID / binlog ``file:position`` that is seeded
-      into ``connect-offsets``; pass it as ``resume_override`` (only when it has usable
-      coordinates). ``force_initial_snapshot`` is always ``False`` (not a MySQL concept).
+    - **MySQL** -- a Manual binlog ``file:position`` is what Start seeds into
+      ``connect-offsets`` (:func:`cdc_seed_watermark`); pass it as ``resume_override``
+      only when it can seed that offset (``can_seed_offset``). A GTID set alone cannot --
+      both seeders key the offset on file+pos -- so it is not an override (and the card
+      refuses it as a start point). ``force_initial_snapshot`` is always ``False`` (not a
+      MySQL concept).
     - **PostgreSQL** -- Debezium resumes only from the replication slot and cannot start
       from an arbitrary WAL LSN, so Manual means "re-snapshot from scratch" (``initial``):
       there is no override value, just ``force_initial_snapshot = (mode == "manual")``.
@@ -288,8 +293,24 @@ def _cdc_resume_signal(migration_state, session):
     if _cdc_source_type(session) is SourceType.POSTGRES:
         return None, mode == "manual"
     override = migration_state.cdc_start_override()
-    usable = mode == "manual" and override is not None and override.has_coordinates()
+    usable = mode == "manual" and override is not None and override.can_seed_offset()
     return (override if usable else None), False
+
+
+def _cdc_start_seed(migration_state, watermark, source_type):
+    """The ``(seed, origin)`` a Start CDC offers the offset seeder. Pure (state reads only).
+
+    MySQL: :func:`cdc_seed_watermark` over the Full Load job ``watermark`` and the Manual
+    start point, so a Manual binlog file:position is really seeded. PostgreSQL keeps the job
+    watermark exactly (it resumes from its slot; Manual is a re-snapshot there). Every
+    surface that says where a Start begins -- the card, the Start button, the Start job, its
+    activity line, the purge pre-flight -- reads this, so they cannot disagree.
+    """
+    if source_type is SourceType.POSTGRES:
+        return watermark, "full_load"
+    return cdc_seed_watermark(
+        watermark, migration_state.cdc_start_override(), now=datetime.now(timezone.utc)
+    )
 
 
 def _logged_cdc_lifecycle(action: str, *, detail: str, work, residue=None):
@@ -599,8 +620,10 @@ def _render_cdc_source_config_card(
             and bool(wm_resume.gtid_executed)
         )
         # Effective start position: in manual mode an entered override wins; in auto
-        # mode the watermark is used.
-        if mode == "manual" and override is not None and override.has_coordinates():
+        # mode the watermark is used. A Manual point must be SEEDABLE (a binlog
+        # file:position): Start seeds exactly that (cdc_seed_watermark), and a GTID set
+        # alone cannot set where the pipeline starts -- so it is not a start point.
+        if mode == "manual" and override is not None and override.can_seed_offset():
             effective_resume = override
         elif mode == "auto" and wm_usable:
             effective_resume = wm_resume
@@ -615,11 +638,13 @@ def _render_cdc_source_config_card(
     # already seeded into connect-offsets and cannot change the live pipeline, so
     # the radio + manual inputs are locked (read-only) to avoid misleading edits.
     started = cdc_streaming_started(migration_state, job_manager)
+    # What Start will offer the seeder (a Manual binlog point beats the job watermark).
+    seed, _seed_origin = _cdc_start_seed(migration_state, watermark, source_type)
     # A stopped-but-previously-streamed pipeline resumes from its own committed offset, so
     # there is no start point left to choose. Without this the card contradicted the
     # button beneath it: "Action needed" / "needs a Full Load watermark" while Start CDC
     # was enabled and would have worked.
-    resumes_from_offset = cdc_start_resumes(migration_state, watermark, source_type)
+    resumes_from_offset = cdc_start_resumes(migration_state, seed, source_type)
     _render_cdc_start_point_card(
         ui,
         migration_state,
@@ -687,10 +712,13 @@ def _render_cdc_source_config_card(
         )
         return
 
+    # MySQL: built from the SEED, the same one Start sends (see _start_cdc_deploy), so
+    # the preview cannot claim a start point the Start would not seed.
+    _config_wm = watermark if is_pg else seed
     config = dispatch_source_config(
         _cdc_source_type(session),
         tables_for_config,
-        watermark if watermark is not None else _sentinel_watermark(),
+        _config_wm if _config_wm is not None else _sentinel_watermark(),
         database=_cdc_source_database(session),
         stack_name=getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME),
         column_exclude_list=exclude_list,
@@ -959,6 +987,26 @@ def _render_cdc_start_point_card(
     GTID/binlog inputs are shown.
     """
     is_pg = source_type is SourceType.POSTGRES
+    # The operator's Manual entry (MySQL): what the notices below judge. Start seeds only
+    # its binlog file:position (cdc_seed_watermark); a GTID set alone seeds nothing.
+    manual_point = (
+        migration_state.cdc_start_override()
+        if (not is_pg and mode == "manual")
+        else None
+    )
+    manual_seedable = manual_point is not None and manual_point.can_seed_offset()
+
+    def _render_gtid_only_notice() -> None:
+        render_notice(
+            ui,
+            tone="warning",
+            header="Enter a binlog file:position",
+            body=(
+                "A GTID set alone cannot set where this pipeline starts; it streams by "
+                "binlog file:position (Fetch current position fills it)."
+            ),
+        )
+
     # A PostgreSQL re-snapshot is a RESOLVED start with no coordinate, so it is "ready" even
     # though effective_resume is None -- for Automatic just as much as for Manual. Testing
     # Manual alone put an amber "Action needed" badge directly above an ENABLED blue
@@ -997,9 +1045,13 @@ def _render_cdc_start_point_card(
             if locked:
                 # The locked reason + how to change it rides on the badge tooltip, so
                 # no separate standing "CDC has started — locked…" line is needed.
+                # A Stop keeps the committed position and Start never rewinds it, so
+                # "stop CDC first" alone promised an edit that cannot move it back.
                 ui.badge("Locked", color="grey").props("outline").tooltip(  # type: ignore[attr-defined]
-                    "CDC has started — the start point is locked. To change it, "
-                    "stop CDC first."
+                    "CDC has started — the start point is locked. After a Stop, a new "
+                    "start point is applied only if it is past the committed position "
+                    "(Start never rewinds it); to replay from an earlier point, delete "
+                    "the CDC infrastructure and deploy again."
                 )
             elif ready:
                 ui.badge("Ready", color="positive").props("outline")  # type: ignore[attr-defined]
@@ -1024,6 +1076,24 @@ def _render_cdc_start_point_card(
                     "choose, no Full Load watermark required, and nothing re-applied."
                 ),
             )
+            # A Manual point is still OFFERED to the seeder, which never rewinds the
+            # committed offset -- so one at/before where this stack streamed from is
+            # silently not applied. Say so rather than let the entry look honoured.
+            if manual_seedable:
+                render_notice(
+                    ui,
+                    tone="warning",
+                    header="Your manual start point is not applied",
+                    body=(
+                        f"Your manual point {manual_point.binlog_file}:"
+                        f"{manual_point.binlog_position} is earlier than where this "
+                        "stack already streamed and is not applied. Start never rewinds "
+                        "a committed position; to replay from it, delete the CDC "
+                        "infrastructure and deploy again."
+                    ),
+                )
+            elif manual_point is not None:
+                _render_gtid_only_notice()
             return
 
         if is_pg:
@@ -1068,10 +1138,11 @@ def _render_cdc_start_point_card(
             refresh()
 
         if not is_pg:
-            # MySQL keeps its radio: there Manual supplies a REAL coordinate (a GTID or
-            # binlog file:position), consumed as `resume_override` in `_cdc_resume_signal`,
-            # and it is the documented cure for a GTID-only watermark that auto cannot seed
-            # from. Both options stay SELECTABLE even when no usable watermark exists -- the
+            # MySQL keeps its radio: there Manual supplies a REAL coordinate (a binlog
+            # file:position), consumed as `resume_override` in `_cdc_resume_signal` and
+            # seeded by Start (cdc_seed_watermark), and it is the documented cure for a
+            # GTID-only watermark that auto cannot seed from. Both options stay
+            # SELECTABLE even when no usable watermark exists -- the
             # steering is the label ("...(unavailable)") plus the notice below, not a disabled
             # option. (A previous comment claimed the option was disabled; no such code
             # existed, and a Quasar radio built from a plain dict has no per-option disable.)
@@ -1131,6 +1202,28 @@ def _render_cdc_start_point_card(
                 )
 
         if mode == "manual" and not is_pg:
+            if manual_point is not None and not manual_seedable and not locked:
+                _render_gtid_only_notice()
+            elif (
+                manual_seedable
+                and not locked
+                and getattr(migration_state, "cdc_has_committed_offset", False)
+            ):
+                # This stack streamed before (and this point is not at/before where it
+                # started, or that is unknown): the seeder applies the point only if it is
+                # past the committed position, which the tool cannot read.
+                render_notice(
+                    ui,
+                    tone="info",
+                    header="This stack has streamed before",
+                    body=(
+                        f"Your manual point {manual_point.binlog_file}:"
+                        f"{manual_point.binlog_position} is applied only if it is past "
+                        "the position this stack already streamed to — Start never "
+                        "rewinds a committed position. To replay from an earlier point, "
+                        "delete the CDC infrastructure and deploy again."
+                    ),
+                )
             _render_cdc_manual_inputs(
                 ui, migration_state, refresh, locked=locked, session=session,
             )
@@ -1162,11 +1255,13 @@ def _render_cdc_start_point_card(
         elif effective_resume is not None:
             with ui.row().classes("items-center gap-2 no-wrap mt-1"):  # type: ignore[attr-defined]
                 ui.icon("check_circle", color="positive").classes("text-base")  # type: ignore[attr-defined]
+                # The binlog coordinate is what Start seeds (the offset is keyed on it),
+                # so the confirmation names IT -- not a GTID set that seeds nothing.
                 coord = (
-                    f"GTID {effective_resume.gtid_executed}"
-                    if effective_resume.gtid_executed
-                    else f"binlog {effective_resume.binlog_file}:"
+                    f"binlog {effective_resume.binlog_file}:"
                     f"{effective_resume.binlog_position}"
+                    if effective_resume.can_seed_offset()
+                    else f"GTID {effective_resume.gtid_executed}"
                 )
                 ui.label(f"Start point set — {coord}").classes(  # type: ignore[attr-defined]
                     "text-xs text-gray-700 font-mono"
@@ -1229,13 +1324,20 @@ def _render_cdc_manual_inputs(
         )
         if not gtid_raw and not binlog_raw:
             ui.notify(  # type: ignore[attr-defined]
-                "Enter a GTID set or a binlog file:position first.",
+                "Enter a binlog file:position first.",
                 type="warning", position="top",
             )
-        elif binlog_unparsed and not gtid_raw:
+        elif binlog_unparsed:
             ui.notify(  # type: ignore[attr-defined]
                 "Binlog must be 'file:position' (e.g. mysql-bin.000123:45678).",
                 type="negative", position="top",
+            )
+        elif binlog_file is None:
+            # GTID only: stored, but it cannot set the start point (see the card notice).
+            ui.notify(  # type: ignore[attr-defined]
+                "A GTID set alone cannot set the start point — enter a binlog "
+                "file:position.",
+                type="warning", position="top",
             )
         elif gtid_error["msg"]:
             ui.notify(  # type: ignore[attr-defined]
@@ -1244,9 +1346,9 @@ def _render_cdc_manual_inputs(
                 type="warning", position="top",
             )
         else:
-            coord = gtid_raw if gtid_raw else f"{binlog_file}:{binlog_pos}"
+            # The binlog coordinate is what Start seeds, so it is what is confirmed.
             ui.notify(  # type: ignore[attr-defined]
-                f"Start point saved (not streaming yet) — {coord}",
+                f"Start point saved (not streaming yet) — {binlog_file}:{binlog_pos}",
                 type="positive", position="top",
             )
         refresh()
@@ -1316,9 +1418,11 @@ def _render_cdc_manual_inputs(
             type="positive", position="top",
         )
 
+    # Not "GTID (preferred)": the start offset is keyed on the binlog file:position, so a
+    # GTID set alone cannot set where streaming begins (cdc_seed_watermark).
     ui.label(  # type: ignore[attr-defined]
-        "Enter a GTID set, or a binlog file:position. Use a GTID when the source "
-        "has GTIDs enabled (preferred)."
+        "Enter the binlog file:position streaming starts from (Fetch current position "
+        "fills it). A GTID set alone cannot set the start point."
     ).classes("text-xs text-gray-500 mt-1")
     gtid_input = ui.input(  # type: ignore[attr-defined]
         "GTID set",
@@ -1456,8 +1560,13 @@ def _cdc_start_detail(
     force_snapshot: bool = False,
     exclusions: Optional[Mapping[str, object]] = None,
     resumes: bool = False,
+    seed_origin: str = "full_load",
 ) -> str:
     """The audit detail for a CDC start: where the stream resumes FROM, and how.
+
+    ``watermark`` is what the Start offers the seeder and ``seed_origin`` where it came
+    from (:func:`_cdc_start_seed`): a ``"manual"`` one is named as the operator's Manual
+    start point, not as a Full Load handoff.
 
     States the resume coordinate through the same precedence the Full Load watermark line
     uses (:func:`~dsql_migrator.ui.data_migration._full_load_engine.watermark_coordinate`),
@@ -1476,6 +1585,17 @@ def _cdc_start_detail(
         parts.append(
             "start point: the committed stream position on MSK (this stack streamed "
             "before; it continues where streaming stopped)"
+        )
+    elif watermark is not None and seed_origin == "manual":
+        parts.append(
+            f"start point {watermark_coordinate(watermark, source_type)} (Manual start "
+            "point; changes from this position on are replicated)"
+        )
+    elif watermark is None and seed_origin == "manual_unseedable":
+        parts.append(
+            "start point: the source's CURRENT position — the Manual start point has no "
+            "binlog file:position to seed, so any change written before this moment is "
+            "NOT replicated"
         )
     elif watermark is not None:
         # "gapless" is a claim about the SLOT, not about merely HAVING a watermark. A
@@ -2069,8 +2189,11 @@ def _render_cdc_start_button(
     # could resume perfectly. The operator was pushed toward re-entering coordinates by
     # hand, or worse, re-running the Full Load, to recover something the connector had
     # not lost.
-    resumes_from_offset = cdc_start_resumes(
+    _seed, _seed_origin = _cdc_start_seed(
         migration_state, watermark, _cdc_source_type(session)
+    )
+    resumes_from_offset = cdc_start_resumes(
+        migration_state, _seed, _cdc_source_type(session)
     )
     # A PostgreSQL start that RE-SNAPSHOTS needs no prior start point: it is a resolved
     # start on its own (snapshot.mode=initial, the connector creates its own slot). Keyed on
@@ -2093,9 +2216,13 @@ def _render_cdc_start_button(
     _resnapshots = pg_start_resnapshots(
         watermark, source_type=_cdc_source_type(session), start_mode=mode
     )
+    # A MySQL Manual start is ready only on a SEEDABLE point (binlog file:position) -- the
+    # thing Start seeds (cdc_seed_watermark). A GTID set alone seeds nothing, and in Manual
+    # the job watermark is NOT a fallback, so neither may enable Start there.
+    manual_mysql = not is_pg and mode == "manual"
     ready = (
         resumes_from_offset
-        or (override is not None and override.has_coordinates())
+        or (override is not None and override.can_seed_offset())
         # The AUTOMATIC gapless handoff resumes from the Full Load watermark. MySQL seeds
         # the connect-offset from a binlog file:position (can_seed_offset); PostgreSQL
         # resumes from the logical-replication slot's WAL LSN (can_resume_from_lsn). Accept
@@ -2107,7 +2234,8 @@ def _render_cdc_start_button(
         # every change made during the load. Such a watermark must steer the operator to
         # Manual (or grant REPLICATION CLIENT), so it must NOT enable auto Start.
         or (
-            wm_resume is not None
+            not manual_mysql
+            and wm_resume is not None
             and (wm_resume.can_seed_offset() or wm_resume.can_resume_from_lsn())
         )
         or (is_pg and _resnapshots)
@@ -3822,24 +3950,21 @@ def _diagnose_for_dialog(migration_state, session):
     return diagnosis.reason, diagnosis.mode, (diagnosis.routed_cidr_warning or "")
 
 def _probe_binlog_resume_gap(migration_state, job_manager, session) -> Optional[str]:
-    """Read-only: is the watermark's binary log still on the source? (blocking)
+    """Read-only: is the start point's binary log still on the source? (blocking)
 
-    Runs one ``SHOW BINARY LOGS`` against the source and compares it with the Full
-    Load watermark's binlog file. Returns an actionable reason when the log has been
-    purged (a gapless resume is impossible), else ``None`` -- including whenever the
-    answer is unknown (no watermark, manual start point, no source password after a
-    restart, or the statement/privilege is unavailable), so this never blocks on
-    uncertainty. Blocking I/O: callers MUST run it via ``run.io_bound``.
+    Runs one ``SHOW BINARY LOGS`` against the source and compares it with the binlog
+    file Start will SEED (:func:`_cdc_start_seed`): the Full Load watermark's, or a
+    Manual start point's. Returns an actionable reason when that log has been purged,
+    else ``None`` -- including whenever the answer is unknown (nothing to seed, no
+    source password after a restart, or the statement/privilege is unavailable), so
+    this never blocks on uncertainty. Blocking I/O: callers MUST run it via
+    ``run.io_bound``.
     """
-    # A manual start point overrides the watermark, so the watermark's log being
-    # gone is not what CDC will resume from -- nothing to warn about here.
-    # ``cdc_start_override`` already returns None in "auto" mode, so this is the
-    # single condition needed.
-    if migration_state.cdc_start_override() is not None:
-        return None
     job = _current_job(job_manager, getattr(migration_state, "job_id", None))
-    watermark = _cdc_watermark(job)
-    watermark_file = getattr(watermark, "binlog_file", None)
+    seed, origin = _cdc_start_seed(
+        migration_state, _cdc_watermark(job), _cdc_source_type(session)
+    )
+    watermark_file = getattr(seed, "binlog_file", None)
     if not watermark_file:
         return None
     source_config = getattr(session, "source_config", None)
@@ -3862,7 +3987,9 @@ def _probe_binlog_resume_gap(migration_state, job_manager, session) -> Optional[
             engine.dispose()
     except Exception:  # noqa: BLE001 - advisory pre-flight; unknown never blocks
         return None
-    return binlog_resume_gap_reason(watermark_file, retained)
+    return binlog_resume_gap_reason(
+        watermark_file, retained, manual=(origin == "manual")
+    )
 
 
 def pg_objects_required_before_deploy(migration_state, job) -> bool:
@@ -3941,11 +4068,14 @@ def _cdc_watermark(job):
 def cdc_start_resumes(migration_state, watermark, source_type) -> bool:
     """Will Start CDC RESUME the stack's committed offset, rather than seed ``watermark``? Pure.
 
-    Start always offers the job's watermark to the offset seeder, which moves the committed
-    offset FORWARD to it unless the offset is already at/past it (seeder.py no-clobber).
-    A stopped stack's offset is at/past the watermark it was last seeded from, so only a
-    DIFFERENT seedable watermark -- a Full Load run after streaming stopped -- changes
-    where streaming begins. PostgreSQL is unchanged.
+    ``watermark`` is the seed Start offers the offset seeder (:func:`_cdc_start_seed`: the
+    job watermark, or a Manual binlog point). The seeder moves the committed offset FORWARD
+    to it unless the offset is already at/past it (no-clobber). A stopped stack's offset is
+    at/past the watermark it was last seeded from (``cdc_deployed_watermark``), so the seed
+    is skipped -- a resume -- when it is at or before that one, judged by the seeders' own
+    comparison (:func:`~dsql_migrator.core.cdc_kafka_prep.offset_already_at_or_past`:
+    numeric binlog sequence, then position). A newer seed, or one judged against an unknown
+    deployed watermark, is a seeded start. PostgreSQL is unchanged.
     """
     if not getattr(migration_state, "cdc_has_committed_offset", False):
         return False
@@ -3955,7 +4085,15 @@ def cdc_start_resumes(migration_state, watermark, source_type) -> bool:
     p = getattr(watermark, "binlog_position", None) if watermark is not None else None
     if not f or p is None:
         return True
-    return (str(f), str(int(p))) == getattr(migration_state, "cdc_deployed_watermark", None)
+    deployed = getattr(migration_state, "cdc_deployed_watermark", None)
+    if not deployed:
+        return False
+    try:
+        return offset_already_at_or_past(
+            {"file": deployed[0], "pos": deployed[1]}, {"file": f, "pos": p}
+        )
+    except (TypeError, ValueError):  # a malformed deployed parameter: not provably a resume
+        return False
 
 
 def pg_start_resnapshots(watermark, *, source_type, start_mode: str) -> bool:
@@ -4258,8 +4396,9 @@ async def _open_cdc_start_dialog(
       connector's credentials secret from the in-memory source password (not
       restored after a restart) and needs a live target. Missing either is a hard
       block: the user reconnects first.
-    * :func:`_probe_binlog_resume_gap` -- the Full Load watermark's binary log must
-      still exist on the source, or the gapless hand-off is impossible. This one is
+    * :func:`_probe_binlog_resume_gap` -- the binary log of the start point Start seeds
+      (the Full Load watermark's, or a Manual one's) must still exist on the source, or
+      streaming cannot begin there. This one is
       a **warning**, not a block: starting with a gap can be a deliberate choice,
       and the check degrades to silence whenever the answer is unknown.
 
@@ -4352,7 +4491,8 @@ async def _open_cdc_start_dialog(
                 ui,
                 tone="warning",
                 icon="history_toggle_off",
-                header="The snapshot's binary log has been purged",
+                # "start point", not "snapshot": the probed log may be a Manual one.
+                header="The start point's binary log has been purged",
                 body=binlog_gap,
             )
         _render_cdc_overlay_changes(ui, overlay_changes)
@@ -5109,8 +5249,11 @@ def _start_cdc_deploy(
     # Settle a restored pre-overlay session's exclusions before any set is read.
     classify_restored_exclusions(migration_state, job_manager)
     job = _current_job(job_manager, migration_state.job_id)
+    # The JOB watermark: it decides the table set, the FK probe, the PostgreSQL gates and
+    # the ops window. What the seeder is OFFERED is the seed below (MySQL: a Manual binlog
+    # point beats it -- the card and the preview already show that point as the start).
     watermark = _cdc_watermark(job)
-    override = migration_state.cdc_start_override()
+    seed, seed_origin = _cdc_start_seed(migration_state, watermark, _cdc_source_type(session))
     tables_for_config = _cdc_tables_for_config(migration_state, inventory, watermark)
     # ONE computation for the preview, Start and Deploy (cdc_capture_exclusions): the
     # EFFECTIVE set (key columns dropped) plus the STORED generated columns of the captured
@@ -5299,10 +5442,14 @@ def _start_cdc_deploy(
                 ),
             )
             return
+    # MySQL: the connector config is built from the SEED, so snapshot.mode (recovery only
+    # when an offset is seeded) and the start coordinate agree with what is seeded by
+    # construction. PostgreSQL: the job watermark exactly as before.
+    _config_wm = watermark if _cdc_source_type(session) is SourceType.POSTGRES else seed
     source_config = dispatch_source_config(
         _cdc_source_type(session),
         tables_for_config,
-        watermark if watermark is not None else _sentinel_watermark(),
+        _config_wm if _config_wm is not None else _sentinel_watermark(),
         database=_cdc_source_database(session),
         stack_name=migration_state.cdc_stack_name,
         column_exclude_list=exclude_list,
@@ -5432,10 +5579,12 @@ def _start_cdc_deploy(
             params=params,
             deployer=deployer,
             on_log=migration_state.append_cdc_deploy_log,
-            # Drives the automatic gapless offset seed (Property 11). When the job
-            # has no watermark (or it lacks binlog coords) the seeder is not
-            # deployed and the source connector starts from the current binlog.
-            watermark=watermark,
+            # The start offset offered to the seeder (_cdc_start_seed): the Full Load
+            # watermark (gapless, Property 11) or the Manual binlog point. With no
+            # seedable point there is no seed and the source connector starts from the
+            # current binlog (or its committed offset on a restart).
+            watermark=seed,
+            seed_origin=seed_origin,
             template_body=template_body,
             seed_mode=seed_mode,
             # PostgreSQL only: lets the Start repair a publication DEBEZIUM created, which
@@ -5459,11 +5608,12 @@ def _start_cdc_deploy(
     # recorded that CDC was started but not FROM WHERE.
     _detail = _cdc_start_detail(
         stack_name,
-        watermark,
+        seed,
         mode=mode,
         source_type=_cdc_source_type(session),
         force_snapshot=_force_initial_snapshot,
-        resumes=cdc_start_resumes(migration_state, watermark, _cdc_source_type(session)),
+        resumes=cdc_start_resumes(migration_state, seed, _cdc_source_type(session)),
+        seed_origin=seed_origin,
         # The operator's (effective) exclusions only -- "oversized LOB" in the detail; the
         # generated columns the capture also drops are not the operator's choice.
         exclusions=effective_lob_exclusions(migration_state, inventory),

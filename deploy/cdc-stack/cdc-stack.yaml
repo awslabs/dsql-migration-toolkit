@@ -639,11 +639,12 @@ Parameters:
       Region for IAM token generation (sink) and Glue converters. Defaults to
       the stack region when left empty.
 
-  # --- Full Load -> CDC handoff watermark (drives the offset seeder) ----------
-  # The binlog coordinates the Full Load bulk loader captured. Passed to the
-  # in-VPC offset-seeder Lambda so the source connector resumes streaming from
-  # exactly the snapshot end point (gapless, Property 11). Empty when no Full Load
-  # watermark is available -> the seeder is not deployed (SeedOffset condition).
+  # --- CDC start offset (drives the offset seeder) ----------------------------
+  # The binlog coordinates Start CDC offers the offset seeder: the Full Load
+  # watermark (the source connector resumes from exactly the snapshot end point --
+  # gapless, Property 11) or the operator's Manual binlog file:position. Empty when
+  # neither is available -> CdcStartPrepResource only pre-creates the topics and
+  # seeds no offset. A committed offset already at/past it is never rewound.
   WatermarkBinlogFile:
     Type: String
     Default: ""
@@ -1726,12 +1727,12 @@ Resources:
   # --- Debezium MySQL source connector ----------------------------------------
   # Configuration mirrors CdcPipelineOrchestrator.build_source_config:
   # table.include.list = selected tables, snapshot.mode = Ref: SnapshotMode
-  # (schema_only for fresh connectors / CDC-only; recovery only when the offset
-  # seeder pre-populated schema-history during the gapless Full-Load path — see
-  # below). The start offset (GTID / binlog file:position from the Full Load
-  # watermark) is seeded by the control plane into the connect-offsets topic for a
-  # gapless handoff (Property 11) — it is not a static connector config key, so it
-  # is documented here rather than set inline.
+  # (schema_only when no offset is seeded; recovery when a start offset is seeded
+  # — see below). The start offset (the binlog file:position of the Full Load
+  # watermark, or of the operator's Manual start point) is seeded by the control
+  # plane into the connect-offsets topic (gapless from a Full Load, Property 11) —
+  # it is not a static connector config key, so it is documented here rather than
+  # set inline.
   DebeziumSourceConnector:
     Type: AWS::KafkaConnect::Connector
     Condition: DeployMysqlSource

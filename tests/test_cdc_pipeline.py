@@ -149,32 +149,74 @@ def test_build_source_config_passes_column_exclude_list() -> None:
     ]
 
 
-def test_build_source_config_resume_override_takes_precedence() -> None:
-    # A manual start position overrides the watermark coordinates entirely.
+def test_build_source_config_gtid_only_override_stays_schema_only() -> None:
+    # A GTID-only manual start position overrides the watermark coordinates entirely,
+    # and seeds NOTHING (both seeders key the offset on binlog file:pos) -- so the config
+    # must not pretend otherwise: schema_only, no start coordinates at all.
     override = CdcResumePoint(
         gtid_executed="99999999-1111-2222-3333-444444444444:1-9",
     )
     config = CdcPipelineOrchestrator().build_source_config(
         "src", _tables(), _watermark(), resume_override=override
     )
-    assert config.start_gtid == "99999999-1111-2222-3333-444444444444:1-9"
     # Watermark's binlog coords are NOT used when an override is supplied.
     assert config.start_binlog_file is None
     assert config.start_binlog_pos is None
-    # Manual override path uses schema_only (no pre-existing schema-history topic).
+    # No GTID is reported for an override: the preview prints exactly what is seeded.
+    assert config.start_gtid is None
     assert config.snapshot_mode == "schema_only"
 
 
-def test_build_source_config_resume_override_binlog() -> None:
-    override = CdcResumePoint(binlog_file="mysql-bin.000999", binlog_position=12345)
+def test_build_source_config_binlog_override_selects_recovery() -> None:
+    # A Manual binlog file:position IS seeded into connect-offsets (cdc_seed_watermark),
+    # so the connector takes the resume path and needs recovery -- schema_only with a
+    # seeded offset dies at task start ("The db history topic is missing").
+    override = CdcResumePoint(
+        binlog_file="mysql-bin.000999",
+        binlog_position=12345,
+        gtid_executed="99999999-1111-2222-3333-444444444444:1-9",
+    )
     config = CdcPipelineOrchestrator().build_source_config(
         "src", _tables(), _watermark(), resume_override=override
     )
     assert config.start_binlog_file == "mysql-bin.000999"
     assert config.start_binlog_pos == 12345
+    # Only file:pos is seeded, so the override's GTID is not reported either.
     assert config.start_gtid is None
-    # Manual override -> schema_only (brand-new connector, no schema-history).
-    assert config.snapshot_mode == "schema_only"
+    assert config.snapshot_mode == "recovery"
+    # Also with the sentinel (no Full Load) watermark a CDC-only Manual start uses.
+    bare = CdcPipelineOrchestrator().build_source_config(
+        "src", _tables(),
+        Watermark(snapshot_timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc)),
+        resume_override=override,
+    )
+    assert bare.snapshot_mode == "recovery"
+
+
+def test_cdc_seed_watermark_precedence() -> None:
+    from dsql_migrator.core.cdc import cdc_seed_watermark
+
+    now = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
+    job = _watermark()
+    # Automatic (no Manual point): the Full Load job watermark, unchanged -- even None.
+    assert cdc_seed_watermark(job, None, now=now) == (job, "full_load")
+    assert cdc_seed_watermark(None, None, now=now) == (None, "full_load")
+    # A usable Manual point beats the job watermark; file:pos only, stamped `now`.
+    manual = CdcResumePoint(
+        binlog_file="mysql-bin.000042", binlog_position=4, gtid_executed="u:1-3"
+    )
+    for job_wm in (job, None):
+        seed, origin = cdc_seed_watermark(job_wm, manual, now=now)
+        assert origin == "manual"
+        assert (seed.binlog_file, seed.binlog_position) == ("mysql-bin.000042", 4)
+        assert seed.gtid_executed is None
+        assert seed.snapshot_timestamp == now
+    # A GTID set alone cannot seed: no fallback to the job watermark or to "now".
+    gtid_only = CdcResumePoint(gtid_executed="u:1-3")
+    assert cdc_seed_watermark(job, gtid_only, now=now) == (None, "manual_unseedable")
+    # A file without a position is not a coordinate either.
+    half = CdcResumePoint(binlog_file="mysql-bin.000042")
+    assert cdc_seed_watermark(job, half, now=now) == (None, "manual_unseedable")
 
 
 def test_build_source_config_none_override_uses_watermark() -> None:

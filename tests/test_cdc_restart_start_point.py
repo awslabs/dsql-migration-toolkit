@@ -112,6 +112,128 @@ def test_cdc_start_resumes_truth_table():
     assert f(_state(deployed=("mysql-bin-changelog.000005", "4")), _WM, my) is False
     # PostgreSQL is unchanged.
     assert f(_state(), _WM, SourceType.POSTGRES) is True
+    # The seeders' own at/past comparison, not string equality: a seed OLDER than the
+    # watermark the stack last started from (e.g. a Manual point) is skipped by the
+    # no-clobber guard -> resume. Same file: position decides.
+    assert f(_state(deployed=("mysql-bin-changelog.000009", "4")), _WM, my) is True
+    same_file = ("mysql-bin-changelog.000007", "108063012")
+    assert f(_state(deployed=same_file), _WM, my) is True  # seed 1 byte earlier
+    assert f(_state(deployed=("mysql-bin-changelog.000007", "108063010")), _WM, my) is False
+    # Numeric binlog sequence across the .999999 -> .1000000 width rollover.
+    rolled = Watermark(snapshot_timestamp=_NOW, binlog_file="mysql-bin.999999",
+                       binlog_position=4)
+    assert f(_state(deployed=("mysql-bin.1000000", "4")), rolled, my) is True
+    # A malformed deployed parameter is not provably a resume.
+    assert f(_state(deployed=("mysql-bin-changelog.000007", "x")), _WM, my) is False
+
+
+_MANUAL_OLD = ("mysql-bin-changelog.000005", 4)
+
+
+def _manual_state(point, **kw):
+    state = _state(**kw)
+    state.set_cdc_start_mode("manual")
+    if isinstance(point, tuple):
+        state.set_cdc_start_position(binlog_file=point[0], binlog_pos=point[1])
+    else:
+        state.set_cdc_start_position(gtid=point)
+    return state
+
+
+def _card(state, job=None, inventory=None):
+    ui = _CardUi()
+    _cdc_ui._render_cdc_source_config_card(
+        ui, state, _JM(job or _job()), lambda: None, inventory=inventory,
+        migration_type=MigrationType.CDC_ONLY, session=None,
+    )
+    return ui
+
+
+def test_a_manual_point_before_where_the_stack_streamed_is_disclosed_as_not_applied():
+    # Committed offset + a Manual point at/before the watermark the stack started from:
+    # the seeder (no-clobber) skips it and streaming resumes. The card must say the entry
+    # is NOT applied -- and how to replay from it -- instead of letting it look honoured.
+    state = _manual_state(
+        _MANUAL_OLD, deployed=("mysql-bin-changelog.000007", "108063011")
+    )
+    assert _cdc_ui.cdc_start_resumes(
+        state, _cdc_ui._cdc_start_seed(state, _WM, SourceType.MYSQL)[0], SourceType.MYSQL
+    ) is True
+    blob = " ".join(_card(state).texts)
+    assert "Resuming from the last streamed position" in blob
+    assert (
+        "Your manual point mysql-bin-changelog.000005:4 is earlier than where this stack "
+        "already streamed and is not applied."
+    ) in blob
+    assert "delete the CDC infrastructure and deploy again" in blob
+    ui = _RecordingUi()
+    _cdc_ui._render_cdc_start_button(ui, state, _JM(_job()), lambda: None,
+                                     inventory=None, session=None)
+    assert "Ready to resume CDC" in " ".join(ui.texts)
+
+
+def test_a_manual_point_on_a_stack_whose_start_is_unknown_is_applied_only_if_past():
+    # Committed offset but no recorded deployed watermark (a CDC-only history): the point
+    # is offered, and applied only if it is past where streaming already reached.
+    state = _manual_state(("mysql-bin-changelog.000009", 4))
+    blob = " ".join(_card(state).texts)
+    assert "Resuming from the last streamed position" not in blob
+    assert "is applied only if it is past the position this stack already streamed" in blob
+    assert "Start point set — binlog mysql-bin-changelog.000009:4" in blob
+
+
+def test_a_gtid_only_manual_entry_is_not_a_start_point():
+    # A GTID set seeds nothing (the offset is keyed on file:pos): the card must not say
+    # "Start point set", must say why, and Start must stay disabled -- even though a
+    # usable Full Load watermark exists (Manual never falls back to it).
+    state = _manual_state(
+        "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-100", committed=False
+    )
+    card = _card(state)
+    blob = " ".join(card.texts)
+    assert "Start point set" not in blob
+    assert "Action needed" in blob
+    assert (
+        "A GTID set alone cannot set where this pipeline starts; it streams by binlog "
+        "file:position (Fetch current position fills it)."
+    ) in blob
+    assert "(preferred)" not in blob
+
+    from tests.test_ui_data_migration import _StartButtonUi
+
+    button = _StartButtonUi()
+    _cdc_ui._render_cdc_start_button(button, state, _JM(_job()), lambda: None,
+                                     inventory=None, session=None)
+    assert button.start_disabled is True
+    assert "Set the CDC start point above first." in " ".join(button.texts)
+
+    # The same state with a binlog file:position is a start point, and Start is enabled.
+    from dsql_migrator.core.models import TableSelection
+    from tests.test_ui_data_migration import _inventory
+
+    state.set_cdc_start_position(binlog_file="mysql-bin-changelog.000009", binlog_pos=4)
+    state.set_selection(TableSelection(selected_tables=["orders"]))
+    blob = " ".join(_card(state, inventory=_inventory()).texts)
+    assert "Start point set — binlog mysql-bin-changelog.000009:4" in blob
+    assert "binlog (start) = mysql-bin-changelog.000009:4" in blob  # the preview agrees
+    assert "snapshot.mode = recovery" in blob  # a seeded offset needs recovery
+    button = _StartButtonUi()
+    _cdc_ui._render_cdc_start_button(button, state, _JM(_job()), lambda: None,
+                                     inventory=None, session=None)
+    assert button.start_disabled is False
+
+
+def test_the_locked_badge_does_not_promise_a_stop_can_rewind_the_start_point():
+    ui = _CardUi()
+    _cdc_ui._render_cdc_start_point_card(
+        ui, _state(), lambda: None, wm_resume=None, wm_usable=False,
+        effective_resume=None, mode="auto", locked=True, session=None,
+        source_type=SourceType.MYSQL,
+    )
+    tips = " ".join(ui.tooltips)
+    assert "To change it, stop CDC first." not in tips
+    assert "never rewinds" in tips
+    assert "delete the CDC infrastructure and deploy again" in tips
 
 
 def test_start_button_after_a_new_full_load_is_a_watermark_start_not_a_resume():
@@ -165,3 +287,23 @@ def test_start_detail_on_a_restart_names_the_committed_position():
     assert "gapless from the Full Load watermark" in d(
         "dsql-cdc-x", _WM, mode="auto", source_type=SourceType.MYSQL
     )
+
+
+def test_start_detail_names_a_manual_start_point():
+    d = _cdc_ui._cdc_start_detail
+    manual = Watermark(snapshot_timestamp=_NOW, binlog_file="mysql-bin.000042",
+                       binlog_position=1234)
+    line = d("dsql-cdc-x", manual, mode="manual", source_type=SourceType.MYSQL,
+             seed_origin="manual")
+    assert (
+        "start point binlog mysql-bin.000042:1234 (Manual start point; changes from this "
+        "position on are replicated)"
+    ) in line
+    assert "gapless from the Full Load watermark" not in line
+    assert "CURRENT position" not in line
+    # A GTID-only Manual entry seeds nothing: say so, not "there is no Full Load watermark".
+    none = d("dsql-cdc-x", None, mode="manual", source_type=SourceType.MYSQL,
+             seed_origin="manual_unseedable")
+    assert "CURRENT position" in none
+    assert "no binlog file:position to seed" in none
+    assert "there is no Full Load watermark" not in none

@@ -763,7 +763,69 @@ def test_start_passes_watermark_params_on_single_pass() -> None:
     assert only["WatermarkBinlogPos"] == "15324"
     assert only["WatermarkGtids"] == "UUID:1-9"
     assert only["DeploySink"] == "true"
-    assert any("Seeding gapless CDC start offset" in m for m in captured)
+    # Neutral: the seeder may legitimately skip it (no-clobber), so no "gapless" claim.
+    offered = [m for m in captured if "Offering CDC start offset" in m]
+    assert offered and "mysql-bin.000042:15324 (Full Load watermark)" in offered[0]
+    assert "not applied if the committed offset is already at/past it" in offered[0]
+    assert not any("Seeding gapless" in m for m in captured)
+
+
+def _manual_seed():
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.cdc import CdcResumePoint, cdc_seed_watermark
+
+    seed, origin = cdc_seed_watermark(
+        _watermark(),  # a NEWER job watermark the Manual point must beat
+        CdcResumePoint(binlog_file="mysql-bin.000040", binlog_position=4),
+        now=datetime(2026, 9, 30, tzinfo=timezone.utc),
+    )
+    assert origin == "manual"
+    return seed
+
+
+def test_start_passes_a_manual_seed_to_the_lambda_seeder_params() -> None:
+    handle = _FakeHandle()
+    deployer = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]}
+    )
+    captured: list[str] = []
+    run_cdc_start(
+        handle, stack_name=STACK, params=_start_params(), deployer=deployer,
+        on_log=lambda ts, msg: captured.append(msg), sleep=lambda _s: None,
+        watermark=_manual_seed(), seed_origin="manual",
+        connector_timeout_seconds=5.0, poll_interval_seconds=0.0,
+    )
+    only = dict(deployer.updates[0])
+    assert only["WatermarkBinlogFile"] == "mysql-bin.000040"
+    assert only["WatermarkBinlogPos"] == "4"
+    assert only["WatermarkGtids"] == ""
+    assert any(
+        "Offering CDC start offset mysql-bin.000040:4 (Manual start point)" in m
+        for m in captured
+    )
+
+
+def test_start_passes_a_manual_seed_to_the_external_seed_fn() -> None:
+    handle = _FakeHandle()
+    deployer = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]}
+    )
+    seed_calls: list[dict] = []
+
+    def _seed_fn(**kwargs):
+        seed_calls.append(kwargs)
+        return "true"
+
+    run_cdc_start(
+        handle, stack_name=STACK, params=_start_params(), deployer=deployer,
+        on_log=lambda ts, msg: None, sleep=lambda _s: None,
+        watermark=_manual_seed(), seed_origin="manual",
+        connector_timeout_seconds=5.0, poll_interval_seconds=0.0,
+        seed_mode="external", seed_fn=_seed_fn,
+    )
+    wm = seed_calls[0]["watermark"]
+    assert (wm.binlog_file, wm.binlog_position) == ("mysql-bin.000040", 4)
 
 
 def test_start_watermark_only_change_does_not_bounce_running_source() -> None:

@@ -380,7 +380,10 @@ def list_binary_logs(connection: _Connection) -> Optional[list[str]]:
 
 
 def binlog_resume_gap_reason(
-    watermark_file: Optional[str], retained: Optional[list[str]]
+    watermark_file: Optional[str],
+    retained: Optional[list[str]],
+    *,
+    manual: bool = False,
 ) -> Optional[str]:
     """Why a gapless CDC resume from ``watermark_file`` is impossible, or ``None``.
 
@@ -396,12 +399,22 @@ def binlog_resume_gap_reason(
     file"), so checking it up front turns a dead end into an actionable message.
 
     ``retained`` is ``None`` when the check could not run (statement unavailable /
-    privilege missing) -- treated as "unknown", which never blocks. Pure.
+    privilege missing) -- treated as "unknown", which never blocks. ``manual`` means
+    ``watermark_file`` is an operator's Manual start point, not a Full Load
+    watermark, so the reason names that point and its remedy instead. Pure.
     """
     if not watermark_file or retained is None or not retained:
         return None
     if watermark_file in retained:
         return None
+    if manual:
+        return (
+            f"The Manual start point is in binary log '{watermark_file}', which the "
+            f"source no longer retains (oldest kept: '{retained[0]}'), so CDC cannot "
+            "start from it — the source connector fails to find that log. Enter a "
+            "position in a log the source still retains (Fetch current position fills "
+            "the current one); changes before that position are not replicated."
+        )
     return (
         f"The Full Load watermark points at binary log '{watermark_file}', which the "
         f"source no longer retains (oldest kept: '{retained[0]}'). A gapless resume "

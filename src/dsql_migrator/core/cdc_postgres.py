@@ -139,7 +139,7 @@ def build_pg_source_config(
 
     ``force_initial_snapshot`` forces ``initial`` even when a gapless slot LSN is
     present -- the PostgreSQL analog of the operator's **Manual** start choice. Unlike
-    MySQL (whose manual GTID/binlog offset is seeded into ``connect-offsets``), Debezium
+    MySQL (whose manual binlog file:position is seeded into ``connect-offsets``), Debezium
     PostgreSQL resumes only from the replication slot's position and cannot be told to
     start from an arbitrary WAL LSN, so the honest manual option is to re-snapshot all
     tables from scratch (``initial``) instead of using the gapless slot. There is no
@@ -410,7 +410,7 @@ def dispatch_source_config(
     with no Full Load in this session). ``force_initial_snapshot`` (the PostgreSQL Manual
     start choice = re-snapshot) is honored only on the PG path. MySQL -> the orchestrator's
     ``build_source_config`` exactly as before (byte-identical; the flag does not apply --
-    MySQL's manual start is a seeded ``resume_override``).
+    MySQL's manual start is a seeded binlog file:position ``resume_override``).
 
     ``publication.autocreate.mode`` is NOT a parameter here: it is DERIVED from the snapshot
     mode inside :func:`build_pg_source_config` (see :func:`pg_publication_autocreate_mode`).
