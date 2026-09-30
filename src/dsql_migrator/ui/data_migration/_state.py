@@ -323,6 +323,11 @@ class DataMigrationState:
         # The binlog (file, pos) the stack's LAST Start offered the offset seeder, from the
         # same phase probe (Stop carries Watermark* forward). None: no stack / no seed.
         self.cdc_deployed_watermark: Optional[tuple[str, str]] = None
+        # The LATEST binlog (file, pos) a Start offered the seeder on this stack. A Start
+        # that fails after seeding leaves it in the offsets topic, and the seeder never
+        # rewinds -- so a later, earlier start point would silently not apply.
+        # Transient; cleared when the stack is gone.
+        self.cdc_offered_seed: Optional[tuple[str, int]] = None
         self.cdc_activity: Optional["CdcActivitySummary"] = None
         # Per-table source/target row counts for the migration-status view, fetched
         # on demand (a direct COUNT(*) on each side -- read-only but adds source
@@ -946,6 +951,8 @@ class DataMigrationState:
             self.cdc_stack_phase_status = status
             self.cdc_stack_phase_checked = True
             self.cdc_probe_error = None  # a successful probe clears any prior failure
+            if phase == "absent":
+                self.cdc_offered_seed = None  # a new stack gets a new offsets topic
 
     def set_cdc_probe_error(self, message: Optional[str]) -> None:
         """Record why the read-only CDC-state probe failed (or clear it with None).
@@ -1007,6 +1014,7 @@ class DataMigrationState:
             self.cdc_deployed_slot_name = None
             self.cdc_deployed_column_exclude_list = None
             self.cdc_deployed_watermark = None
+            self.cdc_offered_seed = None
             # Applied-ops + replication-lag metrics are per-stack too; drop them so the
             # adopted stack's poll repopulates rather than showing the prior stack's.
             self.cdc_applied_ops_by_table = {}
@@ -1092,6 +1100,21 @@ class DataMigrationState:
         """Record the DEPLOYED stack's ColumnExcludeList (``None``: no stack/param)."""
         with self._lock:
             self.cdc_deployed_column_exclude_list = None if value is None else str(value)
+
+    def note_cdc_offered_seed(self, seed) -> None:
+        """Record a seed a Start offers the seeder, keeping the LATEST one (binlog order)."""
+        from dsql_migrator.core.cdc_kafka_prep import offset_already_at_or_past
+
+        f = getattr(seed, "binlog_file", None)
+        pos = getattr(seed, "binlog_position", None)
+        if not f or pos is None:
+            return
+        with self._lock:
+            cur = self.cdc_offered_seed
+            if cur is None or offset_already_at_or_past(
+                {"file": f, "pos": int(pos)}, {"file": cur[0], "pos": int(cur[1])}
+            ):
+                self.cdc_offered_seed = (str(f), int(pos))
 
     def set_cdc_deployed_watermark(self, value: Optional[tuple[str, str]]) -> None:
         """Record the binlog (file, pos) the deployed stack was last started from."""

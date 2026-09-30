@@ -307,3 +307,127 @@ def test_start_detail_names_a_manual_start_point():
     assert "CURRENT position" in none
     assert "no binlog file:position to seed" in none
     assert "there is no Full Load watermark" not in none
+
+
+# --- review of 824a208 ------------------------------------------------------------
+
+
+def _card_text(state, job=None):
+    ui = _CardUi()
+    _cdc_ui._render_cdc_source_config_card(
+        ui, state, _JM(job or _job()), lambda: None, inventory=None,
+        migration_type=MigrationType.FULL_LOAD_AND_CDC, session=None,
+    )
+    return " ".join(ui.texts)
+
+
+def test_a_manual_point_after_the_full_load_watermark_says_the_window_is_not_replicated():
+    state = _state(committed=False)
+    state.set_cdc_start_mode("manual")
+    state.set_cdc_start_position(binlog_file="mysql-bin-changelog.000009", binlog_pos=4)
+    blob = _card_text(state)
+    assert "NOT replicated" in blob
+    assert "mysql-bin-changelog.000007:108063011" in blob and "mysql-bin-changelog.000009:4" in blob
+
+
+def test_a_manual_point_before_the_full_load_watermark_says_changes_are_re_applied():
+    state = _state(committed=False)
+    state.set_cdc_start_mode("manual")
+    state.set_cdc_start_position(binlog_file="mysql-bin-changelog.000005", binlog_pos=4)
+    blob = _card_text(state)
+    assert "re-applied" in blob and "NOT replicated" not in blob
+
+
+def test_a_manual_point_equal_to_the_watermark_needs_no_disclosure():
+    state = _state(committed=False)
+    state.set_cdc_start_mode("manual")
+    state.set_cdc_start_position(binlog_file="mysql-bin-changelog.000007", binlog_pos=108063011)
+    blob = _card_text(state)
+    assert "NOT replicated" not in blob and "re-applied" not in blob
+
+
+def test_the_mysql_manual_option_asks_for_a_binlog_position_not_a_gtid():
+    state = _state(committed=False)
+    blob = _card_text(state)
+    assert "Manual — enter a binlog file:position" in blob
+    assert "Manual — enter a GTID or binlog position" not in blob
+
+
+def test_a_manual_point_on_a_streamed_stack_names_the_skipped_window():
+    state = _state(committed=True)  # streamed; its start watermark unknown
+    state.set_cdc_start_mode("manual")
+    state.set_cdc_start_position(binlog_file="mysql-bin-changelog.000009", binlog_pos=4)
+    blob = _card_text(state, job=SimpleNamespace(watermark=None, status="DONE"))
+    assert "past the position this stack already streamed to" in blob
+    assert "not replicated" in blob.lower()
+
+
+def test_a_new_full_load_resets_a_stale_manual_start_point():
+    """A Manual point entered before a Full load + CDC run's Full Load no longer applies:
+    the new watermark is the gapless handoff (review of 824a208: it silently beat it)."""
+    from dsql_migrator.ui.data_migration import reset_stale_manual_start_point
+
+    logged = []
+    state = DataMigrationState()
+    state.set_cdc_start_mode("manual")
+    state.set_cdc_start_position(binlog_file="mysql-bin-changelog.000003", binlog_pos=154)
+    assert reset_stale_manual_start_point(state, MigrationType.FULL_LOAD_AND_CDC, SourceType.MYSQL,
+                                          log=lambda **kw: logged.append(kw)) is True
+    assert state.cdc_start_mode() == "auto" and logged and "mysql-bin-changelog.000003:154" in logged[0]["detail"]
+    # Untouched: auto already, a Full-load-only run, and PostgreSQL (Manual = re-snapshot there).
+    for mode, mtype, st in (("auto", MigrationType.FULL_LOAD_AND_CDC, SourceType.MYSQL),
+                            ("manual", MigrationType.FULL_LOAD_ONLY, SourceType.MYSQL),
+                            ("manual", MigrationType.FULL_LOAD_AND_CDC, SourceType.POSTGRES)):
+        s = DataMigrationState()
+        s.set_cdc_start_mode(mode)
+        assert reset_stale_manual_start_point(s, mtype, st, log=lambda **kw: None) is False
+        assert s.cdc_start_mode() == mode
+
+
+def test_the_full_load_start_and_retry_reset_a_stale_manual_point() -> None:
+    import inspect
+
+    import dsql_migrator.ui.data_migration as dm
+
+    src = inspect.getsource(dm.build_data_migration_screen)
+    assert src.count("reset_stale_manual_start_point(") >= 2
+
+
+def test_a_start_earlier_than_a_seed_a_failed_start_left_behind_is_refused():
+    """Review of 824a208 (high): a first Start that FAILED after seeding S leaves S in the
+    offsets topic, and the seeder never rewinds -- so a later, EARLIER start point would be
+    silently not applied (the stack never streamed, so the card treats it as a first start)."""
+    from dsql_migrator.ui.data_migration._cdc_ui import seed_refused_by_an_earlier_offer
+
+    state = _state(committed=False)
+    state.note_cdc_offered_seed(Watermark(snapshot_timestamp=_NOW, binlog_file="mysql-bin.000120", binlog_position=999))
+    earlier = Watermark(snapshot_timestamp=_NOW, binlog_file="mysql-bin.000100", binlog_position=4)
+    later = Watermark(snapshot_timestamp=_NOW, binlog_file="mysql-bin.000130", binlog_position=4)
+    same = Watermark(snapshot_timestamp=_NOW, binlog_file="mysql-bin.000120", binlog_position=999)
+    reason = seed_refused_by_an_earlier_offer(state, earlier, SourceType.MYSQL)
+    assert reason and "mysql-bin.000120:999" in reason and "delete the CDC infrastructure" in reason
+    assert seed_refused_by_an_earlier_offer(state, later, SourceType.MYSQL) is None
+    assert seed_refused_by_an_earlier_offer(state, same, SourceType.MYSQL) is None
+    assert seed_refused_by_an_earlier_offer(state, earlier, SourceType.POSTGRES) is None
+    # once the stack streamed, the committed-offset logic (cdc_start_resumes) decides
+    state.set_cdc_has_committed_offset(True)
+    assert seed_refused_by_an_earlier_offer(state, earlier, SourceType.MYSQL) is None
+
+
+def test_the_offered_seed_keeps_the_latest_and_clears_with_the_stack():
+    state = DataMigrationState()
+    a = Watermark(snapshot_timestamp=_NOW, binlog_file="mysql-bin.000120", binlog_position=999)
+    b = Watermark(snapshot_timestamp=_NOW, binlog_file="mysql-bin.000100", binlog_position=4)
+    state.note_cdc_offered_seed(a)
+    state.note_cdc_offered_seed(b)
+    assert state.cdc_offered_seed == ("mysql-bin.000120", 999)
+    state.set_cdc_stack_phase("absent")
+    assert state.cdc_offered_seed is None
+
+
+def test_start_cdc_checks_and_records_the_offered_seed():
+    import inspect
+
+    src = inspect.getsource(_cdc_ui._start_cdc_deploy)
+    assert "seed_refused_by_an_earlier_offer(" in src and "note_cdc_offered_seed(" in src
+    assert src.index("seed_refused_by_an_earlier_offer(") < src.index("note_cdc_offered_seed(")

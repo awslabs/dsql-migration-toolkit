@@ -941,6 +941,40 @@ def _estimate_cdc_table_rows(session, table_names):
         return None
 
 
+def _render_manual_vs_watermark_notice(ui, manual_point, wm_resume) -> None:
+    """A Manual binlog point REPLACES the gapless Full Load watermark as the start offset:
+    say which changes that loses (after it) or re-applies (before it). Nothing when equal."""
+    m = {"file": manual_point.binlog_file, "pos": int(manual_point.binlog_position)}
+    w = {"file": wm_resume.binlog_file, "pos": int(wm_resume.binlog_position)}
+    if m == w:
+        return
+    m_txt = f"{m['file']}:{m['pos']}"
+    w_txt = f"{w['file']}:{w['pos']}"
+    if offset_already_at_or_past(m, w):
+        render_notice(
+            ui,
+            tone="warning",
+            header="Your manual point skips part of the stream",
+            body=(
+                f"The Full Load snapshot ends at {w_txt}; streaming from your manual point "
+                f"{m_txt} means the changes between them are NOT replicated. Choose "
+                "Automatic for the gapless handoff."
+            ),
+        )
+    else:
+        render_notice(
+            ui,
+            tone="info",
+            header="Your manual point is before the Full Load snapshot",
+            body=(
+                f"Streaming from {m_txt} re-reads the changes up to the snapshot's end "
+                f"({w_txt}): they are re-applied on top of the loaded rows (idempotent "
+                "writes, so the result converges). Automatic starts exactly at the "
+                "snapshot's end."
+            ),
+        )
+
+
 def _render_cdc_start_point_card(
     ui,
     migration_state,
@@ -1131,7 +1165,7 @@ def _render_cdc_start_point_card(
                 )
             else:
                 auto_label = "Automatic — needs a Full Load watermark (unavailable)"
-            manual_label = "Manual — enter a GTID or binlog position"
+            manual_label = "Manual — enter a binlog file:position"
 
         def _on_mode(value: str) -> None:
             migration_state.set_cdc_start_mode(value)
@@ -1220,10 +1254,20 @@ def _render_cdc_start_point_card(
                         f"Your manual point {manual_point.binlog_file}:"
                         f"{manual_point.binlog_position} is applied only if it is past "
                         "the position this stack already streamed to — Start never "
-                        "rewinds a committed position. To replay from an earlier point, "
-                        "delete the CDC infrastructure and deploy again."
+                        "rewinds a committed position. If it is past it, the changes "
+                        "between that position and your point are not replicated. To "
+                        "replay from an earlier point, delete the CDC infrastructure and "
+                        "deploy again."
                     ),
                 )
+            elif (
+                manual_seedable
+                and not locked
+                and wm_usable
+                and wm_resume is not None
+                and wm_resume.can_seed_offset()
+            ):
+                _render_manual_vs_watermark_notice(ui, manual_point, wm_resume)
             _render_cdc_manual_inputs(
                 ui, migration_state, refresh, locked=locked, session=session,
             )
@@ -4069,6 +4113,32 @@ def _cdc_watermark(job):
     return wm
 
 
+def seed_refused_by_an_earlier_offer(migration_state, seed, source_type) -> Optional[str]:
+    """Why a MySQL Start must refuse ``seed``: it is EARLIER than a seed an earlier Start
+    already offered on this stack, which never streamed (a Start that failed after seeding).
+    The seeder never rewinds, so that seed stays and this one would silently not apply.
+    ``None`` otherwise (and always once the stack streamed: cdc_start_resumes decides)."""
+    if source_type is SourceType.POSTGRES:
+        return None
+    if getattr(migration_state, "cdc_has_committed_offset", False):
+        return None
+    offered = getattr(migration_state, "cdc_offered_seed", None)
+    f = getattr(seed, "binlog_file", None)
+    pos = getattr(seed, "binlog_position", None)
+    if not offered or not f or pos is None:
+        return None
+    if offset_already_at_or_past({"file": f, "pos": int(pos)}, {"file": offered[0], "pos": int(offered[1])}):
+        return None
+    return (
+        f"An earlier Start already offered the start offset {offered[0]}:{offered[1]} to "
+        "this stack's seeder and did not complete; that offset stays seeded and the seeder "
+        f"never rewinds, so starting from {f}:{int(pos)} would silently not apply -- the "
+        "changes in between would be skipped. Start from that offset or later, or delete "
+        "the CDC infrastructure and deploy again to start earlier. No connectors were "
+        "changed."
+    )
+
+
 def cdc_start_resumes(migration_state, watermark, source_type) -> bool:
     """Will Start CDC RESUME the stack's committed offset, rather than seed ``watermark``? Pure.
 
@@ -5258,6 +5328,14 @@ def _start_cdc_deploy(
     # point beats it -- the card and the preview already show that point as the start).
     watermark = _cdc_watermark(job)
     seed, seed_origin = _cdc_start_seed(migration_state, watermark, _cdc_source_type(session))
+    _seed_refusal = seed_refused_by_an_earlier_offer(
+        migration_state, seed, _cdc_source_type(session)
+    )
+    if _seed_refusal:
+        render_notice(
+            ui, tone="error", header="This start point cannot be applied", body=_seed_refusal
+        )
+        return
     tables_for_config = _cdc_tables_for_config(migration_state, inventory, watermark)
     # ONE computation for the preview, Start and Deploy (cdc_capture_exclusions): the
     # EFFECTIVE set (key columns dropped) plus the STORED generated columns of the captured
@@ -5577,6 +5655,9 @@ def _start_cdc_deploy(
         # "external" (its stack is always SeedMode=External) so the in-process Kafka prep
         # runs; MySQL keeps the host config ("Host is the mode": the in-VPC EC2 host sets
         # DSQL_MIGRATOR_CDC_SEED_MODE=external, Fargate/local leave it -> "lambda").
+        # Recorded BEFORE the Start: if it fails after the seeder wrote this offset, a later
+        # Start must not offer an earlier one (seed_refused_by_an_earlier_offer).
+        migration_state.note_cdc_offered_seed(seed)
         run_cdc_start(
             handle,
             stack_name=stack_name,

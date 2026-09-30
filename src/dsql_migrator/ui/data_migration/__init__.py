@@ -678,6 +678,9 @@ def build_data_migration_screen(
                 inputs=inputs,
             )
 
+        reset_stale_manual_start_point(
+            migration_state, migration_state.migration_type, session_source_type(session)
+        )
         _mark_overlay_use(migration_state, inputs.overlay_columns)
         migration_state.job_id = job_manager.submit(work)
         # Mirror the Full Load start into the AI activity feed (deterministic; the
@@ -1732,6 +1735,10 @@ def build_data_migration_screen(
                         inputs=retry_inputs,
                     )
 
+                reset_stale_manual_start_point(
+                    migration_state, migration_state.migration_type,
+                    session_source_type(session),
+                )
                 _mark_overlay_use(migration_state, retry_inputs.overlay_columns)
                 migration_state.job_id = job_manager.submit(work)
                 ui.notify(
@@ -2934,6 +2941,44 @@ def _overlay_inputs(
         or bool(overlay),
         "on_overlay_ledger_used": mark if callable(mark) else None,
     }
+
+
+def reset_stale_manual_start_point(
+    migration_state, migration_type, source_type, *, log=None
+) -> bool:
+    """At a Full load + CDC run's Full Load (Start or Retry): drop a MySQL Manual CDC start
+    point entered before it, so the watermark this load captures is the gapless handoff.
+
+    A Manual binlog point is seeded instead of the job watermark (it is what the card
+    shows), so one left over from an earlier CDC-only attempt or a restored session would
+    otherwise silently replace the new snapshot's end. The operator can still choose
+    Manual after the load. PostgreSQL is untouched (Manual there means re-snapshot, a
+    separate, deliberate route). Returns whether it reset.
+    """
+    if migration_type is not MigrationType.FULL_LOAD_AND_CDC or source_type is SourceType.POSTGRES:
+        return False
+    if migration_state.cdc_start_mode() != "manual":
+        return False
+    point = migration_state.cdc_start_override()
+    migration_state.set_cdc_start_mode("auto")
+    coord = (
+        f"{point.binlog_file}:{point.binlog_position}"
+        if point is not None and point.binlog_file and point.binlog_position is not None
+        else "(no binlog position)"
+    )
+    detail = (
+        f"the Manual CDC start point {coord} was set before this Full Load; the "
+        "watermark this load captures is the gapless start point, so CDC start is back "
+        "to Automatic (choose Manual again after the load for a different point)"
+    )
+    if log is None:
+        log_activity(
+            ActivityCategory.CDC, "CDC start point reset", status=ActivityStatus.INFO,
+            detail=detail,
+        )
+    else:
+        log(status=ActivityStatus.INFO, detail=detail)
+    return True
 
 
 def _disclosed_differs(disclosed, overlay_columns, tables) -> bool:
@@ -5022,6 +5067,7 @@ __all__ = [
     "exclusion_card_locked",
     "table_set_lock_reason",
     "make_exclusion_inputs_resolver",
+    "reset_stale_manual_start_point",
     "resolve_migration_selection",
     "full_load_progress_caption",
     "generated_table_names",

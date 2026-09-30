@@ -1158,7 +1158,7 @@ def test_the_postgres_card_offers_no_start_point_radio_at_all() -> None:
     # MySQL still gets its two options.
     my = card(SourceType.MYSQL)
     assert any(
-        "Manual — enter a GTID or binlog position" in v
+        "Manual — enter a binlog file:position" in v  # a GTID alone is not a start point
         for r in my.radios
         for v in r.values()
     ), my.radios
