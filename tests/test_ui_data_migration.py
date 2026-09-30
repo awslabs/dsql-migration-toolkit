@@ -28980,3 +28980,90 @@ def test_cdc_cascade_notice_is_scoped_to_the_resolved_selection() -> None:
     src = " ".join(inspect.getsource(dm.build_data_migration_screen).split())
     i = src.index("_cascade_tables = cdc_cascade_gap_tables(")
     assert "tables=" in src[i:i + 400] and "resolve_migration_selection(" in src[i:i + 400]
+
+
+# --- process-path source re-read reaches the activity log (carried finding) --------
+
+
+def test_process_worker_retry_reports_the_source_reread_to_the_parent(monkeypatch) -> None:
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    sent: list = []
+
+    class _Q:
+        def put_nowait(self, msg):
+            sent.append(msg)
+
+    monkeypatch.setattr(engine, "_worker_progress_queue", _Q())
+    monkeypatch.setattr(engine._time, "sleep", lambda _s: None)
+    monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_SOURCE_RETRY_BACKOFF_SECONDS", "4")
+    calls = {"n": 0}
+
+    def _flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _lost_connection(2013)
+        return "ok"
+
+    assert engine._retry_source_drops_in_process(_flaky, cancelled=lambda: False, table_name="app.orders") == "ok"
+    rereads = [m for m in sent if isinstance(m, tuple) and m and m[0] == engine._SOURCE_REREAD]
+    assert rereads == [(engine._SOURCE_REREAD, "app.orders", 1, 3, 4.0)]
+    assert sent.index(rereads[0]) < sent.index(engine._HEARTBEAT)
+    sent.clear()
+    assert engine._retry_source_drops_in_process(lambda: "ok", cancelled=lambda: False, table_name="t") == "ok"
+    with pytest.raises(ValueError):
+        engine._retry_source_drops_in_process(lambda: (_ for _ in ()).throw(ValueError("x")),
+                                              cancelled=lambda: False, table_name="t")
+    assert not [m for m in sent if isinstance(m, tuple) and m and m[0] == engine._SOURCE_REREAD]
+
+
+@pytest.mark.parametrize("stopped_first", [False, True])
+def test_progress_drain_logs_a_worker_source_reread_like_the_thread_path(monkeypatch, stopped_first, caplog) -> None:
+    import queue
+
+    from dsql_migrator.ui.data_migration import _full_load_engine as fle
+
+    logged: list = []
+    monkeypatch.setattr(fle, "log_activity", lambda cat, action, **kw: logged.append((action, kw)))
+    updates: list = []
+
+    class _Handle:
+        cancelled = False
+
+        def update(self, fn):
+            updates.append(fn)
+
+    class _Event:
+        def __init__(self, s=False):
+            self._set = s
+
+        def is_set(self):
+            return self._set
+
+        def set(self):
+            self._set = True
+
+    q: "queue.Queue[object]" = queue.Queue()
+    q.put((fle._SOURCE_REREAD, "app.orders", 1, 3, 15.0))
+    q.put(fle._PROGRESS_SENTINEL)
+    fle._drain_progress_queue(q, _Handle(), _Event(), _Event(stopped_first))
+    lines = [(a, kw["status"], kw["target"], kw["detail"]) for a, kw in logged]
+    assert len(lines) == 1, lines
+    action, status, target, detail = lines[0]
+    assert (action, status, target) == ("load table", fle.ActivityStatus.INFO, "app.orders")
+    assert "source connection lost (attempt 1/3)" in detail and "in 15s" in detail and "idempotent" in detail
+    assert not updates
+    assert "could not apply a message" not in caplog.text
+
+
+def test_thread_path_source_reread_line_is_unchanged(monkeypatch) -> None:
+    """Guard (passes before and after): the shared helper keeps the thread path's text."""
+    from dsql_migrator.ui.data_migration import _full_load_engine as fle
+
+    logged: list = []
+    monkeypatch.setattr(fle, "log_activity", lambda cat, action, **kw: logged.append((action, kw)))
+    fle._log_source_reread("app.orders", 1, 3, 15.0)
+    assert logged[0][1]["detail"] == (
+        "source connection lost (attempt 1/3) — likely an Aurora failover; re-reading this "
+        "table from a fresh snapshot in 15s. Already-written rows are skipped (idempotent), "
+        "so no duplicates.")

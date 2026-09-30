@@ -757,6 +757,10 @@ _CHUNK_THROTTLED = "\x00chunk-throttled"
 # connection. This is an explicit liveness signal -- unlike a diagnostic read, which must
 # NOT stamp liveness (see JobHandle.snapshot).
 _HEARTBEAT = "\x00heartbeat"
+# A worker process re-reads a table after a lost SOURCE connection:
+# (_SOURCE_REREAD, table, attempt, attempts, delay). A child cannot log_activity (no file
+# handler there), so the parent's drain logs the thread path's own line for it.
+_SOURCE_REREAD = "\x00source-reread"
 
 # Ceiling for the source-retry backoff. ``base * 2**(attempt-1)`` is uncapped, so raising
 # the retry budget turned a 30 s wait into hours (attempt 10 = 256 x base). Capped like the
@@ -1020,9 +1024,10 @@ def _retry_source_drops_in_process(
     The in-process twin of :func:`_migrate_table_with_source_retry` (see it for why a
     retry RE-READS the table instead of resuming the dead snapshot). It is separate
     because a child process has no ``JobHandle`` and cannot ``log_activity`` to the
-    parent's log -- it signals only through its returned ``_TableWorkerResult`` -- so
-    the retry state lives entirely in this call and the outcome is what the parent
-    sees. ``cancelled`` is a zero-arg predicate over the shared cancel event.
+    parent's log -- the re-read is reported over the progress queue (the parent's drain
+    logs it) and the outcome through the returned ``_TableWorkerResult`` -- so the retry
+    state lives entirely in this call. ``cancelled`` is a zero-arg predicate over the
+    shared cancel event.
 
     ``release`` (optional) closes the failed attempt's source row stream before the
     retry waits, so the dead connection is not pinned for the whole backoff
@@ -1062,6 +1067,15 @@ def _retry_source_drops_in_process(
         # this function's docstring already promises ("already-written rows are skipped").
         if before_reread is not None:
             before_reread()
+        # The activity log (the downloadable one) lives in the parent: tell it, so the
+        # re-read is visible there exactly as on the thread path (logged before the wait).
+        _report_progress(
+            _worker_progress_queue,
+            (
+                _SOURCE_REREAD, table_name, attempt, attempts,
+                min(_SOURCE_RETRY_MAX_DELAY_SECONDS, backoff * (2 ** (attempt - 1))),
+            ),
+        )
         if not _wait_before_source_reread(
             table_name=table_name, attempt=attempt, attempts=attempts,
             backoff=backoff, cause=cause, cancelled=cancelled,
@@ -1655,6 +1669,23 @@ class _MemoryPressureLogger:
         return f" while loading: {', '.join(sorted(names))}" if names else ""
 
 
+def _log_source_reread(table_name: str, attempt: int, attempts: int, delay: float) -> None:
+    """The activity line for a table re-read after a lost source connection -- ONE text for
+    the thread path and (via the progress drain) a worker process."""
+    log_activity(
+        ActivityCategory.FULL_LOAD,
+        "load table",
+        status=ActivityStatus.INFO,
+        target=table_name,
+        detail=(
+            f"source connection lost (attempt {attempt}/{attempts}) — "
+            f"likely an Aurora failover; re-reading this table from a fresh "
+            f"snapshot in {delay:.0f}s. Already-written rows are skipped "
+            f"(idempotent), so no duplicates."
+        ),
+    )
+
+
 def _drain_progress_queue(
     progress_queue: "multiprocessing.Queue[object]",
     handle: JobHandle,
@@ -1696,6 +1727,9 @@ def _drain_progress_queue(
                 # watchdog's liveness clock without changing any job state.
                 handle.update(lambda job: None)
                 continue
+            if isinstance(msg, tuple) and len(msg) == 5 and msg[0] == _SOURCE_REREAD:
+                _log_source_reread(*msg[1:])
+                continue
             if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == _CHUNK_STARTED:
                 # A worker actually began its table -> mark IN_PROGRESS now (not at
                 # submission). (== not is: the marker is pickled across the process boundary.)
@@ -1730,6 +1764,9 @@ def _drain_progress_queue(
         # exception would propagate out of the drain thread's target and be reported as a
         # run failure for work that had already finished.
         try:
+            if isinstance(msg, tuple) and len(msg) == 5 and msg[0] == _SOURCE_REREAD:
+                _log_source_reread(*msg[1:])
+                continue
             if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == _CHUNK_STARTED:
                 handle.update(lambda job, n=msg[1]: _start_chunk_if_pending(job, n))
                 continue
@@ -1964,18 +2001,7 @@ def _migrate_table_with_source_retry(
                 "%s: %s -- re-reading from a fresh snapshot in %.0fs",
                 name, attempt, attempts, type(exc).__name__, exc, delay,
             )
-            log_activity(
-                ActivityCategory.FULL_LOAD,
-                "load table",
-                status=ActivityStatus.INFO,
-                target=name,
-                detail=(
-                    f"source connection lost (attempt {attempt}/{attempts}) — "
-                    f"likely an Aurora failover; re-reading this table from a fresh "
-                    f"snapshot in {delay:.0f}s. Already-written rows are skipped "
-                    f"(idempotent), so no duplicates."
-                ),
-            )
+            _log_source_reread(name, attempt, attempts, delay)
             # Wait for the promoted writer to take over (DNS re-points within ~30-60s
             # on Aurora); reconnecting instantly would just fail again. Sleep in short
             # slices so a user Stop is honored promptly instead of after the full wait.
