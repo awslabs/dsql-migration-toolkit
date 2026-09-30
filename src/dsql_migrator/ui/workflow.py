@@ -1974,7 +1974,10 @@ def build_workflow_sidebar(
 
                 Advances to the following step once this step is ``DONE``; until
                 then it stays disabled with a hint so the guided path is clear.
-                The sidebar still allows free navigation for power users.
+                Read from the LIVE workflow: it is drawn after the step builder, which
+                may change its own step during the render (a streaming CDC-only run
+                promotes Data Migration to DONE), and the sidebar gates on the live
+                value too.
                 """
                 if following is None:
                     return
@@ -1982,7 +1985,7 @@ def build_workflow_sidebar(
                     f"Next: {step_title(following)}",
                     on_click=lambda s=following: select(s),
                 ).props("color=primary outline")
-                if status is not StepStatus.DONE:
+                if get_status(state.workflow, step) is not StepStatus.DONE:
                     next_button.disable()
                     next_button.tooltip(
                         f"Run {step_title(step)} first to continue to "

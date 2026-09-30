@@ -28850,3 +28850,23 @@ def test_full_load_phase_is_keyed_on_job_id() -> None:
     calls = [ast.unparse(n) for n in ast.walk(tree) if isinstance(n, ast.Call)
              and getattr(n.func, "id", None) == "full_load_phase_status"]
     assert calls == ["full_load_phase_status(status, full_load_ran=migration_state.job_id is not None)"]
+
+
+def test_cdc_promotion_during_render_agrees_with_the_sidebar_gate() -> None:
+    from dsql_migrator.ui.data_migration._full_load_engine import data_migration_step_after_cdc
+    from dsql_migrator.ui.session import SessionConnectionState
+    from dsql_migrator.ui.workflow import (
+        StepStatus,
+        WorkflowStep,
+        get_status,
+        is_prerequisite_met,
+        with_status,
+    )
+
+    state = SessionConnectionState()
+    snapshot = get_status(state.workflow, WorkflowStep.FULL_LOAD)  # what render_main read first
+    promoted = data_migration_step_after_cdc(snapshot, cdc_streaming=True)
+    state.set_workflow(with_status(state.workflow, WorkflowStep.FULL_LOAD, promoted))
+    assert snapshot is not StepStatus.DONE
+    assert get_status(state.workflow, WorkflowStep.FULL_LOAD) is StepStatus.DONE
+    assert is_prerequisite_met(state.workflow, WorkflowStep.VALIDATION)

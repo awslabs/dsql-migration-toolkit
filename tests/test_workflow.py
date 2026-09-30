@@ -1931,3 +1931,35 @@ def test_start_over_revalidates_at_click_time_so_an_edited_box_cannot_reset() ->
     ui.input_on_change(_Change("RESET"))
     ui.reset_click()
     assert reset_calls == [1]
+
+
+def _render_main_fn():
+    import ast
+    import inspect
+
+    import dsql_migrator.ui.workflow as wf
+
+    tree = ast.parse(inspect.getsource(wf.build_workflow_sidebar))
+    (render_main,) = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "render_main"]
+    return render_main
+
+
+def test_next_button_reads_the_live_step_status_not_the_pre_builder_snapshot():
+    """LIVE 4/5: the Data Migration builder promotes its step to DONE mid-render while
+    CDC-only streams; Next is drawn after the builder, so it must read the LIVE workflow,
+    not the snapshot taken before the builder (it stayed disabled while the sidebar,
+    which reads the live gate, opened Validation)."""
+    import ast
+
+    (make_next,) = [n for n in ast.walk(_render_main_fn()) if isinstance(n, ast.FunctionDef)
+                    and n.name == "make_next_button"]
+    assert "status" not in {n.id for n in ast.walk(make_next) if isinstance(n, ast.Name)}
+    conds = [ast.unparse(n.test) for n in ast.walk(make_next) if isinstance(n, ast.If)]
+    assert "get_status(state.workflow, step) is not StepStatus.DONE" in conds
+
+
+def test_next_button_is_rendered_after_the_step_builder():
+    import ast
+
+    body = ast.unparse(_render_main_fn())
+    assert body.index("builder(refresh_all)") < body.rindex("make_next_button()")
