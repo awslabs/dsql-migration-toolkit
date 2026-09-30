@@ -1445,3 +1445,23 @@ def test_a_pending_rollback_error_is_judged_by_the_disconnect_behind_it():
     other = ValueError("bad value")
     other.__context__ = _pymysql_operational(2013, "Lost connection")
     assert is_source_transient_error(other) is False
+
+
+def test_mysql8_text_expression_default_flows_from_information_schema_to_target_default() -> None:
+    """End to end over the live I_S shape (Aurora MySQL 8.0.42: DEFAULT ('none') on a
+    MEDIUMTEXT reports COLUMN_DEFAULT _utf8mb4\\'none\\' + DEFAULT_GENERATED): the target
+    column keeps the DEFAULT instead of losing it (a NOT NULL TEXT column then rejected
+    every insert that omitted it)."""
+    from dsql_migrator.core.converter import SchemaConverter
+
+    tables = [TableDef(name="t", columns=[ColumnDef(name="id", mysql_type="int", nullable=False),
+                                          ColumnDef(name="bio", mysql_type="mediumtext", nullable=False)],
+                       primary_key=["id"])]
+    rows = [("t", "id", None, "", "int", None),
+            ("t", "bio", "utf8mb4_0900_ai_ci", "DEFAULT_GENERATED", "mediumtext", "_utf8mb4\\'none\\'")]
+    enrich_columns(_FakeConnection(rows), "app", tables)
+    bio = next(c for c in tables[0].columns if c.name == "bio")
+    assert bio.default_is_expression is True and bio.default == "_utf8mb4\\'none\\'"
+    result = SchemaConverter().convert_table(tables[0])
+    assert '"bio" TEXT NOT NULL DEFAULT \'none\'' in result.target_ddl, result.target_ddl
+    assert not [w for w in result.warnings if "bio" in w.message and "no Aurora DSQL equivalent" in w.message]

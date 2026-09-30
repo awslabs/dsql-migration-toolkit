@@ -2950,3 +2950,101 @@ def test_the_applied_ddl_parsers_survive_the_identity_cache_clause() -> None:
         variant = f'CREATE TABLE t ("id" BIGINT NOT NULL {clause}, "c" TEXT, PRIMARY KEY ("id"))'
         assert parse_target_column_types(variant).get("c") == "text", clause
         assert parse_target_primary_key(variant) == ["id"], clause
+
+
+# --- MySQL 8 expression defaults that are ONE plain literal (carried finding, 2026-09-30).
+# The information_schema shapes below are exactly what Aurora MySQL 8.0.42 reported for
+# `DEFAULT (...)` on a live probe table (COLUMN_DEFAULT, EXTRA=DEFAULT_GENERATED).
+
+
+def _default_of(mysql_type, default, *, nullable=False):
+    import sqlglot
+
+    result = _convert_table(_single_column_table(
+        "t", mysql_type, nullable=nullable, default=default, default_is_expression=True))
+    sqlglot.parse_one(result.target_ddl, read="postgres")  # the DDL stays valid
+    dropped = [w for w in result.warnings if "no Aurora DSQL equivalent" in w.message]
+    return result.target_ddl, dropped
+
+
+@pytest.mark.parametrize("mysql_type, default, expected", [
+    ("MEDIUMTEXT", "_utf8mb4\\'none\\'", "DEFAULT 'none'"),
+    ("TEXT", "_utf8mb4\\'\\'", "DEFAULT ''"),
+    ("LONGTEXT", "_latin1\\'x\\'", "DEFAULT 'x'"),
+    ("TEXT", "_utf8mb4'none'", "DEFAULT 'none'"),          # a single-layer form
+    ("TEXT", "(_utf8mb4\\'a\\')", "DEFAULT 'a'"),
+    ("TEXT", "((_utf8mb4\\'a\\'))", "DEFAULT 'a'"),
+    ("VARCHAR(10)", "_utf8mb4\\'a\\'", "DEFAULT 'a'"),
+])
+def test_charset_introducer_string_expression_default_is_carried_on_a_text_column(mysql_type, default, expected):
+    ddl, dropped = _default_of(mysql_type, default)
+    assert f"NOT NULL {expected}" in ddl, ddl
+    assert not dropped
+
+
+def test_an_enum_introducer_default_is_carried_only_when_it_is_a_member():
+    ddl, dropped = _default_of("ENUM('a','b')", "_utf8mb4\\'a\\'")
+    assert "DEFAULT 'a'" in ddl and "CHECK" in ddl and not dropped
+    ddl, dropped = _default_of("ENUM('a','b')", "_utf8mb4\\'z\\'")
+    assert "DEFAULT" not in ddl.split("CHECK")[0].split('"value"')[1] and dropped
+
+
+@pytest.mark.parametrize("default, value", [
+    ("_utf8mb4\\'it\\\\\\'s\\'", "it's"),          # live: DEFAULT ('it''s')
+    ("_utf8mb4\\'C:\\\\\\\\tmp\\'", "C:\\tmp"),    # live: DEFAULT ('C:\\tmp')
+    ("_utf8mb4\\'abc\\\\\\\\\\'", "abc\\"),       # a trailing backslash
+    ("_utf8mb4\\'a\\\\nb\\'", "a\nb"),             # live: DEFAULT ('a\nb') -- a real LF
+    ("_utf8mb4\\' \\'", " "),                      # live: DEFAULT (' ') -- never stripped
+])
+def test_introducer_literal_default_decodes_mysql_escapes_exactly(default, value):
+    import sqlglot
+    from sqlglot import exp
+
+    ddl, dropped = _default_of("TEXT", default)
+    assert not dropped
+    col = next(c for c in sqlglot.parse_one(ddl, read="postgres").find_all(exp.ColumnDef) if c.name == "value")
+    lit = col.find(exp.DefaultColumnConstraint).this
+    assert lit.is_string and lit.this == value, (ddl, lit.this)
+
+
+@pytest.mark.parametrize("mysql_type, expr", [
+    ("INT", "1"), ("DECIMAL(10,2)", "1.50"), ("TEXT", "42"), ("TINYINT(1)", "1"),
+    ("INT", "0x0a"), ("BLOB", "0x00"), ("BLOB", "0xdeadbeef"),
+])
+def test_parenthesized_number_and_hex_expression_defaults_match_the_bare_literal(mysql_type, expr):
+    from dsql_migrator.core.converter import _resolve_column_default
+
+    as_expr = ColumnDef(name="value", mysql_type=mysql_type, nullable=False, default=expr, default_is_expression=True)
+    as_literal = as_expr.model_copy(update={"default_is_expression": False})
+    got = _resolve_column_default(as_expr)
+    assert got == _resolve_column_default(as_literal) and got[0] is not None, got
+
+
+@pytest.mark.parametrize("mysql_type, default", [
+    ("TEXT", "concat(_utf8mb4\\'a\\',_utf8mb4\\'b\\')"),   # live shape
+    ("TEXT", "_utf8mb4\\'a\\' collate utf8mb4_bin"),
+    ("TEXT", "_utf8mb4\\'a\\',_utf8mb4\\'b\\'"),
+    ("TEXT", "_utf8mb4'a' = _utf8mb4'b'"),
+    ("TEXT", "_binary\\'abc\\'"),
+    ("TEXT", "_utf8mb4\\'caf\\\\xC3\\\\xA9\\'"),   # an unknown escape
+    ("TEXT", "_utf8mb4\\'a\\\\0b\\'"),             # NUL
+    ("TEXT", "_utf8mb4\\'cafÃ©\\'"),               # live: DEFAULT ('café') comes back garbled
+    ("JSON", "_utf8mb4\\'[]\\'"), ("JSON", "json_array()"), ("JSON", "json_object()"),
+    ("BLOB", "_utf8mb4\\'abc\\'"), ("DATE", "_utf8mb4\\'2020-01-01\\'"),
+    ("BLOB", "1"), ("JSON", "1"), ("INT", "(1 + 1)"), ("INT", "-(1)"), ("DOUBLE", "rand()"),
+])
+def test_expression_defaults_that_are_not_one_plain_string_literal_are_still_dropped(mysql_type, default):
+    """Regression pin (passes before and after): anything but ONE plain literal on a
+    target that accepts it keeps today's drop + MANUAL warning (never a guessed value)."""
+    result = _convert_table(_single_column_table("t", mysql_type, nullable=False, default=default,
+                                                 default_is_expression=True))
+    col_line = next(l for l in result.target_ddl.splitlines() if '"value"' in l)
+    assert "DEFAULT" not in col_line, result.target_ddl
+    messages = [w.message for w in result.warnings if "no Aurora DSQL equivalent" in w.message]
+    assert messages and "REJECTED on Aurora DSQL" in messages[0]
+
+
+@pytest.mark.parametrize("mysql_type", ["TEXT", "INT"])
+def test_null_expression_default_is_never_emitted_as_the_string_null(mysql_type):
+    result = _convert_table(_single_column_table("t", mysql_type, default="NULL", default_is_expression=True))
+    assert "DEFAULT 'NULL'" not in result.target_ddl

@@ -1518,6 +1518,52 @@ _INTEGER_TARGET_BASES = frozenset(
 _BIT_HEX_LITERAL_RE = re.compile(r"(?i)^(?:b'([01]*)'|x'([0-9a-f]*)'|0x([0-9a-f]+))$")
 
 
+# ONE charset-introduced string literal, as information_schema reports a MySQL 8
+# ``DEFAULT ('x')``: ``_utf8mb4\'x\'`` (an extra escape layer) or ``_utf8mb4'x'``.
+_INTRODUCER_LITERAL_RE = re.compile(r"_([A-Za-z0-9]+)(\\?')(.*)\2", re.DOTALL)
+# The only escapes MySQL's String::print writes; anything else is refused, never guessed.
+_MYSQL_PRINT_ESCAPES = {"\\": "\\", "'": "'", "0": "\0", "n": "\n", "r": "\r", "Z": "\x1a"}
+
+
+def _mysql_print_unescape(text: str) -> "Optional[str]":
+    """Undo one MySQL String::print layer; ``None`` for a bare quote (then the text is not
+    ONE literal: a concatenation, a comparison, ...) or an unknown escape."""
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "'":
+            return None
+        if ch == "\\":
+            nxt = text[i + 1 : i + 2]
+            if nxt not in _MYSQL_PRINT_ESCAPES:
+                return None
+            out.append(_MYSQL_PRINT_ESCAPES[nxt])
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _introducer_string_literal(expression: str) -> "Optional[str]":
+    """The exact value of an expression default that is ONE plain string literal with a
+    charset introducer, or ``None``. Refused (``None``): ``_binary``, a NUL, and any
+    non-ASCII value -- information_schema reports ``DEFAULT ('café')`` garbled
+    (``cafÃ©``; live Aurora MySQL 8.0), so such a value is never trusted."""
+    m = _INTRODUCER_LITERAL_RE.fullmatch(expression)
+    if m is None or m.group(1).lower() == "binary":
+        return None
+    value: "Optional[str]" = m.group(3)
+    for _ in range(2 if m.group(2) == "\\'" else 1):
+        value = _mysql_print_unescape(value)
+        if value is None:
+            return None
+    if "\0" in value or not value.isascii():
+        return None
+    return value
+
+
 def _parse_bit_hex_literal(literal: str) -> "Optional[tuple[int, Optional[str]]]":
     """Return ``(int_value, hex_digits)`` for a MySQL bit/hex literal, else ``None``.
 
@@ -1635,8 +1681,11 @@ def _column_default_sql(
     * **``ON UPDATE`` folded into the default** -> stripped (see :func:`_strip_on_update`).
     * **Expression default** -> emitted verbatim when PostgreSQL spells it the same way,
       translated when there is a known equivalent (``UUID()`` -> ``gen_random_uuid()``),
-      and dropped with a warning otherwise. A MySQL-only artifact (a ``_utf8mb4``
-      introducer, a column reference) is dropped rather than risking invalid DDL.
+      and dropped with a warning otherwise. ONE plain literal is the bare literal's default:
+      a charset-introduced string (``DEFAULT ('none')`` -> ``_utf8mb4\'none\'``) is decoded
+      exactly and kept on a textual target, a number or hex literal takes the literal
+      rules. Anything else MySQL-only (a column reference, a concatenation, a non-ASCII or
+      ``_binary`` string, a JSON default) is dropped rather than risking invalid DDL.
     * **boolean target** -> a ``0``/``1`` literal becomes ``FALSE``/``TRUE``; ``DEFAULT 1``
       on a boolean is a hard error on DSQL.
     * **ENUM mapped to text + CHECK** -> a default outside the enum members is dropped,
@@ -1707,6 +1756,33 @@ def _column_default_sql(
         ) or _TRANSLATED_EXPRESSION_DEFAULTS.get(expression.upper())
         if translated:
             return translated, None
+        # ONE plain literal, the only way MySQL 8 allows a TEXT/BLOB/JSON default at all:
+        # the same default as the bare literal, so it takes the literal rules below.
+        literal = _introducer_string_literal(expression)
+        if (
+            literal is not None
+            and target.startswith(_TEXTUAL_TARGET_PREFIXES)
+            and (enum_values is None or literal in enum_values)
+        ):
+            # _quote_default_literal's escaping WITHOUT its strip(): DEFAULT (' ') is ' '.
+            return "'" + literal.replace("\\", "\\\\").replace("'", "''") + "'", None
+        expr_target_base = target.split("(", 1)[0].strip()
+        bit_hex = _parse_bit_hex_literal(expression)
+        if (
+            re.fullmatch(r"[+-]?\d+(\.\d+)?", expression)
+            and expr_target_base not in ("bytea", "json", "jsonb")
+        ) or (
+            bit_hex is not None
+            and (
+                expr_target_base in _INTEGER_TARGET_BASES
+                or (expr_target_base == "bytea" and bit_hex[1] is not None)
+            )
+        ):
+            return _column_default_sql(
+                column.model_copy(update={"default": expression, "default_is_expression": False}),
+                target_type,
+                enum_values,
+            )
         return None, (
             f"MySQL expression default {raw} has no Aurora DSQL equivalent, so the column "
             "is created without a default. Set the value explicitly in the application, or "
