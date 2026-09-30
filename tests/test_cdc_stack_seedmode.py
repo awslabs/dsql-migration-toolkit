@@ -153,15 +153,54 @@ def test_host_diagnostics_ingress_is_9098_by_cidr_and_gated() -> None:
     assert props["GroupId"] == {"Fn::GetAtt": ["ConnectorSecurityGroup", "GroupId"]}
 
 
-def test_bastion_diagnostics_literal_cidr_unchanged() -> None:
-    # The pre-existing bastion rule's hardcoded /20 must NOT be touched or widened.
-    rule = _load_template()["Resources"]["ConnectorBastionDiagnosticsIngress"]
-    assert rule["Properties"]["CidrIp"] == "172.31.0.0/20"
-    # It has NO Condition, so it exists in EVERY deployed cdc-stack -- which is why the
-    # Start-time reachability backstop must treat it as a real admission path. Pin the
-    # Python mirror against the template literal so the two cannot drift: if they did,
-    # the backstop would refuse a default-VPC host that MSK genuinely admits.
-    assert "Condition" not in rule
-    from dsql_migrator.core.cdc import CDC_BASTION_DIAGNOSTICS_CIDR
+def _ingress_rules(res, *, host_cidr=""):
+    """(IpProtocol, FromPort, ToPort, CidrIp-or-source) of every ingress rule on the
+    ConnectorSecurityGroup, with HostSubnetCidr materialized and its condition applied."""
+    rules = []
+    sg = res["ConnectorSecurityGroup"]["Properties"]
+    for r in sg.get("SecurityGroupIngress", []) or []:
+        rules.append((r.get("IpProtocol"), r.get("FromPort"), r.get("ToPort"), r.get("CidrIp")))
+    for name, r in res.items():
+        if r.get("Type") != "AWS::EC2::SecurityGroupIngress":
+            continue
+        if r.get("Condition") == "HasHostSubnetCidr" and not host_cidr:
+            continue
+        props = r["Properties"]
+        cidr = props.get("CidrIp")
+        if cidr == {"Ref": "HostSubnetCidr"}:
+            cidr = host_cidr
+        rules.append((props.get("IpProtocol"), props.get("FromPort"), props.get("ToPort"),
+                      cidr if cidr is not None else ("sg", name)))
+    return rules
 
-    assert CDC_BASTION_DIAGNOSTICS_CIDR == rule["Properties"]["CidrIp"]
+
+def test_no_security_group_ingress_admits_a_hardcoded_cidr() -> None:
+    """LIVE 4/5 review: an UNCONDITIONAL 9098 rule from 172.31.0.0/20 (a dev bastion's
+    subnet) admitted one default subnet of EVERY default VPC to MSK. Every CIDR a cdc-stack
+    admits must come from a parameter the deployer supplies."""
+    res = _load_template()["Resources"]
+    assert "ConnectorBastionDiagnosticsIngress" not in res
+    for name, r in res.items():
+        props = r.get("Properties") or {}
+        entries = []
+        if r.get("Type") == "AWS::EC2::SecurityGroupIngress":
+            entries.append(props)
+        entries.extend(props.get("SecurityGroupIngress", []) or [] if r.get("Type") == "AWS::EC2::SecurityGroup" else [])
+        for e in entries:
+            assert not isinstance(e.get("CidrIp"), str), (name, e.get("CidrIp"))
+
+
+def test_default_deploy_admits_msk_9098_only_from_its_own_security_group() -> None:
+    res = _load_template()["Resources"]
+    k9098 = [r for r in _ingress_rules(res) if r[1] == 9098]
+    assert k9098 == [("tcp", 9098, 9098, ("sg", "ConnectorSelfIngress"))]
+    self_rule = res["ConnectorSelfIngress"]["Properties"]
+    assert self_rule["SourceSecurityGroupId"] == {"Fn::GetAtt": ["ConnectorSecurityGroup", "GroupId"]}
+
+
+def test_host_cidr_equal_to_a_default_subnet_does_not_duplicate_an_ingress_rule() -> None:
+    """An EC2 host in the default subnet 172.31.0.0/20 sets HostSubnetCidr to exactly that:
+    with the old literal rule the SG carried the same rule twice, which EC2 rejects."""
+    rules = _ingress_rules(_load_template()["Resources"], host_cidr="172.31.0.0/20")
+    assert len(rules) == len(set(rules)), rules
+    assert ("tcp", 9098, 9098, "172.31.0.0/20") in rules

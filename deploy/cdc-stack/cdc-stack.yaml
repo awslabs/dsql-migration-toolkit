@@ -978,32 +978,13 @@ Resources:
         Fn::GetAtt: [ConnectorSecurityGroup, GroupId]
       Description: Kafka IAM/TLS traffic within the connector/MSK security group.
 
-  # Diagnostics access: let the in-VPC bastion reach MSK Serverless on 9098 for
-  # operational tasks the laptop can't do (MSK bootstrap is VPC-private) -- gapless
-  # offset seeding, topic alters (max.message.bytes), consumer-lag / offset checks.
-  # Allowed by CIDR (the bastion's subnet 172.31.0.0/20), NOT by SG id, so every
-  # FUTURE cdc-stack's fresh ConnectorSecurityGroup grants the same access without
-  # re-attaching the bastion to this SG (which previously blocked stack deletion --
-  # see the 2026-06-27 run notes). The bastion keeps its own SG; this is inbound on
-  # the MSK side only. /20 (not /32) so a bastion IP change still works.
-  ConnectorBastionDiagnosticsIngress:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId:
-        Fn::GetAtt: [ConnectorSecurityGroup, GroupId]
-      IpProtocol: tcp
-      FromPort: 9098
-      ToPort: 9098
-      CidrIp: 172.31.0.0/20
-      Description: Diagnostics - bastion subnet to MSK Serverless (IAM/TLS 9098).
-
   # SeedMode=External reachability: admit the DEPLOYING APP to MSK on 9098 so it can
   # do the CDC Kafka prep in-process (create topics + seed the offset) instead of the
   # seeder Lambda. Two hosts arrive here -- the Lambda-free in-VPC EC2 control-plane
   # host (its own subnet CIDR, from its user-data) and the Fargate app for a
   # PostgreSQL source, whose cdc-stack is ALWAYS SeedMode=External (the VPC CIDR block
   # containing its task, so a task replaced into another of the service's subnets stays
-  # admitted). Like the bastion rule above, allowed BY CIDR, NOT by SG id, so the
+  # admitted). Allowed BY CIDR, NOT by SG id, so the
   # two stacks' teardown stays decoupled (an SG-id cross-reference previously blocked
   # stack deletion). Condition-gated on a NON-EMPTY HostSubnetCidr with an empty
   # default, so every existing deploy (and every Lambda-mode deploy) templates

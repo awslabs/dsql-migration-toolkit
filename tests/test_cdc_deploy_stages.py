@@ -1752,14 +1752,23 @@ def test_external_seed_refuses_only_when_the_stack_admits_a_different_network(
     assert deployer.updates == []
 
 
+def test_external_seed_refuses_a_default_vpc_host_the_stack_does_not_admit(monkeypatch) -> None:
+    """The removed bastion rule no longer counts as an admission path: a host in
+    172.31.0.0/20 that the stack's HostSubnetCidr does not contain is refused up front."""
+    monkeypatch.delenv("DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR", raising=False)
+    seed_calls: list[dict] = []
+    with pytest.raises(CdcDeployError) as exc:
+        _run_start_external_with_admitted("10.0.0.0/16", "172.31.5.9", monkeypatch, seed_calls)
+    msg = str(exc.value)
+    assert "10.0.0.0/16" in msg and "172.31.5.9" in msg
+    assert seed_calls == []
+
+
 @pytest.mark.parametrize(
     "admitted,own_ip",
     [
         # Admitted: this host is inside the registered network.
         ("10.0.0.0/16", "10.0.11.31"),
-        # Admitted by the cdc-stack's UNCONDITIONAL bastion rule -- refusing a
-        # default-VPC host that MSK genuinely admits would break a working setup.
-        ("10.0.0.0/16", "172.31.5.9"),
         # Empty admitted value: fails OPEN. This keeps the documented manual-ingress
         # maintainer flow and the laptop-deploy / in-VPC-start harness flow working.
         ("", "10.9.9.9"),

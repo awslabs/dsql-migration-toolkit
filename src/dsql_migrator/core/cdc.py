@@ -693,14 +693,6 @@ CDC_DEFAULT_TOPIC_PREFIX = "dsqlcdc"
 CDC_DEFAULT_DLQ_TOPIC = "dsql-sink-dlq"
 CDC_SOURCE_SUFFIX = "-debezium-source"
 CDC_SINK_SUFFIX = "-dsql-sink"
-# The cdc-stack also creates an UNCONDITIONAL 9098 ingress for the maintainer's in-VPC
-# bastion (ConnectorBastionDiagnosticsIngress, deploy/cdc-stack/cdc-stack.yaml).
-# Mirrored here because it is a real admission path present in EVERY deployed
-# cdc-stack: the Start-time reachability backstop must treat it as a disjunct, or it
-# would refuse a default-VPC host that MSK actually admits -- a gate that wrongly
-# refuses a working setup is worse than the bug it guards. Never relied on: it matches
-# nothing in a 10.0.0.0/16 customer VPC.
-CDC_BASTION_DIAGNOSTICS_CIDR = "172.31.0.0/20"
 
 # --- CDC throughput smart defaults ------------------------------------------
 # The connector-scaling knobs (MSK Connect MCUs, sink tasks.max, per-table topic

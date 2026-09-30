@@ -996,13 +996,12 @@ def _run_external_seed(
     # an ADOPTED stack, or on one created from a different host, and without this the
     # only symptom is a ~60s KafkaTimeoutError for what is really "this stack does not
     # admit you". Refuse ONLY on a certainty -- a NON-EMPTY admitted CIDR that does not
-    # contain this address and is not the bastion range. An empty value or an unknown
-    # local address proceeds: the stack may admit this host by a hand-added rule or by
-    # SG membership (ConnectorSelfIngress), and the seed's own three-condition failure
-    # text still applies. A gate that wrongly refuses a working host is worse than the
+    # contain this address. An empty value or an unknown local address proceeds: the
+    # stack may admit this host by a hand-added rule or by SG membership
+    # (ConnectorSelfIngress), and the seed's own three-condition failure text still
+    # applies. A gate that wrongly refuses a working host is worse than the
     # bug it guards.
     from dsql_migrator.config import load_config
-    from dsql_migrator.core.cdc import CDC_BASTION_DIAGNOSTICS_CIDR
     from dsql_migrator.core.ec2_metadata import cidr_contains, local_ipv4
 
     admitted = (current.get("HostSubnetCidr") or "").strip()
@@ -1028,10 +1027,7 @@ def _run_external_seed(
         admitted
         and own_ip
         and admitted != attested
-        and not (
-            cidr_contains(admitted, own_ip)
-            or cidr_contains(CDC_BASTION_DIAGNOSTICS_CIDR, own_ip)
-        )
+        and not cidr_contains(admitted, own_ip)
     ):
         raise CdcDeployError(
             f"The cdc-stack '{stack_name}' admits {admitted} on MSK port 9098 and this "
