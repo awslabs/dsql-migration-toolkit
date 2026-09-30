@@ -374,3 +374,47 @@ def test_the_finish_body_names_only_what_the_block_shows(monkeypatch):
     assert "Restore them now." in body and "Needs your decision" not in body and "will store NULL" in body
     ui, _r, _l = _screen(monkeypatch, snap=_snap(_item("m", auto=False, reason="r")), cdc=False)
     assert 'Decide on the columns listed under "Needs your decision" above.' in ui.body()
+
+
+def test_the_cut_over_statements_wrap_at_word_boundaries():
+    """The SET DEFAULT statements wrap at spaces like the dialogs' ALTERs (break-all split
+    them mid-identifier)."""
+    import inspect
+
+    from dsql_migrator.ui.validation import _render_cutover_defaults_block
+
+    src = inspect.getsource(_render_cutover_defaults_block)
+    assert "break-all" not in src and src.count("wrap-anywhere") >= 3
+
+
+def test_a_full_load_only_restore_with_nothing_blocking_shows_no_off_hint():
+    """LIVE 8: 'Off while a load or Start CDC runs.' sat beside an ENABLED button."""
+    ui = _Ui()
+    _render(ui, cdc=False, snap=_snap(_item("a")))
+    assert not ui.by("Restore DEFAULTs")[0].disabled
+    assert "Off while" not in ui.body()
+
+
+def test_under_cdc_the_restore_hint_names_only_the_drained_confirmation():
+    ui = _Ui()
+    _render(ui, cdc=True, snap=_snap(_item("a")))
+    assert "Enabled once you confirm above that CDC has drained." in ui.body()
+    assert "Off while a load or Start CDC runs" not in ui.body()
+    assert ui.by("Restore DEFAULTs")[0].disabled
+    ui.checkboxes[0].on_change(SimpleNamespace(value=True))
+    assert not ui.by("Restore DEFAULTs")[0].disabled
+
+
+@pytest.mark.parametrize("kw, expected", [
+    ({"restore_running": True}, "Restoring the DEFAULTs…"),
+    ({"restore_job_block": "off while a Full Load runs"}, "Restore is off while a Full Load runs."),
+    ({"has_auto": False}, "Nothing to restore automatically; decide on the columns below."),
+    ({"cdc_in_use": True}, "Enabled once you confirm above that CDC has drained."),
+    ({}, ""),
+])
+def test_restore_hint_branches(kw, expected):
+    from dsql_migrator.ui.validation import _restore_hint
+
+    args = {"cdc_in_use": False, "restore_job_block": None, "restore_running": False, "has_auto": True}
+    args.update(kw)
+    assert _restore_hint(**args) == expected

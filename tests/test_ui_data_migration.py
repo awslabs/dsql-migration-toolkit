@@ -28870,3 +28870,39 @@ def test_cdc_promotion_during_render_agrees_with_the_sidebar_gate() -> None:
     assert snapshot is not StepStatus.DONE
     assert get_status(state.workflow, WorkflowStep.FULL_LOAD) is StepStatus.DONE
     assert is_prerequisite_met(state.workflow, WorkflowStep.VALIDATION)
+
+
+def test_lob_panel_column_exclude_preview_wraps_inside_the_card() -> None:
+    """LIVE 4/5: the column.exclude.list preview (no break chance in a comma list) ran off
+    the card. It wraps (wrap-anywhere) and stays VERBATIM -- it is what Start CDC sends."""
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    recorded = []
+
+    class _Label:
+        def __init__(self, text):
+            self.text = text
+
+        def classes(self, c=""):
+            recorded.append((self.text, c))
+            return self
+
+        def __getattr__(self, _name):
+            return lambda *_a, **_k: self
+
+    class _Ui(_RecordingUi):
+        def label(self, text="", *a, **k):
+            super().label(text, *a, **k)
+            return _Label(str(text))
+
+    inventory = SourceInventory(tables=[TableDef(
+        name="app.docs",
+        columns=[ColumnDef(name="id", mysql_type="int", nullable=False),
+                 ColumnDef(name="payload", mysql_type="longtext", nullable=True)],
+        primary_key=["id"])])
+    value = ",".join(f"app.docs.payload_{i:02d}" for i in range(20))
+    _cdc_ui._render_cdc_lob_exclusion_panel(
+        _Ui(), DataMigrationState(), inventory, lambda: None, locked=False, lock_reason=None,
+        capture_preview=value)
+    hits = [c for t, c in recorded if t == value]
+    assert len(hits) == 1 and "wrap-anywhere" in hits[0] and "break-all" not in hits[0], recorded

@@ -6329,19 +6329,19 @@ def _restore_hint(
     *, cdc_in_use: bool, restore_job_block: Optional[str], restore_running: bool,
     has_auto: bool,
 ) -> str:
-    """Why [Restore DEFAULTs] is (or may be) disabled, in one line."""
+    """What disables (or, under CDC, enables) [Restore DEFAULTs], in one line; empty when
+    nothing does. A load or Start CDC starting later is refused at click time."""
     if restore_running:
         return "Restoring the DEFAULTs…"
     if restore_job_block:
         return f"Restore is {restore_job_block}."
     if not has_auto:
         return "Nothing to restore automatically; decide on the columns below."
-    return (
-        "Off while a load or Start CDC runs. With CDC: after you confirm above that CDC "
-        "has drained."
-        if cdc_in_use
-        else "Off while a load or Start CDC runs."
-    )
+    if cdc_in_use:
+        # The drained tick enables the button client-side without a re-render, so this is
+        # phrased as the rule, true before and after the tick.
+        return "Enabled once you confirm above that CDC has drained."
+    return ""
 
 
 def _render_cutover_defaults_block(
@@ -6437,7 +6437,7 @@ def _render_cutover_defaults_block(
             ):
                 for item in auto:
                     ui.label(item.statement).classes(  # type: ignore[attr-defined]
-                        "text-xs font-mono break-all text-gray-800"
+                        "text-xs font-mono wrap-anywhere text-gray-800"
                     )
         if pending:
             with ui.row().classes("items-center gap-3 mt-1"):  # type: ignore[attr-defined]
@@ -6450,14 +6450,12 @@ def _render_cutover_defaults_block(
                 if other or not drained["ok"]:
                     _btn.props("disable")
                 gated.append((_btn, other))
-                inline_hint(
-                    ui,
-                    _restore_hint(
-                        cdc_in_use=cdc_in_use, restore_job_block=restore_job_block,
-                        restore_running=restore_running, has_auto=bool(auto),
-                    ),
-                    tone="info",
+                _hint = _restore_hint(
+                    cdc_in_use=cdc_in_use, restore_job_block=restore_job_block,
+                    restore_running=restore_running, has_auto=bool(auto),
                 )
+                if _hint:
+                    inline_hint(ui, _hint, tone="info")
         if restore_outcome is not None:
             if restore_outcome.refused:
                 render_notice(
@@ -6500,12 +6498,12 @@ def _render_cutover_defaults_block(
                 with ui.column().classes("w-full gap-0 pl-2"):  # type: ignore[attr-defined]
                     ui.label(  # type: ignore[attr-defined]
                         f"{item.table}.{item.column}  DEFAULT {item.original_default}"
-                    ).classes("text-xs font-mono text-gray-800 break-all")
+                    ).classes("text-xs font-mono text-gray-800 wrap-anywhere")
                     ui.label(item.reason or "").classes(  # type: ignore[attr-defined]
                         "text-xs text-gray-600 leading-snug"
                     )
                     ui.label(item.statement).classes(  # type: ignore[attr-defined]
-                        "text-xs font-mono text-gray-500 break-all"
+                        "text-xs font-mono text-gray-500 wrap-anywhere"
                     )
                     if item.executable:
                         _row_btn = ui.button(  # type: ignore[attr-defined]

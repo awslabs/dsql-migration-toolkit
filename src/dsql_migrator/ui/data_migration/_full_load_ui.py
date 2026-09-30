@@ -403,7 +403,7 @@ def _render_overlay_blocks(
                 )
                 with ui.expansion("show statements").classes("w-full text-xs"):
                     for statement in statements:
-                        ui.label(statement.text()).classes("text-xs font-mono break-all")
+                        ui.label(statement.text()).classes("text-xs font-mono wrap-anywhere")
         shown = {t: r for t, r in forced.items() if _in_scope(t)}
         if shown:
             render_notice(

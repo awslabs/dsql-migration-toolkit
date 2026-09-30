@@ -223,9 +223,10 @@ def apply_start_cdc_overlay(
             log(
                 "overlay planned",
                 status=ActivityStatus.INFO,
-                detail=(
-                    f"{table}: {_plan_detail(live)}; the dropped DEFAULTs are recorded "
-                    "first and restored at cut over"
+                detail=f"{table}: {_plan_detail(live)}" + (
+                    "; the dropped DEFAULTs are recorded first and restored at cut over"
+                    if needs_default
+                    else ""
                 ),
             )
     if merges:

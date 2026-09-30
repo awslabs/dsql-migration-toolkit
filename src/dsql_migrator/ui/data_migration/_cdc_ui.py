@@ -4813,7 +4813,7 @@ def _render_cdc_overlay_changes(ui, overlay_changes) -> None:
     )
     with ui.expansion("show statements").classes("w-full text-xs"):  # type: ignore[attr-defined]
         for statement in statements:
-            ui.label(statement.text()).classes("text-xs font-mono break-all")  # type: ignore[attr-defined]
+            ui.label(statement.text()).classes("text-xs font-mono wrap-anywhere")  # type: ignore[attr-defined]
 
 
 def _note_cdc_start(migration_state) -> None:

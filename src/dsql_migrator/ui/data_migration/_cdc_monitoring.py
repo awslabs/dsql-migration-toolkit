@@ -3161,7 +3161,7 @@ def _render_cdc_lob_exclusion_panel(
                     ui.label("column.exclude.list:").classes(  # type: ignore[attr-defined]
                         "text-xs text-gray-500"
                     )
-                    ui.label(exclude_value).classes("text-xs font-mono")  # type: ignore[attr-defined]
+                    ui.label(exclude_value).classes("text-xs font-mono wrap-anywhere")  # type: ignore[attr-defined]
 
 def _render_stored_exclusion_issues(
     ui,

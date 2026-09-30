@@ -1237,3 +1237,24 @@ def test_a_replace_overlay_table_is_not_read_before_its_recreate(monkeypatch, ev
     rig = _ProcRig(monkeypatch, tables=(DOCS,), replace={"docs"}, rows={"docs": True})
     assert rig.run() == {"docs": "DONE"}
     assert rig.facts_calls[0] == (["docs"], False)  # the first read is step 5's, after the recreate
+
+
+def test_overlay_planned_names_no_default_restore_for_a_not_null_only_column(events):
+    """LIVE 4/5/8: a column with no DEFAULT (only NOT NULL dropped) no longer logs 'the dropped
+    DEFAULTs are recorded first and restored at cut over'; one that has a DEFAULT still does."""
+    from types import SimpleNamespace
+
+    engine._log_overlay_planned("app.t", {"note": SimpleNamespace(not_null=True, default_expr=None)})
+    engine._log_overlay_planned("app.u", {"body": SimpleNamespace(not_null=True, default_expr="'x'::text")})
+    planned = {e[2]: e[3] for e in events if e[0] == "overlay planned"}
+    assert planned["app.t"] == "note: DROP NOT NULL"
+    assert planned["app.u"].endswith("; the dropped DEFAULTs are recorded first and restored at cut over")
+
+
+def test_the_column_excluded_line_does_not_assume_a_default(events):
+    inputs = dataclasses.replace(
+        _inputs(), excluded_lob_columns={"t": frozenset({"a"})}, overlay_columns={"t": frozenset({"a"})})
+    _log_excluded_lob_columns(inputs)
+    details = {e[2]: e[3] for e in events if e[0] == "column excluded"}
+    assert "the DEFAULT is restored" not in details["t.a"]
+    assert "any DEFAULT it had is restored at cut over" in details["t.a"]

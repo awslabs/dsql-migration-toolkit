@@ -644,3 +644,52 @@ def test_the_dialog_says_which_tables_keep_their_values(monkeypatch):
     cdc_ui._render_cdc_overlay_changes(SimpleNamespace(), CdcOverlayPreview([], ("app.t",)))
     assert notices and notices[0]["tone"] == "info"
     assert "Rows already in app.t keep what they hold" in notices[0]["body"]
+
+
+def test_the_cdc_dialog_statements_wrap_at_word_boundaries(monkeypatch):
+    """LIVE 8: the Start CDC dialog's ALTER list wraps at spaces, not mid-identifier."""
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+    from dsql_migrator.ui.data_migration._cdc_overlay import CdcOverlayPreview
+
+    recorded = []
+
+    class _El:
+        def __init__(self, text):
+            self.text = text
+
+        def classes(self, c=""):
+            recorded.append((self.text, c))
+            return self
+
+        def props(self, *_a, **_k):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _Ui:
+        def label(self, text="", *_a, **_k):
+            return _El(str(text))
+
+        def __getattr__(self, _name):
+            return lambda *_a, **_k: _El("")
+
+    monkeypatch.setattr(cdc_ui, "_render_notice", lambda _ui, **_kw: None)
+    stmt = SimpleNamespace(action="DROP NOT NULL",
+                           text=lambda: 'ALTER TABLE "app"."t" ALTER COLUMN "note" DROP NOT NULL')
+    cdc_ui._render_cdc_overlay_changes(_Ui(), CdcOverlayPreview([stmt], ()))
+    alters = [c for t, c in recorded if t.startswith("ALTER TABLE")]
+    assert alters and all("wrap-anywhere" in c and "break-all" not in c for c in alters), recorded
+
+
+def test_overlay_planned_mentions_the_default_restore_only_when_a_default_is_dropped():
+    db = FakeDb({"app.t": {"id": {"notnull": True, "default": None}, "c": {"notnull": True, "default": None}}})
+    log = _run(db, InMemoryOverlayLedger(), overlay={"app.t": frozenset({"c"})})
+    planned = [e[2] for e in log.events if e[0] == "overlay planned"]
+    assert planned == ["app.t: c: DROP NOT NULL"]
+    log = _run(_catalog(["app.u"]), InMemoryOverlayLedger(), overlay={"app.u": frozenset({"c"})})
+    planned = [e[2] for e in log.events if e[0] == "overlay planned"]
+    assert planned and planned[0].endswith("; the dropped DEFAULTs are recorded first and restored at cut over")

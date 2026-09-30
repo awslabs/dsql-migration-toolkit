@@ -546,3 +546,42 @@ def test_every_type_counts_the_overlay_in_the_prerequisites():
 
     src = " ".join(inspect.getsource(dm.build_data_migration_screen).split())
     assert "_prereq_overlay = overlay_lob_exclusions(migration_state, inventory)" in src
+
+
+class _ClassRecorder:
+    """Wraps a double's element and records the classes set on it (per label text)."""
+
+    def __init__(self, el, sink, text):
+        self._el, self._sink, self._text = el, sink, text
+
+    def classes(self, c=""):
+        self._sink.setdefault(self._text, []).append(c)
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def __getattr__(self, name):
+        return getattr(self._el, name)
+
+
+def test_the_full_load_dialog_statements_wrap_at_word_boundaries(monkeypatch):
+    """LIVE 8: break-all split the ALTER list mid-identifier ("not|e"). The statements wrap
+    at spaces (wrap-anywhere only splits a token wider than the line); text unchanged."""
+    recorded = {}
+    orig = _DialogUi.label
+
+    def label(self, text="", *a, **k):
+        return _ClassRecorder(orig(self, text, *a, **k), recorded, str(text))
+
+    monkeypatch.setattr(_DialogUi, "label", label)
+    _open(monkeypatch, view=_view(), ledger=LedgerRead("present", {PAGES: _record()}), rows=(),
+          facts={PAGES: _facts(rows=False, summary=SUMMARY)})
+    alters = {t: c for t, c in recorded.items() if t.startswith("ALTER TABLE")}
+    assert len(alters) == 2
+    for text, cls in alters.items():
+        joined = " ".join(cls)
+        assert "wrap-anywhere" in joined and "break-all" not in joined, (text, cls)

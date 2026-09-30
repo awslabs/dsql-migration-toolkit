@@ -3702,8 +3702,8 @@ def _log_excluded_lob_columns(
                 detail = (
                     "excluded from the load by the user; the column is made nullable with "
                     "no DEFAULT on the target before the load, so every row stores NULL "
-                    "(its data is not migrated; the DEFAULT is restored at cut over). A "
-                    "column Aurora DSQL computes is omitted only and not altered"
+                    "(its data is not migrated; any DEFAULT it had is restored at cut "
+                    "over). A column Aurora DSQL computes is omitted only and not altered"
                 )
             elif column in legacy:
                 detail = (
@@ -4869,9 +4869,10 @@ def _log_overlay_planned(name: str, live) -> None:
         "overlay planned",
         status=ActivityStatus.INFO,
         target=name,
-        detail=(
-            f"{_overlay_plan_detail(live)}; the dropped DEFAULTs are recorded first and "
-            "restored at cut over"
+        detail=_overlay_plan_detail(live) + (
+            "; the dropped DEFAULTs are recorded first and restored at cut over"
+            if any(f.default_expr is not None for f in live.values())
+            else ""
         ),
     )
 
