@@ -1672,6 +1672,11 @@ class ExclusionInputs:
     applied: "Mapping[str, object]"
     preserve_foreign_keys: bool
     live_columns: "Optional[Mapping[str, frozenset[str]]]" = None
+    # The tree's universe (tables with a target to load into), in its order; the applied
+    # view DDLs (W6, view findings); the conversion signature the applied set is keyed by.
+    migratable: "list[str]" = field(default_factory=list)
+    view_ddls: "Mapping[str, str]" = field(default_factory=dict)
+    signature: tuple = ()
 
 
 def live_target_columns_of(target_inventory) -> "Optional[dict[str, frozenset[str]]]":
@@ -1693,6 +1698,8 @@ def exclusion_context_for(
     preserve_foreign_keys: "Optional[bool]" = None,
     selected_tables: "Optional[Sequence[str]]" = None,
     focus_tables: "Optional[Iterable[str]]" = None,
+    view_ddls: "Optional[Mapping[str, str]]" = None,
+    warnings: bool = False,
 ):
     """The :class:`~dsql_migrator.core.column_exclusion.ExclusionContext` for this session.
 
@@ -1717,6 +1724,8 @@ def exclusion_context_for(
         ),
         selected_tables=selected_tables,
         focus_tables=focus_tables,
+        view_ddls=view_ddls,
+        warnings=warnings,
     )
 
 
@@ -2102,6 +2111,306 @@ def exclusion_scope(migration_state) -> "Optional[list[str]]":
         return resolved
     selection = getattr(migration_state, "selection", None)
     return list(getattr(selection, "selected_tables", None) or ()) or None
+
+
+# --- the exclusion popup's pure composition (core.exclusion_rules over live inputs) ----
+
+
+def exclusion_rules_text_for(migration_state, inventory) -> str:
+    """The saved rule text, else lines synthesized from the stored set (a session that
+    never saved rules: legacy, card ticks)."""
+    from dsql_migrator.core.exclusion_rules import synthesize_rule_text
+
+    saved = migration_state.exclusion_rules_text()
+    if saved is not None:
+        return saved
+    return synthesize_rule_text(migration_state.lob_exclusions(), migration_state.legacy_exclusions())
+
+
+def popup_open_text(migration_state, inventory) -> "tuple[str, list[str]]":
+    """What a fresh open shows -- the saved (or synthesized) rules plus the pending lines --
+    and those pending lines (a Save removes exactly them)."""
+    text = exclusion_rules_text_for(migration_state, inventory)
+    pending = migration_state.pending_rules()
+    if pending:
+        text = "\n".join([text.rstrip("\n")] + pending) if text.strip() else "\n".join(pending)
+    return text, pending
+
+
+def popup_resolution(
+    migration_state,
+    inventory,
+    text: str,
+    *,
+    inputs: "ExclusionInputs",
+    source_type: SourceType,
+    selection_lock_reason: "Optional[str]" = None,
+    capture_tables: "Optional[Callable[[Sequence[str]], Sequence[object]]]" = None,
+):
+    """:func:`~dsql_migrator.core.exclusion_rules.resolve_exclusion_rules` over this
+    session's live inputs: the ONE context (selected' + focus, warnings on), the resolved
+    selection, the provenance and re-ticks, the legacy (omit-only) entries, the stored set
+    for the diff, the applied DDL and live columns for 42703 and the target changes, and --
+    when ``capture_tables(selected')`` is given (CDC types) -- the capture preview.
+
+    Memoized on the state (transient) by the text's digest and every input, the inventory,
+    applied set and live columns held by IDENTITY (a reused ``id`` never serves a stale
+    result), so the row and the popup re-resolve only when something changed.
+    """
+    import hashlib
+
+    from dsql_migrator.core.exclusion_rules import resolve_exclusion_rules
+
+    stored = migration_state.lob_exclusions()
+    legacy = migration_state.legacy_exclusions()
+    prev = migration_state.rule_excluded_tables()
+    reticks = migration_state.rule_reticked_tables()
+    mkc_getter = getattr(migration_state, "cdc_message_key_columns", None)
+    mkc = mkc_getter() if callable(mkc_getter) else {}
+    deployed = getattr(migration_state, "cdc_deployed_column_exclude_list", None)
+    key = (
+        hashlib.sha256((text or "").encode("utf-8")).hexdigest(),
+        tuple(inputs.signature), tuple(inputs.selected), tuple(inputs.migratable),
+        frozenset(prev), frozenset(reticks),
+        tuple(sorted((t, tuple(c)) for t, c in (mkc or {}).items())),
+        getattr(getattr(migration_state, "migration_type", None), "value", None),
+        selection_lock_reason,
+        frozenset((t, c) for t, cs in legacy.items() for c in cs),
+        frozenset((t, c) for t, cs in stored.items() for c in cs),
+        deployed if capture_tables is not None else None,
+        capture_tables is not None,
+        source_type,
+    )
+    held = (inventory, inputs.applied, inputs.live_columns, inputs.view_ddls)
+    memo = getattr(migration_state, "_exclusion_resolution_memo", None)
+    if memo and memo[0] == key and all(a is b for a, b in zip(memo[1], held)):
+        return memo[2]
+    tables = {t.name: t for t in (getattr(inventory, "tables", None) or ())}
+    migratable = [tables[n] for n in inputs.migratable if n in tables]
+
+    def factory(selected, focus):
+        return exclusion_context_for(
+            migration_state, inventory, applied_conversions=inputs.applied,
+            preserve_foreign_keys=inputs.preserve_foreign_keys, selected_tables=selected,
+            focus_tables=focus, view_ddls=inputs.view_ddls, warnings=True,
+        )
+
+    capture = None
+    if capture_tables is not None:
+        def capture(columns, selected):
+            return capture_exclusions_for(
+                columns, columns, inventory, list(capture_tables(selected)), deployed)
+
+    resolution = resolve_exclusion_rules(
+        text,
+        migratable=migratable,
+        source_type=source_type,
+        effective_selection=inputs.selected,
+        rule_excluded_prev=prev,
+        selection_lock_reason=selection_lock_reason,
+        retick_overrides=reticks,
+        context_factory=factory,
+        applied_conversions=inputs.applied,
+        live_columns=inputs.live_columns,
+        legacy=legacy,
+        stored_columns=stored,
+        capture=capture,
+    )
+    migration_state._exclusion_resolution_memo = (key, held, resolution)
+    return resolution
+
+
+@dataclass(frozen=True)
+class ExclusionDrift:
+    """What re-resolving the SAVED rules would change now (after Refresh objects, a tree
+    tick): shown as a chip and in the Start dialog, never applied."""
+
+    added: "tuple[tuple[str, str], ...]"
+    removed: "tuple[tuple[str, str], ...]"
+    unselects: "tuple[str, ...]"
+    reselects: "tuple[str, ...]"
+
+
+def exclusion_drift(migration_state, resolution) -> "Optional[ExclusionDrift]":
+    """The difference between ``resolution`` (of the saved rules) and the stored state, or
+    ``None``. A rule-excluded table re-ticked in the tree is an override, not drift; a
+    resolution with errors makes no claim."""
+    if resolution is None or not resolution.can_save:
+        return None
+    stored = migration_state.lob_exclusions()
+    now = {(t, c) for t, cs in resolution.columns.items() for c in cs}
+    before = {(t, c) for t, cs in stored.items() for c in cs}
+    reticks = migration_state.rule_reticked_tables()
+    unselects = tuple(t for t in resolution.tables_to_unselect if t not in reticks)
+    drift = ExclusionDrift(tuple(sorted(now - before)), tuple(sorted(before - now)),
+                           unselects, tuple(resolution.tables_to_reselect))
+    if not (drift.added or drift.removed or drift.unselects or drift.reselects):
+        return None
+    return drift
+
+
+def open_lob_candidates(candidates, excluded: "Mapping[str, Iterable[str]]"):
+    """Oversized-LOB candidates minus the columns ``excluded`` already excludes. Works on
+    :class:`LobExclusionCandidate` lists and on one table's ``(column, type)`` pairs
+    (``excluded`` then maps that table); empty tables drop out."""
+    if candidates and isinstance(candidates[0], LobExclusionCandidate):
+        out = []
+        for c in candidates:
+            gone = set(excluded.get(c.table, ()) or ())
+            kept = tuple(col for col in c.columns if col not in gone)
+            if kept:
+                out.append(LobExclusionCandidate(table=c.table, columns=kept))
+        return out
+    gone = set(excluded or ())
+    return tuple(pair for pair in candidates or () if pair[0] not in gone)
+
+
+QUARANTINE_RULE_COMMENT = "# from the Full Load quarantine"
+
+
+@dataclass(frozen=True)
+class QuarantineSuggestion:
+    """What the "Exclude column & reload" route does with one quarantined table.
+
+    ``outcome``: ``A`` (``lines`` to insert, one per column the reason's type names that
+    the open rules leave open; ``kept`` maps a column an include keeps to its line),
+    ``NOT_SAVED`` (only an unsaved or pending line -- ``not_saved_lines`` -- excludes it:
+    Save), ``B`` (the reason names no open column: pick one; ``filter_table`` when section
+    4 has rows for it) or ``C`` (the saved rules exclude every flagged column: the value
+    is in another column)."""
+
+    outcome: str
+    lines: "tuple[str, ...]" = ()
+    kept: "Mapping[str, tuple[int, ...]]" = field(default_factory=dict)
+    not_saved_lines: "tuple[int, ...]" = ()
+    filter_table: bool = False
+
+
+def quarantine_rule_suggestion(
+    table: str,
+    reason_text: str,
+    candidates: "Sequence[tuple[str, str]]",
+    *,
+    open_excluded: "Iterable[str]",
+    saved_excluded: "Iterable[str]",
+    include_keepers: "Mapping[str, tuple[int, ...]]" = (),
+    open_excluded_by: "Mapping[str, tuple[int, ...]]" = (),
+    source_type: SourceType = SourceType.MYSQL,
+) -> QuarantineSuggestion:
+    """Decide the quarantine route's outcome for ``table`` (first match wins), from its
+    ``(column, type)`` LOB candidates. OPEN = minus what the OPEN rule text excludes (the
+    editor, else the saved rules plus pending lines) -- it decides which lines to insert,
+    so none duplicates one already there; SAVED = minus the effective (saved) set -- it
+    decides the copy when nothing is inserted, so a column only an unsaved line excludes is
+    never treated as fixed. ``include_keepers``/``open_excluded_by`` map a column to the
+    include lines keeping it / the open lines excluding it."""
+    from dsql_migrator.core.exclusion_rules import rule_part_token
+
+    keepers = dict(include_keepers or {})
+    by_line = dict(open_excluded_by or {})
+    open_c = open_lob_candidates(candidates, open_excluded)
+    saved_c = open_lob_candidates(candidates, saved_excluded)
+    pre_open = preselect_lob_columns_for_reason(open_c, reason_text, source_type=source_type)
+    if pre_open:
+        schema, _sep, rest = table.partition(".")
+        lines, kept = [], {}
+        for column in pre_open:
+            if column in keepers:
+                kept[column] = tuple(keepers[column])
+                continue
+            lines.append("exclude " + ".".join(rule_part_token(x) for x in (schema, rest, column))
+                         + f"  {QUARANTINE_RULE_COMMENT}")
+        return QuarantineSuggestion("A", tuple(lines), kept)
+    pre_saved = preselect_lob_columns_for_reason(saved_c, reason_text, source_type=source_type)
+    if pre_saved:
+        lines = tuple(sorted({n for c in pre_saved for n in by_line.get(c, ())}))
+        return QuarantineSuggestion("NOT_SAVED", not_saved_lines=lines)
+    if saved_c:
+        if open_c:
+            return QuarantineSuggestion("B", filter_table=True)
+        lines = tuple(sorted({n for c, _t in saved_c for n in by_line.get(c, ())}))
+        return QuarantineSuggestion("B", not_saved_lines=lines)
+    return QuarantineSuggestion("C")
+
+
+@dataclass(frozen=True)
+class ExclusionRowSummary:
+    """The button row's summary under the tree: ``variant`` is ``nothing``, ``counts``,
+    ``locked``, ``drift`` or ``blocking`` (a notice box, not a hint); the LOB line counts
+    the type-based candidates the open rules leave open in the selected tables."""
+
+    variant: str
+    text: str
+    lob_count: int = 0
+    lob_text: "Optional[str]" = None
+    lob_tone: str = "info"
+
+
+def _count_text(tables: int, columns: int) -> str:
+    parts = []
+    if tables:
+        parts.append(f"{tables} table{'s' if tables != 1 else ''}")
+    if columns:
+        parts.append(f"{columns} column{'s' if columns != 1 else ''}")
+    return ", ".join(parts)
+
+
+def exclusion_row_summary(
+    migration_state,
+    *,
+    locked: bool,
+    drift: "Optional[ExclusionDrift]",
+    block_reason: "Optional[str]",
+    blocking_count: int = 0,
+    lob_candidates: "Sequence[LobExclusionCandidate]" = (),
+    measured_over: "Iterable[str]" = (),
+) -> ExclusionRowSummary:
+    """The row's variant and copy. "N tables" counts only the RULE-excluded tables (the
+    tree counter stays the one selection number); ``lob_candidates`` are already scoped
+    and minus the open exclusions; the LOB line turns warning only when a measured
+    over-limit value (``measured_over``, "table.column") is still not excluded."""
+    stored = migration_state.lob_exclusions()
+    columns = sum(len(c) for c in stored.values())
+    tables = len(migration_state.rule_excluded_tables())
+    counts = _count_text(tables, columns)
+    lob_count = sum(len(c.columns) for c in lob_candidates)
+    lob_text = None
+    lob_tone = "info"
+    if lob_count:
+        lob_text = (
+            f"{lob_count} column{'s' if lob_count != 1 else ''} in the selected tables can "
+            "exceed Aurora DSQL's value limit (type-based). Review them in Exclude tables & "
+            "columns."
+        )
+        open_names = {f"{c.table}.{col}" for c in lob_candidates for col in c.columns}
+        if open_names & set(measured_over):
+            lob_tone = "warning"
+    if block_reason:
+        n = blocking_count or 1
+        text = (f"{n} saved exclusion{'s' if n != 1 else ''} no longer appl"
+                f"{'y' if n != 1 else 'ies'}. Starting is blocked until you review them.")
+        return ExclusionRowSummary("blocking", text, lob_count, lob_text, lob_tone)
+    if locked:
+        text = f"{counts} excluded - locked" if counts else "Nothing excluded - locked"
+        return ExclusionRowSummary("locked", text, lob_count, lob_text, lob_tone)
+    if drift is not None:
+        bits = []
+        if drift.added:
+            names = ", ".join(f"{t}.{c}" for t, c in drift.added[:3])
+            more = f" and {len(drift.added) - 3} more" if len(drift.added) > 3 else ""
+            n = len(drift.added)
+            bits.append(f"match {n} more column{'s' if n != 1 else ''} ({names}{more})")
+        if drift.removed:
+            n = len(drift.removed)
+            bits.append(f"no longer match {n} saved column{'s' if n != 1 else ''}")
+        if drift.unselects or drift.reselects:
+            bits.append("would change the table selection")
+        text = "Your rules now " + "; ".join(bits) + " - review"
+        return ExclusionRowSummary("drift", text, lob_count, lob_text, lob_tone)
+    if counts:
+        return ExclusionRowSummary("counts", f"Rules exclude {counts}", lob_count, lob_text,
+                                   lob_tone)
+    return ExclusionRowSummary("nothing", "Nothing excluded", lob_count, lob_text, lob_tone)
 
 
 def exclusion_refusal(migration_state, inventory, table_name: str, columns) -> "Optional[str]":

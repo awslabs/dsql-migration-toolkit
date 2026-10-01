@@ -789,7 +789,8 @@ def build_data_migration_screen(
             # ... and seed the live resolver with it, so the gates reuse THIS conversion
             # instead of converting again.
             _exclusion_resolver.seed(
-                inventory, _conversion_signature(conv_state, session), _applied
+                inventory, _conversion_signature(conv_state, session), _applied,
+                applied_view_ddls(_conversion, conv_state.edited_target_ddls),
             )
             # Which FK constraints THIS migration OWNS, for the CDC-start precondition:
             # an enforced FK on the target dead-letters out-of-order child rows (23503),
@@ -2860,8 +2861,9 @@ def make_exclusion_inputs_resolver(
     """
     memo: dict = {}
 
-    def seed(inventory, signature, applied) -> None:
-        memo.update(inventory=inventory, signature=signature, applied=applied)
+    def seed(inventory, signature, applied, view_ddls=None) -> None:
+        memo.update(inventory=inventory, signature=signature, applied=applied,
+                    view_ddls=view_ddls)
 
     def resolve():
         inventory = inventory_fn()
@@ -2869,7 +2871,11 @@ def make_exclusion_inputs_resolver(
             return None
         target_inventory = target_inventory_fn()
         signature = _conversion_signature(conv_state, session)
-        if memo.get("inventory") is not inventory or memo.get("signature") != signature:
+        if (
+            memo.get("inventory") is not inventory
+            or memo.get("signature") != signature
+            or memo.get("view_ddls") is None
+        ):
             conversion = SchemaConverter(source_type=signature[0]).convert(inventory)
             seed(
                 inventory,
@@ -2879,6 +2885,7 @@ def make_exclusion_inputs_resolver(
                     conv_state.edited_target_ddls,
                     preserve_foreign_keys=conv_state.preserve_foreign_keys,
                 ),
+                applied_view_ddls(conversion, conv_state.edited_target_ddls),
             )
         if "target" not in memo or memo["target"] is not target_inventory:
             memo.update(
@@ -2891,6 +2898,11 @@ def make_exclusion_inputs_resolver(
             applied=memo["applied"],
             preserve_foreign_keys=bool(conv_state.preserve_foreign_keys),
             live_columns=memo["live"],
+            migratable=migratable_table_names(
+                inventory, conv_state.generated_node_ids, target_inventory
+            ),
+            view_ddls=memo["view_ddls"],
+            signature=signature,
         )
 
     resolve.seed = seed  # type: ignore[attr-defined]

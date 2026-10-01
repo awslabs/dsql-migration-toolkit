@@ -205,6 +205,9 @@ class DataMigrationState:
         # Suggested rule lines waiting for the popup (e.g. a quarantine or DLQ route while
         # the rules are locked); inserted on each open until a Save takes them.
         self._exclusion_pending_rules: list[str] = []
+        # The popup's last resolution (key, held inputs, result): the row and the popup
+        # re-resolve only when an input changed. Transient.
+        self._exclusion_resolution_memo: Optional[tuple] = None
         # Composite-PK record-key override for CDC, keyed by db.table -> target key
         # columns [leading, pk...]. Set from the applied Schema Conversion when a
         # table's DSQL target has a composite key, so Debezium re-keys the change
