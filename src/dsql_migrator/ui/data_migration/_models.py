@@ -1364,10 +1364,10 @@ class LobExclusionCandidate:
 
     ``columns`` are the column names flagged by the evaluation ``OVERSIZED_LOB``
     rule (MySQL ``mediumtext/longtext/mediumblob/longblob``) whose values can
-    exceed the Aurora DSQL 1 MiB per-value limit. Excluding them at capture
-    (Debezium ``column.exclude.list``) is the only safe handling for values that
-    can also exceed the 8 MiB broker limit -- runtime isolation cannot catch
-    those.
+    exceed the Aurora DSQL 1 MiB per-value limit. Excluding them (the column then
+    migrates as NULL, and Debezium's ``column.exclude.list`` never captures it) is the
+    safe handling for values that can also exceed the CDC message size limit --
+    runtime isolation cannot catch those.
     """
 
     table: str
@@ -2639,7 +2639,7 @@ def missing_column_block_reason(
 
 
 def stored_exclusion_block_reason(
-    issues, *, where: str = "in 'Oversized LOB columns' above"
+    issues, *, where: str = "in Exclude tables & columns (under the table list)"
 ) -> "Optional[str]":
     """The gate text for stored-entry ERRORs, or ``None`` when nothing blocks.
 
@@ -2849,8 +2849,8 @@ def capture_exclusion_mismatch(
 
     if stack is None:
         how = (
-            "Delete the CDC infrastructure, choose the columns to exclude on the card, then "
-            "deploy it again."
+            "Delete the CDC infrastructure, change the rules in Exclude tables & columns, "
+            "then deploy it again."
             if getattr(migration_state, "job_id", None) is None
             else "Delete the CDC infrastructure and deploy it again: it then captures with "
             "this session's set, the one its Full Load used (changing that set needs Start "
@@ -3010,14 +3010,12 @@ def capture_ambiguity_warning(capture: "CdcCaptureExclusions") -> "Optional[str]
 
 # The remedy for a capture-size refusal while the exclusion card is still editable.
 CAPTURE_SIZE_REMEDY_UNLOCKED = (
-    "Exclude fewer columns under 'Oversized LOB columns' above first."
+    "Narrow the rules in Exclude tables & columns (under the table list) first."
 )
 
 
-# DSQL caps a single value at 1 MiB and the MSK Serverless broker caps a message
-# at 8 MiB; the Kafka *client* default is 1 MiB (spike H13). Used for display.
+# DSQL caps a single value at 1 MiB. Used for display.
 _DSQL_VALUE_LIMIT_MIB = 1
-_BROKER_MESSAGE_LIMIT_MIB = 8
 
 
 @dataclass(frozen=True)

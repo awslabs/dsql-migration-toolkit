@@ -199,6 +199,11 @@ def render_exclusion_button_row(ui, ctx: ExclusionDialogContext):
             )
         if summary.lob_text:
             inline_hint(ui, summary.lob_text, tone=summary.lob_tone)
+        if lock.locked:
+            noted = [i for i in issues if i.severity is IssueSeverity.WARNING]
+            if noted:
+                inline_hint(ui, f"{len(noted)} saved exclusion{'s' if len(noted) != 1 else ''} "
+                            "need attention: open Exclude tables & columns.", tone="warning")
 
     row()
     return row
@@ -1105,6 +1110,15 @@ def _build_read_only_dialog(ui, ctx: ExclusionDialogContext, lock, *, hint=None,
         n = sum(len(c) for c in stored.values())
         tables = sum(1 for c in stored.values() if c)
         inline_hint(ui, f"Columns: {n} excluded in {tables} table{'s' if tables != 1 else ''}")
+        # What each saved entry does now that the set is fixed (a key column still migrates,
+        # a computed one is already omitted...): never blocking after the lock.
+        inputs = ctx.inputs_fn()
+        for issue in stored_exclusion_issues(
+            state, inventory, committed=True,
+            selected_tables=inputs.selected if inputs is not None else None,
+        ):
+            inline_hint(ui, issue.message,
+                        tone="warning" if issue.severity.value == "warning" else "neutral")
         # While the stack is being deleted its set is going away: no remedy text then.
         _render_deployed_capture(ui, ctx, inventory, with_mismatch=lock.tier != 0)
         if lock.offers_change_and_reload:

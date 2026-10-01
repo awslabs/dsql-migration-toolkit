@@ -262,7 +262,7 @@ def test_block_reason_names_the_entries_and_where_to_remove_them():
     one = stored_exclusion_block_reason(
         stored_exclusion_issues(_state_with([("shop.users", "id")]), INV, committed=False))
     assert one.startswith("1 saved column exclusion no longer applies: shop.users.id")
-    assert one.endswith("Remove it in 'Oversized LOB columns' above first.")
+    assert one.endswith("Remove it in Exclude tables & columns (under the table list) first.")
     many = _state_with([("shop.users", "id"), ("shop.users", "a"), ("shop.users", "b"), ("shop.users", "c")])
     text = stored_exclusion_block_reason(stored_exclusion_issues(many, INV, committed=False))
     assert text.startswith("4 saved column exclusions no longer apply:") and "And 1 more." in text
@@ -310,14 +310,9 @@ def test_screen_wires_the_gate_with_the_cards_own_lock_and_records_the_conversio
     def _kw(call, key):
         return next(ast.unparse(k.value) for k in call.keywords if k.arg == key)
 
-    (panel,) = _calls("_render_cdc_lob_exclusion_panel")
-    assert _kw(panel, "locked") == "_exclusions_committed"
-    assert _kw(panel, "selected_tables") == "selected_names"
-    (assign,) = [
-        n for n in ast.walk(tree)
-        if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "_exclusions_committed"
-    ]
-    assert ast.unparse(assign.value) == "exclusion_card_locked(migration_state, job_manager, session)"
+    # P3-C22: the old card is gone; the popup's row is rendered under the tree.
+    assert not _calls("_render_cdc_lob_exclusion_panel")
+    assert _calls("render_exclusion_button_row")
     (record_sel,) = _calls("set_resolved_selection")
     assert ast.unparse(record_sel.args[0]) == "selected_names"
     # In-content guard + runner() defense in depth.
@@ -426,28 +421,6 @@ def test_both_recovery_actions_check_the_rule_before_writing():
         dm.build_data_migration_screen)
 
 
-def test_card_refuses_a_blocked_candidate_but_lets_a_ticked_one_be_cleared():
-    from dsql_migrator.ui.data_migration import _cdc_ui
-
-    from tests.test_ui_data_migration import _RecordingUi
-
-    inv, applied = _lob_inventory()
-    state = _state_with([("shop.docs", "summary")])
-    state.set_applied_conversions(applied, preserve_foreign_keys=True)
-    ui = _RecordingUi()
-    _cdc_ui._render_cdc_lob_exclusion_panel(
-        ui, state, inv, lambda: None, locked=False, migration_wide=True)
-    boxes = {b.label: b for b in ui.checkboxes}
-    assert boxes["shop.docs.body"].enabled and boxes["shop.docs.body"].on_change
-    for refused in ("shop.docs.tenant", "shop.docs.ref"):
-        assert not boxes[refused].enabled and boxes[refused].on_change is None, refused
-    # Already ticked (a saved B4 entry): still clearable from its box.
-    assert boxes["shop.docs.summary"].enabled and boxes["shop.docs.summary"].on_change
-    joined = " ".join(ui.texts)
-    assert "Part of the target primary key" in joined and "Referenced by shop.notes.fk_doc" in joined
-
-
-
 # ---------------------------------------------------------------------------
 # A source column the applied target DDL lacks (42703): reported, never auto-excluded
 # ---------------------------------------------------------------------------
@@ -528,9 +501,9 @@ def test_memory_pressure_copy_does_not_offer_a_locked_exclusion_mid_load():
 
     src = inspect.getsource(_full_load_engine)
     assert "exclude oversized-LOB columns, or" not in src
-    # (the activity-log copy splits the sentence across two adjacent literals)
-    assert src.count("only before a load; the choice") == 2
-    assert src.count("locks once a Full Load has run.") == 2
+    # P3-C22: both copies name the popup and its Change & reload, never the old card.
+    assert "Oversized LOB columns" not in src
+    assert src.count("Change & reload reloads the tables.") == 2
 
 
 def test_b3_and_b4_follow_the_edited_script_not_the_source():
@@ -651,33 +624,6 @@ def test_attach_is_held_like_deploy_and_refuses_at_click_time():
         inventory=INV, session=None)
     (ok,) = [b for b in ui2.buttons if b.text == "Attach to dsql-cdc-old"]
     assert "disable" not in ok.props_seen
-
-
-def test_post_lock_copy_names_the_real_cause_and_what_each_entry_does():
-    from dsql_migrator.ui.data_migration import _cdc_ui
-
-    from tests.test_ui_data_migration import _RecordingUi
-
-    stored = {"shop.users": {"id", "email"}, "shop.orders": {"total2"}}
-    ctx = build_exclusion_context(INV, APPLIED)
-    after = {(i.table, i.column): i for i in check_stored_exclusions(stored, ctx, committed=True)}
-    assert after[("shop.users", "id")].message.startswith("shop.users.id is still migrated:")
-    assert after[("shop.users", "email")].message.startswith("shop.users.email stays excluded, but:")
-    assert after[("shop.orders", "total2")].severity is IssueSeverity.INFO
-
-    state = _state_with([("shop.users", "id")])
-    for note, expected in (("The data already moved under this set, so it is left as it is.",
-                            "already moved under this set"),
-                           ("The CDC infrastructure was deployed with this set; to change it, "
-                            "delete the CDC infrastructure on the CDC step first.",
-                            "delete the CDC infrastructure on the CDC step first")):
-        ui = _RecordingUi()
-        _cdc_ui._render_cdc_lob_exclusion_panel(
-            ui, state, INV, lambda: None, locked=True, lock_reason="Locked.",
-            migration_wide=True, after_lock_note=note)
-        joined = " ".join(ui.texts)
-        assert expected in joined, (data_moved, joined)
-        assert "1 saved column exclusion does not apply as saved" in joined
 
 
 def test_the_context_parses_each_ddl_once_across_renders():

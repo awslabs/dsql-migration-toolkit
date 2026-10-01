@@ -635,7 +635,7 @@ def test_the_activity_copy_names_null_legacy_and_plain_exclusions(events):
     details = {e[2]: e[3] for e in events if e[0] == "column excluded"}
     assert "every row stores NULL" in details["t.a"]
     assert "earlier version" in details["t.b"] and "not altered" in details["t.b"]
-    assert "left NULL on the target" in details["t.c"]  # unchanged when not an overlay entry
+    assert "NULL on the target" in details["t.c"]  # unchanged when not an overlay entry
     migrator = BatchedTableMigrator(inputs, exporter=object(), watermark_capturer=object())
     assert _lob_excluded_note(migrator, "t") == " (3 column(s) excluded: a, b, c; loaded as NULL: a)"
     only = BatchedTableMigrator(dataclasses.replace(inputs, overlay_columns={"t": frozenset({"a", "b", "c"})}),

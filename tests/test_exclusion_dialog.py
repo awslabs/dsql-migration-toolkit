@@ -1069,3 +1069,45 @@ def test_the_delete_wait_popup_shows_no_remedy_for_a_differing_stack_set():
     ui = _Ui()
     open_exclusion_dialog(ui, ctx)
     assert not any("Delete the CDC infrastructure" in t or "Start over" in t for t in ui.texts)
+
+
+# --- P3-C22: the old cards are gone ---------------------------------------------------------
+
+
+def test_no_surface_renders_the_old_card_name():
+    import pathlib
+
+    import dsql_migrator.ui.data_migration as dm
+
+    root = pathlib.Path(dm.__file__).parent
+    for path in root.glob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        assert "'Oversized LOB columns'" not in text and '"Oversized LOB columns' not in text, path.name
+
+
+def test_the_cdc_step_summary_shows_what_cdc_receives_as_deployed():
+    from dsql_migrator.core.models import SourceInventory
+    from dsql_migrator.ui.data_migration._cdc_ui import _render_cdc_exclusion_summary
+
+    state = DataMigrationState()
+    state.restore_lob_exclusion("shop.t", "a")
+    state.set_cdc_deployed_column_exclude_list("shop.t.a")
+    ui = _Ui()
+    _render_cdc_exclusion_summary(ui, state, SimpleNamespace(get_status=_none),
+                                  SourceInventory(tables=list(INV.tables)))
+    assert any(t.startswith("Excluded: 1 column (change them in Exclude tables & columns")
+               for t in ui.texts)
+    assert any(t.startswith("What CDC receives (") and t.endswith("as deployed)")
+               for t in ui.expansions)
+    assert "shop.t.a" in ui.texts
+
+
+def test_saved_entry_notes_stay_visible_after_the_lock():
+    ctx, state = _locked_ctx(mtype=MigrationType.FULL_LOAD_AND_CDC, job_id="job-1")
+    state.restore_lob_exclusion("shop.t", "id")  # a primary key: still migrated
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx)
+    assert any("shop.t.id is still migrated" in t for t in ui.texts)
+    row_ui = _Ui()
+    render_exclusion_button_row(row_ui, ctx)
+    assert any(t.endswith("need attention: open Exclude tables & columns.") for t in row_ui.texts)

@@ -86,7 +86,6 @@ from dsql_migrator.ui.data_migration._models import (
     MigrationType,
     classify_restored_exclusions,
     cutover_restore_block_reason,
-    _BROKER_MESSAGE_LIMIT_MIB,
     _DSQL_VALUE_LIMIT_MIB,
     assess_dlq_health,
     build_lag_chart_option,
@@ -399,7 +398,6 @@ def _render_cdc_step(
     migration_type: "MigrationType" = MigrationType.CDC_ONLY,
     run_checks=None,
     session: object = None,
-    full_load_status: "Optional[StepStatus]" = None,
     cdc_ai_opener=None,
     ai_post_event=None,
     lob_candidates_for=None,
@@ -444,56 +442,10 @@ def _render_cdc_step(
         session=session,
     )
 
-    # 3. PREPARE: oversized-LOB exclusion influences the captured columns, so it
-    #    sits with the start-point decision (it feeds column.exclude.list).
-    #
-    # Only for CDC ONLY: any type that also runs a Full Load renders this same
-    # migration-wide selection on the Full Load screen (before the load, so the
-    # load and prerequisite gate honor it), and locks it once the load's checks
-    # run. Re-rendering it here would double the card and, worse, let the operator
-    # think a post-Full-Load tick still changes what the completed load wrote. CDC
-    # only has no Full Load screen, so this is its single home.
-    if migration_type is MigrationType.CDC_ONLY:
-        # A Full Load committed under an exclusion set survives a switch to cdc_only:
-        # the FULL_LOAD workflow step stays DONE (even after the job record is pruned)
-        # and job_id persists. Either signal means the exclusion is baked into loaded
-        # data and must not change now (silent split-brain) -- so lock the card, exactly
-        # as selection_lock_reason locks the Full Load screen's copy on `has_job or DONE`.
-        # job_id ONLY: CDC alone promotes the FULL_LOAD step to DONE once it streams, so
-        # the step said "a Full Load committed" about every CDC-only session that had
-        # streamed and kept the card locked after its stack was deleted (see
-        # exclusion_card_locked, which this must agree with).
-        full_load_committed = getattr(migration_state, "job_id", None) is not None
-        lob_locked, lob_lock_reason = lob_exclusion_lock(
-            migration_state, job_manager, full_load_committed=full_load_committed
-        )
-        _render_cdc_lob_exclusion_panel(
-            ui,
-            migration_state,
-            inventory,
-            refresh,
-            locked=lob_locked,
-            # The strict-order cause and its TRUE remedy (exclusion_lock_state) first.
-            lock_reason=exclusion_lock_state(migration_state, job_manager).reason
-            or lob_lock_reason,
-            # The post-lock sentence true for the lock's real cause (data moved, or a
-            # stack being deleted / created / deployed with the set).
-            after_lock_note=exclusion_after_lock_note(migration_state, job_manager),
-            source_type=_cdc_source_type(session),
-            # What Start CDC will SEND (preview == sent): the effective set plus the
-            # captured tables' generated columns, in the form the chooser picks.
-            capture_preview=cdc_capture_exclusions(
-                migration_state,
-                inventory,
-                _cdc_tables_for_config(
-                    migration_state,
-                    inventory,
-                    _cdc_watermark(
-                        _current_job(job_manager, getattr(migration_state, "job_id", None))
-                    ),
-                ),
-            ).sent,
-        )
+    # 3. PREPARE: the column exclusions feed column.exclude.list. They are edited in
+    #    "Exclude tables & columns" under the table list (one home for every type); the
+    #    CDC step only says what CDC receives.
+    _render_cdc_exclusion_summary(ui, migration_state, job_manager, inventory)
 
     # 4. START: actually deploy the connectors (cloudformation update_stack) and
     #    show step-by-step progress.
@@ -851,6 +803,48 @@ def _sentinel_watermark() -> "Watermark":
     valid watermark stamped with the current time so the type contract holds.
     """
     return Watermark(snapshot_timestamp=datetime.now(timezone.utc))
+
+def _render_cdc_exclusion_summary(ui, migration_state, job_manager, inventory) -> None:
+    """The CDC step's read-only line: how much is excluded, and the ColumnExcludeList CDC
+    receives -- as deployed when a stack carries one, else what Start CDC would send
+    (preview == sent). Nothing is drawn when nothing is excluded or captured."""
+    from dsql_migrator.core.cdc import CDC_PARAMETER_BYTE_LIMIT
+    from dsql_migrator.ui.design import CODE_SURFACE_CLASSES, inline_hint
+
+    if inventory is None:
+        return
+    stored = effective_lob_exclusions(migration_state, inventory)
+    columns = sum(len(c) for c in stored.values())
+    getter = getattr(migration_state, "exclusion_inputs", None)
+    inputs = getter() if callable(getter) else None
+    tables = migration_state.rule_excluded_tables()
+    if inputs is not None:
+        tables = tables & set(inputs.migratable)
+    deployed = getattr(migration_state, "cdc_deployed_column_exclude_list", None)
+    if deployed is not None:
+        value, origin = deployed, "as deployed"
+    else:
+        captured = _cdc_tables_for_config(
+            migration_state, inventory,
+            _cdc_watermark(_current_job(job_manager, getattr(migration_state, "job_id", None))),
+        )
+        value, origin = cdc_capture_exclusions(migration_state, inventory, captured).sent, "Start CDC sends"
+    if not columns and not tables and not value:
+        return
+    parts = []
+    if tables:
+        parts.append(f"{len(tables)} table{'s' if len(tables) != 1 else ''}")
+    parts.append(f"{columns} column{'s' if columns != 1 else ''}")
+    inline_hint(ui, f"Excluded: {', '.join(parts)} (change them in Exclude tables & columns "
+                "above the steps).")
+    size = len((value or "").encode("utf-8"))
+    with ui.expansion(  # type: ignore[attr-defined]
+        f"What CDC receives ({size:,} of {CDC_PARAMETER_BYTE_LIMIT:,} bytes; {origin})"
+    ).classes("w-full text-xs"):
+        with ui.column().classes(f"w-full gap-0 p-2 {CODE_SURFACE_CLASSES}"):  # type: ignore[attr-defined]
+            ui.label(value or "(nothing excluded at capture)").classes(  # type: ignore[attr-defined]
+                "text-xs font-mono wrap-anywhere")
+
 
 def _cdc_tables_for_config(
     migration_state, inventory: Optional[SourceInventory], watermark
@@ -2737,7 +2731,7 @@ def _render_cdc_attach_row(
     *,
     inventory=None,
     session=None,
-    where: str = "in 'Oversized LOB columns' above",
+    where: str = "in Exclude tables & columns (under the table list)",
 ) -> None:
     """The "Attach to <stack>" buttons -- ONE implementation for every surface offering them.
 
@@ -3058,7 +3052,7 @@ def _deploy_block_notice(
     *,
     include_capture: bool = True,
     include_missing: bool = True,
-    where: str = "in 'Oversized LOB columns' above",
+    where: str = "in Exclude tables & columns (under the table list)",
     capture=None,
 ):
     """``(header, body)`` of what holds Deploy CDC infrastructure (or Attach), or ``None``.
@@ -6615,20 +6609,16 @@ from dsql_migrator.ui.data_migration._cdc_monitoring import (  # noqa: E402,F401
     _render_cdc_error_download,
     _render_cdc_handling_panel,
     _render_cdc_live_monitoring,
-    _render_cdc_lob_exclusion_panel,
     _render_cdc_pipeline_health,
     _render_cdc_schema_drift_banner,
     _render_change_flow_status,
     _render_full_load_quarantine_pointer,
     _render_migration_table_status,
-    exclude_and_reload_block_reason,
     exclusion_lock_state,
     change_and_reload_block_reason,
     fk_apply_running,
-    exclusion_after_lock_note,
     capture_error_with_remedy,
     cdc_stack_being_deleted,
     cdc_delete_eta,
     _render_cdc_oversized_recovery_without_monitoring,
-    lob_exclusion_lock,
 )

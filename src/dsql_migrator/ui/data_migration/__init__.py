@@ -260,7 +260,6 @@ from dsql_migrator.ui.data_migration._models import (
     scope_lob_candidates,
     format_column_exclude_list,
     _DSQL_VALUE_LIMIT_MIB,
-    _BROKER_MESSAGE_LIMIT_MIB,
     DlqHealth,
     assess_dlq_health,
     ConnectorHealthRow,
@@ -1472,70 +1471,18 @@ def build_data_migration_screen(
             )
             # job_id, not the FULL_LOAD step: CDC alone promotes that step to DONE (see
             # exclusion_card_locked, which this reason must agree with).
-            _lob_locked, _lob_reason = lob_exclusion_lock(
-                migration_state,
-                job_manager,
-                full_load_committed=getattr(migration_state, "job_id", None) is not None,
-            )
             # Every exclusion gate (this screen, the header Run, Deploy, Attach) judges the
-            # tables THIS render resolved -- the same set the card below is given.
+            # tables THIS render resolved. The exclusions themselves are edited in the
+            # "Exclude tables & columns" popup under the table list.
             migration_state.set_resolved_selection(selected_names)
-            _exclusions_committed = exclusion_card_locked(
-                migration_state, job_manager, session
-            )
             # The capture list CDC will send after this load: computed ONCE per render for
-            # both the Continue/Start hold and the card's notices (Full load + CDC only).
+            # the Continue/Start hold (Full load + CDC only).
             _pre_load_capture_now = (
                 _pre_load_capture(migration_state, inventory)
                 if migration_type is MigrationType.FULL_LOAD_AND_CDC
                 and getattr(migration_state, "job_id", None) is None
                 else None
             )
-            if migration_type is not MigrationType.CDC_ONLY:
-                # The LOB tick boxes are frozen by the same lock as the table picker, but
-                # they need the LOB-SPECIFIC reason: the picker's copy only talks about
-                # "a different set of tables", while a user who forgot to exclude a column
-                # is trying to change the COLUMNS -- so that sentence does not read as
-                # applying to them, and they cannot find the way out (which is the same
-                # 'Start over'). Passing lock_reason=None was worse still: the panel only
-                # renders text `if locked and lock_reason`, so the boxes were frozen with
-                # NO explanation at all -- the "silent frozen box reads as a bug" state
-                # that panel's own comment says must never happen. lob_exclusion_lock
-                # already writes the right sentence for each cause; reuse it.
-                _render_cdc_lob_exclusion_panel(
-                    ui,
-                    migration_state,
-                    inventory,
-                    refresh,
-                    # == selection_locked or _lob_locked, via the ONE definition the gates
-                    # share (exclusion_card_locked).
-                    locked=_exclusions_committed,
-                    # Whether the lock means data moved (vs a stack that merely holds the
-                    # set), so the post-lock copy names the real cause and its remedy.
-                    after_lock_note=exclusion_after_lock_note(
-                        migration_state, job_manager
-                    ),
-                    capture_notices=capture_pre_load_notices(
-                        migration_state, job_manager, inventory,
-                        session=session, capture=_pre_load_capture_now,
-                    ),
-                    # Fall back to the SELECTION lock's reason when the LOB clause has
-                    # none: the `locked` flag is an OR, so any contributor without a
-                    # reason renders a frozen card with nothing explaining it (the panel
-                    # only draws the text `if locked and lock_reason`). Adding "unstable"
-                    # to lob_exclusion_lock closed today's instance; this closes the
-                    # CLASS, so the next contributor cannot reopen it.
-                    # The strict-order cause and its TRUE remedy first; the legacy
-                    # texts only for a lock that function does not model.
-                    lock_reason=(
-                        exclusion_lock_state(migration_state, job_manager).reason
-                        or _lob_reason
-                        or selection_lock
-                    ),
-                    migration_wide=True,
-                    selected_tables=selected_names,
-                    source_type=session_source_type(session),
-                )
             # A Full Load that already ran (live job, or the step reached DONE --
             # both survive a session restore) is proof its prerequisites passed at
             # start time, so a missing in-memory report (not persisted across a
@@ -2693,10 +2640,6 @@ def build_data_migration_screen(
                             # the activity-event seam for CDC transitions.
                             cdc_ai_opener=cdc_ai_opener,
                             ai_post_event=ai_post_event,
-                            # So the CDC-step LOB card can lock once a Full Load has
-                            # committed data under an exclusion set (survives a switch
-                            # to cdc_only): FULL_LOAD stays DONE across the switch.
-                            full_load_status=status,
                             # The DLQ's in-app recovery for rows dropped over DSQL's
                             # per-value limit: the candidate lookup needs the inventory and
                             # the exclusion writes migration-wide state, so both come from
@@ -2924,8 +2867,6 @@ def exclusion_card_locked(migration_state, job_manager, session=None) -> bool:
     loaded data" and no way to change the columns. ``session`` is accepted for callers'
     symmetry and unused.
     """
-    from dsql_migrator.ui.data_migration._cdc_monitoring import exclusion_lock_state
-
     return exclusion_lock_state(migration_state, job_manager).locked
 
 
@@ -3157,40 +3098,6 @@ def _pre_load_capture(migration_state, inventory):
     wanted = None if scope is None else set(scope)
     tables = [t for t in inventory.tables if wanted is None or t.name in wanted]
     return cdc_capture_exclusions(migration_state, inventory, tables)
-
-
-def capture_pre_load_notices(
-    migration_state, job_manager, inventory, *, session=None, capture=None
-) -> list[str]:
-    """Non-blocking CDC capture warnings for the Full Load screen's exclusion card.
-
-    Full load + CDC before any load: the generated columns alone exceed the capture limit
-    (Deploy will refuse; the true remedy is to capture fewer tables, still possible now),
-    and names Debezium cannot tell apart from another captured column.
-    """
-    if (
-        migration_state.migration_type is not MigrationType.FULL_LOAD_AND_CDC
-        or getattr(migration_state, "job_id", None) is not None
-    ):
-        return []
-    if capture is None:
-        capture = _pre_load_capture(migration_state, inventory)
-    if capture is None:
-        return []
-    notes: list[str] = []
-    if capture.error and capture.generated_bytes > CDC_PARAMETER_BYTE_LIMIT:
-        notes.append(
-            capture_error_with_remedy(
-                migration_state,
-                job_manager,
-                capture,
-                table_lock=table_set_lock_reason(migration_state, job_manager, session),
-            )
-        )
-    ambiguity = capture_ambiguity_warning(capture)
-    if ambiguity:
-        notes.append(ambiguity)
-    return notes
 
 
 def full_load_run_guard_reason(
@@ -3627,7 +3534,7 @@ def selection_lock_reason(
         "cdc" in substeps_for_type(migration_type)
         and cdc_infra_prep_state(migration_state, job_manager)
         in ("ready", "deploying")
-        and not _cdc_stack_being_deleted(migration_state, job_manager)
+        and not cdc_stack_being_deleted(migration_state, job_manager)
     ):
         return (
             "Locked — CDC infrastructure is deployed for this table set, and each "
@@ -3636,22 +3543,6 @@ def selection_lock_reason(
             "the CDC infrastructure on the CDC step first."
         )
     return None
-
-
-def _cdc_stack_being_deleted(migration_state, job_manager) -> bool:
-    """True while THIS session's cdc-stack is being torn down.
-
-    Deliberately keyed on the DELETE_IN_PROGRESS status (or an in-flight delete job), not on
-    "any teardown": a Stop CDC is an UPDATE that keeps MSK, the topics and the immutable
-    partition plan, so it must keep locking the table set. Pure apart from reading the job
-    status; no AWS I/O.
-    """
-    status = getattr(migration_state, "cdc_stack_phase_status", None)
-    if is_stack_teardown_status(status):
-        return True
-    return bool(
-        job_manager is not None and cdc_delete_in_flight(migration_state, job_manager)
-    )
 
 
 def _render_cdc_existing_infra_banner(
@@ -3781,11 +3672,7 @@ def _render_cdc_existing_infra_banner(
         _render_cdc_attach_row(
             ui, migration_state, job_manager, refresh, in_scope,
             inventory=inventory, session=session,
-            where=(
-                "in 'Oversized LOB columns' on the CDC step"
-                if migration_state.migration_type is MigrationType.CDC_ONLY
-                else "in 'Oversized LOB columns' below"
-            ),
+            where="in Exclude tables & columns (under the table list)",
         )
 
 
@@ -5208,13 +5095,9 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     cdc_infra_prep_state,
     _render_cdc_least_privilege_note,
     _render_cdc_live_monitoring,
-    _render_cdc_lob_exclusion_panel,
-    exclude_and_reload_block_reason,
-    lob_exclusion_lock,
     exclusion_lock_state,
     change_and_reload_block_reason,
     fk_apply_running,
-    exclusion_after_lock_note,
     capture_error_with_remedy,
     cdc_stack_being_deleted,
     cdc_delete_eta,

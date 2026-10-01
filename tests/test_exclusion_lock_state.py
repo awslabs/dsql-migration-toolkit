@@ -15,9 +15,7 @@ import pytest
 from dsql_migrator.core.models import SourceType
 from dsql_migrator.ui.data_migration import DataMigrationState, MigrationType
 from dsql_migrator.ui.data_migration._cdc_monitoring import (
-    exclude_and_reload_block_reason,
     exclusion_lock_state,
-    lob_exclusion_lock,
 )
 
 from tests.test_ui_data_migration import _StubJob, _StubJobManager
@@ -53,9 +51,6 @@ def test_a_running_delete_is_a_wait_not_a_remedy_and_beats_every_other_tier():
     restored.set_cdc_stack_phase("unstable", status="DELETE_IN_PROGRESS")
     lock = exclusion_lock_state(restored, _StubJobManager({}))
     assert lock.tier == 0 and "~2-5 min" in lock.reason  # PostgreSQL: no seeder
-    # The legacy locks say the same wait instead of offering the running Delete.
-    assert "being deleted" in lob_exclusion_lock(restored, _StubJobManager({}))[1]
-    assert "being deleted" in exclude_and_reload_block_reason(restored, _StubJobManager({}))
 
 
 def test_infra_being_created_is_tier_1():
@@ -149,9 +144,6 @@ def test_no_state_offers_a_partial_or_unavailable_remedy():
                             found = job_id is not None and "job-1" in jobs
                             if "Change & reload" in lock.reason:
                                 assert found, (mtype, phase, job_id, jobs)
-                        legacy = lob_exclusion_lock(state, _StubJobManager(jobs))[1]
-                        if legacy:
-                            reasons.append(legacy)
     assert reasons
     for text in reasons:
         assert "Stop CDC to change" not in text and "stop CDC first" not in text, text
@@ -289,27 +281,6 @@ def test_the_stack_cells():
     missing = _state(job_id="job-gone")
     missing.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
     assert exclusion_lock_state(missing, jm).cell == "R1b"
-
-
-def test_the_card_lock_is_the_lock_state_and_matches_the_old_predicate():
-    from dsql_migrator.ui.data_migration import exclusion_card_locked
-
-    cases = []
-    for job_id in (None, "job-1"):
-        for phase in (None, "absent", "infra", "running", "provisioning", "partial", "unstable"):
-            for job_kind in (None, "infra", "delete", "start"):
-                cases.append((job_id, phase, job_kind))
-    for job_id, phase, job_kind in cases:
-        state = _state(job_id=job_id)
-        jobs = {"job-1": _StubJob("DONE")}
-        if phase:
-            state.set_cdc_stack_phase(phase, status="CREATE_COMPLETE")
-        if job_kind:
-            state.set_cdc_deploy_job_id("op-1", kind=job_kind)
-            jobs["op-1"] = _StubJob("RUNNING")
-        jm = _StubJobManager(jobs)
-        old = lob_exclusion_lock(state, jm, full_load_committed=job_id is not None)[0]
-        assert exclusion_card_locked(state, jm) is old, (job_id, phase, job_kind)
 
 
 def test_seeder_answer_honours_the_restored_engine():

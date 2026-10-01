@@ -14012,7 +14012,7 @@ def test_excluded_lob_columns_are_logged_one_event_per_column(monkeypatch) -> No
     }
     one = events[0]
     assert one["status"].value == "info"  # expected, user-chosen -- not a fault
-    assert "left NULL on the target" in one["detail"]
+    assert "NULL on the target" in one["detail"]
     assert "not migrated" in one["detail"]
 
 
@@ -16885,252 +16885,6 @@ class _LockJobManager:
         return j
 
 
-def test_lob_exclusion_is_editable_before_anything_is_committed() -> None:
-    # Nothing deployed and nothing running -> the operator can still choose.
-    from dsql_migrator.ui.data_migration._cdc_ui import lob_exclusion_lock
-
-    state = DataMigrationState()
-
-    assert lob_exclusion_lock(state, _LockJobManager()) == (False, None)
-
-
-def test_lob_exclusion_locks_while_infrastructure_is_being_created() -> None:
-    """The reported gap: the tick boxes stayed live during an infra create.
-
-    ColumnExcludeList is a create-time stack parameter, so it was submitted with the
-    stack -- a later tick changed state nothing would read, and the box silently lied
-    about what CDC captures. This case DOES explain itself: the operator was just
-    here choosing, so the transition needs naming.
-    """
-    from dsql_migrator.ui.data_migration._cdc_ui import lob_exclusion_lock
-
-    state = DataMigrationState()
-    state.set_cdc_deploy_job_id("job-1", kind="infra")
-
-    locked, reason = lob_exclusion_lock(state, _LockJobManager("RUNNING"))
-    assert locked
-    assert reason is not None and "being created" in reason
-
-
-def test_lob_exclusion_locks_and_explains_once_infrastructure_exists() -> None:
-    """Deployed infrastructure locks the choice AND explains why + the remedy.
-
-    The exclusion is fixed for the pipeline once the stack exists (e.g. after a Stop
-    CDC, which keeps the stack and its committed offset), so the boxes must not be
-    tickable. An earlier version left this silent on the theory the greyed boxes were
-    self-explanatory, but a stopped-CDC operator reads a frozen box with no reason as
-    a bug. So the lock now names its reason and the remedy (delete + redeploy). The
-    reason is rendered NEUTRAL (not warning) by the panel -- severity calibration --
-    but the text itself must be present.
-    """
-    from dsql_migrator.ui.data_migration._cdc_ui import lob_exclusion_lock
-
-    for phase in ("infra", "provisioning", "partial"):
-        state = DataMigrationState()
-        state.set_cdc_stack_phase(phase)
-        locked, reason = lob_exclusion_lock(state, _LockJobManager())
-        assert locked, f"phase {phase} must lock the exclusion"
-        assert reason is not None and "delete the CDC infrastructure" in reason, (
-            f"phase {phase} must explain the lock and name the delete+redeploy remedy"
-        )
-
-
-def test_lob_exclusion_lock_names_cdc_start_when_streaming_started() -> None:
-    # The remedy differs: with connectors up the fix is Stop CDC, not deleting the
-    # infrastructure, so the message must say so.
-    from dsql_migrator.ui.data_migration._cdc_ui import lob_exclusion_lock
-
-    state = DataMigrationState()
-    state.set_cdc_connector_names(["mysql-source"])
-    state.set_cdc_stack_phase("running")
-
-    locked, reason = lob_exclusion_lock(state, _LockJobManager())
-    assert locked
-    assert reason is not None and "Stop CDC" in reason
-
-
-def test_lob_exclusion_locks_once_a_full_load_committed_under_the_set() -> None:
-    """The full_load_only -> cdc_only split-brain gap: a completed Full Load's exclusion
-    must not be editable after switching to cdc_only to add replication.
-
-    A full_load_only run excludes a column and loads (rows land NULL). The tool then
-    invites the user to switch to cdc_only and stream onto the already-loaded target. In
-    that state nothing is deployed/streaming, so the CDC-step LOB card was editable --
-    un-excluding the column would make CDC populate it for post-snapshot changes while
-    loaded rows stay NULL (silent split-brain). The lock now fires on the committed load
-    (via full_load_committed), NOT released by deleting the stack; remedy is Start over.
-    """
-    from dsql_migrator.ui.data_migration._cdc_ui import lob_exclusion_lock
-
-    # Nothing deployed, nothing streaming -- the pre-deploy window that used to be open.
-    state = DataMigrationState()
-    locked, reason = lob_exclusion_lock(
-        state, _LockJobManager(), full_load_committed=True
-    )
-    assert locked
-    assert reason is not None
-    assert "Full Load has already loaded data" in reason
-    assert "Start over" in reason  # the correct re-scope remedy (not delete+redeploy)
-
-    # Without the committed-load signal the same pre-deploy state stays editable
-    # (a genuine fresh cdc_only run has nothing loaded yet).
-    assert lob_exclusion_lock(state, _LockJobManager()) == (False, None)
-
-
-def _render_lob_panel(*, locked: bool, lock_reason=None):
-    """Render the LOB panel with one exclusion candidate and return the UI double."""
-    from dsql_migrator.ui.data_migration import _cdc_ui
-
-    inventory = SourceInventory(
-        tables=[
-            TableDef(
-                name="docs",
-                columns=[
-                    ColumnDef(name="id", mysql_type="int", nullable=False),
-                    ColumnDef(name="payload", mysql_type="longtext"),
-                ],
-                primary_key=["id"],
-            )
-        ]
-    )
-    ui = _RecordingUi()
-    _cdc_ui._render_cdc_lob_exclusion_panel(
-        ui,
-        DataMigrationState(),
-        inventory,
-        lambda: None,
-        locked=locked,
-        lock_reason=lock_reason,
-    )
-    return ui
-
-
-def _render_lob_panel_migration_wide(*, state=None):
-    """Render the panel in migration-wide (Full Load) mode with one LOB candidate."""
-    from dsql_migrator.ui.data_migration import _cdc_ui
-
-    inventory = SourceInventory(
-        tables=[
-            TableDef(
-                name="docs",
-                columns=[
-                    ColumnDef(name="id", mysql_type="int", nullable=False),
-                    ColumnDef(name="payload", mysql_type="longtext"),
-                ],
-                primary_key=["id"],
-            )
-        ]
-    )
-    ui = _RecordingUi()
-    _cdc_ui._render_cdc_lob_exclusion_panel(
-        ui,
-        state or DataMigrationState(),
-        inventory,
-        lambda: None,
-        locked=False,
-        lock_reason=None,
-        migration_wide=True,
-    )
-    return ui
-
-
-def test_lob_panel_migration_wide_wording_and_no_connector_preview() -> None:
-    # On the Full Load screen the card speaks of "this migration" (not CDC capture)
-    # and omits the Debezium column.exclude.list preview (a connector-only detail).
-    ui = _render_lob_panel_migration_wide()
-    joined = " ".join(ui.texts)
-
-    assert ui.checkboxes, "candidates must still render tick boxes"
-    assert "this migration" in joined
-    assert "column.exclude.list" not in joined
-
-
-def test_lob_panel_migration_wide_no_candidates_says_this_migration() -> None:
-    # The "nothing to exclude" info notice also uses the migration-wide wording.
-    from dsql_migrator.ui.data_migration import _cdc_ui
-
-    inventory = SourceInventory(
-        tables=[
-            TableDef(
-                name="plain",
-                columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
-                primary_key=["id"],
-            )
-        ]
-    )
-    ui = _RecordingUi()
-    _cdc_ui._render_cdc_lob_exclusion_panel(
-        ui,
-        DataMigrationState(),
-        inventory,
-        lambda: None,
-        locked=False,
-        lock_reason=None,
-        migration_wide=True,
-    )
-    joined = " ".join(ui.texts)
-    assert "this migration" in joined
-    assert "CDC capture" not in joined
-
-
-def test_lob_panel_boxes_are_live_when_not_locked() -> None:
-    # The control point of the two tests below: unlocked really is tickable, so a
-    # "always disabled" regression cannot pass by accident.
-    ui = _render_lob_panel(locked=False)
-
-    assert ui.checkboxes, "the panel must render a tick box for the candidate"
-    assert all(b.enabled for b in ui.checkboxes)
-    assert all(b.on_change is not None for b in ui.checkboxes)
-
-
-def test_lob_panel_disables_the_boxes_and_drops_the_handler_when_locked() -> None:
-    """Greying alone is not enough -- the click must not register either.
-
-    Before this the boxes were fully live: the state changed and was then discarded.
-    Asserted on the RENDERED widgets, so a cosmetic-only "grey but still clickable"
-    version fails.
-    """
-    ui = _render_lob_panel(locked=True, lock_reason="Locked — CDC started.")
-
-    assert ui.checkboxes, "the panel must still render the tick boxes when locked"
-    assert not any(b.enabled for b in ui.checkboxes), "locked boxes must be disabled"
-    assert all(b.on_change is None for b in ui.checkboxes), (
-        "on_change must be dropped while locked, not just greyed"
-    )
-
-
-def test_lob_panel_shows_the_lock_reason_when_one_is_given() -> None:
-    """A transient lock must actually say why, in visible copy (not a tooltip).
-
-    The two transient cases (infra create in flight, CDC started) are the ones where
-    the operator may be mid-decision and needs the remedy named, so the reason has to
-    reach the screen rather than being computed and dropped.
-    """
-    ui = _render_lob_panel(
-        locked=True,
-        lock_reason="Locked — the excluded columns were handed to the connector.",
-    )
-
-    joined = " ".join(ui.texts)
-    assert "handed to the connector" in joined, (
-        "the lock reason must be rendered as visible text"
-    )
-
-
-def test_lob_panel_shows_no_lock_line_when_the_lock_has_no_reason() -> None:
-    """A silent lock renders no warning text -- the greyed boxes carry it.
-
-    Deployed CDC infrastructure is the normal state, and a warning line there read as
-    though something had gone wrong. The boxes must still be frozen.
-    """
-    ui = _render_lob_panel(locked=True, lock_reason=None)
-
-    assert not any(b.enabled for b in ui.checkboxes), "a silent lock still locks"
-    joined = " ".join(ui.texts)
-    assert "Locked" not in joined
-    assert "Delete the CDC infrastructure" not in joined
-
-
 def test_cdc_state_undetermined_distinguishes_unprobed_from_absent() -> None:
     """The restart-recovery bug: a blank CDC pipeline card.
 
@@ -19833,46 +19587,6 @@ def test_fk_failure_detail_names_how_long_it_waited() -> None:
     assert "no UNIQUE index" in absent
 
 
-def test_lob_card_on_the_full_load_screen_explains_its_own_lock() -> None:
-    """A frozen LOB tick box must say WHY and how to change it.
-
-    The Full Load screen passed ``lock_reason=None``, and the panel only renders text
-    ``if locked and lock_reason`` -- so the boxes were frozen with NO explanation at all,
-    the "silent frozen box reads as a bug" state that panel's own comment forbids. The
-    table picker's copy does not help either: it talks about "a different set of tables",
-    while a user who forgot to exclude a column is trying to change the COLUMNS, so that
-    sentence does not read as applying to them. The LOB-specific reason names the cause
-    AND the way out (Start over).
-    """
-    import inspect
-
-    from dsql_migrator.ui import data_migration as _dm
-    from dsql_migrator.ui.data_migration._cdc_monitoring import lob_exclusion_lock
-
-    # The screen wires the LOB-specific lock into the panel call (not a bare None).
-    # NB source-TEXT assertions are why the v0.1.448 blocker shipped: `inspect.getsource`
-    # passes even when the helper was never imported, so the call site's NameError went
-    # unseen until users hit the screen. The name is therefore resolved through the
-    # module namespace here, and every call site in the package is checked mechanically
-    # by tests/test_no_undefined_globals.py.
-    assert callable(_dm.lob_exclusion_lock), (
-        "build_data_migration_screen calls lob_exclusion_lock, so the name must resolve "
-        "in the module namespace -- a missing import only raises when content() runs"
-    )
-    src = inspect.getsource(_dm.build_data_migration_screen)
-    assert "lob_exclusion_lock(" in src
-    # The strict-order cause (exclusion_lock_state) first, the LOB-specific reason next.
-    flat = " ".join(src.split())
-    assert "exclusion_lock_state(migration_state, job_manager).reason or _lob_reason" in flat
-
-    # And that reason actually addresses a column change + names the escape hatch.
-    state = DataMigrationState()
-    locked, reason = lob_exclusion_lock(state, None, full_load_committed=True)
-    assert locked is True
-    assert "excluded columns are fixed" in reason
-    assert "Start over" in reason
-
-
 # ---------------------------------------------------------------------------
 # Drop & reload: the tool must not be blocked by the FKs it created itself
 # ---------------------------------------------------------------------------
@@ -20180,51 +19894,6 @@ def test_preselect_lob_columns_narrows_by_the_dsql_type_in_the_reason() -> None:
     assert preselect_lob_columns_for_reason(cols, "some other failure") == ()
     assert preselect_lob_columns_for_reason([("t", "longtext")], "for bytea") == ()
     assert preselect_lob_columns_for_reason([], "for bytea") == ()
-
-
-def test_exclude_and_reload_is_allowed_after_a_load_but_refused_once_cdc_owns_the_set() -> None:
-    """The bundled action is deliberately NARROWER than the tick-box lock.
-
-    `lob_exclusion_lock`'s `full_load_committed` clause fires because changing the
-    exclusion would leave ALREADY-LOADED rows inconsistent with what CDC captures -- but
-    this action DROPS and reloads the table, so those rows cease to exist and the
-    inconsistency cannot arise. What stays unsafe is a pipeline already given the old set.
-    """
-    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
-
-    # The case the tick boxes lock but this action must allow: a finished Full Load,
-    # no CDC anywhere. (This is the dead end the feature exists to remove.)
-    clean = DataMigrationState()
-    assert cm.exclude_and_reload_block_reason(clean, None) is None
-    assert cm.lob_exclusion_lock(clean, None, full_load_committed=True)[0] is True
-
-    # A deployed cdc-stack bakes ColumnExcludeList at create time -> refuse. "unstable"
-    # is included on purpose: cdc_infra_prep_state treats it as ready, so omitting it
-    # (as lob_exclusion_lock's own tuple does) would let the action through.
-    for phase in ("infra", "running", "provisioning", "partial", "unstable"):
-        state = DataMigrationState()
-        state.cdc_stack_phase = phase
-        reason = cm.exclude_and_reload_block_reason(state, None)
-        assert reason, f"phase {phase} must block"
-        # Either clause may claim it -- "running" also reads as streaming -- but it must
-        # always name CDC as the owner of the set and give a way forward.
-        assert "CDC" in reason, phase
-
-    # A torn-down stack no longer owns the set.
-    gone = DataMigrationState()
-    gone.cdc_stack_phase = "deleted"
-    assert cm.exclude_and_reload_block_reason(gone, None) is None
-
-
-def test_exclude_and_reload_refused_while_cdc_streams(monkeypatch) -> None:
-    # Offsets are committed on MSK under the old excluded-column set, so history was
-    # captured with different columns -- a reload cannot reconcile that.
-    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
-
-    monkeypatch.setattr(cm, "cdc_streaming_started", lambda *a, **k: True)
-    reason = cm.exclude_and_reload_block_reason(DataMigrationState(), None)
-    # Stop alone is not a complete remedy: a stopped stack keeps the set and its offsets.
-    assert reason and "stop CDC, then delete the CDC infrastructure" in reason
 
 
 def _quar_render_ui():
@@ -23857,34 +23526,6 @@ def test_a_deleting_stack_does_not_lock_the_table_selector() -> None:
     # A terminal rollback also still owns its resources.
     failed = _reason("ROLLBACK_COMPLETE")
     assert failed is not None, failed
-
-
-def test_the_lob_panel_is_never_locked_without_a_reason() -> None:
-    """A frozen card with nothing explaining it -- the invariant an adjacent comment names.
-
-    lob_exclusion_lock's phase tuple lacked "unstable" (the phase for every non-stable
-    status), so it returned (False, None) while the caller's OR still rendered the card
-    locked. Fixed in two places: the tuple, and the call site's reason fallback -- the tuple
-    closes today's instance, the fallback closes the class.
-    """
-    import inspect
-
-    from dsql_migrator.ui import data_migration as dm
-    from dsql_migrator.ui.data_migration._cdc_monitoring import lob_exclusion_lock
-
-    for status in ("DELETE_IN_PROGRESS", "ROLLBACK_COMPLETE", "UPDATE_IN_PROGRESS"):
-        state = DataMigrationState()
-        state.set_cdc_stack_phase("unstable", status=status)
-        locked, reason = lob_exclusion_lock(state, None)
-        assert locked is True, status
-        assert reason, f"locked with no reason for {status}"
-
-    # And the caller falls back to the selection lock's reason for ANY future contributor.
-    src = " ".join(inspect.getsource(dm).split())
-    assert (
-        "exclusion_lock_state(migration_state, job_manager).reason or _lob_reason "
-        "or selection_lock" in src
-    )
 
 
 def test_start_cdc_logs_the_resume_point_through_the_real_ui_path(monkeypatch) -> None:
@@ -28886,7 +28527,7 @@ def test_deploy_is_held_by_a_saved_exclusion_that_no_longer_applies() -> None:
     assert held.deploy_button().enabled is False
     joined = " ".join(held.texts)
     assert "docs.id cannot be excluded" in joined
-    assert "Oversized LOB columns' above" in joined
+    assert "Exclude tables & columns (under the table list)" in joined
 
     # Once data has moved under the set (a Full Load job exists) the card is locked, so the
     # gate must not name a Remove it cannot perform: it stops blocking.
@@ -28900,62 +28541,6 @@ def test_deploy_is_held_by_a_saved_exclusion_that_no_longer_applies() -> None:
     fresh.set_cdc_infra_inputs({"vpc_id": "vpc-0123456789abcdef0"})
     fresh.set_lob_exclusion("docs", "payload", True)
     assert _render(fresh).deploy_button().enabled is True
-
-
-def test_lob_card_lists_a_blocked_saved_entry_with_a_working_remove() -> None:
-    from dsql_migrator.ui.data_migration import _cdc_ui
-
-    state = DataMigrationState()
-    state.set_lob_exclusion("docs", "id", True)
-    refreshed: list = []
-    ui = _RecordingUi()
-    _cdc_ui._render_cdc_lob_exclusion_panel(
-        ui, state, _exclusion_inventory(), lambda: refreshed.append(1),
-        locked=False, migration_wide=True,
-    )
-    joined = " ".join(ui.texts)
-    assert "1 saved column exclusion to remove" in joined
-    assert "docs.id cannot be excluded" in joined
-    remove = next(b for b in ui.buttons if b.text == "Remove")
-    remove.on_click()
-    assert state.lob_exclusions() == {}
-    assert refreshed == [1]
-
-    # Locked: reported, not removable (the lock's own remedy applies).
-    state.set_lob_exclusion("docs", "id", True)
-    locked = _RecordingUi()
-    _cdc_ui._render_cdc_lob_exclusion_panel(
-        locked, state, _exclusion_inventory(), lambda: None,
-        locked=True, lock_reason="Locked.", migration_wide=True,
-    )
-    assert not [b for b in locked.buttons if b.text == "Remove"]
-    assert "left as it is" in " ".join(locked.texts)
-
-
-def test_lob_card_still_offers_the_remove_when_nothing_is_a_candidate() -> None:
-    # A key or vanished column is never a LOB candidate, so the "no oversized LOB columns"
-    # early return used to leave such an entry with no Remove anywhere.
-    from dsql_migrator.ui.data_migration import _cdc_ui
-
-    inventory = SourceInventory(
-        tables=[
-            TableDef(
-                name="plain",
-                columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
-                primary_key=["id"],
-            )
-        ]
-    )
-    state = DataMigrationState()
-    state.set_lob_exclusion("plain", "gone", True)
-    ui = _RecordingUi()
-    _cdc_ui._render_cdc_lob_exclusion_panel(
-        ui, state, inventory, lambda: None, locked=False, migration_wide=True
-    )
-    joined = " ".join(ui.texts)
-    assert "No oversized LOB columns" in joined
-    assert "plain.gone" in joined
-    assert [b for b in ui.buttons if b.text == "Remove"]
 
 
 # ---------------------------------------------------------------------------
@@ -29068,42 +28653,6 @@ def test_cdc_promotion_during_render_agrees_with_the_sidebar_gate() -> None:
     assert snapshot is not StepStatus.DONE
     assert get_status(state.workflow, WorkflowStep.FULL_LOAD) is StepStatus.DONE
     assert is_prerequisite_met(state.workflow, WorkflowStep.VALIDATION)
-
-
-def test_lob_panel_column_exclude_preview_wraps_inside_the_card() -> None:
-    """LIVE 4/5: the column.exclude.list preview (no break chance in a comma list) ran off
-    the card. It wraps (wrap-anywhere) and stays VERBATIM -- it is what Start CDC sends."""
-    from dsql_migrator.ui.data_migration import _cdc_ui
-
-    recorded = []
-
-    class _Label:
-        def __init__(self, text):
-            self.text = text
-
-        def classes(self, c=""):
-            recorded.append((self.text, c))
-            return self
-
-        def __getattr__(self, _name):
-            return lambda *_a, **_k: self
-
-    class _Ui(_RecordingUi):
-        def label(self, text="", *a, **k):
-            super().label(text, *a, **k)
-            return _Label(str(text))
-
-    inventory = SourceInventory(tables=[TableDef(
-        name="app.docs",
-        columns=[ColumnDef(name="id", mysql_type="int", nullable=False),
-                 ColumnDef(name="payload", mysql_type="longtext", nullable=True)],
-        primary_key=["id"])])
-    value = ",".join(f"app.docs.payload_{i:02d}" for i in range(20))
-    _cdc_ui._render_cdc_lob_exclusion_panel(
-        _Ui(), DataMigrationState(), inventory, lambda: None, locked=False, lock_reason=None,
-        capture_preview=value)
-    hits = [c for t, c in recorded if t == value]
-    assert len(hits) == 1 and "wrap-anywhere" in hits[0] and "break-all" not in hits[0], recorded
 
 
 def test_foreign_keys_in_scope_keeps_only_migrated_child_tables() -> None:

@@ -17,9 +17,7 @@ from dsql_migrator.core.cdc import (
 from dsql_migrator.core.models import ColumnDef, SourceInventory, SourceType, TableDef
 from dsql_migrator.ui.data_migration import DataMigrationState, MigrationType
 from dsql_migrator.ui.data_migration._cdc_monitoring import (
-    exclusion_after_lock_note,
     exclusion_lock_state,
-    lob_exclusion_lock,
 )
 
 from tests.test_ui_data_migration import (
@@ -119,7 +117,7 @@ def test_a_capture_list_over_4_kib_holds_the_load_while_it_can_still_be_fixed():
     inv, entries = _wide()
     state = _state(entries=entries)
     block = data_migration_exclusion_block(state, _StubJobManager({}), None, inv)
-    assert block and "4,096-byte" in block and "Exclude fewer columns" in block
+    assert block and "4,096-byte" in block and "Narrow the rules in Exclude tables & columns" in block
     # Full load only captures nothing: no such hold.
     only = _state(MigrationType.FULL_LOAD_ONLY, entries=entries)
     assert data_migration_exclusion_block(only, _StubJobManager({}), None, inv) is None
@@ -163,20 +161,6 @@ def test_a_cdc_only_session_that_streamed_can_change_its_columns_after_the_delet
     # Stop + Delete: the stack is gone; the FULL_LOAD step CDC promoted to DONE is not a load.
     state.set_cdc_stack_phase("absent", status=None)
     assert exclusion_card_locked(state, _StubJobManager({})) is False
-    assert lob_exclusion_lock(state, _StubJobManager({}), full_load_committed=False) == (False, None)
-
-
-def test_the_screen_and_the_cdc_card_use_job_id_not_the_step():
-    import inspect
-
-    import dsql_migrator.ui.data_migration as dm
-    import dsql_migrator.ui.data_migration._cdc_ui as cdcui
-
-    screen = " ".join(inspect.getsource(dm.build_data_migration_screen).split())
-    assert "full_load_committed=getattr(migration_state, \"job_id\", None) is not None" in screen
-    assert "status is StepStatus.DONE ) _lob" not in screen
-    step = " ".join(inspect.getsource(cdcui._render_cdc_step).split())
-    assert "full_load_committed = getattr(migration_state, \"job_id\", None) is not None" in step
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +315,6 @@ def test_a_stop_in_flight_is_named_as_a_wait():
     jm = _StubJobManager({"stop": _StubJob("RUNNING")})
     lock = exclusion_lock_state(state, jm)
     assert "CDC is being stopped" in lock.reason and "wait for the Stop CDC that is running" in lock.reason
-    assert "wait for the Stop CDC that is running" in lob_exclusion_lock(state, jm)[1]
 
 
 def test_the_reload_hint_needs_the_job_record():
@@ -341,20 +324,6 @@ def test_the_reload_hint_needs_the_job_record():
     assert "Change & reload" in exclusion_lock_state(
         state, _StubJobManager({"job-1": _StubJob("COMPLETED")})).reason
     assert "Change & reload" not in exclusion_lock_state(state, _StubJobManager({})).reason
-
-
-def test_the_after_lock_note_matches_the_cause():
-    jm = _StubJobManager({})
-    assert "already moved" in exclusion_after_lock_note(_state(job_id="job-1"), jm)
-    deleting = _state()
-    deleting.set_cdc_stack_phase("unstable", status="DELETE_IN_PROGRESS")
-    assert "being deleted" in exclusion_after_lock_note(deleting, jm)
-    creating = _state()
-    creating.set_cdc_deploy_job_id("inf", kind="infra")
-    assert "being created" in exclusion_after_lock_note(creating, _StubJobManager({"inf": _StubJob("RUNNING")}))
-    deployed = _state()
-    deployed.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
-    assert "delete the CDC infrastructure on the CDC step first" in exclusion_after_lock_note(deployed, jm)
 
 
 # ---------------------------------------------------------------------------
@@ -369,26 +338,6 @@ def _pg_gen_tables(n=100):
                  ColumnDef(name=f"amount_with_tax_{i:04d}", mysql_type="numeric", generated=True,
                            generated_kind="STORED", generated_expression="(amount * 1.1)")])
         for i in range(n)])
-
-
-def test_generated_columns_alone_over_the_limit_do_not_hold_the_load_and_say_why():
-    from dsql_migrator.ui.data_migration import capture_pre_load_notices, data_migration_exclusion_block
-    from dsql_migrator.ui.data_migration._cdc_ui import _deploy_block_notice
-
-    inv = _pg_gen_tables()
-    state = _state()  # Full load + CDC, NO saved exclusions
-    # 0.1.561 let this load run; no exclusion change could fix it -> no hold ...
-    assert data_migration_exclusion_block(state, _StubJobManager({}), None, inv) is None
-    # ... but the card warns before the load, with a remedy that can be followed.
-    (note,) = capture_pre_load_notices(state, _StubJobManager({}), inv)
-    assert "generated columns Aurora DSQL computes" in note and "capture fewer tables" in note
-    assert "Exclude fewer" not in note
-    from dsql_migrator.core.table_selection import TableSelection
-
-    state.set_selection(TableSelection(selected_tables=[t.name for t in inv.tables]))
-    header, body = _deploy_block_notice(state, _StubJobManager({}), inv, None)
-    assert header == "The excluded columns do not fit the CDC capture configuration"
-    assert "capture fewer tables" in body and "Exclude fewer" not in body
 
 
 def test_exclusions_on_deselected_tables_are_not_counted_in_the_capture_list():
@@ -446,23 +395,7 @@ def test_the_banner_attach_gate_points_where_the_card_really_is():
         _render_cdc_existing_infra_banner(ui, state, lambda: None, job_manager=_StubJobManager({}),
                                           inventory=inv, session=None)
         joined = " ".join(ui.texts)
-        assert f"in 'Oversized LOB columns' {where} first" in joined and "above first" not in joined, mtype
-
-
-def test_full_load_only_after_lock_note_names_the_type_switch():
-    only = _state(MigrationType.FULL_LOAD_ONLY)
-    only.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
-    note = exclusion_after_lock_note(only, _StubJobManager({}))
-    assert "switch the migration type to Full load + CDC" in note
-
-
-def test_the_reload_tooltip_does_not_send_the_full_load_route_to_the_cdc_step():
-    from dsql_migrator.ui.data_migration._cdc_monitoring import exclude_and_reload_block_reason
-
-    state = _state()
-    state.set_cdc_stack_phase("running", status="UPDATE_COMPLETE")
-    reason = exclude_and_reload_block_reason(state, _StubJobManager({}))
-    assert "this action is available again" in reason and "on the CDC step." not in reason
+        assert "in Exclude tables & columns (under the table list) first" in joined, mtype
 
 
 def test_preview_equals_sent_for_a_legacy_value_with_an_empty_entry():
@@ -590,27 +523,6 @@ def test_start_cdc_refuses_a_missing_target_column_at_click_time(monkeypatch):
     assert not submitted
 
 
-def test_the_generated_overflow_remedy_follows_the_table_pickers_lock():
-    from dsql_migrator.core.table_selection import TableSelection
-    from dsql_migrator.ui.data_migration import capture_pre_load_notices
-    from dsql_migrator.ui.data_migration._cdc_monitoring import capture_error_with_remedy
-    from dsql_migrator.ui.data_migration._models import cdc_capture_exclusions
-
-    inv = _pg_gen_tables()
-    state = _state()
-    state.set_selection(TableSelection(selected_tables=[t.name for t in inv.tables]))
-    capture = cdc_capture_exclusions(state, inv, inv.tables)
-    free = capture_error_with_remedy(state, _StubJobManager({}), capture)
-    assert "Deselect tables in the table picker." in free
-    locked = capture_error_with_remedy(state, _StubJobManager({}), capture, table_lock="Locked — X.")
-    assert "The table picker is locked. Locked — X." in locked and "Deselect tables" not in locked
-    # Real lock: a stack deployed early holds the picker -> its own remedy (delete the stack).
-    state.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
-    (note,) = capture_pre_load_notices(state, _StubJobManager({}), inv, session=SimpleNamespace(workflow=None))
-    assert "The table picker is locked." in note and "delete the CDC infrastructure" in note
-    assert "Deselect tables in the table picker." not in note
-
-
 def test_no_ambiguity_warning_when_both_same_named_columns_are_excluded():
     from dsql_migrator.ui.data_migration._models import capture_ambiguity_warning, cdc_capture_exclusions
 
@@ -620,17 +532,6 @@ def test_no_ambiguity_warning_when_both_same_named_columns_are_excluded():
             ColumnDef(name="id", mysql_type="int"), ColumnDef(name="b", mysql_type="text")])])
     both = _state(entries=[("shop.t", "a.b"), ("shop.t.a", "b")])
     assert capture_ambiguity_warning(cdc_capture_exclusions(both, inv, inv.tables)) is None
-
-
-def test_full_load_only_reload_tooltip_names_the_type_switch():
-    from dsql_migrator.ui.data_migration._cdc_monitoring import exclude_and_reload_block_reason
-
-    only = _state(MigrationType.FULL_LOAD_ONLY)
-    only.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
-    assert "switch the migration type to Full load + CDC" in exclude_and_reload_block_reason(only, _StubJobManager({}))
-    both = _state()
-    both.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
-    assert "switch the migration type" not in exclude_and_reload_block_reason(both, _StubJobManager({}))
 
 
 def test_the_ascii_fold_matches_the_reference_and_the_ambiguity_map_is_skipped_without_dots():
