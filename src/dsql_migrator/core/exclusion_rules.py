@@ -560,6 +560,8 @@ class LineStatus:
     reselects: "tuple[str, ...]" = ()
     codes: "tuple[str, ...]" = ()
     notes: "tuple[str, ...]" = ()
+    # (key, columns, tables) per type a type: line resolved, over the tables in scope.
+    type_counts: "tuple[tuple[str, int, int], ...]" = ()
 
 
 @dataclass(frozen=True)
@@ -604,6 +606,114 @@ def _names(items: "Sequence[str]", limit: int = 3) -> str:
     return shown if len(items) <= limit else f"{shown} and {len(items) - limit} more"
 
 
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+
+def _miss(line: int, line_text: str, part: RulePart, level: str, candidates, where: str):
+    """E2 at the first failing ``level``, suggesting from that level's names only: a
+    case-insensitive equal first, else up to 3 difflib matches (cutoff 0.75)."""
+    what = f'{level} matching "{part.text}"' if part.wildcard else f'{level} "{part.text}"'
+    message = f"No {what}{' ' + where if where else ''}."
+    if part.wildcard:
+        return RuleError("E2", line, message)
+    picks = [c for c in candidates if c.lower() == part.text.lower()][:3]
+    if picks:
+        message += (" Names are case-sensitive: did you mean "
+                    f"{', '.join(rule_part_token(c) for c in picks)}?")
+    else:
+        picks = difflib.get_close_matches(part.text, list(candidates), n=3, cutoff=0.75)
+    suggestions = []
+    for pick in picks:
+        fixed = _replace(line_text, part.span[0], part.span[1], rule_part_token(pick))
+        suggestions.append(Suggestion(f'Use "{split_rule_comment(fixed)[0].strip()}"', fixed))
+    return RuleError("E2", line, message, tuple(suggestions))
+
+
+def _name_miss(line, rule, line_text, order, split, tables) -> RuleError:
+    """The E2 for a table or column rule that matches nothing: schema, then table within
+    the matching schemas, then column within the matching tables."""
+    matchers = [_part_matcher(p) for p in rule.parts]
+    schemas = list(dict.fromkeys(split[n][0] for n in order if n in split))
+    hit_schemas = [x for x in schemas if matchers[0](x)]
+    if not hit_schemas:
+        return _miss(line, line_text, rule.parts[0], "schema", schemas, "")
+    in_schemas = set(hit_schemas)
+    candidates = [n for n in order if n in split and split[n][0] in in_schemas]
+    hit_tables = [n for n in candidates if matchers[1](split[n][1])]
+    if not hit_tables:
+        where = (f"in schema {rule_part_token(hit_schemas[0])}" if len(hit_schemas) == 1
+                 else f"in the {len(hit_schemas)} matching schemas")
+        names = list(dict.fromkeys(split[n][1] for n in candidates))
+        return _miss(line, line_text, rule.parts[1], "table", names, where)
+    where = (f"in {'.'.join(rule_part_token(x) for x in split[hit_tables[0]])}"
+             if len(hit_tables) == 1 else f"in the {len(hit_tables)} matching tables")
+    names = list(dict.fromkeys(c.name for n in hit_tables for c in tables[n].columns))
+    return _miss(line, line_text, rule.parts[2], "column", names, where)
+
+
+def _type_miss(line, index, typed: RulePart, line_text, key_counts, source_type) -> RuleError:
+    """The E2 for one ``type:`` name: the hint, else a case-insensitive equal, else up to 3
+    difflib matches, else no suggestion and the types present by column count."""
+    message = f"No column of type {type_name_token(typed.text)} in any migratable table."
+    hint = hint_for(typed.text, source_type, key_counts)
+    if hint is not None:
+        picks = [hint]
+    else:
+        reduced = reduce_typed_name(typed.text, source_type)
+        picks = [k for k in sorted(key_counts) if k.lower() == reduced.lower()][:3]
+        if picks:
+            message += (" Type names are case-sensitive: did you mean "
+                        f"{', '.join(type_name_token(k) for k in picks)}?")
+        else:
+            picks = difflib.get_close_matches(reduced, sorted(key_counts), n=3, cutoff=0.75)
+    if not picks:
+        ranked = sorted(key_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        listed = ", ".join(f"{type_name_token(k)} ({n})" for k, n in ranked[:8])
+        more = f" and {len(ranked) - 8} more" if len(ranked) > 8 else ""
+        message += f" Types here: {listed}{more}."
+    suggestions = tuple(
+        Suggestion(f"Use type:{type_name_token(k)}",
+                   _replace(line_text, typed.span[0], typed.span[1], type_name_token(k)))
+        for k in picks
+    )
+    return RuleError("E2", line, message, suggestions, name_index=index)
+
+
+def _hint_notes(rule, resolved, scope_counts, source_type) -> "list[str]":
+    """Notes (never errors) for a type name that matched a key while its hint names a
+    DIFFERENT key that is also here; ``bpchar``/``character`` are the same type."""
+    notes = []
+    on_line = set(resolved.values())
+    for typed, key in resolved.items():
+        mine = scope_counts.get(key, 0)
+        if key == "character" and source_type is SourceType.POSTGRES:
+            other = scope_counts.get("bpchar", 0)
+            if other and "bpchar" not in on_line:
+                notes.append(
+                    f"type:{type_name_token(typed)} matched character ({_plural(mine, 'column')})."
+                    f" {other} {'column is' if other == 1 else 'columns are'} the same type "
+                    "declared without a length, printed bpchar: add type:bpchar to cover them.")
+            continue
+        target = hint_for(typed, source_type, scope_counts)
+        if target is None or target == key or target in on_line or not scope_counts.get(target):
+            continue
+        other = scope_counts[target]
+        if key == "bpchar":
+            notes.append(
+                f"type:{type_name_token(typed)} matched bpchar ({_plural(mine, 'column')}: "
+                f"character declared without a length). The {other} character "
+                f"{'column is' if other == 1 else 'columns are'} the same type declared with a "
+                "length: add type:character to cover them.")
+        else:
+            notes.append(
+                f"type:{type_name_token(typed)} matched {type_name_token(key)} "
+                f"({_plural(mine, 'column')}). {type_name_token(target)} is a different type "
+                f"here ({_plural(other, 'column')}): use type:{type_name_token(target)} for "
+                "those.")
+    return notes
+
+
 def resolve_exclusion_rules(
     text: str,
     *,
@@ -637,6 +747,7 @@ def resolve_exclusion_rules(
     would leave no table selected is the global error E5. Pure.
     """
     rules, parsed_errors = parse_rules(text)
+    source_lines = [raw[:-1] if raw.endswith("\r") else raw for raw in (text or "").split("\n")]
     errors: dict[int, list[RuleError]] = {n: list(es) for n, es in parsed_errors.items()}
     global_errors: list[RuleError] = []
     tables: dict[str, "TableDef"] = {}
@@ -662,25 +773,27 @@ def resolve_exclusion_rules(
 
     table_hits: dict[int, list[str]] = {}
     column_hits: dict[int, list[tuple[str, str]]] = {}
+    type_resolved: dict[int, dict[str, str]] = {}
     for line, rule in sorted(rules.items()):
+        line_text = source_lines[line - 1]
         if rule.kind == "type":
             keys = _type_keys()
-            present = set(keys.values())
-            wanted = set()
+            key_counts: dict[str, int] = {}
+            for key in keys.values():
+                key_counts[key] = key_counts.get(key, 0) + 1
+            resolved: dict[str, str] = {}
             for index, typed in enumerate(rule.type_names):
-                key = resolve_type_name(typed.text, present, source_type)
+                key = resolve_type_name(typed.text, key_counts, source_type)
                 if key is None:
-                    errors.setdefault(line, []).append(RuleError(
-                        "E2", line,
-                        f"No match: no column of type {type_name_token(typed.text)} in any "
-                        "migratable table.",
-                        name_index=index,
-                    ))
+                    errors.setdefault(line, []).append(
+                        _type_miss(line, index, typed, line_text, key_counts, source_type))
                 else:
-                    wanted.add(key)
+                    resolved[typed.text] = key
+            wanted = set(resolved.values())
             hits = [item for item, key in keys.items() if key in wanted]
             if hits:
                 column_hits[line] = hits
+                type_resolved[line] = resolved
             continue
         matchers = [_part_matcher(p) for p in rule.parts]
         if rule.kind == "table":
@@ -697,8 +810,8 @@ def resolve_exclusion_rules(
             if hits_c:
                 column_hits[line] = hits_c
         if line not in table_hits and line not in column_hits:
-            errors.setdefault(line, []).append(RuleError(
-                "E2", line, "No match: nothing in any migratable table matches this rule."))
+            errors.setdefault(line, []).append(
+                _name_miss(line, rule, line_text, order, split, tables))
 
     def _by_action(hits_by_line: dict, action: str) -> dict:
         found: dict = {}
@@ -759,6 +872,21 @@ def resolve_exclusion_rules(
         return tuple(sorted(counts.items()))
 
     unselect_set, reselect_set = set(unselect), set(reselect)
+    scope_type_counts: Optional[tuple] = None
+
+    def _scope_type_counts() -> tuple:
+        """Per type key: columns and tables over selected' (the scope of "matches N")."""
+        nonlocal scope_type_counts
+        if scope_type_counts is None:
+            counts: dict[str, int] = {}
+            in_tables: dict[str, set] = {}
+            for (table, _column), key in _type_keys().items():
+                if table in after_set:
+                    counts[key] = counts.get(key, 0) + 1
+                    in_tables.setdefault(key, set()).add(table)
+            scope_type_counts = (counts, in_tables)
+        return scope_type_counts
+
     line_status: dict[int, LineStatus] = {}
     for line in sorted(set(table_hits) | set(column_hits)):
         rule = rules[line]
@@ -808,6 +936,14 @@ def resolve_exclusion_rules(
             if inert:
                 notes.append(f"Inert on {_names(inert)}: a table rule unselects "
                              f"{'it' if len(inert) == 1 else 'them'} in this Save.")
+            type_counts: tuple = ()
+            if line in type_resolved:
+                scope_counts, scope_tables = _scope_type_counts()
+                resolved = type_resolved[line]
+                type_counts = tuple(
+                    (key, scope_counts.get(key, 0), len(scope_tables.get(key, ())))
+                    for key in dict.fromkeys(resolved.values()))
+                notes.extend(_hint_notes(rule, resolved, scope_counts, source_type))
             if rule.action == "exclude":
                 status = LineStatus(line, rule.action, rule.kind,
                                     matched=sum(1 for i in in_scope if i not in incl_c),
@@ -817,7 +953,8 @@ def resolve_exclusion_rules(
                 if not kept_n:
                     codes.append(LINE_NO_EFFECT)
                 status = LineStatus(line, rule.action, rule.kind, keeps=kept_n)
-        line_status[line] = replace(status, codes=tuple(codes), notes=tuple(notes))
+        line_status[line] = replace(status, codes=tuple(codes), notes=tuple(notes),
+                                    type_counts=type_counts if rule.kind != "table" else ())
 
     if selection_lock_reason is not None:
         cancelled = {n for n in incl_t if n in excl_t}

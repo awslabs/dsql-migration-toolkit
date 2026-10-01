@@ -567,3 +567,141 @@ def test_per_line_status():
     assert "Inert on shop.audit_2023: a table rule unselects it in this Save." in st[6].notes
     assert [e.code for e in res.errors[7]] == ["E2"] and 7 not in st
     assert sorted(st) == [1, 2, 3, 4, 5, 6]
+
+
+# --- P3-C04: E2 "did you mean", hint notes, per-type counts --------------------------
+
+
+def _pg(*types_counts, name="public.t"):
+    cols, n = [], 0
+    for declared, count in types_counts:
+        for _ in range(count):
+            n += 1
+            cols.append(ColumnDef(name=f"c{n}", mysql_type=declared))
+    return TableDef(name=name, columns=[ColumnDef(name="id", mysql_type="bigint")] + cols,
+                    primary_key=["id"])
+
+
+def _resolve(text, tables, source=PG):
+    return resolve_exclusion_rules(
+        text, migratable=tables, source_type=source, effective_selection=[t.name for t in tables])
+
+
+PG_TYPES = [_pg(("character varying(20)", 1), ("character varying(20)[]", 1), ("integer", 1),
+                ("timestamp(6) without time zone", 1), ("timestamp with time zone", 1),
+                ("boolean", 1), ("character(3)", 1), ("text", 1))]
+
+
+@pytest.mark.parametrize("typed,token", [
+    ("varchar", '"character varying"'), ("int", "integer"),
+    ("timestamp", '"timestamp without time zone"'), ("timestamptz", '"timestamp with time zone"'),
+    ("bool", "boolean"), ("char", "character"), ("varchar[]", '"character varying[]"'),
+])
+def test_pg_hint_suggestions_rewrite_to_a_resolving_line(typed, token):
+    res = _resolve(f"exclude type:{typed}", PG_TYPES)
+    (error,) = res.errors[1]
+    assert error.code == "E2" and error.name_index == 0 and not res.can_save
+    (fix,) = error.suggestions
+    assert fix.line_text == f"exclude type:{token}" and fix.label == f"Use type:{token}"
+    fixed = _resolve(fix.line_text, PG_TYPES)
+    assert fixed.can_save and fixed.columns
+
+
+def test_type_names_are_judged_one_at_a_time():
+    res = _resolve("exclude type:text,varchar", PG_TYPES)
+    (error,) = res.errors[1]
+    assert error.name_index == 1
+    assert error.suggestions[0].line_text == 'exclude type:text,"character varying"'
+    two = _resolve("exclude type:longtext,varchar  # keep", PG_TYPES)
+    first, second = two.errors[1]
+    assert (first.name_index, second.name_index) == (0, 1)
+    assert first.suggestions[0].line_text == "exclude type:text,varchar  # keep"
+    assert second.suggestions[0].line_text == 'exclude type:longtext,"character varying"  # keep'
+
+
+def test_a_withheld_hint_lists_the_types_here():
+    tables = [_pg(("text", 10), ("character varying(5)", 9), ("bigint", 7), ("boolean", 7),
+                  ("numeric(4,2)", 6), ("date", 5), ("bytea", 4), ("jsonb", 3), ("uuid", 2),
+                  ("real", 1))]
+    (error,) = _resolve("exclude type:int", tables).errors[1]
+    assert error.suggestions == ()
+    assert error.message == (
+        'No column of type int in any migratable table. Types here: text (10), '
+        '"character varying" (9), bigint (8), boolean (7), numeric (6), date (5), bytea (4), '
+        "jsonb (3) and 2 more."
+    )
+
+
+def test_the_internal_char_type_note():
+    tables = [_pg(('"char"', 2), ("character(5)", 3))]
+    res = _resolve("exclude type:char", tables)
+    assert res.can_save and sum(len(c) for c in res.columns.values()) == 2
+    assert res.line_status[1].notes == (
+        "type:char matched char (2 columns). character is a different type here (3 columns): "
+        "use type:character for those.",)
+    assert res.line_status[1].type_counts == (("char", 2, 1),)
+    assert _resolve("exclude type:char,character", tables).line_status[1].notes == ()
+
+
+def test_bpchar_is_the_same_type_as_character():
+    tables = [_pg(("bpchar", 2), ("character(5)", 3))]
+    bp = _resolve("exclude type:bpchar", tables)
+    assert bp.line_status[1].notes == (
+        "type:bpchar matched bpchar (2 columns: character declared without a length). The 3 "
+        "character columns are the same type declared with a length: add type:character to "
+        "cover them.",)
+    ch = _resolve("exclude type:character", tables)
+    assert ch.line_status[1].notes == (
+        "type:character matched character (3 columns). 2 columns are the same type declared "
+        "without a length, printed bpchar: add type:bpchar to cover them.",)
+    (error,) = _resolve("exclude type:bpchar", [_pg(("character(5)", 3))]).errors[1]
+    assert [s.line_text for s in error.suggestions] == ["exclude type:character"]
+
+
+def test_mysql_type_suggestions_and_direct_matches():
+    tables = [_pg(("int(11)", 1), ("varchar(40)", 1), ("longtext", 1), ("double", 1),
+                  ("tinyint(1)", 1), name="shop.t")]
+    (error,) = _resolve("exclude type:integer", tables, MY).errors[1]
+    assert [s.line_text for s in error.suggestions] == ["exclude type:int"]
+    (error,) = _resolve('exclude type:"character varying"', tables, MY).errors[1]
+    assert [s.line_text for s in error.suggestions] == ["exclude type:varchar"]
+    assert _resolve('exclude type:LONGTEXT,"double precision"', tables, MY).can_save
+    (error,) = _resolve("exclude type:bool", tables, MY).errors[1]
+    assert error.suggestions == () and "Types here: " in error.message
+
+
+def test_case_first_type_suggestion():
+    tables = [_pg(('"MyType"', 1), ("text", 1))]
+    (error,) = _resolve("exclude type:mytype", tables).errors[1]
+    assert error.message.endswith("Type names are case-sensitive: did you mean MyType?")
+    assert [s.line_text for s in error.suggestions] == ["exclude type:MyType"]
+
+
+def test_type_counts_cover_the_tables_in_scope():
+    tables = [_pg(("longtext", 2), name="shop.a"), _pg(("longtext", 1), name="shop.b"),
+              _pg(("longtext", 5), name="shop.c")]
+    res = resolve_exclusion_rules(
+        "exclude type:longtext", migratable=tables, source_type=MY,
+        effective_selection=["shop.a", "shop.b"])
+    assert res.line_status[1].type_counts == (("longtext", 3, 2),)
+
+
+def test_name_misses_name_the_first_failing_level():
+    res = _res("exclude shop.prodcut_media.*")
+    (error,) = res.errors[1]
+    assert error.message == 'No table "prodcut_media" in schema shop.'
+    assert [s.line_text for s in error.suggestions] == ["exclude shop.product_media.*"]
+    assert error.suggestions[0].label == 'Use "exclude shop.product_media.*"'
+    (error,) = _res("exclude shop.orders.Notes").errors[1]
+    assert error.message == (
+        'No column "Notes" in shop.orders. Names are case-sensitive: did you mean notes?')
+    assert [s.line_text for s in error.suggestions] == ["exclude shop.orders.notes"]
+    (error,) = _res("exclude table shpo.orders").errors[1]
+    assert error.message == 'No schema "shpo".'
+    assert [s.line_text for s in error.suggestions] == ["exclude table shop.orders"]
+    (error,) = _res("exclude shop.*.nosuchcolumn").errors[1]
+    assert error.message.startswith('No column "nosuchcolumn" in the ') and error.suggestions == ()
+    (error,) = _res("exclude shop.zz*.x").errors[1]
+    assert error.message == 'No table matching "zz*" in schema shop.' and error.suggestions == ()
+    (error,) = _res('exclude "my schema"."order.itemz".x').errors[1]
+    assert [s.line_text for s in error.suggestions] == ['exclude "my schema"."order.items".x']
