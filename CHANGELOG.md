@@ -5,6 +5,33 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.562
+
+Column and table exclusion, rebuilt: an excluded column now migrates as **NULL** on Aurora DSQL (0.1.561 left it to the target DEFAULT), chosen with one rules popup and applied the same way by Full Load, Start CDC, Validation and Cut over. Full guide: [Excluding tables and columns](docs/manual/en/13-excluding-tables-and-columns.md).
+
+### Added
+
+- **Exclude tables & columns**, a rules popup under the table list for every migration type (`exclude` / `include` by table, column or source type, with a live preview and one-click fixes). It replaces both "Oversized LOB columns" cards.
+- **Change & reload** changes excluded columns after a Full Load without Start over: it drops and reloads only the tables whose excluded columns change, after a confirm that names them.
+- **Validation** proves excluded columns are NULL on Aurora DSQL; **Cut over** restores the DEFAULTs the overlay dropped (NOT NULL stays dropped, one-way).
+- Gates before any data moves: a source column missing from the target table (42703), a saved exclusion that no longer applies, and a CDC capture list over 4,096 bytes.
+
+### Changed
+
+- Before a table's first row, each excluded column is made nullable with no DEFAULT (recorded in an overlay ledger); Start CDC applies the same change. A table that already holds rows is dropped and reloaded with your confirmation, or fails closed.
+- Primary-key, foreign-key-referenced and computed columns can no longer be excluded. The quarantine and dead-letter "Exclude column" actions, the CDC step and the Start / Deploy dialogs now go through, or show, the same rules.
+
+### Fixed
+
+- The CDC capture list excludes exactly the chosen columns (`$`, `.`, commas and case twins in names); a fresh session attaching a stack keeps its exclusions; Drop & reload no longer loses a column whose DEFAULT or CHECK mentions "generated"; a MySQL Manual CDC start point is really seeded; MySQL 8 expression, empty and BINARY defaults are carried; a source connection lost mid-read is re-read; the cdc-stack no longer opens port 9098 to 172.31.0.0/20; plus lock messages, foreign-key scoping and several status displays.
+
+### Upgrade notes
+
+- No CDC redeploy is needed. The next Start CDC removes the 9098 rule from a 0.1.561 stack, and such a stack keeps 0.1.561's capture-list matching until it is deployed again ([details](docs/manual/en/13-excluding-tables-and-columns.md#deployed-cdc-stacks)).
+- A 0.1.561 session's exclusions stay omit-only (target DEFAULT) when rows may already be written; convert them with Change & reload ([how](docs/manual/en/13-excluding-tables-and-columns.md#omit-only-legacy-entries-and-how-to-convert-them)).
+- Downgrading to 0.1.561 starts a fresh session; restore the dropped DEFAULTs at Cut over first ([details](docs/manual/en/13-excluding-tables-and-columns.md#downgrading-to-01561)).
+- Not exercised live: the compact capture-list form, most capture-list escapes, the PostgreSQL overlay and CDC half, and the S3-backed ledger.
+
 ## v0.1.561
 
 ### Added

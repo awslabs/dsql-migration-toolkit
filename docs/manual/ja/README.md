@@ -67,6 +67,7 @@ Data Migration は **Full Load**（ツール独自のバルクローダー）と
 | 10 | [Conclusion](10-conclusion.md) | どの経路をいつ使うか、推奨されるエンドツーエンドのフロー、次に進む先。 |
 | 11 | [Customer FAQ](11-customer-faq.md) | 顧客が最もよく尋ねる質問 — Full Load、CDC、制限、型マッピング、検証、カットオーバー／ロールバック、運用 — を、ツールの実際の動作に基づいて回答し、詳細へのリンクを添えています。 |
 | 12 | [付録: 性能テスト結果](12-performance-test-results.md) | チューニングの根拠を裏付ける、実測の Full Load / Validation / CDC スループットの例と方法論。 |
+| 13 | [テーブルと列の除外](13-excluding-tables-and-columns.md) | **Exclude tables & columns** ルールポップアップ: ルール言語、除外できないもの、除外した列が Aurora DSQL で NULL になる仕組み、後から除外設定を変更する方法 (Change & reload)、CDC キャプチャリスト、Validation と Cut over、0.1.561 からのアップグレード。 |
 
 ## MySQL・PostgreSQL ユーザーへの Aurora DSQL についての注意
 

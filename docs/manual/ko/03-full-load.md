@@ -3,6 +3,8 @@
 _언어: [English](../en/03-full-load.md) | **한국어** | [日本語](../ja/03-full-load.md)_
 
 > **이전:** [2. Evaluation과 Schema Conversion](02-evaluation-and-schema-conversion.md)
+>
+> **테이블이나 컬럼을 빼려면** [13. 테이블과 컬럼 제외](13-excluding-tables-and-columns.md)를 보세요. 제외한 컬럼은 Aurora DSQL에 NULL로 로드됩니다.
 
 **Full Load**는 기존 행을 소스 데이터베이스 — RDS / Aurora **MySQL** 또는 RDS / Aurora **PostgreSQL** —
 에서 Aurora DSQL로 옮기는 도구 자체의 벌크 복사입니다. Debezium

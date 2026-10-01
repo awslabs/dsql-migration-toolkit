@@ -359,3 +359,5 @@ on the `-dsql-sink` connector), cross-checking against the DSQL target's
 ---
 
 **Prev:** [11. Customer FAQ](11-customer-faq.md)
+
+**Next:** [13. Excluding tables and columns →](13-excluding-tables-and-columns.md)

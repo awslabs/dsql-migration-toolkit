@@ -3,6 +3,8 @@
 _言語: [English](../en/05-validation.md) | [한국어](../ko/05-validation.md) | **日本語**_
 
 > **前へ:** [4. CDC と DSQL の制約](04-cdc-and-dsql-constraints.md)
+>
+> **除外した列**は値を比較せず、NULL であることを証明します。[13.9 Validation と Cut over](13-excluding-tables-and-columns.md#139-validation-と-cut-over)を参照してください。
 
 **Validation** は、ターゲットがソースと一致することを証明する手順であり、安全なカットオーバーの根拠となります。**正確な** `COUNT(*)` とチェックサムを実行する唯一の手順であり（Full Load はスキャンを伴わない推定を意図的に使用していました）、近似ではなく信頼できる判定を提供します。
 

@@ -3,6 +3,8 @@
 _言語: [English](../en/04-cdc-and-dsql-constraints.md) | [한국어](../ko/04-cdc-and-dsql-constraints.md) | **日本語**_
 
 > **前へ:** [3. Full Load](03-full-load.md)
+>
+> **CDC から列を外すには** [13.8 CDC キャプチャリスト](13-excluding-tables-and-columns.md#138-cdc-キャプチャリスト)を参照してください。
 
 **CDC (Change Data Capture)** は、ほぼ無停止のカットオーバーを実現するための **オプション** のストリーミングパイプラインです。Full Load が既存の行をコピーした後、CDC はソース側で発生するすべての新規 insert/update/delete を反映し、DSQL を継続的に最新の状態に保ちます。これにより、長時間の停止を伴わず、最小限のダウンタイムでカットオーバーできます。
 

@@ -3,6 +3,8 @@
 _언어: [English](../en/04-cdc-and-dsql-constraints.md) | **한국어** | [日本語](../ja/04-cdc-and-dsql-constraints.md)_
 
 > **이전:** [3. Full Load](03-full-load.md)
+>
+> **CDC에서 컬럼을 빼려면** [13.8 CDC 캡처 목록](13-excluding-tables-and-columns.md#138-cdc-캡처-목록)을 보세요.
 
 **CDC**(Change Data Capture)는 거의 무중단 전환을 위한 **선택적** 스트리밍 파이프라인입니다. Full
 Load가 기존 행을 복사한 뒤, CDC는 소스의 모든 신규 insert/update/delete를 반영해 DSQL을 계속 최신

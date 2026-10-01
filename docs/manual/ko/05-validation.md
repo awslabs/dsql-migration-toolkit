@@ -3,6 +3,8 @@
 _언어: [English](../en/05-validation.md) | **한국어** | [日本語](../ja/05-validation.md)_
 
 > **이전:** [4. CDC와 DSQL 제약](04-cdc-and-dsql-constraints.md)
+>
+> **제외한 컬럼**은 값을 비교하지 않고 NULL임을 증명합니다. [13.9 Validation과 Cut over](13-excluding-tables-and-columns.md#139-validation과-cut-over)를 보세요.
 
 **Validation**은 타깃이 소스와 일치함을 증명하는 단계 — 안전한 전환의 근거입니다. **정확한**
 `COUNT(*)`와 체크섬을 실행하는 유일한 단계로(Full Load는 의도적으로 스캔 없는 추정을 사용), 근사가

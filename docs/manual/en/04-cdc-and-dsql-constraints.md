@@ -3,6 +3,8 @@
 _Language: **English** | [한국어](../ko/04-cdc-and-dsql-constraints.md) | [日本語](../ja/04-cdc-and-dsql-constraints.md)_
 
 > **Prev:** [3. Full Load](03-full-load.md)
+>
+> **Leaving columns out of CDC?** See [13.8 The CDC capture list](13-excluding-tables-and-columns.md#138-the-cdc-capture-list).
 
 **CDC (Change Data Capture)** is the **optional** streaming pipeline for a
 near-zero-downtime cut-over. After Full Load copies the existing rows, CDC keeps

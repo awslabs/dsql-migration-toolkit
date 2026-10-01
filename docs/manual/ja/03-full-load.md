@@ -3,6 +3,8 @@
 _言語: [English](../en/03-full-load.md) | [한국어](../ko/03-full-load.md) | **日本語**_
 
 > **前へ:** [2. Evaluation と Schema Conversion](02-evaluation-and-schema-conversion.md)
+>
+> **テーブルや列を移行から外すには** [13. テーブルと列の除外](13-excluding-tables-and-columns.md)を参照してください。除外した列は Aurora DSQL に NULL としてロードされます。
 
 **Full Load** は、ソースデータベース — RDS / Aurora **MySQL** または RDS / Aurora **PostgreSQL** — の
 既存の行を Aurora DSQL へコピーする、本ツール独自のバルクコピーです。

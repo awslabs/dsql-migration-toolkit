@@ -56,6 +56,7 @@ Data Migration은 **Full Load**(도구 자체의 벌크 로더)와, 선택적으
 | 10 | [결론](10-conclusion.md) | 어떤 경로를 언제 쓸지, 권장 end-to-end 흐름, 다음 단계. |
 | 11 | [고객 FAQ](11-customer-faq.md) | 고객이 가장 많이 묻는 질문 — Full Load, CDC, 제약, 타입 매핑, 검증, 컷오버/롤백, 운영 — 을 도구의 실제 동작에 근거해 답하고 상세 장으로 연결. |
 | 12 | [부록: 성능 테스트 결과](12-performance-test-results.md) | 튜닝 근거를 뒷받침하는 실측 Full Load / Validation / CDC 처리량 예시와 방법론. |
+| 13 | [테이블과 컬럼 제외](13-excluding-tables-and-columns.md) | **Exclude tables & columns** 규칙 팝업: 규칙 언어, 제외할 수 없는 것, 제외한 컬럼이 Aurora DSQL에서 NULL이 되는 방식, 나중에 제외 설정 바꾸기(Change & reload), CDC 캡처 목록, Validation과 Cut over, 0.1.561에서 업그레이드. |
 
 ## MySQL·PostgreSQL 사용자를 위한 Aurora DSQL 안내
 

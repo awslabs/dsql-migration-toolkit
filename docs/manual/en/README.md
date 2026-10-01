@@ -63,6 +63,7 @@ application to DSQL once Validation passes.
 | 10 | [Conclusion](10-conclusion.md) | When to use which path, a recommended end-to-end flow, and where to go next. |
 | 11 | [Customer FAQ](11-customer-faq.md) | The questions customers ask most — Full Load, CDC, limitations, type mapping, validation, cut-over/rollback, and operations — each answered from the tool's actual behavior with links to the detail. |
 | 12 | [Appendix: Performance test results](12-performance-test-results.md) | The measured Full Load / Validation / CDC throughput example and methodology behind the tuning rationale. |
+| 13 | [Excluding tables and columns](13-excluding-tables-and-columns.md) | The **Exclude tables & columns** rules popup: rule language, what cannot be excluded, how an excluded column becomes NULL on Aurora DSQL, changing exclusions later (Change & reload), the CDC capture list, Validation and Cut over, and upgrading from 0.1.561. |
 
 ## A note for MySQL and PostgreSQL users about Aurora DSQL
 

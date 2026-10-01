@@ -3,6 +3,8 @@
 _Language: **English** | [한국어](../ko/03-full-load.md) | [日本語](../ja/03-full-load.md)_
 
 > **Prev:** [2. Evaluation and Schema Conversion](02-evaluation-and-schema-conversion.md)
+>
+> **Leaving tables or columns out?** See [13. Excluding tables and columns](13-excluding-tables-and-columns.md): an excluded column loads as NULL on Aurora DSQL.
 
 **Full Load** is the tool's own bulk copy of your existing rows from the source
 database — RDS / Aurora **MySQL** or RDS / Aurora **PostgreSQL** — into Aurora

@@ -414,3 +414,5 @@ CDC는 cdc-stack을 배포하고 소스에 꾸준한 INSERT 워크로드를 걸�
 ---
 
 **이전:** [11. 고객 FAQ](11-customer-faq.md)
+
+**다음:** [13. 테이블과 컬럼 제외 →](13-excluding-tables-and-columns.md)

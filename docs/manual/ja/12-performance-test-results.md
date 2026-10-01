@@ -326,3 +326,5 @@ CDC は cdc-stack をデプロイし、ソースに定常的な INSERT ワーク
 ---
 
 **前へ:** [11. お客様 FAQ](11-customer-faq.md)
+
+**次へ:** [13. テーブルと列の除外 →](13-excluding-tables-and-columns.md)

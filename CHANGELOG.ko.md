@@ -5,6 +5,33 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.562
+
+컬럼·테이블 제외를 다시 만들었습니다. 제외한 컬럼은 이제 Aurora DSQL에 **NULL**로 이관되고(0.1.561에서는 타깃의 DEFAULT 값을 받았습니다), 하나의 규칙 팝업에서 고르며, Full Load, Start CDC, Validation, Cut over가 모두 같은 방식으로 적용합니다. 자세한 안내: [테이블과 컬럼 제외](docs/manual/ko/13-excluding-tables-and-columns.md).
+
+### 추가
+
+- **Exclude tables & columns**: 모든 마이그레이션 유형에서 쓰는 규칙 팝업이 테이블 목록 아래에 생겼습니다(테이블·컬럼·소스 타입 기준 `exclude` / `include`, 실시간 미리보기, 클릭 한 번으로 고치는 수정 제안). 두 "Oversized LOB columns" 카드를 대체합니다.
+- **Change & reload**: Full Load 후에도 Start over 없이 제외 컬럼을 바꿉니다. 제외 컬럼이 바뀌는 테이블만, 이름을 밝힌 확인을 거쳐 삭제 후 다시 로드합니다.
+- **Validation**이 제외 컬럼이 Aurora DSQL에서 NULL임을 증명하고, **Cut over**가 오버레이가 제거한 DEFAULT를 복원합니다(NOT NULL은 되돌릴 수 없이 제거된 채로 남습니다).
+- 데이터를 옮기기 전에 막는 점검: 타깃 테이블에 없는 소스 컬럼(42703), 더 이상 적용되지 않는 저장된 제외 항목, 4,096바이트를 넘는 CDC 캡처 목록.
+
+### 변경
+
+- 테이블의 첫 행을 쓰기 전에 각 제외 컬럼을 DEFAULT 없는 nullable로 바꾸고(오버레이 원장에 기록), Start CDC도 같은 변경을 적용합니다. 이미 행이 있는 테이블은 확인을 거쳐 삭제 후 다시 로드하거나, 실패로 막습니다.
+- 기본 키, 외래 키가 참조하는 컬럼, 계산되는 컬럼은 더 이상 제외할 수 없습니다. 격리·데드레터의 "Exclude column" 동작, CDC 단계, Start / Deploy 다이얼로그가 모두 같은 규칙을 거치거나 보여 줍니다.
+
+### 수정
+
+- CDC 캡처 목록이 고른 컬럼만 정확히 제외합니다(이름 속 `$`, `.`, 쉼표, 대소문자만 다른 쌍). 스택에 연결한 새 세션이 그 제외 설정을 유지합니다. DEFAULT나 CHECK에 "generated"가 들어간 컬럼을 Drop & reload가 잃지 않습니다. MySQL Manual CDC 시작 지점이 실제로 시드됩니다. MySQL 8 식·빈 문자열·BINARY 기본값이 옮겨집니다. 읽는 도중 끊긴 소스 연결을 다시 읽습니다. cdc-stack이 172.31.0.0/20에 포트 9098을 더 이상 열지 않습니다. 이 밖에 잠금 메시지, 외래 키 범위, 여러 상태 표시를 고쳤습니다.
+
+### 업그레이드 참고 사항
+
+- CDC 재배포는 필요 없습니다. 다음 Start CDC가 0.1.561 스택에서 9098 규칙을 제거하고, 그런 스택은 다시 배포할 때까지 0.1.561의 캡처 목록 매칭을 유지합니다([자세히](docs/manual/ko/13-excluding-tables-and-columns.md#배포된-cdc-스택)).
+- 이미 행이 쓰였을 수 있는 0.1.561 세션의 제외 항목은 omit-only(타깃 DEFAULT)로 남습니다. Change & reload로 바꾸세요([방법](docs/manual/ko/13-excluding-tables-and-columns.md#omit-only레거시-항목과-변환-방법)).
+- 0.1.561로 다운그레이드하면 세션이 새로 시작됩니다. 먼저 Cut over에서 제거된 DEFAULT를 복원하세요([자세히](docs/manual/ko/13-excluding-tables-and-columns.md#01561로-다운그레이드)).
+- 라이브로 실행하지 않은 것: 압축된 캡처 목록 형식, 대부분의 캡처 목록 이스케이프, PostgreSQL 오버레이와 CDC 절반, S3 기반 원장.
+
 ## v0.1.561
 
 ### 추가

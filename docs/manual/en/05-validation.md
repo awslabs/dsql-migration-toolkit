@@ -3,6 +3,8 @@
 _Language: **English** | [한국어](../ko/05-validation.md) | [日本語](../ja/05-validation.md)_
 
 > **Prev:** [4. CDC and DSQL constraints](04-cdc-and-dsql-constraints.md)
+>
+> **Excluded columns** are proven NULL rather than value-compared: see [13.9 Validation and Cut over](13-excluding-tables-and-columns.md#139-validation-and-cut-over).
 
 **Validation** is the step that proves the target matches the source — your
 evidence for a safe cut-over. It's the only step that runs **exact** `COUNT(*)`
