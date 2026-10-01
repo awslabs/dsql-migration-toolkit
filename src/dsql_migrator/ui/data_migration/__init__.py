@@ -481,6 +481,46 @@ def build_data_migration_screen(
     )
     migration_state.set_exclusion_inputs_resolver(_exclusion_resolver)
 
+    def _exclusion_capture_tables(selected):
+        """The tables CDC would capture after a popup Save: the Full Load watermark's set
+        once a load ran (the table set is then fixed), else the selection after the Save."""
+        inventory = _inventory()
+        if inventory is None:
+            return []
+        job = _current_job(job_manager, getattr(migration_state, "job_id", None))
+        watermark = getattr(job, "watermark", None) if job is not None else None
+        if watermark is not None and getattr(watermark, "table_row_counts", None):
+            covered = set(watermark.table_row_counts)
+            return [t for t in inventory.tables if t.name in covered]
+        wanted = set(selected)
+        return [t for t in inventory.tables if t.name in wanted]
+
+    from dsql_migrator.ui.data_migration._exclusion_dialog import (
+        ExclusionDialogContext,
+        render_exclusion_button_row,
+    )
+
+    # The rules popup's context (ui/data_migration/_exclusion_dialog.py), built once per
+    # screen; the page refresh and the capture hook are set per render.
+    _exclusion_ctx = ExclusionDialogContext(
+        migration_state=migration_state,
+        job_manager=job_manager,
+        session=session,
+        inventory_fn=_inventory,
+        inputs_fn=_exclusion_resolver,
+        refresh=lambda: None,
+        lock_reason_fn=lambda: table_set_lock_reason(migration_state, job_manager, session),
+    )
+    _exclusion_row: dict = {}
+
+    def _on_tree_selection_change(chosen) -> None:
+        # A rule-excluded table ticked again is a deliberate override (named by the
+        # popup); the row's summary follows the tree without a page refresh.
+        migration_state.note_tree_retick(chosen)
+        row = _exclusion_row.get("row")
+        if row is not None:
+            row.refresh()
+
     def _assessment():
         """The Step 1 (Evaluation) compatibility report, or None if it hasn't run."""
         result = eval_state.result
@@ -698,6 +738,10 @@ def build_data_migration_screen(
     def content(refresh: Callable[[], None]) -> None:
         migration_type = migration_state.migration_type
         prereq_mode = prereq_mode_for_type(migration_type)
+        _exclusion_ctx.refresh = refresh
+        _exclusion_ctx.capture_tables_fn = (
+            None if migration_type is MigrationType.FULL_LOAD_ONLY else _exclusion_capture_tables
+        )
         steps = substeps_for_type(migration_type)
         # The unified Data Migration step is backed by WorkflowStep.FULL_LOAD for
         # all migration types (its status gates Validation).
@@ -1362,7 +1406,11 @@ def build_data_migration_screen(
                     locked=selection_locked,
                     lock_reason=selection_lock,
                     locked_selection=locked_selection,
+                    on_selection_change=_on_tree_selection_change,
                 )
+                # Exclude tables & columns: the one home for every migration type, right
+                # under the tree it edits (a local refreshable the tree ticks refresh).
+                _exclusion_row["row"] = render_exclusion_button_row(ui, _exclusion_ctx)
 
             # Migration-wide oversized-LOB exclusion, offered for any type that
             # includes a Full Load -- right after the picker, BEFORE the checks, so
@@ -4138,6 +4186,7 @@ def _render_table_selection(
     locked: bool = False,
     lock_reason: Optional[str] = None,
     locked_selection: Optional[Sequence[str]] = None,
+    on_selection_change: Optional[Callable[[list[str]], None]] = None,
 ) -> None:
     """Render the hierarchical table picker scoped to migratable tables (Req 5.9).
 
@@ -4261,6 +4310,8 @@ def _render_table_selection(
         chosen = [name for name in migratable_order if name in names]
         migration_state.set_selection(TableSelection(selected_tables=chosen))
         count_label.text = f"{len(chosen)} of {total_leaves} selected"
+        if on_selection_change is not None:
+            on_selection_change(chosen)
 
     # Filter + bulk actions + selection counter (Cloudscape table header band).
     filter_input = None
@@ -4279,11 +4330,15 @@ def _render_table_selection(
                     TableSelection(selected_tables=list(migratable_order))
                 )
                 count_label.text = f"{len(migratable_order)} of {total_leaves} selected"
+                if on_selection_change is not None:
+                    on_selection_change(list(migratable_order))
 
             def _dm_unselect_all() -> None:
                 tree.untick()
                 migration_state.set_selection(TableSelection(selected_tables=[]))
                 count_label.text = f"0 of {total_leaves} selected"
+                if on_selection_change is not None:
+                    on_selection_change([])
 
             ui.button("Select all", on_click=_dm_select_all).props(
                 "flat dense no-caps size=sm color=primary icon=done_all"

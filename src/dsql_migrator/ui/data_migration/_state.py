@@ -205,9 +205,9 @@ class DataMigrationState:
         # Suggested rule lines waiting for the popup (e.g. a quarantine or DLQ route while
         # the rules are locked); inserted on each open until a Save takes them.
         self._exclusion_pending_rules: list[str] = []
-        # The popup's last resolution (key, held inputs, result): the row and the popup
-        # re-resolve only when an input changed. Transient.
-        self._exclusion_resolution_memo: Optional[tuple] = None
+        # The popup's last resolution per slot ({slot: (key, held inputs, result)}): the
+        # row and the popup re-resolve only when an input changed. Transient.
+        self._exclusion_resolution_memo: dict = {}
         # Measured value sizes, "table.column" -> ("over" | "ok", when): from the
         # prerequisite run's SOURCE_VALUE_SIZE answers or the popup's Check sizes. Transient.
         self._value_size_cache: dict[str, tuple[str, datetime]] = {}

@@ -2160,6 +2160,7 @@ def popup_resolution(
     source_type: SourceType,
     selection_lock_reason: "Optional[str]" = None,
     capture_tables: "Optional[Callable[[Sequence[str]], Sequence[object]]]" = None,
+    memo_slot: str = "editor",
 ):
     """:func:`~dsql_migrator.core.exclusion_rules.resolve_exclusion_rules` over this
     session's live inputs: the ONE context (selected' + focus, warnings on), the resolved
@@ -2169,7 +2170,9 @@ def popup_resolution(
 
     Memoized on the state (transient) by the text's digest and every input, the inventory,
     applied set and live columns held by IDENTITY (a reused ``id`` never serves a stale
-    result), so the row and the popup re-resolve only when something changed.
+    result), so the row and the popup re-resolve only when something changed. One entry
+    per ``memo_slot`` (the row's saved rules, the editor's text), so typing in the popup
+    does not evict the row's comparison.
     """
     import hashlib
 
@@ -2196,7 +2199,11 @@ def popup_resolution(
         source_type,
     )
     held = (inventory, inputs.applied, inputs.live_columns, inputs.view_ddls)
-    memo = getattr(migration_state, "_exclusion_resolution_memo", None)
+    memos = getattr(migration_state, "_exclusion_resolution_memo", None)
+    if not isinstance(memos, dict):
+        memos = {}
+        migration_state._exclusion_resolution_memo = memos
+    memo = memos.get(memo_slot)
     if memo and memo[0] == key and all(a is b for a, b in zip(memo[1], held)):
         return memo[2]
     tables = {t.name: t for t in (getattr(inventory, "tables", None) or ())}
@@ -2230,7 +2237,7 @@ def popup_resolution(
         stored_columns=stored,
         capture=capture,
     )
-    migration_state._exclusion_resolution_memo = (key, held, resolution)
+    memos[memo_slot] = (key, held, resolution)
     return resolution
 
 
