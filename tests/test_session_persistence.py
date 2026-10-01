@@ -1804,3 +1804,69 @@ def test_recording_either_choice_moves_the_dirty_check() -> None:
 
     migration_state.set_accept_quarantined_rows(True, gap=3)
     assert _sig() != after_secret, "accepting a gap must move the signature"
+
+
+# ---------------------------------------------------------------------------
+# P3-C10: the exclusion rules' re-editing fields
+# ---------------------------------------------------------------------------
+
+
+def _rules_state():
+    from dsql_migrator.core.exclusion_rules import resolve_exclusion_rules
+    from dsql_migrator.core.models import SourceType
+
+    state = DataMigrationState()
+    tables = [TableDef(name=n, primary_key=["id"], columns=[
+        ColumnDef(name="id", mysql_type="int"), ColumnDef(name="note", mysql_type="text")])
+        for n in ("shop.a", "shop.audit_1")]
+    text = "exclude shop.a.note\nexclude table shop.audit_*"
+    res = resolve_exclusion_rules(text, migratable=tables, source_type=SourceType.MYSQL,
+                                  effective_selection=[t.name for t in tables])
+    assert state.set_column_exclusions(res, text=text) is None
+    state.add_pending_rule("exclude shop.a.id  # from quarantine")
+    return state, text
+
+
+def _snap(migration_state):
+    return capture_session_snapshot("s1", SessionConnectionState(), EvaluationState(),
+                                    SchemaConversionState(), migration_state)
+
+
+def test_the_rules_fields_round_trip_and_default_when_absent() -> None:
+    state, text = _rules_state()
+    snap = _snap(state)
+    assert snap.exclusion_rules_text == text
+    assert snap.rule_excluded_tables == ["shop.audit_1"]
+    assert snap.exclusion_pending_rules == ["exclude shop.a.id  # from quarantine"]
+    restored = DataMigrationState()
+    apply_session_snapshot(SessionSnapshot.model_validate_json(snap.model_dump_json()),
+                           SessionConnectionState(), EvaluationState(), SchemaConversionState(),
+                           restored)
+    assert restored.exclusion_rules_text() == text
+    assert restored.rule_excluded_tables() == {"shop.audit_1"}
+    assert restored.pending_rules() == ["exclude shop.a.id  # from quarantine"]
+    old = SessionSnapshot(session_id="s1", cdc_lob_exclusions=["shop.a:note"])
+    assert (old.exclusion_rules_text, old.rule_excluded_tables, old.exclusion_pending_rules) == (
+        None, [], [])
+    fresh = DataMigrationState()
+    apply_session_snapshot(old, SessionConnectionState(), EvaluationState(),
+                           SchemaConversionState(), fresh)
+    assert fresh.exclusion_rules_text() is None and fresh.pending_rules() == []
+
+
+def test_a_save_and_a_pending_line_change_the_signature() -> None:
+    session, eval_state, conv_state = SessionConnectionState(), EvaluationState(), SchemaConversionState()
+    state = DataMigrationState()
+    before = session_signature(session, eval_state, conv_state, state)
+    state.add_pending_rule("exclude shop.a.note")
+    after_pending = session_signature(session, eval_state, conv_state, state)
+    assert after_pending != before
+    state.restore_exclusion_rules("exclude shop.a.note", (), state.pending_rules())
+    assert session_signature(session, eval_state, conv_state, state) != after_pending
+
+
+def test_the_stored_format_is_unchanged_and_a_save_does_not_mark_the_ledger() -> None:
+    state, _text = _rules_state()
+    snap = _snap(state)
+    assert snap.cdc_lob_exclusions == ["shop.a:note"]
+    assert snap.overlay_ledger_in_use is False

@@ -185,8 +185,8 @@ def _pending_legacy_candidates(migration_state: object) -> "Optional[list[str]]"
 
 
 def _exclusion_semantics_sig(migration_state: object) -> tuple:
-    """Cheap dirty-check part: finalizing a classification, a legacy-set change or the
-    in-use flag flipping must be saved."""
+    """Cheap dirty-check part: finalizing a classification, a legacy-set change, the
+    in-use flag flipping, a rules Save or a new pending line must be saved."""
     pending = getattr(migration_state, "exclusion_classification_pending", lambda: False)()
     legacy = getattr(migration_state, "final_legacy_exclusions", dict)()
     return (
@@ -194,6 +194,9 @@ def _exclusion_semantics_sig(migration_state: object) -> tuple:
         tuple(_flatten_lob_exclusions(legacy)),
         bool(getattr(migration_state, "overlay_ledger_in_use", False)),
         tuple(_pending_legacy_candidates(migration_state) or ()),
+        getattr(migration_state, "exclusion_rules_text", lambda: None)(),
+        tuple(sorted(getattr(migration_state, "rule_excluded_tables", frozenset)())),
+        tuple(getattr(migration_state, "pending_rules", list)()),
     )
 
 
@@ -251,6 +254,11 @@ def capture_session_snapshot(
         ),
         overlay_ledger_in_use=bool(getattr(migration_state, "overlay_ledger_in_use", False)),
         pending_legacy_candidates=_pending_legacy_candidates(migration_state),
+        exclusion_rules_text=getattr(migration_state, "exclusion_rules_text", lambda: None)(),
+        rule_excluded_tables=sorted(
+            getattr(migration_state, "rule_excluded_tables", frozenset)()
+        ),
+        exclusion_pending_rules=list(getattr(migration_state, "pending_rules", list)()),
         cdc_connector_names=list(
             getattr(migration_state, "cdc_connector_names", []) or []
         ),
@@ -609,6 +617,12 @@ def apply_session_snapshot(
     )
     _restore_lob_exclusions(migration_state, snapshot.cdc_lob_exclusions)
     _restore_exclusion_semantics(snapshot, migration_state, job_manager)
+    if hasattr(migration_state, "restore_exclusion_rules"):
+        migration_state.restore_exclusion_rules(  # type: ignore[attr-defined]
+            snapshot.exclusion_rules_text,
+            snapshot.rule_excluded_tables,
+            snapshot.exclusion_pending_rules,
+        )
     # A COMPLETED teardown (Stop / Delete) leaves NO live connectors and no operation
     # worth resume-displaying. Restoring its stale connector names or its finished
     # lifecycle-job link on RECONNECT makes the CDC card cling to that prior state --

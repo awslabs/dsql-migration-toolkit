@@ -136,6 +136,12 @@ class SessionSnapshot(BaseModel):
     # is a new-semantics entry and must not become a legacy candidate on the next restore.
     # None = not pending (or a genuine pre-overlay snapshot, where every entry is one).
     pending_legacy_candidates: Optional[list[str]] = None
+    # The exclusion RULES, for re-editing only (no loader reads them): the saved rule text
+    # (None = never saved), the tables the rules unselected (provenance) and suggested
+    # lines waiting for the popup.
+    exclusion_rules_text: Optional[str] = None
+    rule_excluded_tables: list[str] = Field(default_factory=list)
+    exclusion_pending_rules: list[str] = Field(default_factory=list)
     # The in-flight (or just-finished) CDC lifecycle job (deploy-infra / start /
     # stop / delete) and which operation it is, so a reconnecting session can keep
     # showing that job's ordered stages instead of dropping them on a restart. The
