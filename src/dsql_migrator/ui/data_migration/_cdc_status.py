@@ -1153,6 +1153,123 @@ def _ensure_cdc_controller(migration_state, session) -> None:
                 _logger.warning("Exclusion classification after the CDC probe failed", exc_info=True)
 
 
+# Phases whose stack can still be started: never "unstable" (a DELETE_IN_PROGRESS stack is
+# unstable -- adopting its set after Start over would put the old columns back).
+_ADOPTABLE_PHASES = ("infra", "running", "provisioning", "partial")
+
+
+def adopt_deployed_exclusions_if_safe(
+    migration_state, session, inventory, *, facts_reader=None
+) -> "Optional[str]":
+    """Take the attached stack's excluded columns into a session that has none. BLOCKING.
+
+    A fresh session (Attach, the default-named stack, a resume that never adopted) showed
+    the stack's exclusions unticked and then SENT its own empty set at Start CDC, so the
+    stack stopped excluding columns its streamed rows hold as NULL (live, 2026-10-01).
+    Runs after the phase probe (the deployed value is only known then) and only when
+    nothing could be overwritten: a probed, startable stack not being torn down, an empty
+    stored set, no pending classification, no Full Load or CDC operation in this session,
+    an inventory, and a value :func:`deployed_capture_exclusions` reproduces exactly.
+
+    Overlay (NULL) or omit-only is decided per column from the LIVE target, never from the
+    value's form, the migration type or the ledger: overlay where it changes nothing that
+    holds data -- the column is already nullable with no DEFAULT (the earlier overlay, or
+    naturally), absent, or its table is empty or absent -- and omit-only where the table
+    holds rows and the column still has NOT NULL or a DEFAULT (an overlay there would
+    ALTER rows loaded under the other semantics). An unreadable target adopts nothing, so
+    the next discovery retries. Returns the activity detail when it adopted, else ``None``.
+    """
+    from dsql_migrator.ui.data_migration._models import deployed_capture_exclusions
+
+    phase = getattr(migration_state, "cdc_stack_phase", None)
+    if phase not in _ADOPTABLE_PHASES:
+        return None
+    if is_stack_teardown_status(getattr(migration_state, "cdc_stack_phase_status", None)):
+        return None
+    if getattr(migration_state, "cdc_teardown_job_id", None):
+        return None
+    if getattr(migration_state, "cdc_deploy_job_id", None):
+        return None
+    if not getattr(migration_state, "cdc_stack_phase_checked", False):
+        return None
+    if getattr(migration_state, "cdc_probe_error", None):
+        return None
+    if getattr(migration_state, "job_id", None) is not None:
+        return None
+    if migration_state.exclusion_classification_pending() or any(
+        migration_state.lob_exclusions().values()
+    ):
+        return None
+    if not getattr(inventory, "tables", None):
+        return None
+    deployed = deployed_capture_exclusions(migration_state, inventory)
+    if deployed is None or not deployed.columns:
+        return None
+    try:
+        read = facts_reader or _target_overlay_facts_reader(session)
+        if read is None:
+            return None
+        facts = read(sorted(deployed.columns), deployed.columns)
+    except Exception:  # noqa: BLE001 - unreadable target: retry at the next discovery
+        _logger.warning("Reading the target for the stack's excluded columns failed", exc_info=True)
+        return None
+    omit_only: dict[str, list[str]] = {}
+    for table, cols in deployed.columns.items():
+        table_facts = (facts or {}).get(table)
+        if table_facts is None:
+            return None  # unknown: never guess
+        if not table_facts.exists or table_facts.has_rows is False:
+            continue
+        if table_facts.has_rows is None:
+            return None
+        for column in cols:
+            col = (table_facts.columns or {}).get(column)
+            if col is None or col.generated or col.identity:
+                continue
+            if col.not_null or col.default_expr is not None:
+                omit_only.setdefault(table, []).append(column)
+    if not migration_state.adopt_deployed_exclusions(deployed.columns, legacy_columns=omit_only):
+        return None
+    flat = [f"{t}.{c}" for t, cols in sorted(deployed.columns.items()) for c in cols]
+    detail = (
+        f"took the excluded columns of '{migration_state.cdc_stack_name}' as this session's "
+        f"({', '.join(flat)}); Start CDC keeps sending them"
+    )
+    overlay_n = len(flat) - sum(len(c) for c in omit_only.values())
+    if overlay_n:
+        detail += (
+            "; NULL in every row the tool writes where the target column is already "
+            "nullable with no DEFAULT or its table is empty"
+        )
+    if omit_only:
+        kept = ", ".join(f"{t}.{c}" for t, cols in sorted(omit_only.items()) for c in cols)
+        detail += (
+            f"; omit-only for {kept} (its table holds rows and the column keeps NOT NULL or "
+            "a DEFAULT on Aurora DSQL): rows the tool writes leave it out, so it takes the "
+            "DEFAULT -- and a NOT NULL column with no DEFAULT rejects the row"
+        )
+    return detail
+
+
+def _target_overlay_facts_reader(session):
+    """``(tables, columns_by_table) -> {table: TableOverlayFacts | None}`` on the target,
+    or ``None`` without a target. BLOCKING when called."""
+    target = getattr(session, "target_config", None)
+    if target is None:
+        return None
+    from dsql_migrator.core.target_connection import DsqlConnector
+    from dsql_migrator.core.target_introspector import target_overlay_facts
+
+    connect = DsqlConnector(target, aws_profile=getattr(session, "aws_profile", None)).connect
+
+    def _read(tables, columns_by_table):
+        return target_overlay_facts(
+            tables, columns_by_table, connection_factory=connect, probe_rows=True
+        )
+
+    return _read
+
+
 def _discover_cdc_controller(migration_state, session) -> None:
     """Wire the read-only MSK Connect controller, probe stack phase, detect connectors.
 

@@ -546,6 +546,41 @@ class DataMigrationState:
         with self._lock:
             self._excluded_lob_columns.setdefault(table, set()).add(column)
 
+    def adopt_deployed_exclusions(
+        self,
+        columns: "Mapping[str, Sequence[str]]",
+        *,
+        legacy_columns: "Mapping[str, Sequence[str]]" = (),
+    ) -> bool:
+        """Take an attached cdc-stack's excluded columns as this session's, in one step.
+
+        Only into an EMPTY stored set with no classification pending and -- re-checked
+        HERE, under the lock, because the caller decided after slow reads -- no Full Load
+        job and no CDC operation started in the meantime: it never overwrites a selection a
+        run used. ``legacy_columns`` (a subset) are marked omit-only; the rest are overlay
+        entries, as if ticked. No operator side effects and no ledger-in-use mark -- the
+        first run that overlays marks it. Returns whether anything was adopted.
+        """
+        with self._lock:
+            if self._restored_exclusion_facts is not None:
+                return False
+            if getattr(self, "job_id", None) is not None:
+                return False
+            if getattr(self, "cdc_deploy_job_id", None):
+                return False
+            if any(self._excluded_lob_columns.values()):
+                return False
+            adopted = {t: set(c) for t, c in (columns or {}).items() if c}
+            if not adopted:
+                return False
+            self._excluded_lob_columns = adopted
+            self._legacy_exclusions = {
+                t: set(c) & adopted.get(t, set())
+                for t, c in dict(legacy_columns or {}).items()
+                if set(c) & adopted.get(t, set())
+            }
+            return True
+
     def legacy_exclusions(self) -> dict[str, frozenset[str]]:
         """The omit-only entries: the classified legacy set UNION a still-pending
         classification's entries (pending behaves as legacy), within the stored set."""

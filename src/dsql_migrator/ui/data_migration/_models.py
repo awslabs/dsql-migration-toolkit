@@ -2271,6 +2271,174 @@ def format_column_exclude_list(
 
 
 @dataclass(frozen=True)
+class DeployedCaptureExclusions:
+    """The operator exclusions an attached stack's ColumnExcludeList carries, PROVEN by a
+    byte-for-byte round trip. ``form``: ``"exact"`` (only the 0.1.562+ formula reproduces
+    it), ``"legacy"`` (only the 0.1.561 formula does) or ``"plain"`` (both do). The form
+    says which VERSION deployed the stack -- never whether its entries were overlaid: a
+    0.1.562+ session can hold omit-only (legacy) entries too."""
+
+    columns: "dict[str, list[str]]"
+    form: str
+
+
+def deployed_capture_exclusions(
+    migration_state, inventory
+) -> "Optional[DeployedCaptureExclusions]":
+    """Read the attached stack's ColumnExcludeList back into operator columns, or ``None``.
+
+    * 0.1.562+ (exact) reading: each entry matched the way Debezium matches it against the
+      stack's OWN captured tables (its TableIncludeList decided any ``(?-i)`` marker and
+      the compact grouping), minus the generated columns the value itself carries, then
+      re-formatted with exactly those generated columns.
+    * 0.1.561 (legacy) reading, tried whenever that fails: the value was the raw stored set
+      (any inventory table, captured or not) plus EVERY inventory table's generated columns,
+      unescaped -- so each entry is a literal ``db.table.column`` of the inventory.
+
+    Accepted only when the reading's own formula reproduces the deployed value exactly.
+    ``None``: no value recorded, a stack table missing from the inventory, or a value
+    neither formula reproduces.
+    """
+    from dsql_migrator.core.cdc import (
+        format_column_exclude_value,
+        infer_column_exclusions,
+        split_column_exclude_value,
+    )
+    from dsql_migrator.core.converter import pg_preserved_generated_columns
+
+    deployed = getattr(migration_state, "cdc_deployed_column_exclude_list", None)
+    if deployed is None:
+        return None
+    if deployed == "":
+        return DeployedCaptureExclusions({}, "plain")
+    tables = list(getattr(inventory, "tables", None) or ())
+    by_name = {t.name: t for t in tables}
+    generated_all = {
+        t.name: {c.name for c in pg_preserved_generated_columns(t)} for t in tables
+    }
+
+    def _operator(found):
+        return {
+            t: sorted(set(cols) - generated_all.get(t, set()))
+            for t, cols in found.items()
+            if set(cols) - generated_all.get(t, set())
+        }
+
+    legacy_of = lambda operator: format_column_exclude_list(  # noqa: E731
+        cdc_excluded_columns(operator, inventory)
+    )
+    names = list(getattr(migration_state, "cdc_reconciled_table_names", None) or ())
+    if names and all(name in by_name for name in names):
+        captured = [by_name[name] for name in names]
+        found = infer_column_exclusions(deployed, captured)
+        if found is not None:
+            operator = _operator(found)
+            # Re-formatted from what the VALUE matched (operator + the generated columns it
+            # carries), so a generated column that appeared or went away since deploy does
+            # not fail the reading.
+            exact = format_column_exclude_value(found, captured)
+            if deployed == exact:
+                return DeployedCaptureExclusions(
+                    operator, "plain" if deployed == legacy_of(operator) else "exact"
+                )
+    literal = {f"{t.name}.{c.name}": (t.name, c.name) for t in tables for c in t.columns}
+    found: dict[str, set[str]] = {}
+    for entry in split_column_exclude_value(deployed):
+        if entry not in literal:
+            return None
+        table, column = literal[entry]
+        found.setdefault(table, set()).add(column)
+    # Re-formatted from the literal entries themselves (generated columns as the value
+    # carries them), so a generated column that appeared since deploy does not fail it.
+    if deployed == format_column_exclude_list({t: sorted(c) for t, c in found.items()}):
+        return DeployedCaptureExclusions(_operator(found), "legacy")
+    return None
+
+
+def capture_exclusion_mismatch(
+    migration_state, inventory, capture: "CdcCaptureExclusions", captured_tables
+) -> "Optional[str]":
+    """Why Start CDC must not send ``capture`` to the attached stack, or ``None``.
+
+    Start re-sends ColumnExcludeList on every pass, so a session whose set differs from a
+    stack that already streamed would silently change what CDC captures for rows it has
+    been streaming under the other set (live: a fresh session sent ``""`` over a stack
+    excluding 5 columns, so changes would have carried values the loaded rows hold as
+    NULL). Compared STRUCTURALLY on the tables captured both now and by the stack, so a
+    legitimate string change (0.1.561 -> exact form, a changed table set, a generated
+    column that appeared) is not refused. Nothing to refuse when the bytes already match,
+    the stack never streamed, or no stack value is known yet.
+    """
+    deployed = getattr(migration_state, "cdc_deployed_column_exclude_list", None)
+    if deployed is None or capture.sent == deployed:
+        return None
+    phase = getattr(migration_state, "cdc_stack_phase", None)
+    # "Streamed" = the stack was ever started: a committed offset, connectors detected, or a
+    # phase only a started stack reaches (an update that failed rolling back is "unstable").
+    if not (
+        getattr(migration_state, "cdc_has_committed_offset", False)
+        or getattr(migration_state, "cdc_connector_names", None)
+        or phase in ("running", "partial", "unstable")
+    ):
+        return None
+    from dsql_migrator.core.converter import pg_preserved_generated_columns
+
+    now_names = {getattr(t, "name", None) for t in captured_tables or ()}
+    stack_names = set(getattr(migration_state, "cdc_reconciled_table_names", None) or ())
+    shared = (now_names & stack_names) if stack_names else now_names
+    generated = {
+        t.name: {c.name for c in pg_preserved_generated_columns(t)}
+        for t in captured_tables or ()
+        if getattr(t, "name", None)
+    }
+    session = {
+        t: sorted(set(cols) - generated.get(t, set()))
+        for t, cols in capture.structured.items()
+        if t in shared and set(cols) - generated.get(t, set())
+    }
+    stack = deployed_capture_exclusions(migration_state, inventory)
+    name = getattr(migration_state, "cdc_stack_name", None) or "the CDC infrastructure"
+
+    def _named(columns) -> str:
+        flat = [f"{t}.{c}" for t, cols in sorted(columns.items()) for c in cols]
+        if not flat:
+            return "no columns"
+        return ", ".join(flat[:6]) + (f" and {len(flat) - 6} more" if len(flat) > 6 else "")
+
+    if stack is None:
+        how = (
+            "Delete the CDC infrastructure, choose the columns to exclude on the card, then "
+            "deploy it again."
+            if getattr(migration_state, "job_id", None) is None
+            else "Delete the CDC infrastructure and deploy it again: it then captures with "
+            "this session's set, the one its Full Load used (changing that set needs Start "
+            "over)."
+        )
+        return (
+            f"'{name}' has streamed with an excluded-column list that cannot be read "
+            "against this session's inventory (a table it captures is missing here, or the "
+            "list does not match these columns exactly), so Start CDC cannot tell whether "
+            f"sending this session's set would change what CDC captures. {how}"
+        )
+    stack_cols = {t: cols for t, cols in stack.columns.items() if t in shared}
+    if stack_cols == session:
+        return None
+    remedy = (
+        "Delete the CDC infrastructure and deploy it again with this session's exclusions"
+        + (
+            ", or Start over and attach it again so the session takes the stack's exclusions."
+            if getattr(migration_state, "job_id", None) is None
+            else " (this session's Full Load already wrote its rows under this session's set)."
+        )
+    )
+    return (
+        f"'{name}' has streamed while excluding {_named(stack_cols)}, but this session "
+        f"would exclude {_named(session)}. Start CDC sends the session's set, so changes "
+        f"CDC streams from here on would not match the rows already streamed. {remedy}"
+    )
+
+
+@dataclass(frozen=True)
 class CdcCaptureExclusions:
     """Everything the CDC surfaces need about ``column.exclude.list``, from ONE computation.
 

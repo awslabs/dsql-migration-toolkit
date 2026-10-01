@@ -1543,6 +1543,10 @@ class CdcStackParams(BaseModel):
     # exactly it, so an existing pipeline's capture list stays byte-identical
     # (see :func:`choose_column_exclude_value`). ``None``: always send ``filled``'s value.
     column_exclude_legacy: Optional[str] = None
+    # The ColumnExcludeList the UI's exclusion-mismatch refusal judged against (the last
+    # probe's value). Start CDC refuses when the LIVE stack carries another value by the
+    # time it runs. ``None``: not judged (no value was known), nothing to compare.
+    column_exclude_seen: Optional[str] = None
 
 
 # CloudFormation caps one parameter VALUE at 4,096 bytes, and ColumnExcludeList is one
@@ -1823,6 +1827,51 @@ def legacy_column_exclude_key_conflicts(params: "CdcStackParams") -> list[str]:
         f"{table}.{col}" for table, cols in keys.items() for col in cols
         if f"{table}.{col}" in entries
     )
+
+
+def infer_column_exclusions(
+    value: str, captured: "Sequence[TableDef]"
+) -> "Optional[dict[str, list[str]]]":
+    """The ``{db.table: [columns]}`` of ``captured`` a ColumnExcludeList ``value`` drops,
+    matched the way Debezium matches it -- or ``None`` when it cannot be read exactly.
+
+    There is no string inverse of :func:`format_column_exclude_value` (``\\.`` is both a
+    separator and an escaped dot, and the compact form groups names), so each entry is
+    matched against every captured ``db.table.column`` the way Debezium 2.7.4 does: the
+    entry trimmed like Java's ``String.trim``, an anchored match, case-insensitive for
+    ASCII only unless the entry starts with ``(?-i)``. ``None`` when an entry is not a
+    valid pattern or matches no captured column -- an unreadable value is never guessed.
+    The caller proves the result by re-formatting it (round trip). ``""`` -> ``{}``.
+    """
+    qualified = [
+        (table.name, column.name, f"{table.name}.{column.name}")
+        for table in captured
+        for column in table.columns
+    ]
+    found: dict[str, set[str]] = {}
+    for raw in split_column_exclude_value(value):
+        start, end = 0, len(raw)
+        while start < end and _cdc_trimmed(raw[start]):
+            start += 1
+        while end > start and _cdc_trimmed(raw[end - 1]):
+            end -= 1
+        entry = raw[start:end]
+        if not entry:
+            return None
+        case_sensitive = entry.startswith("(?-i)")
+        try:
+            pattern = re.compile(
+                entry[len("(?-i)"):] if case_sensitive else entry,
+                0 if case_sensitive else re.IGNORECASE | re.ASCII,
+            )
+        except re.error:
+            return None
+        hits = [(table, column) for table, column, name in qualified if pattern.fullmatch(name)]
+        if not hits:
+            return None
+        for table, column in hits:
+            found.setdefault(table, set()).add(column)
+    return {table: sorted(columns) for table, columns in sorted(found.items())}
 
 
 def choose_column_exclude_value(

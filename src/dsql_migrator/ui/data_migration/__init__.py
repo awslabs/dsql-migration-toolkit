@@ -279,6 +279,7 @@ from dsql_migrator.ui.data_migration._models import (
 # resolves the pure helpers/constants it consumes.
 from dsql_migrator.ui.data_migration._cdc_status import (
     _current_job,
+    adopt_deployed_exclusions_if_safe,
     _read_cdc_template_body,
     _CDC_ACTION_NOUN,
     _CDC_ACTION_TERMINAL,
@@ -2224,6 +2225,25 @@ def build_data_migration_screen(
                             )
                         except Exception:  # noqa: BLE001 - best-effort discovery
                             pass
+                        # An attached stack's excluded columns become this session's when
+                        # it has none (the deployed value is only known after the probe):
+                        # otherwise Start CDC sent the empty set over them. May read the
+                        # overlay ledger, so off the event loop; refreshes when it adopts.
+                        _adopted = None
+                        try:
+                            _adopted = await _disc_run.io_bound(
+                                adopt_deployed_exclusions_if_safe,
+                                migration_state, session, inventory,
+                            )
+                        except Exception:  # noqa: BLE001 - best-effort adoption
+                            _LOGGER.warning("Adopting the stack's excluded columns failed", exc_info=True)
+                            _adopted = None
+                        if _adopted:
+                            _log_cdc_event(
+                                "excluded columns adopted",
+                                status=ActivityStatus.INFO,
+                                detail=_adopted,
+                            )
                         # Prefill the CDC VpcId from the source DB's own DBSubnetGroup.
                         # Runs HERE, off the event loop, because render must not block on a
                         # control-plane round-trip (one asyncio loop serves every browser
@@ -2242,7 +2262,7 @@ def build_data_migration_screen(
                         # A real change (first probe reporting, a new stack found, a
                         # connector appearing/going away) still refreshes, so the
                         # duplicate-MSK adopt guard shows up as soon as it is known.
-                        if _vpc_derived or (
+                        if _adopted or _vpc_derived or (
                             cdc_discovery_fingerprint(migration_state) != _before
                         ):
                             refresh()

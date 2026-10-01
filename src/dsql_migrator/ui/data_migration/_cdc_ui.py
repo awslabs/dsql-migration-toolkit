@@ -99,6 +99,7 @@ from dsql_migrator.ui.data_migration._models import (
     cdc_excluded_columns,
     effective_lob_exclusions,
     missing_column_block_reason,
+    capture_exclusion_mismatch,
     cdc_capture_exclusions,
     CAPTURE_SIZE_REMEDY_UNLOCKED,
     capture_ambiguity_warning,
@@ -2460,18 +2461,15 @@ def _render_cdc_start_button(
     # The capture exclusions Start would send: refused when they cannot be carried (a
     # comma in a name, over CloudFormation's 4,096-byte parameter) -- say so before the
     # click -- and flagged when a stack kept on the 0.1.561 form never matched some names.
-    _capture = cdc_capture_exclusions(
-        migration_state,
-        inventory,
-        _cdc_tables_for_config(migration_state, inventory, watermark),
-    )
+    _captured_now = _cdc_tables_for_config(migration_state, inventory, watermark)
+    _capture = cdc_capture_exclusions(migration_state, inventory, _captured_now)
     _capture_error = (
         capture_error_with_remedy(
             migration_state, job_manager, _capture,
             table_lock=_table_lock(migration_state, job_manager, session),
         )
         if _capture.error
-        else None
+        else capture_exclusion_mismatch(migration_state, inventory, _capture, _captured_now)
     )
     # A source column the target certainly lacks: the sink would dead-letter every change
     # to it (42703). Checked HERE as well as at Deploy, because Attach (which moves no data)
@@ -2754,8 +2752,10 @@ def _render_cdc_attach_row(
     exclusion that no longer applies must be removed FIRST: same gate as Deploy, shown on
     the disabled button and re-checked at click time in case the state moved since this
     render. Neither the capture-size nor the 42703 check applies here: attaching moves no
-    data and changes no DDL, and the adopted stack's own deployed value decides what Start
-    sends (the chooser). ``where`` names where the card with the Remove is from THIS
+    data and changes no DDL. What Start then sends is the SESSION's set: a session with
+    none takes the stack's excluded columns after the next probe
+    (``adopt_deployed_exclusions_if_safe``), and Start refuses a set that differs from a
+    stack that streamed (``capture_exclusion_mismatch``). ``where`` names where the card with the Remove is from THIS
     surface. The plan-level banner and the CDC step's adopt panel both call this, so they
     cannot drift apart.
     """
@@ -5373,6 +5373,19 @@ def _start_cdc_deploy(
     # The exact-match form; Start CDC re-chooses against the LIVE stack's value
     # (core.cdc.apply_column_exclude_chooser), Deploy has no stack to keep.
     exclude_list = split_column_exclude_value(_capture.value) or None
+    # Retry CDC skips the dialog, so the Start section's refusal is repeated here: a set
+    # that differs from what a streamed stack excludes would change capture mid-stream.
+    _exclusion_mismatch = capture_exclusion_mismatch(
+        migration_state, inventory, _capture, tables_for_config
+    )
+    if _exclusion_mismatch:
+        render_notice(
+            ui,
+            tone="error",
+            header="The excluded columns cannot be sent to CDC",
+            body=_exclusion_mismatch,
+        )
+        return
     _resume_override, _force_initial_snapshot = _cdc_resume_signal(migration_state, session)
     mode = migration_state.cdc_start_mode()
     # Guard: a CDC sink requires at least one table (empty -> SinkTopics="" ->
@@ -5589,6 +5602,11 @@ def _start_cdc_deploy(
         sink_mcu_count=_sink_mcu_count(),
     )
     params = params.model_copy(update={"column_exclude_legacy": _capture.legacy})
+    # The stack value the exclusion-mismatch refusal judged: the job refuses if the LIVE
+    # stack carries another one by the time it runs (another session started it).
+    params = params.model_copy(
+        update={"column_exclude_seen": migration_state.cdc_deployed_column_exclude_list}
+    )
     migration_state.clear_cdc_deploy_log()
     stack_name = migration_state.cdc_stack_name
     aws_profile = getattr(session, "aws_profile", None)
