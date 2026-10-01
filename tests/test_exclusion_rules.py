@@ -1117,3 +1117,70 @@ def test_every_e1_fix_makes_progress():
             for fix in error.suggestions:
                 _r2, again = parse_rules(fix.line_text)
                 assert all(e.message != error.message for e in again.get(1, ())), (line, fix)
+
+
+# --- P3-C08: rule text for sessions without it ---------------------------------------
+
+from dsql_migrator.core.exclusion_rules import (  # noqa: E402
+    LEGACY_COMMENT,
+    synthesis_gaps,
+    synthesize_rule_text,
+)
+
+
+def test_synthesized_text_resolves_to_exactly_the_stored_set():
+    stored = {"shop.users": {"notes", "email"}, "shop.orders": {"memo"},
+              "my schema.order.items": {"weird*col"}}
+    text = synthesize_rule_text(stored)
+    assert text.splitlines() == [
+        'exclude "my schema"."order.items"."weird*col"',
+        "exclude shop.orders.memo",
+        "exclude shop.users.email",
+        "exclude shop.users.notes",
+    ]
+    res = _res(text)
+    assert res.can_save and {t: set(c) for t, c in res.columns.items()} == stored
+    assert res.selected_after is None and res.rule_excluded_after == frozenset()
+    assert synthesis_gaps(res, stored, TABLES) == ()
+
+
+def test_comments_say_where_an_entry_came_from():
+    stored = {"shop.users": {"notes", "email"}}
+    legacy = {"shop.users": {"notes"}}
+    assert synthesize_rule_text(stored, legacy).splitlines() == [
+        "exclude shop.users.email", f"exclude shop.users.notes  {LEGACY_COMMENT}"]
+    assert synthesize_rule_text(stored, legacy, adopted_from="dsql-cdc-x").splitlines() == [
+        "exclude shop.users.email  # adopted from dsql-cdc-x",
+        "exclude shop.users.notes  # adopted from dsql-cdc-x, omit-only"]
+
+
+@pytest.mark.parametrize("schema,table,column", [
+    ("my.schema", 't"q', "c d"), ("s", "*", "x*"), ("types", "table", " lead"),
+])
+def test_odd_names_round_trip_through_synthesis(schema, table, column):
+    name = f"{schema}.{table}"
+    tables = [_t(name, column)]
+    stored = {name: {column}}
+    res = resolve_exclusion_rules(synthesize_rule_text(stored), migratable=tables,
+                                  source_type=MY, effective_selection=[name])
+    assert res.can_save and {t: set(c) for t, c in res.columns.items()} == stored
+
+
+def test_gaps_are_reported_never_dropped_silently():
+    tables, applied = _shop()
+    stored = {"shop.customers": {"code", "name"}, "shop.orders": {"note", "gone"},
+              "old.table": {"x"}, "shop.lines": {"a\nb"}}
+    text = synthesize_rule_text(stored)
+    assert "a\nb" not in text
+    selection = ["shop.customers", "shop.orders"]
+    res = _full(text, tables=tables, applied=applied, selection=selection)
+    gaps = {(g.table, g.column): g.reason for g in synthesis_gaps(res, stored, tables)}
+    assert gaps == {
+        ("shop.customers", "code"): "Now blocked (referenced by a foreign key).",
+        ("shop.orders", "gone"): "The column is no longer in the source.",
+        ("old.table", "x"): "Its table is not migrated any more.",
+        ("shop.lines", "a\nb"): "Its name cannot be written as a rule.",
+    }
+    unselected = _full(text, tables=tables, applied=applied, selection=["shop.customers"])
+    gaps = {(g.table, g.column): g.reason for g in synthesis_gaps(unselected, stored, tables)}
+    assert gaps[("shop.orders", "note")] == "Its table is not selected."

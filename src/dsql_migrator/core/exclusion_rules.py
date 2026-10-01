@@ -814,6 +814,8 @@ class RuleResolution:
     cdc_value: Optional[str] = None
     cdc_bytes: Optional[int] = None
     capture_warning: Optional[str] = None
+    # selected' -- the tables in scope after this Save, whether or not it changes them.
+    in_scope: "tuple[str, ...]" = ()
 
     @property
     def can_save(self) -> bool:
@@ -1350,6 +1352,7 @@ def resolve_exclusion_rules(
         cdc_value=cdc_value,
         cdc_bytes=cdc_bytes,
         capture_warning=capture_warning,
+        in_scope=tuple(after),
     )
 
 
@@ -1480,10 +1483,88 @@ def _diff(columns, stored, unselect, reselect, cancellations) -> ResolutionDiff:
                           (text, *(c.text for c in cancellations)))
 
 
+# --- rule text for a session that has none ------------------------------------------
+
+LEGACY_COMMENT = "# excluded before v0.1.562"
+
+
+def synthesize_rule_text(
+    stored: "Mapping[str, Collection[str]]",
+    legacy: "Optional[Mapping[str, Collection[str]]]" = None,
+    *,
+    adopted_from: Optional[str] = None,
+) -> str:
+    """Explicit rule lines that resolve to exactly ``stored`` (one sorted column line per
+    entry; no table lines, so provenance starts empty). Comments say where an entry came
+    from: ``legacy`` (omit-only) entries ``# excluded before v0.1.562``; with
+    ``adopted_from`` every line ``# adopted from <stack>`` and the omit-only ones
+    ``# adopted from <stack>, omit-only``; a card tick nothing. An entry whose name cannot
+    be written (a line break, or a table name without a schema) is skipped -- see
+    :func:`synthesis_gaps`. Nothing is stored until the operator saves."""
+    omit = {(t, c) for t, cs in (legacy or {}).items() for c in cs}
+    lines: list[str] = []
+    for table in sorted(stored or {}):
+        schema, sep, rest = table.partition(".")
+        for column in sorted(stored[table] or ()):
+            if not sep or not all(rule_name_writable(x) for x in (schema, rest, column)):
+                continue
+            line = "exclude " + ".".join(rule_part_token(x) for x in (schema, rest, column))
+            if adopted_from is not None:
+                note = f"# adopted from {adopted_from}"
+                line += f"  {note}, omit-only" if (table, column) in omit else f"  {note}"
+            elif (table, column) in omit:
+                line += f"  {LEGACY_COMMENT}"
+            lines.append(line)
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class SynthesisGap:
+    """A stored entry the synthesized rules do not reproduce, and why."""
+
+    table: str
+    column: str
+    reason: str
+
+
+def synthesis_gaps(
+    resolution: RuleResolution,
+    stored: "Mapping[str, Collection[str]]",
+    migratable: "Sequence[TableDef]",
+) -> "tuple[SynthesisGap, ...]":
+    """The ``stored`` entries ``resolution`` (of the synthesized text, over ``migratable``)
+    does not keep, so the popup shows them instead of letting the first Save shrink the
+    set silently."""
+    blocked = {(b.table, b.column): b for b in resolution.blocked}
+    in_scope = set(resolution.in_scope)
+    columns_of = {t.name: {c.name for c in t.columns} for t in migratable}
+    gaps: list[SynthesisGap] = []
+    for table in sorted(stored or {}):
+        schema, sep, rest = table.partition(".")
+        for column in sorted(stored[table] or ()):
+            if column in resolution.columns.get(table, ()):
+                continue
+            if not sep or not all(rule_name_writable(x) for x in (schema, rest, column)):
+                reason = "Its name cannot be written as a rule."
+            elif table not in columns_of:
+                reason = "Its table is not migrated any more."
+            elif column not in columns_of[table]:
+                reason = "The column is no longer in the source."
+            elif (table, column) in blocked:
+                reason = f"Now blocked ({', '.join(blocked[(table, column)].labels)})."
+            elif table not in in_scope:
+                reason = "Its table is not selected."
+            else:
+                reason = "Not reproduced by the rules."
+            gaps.append(SynthesisGap(table, column, reason))
+    return tuple(gaps)
+
+
 __all__ = [
     "LINE_NO_EFFECT",
     "LINE_ONLY_BLOCKED",
     "LINE_ONLY_UNSELECTED",
+    "LEGACY_COMMENT",
     "BlockedItem",
     "Cancellation",
     "LineStatus",
@@ -1491,6 +1572,7 @@ __all__ = [
     "ResolutionDiff",
     "ReviewItem",
     "RuleResolution",
+    "SynthesisGap",
     "TargetChange",
     "RuleError",
     "RulePart",
@@ -1500,8 +1582,11 @@ __all__ = [
     "reduce_typed_name",
     "resolve_exclusion_rules",
     "resolve_type_name",
+    "rule_name_writable",
     "rule_type_name",
     "rule_part_token",
     "split_rule_comment",
+    "synthesis_gaps",
+    "synthesize_rule_text",
     "type_name_token",
 ]
