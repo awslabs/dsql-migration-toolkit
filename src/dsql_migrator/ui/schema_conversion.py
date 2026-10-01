@@ -67,6 +67,9 @@ from dsql_migrator.core.converter import (
     SchemaConverter,
     TableConversion,
     ViewConversion,
+    _BIT_HEX_LITERAL_RE,
+    _mysql_print_unescape,
+    _mysql_source_base,
     default_primary_key_strategy,
     identity_strategy_applies,
     parse_target_primary_key,
@@ -490,6 +493,34 @@ def _quote_mysql(name: str) -> str:
     return f"`{escaped}`"
 
 
+def _quote_mysql_table(name: str) -> str:
+    """Quote a (possibly ``schema.table``) MySQL name per part for display -- one backtick
+    pair around both names a table literally called ``schema.table``."""
+    schema, sep, obj = name.partition(".")
+    if sep and schema and obj:
+        return f"{_quote_mysql(schema)}.{_quote_mysql(obj)}"
+    return _quote_mysql(name)
+
+
+# The one expression default MySQL writes WITHOUT parentheses in SHOW CREATE TABLE (and
+# the only one MySQL 5.7 accepts): CURRENT_TIMESTAMP[(fsp)] -- information_schema reports
+# NOW()/LOCALTIME/... as this spelling too. Only consulted AFTER default_is_expression.
+_BARE_EXPRESSION_DEFAULT_RE = re.compile(r"current_timestamp(\(\d*\))?", re.IGNORECASE)
+# information_schema reports a BIT default as ``b'101'`` and a BINARY/VARBINARY one as
+# ``0x..`` hex; SHOW CREATE TABLE writes them bare (a quoted ``'b''1'''`` is a 4-byte string
+# MySQL rejects for BIT(1)). Keyed on the column's type, never on the value alone.
+_BARE_LITERAL_DEFAULT_BASES = frozenset({"bit", "binary", "varbinary"})
+_TEMPORAL_FSP_RE = re.compile(r"(?:datetime|timestamp)\s*\((\d+)\)", re.IGNORECASE)
+_MAYBE_CUT_BINARY_NOTE = (
+    " /* information_schema stops a binary default at its first 0x00 byte and SHOW CREATE "
+    "TABLE could not be read -- this may be cut short */"
+)
+_TRUNCATED_BINARY_NOTE = (
+    " /* information_schema stops a binary default at its first 0x00 byte, and this "
+    "one starts with it -- check SHOW CREATE TABLE */"
+)
+
+
 def _render_source_default(column: ColumnDef) -> str:
     """Render a column's DEFAULT the way MySQL itself writes it.
 
@@ -508,13 +539,66 @@ def _render_source_default(column: ColumnDef) -> str:
 
     Numeric and boolean-ish literals are quoted too, deliberately: MySQL accepts
     ``DEFAULT '0'`` for an int column and prints defaults quoted in SHOW CREATE TABLE, so
-    quoting is faithful and needs no per-type branch here (this is display text, never
-    executed against the target -- the converter owns the target's typed default).
+    quoting is faithful (this is display text, never executed against the target -- the
+    converter owns the target's typed default). COLUMN_DEFAULT holds a literal's real
+    value, so it is escaped as SHOW CREATE TABLE writes it (backslashes doubled, ``''``
+    for a quote). The one per-type branch: a BIT / BINARY / VARBINARY default is a bit or
+    hex literal and stays bare. That branch assumes the MySQL 8 information_schema
+    (binary defaults hex-encoded); MySQL 5.7 reports them as raw bytes, so a 5.7
+    VARBINARY default that happens to read like ``0x1F`` is shown as hex -- the
+    converter makes the same reading, so display and conversion agree.
+
+    A MySQL 8 expression default arrives from ``COLUMN_DEFAULT`` UNWRAPPED and with one
+    extra ``String::print`` escape layer (``_utf8mb4\\'none\\'``, ``uuid()``). SHOW CREATE
+    TABLE writes ``DEFAULT (_utf8mb4'none')`` / ``DEFAULT (uuid())`` -- the parentheses are
+    required syntax -- so that layer is undone (the converter's own decoder) and the
+    expression wrapped. Text that is not print-escaped (a bare quote) is kept verbatim.
+    information_schema garbles a non-ASCII expression (``'café'`` reads ``cafÃ©``; the
+    converter refuses such a value), so one is flagged rather than passed off as exact.
     """
     raw = column.default or ""
     if column.default_is_expression:
+        if _BARE_EXPRESSION_DEFAULT_RE.fullmatch(raw):
+            return raw
+        expression = _mysql_print_unescape(raw) or raw
+        rendered = f"({expression})"
+        if not expression.isascii():
+            rendered += (
+                " /* non-ASCII default: information_schema may report it garbled -- "
+                "check SHOW CREATE TABLE */"
+            )
+        return rendered
+    base = _mysql_source_base(column.mysql_type)
+    if base in ("binary", "varbinary"):
+        # information_schema stops a binary default at its FIRST 0x00 byte (BINARY(16)
+        # DEFAULT '' reads "0x"; BINARY(4) 'ab' reads "0x6162" though MySQL stores
+        # 'ab\0\0'); the introspector restores the full value from SHOW CREATE TABLE and
+        # writes it as x'..' (shown bare below). A 0x.. value that may still be cut is
+        # mirrored from the converter (``_binary_default_sql``) and flagged: BINARY(n)
+        # padded as MySQL pads it; a VARBINARY "0x" (a value starting with 0x00) cannot be
+        # read, so it is shown as its known first byte.
+        truncated = re.fullmatch(r"(?i)0x((?:[0-9a-f]{2})*)", raw)
+        if truncated is not None:
+            digits = truncated.group(1)
+            width_match = re.search(r"\(\s*(\d+)\s*\)", column.mysql_type or "")
+            width = int(width_match.group(1)) if width_match else 1
+            if base == "varbinary" and not digits:
+                return f"0x00{_TRUNCATED_BINARY_NOTE}"
+            if base == "binary" and len(digits) < 2 * width:
+                digits += "00" * (width - len(digits) // 2)
+                return f"0x{digits}{_MAYBE_CUT_BINARY_NOTE}"
+            if base == "varbinary":
+                # Not restored (the introspector writes a restored value as x'..').
+                return f"0x{digits}{_MAYBE_CUT_BINARY_NOTE}"
+    if base in _BARE_LITERAL_DEFAULT_BASES and _BIT_HEX_LITERAL_RE.fullmatch(raw):
         return raw
-    return "'" + raw.replace("'", "''") + "'"
+    # SHOW CREATE TABLE's own escaping (append_unescaped): backslash first, then NUL /
+    # LF / CR as \0 \n \r (a raw NUL makes the mysql client reject the statement).
+    escaped = (
+        raw.replace("\\", "\\\\").replace("\0", "\\0").replace("\n", "\\n")
+        .replace("\r", "\\r").replace("'", "''")
+    )
+    return f"'{escaped}'"
 
 
 def _quote_pg_ident(name: str) -> str:
@@ -649,7 +733,12 @@ def render_source_table_ddl(
         # MySQL's own SHOW CREATE TABLE order: DEFAULT then ON UPDATE, then the
         # AUTO_INCREMENT marker -- so the reconstruction reads like the real thing.
         if column.auto_update_timestamp:
-            clause += " ON UPDATE CURRENT_TIMESTAMP"
+            # MySQL requires the column's own fractional-seconds precision here
+            # (``datetime(6) ... ON UPDATE CURRENT_TIMESTAMP(6)``); only the flag is kept.
+            fsp = _TEMPORAL_FSP_RE.match(column.mysql_type or "")
+            clause += " ON UPDATE CURRENT_TIMESTAMP" + (
+                f"({fsp.group(1)})" if fsp and fsp.group(1) != "0" else ""
+            )
         if table.auto_increment_column and column.name == table.auto_increment_column:
             clause += " AUTO_INCREMENT"
         # A generated column is marked, NOT reconstructed: introspection captures only the
@@ -683,11 +772,11 @@ def render_source_table_ddl(
         )
         clauses.append(
             f"  CONSTRAINT {_quote_mysql(foreign_key.name)} FOREIGN KEY ({columns}) "
-            f"REFERENCES {_quote_mysql(foreign_key.referenced_table)} ({ref_columns})"
+            f"REFERENCES {_quote_mysql_table(foreign_key.referenced_table)} ({ref_columns})"
         )
 
     body = ",\n".join(clauses)
-    rendered = f"CREATE TABLE {_quote_mysql(table.name)} (\n{body}\n)"
+    rendered = f"CREATE TABLE {_quote_mysql_table(table.name)} (\n{body}\n)"
     # Native partitioning is table-level and, like a generated column, only the BOOLEAN is
     # captured -- the ``PARTITION BY`` clause itself is not. So it is noted rather than
     # reconstructed: DSQL has no user-visible partitioning (it partitions internally by

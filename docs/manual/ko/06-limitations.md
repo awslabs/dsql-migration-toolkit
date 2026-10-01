@@ -63,6 +63,26 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
 - **CDC는 데이터를 복제할 뿐 DDL은 복제하지 않음.** CDC 도중 소스에서 발생한 스키마 변경은 DSQL로
   **전파되지 않으므로** 동일한 DDL을 DSQL에 직접 적용해야 합니다
   ([4장 §4.2](04-cdc-and-dsql-constraints.md#42-cdc는-스키마가-아니라-데이터를-복제--중요) 참조).
+- **CDC가 실행 중이 아닐 때 마이그레이션 대상 테이블에 소스 DDL 금지(MySQL).** 시드된 위치(Full Load
+  워터마크 또는 Manual binlog 시작 지점 — 세션에 Full Load 워터마크가 없는 MySQL CDC only의 첫 시작은 이것이
+  필요 — 그리고 그런 실행을
+  Stop 후 다시 Start하는 모든 경우)에서 시작하는 MySQL CDC는 Debezium을 `snapshot.mode=recovery`로
+  실행합니다. 이 모드는 테이블의 **현재** 정의로 스키마 히스토리를 다시 만든 뒤 그 이전 위치부터 binlog를
+  읽습니다. 그 사이에 커밋된 스키마 변경(`ALTER TABLE` 등)이 있으면 이전 행 이벤트가 새 정의로
+  해석됩니다 — Debezium 문서의 `recovery` 경고("마지막 커넥터 종료 후 데이터베이스에 스키마 변경이
+  커밋되었다면 이 모드를 사용하지 말 것")에 해당합니다. 컬럼이 어긋나거나 커넥터가 실패할 수 있습니다.
+  Full Load부터 CDC 스트리밍 시작까지, 그리고 CDC를 멈춘 동안에는 대상 테이블의 DDL을 고정하세요. 변경이
+  끼어들었다면 CDC를 Stop하고, 소스 인벤토리를 새로 읽은 뒤(1단계 Evaluation 재실행) Schema Conversion에서
+  바뀐 테이블을 갱신해 다시 로드가 새 정의로 테이블을 만들고 읽게 한 다음 — DDL을 직접 편집했거나 키 전략을
+  고른 테이블은 그 편집이 유지되므로 다시 하거나 초기화하고, 삭제·이름 변경된 컬럼은 먼저 Aurora DSQL에서
+  삭제하거나 그 테이블을 Replace로 다시 적용해야 합니다(Drop & reload는 새 정의에 없는 대상 컬럼을 지우지
+  않으려고 해당 테이블을 거부합니다) — **"Drop & reload"로 Re-run Full Load**를 실행하세요(기본값
+  *Append*는 기존 행을 유지하므로 스트림이 멈춘 동안의 UPDATE/DELETE가 사라지고, *Reload specific
+  tables*와 *Retry*는 원래 워터마크를 유지합니다). 새 실행의 워터마크는 스트림이 멈춘 위치보다 뒤이므로
+  Start CDC가 오프셋을 그 위치로 앞당깁니다(Start는 되감지는 않지만 앞으로는 이동합니다). CDC only
+  실행에는 다시 돌릴 Full Load가 없으므로, 마이그레이션 유형을 Full load + CDC로 바꿔 같은 방법을 쓰거나,
+  CDC 인프라를 삭제하고 변경 이후의 Manual 시작 지점으로 다시 배포하세요(그 지점 이전에 바뀐 행은 따로
+  맞춰야 합니다).
 - **캐스케이드 FK 동작은 CDC로 복제되지 않음.** 서버 측 `ON DELETE/UPDATE CASCADE`(및 `SET NULL`/
   `SET DEFAULT`) 동작은 소스 엔진 *내부*에서 발생해 변경 스트림에 잡히지 않을 수 있으므로 CDC가 적용할 수
   없습니다 — 소스가 캐스케이드한 자식 행이 타깃에 orphan으로 남습니다(MySQL 소스의 경우 InnoDB가 binlog에

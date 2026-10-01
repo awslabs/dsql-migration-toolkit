@@ -1963,3 +1963,42 @@ def test_next_button_is_rendered_after_the_step_builder():
 
     body = ast.unparse(_render_main_fn())
     assert body.index("builder(refresh_all)") < body.rindex("make_next_button()")
+
+
+def test_a_builder_that_changes_its_own_step_redraws_only_the_header_and_sidebar():
+    """Review of a61cbbc: the header badge, the stepper and the sidebar were drawn from the
+    status read BEFORE the builder, so a builder that changes its own step (a streaming
+    CDC-only run promotes Data Migration to DONE) left them stale. The redraw is limited to
+    the header and the sidebar: a whole-screen refresh cancelled the builder's own timers
+    (CDC discovery armed in the same render) and dropped its one-render notices (the
+    Evaluation 'interrupted by a restart' notice)."""
+    import ast
+
+    fn = _render_main_fn()
+    body = ast.unparse(fn)
+    (header,) = [n for n in ast.walk(fn) if isinstance(n, ast.FunctionDef) and n.name == "step_header"]
+    assert any(ast.unparse(d) == "ui.refreshable" for d in header.decorator_list)
+    header_src = ast.unparse(header)
+    # the header reads the LIVE status and draws the stepper + badge + Run row
+    assert "get_status(state.workflow, step)" in header_src
+    assert "_render_journey_header(" in header_src and "ui.badge(" in header_src
+    after = body[body.index("builder(refresh_all)"):]
+    assert "get_status(state.workflow, step) is not status" in after
+    branch = after[after.index("is not status"):]
+    branch = branch[: branch.index("make_next_button()")]
+    assert "step_header.refresh()" in branch and "render_nav.refresh()" in branch
+    assert "refresh_all" not in branch and "timer" not in branch
+
+
+def test_the_header_redraw_runs_even_when_the_builder_raised() -> None:
+    """Review round 2: the status comparison sat inside the builder's try, so a builder that
+    changed its own step and then raised left the error notice under a stale header."""
+    import ast
+
+    fn = _render_main_fn()
+    (trys,) = [n for n in ast.walk(fn) if isinstance(n, ast.Try) and "builder(refresh_all)" in ast.unparse(n)]
+    assert "step_header.refresh()" not in ast.unparse(trys)
+    body = ast.unparse(fn)
+    redraw = body.index("if get_status(state.workflow, step) is not status:")
+    assert body.index("builder(refresh_all)") < redraw
+    assert redraw > body.index("This step's screen is implemented in a later task.")

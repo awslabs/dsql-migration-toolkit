@@ -4941,12 +4941,11 @@ def _render_prereq_category(
                 ui.label(group.category.value).classes("text-sm font-semibold")
                 ui.badge(group.summary).props(f"color={color} outline")
         _render_prereq_table(ui, group.results, combined=combined)
-        # NOTE: the cdc-stack deploy guide is intentionally NOT shown here. In this
-        # tool's model MSK/MSK Connect are not prerequisites -- they are created
-        # when the customer deploys the cdc-stack AFTER the CDC step produces the
-        # connector config. The deploy guide therefore lives in the CDC step's
-        # "Start CDC" section, not in prerequisites (where MSK is only an
-        # informational INFO -- expected, no action needed -- not a blocking FAIL).
+        # NOTE: no cdc-stack deploy guide inside a category. MSK/MSK Connect are not
+        # prerequisites: the cdc-stack (MSK) is deployed on this step -- offered at
+        # the bottom of Prerequisites for Full load + CDC, otherwise on the CDC step --
+        # and the connectors are created at Start CDC. So they report an
+        # informational INFO here (expected, no action needed), never a blocking FAIL.
 
 
 def _render_prereq_table(

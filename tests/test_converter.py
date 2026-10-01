@@ -3096,3 +3096,68 @@ def test_an_empty_default_on_a_non_text_column_still_emits_nothing(mysql_type):
     result = _convert_table(_single_column_table("t", mysql_type, nullable=False, default=""))
     col_line = next(l for l in result.target_ddl.splitlines() if '"value"' in l)
     assert "DEFAULT" not in col_line
+
+
+def test_a_binary_default_cut_at_its_first_zero_byte_is_padded_or_dropped_never_text() -> None:
+    """Review (live MySQL 8.0.42): information_schema hex-encodes a BINARY/VARBINARY default
+    only up to its first 0x00 byte -- BINARY(16) DEFAULT '' reads "0x", BINARY(4) 'ab' reads
+    "0x6162" (MySQL stores 'ab\\0\\0'), VARBINARY '' reads ''. "0x" fell through as the
+    2-byte TEXT '0x', a short BINARY lost its padding, and VARBINARY '' lost its default.
+    The introspector restores such a value from SHOW CREATE TABLE as x'..' (exact, silent);
+    a 0x.. value that may still be cut is kept with a warning."""
+    def conv(mysql_type, default, nullable=True):
+        return _convert_table(_single_column_table("t", mysql_type, nullable=nullable, default=default))
+
+    def value_clause(result):
+        return result.target_ddl.split('"value"')[1].split("\n")[0]
+
+    # restored by the introspector (x'..'): exact and silent
+    restored = conv("binary(16)", "x'" + "00" * 16 + "'", nullable=False)
+    assert "DEFAULT '\\x" + "00" * 16 + "'" in restored.target_ddl and not restored.warnings
+    vb_restored = conv("varbinary(8)", "x'610062'", nullable=False)
+    assert "DEFAULT '\\x610062'" in vb_restored.target_ddl and not vb_restored.warnings
+    # still the information_schema form: kept (BINARY padded) but warned it may be cut
+    zero = conv("binary(16)", "0x", nullable=False)
+    assert "DEFAULT '\\x" + "00" * 16 + "'" in zero.target_ddl, zero.target_ddl
+    assert any("may be cut short" in w.message for w in zero.warnings), zero.warnings
+    assert "DEFAULT '\\x61620000'" in conv("binary(4)", "0x6162").target_ddl
+    kept = conv("varbinary(4)", "0x01", nullable=False)
+    assert "DEFAULT '\\x01'" in kept.target_ddl
+    assert any("may be cut short" in w.message for w in kept.warnings)
+    # a full-width BINARY value is exact: no warning
+    full = conv("binary(2)", "0x0A0B")
+    assert "DEFAULT '\\x0a0b'" in full.target_ddl and not full.warnings
+    empty = conv("varbinary(255)", "", nullable=False)
+    assert "DEFAULT '\\x'" in value_clause(empty), empty.target_ddl
+    # a VARBINARY "0x" starts with 0x00 and cannot be read: no default, warned
+    vb = conv("varbinary(4)", "0x")
+    assert "DEFAULT" not in value_clause(vb), vb.target_ddl
+    assert any("cannot be read" in w.message for w in vb.warnings), vb.warnings
+    # MySQL 5.7 reports the raw bytes: ASCII (NUL included) -> exact hex, padded for BINARY
+    assert "DEFAULT '\\x61620000'" in conv("binary(4)", "ab\0\0").target_ddl
+    assert "DEFAULT '\\x" + "00" * 14 + "'" in conv("binary(14)", "\0" * 14).target_ddl
+    assert "DEFAULT '\\x616263'" in conv("varbinary(8)", "abc").target_ddl
+    raw = conv("varbinary(8)", "caf\u00e9")
+    assert "DEFAULT" not in value_clause(raw) and raw.warnings
+    assert all("\0" not in c.target_ddl for c in (zero, empty, raw))
+    # an emitted default never carries the NOT NULL "will be REJECTED" note
+    assert not any("REJECTED" in w.message for c in (zero, kept, empty, restored) for w in c.warnings)
+    # an expression default is printed text (never cut): unchanged, no warning
+    expr = _convert_table(_single_column_table("t", "varbinary(4)", default="0x0102", default_is_expression=True))
+    assert "DEFAULT '\\x0102'" in expr.target_ddl
+
+
+def test_a_text_default_holding_a_nul_is_dropped_with_a_warning() -> None:
+    """Live DSQL: CHAR(3) DEFAULT 'a\\0b' was emitted with a raw NUL inside the literal and
+    the CREATE TABLE failed ("unterminated quoted string"); PostgreSQL text cannot hold
+    U+0000 at all, so the default is dropped with a warning."""
+    result = _convert_table(_single_column_table("t", "char(3)", default="a\0b"))
+    assert "\0" not in result.target_ddl
+    assert "DEFAULT" not in result.target_ddl.split('"value"')[1], result.target_ddl
+    assert any("NUL (0x00)" in w.message for w in result.warnings), result.warnings
+    # also when the literal has edge whitespace (the exact-preserve path)
+    for default in ("a\0 ", " \0"):
+        edged = _convert_table(_single_column_table("t", "varchar(5)", default=default))
+        assert "\0" not in edged.target_ddl and any("NUL (0x00)" in w.message for w in edged.warnings)
+    # a newline is storable: kept
+    assert "DEFAULT 'a\nb'" in _convert_table(_single_column_table("t", "varchar(5)", default="a\nb")).target_ddl

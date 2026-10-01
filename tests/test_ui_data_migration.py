@@ -29214,7 +29214,7 @@ def test_process_worker_retry_reports_the_source_reread_to_the_parent(monkeypatc
 
     assert engine._retry_source_drops_in_process(_flaky, cancelled=lambda: False, table_name="app.orders") == "ok"
     rereads = [m for m in sent if isinstance(m, tuple) and m and m[0] == engine._SOURCE_REREAD]
-    assert rereads == [(engine._SOURCE_REREAD, "app.orders", 1, 3, 4.0)]
+    assert rereads == [(engine._SOURCE_REREAD, "app.orders", 1, 3, 4.0, None, False)]
     assert sent.index(rereads[0]) < sent.index(engine._HEARTBEAT)
     sent.clear()
     assert engine._retry_source_drops_in_process(lambda: "ok", cancelled=lambda: False, table_name="t") == "ok"
@@ -29251,7 +29251,7 @@ def test_progress_drain_logs_a_worker_source_reread_like_the_thread_path(monkeyp
             self._set = True
 
     q: "queue.Queue[object]" = queue.Queue()
-    q.put((fle._SOURCE_REREAD, "app.orders", 1, 3, 15.0))
+    q.put((fle._SOURCE_REREAD, "app.orders", 1, 3, 15.0, None, False))
     q.put(fle._PROGRESS_SENTINEL)
     fle._drain_progress_queue(q, _Handle(), _Event(), _Event(stopped_first))
     lines = [(a, kw["status"], kw["target"], kw["detail"]) for a, kw in logged]
@@ -29389,3 +29389,100 @@ def test_the_apply_skips_an_absent_pointing_in_child_silently_but_not_a_migrated
     present["shop.customers"] = False
     kept = engine._drop_absent_optional_children(conv, lambda: object(), frozenset({"shop.addresses"}))
     assert "shop.customers" in kept
+
+
+# --- review of c7a75f9: a shard's re-read names the shard and its real snapshot ------
+
+
+def test_a_shard_source_reread_names_the_shard_and_the_snapshot_it_reopens(monkeypatch) -> None:
+    """A sharded table re-reads ONE shard, not the table; and a PostgreSQL shared-snapshot
+    shard reopens the run's shared snapshot, not a fresh one (the notice said both wrong)."""
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    sent: list = []
+
+    class _Q:
+        def put_nowait(self, msg):
+            sent.append(msg)
+
+    monkeypatch.setattr(engine, "_worker_progress_queue", _Q())
+    monkeypatch.setattr(engine._time, "sleep", lambda _s: None)
+    monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_SOURCE_RETRY_BACKOFF_SECONDS", "4")
+    calls = {"n": 0}
+
+    def _flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _lost_connection(2013)
+        return "ok"
+
+    assert engine._retry_source_drops_in_process(
+        _flaky, cancelled=lambda: False, table_name="app.orders", shard_index=2,
+        shared_snapshot=True,
+    ) == "ok"
+    rereads = [m for m in sent if isinstance(m, tuple) and m and m[0] == engine._SOURCE_REREAD]
+    assert rereads == [(engine._SOURCE_REREAD, "app.orders", 1, 3, 4.0, 2, True)]
+
+    logged: list = []
+    monkeypatch.setattr(engine, "log_activity", lambda cat, action, **kw: logged.append(kw["detail"]))
+    engine._log_source_reread("app.orders", 1, 3, 15.0, 2, True)
+    engine._log_source_reread("app.orders", 1, 3, 15.0, 2, False)
+    shared, own = logged
+    assert "re-reading shard 2 of this table from the run's shared snapshot in 15s" in shared
+    assert "fresh snapshot" not in shared
+    assert "closes the run's shared-snapshot anchor" in shared
+    assert "the load stops (tables still loading are marked failed)" in shared
+    assert "Retry failed tables" in shared
+    assert "anchor" not in own
+    assert "re-reading shard 2 of this table from a fresh snapshot in 15s" in own
+    assert "idempotent" in shared and "idempotent" in own
+
+
+def test_the_shard_worker_passes_its_index_and_snapshot_to_the_reread() -> None:
+    import inspect
+
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    src = inspect.getsource(engine._migrate_shard_in_process)
+    call = src[src.index("_retry_source_drops_in_process("):]
+    call = call[: call.index("\n        )\n")]
+    assert "shard_index=args.shard_index" in call
+    assert "shared_snapshot=bool(args.shared_snapshot_id)" in call
+
+
+def test_a_lost_snapshot_anchor_fails_the_tables_it_stopped_not_a_user_stop() -> None:
+    """Review of the re-read notice: the keepalive stops every worker when the anchor dies,
+    but the stopped tables were tallied as a user Stop -- not counted as failures -- so the
+    run logged "run completed" over tables that did not finish (``_anchor_lost`` was set
+    and never read). Both result paths now count an anchor stop FAILED, unless the operator
+    also pressed Stop."""
+    import inspect
+
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    src = inspect.getsource(engine)
+    sharded = src[src.index("                        elif any_stopped:"):]
+    sharded = sharded[: sharded.index("                        else:")]
+    assert "_anchor_lost[0] and not handle.cancelled" in sharded
+    assert "_tally(_TableLoadOutcome.FAILED)" in sharded and "_ANCHOR_LOST_DETAIL" in sharded
+    whole = src[src.index('                        elif result.status == "STOPPED":'):]
+    whole = whole[: whole.index("                        else:  # FAILED")]
+    assert "_anchor_stop = _anchor_lost[0] and not handle.cancelled" in whole
+    assert "_TableLoadOutcome.FAILED if _anchor_stop else _TableLoadOutcome.STOPPED" in whole
+    assert "_ANCHOR_LOST_DETAIL if _anchor_stop" in whole
+    assert "Retry failed tables" in engine._ANCHOR_LOST_DETAIL
+    # both record the cause in the error log, like every other FAILED tally
+    assert "_record_anchor_lost(error_log, job_id, name)" in sharded
+    assert "_record_anchor_lost(error_log, job_id, name)" in whole
+
+    class _Log:
+        def __init__(self):
+            self.records = []
+
+        def record(self, job_id, rec):
+            self.records.append((job_id, rec))
+
+    log = _Log()
+    engine._record_anchor_lost(log, "job-1", "app.orders")
+    ((jid, rec),) = log.records
+    assert jid == "job-1" and rec.table == "app.orders" and rec.message == engine._ANCHOR_LOST_DETAIL

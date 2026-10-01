@@ -897,8 +897,10 @@ def check_msk_available(available: bool) -> PrerequisiteResult:
     """Report MSK cluster presence as a non-blocking ``INFO`` (not WARN, not FAIL).
 
     MSK is NOT a CDC prerequisite: in this tool's model the MSK Serverless
-    cluster is created when the customer deploys the cdc-stack -- which happens
-    AFTER the CDC step produces the connector config, not before. So when the
+    cluster is created when the customer deploys the cdc-stack on the Data
+    Migration step -- for Full load + CDC it is offered below these checks so it
+    provisions while the Full Load runs; otherwise it is deployed on the CDC step.
+    So when the
     cluster is not yet present this is expected, no-action-needed ``INFO`` (not a
     ``WARN`` that implies a problem, and never a required ``FAIL`` that would
     block reaching the CDC step). When the cluster IS already present (e.g. a
@@ -916,8 +918,9 @@ def check_msk_available(available: bool) -> PrerequisiteResult:
         if available
         else (
             "Not a prerequisite -- the MSK Serverless cluster is provisioned when "
-            "you deploy the cdc-stack, which you do AFTER completing the CDC step "
-            "(it produces the connector config to deploy). No action needed here."
+            "you deploy the cdc-stack on this Data Migration step (for Full load + "
+            "CDC it is offered below these checks so it is ready when the Full Load "
+            "finishes; otherwise on the CDC step). No action needed here."
         ),
     )
 
@@ -925,11 +928,12 @@ def check_msk_available(available: bool) -> PrerequisiteResult:
 def check_msk_connect_available(available: bool) -> PrerequisiteResult:
     """Report MSK Connect presence as a non-blocking ``INFO`` (not WARN, not FAIL).
 
-    Like :func:`check_msk_available`, MSK Connect (which runs the Debezium source
-    and DSQL sink connectors) is created by the cdc-stack deploy that follows the
-    CDC step -- so its absence is expected, no-action-needed ``INFO``, not a
-    ``WARN`` (no problem here) and not a blocking ``FAIL``. Present (a prior
-    deploy) reports ``PASS``.
+    The probe reports MSK Connect available once a connector exists. The cdc-stack
+    deploy creates none: the Debezium source and DSQL sink connectors are created
+    when the customer starts CDC on the CDC step (and removed again by Stop CDC) --
+    so their absence is expected, no-action-needed ``INFO``, not a ``WARN`` (no
+    problem here) and not a blocking ``FAIL``. Present (a running CDC) reports
+    ``PASS``.
     """
     return PrerequisiteResult(
         check_id=PrerequisiteCheckId.MSK_CONNECT_AVAILABLE,
@@ -938,12 +942,14 @@ def check_msk_connect_available(available: bool) -> PrerequisiteResult:
         required=False,
         detail="MSK Connect available."
         if available
-        else "MSK Connect not deployed yet (created when you deploy the cdc-stack).",
+        else "No MSK Connect connectors yet (created when you start CDC).",
         remediation=""
         if available
         else (
-            "Not a prerequisite -- MSK Connect and its connectors are provisioned "
-            "when you deploy the cdc-stack after the CDC step. No action needed here."
+            "Not a prerequisite -- the source and sink connectors are created when "
+            "you start CDC on the CDC step (on the cdc-stack deployed on this Data "
+            "Migration step) and removed again when you stop it. No action needed "
+            "here."
         ),
     )
 

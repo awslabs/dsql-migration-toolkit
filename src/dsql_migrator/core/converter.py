@@ -1669,6 +1669,64 @@ def _quote_default_literal(literal: str, *, is_string_target: bool = False) -> s
     return f"'{escaped}'"
 
 
+def _binary_default_sql(column: ColumnDef) -> "Optional[tuple[Optional[str], Optional[str]]]":
+    """The bytea default for a MySQL BINARY/VARBINARY literal default, or ``None`` to
+    leave it to :func:`_column_default_sql` (an ``x'..'`` / ``b'..'`` form, another type).
+
+    MySQL 8 information_schema hex-encodes a binary default only up to its FIRST 0x00
+    byte (live 8.0.42: BINARY(16) DEFAULT '' reads ``0x``, BINARY(4) 'ab' reads
+    ``0x6162`` though MySQL stores 'ab\\0\\0', VARBINARY '' reads ``''``). The MySQL
+    introspector restores such a value in full from SHOW CREATE TABLE and writes it as
+    ``x'..'`` (``introspector._restore_cut_binary_defaults``), which the bit/hex branch
+    emits exactly. A ``0x..`` value that may still be cut (that read failed) is kept as
+    reported with a warning -- BINARY(n) padded to n bytes as MySQL pads it -- and a
+    VARBINARY ``0x`` (a value that starts with 0x00) cannot be read: dropped, warned.
+    MySQL 5.7 bytes that are not valid utf8 may already be replaced or cut by the server. MySQL 5.7 reports the raw bytes instead: ASCII ones (NUL included) become
+    the exact hex literal; anything else cannot be trusted and is dropped. A raw NUL in
+    the literal used to cut the CREATE TABLE short; '0x' used to become 2 text bytes.
+    """
+    base = _mysql_source_base(column.mysql_type)
+    if base not in ("binary", "varbinary"):
+        return None
+    value = column.default or ""
+    width_match = re.search(r"\(\s*(\d+)\s*\)", column.mysql_type or "")
+    width = int(width_match.group(1)) if width_match else 1
+    hex_form = re.fullmatch(r"(?i)0x((?:[0-9a-f]{2})*)", value)
+    if hex_form is not None:
+        digits = hex_form.group(1).lower()
+        if base == "varbinary" and not digits:
+            return None, (
+                f"VARBINARY default {value}: information_schema reports a binary default "
+                "only up to its first 0x00 byte, and this one starts with it, so its value "
+                "cannot be read; the column is created without a default. Read it from "
+                "SHOW CREATE TABLE and set it with ALTER TABLE if needed."
+            )
+    elif _BIT_HEX_LITERAL_RE.fullmatch(value.strip()):
+        return None  # x'..' / b'..': the bit/hex literal branch decides
+    elif value.isascii():
+        digits = value.encode("ascii").hex()  # MySQL 5.7: the raw bytes
+    else:
+        return None, (
+            f"{base.upper()} default holds bytes information_schema cannot report exactly, "
+            "so the column is created without a default. Read it from SHOW CREATE TABLE "
+            "and set it with ALTER TABLE if needed."
+        )
+    warning = None
+    if hex_form is not None and (base == "varbinary" or len(digits) < 2 * width):
+        # Still the information_schema form: the introspector rewrites a value it restored
+        # from SHOW CREATE TABLE as x'..', so this one may be cut short at a 0x00 byte.
+        warning = (
+            f"{base.upper()} default {value}: information_schema reports a binary default "
+            "only up to its first 0x00 byte and the full value could not be read from SHOW "
+            "CREATE TABLE, so this default may be cut short"
+            + (f" (padded with 0x00 to {width} bytes as MySQL pads BINARY)" if base == "binary" else "")
+            + ". Check SHOW CREATE TABLE."
+        )
+    if base == "binary" and len(digits) < 2 * width:
+        digits += "00" * (width - len(digits) // 2)
+    return _quote_default_literal("\\x" + digits, is_string_target=True), warning
+
+
 def _column_default_sql(
     column: ColumnDef, target_type: str, enum_values: Optional[list[str]] = None
 ) -> tuple[Optional[str], Optional[str]]:
@@ -1727,6 +1785,20 @@ def _column_default_sql(
     if column.default is None or column.generated:
         return None, None  # no default / a computed value (a default cannot apply)
     target = (target_type or "").strip().lower()
+    if not column.default_is_expression:
+        if target.startswith(_TEXTUAL_TARGET_PREFIXES) and "\0" in column.default:
+            # PostgreSQL text cannot hold U+0000, and a raw NUL inside the literal cut the
+            # CREATE TABLE short ("unterminated quoted string", live DSQL) -- the loader
+            # refuses such a value too (target_connection) -- so it is dropped, never sent.
+            return None, (
+                f"text default {column.default!r} contains a NUL (0x00) character, which "
+                "Aurora DSQL (PostgreSQL) text cannot store, so the column is created "
+                "without a default."
+            )
+        if target.startswith("bytea"):
+            binary = _binary_default_sql(column)
+            if binary is not None:
+                return binary
     if not column.default_is_expression and target.startswith(_TEXTUAL_TARGET_PREFIXES):
         # A textual literal is carried EXACTLY: information_schema reports it unquoted, so
         # ``DEFAULT ''`` arrives as '' (read as "no default" -- a NOT NULL VARCHAR then
@@ -4292,7 +4364,7 @@ class SchemaConverter:
             _emitted, default_warning = _resolve_column_default(column)
             if default_warning is None:
                 continue
-            if not column.nullable:
+            if not column.nullable and _emitted is None:
                 default_warning += (
                     " This column is NOT NULL, so an INSERT that omits it succeeds on "
                     "MySQL but will be REJECTED on Aurora DSQL -- set the value "

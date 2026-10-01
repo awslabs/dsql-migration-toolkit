@@ -1753,6 +1753,11 @@ class ValidationState:
         # Start over, a CDC start or retry -- ``note_cdc_start`` -- and a cut-over DEFAULT
         # restore refused by its settle check). It also gates that restore.
         self.cutover_cdc_drained_confirmed: bool = False
+        # Set when a run restored as IN_PROGRESS had no live job and no report (the app
+        # restarted mid-run), cleared by the next run. The step re-renders once right
+        # after that reconcile, so the "interrupted" notice is drawn from this flag --
+        # a per-render local vanished ~50 ms after it appeared.
+        self.interrupted_by_restart: bool = False
         self._result: Optional[ValidationReport] = None
         self._error: Optional[str] = None
         # Per-table RE-CHECK track (the same single job slot as a full run --
@@ -2313,6 +2318,7 @@ class ValidationState:
             self._cutover_fk_apply_progress = None
             self.proceed_without_foreign_keys = False
             self.cutover_cdc_drained_confirmed = False
+            self.interrupted_by_restart = False
             self._cutover_default_restore_outcome = None
             self._invalidate_cutover_defaults_locked()
 
@@ -3181,38 +3187,50 @@ def build_validation_screen(
                     status = StepStatus.DONE
                     _reconciled_late = True
                 else:
-                    # Truly orphaned with no result: reconcile to NOT_STARTED and
-                    # tell the user to re-run, instead of spinning forever.
+                    # No live job and no result. A job record that is still here ended
+                    # while nothing polled (the poll timer dies on navigation): map it as
+                    # the poll would, so a FAILED run keeps its real error. Only a missing
+                    # record -- the app restarted -- is reported as interrupted; either
+                    # way the step stops spinning forever.
+                    ended = _ended_job_step_status(job_manager, validation_state)
+                    if ended is StepStatus.FAILED:
+                        validation_state.set_error(
+                            job_manager.get_error(validation_state.job_id)
+                            or "Validation failed."
+                        )
+                    if ended is None or ended is StepStatus.DONE:
+                        # DONE with no report cannot be shown: treat it as not run.
+                        ended = StepStatus.NOT_STARTED
+                        validation_state.interrupted_by_restart = True
                     session.set_workflow(
                         with_status(
                             session.workflow,
                             WorkflowStep.VALIDATION,
-                            StepStatus.NOT_STARTED,
+                            ended,
                         )
                     )
-                    status = StepStatus.NOT_STARTED
+                    status = ended
                     _reconciled_late = True
-                    render_notice(
-                        ui,
-                        tone="warning",
-                        header="Previous validation was interrupted",
-                        body=(
-                            "A validation run was in progress but is no longer "
-                            "active (the app restarted or the page was reloaded). "
-                            "No report was produced and nothing on the target was "
-                            "changed (validation is read-only). Click Re-run to "
-                            "validate again."
-                        ),
-                    )
+            if status is StepStatus.NOT_STARTED and validation_state.interrupted_by_restart:
+                render_notice(
+                    ui,
+                    tone="warning",
+                    header="Previous validation was interrupted",
+                    body=(
+                        "A validation run was in progress but is no longer "
+                        "active (the app restarted or the page was reloaded). "
+                        "No report was produced and nothing on the target was "
+                        "changed (validation is read-only). Click Re-run to "
+                        "validate again."
+                    ),
+                )
             if _reconciled_late:
-                # This in-content reconcile changed the PERSISTED workflow status, but
-                # the workflow shell (step header badge + "Re-run validation" button)
-                # already rendered with the stale IN_PROGRESS status THIS pass, and
-                # nothing else re-renders it -- so the step would stay stuck showing an
-                # "In progress" badge + a permanently-locked Re-run over the finished
-                # report. Defer a one-shot refresh so the shell re-renders with the
-                # reconciled status. The next pass reads DONE/NOT_STARTED (no reconcile,
-                # so no further timer) -- a single extra render, never a loop.
+                # This in-content reconcile changed the PERSISTED workflow status after
+                # the scope card and options above were drawn for the stale IN_PROGRESS
+                # status (hidden). The shell redraws its own header and sidebar; this
+                # one-shot refresh redraws THIS screen so they reappear. The next pass
+                # reads DONE/NOT_STARTED (no reconcile, so no further timer) -- a single
+                # extra render, never a loop; the notice above survives it via the flag.
                 ui.timer(0.05, refresh, once=True)  # type: ignore[attr-defined]
 
             result = validation_state.result
@@ -4776,6 +4794,22 @@ def _running_job_alive(
     except JobNotFoundError:
         return False
     return job.status in ("PENDING", "RUNNING")
+
+
+def _ended_job_step_status(
+    job_manager: JobManager, validation_state: "ValidationState"
+) -> Optional[StepStatus]:
+    """The step status of the session's validation job if its record still exists and it
+    ended (FAILED / CANCELLED / DONE), else ``None`` (no job id, or the record is gone --
+    the app restarted). Mirrors the poll timer's terminal mapping."""
+    job_id = validation_state.job_id
+    if job_id is None:
+        return None
+    try:
+        job = job_manager.get_status(job_id)
+    except JobNotFoundError:
+        return None
+    return job_status_to_step_status(job.status)
 
 
 def _render_in_progress(

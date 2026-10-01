@@ -738,6 +738,21 @@ _PROCESS_LAUNCH_STAGGER_SECONDS = 0.15
 # How often the parent pings the shared-snapshot anchor to keep its transaction from
 # being reaped while idle. Well under a typical idle_in_transaction_session_timeout.
 _ANCHOR_KEEPALIVE_SECONDS = 60.0
+# The activity line for a table the anchor's loss stopped (see the keepalive loop).
+_ANCHOR_LOST_DETAIL = (
+    "stopped: the shared-snapshot anchor connection was lost (a source failover closes "
+    "it), so this table did not finish -- Retry failed tables reloads it from a new "
+    "snapshot"
+)
+
+
+def _record_anchor_lost(error_log, job_id: str, table_name: str) -> None:
+    """The error-log record for a table the anchor's loss stopped: every other FAILED
+    tally records its cause, and the failure notice points the operator at the log."""
+    error_log.record(job_id, DataErrorRecord(
+        table=table_name, chunk_id=table_name, error_code=None,
+        message=_ANCHOR_LOST_DETAIL, occurred_at=datetime.now(timezone.utc),
+    ))
 
 _CANCEL_GRACE_SECONDS = 90.0
 
@@ -760,9 +775,10 @@ _CHUNK_THROTTLED = "\x00chunk-throttled"
 # connection. This is an explicit liveness signal -- unlike a diagnostic read, which must
 # NOT stamp liveness (see JobHandle.snapshot).
 _HEARTBEAT = "\x00heartbeat"
-# A worker process re-reads a table after a lost SOURCE connection:
-# (_SOURCE_REREAD, table, attempt, attempts, delay). A child cannot log_activity (no file
-# handler there), so the parent's drain logs the thread path's own line for it.
+# A worker process re-reads a table (or one shard of it) after a lost SOURCE connection:
+# (_SOURCE_REREAD, table, attempt, attempts, delay, shard_index, shared_snapshot). A child
+# cannot log_activity (no file handler there), so the parent's drain logs the thread path's
+# own line for it.
 _SOURCE_REREAD = "\x00source-reread"
 
 # Ceiling for the source-retry backoff. ``base * 2**(attempt-1)`` is uncapped, so raising
@@ -1021,6 +1037,8 @@ def _retry_source_drops_in_process(
     release=None,
     source_type: SourceType = SourceType.MYSQL,
     before_reread=None,
+    shard_index: Optional[int] = None,
+    shared_snapshot: bool = False,
 ):
     """Run ``work()`` in a child process, retrying a dropped SOURCE connection.
 
@@ -1030,7 +1048,9 @@ def _retry_source_drops_in_process(
     parent's log -- the re-read is reported over the progress queue (the parent's drain
     logs it) and the outcome through the returned ``_TableWorkerResult`` -- so the retry
     state lives entirely in this call. ``cancelled`` is a zero-arg predicate over the
-    shared cancel event.
+    shared cancel event. ``shard_index`` / ``shared_snapshot`` only word the re-read
+    notice: a shard re-reads its own PK range, from the run's shared snapshot when it
+    imported one.
 
     ``release`` (optional) closes the failed attempt's source row stream before the
     retry waits, so the dead connection is not pinned for the whole backoff
@@ -1077,11 +1097,14 @@ def _retry_source_drops_in_process(
             (
                 _SOURCE_REREAD, table_name, attempt, attempts,
                 min(_SOURCE_RETRY_MAX_DELAY_SECONDS, backoff * (2 ** (attempt - 1))),
+                shard_index, shared_snapshot,
             ),
         )
         if not _wait_before_source_reread(
-            table_name=table_name, attempt=attempt, attempts=attempts,
+            table_name=table_name if shard_index is None else f"{table_name} shard {shard_index}",
+            attempt=attempt, attempts=attempts,
             backoff=backoff, cause=cause, cancelled=cancelled,
+            reread_from="the run's shared snapshot" if shared_snapshot else "a fresh snapshot",
         ):
             raise _FullLoadStopped()
     raise AssertionError("source retry loop exited without a result")
@@ -1136,6 +1159,7 @@ def _wait_before_source_reread(
     backoff: float,
     cause: str,
     cancelled,
+    reread_from: str = "a fresh snapshot",
 ) -> bool:
     """Wait out the failover before re-reading; ``False`` if the user stopped.
 
@@ -1154,8 +1178,8 @@ def _wait_before_source_reread(
     delay = min(_SOURCE_RETRY_MAX_DELAY_SECONDS, backoff * (2 ** (attempt - 1)))
     _LOGGER.warning(
         "Full Load source connection lost for table %s (attempt %d/%d): %s -- "
-        "re-reading from a fresh snapshot in %.0fs",
-        table_name, attempt, attempts, cause, delay,
+        "re-reading from %s in %.0fs",
+        table_name, attempt, attempts, cause, reread_from, delay,
     )
     waited = 0.0
     while waited < delay:
@@ -1476,6 +1500,8 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
                 if args.shared_snapshot_id
                 else lambda: _discard_ordinal_resume_state(_resume_job)
             ),
+            shard_index=args.shard_index,
+            shared_snapshot=bool(args.shared_snapshot_id),
         )
         if (pending_loaded or pending_skipped) and progress_queue is not None:
             _report_progress(progress_queue, (name, pending_loaded, pending_skipped))
@@ -1672,20 +1698,41 @@ class _MemoryPressureLogger:
         return f" while loading: {', '.join(sorted(names))}" if names else ""
 
 
-def _log_source_reread(table_name: str, attempt: int, attempts: int, delay: float) -> None:
+def _log_source_reread(
+    table_name: str,
+    attempt: int,
+    attempts: int,
+    delay: float,
+    shard_index: Optional[int] = None,
+    shared_snapshot: bool = False,
+) -> None:
     """The activity line for a table re-read after a lost source connection -- ONE text for
-    the thread path and (via the progress drain) a worker process."""
+    the thread path and (via the progress drain) a worker process.
+
+    A shard re-reads only its own PK range, so it is named. A PostgreSQL shard that imported
+    the run's shared snapshot reopens THAT snapshot, which lives only as long as the parent's
+    anchor connection -- and a writer failover closes that too. The parent's keepalive then
+    stops the whole sharded load (:data:`_ANCHOR_LOST_DETAIL`), so the caveat says so.
+    """
+    what = "this table" if shard_index is None else f"shard {shard_index} of this table"
+    source = "the run's shared snapshot" if shared_snapshot else "a fresh snapshot"
+    detail = (
+        f"source connection lost (attempt {attempt}/{attempts}) — "
+        f"likely an Aurora failover; re-reading {what} from {source} in {delay:.0f}s. "
+        f"Already-written rows are skipped (idempotent), so no duplicates."
+    )
+    if shared_snapshot:
+        detail += (
+            " A failover also closes the run's shared-snapshot anchor; if it did, the "
+            "load stops (tables still loading are marked failed) and Retry failed "
+            "tables reloads them from a new snapshot."
+        )
     log_activity(
         ActivityCategory.FULL_LOAD,
         "load table",
         status=ActivityStatus.INFO,
         target=table_name,
-        detail=(
-            f"source connection lost (attempt {attempt}/{attempts}) — "
-            f"likely an Aurora failover; re-reading this table from a fresh "
-            f"snapshot in {delay:.0f}s. Already-written rows are skipped "
-            f"(idempotent), so no duplicates."
-        ),
+        detail=detail,
     )
 
 
@@ -1730,7 +1777,7 @@ def _drain_progress_queue(
                 # watchdog's liveness clock without changing any job state.
                 handle.update(lambda job: None)
                 continue
-            if isinstance(msg, tuple) and len(msg) == 5 and msg[0] == _SOURCE_REREAD:
+            if isinstance(msg, tuple) and len(msg) == 7 and msg[0] == _SOURCE_REREAD:
                 _log_source_reread(*msg[1:])
                 continue
             if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == _CHUNK_STARTED:
@@ -1767,7 +1814,7 @@ def _drain_progress_queue(
         # exception would propagate out of the drain thread's target and be reported as a
         # run failure for work that had already finished.
         try:
-            if isinstance(msg, tuple) and len(msg) == 5 and msg[0] == _SOURCE_REREAD:
+            if isinstance(msg, tuple) and len(msg) == 7 and msg[0] == _SOURCE_REREAD:
                 _log_source_reread(*msg[1:])
                 continue
             if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == _CHUNK_STARTED:
@@ -3042,7 +3089,18 @@ def _migrate_tables_in_parallel(
                             _tally(_TableLoadOutcome.FAILED)
                         elif any_stopped:
                             handle.update(lambda job, n=name: _fail_chunk(job, n))
-                            _tally(_TableLoadOutcome.STOPPED)
+                            if _anchor_lost[0] and not handle.cancelled:
+                                # Not the operator's Stop: the anchor died and the keepalive
+                                # stopped the workers. Counted FAILED so the run is
+                                # incomplete (it was tallied as a stop, so a run whose
+                                # tables did not finish logged "run completed").
+                                log_activity(ActivityCategory.FULL_LOAD, "load table",
+                                    status=ActivityStatus.FAILURE, target=name,
+                                    detail=_ANCHOR_LOST_DETAIL)
+                                _record_anchor_lost(error_log, job_id, name)
+                                _tally(_TableLoadOutcome.FAILED)
+                            else:
+                                _tally(_TableLoadOutcome.STOPPED)
                         else:
                             had_q = len(all_quarantine) > 0
                             log_activity(ActivityCategory.FULL_LOAD, "load table",
@@ -3113,11 +3171,15 @@ def _migrate_tables_in_parallel(
                                 _complete_chunk(job, n, r, s, q))
                             _tally(_TableLoadOutcome.QUARANTINED if had_quarantine else _TableLoadOutcome.LOADED)
                         elif result.status == "STOPPED":
+                            _anchor_stop = _anchor_lost[0] and not handle.cancelled
                             log_activity(ActivityCategory.FULL_LOAD, "load table",
-                                status=ActivityStatus.INFO, target=name,
-                                detail="stopped by user (retryable)")
+                                status=ActivityStatus.FAILURE if _anchor_stop else ActivityStatus.INFO,
+                                target=name,
+                                detail=_ANCHOR_LOST_DETAIL if _anchor_stop else "stopped by user (retryable)")
                             handle.update(lambda job, n=name: _fail_chunk(job, n))
-                            _tally(_TableLoadOutcome.STOPPED)
+                            if _anchor_stop:
+                                _record_anchor_lost(error_log, job_id, name)
+                            _tally(_TableLoadOutcome.FAILED if _anchor_stop else _TableLoadOutcome.STOPPED)
                         else:  # FAILED
                             error_log.record(job_id, DataErrorRecord(
                                 table=name, chunk_id=name,

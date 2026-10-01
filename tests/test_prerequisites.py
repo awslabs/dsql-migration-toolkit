@@ -3015,3 +3015,24 @@ def test_an_unmeasured_lob_column_is_never_reported_inside_a_pass() -> None:
     assert mixed.status is PrerequisiteStatus.WARN
     assert "`notes` (65,535 bytes) already holds" in mixed.detail
     assert "Not determined for `payload`" in mixed.detail
+
+
+def test_msk_info_copy_matches_the_deploy_now_offer() -> None:
+    """P2 review: the INFO said the cdc-stack is deployed AFTER completing the CDC step,
+    while the Data Migration step offers "Deploy now so it is ready when the Full Load
+    finishes" -- the two contradicted each other on the same journey."""
+    from dsql_migrator.core.prerequisites import check_msk_available, check_msk_connect_available
+
+    msk, connect = check_msk_available(False), check_msk_connect_available(False)
+    for result in (msk, connect):
+        text = f"{result.detail} {result.remediation}"
+        assert "AFTER completing the CDC step" not in text
+        assert "after the CDC step" not in text
+        assert "No action needed here." in text
+    # Type-neutral: the early offer is Full load + CDC only (CDC only has no Full Load).
+    assert "for Full load + CDC it is offered below these checks" in msk.remediation
+    assert "otherwise on the CDC step" in msk.remediation
+    # The cdc-stack deploy creates no connectors; Start CDC does (and Stop removes them).
+    assert "created when you start CDC" in connect.detail
+    assert "removed again when you stop it" in connect.remediation
+    assert "while the Full Load" not in connect.remediation

@@ -21,11 +21,12 @@ strings (Property 7).
 
 MSK availability is probed read-only against the account the sink streams
 through: :class:`SessionMskProbe` calls ``kafka:ListClustersV2`` and
-``kafkaconnect:ListConnectors`` in the target's region and reports the cluster
-(and MSK Connect) as available only when a cluster is ``ACTIVE`` and at least
-one connector exists. MSK is NOT a blocking prerequisite -- it is created by the
-cdc-stack deploy that follows the CDC step -- so an unavailable result surfaces
-as a non-blocking advisory ``WARN`` (see ``check_msk_available``), not a failure.
+``kafkaconnect:ListConnectors`` in the target's region and reports the cluster as
+available when at least one MSK cluster is ``ACTIVE``, and MSK Connect as available
+when at least one connector exists (each is its own INFO/PASS check). MSK is NOT a blocking prerequisite -- it is created by the
+cdc-stack deployed on the Data Migration step, and the connectors at Start CDC -- so an
+unavailable result surfaces as a non-blocking ``INFO`` (see ``check_msk_available``),
+not a failure.
 :class:`UnavailableMskProbe` is an explicit always-unavailable fallback.
 """
 
@@ -425,10 +426,10 @@ class SessionMskProbe:
     access error (missing credentials/permissions, unreachable region, or the
     ``cdc-stack`` simply not deployed) returns ``False``.
 
-    Note: MSK is NOT a blocking prerequisite. The cdc-stack (which creates MSK +
-    the connectors) is deployed AFTER the CDC step produces the connector config,
-    so a ``False`` here surfaces as a non-blocking advisory ``WARN`` (see
-    ``check_msk_available``), confirming presence when a prior deploy exists --
+    Note: MSK is NOT a blocking prerequisite. The cdc-stack (which creates MSK) is
+    deployed on the Data Migration step and the connectors only at Start CDC, so a
+    ``False`` here surfaces as a non-blocking ``INFO`` (see ``check_msk_available``
+    / ``check_msk_connect_available``), confirming presence when a deploy exists --
     not failing the run. No credential value is read or logged (Property 7); the
     shared :func:`build_session` honors the single global AWS profile.
     """
@@ -481,8 +482,8 @@ class UnavailableMskProbe:
     """Explicit always-unavailable :class:`MskProbe` fallback.
 
     Reports MSK and MSK Connect as unavailable, which surfaces as a non-blocking
-    advisory ``WARN`` (not a blocking FAIL) -- MSK is created by the later
-    cdc-stack deploy, not a prerequisite. Used when no MSK region/credentials are
+    ``INFO`` (not a blocking FAIL) -- MSK is created by the cdc-stack deploy on the Data
+    Migration step (the connectors at Start CDC), not a prerequisite. Used when no MSK region/credentials are
     configured; :class:`SessionMskProbe` is the default once a target connection
     exists.
     """
@@ -509,8 +510,8 @@ def build_prerequisite_checker(
     MSK probe that reads the target region's MSK + MSK Connect state
     (:class:`SessionMskProbe`); when AWS is unreachable or the ``cdc-stack`` is
     not deployed the MSK probe reports unavailable, which is a non-blocking
-    advisory (MSK is provisioned by the later cdc-stack deploy, not a
-    prerequisite). All probes are read-only (Property 1) and never expose
+    ``INFO`` (MSK is provisioned by the cdc-stack deploy on the Data Migration step,
+    not a prerequisite). All probes are read-only (Property 1) and never expose
     credential values (Property 7).
     """
     return PrerequisiteChecker(

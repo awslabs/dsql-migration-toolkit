@@ -1465,3 +1465,132 @@ def test_mysql8_text_expression_default_flows_from_information_schema_to_target_
     result = SchemaConverter().convert_table(tables[0])
     assert '"bio" TEXT NOT NULL DEFAULT \'none\'' in result.target_ddl, result.target_ddl
     assert not [w for w in result.warnings if "bio" in w.message and "no Aurora DSQL equivalent" in w.message]
+
+
+def test_enrich_columns_restores_a_binary_default_information_schema_cut_short() -> None:
+    """Review round 4 (live MySQL 8.0.42): information_schema hex-encodes a BINARY/VARBINARY
+    default only up to its first 0x00 byte -- VARBINARY 0x610062 reads "0x61", BINARY(4)
+    0x61006200 reads "0x61" -- so the converter silently emitted 1 byte or zero padding.
+    SHOW CREATE TABLE prints the full value (hex, or a quoted string with escapes); it is
+    read once per table that has such a default, and only an EXTENSION of what
+    information_schema reported is trusted."""
+    from dsql_migrator.core.introspector import enrich_columns
+
+    create = (
+        "CREATE TABLE `t` (\n"
+        "  `id` bigint NOT NULL,\n"
+        "  `vb` varbinary(8) NOT NULL DEFAULT 'a\\0b',\n"
+        "  `bn` binary(4) DEFAULT 0x61006200,\n"
+        "  `full` binary(2) DEFAULT 0x0A0B,\n"
+        "  `odd` varbinary(4) DEFAULT 0xFF00,\n"
+        "  `lie` varbinary(4) DEFAULT 0x7700,\n"
+        "  PRIMARY KEY (`id`)\n) ENGINE=InnoDB"
+    )
+
+    class _Conn:
+        def __init__(self):
+            self.executed = []
+
+        def execute(self, statement, parameters=None):
+            sql = str(statement)
+            self.executed.append(sql)
+            if sql.startswith("SHOW CREATE TABLE"):
+                class _R:
+                    def first(self_inner):
+                        return ("t", create)
+                return _R()
+            return _FakeResult([
+                ("t", "id", None, "", "bigint", None),
+                ("t", "vb", None, "", "varbinary(8)", "0x61"),
+                ("t", "bn", None, "", "binary(4)", "0x61"),
+                ("t", "full", None, "", "binary(2)", "0x0A0B"),
+                ("t", "odd", None, "", "varbinary(4)", "0x"),
+                ("t", "lie", None, "", "varbinary(4)", "0x01"),  # SHOW CREATE disagrees: distrust
+            ])
+
+    names = ("id", "vb", "bn", "full", "odd", "lie")
+    tables = [TableDef(name="t", columns=[ColumnDef(name=n, mysql_type="x") for n in names])]
+    conn = _Conn()
+    enrich_columns(conn, "app", tables)
+    got = {c.name: c.default for c in tables[0].columns}
+    assert got["vb"] == "x'610062'"
+    assert got["bn"] == "x'61006200'"
+    assert got["full"] == "0x0A0B"  # already exact: kept as reported
+    assert got["odd"] == "x'FF00'"
+    assert got["lie"] == "0x01"
+    assert [s for s in conn.executed if s.startswith("SHOW CREATE")] == ["SHOW CREATE TABLE `app`.`t`"]
+
+    # no binary default that could be cut -> no extra statement at all
+    plain = [TableDef(name="t", columns=[ColumnDef(name="full", mysql_type="x")])]
+
+    class _Plain(_Conn):
+        def execute(self, statement, parameters=None):
+            self.executed.append(str(statement))
+            return _FakeResult([("t", "full", None, "", "binary(2)", "0x0A0B")])
+
+    quiet = _Plain()
+    enrich_columns(quiet, "app", plain)
+    assert not [s for s in quiet.executed if s.startswith("SHOW CREATE")]
+
+    # a failing SHOW CREATE keeps the reported value
+    class _Fails(_Conn):
+        def execute(self, statement, parameters=None):
+            if str(statement).startswith("SHOW CREATE"):
+                raise RuntimeError("denied")
+            return super().execute(statement, parameters)
+
+    kept = [TableDef(name="t", columns=[ColumnDef(name=n, mysql_type="x") for n in names])]
+    enrich_columns(_Fails(), "app", kept)
+    assert {c.name: c.default for c in kept[0].columns}["vb"] == "0x61"
+
+
+
+def test_binary_default_restore_handles_odd_names_quoting_modes_and_line_separators() -> None:
+    """Review round 5: a hyphenated database (quoted by doubling backticks, not refused),
+    ANSI_QUOTES / unquoted SHOW CREATE output, a form feed inside the literal (no
+    splitlines()), MySQL 5.7 raw-byte defaults (never restored -- its SHOW CREATE turns
+    invalid utf8 into '?'), and a lost connection (propagated, not swallowed)."""
+    import pytest
+
+    from dsql_migrator.core.introspector import _restore_cut_binary_defaults
+
+    class _Conn:
+        def __init__(self, create, fail=None):
+            self.create, self.fail, self.executed, self.invalidated = create, fail, [], False
+
+        def execute(self, statement, parameters=None):
+            self.executed.append(str(statement))
+            if self.fail is not None:
+                raise self.fail
+
+            class _R:
+                def first(inner):
+                    return ("t", self.create)
+            return _R()
+
+    def table(default, mysql_type="varbinary(8)", name="vb"):
+        return TableDef(name="t", columns=[ColumnDef(name=name, mysql_type=mysql_type, default=default)])
+
+    t1 = table("0x01")
+    conn = _Conn('CREATE TABLE "t" (\n  "vb" varbinary(8) DEFAULT 0x0100\n)')
+    _restore_cut_binary_defaults(conn, "my-app", [t1])
+    assert conn.executed == ["SHOW CREATE TABLE `my-app`.`t`"]
+    assert t1.columns[0].default == "x'0100'"
+    t2 = table("0x01")
+    _restore_cut_binary_defaults(_Conn("CREATE TABLE t (\n  vb varbinary(8) DEFAULT 0x01000C\n)"), "app", [t2])
+    assert t2.columns[0].default == "x'01000C'"
+    t3 = table("0x01")
+    _restore_cut_binary_defaults(_Conn("CREATE TABLE `t` (\n  `vb` varbinary(8) DEFAULT '\x01\\0\x0c'\n)"), "app", [t3])
+    assert t3.columns[0].default == "x'01000C'"
+    t4 = table("caf\u00e9")  # MySQL 5.7 raw bytes: never restored
+    quiet = _Conn("CREATE TABLE `t` (\n  `vb` varbinary(8) DEFAULT 'caf?'\n)")
+    _restore_cut_binary_defaults(quiet, "app", [t4])
+    assert t4.columns[0].default == "caf\u00e9" and not quiet.executed
+    lost = _Conn("", fail=ConnectionError("Lost connection to MySQL server during query"))
+    lost.invalidated = True
+    with pytest.raises(ConnectionError):
+        _restore_cut_binary_defaults(lost, "app", [table("0x01")])
+    denied = _Conn("", fail=RuntimeError("(1142) SELECT command denied"))
+    t5 = table("0x01")
+    _restore_cut_binary_defaults(denied, "app", [t5])
+    assert t5.columns[0].default == "0x01"

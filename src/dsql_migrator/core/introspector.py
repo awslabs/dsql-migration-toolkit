@@ -23,6 +23,8 @@ reflection.
 
 from __future__ import annotations
 
+import logging
+import re
 from typing import TYPE_CHECKING, Callable, Optional, Protocol
 
 from sqlalchemy import create_engine, event, inspect, text
@@ -110,6 +112,8 @@ MYSQL_TRANSIENT_SIGNATURES = (
     "read timed out",
     "timed out",
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _mysql_source_transient(exc: BaseException) -> bool:
@@ -806,6 +810,9 @@ def enrich_columns(
                     column.default_is_expression = True
         if table.name in auto_increment_by_table:
             table.auto_increment_column = auto_increment_by_table[table.name]
+    # A BINARY/VARBINARY default information_schema may have cut at a 0x00 byte is read
+    # in full from SHOW CREATE TABLE (only for those tables) -- see the helper.
+    _restore_cut_binary_defaults(connection, database, tables)
 
 
 def enrich_index_types(
@@ -1136,6 +1143,111 @@ class SourceIntrospector:
             return None
         finally:
             engine.dispose()
+
+
+_SHOW_CREATE_ESCAPES = {
+    "0": "\0", "'": "'", '"': '"', "b": "\b", "n": "\n", "r": "\r", "t": "\t",
+    "Z": "\x1a", "\\": "\\",
+}
+
+
+def _binary_default_may_be_cut(column: ColumnDef) -> bool:
+    """Whether information_schema may have reported this BINARY/VARBINARY literal default
+    short: MySQL 8 hex-encodes it only up to its FIRST 0x00 byte (live 8.0.42: BINARY(4)
+    0x61006200 and 'ab' read ``0x61``/``0x6162``; VARBINARY 0x0100 reads ``0x01``). A
+    full-width BINARY value is already exact. Only that MySQL 8 ``0x..`` form is
+    restored: MySQL 5.7 reports raw bytes, and its SHOW CREATE TABLE replaces bytes that
+    are not valid utf8 with ``?``, so neither is trusted (the converter decides)."""
+    if column.default is None or column.default_is_expression:
+        return False
+    words = (column.mysql_type or "").strip().lower().split("(", 1)[0].split()
+    base = words[0] if words else ""
+    hex_form = re.fullmatch(r"(?i)0x((?:[0-9a-f]{2})*)", column.default)
+    if base not in ("binary", "varbinary") or hex_form is None:
+        return False
+    if base == "varbinary":
+        return True
+    width = re.search(r"\(\s*(\d+)\s*\)", column.mysql_type or "")
+    return len(hex_form.group(1)) < 2 * (int(width.group(1)) if width else 1)
+
+
+def _binary_default_from_create(create_sql: str, column: ColumnDef) -> Optional[bytes]:
+    """The exact bytes of ``column``'s DEFAULT as MySQL 8 SHOW CREATE TABLE prints it -- a
+    ``0x..`` hex literal, or a quoted string with MySQL escapes (printed only when the
+    bytes are valid utf8, so they re-encode exactly) -- or ``None``. The column name may
+    be backtick-quoted, double-quoted (ANSI_QUOTES) or bare (sql_quote_show_create=OFF).
+    Split on newlines only: MySQL escapes ``\\n`` inside a literal, while other line
+    separators Python's splitlines() knows (form feed, U+2028, ...) stay raw in it."""
+    prefixes = (
+        "`" + column.name.replace("`", "``") + "` ",
+        '"' + column.name.replace('"', '""') + '" ',
+        column.name + " ",
+    )
+    for line in create_sql.split("\n"):
+        stripped = line.lstrip()
+        prefix = next((p for p in prefixes if stripped.startswith(p)), None)
+        if prefix is None:
+            continue
+        match = re.search(
+            r"\sDEFAULT\s+(0x[0-9A-Fa-f]*|'((?:[^'\\]|\\.|'')*)')", stripped[len(prefix) - 1:]
+        )
+        if match is None:
+            return None
+        if match.group(2) is None:
+            return bytes.fromhex(match.group(1)[2:])
+        text_value = re.sub(
+            r"\\(.)|''",
+            lambda m: "'" if m.group(0) == "''" else _SHOW_CREATE_ESCAPES.get(m.group(1), m.group(1)),
+            match.group(2),
+        )
+        try:
+            return text_value.encode("utf-8")
+        except UnicodeEncodeError:
+            return None
+    return None
+
+
+def _quote_mysql_name(name: str) -> str:
+    """Backtick-quote one MySQL identifier part (backticks doubled), escaping ``:`` so a
+    SQLAlchemy ``text()`` never reads it as a bind parameter."""
+    return ("`" + name.replace("`", "``") + "`").replace(":", "\\:")
+
+
+def _restore_cut_binary_defaults(
+    connection: _Connection, database: str, tables: list[TableDef]
+) -> None:
+    """Replace a BINARY/VARBINARY literal default information_schema may have cut short
+    (:func:`_binary_default_may_be_cut`) with its full value from SHOW CREATE TABLE.
+
+    The restored value is written as ``x'..'`` -- a form information_schema never reports
+    for MySQL 8 -- so the converter can tell an exact value from a ``0x..`` one that may
+    still be cut (and warn about it). Read-only, one statement per table that has such a
+    default (rare), never per row. Best-effort: an unparsable clause, or a value that does
+    not extend what information_schema reported, keeps the reported value; a statement
+    error does too, but a lost connection propagates (swallowing it left the next
+    enrichment step failing with an unrelated PendingRollbackError).
+    """
+    for table in tables:
+        columns = [c for c in table.columns if _binary_default_may_be_cut(c)]
+        if not columns:
+            continue
+        ident = f"{_quote_mysql_name(database)}.{_quote_mysql_name(table.name)}"
+        try:
+            row = connection.execute(text(f"SHOW CREATE TABLE {ident}")).first()
+            create_sql = str(row[1]) if row is not None else ""
+        except Exception as exc:  # noqa: BLE001 - keep the information_schema value
+            if getattr(connection, "invalidated", False) or is_source_transient_error(exc):
+                raise
+            _LOGGER.debug("SHOW CREATE TABLE %s failed; keeping reported defaults", ident, exc_info=True)
+            continue
+        for column in columns:
+            full = _binary_default_from_create(create_sql, column)
+            if full is None:
+                continue
+            reported = re.fullmatch(r"(?i)0x((?:[0-9a-f]{2})*)", column.default or "")
+            if reported is None or not full.hex().startswith(reported.group(1).lower()):
+                continue  # not an extension of what information_schema showed: distrust
+            column.default = "x'" + full.hex().upper() + "'"
 
 
 def _quote_mysql_identifier(name: str) -> Optional[str]:

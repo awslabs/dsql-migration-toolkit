@@ -72,6 +72,29 @@ fails **loudly** where it can't.
 - **CDC replicates data, not DDL.** Schema changes on the source during CDC are
   **not** propagated to DSQL — you must apply equivalent DDL to DSQL yourself
   (see [Chapter 4 §4.2](04-cdc-and-dsql-constraints.md#42-cdc-replicates-data-not-schema--important)).
+- **No source DDL on a migrated table while CDC is not running (MySQL).** A MySQL CDC
+  that starts from a seeded position — the Full Load watermark or a Manual binlog start
+  point (a MySQL CDC-only first start needs one unless the session holds a Full Load
+  watermark), and every re-Start of such a run after Stop — runs Debezium in `snapshot.mode=recovery`: it rebuilds its schema history
+  from the tables' **current** definitions, then reads the binlog from that earlier
+  position. A schema change (`ALTER TABLE`, …) committed in between makes the older row
+  events decode against the newer definition — Debezium's documented `recovery` caveat
+  ("do not use this mode … if schema changes were committed to the database after the
+  last connector shutdown"). Columns can shift or the connector can fail. Keep migrated
+  tables' DDL frozen from the Full Load until CDC streams, and while it is stopped. If a
+  change slipped in: Stop CDC; refresh the source inventory (re-run Step 1 Evaluation)
+  and update the changed tables in Schema Conversion, so the reload both recreates and
+  reads the new definition — a table whose DDL you edited, or whose key strategy you
+  chose, keeps that edit (redo or reset it), and a dropped or renamed column must be
+  dropped on Aurora DSQL first or the table re-applied with Replace (Drop & reload
+  refuses to destroy a target column the new definition no longer has); then
+  **Re-run Full Load with "Drop & reload"** (the default *Append* keeps existing rows, so updates and deletes made while
+  the stream was stopped would be lost; *Reload specific tables* and *Retry* keep the
+  original watermark). The new run's watermark is past where the stream stopped, so
+  Start CDC moves the offset forward to it (Start never rewinds, but it does advance).
+  A CDC-only run has no Full Load to re-run: switch the migration type to Full load +
+  CDC and do the same, or delete the CDC infrastructure and deploy again with a Manual
+  start point after the change (rows changed before that point must be reconciled).
 - **Cascading FK actions don't replicate over CDC.** Server-side `ON DELETE/UPDATE
   CASCADE` (and `SET NULL`/`SET DEFAULT`) actions fire *inside* the source engine
   and may not be captured by the change stream, so CDC can't apply them — the child

@@ -6748,3 +6748,65 @@ def test_cutover_screen_scopes_every_foreign_key_count_to_the_migration_selectio
 
     src = inspect.getsource(build_cutover_screen)
     assert src.count("migration_state=migration_state") >= 4  # ack, provider, count, identity
+
+
+def test_the_interrupted_notice_survives_validations_own_one_shot_refresh() -> None:
+    """Review round 2: the orphan reconcile (IN_PROGRESS, no job, no report -> NOT_STARTED)
+    drew the "Previous validation was interrupted" notice from a per-render local, then
+    armed its own one-shot refresh -- whose pass no longer reconciles, so the notice
+    flashed for ~50 ms. It is drawn from a state flag now, cleared by the next run."""
+    import inspect
+
+    from dsql_migrator.ui import validation as module
+
+    state = module.ValidationState()
+    assert state.interrupted_by_restart is False
+    state.interrupted_by_restart = True
+    state.clear_outputs()  # a (re-)run starts
+    assert state.interrupted_by_restart is False
+
+    src = inspect.getsource(module.build_validation_screen)
+    orphan = src[src.index("# No live job and no result."):]
+    orphan = orphan[: orphan.index("if _reconciled_late:")]
+    assert "validation_state.interrupted_by_restart = True" in orphan
+    flag_gate = "if status is StepStatus.NOT_STARTED and validation_state.interrupted_by_restart:"
+    assert flag_gate in orphan
+    # the notice is rendered only under the flag gate, not inside the reconcile branch
+    assert orphan.index('header="Previous validation was interrupted"') > orphan.index(flag_gate)
+
+
+
+def test_an_orphaned_run_whose_job_ended_keeps_its_real_outcome_not_a_restart_notice() -> None:
+    """Review round 3: the orphan branch (IN_PROGRESS, no live job, no report) also catches
+    a job that FAILED or was CANCELLED while no poll timer ran (it dies on navigation).
+    With the persistent flag that read as "interrupted by a restart" and hid the real
+    error. Only a missing job record is a restart now."""
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.job_manager import JobNotFoundError
+    from dsql_migrator.ui import validation as module
+    from dsql_migrator.ui.workflow import StepStatus
+
+    class _Jobs:
+        def __init__(self, status=None):
+            self._status = status
+
+        def get_status(self, _job_id):
+            if self._status is None:
+                raise JobNotFoundError("gone")
+            return SimpleNamespace(status=self._status)
+
+    state = module.ValidationState()
+    assert module._ended_job_step_status(_Jobs("FAILED"), state) is None  # no job id yet
+    state.job_id = "v-1"
+    assert module._ended_job_step_status(_Jobs("FAILED"), state) is StepStatus.FAILED
+    assert module._ended_job_step_status(_Jobs("CANCELLED"), state) is StepStatus.NOT_STARTED
+    assert module._ended_job_step_status(_Jobs(None), state) is None  # record gone: restart
+
+    import inspect
+
+    orphan = inspect.getsource(module.build_validation_screen)
+    orphan = orphan[orphan.index("# No live job and no result."):]
+    orphan = orphan[: orphan.index("if _reconciled_late:")]
+    assert orphan.index("set_error(") < orphan.index("validation_state.interrupted_by_restart = True")
+    assert "if ended is None or ended is StepStatus.DONE:" in orphan

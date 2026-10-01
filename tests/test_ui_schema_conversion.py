@@ -5311,3 +5311,178 @@ def test_a_restored_scope_that_converts_nothing_does_not_lock_the_screen() -> No
         and node.func.id == "heal_stale_generated_scope"
         for node in ast.walk(tree)
     ), "_render_browser_and_preview must heal a stale generated scope"
+
+
+def test_source_ddl_renders_mysql8_expression_defaults_like_show_create_table() -> None:
+    """P2 review: information_schema reports a MySQL 8 expression default UNWRAPPED and
+    with one extra escape layer (``_utf8mb4\\'none\\'``, ``uuid()``); emitted raw, "Copy
+    Source DDL" handed over ``DEFAULT _utf8mb4\\'none\\'`` / ``DEFAULT uuid()`` -- neither
+    runs on MySQL. SHOW CREATE TABLE writes ``DEFAULT (_utf8mb4'none')`` / ``DEFAULT
+    (uuid())``; only the CURRENT_TIMESTAMP family stays bare (live MySQL 8.0.42)."""
+    from dsql_migrator.core.models import ColumnDef, TableDef
+    from dsql_migrator.ui.schema_conversion import render_source_table_ddl
+
+    def col(name, mysql_type, default):
+        return ColumnDef(name=name, mysql_type=mysql_type, nullable=True, default=default,
+                         default_is_expression=True)
+
+    table = TableDef(
+        name="app.t",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            col("tag", "varchar(20)", "_utf8mb4\\'none\\'"),
+            col("quote", "varchar(20)", "_utf8mb4\\'it\\\\\\'s\\'"),
+            col("path", "varchar(20)", "_utf8mb4\\'C:\\\\\\\\tmp\\'"),
+            col("uid", "char(36)", "uuid()"),
+            col("day", "date", "curdate()"),
+            col("created", "datetime", "CURRENT_TIMESTAMP"),
+            col("created3", "datetime(3)", "CURRENT_TIMESTAMP(3)"),
+            col("odd", "varchar(20)", "concat('a','b')"),  # not print-escaped: kept verbatim
+        ],
+        primary_key=["id"],
+    )
+    lines = {
+        line.strip().split("`")[1]: line.strip().rstrip(",")
+        for line in render_source_table_ddl(table).splitlines()
+        if "DEFAULT" in line
+    }
+    assert lines["tag"] == "`tag` varchar(20) DEFAULT (_utf8mb4'none')"
+    assert lines["quote"] == "`quote` varchar(20) DEFAULT (_utf8mb4'it\\'s')"
+    assert lines["path"] == "`path` varchar(20) DEFAULT (_utf8mb4'C:\\\\tmp')"
+    assert lines["uid"] == "`uid` char(36) DEFAULT (uuid())"
+    assert lines["day"] == "`day` date DEFAULT (curdate())"
+    assert lines["created"] == "`created` datetime DEFAULT CURRENT_TIMESTAMP"
+    assert lines["created3"] == "`created3` datetime(3) DEFAULT CURRENT_TIMESTAMP(3)"
+    assert lines["odd"] == "`odd` varchar(20) DEFAULT (concat('a','b'))"
+
+
+def test_source_ddl_quotes_a_qualified_mysql_name_per_part() -> None:
+    """Table names are always ``schema.table``; one backtick pair around both made "Copy
+    Source DDL" create a table literally named ``app.orders`` in the current database
+    (and an FK referencing it). The PostgreSQL renderer already quotes per part."""
+    from dsql_migrator.core.models import ColumnDef, ForeignKeyDef, TableDef
+    from dsql_migrator.ui.schema_conversion import render_source_table_ddl
+
+    ddl = render_source_table_ddl(TableDef(
+        name="app.order_items",
+        columns=[ColumnDef(name="id", mysql_type="bigint", nullable=False),
+                 ColumnDef(name="order_id", mysql_type="bigint", nullable=True)],
+        primary_key=["id"],
+        foreign_keys=[ForeignKeyDef(name="fk_o", columns=["order_id"],
+                                    referenced_table="app.orders", referenced_columns=["id"])],
+    ))
+    assert ddl.startswith("CREATE TABLE `app`.`order_items` (")
+    assert "REFERENCES `app`.`orders` (`id`)" in ddl
+    assert "`app.order_items`" not in ddl and "`app.orders`" not in ddl
+    # an unqualified name stays one identifier
+    plain = render_source_table_ddl(TableDef(
+        name="orders", columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+        primary_key=["id"]))
+    assert plain.startswith("CREATE TABLE `orders` (")
+
+
+def test_source_ddl_literal_bit_binary_fsp_and_non_ascii_defaults_match_show_create() -> None:
+    """Review of the expression-default fix, against live MySQL 8.0.42 information_schema
+    values: a literal's backslashes are escaped (SHOW CREATE writes 'C:\\\\tmp'), BIT and
+    BINARY defaults are bare bit/hex literals (quoted, MySQL rejects b'1' as a BIT(1)
+    default), ON UPDATE keeps the column's fractional-seconds precision (MySQL requires it),
+    and a non-ASCII expression -- which information_schema reports garbled -- is flagged."""
+    from dsql_migrator.core.models import ColumnDef, TableDef
+    from dsql_migrator.ui.schema_conversion import render_source_table_ddl
+
+    def col(name, mysql_type, default, *, expr=False, on_update=False):
+        return ColumnDef(name=name, mysql_type=mysql_type, nullable=True, default=default,
+                         default_is_expression=expr, auto_update_timestamp=on_update)
+
+    table = TableDef(name="app.t", primary_key=["id"], columns=[
+        ColumnDef(name="id", mysql_type="bigint", nullable=False),
+        col("path", "varchar(20)", "C:\\tmp"),
+        col("tailbs", "varchar(20)", "end\\"),
+        col("quo", "varchar(20)", "it's"),
+        col("flag", "bit(1)", "b'1'"),
+        col("flags", "bit(8)", "b'101'"),
+        col("vb", "varbinary(4)", "0x0102"),
+        col("bn", "binary(2)", "0x0A0B"),
+        col("u6", "datetime(6)", "CURRENT_TIMESTAMP(6)", expr=True, on_update=True),
+        col("t3", "timestamp(3)", None, on_update=True),
+        col("u0", "datetime", "CURRENT_TIMESTAMP", expr=True, on_update=True),
+        col("cafe", "varchar(20)", "_utf8mb4\\'cafÃ©\\'", expr=True),
+        col("cafel", "varchar(20)", "café"),
+        col("bitword", "varchar(10)", "b'1'"),  # a TEXT column holding the string b'1'
+    ])
+    lines = {
+        line.strip().split("`")[1]: line.strip().rstrip(",")
+        for line in render_source_table_ddl(table).splitlines()
+        if line.strip().startswith("`")
+    }
+    assert lines["path"] == "`path` varchar(20) DEFAULT 'C:\\\\tmp'"
+    assert lines["tailbs"] == "`tailbs` varchar(20) DEFAULT 'end\\\\'"
+    assert lines["quo"] == "`quo` varchar(20) DEFAULT 'it''s'"
+    assert lines["flag"] == "`flag` bit(1) DEFAULT b'1'"
+    assert lines["flags"] == "`flags` bit(8) DEFAULT b'101'"
+    assert lines["vb"].startswith("`vb` varbinary(4) DEFAULT 0x0102 /* information_schema stops")
+    assert lines["bn"] == "`bn` binary(2) DEFAULT 0x0A0B"
+    assert lines["u6"] == "`u6` datetime(6) DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)"
+    assert lines["t3"] == "`t3` timestamp(3) ON UPDATE CURRENT_TIMESTAMP(3)"
+    assert lines["u0"] == "`u0` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
+    assert lines["cafe"].startswith("`cafe` varchar(20) DEFAULT (_utf8mb4'cafÃ©') /* ")
+    assert "check SHOW CREATE TABLE" in lines["cafe"]
+    assert lines["cafel"] == "`cafel` varchar(20) DEFAULT 'café'"
+    assert lines["bitword"] == "`bitword` varchar(10) DEFAULT 'b''1'''"
+
+
+def test_source_ddl_binary_defaults_cut_at_a_zero_byte_and_control_chars() -> None:
+    """Review round 2 (live MySQL 8.0.42): information_schema cuts a binary default at its
+    first 0x00 byte (BINARY(16) DEFAULT '' -> "0x"), which the pane rendered as the string
+    '0x'; and NUL / LF / CR in a literal were left raw (SHOW CREATE writes \\0 \\n \\r; a raw
+    NUL makes the mysql client reject the statement)."""
+    from dsql_migrator.core.models import ColumnDef, TableDef
+    from dsql_migrator.ui.schema_conversion import render_source_table_ddl
+
+    def col(name, mysql_type, default, nullable=True):
+        return ColumnDef(name=name, mysql_type=mysql_type, nullable=nullable, default=default)
+
+    table = TableDef(name="app.t", primary_key=["id"], columns=[
+        ColumnDef(name="id", mysql_type="bigint", nullable=False),
+        col("b16e", "binary(16)", "0x", nullable=False),
+        col("b4ab", "binary(4)", "0x6162"),
+        col("vb01", "varbinary(4)", "0x"),
+        col("vb10", "varbinary(4)", "0x01"),
+        col("b2", "binary(2)", "0x0A0B"),
+        col("c3", "char(3)", "a\0b"),
+        col("nl", "varchar(10)", "a\nb\rc"),
+    ])
+    lines = {
+        line.strip().split("`")[1]: line.strip().rstrip(",")
+        for line in render_source_table_ddl(table).splitlines()
+        if line.strip().startswith("`")
+    }
+    note = (" /* information_schema stops a binary default at its first 0x00 byte, and this "
+            "one starts with it -- check SHOW CREATE TABLE */")
+    maybe = (" /* information_schema stops a binary default at its first 0x00 byte and SHOW "
+             "CREATE TABLE could not be read -- this may be cut short */")
+    # not restored by the introspector (still 0x..): padded / kept, flagged as possibly cut
+    assert lines["b16e"] == "`b16e` binary(16) NOT NULL DEFAULT 0x" + "00" * 16 + maybe
+    assert lines["b4ab"] == "`b4ab` binary(4) DEFAULT 0x61620000" + maybe
+    assert lines["vb01"] == "`vb01` varbinary(4) DEFAULT 0x00" + note  # unreadable: flagged
+    assert lines["vb10"] == "`vb10` varbinary(4) DEFAULT 0x01" + maybe
+    assert lines["b2"] == "`b2` binary(2) DEFAULT 0x0A0B"  # full width: exact, no note
+    assert lines["c3"] == "`c3` char(3) DEFAULT 'a\\0b'"
+    assert lines["nl"] == "`nl` varchar(10) DEFAULT 'a\\nb\\rc'"
+
+
+
+def test_source_ddl_shows_a_restored_binary_default_bare() -> None:
+    """The introspector writes a binary default it restored from SHOW CREATE TABLE as
+    x'..' (exact): the pane shows it as is, with no 'may be cut' note."""
+    from dsql_migrator.core.models import ColumnDef, TableDef
+    from dsql_migrator.ui.schema_conversion import render_source_table_ddl
+
+    ddl = render_source_table_ddl(TableDef(name="app.t", primary_key=["id"], columns=[
+        ColumnDef(name="id", mysql_type="bigint", nullable=False),
+        ColumnDef(name="vb", mysql_type="varbinary(8)", default="x'610062'"),
+        ColumnDef(name="bn", mysql_type="binary(4)", default="x'61006200'"),
+    ]))
+    assert "`vb` varbinary(8) DEFAULT x'610062'," in ddl
+    assert "`bn` binary(4) DEFAULT x'61006200'," in ddl
+    assert "/*" not in ddl

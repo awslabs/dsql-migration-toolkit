@@ -1958,15 +1958,7 @@ def build_workflow_sidebar(
             # on every workflow step (not on Connect) to aid understanding. The
             # current step drives the middle node's active-stage label.
             _render_migration_diagram(ui, state, step)
-            # Shared "one journey" header: the progress stepper + the chosen
-            # migration type, identical on every step so the flow reads as a single
-            # guided journey instead of separate screens.
-            _render_journey_header(ui, state, step, select)
 
-            # Title + status on the left; the step actions (Run/Re-run and Next)
-            # on the right, so they stay at the top instead of below long
-            # content (e.g. a large assessment report).
-            run_label = step_run_label(step, status)
             following = next_step(step)
 
             def make_next_button() -> None:
@@ -1992,51 +1984,70 @@ def build_workflow_sidebar(
                         f"{step_title(following)}."
                     )
 
-            with ui.row().classes("items-center justify-between w-full no-wrap"):
-                with ui.row().classes("items-center gap-3"):
-                    group = step_group(step)
-                    with ui.column().classes("gap-0"):
-                        if group:
-                            ui.label(group).classes(
-                                "text-xs uppercase text-gray-500 font-semibold "
-                                "leading-tight"
-                            )
-                        ui.label(step_title(step)).classes("text-2xl font-bold")
-                    ui.badge(status_label(status)).props(
-                        f"color={status_color(status)}"
-                    )
-                with ui.row().classes("items-center gap-2"):
-                    # A step may declare a run guard: a callable returning a
-                    # disable-reason string (or None when runnable). Used e.g.
-                    # by Schema Conversion to require an object-browser
-                    # selection before the bulk Run is allowed.
-                    guard = step_run_guards.get(step)
-                    disable_reason = guard() if guard is not None else None
-                    # While a step is running, disable Run/Re-run so it cannot be
-                    # re-submitted until the current run finishes.
-                    if status is StepStatus.IN_PROGRESS:
-                        disable_reason = f"{step_title(step)} is running..."
-                    # Evaluation drives its first run from an in-content
-                    # "Run evaluation" call-to-action, so the top action stays
-                    # hidden until a report exists and then appears as "Re-run".
-                    # Every other step keeps the top Run/Re-run from the start.
-                    # Cut over has no job to run (it's an operational step the
-                    # operator performs); it is acknowledged from in-content, so it
-                    # never shows a top Run/Re-run button.
-                    hide_top_run = (
-                        step is WorkflowStep.EVALUATION
-                        and status is StepStatus.NOT_STARTED
-                    ) or step is WorkflowStep.CUT_OVER
-                    if not hide_top_run:
-                        run_button = ui.button(
-                            run_label, on_click=_make_runner(step)
+            # The stepper + title/status/Run row, read from the LIVE step status. It is its
+            # own refreshable because a builder can change its own step mid-render (a
+            # streaming CDC-only run promotes Data Migration to DONE); only this header and
+            # the sidebar are redrawn then -- a whole-screen refresh would cancel the
+            # builder's own timers (CDC discovery) and drop its one-render notices.
+            @ui.refreshable
+            def step_header() -> None:
+                # Shared "one journey" header: the progress stepper + the chosen
+                # migration type, identical on every step so the flow reads as a single
+                # guided journey instead of separate screens.
+                _render_journey_header(ui, state, step, select)
+
+                # Title + status on the left; the step actions (Run/Re-run and Next)
+                # on the right, so they stay at the top instead of below long
+                # content (e.g. a large assessment report).
+                status = get_status(state.workflow, step)
+                run_label = step_run_label(step, status)
+                with ui.row().classes("items-center justify-between w-full no-wrap"):
+                    with ui.row().classes("items-center gap-3"):
+                        group = step_group(step)
+                        with ui.column().classes("gap-0"):
+                            if group:
+                                ui.label(group).classes(
+                                    "text-xs uppercase text-gray-500 font-semibold "
+                                    "leading-tight"
+                                )
+                            ui.label(step_title(step)).classes("text-2xl font-bold")
+                        ui.badge(status_label(status)).props(
+                            f"color={status_color(status)}"
                         )
-                        if disable_reason:
-                            run_button.disable()
-                            run_button.tooltip(disable_reason)
-                    # "Next" lives only at the bottom (after the step content), so
-                    # the top keeps just the status and the Run/Re-run action; the
-                    # natural "review then proceed" flow ends with Next below.
+                    with ui.row().classes("items-center gap-2"):
+                        # A step may declare a run guard: a callable returning a
+                        # disable-reason string (or None when runnable). Used e.g.
+                        # by Schema Conversion to require an object-browser
+                        # selection before the bulk Run is allowed.
+                        guard = step_run_guards.get(step)
+                        disable_reason = guard() if guard is not None else None
+                        # While a step is running, disable Run/Re-run so it cannot be
+                        # re-submitted until the current run finishes.
+                        if status is StepStatus.IN_PROGRESS:
+                            disable_reason = f"{step_title(step)} is running..."
+                        # Evaluation drives its first run from an in-content
+                        # "Run evaluation" call-to-action, so the top action stays
+                        # hidden until a report exists and then appears as "Re-run".
+                        # Every other step keeps the top Run/Re-run from the start.
+                        # Cut over has no job to run (it's an operational step the
+                        # operator performs); it is acknowledged from in-content, so it
+                        # never shows a top Run/Re-run button.
+                        hide_top_run = (
+                            step is WorkflowStep.EVALUATION
+                            and status is StepStatus.NOT_STARTED
+                        ) or step is WorkflowStep.CUT_OVER
+                        if not hide_top_run:
+                            run_button = ui.button(
+                                run_label, on_click=_make_runner(step)
+                            )
+                            if disable_reason:
+                                run_button.disable()
+                                run_button.tooltip(disable_reason)
+                        # "Next" lives only at the bottom (after the step content), so
+                        # the top keeps just the status and the Run/Re-run action; the
+                        # natural "review then proceed" flow ends with Next below.
+
+            step_header()
 
             guidance = gating_message(workflow, step)
             if guidance:
@@ -2068,6 +2079,12 @@ def build_workflow_sidebar(
                 ui.label(
                     "This step's screen is implemented in a later task."
                 ).classes("text-sm text-gray-400")
+            # The header and sidebar were drawn before the builder; redraw just those when
+            # it changed its own step (see step_header) -- also when it then raised, so
+            # the error notice is not framed by a stale "In progress" header.
+            if get_status(state.workflow, step) is not status:
+                step_header.refresh()
+                render_nav.refresh()
 
             # Convenience "Next" at the bottom so the user can advance without
             # scrolling back up past a long step screen (mirrors the top button).
