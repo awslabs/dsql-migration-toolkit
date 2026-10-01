@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from dsql_migrator.core.models import ColumnDef, SourceType, TableDef
+from dsql_migrator.core.models import ColumnDef, SourceInventory, SourceType, TableDef
 from dsql_migrator.ui.data_migration import DataMigrationState
 from dsql_migrator.ui.data_migration._models import (
     ExclusionInputs,
@@ -273,3 +273,52 @@ def test_a_retick_survives_a_snapshot_round_trip():
     assert restored.rule_reticked_tables() == {"shop.audit_1"}
     assert exclusion_drift(restored, popup_resolution(restored, INV, text, inputs=inputs,
                                                       source_type=MY)) is None
+
+
+# --- P3-C21: the Start Full Load and Deploy CDC disclosures ---------------------------
+
+
+def test_the_start_dialog_notes_unselected_tables_and_drift_but_never_gates():
+    from dsql_migrator.ui.data_migration._models import start_dialog_exclusion_notes
+
+    state = DataMigrationState()
+    state.set_exclusion_inputs_resolver(lambda: _inputs())
+    assert start_dialog_exclusion_notes(state) == []
+    state.restore_exclusion_rules("exclude table shop.audit_*", ["shop.audit_1", "gone.t"])
+    state.set_exclusion_drift_text("Your rules now match 1 more column (shop.u.x) - review")
+    notes = start_dialog_exclusion_notes(state)
+    assert notes == [
+        ("info", "1 table unselected by your rules is not loaded (left as is on Aurora DSQL)."),
+        ("warning", "Your rules now match 1 more column (shop.u.x) - review in Exclude tables & columns."),
+    ]
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _full_load_ui
+
+    src = inspect.getsource(_full_load_ui)
+    i = src.index("start_dialog_exclusion_notes(migration_state)")
+    assert "disable" not in src[i:i + 200]  # a note, never a gate
+
+
+def test_the_deploy_disclosure_appears_only_when_something_is_excluded_and_shows_what_is_sent():
+    from dsql_migrator.ui.data_migration._models import (
+        cdc_capture_exclusions,
+        deploy_exclusion_disclosure,
+    )
+
+    inv = SourceInventory(tables=list(INV.tables))
+    state = DataMigrationState()
+    state.set_exclusion_inputs_resolver(lambda: _inputs())
+    assert deploy_exclusion_disclosure(state, inv) is None
+    state.restore_lob_exclusion("shop.t", "a")
+    header, details = deploy_exclusion_disclosure(state, inv)
+    assert header == ("Excluded: 1 column. They are fixed once deployed: changing them later "
+                      "needs Delete CDC infrastructure.")
+    assert cdc_capture_exclusions(state, inv, inv.tables).sent in details
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    src = inspect.getsource(_cdc_ui._open_cdc_infra_dialog)
+    after = src[src.index("_disclosure = deploy_exclusion_disclosure"):]
+    assert "deploy_btn.props" not in after.split("deploy_btn = ui.button")[0]

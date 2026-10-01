@@ -183,6 +183,7 @@ def render_exclusion_button_row(ui, ctx: ExclusionDialogContext):
             blocking_count=errors, lob_candidates=lob, measured_over=over,
             migratable=inputs.migratable,
         )
+        state.set_exclusion_drift_text(summary.text if summary.variant == "drift" else None)
         with ui.row().classes("items-center gap-3 w-full"):
             ui.button(
                 BUTTON_LABEL, on_click=lambda: open_exclusion_dialog(ui, ctx)

@@ -214,6 +214,9 @@ class DataMigrationState:
         # The open popup's view state (Review-all page and filter, expanded sections, the
         # LOB section's table filter), so a poll re-render keeps it; cleared on close.
         self._exclusion_dialog_ui: dict = {}
+        # The row's last drift summary ("Your rules now match ... - review"), repeated in
+        # the Start dialog; never applied, never a gate. Transient.
+        self._exclusion_drift_text: Optional[str] = None
         # Check sizes is single-flight (a second click starts nothing) and cancellable
         # between columns. Transient.
         self._size_check_running: bool = False
@@ -1743,6 +1746,12 @@ class DataMigrationState:
                 table: frozenset(cols)
                 for table, cols in self._excluded_lob_columns.items()
             }
+
+    def exclusion_drift_text(self) -> Optional[str]:
+        return self._exclusion_drift_text
+
+    def set_exclusion_drift_text(self, text: Optional[str]) -> None:
+        self._exclusion_drift_text = text
 
     def exclusion_dialog_ui(self) -> dict:
         """The open popup's view state (the SAME dict each call; see __init__)."""

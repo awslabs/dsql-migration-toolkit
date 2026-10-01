@@ -678,6 +678,12 @@ def _render_full_load_step(
                             "new snapshot."
                         ),
                     )
+                from dsql_migrator.ui.data_migration._models import (
+                    start_dialog_exclusion_notes,
+                )
+
+                for _tone, _note in start_dialog_exclusion_notes(migration_state):
+                    inline_hint(ui, _note, tone=_tone)
                 if overlay is not None:
                     _render_overlay_blocks(
                         ui, _ov, action_tables=action_tables, forced=forced,

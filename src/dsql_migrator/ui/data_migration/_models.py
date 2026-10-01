@@ -2329,6 +2329,57 @@ def overlay_change_summary(actions: "Iterable[str]") -> str:
     return ", ".join(parts)
 
 
+def start_dialog_exclusion_notes(migration_state) -> "list[tuple[str, str]]":
+    """The Start Full Load dialog's exclusion lines, ``(tone, text)``: the tables the RULES
+    unselected (in the tree) are not loaded, and the row's drift -- never applied, never a
+    gate."""
+    notes: list[tuple[str, str]] = []
+    getter = getattr(migration_state, "exclusion_inputs", None)
+    inputs = getter() if callable(getter) else None
+    provenance = migration_state.rule_excluded_tables()
+    if inputs is not None:
+        provenance = provenance & set(inputs.migratable)
+    if provenance:
+        n = len(provenance)
+        notes.append(("info", f"{n} table{'s' if n != 1 else ''} unselected by your rules "
+                      f"{'is' if n == 1 else 'are'} not loaded (left as is on Aurora DSQL)."))
+    drift = migration_state.exclusion_drift_text()
+    if drift:
+        notes.append(("warning", f"{drift} in Exclude tables & columns."))
+    return notes
+
+
+def deploy_exclusion_disclosure(migration_state, inventory) -> "Optional[tuple[str, str]]":
+    """The Deploy CDC confirm's one info line, ``(header, details)``, or ``None`` when
+    nothing is excluded: what the stack is created with, and that changing it later needs
+    Delete CDC infrastructure. Never a gate (the gates stay in the deploy block notice)."""
+    stored = migration_state.lob_exclusions()
+    columns = sum(len(c) for c in stored.values())
+    getter = getattr(migration_state, "exclusion_inputs", None)
+    inputs = getter() if callable(getter) else None
+    provenance = migration_state.rule_excluded_tables()
+    if inputs is not None:
+        provenance = provenance & set(inputs.migratable)
+    if not columns and not provenance:
+        return None
+    parts = []
+    if provenance:
+        parts.append(f"{len(provenance)} table{'s' if len(provenance) != 1 else ''}")
+    if columns:
+        parts.append(f"{columns} column{'s' if columns != 1 else ''}")
+    header = (f"Excluded: {', '.join(parts)}. They are fixed once deployed: changing them "
+              "later needs Delete CDC infrastructure.")
+    names = ", ".join(f"{t}.{c}" for t in sorted(stored) for c in sorted(stored[t]))
+    sent = ""
+    if inventory is not None and getattr(inventory, "tables", None):
+        wanted = set(inputs.selected) if inputs is not None else None
+        captured = [t for t in inventory.tables if wanted is None or t.name in wanted]
+        sent = cdc_capture_exclusions(migration_state, inventory, captured).sent
+    details = (f"Columns: {names or '(none)'}. Sent as ColumnExcludeList: "
+               f"{sent or '(nothing excluded at capture)'}")
+    return header, details
+
+
 QUARANTINE_RULE_COMMENT = "# from the Full Load quarantine"
 
 

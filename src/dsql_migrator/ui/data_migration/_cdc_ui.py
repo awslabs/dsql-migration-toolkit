@@ -3743,6 +3743,14 @@ async def _open_cdc_infra_dialog(
             if inspect.isawaitable(result):
                 await result
 
+        from dsql_migrator.ui.data_migration._models import deploy_exclusion_disclosure
+
+        _disclosure = deploy_exclusion_disclosure(migration_state, inventory)
+        if _disclosure is not None:
+            _render_notice(ui, tone="info", header=_disclosure[0], body="")
+            with ui.expansion("show").classes("w-full text-xs"):  # type: ignore[attr-defined]
+                ui.label(_disclosure[1]).classes("text-xs font-mono wrap-anywhere")  # type: ignore[attr-defined]
+
         with ui.row().classes("justify-end gap-2 w-full"):  # type: ignore[attr-defined]
             ui.button("Cancel", on_click=dialog.close).props("flat")  # type: ignore[attr-defined]
             deploy_btn = ui.button("Deploy", on_click=_go).props("color=primary")  # type: ignore[attr-defined]
