@@ -57,6 +57,9 @@ class _El:
     def set_enabled(self, value):
         self.enabled = bool(value)
 
+    def set_visibility(self, value):
+        self.visible = bool(value)
+
     def set_value(self, value):
         self.value = value
         self._ui.set_values.append(value)
@@ -78,6 +81,7 @@ class _Ui:
         self.timers: list = []
         self.set_values: list[str] = []
         self.editors: list[_El] = []
+        self.tooltip_els: list[_El] = []
         self.refreshes = 0
         self.dialogs: list[_El] = []
         self.expansions: dict = {}
@@ -96,6 +100,11 @@ class _Ui:
     def button(self, text="", *_a, on_click=None, **_k):
         el = self._el("button", text)
         self.buttons.setdefault(str(text), []).append((on_click, el))
+        return el
+
+    def tooltip(self, text="", *_a, **_k):
+        el = self._el("tooltip", text)
+        self.tooltip_els.append(el)
         return el
 
     def codemirror(self, value="", *_a, on_change=None, **_k):
@@ -1483,3 +1492,49 @@ def test_saved_entry_notes_stay_visible_after_the_lock():
     row_ui = _Ui()
     render_exclusion_button_row(row_ui, ctx)
     assert any(t.endswith("need attention: open Exclude tables & columns.") for t in row_ui.texts)
+
+
+
+# --- the help tooltip and the editor example ---------------------------------------
+
+
+def test_the_help_tooltip_wraps_inside_the_dialog_and_keeps_its_line_breaks():
+    from dsql_migrator.ui.data_migration._exclusion_dialog import HELP_TOOLTIP
+
+    ui = _Ui()
+    ctx, _calls = _ctx()
+    open_exclusion_dialog(ui, ctx)
+    (tip,) = [el for el in ui.tooltip_els if el.text == HELP_TOOLTIP]
+    props = " ".join(tip.props_seen)
+    assert 'max-width="min(36rem, 80vw)"' in props
+    assert 'anchor="bottom left" self="top left"' in props
+
+
+def test_an_empty_editor_shows_the_two_table_example_until_there_is_text():
+    from dsql_migrator.ui.data_migration._exclusion_dialog import EDITOR_EXAMPLE
+
+    assert EDITOR_EXAMPLE.count("exclude table ") == 2
+    ui = _Ui()
+    ctx, _calls = _ctx()
+    open_exclusion_dialog(ui, ctx)
+    (example,) = [el for el in ui.elements if el.kind == "label" and el.text == EDITOR_EXAMPLE]
+    assert example.visible is True
+    ui.type_text("exclude shop.t.a")
+    assert example.visible is False
+    ui.type_text("   ")
+    assert example.visible is True
+    # Saved rules open with text: no example over them.
+    state = DataMigrationState()
+    state.restore_exclusion_rules("exclude shop.t.a", ())
+    ui2 = _Ui()
+    ctx2, _calls2 = _ctx(state)
+    open_exclusion_dialog(ui2, ctx2)
+    (example2,) = [el for el in ui2.elements if el.kind == "label" and el.text == EDITOR_EXAMPLE]
+    assert example2.visible is False
+
+
+def test_the_example_hides_on_focus_and_lets_clicks_through():
+    from dsql_migrator.ui.data_migration._exclusion_dialog import _EDITOR_CSS
+
+    assert ".exclusion-editor-wrap:focus-within .exclusion-editor-example{display:none}" in _EDITOR_CSS
+    assert "pointer-events:none" in _EDITOR_CSS

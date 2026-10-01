@@ -178,8 +178,12 @@ def _read_ref(text: str, i: int) -> "tuple[list[RulePart], int]":
     while True:
         part, j = _read_part(text, i)
         if not part.quoted and part.text == "":
-            if j < len(text) and text[j] == "," and text[j + 1:].strip():
-                raise _E1(_COMMA_LIST_MESSAGE)
+            if j < len(text) and text[j] == ",":
+                if text[j + 1:].strip():
+                    raise _E1(_COMMA_LIST_MESSAGE)
+                if not parts:  # nothing before the comma, so no "." to remove
+                    raise _E1('A name is missing before ",": write the name and remove '
+                              'the comma.')
             raise _E1('An empty name part: remove the extra ".".')
         parts.append(part)
         if j < len(text) and text[j] == ".":
@@ -940,9 +944,10 @@ def _type_miss(line, index, typed: RulePart, line_text, key_counts, source_type)
     return RuleError("E2", line, message, suggestions, name_index=index)
 
 
-# A MySQL type name never continues with one of these (an attribute like "unsigned" or
-# "precision" does): after the first word they mean a list typed with spaces, even when
-# that type has no column here -- the space cut would otherwise keep only the first.
+# MySQL LOB type names: a quoted multi-word name whose EVERY word is a type here or one of
+# these is a list typed with spaces, even when one listed type has no column here (the
+# space cut would otherwise keep only the first). "medium text" is not: "medium" is no
+# type, so it stays a misspelling with its "Use type:mediumtext" fix.
 _MYSQL_LOB_TYPE_NAMES = frozenset({
     "tinytext", "text", "mediumtext", "longtext",
     "tinyblob", "blob", "mediumblob", "longblob", "json",
@@ -1107,11 +1112,10 @@ def resolve_exclusion_rules(
             for index, typed in enumerate(rule.type_names):
                 words = typed.text.split()
                 if (len(words) > 1 and typed.text not in key_counts
-                        and (all(resolve_type_name(w, key_counts, source_type) is not None
-                                 for w in words)
-                             or (source_type is SourceType.MYSQL
-                                 and any(w.lower() in _MYSQL_LOB_TYPE_NAMES
-                                         for w in words[1:])))):
+                        and all(resolve_type_name(w, key_counts, source_type) is not None
+                                or (source_type is SourceType.MYSQL
+                                    and w.lower() in _MYSQL_LOB_TYPE_NAMES)
+                                for w in words)):
                     # "longtext longblob" is a list typed with a space, not one type: on
                     # MySQL the space cut would silently match only the first word.
                     errors.setdefault(line, []).append(

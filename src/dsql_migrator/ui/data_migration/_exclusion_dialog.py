@@ -65,10 +65,25 @@ HELP_TOOLTIP = (
     'Quote a name that has spaces, ".", "*" or "#": "my schema"."order.items".c\n'
     "# starts a comment."
 )
+# Shown in grey over an EMPTY editor until it gets the cursor (a click hides it), so a
+# first-time user sees the shape of a rule without reading the help.
+EDITOR_EXAMPLE = (
+    "# Example: leave two tables out of this migration\n"
+    "exclude table shop.audit_log\n"
+    "exclude table shop.sessions"
+)
 # The editor grows with its lines, capped at 60vh (local: ui/design.py stays unchanged).
+# The example sits over the editor's text area (past the line-number gutter), lets clicks
+# through, and hides while the editor has focus.
 _EDITOR_CSS = (
     ".exclusion-rules-editor .cm-editor{max-height:60vh;min-height:6rem}"
     ".exclusion-rules-editor .cm-scroller{overflow:auto}"
+    ".exclusion-editor-wrap{position:relative}"
+    ".exclusion-editor-example{position:absolute;top:4px;left:38px;right:8px;"
+    "pointer-events:none;white-space:pre;overflow:hidden;color:#9ca3af;"
+    "font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:14px;"
+    "line-height:1.4}"
+    ".exclusion-editor-wrap:focus-within .exclusion-editor-example{display:none}"
 )
 _DEBOUNCE_SECONDS = 0.3
 _SHOWN = 5
@@ -405,6 +420,34 @@ def _render_hint(ui, hint, go_to=None) -> None:
                 "flat dense no-caps size=sm color=primary")
 
 
+def _rules_editor(ui, text: str, on_change):
+    """The rules editor, with :data:`EDITOR_EXAMPLE` over it while it is empty and has
+    no cursor. Returns ``(editor, example)``; keep the example in step with
+    :func:`_sync_example`."""
+    with ui.element("div").classes("exclusion-editor-wrap w-full"):
+        editor = ui.codemirror(
+            text, language=None, theme="basicLight", line_wrapping=False,
+            on_change=on_change,
+        ).classes("w-full exclusion-rules-editor")
+        example = ui.label(EDITOR_EXAMPLE).classes("exclusion-editor-example")
+    _sync_example(example, text)
+    return editor, example
+
+
+def _sync_example(example, text: str) -> None:
+    example.set_visibility(not (text or "").strip())
+
+
+def _help_icon(ui) -> None:
+    """The (?) beside the title: the rule cheat sheet, wrapped inside the dialog's width
+    with its line breaks kept (a plain .tooltip() rendered one screen-wide line)."""
+    with ui.icon("help_outline").classes("text-gray-400 cursor-help"):
+        # Anchored at the icon's left edge and opening rightwards, so it stays inside the
+        # dialog instead of centring past its left edge.
+        ui.tooltip(HELP_TOOLTIP).classes("text-xs font-mono whitespace-pre-wrap").props(
+            'anchor="bottom left" self="top left" max-width="min(36rem, 80vw)"')
+
+
 def _shown_matches(held: dict, tables: Sequence[str] = ()) -> bool:
     """Whether the click acts on what the dialog last SHOWED (the preview is debounced,
     so a click can land before it caught up with the text)."""
@@ -463,20 +506,19 @@ def _build_edit_dialog(ui, ctx: ExclusionDialogContext, *, insert_lines=(), hint
 
         with ui.row().classes("items-center gap-2 w-full no-wrap"):
             ui.label(TITLE).classes("text-base font-semibold")
-            ui.icon("help_outline").classes("text-gray-400 cursor-help").tooltip(HELP_TOOLTIP)
+            _help_icon(ui)
             ui.space()
             ui.button(on_click=_close).props(
                 "flat dense round size=sm icon=close color=grey-7"
             ).tooltip("Close without saving")
         ui.label(HELP_TEXT).classes("text-xs text-gray-600")
         _render_hint(ui, hint, lambda n: _go_to_line(n))
-        editor = ui.codemirror(
-            text, language=None, theme="basicLight", line_wrapping=False,
-            on_change=lambda e: _on_edit(getattr(e, "value", "")),
-        ).classes("w-full exclusion-rules-editor")
+        editor, example = _rules_editor(
+            ui, text, lambda e: _on_edit(getattr(e, "value", "")))
 
         @ui.refreshable
         def preview() -> None:
+            _sync_example(example, held["text"])
             resolution = _resolve(ctx, inventory, inputs, held["text"], slot="editor")
             _render_errors(ui, resolution, held, editor, _run_preview_now)
             for number in sorted(resolution.line_status):
@@ -526,6 +568,7 @@ def _build_edit_dialog(ui, ctx: ExclusionDialogContext, *, insert_lines=(), hint
 
         def _on_edit(value: str) -> None:
             held["text"] = value or ""
+            _sync_example(example, held["text"])
             # Until the preview caught up, Save acts on nothing it has not shown.
             save_button.set_enabled(False)
             _cancel_timer(held)
@@ -1318,13 +1361,12 @@ def _build_reload_dialog(ui, ctx: ExclusionDialogContext, *, insert_lines=(), hi
         ui.label("Column rules are editable. Tables are fixed after a Full Load (use Start "
                  "over to change them).").classes("text-xs text-gray-600")
         _render_hint(ui, hint, lambda n: _go_to_line(n))
-        editor = ui.codemirror(
-            text, language=None, theme="basicLight", line_wrapping=False,
-            on_change=lambda e: _on_edit(getattr(e, "value", "")),
-        ).classes("w-full exclusion-rules-editor")
+        editor, example = _rules_editor(
+            ui, text, lambda e: _on_edit(getattr(e, "value", "")))
 
         @ui.refreshable
         def preview() -> None:
+            _sync_example(example, held["text"])
             resolution = _resolve(ctx, inventory, inputs, held["text"], slot="editor")
             _render_errors(ui, resolution, held, editor, _run_preview_now)
             for number in sorted(resolution.line_status):
@@ -1371,6 +1413,7 @@ def _build_reload_dialog(ui, ctx: ExclusionDialogContext, *, insert_lines=(), hi
 
         def _on_edit(value: str) -> None:
             held["text"] = value or ""
+            _sync_example(example, held["text"])
             # The confirm names the tables it drops: until the preview caught up with this
             # text, there is nothing to confirm.
             if held.get("action") is not None:

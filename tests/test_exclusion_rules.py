@@ -1310,3 +1310,40 @@ def test_a_mysql_lob_list_with_an_absent_type_is_still_the_comma_e2(typed):
             ColumnDef(name="id", mysql_type="bigint"), ColumnDef(name="x", mysql_type="int unsigned"),
             ColumnDef(name="y", mysql_type="double")])
         assert not _resolve(f"exclude type:{legit}", [t2], MY).errors, legit
+
+
+
+def test_a_misspelled_spaced_mysql_type_is_not_called_a_list():
+    # a48ed96 review: "medium text" is one misspelled type -- its fix is mediumtext, never
+    # a comma list that ends up excluding every text column.
+    table = TableDef(name="shop.media", primary_key=["id"], columns=[
+        ColumnDef(name="id", mysql_type="bigint"), ColumnDef(name="doc", mysql_type="mediumtext"),
+        ColumnDef(name="body", mysql_type="text")])
+    res = _resolve('exclude type:"medium text"', [table], MY)
+    (err,) = res.errors[1]
+    assert "separate types with a comma" not in err.message
+    assert [s.line_text for s in err.suggestions] == ["exclude type:mediumtext"]
+
+
+@pytest.mark.parametrize("text,message", [
+    ("exclude ,", 'A name is missing before ",": write the name and remove the comma.'),
+    ("exclude table ,", 'A name is missing before ",": write the name and remove the comma.'),
+    ("exclude , # c", 'A name is missing before ",": write the name and remove the comma.'),
+    ("exclude shop.t.,", 'An empty name part: remove the extra ".".'),
+    ("exclude , shop.t.c", "One rule per line: a comma list works only after type:. Put each "
+                           "name on its own line."),
+])
+def test_an_empty_name_before_a_comma_names_what_is_missing(text, message):
+    _rules, errors = parse_rules(text)
+    (err,) = errors[1]
+    assert err.message == message
+
+
+def test_a_full_mysql_enum_spelling_with_a_spaced_value_still_matches():
+    # a48ed96 review: a LOB word inside an enum value is not a type list.
+    table = TableDef(name="shop.media", primary_key=["id"], columns=[
+        ColumnDef(name="id", mysql_type="bigint"),
+        ColumnDef(name="fmt", mysql_type="enum('rich text editor','markdown')"),
+        ColumnDef(name="body", mysql_type="text")])
+    res = _resolve('exclude type:"enum(\'rich text editor\',\'markdown\')"', [table], MY)
+    assert not res.errors and dict(res.columns) == {"shop.media": frozenset({"fmt"})}
