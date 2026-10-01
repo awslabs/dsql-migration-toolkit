@@ -268,7 +268,7 @@ def test_errors_disable_save_and_a_suggestion_rewrites_only_that_line():
     ui.type_text("exclude shop.u.note\nexclude shop.t.A")
     save = ui.buttons["Save"][-1][1]
     assert save.enabled is False
-    assert any("need fixing. Save is disabled." in t for t in ui.texts)
+    assert "1 line needs fixing. Save is disabled." in ui.texts  # singular (P3 LIVE 8)
     label = next(k for k in ui.buttons if k.startswith('Use "exclude shop.t.'))
     ui.click(label)
     assert ui.set_values[-1] == "exclude shop.u.note\nexclude shop.t.a"

@@ -683,6 +683,26 @@ def test_the_runner_and_every_retry_check_the_reverse_gate_before_submitting():
         assert any(isinstance(b, ast.Return) for b in guard.body), name
 
 
+def test_a_retry_clears_the_previous_runs_error_after_its_last_refusal():
+    # P3 LIVE 8: a Change & reload that fixed the quarantine kept the first run's red
+    # "Migration failed" above "Full Load complete". The scoped retry clears it, as the
+    # first Start does -- after every early refusal (each sets its own error) and before
+    # the submit.
+    import ast
+    import inspect
+
+    import dsql_migrator.ui.data_migration as dm
+
+    tree = ast.parse(inspect.getsource(dm.build_data_migration_screen))
+    (fn,) = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_run_retry_for"]
+    calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
+    clears = [c.lineno for c in calls if getattr(c.func, "attr", None) == "clear_outputs"]
+    refusals = [c.lineno for c in calls if getattr(c.func, "attr", None) == "set_error"]
+    submits = [c.lineno for c in calls if getattr(c.func, "attr", None) == "submit"]
+    assert clears and submits and refusals
+    assert max(refusals) < min(clears) < min(submits)
+
+
 # ---------------------------------------------------------------------------
 # The cut-over screen: the background fill, the FK click-time re-check
 # ---------------------------------------------------------------------------

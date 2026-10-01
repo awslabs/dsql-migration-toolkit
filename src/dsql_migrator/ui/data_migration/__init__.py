@@ -1737,6 +1737,12 @@ def build_data_migration_screen(
                 watermark = current.watermark
                 prior_recreated = list(getattr(current, "recreated_tables", None) or ())
                 accept_quarantined = migration_state.accept_quarantined_rows
+                # The previous run's failure no longer describes this lineage, exactly as
+                # the first Start clears it: left in place, a reload that fixed the gap
+                # (Exclude column & reload, Change & reload) kept a red "Migration
+                # failed" above "Full Load complete" and a Success step. A failed retry
+                # records its own error again.
+                migration_state.clear_outputs()
                 migration_state.set_active_substep("full_load")
                 session.set_workflow(
                     with_status(

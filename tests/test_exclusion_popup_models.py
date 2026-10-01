@@ -195,6 +195,9 @@ def test_the_lob_line_is_info_until_a_measured_offender_is_open():
     s = exclusion_row_summary(state, locked=False, drift=None, block_reason=None,
                               lob_candidates=cands, measured_over={("shop.t", "a")})
     assert s.lob_tone == "warning"
+    # P3 LIVE 8: the measured offender is named, not only toned.
+    assert s.lob_text.startswith("1 column in the selected tables holds a value over Aurora "
+                                 "DSQL's limit (Check sizes)")
 
 
 # --- review fixes (C05-C11 review) ----------------------------------------------------

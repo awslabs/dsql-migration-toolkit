@@ -575,7 +575,7 @@ def _render_errors(ui, resolution, held, editor, rerun) -> None:
         return
     lines = held["text"].split("\n")
     with ui.column().classes("w-full gap-1 p-2 rounded-md border border-red-200 bg-red-50"):
-        ui.label(f"{total} line{'s' if total != 1 else ''} need fixing. Save is disabled.").classes(
+        ui.label(f"{total} line{'s need' if total != 1 else ' needs'} fixing. Save is disabled.").classes(
             "text-sm font-semibold text-red-700")
         for error in errors:
             shown = lines[error.line - 1] if 0 < error.line <= len(lines) else ""
@@ -685,7 +685,7 @@ def _render_review_all(ui, resolution, view: dict, rerun) -> None:
     total = len(resolution.items)
     if not total:
         return
-    with _expansion(ui, f"Review all {total} items", view, "review_open", rerun):
+    with _expansion(ui, f"Review all {total} item{'s' if total != 1 else ''}", view, "review_open", rerun):
         if not view.get("review_open"):
             return
         status_filter = view.get("review_filter", "All")

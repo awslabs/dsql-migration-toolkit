@@ -2507,8 +2507,17 @@ def exclusion_row_summary(
             "columns."
         )
         open_names = {(c.table, col) for c in lob_candidates for col in c.columns}
-        if open_names & set(measured_over):
+        found = len(open_names & set(measured_over))
+        if found:
+            # A measured offender, not only a type: say so, or the warning tone is the
+            # only difference from the type-based line.
             lob_tone = "warning"
+            lob_text = (
+                f"{found} column{'s' if found != 1 else ''} in the selected tables "
+                f"{'hold' if found != 1 else 'holds'} a value over Aurora DSQL's limit "
+                "(Check sizes): each such row is quarantined at load. Review them in "
+                "Exclude tables & columns."
+            )
     if block_reason:
         n = blocking_count or 1
         text = (f"{n} saved exclusion{'s' if n != 1 else ''} no longer appl"
