@@ -387,7 +387,7 @@ CDC では、そのような行は **DLQ** に送られます。パイプライ�
 **キャプチャの時点で除外** します — Data Migration ステップのテーブル一覧の下にある **Exclude tables & columns**
 で、その列を除外するルールを追加するか、*Oversized-LOB candidates* セクションの **+ add rule** を使います。
 このセクションは Evaluation が `OVERSIZED_LOB` としてフラグ付けするものと同じ集合を示し、**Check sizes** で実際の
-サイズを測れます。除外した列は Aurora DSQL では NULL になります。何が取り分けられたかを正確に確認できます。
+サイズを測れます。ツールが書き込む行では、除外した列は NULL になります。CDC 開始前から Aurora DSQL にあった行は値を保持し(CDC は除外した列を書き込みません)、Validation がそれらの行を数えます。何が取り分けられたかを正確に確認できます。
 [第6章 §6.1](06-limitations.md#61-aurora-dsql-の機能制限スキーマがこれらに適合している必要があります) をご覧ください。
 
 

@@ -1218,6 +1218,8 @@ def _proof_clause(summary: "ValidationSummary") -> str:
         parts.append(f"NULL not determined for {len(summary.proof_not_determined)} table(s)")
     if summary.legacy_values:
         parts.append(f"{len(summary.legacy_values)} table(s) keep the target DEFAULT (omit-only)")
+    if summary.legacy_null:
+        parts.append(f"NULL in every row (omit-only) in {len(summary.legacy_null)} table(s)")
     if summary.null_proven:
         parts.append(f"NULL proven in {len(summary.null_proven)} table(s)")
     return ", ".join(parts) if parts else "NULL not proven"

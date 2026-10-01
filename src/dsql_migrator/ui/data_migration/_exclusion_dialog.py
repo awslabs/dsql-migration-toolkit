@@ -124,7 +124,8 @@ def _lock_state(ctx: ExclusionDialogContext):
     return exclusion_lock_state(ctx.migration_state, ctx.job_manager)
 
 
-def _resolve(ctx: ExclusionDialogContext, inventory, inputs, text: str, *, slot: str):
+def _resolve(ctx: ExclusionDialogContext, inventory, inputs, text: str, *, slot: str,
+             convert_legacy: "Sequence[str]" = ()):
     return popup_resolution(
         ctx.migration_state,
         inventory,
@@ -134,6 +135,7 @@ def _resolve(ctx: ExclusionDialogContext, inventory, inputs, text: str, *, slot:
         selection_lock_reason=ctx.lock_reason_fn(),
         capture_tables=ctx.capture_tables_fn,
         memo_slot=slot,
+        convert_legacy=convert_legacy,
     )
 
 
@@ -750,13 +752,16 @@ def _lob_candidates_open(ctx: ExclusionDialogContext, inventory, resolution):
     return open_lob_candidates(candidates, resolution.columns)
 
 
-def _current_value_limit(inventory, inputs, table: str, column: str) -> int:
+def _current_value_limit(inventory, inputs, table: str, column: str, *, tables=None) -> int:
     """The per-value limit (bytes) of ``table.column`` now: its applied target type's,
-    else its source type's -- the limit lob_rows shows."""
+    else its source type's -- the limit lob_rows shows. ``tables``: a prebuilt
+    ``{name: TableDef}`` map (a caller looking up many columns builds it once)."""
     from dsql_migrator.core.converter import parse_target_column_types
     from dsql_migrator.core.prerequisites import dsql_value_limit_bytes
 
-    tdef = next((t for t in getattr(inventory, "tables", None) or () if t.name == table), None)
+    if tables is None:
+        tables = {t.name: t for t in getattr(inventory, "tables", None) or ()}
+    tdef = tables.get(table)
     col = next((c for c in tdef.columns if c.name == column), None) if tdef else None
     base = (getattr(col, "mysql_type", "") or "").strip().lower().split("(")[0].strip()
     ddl = getattr((getattr(inputs, "applied", None) or {}).get(table), "target_ddl", None) or ""
@@ -779,12 +784,16 @@ def current_over(state, inventory, inputs, candidates) -> "set[tuple[str, str]]"
     limit."""
     sizes = state.value_sizes()
     out = set()
+    tables = None
     for c in candidates:
         for col in c.columns:
             entry = sizes.get((c.table, col))
             if entry is None or entry[0] != "over":
                 continue
-            if _verdict_for_limit(entry, _current_value_limit(inventory, inputs, c.table, col)):
+            if tables is None:  # built once, and only when an "over" entry exists
+                tables = {t.name: t for t in getattr(inventory, "tables", None) or ()}
+            limit = _current_value_limit(inventory, inputs, c.table, col, tables=tables)
+            if _verdict_for_limit(entry, limit):
                 out.add((c.table, col))
     return out
 
@@ -1331,9 +1340,12 @@ def _build_reload_dialog(ui, ctx: ExclusionDialogContext, *, insert_lines=(), hi
             if tables:
                 # What the reload does to each table, BEFORE the confirm: the warnings
                 # (a NOT NULL dropped one way, a generated column rejecting every row...)
-                # and the ALTERs its recreated tables get. No Start dialog follows.
-                _render_result(ui, resolution, tables)
-                _render_target_changes(ui, ctx, resolution, view, _run_preview_now, tables)
+                # and the ALTERs its recreated tables get. No Start dialog follows. A
+                # ticked omit-only table is resolved as overlay: that is what it reloads as.
+                shown = (_resolve(ctx, inventory, inputs, held["text"], slot="reload-converted",
+                                  convert_legacy=sorted(convert)) if convert else resolution)
+                _render_result(ui, shown, tables)
+                _render_target_changes(ui, ctx, shown, view, _run_preview_now, tables)
             _render_drop_card(ui, ctx, resolution, tables)
             label = (f"Drop & reload {tables[0]}" if len(tables) == 1
                      else f"Drop & reload {len(tables)} tables" if tables else "Save")

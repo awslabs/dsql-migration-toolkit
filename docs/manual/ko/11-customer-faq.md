@@ -421,7 +421,7 @@ Validation(4단계)이 소스와 타깃을 **점점 더 엄격한 3단계**로 �
 테이블 목록 아래 **Exclude tables & columns**에서 그 컬럼을 제외하는 규칙을 추가하거나, 그 안의
 *Oversized-LOB candidates* 섹션에서 **+ add rule**을 누르면 됩니다. 이 섹션은 Evaluation이
 `OVERSIZED_LOB`로 표시하는 컬럼과 같은 집합을 보여 주고, **Check sizes**로 실제 크기를 잴 수 있습니다.
-제외한 컬럼은 Aurora DSQL에서 NULL입니다.
+도구가 쓰는 행에서 제외한 컬럼은 NULL입니다. CDC 시작 전에 이미 Aurora DSQL에 있던 행은 그 값을 유지하며(CDC는 제외한 컬럼을 쓰지 않음), Validation이 그 행을 집계합니다.
 [6장 §6.1](06-limitations.md#61-aurora-dsql-기능-한계-스키마가-이에-맞아야-함) 참조.
 
 

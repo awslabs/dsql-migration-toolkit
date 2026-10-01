@@ -2161,6 +2161,7 @@ def popup_resolution(
     selection_lock_reason: "Optional[str]" = None,
     capture_tables: "Optional[Callable[[Sequence[str]], Sequence[object]]]" = None,
     memo_slot: str = "editor",
+    convert_legacy: "Iterable[str]" = (),
 ):
     """:func:`~dsql_migrator.core.exclusion_rules.resolve_exclusion_rules` over this
     session's live inputs: the ONE context (selected' + focus, warnings on), the resolved
@@ -2172,14 +2173,18 @@ def popup_resolution(
     applied set and live columns held by IDENTITY (a reused ``id`` never serves a stale
     result), so the row and the popup re-resolve only when something changed. One entry
     per ``memo_slot`` (the row's saved rules, the editor's text), so typing in the popup
-    does not evict the row's comparison.
+    does not evict the row's comparison. ``convert_legacy``: tables whose omit-only entries
+    Change & reload converts (its ticked checkboxes) -- resolved as overlay entries, so
+    their warnings and ALTERs are the ones the reload really runs.
     """
     import hashlib
 
     from dsql_migrator.core.exclusion_rules import resolve_exclusion_rules
 
     stored = migration_state.lob_exclusions()
-    legacy = migration_state.legacy_exclusions()
+    converted = set(convert_legacy or ())
+    legacy = {t: c for t, c in migration_state.legacy_exclusions().items()
+              if t not in converted}
     prev = migration_state.rule_excluded_tables()
     reticks = migration_state.rule_reticked_tables()
     mkc_getter = getattr(migration_state, "cdc_message_key_columns", None)

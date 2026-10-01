@@ -429,8 +429,9 @@ Values that can't even traverse the pipeline (> ~8 MiB) are **excluded at captur
 you exclude the column in **Exclude tables & columns** (under the table list on the Data
 Migration step) with a rule, or with **+ add rule** in its *Oversized-LOB candidates*
 section, which lists the same columns Evaluation flags `OVERSIZED_LOB` (**Check sizes**
-measures them on request). An excluded column is NULL on Aurora DSQL. You see exactly
-what was set aside. See [Chapter 6 §6.1](06-limitations.md#61-aurora-dsql-feature-limits-your-schema-must-fit-these).
+measures them on request). Rows the tool writes hold NULL in an excluded column; rows
+already on Aurora DSQL before CDC started keep their values (CDC never writes an excluded
+column), and Validation counts them. You see exactly what was set aside. See [Chapter 6 §6.1](06-limitations.md#61-aurora-dsql-feature-limits-your-schema-must-fit-these).
 
 
 **Q25. What does "loud over silent" mean in practice?**

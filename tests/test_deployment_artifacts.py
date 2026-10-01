@@ -2339,3 +2339,9 @@ def test_the_manual_never_names_the_removed_oversized_lob_card() -> None:
     for lang in ("en", "ko", "ja"):
         assert "Exclude tables & columns" in (root / lang / "11-customer-faq.md").read_text(
             encoding="utf-8"), lang
+    # Never the unqualified "an excluded column is NULL": CDC only keeps the values of rows
+    # already on Aurora DSQL before CDC started.
+    overclaims = re.compile(r"An excluded column is NULL on Aurora DSQL|제외한 컬럼은 Aurora "
+                            r"DSQL에서 NULL입니다|除外した列は Aurora DSQL では NULL になります")
+    assert [str(p.relative_to(root)) for p in sorted(root.rglob("*.md"))
+            if overclaims.search(p.read_text(encoding="utf-8"))] == []

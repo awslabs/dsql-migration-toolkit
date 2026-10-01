@@ -89,7 +89,7 @@ DSQL は **約 1 MiB を超える単一の値** (`TEXT`/`bytea` 値) を拒否�
 |---|---|
 | **≤ 1 MiB** | 通常どおり適用されます。 |
 | **1 MiB – 8 MiB** | sink は **書き込み前に** 各値を測定し、特大サイズの値を **DLQ** に **隔離 (quarantine)** します (適用されることは決してありません)。一方でそのレコードのテーブルの残りの値はそのまま流れ続けます。そのようなレコードがデッドレター化のために Kafka を通過できるように、テーブルごとのトピックとクライアントの上限が引き上げられます (デフォルト 4 MiB、最大 8 MiB)。 |
-| **> 8 MiB** | Kafka にまったく入ることができません。これらは **キャプチャ時に除外** する必要があります。Debezium の `column.exclude.list` が特大サイズの LOB 列をドロップし、パイプラインに到達しないようにします。ドロップする列は Data Migration ステップのテーブル一覧の下にある **Exclude tables & columns** でルールにより除外します — その *Oversized-LOB candidates* セクションが Evaluation が `OVERSIZED_LOB` としてフラグ付けするのと同じ集合を示します。除外した列は Aurora DSQL では NULL になります。 |
+| **> 8 MiB** | Kafka にまったく入ることができません。これらは **キャプチャ時に除外** する必要があります。Debezium の `column.exclude.list` が特大サイズの LOB 列をドロップし、パイプラインに到達しないようにします。ドロップする列は Data Migration ステップのテーブル一覧の下にある **Exclude tables & columns** でルールにより除外します — その *Oversized-LOB candidates* セクションが Evaluation が `OVERSIZED_LOB` としてフラグ付けするのと同じ集合を示します。ツールが書き込む行では、除外した列は NULL になります。CDC 開始前から Aurora DSQL にあった行は値を保持し(CDC は除外した列を書き込みません)、Validation がそれらの行を数えます。 |
 
 ### デッドレター化される対象
 

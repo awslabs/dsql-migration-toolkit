@@ -178,7 +178,7 @@ def _read_ref(text: str, i: int) -> "tuple[list[RulePart], int]":
     while True:
         part, j = _read_part(text, i)
         if not part.quoted and part.text == "":
-            if j < len(text) and text[j] == ",":
+            if j < len(text) and text[j] == "," and text[j + 1:].strip():
                 raise _E1(_COMMA_LIST_MESSAGE)
             raise _E1('An empty name part: remove the extra ".".')
         parts.append(part)
@@ -487,6 +487,12 @@ def _no_trailing(line: str, rule_text: str, end: int) -> None:
     existing comment is kept after it). A comma list of names gets no such fix: commenting
     out the rest would silently leave those names migrated."""
     text = rule_text[end:].strip()
+    if text == ",":
+        # A lone trailing comma, not a list: remove it (an existing comment is kept).
+        kept = line[len(rule_text):]
+        raise _E1("A trailing comma: remove it.",
+                  [Suggestion("Remove the comma",
+                              line[:end].rstrip() + ("  " + kept.lstrip() if kept else ""))])
     if text.startswith(","):
         raise _E1(_COMMA_LIST_MESSAGE)
     if text:
@@ -934,6 +940,15 @@ def _type_miss(line, index, typed: RulePart, line_text, key_counts, source_type)
     return RuleError("E2", line, message, suggestions, name_index=index)
 
 
+# A MySQL type name never continues with one of these (an attribute like "unsigned" or
+# "precision" does): after the first word they mean a list typed with spaces, even when
+# that type has no column here -- the space cut would otherwise keep only the first.
+_MYSQL_LOB_TYPE_NAMES = frozenset({
+    "tinytext", "text", "mediumtext", "longtext",
+    "tinyblob", "blob", "mediumblob", "longblob", "json",
+})
+
+
 def _type_list_miss(line, index, typed: RulePart, line_text, words) -> RuleError:
     """The E2 for a quoted name whose every word is a type here: a list typed with spaces.
     Its one fix is the comma list, so no type is silently dropped."""
@@ -1092,8 +1107,11 @@ def resolve_exclusion_rules(
             for index, typed in enumerate(rule.type_names):
                 words = typed.text.split()
                 if (len(words) > 1 and typed.text not in key_counts
-                        and all(resolve_type_name(w, key_counts, source_type) is not None
-                                for w in words)):
+                        and (all(resolve_type_name(w, key_counts, source_type) is not None
+                                 for w in words)
+                             or (source_type is SourceType.MYSQL
+                                 and any(w.lower() in _MYSQL_LOB_TYPE_NAMES
+                                         for w in words[1:])))):
                     # "longtext longblob" is a list typed with a space, not one type: on
                     # MySQL the space cut would silently match only the first word.
                     errors.setdefault(line, []).append(

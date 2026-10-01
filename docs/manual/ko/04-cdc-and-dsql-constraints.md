@@ -140,7 +140,7 @@ DSQL은 **약 1 MiB를 초과하는 단일 값**(`TEXT`/`bytea`)을 거부합니
 |---|---|
 | **≤ 1 MiB** | 정상 적용. |
 | **1 MiB – 8 MiB** | 싱크가 쓰기 **전에** 각 값을 측정해 초대형 값을 **DLQ로 격리**(quarantine)합니다(절대 적용 불가). 그런 레코드가 DLQ에 닿도록 Kafka를 통과하려면 토픽·클라이언트 한도를 상향(기본 4 MiB, 최대 8 MiB). |
-| **> 8 MiB** | Kafka에 들어갈 수 없음. **캡처 단계에서 제외**해야 함: Debezium `column.exclude.list`가 초대형 LOB 컬럼을 드롭해 파이프라인에 닿지 않게 함. 드롭할 컬럼은 Data Migration 단계의 테이블 목록 아래 **Exclude tables & columns**에서 규칙으로 제외합니다 — 그 안의 *Oversized-LOB candidates* 섹션이 Evaluation이 `OVERSIZED_LOB`로 표시하는 컬럼과 같은 집합을 보여 줍니다. 제외한 컬럼은 Aurora DSQL에서 NULL입니다. |
+| **> 8 MiB** | Kafka에 들어갈 수 없음. **캡처 단계에서 제외**해야 함: Debezium `column.exclude.list`가 초대형 LOB 컬럼을 드롭해 파이프라인에 닿지 않게 함. 드롭할 컬럼은 Data Migration 단계의 테이블 목록 아래 **Exclude tables & columns**에서 규칙으로 제외합니다 — 그 안의 *Oversized-LOB candidates* 섹션이 Evaluation이 `OVERSIZED_LOB`로 표시하는 컬럼과 같은 집합을 보여 줍니다. 도구가 쓰는 행에서 제외한 컬럼은 NULL입니다. CDC 시작 전에 이미 Aurora DSQL에 있던 행은 그 값을 유지하며(CDC는 제외한 컬럼을 쓰지 않음), Validation이 그 행을 집계합니다. |
 
 ### DLQ로 가는 것
 

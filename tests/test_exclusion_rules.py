@@ -1276,3 +1276,37 @@ def test_a_comma_list_of_names_gets_no_comment_fix(text):
     (err,) = errors[1]
     assert err.code == "E1" and err.message.startswith("One rule per line")
     assert err.suggestions == ()
+
+
+
+@pytest.mark.parametrize("text,fixed", [
+    ("exclude shop.media.doc,", "exclude shop.media.doc"),
+    ("exclude shop.media.doc, # note", "exclude shop.media.doc  # note"),
+    ("exclude table shop.media ,", "exclude table shop.media"),
+])
+def test_a_lone_trailing_comma_is_removed_not_called_a_list(text, fixed):
+    _rules, errors = parse_rules(text)
+    (err,) = errors[1]
+    assert err.message == "A trailing comma: remove it."
+    (fix,) = err.suggestions
+    assert fix.line_text == fixed and not parse_rules(fix.line_text)[1]
+
+
+
+@pytest.mark.parametrize("typed", ['"longtext longblob mediumblob"', '"longtext mediumtext"'])
+def test_a_mysql_lob_list_with_an_absent_type_is_still_the_comma_e2(typed):
+    # Final regression check: an absent type in the list must not fall back to the space
+    # cut (only longtext matched, longblob silently migrated).
+    table = TableDef(name="shop.media", primary_key=["id"], columns=[
+        ColumnDef(name="id", mysql_type="bigint"), ColumnDef(name="doc", mysql_type="longtext"),
+        ColumnDef(name="img", mysql_type="longblob")])
+    res = _resolve(f"exclude type:{typed}", [table], MY)
+    (err,) = res.errors[1]
+    assert err.code == "E2" and "separate types with a comma" in err.message
+    assert dict(res.columns) == {}
+    # MySQL attribute words keep their meaning.
+    for legit in ('"int unsigned"', '"double precision"'):
+        t2 = TableDef(name="shop.n", primary_key=["id"], columns=[
+            ColumnDef(name="id", mysql_type="bigint"), ColumnDef(name="x", mysql_type="int unsigned"),
+            ColumnDef(name="y", mysql_type="double")])
+        assert not _resolve(f"exclude type:{legit}", [t2], MY).errors, legit

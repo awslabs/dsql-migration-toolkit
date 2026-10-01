@@ -728,6 +728,33 @@ def test_change_and_reload_shows_the_warnings_and_alters_before_its_drop():
     assert submitted == []
 
 
+def test_a_ticked_omit_only_table_shows_the_overlay_it_reloads_with():
+    # Regression check: ticking the conversion makes the reload overlay the column, so
+    # the pre-DROP disclosure shows its ALTERs and W1-W6 warnings, not "no target change".
+    ctx, state, _jobs, submitted = _reload_ctx()
+    applied = {"shop.t": SimpleNamespace(
+        target_ddl=('CREATE TABLE "shop"."t" ("id" BIGINT NOT NULL, "a" TEXT NOT NULL '
+                    "DEFAULT 'x', \"b\" TEXT, \"g\" TEXT NOT NULL GENERATED ALWAYS AS "
+                    '(upper(a)) STORED, PRIMARY KEY ("id"))'),
+        foreign_key_ddls=[], preserved_foreign_keys=[], index_ddls=[])}
+    tables = [_t("shop.t", a="longtext", b="longtext", g="longtext")]
+    ctx.inventory_fn = lambda: SimpleNamespace(tables=tables)
+    ctx.inputs_fn = lambda: ExclusionInputs(selected=["shop.t"], applied=applied,
+                                            preserve_foreign_keys=True, migratable=["shop.t"],
+                                            signature=("s",))
+    state.restore_legacy_exclusions(["shop.t:a"])
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx, mode="change_and_reload")
+    checkbox = [e for e in ui.elements if e.kind == "checkbox"][-1]
+    checkbox.on_change(SimpleNamespace(value=True))
+    assert "Drop & reload shop.t" in ui.buttons
+    assert any(t.startswith("(!) shop.t.a") and "23502" in t for t in ui.texts)
+    assert not any("no target change" in t for t in ui.texts)
+    ui.expand("Changes to Aurora DSQL")
+    assert any(t.endswith('ALTER COLUMN "a" DROP NOT NULL') for t in ui.texts)
+    assert submitted == []
+
+
 def test_a_text_only_change_saves_the_text_and_reloads_nothing():
     ctx, state, _jobs, submitted = _reload_ctx()
     ui = _Ui()
@@ -789,10 +816,22 @@ def test_an_adopted_omit_only_entry_is_never_called_excluded_before_v0_1_562():
     assert checkbox.text.startswith("Reload shop.t so its omit-only columns (a) are NULL")
     edit_ui = _Ui()
     ctx2, _calls = _ctx(state)
+    # NOT NULL with no DEFAULT on the target: the omit-only note is drawn as a "(!)" line,
+    # so its origin wording is visible (and a revert of the adopted label is caught).
+    ddl = ('CREATE TABLE "shop"."t" ("id" BIGINT NOT NULL, "a" TEXT NOT NULL, "b" TEXT, '
+           'PRIMARY KEY ("id"))')
+    applied = {"shop.t": SimpleNamespace(target_ddl=ddl, foreign_key_ddls=[],
+                                         preserved_foreign_keys=[], index_ddls=[])}
+    inputs = ExclusionInputs(selected=list(NAMES), applied=applied, preserve_foreign_keys=True,
+                             migratable=list(NAMES), signature=("s",))
+    ctx2.inputs_fn = lambda: inputs
     state.job_id = None
     open_exclusion_dialog(edit_ui, ctx2, mode="edit")
     assert any("1 more omit-only (1 adopted from the attached CDC stack; no target change)" in t
                for t in edit_ui.texts)
+    assert any(t.startswith("(!) shop.t.a  Omit-only (adopted from the attached CDC stack)")
+               for t in edit_ui.texts)
+    assert not any("before v0.1.562" in t for t in edit_ui.texts)
 
 
 def test_a_ticked_legacy_table_joins_the_reload_and_becomes_overlay():
@@ -1372,6 +1411,67 @@ def test_a_streamed_stack_with_another_set_keeps_the_deployed_value_as_what_cdc_
     assert any(t.startswith("This session would exclude shop.t.a; Start CDC refuses to send it.")
                for t in ui.texts)
     assert not any("Start CDC sends the value above" in t for t in ui.texts)
+
+
+def _summary_state(phase, *, offset, deployed):
+    from dsql_migrator.core.models import TableSelection
+
+    state = DataMigrationState()
+    state.set_selection(TableSelection(selected_tables=[t.name for t in INV.tables]))
+    state.restore_lob_exclusion("shop.t", "a")
+    state.cdc_stack_name = "dsql-cdc-x"
+    state.set_cdc_stack_phase(phase, status="UPDATE_COMPLETE")
+    state.cdc_has_committed_offset = offset
+    state.set_cdc_deployed_column_exclude_list(deployed)
+    return state
+
+
+def test_a_stopped_streamed_stack_with_a_refused_set_heads_with_the_deployed_value():
+    # The mismatch branch alone (no live connectors): never "Start CDC sends <refused>".
+    from dsql_migrator.core.models import SourceInventory
+    from dsql_migrator.ui.data_migration._cdc_ui import _render_cdc_exclusion_summary
+
+    state = _summary_state("infra", offset=True, deployed="shop.t.b")
+    ui = _Ui()
+    _render_cdc_exclusion_summary(ui, state, SimpleNamespace(get_status=_none),
+                                  SourceInventory(tables=list(INV.tables)))
+    assert any(t.endswith("as deployed)") for t in ui.expansions if t.startswith("What CDC"))
+    assert any("Start CDC refuses to send it" in t for t in ui.texts)
+
+
+def test_running_connectors_head_with_the_deployed_value_even_without_a_refusal(monkeypatch):
+    # The live branch alone: the running connector uses the deployed value.
+    from dsql_migrator.core.models import SourceInventory
+    from dsql_migrator.ui.data_migration import _cdc_ui
+    from dsql_migrator.ui.data_migration._cdc_ui import _render_cdc_exclusion_summary
+
+    monkeypatch.setattr(_cdc_ui, "capture_exclusion_mismatch", lambda *a, **k: None)
+    state = _summary_state("running", offset=False, deployed="shop.t.b")
+    ui = _Ui()
+    _render_cdc_exclusion_summary(ui, state, SimpleNamespace(get_status=_none),
+                                  SourceInventory(tables=list(INV.tables)))
+    assert any(t.endswith("as deployed)") for t in ui.expansions if t.startswith("What CDC"))
+    assert "shop.t.b" in ui.texts
+    assert any(t.startswith("The next Start CDC sends: shop.t.a") for t in ui.texts)
+
+
+def test_the_row_still_drifts_for_a_stored_entry_whose_table_left_the_inventory():
+    # The row passes migratable=: an unticked table is not drift, a vanished one is.
+    state = DataMigrationState()
+    state.restore_lob_exclusion("shop.t", "a")
+    state.restore_exclusion_rules("exclude shop.t.a", ())
+    ctx, _calls = _ctx(state)
+    gone = [n for n in NAMES if n != "shop.t"]
+    ctx.inputs_fn = lambda: ExclusionInputs(selected=gone, applied={}, preserve_foreign_keys=True,
+                                            migratable=gone, signature=("s",))
+    row_ui = _Ui()
+    render_exclusion_button_row(row_ui, ctx)
+    assert state.exclusion_drift_text() is not None
+    unticked = _Ui()
+    ctx.inputs_fn = lambda: ExclusionInputs(selected=gone, applied={}, preserve_foreign_keys=True,
+                                            migratable=list(NAMES), signature=("s2",))
+    render_exclusion_button_row(unticked, ctx)
+    assert state.exclusion_drift_text() is None
 
 
 def test_saved_entry_notes_stay_visible_after_the_lock():

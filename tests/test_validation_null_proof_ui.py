@@ -333,7 +333,9 @@ def test_a_zero_count_omit_only_column_is_null_not_default():
     assert "Excluded omit-only, NULL in every row: a (old)" in text
     only_zero, report0 = _summary(_item("b", counts={}, legacy={"old": 0}, excluded=("old",)))
     assert only_zero.legacy_values == {}
-    assert "keep the target DEFAULT" not in verdict_evidence_caveats(only_zero, report0)
+    caveat = verdict_evidence_caveats(only_zero, report0)
+    assert "keep the target DEFAULT" not in caveat and "NULL not proven" not in caveat
+    assert "NULL in every row (omit-only) in 1 table(s)" in caveat
     assert uiv._excluded_cell(report0.items[0]) == uiv._cell("NULL", "ok")
 
 

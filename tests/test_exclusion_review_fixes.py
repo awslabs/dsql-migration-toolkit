@@ -625,3 +625,51 @@ def test_the_start_and_deploy_notes_count_only_still_unselected_provenance():
         signature=("s",))
     assert any("1 table unselected by your rules is not loaded" in text
                for _tone, text in start_dialog_exclusion_notes(state))
+
+
+
+def test_the_dlq_ai_facts_are_wired_into_the_chat_with_the_job_manager(monkeypatch):
+    # Regression check: the helper alone was tested; pin its use in _cdc_dlq_facts and
+    # that the panel passes the job manager (else the lock line silently disappears).
+    import inspect
+    from types import SimpleNamespace
+
+    import dsql_migrator.ui.data_migration._cdc_status as cdc_status
+    from dsql_migrator.ui.data_migration import DataMigrationState, MigrationType
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as mon
+    from tests.test_ui_data_migration import _StubJobManager
+
+    monkeypatch.setattr(cdc_status, "cdc_dlq_records", lambda _state, _key: [])
+    state = DataMigrationState()
+    state.migration_type = MigrationType.CDC_ONLY
+    state._session = SimpleNamespace(source_config=None, restored_source_type=None)
+    state.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
+    facts = mon._cdc_dlq_facts(state, "k", _StubJobManager({}))
+    assert "Migration type: CDC only." in facts
+    assert "Exclusion lock (authoritative; give the operator THESE steps): " in facts
+    src = inspect.getsource(mon._render_cdc_dlq_panel)
+    assert "_cdc_dlq_facts(migration_state, k, job_manager)" in src
+
+
+def test_run_checks_snapshots_the_selection_before_its_first_await():
+    # Regression check: the pin compares against the selection at CLICK time; a snapshot
+    # taken after the await would let the pin undo a Save made during the run.
+    import ast
+    import pathlib
+
+    import dsql_migrator.ui.data_migration as dm
+
+    tree = ast.parse(pathlib.Path(dm.__file__).read_text(encoding="utf-8"))
+    (fn,) = [n for n in ast.walk(tree)
+             if isinstance(n, ast.AsyncFunctionDef) and n.name == "run_checks"]
+    snaps = [n for n in ast.walk(fn) if isinstance(n, ast.Assign)
+             and isinstance(n.value, ast.Call) and getattr(n.value.func, "attr", None)
+             == "selection_snapshot"]
+    (snap,) = snaps
+    name = snap.targets[0].id
+    first_await = min(n.lineno for n in ast.walk(fn) if isinstance(n, ast.Await))
+    assert snap.lineno < first_await
+    (pin,) = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+              and getattr(n.func, "attr", None) == "pin_checked_selection"]
+    (kw,) = [k for k in pin.keywords if k.arg == "expected"]
+    assert isinstance(kw.value, ast.Name) and kw.value.id == name
