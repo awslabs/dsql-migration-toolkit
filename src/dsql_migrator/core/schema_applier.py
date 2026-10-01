@@ -45,6 +45,7 @@ from __future__ import annotations
 import random
 import re
 import time
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Protocol, Sequence
 
 from psycopg import sql
@@ -1099,6 +1100,15 @@ def build_overlay_statements(
     return out
 
 
+@lru_cache(maxsize=4096)
+def _generated_columns_folded(create_ddl: str) -> frozenset:
+    """The applied DDL's GENERATED columns, cached by text: the popup previews every
+    matched table on each render, and the converter's reader is uncached."""
+    from dsql_migrator.core.converter import parse_target_generated_columns
+
+    return frozenset(parse_target_generated_columns(create_ddl, folded=True))
+
+
 def ddl_column_facts(
     create_ddl: str, columns: "Sequence[str]"
 ) -> "Optional[dict[str, Optional[ColumnNullFacts]]]":
@@ -1111,7 +1121,6 @@ def ddl_column_facts(
     """
     from dsql_migrator.core.converter import (
         parse_target_column_constraints,
-        parse_target_generated_columns,
         parse_target_identity_columns,
     )
     from dsql_migrator.core.target_introspector import ColumnNullFacts
@@ -1119,7 +1128,7 @@ def ddl_column_facts(
     constraints = parse_target_column_constraints(create_ddl)
     if not constraints:
         return None
-    generated = parse_target_generated_columns(create_ddl, folded=True)
+    generated = _generated_columns_folded(create_ddl)
     identity = parse_target_identity_columns(create_ddl)
     out: dict[str, Optional[ColumnNullFacts]] = {}
     for column in columns:

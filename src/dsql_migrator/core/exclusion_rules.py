@@ -34,6 +34,20 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable, Collection, Mapping, Optional, Sequence
 
 from dsql_migrator.core.assessor import _base_type
+from dsql_migrator.core.column_exclusion import (
+    B1,
+    B2,
+    B3,
+    B4,
+    T2,
+    T3,
+    ExclusionContext,
+    ExclusionFinding,
+    column_exclusion_verdict,
+    column_exclusion_warnings,
+    missing_target_columns,
+    table_exclusion_findings,
+)
 from dsql_migrator.core.models import SourceType
 
 if TYPE_CHECKING:
@@ -57,7 +71,8 @@ class Suggestion:
 @dataclass(frozen=True)
 class RuleError:
     """One problem on one line. ``name_index`` is the failing name's position in a
-    ``type:`` list (``None`` for every other error)."""
+    ``type:`` list (``None`` for every other error). A GLOBAL error (``line`` 0, not tied
+    to a line) offers suggestions whose ``line_text`` is a line to APPEND."""
 
     code: str
     line: int
@@ -531,6 +546,12 @@ def hint_for(
 # the line, a warning describes an excluded column), so neither copy nor tests can collide.
 LINE_ONLY_UNSELECTED = "only_unselected"  # a warning: every match is on an unselected table
 LINE_NO_EFFECT = "no_effect"  # an include that cancels nothing
+LINE_ONLY_BLOCKED = "only_blocked"  # every candidate this line names is blocked (B1-B4)
+
+# Short labels for a blocked candidate (the full reason is the verdict's message).
+_BLOCKED_LABELS = {
+    B1: "primary key", B2: "target key", B3: "referenced by a foreign key", B4: "computed",
+}
 
 @dataclass(frozen=True)
 class Cancellation:
@@ -541,6 +562,8 @@ class Cancellation:
     exclude_line: int
     kind: str
     items: tuple
+    # "L5 include type:varchar re-includes shop.users.password_hash excluded by L2"
+    text: str = ""
 
 
 @dataclass(frozen=True)
@@ -562,6 +585,59 @@ class LineStatus:
     notes: "tuple[str, ...]" = ()
     # (key, columns, tables) per type a type: line resolved, over the tables in scope.
     type_counts: "tuple[tuple[str, int, int], ...]" = ()
+    # Candidates of an exclude line that are blocked (never stored), and their labels.
+    blocked: int = 0
+    blocked_labels: "tuple[str, ...]" = ()
+
+
+@dataclass(frozen=True)
+class BlockedItem:
+    """A candidate column that cannot be excluded (B1-B4); reported, never stored."""
+
+    table: str
+    column: str
+    lines: "tuple[int, ...]"
+    findings: "tuple[ExclusionFinding, ...]"
+    labels: "tuple[str, ...]"
+
+
+@dataclass(frozen=True)
+class TargetChange:
+    """The overlay ALTERs a Save shows for one table (they run at Start), and the DEFAULTs
+    Cut over restores. ``note`` replaces the statements when they cannot be known."""
+
+    table: str
+    statements: "tuple[str, ...]" = ()
+    restores: "tuple[tuple[str, str], ...]" = ()
+    note: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ReviewItem:
+    """One row of the popup's Review-all list. ``kind``: ``unselected`` (a table),
+    ``excluded``, ``blocked`` or ``kept`` (a column). ``why`` explains it; ``changes`` are
+    the target statements for an excluded column; ``warning`` flags a W/T warning."""
+
+    kind: str
+    table: str
+    column: Optional[str]
+    lines: "tuple[int, ...]"
+    why: "tuple[str, ...]" = ()
+    changes: "tuple[str, ...]" = ()
+    warning: bool = False
+
+
+@dataclass(frozen=True)
+class ResolutionDiff:
+    """What a Save changes against the stored set: per-table added/removed columns, the
+    table moves, the one-line ``text`` and every cancellation (``lines``)."""
+
+    added: "Mapping[str, tuple[str, ...]]"
+    removed: "Mapping[str, tuple[str, ...]]"
+    unselects: "tuple[str, ...]"
+    reselects: "tuple[str, ...]"
+    text: str
+    lines: "tuple[str, ...]"
 
 
 @dataclass(frozen=True)
@@ -585,6 +661,12 @@ class RuleResolution:
     selected_after: "Optional[tuple[str, ...]]"
     rule_excluded_after: "frozenset[str]"
     line_status: "Mapping[int, LineStatus]"
+    blocked: "tuple[BlockedItem, ...]" = ()
+    warnings: "Mapping[tuple[str, str], tuple[ExclusionFinding, ...]]" = ()
+    retained_legacy: "Mapping[str, frozenset[str]]" = ()
+    target_changes: "tuple[TargetChange, ...]" = ()
+    items: "tuple[ReviewItem, ...]" = ()
+    diff: "Optional[ResolutionDiff]" = None
 
     @property
     def can_save(self) -> bool:
@@ -723,6 +805,11 @@ def resolve_exclusion_rules(
     rule_excluded_prev: "Collection[str]" = (),
     selection_lock_reason: Optional[str] = None,
     retick_overrides: "Collection[str]" = (),
+    context_factory: "Optional[Callable[[Sequence[str], Collection[str]], ExclusionContext]]" = None,
+    applied_conversions: "Optional[Mapping[str, object]]" = None,
+    live_columns: "Optional[Mapping[str, Collection[str]]]" = None,
+    legacy: "Optional[Mapping[str, Collection[str]]]" = None,
+    stored_columns: "Optional[Mapping[str, Collection[str]]]" = None,
 ) -> RuleResolution:
     """Resolve rule ``text`` against the ``migratable`` tables (the tree's universe, in its
     order). Include wins and line order never matters: per domain (tables; columns),
@@ -744,7 +831,17 @@ def resolve_exclusion_rules(
 
     While ``selection_lock_reason`` holds, a table line that would change the selection is
     E3, and a re-selection no line causes (a deleted rule) is a global E3. A result that
-    would leave no table selected is the global error E5. Pure.
+    would leave no table selected is the global error E5.
+
+    Eligibility: ``context_factory(selected', candidate tables)`` builds the ONE context
+    (called once, so B3 is judged against the selection AFTER this Save); a BLOCKED
+    candidate is reported and never stored, the rest carry their W1-W6 warnings. E4: a
+    ``:`` in the table of a stored column (the session stores ``table:column``), and,
+    with ``applied_conversions``, a source column the applied DDL lacks that is not
+    excluded -- a certain 42703 only (``live_columns`` lets a column the live target
+    still has through), offering the rule, never applying it. ``target_changes`` preview
+    the overlay over the stored set minus the ``legacy`` (omit-only) entries it keeps;
+    ``diff`` compares with ``stored_columns``. Pure.
     """
     rules, parsed_errors = parse_rules(text)
     source_lines = [raw[:-1] if raw.endswith("\r") else raw for raw in (text or "").split("\n")]
@@ -840,14 +937,31 @@ def resolve_exclusion_rules(
     columns: dict[str, set[str]] = {}
     excluded_by: dict = {}
     kept_by: dict = {}
+    candidates: dict = {}
     for item, lines in excl_c.items():
         if item[0] not in after_set:
             continue
         if item in incl_c:
             kept_by[item] = tuple(sorted(incl_c[item]))
         else:
-            columns.setdefault(item[0], set()).add(item[1])
-            excluded_by[item] = tuple(sorted(lines))
+            candidates[item] = tuple(sorted(lines))
+    ctx = None
+    if context_factory is not None:
+        ctx = context_factory(after, {t for t, _c in candidates})
+    blocked: dict = {}
+    warnings: dict = {}
+    for item, lines in candidates.items():
+        verdict = column_exclusion_verdict(item[0], item[1], ctx) if ctx is not None else None
+        if verdict is not None and verdict.blocked:
+            labels = tuple(dict.fromkeys(_BLOCKED_LABELS[f.code] for f in verdict.findings))
+            blocked[item] = BlockedItem(item[0], item[1], lines, verdict.findings, labels)
+            continue
+        columns.setdefault(item[0], set()).add(item[1])
+        excluded_by[item] = lines
+        if ctx is not None:
+            found = column_exclusion_warnings(item[0], item[1], ctx)
+            if found:
+                warnings[item] = found
 
     cancel: dict = {}
     for kind, hits_by_line, excl, in_scope in (
@@ -861,8 +975,14 @@ def resolve_exclusion_rules(
                 if in_scope(item):
                     for exclude_line in excl.get(item, ()):
                         cancel.setdefault((line, exclude_line, kind), []).append(item)
+    def _cancel_text(include_line: int, exclude_line: int, kind: str, items) -> str:
+        shown = [n if kind == "table" else f"{n[0]}.{n[1]}" for n in items]
+        return (f"L{include_line} {rules[include_line].rule_text.strip()} re-includes "
+                f"{_names(shown)} excluded by L{exclude_line}")
+
     cancellations = tuple(
-        Cancellation(i, x, kind, tuple(items)) for (i, x, kind), items in sorted(cancel.items()))
+        Cancellation(i, x, kind, tuple(items), _cancel_text(i, x, kind, items))
+        for (i, x, kind), items in sorted(cancel.items()))
 
     def _kept_counts(line: int) -> tuple:
         counts: dict[int, int] = {}
@@ -910,6 +1030,7 @@ def resolve_exclusion_rules(
             else:
                 kept = [n for n in hits_t if n in excl_t and n in reach]
                 line_reselects = tuple(n for n in kept if n in reselect_set)
+                notes.extend(c.text for c in cancellations if c.include_line == line)
                 if not kept:
                     codes.append(LINE_NO_EFFECT)
                 status = LineStatus(line, rule.action, rule.kind, keeps=len(kept),
@@ -945,13 +1066,21 @@ def resolve_exclusion_rules(
                     for key in dict.fromkeys(resolved.values()))
                 notes.extend(_hint_notes(rule, resolved, scope_counts, source_type))
             if rule.action == "exclude":
+                named = [i for i in in_scope if i not in incl_c]
+                line_blocked = [blocked[i] for i in named if i in blocked]
+                blocked_labels = tuple(dict.fromkeys(
+                    label for b in line_blocked for label in b.labels))
+                if line_blocked and len(line_blocked) == len(named):
+                    codes.append(LINE_ONLY_BLOCKED)
                 status = LineStatus(line, rule.action, rule.kind,
-                                    matched=sum(1 for i in in_scope if i not in incl_c),
-                                    kept_by=_kept_counts(line))
+                                    matched=len(named) - len(line_blocked),
+                                    kept_by=_kept_counts(line), blocked=len(line_blocked),
+                                    blocked_labels=blocked_labels)
             else:
                 kept_n = sum(1 for i in in_scope if i in excl_c)
                 if not kept_n:
                     codes.append(LINE_NO_EFFECT)
+                notes.extend(c.text for c in cancellations if c.include_line == line)
                 status = LineStatus(line, rule.action, rule.kind, keeps=kept_n)
         line_status[line] = replace(status, codes=tuple(codes), notes=tuple(notes),
                                     type_counts=type_counts if rule.kind != "table" else ())
@@ -970,6 +1099,27 @@ def resolve_exclusion_rules(
         global_errors.append(RuleError(
             "E5", 0, "These rules would leave no table to migrate: keep at least one table "
             "selected."))
+    for item, lines in sorted(excluded_by.items()):
+        if ":" in item[0]:
+            for line in lines:
+                errors.setdefault(line, []).append(RuleError(
+                    "E4", line,
+                    f'{item[0]} contains ":", which a saved column exclusion cannot hold (it is '
+                    'stored as table:column). Exclude the whole table, or remove this rule.'))
+    if applied_conversions:
+        missing = _certain_missing(after, tables, applied_conversions, columns, live_columns)
+        if missing:
+            global_errors.append(missing)
+
+    retained = {
+        t: frozenset(cs & set(legacy.get(t, ()))) for t, cs in columns.items()
+        if legacy and cs & set(legacy.get(t, ()))
+    }
+    target_changes = _target_changes(
+        [t for t in order if t in columns], columns, retained, applied_conversions)
+    items = _review_items(order, new_rule, table_hits, rules, excluded_by, warnings, blocked,
+                          kept_by, target_changes, ctx)
+    diff = _diff(columns, stored_columns or {}, unselect, reselect, cancellations)
 
     return RuleResolution(
         rules=dict(sorted(rules.items())),
@@ -984,16 +1134,152 @@ def resolve_exclusion_rules(
         selected_after=tuple(after) if changed else None,
         rule_excluded_after=rule_excluded_after,
         line_status=line_status,
+        blocked=tuple(blocked[i] for i in sorted(blocked)),
+        warnings=warnings,
+        retained_legacy=retained,
+        target_changes=target_changes,
+        items=items,
+        diff=diff,
     )
+
+
+def _certain_missing(after, tables, applied, columns, live) -> "Optional[RuleError]":
+    """The global E4 for source columns the applied DDL lacks and the rules do not
+    exclude -- only a CERTAIN 42703: a column the live target still has gets through, as
+    in missing_column_block_reason. Offers each column's rule, never applies it (D6)."""
+    missing = missing_target_columns([tables[n] for n in after], applied, columns)
+    if live:
+        missing = {t: kept for t, cols in missing.items()
+                   if (kept := tuple(c for c in cols if c not in live.get(t, ())))}
+    pairs = [(t, c) for t, cols in missing.items() for c in cols]
+    if not pairs:
+        return None
+    shown = [f"{t}.{c}" for t, c in pairs]
+    many = len(pairs) > 1
+    them = "them" if many else "it"
+    suggestions = []
+    for t, c in pairs:
+        schema, _sep, rest = t.partition(".")
+        line = "exclude " + ".".join(rule_part_token(x) for x in (schema, rest, c))
+        suggestions.append(Suggestion(f"+ add rule: {line}", line))
+    return RuleError(
+        "E4", 0,
+        f"{_names(shown)} {'are' if many else 'is'} not in your Aurora DSQL "
+        f"table{'s' if len(missing) > 1 else ''}; writing {them} would fail (42703, undefined "
+        f"column). Add {them} back to the target DDL in Schema Conversion, or exclude {them}.",
+        tuple(suggestions),
+    )
+
+
+def _target_changes(tables_in_order, columns, retained, applied) -> "tuple[TargetChange, ...]":
+    """The overlay preview over the stored set minus the retained legacy (omit-only)
+    entries, through THE builder the Start dialogs use, fed the applied DDL's facts."""
+    if applied is None:
+        return ()
+    from dsql_migrator.core.schema_applier import (
+        OverlayRefusedError,
+        build_overlay_statements,
+        ddl_column_facts,
+    )
+
+    changes = []
+    for table in tables_in_order:
+        cols = sorted(columns[table] - retained.get(table, frozenset()))
+        if not cols:
+            continue
+        ddl = getattr(applied.get(table), "target_ddl", None) or ""
+        facts = ddl_column_facts(ddl, cols) if ddl else None
+        if facts is None:
+            changes.append(TargetChange(table, note=(
+                f"Cannot read the Aurora DSQL DDL of {table}: the changes are decided when "
+                "the migration starts.")))
+            continue
+        try:
+            statements = build_overlay_statements(table, facts)
+        except OverlayRefusedError as exc:  # the B4 backstop; the rule already blocks it
+            changes.append(TargetChange(table, note=str(exc)))
+            continue
+        restores = tuple((c, facts[c].default_expr) for c in cols
+                         if facts[c] is not None and facts[c].default_expr is not None)
+        changes.append(TargetChange(table, tuple(s.text() for s in statements), restores))
+    return tuple(changes)
+
+
+_KIND_ORDER = {"unselected": 0, "excluded": 1, "blocked": 2, "kept": 3}
+
+
+def _review_items(order, new_rule, table_hits, rules, excluded_by, warnings, blocked,
+                  kept_by, target_changes, ctx) -> "tuple[ReviewItem, ...]":
+    """The ONE Review-all list: rule-unselected tables, then each column the rules name."""
+    rank = {n: i for i, n in enumerate(order)}
+    items: list[ReviewItem] = []
+    for table in order:
+        if table not in new_rule:
+            continue
+        lines = tuple(n for n, hits in sorted(table_hits.items())
+                      if rules[n].action == "exclude" and table in hits)
+        found = table_exclusion_findings(table, ctx) if ctx is not None else ()
+        items.append(ReviewItem("unselected", table, None, lines,
+                                tuple(f.message for f in found),
+                                warning=any(f.code in (T2, T3) for f in found)))
+    statements: dict = {}
+    for change in target_changes:
+        for text in change.statements:
+            for column in _columns_named_in(text):
+                statements.setdefault((change.table, column), []).append(text)
+    for (table, column), lines in excluded_by.items():
+        found = warnings.get((table, column), ())
+        items.append(ReviewItem("excluded", table, column, lines,
+                                tuple(f.message for f in found),
+                                tuple(statements.get((table, column), ())), bool(found)))
+    for (table, column), item in blocked.items():
+        items.append(ReviewItem("blocked", table, column, item.lines,
+                                tuple(f.message for f in item.findings)))
+    for (table, column), lines in kept_by.items():
+        on = ", ".join(f"L{n}" for n in lines)
+        items.append(ReviewItem("kept", table, column, lines, (f"Kept by include on {on}.",)))
+    items.sort(key=lambda i: (_KIND_ORDER[i.kind], rank.get(i.table, len(rank)), i.table,
+                              i.column or ""))
+    return tuple(items)
+
+
+def _columns_named_in(statement: str) -> "tuple[str, ...]":
+    """The column an overlay ``ALTER TABLE t ALTER COLUMN "c" ...`` statement names."""
+    match = re.search(r'ALTER COLUMN ("(?:[^"]|"")*")', statement)
+    return (match.group(1)[1:-1].replace('""', '"'),) if match else ()
+
+
+def _diff(columns, stored, unselect, reselect, cancellations) -> ResolutionDiff:
+    added: dict = {}
+    removed: dict = {}
+    for table in sorted(set(columns) | set(stored)):
+        now = set(columns.get(table, ()))
+        before = set(stored.get(table, ()) or ())
+        if now - before:
+            added[table] = tuple(sorted(now - before))
+        if before - now:
+            removed[table] = tuple(sorted(before - now))
+    n_added = sum(len(c) for c in added.values())
+    n_removed = sum(len(c) for c in removed.values())
+    text = f"+{_plural(n_added, 'column')}, -{n_removed}"
+    if unselect or reselect:
+        text += f"; unselects {_plural(len(unselect), 'table')}, re-selects {len(reselect)}"
+    return ResolutionDiff(added, removed, tuple(unselect), tuple(reselect), text,
+                          (text, *(c.text for c in cancellations)))
 
 
 __all__ = [
     "LINE_NO_EFFECT",
+    "LINE_ONLY_BLOCKED",
     "LINE_ONLY_UNSELECTED",
+    "BlockedItem",
     "Cancellation",
     "LineStatus",
     "ParsedRule",
+    "ResolutionDiff",
+    "ReviewItem",
     "RuleResolution",
+    "TargetChange",
     "RuleError",
     "RulePart",
     "Suggestion",

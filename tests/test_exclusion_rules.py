@@ -705,3 +705,208 @@ def test_name_misses_name_the_first_failing_level():
     assert error.message == 'No table matching "zz*" in schema shop.' and error.suggestions == ()
     (error,) = _res('exclude "my schema"."order.itemz".x').errors[1]
     assert [s.line_text for s in error.suggestions] == ['exclude "my schema"."order.items".x']
+
+
+# --- P3-C06: eligibility, E4, 42703, target changes, review items, Save diff ---------
+
+from types import SimpleNamespace  # noqa: E402
+
+from dsql_migrator.core.column_exclusion import build_exclusion_context  # noqa: E402
+from dsql_migrator.core.exclusion_rules import LINE_ONLY_BLOCKED  # noqa: E402
+from dsql_migrator.core.models import ForeignKeyDef, SourceInventory  # noqa: E402
+
+_CUST_DDL = ('CREATE TABLE "shop"."customers" ("id" BIGINT NOT NULL, "code" TEXT NOT NULL, '
+             '"name" TEXT DEFAULT \'n/a\', PRIMARY KEY ("id"))')
+_ORD_DDL = ('CREATE TABLE "shop"."orders" ("region" TEXT NOT NULL, "id" BIGINT NOT NULL, '
+            '"cust_code" TEXT, "price" NUMERIC NOT NULL DEFAULT 0, "total" NUMERIC GENERATED '
+            'ALWAYS AS (price * 2) STORED, "note" TEXT, PRIMARY KEY ("region", "id"))')
+_FK = ('ALTER TABLE "shop"."orders" ADD CONSTRAINT "fk_cust" FOREIGN KEY ("cust_code") '
+       'REFERENCES "shop"."customers" ("code") NOT VALID')
+
+
+def _shop(ddls=None, odd_names=False):
+    customers = TableDef(name="shop.customers", primary_key=["id"], columns=[
+        ColumnDef(name="id", mysql_type="bigint"), ColumnDef(name="code", mysql_type="text"),
+        ColumnDef(name="name", mysql_type="text")])
+    orders = TableDef(name="shop.orders", primary_key=["id"], columns=[
+        ColumnDef(name="region", mysql_type="text"), ColumnDef(name="id", mysql_type="bigint"),
+        ColumnDef(name="cust_code", mysql_type="text"), ColumnDef(name="price", mysql_type="numeric"),
+        ColumnDef(name="total", mysql_type="numeric", generated=True,
+                  generated_expression="(price * (2)::numeric)"),
+        ColumnDef(name="note", mysql_type="text")],
+        foreign_keys=[ForeignKeyDef(name="fk_cust", columns=["cust_code"],
+                                    referenced_table="shop.customers", referenced_columns=["code"])])
+    tables = [customers, orders]
+    if odd_names:
+        tables.append(TableDef(name="shop.we:ird", primary_key=["id"], columns=[
+            ColumnDef(name="id", mysql_type="bigint"), ColumnDef(name="x", mysql_type="text")]))
+        tables.append(TableDef(name="shop.plain", primary_key=["id"], columns=[
+            ColumnDef(name="id", mysql_type="bigint"), ColumnDef(name="a:b", mysql_type="text"),
+            ColumnDef(name="c,d", mysql_type="text")]))
+    ddls = ddls if ddls is not None else {"shop.customers": _CUST_DDL, "shop.orders": _ORD_DDL}
+    applied = {
+        name: SimpleNamespace(target_ddl=ddl, foreign_key_ddls=[_FK] if name == "shop.orders" else [],
+                              preserved_foreign_keys=next(t for t in tables if t.name == name).foreign_keys,
+                              index_ddls=[])
+        for name, ddl in ddls.items()
+    }
+    return tables, applied
+
+
+def _full(text, *, tables=None, applied=None, selection=None, live=None, stored=None,
+          legacy=None, calls=None, prev=()):
+    if tables is None:
+        tables, applied = _shop()
+    inventory = SourceInventory(tables=tables)
+
+    def factory(selected, focus):
+        if calls is not None:
+            calls.append((tuple(selected), tuple(sorted(focus))))
+        return build_exclusion_context(inventory, applied, selected_tables=selected,
+                                       focus_tables=focus, warnings=True)
+
+    return resolve_exclusion_rules(
+        text, migratable=tables, source_type=MY,
+        effective_selection=selection if selection is not None else [t.name for t in tables],
+        rule_excluded_prev=prev, context_factory=factory, applied_conversions=applied,
+        live_columns=live, legacy=legacy, stored_columns=stored)
+
+
+def test_blocked_columns_are_reported_and_never_stored():
+    calls = []
+    res = _full("exclude shop.customers.code\nexclude shop.orders.region\nexclude shop.orders.total\n"
+                "exclude *.*.id", calls=calls)
+    assert res.columns == {} and res.can_save
+    assert len(calls) == 1 and calls[0][0] == ("shop.customers", "shop.orders")
+    labels = {(b.table, b.column): b.labels for b in res.blocked}
+    assert labels == {
+        ("shop.customers", "code"): ("referenced by a foreign key",),
+        ("shop.orders", "region"): ("target key",),
+        ("shop.orders", "total"): ("computed",),
+        ("shop.customers", "id"): ("primary key",),
+        ("shop.orders", "id"): ("primary key",),
+    }
+    st = res.line_status
+    assert all(LINE_ONLY_BLOCKED in st[n].codes for n in (1, 2, 3, 4))
+    assert (st[4].blocked, st[4].blocked_labels) == (2, ("primary key",))
+    assert next(b for b in res.blocked if b.column == "code").lines == (1,)
+
+
+def test_b3_is_freed_when_this_save_unselects_the_only_referencing_child():
+    calls = []
+    res = _full("exclude shop.customers.code\nexclude table shop.orders", calls=calls)
+    assert res.columns == {"shop.customers": frozenset({"code"})}
+    assert calls[0][0] == ("shop.customers",)
+
+
+def test_colon_in_a_table_name_is_e4_but_not_in_a_column_name_and_commas_are_fine():
+    tables, applied = _shop(odd_names=True)
+    res = _full("exclude shop.we:ird.x", tables=tables, applied=applied)
+    (error,) = res.errors[1]
+    assert error.code == "E4" and '":"' in error.message and not res.can_save
+    ok = _full('exclude shop.plain."a:b"\nexclude shop.plain."c,d"', tables=tables, applied=applied)
+    assert ok.can_save and ok.columns == {"shop.plain": frozenset({"a:b", "c,d"})}
+    # a table rule on it is representable: the selection stores the name as is
+    assert _full("exclude table shop.we:ird", tables=tables, applied=applied).can_save
+
+
+def test_42703_blocks_only_a_certain_failure_and_offers_a_rule():
+    ddls = {"shop.customers": _CUST_DDL.replace(', "name" TEXT DEFAULT \'n/a\'', ""),
+            "shop.orders": _ORD_DDL}
+    tables, applied = _shop(ddls=ddls)
+    res = _full("", tables=tables, applied=applied)
+    (error,) = res.global_errors
+    assert error.code == "E4" and "shop.customers.name" in error.message and "42703" in error.message
+    assert [s.line_text for s in error.suggestions] == ["exclude shop.customers.name"]
+    assert not res.can_save
+    assert _full("exclude shop.customers.name", tables=tables, applied=applied).can_save
+    live = {"shop.customers": frozenset({"id", "code", "name"})}
+    assert _full("", tables=tables, applied=applied, live=live).can_save
+
+
+def test_target_changes_match_the_start_dialog_builder():
+    from dsql_migrator.core.schema_applier import build_overlay_statements, ddl_column_facts
+
+    res = _full("exclude shop.orders.price\nexclude shop.orders.note\nexclude shop.customers.name")
+    by_table = {c.table: c for c in res.target_changes}
+    expected = build_overlay_statements(
+        "shop.orders", ddl_column_facts(_ORD_DDL, ["note", "price"]))
+    assert by_table["shop.orders"].statements == tuple(s.text() for s in expected)
+    assert [s.split(" ALTER COLUMN ")[1] for s in by_table["shop.orders"].statements] == [
+        '"price" DROP NOT NULL', '"price" DROP DEFAULT']
+    assert by_table["shop.orders"].restores == (("price", "0"),)
+    assert by_table["shop.customers"].restores == (("name", "'n/a'"),)
+
+
+def test_an_unreadable_ddl_says_so_never_nothing_to_do():
+    tables, applied = _shop(ddls={"shop.customers": "not a create table", "shop.orders": _ORD_DDL})
+    res = _full("exclude shop.customers.name", tables=tables, applied=applied)
+    (change,) = [c for c in res.target_changes if c.table == "shop.customers"]
+    assert change.statements == () and change.note == (
+        "Cannot read the Aurora DSQL DDL of shop.customers: the changes are decided when the "
+        "migration starts.")
+
+
+def test_retained_legacy_entries_stay_excluded_without_an_overlay():
+    res = _full("exclude shop.orders.price\nexclude shop.orders.note",
+                legacy={"shop.orders": {"price"}})
+    assert res.columns == {"shop.orders": frozenset({"price", "note"})}
+    assert res.retained_legacy == {"shop.orders": frozenset({"price"})}
+    assert all(c.table != "shop.orders" or not c.statements for c in res.target_changes)
+
+
+def test_review_items_and_the_save_diff():
+    res = _full(
+        "exclude shop.orders.note\nexclude shop.orders.price\ninclude shop.orders.price\n"
+        "exclude shop.orders.id\nexclude table shop.customers",
+        stored={"shop.orders": {"cust_code"}})
+    kinds = {(i.kind, i.table, i.column) for i in res.items}
+    assert kinds == {
+        ("unselected", "shop.customers", None), ("excluded", "shop.orders", "note"),
+        ("kept", "shop.orders", "price"), ("blocked", "shop.orders", "id"),
+    }
+    kept = next(i for i in res.items if i.kind == "kept")
+    assert kept.lines == (3,) and kept.why == ("Kept by include on L3.",)
+    unselected = next(i for i in res.items if i.kind == "unselected")
+    assert unselected.why[0].startswith("Not loaded by this migration")
+    assert res.diff.added == {"shop.orders": ("note",)}
+    assert res.diff.removed == {"shop.orders": ("cust_code",)}
+    assert res.diff.text == "+1 column, -1; unselects 1 table, re-selects 0"
+    assert ("L3 include shop.orders.price re-includes shop.orders.price excluded by L2"
+            in res.diff.lines)
+
+
+def test_column_only_diff_text_and_a_warning_flag():
+    res = _full("exclude shop.orders.price", stored={})
+    assert res.diff.text == "+1 column, -0"
+    (item,) = [i for i in res.items if i.kind == "excluded"]
+    assert item.warning and any("NOT NULL" in w for w in item.why)
+
+
+def test_each_ddl_is_read_once_per_resolve_and_not_again(monkeypatch):
+    import sqlglot
+
+    names = [f"s.t{i:04d}" for i in range(300)]
+    tables = [TableDef(name=n, primary_key=["id"], columns=[
+        ColumnDef(name="id", mysql_type="bigint"), ColumnDef(name="x", mysql_type="text")])
+        for n in names]
+    applied = {n: SimpleNamespace(
+        target_ddl=f'CREATE TABLE "s"."{n[2:]}" ("id" BIGINT NOT NULL, "x" TEXT NOT NULL, PRIMARY KEY ("id"))',
+        foreign_key_ddls=[], preserved_foreign_keys=[], index_ddls=[]) for n in names}
+    real = sqlglot.parse_one
+    seen: dict = {}
+
+    def counting(sql, *a, **k):
+        seen[sql] = seen.get(sql, 0) + 1
+        return real(sql, *a, **k)
+
+    monkeypatch.setattr(sqlglot, "parse_one", counting)
+    first = _full("exclude *.*.x", tables=tables, applied=applied)
+    assert sum(len(c) for c in first.columns.values()) == 300
+    per_ddl = max(seen.values())
+    seen.clear()
+    _full("exclude *.*.x", tables=tables, applied=applied)
+    assert seen == {}, "a repeated resolve must not re-parse any DDL"
+    # one parse per cached reader (key facts: pk, identity, generated; constraints; UNIQUE
+    # members; column names; the overlay preview's generated set), never a repeat
+    assert per_ddl <= 7
