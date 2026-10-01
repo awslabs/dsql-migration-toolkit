@@ -598,6 +598,7 @@ class DataMigrationState:
         opened_with: "Sequence[str]" = (),
         token: "Optional[tuple]" = None,
         lock_check: "Optional[Callable[[], Optional[str]]]" = None,
+        convert_legacy: "Iterable[str]" = (),
     ) -> Optional[str]:
         """Store a popup Save: ``resolution`` (``core.exclusion_rules.RuleResolution``) is
         the ONLY input -- this is the rules' setter; ``set_lob_exclusion`` stays the raw
@@ -612,8 +613,9 @@ class DataMigrationState:
         classification keep only the entries still excluded. The TableSelection changes
         (touched) only when ``resolution.selected_after`` is set; the provenance and the
         rule text are stored; exactly ``opened_with`` leaves the pending lines (a line
-        another tab added meanwhile stays). Never marks the overlay ledger in use: a run
-        that overlays does.
+        another tab added meanwhile stays). ``convert_legacy`` names tables a Change &
+        reload drops and reloads so their omit-only entries become overlay entries (NULL).
+        Never marks the overlay ledger in use: a run that overlays does.
         """
         if not resolution.can_save:
             return "The rules have errors: fix them before saving."
@@ -629,14 +631,17 @@ class DataMigrationState:
                     "to review the current set."
                 )
             new = {t: set(c) for t, c in resolution.columns.items() if c}
+            converted = set(convert_legacy or ())
             self._excluded_lob_columns = new
             self._legacy_exclusions = {
-                t: c & new[t] for t, c in self._legacy_exclusions.items() if t in new and c & new[t]
+                t: c & new[t] for t, c in self._legacy_exclusions.items()
+                if t in new and c & new[t] and t not in converted
             }
             facts = self._restored_exclusion_facts
             if facts is not None:
                 self._restored_exclusion_facts = replace(facts, entries=frozenset(
-                    (t, c) for t, c in facts.entries if c in new.get(t, ())))
+                    (t, c) for t, c in facts.entries
+                    if c in new.get(t, ()) and t not in converted))
             if resolution.selected_after is not None:
                 self.selection = TableSelection(selected_tables=list(resolution.selected_after))
                 self.selection_touched = True

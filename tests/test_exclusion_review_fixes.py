@@ -330,9 +330,10 @@ def test_a_stop_in_flight_is_named_as_a_wait():
 def test_the_reload_hint_needs_the_job_record():
     state = _state(job_id="job-1")
     state.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
-    assert "Exclude column & reload" in exclusion_lock_state(
+    # P3-C18: the remedy that reloads is Change & reload, named only with the job record.
+    assert "Change & reload" in exclusion_lock_state(
         state, _StubJobManager({"job-1": _StubJob("COMPLETED")})).reason
-    assert "Exclude column & reload" not in exclusion_lock_state(state, _StubJobManager({})).reason
+    assert "Change & reload" not in exclusion_lock_state(state, _StubJobManager({})).reason
 
 
 def test_the_after_lock_note_matches_the_cause():

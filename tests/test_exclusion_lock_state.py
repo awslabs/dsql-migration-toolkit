@@ -72,7 +72,14 @@ def test_a_stack_with_a_committed_full_load_names_delete_then_start_over():
     lock = exclusion_lock_state(state, _StubJobManager({"job-1": _StubJob("COMPLETED")}))
     assert lock.tier == 2
     assert "delete the CDC infrastructure on the CDC step" in lock.reason
-    assert "Stop CDC alone is not enough" in lock.reason and "Start over" in lock.reason
+    assert "Stop CDC alone is not enough" in lock.reason
+    # P3-C18: with the load's record, the remedy is Change & reload (never Start over);
+    # the MySQL line names the watermark re-seed.
+    assert "2 use Change & reload for the affected tables" in lock.reason
+    assert "Start over" not in lock.reason and "re-seeds from the Full Load watermark" in lock.reason
+    pruned = exclusion_lock_state(state, _StubJobManager({}))
+    assert pruned.cell == "R1b" and "Start over" in pruned.reason
+    assert "Change & reload" not in pruned.reason and "watermark" not in pruned.reason
     # Streaming: Stop first, THEN delete -- never Stop as the whole remedy.
     state.set_cdc_stack_phase("running", status="UPDATE_COMPLETE")
     lock = exclusion_lock_state(state, _StubJobManager({"job-1": _StubJob("COMPLETED")}))
@@ -117,15 +124,17 @@ def test_a_full_load_type_without_a_load_needs_no_reload():
 def test_no_stack_and_a_committed_full_load_is_tier_3():
     state = _state(job_id="job-1")
     lock = exclusion_lock_state(state, _StubJobManager({"job-1": _StubJob("COMPLETED")}))
-    assert lock.tier == 3 and "Start over" in lock.reason and "Exclude column & reload" in lock.reason
+    assert lock.tier == 3 and "use Change & reload" in lock.reason
+    assert "Changing the table set needs Start over." in lock.reason
     pruned = exclusion_lock_state(state, _StubJobManager({}))
     assert pruned.tier == 3 and "no longer available" in pruned.reason
+    assert "Change & reload" not in pruned.reason and "Start over" in pruned.reason
     assert exclusion_lock_state(_state(), _StubJobManager({})).locked is False
 
 
 def test_no_state_offers_a_partial_or_unavailable_remedy():
-    """Every reachable state's text: never Stop alone, a Manual start point, or P3's
-    Change & reload (not in this version)."""
+    """Every reachable state's text: never Stop alone or a Manual start point; Change &
+    reload is named only when a Full Load committed and its record is found."""
     reasons = []
     for mtype in MigrationType:
         for engine in (SourceType.MYSQL, SourceType.POSTGRES):
@@ -138,13 +147,16 @@ def test_no_state_offers_a_partial_or_unavailable_remedy():
                         lock = exclusion_lock_state(state, _StubJobManager(jobs))
                         if lock.reason:
                             reasons.append(lock.reason)
+                            found = job_id is not None and "job-1" in jobs
+                            if "Change & reload" in lock.reason:
+                                assert found, (mtype, phase, job_id, jobs)
                         legacy = lob_exclusion_lock(state, _StubJobManager(jobs))[1]
                         if legacy:
                             reasons.append(legacy)
     assert reasons
     for text in reasons:
         assert "Stop CDC to change" not in text and "stop CDC first" not in text, text
-        assert "Manual" not in text and "Change & reload" not in text, text
+        assert "Manual" not in text, text
 
 
 def test_the_dead_letter_runbook_follows_the_real_state():

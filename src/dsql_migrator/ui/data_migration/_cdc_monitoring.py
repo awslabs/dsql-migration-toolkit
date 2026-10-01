@@ -2665,14 +2665,16 @@ def exclusion_lock_state(migration_state, job_manager) -> ExclusionLockState:
     )
     session = getattr(migration_state, "_session", None)
     engine = session_source_type(session) if session is not None else None
-    # The per-table recovery runs a retry of the recorded Full Load, so it exists only
-    # while that job record does (a pruned record leaves Start over alone).
-    reload_hint = (
-        " A table whose rows were quarantined can still be reloaded without the column "
-        "with its 'Exclude column & reload' once no CDC infrastructure is deployed."
-        if migration_type is not MigrationType.CDC_ONLY and job_found
-        else ""
-    )
+    # Change & reload re-runs the recorded Full Load for the changed tables, so it is named
+    # only while that job record exists (a pruned record leaves Start over alone).
+    if engine is SourceType.POSTGRES:
+        reseed = (" PostgreSQL: deleting the stack drops the replication slot and the "
+                  "publication; the next Start CDC snapshots the captured tables again.")
+    elif engine is SourceType.MYSQL:
+        reseed = (" MySQL: Start CDC on Automatic re-seeds from the Full Load watermark (it "
+                  "needs the binlog kept since that load; Start CDC warns if it was purged).")
+    else:
+        reseed = ""
     if stack:
         held = (
             "Locked — CDC is being stopped, and its source connector was started with "
@@ -2694,15 +2696,35 @@ def exclusion_lock_state(migration_state, job_manager) -> ExclusionLockState:
         if streaming:
             delete = _stop_then(migration_state, job_manager) + delete
         full_load_only = migration_type is MigrationType.FULL_LOAD_ONLY
-        if job_id is not None:
-            # R1 / R1b: a Full Load committed data with this set -- the delete does not
-            # release it in this version; Start over does.
+        if job_id is not None and not job_found:
+            # R1b: the load's record is gone, so nothing can be reloaded: Start over.
             return ExclusionLockState(
                 2,
                 f"{held} A Full Load also loaded data with them, so they are fixed for this "
                 f"migration. To migrate a different column set, {delete}, then use Start "
-                f"over.{reload_hint}",
-                cell="R1" if job_found else "R1b",
+                "over.",
+                cell="R1b",
+                offers_change_type=full_load_only,
+            )
+        if job_id is not None:
+            # R1: delete, then Change & reload the tables whose excluded columns change.
+            if migration_type is MigrationType.CDC_ONLY:
+                reload = ("switch the migration type to Full load + CDC, use Change & reload "
+                          "there, then continue with CDC (switch back to CDC only, or stay "
+                          "in Full load + CDC)")
+                then = "deploy it again and Start CDC"
+            elif full_load_only:
+                reload = "use Change & reload for the affected tables"
+                then = ("only if you continue with CDC: deploy it again and Start CDC "
+                        "(otherwise switch back to Full load only)")
+            else:
+                reload = "use Change & reload for the affected tables"
+                then = "deploy it again and Start CDC"
+            return ExclusionLockState(
+                2,
+                f"{held} A Full Load also loaded data with them. To change them: 1 {delete}, "
+                f"2 {reload}, 3 {then}.{reseed}",
+                cell="R1",
                 offers_change_type=full_load_only,
             )
         if migration_type is MigrationType.CDC_ONLY:
@@ -2771,15 +2793,25 @@ def exclusion_lock_state(migration_state, job_manager) -> ExclusionLockState:
                 cell="R4",
             )
         cdc_only = migration_type is MigrationType.CDC_ONLY
+        if cdc_only:
+            return ExclusionLockState(
+                3,
+                "Locked — a Full Load already loaded these tables with these exclusions, "
+                "before this migration was switched to CDC only, and CDC only has no Full "
+                "Load step to reload them on. To change them: 1 switch the migration type to "
+                "Full load + CDC, 2 open this window there and use Change & reload, "
+                "3 continue with CDC (switch back to CDC only, or stay in Full load + CDC).",
+                cell="R4",
+                offers_change_type=True,
+            )
         return ExclusionLockState(
             3,
-            "Locked — a Full Load has already loaded data using this exclusion set, so the "
-            "excluded columns are fixed for this migration (changing them now would leave "
-            "the already-loaded rows inconsistent with what CDC captures). To migrate a "
-            f"different column set, use Start over.{reload_hint}",
+            "Locked — a Full Load has already loaded data using this exclusion set. To "
+            "change the excluded columns, use Change & reload: it drops and reloads exactly "
+            "the tables whose excluded columns change, so no row keeps a value loaded under "
+            "the previous set. Changing the table set needs Start over.",
             cell="R4",
-            offers_change_and_reload=not cdc_only,
-            offers_change_type=cdc_only,
+            offers_change_and_reload=True,
         )
     return ExclusionLockState(None)
 

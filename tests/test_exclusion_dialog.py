@@ -146,6 +146,13 @@ class _Ui:
         self.tables.append(list(rows or []))
         return el
 
+    def checkbox(self, text="", *_a, value=False, on_change=None, **_k):
+        el = self._el("checkbox", text)
+        el.value = value
+        el.on_change = on_change
+        self.texts.append(str(text))
+        return el
+
     def __getattr__(self, _name):
         return lambda *_a, **_k: self._el(_name)
 
@@ -614,3 +621,117 @@ def test_change_migration_type_is_disabled_with_the_type_lock_reason():
     open_exclusion_dialog(ui, ctx)
     _handler, button = ui.buttons["Change migration type"][-1]
     assert "disable" in " ".join(button.props_seen)
+
+
+# --- P3-C18: Change & reload --------------------------------------------------------------
+
+
+def _reload_ctx(status="DONE", *, ready=True):
+    state = DataMigrationState()
+    state.migration_type = MigrationType.FULL_LOAD_AND_CDC
+    state.job_id = "job-1"
+    state.restore_lob_exclusion("shop.t", "a")
+    state.restore_exclusion_rules("exclude shop.t.a", ())
+    jobs = {"job-1": _StubJob(status)}
+    jm = _StubJobManager(jobs)
+    ctx, calls = _ctx(state, job_manager=jm)
+    ctx.session.connection_ready = lambda: ready
+    submitted = []
+
+    def run_retry_for(tables):
+        submitted.append((list(tables), state.take_run_choice()))
+
+    ctx.extra["run_retry_for"] = run_retry_for
+    return ctx, state, jobs, submitted
+
+
+def test_a_running_first_load_disables_change_and_reload_and_a_click_does_not_switch():
+    ctx, state, _jobs, submitted = _reload_ctx("RUNNING")
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx)
+    handler, button = ui.buttons["Change & reload"][-1]
+    assert "disable" in " ".join(button.props_seen)
+    assert any(t.startswith("A Full Load is running") for t in ui.texts)
+    dialogs = len(ui.dialogs)
+    handler()
+    assert len(ui.dialogs) == dialogs and ui.notified  # no mode switch
+
+
+def test_a_successful_change_and_reload_forces_exactly_the_diffed_tables():
+    ctx, state, _jobs, submitted = _reload_ctx()
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx)
+    ui.click("Change & reload")
+    assert ui.texts.count("Change exclusions & reload") == 1
+    ui.type_text("exclude shop.t.a\nexclude shop.u.note")
+    assert "Drop & reload shop.u" in ui.buttons
+    ui.click("Drop & reload shop.u")
+    (tables, (replace, pin)), = submitted
+    assert tables == ["shop.u"] and replace == frozenset({"shop.u"}) and pin is None
+    assert state.reload_mode == "append"  # the run-wide choice is untouched
+    assert state.lob_exclusions() == {"shop.t": {"a"}, "shop.u": {"note"}}
+    assert state.exclusion_forced_replace == {}
+
+
+def test_a_text_only_change_saves_the_text_and_reloads_nothing():
+    ctx, state, _jobs, submitted = _reload_ctx()
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx)
+    ui.click("Change & reload")
+    ui.type_text("exclude shop.t.a  # why")
+    ui.click("Save")
+    assert submitted == [] and state.exclusion_rules_text() == "exclude shop.t.a  # why"
+
+
+@pytest.mark.parametrize("later", ["RUNNING", "gone"])
+def test_the_save_race_writes_nothing_and_keeps_the_text(later):
+    ctx, state, jobs, submitted = _reload_ctx()
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx)
+    ui.click("Change & reload")
+    ui.type_text("exclude shop.t.a\nexclude shop.u.note")
+    if later == "RUNNING":
+        jobs["job-1"] = _StubJob("RUNNING")
+    else:
+        jobs.clear()
+    before = (state.job_id, state.lob_exclusions(), state.exclusion_rules_text(),
+              state.rule_excluded_tables(), state.exclusion_forced_replace, state.pending_rules(),
+              state.fk_apply_result)
+    ui.click("Drop & reload shop.u")
+    after = (state.job_id, state.lob_exclusions(), state.exclusion_rules_text(),
+             state.rule_excluded_tables(), state.exclusion_forced_replace, state.pending_rules(),
+             state.fk_apply_result)
+    assert submitted == [] and after == before and ui.notified
+    assert ui.editors[-1].value == "exclude shop.t.a\nexclude shop.u.note"
+    ui.click("Cancel")
+    assert state.exclusion_rules_text() == "exclude shop.t.a"
+
+
+def test_table_lines_are_e3_in_change_and_reload():
+    ctx, state, _jobs, _submitted = _reload_ctx()
+    ctx.lock_reason_fn = lambda: ("Locked — a Full Load has already run for this table set. "
+                                  "Use 'Start over' to migrate a different set of tables.")
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx)
+    ui.click("Change & reload")
+    ui.type_text("exclude shop.t.a\nexclude table shop.audit_*")
+    assert any("Start over" in t for t in ui.texts)
+    action = [el for el in ui.elements if el.kind == "button"
+              and (el.text == "Save" or str(el.text).startswith("Drop & reload"))][-1]
+    assert action.enabled is False
+
+
+def test_a_ticked_legacy_table_joins_the_reload_and_becomes_overlay():
+    ctx, state, _jobs, submitted = _reload_ctx()
+    state.restore_legacy_exclusions(["shop.t:a"])
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx)
+    ui.click("Change & reload")
+    ui.type_text("exclude shop.t.a")
+    checkbox = [e for e in ui.elements if e.kind == "checkbox"][-1]
+    assert "excluded before v0.1.562 (a)" in checkbox.text and checkbox.value is False
+    checkbox.on_change(SimpleNamespace(value=True))
+    ui.click("Drop & reload shop.t")
+    (tables, (replace, _pin)), = submitted
+    assert tables == ["shop.t"] and replace == frozenset({"shop.t"})
+    assert state.legacy_exclusions() == {}  # now an overlay entry: NULL after the reload

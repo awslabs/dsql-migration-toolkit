@@ -1804,6 +1804,9 @@ def build_data_migration_screen(
                 )
                 refresh()
 
+            # The exclusion popup's Change & reload submits through this same scoped retry.
+            _exclusion_ctx.extra["run_retry_for"] = _run_retry_for
+
             def retry_failed_load() -> None:
                 # Re-run Full Load for the UNFINISHED tables (FAILED *or* still
                 # PENDING), carrying the succeeded tables forward so the view stays

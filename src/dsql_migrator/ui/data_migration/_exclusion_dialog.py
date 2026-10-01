@@ -224,6 +224,8 @@ def open_exclusion_dialog(ui, ctx: ExclusionDialogContext, *, mode: Optional[str
         chosen = mode or ("read_only" if lock.locked else "edit")
         if chosen == "edit":
             _build_edit_dialog(ui, ctx)
+        elif chosen == "change_and_reload":
+            _build_reload_dialog(ui, ctx)
         else:
             _build_read_only_dialog(ui, ctx, lock)
 
@@ -877,11 +879,235 @@ def _build_read_only_dialog(ui, ctx: ExclusionDialogContext, lock) -> None:
         tables = sum(1 for c in stored.values() if c)
         inline_hint(ui, f"Columns: {n} excluded in {tables} table{'s' if tables != 1 else ''}")
         _render_deployed_capture(ui, ctx, inventory)
+        if lock.offers_change_and_reload:
+            _change_and_reload_button(ui, ctx, dialog.close)
         with ui.row().classes("w-full justify-end gap-2"):
             if lock.tier != 0 and lock.offers_change_type:
                 _change_type_button(ui, ctx, dialog.close)
             ui.button("Close", on_click=dialog.close).props("flat no-caps color=grey-8")
     ui.timer(0.05, dialog.open, once=True)
+
+
+def _reload_gate(ctx: ExclusionDialogContext) -> Optional[str]:
+    from dsql_migrator.ui.data_migration._cdc_monitoring import change_and_reload_block_reason
+
+    ready = bool(getattr(ctx.session, "connection_ready", lambda: False)())
+    return change_and_reload_block_reason(ctx.migration_state, ctx.job_manager,
+                                          connections_ready=ready)
+
+
+def _change_and_reload_button(ui, ctx: ExclusionDialogContext, close) -> None:
+    """[Change & reload] (R4, a Full Load type, the job found): enabled only while the ONE
+    gate allows it -- re-checked at the click, which never switches mode on a reason."""
+    reason = _reload_gate(ctx)
+
+    def _go() -> None:
+        now = _reload_gate(ctx)
+        if now:
+            ui.notify(now, type="warning", multi_line=True)
+            return
+        close()
+        open_exclusion_dialog(ui, ctx, mode="change_and_reload")
+
+    with ui.row().classes("items-center gap-2 w-full"):
+        button = ui.button("Change & reload", icon="sync", on_click=_go).props(
+            "no-caps color=primary")
+        if reason:
+            button.props("disable")
+    if reason:
+        no_run = reason.startswith(("No Full Load run is recorded",
+                                    "The record of the last Full Load run"))
+        inline_hint(ui, reason, tone="warning" if no_run else "neutral")
+
+
+def reload_tables(resolution, migratable: Sequence[str], convert: "Sequence[str]" = ()) -> list:
+    """The tables a Change & reload drops and reloads: those in scope whose excluded
+    columns change, plus the legacy tables ticked for conversion -- in tree order."""
+    changed = set(resolution.diff.added) | set(resolution.diff.removed) if resolution.diff else set()
+    wanted = (changed & set(resolution.in_scope)) | set(convert)
+    return [t for t in migratable if t in wanted]
+
+
+def _row_estimate(ctx: ExclusionDialogContext, table: str) -> Optional[int]:
+    from dsql_migrator.ui.data_migration._cdc_status import _current_job
+
+    job = _current_job(ctx.job_manager, getattr(ctx.migration_state, "job_id", None))
+    counts = getattr(getattr(job, "watermark", None), "table_row_counts", None) or {}
+    return counts.get(table)
+
+
+def _build_reload_dialog(ui, ctx: ExclusionDialogContext) -> None:
+    """CHANGE & RELOAD (R4): column rules editable, table lines E3 (the table set is fixed
+    after a Full Load), and a negative confirm naming every table it DROPS and reloads.
+    A text-only change saves the text and nothing else."""
+    from dsql_migrator.core.activity_log import ActivityCategory, ActivityStatus, log_activity
+
+    state = ctx.migration_state
+    classify_restored_exclusions(state, ctx.job_manager)
+    inventory = ctx.inventory_fn()
+    inputs = ctx.inputs_fn()
+    if inventory is None or inputs is None:
+        return
+    text, opened_with = popup_open_text(state, inventory)
+    token = state.exclusion_edit_token()
+    held = {"text": text, "timer": None}
+    convert: set = set()
+    view = state.exclusion_dialog_ui()
+    view.clear()
+    ui.add_css(_EDITOR_CSS)
+    with ui.dialog().props("persistent") as dialog, ui.card().classes("gap-3").style(
+        "width: min(980px, 94vw); max-width: 94vw"
+    ):
+        def _close() -> None:
+            view.clear()
+            dialog.close()
+
+        with ui.row().classes("items-center gap-2 w-full no-wrap"):
+            ui.label("Change exclusions & reload").classes("text-base font-semibold")
+            ui.space()
+            ui.button(on_click=_close).props(
+                "flat dense round size=sm icon=close color=grey-7"
+            ).tooltip("Close without saving")
+        ui.label("Column rules are editable. Tables are fixed after a Full Load (use Start "
+                 "over to change them).").classes("text-xs text-gray-600")
+        editor = ui.codemirror(
+            text, language=None, theme="basicLight", line_wrapping=False,
+            on_change=lambda e: _on_edit(getattr(e, "value", "")),
+        ).classes("w-full exclusion-rules-editor")
+
+        @ui.refreshable
+        def preview() -> None:
+            resolution = _resolve(ctx, inventory, inputs, held["text"], slot="editor")
+            _render_errors(ui, resolution, held, editor, preview.refresh)
+            for number in sorted(resolution.line_status):
+                status = resolution.line_status[number]
+                inline_hint(ui, _line_status_text(status, resolution),
+                            tone="warning" if status.codes else "neutral")
+                for note in status.notes:
+                    inline_hint(ui, f"      {note}", tone="neutral")
+            _render_lob_section(ui, ctx, inventory, inputs, resolution, view, _add_rules,
+                                preview.refresh)
+            _render_legacy_conversion(ui, resolution, convert, preview.refresh)
+            tables = reload_tables(resolution, inputs.migratable, sorted(convert))
+            _render_drop_card(ui, ctx, resolution, tables)
+            label = (f"Drop & reload {tables[0]}" if len(tables) == 1
+                     else f"Drop & reload {len(tables)} tables" if tables else "Save")
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("Cancel", on_click=_close).props("flat no-caps color=grey-8")
+                save = ui.button(label, on_click=_save).props(
+                    "no-caps " + ("color=negative" if tables else "color=primary"))
+                save.set_enabled(resolution.can_save)
+
+        def _add_rules(lines: Sequence[str]) -> None:
+            for line in lines:
+                held["text"] = _append_line(held["text"], line)
+            editor.set_value(held["text"])
+            preview.refresh()
+
+        def _on_edit(value: str) -> None:
+            held["text"] = value or ""
+            timer = held.get("timer")
+            if timer is not None:
+                try:
+                    timer.cancel()
+                except Exception:  # noqa: BLE001 - an already-fired one-shot
+                    pass
+            held["timer"] = ui.timer(_DEBOUNCE_SECONDS, preview.refresh, once=True)
+
+        def _save() -> None:
+            # FIRST the one gate, at the click: a reason writes nothing and keeps the text.
+            reason = _reload_gate(ctx)
+            if reason:
+                ui.notify(reason, type="warning", multi_line=True)
+                return
+            resolution = _resolve(ctx, inventory, inputs, held["text"], slot="editor")
+            tables = reload_tables(resolution, inputs.migratable, sorted(convert))
+            # No await from here on: the store, the forced set, the confirm and the submit
+            # happen in one step, so nothing can interleave.
+            classify_restored_exclusions(state, ctx.job_manager)
+            refused = state.set_column_exclusions(
+                resolution, text=held["text"], opened_with=opened_with, token=token,
+                convert_legacy=sorted(convert),
+            )
+            if refused:
+                ui.notify(refused, type="warning", multi_line=True)
+                return
+            if not tables:
+                _close()
+                ctx.refresh()
+                return
+            state.set_exclusion_forced_replace({t: "Change & reload" for t in tables})
+            state.set_overlay_disclosed(None)
+            state.confirm_exclusion_forced_replace()
+            _close()
+            log_activity(
+                ActivityCategory.FULL_LOAD, "excluded columns changed; reloading",
+                status=ActivityStatus.INFO, target=", ".join(tables),
+                detail=(resolution.diff.text if resolution.diff else "")
+                + f"; dropping and reloading {len(tables)} table(s)",
+            )
+            run = ctx.extra.get("run_retry_for")
+            if run is None:
+                state.clear_exclusion_forced_replace()
+                ui.notify("Open the Full Load step to reload the tables.", type="warning")
+                return
+            run(tables)
+            if state.exclusion_forced_replace:
+                # The retry refused before taking the forced set: never leave it armed.
+                state.clear_exclusion_forced_replace()
+
+        preview()
+    ui.timer(0.05, dialog.open, once=True)
+
+
+def _render_legacy_conversion(ui, resolution, convert: set, rerun) -> None:
+    """The opt-in conversion of omit-only (pre-0.1.562) entries: a ticked table joins the
+    reload, after which its excluded columns are NULL like every other excluded column."""
+    for table in sorted(resolution.retained_legacy):
+        columns = ", ".join(sorted(resolution.retained_legacy[table]))
+
+        def _toggle(event, t=table) -> None:
+            if getattr(event, "value", False):
+                convert.add(t)
+            else:
+                convert.discard(t)
+            rerun()
+
+        ui.checkbox(
+            f"Reload {table} so its columns excluded before v0.1.562 ({columns}) are NULL "
+            "(now they hold the target DEFAULT)",
+            value=table in convert, on_change=_toggle,
+        )
+
+
+def _render_drop_card(ui, ctx: ExclusionDialogContext, resolution, tables) -> None:
+    if not tables:
+        inline_hint(ui, "No table's excluded columns change: Save stores the rules only.")
+        return
+    diff = resolution.diff
+    with ui.column().classes("w-full gap-1 p-2 rounded-md border border-amber-200 bg-amber-50"):
+        ui.label(f"{len(tables)} table{'s' if len(tables) != 1 else ''} will be DROPPED and "
+                 "reloaded from the source").classes("text-sm font-semibold text-amber-800")
+        for table in tables[:20]:
+            added = (diff.added.get(table, ()) if diff else ())
+            removed = (diff.removed.get(table, ()) if diff else ())
+            parts = []
+            if added:
+                parts.append("+ " + ", ".join(added) + " (NULL)")
+            if removed:
+                parts.append("- " + ", ".join(removed))
+            if table in resolution.retained_legacy and not parts:
+                parts.append("excluded before v0.1.562 -> NULL")
+            rows = _row_estimate(ctx, table)
+            estimate = f"   {rows:,} rows re-read" if rows is not None else ""
+            ui.label(f"{table}   {'; '.join(parts)}{estimate}").classes("text-xs font-mono")
+        if len(tables) > 20:
+            ui.label(f"and {len(tables) - 20} more").classes("text-xs")
+        ui.label(
+            "Their rows on Aurora DSQL are permanently deleted; each table is recreated from "
+            "your Schema Conversion DDL, made nullable where needed, and reloaded. Other "
+            "tables are not touched."
+        ).classes("text-xs text-amber-800")
 
 
 def _render_deployed_capture(ui, ctx: ExclusionDialogContext, inventory) -> None:
