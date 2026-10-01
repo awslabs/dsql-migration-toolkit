@@ -431,3 +431,40 @@ def test_start_cdc_checks_and_records_the_offered_seed():
     src = inspect.getsource(_cdc_ui._start_cdc_deploy)
     assert "seed_refused_by_an_earlier_offer(" in src and "note_cdc_offered_seed(" in src
     assert src.index("seed_refused_by_an_earlier_offer(") < src.index("note_cdc_offered_seed(")
+
+
+def test_the_start_cdc_fk_gate_only_checks_keys_the_stream_can_reach() -> None:
+    """Live (GTID check, 2026-10-01): a 5-table migration_schema stream had Start CDC
+    disabled by ecommerce_demo FKs -- owned by the same conversion (the whole evaluated
+    inventory) but unreachable by any streamed row. Kept: streamed tables, and children
+    whose FK references a streamed table (a streamed parent DELETE still trips them)."""
+    from dsql_migrator.core.models import ColumnDef, ForeignKeyDef, SourceInventory, TableDef
+
+    def table(name, refs=()):
+        return TableDef(
+            name=name, columns=[ColumnDef(name="id", mysql_type="int")], primary_key=["id"],
+            foreign_keys=[ForeignKeyDef(name=f"fk_{name.split('.')[1]}_{i}", columns=["id"],
+                                        referenced_table=r, referenced_columns=["id"])
+                          for i, r in enumerate(refs)],
+        )
+
+    inventory = SourceInventory(tables=[
+        table("s.parent"), table("s.child", ["s.parent"]), table("s.grandchild", ["s.child"]),
+        table("o.a"), table("o.b", ["o.a"]),
+    ])
+    preserved = {"s.child": ["fk_child_0"], "s.grandchild": ["fk_grandchild_0"], "o.b": ["fk_b_0"]}
+    scoped = _cdc_ui.cdc_foreign_keys_in_stream_scope(preserved, ["s.parent"], inventory)
+    assert scoped == {"s.child": ["fk_child_0"]}  # direct child of a streamed parent only
+    assert _cdc_ui.cdc_foreign_keys_in_stream_scope(preserved, ["s.child"], inventory) == {
+        "s.child": ["fk_child_0"], "s.grandchild": ["fk_grandchild_0"]}
+    # a preserved table the inventory does not describe is kept (fail-closed)
+    assert "x.unknown" in _cdc_ui.cdc_foreign_keys_in_stream_scope(
+        {**preserved, "x.unknown": ["fk_u"]}, ["s.parent"], inventory)
+    # no inventory: nothing narrowed (the previous, fail-closed behaviour)
+    assert _cdc_ui.cdc_foreign_keys_in_stream_scope(preserved, ["s.parent"], None) == preserved
+
+    import inspect
+
+    src = inspect.getsource(_cdc_ui._probe_cdc_blocking_foreign_keys)
+    assert "cdc_foreign_keys_in_stream_scope(preserved, streamed, inventory)" in src
+    assert src.index("cdc_foreign_keys_in_stream_scope(") < src.index("table_names = sorted(")

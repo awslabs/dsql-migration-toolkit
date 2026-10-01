@@ -5141,6 +5141,34 @@ def _cdc_fk_connection_factory(session):
     ).connect
 
 
+def cdc_foreign_keys_in_stream_scope(preserved, streamed, inventory):
+    """The owned FKs the stream can trip: those on a streamed table, and every key of a
+    child table whose foreign key references a streamed table. Pure.
+
+    ``preserved`` (what this migration's conversion renders) covers the whole evaluated
+    inventory, so a selection of 5 tables was blocked -- with Start CDC disabled -- by the
+    keys of unrelated tables elsewhere on the target that no streamed row can reach (live:
+    ``ecommerce_demo`` FKs blocked a ``migration_schema`` fixture stream). Kept at TABLE
+    level from the source inventory's keys, never per constraint name, so a renamed
+    constraint is never missed. Fail-closed: a table the inventory does not describe is
+    kept, and without an inventory nothing is narrowed.
+    """
+    inventory_tables = getattr(inventory, "tables", None)
+    if not inventory_tables:
+        return dict(preserved)
+    streamed_set = set(streamed)
+    keep = set(streamed_set)
+    for table in inventory_tables:
+        for foreign_key in getattr(table, "foreign_keys", None) or ():
+            if getattr(foreign_key, "referenced_table", None) in streamed_set:
+                keep.add(table.name)
+                break
+    known = {table.name for table in inventory_tables}
+    return {
+        table: names for table, names in preserved.items() if table in keep or table not in known
+    }
+
+
 def _probe_cdc_blocking_foreign_keys(migration_state, session, inventory, watermark):
     """Read the target's enforced FKs on the to-be-streamed tables. BLOCKING I/O.
 
@@ -5166,6 +5194,7 @@ def _probe_cdc_blocking_foreign_keys(migration_state, session, inventory, waterm
     streamed = [t.name for t in tables if getattr(t, "name", None)]
     if not streamed:
         return None
+    preserved = cdc_foreign_keys_in_stream_scope(preserved, streamed, inventory)
     # Check every table this migration gives foreign keys to, not just the streamed set.
     # An FK on a NON-streamed child still blocks: a streamed DELETE on the parent is
     # rejected (23503) because the static child rows still reference it, and that DELETE

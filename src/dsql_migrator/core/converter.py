@@ -1888,8 +1888,16 @@ def _column_default_sql(
             and hex_ok
             and (expr_target_base != "bytea" or bit_hex[1] is not None)
         ):
+            # An expression is printed text, never cut at a 0x00 byte: hand a hex literal
+            # on as x'..' -- the exact form (see _binary_default_sql), not the possibly-cut
+            # information_schema 0x.. one, which would draw a false "may be cut" warning.
+            literal = (
+                f"x'{bit_hex[1]}'"
+                if bit_hex is not None and bit_hex[1] is not None and expr_target_base == "bytea"
+                else expression
+            )
             return _column_default_sql(
-                column.model_copy(update={"default": expression, "default_is_expression": False}),
+                column.model_copy(update={"default": literal, "default_is_expression": False}),
                 target_type,
                 enum_values,
             )

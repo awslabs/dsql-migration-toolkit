@@ -3143,8 +3143,9 @@ def test_a_binary_default_cut_at_its_first_zero_byte_is_padded_or_dropped_never_
     # an emitted default never carries the NOT NULL "will be REJECTED" note
     assert not any("REJECTED" in w.message for c in (zero, kept, empty, restored) for w in c.warnings)
     # an expression default is printed text (never cut): unchanged, no warning
-    expr = _convert_table(_single_column_table("t", "varbinary(4)", default="0x0102", default_is_expression=True))
-    assert "DEFAULT '\\x0102'" in expr.target_ddl
+    for expr_default, emitted in (("0x0102", "0102"), ("0x00", "00")):
+        expr = _convert_table(_single_column_table("t", "varbinary(4)", default=expr_default, default_is_expression=True))
+        assert f"DEFAULT '\\x{emitted}'" in expr.target_ddl and not expr.warnings, expr.warnings
 
 
 def test_a_text_default_holding_a_nul_is_dropped_with_a_warning() -> None:
