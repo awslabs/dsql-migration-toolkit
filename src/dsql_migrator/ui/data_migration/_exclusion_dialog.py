@@ -24,11 +24,16 @@ from dsql_migrator.core.exclusion_rules import (
     LINE_NO_EFFECT,
     LINE_ONLY_BLOCKED,
     LINE_ONLY_UNSELECTED,
+    split_rule_comment,
     synthesis_gaps,
 )
 from dsql_migrator.ui.data_migration._models import (
+    SCROLL_TO_MIGRATION_TYPE_JS,
     capture_ambiguity_warning,
+    capture_exclusion_mismatch,
+    cdc_capture_exclusions,
     classify_restored_exclusions,
+    exclusion_rules_text_for,
     exclusion_drift,
     exclusion_row_summary,
     lob_exclusion_candidates,
@@ -106,6 +111,8 @@ class ExclusionDialogContext:
     refresh: Callable[[], None]
     lock_reason_fn: Callable[[], Optional[str]] = lambda: None
     capture_tables_fn: Optional[Callable[[Sequence[str]], Sequence[object]]] = None
+    # Why the migration type cannot change now (the type selector's own lock), or None.
+    type_lock_reason_fn: Callable[[], Optional[str]] = lambda: None
     extra: dict = field(default_factory=dict)
 
 
@@ -807,28 +814,98 @@ def _render_capture_section(ui, resolution, view, rerun) -> None:
             inline_hint(ui, ambiguity, tone="warning")
 
 
+_LOCK_HEADERS = {
+    0: "The CDC infrastructure is being deleted",
+    1: "The CDC infrastructure is being created",
+    2: "The CDC infrastructure holds these exclusions",
+    3: "A Full Load already loaded data with these exclusions",
+}
+
+
+def _render_pending(ui, pending: Sequence[str]) -> None:
+    for line in pending:
+        rule, comment = split_rule_comment(line)
+        source = f" ({comment.strip().lstrip('#').strip()})" if comment.strip() else ""
+        inline_hint(ui, f'Pending: "{rule.strip()}"{source} will be added when the rules can '
+                    "be edited again.")
+
+
+def _change_type_button(ui, ctx: ExclusionDialogContext, close) -> None:
+    """[Change migration type]: close the popup FIRST (a scroll behind a persistent dialog
+    moves only the page under it), then the shared scroll on the next tick. It only
+    navigates: the tool never switches the type itself."""
+    reason = ctx.type_lock_reason_fn()
+
+    def _go() -> None:
+        close()
+        ui.timer(0.05, lambda: ui.run_javascript(SCROLL_TO_MIGRATION_TYPE_JS), once=True)
+
+    button = ui.button("Change migration type", icon="arrow_upward", on_click=_go).props(
+        "outline no-caps color=primary")
+    if reason:
+        button.props("disable")
+        button.tooltip(reason)
+
+
 def _build_read_only_dialog(ui, ctx: ExclusionDialogContext, lock) -> None:
-    """The locked popup: the rules as saved (disabled), the lock's own reason and remedy.
-    The per-cell variants and their remedy buttons come with the read-only modes."""
+    """The locked popup (D4): the lock's own reason and remedy (exclusion_lock_state is
+    the only source of that text), the saved rules (not editable), the pending lines kept
+    pending, the stored count, the stack's capture list as deployed -- beside the session's
+    when they differ -- and only the remedies true in this cell."""
     state = ctx.migration_state
+    classify_restored_exclusions(state, ctx.job_manager)
     inventory = ctx.inventory_fn()
-    text, _pending = popup_open_text(state, inventory)
+    text = exclusion_rules_text_for(state, inventory)
+    pending = state.pending_rules()
+    stored = state.lob_exclusions()
+    ui.add_css(_EDITOR_CSS)
     with ui.dialog().props("persistent") as dialog, ui.card().classes("gap-3").style(
         "width: min(980px, 94vw); max-width: 94vw"
     ):
         with ui.row().classes("items-center gap-2 w-full no-wrap"):
-            ui.label(TITLE).classes("text-base font-semibold")
+            ui.label(f"{TITLE} (read only)").classes("text-base font-semibold")
             ui.space()
             ui.button(on_click=dialog.close).props(
                 "flat dense round size=sm icon=close color=grey-7"
             ).tooltip("Close")
-        render_notice(ui, tone="info",
-                      header="The exclusions are fixed right now", body=lock.reason or "")
+        render_notice(ui, tone="info", header=_LOCK_HEADERS.get(lock.tier, "Locked"),
+                      body=lock.reason or "")
+        _render_pending(ui, pending)
         ui.codemirror(text, language=None, theme="basicLight", line_wrapping=False).classes(
             "w-full exclusion-rules-editor").props("disable")
-        with ui.row().classes("w-full justify-end"):
+        n = sum(len(c) for c in stored.values())
+        tables = sum(1 for c in stored.values() if c)
+        inline_hint(ui, f"Columns: {n} excluded in {tables} table{'s' if tables != 1 else ''}")
+        _render_deployed_capture(ui, ctx, inventory)
+        with ui.row().classes("w-full justify-end gap-2"):
+            if lock.tier != 0 and lock.offers_change_type:
+                _change_type_button(ui, ctx, dialog.close)
             ui.button("Close", on_click=dialog.close).props("flat no-caps color=grey-8")
     ui.timer(0.05, dialog.open, once=True)
+
+
+def _render_deployed_capture(ui, ctx: ExclusionDialogContext, inventory) -> None:
+    state = ctx.migration_state
+    deployed = getattr(state, "cdc_deployed_column_exclude_list", None)
+    if deployed is None:
+        return
+    with ui.expansion("CDC capture list (as deployed)").classes(
+            f"w-full {EXPANSION_PANEL_CLASSES}"):
+        with ui.column().classes(f"w-full gap-0 p-2 {CODE_SURFACE_CLASSES}"):
+            ui.label(deployed or "(nothing excluded at capture)").classes(
+                "text-xs font-mono wrap-anywhere")
+    inputs = ctx.inputs_fn()
+    if ctx.capture_tables_fn is None or inventory is None or inputs is None:
+        return
+    captured = list(ctx.capture_tables_fn(inputs.selected))
+    capture = cdc_capture_exclusions(state, inventory, captured)
+    mismatch = capture_exclusion_mismatch(state, inventory, capture, captured)
+    if mismatch:
+        render_notice(
+            ui, tone="warning", header="This session's exclusions differ from the stack's",
+            body=f"{mismatch} This session: {capture.sent or '(none)'}. As deployed: "
+            f"{deployed or '(none)'}.",
+        )
 
 
 __all__ = [

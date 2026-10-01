@@ -2303,6 +2303,18 @@ def open_lob_candidates(candidates, excluded: "Mapping[str, Iterable[str]]"):
     return tuple(pair for pair in candidates or () if pair[0] not in gone)
 
 
+# The migration-type heading's CSS marker and the ONE scroll script that brings it into
+# view with a brief ring (the screen's button and the popup's [Change migration type]).
+MIGRATION_TYPE_ANCHOR = "dm-migration-type-anchor"
+SCROLL_TO_MIGRATION_TYPE_JS = (
+    f"const el=document.querySelector('.{MIGRATION_TYPE_ANCHOR}');"
+    "if(el){el.scrollIntoView({behavior:'smooth',block:'center'});"
+    "el.classList.add('ring-2','ring-blue-400','rounded');"
+    "setTimeout(()=>el.classList.remove("
+    "'ring-2','ring-blue-400','rounded'),2000);}"
+)
+
+
 def overlay_change_summary(actions: "Iterable[str]") -> str:
     """"N x DROP NOT NULL (one-way), M x DROP DEFAULT (restored at Cut over)" for the
     overlay statements' actions -- ONE wording for the popup and both Start dialogs."""

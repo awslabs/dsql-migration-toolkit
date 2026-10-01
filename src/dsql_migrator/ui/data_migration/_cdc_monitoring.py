@@ -2635,13 +2635,8 @@ def exclusion_lock_state(migration_state, job_manager) -> ExclusionLockState:
         return ExclusionLockState(
             0,
             "The CDC infrastructure is being deleted. This is in progress, not stuck: a "
-            f"cdc-stack delete takes {estimate} because {why}. "
-            + (
-                "A Full Load already loaded data with these exclusions, so they stay "
-                "fixed after it: to migrate a different column set, use Start over."
-                if committed
-                else "Wait for the deletion to finish before changing these exclusions."
-            ),
+            f"cdc-stack delete takes {estimate} because {why}. Wait for the deletion to "
+            "finish before changing these exclusions.",
             tone="info",
         )
     if cdc_infra_deploy_in_flight(migration_state, job_manager):
@@ -2721,22 +2716,29 @@ def exclusion_lock_state(migration_state, job_manager) -> ExclusionLockState:
             elif has_streamed:
                 cost = (
                     " Deleting it also deletes the stream position and the MSK topics: the "
-                    "next Start CDC begins at the source's current position, so changes to "
+                    "next Start CDC on Automatic begins at the source's current position, so changes to "
                     "the captured tables after the last one Aurora DSQL applied are NOT "
                     "replicated. If they were written in that window, re-copy them: after "
                     "the delete, switch the migration type to Full load + CDC and run its "
-                    "Full Load with Drop & reload for the tables that hold rows."
+                    "Full Load, choosing to drop and recreate the tables that hold rows."
                 )
             else:
                 cost = (
-                    " Start CDC then begins at the source's current position, as the first "
-                    "Start would have."
+                    " Start CDC on Automatic then begins at the source's current position, "
+                    "as the first Start would have."
                 )
+            # CDC promoted the FULL_LOAD step once it streamed, which keeps the table set
+            # locked after the Delete: only the column rules can change then.
+            change = (
+                "change the column rules (changing the table set needs Start over)"
+                if has_streamed
+                else "change the excluded columns here"
+            )
             return ExclusionLockState(
                 2,
-                f"{held} To change them, {delete}, change the excluded columns here, then "
-                f"deploy it again and Start CDC.{cost} Rows already on Aurora DSQL keep "
-                "their values in newly excluded columns.",
+                f"{held} To change them, {delete}, {change}, then deploy it again and Start "
+                f"CDC.{cost} Rows already on Aurora DSQL keep their values in newly excluded "
+                "columns.",
                 cell="R2",
             )
         # R3: a Full Load type, no Full Load has run yet.
@@ -2746,8 +2748,8 @@ def exclusion_lock_state(migration_state, job_manager) -> ExclusionLockState:
             else "switch back to Full load only, then Start Full Load"
         )
         rows = (
-            " The captured tables already hold rows: choose Drop & reload in the Start "
-            "Full Load dialog for them."
+            " The captured tables already hold rows: choose to drop and recreate them in "
+            "the Start Full Load dialog."
             if has_streamed
             else ""
         )

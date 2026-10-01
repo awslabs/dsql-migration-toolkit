@@ -536,3 +536,81 @@ def test_check_sizes_is_disabled_with_the_reconnect_hint_when_not_ready():
     assert any(t.startswith("Reads the source: one bounded query per column for the 1 column")
                for t in ui.texts)
     assert RECONNECT_REASON  # the tooltip carries it (the double records no tooltip text)
+
+
+# --- P3-C17: read-only modes ------------------------------------------------------------
+
+from tests.test_ui_data_migration import _StubJob, _StubJobManager  # noqa: E402
+
+from dsql_migrator.ui.data_migration import MigrationType  # noqa: E402
+
+
+def _locked_ctx(*, mtype, job_id=None, phase="infra", deleting=False, type_lock=None):
+    state = DataMigrationState()
+    state.migration_type = mtype
+    state.job_id = job_id
+    jobs = {"job-1": _StubJob("DONE")}
+    if phase:
+        state.set_cdc_stack_phase(phase, status="CREATE_COMPLETE")
+    if deleting:
+        state.set_cdc_deploy_job_id("del-1", kind="delete")
+        jobs["del-1"] = _StubJob("RUNNING")
+    state.add_pending_rule("exclude shop.t.b  # from the CDC dead-letter queue")
+    ctx, _calls = _ctx(state, job_manager=_StubJobManager(jobs))
+    ctx.type_lock_reason_fn = lambda: type_lock
+    return ctx, state
+
+
+def test_every_read_only_variant_lists_the_pending_lines_and_keeps_them():
+    for kw in (dict(mtype=MigrationType.FULL_LOAD_AND_CDC, deleting=True, phase="running"),
+               dict(mtype=MigrationType.FULL_LOAD_AND_CDC, job_id="job-1"),
+               dict(mtype=MigrationType.CDC_ONLY),
+               dict(mtype=MigrationType.FULL_LOAD_ONLY),
+               dict(mtype=MigrationType.CDC_ONLY, job_id="job-1", phase=None)):
+        ctx, state = _locked_ctx(**kw)
+        ui = _Ui()
+        open_exclusion_dialog(ui, ctx)
+        assert any(t.startswith('Pending: "exclude shop.t.b" (from the CDC dead-letter queue)')
+                   for t in ui.texts), kw
+        assert "disable" in " ".join(ui.editors[0].props_seen)
+        assert state.pending_rules() == ["exclude shop.t.b  # from the CDC dead-letter queue"]
+
+
+def test_the_delete_wait_offers_only_close():
+    ctx, _state2 = _locked_ctx(mtype=MigrationType.FULL_LOAD_ONLY, deleting=True, phase="running")
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx)
+    assert "Close" in ui.buttons and "Change migration type" not in ui.buttons
+
+
+def test_change_migration_type_closes_first_then_scrolls_with_the_shared_script():
+    import inspect
+
+    import dsql_migrator.ui.data_migration as dm
+    from dsql_migrator.ui.data_migration._models import SCROLL_TO_MIGRATION_TYPE_JS
+
+    ctx, _state2 = _locked_ctx(mtype=MigrationType.FULL_LOAD_ONLY)
+    ui = _Ui()
+    events = []
+    ui.run_javascript = lambda js: events.append(("js", js))
+    open_exclusion_dialog(ui, ctx)
+    original_close = ui.dialogs[0].close
+    ui.dialogs[0].close = lambda: (events.append("close"), original_close())[1]
+    handler, _button = ui.buttons["Change migration type"][-1]
+    # the dialog was built with dialog.close bound before our wrapper: call the handler and
+    # read the order from the closed counter and the queued timer
+    before = ui.closed
+    handler()
+    assert ui.closed == before + 1
+    ui.timers[-1]()
+    assert events[-1] == ("js", SCROLL_TO_MIGRATION_TYPE_JS)
+    assert "SCROLL_TO_MIGRATION_TYPE_JS" in inspect.getsource(dm._scroll_to_migration_type_button)
+
+
+def test_change_migration_type_is_disabled_with_the_type_lock_reason():
+    ctx, _state2 = _locked_ctx(mtype=MigrationType.CDC_ONLY, job_id="job-1", phase=None,
+                               type_lock="Locked: CDC is running.")
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx)
+    _handler, button = ui.buttons["Change migration type"][-1]
+    assert "disable" in " ".join(button.props_seen)

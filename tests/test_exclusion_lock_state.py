@@ -46,6 +46,9 @@ def test_a_running_delete_is_a_wait_not_a_remedy_and_beats_every_other_tier():
     assert lock.tier == 0 and lock.tone == "info"
     assert "being deleted" in lock.reason and "not stuck" in lock.reason
     assert "~15-25 min" in lock.reason  # MySQL: the seeder Lambda's ENI wait
+    # Committed or not, tier 0 is a wait: never Start over while the stack goes away.
+    assert lock.reason.endswith("Wait for the deletion to finish before changing these exclusions.")
+    assert "Start over" not in lock.reason
     # A restored session sees the delete only as DELETE_IN_PROGRESS.
     restored = _state(engine=SourceType.POSTGRES)
     restored.set_cdc_stack_phase("unstable", status="DELETE_IN_PROGRESS")
@@ -90,8 +93,12 @@ def test_cdc_only_without_a_full_load_states_the_engine_cost(engine, offset, exp
     state.set_cdc_has_committed_offset(offset)
     lock = exclusion_lock_state(state, _StubJobManager({}))
     assert lock.tier == 2 and expected in lock.reason
-    assert "change the excluded columns here, then deploy it again and Start CDC" in lock.reason
+    step = ("change the column rules (changing the table set needs Start over)" if offset
+            else "change the excluded columns here")
+    assert f"{step}, then deploy it again and Start CDC" in lock.reason
     assert "keep their values in newly excluded columns" in lock.reason
+    if engine is SourceType.MYSQL:
+        assert "Start CDC on Automatic" in lock.reason
 
 
 def test_a_full_load_type_without_a_load_needs_no_reload():
@@ -305,3 +312,60 @@ def test_seeder_answer_honours_the_restored_engine():
         state = DataMigrationState()
         state._session = session
         assert _cdc_stack_has_seeder_lambda(state) is expected
+
+
+# --- P3-C17: read-only popups, the tier-0 wait everywhere, R2/R3 wording ---------------
+
+
+@pytest.mark.parametrize("engine", [SourceType.MYSQL, SourceType.POSTGRES])
+@pytest.mark.parametrize("mtype", list(MigrationType))
+@pytest.mark.parametrize("job_id", [None, "job-1"])
+@pytest.mark.parametrize("restored", [False, True])
+def test_no_lock_offers_delete_or_stop_while_a_delete_runs(engine, mtype, job_id, restored):
+    from dsql_migrator.ui.data_migration._cdc_monitoring import cdc_delete_eta
+
+    state = _state(mtype=mtype, engine=engine, job_id=job_id)
+    jobs = {"job-1": _StubJob("DONE")}
+    if restored:
+        state.set_cdc_stack_phase("unstable", status="DELETE_IN_PROGRESS")
+        jm = _StubJobManager(jobs)
+    else:
+        state.set_cdc_stack_phase("running", status="UPDATE_COMPLETE")
+        state.set_cdc_deploy_job_id("del-1", kind="delete")
+        jobs["del-1"] = _StubJob("RUNNING")
+        jm = _StubJobManager(jobs)
+    lock = exclusion_lock_state(state, jm)
+    assert lock.tier == 0
+    assert lock.reason.endswith("Wait for the deletion to finish before changing these exclusions.")
+    for banned in ("Stop CDC", "delete the CDC infrastructure", "Start over", "Change & reload"):
+        assert banned not in lock.reason
+    assert cdc_delete_eta(state)[0] in lock.reason
+    assert change_and_reload_block_reason(state, jm, connections_ready=True) == lock.reason
+
+
+@pytest.mark.parametrize("offset", [False, True])
+@pytest.mark.parametrize("mtype", [MigrationType.CDC_ONLY, MigrationType.FULL_LOAD_AND_CDC,
+                                   MigrationType.FULL_LOAD_ONLY])
+def test_r2_and_r3_name_no_reload_watermark_or_manual_start(mtype, offset):
+    state = _state(mtype=mtype)
+    state.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
+    state.set_cdc_has_committed_offset(offset)
+    lock = exclusion_lock_state(state, _StubJobManager({}))
+    assert lock.cell == ("R2" if mtype is MigrationType.CDC_ONLY else "R3")
+    for banned in ("Drop & reload", "Change & reload", "watermark", "Manual", "Fetch current position"):
+        assert banned not in lock.reason, banned
+
+
+def test_cdc_promotion_is_r2_never_r1b():
+    from dsql_migrator.core.models import StepStatus
+    from dsql_migrator.ui.data_migration._cdc_state import cdc_pipeline_live
+    from dsql_migrator.ui.data_migration._full_load_engine import data_migration_step_after_cdc
+
+    state = _state(mtype=MigrationType.CDC_ONLY)
+    state.set_cdc_stack_phase("running", status="UPDATE_COMPLETE")
+    state.set_cdc_has_committed_offset(True)
+    step = data_migration_step_after_cdc(StepStatus.NOT_STARTED, cdc_streaming=cdc_pipeline_live(state))
+    assert step is StepStatus.DONE and state.job_id is None
+    lock = exclusion_lock_state(state, _StubJobManager({}))
+    assert lock.cell == "R2" and "Start over" not in lock.reason.split("(changing")[0]
+    assert "change the column rules (changing the table set needs Start over)" in lock.reason

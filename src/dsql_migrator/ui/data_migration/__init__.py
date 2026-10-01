@@ -510,6 +510,11 @@ def build_data_migration_screen(
         inputs_fn=_exclusion_resolver,
         refresh=lambda: None,
         lock_reason_fn=lambda: table_set_lock_reason(migration_state, job_manager, session),
+        type_lock_reason_fn=lambda: migration_type_lock_reason(
+            migration_state,
+            status=get_status(session.workflow, WorkflowStep.FULL_LOAD),
+            job_manager=job_manager,
+        ),
     )
     _exclusion_row: dict = {}
 
@@ -3455,7 +3460,10 @@ def migratable_table_names(
 # ("change the migration type above"), which on a long Data Migration page can be off
 # screen -- so the notice offers a jump link instead of leaving the user to scroll and
 # find it. Kept as a named constant so the anchor and the querySelector cannot drift.
-MIGRATION_TYPE_ANCHOR = "dm-migration-type-anchor"
+from dsql_migrator.ui.data_migration._models import (  # noqa: E402
+    MIGRATION_TYPE_ANCHOR,
+    SCROLL_TO_MIGRATION_TYPE_JS,
+)
 
 
 def _scroll_to_migration_type_button(
@@ -3474,15 +3482,9 @@ def _scroll_to_migration_type_button(
     ui.button(  # type: ignore[attr-defined]
         label,
         icon="arrow_upward",
-        on_click=lambda: ui.run_javascript(  # type: ignore[attr-defined]
-            f"const el=document.querySelector('.{MIGRATION_TYPE_ANCHOR}');"
-            "if(el){el.scrollIntoView({behavior:'smooth',block:'center'});"
-            # Tailwind ring utilities, added then removed, so the highlight needs no
-            # stylesheet and leaves no residue on the element.
-            "el.classList.add('ring-2','ring-blue-400','rounded');"
-            "setTimeout(()=>el.classList.remove("
-            "'ring-2','ring-blue-400','rounded'),2000);}"
-        ),
+        # Tailwind ring utilities, added then removed, so the highlight needs no stylesheet
+        # and leaves no residue on the element (the shared script).
+        on_click=lambda: ui.run_javascript(SCROLL_TO_MIGRATION_TYPE_JS),  # type: ignore[attr-defined]
     ).props("outline no-caps color=primary")
 
 

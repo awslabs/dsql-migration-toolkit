@@ -151,7 +151,10 @@ def test_a_cdc_only_session_that_streamed_can_change_its_columns_after_the_delet
     state = _state(MigrationType.CDC_ONLY)
     state.set_cdc_stack_phase("running", status="UPDATE_COMPLETE")
     assert exclusion_card_locked(state, _StubJobManager({}))
-    assert "change the excluded columns here" in exclusion_lock_state(state, _StubJobManager({})).reason
+    # It streamed, so CDC promoted the FULL_LOAD step: the table set stays locked after the
+    # Delete, and only the column rules can change (P3-C17 wording).
+    assert "change the column rules (changing the table set needs Start over)" in (
+        exclusion_lock_state(state, _StubJobManager({})).reason)
     # Stop + Delete: the stack is gone; the FULL_LOAD step CDC promoted to DONE is not a load.
     state.set_cdc_stack_phase("absent", status=None)
     assert exclusion_card_locked(state, _StubJobManager({})) is False
@@ -306,7 +309,10 @@ def test_delete_or_create_in_flight_after_a_committed_load_names_start_over():
     state = _state(job_id="job-1")
     state.set_cdc_deploy_job_id("del", kind="delete")
     lock = exclusion_lock_state(state, _StubJobManager({"del": _StubJob("RUNNING")}))
-    assert lock.tier == 0 and "use Start over" in lock.reason
+    # P3-C17: tier 0 is a wait whether or not a load committed (never Start over while the
+    # stack goes away); tier 1 keeps the committed Start-over remedy.
+    assert lock.tier == 0 and "Start over" not in lock.reason
+    assert lock.reason.endswith("Wait for the deletion to finish before changing these exclusions.")
     state.set_cdc_deploy_job_id("inf", kind="infra")
     lock = exclusion_lock_state(state, _StubJobManager({"inf": _StubJob("RUNNING")}))
     assert lock.tier == 1 and "then use Start over" in lock.reason
