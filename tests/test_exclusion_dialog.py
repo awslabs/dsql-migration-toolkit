@@ -77,6 +77,9 @@ class _Ui:
         self.editors: list[_El] = []
         self.refreshes = 0
         self.dialogs: list[_El] = []
+        self.expansions: dict = {}
+        self.selects: list = []
+        self.tables: list = []
 
     def _el(self, kind="el", text=""):
         el = _El(self, kind, text)
@@ -126,8 +129,30 @@ class _Ui:
             callback()
         return self._el("timer")
 
+    def expansion(self, text="", *_a, value=False, on_value_change=None, **_k):
+        el = self._el("expansion", text)
+        el.value = value
+        self.expansions[str(text)] = (on_value_change, el)
+        return el
+
+    def select(self, options=None, *_a, value=None, on_change=None, **_k):
+        el = self._el("select")
+        el.value = value
+        self.selects.append((list(options or []), on_change, el))
+        return el
+
+    def table(self, *_a, columns=None, rows=None, **_k):
+        el = self._el("table")
+        self.tables.append(list(rows or []))
+        return el
+
     def __getattr__(self, _name):
         return lambda *_a, **_k: self._el(_name)
+
+    def expand(self, prefix):
+        title = next(t for t in self.expansions if t.startswith(prefix))
+        handler, _el = self.expansions[title]
+        handler(SimpleNamespace(value=True))
 
     def click(self, label, index=-1):
         handler, _el = self.buttons[label][index]
@@ -271,3 +296,97 @@ def test_a_lock_that_appears_after_open_refuses_the_save_and_keeps_the_dialog():
     assert ui.notified and ui.closed == 0 and calls["refresh"] == 0
     assert state.lob_exclusions() == {"shop.u": {"note"}}
     assert ui.editors[0].value == "exclude shop.t.a"
+
+
+# --- P3-C15: the sections -------------------------------------------------------------
+
+from dsql_migrator.ui.data_migration._exclusion_dialog import REVIEW_FILTERS, lob_rows  # noqa: E402
+
+
+def _open(ctx, text):
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx)
+    ui.type_text(text)
+    return ui
+
+
+def test_review_all_filters_and_paging_survive_a_rerender():
+    state = DataMigrationState()
+    ctx, _calls = _ctx(state)
+    ui = _open(ctx, "exclude shop.t.a\nexclude shop.t.id\ninclude shop.t.a\nexclude shop.u.note\n"
+                    "exclude table shop.audit_*")
+    ui.expand("Review all")
+    options, on_change, _el = ui.selects[-1]
+    assert tuple(options) == REVIEW_FILTERS == ("All", "Excluded", "Blocked", "Warning")
+    statuses = {r["status"].split(" ")[0] for r in ui.tables[-1]}
+    assert statuses == {"Unselected", "Excluded", "Kept", "Blocked"}  # id: primary key
+    on_change(SimpleNamespace(value="Excluded"))
+    assert {r["status"].split(" ")[0] for r in ui.tables[-1]} == {"Excluded"}
+    assert state.exclusion_dialog_ui()["review_filter"] == "Excluded"
+    ui.type_text("exclude shop.t.a\nexclude shop.u.note")  # a re-render keeps the filter
+    assert {r["status"].split(" ")[0] for r in ui.tables[-1]} == {"Excluded"}
+    ui.click("Cancel")
+    assert state.exclusion_dialog_ui() == {}  # cleared on close
+
+
+def test_lob_rows_are_the_open_candidates_and_add_rule_quotes_the_name():
+    tables = [_t("shop.t", a="longtext", b="mediumtext"), _t("my s.t2", c="longblob")]
+    inv = SimpleNamespace(tables=tables)
+    state = DataMigrationState()
+    ctx, _calls = _ctx(state)
+    ctx.inventory_fn = lambda: inv
+    names = [t.name for t in tables]
+    inputs = ExclusionInputs(selected=names, applied={}, preserve_foreign_keys=True,
+                             migratable=names, signature=("s",))
+    ctx.inputs_fn = lambda: inputs
+    ui = _open(ctx, "exclude shop.t.a")
+    ui.expand("Oversized-LOB candidates")
+    rows = [(r["table"], r["column"]) for r in lob_rows(ctx, inv, inputs, ctx.migration_state._exclusion_resolution_memo["editor"][2])]
+    assert rows == [("my s.t2", "c"), ("shop.t", "b")]  # a is excluded; id (PK) never offered
+    ui.click("+ add rule", index=0)
+    assert ui.set_values[-1].splitlines()[-1] == 'exclude "my s".t2.c'
+
+
+def test_an_include_kept_candidate_offers_go_to_its_line():
+    state = DataMigrationState()
+    ctx, _calls = _ctx(state)
+    ui = _open(ctx, "exclude shop.t.*\ninclude shop.t.a")
+    ui.expand("Oversized-LOB candidates")
+    assert "Go to L2" in ui.buttons
+
+
+def test_the_capture_section_is_for_cdc_types_only_and_equals_what_is_sent():
+    from dsql_migrator.ui.data_migration._models import cdc_capture_exclusions
+
+    state = DataMigrationState()
+    ctx, _calls = _ctx(state)
+    ui = _open(ctx, "exclude shop.t.a")
+    assert not any(t.startswith("CDC capture list") for t in ui.expansions)
+    ctx.capture_tables_fn = lambda selected: [t for t in INV.tables if t.name in set(selected)]
+    ui = _open(ctx, "exclude shop.t.a")
+    assert any(t.startswith("CDC capture list") for t in ui.expansions)
+    ui.click("Save")
+    sent = cdc_capture_exclusions(state, INV, INV.tables).sent
+    preview = ctx.migration_state._exclusion_resolution_memo["editor"][2]
+    assert preview.cdc_value == sent
+
+
+def test_target_changes_render_defaults_verbatim_and_summarize():
+    ddl = ('CREATE TABLE "shop"."t" ("id" BIGINT NOT NULL, "a" TEXT NOT NULL DEFAULT \'\', '
+           '"b" TEXT DEFAULT \'\\x00\'::bytea, "c" TIMESTAMP DEFAULT (CURRENT_TIMESTAMP + '
+           'INTERVAL \'1 day\'), PRIMARY KEY ("id"))')
+    tables = [_t("shop.t", a="longtext", b="text", c="timestamp")]
+    inv = SimpleNamespace(tables=tables)
+    applied = {"shop.t": SimpleNamespace(target_ddl=ddl, foreign_key_ddls=[],
+                                         preserved_foreign_keys=[], index_ddls=[])}
+    inputs = ExclusionInputs(selected=["shop.t"], applied=applied, preserve_foreign_keys=True,
+                             migratable=["shop.t"], signature=("s",))
+    state = DataMigrationState()
+    ctx, _calls = _ctx(state)
+    ctx.inventory_fn = lambda: inv
+    ctx.inputs_fn = lambda: inputs
+    ui = _open(ctx, "exclude shop.t.a\nexclude shop.t.b\nexclude shop.t.c")
+    ui.expand("Changes to Aurora DSQL")
+    assert "1 x DROP NOT NULL (one-way), 3 x DROP DEFAULT (restored at Cut over)" in ui.texts
+    assert 'ALTER TABLE "shop"."t" ALTER COLUMN "a" DROP NOT NULL' in ui.texts
+    assert "Cut over restores 3 DEFAULTs (new rows only)." in ui.texts

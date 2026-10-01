@@ -211,6 +211,9 @@ class DataMigrationState:
         # Measured value sizes, "table.column" -> ("over" | "ok", when): from the
         # prerequisite run's SOURCE_VALUE_SIZE answers or the popup's Check sizes. Transient.
         self._value_size_cache: dict[str, tuple[str, datetime]] = {}
+        # The open popup's view state (Review-all page and filter, expanded sections, the
+        # LOB section's table filter), so a poll re-render keeps it; cleared on close.
+        self._exclusion_dialog_ui: dict = {}
         # Composite-PK record-key override for CDC, keyed by db.table -> target key
         # columns [leading, pk...]. Set from the applied Schema Conversion when a
         # table's DSQL target has a composite key, so Debezium re-keys the change
@@ -1726,6 +1729,10 @@ class DataMigrationState:
                 table: frozenset(cols)
                 for table, cols in self._excluded_lob_columns.items()
             }
+
+    def exclusion_dialog_ui(self) -> dict:
+        """The open popup's view state (the SAME dict each call; see __init__)."""
+        return self._exclusion_dialog_ui
 
     def value_sizes(self) -> "dict[str, tuple[str, datetime]]":
         """The measured value sizes ("table.column" -> ("over" | "ok", when))."""

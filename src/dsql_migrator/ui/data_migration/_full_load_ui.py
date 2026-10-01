@@ -379,17 +379,13 @@ def _render_overlay_blocks(
                 except OverlayRefusedError:  # computed columns were filtered; defensive
                     continue
             if statements:
-                n_not_null = sum(1 for st in statements if st.action == "DROP NOT NULL")
-                n_default = sum(1 for st in statements if st.action == "DROP DEFAULT")
-                parts = []
-                if n_not_null:
-                    parts.append(f"{n_not_null} x DROP NOT NULL (one-way)")
-                if n_default:
-                    parts.append(f"{n_default} x DROP DEFAULT (restored at Cut over)")
+                from dsql_migrator.ui.data_migration._models import overlay_change_summary
+
                 render_notice(
                     ui,
                     tone="warning",
-                    header="Aurora DSQL changes before loading: " + ", ".join(parts),
+                    header="Aurora DSQL changes before loading: "
+                    + overlay_change_summary(st.action for st in statements),
                     body=(
                         "Each excluded column is made nullable with no DEFAULT before its "
                         "table's first row, so every row stores NULL there."

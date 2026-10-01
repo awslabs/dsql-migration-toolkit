@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
+from dsql_migrator.core.models import SourceType
 from dsql_migrator.core.exclusion_rules import (
     LINE_NO_EFFECT,
     LINE_ONLY_BLOCKED,
@@ -26,11 +27,13 @@ from dsql_migrator.core.exclusion_rules import (
     synthesis_gaps,
 )
 from dsql_migrator.ui.data_migration._models import (
+    capture_ambiguity_warning,
     classify_restored_exclusions,
     exclusion_drift,
     exclusion_row_summary,
     lob_exclusion_candidates,
     open_lob_candidates,
+    overlay_change_summary,
     popup_open_text,
     popup_resolution,
     scope_lob_candidates,
@@ -38,7 +41,7 @@ from dsql_migrator.ui.data_migration._models import (
     stored_exclusion_block_reason,
     stored_exclusion_issues,
 )
-from dsql_migrator.ui.design import inline_hint, render_notice
+from dsql_migrator.ui.design import CODE_SURFACE_CLASSES, EXPANSION_PANEL_CLASSES, inline_hint, render_notice
 
 TITLE = "Exclude tables & columns"
 BUTTON_LABEL = "Exclude tables & columns..."
@@ -62,6 +65,27 @@ _EDITOR_CSS = (
 )
 _DEBOUNCE_SECONDS = 0.3
 _SHOWN = 5
+_PAGE_SIZE = 25
+REVIEW_FILTERS = ("All", "Excluded", "Blocked", "Warning")
+_STATUS = {"unselected": "Unselected", "excluded": "Excluded", "blocked": "Blocked",
+           "kept": "Kept"}
+HONESTY_FOOTER = (
+    "Not highlighted, but can still exceed limits: MySQL JSON and spatial columns; "
+    "PostgreSQL arrays, xml, tsvector and geometric types; large varchar(n)/char(n) holding "
+    "multi-byte text. A row over 2 MiB is not checked. You can still exclude them with a rule."
+)
+QUARANTINE_CONSEQUENCE = (
+    "If loaded, each such row is quarantined (kept out of Aurora DSQL); past 1,000 "
+    "quarantined rows the table fails. Excluding the column keeps the rows."
+)
+# What the SOURCE type can hold -- always worded as a ceiling, never a measurement.
+_TYPE_ALLOWS = {
+    SourceType.MYSQL: {"mediumtext": "16 MiB", "mediumblob": "16 MiB", "longtext": "4 GiB",
+                       "longblob": "4 GiB"},
+    SourceType.POSTGRES: {"text": "about 1 GB", "bytea": "about 1 GB", "json": "about 1 GB",
+                          "character varying": "about 1 GB", "varchar": "about 1 GB",
+                          "jsonb": "about 256 MiB"},
+}
 
 
 @dataclass
@@ -263,16 +287,22 @@ def _build_edit_dialog(ui, ctx: ExclusionDialogContext) -> None:
     stored_at_open = state.lob_exclusions()
     token = state.exclusion_edit_token()
     held = {"text": text, "timer": None}
+    view = state.exclusion_dialog_ui()
+    view.clear()
     ui.add_css(_EDITOR_CSS)
 
     with ui.dialog().props("persistent") as dialog, ui.card().classes("gap-3").style(
         "width: min(980px, 94vw); max-width: 94vw"
     ):
+        def _close() -> None:
+            view.clear()
+            dialog.close()
+
         with ui.row().classes("items-center gap-2 w-full no-wrap"):
             ui.label(TITLE).classes("text-base font-semibold")
             ui.icon("help_outline").classes("text-gray-400 cursor-help").tooltip(HELP_TOOLTIP)
             ui.space()
-            ui.button(on_click=dialog.close).props(
+            ui.button(on_click=_close).props(
                 "flat dense round size=sm icon=close color=grey-7"
             ).tooltip("Close without saving")
         ui.label(HELP_TEXT).classes("text-xs text-gray-600")
@@ -292,6 +322,12 @@ def _build_edit_dialog(ui, ctx: ExclusionDialogContext) -> None:
                 for note in status.notes:
                     inline_hint(ui, f"      {note}", tone="neutral")
             _render_result(ui, resolution)
+            _render_review_all(ui, resolution, view, _run_preview_now)
+            _render_lob_section(ui, ctx, inventory, inputs, resolution, view, _add_rules,
+                                _run_preview_now)
+            _render_target_changes(ui, ctx, resolution, view, _run_preview_now)
+            if ctx.capture_tables_fn is not None:
+                _render_capture_section(ui, resolution, view, _run_preview_now)
             if synthesized:
                 gaps = synthesis_gaps(resolution, stored_at_open, _migratable(inventory, inputs))
                 if gaps:
@@ -312,6 +348,14 @@ def _build_edit_dialog(ui, ctx: ExclusionDialogContext) -> None:
             save_button.set_enabled(resolution.can_save)
 
         def _run_preview_now() -> None:
+            preview.refresh()
+
+        def _add_rules(lines: Sequence[str]) -> None:
+            text = held["text"]
+            for line in lines:
+                text = _append_line(text, line)
+            held["text"] = text
+            editor.set_value(text)
             preview.refresh()
 
         def _on_edit(value: str) -> None:
@@ -342,11 +386,11 @@ def _build_edit_dialog(ui, ctx: ExclusionDialogContext) -> None:
             if reason:
                 ui.notify(reason, type="warning", multi_line=True)
                 return
-            dialog.close()
+            _close()
             ctx.refresh()
 
         with ui.row().classes("w-full justify-end gap-2"):
-            ui.button("Cancel", on_click=dialog.close).props("flat no-caps color=grey-8")
+            ui.button("Cancel", on_click=_close).props("flat no-caps color=grey-8")
             save_button = ui.button("Save", on_click=_save).props("no-caps color=primary")
         preview()
     ui.timer(0.05, dialog.open, once=True)
@@ -416,6 +460,245 @@ def _render_result(ui, resolution) -> None:
             inline_hint(ui, f"... and {len(warned) - _SHOWN} more warnings", tone="warning")
 
 
+# --- the sections ----------------------------------------------------------------------
+
+
+def _expansion(ui, title: str, view: dict, key: str, rerun):
+    """A collapsed section whose content is drawn only while expanded (the open state
+    lives in the view dict, so a re-render keeps it)."""
+    def _toggle(event) -> None:
+        view[key] = bool(getattr(event, "value", False))
+        rerun()
+
+    return ui.expansion(title, value=bool(view.get(key)), on_value_change=_toggle).classes(
+        f"w-full {EXPANSION_PANEL_CLASSES}")
+
+
+def review_rows(resolution, status_filter: str = "All") -> "list[dict]":
+    """The ONE Review-all list (tables and columns, blocked included). Kept and
+    Unselected rows have no filter of their own: they appear under All only."""
+    rows = []
+    for item in resolution.items:
+        if status_filter == "Excluded" and item.kind != "excluded":
+            continue
+        if status_filter == "Blocked" and item.kind != "blocked":
+            continue
+        if status_filter == "Warning" and not item.warning:
+            continue
+        name = item.table if item.column is None else f"{item.table}.{item.column}"
+        why = list(item.changes) + list(item.why)
+        if item.kind == "excluded" and not item.changes:
+            why.insert(0, "none (nullable)")
+        rows.append({
+            "item": name,
+            "status": _STATUS[item.kind] + (" (!)" if item.warning else ""),
+            "lines": ", ".join(f"L{n}" for n in item.lines),
+            "why": "; ".join(why),
+        })
+    return rows
+
+
+def _render_review_all(ui, resolution, view: dict, rerun) -> None:
+    total = len(resolution.items)
+    if not total:
+        return
+    with _expansion(ui, f"Review all {total} items", view, "review_open", rerun):
+        if not view.get("review_open"):
+            return
+        status_filter = view.get("review_filter", "All")
+
+        def _set_filter(event) -> None:
+            view["review_filter"] = getattr(event, "value", "All") or "All"
+            view["review_page"] = 1
+            rerun()
+
+        rows = review_rows(resolution, status_filter)
+        pages = max(1, -(-len(rows) // _PAGE_SIZE))
+        page = min(max(1, int(view.get("review_page", 1))), pages)
+        view["review_page"] = page
+
+        def _go(delta: int) -> None:
+            view["review_page"] = min(max(1, page + delta), pages)
+            rerun()
+
+        with ui.row().classes("items-center gap-2 w-full"):
+            ui.select(list(REVIEW_FILTERS), value=status_filter, label="Status",
+                      on_change=_set_filter).props("dense outlined").classes("w-40")
+            ui.space()
+            ui.label(f"page {page} of {pages}").classes("text-xs text-gray-500")
+            ui.button(on_click=lambda: _go(-1)).props("flat dense round size=sm icon=chevron_left")
+            ui.button(on_click=lambda: _go(1)).props("flat dense round size=sm icon=chevron_right")
+        ui.table(
+            columns=[
+                {"name": "item", "label": "Item", "field": "item", "align": "left"},
+                {"name": "status", "label": "Status", "field": "status", "align": "left"},
+                {"name": "lines", "label": "Lines", "field": "lines", "align": "left"},
+                {"name": "why", "label": "Why / target change", "field": "why", "align": "left"},
+            ],
+            rows=rows[(page - 1) * _PAGE_SIZE: page * _PAGE_SIZE],
+            row_key="item",
+        ).props("dense flat wrap-cells").classes("w-full")
+
+
+def lob_rows(ctx: ExclusionDialogContext, inventory, inputs, resolution) -> "list[dict]":
+    """Section 4's rows: the type-based candidates of the tables in scope, minus what the
+    OPEN rules exclude (never a primary key: the candidates never offer one)."""
+    from dsql_migrator.core.converter import parse_target_column_types
+    from dsql_migrator.core.exclusion_rules import rule_part_token
+    from dsql_migrator.core.prerequisites import (
+        _format_limit,
+        dsql_value_limit_bytes,
+        dsql_value_limit_is_compressed,
+    )
+
+    source_type = session_source_type(ctx.session)
+    candidates = scope_lob_candidates(
+        lob_exclusion_candidates(inventory, source_type=source_type),
+        selected_tables=list(resolution.in_scope), stored_selection=(),
+    )
+    sizes = ctx.migration_state.value_sizes()
+    tables = {t.name: t for t in getattr(inventory, "tables", None) or ()}
+    rows = []
+    for candidate in open_lob_candidates(candidates, resolution.columns):
+        table = tables.get(candidate.table)
+        ddl = getattr((inputs.applied or {}).get(candidate.table), "target_ddl", None) or ""
+        target_types = parse_target_column_types(ddl) if ddl else {}
+        for name in candidate.columns:
+            column = next((c for c in table.columns if c.name == name), None) if table else None
+            source = (getattr(column, "mysql_type", "") or "").strip()
+            base = source.lower().split("(")[0].strip()
+            target = target_types.get(name, "")
+            limit_type = target or base
+            limit = _format_limit(dsql_value_limit_bytes(limit_type))
+            compressed = dsql_value_limit_is_compressed(limit_type) and limit_type != "bytea"
+            collation = (getattr(column, "collation", None) or "").lower()
+            charset = None
+            if (source_type is SourceType.MYSQL and collation
+                    and not collation.startswith("utf8mb4") and "text" in base):
+                charset = collation.split("_")[0]
+            cached = sizes.get(f"{candidate.table}.{name}")
+            schema, _sep, rest = candidate.table.partition(".")
+            rows.append({
+                "table": candidate.table, "column": name, "source": source, "target": target,
+                "allows": _TYPE_ALLOWS.get(source_type, {}).get(base),
+                "limit": limit, "compressed": compressed, "charset": charset,
+                "result": cached,
+                "kept_by": resolution.kept_by.get((candidate.table, name), ()),
+                "rule": "exclude " + ".".join(rule_part_token(x) for x in (schema, rest, name)),
+            })
+    return rows
+
+
+def _size_label(result, charset: "Optional[str]") -> "tuple[str, str]":
+    if result is None:
+        return "Not checked", "neutral"
+    verdict, at = result
+    when = at.astimezone().strftime("%H:%M") if at is not None else ""
+    if verdict == "over":
+        return f"Over the limit found · {when}. {QUARANTINE_CONSEQUENCE}", "warning"
+    caveat = (f" (measured in {charset}; Aurora DSQL stores UTF-8, which can be larger)"
+              if charset else "")
+    return f"No value over the limit · {when}{caveat}", "success"
+
+
+def _render_lob_section(ui, ctx, inventory, inputs, resolution, view, add_rules, rerun) -> None:
+    rows = lob_rows(ctx, inventory, inputs, resolution)
+    over = [r for r in rows if r["result"] and r["result"][0] == "over" and not r["kept_by"]]
+    title = f"Oversized-LOB candidates ({len(rows)})"
+    if over:
+        title += f" - {len(over)} over the limit found"
+    with _expansion(ui, title, view, "lob_open", rerun):
+        if not view.get("lob_open"):
+            return
+        ui.label("Type-based: these types can hold a value over Aurora DSQL's per-value limit. "
+                 "Sizes are measured only if you ask.").classes("text-xs text-gray-600")
+        table_filter = view.get("lob_table")
+        for row in rows:
+            if table_filter and row["table"] != table_filter:
+                continue
+            with ui.row().classes("items-center gap-2 w-full no-wrap"):
+                arrow = f"  {row['source']} -> {row['target']}" if row["target"] else f"  {row['source']}"
+                ui.label(f"{row['table']}.{row['column']}{arrow}").classes("text-xs font-mono")
+                ui.space()
+                if row["kept_by"]:
+                    first = row["kept_by"][0]
+                    ui.button(f"Go to L{first}", on_click=lambda _e=None, n=first: ui.notify(
+                        f"L{n} includes it, so a rule here would do nothing: edit or delete L{n}.")
+                    ).props("flat dense no-caps size=sm color=primary")
+                else:
+                    ui.button("+ add rule", on_click=lambda _e=None, r=row["rule"]: add_rules([r])
+                              ).props("flat dense no-caps size=sm color=primary")
+            parts = []
+            if row["allows"]:
+                parts.append(f"Type allows up to {row['allows']}.")
+            parts.append(f"Limit {row['limit']}.")
+            label, tone = _size_label(row["result"], row["charset"])
+            hint = inline_hint(ui, " ".join(parts) + " " + label, tone=tone)
+            if row["compressed"]:
+                hint.tooltip("The limit applies to the compressed size; the size check "
+                             "measures uncompressed bytes (an upper bound).")
+        if over:
+            n = len(over)
+            ui.button(f"+ add rules for the {n} over the limit",
+                      on_click=lambda: add_rules([r["rule"] for r in over])).props(
+                "flat dense no-caps size=sm color=primary")
+        inline_hint(ui, HONESTY_FOOTER, tone="neutral")
+
+
+def _statement_action(text: str) -> str:
+    return "DROP NOT NULL" if text.rstrip().endswith("DROP NOT NULL") else "DROP DEFAULT"
+
+
+def _render_target_changes(ui, ctx, resolution, view, rerun) -> None:
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    statements = [s for c in resolution.target_changes for s in c.statements]
+    notes = [c.note for c in resolution.target_changes if c.note]
+    restores = sum(len(c.restores) for c in resolution.target_changes)
+    if not statements and not notes:
+        return
+    cdc_only = getattr(ctx.migration_state, "migration_type", None) is MigrationType.CDC_ONLY
+    when = "run when CDC starts" if cdc_only else "run when the load starts"
+    title = (f"Changes to Aurora DSQL ({len(statements)} statement"
+             f"{'s' if len(statements) != 1 else ''}, {when})")
+    with _expansion(ui, title, view, "changes_open", rerun):
+        if not view.get("changes_open"):
+            return
+        summary = overlay_change_summary(_statement_action(s) for s in statements)
+        if summary:
+            inline_hint(ui, summary, tone="warning")
+        with ui.column().classes(f"w-full gap-0 p-2 {CODE_SURFACE_CLASSES}"):
+            for statement in statements:
+                ui.label(statement).classes("text-xs font-mono wrap-anywhere")
+        if any(_statement_action(s) == "DROP NOT NULL" for s in statements):
+            inline_hint(ui, "NOT NULL is dropped one way: Aurora DSQL cannot add NOT NULL back "
+                        "in place (a later Drop & reload of the table restores it).",
+                        tone="warning")
+        if restores:
+            inline_hint(ui, f"Cut over restores {restores} DEFAULT{'s' if restores != 1 else ''} "
+                        "(new rows only).")
+        for note in notes:
+            inline_hint(ui, note, tone="neutral")
+
+
+def _render_capture_section(ui, resolution, view, rerun) -> None:
+    from dsql_migrator.core.cdc import CDC_PARAMETER_BYTE_LIMIT
+
+    if resolution.cdc_value is None:
+        return
+    title = f"CDC capture list ({resolution.cdc_bytes:,} of {CDC_PARAMETER_BYTE_LIMIT:,} bytes)"
+    with _expansion(ui, title, view, "capture_open", rerun):
+        if not view.get("capture_open"):
+            return
+        with ui.column().classes(f"w-full gap-0 p-2 {CODE_SURFACE_CLASSES}"):
+            ui.label(resolution.cdc_value or "(nothing excluded at capture)").classes(
+                "text-xs font-mono wrap-anywhere")
+        ambiguity = (capture_ambiguity_warning(resolution.capture_preview)
+                     if resolution.capture_preview is not None else None)
+        if ambiguity:
+            inline_hint(ui, ambiguity, tone="warning")
+
+
 def _build_read_only_dialog(ui, ctx: ExclusionDialogContext, lock) -> None:
     """The locked popup: the rules as saved (disabled), the lock's own reason and remedy.
     The per-cell variants and their remedy buttons come with the read-only modes."""
@@ -442,6 +725,10 @@ def _build_read_only_dialog(ui, ctx: ExclusionDialogContext, lock) -> None:
 
 __all__ = [
     "BUTTON_LABEL",
+    "HONESTY_FOOTER",
+    "REVIEW_FILTERS",
+    "lob_rows",
+    "review_rows",
     "ExclusionDialogContext",
     "TITLE",
     "open_exclusion_dialog",

@@ -5000,18 +5000,14 @@ def _render_cdc_overlay_changes(ui, overlay_changes) -> None:
                 ui, tone="info", header="Excluded columns on Aurora DSQL", body=kept
             )
         return
-    n_not_null = sum(1 for st in statements if st.action == "DROP NOT NULL")
-    n_default = sum(1 for st in statements if st.action == "DROP DEFAULT")
-    parts = []
-    if n_not_null:
-        parts.append(f"{n_not_null} x DROP NOT NULL (one-way)")
-    if n_default:
-        parts.append(f"{n_default} x DROP DEFAULT (restored at Cut over)")
+    from dsql_migrator.ui.data_migration._models import overlay_change_summary
+
     _render_notice(
         ui,
         tone="warning",
         icon="table_chart",
-        header="Aurora DSQL changes when CDC starts: " + ", ".join(parts),
+        header="Aurora DSQL changes when CDC starts: "
+        + overlay_change_summary(st.action for st in statements),
         body=(
             "They run before any connector is created, so every row CDC inserts holds NULL "
             "in the excluded columns. Aurora DSQL cannot add NOT NULL back in place."

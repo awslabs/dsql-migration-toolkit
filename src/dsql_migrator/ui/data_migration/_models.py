@@ -2286,6 +2286,20 @@ def open_lob_candidates(candidates, excluded: "Mapping[str, Iterable[str]]"):
     return tuple(pair for pair in candidates or () if pair[0] not in gone)
 
 
+def overlay_change_summary(actions: "Iterable[str]") -> str:
+    """"N x DROP NOT NULL (one-way), M x DROP DEFAULT (restored at Cut over)" for the
+    overlay statements' actions -- ONE wording for the popup and both Start dialogs."""
+    actions = list(actions)
+    n_not_null = sum(1 for a in actions if a == "DROP NOT NULL")
+    n_default = sum(1 for a in actions if a == "DROP DEFAULT")
+    parts = []
+    if n_not_null:
+        parts.append(f"{n_not_null} x DROP NOT NULL (one-way)")
+    if n_default:
+        parts.append(f"{n_default} x DROP DEFAULT (restored at Cut over)")
+    return ", ".join(parts)
+
+
 QUARANTINE_RULE_COMMENT = "# from the Full Load quarantine"
 
 

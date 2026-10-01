@@ -816,6 +816,8 @@ class RuleResolution:
     capture_warning: Optional[str] = None
     # selected' -- the tables in scope after this Save, whether or not it changes them.
     in_scope: "tuple[str, ...]" = ()
+    # The capture hook's whole answer (the UI's CdcCaptureExclusions), for its warnings.
+    capture_preview: Optional[object] = None
 
     @property
     def can_save(self) -> bool:
@@ -1302,7 +1304,7 @@ def resolve_exclusion_rules(
         missing = _certain_missing(after, tables, applied_conversions, columns, live_columns)
         if missing:
             global_errors.append(missing)
-    cdc_value = cdc_bytes = capture_warning = None
+    cdc_value = cdc_bytes = capture_warning = preview = None
     if capture is not None:
         from dsql_migrator.core.cdc import CDC_PARAMETER_BYTE_LIMIT
 
@@ -1353,6 +1355,7 @@ def resolve_exclusion_rules(
         cdc_bytes=cdc_bytes,
         capture_warning=capture_warning,
         in_scope=tuple(after),
+        capture_preview=preview,
     )
 
 
