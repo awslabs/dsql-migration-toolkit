@@ -335,3 +335,235 @@ def test_every_key_typed_back_from_its_token_resolves_to_itself():
         rules, errors = parse_rules("exclude type:" + type_name_token(key))
         assert not errors, (key, errors)
         assert resolve_type_name(rules[1].type_names[0].text, keys, PG) == key, key
+
+
+# --- P3-C03: the resolver -- matching, include-wins precedence, table provenance ----
+
+from dsql_migrator.core.exclusion_rules import (  # noqa: E402
+    LINE_NO_EFFECT,
+    LINE_ONLY_UNSELECTED,
+    resolve_exclusion_rules,
+)
+from dsql_migrator.core.models import TableDef  # noqa: E402
+
+
+def _t(name, *cols, types=None):
+    types = types or {}
+    return TableDef(
+        name=name,
+        columns=[ColumnDef(name="id", mysql_type="bigint")]
+        + [ColumnDef(name=c, mysql_type=types.get(c, "text")) for c in cols],
+        primary_key=["id"],
+    )
+
+
+TABLES = [
+    _t("shop.users", "email", "password_hash", "notes",
+       types={"email": "varchar(255)", "password_hash": "varchar(64)"}),
+    _t("shop.orders", "notes", "memo", types={"memo": "longtext"}),
+    _t("shop.product_media", "content", "caption",
+       types={"content": "longblob", "caption": "varchar(100)"}),
+    _t("shop.audit_2023", "payload", types={"payload": "longtext"}),
+    _t("shop.audit_2024", "payload", types={"payload": "longtext"}),
+    _t("shop.audit_keep", "payload", types={"payload": "longtext"}),
+    _t("shop.pages", "body", types={"body": "longtext"}),
+    _t("shop.a_b", "x"),
+    _t("shop.aXb", "x"),
+    _t("shop.misc", "pct%", "pctX", "q?", "qX"),
+    _t("my schema.order.items", "weird*col", "weirdXcol"),
+    _t("crm.contacts", "ssn"),
+]
+ALL = [t.name for t in TABLES]
+
+
+def _res(text, *, selection=ALL, prev=(), lock=None, reticks=()):
+    return resolve_exclusion_rules(
+        text, migratable=TABLES, source_type=MY, effective_selection=selection,
+        rule_excluded_prev=prev, selection_lock_reason=lock, retick_overrides=reticks,
+    )
+
+
+def _cols(res):
+    return {(t, c) for t, cs in res.columns.items() for c in cs}
+
+
+def test_star_matches_within_one_part_and_other_characters_are_literal():
+    assert _cols(_res("exclude shop.*.notes")) == {("shop.users", "notes"), ("shop.orders", "notes")}
+    assert _cols(_res("exclude shop.audit_*.payload")) == {
+        ("shop.audit_2023", "payload"), ("shop.audit_2024", "payload"), ("shop.audit_keep", "payload")}
+    assert _cols(_res("exclude shop.a_b.x")) == {("shop.a_b", "x")}  # '_' is literal
+    assert _cols(_res("exclude shop.misc.pct%")) == {("shop.misc", "pct%")}
+    assert _cols(_res("exclude shop.misc.q?")) == {("shop.misc", "q?")}
+    assert _cols(_res("exclude *.*.ssn")) == {("crm.contacts", "ssn")}
+    assert _cols(_res("exclude shop.users.email*")) == {("shop.users", "email")}  # '*' matches none
+    # the table splits at its FIRST '.', and '*' never reaches across a part
+    assert _cols(_res("exclude my*.order*.weird*col")) == {
+        ("my schema.order.items", "weird*col"), ("my schema.order.items", "weirdXcol")}
+    assert _cols(_res('exclude "my schema"."order.items"."weird*col"')) == {
+        ("my schema.order.items", "weird*col")}
+    nothing = _res("exclude *.*.users")
+    assert not nothing.columns and [e.code for e in nothing.errors[1]] == ["E2"]
+
+
+def test_identifiers_are_case_sensitive():
+    res = _res("exclude shop.users.Email\nexclude Shop.users.email")
+    assert not res.columns and sorted(res.errors) == [1, 2]
+    assert all(e.code == "E2" for es in res.errors.values() for e in es)
+    assert not res.can_save
+
+
+def test_type_rules_resolve_through_the_normalizer():
+    res = _res("exclude type:LONGTEXT,longblob")
+    assert ("shop.product_media", "content") in _cols(res) and ("shop.pages", "body") in _cols(res)
+    assert all(c in ("payload", "memo", "body", "content") for _t2, cs in res.columns.items() for c in cs)
+    two = _res("exclude type:text,nosuch,alsonot")
+    assert [(e.code, e.name_index) for e in two.errors[1]] == [("E2", 1), ("E2", 2)]
+    assert ("shop.users", "notes") in _cols(two)  # the resolved name still matches
+
+
+def _key(res):
+    return (res.columns, res.tables_to_unselect, res.tables_to_reselect, res.selected_after,
+            res.rule_excluded_after)
+
+
+def test_order_independent_and_idempotent():
+    import random
+
+    lines = [
+        "exclude table shop.audit_*", "include table shop.audit_keep", "exclude shop.*.notes",
+        "include shop.orders.notes", "exclude type:longtext", "include shop.pages.body",
+        "exclude *.*.ssn", "include type:varchar", "exclude shop.users.password_hash",
+    ]
+    base = _res("\n".join(lines))
+    rnd = random.Random(7)
+    for _ in range(40):
+        shuffled = lines[:]
+        rnd.shuffle(shuffled)
+        res = _res("\n".join(shuffled))
+        assert _key(res) == _key(base)
+        by_text = {(shuffled[c.include_line - 1], shuffled[c.exclude_line - 1], c.items)
+                   for c in res.cancellations}
+        assert by_text == {(lines[c.include_line - 1], lines[c.exclude_line - 1], c.items)
+                           for c in base.cancellations}
+    assert _key(_res("\n".join(lines))) == _key(base)
+    # saving the result and resolving the same rules again changes nothing
+    again = _res("\n".join(lines), selection=base.selected_after, prev=base.rule_excluded_after)
+    assert again.selected_after is None and not again.tables_to_unselect
+    assert again.columns == base.columns and again.rule_excluded_after == base.rule_excluded_after
+
+
+def test_include_never_adds_a_table_and_a_table_include_never_cancels_a_column():
+    unticked = [n for n in ALL if n != "shop.pages"]
+    res = _res("include table shop.pages", selection=unticked)
+    assert res.selected_after is None and not res.tables_to_reselect
+    assert res.line_status[1].codes == (LINE_NO_EFFECT,)
+    res = _res("exclude shop.pages.body\ninclude table shop.pages")
+    assert _cols(res) == {("shop.pages", "body")}
+    assert res.line_status[2].codes == (LINE_NO_EFFECT,)
+
+
+def test_a_type_include_cancels_a_column_exclude_and_names_both_lines():
+    text = "\n".join([
+        "exclude shop.*.notes", "exclude shop.users.password_hash", "# a note", "",
+        "include type:varchar",
+    ])
+    res = _res(text)
+    assert ("shop.users", "password_hash") not in _cols(res)
+    (cancel,) = res.cancellations
+    assert (cancel.include_line, cancel.exclude_line, cancel.kind, cancel.items) == (
+        5, 2, "column", (("shop.users", "password_hash"),))
+    assert res.kept_by[("shop.users", "password_hash")] == (5,)
+    assert res.excluded_by[("shop.users", "notes")] == (1,)
+    assert res.line_status[2].kept_by == ((5, 1),) and res.line_status[2].matched == 0
+    assert res.line_status[5].keeps == 1 and res.line_status[5].codes == ()
+
+
+def test_table_provenance():
+    first = _res("exclude table shop.audit_*\ninclude table shop.audit_keep")
+    assert first.tables_to_unselect == ("shop.audit_2023", "shop.audit_2024")
+    assert first.selected_after == tuple(n for n in ALL if n not in first.tables_to_unselect)
+    assert first.rule_excluded_after == {"shop.audit_2023", "shop.audit_2024"}
+    assert first.line_status[1].unselects == ("shop.audit_2023", "shop.audit_2024")
+    assert first.line_status[1].matched == 2 and first.line_status[1].kept_by == ((2, 1),)
+    saved, prov = first.selected_after, first.rule_excluded_after
+    # the operator then unticks shop.pages in the tree; deleting the rule re-selects only
+    # what the rules removed
+    unticked = tuple(n for n in saved if n != "shop.pages")
+    gone = _res("", selection=unticked, prev=prov)
+    assert gone.tables_to_reselect == ("shop.audit_2023", "shop.audit_2024")
+    assert "shop.pages" not in gone.selected_after and gone.rule_excluded_after == frozenset()
+    # an include re-selects
+    inc = _res("exclude table shop.audit_*\ninclude table shop.audit_2024", selection=saved, prev=prov)
+    assert inc.tables_to_reselect == ("shop.audit_2024",) and inc.line_status[2].reselects == (
+        "shop.audit_2024",)
+    assert inc.rule_excluded_after == {"shop.audit_2023", "shop.audit_keep"}
+    # a provenance entry for a table no longer migratable is kept, never invented
+    stale = _res("exclude table shop.audit_*\ninclude table shop.audit_keep", selection=saved,
+                 prev=prov | {"old.gone"})
+    assert stale.selected_after is None and stale.rule_excluded_after == prov | {"old.gone"}
+
+
+def test_retick_override_note():
+    reticked = [n for n in ALL if n != "shop.audit_2023"]
+    res = _res("\n\n\n\n\nexclude table shop.audit_*\ninclude table shop.audit_keep",
+               selection=reticked, prev={"shop.audit_2023"}, reticks={"shop.audit_2024"})
+    assert res.tables_to_unselect == ("shop.audit_2024",)
+    assert ("L6 matches shop.audit_2024, ticked in the tree after your last Save: Save will "
+            "unselect it again") in res.line_status[6].notes
+
+
+def test_e3_only_when_a_locked_selection_would_change():
+    lock = "Locked — a Full Load has already run for this table set. Use 'Start over' to migrate a different set of tables."
+    res = _res("exclude shop.users.notes\nexclude table shop.audit_*", lock=lock)
+    assert list(res.errors) == [2] and res.errors[2][0].code == "E3"
+    assert "Start over" in res.errors[2][0].message and "shop.audit_2023" in res.errors[2][0].message
+    assert not res.can_save
+    applied = [n for n in ALL if n not in ("shop.audit_2023", "shop.audit_2024", "shop.audit_keep")]
+    prov = {"shop.audit_2023", "shop.audit_2024", "shop.audit_keep"}
+    same = _res("exclude table shop.audit_*\nexclude shop.users.notes", selection=applied,
+                prev=prov, lock=lock)
+    assert same.can_save and same.selected_after is None
+    assert "No effect while the table set is locked." in same.line_status[1].notes
+    reinc = _res("exclude table shop.audit_*\ninclude table shop.audit_keep", selection=applied,
+                 prev=prov, lock=lock)
+    assert [e.code for e in reinc.errors[2]] == ["E3"] and 1 not in reinc.errors
+    removed = _res("exclude shop.users.notes", selection=applied, prev=prov, lock=lock)
+    assert not removed.errors and [e.code for e in removed.global_errors] == ["E3"]
+    assert "shop.audit_keep" in removed.global_errors[0].message and not removed.can_save
+
+
+def test_an_empty_result_is_refused():
+    res = _res("exclude table *.*")
+    assert [e.code for e in res.global_errors] == ["E5"] and not res.can_save
+    assert res.selected_after == ()
+
+
+def test_column_only_rules_leave_the_selection_untouched():
+    res = _res("exclude shop.*.notes\nexclude type:longblob", selection=ALL[:5])
+    assert res.selected_after is None and res.rule_excluded_after == frozenset()
+    assert not res.tables_to_unselect and not res.tables_to_reselect
+    assert set(res.columns) == {"shop.users", "shop.orders", "shop.product_media"}
+
+
+def test_per_line_status():
+    unticked = [n for n in ALL if n != "shop.pages"]
+    res = _res("\n".join([
+        "exclude shop.*.notes",               # L1 matches 2
+        "include shop.orders.notes",          # L2 keeps 1
+        "exclude shop.pages.body",            # L3 only an unselected table: a warning, not E2
+        "include shop.users.email",           # L4 cancels nothing
+        "exclude table shop.audit_2023",      # L5
+        "exclude shop.audit_2023.payload",    # L6 inert: L5 unselects the table in this Save
+        "exclude shop.nosuch.x",              # L7 E2
+    ]), selection=unticked)
+    st = res.line_status
+    assert (st[1].matched, st[1].kept_by, st[1].codes) == (1, ((2, 1),), ())
+    assert (st[2].keeps, st[2].codes) == (1, ())
+    assert (st[3].matched, st[3].codes) == (0, (LINE_ONLY_UNSELECTED,))
+    assert 3 not in res.errors
+    assert st[4].codes == (LINE_NO_EFFECT,)
+    assert st[5].unselects == ("shop.audit_2023",)
+    assert st[6].codes == (LINE_ONLY_UNSELECTED,)
+    assert "Inert on shop.audit_2023: a table rule unselects it in this Save." in st[6].notes
+    assert [e.code for e in res.errors[7]] == ["E2"] and 7 not in st
+    assert sorted(st) == [1, 2, 3, 4, 5, 6]

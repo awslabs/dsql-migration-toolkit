@@ -30,14 +30,14 @@ from __future__ import annotations
 
 import difflib
 import re
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Collection, Optional
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Callable, Collection, Mapping, Optional, Sequence
 
 from dsql_migrator.core.assessor import _base_type
 from dsql_migrator.core.models import SourceType
 
 if TYPE_CHECKING:
-    from dsql_migrator.core.models import ColumnDef
+    from dsql_migrator.core.models import ColumnDef, TableDef
 
 _WS = " \t"
 # Characters a BARE name part cannot hold (the grammar's bare production).
@@ -525,14 +525,345 @@ def hint_for(
     return target if target in keys else None
 
 
+# --- the resolver: matching, include-wins precedence, table provenance ---------------
+
+# Per-line STATUS codes. Distinct from the column warnings W1-W6 (a line status describes
+# the line, a warning describes an excluded column), so neither copy nor tests can collide.
+LINE_ONLY_UNSELECTED = "only_unselected"  # a warning: every match is on an unselected table
+LINE_NO_EFFECT = "no_effect"  # an include that cancels nothing
+
+@dataclass(frozen=True)
+class Cancellation:
+    """An include line cancelling an exclude line's matches (``kind`` ``table``: table
+    names; ``column``: ``(table, column)`` pairs), in scope only. Every one is shown."""
+
+    include_line: int
+    exclude_line: int
+    kind: str
+    items: tuple
+
+
+@dataclass(frozen=True)
+class LineStatus:
+    """What one rule line did. ``matched``: what an EXCLUDE line puts in effect (stored
+    columns, or tables it unselects or keeps unselected); ``keeps``: what an INCLUDE line
+    cancels; ``kept_by``: ``(include line, count)`` cancelling this exclude line. Only lines
+    with at least one match have a status (a line with none is E2)."""
+
+    line: int
+    action: str
+    kind: str
+    matched: int = 0
+    keeps: int = 0
+    kept_by: "tuple[tuple[int, int], ...]" = ()
+    unselects: "tuple[str, ...]" = ()
+    reselects: "tuple[str, ...]" = ()
+    codes: "tuple[str, ...]" = ()
+    notes: "tuple[str, ...]" = ()
+
+
+@dataclass(frozen=True)
+class RuleResolution:
+    """The resolved rules. ``columns`` (per table, selected' only) and ``selected_after`` /
+    ``rule_excluded_after`` are what a Save stores; everything else explains them.
+
+    ``selected_after`` is ``None`` when the table rules change neither the selection nor
+    the provenance: the TableSelection is then left untouched, so a column-only Save keeps
+    the automatic selection of tables a later Refresh objects adds."""
+
+    rules: "Mapping[int, ParsedRule]"
+    errors: "Mapping[int, tuple[RuleError, ...]]"
+    global_errors: "tuple[RuleError, ...]"
+    columns: "Mapping[str, frozenset[str]]"
+    excluded_by: "Mapping[tuple[str, str], tuple[int, ...]]"
+    kept_by: "Mapping[tuple[str, str], tuple[int, ...]]"
+    cancellations: "tuple[Cancellation, ...]"
+    tables_to_unselect: "tuple[str, ...]"
+    tables_to_reselect: "tuple[str, ...]"
+    selected_after: "Optional[tuple[str, ...]]"
+    rule_excluded_after: "frozenset[str]"
+    line_status: "Mapping[int, LineStatus]"
+
+    @property
+    def can_save(self) -> bool:
+        return not self.errors and not self.global_errors
+
+
+def _part_matcher(part: RulePart) -> "Callable[[str], bool]":
+    """Equality for a quoted or star-free part; otherwise ``*`` is any run of characters
+    (including none) within the part. ``_``, ``%`` and ``?`` are literal: never fnmatch."""
+    if not part.wildcard:
+        text = part.text
+        return lambda name: name == text
+    pattern = re.compile(".*".join(re.escape(seg) for seg in part.text.split("*")), re.DOTALL)
+    return lambda name: pattern.fullmatch(name) is not None
+
+
+def _names(items: "Sequence[str]", limit: int = 3) -> str:
+    shown = ", ".join(items[:limit])
+    return shown if len(items) <= limit else f"{shown} and {len(items) - limit} more"
+
+
+def resolve_exclusion_rules(
+    text: str,
+    *,
+    migratable: "Sequence[TableDef]",
+    source_type: SourceType,
+    effective_selection: "Sequence[str]",
+    rule_excluded_prev: "Collection[str]" = (),
+    selection_lock_reason: Optional[str] = None,
+    retick_overrides: "Collection[str]" = (),
+) -> RuleResolution:
+    """Resolve rule ``text`` against the ``migratable`` tables (the tree's universe, in its
+    order). Include wins and line order never matters: per domain (tables; columns),
+    ``final = U(exclude matches) - U(include matches)``; a table include never cancels a
+    column exclude.
+
+    Tables (the SAME state as the tree): with ``selected`` the effective selection and
+    ``prev_rule`` the tables an earlier Save's rules unselected (``rule_excluded_prev``),
+    ``new_rule = final_tables & (selected | prev_rule)`` and
+    ``selected' = (selected | prev_rule) - new_rule``. So deleting a rule or adding an
+    include re-selects only what the rules removed; a tree-unticked table stays unticked.
+    ``retick_overrides`` are rule-excluded tables re-ticked in the tree since the last Save
+    (a deliberate override): the Save unselects them again, and says so.
+
+    Column and type rules match over every migratable table (a name matching nothing
+    anywhere is E2) but are stored only for ``selected'``. A table name splits at its FIRST
+    ``.``, as :func:`~dsql_migrator.core.cdc.format_column_exclude_value` does; a name with
+    no ``.`` is never matched (introspection always qualifies).
+
+    While ``selection_lock_reason`` holds, a table line that would change the selection is
+    E3, and a re-selection no line causes (a deleted rule) is a global E3. A result that
+    would leave no table selected is the global error E5. Pure.
+    """
+    rules, parsed_errors = parse_rules(text)
+    errors: dict[int, list[RuleError]] = {n: list(es) for n, es in parsed_errors.items()}
+    global_errors: list[RuleError] = []
+    tables: dict[str, "TableDef"] = {}
+    for table in migratable:
+        tables.setdefault(table.name, table)
+    order = list(tables)
+    split = {}
+    for name in order:
+        schema, sep, rest = name.partition(".")
+        if sep:
+            split[name] = (schema, rest)
+    type_keys: Optional[dict] = None
+
+    def _type_keys() -> dict:
+        nonlocal type_keys
+        if type_keys is None:
+            type_keys = {
+                (name, column.name): rule_type_name(column, source_type)
+                for name in order if name in split
+                for column in tables[name].columns
+            }
+        return type_keys
+
+    table_hits: dict[int, list[str]] = {}
+    column_hits: dict[int, list[tuple[str, str]]] = {}
+    for line, rule in sorted(rules.items()):
+        if rule.kind == "type":
+            keys = _type_keys()
+            present = set(keys.values())
+            wanted = set()
+            for index, typed in enumerate(rule.type_names):
+                key = resolve_type_name(typed.text, present, source_type)
+                if key is None:
+                    errors.setdefault(line, []).append(RuleError(
+                        "E2", line,
+                        f"No match: no column of type {type_name_token(typed.text)} in any "
+                        "migratable table.",
+                        name_index=index,
+                    ))
+                else:
+                    wanted.add(key)
+            hits = [item for item, key in keys.items() if key in wanted]
+            if hits:
+                column_hits[line] = hits
+            continue
+        matchers = [_part_matcher(p) for p in rule.parts]
+        if rule.kind == "table":
+            match_schema, match_table = matchers
+            hits_t = [n for n in order if n in split
+                      and match_schema(split[n][0]) and match_table(split[n][1])]
+            if hits_t:
+                table_hits[line] = hits_t
+        else:
+            match_schema, match_table, match_column = matchers
+            hits_c = [(n, column.name) for n in order if n in split
+                      and match_schema(split[n][0]) and match_table(split[n][1])
+                      for column in tables[n].columns if match_column(column.name)]
+            if hits_c:
+                column_hits[line] = hits_c
+        if line not in table_hits and line not in column_hits:
+            errors.setdefault(line, []).append(RuleError(
+                "E2", line, "No match: nothing in any migratable table matches this rule."))
+
+    def _by_action(hits_by_line: dict, action: str) -> dict:
+        found: dict = {}
+        for line, hits in hits_by_line.items():
+            if rules[line].action == action:
+                for item in hits:
+                    found.setdefault(item, []).append(line)
+        return found
+
+    excl_t, incl_t = _by_action(table_hits, "exclude"), _by_action(table_hits, "include")
+    excl_c, incl_c = _by_action(column_hits, "exclude"), _by_action(column_hits, "include")
+
+    known = set(order)
+    selected = set(effective_selection) & known
+    prev_rule = set(rule_excluded_prev) & known
+    reach = selected | prev_rule
+    new_rule = {n for n in excl_t if n not in incl_t} & reach
+    after = [n for n in order if n in reach and n not in new_rule]
+    after_set = set(after)
+    unselect = tuple(n for n in order if n in selected and n not in after_set)
+    reselect = tuple(n for n in order if n in after_set and n not in selected)
+    changed = after_set != selected or new_rule != prev_rule
+    # A provenance entry for a table no longer migratable is kept, not invented or lost.
+    rule_excluded_after = frozenset(new_rule | (set(rule_excluded_prev) - known))
+
+    columns: dict[str, set[str]] = {}
+    excluded_by: dict = {}
+    kept_by: dict = {}
+    for item, lines in excl_c.items():
+        if item[0] not in after_set:
+            continue
+        if item in incl_c:
+            kept_by[item] = tuple(sorted(incl_c[item]))
+        else:
+            columns.setdefault(item[0], set()).add(item[1])
+            excluded_by[item] = tuple(sorted(lines))
+
+    cancel: dict = {}
+    for kind, hits_by_line, excl, in_scope in (
+        ("table", table_hits, excl_t, lambda n: n in reach),
+        ("column", column_hits, excl_c, lambda i: i[0] in after_set),
+    ):
+        for line, hits in hits_by_line.items():
+            if rules[line].action != "include":
+                continue
+            for item in hits:
+                if in_scope(item):
+                    for exclude_line in excl.get(item, ()):
+                        cancel.setdefault((line, exclude_line, kind), []).append(item)
+    cancellations = tuple(
+        Cancellation(i, x, kind, tuple(items)) for (i, x, kind), items in sorted(cancel.items()))
+
+    def _kept_counts(line: int) -> tuple:
+        counts: dict[int, int] = {}
+        for (i, x, _kind), items in cancel.items():
+            if x == line:
+                counts[i] = counts.get(i, 0) + len(items)
+        return tuple(sorted(counts.items()))
+
+    unselect_set, reselect_set = set(unselect), set(reselect)
+    line_status: dict[int, LineStatus] = {}
+    for line in sorted(set(table_hits) | set(column_hits)):
+        rule = rules[line]
+        codes: list[str] = []
+        notes: list[str] = []
+        if rule.kind == "table":
+            hits_t = table_hits[line]
+            if rule.action == "exclude":
+                effect = [n for n in hits_t if n in new_rule]
+                line_unselects = tuple(n for n in effect if n in unselect_set)
+                notes.extend(
+                    f"L{line} matches {n}, ticked in the tree after your last Save: Save will "
+                    "unselect it again"
+                    for n in line_unselects if n in retick_overrides
+                )
+                if not any(n in reach for n in hits_t):
+                    codes.append(LINE_ONLY_UNSELECTED)
+                status = LineStatus(line, rule.action, rule.kind, matched=len(effect),
+                                    kept_by=_kept_counts(line), unselects=line_unselects)
+                touched = line_unselects
+            else:
+                kept = [n for n in hits_t if n in excl_t and n in reach]
+                line_reselects = tuple(n for n in kept if n in reselect_set)
+                if not kept:
+                    codes.append(LINE_NO_EFFECT)
+                status = LineStatus(line, rule.action, rule.kind, keeps=len(kept),
+                                    reselects=line_reselects)
+                touched = line_reselects
+            if selection_lock_reason is not None:
+                if touched:
+                    errors.setdefault(line, []).append(RuleError(
+                        "E3", line,
+                        f"This rule would change which tables migrate ({_names(touched)}). "
+                        f"{selection_lock_reason}",
+                    ))
+                else:
+                    notes.append("No effect while the table set is locked.")
+        else:
+            hits_c = column_hits[line]
+            in_scope = [i for i in hits_c if i[0] in after_set]
+            if hits_c and not in_scope:
+                codes.append(LINE_ONLY_UNSELECTED)
+            inert = []
+            for table, _column in hits_c:
+                if table in unselect_set and table not in inert:
+                    inert.append(table)
+            if inert:
+                notes.append(f"Inert on {_names(inert)}: a table rule unselects "
+                             f"{'it' if len(inert) == 1 else 'them'} in this Save.")
+            if rule.action == "exclude":
+                status = LineStatus(line, rule.action, rule.kind,
+                                    matched=sum(1 for i in in_scope if i not in incl_c),
+                                    kept_by=_kept_counts(line))
+            else:
+                kept_n = sum(1 for i in in_scope if i in excl_c)
+                if not kept_n:
+                    codes.append(LINE_NO_EFFECT)
+                status = LineStatus(line, rule.action, rule.kind, keeps=kept_n)
+        line_status[line] = replace(status, codes=tuple(codes), notes=tuple(notes))
+
+    if selection_lock_reason is not None:
+        cancelled = {n for n in incl_t if n in excl_t}
+        unexplained = [n for n in reselect if n not in cancelled]
+        if unexplained:
+            global_errors.append(RuleError(
+                "E3", 0,
+                f"Save would re-select {_names(unexplained)}: no table rule unselects "
+                f"{'it' if len(unexplained) == 1 else 'them'} any more. "
+                f"{selection_lock_reason}",
+            ))
+    if not after and selected:
+        global_errors.append(RuleError(
+            "E5", 0, "These rules would leave no table to migrate: keep at least one table "
+            "selected."))
+
+    return RuleResolution(
+        rules=dict(sorted(rules.items())),
+        errors={n: tuple(es) for n, es in sorted(errors.items())},
+        global_errors=tuple(global_errors),
+        columns={t: frozenset(cs) for t, cs in sorted(columns.items())},
+        excluded_by=excluded_by,
+        kept_by=kept_by,
+        cancellations=cancellations,
+        tables_to_unselect=unselect,
+        tables_to_reselect=reselect,
+        selected_after=tuple(after) if changed else None,
+        rule_excluded_after=rule_excluded_after,
+        line_status=line_status,
+    )
+
+
 __all__ = [
+    "LINE_NO_EFFECT",
+    "LINE_ONLY_UNSELECTED",
+    "Cancellation",
+    "LineStatus",
     "ParsedRule",
+    "RuleResolution",
     "RuleError",
     "RulePart",
     "Suggestion",
     "hint_for",
     "parse_rules",
     "reduce_typed_name",
+    "resolve_exclusion_rules",
     "resolve_type_name",
     "rule_type_name",
     "rule_part_token",
