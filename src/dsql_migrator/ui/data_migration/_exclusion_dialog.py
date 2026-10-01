@@ -594,6 +594,8 @@ def _size_label(result, charset: "Optional[str]") -> "tuple[str, str]":
         return "Not checked", "neutral"
     verdict, at = result
     when = at.astimezone().strftime("%H:%M") if at is not None else ""
+    if verdict == "unknown":
+        return "Not determined: stopped after 15 s (or cancelled)", "neutral"
     if verdict == "over":
         return f"Over the limit found · {when}. {QUARANTINE_CONSEQUENCE}", "warning"
     caveat = (f" (measured in {charset}; Aurora DSQL stores UTF-8, which can be larger)"
@@ -613,9 +615,22 @@ def _render_lob_section(ui, ctx, inventory, inputs, resolution, view, add_rules,
         ui.label("Type-based: these types can hold a value over Aurora DSQL's per-value limit. "
                  "Sizes are measured only if you ask.").classes("text-xs text-gray-600")
         table_filter = view.get("lob_table")
-        for row in rows:
-            if table_filter and row["table"] != table_filter:
-                continue
+        shown_rows = [r for r in rows if not table_filter or r["table"] == table_filter]
+        pages = max(1, -(-len(shown_rows) // _PAGE_SIZE))
+        page = min(max(1, int(view.get("lob_page", 1))), pages)
+        view["lob_page"] = page
+        page_rows = shown_rows[(page - 1) * _PAGE_SIZE: page * _PAGE_SIZE]
+        if pages > 1:
+            def _go(delta: int) -> None:
+                view["lob_page"] = min(max(1, page + delta), pages)
+                rerun()
+
+            with ui.row().classes("items-center gap-2 w-full"):
+                ui.space()
+                ui.label(f"page {page} of {pages}").classes("text-xs text-gray-500")
+                ui.button(on_click=lambda: _go(-1)).props("flat dense round size=sm icon=chevron_left")
+                ui.button(on_click=lambda: _go(1)).props("flat dense round size=sm icon=chevron_right")
+        for row in page_rows:
             with ui.row().classes("items-center gap-2 w-full no-wrap"):
                 arrow = f"  {row['source']} -> {row['target']}" if row["target"] else f"  {row['source']}"
                 ui.label(f"{row['table']}.{row['column']}{arrow}").classes("text-xs font-mono")
@@ -642,7 +657,94 @@ def _render_lob_section(ui, ctx, inventory, inputs, resolution, view, add_rules,
             ui.button(f"+ add rules for the {n} over the limit",
                       on_click=lambda: add_rules([r["rule"] for r in over])).props(
                 "flat dense no-caps size=sm color=primary")
+        _render_check_sizes(ui, ctx, [r for r in page_rows if not r["kept_by"]], rerun)
         inline_hint(ui, HONESTY_FOOTER, tone="neutral")
+
+
+def check_sizes_cost(n: int) -> str:
+    """The cost of Check sizes, stated before the click."""
+    from dsql_migrator.core.prerequisites import VALUE_SIZE_PROBE_TIMEOUT_SECONDS
+
+    worst = n * VALUE_SIZE_PROBE_TIMEOUT_SECONDS
+    worst_text = f"about {worst / 60:.0f} min" if worst >= 90 else f"{worst:.0f} s"
+    return (
+        f"Reads the source: one bounded query per column for the {n} column"
+        f"{'s' if n != 1 else ''} on this page, stopping at the first over-limit value; at "
+        f"most {VALUE_SIZE_PROBE_TIMEOUT_SECONDS:.0f} s each (worst case {worst_text}). "
+        "Cancel stops after the current column."
+    )
+
+
+def _render_check_sizes(ui, ctx: ExclusionDialogContext, rows, rerun) -> None:
+    """[Check sizes] for the page's not-yet-excluded candidates (at most 25): single-flight,
+    cancellable between columns, ONE source engine per pass disposed in a finally, the
+    probe off the event loop, the labels refreshed between awaits (never from a worker)."""
+    from dsql_migrator.ui.data_migration._cdc_monitoring import RECONNECT_REASON
+
+    state = ctx.migration_state
+    rows = rows[:_PAGE_SIZE]
+    if not rows:
+        return
+    running = state.size_check_running()
+    ready = bool(getattr(ctx.session, "connection_ready", lambda: False)())
+    with ui.row().classes("items-center gap-2 w-full"):
+        button = ui.button("Check sizes", on_click=lambda: _check_sizes(ctx, rows, rerun)).props(
+            "outline dense no-caps size=sm color=primary")
+        if running:
+            button.props("disable")
+            ui.button("Cancel", on_click=state.cancel_size_check).props(
+                "flat dense no-caps size=sm color=grey-8")
+        elif not ready:
+            button.props("disable")
+            button.tooltip(RECONNECT_REASON)
+        inline_hint(ui, check_sizes_cost(len(rows)))
+
+
+async def _check_sizes(ctx: ExclusionDialogContext, rows, rerun) -> None:
+    from nicegui import run
+
+    from dsql_migrator.core.prerequisites import (
+        VALUE_SIZE_PROBE_TIMEOUT_SECONDS,
+        dsql_value_limit_bytes,
+    )
+    from dsql_migrator.ui.connect import make_source_engine_factory
+    from dsql_migrator.ui.prerequisite_probes import SessionSourceProbe
+
+    state = ctx.migration_state
+    session = ctx.session
+    if not getattr(session, "connection_ready", lambda: False)():
+        return
+    if not state.begin_size_check():
+        return  # single-flight: a pass is already running
+    rerun()
+    try:
+        config = session.source_config
+        probe = SessionSourceProbe(config, session.source_password)
+        engine = await run.io_bound(make_source_engine_factory(session.source_password), config)
+        try:
+            by_table: dict[str, list] = {}
+            for row in rows:
+                by_table.setdefault(row["table"], []).append(row)
+            for table, cols in by_table.items():
+                if state.size_check_cancelled():
+                    break
+                names = [r["column"] for r in cols]
+                answer = await run.io_bound(
+                    probe.oversized_values, table, names,
+                    limit_bytes=dsql_value_limit_bytes(""),
+                    timeout_seconds=VALUE_SIZE_PROBE_TIMEOUT_SECONDS,
+                    limits={r["column"]: dsql_value_limit_bytes(r["target"] or r["source"])
+                            for r in cols},
+                    column_types={r["column"]: r["source"] for r in cols},
+                    engine=engine, should_cancel=state.size_check_cancelled,
+                )
+                state.record_value_sizes(table, answer or {}, asked=names)
+                rerun()
+        finally:
+            await run.io_bound(engine.dispose)
+    finally:
+        state.end_size_check()
+        rerun()
 
 
 def _statement_action(text: str) -> str:
@@ -725,6 +827,7 @@ def _build_read_only_dialog(ui, ctx: ExclusionDialogContext, lock) -> None:
 
 __all__ = [
     "BUTTON_LABEL",
+    "check_sizes_cost",
     "HONESTY_FOOTER",
     "REVIEW_FILTERS",
     "lob_rows",

@@ -390,3 +390,149 @@ def test_target_changes_render_defaults_verbatim_and_summarize():
     assert "1 x DROP NOT NULL (one-way), 3 x DROP DEFAULT (restored at Cut over)" in ui.texts
     assert 'ALTER TABLE "shop"."t" ALTER COLUMN "a" DROP NOT NULL' in ui.texts
     assert "Cut over restores 3 DEFAULTs (new rows only)." in ui.texts
+
+
+# --- P3-C16: Check sizes ----------------------------------------------------------------
+
+import asyncio  # noqa: E402
+
+import pytest  # noqa: E402
+
+from dsql_migrator.ui.data_migration import _exclusion_dialog as dlg  # noqa: E402
+
+
+class _Engine:
+    def __init__(self, log):
+        self.log = log
+
+    def dispose(self):
+        self.log.append("dispose")
+
+
+def _patch_probe(monkeypatch, *, answers, log, fail=False, on_call=None):
+    import nicegui.run as nrun
+
+    import dsql_migrator.ui.connect as connect
+    import dsql_migrator.ui.prerequisite_probes as probes
+
+    async def io_bound(fn, *a, **k):
+        return fn(*a, **k)
+
+    monkeypatch.setattr(nrun, "io_bound", io_bound)
+
+    def factory_maker(_password, **_k):
+        def factory(_config):
+            log.append("engine")
+            return _Engine(log)
+        return factory
+
+    monkeypatch.setattr(connect, "make_source_engine_factory", factory_maker)
+
+    class _Probe:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def oversized_values(self, table, columns, *, engine, should_cancel, **_k):
+            assert isinstance(engine, _Engine)
+            log.append(("probe", table, tuple(columns)))
+            if on_call:
+                on_call()
+            if fail:
+                raise RuntimeError("boom")
+            out = {}
+            for column in columns:
+                if should_cancel():
+                    break
+                out[column] = answers.get((table, column), False)
+            return out
+
+    monkeypatch.setattr(probes, "SessionSourceProbe", _Probe)
+
+
+def _rows(*pairs):
+    return [{"table": t, "column": c, "source": "longtext", "target": "text"} for t, c in pairs]
+
+
+def test_check_sizes_measures_the_page_once_and_disposes_the_engine(monkeypatch):
+    log = []
+    _patch_probe(monkeypatch, answers={("shop.t", "a"): True}, log=log)
+    state = DataMigrationState()
+    ctx, _calls = _ctx(state)
+    ctx.session.connection_ready = lambda: True
+    ctx.session.source_config = object()
+    ctx.session.source_password = None
+    asyncio.run(dlg._check_sizes(ctx, _rows(("shop.t", "a"), ("shop.t", "b"), ("shop.u", "note")),
+                                 lambda: None))
+    assert log.count("engine") == 1 and log[-1] == "dispose"
+    assert [e for e in log if isinstance(e, tuple)] == [
+        ("probe", "shop.t", ("a", "b")), ("probe", "shop.u", ("note",))]
+    sizes = state.value_sizes()
+    assert sizes["shop.t.a"][0] == "over" and sizes["shop.t.b"][0] == "ok"
+    assert not state.size_check_running()
+
+
+def test_a_second_click_while_running_starts_nothing(monkeypatch):
+    log = []
+    _patch_probe(monkeypatch, answers={}, log=log)
+    state = DataMigrationState()
+    ctx, _calls = _ctx(state)
+    ctx.session.connection_ready = lambda: True
+    ctx.session.source_config = object()
+    ctx.session.source_password = None
+    assert state.begin_size_check()
+    asyncio.run(dlg._check_sizes(ctx, _rows(("shop.t", "a")), lambda: None))
+    assert log == []
+
+
+def test_cancel_stops_after_the_current_column_and_the_rest_read_not_determined(monkeypatch):
+    log = []
+    state = DataMigrationState()
+    _patch_probe(monkeypatch, answers={}, log=log, on_call=state.cancel_size_check)
+    ctx, _calls = _ctx(state)
+    ctx.session.connection_ready = lambda: True
+    ctx.session.source_config = object()
+    ctx.session.source_password = None
+    asyncio.run(dlg._check_sizes(ctx, _rows(("shop.t", "a"), ("shop.t", "b"), ("shop.u", "note")),
+                                 lambda: None))
+    sizes = state.value_sizes()
+    assert sizes["shop.t.a"][0] == "unknown" and "shop.u.note" not in sizes
+    assert dlg._size_label(sizes["shop.t.a"], None)[0].startswith("Not determined")
+
+
+def test_the_engine_is_disposed_even_when_the_probe_fails(monkeypatch):
+    log = []
+    _patch_probe(monkeypatch, answers={}, log=log, fail=True)
+    state = DataMigrationState()
+    ctx, _calls = _ctx(state)
+    ctx.session.connection_ready = lambda: True
+    ctx.session.source_config = object()
+    ctx.session.source_password = None
+    with pytest.raises(RuntimeError):
+        asyncio.run(dlg._check_sizes(ctx, _rows(("shop.t", "a")), lambda: None))
+    assert log[-1] == "dispose" and not state.size_check_running()
+
+
+def test_size_labels():
+    from datetime import datetime, timezone
+
+    at = datetime(2026, 10, 1, 5, 2, tzinfo=timezone.utc)
+    over, tone = dlg._size_label(("over", at), None)
+    assert over.startswith("Over the limit found · ") and "quarantined" in over and tone == "warning"
+    ok, tone = dlg._size_label(("ok", at), "latin1")
+    assert ok.startswith("No value over the limit · ") and "measured in latin1" in ok
+    assert dlg._size_label(None, None) == ("Not checked", "neutral")
+
+
+def test_check_sizes_is_disabled_with_the_reconnect_hint_when_not_ready():
+    from dsql_migrator.ui.data_migration._cdc_monitoring import RECONNECT_REASON
+
+    ui = _Ui()
+    state = DataMigrationState()
+    ctx, _calls = _ctx(state)
+    ctx.session.connection_ready = lambda: False
+    dlg._render_check_sizes(ui, ctx, _rows(("shop.t", "a")), lambda: None)
+    _handler, button = ui.buttons["Check sizes"][-1]
+    assert "disable" in " ".join(button.props_seen)
+    assert any(t.startswith("Reads the source: one bounded query per column for the 1 column")
+               for t in ui.texts)
+    assert RECONNECT_REASON  # the tooltip carries it (the double records no tooltip text)

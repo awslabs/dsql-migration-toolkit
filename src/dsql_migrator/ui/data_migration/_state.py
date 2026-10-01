@@ -214,6 +214,10 @@ class DataMigrationState:
         # The open popup's view state (Review-all page and filter, expanded sections, the
         # LOB section's table filter), so a poll re-render keeps it; cleared on close.
         self._exclusion_dialog_ui: dict = {}
+        # Check sizes is single-flight (a second click starts nothing) and cancellable
+        # between columns. Transient.
+        self._size_check_running: bool = False
+        self._size_check_cancel: bool = False
         # Composite-PK record-key override for CDC, keyed by db.table -> target key
         # columns [leading, pk...]. Set from the applied Schema Conversion when a
         # table's DSQL target has a composite key, so Debezium re-keys the change
@@ -1739,12 +1743,44 @@ class DataMigrationState:
         with self._lock:
             return dict(self._value_size_cache)
 
-    def record_value_sizes(self, table: str, answer: "Mapping[str, bool]") -> None:
-        """Record one table's measured columns (the popup's Check sizes)."""
+    def record_value_sizes(
+        self, table: str, answer: "Mapping[str, bool]", asked: "Iterable[str]" = ()
+    ) -> None:
+        """Record one table's measured columns (the popup's Check sizes); a column ``asked``
+        but absent from ``answer`` was not determined (timed out, failed or cancelled)."""
         now = datetime.now(timezone.utc)
         with self._lock:
+            for column in asked or ():
+                if column not in (answer or {}):
+                    self._value_size_cache[f"{table}.{column}"] = ("unknown", now)
             for column, over in (answer or {}).items():
                 self._value_size_cache[f"{table}.{column}"] = ("over" if over else "ok", now)
+
+    def begin_size_check(self) -> bool:
+        """Start a Check sizes pass unless one runs (single-flight)."""
+        with self._lock:
+            if self._size_check_running:
+                return False
+            self._size_check_running = True
+            self._size_check_cancel = False
+            return True
+
+    def end_size_check(self) -> None:
+        with self._lock:
+            self._size_check_running = False
+            self._size_check_cancel = False
+
+    def cancel_size_check(self) -> None:
+        with self._lock:
+            self._size_check_cancel = True
+
+    def size_check_running(self) -> bool:
+        with self._lock:
+            return self._size_check_running
+
+    def size_check_cancelled(self) -> bool:
+        with self._lock:
+            return self._size_check_cancel
 
     def get_prereq_report(self, mode: MigrationMode) -> Optional[PrerequisiteReport]:
         """Return the last prerequisite report for ``mode``, if any."""
