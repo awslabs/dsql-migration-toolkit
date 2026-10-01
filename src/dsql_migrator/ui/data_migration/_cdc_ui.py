@@ -242,16 +242,9 @@ def _cdc_stack_has_seeder_lambda(migration_state) -> Optional[bool]:
     stack is always created without the Lambda. Returns ``None`` when the engine cannot be
     determined, so the caller shows a range covering both cases instead of guessing.
     """
-    session = getattr(migration_state, "_session", None)
-    if session is None:
-        return None
-    source_type = _cdc_source_type(session)
-    if source_type is None:
-        return None
-    # The seed mode only matters for MySQL (PostgreSQL is forced external), and reading the
-    # host config here would be I/O on a render path. The default IS lambda, so the MySQL
-    # answer stays the conservative "expect the ENI wait".
-    return stack_has_seeder_lambda(source_type, None)
+    from dsql_migrator.ui.data_migration._models import session_has_seeder_lambda
+
+    return session_has_seeder_lambda(getattr(migration_state, "_session", None))
 
 
 def _cdc_start_seed_mode(source_type: SourceType, host_seed_mode: str) -> str:
@@ -6626,6 +6619,8 @@ from dsql_migrator.ui.data_migration._cdc_monitoring import (  # noqa: E402,F401
     _render_migration_table_status,
     exclude_and_reload_block_reason,
     exclusion_lock_state,
+    change_and_reload_block_reason,
+    fk_apply_running,
     exclusion_after_lock_note,
     capture_error_with_remedy,
     cdc_stack_being_deleted,

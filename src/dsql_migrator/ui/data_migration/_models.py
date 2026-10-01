@@ -1570,6 +1570,20 @@ def session_source_type(session) -> SourceType:
     return getattr(session, "restored_source_type", None) or SourceType.MYSQL
 
 
+def session_has_seeder_lambda(session) -> "Optional[bool]":
+    """Does this session's cdc-stack contain the in-VPC offset-seeder Lambda? ``None`` with
+    no session (the caller shows a range covering both). Read through
+    :func:`session_source_type`, so a RESTORED PostgreSQL session (no live source_config)
+    is not taken for MySQL. The seed mode only matters for MySQL (PostgreSQL is forced
+    external), and reading the host config would be I/O on a render path: the default IS
+    lambda, so the MySQL answer stays the conservative "expect the ENI wait"."""
+    if session is None:
+        return None
+    from dsql_migrator.core.cdc import stack_has_seeder_lambda
+
+    return stack_has_seeder_lambda(session_source_type(session), None)
+
+
 def make_lob_candidates_for(inventory, session, migration_state=None):
     """Build the post-quarantine LOB picker's candidate lookup for one session.
 

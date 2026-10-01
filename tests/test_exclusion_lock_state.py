@@ -186,3 +186,122 @@ def test_the_table_picker_lock_says_wait_during_a_delete_and_delete_after_stop()
     reason = selection_lock_reason(live, _StubJobManager({}), status=StepStatus.NOT_STARTED,
                                    migration_type=MigrationType.CDC_ONLY, has_job=False)
     assert "stop CDC, then delete the CDC infrastructure on the CDC step" in reason
+
+
+# --- P3-C12: structured cells, the Change & reload gate, the seeder answer ------------
+
+from dsql_migrator.ui.data_migration._cdc_monitoring import (  # noqa: E402
+    RECONNECT_REASON,
+    change_and_reload_block_reason,
+)
+
+
+def _gate(state, jm, *, ready=True):
+    return change_and_reload_block_reason(state, jm, connections_ready=ready)
+
+
+@pytest.mark.parametrize("status", ["DONE", "FAILED", "CANCELLED", "COMPLETED"])
+def test_change_and_reload_is_open_for_a_finished_job(status):
+    state = _state(job_id="job-1")
+    assert _gate(state, _StubJobManager({"job-1": _StubJob(status)})) is None
+    lock = exclusion_lock_state(state, _StubJobManager({"job-1": _StubJob(status)}))
+    assert (lock.cell, lock.offers_change_and_reload, lock.offers_change_type) == ("R4", True, False)
+
+
+@pytest.mark.parametrize("status", ["PENDING", "RUNNING"])
+def test_a_running_load_holds_change_and_reload(status):
+    state = _state(job_id="job-1")
+    assert _gate(state, _StubJobManager({"job-1": _StubJob(status)})).startswith(
+        "A Full Load is running with the current exclusions.")
+
+
+def test_no_job_record_gives_the_no_run_or_start_over_reason():
+    from dsql_migrator.core.models import StepStatus  # noqa: F401 (the CDC-promoted step is not read)
+
+    state = _state()
+    assert _gate(state, _StubJobManager({})).startswith("No Full Load run is recorded")
+    assert "Start over" not in _gate(state, _StubJobManager({}))
+    gone = _state(job_id="job-1")
+    assert _gate(gone, _StubJobManager({})).endswith("Use Start over to change exclusions.")
+    assert exclusion_lock_state(gone, _StubJobManager({})).cell == "R4"
+    assert not exclusion_lock_state(gone, _StubJobManager({})).offers_change_and_reload
+
+
+def test_the_fk_pass_restore_and_reconnect_clauses():
+    state = _state(job_id="job-1", fk_apply_job_id="fk-1", fk_apply_result=None)
+    jm = _StubJobManager({"job-1": _StubJob("DONE"), "fk-1": _StubJob("RUNNING")})
+    assert _gate(state, jm).startswith("Foreign keys are being applied")
+    state.fk_apply_result = object()
+    assert _gate(state, jm) is None
+    state.cutover_restore_in_flight = lambda: True
+    assert _gate(state, jm).startswith("Cut over is restoring")
+    state.cutover_restore_in_flight = None
+    assert _gate(state, jm) is None
+    assert _gate(state, jm, ready=False) == RECONNECT_REASON
+
+
+def test_tiers_0_to_2_answer_with_their_own_reason_and_cdc_only_with_a_type_switch():
+    state = _state(job_id="job-1")
+    state.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
+    jm = _StubJobManager({"job-1": _StubJob("DONE")})
+    assert _gate(state, jm) == exclusion_lock_state(state, jm).reason
+    cdc_only = _state(mtype=MigrationType.CDC_ONLY, job_id="job-1")
+    reason = _gate(cdc_only, jm)
+    assert "Full load + CDC" in reason and "Change & reload" in reason
+    lock = exclusion_lock_state(cdc_only, jm)
+    assert (lock.cell, lock.offers_change_and_reload, lock.offers_change_type) == ("R4", False, True)
+
+
+def test_the_stack_cells():
+    jm = _StubJobManager({"job-1": _StubJob("DONE")})
+    for mtype, job_id, cell, change_type in [
+        (MigrationType.FULL_LOAD_AND_CDC, "job-1", "R1", False),
+        (MigrationType.FULL_LOAD_ONLY, "job-1", "R1", True),
+        (MigrationType.CDC_ONLY, None, "R2", False),
+        (MigrationType.FULL_LOAD_AND_CDC, None, "R3", False),
+        (MigrationType.FULL_LOAD_ONLY, None, "R3", True),
+    ]:
+        state = _state(mtype=mtype, job_id=job_id)
+        state.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
+        lock = exclusion_lock_state(state, jm)
+        assert (lock.cell, lock.offers_change_type, lock.offers_change_and_reload) == (
+            cell, change_type, False), mtype
+    missing = _state(job_id="job-gone")
+    missing.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
+    assert exclusion_lock_state(missing, jm).cell == "R1b"
+
+
+def test_the_card_lock_is_the_lock_state_and_matches_the_old_predicate():
+    from dsql_migrator.ui.data_migration import exclusion_card_locked
+
+    cases = []
+    for job_id in (None, "job-1"):
+        for phase in (None, "absent", "infra", "running", "provisioning", "partial", "unstable"):
+            for job_kind in (None, "infra", "delete", "start"):
+                cases.append((job_id, phase, job_kind))
+    for job_id, phase, job_kind in cases:
+        state = _state(job_id=job_id)
+        jobs = {"job-1": _StubJob("DONE")}
+        if phase:
+            state.set_cdc_stack_phase(phase, status="CREATE_COMPLETE")
+        if job_kind:
+            state.set_cdc_deploy_job_id("op-1", kind=job_kind)
+            jobs["op-1"] = _StubJob("RUNNING")
+        jm = _StubJobManager(jobs)
+        old = lob_exclusion_lock(state, jm, full_load_committed=job_id is not None)[0]
+        assert exclusion_card_locked(state, jm) is old, (job_id, phase, job_kind)
+
+
+def test_seeder_answer_honours_the_restored_engine():
+    from dsql_migrator.ui.data_migration._cdc_ui import _cdc_stack_has_seeder_lambda
+    from dsql_migrator.ui.data_migration._models import session_has_seeder_lambda
+
+    restored = SimpleNamespace(source_config=None, restored_source_type=SourceType.POSTGRES)
+    live = SimpleNamespace(source_config=SimpleNamespace(source_type=SourceType.MYSQL))
+    assert session_has_seeder_lambda(restored) is False
+    assert session_has_seeder_lambda(live) is True
+    assert session_has_seeder_lambda(None) is None
+    for session, expected in ((restored, False), (live, True), (None, None)):
+        state = DataMigrationState()
+        state._session = session
+        assert _cdc_stack_has_seeder_lambda(state) is expected

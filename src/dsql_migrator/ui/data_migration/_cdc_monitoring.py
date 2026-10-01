@@ -2601,6 +2601,13 @@ class ExclusionLockState:
     tier: "Optional[int]"
     reason: "Optional[str]" = None
     tone: str = "neutral"
+    # The remedy cell (plan LOCK): "R1" a stack + a recorded Full Load, "R1b" a stack + a
+    # Full Load whose record is gone, "R2" a stack, no Full Load, CDC only, "R3" a stack,
+    # no Full Load, a Full Load type, "R4" no stack + a Full Load; None for tiers 0-1 and
+    # unlocked. Which remedy buttons the read-only popup shows follow from it.
+    cell: "Optional[str]" = None
+    offers_change_and_reload: bool = False
+    offers_change_type: bool = False
 
     @property
     def locked(self) -> bool:
@@ -2691,6 +2698,7 @@ def exclusion_lock_state(migration_state, job_manager) -> ExclusionLockState:
         )
         if streaming:
             delete = _stop_then(migration_state, job_manager) + delete
+        full_load_only = migration_type is MigrationType.FULL_LOAD_ONLY
         if job_id is not None:
             # R1 / R1b: a Full Load committed data with this set -- the delete does not
             # release it in this version; Start over does.
@@ -2699,6 +2707,8 @@ def exclusion_lock_state(migration_state, job_manager) -> ExclusionLockState:
                 f"{held} A Full Load also loaded data with them, so they are fixed for this "
                 f"migration. To migrate a different column set, {delete}, then use Start "
                 f"over.{reload_hint}",
+                cell="R1" if job_found else "R1b",
+                offers_change_type=full_load_only,
             )
         if migration_type is MigrationType.CDC_ONLY:
             # R2: no Full Load; the delete takes the stream position with it.
@@ -2727,6 +2737,7 @@ def exclusion_lock_state(migration_state, job_manager) -> ExclusionLockState:
                 f"{held} To change them, {delete}, change the excluded columns here, then "
                 f"deploy it again and Start CDC.{cost} Rows already on Aurora DSQL keep "
                 "their values in newly excluded columns.",
+                cell="R2",
             )
         # R3: a Full Load type, no Full Load has run yet.
         again = (
@@ -2744,6 +2755,8 @@ def exclusion_lock_state(migration_state, job_manager) -> ExclusionLockState:
             2,
             f"{held} To change them, {delete}, change the excluded columns, then {again}. "
             f"No Full Load has run, so nothing needs reloading.{rows}",
+            cell="R3",
+            offers_change_type=full_load_only,
         )
     if job_id is not None:
         # R4: no stack, a Full Load committed data with this set.
@@ -2753,15 +2766,97 @@ def exclusion_lock_state(migration_state, job_manager) -> ExclusionLockState:
                 "Locked — a Full Load has already loaded data using this exclusion set, and "
                 "the record of that run is no longer available. To migrate a different "
                 "column set, use Start over.",
+                cell="R4",
             )
+        cdc_only = migration_type is MigrationType.CDC_ONLY
         return ExclusionLockState(
             3,
             "Locked — a Full Load has already loaded data using this exclusion set, so the "
             "excluded columns are fixed for this migration (changing them now would leave "
             "the already-loaded rows inconsistent with what CDC captures). To migrate a "
             f"different column set, use Start over.{reload_hint}",
+            cell="R4",
+            offers_change_and_reload=not cdc_only,
+            offers_change_type=cdc_only,
         )
     return ExclusionLockState(None)
+
+
+def fk_apply_running(migration_state, job_manager) -> bool:
+    """Is the foreign-key pass's OWN job still running?
+
+    Reads ``fk_apply_job_id``, never ``job_id`` -- that slot belongs to the Full Load, and
+    writing this job into it is what erased the load's per-table rows and export watermark.
+    """
+    jid = getattr(migration_state, "fk_apply_job_id", None)
+    if not jid or getattr(migration_state, "fk_apply_result", None) is not None:
+        return False
+    job = _current_job(job_manager, jid)
+    return job is not None and job.status in ("PENDING", "RUNNING")
+
+
+RECONNECT_REASON = (
+    "Reconnect first: re-verify the source and target on the Connect step (credentials "
+    "are not restored after a restart)."
+)
+
+
+def change_and_reload_block_reason(
+    migration_state, job_manager, *, connections_ready: bool
+) -> "Optional[str]":
+    """Why Change & reload cannot run now, or ``None``: the ONE gate for every entry point
+    (the read-only popup's remedy, the quarantine route, the re-check at Save), evaluated
+    again at CLICK time. The first match of:
+
+    a. the lock's tiers 0-2 (its own reason, so a tier above always wins);
+    b. CDC only with a recorded Full Load (no Full Load step to reload on);
+    c. no job record: none submitted (``job_id`` None), or the record is gone;
+    d. that Full Load is still pending or running;
+    e. the foreign-key pass is running;
+    f. cut over is restoring the excluded columns' DEFAULTs;
+    g. not reconnected (the reload needs the source).
+    """
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    lock = exclusion_lock_state(migration_state, job_manager)
+    if lock.tier in (0, 1, 2):
+        return lock.reason
+    job_id = getattr(migration_state, "job_id", None)
+    if job_id is not None and getattr(migration_state, "migration_type", None) is MigrationType.CDC_ONLY:
+        return (
+            "A CDC only migration has no Full Load step to reload on. Switch the migration "
+            "type to Full load + CDC, use Change & reload there, then continue with CDC."
+        )
+    if job_id is None:
+        return (
+            "No Full Load run is recorded in this session, so there is nothing to reload. "
+            "Close this dialog: with no CDC stack, the column rules can be edited directly."
+        )
+    job = _current_job(job_manager, job_id)
+    if job is None:
+        return (
+            "The record of the last Full Load run is no longer available, so there is "
+            "nothing to reload from. Use Start over to change exclusions."
+        )
+    if job.status in ("PENDING", "RUNNING"):
+        return (
+            "A Full Load is running with the current exclusions. Wait for it to finish (or "
+            "Stop it), then use Change & reload."
+        )
+    if fk_apply_running(migration_state, job_manager):
+        return (
+            "Foreign keys are being applied to these tables. Wait for that pass to finish "
+            "(or stop it), then use Change & reload."
+        )
+    restoring = getattr(migration_state, "cutover_restore_in_flight", None)
+    if callable(restoring) and restoring():
+        return (
+            "Cut over is restoring the excluded columns' DEFAULTs. Wait for it to finish, "
+            "then use Change & reload."
+        )
+    if not connections_ready:
+        return RECONNECT_REASON
+    return None
 
 
 def dlq_exclusion_runbook(migration_state, job_manager) -> "list[str]":

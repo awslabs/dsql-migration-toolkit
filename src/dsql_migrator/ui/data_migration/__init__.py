@@ -2097,17 +2097,8 @@ def build_data_migration_screen(
                 refresh()
 
             def _fk_apply_running() -> bool:
-                """Is the FK action's OWN job still running?
-
-                Reads ``fk_apply_job_id``, never ``job_id`` -- that slot belongs to the Full
-                Load, and writing this job into it is what erased the load's per-table rows
-                and export watermark.
-                """
-                jid = migration_state.fk_apply_job_id
-                if not jid or migration_state.fk_apply_result is not None:
-                    return False
-                job = _current_job(job_manager, jid)
-                return job is not None and job.status in ("PENDING", "RUNNING")
+                """Is the FK action's OWN job still running? (:func:`fk_apply_running`)"""
+                return fk_apply_running(migration_state, job_manager)
 
             def accept_quarantine_and_continue() -> None:
                 # Accept permanently-quarantined rows (>1 MiB values, etc.) as an
@@ -2924,11 +2915,9 @@ def exclusion_card_locked(migration_state, job_manager, session=None) -> bool:
     loaded data" and no way to change the columns. ``session`` is accepted for callers'
     symmetry and unused.
     """
-    return lob_exclusion_lock(
-        migration_state,
-        job_manager,
-        full_load_committed=getattr(migration_state, "job_id", None) is not None,
-    )[0]
+    from dsql_migrator.ui.data_migration._cdc_monitoring import exclusion_lock_state
+
+    return exclusion_lock_state(migration_state, job_manager).locked
 
 
 def table_set_lock_reason(migration_state, job_manager, session) -> Optional[str]:
@@ -5210,6 +5199,8 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     exclude_and_reload_block_reason,
     lob_exclusion_lock,
     exclusion_lock_state,
+    change_and_reload_block_reason,
+    fk_apply_running,
     exclusion_after_lock_note,
     capture_error_with_remedy,
     cdc_stack_being_deleted,
