@@ -1221,6 +1221,7 @@ class PrerequisiteChecker:
                         provisions_replication=request.provisions_replication,
                         cdc_start_resnapshots=request.cdc_start_resnapshots,
                         message_key_columns=request.message_key_columns,
+                        excluded_columns=exclusions,
                     )
                 )
             # MySQL's binlog/GTID rows are NOT listed for a PostgreSQL source, in either

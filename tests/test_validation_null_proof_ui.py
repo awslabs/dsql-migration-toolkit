@@ -303,13 +303,48 @@ def test_a_cdc_only_count_warns_and_stays_ready():
     assert tone == "warning" and "before CDC started" in header
 
 
-def test_legacy_is_information_and_names_no_later_control():
+def test_legacy_is_information_and_its_remedy_follows_the_state():
+    # P3-C23: the line says what the entry is; the remedy is the caller's, state-aware.
     summary, _report = _summary(_item("a", counts={}, legacy={"old": 5}, excluded=("old",)))
     tone, _header, lines = null_proof_lines(summary)
     assert tone == "info" and summary.ready_for_cutover is True
-    assert any("earlier version" in line and "target DEFAULT (5 non-NULL)" in line and "Start over" in line
+    assert any("excluded before v0.1.562 (omit-only)" in line
+               and "target DEFAULT (5 non-NULL)" in line for line in lines)
+    _t, _h, lines = null_proof_lines(summary, legacy_remedy="REMEDY.",
+                                     adopted=frozenset({("a", "old")}))
+    assert any("omit-only (adopted from the attached CDC stack)" in line and line.endswith("REMEDY.")
                for line in lines)
-    assert not any("Change & reload" in line or "Exclude tables" in line for line in lines)
+
+
+def test_the_legacy_remedy_per_state():
+    from types import SimpleNamespace
+
+    from tests.test_ui_data_migration import _StubJob, _StubJobManager
+
+    from dsql_migrator.ui.data_migration import DataMigrationState, MigrationType
+    from dsql_migrator.ui.validation import adopted_exclusions, legacy_values_remedy
+
+    def _st(mtype, job_id=None, phase=None):
+        state = DataMigrationState()
+        state.migration_type = mtype
+        state.job_id = job_id
+        state._session = SimpleNamespace(source_config=None, restored_source_type=None)
+        if phase:
+            state.set_cdc_stack_phase(phase, status="CREATE_COMPLETE")
+        return state
+
+    found = _StubJobManager({"j": _StubJob("DONE")})
+    assert "use Change & reload" in legacy_values_remedy(_st(MigrationType.FULL_LOAD_ONLY, "j"), found)
+    assert "delete the CDC infrastructure first" in legacy_values_remedy(
+        _st(MigrationType.FULL_LOAD_AND_CDC, "j", "infra"), found)
+    assert "switch the migration type to Full load + CDC" in legacy_values_remedy(
+        _st(MigrationType.CDC_ONLY, "j"), found)
+    assert "Start over" in legacy_values_remedy(_st(MigrationType.FULL_LOAD_ONLY, "j"),
+                                                _StubJobManager({}))
+    state = _st(MigrationType.CDC_ONLY)
+    state.restore_exclusion_rules("exclude shop.t.a  # adopted from dsql-cdc-x, omit-only\n"
+                                  "exclude shop.t.b", ())
+    assert adopted_exclusions(state) == {("shop.t", "a")}
 
 
 @pytest.mark.parametrize("reason", ["query_error", "catalog_unreadable", "table_error", "incomplete"])

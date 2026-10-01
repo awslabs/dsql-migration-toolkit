@@ -3069,3 +3069,22 @@ def test_the_report_fills_the_value_size_cache() -> None:
     state.set_prereq_report(MigrationMode.FULL_LOAD, report)
     sizes = state.value_sizes()
     assert sizes["shop.docs.a"][0] == "over" and sizes["shop.docs.b"][0] == "ok"
+
+
+
+def test_an_excluded_uncarryable_column_is_not_reported_and_the_remedy_names_the_popup() -> None:
+    from dsql_migrator.core.prerequisites_postgres import (
+        UNCARRYABLE_COLUMN_ARRIVES_NULL,
+        UNCARRYABLE_ROW_DEAD_LETTERS,
+        check_columns_replicable,
+    )
+
+    facts = _pg_facts_healthy(cdc_uncarryable_columns=_uncarryable(
+        ("bin_arr", "bytea[]", UNCARRYABLE_COLUMN_ARRIVES_NULL),
+        ("num_arr", "numeric[]", UNCARRYABLE_ROW_DEAD_LETTERS),
+    ))
+    assert check_columns_replicable(_table("app.orders"), facts,
+                                    excluded={"bin_arr", "num_arr"}) is None
+    only = check_columns_replicable(_table("app.orders"), facts, excluded={"num_arr"})
+    assert only is not None and "num_arr" not in only.detail and "bin_arr" in only.detail
+    assert "Exclude tables & columns" in only.remediation

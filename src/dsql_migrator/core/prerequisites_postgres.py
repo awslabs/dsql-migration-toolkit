@@ -20,7 +20,7 @@ import this lazily without a cycle. All strings are English, credential-free (Pr
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Mapping, Optional, Sequence
+from typing import Iterable, Mapping, Optional, Sequence
 
 from dsql_migrator.core.models import (
     PrerequisiteCheckId,
@@ -792,7 +792,7 @@ def _it_they(columns: "Sequence[UncarryableCdcColumn]") -> str:
 
 
 def check_columns_replicable(
-    table: TableDef, facts: PostgresCdcFacts
+    table: TableDef, facts: PostgresCdcFacts, *, excluded: "Iterable[str]" = ()
 ) -> Optional[PrerequisiteResult]:
     """WARN when a column's type cannot survive the CDC hop, NAMING each column and type.
 
@@ -820,12 +820,11 @@ def check_columns_replicable(
       mode=CDC)`` -- the mode a "Full load + CDC" run checks -- so the Run button goes
       dead. Full Load carries every one of these columns CORRECTLY (the exporter reads
       ``CAST(to_jsonb(col) AS text)``), so a FAIL would stop the one operation that works.
-    * Nothing in the UI can clear it. Debezium's ``column.exclude.list`` is reachable only
-      through the oversized-LOB dialog (``lob_exclusion_candidates`` offers LOB-typed
-      columns only), and the capture set follows the run's table selection
-      (``_cdc_tables_for_config``), so for e.g. ``bytea[]`` the only routes are the
-      operator's own source DDL or dropping the table from the selection. A FAIL nobody
-      can clear from inside the tool is a dead end, not a gate.
+    * The operator decides, and every option is a choice, not a fix: exclude the column
+      in Exclude tables & columns (it then migrates as NULL and CDC never captures it --
+      an ``excluded`` column is not judged here at all), remodel the type on the source,
+      or leave the table out of the selection. A FAIL would hold the Full Load over a
+      choice.
     * The consequence shape is ``SOURCE_VALUE_SIZE``'s, not ``TABLE_REPLICABLE``'s: rows
       the target cannot store, dead-lettered VISIBLY, which that check grades WARN /
       ``required=False`` as "a decision the operator owns". An UNLOGGED table, by contrast,
@@ -856,7 +855,9 @@ def check_columns_replicable(
                 "then re-run the checks."
             ),
         )
-    found = list(per_table.get(table.name) or ())
+    # Only columns this migration still writes: an excluded column is never captured.
+    skip = set(excluded or ())
+    found = [c for c in (per_table.get(table.name) or ()) if c.column not in skip]
     if not found:
         return None
     fatal = [c for c in found if c.reason == UNCARRYABLE_ROW_DEAD_LETTERS]
@@ -918,7 +919,9 @@ def check_columns_replicable(
         remediation=(
             "Decide before the CDC infrastructure is created: "
             + numeric_route
-            + "remodel the column on the source to a type CDC does carry (text / text[] "
+            + "exclude the column in Exclude tables & columns (under the table list; it "
+            "then migrates as NULL and CDC never captures it), "
+            "remodel the column on the source to a type CDC does carry (text / text[] "
             "carries every one of these), or leave this table out of the selection and "
             "migrate it with Full Load only -- the capture set follows the table "
             "selection, so there is no per-table \"load but do not stream\" switch. "
@@ -1363,6 +1366,7 @@ def check_postgres_cdc_prerequisites(
     provisions_replication: bool = True,
     cdc_start_resnapshots: bool = False,
     message_key_columns: Optional[Mapping[str, Sequence[str]]] = None,
+    excluded_columns: "Optional[Mapping[str, Iterable[str]]]" = None,
 ) -> list[PrerequisiteResult]:
     """Run all PostgreSQL CDC readiness checks (global + per-table REPLICA IDENTITY).
 
@@ -1393,7 +1397,8 @@ def check_postgres_cdc_prerequisites(
     for table in tables:
         results.append(check_table_replicable(table, facts))
         results.append(check_replica_identity(table, facts))
-        _columns = check_columns_replicable(table, facts)
+        _columns = check_columns_replicable(
+            table, facts, excluded=(excluded_columns or {}).get(table.name, ()))
         if _columns is not None:
             results.append(_columns)
         _covers = check_replica_identity_covers_key(

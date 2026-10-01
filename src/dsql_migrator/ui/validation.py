@@ -950,6 +950,41 @@ def _proof_summary(report: ValidationReport) -> dict:
     }
 
 
+def legacy_values_remedy(migration_state, job_manager) -> str:
+    """How an omit-only entry becomes NULL in THIS session: Change & reload converts it
+    only where that is reachable (a Full Load type whose job record exists); otherwise
+    the true remedy for the lock."""
+    from dsql_migrator.ui.data_migration._cdc_monitoring import exclusion_lock_state
+
+    lock = exclusion_lock_state(migration_state, job_manager)
+    if lock.cell == "R4" and lock.offers_change_and_reload:
+        return ("To load it as NULL, use Change & reload in Exclude tables & columns and "
+                "tick the table to reload it.")
+    if lock.cell == "R1":
+        return ("To load it as NULL, delete the CDC infrastructure first, then use Change & "
+                "reload in Exclude tables & columns and tick the table.")
+    if lock.cell == "R4" and lock.offers_change_type:
+        return ("To load it as NULL, switch the migration type to Full load + CDC and use "
+                "Change & reload in Exclude tables & columns there (tick the table).")
+    return "To load it as NULL, Start over and exclude it again."
+
+
+def adopted_exclusions(migration_state) -> "frozenset[tuple[str, str]]":
+    """The ``(table, column)`` entries whose saved rule line says it was adopted from an
+    attached stack (``# adopted from <stack>``)."""
+    from dsql_migrator.core.exclusion_rules import parse_rules
+
+    text = getattr(migration_state, "exclusion_rules_text", lambda: None)() or ""
+    rules, _errors = parse_rules(text)
+    found = set()
+    for rule in rules.values():
+        if (rule.kind == "column" and "adopted from" in rule.comment
+                and not any(p.wildcard for p in rule.parts)):
+            schema, table, column = (p.text for p in rule.parts)
+            found.add((f"{schema}.{table}", column))
+    return frozenset(found)
+
+
 def excluded_values_remedy(migration_state, job_manager) -> str:
     """How to clear values found in an excluded NULL column, for THIS session. Pure-ish
     (reads the job record). Names only actions the tool offers today."""
@@ -3006,6 +3041,13 @@ def build_validation_screen(
 
         validation_state.job_id = job_manager.submit(work)
 
+    def _legacy_context_safe():
+        try:
+            return (legacy_values_remedy(migration_state, job_manager),
+                    adopted_exclusions(migration_state))
+        except Exception:  # noqa: BLE001 - the line still renders without a remedy
+            return ("", frozenset())
+
     def _excluded_values_remedy_safe() -> str:
         try:
             return excluded_values_remedy(migration_state, job_manager)
@@ -3319,6 +3361,11 @@ def build_validation_screen(
                             for item in result.items
                         )
                         else ""
+                    ),
+                    legacy_context=(
+                        _legacy_context_safe()
+                        if any(item.legacy_nonnull_counts for item in result.items)
+                        else ("", frozenset())
                     ),
                 )
                 if busy:
@@ -5447,6 +5494,7 @@ def _render_result(
     identity_sync: "Optional[dict[str, int]]" = None,
     identity_sync_failed: "Optional[dict[str, str]]" = None,
     excluded_values_remedy: str = "",
+    legacy_context: "tuple[str, frozenset]" = ("", frozenset()),
 ) -> None:
     """Render the cut-over readiness report: verdict, checks, then the details.
 
@@ -5577,6 +5625,7 @@ def _render_result(
         _render_readiness_checks(
             ui, summary, drift, diagnose_provider=diagnose_provider,
             excluded_values_remedy=excluded_values_remedy,
+            legacy_context=legacy_context,
         )
     with _section(ui, icon="download", title="Export report"):
         _render_downloads(ui, report)
@@ -6627,6 +6676,7 @@ def _render_readiness_checks(
     *,
     diagnose_provider=None,
     excluded_values_remedy: str = "",
+    legacy_context: "tuple[str, frozenset]" = ("", frozenset()),
 ) -> None:
     """Render the pre-cut-over checks as a compact, uniform pass/fail panel.
 
@@ -6848,12 +6898,16 @@ def _render_readiness_checks(
     # sign-off artifact and a reviewer who did not tick the box has no other way to see
     # the gap; warning tone because, unlike a rendering limit, it is a permanent loss.
     if summary.migration_excluded_columns:
-        _render_null_proof_notice(ui, summary, excluded_values_remedy)
+        _render_null_proof_notice(ui, summary, excluded_values_remedy, legacy_context)
 
 
 
 def null_proof_lines(
-    summary: ValidationSummary, remedy: str = ""
+    summary: ValidationSummary,
+    remedy: str = "",
+    *,
+    legacy_remedy: str = "",
+    adopted: "frozenset[tuple[str, str]]" = frozenset(),
 ) -> "tuple[str, str, list[str]]":
     """``(tone, header, lines)`` of the excluded-columns notice. Pure.
 
@@ -6891,10 +6945,11 @@ def null_proof_lines(
         )
     for table, cols in summary.legacy_values.items():
         for column, n in sorted(cols.items()):
+            origin = ("omit-only (adopted from the attached CDC stack)"
+                      if (table, column) in adopted else "excluded before v0.1.562 (omit-only)")
             lines.append(
-                f"{table}.{column}: excluded in a session from an earlier version; its "
-                f"rows take the target DEFAULT ({n:,} non-NULL). To load it as NULL, "
-                "Start over and exclude it again."
+                f"{table}.{column}: {origin}; its rows hold the target DEFAULT ({n:,} "
+                f"non-NULL).{' ' + legacy_remedy if legacy_remedy else ''}"
             )
     for table, reason in summary.proof_not_determined.items():
         lines.append(
@@ -6920,10 +6975,12 @@ def null_proof_lines(
 
 
 def _render_null_proof_notice(
-    ui: object, summary: ValidationSummary, remedy: str
+    ui: object, summary: ValidationSummary, remedy: str,
+    legacy_context: "tuple[str, frozenset]" = ("", frozenset()),
 ) -> None:
     """The excluded-columns notice: what was not written, and the NULL proof."""
-    tone, header, lines = null_proof_lines(summary, remedy)
+    tone, header, lines = null_proof_lines(
+        summary, remedy, legacy_remedy=legacy_context[0], adopted=legacy_context[1])
     detail = "; ".join(
         f"{table} ({', '.join(cols)})"
         for table, cols in summary.migration_excluded_columns.items()
