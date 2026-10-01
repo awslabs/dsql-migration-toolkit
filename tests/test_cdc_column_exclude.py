@@ -338,3 +338,72 @@ def test_start_blocks_a_generated_rekey_column_even_with_a_regex_character(monke
     assert "shop.docs.bucket$1" in next(
         n["body"] for n in notices if n.get("header") == "Composite key column is excluded from capture")
     assert not _JM.submitted
+
+
+# --- P3-C07: the pure capture preview for an UNSAVED resolution ---------------------
+
+
+def test_the_wrapper_is_the_pure_function_over_the_stored_state():
+    from dsql_migrator.ui.data_migration._models import (
+        capture_exclusions_for,
+        cdc_capture_exclusions,
+        effective_lob_exclusions,
+    )
+
+    for entries, deployed, inv, captured in [
+        ([("shop.docs", "id"), ("shop.docs", "body")], None, INV, [DOCS]),
+        ([("shop.docs", "body")], "shop.docs.body,shop.docs.gen,shop.other.g2", INV, INV.tables),
+    ]:
+        state = _state(entries, deployed=deployed)
+        assert cdc_capture_exclusions(state, inv, captured) == capture_exclusions_for(
+            effective_lob_exclusions(state, inv), state.lob_exclusions(), inv, captured, deployed)
+
+
+def _capture_hook(inv, deployed=None):
+    from dsql_migrator.ui.data_migration._models import capture_exclusions_for
+
+    def hook(columns, selected):
+        captured = [t for t in inv.tables if t.name in set(selected)]
+        return capture_exclusions_for(columns, columns, inv, captured, deployed)
+    return hook
+
+
+def test_preview_equals_sent_after_the_save():
+    from dsql_migrator.core.exclusion_rules import resolve_exclusion_rules
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration._models import cdc_capture_exclusions
+
+    res = resolve_exclusion_rules(
+        "exclude shop.docs.body", migratable=INV.tables, source_type=SourceType.POSTGRES,
+        effective_selection=[t.name for t in INV.tables], capture=_capture_hook(INV))
+    state = _state([(t, c) for t, cs in res.columns.items() for c in cs])
+    assert res.cdc_value == cdc_capture_exclusions(state, INV, INV.tables).sent
+    assert res.cdc_bytes == len(res.cdc_value.encode()) and res.can_save
+
+
+def test_an_oversized_capture_is_e4_unless_generated_alone_overflow_and_deployed_is_kept():
+    from dsql_migrator.core.exclusion_rules import resolve_exclusion_rules
+    from dsql_migrator.core.models import SourceType
+
+    many = [f"column_with_a_rather_long_name_{i:04d}" for i in range(200)]
+    wide = SourceInventory(tables=[_t(f"shop.t{i}", ["id", many[i]]) for i in range(200)])
+    names = [t.name for t in wide.tables]
+    res = resolve_exclusion_rules("exclude shop.*.column_with_a_rather_long_name_*",
+                                  migratable=wide.tables, source_type=SourceType.MYSQL,
+                                  effective_selection=names, capture=_capture_hook(wide))
+    (error,) = res.global_errors
+    assert error.code == "E4" and f"{res.cdc_bytes:,} bytes" in error.message
+    assert error.message.endswith("Narrow the rules: exclude fewer columns in the tables CDC captures.")
+    kept = resolve_exclusion_rules("exclude shop.*.column_with_a_rather_long_name_*",
+                                   migratable=wide.tables, source_type=SourceType.MYSQL,
+                                   effective_selection=names,
+                                   capture=_capture_hook(wide, deployed=res.cdc_value))
+    assert kept.can_save and kept.cdc_value == res.cdc_value
+    gen = SourceInventory(tables=[_t(f"shop.g{i}", ["id", many[i], "x"], generated=(many[i],))
+                                  for i in range(200)])
+    only_gen = resolve_exclusion_rules("exclude shop.*.x", migratable=gen.tables,
+                                       source_type=SourceType.POSTGRES,
+                                       effective_selection=[t.name for t in gen.tables],
+                                       capture=_capture_hook(gen))
+    assert not any(e.code == "E4" for e in only_gen.global_errors)
+    assert only_gen.capture_warning and "alone need" in only_gen.capture_warning

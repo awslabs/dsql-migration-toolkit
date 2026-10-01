@@ -190,15 +190,23 @@ def _replace(line: str, start: int, end: int, new: str) -> str:
     return line[:start] + new + line[end:]
 
 
+def _needs_quotes(name: str) -> bool:
+    return not name or any(ch in _BARE_STOP or ch == "*" or ch.isspace() for ch in name)
+
+
+def rule_name_writable(name: str) -> bool:
+    """Whether a name can be written in the rule text at all: the text is line-based, so a
+    name holding a line break (``\n`` or ``\r``, which a browser textarea also turns into
+    one) has no rule spelling. Suggestions skip such names; synthesis reports them."""
+    return "\n" not in name and "\r" not in name
+
+
 def rule_part_token(name: str) -> str:
     """A name part as the rule text writes it: bare when the bare production holds and it
-    has no ``*`` (bare ``*`` would be a wildcard) and cannot be read as a keyword; quoted
-    otherwise, with ``"`` doubled. ``parse`` of the token returns ``name`` exactly."""
-    if (
-        name
-        and not any(ch in _BARE_STOP or ch == "*" for ch in name)
-        and not name.lower().startswith(_TYPE_PREFIX)
-    ):
+    has no ``*`` (bare ``*`` would be a wildcard), no other whitespace, and cannot be read
+    as a keyword; quoted otherwise, with ``"`` doubled. ``parse`` of the token returns
+    ``name`` exactly for every :func:`rule_name_writable` name."""
+    if not _needs_quotes(name) and not name.lower().startswith(_TYPE_PREFIX):
         return name
     return '"' + name.replace('"', '""') + '"'
 
@@ -207,69 +215,135 @@ def type_name_token(key: str) -> str:
     """A type key as the rule text writes it (and as every surface shows it, so what is
     shown can be pasted back): bare when it fits the bare production and has no ``*``;
     quoted otherwise, ``"`` doubled. ``character varying`` -> ``"character varying"``."""
-    if key and not any(ch in _BARE_STOP or ch == "*" for ch in key):
+    if not _needs_quotes(key) and _parens_close(key):
         return key
     return '"' + key.replace('"', '""') + '"'
 
 
-def _parse_types(line: str, i: int) -> "tuple[RulePart, ...]":
-    """The ``type:`` list starting at ``i`` (just after the prefix)."""
-    if i >= len(line) or line[i] in _WS:
-        rest = line[i:].strip()
-        if not rest:
+def _parens_close(text: str) -> bool:
+    """Whether every ``(`` closes, as the bare type-name scan requires."""
+    depth = 0
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")" and depth:
+            depth -= 1
+    return depth == 0
+
+
+def _type_run_fix(text: str, i: int, index: int) -> "_E1":
+    """E1 for a type written the way ``format_type`` prints it -- quoted and bare segments
+    joined by ``.``, a typmod, a trailing ``[]`` (``app."Mood"[]``, ``"MyType"[]``) -- with
+    ONE fix to the token of its key, replacing the whole spelling."""
+    j = i
+    while j < len(text) and text[j] not in _WS and text[j] != ",":
+        if text[j] == '"':
+            _value, j = _read_quoted(text, j)
+            continue
+        if text[j] == "(":
+            depth = 0
+            while j < len(text):
+                depth += {"(": 1, ")": -1}.get(text[j], 0)
+                j += 1
+                if depth == 0:
+                    break
+            continue
+        j += 1
+    key = _pg_reduce(text[i:j])
+    token = type_name_token(key)
+    if "." in key:
+        message = f'"{key}" contains "." -- quote a schema-qualified type: type:{token}.'
+    else:
+        message = f"Write the type as one name: type:{token}."
+    return _E1(message, [Suggestion(f"Use type:{token}", _replace(text, i, j, token))], index)
+
+
+def _parse_types(text: str, i: int) -> "tuple[RulePart, ...]":
+    """The ``type:`` list of ``text`` (the rule text, no comment) starting at ``i``, just
+    after the prefix. A bare name may hold a parenthesized typmod (``numeric(10,2)``)."""
+    prefix_end = i
+
+    def _no_spaces() -> "_E1":
+        return _E1("No spaces in a type list.",
+                   [Suggestion("Remove the spaces", _despace_types(text, prefix_end))])
+
+    if i >= len(text) or text[i] in _WS:
+        if not text[i:].strip():
             raise _E1("Empty type list: write type:<type>[,<type>...].")
-        raise _E1("No spaces in a type list.", [Suggestion("Remove the spaces", _despace_types(line, i))])
+        raise _no_spaces()
     names: list[RulePart] = []
     while True:
-        if i >= len(line) or line[i] in _WS:
+        index = len(names)
+        if i >= len(text) or text[i] in _WS:
             if names:
                 raise _E1("A trailing comma: remove it or add a type.")
             raise _E1("Empty type list: write type:<type>[,<type>...].")
-        if line[i] == ",":
+        if text[i] == ",":
             raise _E1('An empty type name: remove the extra ",".')
-        if line[i] == '"':
-            value, end = _read_quoted(line, i)
+        if text[i] == '"':
+            value, end = _read_quoted(text, i)
+            if end < len(text) and text[end] in ".[(":
+                raise _type_run_fix(text, i, index)
+            if end < len(text) and text[end] not in _WS and text[end] != ",":
+                raise _E1(f'Unexpected character after a quoted name: "{text[end]}".')
             part = RulePart(value, True, (i, end))
         else:
-            j = i
-            while j < len(line) and line[j] not in ' \t"#,':
+            j, depth = i, 0
+            while j < len(text):
+                ch = text[j]
+                if depth:
+                    depth += {"(": 1, ")": -1}.get(ch, 0)
+                elif ch == "(":
+                    depth = 1
+                elif ch in _WS or ch in '",':
+                    break
                 j += 1
-            part = RulePart(line[i:j], False, (i, j))
-            index = len(names)
-            if "." in part.text:
-                fixed = _replace(line, i, j, type_name_token(part.text))
-                raise _E1(
-                    f'"{part.text}" contains "." -- quote a schema-qualified type: '
-                    f'type:"{part.text}".',
-                    [Suggestion(f'Use type:"{part.text}"', fixed)],
-                    index,
-                )
-            if "*" in part.text:
-                fixed = _replace(line, i, j, type_name_token(part.text))
+            if depth:
+                raise _E1('Unclosed "(" in a type name.', name_index=index)
+            name = text[i:j]
+            if (j < len(text) and text[j] == '"') or "." in name:
+                raise _type_run_fix(text, i, index)
+            if "*" in name:
+                fixed = _replace(text, i, j, type_name_token(name))
                 raise _E1(
                     'No wildcard in type names: quote it to match a type literally named '
-                    f'"{part.text}".',
-                    [Suggestion(f"Use type:{type_name_token(part.text)}", fixed)],
+                    f'"{name}".',
+                    [Suggestion(f"Use type:{type_name_token(name)}", fixed)],
                     index,
                 )
+            after = _skip_ws(text, j)
+            if j < len(text) and text[j] in _WS and after < len(text) and text[after] != ",":
+                # More words: a multi-word type written bare ("character varying").
+                stop = after
+                while stop < len(text) and text[stop] != ",":
+                    stop += 1
+                words = " ".join(text[i:stop].split())
+                if '"' not in words:
+                    end_words = len(text[:stop].rstrip())
+                    token = type_name_token(words)
+                    raise _E1(
+                        f"Quote a type name that has spaces: type:{token}.",
+                        [Suggestion(f"Use type:{token}", _replace(text, i, end_words, token))],
+                        index,
+                    )
+            part = RulePart(name, False, (i, j))
             end = j
         names.append(part)
         i = end
-        if i < len(line) and line[i] == ",":
+        if i < len(text) and text[i] == ",":
             i += 1
-            if i < len(line) and line[i] in _WS:
-                raise _E1("No spaces in a type list.", [Suggestion("Remove the spaces", _despace_types(line, i - 1))])
+            if i < len(text) and text[i] in _WS:
+                raise _no_spaces()
             continue
-        if i < len(line) and line[i] in _WS and _skip_ws(line, i) < len(line) and line[_skip_ws(line, i)] == ",":
-            raise _E1("No spaces in a type list.", [Suggestion("Remove the spaces", _despace_types(line, i))])
+        if i < len(text) and text[i] in _WS and _skip_ws(text, i) < len(text) and text[_skip_ws(text, i)] == ",":
+            raise _no_spaces()
         return tuple(names)
 
 
-def _despace_types(line: str, start: int) -> str:
-    """``line`` with the whitespace right after ``type:`` and around each ``,`` removed
-    (outside quotes); ``start`` is any index inside the type list."""
-    prefix_end = line.lower().rfind(_TYPE_PREFIX, 0, start + 1) + len(_TYPE_PREFIX)
-    tail = line[prefix_end:]
+def _despace_types(text: str, prefix_end: int) -> str:
+    """``text`` with the whitespace right after ``type:`` (which ends at ``prefix_end``)
+    and around each ``,`` removed, outside quotes."""
+    tail = text[prefix_end:]
     out: list[str] = []
     in_quote = False
     for k, ch in enumerate(tail):
@@ -280,21 +354,70 @@ def _despace_types(line: str, start: int) -> str:
             if not out or out[-1] == "," or nxt == ",":
                 continue
         out.append(ch)
-    return line[:prefix_end] + "".join(out)
+    return text[:prefix_end] + "".join(out)
+
+
+def _odd_space(rule_text: str) -> "Optional[int]":
+    """The index of the first whitespace outside quotes that is not a space or a tab."""
+    in_quote = False
+    for k, ch in enumerate(rule_text):
+        if ch == '"':
+            in_quote = not in_quote
+        elif not in_quote and ch.isspace() and ch not in _WS:
+            return k
+    return None
+
+
+def _first_word_fix(line: str, i: int, j: int, word: str) -> "list[Suggestion]":
+    """A fix for an unknown first word that never loses the rest of the rule: a keyword
+    run into the subject (``excludeshop.t.c``) gets its space; a plain typo (``exlcude``)
+    its keyword. A candidate that still has no subject is withheld."""
+    low = word.lower()
+    for keyword in _ACTIONS:
+        if low.startswith(keyword) and len(word) > len(keyword):
+            rest = word[len(keyword):].lstrip(".")
+            candidate = line[:i] + word[: len(keyword)] + " " + rest + line[j:]
+            label = f'Add a space after "{keyword}"'
+            break
+    else:
+        if any(ch in word for ch in '.",:'):
+            return []
+        close = difflib.get_close_matches(low, _ACTIONS, n=1, cutoff=0.6)
+        if not close:
+            return []
+        candidate, label = _replace(line, i, j, close[0]), f'Use "{close[0]}"'
+    try:
+        _parse_line(0, candidate)
+    except _E1 as exc:
+        if exc.message.startswith(("Unknown first word", "Missing what to")):
+            return []
+    return [Suggestion(label, candidate)]
 
 
 def _parse_line(number: int, line: str) -> ParsedRule:
     rule_text, comment = split_rule_comment(line)
+    odd = _odd_space(rule_text)
+    if odd is not None:
+        out, in_quote = [], False
+        for ch in rule_text:
+            if ch == '"':
+                in_quote = not in_quote
+            out.append(" " if not in_quote and ch.isspace() and ch not in _WS else ch)
+        fixed = "".join(out)
+        raise _E1(
+            f"A non-standard space (U+{ord(rule_text[odd]):04X}) outside quotes: use a normal "
+            "space.",
+            [Suggestion("Use normal spaces", fixed + line[len(rule_text):])],
+        )
     i = _skip_ws(rule_text, 0)
     j = i
     while j < len(rule_text) and rule_text[j] not in _WS:
         j += 1
     word = rule_text[i:j]
     if word.lower() not in _ACTIONS:
-        close = difflib.get_close_matches(word.lower(), _ACTIONS, n=1, cutoff=0.6)
         raise _E1(
             f'Unknown first word "{word}": a rule starts with exclude or include.',
-            [Suggestion(f'Use "{close[0]}"', _replace(line, i, j, close[0]))] if close else [],
+            _first_word_fix(line, i, j, word),
         )
     action = word.lower()
     k = _skip_ws(rule_text, j)
@@ -308,11 +431,19 @@ def _parse_line(number: int, line: str) -> ParsedRule:
     while m < len(rule_text) and rule_text[m] not in _WS:
         m += 1
     kind = "column"
-    if rule_text[k:m].lower() == "table" and m < len(rule_text):
+    if rule_text[k:m].lower() == "table":
         kind = "table"
         k = _skip_ws(rule_text, m)
+        if k >= len(rule_text):
+            raise _E1('"table" takes schema.table (two parts).')
     elif rule_text[k : k + len(_TYPE_PREFIX)].lower() == _TYPE_PREFIX:
-        names = _parse_types(rule_text, k + len(_TYPE_PREFIX))
+        try:
+            names = _parse_types(rule_text, k + len(_TYPE_PREFIX))
+        except _E1 as exc:
+            # The fixes rewrite the rule text: keep the line's comment after them.
+            kept = line[len(rule_text):]
+            raise _E1(exc.message, [Suggestion(s.label, s.line_text + kept)
+                                    for s in exc.suggestions], exc.name_index) from None
         end = names[-1].span[1]
         _no_trailing(line, rule_text, end)
         return ParsedRule(number, action, "type", (), names, comment, rule_text)
@@ -382,6 +513,12 @@ def parse_rules(text: str) -> "tuple[dict[int, ParsedRule], dict[int, list[RuleE
 # --- the type: normalizer ------------------------------------------------------------
 
 
+_INTERVAL_FIELDS_RE = re.compile(
+    r"interval (?:year|month|day|hour|minute|second)(?: to (?:month|hour|minute|second))?",
+    re.IGNORECASE,
+)
+
+
 def _pg_reduce(text: str) -> str:
     """The PostgreSQL type key of a ``format_type`` string (or of a typed name).
 
@@ -416,6 +553,9 @@ def _pg_reduce(text: str) -> str:
     suffix = ""
     if reduced.endswith("[]"):
         reduced, suffix = reduced[:-2].rstrip(), "[]"
+    if '"' not in reduced and _INTERVAL_FIELDS_RE.fullmatch(reduced):
+        # An interval's field qualifier lives in its typmod like a precision: one type.
+        return "interval" + suffix
     parts: list[str] = []
     buf: list[str] = []
     i = 0
@@ -449,7 +589,9 @@ def rule_type_name(column: "ColumnDef", source_type: SourceType) -> str:
       (``format_type`` quotes every name that is not already lower case, so lower-casing
       could only merge case twins: ``"MyType"`` and ``"MYTYPE"`` are distinct keys).
 
-    Two accepted ambiguities: a ``.`` inside one type's own name is not told apart from a
+    An interval's field qualifier is its typmod too (``interval year to month`` and
+    ``interval day to second(3)`` are ``interval``). Two accepted ambiguities: a ``.``
+    inside one type's own name is not told apart from a
     schema separator; and unquoting gives a user type named like a built-in SQL name the
     built-in's key (``CREATE DOMAIN public."integer"`` prints ``"integer"`` -> ``integer``),
     so one ``type:integer`` line matches both and the per-type count sums them -- a column
@@ -528,7 +670,7 @@ def hint_for(
     collapsed, typmods and a trailing ``[]`` removed (``[]`` re-appended to the target) --
     NOT cut at a space, so MySQL ``character varying`` finds ``varchar``. Withheld when the
     target is not a present key, so a suggestion never lands on another miss."""
-    name = re.sub(r"\([^)]*\)", "", typed.lower())
+    name = re.sub(r"\([^)]*\)", "", typed.lower()).split("(")[0]
     name = " ".join(name.split())
     suffix = ""
     if name.endswith("[]"):
@@ -667,6 +809,11 @@ class RuleResolution:
     target_changes: "tuple[TargetChange, ...]" = ()
     items: "tuple[ReviewItem, ...]" = ()
     diff: "Optional[ResolutionDiff]" = None
+    # With a capture hook (CDC types): the ColumnExcludeList Start CDC would send after this
+    # Save, its size, and the non-blocking generated-columns-only size warning.
+    cdc_value: Optional[str] = None
+    cdc_bytes: Optional[int] = None
+    capture_warning: Optional[str] = None
 
     @property
     def can_save(self) -> bool:
@@ -707,6 +854,8 @@ def _miss(line: int, line_text: str, part: RulePart, level: str, candidates, whe
         picks = difflib.get_close_matches(part.text, list(candidates), n=3, cutoff=0.75)
     suggestions = []
     for pick in picks:
+        if not rule_name_writable(pick):
+            continue
         fixed = _replace(line_text, part.span[0], part.span[1], rule_part_token(pick))
         suggestions.append(Suggestion(f'Use "{split_rule_comment(fixed)[0].strip()}"', fixed))
     return RuleError("E2", line, message, tuple(suggestions))
@@ -748,8 +897,13 @@ def _type_miss(line, index, typed: RulePart, line_text, key_counts, source_type)
             message += (" Type names are case-sensitive: did you mean "
                         f"{', '.join(type_name_token(k) for k in picks)}?")
         else:
-            picks = difflib.get_close_matches(reduced, sorted(key_counts), n=3, cutoff=0.75)
-    if not picks:
+            # Compared lower-cased on both sides (type:INTEGR finds integer), mapped back.
+            lowered: dict[str, list[str]] = {}
+            for k in sorted(key_counts):
+                lowered.setdefault(k.lower(), []).append(k)
+            close = difflib.get_close_matches(reduced.lower(), list(lowered), n=3, cutoff=0.75)
+            picks = list(dict.fromkeys(k for c in close for k in lowered[c]))[:3]
+    if not picks and key_counts:
         ranked = sorted(key_counts.items(), key=lambda kv: (-kv[1], kv[0]))
         listed = ", ".join(f"{type_name_token(k)} ({n})" for k, n in ranked[:8])
         more = f" and {len(ranked) - 8} more" if len(ranked) > 8 else ""
@@ -757,42 +911,60 @@ def _type_miss(line, index, typed: RulePart, line_text, key_counts, source_type)
     suggestions = tuple(
         Suggestion(f"Use type:{type_name_token(k)}",
                    _replace(line_text, typed.span[0], typed.span[1], type_name_token(k)))
-        for k in picks
+        for k in picks if rule_name_writable(k)
     )
     return RuleError("E2", line, message, suggestions, name_index=index)
 
 
 def _hint_notes(rule, resolved, scope_counts, source_type) -> "list[str]":
     """Notes (never errors) for a type name that matched a key while its hint names a
-    DIFFERENT key that is also here; ``bpchar``/``character`` are the same type."""
-    notes = []
+    DIFFERENT key that is also here; ``bpchar``/``character`` (and their ``[]`` arrays) are
+    the same type, so those say so in both directions. One note per key."""
+    notes: list[str] = []
+    noted: set[str] = set()
     on_line = set(resolved.values())
+
+    def _them(n: int) -> str:
+        return "it" if n == 1 else "them"
+
     for typed, key in resolved.items():
+        if key in noted:
+            continue
         mine = scope_counts.get(key, 0)
-        if key == "character" and source_type is SourceType.POSTGRES:
-            other = scope_counts.get("bpchar", 0)
-            if other and "bpchar" not in on_line:
+        base, sfx = (key[:-2], "[]") if key.endswith("[]") else (key, "")
+        tok = f"type:{type_name_token(typed)}"
+        if source_type is SourceType.POSTGRES and base == "character":
+            twin = "bpchar" + sfx
+            other = scope_counts.get(twin, 0)
+            if other and twin not in on_line:
                 notes.append(
-                    f"type:{type_name_token(typed)} matched character ({_plural(mine, 'column')})."
-                    f" {other} {'column is' if other == 1 else 'columns are'} the same type "
-                    "declared without a length, printed bpchar: add type:bpchar to cover them.")
+                    f"{tok} matched {type_name_token(key)} ({_plural(mine, 'column')}). "
+                    f"{other} {'column is' if other == 1 else 'columns are'} the same type "
+                    f"declared without a length, printed {type_name_token(twin)}: add "
+                    f"type:{type_name_token(twin)} to cover {_them(other)}.")
+                noted.add(key)
+            continue
+        if source_type is SourceType.POSTGRES and base == "bpchar":
+            twin = "character" + sfx
+            other = scope_counts.get(twin, 0)
+            if other and twin not in on_line:
+                lead = (f"The {type_name_token(twin)} column is" if other == 1
+                        else f"The {other} {type_name_token(twin)} columns are")
+                notes.append(
+                    f"{tok} matched {type_name_token(key)} ({_plural(mine, 'column')}: "
+                    f"character declared without a length). {lead} the same type declared "
+                    f"with a length: add type:{type_name_token(twin)} to cover {_them(other)}.")
+                noted.add(key)
             continue
         target = hint_for(typed, source_type, scope_counts)
         if target is None or target == key or target in on_line or not scope_counts.get(target):
             continue
         other = scope_counts[target]
-        if key == "bpchar":
-            notes.append(
-                f"type:{type_name_token(typed)} matched bpchar ({_plural(mine, 'column')}: "
-                f"character declared without a length). The {other} character "
-                f"{'column is' if other == 1 else 'columns are'} the same type declared with a "
-                "length: add type:character to cover them.")
-        else:
-            notes.append(
-                f"type:{type_name_token(typed)} matched {type_name_token(key)} "
-                f"({_plural(mine, 'column')}). {type_name_token(target)} is a different type "
-                f"here ({_plural(other, 'column')}): use type:{type_name_token(target)} for "
-                "those.")
+        notes.append(
+            f"{tok} matched {type_name_token(key)} ({_plural(mine, 'column')}). "
+            f"{type_name_token(target)} is a different type here ({_plural(other, 'column')}): "
+            f"use type:{type_name_token(target)} for {'it' if other == 1 else 'those'}.")
+        noted.add(key)
     return notes
 
 
@@ -810,6 +982,7 @@ def resolve_exclusion_rules(
     live_columns: "Optional[Mapping[str, Collection[str]]]" = None,
     legacy: "Optional[Mapping[str, Collection[str]]]" = None,
     stored_columns: "Optional[Mapping[str, Collection[str]]]" = None,
+    capture: "Optional[Callable[[Mapping[str, frozenset[str]], Sequence[str]], object]]" = None,
 ) -> RuleResolution:
     """Resolve rule ``text`` against the ``migratable`` tables (the tree's universe, in its
     order). Include wins and line order never matters: per domain (tables; columns),
@@ -841,7 +1014,13 @@ def resolve_exclusion_rules(
     excluded -- a certain 42703 only (``live_columns`` lets a column the live target
     still has through), offering the rule, never applying it. ``target_changes`` preview
     the overlay over the stored set minus the ``legacy`` (omit-only) entries it keeps;
-    ``diff`` compares with ``stored_columns``. Pure.
+    ``diff`` compares with ``stored_columns``.
+
+    ``capture(columns, selected')`` (CDC types; the composition passes the UI's
+    ``capture_exclusions_for`` so core never imports the UI) previews the ColumnExcludeList
+    for the set this Save would store: over CloudFormation's limit even in compact form it
+    is a global E4 -- unless the generated columns alone exceed it, which fewer exclusions
+    cannot fix (a warning) -- and a value equal to the deployed one is never refused. Pure.
     """
     rules, parsed_errors = parse_rules(text)
     source_lines = [raw[:-1] if raw.endswith("\r") else raw for raw in (text or "").split("\n")]
@@ -1059,11 +1238,22 @@ def resolve_exclusion_rules(
                              f"{'it' if len(inert) == 1 else 'them'} in this Save.")
             type_counts: tuple = ()
             if line in type_resolved:
-                scope_counts, scope_tables = _scope_type_counts()
+                scope_counts, _scope_tables = _scope_type_counts()
                 resolved = type_resolved[line]
-                type_counts = tuple(
-                    (key, scope_counts.get(key, 0), len(scope_tables.get(key, ())))
-                    for key in dict.fromkeys(resolved.values()))
+                # Per type, the same items as "matches N" (exclude: stored -- not kept, not
+                # blocked) or "keeps N" (include); the hint note compares what exists.
+                if rule.action == "exclude":
+                    counted = [i for i in in_scope if i not in incl_c and i not in blocked]
+                else:
+                    counted = [i for i in in_scope if i in excl_c]
+                keys = _type_keys()
+                per_key: dict[str, list] = {k: [0, set()] for k in dict.fromkeys(resolved.values())}
+                for item in counted:
+                    entry = per_key.get(keys[item])
+                    if entry is not None:
+                        entry[0] += 1
+                        entry[1].add(item[0])
+                type_counts = tuple((k, n, len(ts)) for k, (n, ts) in per_key.items())
                 notes.extend(_hint_notes(rule, resolved, scope_counts, source_type))
             if rule.action == "exclude":
                 named = [i for i in in_scope if i not in incl_c]
@@ -1110,6 +1300,23 @@ def resolve_exclusion_rules(
         missing = _certain_missing(after, tables, applied_conversions, columns, live_columns)
         if missing:
             global_errors.append(missing)
+    cdc_value = cdc_bytes = capture_warning = None
+    if capture is not None:
+        from dsql_migrator.core.cdc import CDC_PARAMETER_BYTE_LIMIT
+
+        preview = capture({t: frozenset(cs) for t, cs in columns.items()}, tuple(after))
+        cdc_value = preview.sent
+        cdc_bytes = len(cdc_value.encode("utf-8"))
+        if preview.error and preview.generated_bytes > CDC_PARAMETER_BYTE_LIMIT:
+            capture_warning = (
+                f"{preview.error} The generated columns Aurora DSQL computes -- which CDC "
+                f"must not stream -- alone need {preview.generated_bytes:,} bytes, so "
+                "excluding fewer columns cannot fix it: capture fewer tables in this CDC "
+                "pipeline, or use Full load only.")
+        elif preview.error:
+            global_errors.append(RuleError(
+                "E4", 0, f"{preview.error} Narrow the rules: exclude fewer columns in the "
+                "tables CDC captures."))
 
     retained = {
         t: frozenset(cs & set(legacy.get(t, ()))) for t, cs in columns.items()
@@ -1140,6 +1347,9 @@ def resolve_exclusion_rules(
         target_changes=target_changes,
         items=items,
         diff=diff,
+        cdc_value=cdc_value,
+        cdc_bytes=cdc_bytes,
+        capture_warning=capture_warning,
     )
 
 
@@ -1159,6 +1369,8 @@ def _certain_missing(after, tables, applied, columns, live) -> "Optional[RuleErr
     them = "them" if many else "it"
     suggestions = []
     for t, c in pairs:
+        if not all(rule_name_writable(x) for x in (t, c)):
+            continue
         schema, _sep, rest = t.partition(".")
         line = "exclude " + ".".join(rule_part_token(x) for x in (schema, rest, c))
         suggestions.append(Suggestion(f"+ add rule: {line}", line))

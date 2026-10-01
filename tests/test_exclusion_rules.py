@@ -910,3 +910,210 @@ def test_each_ddl_is_read_once_per_resolve_and_not_again(monkeypatch):
     # one parse per cached reader (key facts: pk, identity, generated; constraints; UNIQUE
     # members; column names; the overlay preview's generated set), never a repeat
     assert per_ddl <= 7
+
+
+# --- review fixes (C01-C04 adversarial review) ---------------------------------------
+
+
+def _fix(text):
+    rules, errors = parse_rules(text)
+    assert not rules and list(errors) == [1], (rules, errors)
+    (error,) = errors[1]
+    return error
+
+
+PG_MULTI = [_pg(("character(3)", 1), ("character varying(255)", 1), ("character varying(9)[]", 1),
+                ("timestamp without time zone", 1), ("timestamp with time zone", 1),
+                ("bit(3)", 1), ("bit varying(8)", 1), ("double precision", 1), ("text", 1),
+                ('"MyType"', 1), ('"MyType"[]', 1), ('app."Mood"', 1), ('app."Mood"[]', 1),
+                ("numeric(10,2)", 1))]
+
+
+def _only_key(res):
+    keys = {rule_type_name(c, PG) for t in PG_MULTI for c in t.columns
+            if c.name in res.columns.get("public.t", ())}
+    return keys
+
+
+@pytest.mark.parametrize("typed,fixed,key", [
+    ("character varying", '"character varying"', "character varying"),
+    ("character varying(255)", '"character varying(255)"', "character varying"),
+    ("timestamp with time zone", '"timestamp with time zone"', "timestamp with time zone"),
+    ("bit varying", '"bit varying"', "bit varying"),
+    ("double precision", '"double precision"', "double precision"),
+])
+def test_an_unquoted_multi_word_type_is_fixed_by_quoting_never_by_a_comment(typed, fixed, key):
+    error = _fix(f"exclude type:{typed}  # why")
+    (fix,) = error.suggestions
+    assert fix.line_text == f"exclude type:{fixed}  # why"
+    res = _resolve(fix.line_text, PG_MULTI)
+    assert res.can_save and _only_key(res) == {key}
+
+
+def test_multi_word_fix_keeps_the_other_names():
+    error = _fix("exclude type:character varying,text")
+    assert error.suggestions[0].line_text == 'exclude type:"character varying",text'
+    error = _fix("exclude type:text,character varying")
+    assert error.name_index == 1
+    assert error.suggestions[0].line_text == 'exclude type:text,"character varying"'
+
+
+def test_mysql_multi_word_type_reaches_the_varchar_hint():
+    tables = [_pg(("char(2)", 1), ("varchar(255)", 1), name="shop.t")]
+    fix = _fix("exclude type:character varying").suggestions[0].line_text
+    (error,) = _resolve(fix, tables, MY).errors[1]
+    assert [s.line_text for s in error.suggestions] == ["exclude type:varchar"]
+
+
+@pytest.mark.parametrize("typed,fixed,key", [
+    ('app."Mood"[]', '"app.Mood[]"', "app.Mood[]"),
+    ('"MyType"[]', "MyType[]", "MyType[]"),
+    ('"character varying"[]', '"character varying[]"', "character varying[]"),
+    ('"app"."Mood"', '"app.Mood"', "app.Mood"),
+])
+def test_a_format_type_spelling_gets_one_fix_to_its_key(typed, fixed, key):
+    error = _fix(f"exclude type:{typed} # c")
+    (fix,) = error.suggestions
+    assert fix.line_text == f"exclude type:{fixed} # c"
+    res = _resolve(fix.line_text, PG_MULTI)
+    assert res.can_save and _only_key(res) == {key}
+
+
+def test_type_list_fixes_keep_the_comment():
+    assert _fix("exclude type:app.status # PII").suggestions[0].line_text == (
+        'exclude type:"app.status" # PII')
+    assert _fix("exclude type:long* # c").suggestions[0].line_text == 'exclude type:"long*" # c'
+    assert _fix("exclude type: text , bytea # c").suggestions[0].line_text == (
+        "exclude type:text,bytea # c")
+    assert _fix('exclude type:"type:x" , y').suggestions[0].line_text == 'exclude type:"type:x",y'
+
+
+def test_a_typmod_with_a_comma_is_one_name():
+    res = _resolve("exclude type:numeric(10,2),text", PG_MULTI)
+    assert res.can_save and [t.text for t in res.rules[1].type_names] == ["numeric(10,2)", "text"]
+    assert _resolve("exclude type:numeric(5,-2)", PG_MULTI).can_save
+    my = [_pg(("decimal(10,2)", 1), name="shop.t")]
+    assert _resolve("exclude type:decimal(10,2)", my, MY).can_save
+    (error,) = _resolve("exclude type:numeric(10,2)", my, MY).errors[1]
+    assert [s.line_text for s in error.suggestions] == ["exclude type:decimal"]
+    assert _fix("exclude type:numeric(10").message == 'Unclosed "(" in a type name.'
+    spaced = _fix("exclude type:numeric(10, 2), text")
+    assert _resolve(spaced.suggestions[0].line_text, PG_MULTI).can_save
+
+
+def test_first_word_fixes_never_lose_the_subject():
+    assert [s.line_text for s in _fix("excludeshop.t.c").suggestions] == ["exclude shop.t.c"]
+    assert [s.line_text for s in _fix("exclude.a.b.c").suggestions] == ["exclude a.b.c"]
+    assert [s.line_text for s in _fix("exlcude s.t.c").suggestions] == ["exclude s.t.c"]
+    assert _fix("frobnicate.x s.t.c").suggestions == ()
+
+
+@pytest.mark.parametrize("line,fixed", [
+    ("exclude s.t.c", "exclude s.t.c"),
+    ("exclude　s.t.c", "exclude s.t.c"),
+    ("exclude table shop.audit", "exclude table shop.audit"),
+    ("exclude s.t.c # x", "exclude s.t.c # x"),
+])
+def test_a_non_standard_space_is_named_and_fixed(line, fixed):
+    error = _fix(line)
+    assert error.message.startswith("A non-standard space (U+")
+    assert [s.line_text for s in error.suggestions] == [fixed]
+    assert parse_rules(fixed)[1] == {}
+
+
+def test_a_quoted_non_standard_space_is_a_name():
+    rule = _one('exclude s.t."a b"')
+    assert rule.parts[2].text == "a b"
+    assert rule_part_token("a b") == '"a b"'
+
+
+@pytest.mark.parametrize("line", ["exclude table", "exclude table ", "exclude table\t",
+                                  "exclude table # c"])
+def test_a_bare_table_keyword_says_what_it_takes(line):
+    error = _fix(line)
+    assert error.message == '"table" takes schema.table (two parts).' and error.suggestions == ()
+
+
+def test_table_dot_names_stay_column_refs():
+    assert _one("exclude table.x.y").kind == "column"
+
+
+def test_names_with_line_breaks_are_not_writable_and_never_suggested():
+    from dsql_migrator.core.exclusion_rules import rule_name_writable
+
+    assert not rule_name_writable("a\nb") and not rule_name_writable("x\r")
+    assert rule_part_token("x\r") == '"x\r"'
+    tables = [_t("shop.notes", "long_note\n")]
+    res = resolve_exclusion_rules("exclude shop.notes.long_note", migratable=tables,
+                                  source_type=MY, effective_selection=["shop.notes"])
+    (error,) = res.errors[1]
+    assert all("\n" not in s.line_text and "\r" not in s.line_text for s in error.suggestions)
+
+
+def test_array_bpchar_and_character_are_the_same_type():
+    tables = [_pg(("bpchar[]", 2), ("character(5)[]", 3))]
+    bp = _resolve("exclude type:bpchar[]", tables).line_status[1].notes
+    assert len(bp) == 1 and "a different type" not in bp[0] and "type:character[]" in bp[0]
+    ch = _resolve("exclude type:character[]", tables).line_status[1].notes
+    assert len(ch) == 1 and "printed bpchar[]: add type:bpchar[] to cover them." in ch[0]
+    assert _resolve("exclude type:bpchar[],character[]", tables).line_status[1].notes == ()
+
+
+def test_one_note_per_key_and_singular_wording():
+    tables = [_pg(('"char"', 1), ("character(5)", 1))]
+    (note,) = _resolve("exclude type:char,CHAR", tables).line_status[1].notes
+    assert note == ("type:char matched char (1 column). character is a different type here "
+                    "(1 column): use type:character for it.")
+    single = [_pg(("bpchar", 1), ("character(5)", 1))]
+    (bp,) = _resolve("exclude type:bpchar", single).line_status[1].notes
+    assert "The character column is the same type declared with a length: add type:character to cover it." in bp
+    (ch,) = _resolve("exclude type:character,CHARACTER", single).line_status[1].notes
+    assert ch.endswith("printed bpchar: add type:bpchar to cover it.")
+
+
+def test_interval_field_qualifiers_are_one_type():
+    for declared in ("interval", "interval(3)", "interval year to month", "interval day to second(3)"):
+        assert rule_type_name(_col(declared), PG) == "interval", declared
+    assert rule_type_name(_col("interval second(6)[]"), PG) == "interval[]"
+    assert rule_type_name(_col('"interval year"'), PG) == "interval year"
+    tables = [_pg(("interval", 1), ("interval year to month", 1), ("interval day to second(3)", 1))]
+    res = _resolve("exclude type:interval", tables)
+    assert res.line_status[1].type_counts == (("interval", 3, 1),)
+
+
+def test_type_difflib_ignores_case():
+    tables = [_pg(("integer", 1), ("bytea", 1), ("jsonb", 1), ("text", 1))]
+    (error,) = _resolve("exclude type:INTEGR", tables).errors[1]
+    assert [s.line_text for s in error.suggestions] == ["exclude type:integer"]
+
+
+def test_type_counts_agree_with_matches():
+    res = _res("exclude type:longtext\ninclude shop.pages.body")
+    st = res.line_status[1]
+    assert st.matched == 4 and st.type_counts == (("longtext", 4, 4),) and st.kept_by == ((2, 1),)
+    multi = _res("exclude type:longtext,longblob\ninclude shop.product_media.content")
+    st = multi.line_status[1]
+    assert sum(n for _k, n, _t in st.type_counts) == st.matched
+
+
+def test_no_types_here_list_when_nothing_has_a_type():
+    (error,) = resolve_exclusion_rules("exclude type:text", migratable=[], source_type=PG,
+                                       effective_selection=[]).errors[1]
+    assert "Types here" not in error.message
+
+
+def test_every_e1_fix_makes_progress():
+    """A fix never repeats its own error and never drops a name part (property)."""
+    import random
+
+    rnd = random.Random(99)
+    pieces = ["exclude", "include", "exlcude", "table", "type:", "s", "t", "c", ".", " ", ",",
+              '"', "*", "#", "(", ")", "[]", "\u00a0", "\u3000", "\t", "character", "varying",
+              "x", "excludes", "EXCLUDE", "app", '""']
+    for _ in range(3000):
+        line = "".join(rnd.choice(pieces) for _ in range(rnd.randint(1, 9)))
+        _rules, errors = parse_rules(line)
+        for error in errors.get(1, ()):
+            for fix in error.suggestions:
+                _r2, again = parse_rules(fix.line_text)
+                assert all(e.message != error.message for e in again.get(1, ())), (line, fix)

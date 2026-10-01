@@ -2470,7 +2470,28 @@ class CdcCaptureExclusions:
 def cdc_capture_exclusions(
     migration_state, inventory, captured_tables: "Sequence[object]"
 ) -> CdcCaptureExclusions:
-    """Build :class:`CdcCaptureExclusions` for the tables CDC captures (see there)."""
+    """Build :class:`CdcCaptureExclusions` for the tables CDC captures (see there), from
+    the session's stored set and the stack recorded by the last discovery."""
+    return capture_exclusions_for(
+        effective_lob_exclusions(migration_state, inventory),
+        migration_state.lob_exclusions(),
+        inventory,
+        captured_tables,
+        getattr(migration_state, "cdc_deployed_column_exclude_list", None),
+    )
+
+
+def capture_exclusions_for(
+    effective: "Mapping[str, Iterable[str]]",
+    raw_stored: "Mapping[str, Iterable[str]]",
+    inventory,
+    captured_tables: "Sequence[object]",
+    deployed_value: "Optional[str]",
+) -> CdcCaptureExclusions:
+    """:func:`cdc_capture_exclusions` for ANY set -- pure, so the exclusion popup previews
+    exactly what Start CDC would send after its Save: ``effective`` is the exclusion set
+    every path reads, ``raw_stored`` the stored set the 0.1.561 legacy form is built from,
+    ``deployed_value`` the stack's recorded ColumnExcludeList."""
     from dsql_migrator.core.cdc import (
         CDC_PARAMETER_BYTE_LIMIT,
         choose_column_exclude_value,
@@ -2487,7 +2508,7 @@ def cdc_capture_exclusions(
     # "exclude fewer" remedy could not be followed. (The legacy value below is untouched.)
     merged: dict[str, set[str]] = {
         table: set(cols)
-        for table, cols in effective_lob_exclusions(migration_state, inventory).items()
+        for table, cols in (effective or {}).items()
         if table in captured_names
     }
     generated: dict[str, list[str]] = {}
@@ -2498,9 +2519,10 @@ def cdc_capture_exclusions(
             generated[table.name] = sorted(preserved)
     structured = {t: sorted(c) for t, c in sorted(merged.items()) if c}
     value = format_column_exclude_value(structured, captured)
-    legacy_columns = cdc_excluded_columns(migration_state.lob_exclusions(), inventory)
+    legacy_columns = cdc_excluded_columns(
+        {t: set(c) for t, c in (raw_stored or {}).items()}, inventory)
     legacy = format_column_exclude_list(legacy_columns)
-    deployed = getattr(migration_state, "cdc_deployed_column_exclude_list", None)
+    deployed = deployed_value
     sent = choose_column_exclude_value(value, legacy, deployed)
     error: "Optional[str]" = None
     inexact: "tuple[str, ...]" = ()
