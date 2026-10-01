@@ -1,9 +1,9 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Browser E2E for the Query Playground (Query validation) — no live infra.
+"""Browser E2E for the Query Playground (Query Converter) — no live infra.
 
-Uses the dev-unlocked app server so the optional Query validation tool opens
+Uses the dev-unlocked app server so the optional Query Converter tool opens
 without a verified source/target connection. The **conversion** flow is pure
 sqlglot (no database), so it is fully exercisable offline: enter a MySQL query,
 Convert, and assert the converted DSQL SQL + the "Test on target" affordance
@@ -17,7 +17,7 @@ from playwright.sync_api import Page, expect
 
 
 def _open_query_validation(page: Page) -> None:
-    page.get_by_text("Query validation", exact=False).first.click()
+    page.get_by_text("Query Converter", exact=False).first.click()
     # The screen's SQL editor (aria-label "MySQL SQL") confirms we're on it.
     expect(page.get_by_label("MySQL SQL", exact=False).first).to_be_visible(timeout=10000)
 

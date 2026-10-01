@@ -151,7 +151,7 @@ def app_server() -> Iterator[str]:
 def app_server_unlocked() -> Iterator[str]:
     """The real app with DSQL_MIGRATOR_DEV_UNLOCK_STEPS=1.
 
-    Lets an E2E open workflow steps and optional tools (e.g. Query validation)
+    Lets an E2E open workflow steps and optional tools (e.g. Query Converter)
     WITHOUT a live source/target connection — the dev escape hatch bypasses only
     the connection/prereq gating, never AWS/data safety. Used to exercise the
     Query Playground conversion flow (pure sqlglot, no DB) in the browser.

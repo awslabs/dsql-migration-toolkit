@@ -22,7 +22,7 @@ def test_app_loads_with_title(page: Page) -> None:
 
 
 def test_workflow_steps_render_in_nav(page: Page) -> None:
-    # All five workflow steps + the optional Query validation tool appear in the
+    # All five workflow steps + the optional Query Converter tool appear in the
     # left nav (locked until connected, but present).
     for label in (
         "1. Evaluation",
@@ -30,7 +30,7 @@ def test_workflow_steps_render_in_nav(page: Page) -> None:
         "3. Data Migration",
         "4. Validation",
         "5. Cut over",
-        "Query validation",
+        "Query Converter",
     ):
         expect(page.get_by_text(label, exact=False).first).to_be_visible()
 
@@ -42,9 +42,9 @@ def test_connect_form_fields_present(page: Page) -> None:
 
 
 def test_start_over_dialog_opens_and_cancels(page: Page) -> None:
-    # The Start over control opens its type-to-confirm dialog and can be dismissed
-    # without resetting anything.
-    page.get_by_role("button", name="Start over").click()
+    # The Start over control (a drawer-footer item, not a header button) opens its
+    # type-to-confirm dialog and can be dismissed without resetting anything.
+    page.get_by_text("Start over", exact=True).first.click()
     expect(page.get_by_text("Start over — reset this session")).to_be_visible()
     page.get_by_role("button", name="Cancel").click()
     expect(page.get_by_text("Start over — reset this session")).to_be_hidden()

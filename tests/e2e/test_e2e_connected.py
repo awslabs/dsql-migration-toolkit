@@ -5,7 +5,7 @@
 
 Opt-in and reachability-gated (see conftest ``live_infra``): runs only when
 ``RUN_E2E_CONNECTED=1`` AND both databases are actually reachable, otherwise it
-skips cleanly. It drives the REAL connect → Query validation → Test-on-target
+skips cleanly. It drives the REAL connect → Query Converter → Test-on-target
 flow in a browser against live infrastructure, and (when Amazon Bedrock is also
 reachable, ``bedrock_reachable``) the AI-DBA tuning + re-test + per-code-block
 copy flow.
@@ -53,7 +53,7 @@ def _verify_connections(page: Page, *, enable_ai: bool = False) -> None:
 
 
 def _open_query_validation(page: Page) -> None:
-    page.get_by_text("Query validation", exact=False).first.click()
+    page.get_by_text("Query Converter", exact=False).first.click()
     expect(page.get_by_label("MySQL SQL", exact=False).first).to_be_visible(
         timeout=15_000
     )
