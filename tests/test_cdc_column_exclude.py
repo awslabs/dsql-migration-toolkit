@@ -255,8 +255,10 @@ def test_every_cdc_surface_shows_what_start_sends():
     assert "exclude_list = split_column_exclude_value(_capture.sent) or None" in src
     assert src.count("exclude_list = split_column_exclude_value(_capture.value) or None") == 2
     assert 'params = params.model_copy(update={"column_exclude_legacy": _capture.legacy})' in src
-    # P3-C22: the CDC step's read-only summary shows the same SENT value.
-    assert "cdc_capture_exclusions(migration_state, inventory, captured).sent" in src
+    # P3-C22: the CDC step's read-only summary shows the same SENT value (unless the live
+    # connector or a refused mismatch makes the deployed value what CDC receives).
+    assert "capture = cdc_capture_exclusions(migration_state, inventory, captured)" in src
+    assert "session_value = capture.sent" in src
 
 
 def test_discovery_records_the_deployed_value_and_adopt_clears_it():

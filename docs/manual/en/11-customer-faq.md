@@ -426,9 +426,11 @@ They are **never silently dropped**. In Full Load a value over DSQL's ~1 MiB
 per-value limit is **quarantined** per-row (its primary key + reason recorded in the
 error log) while the rest of the table loads; in CDC such a row goes to the **DLQ**.
 Values that can't even traverse the pipeline (> ~8 MiB) are **excluded at capture**:
-you tick the column on the Data Migration / CDC step's oversized-LOB card, which offers
-the same columns Evaluation flags `OVERSIZED_LOB`. You see exactly what was set
-aside. See [Chapter 6 §6.1](06-limitations.md#61-aurora-dsql-feature-limits-your-schema-must-fit-these).
+you exclude the column in **Exclude tables & columns** (under the table list on the Data
+Migration step) with a rule, or with **+ add rule** in its *Oversized-LOB candidates*
+section, which lists the same columns Evaluation flags `OVERSIZED_LOB` (**Check sizes**
+measures them on request). An excluded column is NULL on Aurora DSQL. You see exactly
+what was set aside. See [Chapter 6 §6.1](06-limitations.md#61-aurora-dsql-feature-limits-your-schema-must-fit-these).
 
 
 **Q25. What does "loud over silent" mean in practice?**

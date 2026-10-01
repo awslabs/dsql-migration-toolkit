@@ -914,6 +914,7 @@ def build_data_migration_screen(
                 migration_state.set_error("Select at least one table to check.")
                 refresh()
                 return
+            _selection_at_click = migration_state.selection_snapshot()
             tables = TableSelector().resolve(
                 inventory, TableSelection(selected_tables=names)
             )
@@ -1084,8 +1085,11 @@ def build_data_migration_screen(
             # selection (the CDC connector's TableIncludeList / SinkTopics and the
             # topic partition plan) then resolved to "no tables". Recording it makes
             # the confirmed scope explicit, so a CDC deploy fired right after the
-            # checks -- before any Full Load watermark exists -- gets the real set.
-            migration_state.set_selection(TableSelection(selected_tables=list(names)))
+            # checks -- before any Full Load watermark exists -- gets the real set. Only
+            # when the selection did not change during the run (a table-rule Save or a
+            # tree tick meanwhile already left an explicit selection; prereq_scope_gap
+            # holds Start if it added a table the checks did not cover).
+            migration_state.pin_checked_selection(names, expected=_selection_at_click)
             # Record the prerequisite-check outcome on the activity log so the
             # timeline shows readiness was assessed and whether it passed. Both
             # modes run the same prerequisite checker, so the action label is

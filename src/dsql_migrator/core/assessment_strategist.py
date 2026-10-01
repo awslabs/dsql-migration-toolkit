@@ -945,6 +945,14 @@ def _cdc_recovery_context(source_engine: str = "MySQL") -> str:
         if source_engine == "PostgreSQL"
         else "on Automatic it re-seeds from the Full Load watermark"
     )
+    # With no Full Load there is nothing to reload and no watermark: the delete takes the
+    # stream position with it (mirrors the R2 lock text in exclusion_lock_state).
+    no_load_restart = (
+        "Start CDC re-creates the publication and snapshots the captured tables again"
+        if source_engine == "PostgreSQL"
+        else "Start CDC on Automatic begins at the source's CURRENT position, so changes "
+        "to the captured tables after the last one Aurora DSQL applied are NOT replicated"
+    )
     return (
     "How this tool's CDC works and how to recover a dead-lettered / drifted stream:\n"
     f"- CDC is Debezium ({capture}) -> Amazon MSK (Kafka) -> a CUSTOM DSQL Sink "
@@ -1005,12 +1013,18 @@ def _cdc_recovery_context(source_engine: str = "MySQL") -> str:
     "prerequisite gate and the Validation comparison all stop covering that column too, "
     "and it is NULL on the target for every reloaded row; (2) Stop CDC, then Delete the "
     "CDC infrastructure on the CDC step (a table cannot be dropped while CDC streams to "
-    "it); (3) in Exclude tables & columns use Change & reload (a Full Load type): it "
-    "drops and reloads exactly the tables whose excluded columns change, recreating them "
-    "with the column NULL; CDC only has no Full Load to reload on, so switch the "
-    "migration type to Full load + CDC first, or rows already on Aurora DSQL keep their "
-    "values; (4) Deploy the CDC infrastructure again and Start CDC "
-    f"({reseed}).\n"
+    "it); then it depends on whether a Full Load ran in this migration (the facts say; "
+    "an 'Exclusion lock' line in the facts is authoritative and overrides this). IF A "
+    "FULL LOAD RAN: (3) in Exclude tables & columns use Change & reload (a Full Load "
+    "type): it drops and reloads exactly the tables whose excluded columns change, "
+    "recreating them with the column NULL; a CDC only session switches the migration "
+    "type to Full load + CDC first; (4) Deploy the CDC infrastructure again and Start CDC "
+    f"({reseed}). IF NO FULL LOAD RAN (CDC only from the start): there is nothing to "
+    "reload -- (3) change the column rules directly in Exclude tables & columns; (4) "
+    f"Deploy the CDC infrastructure again and Start CDC ({no_load_restart}). Rows already "
+    "on Aurora DSQL keep their values in the newly excluded column; to make them NULL, or "
+    "to re-copy changes CDC missed, switch the migration type to Full load + CDC and run "
+    "its Full Load, choosing to drop and recreate the tables in its Start dialog.\n"
     "- If the operator cannot drop the column (the data must migrate), the value itself "
     "has to shrink below 1 MiB on the SOURCE before the reload; there is no target-side "
     "setting that admits it."

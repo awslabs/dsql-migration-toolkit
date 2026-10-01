@@ -203,6 +203,33 @@ def test_the_lob_line_is_info_until_a_measured_offender_is_open():
 # --- review fixes (C05-C11 review) ----------------------------------------------------
 
 
+def test_an_untick_is_not_drift_but_a_table_gone_from_the_inventory_is():
+    # Final check: unticking a table whose columns the rules exclude is not "no longer
+    # match"; the rules still match it, the table is simply not migrated.
+    state = DataMigrationState()
+    res = popup_resolution(state, INV, "exclude shop.t.a", inputs=_inputs(), source_type=MY)
+    assert state.set_column_exclusions(res, text="exclude shop.t.a") is None
+    unticked = _inputs(selected=[n for n in NAMES if n != "shop.t"])
+    again = popup_resolution(state, INV, "exclude shop.t.a", inputs=unticked, source_type=MY)
+    assert exclusion_drift(state, again, migratable=unticked.migratable) is None
+    summary = exclusion_row_summary(state, locked=False, drift=None, block_reason=None)
+    assert summary.variant != "drift"
+    # Re-ticked: still nothing.
+    again = popup_resolution(state, INV, "exclude shop.t.a", inputs=_inputs(), source_type=MY)
+    assert exclusion_drift(state, again, migratable=NAMES) is None
+    # The inverse still drifts: saved with shop.t unticked, then ticked.
+    state2 = DataMigrationState()
+    res = popup_resolution(state2, INV, "exclude shop.t.a", inputs=unticked, source_type=MY)
+    assert state2.set_column_exclusions(res, text="exclude shop.t.a") is None
+    ticked = popup_resolution(state2, INV, "exclude shop.t.a", inputs=_inputs(), source_type=MY)
+    assert exclusion_drift(state2, ticked, migratable=NAMES).added == (("shop.t", "a"),)
+    # A stored entry on a table that left the inventory still reports.
+    gone = [n for n in NAMES if n != "shop.t"]
+    shrunk = popup_resolution(state, INV, "exclude shop.t.a",
+                              inputs=_inputs(selected=gone, migratable=gone), source_type=MY)
+    assert exclusion_drift(state, shrunk, migratable=gone).removed == (("shop.t", "a"),)
+
+
 def test_drift_survives_an_errored_line_and_reports_it():
     state = DataMigrationState()
     inv = SimpleNamespace(tables=[_t("shop.pages", body="longtext", summary="longtext"),
@@ -288,6 +315,9 @@ def test_the_start_dialog_notes_unselected_tables_and_drift_but_never_gates():
     state.set_exclusion_inputs_resolver(lambda: _inputs())
     assert start_dialog_exclusion_notes(state) == []
     state.restore_exclusion_rules("exclude table shop.audit_*", ["shop.audit_1", "gone.t"])
+    # the rules unselected shop.audit_1 (a provenance table is not in the selection)
+    state.set_exclusion_inputs_resolver(
+        lambda: _inputs(selected=[n for n in NAMES if n != "shop.audit_1"]))
     state.set_exclusion_drift_text("Your rules now match 1 more column (shop.u.x) - review")
     notes = start_dialog_exclusion_notes(state)
     assert notes == [
@@ -317,7 +347,15 @@ def test_the_deploy_disclosure_appears_only_when_something_is_excluded_and_shows
     header, details = deploy_exclusion_disclosure(state, inv)
     assert header == ("Excluded: 1 column. They are fixed once deployed: changing them later "
                       "needs Delete CDC infrastructure.")
-    assert cdc_capture_exclusions(state, inv, inv.tables).sent in details
+    sent = cdc_capture_exclusions(state, inv, inv.tables).sent
+    assert sent == "shop.t.a"
+    assert details == f"Columns: shop.t.a. Sent as ColumnExcludeList: {sent}"
+    # The two halves differ when the column's table is not captured.
+    other = DataMigrationState()
+    other.set_exclusion_inputs_resolver(lambda: _inputs(selected=["shop.u", "shop.audit_1"]))
+    other.restore_lob_exclusion("shop.t", "a")
+    assert deploy_exclusion_disclosure(other, inv)[1] == (
+        "Columns: shop.t.a. Sent as ColumnExcludeList: (nothing excluded at capture)")
     import inspect
 
     from dsql_migrator.ui.data_migration import _cdc_ui

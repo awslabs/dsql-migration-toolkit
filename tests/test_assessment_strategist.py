@@ -1175,6 +1175,11 @@ def test_the_cdc_chat_knows_the_oversized_value_class_and_its_order() -> None:
     assert "Stop CDC, then Delete the CDC infrastructure" in system
     assert "use Change & reload" in system
     assert "Deploy the CDC infrastructure again and Start CDC" in system
+    # Final check: split by whether a Full Load ran -- with none there is nothing to
+    # Change & reload and no watermark (the stream position goes with the Delete).
+    assert "IF A FULL LOAD RAN: (3)" in system and "IF NO FULL LOAD RAN" in system
+    assert "begins at the source's CURRENT position" in system
+    assert "'Exclusion lock' line in the facts is authoritative" in system
     # The migration-wide side effect is disclosed, not buried.
     assert "MIGRATION-WIDE" in system
     assert "Validation" in system

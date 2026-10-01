@@ -3132,3 +3132,47 @@ def test_the_ddl_caches_cover_a_very_large_schema() -> None:
     for fn in (converter.parse_target_column_names, column_exclusion._ddl_key_facts,
                column_exclusion._unique_members, column_exclusion._view_table_refs):
         assert fn.cache_info().maxsize >= 32768, fn
+
+
+def test_the_checker_threads_excluded_columns_into_the_pg_column_replicable_row() -> None:
+    """Final check: PrerequisiteChecker.check -> check_postgres_cdc_prerequisites must
+    drop an uncarryable column the operator excluded (nothing else pinned the threading)."""
+    from dsql_migrator.core.models import (
+        ColumnDef, MigrationMode, PrerequisiteCheckId, PrerequisiteCheckRequest, SourceType,
+        TableDef,
+    )
+    from dsql_migrator.core.prerequisites import PrerequisiteChecker
+    from dsql_migrator.core.prerequisites_postgres import (
+        UNCARRYABLE_COLUMN_ARRIVES_NULL, UNCARRYABLE_ROW_DEAD_LETTERS,
+    )
+
+    facts = _pg_facts_healthy(
+        replica_identity={"app.orders": "d"},
+        unlogged={"app.orders": False},
+        cdc_uncarryable_columns=_uncarryable(
+            ("bin_arr", "bytea[]", UNCARRYABLE_COLUMN_ARRIVES_NULL),
+            ("num_arr", "numeric[]", UNCARRYABLE_ROW_DEAD_LETTERS),
+        ),
+    )
+    table = TableDef(name="app.orders", primary_key=["id"], columns=[
+        ColumnDef(name="id", mysql_type="bigint"),
+        ColumnDef(name="bin_arr", mysql_type="bytea[]"),
+        ColumnDef(name="num_arr", mysql_type="numeric[]"),
+    ])
+    checker = PrerequisiteChecker(
+        source_probe=_FakeSource(cdc_facts=facts),
+        target_probe=_FakeTarget(existing={"app.orders"}),
+        msk_probe=_FakeMsk(),
+    )
+    request = PrerequisiteCheckRequest(
+        mode=MigrationMode.CDC, tables=["app.orders"], source_type=SourceType.POSTGRES)
+
+    def rows(excluded):
+        report = checker.check(request, tables=[table], excluded_columns=excluded)
+        return [r for r in report.results if r.check_id is PrerequisiteCheckId.COLUMN_REPLICABLE]
+
+    assert len(rows(None)) == 1
+    both = rows({"app.orders": ["bin_arr", "num_arr"]})
+    assert both == [], [r.detail for r in both]
+    one = rows({"app.orders": ["num_arr"]})
+    assert len(one) == 1 and "bin_arr" in one[0].detail and "num_arr" not in one[0].detail

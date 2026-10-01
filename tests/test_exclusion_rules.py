@@ -277,6 +277,7 @@ def _col(t):
     ("app.status", "app.status"),
     ('"my(x)"', "my(x)"),
     ('"char"', "char"),
+    ('"integer"', "integer"),  # a public."integer" domain shares the built-in's key
     ('"a""b"', 'a"b'),
     ("  double   precision ", "double precision"),
     ("bpchar", "bpchar"),
@@ -1230,3 +1231,48 @@ def test_columns_on_a_reticked_table_are_reported_not_stored():
                prev={"shop.audit_2023"}, reticks={"shop.audit_2024"})
     assert ("shop.audit_2024", "payload") in res.retick_columns
     assert "shop.audit_2024" not in res.columns
+
+
+
+# --- final check: fixes never silently narrow a rule ---------------------------------------
+
+
+def test_builtin_collision_domain_named_integer_shares_the_integer_key():
+    # Documented in rule_type_name: CREATE DOMAIN public."integer" prints "integer".
+    res = _resolve("exclude type:integer", [_pg(('"integer"', 1), ("integer", 1))])
+    assert dict(res.columns) == {"public.t": frozenset({"c1", "c2"})}
+    assert res.line_status[1].type_counts == (("integer", 2, 1),)
+
+
+def test_a_space_separated_type_list_is_e2_with_the_comma_fix_never_a_silent_first_type():
+    table = TableDef(name="shop.media", primary_key=["id"], columns=[
+        ColumnDef(name="id", mysql_type="bigint"), ColumnDef(name="doc", mysql_type="longtext"),
+        ColumnDef(name="img", mysql_type="longblob")])
+    # The quoting fix of the unquoted form leads here; on MySQL the space cut used to
+    # match only longtext and leave img migrated.
+    res = _resolve('exclude type:"longtext longblob"', [table], MY)
+    (err,) = res.errors[1]
+    assert err.code == "E2" and "separate types with a comma" in err.message
+    (fix,) = err.suggestions
+    assert fix.line_text == "exclude type:longtext,longblob"
+    fixed = _resolve(fix.line_text, [table], MY)
+    assert dict(fixed.columns) == {"shop.media": frozenset({"doc", "img"})}
+    # A real multi-word type is untouched (precision is not a type here).
+    dbl = TableDef(name="shop.n", primary_key=["id"], columns=[
+        ColumnDef(name="id", mysql_type="bigint"), ColumnDef(name="x", mysql_type="double")])
+    assert dict(_resolve('exclude type:"double precision"', [dbl], MY).columns) == {
+        "shop.n": frozenset({"x"})}
+    # PG exact multi-word keys still win.
+    pg = _pg(("character varying(20)", 1), ("text", 1))
+    assert dict(_resolve('exclude type:"character varying"', [pg]).columns) == {
+        "public.t": frozenset({"c1"})}
+
+
+@pytest.mark.parametrize("text", [
+    "exclude shop.users.email,phone", "exclude shop.users.email, phone  # why",
+    "exclude table shop.a,shop.b", "exclude shop.users.,phone"])
+def test_a_comma_list_of_names_gets_no_comment_fix(text):
+    _rules, errors = parse_rules(text)
+    (err,) = errors[1]
+    assert err.code == "E1" and err.message.startswith("One rule per line")
+    assert err.suggestions == ()

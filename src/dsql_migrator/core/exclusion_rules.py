@@ -179,7 +179,7 @@ def _read_ref(text: str, i: int) -> "tuple[list[RulePart], int]":
         part, j = _read_part(text, i)
         if not part.quoted and part.text == "":
             if j < len(text) and text[j] == ",":
-                raise _E1(f'Unexpected text after the rule: "{text[j:].strip()}". Use # for a comment.')
+                raise _E1(_COMMA_LIST_MESSAGE)
             raise _E1('An empty name part: remove the extra ".".')
         parts.append(part)
         if j < len(text) and text[j] == ".":
@@ -478,10 +478,17 @@ def _parse_line(number: int, line: str) -> ParsedRule:
     return ParsedRule(number, action, kind, tuple(parts), (), comment, rule_text)
 
 
+_COMMA_LIST_MESSAGE = ("One rule per line: a comma list works only after type:. Put each "
+                       "name on its own line.")
+
+
 def _no_trailing(line: str, rule_text: str, end: int) -> None:
     """E1 for any text after the subject, with a fix that turns it into a comment (an
-    existing comment is kept after it)."""
+    existing comment is kept after it). A comma list of names gets no such fix: commenting
+    out the rest would silently leave those names migrated."""
     text = rule_text[end:].strip()
+    if text.startswith(","):
+        raise _E1(_COMMA_LIST_MESSAGE)
     if text:
         kept = line[len(rule_text):]  # "" or "#<comment>"
         fixed = line[:end].rstrip() + " # " + text + (" " + kept if kept else "")
@@ -927,6 +934,19 @@ def _type_miss(line, index, typed: RulePart, line_text, key_counts, source_type)
     return RuleError("E2", line, message, suggestions, name_index=index)
 
 
+def _type_list_miss(line, index, typed: RulePart, line_text, words) -> RuleError:
+    """The E2 for a quoted name whose every word is a type here: a list typed with spaces.
+    Its one fix is the comma list, so no type is silently dropped."""
+    joined = ",".join(type_name_token(w) for w in words)
+    suggestions = ((Suggestion(f"Use type:{joined}",
+                               _replace(line_text, typed.span[0], typed.span[1], joined)),)
+                   if all(rule_name_writable(w) for w in words) else ())
+    return RuleError(
+        "E2", line,
+        f"No type is written with spaces like {type_name_token(typed.text)}: separate "
+        "types with a comma.", suggestions, name_index=index)
+
+
 def _hint_notes(rule, resolved, scope_counts, source_type) -> "list[str]":
     """Notes (never errors) for a type name that matched a key while its hint names a
     DIFFERENT key that is also here; ``bpchar``/``character`` (and their ``[]`` arrays) are
@@ -1070,6 +1090,15 @@ def resolve_exclusion_rules(
                 key_counts[key] = key_counts.get(key, 0) + 1
             resolved: dict[str, str] = {}
             for index, typed in enumerate(rule.type_names):
+                words = typed.text.split()
+                if (len(words) > 1 and typed.text not in key_counts
+                        and all(resolve_type_name(w, key_counts, source_type) is not None
+                                for w in words)):
+                    # "longtext longblob" is a list typed with a space, not one type: on
+                    # MySQL the space cut would silently match only the first word.
+                    errors.setdefault(line, []).append(
+                        _type_list_miss(line, index, typed, line_text, words))
+                    continue
                 key = resolve_type_name(typed.text, key_counts, source_type)
                 if key is None:
                     errors.setdefault(line, []).append(
@@ -1154,7 +1183,9 @@ def resolve_exclusion_rules(
         excluded_by[item] = lines
         if ctx is not None:
             # An omit-only entry gets no overlay, so the W1-W6 story would be false.
-            found = (legacy_exclusion_notes(item[0], item[1], ctx) if item in legacy_set
+            found = (legacy_exclusion_notes(item[0], item[1], ctx,
+                                            adopted=_adopted_line(rules, lines))
+                     if item in legacy_set
                      else column_exclusion_warnings(item[0], item[1], ctx))
             if found:
                 warnings[item] = found
@@ -1533,6 +1564,20 @@ def _diff(columns, stored, unselect, reselect, cancellations) -> ResolutionDiff:
 
 
 # --- rule text for a session that has none ------------------------------------------
+
+ADOPTED_MARK = "adopted from"
+
+
+def _adopted_line(rules, lines) -> bool:
+    """Whether one of ``lines`` is an adoption line (``# adopted from <stack>``)."""
+    return any(ADOPTED_MARK in (getattr(rules.get(n), "comment", "") or "") for n in lines)
+
+
+def adopted_items(resolution) -> "frozenset[tuple[str, str]]":
+    """The excluded ``(table, column)`` items an adoption line excludes."""
+    return frozenset(item for item, lines in (resolution.excluded_by or {}).items()
+                     if _adopted_line(resolution.rules, lines))
+
 
 LEGACY_COMMENT = "# excluded before v0.1.562"
 

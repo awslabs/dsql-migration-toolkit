@@ -2257,17 +2257,24 @@ class ExclusionDrift:
     retick_columns: "tuple[tuple[str, str], ...]" = ()
 
 
-def exclusion_drift(migration_state, resolution) -> "Optional[ExclusionDrift]":
+def exclusion_drift(
+    migration_state, resolution, *, migratable: "Optional[Iterable[str]]" = None
+) -> "Optional[ExclusionDrift]":
     """The difference between ``resolution`` (of the saved rules) and the stored state, or
     ``None``. A rule-excluded table re-ticked in the tree is an override, not drift -- but
     the column rules that would apply to it are reported. Lines that no longer resolve are
     reported too, and never hide the column changes the rest of the rules make; a table
-    change under the selection lock (E3) is not drift."""
+    change under the selection lock (E3) is not drift. A stored entry on a table unticked
+    in the tree (migratable, out of scope) is not drift either: the rules still match it,
+    the table is simply not migrated. One on a table gone from the inventory still is."""
     if resolution is None:
         return None
     stored = migration_state.lob_exclusions()
+    scope = set(resolution.in_scope)
+    universe = set(migratable) if migratable is not None else None
     now = {(t, c) for t, cs in resolution.columns.items() for c in cs}
-    before = {(t, c) for t, cs in stored.items() for c in cs}
+    before = {(t, c) for t, cs in stored.items() for c in cs
+              if t in scope or (universe is not None and t not in universe)}
     reticks = migration_state.rule_reticked_tables()
     locked = any(e.code == "E3" for es in resolution.errors.values() for e in es) or any(
         e.code == "E3" for e in resolution.global_errors)
@@ -2338,7 +2345,8 @@ def start_dialog_exclusion_notes(migration_state) -> "list[tuple[str, str]]":
     inputs = getter() if callable(getter) else None
     provenance = migration_state.rule_excluded_tables()
     if inputs is not None:
-        provenance = provenance & set(inputs.migratable)
+        # Only the ones still unselected: never "not loaded" for a selected table.
+        provenance = (provenance & set(inputs.migratable)) - set(inputs.selected)
     if provenance:
         n = len(provenance)
         notes.append(("info", f"{n} table{'s' if n != 1 else ''} unselected by your rules "
@@ -2359,7 +2367,8 @@ def deploy_exclusion_disclosure(migration_state, inventory) -> "Optional[tuple[s
     inputs = getter() if callable(getter) else None
     provenance = migration_state.rule_excluded_tables()
     if inputs is not None:
-        provenance = provenance & set(inputs.migratable)
+        # Only the ones still unselected: never "not loaded" for a selected table.
+        provenance = (provenance & set(inputs.migratable)) - set(inputs.selected)
     if not columns and not provenance:
         return None
     parts = []
@@ -2512,11 +2521,18 @@ def exclusion_row_summary(
             # A measured offender, not only a type: say so, or the warning tone is the
             # only difference from the type-based line.
             lob_tone = "warning"
+            mtype = getattr(migration_state, "migration_type", None)
+            consequence = (
+                "each such row is dead-lettered by CDC (kept out of Aurora DSQL)"
+                if mtype is MigrationType.CDC_ONLY
+                else "each such row is quarantined at load"
+                + (" (or dead-lettered during CDC)"
+                   if mtype is MigrationType.FULL_LOAD_AND_CDC else "")
+            )
             lob_text = (
                 f"{found} column{'s' if found != 1 else ''} in the selected tables "
                 f"{'hold' if found != 1 else 'holds'} a value over Aurora DSQL's limit "
-                "(Check sizes): each such row is quarantined at load. Review them in "
-                "Exclude tables & columns."
+                f"(Check sizes): {consequence}. Review them in Exclude tables & columns."
             )
     if block_reason:
         n = blocking_count or 1

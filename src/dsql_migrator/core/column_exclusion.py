@@ -620,13 +620,16 @@ WL_REJECT = "WLR"  # the same, where every row is rejected: a warning
 
 
 def legacy_exclusion_notes(
-    table_name: str, column: str, ctx: ExclusionContext
+    table_name: str, column: str, ctx: ExclusionContext, *, adopted: bool = False
 ) -> tuple[ExclusionFinding, ...]:
     """What an omit-only (legacy) entry does instead of the W1-W6 overlay story: no
     target change, so Aurora DSQL keeps NOT NULL and fills the DEFAULT -- which a UNIQUE
-    member turns into 23505 after the first row, and NOT NULL without one into 23502."""
+    member turns into 23505 after the first row, and NOT NULL without one into 23502.
+    ``adopted``: the entry came from an attached CDC stack, not an earlier version."""
     not_null, default_sql = ctx.target_constraints.get(table_name, {}).get(column, (False, None))
-    text = "Excluded before v0.1.562: omitted only, with no change on Aurora DSQL."
+    text = ("Omit-only (adopted from the attached CDC stack): no change on Aurora DSQL."
+            if adopted else "Excluded before v0.1.562: omitted only, with no change on "
+            "Aurora DSQL.")
     code = WL
     if default_sql is not None:
         text += f" Aurora DSQL fills its DEFAULT {default_sql} in every row."

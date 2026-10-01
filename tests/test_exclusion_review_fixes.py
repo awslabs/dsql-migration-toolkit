@@ -331,15 +331,6 @@ def test_the_reload_hint_needs_the_job_record():
 # ---------------------------------------------------------------------------
 
 
-def _pg_gen_tables(n=100):
-    return SourceInventory(tables=[TableDef(
-        name=f"public.customer_order_line_{i:04d}", primary_key=["id"],
-        columns=[ColumnDef(name="id", mysql_type="integer"), ColumnDef(name="amount", mysql_type="numeric"),
-                 ColumnDef(name=f"amount_with_tax_{i:04d}", mysql_type="numeric", generated=True,
-                           generated_kind="STORED", generated_expression="(amount * 1.1)")])
-        for i in range(n)])
-
-
 def test_exclusions_on_deselected_tables_are_not_counted_in_the_capture_list():
     from dsql_migrator.ui.data_migration._models import cdc_capture_exclusions
 
@@ -567,3 +558,70 @@ def test_the_picker_lock_names_cdc_when_cdc_alone_promoted_the_step():
     session = SimpleNamespace(workflow=with_status(WorkflowState(), WorkflowStep.FULL_LOAD, StepStatus.DONE))
     assert table_set_lock_reason(cdc_only, _StubJobManager({}), session).startswith(
         "Locked — CDC has already streamed")
+
+
+def test_the_dlq_ai_facts_carry_the_type_the_full_load_and_the_lock_steps():
+    # Final check: the CDC chat's runbook depends on these, so the facts state them.
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.data_migration import DataMigrationState, MigrationType
+    from dsql_migrator.ui.data_migration._cdc_monitoring import _exclusion_state_facts
+    from tests.test_ui_data_migration import _StubJobManager
+
+    state = DataMigrationState()
+    state.migration_type = MigrationType.CDC_ONLY
+    state._session = SimpleNamespace(source_config=None, restored_source_type=None)
+    state.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
+    lines = _exclusion_state_facts(state, _StubJobManager({}))
+    assert lines[0] == "Migration type: CDC only."
+    assert lines[1] == "Full Load run recorded in this session: no."
+    assert lines[2].startswith("Exclusion lock (authoritative; give the operator THESE steps): "
+                               "Locked — the CDC infrastructure is deployed")
+    # No lock: no lock line; a failing lookup drops only these lines.
+    state.set_cdc_stack_phase("absent", status=None)
+    assert len(_exclusion_state_facts(state, _StubJobManager({}))) == 2
+    assert _exclusion_state_facts(object(), object()) == [
+        "Full Load run recorded in this session: no."]
+
+
+def test_a_table_rule_saved_during_a_prerequisite_run_is_not_undone_by_its_pin():
+    # Final check: the run pinned its click-time set over a Save made meanwhile, so a
+    # rule-unselected table was loaded while the Start dialog said it was not.
+    from dsql_migrator.core.models import TableSelection
+    from dsql_migrator.ui.data_migration import DataMigrationState
+
+    state = DataMigrationState()
+    names = ["shop.t", "shop.audit_1"]
+    at_click = state.selection_snapshot()
+    state.set_selection(TableSelection(selected_tables=["shop.t"]))  # the Save meanwhile
+    assert state.pin_checked_selection(names, expected=at_click) is False
+    assert state.selection.selected_tables == ["shop.t"]
+    # Unchanged since the click: pinned (the CDC TableIncludeList needs the explicit set).
+    fresh = DataMigrationState()
+    assert fresh.pin_checked_selection(names, expected=fresh.selection_snapshot()) is True
+    assert fresh.selection.selected_tables == names and fresh.selection_touched is True
+
+
+def test_the_start_and_deploy_notes_count_only_still_unselected_provenance():
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.data_migration import DataMigrationState
+    from dsql_migrator.ui.data_migration._models import (
+        ExclusionInputs,
+        deploy_exclusion_disclosure,
+        start_dialog_exclusion_notes,
+    )
+
+    state = DataMigrationState()
+    state.restore_exclusion_rules("exclude table shop.audit_1", ["shop.audit_1"])
+    names = ["shop.t", "shop.audit_1"]
+    state.exclusion_inputs = lambda: ExclusionInputs(
+        selected=list(names), applied={}, preserve_foreign_keys=True, migratable=list(names),
+        signature=("s",))
+    assert not any("unselected by your rules" in text for _tone, text in start_dialog_exclusion_notes(state))
+    assert deploy_exclusion_disclosure(state, SimpleNamespace(tables=[])) is None
+    state.exclusion_inputs = lambda: ExclusionInputs(
+        selected=["shop.t"], applied={}, preserve_foreign_keys=True, migratable=list(names),
+        signature=("s",))
+    assert any("1 table unselected by your rules is not loaded" in text
+               for _tone, text in start_dialog_exclusion_notes(state))

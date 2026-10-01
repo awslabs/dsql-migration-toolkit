@@ -316,6 +316,27 @@ def test_legacy_is_information_and_its_remedy_follows_the_state():
                for line in lines)
 
 
+def test_a_zero_count_omit_only_column_is_null_not_default():
+    # Final check: an omit-only column with 0 non-NULL rows is NULL in every row --
+    # never "holds the target DEFAULT", no remedy, no "keep the DEFAULT" caveat.
+    from dsql_migrator.core.validator import render_text_report
+
+    summary, report = _summary(_item("a", counts={}, legacy={"old": 0, "kept": 4},
+                                     excluded=("old", "kept")))
+    assert summary.legacy_values == {"a": {"kept": 4}} and summary.legacy_null == {"a": ("old",)}
+    _tone, _header, lines = null_proof_lines(summary, legacy_remedy="REMEDY.")
+    assert any(line == "a.old: excluded before v0.1.562 (omit-only); NULL in every row "
+               "(0 non-NULL), nothing to convert." for line in lines)
+    assert any(line.startswith("a.kept:") and line.endswith("REMEDY.") for line in lines)
+    text = render_text_report(report)
+    assert "(rows hold the target DEFAULT, not NULL): a (kept: 4 non-NULL)" in text
+    assert "Excluded omit-only, NULL in every row: a (old)" in text
+    only_zero, report0 = _summary(_item("b", counts={}, legacy={"old": 0}, excluded=("old",)))
+    assert only_zero.legacy_values == {}
+    assert "keep the target DEFAULT" not in verdict_evidence_caveats(only_zero, report0)
+    assert uiv._excluded_cell(report0.items[0]) == uiv._cell("NULL", "ok")
+
+
 def test_the_export_and_the_log_name_omit_only_neutrally():
     # Review #4: the exported report and the log caveat must not call an ADOPTED column
     # "earlier version" / "before the NULL overlay" while the panel says adopted.
@@ -389,6 +410,15 @@ def test_the_legacy_remedy_per_state():
     assert text.startswith("To load it as NULL, wait for the CDC infrastructure create to "
                            "finish, delete the CDC infrastructure"), text
     assert "use Change & reload" in text
+    # Unlocked (no job, no stack -- e.g. the adopted stack was deleted): a plain Full Load
+    # would omit the column again, so the remedy is Start over, never "run the Full Load".
+    for mtype in (full, both, cdc):
+        state = _st(mtype)
+        state.set_cdc_stack_phase("absent", status=None)
+        text = legacy_values_remedy(state, gone)
+        assert text.startswith("To load it as NULL, Start over") and "drop and recreate" in text
+        assert "run the Full Load" not in text
+        assert ("choose Full load + CDC" in text) is (mtype is cdc)
     state = _st(MigrationType.CDC_ONLY)
     state.restore_exclusion_rules("exclude shop.t.a  # adopted from dsql-cdc-x, omit-only\n"
                                   "exclude shop.t.b", ())

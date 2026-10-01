@@ -1668,6 +1668,26 @@ class DataMigrationState:
             self.selection = selection
             self.selection_touched = True
 
+    def selection_snapshot(self) -> "tuple[tuple[str, ...], bool]":
+        """``(selected tables, touched)`` now, for :meth:`pin_checked_selection`."""
+        with self._lock:
+            return tuple(self.selection.selected_tables), bool(self.selection_touched)
+
+    def pin_checked_selection(
+        self, names: "Sequence[str]", *, expected: "tuple[tuple[str, ...], bool]"
+    ) -> bool:
+        """Pin the table set a prerequisite run covered -- only if the selection is still
+        what it was when the run started (``expected``, from :meth:`selection_snapshot`).
+        A Save of table rules or a tree tick during the run already left an explicit
+        selection; pinning the click-time set over it would undo that change (a
+        rule-unselected table loaded again). Atomic under the lock."""
+        with self._lock:
+            if (tuple(self.selection.selected_tables), bool(self.selection_touched)) != expected:
+                return False
+            self.selection = TableSelection(selected_tables=list(names))
+            self.selection_touched = True
+            return True
+
     def set_accept_quarantined_rows(
         self, accepted: bool, *, gap: "Optional[int]" = None
     ) -> None:

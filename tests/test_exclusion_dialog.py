@@ -24,6 +24,7 @@ class _El:
         self.enabled = True
         self.value = None
         self.id = len(ui.elements) + 1
+        self.tooltips: list[str] = []
 
     def __enter__(self):
         return self
@@ -41,7 +42,8 @@ class _El:
     def style(self, *_a, **_k):
         return self
 
-    def tooltip(self, *_a, **_k):
+    def tooltip(self, text="", *_a, **_k):
+        self.tooltips.append(str(text))
         return self
 
     def open(self):
@@ -554,7 +556,13 @@ def test_check_sizes_is_disabled_with_the_reconnect_hint_when_not_ready():
     assert "disable" in " ".join(button.props_seen)
     assert any(t.startswith("Reads the source: one bounded query per column for the 1 column")
                for t in ui.texts)
-    assert RECONNECT_REASON  # the tooltip carries it (the double records no tooltip text)
+    assert button.tooltips == [RECONNECT_REASON]
+    # Reconnected: enabled, no reconnect hint.
+    ui = _Ui()
+    ctx.session.connection_ready = lambda: True
+    dlg._render_check_sizes(ui, ctx, _rows(("shop.t", "a")), lambda: None)
+    _handler, button = ui.buttons["Check sizes"][-1]
+    assert "disable" not in " ".join(button.props_seen) and RECONNECT_REASON not in button.tooltips
 
 
 # --- P3-C17: read-only modes ------------------------------------------------------------
@@ -602,7 +610,7 @@ def test_the_delete_wait_offers_only_close():
     assert "Close" in ui.buttons and "Change migration type" not in ui.buttons
 
 
-def test_change_migration_type_closes_first_then_scrolls_with_the_shared_script():
+def test_change_migration_type_closes_first_then_scrolls_with_the_shared_script(monkeypatch):
     import inspect
 
     import dsql_migrator.ui.data_migration as dm
@@ -612,17 +620,23 @@ def test_change_migration_type_closes_first_then_scrolls_with_the_shared_script(
     ui = _Ui()
     events = []
     ui.run_javascript = lambda js: events.append(("js", js))
+    real_close = _El.close
+
+    def _close(self):
+        if self.kind == "dialog":
+            events.append("close")
+        return real_close(self)
+
+    # Recorded from the close the button really calls (it binds dialog.close at build).
+    monkeypatch.setattr(_El, "close", _close)
     open_exclusion_dialog(ui, ctx)
-    original_close = ui.dialogs[0].close
-    ui.dialogs[0].close = lambda: (events.append("close"), original_close())[1]
     handler, _button = ui.buttons["Change migration type"][-1]
-    # the dialog was built with dialog.close bound before our wrapper: call the handler and
-    # read the order from the closed counter and the queued timer
-    before = ui.closed
+    timers = len(ui.timers)
     handler()
-    assert ui.closed == before + 1
+    assert events == ["close"]  # closed, nothing scrolled yet
+    assert len(ui.timers) == timers + 1  # the scroll waits for its own next-tick timer
     ui.timers[-1]()
-    assert events[-1] == ("js", SCROLL_TO_MIGRATION_TYPE_JS)
+    assert events == ["close", ("js", SCROLL_TO_MIGRATION_TYPE_JS)]
     assert "SCROLL_TO_MIGRATION_TYPE_JS" in inspect.getsource(dm._scroll_to_migration_type_button)
 
 
@@ -685,6 +699,35 @@ def test_a_successful_change_and_reload_forces_exactly_the_diffed_tables():
     assert state.exclusion_forced_replace == {}
 
 
+def test_change_and_reload_shows_the_warnings_and_alters_before_its_drop():
+    # Final check: no Start dialog follows the confirm, so the reload's W1-W6 warnings
+    # (here W5: a kept NOT NULL generated column over the excluded one) and the ALTERs
+    # its recreated table gets must show before [Drop & reload].
+    ctx, state, _jobs, submitted = _reload_ctx()
+    applied = {"shop.t": SimpleNamespace(
+        target_ddl=('CREATE TABLE "shop"."t" ("id" BIGINT NOT NULL, "a" TEXT NOT NULL '
+                    "DEFAULT 'x', \"b\" TEXT, \"g\" TEXT NOT NULL GENERATED ALWAYS AS "
+                    '(upper(a)) STORED, PRIMARY KEY ("id"))'),
+        foreign_key_ddls=[], preserved_foreign_keys=[], index_ddls=[])}
+    tables = [_t("shop.t", a="longtext", b="longtext", g="longtext")]
+    ctx.inventory_fn = lambda: SimpleNamespace(tables=tables)
+    ctx.inputs_fn = lambda: ExclusionInputs(selected=["shop.t"], applied=applied,
+                                            preserve_foreign_keys=True, migratable=["shop.t"],
+                                            signature=("s",))
+    state._excluded_lob_columns.clear()
+    state.restore_exclusion_rules("", ())
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx, mode="change_and_reload")
+    ui.type_text("exclude shop.t.a")
+    assert "Drop & reload shop.t" in ui.buttons
+    assert any(t.startswith("(!) shop.t.a") and "23502" in t for t in ui.texts)
+    (title,) = [t for t in ui.expansions if t.startswith("Changes to Aurora DSQL")]
+    assert title.endswith("run when the reload starts)")
+    ui.expand("Changes to Aurora DSQL")
+    assert any(t.endswith('ALTER COLUMN "a" DROP NOT NULL') for t in ui.texts)
+    assert submitted == []
+
+
 def test_a_text_only_change_saves_the_text_and_reloads_nothing():
     ctx, state, _jobs, submitted = _reload_ctx()
     ui = _Ui()
@@ -731,6 +774,25 @@ def test_table_lines_are_e3_in_change_and_reload():
     action = [el for el in ui.elements if el.kind == "button"
               and (el.text == "Save" or str(el.text).startswith("Drop & reload"))][-1]
     assert action.enabled is False
+
+
+def test_an_adopted_omit_only_entry_is_never_called_excluded_before_v0_1_562():
+    # Final check: the rule line and Validation say "adopted"; the popup must too.
+    ctx, state, _jobs, _submitted = _reload_ctx()
+    state.restore_exclusion_rules("exclude shop.t.a  # adopted from dsql-cdc-x, omit-only", ())
+    state.restore_legacy_exclusions(["shop.t:a"])
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx, mode="change_and_reload")
+    texts = " ".join(ui.texts)
+    assert "before v0.1.562" not in texts
+    checkbox = [e for e in ui.elements if e.kind == "checkbox"][-1]
+    assert checkbox.text.startswith("Reload shop.t so its omit-only columns (a) are NULL")
+    edit_ui = _Ui()
+    ctx2, _calls = _ctx(state)
+    state.job_id = None
+    open_exclusion_dialog(edit_ui, ctx2, mode="edit")
+    assert any("1 more omit-only (1 adopted from the attached CDC stack; no target change)" in t
+               for t in edit_ui.texts)
 
 
 def test_a_ticked_legacy_table_joins_the_reload_and_becomes_overlay():
@@ -1157,6 +1219,44 @@ def test_lob_rows_show_a_verdict_for_another_limit_as_not_checked():
     assert any("No value over the limit" in t for t in ui.texts)
 
 
+def test_the_row_and_the_title_ignore_an_over_verdict_for_another_limit():
+    # Final check: lob_rows shows a verdict for another limit as Not checked, so the row
+    # under the tree and the section title must not count it either.
+    from datetime import datetime, timezone
+
+    ctx, _calls = _ctx()
+    state = ctx.migration_state
+    at = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    state._value_size_cache[("shop.t", "a")] = ("over", at, 65535)  # longtext -> 1 MiB now
+    row_ui = _Ui()
+    render_exclusion_button_row(row_ui, ctx)
+    assert not any("holds a value over" in t for t in row_ui.texts)
+    assert any("can exceed Aurora DSQL's value limit (type-based)" in t for t in row_ui.texts)
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx)
+    assert not any("over the limit found" in t for t in ui.expansions)
+    # For the current limit, both count it.
+    state._value_size_cache[("shop.t", "a")] = ("over", at, 1024 * 1024)
+    row_ui = _Ui()
+    render_exclusion_button_row(row_ui, ctx)
+    assert any("holds a value over Aurora DSQL's limit (Check sizes): each such row is "
+               "quarantined at load." in t for t in row_ui.texts)
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx)
+    assert any("1 over the limit found" in t for t in ui.expansions)
+
+
+def test_the_measured_offender_line_says_dead_lettered_for_cdc_only():
+    from dsql_migrator.ui.data_migration._models import LobExclusionCandidate, exclusion_row_summary
+
+    state = DataMigrationState()
+    state.migration_type = MigrationType.CDC_ONLY
+    s = exclusion_row_summary(state, locked=False, drift=None, block_reason=None,
+                              lob_candidates=[LobExclusionCandidate("shop.t", ("a",))],
+                              measured_over={("shop.t", "a")})
+    assert "dead-lettered by CDC" in s.lob_text and "quarantined at load" not in s.lob_text
+
+
 def test_dotted_names_keep_their_own_size_verdict():
     from datetime import datetime, timezone
 
@@ -1248,6 +1348,30 @@ def test_the_cdc_step_summary_shows_what_start_sends_when_it_differs_from_the_st
     _render_cdc_exclusion_summary(again, state, SimpleNamespace(get_status=_none),
                                   SourceInventory(tables=list(INV.tables)))
     assert again.expansions[title][1].value is True
+
+
+def test_a_streamed_stack_with_another_set_keeps_the_deployed_value_as_what_cdc_receives():
+    # Final check: the live connector uses the deployed set; the session's set is shown
+    # beside it with Start CDC's refusal, never as the headline.
+    from dsql_migrator.core.models import SourceInventory, TableSelection
+    from dsql_migrator.ui.data_migration._cdc_ui import _render_cdc_exclusion_summary
+
+    state = DataMigrationState()
+    state.set_selection(TableSelection(selected_tables=[t.name for t in INV.tables]))
+    state.restore_lob_exclusion("shop.t", "a")
+    state.cdc_stack_name = "dsql-cdc-x"
+    state.set_cdc_stack_phase("running", status="UPDATE_COMPLETE")
+    state.cdc_has_committed_offset = True
+    state.set_cdc_deployed_column_exclude_list("shop.t.b")
+    ui = _Ui()
+    _render_cdc_exclusion_summary(ui, state, SimpleNamespace(get_status=_none),
+                                  SourceInventory(tables=list(INV.tables)))
+    assert any(t.startswith("What CDC receives (") and t.endswith("as deployed)")
+               for t in ui.expansions)
+    assert "shop.t.b" in ui.texts
+    assert any(t.startswith("This session would exclude shop.t.a; Start CDC refuses to send it.")
+               for t in ui.texts)
+    assert not any("Start CDC sends the value above" in t for t in ui.texts)
 
 
 def test_saved_entry_notes_stay_visible_after_the_lock():

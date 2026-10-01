@@ -417,9 +417,11 @@ Validation(4단계)이 소스와 타깃을 **점점 더 엄격한 3단계**로 �
 > UI는 영어로만 제공되므로, 화면·로그에서는 위 용어가 각각 **quarantine**(격리), **error log**(Full
 > Load 격리 기록), **DLQ / Dead Letter Queue**(CDC 격리)로 표시됩니다.
 
-파이프라인을 통과조차 못 하는 값(> ~8 MiB)은 **캡처 단계에서 제외**됩니다 — Data Migration / CDC 단계의
-초대형 LOB 카드에서 컬럼을 체크하면 되고, 그 카드가 제시하는 집합은 Evaluation이 `OVERSIZED_LOB`로
-표시하는 컬럼과 같습니다.
+파이프라인을 통과조차 못 하는 값(> ~8 MiB)은 **캡처 단계에서 제외**됩니다 — Data Migration 단계의
+테이블 목록 아래 **Exclude tables & columns**에서 그 컬럼을 제외하는 규칙을 추가하거나, 그 안의
+*Oversized-LOB candidates* 섹션에서 **+ add rule**을 누르면 됩니다. 이 섹션은 Evaluation이
+`OVERSIZED_LOB`로 표시하는 컬럼과 같은 집합을 보여 주고, **Check sizes**로 실제 크기를 잴 수 있습니다.
+제외한 컬럼은 Aurora DSQL에서 NULL입니다.
 [6장 §6.1](06-limitations.md#61-aurora-dsql-기능-한계-스키마가-이에-맞아야-함) 참조.
 
 

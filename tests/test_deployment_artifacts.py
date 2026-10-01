@@ -2322,3 +2322,20 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
         "connectors/plugins/dsql-sink-plugin.zip, and bump PLUGIN_VERSION in "
         "core/s3_provision.py (a live cdc-stack needs Delete + Deploy infra to pick it up)."
     )
+
+
+def test_the_manual_never_names_the_removed_oversized_lob_card() -> None:
+    """P3-C22 removed both exclusion cards; exclusions are edited only in the 'Exclude
+    tables & columns' popup. The manual (en/ko/ja) must not send users to the old card."""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent / "docs" / "manual"
+    stale = re.compile(r"oversized-LOB card|特大 LOB カード|초대형 LOB 카드")
+    hits = [f"{p.relative_to(root)}:{n}" for p in sorted(root.rglob("*.md"))
+            for n, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1)
+            if stale.search(line)]
+    assert hits == []
+    for lang in ("en", "ko", "ja"):
+        assert "Exclude tables & columns" in (root / lang / "11-customer-faq.md").read_text(
+            encoding="utf-8"), lang

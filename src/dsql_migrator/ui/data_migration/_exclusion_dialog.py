@@ -161,7 +161,8 @@ def render_exclusion_button_row(ui, ctx: ExclusionDialogContext):
         drift = None
         saved = state.exclusion_rules_text()
         if saved is not None and not lock.locked:
-            drift = exclusion_drift(state, _resolve(ctx, inventory, inputs, saved, slot="row"))
+            drift = exclusion_drift(state, _resolve(ctx, inventory, inputs, saved, slot="row"),
+                                    migratable=inputs.migratable)
         issues = stored_exclusion_issues(
             state, inventory, committed=lock.locked, selected_tables=inputs.selected
         )
@@ -177,7 +178,7 @@ def render_exclusion_button_row(ui, ctx: ExclusionDialogContext):
             ),
             state.lob_exclusions(),
         )
-        over = {k for k, entry in state.value_sizes().items() if entry[0] == "over"}
+        over = current_over(state, inventory, inputs, lob)
         summary = exclusion_row_summary(
             state, locked=lock.locked, drift=drift, block_reason=block,
             blocking_count=errors, lob_candidates=lob, measured_over=over,
@@ -611,10 +612,16 @@ def _render_errors(ui, resolution, held, editor, rerun) -> None:
         rerun()
 
 
-def _render_result(ui, resolution) -> None:
-    unselected = [i.table for i in resolution.items if i.kind == "unselected"]
-    excluded = [i for i in resolution.items if i.kind == "excluded"]
-    blocked = [i for i in resolution.items if i.kind == "blocked"]
+def _render_result(ui, resolution, tables: "Optional[Sequence[str]]" = None) -> None:
+    """The Result block. ``tables`` (Change & reload) scopes it to the tables the confirm
+    drops and reloads: their blocked items and W1-W6 warnings show before the DROP."""
+    items = resolution.items
+    if tables is not None:
+        wanted = set(tables)
+        items = [i for i in items if i.table in wanted and i.kind != "unselected"]
+    unselected = [i.table for i in items if i.kind == "unselected"]
+    excluded = [i for i in items if i.kind == "excluded"]
+    blocked = [i for i in items if i.kind == "blocked"]
     warned = [i for i in excluded if i.warning]
     with ui.column().classes("w-full gap-1"):
         ui.label("Result").classes("text-sm font-semibold")
@@ -628,7 +635,16 @@ def _render_result(ui, resolution) -> None:
                 f"{'s' if len(tables) != 1 else ''}, migrated as NULL."
                 if overlaid else "Columns  none excluded.")
         if omit_only:
-            text += f" {omit_only} more omit-only (excluded before v0.1.562, no target change)."
+            from dsql_migrator.core.exclusion_rules import adopted_items
+
+            adopted = adopted_items(resolution)
+            n_adopted = sum(1 for i in excluded if i.legacy and (i.table, i.column) in adopted)
+            origins = [o for o in (
+                f"{omit_only - n_adopted} excluded before v0.1.562"
+                if omit_only - n_adopted else "",
+                f"{n_adopted} adopted from the attached CDC stack" if n_adopted else "",
+            ) if o]
+            text += f" {omit_only} more omit-only ({'; '.join(origins)}; no target change)."
         inline_hint(ui, text)
         for item in blocked[:_SHOWN]:
             inline_hint(ui, f"(not excluded) {item.table}.{item.column} (L"
@@ -734,6 +750,45 @@ def _lob_candidates_open(ctx: ExclusionDialogContext, inventory, resolution):
     return open_lob_candidates(candidates, resolution.columns)
 
 
+def _current_value_limit(inventory, inputs, table: str, column: str) -> int:
+    """The per-value limit (bytes) of ``table.column`` now: its applied target type's,
+    else its source type's -- the limit lob_rows shows."""
+    from dsql_migrator.core.converter import parse_target_column_types
+    from dsql_migrator.core.prerequisites import dsql_value_limit_bytes
+
+    tdef = next((t for t in getattr(inventory, "tables", None) or () if t.name == table), None)
+    col = next((c for c in tdef.columns if c.name == column), None) if tdef else None
+    base = (getattr(col, "mysql_type", "") or "").strip().lower().split("(")[0].strip()
+    ddl = getattr((getattr(inputs, "applied", None) or {}).get(table), "target_ddl", None) or ""
+    target = parse_target_column_types(ddl).get(column, "") if ddl else ""
+    return dsql_value_limit_bytes(target or base)
+
+
+def _verdict_for_limit(entry, limit_bytes: int):
+    """``(verdict, when)`` of a cached size entry when it was measured against
+    ``limit_bytes`` (or an unknown limit), else ``None``: a verdict for another limit (the
+    target type was edited since) says nothing about this one. The ONE rule for the row,
+    the section title and lob_rows."""
+    if entry is None or entry[2] not in (None, limit_bytes):
+        return None
+    return entry[:2]
+
+
+def current_over(state, inventory, inputs, candidates) -> "set[tuple[str, str]]":
+    """The ``(table, column)`` candidates whose cached verdict is "over" for their current
+    limit."""
+    sizes = state.value_sizes()
+    out = set()
+    for c in candidates:
+        for col in c.columns:
+            entry = sizes.get((c.table, col))
+            if entry is None or entry[0] != "over":
+                continue
+            if _verdict_for_limit(entry, _current_value_limit(inventory, inputs, c.table, col)):
+                out.add((c.table, col))
+    return out
+
+
 def lob_rows(ctx: ExclusionDialogContext, inventory, inputs, resolution) -> "list[dict]":
     """Section 4's rows (built only while the section is expanded): each open candidate
     with its source -> target type, ceiling, limit, charset caveat, cached size result,
@@ -776,9 +831,7 @@ def lob_rows(ctx: ExclusionDialogContext, inventory, inputs, resolution) -> "lis
             limit = _format_limit(limit_bytes)
             # A verdict measured against another limit (the target type was edited since)
             # says nothing about this one: shown as not checked.
-            entry = sizes.get((candidate.table, name))
-            result = (entry[:2] if entry is not None and entry[2] in (None, limit_bytes)
-                      else None)
+            result = _verdict_for_limit(sizes.get((candidate.table, name)), limit_bytes)
             compressed = dsql_value_limit_is_compressed(limit_type) and limit_type != "bytea"
             collation = (getattr(column, "collation", None) or "").lower()
             charset = None
@@ -823,9 +876,7 @@ def _render_lob_section(ui, ctx, inventory, inputs, resolution, view, add_rules,
     # while the section is open.
     candidates = _lob_candidates_open(ctx, inventory, resolution)
     count = sum(len(c.columns) for c in candidates)
-    sizes = ctx.migration_state.value_sizes()
-    over_count = sum(1 for c in candidates for col in c.columns
-                     if (sizes.get((c.table, col)) or ("",))[0] == "over")
+    over_count = len(current_over(ctx.migration_state, inventory, inputs, candidates))
     title = f"Oversized-LOB candidates ({count})"
     if over_count:
         title += f" - {over_count} over the limit found"
@@ -1025,16 +1076,25 @@ def _statement_action(text: str) -> str:
     return "DROP NOT NULL" if text.rstrip().endswith("DROP NOT NULL") else "DROP DEFAULT"
 
 
-def _render_target_changes(ui, ctx, resolution, view, rerun) -> None:
+def _render_target_changes(ui, ctx, resolution, view, rerun,
+                           tables: "Optional[Sequence[str]]" = None) -> None:
+    """The overlay ALTERs and the Cut over restores. ``tables`` (Change & reload) scopes
+    them to the tables it drops and reloads: their recreated tables get these ALTERs when
+    the reload starts; the other tables already carry theirs."""
     from dsql_migrator.ui.data_migration._models import MigrationType
 
-    statements = [s for c in resolution.target_changes for s in c.statements]
-    notes = [c.note for c in resolution.target_changes if c.note]
-    restores = sum(len(c.restores) for c in resolution.target_changes)
+    changes = resolution.target_changes
+    if tables is not None:
+        wanted = set(tables)
+        changes = [c for c in changes if c.table in wanted]
+    statements = [s for c in changes for s in c.statements]
+    notes = [c.note for c in changes if c.note]
+    restores = sum(len(c.restores) for c in changes)
     if not statements and not notes:
         return
     cdc_only = getattr(ctx.migration_state, "migration_type", None) is MigrationType.CDC_ONLY
-    when = "run when CDC starts" if cdc_only else "run when the load starts"
+    when = ("run when the reload starts" if tables is not None
+            else "run when CDC starts" if cdc_only else "run when the load starts")
     title = (f"Changes to Aurora DSQL ({len(statements)} statement"
              f"{'s' if len(statements) != 1 else ''}, {when})")
     with _expansion(ui, title, view, "changes_open", rerun):
@@ -1268,6 +1328,12 @@ def _build_reload_dialog(ui, ctx: ExclusionDialogContext, *, insert_lines=(), hi
                                 _run_preview_now, _go_to_line)
             _render_legacy_conversion(ui, resolution, convert, _run_preview_now)
             tables = reload_tables(resolution, inputs.migratable, sorted(convert))
+            if tables:
+                # What the reload does to each table, BEFORE the confirm: the warnings
+                # (a NOT NULL dropped one way, a generated column rejecting every row...)
+                # and the ALTERs its recreated tables get. No Start dialog follows.
+                _render_result(ui, resolution, tables)
+                _render_target_changes(ui, ctx, resolution, view, _run_preview_now, tables)
             _render_drop_card(ui, ctx, resolution, tables)
             label = (f"Drop & reload {tables[0]}" if len(tables) == 1
                      else f"Drop & reload {len(tables)} tables" if tables else "Save")
@@ -1358,8 +1424,14 @@ def _build_reload_dialog(ui, ctx: ExclusionDialogContext, *, insert_lines=(), hi
 def _render_legacy_conversion(ui, resolution, convert: set, rerun) -> None:
     """The opt-in conversion of omit-only (pre-0.1.562) entries: a ticked table joins the
     reload, after which its excluded columns are NULL like every other excluded column."""
+    from dsql_migrator.core.exclusion_rules import adopted_items
+
+    adopted = adopted_items(resolution)
     for table in sorted(resolution.retained_legacy):
         columns = ", ".join(sorted(resolution.retained_legacy[table]))
+        origin = ("omit-only columns" if any((table, c) in adopted
+                                             for c in resolution.retained_legacy[table])
+                  else "columns excluded before v0.1.562")
 
         def _toggle(event, t=table) -> None:
             if getattr(event, "value", False):
@@ -1369,7 +1441,7 @@ def _render_legacy_conversion(ui, resolution, convert: set, rerun) -> None:
             rerun()
 
         ui.checkbox(
-            f"Reload {table} so its columns excluded before v0.1.562 ({columns}) are NULL "
+            f"Reload {table} so its {origin} ({columns}) are NULL "
             "(now they hold the target DEFAULT)",
             value=table in convert, on_change=_toggle,
         )
@@ -1392,7 +1464,7 @@ def _render_drop_card(ui, ctx: ExclusionDialogContext, resolution, tables) -> No
             if removed:
                 parts.append("- " + ", ".join(removed))
             if table in resolution.retained_legacy and not parts:
-                parts.append("excluded before v0.1.562 -> NULL")
+                parts.append("omit-only -> NULL")
             rows = _row_estimate(ctx, table)
             estimate = f"   {rows:,} rows re-read" if rows is not None else ""
             ui.label(f"{table}   {'; '.join(parts)}{estimate}").classes("text-xs font-mono")

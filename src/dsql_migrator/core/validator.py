@@ -2525,6 +2525,7 @@ def _render_proof_lines(report: ValidationReport) -> list[str]:
     values: list[str] = []
     undetermined: list[str] = []
     legacy: list[str] = []
+    legacy_null: list[str] = []
     absent: list[str] = []
     for item in report.items:
         if item.proof_state == "complete":
@@ -2537,12 +2538,18 @@ def _render_proof_lines(report: ValidationReport) -> list[str]:
                 )
             elif item.excluded_nonnull_counts:
                 proven.append(f"{item.table} ({', '.join(sorted(item.excluded_nonnull_counts))})")
-            if item.legacy_nonnull_counts:
+            # Omit-only: a non-NULL count means the rows took the target DEFAULT; a 0
+            # count means the column is NULL in every row (nothing to convert).
+            kept = {c: n for c, n in item.legacy_nonnull_counts.items() if n}
+            if kept:
                 legacy.append(
                     f"{item.table} (" + ", ".join(
-                        f"{c}: {n} non-NULL" for c, n in sorted(item.legacy_nonnull_counts.items())
+                        f"{c}: {n} non-NULL" for c, n in sorted(kept.items())
                     ) + ")"
                 )
+            null_legacy = sorted(c for c, n in item.legacy_nonnull_counts.items() if not n)
+            if null_legacy:
+                legacy_null.append(f"{item.table} ({', '.join(null_legacy)})")
         elif item.proof_state == "not_determined":
             undetermined.append(f"{item.table} ({proof_reason_text(item.proof_reason)})")
         if item.proof_absent_columns:
@@ -2559,6 +2566,8 @@ def _render_proof_lines(report: ValidationReport) -> list[str]:
             "  - Excluded omit-only (rows hold the target DEFAULT, not NULL): "
             f"{'; '.join(legacy)}"
         )
+    if legacy_null:
+        lines.append(f"  - Excluded omit-only, NULL in every row: {'; '.join(legacy_null)}")
     if absent:
         lines.append(
             f"  - Not on the Aurora DSQL table (nothing written): {'; '.join(absent)}"

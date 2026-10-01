@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from dsql_migrator.core.exclusion_rules import resolve_exclusion_rules
 from dsql_migrator.core.models import ColumnDef, SourceType, TableDef, TableSelection
 from dsql_migrator.ui.data_migration import DataMigrationState, DataMigrationStore
@@ -128,6 +130,25 @@ def test_a_save_refuses_when_the_state_changed_since_open():
     assert state.lob_exclusions() == {"shop.t2": {"b"}}
     assert state.set_column_exclusions(res, text="x", lock_check=lambda: "Locked: CDC streams.") == (
         "Locked: CDC streams.")
+
+
+@pytest.mark.parametrize("other_tab_saves", [
+    "exclude shop.t2.b",                   # the stored set changes
+    "exclude shop.t1.a  # same set, new text",  # only the rules text changes
+])
+def test_another_tabs_save_refuses_this_tabs_stale_save(other_tab_saves):
+    # Final check (hardening): two tabs share one state; each change the other tab saves
+    # -- the set or only the text -- must refuse this tab's Save, never overwrite it.
+    state = DataMigrationState()
+    assert _save(state, "exclude shop.t1.a") is None
+    token_a = state.exclusion_edit_token()
+    res_a = _resolve(state, "exclude shop.t1.b")
+    assert _save(state, other_tab_saves) is None  # tab B
+    stored = state.lob_exclusions()
+    text = state.exclusion_rules_text()
+    refused = state.set_column_exclusions(res_a, text="exclude shop.t1.b", token=token_a)
+    assert refused and "open it again" in refused
+    assert state.lob_exclusions() == stored and state.exclusion_rules_text() == text
 
 
 def test_adoption_writes_its_own_rule_lines():

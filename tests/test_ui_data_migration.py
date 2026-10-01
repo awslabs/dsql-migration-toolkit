@@ -5972,8 +5972,9 @@ def test_prerequisite_checks_pin_the_confirmed_table_selection() -> None:
     leaving ``selection`` empty. Anything reading the selection then resolved to "no
     tables", which is what made a CDC deploy fired right after the checks (before any
     watermark exists) produce an empty TableIncludeList and a uniform partition plan.
-    Guard the contract structurally: run_checks calls set_selection with the resolved
-    names.
+    Guard the contract structurally: run_checks pins the resolved names -- through
+    pin_checked_selection, which pins only if the selection did not change during the run
+    (a table-rule Save or a tree tick meanwhile is never undone).
     """
     import ast
     import pathlib
@@ -5992,9 +5993,11 @@ def test_prerequisite_checks_pin_the_confirmed_table_selection() -> None:
         for node in ast.walk(checks[0])
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "set_selection"
+        and node.func.attr == "pin_checked_selection"
     ]
-    assert setters, "run_checks must pin the checked table set via set_selection"
+    assert setters, "run_checks must pin the checked table set via pin_checked_selection"
+    assert not [n for n in ast.walk(checks[0]) if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute) and n.func.attr == "set_selection"]
 
 
 def test_cdc_tables_for_config_uses_the_pinned_selection_without_a_watermark() -> None:
@@ -16861,28 +16864,8 @@ def test_identity_sequence_sync_is_wired_into_both_load_paths() -> None:
 
 
 # ---------------------------------------------------------------------------
-# LOB exclusion lock + undetermined CDC state (restart recovery)
+# Undetermined CDC state (restart recovery)
 # ---------------------------------------------------------------------------
-
-
-class _LockJobManager:
-    """Job manager whose single job has a fixed status, or is missing."""
-
-    def __init__(self, status=None) -> None:
-        self._status = status
-
-    def get_status(self, job_id):
-        if self._status is None:
-            from dsql_migrator.core.job_manager import JobNotFoundError
-
-            raise JobNotFoundError(job_id)
-
-        class _J:
-            pass
-
-        j = _J()
-        j.status = self._status
-        return j
 
 
 def test_cdc_state_undetermined_distinguishes_unprobed_from_absent() -> None:

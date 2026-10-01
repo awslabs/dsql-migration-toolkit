@@ -694,6 +694,8 @@ class ValidationSummary:
     excluded_values_warned: dict[str, dict[str, int]] = field(default_factory=dict)
     proof_not_determined: dict[str, str] = field(default_factory=dict)
     legacy_values: dict[str, dict[str, int]] = field(default_factory=dict)
+    # Legacy (omit-only) columns whose count is 0: NULL in every row, nothing to convert.
+    legacy_null: dict[str, tuple[str, ...]] = field(default_factory=dict)
     proof_absent: dict[str, tuple[str, ...]] = field(default_factory=dict)
     # Tables that failed ONLY because an excluded column holds values (every other check
     # passed): the reload runbook's "backfill" cannot fix them.
@@ -913,6 +915,7 @@ def _proof_summary(report: ValidationReport) -> dict:
     warned: dict[str, dict[str, int]] = {}
     undetermined: dict[str, str] = {}
     legacy: dict[str, dict[str, int]] = {}
+    legacy_null: dict[str, tuple[str, ...]] = {}
     absent: dict[str, tuple[str, ...]] = {}
     only: list[str] = []
     for item in report.items:
@@ -937,14 +940,19 @@ def _proof_summary(report: ValidationReport) -> dict:
             warned[item.table] = values
         elif item.excluded_nonnull_counts:
             null_proven[item.table] = tuple(sorted(item.excluded_nonnull_counts))
-        if item.legacy_nonnull_counts:
-            legacy[item.table] = dict(item.legacy_nonnull_counts)
+        kept = {c: n for c, n in item.legacy_nonnull_counts.items() if n}
+        if kept:
+            legacy[item.table] = kept
+        null_legacy = tuple(sorted(c for c, n in item.legacy_nonnull_counts.items() if not n))
+        if null_legacy:
+            legacy_null[item.table] = null_legacy
     return {
         "null_proven": null_proven,
         "excluded_values": blocking,
         "excluded_values_warned": warned,
         "proof_not_determined": undetermined,
         "legacy_values": legacy,
+        "legacy_null": legacy_null,
         "proof_absent": absent,
         "excluded_values_only_tables": tuple(only),
     }
@@ -978,18 +986,14 @@ def legacy_values_remedy(migration_state, job_manager) -> str:
             if cdc_only
             else "use Change & reload in Exclude tables & columns and tick the table"
         )
-    elif lock.locked:
+    else:
+        # Locked or not: only Start over clears the omit-only mark (a plain Full Load
+        # would omit the column again, so its rows would take the DEFAULT again).
         then = (
             ("Start over, choose Full load + CDC (CDC only never rewrites rows already on "
              "Aurora DSQL), exclude it again" if cdc_only
              else "Start over, exclude it again")
             + ", and choose to drop and recreate the table in the Start Full Load dialog"
-        )
-    else:
-        then = (
-            ("switch the migration type to Full load + CDC, then " if cdc_only else "")
-            + "run the Full Load and choose to drop and recreate the table in its Start "
-            "dialog"
         )
     delete = (
         "switch the migration type to Full load + CDC and delete the CDC infrastructure on "
@@ -3405,6 +3409,8 @@ def build_validation_screen(
                     ),
                     legacy_context=(
                         _legacy_context_safe()
+                        # Any omit-only entry: the adopted set labels a 0-count line
+                        # too; the remedy is appended only to a non-zero one.
                         if any(item.legacy_nonnull_counts for item in result.items)
                         else ("", frozenset())
                     ),
@@ -6992,6 +6998,12 @@ def null_proof_lines(
                 f"{table}.{column}: {origin}; its rows hold the target DEFAULT ({n:,} "
                 f"non-NULL).{' ' + legacy_remedy if legacy_remedy else ''}"
             )
+    for table, cols in summary.legacy_null.items():
+        for column in cols:
+            origin = ("omit-only (adopted from the attached CDC stack)"
+                      if (table, column) in adopted else "excluded before v0.1.562 (omit-only)")
+            lines.append(f"{table}.{column}: {origin}; NULL in every row (0 non-NULL), "
+                         "nothing to convert.")
     for table, reason in summary.proof_not_determined.items():
         lines.append(
             f"{table}: whether the excluded columns are NULL was not determined "
@@ -7695,8 +7707,10 @@ def _excluded_cell(item: TableValidationResult) -> object:
             )
         if item.excluded_nonnull_counts:
             return _cell("NULL", "ok")
-        if item.legacy_nonnull_counts:
+        if any(item.legacy_nonnull_counts.values()):
             return _cell("DEFAULT (legacy)", "neutral")
+        if item.legacy_nonnull_counts:
+            return _cell("NULL", "ok")
     return None
 
 

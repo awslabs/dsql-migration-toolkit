@@ -18,11 +18,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from typing import Optional
 
 from dsql_migrator.core.activity_log import ActivityStatus
-from dsql_migrator.core.models import LoadStatusView, SourceInventory, SourceType
+from dsql_migrator.core.models import LoadStatusView, SourceType
 from dsql_migrator.ui.data_migration._cdc_state import (
     _CDC_POLL_INTERVAL_SECONDS,
     _cdc_is_streaming,
@@ -33,22 +33,15 @@ from dsql_migrator.ui.data_migration._cdc_state import (
     cdc_streaming_started,
 )
 from dsql_migrator.ui.data_migration._models import (
-    _DSQL_VALUE_LIMIT_MIB,
     assess_dlq_health,
     build_lag_chart_option,
     build_migration_table_status,
     cdc_handling_facts,
     connector_health_rows,
     format_column_exclude_list,
-    lob_exclusion_candidates,
     per_table_counts_notice_body,
-    scope_lob_candidates,
-    exclusion_context_for,
-    exclusion_scope,
     session_source_type,
-    stored_exclusion_issues,
 )
-from dsql_migrator.core.column_exclusion import column_exclusion_verdict
 from dsql_migrator.ui.data_migration._cdc_status import (
     _CDC_TONE_STYLE,
     _apply_cdc_status,
@@ -1564,12 +1557,15 @@ _CDC_DRIFT_SEED = (
 )
 
 
-def _cdc_dlq_facts(migration_state, log_key: str) -> str:
+def _cdc_dlq_facts(migration_state, log_key: str, job_manager=None) -> str:
     """Assemble a credential-free, row-free DLQ facts block for the AI DBA chat.
 
     Reuses the CDC-assist error summarizer over the CDC-sourced dead-letter records
     (depth + top tables + top SQLSTATEs + a capped sample), so the chat is grounded on
-    the real poison records without any row values leaving the tool (Property 7)."""
+    the real poison records without any row values leaving the tool (Property 7). It also
+    states the migration type, whether a Full Load ran, and the exclusion lock's own steps
+    -- the runbook in the grounding depends on them (no Full Load: nothing to Change &
+    reload, no watermark to re-seed from)."""
     from collections import Counter
 
     from dsql_migrator.core.cdc_assist import _summarize_errors
@@ -1598,9 +1594,34 @@ def _cdc_dlq_facts(migration_state, log_key: str) -> str:
         lines.append(
             "Sink stalled: yes (a zero DLQ depth would be EXPECTED during a stall)."
         )
+    lines.extend(_exclusion_state_facts(migration_state, job_manager))
     lines.append("Sample dead-lettered events:")
     lines.append(_summarize_errors(records))
     return "\n".join(lines)
+
+
+def _exclusion_state_facts(migration_state, job_manager) -> "list[str]":
+    """The migration type, whether a Full Load ran, and -- when the exclusions are locked
+    -- the lock's own steps, for the AI facts. Best effort: a failed lookup drops only
+    these lines, never the chat."""
+    from dsql_migrator.ui.data_migration._models import _MIGRATION_TYPE_META
+
+    out: "list[str]" = []
+    try:
+        mtype = getattr(migration_state, "migration_type", None)
+        meta = _MIGRATION_TYPE_META.get(mtype)
+        if meta is not None:
+            out.append(f"Migration type: {meta.label}.")
+        ran = getattr(migration_state, "job_id", None) is not None
+        out.append(f"Full Load run recorded in this session: {'yes' if ran else 'no'}.")
+        if job_manager is not None:
+            lock = exclusion_lock_state(migration_state, job_manager)
+            if lock.locked and lock.reason:
+                out.append("Exclusion lock (authoritative; give the operator THESE steps): "
+                           + lock.reason)
+    except Exception:  # noqa: BLE001 - advisory facts only
+        return out
+    return out
 
 
 def _cdc_drift_facts(status_view: LoadStatusView) -> str:
@@ -1993,7 +2014,7 @@ def _render_cdc_dlq_panel(
                 _render_cdc_ai_button(
                     ui,
                     lambda k=_dlq_key: cdc_ai_opener(
-                        "dlq", _cdc_dlq_facts(migration_state, k), _CDC_DLQ_SEED
+                        "dlq", _cdc_dlq_facts(migration_state, k, job_manager), _CDC_DLQ_SEED
                     ),
                     "Ask AI DBA to triage these poison records and how to fix them.",
                 )
@@ -2400,14 +2421,6 @@ def cdc_delete_eta(migration_state) -> "tuple[str, str]":
     return (
         cdc_teardown_estimate(has_seeder_lambda=seeder),
         cdc_teardown_reason(has_seeder_lambda=seeder),
-    )
-
-
-def _deleting_text(migration_state, what: str) -> str:
-    estimate, _why = cdc_delete_eta(migration_state)
-    return (
-        f"Locked while the CDC infrastructure is being deleted (a cdc-stack delete takes "
-        f"{estimate}). Wait for the deletion to finish before changing {what}."
     )
 
 

@@ -806,10 +806,12 @@ def _sentinel_watermark() -> "Watermark":
 
 def _render_cdc_exclusion_summary(ui, migration_state, job_manager, inventory) -> None:
     """The CDC step's read-only line: how much is excluded, and the ColumnExcludeList CDC
-    receives -- what Start CDC sends (preview == sent; the chooser already keeps a
-    deployed value it must keep), labelled "as deployed" when the stack carries exactly
-    that, else shown beside the deployed one. Nothing is drawn when nothing is excluded or
-    captured."""
+    receives. While the connectors run, or when Start CDC would refuse the session's set
+    for a stack that streamed (``capture_exclusion_mismatch``), that is the DEPLOYED value
+    -- the session's set is shown beside it, with the refusal. Otherwise it is what Start
+    CDC sends (preview == sent; the chooser already keeps a deployed value it must keep),
+    labelled "as deployed" when the stack carries exactly that. Nothing is drawn when
+    nothing is excluded or captured."""
     from dsql_migrator.core.cdc import CDC_PARAMETER_BYTE_LIMIT
     from dsql_migrator.ui.design import CODE_SURFACE_CLASSES, inline_hint
 
@@ -827,8 +829,14 @@ def _render_cdc_exclusion_summary(ui, migration_state, job_manager, inventory) -
         migration_state, inventory,
         _cdc_watermark(_current_job(job_manager, getattr(migration_state, "job_id", None))),
     )
-    value = cdc_capture_exclusions(migration_state, inventory, captured).sent
-    origin = "as deployed" if deployed is not None and value == deployed else "Start CDC sends"
+    capture = cdc_capture_exclusions(migration_state, inventory, captured)
+    session_value = capture.sent
+    mismatch = capture_exclusion_mismatch(migration_state, inventory, capture, captured)
+    live = getattr(migration_state, "cdc_stack_phase", None) in ("running", "partial")
+    if deployed is not None and (mismatch or live or session_value == deployed):
+        value, origin = deployed, "as deployed"
+    else:
+        value, origin = session_value, "Start CDC sends"
     if not columns and not tables and not value and not deployed:
         return
     parts = []
@@ -850,9 +858,16 @@ def _render_cdc_exclusion_summary(ui, migration_state, job_manager, inventory) -
         with ui.column().classes(f"w-full gap-0 p-2 {CODE_SURFACE_CLASSES}"):  # type: ignore[attr-defined]
             ui.label(value or "(nothing excluded at capture)").classes(  # type: ignore[attr-defined]
                 "text-xs font-mono wrap-anywhere")
-        if deployed is not None and value != deployed:
-            inline_hint(ui, f"As deployed: {deployed or '(nothing excluded at capture)'}. "
-                        "Start CDC sends the value above.")
+        if mismatch:
+            inline_hint(ui, f"This session would exclude {session_value or '(nothing)'}; "
+                        f"Start CDC refuses to send it. {mismatch}", tone="warning")
+        elif deployed is not None and session_value != deployed:
+            if origin == "as deployed":
+                inline_hint(ui, "The next Start CDC sends: "
+                            f"{session_value or '(nothing excluded at capture)'}.")
+            else:
+                inline_hint(ui, f"As deployed: {deployed or '(nothing excluded at capture)'}. "
+                            "Start CDC sends the value above.")
 
 
 def _cdc_tables_for_config(
