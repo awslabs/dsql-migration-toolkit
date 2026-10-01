@@ -99,9 +99,9 @@ def test_cdc_only_without_a_full_load_states_the_engine_cost(engine, offset, exp
     state.set_cdc_has_committed_offset(offset)
     lock = exclusion_lock_state(state, _StubJobManager({}))
     assert lock.tier == 2 and expected in lock.reason
-    step = ("change the column rules (changing the table set needs Start over)" if offset
-            else "change the excluded columns here")
-    assert f"{step}, then deploy it again and Start CDC" in lock.reason
+    # No promoted FULL_LOAD step here (a stopped stack, e.g. found after a Start over): the
+    # table set is free after the Delete, so the step names the excluded columns.
+    assert "change the excluded columns here, then deploy it again and Start CDC" in lock.reason
     assert "keep their values in newly excluded columns" in lock.reason
     if engine is SourceType.MYSQL:
         assert "Start CDC on Automatic" in lock.reason
@@ -379,6 +379,40 @@ def test_cdc_promotion_is_r2_never_r1b():
     state.set_cdc_has_committed_offset(True)
     step = data_migration_step_after_cdc(StepStatus.NOT_STARTED, cdc_streaming=cdc_pipeline_live(state))
     assert step is StepStatus.DONE and state.job_id is None
+    from dsql_migrator.core.models import WorkflowState
+    from dsql_migrator.ui.workflow import WorkflowStep, with_status
+
+    # as each render applies it: the promoted step is stored on the workflow
+    state._session.workflow = with_status(WorkflowState(), WorkflowStep.FULL_LOAD, step)
     lock = exclusion_lock_state(state, _StubJobManager({}))
     assert lock.cell == "R2" and "Start over" not in lock.reason.split("(changing")[0]
     assert "change the column rules (changing the table set needs Start over)" in lock.reason
+
+
+
+def test_a_stopped_stack_after_start_over_does_not_claim_the_table_set_is_locked():
+    state = _state(MigrationType.CDC_ONLY)
+    state.set_cdc_stack_phase("infra", status="UPDATE_COMPLETE")
+    state.set_cdc_has_committed_offset(True)  # it streamed before the Start over
+    lock = exclusion_lock_state(state, _StubJobManager({}))
+    assert "change the excluded columns here" in lock.reason
+    assert "changing the table set needs Start over" not in lock.reason
+
+
+def test_a_create_in_flight_after_a_recorded_load_names_change_and_reload():
+    state = _state(job_id="job-1")
+    state.set_cdc_deploy_job_id("inf", kind="infra")
+    jm = _StubJobManager({"inf": _StubJob("RUNNING"), "job-1": _StubJob("DONE")})
+    lock = exclusion_lock_state(state, jm)
+    assert lock.tier == 1 and "use Change & reload for the affected tables" in lock.reason
+    assert "Start over" not in lock.reason
+    pruned = exclusion_lock_state(state, _StubJobManager({"inf": _StubJob("RUNNING")}))
+    assert "Start over" in pruned.reason and "Change & reload" not in pruned.reason
+
+
+def test_the_r1_postgresql_line_names_the_resnapshot_choice():
+    state = _state(engine=SourceType.POSTGRES, job_id="job-1")
+    state.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
+    lock = exclusion_lock_state(state, _StubJobManager({"job-1": _StubJob("DONE")}))
+    assert 'choose "Re-snapshot every table instead"' in lock.reason
+    assert "the next Start CDC snapshots" not in lock.reason

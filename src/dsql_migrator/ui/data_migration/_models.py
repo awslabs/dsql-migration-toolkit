@@ -2489,7 +2489,7 @@ def exclusion_row_summary(
     """The row's variant and copy. "N tables" counts only the RULE-excluded tables (the
     tree counter stays the one selection number); ``lob_candidates`` are already scoped
     and minus the open exclusions; the LOB line turns warning only when a measured
-    over-limit value (``measured_over``, "table.column") is still not excluded."""
+    over-limit value (``measured_over``, (table, column) pairs) is still not excluded."""
     stored = migration_state.lob_exclusions()
     columns = sum(len(c) for c in stored.values())
     provenance = migration_state.rule_excluded_tables()
@@ -2506,7 +2506,7 @@ def exclusion_row_summary(
             "exceed Aurora DSQL's value limit (type-based). Review them in Exclude tables & "
             "columns."
         )
-        open_names = {f"{c.table}.{col}" for c in lob_candidates for col in c.columns}
+        open_names = {(c.table, col) for c in lob_candidates for col in c.columns}
         if open_names & set(measured_over):
             lob_tone = "warning"
     if block_reason:

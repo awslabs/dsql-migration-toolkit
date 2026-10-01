@@ -610,6 +610,7 @@ def check_source_value_size(
     table: TableDef,
     columns: "Sequence[str]",
     oversized: "Optional[Mapping[str, bool]]",
+    limit_types: "Optional[Mapping[str, str]]" = None,
 ) -> "Optional[PrerequisiteResult]":
     """Grade whether a LOB column already holds a value DSQL cannot store. Pure.
 
@@ -639,10 +640,13 @@ def check_source_value_size(
     if not columns:
         return None
     by_name = {column.name: column for column in table.columns}
+    targets = dict(limit_types or {})
 
     def limit_of(name: str) -> int:
+        # The TARGET type's ceiling when the applied DDL is known (an edit can remap a
+        # type), else the source type's -- the same limit the exclusion popup shows.
         column = by_name.get(name)
-        return dsql_value_limit_bytes(column.mysql_type if column else "")
+        return dsql_value_limit_bytes(targets.get(name) or (column.mysql_type if column else ""))
 
     def describe(names: "Sequence[str]") -> str:
         """`col` (limit) for each, grouping is unnecessary and per-column is clearer."""
@@ -1012,6 +1016,7 @@ class PrerequisiteChecker:
         table_name: str,
         columns: "Sequence[str]",
         column_types: "Optional[Mapping[str, str]]" = None,
+        limit_types: "Optional[Mapping[str, str]]" = None,
     ) -> "Optional[dict[str, bool]]":
         """Ask the source whether any value exceeds the limit, or ``None`` if it cannot.
 
@@ -1038,8 +1043,12 @@ class PrerequisiteChecker:
             except (TypeError, ValueError):  # pragma: no cover - exotic callable
                 accepted = set()
             if "limits" in accepted:
+                # The target type's ceiling where the applied DDL names one (the popup's
+                # Check sizes uses the same), else the source type's.
+                targets = dict(limit_types or {})
                 kwargs["limits"] = {
-                    name: dsql_value_limit_bytes(types.get(name, "")) for name in columns
+                    name: dsql_value_limit_bytes(targets.get(name) or types.get(name, ""))
+                    for name in columns
                 }
             if "column_types" in accepted:
                 kwargs["column_types"] = types
@@ -1058,6 +1067,7 @@ class PrerequisiteChecker:
         excluded_columns: Optional[Mapping[str, Iterable[str]]] = None,
         lob_columns: Optional[Mapping[str, Sequence[str]]] = None,
         overlay_columns: Optional[Mapping[str, Iterable[str]]] = None,
+        lob_limit_types: Optional[Mapping[str, Mapping[str, str]]] = None,
     ) -> PrerequisiteReport:
         """Run all checks for ``request.mode`` over the resolved ``tables``.
 
@@ -1137,6 +1147,7 @@ class PrerequisiteChecker:
                 if name not in already_excluded
             )
             if lob_columns:
+                _limit_types = (lob_limit_types or {}).get(table.name) or {}
                 results.append(
                     check_source_value_size(
                         table,
@@ -1145,7 +1156,9 @@ class PrerequisiteChecker:
                             table.name,
                             lob_columns,
                             {c.name: (c.mysql_type or "") for c in table.columns},
+                            limit_types=_limit_types,
                         ),
+                        limit_types=_limit_types,
                     )
                 )
 

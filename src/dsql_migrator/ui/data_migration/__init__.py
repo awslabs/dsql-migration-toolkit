@@ -519,13 +519,23 @@ def build_data_migration_screen(
     )
     _exclusion_row: dict = {}
 
-    def _on_tree_selection_change(chosen) -> None:
-        # A rule-excluded table ticked again is a deliberate override (named by the
-        # popup); the row's summary follows the tree without a page refresh.
-        migration_state.note_tree_retick(chosen)
+    def _refresh_exclusion_row() -> None:
         row = _exclusion_row.get("row")
         if row is not None:
             row.refresh()
+
+    def _on_tree_selection_change(chosen) -> None:
+        # A rule-excluded table ticked again is a deliberate override (named by the
+        # popup); the row's summary follows the tree without a page refresh -- coalesced,
+        # so a burst of ticks costs one re-resolve.
+        migration_state.note_tree_retick(chosen)
+        timer = _exclusion_row.get("timer")
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:  # noqa: BLE001 - an already-fired one-shot
+                pass
+        _exclusion_row["timer"] = ui.timer(0.3, _refresh_exclusion_row, once=True)
 
     def _assessment():
         """The Step 1 (Evaluation) compatibility report, or None if it hasn't run."""
@@ -1037,6 +1047,17 @@ def build_data_migration_screen(
                 # Every type: the Full Load pre-pass, and Start CDC for CDC only, make an
                 # overlay column nullable with no DEFAULT before the first write.
                 _prereq_overlay = overlay_lob_exclusions(migration_state, inventory)
+                # Each candidate's TARGET type from the applied DDL, so the size check's
+                # limit is the one the exclusion popup shows (an edit can remap a type).
+                from dsql_migrator.core.converter import parse_target_column_types
+
+                _applied_now = migration_state.applied_conversions()[0]
+                _prereq_limit_types = {
+                    name: parse_target_column_types(
+                        getattr(_applied_now.get(name), "target_ddl", None) or "")
+                    for name in _prereq_lob_columns
+                    if getattr(_applied_now.get(name), "target_ddl", None)
+                }
                 report = await run.io_bound(
                     lambda: checker.check(
                         request,
@@ -1044,6 +1065,7 @@ def build_data_migration_screen(
                         excluded_columns=_prereq_exclusions,
                         lob_columns=_prereq_lob_columns,
                         overlay_columns=_prereq_overlay,
+                        lob_limit_types=_prereq_limit_types,
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - surface as inline feedback
@@ -1417,6 +1439,7 @@ def build_data_migration_screen(
                 # Exclude tables & columns: the one home for every migration type, right
                 # under the tree it edits (a local refreshable the tree ticks refresh).
                 _exclusion_row["row"] = render_exclusion_button_row(ui, _exclusion_ctx)
+                _exclusion_ctx.extra["row_refresh"] = _refresh_exclusion_row
 
             # Migration-wide oversized-LOB exclusion, offered for any type that
             # includes a Full Load -- right after the picker, BEFORE the checks, so

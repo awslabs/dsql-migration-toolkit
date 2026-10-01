@@ -3068,7 +3068,7 @@ def test_the_report_fills_the_value_size_cache() -> None:
         required=False, target="shop.docs", measured={"a": True, "b": False})])
     state.set_prereq_report(MigrationMode.FULL_LOAD, report)
     sizes = state.value_sizes()
-    assert sizes["shop.docs.a"][0] == "over" and sizes["shop.docs.b"][0] == "ok"
+    assert sizes[("shop.docs", "a")][0] == "over" and sizes[("shop.docs", "b")][0] == "ok"
 
 
 
@@ -3088,3 +3088,40 @@ def test_an_excluded_uncarryable_column_is_not_reported_and_the_remedy_names_the
     only = check_columns_replicable(_table("app.orders"), facts, excluded={"num_arr"})
     assert only is not None and "num_arr" not in only.detail and "bin_arr" in only.detail
     assert "Exclude tables & columns" in only.remediation
+
+
+def test_the_size_check_uses_the_target_types_limit_like_the_popup() -> None:
+    from dsql_migrator.core.models import (
+        ColumnDef,
+        MigrationMode,
+        PrerequisiteCheckRequest,
+        TableDef,
+    )
+    from dsql_migrator.core.prerequisites import PrerequisiteChecker
+
+    table = TableDef(name="public.t", primary_key=["id"], columns=[
+        ColumnDef(name="id", mysql_type="bigint"),
+        ColumnDef(name="notes", mysql_type="character varying")])
+    asked: list = []
+
+    class _Probe(_FakeSource):
+        def oversized_values(self, table_name, columns, *, limit_bytes, timeout_seconds,
+                             limits=None, column_types=None):
+            asked.append(dict(limits or {}))
+            return {name: False for name in columns}
+
+    checker = PrerequisiteChecker(source_probe=_Probe(), target_probe=_FakeTarget())
+    request = PrerequisiteCheckRequest(mode=MigrationMode.FULL_LOAD, tables=[table.name])
+    checker.check(request, tables=[table], lob_columns={table.name: ("notes",)})
+    checker.check(request, tables=[table], lob_columns={table.name: ("notes",)},
+                  lob_limit_types={table.name: {"notes": "text"}})
+    assert asked == [{"notes": 65535}, {"notes": 1048576}]  # the edited DDL made it text
+
+
+def test_the_ddl_caches_cover_a_very_large_schema() -> None:
+    from dsql_migrator.core import column_exclusion, converter
+
+    assert converter.DDL_CACHE_SIZE >= 32768
+    for fn in (converter.parse_target_column_names, column_exclusion._ddl_key_facts,
+               column_exclusion._unique_members, column_exclusion._view_table_refs):
+        assert fn.cache_info().maxsize >= 32768, fn

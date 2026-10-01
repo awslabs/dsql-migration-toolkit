@@ -2550,18 +2550,37 @@ def exclusion_lock_state(migration_state, job_manager) -> ExclusionLockState:
             tone="info",
         )
     if cdc_infra_deploy_in_flight(migration_state, job_manager):
+        from dsql_migrator.ui.data_migration._models import MigrationType as _Type
+
+        _type = getattr(migration_state, "migration_type", None)
+        _found = committed and _current_job(
+            job_manager, getattr(migration_state, "job_id", None)) is not None
+        if _found:
+            # The same remedy R1 gives once the create finishes: Change & reload, not
+            # Start over (the load's record exists).
+            then = (
+                "switch the migration type to Full load + CDC and use Change & reload there"
+                if _type is _Type.CDC_ONLY
+                else "use Change & reload for the affected tables"
+            )
+            where = (
+                "switch the migration type to Full load + CDC and delete it on its CDC step"
+                if _type is _Type.FULL_LOAD_ONLY
+                else "delete the CDC infrastructure on the CDC step"
+            )
+            tail = (f"A Full Load also loaded data with them: to change them, wait for the "
+                    f"create to finish, {where}, then {then}.")
+        elif committed:
+            tail = ("A Full Load also loaded data with them, and the record of that run is "
+                    "no longer available: to migrate a different column set, wait for the "
+                    "create to finish, delete the CDC infrastructure on the CDC step, then "
+                    "use Start over.")
+        else:
+            tail = "Wait for it to finish, then delete it on the CDC step to change them."
         return ExclusionLockState(
             1,
             "Locked while the CDC infrastructure is being created — the excluded columns "
-            "were submitted with it. "
-            + (
-                "A Full Load also loaded data with them, so they are fixed for this "
-                "migration: to migrate a different column set, wait for the create to "
-                "finish, delete the CDC infrastructure on the CDC step, then use Start "
-                "over."
-                if committed
-                else "Wait for it to finish, then delete it on the CDC step to change them."
-            ),
+            f"were submitted with it. {tail}",
         )
     from dsql_migrator.ui.data_migration._models import MigrationType
 
@@ -2579,7 +2598,9 @@ def exclusion_lock_state(migration_state, job_manager) -> ExclusionLockState:
     # only while that job record exists (a pruned record leaves Start over alone).
     if engine is SourceType.POSTGRES:
         reseed = (" PostgreSQL: deleting the stack drops the replication slot and the "
-                  "publication; the next Start CDC snapshots the captured tables again.")
+                  "publication, so Start CDC cannot resume from the load's slot: choose "
+                  "\"Re-snapshot every table instead\" in its dialog (it reads every "
+                  "captured table again).")
     elif engine is SourceType.MYSQL:
         reseed = (" MySQL: Start CDC on Automatic re-seeds from the Full Load watermark (it "
                   "needs the binlog kept since that load; Start CDC warns if it was purged).")
@@ -2659,11 +2680,18 @@ def exclusion_lock_state(migration_state, job_manager) -> ExclusionLockState:
                     " Start CDC on Automatic then begins at the source's current position, "
                     "as the first Start would have."
                 )
-            # CDC promoted the FULL_LOAD step once it streamed, which keeps the table set
-            # locked after the Delete: only the column rules can change then.
+            # CDC promotes the FULL_LOAD step to DONE while its pipeline is live, and that
+            # keeps the table set locked after the Delete: only the column rules can
+            # change then. A stopped stack found after a Start over did not promote it.
+            from dsql_migrator.core.models import StepStatus
+            from dsql_migrator.ui.workflow import WorkflowStep, get_status
+
+            workflow = getattr(session, "workflow", None)
+            table_set_locked = workflow is not None and get_status(
+                workflow, WorkflowStep.FULL_LOAD) is StepStatus.DONE
             change = (
                 "change the column rules (changing the table set needs Start over)"
-                if has_streamed
+                if table_set_locked
                 else "change the excluded columns here"
             )
             return ExclusionLockState(

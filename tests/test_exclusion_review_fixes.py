@@ -150,6 +150,11 @@ def test_a_cdc_only_session_that_streamed_can_change_its_columns_after_the_delet
 
     state = _state(MigrationType.CDC_ONLY)
     state.set_cdc_stack_phase("running", status="UPDATE_COMPLETE")
+    from dsql_migrator.core.models import StepStatus, WorkflowState
+    from dsql_migrator.ui.workflow import WorkflowStep, with_status
+
+    # the render promotes the FULL_LOAD step while CDC is live
+    state._session.workflow = with_status(WorkflowState(), WorkflowStep.FULL_LOAD, StepStatus.DONE)
     assert exclusion_card_locked(state, _StubJobManager({}))
     # It streamed, so CDC promoted the FULL_LOAD step: the table set stays locked after the
     # Delete, and only the column rules can change (P3-C17 wording).

@@ -1100,7 +1100,7 @@ def build_overlay_statements(
     return out
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=32768)  # = converter.DDL_CACHE_SIZE
 def _generated_columns_folded(create_ddl: str) -> frozenset:
     """The applied DDL's GENERATED columns, cached by text: the popup previews every
     matched table on each render, and the converter's reader is uncached."""

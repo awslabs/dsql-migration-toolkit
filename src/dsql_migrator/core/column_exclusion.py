@@ -135,7 +135,7 @@ class ExclusionContext:
     _views_memo: dict = field(default_factory=dict, compare=False, repr=False)
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=32768)  # = converter.DDL_CACHE_SIZE
 def _ddl_key_facts(ddl: str) -> "tuple[tuple[str, ...], frozenset[str]]":
     """(target primary key, B4 columns) of an applied CREATE TABLE, cached by text.
 
@@ -380,7 +380,7 @@ def build_exclusion_context(
     )
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=32768)  # = converter.DDL_CACHE_SIZE
 def _ddl_generated_expressions(ddl: str) -> "tuple[tuple[str, str], ...]":
     """``((column, expression), ...)`` of the GENERATED columns of an applied CREATE TABLE,
     names as PostgreSQL stores them; the expression as sqlglot renders it. Cached by text;
@@ -408,7 +408,7 @@ def _ddl_generated_expressions(ddl: str) -> "tuple[tuple[str, str], ...]":
     return tuple(out)
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=32768)  # = converter.DDL_CACHE_SIZE
 def _view_table_refs(ddl: str) -> "Optional[frozenset[str]]":
     """The tables an applied CREATE VIEW reads (FROM/JOIN/subqueries), each as
     ``schema.table`` the way PostgreSQL resolves the names (quoted as written, unquoted
@@ -443,7 +443,7 @@ def _view_table_refs(ddl: str) -> "Optional[frozenset[str]]":
     return frozenset(refs)
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=32768)  # = converter.DDL_CACHE_SIZE
 def _unique_members(ddl: str, index_ddls: "tuple[str, ...]") -> frozenset[str]:
     """Columns in a UNIQUE constraint or index of an applied table: inline ``UNIQUE``,
     a table-level ``UNIQUE (...)``, and each readable ``CREATE UNIQUE INDEX``. Read

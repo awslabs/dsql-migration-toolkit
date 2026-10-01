@@ -876,6 +876,9 @@ def map_data_type(data_type: exp.DataType) -> Optional[_Mapping]:
 def parse_target_column_types(create_ddl: str) -> dict[str, str]:
     """Return ``{column_name: normalized_target_type}`` from a CREATE TABLE DDL.
 
+    Cached by DDL text (the exclusion popup reads it for every candidate table on each
+    render); the returned dict is a fresh copy each call.
+
     Parses an applied/edited DSQL (PostgreSQL) ``CREATE TABLE`` and extracts each
     column's target type, normalized to its base name (lower-cased, parameters
     stripped -- e.g. ``numeric(20, 0)`` -> ``numeric``). This lets the Full Load
@@ -885,6 +888,16 @@ def parse_target_column_types(create_ddl: str) -> dict[str, str]:
     not a parseable ``CREATE TABLE`` (the caller then falls back to the
     source-derived mapping).
     """
+    return dict(_column_types(create_ddl or ""))
+
+
+# The applied-DDL readers are cached by DDL text. The size covers a very large schema
+# (one entry per table DDL): past it, every render would re-parse every table.
+DDL_CACHE_SIZE = 32768
+
+
+@lru_cache(maxsize=DDL_CACHE_SIZE)
+def _column_types(create_ddl: str) -> "tuple[tuple[str, str], ...]":
     # Strip the identity clause FIRST -- see _IDENTITY_CLAUSE_RE. sqlglot's postgres
     # reader raises on the CACHE option, so before this EVERY table with an identity
     # column returned {} and the Full Load value conversion silently fell back to the
@@ -897,9 +910,9 @@ def parse_target_column_types(create_ddl: str) -> dict[str, str]:
             _strip_identity_clauses(create_ddl), read="postgres"
         )
     except Exception:  # noqa: BLE001 - unparseable DDL -> no overrides (safe default)
-        return {}
+        return ()
     if not isinstance(parsed, exp.Create):
-        return {}
+        return ()
     types: dict[str, str] = {}
     for column_def in parsed.find_all(exp.ColumnDef):
         name = column_def.name
@@ -907,7 +920,7 @@ def parse_target_column_types(create_ddl: str) -> dict[str, str]:
         if not name or kind is None:
             continue
         types[name] = kind.sql(dialect="postgres").split("(", 1)[0].strip().lower()
-    return types
+    return tuple(types.items())
 
 
 # ``GENERATED {ALWAYS|BY DEFAULT} AS IDENTITY [(options)]`` as the converter emits it.
@@ -955,7 +968,7 @@ def _strip_identity_clauses(create_ddl: str) -> str:
     return _sub_outside_quotes(_IDENTITY_CLAUSE_RE, "", create_ddl or "")
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=DDL_CACHE_SIZE)
 def parse_target_column_names(create_ddl: str) -> "Optional[frozenset[str]]":
     """The column names of an applied CREATE TABLE, folded the way PostgreSQL folds them.
 
@@ -1011,7 +1024,7 @@ def parse_target_column_constraints(
     return dict(_column_constraints(create_ddl or ""))
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=DDL_CACHE_SIZE)
 def _column_constraints(create_ddl: str) -> "tuple[tuple[str, tuple[bool, Optional[str]]], ...]":
     try:
         parsed = sqlglot.parse_one(_strip_identity_clauses(create_ddl), read="postgres")
@@ -1132,7 +1145,7 @@ _IDENTITY_OPTIONS_RE = re.compile(
 )
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=DDL_CACHE_SIZE)
 def parse_target_identity_columns(create_ddl: str) -> frozenset[str]:
     """The IDENTITY columns of an applied CREATE TABLE, named as PostgreSQL stores them.
 

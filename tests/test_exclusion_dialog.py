@@ -23,6 +23,7 @@ class _El:
         self.props_seen: list[str] = []
         self.enabled = True
         self.value = None
+        self.id = len(ui.elements) + 1
 
     def __enter__(self):
         return self
@@ -329,11 +330,14 @@ def test_review_all_filters_and_paging_survive_a_rerender():
     assert statuses == {"Unselected", "Excluded", "Kept", "Blocked"}  # id: primary key
     on_change(SimpleNamespace(value="Excluded"))
     assert {r["status"].split(" ")[0] for r in ui.tables[-1]} == {"Excluded"}
-    assert state.exclusion_dialog_ui()["review_filter"] == "Excluded"
     ui.type_text("exclude shop.t.a\nexclude shop.u.note")  # a re-render keeps the filter
     assert {r["status"].split(" ")[0] for r in ui.tables[-1]} == {"Excluded"}
-    ui.click("Cancel")
-    assert state.exclusion_dialog_ui() == {}  # cleared on close
+    # the view is the dialog's own: another tab's popup starts fresh and never resets it
+    other = _Ui()
+    open_exclusion_dialog(other, ctx)
+    other.click("Cancel")
+    ui.type_text("exclude shop.t.a\nexclude shop.u.note\nexclude shop.t.b")
+    assert {r["status"].split(" ")[0] for r in ui.tables[-1]} == {"Excluded"}
 
 
 def test_lob_rows_are_the_open_candidates_and_add_rule_quotes_the_name():
@@ -409,8 +413,16 @@ from dsql_migrator.ui.data_migration import _exclusion_dialog as dlg  # noqa: E4
 
 
 class _Engine:
-    def __init__(self, log):
+    def __init__(self, log, reachable=True):
         self.log = log
+        self.reachable = reachable
+
+    def connect(self):
+        import contextlib
+
+        if not self.reachable:
+            raise OSError("unreachable")
+        return contextlib.nullcontext()
 
     def dispose(self):
         self.log.append("dispose")
@@ -474,7 +486,7 @@ def test_check_sizes_measures_the_page_once_and_disposes_the_engine(monkeypatch)
     assert [e for e in log if isinstance(e, tuple)] == [
         ("probe", "shop.t", ("a", "b")), ("probe", "shop.u", ("note",))]
     sizes = state.value_sizes()
-    assert sizes["shop.t.a"][0] == "over" and sizes["shop.t.b"][0] == "ok"
+    assert sizes[("shop.t", "a")][0] == "over" and sizes[("shop.t", "b")][0] == "ok"
     assert not state.size_check_running()
 
 
@@ -502,8 +514,8 @@ def test_cancel_stops_after_the_current_column_and_the_rest_read_not_determined(
     asyncio.run(dlg._check_sizes(ctx, _rows(("shop.t", "a"), ("shop.t", "b"), ("shop.u", "note")),
                                  lambda: None))
     sizes = state.value_sizes()
-    assert sizes["shop.t.a"][0] == "unknown" and "shop.u.note" not in sizes
-    assert dlg._size_label(sizes["shop.t.a"], None)[0].startswith("Not determined")
+    assert sizes[("shop.t", "a")][0] == "unknown" and ("shop.u", "note") not in sizes
+    assert dlg._size_label(sizes[("shop.t", "a")], None)[0].startswith("Not determined")
 
 
 def test_the_engine_is_disposed_even_when_the_probe_fails(monkeypatch):
@@ -769,8 +781,10 @@ def test_outcome_b_filters_the_lob_section_and_c_shows_the_type_a_rule_hint():
     ui = _Ui()
     open_exclusion_route(ui, ctx, "shop.t", "... not supported for jsonb", lob_candidates_for=_CANDS)
     assert any(t.startswith("The database reported a type, not a column") for t in ui.texts)
-    view = state.exclusion_dialog_ui()
-    assert view.get("lob_open") and view.get("lob_table") == "shop.t"
+    lob = next(el for t, (_h, el) in ui.expansions.items() if t.startswith("Oversized-LOB"))
+    assert lob.value is True  # opened, filtered to the table
+    assert any(t.startswith("shop.t.") for t in ui.texts) and not any(
+        t.startswith("shop.u.") for t in ui.texts)
     # C: the saved rules already exclude every flagged column
     ctx2, state2, _j, _s = _reload_ctx()
     ui2 = _Ui()
@@ -846,7 +860,212 @@ def test_the_dlq_route_persists_a_pending_line_once_and_applies_it_at_the_next_e
 def test_a_record_naming_no_column_records_nothing_and_filters_the_lob_section():
     state = DataMigrationState()
     ctx, _calls = _ctx(state)
-    open_dlq_route(_Ui(), ctx, "shop.t", [])
+    ui = _Ui()
+    open_dlq_route(ui, ctx, "shop.t", [])
     assert state.pending_rules() == []
-    view = state.exclusion_dialog_ui()
-    assert view.get("lob_table") == "shop.t" and view.get("lob_open")
+    lob = next(el for t, (_h, el) in ui.expansions.items() if t.startswith("Oversized-LOB"))
+    assert lob.value is True
+    assert any(t.startswith("shop.t.") for t in ui.texts) and not any(
+        t.startswith("shop.u.") for t in ui.texts)
+
+
+# --- review #3 fixes (C12-C18) ---------------------------------------------------------
+
+
+def _change_without_preview(ui, value):
+    editor = ui.editors[-1]
+    editor.value = value
+    editor.on_change(SimpleNamespace(value=value))  # the debounced preview has NOT run
+
+
+def test_a_drop_confirm_never_acts_on_a_text_it_has_not_shown():
+    ctx, state, _jobs, submitted = _reload_ctx()
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx)
+    ui.click("Change & reload")
+    assert "Save" in ui.buttons  # nothing to drop yet
+    _change_without_preview(ui, "exclude shop.t.a\nexclude shop.u.note")
+    ui.click("Save")  # the stale button
+    assert submitted == [] and state.lob_exclusions() == {"shop.t": {"a"}}
+    assert ui.notified and "Drop & reload shop.u" in ui.buttons  # refreshed: now it shows
+    # a retarget inside the window: the shown confirm never drops another table
+    _change_without_preview(ui, "exclude shop.t.a\nexclude shop.audit_1.x")
+    ui.click("Drop & reload shop.u")
+    assert submitted == []
+    ui.click("Drop & reload shop.audit_1")
+    assert [t for t, _choice in submitted] == [["shop.audit_1"]]
+
+
+def test_a_normal_save_never_stores_a_text_it_has_not_checked():
+    state = DataMigrationState()
+    ctx, calls = _ctx(state)
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx)
+    ui.type_text("exclude shop.t.a")
+    _change_without_preview(ui, "exclude shop.t.a\nexclude shop.u.note")
+    ui.click("Save")
+    assert state.lob_exclusions() == {} and calls["refresh"] == 0 and ui.notified
+
+
+def test_a_fix_shown_for_a_line_that_moved_rewrites_nothing():
+    ctx, _calls = _ctx()
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx)
+    ui.type_text("exclude shop.t.A")
+    label = next(k for k in ui.buttons if k.startswith('Use "exclude shop.t.'))
+    _change_without_preview(ui, "exclude shop.u.note\nexclude shop.t.A")
+    ui.click(label)
+    assert ui.editors[-1].value == "exclude shop.u.note\nexclude shop.t.A"  # untouched
+    assert ui.notified
+
+
+def test_blocked_lob_candidates_offer_no_rule_and_add_rule_never_duplicates():
+    applied = {"shop.t": SimpleNamespace(
+        target_ddl=('CREATE TABLE "shop"."t" ("id" BIGINT NOT NULL, "a" TEXT, "b" TEXT, '
+                    '"g" TEXT GENERATED ALWAYS AS (upper(a)) STORED, PRIMARY KEY ("id"))'),
+        foreign_key_ddls=[], preserved_foreign_keys=[], index_ddls=[])}
+    tables = [_t("shop.t", a="longtext", b="longtext", g="longtext")]
+    inv = SimpleNamespace(tables=tables)
+    inputs = ExclusionInputs(selected=["shop.t"], applied=applied, preserve_foreign_keys=True,
+                             migratable=["shop.t"], signature=("s",))
+    state = DataMigrationState()
+    ctx, _calls = _ctx(state)
+    ctx.inventory_fn = lambda: inv
+    ctx.inputs_fn = lambda: inputs
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx)
+    ui.type_text("")
+    ui.expand("Oversized-LOB candidates")
+    assert any(t.startswith("Cannot be excluded: Computed by Aurora DSQL") for t in ui.texts)
+    assert len(ui.buttons.get("+ add rule", [])) == 2  # a and b, not g
+    ui.click("+ add rule", index=0)
+    ui.click("+ add rule", index=0)
+    assert ui.set_values[-1].splitlines().count("exclude shop.t.a") == 1
+
+
+def test_one_popup_per_tab():
+    from dsql_migrator.ui.data_migration import _exclusion_dialog as dlgmod
+
+    ctx, _calls = _ctx()
+
+    class _Client:
+        id = "tab-1"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    ui = _Ui()
+    ui.context = SimpleNamespace(client=_Client())
+    dlgmod._OPEN_DIALOGS.pop("tab-1", None)
+    open_exclusion_dialog(ui, ctx)
+    open_exclusion_dialog(ui, ctx)  # a double-click
+    assert len(ui.dialogs) == 1
+    dlgmod._release(ui.context.client)  # the hide handler
+    open_exclusion_dialog(ui, ctx)
+    assert len(ui.dialogs) == 2
+    dlgmod._OPEN_DIALOGS.pop("tab-1", None)
+
+
+def test_a_pass_refreshes_the_popup_on_screen_and_keeps_earlier_verdicts(monkeypatch):
+    from datetime import datetime, timezone
+
+    log = []
+    _patch_probe(monkeypatch, answers={}, log=log, on_call=None)
+    state = DataMigrationState()
+    ctx, _calls = _ctx(state)
+    ctx.session.connection_ready = lambda: True
+    ctx.session.source_config = object()
+    ctx.session.source_password = None
+    t0 = datetime(2026, 10, 1, 5, 2, tzinfo=timezone.utc)
+    state._value_size_cache[("shop.t", "b")] = ("over", t0)
+    seen = []
+    state.set_size_check_listener(lambda: seen.append("current"))
+    state.cancel_size_check  # noqa: B018
+    _patch_probe(monkeypatch, answers={}, log=log, on_call=state.cancel_size_check)
+    asyncio.run(dlg._check_sizes(ctx, _rows(("shop.t", "a"), ("shop.t", "b")), lambda: seen.append("starter")))
+    assert "current" in seen and "starter" not in seen
+    sizes = state.value_sizes()
+    assert sizes[("shop.t", "b")] == ("over", t0)  # an unfinished pass never undoes a result
+    assert sizes[("shop.t", "a")][0] == "unknown"
+
+
+def test_an_unreachable_source_measures_nothing_and_says_so(monkeypatch):
+    import nicegui.run as nrun
+
+    import dsql_migrator.ui.connect as connect
+
+    async def io_bound(fn, *a, **k):
+        return fn(*a, **k)
+
+    monkeypatch.setattr(nrun, "io_bound", io_bound)
+    log = []
+    monkeypatch.setattr(connect, "make_source_engine_factory",
+                        lambda _p, **_k: (lambda _c: _Engine(log, reachable=False)))
+    state = DataMigrationState()
+    ctx, _calls = _ctx(state)
+    ctx.session.connection_ready = lambda: True
+    ctx.session.source_config = object()
+    ctx.session.source_password = None
+    said = []
+    asyncio.run(dlg._check_sizes(ctx, _rows(("shop.t", "a")), lambda: None,
+                                 notify=lambda text, **_k: said.append(text)))
+    assert state.value_sizes() == {} and said and "reconnect" in said[0]
+    assert log == ["dispose"]
+
+
+def test_size_labels_are_in_utc_and_the_unknown_label_says_what_happened():
+    from datetime import datetime, timedelta, timezone
+
+    at = datetime(2026, 10, 1, 14, 2, tzinfo=timezone(timedelta(hours=9)))
+    assert "· 05:02 UTC" in dlg._size_label(("over", at), None)[0]
+    assert dlg._size_label(("unknown", at), None)[0] == (
+        "Not determined: the read failed, took longer than 15 s, or was cancelled")
+
+
+def test_go_to_line_selects_the_include_line():
+    ctx, _calls = _ctx()
+    ui = _Ui()
+    js = []
+    ui.run_javascript = lambda code: js.append(code)
+    open_exclusion_dialog(ui, ctx)
+    ui.type_text("exclude shop.t.*\ninclude shop.t.a")
+    ui.expand("Oversized-LOB candidates")
+    ui.click("Go to L2")
+    assert js and "Math.min(2," in js[-1] and "scrollIntoView" in js[-1]
+
+
+def test_include_kept_candidates_are_measured_too():
+    ctx, _calls = _ctx()
+    ctx.session.connection_ready = lambda: True
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx)
+    ui.type_text("exclude type:longtext\ninclude shop.t.a")
+    ui.expand("Oversized-LOB candidates")
+    assert "Check sizes" in ui.buttons
+    assert any(t.startswith("Reads the source: one bounded query per column for the 1 column")
+               for t in ui.texts)
+
+
+def test_dotted_names_keep_their_own_size_verdict():
+    from datetime import datetime, timezone
+
+    state = DataMigrationState()
+    state.record_value_sizes("shop.a.b", {"c": True}, asked=["c"])
+    state.record_value_sizes("shop.a", {"b.c": False}, asked=["b.c"])
+    sizes = state.value_sizes()
+    assert sizes[("shop.a.b", "c")][0] == "over" and sizes[("shop.a", "b.c")][0] == "ok"
+    assert isinstance(sizes[("shop.a", "b.c")][1], datetime)
+    assert timezone.utc  # noqa: B018
+
+
+def test_the_delete_wait_popup_shows_no_remedy_for_a_differing_stack_set():
+    ctx, state = _locked_ctx(mtype=MigrationType.CDC_ONLY, deleting=True, phase="running")
+    state.restore_lob_exclusion("shop.t", "a")
+    state.set_cdc_deployed_column_exclude_list("shop.t.b")
+    ctx.capture_tables_fn = lambda selected: [t for t in INV.tables if t.name in set(selected)]
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx)
+    assert not any("Delete the CDC infrastructure" in t or "Start over" in t for t in ui.texts)

@@ -193,7 +193,7 @@ def test_the_lob_line_is_info_until_a_measured_offender_is_open():
     assert s.lob_count == 2 and s.lob_tone == "info" and s.lob_text.startswith(
         "2 columns in the selected tables can exceed Aurora DSQL's value limit (type-based).")
     s = exclusion_row_summary(state, locked=False, drift=None, block_reason=None,
-                              lob_candidates=cands, measured_over={"shop.t.a"})
+                              lob_candidates=cands, measured_over={("shop.t", "a")})
     assert s.lob_tone == "warning"
 
 
