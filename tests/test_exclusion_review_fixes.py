@@ -289,7 +289,9 @@ def test_the_dead_letter_recovery_is_offered_after_stop_and_works_after_delete(m
     stopped.set_cdc_stack_phase("infra", status="UPDATE_COMPLETE")  # Stop keeps the stack
     ui = _render(stopped)
     (button,) = [b for b in ui.buttons if b.text == "Exclude column…"]
-    assert "disable" in " ".join(button.props_seen)
+    # P3-C20: enabled in every state -- it records a pending rule and opens the popup
+    # read-only with the lock's own steps while the stack holds the set.
+    assert "disable" not in " ".join(button.props_seen)
     deleted = _state(MigrationType.CDC_ONLY)
     deleted.set_cdc_stack_phase("absent", status=None)
     (button,) = [b for b in _render(deleted).buttons if b.text == "Exclude column…"]

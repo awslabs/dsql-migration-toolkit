@@ -1829,40 +1829,12 @@ def build_data_migration_screen(
             # call inside it shipped.
             lob_candidates_for = make_lob_candidates_for(inventory, session, migration_state)
 
-            def exclude_cdc_capture_columns(
-                table_name: str, columns: Sequence[str]
-            ) -> None:
-                """Record a LOB column exclusion from the CDC dead-letter recovery card.
+            def exclude_cdc_capture_columns(table_name: str, columns: Sequence[str]) -> None:
+                # The CDC dead-letter "Exclude column…": record a pending rule per named
+                # column and open the exclusion popup in the mode the lock gives.
+                from dsql_migrator.ui.data_migration._exclusion_dialog import open_dlq_route
 
-                The exclusion ONLY -- deliberately not bundled with a reload the way the Full
-                Load's action is. For a CDC quarantine the reload is step 3 of a four-step
-                runbook whose FIRST step is Stop CDC (the streaming connectors have already
-                committed offsets under the current column set), and the card spells those out
-                rather than pretending one click finished the job. Same guard as the bundled
-                action, so this cannot be used to sneak an exclusion past a live pipeline.
-                """
-                blocked = exclude_and_reload_block_reason(migration_state, job_manager)
-                if blocked:
-                    ui.notify(blocked, type="warning", position="top")
-                    return
-                if not columns:
-                    return
-                # The rule, at click time: this writes the exclusion directly and never
-                # passes a prerequisite check, so a key, FK-referenced or generated
-                # column must be refused here (nothing is written).
-                refused = exclusion_refusal(migration_state, inventory, table_name, columns)
-                if refused:
-                    ui.notify(refused, type="warning", position="top")
-                    return
-                for column in columns:
-                    migration_state.set_lob_exclusion(table_name, column, True)
-                ui.notify(
-                    f"{table_name}: {', '.join(columns)} excluded at capture. Next: reload "
-                    "this table (choose DROP), then start CDC again.",
-                    type="warning",
-                    position="top",
-                )
-                refresh()
+                open_dlq_route(ui, _exclusion_ctx, table_name, columns)
 
             def exclusion_route(table_name: str, reason_text: str) -> None:
                 # The quarantine card's "Exclude column & reload": the exclusion popup,

@@ -822,3 +822,31 @@ def test_a_blocked_gate_disables_the_action_and_a_stale_click_does_nothing():
     state.cutover_restore_in_flight = None
     ctx.session.connection_ready = lambda: False
     assert quarantine_route_block(ctx).startswith("Reconnect first")
+
+
+# --- P3-C20: the dead-letter route -------------------------------------------------------
+
+from dsql_migrator.ui.data_migration._exclusion_dialog import open_dlq_route  # noqa: E402
+
+
+def test_the_dlq_route_persists_a_pending_line_once_and_applies_it_at_the_next_editable_open():
+    state = DataMigrationState()
+    ctx, _calls = _ctx(state)
+    for _ in range(2):
+        open_dlq_route(_Ui(), ctx, "shop.t", ["b"])
+    assert state.pending_rules() == ["exclude shop.t.b  # from the CDC dead-letter queue"]
+    from dsql_migrator.ui.data_migration._models import effective_lob_exclusions
+
+    assert effective_lob_exclusions(state, INV) == {}
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx)
+    assert "exclude shop.t.b  # from the CDC dead-letter queue" in ui.editors[-1].value
+
+
+def test_a_record_naming_no_column_records_nothing_and_filters_the_lob_section():
+    state = DataMigrationState()
+    ctx, _calls = _ctx(state)
+    open_dlq_route(_Ui(), ctx, "shop.t", [])
+    assert state.pending_rules() == []
+    view = state.exclusion_dialog_ui()
+    assert view.get("lob_table") == "shop.t" and view.get("lob_open")

@@ -419,14 +419,9 @@ def test_both_recovery_actions_check_the_rule_before_writing():
     route = inspect.getsource(_exclusion_dialog.open_exclusion_route)
     assert "set_lob_exclusion" not in route and "exclude_lob_and_reload" not in inspect.getsource(
         dm.build_data_migration_screen)
-    for name in ("exclude_cdc_capture_columns",):
-        (fn,) = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name]
-        calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
-        refusal = min(c.lineno for c in calls if getattr(c.func, "id", None) == "exclusion_refusal")
-        write = min(c.lineno for c in calls if getattr(c.func, "attr", None) == "set_lob_exclusion")
-        assert refusal < write, name
-        (guard,) = [n for n in ast.walk(fn) if isinstance(n, ast.If) and ast.unparse(n.test) == "refused"]
-        assert any(isinstance(b, ast.Return) for b in guard.body), name
+    # P3-C20: the dead-letter route only records a pending rule (never an exclusion).
+    dlq = inspect.getsource(_exclusion_dialog.open_dlq_route)
+    assert "set_lob_exclusion" not in dlq and "add_pending_rule" in dlq
     assert "make_lob_candidates_for(inventory, session, migration_state)" in inspect.getsource(
         dm.build_data_migration_screen)
 

@@ -1609,7 +1609,6 @@ def test_the_cdc_quarantine_card_offers_the_in_app_recovery() -> None:
         "log",
         lob_candidates_for=lambda _t: [("content", "bytea")],
         exclude_columns=lambda t, c: captured.append((t, c)),
-        block_reason=lambda *_a: None,
         records=[_oversized_record("ecommerce.product_media", "id=1")],
     )
     body = " ".join(ui.texts)
@@ -1621,30 +1620,28 @@ def test_the_cdc_quarantine_card_offers_the_in_app_recovery() -> None:
     assert btn is not None and btn.on_click is not None
 
 
-def test_the_exclude_button_is_disabled_while_cdc_streams_not_hidden() -> None:
-    """While the sink streams, the exclusion is genuinely unsafe -- its connectors committed
-    offsets under the CURRENT column set. So Stop CDC is step 1 of the runbook, and the button
-    says so instead of disappearing (a silently absent control reads as a missing feature).
-    """
+def test_the_exclude_button_is_enabled_in_every_state_and_routes() -> None:
+    """P3-C20: the button no longer refuses while CDC streams; it records a PENDING rule and
+    opens the exclusion popup in the mode the lock gives (read-only with the lock's own
+    steps while a stack holds the set). So it is enabled in every state."""
     from dsql_migrator.ui.data_migration._cdc_monitoring import (
         _render_cdc_oversized_recovery,
     )
 
     ui = _FakeUi()
-    reason = "CDC is streaming — stop CDC first."
+    routed: list = []
     _render_cdc_oversized_recovery(
         ui,
         object(),
         "log",
         lob_candidates_for=lambda _t: [("content", "bytea")],
-        exclude_columns=lambda *_a: None,
-        block_reason=lambda *_a: reason,
+        exclude_columns=lambda t, c: routed.append((t, c)),
         records=[_oversized_record("ecommerce.product_media", "id=1")],
     )
-    assert "Exclude column…" in " ".join(ui.texts), "the control must stay visible"
     btn = next(b for b in ui.buttons if "Exclude column" in getattr(b, "text", ""))
-    assert any("disable" in p for p in btn.props_seen), btn.props_seen
-    assert reason in ui.tooltips, ui.tooltips
+    assert not any("disable" in p for p in btn.props_seen), btn.props_seen
+    btn.on_click()
+    assert routed and routed[0][0] == "ecommerce.product_media"
 
 
 def test_the_card_renders_nothing_without_an_in_app_action() -> None:

@@ -15,7 +15,6 @@ import pytest
 from dsql_migrator.core.models import SourceType
 from dsql_migrator.ui.data_migration import DataMigrationState, MigrationType
 from dsql_migrator.ui.data_migration._cdc_monitoring import (
-    dlq_exclusion_runbook,
     exclude_and_reload_block_reason,
     exclusion_lock_state,
     lob_exclusion_lock,
@@ -159,22 +158,24 @@ def test_no_state_offers_a_partial_or_unavailable_remedy():
         assert "Manual" not in text, text
 
 
-def test_the_dead_letter_runbook_follows_the_real_state():
-    fl = _state(job_id="job-1")
-    steps = dlq_exclusion_runbook(fl, _StubJobManager({"job-1": _StubJob("COMPLETED")}))
-    assert steps[0] == "Exclude the column (this dialog)."
-    assert "Drop & reload" in steps[1] and "empty (NULL) in every row" in steps[1]
-    assert steps[-2:] == ["Deploy the CDC infrastructure again.", "Start CDC."]
-    assert not any("Stop CDC" in s for s in steps)  # the dialog opens only with no stack
-    pruned = dlq_exclusion_runbook(fl, _StubJobManager({}))
-    assert "Start over" in pruned[1]
-    cdc_only = dlq_exclusion_runbook(_state(MigrationType.CDC_ONLY), _StubJobManager({}))
-    assert not any("Full Load step" in s for s in cdc_only)  # CDC only has none
-    assert "current position" in cdc_only[-1]
-    pg = dlq_exclusion_runbook(_state(MigrationType.CDC_ONLY, engine=SourceType.POSTGRES),
-                               _StubJobManager({}))
-    assert "snapshots the captured tables again" in pg[-1]
+def test_the_dead_letter_route_shows_the_lock_states_own_steps():
+    # P3-C20: the DLQ "Exclude column…" records a pending rule and opens the exclusion
+    # popup read-only while a stack holds the set; its text IS exclusion_lock_state's.
+    from tests.test_exclusion_dialog import _Ui, _ctx
 
+    from dsql_migrator.ui.data_migration._exclusion_dialog import open_dlq_route
+
+    state = _state(MigrationType.CDC_ONLY)
+    state.set_cdc_stack_phase("running", status="UPDATE_COMPLETE")
+    state.set_cdc_has_committed_offset(True)
+    ctx, _calls = _ctx(state, job_manager=_StubJobManager({}))
+    ui = _Ui()
+    open_dlq_route(ui, ctx, "shop.t", ["a"])
+    lock = exclusion_lock_state(state, _StubJobManager({}))
+    assert lock.cell == "R2"  # a streamed CDC-only session: never R1b
+    assert lock.reason in ui.texts
+    assert state.pending_rules() == ["exclude shop.t.a  # from the CDC dead-letter queue"]
+    assert state.lob_exclusions() == {}
 
 def test_a_23502_on_a_table_with_saved_exclusions_names_the_exclusion():
     from dsql_migrator.ui.data_migration._cdc_monitoring import _render_cdc_schema_drift_banner

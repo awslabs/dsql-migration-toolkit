@@ -1824,25 +1824,21 @@ def _render_cdc_oversized_recovery(
     job_manager=None,
     lob_candidates_for=None,
     exclude_columns=None,
-    block_reason=None,
     session=None,
     records=None,
 ) -> None:
     """Offer the in-app recovery for rows CDC dropped over DSQL's 1 MiB per-value limit.
 
     The CDC dead-letter surface was read-only: it reported, per table, that rows had been
-    dropped and never let the operator act. The Full Load has had an "Exclude column & reload"
-    card for the same failure since earlier releases, so an operator who hit it on the load
-    could fix it and one who hit it on the stream could not -- and the AI assistant, asked what
-    to do, filled the vacuum by telling them to hand-edit ``column.exclude.list`` on the
-    Debezium connector, which is not doable from this UI and is not necessary (the tool owns
-    that setting and re-sends it on every Start CDC).
+    dropped and never let the operator act, and the AI assistant, asked what to do, told
+    them to hand-edit ``column.exclude.list`` on the connector (not doable from this UI,
+    and not necessary: the tool owns that setting and re-sends it on every Start CDC).
 
-    Deliberately NOT a one-click "exclude and reload" like the Full Load's. The ORDER matters
-    and two of the steps are other buttons: a reload while the sink is live is forced into
-    APPEND mode, so the rows already on the target would keep the old column set. The dialog
-    therefore does the one thing it can do atomically -- record the exclusion -- and spells out
-    the remaining steps in order instead of pretending one click finished the job.
+    ``exclude_columns(table, columns)`` is the route into the exclusion popup: it records
+    the rule for each named column as a PENDING line (it never changes what is excluded
+    by itself) and opens the popup in the mode the lock gives -- read-only with the lock's
+    own steps while a stack holds the set, editable (the line inserted) once it can change.
+    So the button is enabled in every state.
     """
     if exclude_columns is None:
         # No in-app action wired (an older caller) -> render nothing rather than a dead card.
@@ -1858,7 +1854,7 @@ def _render_cdc_oversized_recovery(
     def _action(table: str, columns: "list[str]"):
         def _render() -> None:
             candidates = list(lob_candidates_for(table)) if lob_candidates_for else []
-            if not candidates:
+            if not candidates and not columns:
                 # Nothing excludable on this table (e.g. the only oversized column is part of
                 # the primary key, which lob_exclusion_candidates deliberately withholds). A
                 # dead button would read as a broken feature, so say why instead.
@@ -1871,99 +1867,15 @@ def _render_cdc_oversized_recovery(
             button = ui.button(  # type: ignore[attr-defined]
                 "Exclude column…",
                 icon="filter_alt_off",
-                on_click=lambda: _open_dialog(table, columns, candidates),
+                on_click=lambda: exclude_columns(table, list(columns)),
             )
             button.props("flat dense no-caps size=sm color=warning")
-            # The SAME guard the Full Load's bundled action respects, surfaced the same way:
-            # shown-but-disabled with the reason as the tooltip, never hidden ("a silently
-            # absent control reads as a missing feature"). While CDC streams the exclusion is
-            # genuinely unsafe -- the connectors committed offsets under the current column
-            # set -- so the first step of the runbook is Stop CDC, and this button is what
-            # tells the operator that.
-            blocked = (
-                block_reason(migration_state, job_manager)
-                if block_reason is not None
-                else None
+            button.tooltip(
+                "Open Exclude tables & columns with a rule for the column that cannot fit; "
+                "it is recorded and applied when the rules can change."
             )
-            if blocked:
-                button.props("disable").tooltip(blocked)
-            else:
-                button.tooltip(
-                    "Stop capturing the column that cannot fit, then reload this table "
-                    "and start CDC again."
-                )
 
         return _render
-
-    def _open_dialog(table: str, blamed: "list[str]", candidates) -> None:
-        picked: dict[str, bool] = {
-            name: (name in blamed) for name, _type in candidates
-        }
-        with ui.dialog() as dialog, ui.card().style("min-width: 540px"):  # type: ignore[attr-defined]
-            ui.label(f"Stop capturing a column of {table}?").classes(  # type: ignore[attr-defined]
-                "text-lg font-semibold"
-            )
-            render_notice(
-                ui,
-                tone="warning",
-                header="The column stops migrating everywhere, and this is not the whole fix",
-                body=(
-                    "The exclusion is migration-wide: the Full Load, the prerequisite checks "
-                    "and the Validation comparison all stop covering this column too, and it "
-                    "is empty (NULL) in every row the tool inserts (a row already on Aurora "
-                    "DSQL keeps what it holds there). Rows already dropped are "
-                    "NOT recovered by excluding the column — do the steps below, in this "
-                    "order."
-                ),
-            )
-            ui.label(  # type: ignore[attr-defined]
-                "Columns that can exceed DSQL's 1 MiB per-value limit:"
-            ).classes("text-sm text-gray-700")
-            for name, col_type in candidates:
-                box = ui.checkbox(  # type: ignore[attr-defined]
-                    f"{name}  ({col_type})",
-                    value=picked.get(name, False),
-                    on_change=lambda e, n=name: picked.__setitem__(n, bool(e.value)),
-                )
-                box.props("dense")
-            if blamed:
-                inline_hint(
-                    ui,
-                    "Pre-ticked from the dead-letter record: the sink named "
-                    + ", ".join(blamed)
-                    + ".",
-                    tone="neutral",
-                )
-            # STOP CDC FIRST, and the order is not cosmetic: while the sink streams, its
-            # connectors have already committed offsets under the CURRENT excluded-column set,
-            # so changing the set now makes the rows already streamed inconsistent with
-            # everything after -- which is exactly why exclude_and_reload_block_reason refuses
-            # it, and why the button that opens this dialog is disabled until CDC is stopped. A
-            # reload under a live sink is separately forced into APPEND mode, so the rows
-            # already on the target would keep the old column set too.
-            # The steps follow the REAL state (dlq_exclusion_runbook): this dialog opens only
-            # once no CDC infrastructure exists, and CDC only has no Full Load step.
-            for index, step in enumerate(
-                dlq_exclusion_runbook(migration_state, job_manager), start=1
-            ):
-                with ui.row().classes("items-start gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
-                    ui.badge(str(index)).props("color=grey-7 outline")  # type: ignore[attr-defined]
-                    ui.label(step).classes("text-xs text-gray-700")  # type: ignore[attr-defined]
-
-            def _go() -> None:
-                chosen = [name for name, on in picked.items() if on]
-                if not chosen:
-                    ui.notify("Tick at least one column to exclude.", type="warning")
-                    return
-                dialog.close()
-                exclude_columns(table, chosen)
-
-            with ui.row().classes("w-full justify-end gap-2 items-center"):  # type: ignore[attr-defined]
-                ui.button("Cancel", on_click=dialog.close).props("flat")  # type: ignore[attr-defined]
-                ui.button(  # type: ignore[attr-defined]
-                    "Exclude at capture", icon="filter_alt_off", on_click=_go
-                ).props("color=negative")
-        dialog.open()
 
     for table, pks, columns in groups:
         _quarantine_detail_row(
@@ -2005,8 +1917,8 @@ def _render_cdc_oversized_recovery_without_monitoring(
         tone="warning",
         header="Rows CDC dropped over Aurora DSQL's 1 MiB value limit",
         body=(
-            "These rows were dead-lettered before CDC stopped. Excluding the column "
-            "that cannot fit is offered below once no CDC infrastructure is deployed."
+            "These rows were dead-lettered before CDC stopped. Excluding the column that "
+            "cannot fit is recorded below and applied when the rules can change."
         ),
     )
     _render_cdc_oversized_recovery(
@@ -2016,7 +1928,6 @@ def _render_cdc_oversized_recovery_without_monitoring(
         job_manager=job_manager,
         lob_candidates_for=lob_candidates_for,
         exclude_columns=exclude_columns,
-        block_reason=exclude_and_reload_block_reason,
         session=session,
         records=records,
     )
@@ -2138,7 +2049,6 @@ def _render_cdc_dlq_panel(
             job_manager=job_manager,
             lob_candidates_for=lob_candidates_for,
             exclude_columns=exclude_columns,
-            block_reason=exclude_and_reload_block_reason,
             session=session,
         )
         _render_cdc_dlq_records(ui, migration_state, log_key, page_state=page_state)
@@ -2891,56 +2801,6 @@ def change_and_reload_block_reason(
     if not connections_ready:
         return RECONNECT_REASON
     return None
-
-
-def dlq_exclusion_runbook(migration_state, job_manager) -> "list[str]":
-    """The numbered steps the CDC dead-letter "Exclude column..." dialog shows.
-
-    The dialog opens only when :func:`exclude_and_reload_block_reason` allows it -- no CDC
-    infrastructure deployed, being created or being deleted, nothing streaming -- so the
-    steps start from there: "Stop CDC" is not one of them (a stopped stack keeps the old
-    set and blocks the exclusion), and a CDC-only migration is never sent to a Full Load
-    step it does not have. Only actions this version has are named.
-    """
-    from dsql_migrator.ui.data_migration._models import MigrationType
-
-    migration_type = getattr(migration_state, "migration_type", None)
-    job_id = getattr(migration_state, "job_id", None)
-    job_found = _current_job(job_manager, job_id) is not None if job_id else False
-    session = getattr(migration_state, "_session", None)
-    engine = session_source_type(session) if session is not None else None
-    steps = ["Exclude the column (this dialog)."]
-    if migration_type is MigrationType.CDC_ONLY:
-        steps.append("Deploy the CDC infrastructure again.")
-        if engine is SourceType.POSTGRES:
-            steps.append(
-                "Start CDC — it re-creates the publication and snapshots the captured "
-                "tables again."
-            )
-        else:
-            steps.append(
-                "Start CDC — it begins at the source's current position (the stream "
-                "position went with the deleted infrastructure), so changes to this table "
-                "in between are not replicated."
-            )
-        return steps
-    if job_found:
-        steps.append(
-            "Reload this table from the Full Load step with Drop & reload: it is "
-            "recreated from its target DDL and the column is empty (NULL) in every row."
-        )
-    elif job_id is not None:
-        steps.append(
-            "The record of the last Full Load run is no longer available, so this table "
-            "cannot be reloaded from here: use Start over to reload it."
-        )
-    else:
-        steps.append(
-            "Start Full Load, choosing Drop & reload for this table if it holds rows."
-        )
-    steps.append("Deploy the CDC infrastructure again.")
-    steps.append("Start CDC.")
-    return steps
 
 
 def exclude_and_reload_block_reason(migration_state, job_manager) -> "Optional[str]":
