@@ -142,6 +142,9 @@ class SessionSnapshot(BaseModel):
     exclusion_rules_text: Optional[str] = None
     rule_excluded_tables: list[str] = Field(default_factory=list)
     exclusion_pending_rules: list[str] = Field(default_factory=list)
+    # Rule-excluded tables re-ticked in the tree since the last Save (a deliberate override,
+    # kept until the next Save so a reconnect does not turn it into drift).
+    rule_reticked_tables: list[str] = Field(default_factory=list)
     # The in-flight (or just-finished) CDC lifecycle job (deploy-infra / start /
     # stop / delete) and which operation it is, so a reconnecting session can keep
     # showing that job's ordered stages instead of dropping them on a restart. The

@@ -41,10 +41,12 @@ from dsql_migrator.core.column_exclusion import (
     B4,
     T2,
     T3,
+    WL_REJECT,
     ExclusionContext,
     ExclusionFinding,
     column_exclusion_verdict,
     column_exclusion_warnings,
+    legacy_exclusion_notes,
     missing_target_columns,
     table_exclusion_findings,
 )
@@ -767,6 +769,8 @@ class ReviewItem:
     why: "tuple[str, ...]" = ()
     changes: "tuple[str, ...]" = ()
     warning: bool = False
+    # An omit-only (pre-0.1.562) entry: no target change, not "migrated as NULL".
+    legacy: bool = False
 
 
 @dataclass(frozen=True)
@@ -818,6 +822,9 @@ class RuleResolution:
     in_scope: "tuple[str, ...]" = ()
     # The capture hook's whole answer (the UI's CdcCaptureExclusions), for its warnings.
     capture_preview: Optional[object] = None
+    # Columns the rules would exclude on tables re-ticked in the tree since the last Save:
+    # the Save unselects those tables again, so these are reported (drift), never stored.
+    retick_columns: "tuple[tuple[str, str], ...]" = ()
 
     @property
     def can_save(self) -> bool:
@@ -1128,9 +1135,13 @@ def resolve_exclusion_rules(
             kept_by[item] = tuple(sorted(incl_c[item]))
         else:
             candidates[item] = tuple(sorted(lines))
+    reticked = [t for t in order if t in set(retick_overrides) and t in selected]
+    retick_candidates = [i for i in excl_c if i[0] in set(reticked) and i not in incl_c]
     ctx = None
     if context_factory is not None:
-        ctx = context_factory(after, {t for t, _c in candidates})
+        ctx = context_factory(
+            after, {t for t, _c in candidates} | {t for t, _c in retick_candidates})
+    legacy_set = {(t, c) for t, cs in (legacy or {}).items() for c in cs}
     blocked: dict = {}
     warnings: dict = {}
     for item, lines in candidates.items():
@@ -1142,9 +1153,14 @@ def resolve_exclusion_rules(
         columns.setdefault(item[0], set()).add(item[1])
         excluded_by[item] = lines
         if ctx is not None:
-            found = column_exclusion_warnings(item[0], item[1], ctx)
+            # An omit-only entry gets no overlay, so the W1-W6 story would be false.
+            found = (legacy_exclusion_notes(item[0], item[1], ctx) if item in legacy_set
+                     else column_exclusion_warnings(item[0], item[1], ctx))
             if found:
                 warnings[item] = found
+    retick_columns = tuple(sorted(
+        i for i in retick_candidates
+        if ctx is None or not column_exclusion_verdict(i[0], i[1], ctx).blocked))
 
     cancel: dict = {}
     for kind, hits_by_line, excl, in_scope in (
@@ -1293,15 +1309,23 @@ def resolve_exclusion_rules(
         global_errors.append(RuleError(
             "E5", 0, "These rules would leave no table to migrate: keep at least one table "
             "selected."))
+    colon: dict = {}
     for item, lines in sorted(excluded_by.items()):
         if ":" in item[0]:
             for line in lines:
-                errors.setdefault(line, []).append(RuleError(
-                    "E4", line,
-                    f'{item[0]} contains ":", which a saved column exclusion cannot hold (it is '
-                    'stored as table:column). Exclude the whole table, or remove this rule.'))
+                colon.setdefault((line, item[0]), []).append(item[1])
+    for (line, table), cols in sorted(colon.items()):
+        schema, _sep, rest = table.partition(".")
+        whole = "exclude table " + ".".join(rule_part_token(x) for x in (schema, rest))
+        keep = "include " + ".".join(rule_part_token(x) for x in (schema, rest)) + ".*"
+        errors.setdefault(line, []).append(RuleError(
+            "E4", line,
+            f'{table} contains ":", which a saved column exclusion cannot hold (it is stored '
+            f"as table:column); L{line} matches {_plural(len(cols), 'of its column')}. Exclude "
+            f"the whole table ({whole}), or keep its columns ({keep})."))
     if applied_conversions:
-        missing = _certain_missing(after, tables, applied_conversions, columns, live_columns)
+        missing = _certain_missing(after, tables, applied_conversions, columns, live_columns,
+                                   includes=incl_c, lock_reason=selection_lock_reason)
         if missing:
             global_errors.append(missing)
     cdc_value = cdc_bytes = capture_warning = preview = None
@@ -1329,7 +1353,7 @@ def resolve_exclusion_rules(
     target_changes = _target_changes(
         [t for t in order if t in columns], columns, retained, applied_conversions)
     items = _review_items(order, new_rule, table_hits, rules, excluded_by, warnings, blocked,
-                          kept_by, target_changes, ctx)
+                          kept_by, target_changes, ctx, legacy_set)
     diff = _diff(columns, stored_columns or {}, unselect, reselect, cancellations)
 
     return RuleResolution(
@@ -1356,13 +1380,18 @@ def resolve_exclusion_rules(
         capture_warning=capture_warning,
         in_scope=tuple(after),
         capture_preview=preview,
+        retick_columns=retick_columns,
     )
 
 
-def _certain_missing(after, tables, applied, columns, live) -> "Optional[RuleError]":
+def _certain_missing(
+    after, tables, applied, columns, live, *, includes=None, lock_reason=None
+) -> "Optional[RuleError]":
     """The global E4 for source columns the applied DDL lacks and the rules do not
     exclude -- only a CERTAIN 42703: a column the live target still has gets through, as
-    in missing_column_block_reason. Offers each column's rule, never applies it (D6)."""
+    in missing_column_block_reason. Offers each column's rule, never applies it (D6): not
+    for a column an include keeps (the line would do nothing -- the copy names the
+    include), and a whole-table rule for a table whose name a column rule cannot hold."""
     missing = missing_target_columns([tables[n] for n in after], applied, columns)
     if live:
         missing = {t: kept for t, cols in missing.items()
@@ -1373,20 +1402,35 @@ def _certain_missing(after, tables, applied, columns, live) -> "Optional[RuleErr
     shown = [f"{t}.{c}" for t, c in pairs]
     many = len(pairs) > 1
     them = "them" if many else "it"
-    suggestions = []
+    suggestions: list[Suggestion] = []
+    kept_notes: list[str] = []
+    offered: set[str] = set()
     for t, c in pairs:
         if not all(rule_name_writable(x) for x in (t, c)):
             continue
         schema, _sep, rest = t.partition(".")
+        keepers = (includes or {}).get((t, c))
+        if keepers:
+            on = ", ".join(f"L{n}" for n in sorted(keepers))
+            kept_notes.append(f"{t}.{c} is kept by include on {on}: remove that include, or "
+                              "add the column back to the target DDL.")
+            continue
+        if ":" in t:
+            if lock_reason is None and t not in offered:
+                line = "exclude table " + ".".join(rule_part_token(x) for x in (schema, rest))
+                suggestions.append(Suggestion(f"+ add rule: {line}", line))
+                offered.add(t)
+            continue
         line = "exclude " + ".".join(rule_part_token(x) for x in (schema, rest, c))
         suggestions.append(Suggestion(f"+ add rule: {line}", line))
-    return RuleError(
-        "E4", 0,
+    message = (
         f"{_names(shown)} {'are' if many else 'is'} not in your Aurora DSQL "
         f"table{'s' if len(missing) > 1 else ''}; writing {them} would fail (42703, undefined "
-        f"column). Add {them} back to the target DDL in Schema Conversion, or exclude {them}.",
-        tuple(suggestions),
+        f"column). Add {them} back to the target DDL in Schema Conversion, or exclude {them}."
     )
+    if kept_notes:
+        message += " " + " ".join(kept_notes)
+    return RuleError("E4", 0, message, tuple(suggestions))
 
 
 def _target_changes(tables_in_order, columns, retained, applied) -> "tuple[TargetChange, ...]":
@@ -1427,7 +1471,7 @@ _KIND_ORDER = {"unselected": 0, "excluded": 1, "blocked": 2, "kept": 3}
 
 
 def _review_items(order, new_rule, table_hits, rules, excluded_by, warnings, blocked,
-                  kept_by, target_changes, ctx) -> "tuple[ReviewItem, ...]":
+                  kept_by, target_changes, ctx, legacy_set=frozenset()) -> "tuple[ReviewItem, ...]":
     """The ONE Review-all list: rule-unselected tables, then each column the rules name."""
     rank = {n: i for i, n in enumerate(order)}
     items: list[ReviewItem] = []
@@ -1447,9 +1491,11 @@ def _review_items(order, new_rule, table_hits, rules, excluded_by, warnings, blo
                 statements.setdefault((change.table, column), []).append(text)
     for (table, column), lines in excluded_by.items():
         found = warnings.get((table, column), ())
+        legacy = (table, column) in legacy_set
+        warning = (any(f.code == WL_REJECT for f in found) if legacy else bool(found))
         items.append(ReviewItem("excluded", table, column, lines,
                                 tuple(f.message for f in found),
-                                tuple(statements.get((table, column), ())), bool(found)))
+                                tuple(statements.get((table, column), ())), warning, legacy))
     for (table, column), item in blocked.items():
         items.append(ReviewItem("blocked", table, column, item.lines,
                                 tuple(f.message for f in item.findings)))

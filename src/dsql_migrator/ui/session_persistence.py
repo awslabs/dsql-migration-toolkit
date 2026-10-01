@@ -197,6 +197,7 @@ def _exclusion_semantics_sig(migration_state: object) -> tuple:
         getattr(migration_state, "exclusion_rules_text", lambda: None)(),
         tuple(sorted(getattr(migration_state, "rule_excluded_tables", frozenset)())),
         tuple(getattr(migration_state, "pending_rules", list)()),
+        tuple(sorted(getattr(migration_state, "rule_reticked_tables", frozenset)())),
     )
 
 
@@ -259,6 +260,9 @@ def capture_session_snapshot(
             getattr(migration_state, "rule_excluded_tables", frozenset)()
         ),
         exclusion_pending_rules=list(getattr(migration_state, "pending_rules", list)()),
+        rule_reticked_tables=sorted(
+            getattr(migration_state, "rule_reticked_tables", frozenset)()
+        ),
         cdc_connector_names=list(
             getattr(migration_state, "cdc_connector_names", []) or []
         ),
@@ -622,6 +626,7 @@ def apply_session_snapshot(
             snapshot.exclusion_rules_text,
             snapshot.rule_excluded_tables,
             snapshot.exclusion_pending_rules,
+            reticked=snapshot.rule_reticked_tables,
         )
     # A COMPLETED teardown (Stop / Delete) leaves NO live connectors and no operation
     # worth resume-displaying. Restoring its stale connector names or its finished

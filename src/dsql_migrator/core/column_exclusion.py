@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Iterable, Mapping, Optional, Sequence
@@ -128,6 +129,10 @@ class ExclusionContext:
     fk_children: Mapping[str, Mapping[str, tuple[str, ...]]] = field(default_factory=dict)
     unique_columns: Mapping[str, frozenset[str]] = field(default_factory=dict)
     view_ddls: Mapping[str, str] = field(default_factory=dict)
+    # ``{table: {generated column: its expression}}`` from the applied DDL (else the source).
+    generated_expressions: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    # Lazily filled per table: the views that read it (one scan per table, not per column).
+    _views_memo: dict = field(default_factory=dict, compare=False, repr=False)
 
 
 @lru_cache(maxsize=4096)
@@ -286,6 +291,7 @@ def build_exclusion_context(
     generated: dict[str, frozenset[str]] = {}
     target_constraints: dict[str, Mapping[str, "tuple[bool, Optional[str]]"]] = {}
     unique_columns: dict[str, frozenset[str]] = {}
+    generated_expressions: dict[str, dict[str, str]] = {}
     fk_children: dict[str, dict[str, list[str]]] = {}
     focus = set(tables) if focus_tables is None else set(focus_tables) & set(tables)
     for name in focus:
@@ -320,6 +326,13 @@ def build_exclusion_context(
             target_constraints[name] = facts
         if unique:
             unique_columns[name] = unique
+        expressions = (
+            dict(_ddl_generated_expressions(ddl)) if ddl
+            else {c.name: c.generated_expression for c in pg_preserved_generated_columns(table)
+                  if c.generated_expression}
+        )
+        if expressions:
+            generated_expressions[name] = expressions
     mkc = {
         t: frozenset(cols) for t, cols in (message_key_columns or {}).items() if cols
     }
@@ -363,7 +376,71 @@ def build_exclusion_context(
         },
         unique_columns=unique_columns,
         view_ddls=dict(view_ddls or {}) if warnings else {},
+        generated_expressions=generated_expressions,
     )
+
+
+@lru_cache(maxsize=4096)
+def _ddl_generated_expressions(ddl: str) -> "tuple[tuple[str, str], ...]":
+    """``((column, expression), ...)`` of the GENERATED columns of an applied CREATE TABLE,
+    names as PostgreSQL stores them; the expression as sqlglot renders it. Cached by text;
+    an unreadable DDL gives ``()``."""
+    import sqlglot
+    from sqlglot import exp
+
+    from dsql_migrator.core.converter import _strip_identity_clauses, fold_identifier
+
+    try:
+        parsed = sqlglot.parse_one(_strip_identity_clauses(ddl), read="postgres")
+    except Exception:  # noqa: BLE001 - unparseable DDL -> no claim
+        return ()
+    if not isinstance(parsed, exp.Create):
+        return ()
+    out = []
+    for column_def in parsed.find_all(exp.ColumnDef):
+        for constraint in column_def.args.get("constraints") or []:
+            kind = constraint.args.get("kind")
+            if isinstance(kind, exp.ComputedColumnConstraint) and kind.this is not None:
+                ident = column_def.this
+                quoted = isinstance(ident, exp.Identifier) and bool(ident.quoted)
+                name = column_def.name if quoted else fold_identifier(column_def.name)
+                out.append((name, kind.this.sql(dialect="postgres")))
+    return tuple(out)
+
+
+@lru_cache(maxsize=4096)
+def _view_table_refs(ddl: str) -> "Optional[frozenset[str]]":
+    """The tables an applied CREATE VIEW reads (FROM/JOIN/subqueries), each as
+    ``schema.table`` the way PostgreSQL resolves the names (quoted as written, unquoted
+    folded; a one-part name in ``public``). ``None`` when the DDL cannot be read."""
+    import sqlglot
+    from sqlglot import exp
+
+    from dsql_migrator.core.converter import fold_identifier
+
+    try:
+        parsed = sqlglot.parse_one(ddl, read="postgres")
+    except Exception:  # noqa: BLE001 - unreadable -> the text heuristic decides
+        return None
+    body = parsed.expression if isinstance(parsed, exp.Create) else parsed
+    if body is None:
+        return None
+
+    def _name(node) -> str:
+        if node is None:
+            return ""
+        if isinstance(node, exp.Identifier):
+            return node.name if node.quoted else fold_identifier(node.name)
+        return fold_identifier(getattr(node, "name", "") or "")
+
+    refs = set()
+    for table in body.find_all(exp.Table):
+        name = _name(table.this)
+        if not name:
+            continue
+        schema = _name(table.args.get("db")) or "public"
+        refs.add(f"{schema}.{name}")
+    return frozenset(refs)
 
 
 @lru_cache(maxsize=4096)
@@ -470,8 +547,25 @@ def _mentions(text: str, name: str, *, ignore_case: bool = False) -> bool:
 
 
 def _views_reading(table_name: str, ctx: ExclusionContext) -> list[str]:
-    return [v for v in sorted(ctx.view_ddls)
-            if views_referencing({v: ctx.view_ddls[v]}, frozenset({table_name}))]
+    """The applied views that READ ``table_name``: its FROM/JOIN references, so a view on
+    another schema's same-named table, or one with a column named like the table, is not
+    counted; the text heuristic only when a view cannot be parsed. Memoized per context
+    (one scan per table, not per excluded column)."""
+    memo = ctx._views_memo
+    if table_name in memo:
+        return memo[table_name]
+    bare = table_name.split(".")[-1].lower()
+    found = []
+    for view in sorted(ctx.view_ddls):
+        ddl = ctx.view_ddls[view]
+        refs = _view_table_refs(ddl)
+        if refs is None:
+            if names_in(ddl.lower().replace('"', ""), (table_name.lower(), bare)):
+                found.append(view)
+        elif table_name in refs:
+            found.append(view)
+    memo[table_name] = found
+    return found
 
 
 def column_exclusion_warnings(
@@ -497,14 +591,16 @@ def column_exclusion_warnings(
         found.append(ExclusionFinding(
             W4, "Uniqueness is not enforced for migrated rows (all NULL)."))
     table = ctx.tables.get(table_name)
-    computed = ctx.generated.get(table_name, ())
-    for other in (table.columns if table is not None else ()):
-        expression = other.generated_expression
-        if other.name == column or other.name not in computed or not expression:
+    source_columns = {c.name: c for c in (table.columns if table is not None else ())}
+    expressions = ctx.generated_expressions.get(table_name, {})
+    for other_name in sorted(ctx.generated.get(table_name, ())):
+        expression = expressions.get(other_name)
+        if other_name == column or not expression or not _mentions(expression, column):
             continue
-        if not _mentions(expression, column):
-            continue
-        other_not_null = constraints.get(other.name, (not other.nullable, None))[0]
+        source = source_columns.get(other_name)
+        fallback = (not source.nullable) if source is not None else False
+        other_not_null = constraints.get(other_name, (fallback, None))[0]
+        other = SimpleNamespace(name=other_name)
         if other_not_null:
             message = (
                 f"{other.name} is NOT NULL and computed from this column: if {expression} "
@@ -517,6 +613,33 @@ def column_exclusion_warnings(
             found.append(ExclusionFinding(
                 W6, f"View {view} mentions it (text match) and will read NULL."))
     return tuple(found)
+
+
+WL = "WL"  # an omit-only (pre-0.1.562) entry: information
+WL_REJECT = "WLR"  # the same, where every row is rejected: a warning
+
+
+def legacy_exclusion_notes(
+    table_name: str, column: str, ctx: ExclusionContext
+) -> tuple[ExclusionFinding, ...]:
+    """What an omit-only (legacy) entry does instead of the W1-W6 overlay story: no
+    target change, so Aurora DSQL keeps NOT NULL and fills the DEFAULT -- which a UNIQUE
+    member turns into 23505 after the first row, and NOT NULL without one into 23502."""
+    not_null, default_sql = ctx.target_constraints.get(table_name, {}).get(column, (False, None))
+    text = "Excluded before v0.1.562: omitted only, with no change on Aurora DSQL."
+    code = WL
+    if default_sql is not None:
+        text += f" Aurora DSQL fills its DEFAULT {default_sql} in every row."
+        if column in ctx.unique_columns.get(table_name, ()):
+            text += " A UNIQUE index on it rejects every row after the first (23505)."
+            code = WL_REJECT
+    elif not_null:
+        text += (" It is NOT NULL with no DEFAULT on Aurora DSQL, so every row is rejected "
+                 "(23502).")
+        code = WL_REJECT
+    else:
+        text += " Aurora DSQL stores NULL in it."
+    return (ExclusionFinding(code, text),)
 
 
 def table_exclusion_findings(
@@ -741,11 +864,14 @@ __all__ = [
     "W4",
     "W5",
     "W6",
+    "WL",
+    "WL_REJECT",
     "build_exclusion_context",
     "check_stored_exclusions",
     "column_exclusion_verdict",
     "column_exclusion_warnings",
     "effective_exclusions",
+    "legacy_exclusion_notes",
     "missing_target_columns",
     "names_in",
     "set_digest",

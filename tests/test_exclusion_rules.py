@@ -908,8 +908,9 @@ def test_each_ddl_is_read_once_per_resolve_and_not_again(monkeypatch):
     _full("exclude *.*.x", tables=tables, applied=applied)
     assert seen == {}, "a repeated resolve must not re-parse any DDL"
     # one parse per cached reader (key facts: pk, identity, generated; constraints; UNIQUE
-    # members; column names; the overlay preview's generated set), never a repeat
-    assert per_ddl <= 7
+    # members; generated expressions; column names; the overlay preview's generated set),
+    # never a repeat
+    assert per_ddl <= 8
 
 
 # --- review fixes (C01-C04 adversarial review) ---------------------------------------
@@ -1184,3 +1185,48 @@ def test_gaps_are_reported_never_dropped_silently():
     unselected = _full(text, tables=tables, applied=applied, selection=["shop.customers"])
     gaps = {(g.table, g.column): g.reason for g in synthesis_gaps(unselected, stored, tables)}
     assert gaps[("shop.orders", "note")] == "Its table is not selected."
+
+
+# --- review fixes (C05-C11 review) ----------------------------------------------------
+
+
+def test_a_legacy_entry_gets_no_overlay_story():
+    res = _full("exclude shop.orders.price", legacy={"shop.orders": {"price"}})
+    (item,) = [i for i in res.items if i.kind == "excluded"]
+    assert item.legacy and not any(
+        s in w for w in item.why for s in ("NOT NULL will be dropped", "restored at Cut over",
+                                           "computed from NULL"))
+    assert any("Excluded before v0.1.562" in w for w in item.why)
+    plain = _full("exclude shop.orders.price")
+    (item,) = [i for i in plain.items if i.kind == "excluded"]
+    assert not item.legacy and any("NOT NULL will be dropped" in w for w in item.why)
+
+
+def test_42703_never_offers_a_line_an_include_cancels():
+    ddls = {"shop.customers": _CUST_DDL.replace(', "name" TEXT DEFAULT \'n/a\'', ""),
+            "shop.orders": _ORD_DDL}
+    tables, applied = _shop(ddls=ddls)
+    res = _full("exclude shop.*.name\ninclude shop.customers.name", tables=tables, applied=applied)
+    (error,) = res.global_errors
+    assert error.suggestions == () and "kept by include on L2" in error.message
+    only = _full("include shop.customers.name", tables=tables, applied=applied)
+    (error,) = only.global_errors
+    assert error.suggestions == () and "kept by include on L1" in error.message
+
+
+def test_a_colon_table_gets_one_e4_per_line_and_a_whole_table_rule_for_42703():
+    tables, applied = _shop(odd_names=True)
+    weird = next(t for t in tables if t.name == "shop.we:ird")
+    weird.columns.append(ColumnDef(name="y", mysql_type="text"))
+    res = _full("exclude shop.we:ird.*", tables=tables, applied=applied)
+    assert [e.code for e in res.errors[1]] == ["E4"]
+    assert "matches 2 of its columns" in res.errors[1][0].message
+    assert "exclude table shop.we:ird" in res.errors[1][0].message
+
+
+def test_columns_on_a_reticked_table_are_reported_not_stored():
+    res = _res("exclude table shop.audit_*\nexclude *.*.payload",
+               selection=[n for n in ALL if n != "shop.audit_2023"],
+               prev={"shop.audit_2023"}, reticks={"shop.audit_2024"})
+    assert ("shop.audit_2024", "payload") in res.retick_columns
+    assert "shop.audit_2024" not in res.columns

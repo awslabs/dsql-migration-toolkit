@@ -200,7 +200,7 @@ class DataMigrationState:
         # unticked in the tree.
         self._rule_excluded_tables: set[str] = set()
         # Rule-excluded tables the operator re-ticked in the tree since the last Save (a
-        # deliberate override the popup names). Transient.
+        # deliberate override the popup names). Persisted until the next Save.
         self._rule_reticked_tables: set[str] = set()
         # Suggested rule lines waiting for the popup (e.g. a quarantine or DLQ route while
         # the rules are locked); inserted on each open until a Save takes them.
@@ -678,6 +678,8 @@ class DataMigrationState:
         def _key(text: str) -> str:
             return " ".join(split_rule_comment(text)[0].split())
 
+        if "\n" in line or "\r" in line:
+            return False  # one rule per line: a line break would split it
         with self._lock:
             seen = {_key(x) for x in self._exclusion_pending_rules}
             seen |= {_key(x) for x in (self._exclusion_rules_text or "").splitlines()}
@@ -695,12 +697,15 @@ class DataMigrationState:
         text: Optional[str],
         rule_excluded_tables: "Iterable[str]" = (),
         pending: "Iterable[str]" = (),
+        *,
+        reticked: "Iterable[str]" = (),
     ) -> None:
         """Restore the re-editing fields from a snapshot (no operator semantics)."""
         with self._lock:
             self._exclusion_rules_text = text
             self._rule_excluded_tables = set(rule_excluded_tables or ())
             self._exclusion_pending_rules = list(pending or ())
+            self._rule_reticked_tables = set(reticked or ())
 
     def restore_lob_exclusion(self, table: str, column: str) -> None:
         """Restore one stored exclusion from a snapshot (no operator semantics)."""

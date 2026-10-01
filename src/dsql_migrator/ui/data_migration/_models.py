@@ -2250,22 +2250,39 @@ class ExclusionDrift:
     removed: "tuple[tuple[str, str], ...]"
     unselects: "tuple[str, ...]"
     reselects: "tuple[str, ...]"
+    # Saved lines that no longer resolve (e.g. a dropped table), and a global error.
+    error_lines: "tuple[int, ...]" = ()
+    global_error: bool = False
+    # Columns the rules exclude on a table re-ticked in the tree since the last Save.
+    retick_columns: "tuple[tuple[str, str], ...]" = ()
 
 
 def exclusion_drift(migration_state, resolution) -> "Optional[ExclusionDrift]":
     """The difference between ``resolution`` (of the saved rules) and the stored state, or
-    ``None``. A rule-excluded table re-ticked in the tree is an override, not drift; a
-    resolution with errors makes no claim."""
-    if resolution is None or not resolution.can_save:
+    ``None``. A rule-excluded table re-ticked in the tree is an override, not drift -- but
+    the column rules that would apply to it are reported. Lines that no longer resolve are
+    reported too, and never hide the column changes the rest of the rules make; a table
+    change under the selection lock (E3) is not drift."""
+    if resolution is None:
         return None
     stored = migration_state.lob_exclusions()
     now = {(t, c) for t, cs in resolution.columns.items() for c in cs}
     before = {(t, c) for t, cs in stored.items() for c in cs}
     reticks = migration_state.rule_reticked_tables()
-    unselects = tuple(t for t in resolution.tables_to_unselect if t not in reticks)
-    drift = ExclusionDrift(tuple(sorted(now - before)), tuple(sorted(before - now)),
-                           unselects, tuple(resolution.tables_to_reselect))
-    if not (drift.added or drift.removed or drift.unselects or drift.reselects):
+    locked = any(e.code == "E3" for es in resolution.errors.values() for e in es) or any(
+        e.code == "E3" for e in resolution.global_errors)
+    unselects = () if locked else tuple(
+        t for t in resolution.tables_to_unselect if t not in reticks)
+    reselects = () if locked else tuple(resolution.tables_to_reselect)
+    error_lines = tuple(sorted(n for n, es in resolution.errors.items()
+                               if any(e.code != "E3" for e in es)))
+    drift = ExclusionDrift(
+        tuple(sorted(now - before)), tuple(sorted(before - now)), unselects, reselects,
+        error_lines, any(e.code != "E3" for e in resolution.global_errors),
+        tuple(resolution.retick_columns),
+    )
+    if not (drift.added or drift.removed or drift.unselects or drift.reselects
+            or drift.error_lines or drift.global_error or drift.retick_columns):
         return None
     return drift
 
@@ -2319,6 +2336,8 @@ class QuarantineSuggestion:
     kept: "Mapping[str, tuple[int, ...]]" = field(default_factory=dict)
     not_saved_lines: "tuple[int, ...]" = ()
     filter_table: bool = False
+    # Preselected columns whose name holds a line break: no rule can name them.
+    unwritable: "tuple[str, ...]" = ()
 
 
 def quarantine_rule_suggestion(
@@ -2339,7 +2358,7 @@ def quarantine_rule_suggestion(
     decides the copy when nothing is inserted, so a column only an unsaved line excludes is
     never treated as fixed. ``include_keepers``/``open_excluded_by`` map a column to the
     include lines keeping it / the open lines excluding it."""
-    from dsql_migrator.core.exclusion_rules import rule_part_token
+    from dsql_migrator.core.exclusion_rules import rule_name_writable, rule_part_token
 
     keepers = dict(include_keepers or {})
     by_line = dict(open_excluded_by or {})
@@ -2348,14 +2367,17 @@ def quarantine_rule_suggestion(
     pre_open = preselect_lob_columns_for_reason(open_c, reason_text, source_type=source_type)
     if pre_open:
         schema, _sep, rest = table.partition(".")
-        lines, kept = [], {}
+        lines, kept, unwritable = [], {}, []
         for column in pre_open:
             if column in keepers:
                 kept[column] = tuple(keepers[column])
                 continue
+            if not all(rule_name_writable(x) for x in (schema, rest, column)):
+                unwritable.append(column)
+                continue
             lines.append("exclude " + ".".join(rule_part_token(x) for x in (schema, rest, column))
                          + f"  {QUARANTINE_RULE_COMMENT}")
-        return QuarantineSuggestion("A", tuple(lines), kept)
+        return QuarantineSuggestion("A", tuple(lines), kept, unwritable=tuple(unwritable))
     pre_saved = preselect_lob_columns_for_reason(saved_c, reason_text, source_type=source_type)
     if pre_saved:
         lines = tuple(sorted({n for c in pre_saved for n in by_line.get(c, ())}))
@@ -2399,6 +2421,7 @@ def exclusion_row_summary(
     blocking_count: int = 0,
     lob_candidates: "Sequence[LobExclusionCandidate]" = (),
     measured_over: "Iterable[str]" = (),
+    migratable: "Optional[Iterable[str]]" = None,
 ) -> ExclusionRowSummary:
     """The row's variant and copy. "N tables" counts only the RULE-excluded tables (the
     tree counter stays the one selection number); ``lob_candidates`` are already scoped
@@ -2406,7 +2429,10 @@ def exclusion_row_summary(
     over-limit value (``measured_over``, "table.column") is still not excluded."""
     stored = migration_state.lob_exclusions()
     columns = sum(len(c) for c in stored.values())
-    tables = len(migration_state.rule_excluded_tables())
+    provenance = migration_state.rule_excluded_tables()
+    # Provenance outlives a table leaving the tree (so it stays excluded if it returns);
+    # the count is of the tables the tree shows.
+    tables = len(provenance & set(migratable)) if migratable is not None else len(provenance)
     counts = _count_text(tables, columns)
     lob_count = sum(len(c.columns) for c in lob_candidates)
     lob_text = None
@@ -2430,6 +2456,10 @@ def exclusion_row_summary(
         return ExclusionRowSummary("locked", text, lob_count, lob_text, lob_tone)
     if drift is not None:
         bits = []
+        if drift.error_lines or drift.global_error:
+            where = ", ".join(f"L{n}" for n in drift.error_lines)
+            bits.append(f"have lines that no longer resolve ({where})" if where
+                        else "have an error")
         if drift.added:
             names = ", ".join(f"{t}.{c}" for t, c in drift.added[:3])
             more = f" and {len(drift.added) - 3} more" if len(drift.added) > 3 else ""
@@ -2440,6 +2470,11 @@ def exclusion_row_summary(
             bits.append(f"no longer match {n} saved column{'s' if n != 1 else ''}")
         if drift.unselects or drift.reselects:
             bits.append("would change the table selection")
+        if drift.retick_columns:
+            names = ", ".join(f"{t}.{c}" for t, c in drift.retick_columns[:3])
+            more = f" and {len(drift.retick_columns) - 3} more" if len(drift.retick_columns) > 3 else ""
+            bits.append(f"exclude {names}{more} on tables ticked again after your last Save "
+                        "(not excluded now)")
         text = "Your rules now " + "; ".join(bits) + " - review"
         return ExclusionRowSummary("drift", text, lob_count, lob_text, lob_tone)
     if counts:

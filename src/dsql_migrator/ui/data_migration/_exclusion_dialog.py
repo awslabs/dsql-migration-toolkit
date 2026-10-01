@@ -172,6 +172,7 @@ def render_exclusion_button_row(ui, ctx: ExclusionDialogContext):
         summary = exclusion_row_summary(
             state, locked=lock.locked, drift=drift, block_reason=block,
             blocking_count=errors, lob_candidates=lob, measured_over=over,
+            migratable=inputs.migratable,
         )
         with ui.row().classes("items-center gap-3 w-full"):
             ui.button(
@@ -443,10 +444,15 @@ def _render_result(ui, resolution) -> None:
         if unselected:
             inline_hint(ui, f"Tables  {len(unselected)} unselected by rules ({_names(unselected)}). "
                         "Not loaded by this migration; left as is on Aurora DSQL.")
-        tables = {i.table for i in excluded}
-        inline_hint(ui, f"Columns  {len(excluded)} excluded in {len(tables)} table"
-                    f"{'s' if len(tables) != 1 else ''}, migrated as NULL."
-                    if excluded else "Columns  none excluded.")
+        overlaid = [i for i in excluded if not i.legacy]
+        omit_only = len(excluded) - len(overlaid)
+        tables = {i.table for i in overlaid}
+        text = (f"Columns  {len(overlaid)} excluded in {len(tables)} table"
+                f"{'s' if len(tables) != 1 else ''}, migrated as NULL."
+                if overlaid else "Columns  none excluded.")
+        if omit_only:
+            text += f" {omit_only} more omit-only (excluded before v0.1.562, no target change)."
+        inline_hint(ui, text)
         for item in blocked[:_SHOWN]:
             inline_hint(ui, f"(not excluded) {item.table}.{item.column} (L"
                         f"{', L'.join(str(n) for n in item.lines)})  {' '.join(item.why)}",

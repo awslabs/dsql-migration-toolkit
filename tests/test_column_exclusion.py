@@ -806,7 +806,7 @@ def test_w5_names_the_generated_column_and_escalates_when_it_is_not_null():
         (W5, "total will be computed from NULL and differ from the source.")]
     escalated = next(f for f in column_exclusion_warnings("shop.orders", "code", ctx) if f.code == W5)
     assert escalated.message == (
-        "label is NOT NULL and computed from this column: if upper((code)::text) yields NULL "
+        "label is NOT NULL and computed from this column: if UPPER(code) yields NULL "
         "when this column is NULL, every row is rejected (23502).")
     # an identifier boundary: "a" does not match inside "label" or "upper"
     assert W5 not in _wcodes(column_exclusion_warnings("shop.orders", "a", ctx))
@@ -885,3 +885,95 @@ def test_the_view_helpers_moved_to_core_unchanged():
     from dsql_migrator.ui.data_migration import _full_load_engine as engine
 
     assert engine._views_referencing is views_referencing and engine._names_in is names_in
+
+
+# --- review fixes (C05-C11 review): views by reference, W5 from the applied DDL --------
+
+
+from dsql_migrator.core.column_exclusion import T3  # noqa: E402
+
+
+def _view_ctx(tables, views, *, selected=None):
+    return build_exclusion_context(SourceInventory(tables=tables), selected_tables=selected,
+                                   view_ddls=views, warnings=True)
+
+
+def _tbl(name, *cols):
+    return TableDef(name=name, primary_key=["id"], columns=[
+        ColumnDef(name="id", mysql_type="bigint")] + [ColumnDef(name=c, mysql_type="text") for c in cols])
+
+
+def test_views_are_matched_by_what_they_read_not_by_the_bare_name():
+    tables = [_tbl("tenant1.orders", "notes"), _tbl("tenant2.orders", "notes"),
+              _tbl("shop.products", "category"), _tbl("shop.category", "name")]
+    views = {
+        "tenant2.v_orders": 'CREATE VIEW "tenant2"."v_orders" AS SELECT "tenant2"."orders"."notes" '
+                            'AS "notes" FROM "tenant2"."orders"',
+        "shop.v_products": 'CREATE VIEW "shop"."v_products" AS SELECT "shop"."products"."category" '
+                           'AS "category" FROM "shop"."products"',
+    }
+    ctx = _view_ctx(tables, views)
+    assert not any(f.code == T3 for f in table_exclusion_findings("tenant1.orders", ctx))
+    assert W6 not in _wcodes(column_exclusion_warnings("tenant1.orders", "notes", ctx))
+    assert not any(f.code == T3 for f in table_exclusion_findings("shop.category", ctx))
+    assert any(f.code == T3 for f in table_exclusion_findings("tenant2.orders", ctx))
+    assert W6 in _wcodes(column_exclusion_warnings("tenant2.orders", "notes", ctx))
+    assert views_referencing(views, frozenset({"tenant1.orders"}))  # the drop path is unchanged
+
+
+def test_the_view_scan_runs_once_per_table_not_per_column(monkeypatch):
+    from dsql_migrator.core import column_exclusion as ce
+
+    tables = [_tbl(f"s.t{i}", "x", "y") for i in range(50)]
+    views = {f"s.v{i}": f'CREATE VIEW "s"."v{i}" AS SELECT x FROM "s"."t{i}"' for i in range(20)}
+    ctx = _view_ctx(tables, views)
+    calls = {"n": 0}
+    real = ce._view_table_refs
+
+    def counting(ddl):
+        calls["n"] += 1
+        return real(ddl)
+
+    monkeypatch.setattr(ce, "_view_table_refs", counting)
+    for t in tables:
+        for c in ("x", "y"):
+            column_exclusion_warnings(t.name, c, ctx)
+    assert calls["n"] == 50 * 20  # once per (table, view), never per column
+
+
+def test_w5_reads_the_applied_expression():
+    from types import SimpleNamespace
+
+    t = TableDef(name="s.t", primary_key=["id"], columns=[
+        ColumnDef(name="id", mysql_type="bigint"), ColumnDef(name="price", mysql_type="numeric"),
+        ColumnDef(name="qty", mysql_type="integer"),
+        ColumnDef(name="total", mysql_type="numeric", generated=True,
+                  generated_expression="(price * (2)::numeric)")])
+    ddl = ('CREATE TABLE "s"."t" ("id" BIGINT NOT NULL, "price" NUMERIC, "qty" INT, '
+           '"total" NUMERIC NOT NULL GENERATED ALWAYS AS ((qty * 2)) STORED, PRIMARY KEY ("id"))')
+    ctx = build_exclusion_context(SourceInventory(tables=[t]), {"s.t": SimpleNamespace(
+        target_ddl=ddl, foreign_key_ddls=[], preserved_foreign_keys=[], index_ddls=[])}, warnings=True)
+    (w5,) = column_exclusion_warnings("s.t", "qty", ctx)
+    assert w5.code == W5 and "(qty * 2)" in w5.message and "every row is rejected (23502)" in w5.message
+    assert column_exclusion_warnings("s.t", "price", ctx) == ()
+
+
+def test_legacy_notes_replace_the_overlay_story():
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.column_exclusion import WL, WL_REJECT, legacy_exclusion_notes
+
+    t = TableDef(name="shop.acct", primary_key=["id"], columns=[
+        ColumnDef(name="id", mysql_type="bigint"), ColumnDef(name="code", mysql_type="text"),
+        ColumnDef(name="note", mysql_type="text"), ColumnDef(name="must", mysql_type="text")])
+    ddl = ('CREATE TABLE "shop"."acct" ("id" BIGINT NOT NULL, "code" TEXT NOT NULL DEFAULT \'x\', '
+           '"note" TEXT, "must" TEXT NOT NULL, PRIMARY KEY ("id"))')
+    conv = SimpleNamespace(target_ddl=ddl, foreign_key_ddls=[], preserved_foreign_keys=[],
+                           index_ddls=['CREATE UNIQUE INDEX ASYNC "u" ON "shop"."acct" ("code")'])
+    ctx = build_exclusion_context(SourceInventory(tables=[t]), {"shop.acct": conv}, warnings=True)
+    (code,) = legacy_exclusion_notes("shop.acct", "code", ctx)
+    assert code.code == WL_REJECT and "DEFAULT 'x'" in code.message and "23505" in code.message
+    (note,) = legacy_exclusion_notes("shop.acct", "note", ctx)
+    assert note.code == WL and "stores NULL" in note.message
+    (must,) = legacy_exclusion_notes("shop.acct", "must", ctx)
+    assert must.code == WL_REJECT and "23502" in must.message

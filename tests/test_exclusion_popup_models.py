@@ -195,3 +195,81 @@ def test_the_lob_line_is_info_until_a_measured_offender_is_open():
     s = exclusion_row_summary(state, locked=False, drift=None, block_reason=None,
                               lob_candidates=cands, measured_over={"shop.t.a"})
     assert s.lob_tone == "warning"
+
+
+# --- review fixes (C05-C11 review) ----------------------------------------------------
+
+
+def test_drift_survives_an_errored_line_and_reports_it():
+    state = DataMigrationState()
+    inv = SimpleNamespace(tables=[_t("shop.pages", body="longtext", summary="longtext"),
+                                  _t("shop.orders", note="text")])
+    names = [t.name for t in inv.tables]
+    inputs = _inputs(selected=names, migratable=names)
+    text = "exclude type:longtext\ninclude shop.pages.body"
+    assert state.set_column_exclusions(
+        popup_resolution(state, inv, text, inputs=inputs, source_type=MY), text=text) is None
+    grown = SimpleNamespace(tables=[_t("shop.pages", summary="longtext"),
+                                    _t("shop.orders", note="text", gift_note="longtext")])
+    drift = exclusion_drift(state, popup_resolution(state, grown, text, inputs=inputs,
+                                                    source_type=MY))
+    assert drift is not None and drift.added == (("shop.orders", "gift_note"),)
+    assert drift.error_lines == (2,)
+    s = exclusion_row_summary(state, locked=False, block_reason=None, drift=drift)
+    assert s.variant == "drift" and "no longer resolve (L2)" in s.text
+
+
+def test_drift_names_column_rules_on_a_reticked_table():
+    state = DataMigrationState()
+    inputs = _inputs()
+    text = "exclude table shop.audit_*\nexclude shop.*.x"
+    assert state.set_column_exclusions(
+        popup_resolution(state, INV, text, inputs=inputs, source_type=MY), text=text) is None
+    state.note_tree_retick(["shop.audit_1"])
+    drift = exclusion_drift(state, popup_resolution(state, INV, text, inputs=inputs,
+                                                    source_type=MY))
+    assert drift is not None and drift.retick_columns == (("shop.audit_1", "x"),)
+    assert not drift.unselects
+    s = exclusion_row_summary(state, locked=False, block_reason=None, drift=drift)
+    assert "shop.audit_1.x" in s.text and "ticked again" in s.text
+
+
+def test_the_table_count_is_of_tables_the_tree_shows():
+    state = DataMigrationState()
+    state.restore_exclusion_rules("exclude table shop.audit_*", ["shop.audit_1", "shop.gone"])
+    s = exclusion_row_summary(state, locked=False, drift=None, block_reason=None,
+                              migratable=NAMES)
+    assert s.text == "Rules exclude 1 table"
+
+
+def test_a_quarantine_column_whose_name_breaks_a_line_gets_no_rule():
+    s = quarantine_rule_suggestion("shop.t", "... for text", (("a\nb", "longtext"), ("c", "longtext")),
+                                   open_excluded=set(), saved_excluded=set())
+    assert s.outcome == "A" and s.unwritable == ("a\nb",)
+    assert s.lines == ("exclude shop.t.c  # from the Full Load quarantine",)
+    state = DataMigrationState()
+    assert not state.add_pending_rule('exclude shop.t."a\nb"')
+
+
+def test_a_retick_survives_a_snapshot_round_trip():
+    from dsql_migrator.core.session_state_store import SessionSnapshot
+    from dsql_migrator.ui.evaluation import EvaluationState
+    from dsql_migrator.ui.schema_conversion import SchemaConversionState
+    from dsql_migrator.ui.session import SessionConnectionState
+    from dsql_migrator.ui.session_persistence import apply_session_snapshot, capture_session_snapshot
+
+    state = DataMigrationState()
+    inputs = _inputs()
+    text = "exclude table shop.audit_*"
+    assert state.set_column_exclusions(
+        popup_resolution(state, INV, text, inputs=inputs, source_type=MY), text=text) is None
+    state.note_tree_retick(["shop.audit_1"])
+    snap = capture_session_snapshot("s1", SessionConnectionState(), EvaluationState(),
+                                    SchemaConversionState(), state)
+    restored = DataMigrationState()
+    apply_session_snapshot(SessionSnapshot.model_validate_json(snap.model_dump_json()),
+                           SessionConnectionState(), EvaluationState(), SchemaConversionState(),
+                           restored)
+    assert restored.rule_reticked_tables() == {"shop.audit_1"}
+    assert exclusion_drift(restored, popup_resolution(restored, INV, text, inputs=inputs,
+                                                      source_type=MY)) is None
