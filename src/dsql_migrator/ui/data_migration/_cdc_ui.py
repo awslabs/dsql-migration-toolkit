@@ -5605,7 +5605,10 @@ def _start_cdc_deploy(
     # The stack value the exclusion-mismatch refusal judged: the job refuses if the LIVE
     # stack carries another one by the time it runs (another session started it).
     params = params.model_copy(
-        update={"column_exclude_seen": migration_state.cdc_deployed_column_exclude_list}
+        update={
+            "column_exclude_seen": migration_state.cdc_deployed_column_exclude_list,
+            "column_exclude_judged": True,
+        }
     )
     migration_state.clear_cdc_deploy_log()
     stack_name = migration_state.cdc_stack_name
@@ -5678,6 +5681,24 @@ def _start_cdc_deploy(
                 detail=_pg_block[1],
             )
             raise RuntimeError(f"Start CDC blocked: {_pg_block[0]}. {_pg_block[1]}")
+        deployer = build_cdc_stack_deployer(
+            region, aws_profile=aws_profile, assume_role_arn=assume_role_arn
+        )
+        # The exclusion-set staleness checks BEFORE anything changes (the overlay below
+        # ALTERs the target and writes the ledger): judged against a fresh describe here,
+        # and again by run_cdc_start against its own.
+        from dsql_migrator.core.cdc import apply_column_exclude_chooser, column_exclude_seen_refusal
+
+        _describe = getattr(deployer, "describe_stack_or_none", None)
+        _pre = _describe(stack_name) if callable(_describe) else None
+        _pre_params = getattr(_pre, "current_parameters", None)
+        _seen_refusal = column_exclude_seen_refusal(params, _pre_params)
+        if _seen_refusal:
+            _log_cdc_event(
+                "start blocked: excluded columns changed", status=ActivityStatus.FAILURE,
+                detail=_seen_refusal,
+            )
+            raise RuntimeError(f"Start CDC blocked: {_seen_refusal}")
         # The column-exclusion overlay: every captured excluded column nullable with no
         # DEFAULT (recorded first) BEFORE any connector is created or changed, so every row
         # CDC writes holds NULL there. Covers Retry CDC and a re-Start after Stop; a no-op
@@ -5685,9 +5706,6 @@ def _start_cdc_deploy(
         _apply_start_cdc_overlay(handle, **_overlay_plan)
         if getattr(handle, "cancelled", False):
             return
-        deployer = build_cdc_stack_deployer(
-            region, aws_profile=aws_profile, assume_role_arn=assume_role_arn
-        )
         # The cdc-stack template exceeds CFn's 51,200-byte inline limit, so the deployer
         # stages it in S3 via TemplateURL. Derive the bucket name from the deterministic
         # naming convention (same bucket the infra deploy created).
@@ -5731,6 +5749,11 @@ def _start_cdc_deploy(
             ),
             pg_source_password=getattr(session, "source_password", None),
         )
+        # This Start just sent this value: it IS the stack's value now, so a Retry before
+        # the next probe is judged against it (not the pre-Start one it replaced).
+        _sent = dict(apply_column_exclude_chooser(params, _pre_params).filled).get("ColumnExcludeList")
+        if _sent is not None:
+            migration_state.set_cdc_deployed_column_exclude_list(_sent)
 
     _action = "start CDC connectors"
     # The RESUME POINT is the fact this line exists for: it is what makes the Full

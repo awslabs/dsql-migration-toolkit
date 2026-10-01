@@ -270,11 +270,17 @@ def test_start_cdc_refuses_when_the_live_stack_value_changed_since_the_screen_re
     from dsql_migrator.core.cdc import CdcStackParams
     from dsql_migrator.ui.data_migration import _cdc_ui
 
-    assert "column_exclude_seen" in CdcStackParams.model_fields
+    assert {"column_exclude_seen", "column_exclude_judged"} <= set(CdcStackParams.model_fields)
     src = inspect.getsource(cdc_deployer.run_cdc_start)
-    assert src.index("params.column_exclude_seen") < src.index("apply_column_exclude_chooser(params")
-    assert '"column_exclude_seen": migration_state.cdc_deployed_column_exclude_list' in inspect.getsource(
-        _cdc_ui._start_cdc_deploy)
+    assert src.index("column_exclude_seen_refusal(params") < src.index("apply_column_exclude_chooser(params")
+    job = inspect.getsource(_cdc_ui._start_cdc_deploy)
+    assert '"column_exclude_seen": migration_state.cdc_deployed_column_exclude_list' in job
+    assert '"column_exclude_judged": True' in job
+    # judged BEFORE the overlay ALTERs the target (review round 3)
+    assert job.index("column_exclude_seen_refusal(params, _pre_params)") < job.index(
+        "_apply_start_cdc_overlay(handle")
+    # the value this Start sent becomes the known stack value
+    assert "set_cdc_deployed_column_exclude_list(_sent)" in job
 
 
 def test_run_cdc_start_refuses_a_stack_value_that_changed_since_the_ui_judged_it():
@@ -366,6 +372,94 @@ def test_run_cdc_start_fails_closed_when_the_screen_never_read_a_started_stacks_
                                                "DeploySink": "true", "MskBootstrapServers": ""})
     with pytest.raises(CdcDeployError, match="could not read the CDC stack's excluded columns"):
         run_cdc_start(_FakeHandle(), stack_name="mysql-dsql-cdc-stack",
-                      params=_start_params().model_copy(update={"column_exclude_seen": None}),
+                      params=_start_params().model_copy(
+                          update={"column_exclude_seen": None, "column_exclude_judged": True}),
                       deployer=deployer, on_log=lambda ts, m: None, sleep=lambda _s: None,
                       connector_timeout_seconds=5.0, poll_interval_seconds=0.0)
+    # a caller that does not judge (a library / e2e script) is not refused
+    run_cdc_start(_FakeHandle(), stack_name="mysql-dsql-cdc-stack", params=_start_params(),
+                  deployer=_FakeDeployer(connector_states={SRC: ["RUNNING"], SINK: ["RUNNING"]},
+                                         discovery_params={**base, "ColumnExcludeList": "shop.docs.body",
+                                                           "DeploySink": "true", "MskBootstrapServers": ""}),
+                  on_log=lambda ts, m: None, sleep=lambda _s: None,
+                  connector_timeout_seconds=5.0, poll_interval_seconds=0.0)
+
+
+
+def test_a_start_over_during_the_target_read_adopts_nothing():
+    """Review round 3: Start over re-runs __init__ on the same state while the adoption reads
+    the target; the locked re-check now proves it is still the same attach."""
+    inv = _inventory()
+    state = _attached()
+
+    def _reset_mid_read(tables, columns):
+        state.__init__()  # Start over -> reset_in_place
+        return _facts()(tables, columns)
+
+    assert adopt_deployed_exclusions_if_safe(state, _session(), inv, facts_reader=_reset_mid_read) is None
+    assert not state.lob_exclusions()
+
+
+def test_an_empty_table_a_live_stack_can_write_is_judged_per_column():
+    """Review round 3: an empty table is 'nothing to be inconsistent with' only if nothing
+    writes to it first -- with connectors the stream can, so NOT NULL / DEFAULT stays omit-only."""
+    inv = _inventory()
+    state = _attached(phase="running")
+    state.cdc_connector_names = ["dsql-cdc-p2live-debezium-source"]
+    assert adopt_deployed_exclusions_if_safe(
+        state, _session(), inv, facts_reader=_facts(rows=False, nullable_no_default=False))
+    assert {t: sorted(c) for t, c in state.legacy_exclusions().items()} == LIVE_COLUMNS
+
+
+def test_a_restored_default_is_overlay_when_the_ledger_records_it():
+    """Review round 3: after a cut-over DEFAULT restore the column is nullable WITH a DEFAULT
+    on a table holding rows -- the ledger says it was overlaid; unreadable -> adopt nothing."""
+    from dsql_migrator.core.target_introspector import ColumnNullFacts, TableOverlayFacts
+
+    inv = _inventory()
+
+    def _restored(tables, columns_by_table):
+        return {t: TableOverlayFacts(True, True, None, {
+            c: ColumnNullFacts(not_null=False, default_expr="''::text") for c in columns_by_table[t]})
+            for t in tables}
+
+    class _Ledger:
+        def __init__(self, status="present"):
+            self.status = status
+
+        def read(self, _key):
+            return SimpleNamespace(status=self.status, tables={
+                t: SimpleNamespace(set_columns=list(c), columns=[]) for t, c in LIVE_COLUMNS.items()})
+
+    import dsql_migrator.core.overlay_ledger as ol
+
+    orig = ol.overlay_ledger_key
+    ol.overlay_ledger_key = lambda _t: "k"
+    try:
+        covered = _attached()
+        covered.overlay_ledger = _Ledger()
+        assert adopt_deployed_exclusions_if_safe(covered, _session(), inv, facts_reader=_restored)
+        assert not covered.legacy_exclusions()
+        unreadable = _attached()
+        unreadable.overlay_ledger = _Ledger("unreadable")
+        assert adopt_deployed_exclusions_if_safe(unreadable, _session(), inv, facts_reader=_restored) is None
+        assert not unreadable.lob_exclusions()
+    finally:
+        ol.overlay_ledger_key = orig
+
+
+def test_a_failed_probe_makes_the_stack_value_unknown():
+    state = _attached()
+    state.set_cdc_probe_error("throttled")
+    assert state.cdc_deployed_column_exclude_list is None
+
+
+def test_full_load_plus_cdc_refuses_a_load_under_a_set_a_streamed_stack_does_not_carry():
+    """Live (Session C): a Full load + CDC session ticking a different set and attaching the
+    stack had Start CDC refused only AFTER its Full Load could run under that set."""
+    import inspect
+
+    import dsql_migrator.ui.data_migration as dm
+
+    src = inspect.getsource(dm.data_migration_exclusion_block)
+    assert "capture_exclusion_mismatch(migration_state, inventory, capture, tables)" in src

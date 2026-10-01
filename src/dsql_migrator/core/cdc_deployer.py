@@ -66,6 +66,7 @@ from dsql_migrator.core.cdc import (
     CdcInfraParams,
     CdcStackParams,
     apply_column_exclude_chooser,
+    column_exclude_seen_refusal,
     build_watermark_params,
     legacy_column_exclude_key_conflicts,
     cdc_expected_connector_names,
@@ -1272,28 +1273,9 @@ def run_cdc_start(
         # The UI judged the exclusion set against the stack value its last probe read; a
         # LIVE value that differs means another session started or redeployed the stack
         # since, and sending this session's set could change capture mid-stream.
-        _current = discovery.current_parameters or {}
-        _seen = params.column_exclude_seen
-        _live = _current.get("ColumnExcludeList")
-        if _seen is not None and _live is not None and str(_live) != _seen:
-            raise CdcDeployError(
-                "The CDC stack's excluded columns changed since this screen read them "
-                "(another session started or redeployed it). No connectors were changed. "
-                "Reopen the CDC step so it re-reads the stack, then Start CDC again."
-            )
-        # Nothing judged (the screen never read the stack's value -- its probe failed) over
-        # a stack that was started with excluded columns: fail closed rather than send this
-        # session's set unchecked.
-        _started = str(_current.get("DeploySink", "")).lower() == "true" or bool(
-            str(_current.get("MskBootstrapServers", "") or "").strip()
-        )
-        if _seen is None and _live and _started:
-            raise CdcDeployError(
-                "This screen could not read the CDC stack's excluded columns, and the stack "
-                "has been started with some, so Start CDC cannot tell whether it would change "
-                "what CDC captures. No connectors were changed. Re-check the CDC state on the "
-                "CDC step, then Start CDC again."
-            )
+        _seen_refusal = column_exclude_seen_refusal(params, discovery.current_parameters)
+        if _seen_refusal:
+            raise CdcDeployError(_seen_refusal)
         # A stack deployed with the 0.1.561 ColumnExcludeList keeps it byte-for-byte, so
         # a running pipeline is not updated by this release; judged against THIS describe.
         params = apply_column_exclude_chooser(params, discovery.current_parameters)

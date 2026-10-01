@@ -452,7 +452,10 @@ def _drive_start_cdc(monkeypatch, *, overlay_raises=False, run_raises=False, bac
 def test_the_overlay_runs_after_the_backstops_and_before_the_deployer(monkeypatch):
     order, error = _drive_start_cdc(monkeypatch)
     assert error is None
-    assert order == ["classify", "on_cdc_start", "submit", "fk", "overlay", "deployer", "run_cdc_start",
+    # The deployer is built (and describes the stack) BEFORE the overlay, so the
+    # exclusion-set staleness refusal runs before anything changes; connectors are only
+    # created by run_cdc_start, after the overlay.
+    assert order == ["classify", "on_cdc_start", "submit", "fk", "deployer", "overlay", "run_cdc_start",
                      "on_cdc_start"]
 
 
@@ -465,7 +468,7 @@ def test_a_start_with_overlay_columns_marks_the_ledger_in_use_before_submit(monk
 
 def test_a_cancel_during_the_overlay_creates_no_connector(monkeypatch):
     order, error = _drive_start_cdc(monkeypatch, cancel_in_overlay=True)
-    assert error is None and "deployer" not in order and "run_cdc_start" not in order
+    assert error is None and "run_cdc_start" not in order  # no connector created or changed
     assert order[-1] == "on_cdc_start"
 
 
@@ -475,7 +478,7 @@ def test_on_cdc_start_runs_in_the_finally_whatever_fails(monkeypatch, case):
                                     backstop_raises=case == "backstop")
     assert error is not None and order[-1] == "on_cdc_start" and order[:2] == ["classify", "on_cdc_start"]
     if case == "overlay":
-        assert "deployer" not in order and "run_cdc_start" not in order  # nothing created or changed
+        assert "run_cdc_start" not in order  # nothing created or changed
 
 
 # ---------------------------------------------------------------------------

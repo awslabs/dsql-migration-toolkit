@@ -246,6 +246,7 @@ from dsql_migrator.ui.data_migration._models import (
     stored_exclusion_issues,
     exclusion_refusal,
     missing_column_block_reason,
+    capture_exclusion_mismatch,
     cdc_capture_exclusions,
     exclusion_scope,
     ExclusionInputs,
@@ -3121,8 +3122,16 @@ def data_migration_exclusion_block(
     # then the lock's own (delete, change, redeploy), which is still possible pre-load.
     if capture is None:
         capture = _pre_load_capture(migration_state, inventory)
-    if capture is None or not capture.error:
+    if capture is None:
         return None
+    if not capture.error:
+        # An attached stack that streamed with another set: the load would write under
+        # this session's set, then Start CDC refuses it (capture_exclusion_mismatch) --
+        # refuse here, before the load, where the same remedy still applies.
+        scope = exclusion_scope(migration_state)
+        wanted = None if scope is None else set(scope)
+        tables = [t for t in inventory.tables if wanted is None or t.name in wanted]
+        return capture_exclusion_mismatch(migration_state, inventory, capture, tables)
     # When the generated columns alone exceed the limit, no exclusion change fixes it and
     # 0.1.561 let this load run: warn on the card (capture_pre_load_notices), do not hold.
     if capture.generated_bytes > CDC_PARAMETER_BYTE_LIMIT:

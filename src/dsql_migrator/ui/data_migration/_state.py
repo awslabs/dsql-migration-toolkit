@@ -551,6 +551,9 @@ class DataMigrationState:
         columns: "Mapping[str, Sequence[str]]",
         *,
         legacy_columns: "Mapping[str, Sequence[str]]" = (),
+        expect_stack: "Optional[str]" = None,
+        expect_value: "Optional[str]" = None,
+        startable_phases: "Sequence[str]" = (),
     ) -> bool:
         """Take an attached cdc-stack's excluded columns as this session's, in one step.
 
@@ -569,6 +572,18 @@ class DataMigrationState:
             if getattr(self, "cdc_deploy_job_id", None):
                 return False
             if any(self._excluded_lob_columns.values()):
+                return False
+            # Still the SAME attach the caller decided on: a Start over (or another
+            # Attach) during its slow reads reset the stack name / value / phase.
+            if expect_stack is not None and self.cdc_stack_name != expect_stack:
+                return False
+            if expect_value is not None and self.cdc_deployed_column_exclude_list != expect_value:
+                return False
+            if startable_phases and (
+                self.cdc_stack_phase not in startable_phases
+                or not self.cdc_stack_phase_checked
+                or getattr(self, "cdc_teardown_job_id", None)
+            ):
                 return False
             adopted = {t: set(c) for t, c in (columns or {}).items() if c}
             if not adopted:
@@ -997,6 +1012,11 @@ class DataMigrationState:
         """
         with self._lock:
             self.cdc_probe_error = str(message)[:300] if message else None
+            if message:
+                # A failed probe makes the cached stack exclusion value unknown: judged as
+                # "could not read" (re-check), never as an old value Start would refuse
+                # with a destructive remedy.
+                self.cdc_deployed_column_exclude_list = None
 
     def set_cdc_has_committed_offset(self, value: bool) -> None:
         """Cache whether the probed cdc-stack already holds a committed resume offset.

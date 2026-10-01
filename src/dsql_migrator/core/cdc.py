@@ -1547,6 +1547,10 @@ class CdcStackParams(BaseModel):
     # probe's value). Start CDC refuses when the LIVE stack carries another value by the
     # time it runs. ``None``: not judged (no value was known), nothing to compare.
     column_exclude_seen: Optional[str] = None
+    # True when a UI judged the exclusion set (then ``column_exclude_seen is None`` means
+    # it could NOT read the stack's value, and a started stack is refused fail-closed).
+    # Library callers that do not judge leave it False.
+    column_exclude_judged: bool = False
 
 
 # CloudFormation caps one parameter VALUE at 4,096 bytes, and ColumnExcludeList is one
@@ -1872,6 +1876,39 @@ def infer_column_exclusions(
         for table, column in hits:
             found.setdefault(table, set()).add(column)
     return {table: sorted(columns) for table, columns in sorted(found.items())}
+
+
+def column_exclude_seen_refusal(
+    params: "CdcStackParams", current_parameters: "Optional[Mapping[str, object]]"
+) -> "Optional[str]":
+    """Why Start CDC must not proceed against the LIVE stack parameters, or ``None``.
+
+    The UI judged the exclusion set against the stack value its last probe read
+    (``column_exclude_seen``). A live value that differs means another session started or
+    redeployed the stack since; a judging UI that could not read any value over a stack
+    that was started with excluded columns cannot tell either. Checked BEFORE anything is
+    changed (the Start job's overlay) and again by the deployer. Pure.
+    """
+    current = current_parameters or {}
+    seen = params.column_exclude_seen
+    live = current.get("ColumnExcludeList")
+    if seen is not None and live is not None and str(live) != seen:
+        return (
+            "The CDC stack's excluded columns changed since this screen read them "
+            "(another session started or redeployed it). Nothing was changed. Reopen the "
+            "CDC step so it re-reads the stack, then Start CDC again."
+        )
+    started = str(current.get("DeploySink", "")).lower() == "true" or bool(
+        str(current.get("MskBootstrapServers", "") or "").strip()
+    )
+    if params.column_exclude_judged and seen is None and live and started:
+        return (
+            "This screen could not read the CDC stack's excluded columns, and the stack has "
+            "been started with some, so Start CDC cannot tell whether it would change what "
+            "CDC captures. Nothing was changed. Re-check the CDC state on the CDC step, then "
+            "Start CDC again."
+        )
+    return None
 
 
 def choose_column_exclude_value(

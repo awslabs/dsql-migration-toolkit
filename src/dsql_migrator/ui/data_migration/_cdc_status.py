@@ -1213,22 +1213,50 @@ def adopt_deployed_exclusions_if_safe(
     except Exception:  # noqa: BLE001 - unreadable target: retry at the next discovery
         _logger.warning("Reading the target for the stack's excluded columns failed", exc_info=True)
         return None
+    # An EMPTY table is only "nothing to be inconsistent with" if nothing can write to it
+    # before this session's own run applies the overlay: a stack with connectors can.
+    can_write = bool(getattr(migration_state, "cdc_connector_names", None)) or phase in (
+        "running", "partial"
+    )
+    ledger_tables = None  # read lazily, only for a nullable column with a DEFAULT
     omit_only: dict[str, list[str]] = {}
     for table, cols in deployed.columns.items():
         table_facts = (facts or {}).get(table)
         if table_facts is None:
             return None  # unknown: never guess
-        if not table_facts.exists or table_facts.has_rows is False:
+        if not table_facts.exists:
             continue
         if table_facts.has_rows is None:
             return None
+        if table_facts.has_rows is False and not can_write:
+            continue
         for column in cols:
             col = (table_facts.columns or {}).get(column)
             if col is None or col.generated or col.identity:
                 continue
-            if col.not_null or col.default_expr is not None:
-                omit_only.setdefault(table, []).append(column)
-    if not migration_state.adopt_deployed_exclusions(deployed.columns, legacy_columns=omit_only):
+            if not col.not_null and col.default_expr is None:
+                continue  # already nullable with no DEFAULT: overlay changes nothing
+            if not col.not_null and table_facts.has_rows:
+                # Nullable WITH a DEFAULT on a table holding rows: what a cut-over DEFAULT
+                # restore leaves behind an overlay. The ledger says which.
+                if ledger_tables is None:
+                    ledger_tables = _ledger_tables(migration_state, session)
+                    if ledger_tables is None:
+                        return None  # unreadable: never guess
+                record = ledger_tables.get(table)
+                if record is not None and (
+                    column in set(record.set_columns)
+                    or any(c.column == column for c in record.columns)
+                ):
+                    continue
+            omit_only.setdefault(table, []).append(column)
+    if not migration_state.adopt_deployed_exclusions(
+        deployed.columns,
+        legacy_columns=omit_only,
+        expect_stack=getattr(migration_state, "cdc_stack_name", None),
+        expect_value=getattr(migration_state, "cdc_deployed_column_exclude_list", None),
+        startable_phases=_ADOPTABLE_PHASES,
+    ):
         return None
     flat = [f"{t}.{c}" for t, cols in sorted(deployed.columns.items()) for c in cols]
     detail = (
@@ -1249,6 +1277,24 @@ def adopt_deployed_exclusions_if_safe(
             "DEFAULT -- and a NOT NULL column with no DEFAULT rejects the row"
         )
     return detail
+
+
+def _ledger_tables(migration_state, session):
+    """The target's overlay ledger records ``{table: record}`` (``{}`` when none), or
+    ``None`` when it cannot be read. BLOCKING."""
+    ledger = getattr(migration_state, "overlay_ledger", None)
+    target = getattr(session, "target_config", None)
+    if ledger is None or target is None:
+        return {}
+    try:
+        from dsql_migrator.core.overlay_ledger import overlay_ledger_key
+
+        read = ledger.read(overlay_ledger_key(target))
+    except Exception:  # noqa: BLE001 - unreadable
+        return None
+    if read.status == "unreadable":
+        return None
+    return dict(read.tables or {})
 
 
 def _target_overlay_facts_reader(session):
