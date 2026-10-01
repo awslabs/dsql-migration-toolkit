@@ -85,3 +85,37 @@ def test_assert_default_restored(monkeypatch):
     h.assert_default_restored(conn, "s.orders", "notes", "'active'::text")
     with pytest.raises(AssertionError, match="expected"):
         h.assert_default_restored(conn, "s.orders", "notes", "'other'::text")
+
+
+# --- P3-C24: --exclude-rules ----------------------------------------------------------------
+
+
+def test_a_rules_file_gives_the_same_columns_and_capture_value_as_the_column_list():
+    tables = _tables()
+    from_list = h.parse_exclude_columns(["s.orders.notes"])
+    from_rules = h.resolve_rules_file("exclude s.orders.notes  # why", tables)
+    assert from_rules == from_list
+    assert h.cdc_column_exclude_list(from_rules, tables) == h.cdc_column_exclude_list(from_list, tables)
+    assert h.merge_exclusions(from_list, {"s.orders": {"id"}}) == {"s.orders": frozenset({"notes", "id"})}
+
+
+def test_a_broken_rules_file_is_refused_before_any_connection_naming_the_line(tmp_path):
+    path = tmp_path / "rules.txt"
+    path.write_text("exclude s.orders.notes\nexlcude s.orders.id\n", encoding="utf-8")
+    text = h.read_rules_file(str(path))
+    (problem,) = h.check_rules_file(text)
+    assert problem.startswith('L2 "exlcude s.orders.id": Unknown first word')
+    with pytest.raises(ValueError, match='L1 "exclude s.nosuch.x": No table "nosuch"'):
+        h.resolve_rules_file("exclude s.nosuch.x", _tables())
+    with pytest.raises(ValueError, match="table rules are not supported"):
+        h.resolve_rules_file("exclude table s.orders", _tables() + [
+            TableDef(name="s.other", primary_key=["id"], columns=[ColumnDef(name="id", mysql_type="int")])])
+
+
+def test_the_harnesses_take_exclude_rules():
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "scripts"
+    for name in ("run_full_load_harness.py", "run_pg_cdc_e2e.py"):
+        text = (root / name).read_text(encoding="utf-8")
+        assert '"--exclude-rules"' in text and "check_rules_file(" in text, name

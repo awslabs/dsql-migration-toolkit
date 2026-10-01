@@ -10,7 +10,10 @@ before the first write (``overlay_columns``), with the dropped DEFAULTs recorded
 an overlay ledger. The harness always builds a LOCAL SQLite ledger for that -- the engine
 refuses an overlay with no ledger ("no overlay ledger configured").
 
-The rule-based grammar (``--exclude-rules``) arrives with P3; this is the plain list.
+``--exclude-rules FILE`` takes the popup's rule language instead (or as well): the file
+is syntax-checked before any connection (:func:`check_rules_file`), then resolved against
+the loaded tables through the SAME resolver and context as the UI
+(:func:`resolve_rules_file`). Table rules are refused: a harness loads a fixed table set.
 """
 
 from __future__ import annotations
@@ -44,6 +47,78 @@ def parse_exclude_columns(
                 table = f"{schema}.{table}"
             out.setdefault(table, set()).add(column)
     return {table: frozenset(columns) for table, columns in out.items()}
+
+
+def _rule_errors(text: str, errors, global_errors=()) -> "list[str]":
+    lines = (text or "").split("\n")
+    out = []
+    for number in sorted(errors):
+        quoted = lines[number - 1].strip() if 0 < number <= len(lines) else ""
+        for error in errors[number]:
+            out.append(f'L{number} "{quoted}": {error.message}')
+    out.extend(e.message for e in global_errors)
+    return out
+
+
+def read_rules_file(path: "Optional[str]") -> "Optional[str]":
+    """The rules file's text, or ``None`` without one."""
+    if not path:
+        return None
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
+
+
+def check_rules_file(text: "Optional[str]") -> "list[str]":
+    """Syntax problems (E1) of a rules text, naming each line: checked BEFORE any
+    connection, so a typo never costs a source introspection."""
+    if not text:
+        return []
+    from dsql_migrator.core.exclusion_rules import parse_rules
+
+    _rules, errors = parse_rules(text)
+    return _rule_errors(text, errors)
+
+
+def resolve_rules_file(
+    text: "Optional[str]", tables: Sequence, *, source_type=None, applied=None
+) -> "dict[str, frozenset[str]]":
+    """``{table: columns}`` the rules exclude over ``tables``, resolved exactly as the
+    popup resolves them (the same core resolver and exclusion context: blocked columns
+    are never excluded). Raises ``ValueError`` naming every problem; table rules are
+    refused (the harness loads a fixed table set)."""
+    if not text:
+        return {}
+    from dsql_migrator.core.column_exclusion import build_exclusion_context
+    from dsql_migrator.core.exclusion_rules import resolve_exclusion_rules
+    from dsql_migrator.core.models import SourceInventory, SourceType
+
+    tables = list(tables)
+    inventory = SourceInventory(tables=tables)
+
+    def factory(selected, focus):
+        return build_exclusion_context(inventory, applied, selected_tables=selected,
+                                       focus_tables=focus)
+
+    resolution = resolve_exclusion_rules(
+        text, migratable=tables, source_type=source_type or SourceType.MYSQL,
+        effective_selection=[t.name for t in tables], context_factory=factory,
+        applied_conversions=applied,
+    )
+    problems = _rule_errors(text, resolution.errors, resolution.global_errors)
+    if resolution.selected_after is not None:
+        problems.append("table rules are not supported here: the harness loads a fixed "
+                        "table set")
+    if problems:
+        raise ValueError("; ".join(problems))
+    return {t: frozenset(c) for t, c in resolution.columns.items()}
+
+
+def merge_exclusions(*sets: "Mapping[str, Iterable[str]]") -> "dict[str, frozenset[str]]":
+    out: dict[str, set[str]] = {}
+    for one in sets:
+        for table, columns in (one or {}).items():
+            out.setdefault(table, set()).update(columns)
+    return {t: frozenset(c) for t, c in out.items() if c}
 
 
 def check_exclusions(excluded: "Mapping[str, Iterable[str]]", tables: Sequence) -> list[str]:
@@ -144,7 +219,11 @@ __all__ = [
     "assert_excluded_null",
     "cdc_column_exclude_list",
     "check_exclusions",
+    "check_rules_file",
     "local_overlay_ledger",
+    "merge_exclusions",
     "overlay_input_fields",
     "parse_exclude_columns",
+    "read_rules_file",
+    "resolve_rules_file",
 ]

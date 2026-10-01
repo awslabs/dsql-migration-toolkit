@@ -382,7 +382,7 @@ def stage_full_load(args) -> None:
         "target types.")
     from _exclusion_harness import check_exclusions, local_overlay_ledger, overlay_input_fields
 
-    excluded = getattr(args, "excluded", {}) or {}
+    excluded = _args_excluded(args, tables)
     problems = check_exclusions(excluded, tables)
     if problems:
         raise SystemExit("ERROR: --exclude-columns: " + "; ".join(problems))
@@ -492,16 +492,37 @@ def _table_conversions(tables, verbose: bool = False) -> dict:
     return conversions
 
 
-def _build_pg_configs(allow_empty_sink, excluded=None):
+def _args_excluded(args, tables) -> dict:
+    """``--exclude-columns`` plus the ``--exclude-rules`` file resolved over ``tables``
+    (the same resolver as the popup); computed once per run."""
+    from _exclusion_harness import merge_exclusions, resolve_rules_file
+    from dsql_migrator.core.models import SourceType
+
+    cached = getattr(args, "_excluded_resolved", None)
+    if cached is not None:
+        return cached
+    try:
+        from_rules = resolve_rules_file(getattr(args, "exclude_rules_text", None), tables,
+                                        source_type=SourceType.POSTGRES)
+    except ValueError as exc:
+        raise SystemExit(f"ERROR: --exclude-rules: {exc}") from None
+    merged = merge_exclusions(getattr(args, "excluded", {}) or {}, from_rules)
+    args._excluded_resolved = merged
+    return merged
+
+
+def _build_pg_configs(allow_empty_sink, excluded=None, args=None):
     """Return (pg_source_config, sink_config, tables) built via the tool's dispatch.
 
     ``excluded`` ({table: columns}) becomes the connector's ``column.exclude.list``,
-    formatted as the UI sends it."""
+    formatted as the UI sends it; with ``args`` it is the run's resolved set."""
     from dsql_migrator.core.cdc import CDC_DEFAULT_DLQ_TOPIC, CdcPipelineOrchestrator
     from dsql_migrator.core.cdc_postgres import dispatch_source_config
     from dsql_migrator.core.models import SourceType
 
     _inventory, _wanted, tables = _introspect_tables()
+    if args is not None:
+        excluded = _args_excluded(args, tables)
     watermark = _load_watermark()
     from _exclusion_harness import cdc_column_exclude_list
 
@@ -560,7 +581,7 @@ def stage_deploy_infra(args) -> None:
 
     rg = region()
     source_config, sink_config, tables, watermark = _build_pg_configs(
-        allow_empty_sink=True, excluded=getattr(args, "excluded", None))
+        allow_empty_sink=True, args=args)
 
     dsql_client = build_dsql_client(_profile(), rg)
     dsql_cluster_arn = fetch_dsql_cluster_arn(dsql_client, cfg("TARGET_ENDPOINT"))
@@ -780,7 +801,7 @@ def stage_start_cdc(args) -> None:
         "DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR set at deploy-infra time).")
 
     source_config, sink_config, tables, watermark = _build_pg_configs(
-        allow_empty_sink=False, excluded=getattr(args, "excluded", None))
+        allow_empty_sink=False, args=args)
     params = dispatch_cdc_stack_params(
         source_config, sink_config,
         target_endpoint=cfg("TARGET_ENDPOINT"),
@@ -793,7 +814,7 @@ def stage_start_cdc(args) -> None:
     deployer = _deployer()
     log(f"Starting CDC on '{STACK_NAME}' (PG source, SeedMode=External) …")
 
-    excluded = getattr(args, "excluded", {}) or {}
+    excluded = _args_excluded(args, tables)
 
     def work(handle) -> None:
         if excluded:
@@ -886,7 +907,7 @@ def stage_validate(args) -> None:
 
     inventory, _wanted, tables = _introspect_tables()
     val_inventory = inventory.model_copy(update={"tables": tables})
-    excluded = getattr(args, "excluded", {}) or {}
+    excluded = _args_excluded(args, tables)
     proof: dict = {}
     if excluded:
         # The same ONE live catalog read the Validation screen makes: absent / computed
@@ -1004,18 +1025,31 @@ def main() -> int:
                     help="seconds to await wal_level=logical (0 = check once)")
     ap.add_argument("--workload-rows", type=int, default=5,
                     help="INSERT rows for the workload stage")
-    from _exclusion_harness import DEFAULT_LEDGER_PATH, parse_exclude_columns
+    from _exclusion_harness import (
+        DEFAULT_LEDGER_PATH,
+        check_rules_file,
+        parse_exclude_columns,
+        read_rules_file,
+    )
 
     ap.add_argument("--exclude-columns", action="append", default=[],
                     help="table.col[,table.col...]: excluded, NULL on Aurora DSQL "
                     "(repeatable; pass the same set to every stage)")
+    ap.add_argument("--exclude-rules", default=None,
+                    help="a file in the exclusion rule language (as the popup); pass the "
+                    "same file to every stage")
     ap.add_argument("--overlay-ledger", default=DEFAULT_LEDGER_PATH,
                     help="local SQLite ledger of dropped DEFAULTs (with --exclude-columns)")
     args = ap.parse_args()
     try:
         args.excluded = parse_exclude_columns(args.exclude_columns, schema=SCHEMA)
-    except ValueError as exc:
+        args.exclude_rules_text = read_rules_file(args.exclude_rules)
+    except (ValueError, OSError) as exc:
         log(f"ERROR: {exc}")
+        return 2
+    syntax = check_rules_file(args.exclude_rules_text)
+    if syntax:  # before any connection
+        log("ERROR: --exclude-rules: " + "; ".join(syntax))
         return 2
 
     order = list(STAGES)
