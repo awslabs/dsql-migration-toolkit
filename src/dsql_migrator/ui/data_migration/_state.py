@@ -208,6 +208,9 @@ class DataMigrationState:
         # The popup's last resolution (key, held inputs, result): the row and the popup
         # re-resolve only when an input changed. Transient.
         self._exclusion_resolution_memo: Optional[tuple] = None
+        # Measured value sizes, "table.column" -> ("over" | "ok", when): from the
+        # prerequisite run's SOURCE_VALUE_SIZE answers or the popup's Check sizes. Transient.
+        self._value_size_cache: dict[str, tuple[str, datetime]] = {}
         # Composite-PK record-key override for CDC, keyed by db.table -> target key
         # columns [leading, pk...]. Set from the applied Schema Conversion when a
         # table's DSQL target has a composite key, so Debezium re-keys the change
@@ -1712,10 +1715,29 @@ class DataMigrationState:
         with self._lock:
             self._prereq_reports[mode] = report
             self._prereq_report_checked_at[mode] = datetime.now(timezone.utc)
+            # The value-size answers refresh the exclusion popup's size labels.
+            for result in getattr(report, "results", None) or ():
+                measured = getattr(result, "measured", None)
+                if measured and result.target:
+                    for column, over in measured.items():
+                        self._value_size_cache[f"{result.target}.{column}"] = (
+                            "over" if over else "ok", self._prereq_report_checked_at[mode])
             self._prereq_report_lob_exclusions[mode] = {
                 table: frozenset(cols)
                 for table, cols in self._excluded_lob_columns.items()
             }
+
+    def value_sizes(self) -> "dict[str, tuple[str, datetime]]":
+        """The measured value sizes ("table.column" -> ("over" | "ok", when))."""
+        with self._lock:
+            return dict(self._value_size_cache)
+
+    def record_value_sizes(self, table: str, answer: "Mapping[str, bool]") -> None:
+        """Record one table's measured columns (the popup's Check sizes)."""
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            for column, over in (answer or {}).items():
+                self._value_size_cache[f"{table}.{column}"] = ("over" if over else "ok", now)
 
     def get_prereq_report(self, mode: MigrationMode) -> Optional[PrerequisiteReport]:
         """Return the last prerequisite report for ``mode``, if any."""

@@ -613,3 +613,50 @@ def test_each_column_runs_in_its_own_transaction_and_the_engine_is_disposed() ->
     )()
     probe.oversized_values("shop.docs", ["a"], limit_bytes=1, timeout_seconds=5.0)
     assert disposed == [True, True]
+
+
+# --- P3-C13: a passed engine, cancellation ------------------------------------------
+
+
+def test_a_passed_engine_is_never_disposed_and_the_own_engine_always_is() -> None:
+    from dsql_migrator.core.models import SourceType
+
+    conn = _SizeProbeConn({"b"})
+    probe = _size_probe(SourceType.MYSQL, conn)
+    disposed: list = []
+
+    class _Engine:
+        def connect(self):
+            return conn
+
+        def dispose(self):
+            disposed.append(True)
+
+    def _no_factory(_cfg):
+        raise AssertionError("a passed engine must be used, not a new one")
+
+    probe._engine_factory = _no_factory  # type: ignore[assignment]
+    answer = probe.oversized_values("shop.docs", ["a", "b"], limit_bytes=1, timeout_seconds=5.0,
+                                    engine=_Engine())
+    assert answer == {"a": False, "b": True} and disposed == []
+    probe._engine_factory = lambda _cfg: _Engine()  # type: ignore[assignment]
+    probe.oversized_values("shop.docs", ["a"], limit_bytes=1, timeout_seconds=5.0)
+    assert disposed == [True]
+
+
+def test_should_cancel_stops_between_columns_and_leaves_the_rest_unmeasured() -> None:
+    from dsql_migrator.core.models import SourceType
+
+    conn = _SizeProbeConn(set())
+    probe = _size_probe(SourceType.POSTGRES, conn)
+    probe._engine_factory = lambda _cfg: type(  # type: ignore[assignment]
+        "_E", (), {"connect": lambda self: conn, "dispose": lambda self: None})()
+    asked: list = []
+
+    def cancel_after_first() -> bool:
+        asked.append(True)
+        return len(asked) > 1
+
+    answer = probe.oversized_values("shop.docs", ["a", "b", "c"], limit_bytes=1,
+                                    timeout_seconds=5.0, should_cancel=cancel_after_first)
+    assert answer == {"a": False}

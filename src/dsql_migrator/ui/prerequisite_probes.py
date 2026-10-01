@@ -32,7 +32,7 @@ not a failure.
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 from sqlalchemy import text
 
@@ -121,6 +121,8 @@ class SessionSourceProbe:
         timeout_seconds: float,
         limits: "Optional[Mapping[str, int]]" = None,
         column_types: "Optional[Mapping[str, str]]" = None,
+        engine: "Optional[object]" = None,
+        should_cancel: "Optional[Callable[[], bool]]" = None,
     ) -> "Optional[dict[str, bool]]":
         """Whether any value in each column exceeds ITS limit. Read-only.
 
@@ -149,7 +151,10 @@ class SessionSourceProbe:
           columns (up to one timeout each), pinning purge on the customer's source.
 
         The engine is built for this call and DISPOSED when it returns, so the pool's
-        connection to the source is closed rather than left to garbage collection.
+        connection to the source is closed rather than left to garbage collection. A
+        caller measuring several tables passes its own ``engine`` (one per pass), which is
+        never disposed here. ``should_cancel`` is checked before each column: a cancelled
+        pass stops after the current column, and the rest are simply not measured.
 
         ``octet_length`` has no json/jsonb overload (verified: ``function
         octet_length(jsonb) does not exist``), which is exactly how that cascade started, so
@@ -184,14 +189,18 @@ class SessionSourceProbe:
             quote = lambda name: f"`{name}`"  # noqa: E731
 
         answer: dict[str, bool] = {}
-        try:
-            engine = self._engine_factory(self._config)
-        except Exception:  # noqa: BLE001 - advisory read
-            return None
+        owns_engine = engine is None
+        if owns_engine:
+            try:
+                engine = self._engine_factory(self._config)
+            except Exception:  # noqa: BLE001 - advisory read
+                return None
         try:
             with engine.connect() as connection:
                 self._apply_statement_timeout(connection, timeout_seconds, is_postgres)
                 for index, name in enumerate(columns):
+                    if should_cancel is not None and should_cancel():
+                        break
                     # If the previous column's transaction cannot be ended (the rollback
                     # itself failed -- a dropped connection), STOP: the next statement
                     # could run on a fresh connection without the cap, an unbounded scan
@@ -222,10 +231,11 @@ class SessionSourceProbe:
         except Exception:  # noqa: BLE001 - advisory read; never break the gate
             return answer or None
         finally:
-            try:
-                engine.dispose()
-            except Exception:  # noqa: BLE001 - best effort; the answer stands
-                pass
+            if owns_engine:
+                try:
+                    engine.dispose()
+                except Exception:  # noqa: BLE001 - best effort; the answer stands
+                    pass
         return answer or None
 
     def _end_column_transaction(

@@ -3036,3 +3036,36 @@ def test_msk_info_copy_matches_the_deploy_now_offer() -> None:
     assert "created when you start CDC" in connect.detail
     assert "removed again when you stop it" in connect.remediation
     assert "while the Full Load" not in connect.remediation
+
+
+def test_source_value_size_records_what_it_measured() -> None:
+    from dsql_migrator.core.models import ColumnDef, PrerequisiteCheckId, TableDef
+    from dsql_migrator.core.prerequisites import check_source_value_size
+
+    table = TableDef(name="shop.docs", primary_key=["id"], columns=[
+        ColumnDef(name="id", mysql_type="bigint"), ColumnDef(name="a", mysql_type="longtext"),
+        ColumnDef(name="b", mysql_type="longblob")])
+    for oversized, expected in [({"a": True}, {"a": True}), ({"a": False, "b": False},
+                                                            {"a": False, "b": False}), ({}, {})]:
+        result = check_source_value_size(table, ["a", "b"], oversized)
+        assert result.check_id is PrerequisiteCheckId.SOURCE_VALUE_SIZE
+        assert result.measured == expected
+
+
+def test_the_report_fills_the_value_size_cache() -> None:
+    from dsql_migrator.core.models import (
+        MigrationMode,
+        PrerequisiteCheckId,
+        PrerequisiteReport,
+        PrerequisiteResult,
+        PrerequisiteStatus,
+    )
+    from dsql_migrator.ui.data_migration import DataMigrationState
+
+    state = DataMigrationState()
+    report = PrerequisiteReport.build(MigrationMode.FULL_LOAD, [PrerequisiteResult(
+        check_id=PrerequisiteCheckId.SOURCE_VALUE_SIZE, title="t", status=PrerequisiteStatus.WARN,
+        required=False, target="shop.docs", measured={"a": True, "b": False})])
+    state.set_prereq_report(MigrationMode.FULL_LOAD, report)
+    sizes = state.value_sizes()
+    assert sizes["shop.docs.a"][0] == "over" and sizes["shop.docs.b"][0] == "ok"

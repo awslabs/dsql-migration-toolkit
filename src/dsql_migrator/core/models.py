@@ -1158,6 +1158,10 @@ class PrerequisiteResult(BaseModel):
     #
     # A discriminator, not a text match: matching on detail wording would be fragile.
     resolvable_by_resnapshot: bool = False
+    # SOURCE_VALUE_SIZE only: each MEASURED column (of ``target``) -> whether a value
+    # exceeded its limit; an unmeasured column is absent. Feeds the exclusion popup's size
+    # labels, so a later prerequisite run refreshes them without re-reading the source.
+    measured: Optional[dict[str, bool]] = None
 
 
 class PrerequisiteCheckRequest(BaseModel):

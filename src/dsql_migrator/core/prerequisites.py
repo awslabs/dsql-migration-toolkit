@@ -669,6 +669,7 @@ def check_source_value_size(
     if exceeded:
         return PrerequisiteResult(
             check_id=PrerequisiteCheckId.SOURCE_VALUE_SIZE,
+            measured=dict(measured),
             title=title,
             status=PrerequisiteStatus.WARN,
             required=False,
@@ -695,6 +696,7 @@ def check_source_value_size(
     if unmeasured:
         return PrerequisiteResult(
             check_id=PrerequisiteCheckId.SOURCE_VALUE_SIZE,
+            measured=dict(measured),
             title=title,
             status=PrerequisiteStatus.INFO,
             required=False,
@@ -720,6 +722,7 @@ def check_source_value_size(
 
     return PrerequisiteResult(
         check_id=PrerequisiteCheckId.SOURCE_VALUE_SIZE,
+        measured=dict(measured),
         title=title,
         status=PrerequisiteStatus.PASS,
         required=False,
