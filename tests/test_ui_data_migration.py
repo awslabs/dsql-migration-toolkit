@@ -20325,7 +20325,7 @@ def test_quarantine_card_offers_exclude_and_reload_and_gates_it() -> None:
     _render_full_load_progress(
         ui, _job(), rows(), quarantine_only=True, quarantine_records=records,
         connections_ready=True, lob_candidates_for=cands,
-        exclude_lob_and_reload=lambda *_a: None,
+        exclusion_route=lambda *_a: None,
     )
     btns = [b for b in ui.buttons if b[0] == "Exclude column & reload"]
     assert btns, f"action not offered; buttons={[b[0] for b in ui.buttons]}"
@@ -20336,34 +20336,33 @@ def test_quarantine_card_offers_exclude_and_reload_and_gates_it() -> None:
     _render_full_load_progress(
         ui2, _job(), rows(), quarantine_only=True, quarantine_records=records,
         connections_ready=True, lob_candidates_for=cands,
-        exclude_lob_and_reload=lambda *_a: None,
-        exclude_lob_block_reason="CDC is streaming — stop CDC first.",
+        exclusion_route=lambda *_a: None,
+        exclusion_route_block="Foreign keys are being applied to these tables.",
     )
     blocked = [b for b in ui2.buttons if b[0] == "Exclude column & reload"]
     assert blocked and all("disable" in b[1] for b in blocked)
-    assert any("stop CDC first" in b[2] for b in blocked)
+    assert any("Foreign keys are being applied" in b[2] for b in blocked)
 
     # No excludable column on the table -> no dead button at all.
     ui3 = _Ui()
     _render_full_load_progress(
         ui3, _job(), rows(), quarantine_only=True, quarantine_records=records,
         connections_ready=True, lob_candidates_for=lambda _t: (),
-        exclude_lob_and_reload=lambda *_a: None,
+        exclusion_route=lambda *_a: None,
     )
     assert not [b for b in ui3.buttons if b[0] == "Exclude column & reload"]
 
 
-def test_exclude_and_reload_dialog_preticks_the_matching_column_and_confirms() -> None:
-    # The dialog must PICK (not auto-apply): product_media has two LOB candidates, and
-    # excluding the wrong one silently NULLs it for every row. The one whose source type
-    # maps to the type in the reason (bytea -> longblob) is pre-ticked.
+def test_exclude_and_reload_opens_the_route_with_the_table_and_its_reason() -> None:
+    # P3-C19: the card no longer owns a picker; the route (open_exclusion_route) decides
+    # the column from the reason at click time and opens the exclusion popup.
     from dsql_migrator.ui.data_migration import (
         _render_full_load_progress,
         build_full_load_table_rows,
     )
 
     _Ui, _job, reason = _quar_render_ui()
-    applied: list = []
+    routed: list = []
     ui = _Ui()
     _render_full_load_progress(
         ui, _job(),
@@ -20374,22 +20373,12 @@ def test_exclude_and_reload_dialog_preticks_the_matching_column_and_confirms() -
         lob_candidates_for=lambda _t: (
             ("content", "longblob"), ("full_description", "longtext")
         ),
-        exclude_lob_and_reload=lambda table, cols: applied.append((table, list(cols))),
+        exclusion_route=lambda table, why: routed.append((table, why)),
     )
-
-    ui.handlers["Exclude column & reload"]()          # open the picker
-    assert ui.dialogs == 1
-    # bytea in the reason -> the longblob column is pre-ticked, the longtext one is not
-    assert "content  (longblob)=True" in ui.checkboxes, ui.checkboxes
-    assert "full_description  (longtext)=False" in ui.checkboxes, ui.checkboxes
-    # The confirm is destructive and spells out the impact.
-    confirm = [b for b in ui.buttons if b[0] == "Exclude and reload"]
-    assert confirm and any("negative" in b[1] for b in confirm)
-    body = " ".join(ui.texts)
-    assert "product_media" in body
-
-    ui.handlers["Exclude and reload"]()               # confirm
-    assert applied == [("ecommerce.product_media", ["content"])]
+    ui.handlers["Exclude column & reload"]()
+    ((table, why),) = routed
+    assert table == "ecommerce.product_media" and "not supported for bytea" in why
+    assert ui.dialogs == 0  # no picker of its own any more
 
 
 def test_index_wait_reports_zero_when_it_never_waited_even_as_the_clock_advances() -> None:
@@ -20652,7 +20641,7 @@ def test_the_recovery_action_survives_a_session_whose_error_log_is_gone() -> Non
         quarantine_records=[],                            # log is gone
         connections_ready=True,
         lob_candidates_for=lambda _t: (("content", "longblob"),),
-        exclude_lob_and_reload=lambda *_a: None,
+        exclusion_route=lambda *_a: None,
     )
     assert [b for b in ui.buttons if b[0] == "Exclude column & reload"], (
         f"recovery lost when the log is gone; buttons={[b[0] for b in ui.buttons]}"
@@ -24176,12 +24165,13 @@ def test_the_renderer_supplies_the_engine_to_the_pretick() -> None:
         "_render_full_load_step must pass source_type=session_source_type(session) to "
         "_render_full_load_progress; without it the PG quarantine dialog pre-ticks nothing"
     )
-    # And the renderer must forward it to the pre-select, not default to MySQL.
-    renderer_source = " ".join(
-        _inspect.getsource(_full_load_ui._render_full_load_progress).split()
-    )
-    assert "preselect_lob_columns_for_reason(" in renderer_source
-    assert "source_type=source_type or SourceType.MYSQL" in renderer_source
+    # P3-C19: the pre-select moved to the route, which takes the engine from the session
+    # through the one helper (so the restored-session hint is honoured).
+    from dsql_migrator.ui.data_migration import _exclusion_dialog
+
+    route_source = " ".join(_inspect.getsource(_exclusion_dialog.open_exclusion_route).split())
+    assert "quarantine_rule_suggestion(" in route_source
+    assert "source_type=session_source_type(ctx.session)" in route_source
 
 
 def test_every_session_engine_site_uses_the_one_helper() -> None:

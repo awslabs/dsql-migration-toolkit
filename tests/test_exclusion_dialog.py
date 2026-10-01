@@ -735,3 +735,90 @@ def test_a_ticked_legacy_table_joins_the_reload_and_becomes_overlay():
     (tables, (replace, _pin)), = submitted
     assert tables == ["shop.t"] and replace == frozenset({"shop.t"})
     assert state.legacy_exclusions() == {}  # now an overlay entry: NULL after the reload
+
+
+# --- P3-C19: the quarantine route ----------------------------------------------------------
+
+from dsql_migrator.ui.data_migration._exclusion_dialog import (  # noqa: E402
+    open_exclusion_route,
+    quarantine_route_block,
+)
+
+_TEXT_REASON = "datatype limit greater than 1048576 bytes not supported for text"
+_CANDS = lambda _t: (("a", "longtext"), ("b", "text"))  # noqa: E731
+
+
+def test_outcome_a_inserts_exactly_one_line_and_reloads_in_two_clicks():
+    ctx, state, _jobs, submitted = _reload_ctx()
+    state._excluded_lob_columns.clear()
+    state.restore_exclusion_rules("", ())
+    ui = _Ui()
+    # a text reason narrows the two candidates to the longtext one
+    open_exclusion_route(ui, ctx, "shop.t", _TEXT_REASON, lob_candidates_for=_CANDS)
+    assert ui.texts.count("Change exclusions & reload") == 1
+    assert ui.editors[-1].value == "exclude shop.t.a  # from the Full Load quarantine"
+    ui.click("Drop & reload shop.t")  # the second click
+    (tables, (replace, _pin)), = submitted
+    assert tables == ["shop.t"] and state.lob_exclusions() == {"shop.t": {"a"}}
+
+
+def test_outcome_b_filters_the_lob_section_and_c_shows_the_type_a_rule_hint():
+    ctx, state, _jobs, _submitted = _reload_ctx()
+    state._excluded_lob_columns.clear()
+    state.restore_exclusion_rules("", ())
+    ui = _Ui()
+    open_exclusion_route(ui, ctx, "shop.t", "... not supported for jsonb", lob_candidates_for=_CANDS)
+    assert any(t.startswith("The database reported a type, not a column") for t in ui.texts)
+    view = state.exclusion_dialog_ui()
+    assert view.get("lob_open") and view.get("lob_table") == "shop.t"
+    # C: the saved rules already exclude every flagged column
+    ctx2, state2, _j, _s = _reload_ctx()
+    ui2 = _Ui()
+    open_exclusion_route(ui2, ctx2, "shop.t", "... not supported for jsonb",
+                         lob_candidates_for=lambda _t: (("a", "longtext"),))
+    assert any(t.startswith("Every column of shop.t whose type this tool flags") for t in ui2.texts)
+    assert "disable" not in " ".join(ui2.editors[-1].props_seen)  # still editable
+
+
+def test_not_saved_names_the_line_and_save():
+    ctx, state, _jobs, _submitted = _reload_ctx()
+    state._excluded_lob_columns.clear()
+    state.restore_exclusion_rules("", ())
+    state.add_pending_rule("exclude shop.t.a  # from the CDC dead-letter queue")
+    ui = _Ui()
+    open_exclusion_route(ui, ctx, "shop.t", _TEXT_REASON,
+                         lob_candidates_for=lambda _t: (("a", "longtext"),))
+    assert any(t.startswith("Already excluded by L1 (not saved yet)") for t in ui.texts)
+
+
+def test_with_a_stack_the_route_records_a_pending_line_once_and_submits_nothing():
+    ctx, state, _jobs, submitted = _reload_ctx()
+    state._excluded_lob_columns.clear()
+    state.restore_exclusion_rules("", ())
+    state.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
+    for _ in range(2):
+        ui = _Ui()
+        open_exclusion_route(ui, ctx, "shop.t", _TEXT_REASON,
+                             lob_candidates_for=lambda _t: (("a", "longtext"),))
+        assert any("(read only)" in t for t in ui.texts)
+    assert state.pending_rules() == ["exclude shop.t.a  # from the Full Load quarantine"]
+    assert state.lob_exclusions() == {} and submitted == []
+    # B and C record nothing
+    ui = _Ui()
+    open_exclusion_route(ui, ctx, "shop.u", "... not supported for jsonb",
+                         lob_candidates_for=lambda _t: (("note", "longtext"),))
+    assert state.pending_rules() == ["exclude shop.t.a  # from the Full Load quarantine"]
+
+
+def test_a_blocked_gate_disables_the_action_and_a_stale_click_does_nothing():
+    ctx, state, jobs, submitted = _reload_ctx()
+    state.cutover_restore_in_flight = lambda: True
+    assert quarantine_route_block(ctx).startswith("Cut over is restoring")
+    refreshed = []
+    ctx.refresh = lambda: refreshed.append(True)
+    ui = _Ui()
+    open_exclusion_route(ui, ctx, "shop.t", _TEXT_REASON, lob_candidates_for=_CANDS)
+    assert ui.dialogs == [] and ui.notified and refreshed and submitted == []
+    state.cutover_restore_in_flight = None
+    ctx.session.connection_ready = lambda: False
+    assert quarantine_route_block(ctx).startswith("Reconnect first")

@@ -871,17 +871,25 @@ def test_a_hung_fill_claim_is_re_taken_after_the_watchdog_bound():
 
 
 def test_exclude_and_reload_checks_the_reverse_gate_before_writing_anything():
+    # P3-C19: the quarantine route opens Change & reload, whose ONE gate includes the
+    # cut-over DEFAULT restore (change_and_reload_block_reason clause f); its Save re-checks
+    # that gate before it writes anything.
     import ast
     import inspect
 
-    import dsql_migrator.ui.data_migration as dm
+    from dsql_migrator.ui.data_migration import _exclusion_dialog
 
-    tree = ast.parse(inspect.getsource(dm.build_data_migration_screen))
-    (fn,) = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "exclude_lob_and_reload"]
+    tree = ast.parse(inspect.getsource(_exclusion_dialog._build_reload_dialog))
+    (fn,) = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_save"]
     calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
-    gate = min(c.lineno for c in calls if getattr(c.func, "id", None) == "cutover_restore_block_reason")
-    writes = [c.lineno for c in calls if getattr(c.func, "attr", None) in ("set_lob_exclusion", "set_replace_targets")]
+    gate = min(c.lineno for c in calls if getattr(c.func, "id", None) == "_reload_gate")
+    writes = [c.lineno for c in calls if getattr(c.func, "attr", None) in (
+        "set_column_exclusions", "set_exclusion_forced_replace")]
     assert writes and gate < min(writes)
+    from dsql_migrator.ui.data_migration import _cdc_monitoring
+
+    assert "cutover_restore_in_flight" in inspect.getsource(
+        _cdc_monitoring.change_and_reload_block_reason)
 
 
 def test_the_not_single_expression_reason_is_stated_once():

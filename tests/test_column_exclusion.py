@@ -412,7 +412,14 @@ def test_both_recovery_actions_check_the_rule_before_writing():
     import dsql_migrator.ui.data_migration as dm
 
     tree = ast.parse(inspect.getsource(dm.build_data_migration_screen))
-    for name in ("exclude_lob_and_reload", "exclude_cdc_capture_columns"):
+    # P3-C19: the quarantine route writes only through the popup's Save
+    # (set_column_exclusions), never set_lob_exclusion.
+    from dsql_migrator.ui.data_migration import _exclusion_dialog
+
+    route = inspect.getsource(_exclusion_dialog.open_exclusion_route)
+    assert "set_lob_exclusion" not in route and "exclude_lob_and_reload" not in inspect.getsource(
+        dm.build_data_migration_screen)
+    for name in ("exclude_cdc_capture_columns",):
         (fn,) = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name]
         calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
         refusal = min(c.lineno for c in calls if getattr(c.func, "id", None) == "exclusion_refusal")

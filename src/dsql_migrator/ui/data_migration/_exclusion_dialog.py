@@ -33,6 +33,7 @@ from dsql_migrator.ui.data_migration._models import (
     capture_exclusion_mismatch,
     cdc_capture_exclusions,
     classify_restored_exclusions,
+    effective_lob_exclusions,
     exclusion_rules_text_for,
     exclusion_drift,
     exclusion_row_summary,
@@ -41,6 +42,7 @@ from dsql_migrator.ui.data_migration._models import (
     overlay_change_summary,
     popup_open_text,
     popup_resolution,
+    quarantine_rule_suggestion,
     scope_lob_candidates,
     session_source_type,
     stored_exclusion_block_reason,
@@ -213,21 +215,34 @@ def _client():
         return None
 
 
-def open_exclusion_dialog(ui, ctx: ExclusionDialogContext, *, mode: Optional[str] = None):
+def open_exclusion_dialog(
+    ui,
+    ctx: ExclusionDialogContext,
+    *,
+    mode: Optional[str] = None,
+    insert_lines: Sequence[str] = (),
+    hint: "Optional[tuple[str, str]]" = None,
+    lob_filter: Optional[str] = None,
+):
     """Open the popup: editable while the exclusions are not locked, else read-only with
     the lock's reason and remedy (``mode`` forces one). Built in the clicked client's
-    top-level context and opened on the next tick (QDialog drops a same-batch open)."""
+    top-level context and opened on the next tick (QDialog drops a same-batch open).
+
+    A recovery route passes ``insert_lines`` (shown, not saved), a ``hint`` ``(tone,
+    text)`` above the editor, and ``lob_filter`` (the LOB section opens filtered to that
+    table; the filter lives on the state and is cleared on close)."""
     client = _client()
 
     def _build() -> None:
         lock = _lock_state(ctx)
         chosen = mode or ("read_only" if lock.locked else "edit")
+        extra = {"insert_lines": tuple(insert_lines), "hint": hint, "lob_filter": lob_filter}
         if chosen == "edit":
-            _build_edit_dialog(ui, ctx)
+            _build_edit_dialog(ui, ctx, **extra)
         elif chosen == "change_and_reload":
-            _build_reload_dialog(ui, ctx)
+            _build_reload_dialog(ui, ctx, **extra)
         else:
-            _build_read_only_dialog(ui, ctx, lock)
+            _build_read_only_dialog(ui, ctx, lock, hint=hint)
 
     if client is not None:
         with client:
@@ -283,7 +298,23 @@ def _append_line(text: str, new: str) -> str:
     return f"{text.rstrip(chr(10))}\n{new}" if text.strip() else new
 
 
-def _build_edit_dialog(ui, ctx: ExclusionDialogContext) -> None:
+def _with_inserted(text: str, lines: Sequence[str]) -> str:
+    """``text`` plus each line not already there (by rule text, comment ignored)."""
+    have = {" ".join(split_rule_comment(x)[0].split()) for x in text.split("\n")}
+    for line in lines:
+        if " ".join(split_rule_comment(line)[0].split()) not in have:
+            text = _append_line(text, line)
+    return text
+
+
+def _apply_route_view(view: dict, lob_filter: Optional[str]) -> None:
+    if lob_filter:
+        view["lob_open"] = True
+        view["lob_table"] = lob_filter
+
+
+def _build_edit_dialog(ui, ctx: ExclusionDialogContext, *, insert_lines=(), hint=None,
+                       lob_filter=None) -> None:
     state = ctx.migration_state
     classify_restored_exclusions(state, ctx.job_manager)
     inventory = ctx.inventory_fn()
@@ -293,12 +324,14 @@ def _build_edit_dialog(ui, ctx: ExclusionDialogContext) -> None:
                   type="warning")
         return
     text, opened_with = popup_open_text(state, inventory)
+    text = _with_inserted(text, insert_lines)
     synthesized = state.exclusion_rules_text() is None and bool(state.lob_exclusions())
     stored_at_open = state.lob_exclusions()
     token = state.exclusion_edit_token()
     held = {"text": text, "timer": None}
     view = state.exclusion_dialog_ui()
     view.clear()
+    _apply_route_view(view, lob_filter)
     ui.add_css(_EDITOR_CSS)
 
     with ui.dialog().props("persistent") as dialog, ui.card().classes("gap-3").style(
@@ -316,6 +349,8 @@ def _build_edit_dialog(ui, ctx: ExclusionDialogContext) -> None:
                 "flat dense round size=sm icon=close color=grey-7"
             ).tooltip("Close without saving")
         ui.label(HELP_TEXT).classes("text-xs text-gray-600")
+        if hint:
+            inline_hint(ui, hint[1], tone=hint[0])
         editor = ui.codemirror(
             text, language=None, theme="basicLight", line_wrapping=False,
             on_change=lambda e: _on_edit(getattr(e, "value", "")),
@@ -849,7 +884,7 @@ def _change_type_button(ui, ctx: ExclusionDialogContext, close) -> None:
         button.tooltip(reason)
 
 
-def _build_read_only_dialog(ui, ctx: ExclusionDialogContext, lock) -> None:
+def _build_read_only_dialog(ui, ctx: ExclusionDialogContext, lock, *, hint=None) -> None:
     """The locked popup (D4): the lock's own reason and remedy (exclusion_lock_state is
     the only source of that text), the saved rules (not editable), the pending lines kept
     pending, the stored count, the stack's capture list as deployed -- beside the session's
@@ -872,6 +907,8 @@ def _build_read_only_dialog(ui, ctx: ExclusionDialogContext, lock) -> None:
             ).tooltip("Close")
         render_notice(ui, tone="info", header=_LOCK_HEADERS.get(lock.tier, "Locked"),
                       body=lock.reason or "")
+        if hint:
+            inline_hint(ui, hint[1], tone=hint[0])
         _render_pending(ui, pending)
         ui.codemirror(text, language=None, theme="basicLight", line_wrapping=False).classes(
             "w-full exclusion-rules-editor").props("disable")
@@ -936,7 +973,8 @@ def _row_estimate(ctx: ExclusionDialogContext, table: str) -> Optional[int]:
     return counts.get(table)
 
 
-def _build_reload_dialog(ui, ctx: ExclusionDialogContext) -> None:
+def _build_reload_dialog(ui, ctx: ExclusionDialogContext, *, insert_lines=(), hint=None,
+                         lob_filter=None) -> None:
     """CHANGE & RELOAD (R4): column rules editable, table lines E3 (the table set is fixed
     after a Full Load), and a negative confirm naming every table it DROPS and reloads.
     A text-only change saves the text and nothing else."""
@@ -949,11 +987,13 @@ def _build_reload_dialog(ui, ctx: ExclusionDialogContext) -> None:
     if inventory is None or inputs is None:
         return
     text, opened_with = popup_open_text(state, inventory)
+    text = _with_inserted(text, insert_lines)
     token = state.exclusion_edit_token()
     held = {"text": text, "timer": None}
     convert: set = set()
     view = state.exclusion_dialog_ui()
     view.clear()
+    _apply_route_view(view, lob_filter)
     ui.add_css(_EDITOR_CSS)
     with ui.dialog().props("persistent") as dialog, ui.card().classes("gap-3").style(
         "width: min(980px, 94vw); max-width: 94vw"
@@ -970,6 +1010,8 @@ def _build_reload_dialog(ui, ctx: ExclusionDialogContext) -> None:
             ).tooltip("Close without saving")
         ui.label("Column rules are editable. Tables are fixed after a Full Load (use Start "
                  "over to change them).").classes("text-xs text-gray-600")
+        if hint:
+            inline_hint(ui, hint[1], tone=hint[0])
         editor = ui.codemirror(
             text, language=None, theme="basicLight", line_wrapping=False,
             on_change=lambda e: _on_edit(getattr(e, "value", "")),
@@ -1134,8 +1176,120 @@ def _render_deployed_capture(ui, ctx: ExclusionDialogContext, inventory) -> None
         )
 
 
+# --- the Full Load quarantine route ---------------------------------------------------
+
+
+def quarantine_route_block(ctx: ExclusionDialogContext) -> Optional[str]:
+    """Why "Exclude column & reload" is disabled at render: only when it would open Change
+    & reload and that gate refuses (an FK pass, a cut-over restore, not reconnected...).
+    In tiers 0-2 it opens the read-only popup instead, so it is never disabled there."""
+    lock = _lock_state(ctx)
+    if lock.tier == 3 and lock.offers_change_and_reload:
+        return _reload_gate(ctx)
+    return None
+
+
+def _lines_text(lines: Sequence[int]) -> str:
+    return ", ".join(f"L{n}" for n in lines)
+
+
+def open_exclusion_route(ui, ctx: ExclusionDialogContext, table: str, reason_text: str, *,
+                         lob_candidates_for) -> None:
+    """The quarantine "Exclude column & reload", routed by the lock at CLICK time:
+
+    * Change & reload (R4, a Full Load type): the editor with outcome A's lines inserted
+      (unsaved), or the NOT SAVED / B (section 4 filtered to the table) / C hint;
+    * a lock above (tiers 0-2) or no Change & reload here: the read-only popup, with A's
+      lines recorded as pending (deduped) and every other outcome recorded nowhere;
+    * a click whose gate re-check refuses opens, stores and submits nothing: it says why
+      and re-renders, so the button shows the current state.
+    """
+    state = ctx.migration_state
+    inventory = ctx.inventory_fn()
+    inputs = ctx.inputs_fn()
+    if inventory is None or inputs is None:
+        ui.notify("The source schema is not loaded yet.", type="warning")
+        return
+    lock = _lock_state(ctx)
+    editable = lock.tier == 3 and lock.offers_change_and_reload
+    if editable:
+        reason = _reload_gate(ctx)
+        if reason:
+            ui.notify(reason, type="warning", multi_line=True)
+            ctx.refresh()
+            return
+    text, _pending = popup_open_text(state, inventory)
+    resolution = _resolve(ctx, inventory, inputs, text, slot="editor")
+    keepers = {c: lines for (t, c), lines in resolution.kept_by.items() if t == table}
+    by_line = {c: lines for (t, c), lines in resolution.excluded_by.items() if t == table}
+    saved = effective_lob_exclusions(state, inventory).get(table, frozenset())
+    candidates = tuple(lob_candidates_for(table) if lob_candidates_for else ())
+    outcome = quarantine_rule_suggestion(
+        table, reason_text, candidates,
+        open_excluded=resolution.columns.get(table, frozenset()),
+        saved_excluded=saved, include_keepers=keepers, open_excluded_by=by_line,
+        source_type=session_source_type(ctx.session),
+    )
+    when = "after the Delete" if lock.tier in (0, 1, 2) else "once Change & reload is available"
+    hint = _route_hint(outcome, table, text, editable, when)
+    if editable or not lock.locked:
+        open_exclusion_dialog(
+            ui, ctx, mode="change_and_reload" if editable else "edit",
+            insert_lines=outcome.lines if outcome.outcome == "A" else (), hint=hint,
+            lob_filter=table if outcome.outcome == "B" and outcome.filter_table else None,
+        )
+        return
+    if outcome.outcome == "A":
+        for line in outcome.lines:
+            state.add_pending_rule(line)
+    open_exclusion_dialog(ui, ctx, mode="read_only", hint=hint)
+
+
+def _route_hint(outcome, table: str, text: str, editable: bool, when: str):
+    lines = text.split("\n")
+
+    def _quote(numbers) -> str:
+        return "; ".join(f'"{lines[n - 1].strip()}"' for n in numbers if 0 < n <= len(lines))
+
+    if outcome.outcome == "A":
+        notes = [f"{table}.{c} is kept by the include on {_lines_text(n)}: "
+                 + ("edit or delete that line to exclude it." if editable
+                    else f"{when}, change that line in Change & reload.")
+                 for c, n in outcome.kept.items()]
+        notes += [f"{table}.{c}: its name has a line break and cannot be written as a rule; "
+                  "exclude the table, or edit the target DDL in Schema Conversion."
+                  for c in outcome.unwritable]
+        return ("neutral", " ".join(notes)) if notes else None
+    if outcome.outcome == "NOT_SAVED":
+        if editable:
+            return ("neutral", f"Already excluded by {_lines_text(outcome.not_saved_lines)} "
+                    f"(not saved yet) — Save to drop and reload {table}.")
+        return ("neutral", f"{table}: already excluded by a line not saved yet "
+                f"({_quote(outcome.not_saved_lines)}); {when}, Save it in Change & reload.")
+    if outcome.outcome == "B":
+        text_b = ("The database reported a type, not a column, so no rule was added: pick the "
+                  "column that holds the oversized value with [+ add rule].")
+        if not outcome.filter_table and outcome.not_saved_lines:
+            text_b += (f" Every flagged column of {table} is already excluded by "
+                       f"{_lines_text(outcome.not_saved_lines)} (not saved yet): Save to drop "
+                       f"and reload {table}, or type a rule for a column this tool does not "
+                       "flag.")
+        if not editable:
+            text_b += f" {when}, pick it in Change & reload."
+        return ("warning", text_b)
+    text_c = (f"Every column of {table} whose type this tool flags as oversized is already "
+              "excluded by your saved rules, so the value the database rejected is in another "
+              "column (for example JSON or spatial, which are not flagged). Type a rule for "
+              f"that column: exclude {table}.<column>.")
+    if not editable:
+        text_c += f" {when}, type it in Change & reload."
+    return ("warning", text_c)
+
+
 __all__ = [
     "BUTTON_LABEL",
+    "open_exclusion_route",
+    "quarantine_route_block",
     "check_sizes_cost",
     "HONESTY_FOOTER",
     "REVIEW_FILTERS",

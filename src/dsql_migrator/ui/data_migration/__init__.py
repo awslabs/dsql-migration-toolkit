@@ -497,6 +497,7 @@ def build_data_migration_screen(
 
     from dsql_migrator.ui.data_migration._exclusion_dialog import (
         ExclusionDialogContext,
+        quarantine_route_block,
         render_exclusion_button_row,
     )
 
@@ -1863,57 +1864,16 @@ def build_data_migration_screen(
                 )
                 refresh()
 
-            def exclude_lob_and_reload(table_name: str, columns: Sequence[str]) -> None:
-                """Exclude oversized-LOB column(s) AND reload the table, as ONE action.
-
-                The recovery path for a load that quarantined rows over DSQL's ~1 MiB
-                per-value limit: you cannot know WHICH column is too big until you load,
-                but the exclusion tick boxes lock once a Full Load has run, and the only
-                escape was Start over -- which discards Evaluation, Schema Conversion
-                (including edited DDL), the migration type and the CDC inputs to change
-                one checkbox. That lock exists because changing the exclusion would leave
-                already-loaded rows inconsistent with what CDC captures; bundling the
-                exclusion WITH a forced DROP+reload of that table removes those rows, so
-                the inconsistency cannot arise and the lock does not need to apply.
-
-                Refused while a CDC pipeline already owns the excluded-column set (see
-                :func:`exclude_and_reload_block_reason`).
-                """
-                # Every refusal BEFORE anything is written: a cut-over DEFAULT restore
-                # in flight would otherwise leave a recorded exclusion and a pinned
-                # reload with no load submitted.
-                blocked = exclude_and_reload_block_reason(
-                    migration_state, job_manager
-                ) or cutover_restore_block_reason(migration_state)
-                if blocked:
-                    ui.notify(blocked, type="warning", position="top")
-                    return
-                if not columns:
-                    return
-                # The rule, at click time: this writes the exclusion directly and never
-                # passes a prerequisite check, so a key, FK-referenced or generated
-                # column must be refused here (nothing is written).
-                refused = exclusion_refusal(migration_state, inventory, table_name, columns)
-                if refused:
-                    ui.notify(refused, type="warning", position="top")
-                    return
-                for column in columns:
-                    migration_state.set_lob_exclusion(table_name, column, True)
-                # FORCE the replace for exactly this table: an append would leave the
-                # rows loaded under the old column set beside rows loaded without it.
-                migration_state.set_replace_targets(frozenset({table_name}))
-                log_activity(
-                    ActivityCategory.FULL_LOAD,
-                    "oversized-LOB column excluded",
-                    status=ActivityStatus.INFO,
-                    target=table_name,
-                    detail=(
-                        f"excluded {', '.join(sorted(columns))} and reloading this table "
-                        "(DROP + recreate), so no row keeps a value loaded under the "
-                        "previous column set"
-                    ),
+            def exclusion_route(table_name: str, reason_text: str) -> None:
+                # The quarantine card's "Exclude column & reload": the exclusion popup,
+                # routed by the lock at click time (Change & reload, or read-only with a
+                # pending rule).
+                from dsql_migrator.ui.data_migration._exclusion_dialog import (
+                    open_exclusion_route,
                 )
-                _run_retry_for([table_name])
+
+                open_exclusion_route(ui, _exclusion_ctx, table_name, reason_text,
+                                     lob_candidates_for=lob_candidates_for)
 
             def retry_tables(names: Sequence[str]) -> None:
                 # Retry an explicit SUBSET of tables (the failed-table checklist's
@@ -2529,10 +2489,8 @@ def build_data_migration_screen(
                             # table as ONE action, so the exclusion never applies to
                             # rows that are already loaded.
                             lob_candidates_for=lob_candidates_for,
-                            exclude_lob_and_reload=exclude_lob_and_reload,
-                            exclude_lob_block_reason=exclude_and_reload_block_reason(
-                                migration_state, job_manager
-                            ),
+                            exclusion_route=exclusion_route,
+                            exclusion_route_block=quarantine_route_block(_exclusion_ctx),
                             accept_quarantine_and_continue=accept_quarantine_and_continue,
                             # Foreign keys are an explicit action now, not part of the
                             # load: the orphan pre-check is O(child rows) and was holding
