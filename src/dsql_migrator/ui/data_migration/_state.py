@@ -191,6 +191,20 @@ class DataMigrationState:
         # ledger read that found a record): a table can owe a DEFAULT even with no
         # exclusion left. Persisted; cleared only by Start over.
         self._overlay_ledger_in_use: bool = False
+        # The exclusion RULES (core/exclusion_rules.py), kept for re-editing only: no
+        # loader reads them -- every path reads the resolved set above and the selection.
+        # ``None`` = never saved (the popup synthesizes lines from the stored set).
+        self._exclusion_rules_text: Optional[str] = None
+        # Tables the RULES unselected at the last Save (provenance): read only by the
+        # popup, so deleting a rule re-selects only these, never a table the operator
+        # unticked in the tree.
+        self._rule_excluded_tables: set[str] = set()
+        # Rule-excluded tables the operator re-ticked in the tree since the last Save (a
+        # deliberate override the popup names). Transient.
+        self._rule_reticked_tables: set[str] = set()
+        # Suggested rule lines waiting for the popup (e.g. a quarantine or DLQ route while
+        # the rules are locked); inserted on each open until a Save takes them.
+        self._exclusion_pending_rules: list[str] = []
         # Composite-PK record-key override for CDC, keyed by db.table -> target key
         # columns [leading, pk...]. Set from the applied Schema Conversion when a
         # table's DSQL target has a composite key, so Debezium re-keys the change
@@ -541,6 +555,140 @@ class DataMigrationState:
                     facts, entries=frozenset(facts.entries - {(table, column)})
                 )
 
+    def exclusion_edit_token(self) -> tuple:
+        """What a popup opened against: the stored set, the rules and every fact a Save's
+        legality depends on. A Save refuses when it changed (another tab saved, a stack was
+        adopted or attached, a run or deploy started) -- reopen to review."""
+        with self._lock:
+            return self._edit_token()
+
+    def _edit_token(self) -> tuple:
+        """:meth:`exclusion_edit_token` with the lock already held."""
+        return (
+            tuple(sorted((t, tuple(sorted(c))) for t, c in self._excluded_lob_columns.items())),
+            self._exclusion_rules_text,
+            tuple(sorted(self._rule_excluded_tables)),
+            tuple(self.selection.selected_tables),
+            self.selection_touched,
+            getattr(self, "job_id", None),
+            getattr(self, "cdc_deploy_job_id", None),
+            getattr(self, "cdc_teardown_job_id", None),
+            getattr(self, "cdc_stack_name", None),
+            getattr(self, "cdc_stack_phase", None),
+        )
+
+    def set_column_exclusions(
+        self,
+        resolution,
+        *,
+        text: str,
+        opened_with: "Sequence[str]" = (),
+        token: "Optional[tuple]" = None,
+        lock_check: "Optional[Callable[[], Optional[str]]]" = None,
+    ) -> Optional[str]:
+        """Store a popup Save: ``resolution`` (``core.exclusion_rules.RuleResolution``) is
+        the ONLY input -- this is the rules' setter; ``set_lob_exclusion`` stays the raw
+        path of the card and restore. Returns why it refused, or ``None`` once stored.
+
+        Refuses a resolution that cannot be saved; ``lock_check`` (called first, outside
+        the lock: it reads the lock state) reporting a lock; and -- under the lock, so the
+        adoption/Attach/other-tab race cannot slip between check and write -- a change of
+        :meth:`exclusion_edit_token` since the popup opened (``token``).
+
+        Replaces the stored set with ``resolution.columns``; legacy marks and a pending
+        classification keep only the entries still excluded. The TableSelection changes
+        (touched) only when ``resolution.selected_after`` is set; the provenance and the
+        rule text are stored; exactly ``opened_with`` leaves the pending lines (a line
+        another tab added meanwhile stays). Never marks the overlay ledger in use: a run
+        that overlays does.
+        """
+        if not resolution.can_save:
+            return "The rules have errors: fix them before saving."
+        if lock_check is not None:
+            reason = lock_check()
+            if reason:
+                return reason
+        with self._lock:
+            if token is not None and token != self._edit_token():
+                return (
+                    "The exclusions changed since this window opened (another tab saved, a "
+                    "CDC stack was attached, or a run started). Close it and open it again "
+                    "to review the current set."
+                )
+            new = {t: set(c) for t, c in resolution.columns.items() if c}
+            self._excluded_lob_columns = new
+            self._legacy_exclusions = {
+                t: c & new[t] for t, c in self._legacy_exclusions.items() if t in new and c & new[t]
+            }
+            facts = self._restored_exclusion_facts
+            if facts is not None:
+                self._restored_exclusion_facts = replace(facts, entries=frozenset(
+                    (t, c) for t, c in facts.entries if c in new.get(t, ())))
+            if resolution.selected_after is not None:
+                self.selection = TableSelection(selected_tables=list(resolution.selected_after))
+                self.selection_touched = True
+            self._rule_excluded_tables = set(resolution.rule_excluded_after)
+            self._rule_reticked_tables = set()
+            self._exclusion_rules_text = text
+            pending = list(self._exclusion_pending_rules)
+            for line in opened_with:
+                if line in pending:
+                    pending.remove(line)
+            self._exclusion_pending_rules = pending
+            return None
+
+    def exclusion_rules_text(self) -> Optional[str]:
+        with self._lock:
+            return self._exclusion_rules_text
+
+    def rule_excluded_tables(self) -> frozenset:
+        with self._lock:
+            return frozenset(self._rule_excluded_tables)
+
+    def rule_reticked_tables(self) -> frozenset:
+        with self._lock:
+            return frozenset(self._rule_reticked_tables)
+
+    def note_tree_retick(self, tables: "Iterable[str]") -> None:
+        """The operator re-ticked these in the tree: a rule-excluded one stops being
+        rule-excluded (a deliberate override, named by the popup until the next Save)."""
+        with self._lock:
+            back = set(tables) & self._rule_excluded_tables
+            self._rule_excluded_tables -= back
+            self._rule_reticked_tables |= back
+
+    def add_pending_rule(self, line: str) -> bool:
+        """Queue a suggested rule line for the popup, unless the same rule (ignoring its
+        comment and spacing) is already pending or saved. Returns whether it was added."""
+        from dsql_migrator.core.exclusion_rules import split_rule_comment
+
+        def _key(text: str) -> str:
+            return " ".join(split_rule_comment(text)[0].split())
+
+        with self._lock:
+            seen = {_key(x) for x in self._exclusion_pending_rules}
+            seen |= {_key(x) for x in (self._exclusion_rules_text or "").splitlines()}
+            if not _key(line) or _key(line) in seen:
+                return False
+            self._exclusion_pending_rules.append(line)
+            return True
+
+    def pending_rules(self) -> list[str]:
+        with self._lock:
+            return list(self._exclusion_pending_rules)
+
+    def restore_exclusion_rules(
+        self,
+        text: Optional[str],
+        rule_excluded_tables: "Iterable[str]" = (),
+        pending: "Iterable[str]" = (),
+    ) -> None:
+        """Restore the re-editing fields from a snapshot (no operator semantics)."""
+        with self._lock:
+            self._exclusion_rules_text = text
+            self._rule_excluded_tables = set(rule_excluded_tables or ())
+            self._exclusion_pending_rules = list(pending or ())
+
     def restore_lob_exclusion(self, table: str, column: str) -> None:
         """Restore one stored exclusion from a snapshot (no operator semantics)."""
         with self._lock:
@@ -594,6 +742,16 @@ class DataMigrationState:
                 for t, c in dict(legacy_columns or {}).items()
                 if set(c) & adopted.get(t, set())
             }
+            # True rule text for the adopted set (no false drift, no false legacy comment).
+            from dsql_migrator.core.exclusion_rules import synthesize_rule_text
+
+            lines = synthesize_rule_text(
+                adopted, self._legacy_exclusions,
+                adopted_from=expect_stack or self.cdc_stack_name or "the attached stack",
+            )
+            if lines:
+                before = (self._exclusion_rules_text or "").rstrip("\n")
+                self._exclusion_rules_text = f"{before}\n{lines}" if before else lines
             return True
 
     def legacy_exclusions(self) -> dict[str, frozenset[str]]:
