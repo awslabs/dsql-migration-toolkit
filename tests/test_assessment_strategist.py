@@ -1129,11 +1129,10 @@ def test_the_cdc_chat_never_advises_hand_editing_the_connector_config() -> None:
            "column.exclude.list": "ecommerce.product_media.content"
 
     That is not doable from this UI and it is not necessary: THE TOOL OWNS that setting. It
-    writes column.exclude.list itself from the migration's LOB exclusion and re-sends it on
-    every Start CDC, so the change reaches a RUNNING pipeline with no cdc-stack teardown and no
-    manual connector restart (verified by executing the real parameter builders:
-    ColumnExcludeList lands in params.filled, in the start-pass overrides, and config_changed
-    returns True against a stack carrying the old value).
+    writes column.exclude.list itself from the migration's exclusion rules (ColumnExcludeList
+    lands in params.filled and in the start-pass overrides). Since P3 the exclusions are
+    fixed while a stack exists, so the grounding names the UI's own runbook (Delete, Change &
+    reload, Deploy, Start), never a Stop + Start.
 
     Advice the operator cannot execute is worse than no advice -- it sends them to the AWS
     console for a control this screen already has.
@@ -1146,11 +1145,13 @@ def test_the_cdc_chat_never_advises_hand_editing_the_connector_config() -> None:
     assert "NEVER tell the operator to hand-edit connector configuration" in system
     assert "column.exclude.list" in system
     assert "THIS TOOL OWNS" in system
-    # ...and it corrects the premise that made the bad advice look necessary.
-    assert "re-sends it on EVERY Start CDC" in system
-    assert "no cdc-stack teardown" in system
+    # ...and it states how the tool carries the exclusions (P3: fixed while a stack
+    # exists -- Stop alone is not enough).
+    assert "bakes it into the CDC infrastructure" in system
+    assert "Stop CDC alone is NOT enough" in system
     # It must point at the IN-APP control instead of leaving a vacuum.
-    assert "Exclude-column action on the quarantine card" in system
+    assert "'Exclude tables & columns'" in system
+    assert "picker" not in system and "no cdc-stack teardown" not in system
 
 
 def test_the_cdc_chat_knows_the_oversized_value_class_and_its_order() -> None:
@@ -1158,8 +1159,8 @@ def test_the_cdc_chat_knows_the_oversized_value_class_and_its_order() -> None:
     which is the most common quarantine in practice and the only one with a permanent verdict.
 
     Without it the model treated an oversized row as retryable. The order of the recovery also
-    matters and is load-bearing: a reload while the sink is live is forced into APPEND mode, so
-    the rows already on the target would keep the old column set.
+    matters and is load-bearing: a table cannot be dropped while CDC streams to it, and a
+    stopped stack keeps its exclusions, so the stack is deleted before Change & reload.
     """
     from dsql_migrator.core.assessment_strategist import build_cdc_error_chat_system
 
@@ -1170,10 +1171,10 @@ def test_the_cdc_chat_knows_the_oversized_value_class_and_its_order() -> None:
     # Permanent, and the model must not suggest otherwise.
     assert "NEVER retried" in system
     assert "do not suggest retrying" in system
-    # The ordered runbook, including WHY Stop CDC comes before the reload.
-    assert "Stop CDC" in system
-    assert "APPEND mode" in system
-    assert "choosing DROP" in system
+    # The ordered runbook: Stop + Delete, then Change & reload, then Deploy + Start.
+    assert "Stop CDC, then Delete the CDC infrastructure" in system
+    assert "use Change & reload" in system
+    assert "Deploy the CDC infrastructure again and Start CDC" in system
     # The migration-wide side effect is disclosed, not buried.
     assert "MIGRATION-WIDE" in system
     assert "Validation" in system

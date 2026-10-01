@@ -177,7 +177,7 @@ def render_exclusion_button_row(ui, ctx: ExclusionDialogContext):
             ),
             state.lob_exclusions(),
         )
-        over = {k for k, (verdict, _at) in state.value_sizes().items() if verdict == "over"}
+        over = {k for k, entry in state.value_sizes().items() if entry[0] == "over"}
         summary = exclusion_row_summary(
             state, locked=lock.locked, drift=drift, block_reason=block,
             blocking_count=errors, lob_candidates=lob, measured_over=over,
@@ -385,6 +385,23 @@ def _apply_route_view(view: dict, lob_filter: Optional[str]) -> None:
         view["lob_table"] = lob_filter
 
 
+def _render_hint(ui, hint, go_to=None) -> None:
+    """A route hint ``(tone, text[, lines])``: ``lines`` (an include that keeps the column)
+    get a Go to button where the editor exists."""
+    if not hint:
+        return
+    lines = hint[2] if len(hint) > 2 and go_to is not None else ()
+    if not lines:
+        inline_hint(ui, hint[1], tone=hint[0])
+        return
+    with ui.row().classes("items-center gap-2 w-full no-wrap"):
+        inline_hint(ui, hint[1], tone=hint[0])
+        ui.space()
+        for n in lines:
+            ui.button(f"Go to L{n}", on_click=lambda _e=None, n=n: go_to(n)).props(
+                "flat dense no-caps size=sm color=primary")
+
+
 def _shown_matches(held: dict, tables: Sequence[str] = ()) -> bool:
     """Whether the click acts on what the dialog last SHOWED (the preview is debounced,
     so a click can land before it caught up with the text)."""
@@ -449,8 +466,7 @@ def _build_edit_dialog(ui, ctx: ExclusionDialogContext, *, insert_lines=(), hint
                 "flat dense round size=sm icon=close color=grey-7"
             ).tooltip("Close without saving")
         ui.label(HELP_TEXT).classes("text-xs text-gray-600")
-        if hint:
-            inline_hint(ui, hint[1], tone=hint[0])
+        _render_hint(ui, hint, lambda n: _go_to_line(n))
         editor = ui.codemirror(
             text, language=None, theme="basicLight", line_wrapping=False,
             on_change=lambda e: _on_edit(getattr(e, "value", "")),
@@ -541,7 +557,7 @@ def _build_edit_dialog(ui, ctx: ExclusionDialogContext, *, insert_lines=(), hint
         with ui.row().classes("w-full justify-end gap-2"):
             ui.button("Cancel", on_click=_close).props("flat no-caps color=grey-8")
             save_button = ui.button("Save", on_click=_save).props("no-caps color=primary")
-        state.set_size_check_listener(_run_preview_now)
+        state.add_size_check_listener(_run_preview_now)
         preview()
     ui.timer(0.05, dialog.open, once=True)
     return dialog
@@ -756,7 +772,13 @@ def lob_rows(ctx: ExclusionDialogContext, inventory, inputs, resolution) -> "lis
             base = source.lower().split("(")[0].strip()
             target = target_types.get(name, "")
             limit_type = target or base
-            limit = _format_limit(dsql_value_limit_bytes(limit_type))
+            limit_bytes = dsql_value_limit_bytes(limit_type)
+            limit = _format_limit(limit_bytes)
+            # A verdict measured against another limit (the target type was edited since)
+            # says nothing about this one: shown as not checked.
+            entry = sizes.get((candidate.table, name))
+            result = (entry[:2] if entry is not None and entry[2] in (None, limit_bytes)
+                      else None)
             compressed = dsql_value_limit_is_compressed(limit_type) and limit_type != "bytea"
             collation = (getattr(column, "collation", None) or "").lower()
             charset = None
@@ -768,8 +790,8 @@ def lob_rows(ctx: ExclusionDialogContext, inventory, inputs, resolution) -> "lis
             rows.append({
                 "table": candidate.table, "column": name, "source": source, "target": target,
                 "allows": _TYPE_ALLOWS.get(source_type, {}).get(base),
-                "limit": limit, "compressed": compressed, "charset": charset,
-                "result": sizes.get((candidate.table, name)),
+                "limit": limit, "limit_bytes": limit_bytes, "compressed": compressed,
+                "charset": charset, "result": result,
                 "kept_by": resolution.kept_by.get((candidate.table, name), ()),
                 "blocked": (" ".join(f.message for f in verdict.findings)
                             if verdict.blocked else None),
@@ -783,7 +805,7 @@ def _size_label(result, charset: "Optional[str]") -> "tuple[str, str]":
         return "Not checked", "neutral"
     from datetime import timezone
 
-    verdict, at = result
+    verdict, at = result[0], result[1]
     when = at.astimezone(timezone.utc).strftime("%H:%M UTC") if at is not None else ""
     if verdict == "unknown":
         return ("Not determined: the read failed, took longer than 15 s, or was cancelled",
@@ -811,12 +833,14 @@ def _render_lob_section(ui, ctx, inventory, inputs, resolution, view, add_rules,
         if not view.get("lob_open"):
             return
         rows = lob_rows(ctx, inventory, inputs, resolution)
-        addable_over = [r for r in rows if r["result"] and r["result"][0] == "over"
-                        and not r["kept_by"] and not r["blocked"]]
         ui.label("Type-based: these types can hold a value over Aurora DSQL's per-value limit. "
                  "Sizes are measured only if you ask.").classes("text-xs text-gray-600")
         table_filter = view.get("lob_table")
         shown_rows = [r for r in rows if not table_filter or r["table"] == table_filter]
+        # The bulk add covers only the rows on screen: under a table filter (the quarantine
+        # route) a hidden table's row must never be queued for a drop and reload.
+        addable_over = [r for r in shown_rows if r["result"] and r["result"][0] == "over"
+                        and not r["kept_by"] and not r["blocked"]]
         pages = max(1, -(-len(shown_rows) // _PAGE_SIZE))
         page = min(max(1, int(view.get("lob_page", 1))), pages)
         view["lob_page"] = page
@@ -942,10 +966,14 @@ async def _check_sizes(ctx: ExclusionDialogContext, rows, rerun, notify=None) ->
     session = ctx.session
 
     def _refresh() -> None:
-        # The popup on screen now (it may have been closed and reopened mid-pass), and the
-        # row under the tree, whose LOB line follows a found offender.
-        current = state.size_check_listener() or rerun
-        current()
+        # Every popup on screen now -- one per tab, and the starter's may have been closed
+        # and reopened mid-pass -- and the row under the tree, whose LOB line follows a
+        # found offender.
+        for listener in state.size_check_listeners() or (rerun,):
+            try:
+                listener()
+            except Exception:  # noqa: BLE001 - a popup whose tab is gone
+                state.clear_size_check_listener(listener)
         row_refresh = ctx.extra.get("row_refresh")
         if row_refresh is not None:
             row_refresh()
@@ -974,16 +1002,17 @@ async def _check_sizes(ctx: ExclusionDialogContext, rows, rerun, notify=None) ->
                 if state.size_check_cancelled():
                     break
                 names = [r["column"] for r in cols]
+                limits = {r["column"]: r.get("limit_bytes") or dsql_value_limit_bytes(
+                    r["target"] or r["source"]) for r in cols}
                 answer = await run.io_bound(
                     probe.oversized_values, table, names,
                     limit_bytes=dsql_value_limit_bytes(""),
                     timeout_seconds=VALUE_SIZE_PROBE_TIMEOUT_SECONDS,
-                    limits={r["column"]: dsql_value_limit_bytes(r["target"] or r["source"])
-                            for r in cols},
+                    limits=limits,
                     column_types={r["column"]: r["source"] for r in cols},
                     engine=engine, should_cancel=state.size_check_cancelled,
                 )
-                state.record_value_sizes(table, answer or {}, asked=names)
+                state.record_value_sizes(table, answer or {}, asked=names, limits=limits)
                 _refresh()
         finally:
             await run.io_bound(engine.dispose)
@@ -1102,8 +1131,7 @@ def _build_read_only_dialog(ui, ctx: ExclusionDialogContext, lock, *, hint=None,
             ).tooltip("Close")
         render_notice(ui, tone="info", header=_LOCK_HEADERS.get(lock.tier, "Locked"),
                       body=lock.reason or "")
-        if hint:
-            inline_hint(ui, hint[1], tone=hint[0])
+        _render_hint(ui, hint)
         _render_pending(ui, pending)
         ui.codemirror(text, language=None, theme="basicLight", line_wrapping=False).classes(
             "w-full exclusion-rules-editor").props("disable")
@@ -1220,8 +1248,7 @@ def _build_reload_dialog(ui, ctx: ExclusionDialogContext, *, insert_lines=(), hi
             ).tooltip("Close without saving")
         ui.label("Column rules are editable. Tables are fixed after a Full Load (use Start "
                  "over to change them).").classes("text-xs text-gray-600")
-        if hint:
-            inline_hint(ui, hint[1], tone=hint[0])
+        _render_hint(ui, hint, lambda n: _go_to_line(n))
         editor = ui.codemirror(
             text, language=None, theme="basicLight", line_wrapping=False,
             on_change=lambda e: _on_edit(getattr(e, "value", "")),
@@ -1322,7 +1349,7 @@ def _build_reload_dialog(ui, ctx: ExclusionDialogContext, *, insert_lines=(), hi
                 # The retry refused before taking the forced set: never leave it armed.
                 state.clear_exclusion_forced_replace()
 
-        state.set_size_check_listener(_run_preview_now)
+        state.add_size_check_listener(_run_preview_now)
         preview()
     ui.timer(0.05, dialog.open, once=True)
     return dialog
@@ -1455,7 +1482,8 @@ def open_exclusion_route(ui, ctx: ExclusionDialogContext, table: str, reason_tex
         source_type=session_source_type(ctx.session),
     )
     when = "after the Delete" if lock.tier in (0, 1, 2) else "once Change & reload is available"
-    hint = _route_hint(outcome, table, text, editable, when)
+    still_open = open_lob_candidates(candidates, resolution.columns.get(table, frozenset()))
+    hint = _route_hint(outcome, table, text, editable, when, still_open)
     if editable or not lock.locked:
         open_exclusion_dialog(
             ui, ctx, mode="change_and_reload" if editable else "edit",
@@ -1469,7 +1497,8 @@ def open_exclusion_route(ui, ctx: ExclusionDialogContext, table: str, reason_tex
     open_exclusion_dialog(ui, ctx, mode="read_only", hint=hint)
 
 
-def _route_hint(outcome, table: str, text: str, editable: bool, when: str):
+def _route_hint(outcome, table: str, text: str, editable: bool, when: str,
+                still_open: Sequence = ()):
     lines = text.split("\n")
 
     def _quote(numbers) -> str:
@@ -1483,7 +1512,10 @@ def _route_hint(outcome, table: str, text: str, editable: bool, when: str):
         notes += [f"{table}.{c}: its name has a line break and cannot be written as a rule; "
                   "exclude the table, or edit the target DDL in Schema Conversion."
                   for c in outcome.unwritable]
-        return ("neutral", " ".join(notes)) if notes else None
+        if not notes:
+            return None
+        go_to = tuple(sorted({n[0] for n in outcome.kept.values() if n})) if editable else ()
+        return ("neutral", " ".join(notes), go_to)
     if outcome.outcome == "NOT_SAVED":
         if editable:
             return ("neutral", f"Already excluded by {_lines_text(outcome.not_saved_lines)} "
@@ -1491,22 +1523,30 @@ def _route_hint(outcome, table: str, text: str, editable: bool, when: str):
         return ("neutral", f"{table}: already excluded by a line not saved yet "
                 f"({_quote(outcome.not_saved_lines)}); {when}, Save it in Change & reload.")
     if outcome.outcome == "B":
-        text_b = ("The database reported a type, not a column, so no rule was added: pick the "
-                  "column that holds the oversized value with [+ add rule].")
+        if editable:
+            text_b = ("The database reported a type, not a column, so no rule was added: pick "
+                      "the column that holds the oversized value with [+ add rule].")
+        else:
+            # The read-only popup has no candidate list and no [+ add rule]: name them.
+            names = ", ".join(f"{c} ({t})" for c, t in still_open[:_SHOWN])
+            more = f", and {len(still_open) - _SHOWN} more" if len(still_open) > _SHOWN else ""
+            text_b = ("The database reported a type, not a column, so no rule was added."
+                      + (f" Columns of {table} that can hold it: {names}{more}." if names
+                         else ""))
         if not outcome.filter_table and outcome.not_saved_lines:
             text_b += (f" Every flagged column of {table} is already excluded by "
                        f"{_lines_text(outcome.not_saved_lines)} (not saved yet): Save to drop "
                        f"and reload {table}, or type a rule for a column this tool does not "
                        "flag.")
         if not editable:
-            text_b += f" {when}, pick it in Change & reload."
+            text_b += f" {when[0].upper()}{when[1:]}, pick it in Change & reload."
         return ("warning", text_b)
     text_c = (f"Every column of {table} whose type this tool flags as oversized is already "
               "excluded by your saved rules, so the value the database rejected is in another "
               "column (for example JSON or spatial, which are not flagged). Type a rule for "
               f"that column: exclude {table}.<column>.")
     if not editable:
-        text_c += f" {when}, type it in Change & reload."
+        text_c += f" {when[0].upper()}{when[1:]}, type it in Change & reload."
     return ("warning", text_c)
 
 

@@ -3050,6 +3050,11 @@ def test_source_value_size_records_what_it_measured() -> None:
         result = check_source_value_size(table, ["a", "b"], oversized)
         assert result.check_id is PrerequisiteCheckId.SOURCE_VALUE_SIZE
         assert result.measured == expected
+        assert result.measured_limits == {name: 1024 * 1024 for name in expected}
+    # The TARGET type's limit when known (an edit remaps it).
+    result = check_source_value_size(table, ["a"], {"a": False},
+                                     limit_types={"a": "varchar(100000)"})
+    assert result.measured_limits == {"a": 65535}
 
 
 def test_the_report_fills_the_value_size_cache() -> None:
@@ -3065,10 +3070,12 @@ def test_the_report_fills_the_value_size_cache() -> None:
     state = DataMigrationState()
     report = PrerequisiteReport.build(MigrationMode.FULL_LOAD, [PrerequisiteResult(
         check_id=PrerequisiteCheckId.SOURCE_VALUE_SIZE, title="t", status=PrerequisiteStatus.WARN,
-        required=False, target="shop.docs", measured={"a": True, "b": False})])
+        required=False, target="shop.docs", measured={"a": True, "b": False},
+        measured_limits={"a": 1048576, "b": 65535})])
     state.set_prereq_report(MigrationMode.FULL_LOAD, report)
     sizes = state.value_sizes()
     assert sizes[("shop.docs", "a")][0] == "over" and sizes[("shop.docs", "b")][0] == "ok"
+    assert sizes[("shop.docs", "a")][2] == 1048576 and sizes[("shop.docs", "b")][2] == 65535
 
 
 

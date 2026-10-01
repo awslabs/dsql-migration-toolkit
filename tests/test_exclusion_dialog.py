@@ -794,6 +794,51 @@ def test_outcome_b_filters_the_lob_section_and_c_shows_the_type_a_rule_hint():
     assert "disable" not in " ".join(ui2.editors[-1].props_seen)  # still editable
 
 
+def test_outcome_b_bulk_add_covers_only_the_filtered_table():
+    # Review #4: a hidden table's over-limit row must not be queued for a drop and reload.
+    ctx, state, _jobs, submitted = _reload_ctx()
+    state._excluded_lob_columns.clear()
+    state.restore_exclusion_rules("", ())
+    state.record_value_sizes("shop.t", {"a": True}, asked=["a"], limits={"a": 1024 * 1024})
+    ui = _Ui()
+    open_exclusion_route(ui, ctx, "shop.u", "... not supported for jsonb",
+                         lob_candidates_for=lambda _t: (("note", "longtext"),))
+    lob = next(el for t, (_h, el) in ui.expansions.items() if t.startswith("Oversized-LOB"))
+    assert lob.value is True  # opened, filtered to shop.u
+    assert not any(str(b).startswith("+ add rules for the") for b in ui.buttons)
+    assert "Drop & reload shop.t" not in ui.buttons
+    # Unfiltered, the same verdict is offered.
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx, mode="change_and_reload")
+    ui.expand("Oversized-LOB candidates")
+    assert "+ add rules for the 1 over the limit" in ui.buttons
+
+
+def test_read_only_outcome_b_names_the_open_candidates_not_a_missing_button():
+    ctx, state, _jobs, _submitted = _reload_ctx()
+    state._excluded_lob_columns.clear()
+    state.restore_exclusion_rules("", ())
+    state.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
+    ui = _Ui()
+    open_exclusion_route(ui, ctx, "shop.t", "... not supported for jsonb", lob_candidates_for=_CANDS)
+    (hint,) = [t for t in ui.texts if t.startswith("The database reported a type")]
+    assert "[+ add rule]" not in hint
+    assert "Columns of shop.t that can hold it: a (longtext), b (text)." in hint
+    assert hint.endswith("After the Delete, pick it in Change & reload.")
+
+
+def test_an_include_kept_quarantine_column_gets_go_to_its_line():
+    ctx, state, _jobs, _submitted = _reload_ctx()
+    state.restore_exclusion_rules("exclude shop.t.*\ninclude shop.t.a", ())
+    js = []
+    ui = _Ui()
+    ui.run_javascript = lambda code: js.append(code)
+    open_exclusion_route(ui, ctx, "shop.t", _TEXT_REASON, lob_candidates_for=_CANDS)
+    assert any(t.startswith("shop.t.a is kept by the include on L2") for t in ui.texts)
+    ui.click("Go to L2")
+    assert js and "Math.min(2," in js[-1]
+
+
 def test_not_saved_names_the_line_and_save():
     ctx, state, _jobs, _submitted = _reload_ctx()
     state._excluded_lob_columns.clear()
@@ -980,16 +1025,40 @@ def test_a_pass_refreshes_the_popup_on_screen_and_keeps_earlier_verdicts(monkeyp
     ctx.session.source_config = object()
     ctx.session.source_password = None
     t0 = datetime(2026, 10, 1, 5, 2, tzinfo=timezone.utc)
-    state._value_size_cache[("shop.t", "b")] = ("over", t0)
+    mib = 1024 * 1024  # text's limit, the one this pass measures against
+    state._value_size_cache[("shop.t", "b")] = ("over", t0, mib)
     seen = []
-    state.set_size_check_listener(lambda: seen.append("current"))
+    state.add_size_check_listener(lambda: seen.append("current"))
     state.cancel_size_check  # noqa: B018
     _patch_probe(monkeypatch, answers={}, log=log, on_call=state.cancel_size_check)
     asyncio.run(dlg._check_sizes(ctx, _rows(("shop.t", "a"), ("shop.t", "b")), lambda: seen.append("starter")))
     assert "current" in seen and "starter" not in seen
     sizes = state.value_sizes()
-    assert sizes[("shop.t", "b")] == ("over", t0)  # an unfinished pass never undoes a result
+    assert sizes[("shop.t", "b")] == ("over", t0, mib)  # an unfinished pass never undoes a result
     assert sizes[("shop.t", "a")][0] == "unknown"
+
+
+def test_a_pass_refreshes_every_open_popup_and_drops_a_dead_one(monkeypatch):
+    # Review #4: two tabs share one state; the popup that started the pass is refreshed
+    # too, and a listener whose tab is gone is dropped instead of failing the pass.
+    log = []
+    _patch_probe(monkeypatch, answers={("shop.t", "a"): True}, log=log)
+    state = DataMigrationState()
+    ctx, _calls = _ctx(state)
+    ctx.session.connection_ready = lambda: True
+    ctx.session.source_config = object()
+    ctx.session.source_password = None
+    seen = []
+
+    def _dead():
+        raise RuntimeError("client deleted")
+
+    for listener in (lambda: seen.append("A"), lambda: seen.append("B"), _dead):
+        state.add_size_check_listener(listener)
+    asyncio.run(dlg._check_sizes(ctx, _rows(("shop.t", "a")), lambda: seen.append("starter")))
+    assert "A" in seen and "B" in seen and "starter" not in seen
+    assert len(state.size_check_listeners()) == 2
+    assert state.value_sizes()[("shop.t", "a")][0] == "over"
 
 
 def test_an_unreachable_source_measures_nothing_and_says_so(monkeypatch):
@@ -1049,6 +1118,45 @@ def test_include_kept_candidates_are_measured_too():
                for t in ui.texts)
 
 
+def test_a_verdict_holds_only_for_the_limit_it_was_measured_against():
+    # Review #4: text (1 MiB) measured "ok", then the target type edited to varchar(100000)
+    # (65,535 B): the row reads Not checked, and an unfinished pass for the new limit does
+    # not keep the old "ok".
+    from dsql_migrator.core.models import TableSelection
+
+    mib = 1024 * 1024
+    state = DataMigrationState()
+    state.set_selection(TableSelection(selected_tables=[t.name for t in INV.tables]))
+    state.record_value_sizes("shop.t", {"a": False}, asked=["a"], limits={"a": mib})
+    assert state.value_sizes()[("shop.t", "a")][::2] == ("ok", mib)
+    state.record_value_sizes("shop.t", {}, asked=["a"], limits={"a": 65535})
+    assert state.value_sizes()[("shop.t", "a")][::2] == ("unknown", 65535)
+    state.record_value_sizes("shop.t", {}, asked=["a"], limits={"a": 65535})
+    assert state.value_sizes()[("shop.t", "a")][0] == "unknown"
+    # Same limit: an unfinished pass keeps the earlier result.
+    state.record_value_sizes("shop.t", {"a": True}, asked=["a"], limits={"a": 65535})
+    state.record_value_sizes("shop.t", {}, asked=["a"], limits={"a": 65535})
+    assert state.value_sizes()[("shop.t", "a")][0] == "over"
+
+
+def test_lob_rows_show_a_verdict_for_another_limit_as_not_checked():
+    from datetime import datetime, timezone
+
+    ctx, _calls = _ctx()
+    state = ctx.migration_state
+    at = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    state._value_size_cache[("shop.t", "a")] = ("ok", at, 65535)  # not longtext's 1 MiB
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx)
+    ui.expand("Oversized-LOB candidates")
+    assert not any("No value over the limit" in t for t in ui.texts)
+    state._value_size_cache[("shop.t", "a")] = ("ok", at, 1024 * 1024)
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx)
+    ui.expand("Oversized-LOB candidates")
+    assert any("No value over the limit" in t for t in ui.texts)
+
+
 def test_dotted_names_keep_their_own_size_verdict():
     from datetime import datetime, timezone
 
@@ -1083,6 +1191,15 @@ def test_no_surface_renders_the_old_card_name():
     for path in root.glob("*.py"):
         text = path.read_text(encoding="utf-8")
         assert "'Oversized LOB columns'" not in text and '"Oversized LOB columns' not in text, path.name
+        # Review #4: the copy sweep's two stragglers.
+        assert "(oversized LOB)" not in text and "at capture (the panel below)" not in text, path.name
+
+
+def test_the_cdc_limits_fact_points_at_the_popup():
+    from dsql_migrator.ui.data_migration._models import cdc_handling_facts
+
+    (fact,) = [f for f in cdc_handling_facts() if f.title.startswith("Very large values")]
+    assert "Exclude tables & columns (under the table list)" in fact.detail
 
 
 def test_the_cdc_step_summary_shows_what_cdc_receives_as_deployed():
@@ -1100,6 +1217,37 @@ def test_the_cdc_step_summary_shows_what_cdc_receives_as_deployed():
     assert any(t.startswith("What CDC receives (") and t.endswith("as deployed)")
                for t in ui.expansions)
     assert "shop.t.a" in ui.texts
+
+
+def test_the_cdc_step_summary_shows_what_start_sends_when_it_differs_from_the_stack():
+    # Review #4: an attached infra-only stack carries nothing; Start CDC sends the
+    # session's own set, so the summary must not show the deployed "" as what CDC receives.
+    from dsql_migrator.core.models import SourceInventory
+    from dsql_migrator.ui.data_migration._cdc_ui import _render_cdc_exclusion_summary
+
+    from dsql_migrator.core.models import TableSelection
+
+    state = DataMigrationState()
+    state.set_selection(TableSelection(selected_tables=[t.name for t in INV.tables]))
+    state.restore_lob_exclusion("shop.t", "a")
+    state.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
+    state.set_cdc_deployed_column_exclude_list("")
+    ui = _Ui()
+    _render_cdc_exclusion_summary(ui, state, SimpleNamespace(get_status=_none),
+                                  SourceInventory(tables=list(INV.tables)))
+    assert any(t.startswith("What CDC receives (") and t.endswith("Start CDC sends)")
+               for t in ui.expansions)
+    assert "shop.t.a" in ui.texts
+    assert any(t.startswith("As deployed: (nothing excluded at capture).") for t in ui.texts)
+    # Review #4: the open state survives the CDC step's 5 s re-render.
+    (title,) = [t for t in ui.expansions if t.startswith("What CDC receives (")]
+    handler, element = ui.expansions[title]
+    assert element.value is False
+    handler(SimpleNamespace(value=True))
+    again = _Ui()
+    _render_cdc_exclusion_summary(again, state, SimpleNamespace(get_status=_none),
+                                  SourceInventory(tables=list(INV.tables)))
+    assert again.expansions[title][1].value is True
 
 
 def test_saved_entry_notes_stay_visible_after_the_lock():

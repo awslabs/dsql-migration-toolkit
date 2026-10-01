@@ -3256,7 +3256,8 @@ def cdc_handling_facts() -> list[CdcHandlingFact]:
             title=f"Very large values (over {_DSQL_VALUE_LIMIT_MIB} MiB) must be excluded",
             detail=(
                 "A value too large to stream cannot be recovered later. Exclude such "
-                "oversized LOB/TEXT columns at capture (the panel below)."
+                "columns in Exclude tables & columns (under the table list); CDC then "
+                "never captures them."
             ),
             evidence="H13",
         ),

@@ -208,13 +208,15 @@ class DataMigrationState:
         # The popup's last resolution per slot ({slot: (key, held inputs, result)}): the
         # row and the popup re-resolve only when an input changed. Transient.
         self._exclusion_resolution_memo: dict = {}
-        # Measured value sizes, (table, column) -> ("over" | "ok" | "unknown", when): from
-        # the prerequisite run's SOURCE_VALUE_SIZE answers or the popup's Check sizes.
+        # Measured value sizes, (table, column) -> ("over" | "ok" | "unknown", when,
+        # limit bytes or None): from the prerequisite run's SOURCE_VALUE_SIZE answers or
+        # the popup's Check sizes. A verdict holds only for the limit it was measured
+        # against. Transient.
+        self._value_size_cache: dict[tuple[str, str], tuple[str, datetime, Optional[int]]] = {}
+        # Every open popup's refresh (one per tab: tabs share this state), so a Check
+        # sizes pass refreshes each popup on screen, not only the one that started it.
         # Transient.
-        self._value_size_cache: dict[tuple[str, str], tuple[str, datetime]] = {}
-        # The open popup's refresh, so a Check sizes pass refreshes the popup on screen,
-        # not only the one that started it. Transient.
-        self._size_check_listener: Optional[Callable[[], None]] = None
+        self._size_check_listeners: list[Callable[[], None]] = []
         # The row's last drift summary ("Your rules now match ... - review"), repeated in
         # the Start dialog; never applied, never a gate. Transient.
         self._exclusion_drift_text: Optional[str] = None
@@ -222,6 +224,9 @@ class DataMigrationState:
         # between columns. Transient.
         self._size_check_running: bool = False
         self._size_check_cancel: bool = False
+        # Whether the CDC step's "What CDC receives" is expanded: that step re-renders on
+        # a 5 s poll in some phases, which must not snap it shut. Transient.
+        self.cdc_receives_open: bool = False
         # Composite-PK record-key override for CDC, keyed by db.table -> target key
         # columns [leading, pk...]. Set from the applied Schema Conversion when a
         # table's DSQL target has a composite key, so Debezium re-keys the change
@@ -1740,9 +1745,11 @@ class DataMigrationState:
             for result in getattr(report, "results", None) or ():
                 measured = getattr(result, "measured", None)
                 if measured and result.target:
+                    limits = getattr(result, "measured_limits", None) or {}
                     for column, over in measured.items():
                         self._value_size_cache[(result.target, column)] = (
-                            "over" if over else "ok", self._prereq_report_checked_at[mode])
+                            "over" if over else "ok", self._prereq_report_checked_at[mode],
+                            limits.get(column))
             self._prereq_report_lob_exclusions[mode] = {
                 table: frozenset(cols)
                 for table, cols in self._excluded_lob_columns.items()
@@ -1754,35 +1761,47 @@ class DataMigrationState:
     def set_exclusion_drift_text(self, text: Optional[str]) -> None:
         self._exclusion_drift_text = text
 
-    def value_sizes(self) -> "dict[tuple[str, str], tuple[str, datetime]]":
-        """The measured value sizes ((table, column) -> ("over" | "ok" | "unknown", when))."""
+    def value_sizes(self) -> "dict[tuple[str, str], tuple[str, datetime, Optional[int]]]":
+        """The measured value sizes ((table, column) -> ("over" | "ok" | "unknown", when,
+        the limit in bytes it was measured against, or None))."""
         with self._lock:
             return dict(self._value_size_cache)
 
     def record_value_sizes(
-        self, table: str, answer: "Mapping[str, bool]", asked: "Iterable[str]" = ()
+        self, table: str, answer: "Mapping[str, bool]", asked: "Iterable[str]" = (),
+        limits: "Optional[Mapping[str, int]]" = None,
     ) -> None:
-        """Record one table's measured columns (the popup's Check sizes). A column ``asked``
-        but absent from ``answer`` was not determined -- recorded as such only when no
-        earlier measurement exists: a pass that did not finish never undoes a result."""
+        """Record one table's measured columns (the popup's Check sizes), each with the
+        limit it was measured against (``limits``). A column ``asked`` but absent from
+        ``answer`` was not determined -- recorded as such only when no earlier measurement
+        for the SAME limit exists: a pass that did not finish never undoes a result, and
+        never keeps one measured against another limit."""
         now = datetime.now(timezone.utc)
+        limits = limits or {}
         with self._lock:
             for column in asked or ():
                 key = (table, column)
-                if column not in (answer or {}) and key not in self._value_size_cache:
-                    self._value_size_cache[key] = ("unknown", now)
+                earlier = self._value_size_cache.get(key)
+                if column not in (answer or {}) and (
+                        earlier is None or earlier[2] != limits.get(column)):
+                    self._value_size_cache[key] = ("unknown", now, limits.get(column))
             for column, over in (answer or {}).items():
-                self._value_size_cache[(table, column)] = ("over" if over else "ok", now)
+                self._value_size_cache[(table, column)] = (
+                    "over" if over else "ok", now, limits.get(column))
 
-    def set_size_check_listener(self, listener: "Optional[Callable[[], None]]") -> None:
-        self._size_check_listener = listener
+    def add_size_check_listener(self, listener: "Callable[[], None]") -> None:
+        with self._lock:
+            if not any(x is listener for x in self._size_check_listeners):
+                self._size_check_listeners.append(listener)
 
     def clear_size_check_listener(self, listener: "Callable[[], None]") -> None:
-        if self._size_check_listener is listener:
-            self._size_check_listener = None
+        with self._lock:
+            self._size_check_listeners = [
+                x for x in self._size_check_listeners if x is not listener]
 
-    def size_check_listener(self) -> "Optional[Callable[[], None]]":
-        return self._size_check_listener
+    def size_check_listeners(self) -> "tuple[Callable[[], None], ...]":
+        with self._lock:
+            return tuple(self._size_check_listeners)
 
     def begin_size_check(self) -> bool:
         """Start a Check sizes pass unless one runs (single-flight)."""

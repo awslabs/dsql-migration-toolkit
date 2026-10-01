@@ -951,22 +951,63 @@ def _proof_summary(report: ValidationReport) -> dict:
 
 
 def legacy_values_remedy(migration_state, job_manager) -> str:
-    """How an omit-only entry becomes NULL in THIS session: Change & reload converts it
-    only where that is reachable (a Full Load type whose job record exists); otherwise
-    the true remedy for the lock."""
-    from dsql_migrator.ui.data_migration._cdc_monitoring import exclusion_lock_state
+    """How an omit-only entry becomes NULL in THIS session, built from the same lock state
+    so it never names a step the lock forbids.
+
+    The rows only become NULL when the table is dropped and reloaded. Change & reload does
+    that while the Full Load's job record exists (on a Full Load type: CDC only switches
+    first); otherwise Start over and a Full Load that drops and recreates the table. A
+    stack must be deleted first in both cases -- a fresh session would find it and adopt
+    the same omit-only column again -- and a running create or delete must finish."""
+    from dsql_migrator.ui.data_migration._cdc_monitoring import (
+        _current_job,
+        _stop_then,
+        exclusion_lock_state,
+    )
+    from dsql_migrator.ui.data_migration._cdc_state import cdc_streaming_started
+    from dsql_migrator.ui.data_migration._models import MigrationType
 
     lock = exclusion_lock_state(migration_state, job_manager)
-    if lock.cell == "R4" and lock.offers_change_and_reload:
-        return ("To load it as NULL, use Change & reload in Exclude tables & columns and "
-                "tick the table to reload it.")
-    if lock.cell == "R1":
-        return ("To load it as NULL, delete the CDC infrastructure first, then use Change & "
-                "reload in Exclude tables & columns and tick the table.")
-    if lock.cell == "R4" and lock.offers_change_type:
-        return ("To load it as NULL, switch the migration type to Full load + CDC and use "
-                "Change & reload in Exclude tables & columns there (tick the table).")
-    return "To load it as NULL, Start over and exclude it again."
+    migration_type = getattr(migration_state, "migration_type", None)
+    cdc_only = migration_type is MigrationType.CDC_ONLY
+    job_id = getattr(migration_state, "job_id", None)
+    if job_id is not None and _current_job(job_manager, job_id) is not None:
+        then = (
+            "switch the migration type to Full load + CDC and use Change & reload in "
+            "Exclude tables & columns there (tick the table)"
+            if cdc_only
+            else "use Change & reload in Exclude tables & columns and tick the table"
+        )
+    elif lock.locked:
+        then = (
+            ("Start over, choose Full load + CDC (CDC only never rewrites rows already on "
+             "Aurora DSQL), exclude it again" if cdc_only
+             else "Start over, exclude it again")
+            + ", and choose to drop and recreate the table in the Start Full Load dialog"
+        )
+    else:
+        then = (
+            ("switch the migration type to Full load + CDC, then " if cdc_only else "")
+            + "run the Full Load and choose to drop and recreate the table in its Start "
+            "dialog"
+        )
+    delete = (
+        "switch the migration type to Full load + CDC and delete the CDC infrastructure on "
+        "its CDC step"
+        if migration_type is MigrationType.FULL_LOAD_ONLY
+        else "delete the CDC infrastructure on the CDC step"
+    )
+    if lock.tier == 0:
+        steps = f"wait for the CDC infrastructure deletion to finish, then {then}"
+    elif lock.tier == 1:
+        steps = f"wait for the CDC infrastructure create to finish, {delete}, then {then}"
+    elif lock.cell in ("R1", "R1b", "R2", "R3"):
+        if cdc_streaming_started(migration_state, job_manager):
+            delete = _stop_then(migration_state, job_manager) + delete
+        steps = f"{delete}, then {then}"
+    else:
+        steps = then
+    return f"To load it as NULL, {steps}."
 
 
 def adopted_exclusions(migration_state) -> "frozenset[tuple[str, str]]":
@@ -1172,7 +1213,7 @@ def _proof_clause(summary: "ValidationSummary") -> str:
     if summary.proof_not_determined:
         parts.append(f"NULL not determined for {len(summary.proof_not_determined)} table(s)")
     if summary.legacy_values:
-        parts.append(f"{len(summary.legacy_values)} table(s) keep the target DEFAULT (earlier version)")
+        parts.append(f"{len(summary.legacy_values)} table(s) keep the target DEFAULT (omit-only)")
     if summary.null_proven:
         parts.append(f"NULL proven in {len(summary.null_proven)} table(s)")
     return ", ".join(parts) if parts else "NULL not proven"

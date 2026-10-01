@@ -2556,7 +2556,7 @@ def _render_proof_lines(report: ValidationReport) -> list[str]:
         lines.append(f"  - NULL proof not determined: {'; '.join(undetermined)}")
     if legacy:
         lines.append(
-            "  - Excluded before the NULL overlay (rows hold the target DEFAULT): "
+            "  - Excluded omit-only (rows hold the target DEFAULT, not NULL): "
             f"{'; '.join(legacy)}"
         )
     if absent:

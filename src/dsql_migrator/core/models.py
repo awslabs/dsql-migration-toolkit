@@ -1162,6 +1162,9 @@ class PrerequisiteResult(BaseModel):
     # exceeded its limit; an unmeasured column is absent. Feeds the exclusion popup's size
     # labels, so a later prerequisite run refreshes them without re-reading the source.
     measured: Optional[dict[str, bool]] = None
+    # ...and the byte limit each was measured against (a later target-type edit changes
+    # the limit, and a verdict for another limit says nothing about this one).
+    measured_limits: Optional[dict[str, int]] = None
 
 
 class PrerequisiteCheckRequest(BaseModel):

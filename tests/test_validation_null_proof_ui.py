@@ -316,6 +316,19 @@ def test_legacy_is_information_and_its_remedy_follows_the_state():
                for line in lines)
 
 
+def test_the_export_and_the_log_name_omit_only_neutrally():
+    # Review #4: the exported report and the log caveat must not call an ADOPTED column
+    # "earlier version" / "before the NULL overlay" while the panel says adopted.
+    from dsql_migrator.core.validator import render_text_report
+
+    summary, report = _summary(_item("a", counts={}, legacy={"old": 5}, excluded=("old",)))
+    text = render_text_report(report)
+    assert "Excluded omit-only (rows hold the target DEFAULT, not NULL): a (old: 5 non-NULL)" in text
+    assert "before the NULL overlay" not in text
+    caveat = verdict_evidence_caveats(summary, report)
+    assert "keep the target DEFAULT (omit-only)" in caveat and "earlier version" not in caveat
+
+
 def test_the_legacy_remedy_per_state():
     from types import SimpleNamespace
 
@@ -334,13 +347,48 @@ def test_the_legacy_remedy_per_state():
         return state
 
     found = _StubJobManager({"j": _StubJob("DONE")})
-    assert "use Change & reload" in legacy_values_remedy(_st(MigrationType.FULL_LOAD_ONLY, "j"), found)
-    assert "delete the CDC infrastructure first" in legacy_values_remedy(
-        _st(MigrationType.FULL_LOAD_AND_CDC, "j", "infra"), found)
-    assert "switch the migration type to Full load + CDC" in legacy_values_remedy(
-        _st(MigrationType.CDC_ONLY, "j"), found)
-    assert "Start over" in legacy_values_remedy(_st(MigrationType.FULL_LOAD_ONLY, "j"),
-                                                _StubJobManager({}))
+    gone = _StubJobManager({})
+    full, both, cdc = (MigrationType.FULL_LOAD_ONLY, MigrationType.FULL_LOAD_AND_CDC,
+                       MigrationType.CDC_ONLY)
+    # R4: Change & reload; CDC only switches first.
+    assert legacy_values_remedy(_st(full, "j"), found) == (
+        "To load it as NULL, use Change & reload in Exclude tables & columns and tick the "
+        "table.")
+    assert "switch the migration type to Full load + CDC and use Change & reload" in (
+        legacy_values_remedy(_st(cdc, "j"), found))
+    # R4 with the record gone: Start over and a drop-and-recreate Full Load.
+    text = legacy_values_remedy(_st(full, "j"), gone)
+    assert "Start over, exclude it again" in text and "drop and recreate" in text
+    # R1: delete first, then Change & reload; Full load only switches to delete, CDC only
+    # switches to reload.
+    text = legacy_values_remedy(_st(both, "j", "infra"), found)
+    assert text.startswith("To load it as NULL, delete the CDC infrastructure on the CDC "
+                           "step, then use Change & reload")
+    assert "switch the migration type to Full load + CDC and delete" in (
+        legacy_values_remedy(_st(full, "j", "infra"), found))
+    text = legacy_values_remedy(_st(cdc, "j", "infra"), found)
+    assert "delete the CDC infrastructure" in text and "use Change & reload" in text
+    # R1b / R2 / R3: delete first, then Start over -- never Start over alone (a fresh
+    # session adopts the same column again from the stack it finds).
+    for state, manager in ((_st(both, "j", "infra"), gone), (_st(cdc, None, "infra"), found),
+                           (_st(both, None, "infra"), found)):
+        text = legacy_values_remedy(state, manager)
+        assert text.index("delete the CDC infrastructure") < text.index("Start over"), text
+    assert "choose Full load + CDC" in legacy_values_remedy(_st(cdc, None, "infra"), found)
+    # Tier 0 (deleting) waits, then the no-stack remedy; tier 1 (creating) waits, deletes,
+    # then the same -- neither falls through to a bare Start over.
+    state = _st(both, "j")
+    state.set_cdc_stack_phase("unstable", status="DELETE_IN_PROGRESS")
+    assert legacy_values_remedy(state, found).startswith(
+        "To load it as NULL, wait for the CDC infrastructure deletion to finish, then use "
+        "Change & reload")
+    state = _st(both, "j")
+    state.cdc_action_kind, state.cdc_deploy_job_id = "infra", "d"
+    creating = _StubJobManager({"j": _StubJob("DONE"), "d": _StubJob("RUNNING")})
+    text = legacy_values_remedy(state, creating)
+    assert text.startswith("To load it as NULL, wait for the CDC infrastructure create to "
+                           "finish, delete the CDC infrastructure"), text
+    assert "use Change & reload" in text
     state = _st(MigrationType.CDC_ONLY)
     state.restore_exclusion_rules("exclude shop.t.a  # adopted from dsql-cdc-x, omit-only\n"
                                   "exclude shop.t.b", ())

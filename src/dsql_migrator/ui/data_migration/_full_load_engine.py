@@ -3800,8 +3800,9 @@ def _log_excluded_lob_columns(
                 )
             elif column in legacy:
                 detail = (
-                    "excluded in a session from an earlier version: omitted from the load "
-                    "only, the target column is not altered (rows take its DEFAULT, or NULL)"
+                    "excluded omit-only (in a session from an earlier version, or adopted "
+                    "from an attached CDC stack): omitted from the load only, the target "
+                    "column is not altered (rows take its DEFAULT, or NULL)"
                 )
             else:
                 detail = (

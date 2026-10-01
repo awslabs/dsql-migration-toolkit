@@ -806,8 +806,10 @@ def _sentinel_watermark() -> "Watermark":
 
 def _render_cdc_exclusion_summary(ui, migration_state, job_manager, inventory) -> None:
     """The CDC step's read-only line: how much is excluded, and the ColumnExcludeList CDC
-    receives -- as deployed when a stack carries one, else what Start CDC would send
-    (preview == sent). Nothing is drawn when nothing is excluded or captured."""
+    receives -- what Start CDC sends (preview == sent; the chooser already keeps a
+    deployed value it must keep), labelled "as deployed" when the stack carries exactly
+    that, else shown beside the deployed one. Nothing is drawn when nothing is excluded or
+    captured."""
     from dsql_migrator.core.cdc import CDC_PARAMETER_BYTE_LIMIT
     from dsql_migrator.ui.design import CODE_SURFACE_CLASSES, inline_hint
 
@@ -821,15 +823,13 @@ def _render_cdc_exclusion_summary(ui, migration_state, job_manager, inventory) -
     if inputs is not None:
         tables = tables & set(inputs.migratable)
     deployed = getattr(migration_state, "cdc_deployed_column_exclude_list", None)
-    if deployed is not None:
-        value, origin = deployed, "as deployed"
-    else:
-        captured = _cdc_tables_for_config(
-            migration_state, inventory,
-            _cdc_watermark(_current_job(job_manager, getattr(migration_state, "job_id", None))),
-        )
-        value, origin = cdc_capture_exclusions(migration_state, inventory, captured).sent, "Start CDC sends"
-    if not columns and not tables and not value:
+    captured = _cdc_tables_for_config(
+        migration_state, inventory,
+        _cdc_watermark(_current_job(job_manager, getattr(migration_state, "job_id", None))),
+    )
+    value = cdc_capture_exclusions(migration_state, inventory, captured).sent
+    origin = "as deployed" if deployed is not None and value == deployed else "Start CDC sends"
+    if not columns and not tables and not value and not deployed:
         return
     parts = []
     if tables:
@@ -838,12 +838,21 @@ def _render_cdc_exclusion_summary(ui, migration_state, job_manager, inventory) -
     inline_hint(ui, f"Excluded: {', '.join(parts)} (change them in Exclude tables & columns "
                 "above the steps).")
     size = len((value or "").encode("utf-8"))
+
+    def _toggle(event) -> None:
+        migration_state.cdc_receives_open = bool(getattr(event, "value", False))
+
     with ui.expansion(  # type: ignore[attr-defined]
-        f"What CDC receives ({size:,} of {CDC_PARAMETER_BYTE_LIMIT:,} bytes; {origin})"
+        f"What CDC receives ({size:,} of {CDC_PARAMETER_BYTE_LIMIT:,} bytes; {origin})",
+        value=bool(getattr(migration_state, "cdc_receives_open", False)),
+        on_value_change=_toggle,
     ).classes("w-full text-xs"):
         with ui.column().classes(f"w-full gap-0 p-2 {CODE_SURFACE_CLASSES}"):  # type: ignore[attr-defined]
             ui.label(value or "(nothing excluded at capture)").classes(  # type: ignore[attr-defined]
                 "text-xs font-mono wrap-anywhere")
+        if deployed is not None and value != deployed:
+            inline_hint(ui, f"As deployed: {deployed or '(nothing excluded at capture)'}. "
+                        "Start CDC sends the value above.")
 
 
 def _cdc_tables_for_config(
@@ -1659,7 +1668,7 @@ def _cdc_start_detail(
         parts.append("a FULL initial snapshot is forced for this start")
     excluded = sum(len(cols or ()) for cols in (exclusions or {}).values())
     if excluded:
-        parts.append(f"{excluded} column(s) excluded from replication (oversized LOB)")
+        parts.append(f"{excluded} column(s) excluded from replication (Exclude tables & columns)")
     return "; ".join(parts)
 
 

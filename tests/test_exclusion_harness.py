@@ -116,6 +116,10 @@ def test_the_harnesses_take_exclude_rules():
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parent.parent / "scripts"
+    # run_full_load_harness.py is local-only (git-ignored): a clean clone has no copy, so
+    # it is checked only where it exists. run_pg_cdc_e2e.py is tracked and always checked.
     for name in ("run_full_load_harness.py", "run_pg_cdc_e2e.py"):
+        if name == "run_full_load_harness.py" and not (root / name).exists():
+            continue
         text = (root / name).read_text(encoding="utf-8")
         assert '"--exclude-rules"' in text and "check_rules_file(" in text, name
