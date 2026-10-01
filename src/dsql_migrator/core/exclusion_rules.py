@@ -29,8 +29,15 @@ Pure: no UI, no database, no AWS.
 from __future__ import annotations
 
 import difflib
+import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Collection, Optional
+
+from dsql_migrator.core.assessor import _base_type
+from dsql_migrator.core.models import SourceType
+
+if TYPE_CHECKING:
+    from dsql_migrator.core.models import ColumnDef
 
 _WS = " \t"
 # Characters a BARE name part cannot hold (the grammar's bare production).
@@ -357,12 +364,177 @@ def parse_rules(text: str) -> "tuple[dict[int, ParsedRule], dict[int, list[RuleE
     return rules, errors
 
 
+# --- the type: normalizer ------------------------------------------------------------
+
+
+def _pg_reduce(text: str) -> str:
+    """The PostgreSQL type key of a ``format_type`` string (or of a typed name).
+
+    Every parenthesized typmod OUTSIDE double quotes is removed wherever it sits (a
+    negative scale included: ``numeric(5,-2)``); whitespace outside quotes collapses; a
+    trailing ``[]`` is kept as a suffix; the rest splits at ``.`` outside quotes and each
+    part is unquoted (``""`` is one ``"``) with its case KEPT, then re-joined.
+    """
+    out: list[str] = []
+    in_quote = False
+    depth = 0
+    for ch in text:
+        if ch == '"' and depth == 0:
+            in_quote = not in_quote
+            out.append(ch)
+        elif in_quote:
+            out.append(ch)
+        elif ch == "(":
+            depth += 1
+        elif ch == ")" and depth:
+            depth -= 1
+        elif depth:
+            continue
+        elif ch in _WS or ch in "\r\n":
+            if out and out[-1] != " ":
+                out.append(" ")
+        else:
+            out.append(ch)
+    reduced = "".join(out).strip()
+    # A typmod before [] leaves "name []": the space goes with the typmod.
+    reduced = re.sub(r" +(?=\[\])", "", reduced)
+    suffix = ""
+    if reduced.endswith("[]"):
+        reduced, suffix = reduced[:-2].rstrip(), "[]"
+    parts: list[str] = []
+    buf: list[str] = []
+    i = 0
+    quoted = False
+    while i < len(reduced):
+        ch = reduced[i]
+        if ch == '"':
+            if quoted and reduced[i + 1 : i + 2] == '"':
+                buf.append('"')
+                i += 2
+                continue
+            quoted = not quoted
+        elif ch == "." and not quoted:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return ".".join(parts) + suffix
+
+
+def rule_type_name(column: "ColumnDef", source_type: SourceType) -> str:
+    """The ONE type key a ``type:`` rule matches, suggests and displays for ``column``.
+
+    * MySQL: the assessor's ``_base_type`` (lower-cased, cut at ``(`` or a space), so
+      ``int unsigned`` is ``int`` and ``decimal(10,2) unsigned`` is ``decimal`` -- the same
+      cut the oversized-LOB classifier uses.
+    * PostgreSQL (``column.mysql_type`` holds ``format_type``): :func:`_pg_reduce` -- every
+      typmod outside quotes removed, ``[]`` kept, multi-word names kept, NO lower-casing
+      (``format_type`` quotes every name that is not already lower case, so lower-casing
+      could only merge case twins: ``"MyType"`` and ``"MYTYPE"`` are distinct keys).
+
+    Two accepted ambiguities: a ``.`` inside one type's own name is not told apart from a
+    schema separator; and unquoting gives a user type named like a built-in SQL name the
+    built-in's key (``CREATE DOMAIN public."integer"`` prints ``"integer"`` -> ``integer``),
+    so one ``type:integer`` line matches both and the per-type count sums them -- a column
+    rule separates them. Deliberately NOT ``converter_postgres.normalize_pg_base_type`` (it
+    lower-cases and misses a negative scale) and NOT the ``_base_type`` use inside
+    ``is_pg_oversized_lob_type``, which only needs the LOB bases.
+    """
+    declared = column.mysql_type or ""
+    if source_type is SourceType.POSTGRES:
+        return _pg_reduce(declared)
+    return _base_type(declared)
+
+
+def reduce_typed_name(typed: str, source_type: SourceType) -> str:
+    """A TYPED type name reduced the same way as a column's type (step 2 of resolution)."""
+    if source_type is SourceType.POSTGRES:
+        return _pg_reduce(typed)
+    return _base_type(typed)
+
+
+def resolve_type_name(
+    typed: str, keys: "Collection[str]", source_type: SourceType
+) -> "Optional[str]":
+    """The key a typed ``type:`` name means, or ``None`` (E2): the first step that holds of
+    (1) ``typed`` is a key exactly -- first, so a key such as ``my(x)`` can be typed back;
+    (2) it reduces (:func:`reduce_typed_name`) to a key; (3) the reduction lower-cased is a
+    key (necessarily all lower case: ``type:TEXT`` finds ``text``, while ``MyType`` and
+    ``MYTYPE`` never merge). No wildcard, no alias table: on PostgreSQL ``type:varchar``
+    never matches ``character varying`` -- only the suggestion hints bridge that."""
+    if typed in keys:
+        return typed
+    reduced = reduce_typed_name(typed, source_type)
+    if reduced in keys:
+        return reduced
+    if reduced.lower() in keys:
+        return reduced.lower()
+    return None
+
+
+# Suggestion-ONLY synonyms the source catalog spells differently (E2 "did you mean" and the
+# hint note). The matcher never reads this map, and a hint never broadens a match (no MySQL
+# bool -> tinyint, no serial).
+_TYPE_SUGGESTION_HINTS: "dict[SourceType, dict[str, str]]" = {
+    SourceType.POSTGRES: {
+        "varchar": "character varying",
+        "char": "character", "bpchar": "character",
+        "int": "integer", "int4": "integer",
+        "int2": "smallint", "int8": "bigint",
+        "float4": "real", "float8": "double precision", "double": "double precision",
+        "dec": "numeric", "decimal": "numeric",
+        "bool": "boolean",
+        "timestamp": "timestamp without time zone",
+        "timestamptz": "timestamp with time zone",
+        "time": "time without time zone", "timetz": "time with time zone",
+        "varbit": "bit varying",
+        "tinytext": "text", "mediumtext": "text", "longtext": "text",
+        "tinyblob": "bytea", "blob": "bytea", "mediumblob": "bytea", "longblob": "bytea",
+    },
+    SourceType.MYSQL: {
+        "integer": "int", "int4": "int",
+        "int1": "tinyint", "int2": "smallint",
+        "int3": "mediumint", "middleint": "mediumint",
+        "int8": "bigint",
+        "numeric": "decimal", "dec": "decimal", "fixed": "decimal",
+        "float4": "float", "float8": "double",
+        "character": "char", "nchar": "char",
+        "character varying": "varchar", "nvarchar": "varchar",
+    },
+}
+
+
+def hint_for(
+    typed: str, source_type: SourceType, keys: "Collection[str]"
+) -> "Optional[str]":
+    """The hint target key for a typed name, or ``None``: the name lower-cased, whitespace
+    collapsed, typmods and a trailing ``[]`` removed (``[]`` re-appended to the target) --
+    NOT cut at a space, so MySQL ``character varying`` finds ``varchar``. Withheld when the
+    target is not a present key, so a suggestion never lands on another miss."""
+    name = re.sub(r"\([^)]*\)", "", typed.lower())
+    name = " ".join(name.split())
+    suffix = ""
+    if name.endswith("[]"):
+        name, suffix = name[:-2].rstrip(), "[]"
+    target = _TYPE_SUGGESTION_HINTS.get(source_type, {}).get(name)
+    if target is None:
+        return None
+    target += suffix
+    return target if target in keys else None
+
+
 __all__ = [
     "ParsedRule",
     "RuleError",
     "RulePart",
     "Suggestion",
+    "hint_for",
     "parse_rules",
+    "reduce_typed_name",
+    "resolve_type_name",
+    "rule_type_name",
     "rule_part_token",
     "split_rule_comment",
     "type_name_token",

@@ -244,3 +244,94 @@ def test_rule_part_token_round_trip_fuzz():
         rules, errors = parse_rules("exclude type:" + type_name_token(key))
         assert not errors, (key, errors)
         assert rules[1].type_names[0].text == key
+
+
+# --- P3-C02: the type normalizer, typed-name resolution, suggestion hints -----------
+
+from dsql_migrator.core.exclusion_rules import (  # noqa: E402
+    hint_for,
+    reduce_typed_name,
+    resolve_type_name,
+    rule_type_name,
+)
+from dsql_migrator.core.models import ColumnDef, SourceType  # noqa: E402
+
+MY, PG = SourceType.MYSQL, SourceType.POSTGRES
+
+
+def _col(t):
+    return ColumnDef(name="c", mysql_type=t)
+
+
+@pytest.mark.parametrize("declared,key", [
+    ("timestamp(3) without time zone", "timestamp without time zone"),
+    ("timestamp without time zone", "timestamp without time zone"),
+    ("numeric(5,-2)", "numeric"),
+    ("numeric(10,2)", "numeric"),
+    ("character varying(255)", "character varying"),
+    ("bit varying(8)[]", "bit varying[]"),
+    ("text[]", "text[]"),
+    ('"MyType"', "MyType"),
+    ('"MYTYPE"', "MYTYPE"),
+    ('app."Mood"[]', "app.Mood[]"),
+    ("app.status", "app.status"),
+    ('"my(x)"', "my(x)"),
+    ('"char"', "char"),
+    ('"a""b"', 'a"b'),
+    ("  double   precision ", "double precision"),
+    ("bpchar", "bpchar"),
+    ("character(3)", "character"),
+])
+def test_rule_type_name_postgres(declared, key):
+    assert rule_type_name(_col(declared), PG) == key
+
+
+@pytest.mark.parametrize("declared,key", [
+    ("int unsigned", "int"), ("decimal(10,2) unsigned", "decimal"), ("LONGTEXT", "longtext"),
+    ("varchar(255)", "varchar"), ("enum('a','b')", "enum"),
+])
+def test_rule_type_name_mysql(declared, key):
+    assert rule_type_name(_col(declared), MY) == key
+
+
+def test_resolve_type_name_three_steps():
+    my_keys = {"longtext", "text", "int"}
+    assert resolve_type_name("LONGTEXT", my_keys, MY) == "longtext"
+    assert resolve_type_name("TEXT", my_keys, MY) == "text"
+    assert resolve_type_name("int(11) unsigned", my_keys, MY) == "int"
+    pg_keys = {"MyType", "MYTYPE", "my(x)", "character varying", "text", "timestamp without time zone"}
+    assert resolve_type_name("MyType", pg_keys, PG) == "MyType"
+    assert resolve_type_name("MYTYPE", pg_keys, PG) == "MYTYPE"
+    assert resolve_type_name("mytype", pg_keys, PG) is None  # case twins never merge
+    assert resolve_type_name("my(x)", pg_keys, PG) == "my(x)"  # step 1 before the typmod strip
+    assert resolve_type_name("TEXT", pg_keys, PG) == "text"  # step 3: lower(reduced)
+    assert resolve_type_name("timestamp(6) without time zone", pg_keys, PG) == "timestamp without time zone"
+    assert resolve_type_name("varchar", pg_keys, PG) is None  # no alias table
+    assert reduce_typed_name("Character Varying(20)", PG) == "Character Varying"
+
+
+def test_hint_for_suggests_only_present_targets():
+    assert hint_for("character varying", MY, {"varchar"}) == "varchar"  # the space is not cut
+    assert hint_for("NVARCHAR(40)", MY, {"varchar"}) == "varchar"
+    assert hint_for("integer", MY, {"bigint"}) is None  # target absent: withheld
+    assert hint_for("varchar", PG, {"character varying"}) == "character varying"
+    assert hint_for("int4[]", PG, {"integer[]"}) == "integer[]"
+    assert hint_for("longtext", PG, {"text"}) == "text"
+    assert hint_for("bpchar", PG, {"character"}) == "character"
+    assert hint_for("bool", MY, {"tinyint"}) is None  # a hint never broadens a match
+
+
+def test_the_matcher_never_reads_the_hint_map(monkeypatch):
+    import dsql_migrator.core.exclusion_rules as er
+
+    monkeypatch.setitem(er._TYPE_SUGGESTION_HINTS, PG, {"varchar": "text"})
+    assert resolve_type_name("varchar", {"text"}, PG) is None
+
+
+def test_every_key_typed_back_from_its_token_resolves_to_itself():
+    keys = {"text", "character varying", "MyType", "MYTYPE", "app.status", "app.Mood[]", "my(x)",
+            "char", 'a"b', "a,b", "timestamp without time zone", "text[]"}
+    for key in keys:
+        rules, errors = parse_rules("exclude type:" + type_name_token(key))
+        assert not errors, (key, errors)
+        assert resolve_type_name(rules[1].type_names[0].text, keys, PG) == key, key
