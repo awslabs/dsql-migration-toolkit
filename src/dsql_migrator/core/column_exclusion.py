@@ -43,7 +43,7 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
-from typing import TYPE_CHECKING, Iterable, Mapping, Optional
+from typing import TYPE_CHECKING, Iterable, Mapping, Optional, Sequence
 
 if TYPE_CHECKING:
     from dsql_migrator.core.models import SourceInventory, TableDef
@@ -118,6 +118,16 @@ class ExclusionContext:
     message_key_columns: Mapping[str, frozenset[str]] = field(default_factory=dict)
     generated: Mapping[str, frozenset[str]] = field(default_factory=dict)
     fk_referenced: Mapping[str, Mapping[str, tuple[str, ...]]] = field(default_factory=dict)
+    # WARNING facts (W1-W6), filled only by ``build_exclusion_context(warnings=True)`` and
+    # only for the focus tables. The verdict paths never read them.
+    # ``{table: {column: (not_null, default_sql)}}`` from the applied DDL (else the source).
+    target_constraints: Mapping[str, Mapping[str, "tuple[bool, Optional[str]]"]] = field(
+        default_factory=dict
+    )
+    # ``{child table: {column: (parent table, ...)}}`` for the preserved FKs the pass ADDs.
+    fk_children: Mapping[str, Mapping[str, tuple[str, ...]]] = field(default_factory=dict)
+    unique_columns: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    view_ddls: Mapping[str, str] = field(default_factory=dict)
 
 
 @lru_cache(maxsize=4096)
@@ -158,6 +168,19 @@ _FK_REFERENCES_RE = re.compile(
 )
 
 
+_FK_CHILD_COLUMNS_RE = re.compile(
+    rf"FOREIGN\s+KEY\s*\(\s*((?:{_IDENT})(?:\s*,\s*(?:{_IDENT}))*)\s*\)", re.IGNORECASE
+)
+# An applied ``CREATE UNIQUE INDEX [ASYNC] [name] ON table (col [ASC|DESC], ...)``. An
+# expression or otherwise unreadable index makes no claim.
+_UNIQUE_INDEX_RE = re.compile(
+    rf"CREATE\s+UNIQUE\s+INDEX\s+(?:ASYNC\s+)?(?:IF\s+NOT\s+EXISTS\s+)?(?:(?:{_IDENT})\s+)?"
+    rf"ON\s+(?:ONLY\s+)?(?:{_IDENT})(?:\s*\.\s*(?:{_IDENT}))?\s*(?:USING\s+\w+\s*)?"
+    rf"\(\s*((?:{_IDENT})(?:\s+(?:ASC|DESC))?(?:\s*,\s*(?:{_IDENT})(?:\s+(?:ASC|DESC))?)*)\s*\)",
+    re.IGNORECASE,
+)
+
+
 def _unquote(identifier: str) -> str:
     """A quoted identifier as written; an unquoted one folded as PostgreSQL folds it."""
     from dsql_migrator.core.converter import fold_identifier
@@ -170,8 +193,9 @@ def _unquote(identifier: str) -> str:
 
 def _applied_foreign_keys(
     child, conversion, known_tables: "Optional[Iterable[str]]" = None
-) -> "list[tuple[str, str, list[str]]]":
-    """``(constraint, referenced table, referenced columns)`` the FK pass will ADD.
+) -> "list[tuple[str, str, list[str], list[str]]]":
+    """``(constraint, referenced table, referenced columns, child columns)`` the FK pass
+    will ADD.
 
     Read from the applied ``foreign_key_ddls`` -- the statements the pass actually runs,
     already empty when foreign keys are stripped -- so an FK deleted from an edited script
@@ -193,10 +217,16 @@ def _applied_foreign_keys(
         )
     }
     known = set(known_tables or ())
-    found: list[tuple[str, str, list[str]]] = []
+    found: list[tuple[str, str, list[str], list[str]]] = []
     for ddl in getattr(conversion, "foreign_key_ddls", None) or ():
         name_match = _FK_NAME_RE.search(ddl)
         name = _unquote(name_match.group(1)) if name_match else ""
+        source_fk = by_name.get(name) if name else None
+        own = _FK_CHILD_COLUMNS_RE.search(ddl)
+        if own:
+            child_columns = [_unquote(c) for c in re.findall(_IDENT, own.group(1))]
+        else:
+            child_columns = list(source_fk.columns) if source_fk is not None else []
         ref = _FK_REFERENCES_RE.search(ddl)
         if ref:
             parts = [_unquote(part) for part in re.findall(_IDENT, ref.group(1))]
@@ -206,11 +236,13 @@ def _applied_foreign_keys(
                 if table not in known:
                     continue
             columns = [_unquote(c) for c in re.findall(_IDENT, ref.group(2))]
-            found.append((name or "unnamed", table, columns))
+            found.append((name or "unnamed", table, columns, child_columns))
             continue
-        source_fk = by_name.get(name) if name else None
         if source_fk is not None:
-            found.append((name, source_fk.referenced_table, list(source_fk.referenced_columns)))
+            found.append((
+                name, source_fk.referenced_table, list(source_fk.referenced_columns),
+                child_columns,
+            ))
     return found
 
 
@@ -222,6 +254,8 @@ def build_exclusion_context(
     preserve_foreign_keys: bool = True,
     selected_tables: "Optional[Iterable[str]]" = None,
     focus_tables: "Optional[Iterable[str]]" = None,
+    view_ddls: "Optional[Mapping[str, str]]" = None,
+    warnings: bool = False,
 ) -> ExclusionContext:
     """Build the context from the source inventory and the APPLIED conversions.
 
@@ -236,13 +270,23 @@ def build_exclusion_context(
     about -- the tables that HAVE stored entries. The gates run on every render, and
     parsing every applied CREATE TABLE of a 1,000-table schema each time would stall the
     page; a table outside the focus simply has no B2/B4 facts. ``None`` parses all.
+
+    ``warnings`` also fills the W1-W6 facts for the focus tables (each DDL read is
+    cached by its text); ``view_ddls`` are the APPLIED view DDLs, read for W6 and the
+    table findings. Without ``warnings`` the context is exactly what the gates used.
     """
-    from dsql_migrator.core.converter import pg_preserved_generated_columns
+    from dsql_migrator.core.converter import (
+        parse_target_column_constraints,
+        pg_preserved_generated_columns,
+    )
 
     tables = {t.name: t for t in (getattr(inventory, "tables", None) or ())}
     conversions = applied_conversions or {}
     target_pk: dict[str, frozenset[str]] = {}
     generated: dict[str, frozenset[str]] = {}
+    target_constraints: dict[str, Mapping[str, "tuple[bool, Optional[str]]"]] = {}
+    unique_columns: dict[str, frozenset[str]] = {}
+    fk_children: dict[str, dict[str, list[str]]] = {}
     focus = set(tables) if focus_tables is None else set(focus_tables) & set(tables)
     for name in focus:
         table = tables[name]
@@ -260,6 +304,22 @@ def build_exclusion_context(
             target_pk[name] = frozenset(pk)
         if gen:
             generated[name] = frozenset(gen)
+        if not warnings:
+            continue
+        if ddl:
+            facts = parse_target_column_constraints(ddl)
+            unique = _unique_members(
+                ddl, tuple(getattr(conversions.get(name), "index_ddls", None) or ())
+            )
+        else:
+            facts = {c.name: (not c.nullable, c.default) for c in table.columns}
+            unique = frozenset(
+                c for index in table.indexes if index.unique for c in index.columns
+            )
+        if facts:
+            target_constraints[name] = facts
+        if unique:
+            unique_columns[name] = unique
     mkc = {
         t: frozenset(cols) for t, cols in (message_key_columns or {}).items() if cols
     }
@@ -273,15 +333,20 @@ def build_exclusion_context(
             fks = _applied_foreign_keys(child, conversion, tables)
         elif preserve_foreign_keys:
             fks = [
-                (fk.name, fk.referenced_table, list(fk.referenced_columns))
+                (fk.name, fk.referenced_table, list(fk.referenced_columns), list(fk.columns))
                 for fk in getattr(child, "foreign_keys", None) or ()
             ]
         else:
             fks = []
-        for fk_name, referenced_table, referenced_columns in fks:
+        for fk_name, referenced_table, referenced_columns, child_columns in fks:
             label = f"{child_name}.{fk_name}"
             for col in referenced_columns:
                 fk_ref.setdefault(referenced_table, {}).setdefault(col, []).append(label)
+            if warnings and child_name in focus:
+                for col in child_columns:
+                    parents = fk_children.setdefault(child_name, {}).setdefault(col, [])
+                    if referenced_table not in parents:
+                        parents.append(referenced_table)
     return ExclusionContext(
         tables=tables,
         target_pk=target_pk,
@@ -291,7 +356,187 @@ def build_exclusion_context(
             t: {c: tuple(sorted(refs)) for c, refs in cols.items()}
             for t, cols in fk_ref.items()
         },
+        target_constraints=target_constraints,
+        fk_children={
+            t: {c: tuple(sorted(parents)) for c, parents in cols.items()}
+            for t, cols in fk_children.items()
+        },
+        unique_columns=unique_columns,
+        view_ddls=dict(view_ddls or {}) if warnings else {},
     )
+
+
+@lru_cache(maxsize=4096)
+def _unique_members(ddl: str, index_ddls: "tuple[str, ...]") -> frozenset[str]:
+    """Columns in a UNIQUE constraint or index of an applied table: inline ``UNIQUE``,
+    a table-level ``UNIQUE (...)``, and each readable ``CREATE UNIQUE INDEX``. Read
+    here so the converter stays untouched; an unreadable text makes no claim."""
+    import sqlglot
+    from sqlglot import exp
+
+    from dsql_migrator.core.converter import _strip_identity_clauses, fold_identifier
+
+    def _name(node) -> str:
+        quoted = isinstance(node, exp.Identifier) and bool(node.quoted)
+        return node.name if quoted else fold_identifier(node.name)
+
+    members: set[str] = set()
+    try:
+        parsed = sqlglot.parse_one(_strip_identity_clauses(ddl), read="postgres")
+    except Exception:  # noqa: BLE001 - unparseable DDL -> no claim
+        parsed = None
+    if isinstance(parsed, exp.Create):
+        for unique in parsed.find_all(exp.UniqueColumnConstraint):
+            if isinstance(unique.this, exp.Schema):
+                members.update(_name(e) for e in unique.this.expressions if e.name)
+            else:
+                column_def = unique.find_ancestor(exp.ColumnDef)
+                if column_def is not None and column_def.name:
+                    members.add(_name(column_def.this))
+    for index_ddl in index_ddls:
+        match = _UNIQUE_INDEX_RE.search(index_ddl)
+        if match:
+            members.update(
+                _unquote(c)
+                for c in re.findall(rf"({_IDENT})(?:\s+(?:ASC|DESC))?", match.group(1))
+            )
+    return frozenset(members)
+
+
+# --- column WARNINGS (W1-W6) and table-exclusion findings ---------------------------
+# Allowed, shown in the preview and repeated in the Start dialog. A SEPARATE function from
+# the verdict on purpose: check_stored_exclusions and effective_exclusions read only the
+# verdict, so a warning can never block an entry or leak into a stored-entry message.
+
+W1 = "W1"  # NOT NULL on the target
+W2 = "W2"  # has a DEFAULT
+W3 = "W3"  # FK child column of a preserved FK
+W4 = "W4"  # member of a UNIQUE constraint or index
+W5 = "W5"  # named in a kept generated column's expression
+W6 = "W6"  # named in a view definition (text match)
+# Table-exclusion findings. T1 and T4 are information; T2 and T3 are warnings.
+T1 = "T1"  # not loaded, left as is
+T2 = "T2"  # a selected child's FK skipped by the orphan check
+T3 = "T3"  # a view that reads the table
+T4 = "T4"  # column rules on it are inert
+
+
+def views_referencing(
+    view_ddls: Mapping[str, str], tables: "frozenset[str]"
+) -> list[str]:
+    """Return the CREATE-VIEW DDLs whose SQL references any of ``tables``.
+
+    A view that SELECTs from a table being DROP+recreated blocks that table's
+    DROP. We select exactly the views that name one of the replace ``tables`` --
+    matching either the qualified ``schema.table`` or the bare table name as a
+    word in the view's DDL -- so an unrelated view is never needlessly dropped.
+    Case-insensitive, word-boundary match to avoid matching a substring of a
+    longer identifier. Deterministic order (by view name) for stable behavior.
+    """
+    if not view_ddls or not tables:
+        return []
+    wanted: list[str] = []
+    for view_name in sorted(view_ddls):
+        ddl = view_ddls[view_name]
+        low = ddl.lower()
+        for table in tables:
+            bare = table.split(".")[-1].lower()
+            qualified = table.lower()
+            if names_in(low, (qualified, bare)):
+                wanted.append(ddl)
+                break
+    return wanted
+
+
+def names_in(haystack_lower: str, candidates: "Sequence[str]") -> bool:
+    """True if any candidate appears in ``haystack_lower`` as a bounded token.
+
+    Guards against a bare table name matching a substring of a longer identifier
+    (e.g. ``orders`` inside ``orders_archive``) by requiring a non-identifier
+    character (or string edge) on both sides.
+    """
+    for name in candidates:
+        if not name:
+            continue
+        if re.search(rf"(?<![\w.]){re.escape(name)}(?![\w])", haystack_lower):
+            return True
+    return False
+
+
+def _mentions(text: str, name: str, *, ignore_case: bool = False) -> bool:
+    """``name`` in ``text`` at an identifier boundary (a quoted ``"name"`` counts)."""
+    flags = re.IGNORECASE if ignore_case else 0
+    return re.search(rf"(?<![\w$]){re.escape(name)}(?![\w$])", text, flags) is not None
+
+
+def _views_reading(table_name: str, ctx: ExclusionContext) -> list[str]:
+    return [v for v in sorted(ctx.view_ddls)
+            if views_referencing({v: ctx.view_ddls[v]}, frozenset({table_name}))]
+
+
+def column_exclusion_warnings(
+    table_name: str, column: str, ctx: ExclusionContext
+) -> tuple[ExclusionFinding, ...]:
+    """W1-W6 for excluding ``table_name.column`` (in that order); empty for a context
+    built without ``warnings``. Judges only what excluding it does, never eligibility."""
+    found: list[ExclusionFinding] = []
+    constraints = ctx.target_constraints.get(table_name, {})
+    not_null, default_sql = constraints.get(column, (False, None))
+    if not_null:
+        found.append(ExclusionFinding(W1, (
+            "NOT NULL will be dropped on Aurora DSQL. One-way: Aurora DSQL cannot add NOT NULL "
+            "back in place (a later Drop & reload of this table restores it).")))
+    if default_sql is not None:
+        found.append(ExclusionFinding(W2, (
+            f"DEFAULT {default_sql} is dropped for the migration and restored at Cut over "
+            "(new rows only).")))
+    for parent in ctx.fk_children.get(table_name, {}).get(column, ()):
+        found.append(ExclusionFinding(W3, (
+            f"Its relationship to {parent} is not migrated (NULL passes the foreign key).")))
+    if column in ctx.unique_columns.get(table_name, ()):
+        found.append(ExclusionFinding(
+            W4, "Uniqueness is not enforced for migrated rows (all NULL)."))
+    table = ctx.tables.get(table_name)
+    computed = ctx.generated.get(table_name, ())
+    for other in (table.columns if table is not None else ()):
+        expression = other.generated_expression
+        if other.name == column or other.name not in computed or not expression:
+            continue
+        if not _mentions(expression, column):
+            continue
+        other_not_null = constraints.get(other.name, (not other.nullable, None))[0]
+        if other_not_null:
+            message = (
+                f"{other.name} is NOT NULL and computed from this column: if {expression} "
+                "yields NULL when this column is NULL, every row is rejected (23502).")
+        else:
+            message = f"{other.name} will be computed from NULL and differ from the source."
+        found.append(ExclusionFinding(W5, message))
+    for view in _views_reading(table_name, ctx):
+        if _mentions(ctx.view_ddls[view], column, ignore_case=True):
+            found.append(ExclusionFinding(
+                W6, f"View {view} mentions it (text match) and will read NULL."))
+    return tuple(found)
+
+
+def table_exclusion_findings(
+    table_name: str, ctx: ExclusionContext
+) -> tuple[ExclusionFinding, ...]:
+    """What unselecting ``table_name`` means (the context's ``fk_referenced`` covers the
+    SELECTED children only, so build it for the selection after the Save). Never "stays
+    empty": the table may already exist on the target with rows."""
+    found = [ExclusionFinding(
+        T1, "Not loaded by this migration; left as is on Aurora DSQL (not dropped).")]
+    labels = sorted({label for refs in ctx.fk_referenced.get(table_name, {}).values()
+                     for label in refs})
+    found.extend(ExclusionFinding(T2, (
+        f"{label} will be skipped by the orphan check when foreign keys are applied (Data "
+        "Migration for Full load only; Cut over for CDC).")) for label in labels)
+    found.extend(ExclusionFinding(T3, f"View {view} will return no rows.")
+                 for view in _views_reading(table_name, ctx))
+    found.append(ExclusionFinding(
+        T4, "Column rules on it have no effect while it is unselected."))
+    return tuple(found)
 
 
 def column_exclusion_verdict(
@@ -486,10 +731,24 @@ __all__ = [
     "ExclusionStatus",
     "IssueSeverity",
     "StoredEntryIssue",
+    "T1",
+    "T2",
+    "T3",
+    "T4",
+    "W1",
+    "W2",
+    "W3",
+    "W4",
+    "W5",
+    "W6",
     "build_exclusion_context",
     "check_stored_exclusions",
     "column_exclusion_verdict",
+    "column_exclusion_warnings",
     "effective_exclusions",
     "missing_target_columns",
+    "names_in",
     "set_digest",
+    "table_exclusion_findings",
+    "views_referencing",
 ]

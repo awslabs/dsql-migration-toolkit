@@ -703,3 +703,185 @@ def test_an_edit_that_drops_the_generated_clause_makes_a_pg_generated_column_exc
         target_ddl='CREATE TABLE "app"."items" ("id" INTEGER PRIMARY KEY, "doubled" INTEGER)',
         foreign_key_ddls=[], preserved_foreign_keys=[])}
     assert not column_exclusion_verdict("app.items", "doubled", build_exclusion_context(inv, edited)).blocked
+
+
+# --- P3-C05: column warnings W1-W6 and table-exclusion findings ---------------------
+
+from dsql_migrator.core.column_exclusion import (  # noqa: E402
+    W1, W2, W3, W4, W5, W6,
+    column_exclusion_warnings,
+    names_in,
+    table_exclusion_findings,
+    views_referencing,
+)
+from dsql_migrator.core.models import IndexDef  # noqa: E402
+
+_W_DDL = (
+    'CREATE TABLE "shop"."orders" ("id" BIGINT NOT NULL, "code" VARCHAR(10) NOT NULL DEFAULT \'\', '
+    '"blob" BYTEA DEFAULT \'\\x00\'::bytea, "due" TIMESTAMP DEFAULT (CURRENT_TIMESTAMP + INTERVAL '
+    '\'1 day\'), "cust_id" BIGINT, "email" TEXT UNIQUE, "a" INT, "b" INT, "price" NUMERIC, '
+    '"total" NUMERIC GENERATED ALWAYS AS (price * 2) STORED, "label" TEXT NOT NULL GENERATED ALWAYS '
+    'AS (upper(code)) STORED, "notes" TEXT, PRIMARY KEY ("id"), UNIQUE ("a", "b"))'
+)
+
+
+def _w_ctx(*, preserve=True, ddl=_W_DDL, views=None, index_ddls=(), fk_ddls=None):
+    orders = TableDef(
+        name="shop.orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="code", mysql_type="varchar(10)", nullable=False, default="''"),
+            ColumnDef(name="blob", mysql_type="bytea"),
+            ColumnDef(name="due", mysql_type="timestamp"),
+            ColumnDef(name="cust_id", mysql_type="bigint"),
+            ColumnDef(name="email", mysql_type="text"),
+            ColumnDef(name="a", mysql_type="integer"),
+            ColumnDef(name="b", mysql_type="integer"),
+            ColumnDef(name="price", mysql_type="numeric"),
+            ColumnDef(name="total", mysql_type="numeric", generated=True,
+                      generated_expression="(price * (2)::numeric)"),
+            ColumnDef(name="label", mysql_type="text", nullable=False, generated=True,
+                      generated_expression="upper((code)::text)"),
+            ColumnDef(name="notes", mysql_type="text"),
+        ],
+        primary_key=["id"],
+        foreign_keys=[ForeignKeyDef(name="fk_cust", columns=["cust_id"],
+                                    referenced_table="shop.customers", referenced_columns=["id"])],
+    )
+    customers = TableDef(name="shop.customers",
+                         columns=[ColumnDef(name="id", mysql_type="bigint")], primary_key=["id"])
+    if fk_ddls is None:
+        fk_ddls = ['ALTER TABLE "shop"."orders" ADD CONSTRAINT "fk_cust" FOREIGN KEY ("cust_id") '
+                   'REFERENCES "shop"."customers" ("id") NOT VALID'] if preserve else []
+    conv = SimpleNamespace(target_ddl=ddl, foreign_key_ddls=fk_ddls,
+                           preserved_foreign_keys=orders.foreign_keys, index_ddls=list(index_ddls))
+    return build_exclusion_context(
+        SourceInventory(tables=[orders, customers]), {"shop.orders": conv},
+        preserve_foreign_keys=preserve, view_ddls=views or {}, warnings=True,
+    )
+
+
+def _wcodes(found):
+    return [f.code for f in found]
+
+
+def test_w1_and_w2_read_the_applied_ddl_and_render_the_default():
+    ctx = _w_ctx()
+    code = column_exclusion_warnings("shop.orders", "code", ctx)
+    assert _wcodes(code) == [W1, W2, W5]
+    assert code[0].message == (
+        "NOT NULL will be dropped on Aurora DSQL. One-way: Aurora DSQL cannot add NOT NULL back "
+        "in place (a later Drop & reload of this table restores it).")
+    assert code[1].message == (
+        "DEFAULT '' is dropped for the migration and restored at Cut over (new rows only).")
+    assert column_exclusion_warnings("shop.orders", "blob", ctx)[0].message.startswith(
+        "DEFAULT CAST('\\x00' AS BYTEA) is dropped")
+    assert "DEFAULT (CURRENT_TIMESTAMP + INTERVAL '1 DAY') is dropped" in (
+        column_exclusion_warnings("shop.orders", "due", ctx)[0].message)
+    assert column_exclusion_warnings("shop.orders", "notes", ctx) == ()
+
+
+def test_w3_only_while_foreign_keys_are_preserved():
+    (w3,) = column_exclusion_warnings("shop.orders", "cust_id", _w_ctx())
+    assert w3.code == W3 and w3.message == (
+        "Its relationship to shop.customers is not migrated (NULL passes the foreign key).")
+    assert column_exclusion_warnings("shop.orders", "cust_id", _w_ctx(preserve=False)) == ()
+
+
+def test_w4_inline_table_and_index_uniqueness():
+    ctx = _w_ctx(index_ddls=['CREATE UNIQUE INDEX ASYNC "ux_notes" ON "shop"."orders" ("notes")',
+                             'CREATE INDEX ASYNC "ix_price" ON "shop"."orders" ("price")'])
+    for column in ("email", "a", "b", "notes"):
+        found = column_exclusion_warnings("shop.orders", column, ctx)
+        assert W4 in _wcodes(found), column
+        assert next(f for f in found if f.code == W4).message == (
+            "Uniqueness is not enforced for migrated rows (all NULL).")
+    assert W4 not in _wcodes(column_exclusion_warnings("shop.orders", "price", ctx))
+
+
+def test_w5_names_the_generated_column_and_escalates_when_it_is_not_null():
+    ctx = _w_ctx()
+    price = column_exclusion_warnings("shop.orders", "price", ctx)
+    assert [(f.code, f.message) for f in price] == [
+        (W5, "total will be computed from NULL and differ from the source.")]
+    escalated = next(f for f in column_exclusion_warnings("shop.orders", "code", ctx) if f.code == W5)
+    assert escalated.message == (
+        "label is NOT NULL and computed from this column: if upper((code)::text) yields NULL "
+        "when this column is NULL, every row is rejected (23502).")
+    # an identifier boundary: "a" does not match inside "label" or "upper"
+    assert W5 not in _wcodes(column_exclusion_warnings("shop.orders", "a", ctx))
+
+
+def test_w6_view_text_match():
+    views = {"shop.v_orders": 'CREATE VIEW "shop"."v_orders" AS SELECT id, notes FROM "shop"."orders"',
+             "shop.v_other": 'CREATE VIEW "shop"."v_other" AS SELECT notes FROM "shop"."customers"'}
+    (w6,) = column_exclusion_warnings("shop.orders", "notes", _w_ctx(views=views))
+    assert w6.code == W6 and w6.message == (
+        "View shop.v_orders mentions it (text match) and will read NULL.")
+
+
+def test_table_findings_say_left_as_is_and_scope_the_fk_line_to_selected_children():
+    views = {"shop.v_cust": 'CREATE VIEW "shop"."v_cust" AS SELECT * FROM "shop"."customers"'}
+    ctx = _w_ctx(views=views)
+    found = table_exclusion_findings("shop.customers", ctx)
+    messages = [f.message for f in found]
+    assert messages[0] == "Not loaded by this migration; left as is on Aurora DSQL (not dropped)."
+    assert not any("stays empty" in m for m in messages)
+    assert ("shop.orders.fk_cust will be skipped by the orphan check when foreign keys are "
+            "applied (Data Migration for Full load only; Cut over for CDC).") in messages
+    assert "View shop.v_cust will return no rows." in messages
+    assert messages[-1] == "Column rules on it have no effect while it is unselected."
+    unselected_child = build_exclusion_context(
+        SourceInventory(tables=list(ctx.tables.values())), selected_tables=["shop.customers"],
+        warnings=True)
+    assert not any("orphan" in f.message for f in table_exclusion_findings(
+        "shop.customers", unselected_child))
+
+
+def test_warnings_never_leak_into_the_verdict_paths():
+    plain = _w_ctx()
+    stored = {"shop.orders": {"id", "code", "total", "cust_id"}}
+    import dataclasses
+    bare = build_exclusion_context(
+        SourceInventory(tables=list(plain.tables.values())),
+        {"shop.orders": SimpleNamespace(
+            target_ddl=_W_DDL, preserved_foreign_keys=plain.tables["shop.orders"].foreign_keys,
+            foreign_key_ddls=['ALTER TABLE "shop"."orders" ADD CONSTRAINT "fk_cust" FOREIGN KEY '
+                              '("cust_id") REFERENCES "shop"."customers" ("id") NOT VALID'],
+            index_ddls=[])},
+    )
+    for committed in (False, True):
+        assert check_stored_exclusions(stored, plain, committed=committed) == (
+            check_stored_exclusions(stored, bare, committed=committed))
+    assert effective_exclusions(stored, plain) == effective_exclusions(stored, bare)
+    for f in dataclasses.fields(bare):
+        if f.name in ("tables", "target_pk", "message_key_columns", "generated", "fk_referenced"):
+            assert getattr(bare, f.name) == getattr(plain, f.name), f.name
+    assert bare.target_constraints == {} and bare.unique_columns == {}
+
+
+def test_source_fallback_without_an_applied_ddl():
+    t = TableDef(name="s.t", columns=[
+        ColumnDef(name="id", mysql_type="bigint", nullable=False),
+        ColumnDef(name="c", mysql_type="varchar(5)", nullable=False, default="'x'"),
+        ColumnDef(name="u", mysql_type="int")], primary_key=["id"],
+        indexes=[IndexDef(name="ux", columns=["u"], unique=True)])
+    ctx = build_exclusion_context(SourceInventory(tables=[t]), warnings=True)
+    assert _wcodes(column_exclusion_warnings("s.t", "c", ctx)) == [W1, W2]
+    assert _wcodes(column_exclusion_warnings("s.t", "u", ctx)) == [W4]
+
+
+def test_each_ddl_is_parsed_once_for_repeated_calls():
+    from dsql_migrator.core import column_exclusion as ce
+
+    ce._unique_members.cache_clear()
+    for _ in range(5):
+        _w_ctx(index_ddls=['CREATE UNIQUE INDEX ASYNC "ux_n" ON "shop"."orders" ("notes")'])
+    info = ce._unique_members.cache_info()
+    assert info.misses == 1 and info.hits == 4
+
+
+def test_the_view_helpers_moved_to_core_unchanged():
+    from dsql_migrator.ui.data_migration import _full_load_engine as engine
+
+    assert engine._views_referencing is views_referencing and engine._names_in is names_in

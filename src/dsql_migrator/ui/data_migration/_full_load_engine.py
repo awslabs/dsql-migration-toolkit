@@ -68,6 +68,8 @@ from dsql_migrator.core.converter import (
     parse_target_primary_key,
 )
 from dsql_migrator.core.cdc_schema_evolve import read_target_columns
+from dsql_migrator.core.column_exclusion import names_in as _names_in  # noqa: F401
+from dsql_migrator.core.column_exclusion import views_referencing as _views_referencing
 from dsql_migrator.core.schema_applier import (
     OverlayRefusedError, apply_foreign_key, build_overlay_statements, recreate_table,
     validate_foreign_key,
@@ -4537,50 +4539,6 @@ def _default_importer_factory(inputs: "DataMigrationInputs") -> BatchedImporter:
 # Drops and recreates one table's target from converted DDL, returning its
 # secondary-index DDLs to (re)create after the data load. Injectable for tests.
 TableRecreator = Callable[[TableDef], list[str]]
-
-
-def _views_referencing(
-    view_ddls: Mapping[str, str], tables: "frozenset[str]"
-) -> list[str]:
-    """Return the CREATE-VIEW DDLs whose SQL references any of ``tables``.
-
-    A view that SELECTs from a table being DROP+recreated blocks that table's
-    DROP. We select exactly the views that name one of the replace ``tables`` --
-    matching either the qualified ``schema.table`` or the bare table name as a
-    word in the view's DDL -- so an unrelated view is never needlessly dropped.
-    Case-insensitive, word-boundary match to avoid matching a substring of a
-    longer identifier. Deterministic order (by view name) for stable behavior.
-    """
-    if not view_ddls or not tables:
-        return []
-    wanted: list[str] = []
-    for view_name in sorted(view_ddls):
-        ddl = view_ddls[view_name]
-        low = ddl.lower()
-        for table in tables:
-            bare = table.split(".")[-1].lower()
-            qualified = table.lower()
-            if _names_in(low, (qualified, bare)):
-                wanted.append(ddl)
-                break
-    return wanted
-
-
-def _names_in(haystack_lower: str, candidates: "Sequence[str]") -> bool:
-    """True if any candidate appears in ``haystack_lower`` as a bounded token.
-
-    Guards against a bare table name matching a substring of a longer identifier
-    (e.g. ``orders`` inside ``orders_archive``) by requiring a non-identifier
-    character (or string edge) on both sides.
-    """
-    import re
-
-    for name in candidates:
-        if not name:
-            continue
-        if re.search(rf"(?<![\w.]){re.escape(name)}(?![\w])", haystack_lower):
-            return True
-    return False
 
 
 def _derived_table_conversion(
