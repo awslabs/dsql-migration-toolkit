@@ -684,8 +684,10 @@ def test_the_cdc_dialog_statements_wrap_at_word_boundaries(monkeypatch):
     stmt = SimpleNamespace(action="DROP NOT NULL",
                            text=lambda: 'ALTER TABLE "app"."t" ALTER COLUMN "note" DROP NOT NULL')
     cdc_ui._render_cdc_overlay_changes(_Ui(), CdcOverlayPreview([stmt], ()))
-    alters = [c for t, c in recorded if t.startswith("ALTER TABLE")]
+    alters = [c for t, c in recorded if t.startswith("(DSQL) ALTER TABLE")]
     assert alters and all("wrap-anywhere" in c and "break-all" not in c for c in alters), recorded
+    # Each statement is labelled as run on the target, never shown bare.
+    assert not any(t.startswith("ALTER TABLE") for t, _c in recorded), recorded
 
 
 def test_overlay_planned_mentions_the_default_restore_only_when_a_default_is_dropped():

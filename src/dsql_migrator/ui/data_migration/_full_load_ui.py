@@ -398,7 +398,9 @@ def _render_overlay_blocks(
                 )
                 with ui.expansion("show statements").classes("w-full text-xs"):
                     for statement in statements:
-                        ui.label(statement.text()).classes("text-xs font-mono wrap-anywhere")
+                        # "(DSQL)": these run on the target, never on the source.
+                        ui.label(f"(DSQL) {statement.text()}").classes(
+                            "text-xs font-mono wrap-anywhere")
         shown = {t: r for t, r in forced.items() if _in_scope(t)}
         if shown:
             render_notice(
@@ -619,7 +621,11 @@ def _render_full_load_step(
         confirmed = {"v": False}
 
         def _build() -> None:
-            with ui.dialog() as confirm_dialog, ui.card().classes("min-w-[360px]"):
+            # Wider than Quasar's 560px default: the overlay statements and the per-table
+            # choices read on one line each.
+            with ui.dialog() as confirm_dialog, ui.card().style(
+                "width: min(820px, 94vw); max-width: 94vw"
+            ):
                 def _on_close(e: object) -> None:
                     if not bool(getattr(e, "value", True)) and not confirmed["v"]:
                         migration_state.clear_exclusion_forced_replace()

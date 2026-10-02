@@ -2410,6 +2410,10 @@ def deploy_exclusion_disclosure(migration_state, inventory) -> "Optional[tuple[s
         wanted = set(inputs.selected) if inputs is not None else None
         captured = [t for t in inventory.tables if wanted is None or t.name in wanted]
         sent = cdc_capture_exclusions(migration_state, inventory, captured).sent
+    plain = ",".join(f"{t}.{c}" for t in sorted(stored) for c in sorted(stored[t]))
+    if names and sent == plain:
+        # The capture list is the same names: say so once instead of listing them twice.
+        return header, f"Columns (sent as ColumnExcludeList unchanged): {names}."
     details = (f"Columns: {names or '(none)'}. Sent as ColumnExcludeList: "
                f"{sent or '(nothing excluded at capture)'}")
     return header, details

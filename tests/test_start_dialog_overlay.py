@@ -334,18 +334,20 @@ def test_the_dialog_lists_the_exact_alters_in_run_order(monkeypatch):
                 facts={PAGES: _facts(rows=False, summary=SUMMARY)})
     body = _body(ctx.ui)
     assert "1 x DROP NOT NULL (one-way), 1 x DROP DEFAULT (restored at Cut over)" in body
-    first = 'ALTER TABLE "shop"."pages" ALTER COLUMN "summary" DROP NOT NULL'
-    second = 'ALTER TABLE "shop"."pages" ALTER COLUMN "summary" DROP DEFAULT'
+    # "(DSQL)" labels each statement as run on the target.
+    first = '(DSQL) ALTER TABLE "shop"."pages" ALTER COLUMN "summary" DROP NOT NULL'
+    second = '(DSQL) ALTER TABLE "shop"."pages" ALTER COLUMN "summary" DROP DEFAULT'
     assert first in ctx.ui.texts and second in ctx.ui.texts
     assert ctx.ui.texts.index(first) < ctx.ui.texts.index(second)
     import re
-    for line in (t for t in ctx.ui.texts if t.startswith("ALTER TABLE")):
-        assert re.match(r"^ALTER TABLE .+ ALTER COLUMN .+ DROP (NOT NULL|DEFAULT)$", line)
+    assert not any(t.startswith("ALTER TABLE") for t in ctx.ui.texts)
+    for line in (t for t in ctx.ui.texts if t.startswith("(DSQL) ALTER TABLE")):
+        assert re.match(r"^\(DSQL\) ALTER TABLE .+ ALTER COLUMN .+ DROP (NOT NULL|DEFAULT)$", line)
     # A live catalog whose DEFAULT is already dropped lists only DROP NOT NULL.
     ctx = _open(monkeypatch, view=_view(), ledger=LedgerRead("present", {PAGES: _record()}), rows=(),
                 facts={PAGES: _facts(rows=False, summary=F(True, None))})
-    alters = [t for t in ctx.ui.texts if t.startswith("ALTER TABLE")]
-    assert alters == ['ALTER TABLE "shop"."pages" ALTER COLUMN "summary" DROP NOT NULL']
+    alters = [t for t in ctx.ui.texts if t.startswith("(DSQL) ALTER TABLE")]
+    assert alters == ['(DSQL) ALTER TABLE "shop"."pages" ALTER COLUMN "summary" DROP NOT NULL']
     assert "1 column in 1 table will load as NULL" in _body(ctx.ui)
 
 
@@ -580,7 +582,7 @@ def test_the_full_load_dialog_statements_wrap_at_word_boundaries(monkeypatch):
     monkeypatch.setattr(_DialogUi, "label", label)
     _open(monkeypatch, view=_view(), ledger=LedgerRead("present", {PAGES: _record()}), rows=(),
           facts={PAGES: _facts(rows=False, summary=SUMMARY)})
-    alters = {t: c for t, c in recorded.items() if t.startswith("ALTER TABLE")}
+    alters = {t: c for t, c in recorded.items() if t.startswith("(DSQL) ALTER TABLE")}
     assert len(alters) == 2
     for text, cls in alters.items():
         joined = " ".join(cls)

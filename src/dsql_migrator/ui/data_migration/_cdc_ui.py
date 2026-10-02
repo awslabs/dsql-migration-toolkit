@@ -3597,7 +3597,11 @@ async def _open_cdc_infra_dialog(
             _fk_probed = None
         if _fk_probed is not None and _fk_probed.blocking:
             fk_preview = _fk_probed
-    with ui.dialog() as dialog, ui.card().classes("gap-2").style("min-width: 460px"):  # type: ignore[attr-defined]
+    # Wider than Quasar's 560px default: the blockers, cost, exclusions and capture list
+    # it shows read better on fewer lines.
+    with ui.dialog() as dialog, ui.card().classes("gap-2").style(  # type: ignore[attr-defined]
+        "width: min(820px, 94vw); max-width: 94vw"
+    ):
         ui.label("Deploy CDC infrastructure").classes("text-lg font-semibold")  # type: ignore[attr-defined]
         ui.label(  # type: ignore[attr-defined]
             f"This creates the cdc-stack '{stack_name}' (CloudFormation): an MSK "
@@ -5042,7 +5046,8 @@ def _render_cdc_overlay_changes(ui, overlay_changes) -> None:
     )
     with ui.expansion("show statements").classes("w-full text-xs"):  # type: ignore[attr-defined]
         for statement in statements:
-            ui.label(statement.text()).classes("text-xs font-mono wrap-anywhere")  # type: ignore[attr-defined]
+            # "(DSQL)": these run on the target, never on the source.
+            ui.label(f"(DSQL) {statement.text()}").classes("text-xs font-mono wrap-anywhere")  # type: ignore[attr-defined]
 
 
 def _note_cdc_start(migration_state) -> None:

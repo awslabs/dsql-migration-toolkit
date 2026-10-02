@@ -349,13 +349,25 @@ def test_the_deploy_disclosure_appears_only_when_something_is_excluded_and_shows
                       "needs Delete CDC infrastructure.")
     sent = cdc_capture_exclusions(state, inv, inv.tables).sent
     assert sent == "shop.t.a"
-    assert details == f"Columns: shop.t.a. Sent as ColumnExcludeList: {sent}"
+    # Identical halves are said once, not listed twice.
+    assert details == "Columns (sent as ColumnExcludeList unchanged): shop.t.a."
+    assert "Sent as" not in details
     # The two halves differ when the column's table is not captured.
     other = DataMigrationState()
     other.set_exclusion_inputs_resolver(lambda: _inputs(selected=["shop.u", "shop.audit_1"]))
     other.restore_lob_exclusion("shop.t", "a")
     assert deploy_exclusion_disclosure(other, inv)[1] == (
         "Columns: shop.t.a. Sent as ColumnExcludeList: (nothing excluded at capture)")
+    # ...and when the capture list escapes a name: both halves, so the escape is visible.
+    inv_d = SourceInventory(tables=[_t("shop.t", **{"a$b": "longtext"})])
+    dollar = DataMigrationState()
+    dollar.set_exclusion_inputs_resolver(
+        lambda: _inputs(selected=["shop.t"], migratable=["shop.t"]))
+    dollar.restore_lob_exclusion("shop.t", "a$b")
+    sent_d = cdc_capture_exclusions(dollar, inv_d, inv_d.tables).sent
+    assert sent_d and sent_d != "shop.t.a$b"
+    assert deploy_exclusion_disclosure(dollar, inv_d)[1] == (
+        f"Columns: shop.t.a$b. Sent as ColumnExcludeList: {sent_d}")
     import inspect
 
     from dsql_migrator.ui.data_migration import _cdc_ui
