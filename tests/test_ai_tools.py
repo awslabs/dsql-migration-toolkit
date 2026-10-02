@@ -251,3 +251,42 @@ def test_a_schema_qualified_argument_type_does_not_cross_match_an_overload() -> 
     # The friendly name still resolves (to the first).
     assert _resolved("f") == "app.f(a geo.point)"
     assert _resolved("app.f") == "app.f(a geo.point)"
+
+
+def test_get_cdc_status_exposes_the_source_schema_re_check() -> None:
+    """G4: a source DDL change no dead letter reveals is grounded too -- bounded, open first,
+    names and kind codes only."""
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    from dsql_migrator.core.models import CdcCatalogDriftFinding
+    from dsql_migrator.ui.data_migration._state import DataMigrationState
+
+    state = DataMigrationState()
+    now = datetime.now(timezone.utc)
+    findings = {
+        f"app.t{i:02d}": CdcCatalogDriftFinding(
+            kinds=["drop-column"], first_seen_at=now,
+            resolved_at=now + timedelta(minutes=1) if i % 2 else None,
+            resolved_by="matched" if i % 2 else None,
+        )
+        for i in range(25)
+    }
+    state.cdc_catalog_drift_findings = findings
+    execute = build_ai_tool_executor(
+        session_id="s1",
+        session_store=_Store(_Obj(target_config=None, target_verified=False)),
+        evaluation_store=_Store(get_returns=None),
+        schema_conversion_store=_Store(_Obj(generated_node_ids=[], apply_results=[])),
+        validation_store=_Store(_Obj(result=None)),
+        data_migration_store=_Store(state),
+        job_manager=_Obj(),
+        full_load_rate_eta=lambda *_a, **_k: (None, None),
+    )
+    payload = json.loads(execute("get_cdc_status", {}))
+    assert payload["status"] == "ok", payload
+    rows = payload["source_schema_changes"]
+    assert len(rows) == 20 and payload["source_schema_changes_total"] == 25
+    assert all(r["open"] for r in rows[:13]) and not rows[13]["open"]
+    assert rows[0] == {"table": "app.t00", "kinds": ["drop-column"], "open": True}
+    assert "re-read of the source catalog" in payload["note"]

@@ -1422,6 +1422,83 @@ class CdcReplicaIdentityWaiver(BaseModel):
     waived_at: datetime
 
 
+# The source-schema re-check's change kinds (core/cdc_catalog_drift.py), most severe first.
+# Where the meaning matches, the value is the dead-letter banner's SchemaDriftKind value; the
+# TARGET-side "missing-table" kind is never reused (a source table that is gone is its own
+# kind).
+CatalogDriftKind = Literal[
+    "source-table-missing",
+    "key-change",
+    "type-change",
+    "drop-column",
+    "rename-column",
+    "nullability-change",
+    "add-column",
+    "definition-change",
+]
+
+
+class CdcCatalogDriftChange(BaseModel):
+    """One difference between a captured table's live source definition and its baseline.
+
+    Value-free (Property 7): a column name, catalog type text (``COLUMN_TYPE`` /
+    ``format_type``, cut to 60 characters), a NULL rule or a primary-key column list -- never
+    a row value. ``column`` is the old name of a renamed column (``after`` its new name);
+    ``generated`` marks an added column the source computes.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: CatalogDriftKind
+    column: Optional[str] = None
+    before: Optional[str] = None
+    after: Optional[str] = None
+    generated: bool = False
+
+
+class CdcCatalogDriftFinding(BaseModel):
+    """A captured table whose source definition stopped matching the migration's baseline
+    while CDC ran -- a change no rejected row reveals (a dropped nullable column, a widened
+    type, a renamed table, ...).
+
+    The runtime re-check (``ui/cdc_catalog_drift_gate``) re-reads the captured tables' source
+    catalog and compares it with the Step 1 inventory (plus the columns added through Fix
+    target schema). OPEN (``resolved_at`` None) holds Cut over outright: a CHECKSUM can
+    false-match while the inventory still has the old shape. Resolved by a read that shows
+    the live source equal to the CURRENT baseline (``"matched"``), by a Step 1 re-run that
+    changed the definition it compares with (``"rebaselined"``), or because the table left
+    the Step 1 inventory (``"not-in-inventory"``); Cut over then waits for a CHECKSUM match
+    started after ``resolved_at``. Kept across restarts, cleared only by Start over. At most
+    six changes are kept (``more_changes`` counts the rest). Frozen, replaced on every change.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kinds: list[CatalogDriftKind] = Field(min_length=1)
+    changes: list[CdcCatalogDriftChange] = Field(default_factory=list, max_length=6)
+    more_changes: int = Field(default=0, ge=0)
+    # Every added column is a plain (non-generated) one -- Fix target schema adds every
+    # column its plan finds, so a generated one would arrive as a plain, empty column -- and
+    # nothing makes Fix misleading (a rename, a key change, a missing table).
+    fixable: bool = False
+    first_seen_at: datetime
+    resolved_at: Optional[datetime] = None
+    resolved_by: Optional[Literal["matched", "rebaselined", "not-in-inventory"]] = None
+
+
+class CdcCatalogDriftWaiver(BaseModel):
+    """The operator's recorded decision to cut over without CHECKSUM proof for tables whose
+    source schema changed while CDC ran and that Validation cannot prove (left out of the
+    report, no longer in the Step 1 inventory, or inside an accepted gap). Scoped: each table
+    maps to the ``resolved_at`` it was waived against, so a new change re-opens the check.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tables: dict[str, datetime] = Field(default_factory=dict)
+    waived_at: datetime
+
+
 class LoadStatusView(BaseModel):
     """Normalized monitoring read-model rendered identically for Full Load/CDC.
 

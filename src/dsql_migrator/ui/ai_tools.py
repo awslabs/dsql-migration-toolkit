@@ -730,6 +730,17 @@ def build_ai_tool_executor(
                 ).most_common(5)
                 _lag = getattr(_dm, "cdc_replication_lag_by_table", {}) or {}
                 _max_lag = max((int(v) for v in _lag.values()), default=None)
+                # The source-schema re-check's findings (no dead letter needed): open first,
+                # bounded. Names and kind codes only (value-free).
+                _schema = getattr(_dm, "cdc_catalog_drift_findings", None) or {}
+                _schema_rows = sorted(
+                    (
+                        {"table": t, "kinds": list(getattr(f, "kinds", None) or ()),
+                         "open": getattr(f, "resolved_at", None) is None}
+                        for t, f in _schema.items()
+                    ),
+                    key=lambda r: (not r["open"], r["table"]),
+                )
                 return _json.dumps(
                     {"status": "ok", "streaming": _streaming,
                      "dlq_depth": int(getattr(_dlq, "total_errors", 0) or 0),
@@ -744,10 +755,15 @@ def build_ai_tool_executor(
                          for d in _drift
                      ],
                      "max_replication_lag_ms": _max_lag,
+                     "source_schema_changes": _schema_rows[:20],
+                     "source_schema_changes_total": len(_schema_rows),
                      "note": ("DLQ poison rows + detected schema drift are silent "
                               "data-loss risks — resolve before cut over. Common "
                               "SQLSTATEs: 22P02/22001 = data/format, 23505 = duplicate "
-                              "key, 23502 = NOT NULL / dropped column.")}
+                              "key, 23502 = NOT NULL / dropped column. "
+                              "source_schema_changes come from the tool's re-read of the "
+                              "source catalog (no dead letter needed); an open one holds "
+                              "Cut over.")}
                 )
             if name == "get_cdc_pipeline_diagnostics":
                 # Why CDC is not streaming / a deploy failed. All CACHED/local state:

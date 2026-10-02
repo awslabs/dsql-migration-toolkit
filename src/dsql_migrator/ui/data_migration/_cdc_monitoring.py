@@ -846,6 +846,169 @@ def _render_cdc_replica_identity_notice(
             render_notice(ui, tone=unchecked[0], header=unchecked[1], body=unchecked[2])
 
 
+# The source-schema kinds the dead-letter banner ALSO classifies (from the rejection's
+# SQLSTATE), with the same names as the re-check's: a table both report the same way is
+# listed only in that banner.
+_DLQ_SHARED_SCHEMA_KINDS = frozenset({"add-column", "drop-column", "type-change"})
+
+
+def _listed_in_dlq_banner(finding, banner_kinds) -> bool:
+    """Whether the dead-letter banner already reports every kind of this open finding."""
+    kinds = set(getattr(finding, "kinds", None) or ())
+    if not kinds or not banner_kinds or not kinds <= set(banner_kinds):
+        return False
+    # An added column the source computes is invisible to the banner, and only it makes
+    # such a finding unfixable (diff_table): keep that row here.
+    return "add-column" not in kinds or bool(getattr(finding, "fixable", False))
+
+
+def _render_cdc_catalog_drift_notice(
+    ui, migration_state, session, view=None, *, on_check_again=None, on_fix=None
+) -> None:
+    """The runtime source-schema re-check for the captured tables (render only).
+
+    ``error`` while a finding is open -- a source DDL change CDC does not carry, which no
+    rejected row reveals (a dropped nullable column, a widened type, a missing table, ...):
+    one row per table with what changed and why it matters, the runbook for the migration
+    type, "Fix target schema…" for a plain added column (not where the dead-letter banner
+    already offers it), and "Check again". A table whose change the dead-letter banner
+    already reports the same way (a column added, dropped or retyped; the banner is drawn
+    whenever the queue's depth is known) is listed only there -- never twice, with two
+    severities and two runbooks; the finding still holds Cut over. ``warning`` for a table
+    whose source matches the baseline again but that no CHECKSUM started after that has
+    proven yet. With nothing open, ``info`` when the check cannot run (no source password
+    after a restart) and ``warning`` when its last read failed or found none of the tables.
+    Reads only what the CDC poll's throttled background read (``cdc_catalog_drift_gate``)
+    landed -- the baseline provider is CPU only. Nothing at all without the builder's
+    baseline handle.
+    """
+    from dsql_migrator.ui.cdc_catalog_drift_gate import (
+        _inventory_names,
+        _raw_baseline,
+        _usable,
+        catalog_drift_proven_tables,
+        catalog_drift_scope,
+        catalog_drift_waived_tables,
+        handle_registered,
+        monitor_open_notice,
+        monitor_resolved_notice,
+        monitor_unchecked_notice,
+    )
+    from dsql_migrator.ui.cdc_replica_identity_gate import (
+        _is_postgres,
+        cdc_evidence,
+        has_source_connection,
+    )
+
+    findings = dict(getattr(migration_state, "cdc_catalog_drift_findings", None) or {})
+    # ONE provider call per render (CPU only): the baseline, and the inventory's names.
+    raw_baseline = _raw_baseline(migration_state) if handle_registered(migration_state) else None
+    baseline = raw_baseline if _usable(raw_baseline) else None
+    scope = catalog_drift_scope(migration_state, baseline) if baseline is not None else ()
+    if not findings and not scope:
+        return
+    has_password = has_source_connection(session)
+    last_probe = getattr(migration_state, "cdc_catalog_drift_last_probe", None)
+    migration_type = getattr(migration_state, "migration_type", None)
+    open_findings = {
+        t: f for t, f in findings.items() if getattr(f, "resolved_at", None) is None
+    }
+    # A table whose change the dead-letter banner below already reports the same way is
+    # listed only there (one severity, one runbook). Render only: the gate and Cut over
+    # still see every open finding, and the "Can't re-check" notice below keys on them all.
+    drift_groups = list(getattr(view, "schema_drift", None) or ())
+    banner_kinds: dict = {}
+    if getattr(view, "dlq_depth", None) is not None:  # the dead-letter card is drawn
+        for g in drift_groups:
+            if getattr(g, "kind", "") in _DLQ_SHARED_SCHEMA_KINDS:
+                banner_kinds.setdefault(getattr(g, "table", None), set()).add(g.kind)
+    shown_open = {
+        t: f for t, f in open_findings.items()
+        if not _listed_in_dlq_banner(f, banner_kinds.get(t))
+    }
+    if shown_open:
+        # The dead-letter banner already offers Fix for its add-column groups: one button
+        # per table, never two.
+        dlq_adds = {
+            getattr(g, "table", None)
+            for g in drift_groups
+            if getattr(g, "kind", "") == "add-column"
+        }
+        fix_tables = {
+            t for t, f in shown_open.items()
+            if getattr(f, "fixable", False)
+            and session is not None
+            and on_fix is not None
+            and has_password
+            and t not in dlq_adds
+        }
+        notice = monitor_open_notice(
+            shown_open,
+            is_pg=_is_postgres(session),
+            migration_type=migration_type,
+            has_password=has_password,
+            last_probe=last_probe,
+            baseline_known=baseline is not None,
+            fix_tables=fix_tables,
+        )
+        bg, border, icon_color, _icon = NOTICE_STYLE["error"]
+        with ui.column().classes(  # type: ignore[attr-defined]
+            f"w-full gap-1 rounded-md border {border} {bg} p-2"
+        ):
+            with ui.row().classes("w-full items-center gap-2 no-wrap"):  # type: ignore[attr-defined]
+                ui.icon("schema").classes(f"{icon_color} text-lg")  # type: ignore[attr-defined]
+                ui.label(notice.header).classes(  # type: ignore[attr-defined,union-attr]
+                    "text-sm font-semibold text-gray-900"
+                )
+            ui.label(notice.intro).classes("text-xs text-gray-800")  # type: ignore[attr-defined,union-attr]
+            for table, text in notice.rows:  # type: ignore[union-attr]
+                with ui.row().classes("w-full items-center gap-2"):  # type: ignore[attr-defined]
+                    ui.label(text).classes("text-xs text-gray-800")  # type: ignore[attr-defined]
+                    if table in fix_tables:
+                        ui.button(  # type: ignore[attr-defined]
+                            "Fix target schema…",
+                            on_click=lambda _e=None, t=table: on_fix(t),
+                        ).props("flat dense no-caps size=sm color=primary")
+            if notice.more_tables:  # type: ignore[union-attr]
+                ui.label(notice.more_tables).classes("text-xs text-gray-800")  # type: ignore[attr-defined,union-attr]
+            ui.label(notice.runbook).classes("text-xs italic text-gray-600")  # type: ignore[attr-defined,union-attr]
+            ui.label(notice.tail).classes("text-xs text-gray-800")  # type: ignore[attr-defined,union-attr]
+            if on_check_again is not None:
+                with ui.row().classes("w-full justify-end"):  # type: ignore[attr-defined]
+                    button = ui.button(  # type: ignore[attr-defined]
+                        "Check again", icon="refresh", on_click=on_check_again
+                    ).props("flat no-caps color=primary")
+                    if (
+                        not has_password
+                        or baseline is None
+                        or bool(getattr(migration_state, "cdc_catalog_drift_probe_running", False))
+                    ):
+                        button.props("disable")
+    provider = getattr(migration_state, "validation_state_provider", None)
+    try:
+        validation_state = provider() if callable(provider) else None
+    except Exception:  # noqa: BLE001 - without it every resolved finding still shows
+        validation_state = None
+    inventory_names = _inventory_names(raw_baseline)
+    resolved = monitor_resolved_notice(
+        findings,
+        catalog_drift_proven_tables(findings, validation_state, inventory_names),
+        migration_type,
+        waived=catalog_drift_waived_tables(
+            findings, getattr(validation_state, "cutover_catalog_drift_waiver", None)
+        ),
+        inventory_names=inventory_names,
+    )
+    if resolved is not None:
+        render_notice(ui, tone="warning", header=resolved[0], body=resolved[1])
+    # With a finding open the error above already says why the re-read cannot clear it; with
+    # no baseline nothing is drawn here (Cut over warns).
+    if not open_findings and scope and cdc_evidence(migration_state):
+        unchecked = monitor_unchecked_notice(scope, last_probe, has_password=has_password)
+        if unchecked is not None:
+            render_notice(ui, tone=unchecked[0], header=unchecked[1], body=unchecked[2])
+
+
 # How many named columns the value-conversion notice lists inline before it tails off
 # with "+N more" -- the same treatment cdc_applied_rollup_detail gives a long per-table
 # list, so a pathological schema cannot turn one notice into a wall of text.
@@ -1075,6 +1238,14 @@ def _render_cdc_live_monitoring(
             _render_cdc_replica_identity_notice(
                 ui, migration_state, session, on_check_again=_check_identity_again
             )
+            # A source DDL change CDC does not carry and no rejected row reveals (a dropped
+            # nullable column, a widened type, a renamed table, ...): flagged from the
+            # throttled background re-read of the captured tables' definitions, never read
+            # on this render. A sibling of the dead-letter card, like the notice above.
+            _render_cdc_catalog_drift_notice(
+                ui, migration_state, session, view,
+                on_check_again=_check_schema_again, on_fix=_fix_catalog_drift,
+            )
             # A SIBLING of the dead-letter card, never inside it: these rows landed, so
             # rendering them within a panel titled "poison records" would invite exactly
             # the reading this signal exists to prevent. Above the card so an error-level
@@ -1149,6 +1320,15 @@ def _render_cdc_live_monitoring(
             start_replica_identity_probe(session, migration_state)
         except Exception:  # noqa: BLE001 - monitoring must never break the poll
             _LOGGER.warning("REPLICA IDENTITY re-check could not start", exc_info=True)
+        # Every captured table: start the throttled source-schema re-read (at most every 5
+        # minutes per session, single flight), spawned and never awaited like the one above.
+        # Inert without the builder's baseline handle or CDC evidence.
+        try:
+            from dsql_migrator.ui.cdc_catalog_drift_gate import start_catalog_drift_probe
+
+            start_catalog_drift_probe(session, migration_state)
+        except Exception:  # noqa: BLE001 - monitoring must never break the poll
+            _LOGGER.warning("source schema re-check could not start", exc_info=True)
         _update_lag_chart()  # persistent chart: update in place (no flicker)
         _cdc_live.refresh()  # connector health / change flow / DLQ (text) redraw
 
@@ -1159,6 +1339,33 @@ def _render_cdc_live_monitoring(
 
         await probe_replica_identity_now(session, migration_state)
         _cdc_live.refresh()
+
+    async def _check_schema_again() -> None:
+        # "Check again" on the source-schema notice: one forced read (still landed if this
+        # handler is cancelled by a re-render), then redraw.
+        from dsql_migrator.ui.cdc_catalog_drift_gate import probe_catalog_drift_now
+
+        await probe_catalog_drift_now(session, migration_state)
+        _cdc_live.refresh()
+
+    def _after_catalog_fix() -> None:
+        # The Fix dialog calls this SYNCHRONOUSLY after an apply: force one re-read (the
+        # recorded column changes the baseline), then redraw.
+        try:
+            from dsql_migrator.ui.cdc_catalog_drift_gate import start_catalog_drift_probe
+
+            start_catalog_drift_probe(session, migration_state, force=True)
+        except Exception:  # noqa: BLE001 - the next poll reads it anyway
+            _LOGGER.warning("source schema re-check could not start", exc_info=True)
+        _cdc_live.refresh()
+
+    def _fix_catalog_drift(table: str):
+        # Fix target schema… for a plain column the source added (from the source-schema
+        # notice): the applied columns are recorded as part of the re-check's baseline.
+        return _open_add_column_dialog(
+            ui, session, table, on_refresh=_after_catalog_fix,
+            on_applied=getattr(migration_state, "record_cdc_target_added_columns", None),
+        )
 
     _update_lag_chart()  # initial state (hidden until >=2 points)
     _cdc_live()
@@ -1461,7 +1668,9 @@ _TARGET_SIDE_DRIFT_KINDS = frozenset(
 _CERTAIN_LOSS_DRIFT_KINDS = frozenset({"missing-table", "unbindable-value"})
 
 
-async def _open_add_column_dialog(ui, session, table: str, on_refresh=None) -> None:
+async def _open_add_column_dialog(
+    ui, session, table: str, on_refresh=None, on_applied=None
+) -> None:
     """Offer the operator the exact ADD COLUMN DDL the target is missing.
 
     The recovery for the dominant drift kind (source ADD COLUMN), split so nothing
@@ -1472,6 +1681,10 @@ async def _open_add_column_dialog(ui, session, table: str, on_refresh=None) -> N
 
     Both reads and the apply are blocking I/O, so each is offloaded with
     ``run.io_bound``; the render path itself stays I/O-free.
+
+    ``on_applied(table, {column: source catalog type})`` (optional) is told the columns
+    that were APPLIED -- never a failed or skipped one -- before ``on_refresh``, so the
+    source-schema re-check counts them as part of its baseline.
     """
     from nicegui import run
 
@@ -1606,6 +1819,12 @@ async def _open_add_column_dialog(ui, session, table: str, on_refresh=None) -> N
                 return
             applied = [o for o in outcomes if o.applied]
             failed = [o for o in outcomes if not o.applied]
+            if on_applied is not None and applied:
+                _types = {step.column: step.source_type for step in plan.steps}
+                try:
+                    on_applied(table, {o.column: _types.get(o.column, "") for o in applied})
+                except Exception:  # noqa: BLE001 - recording must never hide the outcome
+                    _LOGGER.warning("could not record the added columns", exc_info=True)
             from dsql_migrator.core.activity_log import (
                 ActivityCategory,
                 ActivityStatus,
@@ -1755,6 +1974,7 @@ def _render_cdc_schema_drift_banner(
     cdc_ai_opener=None,
     saved_exclusions: "Optional[Mapping[str, object]]" = None,
     migration_type=None,
+    on_applied=None,
 ) -> None:
     """Flag source DDL the target has not caught up to (from the classified DLQ).
 
@@ -1765,7 +1985,8 @@ def _render_cdc_schema_drift_banner(
     recovery, so a reader is not left to reverse-engineer a rising DLQ count. Renders
     nothing when no drift was detected (the common case), so it is inert on a healthy
     stream. The truncate-only runbook follows ``migration_type`` (CDC only has no Full
-    Load step to reload from).
+    Load step to reload from). ``on_applied`` is handed to the Fix dialog, which reports
+    the columns it added (the source-schema re-check's baseline records them).
     """
     drift = getattr(status_view, "schema_drift", None) or []
     if not drift:
@@ -1853,7 +2074,8 @@ def _render_cdc_schema_drift_banner(
                         "Fix target schema…",
                         on_click=lambda _e=None, table=group.table: (
                             _open_add_column_dialog(
-                                ui, session, table, on_refresh=on_refresh
+                                ui, session, table, on_refresh=on_refresh,
+                                on_applied=on_applied,
                             )
                         ),
                     ).props("flat dense no-caps size=sm color=primary")
@@ -2182,6 +2404,7 @@ def _render_cdc_dlq_panel(
             cdc_ai_opener=cdc_ai_opener,
             saved_exclusions=migration_state.lob_exclusions(),
             migration_type=getattr(migration_state, "migration_type", None),
+            on_applied=getattr(migration_state, "record_cdc_target_added_columns", None),
         )
         _render_cdc_dlq_breakdown(ui, status_view)
         # CDC commonly has no Full Load job_id this session, so key the record list /

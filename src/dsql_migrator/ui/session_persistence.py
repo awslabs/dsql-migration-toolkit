@@ -301,6 +301,16 @@ def capture_session_snapshot(
             getattr(migration_state, "cdc_replica_identity_findings", None) or {}
         ),
         cdc_deployed_message_key_columns=_deployed_keys(migration_state),
+        # The runtime source-schema re-check's findings, its baseline digests and the
+        # columns Fix target schema added (see SessionSnapshot.cdc_catalog_drift_findings).
+        cdc_catalog_drift_findings=dict(
+            getattr(migration_state, "cdc_catalog_drift_findings", None) or {}
+        ),
+        cdc_catalog_drift_digests={
+            str(t): str(d)
+            for t, d in (getattr(migration_state, "cdc_catalog_drift_digests", None) or {}).items()
+        },
+        cdc_target_added_columns=_target_added(migration_state),
         ai_assist_enabled=bool(getattr(session.ai_assist, "enabled", False)),  # type: ignore[attr-defined]
         ai_assist_model_id=getattr(session.ai_assist, "model_id", None),  # type: ignore[attr-defined]
         ai_assist_region=getattr(session.ai_assist, "region", None),  # type: ignore[attr-defined]
@@ -368,7 +378,18 @@ def capture_session_snapshot(
             snapshot.validation_cdc_replica_identity_waiver = getattr(
                 validation_state, "cutover_replica_identity_waiver", None
             )
+            snapshot.validation_cdc_catalog_drift_waiver = getattr(
+                validation_state, "cutover_catalog_drift_waiver", None
+            )
     return snapshot
+
+
+def _target_added(migration_state: object) -> "dict[str, dict[str, str]]":
+    added = getattr(migration_state, "cdc_target_added_columns", None) or {}
+    return {
+        str(t): {str(c): str(v) for c, v in dict(cols or {}).items()}
+        for t, cols in added.items()
+    }
 
 
 def _deployed_keys(migration_state: object) -> "Optional[dict[str, list[str]]]":
@@ -507,6 +528,9 @@ def apply_session_snapshot(
                 cdc_dlq_waiver=snapshot.validation_cdc_dlq_waiver,
                 replica_identity_waiver=getattr(
                     snapshot, "validation_cdc_replica_identity_waiver", None
+                ),
+                catalog_drift_waiver=getattr(
+                    snapshot, "validation_cdc_catalog_drift_waiver", None
                 ),
             )
         # A step that reads IN_PROGRESS but has a restored report has NO live job
@@ -747,6 +771,26 @@ def apply_session_snapshot(
         migration_state.cdc_replica_identity_findings = dict(  # type: ignore[attr-defined]
             snapshot.cdc_replica_identity_findings
         )
+    # ...and the source-schema re-check's findings, digests and Fix-added columns, likewise
+    # before any poll and by direct assignment (a restore never closes or logs a finding).
+    if getattr(snapshot, "cdc_catalog_drift_findings", None) and hasattr(
+        migration_state, "cdc_catalog_drift_findings"
+    ):
+        migration_state.cdc_catalog_drift_findings = dict(  # type: ignore[attr-defined]
+            snapshot.cdc_catalog_drift_findings
+        )
+    if getattr(snapshot, "cdc_catalog_drift_digests", None) and hasattr(
+        migration_state, "cdc_catalog_drift_digests"
+    ):
+        migration_state.cdc_catalog_drift_digests = dict(  # type: ignore[attr-defined]
+            snapshot.cdc_catalog_drift_digests
+        )
+    if getattr(snapshot, "cdc_target_added_columns", None) and hasattr(
+        migration_state, "cdc_target_added_columns"
+    ):
+        migration_state.cdc_target_added_columns = {  # type: ignore[attr-defined]
+            str(t): dict(cols) for t, cols in snapshot.cdc_target_added_columns.items()
+        }
     if snapshot.cdc_stack_name and hasattr(migration_state, "set_cdc_stack_name"):
         migration_state.set_cdc_stack_name(snapshot.cdc_stack_name)  # type: ignore[attr-defined]
     # The deployed re-key map AFTER the stack name: a name change resets it (it belongs to
@@ -998,6 +1042,9 @@ def session_signature(
         # The REPLICA IDENTITY findings and the deployed re-key map, so an opened / restored /
         # de-scoped finding is saved (a silent identical re-read changes nothing).
         _cdc_replica_identity_sig(migration_state),
+        # The source-schema findings, digests and Fix-added columns, so an opened / resolved
+        # finding, a re-baselined table or a recorded Fix column is saved.
+        _cdc_catalog_drift_sig(migration_state),
         # Schema-Conversion edits (edited DDLs, the preserve-FK toggle, ticked nodes).
         # Without this the snapshot was never written for an edit-only change, so a PK
         # strategy chosen in Step 2 -- and with it the cut-over "Sync identity sequences"
@@ -1025,6 +1072,8 @@ def _validation_sig(validation_state: object) -> tuple:
     waived_at = getattr(waiver, "waived_at", None)
     ri_waiver = getattr(validation_state, "cutover_replica_identity_waiver", None)
     ri_waived_at = getattr(ri_waiver, "waived_at", None)
+    g4_waiver = getattr(validation_state, "cutover_catalog_drift_waiver", None)
+    g4_waived_at = getattr(g4_waiver, "waived_at", None)
     return (
         True,
         completed.isoformat() if completed is not None else None,
@@ -1033,6 +1082,8 @@ def _validation_sig(validation_state: object) -> tuple:
         waived_at.isoformat() if waived_at is not None else None,
         # ...and so is a REPLICA IDENTITY CHECKSUM-proof waiver.
         ri_waived_at.isoformat() if ri_waived_at is not None else None,
+        # ...and a source-schema CHECKSUM-proof waiver.
+        g4_waived_at.isoformat() if g4_waived_at is not None else None,
     )
 
 
@@ -1072,6 +1123,36 @@ def _cdc_replica_identity_sig(migration_state: object) -> tuple:
             )
         ),
         deployed_sig,
+    )
+
+
+def _cdc_catalog_drift_sig(migration_state: object) -> tuple:
+    """Cheap signature of the source-schema findings, digests and Fix-added columns."""
+    findings = getattr(migration_state, "cdc_catalog_drift_findings", None) or {}
+    digests = getattr(migration_state, "cdc_catalog_drift_digests", None) or {}
+    added = getattr(migration_state, "cdc_target_added_columns", None) or {}
+    return (
+        tuple(
+            sorted(
+                (
+                    str(table),
+                    _iso(getattr(f, "first_seen_at", None)),
+                    _iso(getattr(f, "resolved_at", None)),
+                    getattr(f, "resolved_by", None),
+                    tuple(getattr(f, "kinds", None) or ()),
+                    len(getattr(f, "changes", None) or ()),
+                    int(getattr(f, "more_changes", 0) or 0),
+                )
+                for table, f in findings.items()
+            )
+        ),
+        len(digests),
+        hash(frozenset(digests.items())),
+        tuple(
+            sorted(
+                (str(t), tuple(sorted(dict(cols or {}).items()))) for t, cols in added.items()
+            )
+        ),
     )
 
 

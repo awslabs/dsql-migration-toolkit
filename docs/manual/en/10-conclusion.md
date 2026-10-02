@@ -59,7 +59,9 @@ replication; otherwise Full Load alone is simpler and cheaper.
    quarantine, not-yet-converged CDC). For a CDC migration, tables with dead-lettered
    CDC changes are also compared by CHECKSUM automatically.
 6. **Cut over** — once Validation is a clean MATCH (and, for CDC, the dead-letter
-   check in [§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over) clears), switch
+   check in [§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over) and the source
+   schema re-check in [§5.7](05-validation.md#57-source-schema-changes-and-cut-over)
+   clear), switch
    your application to DSQL. This is the one step the tool does not perform for you; follow the
    tailored runbook (§10.3 below).
 
@@ -73,8 +75,9 @@ you — it proves the target is correct and gives you a gapless replication stre
 but *when* and *how* you repoint your application is an operational decision only
 you can make. The UI shows the matching runbook on the **Cut over** step once
 Validation is a clean MATCH (and, for CDC, the dead-letter check in
-[§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over) clears); below is the same
-guidance for each path.
+[§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over) and the source schema re-check
+in [§5.7](05-validation.md#57-source-schema-changes-and-cut-over) clear); below is the
+same guidance for each path.
 
 ### Full Load only (a short maintenance freeze)
 
@@ -108,7 +111,9 @@ freeze shrinks to just the final drain + smoke test.
    automatically, and Cut over re-reads the dead-letter queue before it opens (see
    [§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over)). On a PostgreSQL source
    with re-keyed tables, Cut over also re-reads their REPLICA IDENTITY before it opens
-   (see [§5.6](05-validation.md#56-re-keyed-postgresql-tables-and-cut-over)).
+   (see [§5.6](05-validation.md#56-re-keyed-postgresql-tables-and-cut-over)). Cut over
+   also re-reads the captured tables' definitions on the source before it opens (see
+   [§5.7](05-validation.md#57-source-schema-changes-and-cut-over)).
 5. **Repoint the application** to the DSQL endpoint and smoke-test.
 6. **Tear the CDC pipeline down LAST** — click **Start over (top right)** →
    *Delete all CDC infrastructure*. It ends replication, stops MSK / MSK

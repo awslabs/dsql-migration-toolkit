@@ -154,6 +154,8 @@ Validation을 다시 실행할 때까지(또는 **Objects to validate**에서 �
   table(s)"* 로 표시하고 **Re-check N table(s) with CHECKSUM**을 제공합니다. dead-letter 이력을 확인할
   수 없으면(아래) 리포트는 대신 *"Tables match — cut over waits for one CHECKSUM run of every table"* 로
   표시하고, 실행 전에 Options도 이를 알려 줍니다. Fast sweep을 끈 CHECKSUM 모드 실행 한 번이면 해소됩니다.
+  REPLICA IDENTITY가 FULL 미만으로 내려간 테이블([§5.6](#56-재키잉된-postgresql-테이블과-컷오버))과 CDC 실행
+  중 소스 스키마가 바뀐 테이블([§5.7](#57-소스-스키마-변경과-컷오버))도 같은 방식으로 CHECKSUM으로 비교합니다.
 - **Cut over는 다음이 모두 충족될 때만 열립니다:**
   1. 각 dead-letter 테이블이 최신 dead-letter 레코드보다 **1분 넘게 뒤에 시작한** CHECKSUM 비교에서
      일치했다;
@@ -234,6 +236,49 @@ Cut over가 그 기록을 사용합니다:
 
 수정 후에도 다른 테이블의 **해결 순서**: Full Load + CDC — CDC가 따라잡게 둔 뒤 Stop CDC, **Drop & reload**로
 리로드, Start CDC, 재확인; CDC only — Aurora DSQL에서 잉여 행을 직접 삭제한 뒤 재확인.
+
+---
+
+## 5.7 소스 스키마 변경과 컷오버
+
+이 절은 CDC 마이그레이션(**Full Load + CDC** 또는 **CDC only**)에 MySQL·PostgreSQL 모두 해당합니다. 어떤 소스
+DDL은 거부되는 행 하나 없이 CDC가 쓰는 값을 바꿉니다 — nullable 컬럼 삭제, 타입 확장, 테이블 이름 변경 등
+([§4.2](04-cdc-and-dsql-constraints.md#데드레터를-남기지-않는-변경-소스-스키마-재확인)). CDC 모니터가 소스에서
+캡처 중인 테이블의 정의를 다시 읽고, 정의가 더 이상 Step 1(Evaluation) 인벤토리와 일치하지 않는 테이블을
+기록하며([§4.6](04-cdc-and-dsql-constraints.md#소스-스키마-재확인)), Validation과 Cut over가 그 기록을
+사용합니다:
+
+- **Validation은 그 테이블들을 자동으로 CHECKSUM으로 비교하며**, 실행 전에 Options에 이름을 보여 줍니다.
+  테이블의 소스 정의가 아직 Step 1 인벤토리와 다르면, 리포트가 무엇을 보여 주든 Cut over는 보류됩니다. 컬럼
+  추가·삭제나 테이블 없음은 대개 테이블을 아예 비교할 수 없다는 뜻입니다(*"N table(s) could not be compared"*;
+  Step 1을 다시 실행하세요). 그 밖의 경우 리포트는 *"Tables match — cut over is held: the source schema
+  changed on N table(s)"* 로 표시합니다. 어떤 CHECKSUM도 이를 풀지 못합니다: 비교가 각 컬럼을 Step 1 인벤토리
+  기준으로 렌더링하므로 잘못 일치할 수 있기 때문입니다(`INT`로 넓어진 `TINYINT(1)`은 여전히 true/false로
+  비교됨).
+- **두 단계로 해소됩니다.** 먼저 소스가 다시 Step 1 인벤토리와 일치해야 합니다: Step 1(Evaluation)을 다시
+  실행해 새 정의를 담거나(단순히 추가된 컬럼은 먼저 **Fix target schema…**로 Aurora DSQL에 추가하세요:
+  Validation은 Step 1 인벤토리에 없는 컬럼을 비교할 수 없습니다), 소스의 변경을 되돌리세요 — 도구가 스스로 다시
+  읽으며, **Check again**을 눌러도 됩니다. 그런 다음 그 시각보다 **1분 넘게
+  뒤에 시작한** CHECKSUM 비교에서 테이블이 일치해야 합니다. 리포트는 **Re-check N table(s) with CHECKSUM**을
+  제공합니다. 캡처 중인 테이블의 정의를 바꾸는 Step 1 재실행도 같이 다룹니다: 그 전에 CDC가 적용한 값이 다를
+  수 있으므로, 그 테이블도 재실행 후에 시작한 CHECKSUM이 필요합니다.
+- **Cut over는** 열리기 전에 최신 Validation 또는 Step 1 실행 이후 소스 정의를 **한 번 새로 읽어**(몇 초) 그
+  사이의 변경을 잡아냅니다.
+- 리포트에서 빠진 테이블, Step 1 인벤토리에 더 이상 없는 테이블(소스에서 삭제하거나 이름을 바꾼 뒤 Step 1을
+  다시 실행), 또는 수락한 갭 안의 테이블은, 열려 있거나 재확인이 필요한 다른 테이블이 없을 때 **Continue
+  without this check**로 승인할 수 있습니다(활동 로그에 기록되며, 테이블이 다시 바뀌면 다시 열림). 소스가
+  아직 다른 테이블은 결코 면제할 수 없습니다.
+- **소스를 확인할 수 없고** — 앱 재시작 후 비밀번호가 없음, Step 1 인벤토리가 없음(Step 1이 실행 중이거나
+  마지막 실행이 실패), 읽기 실패 — 바뀐 것으로 기록된 테이블이 없으면 Cut over는 보류하지 않습니다: 런북 위에
+  경고를 표시하고, 활동 로그의 승인 줄에 소스 스키마를 재확인하지 못했다고 기록합니다. 애플리케이션을
+  전환하기 전에 CDC 실행 중 마이그레이션 대상 테이블에 DDL이 실행되지 않았는지 확인하거나, Connect 단계에서
+  소스를 다시 연결하세요(읽기 실패 후에는 **Check again**). 아직 바뀐 것으로 기록된 테이블이 있으면 Cut over는
+  보류됩니다.
+- **재시작.** 각 변경의 기록은 앱 재시작 후에도 남고 Start over로만 지워집니다. **Full load only**는 영향이
+  없습니다. 단, 같은 세션에서 앞서 CDC를 실행했다면 그때 기록된 변경은 여전히 적용됩니다.
+
+그 CHECKSUM에서 다른 테이블의 **해결 순서**: Full Load + CDC — CDC가 따라잡게 둔 뒤 Stop CDC, **Drop &
+reload**로 리로드, Start CDC, 재확인; CDC only — Aurora DSQL에서 행을 직접 바로잡은 뒤 재확인.
 
 ---
 

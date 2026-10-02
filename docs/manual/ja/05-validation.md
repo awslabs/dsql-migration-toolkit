@@ -91,7 +91,7 @@ Validation がクリーンな **MATCH**（またはすべての差異が説明�
 
 そのため CDC 移行（**Full Load + CDC** または **CDC only**）では、ツールがデッドレターの **テーブルごとの件数**（最新時刻とドリフトの種類を含む）を保持し、Validation と Cut over がそれを使います:
 
-- **Validation はそれらのテーブルを自動的に CHECKSUM で比較します。** どのモードを選んでも、実行は値の比較なしで一致したデッドレター対象テーブルをすべて再比較します（実行前に Options がどのテーブルかを表示します）。後からデッドレターが届くと、レポートは *「Tables match — cut over waits for a CHECKSUM re-check of N table(s)」* と表示し、**Re-check N table(s) with CHECKSUM** を提示します。デッドレターの履歴を確認できない場合（後述）、レポートは代わりに *「Tables match — cut over waits for one CHECKSUM run of every table」* と表示し、実行前に Options もそれを知らせます。Fast sweep をオフにした CHECKSUM モードでの実行を 1 回行えば解消します。
+- **Validation はそれらのテーブルを自動的に CHECKSUM で比較します。** どのモードを選んでも、実行は値の比較なしで一致したデッドレター対象テーブルをすべて再比較します（実行前に Options がどのテーブルかを表示します）。後からデッドレターが届くと、レポートは *「Tables match — cut over waits for a CHECKSUM re-check of N table(s)」* と表示し、**Re-check N table(s) with CHECKSUM** を提示します。デッドレターの履歴を確認できない場合（後述）、レポートは代わりに *「Tables match — cut over waits for one CHECKSUM run of every table」* と表示し、実行前に Options もそれを知らせます。Fast sweep をオフにした CHECKSUM モードでの実行を 1 回行えば解消します。REPLICA IDENTITY が FULL 未満に下がったテーブル（[§5.6](#56-リキーされた-postgresql-テーブルとカットオーバー)）と、CDC の実行中にソーススキーマが変わったテーブル（[§5.7](#57-ソーススキーマの変更とカットオーバー)）も同じように CHECKSUM で比較します。
 - **Cut over は次のすべてを満たしたときにのみ開きます:**
   1. 各デッドレター対象テーブルが、最新のデッドレターレコードより **1 分以上後に開始した** CHECKSUM 比較で一致した;
   2. ツールが、**最新の Validation が終わった後に開始した**、CloudWatch Logs の CDC デッドレターログの **成功した完全な読み取り** を行った;
@@ -130,6 +130,21 @@ CHECKSUM は値を比較できない列を明示します（5.1）。デッド�
 - **再起動。** 下がった記録はアプリの再起動後も残り、Start over でのみ消えます。**MySQL** ソースと **Full load only** は影響を受けません。
 
 修正後も異なるテーブルの **対処手順**: Full Load + CDC — CDC を追いつかせてから Stop CDC、**Drop & reload** でリロード、Start CDC、再確認; CDC only — Aurora DSQL 上の余分な行を手作業で削除してから再確認。
+
+---
+
+## 5.7 ソーススキーマの変更とカットオーバー
+
+この節は CDC 移行（**Full Load + CDC** または **CDC only**）に、MySQL・PostgreSQL のどちらでも当てはまります。ソースの DDL の中には、拒否される行が 1 つもないまま CDC が書き込む値を変えるものがあります — nullable 列の削除、型の拡張、テーブルの名前変更など（[§4.2](04-cdc-and-dsql-constraints.md#デッドレターにならない変更-ソーススキーマの再確認)）。CDC モニターがソース上のキャプチャ対象テーブルの定義を読み直し、定義が Step 1（Evaluation）のインベントリと一致しなくなったテーブルを記録します（[§4.6](04-cdc-and-dsql-constraints.md#ソーススキーマの再確認)）。Validation と Cut over はその記録を使います:
+
+- **Validation はそれらのテーブルを自動的に CHECKSUM で比較し**、実行前に Options に名前を表示します。テーブルのソース定義がまだ Step 1 のインベントリと異なる間は、レポートの表示にかかわらず Cut over は保留されます。列の追加・削除やテーブルが見つからない場合は、たいていテーブルをまったく比較できません（*「N table(s) could not be compared」*。Step 1 を再実行してください）。それ以外の場合、レポートは *「Tables match — cut over is held: the source schema changed on N table(s)」* と表示します。どの CHECKSUM でも解除されません: 比較は各列を Step 1 のインベントリに基づいて描画するため、誤って一致することがあるからです（`INT` に広げられた `TINYINT(1)` は引き続き true / false として比較されます）。
+- **解消は 2 段階です。** まずソースが再び Step 1 のインベントリと一致する必要があります: Step 1（Evaluation）を再実行して新しい定義を取り込むか（単純な追加列は、先に **Fix target schema…** で Aurora DSQL に追加します: Validation は Step 1 のインベントリにない列を比較できません）、ソースの変更を元に戻します — ツールが自動で読み直しますし、**Check again** を押しても構いません。そのうえで、その時刻より **1 分以上後に開始した** CHECKSUM 比較でテーブルが一致する必要があります。レポートは **Re-check N table(s) with CHECKSUM** を提示します。キャプチャ対象テーブルの定義を変える Step 1 の再実行も同じように扱います: それ以前に CDC が適用した値が異なる可能性があるため、そのテーブルにも再実行後に開始した CHECKSUM が必要です。
+- **Cut over** は開く前に、最新の Validation または Step 1 の実行以降のソース定義を **1 回新たに読み**（数秒）、その間の変更を捉えます。
+- レポートから外れたテーブル、Step 1 のインベントリにもう存在しないテーブル（ソースで削除または名前変更した後に Step 1 を再実行）、または受け入れたギャップ内のテーブルは、開いているものや再確認が必要なものがほかにない場合に **Continue without this check** で承認できます（アクティビティログに記録され、テーブルが再び変わると再び開きます）。ソースがまだ異なるテーブルは決して免除できません。
+- **ソースを確認できず** — アプリ再起動後にパスワードがない、Step 1 のインベントリがない（Step 1 の実行中、または最後の実行が失敗）、読み取りの失敗 — 変更ありと記録されたテーブルがない場合、Cut over は保留しません: ランブックの上に警告を表示し、アクティビティログの承認行にソーススキーマを再確認できなかったことを記録します。アプリケーションを切り替える前に、CDC の実行中に移行対象テーブルへ DDL が実行されなかったことを確認するか、Connect ステップでソースを再接続してください（読み取りに失敗した後は **Check again**）。変更ありと記録されたテーブルが残っていれば Cut over は保留されます。
+- **再起動。** 各変更の記録はアプリの再起動後も残り、Start over でのみ消えます。**Full load only** は影響を受けません。ただし同じセッションで先に CDC を実行していた場合、そのとき記録された変更は引き続き適用されます。
+
+その CHECKSUM で異なったテーブルの **対処手順**: Full Load + CDC — CDC を追いつかせてから Stop CDC、**Drop & reload** でリロード、Start CDC、再確認; CDC only — Aurora DSQL 上の行を手作業で修正してから再確認。
 
 ---
 

@@ -2620,7 +2620,7 @@ def spawn_detached(work):
     """Run ``work()`` as its own task on the running loop and return the task, kept alive
     (strong reference) until it finishes and its outcome retrieved -- nobody has to await it.
     The building block of :func:`land_detached`; also used by the CDC poll to start a source
-    read it must never wait for (the runtime REPLICA IDENTITY re-check)."""
+    read it must never wait for (the runtime REPLICA IDENTITY and source-schema re-checks)."""
     import asyncio
 
     task = asyncio.get_running_loop().create_task(work())
@@ -2699,6 +2699,71 @@ def read_cdc_replica_identity_once(session, scope) -> object:
         started_at=started, finished_at=datetime.now(timezone.utc), ok=True,
         scope=frozen, reads=dict(reads),
     )
+
+
+# The runtime source-schema read's bound (seconds): one catalog statement for every captured
+# table. On PostgreSQL it is the statement_timeout; on MySQL the PyMySQL socket timeout, with
+# the statement's own MAX_EXECUTION_TIME(8000) hint stopping the server first.
+_CATALOG_DRIFT_READ_TIMEOUT_SECONDS = 10
+
+
+def read_cdc_catalog_drift_once(session, request) -> object:
+    """ONE bounded read of the captured tables' source definitions, diffed (BLOCKING; never
+    raises).
+
+    Returns a :class:`~dsql_migrator.ui.cdc_catalog_drift_gate.CdcCatalogDriftProbe`.
+    Read-only: the engine comes from ``make_source_engine_factory`` (the read-only guard,
+    the read timeout and the dialect's bounded ``connect_timeout``) and is disposed after ONE
+    catalog statement. Without a source connection (no config, or no password: it is kept in
+    memory only) it reports ``no-source-connection`` without connecting; with no table to
+    read it does not connect either (a table that left the inventory is still folded). The
+    diff runs here, on the worker, and the live rows are dropped with it. A failure keeps
+    only the exception's CLASS name: the message can carry a host or a value (Property 7).
+    """
+    from dsql_migrator.core.cdc_catalog_drift import read_live_catalog
+    from dsql_migrator.ui.cdc_catalog_drift_gate import (
+        PROBE_NO_SOURCE,
+        PROBE_READ_FAILED,
+        CdcCatalogDriftProbe,
+        build_catalog_drift_probe,
+    )
+
+    started = datetime.now(timezone.utc)
+    names = tuple(sorted(t.name for t in (getattr(request, "tables", None) or ())))
+
+    def _failed(problem: str, error_class: Optional[str] = None) -> object:
+        return CdcCatalogDriftProbe(
+            started_at=started, finished_at=datetime.now(timezone.utc), ok=False,
+            problem=problem, error_class=error_class, scope=names,
+            not_in_baseline=tuple(getattr(request, "not_in_baseline", None) or ()),
+            token=tuple(getattr(request, "token", None) or ()),
+            inventory=getattr(request, "inventory", None),
+        )
+
+    source_config = getattr(session, "source_config", None)
+    password = getattr(session, "source_password", None)
+    if source_config is None or password is None:
+        return _failed(PROBE_NO_SOURCE)
+    try:
+        if not names:
+            return build_catalog_drift_probe(
+                request, {}, started=started, finished=datetime.now(timezone.utc)
+            )
+        engine = make_source_engine_factory(
+            password, read_timeout_seconds=_CATALOG_DRIFT_READ_TIMEOUT_SECONDS
+        )(source_config)
+        try:
+            with engine.connect() as connection:
+                live = read_live_catalog(
+                    connection, names, source_type=getattr(request, "source_type", None)
+                )
+        finally:
+            engine.dispose()
+        return build_catalog_drift_probe(
+            request, live, started=started, finished=datetime.now(timezone.utc)
+        )
+    except Exception as exc:  # noqa: BLE001 - unreadable is a state, not a crash
+        return _failed(PROBE_READ_FAILED, type(exc).__name__[:64])
 
 
 # Tailwind tone -> (border, background, icon-color, icon) for the health cards.

@@ -64,11 +64,14 @@ CDC replicates **row-level data changes** (insert / update / delete). It does
 
 The DSQL target schema is fixed when the **Schema Conversion** step runs. **If you
 change the source schema while CDC is running**, apply the equivalent DDL to DSQL
-yourself (via Schema Conversion) **first**. Until you do, rows that no longer
-match the target shape (e.g. referencing a new column) are dead-lettered to the
-**DLQ** and never retried — visible, but they must be repaired, and Cut over stays
-locked until each such table passes a CHECKSUM after its last dead-lettered record
-([§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over)).
+yourself (via Schema Conversion) **first**. Until you do, rows that cannot be
+written in the target's shape (e.g. referencing a new column) are dead-lettered to
+the **DLQ** and never retried, and Cut over stays locked until each such table passes
+a CHECKSUM after its last dead-lettered record
+([§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over)). But some changes are
+applied **silently**, with no dead letter at all — see
+[Changes that dead-letter nothing](#changes-that-dead-letter-nothing-the-source-schema-re-check)
+below.
 
 ### Detecting and handling source schema drift
 
@@ -80,8 +83,10 @@ it offers a **"Fix target schema…"** action that shows the exact `ALTER TABLE 
 COLUMN` statements and applies them (one DDL per transaction); CDC then resumes. To
 backfill the rows that were set aside while the column was missing, re-run Step 1
 (Evaluation), Stop CDC, reload the table with **Drop & reload**, Start CDC, then
-re-check it in Validation (CHECKSUM is automatic for it). Drop-column / type-change drifts are surfaced for you to resolve
-by hand (the tool never drops target data automatically).
+re-check it in Validation (CHECKSUM is automatic for it). A dropped column or a changed
+type that Aurora DSQL rejects is surfaced the same way for you to resolve by hand (the
+tool never drops target data automatically); one it accepts silently is caught by the
+source schema re-check below.
 
 **A source `TRUNCATE`** (MySQL or PostgreSQL source) is not a schema change, and CDC
 cannot apply it either. Aurora DSQL has no `TRUNCATE` statement, and deleting every
@@ -111,6 +116,37 @@ remove rows without any change event, so CDC reports nothing and only Validation
 the extra rows; repair such a table the same way. A MySQL pipeline that was already
 streaming when you upgraded from an earlier version of the tool starts reporting
 `TRUNCATE` after one Stop CDC → Start CDC.
+
+### Changes that dead-letter nothing: the source schema re-check
+
+Some source DDL changes what CDC writes without Aurora DSQL rejecting a single row, so
+no dead letter and no banner reveal it:
+
+- a **dropped column** whose target column is nullable or has a DEFAULT: new rows get
+  NULL or the DEFAULT, updated rows keep the old value;
+- a **changed type** the target still accepts: values are converted silently — rounded
+  to the old scale (`DECIMAL(10,2)` → `DECIMAL(12,4)`), or, for a MySQL `TINYINT(1)`
+  widened to `INT` on a boolean target, every non-zero value stored as `true`;
+- a **dropped or renamed table** (or one moved to another schema): CDC captures tables
+  by the names it was deployed with, so the target table stops changing. On MySQL a
+  table re-created under the old name streams into it as is; on PostgreSQL, after a
+  rename, changes reach the old target only until the connector restarts;
+- on PostgreSQL, an **added column** of a type CDC cannot convert (for example
+  `interval[]` or `money[]`), or a **generated** column: its values never arrive;
+- a **NULL-rule** change, or a **primary-key** change.
+
+So while CDC runs, the tool re-reads the definitions of the captured tables on the
+source — one read-only catalog query for all of them (`information_schema` on MySQL,
+`pg_catalog` on PostgreSQL; no table data is read), at most every 5 minutes while the
+CDC monitor, Validation or Cut over is open — and compares them with the Step 1
+(Evaluation) inventory the migration was built from: whether each table still exists,
+its column names (exactly, case included), types, NULL rules and primary key. Excluded
+columns and generated columns CDC does not capture are left out, and a column you added
+with **Fix target schema…** counts as part of the definition; defaults, comments,
+collations and indexes are not compared (a change there does not change a CDC row). A
+difference is shown on the CDC step ([§4.6](#the-source-schema-re-check)) and holds Cut
+over for that table until the source matches the Step 1 inventory again and the table
+then matches by CHECKSUM ([§5.7](05-validation.md#57-source-schema-changes-and-cut-over)).
 
 ---
 
@@ -353,6 +389,61 @@ MySQL source) and shows these notices:
 
 Each change (below FULL, FULL again, no longer re-keyed) is written once to the activity
 log.
+
+### The source schema re-check
+
+The monitor re-reads the captured tables' definitions on the source (see
+[§4.2](#changes-that-dead-letter-nothing-the-source-schema-re-check)) and shows these
+notices, beside the dead-letter queue card rather than in it:
+
+- **Red — "Source schema changed on N captured table(s)":** one line per table says
+  what changed (a column dropped, added or renamed; a type, NULL rule or primary key
+  changed; a table not found) and what that does to the rows CDC writes. Cut over is
+  held. A table whose change the dead-letter banner already reports the same way (a
+  column added, dropped or retyped, with the rows it rejected) is listed only in that
+  banner; Cut over is held either way. To realign a table once the source has its final
+  definition:
+  - **Full Load + CDC:** re-run Step 1 (Evaluation) — the check then compares with it.
+    Where the Aurora DSQL table must change too: let CDC catch up (Stream lag: caught
+    up), Stop CDC, drop a removed or renamed column on Aurora DSQL first (Drop & reload
+    does not destroy a target column the new definition no longer has), reload the
+    table on the Full Load step with **Drop & reload**, then Start CDC. Run no other DDL
+    on migrated tables while CDC is stopped.
+  - **CDC only:** change the Aurora DSQL table by hand where it must follow the source,
+    correct the rows CDC wrote since the change (they are not replayed), then re-run
+    Step 1.
+  - Or undo the change on the source.
+  - A **renamed or dropped table** cannot be realigned in place: CDC captures a fixed
+    table list, so rename it back on the source, or use **Start over** to migrate it
+    under its new name. If you dropped it on purpose, re-run Step 1: it then leaves the
+    check, and Cut over asks you to acknowledge it.
+  - Aurora DSQL cannot change a **primary key** in place: restore the key on the
+    source, or (Full Load + CDC) re-run Step 1 and reload the table with **Drop &
+    reload**, which recreates it with the new key; for CDC only, use **Start over**.
+  - For a plain **added column** the notice offers **Fix target schema…** (unless the
+    dead-letter banner already offers it for that table). It adds the column to Aurora
+    DSQL, and the check counts it as part of the definition from then on. Re-run Step 1
+    too, so Validation compares the new column. It is not offered for a renamed column
+    (it would add an empty column and leave the old one), a key change, or a table where
+    an added column is generated (it would be added as a plain, empty column).
+  - Choose **Check again** after a change. If the re-read itself fails, or finds none of
+    the captured tables (a reconnect to another database or user), the notice says so.
+- **Amber — "The source schema changed while CDC ran":** the source matches the Step 1
+  inventory again (or a Step 1 re-run changed a table's definition, or a table left the
+  inventory), but values CDC wrote meanwhile may differ. Validation compares these
+  tables by CHECKSUM automatically; Cut over waits for a match started after that time
+  ([§5.7](05-validation.md#57-source-schema-changes-and-cut-over)). A table no longer in
+  the Step 1 inventory cannot be compared: acknowledge it on the Cut over step with
+  **Continue without this check**.
+- **Info — "Can't re-check the source schema":** the source password is kept in memory
+  only, so after an app restart the tool cannot connect until you reconnect on the
+  Connect step.
+- **Amber — "Can't re-check the source schema":** the last read failed, or found none
+  of the captured tables; the tool tries again in 5 minutes. Avoid DDL on migrated
+  tables meanwhile.
+
+Each change is written to the activity log once — one line for all the tables a read
+found changed the same way.
 
 ---
 

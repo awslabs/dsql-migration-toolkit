@@ -37,6 +37,8 @@ from dsql_migrator.core.models import (
     AiConversation,
     AssessmentReport,
     CdcDlqLedgerEntry,
+    CdcCatalogDriftFinding,
+    CdcCatalogDriftWaiver,
     CdcDlqWaiver,
     CdcReplicaIdentityFinding,
     CdcReplicaIdentityWaiver,
@@ -199,6 +201,19 @@ class SessionSnapshot(BaseModel):
     # discovery: which tables Debezium actually re-keys, so Validation and Cut over can scope
     # the re-check after a restore before Data Migration renders. None = unknown / no stack.
     cdc_deployed_message_key_columns: Optional[dict[str, list[str]]] = None
+    # Captured tables whose SOURCE definition stopped matching the Step 1 inventory while CDC
+    # ran (ui/cdc_catalog_drift_gate.py): a change no rejected row reveals, so the finding
+    # must outlive a restart or Cut over would forget it. O(changed tables x 6 changes).
+    # Cleared only by Start over. An older snapshot has none (nothing was ever recorded).
+    cdc_catalog_drift_findings: dict[str, CdcCatalogDriftFinding] = Field(
+        default_factory=dict
+    )
+    # Per captured table, a 16-hex digest of the baseline facts the re-check last compared
+    # with, so a Step 1 re-run that changed a table's definition is noticed after a restart.
+    cdc_catalog_drift_digests: dict[str, str] = Field(default_factory=dict)
+    # Columns added to Aurora DSQL through Fix target schema ({table: {column: source catalog
+    # type}}): part of the baseline, so the re-check does not report them as new drift.
+    cdc_target_added_columns: dict[str, dict[str, str]] = Field(default_factory=dict)
     # The NON-SECRET Secrets Manager reference the operator authenticated the source with.
     # Not a credential (the password is never persisted), and without it a restored session
     # forgot the auth METHOD as well as the reference -- and the CDC deploy/teardown reads
@@ -284,6 +299,9 @@ class SessionSnapshot(BaseModel):
     # The operator's recorded decision to cut over without CHECKSUM proof for re-keyed tables
     # whose REPLICA IDENTITY was below FULL earlier (scoped to each table's restore time).
     validation_cdc_replica_identity_waiver: Optional[CdcReplicaIdentityWaiver] = None
+    # ...and for tables whose source schema changed while CDC ran (scoped to each table's
+    # resolve time).
+    validation_cdc_catalog_drift_waiver: Optional[CdcCatalogDriftWaiver] = None
 
 
 class SessionStateStore(Protocol):

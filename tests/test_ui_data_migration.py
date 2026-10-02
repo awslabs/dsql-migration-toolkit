@@ -30794,3 +30794,585 @@ def test_both_dlq_read_paths_drive_the_controller_with_the_records_own_start() -
     source = inspect.getsource(st)
     assert "controller.dlq_errors(group, now=started," in source
     assert "reader(_group, now=_started," in source
+
+
+# ---------------------------------------------------------------------------
+# G4: the CDC monitor re-reads the captured tables' source definitions
+# ---------------------------------------------------------------------------
+
+
+class _G4Ctl(_G1Ctl):
+    """A live pipeline with an EMPTY dead-letter queue: nothing was rejected."""
+
+    def dlq_errors(self, log_group, **kw):
+        self.kwargs.append(kw)
+        return []
+
+
+def _g4_inventory(pg=False, *, notes=True):
+    from dsql_migrator.core.models import ColumnDef, SourceInventory, TableDef
+
+    int_type = "integer" if pg else "int"
+    cols = [ColumnDef(name="id", mysql_type=int_type, nullable=False)]
+    if notes:
+        cols.append(ColumnDef(name="notes", mysql_type="text", nullable=True))
+    return SourceInventory(tables=[TableDef(name="app.orders", columns=cols, primary_key=["id"])])
+
+
+def _g4_state(session, *, pg=False, inventory=None, evidence=True):
+    from dsql_migrator.ui.cdc_catalog_drift_gate import CatalogBaseline
+
+    state = DataMigrationState()
+    state.bind_session(session)
+    state.set_cdc_controller(_G4Ctl())
+    state.set_cdc_connector_names(["sink"])
+    state.set_cdc_stack_phase("running")
+    if evidence:
+        state.set_cdc_ops_window_start(datetime.now(timezone.utc))
+    state.cdc_deployed_message_key_columns = {}  # no re-key: the G2 re-check stays inert
+    holder = {"inv": inventory or _g4_inventory(pg)}
+
+    def _baseline():
+        inv = holder["inv"]
+        return CatalogBaseline(
+            inventory=inv, captured=tuple(inv.tables),
+            capture_names=frozenset(t.name for t in inv.tables),
+            source_type=SourceType.POSTGRES if pg else SourceType.MYSQL,
+        )
+
+    state.cdc_catalog_baseline = _baseline
+    state._g4_holder = holder  # type: ignore[attr-defined]  # tests swap the inventory
+    return state
+
+
+def _g4_rows(pg=False, *, notes=False, extra=()):
+    """The live catalog rows for app.orders: id (+ notes) (+ extra (name, type))."""
+    if pg:
+        rows = [("app.orders", "id", 1, "integer", True, "", True)]
+        if notes:
+            rows.append(("app.orders", "notes", 2, "text", False, "", False))
+        rows += [("app.orders", n, 3 + i, t, False, "", False) for i, (n, t) in enumerate(extra)]
+        return rows
+    rows = [("c", "app", "orders", "id", 1, "int", "NO", ""),
+            ("k", "app", "orders", "id", 1, None, None, None)]
+    if notes:
+        rows.append(("c", "app", "orders", "notes", 2, "text", "YES", ""))
+    rows += [("c", "app", "orders", n, 3 + i, t, "YES", "") for i, (n, t) in enumerate(extra)]
+    return rows
+
+
+_G4_HEADER = (
+    "Source schema changed on 1 captured table(s) — CDC does not carry it to Aurora DSQL"
+)
+
+
+@pytest.mark.parametrize("pg", [False, True])
+def test_a_dropped_nullable_column_with_no_dead_letter_is_flagged_on_the_cdc_monitor(
+    monkeypatch, pg
+) -> None:
+    """The gap (3a): a source DROP COLUMN of a nullable column is applied silently -- inserts
+    store NULL, updates keep the old value -- with no dead letter, so nothing was shown. The
+    poll's throttled re-read of the source catalog now finds it, logs it once, and the next
+    render shows the red notice with what changed, why, and Check again."""
+    from dsql_migrator.core.activity_log import ActivityStatus
+
+    _g2_fake_nicegui(monkeypatch)
+    lines = _g2_logged(monkeypatch)
+    calls, built = _g2_factory(monkeypatch, _g4_rows(pg))
+    session = _g2_session(pg=pg)
+    state = _g4_state(session, pg=pg)
+    _ui, (poll,) = _g2_render(state, session)
+    _g2_poll(poll)
+    assert len(calls) == 1 and ("factory", 10) in built and "disposed" in built
+    finding = state.cdc_catalog_drift_findings["app.orders"]
+    assert finding.resolved_at is None and finding.kinds == ["drop-column"]
+    opened = [kw for action, kw in lines if action.startswith("source schema changed on")]
+    assert len(opened) == 1 and opened[0]["status"] is ActivityStatus.FAILURE
+    assert opened[0]["target"] == "app.orders"
+    ui, _polls = _g2_render(state, session)
+    body = " ".join(ui.texts)
+    assert _G4_HEADER in body
+    assert "app.orders: column dropped at the source (dropped notes)" in body
+    assert "Check again" in [b.text for b in ui.buttons]
+    assert "Fix target schema…" not in [b.text for b in ui.buttons]  # nothing to add
+
+
+def test_many_polls_within_the_ttl_read_the_source_schema_once(monkeypatch) -> None:
+    import dsql_migrator.ui.data_migration._cdc_status as status
+
+    _g2_fake_nicegui(monkeypatch)
+    _g2_logged(monkeypatch)
+    calls, _built = _g2_factory(monkeypatch, _g4_rows(notes=True))
+    spawned: list = []
+    real_spawn = status.spawn_detached
+    monkeypatch.setattr(status, "spawn_detached",
+                        lambda work: spawned.append(work.__qualname__) or real_spawn(work))
+    session = _g2_session(pg=False)
+    state = _g4_state(session)
+    _ui, (poll,) = _g2_render(state, session)
+    _g2_poll(poll, times=6)
+    assert len(calls) == 1
+    # Spawned by the poll's start (never awaited by it), once.
+    assert [q for q in spawned if q.startswith("start_catalog_drift_probe")] == [
+        "start_catalog_drift_probe.<locals>.<lambda>"
+    ]
+    assert state.cdc_catalog_drift_findings == {}
+    assert state.cdc_catalog_drift_last_probe.ok is True
+    assert set(state.cdc_catalog_drift_digests) == {"app.orders"}
+
+
+def test_without_the_source_password_the_schema_check_says_reconnect(monkeypatch) -> None:
+    tones = _g2_tones(monkeypatch)
+    _g2_fake_nicegui(monkeypatch)
+    calls, built = _g2_factory(monkeypatch, _g4_rows())
+    session = _g2_session(pg=False, password=False)
+    state = _g4_state(session)
+    _ui, (poll,) = _g2_render(state, session)
+    _g2_poll(poll)
+    assert calls == [] and built == []
+    tones.clear()
+    _g2_render(state, session)
+    (notice,) = [n for n in tones if n[1] == "Can't re-check the source schema"]
+    assert notice[0] == "info" and "reconnect the source on the Connect step" in notice[2]
+
+
+def test_a_failed_or_blind_read_is_a_warning_without_its_message(monkeypatch) -> None:
+    tones = _g2_tones(monkeypatch)
+    _g2_fake_nicegui(monkeypatch)
+    _g2_logged(monkeypatch)
+    _g2_factory(monkeypatch, [], fail=ConnectionError("db at src.example refused pw"))
+    session = _g2_session(pg=False)
+    state = _g4_state(session)
+    _ui, (poll,) = _g2_render(state, session)
+    _g2_poll(poll)
+    tones.clear()
+    _g2_render(state, session)
+    (notice,) = [n for n in tones if n[1] == "Can't re-check the source schema"]
+    assert notice[0] == "warning" and "failed (ConnectionError)" in notice[2]
+    assert "src.example" not in notice[2] and state.cdc_catalog_drift_findings == {}
+    # Two captured tables and neither found: one read problem, never two findings.
+    from dsql_migrator.core.models import ColumnDef, SourceInventory, TableDef
+
+    two = SourceInventory(tables=[
+        TableDef(name=n, columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+                 primary_key=["id"])
+        for n in ("app.a", "app.b")
+    ])
+    _g2_factory(monkeypatch, [])
+    blind = _g4_state(session, inventory=two)
+    _ui, (poll,) = _g2_render(blind, session)
+    _g2_poll(poll)
+    assert blind.cdc_catalog_drift_findings == {}
+    tones.clear()
+    _g2_render(blind, session)
+    (notice,) = [n for n in tones if n[1] == "Can't re-check the source schema"]
+    assert notice[0] == "warning" and "found none of the 2 captured tables" in notice[2]
+
+
+def test_a_step_1_re_run_makes_the_next_poll_read_at_once(monkeypatch) -> None:
+    _g2_fake_nicegui(monkeypatch)
+    _g2_logged(monkeypatch)
+    calls, _ = _g2_factory(monkeypatch, _g4_rows())
+    session = _g2_session(pg=False)
+    state = _g4_state(session)
+    _ui, (poll,) = _g2_render(state, session)
+    _g2_poll(poll)
+    assert state.cdc_catalog_drift_findings["app.orders"].resolved_at is None
+    _g2_poll(poll)
+    assert len(calls) == 1  # within the TTL
+    # Step 1 re-run: a new inventory without notes -- the read is due at once, and the
+    # source now matches it.
+    state._g4_holder["inv"] = _g4_inventory(notes=False)
+    _g2_poll(poll)
+    assert len(calls) == 2
+    finding = state.cdc_catalog_drift_findings["app.orders"]
+    assert finding.resolved_by == "matched" and finding.resolved_at is not None
+
+
+def test_with_the_handle_but_no_cdc_evidence_nothing_is_read_or_drawn(monkeypatch) -> None:
+    _g2_fake_nicegui(monkeypatch)
+    calls, built = _g2_factory(monkeypatch, _g4_rows())
+    session = _g2_session(pg=False)
+    state = _g4_state(session, evidence=False)
+    state.set_cdc_connector_names([])
+    from dsql_migrator.ui.data_migration._cdc_monitoring import _render_cdc_catalog_drift_notice
+    from dsql_migrator.ui.cdc_catalog_drift_gate import start_catalog_drift_probe
+
+    assert start_catalog_drift_probe(session, state) is False
+    assert calls == [] and built == []
+    ui = _RecordingUi()
+    _render_cdc_catalog_drift_notice(ui, state, session, None)
+    assert ui.texts == []
+
+
+def test_fix_is_offered_only_for_a_plain_added_column_not_already_in_the_dlq_banner(
+    monkeypatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import CdcCatalogDriftChange, CdcCatalogDriftFinding
+    from dsql_migrator.ui.data_migration._cdc_monitoring import _render_cdc_catalog_drift_notice
+
+    session = _g2_session(pg=False)
+    state = _g4_state(session)
+
+    def _f(kinds, *, fixable, generated=False):
+        return CdcCatalogDriftFinding(
+            kinds=kinds, fixable=fixable, first_seen_at=datetime.now(timezone.utc),
+            changes=[CdcCatalogDriftChange(kind=kinds[0], column="x", generated=generated)],
+        )
+
+    def _buttons(finding, *, view=None, sess=session, on_fix=lambda _t: None):
+        state.cdc_catalog_drift_findings = {"app.orders": finding}
+        ui = _RecordingUi()
+        _render_cdc_catalog_drift_notice(ui, state, sess, view, on_check_again=lambda: None,
+                                         on_fix=on_fix)
+        return [b.text for b in ui.buttons]
+
+    assert "Fix target schema…" in _buttons(_f(["add-column"], fixable=True))
+    for finding in (
+        _f(["add-column"], fixable=False, generated=True),
+        _f(["rename-column"], fixable=False),
+        _f(["key-change", "add-column"], fixable=False),
+        _f(["source-table-missing"], fixable=False),
+    ):
+        assert "Fix target schema…" not in _buttons(finding), finding.kinds
+    dlq = SimpleNamespace(schema_drift=[SimpleNamespace(table="app.orders", kind="add-column")])
+    assert "Fix target schema…" not in _buttons(_f(["add-column"], fixable=True), view=dlq)
+    # The banner reports only the added column: the row stays (for the dropped one), but
+    # the banner's Fix is the only one.
+    drawn = SimpleNamespace(dlq_depth=3, schema_drift=dlq.schema_drift)
+    kept = _buttons(_f(["drop-column", "add-column"], fixable=True), view=drawn)
+    assert "Check again" in kept and "Fix target schema…" not in kept
+    assert "Fix target schema…" not in _buttons(
+        _f(["add-column"], fixable=True), sess=_g2_session(pg=False, password=False)
+    )
+    assert "Fix target schema…" not in _buttons(_f(["add-column"], fixable=True), on_fix=None)
+
+
+def test_a_table_that_gained_a_plain_and_a_generated_column_is_not_offered_fix(
+    monkeypatch,
+) -> None:
+    """The row said Fix target schema… is not offered for the generated column while the
+    button sat next to it -- and its plan would have added that column as a plain, empty
+    one. A table with any generated added column gets no Fix."""
+    _g2_fake_nicegui(monkeypatch)
+    _g2_logged(monkeypatch)
+    rows = _g4_rows(notes=True, extra=[("x", "int")]) + [
+        ("c", "app", "orders", "g", 9, "int", "YES", "STORED GENERATED"),
+    ]
+    _g2_factory(monkeypatch, rows)
+    session = _g2_session(pg=False)
+    session.set_target(_g4_target_config())
+    state = _g4_state(session)
+    _ui, (poll,) = _g2_render(state, session)
+    _g2_poll(poll)
+    finding = state.cdc_catalog_drift_findings["app.orders"]
+    assert finding.kinds == ["add-column"] and not finding.fixable
+    ui, _ = _g2_render(state, session)
+    (row,) = [t for t in ui.texts if t.startswith("app.orders: column added at the source")]
+    assert "Fix target schema… is not offered for this table" in row
+    assert "Fix target schema…" not in [b.text for b in ui.buttons]
+
+
+class _G4DlqCtl(_G1Ctl):
+    """A live pipeline whose dead-letter queue holds rejections of one SQLSTATE."""
+
+    def __init__(self, code, **kw):
+        super().__init__(**kw)
+        self.code = code
+
+    def dlq_errors(self, log_group, **kw):
+        self.kwargs.append(kw)
+        return [_g1_dlq("app.orders", i, code=self.code) for i in (1, 2, 3)]
+
+
+def _g4_mysql_rows(columns):
+    """Live MySQL catalog rows for app.orders: [(name, type, nullable)], id the key."""
+    rows = [("c", "app", "orders", n, i + 1, t, "YES" if nl else "NO", "")
+            for i, (n, t, nl) in enumerate(columns)]
+    return rows + [("k", "app", "orders", "id", 1, None, None, None)]
+
+
+@pytest.mark.parametrize(
+    "code,columns,banner_row",
+    [
+        ("42703", [("id", "int", False), ("notes", "text", True), ("c", "int", True)],
+         "app.orders: column added at the source —"),
+        ("23502", [("id", "int", False)], "app.orders: column dropped at the source —"),
+        ("42804", [("id", "int", False), ("notes", "int", True)],
+         "app.orders: column type changed at the source —"),
+    ],
+    ids=["add-column", "drop-column", "type-change"],
+)
+def test_a_change_the_dead_letter_banner_reports_is_listed_only_there(
+    monkeypatch, code, columns, banner_row
+) -> None:
+    """The same source DDL was drawn twice: amber in the dead-letter banner and red in the
+    re-check's box (whose intro says "no dead letter"), with two runbooks. A table whose
+    change the banner classifies the same way is now listed only in the banner -- and its
+    finding still holds Cut over."""
+    from dsql_migrator.ui.cdc_catalog_drift_gate import catalog_drift_gate_for
+
+    _g2_fake_nicegui(monkeypatch)
+    _g2_logged(monkeypatch)
+    _g2_factory(monkeypatch, _g4_mysql_rows(columns))
+    session = _g2_session(pg=False)
+    state = _g4_state(session)
+    state.set_cdc_controller(_G4DlqCtl(code))
+    state.job_id = "job-cdc"
+    _ui, (poll,) = _g2_render(state, session)
+    _g2_poll(poll)
+    finding = state.cdc_catalog_drift_findings["app.orders"]
+    assert finding.resolved_at is None
+    ui, _ = _g2_render(state, session)
+    body = "\n".join(ui.texts)
+    assert "Source schema change detected" in body
+    assert any(t.startswith(banner_row) for t in ui.texts)
+    assert _G4_HEADER not in body and "no error and no dead letter" not in body
+    assert sum(b.text == "Fix target schema…" for b in ui.buttons) == (code == "42703")
+    gate = catalog_drift_gate_for(state, None, session, cdc_in_use=True, release="clean",
+                                  summary=None, check_probe=False)
+    assert [i.table for i in gate.open] == ["app.orders"] and gate.held
+
+
+def test_a_change_the_dead_letter_banner_cannot_classify_keeps_its_row(monkeypatch) -> None:
+    """A rename reaches the sink as an unknown column (42703, "column added") -- the
+    re-check's row is the accurate one, with its "Do not use Fix" sentence: it stays."""
+    _g2_fake_nicegui(monkeypatch)
+    _g2_logged(monkeypatch)
+    _g2_factory(monkeypatch, _g4_mysql_rows([("id", "int", False), ("memo", "text", True)]))
+    session = _g2_session(pg=False)
+    state = _g4_state(session)
+    state.set_cdc_controller(_G4DlqCtl("42703"))
+    state.job_id = "job-cdc"
+    _ui, (poll,) = _g2_render(state, session)
+    _g2_poll(poll)
+    assert state.cdc_catalog_drift_findings["app.orders"].kinds == ["rename-column"]
+    ui, _ = _g2_render(state, session)
+    body = "\n".join(ui.texts)
+    assert _G4_HEADER in body and "Source schema change detected" in body
+    assert "Do not use Fix target schema… for a renamed column" in body
+
+
+def _g4_open_drop(state):
+    from dsql_migrator.core.models import CdcCatalogDriftChange, CdcCatalogDriftFinding
+
+    state.cdc_catalog_drift_findings = {"app.orders": CdcCatalogDriftFinding(
+        kinds=["drop-column"], first_seen_at=datetime.now(timezone.utc),
+        changes=[CdcCatalogDriftChange(kind="drop-column", column="notes")],
+    )}
+    return state
+
+
+def _g4_check_again(state, session):
+    from dsql_migrator.ui.data_migration._cdc_monitoring import _render_cdc_catalog_drift_notice
+
+    ui = _RecordingUi()
+    _render_cdc_catalog_drift_notice(ui, state, session, None, on_check_again=lambda: None)
+    (button,) = [b for b in ui.buttons if b.text == "Check again"]
+    return any("disable" in p for p in button.props_seen)
+
+
+def test_the_monitors_check_again_is_disabled_without_the_password_or_while_a_read_runs() -> None:
+    with_pw = _g2_session(pg=False)
+    assert _g4_check_again(_g4_open_drop(_g4_state(with_pw)), with_pw) is False
+    without = _g2_session(pg=False, password=False)
+    assert _g4_check_again(_g4_open_drop(_g4_state(without)), without) is True
+    running = _g4_open_drop(_g4_state(with_pw))
+    assert running.begin_cdc_catalog_drift_probe() is True
+    assert _g4_check_again(running, with_pw) is True
+
+
+def test_a_clean_schema_read_draws_no_cant_recheck_warning(monkeypatch) -> None:
+    tones = _g2_tones(monkeypatch)
+    _g2_fake_nicegui(monkeypatch)
+    _g2_logged(monkeypatch)
+    _g2_factory(monkeypatch, _g4_rows(notes=True))
+    session = _g2_session(pg=False)
+    state = _g4_state(session)
+    _ui, (poll,) = _g2_render(state, session)
+    _g2_poll(poll)
+    assert state.cdc_catalog_drift_last_probe.ok and state.cdc_catalog_drift_findings == {}
+    tones.clear()
+    ui, _ = _g2_render(state, session)
+    assert not [n for n in tones if n[1] == "Can't re-check the source schema"]
+    assert _G4_HEADER not in " ".join(ui.texts)
+
+
+def _g4_stub_fix_dialog(monkeypatch, *, source_columns, added):
+    """Stub the Fix dialog's I/O: the source/target column reads and the apply."""
+    import dsql_migrator.core.cdc_schema_evolve as evolve
+    import dsql_migrator.core.target_connection as target_connection
+    import dsql_migrator.ui.connect as connect
+    from dsql_migrator.core.cdc_schema_evolve import AddColumnOutcome
+
+    class _Raw:
+        def close(self):
+            return None
+
+    class _Engine:
+        def raw_connection(self):
+            return _Raw()
+
+    class _Connector:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def connect(self):
+            return _Raw()
+
+    monkeypatch.setattr(connect, "make_source_engine_factory",
+                        lambda *_a, **_k: (lambda _config: _Engine()))
+    monkeypatch.setattr(target_connection, "DsqlConnector", _Connector)
+    monkeypatch.setattr(evolve, "read_source_columns", lambda *_a, **_k: list(source_columns))
+    monkeypatch.setattr(evolve, "read_target_columns", lambda *_a, **_k: ["id"])
+    monkeypatch.setattr(
+        evolve, "apply_add_columns",
+        lambda plan, _factory: tuple(
+            AddColumnOutcome(column=s.column, ddl=s.ddl, applied=s.column in added,
+                             error=None if s.column in added else "boom")
+            for s in plan.steps
+        ),
+    )
+
+
+def test_applying_fix_records_the_column_and_resolves_the_finding(monkeypatch) -> None:
+    import asyncio
+
+    tones = _g2_tones(monkeypatch)
+    _g2_fake_nicegui(monkeypatch)
+    _g2_logged(monkeypatch)
+    calls, _ = _g2_factory(monkeypatch, _g4_rows(notes=True, extra=[("x", "int")]))
+    session = _g2_session(pg=False)
+    session.set_target(_g4_target_config())
+    state = _g4_state(session)
+    _ui, (poll,) = _g2_render(state, session)
+    _g2_poll(poll)
+    finding = state.cdc_catalog_drift_findings["app.orders"]
+    assert finding.kinds == ["add-column"] and finding.fixable
+    ui, _ = _g2_render(state, session)
+    (fix,) = [b for b in ui.buttons if b.text == "Fix target schema…"]
+    _g4_stub_fix_dialog(monkeypatch, source_columns=[("id", "int"), ("notes", "text"),
+                                                     ("x", "int")], added={"x"})
+    # Re-patch the source read the forced re-check uses (the dialog stub replaced only the
+    # ui.connect factory, not the status one).
+    calls, _ = _g2_factory(monkeypatch, _g4_rows(notes=True, extra=[("x", "int")]))
+
+    async def _scenario():
+        await fix.on_click()
+        applies = [b for b in ui.buttons if b.text.startswith("Apply ")]
+        assert applies, [b.text for b in ui.buttons]
+        await applies[-1].on_click()
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    asyncio.run(_scenario())
+    assert state.cdc_target_added_columns == {"app.orders": {"x": "int"}}
+    assert len(calls) == 1  # the forced re-read after the apply
+    resolved = state.cdc_catalog_drift_findings["app.orders"]
+    assert resolved.resolved_by == "matched" and resolved.resolved_at is not None
+    tones.clear()
+    _g2_render(state, session)
+    (amber,) = [n for n in tones if n[1].startswith("The source schema changed while CDC ran")]
+    from datetime import timedelta
+
+    threshold = (resolved.resolved_at + timedelta(seconds=60)).strftime("%Y-%m-%d %H:%M:%S UTC")
+    assert amber[0] == "warning" and f"comparison started after {threshold}" in amber[2]
+
+
+def _g4_target_config():
+    from dsql_migrator.core.models import TargetConnectionConfig
+
+    return TargetConnectionConfig(cluster_endpoint="c.dsql.us-east-1.on.aws", region="us-east-1")
+
+
+def test_the_dead_letter_banners_fix_also_records_the_added_column(monkeypatch) -> None:
+    import asyncio
+
+    from dsql_migrator.core.models import MigrationJob
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as mon
+    from dsql_migrator.ui.data_migration import _render_cdc_dlq_panel
+
+    _g2_fake_nicegui(monkeypatch)
+    _g2_logged(monkeypatch)
+    seen: dict = {}
+    real = mon._render_cdc_schema_drift_banner
+    monkeypatch.setattr(mon, "_render_cdc_schema_drift_banner",
+                        lambda *a, **kw: seen.update(kw) or real(*a, **kw))
+    state = DataMigrationState()
+    state.job_id = "job-cdc"
+    view = _cdc_view_with_drift([("app.orders", "add-column", 3)])
+    session = _g2_session(pg=False)
+    session.set_target(_g4_target_config())
+    _render_cdc_dlq_panel(_DlqUi(), state, _JobJM(MigrationJob(job_id="job-cdc")), view,
+                          on_refresh=None, session=session)
+    assert seen["on_applied"] == state.record_cdc_target_added_columns
+    # Drive that banner's Fix: only the APPLIED column is recorded (y failed).
+    _g4_stub_fix_dialog(monkeypatch, source_columns=[("id", "int"), ("x", "int"), ("y", "int")],
+                        added={"x"})
+    ui = _RecordingUi()
+    real(ui, view, session=session, on_applied=seen["on_applied"])
+    (fix,) = [b for b in ui.buttons if b.text == "Fix target schema…"]
+
+    async def _scenario():
+        await fix.on_click()
+        (apply,) = [b for b in ui.buttons if b.text.startswith("Apply ")]
+        await apply.on_click()
+
+    asyncio.run(_scenario())
+    assert state.cdc_target_added_columns == {"app.orders": {"x": "int"}}
+
+
+def test_start_over_keeps_the_baseline_handle_and_clears_the_schema_findings() -> None:
+    from dsql_migrator.core.models import CdcCatalogDriftFinding
+    from dsql_migrator.ui.data_migration import DataMigrationStore
+
+    store = DataMigrationStore()
+    state = store.get_or_create("s1")
+    handle = lambda: None  # noqa: E731
+    state.cdc_catalog_baseline = handle
+    state.cdc_catalog_drift_findings = {
+        "app.t": CdcCatalogDriftFinding(kinds=["drop-column"], first_seen_at=datetime.now(timezone.utc))
+    }
+    state.cdc_catalog_drift_digests = {"app.t": "0" * 16}
+    state.record_cdc_target_added_columns("app.t", {"x": "int"})
+    state.cdc_catalog_drift_last_probe = object()
+    store.reset_in_place("s1")
+    assert state.cdc_catalog_baseline is handle
+    assert state.cdc_catalog_drift_findings == {} and state.cdc_catalog_drift_digests == {}
+    assert state.cdc_target_added_columns == {} and state.cdc_catalog_drift_last_probe is None
+
+
+def test_an_attach_or_a_rename_keeps_the_schema_findings() -> None:
+    from dsql_migrator.core.models import CdcCatalogDriftFinding
+
+    finding = CdcCatalogDriftFinding(kinds=["drop-column"], first_seen_at=datetime.now(timezone.utc))
+    for action in ("adopt", "rename"):
+        state = DataMigrationState()
+        state.cdc_catalog_drift_findings = {"app.t": finding}
+        state.cdc_catalog_drift_digests = {"app.t": "d"}
+        if action == "adopt":
+            assert state.adopt_cdc_stack("dsql-cdc-other")
+        else:
+            assert state.set_cdc_stack_name("dsql-cdc-other")
+        assert state.cdc_catalog_drift_findings == {"app.t": finding}, action
+        assert state.cdc_catalog_drift_digests == {"app.t": "d"}, action
+
+
+def test_the_screen_wires_the_source_schema_baseline(monkeypatch) -> None:
+    """build_data_migration_screen registers the baseline provider: the Step 1 inventory
+    and the tables CDC captures (here the confirmed selection)."""
+    from dsql_migrator.core.models import TableSelection
+
+    _ui, _captured, _built, state = _render_prereq_screen(monkeypatch, verified=True)
+    assert callable(state.cdc_catalog_baseline)
+    baseline = state.cdc_catalog_baseline()
+    assert baseline is not None and baseline.inventory is not None
+    assert {t.name for t in baseline.inventory.tables} >= {"app.t"}
+    # A selected table that left the inventory (dropped, Step 1 re-run): TableSelector
+    # refuses the name, yet the baseline keeps the rest and still names the gone table.
+    state.selection = TableSelection(selected_tables=["app.t", "app.gone"])
+    baseline = state.cdc_catalog_baseline()
+    assert [t.name for t in baseline.captured] == ["app.t"]
+    assert baseline.capture_names == frozenset({"app.t", "app.gone"})

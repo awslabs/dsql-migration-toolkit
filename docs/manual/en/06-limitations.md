@@ -86,6 +86,24 @@ fails **loudly** where it can't.
 - **CDC replicates data, not DDL.** Schema changes on the source during CDC are
   **not** propagated to DSQL — you must apply equivalent DDL to DSQL yourself
   (see [Chapter 4 §4.2](04-cdc-and-dsql-constraints.md#42-cdc-replicates-data-not-schema--important)).
+  Some of them change what CDC writes without any dead letter (a dropped nullable
+  column, a widened type, a renamed table, …), so while the CDC monitor, Validation or
+  Cut over step is open the tool re-reads the captured tables' definitions at most every
+  5 minutes and holds Cut over on a difference from the Step 1 inventory
+  (see [§5.7](05-validation.md#57-source-schema-changes-and-cut-over)). What that
+  re-check cannot see:
+  - a change undone between two reads, or one made while no CDC monitor, Validation or
+    Cut over page is open (it is seen at the next one);
+  - a same-shape `DROP TABLE` + `CREATE TABLE` (MySQL has no stable table identity to
+    compare), or a PostgreSQL enum gaining a value (`ALTER TYPE … ADD VALUE`);
+  - defaults, comments, collations, indexes and generated-column expressions (not
+    compared);
+  - a change already in the Step 1 inventory when the tool first checked the table (a
+    Step 1 re-run before CDC ran becomes the baseline);
+  - after an app restart, anything until you reconnect the source on the Connect step
+    (the password is kept in memory only);
+  - a very large MySQL 5.7 catalog the bounded read cannot finish (8 s on the server,
+    10 s on the socket): the CDC monitor and Cut over then report the failed read.
 - **A source `TRUNCATE` is not applied by CDC.** Aurora DSQL has no `TRUNCATE`, so CDC
   dead-letters it and the CDC step names the table. Cut over is held for that table
   until you remove the extra rows (Drop & reload for Full Load + CDC, a manual delete for

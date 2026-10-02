@@ -73,6 +73,20 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
 - **CDC는 데이터를 복제할 뿐 DDL은 복제하지 않음.** CDC 도중 소스에서 발생한 스키마 변경은 DSQL로
   **전파되지 않으므로** 동일한 DDL을 DSQL에 직접 적용해야 합니다
   ([4장 §4.2](04-cdc-and-dsql-constraints.md#42-cdc는-스키마가-아니라-데이터를-복제--중요) 참조).
+  그중 일부는 dead letter 없이 CDC가 쓰는 값을 바꾸므로(nullable 컬럼 삭제, 타입 확장, 테이블 이름 변경 등),
+  CDC 모니터·Validation·Cut over 단계가 열려 있는 동안 도구가 캡처 중인 테이블의 정의를 최대 5분에 한 번
+  다시 읽고 Step 1 인벤토리와 다르면 Cut over를 보류합니다
+  ([§5.7](05-validation.md#57-소스-스키마-변경과-컷오버) 참고). 이 재확인이 보지 못하는 것:
+  - 두 번의 읽기 사이에 되돌려진 변경, 또는 CDC 모니터·Validation·Cut over 페이지가 하나도 열려 있지 않을 때
+    일어난 변경(다음에 열릴 때 보임);
+  - 모양이 같은 `DROP TABLE` + `CREATE TABLE`(MySQL에는 비교할 안정적인 테이블 식별자가 없음), 또는 값이
+    추가된 PostgreSQL enum(`ALTER TYPE … ADD VALUE`);
+  - 기본값·주석·콜레이션·인덱스·생성 컬럼 식(비교하지 않음);
+  - 도구가 그 테이블을 처음 확인했을 때 이미 Step 1 인벤토리에 들어 있던 변경(CDC 실행 전의 Step 1 재실행은
+    기준이 됨);
+  - 앱 재시작 후, Connect 단계에서 소스를 다시 연결하기 전까지의 모든 것(비밀번호는 메모리에만 있음);
+  - 범위가 제한된 읽기(서버 8초, 소켓 10초)로 끝내지 못하는 매우 큰 MySQL 5.7 카탈로그: 이때 CDC 모니터와
+    Cut over가 읽기 실패를 보고합니다.
 - **소스 `TRUNCATE`는 CDC가 적용하지 않음.** Aurora DSQL에는 `TRUNCATE`가 없으므로 CDC는 그 이벤트를
   데드레터로 보내고 CDC 단계에 테이블 이름을 표시합니다. 남은 행을 지우고(Full Load + CDC는 Drop & reload,
   CDC only는 직접 삭제) 그 테이블이 CHECKSUM으로 일치할 때까지 Cut over가 보류됩니다

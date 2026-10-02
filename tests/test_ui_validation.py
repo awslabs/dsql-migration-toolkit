@@ -7895,3 +7895,530 @@ def test_cut_over_warns_when_the_re_read_failed_or_missed_a_table(monkeypatch, k
     (warn,) = [n for n in s.notices
                if n["header"] == "Cut over could not re-read REPLICA IDENTITY on the source"]
     assert warn["tone"] == "warning" and expect in warn["body"]
+
+
+# ---------------------------------------------------------------------------
+# G4: tables whose source schema changed while CDC ran
+# ---------------------------------------------------------------------------
+
+
+def _g4_finding(*, first=None, resolved=None, by="matched", kinds=("drop-column",)):
+    from datetime import timedelta
+
+    from dsql_migrator.core.models import CdcCatalogDriftChange, CdcCatalogDriftFinding
+
+    now = datetime.now(timezone.utc)
+    return CdcCatalogDriftFinding(
+        kinds=list(kinds),
+        changes=[CdcCatalogDriftChange(kind=kinds[0], column="notes")]
+        if kinds[0] != "source-table-missing" else [],
+        first_seen_at=first or now - timedelta(hours=4),
+        resolved_at=resolved, resolved_by=by if resolved is not None else None,
+    )
+
+
+def _g4_inventory(*, notes=True, name="app.t"):
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    cols = [ColumnDef(name="id", mysql_type="int", nullable=False)]
+    if notes:
+        cols.append(ColumnDef(name="notes", mysql_type="text", nullable=True))
+    return SourceInventory(tables=[TableDef(name=name, columns=cols, primary_key=["id"])])
+
+
+class _G4Cutover:
+    """G1's real cut-over harness with a MySQL source, the source-schema baseline handle and
+    the blocking read doubled (``live`` is what the source catalog holds now)."""
+
+    def __init__(self, monkeypatch, *, password=True, mtype="FULL_LOAD_AND_CDC", cdc=True,
+                 real_factory_rows=None):
+        import dsql_migrator.ui.data_migration._cdc_status as status
+        from dsql_migrator.core.cdc_catalog_drift import LiveColumn, LiveTable
+        from dsql_migrator.core.models import SourceConnectionConfig, SourceType
+        from dsql_migrator.ui.cdc_catalog_drift_gate import (
+            CatalogBaseline,
+            build_catalog_drift_probe,
+        )
+
+        from tests.test_cdc_dlq_gate import _Cutover
+
+        self.c = _Cutover(monkeypatch, cdc=cdc, mtype=mtype)
+        self.c.session.set_source(
+            SourceConnectionConfig(host="src.example", port=3306, database="app",
+                                   username="u"),
+            SecretValue("pw") if password else None,
+        )
+        self.holder = {"inv": _g4_inventory()}
+
+        def _baseline():
+            inv = self.holder["inv"]
+            return CatalogBaseline(
+                inventory=inv, captured=tuple(inv.tables),
+                capture_names=frozenset(t.name for t in inv.tables),
+                source_type=SourceType.MYSQL,
+            )
+
+        self.c.ms.cdc_catalog_baseline = _baseline
+        self.reads: list = []
+        self.live = {"app.t": LiveTable(
+            columns=(LiveColumn("id", "int", False, False, 0),
+                     LiveColumn("notes", "text", True, False, 1)),
+            primary_key=frozenset({"id"}),
+        )}
+        if real_factory_rows is None:
+            def _once(_session, request):
+                self.reads.append([t.name for t in request.tables])
+                now = datetime.now(timezone.utc)
+                return build_catalog_drift_probe(request, self.live, started=now, finished=now)
+
+            monkeypatch.setattr(status, "read_cdc_catalog_drift_once", _once)
+        else:
+            calls: list = []
+
+            class _Conn:
+                def execute(self, statement, params=None):
+                    calls.append(str(statement))
+                    return type("R", (), {"fetchall": lambda _s: list(real_factory_rows)})()
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+            class _Engine:
+                def connect(self):
+                    return _Conn()
+
+                def dispose(self):
+                    return None
+
+            monkeypatch.setattr(status, "make_source_engine_factory",
+                                lambda *_a, **_k: (lambda _config: _Engine()))
+            self.reads = calls
+
+    def __getattr__(self, name):
+        return getattr(self.c, name)
+
+    def g4_timers(self):
+        return [cb for cb in self.c.ui.timers
+                if "schedule_catalog_drift_probe" in getattr(cb, "__qualname__", "")]
+
+    def fresh_probe(self):
+        """A successful read after the validation, against the current baseline."""
+        from dsql_migrator.ui import cdc_catalog_drift_gate as g4
+
+        ms = self.c.ms
+        baseline = g4.catalog_drift_baseline(ms)
+        request = g4.catalog_drift_request(ms, baseline)
+        now = datetime.now(timezone.utc)
+        return g4.build_catalog_drift_probe(request, self.live, started=now, finished=now)
+
+    def ready(self, *, g4=True):
+        from tests.test_cdc_dlq_gate import _item
+
+        self.c.validate(_item(), mode=ValidationMode.CHECKSUM)
+        self.c.landed()
+        if g4:
+            self.c.ms.apply_cdc_catalog_drift_probe(self.fresh_probe())
+
+
+def test_a_dropped_nullable_column_with_an_empty_dead_letter_queue_holds_cut_over(
+    monkeypatch,
+) -> None:
+    """The gap (3a): a clean CHECKSUM report and an EMPTY dead-letter queue released cut over
+    while the source had dropped a nullable column -- CDC storing NULL / keeping old values
+    with no rejected row. Cut over now re-reads the source catalog and holds."""
+    rows = [("c", "app", "t", "id", 1, "int", "NO", ""),
+            ("k", "app", "t", "id", 1, None, None, None)]  # notes is gone
+    s = _G4Cutover(monkeypatch, real_factory_rows=rows)
+    s.ready(g4=False)
+    s.render()
+    assert "Re-reading the source schema" in s.body()  # waits for one fresh read
+    assert "I've cut over to DSQL" not in s.ui.texts
+    (timer,) = s.g4_timers()
+    s.run(timer)
+    assert len(s.reads) == 1 and s.refreshes == [1]
+    s.render()
+    assert "Source schema check" in s.ui.texts
+    (held,) = [n for n in s.notices
+               if n["header"] == "Cut over is held: the source schema changed on 1 table(s)"]
+    assert held["tone"] == "error" and "app.t (column dropped at the source)" in held["body"]
+    assert "I've cut over to DSQL" not in s.ui.texts
+    # Nothing here is waivable; the guard itself: ..._is_not_drawn_while_a_change_is_open.
+    assert "Continue without this check" not in s.ui.texts
+    assert "Check again" in s.ui.texts and not s.button("Check again").disabled
+
+
+def test_cut_over_waits_for_one_fresh_schema_read_then_releases(monkeypatch) -> None:
+    s = _G4Cutover(monkeypatch)
+    s.ready(g4=False)
+    s.render()
+    (pending,) = [n for n in s.notices if n["header"] == "Re-reading the source schema"]
+    assert pending["tone"] == "info" and "1 captured table(s)" in pending["body"]
+    assert s.reads == [] and len(s.g4_timers()) == 1  # armed, never read on the render
+    s.run(s.g4_timers()[0])
+    assert s.reads == [["app.t"]] and s.refreshes == [1]
+    s.render()
+    assert "I've cut over to DSQL" in s.ui.texts and s.g4_timers() == []
+    s.click("I've cut over to DSQL")
+    assert "; source schema: matched the Step 1 inventory at" in s.acknowledged()[-1]["detail"]
+    # A Step 1 re-run (a new inventory object) makes Cut over wait for a read again.
+    s.holder["inv"] = _g4_inventory()
+    s.render()
+    assert "Re-reading the source schema" in s.body()
+
+
+@pytest.mark.parametrize("read_age", ["within-ttl", "past-ttl"])
+def test_cut_over_waits_for_a_schema_read_newer_than_the_latest_validation(
+    monkeypatch, read_age
+) -> None:
+    """A read (full scope, current baseline) that started BEFORE the latest validation
+    cannot show the source that validation compared: Cut over waits for a newer one, arms
+    exactly one read even within the 5-minute TTL, and redraws once it lands."""
+    from dataclasses import replace
+    from datetime import timedelta
+
+    from tests.test_cdc_dlq_gate import _item
+
+    s = _G4Cutover(monkeypatch)
+    if read_age == "within-ttl":
+        s.c.validate(_item(), mode=ValidationMode.CHECKSUM, started_ago=timedelta(minutes=3),
+                     finished_ago=timedelta(minutes=1))
+        s.c.landed()
+        started = datetime.now(timezone.utc) - timedelta(minutes=2)
+    else:
+        s.ready(g4=False)  # validated 80 minutes ago
+        started = s.vs.completed_at - timedelta(minutes=1)
+    s.ms.apply_cdc_catalog_drift_probe(
+        replace(s.fresh_probe(), started_at=started, finished_at=started)
+    )
+    s.render()
+    (pending,) = [n for n in s.notices if n["header"] == "Re-reading the source schema"]
+    assert pending["tone"] == "info"
+    assert "I've cut over to DSQL" not in s.ui.texts
+    assert s.reads == [] and len(s.g4_timers()) == 1
+    s.run(s.g4_timers()[0])
+    assert s.reads == [["app.t"]] and s.refreshes == [1]
+    s.render()
+    assert "I've cut over to DSQL" in s.ui.texts and s.g4_timers() == []
+
+
+def test_check_again_on_cut_over_re_reads_a_fresh_held_finding(monkeypatch) -> None:
+    """The source was realigned within 5 minutes of the read that found the change: Check
+    again must read again (and redraw), not wait for the TTL."""
+    from dsql_migrator.core.cdc_catalog_drift import LiveColumn, LiveTable
+
+    s = _G4Cutover(monkeypatch)
+    s.live["app.t"] = LiveTable(columns=(LiveColumn("id", "int", False, False, 0),),
+                                primary_key=frozenset({"id"}))  # notes dropped
+    s.ready()
+    s.render()
+    held = "Cut over is held: the source schema changed on 1 table(s)"
+    assert held in s.body() and s.g4_timers() == []  # fresh: nothing armed on the render
+    s.live["app.t"] = LiveTable(columns=(LiveColumn("id", "int", False, False, 0),
+                                         LiveColumn("notes", "text", True, False, 1)),
+                                primary_key=frozenset({"id"}))  # the column is back
+    s.click("Check again")
+    assert s.button("Check again").disabled
+    (timer,) = s.g4_timers()
+    s.run(timer)
+    assert s.reads == [["app.t"]] and s.refreshes == [1]
+    assert s.ms.cdc_catalog_drift_findings["app.t"].resolved_by == "matched"
+    s.render()
+    assert held not in s.body()
+
+
+def test_a_schema_read_that_landed_before_the_timer_fired_still_redraws_cut_over(
+    monkeypatch,
+) -> None:
+    s = _G4Cutover(monkeypatch)
+    s.ready(g4=False)
+    s.render()
+    assert "Re-reading the source schema" in s.body()
+    (timer,) = s.g4_timers()
+    s.ms.apply_cdc_catalog_drift_probe(s.fresh_probe())  # the CDC poll's read lands first
+    s.run(timer)
+    assert s.reads == [] and s.refreshes == [1]
+
+
+def test_continue_without_this_check_is_not_drawn_while_a_change_is_open(monkeypatch) -> None:
+    from datetime import timedelta
+
+    from dsql_migrator.core.cdc_catalog_drift import LiveColumn, LiveTable
+
+    s = _G4Cutover(monkeypatch)
+    s.live = {"app.t": LiveTable(columns=(LiveColumn("id", "int", False, False, 0),),
+                                 primary_key=frozenset({"id"}))}  # notes still dropped
+    s.ms.cdc_catalog_drift_findings = {
+        "app.t": _g4_finding(),  # open
+        "app.gone": _g4_finding(resolved=datetime.now(timezone.utc) - timedelta(hours=2),
+                                by="not-in-inventory", kinds=("source-table-missing",)),
+    }
+    s.ready()
+    s.render()
+    body = s.body()
+    assert "Cut over is held: the source schema changed on 1 table(s)" in body
+    assert "1 table(s) whose source schema changed have no CHECKSUM proof" in body
+    assert "Once the tables above match the Step 1 inventory again" in body
+    assert "Continue without this check" not in s.ui.texts
+
+
+def test_a_resolved_change_needs_a_checksum_started_after_it(monkeypatch) -> None:
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    s = _G4Cutover(monkeypatch)
+    # Resolved 89.5 min ago; the validation started 90 min ago -> before: held.
+    s.ms.cdc_catalog_drift_findings = {
+        "app.t": _g4_finding(resolved=now - timedelta(minutes=89, seconds=30))
+    }
+    s.ready()
+    s.render()
+    assert "I've cut over to DSQL" not in s.ui.texts
+    (must,) = [n for n in s.notices if n["header"] == (
+        "Re-check 1 schema-changed table(s) with CHECKSUM before cutting over")]
+    assert must["tone"] == "warning" and "Drop & reload" in must["body"]
+    # Resolved 2 h ago: the comparison started after it -> released.
+    ok = _G4Cutover(monkeypatch)
+    ok.ms.cdc_catalog_drift_findings = {"app.t": _g4_finding(resolved=now - timedelta(hours=2))}
+    ok.ready()
+    ok.render()
+    assert "I've cut over to DSQL" in ok.ui.texts
+    ok.click("I've cut over to DSQL")
+    assert (
+        "; source schema: changed earlier on app.t, each cleared by a CHECKSUM match after it "
+        "matched the Step 1 inventory again" in ok.acknowledged()[-1]["detail"]
+    )
+
+
+def test_a_table_gone_from_the_inventory_can_be_waived_once(monkeypatch) -> None:
+    from datetime import timedelta
+
+    from dsql_migrator.core.activity_log import ActivityStatus
+
+    s = _G4Cutover(monkeypatch)
+    resolved = datetime.now(timezone.utc) - timedelta(hours=2)
+    s.ms.cdc_catalog_drift_findings = {
+        "app.gone": _g4_finding(resolved=resolved, by="not-in-inventory",
+                                kinds=("source-table-missing",))
+    }
+    s.ready()
+    s.render()
+    assert "1 table(s) whose source schema changed have no CHECKSUM proof" in s.body()
+    assert "I've cut over to DSQL" not in s.ui.texts
+    s.click("Continue without this check")
+    (waived,) = [kw for action, kw in s.logged
+                 if action == "source schema CHECKSUM proof waived at cut over"]
+    assert waived["status"] is ActivityStatus.WARNING and "app.gone" in waived["detail"]
+    assert s.vs.cutover_catalog_drift_waiver.tables == {"app.gone": resolved}
+    s.render()
+    assert "I've cut over to DSQL" in s.ui.texts
+    assert "Cutting over without CHECKSUM proof for tables whose source schema changed" in s.body()
+    s.click("I've cut over to DSQL")
+    assert "; source schema check WAIVED (CHECKSUM proof for app.gone)" in (
+        s.acknowledged()[-1]["detail"]
+    )
+    # A new verdict drops the waiver.
+    from tests.test_cdc_dlq_gate import _item
+
+    s.c.validate(_item(), mode=ValidationMode.CHECKSUM)
+    assert s.vs.cutover_catalog_drift_waiver is None
+
+
+def test_without_the_password_cut_over_warns_but_an_open_change_still_holds(monkeypatch) -> None:
+    s = _G4Cutover(monkeypatch, password=False)
+    s.ready(g4=False)
+    s.render()
+    assert "I've cut over to DSQL" in s.ui.texts  # FAIL-OPEN by design
+    (warn,) = [n for n in s.notices if n["header"] == "Cut over could not re-read the source schema"]
+    assert warn["tone"] == "warning" and "reconnect the source on the Connect step" in warn["body"]
+    assert s.g4_timers() == []
+    s.click("I've cut over to DSQL")
+    assert "; source schema: not re-checked (source password not in memory)" in (
+        s.acknowledged()[-1]["detail"]
+    )
+    held = _G4Cutover(monkeypatch, password=False)
+    held.ms.cdc_catalog_drift_findings = {"app.t": _g4_finding()}
+    held.ready(g4=False)
+    held.render()
+    assert "I've cut over to DSQL" not in held.ui.texts
+    assert held.button("Check again").disabled
+    assert "reconnect the source on the Connect step" in held.body()
+
+
+def test_acknowledging_waits_for_a_schema_read_and_stops_on_a_late_change(monkeypatch) -> None:
+    s = _G4Cutover(monkeypatch)
+    s.ready()
+    s.render()
+    assert "I've cut over to DSQL" in s.ui.texts
+    assert s.ms.begin_cdc_catalog_drift_probe() is True
+    s.click("I've cut over to DSQL")
+    assert s.acknowledged() == [] and s.ui.notes[-1][1] == "info"
+    s.ms.finish_cdc_catalog_drift_probe()
+    # The CDC poll records a change after this page was drawn.
+    s.ms.cdc_catalog_drift_findings = {"app.t": _g4_finding()}
+    s.click("I've cut over to DSQL")
+    assert s.acknowledged() == [] and s.ui.notes[-1][1] == "warning" and s.refreshes == [1]
+
+
+def test_full_load_only_cut_over_is_unchanged_by_the_schema_check(monkeypatch) -> None:
+    def _render(with_handle):
+        s = _G4Cutover(monkeypatch, cdc=False, mtype="FULL_LOAD_ONLY")
+        if not with_handle:
+            s.ms.cdc_catalog_baseline = None
+        s.ready(g4=False)
+        s.render()
+        s.click("I've cut over to DSQL")
+        return s
+
+    plain, wired = _render(False), _render(True)
+    assert wired.ui.texts == plain.ui.texts and wired.g4_timers() == [] and wired.reads == []
+    assert "source schema" not in wired.acknowledged()[-1]["detail"]
+
+
+def _g4_gate(findings, report, *, run_start):
+    from dsql_migrator.ui.cdc_catalog_drift_gate import cdc_catalog_drift_cutover_gate
+
+    return cdc_catalog_drift_cutover_gate(
+        findings=findings, scope=tuple(findings), cdc_in_use=True, cdc_evidence=True,
+        registered=True, baseline_known=True, check_probe=False, report=report,
+        release="clean", inventory_names={"orders", "customers"},
+        compared_run_start=run_start, has_source_connection=True,
+    )
+
+
+def test_the_verdict_holds_while_a_source_schema_changed(monkeypatch) -> None:
+    from datetime import timedelta
+
+    import dsql_migrator.ui.validation as uiv
+
+    tones: list = []
+    real = uiv.render_notice
+    monkeypatch.setattr(uiv, "render_notice", lambda ui, **kw: (tones.append((kw["tone"], kw["header"])), real(ui, **kw)))
+    report = _g1_match_report(checksum=True)
+    now = datetime.now(timezone.utc)
+    picked: list = []
+    opened = _g4_gate({"orders": _g4_finding()}, report, run_start=now)
+    ui = _g1_render(report, None, catalog_drift_gate=opened, recheck_provider=picked.append)
+    assert "Ready for cut-over" not in ui.texts
+    assert ("error", "Tables match — cut over is held: the source schema changed on 1 "
+            "table(s)") in tones
+    assert "a TINYINT(1) widened to INT still compares as true or false" in ui.body()
+    assert not any(t.startswith("Re-check") for t, _cb in ui.clicks)
+    tones.clear()
+    must = _g4_gate({"orders": _g4_finding(resolved=now - timedelta(seconds=30))}, report,
+                    run_start=now)
+    ui = _g1_render(report, None, catalog_drift_gate=must, recheck_provider=picked.append)
+    assert ("warning", "Tables match — cut over waits for a CHECKSUM re-check of 1 table(s) "
+            "whose source schema changed") in tones
+    (click,) = [cb for text, cb in ui.clicks if text == "Re-check 1 table(s) with CHECKSUM"]
+    click()
+    assert picked == [["orders"]]
+    tones.clear()
+    gone = _g4_gate({"app.gone": _g4_finding(resolved=now - timedelta(hours=1))}, report,
+                    run_start=now)
+    ui = _g1_render(report, None, catalog_drift_gate=gone)
+    assert ("warning", "Tables match — 1 table(s) whose source schema changed are not in this "
+            "report") in tones
+    proven = _g4_gate({"orders": _g4_finding(resolved=now - timedelta(minutes=5))}, report,
+                      run_start=now)
+    assert "Ready for cut-over" in _g1_render(report, None, catalog_drift_gate=proven).texts
+
+
+def test_the_recheck_button_covers_every_gate_at_once() -> None:
+    from datetime import timedelta
+
+    report = ValidationReport.build(mode=ValidationMode.ROW_COUNT, items=[
+        TableValidationResult(table=n, source_row_count=1, target_row_count=1,
+                              row_count_match=True, matched=True)
+        for n in ("orders", "customers")
+    ])
+    now = datetime.now(timezone.utc)
+    g4 = _g4_gate({"customers": _g4_finding(resolved=now - timedelta(hours=2))}, report,
+                  run_start=now)
+    ui = _g1_render(report, _g1_gate(report), catalog_drift_gate=g4,
+                    recheck_provider=lambda _t: None)
+    assert "Re-check 2 table(s) with CHECKSUM" in [t for t, _cb in ui.clicks]
+
+
+def test_the_options_hint_names_tables_whose_source_schema_changed() -> None:
+    from dsql_migrator.ui.validation import _render_options
+
+    ui = _ScreenUi()
+    _render_options(ui, ValidationState(), StepStatus.DONE,
+                    catalog_drift_checksum_tables=("orders",))
+    assert any("The source schema of 1 table(s) changed while CDC ran (orders): whatever "
+               "mode you pick, this run also compares them by CHECKSUM." in t for t in ui.texts)
+
+
+def test_a_row_count_run_also_checksums_a_table_whose_source_schema_changed(monkeypatch) -> None:
+    from datetime import timedelta
+
+    fake = _ModeAwareValidator()
+    s = _g1_screen(monkeypatch, fake, ledger_tables=())
+    s.mstate.cdc_catalog_drift_findings = {
+        "orders": _g4_finding(resolved=datetime.now(timezone.utc) - timedelta(hours=1))
+    }
+    s.vstate.mode = ValidationMode.ROW_COUNT
+    s.run()
+    assert [c["mode"] for c in fake.calls] == [ValidationMode.ROW_COUNT, ValidationMode.CHECKSUM]
+    assert fake.calls[1]["tables"] == ["orders"]
+    started = _g1_detail(s.logged, "validation started")
+    assert "tables whose source schema changed are also compared by CHECKSUM: orders" in started
+    assert "REPLICA IDENTITY" not in started and "dead-lettered" not in started
+    completed = _g1_detail(s.logged, "validation completed")
+    assert "CHECKSUM pass for tables whose source schema changed: orders" in completed
+    assert "REPLICA IDENTITY" not in completed
+    # ...and an open change replaces "ready for cut-over" in the completed line.
+    s.mstate.cdc_catalog_drift_findings = {"orders": _g4_finding()}
+    s.logged.clear()
+    s.run()
+    completed = _g1_detail(s.logged, "validation completed")
+    assert "; cut over held: source schema changed on orders" in completed
+
+
+def test_the_validation_screen_wires_the_source_schema_gate(monkeypatch) -> None:
+    """End to end through ``content`` with the baseline handle registered: one background
+    source-schema read is armed on the Options render, the hint names the table, and an open
+    change replaces the green verdict with the error hold."""
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.cdc_catalog_drift_gate import CatalogBaseline
+
+    ui = _TimerUi()
+    s = _g1_screen(monkeypatch, _ModeAwareValidator(), ledger_tables=(), ui=ui, cdc=True)
+    s.mstate.set_cdc_ops_window_start(datetime.now(timezone.utc))
+    # Only QUALIFIED names are ever read (the screen's own inventory here is bare).
+    inv = _g4_inventory(name="app.orders")
+    s.mstate.cdc_catalog_baseline = lambda: CatalogBaseline(
+        inventory=inv, captured=tuple(inv.tables), capture_names=frozenset(),
+        source_type=SourceType.MYSQL,
+    )
+    s.mstate.cdc_catalog_drift_findings = {"orders": _g4_finding()}
+    s.content(lambda: None)
+    assert len([cb for cb in ui.timers
+                if "schedule_catalog_drift_probe" in getattr(cb, "__qualname__", "")]) == 1
+    assert "The source schema of 1 table(s) changed while CDC ran (orders)" in ui.body()
+    s.run()
+    ui.texts.clear()
+    s.content(lambda: None)
+    assert "Ready for cut-over" not in ui.texts
+    assert "Tables match — cut over is held: the source schema changed on 1 table(s)" in ui.texts
+
+
+def test_a_checksum_after_a_step_1_refresh_renders_the_new_type_4b_4c() -> None:
+    """Why "resolved" waits for the live source to match the CURRENT inventory: CHECKSUM
+    renders from the Step 1 type. Stale, a tinyint(1) column renders as true/false (so a
+    widened 2 false-matches a stored true) and a decimal at its old scale; refreshed, it
+    renders the integer text and the new scale, which then MISMATCH what CDC stored."""
+    from dsql_migrator.core.models import ColumnDef
+    from dsql_migrator.core.validation_sql import _mysql_checksum_expr
+
+    stale = _mysql_checksum_expr(ColumnDef(name="flag", mysql_type="tinyint(1)",
+                                           target_type="boolean"))
+    assert stale.startswith("CASE WHEN")
+    fresh = _mysql_checksum_expr(ColumnDef(name="flag", mysql_type="int", target_type="integer"))
+    assert "CASE WHEN" not in fresh and fresh == "CAST(`flag` AS CHAR)"
+    scale = _mysql_checksum_expr(ColumnDef(name="amt", mysql_type="decimal(12,4)",
+                                           target_type="numeric(12,4)"))
+    assert scale == "CAST(`amt` AS DECIMAL(65, 4))"

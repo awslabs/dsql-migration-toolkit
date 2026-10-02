@@ -187,7 +187,10 @@ Validation and Cut over use it:
   table(s)"* and offers **Re-check N table(s) with CHECKSUM**. If the dead-letter history
   cannot be confirmed (below), the report says *"Tables match — cut over waits for one
   CHECKSUM run of every table"* instead, and the Options say so before you run: one run
-  in CHECKSUM mode with Fast sweep off clears it.
+  in CHECKSUM mode with Fast sweep off clears it. Tables whose REPLICA IDENTITY dropped
+  below FULL ([§5.6](#56-re-keyed-postgresql-tables-and-cut-over)) or whose source schema
+  changed while CDC ran ([§5.7](#57-source-schema-changes-and-cut-over)) are compared by
+  CHECKSUM the same way.
 - **Cut over opens only when all of the following hold:**
   1. each dead-lettered table matched in a CHECKSUM comparison that **started more
      than a minute after** its latest dead-lettered record;
@@ -283,6 +286,59 @@ Validation and Cut over use that record:
 **The way forward** for a table that differs after the fix: Full Load + CDC — let CDC
 catch up, Stop CDC, reload it with **Drop & reload**, Start CDC, re-check it; CDC only —
 delete the extra rows on Aurora DSQL by hand, then re-check.
+
+---
+
+## 5.7 Source schema changes and cut over
+
+This applies to a CDC migration (**Full Load + CDC** or **CDC only**), MySQL or
+PostgreSQL. Some source DDL changes what CDC writes without a single rejected row — a
+dropped nullable column, a widened type, a renamed table and more
+([§4.2](04-cdc-and-dsql-constraints.md#changes-that-dead-letter-nothing-the-source-schema-re-check)).
+The CDC monitor re-reads the captured tables' definitions on the source and records each
+table whose definition no longer matches the Step 1 (Evaluation) inventory
+([§4.6](04-cdc-and-dsql-constraints.md#the-source-schema-re-check)); Validation and Cut
+over use that record:
+
+- **Validation compares those tables by CHECKSUM automatically**, named in the Options
+  before you run. While a table's source definition still differs from the Step 1
+  inventory, Cut over stays held whatever the report shows. An added or dropped column,
+  or a missing table, usually means the table cannot be compared at all (*"N table(s)
+  could not be compared"*; re-run Step 1). Otherwise the report says *"Tables match —
+  cut over is held: the source schema changed on N table(s)"*. No CHECKSUM releases it:
+  the comparison renders each column from the Step 1 inventory, so it can match falsely
+  (a `TINYINT(1)` widened to `INT` still compares as true or false).
+- **It clears in two steps.** First the source must match the Step 1 inventory again:
+  re-run Step 1 (Evaluation) so it holds the new definition (for a plain added column,
+  add it to Aurora DSQL with **Fix target schema…** first: Validation cannot compare a
+  column the Step 1 inventory does not have), or undo the change on the source — the
+  tool re-reads by itself, or choose **Check again**. Then the table must match in a
+  CHECKSUM comparison that **started more than a minute after** that; the report offers
+  **Re-check N table(s) with CHECKSUM**. A Step 1 re-run that changes a captured table's
+  definition is treated the same way: values CDC applied before it may differ, so that
+  table also needs a CHECKSUM started after the re-run.
+- **Cut over** makes **one fresh read** of the source definitions after the latest
+  validation or Step 1 run (a few seconds) before it opens, so a change since then is
+  caught.
+- A table left out of the report, no longer in the Step 1 inventory (dropped or renamed
+  at the source, then Step 1 re-run), or inside a gap you accepted, can be acknowledged
+  with **Continue without this check** once nothing else is open or needs a re-check
+  (recorded in the activity log; it re-opens if the table changes again). A table whose
+  source still differs is never waivable.
+- **If the source can't be checked** — no password after an app restart, no Step 1
+  inventory (Step 1 is running or its last run failed), a failed read — and nothing is
+  recorded as changed, Cut over does not hold: it shows a warning above the runbook, and
+  the acknowledgement line in the activity log records that the source schema was not
+  re-checked. Confirm that no DDL ran on the migrated tables while CDC ran before you
+  repoint, or reconnect the source on the Connect step (after a failed read, choose
+  **Check again**). A table still recorded as changed keeps Cut over held.
+- **Restarts.** The record of each change survives an app restart and is cleared only by
+  Start over. **Full load only** is unaffected, unless CDC ran earlier in the same
+  session: changes recorded then still apply.
+
+**The way forward** for a table that differs in that CHECKSUM: Full Load + CDC — let CDC
+catch up, Stop CDC, reload it with **Drop & reload**, Start CDC, re-check it; CDC only —
+correct its rows on Aurora DSQL by hand, then re-check.
 
 ---
 

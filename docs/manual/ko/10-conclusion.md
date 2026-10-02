@@ -49,8 +49,9 @@ CDC는 실제로 움직이는 구성 요소(MSK, MSK Connect, 싱크 커넥터)�
 5. **Validation** — 행 수 + 체크섬을 실행합니다(전환 전 + 대조 실행). 모든 차이가 설명될 때만(드리프트,
    의도된 격리, 아직 수렴하지 않은 CDC) 판정이 **MATCH**가 됩니다. CDC 마이그레이션이면 dead-letter 처리된
    CDC 변경이 있는 테이블은 자동으로 CHECKSUM으로도 비교됩니다.
-6. **Cut over** — Validation이 깨끗한 MATCH가 되면(CDC이면 [§5.5](05-validation.md#55-cdc-dead-letter와-컷오버)의 dead-letter 확인까지
-   해소되면) 애플리케이션을 DSQL로 전환합니다. 도구가 대신
+6. **Cut over** — Validation이 깨끗한 MATCH가 되면(CDC이면 [§5.5](05-validation.md#55-cdc-dead-letter와-컷오버)의 dead-letter 확인과
+   [§5.7](05-validation.md#57-소스-스키마-변경과-컷오버)의 소스 스키마 재확인까지 해소되면) 애플리케이션을
+   DSQL로 전환합니다. 도구가 대신
    수행해 주지 않는 유일한 단계이며, 경로에 맞춘 런북(아래 §10.3)을 따르세요.
 
 ---
@@ -60,8 +61,9 @@ CDC는 실제로 움직이는 구성 요소(MSK, MSK Connect, 싱크 커넥터)�
 "Cut over"는 마지막 워크플로 단계이자, 애플리케이션이 MySQL 사용을 멈추고 Aurora DSQL을 쓰기
 시작하는 순간입니다. 도구가 대신 수행해 주지 **않는** 유일한 단계입니다 — 도구는 타깃이 정확함을
 증명하고 무손실 복제 스트림을 제공하지만, 애플리케이션을 *언제* 어떻게 전환할지는 사용자만 내릴 수 있는
-운영상의 결정입니다. Validation이 깨끗한 MATCH가 되면(CDC이면 [§5.5](05-validation.md#55-cdc-dead-letter와-컷오버)의 dead-letter 확인까지
-해소되면) UI의 **Cut over** 단계에 경로별 런북이 표시되며, 아래는 그와 동일한 안내입니다.
+운영상의 결정입니다. Validation이 깨끗한 MATCH가 되면(CDC이면 [§5.5](05-validation.md#55-cdc-dead-letter와-컷오버)의 dead-letter 확인과
+[§5.7](05-validation.md#57-소스-스키마-변경과-컷오버)의 소스 스키마 재확인까지 해소되면) UI의 **Cut over**
+단계에 경로별 런북이 표시되며, 아래는 그와 동일한 안내입니다.
 
 ### Full load only (짧은 점검 동결)
 
@@ -90,7 +92,9 @@ CDC는 실제로 움직이는 구성 요소(MSK, MSK Connect, 싱크 커넥터)�
    dead-letter 처리된 CDC 변경이 있는 테이블은 자동으로 CHECKSUM으로 비교되며, Cut over는 열리기 전에
    dead-letter queue를 다시 읽습니다([§5.5](05-validation.md#55-cdc-dead-letter와-컷오버) 참고). 재키잉된
    테이블이 있는 PostgreSQL 소스에서는 Cut over가 열리기 전에 그 테이블들의 REPLICA IDENTITY도 다시
-   읽습니다([§5.6](05-validation.md#56-재키잉된-postgresql-테이블과-컷오버) 참고).
+   읽습니다([§5.6](05-validation.md#56-재키잉된-postgresql-테이블과-컷오버) 참고). Cut over는 열리기 전에
+   소스에서 캡처 중인 테이블의 정의도 다시 읽습니다([§5.7](05-validation.md#57-소스-스키마-변경과-컷오버)
+   참고).
 5. **애플리케이션을 DSQL 엔드포인트로 전환** + 스모크 테스트.
 6. **CDC 파이프라인은 맨 마지막에 제거** — **Start over(우상단)** → *Delete all CDC
    infrastructure* 를 클릭합니다. 복제를 끝내고 MSK / MSK Connect / NAT 비용을 중단하며, 기존 스택을

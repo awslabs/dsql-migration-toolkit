@@ -477,6 +477,44 @@ def build_data_migration_screen(
         result = eval_state.result
         return result.inventory if result is not None else None
 
+    def _catalog_baseline():
+        # What the source-schema re-check (ui/cdc_catalog_drift_gate.py) compares the live
+        # source with: the Step 1 inventory and the tables CDC captures, resolved by Start
+        # CDC's own chain (watermark, else selection, else the deployed TableIncludeList).
+        # None without an inventory (Step 1 running, or its last run failed) -- "cannot
+        # check", never clean. CPU only (no I/O): called by the poll and on render.
+        from dsql_migrator.ui.cdc_catalog_drift_gate import CatalogBaseline
+
+        inventory = _inventory()
+        if inventory is None or not getattr(inventory, "tables", None):
+            return None
+        job = _current_job(job_manager, getattr(migration_state, "job_id", None))
+        watermark = getattr(job, "watermark", None) if job is not None else None
+        if watermark is not None and getattr(watermark, "table_row_counts", None):
+            names = set(watermark.table_row_counts)
+        else:
+            selection = migration_state.selection
+            if selection is not None and selection.selected_tables:
+                names = set(selection.selected_tables)
+            else:
+                names = set(getattr(migration_state, "cdc_reconciled_table_names", None) or ())
+        try:
+            captured = _cdc_tables_for_config(migration_state, inventory, watermark)
+        except Exception:  # noqa: BLE001 - a selected table left the inventory
+            # TableSelector refuses a selected name the inventory no longer has (a table
+            # dropped at the source, then Step 1 re-run). The check must keep running for
+            # the others -- and close that table's finding -- so match the names directly.
+            captured = [t for t in inventory.tables if t.name in names]
+        return CatalogBaseline(
+            inventory=inventory,
+            captured=tuple(captured),
+            capture_names=frozenset(str(n) for n in names),
+            source_type=session_source_type(session),
+        )
+
+    # A builder-time handle, kept across Start over (reset_in_place).
+    migration_state.cdc_catalog_baseline = _catalog_baseline
+
     def _target_inventory() -> Optional[TargetInventory]:
         # The target DSQL catalog from Step 1 (Evaluation). Used to treat tables
         # that already exist on the target as migratable, so Data Migration can

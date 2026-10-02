@@ -772,10 +772,13 @@ def replica_identity_gate_for(
 
 
 def cdc_checksum_forced_tables(migration_state: object) -> "set[str]":
-    """Tables Validation always compares by CHECKSUM: every dead-lettered table (G1) and every
-    table with a REPLICA IDENTITY finding. Only ever ADDS tables to a CHECKSUM pass."""
-    return set(getattr(migration_state, "cdc_dlq_ledger", None) or {}) | set(
-        _findings(migration_state)
+    """Tables Validation always compares by CHECKSUM: every dead-lettered table (G1), every
+    table with a REPLICA IDENTITY finding (G2) and every table with a source-schema finding
+    (G4, ``ui/cdc_catalog_drift_gate.py``). Only ever ADDS tables to a CHECKSUM pass."""
+    return (
+        set(getattr(migration_state, "cdc_dlq_ledger", None) or {})
+        | set(_findings(migration_state))
+        | set(getattr(migration_state, "cdc_catalog_drift_findings", None) or {})
     )
 
 

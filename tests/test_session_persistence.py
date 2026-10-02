@@ -2141,3 +2141,130 @@ def test_the_signature_changes_on_open_restore_and_de_scope_but_not_on_a_silent_
         tables={"app.t": fixed}, waived_at=fixed
     )
     assert sig() != descoped
+
+
+# ---------------------------------------------------------------------------
+# G4: the source-schema findings, digests, Fix-added columns and the waiver survive a restart
+# ---------------------------------------------------------------------------
+
+
+def _g4_finding(**kw):
+    from dsql_migrator.core.models import CdcCatalogDriftChange, CdcCatalogDriftFinding
+
+    base = dict(
+        kinds=["drop-column", "add-column"],
+        changes=[CdcCatalogDriftChange(kind="drop-column", column="notes", before="text"),
+                 CdcCatalogDriftChange(kind="add-column", column="x", after="int")],
+        more_changes=3, fixable=False,
+        first_seen_at=datetime(2026, 9, 1, 11, 0, tzinfo=timezone.utc),
+    )
+    base.update(kw)
+    return CdcCatalogDriftFinding(**base)
+
+
+def test_source_schema_findings_digests_added_columns_and_waiver_round_trip() -> None:
+    from dsql_migrator.core.models import CdcCatalogDriftWaiver
+    from dsql_migrator.ui.validation import ValidationState
+
+    session, eval_state, conv_state, ms = _populated_states()
+    fixed = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    ms.cdc_catalog_drift_findings = {
+        "app.t": _g4_finding(resolved_at=fixed, resolved_by="rebaselined"),
+        "app.u": _g4_finding(),
+    }
+    ms.cdc_catalog_drift_digests = {"app.t": "0123456789abcdef", "app.u": "fedcba9876543210"}
+    ms.record_cdc_target_added_columns("app.u", {"x": "int"})
+    ms.cdc_catalog_drift_last_probe = object()  # transient: never persisted
+    vstate = ValidationState()
+    vstate._result = _g1_report()
+    vstate._completed_at = fixed
+    vstate.cutover_catalog_drift_waiver = CdcCatalogDriftWaiver(
+        tables={"app.t": fixed}, waived_at=fixed
+    )
+    snapshot = capture_session_snapshot("s1", session, eval_state, conv_state, ms, vstate)
+    restored = SessionSnapshot.model_validate_json(snapshot.model_dump_json())
+    ms2, v2 = DataMigrationState(), ValidationState()
+    apply_session_snapshot(
+        restored, SessionConnectionState(), EvaluationState(), SchemaConversionState(), ms2, v2,
+    )
+    assert ms2.cdc_catalog_drift_findings == ms.cdc_catalog_drift_findings
+    assert ms2.cdc_catalog_drift_findings["app.t"].resolved_by == "rebaselined"
+    assert ms2.cdc_catalog_drift_findings["app.u"].changes[1].after == "int"
+    assert ms2.cdc_catalog_drift_digests == ms.cdc_catalog_drift_digests
+    assert ms2.cdc_target_added_columns == {"app.u": {"x": "int"}}
+    assert ms2.cdc_catalog_drift_last_probe is None
+    assert v2.cutover_catalog_drift_waiver.tables == {"app.t": fixed}
+
+
+def test_an_older_snapshot_restores_no_source_schema_state() -> None:
+    from dsql_migrator.ui.validation import ValidationState
+
+    old = SessionSnapshot.model_validate({
+        "session_id": "s1",
+        "validation_report": _g1_report().model_dump(mode="json"),
+        "validation_completed_at": "2026-09-01T11:40:00+00:00",
+    })
+    assert old.cdc_catalog_drift_findings == {} and old.cdc_catalog_drift_digests == {}
+    assert old.cdc_target_added_columns == {} and old.validation_cdc_catalog_drift_waiver is None
+    ms, v = DataMigrationState(), ValidationState()
+    apply_session_snapshot(
+        old, SessionConnectionState(), EvaluationState(), SchemaConversionState(), ms, v,
+    )
+    assert ms.cdc_catalog_drift_findings == {} and ms.cdc_target_added_columns == {}
+    assert v.cutover_catalog_drift_waiver is None
+
+
+def test_a_restore_assigns_the_source_schema_state_directly(monkeypatch) -> None:
+    """No fold, no transition line, nothing closed: the open finding comes back open."""
+    import dsql_migrator.core.activity_log as act
+
+    lines: list = []
+    monkeypatch.setattr(act, "log_activity", lambda *a, **k: lines.append(a))
+    session, eval_state, conv_state, ms = _populated_states()
+    ms.cdc_catalog_drift_findings = {"app.t": _g4_finding()}
+    snapshot = capture_session_snapshot("s1", session, eval_state, conv_state, ms)
+    ms2 = DataMigrationState()
+    apply_session_snapshot(
+        SessionSnapshot.model_validate_json(snapshot.model_dump_json()),
+        SessionConnectionState(), EvaluationState(), SchemaConversionState(), ms2,
+    )
+    assert ms2.cdc_catalog_drift_findings["app.t"].resolved_at is None
+    assert lines == []
+
+
+def test_the_signature_changes_on_every_source_schema_change_but_not_a_silent_reread() -> None:
+    from dsql_migrator.core.models import CdcCatalogDriftWaiver
+    from dsql_migrator.ui.validation import ValidationState
+
+    session, eval_state, conv_state, ms = _populated_states()
+    vstate = ValidationState()
+    vstate._result = _g1_report()
+
+    def sig():
+        return session_signature(session, eval_state, conv_state, ms, vstate)
+
+    base = sig()
+    ms.cdc_catalog_drift_last_probe = object()  # a read that changed nothing
+    assert sig() == base
+    ms.cdc_catalog_drift_findings = {"app.t": _g4_finding()}
+    opened = sig()
+    assert opened != base
+    ms.cdc_catalog_drift_findings = {"app.t": _g4_finding()}  # identical re-read
+    assert sig() == opened
+    fixed = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    ms.cdc_catalog_drift_findings = {"app.t": _g4_finding(resolved_at=fixed, resolved_by="matched")}
+    resolved = sig()
+    assert resolved != opened
+    ms.cdc_catalog_drift_digests = {"app.t": "0123456789abcdef"}
+    seeded = sig()
+    assert seeded != resolved
+    ms.cdc_catalog_drift_digests = {"app.t": "fedcba9876543210"}
+    rebaselined = sig()
+    assert rebaselined != seeded
+    ms.record_cdc_target_added_columns("app.t", {"x": "int"})
+    added = sig()
+    assert added != rebaselined
+    vstate.cutover_catalog_drift_waiver = CdcCatalogDriftWaiver(
+        tables={"app.t": fixed}, waived_at=fixed
+    )
+    assert sig() != added

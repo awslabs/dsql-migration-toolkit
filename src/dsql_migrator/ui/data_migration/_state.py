@@ -347,6 +347,31 @@ class DataMigrationState:
         # Single-flight claim for that read (monotonic start; None when none runs), with a
         # watchdog of twice the TTL so a hung read never pins "re-reading".
         self._cdc_replica_identity_probe_started: Optional[float] = None
+        # Captured tables whose SOURCE definition stopped matching the migration's baseline
+        # while CDC ran (ui/cdc_catalog_drift_gate.py): {table: CdcCatalogDriftFinding}. A
+        # change no rejected row reveals, so this is PERSISTED on the session snapshot and
+        # cleared only by Start over -- never by an attach or a stack rename (it is about the
+        # source and the TARGET tables). Copy-on-write: replaced, never mutated.
+        self.cdc_catalog_drift_findings: dict = {}
+        # Per compared table, the 16-hex digest of the baseline facts the last successful
+        # read compared with ({table: digest}); a change means a Step 1 re-run redefined the
+        # table. Persisted, copy-on-write.
+        self.cdc_catalog_drift_digests: dict = {}
+        # Columns added to Aurora DSQL through Fix target schema ({table: {column: source
+        # catalog type}}), part of the re-check's baseline. Written only from the APPLIED
+        # outcomes of that dialog. Persisted, copy-on-write.
+        self.cdc_target_added_columns: dict = {}
+        # The last runtime source-schema read (a CdcCatalogDriftProbe). Transient: a
+        # restarted session must read again (and needs the source password to).
+        self.cdc_catalog_drift_last_probe = None
+        # Single-flight claim for that read (monotonic start; None when none runs), with a
+        # watchdog of twice the TTL so a hung read never pins "re-reading".
+        self._cdc_catalog_drift_probe_started: Optional[float] = None
+        # Which migration a read belongs to: a fresh object per __init__, so Start over
+        # (reset_in_place re-runs __init__ on this same object) gives it a new one, and a
+        # read that started before it lands nowhere (never an object()-vs-int counter that
+        # __init__ would reset to a value an old claim could share).
+        self._cdc_catalog_drift_epoch: object = object()
         # Columns the SOURCE connector could not convert and therefore delivered as NULL
         # (the row itself was applied). Sticky, and keyed by (table, column, type): the
         # same value fails on every row that carries it, so the fact is "this column
@@ -601,6 +626,10 @@ class DataMigrationState:
         # REPLICA IDENTITY re-check leaves out a pure primary-key REORDER without a read --
         # the same judgement the Start prerequisite makes from the same inventory.
         self.source_primary_key_for: Optional[Callable[[str], Optional[list]]] = None
+        # The source-schema re-check's baseline provider (a CatalogBaseline: the Step 1
+        # inventory and the captured tables, or ``None`` without an inventory). Without it
+        # the re-check is inert.
+        self.cdc_catalog_baseline: Optional[Callable[[], object]] = None
         # Which CDC activity events have already been mirrored into the AI feed, per CDC
         # log key, so the ~5s monitor poll announces each transition ONCE. Lives HERE (not
         # in a module dict) so Start over's ``reset_in_place`` -> ``__init__`` clears it;
@@ -1508,6 +1537,80 @@ class DataMigrationState:
         with self._lock:
             return self._cdc_replica_identity_probe_running_locked(_time.monotonic())
 
+    def apply_cdc_catalog_drift_probe(self, probe: object, epoch: object = None) -> list:
+        """Land a runtime source-schema read (on the loop): store it as the last probe and
+        fold it into the findings and digests (copy-on-write). Returns the transitions for
+        the caller to log AFTER the lock (one activity line per kind, never per poll).
+
+        ``epoch`` is the migration the read was claimed for (its request's): a read that
+        started before Start over is dropped -- nothing stored, nothing folded, nothing to
+        log -- so it can never open a finding in the new migration."""
+        from dsql_migrator.ui.cdc_catalog_drift_gate import fold_catalog_drift_probe
+
+        with self._lock:
+            if epoch is not None and epoch is not self._cdc_catalog_drift_epoch:
+                return []
+            self.cdc_catalog_drift_last_probe = probe
+            findings, digests, transitions = fold_catalog_drift_probe(
+                self.cdc_catalog_drift_findings, self.cdc_catalog_drift_digests, probe
+            )
+            if transitions or findings != self.cdc_catalog_drift_findings:
+                self.cdc_catalog_drift_findings = findings
+            if digests != self.cdc_catalog_drift_digests:
+                self.cdc_catalog_drift_digests = digests
+        return list(transitions)
+
+    def record_cdc_target_added_columns(
+        self, table: str, columns: "Mapping[str, str]"
+    ) -> None:
+        """Record columns Fix target schema APPLIED to ``table`` on Aurora DSQL ({column:
+        source catalog type}), so the source-schema re-check counts them as baseline columns
+        (resolved drift, not new drift). Copy-on-write; merged per table."""
+        cleaned = {str(c): str(t) for c, t in dict(columns or {}).items() if c}
+        if not table or not cleaned:
+            return
+        with self._lock:
+            current = dict(self.cdc_target_added_columns)
+            merged = dict(current.get(str(table)) or {})
+            merged.update(cleaned)
+            current[str(table)] = merged
+            self.cdc_target_added_columns = current
+
+    def _cdc_catalog_drift_probe_running_locked(self, now: float) -> bool:
+        from dsql_migrator.ui.cdc_catalog_drift_gate import (
+            CDC_CATALOG_DRIFT_PROBE_TTL_SECONDS,
+        )
+
+        started = self._cdc_catalog_drift_probe_started
+        return started is not None and now - started <= 2 * CDC_CATALOG_DRIFT_PROBE_TTL_SECONDS
+
+    def begin_cdc_catalog_drift_probe(self, now_monotonic: Optional[float] = None) -> bool:
+        """Claim the runtime source-schema read (single flight across tabs)."""
+        import time as _time
+
+        now = _time.monotonic() if now_monotonic is None else now_monotonic
+        with self._lock:
+            if self._cdc_catalog_drift_probe_running_locked(now):
+                return False
+            self._cdc_catalog_drift_probe_started = now
+            return True
+
+    def finish_cdc_catalog_drift_probe(self, epoch: object = None) -> None:
+        """Release the claim -- unless ``epoch`` names a migration Start over has replaced
+        (that read's claim went with it; never release one taken since)."""
+        with self._lock:
+            if epoch is not None and epoch is not self._cdc_catalog_drift_epoch:
+                return
+            self._cdc_catalog_drift_probe_started = None
+
+    @property
+    def cdc_catalog_drift_probe_running(self) -> bool:
+        """A runtime source-schema read is in flight."""
+        import time as _time
+
+        with self._lock:
+            return self._cdc_catalog_drift_probe_running_locked(_time.monotonic())
+
     def set_cdc_deployed_column_exclude_list(self, value: Optional[str]) -> None:
         """Record the DEPLOYED stack's ColumnExcludeList (``None``: no stack/param)."""
         with self._lock:
@@ -2304,7 +2407,7 @@ class DataMigrationStore:
                 for name in (
                     "overlay_ledger", "effective_target_ddls", "on_cdc_start",
                     "cutover_restore_in_flight", "validation_state_provider",
-                    "source_primary_key_for",
+                    "source_primary_key_for", "cdc_catalog_baseline",
                 )
             }
             state.__init__()  # type: ignore[misc]  # re-run init on the same object
