@@ -149,7 +149,10 @@ Once Validation reports a clean **MATCH** (or every difference is explained) —
 for a CDC migration, the dead-letter check in 5.5 clears — the
 final workflow step — **Cut over** — appears in the UI with the runbook for
 switching your application from the source database (RDS/Aurora MySQL or PostgreSQL)
-to DSQL. See the recommended end-to-end flow
+to DSQL. In Full load only, Cut over also needs the report to cover every table
+selected after the Full Load: such a table that the report has no row for holds Cut over
+until you load it and re-run Validation (or turn its chip off under **Objects to
+validate**). See the recommended end-to-end flow
 in the [Conclusion](10-conclusion.md) for the cut-over sequence (CDC-drain vs
 Full-Load freeze) and the rollback anchor.
 

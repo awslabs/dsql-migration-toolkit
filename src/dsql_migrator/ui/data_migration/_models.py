@@ -339,6 +339,258 @@ def recreated_unfinished(job: MigrationJob) -> list[str]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# G12: a Full load only table set that changed after the Full Load (NiceGUI-agnostic)
+# ---------------------------------------------------------------------------
+#
+# The job record keeps its whole history (and its watermark is never touched); every
+# surface that reads chunks reads a SCOPED VIEW of it instead -- the identical object
+# whenever nothing changed, so a CDC type, an untouched selection or an unchanged set
+# render exactly as before.
+
+SCOPE_NOTICE_HEADER = "Table set changed after the last Full Load"
+SCOPE_ADDED_REASON = "Not loaded yet — selected after the last Full Load."
+
+
+def _names_text(names: "Sequence[str]") -> str:
+    from dsql_migrator.ui.cdc_dlq_gate import bounded_table_names
+
+    return bounded_table_names(list(names))
+
+
+def full_load_scope_names(migration_state, job_manager, selected) -> "Optional[list[str]]":
+    """The selection the Full Load views follow, or ``None`` (they read the record as is).
+
+    A list only in Full load only, with a TOUCHED, non-empty selection, while
+    :func:`table_set_editable_after_load` holds. The touched rule keeps an untouched
+    Schema Conversion default that drifted from being read as a change: the prerequisite
+    run pins a touched set before any load, so a real migration always has one.
+    """
+    if getattr(migration_state, "migration_type", None) is not MigrationType.FULL_LOAD_ONLY:
+        return None
+    if not getattr(migration_state, "selection_touched", False):
+        return None
+    names = [n for n in dict.fromkeys(selected or ()) if n]
+    if not names:
+        return None
+    from dsql_migrator.ui.data_migration._cdc_monitoring import table_set_editable_after_load
+
+    if not table_set_editable_after_load(migration_state, job_manager):
+        return None
+    return names
+
+
+def scope_full_load_job(job, names: "Optional[Sequence[str]]"):
+    """The job record seen through the current selection ``names``. Pure; never mutates.
+
+    Returns ``job`` ITSELF when ``names`` is None, there is no job, it is still running,
+    or the selection equals the record's tables. Otherwise a copy whose chunks are the
+    selected tables' chunks (record order) followed by a PENDING chunk for each selected
+    table the record lacks (selection order), with ``progress_pct`` / ``error_count``
+    recomputed as the engine does; job id, watermark, status and error lineage are kept.
+    """
+    if names is None or job is None:
+        return job
+    if getattr(job, "status", None) in ("PENDING", "RUNNING"):
+        return job
+    chunks_in = list(getattr(job, "chunks", None) or ())
+    wanted = list(dict.fromkeys(names))
+    if set(wanted) == {c.chunk_id for c in chunks_in}:
+        return job
+    keep = set(wanted)
+    chunks = [c.model_copy(deep=True) for c in chunks_in if c.chunk_id in keep]
+    have = {c.chunk_id for c in chunks}
+    chunks.extend(ChunkState(chunk_id=n) for n in wanted if n not in have)
+    total = len(chunks)
+    settled = sum(1 for c in chunks if c.status in ("DONE", "FAILED"))
+    return job.model_copy(update={
+        "chunks": chunks,
+        "progress_pct": round(settled / total * 100.0, 4) if total else 0.0,
+        "error_count": sum(1 for c in chunks if c.status == "FAILED"),
+    })
+
+
+def scope_change(job, scoped) -> "tuple[list[str], list[str]]":
+    """``(added, removed)``: selected tables the record lacks, record tables not selected.
+    Both empty when ``scoped`` is ``job`` (nothing changed)."""
+    if scoped is job or job is None or scoped is None:
+        return [], []
+    record = [c.chunk_id for c in job.chunks]
+    view = [c.chunk_id for c in scoped.chunks]
+    # Sets built once (a render calls this a few times over every table).
+    record_set, view_set = set(record), set(view)
+    return ([n for n in view if n not in record_set],
+            [n for n in record if n not in view_set])
+
+
+def watermark_coverage_gap(
+    job, selected: "Sequence[str]", migratable: "Sequence[str]" = ()
+) -> "Optional[tuple[list[str], list[str]]]":
+    """``(selected since, unselected since)`` against the tables the watermark covers.
+
+    ``None`` without a job or per-table watermark counts (nothing to compare). The
+    watermark's keys are the run's table set -- every run table gets one -- and CDC
+    streams exactly them (``_cdc_tables_for_config``), so a difference means a CDC type
+    would capture the wrong tables. A covered table that is no longer migratable (left
+    the target) is not "unselected since". Pure.
+    """
+    watermark = getattr(job, "watermark", None) if job is not None else None
+    counts = getattr(watermark, "table_row_counts", None) if watermark is not None else None
+    if not counts:
+        return None
+    covered = set(counts)
+    universe = set(migratable or ()) or covered
+    chosen = set(selected or ())
+    return sorted(chosen - covered), sorted((covered & universe) - chosen)
+
+
+def coverage_lock_reason(gap: "tuple[Sequence[str], Sequence[str]]") -> str:
+    """The migration-type lock text for a table set that left its watermark behind."""
+    added, removed = gap
+    parts = []
+    if added:
+        parts.append(f"selected since: {_names_text(added)}")
+    if removed:
+        parts.append(f"unselected since: {_names_text(removed)}")
+    return (
+        f"Locked — the table set changed after this Full Load ({'; '.join(parts)}), and "
+        "its watermark covers only the tables that run started with. A CDC type would "
+        "stream that original set: a table selected since would not be captured, and a "
+        "table unselected since would keep streaming. To add CDC, re-run Full Load over "
+        "the current set (it takes a fresh watermark), or restore the original table set."
+    )
+
+
+COVERAGE_GAP_NOTICE_BODY = (
+    "The table set changed after this Full Load, so its watermark does not cover the "
+    "current set and CDC cannot continue from it. To add CDC, re-run Full Load over the "
+    "current set first (it takes a fresh watermark), or restore the original table set; "
+    "the migration type unlocks then."
+)
+COVERAGE_GAP_NOTICE_PG_SUFFIX = (
+    " On PostgreSQL, CDC then re-reads the tables either way (a Full load only run "
+    "creates no replication slot)."
+)
+
+
+def added_since_run_reason(added: "Sequence[str]", since: str = "the last Full Load") -> str:
+    """The run-guard text for tables added to the selection after ``since``: the last
+    Full Load with no report to vouch for them (G12), or "the checks ran" for a report
+    that predates them -- one wording, the pronoun following the count."""
+    listed = ", ".join(added[:3]) + (" and more" if len(added) > 3 else "")
+    many = len(added) > 1
+    return (
+        f"Re-run the prerequisite checks — {listed} {'were' if many else 'was'} added to "
+        f"the selection after {since}, so {'they were' if many else 'it was'} never checked."
+    )
+
+
+def scope_notice(
+    job, scoped, *, blocked_by: "Optional[str]" = None
+) -> "Optional[tuple[str, str, str]]":
+    """``(tone, header, body)`` of the Full Load card's scope notice, or ``None`` when the
+    view is the record. Warning while a selected table is not loaded yet -- the step then
+    reads Failed, which the notice says, since nothing failed; info for a removal alone (a
+    left-as-is table is expected, not a problem). ``blocked_by`` (the run guard, e.g. the
+    prerequisite checks a newly selected table never had) is named FIRST: until it clears,
+    Retry unfinished tables refuses the newly selected tables."""
+    added, removed = scope_change(job, scoped)
+    if not added and not removed:
+        return None
+    sentences = []
+    if added:
+        one = len(added) == 1
+        first = f" First: {blocked_by} Then" if blocked_by else ""
+        sentences.append(
+            f"{len(added)} newly selected table{'' if one else 's'} ({_names_text(added)}) "
+            f"{'is' if one else 'are'} not loaded yet, so this step reads Failed until "
+            f"{'it is' if one else 'they are'} loaded.{first} Retry unfinished tables below loads "
+            f"{'it' if one else 'them'} and keeps every loaded table; Validation and Cut "
+            "over wait until then."
+        )
+    if removed:
+        one = len(removed) == 1
+        sentences.append(
+            f"{len(removed)} table{'' if one else 's'} no longer selected "
+            f"({_names_text(removed)}) {'is' if one else 'are'} left as is on Aurora DSQL "
+            f"(not dropped); this migration no longer loads or validates "
+            f"{'it' if one else 'them'}."
+        )
+        status = {c.chunk_id: c for c in job.chunks}
+        unfinished = [
+            n for n in removed
+            if n in status and (
+                status[n].status != "DONE" or (getattr(status[n], "rows_quarantined", 0) or 0)
+            )
+        ]
+        if unfinished:
+            one_u = len(unfinished) == 1
+            sentences.append(
+                f"{_names_text(unfinished)} did not fully load in the last run; as "
+                f"{'it is' if one_u else 'they are'} no longer selected, that no longer "
+                "holds this step."
+            )
+    return ("warning" if added else "info", SCOPE_NOTICE_HEADER, " ".join(sentences))
+
+
+@dataclass(frozen=True)
+class RetryScope:
+    """What a scoped retry submits: ``names`` (empty = nothing), the ``notice`` naming
+    the tables it dropped (unselected; ``notice_tone`` warning when nothing is left), and a
+    ``refusal`` (the prerequisite guard for newly selected tables) that submits nothing."""
+
+    names: "tuple[str, ...]"
+    notice: "Optional[str]" = None
+    notice_tone: str = "info"
+    refusal: "Optional[str]" = None
+    new: "tuple[str, ...]" = ()
+
+
+def retry_scope_block_reason(
+    names: "Sequence[str]",
+    scoped_ids: "Sequence[str]",
+    record_ids: "Sequence[str]",
+    guard: "Optional[Callable[[Sequence[str]], Optional[str]]]" = None,
+) -> RetryScope:
+    """Scope a retry request to the current selection (G12). Pure.
+
+    A name outside ``scoped_ids`` (no longer selected) is dropped -- left as is on Aurora
+    DSQL, never reloaded or dropped. A name outside ``record_ids`` (selected after the
+    load) needs ``guard(new)`` to be ``None``: the prerequisite checks never saw it.
+    """
+    in_scope = set(scoped_ids)
+    record = set(record_ids)
+    wanted = list(dict.fromkeys(names))
+    dropped = [n for n in wanted if n not in in_scope]
+    kept = [n for n in wanted if n in in_scope]
+    notice = None
+    if dropped:
+        one = len(dropped) == 1
+        notice = (
+            f"{_names_text(dropped)} {'is' if one else 'are'} no longer selected for this "
+            f"migration, so {'it is' if one else 'they are'} left as is on Aurora DSQL and "
+            f"not reloaded. Tick {'it' if one else 'them'} in the table list to load "
+            f"{'it' if one else 'them'} again."
+        )
+    new = [n for n in kept if n not in record]
+    refusal = None
+    if new and guard is not None:
+        reason = guard(new)
+        if reason:
+            others = [n for n in kept if n in record]
+            refusal = reason + (
+                f" Untick {_names_text(new)} in the retry list to retry the other tables now."
+                if others else ""
+            )
+    return RetryScope(
+        names=() if refusal else tuple(kept),
+        notice=notice,
+        notice_tone="warning" if dropped and not kept else "info",
+        refusal=refusal,
+        new=tuple(new),
+    )
+
+
 def format_duration(seconds: float) -> str:
     """Format a duration in seconds as a compact ``Hh Mm``/``Mm Ss``/``Ss`` string."""
     total = int(max(0, round(seconds)))
@@ -2570,6 +2822,16 @@ def exclusion_row_summary(
                 f"{'y' if n != 1 else 'ies'}. Starting is blocked until you review them.")
         return ExclusionRowSummary("blocking", text, lob_count, lob_text, lob_tone)
     if locked:
+        if drift is not None and drift.retick_columns:
+            # Full load only after a load (G12): a rule-unselected table ticked again in the
+            # tree has none of the column rules it lost; a reload would load those columns.
+            n = len(drift.retick_columns)
+            names = ", ".join(f"{t}.{c}" for t, c in drift.retick_columns[:3])
+            more = f" and {n - 3} more" if n > 3 else ""
+            text = (f"Your rules exclude {names}{more} on tables ticked again after your last "
+                    f"Save (not excluded now), so a reload would load "
+                    f"{'it' if n == 1 else 'them'} - use Change & reload")
+            return ExclusionRowSummary("drift", text, lob_count, lob_text, lob_tone)
         text = f"{counts} excluded - locked" if counts else "Nothing excluded - locked"
         return ExclusionRowSummary("locked", text, lob_count, lob_text, lob_tone)
     if drift is not None:

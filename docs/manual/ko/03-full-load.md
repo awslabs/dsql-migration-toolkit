@@ -191,6 +191,11 @@ table-fatal `ValueConversionError`는 export 중 값이 변환되는 **MySQL 소
 "실패 테이블 재시도" 경로는 실패 테이블만 대기 상태로 리셋하고, **원래 워터마크를 재사용**하며, 완료된
 테이블은 유지합니다 — 작업을 다시 하거나 CDC 핸드오프 지점을 잃지 않습니다.
 
+로드 후에 선택한 테이블(Full load only는 테이블 집합을 바꿀 수 있습니다.
+[13.7](13-excluding-tables-and-columns.md) 참고)도 같은 재시도가 로드하지만, 원래 워터마크는 그 테이블을
+포함하지 않으므로 CDC 핸드오프는 원래 집합에만 유효합니다: Re-run Full Load가 현재 집합에 대한 새
+워터마크를 잡을 때까지(또는 원래 집합으로 되돌릴 때까지) 마이그레이션 유형은 Full load only에 머뭅니다.
+
 > **명령줄에서 Full Load 실행 (선택).** 동일한 벌크 로더를 CLI 스크립트로도 쓸 수 있습니다 —
 > `scripts/run_full_load.py`(먼저 계획 출력, 그다음 `--yes`; 선택적으로 `--clean`,
 > CDC 워터마크 캡처용 `--watermark-out`) — 웹 UI 없이 자동화나 대용량 실행에 유용합니다. 자세한 내용은

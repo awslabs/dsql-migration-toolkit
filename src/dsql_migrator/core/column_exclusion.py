@@ -493,7 +493,7 @@ W5 = "W5"  # named in a kept generated column's expression
 W6 = "W6"  # named in a view definition (text match)
 # Table-exclusion findings. T1 and T4 are information; T2 and T3 are warnings.
 T1 = "T1"  # not loaded, left as is
-T2 = "T2"  # a selected child's FK skipped by the orphan check
+T2 = "T2"  # a selected child's FK, checked against the rows this table has on the target
 T3 = "T3"  # a view that reads the table
 T4 = "T4"  # column rules on it are inert
 
@@ -655,9 +655,16 @@ def table_exclusion_findings(
         T1, "Not loaded by this migration; left as is on Aurora DSQL (not dropped).")]
     labels = sorted({label for refs in ctx.fk_referenced.get(table_name, {}).values()
                      for label in refs})
+    # Not a promise that the key is skipped: the orphan check reads the rows this table HAS
+    # on Aurora DSQL -- e.g. rows an earlier Full Load left there (Full load only can
+    # unselect a loaded table, G12) satisfy it, and a table absent from the target fails
+    # the check (the key is not applied).
     found.extend(ExclusionFinding(T2, (
-        f"{label} will be skipped by the orphan check when foreign keys are applied (Data "
-        "Migration for Full load only; Cut over for CDC).")) for label in labels)
+        f"{label} references it. When foreign keys are applied (Data Migration for Full "
+        "load only; Cut over for CDC), that key is checked against the rows this table has "
+        "on Aurora DSQL: applied if every referenced row is there, skipped by the orphan "
+        "check if one is missing, and not applied if the table is not on Aurora DSQL."))
+        for label in labels)
     found.extend(ExclusionFinding(T3, f"View {view} will return no rows.")
                  for view in _views_reading(table_name, ctx))
     found.append(ExclusionFinding(

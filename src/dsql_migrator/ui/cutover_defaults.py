@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import Any, Callable, Collection, Mapping, Optional, Sequence
 
 from dsql_migrator.core.overlay_ledger import (
     LedgerDecision,
@@ -42,6 +42,14 @@ CUTOVER_DEFAULTS_TTL_SECONDS = 60.0
 NOT_EXCLUDED_REASON = (
     "DEFAULT {o} was dropped while this column was excluded; it is no longer excluded, "
     "so restoring it is your decision."
+)
+# A ledger table outside the migration's current selection (Full load only can unselect a
+# loaded table, G12; or an earlier migration's table on the same target): never restored
+# automatically -- the migration no longer owns its DDL.
+NOT_SELECTED_REASON = (
+    "DEFAULT {o} was dropped while this column was excluded; its table is no longer "
+    "selected for this migration (left as is on Aurora DSQL), so restoring it is your "
+    "decision."
 )
 NOT_EXECUTABLE_REASON = (
     "DEFAULT {o} is not a single expression, so the tool does not run it; run the "
@@ -240,6 +248,7 @@ def classify_cutover_defaults(
     *,
     current_ddls: "Optional[Mapping[str, str]]",
     still_excluded: "Mapping[str, Sequence[str]]",
+    selected_tables: "Optional[Collection[str]]" = None,
 ) -> "tuple[tuple[CutoverDefaultItem, ...], tuple[str, ...]]":
     """``(items, nullable)`` for the recorded columns. Pure (no I/O, no NiceGUI).
 
@@ -248,8 +257,11 @@ def classify_cutover_defaults(
     recorded original live is ``done``; any other DEFAULT is ``diverged`` (never
     overwritten). A pending column is restored automatically only while it is still
     excluded, its original is a single expression, and (A) or (B) holds; every other
-    pending column is a manual decision with a one-line reason.
+    pending column is a manual decision with a one-line reason. ``selected_tables`` (the
+    migration's current selection; ``None`` = every table, as before) makes a pending
+    column of a table outside it manual (``NOT_SELECTED_REASON``).
     """
+    selected = None if selected_tables is None else set(selected_tables)
     items: list[CutoverDefaultItem] = []
     nullable: list[str] = []
     for table in sorted(ledger_tables):
@@ -282,7 +294,9 @@ def classify_cutover_defaults(
             auto = False
             reason: Optional[str] = None
             if status == "pending":
-                if column not in excluded:
+                if selected is not None and table not in selected:
+                    reason = NOT_SELECTED_REASON.format(o=o)
+                elif column not in excluded:
                     reason = NOT_EXCLUDED_REASON.format(o=o)
                 elif _auto_ok(entry, table, column, current_ddls):
                     auto = executable
@@ -322,6 +336,8 @@ def read_cutover_defaults(
     current_ddls: "Callable[[], Optional[Mapping[str, str]]]",
     still_excluded: "Callable[[], Mapping[str, Sequence[str]]]",
     on_record_found: "Optional[Callable[[], None]]" = None,
+    # The migration's current table selection (None/empty from it: every table, as before).
+    selected_tables: "Optional[Callable[[], Optional[Collection[str]]]]" = None,
     fill_key: Any = None,
     generation: int = 0,
     now: "Optional[Callable[[], datetime]]" = None,
@@ -374,8 +390,13 @@ def read_cutover_defaults(
             excluded = still_excluded() or {}
         except Exception:  # noqa: BLE001 - nothing counts as still excluded: nothing auto
             excluded = {}
+        try:
+            selected = selected_tables() if selected_tables is not None else None
+        except Exception:  # noqa: BLE001 - unknown selection: every table, as before
+            selected = None
         items, nullable = classify_cutover_defaults(
-            {t: tables[t] for t in columns}, facts, current_ddls=ddls, still_excluded=excluded
+            {t: tables[t] for t in columns}, facts, current_ddls=ddls, still_excluded=excluded,
+            selected_tables=selected or None,
         )
         return _snap("loaded", items, nullable)
     except Exception as exc:  # noqa: BLE001 - the fill never raises
@@ -531,6 +552,7 @@ __all__ = [
     "CutoverRestoreOutcome",
     "MANUAL_REASONS",
     "NOT_EXCLUDED_REASON",
+    "NOT_SELECTED_REASON",
     "classify_cutover_defaults",
     "cutover_settle_probe",
     "read_cutover_defaults",

@@ -41,9 +41,15 @@ from dsql_migrator.ui.workflow import WorkflowStep, with_status
 from dsql_migrator.ui.data_migration._full_load_engine import (
     full_load_progress_caption,
     job_status_to_step_status,
+    sync_identity_sequences_for_tables,
 )
 from dsql_migrator.ui.data_migration._models import (
     session_source_type,
+    SCOPE_ADDED_REASON,
+    full_load_scope_names,
+    scope_change,
+    scope_full_load_job,
+    scope_notice,
     FullLoadCompleteness,
     FullLoadTableRow,
     _LOAD_STATE_ORDER,
@@ -492,6 +498,23 @@ def _render_full_load_step(
     and the applied conversions, which the caller owns; the confirm dialog discloses
     whichever of them the current action covers.
     """
+    # G12: in Full load only the table set can change after the load. Every chunk-driven
+    # read below follows the CURRENT selection through a scoped view of the record (the
+    # record itself whenever nothing changed); the watermark and the error-log download
+    # keep the real record.
+    _record_job = job
+
+    def _scoped(record):
+        if record is None or getattr(record, "status", None) in ("PENDING", "RUNNING"):
+            # Never scoped (scope_full_load_job returns it as is): skip the predicate's job
+            # read, which every running-poll tick would otherwise pay for nothing.
+            return record
+        return scope_full_load_job(
+            record, full_load_scope_names(migration_state, job_manager, selected_names)
+        )
+
+    job = _scoped(job)
+    _added, _removed = scope_change(_record_job, job)
     ui.label("Workloads to migrate").classes("text-sm font-semibold")
     ui.label(format_selected_workloads(selected_names)).classes(
         "text-sm text-gray-600"
@@ -1176,9 +1199,14 @@ def _render_full_load_step(
 
     @ui.refreshable
     def _live_detail() -> None:
-        current = _current_job(job_manager, migration_state.job_id)
-        if current is None:
+        record = _current_job(job_manager, migration_state.job_id)
+        if record is None:
             return
+        current = _scoped(record)
+        _tables = _view_tables(record, current)
+        # A set for the per-record membership test below (the error log can hold a record
+        # per quarantined row, across every table).
+        _table_set = None if _tables is None else set(_tables)
         running = current.status in ("PENDING", "RUNNING")
         if running:
             ui.label(full_load_progress_caption(current)).classes(
@@ -1210,16 +1238,18 @@ def _render_full_load_step(
             # merely present (now the case after the v0.1.414 source-endpoint restore).
             connections_ready=session.connection_ready(),
             quarantine_only=_incomplete_is_quarantine_only(
-                current, migration_state.error_log
+                current, migration_state.error_log, _tables
             ),
             # EVERY dropped row, not one per table: ``latest_messages()`` keeps only the
             # last message per table, so a table that dropped 3 rows listed exactly 1 --
-            # and the count above it disagreed with the list below.
+            # and the count above it disagreed with the list below. Only the tables the
+            # view shows: a table no longer selected is never offered a Reload.
             quarantine_records=[
-                (str(record.table), str(record.message))
-                for record in full_load_error_records_for(
+                (str(rec.table), str(rec.message))
+                for rec in full_load_error_records_for(
                     migration_state.error_log, current
                 )
+                if _table_set is None or str(rec.table) in _table_set
             ],
             ai_error_opener=ai_error_opener,
             page_state=_progress_page,
@@ -1228,7 +1258,7 @@ def _render_full_load_step(
         # accept button: sitting immediately below "Accept quarantined rows & continue" it
         # read as that decision's secondary option, when it is just a way to take the same
         # per-row information away with you.
-        _render_error_log(ui, migration_state, current)
+        _render_error_log(ui, migration_state, record)
         # The completeness baseline (expected_rows) comes from the watermark's
         # per-table counts, which are scan-free information_schema ESTIMATES
         # (row_counts_approximate) -- not exact. So a "row-count mismatch" against
@@ -1248,7 +1278,7 @@ def _render_full_load_step(
         _render_accept_quarantine_action(
             ui,
             quarantine_only=_incomplete_is_quarantine_only(
-                current, migration_state.error_log
+                current, migration_state.error_log, _tables
             ),
             terminal=current.status in ("DONE", "FAILED", "CANCELLED"),
             quarantine_accepted=migration_state.accept_quarantined_rows,
@@ -1269,6 +1299,7 @@ def _render_full_load_step(
             running=fk_running,
             progress=_call_or(foreign_keys_progress, None),
             cancel_foreign_keys=cancel_foreign_keys,
+            scope_changed=bool(getattr(migration_state, "fk_result_scope_changed", False)),
         )
         # The FK pass is its OWN job and runs entirely AFTER the load is terminal, so gating
         # the poll on the load alone left nothing to re-arm it: the card could not advance
@@ -1280,6 +1311,43 @@ def _render_full_load_step(
             # once=True avoids the "parent slot deleted" crash a repeating timer
             # hits when its slot is rebuilt.
             ui.timer(_POLL_INTERVAL_SECONDS, _poll_live, once=True)
+
+    def _poll_scoped(current) -> bool:
+        """The terminal poll for a Full load only set changed after the load (G12): the
+        CURRENT set decides (:func:`full_load_step_for_scope`), e.g. a DONE retry with a
+        selected table still not loaded is not a DONE step. Writes the step, refreshes and
+        returns True; False (an unchanged set) leaves the poll's own mapping to run."""
+        view = _scoped(current)
+        if view is current:
+            return False
+        derived = full_load_step_for_scope(
+            current,
+            view,
+            accepted=bool(getattr(migration_state, "accept_quarantined_rows", False)),
+            error_log=migration_state.error_log,
+        )
+        if derived is None:
+            return False
+        if derived is StepStatus.DONE:
+            migration_state.clear_outputs()  # any failure lies in unselected tables
+            if current.status != "DONE":
+                # This run's finalize skipped the identity sync (it was incomplete).
+                submit_scope_identity_sync(job_manager, session, view)
+        elif current.status != "DONE":
+            migration_state.set_error(
+                job_manager.get_error(migration_state.job_id) or "Data migration failed."
+            )
+        # A DONE job with a selected table not loaded yet records no error: nothing
+        # failed, and the scope notice says what is left.
+        session.set_workflow(  # type: ignore[attr-defined]
+            with_status(
+                session.workflow,  # type: ignore[attr-defined]
+                WorkflowStep.FULL_LOAD,
+                derived,
+            )
+        )
+        refresh()
+        return True
 
     def _poll_live() -> None:
         """Poll the job: refresh only the live region while running; on a terminal
@@ -1333,6 +1401,8 @@ def _render_full_load_step(
         # drops the same rows again. Honour the decision here, exactly as the finaliser and
         # the panel already do. Still gated on quarantine-ONLY, so a real retryable failure
         # is never waved through by a stale flag.
+        if _poll_scoped(current):  # G12: a changed Full load only set decides itself
+            return
         if (
             mapped is StepStatus.FAILED
             and getattr(migration_state, "accept_quarantined_rows", False)
@@ -1358,6 +1428,14 @@ def _render_full_load_step(
         # they click "Continue to CDC". refresh() flips the buttons (Re-run /
         # enable Continue) without changing the active sub-step.
         refresh()
+
+    # The scope notice (G12), right under the workloads it describes and above the Start /
+    # recovery actions: which selected tables are not loaded yet, which are left as is.
+    # A run guard (the prerequisite checks a newly selected table never had) is named first:
+    # Retry unfinished tables refuses the newly selected tables until it clears.
+    _notice = scope_notice(_record_job, job, blocked_by=guard_reason if _added else None)
+    if _notice is not None and status is not StepStatus.IN_PROGRESS:
+        render_notice(ui, tone=_notice[0], header=_notice[1], body=_notice[2])
 
     if status is StepStatus.IN_PROGRESS:
         stopping = False
@@ -1456,7 +1534,7 @@ def _render_full_load_step(
         # way, because order within the parent does not affect what the poll rebuilds.
         _render_watermark(
             ui,
-            job,
+            _record_job,
             session_source_type(session),
         )
 
@@ -1476,9 +1554,17 @@ def _render_full_load_step(
             # incompleteness is rows that can never load. Any REAL failure still shows
             # it: that is a retryable error whose exact text matters.
             _quarantine_only_error = _incomplete_is_quarantine_only(
-                job, migration_state.error_log
+                job, migration_state.error_log, _view_tables(_record_job, job)
             )
-            if job_error and not _quarantine_only_error:
+            # After a Full load only set change (G12) the job's error can belong to a
+            # table no longer selected: when the current set is complete, no red box.
+            _scope_clears_error = job is not _record_job and full_load_step_for_scope(
+                _record_job,
+                job,
+                accepted=bool(getattr(migration_state, "accept_quarantined_rows", False)),
+                error_log=migration_state.error_log,
+            ) is StepStatus.DONE
+            if job_error and not _quarantine_only_error and not _scope_clears_error:
                 render_notice(
                     ui,
                     tone="error",
@@ -1574,6 +1660,13 @@ def _render_full_load_step(
                         msg = _failure_reasons.get(name, "")
                         if msg:
                             return msg
+                        if name in _added:
+                            # With a run guard the Confirm refuses it: say so on its row.
+                            return (
+                                f"{SCOPE_ADDED_REASON} {guard_reason}"
+                                if guard_reason
+                                else SCOPE_ADDED_REASON
+                            )
                         if name in _pending_names:
                             return "Not loaded yet — the previous run ended first."
                         return ""
@@ -1598,9 +1691,27 @@ def _render_full_load_step(
                         on_click=_confirm_retry_failed,
                         icon="replay",
                     ).props("color=primary")
+                    # Every unfinished table selected after the load: with a run guard the
+                    # click is CERTAIN to be refused (the same guard runs at the click), so
+                    # the button is disabled with it, as Re-run all tables is.
+                    _only_added = bool(_added) and set(failed) <= set(_added)
                     if connections_missing:
                         retry_btn.disable()
                         retry_btn.tooltip(reconnect_tip)
+                    elif _only_added and guard_reason:
+                        retry_btn.disable()
+                        retry_btn.tooltip(guard_reason)
+                    elif _added and guard_reason:
+                        # Mixed: the click refuses the newly selected tables (with this
+                        # reason); unticking them in the checklist retries the others.
+                        retry_btn.tooltip(guard_reason)
+                    elif _added:
+                        retry_btn.tooltip(
+                            f"Recommended: load only the {len(failed)} unfinished "
+                            "table(s) (failed, not reached, or selected after the last "
+                            f"run); the {done_count} loaded table(s) are kept as-is (no "
+                            "re-load, no new snapshot)."
+                        )
                     else:
                         retry_btn.tooltip(
                             f"Recommended: re-run Full Load for only the "
@@ -1614,9 +1725,13 @@ def _render_full_load_step(
                 # so a table that loaded CLEANLY but has to be re-loaded -- the normal
                 # case after re-applying ONE table's schema on the Schema Conversion
                 # step, which drops and recreates it EMPTY -- had no control. The table
-                # picker is locked once a load has run, so the only escape was a full
+                # picker is locked once a load has run (Full load only excepted: there the
+                # set can change, but re-ticking a loaded table does not reload it), so
+                # the only escape was a full
                 # "Re-run Full Load" over every table (a whole-source re-read) or Start
                 # over (discarding Evaluation, the conversion edits and the CDC inputs).
+                # Only SELECTED tables are offered (``job`` is the scoped view): a table
+                # no longer selected is left as is on Aurora DSQL.
                 #
                 # The engine already supports the scoped run (the same retry path the
                 # quarantine Reload uses, which keeps the ORIGINAL watermark so a later
@@ -1698,7 +1813,9 @@ _LOAD_STATE_COLORS: dict[str, str] = {
 }
 
 
-def _quarantined_row_count(job: "MigrationJob", error_log: "ErrorLogStore") -> int:
+def _quarantined_row_count(
+    job: "MigrationJob", error_log: "ErrorLogStore", tables: "Optional[Sequence[str]]" = None
+) -> int:
     """Count permanently-quarantined rows for ``job``.
 
     Prefers the count recorded on the JOB's chunks, because that is what survives an app
@@ -1711,7 +1828,8 @@ def _quarantined_row_count(job: "MigrationJob", error_log: "ErrorLogStore") -> i
     Start over.
 
     Falls back to counting the log's ``quarantined row pk[...]`` entries so a job written
-    by an older version (no per-chunk count) still works.
+    by an older version (no per-chunk count) still works. ``tables`` (a scoped view of the
+    record, G12) limits that fallback to those tables; ``None`` counts every record.
     """
     if job is None:
         return 0
@@ -1720,15 +1838,17 @@ def _quarantined_row_count(job: "MigrationJob", error_log: "ErrorLogStore") -> i
     )
     if from_chunks:
         return from_chunks
+    wanted = None if tables is None else set(tables)
     return sum(
         1
         for record in error_log.records(job.job_id)
         if str(getattr(record, "message", "")).startswith("quarantined row pk[")
+        and (wanted is None or str(getattr(record, "table", "")) in wanted)
     )
 
 
 def _incomplete_is_quarantine_only(
-    job: "MigrationJob", error_log: "ErrorLogStore"
+    job: "MigrationJob", error_log: "ErrorLogStore", tables: "Optional[Sequence[str]]" = None
 ) -> bool:
     """True when a run's only incompleteness is quarantined rows (overridable).
 
@@ -1742,7 +1862,82 @@ def _incomplete_is_quarantine_only(
         return False
     if unsettled_table_names(job):  # retryable/unfinished work is present
         return False
-    return _quarantined_row_count(job, error_log) > 0
+    return _quarantined_row_count(job, error_log, tables) > 0
+
+
+def submit_scope_identity_sync(job_manager, session, view) -> bool:
+    """Submit the identity-sequence sync a failed or cancelled run skipped, once its step
+    turns DONE because its unfinished work lies only in tables no longer selected (Full load
+    only, G12). Returns True when a job was submitted.
+
+    ``_finalize_run`` syncs only a complete run, so -- exactly as for an accepted
+    quarantine gap -- a GENERATED BY DEFAULT identity key would stay at its start value
+    and the app's first insert after cut-over collide (23505). The same background sync
+    (a target write, never on the render thread) over the LOADED tables of the current
+    set: a table no longer selected is left as is.
+    """
+    target_config = getattr(session, "target_config", None)
+    names = [c.chunk_id for c in getattr(view, "chunks", None) or () if c.status == "DONE"]
+    if target_config is None or not names or job_manager is None:
+        return False
+    profile = getattr(session, "aws_profile", None)
+
+    def _sync_after_scope(_handle) -> None:
+        sync_identity_sequences_for_tables(target_config, names, aws_profile=profile)
+
+    job_manager.submit(_sync_after_scope)
+    return True
+
+
+def _view_tables(job, view) -> "Optional[list[str]]":
+    """The table filter for a scoped view's error-log reads: ``None`` for the record."""
+    if view is job or view is None:
+        return None
+    return [c.chunk_id for c in view.chunks]
+
+
+def full_load_step_for_scope(
+    job, scoped, *, accepted: bool, error_log
+) -> "Optional[StepStatus]":
+    """The Data Migration step status the CURRENT table set earns (G12). Pure.
+
+    For an unchanged set (``scoped is job``) this is exactly the live poll's mapping: the
+    job's status, with an accepted quarantine-only gap counting as DONE. After a set
+    change in Full load only, the view decides instead: a selected table not loaded
+    (unsettled) or an unaccepted quarantine in it is FAILED; a DONE job is DONE; a failed
+    or cancelled job is DONE only when its unfinished work lies entirely in tables no
+    longer selected -- a run-level failure or a cancel with every chunk loaded stays
+    FAILED. ``None`` while the job runs.
+    """
+    if job is None or job.status in ("PENDING", "RUNNING"):
+        return None
+    mapped = job_status_to_step_status(job.status)
+    if mapped is None:
+        return None
+    if (
+        mapped is StepStatus.FAILED
+        and accepted
+        and _incomplete_is_quarantine_only(job, error_log)
+    ):
+        mapped = StepStatus.DONE
+    if scoped is job or scoped is None:
+        return mapped
+    if unsettled_table_names(scoped):
+        return StepStatus.FAILED
+    if not accepted and _quarantined_row_count(
+        scoped, error_log, _view_tables(job, scoped)
+    ) > 0:
+        return StepStatus.FAILED
+    if job.status == "DONE":
+        return StepStatus.DONE
+    view = {c.chunk_id for c in scoped.chunks}
+    if any(
+        c.status != "DONE" or (getattr(c, "rows_quarantined", 0) or 0) > 0
+        for c in job.chunks
+        if c.chunk_id not in view
+    ):
+        return StepStatus.DONE
+    return mapped
 
 
 def _format_progress_cell(row: "FullLoadTableRow") -> str:
@@ -2535,8 +2730,13 @@ def _render_foreign_key_action(
     running: bool = False,
     progress: Optional[tuple] = None,
     cancel_foreign_keys=None,
+    scope_changed: bool = False,
 ) -> None:
     """Render the explicit "Apply foreign keys" action, and its outstanding state.
+
+    ``scope_changed`` (``fk_result_scope_changed``): the previous result was voided by a
+    table-set change (Full load only, G12), so the outstanding notice says to apply again
+    for the changed set rather than that the keys were never applied.
 
     Foreign keys used to be applied as the last act of the load. The orphan pre-check that
     gates each one is O(child rows) -- measured 28.0 min serial / 7.9 min at 8-way for 15
@@ -2641,7 +2841,20 @@ def _render_foreign_key_action(
         # the operator who clicked Stop with no way back other than Start over.
     elif not (terminal and pending and apply_foreign_keys is not None):
         return
-    if applied is None:
+    if applied is None and scope_changed:
+        # The result was voided by a table-set change (Full load only, G12): the keys it
+        # applied still exist, so the never-applied copy below would misstate the target.
+        render_notice(
+            ui, tone="warning",
+            header="Foreign keys: apply again for the changed table set",
+            body=(
+                "The table set changed after foreign keys were applied. Apply again to "
+                "cover the current set: keys already in place are kept (re-applying one is "
+                "a no-op), but the pass re-checks every key, and each check reads the whole "
+                "child table."
+            ),
+        )
+    elif applied is None:
         render_notice(
             ui, tone="warning",
             header=f"{pending} foreign key(s) not yet applied",

@@ -2374,6 +2374,8 @@ def _render_cdc_start_button(
     #   * CDC-only (no Full Load) -> the CDC clause is the only one, and deleting the
     #     infrastructure genuinely does release it.
     # So mirror selection_lock_reason's own precedence rather than assuming one exit.
+    # (Full load only lifts the Full Load clause when no CDC stack exists, G12 -- but it
+    # has no CDC sub-step, so this card never renders for it.)
     full_load_ran = _full_load_committed(job, migration_state)
     started_before = bool(getattr(migration_state, "cdc_connector_names", None))
     if started_before:
@@ -4956,6 +4958,9 @@ def _full_load_committed(job, migration_state) -> bool:
     inferred. Deliberately conservative: when unsure this returns False, which offers
     the cheaper (delete-and-redeploy) remedy -- wrong-but-recoverable, versus sending
     someone to Start over who did not need it.
+
+    Full load only lifts that clause when no CDC stack exists (G12), but it has no CDC
+    sub-step, so none of the notices this feeds ever renders for it.
     """
     from dsql_migrator.ui.data_migration._models import substeps_for_type
 
@@ -6646,6 +6651,11 @@ from dsql_migrator.ui.data_migration._cdc_monitoring import (  # noqa: E402,F401
     exclusion_lock_state,
     change_and_reload_block_reason,
     fk_apply_running,
+    table_set_editable_after_load,
+    table_set_wait_reason,
+    TABLE_SET_WAIT_LOAD,
+    TABLE_SET_WAIT_FK,
+    TABLE_SET_WAIT_RESTORE,
     capture_error_with_remedy,
     cdc_stack_being_deleted,
     cdc_delete_eta,

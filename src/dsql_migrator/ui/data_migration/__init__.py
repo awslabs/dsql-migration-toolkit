@@ -217,6 +217,15 @@ from dsql_migrator.ui.data_migration._models import (
     quarantined_rows_by_table,
     recreated_unfinished,
     unsettled_table_names,
+    full_load_scope_names,
+    scope_full_load_job,
+    scope_change,
+    watermark_coverage_gap,
+    coverage_lock_reason,
+    COVERAGE_GAP_NOTICE_BODY,
+    COVERAGE_GAP_NOTICE_PG_SUFFIX,
+    added_since_run_reason,
+    retry_scope_block_reason,
     format_duration,
     format_table_timing,
     FullLoadCompleteness,
@@ -518,11 +527,77 @@ def build_data_migration_screen(
         ),
     )
     _exclusion_row: dict = {}
+    # The tree's filter text, kept across a page refresh (a Full load only tick after a
+    # load refreshes the page, G12).
+    _tree_filter_state: dict = {}
 
     def _refresh_exclusion_row() -> None:
         row = _exclusion_row.get("row")
         if row is not None:
             row.refresh()
+
+    def _sync_scope_step(status_now: Optional[StepStatus] = None) -> Optional[StepStatus]:
+        """Re-derive the Data Migration step from the CURRENT table set (G12); returns the
+        status it wrote, else ``None``. ``status_now`` is the caller's current step (read
+        from the workflow when omitted).
+
+        Only in Full load only, while the set may change after a load
+        (:func:`table_set_editable_after_load`), with a terminal job, a DONE/FAILED step and
+        a touched selection. Writes only on a difference, so a steady render writes
+        nothing: a newly selected (unloaded) table makes the step FAILED -- Validation
+        locks until it is loaded -- and unselecting the only failed tables makes it DONE.
+        No I/O on the render thread; a failed or cancelled run turning DONE submits the
+        background identity-sequence sync its finalize skipped
+        (:func:`submit_scope_identity_sync`).
+        """
+        if migration_state.migration_type is not MigrationType.FULL_LOAD_ONLY:
+            return None
+        if not table_set_editable_after_load(migration_state, job_manager):
+            return None
+        record = _current_job(job_manager, migration_state.job_id)
+        if record is None or record.status in ("PENDING", "RUNNING"):
+            return None
+        if status_now is None:
+            status_now = get_status(session.workflow, WorkflowStep.FULL_LOAD)
+        if status_now not in (StepStatus.DONE, StepStatus.FAILED):
+            return None
+        inventory_now = _inventory()
+        if inventory_now is None:
+            return None
+        names = full_load_scope_names(
+            migration_state,
+            job_manager,
+            resolve_migration_selection(
+                inventory_now, conv_state, migration_state, _target_inventory()
+            ),
+        )
+        if names is None:
+            return None
+        view = scope_full_load_job(record, names)
+        derived = full_load_step_for_scope(
+            record,
+            view,
+            accepted=bool(migration_state.accept_quarantined_rows),
+            error_log=migration_state.error_log,
+        )
+        if derived is None or derived is status_now:
+            return None
+        if derived is StepStatus.DONE:
+            # The failure it showed belongs to tables no longer selected.
+            migration_state.clear_outputs()
+            if record.status != "DONE":
+                # A failed / cancelled run's finalize skipped the identity sync (the run
+                # was incomplete), as an accepted quarantine gap does: submit it now, over
+                # the current set's loaded tables (once per flip: this writes on a change).
+                submit_scope_identity_sync(job_manager, session, view)
+        elif record.status != "DONE":
+            migration_state.set_error(
+                job_manager.get_error(migration_state.job_id) or "Data migration failed."
+            )
+        session.set_workflow(
+            with_status(session.workflow, WorkflowStep.FULL_LOAD, derived)
+        )
+        return derived
 
     def _on_tree_selection_change(chosen) -> None:
         # A rule-excluded table ticked again is a deliberate override (named by the
@@ -536,6 +611,21 @@ def build_data_migration_screen(
             except Exception:  # noqa: BLE001 - an already-fired one-shot
                 pass
         _exclusion_row["timer"] = ui.timer(0.3, _refresh_exclusion_row, once=True)
+        if not table_set_editable_after_load(migration_state, job_manager):
+            return
+        # G12: after a Full load only load, a tick changes what the Full Load card, the
+        # nav badge and the type tiles show: sync the step now and refresh the page once
+        # the ticks settle (coalesced: a burst costs one render).
+        _sync_scope_step()
+        page_timer = _exclusion_row.get("page_timer")
+        if page_timer is not None:
+            try:
+                page_timer.cancel()
+            except Exception:  # noqa: BLE001 - an already-fired one-shot
+                pass
+        _exclusion_row["page_timer"] = ui.timer(
+            0.8, lambda: _exclusion_ctx.refresh(), once=True
+        )
 
     def _assessment():
         """The Step 1 (Evaluation) compatibility report, or None if it hasn't run."""
@@ -754,7 +844,14 @@ def build_data_migration_screen(
     def content(refresh: Callable[[], None]) -> None:
         migration_type = migration_state.migration_type
         prereq_mode = prereq_mode_for_type(migration_type)
-        _exclusion_ctx.refresh = refresh
+
+        def _refresh_after_save() -> None:
+            # A popup Save can change the table set (G12): the nav badge follows on the
+            # same refresh.
+            _sync_scope_step()
+            refresh()
+
+        _exclusion_ctx.refresh = _refresh_after_save
         _exclusion_ctx.capture_tables_fn = (
             None if migration_type is MigrationType.FULL_LOAD_ONLY else _exclusion_capture_tables
         )
@@ -804,6 +901,10 @@ def build_data_migration_screen(
                 with_status(session.workflow, WorkflowStep.FULL_LOAD, promoted)
             )
             status = promoted
+        # Full load only after a table-set change (G12): the step follows the CURRENT set
+        # (a newly selected table not loaded yet -> FAILED; only unselected tables
+        # unfinished -> DONE). A no-op whenever nothing changed.
+        status = _sync_scope_step(status) or status
         # The Full Load PHASE (what the Full Load surfaces show), apart from the shared
         # step a streaming CDC-only run promoted; ``status`` keeps gating and writes.
         full_load_phase = full_load_phase_status(status, full_load_ran=migration_state.job_id is not None)
@@ -1440,11 +1541,34 @@ def build_data_migration_screen(
                         _target_inventory(),
                         conv_state.ticked_node_ids,
                     ),
-                    on_refresh=refresh_browser,
+                    # Refresh objects stays hidden once a Full Load job exists, as it
+                    # always was: Full load only can now change the set after a load
+                    # (G12), but re-introspecting would change the inventory every
+                    # loaded table, Validation and the exclusions are judged against.
+                    on_refresh=refresh_browser if job is None else None,
                     locked=selection_locked,
                     lock_reason=selection_lock,
                     locked_selection=locked_selection,
                     on_selection_change=_on_tree_selection_change,
+                    # Re-checked at the click (another tab may have started a load), and
+                    # the stored set re-ticked by a page refresh if it refuses.
+                    lock_check=(
+                        (lambda: table_set_lock_reason(migration_state, job_manager, session))
+                        if job is not None
+                        else None
+                    ),
+                    on_locked=refresh,
+                    hint=(
+                        "A Full Load has run. A table you untick is left as is on Aurora "
+                        "DSQL (not dropped); a table you tick that is not loaded yet is "
+                        "loaded with Retry unfinished tables on the Full Load step (one "
+                        "already loaded is kept as is)."
+                        if job is not None
+                        and not selection_locked
+                        and table_set_editable_after_load(migration_state, job_manager)
+                        else None
+                    ),
+                    filter_state=_tree_filter_state,
                 )
                 # Exclude tables & columns: the one home for every migration type, right
                 # under the tree it edits (a local refreshable the tree ticks refresh).
@@ -1464,7 +1588,9 @@ def build_data_migration_screen(
             # picker was explicitly changed away from that "too early and a dead end"
             # behavior). The exclusion is baked only once a Full Load has run, CDC is
             # streaming, or the CDC stack (with its column.exclude.list) is deployed
-            # -- exactly ``selection_locked``. A change made after the checks ran but
+            # -- exactly ``selection_locked``, with one exception: in Full load only the
+            # TABLE set stays editable after a load (G12) while the column exclusions stay
+            # locked (``exclusion_lock_state``). A change made after the checks ran but
             # before the load is caught at the Run button (see
             # ``full_load_run_guard_reason``), so a stale PASS never starts a load
             # against an unchecked column set. The lock is silent: the greyed picker
@@ -1507,12 +1633,26 @@ def build_data_migration_screen(
                 migration_state, job_manager, session, inventory,
                 capture=_pre_load_capture_now,
             )
+            # Full load only after a set change (G12): the tables selected since the load
+            # are not vouched for by its prerequisite pass.
+            _scope_added = (
+                scope_change(
+                    job,
+                    scope_full_load_job(
+                        job,
+                        full_load_scope_names(migration_state, job_manager, selected_names),
+                    ),
+                )[0]
+                if migration_type is MigrationType.FULL_LOAD_ONLY
+                else []
+            )
             guard_reason = full_load_run_guard_reason(
                 migration_state,
                 inventory,
                 prereq_mode=prereq_mode,
                 has_run=job is not None or status is StepStatus.DONE,
                 exclusion_block=_exclusion_block,
+                added_since_run=_scope_added,
             )
             active = resolve_active_substep_for_type(
                 migration_state.active_substep,
@@ -1643,6 +1783,57 @@ def build_data_migration_screen(
                         position="top",
                     )
                     return
+                # G12: after a Full load only set change the retry follows the CURRENT
+                # selection -- a table no longer selected is left as is (never reloaded or
+                # dropped), and a table selected since needs its prerequisite checks. An
+                # unchanged set (and every CDC type) is the record itself: today's path.
+                _selected_now = resolve_migration_selection(
+                    inventory, conv_state, migration_state, _target_inventory()
+                )
+                if (
+                    not _selected_now
+                    and migration_state.migration_type is MigrationType.FULL_LOAD_ONLY
+                    and migration_state.selection_touched
+                    and table_set_editable_after_load(migration_state, job_manager)
+                ):
+                    # Every table unticked after the load: nothing is selected, so nothing
+                    # may be reloaded (the tables are left as is).
+                    ui.notify(
+                        "No table is selected for this migration. Tick the tables to load "
+                        "in the table list first.",
+                        type="warning",
+                        position="top",
+                    )
+                    return
+                _scoped_view = scope_full_load_job(
+                    current,
+                    full_load_scope_names(migration_state, job_manager, _selected_now),
+                )
+                _run_table_names: Optional[list[str]] = None
+                if _scoped_view is not current:
+                    _decision = retry_scope_block_reason(
+                        names,
+                        [c.chunk_id for c in _scoped_view.chunks],
+                        [c.chunk_id for c in current.chunks],
+                        lambda new: retry_added_tables_guard(
+                            migration_state, job_manager, session, inventory, new
+                        ),
+                    )
+                    if _decision.refusal:
+                        ui.notify(
+                            _decision.refusal, type="warning", position="top",
+                            multi_line=True,
+                        )
+                        return
+                    if _decision.notice:
+                        ui.notify(
+                            _decision.notice, type=_decision.notice_tone,
+                            position="top", multi_line=True,
+                        )
+                    names = list(_decision.names)
+                    if not names:
+                        return
+                    _run_table_names = [c.chunk_id for c in _scoped_view.chunks]
                 if not session.has_source() or not session.has_target():
                     migration_state.set_error(
                         "Configure and test the source and target connections "
@@ -1777,6 +1968,7 @@ def build_data_migration_screen(
                         prior_table_error_job_ids=prior_error_owners,
                         prior_recreated_tables=prior_recreated,
                         inputs=retry_inputs,
+                        run_table_names=_run_table_names,
                     )
 
                 reset_stale_manual_start_point(
@@ -1803,7 +1995,18 @@ def build_data_migration_screen(
                 current = _current_job(job_manager, migration_state.job_id)
                 if current is None:
                     return
-                _run_retry_for(unsettled_table_names(current))
+                # The CURRENT set's unfinished tables (G12): a table no longer selected is
+                # not retried; one selected since the load is (scope_full_load_job).
+                _run_retry_for(unsettled_table_names(scope_full_load_job(
+                    current,
+                    full_load_scope_names(
+                        migration_state,
+                        job_manager,
+                        resolve_migration_selection(
+                            inventory, conv_state, migration_state, _target_inventory()
+                        ),
+                    ),
+                )))
 
             def reload_table(table_name: str) -> None:
                 # Per-table Reload: re-run Full Load for exactly one table (even a
@@ -2082,13 +2285,26 @@ def build_data_migration_screen(
                 # Only valid when the incompleteness is quarantine-only (no retryable
                 # failures). Marks the step DONE, records the acceptance, and keeps
                 # the flag so any later re-run also completes.
-                current = _current_job(job_manager, migration_state.job_id)
+                record = _current_job(job_manager, migration_state.job_id)
+                # Judged and counted over the CURRENT set (G12): a table no longer selected
+                # neither blocks the acceptance nor adds to the gap accepted.
+                current = scope_full_load_job(
+                    record,
+                    full_load_scope_names(
+                        migration_state,
+                        job_manager,
+                        resolve_migration_selection(
+                            inventory, conv_state, migration_state, _target_inventory()
+                        ),
+                    ),
+                )
+                _accept_tables = _view_tables(record, current)
                 if current is None or not _incomplete_is_quarantine_only(
-                    current, migration_state.error_log
+                    current, migration_state.error_log, _accept_tables
                 ):
                     return
                 quarantined = _quarantined_row_count(
-                    current, migration_state.error_log
+                    current, migration_state.error_log, _accept_tables
                 )
                 # Record WHAT was accepted, not just that something was. The flag used to be
                 # sticky and unscoped, so consenting to a 3-row gap auto-accepted every later
@@ -2598,6 +2814,21 @@ def build_data_migration_screen(
                                 infra_ready = getattr(
                                     migration_state, "cdc_stack_phase", None
                                 ) in ("infra", "running", "unstable")
+                                _is_pg = (
+                                    getattr(
+                                        getattr(session, "source_config", None),
+                                        "source_type",
+                                        None,
+                                    )
+                                    is SourceType.POSTGRES
+                                )
+                                # G12: the table set changed after this load, so its
+                                # watermark no longer covers it and the type selector is
+                                # locked (migration_type_lock_reason): say how to add CDC
+                                # instead of pointing at a selector that will not move.
+                                _coverage_gap = _type_switch_coverage_gap(
+                                    migration_state, job_manager
+                                )
                                 # ENGINE-SPLIT. The MySQL wording is byte-identical and
                                 # true: its binlog retains history with no consumer, so a
                                 # later CDC-only start really does resume from this
@@ -2608,14 +2839,11 @@ def build_data_migration_screen(
                                 # it here handed the operator a one-click route into a
                                 # dead start. (The app already says as much 1100 lines
                                 # away in _cdc_ui's start-point card.)
-                                if (
-                                    getattr(
-                                        getattr(session, "source_config", None),
-                                        "source_type",
-                                        None,
+                                if _coverage_gap is not None:
+                                    body = COVERAGE_GAP_NOTICE_BODY + (
+                                        COVERAGE_GAP_NOTICE_PG_SUFFIX if _is_pg else ""
                                     )
-                                    is SourceType.POSTGRES
-                                ):
+                                elif _is_pg:
                                     body = (
                                         "This run created no replication slot, so there "
                                         "is no retained WAL to stream from: on PostgreSQL "
@@ -2654,8 +2882,10 @@ def build_data_migration_screen(
                                 # page; after a Full Load the notice can sit well below
                                 # the fold, so "change the migration type above" asked
                                 # the user to go find a control they could not see.
-                                # Jump to it instead of only naming it.
-                                _scroll_to_migration_type_button(ui)
+                                # Jump to it instead of only naming it -- unless it is
+                                # locked by the coverage gap (nothing to change there).
+                                if _coverage_gap is None:
+                                    _scroll_to_migration_type_button(ui)
 
                     _substep(
                         "full_load",
@@ -3151,6 +3381,7 @@ def full_load_run_guard_reason(
     prereq_mode: MigrationMode = MigrationMode.FULL_LOAD,
     has_run: bool = False,
     exclusion_block: Optional[str] = None,
+    added_since_run: Sequence[str] = (),
 ) -> Optional[str]:
     """Return a disable reason for the Data Migration Run button, or ``None``.
 
@@ -3196,6 +3427,11 @@ def full_load_run_guard_reason(
     ``exclusion_block`` is the stored-entry gate (``stored_exclusion_block_reason``): a
     saved column exclusion that no longer applies holds the run while the LOB card can
     still remove it. It is independent of the report, so it comes first.
+
+    ``added_since_run`` names tables selected AFTER the last Full Load (Full load only lets
+    the set change, G12). The ``has_run`` excuse vouches only for the tables that run
+    covered, so with no report to check them these require the checks again -- a
+    never-checked table can fail the whole run (FullLoadIncompleteError).
     """
     if inventory is None or not inventory.tables:
         return "Run Step 1 (Evaluation) first to introspect the source schema."
@@ -3210,6 +3446,8 @@ def full_load_run_guard_reason(
         # genuinely never run.
         gated_mode = getattr(state, "prereq_gated_mode", None)
         if has_run and (gated_mode is None or gated_mode is prereq_mode):
+            if added_since_run:
+                return added_since_run_reason(list(added_since_run))
             return None
         if has_run:
             return (
@@ -3232,12 +3470,8 @@ def full_load_run_guard_reason(
     # so everything still selected was checked and passed.
     added = prereq_scope_gap(report, state.selection.selected_tables)
     if added:
-        listed = ", ".join(added[:3]) + (" and more" if len(added) > 3 else "")
-        return (
-            f"Re-run the prerequisite checks — {listed} "
-            f"{'were' if len(added) > 1 else 'was'} added to the selection after the "
-            "checks ran, so they were never checked."
-        )
+        # The same words as the no-report case (after the last Full Load), pronoun by count.
+        return added_since_run_reason(added, since="the checks ran")
     # A column excluded AFTER the checks no longer blocks: the load's overlay makes it
     # nullable with no DEFAULT before the first write, so it cannot turn a passed
     # loadability check into a mid-load 23502. The screen shows a neutral hint instead
@@ -3246,6 +3480,24 @@ def full_load_run_guard_reason(
     # running" could mean the Full Load, the billable CDC infrastructure deploy or Start
     # CDC, and the operator cannot tell which is held.
     return prerequisite_block_reason(report, mode=prereq_mode)
+
+
+def retry_added_tables_guard(
+    migration_state, job_manager, session, inventory, added: Sequence[str]
+) -> Optional[str]:
+    """The run guard for tables a Full load only retry would load for the FIRST time
+    (selected after the load, G12), evaluated at the click: they never passed the
+    prerequisite checks the load's own pass vouches for. ``None`` = they may load."""
+    return full_load_run_guard_reason(
+        migration_state,
+        inventory,
+        prereq_mode=prereq_mode_for_type(migration_state.migration_type),
+        has_run=True,
+        exclusion_block=data_migration_exclusion_block(
+            migration_state, job_manager, session, inventory
+        ),
+        added_since_run=list(added),
+    )
 
 
 def prereq_exclusion_change_hint(state, prereq_mode) -> Optional[str]:
@@ -3448,6 +3700,11 @@ def migration_type_lock_reason(
       exclusions are a CDC-only setting, so freezing them while leaving the type itself
       switchable was internally inconsistent.
 
+    * **Coverage** (Full load only, last) -- the table set changed after the Full Load, so
+      its watermark no longer covers it, and a CDC type would stream the original set. The
+      remedy is in Full load only: Re-run Full Load (a fresh watermark over the current
+      set) or restore the original set.
+
     Each legitimately freezes the choice, but the reason (and the remedy) differ.
     Reads ``status`` and already-populated state; ``job_manager`` (optional) is only
     consulted to see the in-flight job. No AWS I/O, so it is safe to call during render
@@ -3482,7 +3739,44 @@ def migration_type_lock_reason(
             "CDC infrastructure' control live on the CDC step. Wait for it to finish "
             "(or delete it there) to change the type."
         )
+    # Full load only after a table-set change (G12): CDC streams exactly the watermark's
+    # tables (_cdc_tables_for_config, for Start CDC and the infra deploy), so a CDC type
+    # would capture the ORIGINAL set -- a table selected since without a gapless start, one
+    # unselected since still streaming. Both remedies exist in Full load only, and this
+    # covers the Full load + CDC -> Full load only -> change -> back path as well.
+    gap = _type_switch_coverage_gap(migration_state, job_manager)
+    if gap is not None:
+        return coverage_lock_reason(gap)
     return None
+
+
+def _type_switch_coverage_gap(migration_state, job_manager):
+    """``(selected since, unselected since)`` when a Full load only set left its watermark
+    behind, else ``None``. Touched selections only (an untouched default that drifted is
+    no decision); the live exclusion inputs, else the last render's selection."""
+    if job_manager is None:
+        return None
+    if getattr(migration_state, "migration_type", None) is not MigrationType.FULL_LOAD_ONLY:
+        return None
+    if not getattr(migration_state, "selection_touched", False):
+        return None
+    job = _current_job(job_manager, getattr(migration_state, "job_id", None))
+    if job is None:
+        return None
+    getter = getattr(migration_state, "exclusion_inputs", None)
+    inputs = getter() if callable(getter) else None
+    if inputs is not None:
+        selected, migratable = list(inputs.selected), list(inputs.migratable)
+    else:
+        resolved = getattr(migration_state, "resolved_selection", None)
+        selected = resolved() if callable(resolved) else None
+        if selected is None:
+            return None
+        migratable = []
+    gap = watermark_coverage_gap(job, selected, migratable)
+    if gap is None or not (gap[0] or gap[1]):
+        return None
+    return gap
 
 
 def selection_lock_reason(
@@ -3510,7 +3804,14 @@ def selection_lock_reason(
     The three commits that DO fix the table set, each with its own remedy:
 
     * **A Full Load exists or finished** -- the export ran against this set (the job
-      survives as ``status DONE`` even after the job record is pruned).
+      survives as ``status DONE`` even after the job record is pruned). Full load only
+      lifts this clause (:func:`table_set_editable_after_load`: the job record is found and
+      no CDC stack exists): a table can then be unselected (left as is on Aurora DSQL) or
+      selected (loaded by Retry unfinished tables), and the lock only WAITS while a load, a
+      foreign-key pass or a cut-over DEFAULT restore runs (:func:`table_set_wait_reason`).
+      Nothing feeds a CDC capture list there; the migration-type lock keeps a CDC type off
+      until a fresh watermark covers the set. A pruned record or CDC evidence keeps the
+      lock as before.
     * **CDC is streaming** -- the running source connector's table list is fixed;
       ticking the picker cannot add or remove a streamed table.
     * **CDC infrastructure is deployed or deploying** -- the subtle one. The immutable
@@ -3528,6 +3829,12 @@ def selection_lock_reason(
     render and unit-testable.
     """
     if has_job or status is StepStatus.DONE:
+        # G12: Full load only, record found, no CDC stack -- the set may change after the
+        # load; only a running load / FK pass / DEFAULT restore holds it (a wait).
+        if migration_type is MigrationType.FULL_LOAD_ONLY and table_set_editable_after_load(
+            migration_state, job_manager
+        ):
+            return table_set_wait_reason(migration_state, job_manager, status=status)
         # The FULL_LOAD step is ALSO promoted to DONE by CDC alone once it streams
         # (data_migration_step_after_cdc). The lock is right either way -- the set was
         # committed -- but with no recorded Full Load (no job, no job_id) the cause is CDC,
@@ -4076,6 +4383,10 @@ def _render_table_selection(
     lock_reason: Optional[str] = None,
     locked_selection: Optional[Sequence[str]] = None,
     on_selection_change: Optional[Callable[[list[str]], None]] = None,
+    lock_check: Optional[Callable[[], Optional[str]]] = None,
+    on_locked: Optional[Callable[[], None]] = None,
+    hint: Optional[str] = None,
+    filter_state: Optional[dict] = None,
 ) -> None:
     """Render the hierarchical table picker scoped to migratable tables (Req 5.9).
 
@@ -4101,6 +4412,12 @@ def _render_table_selection(
     tooltip. The causes differ materially -- a finished Full Load, live CDC, and
     deployed CDC infrastructure each need a different remedy -- so the caller passes
     the reason rather than this renderer guessing one.
+
+    ``lock_check`` re-asks the lock at CLICK time (a tick, Select all, Unselect all): a
+    reason there (another tab started a load) applies nothing, warns, and calls
+    ``on_locked`` (a page refresh that re-ticks the stored set). ``hint`` is a neutral
+    line under the title (Full load only after a load: what a tick or an untick does).
+    ``filter_state`` is a caller-held dict keeping the filter text across a refresh.
     """
     with ui.row().classes("items-center gap-1"):
         ui.label("Tables to migrate").classes("text-sm font-semibold")
@@ -4128,6 +4445,8 @@ def _render_table_selection(
                 lock_reason
                 or "Locked — this table set is already committed to a migration."
             )
+    if hint and not locked:
+        inline_hint(ui, hint, tone="neutral")
     if not migratable:
         render_notice(
             ui,
@@ -4193,7 +4512,19 @@ def _render_table_selection(
     effective_set = set(effective)
     total_leaves = sum(len(n["children"][0]["children"]) for n in nodes)
 
+    def _refused() -> bool:
+        """The lock re-asked at the click: a reason applies nothing (see the docstring)."""
+        reason = lock_check() if lock_check is not None else None
+        if not reason:
+            return False
+        ui.notify(f"{reason} This change was not applied.", type="warning", multi_line=True)
+        if on_locked is not None:
+            on_locked()
+        return True
+
     def on_tick(event: object) -> None:
+        if _refused():
+            return
         value = getattr(event, "value", None) or []
         names = selected_object_names(value)
         chosen = [name for name in migratable_order if name in names]
@@ -4208,12 +4539,23 @@ def _render_table_selection(
     if not locked:
         with ui.row().classes("items-center gap-2 w-full no-wrap"):
             filter_input = (
-                ui.input(placeholder="Filter tables by name")
+                ui.input(
+                    placeholder="Filter tables by name",
+                    value=(filter_state or {}).get("text") or "",
+                    on_change=(
+                        (lambda e: filter_state.__setitem__(
+                            "text", getattr(e, "value", "") or ""))
+                        if filter_state is not None
+                        else None
+                    ),
+                )
                 .props("dense clearable outlined")
                 .classes("flex-1 min-w-0 text-sm")
             )
 
             def _dm_select_all() -> None:
+                if _refused():
+                    return
                 tree.tick()
                 migration_state.set_selection(
                     TableSelection(selected_tables=list(migratable_order))
@@ -4223,6 +4565,8 @@ def _render_table_selection(
                     on_selection_change(list(migratable_order))
 
             def _dm_unselect_all() -> None:
+                if _refused():
+                    return
                 tree.untick()
                 migration_state.set_selection(TableSelection(selected_tables=[]))
                 count_label.text = f"0 of {total_leaves} selected"
@@ -4675,14 +5019,15 @@ def _render_prerequisites_panel(
         listed = ", ".join(added[:6]) + (
             f" +{len(added) - 6} more" if len(added) > 6 else ""
         )
+        many = len(added) > 1
         render_notice(
             ui,
             tone="warning",
             header="These results don't cover your current selection",
             body=(
-                f"{listed} {'were' if len(added) > 1 else 'was'} added after these "
-                "checks ran, so they were never checked. Re-run the checks to cover "
-                "the full selection before migrating."
+                f"{listed} {'were' if many else 'was'} added after these checks ran, so "
+                f"{'they were' if many else 'it was'} never checked. Re-run the checks to "
+                "cover the full selection before migrating."
             ),
         )
     _render_prereq_results(ui, mode, report, combined=combined)
@@ -5193,6 +5538,11 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     exclusion_lock_state,
     change_and_reload_block_reason,
     fk_apply_running,
+    table_set_editable_after_load,
+    table_set_wait_reason,
+    TABLE_SET_WAIT_LOAD,
+    TABLE_SET_WAIT_FK,
+    TABLE_SET_WAIT_RESTORE,
     capture_error_with_remedy,
     cdc_stack_being_deleted,
     cdc_delete_eta,
@@ -5237,6 +5587,9 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
 # since _full_load_ui imports cdc_streaming_started from _cdc_ui -- so dm.<name> and every
 # consumer/test import resolve unchanged; content()'s calls resolve as module globals.
 from dsql_migrator.ui.data_migration._full_load_ui import (  # noqa: E402,F401
+    full_load_step_for_scope,
+    submit_scope_identity_sync,
+    _view_tables,
     _LOAD_STATE_COLORS,
     _LOAD_STATE_LABELS,
     _QUARANTINE_PK_CHIP_LIMIT,

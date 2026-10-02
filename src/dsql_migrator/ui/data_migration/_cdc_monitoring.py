@@ -2728,6 +2728,25 @@ def exclusion_lock_state(migration_state, job_manager) -> ExclusionLockState:
                 cell="R4",
                 offers_change_type=True,
             )
+        if migration_type is MigrationType.FULL_LOAD_ONLY and table_set_editable_after_load(
+            migration_state, job_manager
+        ):
+            # G12: Full load only keeps the column set fixed (Change & reload) but lets the
+            # TABLE set change; the Full load + CDC text below stays as it was.
+            return ExclusionLockState(
+                3,
+                "Locked — a Full Load has already loaded data using this exclusion set. To "
+                "change the excluded columns, use Change & reload: it drops and reloads "
+                "exactly the tables whose excluded columns change, so no row keeps a value "
+                "loaded under the previous set. In Full load only, which tables migrate can "
+                "still change: tick or untick them in the table list, or use a table line in "
+                "Change & reload. A table you unselect is left as is on Aurora DSQL (not "
+                "dropped); a table you select that is not loaded yet is loaded by Retry "
+                "unfinished tables on the Full Load step (one already loaded is kept as "
+                "is).",
+                cell="R4",
+                offers_change_and_reload=True,
+            )
         return ExclusionLockState(
             3,
             "Locked — a Full Load has already loaded data using this exclusion set. To "
@@ -2757,6 +2776,75 @@ RECONNECT_REASON = (
     "Reconnect first: re-verify the source and target on the Connect step (credentials "
     "are not restored after a restart)."
 )
+
+# Full load only lifts the table-set lock after a Full Load (G12), but never while one of
+# these runs: each is a WAIT (it ends by itself), so none of them says "Start over".
+TABLE_SET_WAIT_LOAD = (
+    "Locked while a Full Load runs — wait for it to finish (or stop it), then change the "
+    "table set."
+)
+TABLE_SET_WAIT_FK = (
+    "Locked while foreign keys are being applied — wait for that pass to finish (or stop "
+    "it), then change the table set."
+)
+TABLE_SET_WAIT_RESTORE = (
+    "Locked while Cut over restores the excluded columns' DEFAULTs — wait for it to "
+    "finish, then change the table set."
+)
+
+
+def table_set_editable_after_load(migration_state, job_manager) -> bool:
+    """Can the table set still change although a Full Load has run? (Full load only.)
+
+    The ONE predicate behind the tree, the popup's E3 and the R4 text, so they cannot
+    disagree. True only when ALL hold:
+
+    * the migration type is Full load only -- a CDC type keeps its lock: the watermark,
+      the capture list and the topic partitions all describe the loaded set;
+    * the Full Load's job record is found -- a pruned record cannot be reconciled with a
+      changed set (its chunk list is what Retry / Reload / the step verdict read);
+    * no CDC evidence: nothing streaming, starting, being created or deleted, no stack
+      phase that carries the set, and no connector recorded for this migration.
+
+    A running load, foreign-key pass or DEFAULT restore does NOT make this False: those
+    are waits, reported by :func:`table_set_wait_reason`. Pure apart from job reads.
+    """
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    if getattr(migration_state, "migration_type", None) is not MigrationType.FULL_LOAD_ONLY:
+        return False
+    if _current_job(job_manager, getattr(migration_state, "job_id", None)) is None:
+        return False
+    if cdc_streaming_started(migration_state, job_manager):
+        return False
+    if cdc_infra_deploy_in_flight(migration_state, job_manager):
+        return False
+    if cdc_stack_being_deleted(migration_state, job_manager):
+        return False
+    if getattr(migration_state, "cdc_stack_phase", None) in _EXCLUSION_BAKED_PHASES:
+        return False
+    return not (getattr(migration_state, "cdc_connector_names", None) or [])
+
+
+def table_set_wait_reason(migration_state, job_manager, *, status) -> "Optional[str]":
+    """While :func:`table_set_editable_after_load` holds, why the set must wait, or None.
+
+    First match: a Full Load (or retry / reload) running, the foreign-key pass running,
+    cut over restoring the excluded columns' DEFAULTs.
+    """
+    from dsql_migrator.core.models import StepStatus
+    from dsql_migrator.ui.data_migration._models import cutover_restore_block_reason
+
+    job = _current_job(job_manager, getattr(migration_state, "job_id", None))
+    if status is StepStatus.IN_PROGRESS or (
+        job is not None and job.status in ("PENDING", "RUNNING")
+    ):
+        return TABLE_SET_WAIT_LOAD
+    if fk_apply_running(migration_state, job_manager):
+        return TABLE_SET_WAIT_FK
+    if cutover_restore_block_reason(migration_state):
+        return TABLE_SET_WAIT_RESTORE
+    return None
 
 
 def change_and_reload_block_reason(

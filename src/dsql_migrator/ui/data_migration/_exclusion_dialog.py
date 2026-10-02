@@ -180,6 +180,19 @@ def render_exclusion_button_row(ui, ctx: ExclusionDialogContext):
         if saved is not None and not lock.locked:
             drift = exclusion_drift(state, _resolve(ctx, inventory, inputs, saved, slot="row"),
                                     migratable=inputs.migratable)
+        elif saved is not None and state.rule_reticked_tables():
+            from dsql_migrator.ui.data_migration._cdc_monitoring import (
+                table_set_editable_after_load,
+            )
+
+            # Full load only after a load (G12): the columns are locked but the table set
+            # is not, so a rule-unselected table can be ticked again -- without the column
+            # rules its entries were dropped with. The row keeps saying so (only that part
+            # of the drift: the rest cannot change under the column lock).
+            if table_set_editable_after_load(state, ctx.job_manager):
+                drift = exclusion_drift(
+                    state, _resolve(ctx, inventory, inputs, saved, slot="row"),
+                    migratable=inputs.migratable)
         issues = stored_exclusion_issues(
             state, inventory, committed=lock.locked, selected_tables=inputs.selected
         )
@@ -1327,6 +1340,34 @@ def reload_tables(resolution, migratable: Sequence[str], convert: "Sequence[str]
     return [t for t in migratable if t in wanted]
 
 
+def _record_chunks(ctx: ExclusionDialogContext) -> "Optional[dict]":
+    """Full load only after a load (G12): ``{table: chunk}`` of the Full Load record, else
+    ``None`` (every other state reads the reload set as before)."""
+    from dsql_migrator.ui.data_migration._cdc_monitoring import table_set_editable_after_load
+    from dsql_migrator.ui.data_migration._cdc_status import _current_job
+
+    if not table_set_editable_after_load(ctx.migration_state, ctx.job_manager):
+        return None
+    job = _current_job(ctx.job_manager, getattr(ctx.migration_state, "job_id", None))
+    if job is None:
+        return None
+    return {c.chunk_id: c for c in getattr(job, "chunks", None) or ()}
+
+
+def _drop_reload_tables(ctx: ExclusionDialogContext, resolution, migratable, convert) -> list:
+    """:func:`reload_tables` minus the tables the Full Load record lacks (Full load only,
+    selected after the load, G12): nothing of theirs is on Aurora DSQL to drop, and Retry
+    unfinished tables loads them with their column rules (the overlay applies as on a first
+    load). Kept in the set, the retry's prerequisite guard for a never-checked table would
+    refuse the WHOLE reload after the rules were stored. The preview and the Save share it,
+    so the confirm still acts only on what it showed."""
+    tables = reload_tables(resolution, migratable, convert)
+    record = _record_chunks(ctx) if tables else None
+    if record is None:
+        return tables
+    return [t for t in tables if t in record]
+
+
 def _row_estimate(ctx: ExclusionDialogContext, table: str) -> Optional[int]:
     from dsql_migrator.ui.data_migration._cdc_status import _current_job
 
@@ -1337,9 +1378,13 @@ def _row_estimate(ctx: ExclusionDialogContext, table: str) -> Optional[int]:
 
 def _build_reload_dialog(ui, ctx: ExclusionDialogContext, *, insert_lines=(), hint=None,
                          lob_filter=None, client=None):
-    """CHANGE & RELOAD (R4): column rules editable, table lines E3 (the table set is fixed
-    after a Full Load), and a negative confirm naming every table it DROPS and reloads --
-    acting only on what it showed. A text-only change saves the text and nothing else."""
+    """CHANGE & RELOAD (R4): column rules editable, table lines E3 while the table set is
+    fixed after a Full Load (Full load + CDC; in Full load only, ``ctx.lock_reason_fn()`` is
+    None and a table line changes the selection, G12), and a negative confirm naming every
+    table it DROPS and reloads -- acting only on what it showed. A table the Full Load record
+    lacks (selected after the load) is never in that set (:func:`_drop_reload_tables`): Retry
+    unfinished tables loads it. A change that drops nothing saves the rules (and any table
+    selection) and nothing else."""
     from dsql_migrator.core.activity_log import ActivityCategory, ActivityStatus, log_activity
 
     state = ctx.migration_state
@@ -1370,8 +1415,16 @@ def _build_reload_dialog(ui, ctx: ExclusionDialogContext, *, insert_lines=(), hi
             ui.button(on_click=_close).props(
                 "flat dense round size=sm icon=close color=grey-7"
             ).tooltip("Close without saving")
-        ui.label("Column rules are editable. Tables are fixed after a Full Load (use Start "
-                 "over to change them).").classes("text-xs text-gray-600")
+        ui.label(
+            "Column and table rules are editable. A column change drops and reloads that "
+            "table; a table you unselect is left as is on Aurora DSQL (not dropped); a table "
+            "you select that is not loaded yet is loaded by Retry unfinished tables on the "
+            "Full Load step (one already loaded is kept as is, unless it is listed below for "
+            "Drop & reload)."
+            if ctx.lock_reason_fn() is None
+            else "Column rules are editable. Tables are fixed after a Full Load (use Start "
+            "over to change them)."
+        ).classes("text-xs text-gray-600")
         _render_hint(ui, hint, lambda n: _go_to_line(n))
         editor, example = _rules_editor(
             ui, text, lambda e: _on_edit(getattr(e, "value", "")))
@@ -1390,7 +1443,7 @@ def _build_reload_dialog(ui, ctx: ExclusionDialogContext, *, insert_lines=(), hi
             _render_lob_section(ui, ctx, inventory, inputs, resolution, view, _add_rules,
                                 _run_preview_now, _go_to_line)
             _render_legacy_conversion(ui, resolution, convert, _run_preview_now)
-            tables = reload_tables(resolution, inputs.migratable, sorted(convert))
+            tables = _drop_reload_tables(ctx, resolution, inputs.migratable, sorted(convert))
             if tables:
                 # What the reload does to each table, BEFORE the confirm: the warnings
                 # (a NOT NULL dropped one way, a generated column rejecting every row...)
@@ -1440,7 +1493,7 @@ def _build_reload_dialog(ui, ctx: ExclusionDialogContext, *, insert_lines=(), hi
                 ui.notify(reason, type="warning", multi_line=True)
                 return
             resolution = _resolve(ctx, inventory, inputs, held["text"], slot="editor")
-            tables = reload_tables(resolution, inputs.migratable, sorted(convert))
+            tables = _drop_reload_tables(ctx, resolution, inputs.migratable, sorted(convert))
             # Act only on what the confirm SHOWED: a click that landed before the preview
             # caught up drops nothing.
             if not _shown_matches(held, tables):
@@ -1454,6 +1507,15 @@ def _build_reload_dialog(ui, ctx: ExclusionDialogContext, *, insert_lines=(), hi
             refused = state.set_column_exclusions(
                 resolution, text=held["text"], opened_with=opened_with, token=token,
                 convert_legacy=sorted(convert),
+                # A table line that changes the selection (Full load only, G12) asks the
+                # table picker's own lock again at the click. Only a REAL change: a
+                # provenance-only Save leaves the tables as they are.
+                lock_check=(
+                    ctx.lock_reason_fn
+                    if resolution.selected_after is not None
+                    and set(resolution.selected_after) != set(inputs.selected or ())
+                    else None
+                ),
             )
             if refused:
                 ui.notify(refused, type="warning", multi_line=True)
@@ -1514,8 +1576,52 @@ def _render_legacy_conversion(ui, resolution, convert: set, rerun) -> None:
         )
 
 
+def _selection_change_sentence(ctx: ExclusionDialogContext, resolution, tables) -> str:
+    """What a Save does to the table SELECTION (Full load only after a load, G12), or ""
+    when it leaves the selection as it is."""
+    after = getattr(resolution, "selected_after", None)
+    if after is None:
+        return ""
+    inputs = ctx.inputs_fn()
+    current = list(getattr(inputs, "selected", None) or ()) if inputs is not None else []
+    # Sets built once: these run on every debounced preview, over every selected table.
+    after_set, current_set, tables_set = set(after), set(current), set(tables or ())
+    unselects = [t for t in current if t not in after_set]
+    selects = [t for t in after if t not in current_set and t not in tables_set]
+    # A table the last Full Load already loaded is kept as is, not retried: only the
+    # rest (not in the record, or unfinished in it) is listed under Retry unfinished tables.
+    record = _record_chunks(ctx) if selects else None
+    loaded = [t for t in selects if record is not None and t in record
+              and record[t].status == "DONE"]
+    loaded_set = set(loaded)
+    selects = [t for t in selects if t not in loaded_set]
+    parts = []
+    if unselects:
+        one = len(unselects) == 1
+        parts.append(f"Unselects {_names(unselects)}: left as is on Aurora DSQL (not "
+                     f"dropped), and {'its' if one else 'their'} excluded-column entries are "
+                     "not kept.")
+    if selects:
+        parts.append(f"Selects {_names(selects)}: listed under Retry unfinished tables on "
+                     "the Full Load step until loaded.")
+    if loaded:
+        one = len(loaded) == 1
+        parts.append(f"Selects {_names(loaded)} again: already loaded by the last Full Load, "
+                     f"kept as is (Reload specific tables on the Full Load step reloads "
+                     f"{'it' if one else 'them'}).")
+    return " ".join(parts)
+
+
 def _render_drop_card(ui, ctx: ExclusionDialogContext, resolution, tables) -> None:
+    selection_change = _selection_change_sentence(ctx, resolution, tables)
     if not tables:
+        if selection_change:
+            # Not "no excluded columns change": a table selected since the load may get
+            # column rules -- it has nothing on Aurora DSQL to drop (its first load applies
+            # them).
+            inline_hint(ui, "Nothing to drop and reload: Save stores the rules and the "
+                        "table selection. " + selection_change)
+            return
         inline_hint(ui, "No table's excluded columns change: Save stores the rules only.")
         return
     diff = resolution.diff
@@ -1542,6 +1648,8 @@ def _render_drop_card(ui, ctx: ExclusionDialogContext, resolution, tables) -> No
             "your Schema Conversion DDL, made nullable where needed, and reloaded. Other "
             "tables are not touched."
         ).classes("text-xs text-amber-800")
+        if selection_change:
+            ui.label(selection_change).classes("text-xs text-amber-800")
 
 
 def _render_deployed_capture(ui, ctx: ExclusionDialogContext, inventory, *,

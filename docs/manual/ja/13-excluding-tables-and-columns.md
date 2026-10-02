@@ -38,7 +38,8 @@ _言語: [English](../en/13-excluding-tables-and-columns.md) | [한국어](../ko
 - **決して除外できない列があります。** キー列、保持される外部キーが参照する列、Aurora DSQL が計算する列は
   拒否され、その理由は常に表示されます(§13.4)。
 - **データが移動すると集合は固定されます。** Full Load の後、または CDC スタックがデプロイされた後は、
-  除外設定はロックされます。それでも変更はできますが、§13.7 の経路を通じてのみです。
+  除外設定はロックされます。それでも変更はできますが、§13.7 の経路を通じてのみです。Full load only では、
+  Full Load の後も移行するテーブルを変更できます(§13.7 の「Full Load 後にテーブル集合を変更する」)。
 
 ---
 
@@ -81,7 +82,9 @@ _言語: [English](../en/13-excluding-tables-and-columns.md) | [한국어](../ko
 - 構文エラー。
 - 何にも一致しない名前。提案は、最初に失敗した階層(スキーマ、テーブル、列の順)から出されます。まず
   大文字小文字だけが異なる名前を、それがなければ最大 3 つの近い候補を示します。
-- ロック中(たとえば Full Load の後)にテーブル集合を変えることになるテーブルルール、または削除された
+- ロック中(Full load + CDC または CDC only で Full Load の後、CDC のストリーミング中やスタックが集合を
+  保持している間、または Full load only で Full Load、外部キーの適用、カットオーバーの DEFAULT 復元が
+  実行されている間(終わると解除))にテーブル集合を変えることになるテーブルルール、または削除された
   テーブルルール。
 - 名前に `:` を含むテーブルの列に一致する列ルール(§13.11)。
 - Aurora DSQL のテーブルに存在せず、除外もされていないソース列。この場合、ロードは確実に 42703 で失敗します
@@ -275,7 +278,9 @@ NULL を拒否する手書きの `CHECK` 制約は、事前に検出され**ま�
 
 - ロードされず、Aurora DSQL 上ではそのまま残されます(削除されません)。
 - 選択された子テーブルからそのテーブルへの外部キーは、外部キーの適用時(Full load only では Data Migration
-  ステップ、CDC では Cut over)に孤立チェックでスキップされます。
+  ステップ、CDC では Cut over)に、このテーブルが Aurora DSQL 上に持つ行に対してチェックされます。参照先の
+  行がすべてあれば適用され、1 行でも欠けていれば孤立チェックでスキップされ、テーブルが Aurora DSQL 上に
+  なければ適用されません。
 - そのテーブルを読むビューは行を返しません。
 - そのテーブルに対する列ルールは効果がありません。
 
@@ -476,7 +481,7 @@ CDC only の Start ダイアログはそれらのテーブル名を示し、各�
 | CDC スタックが存在し(デプロイ済み、ストリーミング中、または停止中)、Full Load を実行した | 1. ストリーミング中なら Stop CDC を実行し、その後 CDC ステップで **Delete CDC infrastructure** を実行します。2. 影響を受けるテーブルに **Change & reload** を使います(CDC only: 先に Full load + CDC へ切り替えます)。3. 再度デプロイし、Start CDC を実行します。 |
 | CDC スタックが存在し、Full Load は実行しておらず、CDC only | ストリーミング中なら Stop CDC を実行し、Delete CDC infrastructure を実行してルールを変更し(CDC が一度でもストリーミングしていれば列ルールのみ: テーブル集合の変更には Start over が必要)、再度デプロイして Start CDC を実行します。スタックを削除すると、ストリームの位置も削除されます(下記参照)。 |
 | CDC スタックが存在し、まだ Full Load を実行していない(Full load + CDC) | ストリーミング中なら Stop CDC を実行し、Delete CDC infrastructure を実行してルールを変更し、再度デプロイしてから Start Full Load を実行します。reload が必要なものはありません。CDC が既にストリーミングしていた場合は、Start Full Load ダイアログで drop と再作成を選びます。 |
-| CDC スタックがなく、Full Load を実行した(Full load only または Full load + CDC) | **Change & reload**(次のセクション)。 |
+| CDC スタックがなく、Full Load を実行した(Full load only または Full load + CDC) | **Change & reload**(次のセクション)。Full load only: テーブル集合も変更できます(下記の「Full Load 後にテーブル集合を変更する」を参照)。 |
 | CDC スタックがなく、タイプを CDC only に切り替える前に Full Load を実行した | タイプを Full load + CDC に切り替え、そこで Change & reload を使い、その後 CDC を続けます。 |
 | Full Load を実行したが、そのジョブレコードがもう利用できない | CDC スタックがあれば先に削除し、その後 **Start over** します。 |
 
@@ -485,8 +490,9 @@ CDC only の Start ダイアログはそれらのテーブル名を示し、各�
 - **スタックがある状態での Full load only。** 移行タイプが Full load only のときにスタックが存在する場合は、
   それを削除するために Full load + CDC に切り替えてください。Full load only には CDC ステップがないため
   です。
-- **テーブル集合。** Full Load の後は固定されます。Change & reload が変更するのは列だけで、テーブルを変更
-  するには Start over が必要です。
+- **テーブル集合。** Full load + CDC と CDC only では、Full Load の後は固定されます。Change & reload が
+  変更するのは列だけで、テーブルを変更するには Start over が必要です。Full load only については、下記の
+  「Full Load 後にテーブル集合を変更する」を参照してください。
 - **削除後に再び CDC を開始する。** MySQL では、Automatic の Start CDC は Full Load のウォーターマークから
   再シードします(そのロード以降の binlog がまだ存在している必要があります。パージされていれば Start CDC が
   警告します)。PostgreSQL では、スタックを削除するとレプリケーションスロットと publication が削除される
@@ -503,7 +509,12 @@ CDC only の Start ダイアログはそれらのテーブル名を示し、各�
 Full Load を含む移行タイプで、実行が記録されており、CDC スタックがない場合、読み取り専用のポップアップが
 **Change & reload** を提示します。これは **Change exclusions & reload** を開きます。
 
-- **列ルールは編集でき、テーブル集合は固定です。** 選択を変えることになるテーブル行はエラーになります。
+- **列ルールは編集できます。** Full load + CDC では、選択を変えることになるテーブル行はエラーになります。
+  Full load only では、選択を変更します(次のセクションを参照)。選択から外したテーブルは Aurora DSQL 上に
+  そのまま残されます(削除されません)。選択したテーブルのうち、まだロードされていないものは Retry
+  unfinished tables がロードします。前回の Full Load がすでにロードしたものはそのまま保持されますが、列
+  ルールがそのテーブルの列を新たに除外する場合は、除外列が変わる他のテーブルと同様に **Drop & reload** の
+  対象として表示されます。
 - **何かを削除する前に、何が起きるかを正確に示します:** drop して reload する各テーブルを、列の差分
   (`+ c (NULL)`、`- c`)と行数の見積もり(「N rows re-read」)とともに示し、さらにそれらのテーブルに対する
   警告と ALTER も示します。「Their rows on Aurora DSQL are permanently deleted; each table is recreated
@@ -513,7 +524,8 @@ Full Load を含む移行タイプで、実行が記録されており、CDC ス
   **Drop & reload N tables** と表示されます。プレビューに示したテーブルにのみ作用します。Start ダイアログは
   続かず、reload はすぐに開始します。
 - **テキストだけの変更では何も削除されません。** どのテーブルの除外列も変わらない場合(たとえば、コメントを
-  追加しただけの場合)、ボタンは **Save** と表示され、ルールだけを保存します。
+  追加しただけの場合)、ボタンは **Save** と表示され、ルールだけを保存します(Full load only では、
+  テーブル行が変更するテーブルの選択も保存します)。
 - **omit-only の変換。** omit-only のエントリ(v0.1.562 より前に除外されたもの、またはスタックから omit-only
   として採用されたもの。§13.10 を参照)を持つテーブルごとに、チェックの入っていないチェックボックス「Reload *table* so
   its ... are NULL (now they hold the target DEFAULT)」があります。チェックを入れると、同じ reload でそれらの
@@ -524,6 +536,41 @@ Full Load のジョブレコードが無くなっている場合(Start over を�
 されていなければ何もロックされておらず、ルールを直接編集します。提示される場合でも、Full Load の実行中、
 外部キーの適用中、Cut over による DEFAULT の復元中、そしてアプリの再起動後に Connect ステップで接続を
 再検証するまでは、理由を示して無効になります。
+
+### Full Load 後にテーブル集合を変更する (Full load only)
+
+Full load only では、Full Load によってテーブル集合が固定されることはありません。Full Load、外部キーの
+適用、カットオーバーの DEFAULT 復元のいずれも実行中でなく、CDC スタックが存在しない間は、テーブル一覧で
+テーブルにチェックを入れるか外すか、Change & reload でテーブル行(`exclude table ...`)を使います。
+Start over は不要です。
+
+- **チェックを外したテーブルは Aurora DSQL 上にそのまま残されます(削除されません)。** この移行はその
+  テーブルをもうロードも検証もしません。テーブルルールで選択を外した場合、そのテーブルの除外列のエントリは
+  保持されません。
+- **チェックを入れたテーブルのうち、まだロードされていないものは Retry unfinished tables がロードします。**
+  Full Load ステップはそのテーブルを「Not loaded yet — selected after the last Full Load」と表示し、
+  ロードされるまでステップは Failed と表示されます。再試行はロード済みのテーブルをすべて保持し、元の
+  ウォーターマークを再利用します。新しいテーブルは一度もチェックされていないため、ツールに求められたら先に
+  前提条件チェックを再実行してください。それまでの間、未完了のテーブルが新しいテーブルだけなら Retry
+  unfinished tables は無効になり、他のテーブルも再試行する場合は新しいテーブルを拒否します。そのテーブルの
+  列ルールは、この最初のロードで適用されます。Change & reload は、前回の Full Load に含まれていなかった
+  テーブルを drop して reload することはありません。
+- **チェックを入れたテーブルのうち、前回の Full Load がすでにロードしたものはそのまま保持されます。** 再度
+  ロードはされません(Full Load ステップの Reload specific tables で reload できます)。ルールで選択から
+  外していたテーブルに再びチェックを入れても、除外列は戻りません(そのエントリは保持されていません)。
+  Exclude tables & columns の行が警告し、Change & reload でそのテーブルにルールを再び適用できます。
+- **外部キー。** **Apply foreign keys** の処理が完了した後にテーブルのチェックを外しても、その結果は保持
+  されます。キーはそのまま残ります。テーブルにチェックを入れた後(または処理を途中で止めた後にチェックを
+  外した場合)は、カードが再適用を求めます。すでにあるキーは保持されますが、処理はすべてのキーを再チェック
+  します。
+- **Validation。** 新しく選択したテーブルがロードされたら、Validation を再実行してください。結果が Full
+  Load 以降に選択したすべてのテーブルを対象にするまで(または Objects to validate でそのチップをオフに
+  するまで)、Cut over は保留されます。そのようなテーブルがまだロードされていない間、Cut over は Data
+  Migration ステップへ戻るよう案内します。
+- **移行タイプは Full load only のままです。** CDC は Full Load の開始時の集合をストリーミングするため、
+  **Re-run Full Load** が現在の集合に対して新しいウォーターマークを取得するか、元の集合に戻すまで、
+  タイプセレクターはロックされます。
+- **Refresh objects は**、これまでどおりロード後は表示されません。
 
 ### 隔離またはデッドレターから
 
@@ -663,6 +710,8 @@ ALTER TABLE "shop"."users" ALTER COLUMN "status" SET DEFAULT ('active'::text)
 - **DEFAULT の復元が残ったままでもカットオーバーはブロックされません。** 「I've cut over to DSQL」の上の
   警告に専用の **Restore DEFAULTs** ボタンがあり、確認操作は `cut over with N DEFAULTs not restored` を
   ログに記録します。
+- **選択されなくなったテーブル。** テーブルがもう移行に選択されていない列(Full load only はロード済みの
+  テーブルの選択を外せます)は自動では復元されず、**Needs your decision** の下に表示されます。
 
 台帳を読めない場合、ブロックはその旨を示し(「The record of dropped DEFAULTs could not be read ...」)、
 **Check again** を提示します。
@@ -784,7 +833,8 @@ ALTER TABLE <table> ALTER COLUMN <column> SET DEFAULT (<original_default>)
   Conversion の DDL からテーブルを再作成します)だけです。
 - 復元された DEFAULT は**新しい行にのみ**適用され、移行済みの行は NULL のままです。
 - NULL を拒否する手書きの `CHECK` 制約は事前に検出されません(そのテーブルは 23514 で失敗します)。
-- Full Load の後、**テーブル集合**は Start over によってのみ変更できます。CDC スタックがデプロイされると、
+- Full load + CDC と CDC only では、Full Load の後、**テーブル集合**は Start over によってのみ変更できます
+  (Full load only は §13.7 の「Full Load 後にテーブル集合を変更する」を参照)。CDC スタックがデプロイされると、
   その除外設定は Delete CDC infrastructure の後でのみ変更できます。
 - **CDC の開始前から** Aurora DSQL にある行は、除外列の値を保持します。
 - キャプチャリストは 4,096 バイトに収まる必要があります(§13.8)。連結すると同じ `db.table.column` 文字列に

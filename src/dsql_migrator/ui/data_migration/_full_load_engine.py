@@ -4181,6 +4181,11 @@ def _seed_retry_chunks(
     retried are reset to ``PENDING`` (their attempt count is preserved so the
     retry increments it). This keeps a single unified view across the original
     run and the retry instead of fragmenting it into separate jobs.
+
+    A retry name with NO prior chunk -- a table selected after the load (Full load only
+    lets the set change, G12) -- gets a fresh ``PENDING`` chunk appended (sorted), so its
+    load is tracked like any other: without one, ``_find_chunk`` returned None and every
+    start/complete/fail update silently did nothing (an untracked load).
     """
     chunks: list[ChunkState] = []
     for prior in prior_chunks:
@@ -4195,6 +4200,11 @@ def _seed_retry_chunks(
             )
         else:
             chunks.append(prior.model_copy(deep=True))
+    known = {prior.chunk_id for prior in prior_chunks}
+    chunks.extend(
+        ChunkState(chunk_id=name, status="PENDING", rows_loaded=0, attempts=0)
+        for name in sorted(set(retry_names) - known)
+    )
     job.chunks = chunks
     # Carry the error-log lineage with the chunks. Without this the unified view the
     # chunks give is only half true: a table kept its quarantined-row COUNT while its
@@ -4291,6 +4301,10 @@ def run_full_load_retry(
     # The prior job's recreated_tables (see _seed_retry_chunks). Defaulted: an omitting
     # caller just gets the old behaviour.
     prior_recreated_tables: "Optional[Sequence[str]]" = None,
+    # The run's CURRENT table set (Full load only after a set change, G12): the identity
+    # sync and the foreign-key count cover exactly these. None (every other caller): the
+    # prior chunks plus any retry name they lack.
+    run_table_names: "Optional[Sequence[str]]" = None,
     # See run_full_load: needed for the post-load identity-sequence sync. A retry that
     # COMPLETES the load is exactly when the sync must run -- the first attempt's
     # finalize skipped it (the run was incomplete), so without this the sequence stays
@@ -4305,6 +4319,13 @@ def run_full_load_retry(
     ``DONE``/``FAILED`` and appending any failure to the single ``error_log``
     (Property 15). A per-table failure is isolated so the remaining retries
     continue, exactly like :func:`run_full_load`.
+
+    A retry table the prior run never had (selected after the load) is seeded as a new
+    PENDING chunk and loaded under the same original watermark -- which is NOT extended:
+    its ``table_row_counts`` keys stay the run's original set, the signal that a CDC
+    type has no gapless start for the added table. ``run_table_names`` scopes the
+    identity sync and the foreign-key count to the current set (a table left as is on
+    Aurora DSQL is never written to).
     """
     job_id = handle.job_id
     retry_names = {table.name for table in tables_to_retry}
@@ -4378,6 +4399,11 @@ def run_full_load_retry(
     # The whole run's tables (a retry completes the run): the identity sync and the FK
     # count both cover what the run loaded, not just the retried subset.
     _run_tables = [chunk.chunk_id for chunk in prior_chunks] or list(retry_names)
+    if run_table_names is not None:
+        _run_tables = list(run_table_names)
+    else:
+        # A retry table with no prior chunk (seeded above) belongs to the run as well.
+        _run_tables += sorted(retry_names - set(_run_tables))
     _fk_pending = pending_foreign_key_count(migrator, _run_tables)   # see run_full_load
     _finalize_run(
         handle,

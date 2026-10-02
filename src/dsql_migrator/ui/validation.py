@@ -45,7 +45,7 @@ import threading
 import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Sequence
+from typing import Any, Callable, Collection, Iterable, Mapping, Optional, Protocol, Sequence
 
 from dsql_migrator.config import SecretValue, load_config
 from dsql_migrator.core.activity_log import (
@@ -1537,6 +1537,96 @@ def included_from_exclusions(
     return kept
 
 
+def _filtered_scope(
+    scope: ResolvedScope, table_exclude: "set[str] | frozenset[str]"
+) -> "tuple[TableDef, ...]":
+    """The run's tables: the migration scope minus the chips turned off under Objects to
+    validate (excluding everything degrades to the full scope). Pure."""
+    include = included_from_exclusions([t.name for t in scope.tables], table_exclude or set())
+    return apply_table_filter(scope.tables, include)
+
+
+def validation_scope_names(
+    inventory: SourceInventory,
+    selection: TableSelection,
+    table_exclude: "set[str] | frozenset[str]" = frozenset(),
+) -> list[str]:
+    """The tables a validation run covers -- EXACTLY the runner's formula (the migration
+    selection, then the object filter). Pure."""
+    return [t.name for t in _filtered_scope(
+        resolve_validation_tables(inventory, selection), table_exclude)]
+
+
+def validation_scope_gap(
+    report: "Optional[ValidationReport]",
+    inventory: "Optional[SourceInventory]",
+    migration_state: object,
+    table_exclude: "set[str] | frozenset[str]" = frozenset(),
+    covered: "Optional[Collection[str]]" = None,
+) -> "tuple[list[str], list[str]]":
+    """``(missing, extra)`` between a report and the CURRENT validation scope. Pure.
+
+    ``missing``: tables the scope covers that the report has no row for -- a Full load only
+    table set can grow after a Full Load (G12), and a report from before must not release
+    cut over for a table it never compared. ``extra``: report rows for tables no longer
+    selected (left as is on Aurora DSQL). Both empty unless the migration is Full load only
+    with a recorded Full Load and an explicit selection -- the only place the set changes
+    after a load; a CDC type keeps every existing release gate untouched.
+
+    ``covered`` (the Full Load watermark's tables -- the set that load started with, never
+    extended) narrows ``missing`` to the tables selected SINCE that load: a table the load
+    covered and the report lacks was left out by a chip (chips are not kept across a
+    restart, so it would otherwise hold a restored, unchanged session). ``None`` (no
+    record or no per-table counts) holds on every missing table -- the safe side.
+    """
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    if report is None or inventory is None or migration_state is None:
+        return [], []
+    if getattr(migration_state, "migration_type", None) is not MigrationType.FULL_LOAD_ONLY:
+        return [], []
+    if getattr(migration_state, "job_id", None) is None:
+        return [], []
+    selection = getattr(migration_state, "selection", None)
+    if selection is None or not getattr(selection, "selected_tables", None):
+        return [], []
+    compared = [item.table for item in report.items]
+    compared_set = set(compared)
+    loaded = set(covered) if covered else set()
+    missing = [
+        n for n in validation_scope_names(inventory, selection, table_exclude)
+        if n not in compared_set and n not in loaded
+    ]
+    in_scope = {t.name for t in resolve_validation_tables(inventory, selection).tables}
+    extra = [t for t in dict.fromkeys(compared) if t not in in_scope]
+    return missing, extra
+
+
+def _scope_missing_names(missing: "Sequence[str]") -> "tuple[str, bool]":
+    """``(listed, one)`` for the scope-gap copy."""
+    return bounded_table_names(list(missing)), len(missing) == 1
+
+
+def full_load_covered_tables(
+    migration_state: object, job_manager: object
+) -> "Optional[frozenset[str]]":
+    """The tables the recorded Full Load's watermark covers -- the set that load started
+    with (G12 never extends it) -- for :func:`validation_scope_gap`'s ``covered``; ``None``
+    without a record or per-table counts, and outside Full load only (where the gap is
+    empty anyway: no job read there). One job read, no other I/O."""
+    from dsql_migrator.ui.data_migration._cdc_status import _current_job
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    if migration_state is None or job_manager is None:
+        return None
+    if getattr(migration_state, "migration_type", None) is not MigrationType.FULL_LOAD_ONLY:
+        return None
+
+    job = _current_job(job_manager, getattr(migration_state, "job_id", None))
+    counts = getattr(getattr(job, "watermark", None), "table_row_counts", None)
+    return frozenset(counts) if counts else None
+
+
 @dataclass(frozen=True)
 class ValidationScope:
     """Human-facing description of WHAT a validation run covers (for the UI).
@@ -2828,11 +2918,8 @@ def build_validation_screen(
         # all in-scope). Exclusions are converted to the include-set apply_table_
         # filter expects; excluding everything degrades to the full scope so a run
         # never ends up empty.
-        scope_names = [t.name for t in scope.tables]
-        include = included_from_exclusions(
-            scope_names, validation_state.table_exclude
-        )
-        scoped_tables = apply_table_filter(scope.tables, include)
+        # validation_scope_names is this same formula (the cut-over scope hold reads it).
+        scoped_tables = _filtered_scope(scope, validation_state.table_exclude)
         scoped_inventory = inventory.model_copy(
             update={"tables": list(scoped_tables)}
         )
@@ -3681,8 +3768,16 @@ def build_validation_screen(
                     _recheck(tables)
                     refresh()
 
+                # Full load only after a table-set change (G12): a report from before the
+                # change does not cover the tables selected since.
+                _scope_missing, _scope_extra = validation_scope_gap(
+                    result, inventory, migration_state, validation_state.table_exclude,
+                    covered=full_load_covered_tables(migration_state, job_manager),
+                )
                 _render_result(
                     ui, result,
+                    scope_missing=_scope_missing,
+                    scope_extra=_scope_extra,
                     cdc_gate=_validation_dlq_gate(result),
                     diagnose_provider=diagnose_provider,
                     restored=validation_state.restored,
@@ -3933,6 +4028,9 @@ def _fill_cutover_defaults(
             migration_state, session, inventory, conv_state, job_manager
         )[1],
         on_record_found=mark if callable(mark) else None,
+        # A ledger table no longer selected (Full load only can unselect a loaded table,
+        # G12) is the operator's decision, never an automatic restore.
+        selected_tables=lambda: _migrated_tables(migration_state),
         fill_key=fill_key,
         generation=generation,
     )
@@ -3962,6 +4060,8 @@ def _cutover_fill_key(
         tuple(sorted((getattr(conv_state, "edited_target_ddls", None) or {}).items())),
         getattr(conv_state, "preserve_foreign_keys", None),
         tuple(sorted((t, tuple(sorted(c))) for t, c in (stored or {}).items())),
+        # The selection decides which pending DEFAULTs restore automatically (G12).
+        tuple(sorted(_migrated_tables(migration_state) or ())),
     )
 
 
@@ -4622,6 +4722,29 @@ def build_cutover_screen(
             detail=f"cut over with {len(owed)} DEFAULTs not restored: {shown}",
         )
 
+    def _cutover_scope_missing() -> list[str]:
+        """Tables the migration now includes that the last validation never compared (Full
+        load only after a table-set change, G12; empty otherwise). No I/O."""
+        eval_result = (
+            eval_store.get_or_create(session_id).result if eval_store is not None else None
+        )
+        return validation_scope_gap(
+            validation_state.result,
+            eval_result.inventory if eval_result is not None else None,
+            migration_state,
+            validation_state.table_exclude,
+            # Only tables selected SINCE the load hold: a chip turned off for a loaded
+            # table is not kept across a restart, and must not hold it then.
+            covered=full_load_covered_tables(migration_state, job_manager),
+        )[0]
+
+    def _cutover_load_pending() -> bool:
+        """Validation's own prerequisite (Data Migration) is not met: the scope hold then
+        points at the step that can be opened. Reads the workflow only."""
+        from dsql_migrator.ui.workflow import is_prerequisite_met
+
+        return not is_prerequisite_met(session.workflow, WorkflowStep.VALIDATION)
+
     def _current_dlq_gate():
         """The CDC dead-letter gate from the CURRENT state (no I/O), for click handlers."""
         _report = validation_state.result
@@ -4636,6 +4759,18 @@ def build_cutover_screen(
         )
 
     def runner() -> None:
+        # Re-checked at the acknowledgement (another tab may have ticked a table since the
+        # page was drawn): never sign off a table the validation never compared.
+        if _cutover_scope_missing():
+            ui.notify(  # type: ignore[attr-defined]
+                "Validation does not cover the current table set — finish Data Migration "
+                "(load the newly selected tables), then re-run Validation."
+                if _cutover_load_pending()
+                else "Validation does not cover the current table set — re-run Validation "
+                "first.",
+                type="warning",
+            )
+            return
         # No job: mark DONE as the user's acknowledgement that they've cut over.
         session.set_workflow(
             with_status(session.workflow, WorkflowStep.CUT_OVER, StepStatus.DONE)
@@ -4810,6 +4945,43 @@ def build_cutover_screen(
                 ui, summary, drift,
                 cdc_in_use=_cdc_in_use(session), source_engine=engine,
             )
+            return
+
+        # Full load only after a table-set change (G12): a result that has no row for a
+        # table the migration now includes cannot release cut over, whatever it says about
+        # the tables it did compare. An extra hold -- every release gate below is unchanged.
+        _scope_missing = _cutover_scope_missing()
+        if _scope_missing:
+            _listed = bounded_table_names(list(_scope_missing))
+            _one = len(_scope_missing) == 1
+            # Validation cannot be opened while Data Migration is not complete (a table
+            # ticked since the load turns it Failed until loaded): lead with that step.
+            _body = (
+                (
+                    "Data Migration is not complete for the current table set, which "
+                    f"includes {_listed} (selected after the last validation ran). Finish "
+                    "it on the Data Migration step (Retry unfinished tables loads what is "
+                    f"left, or untick {'it' if _one else 'them'} there), then re-run "
+                    "Validation; the cut-over runbook appears here once the result covers "
+                    "every migrated table."
+                )
+                if _cutover_load_pending()
+                else (
+                    f"The last validation has no result for {_listed}, part of this "
+                    "migration's table set (selected after it ran, or left out of it). "
+                    f"Re-run Validation (or turn {'its' if _one else 'their'} chip off "
+                    f"under Objects to validate to leave {'it' if _one else 'them'} "
+                    "out); the cut-over runbook appears here once the result covers "
+                    "every migrated table."
+                )
+            )
+            with _section(ui, icon="fact_check", title="Validate the current table set"):
+                render_notice(
+                    ui,
+                    tone="warning",
+                    header="Validation does not cover the current table set",
+                    body=_body,
+                )
             return
 
         release = cutover_release_state(
@@ -5967,8 +6139,14 @@ def _render_result(
     excluded_values_remedy: str = "",
     legacy_context: "tuple[str, frozenset]" = ("", frozenset()),
     cdc_gate: "Optional[object]" = None,
+    scope_missing: "Sequence[str]" = (),
+    scope_extra: "Sequence[str]" = (),
 ) -> None:
     """Render the cut-over readiness report: verdict, checks, then the details.
+
+    ``scope_missing`` / ``scope_extra`` (:func:`validation_scope_gap`, Full load only after
+    a table-set change): tables the migration now includes that this report has no row for
+    (the verdict is held, and Cut over waits), and rows for tables no longer selected.
 
     ``diagnose_provider`` (when given -- AI Assist on) opens the AI chat drawer
     for a mismatch; it is threaded to the verdict (run-level "Diagnose with AI"),
@@ -6011,7 +6189,32 @@ def _render_result(
         )
     summary = summarize_validation(report)
     drift = format_drift(report)
-    _hold_shown = _render_verdict(ui, summary, drift, cdc_gate=cdc_gate)
+    _hold_shown = _render_verdict(
+        ui, summary, drift, cdc_gate=cdc_gate, scope_missing=scope_missing
+    )
+    if scope_missing and not summary.ready_for_cutover:
+        _listed, _one = _scope_missing_names(scope_missing)
+        render_notice(
+            ui,
+            tone="warning",
+            header="This result does not cover the current table set",
+            body=(
+                f"{_listed} {'is' if _one else 'are'} part of this migration's table set "
+                f"but {'has' if _one else 'have'} no row in this result — selected after "
+                f"this validation ran, or left out of it. Re-run validation to include "
+                f"{'it' if _one else 'them'}; Cut over stays held until the result covers "
+                "every migrated table."
+            ),
+        )
+    if scope_extra:
+        _one_x = len(scope_extra) == 1
+        inline_hint(
+            ui,
+            f"This result also compares {bounded_table_names(list(scope_extra))}, no longer "
+            "selected for this migration (left as is on Aurora DSQL). Re-run validation to "
+            f"drop {'it' if _one_x else 'them'} from the verdict.",
+            tone="neutral",
+        )
     # The way forward for the hold notice above: re-check exactly the dead-lettered tables
     # that still lack a CHECKSUM match after their last dead letter (the re-check upgrades
     # them to CHECKSUM). Drawn only WITH that notice, which explains it -- on a red or
@@ -6190,7 +6393,7 @@ def _section(ui: object, *, icon: str, title: str) -> _Section:
 
 def _render_verdict(
     ui: object, summary: ValidationSummary, drift: DriftDisplay,
-    *, cdc_gate: "Optional[object]" = None,
+    *, cdc_gate: "Optional[object]" = None, scope_missing: "Sequence[str]" = (),
 ) -> bool:
     """Render the overall go/no-go cut-over verdict as a Cloudscape notice (hero).
 
@@ -6208,6 +6411,9 @@ def _render_verdict(
     tables, a matching report reads "Tables match — cut over waits ..." instead of the
     green "Ready for cut-over"; once every dead-lettered table is resolved, the green body
     says so. ``None`` (or an inert gate) renders exactly as before.
+
+    ``scope_missing`` (Full load only after a table-set change): a matching report that has
+    no row for a table the migration now includes is not "Ready" -- Cut over holds on it.
     """
     if summary.ready_for_cutover:
         _is_checksum = str(summary.mode).upper().endswith("CHECKSUM")
@@ -6231,6 +6437,25 @@ def _render_verdict(
                     "cutting over. Reconcile inapplicable for all "
                     f"{len(summary.reconcile_inapplicable_tables)} table(s): "
                     f"{', '.join(summary.reconcile_inapplicable_tables)}."
+                ),
+            )
+            return False
+        if scope_missing:
+            _listed, _one = _scope_missing_names(scope_missing)
+            render_notice(
+                ui,
+                tone="warning",
+                # Cause-neutral: the body names both causes (selected since, or a chip).
+                header="Tables match — cut over waits until the result covers every migrated "
+                "table",
+                body=(
+                    f"The {summary.total_tables} table(s) this result compared match as-of "
+                    f"{summary.as_of}. {_listed} {'is' if _one else 'are'} part of this "
+                    f"migration's table set but {'has' if _one else 'have'} no row in this "
+                    "result — selected after this validation ran, or left out of it. "
+                    f"Re-run validation (or turn {'its' if _one else 'their'} chip off under "
+                    f"Objects to validate to leave {'it' if _one else 'them'} out); Cut over "
+                    "stays held until then."
                 ),
             )
             return False

@@ -43,7 +43,8 @@ Some points to understand early:
   shown (§13.4).
 - **The set becomes fixed once data has moved.** After a Full Load, or once a CDC stack
   is deployed, the exclusions are locked. They can still be changed, but only through
-  the routes in §13.7.
+  the routes in §13.7. In Full load only, which tables migrate can still change after a
+  Full Load (§13.7, "Changing the table set after a Full Load").
 
 ---
 
@@ -90,7 +91,9 @@ live preview under it. About 300 ms after you stop typing, the preview updates:
   (schema, then table, then column): first a name that differs only in case, otherwise
   up to three close matches;
 - a table rule, or a deleted table rule, that would change the table set while it is
-  locked (for example after a Full Load);
+  locked (in Full load + CDC or CDC only after a Full Load, while CDC streams or a stack
+  holds the set, or, in Full load only, while a Full Load, a foreign-key pass or a
+  cut-over DEFAULT restore runs, until it finishes);
 - a column rule that matches a column of a table whose name contains `:` (§13.11);
 - a source column that is missing from the Aurora DSQL table and is not excluded, so
   the load would certainly fail with 42703 (§13.4). The fix appends the `exclude` line
@@ -291,9 +294,10 @@ Such a table fails loudly at load (23514).
 Excluding a **table** also has consequences, which the preview lists:
 
 - it is not loaded and is left as is on Aurora DSQL (not dropped);
-- a selected child table's foreign key to it is skipped by the orphan check when
-  foreign keys are applied (on the Data Migration step for Full load only, at Cut over
-  for CDC);
+- a selected child table's foreign key to it is checked against the rows this table has
+  on Aurora DSQL when foreign keys are applied (on the Data Migration step for Full load
+  only, at Cut over for CDC): applied if every referenced row is there, skipped by the
+  orphan check if one is missing, and not applied if the table is not on Aurora DSQL;
 - a view that reads it returns no rows;
 - column rules on it have no effect.
 
@@ -509,7 +513,7 @@ the set and offers only the remedies that are true for your situation:
 | A CDC stack exists (deployed, streaming or stopped) and a Full Load ran | 1. Stop CDC if it streams, then **Delete CDC infrastructure** on the CDC step. 2. Use **Change & reload** for the affected tables (CDC only: switch to Full load + CDC first). 3. Deploy again and Start CDC. |
 | A CDC stack exists, no Full Load ran, CDC only | Stop CDC if it streams, Delete CDC infrastructure, change the rules (once CDC has streamed, only the column rules: changing the table set needs Start over), deploy again and Start CDC. Deleting the stack also deletes the stream position (see below). |
 | A CDC stack exists, and no Full Load has run yet (Full load + CDC) | Stop CDC if it streams, Delete CDC infrastructure, change the rules, deploy again, then Start Full Load. Nothing needs reloading. If CDC already streamed, choose drop and recreate in the Start Full Load dialog. |
-| No CDC stack, and a Full Load ran (Full load only or Full load + CDC) | **Change & reload** (next section). |
+| No CDC stack, and a Full Load ran (Full load only or Full load + CDC) | **Change & reload** (next section). Full load only: the table set can also change (see "Changing the table set after a Full Load" below). |
 | No CDC stack, and a Full Load ran before the type was switched to CDC only | Switch the type to Full load + CDC, use Change & reload there, then continue with CDC. |
 | A Full Load ran, but its job record is no longer available | Delete the CDC stack first if one exists, then **Start over**. |
 
@@ -517,8 +521,9 @@ More details:
 
 - **Full load only with a stack.** If a stack exists while the type is Full load only,
   switch to Full load + CDC to delete it, because Full load only has no CDC step.
-- **The table set.** It is fixed after a Full Load. Change & reload changes columns
-  only; changing the tables needs Start over.
+- **The table set.** In Full load + CDC and CDC only, it is fixed after a Full Load:
+  Change & reload changes columns only, and changing the tables needs Start over. In
+  Full load only, see "Changing the table set after a Full Load" below.
 - **Starting CDC again after a delete.** On MySQL, Start CDC on Automatic re-seeds from
   the Full Load watermark (the binlog since that load must still exist; Start CDC warns
   if it was purged). On PostgreSQL, deleting the stack drops the replication slot and
@@ -537,8 +542,13 @@ More details:
 For a Full Load migration type whose run is recorded and that has no CDC stack, the
 read-only popup offers **Change & reload**. It opens **Change exclusions & reload**:
 
-- **Column rules are editable; the table set is fixed.** A table line that would change
-  the selection is an error.
+- **Column rules are editable.** In Full load + CDC, a table line that would change the
+  selection is an error. In Full load only, it changes the selection (see the next
+  section): a table it unselects is left as is on Aurora DSQL (not dropped); a table it
+  selects that is not loaded yet is loaded by Retry unfinished tables; a table it selects
+  that the last Full Load already loaded is kept as is, unless a column rule now excludes
+  columns in it, in which case it is listed for **Drop & reload** like any other table
+  whose excluded columns change.
 - **Before anything is dropped, it shows exactly what will happen:** each table it will
   drop and reload, with the column diff (`+ c (NULL)`, `- c`) and a row estimate ("N
   rows re-read"), plus the warnings and the ALTERs those tables will get. "Their rows on
@@ -550,7 +560,7 @@ read-only popup offers **Change & reload**. It opens **Change exclusions & reloa
   No Start dialog follows: the reload starts right away.
 - **A text-only change drops nothing.** If no table's excluded columns change (for
   example, you only added a comment), the button reads **Save** and stores the rules
-  only.
+  only (in Full load only, also the table selection a table line changes).
 - **Omit-only conversion.** For each table holding omit-only entries (excluded before
   v0.1.562, or adopted from a stack as omit-only; see §13.10), there is an unticked
   checkbox "Reload *table* so its ... are NULL (now they hold the target DEFAULT)". Tick
@@ -562,6 +572,42 @@ recorded, nothing is locked and you edit the rules directly. Where it is offered
 disabled, with the reason, while a Full Load runs, while foreign keys are being applied,
 while Cut over restores DEFAULTs, and, after an app restart, until you re-verify the
 connections on the Connect step.
+
+### Changing the table set after a Full Load (Full load only)
+
+In Full load only, the table set is not fixed by a Full Load. While no Full Load,
+foreign-key pass or cut-over DEFAULT restore runs and no CDC stack exists, tick or untick
+tables in the table list, or use a table line (`exclude table ...`) in Change & reload.
+No Start over is needed.
+
+- **An unticked table is left as is on Aurora DSQL (not dropped).** This migration no
+  longer loads or validates it. When a table rule unselects it, its excluded-column
+  entries are not kept.
+- **A ticked table that is not loaded yet is loaded by Retry unfinished tables.** The
+  Full Load step lists it as "Not loaded yet — selected after the last Full Load", and
+  the step reads Failed until it is loaded. The retry keeps every loaded table and reuses
+  the original watermark. The new table was never checked, so re-run the prerequisite
+  checks first when the tool asks: until then, Retry unfinished tables is disabled when
+  only new tables are unfinished, and refuses them when other tables are retried too.
+  Its column rules apply on that first load: Change & reload never drops and reloads a
+  table the last Full Load did not have.
+- **A ticked table the last Full Load already loaded is kept as is.** It is not loaded
+  again (Reload specific tables on the Full Load step reloads it). If your rules had
+  unselected it, ticking it again does not bring back its excluded columns (their entries
+  were not kept): the Exclude tables & columns row warns, and Change & reload applies your
+  rules to it again.
+- **Foreign keys.** Unticking tables after a complete **Apply foreign keys** pass keeps
+  its result: the keys stay in place. After you tick a table (or untick one after a
+  stopped pass), the card asks you to apply again: keys already in place are kept, but
+  the pass re-checks every key.
+- **Validation.** Once a newly selected table is loaded, re-run Validation: Cut over
+  holds until the result covers every table selected since the Full Load (or you turn
+  its chip off under Objects to validate). While such a table is not loaded yet, Cut over
+  points you back to the Data Migration step.
+- **The migration type stays on Full load only.** CDC would stream the set the Full Load
+  started with, so the type selector stays locked until **Re-run Full Load** takes a
+  fresh watermark over the current set, or you restore the original set.
+- **Refresh objects stays hidden** after a load, as before.
 
 ### From a quarantine or a dead letter
 
@@ -718,6 +764,9 @@ ALTER TABLE "shop"."users" ALTER COLUMN "status" SET DEFAULT ('active'::text)
 - **Cutting over with DEFAULTs owed is not blocked.** A warning above
   "I've cut over to DSQL" carries its own **Restore DEFAULTs** button, and the
   acknowledgement logs `cut over with N DEFAULTs not restored`.
+- **A table no longer selected.** A column whose table is no longer selected for the
+  migration (Full load only can unselect a loaded table) is never restored
+  automatically: it is listed under **Needs your decision**.
 
 If the ledger cannot be read, the block says so ("The record of dropped DEFAULTs could
 not be read ...") and offers **Check again**.
@@ -851,8 +900,10 @@ session-state SQLite file. The ledger is left in place, keyed by the target.
 - A restored DEFAULT applies to **new rows only**; the migrated rows stay NULL.
 - A hand-written `CHECK` constraint that rejects NULL is not detected in advance (the
   table fails with 23514).
-- After a Full Load, the **table set** can change only through Start over. Once a CDC
-  stack is deployed, its exclusions change only after Delete CDC infrastructure.
+- In Full load + CDC and CDC only, the **table set** can change after a Full Load only
+  through Start over (Full load only: see "Changing the table set after a Full Load" in
+  §13.7). Once a CDC stack is deployed, its exclusions change only after Delete CDC
+  infrastructure.
 - Rows already on Aurora DSQL **before CDC started** keep their values in an excluded
   column.
 - The capture list must fit 4,096 bytes (§13.8). Two names that join to the same

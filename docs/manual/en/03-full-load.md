@@ -225,6 +225,12 @@ The "retry failed tables" path resets only the failed tables to pending, **reuse
 the original watermark**, and keeps the completed tables — so you never redo work
 or lose the CDC handoff point.
 
+A table selected after the load (Full load only lets the table set change; see
+[13.7](13-excluding-tables-and-columns.md)) is loaded by the same retry, but the
+original watermark does not cover it, so the CDC handoff holds only for the original
+set: the migration type stays on Full load only until Re-run Full Load takes a fresh
+watermark over the current set (or you restore the original set).
+
 > **Run Full Load from the command line (optional).** The same bulk loader is
 > available as a CLI script — `scripts/run_full_load.py` (plan first, then `--yes`;
 > optional `--clean` and `--watermark-out` to capture the CDC watermark) — for

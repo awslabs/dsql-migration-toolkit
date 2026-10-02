@@ -775,8 +775,13 @@ def test_table_findings_say_left_as_is_and_scope_the_fk_line_to_selected_childre
     messages = [f.message for f in found]
     assert messages[0] == "Not loaded by this migration; left as is on Aurora DSQL (not dropped)."
     assert not any("stays empty" in m for m in messages)
-    assert ("shop.orders.fk_cust will be skipped by the orphan check when foreign keys are "
-            "applied (Data Migration for Full load only; Cut over for CDC).") in messages
+    # Truthful about what the orphan check does (G12): rows an earlier load left on Aurora
+    # DSQL satisfy it, and a table absent from the target means the key is not applied.
+    assert ("shop.orders.fk_cust references it. When foreign keys are applied (Data "
+            "Migration for Full load only; Cut over for CDC), that key is checked against the "
+            "rows this table has on Aurora DSQL: applied if every referenced row is there, "
+            "skipped by the orphan check if one is missing, and not applied if the table is "
+            "not on Aurora DSQL.") in messages
     assert "View shop.v_cust will return no rows." in messages
     assert messages[-1] == "Column rules on it have no effect while it is unselected."
     unselected_child = build_exclusion_context(

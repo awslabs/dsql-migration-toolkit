@@ -123,8 +123,10 @@ Validation은 **테이블 단위**로, 선택할 수 있는 점증적 엄밀도�
 
 Validation이 깨끗한 **MATCH**(또는 모든 차이가 설명됨)를 보고하고 — CDC 마이그레이션이면 5.5의
 dead-letter 확인까지 해소되면 — 마지막 워크플로 단계인 **Cut over**가 UI에 나타나며 애플리케이션을 소스 데이터베이스(RDS/Aurora MySQL 또는 PostgreSQL)에서
-DSQL로 전환하는 런북을 제공합니다. 전환 순서
-(CDC drain vs Full Load freeze)와 롤백 앵커는 [결론](10-conclusion.md)의 권장 end-to-end 흐름을
+DSQL로 전환하는 런북을 제공합니다. Full load only에서는 Cut over에 보고서가 Full Load 이후 선택한 모든
+테이블을 다루는 것도 필요합니다: 그런 테이블 중 보고서에 행이 없는 테이블이 있으면, 그 테이블을 로드하고
+Validation을 다시 실행할 때까지(또는 **Objects to validate**에서 그 칩을 끌 때까지) Cut over가 보류됩니다.
+전환 순서(CDC drain vs Full Load freeze)와 롤백 앵커는 [결론](10-conclusion.md)의 권장 end-to-end 흐름을
 참고하세요.
 
 > **명령줄에서 검증 (선택).** 이 내장 Validation 외에도, 읽기 전용 CLI 스크립트 2개로 셸에서

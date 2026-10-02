@@ -355,6 +355,10 @@ class DataMigrationState:
         self.fk_apply_job_id: Optional[str] = None
         # (done, total) foreign keys, for the action's progress while it runs.
         self.fk_apply_progress: Optional[tuple] = None
+        # True when fk_apply_result was voided because the table set changed after the pass
+        # (Full load only, G12): the keys it applied are still in place, so the card asks to
+        # apply again for the changed set instead of saying they were never applied.
+        self.fk_result_scope_changed: bool = False
         self.cdc_connector_names: list[str] = []
         # Subset of cdc_connector_names whose MSK connectorState is RUNNING (vs
         # still CREATING/UPDATING). Lets the lifecycle card distinguish "deployed
@@ -661,6 +665,9 @@ class DataMigrationState:
             reason = lock_check()
             if reason:
                 return reason
+        before = (
+            self._fk_scope_before() if resolution.selected_after is not None else None
+        )
         with self._lock:
             if token is not None and token != self._edit_token():
                 return (
@@ -683,6 +690,7 @@ class DataMigrationState:
             if resolution.selected_after is not None:
                 self.selection = TableSelection(selected_tables=list(resolution.selected_after))
                 self.selection_touched = True
+                self._clear_fk_result_on_scope_change(before, resolution.selected_after)
             self._rule_excluded_tables = set(resolution.rule_excluded_after)
             self._rule_reticked_tables = set()
             self._exclusion_rules_text = text
@@ -1328,9 +1336,12 @@ class DataMigrationState:
             self.fk_apply_progress = (int(done), int(total))
 
     def set_fk_apply_result(self, result: Optional[tuple]) -> None:
-        """Record the "Apply foreign keys" outcome ``(applied, skipped, failed)``."""
+        """Record the "Apply foreign keys" outcome ``(applied, skipped, failed)``. Any write
+        ends the "table set changed" reading (a new load, a Drop & reload, a new pass): its
+        own copy then applies."""
         with self._lock:
             self.fk_apply_result = result
+            self.fk_result_scope_changed = False
 
     def set_cdc_controller(
         self, controller: object, identity: Optional[tuple] = None
@@ -1759,9 +1770,52 @@ class DataMigrationState:
 
     def set_selection(self, selection: TableSelection) -> None:
         """Replace the table selection for the sub-flow (marks it user-touched)."""
+        before = self._fk_scope_before()
         with self._lock:
             self.selection = selection
             self.selection_touched = True
+            self._clear_fk_result_on_scope_change(before, selection.selected_tables)
+
+    def _fk_scope_before(self) -> "Optional[list[str]]":
+        """The effective selection before a change, when a previous foreign-key result
+        could go stale (Full load only after a Full Load, G12); else ``None``. Resolved
+        OUTSIDE the (non-reentrant) lock: the resolver reads this state."""
+        if (
+            getattr(self, "fk_apply_result", None) is None
+            or getattr(self, "job_id", None) is None
+            or self.migration_type is not MigrationType.FULL_LOAD_ONLY
+        ):
+            return None
+        return self.resolved_selection()
+
+    def _clear_fk_result_on_scope_change(
+        self, before: "Optional[list[str]]", after: "Sequence[str]"
+    ) -> None:
+        """With the lock held: a real change of the table set after an "Apply foreign
+        keys" pass voids its result -- the card compared counts, so swapping a table with N
+        keys for another with N read "in place" for keys never applied. The card then
+        offers Apply again (idempotent: an existing constraint is a no-op), saying why
+        (``fk_result_scope_changed``) instead of "not yet applied".
+
+        A pure REMOVAL after a COMPLETE pass keeps the result: unticking a table can only
+        shrink the keys in scope (``foreign_keys_in_scope``), every one of which that pass
+        settled, and nothing on Aurora DSQL changes. A stopped pass (fewer settled than its
+        own total) is voided even then: its unreached keys could all leave the scope while
+        the count still reads "in place" for keys that do not exist."""
+        if before is None or self.fk_apply_result is None:
+            return
+        before_set, after_set = set(before), set(after)
+        if before_set == after_set:
+            return
+        settled = sum(int(n or 0) for n in tuple(self.fk_apply_result)[:3])
+        progress = self.fk_apply_progress
+        complete = progress is not None and settled >= int(tuple(progress)[1] or 0)
+        # An EMPTY selection is "every table" to the foreign-key scope: never a shrink.
+        if after_set and after_set < before_set and complete:
+            return
+        self.fk_apply_result = None
+        self.fk_apply_progress = (0, 0)
+        self.fk_result_scope_changed = True
 
     def selection_snapshot(self) -> "tuple[tuple[str, ...], bool]":
         """``(selected tables, touched)`` now, for :meth:`pin_checked_selection`."""
