@@ -5502,11 +5502,14 @@ def _start_cdc_deploy(
         return
     # FIX 1 (PostgreSQL): a COMPOSITE_KEY re-key prepends a non-PK "leading" column to the
     # CDC record key. Under REPLICA IDENTITY DEFAULT the UPDATE/DELETE before-image carries
-    # only the source PK, so the sink cannot build the re-keyed DELETE and the delete is
-    # silently lost. The tool sets REPLICA IDENTITY FULL on exactly those tables during Full
-    # Load provisioning (cdc_pg_slot); surface the requirement here so a CDC-only start
-    # (no Full Load in this session) knows it must be set on the source first. MySQL is
-    # immune (its binlog before-image is the full row), so this is PostgreSQL-only.
+    # only the source PK, so the DELETE does not carry the leading column and does not
+    # remove its row on Aurora DSQL -- silently (Debezium fills the absent NOT NULL column
+    # with a placeholder, offline-proven, so the sink's NULL-key guard cannot fire). The
+    # tool sets REPLICA IDENTITY FULL on exactly those tables during Full Load provisioning
+    # (cdc_pg_slot); surface the requirement here so a CDC-only start (no Full Load in this
+    # session) knows it must be set on the source first, and that it must STAY FULL: while
+    # CDC runs the monitor re-checks it (ui/cdc_replica_identity_gate.py). MySQL is immune
+    # (its binlog before-image is the full row), so this is PostgreSQL-only.
     if _cdc_source_type(session) is SourceType.POSTGRES:
         from dsql_migrator.core import cdc_pg_slot as _pg_slot
 
@@ -5544,13 +5547,15 @@ def _start_cdc_deploy(
                 header="Re-keyed tables need REPLICA IDENTITY FULL on the source",
                 body=(
                     "These tables are keyed on a composite (re-keyed) primary key, so a "
-                    "DELETE must carry the added leading key column or it is applied to 0 "
-                    "rows and silently lost: " + ", ".join(_rekeyed_full) + ". The tool sets "
+                    "DELETE must carry the added leading key column or it does not remove "
+                    "the row on Aurora DSQL and is silently lost: "
+                    + ", ".join(_rekeyed_full) + ". The tool sets "
                     "REPLICA IDENTITY FULL during Full Load ONLY when that run also "
                     "provisions the replication slot — a Full-load-only run does not, and "
                     "neither does a CDC-only start. Run the CDC prerequisite checks: they "
                     "read the source's actual REPLICA IDENTITY and block the start with the "
-                    "exact ALTER TABLE to run."
+                    "exact ALTER TABLE to run. Keep it FULL for the whole run: while CDC "
+                    "runs the tool re-checks it and holds Cut over if it drops."
                 ),
             )
     # FIX 4: SeedMode is engine-aware -- the SINGLE source of truth shared with the infra

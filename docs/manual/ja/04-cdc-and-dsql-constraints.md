@@ -174,6 +174,37 @@ Reason** で一覧します — ページング・フィルタ対応、テーブ
 残りません。テーブルごとの件数、最新時刻、ドリフトの種類は残り、Cut over が確認するのはそれです
 ([§5.5](05-validation.md#55-cdc-のデッドレターとカットオーバー))。
 
+### リキーされた PostgreSQL テーブル: REPLICA IDENTITY の再確認
+
+CDC がリキーするテーブル(ソースの主キー外の列を加えた複合ターゲットキー)は、ソースの `REPLICA IDENTITY`
+がテーブルとすべてのパーティションで **FULL** の間だけ、`DELETE` にその列を載せます。FULL 未満では delete
+が Aurora DSQL 上の行を削除せず、デッドレターにもなりません — そのためモニターがこれを読み直し(該当する
+テーブル全体に対して読み取り専用のカタログクエリを 1 回、最大 2 分に 1 回。MySQL ソースでは行いません)、
+次の通知を表示します:
+
+- **赤 — 「Deletes on re-keyed tables are being lost」:** テーブル(またはそのパーティションのいずれか)が
+  FULL 未満です。ソースで `ALTER TABLE <table> REPLICA IDENTITY FULL` を実行してください — 親は伝播せず、
+  新しいパーティションは `DEFAULT` で始まるため、各パーティションにも — そのうえで **Check again** を
+  押します。Cut over は保留されます。修正前に行われた delete は再生されません。読み直し自体が失敗した
+  場合は通知がそう伝えます: ソースの認証情報やネットワークアクセスが変わった場合は、Connect ステップで
+  ソースを再接続してください。
+- **黄 — 「REPLICA IDENTITY is FULL again」:** 修正は反映されましたが、FULL 未満だった間の delete が
+  欠けている可能性があります。Validation がそのテーブルを自動的に CHECKSUM で比較し、Cut over は修正後に
+  開始した一致を待ちます([§5.6](05-validation.md#56-リキーされた-postgresql-テーブルとカットオーバー))。
+  ただし、そこで **Continue without this check** を選んだ場合は待ちません。テーブルが異なる場合: CDC を
+  追いつかせてから Stop CDC、Full Load ステップで **Drop & reload** でリロード、Start CDC、再確認。CDC
+  only には Full Load ステップがないため、代わりに Aurora DSQL 上の余分な行を手作業で削除してください。
+  FULL 未満だったテーブルを CDC がリキーしなくなった場合(ソースの主キーで再デプロイした、またはソースの
+  主キーがレコードキーを含むようになった)も、同じ通知が「REPLICA IDENTITY was below FULL on re-keyed
+  tables」という見出しで表示されます: それ以前に失われた delete には引き続き CHECKSUM が必要です。
+- **情報 — 「Can't re-check REPLICA IDENTITY on the source」:** ソースのパスワードはメモリ上にしかない
+  ため、アプリの再起動後は Connect ステップで再接続するまでツールは接続できません。その間、これらの
+  テーブルを FULL に保ってください。
+- **黄 — 「Can't re-check REPLICA IDENTITY on the source」:** 最後の読み取りが失敗しました(2 分後に
+  再試行します)。その間、これらのテーブルを FULL に保ってください。
+
+それぞれの変化(FULL 未満、再び FULL、リキー対象外になった)はアクティビティログに 1 回ずつ記録されます。
+
 ---
 
 **次へ:** [5. Validation →](05-validation.md)

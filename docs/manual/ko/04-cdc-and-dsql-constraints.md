@@ -236,6 +236,35 @@ per-table 표 위에 **파이프라인 헬스 카드**가 각 커넥터 상태�
 — §4.5 참고.) 레코드 목록은 메모리에만 있어 앱 재시작 후에는 남지 않습니다. 테이블별 건수, 최신 시각,
 드리프트 종류는 남으며, Cut over가 확인하는 것이 바로 이것입니다([§5.5](05-validation.md#55-cdc-dead-letter와-컷오버)).
 
+### 재키잉된 PostgreSQL 테이블: REPLICA IDENTITY 재확인
+
+CDC가 재키잉하는 테이블(소스 기본 키 밖의 컬럼을 더한 복합 타깃 키)은 소스의 `REPLICA IDENTITY`가 테이블과
+모든 파티션에서 **FULL**일 때만 `DELETE`에 그 컬럼을 싣습니다. FULL 미만이면 delete가 Aurora DSQL에서 행을
+지우지 못하고, dead letter도 남지 않습니다 — 그래서 모니터가 이를 다시 읽고(그런 테이블 전체에 대해 읽기 전용
+카탈로그 쿼리 한 번, 최대 2분에 한 번, MySQL 소스에서는 하지 않음) 다음 알림을 보여 줍니다:
+
+- **빨간색 — "Deletes on re-keyed tables are being lost":** 테이블(또는 그 파티션 중 하나)이 FULL
+  미만입니다. 소스에서 `ALTER TABLE <table> REPLICA IDENTITY FULL`을 실행하세요 — 부모는 전파되지 않고
+  새 파티션은 `DEFAULT`로 시작하므로 각 파티션에도 — 그런 다음 **Check again**을 누르세요. Cut over가
+  보류됩니다. 수정 전에 일어난 delete는 다시 재생되지 않습니다. 다시 읽기 자체가 실패하면 알림이 그렇게
+  알려 줍니다: 소스 자격 증명이나 네트워크 접근이 바뀌었다면 Connect 단계에서 소스를 다시 연결하세요.
+- **노란색 — "REPLICA IDENTITY is FULL again":** 수정은 반영되었지만 FULL 미만이던 동안의 delete가 빠져
+  있을 수 있습니다. Validation이 그 테이블을 자동으로 CHECKSUM으로 비교하고, Cut over는 수정 후에 시작한
+  일치를 기다립니다([§5.6](05-validation.md#56-재키잉된-postgresql-테이블과-컷오버)). 단, 그곳에서
+  **Continue without this check**를 선택했다면 기다리지 않습니다. 테이블이 다르면: CDC가 따라잡게 둔 뒤
+  Stop CDC, Full Load 단계에서 **Drop & reload**로 리로드, Start CDC, 재확인. CDC only에는 Full Load 단계가
+  없으므로 대신 Aurora DSQL에서 잉여 행을 직접 삭제하세요. FULL 미만이던 테이블을 CDC가 더 이상 재키잉하지
+  않게 되면(소스 기본 키로 다시 배포했거나, 소스 기본 키가 이제 레코드 키를 포함함) 같은 알림이 "REPLICA
+  IDENTITY was below FULL on re-keyed tables"라는 제목으로 나타납니다: 그 전에 유실된 delete에는 여전히
+  CHECKSUM이 필요합니다.
+- **정보 — "Can't re-check REPLICA IDENTITY on the source":** 소스 비밀번호는 메모리에만 있으므로 앱
+  재시작 후에는 Connect 단계에서 다시 연결할 때까지 도구가 접속할 수 없습니다. 그동안 이 테이블들을 FULL로
+  유지하세요.
+- **노란색 — "Can't re-check REPLICA IDENTITY on the source":** 마지막 읽기가 실패했습니다(2분 뒤 다시
+  시도). 그동안 이 테이블들을 FULL로 유지하세요.
+
+각 변화(FULL 미만, 다시 FULL, 더 이상 재키잉하지 않음)는 활동 로그에 한 번씩 기록됩니다.
+
 ---
 
 **다음:** [5. Validation →](05-validation.md)

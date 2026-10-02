@@ -69,6 +69,20 @@ fails **loudly** where it can't.
     consistency point, so WAL is pinned by the slot instead of by a retention window
     (watch `wal_status` — an inactive slot can fill the source disk).
     Replication-slot / `max_wal_senders` headroom is checked (non-blocking).
+  - **PostgreSQL source, re-keyed tables:** a table CDC re-keys — Schema
+    Conversion's **Composite key**, or an edited target key that adds a column outside
+    the source primary key — needs **`REPLICA IDENTITY FULL` on the table and on every
+    partition, for the whole CDC run**, not only at Start (a partition created later
+    starts at `DEFAULT`). Below FULL, a `DELETE` on that table does not remove its row
+    on Aurora DSQL — silently, with no error and no dead letter — and an `UPDATE` that
+    changes a key column is affected too. The prerequisites block Start. While the
+    Data Migration, Validation or Cut over step is open, the tool re-reads it at most
+    every 2 minutes: a red notice appears in the CDC monitor, and Cut over is held
+    until it is FULL again and the table matches by CHECKSUM
+    (see [§5.6](05-validation.md#56-re-keyed-postgresql-tables-and-cut-over)). After an
+    app restart the re-check needs the source password again (reconnect on the Connect
+    step). A drop and its reversal between two re-checks are not seen, so keep FULL in
+    place.
 - **CDC replicates data, not DDL.** Schema changes on the source during CDC are
   **not** propagated to DSQL — you must apply equivalent DDL to DSQL yourself
   (see [Chapter 4 §4.2](04-cdc-and-dsql-constraints.md#42-cdc-replicates-data-not-schema--important)).

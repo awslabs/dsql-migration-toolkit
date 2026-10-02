@@ -1370,6 +1370,58 @@ class CdcDlqWaiver(BaseModel):
     waived_at: datetime
 
 
+class CdcReplicaIdentityFinding(BaseModel):
+    """A re-keyed PostgreSQL table whose REPLICA IDENTITY was read below FULL while CDC ran.
+
+    A table CDC re-keys (its record key adds a column outside the source primary key) needs
+    REPLICA IDENTITY FULL on the table and every partition, or a DELETE does not carry that
+    column and does not remove its row on Aurora DSQL -- silently, with no dead letter. The
+    Start prerequisite checks it once; the runtime re-check (``ui/cdc_replica_identity_gate``)
+    re-reads it while CDC runs and records each drop here, kept across restarts. OPEN
+    (``restored_at`` None) holds Cut over outright; once restored (``restored_by`` "full",
+    or "not-rekeyed" when CDC stopped re-keying the table) Cut over waits for a CHECKSUM
+    match started after ``restored_at``. Value-free (Property 7): table and partition names,
+    identity codes and times only. Frozen, replaced on every change.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    key_columns: list[str]
+    primary_key: list[str] = Field(default_factory=list)
+    first_weak_at: datetime
+    restored_at: Optional[datetime] = None
+    restored_by: Optional[Literal["full", "not-rekeyed"]] = None
+    # pg_class.relreplident of the table itself at the latest weak read ('d'/'n'/'i'/'f').
+    identity: str = ""
+    weak_partitions: int = Field(default=0, ge=0)
+    weak_partition_names: list[str] = Field(default_factory=list, max_length=5)
+
+    @property
+    def missing(self) -> list[str]:
+        """The record-key columns outside the source primary key (what a DELETE lacks)."""
+        pk = set(self.primary_key)
+        return [c for c in self.key_columns if c not in pk]
+
+    @property
+    def key_omits_source_pk(self) -> bool:
+        """The key does not contain the whole source primary key (a wrong-row DELETE risk)."""
+        return not set(self.primary_key) <= set(self.key_columns)
+
+
+class CdcReplicaIdentityWaiver(BaseModel):
+    """The operator's recorded decision to cut over without CHECKSUM proof for re-keyed tables
+    whose REPLICA IDENTITY was below FULL earlier and that Validation cannot prove (left out of
+    the report, or inside an accepted gap). Scoped: each table maps to the ``restored_at`` it
+    was waived against, so a later drop (a new finding and a new restore) re-opens the check.
+    Never covers a table whose identity is below FULL now, nor one a CHECKSUM can re-check.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tables: dict[str, datetime] = Field(default_factory=dict)
+    waived_at: datetime
+
+
 class LoadStatusView(BaseModel):
     """Normalized monitoring read-model rendered identically for Full Load/CDC.
 

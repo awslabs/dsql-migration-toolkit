@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Callable, Mapping, Optional, Sequence
+from typing import Callable, Mapping, NamedTuple, Optional, Sequence
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -153,8 +153,11 @@ def rekeyed_tables_needing_full_identity(
     A ``COMPOSITE_KEY`` schema conversion re-keys the change record on
     ``(leading, *source_pk)`` (:func:`~dsql_migrator.core.cdc.composite_key_columns_for_cdc`).
     Under PostgreSQL ``REPLICA IDENTITY DEFAULT`` the UPDATE/DELETE before-image carries ONLY
-    the source PRIMARY-KEY columns, so the prepended ``leading`` column is ABSENT -- and the
-    sink cannot build the re-keyed DELETE, so that delete is SILENTLY LOST. Such a table
+    the source PRIMARY-KEY columns, so the prepended ``leading`` column is ABSENT -- the
+    DELETE does not carry it, so it does not remove its row on Aurora DSQL, and the loss is
+    SILENT (Debezium fills the absent NOT NULL column with a placeholder rather than NULL,
+    offline-proven; the v50 live run saw no DELETE reach the sink at all -- either way no
+    error and no dead letter). Such a table
     needs ``REPLICA IDENTITY FULL`` (the before-image then carries every column). A re-key
     that only REORDERS existing PK columns adds nothing outside the PK, so DEFAULT identity
     already covers it and it is NOT returned. (MySQL is immune -- its binlog before-image is
@@ -167,6 +170,127 @@ def rekeyed_tables_needing_full_identity(
         if set(key_cols) - pk:
             offending.append(table)
     return sorted(offending)
+
+
+class RekeyedIdentityRead(NamedTuple):
+    """One re-keyed table's live REPLICA IDENTITY facts, as the runtime re-check reads them.
+
+    ``identity`` is ``pg_class.relreplident`` of the table itself ('d'/'f'/'i'/'n');
+    ``primary_key`` its LIVE primary-key columns (column order); ``weak_partitions`` how many
+    of its LEAF partitions are not FULL (0 for a plain table), and ``weak_partition_names``
+    at most five of them, sorted. Value-free: names and codes only.
+    """
+
+    identity: str
+    primary_key: tuple
+    weak_partitions: int
+    weak_partition_names: tuple
+
+
+# ONE catalog round trip for every scoped table. Leaves are aggregated SERVER-side (a count
+# plus at most five names), never one row per leaf, so a heavily partitioned table costs the
+# same result size as a plain one. Catalog only: no table scan, no lock. pg_partition_tree is
+# PostgreSQL 12+ (the tool targets 13-18); ``a.attnum = ANY(i.indkey)`` reads the int2vector
+# directly. The approved live check runs this on PG 13-17 (see the G2 notes).
+_REKEYED_REPLICA_IDENTITY_SQL = (
+    "SELECT n.nspname || '.' || c.relname AS qname, "
+    "       c.relreplident::text AS identity, "
+    "       ARRAY(SELECT a.attname::text "
+    "             FROM pg_catalog.pg_index i "
+    "             JOIN pg_catalog.pg_attribute a "
+    "               ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
+    "             WHERE i.indrelid = c.oid AND i.indisprimary "
+    "             ORDER BY a.attnum) AS pk_columns, "
+    "       CASE WHEN c.relkind = 'p' THEN "
+    "         (SELECT count(*) "
+    "          FROM pg_catalog.pg_partition_tree(c.oid) t "
+    "          JOIN pg_catalog.pg_class l ON l.oid = t.relid "
+    "          WHERE t.isleaf AND l.relreplident <> 'f') "
+    "       ELSE 0 END AS weak_partitions, "
+    "       CASE WHEN c.relkind = 'p' THEN "
+    "         ARRAY(SELECT ln.nspname || '.' || l.relname "
+    "               FROM pg_catalog.pg_partition_tree(c.oid) t "
+    "               JOIN pg_catalog.pg_class l ON l.oid = t.relid "
+    "               JOIN pg_catalog.pg_namespace ln ON ln.oid = l.relnamespace "
+    "               WHERE t.isleaf AND l.relreplident <> 'f' "
+    "               ORDER BY 1 LIMIT 5) "
+    "       ELSE ARRAY[]::text[] END AS weak_sample "
+    "FROM pg_catalog.pg_class c "
+    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "WHERE c.relkind IN ('r','p') "
+    "  AND n.nspname || '.' || c.relname = ANY(:names)"
+)
+
+
+def read_rekeyed_replica_identity(
+    connection: object, names: Sequence[str]
+) -> "dict[str, RekeyedIdentityRead]":
+    """Read the live REPLICA IDENTITY facts of the re-keyed ``names`` (read-only, ONE statement).
+
+    Returns ``{qualified name: RekeyedIdentityRead}`` for each name found on the source; a
+    name absent from the result was not found (the caller grades it "unknown", never FULL).
+    RAISES on failure, like :func:`read_pg_replication_objects`: unreadable is not evidence
+    of anything, and the caller must tell it apart from a read. Run it only through the
+    read-only guarded source engine (``make_source_engine_factory``) -- never this module's
+    write engine.
+    """
+    wanted = sorted({str(n) for n in names or () if n})
+    if not wanted:
+        return {}
+    rows = connection.execute(  # type: ignore[attr-defined]
+        text(_REKEYED_REPLICA_IDENTITY_SQL), {"names": wanted}
+    ).fetchall()
+    out: dict[str, RekeyedIdentityRead] = {}
+    for row in rows:
+        sample = tuple(str(v) for v in (row[4] or ()) if v is not None)[:5]
+        out[str(row[0])] = RekeyedIdentityRead(
+            identity=str(row[1]) if row[1] is not None else "",
+            primary_key=tuple(str(v) for v in (row[2] or ()) if v is not None),
+            weak_partitions=max(int(row[3] or 0), 0),
+            weak_partition_names=sample,
+        )
+    return out
+
+
+REPLICA_IDENTITY_WEAK = "weak"
+REPLICA_IDENTITY_FULL = "full"
+REPLICA_IDENTITY_UNKNOWN = "unknown"
+
+
+def grade_rekeyed_replica_identity(
+    table: str,
+    key_columns: Sequence[str],
+    read: "Optional[RekeyedIdentityRead]",
+) -> Optional[str]:
+    """Grade one re-keyed table's live identity with the Start prerequisite's OWN rule. Pure.
+
+    ``"weak"`` (the prerequisite would FAIL: deletes are being lost), ``"full"`` (it would
+    PASS), ``"unknown"`` (INFO, or no row was read), or ``None`` when the key adds nothing
+    beyond the LIVE primary key (not re-keyed in the sense that matters). A missing ``read``
+    is always ``"unknown"`` -- never graded as not-re-keyed, which would close a finding on
+    the strength of a read that found nothing.
+    """
+    if read is None:
+        return REPLICA_IDENTITY_UNKNOWN
+    from dsql_migrator.core.models import PrerequisiteStatus, TableDef
+    from dsql_migrator.core.prerequisites_postgres import (
+        replica_identity_covers_key_result,
+    )
+
+    result = replica_identity_covers_key_result(
+        TableDef(name=table, primary_key=list(read.primary_key)),
+        list(key_columns or ()),
+        identity=read.identity or None,
+        weak_partition_names=read.weak_partition_names,
+        weak_partition_count=read.weak_partitions,
+    )
+    if result is None:
+        return None
+    if result.status is PrerequisiteStatus.FAIL:
+        return REPLICA_IDENTITY_WEAK
+    if result.status is PrerequisiteStatus.PASS:
+        return REPLICA_IDENTITY_FULL
+    return REPLICA_IDENTITY_UNKNOWN
 
 
 def build_pg_source_write_engine(
@@ -877,6 +1001,12 @@ __all__ = [
     "pg_slot_name",
     "pg_publication_name",
     "rekeyed_tables_needing_full_identity",
+    "RekeyedIdentityRead",
+    "read_rekeyed_replica_identity",
+    "grade_rekeyed_replica_identity",
+    "REPLICA_IDENTITY_WEAK",
+    "REPLICA_IDENTITY_FULL",
+    "REPLICA_IDENTITY_UNKNOWN",
     "set_replica_identity_full",
     "build_pg_source_write_engine",
     "publication_exists",

@@ -2014,3 +2014,130 @@ def test_a_new_dead_letter_on_a_table_already_in_the_ledger_triggers_a_save() ->
     ms.fold_cdc_dlq_ledger([CdcConnectorError(table="orders", message="DLQ offset=2: x")])
     assert ms.cdc_dlq_ledger["orders"].count == 2
     assert sig() != one
+
+
+# ---------------------------------------------------------------------------
+# G2: the REPLICA IDENTITY findings, the deployed re-key map and the waiver survive a restart
+# ---------------------------------------------------------------------------
+
+
+def _g2_finding(**kw):
+    from dsql_migrator.core.models import CdcReplicaIdentityFinding
+
+    base = dict(
+        key_columns=["tenant_id", "id"], primary_key=["id"], identity="d",
+        first_weak_at=datetime(2026, 9, 1, 11, 0, tzinfo=timezone.utc),
+        weak_partitions=2, weak_partition_names=["app.t_p1", "app.t_p2"],
+    )
+    base.update(kw)
+    return CdcReplicaIdentityFinding(**base)
+
+
+def test_replica_identity_findings_map_and_waiver_round_trip() -> None:
+    from dsql_migrator.core.models import CdcReplicaIdentityWaiver
+    from dsql_migrator.ui.validation import ValidationState
+
+    session, eval_state, conv_state, ms = _populated_states()
+    fixed = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    ms.cdc_replica_identity_findings = {
+        "app.t": _g2_finding(restored_at=fixed, restored_by="full"),
+        "app.u": _g2_finding(),
+    }
+    ms.cdc_deployed_message_key_columns = {"app.t": ["tenant_id", "id"], "app.u": ["tenant_id", "id"]}
+    ms.cdc_replica_identity_last_probe = object()  # transient: never persisted
+    vstate = ValidationState()
+    vstate._result = _g1_report()
+    vstate._completed_at = fixed
+    vstate.cutover_replica_identity_waiver = CdcReplicaIdentityWaiver(
+        tables={"app.t": fixed}, waived_at=fixed
+    )
+    snapshot = capture_session_snapshot("s1", session, eval_state, conv_state, ms, vstate)
+    restored = SessionSnapshot.model_validate_json(snapshot.model_dump_json())
+    ms2, v2 = DataMigrationState(), ValidationState()
+    apply_session_snapshot(
+        restored, SessionConnectionState(), EvaluationState(), SchemaConversionState(), ms2, v2,
+    )
+    assert ms2.cdc_replica_identity_findings == ms.cdc_replica_identity_findings
+    assert ms2.cdc_replica_identity_findings["app.t"].restored_at == fixed
+    assert ms2.cdc_replica_identity_findings["app.u"].weak_partition_names == ["app.t_p1", "app.t_p2"]
+    assert ms2.cdc_deployed_message_key_columns == ms.cdc_deployed_message_key_columns
+    assert ms2.cdc_replica_identity_last_probe is None
+    assert v2.cutover_replica_identity_waiver.tables == {"app.t": fixed}
+
+
+def test_an_older_snapshot_restores_no_findings_and_an_unknown_map() -> None:
+    from dsql_migrator.ui.validation import ValidationState
+
+    old = SessionSnapshot.model_validate({
+        "session_id": "s1",
+        "validation_report": _g1_report().model_dump(mode="json"),
+        "validation_completed_at": "2026-09-01T11:40:00+00:00",
+    })
+    assert old.cdc_replica_identity_findings == {}
+    assert old.cdc_deployed_message_key_columns is None
+    assert old.validation_cdc_replica_identity_waiver is None
+    ms, v = DataMigrationState(), ValidationState()
+    apply_session_snapshot(
+        old, SessionConnectionState(), EvaluationState(), SchemaConversionState(), ms, v,
+    )
+    assert ms.cdc_replica_identity_findings == {} and ms.cdc_deployed_message_key_columns is None
+    assert v.cutover_replica_identity_waiver is None
+
+
+def test_a_restore_never_de_scopes_an_open_finding(monkeypatch) -> None:
+    """The restored map lacks the finding's table; the setter would close it as
+    not-rekeyed and log -- a restore must do neither (direct assignment)."""
+    import dsql_migrator.core.activity_log as act
+
+    lines: list = []
+    monkeypatch.setattr(act, "log_activity", lambda *a, **k: lines.append(a))
+    session, eval_state, conv_state, ms = _populated_states()
+    ms.cdc_replica_identity_findings = {"app.t": _g2_finding()}
+    ms.cdc_deployed_message_key_columns = {}
+    ms.cdc_stack_name = "dsql-cdc-other"
+    snapshot = capture_session_snapshot("s1", session, eval_state, conv_state, ms)
+    ms2 = DataMigrationState()
+    apply_session_snapshot(
+        SessionSnapshot.model_validate_json(snapshot.model_dump_json()),
+        SessionConnectionState(), EvaluationState(), SchemaConversionState(), ms2,
+    )
+    assert ms2.cdc_replica_identity_findings["app.t"].restored_at is None
+    # Restored AFTER the stack name (a name change resets the map), so it survives.
+    assert ms2.cdc_stack_name == "dsql-cdc-other"
+    assert ms2.cdc_deployed_message_key_columns == {}
+    assert lines == []
+
+
+def test_the_signature_changes_on_open_restore_and_de_scope_but_not_on_a_silent_reread() -> None:
+    from dsql_migrator.core.models import CdcReplicaIdentityWaiver
+    from dsql_migrator.ui.validation import ValidationState
+
+    session, eval_state, conv_state, ms = _populated_states()
+    vstate = ValidationState()
+    vstate._result = _g1_report()
+
+    def sig():
+        return session_signature(session, eval_state, conv_state, ms, vstate)
+
+    base = sig()
+    ms.cdc_replica_identity_last_probe = object()  # a read that changed nothing
+    assert sig() == base
+    ms.cdc_replica_identity_findings = {"app.t": _g2_finding()}
+    opened = sig()
+    assert opened != base
+    ms.cdc_replica_identity_findings = {"app.t": _g2_finding()}  # identical re-read
+    assert sig() == opened
+    fixed = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    ms.cdc_replica_identity_findings = {"app.t": _g2_finding(restored_at=fixed, restored_by="full")}
+    restored = sig()
+    assert restored != opened
+    ms.cdc_deployed_message_key_columns = {"app.t": ["tenant_id", "id"]}
+    mapped = sig()
+    assert mapped != restored
+    ms.cdc_deployed_message_key_columns = {}
+    assert sig() != mapped
+    descoped = sig()
+    vstate.cutover_replica_identity_waiver = CdcReplicaIdentityWaiver(
+        tables={"app.t": fixed}, waived_at=fixed
+    )
+    assert sig() != descoped

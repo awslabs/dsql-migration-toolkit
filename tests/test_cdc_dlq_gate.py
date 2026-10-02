@@ -1178,3 +1178,38 @@ def test_check_again_is_disabled_while_a_check_runs(monkeypatch):
     assert s.ms.begin_cdc_dlq_check() is True
     s.render()
     assert s.button("Check again").disabled
+
+
+# ---------------------------------------------------------------------------
+# The per-table ladder, extracted for the REPLICA IDENTITY gate (G2): same answers
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "item,kw,expected",
+    [
+        (None, {}, "not-validated"),
+        (_item(matched=False, checksum=False), {"release": "accepted", "explained": True},
+         "accepted-gap"),
+        (_item(matched=False, checksum=False), {}, "not-matched"),
+        (_item(error="boom", matched=False, checksum=None), {}, "not-matched"),
+        (_item(checksum=None), {}, "row-count-only"),
+        (_item(skipped=True), {}, "row-count-only"),
+        (_item(), {"started": None}, "compare-time-unknown"),
+        (_item(), {"started": T_DL + timedelta(seconds=60)}, "compared-before"),
+        (_item(), {"started": T_DL + timedelta(seconds=61)}, None),
+        # An accepted gap is only waivable for an EXPLAINED table; otherwise it is a mismatch.
+        (_item(matched=False, checksum=False), {"release": "accepted", "explained": False},
+         "not-matched"),
+    ],
+)
+def test_table_proof_reason_is_the_gates_own_ladder(item, kw, expected):
+    from dsql_migrator.ui.cdc_dlq_gate import table_proof_reason
+
+    args = {"release": "clean", "explained": False, "started": T_RUN, "last_at": T_DL}
+    args.update(kw)
+    assert table_proof_reason(item, **args) == expected
+    # A naive datetime is read as UTC, exactly like the gate's own inputs.
+    if args["started"] is not None:
+        naive = dict(args, started=args["started"].replace(tzinfo=None))
+        assert table_proof_reason(item, **naive) == expected

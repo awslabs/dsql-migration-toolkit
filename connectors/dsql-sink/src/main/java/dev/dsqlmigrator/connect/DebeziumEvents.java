@@ -188,12 +188,20 @@ final class DebeziumEvents {
    * source: a deleted row stayed on the target while rows from the same transaction that were
    * keyed on the source primary key deleted correctly.
    *
-   * <p>The cause is upstream of the sink -- a table re-keyed onto the target primary key whose
-   * source {@code REPLICA IDENTITY} is DEFAULT, so the added key column is absent from the
-   * DELETE before-image -- and the tool now blocks that configuration in its prerequisites.
-   * This is the backstop: a key the sink cannot use must be LOUD (dead-lettered, like any
-   * other unusable record) rather than silently dropped, because a silent drop is
-   * indistinguishable from success and the operator has no way to find it.
+   * <p>It fires only for a Java {@code null} component, i.e. a NULLABLE key column the record
+   * genuinely carries as null. It does NOT catch the case it was first written for -- a table
+   * re-keyed onto the target primary key whose source {@code REPLICA IDENTITY} is DEFAULT, so
+   * the added key column is absent from the DELETE before-image: offline-proven against the
+   * shipped Debezium 2.7.4 jar, {@code TableSchemaBuilder}'s key generator converts the
+   * absent value with no null check, and for a NOT NULL column (a composite key's leading
+   * column always is) the converter yields a placeholder -- 0, {@code ""} or the column's
+   * DEFAULT -- so the key arrives non-null and addresses a row that is not there. (The v50
+   * live run saw no such DELETE reach the sink at all; either way it is lost silently.) The
+   * protections for that case are upstream: the control plane's Start prerequisite blocks the
+   * configuration, and its runtime REPLICA IDENTITY re-check holds cut over if the identity
+   * drops while CDC runs. This guard stays for the case it does see: a key the sink cannot
+   * use must be LOUD (dead-lettered, like any other unusable record) rather than silently
+   * dropped, because a silent drop is indistinguishable from success.
    */
   private static void requireNoNullKeyComponent(
       String table, List<String> pkColumns, List<Object> pkValues, String opName) {
@@ -248,12 +256,15 @@ final class DebeziumEvents {
    * starts failing. It cannot throw for a field obtained from {@code struct.schema()
    * .fields()}, which is the only way this is called.
    *
-   * <p>This also fixes the KEY path. A re-keyed table's key schema carries the same source
-   * default, so {@code Struct.get} fabricated a non-NULL key component out of a before-image
-   * that never had one: {@link #requireNoNullKeyComponent} could never fire, and the DELETE
-   * went out with an invented key, applied to 0 rows and was acknowledged -- the source row
-   * gone, the target's copy kept. Reading the slot verbatim restores the NULL, so that
-   * existing guard fires and dead-letters with its already-actionable message.
+   * <p>This also fixes the KEY path, for a NULLABLE key column: a re-keyed table's key schema
+   * carries the same source default, so {@code Struct.get} fabricated a non-NULL key component
+   * out of a null slot. Reading the slot verbatim keeps that NULL, so
+   * {@link #requireNoNullKeyComponent} fires and dead-letters with its actionable message. It
+   * cannot help a NOT NULL key column (a composite key's leading column): Debezium's key
+   * generator already put a placeholder (0, {@code ""} or the column's DEFAULT) in the slot
+   * when the before-image did not carry the column (offline-proven against the shipped
+   * 2.7.4 jar), so there is no NULL to restore and the guard cannot see it -- see
+   * {@link #requireNoNullKeyComponent} for where that case is caught instead.
    */
   private static Object rawFieldValue(Struct struct, Field field) {
     return struct.getWithoutDefault(field.name());

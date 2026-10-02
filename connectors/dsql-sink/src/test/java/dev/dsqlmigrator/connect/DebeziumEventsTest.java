@@ -443,12 +443,13 @@ class DebeziumEventsTest {
 
   @Test
   void aDeleteWithANullKeyComponentIsRejectedRatherThanAppliedToZeroRows() {
-    // A table re-keyed onto the target primary key (user_id, id) whose PostgreSQL source is
-    // REPLICA IDENTITY DEFAULT: the DELETE before-image carries only the source PK (id), so
-    // user_id arrives null. The delete SQL renders "user_id" = ? AND "id" = ?, and a NULL
-    // makes that predicate UNKNOWN -- the statement removes nothing. The affected-row count
-    // is not inspected, so before this guard the record was acknowledged and the delete lost
-    // with no error, no log and no dead-letter. Live-observed on Aurora PostgreSQL 17.7.
+    // A NULLABLE key component that arrives null (COMPOSITE_KEY makes user_id OPTIONAL). The
+    // delete SQL renders "user_id" = ? AND "id" = ?, and a NULL makes that predicate UNKNOWN
+    // -- the statement removes nothing, and the affected-row count is not inspected, so
+    // without this guard the delete would be lost with no error, no log and no dead-letter.
+    // NOT the shape a REPLICA IDENTITY DEFAULT before-image produces for a composite key's
+    // NOT NULL leading column: Debezium puts a placeholder there instead (see
+    // aRequiredRekeyColumnHoldingDebeziumsPlaceholderIsNotDetectedBySink).
     Struct k = new Struct(COMPOSITE_KEY).put("user_id", null).put("id", 510L);
     Struct env =
         new Struct(ENVELOPE)
@@ -474,6 +475,43 @@ class DebeziumEventsTest {
     Struct k = new Struct(COMPOSITE_KEY).put("user_id", null).put("id", 510L);
     assertThrows(
         DataException.class, () -> DebeziumEvents.parse(record(k, null, "dsqlcdc.app.orders")));
+  }
+
+  @Test
+  void aRequiredRekeyColumnHoldingDebeziumsPlaceholderIsNotDetectedBySink() {
+    // CHARACTERIZATION (G2), pinning what the sink CANNOT see. The real shape of a re-keyed
+    // table's DELETE under PostgreSQL REPLICA IDENTITY DEFAULT: the composite key's leading
+    // column is NOT NULL on the source, so its key field is REQUIRED, and Debezium's
+    // TableSchemaBuilder key generator converts the absent before-image value with no null
+    // check -- JdbcValueConverters yields the type's placeholder (0 here; '' for text, or the
+    // column's DEFAULT). Offline-proven against the shipped debezium-core 2.7.4 jar. The key is
+    // therefore non-null, requireNoNullKeyComponent cannot fire, and the sink builds
+    // DELETE ... WHERE user_id = 0 AND id = 510, which removes nothing -- silently (a different
+    // row can match only when the key omits part of the source primary key; this one keeps
+    // id, the whole source key). The protection is upstream, in the control plane:
+    // the Start prerequisite blocks this configuration and the runtime REPLICA IDENTITY
+    // re-check holds cut over while it lasts. If this test ever starts failing because the
+    // sink learned to detect it, update that design (and the docs) deliberately.
+    Schema requiredKey =
+        SchemaBuilder.struct()
+            .name("Key")
+            .field("user_id", Schema.INT64_SCHEMA)
+            .field("id", Schema.INT64_SCHEMA)
+            .build();
+    Struct k = new Struct(requiredKey).put("user_id", 0L).put("id", 510L);
+    Struct env =
+        new Struct(ENVELOPE)
+            .put("op", "d")
+            .put("before", row(510L, "Bob"))
+            .put("source", source("orders"));
+    ChangeEvent event = DebeziumEvents.parse(record(k, env, "dsqlcdc.app.orders"));
+    assertTrue(event.isDelete());
+    assertEquals(List.of("user_id", "id"), event.pkColumns());
+    assertEquals(List.of(0L, 510L), event.pkValues());
+    // ...and its tombstone the same way.
+    ChangeEvent tombstone = DebeziumEvents.parse(record(k, null, "dsqlcdc.app.orders"));
+    assertTrue(tombstone.isTombstone());
+    assertEquals(List.of(0L, 510L), tombstone.pkValues());
   }
 
   @Test

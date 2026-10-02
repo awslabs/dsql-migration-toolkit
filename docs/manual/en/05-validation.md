@@ -238,4 +238,49 @@ letters recorded then still need their CHECKSUM match.
 
 ---
 
+## 5.6 Re-keyed PostgreSQL tables and cut over
+
+This applies only to a **PostgreSQL** source and only to tables CDC **re-keys** — a
+composite target key (Schema Conversion's Composite key, or an edited key) that adds a
+column outside the source primary key. A `DELETE` on such a table carries that column
+only while the source's `REPLICA IDENTITY` is **FULL** on the table and every partition.
+If it drops below FULL while CDC runs (`ALTER TABLE … REPLICA IDENTITY DEFAULT`, a new
+partition, `USING INDEX`), each delete leaves its row on Aurora DSQL with no error and no
+dead letter. The CDC monitor re-reads it and records each drop
+([§4.6](04-cdc-and-dsql-constraints.md#re-keyed-postgresql-tables-the-replica-identity-re-check));
+Validation and Cut over use that record:
+
+- **Validation compares those tables by CHECKSUM automatically**, named in the Options
+  before you run. While a table is still below FULL the report says *"Tables match —
+  cut over is held: REPLICA IDENTITY on N re-keyed table(s) is below FULL"*: no CHECKSUM
+  releases it, because deletes keep being lost. Once it is FULL again, a match started
+  before the fix is not enough: the report says *"cut over waits for a CHECKSUM re-check"*
+  and offers **Re-check N table(s) with CHECKSUM**.
+- **Cut over opens only when** every such table is FULL again **and** matched in a
+  CHECKSUM comparison that **started more than a minute after** the tool read it FULL.
+  Cut over also makes **one fresh read** of REPLICA IDENTITY after the latest
+  validation (a few seconds) before it opens, so a change since then is caught.
+- A table left out of the report, or inside a gap you accepted, can be acknowledged
+  with **Continue without this check** once no other re-keyed table is below FULL or
+  needs a re-check (recorded in the activity log; it re-opens if the identity drops
+  again). A table inside an accepted gap cannot be cleared by a CHECKSUM until its source
+  rows are corrected and it is reloaded with **Drop & reload**. A table still below FULL
+  is never waivable.
+- **If the source can't be read** — no password after an app restart, a failed read, a
+  table not found — and no table is still recorded below FULL, Cut over does not hold:
+  it shows a warning above the runbook, and the acknowledgement line in the activity log
+  records that the identity was not re-checked. Confirm on the source that these tables
+  and their partitions are FULL before you repoint, or reconnect the source on the
+  Connect step (the tool then re-reads it by itself; after a failed read, choose
+  **Check again**). A table still recorded below FULL keeps Cut over held until the tool
+  reads it FULL; the held notice says when the re-read failed.
+- **Restarts.** The record of each drop survives an app restart and is cleared only by
+  Start over. **MySQL** sources and **Full load only** are unaffected.
+
+**The way forward** for a table that differs after the fix: Full Load + CDC — let CDC
+catch up, Stop CDC, reload it with **Drop & reload**, Start CDC, re-check it; CDC only —
+delete the extra rows on Aurora DSQL by hand, then re-check.
+
+---
+
 **Next:** [6. Limitations →](06-limitations.md)

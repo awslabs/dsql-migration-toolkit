@@ -38,6 +38,8 @@ from dsql_migrator.core.models import (
     AssessmentReport,
     CdcDlqLedgerEntry,
     CdcDlqWaiver,
+    CdcReplicaIdentityFinding,
+    CdcReplicaIdentityWaiver,
     SourceInventory,
     TableSelection,
     TargetInventory,
@@ -186,6 +188,17 @@ class SessionSnapshot(BaseModel):
     # cursor, after the CDC start, so the gate reports the history as unconfirmed (fail
     # closed) until one full CHECKSUM run or a recorded waiver.
     cdc_dlq_read_from_ms: dict[str, int] = Field(default_factory=dict)
+    # Re-keyed PostgreSQL tables whose REPLICA IDENTITY was read below FULL while CDC ran
+    # (ui/cdc_replica_identity_gate.py): a DELETE lost then is never replayed, so the finding
+    # must outlive a restart or Cut over would forget it. O(re-keyed tables). Cleared only by
+    # Start over. An older snapshot has none (nothing was ever recorded).
+    cdc_replica_identity_findings: dict[str, CdcReplicaIdentityFinding] = Field(
+        default_factory=dict
+    )
+    # The DEPLOYED stack's MessageKeyColumns (table -> record-key columns), read on CDC
+    # discovery: which tables Debezium actually re-keys, so Validation and Cut over can scope
+    # the re-check after a restore before Data Migration renders. None = unknown / no stack.
+    cdc_deployed_message_key_columns: Optional[dict[str, list[str]]] = None
     # The NON-SECRET Secrets Manager reference the operator authenticated the source with.
     # Not a credential (the password is never persisted), and without it a restored session
     # forgot the auth METHOD as well as the reference -- and the CDC deploy/teardown reads
@@ -268,6 +281,9 @@ class SessionSnapshot(BaseModel):
     validation_run_started_at: Optional[datetime] = None
     validation_compared_from: dict[str, datetime] = Field(default_factory=dict)
     validation_cdc_dlq_waiver: Optional[CdcDlqWaiver] = None
+    # The operator's recorded decision to cut over without CHECKSUM proof for re-keyed tables
+    # whose REPLICA IDENTITY was below FULL earlier (scoped to each table's restore time).
+    validation_cdc_replica_identity_waiver: Optional[CdcReplicaIdentityWaiver] = None
 
 
 class SessionStateStore(Protocol):

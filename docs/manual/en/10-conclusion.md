@@ -106,7 +106,9 @@ freeze shrinks to just the final drain + smoke test.
    application's first insert after cut-over can't collide with a migrated id
    (`23505`). Tables with dead-lettered CDC changes are compared by CHECKSUM
    automatically, and Cut over re-reads the dead-letter queue before it opens (see
-   [§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over)).
+   [§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over)). On a PostgreSQL source
+   with re-keyed tables, Cut over also re-reads their REPLICA IDENTITY before it opens
+   (see [§5.6](05-validation.md#56-re-keyed-postgresql-tables-and-cut-over)).
 5. **Repoint the application** to the DSQL endpoint and smoke-test.
 6. **Tear the CDC pipeline down LAST** — click **Start over (top right)** →
    *Delete all CDC infrastructure*. It ends replication, stops MSK / MSK

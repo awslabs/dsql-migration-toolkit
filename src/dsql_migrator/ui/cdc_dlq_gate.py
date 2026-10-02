@@ -190,6 +190,41 @@ class CdcDlqGate:
         return tuple(i.table for i in self.must_recheck)
 
 
+def table_proof_reason(
+    item: Optional[object],
+    *,
+    release: str,
+    explained: bool,
+    started: Optional[datetime],
+    last_at: Optional[datetime],
+) -> Optional[str]:
+    """Why a table's current report item does NOT prove it after ``last_at``, or ``None``. Pure.
+
+    The per-table ladder of this gate, shared with the REPLICA IDENTITY gate
+    (``ui/cdc_replica_identity_gate.py``, where ``last_at`` is the identity's restore time).
+    First reason that applies: not in the report; inside an accepted gap (``explained`` and
+    ``release == "accepted"``); not a match; matched by row count only; compare time
+    unknown; compared too early -- the comparison must have STARTED more than
+    :data:`CDC_DLQ_EVIDENCE_MARGIN_SECONDS` after ``last_at``.
+    """
+    started = _aware(started)
+    last_at = _aware(last_at)
+    if item is None:
+        return REASON_NOT_VALIDATED
+    if release == "accepted" and explained:
+        return REASON_ACCEPTED_GAP
+    if getattr(item, "error", None) is not None or not getattr(item, "matched", False):
+        return REASON_NOT_MATCHED
+    if not value_verified(item):
+        return REASON_ROW_COUNT_ONLY
+    if started is None:
+        return REASON_COMPARE_TIME_UNKNOWN
+    margin = timedelta(seconds=CDC_DLQ_EVIDENCE_MARGIN_SECONDS)
+    if last_at is not None and last_at >= started - margin:
+        return REASON_COMPARED_BEFORE
+    return None
+
+
 def cdc_dlq_waiver_covers(
     waiver: object,
     *,
@@ -260,19 +295,13 @@ def cdc_dlq_cutover_gate(
         kinds = tuple(getattr(entry, "kinds", None) or ())
         item = items.get(table)
         started = compared_from(table)
-        reason: Optional[str] = None
-        if item is None:
-            reason = REASON_NOT_VALIDATED
-        elif release == "accepted" and table in explained:
-            reason = REASON_ACCEPTED_GAP
-        elif getattr(item, "error", None) is not None or not getattr(item, "matched", False):
-            reason = REASON_NOT_MATCHED
-        elif not value_verified(item):
-            reason = REASON_ROW_COUNT_ONLY
-        elif started is None:
-            reason = REASON_COMPARE_TIME_UNKNOWN
-        elif last_at is not None and last_at >= started - margin:
-            reason = REASON_COMPARED_BEFORE
+        reason = table_proof_reason(
+            item,
+            release=release,
+            explained=table in explained,
+            started=started,
+            last_at=last_at,
+        )
         if reason is None:
             resolved.append(table)
             resolved_counts[table] = count
@@ -661,8 +690,10 @@ def issue_notice(gate: CdcDlqGate) -> Optional[tuple[str, str, str]]:
             "never touched again stays missing or stale, and a lost DELETE leaves an extra "
             "row. A row count cannot see a missed UPDATE, so each table must match in a "
             "CHECKSUM comparison that started after its last dead-lettered record. On the "
-            f"Validation step choose 'Re-check {n} table(s) with CHECKSUM'; this check "
-            "clears by itself once they match.",
+            # Not the button's label: Validation draws ONE re-check for this gate's tables
+            # and the REPLICA IDENTITY gate's, so its count can differ from n.
+            "Validation step, re-check them with CHECKSUM (one button there re-checks every "
+            "table that needs it); this check clears by itself once they match.",
         )
     waivable = gate.waivable_issues
     if waivable:
@@ -1085,5 +1116,6 @@ __all__ = [
     "cdc_dlq_gate_for",
     "cdc_dlq_waiver_covers",
     "schedule_cdc_dlq_check",
+    "table_proof_reason",
     "value_verified",
 ]

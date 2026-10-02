@@ -536,11 +536,14 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 #
 # The SAME substitution fabricated a non-NULL KEY component on a re-keyed table, because a
 # re-keyed table's KEY schema carries the source default too. Reading the slot verbatim makes
-# the key faithful. Live follow-up (v50) narrowed what that buys: on a re-keyed table switched
-# to REPLICA IDENTITY DEFAULT the DELETE never reaches the sink at all -- it is dropped
-# upstream with no log line -- so ``requireNoNullKeyComponent`` is a backstop that path does
-# not exercise, and the prerequisite check that BLOCKS the configuration is the real
-# protection. The guard still covers a record that does arrive with a null key component.
+# the key faithful -- for a NULLABLE key column only. Live follow-up (v50) narrowed what that
+# buys: on a re-keyed table switched to REPLICA IDENTITY DEFAULT the DELETE never reached the
+# sink at all (no log line). Later offline work (G2, against the shipped 2.7.4 jar) found that
+# Debezium's key generator itself fills an absent NOT NULL key column with a placeholder (0,
+# '' or its DEFAULT) before any converter runs, so for a composite key's NOT NULL leading
+# column ``requireNoNullKeyComponent`` cannot fire either way; which account holds is pending
+# a live check. The protection is the Start prerequisite that BLOCKS the configuration plus
+# the app's runtime REPLICA IDENTITY re-check that holds Cut over (no plugin change).
 #
 # Both are fixed by reading the slot VERBATIM (``getWithoutDefault``) at the two
 # value-reading call sites, via ``DebeziumEvents.rawFieldValue``. That is the correct

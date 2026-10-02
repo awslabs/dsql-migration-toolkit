@@ -248,8 +248,10 @@ class PostgresCdcFacts:
     # the table keeps reporting 'i' while behaving exactly like 'nothing'.
     identity_index_valid: Mapping[str, bool] = field(default_factory=dict)
     # For ``relreplident='i'``: whether that index is the PRIMARY KEY. When it is not, the
-    # UPDATE/DELETE before-image carries only the index's columns, so the primary key the
-    # DSQL sink upserts on arrives NULL.
+    # UPDATE/DELETE before-image carries only the index's columns, so a primary-key column
+    # outside that index is not carried. (Offline-proven against the shipped Debezium 2.7.4
+    # jar: its key generator fills an absent NOT NULL key column with a placeholder -- 0, ''
+    # or the column's DEFAULT -- not NULL, so the change addresses a row that is not there.)
     identity_index_is_primary: Mapping[str, bool] = field(default_factory=dict)
     # ``relpersistence='u'``: an UNLOGGED table cannot be published at all.
     unlogged: Mapping[str, bool] = field(default_factory=dict)
@@ -562,10 +564,12 @@ def check_replica_identity(
                 "run ALTER TABLE ... REPLICA IDENTITY USING INDEX <index>, or use "
                 "REPLICA IDENTITY DEFAULT (primary key) / FULL.",
             )
-        # A non-PK identity index publishes only ITS columns in the before-image, so the
-        # primary key the DSQL sink upserts on arrives NULL for UPDATE/DELETE. Non-blocking
-        # (the load itself is fine and the user may have keyed the sink differently), but
-        # it is a real change-replication risk, so WARN rather than a silent PASS.
+        # A non-PK identity index publishes only ITS columns in the before-image, so a
+        # primary-key column outside that index is not carried for UPDATE/DELETE (Debezium
+        # fills an absent NOT NULL key column with a placeholder -- 0, '' or its DEFAULT --
+        # offline-proven against the shipped jar, not NULL). Non-blocking (the load itself
+        # is fine and the user may have keyed the sink differently), but it is a real
+        # change-replication risk, so WARN rather than a silent PASS.
         if facts.identity_index_is_primary.get(table.name) is False:
             return PrerequisiteResult(
                 check_id=PrerequisiteCheckId.REPLICA_IDENTITY,
@@ -575,8 +579,9 @@ def check_replica_identity(
                 target=table.name,
                 detail=(
                     "REPLICA IDENTITY is an index that is NOT the primary key, so an "
-                    "UPDATE/DELETE before-image carries only that index's columns and the "
-                    "primary key the target upserts on arrives NULL."
+                    "UPDATE/DELETE before-image carries only that index's columns: a "
+                    "primary-key column outside it is not carried, and the change cannot "
+                    "locate its row on the target."
                 ),
                 remediation=(
                     f"Prefer ALTER TABLE {table.name} REPLICA IDENTITY DEFAULT (the "
@@ -611,12 +616,20 @@ def check_replica_identity_covers_key(
     "Composite key" option prepends a high-cardinality column to the target primary key (a
     DSQL hot-partition remedy), the connector is told ``message.key.columns`` = that target
     key. Under ``REPLICA IDENTITY DEFAULT`` PostgreSQL limits the UPDATE/DELETE before-image
-    to the SOURCE primary key, so the prepended column is ABSENT from a DELETE: the record
-    key carries a NULL component, the sink renders ``WHERE "leading" = NULL AND "id" = ?``,
-    three-valued logic matches nothing, and the delete is applied as 0 rows with no error, no
-    dead-letter and no log. Live-observed on Aurora PostgreSQL 17.7: one deleted order stayed
-    on the target while its child rows (no re-key, so keyed on the source PK) deleted
-    correctly. INSERT and UPDATE are unaffected -- their after-image carries every column.
+    to the SOURCE primary key, so the prepended column is ABSENT from a DELETE, and the
+    delete does not remove its row on Aurora DSQL -- no error, no dead-letter, no log.
+    Live-observed on Aurora PostgreSQL 17.7: one deleted order stayed on the target while
+    its child rows (no re-key, so keyed on the source PK) deleted correctly.
+
+    How it is lost is not the sink's NULL-key guard: offline-proven against the shipped
+    Debezium 2.7.4 jar, the key generator converts the absent column with no null check, and
+    for a NOT NULL column (a composite key's leading column always is) the converter yields a
+    placeholder -- 0, '' or the column's DEFAULT -- so the record key is non-NULL and
+    addresses a row that is not there (or, when the key omits part of the source primary
+    key, possibly a different row). The v50 live run saw no DELETE reach the sink at all.
+    Either way the delete is silently lost; which account holds is pending a live check.
+    An UPDATE that changes a key column is affected too (its old key is the before-image);
+    INSERTs and other UPDATEs are not -- their after-image carries every column.
 
     The tool DOES widen the identity itself (``cdc_pg_slot.set_replica_identity_full``), but
     only on the path where the Full Load provisions the replication slot. A Full-load-only
@@ -624,15 +637,48 @@ def check_replica_identity_covers_key(
     PARTITIONED table (``ALTER TABLE`` on the parent does not reach existing partitions,
     while PostgreSQL logs the LEAF's identity) all reach streaming with the identity still
     DEFAULT. This check verifies the source's actual catalog instead of trusting that the
-    widening ran, so every route is covered by the same gate.
+    widening ran, so every route is covered by the same gate -- and the CDC monitor re-reads
+    the same catalog facts while CDC runs and grades them with the SAME rule
+    (:func:`replica_identity_covers_key_result`), so an identity dropped after Start holds
+    Cut over.
 
     Returns ``None`` when there is nothing to grade: no re-key for this table, or the key
     adds nothing beyond the source primary key (a pure reorder). Pure.
     """
+    weak_leaves = sorted(
+        leaf
+        for leaf, code in (facts.leaf_replica_identity.get(table.name) or {}).items()
+        if code != "f"
+    )
+    return replica_identity_covers_key_result(
+        table,
+        key_columns,
+        identity=facts.replica_identity.get(table.name),
+        weak_partition_names=weak_leaves,
+        weak_partition_count=len(weak_leaves),
+    )
+
+
+def replica_identity_covers_key_result(
+    table: TableDef,
+    key_columns: Sequence[str],
+    *,
+    identity: Optional[str],
+    weak_partition_names: Sequence[str],
+    weak_partition_count: int,
+) -> Optional[PrerequisiteResult]:
+    """The REPLICA_IDENTITY_COVERS_KEY rule on explicit catalog facts. Pure.
+
+    Shared by the Start prerequisite (:func:`check_replica_identity_covers_key`) and the CDC
+    monitor's runtime re-check (``cdc_pg_slot.grade_rekeyed_replica_identity``), so a state
+    that passes Start can never raise the runtime finding and the reverse. In order: ``None``
+    when the key adds nothing beyond ``table.primary_key``; INFO when ``identity`` is unknown;
+    FAIL when any partition is not FULL (``weak_partition_count``; at most five of
+    ``weak_partition_names`` are named); PASS on 'f'; FAIL on 'd', 'n' and 'i'.
+    """
     extra = [c for c in (key_columns or []) if c not in set(table.primary_key or ())]
     if not extra:
         return None
-    identity = facts.replica_identity.get(table.name)
     title = "Re-keyed table's before-image carries the record key"
     key_desc = ", ".join(key_columns)
     missing = ", ".join(extra)
@@ -664,23 +710,21 @@ def check_replica_identity_covers_key(
     # enforces and logs the LEAF's identity, and ALTER TABLE on a parent does not propagate
     # to existing partitions (live-verified elsewhere in this module). So a re-keyed
     # partitioned table whose parent the tool widened still loses deletes on every leaf.
-    weak_leaves = sorted(
-        leaf
-        for leaf, code in (facts.leaf_replica_identity.get(table.name) or {}).items()
-        if code != "f"
-    )
-    if weak_leaves:
-        shown = ", ".join(weak_leaves[:5])
-        more = f" (and {len(weak_leaves) - 5} more)" if len(weak_leaves) > 5 else ""
+    count = max(int(weak_partition_count or 0), 0)
+    if count:
+        names = list(weak_partition_names or ())[:5]
+        shown = ", ".join(names)
+        more = f" (and {count - len(names)} more)" if count > len(names) else ""
         return _fail(
             f"The CDC record key for {table.name} is ({key_desc}), which adds {missing} "
-            f"beyond the source primary key, but {len(weak_leaves)} partition(s) are not "
+            f"beyond the source primary key, but {count} partition(s) are not "
             f"REPLICA IDENTITY FULL: {shown}{more}. PostgreSQL logs the PARTITION's "
-            f"identity, so a DELETE would arrive without {missing} and be silently applied "
-            "to 0 rows.",
+            f"identity, so a DELETE would not carry {missing} and would not remove its row "
+            "on Aurora DSQL — silently lost.",
             "Run ALTER TABLE <partition> REPLICA IDENTITY FULL on each PARTITION (the "
             "parent does not propagate to existing partitions), and set it on new "
-            "partitions as they are created.",
+            "partitions as they are created. Keep them FULL for the whole run: while CDC "
+            "runs the tool re-checks it and holds Cut over if it drops.",
         )
 
     if identity == "f":
@@ -717,14 +761,16 @@ def check_replica_identity_covers_key(
     return _fail(
         f"The CDC record key for {table.name} is ({key_desc}) -- the target primary key "
         f"chosen in Schema Conversion -- which adds {missing} beyond the source primary "
-        f"key ({', '.join(table.primary_key or ()) or 'none'}). {_reason}, so {missing} "
-        "would be NULL in a DELETE and the sink would apply it to 0 rows: the delete is "
-        "SILENTLY LOST, with no error and no dead-letter. INSERT and UPDATE are unaffected "
-        "(their after-image carries every column).",
+        f"key ({', '.join(table.primary_key or ()) or 'none'}). {_reason}, so a DELETE does "
+        f"not carry {missing} and does not remove its row on Aurora DSQL: it is SILENTLY "
+        "LOST, with no error and no dead-letter. An UPDATE that changes a key column is "
+        "affected too; INSERTs and other UPDATEs are not (their after-image carries every "
+        "column).",
         f"Run ALTER TABLE {table.name} REPLICA IDENTITY FULL on the source, then re-run "
         "these checks. DEFAULT is not enough for a re-keyed table. The alternative is to "
         f"set {table.name} back to \"Keep source PK\" in Schema Conversion, which removes "
-        "the re-key and the requirement with it.",
+        "the re-key and the requirement with it. Keep it FULL for the whole run: while CDC "
+        "runs the tool re-checks it and holds Cut over if it drops.",
     )
 
 

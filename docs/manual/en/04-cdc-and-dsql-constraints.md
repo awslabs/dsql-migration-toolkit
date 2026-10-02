@@ -289,6 +289,42 @@ values — see §4.5.) The record list lives in memory and is not kept across an
 restart; the per-table count, latest time and drift kinds are, and they are what Cut
 over checks ([§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over)).
 
+### Re-keyed PostgreSQL tables: the REPLICA IDENTITY re-check
+
+A table CDC re-keys (a composite target key that adds a column outside the source
+primary key) carries that column in a `DELETE` only while its source `REPLICA IDENTITY`
+is **FULL** on the table and every partition. Below FULL the delete does not remove its
+row on Aurora DSQL, and nothing dead-letters it — so the monitor re-reads it (one
+read-only catalog query for all such tables, at most every 2 minutes, never on a
+MySQL source) and shows these notices:
+
+- **Red — "Deletes on re-keyed tables are being lost":** a table (or one of its
+  partitions) is below FULL. Run `ALTER TABLE <table> REPLICA IDENTITY FULL` on the
+  source — on each partition too, since the parent does not propagate and a new
+  partition starts at `DEFAULT` — then choose **Check again**. Cut over is held.
+  Deletes made before the fix are not replayed. If the re-read itself fails, the notice
+  says so: if the source credentials or network access changed, reconnect the source on
+  the Connect step.
+- **Amber — "REPLICA IDENTITY is FULL again":** the fix is in, but deletes made while
+  it was below FULL may be missing. Validation compares the table by CHECKSUM
+  automatically; Cut over waits for a match started after the fix
+  ([§5.6](05-validation.md#56-re-keyed-postgresql-tables-and-cut-over)), unless you
+  chose **Continue without this check** there. If the table differs: let CDC catch up,
+  Stop CDC, reload it on the Full Load step with **Drop & reload**, Start CDC, and
+  re-check it. CDC only has no Full Load step: delete the extra rows on Aurora DSQL by
+  hand instead. The same notice, headed "REPLICA IDENTITY was below FULL on re-keyed
+  tables", appears when CDC stops re-keying a table that was below FULL (redeployed with
+  the source primary key, or the source primary key now covers the record key): deletes
+  lost before then still need the CHECKSUM.
+- **Info — "Can't re-check REPLICA IDENTITY on the source":** the source password is
+  kept in memory only, so after an app restart the tool cannot connect until you
+  reconnect on the Connect step. Keep these tables at FULL meanwhile.
+- **Amber — "Can't re-check REPLICA IDENTITY on the source":** the last read failed;
+  the tool tries again in 2 minutes. Keep these tables at FULL meanwhile.
+
+Each change (below FULL, FULL again, no longer re-keyed) is written once to the activity
+log.
+
 ---
 
 **Next:** [5. Validation →](05-validation.md)

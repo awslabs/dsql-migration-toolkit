@@ -60,6 +60,16 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
     **논리 복제 슬롯**과 **정확히 마이그레이션 대상 테이블만을 범위로 하는 publication**을 생성하므로, WAL은
     보존 기간이 아니라 슬롯에 의해 고정됩니다(`wal_status`를 관찰하세요 — 비활성 슬롯은 소스 디스크를 가득
     채울 수 있음). 복제 슬롯 / `max_wal_senders` 여유는 점검됩니다(차단하지 않음).
+  - **PostgreSQL 소스, 재키잉(re-keyed) 테이블:** CDC가 재키잉하는 테이블 — Schema Conversion의
+    **Composite key**, 또는 소스 기본 키 밖의 컬럼을 더하도록 편집한 타깃 키 — 은 Start 시점만이 아니라
+    **CDC 실행 내내 테이블과 모든 파티션에 `REPLICA IDENTITY FULL`**이 필요합니다(나중에 만든 파티션은
+    `DEFAULT`로 시작). FULL 미만이면 그 테이블의 `DELETE`가 Aurora DSQL에서 행을 지우지 못합니다 — 오류도
+    dead letter도 없이 조용히 — 그리고 키 컬럼을 바꾸는 `UPDATE`도 영향을 받습니다. 사전 점검이 Start를
+    차단합니다. Data Migration, Validation 또는 Cut over 단계가 열려 있는 동안 도구는 최대 2분마다 이를
+    다시 읽습니다: CDC 모니터에 빨간 알림이 나타나고, 다시 FULL이 되고 테이블이 CHECKSUM으로 일치할 때까지
+    Cut over가 보류됩니다([§5.6](05-validation.md#56-재키잉된-postgresql-테이블과-컷오버) 참고). 앱 재시작
+    후에는 재확인에 소스 비밀번호가 다시 필요합니다(Connect 단계에서 다시 연결). 두 번의 재확인 사이에
+    내려갔다가 되돌아온 경우는 보이지 않으므로 FULL을 계속 유지하세요.
 - **CDC는 데이터를 복제할 뿐 DDL은 복제하지 않음.** CDC 도중 소스에서 발생한 스키마 변경은 DSQL로
   **전파되지 않으므로** 동일한 DDL을 DSQL에 직접 적용해야 합니다
   ([4장 §4.2](04-cdc-and-dsql-constraints.md#42-cdc는-스키마가-아니라-데이터를-복제--중요) 참조).

@@ -27244,7 +27244,7 @@ def test_the_block_reason_names_the_failing_check_and_its_remedy() -> None:
             status=PrerequisiteStatus.FAIL,
             required=True,
             target="ecommerce.orders",
-            detail="user_id would be NULL in a DELETE",
+            detail="a DELETE does not carry user_id and does not remove its row on Aurora DSQL",
             remediation="Run ALTER TABLE ecommerce.orders REPLICA IDENTITY FULL",
         ),
         PrerequisiteResult(
@@ -30110,3 +30110,563 @@ def test_a_continued_read_counts_from_its_first_call_not_its_last(monkeypatch) -
     time.sleep(0.02)
     apply_cdc_dlq_read(state, read_cdc_dlq_once(state, session))  # a fresh, short read
     assert _state().read_state == "ok"
+
+
+# ---------------------------------------------------------------------------
+# G2: the CDC monitor re-reads REPLICA IDENTITY on re-keyed PostgreSQL tables
+# ---------------------------------------------------------------------------
+
+
+class _G2Conn:
+    """The read-only source connection double: answers the ONE identity statement."""
+
+    def __init__(self, rows, calls):
+        self._rows, self._calls = rows, calls
+
+    def execute(self, statement, params=None):
+        self._calls.append((str(statement), dict(params or {})))
+
+        class _R:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def fetchall(self):
+                return list(self._rows)
+
+        return _R(self._rows)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _g2_factory(monkeypatch, rows, *, fail=None):
+    """Patch the read-only source engine factory the re-check uses; returns the call log."""
+    import dsql_migrator.ui.data_migration._cdc_status as status
+
+    calls: list = []
+    built: list = []
+
+    class _Engine:
+        def connect(self):
+            if fail is not None:
+                raise fail
+            return _G2Conn(rows, calls)
+
+        def dispose(self):
+            built.append("disposed")
+
+    def _factory(password, *, read_timeout_seconds=None):
+        built.append(("factory", read_timeout_seconds))
+        return lambda _config: _Engine()
+
+    monkeypatch.setattr(status, "make_source_engine_factory", _factory)
+    return calls, built
+
+
+def _g2_session(*, pg=True, password=True, mtype=None):
+    from dsql_migrator.config import SecretValue
+    from dsql_migrator.core.models import SourceConnectionConfig, SourceType
+    from dsql_migrator.ui.data_migration import MigrationType
+    from dsql_migrator.ui.session import SessionConnectionState
+
+    session = SessionConnectionState()
+    session.set_source(
+        SourceConnectionConfig(
+            source_type=SourceType.POSTGRES if pg else SourceType.MYSQL,
+            host="src.example", port=5432 if pg else 3306, database="app", username="u",
+        ),
+        SecretValue("pw") if password else None,
+    )
+    session.set_migration_type(mtype or MigrationType.FULL_LOAD_AND_CDC)
+    return session
+
+
+def _g2_state(session, *, keys=None):
+    state = DataMigrationState()
+    state.bind_session(session)
+    state.set_cdc_controller(_G1Ctl())
+    state.set_cdc_connector_names(["sink"])
+    state.set_cdc_stack_phase("running")
+    state.set_cdc_ops_window_start(datetime.now(timezone.utc))
+    state.cdc_deployed_message_key_columns = (
+        {"app.orders": ["user_id", "id"]} if keys is None else keys
+    )
+    return state
+
+
+def _g2_fake_nicegui(monkeypatch):
+    import sys
+    import types
+
+    class _Run:
+        @staticmethod
+        async def io_bound(fn, *a, **k):
+            return fn(*a, **k)
+
+    fake = types.ModuleType("nicegui")
+    fake.run = _Run  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "nicegui", fake)
+
+
+def _g2_render(state, session):
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    polls: list = []
+
+    class _Ui(_RecordingUi):
+        def timer(self, _interval, callback, *_a, **_k):
+            polls.append(callback)
+            return self._El(self)
+
+    ui = _Ui()
+    _cdc_ui._render_cdc_live_monitoring(ui, state, _StubJobManager({}), session=session)
+    return ui, [cb for cb in polls if getattr(cb, "__name__", "") == "_poll_cdc"]
+
+
+def _g2_poll(poll, times=1):
+    import asyncio
+
+    async def scenario():
+        for _ in range(times):
+            await poll()
+            for _ in range(20):
+                await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+
+def _g2_logged(monkeypatch):
+    import dsql_migrator.core.activity_log as act
+
+    lines: list = []
+    monkeypatch.setattr(act, "log_activity", lambda _c, action, **kw: lines.append((action, kw)))
+    return lines
+
+
+_G2_HEADER = (
+    "Deletes on re-keyed tables are being lost — REPLICA IDENTITY is not FULL on the source"
+)
+
+
+def test_cdc_poll_probes_rekeyed_replica_identity_and_shows_error_banner(monkeypatch) -> None:
+    """The gap: a re-keyed table switched to REPLICA IDENTITY DEFAULT after Start loses every
+    DELETE silently. The poll's throttled re-read now finds it, logs it once, and the next
+    render shows the red banner with the fix."""
+    from dsql_migrator.core.activity_log import ActivityStatus
+
+    _g2_fake_nicegui(monkeypatch)
+    lines = _g2_logged(monkeypatch)
+    calls, built = _g2_factory(monkeypatch, [("app.orders", "d", ["id"], 0, [])])
+    session = _g2_session()
+    state = _g2_state(session)
+    _ui, (poll,) = _g2_render(state, session)
+    _g2_poll(poll)
+    assert len(calls) == 1 and calls[0][1] == {"names": ["app.orders"]}
+    assert ("factory", 10) in built and "disposed" in built
+    finding = state.cdc_replica_identity_findings["app.orders"]
+    assert finding.restored_at is None and finding.identity == "d"
+    opened = [kw for action, kw in lines if action.startswith("re-keyed table's REPLICA IDENTITY is below")]
+    assert len(opened) == 1 and opened[0]["status"] is ActivityStatus.FAILURE
+    assert opened[0]["target"] == "app.orders"
+    ui, _polls = _g2_render(state, session)
+    body = " ".join(ui.texts)
+    assert _G2_HEADER in body
+    assert "app.orders (REPLICA IDENTITY DEFAULT)" in body
+    assert "ALTER TABLE <table> REPLICA IDENTITY FULL" in body
+    assert "Check again" in [b.text for b in ui.buttons]
+
+
+def test_many_polls_within_the_ttl_read_the_source_once(monkeypatch) -> None:
+    _g2_fake_nicegui(monkeypatch)
+    _g2_logged(monkeypatch)
+    calls, _built = _g2_factory(monkeypatch, [("app.orders", "f", ["id"], 0, [])])
+    session = _g2_session()
+    state = _g2_state(session)
+    _ui, (poll,) = _g2_render(state, session)
+    _g2_poll(poll, times=6)
+    assert len(calls) == 1
+    assert state.cdc_replica_identity_findings == {}  # FULL: nothing to report
+    assert state.cdc_replica_identity_last_probe.ok is True
+
+
+@pytest.mark.parametrize("kind", ["mysql", "no-rekey"])
+def test_mysql_and_a_table_set_with_no_rekey_never_read_and_draw_nothing(monkeypatch, kind) -> None:
+    _g2_fake_nicegui(monkeypatch)
+    calls, built = _g2_factory(monkeypatch, [])
+    session = _g2_session(pg=(kind != "mysql"))
+    state = _g2_state(session, keys={} if kind == "no-rekey" else None)
+    if kind == "mysql":
+        state.set_cdc_message_key_columns({"app.orders": ["user_id", "id"]})
+    ui, (poll,) = _g2_render(state, session)
+    _g2_poll(poll, times=2)
+    assert calls == [] and built == []
+    ui, _ = _g2_render(state, session)
+    assert not any("REPLICA IDENTITY" in t for t in ui.texts)
+
+
+def test_without_the_source_password_the_monitor_says_reconnect(monkeypatch) -> None:
+    _g2_fake_nicegui(monkeypatch)
+    calls, _ = _g2_factory(monkeypatch, [])
+    session = _g2_session(password=False)
+    state = _g2_state(session)
+    ui, (poll,) = _g2_render(state, session)
+    _g2_poll(poll)
+    assert calls == []
+    ui, _ = _g2_render(state, session)
+    body = " ".join(ui.texts)
+    assert "Can't re-check REPLICA IDENTITY on the source" in body
+    assert "reconnect the source on the Connect step" in body
+
+
+def test_a_failed_read_is_named_without_its_message(monkeypatch) -> None:
+    _g2_fake_nicegui(monkeypatch)
+    _g2_factory(monkeypatch, [], fail=ConnectionError("db at src.example refused pw"))
+    session = _g2_session()
+    state = _g2_state(session)
+    _ui, (poll,) = _g2_render(state, session)
+    _g2_poll(poll)
+    ui, _ = _g2_render(state, session)
+    body = " ".join(ui.texts)
+    assert "Can't re-check REPLICA IDENTITY on the source" in body
+    assert "failed (ConnectionError)" in body and "src.example" not in body
+
+
+def test_a_restored_finding_is_amber_until_a_checksum_after_the_fix_proves_it(monkeypatch) -> None:
+    from datetime import timedelta
+
+    from dsql_migrator.core.models import (
+        CdcReplicaIdentityFinding,
+        TableValidationResult,
+        ValidationMode,
+        ValidationReport,
+    )
+    from dsql_migrator.ui.validation import ValidationState
+
+    session = _g2_session()
+    state = _g2_state(session)
+    fixed = datetime.now(timezone.utc) - timedelta(minutes=30)
+    state.cdc_replica_identity_findings = {
+        "app.orders": CdcReplicaIdentityFinding(
+            key_columns=["user_id", "id"], primary_key=["id"], identity="d",
+            first_weak_at=fixed - timedelta(hours=1), restored_at=fixed, restored_by="full",
+        )
+    }
+    vs = ValidationState()
+    state.validation_state_provider = lambda: vs
+    _g2_logged(monkeypatch)
+    from dsql_migrator.ui.data_migration import _refresh_cdc_status
+
+    _refresh_cdc_status(state)  # a status view, as after the first poll
+    ui, _ = _g2_render(state, session)
+    body = " ".join(ui.texts)
+    assert "REPLICA IDENTITY is FULL again — deletes made before the fix may be missing" in body
+    assert "Drop & reload" in body and _G2_HEADER not in body
+    vs.mark_run_started()
+    vs._run_started_wall = fixed + timedelta(seconds=61)
+    vs.set_result(ValidationReport.build(mode=ValidationMode.CHECKSUM, items=[
+        TableValidationResult(table="app.orders", source_row_count=1, target_row_count=1,
+                              row_count_match=True, checksum_match=True, matched=True)
+    ]))
+    ui, _ = _g2_render(state, session)
+    assert not any("FULL again" in t for t in ui.texts)
+
+
+def test_check_again_forces_a_read(monkeypatch) -> None:
+    import asyncio
+
+    _g2_fake_nicegui(monkeypatch)
+    _g2_logged(monkeypatch)
+    calls, _ = _g2_factory(monkeypatch, [("app.orders", "d", ["id"], 0, [])])
+    session = _g2_session()
+    state = _g2_state(session)
+    _ui, (poll,) = _g2_render(state, session)
+    _g2_poll(poll)
+    assert len(calls) == 1
+    ui, _ = _g2_render(state, session)
+    (check,) = [b for b in ui.buttons if b.text == "Check again"]
+    assert not any("disable" in p for p in check.props_seen)
+    asyncio.run(check.on_click())  # within the TTL: only a forced read runs
+    assert len(calls) == 2
+    # Without a password the button is drawn disabled.
+    session_nopw = _g2_session(password=False)
+    state.bind_session(session_nopw)
+    ui, _ = _g2_render(state, session_nopw)
+    (check,) = [b for b in ui.buttons if b.text == "Check again"]
+    assert any("disable" in p for p in check.props_seen)
+
+
+def test_discovery_records_the_deployed_message_key_columns(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import dsql_migrator.core.cdc_deployer as deployer_mod
+    from dsql_migrator.ui.data_migration._cdc_status import _probe_cdc_stack_phase
+
+    params: dict = {}
+
+    class _Deployer:
+        def describe_stack_or_none(self, _name):
+            if params.get("absent"):
+                return None
+            return SimpleNamespace(stack_status="UPDATE_COMPLETE", is_stable=True,
+                                   current_parameters=dict(params["p"]), outputs={})
+
+        def list_cdc_stacks(self):
+            return []
+
+    monkeypatch.setattr(deployer_mod, "build_cdc_stack_deployer", lambda *a, **k: _Deployer())
+    session = SimpleNamespace(target_config=SimpleNamespace(region="us-east-1"), aws_profile=None)
+    state = DataMigrationState()
+    params["p"] = {"MessageKeyColumns": r"app\.orders:user_id,id"}
+    _probe_cdc_stack_phase(state, session)
+    assert state.cdc_deployed_message_key_columns == {"app.orders": ["user_id", "id"]}
+    params["p"] = {"MessageKeyColumns": ""}
+    _probe_cdc_stack_phase(state, session)
+    assert state.cdc_deployed_message_key_columns == {}
+    params["p"] = {"TableIncludeList": "app.orders"}  # an older stack: no such parameter
+    _probe_cdc_stack_phase(state, session)
+    assert state.cdc_deployed_message_key_columns is None
+    params["absent"] = True
+    _probe_cdc_stack_phase(state, session)
+    assert state.cdc_deployed_message_key_columns is None
+
+
+def test_a_deployed_map_without_the_table_closes_its_open_finding_once(monkeypatch) -> None:
+    from dsql_migrator.core.activity_log import ActivityStatus
+    from dsql_migrator.core.models import CdcReplicaIdentityFinding
+
+    lines = _g2_logged(monkeypatch)
+    state = DataMigrationState()
+    state.cdc_replica_identity_findings = {
+        "app.orders": CdcReplicaIdentityFinding(
+            key_columns=["user_id", "id"], primary_key=["id"], identity="d",
+            first_weak_at=datetime(2026, 9, 1, 11, tzinfo=timezone.utc),
+        ),
+        "app.items": CdcReplicaIdentityFinding(
+            key_columns=["tenant_id", "id"], primary_key=["id"], identity="d",
+            first_weak_at=datetime(2026, 9, 1, 11, tzinfo=timezone.utc),
+        ),
+    }
+    stamp = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    state.set_cdc_deployed_message_key_columns({"app.items": ["tenant_id", "id"]}, now=stamp)
+    orders = state.cdc_replica_identity_findings["app.orders"]
+    assert orders.restored_at == stamp and orders.restored_by == "not-rekeyed"
+    assert state.cdc_replica_identity_findings["app.items"].restored_at is None
+    (line,) = lines
+    assert line[0] == "table is no longer re-keyed by CDC: REPLICA IDENTITY finding closed"
+    assert line[1]["status"] is ActivityStatus.WARNING
+    # Again: nothing more to close, nothing logged.
+    state.set_cdc_deployed_message_key_columns({"app.items": ["tenant_id", "id"]}, now=stamp)
+    assert len(lines) == 1
+    # Unknown (None) never closes anything.
+    state.set_cdc_deployed_message_key_columns(None)
+    assert state.cdc_replica_identity_findings["app.items"].restored_at is None
+
+
+def test_the_cdc_step_caller_still_matches_the_live_monitor_signature() -> None:
+    """The earlier TypeError regression: the real caller (_render_cdc_step) passes keywords
+    the monitor must accept. Bind the caller's actual call against the callee's signature."""
+    import ast
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_monitoring, _cdc_ui
+
+    tree = ast.parse(inspect.getsource(_cdc_ui._render_cdc_step))
+    (call,) = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_render_cdc_live_monitoring"
+    ]
+    sig = inspect.signature(_cdc_monitoring._render_cdc_live_monitoring)
+    sig.bind(*[object()] * len(call.args), **{kw.arg: object() for kw in call.keywords})
+    assert _cdc_ui._render_cdc_live_monitoring is _cdc_monitoring._render_cdc_live_monitoring
+
+
+def test_start_over_clears_findings_and_keeps_the_validation_handle() -> None:
+    from dsql_migrator.core.models import CdcReplicaIdentityFinding
+    from dsql_migrator.ui.data_migration import DataMigrationStore
+
+    store = DataMigrationStore()
+    state = store.get_or_create("s1")
+    handle = lambda: None  # noqa: E731
+    state.validation_state_provider = handle
+    state.cdc_replica_identity_findings = {
+        "app.t": CdcReplicaIdentityFinding(key_columns=["a", "id"], first_weak_at=datetime.now(timezone.utc))
+    }
+    state.cdc_deployed_message_key_columns = {"app.t": ["a", "id"]}
+    state.cdc_replica_identity_last_probe = object()
+    store.reset_in_place("s1")
+    assert state.cdc_replica_identity_findings == {}
+    assert state.cdc_deployed_message_key_columns is None
+    assert state.cdc_replica_identity_last_probe is None
+    assert state.validation_state_provider is handle
+
+
+def test_an_attach_or_a_rename_keeps_findings_and_drops_the_deployed_map() -> None:
+    from dsql_migrator.core.models import CdcReplicaIdentityFinding
+
+    finding = CdcReplicaIdentityFinding(key_columns=["a", "id"], first_weak_at=datetime.now(timezone.utc))
+    for action in ("adopt", "rename", "same-name"):
+        state = DataMigrationState()
+        state.cdc_replica_identity_findings = {"app.t": finding}
+        state.cdc_deployed_message_key_columns = {"app.t": ["a", "id"]}
+        if action == "adopt":
+            assert state.adopt_cdc_stack("dsql-cdc-other")
+        elif action == "rename":
+            assert state.set_cdc_stack_name("dsql-cdc-other")
+        else:
+            assert state.set_cdc_stack_name(state.cdc_stack_name)
+        assert state.cdc_replica_identity_findings == {"app.t": finding}, action
+        expected = {"app.t": ["a", "id"]} if action == "same-name" else None
+        assert state.cdc_deployed_message_key_columns == expected, action
+
+
+def test_the_screen_wires_the_replica_identity_handles(monkeypatch) -> None:
+    """build_data_migration_screen sets the inventory primary-key lookup (pure reorders are
+    left out without a read) next to the other builder-time handles."""
+    _ui, _captured, _built, state = _render_prereq_screen(monkeypatch, verified=True)
+    assert callable(state.source_primary_key_for)
+    assert state.source_primary_key_for("app.t") == ["id"]
+    assert state.source_primary_key_for("app.missing") is None
+
+
+def _g2_tones(monkeypatch):
+    """Record (tone, header, body) of every notice the CDC monitor draws."""
+    from dsql_migrator.ui.data_migration import _cdc_monitoring
+
+    seen: list = []
+    real = _cdc_monitoring.render_notice
+
+    def _notice(ui, **kw):
+        seen.append((kw.get("tone"), kw.get("header"), kw.get("body", "")))
+        return real(ui, **kw)
+
+    monkeypatch.setattr(_cdc_monitoring, "render_notice", _notice)
+    return seen
+
+
+def test_an_open_finding_shows_a_failed_check_again(monkeypatch) -> None:
+    """The dead end: a finding is open, the operator fixed the source, but every re-read now
+    fails (a rotated password). The red notice must say the read failed, not just redraw."""
+    import asyncio
+
+    _g2_fake_nicegui(monkeypatch)
+    _g2_logged(monkeypatch)
+    _g2_factory(monkeypatch, [("app.orders", "d", ["id"], 0, [])])
+    session = _g2_session()
+    state = _g2_state(session)
+    _ui, (poll,) = _g2_render(state, session)
+    _g2_poll(poll)
+    assert state.cdc_replica_identity_findings["app.orders"].restored_at is None
+    _g2_factory(monkeypatch, [], fail=ConnectionError("password authentication failed for pw"))
+    ui, _ = _g2_render(state, session)
+    (check,) = [b for b in ui.buttons if b.text == "Check again"]
+    asyncio.run(check.on_click())
+    assert state.cdc_replica_identity_last_probe.ok is False
+    tones = _g2_tones(monkeypatch)
+    ui, _ = _g2_render(state, session)
+    (error,) = [n for n in tones if n[0] == "error" and n[1] == _G2_HEADER]
+    assert "failed (ConnectionError)" in error[2] and "reconnect the source" in error[2]
+    assert "password authentication" not in " ".join(ui.texts)
+    # Said once, in the red notice: no second "Can't re-check" notice next to it.
+    assert not any(n[1] == "Can't re-check REPLICA IDENTITY on the source" for n in tones)
+
+
+def test_the_monitor_tones_a_failed_read_amber_and_a_missing_password_blue(monkeypatch) -> None:
+    _g2_fake_nicegui(monkeypatch)
+    _g2_factory(monkeypatch, [], fail=ConnectionError("refused"))
+    session = _g2_session()
+    state = _g2_state(session)
+    _ui, (poll,) = _g2_render(state, session)
+    _g2_poll(poll)
+    tones = _g2_tones(monkeypatch)
+    _g2_render(state, session)
+    assert ("warning", "Can't re-check REPLICA IDENTITY on the source") in [n[:2] for n in tones]
+    tones.clear()
+    nopw = _g2_session(password=False)
+    state.bind_session(nopw)
+    _g2_render(state, nopw)
+    assert ("info", "Can't re-check REPLICA IDENTITY on the source") in [n[:2] for n in tones]
+
+
+def test_a_waived_table_is_not_said_to_hold_cut_over_in_the_monitor(monkeypatch) -> None:
+    from datetime import timedelta
+
+    from dsql_migrator.core.models import CdcReplicaIdentityFinding, CdcReplicaIdentityWaiver
+    from dsql_migrator.ui.data_migration import _refresh_cdc_status
+    from dsql_migrator.ui.validation import ValidationState
+
+    session = _g2_session()
+    state = _g2_state(session)
+    fixed = datetime.now(timezone.utc) - timedelta(minutes=30)
+    state.cdc_replica_identity_findings = {
+        "app.orders": CdcReplicaIdentityFinding(
+            key_columns=["user_id", "id"], primary_key=["id"], identity="d",
+            first_weak_at=fixed - timedelta(hours=1), restored_at=fixed, restored_by="full",
+        )
+    }
+    vs = ValidationState()
+    state.validation_state_provider = lambda: vs
+    _g2_logged(monkeypatch)
+    _refresh_cdc_status(state)
+    ui, _ = _g2_render(state, session)
+    assert "Cut over waits until each matches" in " ".join(ui.texts)
+    vs.cutover_replica_identity_waiver = CdcReplicaIdentityWaiver(
+        tables={"app.orders": fixed}, waived_at=datetime.now(timezone.utc)
+    )
+    ui, _ = _g2_render(state, session)
+    body = " ".join(ui.texts)
+    assert "Cut over waits" not in body
+    assert "continue without this proof for app.orders" in body
+
+
+def test_a_deployed_key_within_the_primary_key_closes_its_open_finding(monkeypatch) -> None:
+    """Re-deployed with the source key (Keep source PK): the deployed key is now inside the
+    finding's primary key, so CDC no longer re-keys it -- closed, never a false hold."""
+    from dsql_migrator.core.models import CdcReplicaIdentityFinding
+    from dsql_migrator.ui.cdc_replica_identity_gate import replica_identity_read_scope
+
+    lines = _g2_logged(monkeypatch)
+    session = _g2_session()
+    state = _g2_state(session, keys={"app.orders": ["user_id", "id"]})
+    state.source_primary_key_for = {"app.orders": ["id"]}.get
+    state.cdc_replica_identity_findings = {
+        "app.orders": CdcReplicaIdentityFinding(
+            key_columns=["user_id", "id"], primary_key=["id"], identity="d",
+            first_weak_at=datetime(2026, 9, 1, 11, tzinfo=timezone.utc),
+        )
+    }
+    stamp = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    state.set_cdc_deployed_message_key_columns({"app.orders": ["id"]}, now=stamp)
+    finding = state.cdc_replica_identity_findings["app.orders"]
+    assert finding.restored_at == stamp and finding.restored_by == "not-rekeyed"
+    assert len(lines) == 1
+    assert replica_identity_read_scope(state, session) == {}
+
+
+def test_check_again_is_single_flight_with_the_polls_read(monkeypatch) -> None:
+    import asyncio
+
+    from dsql_migrator.core.models import CdcReplicaIdentityFinding
+    from dsql_migrator.ui.cdc_replica_identity_gate import probe_replica_identity_now
+    from dsql_migrator.ui.data_migration import _refresh_cdc_status
+
+    _g2_fake_nicegui(monkeypatch)
+    _g2_logged(monkeypatch)
+    calls, _ = _g2_factory(monkeypatch, [("app.orders", "d", ["id"], 0, [])])
+    session = _g2_session()
+    state = _g2_state(session)
+    state.cdc_replica_identity_findings = {
+        "app.orders": CdcReplicaIdentityFinding(
+            key_columns=["user_id", "id"], primary_key=["id"], identity="d",
+            first_weak_at=datetime.now(timezone.utc),
+        )
+    }
+    _refresh_cdc_status(state)
+    assert state.begin_cdc_replica_identity_probe()  # the poll's read is in flight
+    ui, _ = _g2_render(state, session)
+    (check,) = [b for b in ui.buttons if b.text == "Check again"]
+    assert any("disable" in p for p in check.props_seen)
+    assert asyncio.run(probe_replica_identity_now(session, state)) is False
+    assert calls == [] and state.cdc_replica_identity_probe_running is True

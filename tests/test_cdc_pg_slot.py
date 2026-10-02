@@ -998,3 +998,108 @@ def test_the_option_is_a_statement_suffix_not_a_table_name() -> None:
     sql = next(s for s in conn.writes() if s.upper().startswith("CREATE PUBLICATION"))
     assert sql.lower().rstrip().endswith("with (publish_via_partition_root = true)"), sql
     assert sql.index('"s"."b"') < sql.lower().index("with ("), sql
+
+
+# ---------------------------------------------------------------------------
+# G2: the runtime REPLICA IDENTITY re-read for re-keyed tables (read-only)
+# ---------------------------------------------------------------------------
+
+
+class _IdentityConn:
+    """Records every execute; answers the one re-keyed identity statement with ``rows``."""
+
+    def __init__(self, rows=(), *, fail=None):
+        self.calls: list[tuple[str, dict]] = []
+        self._rows = list(rows)
+        self._fail = fail
+
+    def execute(self, statement, params=None):
+        self.calls.append((str(statement), dict(params or {})))
+        if self._fail is not None:
+            raise self._fail
+        return _Result(self._rows)
+
+
+def test_read_rekeyed_replica_identity_is_one_bounded_statement() -> None:
+    from dsql_migrator.core.cdc_pg_slot import RekeyedIdentityRead, read_rekeyed_replica_identity
+
+    sample = [f"app.events_p{i}" for i in range(5)]
+    conn = _IdentityConn([
+        ("app.orders", "d", ["id"], 0, []),
+        ("app.events", "f", ["id"], 37, sample),
+        ("app.items", "f", ["order_id", "id"], 0, None),
+    ])
+    reads = read_rekeyed_replica_identity(conn, ["app.orders", "app.events", "app.items", "app.orders"])
+    # ONE execute for every table, the names bound (never interpolated), deduplicated.
+    assert len(conn.calls) == 1
+    sql, params = conn.calls[0]
+    assert params == {"names": ["app.events", "app.items", "app.orders"]}
+    assert "= ANY(:names)" in sql
+    # Leaves aggregated server-side: a count and at most five names, never a row per leaf.
+    assert "pg_partition_tree" in sql and "count(*)" in sql and "LIMIT 5" in sql
+    assert "relkind IN ('r','p')" in sql
+    # The grading predicates themselves (the live PG 13-17 run checks their semantics): a
+    # LEAF is weak when it is NOT FULL, in both the count and the sample, and the live key is
+    # the PRIMARY KEY, never a unique index.
+    assert sql.count("t.isleaf AND l.relreplident <> 'f'") == 2, sql
+    assert "i.indisprimary" in sql, sql
+    # Catalog only: nothing that could write or lock a user table.
+    upper = sql.upper()
+    for word in ("INSERT", "UPDATE ", "DELETE", "ALTER", "LOCK", "FOR UPDATE"):
+        assert word not in upper, word
+    assert reads["app.orders"] == RekeyedIdentityRead("d", ("id",), 0, ())
+    assert reads["app.events"] == RekeyedIdentityRead("f", ("id",), 37, tuple(sample))
+    assert reads["app.items"].weak_partition_names == ()  # a NULL sample is empty
+    assert reads["app.items"].primary_key == ("order_id", "id")
+    # No names: no statement at all.
+    idle = _IdentityConn()
+    assert read_rekeyed_replica_identity(idle, []) == {} and idle.calls == []
+
+
+def test_read_rekeyed_replica_identity_raises_on_failure() -> None:
+    """Unreadable is not evidence: the failure propagates, never mapped to FULL."""
+    from dsql_migrator.core.cdc_pg_slot import read_rekeyed_replica_identity
+
+    with pytest.raises(RuntimeError):
+        read_rekeyed_replica_identity(_IdentityConn(fail=RuntimeError("denied")), ["app.t"])
+
+
+_IDENTITY_KEYS = {
+    "adds-a-column": ["tenant_id", "id"],
+    "pure-reorder": ["b", "a"],
+    "omits-a-source-pk-column": ["tenant_id", "a"],
+}
+
+
+@pytest.mark.parametrize("identity", ["d", "n", "i", "f"])
+@pytest.mark.parametrize("weak_partitions", [0, 3, 37])
+@pytest.mark.parametrize("key_kind", sorted(_IDENTITY_KEYS))
+def test_runtime_grade_matches_start_prerequisite(identity, weak_partitions, key_kind) -> None:
+    """Parity: a state that passes Start never raises a runtime finding, and the reverse."""
+    from dsql_migrator.core.cdc_pg_slot import RekeyedIdentityRead, grade_rekeyed_replica_identity
+    from dsql_migrator.core.models import PrerequisiteStatus, TableDef
+    from dsql_migrator.core.prerequisites_postgres import (
+        PostgresCdcFacts,
+        check_replica_identity_covers_key,
+    )
+
+    pk = ["id"] if key_kind == "adds-a-column" else ["a", "b"]
+    key = _IDENTITY_KEYS[key_kind]
+    leaves = {f"app.t_p{i}": "d" for i in range(weak_partitions)}
+    leaves.update({f"app.t_ok{i}": "f" for i in range(2)})
+    start = check_replica_identity_covers_key(
+        TableDef(name="app.t", primary_key=pk),
+        PostgresCdcFacts(replica_identity={"app.t": identity},
+                         leaf_replica_identity={"app.t": leaves}),
+        key,
+    )
+    expected = None if start is None else {
+        PrerequisiteStatus.FAIL: "weak",
+        PrerequisiteStatus.PASS: "full",
+        PrerequisiteStatus.INFO: "unknown",
+    }[start.status]
+    weak_names = tuple(sorted(n for n, c in leaves.items() if c != "f"))[:5]
+    read = RekeyedIdentityRead(identity, tuple(pk), weak_partitions, weak_names)
+    assert grade_rekeyed_replica_identity("app.t", key, read) == expected
+    # A missing row is always unknown -- never "not re-keyed", never FULL.
+    assert grade_rekeyed_replica_identity("app.t", key, None) == "unknown"

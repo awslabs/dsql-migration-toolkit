@@ -452,6 +452,26 @@ def build_data_migration_screen(
         if validation_store is not None
         else None
     )
+    # The session's ValidationState, so the CDC monitor's REPLICA IDENTITY notice can hide a
+    # finding a CHECKSUM has already proven (duck-typed, like the two handles above).
+    migration_state.validation_state_provider = (
+        (lambda: validation_store.get_or_create(session_id))
+        if validation_store is not None
+        else None
+    )
+
+    def _source_primary_key(name: str) -> "Optional[list[str]]":
+        # The Step 1 inventory's primary key for the REPLICA IDENTITY re-check's scope (a
+        # pure PK reorder needs nothing from the source). A linear scan over the inventory,
+        # called only for the few re-keyed tables.
+        result = eval_state.result
+        inventory = getattr(result, "inventory", None) if result is not None else None
+        for table in getattr(inventory, "tables", None) or ():
+            if table.name == name:
+                return list(table.primary_key)
+        return None
+
+    migration_state.source_primary_key_for = _source_primary_key
 
     def _inventory() -> Optional[SourceInventory]:
         result = eval_state.result

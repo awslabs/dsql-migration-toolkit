@@ -6902,7 +6902,7 @@ def _g1_screen(monkeypatch, validator, *, ledger_tables=("orders",), ui=None, cd
         assert manager.wait(vstate.job_id, timeout=5.0) is True
 
     return SimpleNamespace(content=content, run=run, vstate=vstate, mstate=mstate,
-                           manager=manager, logged=logged)
+                           manager=manager, logged=logged, session=session)
 
 
 def _g1_detail(logged, action):
@@ -7290,3 +7290,608 @@ def test_an_attached_pipeline_tells_validation_cut_over_needs_a_full_checksum(mo
     ui.texts.clear()
     s.content(lambda: None)
     assert "Cut over also needs one CHECKSUM run of every table" not in ui.body()
+
+
+# ---------------------------------------------------------------------------
+# G2: re-keyed PostgreSQL tables whose REPLICA IDENTITY dropped below FULL
+# ---------------------------------------------------------------------------
+
+
+def _g2_finding(*, first=None, restored=None, key=("tenant_id", "id"), pk=("id",)):
+    from datetime import timedelta
+
+    from dsql_migrator.core.models import CdcReplicaIdentityFinding
+
+    now = datetime.now(timezone.utc)
+    return CdcReplicaIdentityFinding(
+        key_columns=list(key), primary_key=list(pk), identity="d",
+        first_weak_at=first or now - timedelta(hours=4),
+        restored_at=restored, restored_by="full" if restored is not None else None,
+    )
+
+
+def _g2_probe(tables, *, identity="f", ago=None, ok=True, error_class=None):
+    from datetime import timedelta
+
+    from dsql_migrator.core.cdc_pg_slot import RekeyedIdentityRead
+    from dsql_migrator.ui.cdc_replica_identity_gate import CdcReplicaIdentityProbe
+
+    started = datetime.now(timezone.utc) - (ago if ago is not None else timedelta(seconds=1))
+    return CdcReplicaIdentityProbe(
+        started_at=started, finished_at=started + timedelta(seconds=1), ok=ok,
+        problem=None if ok else "read-failed", error_class=error_class,
+        scope={t: ("tenant_id", "id") for t in tables},
+        reads={t: RekeyedIdentityRead(identity, ("id",), 0, ()) for t in tables} if ok else {},
+    )
+
+
+class _G2Cutover:
+    """G1's real cut-over harness with a PostgreSQL source and a re-keyed table."""
+
+    def __init__(self, monkeypatch, *, password=True, mtype="FULL_LOAD_AND_CDC", cdc=True,
+                 pg=True, keys=None):
+        from dsql_migrator.core.models import SourceConnectionConfig, SourceType
+        import dsql_migrator.ui.data_migration._cdc_status as status
+
+        from tests.test_cdc_dlq_gate import _Cutover
+
+        self.c = _Cutover(monkeypatch, cdc=cdc, mtype=mtype)
+        self.c.session.set_source(
+            SourceConnectionConfig(
+                source_type=SourceType.POSTGRES if pg else SourceType.MYSQL,
+                host="src.example", port=5432 if pg else 3306, database="app", username="u",
+            ),
+            SecretValue("pw") if password else None,
+        )
+        self.c.ms.cdc_deployed_message_key_columns = (
+            {"app.t": ["tenant_id", "id"]} if keys is None else keys
+        )
+        self.ri_reads: list = []
+        self.next_ri = None
+
+        def _once(_session, scope):
+            self.ri_reads.append(dict(scope))
+            return self.next_ri
+
+        monkeypatch.setattr(status, "read_cdc_replica_identity_once", _once)
+
+    def __getattr__(self, name):
+        return getattr(self.c, name)
+
+    def ri_timers(self):
+        return [cb for cb in self.c.ui.timers
+                if "schedule_replica_identity_probe" in getattr(cb, "__qualname__", "")]
+
+    def ready(self, *, ri=True, validated_ago=None):
+        """A clean CHECKSUM report, a fresh dead-letter read and (optionally) a fresh
+        REPLICA IDENTITY read, all after the validation."""
+        from tests.test_cdc_dlq_gate import _item
+
+        self.c.validate(_item(), mode=ValidationMode.CHECKSUM)
+        self.c.landed()
+        if ri:
+            self.c.ms.cdc_replica_identity_last_probe = _g2_probe(["app.t"])
+
+
+def test_cutover_held_while_rekeyed_replica_identity_below_full(monkeypatch) -> None:
+    """The gap: a clean CHECKSUM report released cut over while a re-keyed table's REPLICA
+    IDENTITY was DEFAULT -- every DELETE on it silently missing Aurora DSQL."""
+    s = _G2Cutover(monkeypatch)
+    s.ms.cdc_replica_identity_findings = {"app.t": _g2_finding()}
+    s.ready()
+    s.ms.cdc_replica_identity_last_probe = _g2_probe(["app.t"], identity="d")
+    s.render()
+    assert "Source REPLICA IDENTITY check" in s.ui.texts
+    assert "I've cut over to DSQL" not in s.ui.texts
+    (weak,) = [n for n in s.notices if n["header"].startswith("Cut over is held: deletes on")]
+    assert weak["tone"] == "error" and "app.t (REPLICA IDENTITY DEFAULT)" in weak["body"]
+    assert "ALTER TABLE <table> REPLICA IDENTITY FULL" in weak["body"]
+    assert "Check again" in s.ui.texts and not s.button("Check again").disabled
+    assert "Continue without this check" not in s.ui.texts  # never waivable
+    # Check again forces ONE read (scheduled, not run on the click).
+    s.click("Check again")
+    assert len(s.ri_timers()) == 1 and s.button("Check again").disabled
+
+
+def test_a_restored_table_releases_only_after_a_checksum_started_after_the_fix(monkeypatch) -> None:
+    from datetime import timedelta
+
+    from tests.test_cdc_dlq_gate import _item
+
+    s = _G2Cutover(monkeypatch)
+    now = datetime.now(timezone.utc)
+    # Restored 2 h ago; the validation started 90 min ago -> after the fix: released.
+    s.ms.cdc_replica_identity_findings = {"app.t": _g2_finding(restored=now - timedelta(hours=2))}
+    s.ready()
+    s.render()
+    assert "I've cut over to DSQL" in s.ui.texts
+    assert "Source REPLICA IDENTITY check" not in s.ui.texts
+    s.click("I've cut over to DSQL")
+    (ack,) = s.acknowledged()
+    assert (
+        "; re-keyed tables' REPLICA IDENTITY: below FULL earlier on app.t, each cleared by a "
+        "CHECKSUM match after the fix" in ack["detail"]
+    )
+    # Restored AFTER the comparison started: held, re-check by CHECKSUM.
+    late = _G2Cutover(monkeypatch)
+    late.ms.cdc_replica_identity_findings = {
+        "app.t": _g2_finding(restored=now - timedelta(minutes=89, seconds=30))
+    }
+    late.ready()
+    late.render()
+    assert "I've cut over to DSQL" not in late.ui.texts
+    assert "Re-check 1 re-keyed table(s) with CHECKSUM before cutting over" in late.body()
+    assert "Drop & reload" in late.body()
+    # A row-count-only comparison never proves it.
+    counted = _G2Cutover(monkeypatch)
+    counted.ms.cdc_replica_identity_findings = {"app.t": _g2_finding(restored=now - timedelta(hours=2))}
+    counted.c.validate(_item(checksum=None))
+    counted.c.landed()
+    counted.ms.cdc_replica_identity_last_probe = _g2_probe(["app.t"])
+    counted.render()
+    assert "I've cut over to DSQL" not in counted.ui.texts
+
+
+def test_a_table_left_out_of_the_report_can_be_waived_once_and_releases(monkeypatch) -> None:
+    from datetime import timedelta
+
+    from dsql_migrator.core.activity_log import ActivityStatus
+
+    s = _G2Cutover(monkeypatch)
+    restored = datetime.now(timezone.utc) - timedelta(hours=2)
+    s.ms.cdc_replica_identity_findings = {"app.gone": _g2_finding(restored=restored)}
+    s.ready()
+    s.render()
+    assert "1 re-keyed table(s) have no CHECKSUM proof since REPLICA IDENTITY was restored" in s.body()
+    assert "I've cut over to DSQL" not in s.ui.texts
+    s.click("Continue without this check")
+    (waived,) = [kw for action, kw in s.logged
+                 if action == "REPLICA IDENTITY CHECKSUM proof waived at cut over"]
+    assert waived["status"] is ActivityStatus.WARNING and "app.gone" in waived["detail"]
+    assert s.vs.cutover_replica_identity_waiver.tables == {"app.gone": restored}
+    s.render()
+    assert "I've cut over to DSQL" in s.ui.texts
+    assert "Cutting over without CHECKSUM proof for re-keyed tables" in s.body()
+    s.click("I've cut over to DSQL")
+    assert "; REPLICA IDENTITY check WAIVED (CHECKSUM proof for app.gone)" in s.acknowledged()[-1]["detail"]
+    # A restored table a CHECKSUM CAN re-check is never offered the waiver.
+    must = _G2Cutover(monkeypatch)
+    must.ms.cdc_replica_identity_findings = {
+        "app.t": _g2_finding(restored=datetime.now(timezone.utc) - timedelta(minutes=10))
+    }
+    must.ready()
+    must.render()
+    assert "Continue without this check" not in must.ui.texts
+
+
+def test_cut_over_waits_for_one_fresh_read_and_then_releases(monkeypatch) -> None:
+    s = _G2Cutover(monkeypatch)
+    s.ready(ri=False)  # no REPLICA IDENTITY read since the validation
+    s.render()
+    assert "Re-reading REPLICA IDENTITY on the source" in s.body()
+    assert [n["tone"] for n in s.notices if n["header"] == "Re-reading REPLICA IDENTITY on the source"] == ["info"]
+    assert "I've cut over to DSQL" not in s.ui.texts
+    assert s.ri_reads == [] and len(s.ri_timers()) == 1  # armed, never read on the render
+    s.next_ri = _g2_probe(["app.t"])
+    s.run(s.ri_timers()[0])
+    assert s.ri_reads == [{"app.t": ["tenant_id", "id"]}] and s.refreshes == [1]
+    s.render()
+    assert "I've cut over to DSQL" in s.ui.texts and s.ri_timers() == []
+    s.click("I've cut over to DSQL")
+    assert "; re-keyed tables' REPLICA IDENTITY: FULL at" in s.acknowledged()[-1]["detail"]
+
+
+def test_without_the_password_cut_over_warns_and_logs_rather_than_holds(monkeypatch) -> None:
+    s = _G2Cutover(monkeypatch, password=False)
+    s.ready(ri=False)
+    s.render()
+    assert "I've cut over to DSQL" in s.ui.texts  # FAIL-OPEN by design
+    (warn,) = [n for n in s.notices
+               if n["header"] == "Cut over could not re-read REPLICA IDENTITY on the source"]
+    assert warn["tone"] == "warning" and "reconnect the source on the Connect step" in warn["body"]
+    assert s.ri_timers() == []
+    s.click("I've cut over to DSQL")
+    assert (
+        "; re-keyed tables' REPLICA IDENTITY: not re-checked (source password not in memory)"
+        in s.acknowledged()[-1]["detail"]
+    )
+    # ...but a RECORDED open finding still holds without a password.
+    held = _G2Cutover(monkeypatch, password=False)
+    held.ms.cdc_replica_identity_findings = {"app.t": _g2_finding()}
+    held.ready(ri=False)
+    held.render()
+    assert "I've cut over to DSQL" not in held.ui.texts
+    assert held.button("Check again").disabled
+    assert "reconnect the source on the Connect step" in held.body()
+
+
+def test_dead_letter_and_replica_identity_holds_render_together(monkeypatch) -> None:
+    from tests.test_cdc_dlq_gate import _item
+
+    s = _G2Cutover(monkeypatch)
+    s.c.dead_letter("app.t")
+    s.ms.cdc_replica_identity_findings = {"app.t": _g2_finding()}
+    s.c.validate(_item(checksum=None))
+    s.c.landed()
+    s.ms.cdc_replica_identity_last_probe = _g2_probe(["app.t"], identity="d")
+    s.render()
+    assert "CDC dead-letter check" in s.ui.texts
+    assert "Source REPLICA IDENTITY check" in s.ui.texts
+    assert "I've cut over to DSQL" not in s.ui.texts
+
+
+@pytest.mark.parametrize("kind", ["mysql", "full-load-only"])
+def test_mysql_and_full_load_only_cut_over_is_unchanged(monkeypatch, kind) -> None:
+    def _render(with_keys):
+        s = _G2Cutover(
+            # MySQL: never re-keyed-PG; Full load only: a PG source, but no CDC in use.
+            monkeypatch, pg=(kind == "full-load-only"),
+            cdc=(kind != "full-load-only"),
+            mtype="FULL_LOAD_ONLY" if kind == "full-load-only" else "FULL_LOAD_AND_CDC",
+            keys={"app.t": ["tenant_id", "id"]} if with_keys else {},
+        )
+        s.ready(ri=False)
+        s.render()
+        s.click("I've cut over to DSQL")
+        return s
+
+    plain, keyed = _render(False), _render(True)
+    assert keyed.ui.texts == plain.ui.texts
+    assert keyed.ri_timers() == [] and keyed.ri_reads == []
+    assert "REPLICA IDENTITY" not in keyed.acknowledged()[-1]["detail"]
+
+
+def _g2_gate(findings, report, *, run_start, scope=None):
+    from dsql_migrator.ui.cdc_replica_identity_gate import cdc_replica_identity_cutover_gate
+
+    return cdc_replica_identity_cutover_gate(
+        findings=findings, scope=scope or {}, cdc_in_use=True, cdc_evidence=True, is_pg=True,
+        check_probe=False, report=report, release="clean", compared_run_start=run_start,
+    )
+
+
+def test_the_verdict_is_not_ready_while_replica_identity_is_or_was_below_full(monkeypatch) -> None:
+    from datetime import timedelta
+
+    import dsql_migrator.ui.validation as uiv
+
+    tones: list = []
+    real = uiv.render_notice
+    monkeypatch.setattr(uiv, "render_notice", lambda ui, **kw: (tones.append((kw["tone"], kw["header"])), real(ui, **kw)))
+    report = _g1_match_report(checksum=True)
+    now = datetime.now(timezone.utc)
+    weak = _g2_gate({"orders": _g2_finding()}, report, run_start=now,
+                    scope={"orders": ("tenant_id", "id")})
+    picked: list = []
+    ui = _g1_render(report, None, replica_identity_gate=weak, recheck_provider=picked.append)
+    assert "Ready for cut-over" not in ui.texts
+    assert ("error", "Tables match — cut over is held: REPLICA IDENTITY on 1 re-keyed table(s) is "
+            "below FULL") in tones
+    assert not any(t.startswith("Re-check") for t, _cb in ui.clicks)  # never offered
+    tones.clear()
+    restored = _g2_gate({"orders": _g2_finding(restored=now - timedelta(seconds=30))}, report,
+                        run_start=now)
+    ui = _g1_render(report, None, replica_identity_gate=restored, recheck_provider=picked.append)
+    assert ("warning", "Tables match — cut over waits for a CHECKSUM re-check of 1 re-keyed "
+            "table(s)") in tones
+    (click,) = [cb for text, cb in ui.clicks if text == "Re-check 1 table(s) with CHECKSUM"]
+    click()
+    assert picked == [["orders"]]
+    # Proven after the fix: green, exactly as before.
+    proven = _g2_gate({"orders": _g2_finding(restored=now - timedelta(minutes=5))}, report,
+                      run_start=now)
+    assert "Ready for cut-over" in _g1_render(report, None, replica_identity_gate=proven).texts
+
+
+def _g2_findings_screen(monkeypatch, validator, **kw):
+    from datetime import timedelta
+
+    s = _g1_screen(monkeypatch, validator, ledger_tables=(), **kw)
+    s.mstate.cdc_replica_identity_findings = {
+        "orders": _g2_finding(restored=datetime.now(timezone.utc) - timedelta(hours=1))
+    }
+    return s
+
+
+def test_a_row_count_run_also_checksums_a_table_with_a_replica_identity_finding(monkeypatch) -> None:
+    fake = _ModeAwareValidator()
+    s = _g2_findings_screen(monkeypatch, fake)
+    s.vstate.mode = ValidationMode.ROW_COUNT
+    s.run()
+    assert [c["mode"] for c in fake.calls] == [ValidationMode.ROW_COUNT, ValidationMode.CHECKSUM]
+    assert fake.calls[1]["tables"] == ["orders"]
+    started = _g1_detail(s.logged, "validation started")
+    assert "tables whose REPLICA IDENTITY dropped below FULL are also compared by CHECKSUM: orders" in started
+    assert "dead-lettered" not in started
+    completed = _g1_detail(s.logged, "validation completed")
+    assert "CHECKSUM pass for tables whose REPLICA IDENTITY dropped below FULL: orders" in completed
+
+
+def test_the_recheck_split_upgrades_a_finding_table_to_checksum(monkeypatch) -> None:
+    fake = _ModeAwareValidator()
+    s = _g2_findings_screen(monkeypatch, fake)
+    s.vstate.set_result(ValidationReport.build(
+        mode=ValidationMode.ROW_COUNT,
+        items=[TableValidationResult(table=n, source_row_count=1, target_row_count=2,
+                                     row_count_match=False, matched=False)
+               for n in ("orders", "customers")],
+    ))
+    _recheck_closure(s.content)(["orders", "customers"])
+    assert s.manager.wait(s.vstate.job_id, timeout=5.0) is True
+    assert [(c["tables"], c["mode"]) for c in fake.calls] == [
+        (["orders"], ValidationMode.CHECKSUM),
+        (["customers"], ValidationMode.ROW_COUNT),
+    ]
+
+
+def test_the_options_hint_names_finding_tables() -> None:
+    from dsql_migrator.ui.validation import _render_options
+
+    ui = _ScreenUi()
+    _render_options(ui, ValidationState(), StepStatus.DONE,
+                    replica_identity_checksum_tables=("orders",))
+    assert any("REPLICA IDENTITY on the source was below FULL while CDC ran for 1 re-keyed "
+               "table(s) (orders)" in t for t in ui.texts)
+    quiet = _ScreenUi()
+    _render_options(quiet, ValidationState(), StepStatus.DONE)
+    assert not any("REPLICA IDENTITY" in t for t in quiet.texts)
+
+
+def test_a_held_finding_replaces_ready_in_the_completed_log(monkeypatch) -> None:
+    from datetime import timedelta
+
+    s = _g1_screen(monkeypatch, _ModeAwareValidator(), ledger_tables=(), cdc=True)
+    s.mstate.cdc_replica_identity_findings = {"orders": _g2_finding()}
+    s.run()
+    completed = _g1_detail(s.logged, "validation completed")
+    assert "; cut over held: REPLICA IDENTITY below FULL on orders" in completed
+    assert "; ready for cut-over" not in completed
+    s.mstate.cdc_replica_identity_findings = {
+        "orders": _g2_finding(restored=datetime.now(timezone.utc) + timedelta(minutes=5))
+    }
+    s.logged.clear()
+    s.run()
+    assert "re-keyed table(s) lack a CHECKSUM match after REPLICA IDENTITY was restored: orders" in (
+        _g1_detail(s.logged, "validation completed")
+    )
+
+
+def test_the_extra_rows_notice_no_longer_claims_a_null_key() -> None:
+    from dsql_migrator.ui.validation import _render_recovery_section
+
+    ui = _CopyUi()
+    _render_recovery_section(ui, _release_summary(is_match=False, mismatched=1, extra=1), _drift_na())
+    body = ui.body()
+    assert "a delete never landed" in body
+    assert "arrives NULL" not in body
+    assert "does not carry the added key column and removes nothing" in body
+    assert "Check that table's REPLICA IDENTITY on the source" in body
+
+
+# --- G2 review fixes -------------------------------------------------------------------
+
+
+def test_cut_over_names_a_failed_re_read_while_a_finding_holds_it(monkeypatch) -> None:
+    """Held (fail-closed) on an open finding, but the last re-read failed: the held section
+    must say so -- otherwise Check again looks like it does nothing."""
+    s = _G2Cutover(monkeypatch)
+    s.ms.cdc_replica_identity_findings = {"app.t": _g2_finding()}
+    s.ready(ri=False)
+    s.ms.cdc_replica_identity_last_probe = _g2_probe(["app.t"], ok=False,
+                                                     error_class="OperationalError")
+    s.render()
+    assert "I've cut over to DSQL" not in s.ui.texts
+    (weak,) = [n for n in s.notices if n["header"].startswith("Cut over is held: deletes on")]
+    assert "failed (OperationalError)" in weak["body"]
+    assert "reconnect the source on the Connect step, then choose Check again" in weak["body"]
+    assert not s.button("Check again").disabled
+
+
+@pytest.mark.parametrize("ok", [True, False])
+def test_a_pending_cut_over_is_not_stranded_by_a_read_that_started_before_the_validation(
+    monkeypatch, ok
+) -> None:
+    """Another read (the CDC poll's, another tab's) was in flight when the validation
+    finished. The page waited for it, saw no change (it also started before the validation)
+    and never refreshed: 'Re-reading ... a few seconds' forever, with no button."""
+    import asyncio
+    from datetime import timedelta
+
+    s = _G2Cutover(monkeypatch)
+    s.ready(ri=False)
+    evidence = s.vs.completed_at
+    s.ms.cdc_replica_identity_last_probe = _g2_probe(
+        ["app.t"], ago=timedelta(minutes=85), ok=ok, error_class=None if ok else "OperationalError"
+    )
+    assert s.ms.begin_cdc_replica_identity_probe()  # the other read is in flight
+    s.render()
+    assert "Re-reading REPLICA IDENTITY on the source" in s.body()
+    (timer,) = s.ri_timers()
+
+    async def _scenario():
+        async def _other_read_lands():
+            await asyncio.sleep(0.1)
+            landed = _g2_probe(["app.t"], ago=timedelta(minutes=81), ok=ok,
+                               error_class=None if ok else "OperationalError")
+            assert landed.started_at <= evidence  # it too predates the validation
+            s.ms.apply_cdc_replica_identity_probe(landed)
+            s.ms.finish_cdc_replica_identity_probe()
+
+        await asyncio.gather(timer(), _other_read_lands())
+
+    asyncio.run(_scenario())
+    assert s.refreshes == [1] and s.ri_reads == []
+    s.render()  # the refresh re-arms ONE read of its own, which now can take the claim
+    (again,) = s.ri_timers()
+    s.next_ri = _g2_probe(["app.t"])
+    s.run(again)
+    assert len(s.ri_reads) == 1 and s.refreshes == [1, 1]
+    s.render()
+    assert "I've cut over to DSQL" in s.ui.texts
+
+
+def test_cut_over_never_quotes_a_recheck_button_count_validation_does_not_draw(monkeypatch) -> None:
+    """Both gates hold one table each; Validation draws ONE button for both ("Re-check 2
+    table(s) with CHECKSUM"), so neither Cut over notice may quote "Re-check 1 ...")."""
+    from datetime import timedelta
+
+    from tests.test_cdc_dlq_gate import _item
+
+    s = _G2Cutover(monkeypatch)
+    s.c.dead_letter("app.t")
+    s.ms.cdc_replica_identity_findings = {
+        "app.u": _g2_finding(restored=datetime.now(timezone.utc) - timedelta(hours=2))
+    }
+    s.c.validate(_item("app.t", checksum=None), _item("app.u", checksum=None))
+    s.c.landed()
+    s.ms.cdc_replica_identity_last_probe = _g2_probe(["app.u"])
+    s.render()
+    assert "CDC dead-letter check" in s.ui.texts and "Source REPLICA IDENTITY check" in s.ui.texts
+    bodies = [n["body"] for n in s.notices]
+    assert not any("'Re-check 1 table(s) with CHECKSUM'" in b for b in bodies)
+    assert sum("re-check them with CHECKSUM (one button there re-checks every table that "
+               "needs it)" in b for b in bodies) == 2
+    # ...and Validation's one button covers both.
+    report = ValidationReport.build(mode=ValidationMode.ROW_COUNT, items=[
+        TableValidationResult(table=n, source_row_count=1, target_row_count=1,
+                              row_count_match=True, matched=True)
+        for n in ("orders", "customers")
+    ])
+    ri = _g2_gate({"customers": _g2_finding(restored=datetime.now(timezone.utc) - timedelta(hours=2))},
+                  report, run_start=datetime.now(timezone.utc))
+    ui = _g1_render(report, _g1_gate(report), replica_identity_gate=ri,
+                    recheck_provider=lambda _t: None)
+    assert "Re-check 2 table(s) with CHECKSUM" in [t for t, _cb in ui.clicks]
+
+
+def test_the_verdict_names_every_held_re_keyed_table(monkeypatch) -> None:
+    from datetime import timedelta
+
+    report = _g1_match_report(checksum=True)
+    now = datetime.now(timezone.utc)
+    # (a) orders still below FULL, customers restored too late: the button under the red
+    # verdict re-checks customers, so the verdict must name it (and never orders).
+    gate = _g2_gate({"orders": _g2_finding(),
+                     "customers": _g2_finding(restored=now - timedelta(seconds=30))},
+                    report, run_start=now, scope={"orders": ("tenant_id", "id")})
+    picked: list = []
+    ui = _g1_render(report, None, replica_identity_gate=gate, recheck_provider=picked.append)
+    body = ui.body()
+    assert "customers" in body and "re-check them below" in body
+    (click,) = [cb for text, cb in ui.clicks if text == "Re-check 1 table(s) with CHECKSUM"]
+    click()
+    assert picked == [["customers"]]
+    # (b) a re-check plus a table not in the report: both named.
+    gate = _g2_gate({"orders": _g2_finding(restored=now - timedelta(seconds=30)),
+                     "app.gone": _g2_finding(restored=now - timedelta(hours=1))},
+                    report, run_start=now)
+    body = _g1_render(report, None, replica_identity_gate=gate).body()
+    assert "app.gone" in body and "acknowledge them on the Cut over step" in body
+    # (c) only a table not in the report: the warning hold, never a green "Ready".
+    gate = _g2_gate({"app.gone": _g2_finding(restored=now - timedelta(hours=1))}, report,
+                    run_start=now)
+    assert [i.reason for i in gate.issues] == ["not-validated"]
+    ui = _g1_render(report, None, replica_identity_gate=gate)
+    assert "Ready for cut-over" not in ui.texts
+    assert ("Tables match — 1 re-keyed table(s) whose REPLICA IDENTITY was below FULL are not "
+            "in this report") in ui.body()
+
+
+def test_a_weak_finding_that_lands_after_the_render_stops_the_acknowledgement(monkeypatch) -> None:
+    s = _G2Cutover(monkeypatch)
+    s.ready()
+    s.render()
+    assert "I've cut over to DSQL" in s.ui.texts
+    # The CDC poll (or another tab) records a weak finding after this page was drawn.
+    s.ms.cdc_replica_identity_findings = {"app.t": _g2_finding()}
+    s.click("I've cut over to DSQL")
+    assert s.acknowledged() == []
+    assert s.ui.notes and s.ui.notes[-1][1] == "warning"
+    assert s.refreshes == [1]
+
+
+def test_acknowledging_while_a_replica_identity_read_runs_waits_for_it(monkeypatch) -> None:
+    s = _G2Cutover(monkeypatch)
+    s.ready()
+    s.render()
+    assert "I've cut over to DSQL" in s.ui.texts
+    assert s.ms.begin_cdc_replica_identity_probe() is True
+    s.click("I've cut over to DSQL")
+    assert s.acknowledged() == []
+    assert s.ui.notes and s.ui.notes[-1][1] == "info"
+    s.ms.finish_cdc_replica_identity_probe()
+    s.click("I've cut over to DSQL")  # control: a released click acknowledges once
+    assert len(s.acknowledged()) == 1
+
+
+def test_the_validation_screen_wires_the_replica_identity_gate(monkeypatch) -> None:
+    """End to end through ``content``: the one background REPLICA IDENTITY read is armed and
+    an open finding replaces the green "Ready" verdict with the error hold."""
+    from dsql_migrator.core.models import SourceType
+
+    ui = _TimerUi()
+    s = _g1_screen(monkeypatch, _ModeAwareValidator(), ledger_tables=(), ui=ui, cdc=True)
+    s.session.set_source(
+        SourceConnectionConfig(source_type=SourceType.POSTGRES, host="db", port=5432,
+                               database="app", username="u"),
+        SecretValue("pw"),
+    )
+    s.mstate.cdc_deployed_message_key_columns = {"orders": ["tenant_id", "id"]}
+    s.mstate.set_cdc_ops_window_start(datetime.now(timezone.utc))
+    s.mstate.cdc_replica_identity_findings = {"orders": _g2_finding()}
+    s.content(lambda: None)
+    assert len([cb for cb in ui.timers
+                if "schedule_replica_identity_probe" in getattr(cb, "__qualname__", "")]) == 1
+    s.run()
+    ui.texts.clear()
+    s.content(lambda: None)
+    assert "Ready for cut-over" not in ui.texts
+    assert ("Tables match — cut over is held: REPLICA IDENTITY on 1 re-keyed table(s) is "
+            "below FULL") in ui.texts
+
+
+def test_a_read_inside_the_ttl_but_before_the_latest_validation_is_read_again(monkeypatch) -> None:
+    """The common path: the CDC poll read 60 s ago (inside the TTL), but Validation finished
+    30 s ago -- Cut over arms a read anyway and the landed read refreshes the page."""
+    from datetime import timedelta
+
+    from tests.test_cdc_dlq_gate import _item
+
+    s = _G2Cutover(monkeypatch)
+    s.c.validate(_item(), mode=ValidationMode.CHECKSUM, started_ago=timedelta(minutes=5),
+                 finished_ago=timedelta(seconds=30))
+    s.c.landed()
+    s.ms.cdc_replica_identity_last_probe = _g2_probe(["app.t"], ago=timedelta(seconds=60))
+    s.render()
+    assert "Re-reading REPLICA IDENTITY on the source" in s.body()
+    assert "I've cut over to DSQL" not in s.ui.texts
+    assert s.ri_reads == [] and len(s.ri_timers()) == 1  # armed despite the TTL
+    s.next_ri = _g2_probe(["app.t"])
+    s.run(s.ri_timers()[0])
+    assert len(s.ri_reads) == 1 and s.refreshes == [1]
+    s.render()
+    assert "I've cut over to DSQL" in s.ui.texts
+
+
+@pytest.mark.parametrize("kind", ["failed", "not-found"])
+def test_cut_over_warns_when_the_re_read_failed_or_missed_a_table(monkeypatch, kind) -> None:
+    from dsql_migrator.ui.cdc_replica_identity_gate import CdcReplicaIdentityProbe
+
+    s = _G2Cutover(monkeypatch)
+    s.ready()
+    if kind == "failed":
+        s.ms.cdc_replica_identity_last_probe = _g2_probe(["app.t"], ok=False,
+                                                         error_class="OperationalError")
+        expect = "failed (OperationalError); choose Check again"
+    else:
+        started = datetime.now(timezone.utc)
+        s.ms.cdc_replica_identity_last_probe = CdcReplicaIdentityProbe(
+            started_at=started, finished_at=started, ok=True,
+            scope={"app.t": ("tenant_id", "id")}, reads={},
+        )
+        expect = "app.t were not found on the source"
+    s.render()
+    assert "I've cut over to DSQL" in s.ui.texts  # fail-open by design, but never silent
+    (warn,) = [n for n in s.notices
+               if n["header"] == "Cut over could not re-read REPLICA IDENTITY on the source"]
+    assert warn["tone"] == "warning" and expect in warn["body"]

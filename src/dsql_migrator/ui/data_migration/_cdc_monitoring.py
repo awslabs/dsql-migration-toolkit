@@ -776,6 +776,71 @@ def _render_cdc_slot_health(ui, migration_state) -> None:
     render_notice(ui, tone=tone, header=headline, body=detail)
 
 
+def _render_cdc_replica_identity_notice(
+    ui, migration_state, session, on_check_again=None
+) -> None:
+    """The runtime REPLICA IDENTITY re-check for re-keyed PostgreSQL tables (render only).
+
+    ``error`` while a finding is open (deletes are being lost; Cut over is held), with
+    "Check again" -- and, when the re-read cannot clear it, why (no source password, or the
+    last read failed); ``warning`` for a table whose identity is FULL again (or that CDC no
+    longer re-keys) but that no CHECKSUM started after the fix has proven yet; with nothing
+    open, ``info`` when the re-check cannot run (no source password after a restart) and
+    ``warning`` when its last read failed. Reads only state the CDC poll's throttled
+    background read (``cdc_replica_identity_gate.start_replica_identity_probe``) landed -- no
+    I/O here. Nothing at all for MySQL or a table set with no re-key.
+    """
+    from dsql_migrator.ui.cdc_replica_identity_gate import (
+        cdc_evidence,
+        has_source_connection,
+        monitor_restored_notice,
+        monitor_unchecked_notice,
+        monitor_weak_notice,
+        replica_identity_proven_tables,
+        replica_identity_scope,
+        replica_identity_waived_tables,
+    )
+
+    findings = dict(getattr(migration_state, "cdc_replica_identity_findings", None) or {})
+    scope = replica_identity_scope(migration_state, session)
+    if not findings and not scope:
+        return
+    has_password = has_source_connection(session)
+    last_probe = getattr(migration_state, "cdc_replica_identity_last_probe", None)
+    weak = monitor_weak_notice(findings, has_password=has_password, last_probe=last_probe)
+    if weak is not None:
+        render_notice(ui, tone="error", header=weak[0], body=weak[1])
+        if on_check_again is not None:
+            with ui.row().classes("w-full justify-end"):  # type: ignore[attr-defined]
+                button = ui.button(  # type: ignore[attr-defined]
+                    "Check again", icon="refresh", on_click=on_check_again
+                ).props("flat no-caps color=primary")
+                if not has_password or bool(
+                    getattr(migration_state, "cdc_replica_identity_probe_running", False)
+                ):
+                    button.props("disable")
+    provider = getattr(migration_state, "validation_state_provider", None)
+    try:
+        validation_state = provider() if callable(provider) else None
+    except Exception:  # noqa: BLE001 - without it every restored finding still shows
+        validation_state = None
+    restored = monitor_restored_notice(
+        findings,
+        replica_identity_proven_tables(findings, validation_state),
+        getattr(migration_state, "migration_type", None),
+        waived=replica_identity_waived_tables(
+            findings, getattr(validation_state, "cutover_replica_identity_waiver", None)
+        ),
+    )
+    if restored is not None:
+        render_notice(ui, tone="warning", header=restored[0], body=restored[1])
+    # With a finding open the error above already says why the re-read cannot clear it.
+    if weak is None and scope and cdc_evidence(migration_state):
+        unchecked = monitor_unchecked_notice(scope, last_probe, has_password=has_password)
+        if unchecked is not None:
+            render_notice(ui, tone=unchecked[0], header=unchecked[1], body=unchecked[2])
+
+
 # How many named columns the value-conversion notice lists inline before it tails off
 # with "+N more" -- the same treatment cdc_applied_rollup_detail gives a long per-table
 # list, so a pathological schema cannot turn one notice into a wall of text.
@@ -999,6 +1064,12 @@ def _render_cdc_live_monitoring(
             # PostgreSQL CDC: warn about source WAL pressure (the logical slot pinning
             # WAL) before the source disk fills. No-op for a MySQL source (no slot).
             _render_cdc_slot_health(ui, migration_state)
+            # PostgreSQL re-keyed tables: a REPLICA IDENTITY dropped below FULL loses every
+            # DELETE silently (no dead letter), so it is flagged here from the throttled
+            # background re-check, never read on this render.
+            _render_cdc_replica_identity_notice(
+                ui, migration_state, session, on_check_again=_check_identity_again
+            )
             # A SIBLING of the dead-letter card, never inside it: these rows landed, so
             # rendering them within a panel titled "poison records" would invite exactly
             # the reading this signal exists to prevent. Above the card so an error-level
@@ -1062,8 +1133,27 @@ def _render_cdc_live_monitoring(
                 _apply_cdc_status(migration_state, fetched)
 
         await land_detached(_fetch_and_land)
+        # PostgreSQL re-keyed tables: start the throttled REPLICA IDENTITY re-read (at most
+        # every 2 minutes per session, single flight). Spawned, never awaited, so it cannot
+        # delay this poll; the next tick renders what it found. No-op for MySQL.
+        try:
+            from dsql_migrator.ui.cdc_replica_identity_gate import (
+                start_replica_identity_probe,
+            )
+
+            start_replica_identity_probe(session, migration_state)
+        except Exception:  # noqa: BLE001 - monitoring must never break the poll
+            _LOGGER.warning("REPLICA IDENTITY re-check could not start", exc_info=True)
         _update_lag_chart()  # persistent chart: update in place (no flicker)
         _cdc_live.refresh()  # connector health / change flow / DLQ (text) redraw
+
+    async def _check_identity_again() -> None:
+        # "Check again" on the REPLICA IDENTITY notice: one forced read (still landed if this
+        # handler is cancelled by a re-render), then redraw.
+        from dsql_migrator.ui.cdc_replica_identity_gate import probe_replica_identity_now
+
+        await probe_replica_identity_now(session, migration_state)
+        _cdc_live.refresh()
 
     _update_lag_chart()  # initial state (hidden until >=2 points)
     _cdc_live()

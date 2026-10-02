@@ -5332,10 +5332,14 @@ class BatchedTableMigrator:
 
         # A COMPOSITE_KEY-re-keyed table's CDC record key prepends a non-PK "leading"
         # column. Under PostgreSQL REPLICA IDENTITY DEFAULT the UPDATE/DELETE before-image
-        # carries only the source PK, so that leading column is absent and the sink cannot
-        # build the re-keyed DELETE (the delete is silently lost). Set REPLICA IDENTITY FULL
-        # on exactly those tables at provision (before the slot's LSN) so the before-image
-        # carries the leading column. Scoped to the tables actually being captured.
+        # carries only the source PK, so the DELETE does not carry that leading column and
+        # does not remove its row on Aurora DSQL -- silently (offline-proven: Debezium fills
+        # the absent NOT NULL column with a placeholder, so the sink's NULL-key guard cannot
+        # fire; the v50 live run saw no DELETE reach the sink at all). Set REPLICA IDENTITY
+        # FULL on exactly those tables at provision (before the slot's LSN) so the
+        # before-image carries the leading column. Scoped to the tables actually being
+        # captured. Only the parent is widened here (existing partitions are not); the Start
+        # prerequisite and the CDC monitor's runtime re-check grade every partition.
         _selected = set(table_names)
         _rekey_map = {
             t: c

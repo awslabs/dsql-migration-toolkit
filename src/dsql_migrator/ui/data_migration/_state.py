@@ -330,6 +330,23 @@ class DataMigrationState:
         # still have no discovery side effects -- so a page-capped read's continuation
         # survives to the next "Check again" instead of re-scanning the same pages. Transient.
         self.cdc_dlq_gate_reader: Optional[tuple] = None
+        # Re-keyed PostgreSQL tables whose REPLICA IDENTITY the runtime re-check read below
+        # FULL (ui/cdc_replica_identity_gate.py): {table: CdcReplicaIdentityFinding}. A
+        # DELETE lost while it was below FULL is never replayed, so this is PERSISTED on the
+        # session snapshot and cleared only by Start over -- never by an attach or a stack
+        # rename (the loss is about TARGET tables). Copy-on-write: replaced, never mutated.
+        self.cdc_replica_identity_findings: dict = {}
+        # The DEPLOYED stack's MessageKeyColumns ({table: key columns}), from the same
+        # discovery describe as cdc_deployed_slot_name: which tables Debezium actually
+        # re-keys. ``None`` = unknown / no stack; ``{}`` = deployed with no re-key. Persisted
+        # so Validation and Cut over can scope the re-check after a restore.
+        self.cdc_deployed_message_key_columns: Optional[dict[str, list[str]]] = None
+        # The last runtime REPLICA IDENTITY read (a CdcReplicaIdentityProbe). Transient: a
+        # restarted session must read again (and needs the source password to).
+        self.cdc_replica_identity_last_probe = None
+        # Single-flight claim for that read (monotonic start; None when none runs), with a
+        # watchdog of twice the TTL so a hung read never pins "re-reading".
+        self._cdc_replica_identity_probe_started: Optional[float] = None
         # Columns the SOURCE connector could not convert and therefore delivered as NULL
         # (the row itself was applied). Sticky, and keyed by (table, column, type): the
         # same value fails on every row that carries it, so the fact is "this column
@@ -576,6 +593,14 @@ class DataMigrationState:
         self.effective_target_ddls: Optional[Callable[[], Optional[dict]]] = None
         self.on_cdc_start: Optional[Callable[[], None]] = None
         self.cutover_restore_in_flight: Optional[Callable[[], bool]] = None
+        # The session's ValidationState (or None), so the CDC monitor can tell a REPLICA
+        # IDENTITY finding already proven by a CHECKSUM from one still owed. Duck-typed:
+        # data_migration never imports ui.validation.
+        self.validation_state_provider: Optional[Callable[[], object]] = None
+        # The Step 1 inventory's primary key of a table (``None`` when unknown), so the
+        # REPLICA IDENTITY re-check leaves out a pure primary-key REORDER without a read --
+        # the same judgement the Start prerequisite makes from the same inventory.
+        self.source_primary_key_for: Optional[Callable[[str], Optional[list]]] = None
         # Which CDC activity events have already been mirrored into the AI feed, per CDC
         # log key, so the ~5s monitor poll announces each transition ONCE. Lives HERE (not
         # in a module dict) so Start over's ``reset_in_place`` -> ``__init__`` clears it;
@@ -1216,6 +1241,11 @@ class DataMigrationState:
         if not cdc_stack_name_is_valid(candidate):
             return False
         with self._lock:
+            if candidate != self.cdc_stack_name:
+                # The deployed re-key map belongs to the previously-targeted stack; the next
+                # discovery reads this one's. REPLICA IDENTITY findings are kept: they are
+                # about target tables, whichever stack produced the loss.
+                self.cdc_deployed_message_key_columns = None
             self.cdc_stack_name = candidate
         return True
 
@@ -1294,6 +1324,8 @@ class DataMigrationState:
             # Belongs to the previously-targeted stack; the fresh probe repopulates.
             self.cdc_reconciled_table_names = []
             self.cdc_deployed_slot_name = None
+            # ...and so is its re-key map (REPLICA IDENTITY findings are kept, see above).
+            self.cdc_deployed_message_key_columns = None
             self.cdc_deployed_column_exclude_list = None
             self.cdc_deployed_watermark = None
             self.cdc_offered_seed = None
@@ -1380,6 +1412,101 @@ class DataMigrationState:
         with self._lock:
             cleaned = (slot_name or "").strip()
             self.cdc_deployed_slot_name = cleaned or None
+
+    def set_cdc_deployed_message_key_columns(
+        self,
+        value: "Optional[Mapping[str, Sequence[str]]]",
+        now: Optional[datetime] = None,
+    ) -> None:
+        """Record the DEPLOYED stack's MessageKeyColumns (``None``: no stack / no parameter).
+
+        When the map is known, an OPEN REPLICA IDENTITY finding whose table CDC no longer
+        re-keys (absent from the map, or keyed within its source primary key) is closed as
+        ``"not-rekeyed"`` at ``now``: no further DELETE can be lost, but the ones lost while
+        it was below FULL still need a CHECKSUM after that time. One activity line each.
+        """
+        closed: list = []
+        with self._lock:
+            if value is None:
+                self.cdc_deployed_message_key_columns = None
+                return
+            deployed = {
+                str(table): [str(c) for c in (cols or ()) if c]
+                for table, cols in dict(value).items()
+            }
+            self.cdc_deployed_message_key_columns = deployed
+            stamp = now or datetime.now(timezone.utc)
+            findings = dict(self.cdc_replica_identity_findings)
+            for table, finding in list(findings.items()):
+                if getattr(finding, "restored_at", None) is not None:
+                    continue
+                key = deployed.get(table) or []
+                if key and not set(key) <= set(getattr(finding, "primary_key", None) or ()):
+                    continue
+                findings[table] = finding.model_copy(
+                    update={"restored_at": stamp, "restored_by": "not-rekeyed"}
+                )
+                closed.append((table, findings[table]))
+            if closed:
+                self.cdc_replica_identity_findings = findings
+        if closed:
+            from dsql_migrator.ui.cdc_replica_identity_gate import (
+                ReplicaIdentityTransition,
+                log_replica_identity_transitions,
+            )
+
+            log_replica_identity_transitions(
+                [
+                    ReplicaIdentityTransition(kind="not-rekeyed", table=t, finding=f)
+                    for t, f in closed
+                ]
+            )
+
+    def apply_cdc_replica_identity_probe(self, probe: object) -> list:
+        """Land a runtime REPLICA IDENTITY read (on the loop): store it as the last probe and
+        fold it into the findings (copy-on-write). Returns the transitions for the caller to
+        log AFTER the lock (one activity line each, never per poll)."""
+        from dsql_migrator.ui.cdc_replica_identity_gate import fold_replica_identity_probe
+
+        with self._lock:
+            self.cdc_replica_identity_last_probe = probe
+            findings, transitions = fold_replica_identity_probe(
+                self.cdc_replica_identity_findings, probe
+            )
+            if transitions or findings != self.cdc_replica_identity_findings:
+                self.cdc_replica_identity_findings = findings
+        return list(transitions)
+
+    def _cdc_replica_identity_probe_running_locked(self, now: float) -> bool:
+        from dsql_migrator.ui.cdc_replica_identity_gate import (
+            CDC_REPLICA_IDENTITY_PROBE_TTL_SECONDS,
+        )
+
+        started = self._cdc_replica_identity_probe_started
+        return started is not None and now - started <= 2 * CDC_REPLICA_IDENTITY_PROBE_TTL_SECONDS
+
+    def begin_cdc_replica_identity_probe(self, now_monotonic: Optional[float] = None) -> bool:
+        """Claim the runtime REPLICA IDENTITY read (single flight across tabs)."""
+        import time as _time
+
+        now = _time.monotonic() if now_monotonic is None else now_monotonic
+        with self._lock:
+            if self._cdc_replica_identity_probe_running_locked(now):
+                return False
+            self._cdc_replica_identity_probe_started = now
+            return True
+
+    def finish_cdc_replica_identity_probe(self) -> None:
+        with self._lock:
+            self._cdc_replica_identity_probe_started = None
+
+    @property
+    def cdc_replica_identity_probe_running(self) -> bool:
+        """A runtime REPLICA IDENTITY read is in flight."""
+        import time as _time
+
+        with self._lock:
+            return self._cdc_replica_identity_probe_running_locked(_time.monotonic())
 
     def set_cdc_deployed_column_exclude_list(self, value: Optional[str]) -> None:
         """Record the DEPLOYED stack's ColumnExcludeList (``None``: no stack/param)."""
@@ -2176,7 +2303,8 @@ class DataMigrationStore:
                 name: getattr(state, name, None)
                 for name in (
                     "overlay_ledger", "effective_target_ddls", "on_cdc_start",
-                    "cutover_restore_in_flight",
+                    "cutover_restore_in_flight", "validation_state_provider",
+                    "source_primary_key_for",
                 )
             }
             state.__init__()  # type: ignore[misc]  # re-run init on the same object

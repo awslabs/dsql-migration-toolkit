@@ -2488,8 +2488,10 @@ def test_a_rekeyed_table_on_replica_identity_default_blocks_cdc() -> None:
     the whole diagnosis: `orders` was the ONLY table with a re-keyed record key
     (`message.key.columns=ecommerce\\.orders:user_id,id`, the target PK chosen in Schema
     Conversion), and under REPLICA IDENTITY DEFAULT PostgreSQL limits a DELETE's before-image
-    to the SOURCE primary key `(id)` -- so `user_id` arrives NULL, the sink renders
-    `WHERE "user_id" = NULL AND "id" = ?`, and three-valued logic matches 0 rows.
+    to the SOURCE primary key `(id)` -- so the DELETE does not carry `user_id` and removes
+    nothing on the target. (Not a NULL key: offline-proven against the shipped Debezium 2.7.4
+    jar, the key generator fills the absent NOT NULL column with a placeholder such as 0, so
+    the sink's NULL-key guard cannot fire; the v50 live run saw no DELETE at the sink at all.)
 
     The existing REPLICA_IDENTITY check graded this table PASS ("REPLICA IDENTITY is set for
     change replication"), because it asks a different question and accepts 'd'.
@@ -2510,16 +2512,23 @@ def test_a_rekeyed_table_on_replica_identity_default_blocks_cdc() -> None:
     assert blocked.status is PrerequisiteStatus.FAIL
     assert blocked.required is True, "a silently-lost DELETE must block the start"
     assert blocked.target == "ecommerce.orders"
-    # It must name the missing column, the consequence, and that INSERT/UPDATE are fine --
-    # otherwise the operator cannot tell this from the generic identity check above.
+    # It must name the missing column, the consequence, and which writes are affected --
+    # otherwise the operator cannot tell this from the generic identity check above. An
+    # UPDATE that changes a key column is affected too (its old key is the before-image).
     assert "user_id" in blocked.detail
     assert "SILENTLY LOST" in blocked.detail
-    assert "UPDATE are unaffected" in blocked.detail
+    assert "An UPDATE that changes a key column is affected too" in blocked.detail
+    assert "INSERTs and other UPDATEs are not" in blocked.detail
+    assert "UPDATE are unaffected" not in blocked.detail
+    # The mechanism is not claimed to be a NULL key (it is a placeholder, offline-proven).
+    assert "would be NULL" not in blocked.detail
     # The remediation is the one statement Debezium itself documents, and it must say that
     # DEFAULT is not enough -- the neighbouring check's remedy says "the default is enough".
     assert "REPLICA IDENTITY FULL" in blocked.remediation
     assert "DEFAULT is not enough" in blocked.remediation
     assert "ecommerce.orders" in blocked.remediation
+    # ...and that it has to STAY FULL: the runtime re-check holds Cut over if it drops.
+    assert "while CDC runs the tool re-checks it" in blocked.remediation
 
 
 def test_replica_identity_full_satisfies_a_rekeyed_table() -> None:
@@ -2598,7 +2607,7 @@ def test_the_key_coverage_check_grades_partitions_not_the_parent() -> None:
 
 
 def test_an_identity_index_is_not_accepted_for_a_rekeyed_table() -> None:
-    """'i' publishes only that index's columns, so the added key column can still be NULL.
+    """'i' publishes only that index's columns, so the added key column can still be absent.
 
     Graded FAIL rather than probed for the index's column list: FULL is the remedy either
     way, and a WARN would let the silent loss ship (the neighbouring check WARNs, which is
@@ -2628,6 +2637,55 @@ def test_an_identity_index_is_not_accepted_for_a_rekeyed_table() -> None:
     )
     assert unknown is not None and unknown.status is PrerequisiteStatus.INFO
     assert unknown.required is False
+
+
+def test_the_shared_rule_names_five_partitions_of_a_server_side_count() -> None:
+    """G2: the runtime re-check reads a COUNT of weak leaves plus at most five names (it
+    never reads one row per leaf); the shared rule must render that bounded shape."""
+    from dsql_migrator.core.prerequisites_postgres import replica_identity_covers_key_result
+
+    table = TableDef(name="app.events", primary_key=["id"])
+    names = [f"app.events_p{i}" for i in range(5)]
+    r = replica_identity_covers_key_result(
+        table, ["tenant_id", "id"], identity="f",
+        weak_partition_names=names, weak_partition_count=37,
+    )
+    assert r is not None and r.status is PrerequisiteStatus.FAIL
+    assert "37 partition(s) are not REPLICA IDENTITY FULL" in r.detail
+    assert ", ".join(names) + " (and 32 more)" in r.detail
+    assert "would not remove its row on Aurora DSQL" in r.detail
+    # Exactly five shown, no tail.
+    five = replica_identity_covers_key_result(
+        table, ["tenant_id", "id"], identity="f",
+        weak_partition_names=names, weak_partition_count=5,
+    )
+    assert "(and" not in five.detail
+    # Nothing weak and FULL: PASS; a pure reorder: None (nothing to grade).
+    ok = replica_identity_covers_key_result(
+        table, ["tenant_id", "id"], identity="f", weak_partition_names=(), weak_partition_count=0,
+    )
+    assert ok.status is PrerequisiteStatus.PASS
+    assert replica_identity_covers_key_result(
+        table, ["id"], identity="d", weak_partition_names=(), weak_partition_count=0,
+    ) is None
+
+
+def test_a_non_pk_identity_index_warning_no_longer_claims_a_null_key() -> None:
+    """The WARN copy said the primary key "arrives NULL"; offline-proven, Debezium fills an
+    absent NOT NULL key column with a placeholder instead. Mechanism-neutral wording now."""
+    from dsql_migrator.core.prerequisites_postgres import check_replica_identity
+
+    r = check_replica_identity(
+        TableDef(name="app.idxnonpk", primary_key=["id"]),
+        _pg_facts_healthy(
+            replica_identity={"app.idxnonpk": "i"},
+            identity_index_valid={"app.idxnonpk": True},
+            identity_index_is_primary={"app.idxnonpk": False},
+        ),
+    )
+    assert r.status is PrerequisiteStatus.WARN
+    assert "arrives NULL" not in r.detail
+    assert "a primary-key column outside it is not carried" in r.detail
 
 
 def test_the_rekey_map_reaches_the_aggregate_report_and_blocks_it() -> None:

@@ -54,7 +54,7 @@ CDC は実際に動く構成要素（MSK、MSK Connect、シンクコネクタ�
 1. **CDC が追いつくまで待つ** — レプリケーションラグがゼロに近づく（または達する）まで。
 2. **ソースの書き込みを凍結する**（短時間の読み取り専用／メンテナンスモード）。
 3. **最後のドレインを待つ** — CDC が処理中(in-flight)の最後の変更まで適用し、ラグが再びゼロになるようにします。これで MySQL と DSQL は同じ行を保持します。
-4. 最終の go/no-go のために **Validation を再実行** し、クリーンな MATCH のときにのみカットオーバーします。最終検証は、CDC が届けた行の先まで **identity / `AUTO_INCREMENT` シーケンスを前進**させます(*Sync identity sequences* 操作)。これにより、カットオーバー後のアプリの最初の insert が移行済み id と衝突(`23505`)することを防ぎます。デッドレターされた CDC 変更があるテーブルは自動的に CHECKSUM で比較され、Cut over は開く前にデッドレターキューを読み直します（[§5.5](05-validation.md#55-cdc-のデッドレターとカットオーバー) 参照）。
+4. 最終の go/no-go のために **Validation を再実行** し、クリーンな MATCH のときにのみカットオーバーします。最終検証は、CDC が届けた行の先まで **identity / `AUTO_INCREMENT` シーケンスを前進**させます(*Sync identity sequences* 操作)。これにより、カットオーバー後のアプリの最初の insert が移行済み id と衝突(`23505`)することを防ぎます。デッドレターされた CDC 変更があるテーブルは自動的に CHECKSUM で比較され、Cut over は開く前にデッドレターキューを読み直します（[§5.5](05-validation.md#55-cdc-のデッドレターとカットオーバー) 参照）。リキーされたテーブルがある PostgreSQL ソースでは、Cut over は開く前にそれらの REPLICA IDENTITY も読み直します（[§5.6](05-validation.md#56-リキーされた-postgresql-テーブルとカットオーバー) 参照）。
 5. **アプリケーションを再ポイント** して DSQL エンドポイントへ向け、スモークテストします。
 6. **CDC パイプラインは最後に撤去する** — **Start over(右上)** → *Delete all CDC infrastructure* をクリックします。これはレプリケーションを終了し、MSK / MSK Connect / NAT のコストを止め、古いスタックをクリアします（将来、新しい Full Load や CDC を実行するには、デプロイする前にそれが削除されている必要があります）。
 

@@ -19,6 +19,7 @@ re-serialized on every UI poll (large-scale: avoid O(rows) repeated work).
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Optional
 
 from dsql_migrator.core.models import SourceType, StepStatus
@@ -294,6 +295,12 @@ def capture_session_snapshot(
             ).items()
             if value is not None
         },
+        # The runtime REPLICA IDENTITY re-check's findings and the deployed re-key map it
+        # scopes to (see SessionSnapshot.cdc_replica_identity_findings).
+        cdc_replica_identity_findings=dict(
+            getattr(migration_state, "cdc_replica_identity_findings", None) or {}
+        ),
+        cdc_deployed_message_key_columns=_deployed_keys(migration_state),
         ai_assist_enabled=bool(getattr(session.ai_assist, "enabled", False)),  # type: ignore[attr-defined]
         ai_assist_model_id=getattr(session.ai_assist, "model_id", None),  # type: ignore[attr-defined]
         ai_assist_region=getattr(session.ai_assist, "region", None),  # type: ignore[attr-defined]
@@ -358,7 +365,17 @@ def capture_session_snapshot(
             snapshot.validation_cdc_dlq_waiver = getattr(
                 validation_state, "cutover_dlq_waiver", None
             )
+            snapshot.validation_cdc_replica_identity_waiver = getattr(
+                validation_state, "cutover_replica_identity_waiver", None
+            )
     return snapshot
+
+
+def _deployed_keys(migration_state: object) -> "Optional[dict[str, list[str]]]":
+    keys = getattr(migration_state, "cdc_deployed_message_key_columns", None)
+    if keys is None:
+        return None
+    return {str(t): [str(c) for c in (cols or ())] for t, cols in dict(keys).items()}
 
 
 def _qualify_restored_table_names(snapshot: "SessionSnapshot") -> None:
@@ -488,6 +505,9 @@ def apply_session_snapshot(
                 compared_run_start=snapshot.validation_run_started_at,
                 compared_overrides=dict(snapshot.validation_compared_from or {}),
                 cdc_dlq_waiver=snapshot.validation_cdc_dlq_waiver,
+                replica_identity_waiver=getattr(
+                    snapshot, "validation_cdc_replica_identity_waiver", None
+                ),
             )
         # A step that reads IN_PROGRESS but has a restored report has NO live job
         # after a reconnect (the validation job id is not persisted, so it can never
@@ -719,8 +739,25 @@ def apply_session_snapshot(
         migration_state, "cdc_dlq_read_from_ms"
     ):
         migration_state.cdc_dlq_read_from_ms = dict(snapshot.cdc_dlq_read_from_ms)  # type: ignore[attr-defined]
+    # ...and the REPLICA IDENTITY findings, before any poll too. Direct assignment, never the
+    # setters: a restore must not close a finding (the de-scope rule) or log a transition.
+    if getattr(snapshot, "cdc_replica_identity_findings", None) and hasattr(
+        migration_state, "cdc_replica_identity_findings"
+    ):
+        migration_state.cdc_replica_identity_findings = dict(  # type: ignore[attr-defined]
+            snapshot.cdc_replica_identity_findings
+        )
     if snapshot.cdc_stack_name and hasattr(migration_state, "set_cdc_stack_name"):
         migration_state.set_cdc_stack_name(snapshot.cdc_stack_name)  # type: ignore[attr-defined]
+    # The deployed re-key map AFTER the stack name: a name change resets it (it belongs to
+    # the previously-targeted stack), and this map is the restored stack's own.
+    if getattr(snapshot, "cdc_deployed_message_key_columns", None) is not None and hasattr(
+        migration_state, "cdc_deployed_message_key_columns"
+    ):
+        migration_state.cdc_deployed_message_key_columns = {  # type: ignore[attr-defined]
+            str(t): [str(c) for c in (cols or ())]
+            for t, cols in snapshot.cdc_deployed_message_key_columns.items()
+        }
     if snapshot.cdc_infra_inputs:
         migration_state.set_cdc_infra_inputs(dict(snapshot.cdc_infra_inputs))  # type: ignore[attr-defined]
 
@@ -958,6 +995,9 @@ def session_signature(
         # first proven read) is saved -- together with the cursor that skips it on a
         # restart. The cursor itself stays out: it moves every poll.
         _cdc_dlq_sig(migration_state),
+        # The REPLICA IDENTITY findings and the deployed re-key map, so an opened / restored /
+        # de-scoped finding is saved (a silent identical re-read changes nothing).
+        _cdc_replica_identity_sig(migration_state),
         # Schema-Conversion edits (edited DDLs, the preserve-FK toggle, ticked nodes).
         # Without this the snapshot was never written for an edit-only change, so a PK
         # strategy chosen in Step 2 -- and with it the cut-over "Sync identity sequences"
@@ -983,12 +1023,16 @@ def _validation_sig(validation_state: object) -> tuple:
     rechecked = getattr(validation_state, "rechecked_at", None)
     waiver = getattr(validation_state, "cutover_dlq_waiver", None)
     waived_at = getattr(waiver, "waived_at", None)
+    ri_waiver = getattr(validation_state, "cutover_replica_identity_waiver", None)
+    ri_waived_at = getattr(ri_waiver, "waived_at", None)
     return (
         True,
         completed.isoformat() if completed is not None else None,
         rechecked.isoformat() if rechecked is not None else None,
         # A recorded CDC dead-letter waiver is a sign-off decision: save it.
         waived_at.isoformat() if waived_at is not None else None,
+        # ...and so is a REPLICA IDENTITY CHECKSUM-proof waiver.
+        ri_waived_at.isoformat() if ri_waived_at is not None else None,
     )
 
 
@@ -1001,6 +1045,38 @@ def _cdc_dlq_sig(migration_state: object) -> tuple:
         sum(int(getattr(entry, "count", 0) or 0) for entry in ledger.values()),
         tuple(sorted(read_from.items())),
     )
+
+
+def _cdc_replica_identity_sig(migration_state: object) -> tuple:
+    """Cheap signature of the REPLICA IDENTITY findings and the deployed re-key map."""
+    findings = getattr(migration_state, "cdc_replica_identity_findings", None) or {}
+    deployed = getattr(migration_state, "cdc_deployed_message_key_columns", None)
+    if deployed is None:
+        deployed_sig = None
+    else:
+        from dsql_migrator.core.cdc import format_message_key_columns
+
+        deployed_sig = format_message_key_columns(deployed)
+    return (
+        tuple(
+            sorted(
+                (
+                    str(table),
+                    _iso(getattr(f, "first_weak_at", None)),
+                    _iso(getattr(f, "restored_at", None)),
+                    getattr(f, "identity", ""),
+                    int(getattr(f, "weak_partitions", 0) or 0),
+                    tuple(getattr(f, "key_columns", None) or ()),
+                )
+                for table, f in findings.items()
+            )
+        ),
+        deployed_sig,
+    )
+
+
+def _iso(value: object) -> Optional[str]:
+    return value.isoformat() if isinstance(value, datetime) else None
 
 
 __all__ = [

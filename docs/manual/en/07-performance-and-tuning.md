@@ -89,7 +89,12 @@ single rightmost partition. Key points:
   `INSERT ... ON CONFLICT` keys on the target composite key; CDC needs **no
   connector or plugin change** — the Debezium source is re-keyed (via
   `message.key.columns`) so each change record's key matches the target composite
-  key, and the sink's upsert/delete apply against it unchanged.
+  key, and the sink's upsert/delete apply against it unchanged. On a **PostgreSQL**
+  source this holds only with **`REPLICA IDENTITY FULL` on the table and every
+  partition for the whole run** — a `DELETE` otherwise does not carry the added key
+  column. The prerequisites block Start without it, and the CDC monitor re-checks it
+  while CDC runs (see [Chapter 6](06-limitations.md) and
+  [§5.6](05-validation.md#56-re-keyed-postgresql-tables-and-cut-over)).
 
 Reach for this when a table's writes are demonstrably hot-partitioned (a
 `CommitLatency` long tail under load with low OCC) **and** it has a natural

@@ -199,4 +199,40 @@ CHECKSUM은 값 비교할 수 없는 컬럼을 명시합니다(5.1). dead-letter
 
 ---
 
+## 5.6 재키잉된 PostgreSQL 테이블과 컷오버
+
+이 절은 **PostgreSQL** 소스에만, 그리고 CDC가 **재키잉**하는 테이블 — 소스 기본 키 밖의 컬럼을 더한 복합
+타깃 키(Schema Conversion의 Composite key, 또는 편집한 키) — 에만 해당합니다. 그런 테이블의 `DELETE`는 소스의
+`REPLICA IDENTITY`가 테이블과 모든 파티션에서 **FULL**인 동안에만 그 컬럼을 싣습니다. CDC 실행 중 FULL
+미만으로 내려가면(`ALTER TABLE … REPLICA IDENTITY DEFAULT`, 새 파티션, `USING INDEX`) 각 delete가 오류도 dead
+letter도 없이 Aurora DSQL에 행을 남깁니다. CDC 모니터가 이를 다시 읽고 내려갈 때마다 기록하며
+([§4.6](04-cdc-and-dsql-constraints.md#재키잉된-postgresql-테이블-replica-identity-재확인)), Validation과
+Cut over가 그 기록을 사용합니다:
+
+- **Validation은 그 테이블들을 자동으로 CHECKSUM으로 비교하며**, 실행 전에 Options에 이름을 보여 줍니다.
+  테이블이 아직 FULL 미만이면 리포트는 *"Tables match — cut over is held: REPLICA IDENTITY on N re-keyed
+  table(s) is below FULL"* 로 표시합니다: delete가 계속 유실되므로 어떤 CHECKSUM도 이를 풀지 못합니다.
+  다시 FULL이 되면 수정 전에 시작한 일치로는 부족합니다: 리포트는 *"cut over waits for a CHECKSUM
+  re-check"* 로 표시하고 **Re-check N table(s) with CHECKSUM**을 제공합니다.
+- **Cut over는** 그런 테이블이 모두 다시 FULL이고 **그리고** 도구가 FULL을 읽은 시각보다 **1분 넘게 뒤에
+  시작한** CHECKSUM 비교에서 일치했을 때**만 열립니다**. 또한 Cut over는 열리기 전에 최신 Validation 이후
+  REPLICA IDENTITY를 **한 번 새로 읽어**(몇 초) 그 사이의 변화를 잡아냅니다.
+- 리포트에서 빠진 테이블, 또는 수락한 갭 안의 테이블은 FULL 미만이거나 재확인이 필요한 다른 재키잉
+  테이블이 없을 때 **Continue without this check**로 승인할 수 있습니다(활동 로그에 기록되며, identity가
+  다시 내려가면 다시 열림). 수락한 갭 안의 테이블은 소스 행을 바로잡고 **Drop & reload**로 리로드하기
+  전에는 CHECKSUM으로 해소할 수 없습니다. 아직 FULL 미만인 테이블은 결코 면제할 수 없습니다.
+- **소스를 읽을 수 없고** — 앱 재시작 후 비밀번호가 없음, 읽기 실패, 테이블을 찾을 수 없음 — 아직 FULL
+  미만으로 기록된 테이블이 없으면 Cut over는 보류하지 않습니다: 런북 위에 경고를 표시하고, 활동 로그의 승인
+  줄에 identity를 재확인하지 못했다고 기록합니다. 애플리케이션을 전환하기 전에 소스에서 이 테이블들과
+  파티션이 FULL인지 확인하거나, Connect 단계에서 소스를 다시 연결하세요(도구가 스스로 다시 읽으며, 읽기
+  실패 후에는 **Check again**을 누르세요). 아직 FULL 미만으로 기록된 테이블이 있으면 도구가 FULL을 읽을
+  때까지 Cut over는 보류되며, 보류 알림이 다시 읽기 실패를 알려 줍니다.
+- **재시작.** 내려간 기록은 앱 재시작 후에도 남고 Start over로만 지워집니다. **MySQL** 소스와 **Full load
+  only**는 영향이 없습니다.
+
+수정 후에도 다른 테이블의 **해결 순서**: Full Load + CDC — CDC가 따라잡게 둔 뒤 Stop CDC, **Drop & reload**로
+리로드, Start CDC, 재확인; CDC only — Aurora DSQL에서 잉여 행을 직접 삭제한 뒤 재확인.
+
+---
+
 **다음:** [6. 한계 →](06-limitations.md)

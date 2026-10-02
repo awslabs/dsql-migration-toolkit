@@ -1094,6 +1094,19 @@ def _probe_cdc_stack_phase(migration_state, session) -> None:
         if _deployed_params and "ColumnExcludeList" in _deployed_params
         else None
     )
+    # The DEPLOYED re-key map (MessageKeyColumns), from the SAME describe: the tables
+    # Debezium actually re-keys, which the runtime REPLICA IDENTITY re-check scopes to
+    # (ui/cdc_replica_identity_gate.py). '' is a real value -- no re-key -- and None means no
+    # stack or no such parameter.
+    _set_keys = getattr(migration_state, "set_cdc_deployed_message_key_columns", None)
+    if callable(_set_keys):
+        from dsql_migrator.core.cdc import _parse_message_key_columns
+
+        _set_keys(
+            _parse_message_key_columns(str(_deployed_params.get("MessageKeyColumns") or ""))
+            if _deployed_params and "MessageKeyColumns" in _deployed_params
+            else None
+        )
     # Also read each ATTACH CANDIDATE's replicated table set, so the attach offer can be
     # withheld when the pipeline does not cover what this session loaded. ``list_stacks``
     # returns no parameters, so this needs one describe per candidate -- bounded by the
@@ -2596,6 +2609,20 @@ def _retrieve(task) -> None:
         task.exception()
 
 
+def spawn_detached(work):
+    """Run ``work()`` as its own task on the running loop and return the task, kept alive
+    (strong reference) until it finishes and its outcome retrieved -- nobody has to await it.
+    The building block of :func:`land_detached`; also used by the CDC poll to start a source
+    read it must never wait for (the runtime REPLICA IDENTITY re-check)."""
+    import asyncio
+
+    task = asyncio.get_running_loop().create_task(work())
+    _LANDING_TASKS.add(task)
+    task.add_done_callback(_LANDING_TASKS.discard)
+    task.add_done_callback(_retrieve)
+    return task
+
+
 async def land_detached(work) -> None:
     """Await ``work()`` -- a read on a worker thread plus the loop-side landing of its result
     -- so that cancelling the CALLER can never drop a result the read already consumed.
@@ -2611,11 +2638,60 @@ async def land_detached(work) -> None:
     """
     import asyncio
 
-    task = asyncio.get_running_loop().create_task(work())
-    _LANDING_TASKS.add(task)
-    task.add_done_callback(_LANDING_TASKS.discard)
-    task.add_done_callback(_retrieve)
-    await asyncio.shield(task)
+    await asyncio.shield(spawn_detached(work))
+
+
+# The runtime REPLICA IDENTITY read's statement_timeout (seconds): one catalog statement, so
+# 10 s is generous; with the dialect's bounded connect_timeout a stalled source can never pin
+# a worker thread for long.
+_REPLICA_IDENTITY_READ_TIMEOUT_SECONDS = 10
+
+
+def read_cdc_replica_identity_once(session, scope) -> object:
+    """ONE bounded read of the re-keyed tables' REPLICA IDENTITY (BLOCKING; never raises).
+
+    Returns a :class:`~dsql_migrator.ui.cdc_replica_identity_gate.CdcReplicaIdentityProbe`.
+    Read-only: the engine comes from ``make_source_engine_factory`` (the read-only guard,
+    plus ``statement_timeout`` and the dialect's bounded ``connect_timeout``) and is disposed
+    after ONE catalog statement -- never the cdc_pg_slot write engine. Without a source
+    connection (no config, or no password: it is kept in memory only, so a restored session
+    has none) it reports ``no-source-connection`` without connecting. A failure keeps only
+    the exception's CLASS name: the message can carry a host or a value (Property 7).
+    """
+    from dsql_migrator.core.cdc_pg_slot import read_rekeyed_replica_identity
+    from dsql_migrator.ui.cdc_replica_identity_gate import (
+        PROBE_NO_SOURCE,
+        PROBE_READ_FAILED,
+        CdcReplicaIdentityProbe,
+    )
+
+    frozen = {str(t): tuple(k) for t, k in dict(scope or {}).items()}
+    started = datetime.now(timezone.utc)
+    source_config = getattr(session, "source_config", None)
+    password = getattr(session, "source_password", None)
+    if source_config is None or password is None:
+        return CdcReplicaIdentityProbe(
+            started_at=started, finished_at=datetime.now(timezone.utc), ok=False,
+            problem=PROBE_NO_SOURCE, scope=frozen,
+        )
+    try:
+        engine = make_source_engine_factory(
+            password, read_timeout_seconds=_REPLICA_IDENTITY_READ_TIMEOUT_SECONDS
+        )(source_config)
+        try:
+            with engine.connect() as connection:
+                reads = read_rekeyed_replica_identity(connection, sorted(frozen))
+        finally:
+            engine.dispose()
+    except Exception as exc:  # noqa: BLE001 - unreadable is a state, not a crash
+        return CdcReplicaIdentityProbe(
+            started_at=started, finished_at=datetime.now(timezone.utc), ok=False,
+            problem=PROBE_READ_FAILED, error_class=type(exc).__name__[:64], scope=frozen,
+        )
+    return CdcReplicaIdentityProbe(
+        started_at=started, finished_at=datetime.now(timezone.utc), ok=True,
+        scope=frozen, reads=dict(reads),
+    )
 
 
 # Tailwind tone -> (border, background, icon-color, icon) for the health cards.

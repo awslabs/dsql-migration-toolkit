@@ -119,4 +119,18 @@ CHECKSUM は値を比較できない列を明示します（5.1）。デッド�
 
 ---
 
+## 5.6 リキーされた PostgreSQL テーブルとカットオーバー
+
+この節は **PostgreSQL** ソースにのみ、そして CDC が **リキー** するテーブル — ソースの主キー外の列を加えた複合ターゲットキー（Schema Conversion の Composite key、または編集したキー）— にのみ当てはまります。そのようなテーブルの `DELETE` は、ソースの `REPLICA IDENTITY` がテーブルとすべてのパーティションで **FULL** の間だけその列を載せます。CDC の実行中に FULL 未満に下がると（`ALTER TABLE … REPLICA IDENTITY DEFAULT`、新しいパーティション、`USING INDEX`）、各 delete はエラーもデッドレターもなく Aurora DSQL に行を残します。CDC モニターがこれを読み直し、下がるたびに記録します（[§4.6](04-cdc-and-dsql-constraints.md#リキーされた-postgresql-テーブル-replica-identity-の再確認)）。Validation と Cut over はその記録を使います:
+
+- **Validation はそれらのテーブルを自動的に CHECKSUM で比較し**、実行前に Options に名前を表示します。テーブルがまだ FULL 未満なら、レポートは *「Tables match — cut over is held: REPLICA IDENTITY on N re-keyed table(s) is below FULL」* と表示します: delete が失われ続けるため、どの CHECKSUM でも解除されません。再び FULL になったら、修正前に開始した一致では足りません: レポートは *「cut over waits for a CHECKSUM re-check」* と表示し、**Re-check N table(s) with CHECKSUM** を提示します。
+- **Cut over が開くのは**、そのようなテーブルがすべて再び FULL であり、**かつ** ツールが FULL を読んだ時刻より **1 分以上後に開始した** CHECKSUM 比較で一致した場合**だけ**です。さらに Cut over は開く前に、最新の Validation 以降の REPLICA IDENTITY を **1 回新たに読み**（数秒）、その間の変化を捉えます。
+- レポートから外れたテーブル、または受け入れたギャップ内のテーブルは、FULL 未満または再確認が必要な他のリキーされたテーブルがない場合に **Continue without this check** で承認できます（アクティビティログに記録され、identity が再び下がると再び開きます）。受け入れたギャップ内のテーブルは、ソースの行を修正して **Drop & reload** でリロードするまで CHECKSUM では解消できません。まだ FULL 未満のテーブルは決して免除できません。
+- **ソースを読めず** — アプリ再起動後にパスワードがない、読み取りの失敗、テーブルが見つからない — まだ FULL 未満と記録されたテーブルがない場合、Cut over は保留しません: ランブックの上に警告を表示し、アクティビティログの承認行に identity を再確認できなかったことを記録します。アプリケーションを切り替える前に、ソースでこれらのテーブルとパーティションが FULL であることを確認するか、Connect ステップでソースを再接続してください（ツールが自動で読み直します。読み取りに失敗した後は **Check again** を押してください）。まだ FULL 未満と記録されたテーブルがあれば、ツールが FULL を読むまで Cut over は保留され、保留の通知が読み直しの失敗を伝えます。
+- **再起動。** 下がった記録はアプリの再起動後も残り、Start over でのみ消えます。**MySQL** ソースと **Full load only** は影響を受けません。
+
+修正後も異なるテーブルの **対処手順**: Full Load + CDC — CDC を追いつかせてから Stop CDC、**Drop & reload** でリロード、Start CDC、再確認; CDC only — Aurora DSQL 上の余分な行を手作業で削除してから再確認。
+
+---
+
 **次へ:** [6. 制限事項 →](06-limitations.md)
