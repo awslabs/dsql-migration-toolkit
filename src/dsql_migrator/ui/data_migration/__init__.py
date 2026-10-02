@@ -197,6 +197,7 @@ from dsql_migrator.ui.data_migration._models import (
     migration_status_label,
     migration_status_badge,
     stale_error_notice,
+    prereq_connection_block,
     substeps_for_type,
     resolve_active_substep_for_type,
     resolve_active_substep,
@@ -882,10 +883,16 @@ def build_data_migration_screen(
                 )
                 refresh()
                 return
-            if not session.has_source() or not session.has_target():
-                migration_state.set_error(
-                    "Configure and test the source and target connections first."
-                )
+            # Re-checked at CLICK time, not only when the button rendered: a connection
+            # can be edited (or the page left open across a restart) between the two. A
+            # configured connection is not enough -- a restored session has both configs
+            # but no source password, so the source checks would all read as failed.
+            # Before anything is built or flagged as running, and with no await, so the
+            # selection snapshot below still precedes the first await. A warning toast,
+            # not set_error: nothing failed, and the refreshed panel keeps the notice.
+            _conn_block = prereq_connection_block(session)
+            if _conn_block is not None:
+                ui.notify(_conn_block[2], type="warning", multi_line=True)
                 refresh()
                 return
             generated = migratable_table_names(
@@ -2318,6 +2325,18 @@ def build_data_migration_screen(
                         )
                         or cdc_streaming_started(migration_state, job_manager)
                     ) and not _cdc_tearing_down
+                    # Held while a connection is unverified in this session (a restored
+                    # session after a restart/redeploy has no source password; an edited
+                    # one still holds the last-tested values). run_checks re-checks it.
+                    _conn_block = prereq_connection_block(session)
+                    _load_running = status is StepStatus.IN_PROGRESS or _cdc_deploying
+                    # The panel shows the reconnect notice only while nothing runs, so
+                    # the two "the notice above explains it" branches below follow it.
+                    _conn_notice = (
+                        _conn_block is not None
+                        and not _load_running
+                        and not migration_state.is_prereq_running(prereq_mode)
+                    )
                     _route_choice_pending = _render_prerequisites_panel(
                         ui,
                         migration_state,
@@ -2326,10 +2345,9 @@ def build_data_migration_screen(
                         combined=(
                             migration_type is MigrationType.FULL_LOAD_AND_CDC
                         ),
-                        load_running=(
-                            status is StepStatus.IN_PROGRESS or _cdc_deploying
-                        ),
+                        load_running=_load_running,
                         refresh=refresh,
+                        connections_block=_conn_block,
                     )
                     # Right-align ONLY when this row holds the primary action (design
                     # system: primary actions sit on the right of a button row). The
@@ -2348,6 +2366,22 @@ def build_data_migration_screen(
                                 on_click=lambda t=first_phase: go(t),
                                 icon="arrow_forward",
                             ).props("color=primary")
+                        elif (
+                            _conn_notice
+                            and _exclusion_block is None
+                            and inventory is not None
+                            and inventory.tables
+                            and migration_state.get_prereq_report(prereq_mode) is None
+                        ):
+                            # The guard here would only say "run the prerequisite
+                            # checks", under a Check button the notice above has just
+                            # disabled and explained. The next action is the re-test that
+                            # notice names, so nothing is added here.
+                            pass
+                        elif _route_choice_pending and _conn_notice:
+                            # Both routes are disabled while a connection is unverified,
+                            # and the amber notice above already names the next action.
+                            pass
                         elif _route_choice_pending:
                             # The panel just rendered the two routes WITH their buttons.
                             # Repeating the block reason here would state one failure's
@@ -4506,6 +4540,7 @@ def _render_prerequisites_panel(
     combined: bool = False,
     load_running: bool = False,
     refresh=None,
+    connections_block: Optional[tuple[str, str, str]] = None,
 ) -> bool:
     """Render a mode's prerequisite check button and result panel (Req 5.10).
 
@@ -4530,6 +4565,14 @@ def _render_prerequisites_panel(
     move the operator onto the Full Load sub-step once its re-graded checks pass); every
     other action here re-renders via ``run_checks``. Optional so a test can render the
     panel without one.
+
+    ``connections_block`` is :func:`prereq_connection_block`'s ``(header, body, short)``
+    while a connection is unverified in this session (e.g. a restored session after a
+    restart). The checks are then held: a warning notice says why and where to go, the
+    Check button is disabled with ``short`` as its tooltip, and so are the two gapless
+    route buttons (each re-runs the checks after changing the migration type or start
+    mode, so it would record the choice and then be refused). ``run_checks`` re-checks
+    at click time, so this is the visible half of the gate, not the only one.
 
     **Returns** whether the gapless-handoff route choice was rendered. The caller draws
     the run guard directly below this panel, and when a choice is pending that guard would
@@ -4562,6 +4605,28 @@ def _render_prerequisites_panel(
         running_text = "Running Full Load prerequisite checks… (read-only)"
     ui.label(intro).classes("text-sm text-gray-500")
     running = migration_state.is_prereq_running(mode)
+    report = migration_state.get_prereq_report(mode)
+    # Visible text ABOVE the disabled button, not only its tooltip: the guidance has to be
+    # readable without hovering. Amber, not red: nothing failed, and the remedy is one
+    # re-test on the Connect step.
+    # Not while an operation runs either: the button stays disabled for THAT reason (the
+    # grey line below says so), and "then run the checks here" would be false meanwhile.
+    if connections_block is not None and not running and not load_running:
+        _conn_header, _conn_body, _ = connections_block
+        render_notice(
+            ui,
+            tone="warning",
+            header=_conn_header,
+            body=_conn_body
+            + (
+                # Reports are never persisted, so a report beside this notice was run
+                # before a connection was edited (or failed a re-test) in this session.
+                " The results below were produced before that and may not reflect the "
+                "connection as it is now."
+                if report is not None
+                else ""
+            ),
+        )
     with ui.row().classes("items-center gap-2 flex-wrap"):
         # Keep the label visible while running (just disabled) -- Quasar's
         # `loading` prop would swap the label for a spinner, leaving an empty
@@ -4573,7 +4638,8 @@ def _render_prerequisites_panel(
         ).props("outline")
         # Disable while the check itself runs, OR while a Full Load is in flight
         # (a mid-load re-run is inert w.r.t. the running job and only adds source
-        # read load). The tooltip explains the load-running case.
+        # read load), OR while a connection is unverified in this session (the notice
+        # above says why). The tooltip explains the latter two.
         if running:
             check_btn.props("disable")
         elif load_running:
@@ -4581,6 +4647,8 @@ def _render_prerequisites_panel(
                 "A migration operation is in progress — prerequisite checks are "
                 "read-only and apply to the NEXT run, not the one in progress."
             )
+        elif connections_block is not None:
+            check_btn.props("disable").tooltip(connections_block[2])
     # While a load runs, spell out that re-checking here won't affect it (the
     # button is disabled above; this notice says why, so the disabled state isn't
     # a mystery).
@@ -4595,7 +4663,6 @@ def _render_prerequisites_panel(
         with ui.row().classes("items-center gap-2"):
             ui.spinner(size="sm")
             ui.label(running_text).classes("text-sm text-gray-600")
-    report = migration_state.get_prereq_report(mode)
     if report is None:
         return False
     # A report can outlive the selection it covered (nothing clears it, and the
@@ -4625,12 +4692,22 @@ def _render_prerequisites_panel(
     # place that could record the re-snapshot decision was the Start CDC dialog, which
     # needs infrastructure that cannot be deployed.
     if mode is MigrationMode.CDC and resnapshot_resolvable_failures(report):
-        _render_gapless_choice(ui, migration_state, run_checks, refresh=refresh)
+        _render_gapless_choice(
+            ui,
+            migration_state,
+            run_checks,
+            refresh=refresh,
+            blocked_reason=(
+                connections_block[2] if connections_block is not None else None
+            ),
+        )
         return True
     return False
 
 
-def _render_gapless_choice(ui, migration_state, run_checks, *, refresh=None) -> None:
+def _render_gapless_choice(
+    ui, migration_state, run_checks, *, refresh=None, blocked_reason=None
+) -> None:
     """The PostgreSQL "Full load only -> CDC" fork: ONE situation, two routes, a button each.
 
     Shipped first (v0.1.510/511) as three stacked notices -- amber situation, blue
@@ -4653,6 +4730,11 @@ def _render_gapless_choice(ui, migration_state, run_checks, *, refresh=None) -> 
     Both handlers RE-RUN the (read-only, seconds) prerequisite checks, so one re-graded
     report clears every gate at once instead of leaving a red FAIL beside an enabled
     primary button.
+
+    ``blocked_reason`` (set while a connection is unverified) disables both buttons with
+    it as the tooltip: each handler changes the migration type or start mode BEFORE its
+    re-run, and that re-run would then be refused, so the choice would be recorded but
+    not re-graded until the connections are re-tested.
     """
     # RECOMMENDED FIRST, and deliberately so -- against the usual "primary action on the
     # right" rule, which governs a form's action row, not a two-way fork where reading
@@ -4718,6 +4800,8 @@ def _render_gapless_choice(ui, migration_state, run_checks, *, refresh=None) -> 
         with ui.column().classes("flex-1 min-w-0 gap-1"):
             btn = ui.button(label, icon=icon, on_click=on_click)  # type: ignore[attr-defined]
             btn.props("color=primary" if primary else "outline color=primary")
+            if blocked_reason:
+                btn.props("disable").tooltip(blocked_reason)
             # A fixed floor on the summary height keeps the two routes' expansions on the
             # same baseline: the summaries wrap to different line counts, and a ragged pair
             # reads as two unrelated blocks rather than two options being compared.
@@ -4992,6 +5076,7 @@ __all__ = [
     "summarize_table_states",
     "run_full_load_retry",
     "prerequisite_block_reason",
+    "prereq_connection_block",
     "resnapshot_resolvable_failures",
     "group_prereq_results",
     "PrereqCategory",

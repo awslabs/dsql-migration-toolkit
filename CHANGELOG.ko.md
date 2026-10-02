@@ -5,6 +5,13 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.563
+
+### 수정
+
+- **검증되지 않은 연결로는 사전 점검(prerequisite checks)을 실행하지 않습니다.** 앱을 재시작하거나 다시 배포한 뒤(소스 비밀번호는 메모리에만 보관됩니다), 또는 연결 정보를 수정한 뒤에는 Connect 단계에서 연결을 다시 테스트할 때까지 "Check … prerequisites" 버튼과 PostgreSQL 무중단(gapless) 경로 버튼 두 개가 비활성화되고 노란색 "Reconnect first" 안내가 표시됩니다.
+- **소스에 연결할 수 없을 때 잘못된 소스 점검 결과가 나오지 않습니다.** "Source database is reachable"만 실패로 표시되고, 소스가 필요한 나머지 점검은 실패나 통과 대신 "Not checked"로 표시되며, 해당 섹션도 더 이상 초록색으로 표시되지 않습니다.
+
 ## v0.1.562
 
 컬럼·테이블 제외를 다시 만들었습니다. 제외한 컬럼은 이제 Aurora DSQL에 **NULL**로 이관되고(0.1.561에서는 타깃의 DEFAULT 값을 받았습니다), 하나의 규칙 팝업에서 고르며, Full Load, Start CDC, Validation, Cut over가 모두 같은 방식으로 적용합니다. 자세한 안내: [테이블과 컬럼 제외](docs/manual/ko/13-excluding-tables-and-columns.md).

@@ -40,6 +40,7 @@ from dsql_migrator.core.models import (
     PrerequisiteStatus,
     SourceConnectionConfig,
     SourceInventory,
+    SourceType,
     StepStatus,
     TableDef,
     TableSelection,
@@ -29008,3 +29009,607 @@ def test_a_lost_snapshot_anchor_fails_the_tables_it_stopped_not_a_user_stop() ->
     engine._record_anchor_lost(log, "job-1", "app.orders")
     ((jid, rec),) = log.records
     assert jid == "job-1" and rec.table == "app.orders" and rec.message == engine._ANCHOR_LOST_DETAIL
+
+
+# ---------------------------------------------------------------------------
+# Prerequisites need connections verified in THIS session; an unreachable
+# source is reported as itself, not as a list of false source verdicts
+# ---------------------------------------------------------------------------
+#
+# Live (Seoul, after a redeploy): a restored session ran "Check Full load + CDC
+# prerequisites" without re-testing the connections. The source password is kept in
+# memory only, so the run had none: "Source database is reachable" failed (true), and the
+# privilege, binlog-format, retention and GTID rows all came back as false verdicts.
+
+
+class _UnreachableProbe:
+    def reachable(self):
+        from dsql_migrator.core.models import ConnectionResult
+
+        return ConnectionResult(success=False, detail="Source connection failed: X")
+
+    def __getattr__(self, name):
+        raise AssertionError(f"{name}() probed an unreachable source")
+
+
+class _HealthyTarget:
+    def reachable(self):
+        return True
+
+    def iam_auth(self):
+        from dsql_migrator.core.models import ConnectionResult
+
+        return ConnectionResult(success=True)
+
+    def relation_exists(self, _name):
+        return True
+
+    def required_columns_without_default(self, _name):
+        return []
+
+
+class _NoMsk:
+    def cluster_available(self):
+        return False
+
+    def connect_available(self):
+        return False
+
+
+def _unreachable_source_report(mode, source_type):
+    from dsql_migrator.core.models import PrerequisiteCheckRequest
+    from dsql_migrator.core.prerequisites import PrerequisiteChecker
+
+    table = TableDef(
+        name="app.orders",
+        columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+        primary_key=["id"],
+    )
+    return PrerequisiteChecker(
+        source_probe=_UnreachableProbe(),
+        target_probe=_HealthyTarget(),
+        msk_probe=_NoMsk(),
+    ).check(
+        PrerequisiteCheckRequest(
+            mode=mode, tables=["app.orders"], source_type=source_type
+        ),
+        tables=[table],
+    )
+
+
+def test_a_not_checked_group_does_not_read_not_applicable() -> None:
+    from dsql_migrator.ui.data_migration import _category_summary
+
+    def skip(check_id, *, not_checked):
+        return PrerequisiteResult(
+            check_id=check_id, title="Check", status=PrerequisiteStatus.SKIP,
+            not_checked=not_checked,
+        )
+
+    four = [
+        skip(PrerequisiteCheckId.REPLICATION_GRANTS, not_checked=True),
+        skip(PrerequisiteCheckId.BINLOG_ROW_FORMAT, not_checked=True),
+        skip(PrerequisiteCheckId.BINLOG_RETENTION, not_checked=True),
+        skip(PrerequisiteCheckId.GTID_MODE, not_checked=True),
+    ]
+    assert _category_summary(four) == "4 not checked"
+    mixed = [four[0]] + [
+        skip(PrerequisiteCheckId.BINLOG_ROW_FORMAT, not_checked=False),
+        skip(PrerequisiteCheckId.BINLOG_RETENTION, not_checked=False),
+        skip(PrerequisiteCheckId.GTID_MODE, not_checked=False),
+    ]
+    assert _category_summary(mixed) == "1 not checked · 3 skipped"
+    # Unchanged when nothing is not_checked.
+    assert _category_summary(mixed[1:]) == "Not applicable for this mode"
+
+    # End to end: the MySQL CDC Source Configuration group of an unreachable source.
+    report = _unreachable_source_report(MigrationMode.CDC, SourceType.MYSQL)
+    groups = {g.category: g for g in group_prereq_results(report.results)}
+    source_config = groups[PrereqCategory.SOURCE_CONFIG]
+    assert source_config.summary == "4 not checked"
+    assert groups[PrereqCategory.CONNECTIVITY].status is PrerequisiteStatus.FAIL
+
+
+@pytest.mark.parametrize("source_type", [SourceType.MYSQL, SourceType.POSTGRES])
+def test_the_cdc_gate_names_the_unreachable_source_not_a_parameter_group(source_type) -> None:
+    """The stream check is not-checked, not failed: "change a parameter group" is wrong."""
+    from dsql_migrator.ui.data_migration import cdc_prerequisite_block_reason
+
+    report = _unreachable_source_report(MigrationMode.CDC, source_type)
+    reason = cdc_prerequisite_block_reason(report)
+    assert reason is not None
+    assert reason.startswith("Source database is reachable failed.")
+    assert "parameter-group" not in reason and "reboot" not in reason
+    # The Full Load / CDC guard lists the one real failure, nothing derived from it.
+    assert prerequisite_block_reason(report, mode=MigrationMode.CDC) == (
+        "Resolve the failed prerequisite(s) before deploying the CDC infrastructure or "
+        "starting CDC: Source database is reachable."
+    )
+
+
+def _verified_session():
+    from dsql_migrator.ui.session import SessionConnectionState
+
+    session = SessionConnectionState()
+    session.set_source(
+        SourceConnectionConfig(host="h", database="app", username="u"), None
+    )
+    session.set_target(
+        TargetConnectionConfig(cluster_endpoint="c.dsql.us-east-1.on.aws", region="us-east-1")
+    )
+    session.set_source_verified(True)
+    session.set_target_verified(True)
+    return session
+
+
+def test_prereq_connection_block_is_none_once_both_sides_are_verified() -> None:
+    from dsql_migrator.ui.data_migration import prereq_connection_block
+
+    assert prereq_connection_block(_verified_session()) is None
+
+
+@pytest.mark.parametrize("source_type", [SourceType.MYSQL, SourceType.POSTGRES])
+def test_a_restored_session_is_held_although_its_configs_and_unlock_came_back(
+    source_type,
+) -> None:
+    """The old guard (``has_source() and has_target()``) passed exactly here."""
+    from dsql_migrator.ui.data_migration import prereq_connection_block
+    from dsql_migrator.ui.evaluation import EvaluationState
+    from dsql_migrator.ui.schema_conversion import SchemaConversionState
+    from dsql_migrator.ui.session import SessionConnectionState
+    from dsql_migrator.ui.session_persistence import (
+        apply_session_snapshot,
+        capture_session_snapshot,
+    )
+
+    live = _verified_session()
+    live.set_source(
+        SourceConnectionConfig(
+            source_type=source_type, host="h", port=5432, database="app", username="u"
+        ),
+        None,
+    )
+    live.source_secret_id = "arn:aws:secretsmanager:us-east-1:111122223333:secret:s"
+    assert live.workflow_unlocked()
+    snapshot = capture_session_snapshot(
+        "s1", live, EvaluationState(), SchemaConversionState(), DataMigrationState()
+    )
+
+    restored = SessionConnectionState()
+    state = DataMigrationState()
+    state.bind_session(restored)
+    apply_session_snapshot(
+        snapshot, restored, EvaluationState(), SchemaConversionState(), state
+    )
+    assert restored.has_source() and restored.has_target()
+    assert restored.workflow_unlocked()
+    assert restored.source_password is None
+
+    block = prereq_connection_block(restored)
+    assert block is not None
+    header, body, short = block
+    assert header.startswith("Reconnect first")
+    assert "source and target connections" in body
+    assert "in memory" in body and "Connect step" in body
+    assert short == (
+        "Reconnect first: test the source and target connections on the Connect step."
+    )
+
+
+def test_an_edited_connection_is_held_and_named_while_the_unlock_latch_stays() -> None:
+    from dsql_migrator.ui.data_migration import prereq_connection_block
+    from dsql_migrator.ui.session import SessionConnectionState
+
+    session = _verified_session()
+    session.set_source_verified(False)  # what Connect does on any field edit
+    assert session.workflow_unlocked(), "the sticky latch must not be the signal"
+    _header, body, short = prereq_connection_block(session)
+    assert body.startswith("The source connection is not verified right now.")
+    assert "source password is kept in memory only" in body
+    assert short == "Reconnect first: test the source connection on the Connect step."
+
+    session = _verified_session()
+    session.set_target_verified(False)
+    _header, body, short = prereq_connection_block(session)
+    assert "target connection on the Connect step" in short
+    # The target signs in with IAM tokens: no "kept in memory" reason for it alone.
+    assert "in memory" not in body and "failed test, clears its verification" in body
+
+    # Nothing configured at all (a fresh session, e.g. a .env prefill not yet tested).
+    assert prereq_connection_block(SessionConnectionState()) is not None
+
+
+_CONN_BLOCK = (
+    "Reconnect first to run the prerequisite checks",
+    "The source and target connections are not verified right now.",
+    "Reconnect first: test the source and target connections on the Connect step.",
+)
+
+
+@pytest.mark.parametrize(
+    "mode,combined,label",
+    [
+        (MigrationMode.FULL_LOAD, False, "Check Full Load prerequisites"),
+        (MigrationMode.CDC, False, "Check CDC prerequisites"),
+        (MigrationMode.CDC, True, "Check Full load + CDC prerequisites"),
+    ],
+)
+def test_the_check_button_is_held_with_a_visible_warning_while_unverified(
+    mode, combined, label
+) -> None:
+    from dsql_migrator.ui import data_migration as dm
+    from dsql_migrator.ui.design import notice_box_classes
+
+    def render(block):
+        ui = _RecordingUi()
+
+        async def _run_checks(_mode):
+            raise AssertionError("not clicked here")
+
+        dm._render_prerequisites_panel(
+            ui, DataMigrationState(), _run_checks, mode,
+            combined=combined, connections_block=block,
+        )
+        (button,) = [b for b in ui.buttons if b.text == label]
+        return ui, button
+
+    ui, button = render(_CONN_BLOCK)
+    assert "disable" in button.props_seen
+    assert _CONN_BLOCK[2] in ui.tooltips
+    # Visible text, not only the tooltip -- and ABOVE the button it explains.
+    assert _CONN_BLOCK[0] in ui.texts and _CONN_BLOCK[1] in ui.texts
+    assert ui.texts.index(_CONN_BLOCK[0]) < ui.texts.index(label)
+    assert notice_box_classes("warning") in ui.classes_applied
+
+    ui, button = render(None)
+    assert "disable" not in button.props_seen
+    assert _CONN_BLOCK[0] not in ui.texts
+    assert notice_box_classes("warning") not in ui.classes_applied
+
+
+def test_the_held_panel_keeps_running_and_load_running_precedence() -> None:
+    from dsql_migrator.ui import data_migration as dm
+
+    async def _run_checks(_mode):
+        return None
+
+    running = DataMigrationState()
+    running.set_prereq_running(MigrationMode.FULL_LOAD)
+    ui = _RecordingUi()
+    dm._render_prerequisites_panel(
+        ui, running, _run_checks, MigrationMode.FULL_LOAD, connections_block=_CONN_BLOCK
+    )
+    assert "Checking…" in ui.texts and _CONN_BLOCK[0] not in ui.texts
+
+    ui = _RecordingUi()
+    dm._render_prerequisites_panel(
+        ui, DataMigrationState(), _run_checks, MigrationMode.FULL_LOAD,
+        load_running=True, connections_block=_CONN_BLOCK,
+    )
+    assert any("A migration operation is in progress" in t for t in ui.tooltips)
+    assert _CONN_BLOCK[2] not in ui.tooltips
+    # Review: no "then run the checks here" notice while an operation holds the button.
+    assert _CONN_BLOCK[0] not in ui.texts
+
+
+def test_a_section_with_not_checked_rows_is_never_rolled_up_green() -> None:
+    """Review: two required CDC gates nobody evaluated sat in a green PASS section."""
+    from dsql_migrator.core.models import PrerequisiteCheckId, PrerequisiteResult, PrerequisiteStatus
+    from dsql_migrator.ui.data_migration._models import _rollup_category_status
+
+    passed = PrerequisiteResult(check_id=PrerequisiteCheckId.TABLE_PRIMARY_KEY, title="pk",
+                                status=PrerequisiteStatus.PASS, required=True)
+    not_checked = PrerequisiteResult(check_id=PrerequisiteCheckId.REPLICA_IDENTITY, title="ri",
+                                     status=PrerequisiteStatus.SKIP, required=True,
+                                     not_checked=True)
+    mode_skip = not_checked.model_copy(update={"not_checked": False})
+    assert _rollup_category_status([passed, not_checked]) is PrerequisiteStatus.INFO
+    assert _rollup_category_status([passed, mode_skip]) is PrerequisiteStatus.PASS
+    assert _rollup_category_status([not_checked]) is PrerequisiteStatus.SKIP
+
+
+def test_a_stale_report_beside_the_held_button_is_said_to_predate_the_edit() -> None:
+    from dsql_migrator.ui import data_migration as dm
+
+    async def _run_checks(_mode):
+        return None
+
+    state = DataMigrationState()
+    state.set_prereq_report(
+        MigrationMode.FULL_LOAD,
+        PrerequisiteReport(mode=MigrationMode.FULL_LOAD, results=[], can_proceed=True),
+    )
+    ui = _RecordingUi()
+    dm._render_prerequisites_panel(
+        ui, state, _run_checks, MigrationMode.FULL_LOAD, connections_block=_CONN_BLOCK
+    )
+    assert any(
+        t.startswith(_CONN_BLOCK[1]) and "were produced before that" in t for t in ui.texts
+    )
+
+
+def test_the_gapless_routes_are_held_too_while_unverified() -> None:
+    """Each route changes the type / start mode BEFORE its re-run, which would be refused."""
+    from dsql_migrator.core.prerequisites_postgres import (
+        PostgresCdcFacts,
+        check_cdc_replication_objects,
+    )
+    from dsql_migrator.ui import data_migration as dm
+    from dsql_migrator.ui.design import notice_box_classes
+
+    row = check_cdc_replication_objects(
+        PostgresCdcFacts(
+            checked_publication_name="p", checked_slot_name="s",
+            publication_present=False, publication_tables=(),
+        ),
+        [TableDef(name="app.orders", columns=[ColumnDef(name="id", mysql_type="int")],
+                  primary_key=["id"])],
+        provisions_replication=False,
+    )
+    state = DataMigrationState()
+    state.set_prereq_report(
+        MigrationMode.CDC,
+        PrerequisiteReport(mode=MigrationMode.CDC, results=[row], can_proceed=False),
+    )
+
+    async def _run_checks(_mode):
+        return None
+
+    ui = _RecordingUi()
+    assert dm._render_prerequisites_panel(
+        ui, state, _run_checks, MigrationMode.CDC, connections_block=_CONN_BLOCK
+    ) is True
+    routes = [
+        b for b in ui.buttons
+        if b.text in ('Start over as "Full load + CDC"', "Re-snapshot every table")
+    ]
+    assert len(routes) == 2
+    assert all("disable" in b.props_seen for b in routes)
+    assert ui.tooltips.count(_CONN_BLOCK[2]) == 3  # the Check button and both routes
+    boxes = [c for c in ui.classes_applied if c == notice_box_classes("warning")]
+    assert len(boxes) == 2  # the connection notice + the one gapless situation box
+
+
+class _ScreenUi(_RecordingUi):
+    """A permissive double that can render the whole Data Migration screen."""
+
+    class _El(_RecordingUi._El):
+        def __getattr__(self, name):
+            if name.startswith("__"):
+                raise AttributeError(name)
+            return lambda *_a, **_k: self
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.notified: list = []
+
+    def notify(self, message="", *_a, **kwargs):
+        self.notified.append((str(message), kwargs))
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return lambda *_a, **_k: self._El(self)
+
+
+def _render_prereq_screen(
+    monkeypatch, *, verified: bool, pg: bool = False, migration_type=None, report=None,
+    report_mode=MigrationMode.FULL_LOAD, exclusion_block=None,
+):
+    """Render the real screen for a session whose configs exist; hand back run_checks.
+
+    ``report`` (a report, or a callable taking the one table) is stored for
+    ``report_mode`` before the render; ``exclusion_block`` stubs the exclusion gate.
+    """
+    import sys
+    import types
+
+    from dsql_migrator.core.models import AssessmentReport
+    from dsql_migrator.ui import data_migration as dm
+    from dsql_migrator.ui.evaluation import EvaluationResult, EvaluationStore
+    from dsql_migrator.ui.schema_conversion import SchemaConversionStore
+    from dsql_migrator.ui.session import SessionStore
+
+    class _Run:
+        @staticmethod
+        async def io_bound(fn, *a, **k):
+            return fn(*a, **k)
+
+    ui = _ScreenUi()
+    fake = types.ModuleType("nicegui")
+    fake.ui = ui
+    fake.run = _Run
+    monkeypatch.setitem(sys.modules, "nicegui", fake)
+
+    sessions = SessionStore()
+    session = sessions.get_or_create("s1")
+    # What a restore leaves: both configs, no source password, nothing verified.
+    if pg:
+        source = SourceConnectionConfig(
+            source_type=SourceType.POSTGRES, host="h", port=5432, database="app", username="u"
+        )
+    else:
+        source = SourceConnectionConfig(host="h", database="app", username="u")
+    session.set_source(source, None)
+    session.set_target(
+        TargetConnectionConfig(cluster_endpoint="c.dsql.us-east-1.on.aws", region="us-east-1")
+    )
+    if migration_type is not None:
+        session.set_migration_type(migration_type)
+    if verified:
+        session.set_source_verified(True)
+        session.set_target_verified(True)
+    table = TableDef(
+        name="app.t",
+        columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+        primary_key=["id"],
+    )
+    evals = EvaluationStore()
+    evals.get_or_create("s1").set_result(
+        EvaluationResult(
+            inventory=SourceInventory(tables=[table]),
+            assessment=AssessmentReport.from_items([]),
+            target_inventory=TargetInventory(schemas=[]),
+            target_conflicts=[],
+        )
+    )
+    convs = SchemaConversionStore()
+    convs.get_or_create("s1").generated_node_ids = ["table:app.t"]
+    migrations = DataMigrationStore()
+    if report is not None:
+        held = migrations.get_or_create("s1")
+        held.bind_session(session)
+        held.set_prereq_report(report_mode, report(table) if callable(report) else report)
+    if exclusion_block is not None:
+        monkeypatch.setattr(dm, "data_migration_exclusion_block", lambda *a, **k: exclusion_block)
+
+    captured: dict = {}
+    real_panel = dm._render_prerequisites_panel
+
+    def _spy(ui_, state, run_checks, *a, **k):
+        captured["run_checks"] = run_checks
+        captured["connections_block"] = k.get("connections_block")
+        return real_panel(ui_, state, run_checks, *a, **k)
+
+    built: list = []
+
+    class _Checker:
+        def check(self, request, **_k):
+            return PrerequisiteReport.build(request.mode, [])
+
+    monkeypatch.setattr(dm, "_render_prerequisites_panel", _spy)
+    monkeypatch.setattr(
+        dm, "build_prerequisite_checker", lambda **k: built.append(k) or _Checker()
+    )
+    content, _runner = dm.build_data_migration_screen(
+        sessions, "s1", job_manager=JobManager(), eval_store=evals,
+        migration_store=migrations, conv_store=convs,
+    )
+    content(lambda: None)
+    return ui, captured, built, migrations.get_or_create("s1")
+
+
+def test_a_restored_session_cannot_run_the_checks_even_from_a_stale_click(monkeypatch) -> None:
+    import asyncio
+
+    ui, captured, built, state = _render_prereq_screen(monkeypatch, verified=False)
+    block = captured["connections_block"]
+    assert block is not None, "the screen must pass the gate to the panel"
+    rendered = " ".join(ui.texts)
+    assert block[0] in rendered
+    # The nav row does not add "run the prerequisite checks" under the held button.
+    assert "Run the prerequisite checks first" not in rendered
+
+    # A click that slips through (a render from before the restart) runs NOTHING.
+    asyncio.run(captured["run_checks"](MigrationMode.FULL_LOAD))
+    assert built == [], "no checker may be built for an unverified session"
+    assert ui.notified == [(block[2], {"type": "warning", "multi_line": True})]
+    assert state.get_prereq_report(MigrationMode.FULL_LOAD) is None
+    assert not state.is_prereq_running(MigrationMode.FULL_LOAD)
+    assert not state.error, "a refusal is not a failed migration (no red banner)"
+
+
+def test_a_verified_session_runs_the_checks(monkeypatch) -> None:
+    import asyncio
+
+    ui, captured, built, state = _render_prereq_screen(monkeypatch, verified=True)
+    assert captured["connections_block"] is None
+    # The control for the nav-row assertion above: without the gate the guard does show.
+    assert "Run the prerequisite checks first" in " ".join(ui.texts)
+
+    asyncio.run(captured["run_checks"](MigrationMode.FULL_LOAD))
+    assert len(built) == 1
+    assert ui.notified == []
+    assert state.get_prereq_report(MigrationMode.FULL_LOAD) is not None
+
+
+def _resolvable_replication_objects_report(table):
+    from dsql_migrator.core.prerequisites_postgres import (
+        PostgresCdcFacts,
+        check_cdc_replication_objects,
+    )
+
+    row = check_cdc_replication_objects(
+        PostgresCdcFacts(
+            checked_publication_name="p", checked_slot_name="s",
+            publication_present=False, publication_tables=(),
+        ),
+        [table],
+        provisions_replication=False,
+    )
+    return PrerequisiteReport.build(MigrationMode.CDC, [row])
+
+
+@pytest.mark.parametrize("verified", [False, True])
+def test_the_route_hint_follows_whether_the_routes_are_held(monkeypatch, verified) -> None:
+    """Review: no "Pick one of the two routes" under two routes the gate disabled."""
+    from dsql_migrator.ui.data_migration import MigrationType
+
+    ui, *_ = _render_prereq_screen(
+        monkeypatch, verified=verified, pg=True, migration_type=MigrationType.CDC_ONLY,
+        report=_resolvable_replication_objects_report, report_mode=MigrationMode.CDC,
+    )
+    routes = [
+        b for b in ui.buttons
+        if b.text in ('Start over as "Full load + CDC"', "Re-snapshot every table")
+    ]
+    assert len(routes) == 2
+    assert all(("disable" in b.props_seen) is (not verified) for b in routes)
+    assert ("Pick one of the two routes above to continue." in " ".join(ui.texts)) is verified
+
+
+def test_an_exclusion_block_is_still_shown_while_unverified(monkeypatch) -> None:
+    reason = "A saved exclusion no longer applies: app.t.id is a key column."
+    ui, *_ = _render_prereq_screen(monkeypatch, verified=False, exclusion_block=reason)
+    assert reason in " ".join(ui.texts)
+
+
+def test_a_failing_earlier_report_keeps_its_guard_while_unverified(monkeypatch) -> None:
+    from dsql_migrator.core.models import PrerequisiteCheckId, PrerequisiteResult, PrerequisiteStatus
+
+    report = PrerequisiteReport.build(MigrationMode.FULL_LOAD, [PrerequisiteResult(
+        check_id=PrerequisiteCheckId.SOURCE_REACHABLE, title="Source database is reachable",
+        status=PrerequisiteStatus.FAIL, detail="timed out", remediation="Check the SG.",
+    )])
+    ui, *_ = _render_prereq_screen(monkeypatch, verified=False, report=report)
+    assert "Resolve the failed prerequisite(s)" in " ".join(ui.texts)
+
+
+def test_run_checks_refuses_before_building_anything_or_awaiting() -> None:
+    """Ordering a behavioral test cannot see: the refusal precedes every side effect."""
+    import ast
+    import pathlib
+
+    import dsql_migrator.ui.data_migration as dm
+
+    source = pathlib.Path(dm.__file__).read_text(encoding="utf-8")
+    (fn,) = [
+        n for n in ast.walk(ast.parse(source))
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "run_checks"
+    ]
+    calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
+
+    def first(name):
+        return min(
+            c.lineno for c in calls
+            if getattr(c.func, "id", None) == name or getattr(c.func, "attr", None) == name
+        )
+
+    gate = first("prereq_connection_block")
+    first_await = min(n.lineno for n in ast.walk(fn) if isinstance(n, ast.Await))
+    for later in ("selection_snapshot", "build_prerequisite_checker", "set_prereq_running"):
+        assert gate < first(later), later
+    assert gate < first_await
+    (guard,) = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.If) and ast.unparse(n.test) == "_conn_block is not None"
+    ]
+    body_calls = {
+        getattr(c.func, "attr", None) for b in guard.body for c in ast.walk(b)
+        if isinstance(c, ast.Call)
+    }
+    assert "notify" in body_calls and "set_error" not in body_calls
+    assert any(isinstance(b, ast.Return) for b in guard.body)
+    assert "Configure and test the source and target connections first." not in (
+        ast.get_source_segment(source, fn)
+    )

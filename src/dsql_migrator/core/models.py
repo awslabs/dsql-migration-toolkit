@@ -1043,7 +1043,9 @@ class PrerequisiteStatus(str, Enum):
     ``WARN`` -- something is off and worth attention; ``INFO`` -- an optional
     recommendation or an expected, no-action-needed state (e.g. GTID is off but
     CDC still works; MSK is not yet provisioned because it is created at deploy
-    time); ``SKIP`` -- the check does not apply to the requested mode. ``INFO`` is
+    time); ``SKIP`` -- the check does not apply to the requested mode, or it was
+    not evaluated because the source could not be reached
+    (:attr:`PrerequisiteResult.not_checked`). ``INFO`` is
     deliberately quieter than ``WARN`` (it is not a problem), so the UI shows it
     with an info tone and does not auto-expand its section.
     """
@@ -1165,6 +1167,14 @@ class PrerequisiteResult(BaseModel):
     # ...and the byte limit each was measured against (a later target-type edit changes
     # the limit, and a verdict for another limit says nothing about this one).
     measured_limits: Optional[dict[str, int]] = None
+    # Set ONLY on a SKIP that stands in for a source check the checker did NOT run because
+    # SOURCE_REACHABLE failed. Probing an unreachable source anyway turned every one of its
+    # errors into a confident verdict -- "Missing privileges: SELECT, REPLICATION CLIENT,
+    # REPLICATION SLAVE", "not ROW/FULL", "gtid_mode is not ON" on a source that had all of
+    # them -- each with a remediation for a problem that did not exist. Distinguishes "did
+    # not run" from "does not apply to this mode", which read the same as a bare SKIP. A
+    # discriminator, not a text match (same reason as resolvable_by_resnapshot).
+    not_checked: bool = False
 
 
 class PrerequisiteCheckRequest(BaseModel):

@@ -5,6 +5,13 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.563
+
+### 修正
+
+- **検証されていない接続では前提条件チェック (prerequisite checks) を実行しなくなりました。** アプリの再起動・再デプロイ後 (ソースのパスワードはメモリにのみ保持されます) や接続情報の編集後は、Connect ステップで接続を再テストするまで、"Check … prerequisites" ボタンと PostgreSQL のギャップレス (gapless) 経路ボタン 2 つが無効になり、黄色の "Reconnect first" 通知が表示されます。
+- **ソースに接続できないときに誤解を招くソースの結果を出さなくなりました。** 失敗になるのは "Source database is reachable" だけで、ソースを必要とする他のチェックは失敗や合格ではなく "Not checked" と表示され、そのセクションも緑色で表示されなくなりました。
+
 ## v0.1.562
 
 列とテーブルの除外を作り直しました。除外した列は Aurora DSQL に **NULL** として移行されるようになり (0.1.561 ではターゲットの DEFAULT が入りました)、1 つのルールポップアップで選び、Full Load、Start CDC、Validation、Cut over がすべて同じ方法で適用します。詳しい手引き: [テーブルと列の除外](docs/manual/ja/13-excluding-tables-and-columns.md)。

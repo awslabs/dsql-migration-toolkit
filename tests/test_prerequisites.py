@@ -3176,3 +3176,333 @@ def test_the_checker_threads_excluded_columns_into_the_pg_column_replicable_row(
     assert both == [], [r.detail for r in both]
     one = rows({"app.orders": ["num_arr"]})
     assert len(one) == 1 and "bin_arr" in one[0].detail and "num_arr" not in one[0].detail
+
+
+# ---------------------------------------------------------------------------
+# An unreachable source: no further probe, source rows are "not checked"
+# ---------------------------------------------------------------------------
+#
+# Live (Seoul, after a redeploy): a restored session ran the checks without its source
+# password. Beside the one true FAIL ("Source database is reachable") the report showed
+# "Missing privileges: SELECT, REPLICATION CLIENT, REPLICATION SLAVE", "not ROW/FULL" and
+# "gtid_mode is not ON" for a source that had all of them -- every other probe had turned
+# its own connection error into a confident verdict, each with a remediation to follow.
+
+
+class _UnreachableSource:
+    """Fails the reachability check; records every call so a later probe is visible.
+
+    The probe methods also raise, so a call that is not swallowed fails loudly. The value
+    size probe IS swallowed by the checker (it is advisory), which is why the call log,
+    not the exception, is what the tests assert on.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def reachable(self) -> ConnectionResult:
+        self.calls.append("reachable")
+        return ConnectionResult(
+            success=False, detail="Source connection failed: OperationalError"
+        )
+
+    def grants(self) -> list[str]:
+        self.calls.append("grants")
+        raise AssertionError("grants() probed an unreachable source")
+
+    def variables(self) -> dict[str, str]:
+        self.calls.append("variables")
+        raise AssertionError("variables() probed an unreachable source")
+
+    def cdc_prerequisites(self, table_names, *, publication_name="", slot_name=""):
+        self.calls.append("cdc_prerequisites")
+        raise AssertionError("cdc_prerequisites() probed an unreachable source")
+
+    def oversized_values(self, table_name, columns, *, limit_bytes, timeout_seconds):
+        self.calls.append("oversized_values")
+        raise AssertionError("oversized_values() probed an unreachable source")
+
+
+# Rows that never read the source: the inventory (primary key), the target, and MSK.
+_SOURCE_INDEPENDENT_IDS = frozenset(
+    {
+        PrerequisiteCheckId.TABLE_PRIMARY_KEY,
+        PrerequisiteCheckId.TARGET_DSQL_REACHABLE,
+        PrerequisiteCheckId.TARGET_IAM_AUTH,
+        PrerequisiteCheckId.TARGET_SCHEMA_READY,
+        PrerequisiteCheckId.TARGET_COLUMNS_LOADABLE,
+        PrerequisiteCheckId.MSK_AVAILABLE,
+        PrerequisiteCheckId.MSK_CONNECT_AVAILABLE,
+    }
+)
+
+
+def _unreachable_report(
+    mode, source_type, *, source=None, provisions_replication=True, cdc_stack_name=""
+):
+    """A report over a LOB table and a no-PK table, against ``source`` (unreachable)."""
+    checker = PrerequisiteChecker(
+        source_probe=source if source is not None else _UnreachableSource(),
+        target_probe=_FakeTarget(existing={"app.orders", "app.nopk"}),
+        msk_probe=_FakeMsk(cluster=False, connect=False),
+    )
+    return checker.check(
+        PrerequisiteCheckRequest(
+            mode=mode,
+            tables=["app.orders", "app.nopk"],
+            source_type=source_type,
+            provisions_replication=provisions_replication,
+            cdc_stack_name=cdc_stack_name,
+        ),
+        tables=[_lob_table("app.orders"), _table("app.nopk", pk=False)],
+        lob_columns={"app.orders": ["blob_doc"]},
+    )
+
+
+def _assert_not_checked(row, *, required: bool) -> None:
+    from dsql_migrator.core.prerequisites import SOURCE_NOT_CHECKED_DETAIL
+
+    assert row.status is PrerequisiteStatus.SKIP, (row.check_id, row.status)
+    assert row.not_checked is True, row.check_id
+    assert row.detail == SOURCE_NOT_CHECKED_DETAIL
+    assert row.remediation == ""
+    assert row.required is required, row.check_id
+
+
+def test_the_not_checked_detail_names_the_reachability_row_by_its_title() -> None:
+    from dsql_migrator.core.prerequisites import (
+        SOURCE_NOT_CHECKED_DETAIL,
+        check_source_reachable,
+    )
+
+    title = check_source_reachable(ConnectionResult(success=False)).title
+    assert SOURCE_NOT_CHECKED_DETAIL == (
+        "Not checked: the source database could not be reached. "
+        f'Fix "{title}" first.'
+    )
+
+
+def test_mysql_full_load_with_an_unreachable_source_probes_nothing_else() -> None:
+    source = _UnreachableSource()
+    report = _unreachable_report(MigrationMode.FULL_LOAD, SourceType.MYSQL, source=source)
+
+    assert source.calls == ["reachable"]
+    assert _result(report, PrerequisiteCheckId.SOURCE_REACHABLE).status is (
+        PrerequisiteStatus.FAIL
+    )
+    grants = _result(report, PrerequisiteCheckId.REPLICATION_GRANTS)
+    _assert_not_checked(grants, required=True)
+    assert grants.title == "Source user has the required privileges"
+    assert "Missing privileges" not in grants.detail
+    # The scope notice is conditional on what the grants say; with none read it is absent.
+    assert not [
+        r for r in report.results if r.check_id is PrerequisiteCheckId.SELECT_GRANT_SCOPE
+    ]
+    # The value-size row stays, per LOB table, and claims no measurement.
+    size = _result(report, PrerequisiteCheckId.SOURCE_VALUE_SIZE, "app.orders")
+    _assert_not_checked(size, required=False)
+    assert size.measured is None and size.measured_limits is None
+    # Mode-SKIP rows need no source: still "not applicable", not "not checked".
+    for check_id in (
+        PrerequisiteCheckId.BINLOG_ROW_FORMAT,
+        PrerequisiteCheckId.BINLOG_RETENTION,
+        PrerequisiteCheckId.GTID_MODE,
+        PrerequisiteCheckId.MSK_AVAILABLE,
+        PrerequisiteCheckId.MSK_CONNECT_AVAILABLE,
+    ):
+        row = _result(report, check_id)
+        assert row.status is PrerequisiteStatus.SKIP
+        assert row.detail == "Not applicable for this mode."
+        assert row.not_checked is False
+    # The inventory and the target are still evaluated: a no-PK table still FAILs.
+    assert _result(report, PrerequisiteCheckId.TABLE_PRIMARY_KEY, "app.orders").status is (
+        PrerequisiteStatus.PASS
+    )
+    assert _result(report, PrerequisiteCheckId.TABLE_PRIMARY_KEY, "app.nopk").status is (
+        PrerequisiteStatus.FAIL
+    )
+    assert _result(report, PrerequisiteCheckId.TARGET_IAM_AUTH).status is (
+        PrerequisiteStatus.PASS
+    )
+    assert _result(report, PrerequisiteCheckId.TARGET_SCHEMA_READY, "app.orders").status is (
+        PrerequisiteStatus.PASS
+    )
+    assert report.can_proceed is False
+
+
+def test_mysql_cdc_with_an_unreachable_source_reports_no_false_binlog_verdicts() -> None:
+    """The live incident's rows, one by one: none of them may grade the source."""
+    source = _UnreachableSource()
+    report = _unreachable_report(MigrationMode.CDC, SourceType.MYSQL, source=source)
+
+    assert source.calls == ["reachable"], "variables()/grants() must not be called"
+    _assert_not_checked(_result(report, PrerequisiteCheckId.BINLOG_ROW_FORMAT), required=True)
+    _assert_not_checked(_result(report, PrerequisiteCheckId.BINLOG_RETENTION), required=False)
+    gtid = _result(report, PrerequisiteCheckId.GTID_MODE)
+    _assert_not_checked(gtid, required=False)
+    assert gtid.title == "GTID mode is enabled (recommended)"
+    rendered = " ".join(f"{r.detail} {r.remediation}" for r in report.results)
+    assert "Missing privileges" not in rendered
+    assert "not ROW/FULL" not in rendered
+    assert "gtid_mode is not ON" not in rendered
+    assert "Could not read the source's binlog retention" not in rendered
+    # MSK is an AWS call, not the source, so it still runs.
+    assert _result(report, PrerequisiteCheckId.MSK_AVAILABLE).status is PrerequisiteStatus.INFO
+    blocking = [
+        r for r in report.results
+        if r.required and r.status is PrerequisiteStatus.FAIL
+        and r.check_id is not PrerequisiteCheckId.TABLE_PRIMARY_KEY
+    ]
+    assert [r.check_id for r in blocking] == [PrerequisiteCheckId.SOURCE_REACHABLE]
+    assert report.can_proceed is False
+
+
+def test_postgres_full_load_with_an_unreachable_source_keeps_the_cdc_preview() -> None:
+    from dsql_migrator.core.prerequisites_postgres import (
+        postgres_cdc_prerequisites_skipped,
+    )
+
+    source = _UnreachableSource()
+    report = _unreachable_report(MigrationMode.FULL_LOAD, SourceType.POSTGRES, source=source)
+
+    assert source.calls == ["reachable"]
+    _assert_not_checked(_result(report, PrerequisiteCheckId.REPLICATION_GRANTS), required=True)
+    # The ten preview rows are mode SKIPs (no source needed), byte-identical to the preview.
+    preview = {row.check_id: row for row in postgres_cdc_prerequisites_skipped()}
+    for check_id, expected in preview.items():
+        row = _result(report, check_id)
+        assert row == expected, check_id
+        assert row.not_checked is False
+    assert report.can_proceed is False
+
+
+def test_postgres_cdc_with_an_unreachable_source_lists_each_readiness_check_once() -> None:
+    from dsql_migrator.core.prerequisites_postgres import (
+        postgres_cdc_prerequisites_skipped,
+    )
+
+    source = _UnreachableSource()
+    # The CDC-only shape: the run must FIND the publication + slot, so the names are
+    # derived -- and still nothing may be read.
+    report = _unreachable_report(
+        MigrationMode.CDC,
+        SourceType.POSTGRES,
+        source=source,
+        provisions_replication=False,
+        cdc_stack_name="dsql-cdc-orders",
+    )
+
+    assert source.calls == ["reachable"], "cdc_prerequisites() must not be called"
+    preview = postgres_cdc_prerequisites_skipped()
+    for expected in preview:
+        rows = [r for r in report.results if r.check_id is expected.check_id]
+        assert len(rows) == 1, expected.check_id  # one row per check, not per table
+        _assert_not_checked(rows[0], required=True)
+        assert rows[0].title == expected.title
+        assert rows[0].target is None
+    titles = {r.title for r in report.results}
+    assert "PostgreSQL CDC readiness could not be verified" not in titles
+    # The preview itself is untouched (the not-checked rows are copies).
+    assert all(not r.not_checked for r in postgres_cdc_prerequisites_skipped())
+    assert _result(report, PrerequisiteCheckId.MSK_CONNECT_AVAILABLE).status is (
+        PrerequisiteStatus.INFO
+    )
+    assert report.can_proceed is False
+
+
+def test_a_reachable_source_with_unread_postgres_facts_still_blocks_as_unverified() -> None:
+    """Precedence: "could not be verified" is for a source that ANSWERED without facts."""
+    from dsql_migrator.core.prerequisites_postgres import PostgresCdcFacts
+
+    report = PrerequisiteChecker(
+        source_probe=_FakeSource(cdc_facts=PostgresCdcFacts()),
+        target_probe=_FakeTarget(existing={"app.orders"}),
+        msk_probe=_FakeMsk(),
+    ).check(
+        PrerequisiteCheckRequest(
+            mode=MigrationMode.CDC, tables=["app.orders"], source_type=SourceType.POSTGRES
+        ),
+        tables=[_table("app.orders")],
+    )
+    row = _result(report, PrerequisiteCheckId.WAL_LEVEL_LOGICAL)
+    assert row.status is PrerequisiteStatus.FAIL
+    assert row.title == "PostgreSQL CDC readiness could not be verified"
+    assert row.not_checked is False
+    assert report.can_proceed is False
+
+
+def test_an_unreachable_source_never_grades_a_source_check_for_any_engine_or_mode() -> None:
+    """The invariant behind the four cases above, over every (engine, mode) pair."""
+    for source_type in (SourceType.MYSQL, SourceType.POSTGRES):
+        for mode in (MigrationMode.FULL_LOAD, MigrationMode.CDC):
+            source = _UnreachableSource()
+            report = _unreachable_report(mode, source_type, source=source)
+            where = f"{source_type.value}/{mode.value}"
+            assert source.calls == ["reachable"], where
+            for row in report.results:
+                if (
+                    row.check_id in _SOURCE_INDEPENDENT_IDS
+                    or row.check_id is PrerequisiteCheckId.SOURCE_REACHABLE
+                ):
+                    continue
+                assert row.status is PrerequisiteStatus.SKIP, (where, row.check_id, row.status)
+                assert row.remediation == "", (where, row.check_id)
+            required_fails = [
+                r.check_id for r in report.results
+                if r.required and r.status is PrerequisiteStatus.FAIL
+                and r.check_id is not PrerequisiteCheckId.TABLE_PRIMARY_KEY
+            ]
+            assert required_fails == [PrerequisiteCheckId.SOURCE_REACHABLE], where
+            assert report.can_proceed is False, where
+
+            # Every row a healthy source would get is still listed (the operator sees the
+            # same checks), apart from the two that only appear on a specific finding.
+            healthy = PrerequisiteChecker(
+                source_probe=_FakeSource(cdc_facts=_pg_facts_healthy()),
+                target_probe=_FakeTarget(existing={"app.orders", "app.nopk"}),
+                msk_probe=_FakeMsk(),
+            ).check(
+                PrerequisiteCheckRequest(
+                    mode=mode, tables=["app.orders", "app.nopk"], source_type=source_type
+                ),
+                tables=[_lob_table("app.orders"), _table("app.nopk", pk=False)],
+                lob_columns={"app.orders": ["blob_doc"]},
+            )
+            conditional = {
+                PrerequisiteCheckId.SELECT_GRANT_SCOPE,
+                PrerequisiteCheckId.REPLICA_IDENTITY_COVERS_KEY,
+            }
+            missing = (
+                {r.check_id for r in healthy.results} - conditional
+            ) - {r.check_id for r in report.results}
+            assert missing == set(), (where, sorted(i.value for i in missing))
+
+
+def test_a_provisioning_run_keeps_its_own_replication_objects_skip_when_unreachable() -> None:
+    """Review: in Full load + CDC the object check never reads the source, so an
+    unreachable source does not relabel it "not checked"."""
+    report = _unreachable_report(MigrationMode.CDC, SourceType.POSTGRES,
+                                 provisions_replication=True)
+    row = _result(report, PrerequisiteCheckId.CDC_REPLICATION_OBJECTS)
+    assert row.status is PrerequisiteStatus.SKIP and row.not_checked is False
+    assert row.detail.startswith("Not graded here")
+
+
+def test_a_rekeyed_postgres_table_lists_its_before_image_check_as_not_checked() -> None:
+    """Review: whether the re-key check applies is known without the source."""
+    checker = PrerequisiteChecker(
+        source_probe=_UnreachableSource(),
+        target_probe=_FakeTarget(existing={"app.orders"}),
+        msk_probe=_FakeMsk(cluster=False, connect=False),
+    )
+    report = checker.check(
+        PrerequisiteCheckRequest(
+            mode=MigrationMode.CDC, tables=["app.orders"], source_type=SourceType.POSTGRES,
+            message_key_columns={"app.orders": ["name", "id"]},
+        ),
+        tables=[_table("app.orders")],
+    )
+    rows = [r for r in report.results
+            if r.check_id is PrerequisiteCheckId.REPLICA_IDENTITY_COVERS_KEY]
+    assert len(rows) == 1 and rows[0].not_checked is True
+    assert rows[0].status is PrerequisiteStatus.SKIP and rows[0].target == "app.orders"

@@ -1157,16 +1157,33 @@ def _rollup_category_status(
         for r in results
     ):
         return PrerequisiteStatus.WARN
-    if any(r.status is PrerequisiteStatus.INFO for r in results):
+    # A not-checked SKIP (the source was unreachable) is never green: the section reads
+    # calm INFO, as the unmeasured rows it replaces did. A mode SKIP beside passes is PASS.
+    if any(
+        r.status is PrerequisiteStatus.INFO
+        or (r.status is PrerequisiteStatus.SKIP and getattr(r, "not_checked", False))
+        for r in results
+    ):
         return PrerequisiteStatus.INFO
     return PrerequisiteStatus.PASS
 
 
 def _category_summary(results: Sequence[PrerequisiteResult]) -> str:
-    """Return a short per-status count line for a category (e.g. ``1 failed · 2 passed``)."""
+    """Return a short per-status count line for a category (e.g. ``1 failed · 2 passed``).
+
+    A SKIP that stands in for a check NOT RUN because the source was unreachable
+    (``not_checked``) counts as "not checked", never as "skipped": an all-SKIP Source
+    Configuration group read "Not applicable for this mode" for checks that very much
+    apply, they just could not be asked.
+    """
     total = len(results)
     skipped = sum(1 for r in results if r.status is PrerequisiteStatus.SKIP)
-    if total and skipped == total:
+    not_checked = sum(
+        1
+        for r in results
+        if r.status is PrerequisiteStatus.SKIP and getattr(r, "not_checked", False)
+    )
+    if total and skipped == total and not not_checked:
         return "Not applicable for this mode"
     counts = (
         (PrerequisiteStatus.FAIL, "failed"),
@@ -1181,6 +1198,10 @@ def _category_summary(results: Sequence[PrerequisiteResult]) -> str:
     parts: list[str] = []
     for status, label in counts:
         n = sum(1 for r in results if r.status is status)
+        if status is PrerequisiteStatus.SKIP:
+            if not_checked:
+                parts.append(f"{not_checked} not checked")
+            n -= not_checked
         if not n:
             continue
         if label in _pluralize and n != 1:
@@ -3485,6 +3506,52 @@ def stale_error_notice(
     )
 
 
+def prereq_connection_block(session) -> Optional[tuple[str, str, str]]:
+    """``(header, body, short)`` while a connection is unverified in this session, else None.
+
+    The prerequisite checks used to run whenever a source and target CONFIG existed. A
+    restored session has both (the restore re-creates them) but not the source password,
+    which is kept in memory only (Property 7) -- so after a restart or redeploy the checks
+    ran password-less, and every source check came back as a confident false verdict. An
+    edited but untested connection is the same hazard the other way round: the session
+    still holds the LAST TESTED values, so the checks would quietly test a connection the
+    screen no longer shows.
+
+    Keys on the per-side verified flags (a passed test in THIS session), the same signal
+    as Validation, Reload, Check sizes and Change & reload. Not ``workflow_unlocked()``
+    (a sticky latch the restore sets again) and not ``has_source()`` (a config exists).
+    ``short`` is the disabled button's tooltip and the click-time refusal. Pure.
+    """
+    missing = [
+        side
+        for side, verified in (
+            ("source", getattr(session, "source_verified", False)),
+            ("target", getattr(session, "target_verified", False)),
+        )
+        if not verified
+    ]
+    if not missing:
+        return None
+    names = " and ".join(missing)
+    plural = len(missing) > 1
+    noun = "connections" if plural else "connection"
+    header = "Reconnect first to run the prerequisite checks"
+    # The memory-only reason is the source's alone: the target signs in with IAM tokens.
+    why = (
+        "The source password is kept in memory only, so an app restart or redeploy "
+        "clears it. "
+        if "source" in missing
+        else ""
+    )
+    body = (
+        f"The {names} {noun} {'are' if plural else 'is'} not verified right now. {why}"
+        "Editing a connection, or a failed test, clears its verification. Test "
+        f"{'them' if plural else 'it'} on the Connect step, then run the checks here."
+    )
+    short = f"Reconnect first: test the {names} {noun} on the Connect step."
+    return header, body, short
+
+
 def should_pin_cdc_substep(
     *,
     migration_type: MigrationType,
@@ -3877,6 +3944,8 @@ def cdc_prerequisite_block_reason(
     checked only in ``MigrationMode.CDC``:
 
     * the report exists (the CDC-mode checks have actually run), and
+    * the source was reachable -- otherwise the checker ran none of the source checks,
+      so the reason given is the reachability failure, not their not-checked rows, and
     * the engine's change-stream check passed -- ``BINLOG_ROW_FORMAT`` for MySQL
       (Debezium cannot read a ``STATEMENT``/``MIXED`` binlog, nor reconstruct rows
       without ``binlog_row_image=FULL``), or ``WAL_LEVEL_LOGICAL`` for PostgreSQL
@@ -3932,6 +4001,25 @@ def cdc_prerequisite_block_reason(
             "PostgreSQL: wal_level=logical and the replication objects) before any "
             "billable infrastructure is created."
         )
+    # An unreachable source comes FIRST. The checker then reports the change-stream check
+    # as not checked (SKIP), and the stream branch below would read that as "not passed"
+    # and send the operator to change a parameter group and reboot a source that may
+    # already be configured correctly. The reachability row says what is actually wrong.
+    reach = next(
+        (
+            r
+            for r in report.results
+            if r.check_id is PrerequisiteCheckId.SOURCE_REACHABLE
+        ),
+        None,
+    )
+    if reach is not None and reach.status is PrerequisiteStatus.FAIL:
+        parts = [
+            f"{reach.title} failed.",
+            (reach.detail or "").strip(),
+            (reach.remediation or "").strip(),
+        ]
+        return " ".join(p for p in parts if p)
     # The "CDC possible at all" source check differs by engine: MySQL needs the binary
     # log in ROW format with a FULL row image (BINLOG_ROW_FORMAT); PostgreSQL needs
     # wal_level=logical (WAL_LEVEL_LOGICAL). A report carries only its own engine's

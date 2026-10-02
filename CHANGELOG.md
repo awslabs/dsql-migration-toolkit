@@ -5,6 +5,13 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.563
+
+### Fixed
+
+- **The prerequisite checks no longer run against a connection that is not verified.** After an app restart or redeploy (the source password is kept in memory only), or after a connection is edited, the "Check … prerequisites" button and both PostgreSQL gapless routes are disabled under an amber "Reconnect first" notice until the connection is tested again on the Connect step.
+- **An unreachable source no longer produces misleading source results.** Only "Source database is reachable" fails; every check that needs the source is listed as "Not checked" instead of failing or passing, and its section is no longer shown green.
+
 ## v0.1.562
 
 Column and table exclusion, rebuilt: an excluded column now migrates as **NULL** on Aurora DSQL (0.1.561 left it to the target DEFAULT), chosen with one rules popup and applied the same way by Full Load, Start CDC, Validation and Cut over. Full guide: [Excluding tables and columns](docs/manual/en/13-excluding-tables-and-columns.md).

@@ -25,6 +25,12 @@ Mode coverage:
   ``MSK_CONNECT_AVAILABLE``) are reported as ``SKIP``.
 - ``CDC`` runs the common checks plus the CDC-only checks.
 
+An unreachable source short-circuits every source-dependent check: when
+``SOURCE_REACHABLE`` fails, the source is not probed again and each check that would
+have read it is reported as a ``SKIP`` with ``not_checked`` set
+(:data:`SOURCE_NOT_CHECKED_DETAIL`), never as a ``FAIL``/``INFO`` derived from a
+failed read. The target, MSK and inventory-only checks still run.
+
 Credential confidentiality (Property 7): probe results and remediation strings
 never include credential or token values.
 """
@@ -147,12 +153,23 @@ class MskProbe(Protocol):
 # ---------------------------------------------------------------------------
 
 
+_SOURCE_REACHABLE_TITLE = "Source database is reachable"
+
+# The detail of every source-dependent row the checker did not run because the source
+# could not be reached. Names the reachability row by its own title, so the two cannot
+# drift apart.
+SOURCE_NOT_CHECKED_DETAIL = (
+    "Not checked: the source database could not be reached. "
+    f'Fix "{_SOURCE_REACHABLE_TITLE}" first.'
+)
+
+
 def check_source_reachable(result: ConnectionResult) -> PrerequisiteResult:
     """PASS when the source connection check succeeded."""
     ok = result.success
     return PrerequisiteResult(
         check_id=PrerequisiteCheckId.SOURCE_REACHABLE,
-        title="Source database is reachable",
+        title=_SOURCE_REACHABLE_TITLE,
         status=PrerequisiteStatus.PASS if ok else PrerequisiteStatus.FAIL,
         required=True,
         detail="Connected to the source." if ok else "Could not connect to the source.",
@@ -990,6 +1007,32 @@ def _skipped(
     )
 
 
+def _not_checked(result: PrerequisiteResult) -> PrerequisiteResult:
+    """Re-cast a source check's row as "not checked" because the source was unreachable.
+
+    ``result`` is that check's OWN row built from a neutral input (e.g.
+    ``check_binlog_row_format({})``), so the check id, title and target come from the
+    check itself and no title is written down twice (the PostgreSQL rows are the Full
+    Load preview's, which, like every SKIP, carry a placeholder required=True; a SKIP
+    never gates). Everything the failed
+    read would have claimed goes: the status becomes SKIP (which never gates; the
+    SOURCE_REACHABLE FAIL already blocks the report), the remediation is dropped, and no
+    measurement is carried. A copy, so a shared row (the PostgreSQL preview) is never
+    mutated.
+    """
+    return result.model_copy(
+        update={
+            "status": PrerequisiteStatus.SKIP,
+            "detail": SOURCE_NOT_CHECKED_DETAIL,
+            "remediation": "",
+            "measured": None,
+            "measured_limits": None,
+            "resolvable_by_resnapshot": False,
+            "not_checked": True,
+        }
+    )
+
+
 class PrerequisiteChecker:
     """Runs the prerequisite gate for a mode over the selected tables.
 
@@ -1098,28 +1141,51 @@ class PrerequisiteChecker:
         candidates to ask the per-value size question about. Supplied by the caller
         because the helper that identifies them lives in the UI layer; omitted => the
         size check is not run at all (no row in the report).
+
+        An unreachable source (``SOURCE_REACHABLE`` FAIL) is not probed again: every
+        check that would have read it is reported as a not-checked ``SKIP`` (see
+        :func:`_not_checked`), while the target, MSK and inventory-only checks still run.
+        A row that is SKIP because of the mode stays "not applicable"; that needs no
+        source. The report stays blocked by the reachability FAIL itself.
         """
         exclusions = excluded_columns or {}
         results: list[Optional[PrerequisiteResult]] = []
 
-        # Source-side checks
-        results.append(check_source_reachable(self._source.reachable()))
-        grants = self._source.grants()
-        results.append(
-            check_replication_grants(
-                grants,
-                request.mode,
-                source_type=request.source_type,
+        # Source-side checks. Reachability is asked ONCE and decides whether the source is
+        # read at all. Every other probe turns a failed read into a "not satisfied" value
+        # ([] grants, {} variables, None facts), so probing an unreachable source graded a
+        # fully privileged ROW/FULL/GTID source as missing every privilege and setting --
+        # false FAILs beside the one true one, each with a remediation to follow.
+        source_check = self._source.reachable()
+        results.append(check_source_reachable(source_check))
+        source_ok = source_check.success
+        if source_ok:
+            grants = self._source.grants()
+            results.append(
+                check_replication_grants(
+                    grants,
+                    request.mode,
+                    source_type=request.source_type,
+                )
             )
-        )
-        # Non-blocking notice: a db-/table-scoped SELECT grant means introspection's
-        # privilege-filtered object listing may silently omit objects the user cannot
-        # see. Only added when the grant is actually scoped (None otherwise).
-        scope_notice = check_select_grant_scope(
-            grants, source_type=request.source_type
-        )
-        if scope_notice is not None:
-            results.append(scope_notice)
+            # Non-blocking notice: a db-/table-scoped SELECT grant means introspection's
+            # privilege-filtered object listing may silently omit objects the user cannot
+            # see. Only added when the grant is actually scoped (None otherwise).
+            scope_notice = check_select_grant_scope(
+                grants, source_type=request.source_type
+            )
+            if scope_notice is not None:
+                results.append(scope_notice)
+        else:
+            # The scope notice is conditional on what the grants say, so with no grants
+            # read it is simply absent rather than a not-checked row of its own.
+            results.append(
+                _not_checked(
+                    check_replication_grants(
+                        [], request.mode, source_type=request.source_type
+                    )
+                )
+            )
 
         # Per-table checks. Filter each table through the migration-wide LOB
         # exclusion so the pre-load gate sees the columns the load will actually
@@ -1151,19 +1217,29 @@ class PrerequisiteChecker:
             )
             if lob_columns:
                 _limit_types = (lob_limit_types or {}).get(table.name) or {}
-                results.append(
-                    check_source_value_size(
-                        table,
-                        lob_columns,
-                        self._probe_oversized_values(
-                            table.name,
+                if source_ok:
+                    results.append(
+                        check_source_value_size(
+                            table,
                             lob_columns,
-                            {c.name: (c.mysql_type or "") for c in table.columns},
+                            self._probe_oversized_values(
+                                table.name,
+                                lob_columns,
+                                {c.name: (c.mysql_type or "") for c in table.columns},
+                                limit_types=_limit_types,
+                            ),
                             limit_types=_limit_types,
-                        ),
-                        limit_types=_limit_types,
+                        )
                     )
-                )
+                else:
+                    # A row-data read; with no source there is nothing to measure.
+                    results.append(
+                        _not_checked(
+                            check_source_value_size(
+                                table, lob_columns, None, limit_types=_limit_types
+                            )
+                        )
+                    )
 
         # Target-side checks
         results.append(check_target_dsql_reachable(self._target.reachable()))
@@ -1199,47 +1275,84 @@ class PrerequisiteChecker:
             # checks do not apply and are SKIP.
             from dsql_migrator.core import prerequisites_postgres
 
-            # Derive the object names ONLY when the run must find them, so a
-            # Full-load-+-CDC probe stays byte-identical (it reads no existence facts and
-            # the existence check SKIPs).
-            _pub_name = _slot_name = ""
-            if not request.provisions_replication and request.cdc_stack_name:
-                from dsql_migrator.core import cdc_pg_slot as _pg_names
-
-                _pub_name = _pg_names.pg_publication_name(request.cdc_stack_name)
-                _slot_name = _pg_names.pg_slot_name(request.cdc_stack_name)
-            facts = self._source.cdc_prerequisites(
-                [table.name for table in tables],
-                publication_name=_pub_name,
-                slot_name=_slot_name,
-            )
-            # ``facts`` full of Nones is NOT "partially known" -- it is a source whose
-            # readiness was never verified, and it used to slip past this gate because the
-            # object itself was not None: every check degraded to a non-blocking INFO and
-            # the report proceeded. Treated the same as no facts at all.
-            if facts is not None and prerequisites_postgres.postgres_cdc_facts_are_unverified(
-                facts
-            ):
-                facts = None
-            if facts is None:
-                # For a PostgreSQL source the probe returns facts unless it FAILED
-                # (unreachable / insufficient privilege). CDC must not start against a
-                # source whose logical-replication readiness is unverified, so this is a
-                # blocking FAIL -- not the advisory not-supported INFO.
-                results.append(
-                    prerequisites_postgres.check_postgres_cdc_facts_unavailable()
-                )
-            else:
-                results.extend(
-                    prerequisites_postgres.check_postgres_cdc_prerequisites(
-                        facts,
-                        [effective[table.name] for table in tables],
-                        provisions_replication=request.provisions_replication,
-                        cdc_start_resnapshots=request.cdc_start_resnapshots,
-                        message_key_columns=request.message_key_columns,
-                        excluded_columns=exclusions,
+            if not source_ok:
+                # No facts can be read, so each readiness check is listed once as not
+                # checked, under the same ids and titles as the Full Load preview (one
+                # row per check, not per table). Not the blocking "could not be
+                # verified" FAIL below: that one is for a source that answered but whose
+                # facts did not come back, and here the reachability FAIL already blocks.
+                for row in prerequisites_postgres.postgres_cdc_prerequisites_skipped():
+                    if (
+                        request.provisions_replication
+                        and row.check_id is PrerequisiteCheckId.CDC_REPLICATION_OBJECTS
+                    ):
+                        # Not graded in a provisioning run whether or not the source
+                        # answers: its own SKIP reads no fact, so it stays as it is.
+                        results.append(
+                            prerequisites_postgres.check_cdc_replication_objects(
+                                prerequisites_postgres.PostgresCdcFacts(), [],
+                                provisions_replication=True,
+                            )
+                        )
+                    else:
+                        results.append(_not_checked(row))
+                # Whether a re-keyed table needs its before-image check is known from the
+                # request and the inventory alone, so it is listed (not checked) too.
+                # Built from an identity 'd' fact so the check returns its own row.
+                _keys = dict(request.message_key_columns or {})
+                for table in tables:
+                    _covers = prerequisites_postgres.check_replica_identity_covers_key(
+                        effective[table.name],
+                        prerequisites_postgres.PostgresCdcFacts(
+                            replica_identity={table.name: "d"}),
+                        _keys.get(table.name) or (),
                     )
+                    if _covers is not None:
+                        results.append(_not_checked(_covers))
+            else:
+                # Derive the object names ONLY when the run must find them, so a
+                # Full-load-+-CDC probe stays byte-identical (it reads no existence facts
+                # and the existence check SKIPs).
+                _pub_name = _slot_name = ""
+                if not request.provisions_replication and request.cdc_stack_name:
+                    from dsql_migrator.core import cdc_pg_slot as _pg_names
+
+                    _pub_name = _pg_names.pg_publication_name(request.cdc_stack_name)
+                    _slot_name = _pg_names.pg_slot_name(request.cdc_stack_name)
+                facts = self._source.cdc_prerequisites(
+                    [table.name for table in tables],
+                    publication_name=_pub_name,
+                    slot_name=_slot_name,
                 )
+                # ``facts`` full of Nones is NOT "partially known" -- it is a source whose
+                # readiness was never verified, and it used to slip past this gate because
+                # the object itself was not None: every check degraded to a non-blocking
+                # INFO and the report proceeded. Treated the same as no facts at all.
+                if (
+                    facts is not None
+                    and prerequisites_postgres.postgres_cdc_facts_are_unverified(facts)
+                ):
+                    facts = None
+                if facts is None:
+                    # For a PostgreSQL source the probe returns facts unless it FAILED
+                    # (insufficient privilege, or a source lost after the reachability
+                    # check). CDC must not start against a source whose logical-replication
+                    # readiness is unverified, so this is a blocking FAIL -- not the
+                    # advisory not-supported INFO.
+                    results.append(
+                        prerequisites_postgres.check_postgres_cdc_facts_unavailable()
+                    )
+                else:
+                    results.extend(
+                        prerequisites_postgres.check_postgres_cdc_prerequisites(
+                            facts,
+                            [effective[table.name] for table in tables],
+                            provisions_replication=request.provisions_replication,
+                            cdc_start_resnapshots=request.cdc_start_resnapshots,
+                            message_key_columns=request.message_key_columns,
+                            excluded_columns=exclusions,
+                        )
+                    )
             # MySQL's binlog/GTID rows are NOT listed for a PostgreSQL source, in either
             # mode. They were kept as SKIPs to satisfy a mode-symmetry rule (a check id
             # present in the weaker mode but absent in the stronger one reads as an
@@ -1261,10 +1374,22 @@ class PrerequisiteChecker:
                 )
             )
         elif request.mode == MigrationMode.CDC:
-            variables = self._source.variables()
-            results.append(check_binlog_row_format(variables))
-            results.append(check_binlog_retention(variables))
-            results.append(check_gtid_mode(variables))
+            if source_ok:
+                variables = self._source.variables()
+                results.append(check_binlog_row_format(variables))
+                results.append(check_binlog_retention(variables))
+                results.append(check_gtid_mode(variables))
+            else:
+                # The three rows one variables() read would have graded, built from an
+                # empty read so each keeps its own title and required flag.
+                results.extend(
+                    _not_checked(row)
+                    for row in (
+                        check_binlog_row_format({}),
+                        check_binlog_retention({}),
+                        check_gtid_mode({}),
+                    )
+                )
             results.append(
                 check_msk_available(
                     self._msk.cluster_available() if self._msk else False
@@ -1336,6 +1461,7 @@ __all__ = [
     "TargetProbe",
     "MskProbe",
     "PrerequisiteChecker",
+    "SOURCE_NOT_CHECKED_DETAIL",
     "check_source_reachable",
     "check_replication_grants",
     "check_select_grant_scope",
