@@ -1765,7 +1765,10 @@ def _fetch_cdc_status(migration_state, tables=None):
         # finish time, so it must never claim more than the read can have seen.
         _started = datetime.now(timezone.utc)
         try:
-            dlq_errors = list(reader(_group, **_dlq_read_kwargs(migration_state)) or [])
+            # One instant for both clocks (see read_cdc_dlq_once).
+            dlq_errors = list(
+                reader(_group, now=_started, **_dlq_read_kwargs(migration_state)) or []
+            )
         except Exception as exc:  # noqa: BLE001 - advisory, keep status even if logs fail
             dlq_errors = []
             from dsql_migrator.core.cdc_dlq import CdcDlqReadRecord
@@ -2559,8 +2562,12 @@ def read_cdc_dlq_once(migration_state, session) -> tuple:
                 except Exception:  # noqa: BLE001 - a read-only double: just not kept
                     pass
         started = datetime.now(timezone.utc)  # just before the read itself
+        # The SAME instant drives the controller's clock, so a continuation's recorded first
+        # call (ms) can never land after this record's start: two clocks a millisecond apart
+        # made a continued read's start differ from the read it continued.
         errors = list(
-            controller.dlq_errors(group, **_dlq_read_kwargs(migration_state)) or []
+            controller.dlq_errors(group, now=started, **_dlq_read_kwargs(migration_state))
+            or []
         )
         record = _dlq_read_record(controller, group, started) or _failed(
             "ReadStateUnavailable"

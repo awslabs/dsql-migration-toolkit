@@ -29804,7 +29804,9 @@ def test_the_poll_records_what_its_read_proved_and_publishes_it_after_the_fold(
     fetched = _fetch_cdc_status(state)
     _statuses, _health, dlq_errors, _ops, _lag, _series = fetched  # still a 6-tuple
     assert [e.table for e in dlq_errors] == ["shop.orders"]
-    assert ctl.kwargs == [{}]  # no CDC start known: the reader's default window
+    # No CDC start known: the reader's default window (only the shared clock instant).
+    assert [{k: v for k, v in kw.items() if k != "now"} for kw in ctl.kwargs] == [{}]
+    assert all(isinstance(kw.get("now"), datetime) for kw in ctl.kwargs)
     pending = state.cdc_dlq_pending_read
     assert pending is not None and pending.ok and pending.complete
     assert pending.history_start_ms == 123 and pending.log_group == "/msk-connect/dsql-cdc-stack-cdc"
@@ -30780,3 +30782,15 @@ def test_check_again_is_single_flight_with_the_polls_read(monkeypatch) -> None:
     assert any("disable" in p for p in check.props_seen)
     assert asyncio.run(probe_replica_identity_now(session, state)) is False
     assert calls == [] and state.cdc_replica_identity_probe_running is True
+
+
+def test_both_dlq_read_paths_drive_the_controller_with_the_records_own_start() -> None:
+    """A continued read's start must equal the read it continued: the record's start and
+    the controller's clock are ONE instant, never two clocks a millisecond apart."""
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_status as st
+
+    source = inspect.getsource(st)
+    assert "controller.dlq_errors(group, now=started," in source
+    assert "reader(_group, now=_started," in source
