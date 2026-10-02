@@ -65,8 +65,10 @@ CDC replicates **row-level data changes** (insert / update / delete). It does
 The DSQL target schema is fixed when the **Schema Conversion** step runs. **If you
 change the source schema while CDC is running**, apply the equivalent DDL to DSQL
 yourself (via Schema Conversion) **first**. Until you do, rows that no longer
-match the target shape (e.g. referencing a new column) are isolated to the **DLQ**
-rather than lost — visible, not silent.
+match the target shape (e.g. referencing a new column) are dead-lettered to the
+**DLQ** and never retried — visible, but they must be repaired, and Cut over stays
+locked until each such table passes a CHECKSUM after its last dead-lettered record
+([§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over)).
 
 ### Detecting and handling source schema drift
 
@@ -75,9 +77,10 @@ indicate the source shape changed, the tool **classifies the drift** by SQLSTATE
 (added column / dropped column / type change) and shows a **"Source schema change
 detected"** banner on the CDC step. For the common case — a source **`ADD COLUMN`** —
 it offers a **"Fix target schema…"** action that shows the exact `ALTER TABLE … ADD
-COLUMN` statements and applies them (one DDL per transaction); CDC then resumes and
-you use the per-table **Reload** to backfill the rows that were set aside while the
-column was missing. Drop-column / type-change drifts are surfaced for you to resolve
+COLUMN` statements and applies them (one DDL per transaction); CDC then resumes. To
+backfill the rows that were set aside while the column was missing, re-run Step 1
+(Evaluation), Stop CDC, reload the table with **Drop & reload**, Start CDC, then
+re-check it in Validation (CHECKSUM is automatic for it). Drop-column / type-change drifts are surfaced for you to resolve
 by hand (the tool never drops target data automatically).
 
 ---
@@ -282,7 +285,9 @@ An interactive **DLQ inspector** lists dead-lettered records — **Time / Table 
 SQLSTATE / Reason** — paged and filterable, with a per-table breakdown and a depth
 badge, so you can triage poison rows without leaving the UI. **"Download CDC error
 log"** exports them as NDJSON. (The reason carries the SQL template, never row
-values — see §4.5.)
+values — see §4.5.) The record list lives in memory and is not kept across an app
+restart; the per-table count, latest time and drift kinds are, and they are what Cut
+over checks ([§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over)).
 
 ---
 

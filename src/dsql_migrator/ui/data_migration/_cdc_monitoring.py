@@ -1045,14 +1045,23 @@ def _render_cdc_live_monitoring(
         # happens back on the loop after the fetch returns.
         from nicegui import run
 
+        from dsql_migrator.ui.data_migration._cdc_status import land_detached
+
         # Scope the scan-free net-rows metric read to the migrated table set.
         tables = _migration_status_tables(migration_state, job_manager)
-        try:
-            fetched = await run.io_bound(_fetch_cdc_status, migration_state, tables)
-        except Exception:  # noqa: BLE001 - keep the last good view on any error
-            fetched = None
-        if fetched is not None:
-            _apply_cdc_status(migration_state, fetched)
+
+        async def _fetch_and_land() -> None:
+            # Detached from this timer (see land_detached): the worker has already moved
+            # the DLQ cursor past the dead letters it read, so a poll cancelled by a refresh
+            # or a step change must still fold them -- the cut-over gate counts on it.
+            try:
+                fetched = await run.io_bound(_fetch_cdc_status, migration_state, tables)
+            except Exception:  # noqa: BLE001 - keep the last good view on any error
+                fetched = None
+            if fetched is not None:
+                _apply_cdc_status(migration_state, fetched)
+
+        await land_detached(_fetch_and_land)
         _update_lag_chart()  # persistent chart: update in place (no flicker)
         _cdc_live.refresh()  # connector health / change flow / DLQ (text) redraw
 
@@ -1694,7 +1703,8 @@ def _render_cdc_schema_drift_banner(
         # Not a schema change, so it must not be announced as one -- and the direction is the
         # reverse of every other kind (extra rows on the target, not missing ones). Stays
         # `warning` by the design system's calibration: real, but the stream keeps running and
-        # the cut-over gate already blocks on Validation's verdict.
+        # the cut-over gate already blocks on Validation's verdict -- and also holds each
+        # dead-lettered table until a CHECKSUM comparison started after its last record.
         _header = "Source TRUNCATE was not replicated"
     else:
         _header = "Source schema change detected"
@@ -2148,15 +2158,16 @@ def _render_cdc_dlq_breakdown(ui, status_view: LoadStatusView) -> None:
             ui.badge(f"{table} ×{count}").props("color=grey-7 outline")  # type: ignore[attr-defined]
     # WHAT TO DO with a quarantine, and where the answer actually lives. The dead-letter
     # record says a row was dropped; only Validation says what the TARGET is missing or
-    # holding as a result, per table and by primary key -- and the two surfaces were not
-    # linked at all (Validation never reads a dead-letter record, and the Full-Load-only
-    # quarantine count that feeds its "known gap" acknowledgement is not populated by CDC).
+    # holding as a result, per table and by primary key. The two are linked through the
+    # per-table dead-letter ledger (ui/cdc_dlq_gate.py): Validation compares every
+    # dead-lettered table by CHECKSUM, and Cut over stays locked until each has matched in a
+    # CHECKSUM comparison started after its last record. (The Full-Load-only quarantine count
+    # that feeds Validation's "known gap" acknowledgement is still not populated by CDC.)
     #
     # The blind spot is stated because it is wider than it looks: a quarantined UPDATE changes
-    # no row count, so RECONCILE cannot see it -- and ROW_COUNT is the DEFAULT validation mode,
-    # so on a default run nothing catches it. CHECKSUM does, except on columns it excludes
-    # (json / floating point). Telling the operator to run CHECKSUM is the difference between
-    # "verified" and "assumed".
+    # no row count, so RECONCILE cannot see it -- and ROW_COUNT is the DEFAULT validation mode.
+    # CHECKSUM does, except on the columns it cannot value-compare (json always; floating
+    # point only from a MySQL source), which the result names per table.
     #
     # "Stop CDC first" is part of the RECOVERY, not a footnote. This card is only on screen
     # while the sink is streaming (that is what fills the DLQ), and in exactly that state
@@ -2176,16 +2187,18 @@ def _render_cdc_dlq_breakdown(ui, status_view: LoadStatusView) -> None:
         icon="fact_check",
         header="Confirm the effect of these drops in Validation",
         body=(
-            "A dead-lettered record is a row the stream did NOT apply; Validation is what "
-            "shows the consequence on the target. Re-run it for the tables above and read "
-            "the record-level result: rows MISSING on the target are a dropped insert "
-            "(reload that table to backfill it), rows EXTRA on the target are a dropped "
-            "delete (a reload cannot remove it — the table must be dropped and reloaded, or "
-            "the row deleted by hand). Both repairs need Stop CDC first: while the sink is "
-            "streaming, Full Load collides with it and the drop-and-recreate option is not "
-            "offered at all. Run Validation in CHECKSUM mode: a dropped UPDATE changes no "
-            "row count, so the default row-count mode cannot see it, and even CHECKSUM skips "
-            "json and floating-point columns."
+            "A dead-lettered record is a row the stream did NOT apply, and it is never "
+            "retried; Validation is what shows the consequence on the target. Rows MISSING "
+            "on the target are a dropped insert (reload that table to backfill it); rows "
+            "EXTRA on the target are a dropped delete (a reload cannot remove it — the table "
+            "must be dropped and reloaded, or the row deleted by hand). Both repairs need "
+            "Stop CDC first: while the sink is streaming, Full Load collides with it and the "
+            "drop-and-recreate option is not offered at all. A dropped UPDATE changes no row "
+            "count, so the default row-count mode cannot see it: Validation therefore also "
+            "compares these tables by CHECKSUM, and Cut over stays locked until each has "
+            "matched in a CHECKSUM comparison that started after its last dead-lettered "
+            "record. CHECKSUM cannot value-compare json columns (nor, from a MySQL source, "
+            "floating-point ones); the result names them per table."
         ),
     )
 

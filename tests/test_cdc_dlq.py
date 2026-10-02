@@ -616,3 +616,63 @@ def test_the_postgres_source_connector_emits_truncates_and_mysql_does_not() -> N
     assert "skipped.operations: none" in pg_block
     # MySQL stays byte-identical: no skipped.operations key at all.
     assert "skipped.operations" not in mysql_block
+
+
+# ---------------------------------------------------------------------------
+# fold_dlq_ledger: the per-table dead-letter memory the cut-over gate reads
+# ---------------------------------------------------------------------------
+
+
+def test_the_ledger_counts_per_table_and_keeps_the_latest_time():
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.cdc import CdcConnectorError
+    from dsql_migrator.core.cdc_dlq import fold_dlq_ledger
+
+    early = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)
+    late = datetime(2026, 9, 1, 11, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    errors = [
+        CdcConnectorError(table="app.t", message="m1", occurred_at=late),
+        CdcConnectorError(table="app.t", message="m2", occurred_at=early),
+        CdcConnectorError(table="app.u", message="m3"),  # no time: stamped with now
+    ]
+    ledger = fold_dlq_ledger({}, errors, now=now)
+    assert ledger["app.t"].count == 2 and ledger["app.t"].last_at == late
+    assert ledger["app.u"].count == 1 and ledger["app.u"].last_at == now
+
+
+def test_the_ledger_records_drift_kinds_sorted_unique_and_oversized_values():
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.cdc import CdcConnectorError
+    from dsql_migrator.core.cdc_dlq import fold_dlq_ledger
+
+    now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    codes = ["42703", "23505", "42703", "SOURCE_TRUNCATE", "OVERSIZED_VALUE", "22001"]
+    ledger = fold_dlq_ledger(
+        {},
+        [CdcConnectorError(table="app.t", message=f"m{i}", error_code=c) for i, c in enumerate(codes)],
+        now=now,
+    )
+    assert ledger["app.t"].kinds == [
+        "add-column", "oversized-value", "source-truncate", "unique-conflict",
+    ]
+    plain = fold_dlq_ledger(
+        {}, [CdcConnectorError(table="app.v", message="x", error_code="22001")], now=now
+    )
+    assert plain["app.v"].kinds == []  # a value error is not a drift kind
+
+
+def test_the_ledger_fold_is_pure():
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.cdc import CdcConnectorError
+    from dsql_migrator.core.cdc_dlq import fold_dlq_ledger
+
+    now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    before = fold_dlq_ledger({}, [CdcConnectorError(table="app.t", message="a")], now=now)
+    snapshot = dict(before)
+    after = fold_dlq_ledger(before, [CdcConnectorError(table="app.t", message="b")], now=now)
+    assert before == snapshot and before["app.t"].count == 1
+    assert after is not before and after["app.t"].count == 2

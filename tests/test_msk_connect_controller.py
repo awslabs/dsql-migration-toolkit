@@ -897,3 +897,255 @@ def test_list_connectors_checked_separates_a_failed_read_from_an_empty_one() -> 
         "us-east-2", session=_FakeSession(_Two())
     ).list_connectors_checked()
     assert ok is True and [c["connectorName"] for c in found] == ["a", "b"]
+
+
+# ---------------------------------------------------------------------------
+# dlq_errors: what a read PROVED (read state), the cursor floor, the coverage start
+# ---------------------------------------------------------------------------
+
+
+class _LogsDouble:
+    """A logs client that honours ``startTime`` and pages by a fixed page list."""
+
+    def __init__(self, events=(), *, pages=None, error=None):
+        self.events = list(events)
+        self.pages = pages
+        self.error = error
+        self.starts: list[int] = []
+
+    def filter_log_events(self, **kwargs: Any) -> Any:
+        if self.error is not None:
+            raise self.error
+        self.starts.append(kwargs["startTime"])
+        if self.pages is not None:
+            return self.pages[min(len(self.starts) - 1, len(self.pages) - 1)]
+        return {"events": [e for e in self.events if e["timestamp"] >= kwargs["startTime"]]}
+
+
+def _dlq_line(offset: int) -> str:
+    return (
+        f"Quarantined record to DLQ (topic=dsqlcdc.shop.orders, partition=0, "
+        f"offset={offset}): apply failed (sqlstate=42804)"
+    )
+
+
+def _with_logs(logs: _LogsDouble) -> MskConnectController:
+    controller = MskConnectController("us-east-1")
+    controller._client = lambda _svc: logs  # type: ignore[assignment]
+    return controller
+
+
+def test_a_complete_empty_read_moves_the_cursor_so_a_late_return_misses_nothing() -> None:
+    """A clean stream never got a cursor, so a session reopened 8 h later read only the
+    last 6 h and every dead letter in between was lost for good."""
+    from datetime import timedelta
+
+    from dsql_migrator.core.msk_connect_controller import _DLQ_INGEST_GRACE_SECONDS
+
+    t = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    t_ms = int(t.timestamp() * 1000)
+    logs = _LogsDouble()
+    controller = _with_logs(logs)
+    assert controller.dlq_errors("/msk-connect/x-cdc", now=t) == []
+    assert controller.dlq_cursor_state()[0]["/msk-connect/x-cdc"] == (
+        t_ms - _DLQ_INGEST_GRACE_SECONDS * 1000
+    )
+    # A dead letter logged 2 h later, read 8 h later: found, because the read resumes at
+    # the cursor instead of the 6 h look-back.
+    logs.events.append(
+        {"eventId": "e1", "timestamp": t_ms + 2 * 3600 * 1000, "message": _dlq_line(7)}
+    )
+    found = controller.dlq_errors("/msk-connect/x-cdc", now=t + timedelta(hours=8))
+    assert [e.offset for e in found] == [7]
+    assert logs.starts[-1] == t_ms - _DLQ_INGEST_GRACE_SECONDS * 1000
+
+
+def test_the_cursor_never_moves_backwards_and_stays_past_the_newest_event() -> None:
+    from datetime import timedelta
+
+    t = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    t_ms = int(t.timestamp() * 1000)
+    future = t_ms + 3600 * 1000  # an event newer than the floor
+    logs = _LogsDouble([{"eventId": "e1", "timestamp": future, "message": _dlq_line(1)}])
+    controller = _with_logs(logs)
+    controller.dlq_errors("/msk-connect/x-cdc", now=t)
+    assert controller.dlq_cursor_state()[0]["/msk-connect/x-cdc"] == future + 1
+    # A later read with an EARLIER clock never rewinds it.
+    controller.dlq_errors("/msk-connect/x-cdc", now=t - timedelta(hours=1))
+    assert controller.dlq_cursor_state()[0]["/msk-connect/x-cdc"] >= future + 1
+
+
+def test_a_page_capped_read_keeps_the_old_cursor_rule() -> None:
+    page = {"events": [{"eventId": "a", "timestamp": 5, "message": _dlq_line(1)}],
+            "nextToken": "more"}
+    controller = _with_logs(_LogsDouble(pages=[page]))
+    controller.dlq_errors("/msk-connect/x-cdc", max_pages=2)
+    assert controller.dlq_cursor_state()[0]["/msk-connect/x-cdc"] == 6  # max_ts + 1 only
+    state = controller.dlq_read_state("/msk-connect/x-cdc")
+    assert state.ok is True and state.truncated is True
+
+
+def test_the_read_state_tells_a_failed_read_from_an_empty_one() -> None:
+    class _ClientError(Exception):
+        def __init__(self):
+            super().__init__("denied")
+            self.response = {"Error": {"Code": "AccessDeniedException", "Message": "x"}}
+
+    denied = _with_logs(_LogsDouble(error=_ClientError()))
+    assert denied.dlq_read_state("/msk-connect/x-cdc") is None  # before any read
+    assert denied.dlq_errors("/msk-connect/x-cdc") == []  # the pinned contract holds
+    state = denied.dlq_read_state("/msk-connect/x-cdc")
+    assert state.ok is False and state.error_code == "AccessDeniedException"
+    assert state.history_start_ms is None and state.truncated is False
+
+    other = _with_logs(_LogsDouble(error=RuntimeError("timeout")))
+    other.dlq_errors("/msk-connect/x-cdc")
+    assert other.dlq_read_state("/msk-connect/x-cdc").error_code == "RuntimeError"
+
+    fine = _with_logs(_LogsDouble())
+    fine.dlq_errors("/msk-connect/x-cdc")
+    assert fine.dlq_read_state("/msk-connect/x-cdc").ok is True
+
+
+def test_the_coverage_start_is_the_first_read_or_the_seeded_cursor() -> None:
+    t = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    t_ms = int(t.timestamp() * 1000)
+    first = _with_logs(_LogsDouble())
+    first.dlq_errors("/msk-connect/x-cdc", now=t, window_seconds=10 * 3600)
+    assert first.dlq_read_state("/msk-connect/x-cdc").history_start_ms == t_ms - 10 * 3600 * 1000
+    # A later read does not move it.
+    first.dlq_errors("/msk-connect/x-cdc", now=t)
+    assert first.dlq_read_state("/msk-connect/x-cdc").history_start_ms == t_ms - 10 * 3600 * 1000
+
+    seeded = _with_logs(_LogsDouble())
+    seeded.seed_dlq_cursor({"/msk-connect/x-cdc": 1700000000000}, {})
+    seeded.dlq_errors("/msk-connect/x-cdc", now=t)
+    assert seeded.dlq_read_state("/msk-connect/x-cdc").history_start_ms == 1700000000000
+
+
+def test_window_seconds_is_honoured_on_a_cursor_less_read() -> None:
+    t = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    logs = _LogsDouble()
+    _with_logs(logs).dlq_errors("/msk-connect/x-cdc", now=t, window_seconds=36 * 3600)
+    assert logs.starts == [int(t.timestamp() * 1000) - 36 * 3600 * 1000]
+
+
+def test_a_bare_controller_still_seeds_and_reports_no_read_state() -> None:
+    controller = MskConnectController.__new__(MskConnectController)
+    controller._dlq_cursor_ms = {}
+    controller._dlq_seen_ids = {}
+    controller.seed_dlq_cursor({"/msk-connect/a-cdc": 5}, {})
+    assert controller.dlq_cursor_state()[0] == {"/msk-connect/a-cdc": 5}
+    assert controller.dlq_read_state("/msk-connect/a-cdc") is None
+
+
+class _ScanningLogs:
+    """FilterLogEvents as AWS documents it on a busy, clean log group: each call scans a
+    bounded slice and may return an EMPTY page that still carries a nextToken. A token
+    resumes the SAME request (it must come with the same startTime)."""
+
+    def __init__(self, pages: int, events_on_page=None):
+        self.pages = pages
+        self.events_on_page = dict(events_on_page or {})
+        self.calls: list[dict] = []
+        self._requests: dict[str, int] = {}
+
+    def filter_log_events(self, **kwargs: Any) -> Any:
+        self.calls.append(dict(kwargs))
+        token = kwargs.get("nextToken")
+        if token is None:
+            index = 0
+        else:
+            start, page = token.split(":")
+            assert int(start) == kwargs["startTime"], "a token resumes its own request only"
+            index = int(page)
+        events = self.events_on_page.get(index, [])
+        if index + 1 >= self.pages:
+            return {"events": events}
+        return {"events": events, "nextToken": f"{kwargs['startTime']}:{index + 1}"}
+
+
+def test_a_page_capped_read_with_no_match_is_continued_by_the_next_read() -> None:
+    """Empty pages that still carry a token used to leave no position at all, so every
+    retry re-scanned the same first pages and a large clean stream never completed."""
+    from datetime import timedelta
+
+    t = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    t_ms = int(t.timestamp() * 1000)
+    logs = _ScanningLogs(pages=25)
+    controller = _with_logs(logs)
+    group = "/msk-connect/x-cdc"
+    controller.dlq_errors(group, now=t, window_seconds=3 * 24 * 3600)
+    first = controller.dlq_read_state(group)
+    assert first.truncated is True and first.started_ms == t_ms
+    assert controller.dlq_cursor_state()[0] == {}  # nothing matched: nowhere to move to
+    controller.dlq_errors(group, now=t + timedelta(seconds=30))
+    second = controller.dlq_read_state(group)
+    assert second.truncated is False  # the second read CONTINUED and reached the end
+    resumed = logs.calls[20]
+    assert resumed["nextToken"] is not None and resumed["startTime"] == t_ms - 3 * 24 * 3600 * 1000
+    assert len(logs.calls) == 25  # never the same pages twice
+    # The coverage starts where the continued read started, and "now" for the cursor is
+    # when that read BEGAN: a line ingested while it was continuing is read next time.
+    assert second.history_start_ms == t_ms - 3 * 24 * 3600 * 1000
+    assert second.started_ms == t_ms
+    from dsql_migrator.core.msk_connect_controller import _DLQ_INGEST_GRACE_SECONDS
+
+    assert controller.dlq_cursor_state()[0][group] == t_ms - _DLQ_INGEST_GRACE_SECONDS * 1000
+
+
+def test_a_dead_letter_on_a_not_yet_scanned_page_is_still_found() -> None:
+    line = {"eventId": "late", "timestamp": 1_000, "message": _dlq_line(9)}
+    logs = _ScanningLogs(pages=30, events_on_page={27: [line]})
+    controller = _with_logs(logs)
+    group = "/msk-connect/x-cdc"
+    assert controller.dlq_errors(group) == []
+    found = controller.dlq_errors(group)
+    assert [e.offset for e in found] == [9]
+    assert controller.dlq_read_state(group).truncated is False
+
+
+def test_a_seeded_cursor_after_a_long_gap_progresses_too() -> None:
+    controller = _with_logs(_ScanningLogs(pages=45))
+    group = "/msk-connect/x-cdc"
+    controller.seed_dlq_cursor({group: 1_700_000_000_000}, {})
+    states = []
+    for _ in range(3):
+        controller.dlq_errors(group)
+        states.append(controller.dlq_read_state(group).truncated)
+    assert states == [True, True, False]
+    # The cursor never moved backwards (nor crept 1 ms per capped read).
+    assert controller.dlq_cursor_state()[0][group] >= 1_700_000_000_000
+
+
+def test_a_stale_or_rejected_continuation_restarts_from_the_cursor() -> None:
+    from datetime import timedelta
+
+    from dsql_migrator.core.msk_connect_controller import _DLQ_RESUME_MAX_AGE_SECONDS
+
+    t = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    logs = _ScanningLogs(pages=25)
+    controller = _with_logs(logs)
+    group = "/msk-connect/x-cdc"
+    controller.dlq_errors(group, now=t)
+    later = t + timedelta(seconds=_DLQ_RESUME_MAX_AGE_SECONDS + 1)
+    controller.dlq_errors(group, now=later)
+    assert "nextToken" not in logs.calls[20]  # too old to resume: a fresh read
+    assert controller.dlq_read_state(group).started_ms == int(later.timestamp() * 1000)
+
+    class _Rejecting(_ScanningLogs):
+        def filter_log_events(self, **kwargs: Any) -> Any:
+            if kwargs.get("nextToken") and self.reject:
+                self.reject = False
+                raise RuntimeError("InvalidParameterException: the token has expired")
+            return super().filter_log_events(**kwargs)
+
+    rejecting = _Rejecting(pages=25)
+    rejecting.reject = False
+    controller = _with_logs(rejecting)
+    controller.dlq_errors(group, now=t)
+    rejecting.reject = True  # the stored continuation is refused on the next read
+    controller.dlq_errors(group, now=t + timedelta(seconds=5))
+    state = controller.dlq_read_state(group)
+    assert state.ok is True  # the rejected token fell back to a fresh read, not a failure
+    assert "nextToken" not in rejecting.calls[20]  # the rejected call raised before recording

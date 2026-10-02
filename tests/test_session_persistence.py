@@ -1870,3 +1870,147 @@ def test_the_stored_format_is_unchanged_and_a_save_does_not_mark_the_ledger() ->
     snap = _snap(state)
     assert snap.cdc_lob_exclusions == ["shop.a:note"]
     assert snap.overlay_ledger_in_use is False
+
+
+# ---------------------------------------------------------------------------
+# G1: the CDC dead-letter gate's memory survives a restart -- and an older snapshot
+# without it restores as UNPROVEN, never as resolved
+# ---------------------------------------------------------------------------
+
+
+def _g1_report():
+    from dsql_migrator.core.models import TableValidationResult, ValidationMode, ValidationReport
+
+    return ValidationReport.build(
+        mode=ValidationMode.CHECKSUM,
+        items=[TableValidationResult(table="orders", source_row_count=1, target_row_count=1,
+                                     row_count_match=True, checksum_match=True, matched=True)],
+    )
+
+
+def test_the_dead_letter_ledger_evidence_and_waiver_round_trip() -> None:
+    from dsql_migrator.core.cdc import CdcConnectorError
+    from dsql_migrator.core.cdc_dlq import CdcDlqReadRecord
+    from dsql_migrator.core.models import CdcDlqWaiver
+    from dsql_migrator.ui.validation import ValidationState
+
+    session, eval_state, conv_state, migration_state = _populated_states()
+    t = datetime(2026, 9, 1, 11, 0, tzinfo=timezone.utc)
+    migration_state.fold_cdc_dlq_ledger(
+        [CdcConnectorError(table="orders", message="DLQ offset=1: x", error_code="42703",
+                           occurred_at=t)]
+    )
+    migration_state.promote_cdc_dlq_read(CdcDlqReadRecord(
+        log_group="/msk-connect/s-cdc", started_at=t, ok=True, complete=True,
+        history_start_ms=1700000000000,
+    ))
+    vstate = ValidationState()
+    vstate._result = _g1_report()
+    vstate._completed_at = t
+    vstate._compared_run_start = t
+    vstate._compared_overrides = {"orders": datetime(2026, 9, 1, 11, 5, tzinfo=timezone.utc)}
+    vstate.cutover_dlq_waiver = CdcDlqWaiver(tables={"orders": 1}, read_problem="failed",
+                                             waived_at=t)
+    snapshot = capture_session_snapshot(
+        "s1", session, eval_state, conv_state, migration_state, vstate
+    )
+    restored_snapshot = SessionSnapshot.model_validate_json(snapshot.model_dump_json())
+    ms2, v2 = DataMigrationState(), ValidationState()
+    apply_session_snapshot(
+        restored_snapshot, SessionConnectionState(), EvaluationState(),
+        SchemaConversionState(), ms2, v2,
+    )
+    entry = ms2.cdc_dlq_ledger["orders"]
+    assert entry.count == 1 and entry.last_at == t and entry.kinds == ["add-column"]
+    assert ms2.cdc_dlq_read_from_ms == {"/msk-connect/s-cdc": 1700000000000}
+    assert ms2.cdc_dlq_last_read is None  # never persisted: a restart must read again
+    assert v2.compared_run_start == t
+    assert v2.compared_from("orders") == datetime(2026, 9, 1, 11, 5, tzinfo=timezone.utc)
+    assert v2.cutover_dlq_waiver.tables == {"orders": 1}
+    assert v2.cutover_dlq_waiver.read_problem == "failed"
+
+
+def test_an_older_snapshot_restores_the_gate_as_unproven() -> None:
+    """No ledger/evidence fields: the restored report's compare time is unknown, and a
+    restored cursor without a coverage start leaves the history unconfirmed."""
+    from datetime import timedelta
+
+    from dsql_migrator.core.cdc_dlq import CdcDlqReadRecord
+    from dsql_migrator.core.models import CdcDlqLedgerEntry
+    from dsql_migrator.ui.cdc_dlq_gate import cdc_dlq_cutover_gate
+    from dsql_migrator.ui.validation import ValidationState
+
+    old = SessionSnapshot.model_validate({
+        "session_id": "s1",
+        "validation_report": _g1_report().model_dump(mode="json"),
+        "validation_completed_at": "2026-09-01T11:40:00+00:00",
+        "cdc_dlq_cursor_ms": {"/msk-connect/s-cdc": 1788260400000},  # 2026-09-01 11:00Z
+    })
+    assert old.cdc_dlq_ledger == {} and old.validation_compared_from == {}
+    ms, v = DataMigrationState(), ValidationState()
+    apply_session_snapshot(
+        old, SessionConnectionState(), EvaluationState(), SchemaConversionState(), ms, v,
+    )
+    assert v.compared_run_start is None and v.compared_from("orders") is None
+    assert ms.cdc_dlq_read_from_ms == {}
+    t = datetime(2026, 9, 1, 11, 0, tzinfo=timezone.utc)
+    gate = cdc_dlq_cutover_gate(
+        ledger={"orders": CdcDlqLedgerEntry(count=1, last_at=t - timedelta(hours=1))},
+        cdc_in_use=True, cdc_evidence=True, check_reads=True, report=v.result,
+        release="clean", compared_run_start=v.compared_run_start,
+        compared_overrides=v.compared_overrides, evidence_at=v.completed_at,
+        log_group="/msk-connect/s-cdc",
+        # The seeded controller's first read: its coverage starts at the restored cursor.
+        last_read=CdcDlqReadRecord(log_group="/msk-connect/s-cdc",
+                                   started_at=t + timedelta(hours=2), ok=True,
+                                   complete=True, history_start_ms=1788260400000),
+        history_from_ms=1788260400000, cdc_start=t - timedelta(hours=6),
+    )
+    assert [i.reason for i in gate.issues] == ["compare-time-unknown"]
+    assert gate.read_state == "partial-history" and gate.blocks
+
+
+def test_a_new_dead_letter_or_waiver_triggers_a_save_but_the_cursor_does_not() -> None:
+    from dsql_migrator.core.cdc import CdcConnectorError
+    from dsql_migrator.core.cdc_dlq import CdcDlqReadRecord
+    from dsql_migrator.core.models import CdcDlqWaiver
+    from dsql_migrator.ui.validation import ValidationState
+
+    session, eval_state, conv_state, ms = _populated_states()
+    vstate = ValidationState()
+    vstate._result = _g1_report()
+
+    def sig():
+        return session_signature(session, eval_state, conv_state, ms, vstate)
+
+    base = sig()
+    ms.cdc_dlq_cursor_ms = {"/msk-connect/s-cdc": 5}
+    assert sig() == base  # the cursor moves every poll: never a save on its own
+    ms.fold_cdc_dlq_ledger([CdcConnectorError(table="orders", message="DLQ offset=1: x")])
+    grown = sig()
+    assert grown != base
+    ms.promote_cdc_dlq_read(CdcDlqReadRecord(
+        log_group="/msk-connect/s-cdc", started_at=datetime.now(timezone.utc), ok=True,
+        complete=True, history_start_ms=1,
+    ))
+    proven = sig()
+    assert proven != grown
+    vstate.cutover_dlq_waiver = CdcDlqWaiver(waived_at=datetime.now(timezone.utc))
+    assert sig() != proven
+
+
+def test_a_new_dead_letter_on_a_table_already_in_the_ledger_triggers_a_save() -> None:
+    """The count, not just the table set, is in the signature: otherwise a second dead
+    letter for a ledger table was never saved and a restart restored the lower count."""
+    from dsql_migrator.core.cdc import CdcConnectorError
+
+    session, eval_state, conv_state, ms = _populated_states()
+
+    def sig():
+        return session_signature(session, eval_state, conv_state, ms, None)
+
+    ms.fold_cdc_dlq_ledger([CdcConnectorError(table="orders", message="DLQ offset=1: x")])
+    one = sig()
+    ms.fold_cdc_dlq_ledger([CdcConnectorError(table="orders", message="DLQ offset=2: x")])
+    assert ms.cdc_dlq_ledger["orders"].count == 2
+    assert sig() != one

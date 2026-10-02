@@ -56,9 +56,11 @@ replication; otherwise Full Load alone is simpler and cheaper.
    converge.
 5. **Validation** — run row-count + checksum (+ reconcile before cut-over). The
    verdict is **MATCH** only when every difference is explained (drift, intentional
-   quarantine, not-yet-converged CDC).
-6. **Cut over** — once Validation is a clean MATCH, switch your application to
-   DSQL. This is the one step the tool does not perform for you; follow the
+   quarantine, not-yet-converged CDC). For a CDC migration, tables with dead-lettered
+   CDC changes are also compared by CHECKSUM automatically.
+6. **Cut over** — once Validation is a clean MATCH (and, for CDC, the dead-letter
+   check in [§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over) clears), switch
+   your application to DSQL. This is the one step the tool does not perform for you; follow the
    tailored runbook (§10.3 below).
 
 ---
@@ -70,7 +72,9 @@ MySQL and starts using Aurora DSQL. It is the one step the tool does **not** do 
 you — it proves the target is correct and gives you a gapless replication stream,
 but *when* and *how* you repoint your application is an operational decision only
 you can make. The UI shows the matching runbook on the **Cut over** step once
-Validation is a clean MATCH; below is the same guidance for each path.
+Validation is a clean MATCH (and, for CDC, the dead-letter check in
+[§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over) clears); below is the same
+guidance for each path.
 
 ### Full Load only (a short maintenance freeze)
 
@@ -100,7 +104,9 @@ freeze shrinks to just the final drain + smoke test.
    The final validation also **advances any identity / `AUTO_INCREMENT` sequence**
    past the rows CDC delivered (a *Sync identity sequences* action), so the
    application's first insert after cut-over can't collide with a migrated id
-   (`23505`).
+   (`23505`). Tables with dead-lettered CDC changes are compared by CHECKSUM
+   automatically, and Cut over re-reads the dead-letter queue before it opens (see
+   [§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over)).
 5. **Repoint the application** to the DSQL endpoint and smoke-test.
 6. **Tear the CDC pipeline down LAST** — click **Start over (top right)** →
    *Delete all CDC infrastructure*. It ends replication, stops MSK / MSK

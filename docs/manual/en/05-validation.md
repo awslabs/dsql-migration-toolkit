@@ -33,6 +33,10 @@ You don't have to run the heavy modes on everything: an option computes the
 expensive checksum/reconcile **only on tables whose counts already mismatch**, so
 count-matched tables are reported as "not deeply checked" (not as a false match).
 
+> **CDC migrations:** any table the stream dead-lettered a change for is also
+> compared by **CHECKSUM**, whatever mode you pick — a row count cannot see a missed
+> UPDATE (see 5.5).
+
 > **Reconcile applies to single-column integer PKs.** Those have a well-defined
 > ordering across both engines. Composite or non-integer PKs are skipped for the
 > reconcile pass (count/checksum still apply). On a **very large** table with a
@@ -40,12 +44,13 @@ count-matched tables are reported as "not deeply checked" (not as a false match)
 > unbounded query that can hit DSQL's ~300 s per-transaction limit (surfaced as a
 > per-table error); single-column-PK tables are keyset-paged and unaffected.
 
-> **Checksum excludes floating-point and JSON columns.** MySQL `FLOAT`/`DOUBLE` and
-> `JSON` (and their PostgreSQL equivalents `real`/`double precision` and `json`) have
-> no stable exact text form to hash identically, so they are left out of the checksum
-> and listed in the report as **"not value-compared."** On a **PostgreSQL** source,
-> `jsonb` (which has a canonical form) **is** checksummed — only plain `json` is
-> excluded — so a jsonb value drift in a non-key column is still caught. A value
+> **Checksum excludes floating-point and JSON columns from a MySQL source.** MySQL
+> `FLOAT`/`DOUBLE` and `JSON` have no exact text form that renders identically on both
+> engines, so they are left out of the checksum and listed in the report as **"not
+> value-compared."** On a **PostgreSQL** source one expression renders both ends, so
+> `real`/`double precision` **are** checksummed, and so is `jsonb` (which has a
+> canonical form) — only plain `json` is excluded — so a jsonb value drift in a
+> non-key column is still caught. A value
 > difference confined to such a **non-key** column is therefore not caught by any mode
 > (row count is unchanged by an in-place edit, and reconcile compares PK *presence*, not
 > values). Key columns and every other type are still fully compared. Column count is
@@ -115,7 +120,8 @@ The report is **exportable** so you can attach it to a cut-over decision.
 | `order_items` | 3785 | 3785 | **MATCH** |
 | `documents` | 2309 | 2306 | **investigate** |
 
-- **MATCH** on every table (and no orphans) → safe to cut over.
+- **MATCH** on every table (and no orphans) → safe to cut over (for a CDC
+  migration, once the dead-letter check in 5.5 clears).
 - A small **target deficit** is usually either (a) **drift** — the source advanced
   since the watermark (check the drift flag), or (b) **intentional** — rows that were
   quarantined (e.g. values over DSQL's 1 MiB limit). You no longer have to work out
@@ -129,7 +135,8 @@ The report is **exportable** so you can attach it to a cut-over decision.
   source value and reloading that table, or accept it as a known gap before cut over.
   (After an app restart the per-table drop counts are gone — they are not persisted —
   so the deficit is reported unexplained rather than guessed at. Cross-check the
-  **Full Load error log** / **CDC DLQ** in that case.)
+  **Full Load error log** in that case. CDC dead letters are different: the tool keeps
+  a per-table count of them across restarts, and Cut over checks it (5.5).)
 - A **target surplus** (extra PKs on the target) during CDC usually means a source
   **delete** that the stream hasn't applied yet — re-check after it converges.
 
@@ -138,7 +145,8 @@ The report is **exportable** so you can attach it to a cut-over decision.
 > Any **unexplained** missing/extra PK on a count-matched, caught-up table is what
 > Validation exists to surface.
 
-Once Validation reports a clean **MATCH** (or every difference is explained), the
+Once Validation reports a clean **MATCH** (or every difference is explained) — and,
+for a CDC migration, the dead-letter check in 5.5 clears — the
 final workflow step — **Cut over** — appears in the UI with the runbook for
 switching your application from the source database (RDS/Aurora MySQL or PostgreSQL)
 to DSQL. See the recommended end-to-end flow
@@ -154,6 +162,76 @@ Full-Load freeze) and the rollback anchor.
 > cut-over). See [`scripts/README.md`](../../../scripts/README.md). This built-in
 > Validation step remains the authoritative go/no-go (it also runs checksums and
 > drift attribution).
+
+---
+
+## 5.5 CDC dead letters and cut over
+
+A **dead letter** is a change the CDC stream set aside because Aurora DSQL rejected it
+(for example after a source schema change). It is **never retried**. A later full-row
+update of the same row heals it, but a row that is never touched again stays missing
+or stale, and a lost DELETE leaves an extra row on the target. A missed UPDATE changes
+no row count, so the default row-count mode cannot see it.
+
+So for a CDC migration (**Full Load + CDC** or **CDC only**) the tool keeps a
+**per-table count** of dead letters (with the latest time and the drift kinds), and
+Validation and Cut over use it:
+
+- **Validation compares those tables by CHECKSUM automatically.** Whatever mode you
+  pick, a run also re-compares every dead-lettered table that matched without a value
+  comparison (the Options show which tables before you run). If a dead letter arrives
+  later, the report says *"Tables match — cut over waits for a CHECKSUM re-check of N
+  table(s)"* and offers **Re-check N table(s) with CHECKSUM**. If the dead-letter history
+  cannot be confirmed (below), the report says *"Tables match — cut over waits for one
+  CHECKSUM run of every table"* instead, and the Options say so before you run: one run
+  in CHECKSUM mode with Fast sweep off clears it.
+- **Cut over opens only when all of the following hold:**
+  1. each dead-lettered table matched in a CHECKSUM comparison that **started more
+     than a minute after** its latest dead-lettered record;
+  2. the tool has made a **successful, complete read** of the CDC dead-letter log in
+     CloudWatch Logs that **started after the latest validation finished**;
+  3. the history of that read reaches back to the **Full Load watermark** (or, for CDC
+     only, the CDC start).
+- **Restarts.** The per-table count, its latest time and the drift kinds survive an
+  app restart; the record list on the Data Migration step does not. After a restart,
+  Cut over re-reads the log automatically — one bounded read each time the Validation or
+  Cut over step is drawn, at most once a minute.
+
+It **fails closed**. Cut over shows a red notice instead of the runbook when:
+
+- the log cannot be read — usually a missing `logs:FilterLogEvents` permission (the
+  deployed task role covers CDC stacks named `dsql-cdc-*` or `mysql-dsql-cdc-*`; a
+  local AWS profile needs the same permission);
+- the CDC infrastructure (and with it the log group) was deleted;
+- a read stopped at its page limit.
+
+If the history cannot be confirmed — a pipeline you attached while it was already
+running, or a session saved by an earlier version of the tool — it shows an amber
+notice instead; one full CHECKSUM run of every table clears it by itself.
+
+**Check again** continues the read where it stopped: a log group too large for one
+read is read further each time. **Continue without this check** records your decision
+in the activity log; it is offered only once no table is left to re-check. It is scoped
+to the records seen so far and re-opens when a newer one arrives — except while the log
+cannot be read: the tool cannot see a newer record then, so check the stream another
+way before you repoint the application. A new validation run clears it, and it never
+overrides a Validation mismatch. A dead-lettered table whose CHECKSUM cannot finish (a
+very large table with a composite or missing primary key, see 5.1) is the one case a
+re-check cannot clear: turn it off under **Objects to validate**, re-run, and then
+acknowledge it on Cut over.
+
+CHECKSUM names the columns it cannot value-compare (5.1); for a dead-lettered table
+Cut over repeats them as a non-blocking warning.
+
+**The way forward** for a table that does not match:
+
+- **Full Load + CDC:** re-run Step 1 (Evaluation) if the source schema changed →
+  Stop CDC → reload the table with **Drop & reload** → Start CDC → re-check it.
+- **CDC only:** correct the rows on Aurora DSQL by hand (the dead-letter queue card
+  lists each record's primary key and Kafka offset) → re-check.
+
+**Full Load only** is unaffected, unless CDC ran earlier in the same session: dead
+letters recorded then still need their CHECKSUM match.
 
 ---
 

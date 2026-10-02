@@ -2008,3 +2008,22 @@ def test_estimate_age_is_cleared_when_the_source_cannot_be_read(monkeypatch) -> 
     *_counts, source_available = _cdc_status._fetch_migration_row_counts(state, session, ["t1"])
     assert source_available is False
     assert state.source_estimate_stats_at == {}
+
+
+def test_the_dlq_panel_says_cut_over_waits_for_a_checksum_after_the_last_record() -> None:
+    """G1: the card used to say Validation never reads a dead letter and named a blind spot
+    that is wrong for a PostgreSQL source (its floats ARE compared)."""
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import ErrorLogSummary
+    from dsql_migrator.ui.data_migration._cdc_monitoring import _render_cdc_dlq_breakdown
+
+    ui = _FakeUi()
+    _render_cdc_dlq_breakdown(ui, SimpleNamespace(
+        error_summary=ErrorLogSummary(total_errors=1, errors_by_table={"app.t": 1})
+    ))
+    body = " ".join(ui.texts)
+    assert "Cut over stays locked until each has matched in a CHECKSUM comparison" in body
+    assert "never retried" in body
+    assert "json and floating-point columns" not in body
+    assert "nor, from a MySQL source, floating-point ones" in body

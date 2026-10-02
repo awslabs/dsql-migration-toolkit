@@ -285,6 +285,15 @@ def capture_session_snapshot(
             ).items()
             if value is not None
         },
+        # The cut-over gate's dead-letter memory (see SessionSnapshot.cdc_dlq_ledger).
+        cdc_dlq_ledger=dict(getattr(migration_state, "cdc_dlq_ledger", None) or {}),
+        cdc_dlq_read_from_ms={
+            str(group): int(value)
+            for group, value in (
+                getattr(migration_state, "cdc_dlq_read_from_ms", None) or {}
+            ).items()
+            if value is not None
+        },
         ai_assist_enabled=bool(getattr(session.ai_assist, "enabled", False)),  # type: ignore[attr-defined]
         ai_assist_model_id=getattr(session.ai_assist, "model_id", None),  # type: ignore[attr-defined]
         ai_assist_region=getattr(session.ai_assist, "region", None),  # type: ignore[attr-defined]
@@ -337,6 +346,17 @@ def capture_session_snapshot(
             )
             snapshot.validation_rechecked_at = getattr(
                 validation_state, "rechecked_at", None
+            )
+            # The CDC dead-letter gate's evidence for this report (when each table's
+            # comparison started) and any recorded waiver.
+            snapshot.validation_run_started_at = getattr(
+                validation_state, "compared_run_start", None
+            )
+            snapshot.validation_compared_from = dict(
+                getattr(validation_state, "compared_overrides", None) or {}
+            )
+            snapshot.validation_cdc_dlq_waiver = getattr(
+                validation_state, "cutover_dlq_waiver", None
             )
     return snapshot
 
@@ -465,6 +485,9 @@ def apply_session_snapshot(
                 snapshot.validation_completed_at,
                 rechecked_tables=tuple(snapshot.validation_rechecked_tables or ()),
                 rechecked_at=snapshot.validation_rechecked_at,
+                compared_run_start=snapshot.validation_run_started_at,
+                compared_overrides=dict(snapshot.validation_compared_from or {}),
+                cdc_dlq_waiver=snapshot.validation_cdc_dlq_waiver,
             )
         # A step that reads IN_PROGRESS but has a restored report has NO live job
         # after a reconnect (the validation job id is not persisted, so it can never
@@ -688,6 +711,14 @@ def apply_session_snapshot(
     # silently loses everything older (see SessionSnapshot.cdc_dlq_cursor_ms).
     if getattr(snapshot, "cdc_dlq_cursor_ms", None):
         migration_state.cdc_dlq_cursor_ms = dict(snapshot.cdc_dlq_cursor_ms)  # type: ignore[attr-defined]
+    # ...and, with it, the dead-letter ledger and its coverage start -- also before any poll,
+    # so the cut-over gate never sees a restored cursor without the dead letters it skips.
+    if getattr(snapshot, "cdc_dlq_ledger", None) and hasattr(migration_state, "cdc_dlq_ledger"):
+        migration_state.cdc_dlq_ledger = dict(snapshot.cdc_dlq_ledger)  # type: ignore[attr-defined]
+    if getattr(snapshot, "cdc_dlq_read_from_ms", None) and hasattr(
+        migration_state, "cdc_dlq_read_from_ms"
+    ):
+        migration_state.cdc_dlq_read_from_ms = dict(snapshot.cdc_dlq_read_from_ms)  # type: ignore[attr-defined]
     if snapshot.cdc_stack_name and hasattr(migration_state, "set_cdc_stack_name"):
         migration_state.set_cdc_stack_name(snapshot.cdc_stack_name)  # type: ignore[attr-defined]
     if snapshot.cdc_infra_inputs:
@@ -923,6 +954,10 @@ def session_signature(
         # triggers a snapshot save (and a re-run that replaces it does too). Cheap:
         # a bool + timestamp, never the report itself.
         _validation_sig(validation_state),
+        # The dead-letter ledger's size and coverage start, so a NEW dead letter (or the
+        # first proven read) is saved -- together with the cursor that skips it on a
+        # restart. The cursor itself stays out: it moves every poll.
+        _cdc_dlq_sig(migration_state),
         # Schema-Conversion edits (edited DDLs, the preserve-FK toggle, ticked nodes).
         # Without this the snapshot was never written for an edit-only change, so a PK
         # strategy chosen in Step 2 -- and with it the cut-over "Sync identity sequences"
@@ -946,10 +981,25 @@ def _validation_sig(validation_state: object) -> tuple:
         return (False,)
     completed = getattr(validation_state, "completed_at", None)
     rechecked = getattr(validation_state, "rechecked_at", None)
+    waiver = getattr(validation_state, "cutover_dlq_waiver", None)
+    waived_at = getattr(waiver, "waived_at", None)
     return (
         True,
         completed.isoformat() if completed is not None else None,
         rechecked.isoformat() if rechecked is not None else None,
+        # A recorded CDC dead-letter waiver is a sign-off decision: save it.
+        waived_at.isoformat() if waived_at is not None else None,
+    )
+
+
+def _cdc_dlq_sig(migration_state: object) -> tuple:
+    """Cheap signature of the persisted dead-letter ledger (never the entries)."""
+    ledger = getattr(migration_state, "cdc_dlq_ledger", None) or {}
+    read_from = getattr(migration_state, "cdc_dlq_read_from_ms", None) or {}
+    return (
+        len(ledger),
+        sum(int(getattr(entry, "count", 0) or 0) for entry in ledger.values()),
+        tuple(sorted(read_from.items())),
     )
 
 

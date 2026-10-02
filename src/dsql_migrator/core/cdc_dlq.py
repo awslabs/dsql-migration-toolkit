@@ -31,10 +31,12 @@ per-table "Quarantined" surface.
 from __future__ import annotations
 
 import re
-from datetime import datetime
-from typing import Optional
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Iterable, Mapping, Optional
 
-from dsql_migrator.core.cdc import CdcConnectorError
+from dsql_migrator.core.cdc import CdcConnectorError, classify_schema_drift
+from dsql_migrator.core.models import CdcDlqLedgerEntry
 
 # One regex handles both the "Quarantined record to DLQ (...)" and the
 # "Dropping unapplicable record (...) ..." forms: the ``)`` before the colon is
@@ -201,3 +203,85 @@ def parse_dlq_log_message(
         offset=int(match.group("offset")),
         occurred_at=occurred_at,
     )
+
+
+# ---------------------------------------------------------------------------
+# The per-table dead-letter ledger (the cut-over gate's persisted memory)
+# ---------------------------------------------------------------------------
+
+# The ledger kind for an oversized-value quarantine. Not a SchemaDriftKind (the size guard is
+# deliberately unmapped by classify_schema_drift, see OVERSIZED_VALUE_CODE), but the cut-over
+# gate needs it: such a value can NEVER be stored, so the way forward is to exclude the column
+# or shrink the value -- a re-check alone cannot clear it.
+OVERSIZED_VALUE_KIND = "oversized-value"
+# Bound on the kind labels kept per table, so a pathological table cannot bloat the snapshot.
+# It equals today's number of kinds (the seven SchemaDriftKind values plus "oversized-value"),
+# so it is unreachable from real records and only guards against kinds added later.
+_LEDGER_MAX_KINDS = 8
+
+
+def _aware(value: Optional[datetime]) -> Optional[datetime]:
+    """A naive datetime is UTC here (every stamp in this path is); keeps comparisons safe."""
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def fold_dlq_ledger(
+    ledger: "Optional[Mapping[str, CdcDlqLedgerEntry]]",
+    errors: "Iterable[CdcConnectorError]",
+    *,
+    now: datetime,
+) -> "dict[str, CdcDlqLedgerEntry]":
+    """Return a NEW per-table ledger with ``errors`` counted in. Pure.
+
+    Per dead letter: the table's count grows by one, ``last_at`` becomes the later of the
+    stored time and the record's own ``occurred_at`` (``now`` when the record carries none,
+    the same stamp the error log uses), and the drift kind :func:`classify_schema_drift`
+    reveals -- or ``"oversized-value"`` for a size-guard quarantine -- joins the table's kind
+    set. The input mapping is never mutated, so a reader holding the previous reference
+    (a worker thread) keeps a consistent view. Memory is O(tables).
+    """
+    out: dict[str, CdcDlqLedgerEntry] = dict(ledger or {})
+    for error in errors or ():
+        table = getattr(error, "table", None)
+        if not table:
+            continue
+        previous = out.get(table)
+        stamp = _aware(getattr(error, "occurred_at", None) or now)
+        last = _aware(previous.last_at) if previous is not None else None
+        kinds = set(previous.kinds if previous is not None else ())
+        code = getattr(error, "error_code", None)
+        drift = classify_schema_drift(code)
+        if drift is not None:
+            kinds.add(drift.value)
+        if code == OVERSIZED_VALUE_CODE:
+            kinds.add(OVERSIZED_VALUE_KIND)
+        out[table] = CdcDlqLedgerEntry(
+            count=(previous.count if previous is not None else 0) + 1,
+            last_at=stamp if last is None or stamp > last else last,
+            kinds=sorted(kinds)[:_LEDGER_MAX_KINDS],
+        )
+    return out
+
+
+@dataclass(frozen=True)
+class CdcDlqReadRecord:
+    """What one dead-letter-queue read proved: when it STARTED (app clock), whether it
+    succeeded and reached the end, and how far back its history reaches.
+
+    ``ok`` False means the read failed and returned nothing -- which ``dlq_errors`` makes
+    look exactly like an empty queue, so the cut-over gate must be told. ``complete`` False
+    means it stopped at its page cap. ``history_start_ms`` is where the controller's
+    continuous coverage of the log group begins (its first successful read's start, or the
+    seeded cursor of a controller rebuilt from a saved session). ``error_code`` is a
+    value-free class (an AWS error code or an exception class name), never a message.
+    Transient: never persisted, so a restarted session always needs one fresh read.
+    """
+
+    log_group: str
+    started_at: datetime
+    ok: bool
+    complete: bool
+    error_code: Optional[str] = None
+    history_start_ms: Optional[int] = None

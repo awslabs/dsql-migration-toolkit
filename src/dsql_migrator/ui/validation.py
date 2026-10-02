@@ -57,6 +57,7 @@ from dsql_migrator.core.assessment_strategist import AssessmentStrategist
 from dsql_migrator.core.job_manager import JobManager, JobNotFoundError
 from dsql_migrator.core.models import (
     AiAssistConfig,
+    CdcDlqWaiver,
     DriftReport,
     OrphanFinding,
     SourceConnectionConfig,
@@ -81,6 +82,28 @@ from dsql_migrator.core.validator import (
 )
 from dsql_migrator.core.validator import export_report as export_validation_report
 from dsql_migrator.ui.ai_assist import ai_is_usable
+from dsql_migrator.ui.cdc_dlq_gate import (
+    READ_FAILED,
+    READ_INCOMPLETE,
+    REASON_NOT_MATCHED,
+    ack_log_clause,
+    bounded_table_names,
+    cdc_dlq_gate_for,
+    held_log_clause,
+    history_options_hint,
+    issue_lines,
+    issue_notice,
+    read_state_notice,
+    schedule_cdc_dlq_check,
+    unverifiable_notice,
+    validation_evidence_at,
+    value_verified,
+    verdict_hold,
+    verdict_resolved_suffix,
+    waived_notice,
+    waiver_log_detail,
+    way_forward_lines,
+)
 from dsql_migrator.ui.cutover_defaults import (
     CutoverDefaultsSnapshot,
     CutoverRestoreOutcome,
@@ -1324,7 +1347,10 @@ def merge_revalidated(
       report's scope would change what "all tables match" means.
     - ``mode``, ``orphan_check_performed`` and ``snapshot_timestamp`` are carried
       over unchanged -- they describe the RUN, and a re-check is required to use
-      the same options, so they still hold.
+      the same options, so they still hold. The one exception is a CDC
+      dead-lettered table, which a re-check (and the run's own extra pass) compares
+      by CHECKSUM: its item carries that checksum evidence itself, and the run-level
+      mode label can then only understate it, never overstate it.
     - ``drift`` is carried over as-is. It is a whole-source signal that a
       single-table re-check does not re-measure, so overwriting it with a fresh
       reading would silently re-date the report's drift verdict.
@@ -1389,6 +1415,9 @@ def report_run_options(report: ValidationReport) -> RunOptions:
       screen after the run, and they describe the NEXT run, not this report;
     - a restored report (re-hydrated from a session snapshot) has no remembered
       options at all, yet must still be re-checkable.
+
+    (A re-check of a table CDC dead-lettered a change for upgrades ``mode`` to CHECKSUM
+    on top of these -- see ``_recheck``.)
 
     ``reconcile`` is taken from the report's ``reconcile_requested`` flag (falling back to
     "at least one item carries a reconciliation result" for a legacy report) -- so a
@@ -1874,6 +1903,22 @@ class ValidationState:
         # restored-as-of note and persistence. Distinct from the monotonic timing
         # above (which can't be turned into a calendar time). None until finished.
         self._completed_at: Optional[datetime] = None
+        # CDC dead-letter gate evidence (ui/cdc_dlq_gate.py): when each table's comparison
+        # STARTED (app clock, UTC), stamped before the compare so it is conservative. A
+        # finish time cannot prove a table was compared after its last dead letter -- a dead
+        # letter can land mid-run -- so the gate needs the start. ``_run_started_wall`` is the
+        # current run's start (kept through mark_run_finished, which runs before
+        # set_result); ``_compared_run_start`` is the start of the run that produced the
+        # current report; ``_compared_overrides`` the per-table starts of later re-checks and
+        # of the run's automatic CHECKSUM pass. Persisted with the report.
+        self._run_started_wall: Optional[datetime] = None
+        self._compared_run_start: Optional[datetime] = None
+        self._compared_overrides: dict[str, datetime] = {}
+        self._recheck_started_wall: Optional[datetime] = None
+        # The operator's recorded decision to cut over without the full CDC dead-letter
+        # check (a core.models.CdcDlqWaiver), scoped to the state it was made on; a new
+        # verdict drops it. Persisted with the report.
+        self.cutover_dlq_waiver = None
         # True only when the current result was re-hydrated from a saved snapshot
         # (so the UI can show a "restored as-of <time>" note); a fresh run clears it.
         self._restored: bool = False
@@ -2146,6 +2191,7 @@ class ValidationState:
         with self._lock:
             self._run_started = time.monotonic()
             self._run_elapsed = None
+            self._run_started_wall = datetime.now(timezone.utc)
 
     def mark_run_finished(self) -> None:
         """Record the elapsed time + finish wall-clock time for the just-finished run."""
@@ -2169,6 +2215,23 @@ class ValidationState:
         with self._lock:
             return self._completed_at
 
+    @property
+    def compared_run_start(self) -> Optional[datetime]:
+        """UTC start of the run that produced the current report (``None``: unknown)."""
+        with self._lock:
+            return self._compared_run_start
+
+    @property
+    def compared_overrides(self) -> "dict[str, datetime]":
+        """Per-table compare starts newer than the run's (re-checks, the CHECKSUM pass)."""
+        with self._lock:
+            return dict(self._compared_overrides)
+
+    def compared_from(self, table: str) -> Optional[datetime]:
+        """When ``table``'s current result's comparison started, or ``None`` if unknown."""
+        with self._lock:
+            return self._compared_overrides.get(table) or self._compared_run_start
+
     def restore(
         self,
         report: ValidationReport,
@@ -2176,6 +2239,9 @@ class ValidationState:
         *,
         rechecked_tables: "Sequence[str]" = (),
         rechecked_at: Optional[datetime] = None,
+        compared_run_start: Optional[datetime] = None,
+        compared_overrides: "Optional[Mapping[str, datetime]]" = None,
+        cdc_dlq_waiver: object = None,
     ) -> None:
         """Re-hydrate a persisted result on reconnect (no elapsed time available).
 
@@ -2188,6 +2254,10 @@ class ValidationState:
         from the snapshot, so a restored MERGED report still discloses that those
         rows are newer than the rest of the run (both default to empty, which is
         the ordinary "one uniform run" case and what older snapshots restore as).
+
+        ``compared_run_start``/``compared_overrides``/``cdc_dlq_waiver`` carry the CDC
+        dead-letter gate's evidence; an older snapshot has none, which the gate reads as
+        "compare time unknown" -- unproven, never resolved.
         """
         with self._lock:
             self._result = report
@@ -2199,6 +2269,9 @@ class ValidationState:
             self._rechecked_at = rechecked_at
             self._recheck_tables = ()
             self._recheck_error = None
+            self._compared_run_start = compared_run_start
+            self._compared_overrides = dict(compared_overrides or {})
+            self.cutover_dlq_waiver = cdc_dlq_waiver
 
     @property
     def restored(self) -> bool:
@@ -2222,11 +2295,19 @@ class ValidationState:
         with self._lock:
             self._progress = None
 
-    def set_result(self, result: ValidationReport) -> None:
+    def set_result(
+        self,
+        result: ValidationReport,
+        *,
+        compared_overrides: "Optional[Mapping[str, datetime]]" = None,
+    ) -> None:
         """Record a successful run's report (clears any prior error + progress).
 
         A full run replaces the whole report, so any earlier per-table re-check
-        marks are cleared too -- every row is once again from one run.
+        marks are cleared too -- every row is once again from one run. The run's start
+        (``mark_run_started``) becomes the compare start of every table, except those in
+        ``compared_overrides`` (the run's own CHECKSUM pass, which started later). A
+        CDC dead-letter waiver belongs to the previous verdict and is dropped.
         """
         with self._lock:
             self._result = result
@@ -2235,6 +2316,9 @@ class ValidationState:
             self._restored = False  # a freshly-run result, not a restored one
             self._rechecked_tables = ()
             self._rechecked_at = None
+            self._compared_run_start = self._run_started_wall
+            self._compared_overrides = dict(compared_overrides or {})
+            self.cutover_dlq_waiver = None
             # A new verdict supersedes any earlier cut-over outcome (the target may have
             # advanced since), so the runbook offers fresh runs and starts its outcomes
             # clean -- otherwise a stale red "identity sync failed" / an old FK-apply
@@ -2287,6 +2371,9 @@ class ValidationState:
         with self._lock:
             self._recheck_tables = tuple(tables)
             self._recheck_error = None
+            # Before the job is even submitted, so it can only understate how recent the
+            # re-check's comparison is (the CDC dead-letter gate's rule).
+            self._recheck_started_wall = datetime.now(timezone.utc)
 
     @property
     def recheck_tables(self) -> tuple[str, ...]:
@@ -2332,6 +2419,10 @@ class ValidationState:
                 sorted(set(self._rechecked_tables) | names)
             )
             self._rechecked_at = completed_at or datetime.now(timezone.utc)
+            # Each merged table was compared from the re-check's start, not the run's.
+            if self._recheck_started_wall is not None:
+                for name in names:
+                    self._compared_overrides[name] = self._recheck_started_wall
             # The report is no longer purely the restored snapshot -- part of it was
             # just measured live, so the "restored, may be stale" banner would be
             # misleading. The re-check note takes over the as-of story.
@@ -2403,6 +2494,10 @@ class ValidationState:
             self.interrupted_by_restart = False
             self._cutover_default_restore_outcome = None
             self._invalidate_cutover_defaults_locked()
+            self._run_started_wall = None
+            self._compared_run_start = None
+            self._compared_overrides = {}
+            self.cutover_dlq_waiver = None
 
 
 @dataclass
@@ -2790,6 +2885,14 @@ def build_validation_screen(
             # records the job as CANCELLED, not FAILED -- and no partial report is
             # ever displayed. on_progress writes live per-table progress for the UI
             # poller (worker thread -> ValidationState lock).
+            # Tables CDC dead-lettered a change for get a CHECKSUM pass on top of this
+            # run's mode (see below), so the start line says so up front. Read here, in the
+            # worker: the ledger is copy-on-write, so this reference is a consistent view.
+            _dlq_scope = [
+                t.name
+                for t in scoped_tables
+                if t.name in (getattr(migration_state, "cdc_dlq_ledger", None) or {})
+            ]
             log_activity(
                 ActivityCategory.VALIDATION,
                 "validation started",
@@ -2797,6 +2900,16 @@ def build_validation_screen(
                 detail=(
                     f"{inputs.mode.value} comparison of "
                     f"{len(scoped_tables)} table(s), source vs target"
+                    + (
+                        "; tables with dead-lettered CDC changes are also compared by "
+                        f"CHECKSUM: {_bounded_names(_dlq_scope)}"
+                        if _dlq_scope
+                        and (
+                            inputs.mode is not ValidationMode.CHECKSUM
+                            or inputs.deep_only_on_count_mismatch
+                        )
+                        else ""
+                    )
                 ),
             )
             if ai_post_event is not None:
@@ -2821,15 +2934,62 @@ def build_validation_screen(
                     _beat()
                 validation_state.set_progress(table_name, index, total)
 
+            _checksum_pass: list[str] = []
+            _overrides: dict[str, datetime] = {}
             try:
+                live = _with_live_proof(inputs, proof_overlay, proof_legacy, handle)
                 result = run_validation(
-                    _with_live_proof(inputs, proof_overlay, proof_legacy, handle),
+                    live,
                     validator_factory=validator_factory,
                     should_cancel=lambda: bool(getattr(handle, "cancelled", False)),
                     on_progress=_progress,
                     on_page=getattr(handle, "heartbeat", None),
                     deep_only_on_count_mismatch=inputs.deep_only_on_count_mismatch,
                 )
+                # A CDC dead letter is a change the stream never applied; a missed UPDATE
+                # changes no row count, so a table CDC dead-lettered anything for is proven
+                # only by a VALUE comparison. Re-compare, by CHECKSUM, every such table this
+                # run matched without one (a row-count mode, or a fast sweep's skipped deep
+                # check) -- only those tables, never the whole schema. The ledger is read
+                # AFTER the main pass, so a dead letter folded during the run counts too.
+                _ledger_now = getattr(migration_state, "cdc_dlq_ledger", None) or {}
+                _items = {item.table: item for item in result.items}
+                _need = [
+                    t
+                    for t in live.inventory.tables
+                    if t.name in _ledger_now
+                    and t.name in _items
+                    and _items[t.name].error is None
+                    and _items[t.name].matched
+                    and not value_verified(_items[t.name])
+                ]
+                if _need:
+                    _pass_start = datetime.now(timezone.utc)
+                    # ``reconcile`` deliberately stays the run's: the replacing item must
+                    # carry its OWN record reconciliation (an item without one in a
+                    # reconcile-requested report reads as "composite primary key" in
+                    # reconcile_skipped_tables), taken at the same moment as its checksum.
+                    # The repeat is bounded to these dead-lettered tables, and the checksum
+                    # scan dominates their cost.
+                    fresh = run_validation(
+                        dataclasses.replace(
+                            live,
+                            inventory=live.inventory.model_copy(update={"tables": _need}),
+                            mode=ValidationMode.CHECKSUM,
+                            check_orphans=False,
+                            deep_only_on_count_mismatch=False,
+                        ),
+                        validator_factory=validator_factory,
+                        should_cancel=lambda: bool(getattr(handle, "cancelled", False)),
+                        on_progress=_progress,
+                        on_page=getattr(handle, "heartbeat", None),
+                        deep_only_on_count_mismatch=False,
+                    )
+                    # The report keeps the run's mode; these items carry their own
+                    # checksum evidence (report-level labels can only understate them).
+                    result = merge_revalidated(result, fresh.items)
+                    _overrides = {item.table: _pass_start for item in fresh.items}
+                    _checksum_pass = [item.table for item in fresh.items]
             except ValidationCancelled:
                 return
             finally:
@@ -2838,7 +2998,7 @@ def build_validation_screen(
                 # long it took and a cancelled/failed run does not show a stale one.
                 validation_state.mark_run_finished()
                 validation_state.clear_progress()
-            validation_state.set_result(result)
+            validation_state.set_result(result, compared_overrides=_overrides)
             # Record the verdict in the audit trail. Validation is the step that PROVES
             # source == target, so its outcome (match/mismatch, mode, how many tables
             # passed) is exactly what a reviewer attaches to a change ticket -- yet it
@@ -2852,6 +3012,24 @@ def build_validation_screen(
                 if _summary.reconcile_performed
                 else ""
             )
+            # "ready for cut-over" must not contradict the cut-over gate: while a table CDC
+            # dead-lettered a change for lacks a CHECKSUM match after its last one, the log
+            # says cut over is held instead.
+            try:
+                _held_clause = held_log_clause(
+                    cdc_dlq_gate_for(
+                        migration_state,
+                        validation_state,
+                        cdc_in_use=_cdc_in_use(session),
+                        release=cutover_release_state(
+                            _summary, gap_accepted=validation_state.accept_explained_gap
+                        ),
+                        summary=_summary,
+                        check_reads=False,
+                    )
+                )
+            except Exception:  # noqa: BLE001 - the verdict line still logs
+                _held_clause = None
             log_activity(
                 ActivityCategory.VALIDATION,
                 "validation completed",
@@ -2870,7 +3048,15 @@ def build_validation_screen(
                         else ""
                     )
                     + (
-                        "; ready for cut-over" if _summary.ready_for_cutover else ""
+                        "; CHECKSUM pass for tables with dead-lettered CDC changes: "
+                        f"{_bounded_names(_checksum_pass)}"
+                        if _checksum_pass
+                        else ""
+                    )
+                    + (
+                        (_held_clause or "; ready for cut-over")
+                        if _summary.ready_for_cutover
+                        else ""
                     )
                     # What the verdict does NOT cover, on the same line -- otherwise
                     # "MATCH … ready for cut-over" reads as "every column of every table
@@ -2993,7 +3179,9 @@ def build_validation_screen(
 
         - The comparison OPTIONS come from the existing report
           (:func:`report_run_options`), not the live toggles, so the merged report
-          stays internally consistent (and a restored report is re-checkable).
+          stays internally consistent (and a restored report is re-checkable). One
+          exception, an upgrade only: a table CDC dead-lettered a change for is
+          compared by CHECKSUM, because no other mode can prove a missed UPDATE.
         - ``deep_only_on_count_mismatch`` is forced OFF: this table is already known
           to differ, so the fast sweep's "skip deep checks when counts agree" would
           be exactly the wrong economy -- if the counts now agree we specifically
@@ -3031,59 +3219,85 @@ def build_validation_screen(
             return
 
         options = report_run_options(report)
+        # A table CDC dead-lettered a change for is re-checked by CHECKSUM whatever the
+        # report's mode: only a value comparison can prove a missed UPDATE (the cut-over
+        # gate's rule). PER TABLE: the rest of the batch keeps the report's mode, so one
+        # dead-lettered table never turns "Re-check all" into full value scans of every
+        # other table. This only ever UPGRADES a comparison; reconcile and the orphan
+        # check still come from the report.
+        _ledger = getattr(migration_state, "cdc_dlq_ledger", None) or {}
+        _dlq_part = [t for t in scoped if t.name in _ledger]
+        _rest_part = [t for t in scoped if t.name not in _ledger]
+        if options.mode is ValidationMode.CHECKSUM or not _dlq_part or not _rest_part:
+            _parts = [
+                (scoped, ValidationMode.CHECKSUM if _dlq_part else options.mode)
+            ]
+        else:
+            _parts = [
+                (_dlq_part, ValidationMode.CHECKSUM),
+                (_rest_part, options.mode),
+            ]
         source_config = session.source_config
         target_config = session.target_config
         assert source_config is not None  # guaranteed by the gate
         assert target_config is not None  # guaranteed by the gate
         _split = _exclusion_split(inventory)
-        proof_overlay, proof_legacy = _proof_candidates(_split, (t.name for t in scoped))
-        inputs = ValidationInputs(
-            source_config=source_config,
-            source_password=session.source_password,
-            target_config=target_config,
-            inventory=inventory.model_copy(update={"tables": scoped}),
-            mode=options.mode,
-            check_orphans=options.check_orphans,
-            watermark=_migration_watermark(),
-            reconcile=options.reconcile,
-            # Always deep-check a re-check (see docstring).
-            deep_only_on_count_mismatch=False,
-            excluded_columns=_split[0],
-            quarantined_by_table=_migration_quarantined(),
-            # Applied target types so a CHECKSUM honors a Schema-Conversion remap.
-            target_types=_applied_target_types(
-                inventory.model_copy(update={"tables": scoped})
-            ),
-            null_proof_blocks_match=proof_blocks_match(migration_state),
-        )
+
+        def _inputs_for(tables: list, mode: ValidationMode) -> tuple:
+            _inventory_part = inventory.model_copy(update={"tables": tables})
+            return (
+                ValidationInputs(
+                    source_config=source_config,
+                    source_password=session.source_password,
+                    target_config=target_config,
+                    inventory=_inventory_part,
+                    mode=mode,
+                    check_orphans=options.check_orphans,
+                    watermark=_migration_watermark(),
+                    reconcile=options.reconcile,
+                    # Always deep-check a re-check (see docstring).
+                    deep_only_on_count_mismatch=False,
+                    excluded_columns=_split[0],
+                    quarantined_by_table=_migration_quarantined(),
+                    # Applied target types so a CHECKSUM honors a Schema-Conversion remap.
+                    target_types=_applied_target_types(_inventory_part),
+                    null_proof_blocks_match=proof_blocks_match(migration_state),
+                ),
+                *_proof_candidates(_split, (t.name for t in tables)),
+            )
+
+        runs = [_inputs_for(tables, mode) for tables, mode in _parts]
 
         validation_state.start_recheck([t.name for t in scoped])
         validation_state.cancel_requested = False
 
         def work(handle: object) -> None:
+            items: list = []
+            orphans: list = []
             try:
-                fresh = run_validation(
-                    _with_live_proof(inputs, proof_overlay, proof_legacy, handle),
-                    validator_factory=validator_factory,
-                    should_cancel=lambda: bool(getattr(handle, "cancelled", False)),
-                    # The same liveness seam the full run passes. A re-check is typically
-                    # ONE large mismatched table -- the longest single-table scan in the
-                    # app, with no other statement in between -- so without a per-page beat
-                    # the job is silent for its whole duration and the stall watchdog reaps
-                    # it at 900 s, reporting a read-only comparison as a stalled LOAD while
-                    # the comparison itself completes.
-                    on_page=getattr(handle, "heartbeat", None),
-                    deep_only_on_count_mismatch=False,
-                )
+                for inputs, proof_overlay, proof_legacy in runs:
+                    fresh = run_validation(
+                        _with_live_proof(inputs, proof_overlay, proof_legacy, handle),
+                        validator_factory=validator_factory,
+                        should_cancel=lambda: bool(getattr(handle, "cancelled", False)),
+                        # The same liveness seam the full run passes. A re-check is
+                        # typically ONE large mismatched table -- the longest single-table
+                        # scan in the app, with no other statement in between -- so without
+                        # a per-page beat the job is silent for its whole duration and the
+                        # stall watchdog reaps it at 900 s, reporting a read-only comparison
+                        # as a stalled LOAD while the comparison itself completes.
+                        on_page=getattr(handle, "heartbeat", None),
+                        deep_only_on_count_mismatch=False,
+                    )
+                    items.extend(fresh.items)
+                    orphans.extend(fresh.orphan_findings or ())
             except ValidationCancelled:
                 return  # cancelled: the report is simply left as it was
             # Merge under the state lock; a False return means a full re-run cleared
             # the report while this was in flight, so there is nothing to update.
             validation_state.merge_recheck_result(
-                fresh.items,
-                orphan_findings=(
-                    fresh.orphan_findings if options.check_orphans else None
-                ),
+                items,
+                orphan_findings=(orphans if options.check_orphans else None),
             )
 
         validation_state.job_id = job_manager.submit(work)
@@ -3100,6 +3314,80 @@ def build_validation_screen(
             return excluded_values_remedy(migration_state, job_manager)
         except Exception:  # noqa: BLE001 - the notice still names the values
             return ""
+
+    def _cdc_checksum_scope(inv: "Optional[SourceInventory]") -> tuple[str, ...]:
+        """Tables in the NEXT run's scope that CDC dead-lettered a change for."""
+        ledger = getattr(migration_state, "cdc_dlq_ledger", None) or {}
+        if not ledger:
+            return ()
+        if inv is None:
+            return tuple(sorted(ledger))
+        try:
+            scope = resolve_validation_tables(inv, migration_state.selection)
+            names = [t.name for t in scope.tables]
+            include = included_from_exclusions(names, validation_state.table_exclude)
+            scoped = [t.name for t in apply_table_filter(scope.tables, include)]
+        except Exception:  # noqa: BLE001 - the hint falls back to the whole ledger
+            return tuple(sorted(ledger))
+        return tuple(name for name in scoped if name in ledger)
+
+    def _validation_dlq_gate(report: ValidationReport):
+        """The CDC dead-letter gate as Validation shows it (per table; no read state)."""
+        summary = summarize_validation(report)
+        try:
+            return cdc_dlq_gate_for(
+                migration_state,
+                validation_state,
+                cdc_in_use=_cdc_in_use(session),
+                release=cutover_release_state(
+                    summary, gap_accepted=validation_state.accept_explained_gap
+                ),
+                summary=summary,
+                check_reads=False,
+            )
+        except Exception:  # noqa: BLE001 - the report still renders without it
+            return None
+
+    def _cdc_history_hint() -> str:
+        """The Options hint while the CDC dead-letter history can't be confirmed, unless the
+        picked options already are a full CHECKSUM run (which is what clears it)."""
+        if (
+            validation_state.mode is ValidationMode.CHECKSUM
+            and not validation_state.deep_only_on_count_mismatch
+        ):
+            return ""
+        try:
+            report = validation_state.result
+            summary = summarize_validation(report) if report is not None else None
+            gate = cdc_dlq_gate_for(
+                migration_state,
+                validation_state,
+                cdc_in_use=_cdc_in_use(session),
+                release=cutover_release_state(
+                    summary, gap_accepted=validation_state.accept_explained_gap
+                ),
+                summary=summary,
+                check_reads=False,
+            )
+        except Exception:  # noqa: BLE001 - an advisory hint never breaks the page
+            return ""
+        return history_options_hint(gate)
+
+    def _schedule_dlq_check(refresh: Callable[[], None]) -> None:
+        try:
+            gate = cdc_dlq_gate_for(
+                migration_state,
+                validation_state,
+                cdc_in_use=_cdc_in_use(session),
+                release="clean",
+                summary=None,
+            )
+        except Exception:  # noqa: BLE001 - never break the page for an advisory read
+            return
+        if gate.read_required:
+            schedule_cdc_dlq_check(
+                ui, session, migration_state, refresh, evidence_at=None
+            )
 
     def content(refresh: Callable[[], None]) -> None:
         status = get_status(session.workflow, WorkflowStep.VALIDATION)
@@ -3202,7 +3490,12 @@ def build_validation_screen(
                     validation_state,
                     status,
                     refresh=refresh,
+                    cdc_checksum_tables=_cdc_checksum_scope(inventory),
+                    cdc_history_hint=_cdc_history_hint(),
                 )
+                # Keep the dead-letter ledger fresh before a run and for the cut-over gate:
+                # one bounded background read, TTL-throttled, never on the render itself.
+                _schedule_dlq_check(refresh)
 
             error = validation_state.error
             if error and status is not StepStatus.IN_PROGRESS:
@@ -3390,6 +3683,7 @@ def build_validation_screen(
 
                 _render_result(
                     ui, result,
+                    cdc_gate=_validation_dlq_gate(result),
                     diagnose_provider=diagnose_provider,
                     restored=validation_state.restored,
                     completed_at=validation_state.completed_at,
@@ -4328,6 +4622,19 @@ def build_cutover_screen(
             detail=f"cut over with {len(owed)} DEFAULTs not restored: {shown}",
         )
 
+    def _current_dlq_gate():
+        """The CDC dead-letter gate from the CURRENT state (no I/O), for click handlers."""
+        _report = validation_state.result
+        _summary = summarize_validation(_report) if _report is not None else None
+        return cdc_dlq_gate_for(
+            migration_state, validation_state,
+            cdc_in_use=_cdc_in_use(session),
+            release=cutover_release_state(
+                _summary, gap_accepted=validation_state.accept_explained_gap
+            ),
+            summary=_summary,
+        )
+
     def runner() -> None:
         # No job: mark DONE as the user's acknowledgement that they've cut over.
         session.set_workflow(
@@ -4387,6 +4694,14 @@ def build_cutover_screen(
                         _ack_caveats := verdict_evidence_caveats(_summary, _report)
                     )
                     else ""
+                )
+                # What the CDC dead-letter gate rested on (nothing when it is inert).
+                + ack_log_clause(
+                    cdc_dlq_gate_for(
+                        migration_state, validation_state,
+                        cdc_in_use=_cdc_in_use(session), release=_release,
+                        summary=_summary,
+                    )
                 )
             ),
         )
@@ -4586,6 +4901,72 @@ def build_cutover_screen(
                     ),
                 )
             return
+
+        # The CDC dead-letter gate (ui/cdc_dlq_gate.py), evaluated only AFTER the release
+        # gate above has released -- so nothing here can ever override a mismatch, an
+        # unverified record set or an unaccepted gap. Inert (nothing drawn, nothing armed)
+        # when the session has no CDC evidence, so Full Load only is unchanged.
+        _dlq_gate = cdc_dlq_gate_for(
+            migration_state, validation_state,
+            cdc_in_use=_cdc_in_use(session), release=release, summary=summary,
+        )
+        if _dlq_gate.read_required:
+            # One bounded background read (never on this render), TTL-throttled.
+            schedule_cdc_dlq_check(
+                ui, session, migration_state, refresh,
+                evidence_at=validation_evidence_at(validation_state),
+            )
+        if _dlq_gate.held:
+            def _waive_dlq_check() -> None:
+                current = _current_dlq_gate()
+                if not current.can_waive:
+                    refresh()  # the state moved since this was drawn: show it
+                    return
+                log_activity(
+                    ActivityCategory.VALIDATION,
+                    "CDC dead-letter check waived at cut over",
+                    status=ActivityStatus.WARNING,
+                    detail=waiver_log_detail(current),
+                )
+                validation_state.cutover_dlq_waiver = CdcDlqWaiver(
+                    tables={i.table: i.count for i in current.waivable_issues},
+                    read_problem=current.read_problem,
+                    waived_at=datetime.now(timezone.utc),
+                )
+                refresh()
+
+            _check_btn: dict = {}
+
+            def _check_dlq_again() -> None:
+                # No refresh here: it would delete the one-shot timer before it fires. The
+                # read's own completion refreshes the screen.
+                schedule_cdc_dlq_check(
+                    ui, session, migration_state, refresh,
+                    evidence_at=validation_evidence_at(validation_state), force=True,
+                )
+                btn = _check_btn.get("button")
+                if btn is not None:
+                    btn.props("disable")
+
+            with _section(ui, icon="fact_check", title="CDC dead-letter check"):
+                _render_cdc_dlq_gate(
+                    ui, _dlq_gate,
+                    on_waive=_waive_dlq_check,
+                    on_check_again=_check_dlq_again,
+                    check_running=bool(
+                        getattr(migration_state, "cdc_dlq_check_running", False)
+                    ),
+                    check_button=_check_btn,
+                )
+            return
+        if _dlq_gate.waived:
+            _w_header, _w_body = waived_notice(_dlq_gate)
+            render_notice(ui, tone="warning", header=_w_header, body=_w_body)
+        _unverifiable = unverifiable_notice(_dlq_gate)
+        if _unverifiable is not None:
+            render_notice(
+                ui, tone="warning", header=_unverifiable[0], body=_unverifiable[1]
+            )
 
         # Released with an accepted gap: the runbook follows, but it must not read as a
         # clean match -- the operator is cutting over to a target that is knowingly short.
@@ -4831,6 +5212,26 @@ def build_cutover_screen(
                     def _acknowledge() -> None:
                         if _fk_gate is not None:
                             return  # gated: FKs not applied and no opt-out
+                        # Re-evaluated from state at the click (no I/O): a dead letter folded
+                        # after this page was drawn must not be signed off unseen.
+                        _now = _current_dlq_gate()
+                        if _now.applies and bool(
+                            getattr(migration_state, "cdc_dlq_check_running", False)
+                        ):
+                            ui.notify(  # type: ignore[attr-defined]
+                                "Checking the CDC dead-letter queue — try again in a few "
+                                "seconds.",
+                                type="info",
+                            )
+                            return
+                        if _now.held:
+                            ui.notify(  # type: ignore[attr-defined]
+                                "New CDC dead-letter information arrived since this page "
+                                "was drawn — review the check above.",
+                                type="warning",
+                            )
+                            refresh()
+                            return
                         runner()
                         refresh()
 
@@ -5393,12 +5794,33 @@ def _render_options(
     status: StepStatus,
     *,
     refresh: Optional[Callable[[], None]] = None,
+    cdc_checksum_tables: "Sequence[str]" = (),
+    cdc_history_hint: str = "",
 ) -> None:
-    """Render the validation mode select, reconcile, and orphan-check switches."""
+    """Render the validation mode select, reconcile, and orphan-check switches.
+
+    ``cdc_checksum_tables`` (the next run's tables CDC dead-lettered a change for) adds a
+    hint that those tables are compared by CHECKSUM whatever mode is picked.
+    ``cdc_history_hint`` (non-empty while the CDC dead-letter history can't be confirmed
+    and the picked options are not a full CHECKSUM run) says Cut over will need one.
+    """
     disabled = status is StepStatus.IN_PROGRESS
     # Comparison mode as AWS Cloudscape "tiles" (selectable radio cards), matching
     # the Data Migration migration-type selector so the journey stays consistent.
     _render_mode_tiles(ui, validation_state, disabled=disabled, refresh=refresh)
+    if cdc_checksum_tables:
+        # Disclosed BEFORE the run: the extra pass costs time, and the operator should not
+        # be surprised by a CHECKSUM on a row-count run.
+        inline_hint(
+            ui,
+            f"CDC dead-lettered changes for {len(cdc_checksum_tables)} table(s) "
+            f"({_bounded_names(list(cdc_checksum_tables))}): whatever mode you pick, this "
+            "run also compares them by CHECKSUM, because a row count cannot reveal a "
+            "missed UPDATE.",
+            tone="info",
+        )
+    if cdc_history_hint:
+        inline_hint(ui, cdc_history_hint, tone="info")
     with ui.row().classes("items-center gap-4 flex-wrap"):  # type: ignore[attr-defined]
         ui.switch(  # type: ignore[attr-defined]
             "Reconcile every record (find missing / extra rows)",
@@ -5544,6 +5966,7 @@ def _render_result(
     identity_sync_failed: "Optional[dict[str, str]]" = None,
     excluded_values_remedy: str = "",
     legacy_context: "tuple[str, frozenset]" = ("", frozenset()),
+    cdc_gate: "Optional[object]" = None,
 ) -> None:
     """Render the cut-over readiness report: verdict, checks, then the details.
 
@@ -5562,6 +5985,11 @@ def _render_result(
     busy instead. ``rechecked_tables``/``rechecked_at`` describe which rows in this
     report are NEWER than the rest of the run, so the mixed as-of is stated
     plainly rather than left for the reader to infer.
+
+    ``cdc_gate`` (a :class:`~dsql_migrator.ui.cdc_dlq_gate.CdcDlqGate`, Validation's
+    per-table view) keeps a matching report from reading "Ready for cut-over" while a
+    table CDC dead-lettered a change for lacks a CHECKSUM match after its last one, and
+    offers the re-check of exactly those tables.
     """
     # Restored-from-snapshot banner FIRST, so the user knows this verdict is as-of
     # a past run (the source may have changed since) before reading it.
@@ -5583,7 +6011,52 @@ def _render_result(
         )
     summary = summarize_validation(report)
     drift = format_drift(report)
-    _render_verdict(ui, summary, drift)
+    _hold_shown = _render_verdict(ui, summary, drift, cdc_gate=cdc_gate)
+    # The way forward for the hold notice above: re-check exactly the dead-lettered tables
+    # that still lack a CHECKSUM match after their last dead letter (the re-check upgrades
+    # them to CHECKSUM). Drawn only WITH that notice, which explains it -- on a red or
+    # explained-gap verdict the per-row Re-check already upgrades those tables. Withheld
+    # while a comparison runs (no provider), like every re-check.
+    _recheckable = tuple(getattr(cdc_gate, "recheckable", ()) or ()) if cdc_gate else ()
+    if _hold_shown and _recheckable and recheck_provider is not None:
+        with ui.row().classes("w-full justify-end"):  # type: ignore[attr-defined]
+            ui.button(  # type: ignore[attr-defined]
+                f"Re-check {len(_recheckable)} table(s) with CHECKSUM",
+                icon="fact_check",
+                on_click=lambda: recheck_provider(list(_recheckable)),
+            ).props("no-caps color=primary")
+    # A dead-lettered table whose comparison could not FINISH is held by the cut-over gate
+    # (its values are unproven) and every re-check is forced back to CHECKSUM -- which, for
+    # a very large table hashed in one statement, can fail the same way every time. Name
+    # the exit instead of leaving a loop: leave the table out, then acknowledge it on Cut
+    # over. The re-check stays offered (a transient error can clear on retry).
+    if cdc_gate is not None:
+        _by_name = {item.table: item for item in report.items}
+        _unfinished = [
+            i.table
+            for i in getattr(cdc_gate, "issues", ()) or ()
+            if i.reason == REASON_NOT_MATCHED
+            and getattr(_by_name.get(i.table), "error", None) is not None
+        ]
+        if _unfinished:
+            render_notice(
+                ui,
+                tone="warning",
+                header=(
+                    f"Validation could not finish comparing {len(_unfinished)} table(s) "
+                    "with dead-lettered CDC changes"
+                ),
+                body=(
+                    f"{bounded_table_names(_unfinished)}: cut over needs each to match in "
+                    "a CHECKSUM comparison, because CDC dead-lettered changes for them. If "
+                    "re-checking keeps failing — a very large table with a composite or "
+                    "missing primary key is hashed in one statement, which can exceed "
+                    "Aurora DSQL's 300-second transaction limit — turn its chip off under "
+                    "Objects to validate and re-run Validation. Cut over then lets you "
+                    "continue without its CHECKSUM proof, and that decision is recorded in "
+                    "the activity log."
+                ),
+            )
     # Mixed as-of honesty: when part of this report came from a later per-table
     # re-check, say which tables and when, right under the verdict -- the verdict
     # above is computed over BOTH vintages, so the reader must know that before
@@ -5717,8 +6190,12 @@ def _section(ui: object, *, icon: str, title: str) -> _Section:
 
 def _render_verdict(
     ui: object, summary: ValidationSummary, drift: DriftDisplay,
-) -> None:
+    *, cdc_gate: "Optional[object]" = None,
+) -> bool:
     """Render the overall go/no-go cut-over verdict as a Cloudscape notice (hero).
+
+    Returns whether it rendered the CDC dead-letter HOLD notice (the caller draws that
+    notice's "Re-check N table(s) with CHECKSUM" action only beside it).
 
     The verdict body also surfaces the two qualifiers that the strict
     ``ready_for_cutover`` flag does not capture on its own: record-level
@@ -5726,6 +6203,11 @@ def _render_verdict(
     having advanced since the snapshot (fine under live CDC, but a re-verify
     signal otherwise). The recovery guidance on a no-go is a separate section
     (:func:`_render_recovery_section`), not part of the verdict.
+
+    ``cdc_gate`` (Validation's per-table view of the CDC dead-letter gate): while it holds
+    tables, a matching report reads "Tables match — cut over waits ..." instead of the
+    green "Ready for cut-over"; once every dead-lettered table is resolved, the green body
+    says so. ``None`` (or an inert gate) renders exactly as before.
     """
     if summary.ready_for_cutover:
         _is_checksum = str(summary.mode).upper().endswith("CHECKSUM")
@@ -5751,7 +6233,16 @@ def _render_verdict(
                     f"{', '.join(summary.reconcile_inapplicable_tables)}."
                 ),
             )
-            return
+            return False
+        _hold = verdict_hold(cdc_gate, total=summary.total_tables, as_of=summary.as_of)
+        if _hold is not None:
+            # CDC dead-lettered changes for these tables and none has a CHECKSUM match that
+            # started after its last dead letter (counted by row only, compared too early,
+            # or a compare time lost in a restore -- the body names which), or the
+            # dead-letter history can't be confirmed: the report is not "Ready" while the
+            # cut-over gate holds on either.
+            render_notice(ui, tone="warning", header=_hold[0], body=_hold[1])
+            return True
         body = (
             f"All {summary.total_tables} table(s) match and no issues were found. "
             f"Source and target are consistent as-of {summary.as_of}."
@@ -5787,8 +6278,9 @@ def _render_verdict(
             )
         if caveats:
             body += " Note: " + "; ".join(caveats) + "."
+        body += verdict_resolved_suffix(cdc_gate)  # type: ignore[arg-type]
         render_notice(ui, tone="success", header="Ready for cut-over", body=body)
-        return
+        return False
 
     # When EVERY non-matching table is short by exactly the rows the migration already
     # reported dropping, "N of M did not pass — review the failing checks" sends the
@@ -5823,7 +6315,7 @@ def _render_verdict(
                 f"those {row_noun} will be absent from the target."
             ),
         )
-        return
+        return False
 
     render_notice(
         ui,
@@ -5841,6 +6333,7 @@ def _render_verdict(
             )
         ),
     )
+    return False
 
 
 # How many re-checked table names to spell out in the mixed-as-of note before
@@ -6099,6 +6592,69 @@ def _render_excluded_values_recovery(
     )
 
 
+def _render_cdc_dlq_gate(
+    ui: object,
+    gate: object,
+    *,
+    on_waive: Callable[[], None],
+    on_check_again: Callable[[], None],
+    check_running: bool,
+    check_button: "Optional[dict]" = None,
+) -> None:
+    """Render the held CDC dead-letter gate: why, which tables, what to do, the actions.
+
+    Copy comes from :mod:`dsql_migrator.ui.cdc_dlq_gate` (value-free: names, counts,
+    times, error classes). The read-state notice is ``error`` for a failed or page-capped
+    read, ``warning`` for a history that can't be confirmed (its way forward is one full
+    CHECKSUM run that clears it by itself, like the per-table re-check) and ``info`` while
+    the fresh read is in flight; the per-table notice is ``warning`` (a re-check, the
+    normal way forward). "Continue without this check" appears only when nothing
+    re-checkable is left; "Check again" only for a failed or partial read, disabled while
+    a read runs.
+    """
+    read = read_state_notice(gate)  # type: ignore[arg-type]
+    if read is not None:
+        render_notice(ui, tone=read[0], header=read[1], body=read[2])
+    issue = issue_notice(gate)  # type: ignore[arg-type]
+    if issue is not None:
+        render_notice(ui, tone=issue[0], header=issue[1], body=issue[2])
+        with ui.column().classes("w-full gap-1"):  # type: ignore[attr-defined]
+            for line in issue_lines(gate):  # type: ignore[arg-type]
+                ui.label(line).classes("text-sm text-gray-700")  # type: ignore[attr-defined]
+    steps = way_forward_lines(gate)  # type: ignore[arg-type]
+    if steps:
+        ui.label("What to do").classes(  # type: ignore[attr-defined]
+            "text-sm font-medium text-gray-900 mt-1"
+        )
+        with ui.column().classes("w-full gap-1.5"):  # type: ignore[attr-defined]
+            for num, text in enumerate(steps, start=1):
+                with ui.row().classes("items-start gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
+                    ui.label(str(num)).classes(  # type: ignore[attr-defined]
+                        "shrink-0 w-5 h-5 rounded-full bg-blue-100 text-blue-700 "
+                        "text-[11px] font-semibold flex items-center justify-center"
+                    )
+                    ui.label(text).classes("text-sm text-gray-700 leading-snug")  # type: ignore[attr-defined]
+    show_check = bool(getattr(gate, "read_required", False)) and getattr(
+        gate, "read_state", None
+    ) in (READ_FAILED, READ_INCOMPLETE)
+    can_waive = bool(getattr(gate, "can_waive", False))
+    if not (show_check or can_waive):
+        return
+    with ui.row().classes("w-full justify-end gap-2"):  # type: ignore[attr-defined]
+        if can_waive:
+            ui.button(  # type: ignore[attr-defined]
+                "Continue without this check", icon="rule", on_click=on_waive,
+            ).props("no-caps color=warning outline")
+        if show_check:
+            button = ui.button(  # type: ignore[attr-defined]
+                "Check again", icon="refresh", on_click=on_check_again,
+            ).props("no-caps color=primary")
+            if check_running:
+                button.props("disable")
+            if check_button is not None:
+                check_button["button"] = button
+
+
 def _render_cutover_section(
     ui: object, summary: ValidationSummary, drift: DriftDisplay, *,
     cdc_in_use: bool = False,
@@ -6187,7 +6743,11 @@ def _render_cutover_section(
                  "you can fully explain). This final run also advances any "
                  "auto-generated / identity key sequence past the rows CDC delivered, "
                  "so the app's first insert after cut-over cannot collide with a "
-                 "migrated id."),
+                 "migrated id. Tables with dead-lettered CDC changes are compared by "
+                 "CHECKSUM automatically, and Cut over re-reads the CDC dead-letter "
+                 "queue before this runbook opens; a dead letter found by a later read "
+                 "(each time you reopen this step, at most once a minute) locks it "
+                 "again until that table is re-checked."),
                 ("5", "Repoint your application to the Aurora DSQL endpoint "
                  "(PostgreSQL wire, IAM-token auth — no password) and smoke-test "
                  "the critical read/write paths."),

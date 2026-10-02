@@ -25,6 +25,8 @@ guarded stop) and Property 7 (no credential value is read or logged) hold.
 
 from __future__ import annotations
 
+import contextlib
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -132,6 +134,55 @@ _METRIC_DIM_CACHE_TTL_SECONDS = 30
 # (later polls advance from the cursor), so it does not re-scan history every poll.
 _DLQ_INITIAL_LOOKBACK_SECONDS = 6 * 3600
 
+# How far behind "now" the DLQ cursor is allowed to trail after a COMPLETE read. The cursor
+# used to advance only to the newest event read, so a clean stream never got one: every poll
+# re-scanned the whole first-read look-back, and a session left closed for longer than that
+# window lost every dead letter older than it on the next read. After a read that reached the
+# end, nothing older than this grace can still be on its way into the log group (CloudWatch
+# ingestion is seconds), so the cursor may move up to ``now - grace`` -- never backwards and
+# always past the newest event already read.
+_DLQ_INGEST_GRACE_SECONDS = 600
+
+# How long a page-capped read's continuation is resumed by the next read. FilterLogEvents can
+# return EMPTY pages that still carry a nextToken while it scans (documented behaviour), so on
+# a busy, clean worker log group a 20-page read can end with nothing matched and no position
+# to move the cursor to -- and every retry re-scanned the same first pages for good. The next
+# read therefore continues from the stored nextToken (same request, so the same scan). A
+# CloudWatch token expires after 24 h; a continuation older than this restarts from the
+# cursor instead (seen-id de-dup covers the overlap).
+_DLQ_RESUME_MAX_AGE_SECONDS = 3600
+
+
+@dataclass(frozen=True)
+class DlqReadState:
+    """What the LAST dead-letter read of one log group proved (see :meth:`dlq_read_state`).
+
+    ``ok`` False: the read failed -- and returned ``[]``, indistinguishable from an empty
+    queue -- with ``error_code`` a value-free class (AWS error code or exception class).
+    ``truncated``: it stopped at its page cap (the next read continues where it stopped).
+    ``history_start_ms``: where this controller's continuous coverage of the group begins
+    (its first successful read's start time, or the seeded cursor for a controller rebuilt
+    from a saved session), ``None`` until known. ``started_ms``: when the read that produced
+    this state BEGAN -- for a read continued across calls, its first call -- so a reader
+    that needs "a read started after X" never credits a continuation with a later start.
+    """
+
+    ok: bool
+    error_code: Optional[str] = None
+    truncated: bool = False
+    history_start_ms: Optional[int] = None
+    started_ms: Optional[int] = None
+
+
+def _dlq_error_code(exc: BaseException) -> str:
+    """A value-free class for a failed DLQ read: the AWS error code, else the exception class."""
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        code = (response.get("Error") or {}).get("Code")
+        if code:
+            return str(code)[:64]
+    return type(exc).__name__[:64]
+
 
 def _match_metric_tables(
     requested: Sequence[str], discovered: Sequence[str]
@@ -201,6 +252,24 @@ class MskConnectController:
         # {log_group: bool} for a read that hit the page cap.
         self._dlq_first_read_window_seconds: "dict[str, int]" = {}
         self._dlq_read_truncated: "dict[str, bool]" = {}
+        # Whether the last read of each group SUCCEEDED, and why not. dlq_errors returns []
+        # on any error, so a missing logs:FilterLogEvents grant or a deleted log group looked
+        # exactly like a clean queue -- and the cut-over gate turns on that difference.
+        self._dlq_read_ok: "dict[str, bool]" = {}
+        self._dlq_read_error: "dict[str, Optional[str]]" = {}
+        # Where this controller's continuous coverage of each group begins (ms): the start of
+        # its first successful read (or the seeded cursor). Set once per group.
+        self._dlq_history_start_ms: "dict[str, int]" = {}
+        # A page-capped read's continuation, per group: (startTime, nextToken, first-call
+        # ms). The next read resumes it instead of re-scanning the same first pages (see
+        # _DLQ_RESUME_MAX_AGE_SECONDS). In memory only: a token is opaque and short-lived.
+        self._dlq_resume: "dict[str, tuple[int, str, int]]" = {}
+        # When the read behind each group's read state began (ms; a continuation's first
+        # call), see DlqReadState.started_ms.
+        self._dlq_read_started_ms: "dict[str, int]" = {}
+        # Serializes overlapping reads (the Data Migration poll and the cut-over check can
+        # share one controller), so the cursor and seen-id set are never raced.
+        self._dlq_lock = threading.Lock()
         # SEPARATE read position for the value-conversion read (see
         # value_conversion_failures). It reads the SAME log group with a different
         # pattern, and sharing the DLQ cursor above would let the far more frequent
@@ -264,6 +333,38 @@ class MskConnectController:
             )
         return None
 
+    def _dlq_state_dict(self, name: str) -> dict:
+        """The named per-group bookkeeping dict, created on a ``__new__``-built instance."""
+        value = getattr(self, name, None)
+        if value is None:
+            value = {}
+            setattr(self, name, value)
+        return value
+
+    def dlq_read_state(self, log_group: str) -> Optional[DlqReadState]:
+        """What the last dead-letter read of ``log_group`` proved, or ``None`` before any.
+
+        Pure: reports what :meth:`dlq_errors` recorded, no AWS call. The cut-over gate reads
+        it because the read itself returns ``[]`` on failure (pinned behaviour), which makes
+        "I could not read the queue" indistinguishable from "the queue is empty".
+        """
+        ok_by_group = getattr(self, "_dlq_read_ok", None) or {}
+        if log_group not in ok_by_group:
+            return None
+        ok = bool(ok_by_group[log_group])
+        return DlqReadState(
+            ok=ok,
+            error_code=(getattr(self, "_dlq_read_error", None) or {}).get(log_group),
+            truncated=ok
+            and bool((getattr(self, "_dlq_read_truncated", None) or {}).get(log_group)),
+            history_start_ms=(getattr(self, "_dlq_history_start_ms", None) or {}).get(
+                log_group
+            ),
+            started_ms=(getattr(self, "_dlq_read_started_ms", None) or {}).get(log_group)
+            if ok
+            else None,
+        )
+
     def _client(self, service_name: str) -> object:
         session = self._session or build_session(self._aws_profile)
         return session.client(service_name, region_name=self._region)
@@ -297,32 +398,72 @@ class MskConnectController:
         blocking network I/O); the caller records the returned errors into the
         single error log so the DLQ depth / per-table "Quarantined" surface
         reflects the real pipeline.
+
+        Each read also records what it PROVED (:meth:`dlq_read_state`): whether it
+        succeeded (and the value-free error class when not), whether it hit the page cap,
+        and where this controller's continuous coverage of the group begins. After a read
+        that reached the end, the cursor also moves up to ``now`` minus
+        :data:`_DLQ_INGEST_GRACE_SECONDS` (never backwards, always past the newest event
+        read), so a clean stream stops re-scanning the look-back window on every poll.
+        A read that stops at its page cap stores its continuation, and the next read
+        resumes it (see :data:`_DLQ_RESUME_MAX_AGE_SECONDS`), so repeated reads always make
+        progress through a log group too large for one. Overlapping calls are serialized.
         """
+        lock = getattr(self, "_dlq_lock", None) or contextlib.nullcontext()
+        with lock:
+            return self._dlq_errors_locked(
+                log_group,
+                now=now,
+                limit=limit,
+                window_seconds=window_seconds,
+                max_pages=max_pages,
+            )
+
+    def _dlq_errors_locked(
+        self,
+        log_group: str,
+        *,
+        now: Optional[datetime],
+        limit: int,
+        window_seconds: int,
+        max_pages: int,
+    ) -> list[CdcConnectorError]:
+        """The body of :meth:`dlq_errors`, run under the read lock."""
         now_dt = now or datetime.now(timezone.utc)
         now_ms = int(now_dt.timestamp() * 1000)
         cursor = self._dlq_cursor_ms.get(log_group)
         seen = self._dlq_seen_ids.setdefault(log_group, set())
-        start_ms = (
-            cursor if cursor is not None else now_ms - window_seconds * 1000
-        )
-        # Remember that THIS read had no cursor and therefore only looked back
-        # ``window_seconds``. Anything quarantined before that is, in this module's own
-        # words, an event that can never be picked up -- so the count it produces is a
-        # LOWER BOUND, and a cut-over decision must be told that rather than shown a
-        # number that looks complete.
-        if cursor is None:
-            self._dlq_first_read_window_seconds[log_group] = int(window_seconds)
-        truncated = False
-        try:
-            logs = self._client("logs")
+        # A page-capped previous read left a continuation: resume THAT request (the token is
+        # tied to its startTime) rather than re-scanning its first pages again.
+        resumes = self._dlq_state_dict("_dlq_resume")
+        resume = resumes.get(log_group)
+        if resume is not None and now_ms - resume[2] > _DLQ_RESUME_MAX_AGE_SECONDS * 1000:
+            resumes.pop(log_group, None)
+            resume = None
+
+        def _fresh_start() -> int:
+            # Remember that THIS read had no cursor and therefore only looked back
+            # ``window_seconds``. Anything quarantined before that is, in this module's own
+            # words, an event that can never be picked up -- so the count it produces is a
+            # LOWER BOUND, and a cut-over decision must be told that rather than shown a
+            # number that looks complete.
+            if cursor is None:
+                self._dlq_first_read_window_seconds[log_group] = int(window_seconds)
+            return cursor if cursor is not None else now_ms - window_seconds * 1000
+
+        if resume is not None:
+            start_ms, token, chain_started_ms = resume
+        else:
+            start_ms, token, chain_started_ms = _fresh_start(), None, now_ms
+
+        def _pages(logs, token):
             # FOLLOW nextToken. A single page capped at ``limit`` silently dropped every
             # further dead letter in the window -- and the quarantine count is exactly the
             # number a cut-over decision turns on, so an undercount reads as a cleaner
             # stream than there was. Bounded by ``max_pages`` so a pathological log group
             # cannot turn an advisory poll into an unbounded scan; when the bound is hit we
             # say so (``dlq_read_truncated``) instead of returning a quiet partial count.
-            events = []
-            token = None
+            events: list = []
             for _page in range(max(1, max_pages)):
                 kwargs = {
                     "logGroupName": log_group,
@@ -338,12 +479,36 @@ class MskConnectController:
                 events.extend(list(response.get("events", []) or []))
                 token = response.get("nextToken")
                 if not token:
-                    break
-            else:
-                truncated = bool(token)
-        except Exception:  # noqa: BLE001 - advisory monitoring read, never crash
+                    return events, None, False
+            return events, token, bool(token)
+
+        try:
+            logs = self._client("logs")
+            try:
+                events, token, truncated = _pages(logs, token)
+            except Exception:
+                if resume is None:
+                    raise
+                # A continuation CloudWatch no longer accepts (expired, or the group was
+                # recreated): drop it and read afresh from the cursor, once.
+                resumes.pop(log_group, None)
+                resume = None
+                start_ms, chain_started_ms = _fresh_start(), now_ms
+                events, token, truncated = _pages(logs, None)
+        except Exception as exc:  # noqa: BLE001 - advisory monitoring read, never crash
+            # Still [] (the monitor degrades gracefully), but the failure is RECORDED: a
+            # failed read must not pass for an empty queue at cut over.
+            self._dlq_state_dict("_dlq_read_ok")[log_group] = False
+            self._dlq_state_dict("_dlq_read_error")[log_group] = _dlq_error_code(exc)
             return []
+        if truncated:
+            resumes[log_group] = (int(start_ms), str(token), int(chain_started_ms))
+        else:
+            resumes.pop(log_group, None)
+        self._dlq_state_dict("_dlq_read_started_ms")[log_group] = int(chain_started_ms)
         self._dlq_read_truncated[log_group] = truncated
+        self._dlq_state_dict("_dlq_read_ok")[log_group] = True
+        self._dlq_state_dict("_dlq_read_error")[log_group] = None
         errors: list[CdcConnectorError] = []
         max_ts = cursor or 0
         for event in events:
@@ -365,8 +530,26 @@ class MskConnectController:
                 errors.append(record)
             if isinstance(timestamp, (int, float)) and timestamp > max_ts:
                 max_ts = int(timestamp)
-        if max_ts:
+        if not truncated:
+            # A complete read: nothing older than the ingest grace can still arrive, so the
+            # cursor may trail "now" by that much even when no event was read. max() keeps it
+            # from ever moving backwards (max_ts starts at the previous cursor) and past the
+            # newest event already read. "Now" is when this read BEGAN (a continuation's
+            # first call): a line ingested while it was continuing is read next time.
+            self._dlq_cursor_ms[log_group] = max(
+                max_ts + 1 if max_ts else 0,
+                chain_started_ms - _DLQ_INGEST_GRACE_SECONDS * 1000,
+            )
+        elif max_ts > (cursor or 0):
+            # Past the newest event read -- the restart point should the continuation be
+            # dropped. Unmoved when this capped read matched nothing new.
             self._dlq_cursor_ms[log_group] = max_ts + 1
+        # Coverage of this group starts at the first successful read that reached the end or
+        # established a read position (a seeded controller's start IS its seeded cursor).
+        if not truncated or self._dlq_cursor_ms.get(log_group) is not None:
+            self._dlq_state_dict("_dlq_history_start_ms").setdefault(
+                log_group, int(start_ms)
+            )
         # Bound the de-dup set so a long-running session never grows it unbounded.
         if len(seen) > 5000:
             self._dlq_seen_ids[log_group] = set(list(seen)[-2000:])

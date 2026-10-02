@@ -1330,6 +1330,46 @@ class SchemaDriftSummary(BaseModel):
     count: int = Field(ge=1)
 
 
+class CdcDlqLedgerEntry(BaseModel):
+    """One table's running tally of CDC dead letters, kept across app restarts.
+
+    The dead-letter RECORDS live only in the in-memory error log, and the persisted DLQ
+    read cursor stops a restarted session from ever reading them again -- so without this
+    tally a restart made every earlier dead letter vanish from the cut-over decision. It
+    is the per-table memory the cut-over gate (``ui/cdc_dlq_gate.py``) reads: how many
+    records the stream set aside for the table, when the latest one was logged (the MSK
+    Connect worker / CloudWatch clock), and which drift kinds they revealed. Value-free
+    (Property 7) and bounded: one entry per table, at most a handful of kind labels.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    count: int = Field(default=0, ge=0)
+    last_at: Optional[datetime] = None
+    # ``core.cdc.SchemaDriftKind`` values (plus ``"oversized-value"``), sorted, unique.
+    kinds: list[str] = Field(default_factory=list)
+
+
+class CdcDlqWaiver(BaseModel):
+    """The operator's recorded decision to cut over without the full CDC dead-letter check.
+
+    Scoped, never sticky: ``tables`` maps each table whose dead letters Validation could not
+    prove (not in the report, or inside an accepted gap) to the record count seen when the
+    decision was made, and ``read_problem`` names the dead-letter-queue read problem that was
+    accepted (``"failed"`` / ``"incomplete"`` / ``"partial-history"``), if any. A later dead
+    letter for such a table, a new such table or a different read problem re-opens the check
+    -- once the queue can be read: while a ``"failed"`` read keeps failing, no newer dead
+    letter can be seen at all. It never covers a table that can simply be re-checked by
+    CHECKSUM, and never a Validation mismatch.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tables: dict[str, int] = Field(default_factory=dict)
+    read_problem: Optional[str] = None
+    waived_at: datetime
+
+
 class LoadStatusView(BaseModel):
     """Normalized monitoring read-model rendered identically for Full Load/CDC.
 
@@ -1773,13 +1813,14 @@ class TableValidationResult(BaseModel):
     # full record-level match. ``matched`` then means "counts equal", not "rows
     # proven identical".
     deep_checks_skipped: bool = False
-    # Rows the migration PERMANENTLY DROPPED for this table (Full Load per-row
-    # quarantine / CDC DLQ) -- 0 when none or unknown. Carried here so a target
+    # Rows the migration PERMANENTLY DROPPED for this table -- populated by the Full Load
+    # per-row quarantine only; 0 when none or unknown. CDC dead letters are NOT counted
+    # here: they gate cut over through the per-table dead-letter ledger instead
+    # (``ui/cdc_dlq_gate.py``), which holds each such table until it matches in a
+    # CHECKSUM comparison started after its last dead letter. Carried here so a target
     # deficit can be attributed instead of leaving the operator to reconstruct it by
-    # hand from the error log: the manual previously told them to "cross-check the
-    # deficit against the Full Load error log / CDC DLQ", which is information the
-    # tool already had. Never changes ``matched`` -- the rows really are absent -- it
-    # only explains WHY, so an expected gap is distinguishable from unexplained loss.
+    # hand from the error log. Never changes ``matched`` -- the rows really are absent --
+    # it only explains WHY, so an expected gap is distinguishable from unexplained loss.
     rows_quarantined: int = Field(default=0, ge=0)
     # The column-exclusion NULL proof, counted in the SAME target pass that produces
     # ``target_row_count`` (no extra scan). ``excluded_nonnull_counts``: per excluded

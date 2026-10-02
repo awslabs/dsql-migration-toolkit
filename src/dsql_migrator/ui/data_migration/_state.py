@@ -301,6 +301,35 @@ class DataMigrationState:
         # Identities of dead letters already written to the DURABLE activity log, so a
         # re-surfaced record is audited once (the write is append-only and permanent).
         self.cdc_dlq_audited_keys: set = set()
+        # The per-table dead-letter LEDGER: {table: CdcDlqLedgerEntry} (count, latest time,
+        # drift kinds), folded from each NEW dead letter as it is audited. PERSISTED on the
+        # session snapshot: the records themselves live only in the in-memory error log and
+        # the restored cursor stops them ever being re-read, so without this a restart made
+        # every earlier dead letter vanish from the cut-over gate (ui/cdc_dlq_gate.py).
+        # Copy-on-write (replaced, never mutated) so a worker thread can read the reference.
+        # O(tables). Cleared only by Start over; deliberately NOT by an attach or a stack
+        # rename -- dead letters are about TARGET tables, whichever stack produced them.
+        self.cdc_dlq_ledger: dict = {}
+        # Per log group, where the tool's continuous dead-letter coverage BEGINS (epoch ms):
+        # the start of the first successful read. Persisted with the ledger; the gate proves
+        # "no dead letter was missed" by comparing it with the CDC start. Copy-on-write.
+        self.cdc_dlq_read_from_ms: dict = {}
+        # The last dead-letter read's outcome (core.cdc_dlq.CdcDlqReadRecord), promoted only
+        # AFTER its records were folded, so a render never sees an "ok" read whose records
+        # are not counted yet. Deliberately transient: a restarted session must read again.
+        self.cdc_dlq_last_read = None
+        # The record the Data Migration poll's worker produced, waiting for the loop-side
+        # fold in _apply_cdc_status to promote it.
+        self.cdc_dlq_pending_read = None
+        # Single-flight claim for the cut-over gate's background dead-letter read
+        # (monotonic start time; None when no read runs). A claim older than the watchdog
+        # bound is re-taken, so a hung read never pins "checking".
+        self._cdc_dlq_check_started: Optional[float] = None
+        # The controller the cut-over gate's read built when the session had none (identity,
+        # controller). Kept HERE -- never as ``cdc_controller``, so Cut over and Validation
+        # still have no discovery side effects -- so a page-capped read's continuation
+        # survives to the next "Check again" instead of re-scanning the same pages. Transient.
+        self.cdc_dlq_gate_reader: Optional[tuple] = None
         # Columns the SOURCE connector could not convert and therefore delivered as NULL
         # (the row itself was applied). Sticky, and keyed by (table, column, type): the
         # same value fails on every row that carries it, so the fact is "this column
@@ -1423,6 +1452,72 @@ class DataMigrationState:
             self.cdc_ops_window_start = (
                 ts if ts is not None else datetime.now(timezone.utc)
             )
+
+    def fold_cdc_dlq_ledger(self, errors: "Sequence[object]") -> None:
+        """Count NEW dead letters into the per-table ledger (copy-on-write, see __init__).
+
+        Called on the event loop with only the records not audited before, so a record
+        that re-surfaces (a rebuilt controller, a re-read) is never counted twice.
+        """
+        if not errors:
+            return
+        from dsql_migrator.core.cdc_dlq import fold_dlq_ledger
+
+        with self._lock:
+            self.cdc_dlq_ledger = fold_dlq_ledger(
+                self.cdc_dlq_ledger, errors, now=datetime.now(timezone.utc)
+            )
+
+    def promote_cdc_dlq_read(self, record: object) -> None:
+        """Publish a dead-letter read's outcome once its records are folded.
+
+        Also records where the coverage of that log group begins, the FIRST time a read
+        proves it -- an earlier, wider start is never replaced by a later one.
+        """
+        if record is None:
+            return
+        with self._lock:
+            self.cdc_dlq_last_read = record
+            group = getattr(record, "log_group", None)
+            start = getattr(record, "history_start_ms", None)
+            if (
+                getattr(record, "ok", False)
+                and group
+                and start is not None
+                and group not in self.cdc_dlq_read_from_ms
+            ):
+                updated = dict(self.cdc_dlq_read_from_ms)
+                updated[group] = int(start)
+                self.cdc_dlq_read_from_ms = updated
+
+    def _cdc_dlq_check_running_locked(self, now: float) -> bool:
+        from dsql_migrator.ui.cdc_dlq_gate import CDC_DLQ_CHECK_TTL_SECONDS
+
+        started = self._cdc_dlq_check_started
+        return started is not None and now - started <= 2 * CDC_DLQ_CHECK_TTL_SECONDS
+
+    def begin_cdc_dlq_check(self, now_monotonic: Optional[float] = None) -> bool:
+        """Claim the cut-over gate's background dead-letter read (single flight)."""
+        import time as _time
+
+        now = _time.monotonic() if now_monotonic is None else now_monotonic
+        with self._lock:
+            if self._cdc_dlq_check_running_locked(now):
+                return False
+            self._cdc_dlq_check_started = now
+            return True
+
+    def finish_cdc_dlq_check(self) -> None:
+        with self._lock:
+            self._cdc_dlq_check_started = None
+
+    @property
+    def cdc_dlq_check_running(self) -> bool:
+        """A background dead-letter read for the cut-over gate is in flight."""
+        import time as _time
+
+        with self._lock:
+            return self._cdc_dlq_check_running_locked(_time.monotonic())
 
     def set_cdc_replication_lag_by_table(self, lag_ms: "dict[str, int]") -> None:
         """Record per-table replication lag in ms (from ``ReplicationLagMs``).

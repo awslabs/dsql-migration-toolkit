@@ -54,15 +54,18 @@ CDC는 **행 수준 데이터 변경**(insert/update/delete)을 복제합니다.
 
 DSQL 타깃 스키마는 **Schema Conversion** 단계에서 고정됩니다. **CDC 중 소스 스키마를 바꾸면**,
 동일 DDL을 DSQL에 직접(Schema Conversion으로) **먼저** 적용하세요. 그 전까지, 타깃 형태에 맞지 않는
-행(예: 새 컬럼 참조)은 손실되지 않고 **DLQ**로 격리됩니다 — 조용히 사라지지 않습니다.
+행(예: 새 컬럼 참조)은 **DLQ**로 dead-letter 처리되며 재시도되지 않습니다 — 눈에는 보이지만 복구해야
+하며, 그런 테이블이 마지막 dead-letter 레코드 이후 CHECKSUM을 통과할 때까지 Cut over는 잠긴
+상태로 남습니다([§5.5](05-validation.md#55-cdc-dead-letter와-컷오버)).
 
 ### CDC 중 소스 스키마 드리프트 감지·처리
 
 소스 `ALTER`를 직접 눈치챌 필요가 없습니다. 데드레터 레코드가 소스 형태 변경을 시사하면, 도구가
 SQLSTATE로 드리프트를 **분류**(컬럼 추가/삭제/타입 변경)하고 CDC 단계에 **"소스 스키마 변경 감지"** 배너를
 표시합니다. 흔한 경우인 소스 **`ADD COLUMN`**에 대해서는 정확한 `ALTER TABLE … ADD COLUMN` 문을 보여주고
-원클릭 적용(트랜잭션당 1 DDL)하는 **"Fix target schema…"** 액션을 제공합니다; 이후 CDC가 재개되고, 컬럼이
-없던 동안 밀쳐뒀던 행은 테이블별 **Reload**로 백필합니다. 컬럼 삭제/타입 변경 드리프트는 직접 해결하도록
+원클릭 적용(트랜잭션당 1 DDL)하는 **"Fix target schema…"** 액션을 제공합니다; 이후 CDC가 재개됩니다. 컬럼이
+없던 동안 밀쳐뒀던 행을 백필하려면 Step 1(Evaluation) 재실행 → Stop CDC → **Drop & reload**로 테이블
+리로드 → Start CDC → Validation에서 재확인(그 테이블은 CHECKSUM이 자동). 컬럼 삭제/타입 변경 드리프트는 직접 해결하도록
 표시만 합니다(도구는 타깃 데이터를 자동 삭제하지 않습니다).
 
 ---
@@ -230,7 +233,8 @@ per-table 표 위에 **파이프라인 헬스 카드**가 각 커넥터 상태�
 인터랙티브 **DLQ 인스펙터**가 데드레터 레코드를 **Time / Table / SQLSTATE / Reason**으로 나열합니다 —
 페이지·필터 지원, 테이블별 분해와 depth 배지 포함 — UI를 벗어나지 않고 poison 행을 트리아지할 수
 있습니다. **"Download CDC error log"**로 NDJSON 내보내기. (Reason에는 SQL 템플릿이 담기고 행 값은 없습니다
-— §4.5 참고.)
+— §4.5 참고.) 레코드 목록은 메모리에만 있어 앱 재시작 후에는 남지 않습니다. 테이블별 건수, 최신 시각,
+드리프트 종류는 남으며, Cut over가 확인하는 것이 바로 이것입니다([§5.5](05-validation.md#55-cdc-dead-letter와-컷오버)).
 
 ---
 

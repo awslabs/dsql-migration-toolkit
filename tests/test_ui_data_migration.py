@@ -29613,3 +29613,500 @@ def test_run_checks_refuses_before_building_anything_or_awaiting() -> None:
     assert "Configure and test the source and target connections first." not in (
         ast.get_source_segment(source, fn)
     )
+
+
+# ---------------------------------------------------------------------------
+# G1: the per-table dead-letter ledger and the read record the cut-over gate reads
+# ---------------------------------------------------------------------------
+
+
+def _g1_dlq(table: str, offset: int, code: str = "42804"):
+    from dsql_migrator.core.cdc import CdcConnectorError
+
+    return CdcConnectorError(
+        table=table, message=f"DLQ offset={offset}: boom", error_code=code,
+        occurred_at=datetime(2026, 9, 1, 11, offset, tzinfo=timezone.utc),
+    )
+
+
+def test_the_ledger_counts_each_new_dead_letter_once(monkeypatch) -> None:
+    import dsql_migrator.core.activity_log as act
+    from dsql_migrator.ui.data_migration import _apply_cdc_status
+
+    monkeypatch.setattr(act, "log_activity", lambda *a, **k: None)
+    state = DataMigrationState()
+    first = [_g1_dlq("shop.orders", 1), _g1_dlq("shop.orders", 2)]
+    _apply_cdc_status(state, ([], {}, first, {}, {}, []))
+    assert state.cdc_dlq_ledger["shop.orders"].count == 2
+    assert state.cdc_dlq_ledger["shop.orders"].kinds == ["type-change"]
+    before = state.cdc_dlq_ledger
+    _apply_cdc_status(state, ([], {}, first, {}, {}, []))  # re-surfaced: not recounted
+    assert state.cdc_dlq_ledger["shop.orders"].count == 2
+    _apply_cdc_status(state, ([], {}, [_g1_dlq("shop.orders", 3)], {}, {}, []))
+    assert state.cdc_dlq_ledger["shop.orders"].count == 3
+    assert state.cdc_dlq_ledger is not before  # copy-on-write: readers keep their view
+    assert before["shop.orders"].count == 2
+
+
+class _G1Ctl(_FakeCdcController):
+    def __init__(self, *, raises=None, read_state=True, **kw):
+        from dsql_migrator.core.cdc import ConnectorState, ConnectorStatus
+        from dsql_migrator.core.msk_connect_controller import ConnectorHealth
+
+        super().__init__(
+            statuses=[ConnectorStatus(name="sink", state=ConnectorState.RUNNING)],
+            health={"sink": ConnectorHealth(running_tasks=1, errored_tasks=0)},
+        )
+        self.kwargs: list[dict] = []
+        self._raises = raises
+        if not read_state:
+            self.dlq_read_state = None  # an older controller: cannot say what it proved
+
+    def dlq_errors(self, log_group, **kw):
+        self.kwargs.append(kw)
+        if self._raises is not None:
+            raise self._raises
+        return [_g1_dlq("shop.orders", 1)]
+
+    def dlq_cursor_state(self):
+        return ({"/msk-connect/dsql-cdc-stack-cdc": 9}, {})
+
+    def dlq_coverage_bound(self, _group):
+        return None
+
+    def dlq_read_state(self, group):  # noqa: F811 - replaced per instance above
+        from dsql_migrator.core.msk_connect_controller import DlqReadState
+
+        return DlqReadState(ok=True, truncated=False, history_start_ms=123)
+
+
+def test_the_poll_records_what_its_read_proved_and_publishes_it_after_the_fold(
+    monkeypatch,
+) -> None:
+    import dsql_migrator.core.activity_log as act
+    from dsql_migrator.ui.data_migration import _apply_cdc_status, _fetch_cdc_status
+
+    monkeypatch.setattr(act, "log_activity", lambda *a, **k: None)
+    state = DataMigrationState()
+    ctl = _G1Ctl()
+    state.set_cdc_controller(ctl)
+    state.set_cdc_connector_names(["sink"])
+    fetched = _fetch_cdc_status(state)
+    _statuses, _health, dlq_errors, _ops, _lag, _series = fetched  # still a 6-tuple
+    assert [e.table for e in dlq_errors] == ["shop.orders"]
+    assert ctl.kwargs == [{}]  # no CDC start known: the reader's default window
+    pending = state.cdc_dlq_pending_read
+    assert pending is not None and pending.ok and pending.complete
+    assert pending.history_start_ms == 123 and pending.log_group == "/msk-connect/dsql-cdc-stack-cdc"
+    assert state.cdc_dlq_last_read is None  # not published before its records are folded
+    _apply_cdc_status(state, fetched)
+    assert state.cdc_dlq_last_read is pending and state.cdc_dlq_pending_read is None
+    assert state.cdc_dlq_ledger["shop.orders"].count == 1
+    assert state.cdc_dlq_read_from_ms == {"/msk-connect/dsql-cdc-stack-cdc": 123}
+
+
+def test_the_poll_widens_the_first_read_to_the_cdc_start_only_when_known() -> None:
+    from datetime import timedelta
+
+    from dsql_migrator.ui.data_migration import _fetch_cdc_status
+
+    state = DataMigrationState()
+    ctl = _G1Ctl()
+    state.set_cdc_controller(ctl)
+    state.set_cdc_connector_names(["sink"])
+    state.set_cdc_ops_window_start(datetime.now(timezone.utc) - timedelta(hours=20))
+    _fetch_cdc_status(state)
+    window = ctl.kwargs[-1]["window_seconds"]
+    assert 20 * 3600 + 290 <= window <= 20 * 3600 + 400  # five minutes before the start
+
+
+def test_a_raising_reader_is_a_failed_read_and_an_old_controller_records_nothing() -> None:
+    from dsql_migrator.ui.data_migration import _fetch_cdc_status
+
+    state = DataMigrationState()
+    state.set_cdc_controller(_G1Ctl(raises=RuntimeError("throttled")))
+    state.set_cdc_connector_names(["sink"])
+    _fetch_cdc_status(state)
+    assert state.cdc_dlq_pending_read.ok is False
+    assert state.cdc_dlq_pending_read.error_code == "RuntimeError"
+
+    old = DataMigrationState()
+    old.set_cdc_controller(_G1Ctl(read_state=False))
+    old.set_cdc_connector_names(["sink"])
+    _fetch_cdc_status(old)
+    assert old.cdc_dlq_pending_read is None
+
+
+def test_the_gate_read_without_a_target_is_a_failed_record_never_an_exception() -> None:
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.data_migration._cdc_status import read_cdc_dlq_once
+
+    errors, record, cursor = read_cdc_dlq_once(DataMigrationState(), SimpleNamespace(target_config=None))
+    assert errors == [] and cursor is None
+    assert record.ok is False and record.error_code == "NoTargetConnection"
+
+
+def test_the_gate_read_reuses_the_session_controller_and_lands_in_order(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import dsql_migrator.core.activity_log as act
+    import dsql_migrator.ui.data_migration._cdc_status as status
+
+    monkeypatch.setattr(act, "log_activity", lambda *a, **k: None)
+    state = DataMigrationState()
+    ctl = _G1Ctl()
+    state.set_cdc_controller(ctl, ("us-east-1", None))
+    session = SimpleNamespace(target_config=SimpleNamespace(region="us-east-1"), aws_profile=None)
+    fetched = status.read_cdc_dlq_once(state, session)
+    assert ctl.kwargs, "the session's controller was reused"
+    order: list[str] = []
+    real_fold = status._fold_cdc_dlq_errors
+    monkeypatch.setattr(
+        status, "_fold_cdc_dlq_errors",
+        lambda ms, errs: order.append("fold") or real_fold(ms, errs),
+    )
+    real_promote = state.promote_cdc_dlq_read
+
+    def _promote(record):
+        order.append("promote")
+        assert state.cdc_dlq_cursor_ms == {"/msk-connect/dsql-cdc-stack-cdc": 9}
+        real_promote(record)
+
+    state.promote_cdc_dlq_read = _promote  # type: ignore[method-assign]
+    status.apply_cdc_dlq_read(state, fetched)
+    assert order == ["fold", "promote"]
+    assert state.cdc_dlq_ledger["shop.orders"].count == 1
+    assert state.cdc_dlq_last_read.ok is True
+
+
+def test_start_over_clears_the_dead_letter_ledger() -> None:
+    from dsql_migrator.core.cdc_dlq import CdcDlqReadRecord
+    from dsql_migrator.ui.data_migration import DataMigrationStore
+
+    store = DataMigrationStore()
+    state = store.get_or_create("s1")
+    state.fold_cdc_dlq_ledger([_g1_dlq("shop.orders", 1)])
+    state.promote_cdc_dlq_read(CdcDlqReadRecord(
+        log_group="g", started_at=datetime.now(timezone.utc), ok=True, complete=True,
+        history_start_ms=1,
+    ))
+    assert state.cdc_dlq_ledger and state.cdc_dlq_read_from_ms and state.cdc_dlq_last_read
+    store.reset_in_place("s1")
+    assert state.cdc_dlq_ledger == {} and state.cdc_dlq_read_from_ms == {}
+    assert state.cdc_dlq_last_read is None
+
+
+def test_an_attach_keeps_the_dead_letter_ledger() -> None:
+    state = DataMigrationState()
+    state.fold_cdc_dlq_ledger([_g1_dlq("shop.orders", 1)])
+    assert state.adopt_cdc_stack("dsql-cdc-other") is True
+    assert state.cdc_dlq_ledger["shop.orders"].count == 1
+
+
+def test_the_gate_read_claim_is_single_flight_with_a_watchdog() -> None:
+    from dsql_migrator.ui.cdc_dlq_gate import CDC_DLQ_CHECK_TTL_SECONDS
+
+    state = DataMigrationState()
+    assert state.begin_cdc_dlq_check(now_monotonic=100.0) is True
+    assert state.begin_cdc_dlq_check(now_monotonic=101.0) is False
+    assert state.begin_cdc_dlq_check(now_monotonic=100.0 + 2 * CDC_DLQ_CHECK_TTL_SECONDS + 1)
+    state.finish_cdc_dlq_check()
+    assert state.cdc_dlq_check_running is False
+
+
+def test_the_read_record_carries_the_page_cap_through_to_the_gate(monkeypatch) -> None:
+    """The controller's ``truncated`` must reach the gate as an INCOMPLETE read, on both
+    paths that build a read record -- a capped read published as complete released cut
+    over with dead letters still unread."""
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    import dsql_migrator.core.activity_log as act
+    from dsql_migrator.core.msk_connect_controller import DlqReadState
+    from dsql_migrator.ui.cdc_dlq_gate import cdc_dlq_gate_for
+    from dsql_migrator.ui.data_migration import _apply_cdc_status, _fetch_cdc_status
+    from dsql_migrator.ui.data_migration._cdc_status import apply_cdc_dlq_read, read_cdc_dlq_once
+
+    monkeypatch.setattr(act, "log_activity", lambda *a, **k: None)
+    now = datetime.now(timezone.utc)
+    evidence = now - timedelta(minutes=1)
+    for truncated in (True, False):
+        class _Capped(_G1Ctl):
+            def dlq_read_state(self, group, _t=truncated):  # noqa: F811
+                return DlqReadState(ok=True, truncated=_t, history_start_ms=123)
+
+        for path in ("poll", "gate"):
+            state = DataMigrationState()
+            state.set_cdc_ops_window_start(now - timedelta(hours=1))
+            state.set_cdc_controller(_Capped(), ("us-east-1", None))
+            state.set_cdc_connector_names(["sink"])
+            if path == "poll":
+                _apply_cdc_status(state, _fetch_cdc_status(state))
+            else:
+                fetched = read_cdc_dlq_once(state, SimpleNamespace(
+                    target_config=SimpleNamespace(region="us-east-1"), aws_profile=None))
+                assert fetched[1].complete is (not truncated)
+                apply_cdc_dlq_read(state, fetched)
+            assert state.cdc_dlq_last_read.complete is (not truncated), (path, truncated)
+            vs = SimpleNamespace(completed_at=evidence, rechecked_at=None, result=None,
+                                 compared_run_start=None, compared_overrides={},
+                                 cutover_dlq_waiver=None)
+            gate = cdc_dlq_gate_for(state, vs, cdc_in_use=True, release="clean", summary=None)
+            assert gate.read_state == ("incomplete" if truncated else "ok"), (path, truncated)
+
+
+def test_the_first_read_window_is_clamped_to_six_hours_and_fourteen_days() -> None:
+    """Bounded on both sides; 14 d also stays under the log group's 30-day retention, so a
+    read with no cursor never claims history CloudWatch has already expired."""
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.data_migration._cdc_status import _dlq_read_kwargs
+
+    now = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
+    assert _dlq_read_kwargs(SimpleNamespace(cdc_ops_window_start=now - timedelta(days=30)),
+                            now) == {"window_seconds": 14 * 24 * 3600}
+    assert _dlq_read_kwargs(SimpleNamespace(cdc_ops_window_start=now - timedelta(hours=1)),
+                            now) == {"window_seconds": 6 * 3600}
+    assert _dlq_read_kwargs(SimpleNamespace(cdc_ops_window_start=None), now) == {}
+
+
+class _G1RecordingCtl:
+    def __init__(self):
+        self.reads: list = []
+        self.seeded = None
+
+    def seed_dlq_cursor(self, cursor_ms=None, seen_ids=None):
+        self.seeded = (dict(cursor_ms or {}), dict(seen_ids or {}))
+
+    def dlq_errors(self, group, **kw):
+        self.reads.append(group)
+        return []
+
+    def dlq_read_state(self, group):
+        from dsql_migrator.core.msk_connect_controller import DlqReadState
+
+        return DlqReadState(ok=True, truncated=False, history_start_ms=1)
+
+    def dlq_cursor_state(self):
+        return ({"/msk-connect/dsql-cdc-stack-cdc": 9}, {})
+
+
+def test_the_gate_read_for_another_identity_builds_a_seeded_reader_it_keeps_apart(
+    monkeypatch,
+) -> None:
+    from types import SimpleNamespace
+
+    import dsql_migrator.core.msk_connect_controller as mcc
+    import dsql_migrator.ui.data_migration._cdc_status as status
+
+    group = "/msk-connect/dsql-cdc-stack-cdc"
+    for old in (_G1RecordingCtl(), None):
+        state = DataMigrationState()
+        if old is not None:
+            state.set_cdc_controller(old, ("us-east-1", "profile-a"))
+        state.cdc_dlq_cursor_ms = {group: 7}
+        state.cdc_dlq_seen_ids = {group: {"e1"}}
+        built: list = []
+
+        def _build(region, aws_profile=None, _built=built):
+            ctl = _G1RecordingCtl()
+            _built.append((region, aws_profile, ctl))
+            return ctl
+
+        monkeypatch.setattr(mcc, "build_msk_connect_controller", _build)
+        session = SimpleNamespace(
+            target_config=SimpleNamespace(region="ap-northeast-2"), aws_profile="profile-b"
+        )
+        _errors, record, _cursor = status.read_cdc_dlq_once(state, session)
+        if old is not None:
+            assert old.reads == []  # never the other identity's controller
+        ((region, profile, new),) = built
+        assert (region, profile) == ("ap-northeast-2", "profile-b")
+        assert new.seeded == ({group: 7}, {group: {"e1"}})  # resumes the session's cursor
+        assert new.reads == [group] and record.ok
+        assert state.cdc_controller is old  # no discovery side effect
+        # ...and the next gate read reuses that reader (its continuation carries on).
+        status.read_cdc_dlq_once(state, session)
+        assert len(built) == 1 and new.reads == [group, group]
+
+
+def test_a_later_coverage_start_never_replaces_the_first() -> None:
+    from dsql_migrator.core.cdc_dlq import CdcDlqReadRecord
+
+    group = "/msk-connect/dsql-cdc-stack-cdc"
+    state = DataMigrationState()
+
+    def _record(start):
+        return CdcDlqReadRecord(
+            log_group=group, started_at=datetime.now(timezone.utc), ok=True, complete=True,
+            history_start_ms=start,
+        )
+
+    state.promote_cdc_dlq_read(_record(100))
+    state.promote_cdc_dlq_read(_record(900))
+    assert state.cdc_dlq_read_from_ms == {group: 100}
+    assert state.cdc_dlq_last_read.history_start_ms == 900
+
+
+def test_check_again_reads_on_through_a_log_group_too_large_for_one_read(monkeypatch) -> None:
+    """A clean, busy log group: FilterLogEvents returns empty pages with a token. The
+    gate's read used a throwaway controller and restarted every time, so "Check again"
+    re-read the same 20 pages forever and the gate stayed "incomplete"."""
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    import dsql_migrator.core.activity_log as act
+    import dsql_migrator.core.msk_connect_controller as mcc
+    from dsql_migrator.ui.cdc_dlq_gate import cdc_dlq_gate_for
+    from dsql_migrator.ui.data_migration._cdc_status import apply_cdc_dlq_read, read_cdc_dlq_once
+
+    monkeypatch.setattr(act, "log_activity", lambda *a, **k: None)
+
+    class _Busy:
+        def __init__(self):
+            self.calls = 0
+
+        def filter_log_events(self, **kw):
+            self.calls += 1
+            page = int((kw.get("nextToken") or "0:0").split(":")[1])
+            if page + 1 >= 25:
+                return {"events": []}
+            return {"events": [], "nextToken": f"{kw['startTime']}:{page + 1}"}
+
+    logs = _Busy()
+
+    def _build(region, aws_profile=None):
+        ctl = mcc.MskConnectController(region, aws_profile=aws_profile)
+        ctl._client = lambda _svc: logs  # type: ignore[assignment]
+        return ctl
+
+    monkeypatch.setattr(mcc, "build_msk_connect_controller", _build)
+    state = DataMigrationState()
+    state.set_cdc_ops_window_start(datetime.now(timezone.utc) - timedelta(days=2))
+    session = SimpleNamespace(target_config=SimpleNamespace(region="us-east-1"), aws_profile=None)
+    vs = SimpleNamespace(completed_at=datetime.now(timezone.utc) - timedelta(hours=1),
+                         rechecked_at=None, result=None, compared_run_start=None,
+                         compared_overrides={}, cutover_dlq_waiver=None)
+    states = []
+    for _check_again in range(3):
+        apply_cdc_dlq_read(state, read_cdc_dlq_once(state, session))
+        states.append(
+            cdc_dlq_gate_for(state, vs, cdc_in_use=True, release="clean", summary=None).read_state
+        )
+        if states[-1] == "ok":
+            break
+    assert states == ["incomplete", "ok"]
+    assert logs.calls == 25  # every page read once, none re-scanned
+
+
+def test_a_poll_cancelled_mid_read_still_folds_its_dead_letters(monkeypatch) -> None:
+    """The poll's worker has already moved the shared DLQ cursor past what it read; a
+    refresh or step change that cancels the timer must not drop those records."""
+    import asyncio
+    import sys
+    import time
+    import types
+
+    from nicegui import run as real_run
+
+    import dsql_migrator.core.activity_log as act
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    monkeypatch.setattr(act, "log_activity", lambda *a, **k: None)
+    fake = types.ModuleType("nicegui")
+    fake.run = real_run  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "nicegui", fake)
+
+    class _SlowCtl(_G1Ctl):
+        def dlq_errors(self, log_group, **kw):
+            time.sleep(0.3)
+            return super().dlq_errors(log_group, **kw)
+
+    state = DataMigrationState()
+    state.set_cdc_controller(_SlowCtl())
+    state.set_cdc_connector_names(["sink"])
+    state.set_cdc_stack_phase("running")
+    polls: list = []
+
+    class _Ui(_RecordingUi):
+        def timer(self, _interval, callback, *_a, **_k):
+            polls.append(callback)
+            return self._El(self)
+
+    _cdc_ui._render_cdc_live_monitoring(_Ui(), state, _StubJobManager({}))
+    (poll,) = [cb for cb in polls if getattr(cb, "__name__", "") == "_poll_cdc"]
+
+    async def scenario():
+        task = asyncio.get_running_loop().create_task(poll())
+        await asyncio.sleep(0.1)  # the read is on the worker now
+        task.cancel()  # what deleting the timer does to its running callback
+        for _ in range(60):
+            await asyncio.sleep(0.05)
+            if "shop.orders" in state.cdc_dlq_ledger:
+                break
+
+    asyncio.run(scenario())
+    assert state.cdc_dlq_ledger["shop.orders"].count == 1
+
+
+def test_start_over_drops_the_gate_reader() -> None:
+    from dsql_migrator.ui.data_migration import DataMigrationStore
+
+    store = DataMigrationStore()
+    state = store.get_or_create("s1")
+    state.cdc_dlq_gate_reader = (("us-east-1", None), object())
+    store.reset_in_place("s1")
+    assert state.cdc_dlq_gate_reader is None
+
+
+def test_a_continued_read_counts_from_its_first_call_not_its_last(monkeypatch) -> None:
+    """The gate wants a read STARTED after the latest validation; a continuation begun
+    before it covers only up to its first call, so it must not count as one."""
+    import time
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    import dsql_migrator.core.activity_log as act
+    import dsql_migrator.core.msk_connect_controller as mcc
+    from dsql_migrator.ui.cdc_dlq_gate import cdc_dlq_gate_for
+    from dsql_migrator.ui.data_migration._cdc_status import apply_cdc_dlq_read, read_cdc_dlq_once
+
+    monkeypatch.setattr(act, "log_activity", lambda *a, **k: None)
+    long_ago = int((datetime.now(timezone.utc) - timedelta(days=1)).timestamp() * 1000)
+
+    class _Busy:
+        def filter_log_events(self, **kw):
+            pages = 25 if kw["startTime"] < long_ago else 1  # a short range reads in one
+            page = int((kw.get("nextToken") or "0:0").split(":")[1])
+            if page + 1 >= pages:
+                return {"events": []}
+            return {"events": [], "nextToken": f"{kw['startTime']}:{page + 1}"}
+
+    def _build(region, aws_profile=None):
+        ctl = mcc.MskConnectController(region, aws_profile=aws_profile)
+        ctl._client = lambda _svc: _Busy()  # type: ignore[assignment]
+        return ctl
+
+    monkeypatch.setattr(mcc, "build_msk_connect_controller", _build)
+    state = DataMigrationState()
+    state.set_cdc_ops_window_start(datetime.now(timezone.utc) - timedelta(days=2))
+    session = SimpleNamespace(target_config=SimpleNamespace(region="us-east-1"), aws_profile=None)
+    apply_cdc_dlq_read(state, read_cdc_dlq_once(state, session))  # capped: incomplete
+    first_started = state.cdc_dlq_last_read.started_at
+    time.sleep(0.02)  # the stamps are milliseconds: keep the three moments apart
+    vs = SimpleNamespace(completed_at=datetime.now(timezone.utc), rechecked_at=None,
+                         result=None, compared_run_start=None, compared_overrides={},
+                         cutover_dlq_waiver=None)  # a validation finished since
+
+    def _state():
+        return cdc_dlq_gate_for(state, vs, cdc_in_use=True, release="clean", summary=None)
+
+    apply_cdc_dlq_read(state, read_cdc_dlq_once(state, session))  # continued to the end
+    assert state.cdc_dlq_last_read.complete
+    assert state.cdc_dlq_last_read.started_at == first_started
+    assert _state().read_state == "pending"  # not credited as a read after the validation
+    time.sleep(0.02)
+    apply_cdc_dlq_read(state, read_cdc_dlq_once(state, session))  # a fresh, short read
+    assert _state().read_state == "ok"

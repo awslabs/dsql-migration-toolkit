@@ -36,6 +36,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from dsql_migrator.core.models import (
     AiConversation,
     AssessmentReport,
+    CdcDlqLedgerEntry,
+    CdcDlqWaiver,
     SourceInventory,
     TableSelection,
     TargetInventory,
@@ -174,6 +176,16 @@ class SessionSnapshot(BaseModel):
     # the cursor restored there is no re-read of old events to de-duplicate, and the sets
     # are bounded at thousands of ids (snapshot bloat for no gain).
     cdc_dlq_cursor_ms: dict[str, int] = Field(default_factory=dict)
+    # The per-table dead-letter LEDGER ({table: count, latest time, drift kinds}). The
+    # restored cursor above stops a restarted session from re-reading old dead letters, and
+    # the records themselves live only in memory -- so without this the cut-over gate would
+    # forget every dead letter read before a restart (fail open). O(tables).
+    cdc_dlq_ledger: dict[str, CdcDlqLedgerEntry] = Field(default_factory=dict)
+    # Per log group, where the tool's continuous dead-letter coverage began (epoch ms). An
+    # older snapshot has none; the rebuilt controller's coverage then starts at the restored
+    # cursor, after the CDC start, so the gate reports the history as unconfirmed (fail
+    # closed) until one full CHECKSUM run or a recorded waiver.
+    cdc_dlq_read_from_ms: dict[str, int] = Field(default_factory=dict)
     # The NON-SECRET Secrets Manager reference the operator authenticated the source with.
     # Not a credential (the password is never persisted), and without it a restored session
     # forgot the auth METHOD as well as the reference -- and the CDC deploy/teardown reads
@@ -249,6 +261,13 @@ class SessionSnapshot(BaseModel):
     # ``None`` for a report that was never partially re-checked (the usual case).
     validation_rechecked_tables: list[str] = Field(default_factory=list)
     validation_rechecked_at: Optional[datetime] = None
+    # The CDC dead-letter gate's evidence for ``validation_report``: when the run started
+    # and, per table, when a later re-check / the run's CHECKSUM pass started (overrides
+    # only, so it stays compact), plus the operator's recorded waiver. An older snapshot has
+    # none, which the gate reads as "compare time unknown" -- unproven, never resolved.
+    validation_run_started_at: Optional[datetime] = None
+    validation_compared_from: dict[str, datetime] = Field(default_factory=dict)
+    validation_cdc_dlq_waiver: Optional[CdcDlqWaiver] = None
 
 
 class SessionStateStore(Protocol):

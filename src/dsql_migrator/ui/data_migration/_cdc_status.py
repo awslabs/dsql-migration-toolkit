@@ -1316,6 +1316,79 @@ def _target_overlay_facts_reader(session):
     return _read
 
 
+def _seed_dlq_cursor_from_state(controller, migration_state) -> None:
+    """Restore the DLQ read cursor (and seen ids) from the SESSION onto a new controller.
+
+    A rebuilt controller otherwise starts cursor-less and re-reads the blind look-back
+    window, re-writing every already audited dead letter to the durable activity log
+    (N records became 2N, 3N lines). Shared by discovery and the cut-over gate's read.
+    """
+    _seed = getattr(migration_state, "cdc_dlq_cursor_ms", None)
+    if _seed:
+        try:
+            controller.seed_dlq_cursor(
+                _seed, dict(getattr(migration_state, "cdc_dlq_seen_ids", None) or {})
+            )
+        except AttributeError:
+            pass
+
+
+def cdc_dlq_log_group(stack_name: str) -> str:
+    """The CloudWatch log group the DSQL sink writes its dead-letter lines to."""
+    return f"/msk-connect/{stack_name}-cdc"
+
+
+def _dlq_read_kwargs(migration_state, now: "Optional[datetime]" = None) -> dict:
+    """The first-read look-back for this session's dead-letter reads (``{}``: the default).
+
+    A read with no cursor can see only its look-back window, and the default (6 h) is
+    shorter than a long Full Load: the dead letters CDC logged before that were never
+    counted. When the CDC start is known (the Full Load watermark, or the CDC start for CDC
+    only) the window reaches 5 minutes before it, clamped to [6 h, 14 d] so the read stays
+    bounded. Only affects a read that has no cursor yet.
+    """
+    start = getattr(migration_state, "cdc_ops_window_start", None)
+    if start is None:
+        return {}
+    try:
+        current = now or datetime.now(timezone.utc)
+        elapsed = (current - start).total_seconds() + 300
+    except Exception:  # noqa: BLE001 - a malformed start falls back to the default window
+        return {}
+    return {"window_seconds": int(max(6 * 3600, min(elapsed, 14 * 24 * 3600)))}
+
+
+def _dlq_read_record(controller, group: str, started_at: datetime):
+    """The :class:`CdcDlqReadRecord` a just-finished read of ``group`` proved, or ``None``
+    when the controller cannot say (an older double without ``dlq_read_state``).
+
+    A read that CONTINUED a page-capped one began at that one's first call, so the record's
+    start is the earlier of the two: the gate asks for a read that started after the latest
+    validation, and a continuation begun before it must not count as one."""
+    from dsql_migrator.core.cdc_dlq import CdcDlqReadRecord
+
+    reader = getattr(controller, "dlq_read_state", None)
+    if not callable(reader):
+        return None
+    state = reader(group)
+    if state is None:
+        return None
+    began_ms = getattr(state, "started_ms", None)
+    if isinstance(began_ms, (int, float)):
+        began = datetime.fromtimestamp(began_ms / 1000, tz=timezone.utc)
+        if began < started_at:
+            started_at = began
+    return CdcDlqReadRecord(
+        log_group=group,
+        started_at=started_at,
+        ok=bool(getattr(state, "ok", False)),
+        complete=bool(getattr(state, "ok", False))
+        and not bool(getattr(state, "truncated", False)),
+        error_code=getattr(state, "error_code", None),
+        history_start_ms=getattr(state, "history_start_ms", None),
+    )
+
+
 def _discover_cdc_controller(migration_state, session) -> None:
     """Wire the read-only MSK Connect controller, probe stack phase, detect connectors.
 
@@ -1417,17 +1490,7 @@ def _discover_cdc_controller(migration_state, session) -> None:
     # Record the identity so a later profile/region change drops this cache instead of
     # serving the old account's view.
     migration_state.set_cdc_controller(controller, _identity)
-    # Restore the DLQ read cursor from the SESSION: a rebuilt controller otherwise starts
-    # cursor-less and re-reads the blind 6h look-back window, re-writing every already
-    # audited dead letter to the durable activity log (N records became 2N, 3N lines).
-    _seed = getattr(migration_state, "cdc_dlq_cursor_ms", None)
-    if _seed:
-        try:
-            controller.seed_dlq_cursor(
-                _seed, dict(getattr(migration_state, "cdc_dlq_seen_ids", None) or {})
-            )
-        except AttributeError:
-            pass
+    _seed_dlq_cursor_from_state(controller, migration_state)
     if not names:
         # No connectors of mine: this is also how a Stop/Delete reads once it lands,
         # so the step status must follow (see _sync_cdc_step_status).
@@ -1614,9 +1677,12 @@ def _fetch_cdc_status(migration_state, tables=None):
     or the read fails. This is the only part of the CDC poll that touches the network,
     so the live poller runs it on a worker thread (``run.io_bound``) -- keeping the
     blocking calls off the NiceGUI event loop so the browser's WebSocket keep-alive
-    is never starved. Pure read: it does not mutate ``migration_state`` (the apply
-    step does that on the loop). ``tables`` (the migrated table set) scopes the
-    scan-free per-table applied-ops metrics read; omitted (non-UI callers) -> skipped.
+    is never starved. It builds no view (the apply step does that on the loop), but it
+    is not a pure read: it writes the DLQ read bookkeeping onto ``migration_state`` --
+    the cursor and seen ids, the coverage bound, the value-conversion set, and the
+    read's outcome as ``cdc_dlq_pending_read``, which :func:`_apply_cdc_status`
+    promotes only after folding the records. ``tables`` (the migrated table set) scopes
+    the scan-free per-table applied-ops metrics read; omitted (non-UI callers) -> skipped.
     """
     controller = getattr(migration_state, "cdc_controller", None)
     names = list(getattr(migration_state, "cdc_connector_names", []) or [])
@@ -1681,11 +1747,32 @@ def _fetch_cdc_status(migration_state, tables=None):
     stack_name = getattr(migration_state, "cdc_stack_name", None)
     reader = getattr(controller, "dlq_errors", None)
     if callable(reader) and stack_name:
+        _group = cdc_dlq_log_group(stack_name)
+        # Stamped BEFORE the read: the cut-over gate compares it with the validation
+        # finish time, so it must never claim more than the read can have seen.
+        _started = datetime.now(timezone.utc)
         try:
-            dlq_errors = list(reader(f"/msk-connect/{stack_name}-cdc") or [])
-        except Exception:  # noqa: BLE001 - advisory, keep status even if logs fail
+            dlq_errors = list(reader(_group, **_dlq_read_kwargs(migration_state)) or [])
+        except Exception as exc:  # noqa: BLE001 - advisory, keep status even if logs fail
             dlq_errors = []
+            from dsql_migrator.core.cdc_dlq import CdcDlqReadRecord
+
+            migration_state.cdc_dlq_pending_read = CdcDlqReadRecord(
+                log_group=_group,
+                started_at=_started,
+                ok=False,
+                complete=False,
+                error_code=type(exc).__name__[:64],
+            )
         else:
+            # What the read PROVED (ok / complete / coverage start), promoted by the apply
+            # step after the fold. None for a controller that cannot say.
+            try:
+                _record = _dlq_read_record(controller, _group, _started)
+            except Exception:  # noqa: BLE001 - advisory bookkeeping only
+                _record = None
+            if _record is not None:
+                migration_state.cdc_dlq_pending_read = _record
             # Persist the read position on the SESSION so a rebuilt controller resumes
             # here instead of re-reading the blind look-back window and re-auditing every
             # dead letter it already wrote.
@@ -2084,6 +2171,72 @@ def cdc_applied_rollup_detail(
     )
 
 
+def _fold_cdc_dlq_errors(migration_state, dlq_errors) -> str:
+    """Fold newly-read dead letters into the error log, the audit trail and the ledger.
+
+    The DLQ part of :func:`_apply_cdc_status`, shared with the cut-over gate's own read
+    (:func:`apply_cdc_dlq_read`) so both land records the same way. Returns the CDC
+    error-log key. Only records whose identity was NOT audited before reach the per-table
+    ledger, so a re-surfaced record is never counted twice. Event loop only.
+    """
+    # CDC records under a stable key even when no Full Load job exists this session
+    # (see cdc_error_log_key) -- otherwise an empty job_id would drop every DLQ event.
+    job_id = cdc_error_log_key(migration_state)
+    # Fold any newly-read DLQ events into the single error log so DLQ depth and the
+    # per-table "Quarantined" count reflect the real pipeline. Reuse the CDC
+    # orchestrator's CdcConnectorError -> DataErrorRecord conversion (credential-free).
+    if dlq_errors and job_id:
+        from dsql_migrator.core.cdc import CdcPipelineOrchestrator
+
+        CdcPipelineOrchestrator(error_source=lambda: dlq_errors).surface_errors(
+            job_id, migration_state.error_log
+        )
+        # Also record each NEW DLQ event in the durable activity-log file, so a
+        # quarantine is auditable outside the live UI (the file persists; the UI's
+        # in-memory error log does not). The controller's dlq_errors() already
+        # cursor-dedups, so what reaches here is the new-since-last-poll set -- one
+        # FAILURE line per quarantined record, credential-free (table + SQLSTATE +
+        # reason; no row values or SQL).
+        from dsql_migrator.core.activity_log import (
+            ActivityCategory,
+            ActivityStatus,
+            log_activity,
+        )
+
+        # Belt AND braces: the cursor above is the primary dedup, but this write is
+        # DURABLE and was not idempotent, so any path that re-surfaced a record (a
+        # controller rebuilt before the cursor was restored, an app restart) turned N
+        # quarantines into 2N/3N audit lines and the log could no longer answer "how many
+        # rows did the pipeline drop?". Key on the record's own identity for the session.
+        _audited = migration_state.cdc_dlq_audited_keys
+        # The same identity decides what the per-table ledger counts: only a record seen
+        # for the first time, so a re-surfaced one never inflates the cut-over gate.
+        _fresh = []
+        for err in dlq_errors:
+            _key = (
+                getattr(err, "table", None),
+                getattr(err, "error_code", None),
+                getattr(err, "message", None),
+                str(getattr(err, "occurred_at", "") or ""),
+            )
+            if _key in _audited:
+                continue
+            _audited.add(_key)
+            _fresh.append(err)
+            log_activity(
+                ActivityCategory.CDC,
+                "quarantine record to DLQ",
+                status=ActivityStatus.FAILURE,
+                target=getattr(err, "table", None),
+                error_code=getattr(err, "error_code", None),
+                detail=getattr(err, "message", None),
+            )
+        _fold = getattr(migration_state, "fold_cdc_dlq_ledger", None)
+        if _fresh and callable(_fold):
+            _fold(_fresh)
+    return job_id
+
+
 def _apply_cdc_status(migration_state, fetched) -> None:
     """Build the CDC status view from a fetched ``(statuses, health)`` and store it.
 
@@ -2184,52 +2337,15 @@ def _apply_cdc_status(migration_state, fetched) -> None:
         )
     # CDC records under a stable key even when no Full Load job exists this session
     # (see cdc_error_log_key) -- otherwise an empty job_id would drop every DLQ event.
-    job_id = cdc_error_log_key(migration_state)
-    # Fold any newly-read DLQ events into the single error log so DLQ depth and the
-    # per-table "Quarantined" count reflect the real pipeline. Reuse the CDC
-    # orchestrator's CdcConnectorError -> DataErrorRecord conversion (credential-free).
-    if dlq_errors and job_id:
-        from dsql_migrator.core.cdc import CdcPipelineOrchestrator
-
-        CdcPipelineOrchestrator(error_source=lambda: dlq_errors).surface_errors(
-            job_id, migration_state.error_log
-        )
-        # Also record each NEW DLQ event in the durable activity-log file, so a
-        # quarantine is auditable outside the live UI (the file persists; the UI's
-        # in-memory error log does not). The controller's dlq_errors() already
-        # cursor-dedups, so what reaches here is the new-since-last-poll set -- one
-        # FAILURE line per quarantined record, credential-free (table + SQLSTATE +
-        # reason; no row values or SQL).
-        from dsql_migrator.core.activity_log import (
-            ActivityCategory,
-            ActivityStatus,
-            log_activity,
-        )
-
-        # Belt AND braces: the cursor above is the primary dedup, but this write is
-        # DURABLE and was not idempotent, so any path that re-surfaced a record (a
-        # controller rebuilt before the cursor was restored, an app restart) turned N
-        # quarantines into 2N/3N audit lines and the log could no longer answer "how many
-        # rows did the pipeline drop?". Key on the record's own identity for the session.
-        _audited = migration_state.cdc_dlq_audited_keys
-        for err in dlq_errors:
-            _key = (
-                getattr(err, "table", None),
-                getattr(err, "error_code", None),
-                getattr(err, "message", None),
-                str(getattr(err, "occurred_at", "") or ""),
-            )
-            if _key in _audited:
-                continue
-            _audited.add(_key)
-            log_activity(
-                ActivityCategory.CDC,
-                "quarantine record to DLQ",
-                status=ActivityStatus.FAILURE,
-                target=getattr(err, "table", None),
-                error_code=getattr(err, "error_code", None),
-                detail=getattr(err, "message", None),
-            )
+    job_id = _fold_cdc_dlq_errors(migration_state, dlq_errors)
+    # The read's outcome becomes visible only NOW, after its records are folded: a render
+    # in between would otherwise see an "ok" read whose dead letters are not counted yet.
+    _pending = getattr(migration_state, "cdc_dlq_pending_read", None)
+    if _pending is not None:
+        _promote = getattr(migration_state, "promote_cdc_dlq_read", None)
+        if callable(_promote):
+            _promote(_pending)
+        migration_state.cdc_dlq_pending_read = None
     # The quarantine count's own coverage, written ONCE to the durable log. A cut-over
     # reviewer reading only the activity log would otherwise take the recorded count as a
     # total when the read was bounded -- the single number that decision turns on.
@@ -2378,6 +2494,128 @@ def _refresh_cdc_status(migration_state) -> None:
     the loop); this combined form is kept for non-UI/test callers.
     """
     _apply_cdc_status(migration_state, _fetch_cdc_status(migration_state))
+
+
+def read_cdc_dlq_once(migration_state, session) -> tuple:
+    """ONE bounded dead-letter read for the cut-over gate (BLOCKING; never raises).
+
+    Returns ``(errors, record, cursor_state)`` for :func:`apply_cdc_dlq_read` to land on
+    the event loop. Reuses the session's controller when it was built for the current
+    identity (so its cursor and seen ids carry on); otherwise builds one seeded from the
+    session's cursor and keeps it only in ``cdc_dlq_gate_reader`` -- never as the
+    session's ``cdc_controller``, so Cut over and Validation have no discovery side
+    effects -- so a page-capped read is CONTINUED by the next one rather than restarted.
+    One ``dlq_errors`` call, bounded by its page cap. A failure becomes a record with
+    ``ok=False`` and a value-free code, never an exception: the gate must tell "could not
+    read" from "nothing there".
+    """
+    from dsql_migrator.core.cdc_dlq import CdcDlqReadRecord
+
+    stack = getattr(migration_state, "cdc_stack_name", None) or CDC_DEFAULT_STACK_NAME
+    group = cdc_dlq_log_group(stack)
+    started = datetime.now(timezone.utc)
+
+    def _failed(code: str) -> "CdcDlqReadRecord":
+        return CdcDlqReadRecord(
+            log_group=group, started_at=started, ok=False, complete=False,
+            error_code=code[:64],
+        )
+
+    target = getattr(session, "target_config", None)
+    if target is None:
+        return [], _failed("NoTargetConnection"), None
+    try:
+        identity = (getattr(target, "region", None), getattr(session, "aws_profile", None))
+        controller = getattr(migration_state, "cdc_controller", None)
+        known = getattr(migration_state, "cdc_controller_identity", None)
+        if controller is None or (known is not None and known != identity):
+            cached = getattr(migration_state, "cdc_dlq_gate_reader", None)
+            if cached is not None and cached[0] == identity:
+                controller = cached[1]
+            else:
+                from dsql_migrator.core.msk_connect_controller import (
+                    build_msk_connect_controller,
+                )
+
+                controller = build_msk_connect_controller(
+                    identity[0], aws_profile=identity[1]
+                )
+                _seed_dlq_cursor_from_state(controller, migration_state)
+                try:
+                    migration_state.cdc_dlq_gate_reader = (identity, controller)
+                except Exception:  # noqa: BLE001 - a read-only double: just not kept
+                    pass
+        started = datetime.now(timezone.utc)  # just before the read itself
+        errors = list(
+            controller.dlq_errors(group, **_dlq_read_kwargs(migration_state)) or []
+        )
+        record = _dlq_read_record(controller, group, started) or _failed(
+            "ReadStateUnavailable"
+        )
+        try:
+            cursor_state = controller.dlq_cursor_state()
+        except Exception:  # noqa: BLE001 - bookkeeping only
+            cursor_state = None
+        return errors, record, cursor_state
+    except Exception as exc:  # noqa: BLE001 - a failed read is a state, not a crash
+        return [], _failed(type(exc).__name__), None
+
+
+def apply_cdc_dlq_read(migration_state, fetched) -> None:
+    """Land a :func:`read_cdc_dlq_once` result on the event loop, in the safe order.
+
+    Fold the records first (error log, audit, ledger), then store the read position, and
+    only then publish the read's outcome -- so no render can see an "ok" read whose dead
+    letters are not counted yet.
+    """
+    if not fetched:
+        return
+    errors, record, cursor_state = fetched
+    _fold_cdc_dlq_errors(migration_state, list(errors or []))
+    if cursor_state:
+        try:
+            cursor_ms, seen = cursor_state
+            migration_state.cdc_dlq_cursor_ms = cursor_ms
+            migration_state.cdc_dlq_seen_ids = seen
+        except Exception:  # noqa: BLE001 - bookkeeping only
+            pass
+    promote = getattr(migration_state, "promote_cdc_dlq_read", None)
+    if callable(promote):
+        promote(record)
+
+
+# Landing tasks in flight. asyncio keeps only a weak reference to a task, so one whose caller
+# was cancelled would otherwise be garbage-collected mid-read.
+_LANDING_TASKS: set = set()
+
+
+def _retrieve(task) -> None:
+    # A landing whose caller was cancelled has nobody awaiting it: retrieve its outcome so a
+    # failure is not reported as "exception was never retrieved".
+    if not task.cancelled():
+        task.exception()
+
+
+async def land_detached(work) -> None:
+    """Await ``work()`` -- a read on a worker thread plus the loop-side landing of its result
+    -- so that cancelling the CALLER can never drop a result the read already consumed.
+
+    A NiceGUI timer's callback is cancelled when its element is deleted, and every
+    ``refresh()`` deletes the timers it drew (a 0.5 s re-check poll, a DEFAULT-status fill, a
+    step change). ``run.io_bound`` then returns ``None`` while its worker thread keeps going,
+    and a dead-letter read has by then moved the shared controller's cursor and seen ids
+    past the records it returned: they never reached the ledger, and no later read could
+    see them again -- the cut-over gate failed open. The work runs as its own task, which
+    the caller only awaits through ``asyncio.shield``: a cancelled caller stops waiting, the
+    read still lands.
+    """
+    import asyncio
+
+    task = asyncio.get_running_loop().create_task(work())
+    _LANDING_TASKS.add(task)
+    task.add_done_callback(_LANDING_TASKS.discard)
+    task.add_done_callback(_retrieve)
+    await asyncio.shield(task)
 
 
 # Tailwind tone -> (border, background, icon-color, icon) for the health cards.

@@ -6810,3 +6810,483 @@ def test_an_orphaned_run_whose_job_ended_keeps_its_real_outcome_not_a_restart_no
     orphan = orphan[: orphan.index("if _reconciled_late:")]
     assert orphan.index("set_error(") < orphan.index("validation_state.interrupted_by_restart = True")
     assert "if ended is None or ended is StepStatus.DONE:" in orphan
+
+
+# ---------------------------------------------------------------------------
+# G1: tables CDC dead-lettered a change for are compared by CHECKSUM
+# ---------------------------------------------------------------------------
+
+
+class _ModeAwareValidator:
+    """Answers per requested table and mode: a CHECKSUM (deep) compare proves the values."""
+
+    def __init__(self, on_call=None) -> None:
+        self.calls: list[dict] = []
+        self.on_call = on_call
+
+    def validate(self, source, target, tables, mode=ValidationMode.ROW_COUNT, *,
+                 watermark=None, check_orphans=False, reconcile=False, should_cancel=None,
+                 on_progress=None, max_workers=1, deep_only_on_count_mismatch=False,
+                 quarantined_by_table=None):
+        self.calls.append({
+            "tables": [t.name for t in tables], "mode": mode, "check_orphans": check_orphans,
+            "reconcile": reconcile, "deep_only": deep_only_on_count_mismatch,
+        })
+        if self.on_call is not None:
+            self.on_call(len(self.calls))
+        deep = mode is ValidationMode.CHECKSUM and not deep_only_on_count_mismatch
+        return ValidationReport.build(mode=mode, items=[
+            TableValidationResult(
+                table=t.name, source_row_count=1, target_row_count=1, row_count_match=True,
+                checksum_match=True if deep else None, matched=True,
+                deep_checks_skipped=mode is ValidationMode.CHECKSUM and not deep,
+            )
+            for t in tables
+        ])
+
+
+def _g1_screen(monkeypatch, validator, *, ledger_tables=("orders",), ui=None, cdc=False):
+    import sys
+    import types
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.cdc import CdcConnectorError
+    from dsql_migrator.core.models import AssessmentReport, TargetInventory
+    from dsql_migrator.ui import validation as _v
+    from dsql_migrator.ui.data_migration import DataMigrationStore
+    from dsql_migrator.ui.evaluation import EvaluationResult, EvaluationStore
+    from dsql_migrator.ui.session import SessionStore
+
+    logged: list[dict] = []
+    monkeypatch.setattr(
+        _v, "log_activity", lambda _c, action, **kw: logged.append({"action": action, **kw})
+    )
+    store, eval_store, mstore, vstore = (
+        SessionStore(), EvaluationStore(), DataMigrationStore(), ValidationStore()
+    )
+    manager = JobManager()
+    session = store.get_or_create("g1")
+    session.set_source(SourceConnectionConfig(host="db", database="app"), SecretValue("pw"))
+    session.set_target(TargetConnectionConfig(
+        cluster_endpoint="c.dsql.us-east-1.on.aws", region="us-east-1"))
+    session.set_source_verified(True)
+    session.set_target_verified(True)
+    eval_store.get_or_create("g1").set_result(EvaluationResult(
+        inventory=_inventory(), assessment=AssessmentReport.from_items([]),
+        target_inventory=TargetInventory(), target_conflicts=[]))
+    if cdc:
+        from dsql_migrator.ui.data_migration import MigrationType
+
+        session.set_migration_type(MigrationType.FULL_LOAD_AND_CDC)
+    if ui is not None:
+        # build_validation_screen imports ``nicegui.ui`` when it is built.
+        fake = types.ModuleType("nicegui")
+        fake.ui = ui  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "nicegui", fake)
+    mstate = mstore.get_or_create("g1")
+    if ledger_tables:
+        mstate.fold_cdc_dlq_ledger([
+            CdcConnectorError(table=name, message=f"DLQ offset={i}: boom")
+            for i, name in enumerate(ledger_tables)
+        ])
+    content, runner = build_validation_screen(
+        store, "g1", job_manager=manager, eval_store=eval_store, migration_store=mstore,
+        validation_store=vstore, validator_factory=lambda _i: validator,
+        sync_sequences=lambda names, *, connection_factory: {},
+    )
+    vstate = vstore.get_or_create("g1")
+
+    def run():
+        runner()
+        assert vstate.job_id is not None
+        assert manager.wait(vstate.job_id, timeout=5.0) is True
+
+    return SimpleNamespace(content=content, run=run, vstate=vstate, mstate=mstate,
+                           manager=manager, logged=logged)
+
+
+def _g1_detail(logged, action):
+    (entry,) = [e for e in logged if e["action"] == action]
+    return entry["detail"]
+
+
+def test_a_row_count_run_also_compares_dead_lettered_tables_by_checksum(monkeypatch) -> None:
+    fake = _ModeAwareValidator()
+    s = _g1_screen(monkeypatch, fake)
+    s.vstate.mode = ValidationMode.ROW_COUNT
+    s.run()
+    assert [c["mode"] for c in fake.calls] == [ValidationMode.ROW_COUNT, ValidationMode.CHECKSUM]
+    assert fake.calls[1]["tables"] == ["orders"] and fake.calls[1]["check_orphans"] is False
+    report = s.vstate.result
+    assert report.mode is ValidationMode.ROW_COUNT  # the run's mode is kept
+    by_name = {i.table: i for i in report.items}
+    assert by_name["orders"].checksum_match is True
+    assert by_name["customers"].checksum_match is None
+    run_start = s.vstate.compared_run_start
+    assert s.vstate.compared_overrides["orders"] >= run_start
+    assert "also compared by CHECKSUM: orders" in _g1_detail(s.logged, "validation started")
+    completed = _g1_detail(s.logged, "validation completed")
+    assert "CHECKSUM pass for tables with dead-lettered CDC changes: orders" in completed
+
+
+def test_a_checksum_run_makes_no_second_pass_unless_it_was_a_fast_sweep(monkeypatch) -> None:
+    fake = _ModeAwareValidator()
+    s = _g1_screen(monkeypatch, fake)
+    s.vstate.mode = ValidationMode.CHECKSUM
+    s.run()
+    assert len(fake.calls) == 1
+    assert "also compared by CHECKSUM" not in _g1_detail(s.logged, "validation started")
+
+    sweep = _ModeAwareValidator()
+    s = _g1_screen(monkeypatch, sweep)
+    s.vstate.mode = ValidationMode.CHECKSUM
+    s.vstate.deep_only_on_count_mismatch = True
+    s.run()
+    assert [c["deep_only"] for c in sweep.calls] == [True, False]
+    assert sweep.calls[1]["tables"] == ["orders"]
+
+
+def test_a_dead_letter_folded_during_the_run_joins_the_checksum_pass(monkeypatch) -> None:
+    from dsql_migrator.core.cdc import CdcConnectorError
+
+    holder: dict = {}
+
+    def _on_call(n):
+        if n == 1:
+            holder["s"].mstate.fold_cdc_dlq_ledger(
+                [CdcConnectorError(table="customers", message="DLQ offset=9: late")]
+            )
+
+    fake = _ModeAwareValidator(on_call=_on_call)
+    holder["s"] = s = _g1_screen(monkeypatch, fake)
+    s.run()
+    assert sorted(fake.calls[1]["tables"]) == ["customers", "orders"]
+
+
+def test_a_cancel_during_the_checksum_pass_stores_no_report(monkeypatch) -> None:
+    from dsql_migrator.core.validator import ValidationCancelled
+
+    def _on_call(n):
+        if n == 2:
+            raise ValidationCancelled()
+
+    s = _g1_screen(monkeypatch, _ModeAwareValidator(on_call=_on_call))
+    s.run()
+    assert s.vstate.result is None
+
+
+def test_an_empty_ledger_runs_exactly_as_before(monkeypatch) -> None:
+    fake = _ModeAwareValidator()
+    s = _g1_screen(monkeypatch, fake, ledger_tables=())
+    s.run()
+    assert len(fake.calls) == 1 and s.vstate.compared_overrides == {}
+    assert _g1_detail(s.logged, "validation started").endswith("table(s), source vs target")
+    assert "; ready for cut-over" in _g1_detail(s.logged, "validation completed")
+
+
+def test_a_recheck_of_a_dead_lettered_table_upgrades_to_checksum(monkeypatch) -> None:
+    fake = _ModeAwareValidator()
+    s = _g1_screen(monkeypatch, fake)
+    s.vstate.set_result(ValidationReport.build(
+        mode=ValidationMode.ROW_COUNT,
+        items=[TableValidationResult(table=n, source_row_count=1, target_row_count=1,
+                                     row_count_match=True, matched=True)
+               for n in ("orders", "customers")],
+        orphan_check_performed=True, reconcile_requested=True,
+    ))
+    recheck = _recheck_closure(s.content)
+    recheck(["orders"])
+    assert s.manager.wait(s.vstate.job_id, timeout=5.0) is True
+    call = fake.calls[-1]
+    assert call["mode"] is ValidationMode.CHECKSUM
+    assert call["reconcile"] is True and call["check_orphans"] is True  # from the report
+    recheck(["customers"])  # not in the ledger: the report's mode
+    assert s.manager.wait(s.vstate.job_id, timeout=5.0) is True
+    assert fake.calls[-1]["mode"] is ValidationMode.ROW_COUNT
+
+
+_UNSET = object()
+
+
+def _g1_gate(report, *, ledger_tables=("orders",), run_start=None, cdc_start=_UNSET,
+             history_from_ms=None):
+    from datetime import timedelta
+
+    from dsql_migrator.core.models import CdcDlqLedgerEntry
+    from dsql_migrator.ui.cdc_dlq_gate import cdc_dlq_cutover_gate
+
+    t = datetime(2026, 9, 1, 11, 0, tzinfo=timezone.utc)
+    return cdc_dlq_cutover_gate(
+        ledger={n: CdcDlqLedgerEntry(count=2, last_at=t) for n in ledger_tables},
+        cdc_in_use=True, cdc_evidence=True, check_reads=False, report=report,
+        release="clean", compared_run_start=run_start or t + timedelta(minutes=5),
+        # A pipeline this session started (its CDC start is known), so the dead-letter
+        # history is not in question here -- see the attached-pipeline tests for that.
+        cdc_start=cdc_start if cdc_start is not _UNSET else t - timedelta(hours=1),
+        history_from_ms=history_from_ms,
+    )
+
+
+def _g1_render(report, gate, **kw):
+    import sys
+    import types
+
+    from dsql_migrator.ui.validation import _render_result
+
+    recorder = _ScreenUi()
+    fake = types.ModuleType("nicegui")
+    fake.ui = recorder  # type: ignore[attr-defined]
+    saved = sys.modules.get("nicegui")
+    sys.modules["nicegui"] = fake
+    try:
+        _render_result(recorder, report, cdc_gate=gate, **kw)
+    finally:
+        if saved is None:
+            sys.modules.pop("nicegui", None)
+        else:
+            sys.modules["nicegui"] = saved
+    return recorder
+
+
+def _g1_match_report(*, checksum=None):
+    return ValidationReport.build(
+        mode=ValidationMode.ROW_COUNT if checksum is None else ValidationMode.CHECKSUM,
+        items=[TableValidationResult(table=n, source_row_count=1, target_row_count=1,
+                                     row_count_match=True, checksum_match=checksum,
+                                     matched=True)
+               for n in ("orders", "customers")],
+    )
+
+
+def test_a_matching_report_is_not_ready_while_a_dead_lettered_table_needs_checksum() -> None:
+    report = _g1_match_report()
+    picked: list = []
+    ui = _g1_render(report, _g1_gate(report), recheck_provider=picked.append)
+    body = ui.body()
+    assert "Tables match — cut over waits for a CHECKSUM re-check of 1 table(s)" in body
+    assert "Ready for cut-over" not in ui.texts
+    assert "orders (2)" in body
+    (click,) = [cb for text, cb in ui.clicks if text == "Re-check 1 table(s) with CHECKSUM"]
+    click()
+    assert picked == [["orders"]]
+    # Withheld while a comparison runs (no provider).
+    busy = _g1_render(report, _g1_gate(report), recheck_provider=None)
+    assert "Re-check 1 table(s) with CHECKSUM" not in busy.texts
+
+
+def test_a_dead_lettered_table_missing_from_the_report_has_its_own_hold() -> None:
+    report = _g1_match_report(checksum=True)
+    ui = _g1_render(report, _g1_gate(report, ledger_tables=("app.gone",)))
+    assert (
+        "Tables match — 1 table(s) with dead-lettered CDC changes are not in this report"
+        in ui.body()
+    )
+    assert "Ready for cut-over" not in ui.texts
+
+
+def test_a_resolved_gate_names_the_tables_in_the_green_verdict() -> None:
+    report = _g1_match_report(checksum=True)
+    ui = _g1_render(report, _g1_gate(report))
+    assert "Ready for cut-over" in ui.texts
+    assert (
+        "CDC dead-lettered changes for orders (2); each has since matched in a CHECKSUM "
+        "comparison started after its last dead-lettered record." in ui.body()
+    )
+    plain = _g1_render(report, None)  # no gate: exactly as before
+    assert "dead-lettered" not in plain.body()
+
+
+def test_the_options_say_dead_lettered_tables_are_also_compared_by_checksum() -> None:
+    from dsql_migrator.ui.validation import _render_options
+
+    ui = _ScreenUi()
+    _render_options(ui, ValidationState(), StepStatus.DONE, cdc_checksum_tables=("orders",))
+    assert any("whatever mode you pick, this run also compares them by CHECKSUM" in t
+               for t in ui.texts)
+    quiet = _ScreenUi()
+    _render_options(quiet, ValidationState(), StepStatus.DONE)
+    assert not any("CHECKSUM, because a row count" in t for t in quiet.texts)
+
+
+class _ChecksumCannotFinish(_ModeAwareValidator):
+    """The CHECKSUM of ``orders`` errors the way a whole-table hash over Aurora DSQL's
+    transaction limit does; everything else answers like ``_ModeAwareValidator``."""
+
+    def validate(self, source, target, tables, mode=ValidationMode.ROW_COUNT, **kw):
+        report = super().validate(source, target, tables, mode, **kw)
+        if mode is not ValidationMode.CHECKSUM:
+            return report
+        items = [
+            TableValidationResult(
+                table=i.table, source_row_count=0, target_row_count=0,
+                row_count_match=False, matched=False,
+                error="QueryCanceled: transaction age limit of 300s exceeded",
+            )
+            if i.table == "orders"
+            else i
+            for i in report.items
+        ]
+        return ValidationReport.build(mode=mode, items=items)
+
+
+def test_a_dead_lettered_table_whose_checksum_cannot_finish_is_shown_its_exit(monkeypatch) -> None:
+    from dsql_migrator.ui.cdc_dlq_gate import cdc_dlq_gate_for
+    from dsql_migrator.ui.validation import cutover_release_state, summarize_validation
+
+    s = _g1_screen(monkeypatch, _ChecksumCannotFinish())
+    s.vstate.mode = ValidationMode.ROW_COUNT
+    s.run()
+    report = s.vstate.result
+    summary = summarize_validation(report)
+    release = cutover_release_state(summary, gap_accepted=False)
+    gate = cdc_dlq_gate_for(s.mstate, s.vstate, cdc_in_use=True, release=release,
+                            summary=summary, check_reads=False)
+    assert release == "blocked"  # the hold itself stays: the values are unproven
+    assert [i.reason for i in gate.issues] == ["not-matched"] and not gate.can_waive
+    body = _g1_render(report, gate, recheck_provider=lambda _t: None).body()
+    assert "Validation could not finish comparing 1 table(s) with dead-lettered CDC changes" in body
+    assert "turn its chip off under Objects to validate and re-run Validation" in body
+    # ...and that exit really is waivable on Cut over.
+    s.vstate.table_exclude = {"orders"}
+    s.run()
+    summary = summarize_validation(s.vstate.result)
+    release = cutover_release_state(summary, gap_accepted=False)
+    left_out = cdc_dlq_gate_for(s.mstate, s.vstate, cdc_in_use=True, release=release,
+                                summary=summary, check_reads=False)
+    assert release == "clean"
+    assert [i.reason for i in left_out.issues] == ["not-validated"] and left_out.can_waive
+
+
+def test_a_mismatch_never_gets_the_unexplained_checksum_button() -> None:
+    def _row(name, *, ok):
+        return TableValidationResult(
+            table=name, source_row_count=5, target_row_count=5 if ok else 4,
+            row_count_match=ok, matched=ok,
+        )
+
+    # (a) the dead-lettered table itself mismatches: its per-row Re-check is the action.
+    report = ValidationReport.build(
+        mode=ValidationMode.ROW_COUNT, items=[_row("orders", ok=False), _row("customers", ok=True)]
+    )
+    ui = _g1_render(report, _g1_gate(report), recheck_provider=lambda _t: None)
+    assert "Not ready for cut-over" in ui.texts
+    assert "Re-check 1 table(s) with CHECKSUM" not in ui.texts
+    assert [t for t, _cb in ui.clicks if t == "Re-check"] == ["Re-check"]
+    # (b) another table fails; the dead-lettered one matched by row count. The button
+    # would have re-checked the PASSING table right under a red verdict.
+    report = ValidationReport.build(
+        mode=ValidationMode.ROW_COUNT, items=[_row("orders", ok=False), _row("customers", ok=True)]
+    )
+    gate = _g1_gate(report, ledger_tables=("customers",))
+    assert gate.recheckable == ("customers",)
+    ui = _g1_render(report, gate, recheck_provider=lambda _t: None)
+    assert "Re-check 1 table(s) with CHECKSUM" not in ui.texts
+
+
+def test_a_mixed_recheck_compares_only_the_dead_lettered_table_by_checksum(monkeypatch) -> None:
+    fake = _ModeAwareValidator()
+    s = _g1_screen(monkeypatch, fake)
+    s.vstate.set_result(ValidationReport.build(
+        mode=ValidationMode.ROW_COUNT,
+        items=[TableValidationResult(table=n, source_row_count=1, target_row_count=2,
+                                     row_count_match=False, matched=False)
+               for n in ("orders", "customers")],
+        orphan_check_performed=True, reconcile_requested=True,
+    ))
+    recheck = _recheck_closure(s.content)
+    recheck(["orders", "customers"])  # e.g. "Re-check all 2 tables"
+    assert s.manager.wait(s.vstate.job_id, timeout=5.0) is True
+    assert [(c["tables"], c["mode"]) for c in fake.calls] == [
+        (["orders"], ValidationMode.CHECKSUM),
+        (["customers"], ValidationMode.ROW_COUNT),
+    ]
+    assert all(c["reconcile"] and c["check_orphans"] for c in fake.calls)  # from the report
+    by_name = {i.table: i for i in s.vstate.result.items}
+    assert by_name["orders"].checksum_match is True
+    assert by_name["customers"].checksum_match is None
+    assert s.vstate.rechecked_tables == ("customers", "orders")
+
+
+def test_the_extra_checksum_pass_never_repeats_the_orphan_scan(monkeypatch) -> None:
+    fake = _ModeAwareValidator()
+    s = _g1_screen(monkeypatch, fake)
+    s.vstate.mode = ValidationMode.ROW_COUNT
+    s.vstate.check_orphans = True
+    s.run()
+    assert fake.calls[0]["check_orphans"] is True
+    assert fake.calls[1]["check_orphans"] is False and fake.calls[1]["tables"] == ["orders"]
+
+
+def test_a_mismatched_dead_lettered_table_gets_no_checksum_pass(monkeypatch) -> None:
+    class _OrdersShort(_ModeAwareValidator):
+        def validate(self, source, target, tables, mode=ValidationMode.ROW_COUNT, **kw):
+            report = super().validate(source, target, tables, mode, **kw)
+            return ValidationReport.build(mode=mode, items=[
+                TableValidationResult(table="orders", source_row_count=2, target_row_count=1,
+                                      row_count_match=False, matched=False)
+                if i.table == "orders" else i
+                for i in report.items
+            ])
+
+    fake = _OrdersShort()
+    s = _g1_screen(monkeypatch, fake)
+    s.vstate.mode = ValidationMode.ROW_COUNT
+    s.run()
+    assert len(fake.calls) == 1  # a known mismatch is not hashed on top
+
+
+class _TimerUi(_ScreenUi):
+    def __init__(self) -> None:
+        super().__init__()
+        self.timers: list = []
+
+    def timer(self, interval, callback, *_a, **_k):
+        self.timers.append(callback)
+        return self._El(self)
+
+
+def test_the_validation_screen_wires_the_dead_letter_gate(monkeypatch) -> None:
+    """End to end through ``content``: the Options hint, the one background read, the hold
+    verdict with its button, and the "cut over held" log clause."""
+    ui = _TimerUi()
+    s = _g1_screen(monkeypatch, _ModeAwareValidator(), ledger_tables=("orders", "app.gone"),
+                   ui=ui, cdc=True)
+    s.mstate.set_cdc_ops_window_start(datetime.now(timezone.utc))
+    s.content(lambda: None)
+    assert "whatever mode you pick, this run also compares them by CHECKSUM" in ui.body()
+    assert len(ui.timers) == 1  # one background dead-letter read, armed, not run
+    s.vstate.mode = ValidationMode.ROW_COUNT
+    s.run()
+    completed = _g1_detail(s.logged, "validation completed")
+    assert "; cut over held:" in completed and "app.gone" in completed
+    assert "; ready for cut-over" not in completed
+    ui.texts.clear()
+    ui.clicks.clear()
+    s.content(lambda: None)
+    assert "Ready for cut-over" not in ui.texts
+    assert "Tables match — cut over waits for a CHECKSUM re-check of 1 table(s)" in ui.texts
+    assert "Re-check 1 table(s) with CHECKSUM" in [t for t, _cb in ui.clicks]
+
+
+def test_an_attached_pipeline_tells_validation_cut_over_needs_a_full_checksum(monkeypatch) -> None:
+    """Validation said a green "Ready" while Cut over held on a history only a full
+    CHECKSUM run can clear."""
+    ui = _TimerUi()
+    s = _g1_screen(monkeypatch, _ModeAwareValidator(), ledger_tables=(), ui=ui, cdc=True)
+    s.mstate.set_cdc_connector_names(["sink"])  # attached: the CDC start is unknown
+    s.vstate.mode = ValidationMode.ROW_COUNT
+    s.content(lambda: None)
+    assert "Cut over also needs one CHECKSUM run of every table" in ui.body()
+    s.run()
+    assert "; cut over held: the CDC dead-letter history can't be confirmed" in _g1_detail(
+        s.logged, "validation completed"
+    )
+    ui.texts.clear()
+    s.content(lambda: None)
+    assert "Ready for cut-over" not in ui.texts
+    assert "Tables match — cut over waits for one CHECKSUM run of every table" in ui.texts
+    # With CHECKSUM picked (and Fast sweep off) the hint has nothing to add.
+    s.vstate.mode = ValidationMode.CHECKSUM
+    ui.texts.clear()
+    s.content(lambda: None)
+    assert "Cut over also needs one CHECKSUM run of every table" not in ui.body()

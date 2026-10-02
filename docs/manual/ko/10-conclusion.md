@@ -47,8 +47,10 @@ CDC는 실제로 움직이는 구성 요소(MSK, MSK Connect, 싱크 커넥터)�
    인프라를 배포하세요 — 약 15~20분의 생성이 스냅샷과 겹쳐서 진행됩니다. 그 다음 그 워터마크부터
    **CDC**를 시작해 타깃이 수렴해 가는 과정을 지켜보세요.
 5. **Validation** — 행 수 + 체크섬을 실행합니다(전환 전 + 대조 실행). 모든 차이가 설명될 때만(드리프트,
-   의도된 격리, 아직 수렴하지 않은 CDC) 판정이 **MATCH**가 됩니다.
-6. **Cut over** — Validation이 깨끗한 MATCH가 되면 애플리케이션을 DSQL로 전환합니다. 도구가 대신
+   의도된 격리, 아직 수렴하지 않은 CDC) 판정이 **MATCH**가 됩니다. CDC 마이그레이션이면 dead-letter 처리된
+   CDC 변경이 있는 테이블은 자동으로 CHECKSUM으로도 비교됩니다.
+6. **Cut over** — Validation이 깨끗한 MATCH가 되면(CDC이면 [§5.5](05-validation.md#55-cdc-dead-letter와-컷오버)의 dead-letter 확인까지
+   해소되면) 애플리케이션을 DSQL로 전환합니다. 도구가 대신
    수행해 주지 않는 유일한 단계이며, 경로에 맞춘 런북(아래 §10.3)을 따르세요.
 
 ---
@@ -58,8 +60,8 @@ CDC는 실제로 움직이는 구성 요소(MSK, MSK Connect, 싱크 커넥터)�
 "Cut over"는 마지막 워크플로 단계이자, 애플리케이션이 MySQL 사용을 멈추고 Aurora DSQL을 쓰기
 시작하는 순간입니다. 도구가 대신 수행해 주지 **않는** 유일한 단계입니다 — 도구는 타깃이 정확함을
 증명하고 무손실 복제 스트림을 제공하지만, 애플리케이션을 *언제* 어떻게 전환할지는 사용자만 내릴 수 있는
-운영상의 결정입니다. Validation이 깨끗한 MATCH가 되면 UI의 **Cut over** 단계에 경로별 런북이
-표시되며, 아래는 그와 동일한 안내입니다.
+운영상의 결정입니다. Validation이 깨끗한 MATCH가 되면(CDC이면 [§5.5](05-validation.md#55-cdc-dead-letter와-컷오버)의 dead-letter 확인까지
+해소되면) UI의 **Cut over** 단계에 경로별 런북이 표시되며, 아래는 그와 동일한 안내입니다.
 
 ### Full load only (짧은 점검 동결)
 
@@ -85,6 +87,8 @@ CDC는 실제로 움직이는 구성 요소(MSK, MSK Connect, 싱크 커넥터)�
 4. **Validation 재실행**으로 최종 go/no-go 판단을 하고, 깨끗한 MATCH일 때만 전환합니다. 최종 검증은
    CDC가 전달한 행들 이후로 **identity / `AUTO_INCREMENT` 시퀀스를 전진**시키기도 하므로(*Sync identity
    sequences* 동작), 전환 후 앱의 첫 insert가 마이그레이션된 id와 충돌(`23505`)하지 않습니다.
+   dead-letter 처리된 CDC 변경이 있는 테이블은 자동으로 CHECKSUM으로 비교되며, Cut over는 열리기 전에
+   dead-letter queue를 다시 읽습니다([§5.5](05-validation.md#55-cdc-dead-letter와-컷오버) 참고).
 5. **애플리케이션을 DSQL 엔드포인트로 전환** + 스모크 테스트.
 6. **CDC 파이프라인은 맨 마지막에 제거** — **Start over(우상단)** → *Delete all CDC
    infrastructure* 를 클릭합니다. 복제를 끝내고 MSK / MSK Connect / NAT 비용을 중단하며, 기존 스택을
