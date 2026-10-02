@@ -329,6 +329,27 @@ def _open(ctx, text):
     return ui
 
 
+def test_the_result_counts_warnings_that_review_all_lists():
+    """Each warning shows once in the editor (Review all, Status: Warning), not again as
+    a Result line; Change & reload keeps them in its pre-DROP Result (no Review all)."""
+    state = DataMigrationState()
+    ctx, _calls = _ctx(state)
+    applied = {"shop.t": SimpleNamespace(
+        target_ddl=('CREATE TABLE "shop"."t" ("id" BIGINT NOT NULL, "a" TEXT NOT NULL '
+                    "DEFAULT 'x', \"b\" TEXT, PRIMARY KEY (\"id\"))"),
+        foreign_key_ddls=[], preserved_foreign_keys=[], index_ddls=[])}
+    ctx.inventory_fn = lambda: SimpleNamespace(tables=[_t("shop.t", a="longtext", b="longtext")])
+    ctx.inputs_fn = lambda: ExclusionInputs(selected=["shop.t"], applied=applied,
+                                            preserve_foreign_keys=True, migratable=["shop.t"],
+                                            signature=("s",))
+    ui = _open(ctx, "exclude shop.t.a\nexclude shop.t.b")
+    assert not any(t.startswith("(!) shop.t.a") for t in ui.texts)
+    assert "(!) 1 of 2 excluded columns has a warning: see Review all 2 items (Status: Warning)." in ui.texts
+    ui.expand("Review all")
+    (row,) = [r for r in ui.tables[-1] if r["item"] == "shop.t.a"]
+    assert row["status"].endswith("(!)") and "NOT NULL will be dropped" in row["why"]
+
+
 def test_review_all_filters_and_paging_survive_a_rerender():
     state = DataMigrationState()
     ctx, _calls = _ctx(state)
@@ -825,8 +846,9 @@ def test_an_adopted_omit_only_entry_is_never_called_excluded_before_v0_1_562():
     assert checkbox.text.startswith("Reload shop.t so its omit-only columns (a) are NULL")
     edit_ui = _Ui()
     ctx2, _calls = _ctx(state)
-    # NOT NULL with no DEFAULT on the target: the omit-only note is drawn as a "(!)" line,
-    # so its origin wording is visible (and a revert of the adopted label is caught).
+    # NOT NULL with no DEFAULT on the target: the omit-only note is a warning, listed in
+    # Review all, so its origin wording is visible (and a revert of the adopted label is
+    # caught). The Result only counts it.
     ddl = ('CREATE TABLE "shop"."t" ("id" BIGINT NOT NULL, "a" TEXT NOT NULL, "b" TEXT, '
            'PRIMARY KEY ("id"))')
     applied = {"shop.t": SimpleNamespace(target_ddl=ddl, foreign_key_ddls=[],
@@ -838,9 +860,13 @@ def test_an_adopted_omit_only_entry_is_never_called_excluded_before_v0_1_562():
     open_exclusion_dialog(edit_ui, ctx2, mode="edit")
     assert any("1 more omit-only (1 adopted from the attached CDC stack; no target change)" in t
                for t in edit_ui.texts)
-    assert any(t.startswith("(!) shop.t.a  Omit-only (adopted from the attached CDC stack)")
-               for t in edit_ui.texts)
+    assert not any(t.startswith("(!) shop.t.a") for t in edit_ui.texts)
+    assert any(t.startswith("(!) 1 of ") and "(Status: Warning)" in t for t in edit_ui.texts)
+    edit_ui.expand("Review all")
+    (row,) = [r for r in edit_ui.tables[-1] if r["item"] == "shop.t.a"]
+    assert "Omit-only (adopted from the attached CDC stack)" in row["why"]
     assert not any("before v0.1.562" in t for t in edit_ui.texts)
+    assert "before v0.1.562" not in row["why"]
 
 
 def test_a_ticked_legacy_table_joins_the_reload_and_becomes_overlay():

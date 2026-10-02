@@ -69,7 +69,7 @@ columns...** 버튼이 있습니다. 그 옆의 상태 줄이 지금 무엇이 �
 |---|---|
 | 오류 상자 | `N lines need fixing. Save is disabled.` 각 문제가 줄 번호와 함께, 수정 방법이 있으면 원클릭 수정과 함께 나열됩니다. |
 | 줄 상태 | 규칙마다 한 줄씩, 예: `L3  matches 4 columns - 1 kept by include on L5 - 2 blocked (primary key, computed)`. `type:` 규칙은 타입별 개수를 보여 줍니다(`longtext: 3 columns in 2 tables`). `only unselected tables`, `all blocked`, `cancels nothing` 같은 플래그는 보기보다 하는 일이 적은 줄을 표시합니다. |
-| Result | 규칙이 선택 해제하는 테이블, 제외되는 컬럼("migrated as NULL"), 거부된 모든 컬럼과 그 사유, 그리고 각 경고(§13.4). |
+| Result | 규칙이 선택 해제하는 테이블, 제외되는 컬럼("migrated as NULL"), 거부된 모든 컬럼과 그 사유, 그리고 경고가 있는 제외 컬럼의 수(§13.4. 각 경고는 Review all의 Status: Warning에 나옵니다). |
 | Review all N items | 관련된 모든 것을 담은 페이지 단위 표 하나로, **All / Excluded / Blocked / Warning**으로 필터할 수 있습니다. 각 항목의 상태, 그 항목에 매칭된 줄, 그리고 그 항목이 왜 거기 있는지 또는 어떤 타깃 변경을 받는지를 보여 줍니다. |
 | Oversized-LOB candidates (N) | 접혀 있습니다. §13.5 참고. |
 | Changes to Aurora DSQL (N statements, run when the load starts) | 접혀 있습니다. 실행 순서대로의 정확한 `ALTER` 구문(§13.6). CDC only에서는 "run when CDC starts"로 표시됩니다. |

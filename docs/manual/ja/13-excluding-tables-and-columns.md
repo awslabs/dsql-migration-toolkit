@@ -69,7 +69,7 @@ _言語: [English](../en/13-excluding-tables-and-columns.md) | [한국어](../ko
 |---|---|
 | エラーボックス | `N lines need fixing. Save is disabled.` 各問題がその行とともに一覧され、修正方法がある場合はワンクリックの修正も付きます。 |
 | 行ステータス | ルールごとに 1 行。たとえば `L3  matches 4 columns - 1 kept by include on L5 - 2 blocked (primary key, computed)`。`type:` ルールは型ごとの件数を示します(`longtext: 3 columns in 2 tables`)。`only unselected tables`、`all blocked`、`cancels nothing` などのフラグは、見かけよりも効果の小さい行を示します。 |
-| 結果 | ルールが選択解除するテーブル、除外される列(「migrated as NULL」)、拒否されるすべての列とその理由、そして各警告(§13.4)。 |
+| 結果 | ルールが選択解除するテーブル、除外される列(「migrated as NULL」)、拒否されるすべての列とその理由、そして警告がある除外列の数(§13.4。各警告は Review all の Status: Warning に表示されます)。 |
 | Review all N items | 関係するすべての項目をまとめた、ページ分割された 1 つの表で、**All / Excluded / Blocked / Warning** で絞り込めます。各項目の状態、それに一致した行、そしてそれが含まれる理由またはそれに対して行われるターゲットの変更を示します。 |
 | Oversized-LOB candidates (N) | 折りたたまれています。§13.5 を参照。 |
 | Changes to Aurora DSQL (N statements, run when the load starts) | 折りたたまれています。正確な `ALTER` 文を実行順に示します(§13.6)。CDC only では「run when CDC starts」と表示されます。 |

@@ -661,6 +661,7 @@ def _render_result(ui, resolution, tables: "Optional[Sequence[str]]" = None) -> 
     """The Result block. ``tables`` (Change & reload) scopes it to the tables the confirm
     drops and reloads: their blocked items and W1-W6 warnings show before the DROP."""
     items = resolution.items
+    tables_scope = tables
     if tables is not None:
         wanted = set(tables)
         items = [i for i in items if i.table in wanted and i.kind != "unselected"]
@@ -697,6 +698,17 @@ def _render_result(ui, resolution, tables: "Optional[Sequence[str]]" = None) -> 
                         tone="warning")
         if len(blocked) > _SHOWN:
             inline_hint(ui, f"... and {len(blocked) - _SHOWN} more not excluded", tone="warning")
+        if warned and tables_scope is None:
+            # The editor lists each warning in Review all (Status: Warning) and on its
+            # rule's line, so the Result only counts them. Change & reload (scoped) has
+            # no Review all: there the warnings are the pre-DROP disclosure, listed below.
+            total = len(resolution.items)
+            inline_hint(ui, f"(!) {len(warned)} of {len(excluded)} excluded column"
+                        f"{'s' if len(excluded) != 1 else ''} "
+                        f"{'have warnings' if len(warned) != 1 else 'has a warning'}: see "
+                        f"Review all {total} item{'s' if total != 1 else ''} "
+                        "(Status: Warning).", tone="warning")
+            return
         for item in warned[:_SHOWN]:
             inline_hint(ui, f"(!) {item.table}.{item.column}  {' '.join(item.why)}",
                         tone="warning")

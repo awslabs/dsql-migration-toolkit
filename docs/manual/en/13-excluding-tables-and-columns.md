@@ -76,7 +76,7 @@ live preview under it. About 300 ms after you stop typing, the preview updates:
 |---|---|
 | Error box | `N lines need fixing. Save is disabled.` Each problem is listed with its line, and with a one-click fix where one exists. |
 | Line status | One line per rule, for example `L3  matches 4 columns - 1 kept by include on L5 - 2 blocked (primary key, computed)`. A `type:` rule shows its count per type (`longtext: 3 columns in 2 tables`). Flags such as `only unselected tables`, `all blocked` or `cancels nothing` mark a line that does less than it seems. |
-| Result | The tables your rules unselect, the columns excluded ("migrated as NULL"), every refused column with its reason, and each warning (§13.4). |
+| Result | The tables your rules unselect, the columns excluded ("migrated as NULL"), every refused column with its reason, and how many excluded columns have a warning (§13.4; each warning is listed in Review all, Status: Warning). |
 | Review all N items | One paginated table of everything involved, filterable by **All / Excluded / Blocked / Warning**. It shows each item's status, the lines that matched it, and why it is there or which target change it gets. |
 | Oversized-LOB candidates (N) | Collapsed. See §13.5. |
 | Changes to Aurora DSQL (N statements, run when the load starts) | Collapsed. The exact `ALTER` statements in run order (§13.6). For CDC only, it reads "run when CDC starts". |
