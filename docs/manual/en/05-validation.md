@@ -231,7 +231,10 @@ Cut over repeats them as a non-blocking warning.
 - **Full Load + CDC:** re-run Step 1 (Evaluation) if the source schema changed →
   Stop CDC → reload the table with **Drop & reload** → Start CDC → re-check it.
 - **CDC only:** correct the rows on Aurora DSQL by hand (the dead-letter queue card
-  lists each record's primary key and Kafka offset) → re-check.
+  lists each record's primary key and Kafka offset) → re-check. A source `TRUNCATE`'s
+  dead letter names no row: Stop CDC → delete the rows the source no longer has (at most
+  3,000 rows per transaction) → Start CDC → re-check
+  ([§4.2](04-cdc-and-dsql-constraints.md#42-cdc-replicates-data-not-schema--important)).
 
 **Full Load only** is unaffected, unless CDC ran earlier in the same session: dead
 letters recorded then still need their CHECKSUM match.

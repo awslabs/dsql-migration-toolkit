@@ -987,6 +987,114 @@ def test_the_runbook_says_cut_over_rereads_and_when(monkeypatch):
     assert "this step re-reads" not in s.body()
 
 
+def test_cdc_only_names_the_truncate_repair_before_the_recheck(monkeypatch):
+    """G3: a source TRUNCATE dead letter names no row, so CDC only's generic repair line
+    ("the dead-letter queue card lists each record's primary key") gives no way to find the
+    rows to remove. The Cut over step must say what to delete, and that CDC is stopped first."""
+    s = _Cutover(monkeypatch, mtype="CDC_ONLY")
+    s.dead_letter("app.t", code="SOURCE_TRUNCATE")
+    s.validate(_item("app.t", checksum=None))
+    s.render()
+    body = s.body()
+    line = "Source TRUNCATE was not replicated for app.t: a TRUNCATE dead letter names no row"
+    assert line in body and "3,000 rows per transaction" in body
+    assert body.index(line) < body.index("Re-check these tables")
+
+
+def test_cdc_only_truncate_line_is_one_step_before_the_finals():
+    from dsql_migrator.core.cdc import SchemaDriftKind
+    from dsql_migrator.ui.cdc_dlq_gate import _SOURCE_TRUNCATE_KIND, way_forward_lines
+    from dsql_migrator.ui.data_migration import MigrationType
+
+    assert _SOURCE_TRUNCATE_KIND == SchemaDriftKind.SOURCE_TRUNCATE.value
+    gate = dataclasses.replace(
+        _gate(
+            ledger={"app.t": _entry(kinds=["source-truncate"])},
+            report=_report(_item(checksum=None)),
+        ),
+        migration_type=MigrationType.CDC_ONLY,
+    )
+    steps = way_forward_lines(gate)
+    (line,) = [step for step in steps if "dead letter names no row" in step]
+    assert line.index("Stop CDC") < line.index("delete the rows") < line.index("Start CDC")
+    assert steps[-1].startswith("Re-check these tables")
+
+
+def _cdc_only_gate(ledger, *tables):
+    from dsql_migrator.ui.data_migration import MigrationType
+
+    return dataclasses.replace(
+        _gate(ledger=ledger, report=_report(*[_item(t, checksum=None) for t in tables])),
+        migration_type=MigrationType.CDC_ONLY,
+    )
+
+
+def test_cdc_only_truncate_line_names_only_the_truncated_tables_after_the_repair():
+    """The truncate line tells the user to DELETE target rows, so it must name only the tables
+    whose dead letters carry the truncate kind -- never a table held for another reason -- and
+    it follows the generic repair line it qualifies, before the finals."""
+    from dsql_migrator.ui.cdc_dlq_gate import way_forward_lines
+
+    gate = _cdc_only_gate(
+        {"app.t": _entry(kinds=["source-truncate"]), "app.u": _entry(kinds=["type-change"])},
+        "app.t",
+        "app.u",
+    )
+    steps = way_forward_lines(gate)
+    (line,) = [s for s in steps if "dead letter names no row" in s]
+    assert line.startswith("Source TRUNCATE was not replicated for app.t:")
+    assert "app.u" not in line
+    repair = next(s for s in steps if s.startswith("CDC only has no Full Load step"))
+    final = next(s for s in steps if s.startswith("Re-check these tables"))
+    assert steps.index(repair) < steps.index(line) < steps.index(final)
+
+
+def test_cdc_only_without_a_truncate_has_no_truncate_line():
+    from dsql_migrator.ui.cdc_dlq_gate import way_forward_lines
+
+    gate = _cdc_only_gate({"app.u": _entry(kinds=["type-change"])}, "app.u")
+    assert not any("dead letter names no row" in s for s in way_forward_lines(gate))
+
+
+@pytest.mark.parametrize(
+    ("count", "names"),
+    [
+        (2, "app.t0, app.t1"),
+        (6, "app.t0, app.t1, app.t2, app.t3, app.t4, app.t5"),
+        (7, "app.t0, app.t1, app.t2, app.t3, app.t4, app.t5 (+1 more)"),
+    ],
+)
+def test_cdc_only_truncate_line_reads_for_any_count_and_caps_the_names(count, names):
+    """Several truncated tables share ONE line, worded for any count, and a workload that
+    truncates many staging tables gets a capped name list, not hundreds of names."""
+    from dsql_migrator.ui.cdc_dlq_gate import way_forward_lines
+
+    tables = [f"app.t{i}" for i in range(count)]
+    gate = _cdc_only_gate({t: _entry(kinds=["source-truncate"]) for t in tables}, *tables)
+    (line,) = [s for s in way_forward_lines(gate) if "dead letter names no row" in s]
+    assert line.startswith(f"Source TRUNCATE was not replicated for {names}: ")
+    assert "its dead letter" not in line
+    assert ("more)" in line) is (count > 6)
+    assert "app.t6" not in line
+
+
+def test_full_load_and_cdc_truncate_uses_the_generic_drop_and_reload_line():
+    from dsql_migrator.ui.cdc_dlq_gate import way_forward_lines
+    from dsql_migrator.ui.data_migration import MigrationType
+
+    gate = dataclasses.replace(
+        _gate(
+            ledger={"app.t": _entry(kinds=["source-truncate"])},
+            report=_report(_item(checksum=None)),
+        ),
+        migration_type=MigrationType.FULL_LOAD_AND_CDC,
+    )
+    steps = way_forward_lines(gate)
+    assert not any("dead letter names no row" in s or "3,000" in s for s in steps)
+    (line,) = [step for step in steps if "Drop & reload" in step]
+    assert "remove an extra one" in line
+
+
 def test_issue_lines_are_capped_at_twenty_with_a_count_tail():
     from dsql_migrator.ui.cdc_dlq_gate import issue_lines
 

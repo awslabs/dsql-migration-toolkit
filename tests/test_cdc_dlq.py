@@ -5,6 +5,8 @@
 
 from datetime import datetime, timezone
 
+import pytest
+
 from dsql_migrator.core.cdc import SchemaDriftKind
 from dsql_migrator.core.cdc_dlq import _table_from_topic, parse_dlq_log_message
 
@@ -295,11 +297,13 @@ def test_a_source_truncate_quarantine_is_classified_as_its_own_drift_kind() -> N
 
     Live-measured on PostgreSQL 17.7 -> MSK -> Aurora DSQL: ``TRUNCATE`` on a captured table
     produced NO source record at all (Debezium's ``skipped.operations`` defaults to ``t``), so
-    the target kept all 9 truncated rows while the source held 1 -- permanently. The cdc-stack's
-    PostgreSQL source now sets ``skipped.operations: none`` and, since Aurora DSQL has no
-    TRUNCATE statement, the sink dead-letters the event by name. That single quarantine is far
-    below the DLQ badge's 50-record warn threshold, so the DRIFT classification is what actually
-    surfaces it -- otherwise only Validation would, after the cut-over decision was in progress.
+    the target kept all 9 truncated rows while the source held 1 -- permanently. Both cdc-stack
+    source connectors (PostgreSQL and MySQL) now set ``skipped.operations: none`` and, since
+    Aurora DSQL has no TRUNCATE statement, the sink dead-letters the event by name. The MySQL
+    shape is pinned by ``test_a_mysql_source_truncate_quarantine_is_classified_and_held``.
+    That single quarantine is far below the DLQ badge's 50-record warn threshold, so the DRIFT
+    classification is what actually surfaces it -- otherwise only Validation would, after the
+    cut-over decision was in progress.
     """
     from dsql_migrator.core.cdc import SchemaDriftKind
     from dsql_migrator.core.cdc_dlq import SOURCE_TRUNCATE_CODE
@@ -326,6 +330,43 @@ def test_a_source_truncate_quarantine_is_classified_as_its_own_drift_kind() -> N
     # The recovery must survive into the surfaced message (Drop & reload, not a plain Reload:
     # an upsert cannot remove a row the source no longer has).
     assert "Drop & reload" in rec.message
+
+
+def test_a_mysql_source_truncate_quarantine_is_classified_and_held() -> None:
+    """The MySQL-shaped truncate dead letter takes the same path as the PostgreSQL one.
+
+    With ``skipped.operations: none`` on the MySQL source, debezium-connector-binlog 2.7.4
+    (``BinlogStreamingChangeEventSource.handleQueryEvent`` ->
+    ``BinlogChangeRecordEmitter.emitTruncateRecord``) emits one keyless op='t' record on the
+    table's own ``<prefix>.<db>.<table>`` topic, with ``source.db``/``source.table`` set and
+    no ``source.schema``. Fed to the shipped sink (verified offline against the shipped
+    jars), it dead-letters as below -- no SQLSTATE, no pk, no op suffix. The parse, the drift
+    kind and the Cut over ledger are engine-agnostic; this pins that they stay so.
+    """
+    from dsql_migrator.core.cdc_dlq import SOURCE_TRUNCATE_CODE, fold_dlq_ledger
+
+    msg = (
+        "Quarantined record to DLQ (topic=dsqlcdc.migration_schema.g3_trunc, partition=0, "
+        "offset=7): Cannot apply a source TRUNCATE of table migration_schema.g3_trunc: Aurora "
+        "DSQL has no TRUNCATE statement, so there is no correct apply and this event is "
+        "quarantined rather than guessed at. The target still holds the rows the source "
+        "truncated, so the two now differ by exactly those rows (Validation reports them as "
+        "extra). Recovery: reload this table on the Full Load step with 'Drop & reload', which "
+        "recreates it and re-reads the source -- an upsert-only reload cannot remove rows the "
+        "source no longer has. (dev.dsqlmigrator.connect.DsqlSinkTask:818)"
+    )
+    rec = parse_dlq_log_message(msg)
+    assert rec is not None
+    assert rec.table == "migration_schema.g3_trunc"
+    assert rec.error_code == SOURCE_TRUNCATE_CODE
+    assert rec.drift_kind is SchemaDriftKind.SOURCE_TRUNCATE
+    assert rec.pk is None
+    # ...and it reaches the Cut over ledger under its own kind, which is what holds Cut over
+    # for that table until a CHECKSUM match.
+    ledger = fold_dlq_ledger(None, [rec], now=datetime.now(timezone.utc))
+    entry = ledger["migration_schema.g3_trunc"]
+    assert entry.count == 1
+    assert entry.kinds == [SchemaDriftKind.SOURCE_TRUNCATE.value]
 
 
 def test_a_source_truncate_code_never_overrides_a_real_sqlstate() -> None:
@@ -587,18 +628,21 @@ def test_the_add_column_runbook_names_step_1_and_drop_and_reload() -> None:
     assert "use per-table Reload to backfill" not in blob
 
 
-def test_the_postgres_source_connector_emits_truncates_and_mysql_does_not() -> None:
-    """The config half of the pair, and the MySQL scope boundary.
+def test_both_source_connectors_emit_truncates() -> None:
+    """The config half of the pair, on both source engines.
 
     Debezium's ``skipped.operations`` defaults to ``t`` (verified in the shipped
     debezium-core-2.7.4.Final.jar: ``CommonConnectorConfig.SKIPPED_OPERATIONS`` is built
-    ``.withDefault("t")``), and on PostgreSQL that default is applied inside the pgoutput
-    decoder, so the truncate never becomes a record. The sink branch is useless without this
-    key. MySQL CAN emit the same event -- debezium-connector-binlog's
-    ``BinlogStreamingChangeEventSource`` dispatches a TRUNCATE change record off the parsed DDL
-    -- but that is unverified against a live MySQL source, so the MySQL block keeps the default.
+    ``.withDefault("t")``). On PostgreSQL that default is applied inside the pgoutput decoder;
+    on MySQL, in debezium-connector-binlog's ``BinlogStreamingChangeEventSource.handleQueryEvent``
+    -- either way the truncate never becomes a record and the target silently keeps the rows.
+    The sink branch is useless without this key. Each block must carry exactly ONE
+    ``skipped.operations`` key valued ``none`` (the only value that skips nothing). MySQL
+    emission was verified offline against the shipped binlog 2.7.4 jar; the live MySQL check
+    is still pending.
     """
     import pathlib
+    import re
 
     template = (
         pathlib.Path(__file__).resolve().parents[1] / "deploy/cdc-stack/cdc-stack.yaml"
@@ -613,9 +657,106 @@ def test_the_postgres_source_connector_emits_truncates_and_mysql_does_not() -> N
     pg_block = mysql_block[pg_start:]
     mysql_block = mysql_block[:pg_start]
 
-    assert "skipped.operations: none" in pg_block
-    # MySQL stays byte-identical: no skipped.operations key at all.
-    assert "skipped.operations" not in mysql_block
+    key = re.compile(r"^\s*skipped\.operations:\s*(\S+)\s*$", re.M)
+    assert key.findall(pg_block) == ["none"]
+    assert key.findall(mysql_block) == ["none"]
+    # The comments must describe the key correctly, and the same way in both blocks: a value
+    # skips exactly the op codes it lists (the default "t" only truncate), never "c/u/d".
+    assert "skip c/u/d" not in mysql_block and "skip c/u/d" not in pg_block
+    assert "skips exactly the op codes it lists" in mysql_block
+
+
+class _BannerUi:
+    """A NiceGUI stand-in that records every label/button text the drift banner renders."""
+
+    class _El:
+        def classes(self, *a, **k):
+            return self
+
+        def props(self, *a, **k):
+            return self
+
+        def tooltip(self, *a, **k):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+
+    def column(self, *a, **k):
+        return self._El()
+
+    def row(self, *a, **k):
+        return self._El()
+
+    def label(self, text="", *a, **k):
+        self.texts.append(str(text))
+        return self._El()
+
+    def icon(self, name="", *a, **k):
+        return self._El()
+
+    def button(self, text="", *a, **k):
+        self.texts.append(str(text))
+        return self._El()
+
+    def space(self, *a, **k):
+        return self._El()
+
+    def card(self, *a, **k):
+        return self._El()
+
+
+@pytest.mark.parametrize("migration_type", [None, "FULL_LOAD_AND_CDC", "CDC_ONLY"])
+def test_the_truncate_runbook_says_stop_cdc_and_fits_the_migration_type(migration_type) -> None:
+    """The truncate runbook must be executable as written, for the run's migration type.
+
+    Two ways the old line misled once a MySQL TRUNCATE (not just a PostgreSQL one) could reach
+    it: it sent the operator to 'Drop & reload' without saying Stop CDC first -- that choice is
+    only offered while CDC is not live (``_full_load_ui``), so the instruction could not be
+    followed -- and on a CDC-only run it pointed at a Full Load step that does not exist.
+    """
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import SchemaDriftSummary
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    mt = getattr(MigrationType, migration_type) if migration_type else None
+    view = SimpleNamespace(
+        schema_drift=[
+            SchemaDriftSummary(table="migration_schema.g3_trunc", kind="source-truncate", count=1)
+        ]
+    )
+    ui = _BannerUi()
+    cm._render_cdc_schema_drift_banner(ui, view, session=None, migration_type=mt)
+    blob = " ".join(ui.texts)
+
+    assert "Source TRUNCATE was not replicated" in blob
+    assert "migration_schema.g3_trunc" in blob
+    for absent in ("ALTER TABLE", "backfill", "Stop CDC and reload these tables"):
+        assert absent not in blob
+    assert "CHECKSUM" in blob
+    (runbook,) = [t for t in ui.texts if t.startswith("CDC cannot replicate a TRUNCATE")]
+    if mt is MigrationType.CDC_ONLY:
+        assert "no Full Load step" in runbook
+        assert "3,000 rows per transaction" in runbook
+        assert runbook.index("Stop CDC") < runbook.index("delete the rows") < runbook.index(
+            "Start CDC"
+        )
+        assert "'Drop & reload'" not in blob
+        assert "on the Full Load step" not in blob
+    else:
+        assert "offered only while CDC is stopped" in runbook
+        assert "'Append' only adds missing rows" in runbook
+        assert runbook.index("Stop CDC") < runbook.index("'Drop & reload'") < runbook.index(
+            "Start CDC"
+        )
 
 
 # ---------------------------------------------------------------------------

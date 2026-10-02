@@ -1170,6 +1170,20 @@ def test_cdc_source_connector_has_heartbeat_without_source_write(cdc_template: d
     )
 
 
+def test_both_source_connectors_emit_source_truncates_parsed(cdc_template: dict) -> None:
+    # G3: Debezium's `skipped.operations` defaults to "t", so without this key a source
+    # TRUNCATE produces NO record -- the target silently keeps every truncated row. Both
+    # engines must carry exactly `none` (the only value that skips nothing; Debezium rejects
+    # `none` combined with other codes, and any other value skips exactly the op codes it
+    # lists -- the default "t" is this bug), so the sink can dead-letter the event by name
+    # and the `source-truncate` banner + Cut over hold can fire. Checked on the PARSED
+    # template, as CloudFormation will read it.
+    for name in ("DebeziumSourceConnector", "PostgresSourceConnector"):
+        cfg = cdc_template["Resources"][name]["Properties"]["ConnectorConfiguration"]
+        value = cfg["skipped.operations"]
+        assert isinstance(value, str) and value == "none", (name, value)
+
+
 def test_cdc_stack_alarms_on_connector_errored_tasks(cdc_template: dict) -> None:
     # Each connector gets a CloudWatch alarm on AWS/KafkaConnect ErroredTaskCount
     # (dimension ConnectorName) so a FAILED task is surfaced automatically. The alarm
@@ -2112,6 +2126,23 @@ def test_anchor_slug_helper_matches_github_for_a_known_heading() -> None:
     assert "11-前提条件" in ja
 
 
+def test_the_cut_over_runbook_in_every_language_covers_a_cdc_only_truncate() -> None:
+    # G3: section 5.5 "The way forward" is the written form of the Cut over step's runbook,
+    # whose CDC only branch now has a separate TRUNCATE line (cdc_dlq_gate.way_forward_lines):
+    # that dead letter names no row, so "the card lists each record's primary key" cannot
+    # find what to delete. Each language must give the same steps and point back to 4.2.
+    import pathlib
+
+    manual = pathlib.Path(__file__).resolve().parents[1] / "docs" / "manual"
+    for lang in ("en", "ko", "ja"):
+        text = (manual / lang / "05-validation.md").read_text(encoding="utf-8")
+        section = text[text.index("## 5.5") : text.index("## 5.6")]
+        (bullet,) = [line for line in section.split("\n- ") if line.startswith("**CDC only:**")]
+        assert "`TRUNCATE`" in bullet, lang
+        assert bullet.index("Stop CDC") < bullet.index("3,000") < bullet.index("Start CDC"), lang
+        assert "(04-cdc-and-dsql-constraints.md#42-" in bullet, lang
+
+
 # --- PostgreSQL CDC: the app seeds MSK itself (SeedMode=External) --------------
 # A PostgreSQL cdc-stack has no in-VPC offset-seeder Lambda, so THIS task creates the
 # Kafka topics and the CDC start offset over the MSK Serverless IAM endpoint on 9098
@@ -2293,8 +2324,8 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
         # v47: a source TRUNCATE is dead-lettered with the TRUNCATE NAMED. Without the
         # sink's op='t' branch a truncate envelope (no after-image, no key) fell through to
         # buildDelete and dead-lettered as "Cannot build DELETE ... no primary key" -- loud
-        # about the wrong thing. Pairs with `skipped.operations: none` on the PostgreSQL
-        # source block, which is what makes the event reach the sink at all.
+        # about the wrong thing. Pairs with `skipped.operations: none` on BOTH source blocks
+        # (PostgreSQL and MySQL), which is what makes the event reach the sink at all.
         "pg truncate named": b"has no TRUNCATE statement",
         # v46: an unbounded `bit varying` column's declared length is REFUSED instead of
         # allocated. Padding to it asked String.repeat for a multi-gigabyte array and the JVM

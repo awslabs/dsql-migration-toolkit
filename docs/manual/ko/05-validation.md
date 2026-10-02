@@ -192,7 +192,9 @@ CHECKSUM은 값 비교할 수 없는 컬럼을 명시합니다(5.1). dead-letter
 - **Full Load + CDC:** 소스 스키마가 바뀌었으면 Step 1(Evaluation) 재실행 → Stop CDC → **Drop &
   reload**로 테이블 리로드 → Start CDC → 재확인.
 - **CDC only:** Aurora DSQL에서 행을 직접 수정(dead-letter queue 카드에 각 레코드의 기본 키와 Kafka
-  오프셋이 나옴) → 재확인.
+  오프셋이 나옴) → 재확인. 소스 `TRUNCATE`의 dead letter는 어떤 행도 가리키지 않습니다: Stop CDC → 소스에
+  더 이상 없는 행을 트랜잭션당 최대 3,000행씩 삭제 → Start CDC → 재확인
+  ([§4.2](04-cdc-and-dsql-constraints.md#42-cdc는-스키마가-아니라-데이터를-복제--중요)).
 
 **Full Load only**는 영향이 없습니다. 단, 같은 세션에서 앞서 CDC를 실행했다면 그때 기록된 dead letter는
 여전히 CHECKSUM 일치가 필요합니다.

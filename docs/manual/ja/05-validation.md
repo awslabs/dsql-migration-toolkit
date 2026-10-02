@@ -113,7 +113,7 @@ CHECKSUM は値を比較できない列を明示します（5.1）。デッド�
 一致しないテーブルの **対処手順**:
 
 - **Full Load + CDC:** ソースのスキーマが変わった場合は Step 1（Evaluation）を再実行 → Stop CDC → **Drop & reload** でテーブルをリロード → Start CDC → 再確認。
-- **CDC only:** Aurora DSQL 上の行を手作業で修正（dead-letter queue カードに各レコードの主キーと Kafka オフセットが表示されます）→ 再確認。
+- **CDC only:** Aurora DSQL 上の行を手作業で修正（dead-letter queue カードに各レコードの主キーと Kafka オフセットが表示されます）→ 再確認。ソースの `TRUNCATE` のデッドレターはどの行も示しません: Stop CDC → ソースにもう存在しない行をトランザクションあたり最大 3,000 行ずつ削除 → Start CDC → 再確認（[§4.2](04-cdc-and-dsql-constraints.md#42-cdc-は-スキーマ-ではなく-データ-を複製する--重要)）。
 
 **Full Load only** は影響を受けません。ただし同じセッションで先に CDC を実行していた場合、そのとき記録されたデッドレターには引き続き CHECKSUM での一致が必要です。
 

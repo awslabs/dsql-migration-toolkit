@@ -48,6 +48,32 @@ Step 1（Evaluation）を再実行 → Stop CDC → **Drop & reload** でテー�
 再確認します（そのテーブルは CHECKSUM が自動です）。列削除/型変更のドリフトは手動対応のために表示のみ行います（ツールはターゲットの
 データを自動削除しません）。
 
+**ソースの `TRUNCATE`**（MySQL・PostgreSQL ソース）はスキーマ変更ではありませんが、CDC が適用することも
+できません。Aurora DSQL には `TRUNCATE` 文がなく、どの行も示さない 1 件のイベントを理由にターゲットの行を
+すべて削除すると、範囲に上限がなく、その後に挿入された行まで消えるおそれがあるため、ツールはそうしません。
+代わりに sink はそのイベントをデッドレターにします（TRUNCATE されたテーブルごとに 1 件）。CDC ステップには
+テーブル名を示す **「Source TRUNCATE was not replicated」** バナーが表示され、そのテーブルへのその後の変更は
+ストリーミングされ続け、ターゲットにはソースが削除した行が残り（Validation が extra 行として報告します）、
+そのテーブルが CHECKSUM で一致するまで Cut over は保留されます
+（[§5.5](05-validation.md#55-cdc-のデッドレターとカットオーバー)）。復旧方法:
+
+- **Full Load + CDC:** Stop CDC → Full Load ステップで **Drop & reload** によりテーブルをリロード（CDC の停止中に
+  のみ表示されます。**Append** は欠けている行を追加するだけなので、余分な行は削除できません）→ Start CDC →
+  Validation でそのテーブルを再確認します。
+- **CDC only:** リロード元の Full Load ステップはありません。Stop CDC → Aurora DSQL のテーブルから、ソースに
+  もう存在しない行をトランザクションあたり最大 3,000 行ずつ自分で削除 → Start CDC → Validation でそのテーブルを
+  再確認します。単一列の整数キーのテーブルなら、Validation の **Reconcile every record** が余分な行の数を数え、
+  そのキーの一部を表示します。
+
+TRUNCATE が Full Load の開始後、そのテーブルのコピー前に実行された場合、ターゲットはすでに一致していることが
+あり、その場合は CHECKSUM の再確認でリロードなしに保留が解除されます。ワークロードが定期的に TRUNCATE する
+テーブル（ステージングやキューのテーブルなど）は TRUNCATE のたびにこの状態になるため、Aurora DSQL でその
+データが不要なら移行対象から外してください。対象外: MySQL の `ALTER TABLE … TRUNCATE PARTITION` と
+`ALTER TABLE … DROP PARTITION` は変更イベントを生成せずに行を削除するため、CDC は何も報告せず、余分な行は
+Validation でしか確認できません。そのようなテーブルも同じ方法で修復してください。以前のバージョンのツールから
+アップグレードした時点ですでにストリーミング中だった MySQL パイプラインは、Stop CDC → Start CDC を 1 回
+行った後から TRUNCATE を報告します。
+
 ---
 
 ## 4.3 ギャップのない Full Load → CDC ハンドオフ

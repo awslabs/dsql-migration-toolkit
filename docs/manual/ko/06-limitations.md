@@ -73,6 +73,13 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
 - **CDC는 데이터를 복제할 뿐 DDL은 복제하지 않음.** CDC 도중 소스에서 발생한 스키마 변경은 DSQL로
   **전파되지 않으므로** 동일한 DDL을 DSQL에 직접 적용해야 합니다
   ([4장 §4.2](04-cdc-and-dsql-constraints.md#42-cdc는-스키마가-아니라-데이터를-복제--중요) 참조).
+- **소스 `TRUNCATE`는 CDC가 적용하지 않음.** Aurora DSQL에는 `TRUNCATE`가 없으므로 CDC는 그 이벤트를
+  데드레터로 보내고 CDC 단계에 테이블 이름을 표시합니다. 남은 행을 지우고(Full Load + CDC는 Drop & reload,
+  CDC only는 직접 삭제) 그 테이블이 CHECKSUM으로 일치할 때까지 Cut over가 보류됩니다
+  ([4장 §4.2](04-cdc-and-dsql-constraints.md#42-cdc는-스키마가-아니라-데이터를-복제--중요) 참조). MySQL의
+  `ALTER TABLE … TRUNCATE PARTITION` / `DROP PARTITION`은 변경 이벤트를 전혀 만들지 않으며, 남은 행은
+  Validation에서만 보입니다. 이전 버전의 도구에서 업그레이드할 때 이미 스트리밍 중이던 MySQL 파이프라인은
+  Stop CDC → Start CDC를 한 번 거친 뒤부터 `TRUNCATE`를 감지합니다.
 - **CDC가 실행 중이 아닐 때 마이그레이션 대상 테이블에 소스 DDL 금지(MySQL).** 시드된 위치(Full Load
   워터마크 또는 Manual binlog 시작 지점 — 세션에 Full Load 워터마크가 없는 MySQL CDC only의 첫 시작은 이것이
   필요 — 그리고 그런 실행을

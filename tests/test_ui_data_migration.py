@@ -1738,6 +1738,35 @@ def test_cdc_activity_events_are_edge_triggered_once() -> None:
     assert len(posted) == 1 and "stalled" in posted[0]["text"]
 
 
+def test_cdc_drift_events_do_not_call_a_truncate_or_a_target_problem_a_schema_change() -> None:
+    # G3: a source TRUNCATE (now reachable on MySQL too) and a missing TARGET table are not
+    # source schema changes; the feed text grounds later AI turns, so a blanket "source schema
+    # change" would steer the assistant toward DDL. Each event is worded by its kind's label.
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+
+    posted: list = []
+    ms = SimpleNamespace(
+        job_id="cdc-drift-wording",
+        cdc_stack_name=None,
+        cdc_activity=SimpleNamespace(sink_stall_confirmed=False),
+    )
+    view = SimpleNamespace(
+        dlq_depth=0,
+        schema_drift=[
+            SimpleNamespace(table="shop.orders", kind="source-truncate", count=1),
+            SimpleNamespace(table="shop.items", kind="missing-table", count=4),
+        ],
+    )
+    cm._announce_cdc_events(ms, view, lambda **kw: posted.append(kw["text"]))
+    (truncate,) = [t for t in posted if "shop.orders" in t]
+    assert "TRUNCATE" in truncate and "1 record(s) dead-lettered" in truncate
+    (missing,) = [t for t in posted if "shop.items" in t]
+    assert "TARGET table no longer exists" in missing
+    assert not any("schema change" in t.lower() for t in posted), posted
+
+
 def test_quarantine_rows_offer_ai_assist_scoped_to_the_reason() -> None:
     # Quarantined-row groups now offer BOTH AI Assist and Reload (previously Reload
     # only). The AI chat is scoped to the quarantine reason (topic + a dropped-rows
@@ -10995,6 +11024,87 @@ def test_render_cdc_dlq_panel_shows_schema_drift_banner() -> None:
     assert any("Source schema change detected" in t for t in ui.texts)
     assert any("orders" in t and "column added" in t for t in ui.texts)
     assert any("does not replicate DDL" in t for t in ui.texts)
+
+
+def test_cdc_dlq_panel_passes_the_migration_type_to_the_truncate_runbook() -> None:
+    # G3: the truncate runbook differs by migration type (CDC only has no Full Load step to
+    # Drop & reload from), so the panel must hand the run's type to the banner -- a missed
+    # wiring would silently show CDC-only users the Full Load + CDC remedy.
+    from dsql_migrator.core.models import MigrationJob
+    from dsql_migrator.ui.data_migration import _render_cdc_dlq_panel
+
+    state = DataMigrationState()
+    state.job_id = "job-cdc"
+    state.set_migration_type(MigrationType.CDC_ONLY)
+    ui = _DlqUi()
+    _render_cdc_dlq_panel(
+        ui,
+        state,
+        _JobJM(MigrationJob(job_id="job-cdc")),
+        _cdc_view_with_drift([("migration_schema.g3_trunc", "source-truncate", 1)]),
+        on_refresh=None,
+    )
+    assert any("Source TRUNCATE was not replicated" in t for t in ui.texts)
+    assert any("no Full Load step" in t for t in ui.texts)
+    assert not any("'Drop & reload' (offered only" in t for t in ui.texts)
+
+
+def test_cdc_dlq_record_list_drops_the_sinks_truncate_recovery_clause() -> None:
+    # G3: the sink's truncate reason ends "Recovery: reload this table on the Full Load step
+    # with 'Drop & reload'", which a CDC only run cannot do and which skips Stop CDC. The
+    # banner on the same panel gives the per-type runbook, so the Reason cell must not show
+    # a contradicting one beneath it. Other records' reasons are shown verbatim.
+    from dsql_migrator.core.cdc_dlq import SOURCE_TRUNCATE_CODE, parse_dlq_log_message
+    from dsql_migrator.core.models import DataErrorRecord, MigrationJob
+    from dsql_migrator.ui.data_migration import _render_cdc_dlq_panel
+
+    sink_line = (
+        "Quarantined record to DLQ (topic=dsqlcdc.migration_schema.g3_trunc, partition=0, "
+        "offset=7): Cannot apply a source TRUNCATE of table migration_schema.g3_trunc: "
+        "Aurora DSQL has no TRUNCATE statement, so there is no correct apply and this event "
+        "is quarantined rather than guessed at. The target still holds the rows the source "
+        "truncated, so the two now differ by exactly those rows (Validation reports them as "
+        "extra). Recovery: reload this table on the Full Load step with 'Drop & reload', "
+        "which recreates it and re-reads the source -- an upsert-only reload cannot remove "
+        "rows the source no longer has. (dev.dsqlmigrator.connect.DsqlSinkTask:818)"
+    )
+    when = datetime(2026, 10, 3, 1, 2, 3, tzinfo=timezone.utc)
+    rec = parse_dlq_log_message(sink_line, occurred_at=when)
+    assert rec is not None and rec.error_code == SOURCE_TRUNCATE_CODE
+    state = DataMigrationState()
+    state.job_id = "job-cdc"
+    state.set_migration_type(MigrationType.CDC_ONLY)
+    state.error_log.record(
+        "job-cdc",
+        DataErrorRecord(
+            table=rec.table, error_code=rec.error_code, message=rec.message, occurred_at=when
+        ),
+    )
+    other = "DLQ offset=8: undefined_column"
+    state.error_log.record(
+        "job-cdc",
+        DataErrorRecord(table="orders", error_code="42703", message=other, occurred_at=when),
+    )
+    ui = _DlqUi()
+    _render_cdc_dlq_panel(
+        ui,
+        state,
+        _JobJM(MigrationJob(job_id="job-cdc")),
+        _cdc_view_with_drift([("migration_schema.g3_trunc", "source-truncate", 1)]),
+        on_refresh=None,
+    )
+    (reason,) = [
+        r["message"] for r in ui.table_rows if r.get("table") == "migration_schema.g3_trunc"
+    ]
+    assert reason.startswith("DLQ offset=7: Cannot apply a source TRUNCATE of table")
+    assert "Validation reports them as extra" in reason
+    assert "Full Load step" not in reason and "Recovery:" not in reason
+    assert any("no Full Load step" in t for t in ui.texts)
+    assert [r["message"] for r in ui.table_rows if r.get("table") == "orders"] == [other]
+    # Display only: the stored record keeps the sink's full text (the download renders it).
+    assert any(
+        "Recovery:" in (r.message or "") for r in state.error_log.records("job-cdc")
+    )
 
 
 def test_render_cdc_dlq_panel_no_drift_banner_when_none() -> None:

@@ -68,6 +68,28 @@ SQLSTATE로 드리프트를 **분류**(컬럼 추가/삭제/타입 변경)하고
 리로드 → Start CDC → Validation에서 재확인(그 테이블은 CHECKSUM이 자동). 컬럼 삭제/타입 변경 드리프트는 직접 해결하도록
 표시만 합니다(도구는 타깃 데이터를 자동 삭제하지 않습니다).
 
+**소스 `TRUNCATE`**(MySQL·PostgreSQL 소스)는 스키마 변경이 아니지만 CDC가 적용할 수도 없습니다. Aurora
+DSQL에는 `TRUNCATE` 문이 없고, 어떤 행도 가리키지 않는 이벤트 하나 때문에 타깃 행을 모두 지우면 범위에
+제한이 없고 그 뒤에 삽입된 행까지 지울 수 있으므로 도구는 그렇게 하지 않습니다. 대신 싱크가 그 이벤트를
+데드레터로 보냅니다(잘린 테이블당 1건). CDC 단계에는 테이블 이름이 적힌 **"Source TRUNCATE was not
+replicated"** 배너가 표시되고, 그 테이블의 이후 변경은 계속 스트리밍되며, 타깃에는 소스가 지운 행이 그대로
+남고(Validation이 extra 행으로 보고), 그 테이블이 CHECKSUM으로 일치할 때까지 Cut over가 보류됩니다
+([§5.5](05-validation.md#55-cdc-dead-letter와-컷오버)). 복구 방법:
+
+- **Full Load + CDC:** Stop CDC → Full Load 단계에서 **Drop & reload**로 테이블 리로드(CDC가 중지된 동안에만
+  제공됨; **Append**는 없는 행만 추가하므로 남은 행을 지우지 못함) → Start CDC → Validation에서 그 테이블 재확인.
+- **CDC only:** 리로드할 Full Load 단계가 없습니다. Stop CDC → Aurora DSQL 테이블에서 소스에 더 이상 없는 행을
+  트랜잭션당 최대 3,000행씩 직접 삭제 → Start CDC → Validation에서 그 테이블 재확인. 단일 정수 키 테이블이라면
+  Validation의 **Reconcile every record**가 extra 행 수를 세고 그 키 일부를 보여 줍니다.
+
+TRUNCATE가 Full Load 시작 후 그 테이블을 복사하기 전에 실행됐다면 타깃이 이미 일치할 수 있으며, 이때는
+CHECKSUM 재확인으로 리로드 없이 보류가 풀립니다. 워크로드가 주기적으로 TRUNCATE하는 테이블(스테이징·큐
+테이블 등)은 TRUNCATE할 때마다 이 상황이 생기므로, Aurora DSQL에 그 데이터가 필요 없다면 마이그레이션에서
+제외하세요. 다루지 않는 경우: MySQL의 `ALTER TABLE … TRUNCATE PARTITION`과 `ALTER TABLE … DROP PARTITION`은
+변경 이벤트 없이 행을 지우므로 CDC는 아무것도 보고하지 않고 extra 행은 Validation에서만 보입니다. 이런
+테이블도 같은 방법으로 복구하세요. 이전 버전의 도구에서 업그레이드할 때 이미 스트리밍 중이던 MySQL
+파이프라인은 Stop CDC → Start CDC를 한 번 거친 뒤부터 TRUNCATE를 보고합니다.
+
 ---
 
 ## 4.3 무손실 Full Load → CDC 핸드오프

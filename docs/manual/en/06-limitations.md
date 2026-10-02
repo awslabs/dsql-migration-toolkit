@@ -86,6 +86,15 @@ fails **loudly** where it can't.
 - **CDC replicates data, not DDL.** Schema changes on the source during CDC are
   **not** propagated to DSQL — you must apply equivalent DDL to DSQL yourself
   (see [Chapter 4 §4.2](04-cdc-and-dsql-constraints.md#42-cdc-replicates-data-not-schema--important)).
+- **A source `TRUNCATE` is not applied by CDC.** Aurora DSQL has no `TRUNCATE`, so CDC
+  dead-letters it and the CDC step names the table. Cut over is held for that table
+  until you remove the extra rows (Drop & reload for Full Load + CDC, a manual delete for
+  CDC only) and it matches by CHECKSUM (see
+  [Chapter 4 §4.2](04-cdc-and-dsql-constraints.md#42-cdc-replicates-data-not-schema--important)).
+  On MySQL, `ALTER TABLE … TRUNCATE PARTITION` / `DROP PARTITION` produce no change event
+  at all; only Validation shows the extra rows. A MySQL pipeline that was already
+  streaming when you upgraded from an earlier version of the tool detects `TRUNCATE`
+  only after one Stop CDC → Start CDC.
 - **No source DDL on a migrated table while CDC is not running (MySQL).** A MySQL CDC
   that starts from a seeded position — the Full Load watermark or a Manual binlog start
   point (a MySQL CDC-only first start needs one unless the session holds a Full Load

@@ -1932,6 +1932,23 @@ Resources:
         gtid.source.excludes: ".*"
         schema.history.internal.store.only.captured.tables.ddl: "false"
         include.schema.changes: "false"
+        # Emit TRUNCATE events. Debezium's `skipped.operations` defaults to "t", and the
+        # shipped debezium-connector-binlog 2.7.4 applies that default in
+        # BinlogStreamingChangeEventSource.handleQueryEvent, so a source TRUNCATE of a captured
+        # table produced NO record: Aurora DSQL silently kept every truncated row. With `none`,
+        # handleQueryEvent dispatches one op='t' record on the table's own topic; per
+        # BinlogChangeRecordEmitter.emitTruncateRecord it has a null key, no before/after, and
+        # source.db/source.table set with no source.schema -- the same shape the PostgreSQL
+        # source emits. The DSQL sink dead-letters it by name
+        # (DebeziumEvents.truncateNotApplicable), which feeds the `source-truncate` banner and
+        # the Cut over hold. Only truncate emission changes: the c/u/d handlers, the QUERY/DDL
+        # path and schema history behave the same for "t" and `none`, and a table outside
+        # table.include.list is still filtered. `ALTER TABLE ... TRUNCATE PARTITION` /
+        # `DROP PARTITION` still emit nothing. Must be exactly `none`: Debezium rejects `none`
+        # combined with other codes, and any other value skips exactly the op codes it lists
+        # (the default "t" is this bug). Verified offline against the shipped jars; the live
+        # MySQL check is pending.
+        skipped.operations: none
         # Serialize BIGINT UNSIGNED as an exact BigDecimal (Avro decimal) instead
         # of the default signed Long, which overflows for values > 2^63-1. The
         # DSQL write contract maps BIGINT UNSIGNED to numeric(20,0); a BigDecimal
@@ -2110,10 +2127,10 @@ Resources:
         # never skipped, so this is the whole delta); the DSQL sink then dead-letters it with a
         # named reason, because Aurora DSQL has no TRUNCATE and there is no correct apply --
         # see DebeziumEvents.truncateNotApplicable and the `source-truncate` drift banner.
-        # Deliberately NOT set on the MySQL source connector above: MySQL CAN emit the same
-        # event (debezium-connector-binlog's BinlogStreamingChangeEventSource dispatches a
-        # TRUNCATE change record off the parsed DDL), but that path is unverified against a
-        # live MySQL source, so it keeps its byte-identical default.
+        # The MySQL source connector above sets the same `none`: debezium-connector-binlog
+        # applies the same default in BinlogStreamingChangeEventSource.handleQueryEvent and,
+        # with `none`, emits the same keyless op='t' record (verified offline against the
+        # shipped 2.7.4 jars).
         skipped.operations: none
         topic.prefix:
           Ref: TopicPrefix

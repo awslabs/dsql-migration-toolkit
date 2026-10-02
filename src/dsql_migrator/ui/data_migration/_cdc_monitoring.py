@@ -679,7 +679,8 @@ def _render_migration_table_status(
 def _announce_cdc_events(migration_state, status_view, ai_post_event) -> None:
     """Edge-triggered CDC activity events into the AI feed (once per transition).
 
-    Announces: CDC streaming started, source schema drift (per table+kind), the DLQ
+    Announces: CDC streaming started, each classified dead-letter group (schema drift, a
+    source TRUNCATE, a missing target table, ... -- per table+kind), the DLQ
     first growing past zero, and a confirmed sink stall -- the silent-data-loss signals
     the assistant should be aware of. Deduped per stream via ``migration_state
     .cdc_announced``, so Start over's in-place state reset clears the markers.
@@ -715,9 +716,13 @@ def _announce_cdc_events(migration_state, status_view, ai_post_event) -> None:
             if marker not in seen:
                 seen.add(marker)
                 label = _DRIFT_LABELS.get(group.kind, (group.kind, ""))[0]
+                # Worded by the kind's own label, never as a blanket "source schema change":
+                # several kinds are not one (a source TRUNCATE, a missing TARGET table, a key
+                # conflict), and this text grounds later AI turns, so calling them DDL would
+                # point the assistant at the wrong fix.
                 ai_post_event(
                     text=(
-                        f"CDC: source schema change on {group.table} ({label}) — "
+                        f"CDC: {group.table}: {label} — "
                         f"{group.count} record(s) dead-lettered"
                     ),
                     status="warning",
@@ -1749,6 +1754,7 @@ def _render_cdc_schema_drift_banner(
     on_refresh=None,
     cdc_ai_opener=None,
     saved_exclusions: "Optional[Mapping[str, object]]" = None,
+    migration_type=None,
 ) -> None:
     """Flag source DDL the target has not caught up to (from the classified DLQ).
 
@@ -1758,7 +1764,8 @@ def _render_cdc_schema_drift_banner(
     band names the affected table(s) + what changed and points at the manual
     recovery, so a reader is not left to reverse-engineer a rising DLQ count. Renders
     nothing when no drift was detected (the common case), so it is inert on a healthy
-    stream.
+    stream. The truncate-only runbook follows ``migration_type`` (CDC only has no Full
+    Load step to reload from).
     """
     drift = getattr(status_view, "schema_drift", None) or []
     if not drift:
@@ -1852,18 +1859,15 @@ def _render_cdc_schema_drift_banner(
                     ).props("flat dense no-caps size=sm color=primary")
         # One shared runbook line: CDC cannot apply the DDL for you (Property 6). A TRUNCATE-only
         # banner gets its OWN line: there is no DDL to apply and no set-aside row to backfill --
-        # the target has too MANY rows, and an upsert-only Reload cannot remove a row the source
-        # no longer has, so the remedy must name Drop & reload specifically.
-        ui.label(  # type: ignore[attr-defined]
-            (
-                "CDC cannot replicate a TRUNCATE (Aurora DSQL has no TRUNCATE statement). "
-                "Reload the table on the Full Load step with 'Drop & reload', which recreates "
-                "it and re-reads the source; a plain Reload upserts and so cannot remove the "
-                "stale rows. Run Validation (step 4) afterwards to confirm the extra rows are "
-                "gone."
-            )
-            if _truncate_only
-            else (
+        # the target has too MANY rows, and an append (upsert-only) reload cannot remove a row
+        # the source no longer has, so the remedy must name Drop & reload specifically. It says
+        # Stop CDC FIRST because the Full Load step offers Drop & reload only while CDC is not
+        # live (_full_load_ui's `not cdc_live_now`). CDC only has no Full Load step at all, so
+        # its remedy is a manual delete on the target -- also with CDC stopped, which freezes
+        # the target so the delete cannot race a newly replicated insert; the replay after
+        # Start is idempotent (upserts and no-op deletes).
+        if not _truncate_only:
+            _runbook = (
                 "CDC does not replicate DDL. Apply the matching change to the target "
                 "schema (e.g. ALTER TABLE) to stop new rows being set aside — then "
                 "backfill the ones already set aside: re-run Step 1 (Evaluation) so the "
@@ -1872,7 +1876,28 @@ def _render_cdc_schema_drift_banner(
                 "only inserts primary keys the target is missing, so a row already there "
                 "keeps its old values. Run Validation (step 4) afterwards to confirm."
             )
-        ).classes("text-xs italic text-gray-600")
+        else:
+            from dsql_migrator.ui.data_migration._models import MigrationType
+
+            if migration_type is MigrationType.CDC_ONLY:
+                _runbook = (
+                    "CDC cannot replicate a TRUNCATE (Aurora DSQL has no TRUNCATE statement), "
+                    "and CDC only has no Full Load step to reload from. Stop CDC, delete the "
+                    "rows the source no longer has from the table on Aurora DSQL (at most "
+                    "3,000 rows per transaction), then Start CDC. Run Validation (step 4) "
+                    "afterwards: Cut over stays held for each truncated table until it "
+                    "matches by CHECKSUM."
+                )
+            else:
+                _runbook = (
+                    "CDC cannot replicate a TRUNCATE (Aurora DSQL has no TRUNCATE statement). "
+                    "Stop CDC, reload the table on the Full Load step with 'Drop & reload' "
+                    "(offered only while CDC is stopped; 'Append' only adds missing rows, so "
+                    "it cannot remove the stale ones), then Start CDC. Run Validation (step 4) "
+                    "afterwards: Cut over stays held for each truncated table until it "
+                    "matches by CHECKSUM."
+                )
+        ui.label(_runbook).classes("text-xs italic text-gray-600")  # type: ignore[attr-defined]
         if _target_side:
             # The recovery is different in kind: dead-lettered rows are NOT replayed and
             # their Kafka offsets are already committed, so nothing will re-deliver them
@@ -2156,6 +2181,7 @@ def _render_cdc_dlq_panel(
             ui, status_view, session=session, on_refresh=on_refresh,
             cdc_ai_opener=cdc_ai_opener,
             saved_exclusions=migration_state.lob_exclusions(),
+            migration_type=getattr(migration_state, "migration_type", None),
         )
         _render_cdc_dlq_breakdown(ui, status_view)
         # CDC commonly has no Full Load job_id this session, so key the record list /
@@ -2325,11 +2351,22 @@ def _render_cdc_dlq_records(ui, migration_state, log_key: str, page_state=None) 
         reverse=True,
     )
     shown = ordered[:_DLQ_RECORD_LIST_LIMIT]
+    from dsql_migrator.core.cdc_dlq import SOURCE_TRUNCATE_CODE
+
     rows = [
         {
             "table": r.table,
             "code": r.error_code or "—",
-            "message": r.message,
+            # A source TRUNCATE's reason ends in the sink's own "Recovery: reload ... on the
+            # Full Load step with 'Drop & reload'" clause, which leaves out Stop CDC and is
+            # impossible in CDC only (no Full Load step). The drift banner on this same panel
+            # (fed by the same records) gives the runbook for the run's migration type, so the
+            # list shows the reason without that clause rather than contradicting the banner.
+            # Display only: the stored message and the download keep the full text, and
+            # deployed sink plugins keep emitting the clause, so this stays when it is reworded.
+            "message": r.message.split(" Recovery:", 1)[0]
+            if r.error_code == SOURCE_TRUNCATE_CODE and r.message
+            else r.message,
             "when": r.occurred_at.strftime("%Y-%m-%d %H:%M:%S")
             if r.occurred_at
             else "—",

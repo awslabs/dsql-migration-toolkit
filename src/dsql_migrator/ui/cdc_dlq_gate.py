@@ -732,6 +732,8 @@ _OVERSIZED_LABEL = "a value over Aurora DSQL's per-value limit"
 # The drift kinds that mean the SOURCE schema changed (the other kinds are a missing target
 # table, a key conflict, an unbindable value or a TRUNCATE -- not a schema change).
 _SCHEMA_CHANGE_KINDS = frozenset({"add-column", "drop-column", "type-change"})
+# core.cdc.SchemaDriftKind.SOURCE_TRUNCATE (kept a literal like the kinds above).
+_SOURCE_TRUNCATE_KIND = "source-truncate"
 
 
 def _kind_label(kind: str) -> str:
@@ -831,6 +833,7 @@ def way_forward_lines(gate: CdcDlqGate) -> list[str]:
             "each record's reason (after an app restart it lists only records read since "
             "then)."
         )
+        truncate_repair: list[str] = []
         if _is_type(gate.migration_type, "CDC_ONLY"):
             repair = (
                 "CDC only has no Full Load step to reload from: correct these rows on "
@@ -838,6 +841,20 @@ def way_forward_lines(gate: CdcDlqGate) -> list[str]:
                 "primary key and Kafka offset), and delete any row a lost DELETE left "
                 "behind."
             )
+            # A source TRUNCATE dead letter names no row (no key, no image), so the line
+            # above gives no way to find what to remove. Stop CDC first: it freezes the
+            # target, so the delete cannot race a newly replicated insert. Names only the
+            # tables that carry the truncate kind -- this line tells the user to DELETE target
+            # rows, so it must never name a table that was not truncated -- and the wording
+            # holds for one table or several (and for repeated TRUNCATEs of one table).
+            truncated = [i for i in gate.issues if _SOURCE_TRUNCATE_KIND in i.kinds]
+            if truncated:
+                truncate_repair.append(
+                    "Source TRUNCATE was not replicated for "
+                    f"{bounded_table_names([i.table for i in truncated])}: a TRUNCATE dead "
+                    "letter names no row. Stop CDC, delete the rows the source no longer has "
+                    "from Aurora DSQL (at most 3,000 rows per transaction), then Start CDC."
+                )
         else:
             # The same order as the Fix-target-schema dialog's "in this order" runbook (and
             # the manual's 4.2): Evaluation first, while CDC keeps streaming, so the window
@@ -848,7 +865,7 @@ def way_forward_lines(gate: CdcDlqGate) -> list[str]:
                 "'Drop & reload', then Start CDC and let it drain. An append reload cannot "
                 "rewrite a stale row or remove an extra one."
             )
-        lines = [fix, repair, *finals]
+        lines = [fix, repair, *truncate_repair, *finals]
     from dsql_migrator.core.cdc_dlq import OVERSIZED_VALUE_KIND
 
     kinds = {k for i in gate.issues for k in i.kinds}

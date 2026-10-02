@@ -681,6 +681,7 @@ class DebeziumEventsTest {
     // PostgresChangeRecordEmitter.emitTruncateRecord passes a null key). It therefore fell
     // through the `after == null` branch into buildDelete and dead-lettered as
     // "no primary key in record key or before-image" -- loud, but naming the wrong problem.
+    // The MySQL source now emits the same shape (see the MySQL test below).
     Schema env =
         SchemaBuilder.struct().name("Envelope")
             .field("op", Schema.STRING_SCHEMA)
@@ -709,11 +710,42 @@ class DebeziumEventsTest {
   }
 
   @Test
-  void aMysqlSourceIsUnaffectedBecauseNoTruncateEventIsEverEmitted() {
-    // Byte-identical MySQL behaviour: the cdc-stack leaves the MySQL source connector's
-    // `skipped.operations` at its "t" default, so op="t" never reaches the sink from MySQL and
-    // the branch above is unreachable there. Every op MySQL DOES emit is untouched -- asserted
-    // here rather than assumed, because the new branch sits on the hot parse path.
+  void aMysqlSourceTruncateIsDeadLetteredByNameAndRowOpsAreUnchanged() {
+    // The cdc-stack's MySQL source now sets `skipped.operations: none` too, so op="t" reaches
+    // the sink from MySQL. Shape, verified offline against the shipped
+    // debezium-connector-binlog 2.7.4 jar (BinlogStreamingChangeEventSource.handleQueryEvent ->
+    // BinlogChangeRecordEmitter.emitTruncateRecord): null key and key schema, no before/after,
+    // and a source block with connector=mysql and db/table -- MySQL's source block has NO
+    // `schema` field, so the table must qualify from source.db.
+    Schema env =
+        SchemaBuilder.struct().name("Envelope")
+            .field("op", Schema.STRING_SCHEMA)
+            .field("before", ROW)
+            .field("after", ROW)
+            .field("source", ENGINE_SOURCE)
+            .build();
+    Struct truncate =
+        new Struct(env)
+            .put("op", "t")
+            .put(
+                "source",
+                new Struct(ENGINE_SOURCE)
+                    .put("connector", "mysql")
+                    .put("db", "migration_schema")
+                    .put("table", "g3_trunc"));
+    DataException failure =
+        assertThrows(
+            DataException.class,
+            () -> DebeziumEvents.parse(record(null, truncate, "dsqlcdc.migration_schema.g3_trunc")));
+    String message = failure.getMessage();
+    assertTrue(
+        message.startsWith("Cannot apply a source TRUNCATE of table migration_schema.g3_trunc"),
+        message);
+    assertTrue(message.contains("no TRUNCATE statement"), message);
+    assertFalse(message.contains("no primary key"), message);
+
+    // Every row op MySQL emits is untouched -- asserted here rather than assumed, because the
+    // truncate branch sits on the hot parse path.
     Struct ins =
         new Struct(ENVELOPE).put("op", "c").put("after", row(1L, "Alice")).put("source", source("users"));
     assertTrue(DebeziumEvents.parse(record(key(1L), ins, "dsqlcdc.app.users")).isInsert());

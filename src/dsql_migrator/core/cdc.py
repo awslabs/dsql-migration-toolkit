@@ -496,11 +496,12 @@ class SchemaDriftKind(str, Enum):
     # because it is otherwise completely silent. Debezium's `skipped.operations` defaults to
     # "t", so a source TRUNCATE produced no record at all (live-measured on PostgreSQL 17.7:
     # source 1 row, target 10 rows, permanently, with a flat SourceRecordPollRate for that
-    # minute); the cdc-stack's PostgreSQL source now sets `skipped.operations: none`, and since
-    # Aurora DSQL has no TRUNCATE statement there is no correct apply, so the sink dead-letters
-    # the event by name (DebeziumEvents.truncateNotApplicable). This is what turns that single,
-    # sub-badge-threshold quarantine into a banner -- otherwise only Validation's row
-    # count/checksum would ever report it, after the cut-over decision was already being made.
+    # minute); both cdc-stack source connectors (PostgreSQL and MySQL) set `skipped.operations:
+    # none`, and since Aurora DSQL has no TRUNCATE statement there is no correct apply, so the
+    # sink dead-letters the event by name (DebeziumEvents.truncateNotApplicable). This is what
+    # turns that single, sub-badge-threshold quarantine into a banner -- otherwise only
+    # Validation's row count/checksum would ever report it, after the cut-over decision was
+    # already being made.
     SOURCE_TRUNCATE = "source-truncate"  # sink code SOURCE_TRUNCATE (no SQLSTATE)
 
 

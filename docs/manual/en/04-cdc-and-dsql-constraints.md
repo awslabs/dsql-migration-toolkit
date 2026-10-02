@@ -83,6 +83,35 @@ backfill the rows that were set aside while the column was missing, re-run Step 
 re-check it in Validation (CHECKSUM is automatic for it). Drop-column / type-change drifts are surfaced for you to resolve
 by hand (the tool never drops target data automatically).
 
+**A source `TRUNCATE`** (MySQL or PostgreSQL source) is not a schema change, and CDC
+cannot apply it either. Aurora DSQL has no `TRUNCATE` statement, and deleting every
+target row because of one event that names no row would be unbounded and could also
+remove rows inserted after it, so the tool never does that. Instead the sink
+dead-letters the event: one dead letter per truncated table. The CDC step shows a
+**"Source TRUNCATE was not replicated"** banner naming the table, later changes to the
+table keep streaming, the target keeps the rows the source removed (Validation reports
+them as extra rows), and Cut over is held for that table until it matches by CHECKSUM
+([§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over)). To repair it:
+
+- **Full Load + CDC:** Stop CDC, reload the table on the Full Load step with **Drop &
+  reload** (offered only while CDC is stopped; **Append** only adds missing rows, so it
+  cannot remove the extra ones), Start CDC, then re-check the table in Validation.
+- **CDC only:** there is no Full Load step to reload from. Stop CDC, delete the rows the
+  source no longer has from the Aurora DSQL table yourself, at most 3,000 rows per
+  transaction, then Start CDC and re-check the table in Validation. For a table with a
+  single-column integer key, Validation's **Reconcile every record** counts the extra
+  rows and lists a sample of their keys.
+
+If the `TRUNCATE` ran after the Full Load started but before it copied that table, the
+target may already match; the CHECKSUM re-check then clears the hold with no reload. A
+table your workload truncates routinely (a staging or queue table) raises this on every
+`TRUNCATE`; leave it out of the migration if you don't need its data on Aurora DSQL. Not
+covered: on MySQL, `ALTER TABLE … TRUNCATE PARTITION` and `ALTER TABLE … DROP PARTITION`
+remove rows without any change event, so CDC reports nothing and only Validation shows
+the extra rows; repair such a table the same way. A MySQL pipeline that was already
+streaming when you upgraded from an earlier version of the tool starts reporting
+`TRUNCATE` after one Stop CDC → Start CDC.
+
 ---
 
 ## 4.3 The gapless Full Load → CDC handoff

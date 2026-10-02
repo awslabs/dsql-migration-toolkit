@@ -91,20 +91,23 @@ final class DebeziumEvents {
 
     // A source TRUNCATE, BEFORE the after-image branch below -- it has no row image at all,
     // so it would otherwise be mistaken for a delete. Verified against the SHIPPED jars
-    // (connectors/plugins/debezium-postgres-plugin.zip): the op code is "t"
-    // (io.debezium.data.Envelope$Operation.TRUNCATE in debezium-core-2.7.4.Final.jar),
+    // (connectors/plugins/debezium-postgres-plugin.zip and the MySQL plugin): the op code is
+    // "t" (io.debezium.data.Envelope$Operation.TRUNCATE in debezium-core-2.7.4.Final.jar),
     // Envelope.truncate(source, ts) sets ONLY op/source/ts_ms/ts_us/ts_ns -- so both
-    // before and after are null -- and PostgresChangeRecordEmitter.emitTruncateRecord passes
-    // a null key, which EventDispatcher$StreamingChangeRecordReceiver turns into a record
-    // with a null keySchema AND a null key. pgoutput emits ONE such record per truncated
-    // table on that table's own topic, so `table` above already names the diverged table.
+    // before and after are null -- and both PostgresChangeRecordEmitter.emitTruncateRecord
+    // and BinlogChangeRecordEmitter.emitTruncateRecord pass a null key, which
+    // EventDispatcher$StreamingChangeRecordReceiver turns into a record with a null keySchema
+    // AND a null key. pgoutput emits ONE such record per truncated table, and MySQL one per
+    // TRUNCATE statement (from the binlog QUERY event), on that table's own topic, so `table`
+    // above already names the diverged table. On MySQL the source block carries db/table and
+    // no schema, so `table` resolves from source.db.
     //
     // Without this branch the record fell through `after == null` into buildDelete and
     // dead-lettered as "no primary key in record key or before-image": loud, but naming the
     // wrong problem, so the operator could not tell a TRUNCATE from a broken REPLICA
     // IDENTITY. Unreachable unless the source connector is configured to emit truncates
     // (Debezium's `skipped.operations` defaults to "t", i.e. truncate skipped), which the
-    // cdc-stack does only for the PostgreSQL source -- so this is inert for MySQL.
+    // cdc-stack does for both source engines.
     if ("t".equals(op)) {
       throw truncateNotApplicable(table);
     }

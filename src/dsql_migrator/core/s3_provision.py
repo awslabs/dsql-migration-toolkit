@@ -520,6 +520,12 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # emission on the same `getSkippedOperations().contains(TRUNCATE)` default -- so a MySQL source
 # is blind the same way. The MySQL path is not verified against a live MySQL source, so its
 # block stays byte-identical and a test fences it; enabling it is a follow-up.
+# (Follow-up, template-only: the MySQL source block now sets `skipped.operations: none` too.
+# Verified offline against the shipped debezium-connector-binlog/core 2.7.4 jars and this v50
+# sink jar: the same keyless op='t' shape, dead-lettered by name by the v47 branch above
+# (resolveTable falls back to source.db). PLUGIN_VERSION stays v50. No Delete + Deploy is
+# needed: Stop deletes the connectors and the next Start CDC recreates the source connector
+# from the bundled template. The live MySQL check is pending.)
 #
 # Bumped because the sink ZIP's CONTENT changed. A live cdc-stack needs Delete + Deploy infra:
 # Start CDC does not re-register the plugin, and the `skipped.operations` change replaces the

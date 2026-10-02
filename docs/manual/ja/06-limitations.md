@@ -83,6 +83,13 @@ _言語: [English](../en/06-limitations.md) | [한국어](../ko/06-limitations.m
   スキーマ変更は DSQL に**伝播されません** — 同等の DDL を DSQL に自分で適用する
   必要があります
   ([第 4 章 §4.2](04-cdc-and-dsql-constraints.md#42-cdc-は-スキーマ-ではなく-データ-を複製する--重要) を参照)。
+- **ソースの `TRUNCATE` は CDC で適用されません。** Aurora DSQL には `TRUNCATE` がないため、CDC はその
+  イベントをデッドレターにし、CDC ステップにテーブル名を表示します。余分な行を削除し（Full Load + CDC は
+  Drop & reload、CDC only は手動削除）、そのテーブルが CHECKSUM で一致するまで Cut over は保留されます
+  （[第 4 章 §4.2](04-cdc-and-dsql-constraints.md#42-cdc-は-スキーマ-ではなく-データ-を複製する--重要) を参照）。
+  MySQL の `ALTER TABLE … TRUNCATE PARTITION` / `DROP PARTITION` は変更イベントを一切生成せず、余分な行は
+  Validation でしか確認できません。以前のバージョンのツールからアップグレードした時点ですでにストリーミング中
+  だった MySQL パイプラインは、Stop CDC → Start CDC を 1 回行った後から `TRUNCATE` を検出します。
 - **CDC が動いていない間は、移行対象テーブルにソース DDL を実行しないでください(MySQL)。**
   シードされた位置(Full Load のウォーターマークまたは Manual の binlog 開始位置 — セッションに Full Load
   のウォーターマークがない MySQL の CDC only の初回開始には必要 — そしてそのような実行を Stop 後に再 Start
