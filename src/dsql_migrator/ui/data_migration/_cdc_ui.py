@@ -5257,6 +5257,17 @@ def _open_cdc_stop_dialog(
                 "for as long as you stay stopped. Restarting drains it; if you are done, "
                 "use Delete CDC infrastructure, which drops the slot."
             )
+            # pgoutput carries no DDL, so the backlog is decoded against the CURRENT
+            # catalog when CDC continues: a key / NULL-rule change made while stopped can
+            # be applied to the earlier changes too (case 12f; jar-verified, not
+            # live-verified -- hence "may" and the CHECKSUM advice).
+            body += (
+                " A schema change (ALTER TABLE) to a captured table while CDC is stopped "
+                "is not replayed in order: when CDC continues, the changes made before it "
+                "may be applied with the table's current key and NULL rule. Make the same "
+                "follow-up change on Aurora DSQL as for a live change, and validate the "
+                "table with CHECKSUM afterwards."
+            )
         else:
             # MySQL: a restart RESUMES with snapshot.mode=schema_only, replaying Debezium's
             # recorded schema history in binlog order -- so a DDL made while stopped is

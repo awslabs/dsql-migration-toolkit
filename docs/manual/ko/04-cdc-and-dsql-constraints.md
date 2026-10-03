@@ -40,8 +40,8 @@ CDC가 필요한 경우는 **대규모 또는 지속적** 마이그레이션뿐�
 **왜 표준 JDBC 싱크가 아니라 *커스텀* 싱크일까요?**
 
 표준 JDBC 싱크는 낙관적 동시성 충돌(`SQLSTATE 40001`)을 **배치 단위로** 재시도하기 때문에, 경합이
-심한 대용량 CDC에서는 처리량이 무너집니다. 커스텀 싱크는 **문장 단위**로 재시도하며 DSQL의 단기
-IAM 토큰, ≤3000행 배치, 재연결을 처리합니다(§4.4).
+심한 대용량 CDC에서는 처리량이 무너집니다. 커스텀 싱크는 충돌한 **트랜잭션**(≤3000행 청크
+하나, 또는 행 하나)을 백오프와 지터로 직접 재시도하며 DSQL의 단기 IAM 토큰과 재연결을 처리합니다(§4.4).
 
 ---
 
@@ -50,11 +50,26 @@ IAM 토큰, ≤3000행 배치, 재연결을 처리합니다(§4.4).
 CDC는 **행 수준 데이터 변경**(insert/update/delete)을 복제합니다. SQL 문이나 **DDL**은 복제하지
 **않습니다.** 구체적으로:
 
-- Debezium은 `include.schema.changes=false`로 실행되고, 싱크는 DML만 적용함.
+- 싱크는 행 변경(DML)만 적용함. MySQL 소스에서는 커넥터가 `include.schema.changes=false`로도 실행되므로
+  스키마 변경 이벤트가 Kafka에 도달하지 않음. PostgreSQL 소스에서는 `pgoutput` 스트림에 DDL이 아예 없으며,
+  Debezium은 테이블의 다음 변경 앞에 오는 스트림의 Relation 메시지에서 그 테이블의 새 형태를 알게 됨.
 - 소스 **DDL**(`ALTER TABLE`, `CREATE`, `DROP` 등)은 DSQL로 **전파되지 않음.**
 
 DSQL 타깃 스키마는 **Schema Conversion** 단계에서 고정됩니다. **CDC 중 소스 스키마를 바꾸면**,
-동일 DDL을 DSQL에 직접(Schema Conversion으로) **먼저** 적용하세요. 그 전까지, 타깃 형태로 쓸 수 없는
+Aurora DSQL에 대응하는 변경을 직접 하되, CDC가 스트리밍하는 동안에는 Schema Conversion으로 하지 마세요:
+그동안에는 그 Apply가 **Replace**를 포함해 차단됩니다. Replace는 테이블을 삭제하고 다시 만들므로, 이미 로드된
+행은 사라지고 이후 변경은 **Drop & reload**로 다시 로드할 때까지 빈 테이블에 쓰입니다. 무엇을 실행할지는
+변경에 따라 다릅니다(아래 표 참고):
+
+- 추가되거나 이름이 바뀐 컬럼: 드리프트 배너의 **Fix target schema…**를 쓰거나, 같은 `ALTER`를 Aurora DSQL에서
+  직접 실행;
+- 이제 NULL을 허용하는 소스 컬럼, 또는 삭제할 소스 컬럼이 Aurora DSQL에서 `NOT NULL`인 경우: Aurora DSQL에서
+  `ALTER TABLE … ALTER COLUMN … DROP NOT NULL` 실행(소스에서 삭제하기 전에);
+- 타입·키 변경: CDC를 중지한 상태에서 테이블을 다시 만듦: Schema Conversion의 **Replace**, 그다음
+  **Drop & reload**. 아래 표의 설명대로 함(CDC only라면 그 CDC only 복구 방법을 따름).
+
+소스보다 먼저 Aurora DSQL에 해도 안전한 것은 추가 변경뿐입니다: 싱크는 컬럼 이름을 지정하므로, NULL을 허용하는
+여분의 타깃 컬럼은 무시합니다. 타깃이 일치할 때까지, 타깃 형태로 쓸 수 없는
 행(예: 새 컬럼 참조)은 **DLQ**로 dead-letter 처리되며 재시도되지 않고, 그런 테이블이 마지막 dead-letter
 레코드 이후 CHECKSUM을 통과할 때까지 Cut over는 잠긴 상태로 남습니다
 ([§5.5](05-validation.md#55-cdc-dead-letter와-컷오버)). 하지만 어떤 변경은 dead letter 없이 **조용히**
@@ -92,9 +107,23 @@ SQLSTATE와 레코드 형태로 드리프트를 **분류**(아래 표)하고 CDC
 - **ENUM** 컬럼은 `CHECK` 없이 `text`로 추가됩니다(Aurora DSQL의 `ADD COLUMN`은 제약을 받지 않음). 경고에 그
   `CHECK`를 추가하는 `ADD CONSTRAINT … CHECK (…) NOT VALID` 문이 나옵니다.
 
-소스 변경이 일으키는 그 밖의 모든 거부도 같은 방식으로 분류되며, 직접 해결하도록 표시만 합니다(도구는 타깃
-데이터를 자동으로 삭제하거나 다시 쓰지 않습니다). Aurora DSQL이 조용히 받아들이는 변경은 아래의 소스 스키마
-재확인이 잡아냅니다. Aurora DSQL에는 `ALTER COLUMN … TYPE`과 `SET NOT NULL`이 없고 기본 키를 바꿀 수 없으므로,
+아래 표의 모든 거부와, 더 이상 존재하지 않는 타깃 테이블(`42P01`), 고유 키 충돌(`23505`), 싱크가 바인딩할 수
+없는 값(`07006`)은 같은 방식으로 배너 행이 생기며, 직접 해결하도록 표시만 합니다(도구는 타깃 데이터를 자동으로
+삭제하거나 다시 쓰지 않습니다). 소스 `TRUNCATE`는 별도의 배너가 생깁니다(아래 참고). 그 밖의 데드레터는 자체
+배너 행이 생기지 않고 데드레터 큐 카드에만 나타납니다:
+
+- 그 밖의 SQLSTATE로 인한 거부(예: `22P02`, `22007`/`22008`, `22021`, `23503`, `54000`). 그 SQLSTATE와 함께
+  표시됨;
+- Aurora DSQL에 비해 너무 큰 값([§4.5](#45-1-mib-값당-한도-그리고-dlq));
+- 싱크가 변환할 수 없는 값. 예: PostgreSQL의 `timetz[]`, `bytea[]` 또는 제약 없는 `numeric[]` 컬럼;
+- 소스 기본 키가 삭제된 뒤의 키 없는 변경 레코드(MySQL 또는 PostgreSQL). 레코드 자체는 분류되지 않지만, 소스
+  스키마 재확인이 삭제된 키를 "primary key changed at the source"로 보고함.
+
+아래의 소스 스키마 재확인은 Aurora DSQL이 조용히 받아들이는 변경을 보고하지만, 그 한계 안에서만 그렇습니다
+([§6.2](06-limitations.md#62-마이그레이션-프로세스-한계)). 테이블에 소스 DDL을 실행한 뒤에는 그 테이블을
+CHECKSUM으로 검증하세요.
+
+Aurora DSQL에는 `ALTER COLUMN … TYPE`과 `SET NOT NULL`이 없고 기본 키를 바꿀 수 없으므로,
 배너의 각 행은 Aurora DSQL이 지원하는 복구 방법을 안내합니다:
 
 | 배너 행 | SQLSTATE | 흔한 원인 | Aurora DSQL에서의 복구 |
@@ -277,7 +306,7 @@ DSQL은 분산형이면서 PostgreSQL 호환이라, 싱크는 기존 MySQL/JDBC 
 | DSQL 제약 | 커스텀 싱크의 처리 |
 |---|---|
 | **IAM 토큰 인증(비밀번호 없음)** | 단기 IAM 토큰(admin 또는 standard)을 생성해 TLS 위 JDBC 비밀번호로 사용하고, 만료 전 **갱신**(15분 토큰, 2분 갱신 여유)해 장기 CDC가 만료 토큰에 멈추지 않게 함. |
-| **낙관적 동시성(락 없음)** | `SQLSTATE 40001`에 대해 배치 전체가 아닌 **문장 단위**로 지수 백오프+지터로 재시도(최대 10회). 경합 시 처리량 차이의 핵심. |
+| **낙관적 동시성(락 없음)** | `SQLSTATE 40001`이면 충돌한 **트랜잭션**을 지수 백오프+지터로 다시 실행(최대 10회): ≤3000행 청크 하나(적용이 멱등이므로 안전), 또는 거부된 행을 격리하려고 행 단위로 적용하는 동안에는 행 하나. |
 | **트랜잭션당 ≤ 3000행** | ≤ 3000행 청크로 적용(기본 배치 3000), 청크당 한 번 `commit()`. |
 | **문장 단위 UPDATE/재생 없음** | 모든 변경을 **PK 기준 upsert/delete**로 적용: insert/update는 `INSERT ... ON CONFLICT (pk) DO UPDATE`, delete는 `DELETE ... WHERE pk = ?`(Kafka tombstone 포함). 같은 이벤트를 다시 적용해도 안전(중복 없음). |
 | **커넥션 끊김(idle close / 토큰 만료 / 워커 교체)** | 죽은 커넥션이나 half-open(끊겼지만 살아있는 듯 보이는) 커넥션을 감지해 새 토큰으로 재연결하고 **같은 오프셋부터 다시 적용**합니다. 같은 변경을 다시 적용해도 중복이 안 생기므로 안전하며, 레코드를 버리지 않습니다. 연결 오류는 일시적(transient) 오류로 보고 재시도하며, 손상된 행(poison row)으로 오인하지 않습니다. |

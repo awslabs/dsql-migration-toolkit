@@ -2173,6 +2173,270 @@ def test_the_drift_lag_paragraph_promises_only_what_the_sink_cool_down_does() ->
         assert "`NOT NULL`" in lag and "60" in lag, lang
 
 
+def test_manual_4_2_scopes_schema_changes_flag_and_does_not_route_ddl_through_schema_conversion() -> None:
+    # G11: include.schema.changes=false is a MySQL-connector setting (pgoutput carries no
+    # DDL at all), and Schema Conversion's Apply -- Replace included -- is blocked while CDC
+    # streams (Replace drops the table, so the loaded rows would be gone). The 4.2 intro
+    # used to say the flag applied to Debezium in general and to apply DDL "via Schema
+    # Conversion first".
+    import pathlib
+
+    manual = pathlib.Path(__file__).resolve().parents[1] / "docs" / "manual"
+    forbidden = {
+        "en": "(via Schema Conversion) **first**",
+        "ko": "(Schema Conversion으로) **먼저**",
+        "ja": "(Schema Conversion 経由で) **先に**",
+    }
+    for lang, old in forbidden.items():
+        text = (manual / lang / "04-cdc-and-dsql-constraints.md").read_text(encoding="utf-8")
+        start = text.index("\n## 4.2")
+        intro = text[start : text.index("\n### ", start)]
+        flag_bullets = [b for b in intro.split("\n- ") if "include.schema.changes=false" in b]
+        assert flag_bullets, lang
+        # The sentence carrying the flag names MySQL (it is the MySQL connector's).
+        for bullet in flag_bullets:
+            head = bullet[: bullet.index("include.schema.changes=false")]
+            assert "MySQL" in head.rsplit(".", 1)[-1] or "MySQL" in head.rsplit("。", 1)[-1], lang
+        assert "pgoutput" in intro, lang
+        assert "Fix target schema" in intro, lang
+        assert old not in text, lang
+
+
+def test_no_manual_or_readme_page_routes_live_ddl_through_schema_conversion() -> None:
+    # G11: the same "re-apply it via Schema Conversion" / "not lost" advice lived outside
+    # the chapters G1-G10 touched. Apply is blocked while CDC streams, and some source DDL
+    # dead-letters nothing, so neither claim holds.
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    manual = root / "docs" / "manual"
+    stale = {
+        root / "README.md": ["go through Schema Conversion"],
+        root / "README.ko.md": ["Schema Conversion으로 처리"],
+        root / "README.ja.md": ["ではなく Schema Conversion"],
+        manual / "en" / "00-before-you-begin.md": ["re-apply them yourself via Schema"],
+        manual / "ko" / "00-before-you-begin.md": ["Schema Conversion으로 직접 다시 적용"],
+        manual / "ja" / "00-before-you-begin.md": ["Schema Conversion によって自分で再適用"],
+        manual / "en" / "02-evaluation-and-schema-conversion.md": [
+            "re-apply the equivalent DDL here yourself"
+        ],
+        manual / "ko" / "02-evaluation-and-schema-conversion.md": ["동일한 DDL을 여기서 직접 다시 적용"],
+        manual / "ja" / "02-evaluation-and-schema-conversion.md": ["同等の DDL をここで"],
+        manual / "en" / "08-testing-and-verification.md": ["goes to the **DLQ**, not lost"],
+        manual / "ja" / "08-testing-and-verification.md": ["失われずに **DLQ**"],
+        manual / "en" / "11-customer-faq.md": ["(dead-letter), not lost"],
+        manual / "ko" / "11-customer-faq.md": ["조용히 사라지지 않고"],
+        manual / "ja" / "11-customer-faq.md": ["失われるのではなく"],
+    }
+    for path, phrases in stale.items():
+        text = path.read_text(encoding="utf-8")
+        for phrase in phrases:
+            assert phrase not in text, (path.name, phrase)
+
+
+def test_06_recovery_restart_window_covers_the_whole_run() -> None:
+    # G11: a connector created in recovery keeps that mode until Stop CDC
+    # (core.cdc.mysql_snapshot_mode rule 1), so the automatic-restart risk window is the
+    # whole run, not "that first run" -- and a restart after Stop resumes in schema_only.
+    import pathlib
+
+    manual = pathlib.Path(__file__).resolve().parents[1] / "docs" / "manual"
+    old = {"en": "restart of that first run", "ko": "그 첫 실행이", "ja": "その初回実行の"}
+    for lang, phrase in old.items():
+        text = (manual / lang / "06-limitations.md").read_text(encoding="utf-8")
+        assert phrase not in text, lang
+        assert "Stop CDC" in text and "`schema_only`" in text, lang
+    en = (manual / "en" / "06-limitations.md").read_text(encoding="utf-8")
+    assert "until Stop CDC" in en
+
+
+def test_sink_retry_timeout_comment_does_not_claim_it_retries_put() -> None:
+    # G11: errors.retry.timeout wraps only Connect's conversion stage; DsqlSinkTask.put()
+    # retries transient errors indefinitely (RetriableException), and OccRetry re-runs a
+    # whole TRANSACTION (applyChunk: the chunk; applyRecordByRecord: one row) -- nothing in
+    # the plugin retries a single statement.
+    text = CDC_STACK_TEMPLATE.read_text(encoding="utf-8")
+    assert "absorbed by the" not in text
+    assert text.count("CONVERSION stage only") == 2
+    assert "retried per statement" not in text
+    assert text.count("retried per transaction") == 2
+
+
+def test_manual_4_says_the_sink_retries_occ_per_transaction_not_per_statement() -> None:
+    # G11 review: OccRetry wraps the whole chunk transaction (DsqlSinkTask.applyChunk) or
+    # one row's (applyRecordByRecord); 4.1 / 4.4 claimed a "statement level" retry.
+    import pathlib
+
+    manual = pathlib.Path(__file__).resolve().parents[1] / "docs" / "manual"
+    stale = {"en": "**statement level**", "ko": "**문장 단위**로", "ja": "**ステートメント単位で**"}
+    new = {"en": "**transaction**", "ko": "**트랜잭션**", "ja": "**トランザクション**"}
+    for lang, phrase in stale.items():
+        text = (manual / lang / "04-cdc-and-dsql-constraints.md").read_text(encoding="utf-8")
+        assert phrase not in text, lang
+        occ_rows = [line for line in text.splitlines() if "`SQLSTATE 40001`" in line]
+        # 4.1 (why a custom sink) and the 4.4 table row both name the transaction.
+        assert text.count(new[lang]) >= 2, lang
+        assert any(new[lang] in row for row in occ_rows), lang
+
+
+def _manual_4_2_drift_region(lang: str) -> str:
+    """4.2's drift sub-section up to the banner-row table (the 'which dead letters get a
+    banner row' paragraph and its bullets live here)."""
+    import pathlib
+
+    manual = pathlib.Path(__file__).resolve().parents[1] / "docs" / "manual"
+    text = (manual / lang / "04-cdc-and-dsql-constraints.md").read_text(encoding="utf-8")
+    start = text.index("\n### ", text.index("\n## 4.2"))
+    return text[start : text.index("\n|", start)]
+
+
+def test_manual_4_2_banner_row_scope_matches_the_drift_classifier() -> None:
+    # G11 review: the paragraph after the Fix target schema bullets claimed EVERY rejection
+    # with a SQLSTATE gets a banner row and that "no SQLSTATE" is why the rest do not. The
+    # classifier is the single source of truth: 22P02 / 23503 / 54000 stay unmapped (no
+    # banner row), while 42P01 / 23505 / 07006 and the sink's synthetic codes ARE mapped.
+    # Every code the page puts on either side must agree with classify_schema_drift.
+    import re
+
+    from dsql_migrator.core.cdc import classify_schema_drift
+    from dsql_migrator.core.cdc_dlq import OVERSIZED_VALUE_CODE
+
+    assert classify_schema_drift(OVERSIZED_VALUE_CODE) is None  # the "too large" bullet
+    code = re.compile(r"`([0-9][0-9A-Z]{4})`")
+    stale = {
+        "en": [
+            "Every other rejection that Aurora DSQL reports with a SQLSTATE",
+            "carry no SQLSTATE",
+            "on MySQL, a change record with no key",
+            "is caught by the source schema re-check below",
+        ],
+        "ko": ["SQLSTATE와 함께 보고하는 그 밖의 모든 거부", "SQLSTATE가 없으므로", "MySQL에서, 소스 기본 키가"],
+        "ja": ["SQLSTATE 付きで報告するそのほかの拒否", "SQLSTATE がないため", "MySQL で、ソースの主キー"],
+    }
+    for lang, phrases in stale.items():
+        region = _manual_4_2_drift_region(lang)
+        for phrase in phrases:
+            assert phrase not in region, (lang, phrase)
+        blocks = region.split("\n\n")
+        (banner,) = [b for b in blocks if "`42P01`" in b]
+        mapped = set(code.findall(banner))
+        assert {"42P01", "23505", "07006"} <= mapped, lang
+        assert all(classify_schema_drift(c) is not None for c in mapped), (lang, mapped)
+        (no_banner_list,) = [b for b in blocks if "`22P02`" in b]
+        bullets = no_banner_list.split("\n- ")
+        (unmapped_bullet,) = [b for b in bullets if "`22P02`" in b]
+        unmapped = set(code.findall(unmapped_bullet))
+        assert {"22P02", "23503", "54000"} <= unmapped, lang
+        assert all(classify_schema_drift(c) is None for c in unmapped), (lang, unmapped)
+        # The other no-banner dead letters, and what to do after any source DDL.
+        assert "`timetz[]`" in no_banner_list and "`bytea[]`" in no_banner_list, lang
+        assert "#45-" in no_banner_list, lang  # the oversized-value bullet links 4.5
+        # The no-key record is not MySQL-only, and the re-check does report the key drop.
+        assert "primary key changed at the source" in no_banner_list, lang
+        assert "PostgreSQL" in [b for b in bullets if "primary key changed" in b][0], lang
+        assert "06-limitations.md#62-" in region and "CHECKSUM" in region, lang
+
+
+def test_manual_4_2_does_not_offer_replace_as_a_mode_apply_does_not_block() -> None:
+    # G11 review: "Its Apply is blocked ... Its other mode, Replace, ..." read as if Replace
+    # were a way around the block (it is an ApplyMode; _cdc_blocks_apply returns before the
+    # REPLACE branch), and it named the wrong failure: after the recreate the upserts
+    # SUCCEED into an empty table -- the loaded rows are simply gone.
+    import pathlib
+
+    manual = pathlib.Path(__file__).resolve().parents[1] / "docs" / "manual"
+    stale = {"en": "Its other mode", "ko": "다른 모드인", "ja": "もう一つのモード"}
+    included = {"en": "**Replace** included", "ko": "**Replace**를 포함해", "ja": "**Replace** を含めて"}
+    for lang, phrase in stale.items():
+        text = (manual / lang / "04-cdc-and-dsql-constraints.md").read_text(encoding="utf-8")
+        start = text.index("\n## 4.2")
+        intro = text[start : text.index("\n### ", start)]
+        assert phrase not in intro, lang
+        assert included[lang] in intro, lang
+        assert "**Drop & reload**" in intro, lang
+
+
+def test_ddl_advice_names_the_recreate_for_a_type_or_key_change() -> None:
+    # G11 review: "Fix target schema… or an ALTER" was offered for every source change, but
+    # Aurora DSQL has no ALTER COLUMN … TYPE and cannot change a primary key: those need a
+    # recreate with CDC stopped (Replace + Drop & reload), as the 4.2 drift table says.
+    import pathlib
+
+    manual = pathlib.Path(__file__).resolve().parents[1] / "docs" / "manual"
+    markers = {
+        "06-limitations.md": {
+            "en": "**CDC replicates data, not DDL.**",
+            "ko": "**CDC는 데이터를 복제할 뿐 DDL은 복제하지 않음.**",
+            "ja": "**CDC が複製するのはデータであり、DDL ではありません。**",
+        },
+        "00-before-you-begin.md": {
+            "en": "**CDC replicates data, not schema.**",
+            "ko": "**CDC는 스키마가 아니라 데이터를 복제합니다.**",
+            "ja": "**CDC が複製するのはスキーマではなくデータです。**",
+        },
+        "02-evaluation-and-schema-conversion.md": {
+            "en": "not by re-applying it",
+            "ko": "다시 적용하는 방식이 아닙니다",
+            "ja": "ここで再適用するのではありません",
+        },
+    }
+    needs = {
+        "06-limitations.md": ["**Replace** + **Drop & reload**", "DROP NOT NULL"],
+        "00-before-you-begin.md": ["DROP NOT NULL", "Fix target schema"],
+        "02-evaluation-and-schema-conversion.md": ["**Replace**", "**Drop & reload**"],
+    }
+    for page, per_lang in markers.items():
+        for lang, marker in per_lang.items():
+            text = (manual / lang / page).read_text(encoding="utf-8")
+            assert text.count(marker) == 1, (page, lang)
+            window = text[text.index(marker) :][:700]
+            for phrase in needs[page]:
+                assert phrase in window, (page, lang, phrase)
+
+
+def test_06_pg_ddl_while_stopped_is_its_own_item_not_a_recheck_blind_spot() -> None:
+    # G11 review: the PostgreSQL stopped-DDL caveat sat in "What that re-check cannot see",
+    # but the re-check DOES see a key / NULL-rule change (cdc_catalog_drift.diff_table emits
+    # KIND_KEY_CHANGE / KIND_NULLABILITY_CHANGE for any source). What it cannot see is that
+    # the backlog was already applied with the current definition -- so it is a top-level
+    # item of its own, not a nested blind-spot bullet.
+    import pathlib
+
+    manual = pathlib.Path(__file__).resolve().parents[1] / "docs" / "manual"
+    titles = {
+        "en": "**PostgreSQL: DDL while CDC is stopped.**",
+        "ko": "**PostgreSQL: CDC를 멈춘 동안의 DDL.**",
+        "ja": "**PostgreSQL: CDC 停止中の DDL。**",
+    }
+    for lang, title in titles.items():
+        text = (manual / lang / "06-limitations.md").read_text(encoding="utf-8")
+        assert text.count(title) == 1, lang
+        assert f"\n- {title}" in text, lang  # top level, not "  - " under the blind spots
+        item = text[text.index(title) :]
+        item = item[: item.index("\n- ")]
+        assert "`pgoutput`" in item and "CHECKSUM" in item, lang
+
+
+def test_06_schema_only_restart_names_the_missing_history_exception() -> None:
+    # G11 review: mysql_snapshot_mode rule 3 -- a resume whose schema history is missing
+    # runs in recovery, so "a restart after Stop CDC resumes in schema_only and is not
+    # affected" was wrong for exactly that Start.
+    import pathlib
+
+    manual = pathlib.Path(__file__).resolve().parents[1] / "docs" / "manual"
+    item_titles = {
+        "en": ("**What it cannot see.**", "normally resumes in `schema_only`", "schema history is missing"),
+        "ko": ("**검사가 볼 수 없는 것.**", "보통\n    `schema_only`로 재개", "히스토리가 없으면"),
+        "ja": ("**チェックで分からないもの。**", "通常 `schema_only` で", "履歴がない場合"),
+    }
+    for lang, (title, normally, missing) in item_titles.items():
+        text = (manual / lang / "06-limitations.md").read_text(encoding="utf-8")
+        item = text[text.index(title) :]
+        item = item[: item.index("\n  - ")]
+        assert normally in item and missing in item, lang
+        assert item.count("`recovery`") >= 2, lang
+
+
 # --- PostgreSQL CDC: the app seeds MSK itself (SeedMode=External) --------------
 # A PostgreSQL cdc-stack has no in-VPC offset-seeder Lambda, so THIS task creates the
 # Kafka topics and the CDC start offset over the MSK Serverless IAM endpoint on 9098

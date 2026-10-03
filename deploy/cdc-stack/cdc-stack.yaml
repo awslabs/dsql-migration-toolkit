@@ -2359,11 +2359,15 @@ Resources:
         errors.deadletterqueue.context.headers.enable: "true"
         errors.deadletterqueue.topic.replication.factor: "3"
         errors.log.enable: "true"
-        # Retry retriable errors (e.g. OCC SQLSTATE 40001 conflicts) for up to
-        # 10 min before dead-lettering, so transient conflicts are absorbed by the
-        # connector's statement-level retry instead of being dropped to the DLQ
-        # with zero retries (the original errors.retry.timeout=0 default caused
-        # contiguous-band data loss under concurrent DML -- see 2026-06 analysis).
+        # errors.retry.timeout bounds retries of the CONVERSION stage only
+        # (converter/transform errors), for up to 10 min before dead-lettering; it
+        # never wraps put(). Transient DSQL errors (dropped connection, token
+        # expiry) are rethrown from put() as RetriableException and retried
+        # indefinitely by Connect, and OCC 40001 is retried per transaction inside
+        # the plugin (OccRetry: the whole chunk, or one row in the record-by-record
+        # fallback) -- see DsqlSinkTask.put(). (History: the original
+        # errors.retry.timeout=0 default was part of the 2026-06 contiguous-band
+        # data-loss analysis.)
         errors.retry.timeout: "600000"
         errors.retry.delay.max.ms: "60000"
         # Log the failed record + exception (not just that an error occurred) so
@@ -2491,11 +2495,15 @@ Resources:
         errors.deadletterqueue.context.headers.enable: "true"
         errors.deadletterqueue.topic.replication.factor: "3"
         errors.log.enable: "true"
-        # Retry retriable errors (e.g. OCC SQLSTATE 40001 conflicts) for up to
-        # 10 min before dead-lettering, so transient conflicts are absorbed by the
-        # connector's statement-level retry instead of being dropped to the DLQ
-        # with zero retries (the original errors.retry.timeout=0 default caused
-        # contiguous-band data loss under concurrent DML -- see 2026-06 analysis).
+        # errors.retry.timeout bounds retries of the CONVERSION stage only
+        # (converter/transform errors), for up to 10 min before dead-lettering; it
+        # never wraps put(). Transient DSQL errors (dropped connection, token
+        # expiry) are rethrown from put() as RetriableException and retried
+        # indefinitely by Connect, and OCC 40001 is retried per transaction inside
+        # the plugin (OccRetry: the whole chunk, or one row in the record-by-record
+        # fallback) -- see DsqlSinkTask.put(). (History: the original
+        # errors.retry.timeout=0 default was part of the 2026-06 contiguous-band
+        # data-loss analysis.)
         errors.retry.timeout: "600000"
         errors.retry.delay.max.ms: "60000"
         # Log the failed record + exception (not just that an error occurred) so

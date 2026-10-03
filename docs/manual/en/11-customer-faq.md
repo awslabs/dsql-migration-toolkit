@@ -215,8 +215,12 @@ stream **can't create duplicates**. The result is no gap and no double-apply. Se
 
 CDC replicates **row data changes** (INSERT/UPDATE/DELETE), not SQL and **not
 DDL**. A schema change on the source **during** CDC is **not** propagated to DSQL —
-you must apply the equivalent DDL to DSQL yourself. A row that no longer matches the
-target's shape goes to the **DLQ** (dead-letter), not lost. See
+you make the matching change on Aurora DSQL yourself (**Fix target schema…** for an
+added or renamed column, otherwise an `ALTER` or the recreate in §4.2; Schema
+Conversion's Apply is blocked while CDC streams). Most rows that no longer match the
+target go to the **DLQ** (dead-letter) and hold Cut over until the table matches by
+CHECKSUM, but some changes are written with no dead letter, so validate with CHECKSUM
+after any source DDL. See
 [Chapter 4 §4.2](04-cdc-and-dsql-constraints.md#42-cdc-replicates-data-not-schema--important).
 
 

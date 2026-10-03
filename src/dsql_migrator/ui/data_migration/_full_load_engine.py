@@ -4609,7 +4609,8 @@ def _target_columns_the_conversion_would_drop(
     HAND (the CDC monitor's "Fix target schema..." action), a Drop & reload silently
     dropped it again -- measured live against Aurora DSQL: the recreator turned
     ``['id', 'a', 'b']`` back into ``['id', 'a']``. After that CDC dead-letters every
-    change for the table again (42703), and the reload's own row counts look clean.
+    insert and update for the table again (42703; a DELETE by key still applies), and
+    the reload's own row counts look clean.
 
     Compares column NAMES only, deliberately. Schema Conversion remaps types on the
     tool's own advice (``money`` -> ``numeric``, an array -> ``jsonb``, ``inet`` ->

@@ -307,7 +307,9 @@ FK는 Evaluation에서 **MANUAL**로 표시됩니다. 자동 동작을 명시적
 
 Schema Conversion 후에는 **DSQL 타깃 스키마가 고정**됩니다. 이것이 Full Load가 쓰고 CDC가 스트리밍하는
 스키마입니다. 한 가지 중요한 점은, CDC는 이후 소스 DDL을 **전파하지 않는다는** 것입니다. 따라서 CDC
-도중에 소스 스키마를 바꾸면, 동일한 DDL을 여기서 직접 다시 적용해야 합니다
+도중에 소스 스키마를 바꾸면, Aurora DSQL에 대응하는 변경을 직접 해야 합니다 — CDC가 스트리밍하는 동안 여기서
+다시 적용하는 방식이 아닙니다(그동안 Apply는 **Replace**를 포함해 차단되며, Replace는 테이블을 삭제합니다).
+CDC를 중지한 상태에서 타입·키 변경은 다시 만들기입니다: 여기서 **Replace**, 그다음 **Drop & reload**
 ([4장 §4.2](04-cdc-and-dsql-constraints.md#42-cdc는-스키마가-아니라-데이터를-복제--중요) 참조).
 
 ## 2.3 MySQL → DSQL 타입과 제약 처리 (참조)

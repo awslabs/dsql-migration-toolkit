@@ -84,7 +84,11 @@ fails **loudly** where it can't.
     step). A drop and its reversal between two re-checks are not seen, so keep FULL in
     place.
 - **CDC replicates data, not DDL.** Schema changes on the source during CDC are
-  **not** propagated to DSQL — you must apply equivalent DDL to DSQL yourself
+  **not** propagated to DSQL — you make the matching change on Aurora DSQL yourself:
+  **Fix target schema…** for an added or renamed column, an `ALTER … DROP NOT NULL`
+  for a column that now allows NULL, and for a type or key change a recreate with CDC
+  stopped (**Replace** + **Drop & reload**; CDC only has its own repair). Schema
+  Conversion's Apply, Replace included, is blocked while CDC streams
   (see [Chapter 4 §4.2](04-cdc-and-dsql-constraints.md#42-cdc-replicates-data-not-schema--important)).
   Some of them change what CDC writes without any dead letter (a dropped nullable
   column, a widened type, a renamed table, …), so while the CDC monitor, Validation or
@@ -104,6 +108,12 @@ fails **loudly** where it can't.
     (the password is kept in memory only);
   - a very large MySQL 5.7 catalog the bounded read cannot finish (8 s on the server,
     10 s on the socket): the CDC monitor and Cut over then report the failed read.
+- **PostgreSQL: DDL while CDC is stopped.** Nothing replays the DDL, because `pgoutput`
+  carries none. The source schema re-check above reports a changed key or NULL rule at
+  its next read, but it cannot tell you that, when CDC continues, the backlog may
+  already have been applied with the table's *current* key and NULL rule, as if the
+  change were already in force for earlier changes too. Give it the same follow-up on
+  Aurora DSQL as a live change, and validate the table with CHECKSUM before Cut over.
 - **A source `TRUNCATE` is not applied by CDC.** Aurora DSQL has no `TRUNCATE`, so CDC
   dead-letters it and the CDC step names the table. Cut over is held for that table
   until you remove the extra rows (Drop & reload for Full Load + CDC, a manual delete for
@@ -143,8 +153,13 @@ fails **loudly** where it can't.
     from a narrowing or a reorder, which do decode wrongly.
   - **What it cannot see.** A column rename on a table CDC does **not** capture
     (Debezium tracks every table's definition, so it fails replaying it), a change made
-    while the connectors are being created, or one made shortly before an automatic
-    restart of that first run. A rename, or an added or dropped column, stops the
+    while the connectors are being created, or one made before an automatic task
+    restart while that run is in `recovery` mode. A connector created in recovery keeps
+    that mode until Stop CDC, so this window lasts for the whole run, not just its first
+    minutes. A restart after Stop CDC normally resumes in `schema_only` and is not
+    affected; if its schema history is missing, that Start rebuilds it in `recovery`
+    (see "A restart after Stop CDC is different" below), and the window applies to the
+    run it creates. A rename, or an added or dropped column, stops the
     connector, and the CDC step names the cause — in the Start CDC error, or on the
     connector's Pipeline health row if it stops after starting
     ([§4.6](04-cdc-and-dsql-constraints.md#pipeline-health-and-change-flow)). A change

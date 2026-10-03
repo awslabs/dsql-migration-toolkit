@@ -743,7 +743,8 @@ def missing_target_columns(
     The Full Load INSERT names every source column that is not excluded (and not computed
     by the target, which the DDL then declares anyway), so a column removed from the target
     DDL in Schema Conversion -- and not excluded -- fails every batch with 42703 (undefined
-    column), and CDC dead-letters every change to it. It is NEVER excluded automatically:
+    column), and CDC dead-letters every insert and update to it (a DELETE by key still
+    applies). It is NEVER excluded automatically:
     silently dropping data the user did not choose to drop is exactly what the explicit
     exclusion exists to prevent.
 

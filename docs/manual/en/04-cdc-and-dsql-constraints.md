@@ -47,8 +47,9 @@ cut-over where a short freeze is acceptable, Full Load alone is enough.
 
 A standard JDBC sink retries optimistic-concurrency conflicts (`SQLSTATE 40001`)
 **per batch**, which collapses throughput under high-contention large-scale CDC.
-The custom sink retries at the **statement level** and handles DSQL's short-lived
-IAM tokens, ≤3000-row batches, and reconnects (details in §4.4).
+The custom sink retries a conflicting **transaction** itself (one chunk of ≤3000
+rows, or one row), with backoff and jitter, and handles DSQL's short-lived IAM tokens
+and reconnects (details in §4.4).
 
 ---
 
@@ -57,16 +58,35 @@ IAM tokens, ≤3000-row batches, and reconnects (details in §4.4).
 CDC replicates **row-level data changes** (insert / update / delete). It does
 **not** replicate SQL statements or **DDL**. Concretely:
 
-- Debezium runs with `include.schema.changes=false`, and the sink applies only
-  DML.
+- The sink applies only row changes (DML). On a MySQL source the connector also
+  runs with `include.schema.changes=false`, so no schema-change events reach Kafka.
+  On a PostgreSQL source the `pgoutput` stream carries no DDL at all; Debezium
+  learns a table's new shape from the stream's Relation message that precedes the
+  next change to it.
 - Source **DDL** (`ALTER TABLE`, `CREATE`, `DROP`, …) is **not** propagated to
   DSQL.
 
 The DSQL target schema is fixed when the **Schema Conversion** step runs. **If you
-change the source schema while CDC is running**, apply the equivalent DDL to DSQL
-yourself (via Schema Conversion) **first**. Until you do, rows that cannot be
-written in the target's shape (e.g. referencing a new column) are dead-lettered to
-the **DLQ** and never retried, and Cut over stays locked until each such table passes
+change the source schema while CDC is running**, make the matching change on
+Aurora DSQL yourself, but not with Schema Conversion while CDC streams: its Apply,
+**Replace** included, is blocked then. Replace drops and recreates the table, so
+the rows already loaded would be gone and later changes would land in an empty
+table until you reload it with **Drop & reload**. What to run depends on the
+change (see the table below):
+
+- for an added or renamed column, use **Fix target schema…** on the drift banner,
+  or run the same `ALTER` by hand on Aurora DSQL;
+- for a source column that now allows NULL, or one you will drop that is
+  `NOT NULL` on Aurora DSQL, run `ALTER TABLE … ALTER COLUMN … DROP NOT NULL` on
+  Aurora DSQL (before the source drop);
+- for a type or key change, recreate the table with CDC stopped: **Replace** in
+  Schema Conversion, then **Drop & reload**, as the table below describes (with CDC
+  only, follow its CDC-only repair).
+
+Only additive changes are safe to make on Aurora DSQL before the source: the sink
+names its columns, so it ignores an extra nullable target column. Until the target
+matches, rows that cannot be written in the target's shape (e.g. referencing a new
+column) are dead-lettered to the **DLQ** and never retried, and Cut over stays locked until each such table passes
 a CHECKSUM after its last dead-lettered record
 ([§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over)). But some changes are
 applied **silently**, with no dead letter at all — see
@@ -113,11 +133,29 @@ CDC then resumes for that table.
   takes no constraint); the warning gives the `ADD CONSTRAINT … CHECK (…) NOT VALID`
   statement that adds it.
 
-Every other rejection a source change causes is classified the same way, for you to
-resolve by hand (the tool never drops or rewrites target data automatically); a change
-Aurora DSQL accepts silently is caught by the source schema re-check below. Aurora DSQL
-has no `ALTER COLUMN … TYPE` or `SET NOT NULL` and cannot change a primary key, so each
-banner row gives the repair it does support:
+Every rejection in the table below, and a target table that no longer exists
+(`42P01`), a unique-key conflict (`23505`) or a value the sink cannot bind (`07006`),
+gets a banner row the same way, for you to resolve by hand (the tool never drops or
+rewrites target data automatically); a source `TRUNCATE` gets its own (below). Any
+other dead letter gets no banner row of its own and shows up only in the dead-letter
+queue card:
+
+- a rejection with any other SQLSTATE (for example `22P02`, `22007`/`22008`, `22021`,
+  `23503` or `54000`), listed with that SQLSTATE;
+- a value too large for Aurora DSQL
+  ([§4.5](#45-the-1-mib-per-value-limit-and-the-dlq));
+- a value the sink cannot convert, for example a PostgreSQL `timetz[]`, `bytea[]` or
+  unconstrained `numeric[]` column;
+- a change record with no key after the source primary key was dropped (MySQL or
+  PostgreSQL). The record itself is not classified, but the source schema re-check
+  reports the dropped key as "primary key changed at the source".
+
+The source schema re-check below reports a change that Aurora DSQL accepts silently,
+but only within its limits ([§6.2](06-limitations.md#62-migration-process-limits)).
+After any source DDL to a table, validate that table with CHECKSUM.
+
+Aurora DSQL has no `ALTER COLUMN … TYPE` or `SET NOT NULL` and cannot change a primary
+key, so each banner row gives the repair it does support:
 
 | Banner row | SQLSTATE | Usual cause | Repair on Aurora DSQL |
 |---|---|---|---|
@@ -351,7 +389,7 @@ classic MySQL/JDBC writer. Here is what it does for each constraint:
 | DSQL constraint | How the custom sink handles it |
 |---|---|
 | **IAM-token auth (no password)** | Generates a short-lived IAM token (admin or standard) and uses it as the JDBC password over TLS; **refreshes before expiry** (15-min token, 2-min refresh margin) so long-running CDC never stalls on an expired token. |
-| **Optimistic concurrency (no locks)** | On `SQLSTATE 40001` it retries at the **statement level** with exponential backoff + jitter (up to 10 attempts), not per whole batch. This is the key throughput difference under contention. |
+| **Optimistic concurrency (no locks)** | On `SQLSTATE 40001` it re-runs the conflicting **transaction** with exponential backoff + jitter (up to 10 attempts): one chunk of ≤3000 rows (safe because apply is idempotent), or one row while it applies row by row to isolate a rejected row. |
 | **≤ 3000 rows per transaction** | Applies in chunks of ≤ 3000 rows (default batch 3000), one `commit()` per chunk. |
 | **No UPDATE-by-statement / replays** | Every change is an **idempotent upsert or delete keyed by PK**: `INSERT ... ON CONFLICT (pk) DO UPDATE` for inserts/updates, `DELETE ... WHERE pk = ?` for deletes (and Kafka tombstones). Re-applying the same event is safe. |
 | **Connections drop (idle close / token expiry / worker recycle)** | Detects a dead/half-open connection, reconnects with a fresh token, and **replays the same offsets** (safe because applies are idempotent) rather than dropping records. Connectivity errors are treated as transient and retried, not mistaken for poison rows. |

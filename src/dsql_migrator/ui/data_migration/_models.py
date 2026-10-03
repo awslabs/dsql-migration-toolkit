@@ -3536,7 +3536,8 @@ def cdc_handling_facts() -> list[CdcHandlingFact]:
             title="Inserts, updates, and deletes all replicate",
             detail=(
                 "Source inserts/updates are applied to the target and source "
-                "deletes are removed from the target."
+                "deletes are removed from the target. A source TRUNCATE is not "
+                "replicated; the CDC step flags it."
             ),
             evidence="H7",
         ),
@@ -3571,9 +3572,15 @@ def cdc_handling_facts() -> list[CdcHandlingFact]:
             handled=False,
             title="Schema changes (DDL) are NOT replicated",
             detail=(
-                "An ALTER TABLE on the source is not applied to the target. Apply "
-                "schema changes through Schema Conversion separately; rows that no "
-                "longer match are set aside to the dead-letter queue."
+                "An ALTER TABLE on the source is not applied to the target. Make "
+                "the matching change on the target yourself: Fix target schema… "
+                "for an added or renamed column, ALTER … DROP NOT NULL for a column "
+                "that now allows NULL, and for a type or key change recreate the "
+                "table with CDC stopped (Replace in Schema Conversion, then Drop & "
+                "reload; with CDC only, correct it by hand or use Start over). "
+                "Schema Conversion's Apply is blocked while CDC streams. Rows that "
+                "no longer fit are set aside to the dead-letter queue, but some "
+                "changes are written with no dead letter, so validate with CHECKSUM."
             ),
             evidence="§4",
         ),

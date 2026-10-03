@@ -75,8 +75,9 @@ source again).
   over** remain your decision and action.
 - **Never writes to the source** — the source stays read-only throughout, preserved as a
   rollback anchor.
-- **Doesn't replicate DDL over CDC** — schema changes go through Schema Conversion, not
-  the replication stream.
+- **Doesn't replicate DDL over CDC** — you make a source schema change on Aurora DSQL
+  yourself; the CDC step detects most of them and offers **Fix target schema…** for an
+  added or renamed column.
 - **Single region only** — the source and target must be in the same AWS region.
 - **Inherits DSQL's constraints** — no triggers or stored procedures; a
   per-transaction row limit; a ~1 MiB per-value limit; and more.

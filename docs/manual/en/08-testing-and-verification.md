@@ -89,7 +89,7 @@ stored procedures, and several types.
 | DSQL characteristic | Scenario tested | How it's exercised |
 |---|---|---|
 | Bulk load then resume streaming with no gap / no duplicate | Load a snapshot, run a live INSERT/UPDATE/DELETE workload, start CDC from the watermark, converge | **MySQL:** the binlog `file:position` (or GTID) watermark is seeded into Kafka `connect-offsets` by the in-VPC offset-seeder Lambda, and Debezium resumes with `snapshot.mode=recovery`. **PostgreSQL:** the WAL LSN watermark is pinned by a pre-created `pgoutput` logical replication slot (plus a publication for exactly the migrated tables) and Debezium resumes from the slot with `snapshot.mode=never` — no offset-seeder Lambda / `connect-offsets` seed (`seed_mode='external'`). Either way, idempotent PK-keyed apply means overlap can't duplicate (`test_cdc_pipeline.py`, `test_cdc_offset_seed.py`, `test_offset_seeder_lambda.py`; PG slot/publication: `test_cdc_pg_slot.py`, `test_cdc_postgres.py`) |
-| CDC replicates data, not DDL | A source schema change mid-CDC | A row that no longer matches the target shape goes to the **DLQ**, not lost (`test_cdc_dlq.py`) |
+| CDC replicates data, not DDL | A source schema change mid-CDC | A row that no longer matches the target shape goes to the **DLQ** and holds Cut over until the table matches by CHECKSUM; most changes Aurora DSQL accepts silently are reported by the source schema re-check, so validate with CHECKSUM (`test_cdc_dlq.py`) |
 
 ### Live source keeps changing — drift must be attributed correctly
 

@@ -71,7 +71,7 @@ Aurora DSQL は外部キーを強制し、プライマリキーを必須とし�
 | DSQL 特性 | テストするシナリオ | どう検証するか |
 |---|---|---|
 | バルクロードした後、ギャップなし/重複なしでストリーミングを再開する | スナップショットをロードし、ライブの INSERT/UPDATE/DELETE ワークロードを実行し、ウォーターマーク(watermark)から CDC を開始し、収束させる | **MySQL:** binlog の `file:position`(または GTID)ウォーターマークを VPC 内のオフセットシーダー Lambda が Kafka の `connect-offsets` にシードし、Debezium は `snapshot.mode=recovery` で再開する。**PostgreSQL:** WAL LSN ウォーターマークを事前作成した `pgoutput` の論理レプリケーションスロット(およびマイグレーション対象テーブルだけを含む publication)が固定し、Debezium はスロットから `snapshot.mode=never` で再開する — オフセットシーダー Lambda や `connect-offsets` のシードはない(`seed_mode='external'`)。いずれの場合も、PK をキーとした冪等な適用により、重複区間があっても重複は生じない(`test_cdc_pipeline.py`、`test_cdc_offset_seed.py`、`test_offset_seeder_lambda.py`。PG のスロット/publication: `test_cdc_pg_slot.py`、`test_cdc_postgres.py`) |
-| CDC は DDL ではなくデータを複製する | CDC 中のソーススキーマ変更 | ターゲットの形状にもう一致しない行は失われずに **DLQ** へ送られる(`test_cdc_dlq.py`) |
+| CDC は DDL ではなくデータを複製する | CDC 中のソーススキーマ変更 | ターゲットの形状にもう一致しない行は **DLQ** へ送られ、そのテーブルが CHECKSUM で一致するまで Cut over を保留する。Aurora DSQL が黙って受け入れる変更の多くはソーススキーマの再確認が報告するため、CHECKSUM で検証する(`test_cdc_dlq.py`) |
 
 ### ライブソースは変わり続ける — ドリフトは正しく帰属させなければならない
 

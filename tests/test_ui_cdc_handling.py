@@ -363,6 +363,41 @@ def test_cdc_handling_facts_cover_handled_and_caveats() -> None:
     assert "h4" not in blob and "h13" not in blob and "§4" not in blob
 
 
+def test_cdc_handling_ddl_fact_does_not_route_ddl_through_schema_conversion() -> None:
+    # G11: Schema Conversion's Apply is blocked while CDC streams (and Replace drops the
+    # table), and some source DDL dead-letters nothing -- the panel must say so.
+    (fact,) = [f for f in cdc_handling_facts() if "DDL" in f.title]
+    detail = fact.detail.lower()
+    assert "through schema conversion" not in detail
+    assert "fix target schema" in detail
+    assert "blocked while cdc streams" in detail
+    assert "checksum" in detail
+
+
+def test_cdc_handling_ddl_fact_names_the_recreate_for_a_type_or_key_change() -> None:
+    # G11 review: "otherwise an ALTER on Aurora DSQL" sent a user with a type or key change
+    # looking for an ALTER that does not exist (no ALTER COLUMN ... TYPE, no primary-key
+    # change). The panel must give the same split as the manual's 4.2 drift table: DROP NOT
+    # NULL for a relaxed NULL rule, a recreate with CDC stopped for a type or key change,
+    # and the CDC-only path (no reload exists there).
+    (fact,) = [f for f in cdc_handling_facts() if "DDL" in f.title]
+    detail = fact.detail.lower()
+    assert "drop not null" in detail
+    assert "recreate" in detail and "cdc stopped" in detail
+    assert "replace" in detail and "drop & reload" in detail
+    assert "cdc only" in detail and "start over" in detail
+    assert "otherwise an alter" not in detail
+
+
+def test_cdc_handling_replicate_fact_discloses_truncate() -> None:
+    (fact,) = [
+        f
+        for f in cdc_handling_facts()
+        if f.title.startswith("Inserts, updates, and deletes")
+    ]
+    assert "truncate" in fact.detail.lower()
+
+
 # ---------------------------------------------------------------------------
 # DataMigrationState: opt-in LOB exclusion persistence (H13)
 # ---------------------------------------------------------------------------

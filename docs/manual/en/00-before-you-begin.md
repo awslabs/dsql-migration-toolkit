@@ -109,8 +109,12 @@ plus a pointer to the chapter that covers it in depth.
       **publication** and **logical replication slot** for you.
 
 - [ ] **CDC replicates data, not schema.** During CDC, source **DDL** changes are
-      **not** propagated to DSQL — you re-apply them yourself via Schema
-      Conversion. → [§4.2](04-cdc-and-dsql-constraints.md#42-cdc-replicates-data-not-schema--important)
+      **not** propagated to DSQL — you make the matching change on Aurora DSQL
+      yourself (**Fix target schema…** for an added or renamed column,
+      `ALTER … DROP NOT NULL` for a column that now allows NULL, a recreate with CDC
+      stopped for a type or key change; Schema Conversion's Apply is blocked while
+      CDC streams). Some changes are written with no dead letter, so validate.
+      → [§4.2](04-cdc-and-dsql-constraints.md#42-cdc-replicates-data-not-schema--important)
 
 - [ ] **Credentials live in session memory only.** They're never written to disk,
       logs, or reports, and are discarded when the session ends — so after a

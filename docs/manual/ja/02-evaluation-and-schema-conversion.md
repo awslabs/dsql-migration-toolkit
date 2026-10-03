@@ -321,8 +321,10 @@ ALTER TABLE "orders" ADD CONSTRAINT "fk_customer"
 
 Schema Conversion の後は、**DSQL ターゲットスキーマが確定** します。これが Full Load の書き込み先で
 あり、CDC のストリーミング先となるスキーマです。そして重要な点として、CDC は後続のソース DDL を
-**伝播しません**。したがって CDC の実行中にソーススキーマを変更した場合は、同等の DDL をここで
-自分で再適用する必要があります
+**伝播しません**。したがって CDC の実行中にソーススキーマを変更した場合は、対応する変更を Aurora DSQL に
+自分で行う必要があります — CDC のストリーミング中にここで再適用するのではありません(その間は **Replace** を
+含めて Apply がブロックされ、Replace はテーブルを削除します)。CDC を停止した状態では、型・キーの変更は作り直し
+です: ここで **Replace**、次に **Drop & reload**
 ([第 4 章 §4.2](04-cdc-and-dsql-constraints.md#42-cdc-は-スキーマ-ではなく-データ-を複製する--重要) を参照)。
 
 ## 2.3 MySQL → DSQL の型と制約の処理 (リファレンス)

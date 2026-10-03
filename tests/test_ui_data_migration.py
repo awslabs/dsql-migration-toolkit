@@ -17426,6 +17426,35 @@ def test_stop_dialog_warns_a_postgres_source_that_the_slot_keeps_pinning_wal() -
     assert "schema history" not in blob
 
 
+def test_pg_stop_dialog_warns_about_ddl_while_stopped() -> None:
+    """G11: pgoutput carries no DDL, so a PostgreSQL DDL made while CDC is stopped is not
+    replayed in order -- the backlog may be applied with the table's CURRENT key and NULL
+    rule (case 12f). The MySQL caveat (schema-history replay) does not hold here, and the
+    PG dialog used to say nothing about DDL at all."""
+    from dsql_migrator.core.models import SourceConnectionConfig, SourceType
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    class _PgSession:
+        source_config = SourceConnectionConfig(
+            host="db", database="app", source_type=SourceType.POSTGRES
+        )
+
+    ui = _RecordingUi()
+    _cdc_ui._open_cdc_stop_dialog(
+        ui, DataMigrationState(), lambda: None, session=_PgSession()
+    )
+    pg = " ".join(ui.texts)
+    assert "ALTER TABLE" in pg
+    assert "while CDC is stopped" in pg
+    assert "current key" in pg
+    assert "CHECKSUM" in pg
+    assert "schema history" not in pg
+    # The PG-only caveat must not leak into the MySQL body (which replays history).
+    ui = _RecordingUi()
+    _cdc_ui._open_cdc_stop_dialog(ui, DataMigrationState(), lambda: None)
+    assert "current key" not in " ".join(ui.texts)
+
+
 def test_the_delete_dialog_says_a_redeploy_rereads_from_the_original_start_point() -> None:
     # G5: Delete removes the offsets AND the schema history, so the first Start on a new
     # stack reads from the ORIGINAL watermark again with snapshot.mode=recovery.

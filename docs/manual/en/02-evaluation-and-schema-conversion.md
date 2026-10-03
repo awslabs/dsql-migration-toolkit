@@ -375,7 +375,10 @@ find code that needs changing **before** cut-over.
 After Schema Conversion, the **DSQL target schema is fixed**. This is the schema
 Full Load writes into and the schema CDC streams into — and, importantly, CDC does
 **not** propagate later source DDL, so if you change the source schema during CDC
-you must re-apply the equivalent DDL here yourself (see
+you must make the matching change on Aurora DSQL yourself — not by re-applying it
+here while CDC streams (Apply, **Replace** included, is blocked then, and Replace
+drops the table). With CDC stopped, a type or key change is a recreate: **Replace**
+here, then **Drop & reload** (see
 [Chapter 4 §4.2](04-cdc-and-dsql-constraints.md#42-cdc-replicates-data-not-schema--important)).
 
 ## 2.3 MySQL → DSQL type and constraint handling (reference)
