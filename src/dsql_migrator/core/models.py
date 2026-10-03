@@ -1341,6 +1341,10 @@ class SchemaDriftSummary(BaseModel):
     table: str = Field(min_length=1)
     kind: str = Field(min_length=1)
     count: int = Field(ge=1)
+    # For a ``value-does-not-fit`` group only: the ``"<column> <type>"`` descriptors the sink
+    # named (bounded, first-seen order), so the banner can say WHICH column needs a wider
+    # type. Never a value. Transient (the status view is rebuilt every poll).
+    columns: list[str] = Field(default_factory=list)
 
 
 class CdcDlqLedgerEntry(BaseModel):

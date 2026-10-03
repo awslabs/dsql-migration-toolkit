@@ -418,7 +418,7 @@ conversion (redesign).
 | MySQL type | Aurora DSQL type | Stored value form | Class | Note |
 |---|---|---|---|---|
 | `TINYINT` | `smallint` | `smallint` | AUTO | Signed 8-bit. |
-| `TINYINT(1)` | `boolean` | `boolean` (`true`/`false`) | MANUAL | MySQL boolean convention; `0/1`→`false/true`. A value **outside `{0,1}` fails loudly** (no silent flatten). |
+| `TINYINT(1)` | `boolean` | `boolean` (`true`/`false`) | MANUAL | MySQL boolean convention; `0/1`→`false/true`. A value **outside `{0,1}` is refused** (no silent flatten): Full Load stops the table, CDC dead-letters the row. Edit the type to `smallint` here if the column holds other values. |
 | `SMALLINT` | `smallint` | `smallint` | AUTO | Signed 16-bit. |
 | `MEDIUMINT` | `integer` | `integer` | AUTO | PostgreSQL has no 3-byte int; `integer` covers the signed 24-bit range. |
 | `INT` / `INTEGER` | `integer` | `integer` | AUTO | Signed 32-bit. |
@@ -435,7 +435,7 @@ conversion (redesign).
 
 | MySQL type | Aurora DSQL type | Stored value form | Class | Note |
 |---|---|---|---|---|
-| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | Precision/scale preserved. **Precision > 1000** → Evaluation flags it **UNSUPPORTED** (DSQL documents a maximum precision of 1000, scale -1000..1000, default `numeric(18,6)`); Schema Conversion still emits DDL by **clamping to the maximum** with a data-loss warning. A MySQL `DECIMAL` (max 65,30) and almost every PostgreSQL `numeric` are well inside this, so the clamp normally never fires. |
+| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | Precision/scale preserved. **Precision > 1000** → Evaluation flags it **UNSUPPORTED** (DSQL documents a maximum precision of 1000, scale -1000..1000, default `numeric(18,6)`); Schema Conversion still emits DDL by **clamping to the maximum** with a data-loss warning. A MySQL `DECIMAL` (max 65,30) and almost every PostgreSQL `numeric` are well inside this, so the clamp normally never fires. A value with more decimal places than the target keeps (a source widened after Step 1, or a narrower type set here) is refused on Full Load and CDC, never rounded. |
 | `DECIMAL(p,s) UNSIGNED` | `numeric(p,s)` | `numeric(p,s)` | AUTO | Unsigned-ness is not representable and carries no storage meaning. |
 | `FLOAT` | `real` | `real` | AUTO | Single-precision float. |
 | `FLOAT(M,D)` | `real` | `real` | AUTO | The `(M,D)` display spec is dropped (PostgreSQL `float` takes one precision, not a scale). |

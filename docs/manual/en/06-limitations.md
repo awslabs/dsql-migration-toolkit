@@ -235,11 +235,22 @@ fails **loudly** where it can't.
   MSK Connect, plus a NAT gateway if created) costs money for as long as it runs.
   Tear down the cdc-stack after cut-over. Full Load alone provisions no streaming
   infrastructure.
-- **TINYINT(1) out-of-range is table-fatal (MySQL source).** A `TINYINT(1)` value
-  outside `{0,1}` stops that table's Full Load loudly rather than silently
-  flattening to `true`. Clean the source data (or exclude the column) and re-run.
-  A PostgreSQL source has a native `boolean` type, so this MySQL-specific
-  `TINYINT(1)`→`boolean` coercion and its table-fatal guard do not apply.
+- **A value its target column cannot hold exactly is refused, never converted.** This
+  covers:
+  - a number other than 0 or 1 for a `boolean` column (a MySQL `TINYINT(1)` holding
+    `2`, or, on CDC, a PostgreSQL `boolean` changed to an integer type);
+  - more decimal places than a `numeric(p,s)` column keeps;
+  - a fraction for an integer column.
+
+  It usually happens when a source type was widened after Step 1, or a narrower type
+  was chosen in Schema Conversion. Full Load stops that table (table-fatal). CDC
+  dead-letters the row and shows a banner; CDC infrastructure deployed by an earlier
+  version of the tool still writes the changed value until it is deleted and deployed
+  again. Give the column a type that holds the values in Schema Conversion (re-apply
+  with **Replace**) and reload, or clean the source data. A bare `numeric` target
+  (Aurora DSQL's default `numeric(18,6)`, warned in Schema Conversion) still rounds a
+  PostgreSQL unconstrained `numeric` to 6 decimal places, by design. Not checked:
+  `FLOAT`/`DOUBLE` values in a `numeric` column.
 - **PostgreSQL 17/18 sources — three version-specific edges (none block a
   migration).** PG 13–18 are supported; 17 and 18 add three things to keep in mind:
   - **`interval` `infinity`/`-infinity` (new in PG17).** Aurora DSQL is

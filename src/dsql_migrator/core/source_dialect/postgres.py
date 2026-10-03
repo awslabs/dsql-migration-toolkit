@@ -967,6 +967,22 @@ class PostgresSourceDialect(SourceDialect):
 
         return PostgresValueConverter(table, target_types=target_types)
 
+    def live_number_shape(self, entry: object) -> "Optional[tuple[str, Optional[int]]]":
+        # psycopg's Column is a DB-API sequence (name, type_code, ..., scale at 5, null_ok).
+        # numeric (oid 1700) reports its declared scale, or None when unconstrained (as is a
+        # money column read through CAST(... AS numeric)); float4/float8 (700/701) are
+        # floating point.
+        try:
+            type_code = entry[1]  # type: ignore[index]
+            if type_code == 1700:
+                scale = entry[5]  # type: ignore[index]
+                return ("decimal", int(scale) if scale is not None else None)
+            if type_code in (700, 701):
+                return ("float", None)
+        except (IndexError, TypeError, ValueError):
+            return None
+        return None
+
     def estimate_row_counts(
         self, connection: object, tables: list[str]
     ) -> "dict[str, Optional[int]]":

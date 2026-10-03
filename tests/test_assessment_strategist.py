@@ -1183,3 +1183,19 @@ def test_the_cdc_chat_knows_the_oversized_value_class_and_its_order() -> None:
     # The migration-wide side effect is disclosed, not buried.
     assert "MIGRATION-WIDE" in system
     assert "Validation" in system
+
+
+def test_the_cdc_rubric_forbids_alter_column_type_and_explains_value_fit_refusals() -> None:
+    """Aurora DSQL has no ALTER COLUMN ... TYPE, so the AI DBA must never advise one: a type
+    changes only by recreating the table. And it must know the sink's synthetic
+    VALUE_DOES_NOT_FIT refusal (no SQLSTATE), or it reads it as an ordinary poison row."""
+    from dsql_migrator.core.assessment_strategist import _cdc_recovery_context
+
+    for engine in ("MySQL", "PostgreSQL"):
+        rubric = _cdc_recovery_context(engine)
+        assert "NO ALTER COLUMN" in rubric
+        assert "VALUE_DOES_NOT_FIT" in rubric
+        assert "Value does not fit target column" in rubric
+    # The TINYINT(1) remap is MySQL advice only (a PostgreSQL rubric never names MySQL).
+    assert "smallint" in _cdc_recovery_context("MySQL")
+    assert "TINYINT" not in _cdc_recovery_context("PostgreSQL")

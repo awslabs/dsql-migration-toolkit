@@ -16,22 +16,40 @@ package dev.dsqlmigrator.connect;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Proxy;
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLNonTransientConnectionException;
 import java.sql.SQLRecoverableException;
 
 import org.postgresql.util.PSQLException;
 import org.postgresql.util.ServerErrorMessage;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import org.apache.kafka.connect.data.Decimal;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.RetriableException;
+import org.apache.kafka.connect.sink.SinkRecord;
 import org.junit.jupiter.api.Test;
 
 class DsqlSinkTaskTest {
@@ -249,5 +267,479 @@ class DsqlSinkTaskTest {
             ChangeEvent.tombstone("app.orders", List.of("id"), List.of(1L), 0L)));
     // No event (the envelope did not parse) -> no op, never a guess.
     assertEquals("", DsqlSinkTask.opSuffix(null));
+  }
+
+  // --- The pre-write value-fit guard (ValueFit) and its bind backstop ----------
+
+  @Test
+  void bindValueCoercesOnlyAnExactZeroOrOne() {
+    // The old bind turned ANY number bound to a boolean parameter into `longValue() != 0`, so
+    // a MySQL TINYINT(1) holding 2 was written as true and 0.5 as false -- silently. Now only
+    // an exact 0/1 is coerced; anything else is bound as itself, so Aurora DSQL rejects it
+    // (42804) instead of storing a value the source never had.
+    Short two = (short) 2;
+    assertSame(two, DsqlSinkTask.bindValue(two, true, false));
+    BigDecimal half = new BigDecimal("0.5");
+    assertSame(half, DsqlSinkTask.bindValue(half, true, false));
+    assertEquals(Boolean.TRUE, DsqlSinkTask.bindValue((short) 1, true, false));
+    assertEquals(Boolean.FALSE, DsqlSinkTask.bindValue((short) 0, true, false));
+    assertEquals(Boolean.TRUE, DsqlSinkTask.bindValue(new BigDecimal("1.0"), true, false));
+    // BIT(1) -> integer coercion is unchanged.
+    assertEquals(1, DsqlSinkTask.bindValue(Boolean.TRUE, false, true));
+    assertEquals(0, DsqlSinkTask.bindValue(Boolean.FALSE, false, true));
+    // Every other value is the ORIGINAL object (never a rescaled copy).
+    BigDecimal amount = new BigDecimal("1.23");
+    assertSame(amount, DsqlSinkTask.bindValue(amount, false, false));
+  }
+
+  /** A task whose catalog read is scripted (a Map, null, or an SQLException to throw). */
+  private static final class ScriptedCatalogTask extends DsqlSinkTask {
+    private final Deque<Object> answers = new ArrayDeque<>();
+    int loads;
+
+    ScriptedCatalogTask answer(Object... next) {
+      for (Object a : next) {
+        answers.add(a == null ? NULL : a);
+      }
+      return this;
+    }
+
+    private static final Object NULL = new Object();
+
+    @Override
+    @SuppressWarnings("unchecked")
+    Map<String, ValueFit.TargetType> loadTargetTypes(String schema, String table)
+        throws SQLException {
+      loads++;
+      Object next = answers.size() > 1 ? answers.poll() : answers.peek();
+      if (next instanceof SQLException e) {
+        throw e;
+      }
+      return next == NULL || next == null ? null : (Map<String, ValueFit.TargetType>) next;
+    }
+  }
+
+  private static Map<String, String> sinkProps() {
+    Map<String, String> props = new HashMap<>();
+    props.put(DsqlSinkConnectorConfig.CLUSTER_ENDPOINT, "example.dsql.us-east-1.on.aws");
+    props.put(DsqlSinkConnectorConfig.REGION, "us-east-1");
+    props.put(DsqlSinkConnectorConfig.RETRY_BACKOFF_MS, "0"); // OCC retries sleep 0 ms
+    return props;
+  }
+
+  private static final Schema ORDER_KEY =
+      SchemaBuilder.struct().name("Key").field("id", Schema.INT64_SCHEMA).build();
+  private static final Schema ORDER_ROW =
+      SchemaBuilder.struct()
+          .name("Row")
+          .field("id", Schema.INT64_SCHEMA)
+          .field("flag", Schema.OPTIONAL_INT16_SCHEMA)
+          .optional()
+          .build();
+  private static final Schema ORDER_SOURCE =
+      SchemaBuilder.struct()
+          .name("Source")
+          .field("db", Schema.STRING_SCHEMA)
+          .field("table", Schema.STRING_SCHEMA)
+          .optional()
+          .build();
+  private static final Schema ORDER_ENVELOPE =
+      SchemaBuilder.struct()
+          .name("Envelope")
+          .field("op", Schema.STRING_SCHEMA)
+          .field("after", ORDER_ROW)
+          .field("source", ORDER_SOURCE)
+          .build();
+
+  @Test
+  void putRefusesAValueTheTargetWouldChangeBeforeAnyWrite() {
+    ScriptedCatalogTask task =
+        new ScriptedCatalogTask()
+            .answer(Map.of("flag", ValueFit.TargetType.fromCatalog("boolean", null, null)));
+    task.startMetrics(sinkProps()); // no start(): no token provider, no DLQ reporter
+    Struct envelope =
+        new Struct(ORDER_ENVELOPE)
+            .put("op", "c")
+            .put("after", new Struct(ORDER_ROW).put("id", 1L).put("flag", (short) 97))
+            .put("source", new Struct(ORDER_SOURCE).put("db", "shop").put("table", "orders"));
+    SinkRecord record =
+        new SinkRecord(
+            "dsqlcdc.shop.orders", 0, ORDER_KEY, new Struct(ORDER_KEY).put("id", 1L),
+            ORDER_ENVELOPE, envelope, 0L);
+
+    // No DLQ reporter is wired, so the refusal fails loudly rather than skipping. It must be
+    // the QUARANTINE that throws: had the row reached applyBatch, connection() would have hit
+    // the missing token provider (a NullPointerException, not a ConnectException).
+    ConnectException e = assertThrows(ConnectException.class, () -> task.put(List.of(record)));
+    String message = e.getMessage();
+    assertTrue(
+        message.contains("Value does not fit target column 'flag' of type boolean"), message);
+    assertTrue(message.contains("pk: id=1"), message);
+    assertTrue(message.contains("op: c/r"), message);
+    assertFalse(message.contains("97"), "the value leaked into the reason: " + message);
+    assertEquals(1, task.loads);
+  }
+
+  @Test
+  void valueFitRefusalReReadsAStaleEntryBeforeRefusing() {
+    // The target column was recreated WIDER out of band (numeric(10,2) -> numeric(12,4)). A
+    // refusal from an entry older than 30 s re-reads the table first, so a value that now
+    // fits is not dead-lettered on a stale type.
+    ScriptedCatalogTask task =
+        new ScriptedCatalogTask()
+            .answer(
+                Map.of("amount", ValueFit.TargetType.fromCatalog("numeric", 10, 2)),
+                Map.of("amount", ValueFit.TargetType.fromCatalog("numeric", 12, 4)));
+    task.startMetrics(sinkProps());
+    ChangeEvent event =
+        ChangeEvent.upsert(
+            "shop.orders", List.of("id", "amount"), List.of(1L, new BigDecimal("1.2345")),
+            List.of("id"), List.of(1L), 0L);
+    long t0 = 5_000_000_000L;
+    String reason = task.valueFitRefusal(null, event, t0);
+    assertNotNull(reason);
+    assertTrue(reason.contains("numeric(10,2)"), reason);
+    // Within 30 s of the read: refused again, no re-read.
+    assertNotNull(task.valueFitRefusal(null, event, t0 + TimeUnit.SECONDS.toNanos(5)));
+    assertEquals(1, task.loads);
+    // Past 30 s: re-read before refusing; the wider column holds the value.
+    assertNull(task.valueFitRefusal(null, event, t0 + TimeUnit.SECONDS.toNanos(31)));
+    assertEquals(2, task.loads);
+    // A delete is never refused and never reads the catalog.
+    ChangeEvent delete =
+        ChangeEvent.delete("shop.other", List.of("id"), List.of(new BigDecimal("5.5")), 0L);
+    assertNull(task.valueFitRefusal(null, delete, t0));
+    assertEquals(2, task.loads);
+  }
+
+  @Test
+  void catalogReadFailureSemantics() {
+    // Transient (no SQLSTATE, as a dropped connection reports it; or class 08): redelivered,
+    // exactly like the apply path -- never a dead letter, never a failed task.
+    ScriptedCatalogTask closed =
+        new ScriptedCatalogTask().answer(new SQLException("This connection has been closed."));
+    closed.startMetrics(sinkProps());
+    assertThrows(RetriableException.class, () -> closed.readTargetTypes("shop.orders"));
+    ScriptedCatalogTask dropped =
+        new ScriptedCatalogTask().answer(new SQLException("connection failure", "08006"));
+    dropped.startMetrics(sinkProps());
+    assertThrows(RetriableException.class, () -> dropped.readTargetTypes("shop.orders"));
+
+    // Permanent (e.g. no privilege): fail OPEN -- the table goes unchecked, as before the
+    // guard existed, and the task keeps running.
+    ScriptedCatalogTask denied =
+        new ScriptedCatalogTask().answer(new SQLException("permission denied", "42501"));
+    denied.startMetrics(sinkProps());
+    assertNull(denied.readTargetTypes("shop.orders"));
+    assertNull(denied.readTargetTypes("shop.orders"));
+
+    // OCC 40001 is retried, then the read succeeds.
+    Map<String, ValueFit.TargetType> types =
+        Map.of("flag", ValueFit.TargetType.fromCatalog("boolean", null, null));
+    ScriptedCatalogTask conflicted =
+        new ScriptedCatalogTask().answer(new SQLException("conflict", "40001"), types);
+    conflicted.startMetrics(sinkProps());
+    assertEquals(types, conflicted.readTargetTypes("shop.orders"));
+    assertEquals(2, conflicted.loads);
+
+    // A target name that is not schema.table is not guarded and not read.
+    ScriptedCatalogTask unqualified = new ScriptedCatalogTask().answer(types);
+    unqualified.startMetrics(sinkProps());
+    assertNull(unqualified.readTargetTypes("orders"));
+    assertEquals(0, unqualified.loads);
+  }
+
+  @Test
+  void isVariableScaleSourceReadsTheAfterSchema() {
+    Schema variableScale =
+        SchemaBuilder.struct()
+            .name(DebeziumTypeConverter.VARIABLE_SCALE_DECIMAL)
+            .field("scale", Schema.INT32_SCHEMA)
+            .field("value", Schema.BYTES_SCHEMA)
+            .optional()
+            .build();
+    Schema row =
+        SchemaBuilder.struct()
+            .name("Row")
+            .field("v", variableScale)
+            .field("d", Decimal.builder(2).optional().build())
+            .optional()
+            .build();
+    Schema env = SchemaBuilder.struct().name("Envelope").field("after", row).build();
+    SinkRecord record =
+        new SinkRecord("dsqlcdc.app.t", 0, null, null, env, new Struct(env), 0L);
+    assertTrue(DsqlSinkTask.isVariableScaleSource(record, "v"));
+    assertFalse(DsqlSinkTask.isVariableScaleSource(record, "d"));
+    assertFalse(DsqlSinkTask.isVariableScaleSource(record, "missing"));
+    assertFalse(
+        DsqlSinkTask.isVariableScaleSource(
+            new SinkRecord("dsqlcdc.app.t", 0, null, null, null, null, 0L), "v"));
+    assertFalse(DsqlSinkTask.isVariableScaleSource(null, "v"));
+  }
+
+  @Test
+  void theDefaultNumericExemptionIsOnlyForAnUnconstrainedSourceColumn() {
+    // Through valueFitRefusal with a REAL record, so the record -> isVariableScaleSource wiring
+    // is what decides. An unconstrained PostgreSQL numeric (VariableScaleDecimal) into Aurora
+    // DSQL's default numeric(18,6) rounds by design; a CONSTRAINED source decimal (a MySQL
+    // DECIMAL(18,6) -> numeric(18,6) later widened to DECIMAL(20,8)) must still be refused.
+    ScriptedCatalogTask task =
+        new ScriptedCatalogTask()
+            .answer(
+                Map.of(
+                    "v", ValueFit.TargetType.fromCatalog("numeric", null, null),
+                    "d", ValueFit.TargetType.fromCatalog("numeric", 18, 6)));
+    task.startMetrics(sinkProps());
+    Schema variableScale =
+        SchemaBuilder.struct()
+            .name(DebeziumTypeConverter.VARIABLE_SCALE_DECIMAL)
+            .field("scale", Schema.INT32_SCHEMA)
+            .field("value", Schema.BYTES_SCHEMA)
+            .optional()
+            .build();
+    Schema row =
+        SchemaBuilder.struct()
+            .name("Row")
+            .field("id", Schema.INT64_SCHEMA)
+            .field("v", variableScale)
+            .field("d", Decimal.builder(8).optional().build())
+            .optional()
+            .build();
+    Schema env = SchemaBuilder.struct().name("Envelope").field("after", row).build();
+    SinkRecord record = new SinkRecord("dsqlcdc.app.t", 0, null, null, env, new Struct(env), 0L);
+
+    ChangeEvent unconstrained =
+        ChangeEvent.upsert(
+            "app.t", List.of("id", "v"), List.of(1L, new BigDecimal("1.1234567")),
+            List.of("id"), List.of(1L), 0L);
+    assertNull(task.valueFitRefusal(record, unconstrained, 1L));
+    ChangeEvent constrained =
+        ChangeEvent.upsert(
+            "app.t", List.of("id", "d"), List.of(1L, new BigDecimal("1.12345678")),
+            List.of("id"), List.of(1L), 0L);
+    String reason = task.valueFitRefusal(record, constrained, 1L);
+    assertNotNull(reason);
+    assertTrue(reason.contains("'d'"), reason);
+    assertTrue(reason.contains("6 decimal places"), reason);
+    assertFalse(reason.contains("12345678"), reason);
+  }
+
+  // --- The real catalog read (loadTargetTypes) over a JDBC double -------------
+
+  /**
+   * A JDBC double (java.lang.reflect.Proxy): the catalog statement answers {@link #catalogRows}
+   * (or throws {@link #catalogFailure}); any other statement is a write that succeeds (or
+   * throws {@link #writeFailure}). Records the Connection calls that matter.
+   */
+  private static final class FakeJdbc {
+    final List<String> calls = new ArrayList<>(); // prepare/commit/rollback/close, in order
+    final Map<Integer, Object> params = new HashMap<>(); // the catalog query's parameters
+    List<Object[]> catalogRows = List.of();
+    SQLException catalogFailure;
+    SQLException writeFailure;
+    int catalogReads;
+
+    @SuppressWarnings("unchecked")
+    private static <T> T proxy(Class<T> type, InvocationHandler handler) {
+      return (T) Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[] {type}, handler);
+    }
+
+    private static Object objectMethod(Object self, String name, Object[] args) {
+      return switch (name) {
+        case "toString" -> "FakeJdbc";
+        case "hashCode" -> System.identityHashCode(self);
+        case "equals" -> self == args[0];
+        default -> throw new UnsupportedOperationException(name);
+      };
+    }
+
+    private ResultSet resultSet() {
+      Iterator<Object[]> rows = catalogRows.iterator();
+      Object[][] current = new Object[1][];
+      boolean[] lastNull = new boolean[1];
+      return proxy(
+          ResultSet.class,
+          (self, m, a) ->
+              switch (m.getName()) {
+                case "next" -> {
+                  current[0] = rows.hasNext() ? rows.next() : null;
+                  yield current[0] != null;
+                }
+                case "getString" -> (String) current[0][(int) a[0] - 1];
+                case "getInt" -> {
+                  Object v = current[0][(int) a[0] - 1];
+                  lastNull[0] = v == null;
+                  yield v == null ? 0 : (Integer) v;
+                }
+                case "wasNull" -> lastNull[0];
+                case "close" -> null;
+                default -> objectMethod(self, m.getName(), a);
+              });
+    }
+
+    private PreparedStatement catalogStatement() {
+      return proxy(
+          PreparedStatement.class,
+          (self, m, a) ->
+              switch (m.getName()) {
+                case "setString" -> {
+                  params.put((Integer) a[0], a[1]);
+                  yield null;
+                }
+                case "executeQuery" -> {
+                  catalogReads++;
+                  if (catalogFailure != null) {
+                    throw catalogFailure;
+                  }
+                  yield resultSet();
+                }
+                case "close" -> null;
+                default -> objectMethod(self, m.getName(), a);
+              });
+    }
+
+    private PreparedStatement writeStatement() {
+      return proxy(
+          PreparedStatement.class,
+          (self, m, a) ->
+              switch (m.getName()) {
+                case "getParameterMetaData", "setObject", "addBatch", "close" -> null;
+                case "executeUpdate" -> {
+                  if (writeFailure != null) {
+                    throw writeFailure;
+                  }
+                  yield 1;
+                }
+                case "executeBatch" -> {
+                  if (writeFailure != null) {
+                    throw writeFailure;
+                  }
+                  yield new int[0];
+                }
+                default -> objectMethod(self, m.getName(), a);
+              });
+    }
+
+    Connection connection() {
+      return proxy(
+          Connection.class,
+          (self, m, a) ->
+              switch (m.getName()) {
+                case "isClosed" -> false;
+                case "isValid" -> true;
+                case "prepareStatement" -> {
+                  boolean catalog = ValueFit.CATALOG_SQL.equals(a[0]);
+                  calls.add(catalog ? "prepareCatalog" : "prepareWrite");
+                  yield catalog ? catalogStatement() : writeStatement();
+                }
+                case "commit", "rollback", "close" -> {
+                  calls.add(m.getName());
+                  yield null;
+                }
+                default -> objectMethod(self, m.getName(), a);
+              });
+    }
+  }
+
+  /** Hand the task an open connection (connection() reuses one that is open and valid). */
+  private static void inject(DsqlSinkTask task, Connection connection) throws Exception {
+    java.lang.reflect.Field field = DsqlSinkTask.class.getDeclaredField("connection");
+    field.setAccessible(true);
+    field.set(task, connection);
+  }
+
+  private static Connection injected(DsqlSinkTask task) throws Exception {
+    java.lang.reflect.Field field = DsqlSinkTask.class.getDeclaredField("connection");
+    field.setAccessible(true);
+    return (Connection) field.get(task);
+  }
+
+  @Test
+  void loadTargetTypesReadsTheNamedTableInExactCaseAndCommits() throws Exception {
+    FakeJdbc jdbc = new FakeJdbc();
+    jdbc.catalogRows =
+        List.of(
+            new Object[] {"Flag", "boolean", null, null},
+            new Object[] {"amount", "numeric", 10, 2},
+            new Object[] {"note", "text", null, null});
+    DsqlSinkTask task = new DsqlSinkTask();
+    inject(task, jdbc.connection());
+
+    Map<String, ValueFit.TargetType> types = task.loadTargetTypes("shop", "Orders");
+    // Bound in order: schema, then table (swapped, every table reads 0 rows and goes unchecked).
+    assertEquals("shop", jdbc.params.get(1));
+    assertEquals("Orders", jdbc.params.get(2));
+    // Keyed by the exact column_name: DsqlDialect quotes identifiers, so ValueFit looks a
+    // column up by its exact case. An unguarded type (text) is left out.
+    assertEquals(
+        Map.of(
+            "Flag", ValueFit.TargetType.fromCatalog("boolean", null, null),
+            "amount", ValueFit.TargetType.fromCatalog("numeric", 10, 2)),
+        types);
+    // The read transaction is ended before any chunk transaction starts.
+    assertEquals(List.of("prepareCatalog", "commit"), jdbc.calls);
+
+    // A table the role cannot see reads 0 rows: unknown (null), never "no guarded columns".
+    FakeJdbc empty = new FakeJdbc();
+    DsqlSinkTask unseen = new DsqlSinkTask();
+    inject(unseen, empty.connection());
+    assertNull(unseen.loadTargetTypes("shop", "orders"));
+    assertEquals(List.of("prepareCatalog", "commit"), empty.calls);
+
+    // A failed read is rolled back and rethrown as is (readTargetTypes classifies it).
+    FakeJdbc denied = new FakeJdbc();
+    denied.catalogFailure = new SQLException("permission denied", "42501");
+    DsqlSinkTask refused = new DsqlSinkTask();
+    inject(refused, denied.connection());
+    SQLException thrown =
+        assertThrows(SQLException.class, () -> refused.loadTargetTypes("shop", "orders"));
+    assertSame(denied.catalogFailure, thrown);
+    assertTrue(denied.calls.contains("rollback"), denied.calls.toString());
+    assertFalse(denied.calls.contains("commit"), denied.calls.toString());
+  }
+
+  @Test
+  void aTransientCatalogFailureDiscardsTheConnectionAndIsRedelivered() throws Exception {
+    // Same contract as the apply path: a connection that just failed must not be reused
+    // (isValid can pass on a half-open socket), and Connect must redeliver the batch.
+    FakeJdbc jdbc = new FakeJdbc();
+    jdbc.catalogFailure = new SQLException("This connection has been closed.");
+    DsqlSinkTask task = new DsqlSinkTask();
+    task.startMetrics(sinkProps());
+    Connection connection = jdbc.connection();
+    inject(task, connection);
+    assertThrows(RetriableException.class, () -> task.readTargetTypes("shop.orders"));
+    assertTrue(jdbc.calls.contains("close"), jdbc.calls.toString());
+    assertNull(injected(task));
+  }
+
+  @Test
+  void aMissingTargetColumnMakesTheNextPutReReadTheColumnTypes() throws Exception {
+    // 42703 (and 42P01/3F000) means the target was recreated or altered, so the cached types
+    // may be stale: the quarantine drops them and the next put() reads them again, instead of
+    // trusting them for up to 10 minutes.
+    FakeJdbc jdbc = new FakeJdbc();
+    jdbc.catalogRows =
+        List.of(new Object[] {"id", "bigint", 64, 0}, new Object[] {"flag", "boolean", null, null});
+    jdbc.writeFailure = new SQLException("column \"flag\" does not exist", "42703");
+    DsqlSinkTask task = new DsqlSinkTask();
+    task.startMetrics(sinkProps()); // no start(): no DLQ reporter, so a quarantine throws
+    inject(task, jdbc.connection());
+    Struct envelope =
+        new Struct(ORDER_ENVELOPE)
+            .put("op", "u")
+            .put("after", new Struct(ORDER_ROW).put("id", 1L).put("flag", (short) 1))
+            .put("source", new Struct(ORDER_SOURCE).put("db", "shop").put("table", "orders"));
+    SinkRecord record =
+        new SinkRecord(
+            "dsqlcdc.shop.orders", 0, ORDER_KEY, new Struct(ORDER_KEY).put("id", 1L),
+            ORDER_ENVELOPE, envelope, 0L);
+
+    ConnectException first = assertThrows(ConnectException.class, () -> task.put(List.of(record)));
+    assertTrue(first.getMessage().contains("sqlstate=42703"), first.getMessage());
+    assertEquals(1, jdbc.catalogReads);
+    assertTrue(jdbc.calls.contains("prepareWrite"), jdbc.calls.toString()); // it was written
+    assertThrows(ConnectException.class, () -> task.put(List.of(record)));
+    assertEquals(2, jdbc.catalogReads);
   }
 }

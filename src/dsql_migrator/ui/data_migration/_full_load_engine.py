@@ -63,6 +63,7 @@ from dsql_migrator.core.converter import (
     SchemaConvertOptions,
     TableConversion,
     parse_target_column_types,
+    parse_target_value_specs,
     parse_target_generated_columns,
     pg_preserved_generated_columns,
     parse_target_primary_key,
@@ -1368,11 +1369,15 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
         # Same deterministic fallback as the in-process path: the parent recreated this
         # target from _derived_table_conversion when no applied conversion was carried in,
         # so the read expressions must come from that same conversion.
-        target_types = parse_target_column_types(
+        _ddl = (
             applied.target_ddl
             if applied
             else _derived_table_conversion(args.inputs, args.table).target_ddl
         )
+        target_types = parse_target_column_types(_ddl)
+        # Precision/scale kept: the reader refuses (table-fatal) a value this DDL's column
+        # would round, e.g. after the source type was widened since Step 1 (ValueFitGuard).
+        target_specs = parse_target_value_specs(_ddl)
         # The target is ALREADY in its final shape here (the parent recreates every
         # replace table before submitting shards), so the LIVE catalog is the authority
         # for which columns DSQL computes -- see BatchedTableMigrator.resolve_generated_
@@ -1466,6 +1471,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
                 on_throttle=_on_throttle,
                 on_pause_slice=_on_pause_slice,
                 shared_snapshot_id=args.shared_snapshot_id,
+                target_specs=target_specs,
             )
             _live_rows[0] = rows
             return importer.import_rows(
@@ -5465,11 +5471,15 @@ class BatchedTableMigrator:
         # ignores target_type on read and ValueConverter derives identical kinds from
         # map_mysql_type); on PostgreSQL this is what makes an array column read as
         # to_jsonb text for the jsonb target the engine itself created.
-        target_types = parse_target_column_types(
+        _ddl = (
             applied.target_ddl
             if applied is not None
             else _derived_table_conversion(self._inputs, original_table).target_ddl
         )
+        target_types = parse_target_column_types(_ddl)
+        # Precision/scale kept: the reader refuses (table-fatal) a value this DDL's column
+        # would round, e.g. after the source type was widened since Step 1 (ValueFitGuard).
+        target_specs = parse_target_value_specs(_ddl)
         # The TARGET table's primary key, parsed from the APPLIED (possibly user- or
         # AI-edited) target DDL -- the single source of truth for the conflict key.
         # When the target PK differs from the source PK (e.g. a composite
@@ -5569,6 +5579,7 @@ class BatchedTableMigrator:
                 pk_upper=hi,
                 on_throttle=on_throttle,
                 on_pause_slice=on_pause_slice,
+                target_specs=target_specs,
             )
 
         sharded = len(shard_ranges) > 1

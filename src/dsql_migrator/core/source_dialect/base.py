@@ -324,6 +324,18 @@ class SourceDialect(ABC):
         as the FIRST statement after :pyattr:`snapshot_start_sql`, before any query."""
         raise NotImplementedError("this source dialect cannot import a shared snapshot")
 
+    def live_number_shape(self, entry: object) -> "Optional[tuple[str, Optional[int]]]":
+        """The numeric shape of one DBAPI ``cursor.description`` entry, or ``None``.
+
+        ``("decimal", scale)`` for an exact decimal (``scale`` ``None`` when the column has
+        no declared scale), ``("float", None)`` for a floating-point column, ``None`` for
+        anything else or an unknown shape. Read from the live result's type metadata, never
+        from a value, so the Full Load value-fit check (:class:`~dsql_migrator.core.exporter.
+        ValueFitGuard`) can decide once per stream which columns could need checking. The
+        default knows no driver, which leaves the check off.
+        """
+        return None
+
     @abstractmethod
     def value_converter(self, table: object, *, target_types: object = None) -> object:
         """Per-row value converter for reading ``table`` from this source.

@@ -188,17 +188,27 @@ downloadable error log.
 
 ### Table-fatal (the whole table stops)
 
-If a value **cannot be converted at all without silent data loss** — the
-canonical case is a `TINYINT(1)` column mapped to DSQL `boolean` that holds a
-value outside `{0, 1}` (e.g. `2`) — the exporter raises a `ValueConversionError`.
-This has **no SQLSTATE** (it happens while reading/converting, before DSQL is
-even asked), so it is **not** a per-row quarantine: it stops that table's load
-**loudly**. This is intentional — the tool refuses to flatten `2` to `true` and
-silently corrupt your data. This table-fatal `ValueConversionError` arises only for
-a **MySQL source**, where values are translated during export; a **PostgreSQL
-source** streams pass-through with no type translation, so this specific case does
-not occur (per-row SQLSTATE quarantine still applies to both engines). Fix the
-source data (or exclude the column) and re-run.
+If a value **cannot be written without silently changing it**, the exporter raises a
+`ValueConversionError`:
+
+- a `TINYINT(1)` mapped to `boolean` holding a value outside `{0,1}` (e.g. `2`; MySQL
+  source only, where values are translated during export);
+- a value with more decimal places than its `numeric(p,s)` column keeps, or a fraction
+  for an integer column, on both engines. This is detected from the source column's
+  live type once per table read, so a table whose types match pays nothing. It arises
+  when the source type was widened after Step 1 or a narrower type was chosen in Schema
+  Conversion. A PostgreSQL `numeric` without precision into a bare `numeric` target is
+  not refused (Aurora DSQL's documented `numeric(18,6)` default), and a `FLOAT`/`DOUBLE`
+  source value for a `numeric` column is not checked and is still rounded;
+- a MySQL `TIME` outside 00:00:00–23:59:59.999999.
+
+This has **no SQLSTATE** (it happens while reading/converting, before DSQL is even
+asked), so it is **not** a per-row quarantine: it stops that table's load **loudly**.
+This is intentional — the tool refuses to flatten `2` to `true` or round `1.2345` to
+`1.23` and silently corrupt your data. The message names the column, its type and the
+rule — never the value. Give the column a type that holds the values in Schema
+Conversion (re-run Step 1 first if the source type changed, then re-apply with
+**Replace**), or fix the source data / exclude the column, then retry the table.
 
 > **Why "loud" beats "silent":** DSQL's `boolean` can't represent `2`. The tool
 > chooses a visible, fixable failure over a quiet, wrong value.

@@ -50,15 +50,17 @@ from __future__ import annotations
 
 import csv
 import logging
+import math
 from abc import ABC, abstractmethod
 from datetime import datetime, time, timedelta, timezone
+from decimal import Decimal
 from time import monotonic as _wall_monotonic, sleep as _wall_sleep
 from typing import Callable, Iterator, Mapping, Optional, Protocol, TextIO
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from dsql_migrator.core.converter import map_mysql_type
+from dsql_migrator.core.converter import TargetValueSpec, map_mysql_type
 from dsql_migrator.core.introspector import _default_engine_factory
 from dsql_migrator.core.models import SourceConnectionConfig, TableDef
 from dsql_migrator.core.source_dialect import (
@@ -129,14 +131,16 @@ class ExportError(RuntimeError):
 
 
 class ValueConversionError(ExportError):
-    """Raised when a source cell cannot be safely converted to its target type.
+    """Raised when a source cell cannot be written without silently changing it.
 
     Surfaces a value that would otherwise be silently corrupted -- e.g. a
     ``TINYINT(1)`` column (mapped to DSQL ``boolean``) holding a value outside
     ``{0, 1}`` (MySQL's ``(1)`` is display width, not a value constraint, so a
-    ``TINYINT(1)`` legally stores -128..127 / 0..255). ``bool(int(value))`` would
-    flatten any non-zero magnitude to ``True`` and lose the original number, so we
-    fail loudly (naming the column + value) instead of corrupting the row.
+    ``TINYINT(1)`` legally stores -128..127 / 0..255), or a decimal with more places
+    than its ``numeric(p,s)`` column keeps (see :class:`ValueFitGuard`).
+    ``bool(int(value))`` would flatten any non-zero magnitude to ``True`` and lose the
+    original number, so we fail loudly instead of corrupting the row -- naming the
+    column and the rule, never the value (the message reaches logs and the UI).
     """
 
 
@@ -190,6 +194,75 @@ def _target_kind(mysql_type: str) -> str:
     except ValueError:
         return mysql_type.strip().lower()
     return target_type.split("(", 1)[0].strip().lower()
+
+
+# The verdicts of :func:`value_fit_rule` (the same names as the CDC sink's ValueFit.Rule, in
+# the shared tests/fixtures/value_fit_contract.tsv).
+VALUE_FIT_NOT_ZERO_OR_ONE = "not-0-or-1"
+VALUE_FIT_FRACTION = "fraction"
+VALUE_FIT_SCALE = "scale"
+
+_BOOLEAN_SPEC = TargetValueSpec("boolean", 0, False, "boolean")
+
+
+def _digits_beyond(value: Decimal, places: int) -> bool:
+    """Whether a FINITE ``value`` has a non-zero digit past ``places`` decimal places.
+
+    Reads the decimal's own digits (``as_tuple``): no quantize, no context, so it can neither
+    round nor raise, and it costs O(digits)."""
+    _sign, digits, exponent = value.as_tuple()
+    beyond = -int(exponent) - places
+    if beyond <= 0:
+        return False
+    return any(digits[-beyond:])
+
+
+def value_fit_rule(
+    value: object, spec: TargetValueSpec, *, unconstrained_source: bool = False
+) -> Optional[str]:
+    """The rule ``value`` breaks for its target column, or ``None`` when it is stored exactly.
+
+    Pure; mirrors the CDC sink's ``ValueFit.rule`` (the shared verdict table is
+    ``tests/fixtures/value_fit_contract.tsv``). Aurora DSQL ACCEPTS these and stores something
+    else, with no error:
+
+    * ``boolean``: a number other than exactly 0 or 1 (it would become true/false);
+    * ``integral``: a finite decimal or float with a fractional part (rounded to a whole);
+    * ``numeric``: a finite decimal with a non-zero digit beyond the column's scale
+      (rounded) -- unless the column is Aurora DSQL's default ``numeric(18,6)`` and the source
+      numeric is unconstrained, whose rounding is documented and warned in Schema Conversion.
+
+    ``None`` and ``bool`` always fit. A float into ``numeric`` is not checked (PostgreSQL
+    renders it to 15 significant digits first; the sink leaves it unchecked too).
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    kind = spec.kind
+    if kind == "boolean":
+        if isinstance(value, (int, float, Decimal)):
+            if isinstance(value, Decimal) and not value.is_finite():
+                return VALUE_FIT_NOT_ZERO_OR_ONE
+            return None if value in (0, 1) else VALUE_FIT_NOT_ZERO_OR_ONE
+        return None
+    if kind == "integral":
+        if isinstance(value, Decimal):
+            return VALUE_FIT_FRACTION if value.is_finite() and _digits_beyond(value, 0) else None
+        if isinstance(value, float):
+            return (
+                VALUE_FIT_FRACTION
+                if math.isfinite(value) and not value.is_integer()
+                else None
+            )
+        return None
+    if kind == "numeric":
+        if not isinstance(value, Decimal) or not value.is_finite():
+            return None
+        if not _digits_beyond(value, spec.scale):
+            return None
+        if spec.default_numeric and unconstrained_source:
+            return None
+        return VALUE_FIT_SCALE
+    return None
 
 
 class ValueConverter:
@@ -272,22 +345,25 @@ class ValueConverter:
                 return value
             # TINYINT(1) -> DSQL boolean. The (1) is display width, not a value
             # constraint, so the column can legally hold values outside {0, 1};
-            # bool(int(value)) would flatten e.g. 2 or -1 to True and silently lose
-            # the magnitude. Fail loudly (naming the column + value) so a wrong
-            # boolean never lands instead of corrupting the row. A genuine 0/1
-            # boolean column is unaffected.
-            as_int = int(value)
-            if as_int not in (0, 1):
+            # bool(int(value)) would flatten e.g. 2 or -1 to True (and int(0.5) to
+            # False) and silently lose the magnitude. Fail loudly so a wrong boolean
+            # never lands -- the same refusal as the CDC sink's value-fit guard -- naming
+            # the column, never the value. A genuine 0/1 boolean column is unaffected.
+            number = (
+                value
+                if isinstance(value, (int, float, Decimal))
+                else int(value)  # type: ignore[call-overload]
+            )
+            if value_fit_rule(number, _BOOLEAN_SPEC) is not None:
                 raise ValueConversionError(
-                    f"column '{column_name}' maps to DSQL boolean but the source "
-                    f"value {as_int!r} is outside {{0, 1}}; a TINYINT(1) storing "
-                    "values beyond 0/1 cannot be a boolean without data loss. In "
-                    "Schema Conversion, remap this column's target type to "
-                    "smallint/integer (the converted DDL is editable), re-apply, "
-                    "then retry this table -- the value then loads as an integer. "
-                    "Alternatively, restrict the source values to 0/1."
+                    f"column '{column_name}' maps to DSQL boolean, but the source holds "
+                    "a value other than 0 or 1 in it; a TINYINT(1) storing values beyond "
+                    "0/1 cannot be a boolean without data loss. In Schema Conversion, "
+                    "remap this column's target type to smallint/integer (the converted "
+                    "DDL is editable), re-apply, then retry this table -- the value then "
+                    "loads as an integer. Alternatively, restrict the source values to 0/1."
                 )
-            return bool(as_int)
+            return number == 1
         if kind == "bytea":
             if isinstance(value, (bytes, bytearray, memoryview)):
                 return bytes(value)
@@ -316,7 +392,8 @@ class ValueConverter:
             # value outside [0, 24h) has NO ``time`` representation -- passing the
             # raw timedelta through would silently bind to interval (or emit a
             # non-time text cell), corrupting the column. Fail loudly (naming the
-            # column + value) instead, matching the TINYINT(1)-out-of-range guard.
+            # column, never the value) instead, matching the TINYINT(1)-out-of-range
+            # guard.
             if isinstance(value, timedelta):
                 total = value.total_seconds()
                 if 0 <= total < 86400:
@@ -329,8 +406,8 @@ class ValueConverter:
                         microsecond=micros,
                     )
                 raise ValueConversionError(
-                    f"column '{column_name}' maps to DSQL time but the source "
-                    f"value {value!r} is outside 00:00:00..23:59:59.999999; MySQL "
+                    f"column '{column_name}' maps to DSQL time, but a source value is "
+                    "outside 00:00:00..23:59:59.999999; MySQL "
                     "TIME allows -838:59:59..838:59:59, which has no DSQL 'time' "
                     "representation and would corrupt the column. In Schema "
                     "Conversion, remap this column's target type to interval or "
@@ -354,6 +431,134 @@ class ValueConverter:
             name: (value if name in passthrough else self.convert_value(name, value))
             for name, value in row.items()
         }
+
+
+class ValueFitGuard:
+    """Refuse, table-fatally, a source value its Aurora DSQL column would silently change.
+
+    The Full Load twin of the CDC sink's pre-write value-fit guard: a decimal with more places
+    than its ``numeric(p,s)`` column keeps, or a fraction for an integer column, is rounded by
+    Aurora DSQL with no error. That happens when the source type was widened after Step 1, or a
+    narrower type was chosen in Schema Conversion. (The boolean case is refused by
+    :class:`ValueConverter` itself.)
+
+    Zero cost in the steady state: :meth:`arm` compares the LIVE result description of the
+    first keyset page (once per stream) with the applied target specs, and only a column whose
+    live type can hold a value the target cannot is checked per row. When nothing is armed --
+    the types match, the driver gives no usable description, or the column is a float into a
+    numeric (not checked, like the sink) -- :attr:`armed` is False and the stream pays one
+    attribute read per row. Never scans the source and holds no rows.
+    """
+
+    def __init__(
+        self,
+        specs: "Mapping[str, TargetValueSpec]",
+        dialect: "SourceDialect",
+        table_name: str,
+    ) -> None:
+        self._specs = dict(specs or {})
+        self._dialect = dialect
+        self._table = table_name
+        # column -> (target spec, live shape (kind, scale))
+        self._checks: dict[str, tuple[TargetValueSpec, tuple[str, Optional[int]]]] = {}
+        self._described = False
+
+    @property
+    def armed(self) -> bool:
+        return bool(self._checks)
+
+    def arm(self, description: object) -> None:
+        """Decide, from the first page's ``cursor.description``, which columns to check.
+
+        Called once per stream; never raises (a malformed description leaves it unarmed, which
+        is the behaviour before this check existed). One consistent-snapshot transaction holds
+        the table's metadata lock / ACCESS SHARE for the whole read, so the first description
+        is authoritative for every page.
+        """
+        if self._described:
+            return
+        self._described = True
+        if not self._specs or not description:
+            return
+        checks: dict[str, tuple[TargetValueSpec, tuple[str, Optional[int]]]] = {}
+        try:
+            for entry in description:  # type: ignore[union-attr]
+                name = entry[0]
+                spec = self._specs.get(name)
+                if spec is None or spec.kind not in ("integral", "numeric"):
+                    continue
+                shape = self._dialect.live_number_shape(entry)
+                if shape is None:
+                    continue
+                live_kind, live_scale = shape
+                if spec.kind == "integral":
+                    if live_kind == "float" or (
+                        live_kind == "decimal" and (live_scale is None or live_scale > 0)
+                    ):
+                        checks[name] = (spec, shape)
+                elif live_kind == "decimal":
+                    if live_scale is None:
+                        if not spec.default_numeric:
+                            checks[name] = (spec, shape)
+                    elif live_scale > spec.scale:
+                        checks[name] = (spec, shape)
+        except Exception:  # noqa: BLE001 - an odd driver shape must never fail the load
+            return
+        self._checks = checks
+        if checks:
+            _LOGGER.info(
+                "Full Load value-fit check on for table %s, column(s) %s: the source type "
+                "can hold values the Aurora DSQL column would round",
+                self._table,
+                ", ".join(sorted(checks)),
+            )
+
+    def check(self, row: Mapping[str, object]) -> None:
+        """Raise :class:`ValueConversionError` for the first armed column ``row`` cannot fit."""
+        for name, (spec, shape) in self._checks.items():
+            value = row.get(name)
+            if value is None:
+                continue
+            rule = value_fit_rule(value, spec, unconstrained_source=shape[1] is None)
+            if rule is not None:
+                raise ValueConversionError(self._message(name, spec, shape, rule))
+
+    @staticmethod
+    def _message(
+        name: str,
+        spec: TargetValueSpec,
+        shape: "tuple[str, Optional[int]]",
+        rule: str,
+    ) -> str:
+        live_kind, live_scale = shape
+        remedy = (
+            " Aurora DSQL cannot change a column's type in place: re-run Step 1 (Evaluation) "
+            "if the source type changed, re-apply this table in Schema Conversion with "
+            "Replace and a type that holds the source values, then retry this table."
+        )
+        if rule == VALUE_FIT_SCALE:
+            has = (
+                "no declared scale"
+                if live_scale is None
+                else f"{live_scale} decimal places"
+            )
+            return (
+                f"column '{name}' cannot be loaded without changing its values: its Aurora "
+                f"DSQL type is {spec.type_sql}, which keeps {spec.scale} decimal places, but "
+                f"the source column has {has} and a source value has a non-zero digit beyond "
+                f"{spec.scale} decimal places, which Aurora DSQL would round." + remedy
+            )
+        if live_kind == "float":
+            source = "floating point"
+        elif live_scale is None:
+            source = "a decimal with no declared scale"
+        else:
+            source = f"a decimal with {live_scale} decimal places"
+        return (
+            f"column '{name}' cannot be loaded without changing its values: its Aurora DSQL "
+            f"type is {spec.type_sql}, but the source column is {source} and a source value "
+            "has a fractional part, which Aurora DSQL would round to a whole number." + remedy
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -761,6 +966,7 @@ def keyset_stream(
     governor: Optional["SourceLoadGovernor"] = None,
     dialect: "SourceDialect" = _MYSQL_DIALECT,
     target_types: Optional[Mapping[str, str]] = None,
+    on_description: Optional[Callable[[object], None]] = None,
 ) -> Iterator[Mapping[str, object]]:
     """Yield ``table`` rows in ascending primary-key order via keyset pagination.
 
@@ -791,6 +997,11 @@ def keyset_stream(
     asked to :meth:`~SourceLoadGovernor.throttle` at the SAME pre-page poll point as
     ``should_cancel``, so a loaded source pauses the read between pages (never
     mid-page) and resumes when it recedes. ``None`` (the default) adds no overhead.
+
+    ``on_description`` (optional) is called ONCE, with the first page's DBAPI
+    ``cursor.description`` (``None`` when the result exposes none), before any row is
+    yielded -- the seam :class:`ValueFitGuard` arms from. The read holds one snapshot for
+    every page, so the first page's column types hold for the rest.
     """
     if batch_size < 1:
         raise ValueError("batch_size must be a positive integer")
@@ -909,6 +1120,8 @@ def keyset_stream(
                 params[name] = value
 
         result = connection.execute(statement, params)
+        if on_description is not None and page_index == 0:
+            on_description(getattr(getattr(result, "cursor", None), "description", None))
         page_index += 1
         page_count = 0
         first_key: Optional[tuple] = None
@@ -1070,6 +1283,7 @@ class TableExporter:
         # Per-wait-slice liveness while the source-load governor holds a reader paused.
         on_pause_slice: Optional[Callable[[], None]] = None,
         shared_snapshot_id: Optional[str] = None,
+        target_specs: "Optional[Mapping[str, TargetValueSpec]]" = None,
     ) -> "Iterator[Mapping[str, object]]":
         """Yield target-ready (converted) rows from a read-only consistent snapshot.
 
@@ -1095,9 +1309,18 @@ class TableExporter:
         start), so every shard observes ONE point-in-time cut -- a consistent range-sharded
         read even on a live source with no CDC handoff. ``None`` (the default) keeps the
         shard's own independently-timed snapshot.
+
+        ``target_specs`` (optional, from
+        :func:`~dsql_migrator.core.converter.parse_target_value_specs` over the applied DDL)
+        turns on the :class:`ValueFitGuard`: a value its Aurora DSQL column would round stops
+        the table (table-fatal ``ValueConversionError``) instead of loading changed. It checks
+        rows only for columns whose live source type can exceed the target, so a table whose
+        types match pays one attribute read per row.
         """
         dialect = dialect_for(conn.source_type)
         converter = dialect.value_converter(table, target_types=target_types)
+        guard = ValueFitGuard(target_specs, dialect, table.name) if target_specs else None
+        on_description = guard.arm if guard is not None else None
         engine = self._engine_factory(conn)
         try:
             with engine.connect() as connection:
@@ -1139,8 +1362,12 @@ class TableExporter:
                         governor=governor,
                         dialect=dialect,
                         target_types=target_types,
+                        on_description=on_description,
                     ):
-                        yield converter.convert_row(raw)
+                        row = converter.convert_row(raw)
+                        if guard is not None and guard.armed:
+                            guard.check(row)
+                        yield row
                 except BaseException:  # incl. GeneratorExit: the consumer stopped early
                     _end_snapshot_after_failure(snapshot)
                     raise

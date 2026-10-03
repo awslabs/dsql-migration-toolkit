@@ -817,3 +817,389 @@ def test_the_ledger_fold_is_pure():
     after = fold_dlq_ledger(before, [CdcConnectorError(table="app.t", message="b")], now=now)
     assert before == snapshot and before["app.t"].count == 1
     assert after is not before and after["app.t"].count == 2
+
+
+# ---------------------------------------------------------------------------
+# G8: the sink's value-fit refusal (a value its Aurora DSQL column would change)
+# ---------------------------------------------------------------------------
+
+_VALUE_FIT_LINE = (
+    "Quarantined record to DLQ (topic=dsqlcdc.shop.orders, partition=0, offset=7): Value does "
+    "not fit target column 'amount' of type numeric(10,2): a number with more than 2 decimal "
+    "places would be rounded. Not applied and never retried: the Aurora DSQL column needs a "
+    "type that holds the source values. | pk: id=7 | op: u "
+    "(dev.dsqlmigrator.connect.DsqlSinkTask:301)"
+)
+
+
+class _BannerEl:
+    def classes(self, *a, **k):
+        return self
+
+    def props(self, *a, **k):
+        return self
+
+    def tooltip(self, *a, **k):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _BannerUi:
+    """Records every label/button text and every container's classes."""
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+        self.classes_seen: list[str] = []
+
+    def _el(self):
+        ui = self
+
+        class _Tracked(_BannerEl):
+            def classes(self, *a, **k):
+                ui.classes_seen.extend(str(x) for x in a)
+                return self
+
+        return _Tracked()
+
+    def column(self, *a, **k):
+        return self._el()
+
+    def row(self, *a, **k):
+        return self._el()
+
+    def label(self, text="", *a, **k):
+        self.texts.append(str(text))
+        return self._el()
+
+    def icon(self, name="", *a, **k):
+        return self._el()
+
+    def button(self, text="", *a, **k):
+        self.texts.append(str(text))
+        return self._el()
+
+    def space(self, *a, **k):
+        return self._el()
+
+    def card(self, *a, **k):
+        return self._el()
+
+    def markdown(self, text="", *a, **k):
+        self.texts.append(str(text))
+        return self._el()
+
+    def html(self, text="", *a, **k):
+        self.texts.append(str(text))
+        return self._el()
+
+
+def _render_drift(groups, migration_type=None, session=None) -> "tuple[str, list[str]]":
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import SchemaDriftSummary
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+
+    view = SimpleNamespace(schema_drift=[SchemaDriftSummary(**g) for g in groups])
+    ui = _BannerUi()
+    cm._render_cdc_schema_drift_banner(
+        ui, view, session=session, migration_type=migration_type
+    )
+    return " ".join(ui.texts), ui.classes_seen
+
+
+def test_a_value_fit_refusal_is_classified_as_its_own_drift_kind() -> None:
+    """Aurora DSQL would have ACCEPTED these values and stored them changed (true for a
+    TINYINT(1) holding 2, a rounded decimal), so the sink refuses them before writing -- with
+    no SQLSTATE. The synthetic code is what turns that into a banner instead of one more
+    anonymous poison row."""
+    from dsql_migrator.core.cdc import classify_schema_drift
+    from dsql_migrator.core.cdc_dlq import (
+        VALUE_DOES_NOT_FIT_CODE,
+        oversized_column_from_reason,
+        value_fit_column_from_reason,
+    )
+
+    rec = parse_dlq_log_message(_VALUE_FIT_LINE)
+    assert rec is not None
+    assert rec.table == "shop.orders"
+    assert rec.error_code == VALUE_DOES_NOT_FIT_CODE == "VALUE_DOES_NOT_FIT"
+    assert len(VALUE_DOES_NOT_FIT_CODE) != 5  # can never be mistaken for a real SQLSTATE
+    assert classify_schema_drift(rec.error_code) is SchemaDriftKind.VALUE_DOES_NOT_FIT
+    assert rec.drift_kind is SchemaDriftKind.VALUE_DOES_NOT_FIT
+    assert rec.pk == "id=7"
+    assert rec.op == "u"
+    assert value_fit_column_from_reason(rec.message) == "amount numeric(10,2)"
+    # The size guard's column extractor must not claim this record.
+    assert oversized_column_from_reason(rec.message) is None
+    assert value_fit_column_from_reason("Value for column 'x' exceeds DSQL's 1-byte limit") is None
+    # The default-numeric type name (it has parentheses but no colon) is read whole.
+    default = _VALUE_FIT_LINE.replace(
+        "numeric(10,2)", "numeric (Aurora DSQL default numeric(18,6))"
+    )
+    assert value_fit_column_from_reason(default) == (
+        "amount numeric (Aurora DSQL default numeric(18,6))"
+    )
+
+
+def test_a_value_fit_phrase_never_overrides_a_real_sqlstate() -> None:
+    from dsql_migrator.core.cdc_dlq import VALUE_DOES_NOT_FIT_CODE
+
+    msg = _VALUE_FIT_LINE.replace("offset=7): ", "offset=7): sqlstate=42804 ")
+    rec = parse_dlq_log_message(msg)
+    assert rec is not None
+    assert rec.error_code == "42804" != VALUE_DOES_NOT_FIT_CODE
+    assert rec.drift_kind is SchemaDriftKind.TYPE_CHANGE
+
+
+def test_the_sink_runs_the_value_fit_guard_before_batching() -> None:
+    """Cross-language anchor: the guard must sit in put() BEFORE batch.add -- a pre-write
+    refusal, so a refused row costs no chunk rollback and no per-row replay -- and the Python
+    parser must match the sink's exact leading phrase."""
+    import pathlib
+
+    from dsql_migrator.core.cdc_dlq import _VALUE_DOES_NOT_FIT
+
+    base = pathlib.Path(__file__).resolve().parents[1] / "connectors/dsql-sink/src/main/java"
+    sink = (base / "dev/dsqlmigrator/connect/DsqlSinkTask.java").read_text(encoding="utf-8")
+    guard = sink[sink.index("String oversized = oversizedColumn(event);") :]
+    guard = guard[: guard.index("batch.add(")]
+    assert "valueFitRefusal(" in guard, guard[:800]
+    assert "reportOrThrow(record, event, new DataException(unfit))" in guard
+    value_fit = (base / "dev/dsqlmigrator/connect/ValueFit.java").read_text(encoding="utf-8")
+    literal = "Value does not fit target column '"
+    assert f'REASON_PREFIX = "{literal}"' in value_fit
+    assert _VALUE_DOES_NOT_FIT.search(literal)
+
+
+def test_every_drift_kind_has_a_label() -> None:
+    """A kind missing from _DRIFT_LABELS renders as its raw string on the banner and on the
+    cut-over line; nothing caught that before."""
+    from dsql_migrator.ui import cdc_dlq_gate
+    from dsql_migrator.ui.data_migration._cdc_monitoring import _DRIFT_LABELS
+
+    for kind in SchemaDriftKind:
+        assert kind.value in _DRIFT_LABELS, kind
+        label, why = _DRIFT_LABELS[kind.value]
+        assert label.strip() and why.strip(), kind
+        assert cdc_dlq_gate._kind_label(kind.value) != kind.value, kind
+
+
+def test_the_ledger_keeps_every_kind() -> None:
+    """The persisted ledger (which holds Cut over) must not drop a kind: the old fixed cap of
+    8 had already fallen behind the enum, and the ninth kind would have been cut."""
+    from dsql_migrator.core.cdc import CdcConnectorError, _DRIFT_BY_SQLSTATE
+    from dsql_migrator.core.cdc_dlq import OVERSIZED_VALUE_CODE, fold_dlq_ledger
+
+    now = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+    codes = sorted({code for code, kind in _DRIFT_BY_SQLSTATE.items()})
+    errors = [
+        CdcConnectorError(table="app.t", message=f"m{i}", error_code=c)
+        for i, c in enumerate([*codes, OVERSIZED_VALUE_CODE])
+    ]
+    kinds = fold_dlq_ledger({}, errors, now=now)["app.t"].kinds
+    assert len(kinds) == len(SchemaDriftKind) + 1
+    assert SchemaDriftKind.VALUE_DOES_NOT_FIT.value in kinds
+
+
+def test_value_fit_banner_is_a_warning_with_its_own_header_columns_and_recreate_runbook() -> None:
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+    from dsql_migrator.ui.data_migration._models import MigrationType
+    from dsql_migrator.ui.design import NOTICE_STYLE
+
+    kind = SchemaDriftKind.VALUE_DOES_NOT_FIT.value
+    # Not a target-side loss and not a certain loss: amber, no "Stop CDC and reload" escalation.
+    assert kind not in cm._TARGET_SIDE_DRIFT_KINDS
+    assert kind not in cm._CERTAIN_LOSS_DRIFT_KINDS
+    # And not a schema-change claim, so it never hides a source schema re-check finding.
+    assert kind not in cm._DLQ_SHARED_SCHEMA_KINDS
+
+    group = {"table": "shop.orders", "kind": kind, "count": 3,
+             "columns": ["amount numeric(10,2)"]}
+    blob, classes = _render_drift([group], MigrationType.FULL_LOAD_AND_CDC)
+    assert "Rows set aside: a value does not fit its Aurora DSQL column" in blob
+    bg, border, _icon_color, _icon = NOTICE_STYLE["warning"]
+    assert any(bg in c and border in c for c in classes), classes
+    # A TINYINT(1) holding 2 involved no DDL: the banner must not claim one.
+    assert "Source schema change detected" not in blob
+    assert "amount numeric(10,2)" in blob
+    for needle in ("cannot change a column's type in place", "Replace", "'Drop & reload'",
+                   "smallint", "CHECKSUM"):
+        assert needle in blob, needle
+    # Aurora DSQL has no ALTER COLUMN TYPE: the generic ALTER advice would be impossible here.
+    assert "e.g. ALTER TABLE" not in blob
+    assert "Fix target schema" not in blob
+    assert "Stop CDC and reload these tables" not in blob
+
+    # CDC only has no Full Load step to reload from.
+    blob, _ = _render_drift([group], MigrationType.CDC_ONLY)
+    assert "Start over" in blob and "3,000" in blob
+    assert "'Drop & reload'" not in blob
+
+    # A PostgreSQL source has no TINYINT(1): its banner never talks about MySQL.
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import SourceType
+
+    pg = SimpleNamespace(source_config=SimpleNamespace(source_type=SourceType.POSTGRES))
+    blob, _ = _render_drift([group], MigrationType.FULL_LOAD_AND_CDC, session=pg)
+    assert "MySQL" not in blob and "TINYINT" not in blob
+    assert "changed to an integer type" in blob
+    assert "cannot change a column's type in place" in blob
+
+    # Mixed with a real DDL change: the DDL header and runbook stay, and the value-fit
+    # sentence is added.
+    blob, _ = _render_drift(
+        [{"table": "shop.orders", "kind": "add-column", "count": 2}, group],
+        MigrationType.FULL_LOAD_AND_CDC,
+    )
+    assert "Source schema change detected" in blob
+    assert "e.g. ALTER TABLE" in blob
+    assert "cannot change a column's type in place" in blob
+    assert "a value its Aurora DSQL column cannot hold exactly" in blob
+
+
+@pytest.mark.parametrize("mtype_name", ["FULL_LOAD_AND_CDC", "CDC_ONLY"])
+def test_a_truncate_and_a_value_fit_refusal_together_claim_no_schema_change(mtype_name) -> None:
+    """Neither kind is a source DDL change, so together (and with nothing else) they must not
+    fall through to the DDL header and its ALTER TABLE runbook -- which also dropped the
+    TRUNCATE repair, and on CDC only sent the user to a Drop & reload that does not exist."""
+    from dsql_migrator.ui.data_migration._models import MigrationType
+    from dsql_migrator.ui.design import NOTICE_STYLE
+
+    mtype = MigrationType[mtype_name]
+    groups = [
+        {"table": "shop.events", "kind": "source-truncate", "count": 1},
+        {"table": "shop.orders", "kind": "value-does-not-fit", "count": 2,
+         "columns": ["flag boolean"]},
+    ]
+    blob, classes = _render_drift(groups, mtype)
+    assert "Source schema change detected" not in blob
+    assert "e.g. ALTER TABLE" not in blob
+    assert (
+        "Source TRUNCATE was not replicated, and a value does not fit its Aurora DSQL column"
+        in blob
+    )
+    bg, border, _icon_color, _icon = NOTICE_STYLE["warning"]
+    assert any(bg in c and border in c for c in classes), classes
+    # Both repairs, each for its own table.
+    assert "Aurora DSQL has no TRUNCATE statement" in blob
+    assert "cannot change a column's type in place" in blob
+    assert "flag boolean" in blob
+    if mtype is MigrationType.CDC_ONLY:
+        assert "delete the rows the source no longer has" in blob
+        assert "'Drop & reload'" not in blob
+    else:
+        assert "cannot remove the stale ones" in blob
+
+
+def test_a_truncate_mixed_with_a_ddl_change_keeps_the_ddl_banner() -> None:
+    # Unchanged: a real DDL kind beside the TRUNCATE keeps the (more severe) DDL header and the
+    # generic runbook, and a TRUNCATE alone keeps its own header.
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    truncate = {"table": "shop.events", "kind": "source-truncate", "count": 1}
+    blob, _ = _render_drift(
+        [truncate, {"table": "shop.orders", "kind": "add-column", "count": 2}],
+        MigrationType.FULL_LOAD_AND_CDC,
+    )
+    assert "Source schema change detected" in blob
+    assert "e.g. ALTER TABLE" in blob
+    blob, _ = _render_drift([truncate], MigrationType.FULL_LOAD_AND_CDC)
+    assert "Source TRUNCATE was not replicated" in blob
+    assert "and a value does not fit" not in blob
+    assert "e.g. ALTER TABLE" not in blob
+
+
+class _AiBannerUi(_BannerUi):
+    """A _BannerUi that also keeps each button's on_click and the tooltips set on it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.clicks: dict[str, object] = {}
+        self.tooltips: list[str] = []
+
+    def button(self, text="", *a, on_click=None, **k):
+        self.texts.append(str(text))
+        self.clicks[str(text)] = on_click
+        ui = self
+
+        class _Button(_BannerEl):
+            def tooltip(self, tip="", *a, **k):
+                ui.tooltips.append(str(tip))
+                return self
+
+        return _Button()
+
+
+def _ask_ai_dba(groups, migration_type=None) -> "tuple[str, str, str, list[str]]":
+    """Render the drift banner with a capturing AI opener, click Ask AI DBA, and return
+    (scope, facts, seed, tooltips)."""
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import SchemaDriftSummary
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+
+    view = SimpleNamespace(schema_drift=[SchemaDriftSummary(**g) for g in groups])
+    ui = _AiBannerUi()
+    calls: list[tuple[str, str, str]] = []
+    cm._render_cdc_schema_drift_banner(
+        ui, view, migration_type=migration_type,
+        cdc_ai_opener=lambda scope, facts, seed: calls.append((scope, facts, seed)),
+    )
+    ui.clicks["Ask AI DBA"]()
+    scope, facts, seed = calls[-1]
+    return scope, facts, seed, ui.tooltips
+
+
+def test_the_value_fit_banner_asks_the_ai_dba_without_claiming_a_schema_change() -> None:
+    """The seed becomes the operator's first chat message and the facts are 'authoritative' to
+    the model, so a value-fit-only banner (a TINYINT(1) holding 2: no DDL at all) must not ask
+    'what DDL to apply' for 'the source schema changed'."""
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    group = {"table": "shop.orders", "kind": "value-does-not-fit", "count": 2,
+             "columns": ["is_gift boolean"]}
+    for mtype in (MigrationType.FULL_LOAD_AND_CDC, MigrationType.CDC_ONLY):
+        scope, facts, seed, tooltips = _ask_ai_dba([group], mtype)
+        assert scope == "drift"
+        assert seed == cm._CDC_VALUE_FIT_SEED
+        assert "source schema changed" not in seed and "what DDL to apply" not in seed
+        assert "ALTER COLUMN ... TYPE" in seed
+        assert not facts.startswith("Source schema drift detected"), facts
+        assert "value-does-not-fit (columns: is_gift boolean)" in facts
+        assert tooltips and not any("what DDL" in t for t in tooltips), tooltips
+
+    # A real DDL change (alone or beside a value-fit group) keeps the DDL seed and facts.
+    add = {"table": "shop.orders", "kind": "add-column", "count": 1}
+    for groups in ([add], [add, group]):
+        _scope, facts, seed, tooltips = _ask_ai_dba(groups, MigrationType.FULL_LOAD_AND_CDC)
+        assert seed == cm._CDC_DRIFT_SEED
+        assert facts.startswith("Source schema drift detected")
+        assert any("what DDL to apply" in t for t in tooltips), tooltips
+
+
+def test_cdc_schema_drift_summary_lists_value_fit_columns(monkeypatch) -> None:
+    from dsql_migrator.ui.data_migration import _cdc_status
+
+    flag_line = _VALUE_FIT_LINE.replace("'amount' of type numeric(10,2)", "'flag' of type boolean")
+    records = [
+        parse_dlq_log_message(_VALUE_FIT_LINE),
+        parse_dlq_log_message(_VALUE_FIT_LINE.replace("offset=7", "offset=8")),
+        parse_dlq_log_message(flag_line),
+        parse_dlq_log_message(
+            "Quarantined record to DLQ (topic=dsqlcdc.shop.orders, partition=0, offset=9): "
+            "sqlstate=42703 column \"notes\" of relation \"orders\" does not exist"
+        ),
+    ]
+    monkeypatch.setattr(_cdc_status, "cdc_dlq_records", lambda _state, _key: records)
+    groups = {g.kind: g for g in _cdc_status.cdc_schema_drift_summary(object(), "k")}
+    fit = groups["value-does-not-fit"]
+    assert fit.count == 3
+    assert fit.columns == ["amount numeric(10,2)", "flag boolean"]
+    assert groups["add-column"].columns == []

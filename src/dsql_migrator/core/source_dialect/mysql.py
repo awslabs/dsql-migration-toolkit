@@ -134,6 +134,21 @@ class MySQLSourceDialect(SourceDialect):
 
         return ValueConverter(table, target_types=target_types)
 
+    def live_number_shape(self, entry: object) -> "Optional[tuple[str, Optional[int]]]":
+        # PyMySQL's 7-tuple (name, type_code, display_size, internal_size, precision, scale,
+        # null_ok). DECIMAL (0) / NEWDECIMAL (246) carry their declared scale; FLOAT (4) and
+        # DOUBLE (5) are floating point.
+        try:
+            type_code = entry[1]  # type: ignore[index]
+            if type_code in (0, 246):
+                scale = entry[5]  # type: ignore[index]
+                return ("decimal", int(scale) if scale is not None else None)
+            if type_code in (4, 5):
+                return ("float", None)
+        except (IndexError, TypeError, ValueError):
+            return None
+        return None
+
     def estimate_row_counts(
         self, connection: object, tables: list[str]
     ) -> "dict[str, Optional[int]]":

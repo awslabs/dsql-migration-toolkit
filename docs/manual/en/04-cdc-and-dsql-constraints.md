@@ -117,6 +117,44 @@ type that Aurora DSQL rejects is surfaced the same way for you to resolve by han
 tool never drops target data automatically); one it accepts silently is caught by the
 source schema re-check below.
 
+**A value its column cannot hold exactly** (MySQL or PostgreSQL source) is refused, not
+written. Before writing, the sink checks each number against its Aurora DSQL column,
+whose type it reads once per table (and again every 10 minutes). Without this check,
+three kinds of value would change with no error:
+
+- a number other than 0 or 1 for a `boolean` column, which would be stored as `true` or
+  `false`. A MySQL `TINYINT(1)` can hold up to 127 with no source `ALTER` at all; a
+  `TINYINT(1)` widened to `INT`, or a PostgreSQL `boolean` changed to an integer type,
+  does the same;
+- a number with more decimal places than a `numeric(p,s)` column keeps (for example
+  after `DECIMAL(10,2)` → `DECIMAL(12,4)`), which would be rounded;
+- a fractional number for an integer column (for example after `INT` →
+  `DECIMAL(10,2)` or `DOUBLE`), which would be rounded to a whole number.
+
+The row is dead-lettered instead, and the CDC step shows a **"Rows set aside: a value
+does not fit its Aurora DSQL column"** banner naming the table and column. The
+dead-letter reason names the column and its type, never the value. A value that fits is
+written unchanged (`1.2300` into `numeric(10,2)` stores `1.23`). A PostgreSQL `numeric`
+declared without precision is stored at Aurora DSQL's default `numeric(18,6)`, as Schema
+Conversion warns, and is still rounded to 6 decimal places. A `FLOAT`/`DOUBLE` value for
+a `numeric` column is not checked and is still rounded. Aurora DSQL cannot change a
+column's type in place, so the repair is to recreate the table:
+
+- **Full Load + CDC:** let CDC catch up, Stop CDC, re-run Step 1 if the source type
+  changed, re-apply the table in Schema Conversion with **Replace** and a type that holds
+  the values (edit a `TINYINT(1)` to `smallint`), reload it with **Drop & reload**, Start
+  CDC, then re-check it in Validation.
+- **CDC only:** Stop CDC and give the column such a type by hand (add a column of that
+  type, copy the values across at most 3,000 rows per transaction, drop the old column
+  and rename the new one), correct the set-aside rows, then Start CDC; or use **Start
+  over**.
+
+Cut over is held for the table until it matches by CHECKSUM
+([§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over)). CDC infrastructure deployed
+by an earlier version of the tool does not have this check: until you **Delete CDC
+infrastructure** and deploy it again, it stores such values as `true`/`false`, or
+rounded.
+
 **A source `TRUNCATE`** (MySQL or PostgreSQL source) is not a schema change, and CDC
 cannot apply it either. Aurora DSQL has no `TRUNCATE` statement, and deleting every
 target row because of one event that names no row would be unbounded and could also
@@ -153,9 +191,14 @@ no dead letter and no banner reveal it:
 
 - a **dropped column** whose target column is nullable or has a DEFAULT: new rows get
   NULL or the DEFAULT, updated rows keep the old value;
-- a **changed type** the target still accepts: values are converted silently — rounded
-  to the old scale (`DECIMAL(10,2)` → `DECIMAL(12,4)`), or, for a MySQL `TINYINT(1)`
-  widened to `INT` on a boolean target, every non-zero value stored as `true`;
+- a **changed type** the target still accepts with every value intact (a wider
+  `VARCHAR` or integer type). A value it would round or store as `true`/`false` is
+  dead-lettered instead ([see above](#detecting-and-handling-source-schema-drift)); CDC
+  infrastructure deployed by an earlier version of the tool still writes it changed until
+  you delete and redeploy it;
+- a column changed to `FLOAT`/`DOUBLE` on a `numeric(p,s)` target (for example
+  `DECIMAL(10,2)` → `DOUBLE`): its values are rounded to the target's scale with no dead
+  letter, because that case is not checked;
 - a **dropped or renamed table** (or one moved to another schema): CDC captures tables
   by the names it was deployed with, so the target table stops changing. On MySQL a
   table re-created under the old name streams into it as is; on PostgreSQL, after a
@@ -291,8 +334,9 @@ pipeline handles oversized values in **three bands**:
 
 Beyond oversized values, the DLQ isolates any record DSQL **permanently** rejects
 — a type mismatch, a constraint violation, a missing target column (e.g. after an
-un-propagated source `ALTER`). Transient failures (OCC `40001`, connection drops)
-are **retried**, not dead-lettered.
+un-propagated source `ALTER`) — and any value the sink refuses because its Aurora DSQL
+column would change it ([§4.2](#detecting-and-handling-source-schema-drift)). Transient
+failures (OCC `40001`, connection drops) are **retried**, not dead-lettered.
 
 ### Where the DLQ surfaces — CloudWatch, not a Kafka topic you read
 
@@ -461,9 +505,12 @@ notices, beside the dead-letter queue card rather than in it:
     up), Stop CDC, rename a renamed column on Aurora DSQL (**Fix target schema…** does
     it) and drop a removed one there first (Drop & reload does not destroy a target
     column the new definition no longer has; a primary-key column cannot be dropped on
-    Aurora DSQL, so re-apply that table in Schema Conversion with **Replace** instead),
-    reload the table on the Full Load step with **Drop & reload**, then Start CDC. Run
-    no other DDL on migrated tables while CDC is stopped.
+    Aurora DSQL, so re-apply that table in Schema Conversion with **Replace** instead;
+    Drop & reload recreates a column whose type changed with its type from the re-run
+    Step 1, unless you edited that table's DDL in Schema Conversion, where the edit wins:
+    change the column's type there first, as Aurora DSQL cannot change a column's type in
+    place), reload the table on the Full Load step with **Drop & reload**, then Start
+    CDC. Run no other DDL on migrated tables while CDC is stopped.
   - **CDC only:** change the Aurora DSQL table by hand where it must follow the source,
     correct the rows CDC wrote since the change (they are not replayed), then re-run
     Step 1.

@@ -848,7 +848,9 @@ def _render_cdc_replica_identity_notice(
 
 # The source-schema kinds the dead-letter banner ALSO classifies (from the rejection's
 # SQLSTATE), with the same names as the re-check's: a table both report the same way is
-# listed only in that banner.
+# listed only in that banner. ``value-does-not-fit`` is deliberately NOT here: it is not a
+# schema-change claim (a MySQL TINYINT(1) holding 2 needs no DDL), so it must never hide a
+# re-check finding; a widened table shows both, and both hold Cut over.
 _DLQ_SHARED_SCHEMA_KINDS = frozenset({"add-column", "drop-column", "type-change"})
 
 
@@ -1642,7 +1644,7 @@ _DRIFT_LABELS: dict[str, tuple[str, str]] = {
     "type-change": (
         "column type changed at the source",
         "the source changed a column's type incompatibly, so DSQL rejected the rows "
-        "(SQLSTATE 42804 / 22xxx)",
+        "(SQLSTATE 42804)",
     ),
     # TARGET-side, and the most destructive: every event for the table is dead-lettered
     # with its offset committed, so the rows are not waiting anywhere to be retried.
@@ -1697,7 +1699,31 @@ _DRIFT_LABELS: dict[str, tuple[str, str]] = {
         "(Validation, step 4, reports them as EXTRA rows). The stream itself is unaffected: "
         "later inserts and updates keep flowing",
     ),
+    # The sink's own pre-write refusal (no SQLSTATE): Aurora DSQL would have ACCEPTED these
+    # values and stored them changed. Not necessarily a DDL change -- a MySQL TINYINT(1) holds
+    # up to 127 with none -- so it names the value rule, not a source ALTER, and gets its own
+    # header and runbook below.
+    "value-does-not-fit": (
+        "a value its Aurora DSQL column cannot hold exactly",
+        "the sink set these rows aside instead of writing a value this column would change: a "
+        "number other than 0 or 1 for a boolean column would be stored as true or false (a "
+        "MySQL TINYINT(1) can hold up to 127 with no source change at all), and a fraction, or "
+        "more decimal places than an integer or numeric column keeps, would be rounded "
+        "(usually after the source type was widened, or a narrower type was chosen in Schema "
+        "Conversion). Values that fit keep flowing",
+    ),
 }
+
+# The same "why" for a PostgreSQL source, which has no TINYINT(1): there a boolean target only
+# meets other numbers after a source boolean column was changed to an integer type.
+_VALUE_FIT_WHY_PG = (
+    "the sink set these rows aside instead of writing a value this column would change: a "
+    "number other than 0 or 1 for a boolean column would be stored as true or false (after a "
+    "source boolean column was changed to an integer type), and a fraction, or more decimal "
+    "places than an integer or numeric column keeps, would be rounded (usually after the "
+    "source type was widened, or a narrower type was chosen in Schema Conversion). Values "
+    "that fit keep flowing"
+)
 
 # Drift kinds that are NOT a source DDL change, so the banner must not call them one.
 # ``source-truncate`` is deliberately NOT here: it IS source-side, and this set's header and
@@ -1714,6 +1740,13 @@ _TARGET_SIDE_DRIFT_KINDS = frozenset(
 # deliberately NOT here -- there a row only CAN end up missing.
 _CERTAIN_LOSS_DRIFT_KINDS = frozenset({"missing-table", "unbindable-value"})
 
+# The kinds that are neither a source DDL change nor target-side: a source TRUNCATE (extra
+# rows on the target) and a value the sink refused because its column would change it (a
+# MySQL TINYINT(1) can hold 2 with no DDL). A banner holding only these -- either or both --
+# gets their own header(s) and runbook(s), never the generic "apply the matching change
+# (e.g. ALTER TABLE)" one.
+_NON_DDL_SOURCE_KINDS = frozenset({"source-truncate", "value-does-not-fit"})
+
 
 # How many names one Fix target schema… sentence lists before it tails off with "+N more".
 _FIX_NAME_LIMIT = 6
@@ -1729,6 +1762,44 @@ def _fix_names(names, joiner: str = ", ") -> str:
 
 def _fix_is_cdc_only(migration_type) -> bool:
     return getattr(migration_type, "name", None) == "CDC_ONLY"
+
+
+def _value_fit_runbook(migration_type, names, *, is_pg: bool = False) -> str:
+    """The recreate runbook for rows the sink refused because their column would change them.
+
+    Aurora DSQL has no ``ALTER COLUMN ... TYPE``, so the only way to give a column a type that
+    holds the values is to recreate the table -- never an ALTER. ``names`` are the affected
+    tables (capped like the Fix sentences). No engine sentence: nothing here deletes the CDC
+    infrastructure, so the replication slot / stream position is kept.
+    """
+    shown = _fix_names(sorted({str(n) for n in names}))
+    # A MySQL TINYINT(1) is the common no-DDL cause; PostgreSQL has no such type.
+    remap = (
+        ""
+        if is_pg
+        else " (for a MySQL TINYINT(1) holding values other than 0 and 1, edit its type to "
+        "smallint)"
+    )
+    if _fix_is_cdc_only(migration_type):
+        return (
+            "Aurora DSQL cannot change a column's type in place, and CDC only has no Full Load "
+            "step to reload from. Stop CDC and give the column a type that holds these values "
+            "by hand: add a column of that type, copy the values across (at most 3,000 rows "
+            "per transaction), drop the old column and rename the new one (a primary-key "
+            "column cannot be dropped: use Start over instead). Then correct the set-aside "
+            "rows on Aurora DSQL (the dead-letter queue card lists each record's primary key), "
+            f"Start CDC and run Validation (step 4); or use Start over to migrate {shown} "
+            "again with that type."
+        )
+    return (
+        "Aurora DSQL cannot change a column's type in place, so recreate the table with a type "
+        "that holds these values: let CDC catch up (Stream lag: caught up), Stop CDC, re-run "
+        f"Step 1 (Evaluation) if the source column's type changed, re-apply {shown} in Schema "
+        "Conversion (Step 2) choosing Replace when asked, with the column given a type that "
+        f"holds the values{remap}, reload it on the Full Load step with 'Drop & reload', then "
+        "Start CDC and run Validation (step 4). Until then CDC keeps setting such rows aside, "
+        "and Cut over stays held for each table until it matches by CHECKSUM."
+    )
 
 
 def _fix_engine_sentence(*, is_pg: bool, cdc_only: bool) -> str:
@@ -2588,6 +2659,14 @@ _CDC_DRIFT_SEED = (
     "table, tell me exactly what DDL to apply to the target and how to backfill the "
     "set-aside rows — and whether I must stop CDC first."
 )
+# The value-fit-only banner's seed: those rows need not come from any source DDL (a MySQL
+# TINYINT(1) can hold 2), and Aurora DSQL has no ALTER COLUMN ... TYPE to "apply".
+_CDC_VALUE_FIT_SEED = (
+    "CDC set rows aside because a value does not fit its Aurora DSQL column (not necessarily "
+    "a source schema change). For each affected table, tell me how to give the column a type "
+    "that holds these values — Aurora DSQL has no ALTER COLUMN ... TYPE — and how to backfill "
+    "the set-aside rows, and whether I must stop CDC first."
+)
 
 
 def _cdc_dlq_facts(migration_state, log_key: str, job_manager=None) -> str:
@@ -2658,13 +2737,26 @@ def _exclusion_state_facts(migration_state, job_manager) -> "list[str]":
 
 
 def _cdc_drift_facts(status_view: LoadStatusView) -> str:
-    """Assemble a credential-free schema-drift facts block for the AI DBA chat."""
+    """Assemble a credential-free schema-drift facts block for the AI DBA chat.
+
+    The model is told these facts are authoritative, so a value-fit-only block must not open
+    by claiming a source schema change the banner itself does not claim."""
     drift = getattr(status_view, "schema_drift", None) or []
-    lines = ["Source schema drift detected (CDC does not replicate DDL):"]
+    value_fit_only = bool(drift) and all(
+        getattr(g, "kind", "") == "value-does-not-fit" for g in drift
+    )
+    lines = [
+        "CDC set rows aside: a value does not fit its Aurora DSQL column (not necessarily a "
+        "source schema change; CDC does not replicate DDL):"
+        if value_fit_only
+        else "Source schema drift detected (CDC does not replicate DDL):"
+    ]
     for group in drift:
         noun = "record" if group.count == 1 else "records"
+        columns = list(getattr(group, "columns", None) or ())
+        detail = f" (columns: {', '.join(columns)})" if columns else ""
         lines.append(
-            f"- {group.table}: {group.kind} — {group.count} {noun} dead-lettered"
+            f"- {group.table}: {group.kind}{detail} — {group.count} {noun} dead-lettered"
         )
     return "\n".join(lines)
 
@@ -2715,9 +2807,20 @@ def _render_cdc_schema_drift_banner(
     _certain_loss = bool(_kinds & _CERTAIN_LOSS_DRIFT_KINDS)
     # FOUR cases now: a source TRUNCATE is neither a DDL change nor a target-side loss, so it
     # needs its own header and its own runbook line. Only when it is the ONLY kind present --
-    # mixed drift keeps the (more severe) DDL header, and the per-table line below still states
-    # the truncate in full.
+    # mixed with a DDL change it keeps the (more severe) DDL header, and the per-table line below
+    # still states the truncate in full.
     _truncate_only = _kinds == {"source-truncate"}
+    # FIVE: a value the sink refused because its column would change it is not a schema change
+    # either (a MySQL TINYINT(1) can hold 2 with no DDL), so it too gets its own header and
+    # runbook when it is the only kind. `warning`: real, but the stream keeps running and the
+    # cut-over gate holds each such table until a CHECKSUM match. No Fix button.
+    _value_fit_only = _kinds == {"value-does-not-fit"}
+    # SIX: those two together (and nothing else) are still no DDL change, so the banner names
+    # both and gives the TRUNCATE runbook plus the value-fit one -- never the generic DDL one.
+    _no_ddl = _kinds <= _NON_DDL_SOURCE_KINDS
+    from dsql_migrator.ui.cdc_replica_identity_gate import _is_postgres
+
+    _is_pg = _is_postgres(session)
     # `error` for certain ongoing loss AND for the target-side kinds generally: a row that
     # may have vanished is not "be aware" either. `warning` is left to a source DDL change,
     # which is recoverable by applying the DDL.
@@ -2737,6 +2840,13 @@ def _render_cdc_schema_drift_banner(
         # the cut-over gate already blocks on Validation's verdict -- and also holds each
         # dead-lettered table until a CHECKSUM comparison started after its last record.
         _header = "Source TRUNCATE was not replicated"
+    elif _value_fit_only:
+        _header = "Rows set aside: a value does not fit its Aurora DSQL column"
+    elif _no_ddl:
+        _header = (
+            "Source TRUNCATE was not replicated, and a value does not fit its Aurora DSQL "
+            "column"
+        )
     else:
         _header = "Source schema change detected"
     bg, border, icon_color, _icon = NOTICE_STYLE.get(_tone, NOTICE_STYLE["info"])
@@ -2748,17 +2858,26 @@ def _render_cdc_schema_drift_banner(
             ui.label(_header).classes("text-sm font-semibold text-gray-900")  # type: ignore[attr-defined]
             if cdc_ai_opener is not None:
                 ui.space()  # type: ignore[attr-defined]
+                # A value-fit-only banner claims no schema change, so its chat must not either
+                # (the seed becomes the operator's first message).
                 _render_cdc_ai_button(
                     ui,
                     lambda: cdc_ai_opener(
-                        "drift", _cdc_drift_facts(status_view), _CDC_DRIFT_SEED
+                        "drift",
+                        _cdc_drift_facts(status_view),
+                        _CDC_VALUE_FIT_SEED if _value_fit_only else _CDC_DRIFT_SEED,
                     ),
-                    "Ask AI DBA what DDL to apply and how to backfill the drifted rows.",
+                    "Ask AI DBA how to give the column a type that holds these values and "
+                    "backfill the set-aside rows."
+                    if _value_fit_only
+                    else "Ask AI DBA what DDL to apply and how to backfill the drifted rows.",
                 )
         for group in drift:
             label, why = _DRIFT_LABELS.get(
                 group.kind, (group.kind, "the source schema changed")
             )
+            if group.kind == "value-does-not-fit" and _is_pg:
+                why = _VALUE_FIT_WHY_PG
             noun = "record" if group.count == 1 else "records"
             # 23502 is ALSO what an excluded column produces when the target still
             # requires it (NOT NULL, no DEFAULT): capture drops it from the event, so the
@@ -2772,9 +2891,13 @@ def _render_cdc_schema_drift_banner(
                     "requires (NOT NULL, no DEFAULT) — it is not sent, so the same "
                     "rejection follows"
                 )
+            # A value-fit group names the column(s) and their Aurora DSQL type (never a value).
+            _columns = list(getattr(group, "columns", None) or ())
+            _named = f" ({', '.join(_columns)})" if _columns else ""
             with ui.row().classes("w-full items-center gap-2"):  # type: ignore[attr-defined]
                 ui.label(  # type: ignore[attr-defined]
-                    f"{group.table}: {label} — {why}. {group.count} {noun} dead-lettered."
+                    f"{group.table}: {label}{_named} — {why}. {group.count} {noun} "
+                    "dead-lettered."
                 ).classes("text-xs text-gray-800")
                 # An added or renamed column (42703) is the only drift we offer to fix:
                 # the dialog ADDs a new column or RENAMEs a renamed one, after approval of
@@ -2802,7 +2925,17 @@ def _render_cdc_schema_drift_banner(
         # its remedy is a manual delete on the target -- also with CDC stopped, which freezes
         # the target so the delete cannot race a newly replicated insert; the replay after
         # Start is idempotent (upserts and no-op deletes).
-        if not _truncate_only:
+        # A value-fit refusal has its OWN runbook: a column's type can only change by recreating
+        # the table on Aurora DSQL (no ALTER COLUMN ... TYPE), so the generic "apply the matching
+        # change (e.g. ALTER TABLE)" line would be impossible advice for it. Alone, it IS the
+        # runbook; with only a TRUNCATE it is appended to the TRUNCATE line (no DDL kind, so no
+        # generic line); mixed with a DDL or target-side kind, it is appended to the generic one.
+        _value_fit_tables = [
+            g.table for g in drift if getattr(g, "kind", "") == "value-does-not-fit"
+        ]
+        if _value_fit_only:
+            _runbook = _value_fit_runbook(migration_type, _value_fit_tables, is_pg=_is_pg)
+        elif not _no_ddl:
             _runbook = (
                 "CDC does not replicate DDL. Apply the matching change to the target "
                 "schema (e.g. ALTER TABLE) to stop new rows being set aside — then "
@@ -2812,6 +2945,10 @@ def _render_cdc_schema_drift_banner(
                 "only inserts primary keys the target is missing, so a row already there "
                 "keeps its old values. Run Validation (step 4) afterwards to confirm."
             )
+            if _value_fit_tables:
+                _runbook += " " + _value_fit_runbook(
+                    migration_type, _value_fit_tables, is_pg=_is_pg
+                )
         else:
             from dsql_migrator.ui.data_migration._models import MigrationType
 
@@ -2832,6 +2969,10 @@ def _render_cdc_schema_drift_banner(
                     "it cannot remove the stale ones), then Start CDC. Run Validation (step 4) "
                     "afterwards: Cut over stays held for each truncated table until it "
                     "matches by CHECKSUM."
+                )
+            if _value_fit_tables:
+                _runbook += " " + _value_fit_runbook(
+                    migration_type, _value_fit_tables, is_pg=_is_pg
                 )
         ui.label(_runbook).classes("text-xs italic text-gray-600")  # type: ignore[attr-defined]
         if _target_side:

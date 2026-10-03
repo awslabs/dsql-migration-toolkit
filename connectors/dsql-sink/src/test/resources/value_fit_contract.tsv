@@ -1,0 +1,34 @@
+# The value-fit verdict table shared by the CDC sink (connectors/dsql-sink ValueFit, ValueFitTest)
+# and the Full Load (core/exporter.value_fit_rule, tests/test_exporter.py). Byte-identical copy at
+# connectors/dsql-sink/src/test/resources/value_fit_contract.tsv. Tab-separated; '-' is NULL.
+# data_type/numeric_precision/numeric_scale are what information_schema.columns reports for the
+# target column (the sink's source of truth); ddl_type is the same column in the applied DDL
+# (the Full Load's). 'double' rows into numeric are the documented residual (not checked).
+data_type	numeric_precision	numeric_scale	ddl_type	value_kind	value	unconstrained_source	expected
+boolean	-	-	boolean	int	0	false	fit
+boolean	-	-	boolean	int	1	false	fit
+boolean	-	-	boolean	int	2	false	not-0-or-1
+boolean	-	-	boolean	int	-1	false	not-0-or-1
+boolean	-	-	boolean	int	127	false	not-0-or-1
+boolean	-	-	boolean	decimal	0.5	false	not-0-or-1
+boolean	-	-	boolean	decimal	1.0	false	fit
+boolean	-	-	boolean	double	0.5	false	not-0-or-1
+smallint	16	0	smallint	int	7	false	fit
+integer	32	0	integer	decimal	5.000	false	fit
+integer	32	0	integer	decimal	5.5	false	fraction
+integer	32	0	integer	double	0.5	false	fraction
+integer	32	0	integer	double	3.0	false	fit
+integer	32	0	integer	decimal	5.5	true	fraction
+bigint	64	0	bigint	decimal	12345678901.25	false	fraction
+numeric	10	2	numeric(10,2)	decimal	1.2300	false	fit
+numeric	10	2	numeric(10,2)	decimal	1.2345	false	scale
+numeric	10	2	numeric(10,2)	decimal	-0.001	false	scale
+numeric	10	2	numeric(10,2)	decimal	1.234	true	scale
+numeric	10	2	numeric(10,2)	int	5	false	fit
+numeric	10	2	numeric(10,2)	double	1.2345	false	fit
+numeric	20	0	numeric(20)	decimal	5.5	false	scale
+numeric	-	-	numeric	decimal	1.1234567	false	scale
+numeric	-	-	numeric	decimal	1.1234567	true	fit
+numeric	-	-	numeric	decimal	1.123456	false	fit
+numeric	18	6	numeric(18,6)	decimal	1.1234567	true	fit
+numeric	18	6	numeric(18,6)	decimal	1.1234567	false	scale

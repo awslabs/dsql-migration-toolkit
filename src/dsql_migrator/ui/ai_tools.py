@@ -752,7 +752,10 @@ def build_ai_tool_executor(
                          {"sqlstate": s, "count": c} for s, c in _sqlstates
                      ],
                      "schema_drift": [
-                         {"table": d.table, "kind": d.kind, "count": d.count}
+                         {"table": d.table, "kind": d.kind, "count": d.count,
+                          # value-does-not-fit only: "<column> <type>" (never a value).
+                          **({"columns": list(d.columns)}
+                             if getattr(d, "columns", None) else {})}
                          for d in _drift
                      ],
                      "max_replication_lag_ms": _max_lag,

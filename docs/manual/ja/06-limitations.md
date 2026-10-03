@@ -204,11 +204,19 @@ _言語: [English](../en/06-limitations.md) | [한국어](../ko/06-limitations.m
   実行されている間ずっとコストが発生します。Cut over 後は cdc-stack を削除して
   ください。Full Load のみを実行する場合、ストリーミングインフラはプロビジョニング
   されません。
-- **TINYINT(1) の範囲外の値はテーブル全体の失敗になります(MySQL ソース)。** `{0,1}` の
-  範囲外の `TINYINT(1)` 値は、暗黙のうちに `true` に丸められることなく、そのテーブルの
-  Full Load を明示的に(loudly)中断させます。ソースデータをクリーンアップ(または
-  その列を除外)してから再実行してください。PostgreSQL ソースにはネイティブの `boolean` 型が
-  あるため、この MySQL 固有の `TINYINT(1)`→`boolean` 変換とテーブル全体の失敗ガードは適用されません。
+- **ターゲット列が正確に保持できない値は、変換せずに拒否します。** 対象は次のとおりです:
+  - `boolean` 列に入る 0 または 1 以外の数値(`2` を保持する MySQL の `TINYINT(1)`、または CDC で
+    整数型に変更された PostgreSQL の `boolean`);
+  - `numeric(p,s)` 列が保持するより多い小数桁;
+  - 整数列に入る小数。
+
+  通常は、Step 1 の後でソースの型が広げられたか、Schema Conversion でより狭い型を選んだときに起こります。
+  Full Load はそのテーブルを停止します(テーブル全体の失敗)。CDC はその行をデッドレターにしてバナーを
+  表示します。以前のバージョンのツールでデプロイした CDC インフラは、削除して再デプロイするまで変わった値を
+  書き込み続けます。Schema Conversion で値を保持できる型を列に指定して(**Replace** で再適用)リロードするか、
+  ソースデータをクリーンアップしてください。精度なしの `numeric` ターゲット(Schema Conversion が警告する
+  Aurora DSQL の既定値 `numeric(18,6)`)は、設計どおり PostgreSQL の制約なし `numeric` を引き続き小数 6 桁に
+  丸めます。確認しない対象: `numeric` 列に入る `FLOAT`/`DOUBLE` の値。
 - **PostgreSQL 17/18 ソース — バージョン固有のエッジ 3 点（いずれも移行を止めません）。** PG 13–18
   をサポートします。17・18 では次の 3 点に注意してください:
   - **`interval` の `infinity`/`-infinity`（PG17 で新規）。** Aurora DSQL は PostgreSQL-16 互換で

@@ -14,13 +14,16 @@ import java.math.BigInteger;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -36,6 +39,7 @@ import java.util.regex.Pattern;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.connect.data.Field;
+import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.DataException;
@@ -76,6 +80,12 @@ import software.amazon.awssdk.services.cloudwatch.model.StandardUnit;
  * failure the batch is replayed record-by-record so the exact poison row is
  * identified and quarantined while every healthy row still lands. Re-applying a
  * healthy row is safe (idempotent {@code ON CONFLICT} upsert / PK delete).
+ *
+ * <p>Two kinds of row are refused BEFORE any write, so they never cost a chunk rollback or a
+ * per-row replay: a value over DSQL's per-value byte limit ({@link #oversizedColumn}), and a
+ * number its target column would silently change -- a number other than 0/1 for a boolean,
+ * more decimal places than a {@code numeric(p,s)} keeps, or a fraction for an integer column
+ * ({@link ValueFit}, fed by a per-table catalog read cached on this task).
  */
 public class DsqlSinkTask extends SinkTask {
 
@@ -128,6 +138,15 @@ public class DsqlSinkTask extends SinkTask {
   private DsqlIamTokenProvider tokenProvider;
   private Connection connection;
   private ErrantRecordReporter dlqReporter; // null if the runtime has no DLQ wired
+
+  // The target column types the value-fit guard checks against (see ValueFit): one catalog
+  // read per newly seen table, then at most one per ValueFit.TTL_NANOS per table, dropped on
+  // 42703/42P01/3F000. In memory, per task: Stop CDC deletes the connector, so every Start
+  // begins cold.
+  private final ValueFit.TargetTypeCache targetTypes =
+      new ValueFit.TargetTypeCache(this::readTargetTypes);
+  // Tables whose unreadable column types were already WARNed about on this task (once each).
+  private final Set<String> catalogWarned = new HashSet<>();
 
   // --- Per-table applied-ops monitor metrics (best-effort CloudWatch) --------
   // The UI reads these instead of COUNT(*)-ing the source: the sink knows exactly
@@ -261,6 +280,7 @@ public class DsqlSinkTask extends SinkTask {
     // Keep each event paired with its originating SinkRecord so a poison row can
     // be reported to the DLQ with full Connect context.
     List<Applicable> batch = new ArrayList<>(records.size());
+    long now = System.nanoTime(); // one clock read per put() for the value-fit cache
     for (SinkRecord record : records) {
       ChangeEvent event;
       try {
@@ -290,6 +310,15 @@ public class DsqlSinkTask extends SinkTask {
                     + "(exclude oversized LOB columns at capture). This row cannot be "
                     + "stored as-is and is never retried: exclude the column at capture "
                     + "and keep the value outside the database."));
+        continue;
+      }
+      // Value-fit guard: a number its Aurora DSQL column would silently change (a number
+      // other than 0/1 for a boolean, more decimal places than numeric(p,s) keeps, a fraction
+      // for an integer column) is quarantined here, pre-write -- nothing is sent to DSQL, so
+      // it costs no chunk rollback and no per-row replay. A value that fits is untouched.
+      String unfit = valueFitRefusal(record, event, now);
+      if (unfit != null) {
+        reportOrThrow(record, event, new DataException(unfit));
         continue;
       }
       batch.add(new Applicable(record, event));
@@ -451,6 +480,140 @@ public class DsqlSinkTask extends SinkTask {
       }
     }
     return null;
+  }
+
+  /**
+   * The value-free reason to refuse {@code event} because its target column would change one
+   * of its numbers, or {@code null} (the common case). Package-private for tests.
+   *
+   * <p>Steady-state cost per event: one cache lookup, then per NUMBER value one map lookup
+   * and O(1) compares, with no allocation while every value fits. A refusal computed from an
+   * entry older than {@link ValueFit#RECHECK_BEFORE_REFUSE_NANOS} re-reads the table first, so
+   * a column recreated wider out of band does not keep refusing values that now fit.
+   */
+  String valueFitRefusal(SinkRecord record, ChangeEvent event, long nowNanos) {
+    if (event.isDelete()) {
+      return null;
+    }
+    String table = event.table();
+    Map<String, ValueFit.TargetType> cols = targetTypes.get(table, nowNanos);
+    if (cols.isEmpty()) {
+      return null;
+    }
+    String refusal = ValueFit.refusal(event, cols, record, DsqlSinkTask::isVariableScaleSource);
+    if (refusal != null
+        && targetTypes.ageNanos(table, nowNanos) > ValueFit.RECHECK_BEFORE_REFUSE_NANOS) {
+      targetTypes.invalidate(table);
+      cols = targetTypes.get(table, nowNanos);
+      refusal =
+          cols.isEmpty()
+              ? null
+              : ValueFit.refusal(event, cols, record, DsqlSinkTask::isVariableScaleSource);
+    }
+    return refusal;
+  }
+
+  /**
+   * The cache loader: the guarded column types of a {@code schema.table} target, or
+   * {@code null} when they are unknown. Mirrors the apply path's failure semantics: a 40001 is
+   * retried ({@link OccRetry}); a transient failure discards the connection and throws a
+   * {@link RetriableException} so Connect redelivers the batch; any other failure FAILS OPEN
+   * -- the table's values are written unchecked, as before this guard existed, with one WARN
+   * per table per task, and the read is retried after {@link ValueFit#UNKNOWN_RETRY_NANOS}.
+   * It never fails the task and never dead-letters a row for this.
+   */
+  Map<String, ValueFit.TargetType> readTargetTypes(String table) {
+    String[] key = ValueFit.catalogKey(table);
+    if (key == null) {
+      return null;
+    }
+    try {
+      return OccRetry.withRetry(
+          () -> loadTargetTypes(key[0], key[1]), config.maxRetries(), config.retryBackoffMs());
+    } catch (SQLException e) {
+      rollbackQuietly();
+      if (isTransient(e)) {
+        discardConnection();
+        throw transientRetryException(e);
+      }
+      if (catalogWarned.add(table)) {
+        // Table name and SQLSTATE only: the driver message is not logged (Property 7).
+        log.warn(
+            "Value-fit check is off for table {}: its Aurora DSQL column types could not be "
+                + "read (sqlstate={}); its values are written unchecked and the read is retried "
+                + "every 60 s (a number other than 0 or 1 for a boolean column is still "
+                + "rejected by Aurora DSQL)",
+            table,
+            e.getSQLState());
+      } else {
+        log.debug(
+            "Value-fit check still off for table {} (sqlstate={})", table, e.getSQLState());
+      }
+      return null;
+    }
+  }
+
+  /**
+   * One bounded {@code information_schema.columns} read for one table, committed before any
+   * chunk transaction starts. Returns {@code null} when the table is not visible (0 rows), so
+   * it is never cached as final. Package-private and overridable: the offline test seam.
+   */
+  Map<String, ValueFit.TargetType> loadTargetTypes(String schema, String table)
+      throws SQLException {
+    try {
+      Connection conn = connection();
+      Map<String, ValueFit.TargetType> out = new HashMap<>();
+      int rows = 0;
+      try (PreparedStatement ps = conn.prepareStatement(ValueFit.CATALOG_SQL)) {
+        ps.setString(1, schema);
+        ps.setString(2, table);
+        try (ResultSet rs = ps.executeQuery()) {
+          while (rs.next()) {
+            rows++;
+            ValueFit.TargetType type =
+                ValueFit.TargetType.fromCatalog(
+                    rs.getString(2), intOrNull(rs, 3), intOrNull(rs, 4));
+            if (type != null) {
+              out.put(rs.getString(1), type);
+            }
+          }
+        }
+      }
+      conn.commit(); // end the read transaction before any chunk transaction
+      return rows == 0 ? null : out;
+    } catch (SQLException e) {
+      rollbackQuietly();
+      throw e;
+    }
+  }
+
+  private static Integer intOrNull(ResultSet rs, int column) throws SQLException {
+    int value = rs.getInt(column);
+    return rs.wasNull() ? null : value;
+  }
+
+  /**
+   * True when {@code column} of the record's after-image is a Debezium
+   * {@code VariableScaleDecimal} -- an UNCONSTRAINED PostgreSQL {@code numeric} -- whose
+   * rounding into Aurora DSQL's default {@code numeric(18,6)} is by design (see
+   * {@link ValueFit}). Null-safe; any unexpected shape is {@code false}.
+   */
+  static boolean isVariableScaleSource(SinkRecord record, String column) {
+    try {
+      if (record == null || !(record.value() instanceof Struct envelope)) {
+        return false;
+      }
+      Field after = envelope.schema().field("after");
+      if (after == null) {
+        return false;
+      }
+      Schema afterSchema = after.schema();
+      Field field = afterSchema.field(column);
+      return field != null
+          && DebeziumTypeConverter.VARIABLE_SCALE_DECIMAL.equals(field.schema().name());
+    } catch (RuntimeException e) {
+      return false;
+    }
   }
 
   /**
@@ -711,6 +874,11 @@ public class DsqlSinkTask extends SinkTask {
    * row, so it does not affect steady-state throughput.
    */
   private void reportOrThrow(SinkRecord record, ChangeEvent event, SQLException cause) {
+    // A missing column / table / schema means the table's cached column types may be stale
+    // (the target was recreated or altered): read them again on the next put().
+    if (ValueFit.invalidatesTargetTypes(cause.getSQLState())) {
+      targetTypes.invalidate(event.table());
+    }
     String sql;
     try {
       sql =
@@ -777,9 +945,10 @@ public class DsqlSinkTask extends SinkTask {
    * token the parser sees -- that lets the control plane classify a permanent
    * rejection into a source-schema-drift kind (42703 = a source ADD COLUMN the
    * target lacks, 23502 = a source DROP COLUMN of a target NOT NULL column,
-   * 42804/22xxx = a source TYPE CHANGE) purely from the CloudWatch log line, with
-   * no extra probe. pgjdbc's {@code getMessage()} does not include the SQLSTATE, so
-   * this is the only place it reaches the log; it carries no row values (Property 7).
+   * 42804 = a source TYPE CHANGE; a class 22 data exception is per-value and is not
+   * classified as drift) purely from the CloudWatch log line, with no extra probe.
+   * pgjdbc's {@code getMessage()} does not include the SQLSTATE, so this is the only
+   * place it reaches the log; it carries no row values (Property 7).
    *
    * <p>Package-private + static so a unit test can assert the tag shape without a
    * live JDBC connection (mirrors {@link #transientRetryException}).
@@ -899,12 +1068,14 @@ public class DsqlSinkTask extends SinkTask {
    * maps it to a DSQL {@code boolean} column, but Debezium serializes it as a plain
    * integer (INT16) with no logical schema name, so it arrives as a {@code Short}/
    * {@code Integer}. Binding that via {@code setObject} into a {@code boolean}
-   * column fails ("column is of type boolean but expression is of type smallint")
-   * and DLQs every such row. We therefore consult the statement's parameter
-   * metadata and convert a numeric bind to a {@link Boolean} (0 -&gt; false, non-0
-   * -&gt; true) when the target parameter is {@code BIT}/{@code BOOLEAN}. This mirrors
-   * the Full Load value converter's TINYINT(1)-&gt;boolean handling so both data
-   * paths agree.
+   * column fails ("column is of type boolean but expression is of type smallint").
+   * We therefore consult the statement's parameter metadata and convert a numeric
+   * bind to a {@link Boolean} when the target parameter is {@code BIT}/{@code BOOLEAN}:
+   * 0 -&gt; false, 1 -&gt; true. Any other number is bound UNCHANGED, so Aurora DSQL
+   * rejects it (42804) instead of storing a value it never had -- the pre-write value-fit
+   * guard in {@link #put} normally refuses it first with a named reason ({@link ValueFit});
+   * this is the backstop when the column types could not be read. The Full Load value
+   * converter refuses the same values, so both data paths agree.
    *
    * <p>The MIRROR case is MySQL {@code BIT(1)}: Debezium serializes it as a plain
    * Kafka {@code BOOLEAN} (no logical schema name), but the schema converter maps
@@ -923,14 +1094,30 @@ public class DsqlSinkTask extends SinkTask {
     List<Object> binds = event.isDelete() ? event.pkValues() : event.values();
     for (int i = 0; i < binds.size(); i++) {
       Object value = binds.get(i);
-      if (value instanceof Number && meta != null && isBooleanParam(meta, i + 1)) {
-        ps.setObject(i + 1, ((Number) value).longValue() != 0L);
-      } else if (value instanceof Boolean && meta != null && isIntegerParam(meta, i + 1)) {
-        ps.setObject(i + 1, ((Boolean) value) ? 1 : 0);
-      } else {
-        ps.setObject(i + 1, value);
-      }
+      // The metadata is consulted only for a Number (boolean target?) or a Boolean (integer
+      // target?), exactly as before: every other value goes straight to setObject.
+      boolean booleanParam =
+          value instanceof Number && meta != null && isBooleanParam(meta, i + 1);
+      boolean integerParam =
+          value instanceof Boolean && meta != null && isIntegerParam(meta, i + 1);
+      ps.setObject(i + 1, bindValue(value, booleanParam, integerParam));
     }
+  }
+
+  /**
+   * The object to bind for {@code value}: a Number becomes a Boolean only when it is EXACTLY
+   * 0 or 1 and the parameter is boolean; a Boolean becomes 0/1 when the parameter is an
+   * integer; anything else is the ORIGINAL object (never a rescaled or converted copy). Pure
+   * and package-private for tests.
+   */
+  static Object bindValue(Object value, boolean booleanParam, boolean integerParam) {
+    if (booleanParam && value instanceof Number n && ValueFit.isZeroOrOne(n)) {
+      return n.longValue() != 0L;
+    }
+    if (integerParam && value instanceof Boolean b) {
+      return b ? 1 : 0;
+    }
+    return value;
   }
 
   /**

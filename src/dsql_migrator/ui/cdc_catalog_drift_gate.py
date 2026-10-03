@@ -6,7 +6,9 @@
 CDC replicates row data, not DDL. Most source changes the target cannot take are rejected
 and dead-lettered (the dead-letter banner and the G1 gate see them), but several are applied
 with no rejected row at all: a dropped nullable or DEFAULT column, a widened numeric or a
-MySQL ``tinyint(1)`` widened to ``int`` (rounded / collapsed to true on Aurora DSQL), a
+MySQL ``tinyint(1)`` widened to ``int`` (the current sink dead-letters a value it would round
+or store as true, except a FLOAT/DOUBLE value for a numeric column, which is still rounded;
+CDC infrastructure deployed by an earlier version writes it changed), a
 dropped or renamed table (the target freezes, or a same-name table streams into it), a
 PostgreSQL column Debezium cannot convert or a generated column (never sent), a NULL-rule or
 primary-key change. Nothing reports them. This module keeps checking, like the REPLICA
@@ -1117,10 +1119,17 @@ _WHYS = {
         "so writes are dead-lettered or miss their rows, and Aurora DSQL cannot change a "
         "primary key in place"
     ),
+    # Hedged: the UI cannot read which sink plugin a deployed stack runs, and a stack keeps its
+    # plugin until it is deleted and deployed again. And the value-fit guard does not check a
+    # FLOAT/DOUBLE value for a numeric column (the sink and the Full Load both leave it), so
+    # this row is the only signal for that one: it must not say such values are set aside.
     KIND_TYPE_CHANGE: (
-        "Aurora DSQL keeps the old type: a value it cannot hold is dead-lettered, and one it "
-        "can is converted silently, for example rounded to the old scale, or stored as true "
-        "for any non-zero value when a MySQL tinyint(1) became a wider integer"
+        "Aurora DSQL keeps the old type: a value it cannot hold is dead-lettered, and so is one "
+        "it could store only by changing it (rounded to the old scale, or stored as true when a "
+        "MySQL tinyint(1) became a wider integer), except a FLOAT or DOUBLE value for a numeric "
+        "column, which is not checked and is still rounded with no dead letter. CDC "
+        "infrastructure deployed by an earlier version of this tool writes every such changed "
+        "value instead, until you Delete CDC infrastructure and deploy it again"
     ),
     KIND_DROP_COLUMN: (
         "CDC no longer sends it, so Aurora DSQL stores NULL or the column DEFAULT in it for "
@@ -1256,8 +1265,11 @@ def monitor_runbook(migration_type: object) -> str:
         "column on Aurora DSQL first (Fix target schema… does it) and drop a removed one "
         "there: Drop & reload does not destroy a target column the new definition no longer "
         "has. A primary-key column cannot be dropped on Aurora DSQL: re-apply that table in "
-        "Schema Conversion with Replace instead. Run no other DDL on migrated tables while "
-        "CDC is stopped. Or undo the change on the source."
+        "Schema Conversion with Replace instead. Drop & reload recreates a column whose type "
+        "changed with its type from the re-run Step 1, unless you edited that table's DDL in "
+        "Schema Conversion (Step 2): the edit wins, so change the column's type there first "
+        "(Aurora DSQL cannot change a column's type in place). Run no other DDL on migrated "
+        "tables while CDC is stopped. Or undo the change on the source."
     )
 
 

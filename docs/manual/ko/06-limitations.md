@@ -184,10 +184,19 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
 - **CDC는 배포되어 있는 동안 과금됨.** 스트리밍 파이프라인(MSK Serverless + MSK Connect, NAT 게이트웨이를
   만들었다면 그것까지)은 실행되는 내내 비용이 발생합니다. Cut over 후에는 cdc-stack을 내리세요. Full Load만
   수행하면 스트리밍 인프라가 프로비저닝되지 않습니다.
-- **TINYINT(1) 범위 초과는 테이블 전체 실패(MySQL 소스).** `{0,1}`을 벗어난 `TINYINT(1)` 값은 조용히 `true`로
-  뭉개지 않고, 해당 테이블의 Full Load를 요란하게 중단시킵니다. 소스 데이터를 정리(또는 해당 컬럼 제외)한 뒤
-  다시 실행하세요. PostgreSQL 소스에는 네이티브 `boolean` 타입이 있으므로, 이 MySQL 고유의
-  `TINYINT(1)`→`boolean` 강제 변환과 테이블 전체 실패 가드는 적용되지 않습니다.
+- **타깃 컬럼이 정확히 담을 수 없는 값은 변환하지 않고 거부합니다.** 대상은 다음과 같습니다:
+  - `boolean` 컬럼에 들어가는 0이나 1이 아닌 숫자(`2`를 담은 MySQL `TINYINT(1)`, 또는 CDC에서 정수 타입으로
+    바뀐 PostgreSQL `boolean`);
+  - `numeric(p,s)` 컬럼이 유지하는 것보다 많은 소수 자릿수;
+  - 정수 컬럼에 들어가는 소수.
+
+  보통 Step 1 이후 소스 타입이 넓어졌거나 Schema Conversion에서 더 좁은 타입을 골랐을 때 생깁니다. Full Load는
+  그 테이블을 중단합니다(테이블 전체 실패). CDC는 그 행을 데드레터로 보내고 배너를 표시합니다. 이전 버전의
+  도구로 배포한 CDC 인프라는 삭제하고 다시 배포하기 전까지 여전히 바뀐 값을 씁니다. Schema Conversion에서
+  값을 담을 수 있는 타입을 컬럼에 지정하고(**Replace**로 다시 적용) 리로드하거나, 소스 데이터를 정리하세요.
+  정밀도 없는 `numeric` 타깃(Schema Conversion이 경고하는 Aurora DSQL 기본값 `numeric(18,6)`)은 설계상
+  PostgreSQL의 제약 없는 `numeric`을 여전히 소수 6자리로 반올림합니다. 검사하지 않는 경우: `numeric` 컬럼에
+  들어가는 `FLOAT`/`DOUBLE` 값.
 - **PostgreSQL 17/18 소스 — 버전별 엣지 3가지(어느 것도 마이그레이션을 막지 않음).** PG 13–18을
   지원하며, 17·18에서 유의할 점이 3가지 있습니다:
   - **`interval`의 `infinity`/`-infinity`(PG17 신규).** Aurora DSQL은 PostgreSQL-16 호환이라 그

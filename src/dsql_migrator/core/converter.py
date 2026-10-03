@@ -70,7 +70,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from enum import Enum
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import sqlglot
 from sqlglot import exp
@@ -880,8 +880,9 @@ def parse_target_column_types(create_ddl: str) -> dict[str, str]:
     render); the returned dict is a fresh copy each call.
 
     Parses an applied/edited DSQL (PostgreSQL) ``CREATE TABLE`` and extracts each
-    column's target type, normalized to its base name (lower-cased, parameters
-    stripped -- e.g. ``numeric(20, 0)`` -> ``numeric``). This lets the Full Load
+    column's target type, normalized to its base name as sqlglot spells it (lower-cased,
+    parameters stripped -- e.g. ``numeric(20, 0)`` -> ``decimal``, ``integer`` -> ``int``).
+    For the precision and scale, see :func:`parse_target_value_specs`. This lets the Full Load
     value conversion follow the *applied* target type (including a user remap such
     as ``boolean`` -> ``smallint`` made in Schema Conversion) instead of
     re-deriving it from the source type. Returns an empty mapping when the DDL is
@@ -966,6 +967,90 @@ def _sub_outside_quotes(pattern: "re.Pattern[str]", repl: str, text: str) -> str
 def _strip_identity_clauses(create_ddl: str) -> str:
     """The DDL with every identity clause removed (outside quotes; see above)."""
     return _sub_outside_quotes(_IDENTITY_CLAUSE_RE, "", create_ddl or "")
+
+
+class TargetValueSpec(NamedTuple):
+    """What a target column can hold EXACTLY, for the Full Load value-fit check.
+
+    The Python twin of the CDC sink's ``ValueFit.TargetType`` (same kinds, same type names
+    in the value-free message). ``kind`` is ``"boolean"``, ``"integral"`` (smallint /
+    integer / bigint) or ``"numeric"``; ``scale`` is the decimal places a numeric keeps (6
+    for a bare ``numeric``, which Aurora DSQL stores at its default ``numeric(18,6)``);
+    ``default_numeric`` marks a bare numeric or an explicit ``numeric(18,6)`` -- the one
+    target an unconstrained source numeric is exempt into.
+    """
+
+    kind: str
+    scale: int
+    default_numeric: bool
+    type_sql: str
+
+
+_INTEGRAL_VALUE_TYPES = {
+    exp.DataType.Type.SMALLINT: "smallint",
+    exp.DataType.Type.INT: "integer",
+    exp.DataType.Type.BIGINT: "bigint",
+    exp.DataType.Type.SMALLSERIAL: "smallint",
+    exp.DataType.Type.SERIAL: "integer",
+    exp.DataType.Type.BIGSERIAL: "bigint",
+}
+
+
+def parse_target_value_specs(create_ddl: str) -> "dict[str, TargetValueSpec]":
+    """``{column: TargetValueSpec}`` for the boolean / integer / numeric columns of a DDL.
+
+    Unlike :func:`parse_target_column_types` this KEEPS precision and scale -- the Full Load
+    value-fit check needs them to tell whether a source value would be rounded. Every other
+    column type is absent, and an unparseable DDL yields ``{}`` (the check then stays off,
+    which is the behaviour before it existed). Cached by DDL text; a fresh dict each call.
+    """
+    return dict(_value_specs(create_ddl or ""))
+
+
+@lru_cache(maxsize=DDL_CACHE_SIZE)
+def _value_specs(create_ddl: str) -> "tuple[tuple[str, TargetValueSpec], ...]":
+    try:
+        parsed = sqlglot.parse_one(_strip_identity_clauses(create_ddl), read="postgres")
+    except Exception:  # noqa: BLE001 - unparseable DDL -> no check (safe default)
+        return ()
+    if not isinstance(parsed, exp.Create):
+        return ()
+    specs: dict[str, TargetValueSpec] = {}
+    for column_def in parsed.find_all(exp.ColumnDef):
+        name = column_def.name
+        kind = column_def.args.get("kind")
+        if not name or not isinstance(kind, exp.DataType):
+            continue
+        spec = _value_spec(kind)
+        if spec is not None:
+            specs[name] = spec
+    return tuple(specs.items())
+
+
+def _value_spec(kind: "exp.DataType") -> "Optional[TargetValueSpec]":
+    dtype = kind.this
+    if dtype == exp.DataType.Type.BOOLEAN:
+        return TargetValueSpec("boolean", 0, False, "boolean")
+    if dtype in _INTEGRAL_VALUE_TYPES:
+        return TargetValueSpec("integral", 0, False, _INTEGRAL_VALUE_TYPES[dtype])
+    if dtype != exp.DataType.Type.DECIMAL:
+        return None
+    try:
+        params = [int(param.sql()) for param in kind.expressions]
+    except (TypeError, ValueError):
+        return None
+    if not params:
+        return TargetValueSpec(
+            "numeric", 6, True, "numeric (Aurora DSQL default numeric(18,6))"
+        )
+    precision = params[0]
+    scale = params[1] if len(params) > 1 else 0
+    return TargetValueSpec(
+        "numeric",
+        scale,
+        precision == 18 and scale == 6,
+        f"numeric({precision},{scale})",
+    )
 
 
 @lru_cache(maxsize=DDL_CACHE_SIZE)

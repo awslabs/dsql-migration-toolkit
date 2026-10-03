@@ -7,10 +7,13 @@ CDC replicates row data, never DDL, and the sink rebuilds its SQL from each reco
 source DDL change reaches Aurora DSQL only as a different row shape. Most shapes the target
 cannot take are rejected and dead-lettered (the dead-letter banner), but several are applied
 SILENTLY: a dropped nullable / DEFAULT column (inserts store NULL or the DEFAULT, updates keep
-the old value), a widened numeric (rounded to the old scale), a MySQL ``tinyint(1)`` widened
-to ``int`` on a boolean target (every non-zero value becomes true), a dropped or renamed
-table (the target freezes, or a same-name table streams into it), a PostgreSQL column
-Debezium cannot convert or a generated column (never sent). No rejected row, no signal.
+the old value), a widened numeric or a MySQL ``tinyint(1)`` widened to ``int`` on a boolean
+target (the current sink dead-letters a value it would round or store as true, except a
+FLOAT/DOUBLE value for a numeric column, which is still rounded; CDC infrastructure deployed
+by an earlier version writes it changed, and a value that still fits leaves no dead letter
+either way), a dropped or renamed table (the target freezes, or a
+same-name table streams into it), a PostgreSQL column Debezium cannot convert or a generated
+column (never sent). No rejected row, no signal.
 
 This module is the engine-side half of the runtime re-check (``ui/cdc_catalog_drift_gate``):
 

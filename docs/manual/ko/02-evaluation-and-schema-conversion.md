@@ -344,7 +344,7 @@ CDC 싱크(Java) — 가 동일한 매핑을 따르며, 공유 **write-contract*
 | MySQL 타입 | Aurora DSQL 타입 | 저장 값 형태 | 분류 | 비고 |
 |---|---|---|---|---|
 | `TINYINT` | `smallint` | `smallint` | AUTO | 부호 있는 8비트. |
-| `TINYINT(1)` | `boolean` | `boolean` (`true`/`false`) | MANUAL | MySQL boolean 관례; `0/1`→`false/true`. `{0,1}` **범위 밖의 값은 시끄럽게 실패**(조용한 평탄화 없음). |
+| `TINYINT(1)` | `boolean` | `boolean` (`true`/`false`) | MANUAL | MySQL boolean 관례; `0/1`→`false/true`. `{0,1}` **범위 밖의 값은 거부**(조용한 평탄화 없음): Full Load는 테이블을 중단하고, CDC는 그 행을 데드레터로 보냅니다. 컬럼에 다른 값이 있다면 여기서 타입을 `smallint`로 수정하세요. |
 | `SMALLINT` | `smallint` | `smallint` | AUTO | 부호 있는 16비트. |
 | `MEDIUMINT` | `integer` | `integer` | AUTO | PostgreSQL에 3바이트 정수 없음; `integer`가 부호 있는 24비트 범위를 커버. |
 | `INT` / `INTEGER` | `integer` | `integer` | AUTO | 부호 있는 32비트. |
@@ -361,7 +361,7 @@ CDC 싱크(Java) — 가 동일한 매핑을 따르며, 공유 **write-contract*
 
 | MySQL 타입 | Aurora DSQL 타입 | 저장 값 형태 | 분류 | 비고 |
 |---|---|---|---|---|
-| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 정밀도/스케일 보존. **정밀도 > 38**은 Evaluation에서 **UNSUPPORTED**로 표시(DSQL은 NUMERIC을 38로 제한)되지만, Schema Conversion은 **`numeric(38,37)`으로 clamp**하며 데이터 손실 경고와 함께 DDL을 냅니다(스케일도 37로 제한). |
+| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 정밀도/스케일 보존. **정밀도 > 38**은 Evaluation에서 **UNSUPPORTED**로 표시(DSQL은 NUMERIC을 38로 제한)되지만, Schema Conversion은 **`numeric(38,37)`으로 clamp**하며 데이터 손실 경고와 함께 DDL을 냅니다(스케일도 37로 제한). 타깃이 유지하는 것보다 소수 자릿수가 많은 값(Step 1 이후 넓어진 소스, 또는 여기서 지정한 더 좁은 타입)은 Full Load와 CDC 모두에서 반올림하지 않고 거부합니다. |
 | `DECIMAL(p,s) UNSIGNED` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 부호 없음은 표현 불가하며 저장상 의미 없음. |
 | `FLOAT` | `real` | `real` | AUTO | 단정밀도 float. |
 | `FLOAT(M,D)` | `real` | `real` | AUTO | `(M,D)` 표시 스펙 드롭(PostgreSQL `float`은 스케일이 아닌 정밀도 하나만 받음). |

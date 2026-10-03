@@ -953,6 +953,16 @@ def _cdc_recovery_context(source_engine: str = "MySQL") -> str:
         else "Start CDC on Automatic begins at the source's CURRENT position, so changes "
         "to the captured tables after the last one Aurora DSQL applied are NOT replicated"
     )
+    # The boolean cause of a value-fit refusal, in the source engine's own terms (a MySQL
+    # TINYINT(1) holds up to 127 with no DDL; on PostgreSQL it takes a boolean -> integer ALTER).
+    value_fit_boolean = (
+        "a source boolean column changed to an integer type"
+        if source_engine == "PostgreSQL"
+        else "a MySQL TINYINT(1) can hold up to 127 with no DDL at all"
+    )
+    value_fit_remap = (
+        "" if source_engine == "PostgreSQL" else "; for a TINYINT(1), remap the column to smallint"
+    )
     return (
     "How this tool's CDC works and how to recover a dead-lettered / drifted stream:\n"
     f"- CDC is Debezium ({capture}) -> Amazon MSK (Kafka) -> a CUSTOM DSQL Sink "
@@ -979,7 +989,15 @@ def _cdc_recovery_context(source_engine: str = "MySQL") -> str:
     "at deploy; keeping it out needs Delete CDC infrastructure and a redeploy). Never "
     "advise adding a renamed column, or dropping a primary-key column, on Aurora DSQL. "
     "A DROP COLUMN or a TYPE CHANGE can rewrite/destroy target data, so it is "
-    "alert-only: STOP CDC first, apply the change (or recreate the table) by hand.\n"
+    "alert-only. Aurora DSQL has NO ALTER COLUMN ... TYPE, so never advise one: a type "
+    "changes only by recreating the table (Stop CDC, re-run Step 1, re-apply the table in "
+    "Schema Conversion with Replace and the new type, 'Drop & reload', Start CDC; CDC only: "
+    "add a column of the new type, copy, drop and rename by hand, or Start over). "
+    "VALUE_DOES_NOT_FIT (no SQLSTATE; reason 'Value does not fit target column ...') means "
+    "the sink refused, before writing, a value its Aurora DSQL column would change: a number "
+    f"other than 0 or 1 for a boolean ({value_fit_boolean}), or more decimal places than a "
+    "numeric or integer column keeps (usually a widened source type). Same recreate remedy"
+    f"{value_fit_remap}.\n"
     "- BACKFILLING AFTER DRIFT: a plain per-table Reload does NOT repair an ADD COLUMN "
     "drift, so never recommend it on its own. TWO independent reasons: (a) the Full "
     "Load's SELECT list comes from the Step 1 (Evaluation) inventory, which predates the "
@@ -1048,15 +1066,16 @@ def build_cdc_error_chat_system(
 
     ``facts`` is a pre-formatted, credential-free, row-free block the UI assembles from
     the live CDC status (DLQ depth + poison tables + SQLSTATEs, detected schema drift,
-    stream/stall state). ``scope`` is ``"dlq"`` (poison records) or ``"drift"`` (source
-    schema change). The model is grounded on this tool's CDC model
+    stream/stall state). ``scope`` is ``"dlq"`` (poison records) or ``"drift"`` (the drift
+    banner: a source schema change, or a value its column cannot hold). The model is grounded on this tool's CDC model
     (:data:`_CDC_RECOVERY_CONTEXT`) so its advice maps to the real buttons (Fix target
     schema / per-table Reload / Stop CDC) and the standing-gap-before-cutover rule.
     """
     subject = (
         "dead-lettered (poison) CDC records"
         if scope == "dlq"
-        else "a source schema change (drift) the CDC stream hit"
+        else "a source schema change, or a value its Aurora DSQL column cannot hold (drift), "
+        "the CDC stream hit"
     )
     return (
         "You are a senior AWS database migration engineer chatting with a teammate "

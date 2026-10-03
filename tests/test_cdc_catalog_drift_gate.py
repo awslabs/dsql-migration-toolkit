@@ -16,6 +16,7 @@ from dsql_migrator.core.cdc_catalog_drift import (
     KIND_DROP_COLUMN,
     KIND_RENAME_COLUMN,
     KIND_SOURCE_TABLE_MISSING,
+    KIND_TYPE_CHANGE,
     CatalogDiff,
     LiveColumn,
     LiveTable,
@@ -1359,3 +1360,74 @@ def test_a_page_waits_for_a_read_another_tab_holds_and_then_refreshes(fake_run,
 
     asyncio.run(_scenario())
     assert refreshes == [1]
+
+
+def test_the_type_change_why_and_runbook_reflect_the_value_fit_guard():
+    """A widened type no longer lands rounded or as true on a current sink -- it is
+    dead-lettered -- but the UI cannot tell which sink a deployed stack runs, so the copy must
+    hedge for CDC infrastructure deployed by an earlier version, and for the one case the guard
+    does not check (a FLOAT/DOUBLE value for a numeric column), for which this row is the only
+    signal. And the runbook must not claim Drop & reload keeps a retyped column's old type: it
+    recreates the table from a conversion of the re-run Step 1, except where the table's DDL
+    was edited in Schema Conversion (the edit wins), so THAT is where the type must change."""
+    from dsql_migrator.core.converter import parse_target_value_specs
+    from dsql_migrator.core.exporter import value_fit_rule
+
+    why = g4._WHYS[KIND_TYPE_CHANGE]
+    assert "dead-lettered" in why
+    assert "converted silently" not in why
+    assert "Delete CDC infrastructure" in why
+    # The residual the copy names is real on both write paths (the sink's ValueFitTest pins
+    # the same verdict): a float is not checked against a numeric column's scale.
+    assert "FLOAT or DOUBLE value for a numeric column" in why
+    assert "still rounded" in why
+    spec = parse_target_value_specs("CREATE TABLE t (c numeric(10,2))")["c"]
+    assert value_fit_rule(1.2345, spec) is None
+    full = g4.monitor_runbook(MigrationType.FULL_LOAD_AND_CDC)
+    assert "keeps its old type" not in full
+    assert "with its type from the re-run Step 1" in full
+    assert "edited that table's DDL in Schema Conversion" in full
+    assert "the edit wins" in full
+    assert "edited" not in g4.monitor_runbook(MigrationType.CDC_ONLY)
+
+
+def test_drop_and_reload_recreates_a_retyped_column_with_the_re_run_step1_type(monkeypatch):
+    """Grounds the runbook sentence above: the recreate DDL comes from the CURRENT Step 1
+    inventory plus the Schema Conversion edits, so an unedited table gets the new type and an
+    edited one keeps its edit."""
+    from unittest import mock
+
+    from dsql_migrator.core.converter import SchemaConverter
+    from dsql_migrator.ui.data_migration import _full_load_engine as fle
+    from dsql_migrator.ui.schema_conversion_apply import applied_table_conversions
+
+    def inventory(price: str, flag: str) -> SourceInventory:
+        return SourceInventory(
+            tables=[_table("orders", (("id", "int", False), ("price", price, True),
+                                      ("flag", flag, True)))]
+        )
+
+    seen: list[str] = []
+    monkeypatch.setattr(fle, "_target_columns_the_conversion_would_drop", lambda *a, **k: [])
+    monkeypatch.setattr(fle, "DsqlConnector", mock.MagicMock())
+    monkeypatch.setattr(
+        fle, "recreate_table", lambda _schema_ddls, ddl, **_k: seen.append(ddl)
+    )
+
+    def recreated(inv: SourceInventory, edits: dict) -> str:
+        inputs = mock.MagicMock()
+        inputs.table_conversions = applied_table_conversions(
+            SchemaConverter().convert(inv), edits
+        )
+        fle._default_table_recreator(inputs)(inv.tables[0])
+        return seen[-1].upper().replace(" ", "")
+
+    old = inventory("decimal(10,2)", "tinyint(1)")
+    assert "DECIMAL(10,2)" in recreated(old, {}) and "BOOLEAN" in recreated(old, {})
+    # Unedited, after the source widened and Step 1 was re-run: the new types.
+    new = inventory("decimal(12,4)", "int")
+    assert "DECIMAL(12,4)" in recreated(new, {})
+    assert "BOOLEAN" not in recreated(new, {})
+    # Edited in Step 2: the edit survives the Step 1 re-run, old type and all.
+    edited = SchemaConverter().convert(old).tables[0].target_ddl
+    assert "DECIMAL(10,2)" in recreated(new, {"orders": edited})

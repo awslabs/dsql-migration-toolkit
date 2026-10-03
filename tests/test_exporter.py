@@ -1069,14 +1069,29 @@ def test_value_converter_rejects_tinyint_value_outside_0_1() -> None:
     # A TINYINT(1) column maps to DSQL boolean, but MySQL's (1) is display width:
     # the column can legally hold 2, -1, 127, ... bool(int(value)) would flatten
     # any non-zero to True and silently lose the magnitude, so the converter must
-    # fail loudly (naming the column + value) rather than corrupt the row.
+    # fail loudly rather than corrupt the row -- naming the column, NEVER the value
+    # (the message reaches the log and the UI; the manual promises errors carry no values).
     converter = ValueConverter(_typed_table())
-    for bad in (2, -1, 127):
+    for bad in (2, -1, 127, 37):
         with pytest.raises(ValueConversionError) as excinfo:
             converter.convert_value("active", bad)
         message = str(excinfo.value)
         assert "active" in message
-        assert str(bad) in message
+        assert str(bad) not in message, message
+
+
+def test_value_converter_rejects_a_fractional_value_for_a_boolean() -> None:
+    # int(0.5) is 0, so the old converter loaded a fractional value as False -- silently. The
+    # CDC sink refuses the same value (ValueFit NOT_ZERO_OR_ONE), so the Full Load must too.
+    from decimal import Decimal
+
+    converter = ValueConverter(_typed_table())
+    for bad in (Decimal("0.5"), 0.5):
+        with pytest.raises(ValueConversionError):
+            converter.convert_value("active", bad)
+    assert converter.convert_value("active", Decimal("1.0")) is True
+    assert converter.convert_value("active", 1.0) is True
+    assert converter.convert_value("active", 0) is False
 
 
 def test_value_converter_target_type_override_loads_tinyint_as_smallint() -> None:
@@ -1211,6 +1226,9 @@ def test_value_converter_rejects_out_of_range_time() -> None:
         message = str(excinfo.value)
         assert "t_of_day" in message
         assert "time" in message
+        # Value-free: the column and the rule, never the value itself.
+        assert "timedelta" not in message, message
+        assert repr(bad) not in message, message
 
 
 def test_value_converter_time_boundary_values_convert() -> None:
@@ -1659,3 +1677,287 @@ def test_a_commit_failure_after_a_complete_read_still_surfaces():
     with pytest.raises(OperationalError):
         list(TableExporter(engine_factory=lambda _c: _FakeEngine(conn), batch_size=2).stream_converted_rows(
             _source_config(), _simple_table()))
+
+
+# ---------------------------------------------------------------------------
+# The Full Load value-fit check (write parity with the CDC sink's ValueFit)
+# ---------------------------------------------------------------------------
+
+
+class _DescribedConnection(_FakeConnection):
+    """A fake connection whose page results carry a DBAPI ``cursor.description``."""
+
+    def __init__(self, rows, description, **kwargs) -> None:  # noqa: ANN001
+        super().__init__(rows, **kwargs)
+        self._description = description
+
+    def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
+        result = super().execute(statement, parameters, execution_options)
+        if str(statement).strip().upper().startswith("SELECT"):
+
+            class _Cursor:
+                description = self._description
+
+            result.cursor = _Cursor()
+        return result
+
+
+def _amount_table(source_type: str = "DECIMAL(12,4)") -> TableDef:
+    return TableDef(
+        name="orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="INT"),
+            ColumnDef(name="amount", mysql_type=source_type),
+        ],
+        primary_key=["id"],
+    )
+
+
+def _specs(ddl_columns: str):
+    from dsql_migrator.core.converter import parse_target_value_specs
+
+    return parse_target_value_specs(f'CREATE TABLE "orders" ("id" integer PRIMARY KEY, {ddl_columns})')
+
+
+# pymysql's 7-tuple: (name, type_code, display_size, internal_size, precision, scale, null_ok).
+_MYSQL_ID = ("id", 3, None, 11, 11, 0, False)
+
+
+def test_full_load_refuses_a_decimal_the_target_would_round() -> None:
+    # The source DECIMAL was widened to (12,4) after Step 1 (or a narrower type was set in
+    # Schema Conversion), so the applied numeric(10,2) column would ROUND 1.2345 -- Aurora DSQL
+    # accepts it with no error. The CDC sink refuses that value; the Full Load must too, and
+    # must still load a value that fits unchanged.
+    from decimal import Decimal
+
+    fits, rounds = Decimal("1.2300"), Decimal("1.2345")
+    conn = _DescribedConnection(
+        [{"id": 1, "amount": fits}, {"id": 2, "amount": rounds}],
+        [_MYSQL_ID, ("amount", 246, None, 14, 14, 4, True)],
+    )
+    exporter = TableExporter(engine_factory=lambda _cfg: _FakeEngine(conn))
+    stream = exporter.stream_converted_rows(
+        _source_config(), _amount_table(), target_specs=_specs('"amount" numeric(10,2)')
+    )
+    first = next(stream)
+    assert first["amount"] is fits  # the same object: a value that fits is untouched
+    with pytest.raises(ValueConversionError) as excinfo:
+        next(stream)
+    message = str(excinfo.value)
+    assert "amount" in message and "numeric(10,2)" in message, message
+    assert "1.2345" not in message and "2345" not in message, message
+    # The excess is measured against the TARGET's 2 places, never the source's 4 (a
+    # DECIMAL(12,4) value cannot have "more" than 4).
+    assert "a non-zero digit beyond 2 decimal places" in message, message
+    assert "has more," not in message, message
+    assert "cannot change a column's type in place" in message
+
+
+def test_full_load_refuses_a_decimal_the_target_would_round_on_postgres() -> None:
+    # psycopg's Column is the same DB-API sequence: numeric is oid 1700, scale at index 5.
+    from decimal import Decimal
+
+    conn = _DescribedConnection(
+        [{"id": 1, "amount": Decimal("1.23")}, {"id": 2, "amount": Decimal("1.2345")}],
+        [("id", 23, None, 4, None, None, False), ("amount", 1700, None, None, 12, 4, True)],
+    )
+    exporter = TableExporter(engine_factory=lambda _cfg: _FakeEngine(conn))
+    stream = exporter.stream_converted_rows(
+        _pg_source_config(),
+        _amount_table("numeric(12,4)"),
+        target_specs=_specs('"amount" numeric(10,2)'),
+    )
+    assert next(stream)["amount"] == Decimal("1.23")
+    with pytest.raises(ValueConversionError):
+        next(stream)
+
+
+def test_full_load_refuses_a_fraction_for_an_integer_target() -> None:
+    from decimal import Decimal
+
+    # MySQL NEWDECIMAL(…,2) into an integer column: 2.00 fits, 1.50 would be rounded.
+    conn = _DescribedConnection(
+        [{"id": 1, "amount": Decimal("2.00")}, {"id": 2, "amount": Decimal("1.50")}],
+        [_MYSQL_ID, ("amount", 246, None, 12, 12, 2, True)],
+    )
+    exporter = TableExporter(engine_factory=lambda _cfg: _FakeEngine(conn))
+    stream = exporter.stream_converted_rows(
+        _source_config(), _amount_table("DECIMAL(10,2)"), target_specs=_specs('"amount" integer')
+    )
+    assert next(stream)["amount"] == Decimal("2.00")
+    with pytest.raises(ValueConversionError) as excinfo:
+        next(stream)
+    assert "fractional part" in str(excinfo.value)
+    assert "1.5" not in str(excinfo.value)
+
+    # MySQL DOUBLE (type 5) into an integer column: 3.0 fits, 0.5 would be rounded.
+    conn = _DescribedConnection(
+        [{"id": 1, "amount": 3.0}, {"id": 2, "amount": 0.5}],
+        [_MYSQL_ID, ("amount", 5, None, 22, 22, 31, True)],
+    )
+    exporter = TableExporter(engine_factory=lambda _cfg: _FakeEngine(conn))
+    stream = exporter.stream_converted_rows(
+        _source_config(), _amount_table("DOUBLE"), target_specs=_specs('"amount" integer')
+    )
+    assert next(stream)["amount"] == 3.0
+    with pytest.raises(ValueConversionError) as excinfo:
+        next(stream)
+    assert "floating point" in str(excinfo.value)
+
+
+def test_value_fit_guard_stays_off_when_types_match_or_are_unknown() -> None:
+    from decimal import Decimal
+
+    from dsql_migrator.core.exporter import ValueFitGuard
+    from dsql_migrator.core.source_dialect import dialect_for
+
+    mysql = dialect_for(SourceType.MYSQL)
+    # Same scale as the target: nothing to check (the steady state).
+    guard = ValueFitGuard(_specs('"amount" numeric(10,2)'), mysql, "orders")
+    guard.arm([_MYSQL_ID, ("amount", 246, None, 12, 12, 2, True)])
+    assert not guard.armed
+    # No description at all (a driver/fake that exposes none): off, today's behaviour.
+    guard = ValueFitGuard(_specs('"amount" numeric(10,2)'), mysql, "orders")
+    guard.arm(None)
+    assert not guard.armed
+    # An integer source into numeric(20,0): nothing can be rounded.
+    guard = ValueFitGuard(_specs('"amount" numeric(20,0)'), mysql, "orders")
+    guard.arm([_MYSQL_ID, ("amount", 3, None, 11, 11, 0, True)])
+    assert not guard.armed
+    # A DOUBLE into numeric is the documented residual (not checked, like the sink).
+    guard = ValueFitGuard(_specs('"amount" numeric(10,2)'), mysql, "orders")
+    guard.arm([_MYSQL_ID, ("amount", 5, None, 22, 22, 31, True)])
+    assert not guard.armed
+    # A malformed description never raises and leaves the check off.
+    guard = ValueFitGuard(_specs('"amount" numeric(10,2)'), mysql, "orders")
+    guard.arm([object()])
+    assert not guard.armed
+
+    # ...and an unarmed stream loads every value as before (fail open).
+    conn = _FakeConnection([{"id": 1, "amount": Decimal("1.2345")}])
+    exporter = TableExporter(engine_factory=lambda _cfg: _FakeEngine(conn))
+    out = list(
+        exporter.stream_converted_rows(
+            _source_config(), _amount_table(), target_specs=_specs('"amount" numeric(10,2)')
+        )
+    )
+    assert out[0]["amount"] == Decimal("1.2345")
+
+
+def test_postgres_unconstrained_numeric_is_exempt_only_into_the_default_numeric() -> None:
+    # A PostgreSQL numeric declared without precision is stored by Aurora DSQL at its default
+    # numeric(18,6) BY DESIGN (Schema Conversion warns; Validation compares at scale 6), so it
+    # is not refused into that default -- but it is into any narrower or integer column.
+    from decimal import Decimal
+
+    from dsql_migrator.core.exporter import ValueFitGuard
+    from dsql_migrator.core.source_dialect import dialect_for
+
+    pg = dialect_for(SourceType.POSTGRES)
+    unconstrained = [("id", 23, None, 4, None, None, False), ("amount", 1700, None, None, None, None, True)]
+    for ddl in ('"amount" numeric', '"amount" numeric(18,6)'):
+        guard = ValueFitGuard(_specs(ddl), pg, "orders")
+        guard.arm(unconstrained)
+        assert not guard.armed, ddl
+
+    guard = ValueFitGuard(_specs('"amount" numeric(10,2)'), pg, "orders")
+    guard.arm(unconstrained)
+    assert guard.armed
+    guard.check({"id": 1, "amount": Decimal("1.23")})
+    with pytest.raises(ValueConversionError) as excinfo:
+        guard.check({"id": 2, "amount": Decimal("1.234")})
+    assert "no declared scale" in str(excinfo.value)
+    assert "a non-zero digit beyond 2 decimal places" in str(excinfo.value)
+
+    guard = ValueFitGuard(_specs('"amount" integer'), pg, "orders")
+    guard.arm(unconstrained)
+    assert guard.armed
+    guard.check({"id": 1, "amount": Decimal("5")})
+    with pytest.raises(ValueConversionError):
+        guard.check({"id": 2, "amount": Decimal("5.5")})
+
+
+def test_a_constrained_source_decimal_is_refused_into_the_default_numeric() -> None:
+    # The exemption above is for an UNCONSTRAINED source numeric only. A MySQL DECIMAL(18,6)
+    # maps to numeric(18,6) -- the default-numeric shape -- so a source widened to
+    # DECIMAL(20,8) (or a PostgreSQL numeric(20,8)) must still be refused, not exempted.
+    from decimal import Decimal
+
+    from dsql_migrator.core.exporter import ValueFitGuard
+    from dsql_migrator.core.source_dialect import dialect_for
+
+    shapes = (
+        (SourceType.MYSQL, [_MYSQL_ID, ("amount", 246, None, 22, 22, 8, True)]),
+        (SourceType.POSTGRES, [("id", 23, None, 4, None, None, False),
+                               ("amount", 1700, None, None, 20, 8, True)]),
+    )
+    for source_type, description in shapes:
+        for ddl in ('"amount" numeric', '"amount" numeric(18,6)'):
+            guard = ValueFitGuard(_specs(ddl), dialect_for(source_type), "orders")
+            guard.arm(description)
+            assert guard.armed, (source_type, ddl)
+            guard.check({"id": 1, "amount": Decimal("1.12345600")})
+            with pytest.raises(ValueConversionError) as excinfo:
+                guard.check({"id": 2, "amount": Decimal("1.12345678")})
+            assert "8 decimal places" in str(excinfo.value)
+            assert "12345678" not in str(excinfo.value)
+
+
+def test_value_fit_guard_arms_once_per_stream() -> None:
+    # The decision is made from the FIRST page only: every page runs in one snapshot.
+    seen: list[object] = []
+    conn = _DescribedConnection(
+        [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}, {"id": 3, "name": "c"}],
+        [_MYSQL_ID, ("name", 253, None, 100, 100, 0, True)],
+    )
+    out = list(keyset_stream(conn, _simple_table(), batch_size=1, on_description=seen.append))
+    assert [r["id"] for r in out] == [1, 2, 3]
+    assert conn.page_queries > 1
+    assert len(seen) == 1 and seen[0][0][0] == "id"
+    # A result with no cursor reports None, once.
+    seen.clear()
+    list(keyset_stream(_FakeConnection([{"id": 1, "name": "a"}]), _simple_table(),
+                       on_description=seen.append))
+    assert seen == [None]
+
+
+def _catalog_type_sql(data_type: str, precision: str, scale: str) -> str:
+    """The type name the sink's ValueFit.TargetType.fromCatalog gives this catalog row."""
+    if data_type == "numeric":
+        if precision == "-" or scale == "-":
+            return "numeric (Aurora DSQL default numeric(18,6))"
+        return f"numeric({precision},{scale})"
+    return data_type
+
+
+def test_value_fit_rule_matches_the_shared_contract() -> None:
+    # One verdict table for both write paths: the sink asserts it in ValueFitTest, this asserts
+    # it for the Full Load. A row the two disagree on is a write-parity break.
+    from decimal import Decimal
+    from pathlib import Path
+
+    from dsql_migrator.core.converter import parse_target_value_specs
+    from dsql_migrator.core.exporter import value_fit_rule
+
+    contract = Path(__file__).parent / "fixtures" / "value_fit_contract.tsv"
+    java_copy = (
+        Path(__file__).parent.parent
+        / "connectors/dsql-sink/src/test/resources/value_fit_contract.tsv"
+    )
+    assert contract.read_bytes() == java_copy.read_bytes(), (
+        "tests/fixtures/value_fit_contract.tsv and the sink's test-resource copy differ"
+    )
+    lines = [
+        line for line in contract.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    header, rows = lines[0].split("\t"), [line.split("\t") for line in lines[1:]]
+    assert header[-1] == "expected" and len(rows) >= 20
+    for row in rows:
+        data_type, precision, scale, ddl_type, value_kind, value, unconstrained, expected = row
+        spec = parse_target_value_specs(f"CREATE TABLE t (c {ddl_type})")["c"]
+        # The DDL reading and the sink's catalog reading name the type identically.
+        assert spec.type_sql == _catalog_type_sql(data_type, precision, scale), row
+        typed = {"int": int, "decimal": Decimal, "double": float}[value_kind](value)
+        verdict = value_fit_rule(typed, spec, unconstrained_source=unconstrained == "true")
+        assert (verdict or "fit") == expected, row

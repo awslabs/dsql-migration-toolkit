@@ -352,7 +352,7 @@ Schema Conversion の後は、**DSQL ターゲットスキーマが確定** し�
 | MySQL 型 | Aurora DSQL 型 | 格納される値の形式 | 分類 | 備考 |
 |---|---|---|---|---|
 | `TINYINT` | `smallint` | `smallint` | AUTO | 符号付き 8 ビット。 |
-| `TINYINT(1)` | `boolean` | `boolean` (`true`/`false`) | MANUAL | MySQL の boolean 慣例。`0/1`→`false/true`。`{0,1}` **の範囲外の値は明示的に失敗** します (サイレントな平坦化はありません)。 |
+| `TINYINT(1)` | `boolean` | `boolean` (`true`/`false`) | MANUAL | MySQL の boolean 慣例。`0/1`→`false/true`。`{0,1}` **の範囲外の値は拒否** します (サイレントな平坦化はありません): Full Load はテーブルを停止し、CDC はその行をデッドレターにします。列にほかの値がある場合は、ここで型を `smallint` に編集してください。 |
 | `SMALLINT` | `smallint` | `smallint` | AUTO | 符号付き 16 ビット。 |
 | `MEDIUMINT` | `integer` | `integer` | AUTO | PostgreSQL には 3 バイト整数がありません。`integer` が符号付き 24 ビット範囲をカバーします。 |
 | `INT` / `INTEGER` | `integer` | `integer` | AUTO | 符号付き 32 ビット。 |
@@ -369,7 +369,7 @@ Schema Conversion の後は、**DSQL ターゲットスキーマが確定** し�
 
 | MySQL 型 | Aurora DSQL 型 | 格納される値の形式 | 分類 | 備考 |
 |---|---|---|---|---|
-| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 精度/スケールを保持。**精度 > 38** は Evaluation で **UNSUPPORTED** と表示されます (DSQL は NUMERIC を 38 に制限) が、Schema Conversion は **`numeric(38,37)` にクランプ**し、データ損失の警告とともに DDL を出力します (スケールも 37 に制限)。 |
+| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 精度/スケールを保持。**精度 > 38** は Evaluation で **UNSUPPORTED** と表示されます (DSQL は NUMERIC を 38 に制限) が、Schema Conversion は **`numeric(38,37)` にクランプ**し、データ損失の警告とともに DDL を出力します (スケールも 37 に制限)。ターゲットが保持するより小数桁の多い値 (Step 1 の後で広げられたソース、またはここで指定したより狭い型) は、Full Load と CDC のどちらでも丸めずに拒否します。 |
 | `DECIMAL(p,s) UNSIGNED` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 符号なしは表現できず、格納上の意味を持ちません。 |
 | `FLOAT` | `real` | `real` | AUTO | 単精度 float。 |
 | `FLOAT(M,D)` | `real` | `real` | AUTO | `(M,D)` 表示仕様はドロップされます (PostgreSQL の `float` はスケールではなく 1 つの精度を取ります)。 |

@@ -2305,21 +2305,38 @@ def cdc_schema_drift_summary(migration_state, log_key: str) -> list:
     means "no source DDL detected". Built from the whole error log (not the
     per-poll delta) so the count is cumulative and survives a restored session.
     Best-effort and pure; never raises into the poller.
+
+    A ``value-does-not-fit`` group also carries the ``"<column> <type>"`` descriptors the
+    sink named (at most :data:`_VALUE_FIT_COLUMN_LIMIT`, first-seen order), so the banner can
+    say which column needs a type that holds the values. Other kinds carry none.
     """
-    from dsql_migrator.core.cdc import classify_schema_drift
+    from dsql_migrator.core.cdc import SchemaDriftKind, classify_schema_drift
+    from dsql_migrator.core.cdc_dlq import value_fit_column_from_reason
     from dsql_migrator.core.models import SchemaDriftSummary
 
     counts: dict[tuple[str, str], int] = {}
+    columns: dict[tuple[str, str], list[str]] = {}
     for record in cdc_dlq_records(migration_state, log_key):
         kind = classify_schema_drift(getattr(record, "error_code", None))
         if kind is None:
             continue
         key = (record.table, kind.value)
         counts[key] = counts.get(key, 0) + 1
+        if kind is SchemaDriftKind.VALUE_DOES_NOT_FIT:
+            seen = columns.setdefault(key, [])
+            column = value_fit_column_from_reason(getattr(record, "message", ""))
+            if column and column not in seen and len(seen) < _VALUE_FIT_COLUMN_LIMIT:
+                seen.append(column)
     return [
-        SchemaDriftSummary(table=table, kind=kind, count=count)
+        SchemaDriftSummary(
+            table=table, kind=kind, count=count, columns=columns.get((table, kind), [])
+        )
         for (table, kind), count in sorted(counts.items())
     ]
+
+
+# How many "<column> <type>" descriptors one value-does-not-fit group names.
+_VALUE_FIT_COLUMN_LIMIT = 6
 
 
 # How long between two logged applied-rows roll-ups. The CDC status poll runs every few

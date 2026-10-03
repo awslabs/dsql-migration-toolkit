@@ -1321,3 +1321,32 @@ def test_table_proof_reason_is_the_gates_own_ladder(item, kw, expected):
     if args["started"] is not None:
         naive = dict(args, started=args["started"].replace(tzinfo=None))
         assert table_proof_reason(item, **naive) == expected
+
+
+@pytest.mark.parametrize("migration_type", ["FULL_LOAD_AND_CDC", "FULL_LOAD_ONLY", "CDC_ONLY"])
+def test_a_value_fit_dead_letter_gets_its_own_way_forward_line(migration_type):
+    """A row the sink refused because its Aurora DSQL column would change the value needs a
+    column type that holds the values -- and Aurora DSQL can only give it one by recreating
+    the table (no ALTER COLUMN ... TYPE). It is not a schema-change claim: a MySQL TINYINT(1)
+    holding 2 involved no DDL at all."""
+    from dsql_migrator.core.cdc import SchemaDriftKind
+    from dsql_migrator.ui.cdc_dlq_gate import _VALUE_FIT_KIND, way_forward_lines
+    from dsql_migrator.ui.data_migration import MigrationType
+
+    assert _VALUE_FIT_KIND == SchemaDriftKind.VALUE_DOES_NOT_FIT.value
+    gate = dataclasses.replace(
+        _gate(
+            ledger={"app.t": _entry(kinds=["value-does-not-fit"])},
+            report=_report(_item(checksum=None)),
+        ),
+        migration_type=MigrationType[migration_type],
+    )
+    steps = way_forward_lines(gate)
+    (line,) = [s for s in steps if "cannot store exactly" in s]
+    assert line.startswith("Records for app.t hold a value their Aurora DSQL column")
+    assert "cannot change a column's type in place" in line
+    assert not any("show a source schema change" in s for s in steps)
+    if migration_type == "CDC_ONLY":
+        assert "by hand" in line and "Start over" in line
+    else:
+        assert "Replace" in line and "Schema Conversion" in line

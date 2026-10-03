@@ -512,6 +512,15 @@ class SchemaDriftKind(str, Enum):
     # Validation's row count/checksum would ever report it, after the cut-over decision was
     # already being made.
     SOURCE_TRUNCATE = "source-truncate"  # sink code SOURCE_TRUNCATE (no SQLSTATE)
+    # The sink's own PRE-WRITE refusal of a value Aurora DSQL would ACCEPT and silently
+    # change, so there is no server error and no SQLSTATE (sink ValueFit, plugin v51+): a
+    # number other than 0 or 1 for a boolean column (stored as true/false), more decimal
+    # places than a numeric(p,s) keeps, or a fraction for an integer column (both rounded).
+    # NOT always a DDL change: a MySQL TINYINT(1) can hold 2..127 with no ALTER at all, and a
+    # type narrowed in Schema Conversion produces it too -- so the banner must not announce a
+    # source schema change for it. Before the guard these values landed changed, with no
+    # dead letter; only a CHECKSUM could see them.
+    VALUE_DOES_NOT_FIT = "value-does-not-fit"  # sink code VALUE_DOES_NOT_FIT (no SQLSTATE)
 
 
 # SQLSTATE -> drift kind. Only STRUCTURAL rejections (tied to the row's column set
@@ -527,12 +536,13 @@ class SchemaDriftKind(str, Enum):
 # per-table data hole. Unmapped, it rendered as an ordinary poison row: no banner, and
 # under 50 records not even an amber DLQ badge.
 #
-# SOURCE_TRUNCATE is the one key that is NOT a SQLSTATE: the sink refuses a source TRUNCATE
-# before it sends anything to DSQL, so there is no server error and no SQLSTATE to report --
-# exactly like the oversized-value guard, whose synthetic OVERSIZED_VALUE_CODE is deliberately
-# left UNMAPPED here. This one IS mapped because the divergence it reports is real and
-# invisible to every other CDC-time surface. Both synthetic codes are non-5-character by
-# construction, so neither can ever collide with a real SQLSTATE.
+# SOURCE_TRUNCATE and VALUE_DOES_NOT_FIT are the keys that are NOT a SQLSTATE: the sink refuses
+# a source TRUNCATE, and a value its target column would silently change, before it sends
+# anything to DSQL, so there is no server error and no SQLSTATE to report -- exactly like the
+# oversized-value guard, whose synthetic OVERSIZED_VALUE_CODE is deliberately left UNMAPPED
+# here. These two ARE mapped because the divergence each reports is real and invisible to
+# every other CDC-time surface. The synthetic codes are non-5-character by construction, so
+# none can ever collide with a real SQLSTATE.
 _DRIFT_BY_SQLSTATE: dict[str, SchemaDriftKind] = {
     "42703": SchemaDriftKind.ADD_COLUMN,
     "23502": SchemaDriftKind.DROP_COLUMN,
@@ -542,6 +552,7 @@ _DRIFT_BY_SQLSTATE: dict[str, SchemaDriftKind] = {
     "23505": SchemaDriftKind.UNIQUE_CONFLICT,
     "07006": SchemaDriftKind.UNBINDABLE_VALUE,
     "SOURCE_TRUNCATE": SchemaDriftKind.SOURCE_TRUNCATE,
+    "VALUE_DOES_NOT_FIT": SchemaDriftKind.VALUE_DOES_NOT_FIT,
 }
 
 
@@ -620,15 +631,17 @@ def stack_has_seeder_lambda(
 
 
 def classify_schema_drift(error_code: Optional[str]) -> Optional[SchemaDriftKind]:
-    """Map a sink-quarantine SQLSTATE to a source-schema-drift kind, else ``None``.
+    """Map a sink-quarantine SQLSTATE (or synthetic sink code) to a drift kind, else ``None``.
 
-    Pure: the single source of truth for "which SQLSTATE means which drift". Only the
-    three STRUCTURAL SQLSTATEs map -- rejections determined by the row's COLUMN SET or
-    a column's DECLARED TYPE, which a source DDL change produces:
-    ``42703`` (a column the target lacks -> ADD COLUMN), ``23502`` (a NOT NULL target
-    column got no value -> a dropped source column), ``42804`` (datatype_mismatch ->
-    TYPE CHANGE), and ``42P01`` / ``3F000`` (the TARGET table or schema is gone ->
-    MISSING TABLE -- the one target-side kind).
+    Pure: the single source of truth for "which code means which drift". The keys are:
+    the STRUCTURAL SQLSTATEs -- rejections determined by the row's COLUMN SET or a
+    column's DECLARED TYPE, which a source DDL change produces: ``42703`` (a column the
+    target lacks -> ADD COLUMN), ``23502`` (a NOT NULL target column got no value -> a
+    dropped source column), ``42804`` (datatype_mismatch -> TYPE CHANGE); ``42P01`` /
+    ``3F000`` (the TARGET table or schema is gone -> MISSING TABLE); ``23505`` (a unique
+    index rejected the row -> UNIQUE CONFLICT); ``07006`` (the sink could not bind a value
+    -> UNBINDABLE VALUE); and the sink's two synthetic, non-SQLSTATE codes for refusals made
+    before anything is sent: ``SOURCE_TRUNCATE`` and ``VALUE_DOES_NOT_FIT``.
 
     A class ``22`` data exception (``22001`` string-too-long / ``22003`` numeric range
     / ``22007`` bad datetime / ``22P02`` bad text) is deliberately NOT drift: it is a
@@ -636,6 +649,10 @@ def classify_schema_drift(error_code: Optional[str]) -> Optional[SchemaDriftKind
     mapping it to TYPE_CHANGE fired a false "source changed a column's type" banner on
     every oversized/out-of-range poison row. Such a code (and any other unknown /
     ``None`` code) returns ``None`` so it stays an ordinary quarantine, not drift.
+    ``VALUE_DOES_NOT_FIT`` is per-value too, but it IS mapped: Aurora DSQL would have
+    ACCEPTED those values and stored them changed, so there is no server error behind
+    it, and without its own banner (which never calls it a schema change) a row the sink
+    refused for this reason would be one more anonymous poison row.
     """
     if not error_code:
         return None

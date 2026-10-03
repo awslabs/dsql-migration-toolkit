@@ -452,8 +452,12 @@ class _FakeExporter:
         on_throttle=None,
         on_pause_slice=None,
         shared_snapshot_id=None,
+        target_specs=None,
     ) -> list[dict]:
         self.on_pause_slice = on_pause_slice
+        # The applied DDL's precision/scale specs the reader's value-fit check receives.
+        self.target_specs_by_table = getattr(self, "target_specs_by_table", {})
+        self.target_specs_by_table[table.name] = target_specs
         self.shared_snapshot_ids = getattr(self, "shared_snapshot_ids", [])
         self.shared_snapshot_ids.append(shared_snapshot_id)
         self.streamed.append(table.name)
@@ -11712,6 +11716,62 @@ def test_migrate_table_passes_applied_target_types_to_exporter() -> None:
         "id": "uuid",
         "active": "smallint",
     }
+
+
+def test_full_load_hands_target_value_specs_to_the_reader(monkeypatch) -> None:
+    """Both read paths pass the APPLIED DDL's precision/scale to the value-fit check.
+
+    Without them the reader cannot tell that a source DECIMAL widened after Step 1 would be
+    rounded by the numeric(10,2) column Schema Conversion created, so the value loads changed.
+    Pinned on the in-process path (migrate_table) and on the shard worker, which builds its
+    own read arguments.
+    """
+    import dataclasses
+
+    from dsql_migrator.core.converter import TableConversion
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    applied = TableConversion(
+        table="orders",
+        target_ddl='CREATE TABLE "orders" ("id" integer PRIMARY KEY, "price" numeric(10,2))',
+    )
+    inputs = dataclasses.replace(_inputs(), table_conversions={"orders": applied})
+
+    exporter = _FakeExporter(rows_by_table={"orders": [{"id": 1}]})
+    migrator = BatchedTableMigrator(
+        inputs,
+        exporter=exporter,  # type: ignore[arg-type]
+        watermark_capturer=_FakeWatermarkCapturer(_watermark()),  # type: ignore[arg-type]
+        importer_factory=lambda _i: _FakeImporter(),  # type: ignore[arg-type,return-value]
+    )
+    migrator.migrate_table(_tables()[0])
+    assert exporter.target_specs_by_table["orders"]["price"].scale == 2
+
+    shard_exporter = _FakeExporter()
+
+    class _NoopImporter:
+        def import_rows(self, rows, _table, **_kw):
+            list(rows)
+            return BatchedImportResult(rows_loaded=1, failures=0)
+
+    monkeypatch.setattr(
+        _engine, "BatchedTableMigrator",
+        lambda inp: BatchedTableMigrator(
+            inp, exporter=shard_exporter,
+            watermark_capturer=_FakeWatermarkCapturer(_watermark()),
+            importer_factory=lambda _i: _NoopImporter(),
+            target_counter=lambda _t: None,
+        ),
+    )
+    result = _engine._migrate_shard_in_process(
+        _engine._ShardWorkerArgs(
+            job_id="j", table=_tables()[0],
+            inputs=dataclasses.replace(inputs, replace_tables=frozenset()),
+            pk_lower=0, pk_upper=1000, shard_index=0,
+        )
+    )
+    assert result.status == "DONE"
+    assert shard_exporter.target_specs_by_table["orders"]["price"].scale == 2
 
 
 def test_migrate_table_derives_target_types_when_the_run_carries_no_conversion() -> None:

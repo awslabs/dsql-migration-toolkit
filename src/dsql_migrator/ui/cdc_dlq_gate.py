@@ -734,6 +734,11 @@ _OVERSIZED_LABEL = "a value over Aurora DSQL's per-value limit"
 _SCHEMA_CHANGE_KINDS = frozenset({"add-column", "drop-column", "type-change"})
 # core.cdc.SchemaDriftKind.SOURCE_TRUNCATE (kept a literal like the kinds above).
 _SOURCE_TRUNCATE_KIND = "source-truncate"
+# core.cdc.SchemaDriftKind.VALUE_DOES_NOT_FIT: the sink refused a value its Aurora DSQL column
+# would change. Not a schema-change claim (a MySQL TINYINT(1) holds 2 with no DDL), so it is not
+# in _SCHEMA_CHANGE_KINDS; it gets its own "What to do" line, because the remedy is a column
+# type that holds the values, and Aurora DSQL can only give it one by recreating the table.
+_VALUE_FIT_KIND = "value-does-not-fit"
 
 
 def _kind_label(kind: str) -> str:
@@ -884,6 +889,25 @@ def way_forward_lines(gate: CdcDlqGate) -> list[str]:
             f"Records for {names} show a source schema change: re-run Step 1 (Evaluation) "
             "and align the Aurora DSQL table before you reload."
         )
+    unfit = [i for i in gate.issues if _VALUE_FIT_KIND in i.kinds]
+    if unfit:
+        names = ", ".join(i.table for i in unfit[:_NAME_LIMIT]) + (
+            f" (+{len(unfit) - _NAME_LIMIT} more)" if len(unfit) > _NAME_LIMIT else ""
+        )
+        if _is_type(gate.migration_type, "CDC_ONLY"):
+            lines.append(
+                f"Records for {names} hold a value their Aurora DSQL column cannot store "
+                "exactly: with CDC stopped, give that column a type that holds the values on "
+                "Aurora DSQL by hand (Aurora DSQL cannot change a column's type in place), or "
+                "use Start over."
+            )
+        else:
+            lines.append(
+                f"Records for {names} hold a value their Aurora DSQL column cannot store "
+                "exactly: Aurora DSQL cannot change a column's type in place, so re-apply these "
+                "tables in Schema Conversion with Replace and a type that holds the values "
+                "(re-run Step 1 first if the source type changed) before you reload."
+            )
     return lines
 
 

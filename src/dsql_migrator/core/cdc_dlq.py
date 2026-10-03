@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterable, Mapping, Optional
 
-from dsql_migrator.core.cdc import CdcConnectorError, classify_schema_drift
+from dsql_migrator.core.cdc import CdcConnectorError, SchemaDriftKind, classify_schema_drift
 from dsql_migrator.core.models import CdcDlqLedgerEntry
 
 # One regex handles both the "Quarantined record to DLQ (...)" and the
@@ -91,6 +91,20 @@ _OVERSIZED = re.compile(r"exceeds DSQL's\s+\d+-byte limit", re.IGNORECASE)
 SOURCE_TRUNCATE_CODE = "SOURCE_TRUNCATE"
 _SOURCE_TRUNCATE = re.compile(r"Cannot apply a source TRUNCATE", re.IGNORECASE)
 
+# The same shape for the sink's value-fit guard (ValueFit, plugin v51+): it refuses, before
+# sending anything to DSQL, a number its Aurora DSQL column would ACCEPT and silently change (a
+# number other than 0/1 for a boolean, more decimal places than numeric(p,s) keeps, a fraction
+# for an integer column). No server error, so no SQLSTATE. Mapped by classify_schema_drift (to
+# SchemaDriftKind.VALUE_DOES_NOT_FIT) because those values used to land changed with no signal
+# at all. Anchored on the sink's exact leading phrase (ValueFit.REASON_PREFIX) and only
+# consulted when no SQLSTATE was reported, so it can never reclassify a real server rejection.
+VALUE_DOES_NOT_FIT_CODE = "VALUE_DOES_NOT_FIT"
+_VALUE_DOES_NOT_FIT = re.compile(r"Value does not fit target column '", re.IGNORECASE)
+# The column and its Aurora DSQL type, which the reason names (never the value).
+_VALUE_FIT_COLUMN = re.compile(
+    r"Value does not fit target column '(?P<column>[^']+)' of type (?P<type>[^:]+):"
+)
+
 # The reason may carry the sink's rendered SQL TEMPLATE (column names + `?`
 # placeholders, never values), so allow a longer message than a bare error string
 # while still bounding it so a pathological line can't bloat the error log.
@@ -116,6 +130,20 @@ def oversized_column_from_reason(message: Optional[str]) -> Optional[str]:
         return None
     match = _OVERSIZED_COLUMN.search(message)
     return match.group("column") if match else None
+
+
+def value_fit_column_from_reason(message: Optional[str]) -> Optional[str]:
+    """``"<column> <type>"`` a value-fit refusal names (e.g. ``"amount numeric(10,2)"``). Pure.
+
+    ``None`` when the message is not a value-fit refusal (or a future sink wording stops
+    naming the column), so the banner simply lists no column rather than a guess.
+    """
+    if not message:
+        return None
+    match = _VALUE_FIT_COLUMN.search(message)
+    if match is None:
+        return None
+    return f"{match.group('column')} {match.group('type').strip()}"
 
 
 def _table_from_topic(topic: str) -> str:
@@ -177,6 +205,8 @@ def parse_dlq_log_message(
         error_code = OVERSIZED_VALUE_CODE
     if error_code is None and _SOURCE_TRUNCATE.search(reason):
         error_code = SOURCE_TRUNCATE_CODE
+    if error_code is None and _VALUE_DOES_NOT_FIT.search(reason):
+        error_code = VALUE_DOES_NOT_FIT_CODE
     pk_match = _PK.search(reason)
     op_match = _OP.search(reason)
     op = None
@@ -215,9 +245,10 @@ def parse_dlq_log_message(
 # or shrink the value -- a re-check alone cannot clear it.
 OVERSIZED_VALUE_KIND = "oversized-value"
 # Bound on the kind labels kept per table, so a pathological table cannot bloat the snapshot.
-# It equals today's number of kinds (the seven SchemaDriftKind values plus "oversized-value"),
-# so it is unreachable from real records and only guards against kinds added later.
-_LEDGER_MAX_KINDS = 8
+# DERIVED from the enum (every SchemaDriftKind value plus "oversized-value"), so it is
+# unreachable from real records and a kind added later can never be silently dropped from the
+# ledger that holds Cut over (a fixed 8 had already fallen behind the enum once).
+_LEDGER_MAX_KINDS = len(SchemaDriftKind) + 1
 
 
 def _aware(value: Optional[datetime]) -> Optional[datetime]:
