@@ -74,6 +74,10 @@ class _Recorder:
         self.existing_records = []  # _FakeMsg list the consumer will return
         self.topic_partitions = {0}  # partitions_for_topic result (empty -> none)
         self.create_raises = None  # set to an exception class to simulate exists
+        self.existing_topics = []  # what list_topics returns (topics that exist)
+        self.throttled_calls = 0   # admin calls that fail "Node paused" before succeeding
+        self.list_topics_calls = 0
+        self.create_calls = 0
 
 
 def _install_fakes(recorder: _Recorder) -> list[str]:
@@ -112,11 +116,28 @@ def _install_fakes(recorder: _Recorder) -> list[str]:
     class _TopicAlreadyExistsError(Exception):
         pass
 
+    class _NodeNotReadyError(Exception):
+        # kafka-python raises this on a request sent while the broker connection is
+        # paused for a throttle (MSK Serverless throttles CreateTopics).
+        pass
+
+    def _maybe_throttled():
+        if recorder.throttled_calls > 0:
+            recorder.throttled_calls -= 1
+            raise _NodeNotReadyError("Node paused: {'throttle'}")
+
     class _FakeAdmin:
         def __init__(self, **kw):
             pass
 
+        def list_topics(self):
+            recorder.list_topics_calls += 1
+            _maybe_throttled()
+            return list(recorder.existing_topics)
+
         def create_topics(self, topics):
+            recorder.create_calls += 1
+            _maybe_throttled()
             if recorder.create_raises is not None:
                 raise recorder.create_raises()
             for t in topics:
@@ -207,6 +228,7 @@ def _install_fakes(recorder: _Recorder) -> list[str]:
 
     errors_mod = types.ModuleType("kafka.errors")
     errors_mod.TopicAlreadyExistsError = _TopicAlreadyExistsError
+    errors_mod.NodeNotReadyError = _NodeNotReadyError
 
     kafka.admin = admin_mod
     kafka.errors = errors_mod
@@ -217,6 +239,7 @@ def _install_fakes(recorder: _Recorder) -> list[str]:
 
     # Expose the exception type so a test can trigger the "topic already exists" path.
     recorder.TopicAlreadyExistsError = _TopicAlreadyExistsError
+    recorder.NodeNotReadyError = _NodeNotReadyError
     return added
 
 
@@ -935,3 +958,57 @@ def test_committed_zip_embeds_current_lambda_sources() -> None:
                 "-- rebuild connectors/plugins/offset-seeder-lambda.zip (and bump "
                 "PLUGIN_VERSION) so the shipped Lambda matches the source tree"
             )
+
+
+# --- Start after a Stop: MSK Serverless throttles CreateTopics (seen live) -------------
+
+
+def test_a_restart_sends_no_create_topics_for_data_topics_that_exist(seeder_env) -> None:
+    """Every Start after a Stop re-runs the topic prep against topics that all exist. A
+    CreateTopics per existing topic is what MSK Serverless throttled (the next request on
+    the paused connection failed "Node paused: {'throttle'}" and Start CDC rolled back);
+    the existing topics are now read once and none of them is re-created."""
+    module, recorder = seeder_env
+    recorder.topic_partitions = set()
+    recorder.existing_topics = ["dsqlcdc.app.a", "dsqlcdc.app.b", "dsqlcdc.app.c"]
+    module._ensure_data_topics("boot:9098", "ap-northeast-2",
+                               "dsqlcdc.app.a,dsqlcdc.app.b,dsqlcdc.app.c", 1)
+    assert recorder.list_topics_calls == 1
+    assert recorder.create_calls == 0 and recorder.created_topics == []
+
+
+def test_only_the_missing_data_topics_are_created(seeder_env) -> None:
+    module, recorder = seeder_env
+    recorder.existing_topics = ["dsqlcdc.app.a"]
+    module._ensure_data_topics("boot:9098", "ap-northeast-2", "dsqlcdc.app.a,dsqlcdc.app.b", 1)
+    assert [name for name, _p, _c in recorder.created_topics] == ["dsqlcdc.app.b"]
+
+
+def test_a_throttled_admin_request_is_waited_out_and_retried(seeder_env, monkeypatch) -> None:
+    module, recorder = seeder_env
+    slept: list = []
+    monkeypatch.setattr(module.time, "sleep", slept.append)
+    recorder.throttled_calls = 3  # the first three requests hit a paused connection
+    module._ensure_data_topics("boot:9098", "ap-northeast-2", "dsqlcdc.app.b", 1)
+    assert [name for name, _p, _c in recorder.created_topics] == ["dsqlcdc.app.b"]
+    assert slept == [0.5, 1.0, 2.0]  # exponential backoff, then the request goes through
+    assert recorder.list_topics_calls == 4 and recorder.create_calls == 1
+
+
+def test_a_throttle_that_never_clears_still_fails_loudly(seeder_env, monkeypatch) -> None:
+    module, recorder = seeder_env
+    monkeypatch.setattr(module.time, "sleep", lambda _s: None)
+    recorder.throttled_calls = 10 ** 6
+    with pytest.raises(recorder.NodeNotReadyError):
+        module._ensure_data_topics("boot:9098", "ap-northeast-2", "dsqlcdc.app.b", 1)
+    assert recorder.list_topics_calls == module._THROTTLE_RETRIES  # bounded
+
+
+def test_offset_and_dlq_topic_creation_are_throttle_tolerant_too(seeder_env, monkeypatch) -> None:
+    module, recorder = seeder_env
+    monkeypatch.setattr(module.time, "sleep", lambda _s: None)
+    recorder.throttled_calls = 1
+    module._ensure_compact_topic("boot:9098", "ap-northeast-2", "offsets", 1)
+    recorder.throttled_calls = 1
+    module._ensure_dlq_topic("boot:9098", "ap-northeast-2", "dsql-sink-dlq", 4194304)
+    assert {name for name, _p, _c in recorder.created_topics} == {"offsets", "dsql-sink-dlq"}

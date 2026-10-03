@@ -22,13 +22,14 @@ CDC and source schema changes (DDL), hardened end to end: a change that CDC cann
 - **A value its Aurora DSQL column cannot hold exactly is refused, not changed:** a number other than 0/1 into boolean, extra fractional digits into numeric(p,s), or a fraction into an integer column is dead-lettered (CDC) or quarantined (Full Load) instead of being stored as true or rounded.
 - **Every reachable rejection gets the right drift kind and a DSQL-valid remedy** (key change 42P10, CHECK/ENUM 23514, NULL-rule change 23502, value does not fit 22001/22003). "Fix target schema" never adds a key column, renames instead of adding for a renamed column, and never adds a column an exclusion rule matches.
 - **A MySQL source TRUNCATE is dead-lettered and flagged** like PostgreSQL (it was skipped silently).
+- **Start CDC after Stop CDC no longer fails on MySQL.** The in-VPC topic prep re-sent a CreateTopics for every existing topic; MSK Serverless throttled it and the bundled Kafka client failed instead of waiting, so the stack update rolled back. It now creates only missing topics and waits out a throttle (found by the live check).
 - **A drifting table no longer slows the other tables** on the sink (its rows go one per transaction for a bounded cool-down).
 - **MySQL JSON columns are oversized-value candidates** like LONGTEXT (Evaluation, Schema Conversion note, exclusion offer, Check sizes).
 - Exclude tables & columns: the Result counts warnings instead of repeating Review all. Start Full Load and Deploy CDC infrastructure dialogs are wider, statements are labelled "(DSQL)", and the Deploy dialog lists the capture list once when it equals the excluded columns.
 
 ### Upgrade notes
 
-- The sink plugin is now **v51**. A deployed cdc-stack keeps running v50 until you **Delete CDC infrastructure and Deploy it again**; the TRUNCATE capture and the new start modes apply at the next Start CDC.
+- The sink plugin is now **v51**, and the offset-seeder Lambda is fixed. A deployed cdc-stack keeps running v50 and the old seeder (so Start after Stop can still fail on MySQL) until you **Delete CDC infrastructure and Deploy it again**; the TRUNCATE capture and the new start modes apply at the next Start CDC.
 - Expect new holds: Cut over may now wait for a CHECKSUM on tables that dead-lettered or drifted, and a Full Load may quarantine a value it used to round. MySQL JSON columns now count as MANUAL in Evaluation (the score may drop; nothing new is blocked).
 - Not exercised live yet: the exact DSQL SQLSTATEs for the new kinds, the PostgreSQL catalog re-check, and the v51 sink behaviours on a real stream.
 

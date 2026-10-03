@@ -22,13 +22,14 @@ CDC와 소스 스키마 변경(DDL) 처리를 전 구간에서 보강했습니�
 - **Aurora DSQL 컬럼에 정확히 들어가지 않는 값은 바꾸지 않고 거부합니다:** boolean에 0/1이 아닌 숫자, numeric(p,s)에 넘치는 소수 자리, 정수 컬럼에 소수가 오면 true로 저장하거나 반올림하지 않고 DLQ(CDC) 또는 격리(Full Load)합니다.
 - **발생 가능한 모든 거부가 맞는 드리프트 종류와 DSQL에서 쓸 수 있는 해결 방법을 가집니다**(키 변경 42P10, CHECK/ENUM 23514, NULL 규칙 변경 23502, 값이 맞지 않음 22001/22003). "Fix target schema"는 키 컬럼을 추가하지 않고, 이름이 바뀐 컬럼은 추가 대신 이름 변경을 제안하며, 제외 규칙에 해당하는 컬럼은 추가하지 않습니다.
 - **MySQL 소스의 TRUNCATE도 DLQ로 보내고 표시합니다**(PostgreSQL과 동일, 이전에는 조용히 건너뜀).
+- **MySQL에서 Stop CDC 후 Start CDC가 더 이상 실패하지 않습니다.** VPC 안의 토픽 준비 단계가 이미 있는 토픽마다 CreateTopics를 다시 보내 MSK Serverless의 throttle에 걸렸고, 번들된 Kafka 클라이언트가 기다리지 않고 실패해 스택 업데이트가 롤백됐습니다. 이제 없는 토픽만 만들고 throttle은 기다렸다가 다시 시도합니다(라이브 검증 중 발견).
 - **드리프트가 생긴 테이블이 다른 테이블을 느리게 하지 않습니다**(그 테이블만 일정 시간 행 단위로 처리).
 - **MySQL JSON 컬럼도 큰 값 후보입니다**(LONGTEXT와 동일: Evaluation, Schema Conversion 안내, 제외 제안, Check sizes).
 - Exclude tables & columns: Result는 Review all의 경고를 반복하지 않고 개수만 보여줍니다. Start Full Load와 Deploy CDC infrastructure 다이얼로그가 넓어졌고, statements 앞에 "(DSQL)"을 붙였으며, Deploy 다이얼로그는 capture list가 제외 컬럼과 같으면 한 번만 보여줍니다.
 
 ### 업그레이드 참고
 
-- sink 플러그인이 **v51**이 되었습니다. 이미 배포된 cdc-stack은 **Delete CDC infrastructure 후 다시 Deploy**하기 전까지 v50으로 동작합니다. TRUNCATE 캡처와 새 시작 모드는 다음 Start CDC부터 적용됩니다.
+- sink 플러그인이 **v51**이 되었고 offset-seeder Lambda도 고쳤습니다. 이미 배포된 cdc-stack은 **Delete CDC infrastructure 후 다시 Deploy**하기 전까지 v50과 이전 seeder로 동작합니다(MySQL에서 Stop 후 Start가 여전히 실패할 수 있음). TRUNCATE 캡처와 새 시작 모드는 다음 Start CDC부터 적용됩니다.
 - 새로 보류될 수 있습니다: DLQ나 드리프트가 있던 테이블은 Cut over가 CHECKSUM을 기다릴 수 있고, Full Load는 예전에 반올림하던 값을 격리할 수 있습니다. MySQL JSON 컬럼은 Evaluation에서 MANUAL로 계산됩니다(점수가 내려갈 수 있으나 새로 막히는 것은 없음).
 - 아직 실제 환경에서 검증하지 않은 것: 새 종류의 정확한 DSQL SQLSTATE, PostgreSQL 카탈로그 재확인, 실제 스트림에서의 v51 sink 동작.
 

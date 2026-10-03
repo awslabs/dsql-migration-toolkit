@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import traceback
 
 import cfnresponse
@@ -45,7 +46,36 @@ import cfnresponse
 # kafka-python + the MSK IAM SASL signer are bundled into the deployment zip.
 from kafka import KafkaAdminClient, KafkaConsumer, KafkaProducer, TopicPartition
 from kafka.admin import NewTopic
-from kafka.errors import TopicAlreadyExistsError
+from kafka.errors import NodeNotReadyError, TopicAlreadyExistsError
+
+# MSK Serverless THROTTLES admin requests such as CreateTopics. kafka-python then PAUSES
+# the broker connection for the throttle time the response carries, and the next
+# request on it fails at once with NodeNotReadyError ("Node paused: {'throttle'}")
+# instead of waiting. Every Start after a Stop re-runs the topic prep below against
+# topics that all exist already, so the per-topic loop tripped the throttle and failed
+# the custom resource -- Start CDC rolled back every time (seen live on kafka-python
+# 3.0.10, the bundled client). Wait the pause out, bounded: at most ~31 s per request.
+_THROTTLE_RETRIES = 8
+_THROTTLE_FIRST_WAIT_S = 0.5
+_THROTTLE_MAX_WAIT_S = 8.0
+
+
+def _throttle_tolerant(call):
+    """Run ``call()``; on a throttled (paused) broker connection, wait and retry, bounded.
+
+    Only NodeNotReadyError is retried -- the paused-connection signal. Everything else
+    (TopicAlreadyExistsError included) propagates to the caller unchanged.
+    """
+    wait = _THROTTLE_FIRST_WAIT_S
+    for attempt in range(_THROTTLE_RETRIES):
+        try:
+            return call()
+        except NodeNotReadyError:
+            if attempt == _THROTTLE_RETRIES - 1:
+                raise
+            print(f"broker throttled the admin request; retrying in {wait:.1f}s")
+            time.sleep(wait)
+            wait = min(wait * 2, _THROTTLE_MAX_WAIT_S)
 
 
 # --------------------------------------------------------------------------- #
@@ -145,7 +175,7 @@ def _ensure_compact_topic(bootstrap, region, topic, partitions):
         bootstrap_servers=bootstrap, **_iam_sasl_args(region)
     )
     try:
-        admin.create_topics(
+        _throttle_tolerant(lambda: admin.create_topics(
             [
                 NewTopic(
                     name=topic,
@@ -154,7 +184,7 @@ def _ensure_compact_topic(bootstrap, region, topic, partitions):
                     topic_configs={"cleanup.policy": "compact"},
                 )
             ]
-        )
+        ))
         print(f"created offset topic {topic} (compact, {partitions} partition(s))")
     except TopicAlreadyExistsError:
         print(f"offset topic {topic} already exists -- reusing")
@@ -201,9 +231,12 @@ def _ensure_data_topics(
     * **max.message.bytes** -- set to ``max_message_bytes`` so a >1 MiB change event
       isn't rejected (the Kafka default is 1 MiB; the source producer uses this too).
 
-    Each topic is created individually so already-existing ones are skipped (Debezium
-    ``topic.creation`` then no-ops on them). ``replication_factor=-1`` lets the broker
-    apply its default (required for MSK Serverless).
+    The existing topics are read ONCE and only the missing ones are created, each
+    individually, so a re-Start (every topic already exists) sends no CreateTopics at all
+    -- a request per existing topic is what tripped MSK Serverless's throttle (see
+    ``_throttle_tolerant``). Debezium ``topic.creation`` then no-ops on them.
+    ``replication_factor=-1`` lets the broker apply its default (required for MSK
+    Serverless).
     """
     topics = [t.strip() for t in (topics_csv or "").split(",") if t.strip()]
     if not topics:
@@ -216,13 +249,16 @@ def _ensure_data_topics(
     admin = KafkaAdminClient(bootstrap_servers=bootstrap, **_iam_sasl_args(region))
     created = skipped = 0
     try:
+        existing = set(_throttle_tolerant(admin.list_topics) or ())
         for name in topics:
+            if name in existing:
+                skipped += 1
+                continue
             parts = int(part_map.get(name, default_partitions))
+            new_topic = NewTopic(name=name, num_partitions=parts,
+                                 replication_factor=-1, topic_configs=topic_configs)
             try:
-                admin.create_topics(
-                    [NewTopic(name=name, num_partitions=parts,
-                              replication_factor=-1, topic_configs=topic_configs)]
-                )
+                _throttle_tolerant(lambda: admin.create_topics([new_topic]))
                 created += 1
             except TopicAlreadyExistsError:
                 skipped += 1
@@ -257,10 +293,10 @@ def _ensure_dlq_topic(bootstrap, region, dlq_topic, max_message_bytes):
         topic_configs = {"max.message.bytes": str(int(max_message_bytes))}
     admin = KafkaAdminClient(bootstrap_servers=bootstrap, **_iam_sasl_args(region))
     try:
-        admin.create_topics(
+        _throttle_tolerant(lambda: admin.create_topics(
             [NewTopic(name=dlq_topic, num_partitions=1,
                       replication_factor=-1, topic_configs=topic_configs)]
-        )
+        ))
         print(
             f"pre-created DLQ topic {dlq_topic} "
             f"(max.message.bytes={max_message_bytes})"

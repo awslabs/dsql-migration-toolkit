@@ -22,13 +22,14 @@ CDC とソースのスキーマ変更 (DDL) の扱いを全体にわたって強
 - **Aurora DSQL の列に正確に収まらない値は変更せず拒否します:** boolean への 0/1 以外の数値、numeric(p,s) への超過した小数桁、整数列への小数は、true として保存したり丸めたりせず、デッドレター (CDC) または隔離 (Full Load) します。
 - **発生しうるすべての拒否に正しいドリフト種別と DSQL で使える対処を付けました** (キー変更 42P10、CHECK/ENUM 23514、NULL ルール変更 23502、値が収まらない 22001/22003)。「Fix target schema」はキー列を追加せず、名前が変わった列には追加ではなく名前変更を提案し、除外ルールに一致する列は追加しません。
 - **MySQL ソースの TRUNCATE もデッドレターにして表示します** (PostgreSQL と同じ。以前は黙ってスキップ)。
+- **MySQL で Stop CDC の後の Start CDC が失敗しなくなりました。** VPC 内のトピック準備が既存トピックごとに CreateTopics を再送して MSK Serverless のスロットリングに当たり、同梱の Kafka クライアントが待たずに失敗してスタック更新がロールバックしていました。今は存在しないトピックだけを作成し、スロットリングは待ってから再試行します (ライブ検証中に発見)。
 - **ドリフト中のテーブルが他のテーブルを遅くしなくなりました** (そのテーブルだけ一定時間 1 行ずつ処理)。
 - **MySQL の JSON 列も大きな値の候補になりました** (LONGTEXT と同じ: Evaluation、Schema Conversion の注記、除外の提案、Check sizes)。
 - Exclude tables & columns: Result は Review all の警告を繰り返さず件数だけを表示します。Start Full Load と Deploy CDC infrastructure のダイアログを広げ、ステートメントに "(DSQL)" を付け、Deploy ダイアログはキャプチャリストが除外列と同じ場合は 1 回だけ表示します。
 
 ### アップグレードの注意
 
-- sink プラグインは **v51** になりました。デプロイ済みの cdc-stack は、**Delete CDC infrastructure の後に再度 Deploy** するまで v50 のまま動作します。TRUNCATE のキャプチャと新しい開始モードは次の Start CDC から適用されます。
+- sink プラグインは **v51** になり、offset-seeder Lambda も修正しました。デプロイ済みの cdc-stack は、**Delete CDC infrastructure の後に再度 Deploy** するまで v50 と以前の seeder のまま動作します (MySQL で Stop の後の Start が引き続き失敗することがあります)。TRUNCATE のキャプチャと新しい開始モードは次の Start CDC から適用されます。
 - 新たに保留されることがあります: デッドレターやドリフトのあったテーブルでは Cut over が CHECKSUM を待つことがあり、Full Load は以前丸めていた値を隔離することがあります。MySQL の JSON 列は Evaluation で MANUAL として数えられます (スコアが下がることがありますが、新たにブロックされるものはありません)。
 - まだ実環境で検証していないもの: 新しい種別の正確な DSQL SQLSTATE、PostgreSQL のカタログ再確認、実際のストリームでの v51 sink の動作。
 
