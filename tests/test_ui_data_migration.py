@@ -32835,3 +32835,398 @@ def test_a_finished_stop_drops_the_live_snapshot_mode(monkeypatch) -> None:
     assert state.cdc_deployed_snapshot_mode == "recovery"  # nothing ran yet
     _JM.work(SimpleNamespace(cancelled=False))
     assert state.cdc_deployed_snapshot_mode is None
+
+
+# ---------------------------------------------------------------------------
+# G7: a connector that stopped after it started -- the cause, the card, the episode
+# ---------------------------------------------------------------------------
+
+_G7_STACK = "dsql-cdc-x"
+
+
+def _g7_names():
+    from dsql_migrator.core.cdc import cdc_expected_connector_names
+
+    src, sink = cdc_expected_connector_names(_G7_STACK)
+    return src, sink
+
+
+def _g7_diagnosis(kind="streaming"):
+    from dsql_migrator.core.cdc_deployer import diagnose_connector_log
+
+    src, _sink = _g7_names()
+    tails = {
+        "streaming": (
+            "ERROR Error during binlog processing. Last offset stored = {...}\n"
+            "ParsingException: DDL statement couldn't be parsed. Please open a Jira issue "
+            "with the statement 'CREATE PROCEDURE p() BEGIN SELECT 1; END'"
+        ),
+        "snapshot": (
+            "ERROR Error during snapshot\n"
+            "ParsingException: DDL statement couldn't be parsed. Please open a Jira issue "
+            "with the statement 'CREATE TABLE `orders` ('"
+        ),
+        "history": "ERROR The db history topic is missing. You may attempt to recover it.",
+        "unknown": "for table app.orders whose schema isn't known to this connector",
+    }
+    diagnosis = diagnose_connector_log(src, tails[kind], episode_only=True)
+    assert diagnosis is not None
+    return diagnosis
+
+
+def _g7_hold(state, diagnosis=None, name=None):
+    name = name or _g7_names()[0]
+    epoch = state.claim_cdc_diagnosis_read(name, now=0.0, interval=0.0)
+    assert epoch is not None
+    state.record_cdc_connector_diagnosis(name, diagnosis or _g7_diagnosis(), epoch=epoch)
+
+
+def _g7_state():
+    state = DataMigrationState()
+    state.set_cdc_stack_name(_G7_STACK)
+    state.set_cdc_connector_names(list(_g7_names()))
+    return state
+
+
+def test_partial_card_for_a_dead_task_offers_stop_not_retry() -> None:
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    src, sink = _g7_names()
+
+    def _render(state, names, failed):
+        ui = _RecordingUi()
+        _cdc_ui._render_cdc_partial_actions(
+            ui, state, object(), lambda: None,
+            # A tuple in data-flow order, as cdc_expected_connector_names returns: a set
+            # made the "Source ... and Sink" order depend on the hash seed.
+            names=names, expected=(src, sink), failed=failed,
+        )
+        return ui
+
+    plain = _render(_g7_state(), [src, sink], [src])
+    blob = " ".join(plain.texts)
+    assert "CDC is not streaming — a connector stopped" in blob
+    assert "Both connectors exist" in blob and "cannot restart this one" in blob
+    assert "is missing (a failed" not in blob
+    labels = [b.text for b in plain.buttons]
+    assert "Retry CDC" not in labels and "Clean up leftover connector" not in labels
+    # No cause matched yet: where the error is, and the honest way back.
+    assert f"/msk-connect/{_G7_STACK}-cdc" in blob
+    stop = next(b for b in plain.buttons if b.text == "Stop CDC")
+    stop.on_click()
+    assert "Stop CDC — remove connectors" in plain.texts
+    # A matched cause: point at Pipeline health, which carries it.
+    held = _g7_state()
+    _g7_hold(held)
+    known = " ".join(_render(held, [src, sink], [src]).texts)
+    assert "Pipeline health below names the cause" in known
+    assert "/msk-connect/" not in known
+    # A connector that is really MISSING keeps the old copy and its Retry.
+    missing = _render(_g7_state(), [src], [])
+    assert "is missing (a failed" in " ".join(missing.texts)
+    assert "Retry CDC" in [b.text for b in missing.buttons]
+    # One severity for "a connector's task stopped": error, like the Pipeline-health notice
+    # and row for the same stop. The missing-connector notice keeps its warning tone.
+    from dsql_migrator.ui.design import notice_box_classes
+
+    for dead in (plain, _render(held, [src, sink], [src])):
+        assert notice_box_classes("error") in dead.classes_applied
+        assert notice_box_classes("warning") not in dead.classes_applied
+    assert notice_box_classes("warning") in missing.classes_applied
+    # BOTH tasks stopped: plural copy, labels in data-flow order, still no Retry.
+    both = _render(_g7_state(), [src, sink], [sink, src])
+    both_blob = " ".join(both.texts)
+    assert "CDC is not streaming — both connectors stopped" in both_blob
+    assert "the Source (→ Kafka) and Sink (Kafka → Aurora DSQL) tasks have stopped" in both_blob
+    assert "cannot restart them" in both_blob and "in their worker logs" in both_blob
+    assert "a connector stopped" not in both_blob and "this one" not in both_blob
+    both_labels = [b.text for b in both.buttons]
+    assert "Retry CDC" not in both_labels and "Stop CDC" in both_labels
+
+
+def _g7_dead_source_card(*, hold=None):
+    """Render the WHOLE lifecycle card with both connectors present and the source's task
+    dead (RUNNING on MSK, an errored task in CloudWatch, folded to FAILED)."""
+    from dsql_migrator.core.cdc import ConnectorState, ConnectorStatus
+    from dsql_migrator.core.msk_connect_controller import ConnectorHealth
+    from dsql_migrator.ui.data_migration import _apply_cdc_status, _cdc_ui
+
+    src, sink = _g7_names()
+    state = _g7_state()
+    state.set_cdc_controller(object())
+    state.set_cdc_connector_running_names([src, sink])
+    state.set_cdc_stack_phase("running")
+    if hold is not None:
+        _g7_hold(state, hold)
+    _apply_cdc_status(state, (
+        [ConnectorStatus(name=src, state=ConnectorState.RUNNING),
+         ConnectorStatus(name=sink, state=ConnectorState.RUNNING)],
+        {src: ConnectorHealth(running_tasks=0, errored_tasks=1),
+         sink: ConnectorHealth(running_tasks=1, errored_tasks=0)},
+    ))
+    ui = _RecordingUi()
+    _cdc_ui._render_cdc_start_action(
+        ui, state, _StubJobManager({}), lambda: None, inventory=None, session=None
+    )
+    return ui
+
+
+def test_lifecycle_card_routes_a_dead_task_to_the_stopped_notice() -> None:
+    # Wiring: the card must pass the failed connectors into the partial branch, or a dead
+    # source (both connectors present) gets the "is missing" copy and a Retry CDC that
+    # cannot restart it. Renders the real card, not the helper.
+    ui = _g7_dead_source_card()
+    blob = " ".join(ui.texts)
+    labels = [b.text for b in ui.buttons]
+    assert "CDC is not streaming — a connector stopped" in blob
+    assert "is missing (a failed" not in blob
+    assert "Retry CDC" not in labels and "Stop CDC" in labels
+
+
+def test_the_danger_zone_of_a_dead_task_does_not_promise_delete_as_the_fallback() -> None:
+    # For a stop that repeats by design (an unparseable DDL, a schema-history replay),
+    # "Delete only if Start keeps failing" sent the operator to a slow, billable teardown
+    # that returns to the same stop: a redeployed Start reads the source again.
+    for kind in ("streaming", "snapshot"):
+        blob = " ".join(_g7_dead_source_card(hold=_g7_diagnosis(kind)).texts)
+        assert "Delete does not restart a stopped connector" in blob, kind
+        assert "Start CDC again first" not in blob and "Start keeps failing" not in blob
+        assert "MSK partition quota is exhausted" in blob  # the one cause Delete fixes
+    # A connector that is really missing keeps the old Danger-zone copy.
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    src, _sink = _g7_names()
+    state = _g7_state()
+    state.set_cdc_controller(object())
+    state.set_cdc_connector_names([src])
+    state.set_cdc_connector_running_names([src])
+    state.set_cdc_stack_phase("running")
+    ui = _RecordingUi()
+    _cdc_ui._render_cdc_start_action(
+        ui, state, _StubJobManager({}), lambda: None, inventory=None, session=None
+    )
+    missing = " ".join(ui.texts)
+    assert "is missing (a failed" in missing
+    assert "Delete only if Stop + Start can't recover" in missing
+    assert "Delete does not restart a stopped connector" not in missing
+
+
+def test_live_pipeline_health_names_the_held_stop_cause() -> None:
+    # Wiring: the Live status render must hand the held causes (and the log group) to
+    # Pipeline health, or the row falls back to the generic "Restart required".
+    from dsql_migrator.core.cdc import ConnectorState, ConnectorStatus
+    from dsql_migrator.core.msk_connect_controller import ConnectorHealth
+    from dsql_migrator.ui.data_migration import _apply_cdc_status
+
+    src, sink = _g7_names()
+    diagnosis = _g7_diagnosis()
+    state = _g7_state()
+    state.set_cdc_stack_phase("running")
+    _g7_hold(state, diagnosis)
+    _apply_cdc_status(state, (
+        [ConnectorStatus(name=src, state=ConnectorState.RUNNING),
+         ConnectorStatus(name=sink, state=ConnectorState.RUNNING)],
+        {src: ConnectorHealth(running_tasks=0, errored_tasks=1),
+         sink: ConnectorHealth(running_tasks=1, errored_tasks=0)},
+    ))
+    ui = _render_live_monitoring(state)
+    blob = " ".join(ui.texts)
+    assert f"Stopped — {diagnosis.headline}." in ui.texts  # the row names the cause
+    assert f"stopped: {diagnosis.headline}" in blob  # the error notice's header
+    assert f"/msk-connect/{_G7_STACK}-cdc" in blob  # the log group is wired through
+
+
+def test_the_filtered_publication_runbook_matches_the_picker_lock() -> None:
+    # The runbook's exit for a table dropped on purpose is the one the lock itself names.
+    from dsql_migrator.core.cdc_deployer import diagnose_connector_log
+    from dsql_migrator.ui.data_migration import MigrationType, selection_lock_reason
+
+    src, _sink = _g7_names()
+    state = _g7_state()
+    state.set_cdc_stack_phase("partial", status="UPDATE_ROLLBACK_COMPLETE")
+    reason = selection_lock_reason(
+        state, _StubJobManager({}), status=None, migration_type=MigrationType.CDC_ONLY,
+        has_job=False,
+    )
+    assert reason is not None and "delete the CDC infrastructure" in reason
+    found = diagnose_connector_log(
+        src, 'ERROR Unable to create filtered publication dbz for "public"."orders"'
+    )
+    assert found is not None and "Delete CDC infrastructure" in found.guidance
+
+
+def test_health_path_history_diagnoses_set_the_flag_only_where_the_start_path_would(
+    monkeypatch,
+) -> None:
+    from dsql_migrator.core.cdc import ConnectorState, ConnectorStatus
+    from dsql_migrator.core.cdc_deployer import CdcDeployError
+    from dsql_migrator.core.msk_connect_controller import ConnectorHealth
+    from dsql_migrator.ui.data_migration import _apply_cdc_status
+
+    src, _sink = _g7_names()
+    failed = (
+        [ConnectorStatus(name=src, state=ConnectorState.FAILED)],
+        {src: ConnectorHealth(running_tasks=0, errored_tasks=1)},
+    )
+
+    def _flag(mode, kind):
+        state = _g7_state()
+        state.set_cdc_deployed_snapshot_mode(mode)
+        _g7_hold(state, _g7_diagnosis(kind))
+        _apply_cdc_status(state, failed)
+        return state.cdc_history_missing
+
+    assert _flag("schema_only", "history") is True
+    assert _flag("recovery", "unknown") is False
+    assert _flag("recovery", "snapshot") is True
+    assert _flag("schema_only", "streaming") is False
+    assert _flag(None, "history") is False  # PostgreSQL: no snapshot mode, never flagged
+    # A Start-success clear that raced the diagnosis is set again on the next apply.
+    state = _g7_state()
+    state.set_cdc_deployed_snapshot_mode("recovery")
+    _g7_hold(state, _g7_diagnosis("snapshot"))
+    _apply_cdc_status(state, failed)
+    state.note_cdc_history_missing(False)
+    _apply_cdc_status(state, failed)
+    assert state.cdc_history_missing is True
+    # The Start path follows the same rule: a recovery Start whose schema snapshot stopped
+    # on a table definition flags the history (the offset is seeded, the history is not).
+    run = _g5_run(
+        monkeypatch, job_watermark=_g5_wm(fingerprints=False),
+        run_raises=CdcDeployError(_g7_diagnosis("snapshot").guidance),
+    )
+    assert _g5_mode(run) == "recovery" and isinstance(run["error"], CdcDeployError)
+    assert run["state"].cdc_history_missing is True
+    streaming = _g5_run(
+        monkeypatch, job_watermark=_g5_wm(fingerprints=False),
+        run_raises=CdcDeployError(_g7_diagnosis("streaming").guidance),
+    )
+    assert streaming["state"].cdc_history_missing is False
+
+
+def test_connector_diagnoses_are_episode_scoped_and_never_persisted(monkeypatch) -> None:
+    from dsql_migrator.core.session_state_store import SessionSnapshot
+    from dsql_migrator.ui.data_migration import DataMigrationStore
+    from dsql_migrator.ui.evaluation import EvaluationState
+    from dsql_migrator.ui.schema_conversion import SchemaConversionState
+    from dsql_migrator.ui.session import SessionConnectionState
+    from dsql_migrator.ui.session_persistence import session_signature
+
+    def _held():
+        state = _g7_state()
+        _g7_hold(state)
+        assert state.cdc_connector_diagnoses
+        return state
+
+    for end in (
+        lambda s: s.set_cdc_stack_name("dsql-cdc-other"),
+        lambda s: s.set_cdc_stack_phase("absent"),
+        lambda s: s.adopt_cdc_stack("dsql-cdc-other"),
+    ):
+        state = _held()
+        end(state)
+        assert state.cdc_connector_diagnoses == {}
+    # Re-targeting the SAME stack name keeps it.
+    same = _held()
+    same.set_cdc_stack_name(_G7_STACK)
+    assert same.cdc_connector_diagnoses
+    # Start over (reset_in_place re-runs __init__).
+    store = DataMigrationStore()
+    reset = store.get_or_create("s1")
+    reset.set_cdc_stack_name(_G7_STACK)
+    _g7_hold(reset)
+    store.reset_in_place("s1")
+    assert reset.cdc_connector_diagnoses == {}
+    # Stop CDC deliberately KEEPS it (the runbook's first step is Stop CDC).
+    stopped = _held()
+    stopped.set_cdc_connector_names([])
+    stopped.set_cdc_stack_phase("infra", status="UPDATE_COMPLETE")
+    assert stopped.cdc_connector_diagnoses
+    # ...and the next Start submission ends the episode.
+    run = _g5_run(monkeypatch, job_watermark=_g5_wm(fingerprints=False), state=stopped)
+    assert run["submitted"] and stopped.cdc_connector_diagnoses == {}
+    # Never persisted, and recording one does not dirty the session.
+    assert not [f for f in SessionSnapshot.model_fields if "diagnos" in f]
+    session, ev, conv = SessionConnectionState(), EvaluationState(), SchemaConversionState()
+    fresh = _g7_state()
+    before = session_signature(session, ev, conv, fresh)
+    _g7_hold(fresh)
+    assert session_signature(session, ev, conv, fresh) == before
+
+
+def test_start_card_and_stop_dialog_carry_the_last_stop_cause() -> None:
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import MigrationMode
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    class _JM:
+        def get_status(self, _job_id):
+            return SimpleNamespace(watermark=None, status="DONE")
+
+    diagnosis = _g7_diagnosis()
+    state = _g7_state()
+    _g7_hold(state, diagnosis)
+    # After Stop CDC: no connectors, infra phase -- the Start card says why it stopped.
+    state.set_cdc_connector_names([])
+    state.set_cdc_stack_phase("infra", status="UPDATE_COMPLETE")
+    state.set_prereq_gated_mode(MigrationMode.CDC)
+    ui = _RecordingUi()
+    _cdc_ui._render_cdc_start_button(
+        ui, state, _JM(), lambda: None, inventory=None, session=None
+    )
+    blob = " ".join(ui.texts)
+    assert f"The last CDC run stopped: {diagnosis.headline}" in blob
+    assert diagnosis.guidance in blob and f"/msk-connect/{_G7_STACK}-cdc" in blob
+    # A RESUME (offset committed on MSK) with a held cause: the resume notice must not
+    # promise "no need to re-enter a start point" beside a runbook that says to set one
+    # (or, for a table definition, that CDC cannot run at all).
+    for kind in ("streaming", "snapshot"):
+        resumed = _g7_state()
+        held_cause = _g7_diagnosis(kind)
+        _g7_hold(resumed, held_cause)
+        resumed.set_cdc_connector_names([])
+        resumed.set_cdc_stack_phase("infra", status="UPDATE_COMPLETE")
+        resumed.set_prereq_gated_mode(MigrationMode.CDC)
+        resumed.set_cdc_has_committed_offset(True)
+        card = _RecordingUi()
+        _cdc_ui._render_cdc_start_button(
+            card, resumed, _JM(), lambda: None, inventory=None, session=None
+        )
+        text = " ".join(card.texts)
+        assert f"The last CDC run stopped: {held_cause.headline}" in text, kind
+        assert "Ready to resume CDC" in text
+        assert "no need to re-enter a start point" not in text, kind
+        assert "streamed before" not in text, kind
+        assert "follow its steps before Start CDC" in text
+    # Control: the same resume with no held cause keeps the original promise, unchanged.
+    plain_resume = _g7_state()
+    plain_resume.set_cdc_connector_names([])
+    plain_resume.set_cdc_stack_phase("infra", status="UPDATE_COMPLETE")
+    plain_resume.set_prereq_gated_mode(MigrationMode.CDC)
+    plain_resume.set_cdc_has_committed_offset(True)
+    plain_card = _RecordingUi()
+    _cdc_ui._render_cdc_start_button(
+        plain_card, plain_resume, _JM(), lambda: None, inventory=None, session=None
+    )
+    plain_text = " ".join(plain_card.texts)
+    assert "Ready to resume CDC" in plain_text
+    assert "This pipeline streamed before" in plain_text
+    assert "no need to re-enter a start point" in plain_text
+    # The Stop dialog of a pipeline whose connector stopped for a known cause qualifies
+    # "no start point needed again".
+    live = _g7_state()
+    _g7_hold(live, diagnosis)
+    dialog = _RecordingUi()
+    _cdc_ui._open_cdc_stop_dialog(dialog, live, lambda: None)
+    body = " ".join(dialog.texts)
+    assert f"stopped: {diagnosis.headline}." in body
+    assert "Follow the steps the CDC step shows for it before Start CDC" in body
+    # Without one, the dialog is byte-identical to before.
+    plain, bare = _RecordingUi(), _RecordingUi()
+    _cdc_ui._open_cdc_stop_dialog(plain, _g7_state(), lambda: None)
+    _cdc_ui._open_cdc_stop_dialog(bare, DataMigrationState(), lambda: None)
+    assert "Follow the steps" not in " ".join(plain.texts)
+    assert [t for t in plain.texts if "cdc-stack" not in t] == [
+        t for t in bare.texts if "cdc-stack" not in t
+    ]

@@ -2593,3 +2593,503 @@ def test_the_manual_route_in_the_replay_diagnoses_says_a_reload_resets_it() -> N
     for line in (_COLUMN_SIZE_LINE, _RENAME_LINE, _UNKNOWN_SCHEMA_LINE):
         guidance = _diagnose_connector_log(SRC, line)
         assert "back to Automatic, so choose Manual again" in guidance
+
+
+# ---------------------------------------------------------------------------
+# G7: a DDL statement Debezium's MySQL grammar cannot parse stops the source for good
+# ---------------------------------------------------------------------------
+
+# A streaming failure as the worker log carries it (ParsingErrorListener's literal, from the
+# shipped debezium-connector-mysql 2.7.4 bytecode), ending on an unrelated INFO line -- the
+# line the unmatched-log excerpt used to repeat as "the cause".
+_G7_STREAMING_TAIL = "\n".join([
+    f"[Worker-0a1] [2026-10-03 01:02:03,456] ERROR [{SRC}|task-0] Error during binlog "
+    "processing. Last offset stored = {file=mysql-bin-changelog.000123, pos=4100}, binlog "
+    "reader near position = mysql-bin-changelog.000123/4567 "
+    "(io.debezium.connector.binlog.BinlogStreamingChangeEventSource:1225)",
+    f"[Worker-0a1] [2026-10-03 01:02:03,457] ERROR [{SRC}|task-0] Producer failure "
+    "(io.debezium.pipeline.ErrorHandler:52)",
+    "[Worker-0a1] io.debezium.DebeziumException: Error processing binlog event",
+    "[Worker-0a1] \tat io.debezium.connector.binlog.BinlogStreamingChangeEventSource"
+    ".handleEvent(BinlogStreamingChangeEventSource.java:592)",
+    "[Worker-0a1] Caused by: io.debezium.text.ParsingException: DDL statement couldn't be "
+    "parsed. Please open a Jira issue with the statement 'CREATE PROCEDURE p() BEGIN "
+    "SELECT 'secret-ish'; END'",
+    "[Worker-0a1] mismatched input 'FOO' expecting {...}",
+    f"[Worker-0a1] [2026-10-03 01:02:04,000] INFO [{SRC}|task-0] App info kafka.producer "
+    f"for connector-producer-{SRC}-0 unregistered",
+])
+
+_G7_SNAPSHOT_TAIL = "\n".join([
+    f"[Worker-0a1] [2026-10-03 01:02:03,456] ERROR [{SRC}|task-0] Error during snapshot "
+    "(io.debezium.relational.RelationalSnapshotChangeEventSource:120)",
+    "[Worker-0a1] io.debezium.text.ParsingException: DDL statement couldn't be parsed. "
+    "Please open a Jira issue with the statement 'CREATE TABLE `orders` ('",
+    "[Worker-0a1] no viable alternative at input 'CREATE TABLE `orders` ('",
+])
+
+
+def test_an_unparseable_binlog_ddl_is_diagnosed_with_a_masked_statement() -> None:
+    from dsql_migrator.core.cdc_deployer import _diagnose_connector_log
+    from dsql_migrator.ui.cdc_start_point_gate import RELOAD_RESETS_MANUAL
+
+    guidance = _diagnose_connector_log(SRC, _G7_STREAMING_TAIL)
+    assert guidance is not None
+    assert "could not parse a DDL statement" in guidance
+    assert 'It begins "CREATE PROCEDURE p() BEGIN SELECT \'?\'; END"' in guidance
+    # The statement's literal is a value: hidden. The irrelevant last line is not "the cause".
+    assert "secret-ish" not in guidance
+    assert "App info kafka.producer" not in guidance
+    assert "mismatched input" not in guidance  # the ANTLR detail line is never quoted
+    for phrase in (
+        "Retry CDC", "Fetch current position", "Drop & reload", "near position",
+        "back to Automatic, so choose Manual again",
+    ):
+        assert phrase in guidance, phrase
+    # Starting again replays the statement: never recommended.
+    assert "Start CDC again" not in guidance
+    # The Manual route carries the gate's own sentence verbatim (core cannot import it).
+    assert RELOAD_RESETS_MANUAL in guidance
+
+
+def test_the_multiple_parsing_errors_form_is_diagnosed_too() -> None:
+    from dsql_migrator.core.cdc_deployer import _diagnose_connector_log
+
+    tail = (
+        "ERROR Error during binlog processing. Last offset stored = {...}\n"
+        "io.debezium.text.MultipleParsingExceptions: Multiple parsing errors\n"
+        "io.debezium.text.ParsingException: DDL statement couldn't be parsed. Please open "
+        "a Jira issue with the statement 'ALTER TABLE t ADD CONSTRAINT c CHECK (a > 0) "
+        "NOT ENFORCED'\n"
+        "extraneous input 'ENFORCED'"
+    )
+    guidance = _diagnose_connector_log(SRC, tail)
+    assert guidance is not None
+    assert "could not parse a DDL statement in the source's binary log" in guidance
+    assert 'It begins "ALTER TABLE t ADD CONSTRAINT c CHECK (a > 0) NOT ENFORCED"' in guidance
+
+
+def test_an_unparseable_table_definition_gets_the_snapshot_variant() -> None:
+    from dsql_migrator.core.cdc_deployer import (
+        DEFINITION_SNAPSHOT_MARK,
+        _diagnose_connector_log,
+    )
+
+    guidance = _diagnose_connector_log(SRC, _G7_SNAPSHOT_TAIL)
+    assert guidance is not None
+    assert DEFINITION_SNAPSHOT_MARK in guidance
+    assert "EVERY table" in guidance and "Full load only" in guidance
+    assert "CREATE TABLE `orders` (" in guidance
+    # No start point can help a table definition the grammar rejects.
+    assert "Fetch current position" not in guidance
+    assert "Start CDC again" not in guidance
+    # The more RECENT marker decides: an older snapshot error, then a streaming one.
+    newer_streaming = (
+        "ERROR Error during snapshot\n"
+        + "ERROR Error during binlog processing. Last offset stored = {...}\n"
+        + "ParsingException: DDL statement couldn't be parsed. Please open a Jira issue "
+        "with the statement 'DROP TRIGGER x'"
+    )
+    streaming = _diagnose_connector_log(SRC, newer_streaming)
+    assert streaming is not None and DEFINITION_SNAPSHOT_MARK not in streaming
+    assert "Fetch current position" in streaming
+    # The binlog reader's other marker counts as streaming too.
+    newer_event = (
+        "ERROR Error during snapshot\n"
+        "io.debezium.DebeziumException: Error processing binlog event\n"
+        "ParsingException: DDL statement couldn't be parsed. Please open a Jira issue "
+        "with the statement 'DROP TRIGGER x'"
+    )
+    event = _diagnose_connector_log(SRC, newer_event)
+    assert event is not None and DEFINITION_SNAPSHOT_MARK not in event
+    # NEITHER marker (pushed out of the bounded tail, say): the recoverable streaming
+    # runbook, never "CDC cannot run against this source server", and no history flag.
+    from dsql_migrator.core.cdc_deployer import (
+        diagnose_connector_log,
+        history_missing_after_failure,
+    )
+
+    bare = diagnose_connector_log(SRC, "DDL statement couldn't be parsed.")
+    assert bare is not None
+    assert bare.headline == "Debezium could not parse a DDL statement in the binary log"
+    assert "Fetch current position" in bare.guidance
+    assert DEFINITION_SNAPSHOT_MARK not in bare.guidance
+    assert history_missing_after_failure("recovery", bare.guidance) is False
+
+
+def test_unparseable_ddl_is_never_a_history_failure_and_sits_above_transient_needles() -> None:
+    from dsql_migrator.core.cdc_deployer import (
+        _CONNECTOR_LOG_DIAGNOSES,
+        _UNPARSEABLE_DDL_NEEDLE,
+        SCHEMA_HISTORY_MARK,
+        _diagnose_connector_log,
+        is_schema_history_failure,
+    )
+
+    for tail in (_G7_STREAMING_TAIL, _G7_SNAPSHOT_TAIL):
+        guidance = _diagnose_connector_log(SRC, tail)
+        assert guidance is not None
+        assert SCHEMA_HISTORY_MARK not in guidance
+        assert not is_schema_history_failure(guidance)
+    needles = [n for n, _g in _CONNECTOR_LOG_DIAGNOSES]
+    ddl = needles.index(_UNPARSEABLE_DDL_NEEDLE)
+    assert needles.index("isn't known to this connector") < ddl
+    for later in (
+        "communications link failure", "access denied for user",
+        "publication autocreation is disabled", "replication slot",
+    ):
+        assert ddl < needles.index(later), later
+    assert needles[-1] == "failed testing connection"
+    # The tail quotes the statement: words inside it must not pick a later entry.
+    mixed = (
+        "WARN com.mysql.cj.jdbc.exceptions.CommunicationsException: Communications link "
+        "failure\n"
+        "ERROR Error during binlog processing. Last offset stored = {...}\n"
+        "ParsingException: DDL statement couldn't be parsed. Please open a Jira issue with "
+        "the statement 'CREATE EVENT e DO SELECT \"Access denied for user\", "
+        "\"replication slot\"'"
+    )
+    guidance = _diagnose_connector_log(SRC, mixed)
+    assert guidance is not None and "could not parse a DDL statement" in guidance
+
+
+def test_ddl_statement_head_masks_literals_and_is_bounded() -> None:
+    from dsql_migrator.core.cdc_deployer import _ddl_statement_head, _diagnose_connector_log
+
+    def head(statement: str):
+        return _ddl_statement_head(
+            "ParsingException: DDL statement couldn't be parsed. Please open a Jira issue "
+            f"with the statement '{statement}'\nmismatched input 'x'"
+        )
+
+    user = head(
+        "CREATE USER 'bob'@'%' IDENTIFIED WITH 'mysql_native_password' AS '*ABCDEF0123'"
+    )
+    assert user == "CREATE USER '?'@'?' IDENTIFIED WITH '?' AS '?'"
+    assert "ABCDEF" not in user and "native" not in user
+    assert head("ALTER TABLE `it's` ADD x INT") == "ALTER TABLE `it's` ADD x INT"
+    # A backslash before the quote is ambiguous (escaped quote, or under NO_BACKSLASH_ESCAPES
+    # the end of a value): still masked, and it ends the head (fail closed).
+    assert head("ALTER TABLE t COMMENT 'a\\'b'") == "ALTER TABLE t COMMENT '?"
+    assert head("ALTER TABLE t COMMENT 'a''b'") == "ALTER TABLE t COMMENT '?'"
+    assert head('CREATE VIEW v AS SELECT "lit" FROM t') == 'CREATE VIEW v AS SELECT "?" FROM t'
+    # An unterminated literal: masked, and everything after it dropped.
+    assert head("ALTER TABLE t COMMENT 'never closed and more text") == (
+        "ALTER TABLE t COMMENT '?"
+    )
+    # A multi-line statement: its first line only, never the ANTLR detail line.
+    multi = _ddl_statement_head(
+        "DDL statement couldn't be parsed. Please open a Jira issue with the statement "
+        "'CREATE TRIGGER tr BEFORE INSERT ON t\nFOR EACH ROW SET NEW.a = 'v''\n"
+        "mismatched input 'zzz'"
+    )
+    assert multi == "CREATE TRIGGER tr BEFORE INSERT ON t"
+    assert "password=***" in head("ALTER SERVER s OPTIONS (password=hunter2)")
+    assert "hunter2" not in head("ALTER SERVER s OPTIONS (password=hunter2)")
+    long = head("CREATE TABLE t (" + ", ".join(f"c{i} INT" for i in range(800)) + ")")
+    assert long is not None and long.endswith(" …") and len(long) <= 162
+    # Just past the cap is capped too (not only a huge statement).
+    near = head("ALTER TABLE t ADD " + "x" * 200 + " INT")
+    assert near is not None and near.endswith(" …") and len(near) <= 162
+    assert _ddl_statement_head("ParsingException with no statement marker") is None
+    unmarked = _diagnose_connector_log(SRC, "DDL statement couldn't be parsed.")
+    assert unmarked is not None
+    assert "The connector's CloudWatch log shows the statement." in unmarked
+    # The LAST statement marker in the tail is the one quoted.
+    two = _diagnose_connector_log(
+        SRC,
+        "DDL statement couldn't be parsed. Please open a Jira issue with the statement "
+        "'DROP TRIGGER first'\nDDL statement couldn't be parsed. Please open a Jira issue "
+        "with the statement 'DROP TRIGGER second'",
+    )
+    assert two is not None and 'It begins "DROP TRIGGER second"' in two
+
+
+def test_a_value_ending_in_a_backslash_never_unmasks_the_next_value() -> None:
+    # Under sql_mode NO_BACKSLASH_ESCAPES 'C:\' is a complete value, and Debezium 2.7.4's
+    # grammar rejects exactly these statements (so they reach the statement head). Reading
+    # the backslash as an escape would end the "value" at the NEXT quote and show the
+    # following COMMENT in clear.
+    from dsql_migrator.core.cdc_deployer import _ddl_statement_head, _diagnose_connector_log
+
+    def tail(statement: str) -> str:
+        return (
+            "ERROR Error during binlog processing. Last offset stored = {...}\n"
+            "ParsingException: DDL statement couldn't be parsed. Please open a Jira issue "
+            f"with the statement '{statement}'\nmismatched input 'secret'"
+        )
+
+    for statement, secret, expected in (
+        (
+            "ALTER TABLE t ADD COLUMN a VARCHAR(10) DEFAULT 'C:\\', ADD COLUMN b INT "
+            "COMMENT 'secret comment text'",
+            "secret comment text",
+            "ALTER TABLE t ADD COLUMN a VARCHAR(10) DEFAULT '?",
+        ),
+        (
+            "CREATE TABLE t9 (a VARCHAR(10) DEFAULT 'C:\\' COMMENT 'top secret note')",
+            "top secret note",
+            "CREATE TABLE t9 (a VARCHAR(10) DEFAULT '?",
+        ),
+    ):
+        assert _ddl_statement_head(tail(statement)) == expected
+        guidance = _diagnose_connector_log(SRC, tail(statement))
+        assert guidance is not None and secret not in guidance
+    # An escaped backslash (an even run) reads the same in both modes: the head goes on.
+    even = _ddl_statement_head(tail("ALTER TABLE t COMMENT 'a\\\\' , MODIFY b INT COMMENT 'x'"))
+    assert even == "ALTER TABLE t COMMENT '?' , MODIFY b INT COMMENT '?'"
+
+
+def test_a_failed_connector_with_an_unparseable_ddl_surfaces_it_on_start() -> None:
+    handle = _FakeHandle()
+    deployer = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "FAILED"]},
+        connector_logs={SRC: _G7_STREAMING_TAIL},
+    )
+    with pytest.raises(CdcDeployError) as excinfo:
+        _run_start(handle, deployer)
+    message = str(excinfo.value)
+    assert "could not parse a DDL statement" in message
+    assert "No known failure signature" not in message
+    assert "secret-ish" not in message
+
+
+def test_create_unique_index_on_unknown_table_maps_to_the_unknown_table_guidance() -> None:
+    from dsql_migrator.core.cdc_deployer import (
+        _diagnose_connector_log,
+        is_schema_history_failure,
+    )
+
+    line = (
+        "ERROR Trying to create index on non existing table app.orders.Query: CREATE "
+        "UNIQUE INDEX u ON orders (a)"
+    )
+    guidance = _diagnose_connector_log(SRC, line)
+    assert guidance == _diagnose_connector_log(SRC, _UNKNOWN_SCHEMA_LINE)
+    assert "CREATE UNIQUE INDEX" in guidance
+    assert is_schema_history_failure(guidance)
+    for phrase in ("does not hold", "Clean up leftover connector", "back to Automatic"):
+        assert phrase in guidance
+
+
+def test_a_filtered_publication_failure_outranks_the_slot_needle() -> None:
+    from dsql_migrator.core.cdc_deployer import (
+        _CONNECTOR_LOG_DIAGNOSES,
+        _diagnose_connector_log,
+    )
+
+    for failure in (
+        'Unable to create filtered publication dbz_publication for "public"."orders"',
+        "No table filters found for filtered publication dbz_publication",
+    ):
+        tail = (
+            "INFO Obtained valid replication slot ReplicationSlot [active=false]\n"
+            f"ERROR {failure}"
+        )
+        guidance = _diagnose_connector_log(SRC, tail)
+        assert guidance is not None
+        assert "could not create or update its PostgreSQL publication" in guidance
+        assert "replication slot" not in guidance
+    # "the log line above" pointed at a line no notice ever shows.
+    assert not any("log line above" in g for _n, g in _CONNECTOR_LOG_DIAGNOSES)
+
+
+def test_the_filtered_publication_runbook_names_the_exits_the_locked_picker_allows() -> None:
+    # The table picker is locked while the cdc-stack exists (and after a Full Load or a
+    # streamed CDC), so "re-run Step 1 and take it out of the selection" alone was a step
+    # the UI refuses. The runbook must name the real exits, in an order that works.
+    from dsql_migrator.core.cdc_deployer import diagnose_connector_log
+
+    found = diagnose_connector_log(
+        SRC, 'ERROR Unable to create filtered publication dbz for "public"."orders"'
+    )
+    assert found is not None
+    guidance = found.guidance
+    assert "Delete CDC infrastructure" in guidance and "Start over" in guidance
+    assert "the table picker is locked" in guidance
+    assert "and take it out of the table selection; then Stop CDC" not in guidance
+    # Delete (which unlocks the picker) comes before the Step 1 re-run and the re-selection.
+    assert (
+        guidance.index("Delete CDC infrastructure")
+        < guidance.index("re-run Step 1")
+        < guidance.index("take the table out of the selection")
+    )
+    # Restoring the table on the source still needs only Stop CDC and Start CDC.
+    assert guidance.index("Restore the table") < guidance.index("Stop CDC")
+
+
+def test_link_and_auth_runbooks_say_stop_before_start() -> None:
+    # Reused on Pipeline health, where the connectors still exist and the card offers only
+    # Stop CDC: "then Start CDC again" named a button that is not there.
+    from dsql_migrator.core.cdc_deployer import diagnose_connector_log
+
+    for tail in (
+        "[W] [ts] ERROR [c|task-0] com.mysql.cj.jdbc.exceptions.CommunicationsException: "
+        "Communications link failure",
+        "[W] [ts] ERROR [c|task-0] java.sql.SQLException: Access denied for user "
+        "'cdc'@'10.0.1.5' (using password: YES)",
+    ):
+        found = diagnose_connector_log(SRC, tail, episode_only=True)
+        assert found is not None
+        assert "Start CDC again" not in found.guidance
+        assert "Stop CDC" in found.guidance and "Start CDC" in found.guidance
+        assert found.guidance.index("Stop CDC") < found.guidance.index("Start CDC")
+        assert "Clean up leftover connector" in found.guidance
+
+
+def test_debeziums_own_restart_bounds_the_health_path_episode() -> None:
+    # debezium-core 2.7.4: "Starting ... with configuration:" is logged only by Kafka
+    # Connect's first start; Debezium's own restart after a RETRIED error logs "Attempting
+    # to restart task." / "Successfully restarted task", while ErrorHandler logs the retried
+    # error as an ERROR "Producer failure". That recovered error must not label the death.
+    from dsql_migrator.core.cdc_deployer import (
+        _CONNECTOR_LOG_HEADLINES,
+        _diagnose_connector_log,
+        diagnose_connector_log,
+    )
+
+    w = "[Worker-0a1]"
+    start = [
+        f"{w} [t0] INFO [{SRC}|task-0] Starting MySqlConnectorTask with configuration: "
+        "(io.debezium.connector.common.BaseSourceTask:248)",
+        f"{w} [t0] INFO [{SRC}|task-0]    connector.class = io.debezium.connector.mysql.X",
+    ]
+    recovered_link = [
+        f"{w} [t1] ERROR [{SRC}|task-0] Producer failure (io.debezium.pipeline.ErrorHandler:52)",
+        f"{w} java.lang.RuntimeException: com.mysql.cj.jdbc.exceptions.CommunicationsException: "
+        "Communications link failure",
+        f"{w} [t1] WARN [{SRC}|task-0] Going to restart connector after 10 sec. after a "
+        "retriable exception (io.debezium.connector.common.BaseSourceTask)",
+        f"{w} Caused by: com.mysql.cj.jdbc.exceptions.CommunicationsException: Communications "
+        "link failure",
+        f"{w} [t3] INFO [{SRC}|task-0] Attempting to restart task. "
+        "(io.debezium.connector.common.BaseSourceTask)",
+    ]
+    killed = (
+        f"{w} [t3] ERROR [{SRC}|task-0] WorkerSourceTask{{id={SRC}-0}} Task threw an uncaught "
+        "and unrecoverable exception. Task is being killed and will not recover until "
+        "manually restarted (org.apache.kafka.connect.runtime.WorkerTask:212)"
+    )
+
+    def scoped(*lines: str):
+        return diagnose_connector_log(SRC, "\n".join(lines), episode_only=True)
+
+    access = f"{w} io.debezium.DebeziumException: Access denied for user 'cdc'@'10.0.1.5'"
+    found = scoped(*start, *recovered_link, killed, access)
+    assert found is not None
+    assert found.headline == _CONNECTOR_LOG_HEADLINES["access denied for user"]
+    # A death no needle matches: the generic row, not the recovered link failure's runbook.
+    gone = (
+        f"{w} io.debezium.DebeziumException: The connector is trying to read binlog starting "
+        "at file=mysql-bin-changelog.000200, pos=4, but this is no longer available"
+    )
+    assert scoped(*start, *recovered_link, killed, gone) is None
+    # The restart itself dies of the link: still found.
+    link = scoped(
+        *start, *recovered_link, killed,
+        f"{w} io.debezium.DebeziumException: Error reading MySQL variables: Communications "
+        "link failure",
+    )
+    assert link is not None
+    assert link.headline == _CONNECTOR_LOG_HEADLINES["communications link failure"]
+    # "Successfully restarted task", then a DDL the grammar rejects: the DDL is the cause.
+    ddl = scoped(
+        *start, *recovered_link[:-1],
+        f"{w} [t4] INFO [{SRC}|task-0] Successfully restarted task "
+        "(io.debezium.connector.common.BaseSourceTask)",
+        *_G7_STREAMING_TAIL.splitlines(),
+    )
+    assert ddl is not None
+    assert ddl.headline == "Debezium could not parse a DDL statement in the binary log"
+    # The Start CDC path still reads the whole tail, unchanged (first match wins).
+    whole = "\n".join([*start, *recovered_link, killed, access])
+    assert "could not reach the source MySQL" in (_diagnose_connector_log(SRC, whole) or "")
+
+
+def test_every_needle_has_a_short_headline() -> None:
+    from dsql_migrator.core.cdc_deployer import (
+        _CONNECTOR_LOG_DIAGNOSES,
+        _CONNECTOR_LOG_HEADLINES,
+        _UNPARSEABLE_DEFINITION_HEADLINE,
+        diagnose_connector_log,
+    )
+
+    from dsql_migrator.ui.data_migration._models import connector_health_rows
+
+    needles = [n for n, _g in _CONNECTOR_LOG_DIAGNOSES]
+    assert set(needles) == set(_CONNECTOR_LOG_HEADLINES)
+    proper = {"Debezium", "Debezium's", "AWS", "MSK", "PostgreSQL"}
+    for headline in (*_CONNECTOR_LOG_HEADLINES.values(), _UNPARSEABLE_DEFINITION_HEADLINE):
+        assert 0 < len(headline) <= 80 and "{" not in headline
+        assert not headline.endswith(".")
+        # Always composed mid-sentence ("Stopped — <headline>.", "... stopped: <headline>"),
+        # so a lower-case fragment unless it opens with a proper noun or acronym.
+        assert headline[0].islower() or headline.split()[0] in proper, headline
+        (row,) = connector_health_rows({SRC: "FAILED"}, diagnoses={SRC: headline})
+        after_dash = row.detail.split(" — ", 1)[1]
+        assert after_dash[0].islower() or after_dash.split()[0] in proper, row.detail
+    snap = diagnose_connector_log(SRC, _G7_SNAPSHOT_TAIL)
+    assert snap is not None and snap.headline == _UNPARSEABLE_DEFINITION_HEADLINE
+    stream = diagnose_connector_log(SRC, _G7_STREAMING_TAIL)
+    assert stream is not None
+    assert stream.headline == "Debezium could not parse a DDL statement in the binary log"
+
+
+def test_health_path_scoping_ignores_info_lines_and_earlier_task_runs() -> None:
+    from dsql_migrator.core.cdc_deployer import _diagnose_connector_log, diagnose_connector_log
+
+    # 1. A PostgreSQL start's INFO line must not label a later, unrelated failure.
+    slot_info = (
+        "[W] [ts] INFO [c|task-0] Obtained valid replication slot ReplicationSlot [...]\n"
+        "[W] [ts] ERROR [c|task-0] WorkerSourceTask{id=c-0} Task threw an uncaught "
+        "exception: org.apache.kafka.connect.errors.ConnectException: something else"
+    )
+    assert diagnose_connector_log(SRC, slot_info, episode_only=True) is None
+    # ...while the Start path (unscoped, pinned) still reads it as a slot setup failure.
+    start_path = _diagnose_connector_log(SRC, slot_info)
+    assert start_path is not None and "replication slot" in start_path
+    # 2. A failure from an EARLIER task run, then a clean restart: not this episode's cause.
+    restarted = (
+        f"{_G7_STREAMING_TAIL}\n"
+        "[W] [ts] INFO [c|task-0] Starting MySqlConnectorTask with configuration:\n"
+        "[W] [ts] INFO [c|task-0]    connector.class = io.debezium.connector.mysql.Mysql\n"
+        "[W] [ts] WARN [c|task-0] something harmless"
+    )
+    assert diagnose_connector_log(SRC, restarted, episode_only=True) is None
+    # ...and with two runs in the tail it is the LAST start line that bounds the episode.
+    start_line = "[W] [ts] INFO [c|task-0] Starting MySqlConnectorTask with configuration:"
+    two_runs = "\n".join([
+        start_line, _G7_STREAMING_TAIL, start_line, "[W] [ts] WARN [c|task-0] harmless",
+    ])
+    assert diagnose_connector_log(SRC, two_runs, episode_only=True) is None
+    # 3. The failure AFTER the start line is this episode's.
+    current = (
+        "[W] [ts] INFO [c|task-0] Starting MySqlConnectorTask with configuration:\n"
+        f"{_G7_STREAMING_TAIL}"
+    )
+    found = diagnose_connector_log(SRC, current, episode_only=True)
+    assert found is not None and "could not parse a DDL statement" in found.guidance
+    # 4. No start line and no level prefixes: exactly the Start path.
+    for tail in (_COLUMN_SIZE_LINE, _HISTORY_MISSING_LINE, "Access denied for user 'x'"):
+        scoped = diagnose_connector_log(SRC, tail, episode_only=True)
+        assert scoped is not None and scoped.guidance == _diagnose_connector_log(SRC, tail)
+
+
+def test_history_missing_after_failure_rule() -> None:
+    from dsql_migrator.core.cdc_deployer import (
+        _diagnose_connector_log,
+        history_missing_after_failure,
+    )
+
+    history = _diagnose_connector_log(SRC, _HISTORY_MISSING_LINE)
+    unknown = _diagnose_connector_log(SRC, _UNKNOWN_SCHEMA_LINE)
+    snapshot = _diagnose_connector_log(SRC, _G7_SNAPSHOT_TAIL)
+    streaming = _diagnose_connector_log(SRC, _G7_STREAMING_TAIL)
+    assert history_missing_after_failure("schema_only", history) is True
+    assert history_missing_after_failure("schema_only", unknown) is True
+    assert history_missing_after_failure("recovery", unknown) is False
+    assert history_missing_after_failure("recovery", snapshot) is True
+    assert history_missing_after_failure("recovery", streaming) is False
+    assert history_missing_after_failure("schema_only", snapshot) is False
+    for message in (history, unknown, snapshot, streaming, ""):
+        assert history_missing_after_failure(None, message) is False

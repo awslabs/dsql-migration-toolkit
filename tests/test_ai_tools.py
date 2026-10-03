@@ -290,3 +290,45 @@ def test_get_cdc_status_exposes_the_source_schema_re_check() -> None:
     assert all(r["open"] for r in rows[:13]) and not rows[13]["open"]
     assert rows[0] == {"table": "app.t00", "kinds": ["drop-column"], "open": True}
     assert "re-read of the source catalog" in payload["note"]
+
+
+def test_get_cdc_pipeline_diagnostics_names_connector_failure_causes() -> None:
+    """G7: the assistant learns WHY a stopped connector stopped -- the headline only."""
+    import json
+
+    from dsql_migrator.core.cdc_deployer import diagnose_connector_log
+    from dsql_migrator.ui.data_migration._state import DataMigrationState
+
+    def _execute(state):
+        return json.loads(
+            build_ai_tool_executor(
+                session_id="s1",
+                session_store=_Store(_Obj(target_config=None, target_verified=False)),
+                evaluation_store=_Store(get_returns=None),
+                schema_conversion_store=_Store(
+                    _Obj(generated_node_ids=[], apply_results=[])
+                ),
+                validation_store=_Store(_Obj(result=None)),
+                data_migration_store=_Store(state),
+                job_manager=_Obj(),
+                full_load_rate_eta=lambda *_a, **_k: (None, None),
+            )("get_cdc_pipeline_diagnostics", {})
+        )
+
+    empty = _execute(DataMigrationState())
+    assert empty["status"] == "ok" and empty["connector_failure_causes"] == {}
+    state = DataMigrationState()
+    src = "dsql-cdc-x-debezium-source"
+    diagnosis = diagnose_connector_log(
+        src,
+        "ParsingException: DDL statement couldn't be parsed. Please open a Jira issue "
+        "with the statement 'CREATE USER 'u'@'%' IDENTIFIED BY 'pw''",
+        episode_only=True,
+    )
+    epoch = state.claim_cdc_diagnosis_read(src, now=0.0, interval=60.0)
+    state.record_cdc_connector_diagnosis(src, diagnosis, epoch=epoch)
+    payload = _execute(state)
+    assert payload["status"] == "ok", payload
+    assert payload["connector_failure_causes"] == {src: diagnosis.headline}
+    assert "CREATE USER" not in json.dumps(payload)  # the headline, never the statement
+    assert "connector_failure_causes names why a stopped connector stopped" in payload["note"]

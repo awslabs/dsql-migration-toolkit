@@ -312,6 +312,16 @@ per-table 표 위에 **파이프라인 헬스 카드**가 각 커넥터 상태�
 싱크 send의 rec/s 게이지 두 개와 함께라 유휴 스트림과 멈춘 스트림을 한눈에 구분합니다. **라이브 stream-lag
 차트**는 최악의 종단 지연을 시간축으로 그려 "caught up"과 확정된 싱크 stall을 구분합니다.
 
+커넥터의 태스크가 멈추면 그 행이 빨간색으로 바뀝니다. 커넥터의 CloudWatch 워커 로그에 도구가 아는 실패 —
+Debezium이 파싱하지 못하는 MySQL DDL 문, 스키마 히스토리 문제, 만들 수 없는 PostgreSQL publication, 연결할
+수 없는 소스 등 — 가 보이면 행에 *Stopped —* 뒤에 원인이 표시되고, 커넥터 아래의 오류 알림이 무엇을 해야
+하는지 알려 줍니다. 도구는 그 로그의 최신 몇백 줄만, 커넥터가 멈춰 있는 동안에만, 최대 1분에 한 번 읽고,
+찾은 내용을 커넥터가 다시 실행되거나 다음 Start까지 유지합니다. DDL 문의 따옴표로 묶인 값은 가려집니다.
+그렇지 않으면 행에 *Stopped — a task is not running. Restart required.*가 표시되고, 자세한 내용은 로그 그룹
+`/msk-connect/<stack>-cdc`에 있습니다. 그러면 라이프사이클 카드는 CDC가 스트리밍 중이 아니라고 알리고
+**Stop CDC**를 제공합니다: Retry CDC는 이미 있는 커넥터를 그대로 두므로 멈춘 커넥터를 다시 시작할 수 없습니다.
+Stop CDC 후에도 원인은 다음 Start까지 Start CDC 카드에 남습니다.
+
 ### DLQ 들여다보기
 
 인터랙티브 **DLQ 인스펙터**가 데드레터 레코드를 **Time / Table / SQLSTATE / Reason**으로 나열합니다 —

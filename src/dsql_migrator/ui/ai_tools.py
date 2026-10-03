@@ -178,7 +178,8 @@ AI_TOOL_SCHEMAS: list[dict] = [
         "description": (
             "Diagnose WHY CDC is not streaming (or failed to start): the CDC "
             "CloudFormation stack phase + raw status, per-connector state "
-            "(RUNNING/FAILED), a confirmed sink stall (connector RUNNING but applying "
+            "(RUNNING/FAILED) and, for a stopped connector, the cause matched from its "
+            "worker log, a confirmed sink stall (connector RUNNING but applying "
             "nothing), the last CDC deploy action + any FAILED deploy stage, the tail "
             "of the deploy log (already-diagnosed, human-actionable failure text — e.g. "
             "partition-quota exhaustion, missing IAM JAAS, bad source creds), and the "
@@ -825,6 +826,14 @@ def build_ai_tool_executor(
                      "stack_phase": getattr(_dm, "cdc_stack_phase", None),
                      "stack_status": getattr(_dm, "cdc_stack_phase_status", None),
                      "connector_states": _conn_states,
+                     # Why a stopped connector stopped, from its worker log: the short
+                     # headline only (value-free), never the runbook or the log.
+                     "connector_failure_causes": {
+                         str(n): str(getattr(d, "headline", "") or "")
+                         for n, d in (
+                             getattr(_dm, "cdc_connector_diagnoses", None) or {}
+                         ).items()
+                     },
                      "sink_stall_confirmed": bool(
                          getattr(_act, "sink_stall_confirmed", False)
                      ),
@@ -838,7 +847,9 @@ def build_ai_tool_executor(
                               "deploy_log_tail (why the deploy stopped). "
                               "sink_stall_confirmed = connector RUNNING but nothing "
                               "applied (silent data loss). watermark_handoff is where "
-                              "CDC resumes from after Full Load.")}
+                              "CDC resumes from after Full Load. "
+                              "connector_failure_causes names why a stopped connector "
+                              "stopped; the CDC step shows the steps to take.")}
                 )
             if name == "get_prerequisite_verdicts":
                 from dsql_migrator.core.models import MigrationMode

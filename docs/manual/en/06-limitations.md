@@ -145,9 +145,11 @@ fails **loudly** where it can't.
     (Debezium tracks every table's definition, so it fails replaying it), a change made
     while the connectors are being created, or one made shortly before an automatic
     restart of that first run. A rename, or an added or dropped column, stops the
-    connector, and the CDC step names the cause. A change that keeps the column count
-    does not: the older rows are written with shifted or NULL values and no error. The
-    source schema re-check
+    connector, and the CDC step names the cause — in the Start CDC error, or on the
+    connector's Pipeline health row if it stops after starting
+    ([§4.6](04-cdc-and-dsql-constraints.md#pipeline-health-and-change-flow)). A change
+    that keeps the column count does not: the older rows are written with shifted or
+    NULL values and no error. The source schema re-check
     ([§4.2](04-cdc-and-dsql-constraints.md#changes-that-dead-letter-nothing-the-source-schema-re-check))
     reports a retype or a replaced column and holds Cut over. Neither check sees a
     reorder or a character-set conversion, so validate the table with CHECKSUM after such
@@ -183,6 +185,40 @@ fails **loudly** where it can't.
     next Start rebuilds it (`recovery`) after the same check. That check compares the
     tables with the original start point, so a change made even before the Stop refuses
     that Start.
+- **MySQL: a DDL statement Debezium cannot parse, anywhere on the source server, stops
+  CDC.** Debezium parses every DDL statement in the binary log with its MySQL grammar
+  (Debezium 2.7) — for every database and table on the server, not only the captured
+  ones, including stored routines, triggers, views and account statements — before it
+  filters anything, and the tool's configuration stops rather than skip one it cannot
+  parse. The source connector stops just before the statement and its position cannot
+  move past it: Retry CDC, and Start CDC after Stop CDC, stop on it again. The CDC step
+  names the cause — in the Start CDC error, or on the connector's Pipeline health row
+  with an error notice once it has started
+  ([§4.6](04-cdc-and-dsql-constraints.md#pipeline-health-and-change-flow)) — and shows
+  the beginning of the statement with quoted values hidden.
+  - **Way forward.** Stop CDC, then give CDC a start point after the statement:
+    **Re-run Full Load with "Drop & reload"** for all tables (Full load + CDC; re-run
+    Step 1 Evaluation and Schema Conversion first if the statement changed a captured
+    table), or **Manual** → **Fetch current position** → **Use this start point**;
+    changes made between where CDC stopped and that point are then not replicated, so
+    reload those tables with "Drop & reload" (CDC only: correct them on Aurora DSQL) and
+    validate with CHECKSUM. A reload switches the start point back to Automatic, so
+    choose Manual again before Start CDC. Do not use the *binlog reader near position*
+    from the connector log as a start point: it is where the failing statement begins.
+  - **When moving the start point does not help.** A Start that builds Debezium's
+    schema from the source — the first Start, a Start from a new start point, a Start
+    that rebuilds a missing schema history — reads the current definition of every
+    table on the server. If a table's own definition uses syntax the grammar does not
+    support, every such Start stops while reading it, whatever the start point: change
+    that definition on the source, then Stop CDC and Start CDC, or migrate that server
+    with Full load only. A statement that runs again (a schema-migration tool, a
+    scheduled job) stops CDC each time it runs.
+  - **No skip option.** The tool does not offer Debezium's
+    `schema.history.internal.skip.unparseable.ddl`: a skipped statement can leave
+    Debezium's table definitions silently wrong, so later rows could be written to the
+    wrong columns with no error, and the same setting also skips a column rename
+    Debezium cannot replay (above), turning that stop into wrong values. PostgreSQL
+    sources are not affected: their change stream carries no DDL.
 - **Cascading FK actions don't replicate over CDC.** Server-side `ON DELETE/UPDATE
   CASCADE` (and `SET NULL`/`SET DEFAULT`) actions fire *inside* the source engine
   and may not be captured by the change stream, so CDC can't apply them — the child

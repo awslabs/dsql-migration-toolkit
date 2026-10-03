@@ -1149,3 +1149,63 @@ def test_a_stale_or_rejected_continuation_restarts_from_the_cursor() -> None:
     state = controller.dlq_read_state(group)
     assert state.ok is True  # the rejected token fell back to a fresh read, not a failure
     assert "nextToken" not in rejecting.calls[20]  # the rejected call raised before recording
+
+
+# ---------------------------------------------------------------------------
+# connector_log_tail (G7: the Pipeline-health read of a stopped connector)
+# ---------------------------------------------------------------------------
+
+
+class _FakeLogs:
+    """Fake CloudWatch Logs client recording describe_log_streams / get_log_events."""
+
+    def __init__(self, streams, events, *, raise_on=None):
+        self._streams = streams
+        self._events = events
+        self._raise_on = raise_on
+        self.calls: list[tuple[str, dict]] = []
+
+    def describe_log_streams(self, **kwargs):
+        self.calls.append(("describe_log_streams", kwargs))
+        if self._raise_on == "describe_log_streams":
+            raise RuntimeError("AccessDenied")
+        return {"logStreams": [{"logStreamName": s} for s in self._streams]}
+
+    def get_log_events(self, **kwargs):
+        self.calls.append(("get_log_events", kwargs))
+        if self._raise_on == "get_log_events":
+            raise RuntimeError("Throttling")
+        return {"events": [{"message": m} for m in self._events]}
+
+
+def test_connector_log_tail_reads_the_newest_matching_stream_bounded() -> None:
+    src = "dsql-cdc-x-debezium-source"
+    logs = _FakeLogs(
+        ["dsql-cdc-x-dsql-sink/worker-1", f"{src}/worker-2", f"{src}/worker-0"],
+        ["line one", "line two"],
+    )
+    controller = MskConnectController("us-east-1", session=_FakeSession(logs))
+    assert controller.connector_log_tail("dsql-cdc-x", src) == "line one\nline two"
+    (describe, d_kwargs), (get, g_kwargs) = logs.calls
+    assert describe == "describe_log_streams" and get == "get_log_events"
+    assert d_kwargs == {
+        "logGroupName": "/msk-connect/dsql-cdc-x-cdc",
+        "orderBy": "LastEventTime",
+        "descending": True,
+        "limit": 10,
+    }
+    # The FIRST stream (newest) that names this connector -- not the sink's, not an older one.
+    assert g_kwargs["logStreamName"] == f"{src}/worker-2"
+    assert g_kwargs["limit"] == 400 and g_kwargs["startFromHead"] is False
+    # No stream for this connector: nothing, and no events read.
+    none = _FakeLogs(["dsql-cdc-x-dsql-sink/worker-1"], ["x"])
+    assert MskConnectController("us-east-1", session=_FakeSession(none)).connector_log_tail(
+        "dsql-cdc-x", src
+    ) == ""
+    assert [c for c, _k in none.calls] == ["describe_log_streams"]
+    # Any error is advisory: "".
+    for where in ("describe_log_streams", "get_log_events"):
+        broken = _FakeLogs([f"{src}/w"], ["x"], raise_on=where)
+        assert MskConnectController(
+            "us-east-1", session=_FakeSession(broken)
+        ).connector_log_tail("dsql-cdc-x", src) == ""

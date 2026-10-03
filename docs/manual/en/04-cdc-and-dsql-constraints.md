@@ -384,6 +384,19 @@ poll vs sink send), so you can tell an idle stream from a stuck one at a glance.
 **live stream-lag chart** plots the worst end-to-end lag over time, distinguishing
 "caught up" from a confirmed sink stall.
 
+When a connector's task stops, its row turns red. If the connector's CloudWatch worker
+log shows a failure the tool recognizes — a MySQL DDL statement Debezium cannot parse, a
+schema-history problem, a PostgreSQL publication it cannot create, an unreachable
+source, and others — the row reads *Stopped —* followed by the cause, and an error
+notice under the connectors says what to do. The tool reads only the newest few hundred
+lines of that log, only while a connector is stopped and at most once a minute, and
+keeps what it found until the connector runs again or the next Start; quoted values in
+a DDL statement are hidden. Otherwise the row reads *Stopped — a task is not running.
+Restart required.* and the log group `/msk-connect/<stack>-cdc` has the details. The
+lifecycle card then says CDC is not streaming and offers **Stop CDC**: Retry CDC leaves
+connectors that exist as they are, so it cannot restart a stopped one. After Stop CDC,
+the cause stays on the Start CDC card until the next Start.
+
 ### Inspecting the DLQ
 
 An interactive **DLQ inspector** lists dead-lettered records — **Time / Table /

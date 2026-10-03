@@ -387,6 +387,24 @@ class DataMigrationState:
         # ...and the ones already written to the DURABLE activity log, so the 5 s poll
         # writes one line per column, once (same guard as cdc_dlq_audited_keys).
         self.cdc_value_conversion_audited_keys: set = set()
+        # Why a connector stopped after it started, matched from its CloudWatch worker log
+        # by the poll ({connector name: core.cdc_deployer.ConnectorLogDiagnosis}): the
+        # cause on its Pipeline-health row and the runbook under it. Transient and scoped to
+        # ONE failure episode -- never persisted (a restarted session re-reads it while the
+        # task is still dead). Cleared when the connector runs again, at every Start/Retry
+        # submission, and when the stack is gone or another one is targeted; deliberately
+        # KEPT across Stop CDC, because the runbook's first step is Stop CDC and the cause
+        # must still be on the Start card afterwards. Copy-on-write: replaced, never mutated.
+        self.cdc_connector_diagnoses: dict = {}
+        # Monotonic time of each connector's last log read (the throttle; single flight
+        # across tabs, see claim_cdc_diagnosis_read), and the diagnoses already written to
+        # the durable activity log (one line per episode).
+        self._cdc_diagnosis_read_at: dict[str, float] = {}
+        self._cdc_diagnoses_audited: frozenset = frozenset()
+        # Which episode a read belongs to: every clear makes a new object, so a read that
+        # was in flight when the episode ended lands nowhere (same idea as
+        # _cdc_catalog_drift_epoch).
+        self._cdc_diagnosis_epoch: object = object()
         # Outcome of the explicit "Apply foreign keys" action on this step:
         # (applied, skipped, failed), or None while it has not been run. Foreign keys are
         # no longer applied as part of the load (the orphan pre-check is O(child rows) and
@@ -1309,6 +1327,8 @@ class DataMigrationState:
                 # The snapshot-mode facts describe the previously-targeted stack too.
                 self.cdc_deployed_snapshot_mode = None
                 self.cdc_history_missing = False
+                # ...and so does why its connectors stopped (names embed the stack name).
+                self._clear_cdc_connector_diagnoses_locked(None)
             self.cdc_stack_name = candidate
         return True
 
@@ -1323,9 +1343,10 @@ class DataMigrationState:
             self.cdc_probe_error = None  # a successful probe clears any prior failure
             if phase == "absent":
                 self.cdc_offered_seed = None  # a new stack gets a new offsets topic
-                # ...and a new schema history, and no connectors.
+                # ...and a new schema history, and no connectors (nor why they stopped).
                 self.cdc_deployed_snapshot_mode = None
                 self.cdc_history_missing = False
+                self._clear_cdc_connector_diagnoses_locked(None)
 
     def set_cdc_probe_error(self, message: Optional[str]) -> None:
         """Record why the read-only CDC-state probe failed (or clear it with None).
@@ -1397,6 +1418,7 @@ class DataMigrationState:
             self.cdc_offered_seed = None
             self.cdc_deployed_snapshot_mode = None
             self.cdc_history_missing = False
+            self._clear_cdc_connector_diagnoses_locked(None)
             # Applied-ops + replication-lag metrics are per-stack too; drop them so the
             # adopted stack's poll repopulates rather than showing the prior stack's.
             self.cdc_applied_ops_by_table = {}
@@ -1684,6 +1706,77 @@ class DataMigrationState:
         """Record whether a schema_only resume found this stack's schema history missing."""
         with self._lock:
             self.cdc_history_missing = bool(value)
+
+    # -- why a connector stopped (Pipeline-health diagnosis, one failure episode) --------
+
+    def claim_cdc_diagnosis_read(
+        self, name: str, *, now: float, interval: float
+    ) -> Optional[object]:
+        """Claim the next worker-log read for ``name``; the episode token, or ``None``.
+
+        ``None`` when ``name`` already has a diagnosis (sticky: a dead task stops logging,
+        so re-reading cannot improve it) or was read less than ``interval`` seconds ago.
+        Otherwise stamps the read time -- before the read, so concurrent polls of other
+        tabs skip it (single flight) -- and returns the current epoch, which
+        :meth:`record_cdc_connector_diagnosis` checks.
+        """
+        with self._lock:
+            if name in self.cdc_connector_diagnoses:
+                return None
+            last = self._cdc_diagnosis_read_at.get(name)
+            if last is not None and now - last < interval:
+                return None
+            self._cdc_diagnosis_read_at = {**self._cdc_diagnosis_read_at, name: now}
+            return self._cdc_diagnosis_epoch
+
+    def record_cdc_connector_diagnosis(self, name: str, diagnosis, *, epoch) -> None:
+        """Hold ``diagnosis`` for ``name`` -- unless its read began before the last clear."""
+        with self._lock:
+            if epoch is not self._cdc_diagnosis_epoch:
+                return
+            if name in self.cdc_connector_diagnoses:
+                return
+            self.cdc_connector_diagnoses = {**self.cdc_connector_diagnoses, name: diagnosis}
+
+    def clear_cdc_connector_diagnoses(self, names: Optional[Iterable[str]] = None) -> None:
+        """End the failure episode of ``names`` (every connector when ``None``)."""
+        with self._lock:
+            self._clear_cdc_connector_diagnoses_locked(names)
+
+    def _clear_cdc_connector_diagnoses_locked(self, names: Optional[Iterable[str]]) -> None:
+        # Caller holds self._lock. ALWAYS a new epoch, even when nothing was held, so a read
+        # already in flight cannot land after the clear.
+        self._cdc_diagnosis_epoch = object()
+        if names is None:
+            self.cdc_connector_diagnoses = {}
+            self._cdc_diagnosis_read_at = {}
+            self._cdc_diagnoses_audited = frozenset()
+            return
+        drop = set(names)
+        if not drop:
+            return
+        self.cdc_connector_diagnoses = {
+            k: v for k, v in self.cdc_connector_diagnoses.items() if k not in drop
+        }
+        self._cdc_diagnosis_read_at = {
+            k: v for k, v in self._cdc_diagnosis_read_at.items() if k not in drop
+        }
+        self._cdc_diagnoses_audited = frozenset(self._cdc_diagnoses_audited - drop)
+
+    def take_unaudited_cdc_diagnoses(self) -> list:
+        """The held ``(name, diagnosis)`` pairs not yet written to the activity log.
+
+        Marks them written, so each episode gets ONE durable line however often the poll
+        applies; the written set is pruned to the names still held.
+        """
+        with self._lock:
+            held = self.cdc_connector_diagnoses
+            fresh = [(n, d) for n, d in held.items() if n not in self._cdc_diagnoses_audited]
+            self._cdc_diagnoses_audited = frozenset(
+                n for n in (set(self._cdc_diagnoses_audited) | {n for n, _ in fresh})
+                if n in held
+            )
+            return fresh
 
     def set_cdc_applied_ops_by_table(
         self, applied_ops: "dict[str, dict[str, int]]"

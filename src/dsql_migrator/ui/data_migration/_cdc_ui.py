@@ -1792,6 +1792,21 @@ def classify_cdc_card_phase(
     return "running"
 
 
+def cdc_dead_task_names(expected, names, failed_names) -> list:
+    """The expected connectors whose TASK stopped while every expected one exists. Pure.
+
+    In ``expected``'s order (the card passes source first); ``[]`` when an expected
+    connector is missing or none stopped. This is the dead-task clause of
+    :func:`classify_cdc_card_phase`'s ``"partial"``: the lifecycle notice and its Danger
+    zone both key on it, so they never disagree about "missing" versus "stopped".
+    """
+    expected = list(expected or [])
+    if not expected or not set(expected).issubset(set(names or [])):
+        return []
+    stopped = set(failed_names or [])
+    return [n for n in expected if n in stopped]
+
+
 def _cdc_start_detail(
     stack_name: str,
     watermark: object,
@@ -2257,8 +2272,11 @@ def _render_cdc_start_action(
         elif phase == "partial":
             _render_cdc_partial_actions(
                 ui, migration_state, job_manager, refresh,
-                names=names, expected=expected,
+                # Ordered (source first), so the notice names stopped connectors in
+                # data-flow order.
+                names=names, expected=cdc_expected_connector_names(stack_name),
                 inventory=inventory, session=session,
+                failed=failed_names,
             )
         elif phase == "infra":
             _render_cdc_start_button(
@@ -2319,7 +2337,24 @@ def _render_cdc_start_action(
                     "instead — it keeps the infrastructure so you can restart "
                     "quickly. Delete only for a full teardown."
                 )
-            else:  # partial
+            elif cdc_dead_task_names(
+                cdc_expected_connector_names(stack_name), names, failed_names
+            ):
+                # Every connector exists but a task stopped: "Delete if Start keeps
+                # failing" would send a stop that repeats by design (an unparseable DDL,
+                # a schema-history replay) to a slow, billable teardown that returns to
+                # the same stop. The partition quota is the one cause Delete does fix.
+                danger_header = "Delete does not restart a stopped connector"
+                danger_body = (
+                    "Deleting tears down the whole cdc-stack (MSK, VPC wiring, plugins, "
+                    "connectors) and does not fix why a connector stopped: after you "
+                    "deploy again, Start CDC reads the source again, so the connector "
+                    "stops the same way until its cause is dealt with. Follow the steps "
+                    "above, and on Pipeline health when it names the cause, instead. "
+                    "Delete only for a full teardown, or when the MSK partition quota is "
+                    "exhausted (a redeploy reclaims it)."
+                )
+            else:  # partial: a connector is missing
                 danger_header = "Delete only if Stop + Start can't recover"
                 danger_body = (
                     "Try Stop CDC above, then Start CDC again first. Delete only if "
@@ -2339,9 +2374,10 @@ def _render_cdc_start_action(
 
 def _render_cdc_partial_actions(
     ui, migration_state, job_manager, refresh, *, names, expected,
-    inventory=None, session=None,
+    inventory=None, session=None, failed=None,
 ) -> None:
-    """Actions for a PARTIAL pipeline: some but not all connectors are present.
+    """Actions for a PARTIAL pipeline: some but not all connectors are present -- or all
+    are, but a connector's task stopped (``failed``).
 
     This is the post-failed-Start / post-rollback state — e.g. the source
     survived but the sink connector failed to create (commonly the MSK Serverless
@@ -2362,9 +2398,55 @@ def _render_cdc_partial_actions(
       (same backend path as Stop CDC) to return to a clean infra-only state --
       useful when Retry keeps failing (e.g. MSK partition quota) and a from-scratch
       Start (or Delete + redeploy via the Danger zone) is wanted.
+
+    When every expected connector EXISTS but one's task stopped (a FAILED connector -- an
+    unparseable DDL statement or a schema-history replay failure, say), neither action
+    fits: there is nothing missing to re-create, and Retry CDC does not restart a
+    connector that exists (``run_cdc_start`` skips both when MSK reports them RUNNING, and
+    an unchanged update re-creates nothing). That case says so and offers the normal Stop
+    CDC; the cause, when the worker log matched one, is on the Pipeline-health card below.
     """
     present = set(names)
     missing = [n for n in expected if n not in present]
+    stopped = cdc_dead_task_names(expected, names, failed)
+    if stopped:
+        stack_name = getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
+        many = len(stopped) > 1
+        failed_label = " and ".join(connector_role_label(n) for n in stopped)
+        held = getattr(migration_state, "cdc_connector_diagnoses", None) or {}
+        known = any(n in held for n in stopped)
+        # error, not warning: a dead task blocks streaming and cut over -- the same tone as
+        # the Pipeline-health notice and row for the same stop.
+        render_notice(
+            ui,
+            tone="error",
+            header=(
+                "CDC is not streaming — both connectors stopped"
+                if many
+                else "CDC is not streaming — a connector stopped"
+            ),
+            body=(
+                f"Both connectors exist, but the {failed_label} "
+                + ("tasks have" if many else "task has")
+                + " stopped, so changes are not reaching Aurora DSQL. Retry CDC leaves "
+                "connectors that exist as they are, so it cannot restart "
+                + ("them. " if many else "this one. ")
+                + (
+                    "Pipeline health below names the cause and what to do."
+                    if known
+                    else "No known cause has been matched in "
+                    + ("their worker logs" if many else "its worker log")
+                    + " yet; the "
+                    f"CloudWatch log group /msk-connect/{stack_name}-cdc has the error. "
+                    "Once the cause is fixed, Stop CDC, then Start CDC: it continues "
+                    "from the recorded stream position."
+                )
+            ),
+        )
+        _render_cdc_running_actions(
+            ui, migration_state, job_manager, refresh, session=session
+        )
+        return
     missing_label = ", ".join(connector_role_label(n) for n in missing) or "a connector"
     present_label = ", ".join(connector_role_label(n) for n in sorted(present))
     render_notice(
@@ -2443,6 +2525,21 @@ def _render_cdc_start_button(
     resumes_from_offset = cdc_start_resumes(
         migration_state, _seed, _cdc_source_type(session)
     )
+    # Why the last run's connector stopped, kept across Stop CDC (the runbook's first step)
+    # until the next Start: "Ready to resume" alone would invite the Start that stops the
+    # same way. A past event the operator can act on, not a block -> warning.
+    _stack = getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
+    _last_causes = getattr(migration_state, "cdc_connector_diagnoses", None) or {}
+    for _diagnosis in _last_causes.values():
+        render_notice(
+            ui,
+            tone="warning",
+            header=f"The last CDC run stopped: {_diagnosis.headline}",
+            body=(
+                f"{_diagnosis.guidance} The full error is in the CloudWatch log group "
+                f"/msk-connect/{_stack}-cdc."
+            ),
+        )
     # A PostgreSQL start that RE-SNAPSHOTS needs no prior start point: it is a resolved
     # start on its own (snapshot.mode=initial, the connector creates its own slot). Keyed on
     # that FACT, not on the radio value it used to read (`is_pg and mode == "manual"`).
@@ -2505,6 +2602,15 @@ def _render_cdc_start_button(
                 "Start CDC re-creates them and continues from exactly where streaming "
                 "stopped: no gap, no re-load, and no need to re-enter a start point. It "
                 "takes a few minutes; progress appears below."
+                if not _last_causes
+                # A held stop cause qualifies the promise: for the replay causes (an
+                # unparseable DDL, a schema-history replay) a Start from the recorded
+                # position stops the same way, and the notice above says what to do. Not
+                # "streamed before" either: a stop in the schema snapshot never streamed.
+                else "This pipeline's resume position is still recorded on MSK — stopping "
+                "CDC removed only the connectors, not that position. The last run stopped "
+                "for the cause above: follow its steps before Start CDC — for some causes "
+                "a Start from the recorded position stops the same way."
             ),
         )
     else:
@@ -5163,6 +5269,17 @@ def _open_cdc_stop_dialog(
                 "it needs the same follow-up on Aurora DSQL, and the CDC step reports it as "
                 "schema drift."
             )
+        # A connector that stopped for a known cause: "no start point needed again" is
+        # not true for every cause (a stop the recorded position replays), so say so.
+        _held = getattr(migration_state, "cdc_connector_diagnoses", None) or {}
+        _wired = list(getattr(migration_state, "cdc_connector_names", None) or [])
+        _cause = next(((n, _held[n]) for n in _wired if n in _held), None)
+        if _cause is not None:
+            body += (
+                f" {connector_role_label(_cause[0])} stopped: {_cause[1].headline}. "
+                "Follow the steps the CDC step shows for it before Start CDC — for some "
+                "causes a Start from the recorded position stops the same way."
+            )
         confirm_label = "Stop CDC"
     with ui.dialog() as dialog, ui.card().classes("gap-2").style("min-width: 460px"):  # type: ignore[attr-defined]
         ui.label(title).classes("text-lg font-semibold")  # type: ignore[attr-defined]
@@ -6149,7 +6266,10 @@ def _start_cdc_deploy(
         # Recorded BEFORE the Start: if it fails after the seeder wrote this offset, a later
         # Start must not offer an earlier one (seed_refused_by_an_earlier_offer).
         migration_state.note_cdc_offered_seed(seed)
-        from dsql_migrator.core.cdc_deployer import CdcDeployError, is_schema_history_failure
+        from dsql_migrator.core.cdc_deployer import (
+            CdcDeployError,
+            history_missing_after_failure,
+        )
 
         try:
             run_cdc_start(
@@ -6182,11 +6302,11 @@ def _start_cdc_deploy(
         except CdcDeployError as exc:
             # A schema_only RESUME that found this stack's schema history missing or
             # incomplete would fail the same way on every Start: flag it so the next one
-            # rebuilds the history (recovery, after the start-point check).
-            if (
-                not _is_pg_start
-                and _sent_snapshot_mode == "schema_only"
-                and is_schema_history_failure(str(exc))
+            # rebuilds the history (recovery, after the start-point check). So would a
+            # recovery Start whose schema snapshot stopped on a table definition Debezium
+            # cannot parse: the offset is seeded, the history is not.
+            if not _is_pg_start and history_missing_after_failure(
+                _sent_snapshot_mode, str(exc)
             ):
                 _note = getattr(migration_state, "note_cdc_history_missing", None)
                 if callable(_note):
@@ -6231,6 +6351,11 @@ def _start_cdc_deploy(
         if callable(_mark):
             _mark()
     _note_cdc_start(migration_state)
+    # Each Start or Retry is a new failure episode: a cause read for the connectors it
+    # replaces must not label the ones it creates (their names repeat).
+    _clear_causes = getattr(migration_state, "clear_cdc_connector_diagnoses", None)
+    if callable(_clear_causes):
+        _clear_causes()
     job_id = job_manager.submit(
         _logged_cdc_lifecycle(_action, detail=_detail, work=work)
     )

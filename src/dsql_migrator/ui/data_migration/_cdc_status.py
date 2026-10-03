@@ -1770,6 +1770,125 @@ def cdc_activity_summary(
     )
 
 
+# How often the poll may re-read a STOPPED connector's worker log while no known cause has
+# matched yet (per connector, per session). Two capped CloudWatch Logs calls per read; zero
+# while every connector is healthy or once a cause is held.
+_CDC_DIAGNOSIS_READ_INTERVAL_SECONDS = 60.0
+
+
+def _folded_connector_state(state, health_entry):
+    """A connector's display state with its CloudWatch task health folded in. Pure.
+
+    MSK reports the CONNECTOR resource, not its task: a connector that is RUNNING while
+    ``ErroredTaskCount > 0`` is not streaming, so it reads FAILED. FAILED stays FAILED and
+    every other state is unchanged. ONE rule for the status view and the log read below.
+    """
+    errored = getattr(health_entry, "errored_tasks", None) if health_entry else None
+    if state is ConnectorState.RUNNING and errored and errored > 0:
+        return ConnectorState.FAILED
+    return state
+
+
+def _read_connector_diagnoses(migration_state, controller, statuses, health, *, now=None):
+    """Read and diagnose the worker log of each STOPPED connector (BLOCKING; worker thread).
+
+    Only for a connector whose folded state is FAILED, at most once per
+    ``_CDC_DIAGNOSIS_READ_INTERVAL_SECONDS`` each, and never again once a cause is held
+    (see ``claim_cdc_diagnosis_read``). The tail is scoped to the latest task run without
+    INFO lines (``episode_only``) and dropped right after matching: only the derived,
+    value-masked diagnosis is kept on ``migration_state``. A no-op for a controller without
+    the reader or a state without the claim.
+    """
+    reader = getattr(controller, "connector_log_tail", None)
+    stack = getattr(migration_state, "cdc_stack_name", None)
+    claim = getattr(migration_state, "claim_cdc_diagnosis_read", None)
+    record = getattr(migration_state, "record_cdc_connector_diagnosis", None)
+    if not callable(reader) or not stack or not callable(claim) or not callable(record):
+        return
+    import time as _time
+
+    from dsql_migrator.core.cdc_deployer import diagnose_connector_log
+
+    when = _time.monotonic() if now is None else now
+    for status in statuses or []:
+        name = getattr(status, "name", None)
+        if not name:
+            continue
+        state = _folded_connector_state(status.state, (health or {}).get(name))
+        if state is not ConnectorState.FAILED:
+            continue
+        epoch = claim(name, now=when, interval=_CDC_DIAGNOSIS_READ_INTERVAL_SECONDS)
+        if epoch is None:
+            continue
+        try:
+            tail = reader(stack, name)
+        except Exception:  # noqa: BLE001 - advisory; the next interval reads again
+            tail = ""
+        diagnosis = diagnose_connector_log(
+            name, tail if isinstance(tail, str) else "", episode_only=True
+        )
+        del tail
+        if diagnosis is not None:
+            record(name, diagnosis, epoch=epoch)
+
+
+def _settle_cdc_connector_diagnoses(migration_state, adjusted, health) -> None:
+    """Apply step for the held stop causes (in-memory; on the event loop).
+
+    * A connector with a POSITIVE healthy signal -- RUNNING and ``errored_tasks == 0`` --
+      ends its episode (an unknown task count keeps the cause: absence of evidence is not
+      recovery).
+    * Each newly held cause gets ONE durable activity line: the headline and the masked
+      guidance, never the raw log.
+    * A held cause that means the stack's schema history is missing flags it, by the same
+      rule as the Start CDC error (``history_missing_after_failure`` on the deployed MySQL
+      snapshot mode). Re-applied on every poll, so a Start-success clear that raced the
+      first diagnosis is set again.
+    """
+    held = dict(getattr(migration_state, "cdc_connector_diagnoses", None) or {})
+    if not held:
+        return
+    recovered = []
+    for status in adjusted or []:
+        if status.name not in held or status.state is not ConnectorState.RUNNING:
+            continue
+        entry = (health or {}).get(status.name)
+        if entry is not None and entry.errored_tasks == 0:
+            recovered.append(status.name)
+    clear = getattr(migration_state, "clear_cdc_connector_diagnoses", None)
+    if recovered and callable(clear):
+        clear(recovered)
+        for name in recovered:
+            held.pop(name, None)
+    take = getattr(migration_state, "take_unaudited_cdc_diagnoses", None)
+    if callable(take):
+        fresh = take()
+        if fresh:
+            # Function-local, matching the other activity-log writes in this module.
+            from dsql_migrator.core.activity_log import (
+                ActivityCategory,
+                ActivityStatus,
+                log_activity,
+            )
+
+            for name, diagnosis in fresh:
+                log_activity(
+                    ActivityCategory.CDC,
+                    f"connector {name} stopped: {diagnosis.headline}",
+                    status=ActivityStatus.FAILURE,
+                    detail=diagnosis.guidance,
+                )
+    if not held or getattr(migration_state, "cdc_history_missing", False):
+        return
+    from dsql_migrator.core.cdc_deployer import history_missing_after_failure
+
+    mode = getattr(migration_state, "cdc_deployed_snapshot_mode", None)
+    if any(history_missing_after_failure(mode, d.guidance) for d in held.values()):
+        note = getattr(migration_state, "note_cdc_history_missing", None)
+        if callable(note):
+            note(True)
+
+
 def _fetch_cdc_status(migration_state, tables=None):
     """Read connector state + CloudWatch task health (BLOCKING network I/O).
 
@@ -1782,8 +1901,10 @@ def _fetch_cdc_status(migration_state, tables=None):
     is not a pure read: it writes the DLQ read bookkeeping onto ``migration_state`` --
     the cursor and seen ids, the coverage bound, the value-conversion set, and the
     read's outcome as ``cdc_dlq_pending_read``, which :func:`_apply_cdc_status`
-    promotes only after folding the records. ``tables`` (the migrated table set) scopes
-    the scan-free per-table applied-ops metrics read; omitted (non-UI callers) -> skipped.
+    promotes only after folding the records -- and the stop cause of a connector whose
+    task stopped (``cdc_connector_diagnoses``, see :func:`_read_connector_diagnoses`).
+    ``tables`` (the migrated table set) scopes the scan-free per-table applied-ops
+    metrics read; omitted (non-UI callers) -> skipped.
     """
     controller = getattr(migration_state, "cdc_controller", None)
     names = list(getattr(migration_state, "cdc_connector_names", []) or [])
@@ -1794,6 +1915,12 @@ def _fetch_cdc_status(migration_state, tables=None):
         health = controller.connector_health(names)
     except Exception:  # noqa: BLE001 - keep the last good view on any error
         return None
+    # Best-effort: why a connector stopped, from its worker log -- only for a stopped one,
+    # throttled and sticky, so a healthy pipeline makes no log call at all. Never fatal.
+    try:
+        _read_connector_diagnoses(migration_state, controller, statuses, health)
+    except Exception:  # noqa: BLE001 - advisory, never break the poll
+        _logger.warning("connector stop-cause read failed", exc_info=True)
     # Best-effort: read the sink's per-table applied-ops (Inserts/Updates/Deletes) so
     # the per-table monitor shows CDC progress WITHOUT a source/target COUNT(*).
     # Only when the controller exposes the reader and we know the table set; never
@@ -2346,8 +2473,10 @@ def _apply_cdc_status(migration_state, fetched) -> None:
 
     Pure/in-memory (no network): folds CloudWatch errored-task counts into the
     connector state (a connector MSK reports as RUNNING but with errored tasks is
-    degraded -> FAILED) and writes the view + throughput onto ``migration_state``.
-    Safe to call on the event loop after :func:`_fetch_cdc_status` returns.
+    degraded -> FAILED, :func:`_folded_connector_state`), settles the held connector stop
+    causes (:func:`_settle_cdc_connector_diagnoses`) and writes the view + throughput onto
+    ``migration_state``. Safe to call on the event loop after :func:`_fetch_cdc_status`
+    returns.
     """
     if fetched is None:
         return
@@ -2425,12 +2554,10 @@ def _apply_cdc_status(migration_state, fetched) -> None:
     adjusted = []
     for status in statuses:
         h = health.get(status.name)
-        state = status.state
+        state = _folded_connector_state(status.state, h)
         tasks_failed = 0
         if h is not None and h.errored_tasks:
             tasks_failed = h.errored_tasks
-            if state is ConnectorState.RUNNING and h.errored_tasks > 0:
-                state = ConnectorState.FAILED
         adjusted.append(
             ConnectorStatus(
                 name=status.name,
@@ -2439,6 +2566,9 @@ def _apply_cdc_status(migration_state, fetched) -> None:
                 tasks_failed=tasks_failed,
             )
         )
+    # Why a stopped connector stopped (read by the fetch): end the episode on recovery, log
+    # each new cause once, and flag a missing schema history the way Start CDC does.
+    _settle_cdc_connector_diagnoses(migration_state, adjusted, health)
     # CDC records under a stable key even when no Full Load job exists this session
     # (see cdc_error_log_key) -- otherwise an empty job_id would drop every DLQ event.
     job_id = _fold_cdc_dlq_errors(migration_state, dlq_errors)

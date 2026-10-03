@@ -327,6 +327,82 @@ def _is_partition_quota_message(msg: str) -> bool:
     )
 
 
+# One text for both "Debezium has no definition for this table" signatures below (a row
+# change, or a replayed CREATE UNIQUE INDEX). It carries SCHEMA_HISTORY_MARK on purpose:
+# a schema_only Start that fails with it flags the stack's history as missing.
+_UNKNOWN_TABLE_GUIDANCE = (
+    "{connector} failed: Debezium met a row change or a CREATE UNIQUE INDEX for a table "
+    "that Debezium's schema history for this stack does not hold — the history is "
+    "incomplete, or a captured table was dropped or renamed on the source after the "
+    "position this connector started reading from. If this stack streamed before (a "
+    "restart after Stop CDC), remove the connectors first if the CDC step still shows "
+    "them — Stop CDC, or Clean up leftover connector on an incomplete pipeline (a Start or "
+    "Retry CDC on connectors that exist keeps their snapshot mode and fails the same way) "
+    "— then Start CDC: it rebuilds the history from the source tables as they are now, "
+    "after checking the captured tables against the start point. Otherwise, or if that "
+    "check names a changed or missing table, give CDC a start point after the change: "
+    "Re-run Full Load for all tables with \"Drop & reload\" (Full load + CDC), or choose "
+    "Manual, Fetch current position and Use this start point, then reconcile with "
+    "\"Drop & reload\" and CHECKSUM. "
+    "A reload switches the CDC start point back to Automatic, so choose Manual again "
+    "and Use this start point before Start CDC (the fetched point is kept)."
+)
+
+# G7: a DDL statement Debezium's MySQL grammar cannot parse (see the table entry below).
+_UNPARSEABLE_DDL_NEEDLE = "ddl statement couldn't be parsed"
+
+# The STREAMING variant: the statement was in the binary log. Neither G7 text may carry
+# SCHEMA_HISTORY_MARK (that would flip the next resume to recovery) or "Start CDC again"
+# (Starting again replays the statement). The sentence after the CHECKSUM step ("A reload
+# switches the CDC start point back to Automatic, ...") is
+# ui.cdc_start_point_gate.RELOAD_RESETS_MANUAL verbatim -- core may not import ui, so it
+# is duplicated here and a test pins the two in sync.
+_UNPARSEABLE_DDL_GUIDANCE = (
+    "{connector} failed: Debezium could not parse a DDL statement in the source's binary "
+    "log and stopped just before it.{statement} Debezium parses every DDL statement on the "
+    "source server — for every database and table, not only the captured ones, including "
+    "stored routines, triggers, views and accounts — and stops at one its MySQL grammar "
+    "does not support rather than skip it, because a skipped statement could leave its "
+    "table definitions wrong. The connector resumes from a position before that "
+    "statement, so Retry CDC, and Start CDC after Stop CDC, read it and stop again. Stop "
+    "CDC, then give CDC a start point after the statement: Re-run Full Load for all "
+    "tables with \"Drop & reload\" (Full load + CDC; re-run Step 1 (Evaluation) and Schema "
+    "Conversion first if the statement changed a captured table) — its new watermark is "
+    "past the statement; or choose Manual, Fetch current position and Use this start "
+    "point — changes made between where CDC stopped and that point are then not "
+    "replicated, so reload those tables with \"Drop & reload\" (CDC only: correct them on "
+    "Aurora DSQL) and validate with CHECKSUM. "
+    "A reload switches the CDC start point back to Automatic, so choose Manual again "
+    "and Use this start point before Start CDC (the fetched point is kept). "
+    "Do not use the \"binlog reader near position\" in the connector log as a start "
+    "point: it is where the statement begins. A Start from a new start point reads the "
+    "current definition of every table on the server, so if the statement created or "
+    "altered a table, that Start can stop on the table's definition the same way, and the "
+    "CDC step then says so. A statement that runs again (a schema-migration tool, a "
+    "scheduled job) stops CDC each time."
+)
+
+# Carried ONLY by the snapshot variant below: history_missing_after_failure keys on it.
+DEFINITION_SNAPSHOT_MARK = "could not parse the definition of a table on the source server"
+
+# The SNAPSHOT variant: the statement was a table's current definition (SHOW CREATE TABLE),
+# read for every table on the server because store.only.captured.tables.ddl=false. No
+# start point helps, so it never offers one.
+_UNPARSEABLE_DEFINITION_GUIDANCE = (
+    "{connector} failed: Debezium " + DEFINITION_SNAPSHOT_MARK + " while reading the "
+    "definitions of every table at Start.{statement} A Start that builds Debezium's schema "
+    "from the source — the first Start, a Start from a new start point, and a Start that "
+    "rebuilds a missing schema history — reads the definition of EVERY table on the "
+    "server, in every database, not only the captured ones, and stops at one its MySQL "
+    "grammar does not support. So a different start point, Retry CDC and another Start all "
+    "stop the same way. The tool cannot work around this: change that table's definition "
+    "on the source to a form the grammar supports, then Stop CDC and Start CDC, which "
+    "reads the definitions again. Otherwise CDC cannot run against this source server: "
+    "migrate it with Full load only."
+)
+_UNPARSEABLE_DEFINITION_HEADLINE = "Debezium could not parse a source table's definition"
+
+
 _CONNECTOR_LOG_DIAGNOSES: tuple[tuple[str, str], ...] = (
     (
         "quota exceeded for maximum number of partitions",
@@ -391,10 +467,11 @@ _CONNECTOR_LOG_DIAGNOSES: tuple[tuple[str, str], ...] = (
         "from the source table as it is now already has the new name. A column was "
         "renamed after the position this connector started reading from, on ANY table of "
         "the source server, not only a captured one: Debezium tracks every table's "
-        "definition (the log line above names the table). Starting again, Retry CDC and "
-        "recovery mode repeat it. Stop CDC, then give CDC a start point after the "
-        "rename: Re-run Full Load for all tables with \"Drop & reload\" (Full load + CDC; "
-        "re-run Step 1 and Schema Conversion first if a captured table changed); or "
+        "definition (the connector's CloudWatch log names the table). Starting again, "
+        "Retry CDC and recovery mode repeat it. Stop CDC, then give CDC a start point "
+        "after the rename: Re-run Full Load for all tables with \"Drop & reload\" (Full "
+        "load + CDC; re-run Step 1 and Schema Conversion first if a captured table "
+        "changed); or "
         "choose Manual, Fetch current position and Use this start point, then reload or "
         "correct the changes made before it and validate with CHECKSUM. "
         "A reload switches the CDC start point back to Automatic, so choose Manual again "
@@ -421,34 +498,61 @@ _CONNECTOR_LOG_DIAGNOSES: tuple[tuple[str, str], ...] = (
         # whose schema isn't known to this connector. One possible cause is an incomplete
         # database schema history topic." (inconsistent.schema.handling.mode=fail).
         "isn't known to this connector",
-        "{connector} failed: Debezium met a row change for a table that Debezium's schema "
-        "history for this stack does not hold — the history is incomplete, or a captured "
-        "table was dropped or renamed on the source after the position this connector "
-        "started reading from. If this stack streamed before (a restart after Stop CDC), "
-        "remove the connectors first if the CDC step still shows them — Stop CDC, or "
-        "Clean up leftover connector on an incomplete pipeline (a Start or Retry CDC on "
-        "connectors that exist keeps their snapshot mode and fails the same way) — then "
-        "Start CDC: it rebuilds the history from the source tables as they are now, after "
-        "checking the captured tables against the start point. Otherwise, or if that check "
-        "names a changed or missing table, give CDC a start point after the change: Re-run "
-        "Full Load for all tables with \"Drop & reload\" (Full load + CDC), or choose "
-        "Manual, Fetch current position and Use this start point, then reconcile with "
-        "\"Drop & reload\" and CHECKSUM. "
-        "A reload switches the CDC start point back to Automatic, so choose Manual again "
-        "and Use this start point before Start CDC (the fetched point is kept).",
+        _UNKNOWN_TABLE_GUIDANCE,
+    ),
+    (
+        # CreateUniqueIndexParserListener: "Trying to create index on non existing table
+        # <t>.Query: <ddl>" -- a CREATE UNIQUE INDEX replayed for a captured table the
+        # schema history does not hold: the same cause as the entry above.
+        "trying to create index on non existing table",
+        _UNKNOWN_TABLE_GUIDANCE,
+    ),
+    # --- MySQL: a DDL statement Debezium's grammar cannot parse (Debezium 2.7.4) -------
+    # The literal is ParsingErrorListener.syntaxError's (verified with javap):
+    #   "DDL statement couldn't be parsed. Please open a Jira issue with the statement
+    #   '<ddl>'\n<ANTLR detail>"
+    # and MultipleParsingExceptions ("Multiple parsing errors") repeats each inner
+    # ParsingException in its toString, so the phrase reaches the log for one error or
+    # many. BinlogDatabaseSchema.parseDdl parses EVERY DDL on the server -- any database,
+    # any table, routines, triggers, views and account statements -- BEFORE the
+    # captured-table filter, for streaming and snapshot DDL alike, and rethrows because
+    # schema.history.internal.skip.unparseable.ddl is false (the default; the template
+    # does not set it). MySqlErrorHandler retries only IOException/SQLException, so the
+    # task stops and its offset never passes the statement.
+    #
+    # The G5 tree-walk entries above ("trying to change column", "trying to create index
+    # ...") cannot shadow it (first match wins): AntlrDdlParser.parse walks the tree only
+    # when the statement had no syntax error, so one statement raises one kind or the
+    # other. It sits ABOVE
+    # the link, auth, PostgreSQL and connection-test needles because the tail quotes the
+    # statement text, which can contain any of their words.
+    #
+    # No skip option is offered on purpose: the same setting also swallows the tree-walk
+    # ParsingExceptions above, turning those loud stops into a silently stale in-memory
+    # schema (shifted or NULL values with no error). The tuple carries the STREAMING text;
+    # diagnose_connector_log swaps in _UNPARSEABLE_DEFINITION_GUIDANCE when the failure
+    # came from the schema snapshot instead (see _failed_in_schema_snapshot) and fills
+    # {statement} with a masked, bounded head of the statement (_ddl_statement_head).
+    (
+        _UNPARSEABLE_DDL_NEEDLE,
+        _UNPARSEABLE_DDL_GUIDANCE,
     ),
     (
         "communications link failure",
         "{connector} failed: the Debezium worker could not reach the source MySQL "
         "(TCP connection timed out). Check that the source database is reachable from "
         "the connector's network and that its security group allows inbound on the "
-        "MySQL port from the connector, then Start CDC again.",
+        "MySQL port from the connector. Then Stop CDC if the CDC step still shows the "
+        "connectors (or Clean up leftover connector on an incomplete pipeline), and "
+        "Start CDC.",
     ),
     (
         "access denied for user",
         "{connector} failed: the source MySQL rejected the connector's credentials "
         "(access denied). Verify the CDC user's username/password and that it has the "
-        "required REPLICATION privileges, then Start CDC again.",
+        "required REPLICATION privileges. Then Stop CDC if the CDC step still shows the "
+        "connectors (or Clean up leftover connector on an incomplete pipeline), and "
+        "Start CDC.",
     ),
     # --- PostgreSQL source ----------------------------------------------------
     # Every needle above is MySQL/MSK-flavoured, so a PostgreSQL source connector that
@@ -466,11 +570,32 @@ _CONNECTOR_LOG_DIAGNOSES: tuple[tuple[str, str], ...] = (
         "skip every change made since the Full Load.",
     ),
     (
+        # PostgresReplicationConnection: "Unable to %s filtered publication %s for %s" and
+        # "No table filters found for filtered publication %s", at task start, when
+        # publication.autocreate.mode=filtered (a CDC-only re-snapshot Start) must create or
+        # update the publication. ABOVE "replication slot": every PostgreSQL start logs
+        # "Obtained valid replication slot ..." before it gets here.
+        "filtered publication",
+        "{connector} failed: it could not create or update its PostgreSQL publication for "
+        "the selected tables. Usually a selected table no longer exists on the source "
+        "under that schema and name (dropped, renamed or moved to another schema since it "
+        "was selected), or the CDC user does not own it — adding a table to a publication "
+        "requires owning it (membership in the owning role is enough). The connector's "
+        "CloudWatch log names the tables. Every Start fails the same way until the "
+        "selection and the source agree. Restore the table or its ownership on the "
+        "source, then Stop CDC (or Clean up leftover connector on an incomplete pipeline) "
+        "and Start CDC. If it was dropped or renamed on purpose, the table set cannot "
+        "change while the CDC infrastructure exists (the table picker is locked): Delete "
+        "CDC infrastructure on the CDC step (or, once a Full Load has run or CDC has "
+        "streamed, use Start over), then re-run Step 1 (Evaluation), take the table out "
+        "of the selection, deploy the infrastructure again and Start CDC.",
+    ),
+    (
         "replication slot",
         "{connector} failed while setting up its PostgreSQL replication slot. Check that "
         "the source's wal_level is 'logical', that the CDC user has REPLICATION (or is "
         "rds_replication on RDS/Aurora), and that max_replication_slots is not "
-        "exhausted; the connector's log line above names the specific cause.",
+        "exhausted; the connector's CloudWatch log names the specific cause.",
     ),
     # LAST RESORT -- must stay BELOW every specific needle above, because the failure modes
     # OVERLAP in the log tail and the first match wins.
@@ -483,9 +608,10 @@ _CONNECTOR_LOG_DIAGNOSES: tuple[tuple[str, str], ...] = (
     # literal comes from BinlogConnector's catch of ANY SQLException around connect() +
     # SELECT version(), which covers a wrong database name, TZ/SSL and auth-plugin errors.
     # So this entry must NOT claim "could not connect": it names the three real causes in
-    # likelihood order and defers to the log line. (Keyed on this literal and not on
-    # pgjdbc's own "The connection attempt failed." because that one could also come from
-    # the SINK reaching DSQL; verified this literal has zero hits in dsql-sink-plugin.zip.)
+    # likelihood order and defers to the connector's CloudWatch log. (Keyed on this literal
+    # and not on pgjdbc's own "The connection attempt failed." because that one could also
+    # come from the SINK reaching DSQL; verified this literal has zero hits in
+    # dsql-sink-plugin.zip.)
     (
         "failed testing connection",
         "{connector} failed its connection TEST to the source database -- it got far "
@@ -496,9 +622,43 @@ _CONNECTOR_LOG_DIAGNOSES: tuple[tuple[str, str], ...] = (
         "those are right, check the path: the connectors run in your VPC on the cdc-stack's "
         "own security group, and the stack can only open its OWN egress -- so the SOURCE "
         "database's security group must allow INBOUND on the database port from the "
-        "connector subnets. The connector log line above names the specific cause.",
+        "connector subnets. The connector's CloudWatch log names the specific cause.",
     ),
 )
+
+# The cause in a few words, per needle, for places a runbook does not fit: a
+# Pipeline-health row ("Stopped — <headline>."), a notice header ("... stopped:
+# <headline>"), an activity-log action, the AI payload. Always composed mid-sentence, so
+# it is a lower-case fragment unless its first word is a proper noun or acronym
+# (Debezium, MSK, AWS, PostgreSQL). At most 80 characters, no braces, no trailing period
+# (a test pins all four).
+_CONNECTOR_LOG_HEADLINES: dict[str, str] = {
+    "quota exceeded for maximum number of partitions": (
+        "MSK Serverless partition quota exhausted"
+    ),
+    "could not find a 'kafkaclient' entry in the jaas": (
+        "schema-history client could not authenticate to MSK"
+    ),
+    "auth_scheme_provider": "AWS SDK conflict in the connector plugin",
+    "internal schema size": "a captured table's column count changed after the start point",
+    "trying to change column": "a column rename after the start point cannot be replayed",
+    "db history topic is missing": "Debezium's schema history is missing",
+    "isn't known to this connector": (
+        "a change arrived for a table Debezium's schema history does not hold"
+    ),
+    "trying to create index on non existing table": (
+        "a change arrived for a table Debezium's schema history does not hold"
+    ),
+    _UNPARSEABLE_DDL_NEEDLE: "Debezium could not parse a DDL statement in the binary log",
+    "communications link failure": "the source MySQL could not be reached",
+    "access denied for user": "the source MySQL rejected the CDC user's credentials",
+    "publication autocreation is disabled": "the PostgreSQL CDC publication does not exist",
+    "filtered publication": (
+        "the PostgreSQL CDC publication could not be created for the selected tables"
+    ),
+    "replication slot": "PostgreSQL replication slot setup failed",
+    "failed testing connection": "the connection test to the source database failed",
+}
 
 # How an UNMATCHED worker log is surfaced. Before this, a tail that matched no needle was
 # fetched and then DISCARDED, leaving the bare "<connector> entered FAILED state." -- the
@@ -587,18 +747,229 @@ def is_schema_history_failure(message: str) -> bool:
     return SCHEMA_HISTORY_MARK in str(message or "")
 
 
+def history_missing_after_failure(snapshot_mode: Optional[str], message: str) -> bool:
+    """Should a failure with this guidance flag the stack's schema history as missing? Pure.
+
+    ONE rule for the Start CDC error and the Pipeline-health diagnosis, keyed on the
+    ``snapshot.mode`` the connectors ran with (MySQL only; ``None`` for PostgreSQL):
+
+    * ``schema_only`` -- the missing/incomplete-history diagnoses (G5).
+    * ``recovery`` -- the unparseable-table-definition diagnosis: that snapshot failed while
+      reading the table definitions, before any schema event reached the history, while
+      the seeded offset is already the start point -- so the next Start of the same seed
+      is a resume and would otherwise go ``schema_only`` on an empty or stale history.
+
+    Setting the flag only ever moves the next Start to recovery plus the start-point
+    check, which is the safe side.
+    """
+    text = str(message or "")
+    if snapshot_mode == "schema_only":
+        return is_schema_history_failure(text)
+    if snapshot_mode == "recovery":
+        return DEFINITION_SNAPSHOT_MARK in text
+    return False
+
+
+@dataclass(frozen=True)
+class ConnectorLogDiagnosis:
+    """A known connector failure: a short ``headline`` and the full ``guidance``.
+
+    The headline is the cause in a few words (a Pipeline-health row, an activity-log
+    action, the AI payload); the guidance is the runbook. Both are value-free: the only
+    source text either can carry is a masked, bounded head of a DDL statement.
+    """
+
+    headline: str
+    guidance: str
+
+
+# Where a task RUN begins, per debezium-core 2.7.4's BaseSourceTask (all at INFO, so they
+# must be found before quiet lines are dropped): "Starting {} with configuration:" is
+# logged only by start(Map), Kafka Connect's first start; "Attempting to restart task."
+# and "Successfully restarted task" by Debezium's own restart after an error it retries
+# (startIfNeededAndPossible), which never logs the first one. ErrorHandler logs
+# "Producer failure" at ERROR even for an error it then retries, so without the restart
+# lines an error the task recovered from would outrank the one that finally stopped it.
+_TASK_RUN_BOUNDARY_RE = re.compile(
+    r"(?i)\bstarting \w+ with configuration:"
+    r"|\battempting to restart task\b"
+    r"|\bsuccessfully restarted task\b"
+)
+# A line logged at INFO/DEBUG/TRACE, after any "[Worker-...]" / "[timestamp]" prefixes.
+_QUIET_LEVEL_RE = re.compile(r"^\s*(?:\[[^\]]*\]\s*)*(?:INFO|DEBUG|TRACE)\b")
+
+
+def _episode_lines(log_tail: str) -> str:
+    """The part of a worker-log tail that belongs to the latest task run, minus quiet lines.
+
+    Keeps only the lines after the LAST task-run boundary (``_TASK_RUN_BOUNDARY_RE``: Kafka
+    Connect's first start, or Debezium's own restart after a retried error), because an
+    earlier run's or attempt's error must not label this one; then drops INFO/DEBUG/TRACE
+    lines (a PostgreSQL start logs "Obtained valid replication slot ..." at INFO, which
+    the broad slot needle would otherwise match on any later failure). Both steps only
+    ever fail toward KEEPING lines when the log format differs. Pure.
+    """
+    lines = (log_tail or "").splitlines()
+    last_start = None
+    for index, line in enumerate(lines):
+        if _TASK_RUN_BOUNDARY_RE.search(line):
+            last_start = index
+    if last_start is not None:
+        lines = lines[last_start + 1:]
+    return "\n".join(line for line in lines if not _QUIET_LEVEL_RE.match(line))
+
+
+def _mask_sql_literals(text: str) -> str:
+    """Replace every quoted SQL literal with ``'?'`` / ``"?"``; keep identifiers. Pure.
+
+    A character scanner, not a regex: backtick identifiers are copied verbatim (a doubled
+    backtick escapes one; an unterminated identifier keeps the rest), a single- or
+    double-quoted literal with backslash or doubled-quote escapes becomes ``q?q``, and an
+    UNTERMINATED literal becomes ``q?`` and ends the scan (the rest of the text is
+    dropped, since it is inside the literal). A backslash right before the literal's own
+    quote is ambiguous -- an escaped quote, or, under sql_mode NO_BACKSLASH_ESCAPES, the
+    end of a complete value such as ``'C:\\'`` -- and guessing wrong would show the NEXT
+    literal in clear, so it is treated like an unterminated literal (fail closed). Other
+    backslash escapes read the same in both modes. Numbers and keywords stay.
+    """
+    out: list[str] = []
+    i, n = 0, len(text or "")
+    while i < n:
+        ch = text[i]
+        if ch == "`":
+            j = i + 1
+            while j < n:
+                if text[j] == "`":
+                    if j + 1 < n and text[j + 1] == "`":
+                        j += 2
+                        continue
+                    break
+                j += 1
+            if j >= n:
+                out.append(text[i:])
+                break
+            out.append(text[i:j + 1])
+            i = j + 1
+            continue
+        if ch in ("'", '"'):
+            j = i + 1
+            closed = False
+            while j < n:
+                c = text[j]
+                if c == "\\":
+                    if j + 1 < n and text[j + 1] == ch:
+                        break  # ambiguous (see above): fail closed, like unterminated
+                    j += 2
+                    continue
+                if c == ch:
+                    if j + 1 < n and text[j + 1] == ch:
+                        j += 2
+                        continue
+                    closed = True
+                    break
+                j += 1
+            if not closed:
+                out.append(ch + "?")
+                break
+            out.append(ch + "?" + ch)
+            i = j + 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+# ParsingErrorListener's exact wording before the statement (case as in the bytecode).
+_DDL_STATEMENT_MARK = "with the statement '"
+_DDL_HEAD_MAX = 160
+
+
+def _ddl_statement_head(text: str) -> Optional[str]:
+    """The masked, bounded beginning of the statement an unparseable-DDL error quotes. Pure.
+
+    Takes the LAST "...with the statement '" in ``text``, keeps only the rest of THAT line
+    (the ANTLR detail on the next line can quote a token, and a multi-line statement is
+    cut to its first line), drops the one closing quote Debezium adds, masks every quoted
+    literal (DEFAULT/COMMENT values, routine bodies, an account's auth string), collapses
+    whitespace, scrubs ``password=...``-style pairs and caps the result at
+    ``_DDL_HEAD_MAX`` characters. ``None`` when there is no such marker or nothing is left.
+    Only this derived string is kept; the caller drops the raw tail.
+    """
+    at = (text or "").rfind(_DDL_STATEMENT_MARK)
+    if at < 0:
+        return None
+    rest = text[at + len(_DDL_STATEMENT_MARK):]
+    line = (rest.splitlines() or [""])[0].rstrip()
+    if line.endswith("'"):
+        line = line[:-1]
+    head = " ".join(_mask_sql_literals(line).split())
+    head = _SECRET_IN_LOG_RE.sub(r"\1=***", head)
+    if not head:
+        return None
+    if len(head) > _DDL_HEAD_MAX:
+        head = head[:_DDL_HEAD_MAX].rstrip() + " …"
+    return head
+
+
+def _failed_in_schema_snapshot(lowered: str) -> bool:
+    """True when an unparseable-DDL tail failed in the schema snapshot, not while streaming.
+
+    The more RECENT marker wins: RelationalSnapshotChangeEventSource logs "Error during
+    snapshot"; the binlog reader logs "Error during binlog processing" and "Error
+    processing binlog event". Neither present -> streaming (the default). Pure.
+    """
+    snapshot = lowered.rfind("error during snapshot")
+    streaming = max(
+        lowered.rfind("error during binlog processing"),
+        lowered.rfind("error processing binlog event"),
+    )
+    return snapshot > streaming
+
+
+def diagnose_connector_log(
+    connector: str, log_tail: str, *, episode_only: bool = False
+) -> Optional[ConnectorLogDiagnosis]:
+    """Map a connector's worker-log tail to a :class:`ConnectorLogDiagnosis`, or ``None``.
+
+    First match wins over ``_CONNECTOR_LOG_DIAGNOSES`` (lower-cased substring). With
+    ``episode_only`` (the Pipeline-health read of a connector that stopped after it
+    started) the tail is first reduced to the latest task run without INFO/DEBUG/TRACE
+    lines (:func:`_episode_lines`); the Start CDC path reads it whole, unchanged. Pure.
+    """
+    text = _episode_lines(log_tail) if episode_only else (log_tail or "")
+    lowered = text.lower()
+    for needle, guidance in _CONNECTOR_LOG_DIAGNOSES:
+        if needle not in lowered:
+            continue
+        headline = _CONNECTOR_LOG_HEADLINES[needle]
+        statement = ""
+        if needle == _UNPARSEABLE_DDL_NEEDLE:
+            head = _ddl_statement_head(text)
+            statement = (
+                f" It begins \"{head}\" (quoted values are hidden)."
+                if head
+                else " The connector's CloudWatch log shows the statement."
+            )
+            if _failed_in_schema_snapshot(lowered):
+                guidance = _UNPARSEABLE_DEFINITION_GUIDANCE
+                headline = _UNPARSEABLE_DEFINITION_HEADLINE
+        return ConnectorLogDiagnosis(
+            headline=headline,
+            guidance=guidance.format(connector=connector, statement=statement),
+        )
+    return None
+
+
 def _diagnose_connector_log(connector: str, log_tail: str) -> Optional[str]:
     """Map a connector's worker-log tail to actionable guidance, or ``None``.
 
     Returns the guidance for the first known failure signature found in
     ``log_tail`` (the recent worker-log messages). ``None`` when nothing matches,
-    so the caller can fall back to the raw connector state. Pure (no AWS).
+    so the caller can fall back to the raw connector state. Pure (no AWS). The Start
+    CDC path: the whole tail, unscoped (see :func:`diagnose_connector_log`).
     """
-    lowered = (log_tail or "").lower()
-    for needle, guidance in _CONNECTOR_LOG_DIAGNOSES:
-        if needle in lowered:
-            return guidance.format(connector=connector)
-    return None
+    diagnosis = diagnose_connector_log(connector, log_tail)
+    return diagnosis.guidance if diagnosis is not None else None
 
 
 def _wait_stack_settles(
@@ -2193,6 +2564,10 @@ __all__ = [
     "CdcStackDiscovery",
     "CdcDeployLog",
     "SCHEMA_HISTORY_MARK",
+    "DEFINITION_SNAPSHOT_MARK",
+    "ConnectorLogDiagnosis",
+    "diagnose_connector_log",
+    "history_missing_after_failure",
     "is_schema_history_failure",
     "CdcStackDeployer",
     "build_cdc_stack_deployer",

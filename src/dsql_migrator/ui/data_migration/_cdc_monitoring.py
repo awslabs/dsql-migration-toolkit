@@ -1229,8 +1229,20 @@ def _render_cdc_live_monitoring(
             # Mirror CDC transitions (started / drift / DLQ growing / sink stalled) into
             # the AI feed, once each, so the assistant is aware of silent-loss risks.
             _announce_cdc_events(migration_state, view, ai_post_event)
+            # Stop causes only for the connectors wired NOW: the status view is not cleared
+            # on Stop CDC, and a cause kept for the Start card must not resurface here.
+            _wired = set(getattr(migration_state, "cdc_connector_names", None) or [])
+            _stack = getattr(migration_state, "cdc_stack_name", None)
             _render_cdc_pipeline_health(
-                ui, view, getattr(migration_state, "cdc_activity", None)
+                ui, view, getattr(migration_state, "cdc_activity", None),
+                diagnoses={
+                    n: d
+                    for n, d in (
+                        getattr(migration_state, "cdc_connector_diagnoses", None) or {}
+                    ).items()
+                    if n in _wired
+                },
+                log_group=f"/msk-connect/{_stack}-cdc" if _stack else None,
             )
             # PostgreSQL CDC: warn about source WAL pressure (the logical slot pinning
             # WAL) before the source disk fills. No-op for a MySQL source (no slot).
@@ -1379,6 +1391,9 @@ def _render_cdc_pipeline_health(
     ui,
     status_view: LoadStatusView,
     activity: "Optional[CdcActivitySummary]",
+    *,
+    diagnoses: "Optional[Mapping[str, object]]" = None,
+    log_group: Optional[str] = None,
 ) -> None:
     """Render the combined "Pipeline health" card: connector health + change flow.
 
@@ -1388,9 +1403,21 @@ def _render_cdc_pipeline_health(
     cards the operator has to mentally join. The DLQ stays its own card (it is about
     data set aside, a different concern). Renders nothing when there is no connector
     health to show (pre-streaming).
+
+    ``diagnoses`` (connector name -> ``ConnectorLogDiagnosis``, matched by the poll from
+    the worker log) names a stopped connector's cause on its row, and its runbook in an
+    error notice under the connectors: the row's detail is one truncated line, and a
+    stopped connector blocks progress. ``log_group`` is where the full error is. Reads
+    only what the poll already stored (no AWS call on render).
     """
+    held = dict(diagnoses or {})
     rows = connector_health_rows(
-        status_view.connector_states, lag_seconds=status_view.lag_seconds
+        status_view.connector_states,
+        lag_seconds=status_view.lag_seconds,
+        diagnoses={
+            name: getattr(d, "headline", "") for name, d in held.items()
+            if getattr(d, "headline", "")
+        },
     )
     if not rows:
         return
@@ -1429,6 +1456,21 @@ def _render_cdc_pipeline_health(
                 ui.label(row.detail).classes(  # type: ignore[attr-defined]
                     "text-xs text-gray-500 truncate"
                 )
+        # What to do about a stopped connector whose cause is known: the row above can
+        # only name it, so the runbook goes in an error notice (it blocks progress).
+        for row in rows:
+            diagnosis = held.get(row.name)
+            if row.state.upper() != "FAILED" or diagnosis is None:
+                continue
+            body = str(getattr(diagnosis, "guidance", "") or "")
+            if log_group:
+                body += f" The full error is in the CloudWatch log group {log_group}."
+            render_notice(
+                ui,
+                tone="error",
+                header=f"{row.label or row.name} stopped: {diagnosis.headline}",
+                body=body,
+            )
 
         # --- Change flow ------------------------------------------------------
         if activity is not None:

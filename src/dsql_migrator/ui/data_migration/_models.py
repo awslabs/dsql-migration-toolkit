@@ -3441,6 +3441,7 @@ def connector_health_rows(
     *,
     lag_seconds: Optional[float] = None,
     lag_warn_seconds: float = 30.0,
+    diagnoses: Optional[Mapping[str, str]] = None,
 ) -> list[ConnectorHealthRow]:
     """Map connector states (+ worst lag) to display health rows, name-sorted.
 
@@ -3450,7 +3451,10 @@ def connector_health_rows(
     nudges the tone to ``warn`` past ``lag_warn_seconds`` so a silently growing
     lag is visible. Each row carries a user-friendly role ``label`` (Source/Sink)
     and rows are ordered Source-then-Sink (data-flow order), not by raw name.
-    Returns ``[]`` when no connector states are reported.
+    ``diagnoses`` (connector name -> short cause headline, matched from its worker log)
+    turns a FAILED row's detail into "Stopped — <cause>." instead of the generic restart
+    text; it is ignored for every other state. Returns ``[]`` when no connector states
+    are reported.
     """
     # Order by data flow: Source (-> Kafka) before Sink (Kafka -> DSQL), then
     # by name for any extra/unknown connectors.
@@ -3464,7 +3468,12 @@ def connector_health_rows(
         state = connector_states[name]
         upper = state.upper()
         if upper in _BAD_CONNECTOR_STATES:
-            tone, detail = "bad", "Stopped — a task is not running. Restart required."
+            cause = (diagnoses or {}).get(name)
+            tone, detail = "bad", (
+                f"Stopped — {cause}."
+                if cause
+                else "Stopped — a task is not running. Restart required."
+            )
         elif upper not in _HEALTHY_CONNECTOR_STATES:
             tone, detail = "warn", "Starting up — not streaming yet."
         elif lag_seconds is not None and lag_seconds >= lag_warn_seconds:

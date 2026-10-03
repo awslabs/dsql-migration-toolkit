@@ -97,6 +97,49 @@ def _parse_unsupported_azs(reason: str) -> set[str]:
     return {az.strip() for az in match.group(1).split(",") if az.strip()}
 
 
+def read_connector_log_tail(
+    logs, stack_name: str, connector_name: str, *, limit: int = 400
+) -> str:
+    """Recent worker-log lines of ``connector_name`` from a CloudWatch Logs client. Bounded.
+
+    Two calls, both capped: ``DescribeLogStreams`` on ``/msk-connect/<stack>-cdc`` (newest
+    first, at most 10 streams), then ``GetLogEvents`` on the first stream whose name
+    contains ``connector_name`` (the newest ``limit`` events). Returns the messages joined
+    with newlines, or ``""`` when no stream matches or on ANY error -- the log may not
+    exist yet or permissions may be missing, so callers must treat it as advisory. Shared
+    by the Start CDC failure path (:meth:`CdcStackDeployer.connector_log_tail`) and the
+    Pipeline-health read of a stopped connector
+    (``MskConnectController.connector_log_tail``).
+    """
+    log_group = f"/msk-connect/{stack_name}-cdc"
+    try:
+        streams = logs.describe_log_streams(
+            logGroupName=log_group,
+            orderBy="LastEventTime",
+            descending=True,
+            limit=10,
+        ).get("logStreams", [])
+        stream = next(
+            (
+                s.get("logStreamName")
+                for s in streams
+                if connector_name in str(s.get("logStreamName", ""))
+            ),
+            None,
+        )
+        if stream is None:
+            return ""
+        events = logs.get_log_events(
+            logGroupName=log_group,
+            logStreamName=stream,
+            limit=limit,
+            startFromHead=False,
+        ).get("events", [])
+        return "\n".join(str(e.get("message", "")) for e in events)
+    except Exception:  # noqa: BLE001 - advisory only
+        return ""
+
+
 # Known connector-failure signatures and the actionable guidance for each. The
 # CloudFormation event for a CREATE_FAILED connector is only a generic
 # GeneralServiceException; the real cause is in the worker log. Each entry is
@@ -593,36 +636,15 @@ class CdcStackDeployer:
         newest stream of the cdc-stack log group (/msk-connect/<stack>-cdc) for
         that connector and returns its joined messages, so failure handlers can
         classify the cause. Returns ``""`` on any error (the log may not exist yet,
-        or permissions may be missing) -- callers must treat it as advisory.
+        or permissions may be missing) -- callers must treat it as advisory. The
+        read itself is :func:`read_connector_log_tail`, shared with the poll-time
+        controller.
         """
-        log_group = f"/msk-connect/{stack_name}-cdc"
         try:
             logs = self._client("logs")
-            streams = logs.describe_log_streams(
-                logGroupName=log_group,
-                orderBy="LastEventTime",
-                descending=True,
-                limit=10,
-            ).get("logStreams", [])
-            stream = next(
-                (
-                    s.get("logStreamName")
-                    for s in streams
-                    if connector_name in str(s.get("logStreamName", ""))
-                ),
-                None,
-            )
-            if stream is None:
-                return ""
-            events = logs.get_log_events(
-                logGroupName=log_group,
-                logStreamName=stream,
-                limit=limit,
-                startFromHead=False,
-            ).get("events", [])
-            return "\n".join(str(e.get("message", "")) for e in events)
         except Exception:  # noqa: BLE001 - advisory only
             return ""
+        return read_connector_log_tail(logs, stack_name, connector_name, limit=limit)
 
     # -- First-deploy / teardown (create_stack / delete_stack) ---------------
 

@@ -117,8 +117,9 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
   - **검사가 볼 수 없는 것.** CDC가 캡처하지 **않는** 테이블의 컬럼 이름 변경(Debezium은 모든 테이블의
     정의를 추적하므로 그것을 재생하다 실패합니다), 커넥터를 만드는 동안의 변경, 그리고 그 첫 실행이
     자동 재시작되기 직전의 변경. 이름 변경이나 컬럼 추가·삭제는 커넥터를 멈추고, CDC 단계가 원인을 알려
-    줍니다. 컬럼 수가 그대로인 변경은 커넥터를 멈추지 않습니다: 이전 행이 오류 없이 밀리거나 NULL인 값으로
-    쓰입니다. 소스 스키마 재확인
+    줍니다 — Start CDC 오류에서, 또는 시작된 뒤에 멈췄다면 그 커넥터의 Pipeline health 행에서
+    ([§4.6](04-cdc-and-dsql-constraints.md#파이프라인-헬스와-change-flow)). 컬럼 수가 그대로인 변경은
+    커넥터를 멈추지 않습니다: 이전 행이 오류 없이 밀리거나 NULL인 값으로 쓰입니다. 소스 스키마 재확인
     ([§4.2](04-cdc-and-dsql-constraints.md#데드레터를-남기지-않는-변경-소스-스키마-재확인))은 타입 변경과
     다른 컬럼으로 대체된 컬럼을 알리고 Cut over를 보류합니다. 순서 변경과 문자 집합 변환은 어느 검사도 보지
     못하므로, 그런 변경 뒤에는 CHECKSUM으로 검증하세요.
@@ -147,6 +148,33 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
     스냅샷 모드를 유지하므로 같은 방식으로 실패합니다. 그러면 다음 Start가 같은 검사를 거친 뒤 히스토리를
     다시 만듭니다(`recovery`). 이 검사는 테이블을 원래 시작 지점과 비교하므로, Stop 전에 한 변경이라도 그
     Start를 거부합니다.
+- **MySQL: Debezium이 파싱하지 못하는 DDL 문은, 소스 서버의 어디에서 실행되든 CDC를 멈춤.** Debezium은
+  binary log의 모든 DDL 문을 자신의 MySQL 문법(Debezium 2.7)으로 파싱합니다 — 캡처 대상만이 아니라 서버의
+  모든 데이터베이스와 테이블에 대해, 저장 루틴·트리거·뷰·계정 문까지 포함해 — 무엇이든 필터링하기 전에
+  그렇게 하며, 도구의 설정은 파싱하지 못하는 문을 건너뛰지 않고 멈춥니다. 소스 커넥터는 그 문 바로 앞에서
+  멈추고 그 위치는 문을 지나 앞으로 나아갈 수 없습니다: Retry CDC도, Stop CDC 후의 Start CDC도 다시 그
+  문에서 멈춥니다. CDC 단계가 원인을 알려 줍니다 — Start CDC 오류에서, 또는 시작된 뒤라면 그 커넥터의
+  Pipeline health 행과 오류 알림에서
+  ([§4.6](04-cdc-and-dsql-constraints.md#파이프라인-헬스와-change-flow)) — 그리고 따옴표로 묶인 값을 가린
+  채 그 문의 앞부분을 보여 줍니다.
+  - **해결 방법.** CDC를 Stop한 다음, 그 문 이후의 시작 지점을 CDC에 주세요: 모든 테이블에 대해
+    **"Drop & reload"로 Re-run Full Load**를 실행하거나(Full load + CDC; 그 문이 캡처 대상 테이블을
+    바꿨다면 먼저 1단계 Evaluation과 Schema Conversion을 다시 실행), **Manual** → **Fetch current
+    position** → **Use this start point**를 선택하세요. 그러면 CDC가 멈춘 지점과 그 지점 사이의 변경은
+    복제되지 않으므로, 그 테이블들을 "Drop & reload"로 다시 로드하고(CDC only: Aurora DSQL에서 바로잡기)
+    CHECKSUM으로 검증하세요. 다시 로드하면 시작 지점이 Automatic으로 돌아가므로, Start CDC 전에 Manual을
+    다시 선택하세요. 커넥터 로그의 *binlog reader near position*을 시작 지점으로 쓰지 마세요: 그것은
+    실패한 문이 시작되는 위치입니다.
+  - **시작 지점을 옮겨도 도움이 되지 않는 경우.** 소스로부터 Debezium의 스키마를 만드는 Start — 첫
+    Start, 새 시작 지점에서의 Start, 없어진 스키마 히스토리를 다시 만드는 Start — 는 서버의 모든 테이블의
+    현재 정의를 읽습니다. 어떤 테이블의 정의 자체가 문법이 지원하지 않는 구문을 쓰면, 그런 Start는 시작
+    지점과 상관없이 매번 그 정의를 읽다가 멈춥니다: 소스에서 그 정의를 바꾼 뒤 Stop CDC와 Start CDC를
+    하거나, 그 서버는 Full load only로 마이그레이션하세요. 다시 실행되는 문(스키마 마이그레이션 도구,
+    예약된 작업)은 실행될 때마다 CDC를 멈춥니다.
+  - **건너뛰기 옵션 없음.** 도구는 Debezium의 `schema.history.internal.skip.unparseable.ddl`을 제공하지
+    않습니다: 건너뛴 문은 Debezium의 테이블 정의를 조용히 틀리게 남길 수 있어 이후의 행이 오류 없이 잘못된
+    컬럼에 쓰일 수 있고, 같은 설정은 Debezium이 재생하지 못하는 컬럼 이름 변경(위)도 건너뛰어 그 멈춤을
+    잘못된 값으로 바꿉니다. PostgreSQL 소스는 영향을 받지 않습니다: 그 변경 스트림에는 DDL이 없습니다.
 - **캐스케이드 FK 동작은 CDC로 복제되지 않음.** 서버 측 `ON DELETE/UPDATE CASCADE`(및 `SET NULL`/
   `SET DEFAULT`) 동작은 소스 엔진 *내부*에서 발생해 변경 스트림에 잡히지 않을 수 있으므로 CDC가 적용할 수
   없습니다 — 소스가 캐스케이드한 자식 행이 타깃에 orphan으로 남습니다(MySQL 소스의 경우 InnoDB가 binlog에

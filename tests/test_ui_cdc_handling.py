@@ -2027,3 +2027,328 @@ def test_the_dlq_panel_says_cut_over_waits_for_a_checksum_after_the_last_record(
     assert "never retried" in body
     assert "json and floating-point columns" not in body
     assert "nor, from a MySQL source, floating-point ones" in body
+
+
+# ---------------------------------------------------------------------------
+# G7: why a connector stopped, on the Pipeline-health row (worker-log diagnosis)
+# ---------------------------------------------------------------------------
+
+_G7_SRC = "dsql-cdc-x-debezium-source"
+_G7_SINK = "dsql-cdc-x-dsql-sink"
+_G7_TAIL = "\n".join([
+    f"[Worker-1] [ts] ERROR [{_G7_SRC}|task-0] Error during binlog processing. Last offset "
+    "stored = {...}, binlog reader near position = mysql-bin-changelog.000123/4567",
+    "[Worker-1] Caused by: io.debezium.text.ParsingException: DDL statement couldn't be "
+    "parsed. Please open a Jira issue with the statement 'CREATE PROCEDURE p() BEGIN "
+    "SELECT 'secret-ish'; END'",
+    f"[Worker-1] [ts] INFO [{_G7_SRC}|task-0] App info kafka.producer unregistered",
+])
+_G7_HEADLINE = "Debezium could not parse a DDL statement in the binary log"
+
+
+def _g7_diagnosis():
+    from dsql_migrator.core.cdc_deployer import diagnose_connector_log
+
+    diagnosis = diagnose_connector_log(_G7_SRC, _G7_TAIL, episode_only=True)
+    assert diagnosis is not None
+    return diagnosis
+
+
+class _DiagController:
+    """Fake MskConnectController: connector states/health plus a recorded log reader."""
+
+    def __init__(self, statuses, health, tail=_G7_TAIL):
+        self._statuses = statuses
+        self._health = health
+        self._tail = tail
+        self.calls: list[tuple[str, str]] = []
+
+    def connector_statuses(self, _names):
+        from dsql_migrator.core.cdc import ConnectorStatus
+
+        return [ConnectorStatus(name=n, state=s) for n, s in self._statuses]
+
+    def connector_health(self, _names):
+        return dict(self._health)
+
+    def connector_log_tail(self, stack, connector, **_kw):
+        self.calls.append((stack, connector))
+        return self._tail
+
+
+def _g7_state(controller=None):
+    state = DataMigrationState()
+    state.set_cdc_stack_name("dsql-cdc-x")
+    if controller is not None:
+        state.set_cdc_controller(controller)
+    state.set_cdc_connector_names([_G7_SRC, _G7_SINK])
+    return state
+
+
+def test_health_row_shows_the_diagnosed_cause_for_a_failed_connector() -> None:
+    states = {_G7_SRC: "FAILED", _G7_SINK: "RUNNING"}
+    rows = connector_health_rows(states, diagnoses={_G7_SRC: _G7_HEADLINE})
+    by_name = {r.name: r for r in rows}
+    assert by_name[_G7_SRC].detail == f"Stopped — {_G7_HEADLINE}."
+    assert by_name[_G7_SRC].tone == "bad"
+    assert by_name[_G7_SINK].detail == "Streaming normally."
+    # No diagnosis: the generic text, byte for byte.
+    plain = {r.name: r for r in connector_health_rows(states)}
+    assert plain[_G7_SRC].detail == "Stopped — a task is not running. Restart required."
+    # A cause for a RUNNING connector is ignored.
+    running = connector_health_rows({_G7_SINK: "RUNNING"}, diagnoses={_G7_SINK: "x"})
+    assert running[0].detail == "Streaming normally." and running[0].tone == "ok"
+
+
+def test_fetch_reads_the_worker_log_only_for_a_stopped_connector_throttled_and_sticky() -> None:
+    from dsql_migrator.core.cdc import ConnectorState
+    from dsql_migrator.ui.data_migration import _fetch_cdc_status
+    from dsql_migrator.ui.data_migration._cdc_status import _read_connector_diagnoses
+
+    controller = _DiagController(
+        [(_G7_SRC, ConnectorState.RUNNING), (_G7_SINK, ConnectorState.RUNNING)],
+        {
+            _G7_SRC: ConnectorHealth(running_tasks=0, errored_tasks=1),
+            _G7_SINK: ConnectorHealth(running_tasks=1, errored_tasks=0),
+        },
+    )
+    state = _g7_state(controller)
+    fetched = _fetch_cdc_status(state)
+    assert fetched is not None and len(fetched) == 6  # the tuple shape is unchanged
+    assert controller.calls == [("dsql-cdc-x", _G7_SRC)]
+    held = state.cdc_connector_diagnoses
+    assert set(held) == {_G7_SRC} and held[_G7_SRC].headline == _G7_HEADLINE
+    assert "secret-ish" not in held[_G7_SRC].guidance
+    _fetch_cdc_status(state)
+    assert controller.calls == [("dsql-cdc-x", _G7_SRC)]  # no second read within the interval
+
+    # Sticky, not merely throttled: on an injected clock a held cause is never re-read,
+    # however long past the read interval the page stays open.
+    held_ctl = _DiagController([(_G7_SRC, ConnectorState.FAILED)], {})
+    h_state = _g7_state(held_ctl)
+    for t in (0.0, 61.0, 1000.0):
+        _read_connector_diagnoses(h_state, held_ctl, held_ctl.connector_statuses([]), {}, now=t)
+    assert held_ctl.calls == [("dsql-cdc-x", _G7_SRC)]
+    assert set(h_state.cdc_connector_diagnoses) == {_G7_SRC}
+
+    # Unmatched: re-read at most once per interval (injected clock).
+    quiet = _DiagController(
+        [(_G7_SRC, ConnectorState.FAILED)], {}, tail="nothing recognisable"
+    )
+    q_state = _g7_state(quiet)
+    statuses = quiet.connector_statuses([])
+    for t in (0.0, 30.0, 61.0):
+        _read_connector_diagnoses(q_state, quiet, statuses, {}, now=t)
+    assert len(quiet.calls) == 2 and q_state.cdc_connector_diagnoses == {}
+
+    # Same fold as the status view: errored tasks fold only a RUNNING connector (CREATING
+    # maps to UNASSIGNED).
+    creating = _DiagController(
+        [(_G7_SRC, ConnectorState.UNASSIGNED)],
+        {_G7_SRC: ConnectorHealth(running_tasks=0, errored_tasks=1)},
+    )
+    _read_connector_diagnoses(
+        _g7_state(creating), creating, creating.connector_statuses([]),
+        creating.connector_health([]), now=0.0,
+    )
+    assert creating.calls == []
+    # A healthy pipeline makes no log call at all.
+    healthy = _DiagController(
+        [(_G7_SRC, ConnectorState.RUNNING)],
+        {_G7_SRC: ConnectorHealth(running_tasks=1, errored_tasks=0)},
+    )
+    _fetch_cdc_status(_g7_state(healthy))
+    assert healthy.calls == []
+
+    # A controller without the reader is a no-op (older doubles, other callers).
+    class _NoReader:
+        pass
+
+    _read_connector_diagnoses(_g7_state(), _NoReader(), statuses, {}, now=0.0)
+
+
+def test_the_poll_scopes_the_worker_log_to_the_latest_task_run() -> None:
+    # The poll must read the tail with episode_only: the pure scoping alone does not stop
+    # the health row from being mislabelled if the poll reads the tail whole.
+    from dsql_migrator.core.cdc import ConnectorState
+    from dsql_migrator.ui.data_migration._cdc_status import _read_connector_diagnoses
+
+    # A PostgreSQL start's INFO slot line must not label a later, unrelated failure...
+    slot_info = (
+        "[W] [ts] INFO [c|task-0] Obtained valid replication slot ReplicationSlot [...]\n"
+        "[W] [ts] ERROR [c|task-0] WorkerSourceTask{id=c-0} Task threw an uncaught "
+        "exception: org.apache.kafka.connect.errors.ConnectException: something else"
+    )
+    # ...nor an EARLIER task run's DDL failure label this run.
+    restarted = (
+        f"{_G7_TAIL}\n"
+        "[W] [ts] INFO [c|task-0] Starting MySqlConnectorTask with configuration:\n"
+        "[W] [ts] WARN [c|task-0] something harmless"
+    )
+    for tail in (slot_info, restarted):
+        controller = _DiagController([(_G7_SRC, ConnectorState.FAILED)], {}, tail=tail)
+        state = _g7_state(controller)
+        _read_connector_diagnoses(
+            state, controller, controller.connector_statuses([]), {}, now=0.0
+        )
+        assert controller.calls == [("dsql-cdc-x", _G7_SRC)]
+        assert state.cdc_connector_diagnoses == {}
+
+
+def test_a_late_read_after_a_clear_is_dropped() -> None:
+    diagnosis = _g7_diagnosis()
+
+    def _late(state, end_episode):
+        epoch = state.claim_cdc_diagnosis_read(_G7_SRC, now=0.0, interval=60.0)
+        assert epoch is not None
+        end_episode(state)
+        state.record_cdc_connector_diagnosis(_G7_SRC, diagnosis, epoch=epoch)
+        return state.cdc_connector_diagnoses
+
+    assert _late(_g7_state(), lambda s: s.clear_cdc_connector_diagnoses()) == {}
+    assert _late(_g7_state(), lambda s: s.set_cdc_stack_name("dsql-cdc-other")) == {}
+    assert _late(_g7_state(), lambda s: s.adopt_cdc_stack("dsql-cdc-other")) == {}
+    # A recovery (the per-name clear the apply step does) drops a late read too: another
+    # tab's read that began before it must not re-hold a cause the connector recovered from.
+    assert _late(_g7_state(), lambda s: s.clear_cdc_connector_diagnoses([_G7_SRC])) == {}
+    # ...while a read in the same episode lands.
+    state = _g7_state()
+    epoch = state.claim_cdc_diagnosis_read(_G7_SRC, now=0.0, interval=60.0)
+    state.record_cdc_connector_diagnosis(_G7_SRC, diagnosis, epoch=epoch)
+    assert state.cdc_connector_diagnoses == {_G7_SRC: diagnosis}
+    # A recovery also forgets the throttle: a re-failure is read at once, not up to 60 s on.
+    state.clear_cdc_connector_diagnoses([_G7_SRC])
+    assert state.claim_cdc_diagnosis_read(_G7_SRC, now=1.0, interval=60.0) is not None
+
+
+def test_apply_clears_a_diagnosis_only_on_a_positive_healthy_signal() -> None:
+    from dsql_migrator.core.cdc import ConnectorState, ConnectorStatus
+    from dsql_migrator.ui.data_migration import _apply_cdc_status
+
+    def _held_state():
+        state = _g7_state()
+        epoch = state.claim_cdc_diagnosis_read(_G7_SRC, now=0.0, interval=60.0)
+        state.record_cdc_connector_diagnosis(_G7_SRC, _g7_diagnosis(), epoch=epoch)
+        return state
+
+    running = [ConnectorStatus(name=_G7_SRC, state=ConnectorState.RUNNING)]
+    healthy = _held_state()
+    _apply_cdc_status(
+        healthy, (running, {_G7_SRC: ConnectorHealth(running_tasks=1, errored_tasks=0)})
+    )
+    assert healthy.cdc_connector_diagnoses == {}
+    unknown = _held_state()
+    _apply_cdc_status(unknown, (running, {_G7_SRC: ConnectorHealth()}))
+    assert set(unknown.cdc_connector_diagnoses) == {_G7_SRC}
+    absent = _held_state()
+    _apply_cdc_status(absent, ([], {}))
+    assert set(absent.cdc_connector_diagnoses) == {_G7_SRC}
+    # Only RUNNING with no errored task is a recovery: MSK still reporting the connector
+    # FAILED keeps the cause, even when the newest ErroredTaskCount datapoint reads 0.
+    failed_zero = _held_state()
+    _apply_cdc_status(
+        failed_zero,
+        (
+            [ConnectorStatus(name=_G7_SRC, state=ConnectorState.FAILED)],
+            {_G7_SRC: ConnectorHealth(running_tasks=0, errored_tasks=0)},
+        ),
+    )
+    assert set(failed_zero.cdc_connector_diagnoses) == {_G7_SRC}
+
+
+def test_a_failed_connector_with_zero_errored_tasks_is_read_once_and_logged_once() -> None:
+    # Through the real poll: were FAILED + ErroredTaskCount 0 taken for a recovery, the
+    # clear (which also drops the read throttle) would re-read the log on every poll and
+    # never hold the cause or write its activity line.
+    import dsql_migrator.core.activity_log as real_log
+    from dsql_migrator.core.cdc import ConnectorState
+    from dsql_migrator.ui.data_migration import _apply_cdc_status, _fetch_cdc_status
+
+    controller = _DiagController(
+        [(_G7_SRC, ConnectorState.FAILED)],
+        {_G7_SRC: ConnectorHealth(running_tasks=0, errored_tasks=0)},
+    )
+    state = _g7_state(controller)
+    logged: list = []
+    original = real_log.log_activity
+    real_log.log_activity = lambda *a, **k: logged.append((a, k))  # type: ignore[assignment]
+    try:
+        for _ in range(3):
+            _apply_cdc_status(state, _fetch_cdc_status(state))
+    finally:
+        real_log.log_activity = original  # type: ignore[assignment]
+    assert controller.calls == [("dsql-cdc-x", _G7_SRC)]
+    assert set(state.cdc_connector_diagnoses) == {_G7_SRC}
+    assert len([e for e in logged if "stopped:" in str(e[0][1])]) == 1
+
+
+def test_apply_logs_each_stop_once_without_the_raw_tail() -> None:
+    import dsql_migrator.core.activity_log as real_log
+    from dsql_migrator.core.cdc import ConnectorState, ConnectorStatus
+    from dsql_migrator.ui.data_migration import _apply_cdc_status
+
+    state = _g7_state()
+
+    def _hold():
+        epoch = state.claim_cdc_diagnosis_read(_G7_SRC, now=0.0, interval=0.0)
+        state.record_cdc_connector_diagnosis(_G7_SRC, _g7_diagnosis(), epoch=epoch)
+
+    failed = (
+        [ConnectorStatus(name=_G7_SRC, state=ConnectorState.FAILED)],
+        {_G7_SRC: ConnectorHealth(running_tasks=0, errored_tasks=1)},
+    )
+    logged: list = []
+    original = real_log.log_activity
+    real_log.log_activity = lambda *a, **k: logged.append((a, k))  # type: ignore[assignment]
+    try:
+        _hold()
+        _apply_cdc_status(state, failed)
+        _apply_cdc_status(state, failed)
+        mine = [entry for entry in logged if "stopped:" in str(entry[0][1])]
+        assert len(mine) == 1
+        (args, kwargs), = mine
+        assert args[1] == f"connector {_G7_SRC} stopped: {_G7_HEADLINE}"
+        assert kwargs["status"] is real_log.ActivityStatus.FAILURE
+        assert kwargs["detail"] == _g7_diagnosis().guidance
+        assert "App info kafka.producer" not in kwargs["detail"]
+        assert "secret-ish" not in kwargs["detail"]
+        # A new episode (cleared, then diagnosed again) is logged again.
+        state.clear_cdc_connector_diagnoses()
+        _hold()
+        _apply_cdc_status(state, failed)
+        assert len([e for e in logged if "stopped:" in str(e[0][1])]) == 2
+    finally:
+        real_log.log_activity = original  # type: ignore[assignment]
+
+
+def test_pipeline_health_renders_the_runbook_notice_for_a_diagnosed_failure() -> None:
+    from dsql_migrator.core.models import LoadKind, LoadStatusView
+    from dsql_migrator.ui.data_migration._cdc_monitoring import _render_cdc_pipeline_health
+    from dsql_migrator.ui.design import NOTICE_STYLE
+
+    diagnosis = _g7_diagnosis()
+    view = LoadStatusView(
+        kind=LoadKind.CDC, connector_states={_G7_SRC: "FAILED", _G7_SINK: "RUNNING"}
+    )
+    ui = _FakeUi()
+    _render_cdc_pipeline_health(
+        ui, view, None, diagnoses={_G7_SRC: diagnosis}, log_group="/msk-connect/x-cdc"
+    )
+    # The FAILED row's own status glyph is the same Material icon, so count: one for the
+    # row, one for the error notice.
+    error_icon = NOTICE_STYLE["error"][3]
+    assert ui.icons.count(error_icon) == 2
+    assert f"Source (→ Kafka) stopped: {_G7_HEADLINE}" in ui.texts
+    body = next(t for t in ui.texts if t.startswith(diagnosis.guidance))
+    assert "/msk-connect/x-cdc" in body
+    assert f"Stopped — {_G7_HEADLINE}." in ui.texts
+    # No diagnosis, or one for a RUNNING connector: no notice (and the positional call works).
+    plain = _FakeUi()
+    _render_cdc_pipeline_health(plain, view, None)
+    assert plain.icons.count(error_icon) == 1
+    assert not any("stopped:" in t for t in plain.texts)
+    assert "Stopped — a task is not running. Restart required." in plain.texts
+    sink_only = _FakeUi()
+    _render_cdc_pipeline_health(sink_only, view, None, diagnoses={_G7_SINK: diagnosis})
+    assert sink_only.icons.count(error_icon) == 1
+    assert not any("stopped:" in t for t in sink_only.texts)
