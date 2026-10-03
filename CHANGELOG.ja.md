@@ -5,6 +5,33 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.564
+
+CDC とソースのスキーマ変更 (DDL) の扱いを全体にわたって強化しました。CDC が適用できない変更は、黙って通過せず、検出・説明され、Cut over が保留されるようになりました。詳細: [CDC はスキーマではなくデータを複製する](docs/manual/ja/04-cdc-and-dsql-constraints.md)、[CDC のデッドレターと cut over](docs/manual/ja/05-validation.md)。
+
+### 追加
+
+- **デッドレターの後、Cut over は証明を待ちます。** CDC 移行では、変更がデッドレターになった (またはドリフトが検出された) テーブルは、その後に開始した CHECKSUM 比較で一致し、DLQ を最後まで読んだ結果がある必要があります。Validation がこの CHECKSUM を自動で実行します。読み取りに失敗すると Check again 付きで保留されます。
+- **CDC の実行中にソースを再確認します:** キャプチャ中のテーブル定義 (行を拒否しないテーブル・列の削除/名前変更、型・NULL ルール・キーの変更) と、PostgreSQL の再キー化テーブルの REPLICA IDENTITY。各検出結果は対処方法とともに表示され、解決と再検証まで Cut over を保留します。
+- **スキーマを作り直す MySQL CDC の開始は事前に確認します:** Stop 後の再開は記録されたスキーマ履歴を再生 (`schema_only`) し、それ以外の開始はキャプチャ対象テーブルの列を開始地点の記録と比較して、違えば対処方法とともに拒否します。失敗の繰り返しや、古い行を位置で誤解釈することがなくなります。
+- **DDL が原因で CDC が止まると原因を表示します** (解析できない DDL、スキーマ履歴の再生失敗)。CDC の状態行に手順が表示されます。
+- **Full load only は Full Load 後もテーブル構成を変更できます** (CDC スタックがなく、実行中の処理がない場合)。Start over は不要です。
+
+### 変更
+
+- **Aurora DSQL の列に正確に収まらない値は変更せず拒否します:** boolean への 0/1 以外の数値、numeric(p,s) への超過した小数桁、整数列への小数は、true として保存したり丸めたりせず、デッドレター (CDC) または隔離 (Full Load) します。
+- **発生しうるすべての拒否に正しいドリフト種別と DSQL で使える対処を付けました** (キー変更 42P10、CHECK/ENUM 23514、NULL ルール変更 23502、値が収まらない 22001/22003)。「Fix target schema」はキー列を追加せず、名前が変わった列には追加ではなく名前変更を提案し、除外ルールに一致する列は追加しません。
+- **MySQL ソースの TRUNCATE もデッドレターにして表示します** (PostgreSQL と同じ。以前は黙ってスキップ)。
+- **ドリフト中のテーブルが他のテーブルを遅くしなくなりました** (そのテーブルだけ一定時間 1 行ずつ処理)。
+- **MySQL の JSON 列も大きな値の候補になりました** (LONGTEXT と同じ: Evaluation、Schema Conversion の注記、除外の提案、Check sizes)。
+- Exclude tables & columns: Result は Review all の警告を繰り返さず件数だけを表示します。Start Full Load と Deploy CDC infrastructure のダイアログを広げ、ステートメントに "(DSQL)" を付け、Deploy ダイアログはキャプチャリストが除外列と同じ場合は 1 回だけ表示します。
+
+### アップグレードの注意
+
+- sink プラグインは **v51** になりました。デプロイ済みの cdc-stack は、**Delete CDC infrastructure の後に再度 Deploy** するまで v50 のまま動作します。TRUNCATE のキャプチャと新しい開始モードは次の Start CDC から適用されます。
+- 新たに保留されることがあります: デッドレターやドリフトのあったテーブルでは Cut over が CHECKSUM を待つことがあり、Full Load は以前丸めていた値を隔離することがあります。MySQL の JSON 列は Evaluation で MANUAL として数えられます (スコアが下がることがありますが、新たにブロックされるものはありません)。
+- まだ実環境で検証していないもの: 新しい種別の正確な DSQL SQLSTATE、PostgreSQL のカタログ再確認、実際のストリームでの v51 sink の動作。
+
 ## v0.1.563
 
 ### 修正

@@ -606,7 +606,22 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # the custom-named, immutable ``AWS::KafkaConnect::WorkerConfiguration``, so the bump is the
 # only vehicle that can replace it without a name clash. A live cdc-stack therefore needs
 # Delete + Deploy infra, as for any other plugin-version bump.
-PLUGIN_VERSION = "v50"
+# v51 (CDC source-DDL gap series, 0.1.564): the sink ZIP's CONTENT changed twice.
+#   * G8 -- a pre-write VALUE-FIT guard (ValueFit): a number other than 0/1 into a
+#     boolean column, non-zero digits beyond a numeric(p,s) scale, or a fractional value
+#     into smallint/integer/bigint is dead-lettered with a value-free reason ("Value does
+#     not fit target column '...'") BEFORE any SQL, instead of being stored as true or
+#     rounded by the assignment cast. Target types come from one information_schema read
+#     per table, cached per task. Values that fit take the byte-identical bind path.
+#   * G10 -- a per-table drift COOL-DOWN: after a structural rejection (42703, 42P01/3F000,
+#     42P10, 42804/42883, 23502) that table's rows go one per transaction for up to 60 s
+#     while other tables keep batching. It only chooses the path, never a row's fate.
+#   Comment-only Java changes from G2/G3/G9 ride along. The worker configuration and the
+#   connector properties are unchanged apart from the template edits shipped with them
+#   (G3 `skipped.operations: none` on the MySQL source, applied by the next Start CDC).
+#   Bumped because the ZIP changed; a live cdc-stack needs Delete + Deploy infra to pick
+#   up v51 (Start CDC alone does not re-register the plugin).
+PLUGIN_VERSION = "v51"
 
 
 class S3ProvisionError(RuntimeError):

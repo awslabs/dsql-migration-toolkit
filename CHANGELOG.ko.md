@@ -5,6 +5,33 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.564
+
+CDC와 소스 스키마 변경(DDL) 처리를 전 구간에서 보강했습니다. CDC가 적용하지 못하는 변경은 이제 그냥 지나가지 않고, 감지되어 원인과 해결 방법이 표시되며 Cut over가 보류됩니다. 자세한 내용: [CDC는 스키마가 아니라 데이터를 복제합니다](docs/manual/ko/04-cdc-and-dsql-constraints.md), [CDC dead letter와 cut over](docs/manual/ko/05-validation.md).
+
+### 추가
+
+- **dead letter가 생기면 Cut over가 증명을 기다립니다.** CDC 마이그레이션에서 변경이 DLQ로 간(또는 드리프트가 감지된) 테이블은, 그 이후에 시작한 CHECKSUM 비교에서 일치해야 하고 DLQ를 끝까지 읽은 결과가 있어야 합니다. Validation이 이 CHECKSUM을 자동으로 실행합니다. 읽기에 실패하면 Check again과 함께 보류됩니다.
+- **CDC가 도는 동안 소스를 다시 확인합니다:** 캡처 중인 테이블의 정의(행을 거부하지 않는 테이블·컬럼 삭제/이름 변경, 타입·NULL 규칙·키 변경)와, PostgreSQL 재키 테이블의 REPLICA IDENTITY. 각 결과는 해결 방법과 함께 표시되고, 해결 후 재검증할 때까지 Cut over를 보류합니다.
+- **스키마를 다시 만드는 MySQL CDC 시작은 먼저 확인합니다:** Stop 후 재개는 이제 기록된 스키마 이력을 재생(`schema_only`)하고, 그 밖의 시작은 캡처 테이블의 컬럼을 시작 지점 기록과 비교해 다르면 해결 방법과 함께 거부합니다. 반복 실패나 옛 행을 위치 기준으로 잘못 해석하는 일이 없어집니다.
+- **DDL 때문에 CDC가 멈추면 원인을 보여줍니다**(파싱 불가 DDL, 스키마 이력 재생 실패). CDC 상태 행에 해결 순서가 표시됩니다.
+- **Full load only는 Full Load 후에도 테이블 구성을 바꿀 수 있습니다**(CDC 스택이 없고 실행 중인 작업이 없을 때). Start over가 필요 없습니다.
+
+### 변경
+
+- **Aurora DSQL 컬럼에 정확히 들어가지 않는 값은 바꾸지 않고 거부합니다:** boolean에 0/1이 아닌 숫자, numeric(p,s)에 넘치는 소수 자리, 정수 컬럼에 소수가 오면 true로 저장하거나 반올림하지 않고 DLQ(CDC) 또는 격리(Full Load)합니다.
+- **발생 가능한 모든 거부가 맞는 드리프트 종류와 DSQL에서 쓸 수 있는 해결 방법을 가집니다**(키 변경 42P10, CHECK/ENUM 23514, NULL 규칙 변경 23502, 값이 맞지 않음 22001/22003). "Fix target schema"는 키 컬럼을 추가하지 않고, 이름이 바뀐 컬럼은 추가 대신 이름 변경을 제안하며, 제외 규칙에 해당하는 컬럼은 추가하지 않습니다.
+- **MySQL 소스의 TRUNCATE도 DLQ로 보내고 표시합니다**(PostgreSQL과 동일, 이전에는 조용히 건너뜀).
+- **드리프트가 생긴 테이블이 다른 테이블을 느리게 하지 않습니다**(그 테이블만 일정 시간 행 단위로 처리).
+- **MySQL JSON 컬럼도 큰 값 후보입니다**(LONGTEXT와 동일: Evaluation, Schema Conversion 안내, 제외 제안, Check sizes).
+- Exclude tables & columns: Result는 Review all의 경고를 반복하지 않고 개수만 보여줍니다. Start Full Load와 Deploy CDC infrastructure 다이얼로그가 넓어졌고, statements 앞에 "(DSQL)"을 붙였으며, Deploy 다이얼로그는 capture list가 제외 컬럼과 같으면 한 번만 보여줍니다.
+
+### 업그레이드 참고
+
+- sink 플러그인이 **v51**이 되었습니다. 이미 배포된 cdc-stack은 **Delete CDC infrastructure 후 다시 Deploy**하기 전까지 v50으로 동작합니다. TRUNCATE 캡처와 새 시작 모드는 다음 Start CDC부터 적용됩니다.
+- 새로 보류될 수 있습니다: DLQ나 드리프트가 있던 테이블은 Cut over가 CHECKSUM을 기다릴 수 있고, Full Load는 예전에 반올림하던 값을 격리할 수 있습니다. MySQL JSON 컬럼은 Evaluation에서 MANUAL로 계산됩니다(점수가 내려갈 수 있으나 새로 막히는 것은 없음).
+- 아직 실제 환경에서 검증하지 않은 것: 새 종류의 정확한 DSQL SQLSTATE, PostgreSQL 카탈로그 재확인, 실제 스트림에서의 v51 sink 동작.
+
 ## v0.1.563
 
 ### 수정

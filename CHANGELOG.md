@@ -5,6 +5,33 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.564
+
+CDC and source schema changes (DDL), hardened end to end: a change that CDC cannot apply is now detected, explained and held at Cut over instead of passing silently. Details: [CDC replicates data, not schema](docs/manual/en/04-cdc-and-dsql-constraints.md#42-cdc-replicates-data-not-schema--important) and [CDC dead letters and cut over](docs/manual/en/05-validation.md#55-cdc-dead-letters-and-cut-over).
+
+### Added
+
+- **Cut over waits for proof after a dead letter.** For CDC migrations, a table with a dead-lettered change (or detected drift) must match in a CHECKSUM comparison started after it, and the dead-letter queue must have been read completely; Validation runs that CHECKSUM automatically. A failed read holds with Check again.
+- **CDC re-checks the source while it streams:** each captured table's definition (dropped/renamed tables and columns, type, NULL rule and key changes that reject no row) and, for re-keyed PostgreSQL tables, REPLICA IDENTITY. Each finding shows its remedy and holds Cut over until resolved and re-validated.
+- **MySQL CDC is checked before a start that rebuilds the schema:** a resume after Stop now replays the recorded schema history (`schema_only`), and every other start compares the captured tables with their columns at the start point and refuses a mismatch with the real ways forward, instead of crash-looping or decoding old rows by position.
+- **A CDC stop caused by DDL names its cause** (an unparseable DDL statement, a schema-history replay failure) with a runbook on the CDC health row.
+- **Full load only can change its table set after a Full Load** (no CDC stack, nothing running), without Start over.
+
+### Changed
+
+- **A value its Aurora DSQL column cannot hold exactly is refused, not changed:** a number other than 0/1 into boolean, extra fractional digits into numeric(p,s), or a fraction into an integer column is dead-lettered (CDC) or quarantined (Full Load) instead of being stored as true or rounded.
+- **Every reachable rejection gets the right drift kind and a DSQL-valid remedy** (key change 42P10, CHECK/ENUM 23514, NULL-rule change 23502, value does not fit 22001/22003). "Fix target schema" never adds a key column, renames instead of adding for a renamed column, and never adds a column an exclusion rule matches.
+- **A MySQL source TRUNCATE is dead-lettered and flagged** like PostgreSQL (it was skipped silently).
+- **A drifting table no longer slows the other tables** on the sink (its rows go one per transaction for a bounded cool-down).
+- **MySQL JSON columns are oversized-value candidates** like LONGTEXT (Evaluation, Schema Conversion note, exclusion offer, Check sizes).
+- Exclude tables & columns: the Result counts warnings instead of repeating Review all. Start Full Load and Deploy CDC infrastructure dialogs are wider, statements are labelled "(DSQL)", and the Deploy dialog lists the capture list once when it equals the excluded columns.
+
+### Upgrade notes
+
+- The sink plugin is now **v51**. A deployed cdc-stack keeps running v50 until you **Delete CDC infrastructure and Deploy it again**; the TRUNCATE capture and the new start modes apply at the next Start CDC.
+- Expect new holds: Cut over may now wait for a CHECKSUM on tables that dead-lettered or drifted, and a Full Load may quarantine a value it used to round. MySQL JSON columns now count as MANUAL in Evaluation (the score may drop; nothing new is blocked).
+- Not exercised live yet: the exact DSQL SQLSTATEs for the new kinds, the PostgreSQL catalog re-check, and the v51 sink behaviours on a real stream.
+
 ## v0.1.563
 
 ### Fixed

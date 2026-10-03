@@ -2610,6 +2610,12 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
     # One marker per behaviour the ZIP must carry. Each is a literal this repo's Java source
     # owns, so it can only be present if that source was compiled into the committed ZIP.
     markers = {
+        # v51 (G8): a value its Aurora DSQL column cannot hold exactly is REFUSED pre-write
+        # with a value-free reason -- not stored as true (boolean) or rounded (numeric/int).
+        "value-fit refusal": b"Value does not fit target column '",
+        # v51 (G10): a table DSQL keeps rejecting for a schema reason goes one row per
+        # transaction for a bounded cool-down, so healthy tables keep batching.
+        "drift cool-down": b"batching resumed",
         # v48: field values are read VERBATIM. Struct.get(Field) substitutes the schema's
         # default for a null slot, and Debezium sets that default from the source column's
         # DEFAULT clause -- so a source NULL was written to the target as the default, and a
