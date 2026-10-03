@@ -86,6 +86,18 @@ import software.amazon.awssdk.services.cloudwatch.model.StandardUnit;
  * number its target column would silently change -- a number other than 0/1 for a boolean,
  * more decimal places than a {@code numeric(p,s)} keeps, or a fraction for an integer column
  * ({@link ValueFit}, fed by a per-table catalog read cached on this task).
+ *
+ * <p><b>Drift cool-down (per table).</b> A source DDL the target lacks (an added column, a
+ * changed type or key, a dropped table) makes DSQL reject EVERY upsert of that one table, so
+ * without memory each chunk holding one of its rows paid a failed batch, a rollback and a
+ * one-row-per-transaction replay of the WHOLE chunk -- every other table on this task included.
+ * Once DSQL rejects a table's row for such a structural reason ({@link #isStructuralDrift}),
+ * that table's later rows go straight to the one-row-per-transaction path while every other
+ * table keeps batching. It ends on the table's first applied row of the kind that failed, or
+ * {@link #DRIFT_COOLDOWN_NANOS} after its last structural rejection. The invariant: the
+ * cool-down only chooses the PATH (batched or one row per transaction), never a row's fate --
+ * every row is still executed against DSQL and is dead-lettered only when its own statement
+ * fails, with the same reason text as before. Nothing is refused pre-emptively.
  */
 public class DsqlSinkTask extends SinkTask {
 
@@ -147,6 +159,30 @@ public class DsqlSinkTask extends SinkTask {
       new ValueFit.TargetTypeCache(this::readTargetTypes);
   // Tables whose unreadable column types were already WARNed about on this task (once each).
   private final Set<String> catalogWarned = new HashSet<>();
+
+  /**
+   * How long a table stays on the one-row-per-transaction path after its LAST structural
+   * rejection when no row of it is applied in between (the ValueFit 60 s scale). Each further
+   * structural rejection refreshes it, so sustained drift never pays a periodic failed batch;
+   * a table repaired with no traffic that proves it returns to batching within this time.
+   * Package-private for tests; deliberately not a config option.
+   */
+  static final long DRIFT_COOLDOWN_NANOS = TimeUnit.SECONDS.toNanos(60);
+
+  /**
+   * One cooled table: when it expires, and whether ANY applied row ends it. A delete only ends
+   * it for a missing table/schema (42P01/3F000), or when a delete is what failed: under column
+   * drift (42703/42804/42P10/23502) deletes keep succeeding, so they prove nothing.
+   */
+  record DriftCooldown(long expiresAtNanos, boolean anySuccessClears) {}
+
+  // Tables DSQL rejected for a structural reason, keyed by event.table(): at most one entry per
+  // captured table, removed on the table's first matching applied row or on expiry. In memory,
+  // per task (like targetTypes): every Start begins cold.
+  private final Map<String, DriftCooldown> driftCooldown = new HashMap<>();
+
+  // The clock value of the current put() (its single clock read), for the cool-down expiry.
+  private long putNanos;
 
   // --- Per-table applied-ops monitor metrics (best-effort CloudWatch) --------
   // The UI reads these instead of COUNT(*)-ing the source: the sink knows exactly
@@ -280,7 +316,8 @@ public class DsqlSinkTask extends SinkTask {
     // Keep each event paired with its originating SinkRecord so a poison row can
     // be reported to the DLQ with full Connect context.
     List<Applicable> batch = new ArrayList<>(records.size());
-    long now = System.nanoTime(); // one clock read per put() for the value-fit cache
+    long now = nanoTime(); // one clock read per put(): the value-fit cache + drift cool-down
+    putNanos = now;
     for (SinkRecord record : records) {
       ChangeEvent event;
       try {
@@ -373,12 +410,130 @@ public class DsqlSinkTask extends SinkTask {
     return SCALAR_VALUE_BYTES;
   }
 
+  /** The clock (monotonic nanoseconds). Package-private and overridable: the test seam. */
+  long nanoTime() {
+    return System.nanoTime();
+  }
+
   /**
-   * Apply one &lt;=batchSize chunk in a single transaction, retrying transient
+   * Apply one &lt;=batchSize chunk, routing by the drift cool-down: with no table cooling down
+   * (the steady state) this is exactly {@link #applyChunk}. Otherwise the chunk is split in one
+   * stable pass -- rows of tables not cooling down are batched as one smaller chunk, then the
+   * cooled tables' rows are applied one per transaction, each table's rows in arrival order
+   * (a key belongs to one table, so per-key order holds; cross-table order within a put was
+   * never guaranteed, and CDC foreign keys are only applied at cut over). Cooled rows never
+   * enter the batched path's per-PK dedupe. Splitting only shrinks a chunk, so the row and byte
+   * limits still hold, and a transient failure in either half still redelivers the whole put.
+   */
+  private void applyBatch(List<Applicable> chunk) {
+    if (driftCooldown.isEmpty()) {
+      applyChunk(chunk); // hot path: no table is cooling down
+      return;
+    }
+    expireDriftCooldowns();
+    if (driftCooldown.isEmpty()) {
+      applyChunk(chunk);
+      return;
+    }
+    List<Applicable> healthy = new ArrayList<>(chunk.size());
+    List<Applicable> cooled = new ArrayList<>();
+    for (Applicable a : chunk) {
+      (driftCooldown.containsKey(a.event().table()) ? cooled : healthy).add(a);
+    }
+    if (cooled.isEmpty()) {
+      applyChunk(chunk);
+      return;
+    }
+    if (!healthy.isEmpty()) {
+      applyChunk(healthy);
+    }
+    applyRecordByRecord(cooled);
+  }
+
+  /** Drop the cool-downs that expired by this put's clock (bounded by the table count). */
+  private void expireDriftCooldowns() {
+    java.util.Iterator<Map.Entry<String, DriftCooldown>> it = driftCooldown.entrySet().iterator();
+    while (it.hasNext()) {
+      Map.Entry<String, DriftCooldown> entry = it.next();
+      if (entry.getValue().expiresAtNanos() <= putNanos) {
+        it.remove();
+        log.info("Table {}: no further rejections for 60 s; batching resumed.", entry.getKey());
+      }
+    }
+  }
+
+  /**
+   * Structural SQLSTATEs: DSQL rejects the statement SHAPE for the whole table, so every row of
+   * it would fail the same way (the drift kinds of core/cdc.py {@code _DRIFT_BY_SQLSTATE}).
+   * Per-value codes (class 22, 23505, 23514, 23503, 07006, 54000, 25P02) do not count -- one
+   * bad value says nothing about the next row. Transient codes (40001 incl. DSQL OC000/OC001,
+   * 08xxx, 57xxx, no SQLSTATE) never get here: they are retried, never quarantined. Only the
+   * PATH depends on this set, never a row's fate. Package-private for tests.
+   */
+  static boolean isStructuralDrift(String sqlState) {
+    if (sqlState == null) {
+      return false;
+    }
+    return switch (sqlState) {
+      case "42703", // ADD_COLUMN: a column the target lacks (added or renamed)
+          "42P01", // MISSING_TABLE: the target table is gone
+          "3F000", // MISSING_TABLE: the target schema is gone
+          "42P10", // KEY_CHANGE: the record key no longer matches the primary key
+          "42804", // TYPE_CHANGE: a column's type changed
+          "42883", // TYPE_CHANGE: no operator/function for the new type
+          "23502" // DROP_COLUMN / NULLABILITY_CHANGE: a NOT NULL column got no value
+          -> true;
+      default -> false;
+    };
+  }
+
+  /** Put {@code event}'s table on the one-row-per-transaction path (or refresh its expiry). */
+  private void armDriftCooldown(ChangeEvent event, String sqlState) {
+    boolean any = event.isDelete() || "42P01".equals(sqlState) || "3F000".equals(sqlState);
+    DriftCooldown prev =
+        driftCooldown.put(
+            event.table(), new DriftCooldown(putNanos + DRIFT_COOLDOWN_NANOS, any));
+    if (prev == null) {
+      log.info(driftCooldownStartMessage(any), event.table(), sqlState);
+    }
+  }
+
+  /**
+   * The INFO line that starts a table's cool-down. It names the end condition that holds at
+   * that first rejection: under column drift a successful delete proves nothing, so only an
+   * applied insert or update ends it; for a missing table/schema or a rejected delete any
+   * applied row does. Placeholders: table name and SQLSTATE only, never a value (Property 7).
+   */
+  static String driftCooldownStartMessage(boolean anySuccessClears) {
+    return "Table {}: Aurora DSQL rejected a row for a schema reason (SQLSTATE {}); applying "
+        + "this table's rows one per transaction until "
+        + (anySuccessClears
+            ? "one of its rows is applied"
+            : "one of its inserts or updates is applied (a delete does not prove the repair)")
+        + ", or for 60 s with no further rejection. Other tables keep batching.";
+  }
+
+  /** End {@code event}'s table's cool-down when this applied row proves it recovered. */
+  private void clearDriftCooldownOnSuccess(ChangeEvent event) {
+    String table = event.table();
+    DriftCooldown c = driftCooldown.get(table);
+    if (c != null && (!event.isDelete() || c.anySuccessClears())) {
+      driftCooldown.remove(table);
+      log.info("Table {}: a row applied again; batching resumed.", table);
+    }
+  }
+
+  /** Package-private view for tests: the tables currently cooling down. */
+  Set<String> driftCooledTables() {
+    return java.util.Collections.unmodifiableSet(driftCooldown.keySet());
+  }
+
+  /**
+   * Apply one chunk in a single transaction, retrying transient
    * failures. On a permanent SQL failure, fall back to record-by-record apply so
    * the poison row is isolated to the DLQ and the healthy rows still commit.
    */
-  private void applyBatch(List<Applicable> chunk) {
+  private void applyChunk(List<Applicable> chunk) {
     try {
       OccRetry.withRetry(
           () -> {
@@ -425,7 +580,9 @@ public class DsqlSinkTask extends SinkTask {
   /**
    * Replay a chunk one row at a time (each in its own transaction). Healthy rows
    * commit; a row that hits a permanent error is quarantined to the DLQ; a
-   * transient error re-raises so Connect retries.
+   * transient error re-raises so Connect retries. Also the path of a cooled table's
+   * rows (see {@link #applyBatch}); the first applied row of the kind that failed ends
+   * that table's cool-down.
    */
   private void applyRecordByRecord(List<Applicable> chunk) {
     for (Applicable a : chunk) {
@@ -440,11 +597,14 @@ public class DsqlSinkTask extends SinkTask {
             config.maxRetries(),
             config.retryBackoffMs());
         recordOps(a.event()); // committed this row: count its applied op
+        if (!driftCooldown.isEmpty()) {
+          clearDriftCooldownOnSuccess(a.event());
+        }
       } catch (SQLException e) {
         rollbackQuietly();
         if (isTransient(e)) {
           // Transient: reconnect + re-raise as RetriableException so Connect
-          // redelivers (see applyBatch for the full rationale). Not fatal.
+          // redelivers (see applyChunk for the full rationale). Not fatal.
           discardConnection();
           throw transientRetryException(e);
         }
@@ -872,12 +1032,21 @@ public class DsqlSinkTask extends SinkTask {
    * (e.g. an {@code INSERT} referencing a column the target lacks) without a
    * separate lookup. Re-rendering is a few microseconds and runs only per poison
    * row, so it does not affect steady-state throughput.
+   *
+   * <p>This is the one place a DSQL-proven permanent rejection passes, so it is where a
+   * structural one ({@link #isStructuralDrift}) puts the table on the drift cool-down.
    */
   private void reportOrThrow(SinkRecord record, ChangeEvent event, SQLException cause) {
     // A missing column / table / schema means the table's cached column types may be stale
     // (the target was recreated or altered): read them again on the next put().
     if (ValueFit.invalidatesTargetTypes(cause.getSQLState())) {
       targetTypes.invalidate(event.table());
+    }
+    // A structural rejection: apply this table's later rows one per transaction for a while,
+    // instead of failing and replaying every chunk that holds one (see applyBatch).
+    String state = cause.getSQLState();
+    if (isStructuralDrift(state)) {
+      armDriftCooldown(event, state);
     }
     String sql;
     try {

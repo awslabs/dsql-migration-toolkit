@@ -2143,6 +2143,36 @@ def test_the_cut_over_runbook_in_every_language_covers_a_cdc_only_truncate() -> 
         assert "(04-cdc-and-dsql-constraints.md#42-" in bullet, lang
 
 
+def test_the_drift_lag_paragraph_promises_only_what_the_sink_cool_down_does() -> None:
+    # G10: DsqlSinkTask's per-table cool-down (isStructuralDrift) starts only for a missing
+    # column/table/schema, a key, type or NOT NULL change; the other tables keep batching but
+    # still share the task thread, so their lag is NOT "normal". A value-level rejection
+    # (23505/23514/22001/22003/07006) starts no cool-down: its chunk still replays per row.
+    import pathlib
+
+    manual = pathlib.Path(__file__).resolve().parents[1] / "docs" / "manual"
+    cases = {
+        "en": ("**Lag while a table drifts.**", "### What gets dead-lettered",
+               ("stays normal", "normal speed", "for a schema reason")),
+        "ko": ("**드리프트 중의 지연.**", "### DLQ로 가는 것",
+               ("정상으로 유지", "정상 속도", "스키마 문제로")),
+        "ja": ("**ドリフト中の遅延。**", "### デッドレター化される対象",
+               ("通常どおり", "通常の速度", "スキーマ上の理由で")),
+    }
+    for lang, (lag_head, dlq_head, overclaims) in cases.items():
+        text = (manual / lang / "04-cdc-and-dsql-constraints.md").read_text(encoding="utf-8")
+        start = text.index(lag_head)
+        lag = text[start : text.index("\n\n", start)]
+        dlq_start = text.index(dlq_head)
+        dlq = text[dlq_start : text.index("\n### ", dlq_start + 1)]
+        for part, name in ((lag, "lag"), (dlq, "dlq")):
+            for claim in overclaims:
+                assert claim not in part, (lang, name, claim)
+            # The value-level exception is spelled out where the isolation is described.
+            assert "`CHECK`" in part, (lang, name)
+        assert "`NOT NULL`" in lag and "60" in lag, lang
+
+
 # --- PostgreSQL CDC: the app seeds MSK itself (SeedMode=External) --------------
 # A PostgreSQL cdc-stack has no in-VPC offset-seeder Lambda, so THIS task creates the
 # Kafka topics and the CDC start offset over the MSK Serverless IAM endpoint on 9098

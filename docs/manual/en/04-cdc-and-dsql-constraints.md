@@ -208,6 +208,21 @@ the extra rows; repair such a table the same way. A MySQL pipeline that was alre
 streaming when you upgraded from an earlier version of the tool starts reporting
 `TRUNCATE` after one Stop CDC → Start CDC.
 
+**Lag while a table drifts.** After Aurora DSQL rejects one of a table's rows because
+the target lacks a column, the table or its schema, the key changed, a column's type
+changed, or a `NOT NULL` column got no value, the sink applies that table's later changes
+one row per transaction and keeps applying every other table in batches. The drift then
+no longer pushes every table's changes through one-row transactions, but the other tables
+still share the sink with the drifted one, so their stream lag can still grow while you
+repair it, and grows more the busier the drifted table is. Every row of the drifted table
+is still tried on Aurora DSQL, and a row is dead-lettered only if Aurora DSQL rejects it.
+After the repair (**Fix target schema…** or your own fix), the table goes back to batches
+as soon as one of its inserts or updates is applied, or 60 seconds after its last
+rejection. A value-level rejection (a unique or `CHECK` violation, a value too long or out
+of range, a value that can't be bound) does not switch the table to one row per
+transaction: each change batch that holds such a row is still replayed one row per
+transaction, the other tables' rows in it included.
+
 ### Changes that dead-letter nothing: the source schema re-check
 
 Some source DDL changes what CDC writes without Aurora DSQL rejecting a single row, so
@@ -363,6 +378,10 @@ column would change it ([§4.2](#detecting-and-handling-source-schema-drift)). T
 failures (OCC `40001`, connection drops) are **retried**, not dead-lettered. A rejection
 a source schema change explains gets a banner row with its repair (§4.2); a per-value data
 error with no schema meaning (for example `22P02`) is listed with its SQLSTATE only.
+While a table's rows are being dead-lettered because the target lacks a column, a table
+or the key, or a column's type changed, the other tables are still applied in batches
+(see §4.2); a value-level rejection (a unique or `CHECK` violation, a value too long or
+out of range) still makes the rows near it apply one per transaction.
 
 ### Where the DLQ surfaces — CloudWatch, not a Kafka topic you read
 
