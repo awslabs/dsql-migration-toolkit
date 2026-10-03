@@ -361,13 +361,13 @@ def test_read_env_file_parses_key_values(tmp_path) -> None:
         "# a comment\n"
         "DB_HOST=db.example.com\n"
         "\n"
-        "DB_PASSWORD=Welcome1!\n"
+        "DB_PASSWORD=not-a-real-password\n"
         "INVALID_LINE_WITHOUT_EQUALS\n",
         encoding="utf-8",
     )
     values = read_env_file(str(env_file))
     assert values["DB_HOST"] == "db.example.com"
-    assert values["DB_PASSWORD"] == "Welcome1!"
+    assert values["DB_PASSWORD"] == "not-a-real-password"
     assert "INVALID_LINE_WITHOUT_EQUALS" not in values
 
 
