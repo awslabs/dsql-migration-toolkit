@@ -753,18 +753,33 @@ def build_ai_tool_executor(
                      ],
                      "schema_drift": [
                          {"table": d.table, "kind": d.kind, "count": d.count,
-                          # value-does-not-fit only: "<column> <type>" (never a value).
-                          **({"columns": list(d.columns)}
-                             if getattr(d, "columns", None) else {})}
+                          # The value-free names the group's reasons give (never a value):
+                          # a check-violation's CHECK constraint, otherwise columns (a
+                          # value-fit "<column> <type>", a 23502's column).
+                          **({("constraints" if d.kind == "check-violation" else "columns"):
+                              list(d.columns)}
+                             if getattr(d, "columns", None) else {}),
+                          **({"codes": list(d.codes)} if getattr(d, "codes", None) else {})}
                          for d in _drift
                      ],
                      "max_replication_lag_ms": _max_lag,
                      "source_schema_changes": _schema_rows[:20],
                      "source_schema_changes_total": len(_schema_rows),
                      "note": ("DLQ poison rows + detected schema drift are silent "
-                              "data-loss risks — resolve before cut over. Common "
-                              "SQLSTATEs: 22P02/22001 = data/format, 23505 = duplicate "
-                              "key, 23502 = NOT NULL / dropped column. "
+                              "data-loss risks — resolve before cut over. SQLSTATEs: "
+                              "42703 = column added/renamed at the source; 23502 = a "
+                              "NOT NULL column got no value (dropped or excluded "
+                              "column) or got NULL (source now allows NULL: ALTER "
+                              "COLUMN ... DROP NOT NULL); 42804/42883 = type changed "
+                              "(recreate the table; there is no ALTER COLUMN TYPE); "
+                              "42P10 = the records' key no longer matches the primary "
+                              "key (every insert/update lost; restore the key or "
+                              "recreate); 23514 = a CHECK (the tool's ENUM port) "
+                              "rejected a value (DROP CONSTRAINT, then ADD CONSTRAINT "
+                              "... CHECK (...) NOT VALID); 22001/22003 = too long / out "
+                              "of range for the Aurora DSQL type (recreate with a type "
+                              "that holds it); 22P02 = malformed value; 23505 = "
+                              "duplicate key. "
                               "source_schema_changes come from the tool's re-read of the "
                               "source catalog (no dead letter needed); an open one holds "
                               "Cut over.")}

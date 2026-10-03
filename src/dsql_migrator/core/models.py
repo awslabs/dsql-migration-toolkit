@@ -1323,17 +1323,19 @@ class TableStatusRow(BaseModel):
 
 
 class SchemaDriftSummary(BaseModel):
-    """One (table, drift-kind) group of quarantined CDC records that reveal a
-    source schema change (Req 12 CDC monitoring).
+    """One (table, drift-kind) group of classified CDC dead letters (Req 12 CDC monitoring).
 
     CDC does not propagate DDL: when the source alters a table, the target is
     unchanged and the first row written under the new source schema is rejected by
-    DSQL and dead-lettered. Grouping those quarantines by the SQLSTATE-derived
-    ``kind`` turns an opaque DLQ count into an actionable "the source added/dropped
-    a column / changed a type on <table>" signal. ``kind`` is the string value of
-    ``core.cdc.SchemaDriftKind`` (this module cannot import cdc.py -- cdc imports
-    models -- so it is stored as its ``str`` value, which the UI maps to a label).
-    Detection only; recovery stays operator-driven (Property 6).
+    DSQL and dead-lettered. Grouping those quarantines by the record-level ``kind``
+    (``core.cdc.classify_schema_drift`` over the SQLSTATE and, for a 23502, the reason's
+    record shape) turns an opaque DLQ count into an actionable "a column was added / got no
+    value / the key no longer matches ... on <table>" signal. Not every kind is a source DDL
+    change (a TRUNCATE, a missing TARGET table, a value its column cannot hold). ``kind`` is
+    the string value of ``core.cdc.SchemaDriftKind`` (this module cannot import cdc.py -- cdc
+    imports models -- so it is stored as its ``str`` value, which the UI maps to a label).
+    Detection only; recovery stays operator-driven (Property 6). Transient: rebuilt from the
+    error log, never persisted.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1341,10 +1343,16 @@ class SchemaDriftSummary(BaseModel):
     table: str = Field(min_length=1)
     kind: str = Field(min_length=1)
     count: int = Field(ge=1)
-    # For a ``value-does-not-fit`` group only: the ``"<column> <type>"`` descriptors the sink
-    # named (bounded, first-seen order), so the banner can say WHICH column needs a wider
-    # type. Never a value. Transient (the status view is rebuilt every poll).
+    # Value-free identifiers the group's reasons name (bounded, first-seen order), per kind:
+    # ``value-does-not-fit`` the ``"<column> <type>"`` the sink's refusal named;
+    # ``nullability-change`` the column sent as NULL; ``drop-column`` the column ONLY when the
+    # record proves it was not sent; ``check-violation`` the constraint name. Other kinds: none.
+    # Never a value.
     columns: list[str] = Field(default_factory=list)
+    # The distinct normalized codes in the group, sorted (e.g. ``["22003",
+    # "VALUE_DOES_NOT_FIT"]``), so the banner can say whether Aurora DSQL rejected the value
+    # or the sink refused it first.
+    codes: list[str] = Field(default_factory=list)
 
 
 class CdcDlqLedgerEntry(BaseModel):
@@ -1440,9 +1448,11 @@ class CdcReplicaIdentityWaiver(BaseModel):
 
 
 # The source-schema re-check's change kinds (core/cdc_catalog_drift.py), most severe first.
-# Where the meaning matches, the value is the dead-letter banner's SchemaDriftKind value; the
-# TARGET-side "missing-table" kind is never reused (a source table that is gone is its own
-# kind).
+# Where the meaning matches, the value is the dead-letter banner's SchemaDriftKind value
+# ("key-change", "type-change", "drop-column", "nullability-change", "add-column" are both:
+# a 42P10 / NULL-sent 23502 dead letter carries the same kind as the re-check's finding, so
+# the two dedupe); the TARGET-side "missing-table" kind is never reused (a source table that
+# is gone is its own kind).
 CatalogDriftKind = Literal[
     "source-table-missing",
     "key-change",

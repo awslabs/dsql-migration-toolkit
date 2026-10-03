@@ -496,6 +496,12 @@ class DataMigrationState:
         # was exactly the v0.1.498 bug where CDC posted no events after a Start over.
         self.cdc_applied_logged_totals: Optional[tuple] = None
         self.cdc_applied_logged_at: Optional[float] = None
+        # The dead-letter memos (_cdc_status.cdc_dlq_records / cdc_schema_drift_summary). On
+        # the state so reset_in_place / Start over drops them: both key on the log key and a
+        # record count, and a CDC-only "cdc:<stack>" key is the same across Start over, so a
+        # memo that survived the reset would serve the previous migration's dead letters.
+        self._cdc_dlq_records_cache: Optional[tuple] = None
+        self._cdc_drift_summary_cache: Optional[tuple] = None
         # Start of the window the applied-ops above are summed over: the Full Load
         # watermark (this migration's gapless resume point), set when CDC starts. The
         # sink's *Applied CloudWatch metrics have a long retention, so a fixed trailing

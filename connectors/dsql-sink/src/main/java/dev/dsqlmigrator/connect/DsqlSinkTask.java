@@ -943,10 +943,12 @@ public class DsqlSinkTask extends SinkTask {
    * no SQLSTATE). Placed at the FRONT of the quarantine reason so it survives the
    * Python parser's fixed-length truncation and is the first {@code sqlstate=}
    * token the parser sees -- that lets the control plane classify a permanent
-   * rejection into a source-schema-drift kind (42703 = a source ADD COLUMN the
-   * target lacks, 23502 = a source DROP COLUMN of a target NOT NULL column,
-   * 42804 = a source TYPE CHANGE; a class 22 data exception is per-value and is not
-   * classified as drift) purely from the CloudWatch log line, with no extra probe.
+   * rejection into a drift kind purely from the CloudWatch log line, with no extra
+   * probe. The map lives in core/cdc.py {@code _DRIFT_BY_SQLSTATE}: 42703 a column the
+   * target lacks (added or renamed), 23502 a NOT NULL column got no value or a NULL
+   * (told apart by the SQL template), 42804/42883 a type change, 42P10 the record key
+   * no longer matches the primary key, 23514 a CHECK rejected a value, 22001/22003 a
+   * value its column cannot hold; the rest of class 22 is per-value and not classified.
    * pgjdbc's {@code getMessage()} does not include the SQLSTATE, so this is the only
    * place it reaches the log; it carries no row values (Property 7).
    *

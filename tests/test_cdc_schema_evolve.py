@@ -732,3 +732,34 @@ def test_target_fix_adds_beside_a_live_excluded_column() -> None:
     assert plan.steps == expected.steps and plan.skipped == expected.skipped
     assert [s.column for s in plan.steps] == ["x"]
     assert plan.held == () and plan.refusal is None and plan.offers_fix
+
+
+def test_an_added_enum_column_does_not_promise_a_check() -> None:
+    """G9: the Fix dialog showed map_mysql_type's note -- "Converted to text with a CHECK that
+    preserves the SAME allowed values" -- above an ADD COLUMN that adds no CHECK (Aurora
+    DSQL's ADD COLUMN takes no constraint). The warning now says so and gives the NOT VALID
+    statement; the plan itself (one ADD COLUMN, TEXT) is unchanged."""
+    from dsql_migrator.core.cdc_schema_evolve import plan_add_columns
+
+    for source_type in ("enum('a','b')", "ENUM ('a','b')"):
+        (step,) = plan_add_columns("s.t", [("st", source_type)], []).steps
+        assert step.ddl == 'ALTER TABLE "s"."t" ADD COLUMN "st" TEXT'
+        assert step.target_type.upper() == "TEXT"
+        assert "without the CHECK" in step.warning and "NOT VALID" in step.warning
+        assert "with a CHECK that preserves" not in step.warning
+        assert "declaration order" in step.warning
+        # Shown for every migration type, and CDC only has no Full Load step to reload from.
+        assert "Drop & reload" not in step.warning and "reload" not in step.warning
+    # Any other type keeps the shared converter note.
+    (step,) = plan_add_columns("s.t", [("flag", "tinyint(1)")], []).steps
+    assert "without the CHECK" not in (step.warning or "")
+
+
+def test_the_mysql_enum_note_gives_a_check_change_aurora_dsql_accepts() -> None:
+    """Aurora DSQL accepts ADD CONSTRAINT only NOT VALID: "DROP/ADD CONSTRAINT" alone failed."""
+    from dsql_migrator.core.converter import map_mysql_type
+
+    _target, warning = map_mysql_type("enum('a','b')")
+    assert "preserves the SAME allowed values" in warning.message
+    assert "DROP CONSTRAINT, then ADD CONSTRAINT ... CHECK (...) NOT VALID" in warning.message
+    assert "DROP/ADD CONSTRAINT" not in warning.message

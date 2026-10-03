@@ -796,13 +796,17 @@ def test_the_ledger_records_drift_kinds_sorted_unique_and_oversized_values():
         [CdcConnectorError(table="app.t", message=f"m{i}", error_code=c) for i, c in enumerate(codes)],
         now=now,
     )
+    # G9: a 22001 (too long for the Aurora DSQL column) is the value-fit kind now.
     assert ledger["app.t"].kinds == [
         "add-column", "oversized-value", "source-truncate", "unique-conflict",
+        "value-does-not-fit",
     ]
     plain = fold_dlq_ledger(
-        {}, [CdcConnectorError(table="app.v", message="x", error_code="22001")], now=now
+        {}, [CdcConnectorError(table="app.v", message="x", error_code="22P02")], now=now
     )
-    assert plain["app.v"].kinds == []  # a value error is not a drift kind
+    # A malformed value has no schema meaning: no kind, but it is still counted (Cut over
+    # holds every dead-lettered table, classified or not).
+    assert plain["app.v"].kinds == [] and plain["app.v"].count == 1
 
 
 def test_the_ledger_fold_is_pure():
@@ -898,16 +902,19 @@ class _BannerUi:
         return self._el()
 
 
-def _render_drift(groups, migration_type=None, session=None) -> "tuple[str, list[str]]":
+def _render_drift(
+    groups, migration_type=None, session=None, *, migration_state=None, ui=None
+) -> "tuple[str, list[str]]":
     from types import SimpleNamespace
 
     from dsql_migrator.core.models import SchemaDriftSummary
     from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
 
     view = SimpleNamespace(schema_drift=[SchemaDriftSummary(**g) for g in groups])
-    ui = _BannerUi()
+    ui = ui or _BannerUi()
     cm._render_cdc_schema_drift_banner(
-        ui, view, session=session, migration_type=migration_type
+        ui, view, session=session, migration_type=migration_type,
+        migration_state=migration_state,
     )
     return " ".join(ui.texts), ui.classes_seen
 
@@ -991,7 +998,9 @@ def test_every_drift_kind_has_a_label() -> None:
 
 def test_the_ledger_keeps_every_kind() -> None:
     """The persisted ledger (which holds Cut over) must not drop a kind: the old fixed cap of
-    8 had already fallen behind the enum, and the ninth kind would have been cut."""
+    8 had already fallen behind the enum, and the ninth kind would have been cut. Every kind is
+    reachable: from a code in the map, or -- NULLABILITY_CHANGE, record evidence only -- from a
+    23502 whose SQL template carries the column it names."""
     from dsql_migrator.core.cdc import CdcConnectorError, _DRIFT_BY_SQLSTATE
     from dsql_migrator.core.cdc_dlq import OVERSIZED_VALUE_CODE, fold_dlq_ledger
 
@@ -1001,9 +1010,97 @@ def test_the_ledger_keeps_every_kind() -> None:
         CdcConnectorError(table="app.t", message=f"m{i}", error_code=c)
         for i, c in enumerate([*codes, OVERSIZED_VALUE_CODE])
     ]
+    errors.append(
+        CdcConnectorError(table="app.t", message=_NULL_SENT_REASON, error_code="23502")
+    )
     kinds = fold_dlq_ledger({}, errors, now=now)["app.t"].kinds
     assert len(kinds) == len(SchemaDriftKind) + 1
     assert SchemaDriftKind.VALUE_DOES_NOT_FIT.value in kinds
+    assert SchemaDriftKind.NULLABILITY_CHANGE.value in kinds
+
+
+# A sink-shaped NULL-sent 23502 reason (synthetic: the DSQL wording is not documented).
+_NULL_SENT_REASON = (
+    'DLQ offset=5: sqlstate=23502 null value in column "note" of relation "orders" violates '
+    'not-null constraint | pk: id=5 | op: u | sql: INSERT INTO "shop"."orders" ("id", "note") '
+    'VALUES (?, ?) ON CONFLICT ("id") DO UPDATE SET "note" = EXCLUDED."note"'
+)
+_NOT_SENT_REASON = _NULL_SENT_REASON.replace('("id", "note")', '("id", "total")')
+
+
+def test_the_ledger_folds_the_record_level_kind() -> None:
+    """G9: the ledger (persisted, read by the cut-over gate) records the SAME kind the banner
+    shows: 42P10 / 23514 / 22003 used to add no kind at all, and a NULL-sent 23502 was
+    recorded as a dropped column."""
+    from dsql_migrator.core.cdc import CdcConnectorError
+    from dsql_migrator.core.cdc_dlq import VALUE_DOES_NOT_FIT_CODE, fold_dlq_ledger
+
+    now = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+    errors = [
+        CdcConnectorError(table="app.t", message="m1", error_code="42P10"),
+        CdcConnectorError(table="app.t", message="m2", error_code="23514"),
+        CdcConnectorError(table="app.t", message="m3", error_code="22003"),
+        CdcConnectorError(table="app.t", message=_NULL_SENT_REASON, error_code="23502"),
+    ]
+    entry = fold_dlq_ledger({}, errors, now=now)["app.t"]
+    assert entry.kinds == [
+        "check-violation", "key-change", "nullability-change", "value-does-not-fit",
+    ]
+    assert entry.count == 4
+    # An unclassified data error raises the count (Cut over holds it) and adds no kind.
+    more = fold_dlq_ledger(
+        {"app.t": entry},
+        [CdcConnectorError(table="app.t", message="m5", error_code="22P02")],
+        now=now,
+    )["app.t"]
+    assert more.count == 5 and more.kinds == entry.kinds
+    # The sink's refusal and Aurora DSQL's own 22003 are one kind, never double-counted.
+    both = fold_dlq_ledger(
+        {},
+        [
+            CdcConnectorError(table="app.u", message="a", error_code=VALUE_DOES_NOT_FIT_CODE),
+            CdcConnectorError(table="app.u", message="b", error_code="22003"),
+        ],
+        now=now,
+    )["app.u"]
+    assert both.kinds == ["value-does-not-fit"] and both.count == 2
+    # A proven-not-sent 23502 stays a dropped column.
+    dropped = fold_dlq_ledger(
+        {}, [CdcConnectorError(table="app.v", message=_NOT_SENT_REASON, error_code="23502")],
+        now=now,
+    )["app.v"]
+    assert dropped.kinds == ["drop-column"]
+
+
+def test_a_parsed_null_sent_23502_record_is_a_nullability_change() -> None:
+    """End to end from the sink's log line: the parser keeps the template in the message, so
+    the record-level kind is available to every consumer (banner, ledger, drift_kind)."""
+    line = (
+        "Quarantined record to DLQ (topic=dsqlcdc.shop.orders, partition=0, offset=5): "
+        + _NULL_SENT_REASON.split(": ", 1)[1]
+        + " (dev.dsqlmigrator.connect.DsqlSinkTask:900)"
+    )
+    rec = parse_dlq_log_message(line)
+    assert rec is not None and rec.error_code == "23502"
+    assert rec.drift_kind is SchemaDriftKind.NULLABILITY_CHANGE
+    not_sent = parse_dlq_log_message(line.replace('("id", "note")', '("id", "total")'))
+    assert not_sent.drift_kind is SchemaDriftKind.DROP_COLUMN
+
+
+def test_check_constraint_from_reason_reads_the_name_never_a_value() -> None:
+    from dsql_migrator.core.cdc_dlq import check_constraint_from_reason
+
+    reason = (
+        'sqlstate=23514 new row for relation "orders" violates check constraint '
+        '"orders_status_check" [constraint: orders_status_check] | pk: id=3 | op: c'
+    )
+    assert check_constraint_from_reason(reason) == "orders_status_check"
+    # The server's quoted name is the fallback when the suffix is missing.
+    assert check_constraint_from_reason(
+        'new row for relation "orders" violates check constraint "chk_qty"'
+    ) == "chk_qty"
+    assert check_constraint_from_reason("boom") is None
+    assert check_constraint_from_reason(None) is None
 
 
 def test_value_fit_banner_is_a_warning_with_its_own_header_columns_and_recreate_runbook() -> None:
@@ -1097,9 +1194,26 @@ def test_a_truncate_and_a_value_fit_refusal_together_claim_no_schema_change(mtyp
         assert "cannot remove the stale ones" in blob
 
 
+def test_a_truncate_beside_dsqls_own_value_rejection_gives_no_tinyint_advice() -> None:
+    """The TINYINT(1) -> smallint advice belongs to the sink's own refusal (a boolean target
+    holding 2); Aurora DSQL's 22003 beside a TRUNCATE never needs it."""
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    truncate = {"table": "shop.events", "kind": "source-truncate", "count": 1}
+    server = {"table": "shop.orders", "kind": "value-does-not-fit", "count": 2,
+              "codes": ["22003"]}
+    blob, _ = _render_drift([truncate, server], MigrationType.FULL_LOAD_AND_CDC)
+    assert "Aurora DSQL has no TRUNCATE statement" in blob
+    assert "smallint" not in blob
+    sink = dict(server, codes=["VALUE_DOES_NOT_FIT"])
+    blob, _ = _render_drift([truncate, sink], MigrationType.FULL_LOAD_AND_CDC)
+    assert "smallint" in blob
+
+
 def test_a_truncate_mixed_with_a_ddl_change_keeps_the_ddl_banner() -> None:
     # Unchanged: a real DDL kind beside the TRUNCATE keeps the (more severe) DDL header and the
-    # generic runbook, and a TRUNCATE alone keeps its own header.
+    # generic runbook (plus the TRUNCATE repair, see below), and a TRUNCATE alone keeps its own
+    # header.
     from dsql_migrator.ui.data_migration._models import MigrationType
 
     truncate = {"table": "shop.events", "kind": "source-truncate", "count": 1}
@@ -1113,6 +1227,43 @@ def test_a_truncate_mixed_with_a_ddl_change_keeps_the_ddl_banner() -> None:
     assert "Source TRUNCATE was not replicated" in blob
     assert "and a value does not fit" not in blob
     assert "e.g. ALTER TABLE" not in blob
+
+
+@pytest.mark.parametrize("mtype_name", ["FULL_LOAD_AND_CDC", "CDC_ONLY"])
+@pytest.mark.parametrize(
+    "kind", ["key-change", "type-change", "add-column", "check-violation", "unique-conflict"]
+)
+def test_a_truncate_beside_any_other_kind_keeps_its_own_repair(kind, mtype_name) -> None:
+    """The runbook of a banner mixing a TRUNCATE with a DDL or target-side kind gave the
+    truncated table no repair at all (a type or key change's bare lead; on CDC only no delete
+    step, and a TRUNCATE dead letter names no row to correct by hand), while its own row says
+    the target keeps the stale rows "until you act"."""
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    mtype = MigrationType[mtype_name]
+    ui = _BannerUi()
+    _render_drift(
+        [{"table": "shop.a", "kind": kind, "count": 2},
+         {"table": "shop.b", "kind": "source-truncate", "count": 1}],
+        mtype, ui=ui,
+    )
+    (runbook,) = [t for t in ui.texts if t.startswith("CDC does not replicate DDL.")]
+    assert "Aurora DSQL has no TRUNCATE statement" in runbook
+    if mtype is MigrationType.CDC_ONLY:
+        assert "delete the rows the source no longer has from shop.b on Aurora DSQL" in runbook
+        assert "'Drop & reload'" not in runbook
+    else:
+        assert "reload shop.b on the Full Load step with 'Drop & reload'" in runbook
+        assert "cannot remove the stale ones" in runbook
+    # A TRUNCATE alone keeps its "the table" wording byte for byte.
+    alone = _BannerUi()
+    _render_drift([{"table": "shop.b", "kind": "source-truncate", "count": 1}], mtype, ui=alone)
+    expected = (
+        "delete the rows the source no longer has from the table on Aurora DSQL"
+        if mtype is MigrationType.CDC_ONLY
+        else "Stop CDC, reload the table on the Full Load step with 'Drop & reload'"
+    )
+    assert any(expected in t for t in alone.texts)
 
 
 class _AiBannerUi(_BannerUi):
@@ -1184,6 +1335,25 @@ def test_the_value_fit_banner_asks_the_ai_dba_without_claiming_a_schema_change()
         assert any("what DDL to apply" in t for t in tooltips), tooltips
 
 
+def test_the_ai_drift_facts_name_a_constraint_as_a_constraint_and_list_the_codes() -> None:
+    """The facts are authoritative to the AI DBA: a 23514 group names its CHECK constraint
+    (never "columns"), and every group carries its SQLSTATEs."""
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import SchemaDriftSummary
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+
+    facts = cm._cdc_drift_facts(SimpleNamespace(schema_drift=[
+        SchemaDriftSummary(table="shop.orders", kind="check-violation", count=2,
+                           columns=["orders_status_check"], codes=["23514"]),
+        SchemaDriftSummary(table="shop.items", kind="nullability-change", count=1,
+                           columns=["note"], codes=["23502"]),
+    ]))
+    assert "(constraint: orders_status_check)" in facts and "columns: orders" not in facts
+    assert "[codes: 23514]" in facts
+    assert "nullability-change (columns: note) [codes: 23502]" in facts
+
+
 def test_cdc_schema_drift_summary_lists_value_fit_columns(monkeypatch) -> None:
     from dsql_migrator.ui.data_migration import _cdc_status
 
@@ -1202,4 +1372,646 @@ def test_cdc_schema_drift_summary_lists_value_fit_columns(monkeypatch) -> None:
     fit = groups["value-does-not-fit"]
     assert fit.count == 3
     assert fit.columns == ["amount numeric(10,2)", "flag boolean"]
+    assert fit.codes == ["VALUE_DOES_NOT_FIT"]
     assert groups["add-column"].columns == []
+    assert groups["add-column"].codes == ["42703"]
+
+
+def _dlq_line(offset: int, reason: str, table: str = "orders") -> str:
+    return (
+        f"Quarantined record to DLQ (topic=dsqlcdc.shop.{table}, partition=0, "
+        f"offset={offset}): {reason}"
+    )
+
+
+def test_cdc_schema_drift_summary_groups_and_names_by_record_evidence(monkeypatch) -> None:
+    """G9: a sink refusal and a DSQL 22003 on one table are ONE value-fit group (one banner
+    row, one runbook); a 23514 names its constraint; a 23502 names its column only when the
+    record shape proves which case it is; every list is capped."""
+    from dsql_migrator.ui.data_migration import _cdc_status
+
+    null_sent = _NULL_SENT_REASON.split(": ", 1)[1]
+    not_sent = _NOT_SENT_REASON.split(": ", 1)[1]
+    records = [
+        parse_dlq_log_message(_VALUE_FIT_LINE),
+        parse_dlq_log_message(_dlq_line(20, "sqlstate=22003 integer out of range | pk: id=20")),
+        parse_dlq_log_message(_dlq_line(
+            21, 'sqlstate=23514 new row for relation "orders" violates check constraint '
+            '"orders_status_check" [constraint: orders_status_check] | pk: id=21 | op: c',
+            table="items",
+        )),
+        parse_dlq_log_message(_dlq_line(
+            22, 'sqlstate=23514 new row for relation "orders" violates check constraint '
+            '"chk_qty" | pk: id=22 | op: c', table="items",
+        )),
+        parse_dlq_log_message(_dlq_line(23, null_sent, table="notes")),
+        parse_dlq_log_message(_dlq_line(24, not_sent, table="docs")),
+        parse_dlq_log_message(_dlq_line(25, "sqlstate=23502 boom", table="bare")),
+        parse_dlq_log_message(_dlq_line(26, "sqlstate=22P02 invalid input syntax", table="bad")),
+        # The column is named but the SQL template is cut before ") VALUES (" (a wide table
+        # past the reason's bound): nothing proves it was not sent -- it may have been a NULL.
+        parse_dlq_log_message(_dlq_line(
+            27, null_sent[: null_sent.index(") VALUES (")], table="wide",
+        )),
+    ]
+    monkeypatch.setattr(_cdc_status, "cdc_dlq_records", lambda _state, _key: records)
+    groups = {
+        (g.table, g.kind): g for g in _cdc_status.cdc_schema_drift_summary(object(), "k")
+    }
+    fit = groups[("shop.orders", "value-does-not-fit")]
+    assert fit.count == 2
+    assert fit.codes == ["22003", "VALUE_DOES_NOT_FIT"]
+    assert fit.columns == ["amount numeric(10,2)"]  # DSQL's 22003 names no column
+    check = groups[("shop.items", "check-violation")]
+    assert check.columns == ["orders_status_check", "chk_qty"] and check.codes == ["23514"]
+    assert groups[("shop.notes", "nullability-change")].columns == ["note"]
+    assert groups[("shop.docs", "drop-column")].columns == ["note"]  # proven not sent
+    assert groups[("shop.bare", "drop-column")].columns == []  # no evidence: no guess
+    assert groups[("shop.wide", "drop-column")].columns == []  # named, not proven absent
+    assert not any(table == "shop.bad" for table, _kind in groups)  # 22P02: no kind
+    # One group per (table, kind): no second value-fit or type-change group anywhere.
+    assert not any(kind == "type-change" for _table, kind in groups)
+
+    capped = [
+        parse_dlq_log_message(_dlq_line(
+            30 + i, f'sqlstate=23514 x [constraint: c{i}] | pk: id={i}', table="many",
+        ))
+        for i in range(9)
+    ]
+    monkeypatch.setattr(_cdc_status, "cdc_dlq_records", lambda _state, _key: capped)
+    (group,) = _cdc_status.cdc_schema_drift_summary(object(), "k")
+    assert group.count == 9 and group.columns == [f"c{i}" for i in range(6)]
+
+
+def test_cdc_schema_drift_summary_parses_each_record_once(monkeypatch) -> None:
+    """The summary is re-run on every CDC poll over an uncapped, append-only log: it must
+    parse only the new tail, and rebuild when the log is not the one it saw."""
+    from types import SimpleNamespace
+
+    import dsql_migrator.core.cdc as cdc
+    from dsql_migrator.ui.data_migration import _cdc_status
+
+    calls = {"classify": 0, "evidence": 0}
+    real_classify, real_evidence = cdc.classify_schema_drift, cdc.not_null_evidence
+
+    def _classify(code, message=None):
+        calls["classify"] += 1
+        return real_classify(code, message)
+
+    def _evidence(message):
+        calls["evidence"] += 1
+        return real_evidence(message)
+
+    monkeypatch.setattr(cdc, "classify_schema_drift", _classify)
+    monkeypatch.setattr(cdc, "not_null_evidence", _evidence)
+    null_sent = _NULL_SENT_REASON.split(": ", 1)[1]
+    log = [parse_dlq_log_message(_dlq_line(i, null_sent)) for i in range(3)]
+    view = {"records": list(log)}
+    monkeypatch.setattr(_cdc_status, "cdc_dlq_records", lambda _state, _key: view["records"])
+    state = SimpleNamespace()
+
+    first = _cdc_status.cdc_schema_drift_summary(state, "k")
+    assert [(g.kind, g.count) for g in first] == [("nullability-change", 3)]
+    assert calls["classify"] == 3
+    calls.update(classify=0, evidence=0)
+    assert _cdc_status.cdc_schema_drift_summary(state, "k") == first
+    assert calls == {"classify": 0, "evidence": 0}  # unchanged log: nothing parsed
+
+    log.append(parse_dlq_log_message(_dlq_line(9, "sqlstate=42P10 no unique constraint")))
+    view["records"] = list(log)  # cdc_dlq_records hands out a new list, same objects
+    grown = _cdc_status.cdc_schema_drift_summary(state, "k")
+    assert calls["classify"] == 1  # only the new tail
+    assert [(g.kind, g.count) for g in grown] == [("key-change", 1), ("nullability-change", 3)]
+    # The earlier view was not mutated by the incremental fold.
+    assert [(g.kind, g.count) for g in first] == [("nullability-change", 3)]
+
+    calls.update(classify=0, evidence=0)
+    view["records"] = [parse_dlq_log_message(_dlq_line(i, null_sent)) for i in range(2)]
+    rebuilt = _cdc_status.cdc_schema_drift_summary(state, "k")  # new objects: rebuild
+    assert calls["classify"] == 2
+    assert [(g.kind, g.count) for g in rebuilt] == [("nullability-change", 2)]
+    calls.update(classify=0)
+    assert _cdc_status.cdc_schema_drift_summary(state, "other-key")  # another key: rebuild
+    assert calls["classify"] == 2
+    view["records"] = []
+    assert _cdc_status.cdc_schema_drift_summary(state, "other-key") == []  # a reset
+
+    # NEW record objects, at least as many as were folded, under the same key: the identity
+    # of the last folded record is what tells them apart -- rebuild, never extend the old.
+    view["records"] = [parse_dlq_log_message(_dlq_line(i, null_sent)) for i in range(3)]
+    _cdc_status.cdc_schema_drift_summary(state, "k")
+    calls.update(classify=0)
+    view["records"] = [
+        parse_dlq_log_message(_dlq_line(40 + i, "sqlstate=42703 x", table="items"))
+        for i in range(4)
+    ]
+    fresh = _cdc_status.cdc_schema_drift_summary(state, "k")
+    assert calls["classify"] == 4
+    assert [(g.table, g.kind, g.count) for g in fresh] == [("shop.items", "add-column", 4)]
+
+    # Copy-then-extend: a reader still holding the stored entry (the AI tool reads it off the
+    # event loop) folds the same tail again and must get the same counts, not double them.
+    base = [parse_dlq_log_message(_dlq_line(50 + i, null_sent)) for i in range(2)]
+    view["records"] = list(base)
+    _cdc_status.cdc_schema_drift_summary(state, "k")
+    stored = state._cdc_drift_summary_cache
+    view["records"] = base + [parse_dlq_log_message(_dlq_line(52, null_sent))]
+    once = [(g.kind, g.count, g.columns) for g in _cdc_status.cdc_schema_drift_summary(state, "k")]
+    state._cdc_drift_summary_cache = stored
+    twice = [(g.kind, g.count, g.columns) for g in _cdc_status.cdc_schema_drift_summary(state, "k")]
+    assert once == twice == [("nullability-change", 3, ["note"])]
+
+
+@pytest.mark.parametrize("new_count", [3, 4])
+def test_start_over_never_shows_the_previous_migrations_dead_letters(new_count) -> None:
+    """A CDC-only log key ("cdc:<stack>") is the same across Start over, and reset_in_place
+    re-runs __init__ on the same object: the dead-letter memos lived on as dynamic attributes,
+    so the new run (at the old record count) was served the previous migration's records --
+    its red key-change row, its DLQ depth and chips."""
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.models import DataErrorRecord
+    from dsql_migrator.ui.data_migration import _cdc_status
+    from dsql_migrator.ui.data_migration._state import DataMigrationState
+
+    def _rec(table, code):
+        return DataErrorRecord(table=table, error_code=code, message="m",
+                               occurred_at=datetime(2026, 10, 3, tzinfo=timezone.utc))
+
+    state = DataMigrationState()
+    key = _cdc_status.cdc_error_log_key(state)
+    for _ in range(3):
+        state.error_log.record(key, _rec("old.orders", "42P10"))
+    assert [g.kind for g in _cdc_status.cdc_schema_drift_summary(state, key)] == ["key-change"]
+    assert _cdc_status.cdc_dlq_summary(state, key).errors_by_table == {"old.orders": 3}
+    state.__init__()  # what reset_in_place does
+    assert _cdc_status.cdc_error_log_key(state) == key
+    for _ in range(new_count):
+        state.error_log.record(key, _rec("new.items", "42703"))
+    groups = _cdc_status.cdc_schema_drift_summary(state, key)
+    assert [(g.table, g.kind, g.count) for g in groups] == [
+        ("new.items", "add-column", new_count)
+    ]
+    assert _cdc_status.cdc_dlq_summary(state, key).errors_by_table == {"new.items": new_count}
+
+
+# ---------------------------------------------------------------------------
+# G9: every classified rejection gets an accurate label, its real cause and a repair Aurora
+# DSQL supports (no ALTER COLUMN TYPE, no SET NOT NULL, an immutable primary key, a CHECK only
+# NOT VALID), by migration type and engine.
+# ---------------------------------------------------------------------------
+
+
+def _pg_session():
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import SourceType
+
+    return SimpleNamespace(source_config=SimpleNamespace(source_type=SourceType.POSTGRES))
+
+
+def _row(blob_texts, table):
+    return [t for t in blob_texts if t.startswith(f"{table}: ")]
+
+
+def test_a_key_change_banner_is_red_with_the_recreate_remedy() -> None:
+    """42P10 dead-letters EVERY insert and update of the table (certain, ongoing loss: error,
+    like 07006), but the table exists -- so never the dropped-table notice, and never the
+    generic "apply the matching change (e.g. ALTER TABLE)": Aurora DSQL cannot change a key."""
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+    from dsql_migrator.ui.data_migration._models import MigrationType
+    from dsql_migrator.ui.design import NOTICE_STYLE
+
+    assert "key-change" not in cm._TARGET_SIDE_DRIFT_KINDS
+    assert "key-change" not in cm._CERTAIN_LOSS_DRIFT_KINDS
+    group = {"table": "shop.orders", "kind": "key-change", "count": 4, "codes": ["42P10"]}
+    blob, classes = _render_drift([group], MigrationType.FULL_LOAD_AND_CDC)
+    bg, border, _icon_color, _icon = NOTICE_STYLE["error"]
+    assert any(bg in c and border in c for c in classes), classes
+    assert (
+        "Rows are being lost — the key no longer matches the Aurora DSQL primary key" in blob
+    )
+    assert "shop.orders: the change records' key no longer matches" in blob
+    assert "SQLSTATE 42P10" in blob and "EVERY insert and update" in blob
+    for needle in ("cannot change a primary key in place", "Replace", "'Drop & reload'",
+                   "A table CDC re-keys", "Delete CDC infrastructure"):
+        assert needle in blob, needle
+    for absent in ("Stop CDC and reload these tables", "e.g. ALTER TABLE", "Fix target schema",
+                   "Source schema change detected", "Target table missing"):
+        assert absent not in blob, absent
+
+    blob, _ = _render_drift([group], MigrationType.CDC_ONLY)
+    assert "Start over" in blob and "restore the original key on the source" in blob
+    assert "'Drop & reload'" not in blob and "e.g. ALTER TABLE" not in blob
+    # Every insert and update was dead-lettered meanwhile and is never replayed: restoring
+    # the key repairs only new writes (the Full Load + CDC remedy says "still need 'Drop &
+    # reload'"; CDC only must say how to correct them).
+    assert "rows set aside meanwhile are not replayed" in blob
+    assert "correct them on Aurora DSQL by hand" in blob
+
+
+def _rekey_state(current, deployed):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        cdc_message_key_columns=lambda: current,
+        cdc_deployed_message_key_columns=deployed,
+        cdc_catalog_drift_findings={},
+    )
+
+
+def test_a_key_change_banner_says_redeploy_only_for_a_table_cdc_re_keys() -> None:
+    """The Composite-key redeploy clause applies to a re-keyed table only: the banner reads
+    the same re-key map the Fix dialog does, and keeps the conditional hedge only while it
+    cannot tell (no state, or the deployed stack's key map not read yet -- a key removed
+    after the deploy is still on the stack)."""
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    mt = MigrationType.FULL_LOAD_AND_CDC
+    group = {"table": "shop.orders", "kind": "key-change", "count": 4, "codes": ["42P10"]}
+    plain, _ = _render_drift([group], mt, migration_state=_rekey_state({}, {}))
+    assert "A table CDC re-keys" not in plain and "Delete CDC infrastructure" not in plain
+    assert "Or restore the original key on the source" in plain
+    rekeyed, _ = _render_drift(
+        [group], mt, migration_state=_rekey_state({}, {"shop.orders": ["tenant_id", "id"]})
+    )
+    assert "CDC re-keys this table on id, tenant_id" in rekeyed
+    assert "A table CDC re-keys" not in rekeyed
+    assert "Delete CDC infrastructure and deploy it again" in rekeyed
+    unknown, _ = _render_drift([group], mt, migration_state=_rekey_state({}, None))
+    assert "A table CDC re-keys" in unknown
+    # Several key-change tables, one re-keyed: "this table" cannot name them all.
+    two = [group, dict(group, table="shop.items")]
+    several, _ = _render_drift(
+        two, mt, migration_state=_rekey_state({"shop.items": ["sku"]}, {})
+    )
+    assert "A table CDC re-keys" in several and "re-keys this table" not in several
+    # CDC only never names the Composite-key redeploy, whatever the state.
+    for state in (None, _rekey_state({}, {"shop.orders": ["tenant_id", "id"]})):
+        blob, _ = _render_drift([group], MigrationType.CDC_ONLY, migration_state=state)
+        assert "re-keys" not in blob
+
+
+def test_the_fix_dialog_key_refusal_text_is_unchanged_by_the_extraction() -> None:
+    """_key_change_remedy is shared with the banner; the dialog's own text stays byte-equal."""
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    refusal = SimpleNamespace(renamed=(), gone=("id",), missing=(), before=("id",),
+                              after=("code",), rekeyed=("tenant_id",))
+    plan = SimpleNamespace(refusal=refusal)
+    _header, body = cm._fix_refusal_notice(
+        plan, "shop.orders", migration_type=MigrationType.FULL_LOAD_AND_CDC, is_pg=False
+    )
+    assert body.endswith(
+        "re-apply shop.orders in Schema Conversion (Step 2) choosing Replace when asked (it "
+        "recreates the table empty, with the new key), reload it on the Full Load step with "
+        "'Drop & reload', then Start CDC and run Validation (step 4). Or restore the original "
+        "key on the source; the rows set aside meanwhile still need 'Drop & reload'. CDC "
+        "re-keys this table on tenant_id (Schema Conversion's Composite key), and the "
+        "deployed CDC infrastructure carries that key: choose the Composite key again in "
+        "Schema Conversion, then Delete CDC infrastructure and deploy it again before Start "
+        "CDC. On MySQL, that Start needs a start point newer than this change; the Start CDC "
+        "dialog explains the options."
+    ), body
+    plain = SimpleNamespace(refusal=SimpleNamespace(
+        renamed=(), gone=("id",), missing=(), before=(), after=(), rekeyed=(),
+    ))
+    _h, body = cm._fix_refusal_notice(
+        plain, "shop.orders", migration_type=MigrationType.FULL_LOAD_AND_CDC, is_pg=False
+    )
+    assert "re-keys" not in body and "A table CDC re-keys" not in body
+
+
+@pytest.mark.parametrize("pg", [False, True])
+def test_a_check_violation_banner_names_the_constraint_and_a_not_valid_repair(pg) -> None:
+    """23514: usually the tool's own ENUM port (text + CHECK) after the source type gained a
+    value. Aurora DSQL adds a CHECK only NOT VALID, one DDL per transaction, and the name is
+    the one the dead-letter reason gives -- never a guessed auto-name."""
+    from dsql_migrator.ui.data_migration._models import MigrationType
+    from dsql_migrator.ui.design import NOTICE_STYLE
+
+    group = {"table": "shop.orders", "kind": "check-violation", "count": 2,
+             "columns": ["orders_status_check"], "codes": ["23514"]}
+    session = _pg_session() if pg else None
+    blob, classes = _render_drift([group], MigrationType.FULL_LOAD_AND_CDC, session)
+    bg, border, _icon_color, _icon = NOTICE_STYLE["warning"]
+    assert any(bg in c and border in c for c in classes), classes
+    assert "a CHECK constraint rejected the row (orders_status_check)" in blob
+    for needle in ("SQLSTATE 23514", "DROP CONSTRAINT", "NOT VALID", "one statement per "
+                   "transaction", "re-run Step 1"):
+        assert needle in blob, needle
+    if pg:
+        assert "ALTER TYPE ... ADD VALUE" in blob and "MySQL" not in blob
+    else:
+        assert "MySQL ENUM" in blob
+    assert "'Drop & reload' backfill recreates it" in blob
+    blob, _ = _render_drift([group], MigrationType.CDC_ONLY, session)
+    assert "NOT VALID" in blob and "'Drop & reload'" not in blob
+    assert "no Full Load step" in blob
+    assert "backfill recreates it" not in blob
+
+
+def test_a_type_change_banner_recreates_instead_of_an_alter() -> None:
+    """Aurora DSQL has no ALTER COLUMN ... TYPE, so 'Apply the matching change (e.g. ALTER
+    TABLE)' was impossible advice for a type change (and for 42883 on a delete)."""
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    group = {"table": "shop.orders", "kind": "type-change", "count": 3,
+             "codes": ["42804", "42883"]}
+    blob, _ = _render_drift([group], MigrationType.FULL_LOAD_AND_CDC)
+    assert "Source schema change detected" in blob
+    assert "cannot change a column's type in place" in blob and "Replace" in blob
+    assert "42883" in blob
+    assert "e.g. ALTER TABLE" not in blob
+    assert "smallint" not in blob  # the TINYINT(1) advice belongs to the sink's refusal only
+    blob, _ = _render_drift([group], MigrationType.CDC_ONLY)
+    assert "add a column of that type" in blob
+    assert "'Drop & reload'" not in blob
+
+
+def test_an_add_column_banner_on_cdc_only_never_names_a_reload() -> None:
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    group = {"table": "shop.orders", "kind": "add-column", "count": 3}
+    blob, _ = _render_drift([group], MigrationType.CDC_ONLY)
+    assert "e.g. ALTER TABLE" in blob and "no Full Load step" in blob
+    assert "'Drop & reload'" not in blob
+    # Full Load + CDC keeps today's runbook verbatim.
+    blob, _ = _render_drift([group], MigrationType.FULL_LOAD_AND_CDC)
+    assert "A plain append reload cannot backfill them" in blob
+
+
+def test_a_dsql_value_rejection_shares_the_value_fit_banner_without_a_type_claim() -> None:
+    """22001/22003 are Aurora DSQL's own "this column cannot hold the value": the value-fit
+    header, seed and recreate runbook -- and never "column type changed"."""
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    mt = MigrationType.FULL_LOAD_AND_CDC
+    server = {"table": "shop.orders", "kind": "value-does-not-fit", "count": 2,
+              "codes": ["22003"]}
+    blob, _ = _render_drift([server], mt)
+    assert "Rows set aside: a value does not fit its Aurora DSQL column" in blob
+    assert "SQLSTATE 22003" in blob and "Aurora DSQL rejected a value its column cannot hold" in blob
+    for absent in ("Source schema change detected", "column type changed", "smallint"):
+        assert absent not in blob, absent
+    blob, _ = _render_drift([server], mt, _pg_session())
+    assert "numeric(18,6)" in blob
+    # No codes (an older summary): today's why, byte for byte.
+    plain = {"table": "shop.orders", "kind": "value-does-not-fit", "count": 2}
+    blob, _ = _render_drift([plain], mt)
+    assert f"{cm._DRIFT_LABELS['value-does-not-fit'][1]}. 2 records dead-lettered." in blob
+    assert "smallint" in blob
+    # The sink's refusals AND DSQL's own: one row, the sink's why plus the DSQL sentence.
+    both = dict(plain, codes=["22001", "VALUE_DOES_NOT_FIT"])
+    blob, _ = _render_drift([both], mt)
+    assert cm._DRIFT_LABELS["value-does-not-fit"][1] in blob
+    assert "also rejected" in blob and "SQLSTATE 22001" in blob
+
+
+def test_a_23502_banner_is_neutral_without_evidence_and_gives_both_repairs() -> None:
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    group = {"table": "shop.orders", "kind": "drop-column", "count": 2, "codes": ["23502"]}
+    blob, _ = _render_drift([group], MigrationType.FULL_LOAD_AND_CDC)
+    assert "shop.orders: a NOT NULL column got no value —" in blob
+    assert "or now allows NULL in it" in blob
+    assert "column dropped at the source" not in blob  # not without evidence
+    for needle in ("DROP NOT NULL", "DROP COLUMN", "'Drop & reload' refuses",
+                   "cannot make the column NOT NULL again"):
+        assert needle in blob, needle
+    blob, _ = _render_drift([group], MigrationType.CDC_ONLY)
+    assert "DROP NOT NULL" in blob and "'Drop & reload'" not in blob
+    # The records prove the column was not sent: PostgreSQL names the TOAST cause too.
+    named = dict(group, columns=["note"])
+    blob, _ = _render_drift([named], MigrationType.FULL_LOAD_AND_CDC, _pg_session())
+    assert "a NOT NULL column got no value (note)" in blob
+    # Both PostgreSQL TOAST clauses, each pinned on its own: the row's why and the runbook.
+    assert "which PostgreSQL does not resend" in blob
+    assert (
+        "or your exclusions keep it out, or an update left its large (TOASTed) value unchanged"
+        in blob
+    )
+    blob, _ = _render_drift([named], MigrationType.FULL_LOAD_AND_CDC)
+    assert "TOAST" not in blob and "do not carry this column" in blob
+
+
+@pytest.mark.parametrize("pg", [False, True])
+def test_a_23502_row_on_a_table_with_exclusions_follows_the_column_the_records_name(pg) -> None:
+    """The exclusions clause blamed an excluded column even when the records prove another
+    one was not sent, and led with "usually the source dropped it" when the named column IS
+    excluded. The named column decides; with no name the hedged clause stays."""
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import SchemaDriftSummary
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    def _why(columns, excluded):
+        view = SimpleNamespace(schema_drift=[SchemaDriftSummary(
+            table="shop.orders", kind="drop-column", count=2, columns=columns, codes=["23502"],
+        )])
+        ui = _BannerUi()
+        cm._render_cdc_schema_drift_banner(
+            ui, view, session=_pg_session() if pg else None,
+            migration_type=MigrationType.FULL_LOAD_AND_CDC,
+            saved_exclusions={"shop.orders": excluded},
+        )
+        (row,) = _row(ui.texts, "shop.orders")
+        return row
+
+    other = _why(["note"], {"blob_col"})  # the records name a column the rules do not cover
+    assert "saved column exclusions" not in other and "usually the source dropped it" in other
+    excluded = _why(["note"], {"note"})  # the records name the excluded column: the cause
+    assert "saved column exclusions keep it out" in excluded
+    assert "usually the source dropped it" not in excluded and "TOAST" not in excluded
+    partly = _why(["note", "memo"], {"memo"})
+    assert "this table's saved column exclusions also keep out memo" in partly
+    assert "usually the source dropped it" in partly
+    hedged = _why([], {"body"})  # no evidence: the hedged clause, unchanged
+    assert "since this table has saved column exclusions (body)" in hedged
+    capped = _why([f"c{i}" for i in range(6)], {"body"})  # names capped: more may exist
+    assert "since this table has saved column exclusions (body)" in capped
+
+
+def test_a_null_sent_23502_is_never_called_a_dropped_column() -> None:
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    group = {"table": "shop.orders", "kind": "nullability-change", "count": 2,
+             "columns": ["note"], "codes": ["23502"]}
+    for mt in (MigrationType.FULL_LOAD_AND_CDC, MigrationType.CDC_ONLY):
+        blob, _ = _render_drift([group], mt)
+        assert "a NULL sent for a NOT NULL column (note)" in blob
+        for needle in ("now allows NULL", "DROP NOT NULL", "cannot make the column NOT NULL "
+                       "again", "still NOT NULL"):
+            assert needle in blob, needle
+        assert "column dropped at the source" not in blob
+        assert "DROP COLUMN" not in blob
+
+
+def _catalog_state(*findings):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import CdcCatalogDriftChange, CdcCatalogDriftFinding
+
+    out = {}
+    for table, kind, column, before, after, resolved in findings:
+        now = datetime(2026, 10, 3, tzinfo=timezone.utc)
+        out[table] = CdcCatalogDriftFinding(
+            kinds=[kind], first_seen_at=now,
+            changes=[CdcCatalogDriftChange(kind=kind, column=column, before=before, after=after)],
+            resolved_at=now if resolved else None, resolved_by="matched" if resolved else None,
+        )
+    return SimpleNamespace(cdc_catalog_drift_findings=out)
+
+
+@pytest.mark.parametrize(
+    "finding,group,label",
+    [
+        (("shop.orders", "drop-column", "note", "text", None, False),
+         {"kind": "drop-column", "columns": []}, "column dropped at the source"),
+        (("shop.orders", "drop-column", "note", "text", None, False),
+         {"kind": "drop-column", "columns": ["note"]}, "column dropped at the source"),
+        (("shop.orders", "nullability-change", "note", "NOT NULL", "NULL", False),
+         {"kind": "nullability-change", "columns": ["note"]}, "NULL rule changed at the source"),
+        (("shop.orders", "key-change", None, "id", "code", False),
+         {"kind": "key-change"}, "primary key changed at the source"),
+    ],
+)
+def test_an_open_re_check_finding_confirms_the_dead_letter_label(finding, group, label) -> None:
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    state = _catalog_state(finding)
+    groups = [dict(group, table="shop.orders", count=2)]
+    blob, _ = _render_drift(groups, MigrationType.FULL_LOAD_AND_CDC, migration_state=state)
+    assert f"shop.orders: {label}" in blob
+
+
+def test_a_confirmed_key_change_row_names_the_old_and_new_key() -> None:
+    """The banner hides the re-check's key-change row, so it carries that row's facts: the
+    remedy says "restore the original key", and this says which key that is."""
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    group = {"table": "shop.orders", "kind": "key-change", "count": 2, "codes": ["42P10"]}
+    confirmed = _catalog_state(("shop.orders", "key-change", None, "id", "code", False))
+    for mt in (MigrationType.FULL_LOAD_AND_CDC, MigrationType.CDC_ONLY):
+        ui = _BannerUi()
+        _render_drift([group], mt, migration_state=confirmed, ui=ui)
+        (row,) = _row(ui.texts, "shop.orders")
+        assert row.startswith(
+            "shop.orders: primary key changed at the source (primary key was (id), now (code)) —"
+        ), row
+    # Unconfirmed (no finding, or a resolved one): the record label, no facts.
+    resolved = _catalog_state(("shop.orders", "key-change", None, "id", "code", True))
+    for state in (None, resolved):
+        ui = _BannerUi()
+        _render_drift([group], MigrationType.FULL_LOAD_AND_CDC, migration_state=state, ui=ui)
+        (row,) = _row(ui.texts, "shop.orders")
+        assert row.startswith("shop.orders: the change records' key no longer matches the "
+                              "Aurora DSQL primary key —"), row
+
+
+@pytest.mark.parametrize(
+    "finding,group",
+    [
+        # A tightening (NULL -> NOT NULL) dead-letters nothing: it confirms no NULL row.
+        (("shop.orders", "nullability-change", "note", "NULL", "NOT NULL", False),
+         {"kind": "nullability-change", "columns": ["note"]}),
+        # A resolved finding confirms nothing any more.
+        (("shop.orders", "drop-column", "note", "text", None, True),
+         {"kind": "drop-column", "columns": []}),
+        # A drop of ANOTHER column than the records name.
+        (("shop.orders", "drop-column", "memo", "text", None, False),
+         {"kind": "drop-column", "columns": ["note"]}),
+        # A finding of a different kind.
+        (("shop.orders", "type-change", "note", "int", "bigint", False),
+         {"kind": "drop-column", "columns": []}),
+        # Another table's finding.
+        (("shop.items", "drop-column", "note", "text", None, False),
+         {"kind": "drop-column", "columns": []}),
+    ],
+)
+def test_a_re_check_finding_that_does_not_match_keeps_the_record_label(finding, group) -> None:
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    state = _catalog_state(finding)
+    groups = [dict(group, table="shop.orders", count=2)]
+    blob, _ = _render_drift(groups, MigrationType.FULL_LOAD_AND_CDC, migration_state=state)
+    assert f"shop.orders: {cm._DRIFT_LABELS[group['kind']][0]}" in blob
+
+
+def test_the_dead_letter_banner_hides_only_re_check_rows_it_fully_repairs() -> None:
+    """One banner per cause: a key change and a relaxed NULL rule are listed only in the
+    banner (which carries their repair); a tightening, a finding with more changes than were
+    kept, and a MySQL ENUM change behind a 23514 keep their re-check row (deliberately, like a
+    rename: that row shows the new ENUM definition the replacement CHECK needs)."""
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+
+    assert {"key-change", "nullability-change"} <= cm._DLQ_SHARED_SCHEMA_KINDS
+    assert "check-violation" not in cm._DLQ_SHARED_SCHEMA_KINDS
+    assert "value-does-not-fit" not in cm._DLQ_SHARED_SCHEMA_KINDS
+
+    def _finding(kind, before=None, after=None, more=0, columns=("note",)):
+        return SimpleNamespace(
+            kinds=[kind], more_changes=more, fixable=False,
+            changes=[SimpleNamespace(kind=kind, column=c, before=before, after=after)
+                     for c in columns],
+        )
+
+    assert cm._listed_in_dlq_banner(_finding("key-change"), {"key-change"})
+    relaxed = _finding("nullability-change", "NOT NULL", "NULL")
+    assert cm._listed_in_dlq_banner(relaxed, {"nullability-change"}, {"note"})
+    tightened = _finding("nullability-change", "NULL", "NOT NULL")
+    assert not cm._listed_in_dlq_banner(tightened, {"nullability-change"}, {"note"})
+    more = _finding("nullability-change", "NOT NULL", "NULL", more=1)
+    assert not cm._listed_in_dlq_banner(more, {"nullability-change"}, {"note"})
+    enum = _finding("type-change", "enum('a','b')", "enum('a','b','c')")
+    assert not cm._listed_in_dlq_banner(enum, {"check-violation"})
+    # The banner's NULL row names only the columns a NULL reached: a relaxed column it does
+    # not name (none at all, another one, or one of two relaxed) is named only by the
+    # re-check row, which therefore stays.
+    assert not cm._listed_in_dlq_banner(relaxed, {"nullability-change"})
+    assert not cm._listed_in_dlq_banner(relaxed, {"nullability-change"}, {"memo"})
+    both = _finding("nullability-change", "NOT NULL", "NULL", columns=("note", "memo"))
+    assert not cm._listed_in_dlq_banner(both, {"nullability-change"}, {"note"})
+    assert cm._listed_in_dlq_banner(both, {"nullability-change"}, {"note", "memo"})
+
+
+@pytest.mark.parametrize("pg", [False, True])
+def test_mixed_drift_gets_one_repair_per_cause(pg) -> None:
+    """A table set with several causes: one lead, one sentence per kind, the type change and
+    the value-fit tables in ONE recreate sentence (never two), the header by severity."""
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    groups = [
+        {"table": "shop.a", "kind": "add-column", "count": 1},
+        {"table": "shop.b", "kind": "type-change", "count": 1, "codes": ["42804"]},
+        {"table": "shop.c", "kind": "value-does-not-fit", "count": 1, "codes": ["22001"]},
+        {"table": "shop.d", "kind": "nullability-change", "count": 1, "columns": ["n"]},
+        {"table": "shop.e", "kind": "check-violation", "count": 1},
+        {"table": "shop.f", "kind": "key-change", "count": 1},
+    ]
+    session = _pg_session() if pg else None
+    ui = _BannerUi()
+    blob, _ = _render_drift(groups, MigrationType.FULL_LOAD_AND_CDC, session, ui=ui)
+    (runbook,) = [t for t in ui.texts if t.startswith("CDC does not replicate DDL.")]
+    assert runbook.count("cannot change a column's type in place") == 1
+    assert "re-apply shop.b, shop.c in Schema Conversion" in runbook
+    assert runbook.count("For shop.") == 3  # nullability, check, key
+    assert "Rows are being lost — the key no longer matches" in blob
+    for table in ("shop.a", "shop.b", "shop.c", "shop.d", "shop.e", "shop.f"):
+        assert len(_row(ui.texts, table)) == 1, table
+
+
+def test_the_monitor_names_the_sinks_value_fit_code_exactly() -> None:
+    from dsql_migrator.core.cdc_dlq import VALUE_DOES_NOT_FIT_CODE
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+
+    assert cm._SINK_VALUE_FIT_CODE == VALUE_DOES_NOT_FIT_CODE

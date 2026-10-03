@@ -1350,3 +1350,55 @@ def test_a_value_fit_dead_letter_gets_its_own_way_forward_line(migration_type):
         assert "by hand" in line and "Start over" in line
     else:
         assert "Replace" in line and "Schema Conversion" in line
+
+
+@pytest.mark.parametrize("migration_type", ["FULL_LOAD_AND_CDC", "FULL_LOAD_ONLY", "CDC_ONLY"])
+@pytest.mark.parametrize("kind", ["key-change", "nullability-change", "check-violation"])
+def test_a_g9_dead_letter_kind_gets_the_schema_change_line(migration_type, kind):
+    """G9's new kinds are source schema changes: the gate's "What to do" names them (they used
+    to classify to nothing, so no kind and no line). The hold itself is kind-agnostic and
+    untouched: every ledger table already needs a CHECKSUM after its last record."""
+    from dsql_migrator.ui.cdc_dlq_gate import _kind_label, issue_lines, way_forward_lines
+    from dsql_migrator.ui.data_migration import MigrationType
+
+    gate = dataclasses.replace(
+        _gate(ledger={"app.t": _entry(kinds=[kind])}, report=_report(_item(checksum=None))),
+        migration_type=MigrationType[migration_type],
+    )
+    assert gate.issues and gate.held  # the hold is kind-agnostic: held with or without G9
+    steps = way_forward_lines(gate)
+    (line,) = [s for s in steps if "show a source schema change" in s]
+    assert line.startswith("Records for app.t show a source schema change")
+    assert _kind_label(kind) in " ".join(issue_lines(gate))
+    if migration_type == "CDC_ONLY":
+        assert "by hand" in line and "before you reload" not in line
+        assert "'Drop & reload'" not in line
+        if kind == "key-change":
+            assert "restore it on the source, or use Start over" in line
+    else:
+        assert "before you reload" in line
+        if kind == "key-change":
+            assert "Replace" in line
+    if kind != "key-change":
+        assert "primary key" not in line
+
+
+def test_a_dsql_value_rejection_reaches_the_single_value_fit_line():
+    """22001/22003 fold into value-does-not-fit in the ledger, so the table lands on the one
+    recreate line -- listed once, never also as a schema change."""
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.cdc import CdcConnectorError
+    from dsql_migrator.core.cdc_dlq import fold_dlq_ledger
+    from dsql_migrator.ui.cdc_dlq_gate import way_forward_lines
+
+    ledger = fold_dlq_ledger(
+        {},
+        [CdcConnectorError(table="app.t", message="m", error_code=c, occurred_at=T_DL)
+         for c in ("22003", "VALUE_DOES_NOT_FIT")],
+        now=datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc),
+    )
+    gate = _gate(ledger=ledger, report=_report(_item(checksum=None)))
+    steps = way_forward_lines(gate)
+    assert len([s for s in steps if "cannot store exactly" in s]) == 1
+    assert not any("show a source schema change" in s for s in steps)

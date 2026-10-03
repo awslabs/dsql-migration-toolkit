@@ -44,6 +44,7 @@ from dsql_migrator.ui.data_migration._models import (
 )
 from dsql_migrator.ui.data_migration._cdc_status import (
     _CDC_TONE_STYLE,
+    _VALUE_FIT_COLUMN_LIMIT,
     _apply_cdc_status,
     _cdc_status_view,
     _current_job,
@@ -847,18 +848,49 @@ def _render_cdc_replica_identity_notice(
 
 
 # The source-schema kinds the dead-letter banner ALSO classifies (from the rejection's
-# SQLSTATE), with the same names as the re-check's: a table both report the same way is
-# listed only in that banner. ``value-does-not-fit`` is deliberately NOT here: it is not a
-# schema-change claim (a MySQL TINYINT(1) holding 2 needs no DDL), so it must never hide a
-# re-check finding; a widened table shows both, and both hold Cut over.
-_DLQ_SHARED_SCHEMA_KINDS = frozenset({"add-column", "drop-column", "type-change"})
+# SQLSTATE and record shape), with the same names as the re-check's: a table both report the
+# same way is listed only in that banner, which then carries the re-check row's repair for it
+# (the key-change recreate remedy, the DROP NOT NULL step) and the re-check's label
+# (_catalog_label). ``value-does-not-fit`` is deliberately NOT here: it is not a schema-change
+# claim (a MySQL TINYINT(1) holding 2 needs no DDL), so it must never hide a re-check finding;
+# a widened table shows both, and both hold Cut over. Nor is ``check-violation``: a MySQL ENUM
+# that gained a value is a re-check "type-change", and that row shows the new definition the
+# replacement CHECK needs -- both stay, deliberately (like a rename).
+_DLQ_SHARED_SCHEMA_KINDS = frozenset(
+    {"add-column", "drop-column", "type-change", "key-change", "nullability-change"}
+)
 
 
-def _listed_in_dlq_banner(finding, banner_kinds) -> bool:
-    """Whether the dead-letter banner already reports every kind of this open finding."""
+def _listed_in_dlq_banner(finding, banner_kinds, null_columns=()) -> bool:
+    """Whether the dead-letter banner already reports every kind of this open finding.
+
+    ``null_columns`` are the columns the banner's NULL rows (nullability-change) name for
+    this table: the columns a NULL has reached."""
     kinds = set(getattr(finding, "kinds", None) or ())
     if not kinds or not banner_kinds or not kinds <= set(banner_kinds):
         return False
+    if "nullability-change" in kinds:
+        # The banner's NULL row is a RELAXATION (a NULL sent) and names only the columns a
+        # NULL has reached. A tightening dead-letters nothing, changes past the kept six
+        # cannot be checked, and a relaxed column no NULL has reached yet is named only by
+        # the re-check row: each keeps that row. Names compare exactly, so a mismatch shows
+        # both rows (the safe side).
+        named = set(null_columns or ())
+        changes = [
+            change
+            for change in (getattr(finding, "changes", None) or ())
+            if getattr(change, "kind", None) == "nullability-change"
+        ]
+        if (
+            not changes
+            or int(getattr(finding, "more_changes", 0) or 0) > 0
+            or any(
+                getattr(change, "after", None) != "NULL"
+                or getattr(change, "column", None) not in named
+                for change in changes
+            )
+        ):
+            return False
     # An unfixable add-column finding keeps its row here: an added column the source
     # computes is invisible to the banner, and the shared plan also refuses a table whose
     # CDC key column (message.key.columns) is gone -- the banner's Fix then only shows that
@@ -876,8 +908,9 @@ def _render_cdc_catalog_drift_notice(
     one row per table with what changed and why it matters, the runbook for the migration
     type, "Fix target schema…" for an added or renamed column (not where the dead-letter
     banner already offers it), and "Check again". A table whose change the dead-letter banner
-    already reports the same way (a column added, dropped or retyped; the banner is drawn
-    whenever the queue's depth is known) is listed only there -- never twice, with two
+    already reports the same way (a column added, dropped or retyped, a changed key, a NULL
+    rule relaxed when the banner names every relaxed column; the banner is drawn whenever
+    the queue's depth is known) is listed only there -- never twice, with two
     severities and two runbooks (an unfixable add -- all generated, or a key refusal -- keeps
     its row here); the finding still holds Cut over. ``warning`` for a table
     whose source matches the baseline again but that no CHECKSUM started after that has
@@ -923,13 +956,19 @@ def _render_cdc_catalog_drift_notice(
     # still see every open finding, and the "Can't re-check" notice below keys on them all.
     drift_groups = list(getattr(view, "schema_drift", None) or ())
     banner_kinds: dict = {}
+    banner_null_columns: dict = {}
     if getattr(view, "dlq_depth", None) is not None:  # the dead-letter card is drawn
         for g in drift_groups:
             if getattr(g, "kind", "") in _DLQ_SHARED_SCHEMA_KINDS:
-                banner_kinds.setdefault(getattr(g, "table", None), set()).add(g.kind)
+                table = getattr(g, "table", None)
+                banner_kinds.setdefault(table, set()).add(g.kind)
+                if g.kind == "nullability-change":
+                    banner_null_columns.setdefault(table, set()).update(
+                        getattr(g, "columns", None) or ()
+                    )
     shown_open = {
         t: f for t, f in open_findings.items()
-        if not _listed_in_dlq_banner(f, banner_kinds.get(t))
+        if not _listed_in_dlq_banner(f, banner_kinds.get(t), banner_null_columns.get(t, ()))
     }
     if shown_open:
         # The dead-letter banner already offers Fix for its add-column groups: one button
@@ -1636,15 +1675,20 @@ _DRIFT_LABELS: dict[str, tuple[str, str]] = {
         "the source added or renamed a column, and the target table has no column of that "
         "name, so DSQL rejected the new-schema rows (SQLSTATE 42703)",
     ),
+    # Neutral on purpose: a 23502 whose record did not carry the column is a dropped column,
+    # an excluded one, or (PostgreSQL) an unchanged TOAST value, and one with no evidence at
+    # all may be a NULL the source now allows. The banner upgrades the label to "column
+    # dropped at the source" only when the source schema re-check confirms it (_catalog_label).
     "drop-column": (
-        "column dropped at the source",
-        "the source dropped a column the target still requires (NOT NULL), so DSQL "
-        "rejected the rows (SQLSTATE 23502)",
+        "a NOT NULL column got no value",
+        "Aurora DSQL rejected rows that carry no value for a column it requires, NOT NULL "
+        "with no DEFAULT (SQLSTATE 23502): usually the source dropped that column, or now "
+        "allows NULL in it",
     ),
     "type-change": (
         "column type changed at the source",
         "the source changed a column's type incompatibly, so DSQL rejected the rows "
-        "(SQLSTATE 42804)",
+        "(SQLSTATE 42804, or 42883 for a delete keyed on that column)",
     ),
     # TARGET-side, and the most destructive: every event for the table is dead-lettered
     # with its offset committed, so the rows are not waiting anywhere to be retried.
@@ -1712,6 +1756,30 @@ _DRIFT_LABELS: dict[str, tuple[str, str]] = {
         "(usually after the source type was widened, or a narrower type was chosen in Schema "
         "Conversion). Values that fit keep flowing",
     ),
+    # 42P10: every insert and update for the table is lost (deletes, keyed by WHERE, still
+    # apply), so the banner is `error` -- but NOT target-side: the table exists, and the
+    # dropped-table "Stop CDC and reload these tables" notice would be false here.
+    "key-change": (
+        "the change records' key no longer matches the Aurora DSQL primary key",
+        "Aurora DSQL found no primary key or unique index matching the key these change "
+        "records carry (SQLSTATE 42P10), so EVERY insert and update for this table is being "
+        "dead-lettered: the source's primary key changed, or the table was re-applied in "
+        "Schema Conversion with a different key than the deployed CDC infrastructure writes by",
+    ),
+    "nullability-change": (
+        "a NULL sent for a NOT NULL column",
+        "the change records carry NULL in a column the Aurora DSQL table keeps NOT NULL, so "
+        "DSQL rejected the rows (SQLSTATE 23502): usually the source column now allows NULL",
+    ),
+    # 23514. The tool's own ENUM port is the usual CHECK (text + CHECK IN (...)), so a value
+    # the source type gained is the realistic cause; a hand-added CHECK is named too.
+    "check-violation": (
+        "a CHECK constraint rejected the row",
+        "a value fails a CHECK constraint on the Aurora DSQL table, so DSQL rejected the rows "
+        "(SQLSTATE 23514). Schema Conversion gives every MySQL ENUM column a CHECK listing its "
+        "allowed values, so usually the source ENUM gained a value; a CHECK you added in Schema "
+        "Conversion or on Aurora DSQL does the same. Rows the CHECK allows keep flowing",
+    ),
 }
 
 # The same "why" for a PostgreSQL source, which has no TINYINT(1): there a boolean target only
@@ -1725,6 +1793,114 @@ _VALUE_FIT_WHY_PG = (
     "that fit keep flowing"
 )
 
+# Aurora DSQL's OWN rejection of a value (22001 / 22003), when the group holds only those: the
+# same kind as the sink's refusals (the column needs a type that holds the value), but not the
+# sink's words. Never a type-change claim. ``{pg}`` is the PostgreSQL numeric clause.
+_VALUE_FIT_SERVER_WHY = (
+    "Aurora DSQL rejected a value its column cannot hold: a string longer than its varchar or "
+    "char length (SQLSTATE 22001), or a number outside its integer or numeric range (SQLSTATE "
+    "22003), usually after the source column was widened or because a narrower type was "
+    "chosen in Schema Conversion{pg}. Values that fit keep flowing"
+)
+_VALUE_FIT_SERVER_PG = (
+    " (a numeric with no precision is stored as numeric(18,6) on Aurora DSQL)"
+)
+# Appended to the sink's why when a group holds both the sink's refusals and DSQL's own.
+_VALUE_FIT_SERVER_ALSO = (
+    ". Aurora DSQL also rejected a string longer than its varchar or char column (SQLSTATE "
+    "22001) or a number outside its integer or numeric range (SQLSTATE 22003)"
+)
+# The sink's synthetic value-fit code (core.cdc_dlq.VALUE_DOES_NOT_FIT_CODE). Every OTHER code
+# a value-fit group can hold is one core.cdc maps to the kind -- Aurora DSQL's own rejection --
+# so no second code table is kept here.
+_SINK_VALUE_FIT_CODE = "VALUE_DOES_NOT_FIT"
+
+# A drop-column group whose records PROVE the column was not sent (group.columns names it).
+_DROP_COLUMN_NOT_SENT_WHY = (
+    "the change records do not carry this column, which the Aurora DSQL table requires (NOT "
+    "NULL, no DEFAULT), so DSQL rejected the rows (SQLSTATE 23502): usually the source "
+    "dropped it"
+)
+_DROP_COLUMN_TOAST_PG = (
+    ", or an update left its large (TOASTed) value unchanged, which PostgreSQL does not resend"
+)
+
+# The check-violation "why" for a PostgreSQL source: its enum is a TYPE, and ALTER TYPE ... ADD
+# VALUE changes no column definition, so the source schema re-check cannot see it.
+_CHECK_WHY_PG = (
+    "a value fails a CHECK constraint on the Aurora DSQL table, so DSQL rejected the rows "
+    "(SQLSTATE 23514). Schema Conversion gives every PostgreSQL enum column a CHECK listing its "
+    "labels, so usually the source enum gained a value (ALTER TYPE ... ADD VALUE, which the "
+    "source schema re-check cannot see); a CHECK you added in Schema Conversion or on Aurora "
+    "DSQL does the same. Rows the CHECK allows keep flowing"
+)
+
+
+def _drift_why(group, *, is_pg: bool) -> str:
+    """The banner's "why" for one group: by kind, engine and the group's own evidence."""
+    kind = getattr(group, "kind", "")
+    why = _DRIFT_LABELS.get(kind, (kind, "the source schema changed"))[1]
+    if kind == "value-does-not-fit":
+        codes = set(getattr(group, "codes", None) or ())
+        server = codes - {_SINK_VALUE_FIT_CODE}
+        if server and _SINK_VALUE_FIT_CODE not in codes:
+            return _VALUE_FIT_SERVER_WHY.format(pg=_VALUE_FIT_SERVER_PG if is_pg else "")
+        why = _VALUE_FIT_WHY_PG if is_pg else why
+        return why + (_VALUE_FIT_SERVER_ALSO if server else "")
+    if kind == "drop-column" and getattr(group, "columns", None):
+        return _DROP_COLUMN_NOT_SENT_WHY + (_DROP_COLUMN_TOAST_PG if is_pg else "")
+    if kind == "check-violation" and is_pg:
+        return _CHECK_WHY_PG
+    return why
+
+
+# The dead-letter kinds whose label the source schema re-check (G4) can CONFIRM: a finding of
+# the same kind for the same table (and column, when the records name one) upgrades the label
+# to the re-check's own ("column dropped at the source", ...). Render-time and label only: the
+# kind, the ledger, the gate and the activity marker stay record-level.
+_CORROBORATED_KINDS = frozenset({"drop-column", "nullability-change", "key-change"})
+
+
+def _catalog_confirming_changes(group, migration_state) -> list:
+    """The OPEN re-check finding's changes that confirm this group, else ``[]``.
+
+    Reads state only (the throttled background read landed it; no I/O here). A nullability
+    finding confirms only a relaxation (NOT NULL -> NULL): a tightening dead-letters nothing.
+    """
+    kind = getattr(group, "kind", "")
+    if kind not in _CORROBORATED_KINDS or migration_state is None:
+        return []
+    findings = getattr(migration_state, "cdc_catalog_drift_findings", None) or {}
+    try:
+        finding = findings.get(getattr(group, "table", None))
+    except Exception:  # noqa: BLE001 - a label upgrade must never break the banner
+        return []
+    if finding is None or getattr(finding, "resolved_at", None) is not None:
+        return []
+    changes = [
+        change
+        for change in (getattr(finding, "changes", None) or ())
+        if getattr(change, "kind", None) == kind
+        and (kind != "nullability-change" or getattr(change, "after", None) == "NULL")
+    ]
+    if not changes:
+        return []
+    named = set(getattr(group, "columns", None) or ())
+    if kind == "key-change" or not named or any(
+        getattr(change, "column", None) in named for change in changes
+    ):
+        return changes
+    return []
+
+
+def _catalog_label(group, migration_state) -> Optional[str]:
+    """The re-check's label for this group when an OPEN finding confirms it, else ``None``."""
+    if not _catalog_confirming_changes(group, migration_state):
+        return None
+    from dsql_migrator.ui.cdc_catalog_drift_gate import _LABELS as _CATALOG_LABELS
+
+    return _CATALOG_LABELS.get(getattr(group, "kind", ""))
+
 # Drift kinds that are NOT a source DDL change, so the banner must not call them one.
 # ``source-truncate`` is deliberately NOT here: it IS source-side, and this set's header and
 # stop-and-reload notice are both about a row going MISSING from the target, which is the
@@ -1737,7 +1913,9 @@ _TARGET_SIDE_DRIFT_KINDS = frozenset(
 # risk. `error` rather than `warning` by the design system's own calibration (warning =
 # real but non-blocking): an unbindable value loses every write for the table until the
 # connector is replaced, and a missing target table loses every event for it. 23505 is
-# deliberately NOT here -- there a row only CAN end up missing.
+# deliberately NOT here -- there a row only CAN end up missing. ``key-change`` (42P10) loses
+# every insert and update too, but is in neither set: its table exists, so it gets its own
+# `error` header and the recreate runbook, never the dropped-table notice these sets drive.
 _CERTAIN_LOSS_DRIFT_KINDS = frozenset({"missing-table", "unbindable-value"})
 
 # The kinds that are neither a source DDL change nor target-side: a source TRUNCATE (extra
@@ -1764,19 +1942,23 @@ def _fix_is_cdc_only(migration_type) -> bool:
     return getattr(migration_type, "name", None) == "CDC_ONLY"
 
 
-def _value_fit_runbook(migration_type, names, *, is_pg: bool = False) -> str:
-    """The recreate runbook for rows the sink refused because their column would change them.
+def _value_fit_runbook(
+    migration_type, names, *, is_pg: bool = False, remap: bool = True
+) -> str:
+    """The recreate runbook for rows whose column needs another type to hold their values.
 
     Aurora DSQL has no ``ALTER COLUMN ... TYPE``, so the only way to give a column a type that
     holds the values is to recreate the table -- never an ALTER. ``names`` are the affected
-    tables (capped like the Fix sentences). No engine sentence: nothing here deletes the CDC
-    infrastructure, so the replication slot / stream position is kept.
+    tables (capped like the Fix sentences): the sink's value-fit refusals, Aurora DSQL's own
+    22001/22003 and a type change. ``remap`` False drops the TINYINT(1) clause (no sink
+    refusal among them). No engine sentence: nothing here deletes the CDC infrastructure, so
+    the replication slot / stream position is kept.
     """
     shown = _fix_names(sorted({str(n) for n in names}))
     # A MySQL TINYINT(1) is the common no-DDL cause; PostgreSQL has no such type.
-    remap = (
+    remap_clause = (
         ""
-        if is_pg
+        if is_pg or not remap
         else " (for a MySQL TINYINT(1) holding values other than 0 and 1, edit its type to "
         "smallint)"
     )
@@ -1796,7 +1978,8 @@ def _value_fit_runbook(migration_type, names, *, is_pg: bool = False) -> str:
         "that holds these values: let CDC catch up (Stream lag: caught up), Stop CDC, re-run "
         f"Step 1 (Evaluation) if the source column's type changed, re-apply {shown} in Schema "
         "Conversion (Step 2) choosing Replace when asked, with the column given a type that "
-        f"holds the values{remap}, reload it on the Full Load step with 'Drop & reload', then "
+        f"holds the values{remap_clause}, reload it on the Full Load step with 'Drop & reload', "
+        "then "
         "Start CDC and run Validation (step 4). Until then CDC keeps setting such rows aside, "
         "and Cut over stays held for each table until it matches by CHECKSUM."
     )
@@ -1847,33 +2030,224 @@ def _fix_refusal_notice(plan, table: str, *, migration_type, is_pg: bool) -> "tu
         "column here would not repair it: every insert and update would still be rejected, "
         "and every delete would silently match no row."
     )
-    if _fix_is_cdc_only(migration_type):
-        remedy = (
-            " Aurora DSQL cannot change a primary key in place or drop a primary-key column, "
-            "and CDC only has no Full Load step to reload from: restore the original key on "
-            "the source, or use Start over to migrate the table with its new key."
-        )
-    else:
-        remedy = (
-            " Aurora DSQL cannot change a primary key in place or drop a primary-key column, "
-            "so recreate the table: let CDC catch up (Stream lag: caught up), Stop CDC, "
-            f"re-run Step 1 (Evaluation), re-apply {table} in Schema Conversion (Step 2) "
-            "choosing Replace when asked (it recreates the table empty, with the new key), "
-            "reload it on the Full Load step with 'Drop & reload', then Start CDC and run "
-            "Validation (step 4). Or restore the original key on the source; the rows set "
-            "aside meanwhile still need 'Drop & reload'."
-        )
-        if refusal.rekeyed:
-            remedy += (
-                f" CDC re-keys this table on {_fix_names(refusal.rekeyed)} (Schema "
-                "Conversion's Composite key), and the deployed CDC infrastructure carries "
-                "that key: choose the Composite key again in Schema Conversion, then Delete "
-                "CDC infrastructure and deploy it again before Start CDC."
-                + _fix_engine_sentence(is_pg=is_pg, cdc_only=False)
-            )
+    remedy = _key_change_remedy(
+        migration_type, table, is_pg=is_pg, rekeyed=tuple(refusal.rekeyed)
+    )
     return (
         f"Fix target schema… cannot repair {table}: its key changed on the source",
         "On the source, " + "; ".join(facts) + ". " + consequence + remedy,
+    )
+
+
+def _key_change_remedy(migration_type, shown: str, *, is_pg: bool, rekeyed) -> str:
+    """The recreate remedy for a table whose key changed (a leading space, then sentences).
+
+    Shared by the Fix dialog's key refusal and the dead-letter banner's 42P10 line, so the
+    two never disagree. ``shown`` names the table(s). ``rekeyed`` is the table's re-key
+    columns (the dialog: those the change touches; the banner: the table's own): non-empty
+    adds the Composite-key redeploy clause, an empty tuple adds nothing, ``None`` (not known:
+    no state, the deployed stack's key map not read yet, or several tables) adds it
+    conditionally.
+    """
+    if _fix_is_cdc_only(migration_type):
+        # Every insert and update was dead-lettered while the key did not match, and a
+        # dead-lettered row is never replayed: restoring the key repairs only new writes.
+        return (
+            " Aurora DSQL cannot change a primary key in place or drop a primary-key column, "
+            "and CDC only has no Full Load step to reload from: restore the original key on "
+            "the source, or use Start over to migrate the table with its new key. If you "
+            "restore the key, the rows set aside meanwhile are not replayed: correct them on "
+            "Aurora DSQL by hand (the dead-letter queue card lists each record's primary key)."
+        )
+    remedy = (
+        " Aurora DSQL cannot change a primary key in place or drop a primary-key column, "
+        "so recreate the table: let CDC catch up (Stream lag: caught up), Stop CDC, "
+        f"re-run Step 1 (Evaluation), re-apply {shown} in Schema Conversion (Step 2) "
+        "choosing Replace when asked (it recreates the table empty, with the new key), "
+        "reload it on the Full Load step with 'Drop & reload', then Start CDC and run "
+        "Validation (step 4). Or restore the original key on the source; the rows set "
+        "aside meanwhile still need 'Drop & reload'."
+    )
+    if rekeyed:
+        remedy += (
+            f" CDC re-keys this table on {_fix_names(rekeyed)} (Schema "
+            "Conversion's Composite key), and the deployed CDC infrastructure carries "
+            "that key: choose the Composite key again in Schema Conversion, then Delete "
+            "CDC infrastructure and deploy it again before Start CDC."
+            + _fix_engine_sentence(is_pg=is_pg, cdc_only=False)
+        )
+    elif rekeyed is None:
+        remedy += (
+            " A table CDC re-keys (Schema Conversion's Composite key) also needs the "
+            "Composite key chosen again in Schema Conversion, then Delete CDC infrastructure "
+            "and deploy it again before Start CDC."
+            + _fix_engine_sentence(is_pg=is_pg, cdc_only=False)
+        )
+    return remedy
+
+
+def _truncate_runbook(migration_type, names: Optional[str] = None) -> str:
+    """The repair for a source TRUNCATE (extra rows on the target), by migration type. Pure.
+
+    ``names`` (already capped) names the truncated tables when the banner holds other kinds
+    too; a TRUNCATE-only banner says "the table" (its rows name them)."""
+    table = names or "the table"
+    if _fix_is_cdc_only(migration_type):
+        return (
+            "CDC cannot replicate a TRUNCATE (Aurora DSQL has no TRUNCATE statement), "
+            "and CDC only has no Full Load step to reload from. Stop CDC, delete the "
+            f"rows the source no longer has from {table} on Aurora DSQL (at most "
+            "3,000 rows per transaction), then Start CDC. Run Validation (step 4) "
+            "afterwards: Cut over stays held for each truncated table until it "
+            "matches by CHECKSUM."
+        )
+    return (
+        "CDC cannot replicate a TRUNCATE (Aurora DSQL has no TRUNCATE statement). "
+        f"Stop CDC, reload {table} on the Full Load step with 'Drop & reload' "
+        "(offered only while CDC is stopped; 'Append' only adds missing rows, so "
+        "it cannot remove the stale ones), then Start CDC. Run Validation (step 4) "
+        "afterwards: Cut over stays held for each truncated table until it "
+        "matches by CHECKSUM."
+    )
+
+
+def _banner_rekeyed(tables, migration_state):
+    """``rekeyed`` for the banner's key-change remedy (see :func:`_key_change_remedy`).
+
+    ``()`` when the state proves no listed table is re-keyed, the one table's re-key columns
+    when it is, else ``None`` (no state, the deployed stack's key map not read yet -- a key
+    removed after the deploy is still on the stack -- or several tables, some re-keyed)."""
+    if migration_state is None or (
+        getattr(migration_state, "cdc_deployed_message_key_columns", None) is None
+    ):
+        return None
+    from dsql_migrator.ui.cdc_catalog_drift_gate import cdc_rekey_columns
+
+    rekey = cdc_rekey_columns(migration_state)  # CPU only; never raises
+    hit = [t for t in tables if rekey.get(t)]
+    if not hit:
+        return ()
+    if len(tables) == 1:
+        return tuple(sorted(rekey[hit[0]]))
+    return None
+
+
+def _ddl_runbook(drift, migration_type, *, is_pg: bool, migration_state=None) -> str:
+    """The banner's runbook when at least one kind is a source schema change. CPU only.
+
+    One lead, then one sentence per kind present, each a repair Aurora DSQL supports: no
+    ``ALTER COLUMN ... TYPE`` (a type change and a value its column cannot hold share the
+    recreate runbook), no ``SET NOT NULL``, no primary-key change (the recreate remedy), a
+    CHECK only re-added ``NOT VALID``, ``DROP NOT NULL`` keeps the values, and ``DROP
+    COLUMN`` must come before a reload (Drop & reload refuses while the target still has the
+    column). A source TRUNCATE beside them keeps its own repair (no DDL lead removes extra
+    rows, and its dead letter names no row to correct by hand). CDC only has no Full Load
+    step, so it never names 'Drop & reload'. ``migration_state`` (read only) tells whether a
+    key-change table is re-keyed (:func:`_banner_rekeyed`).
+    """
+    by_kind: dict[str, set] = {}
+    for group in drift:
+        by_kind.setdefault(getattr(group, "kind", ""), set()).add(str(group.table))
+    cdc_only = _fix_is_cdc_only(migration_type)
+    ddl = set(by_kind) - _NON_DDL_SOURCE_KINDS
+
+    def names(kind: str) -> str:
+        return _fix_names(sorted(by_kind[kind]))
+
+    if ddl <= {"type-change", "key-change"}:
+        # Neither can be "applied" with an ALTER on Aurora DSQL: their own sentences recreate.
+        parts = ["CDC does not replicate DDL."]
+    elif cdc_only:
+        parts = [
+            "CDC does not replicate DDL. Apply the matching change to the target schema (e.g. "
+            "ALTER TABLE) to stop new rows being set aside. The rows already set aside are not "
+            "replayed, and CDC only has no Full Load step to reload them from: correct them on "
+            "Aurora DSQL by hand (the dead-letter queue card lists each record's primary key), "
+            "re-run Step 1 (Evaluation) so Validation compares the new definition, then run "
+            "Validation (step 4)."
+        ]
+    else:
+        parts = [
+            "CDC does not replicate DDL. Apply the matching change to the target "
+            "schema (e.g. ALTER TABLE) to stop new rows being set aside — then "
+            "backfill the ones already set aside: re-run Step 1 (Evaluation) so the "
+            "Full Load sees the changed column list, stop CDC, and reload the table "
+            "with 'Drop & reload'. A plain append reload cannot backfill them: it "
+            "only inserts primary keys the target is missing, so a row already there "
+            "keeps its old values. Run Validation (step 4) afterwards to confirm."
+        ]
+    drop_not_null = (
+        "run ALTER TABLE ... ALTER COLUMN ... DROP NOT NULL on Aurora DSQL: it keeps the "
+        "stored values, and Aurora DSQL cannot make the column NOT NULL again."
+    )
+    if "drop-column" in by_kind:
+        toast = ", or an update left its large (TOASTed) value unchanged" if is_pg else ""
+        if cdc_only:
+            drop = (
+                "drop it on Aurora DSQL too (ALTER TABLE ... DROP COLUMN ...; a primary-key "
+                "column cannot be dropped: use Start over for that table)."
+            )
+        else:
+            drop = (
+                "drop it on Aurora DSQL too (ALTER TABLE ... DROP COLUMN ...) before you "
+                "reload: 'Drop & reload' refuses while the target still has a column the new "
+                "definition does not, and a primary-key column cannot be dropped (re-apply "
+                "that table in Schema Conversion with Replace instead)."
+            )
+        parts.append(
+            f"For {names('drop-column')} (a NOT NULL column got no value): if the source "
+            f"dropped that column, {drop} Otherwise (the source column now allows NULL, or "
+            f"your exclusions keep it out{toast}), {drop_not_null}"
+        )
+    if "nullability-change" in by_kind:
+        parts.append(
+            f"For {names('nullability-change')} (a NULL sent for a NOT NULL column): if the "
+            f"source column now allows NULL, {drop_not_null} If the source column is still "
+            "NOT NULL, CDC could not convert that row's value: check the row on the source "
+            "(the dead-letter queue card lists its primary key)."
+        )
+    if "check-violation" in by_kind:
+        check = (
+            f"For {names('check-violation')} (a CHECK constraint rejected the row): if the "
+            "source now allows more values, replace that CHECK on Aurora DSQL, one statement "
+            "per transaction: ALTER TABLE ... DROP CONSTRAINT with the constraint the "
+            "dead-letter reason names, then ALTER TABLE ... ADD CONSTRAINT with the same name "
+            "and CHECK (column IN (...every value the source now allows...)) NOT VALID. Aurora "
+            "DSQL adds a CHECK only as NOT VALID; it still checks every new write."
+        )
+        if not cdc_only:
+            check += (
+                " The 'Drop & reload' backfill recreates it from the re-run Step 1 with the "
+                "new values."
+            )
+        parts.append(check)
+    if "key-change" in by_kind:
+        rekeyed = _banner_rekeyed(sorted(by_kind["key-change"]), migration_state)
+        parts.append(
+            f"For {names('key-change')}:"
+            + _key_change_remedy(
+                migration_type, names("key-change"), is_pg=is_pg, rekeyed=rekeyed
+            )
+        )
+    recreate = sorted(by_kind.get("type-change", set()) | by_kind.get("value-does-not-fit", set()))
+    if recreate:
+        parts.append(
+            _value_fit_runbook(migration_type, recreate, is_pg=is_pg, remap=_value_fit_remap(drift))
+        )
+    if "source-truncate" in by_kind:
+        parts.append(_truncate_runbook(migration_type, names("source-truncate")))
+    return " ".join(parts)
+
+
+def _value_fit_remap(drift) -> bool:
+    """Whether the recreate runbook gives the TINYINT(1) -> smallint advice.
+
+    Only for the sink's own value-fit refusal (a boolean target holding 2), or a group whose
+    codes are unknown; a type change or Aurora DSQL's 22001/22003 alone never needs it."""
+    return any(
+        not getattr(g, "codes", None) or _SINK_VALUE_FIT_CODE in g.codes
+        for g in drift
+        if getattr(g, "kind", "") == "value-does-not-fit"
     )
 
 
@@ -2754,9 +3128,13 @@ def _cdc_drift_facts(status_view: LoadStatusView) -> str:
     for group in drift:
         noun = "record" if group.count == 1 else "records"
         columns = list(getattr(group, "columns", None) or ())
-        detail = f" (columns: {', '.join(columns)})" if columns else ""
+        # A check-violation group names its CHECK constraint, every other kind columns.
+        what = "constraint" if getattr(group, "kind", "") == "check-violation" else "columns"
+        detail = f" ({what}: {', '.join(columns)})" if columns else ""
+        codes = list(getattr(group, "codes", None) or ())
+        coded = f" [codes: {', '.join(codes)}]" if codes else ""
         lines.append(
-            f"- {group.table}: {group.kind}{detail} — {group.count} {noun} dead-lettered"
+            f"- {group.table}: {group.kind}{detail}{coded} — {group.count} {noun} dead-lettered"
         )
     return "\n".join(lines)
 
@@ -2783,11 +3161,14 @@ def _render_cdc_schema_drift_banner(
 
     CDC does not propagate DDL: when the source alters a table, the first row under
     the new schema is rejected by DSQL and dead-lettered. The control plane derives
-    the drift kind from the quarantine SQLSTATE (see ``classify_schema_drift``); this
-    band names the affected table(s) + what changed and points at the manual
-    recovery, so a reader is not left to reverse-engineer a rising DLQ count. Renders
+    the drift kind from the quarantine SQLSTATE and record shape (see
+    ``classify_schema_drift``); this band names the affected table(s) + what changed and
+    points at the manual recovery, so a reader is not left to reverse-engineer a rising DLQ
+    count. Each DDL kind present gets its own repair that Aurora DSQL supports
+    (:func:`_ddl_runbook`), and a 23502 / 42P10 row takes the source schema re-check's label
+    when an open finding confirms it (:func:`_catalog_label`, state only). Renders
     nothing when no drift was detected (the common case), so it is inert on a healthy
-    stream. The truncate-only runbook follows ``migration_type`` (CDC only has no Full
+    stream. Every runbook follows ``migration_type`` (CDC only has no Full
     Load step to reload from). ``on_applied`` is handed to the Fix dialog, which reports
     the columns it added (the source-schema re-check's baseline records them), and so is
     ``migration_state`` (the dialog's key, exclusion and rename inputs; without it the dialog
@@ -2807,8 +3188,8 @@ def _render_cdc_schema_drift_banner(
     _certain_loss = bool(_kinds & _CERTAIN_LOSS_DRIFT_KINDS)
     # FOUR cases now: a source TRUNCATE is neither a DDL change nor a target-side loss, so it
     # needs its own header and its own runbook line. Only when it is the ONLY kind present --
-    # mixed with a DDL change it keeps the (more severe) DDL header, and the per-table line below
-    # still states the truncate in full.
+    # mixed with a DDL change it keeps the (more severe) DDL header, the per-table line below
+    # still states the truncate in full, and _ddl_runbook adds the TRUNCATE repair for it.
     _truncate_only = _kinds == {"source-truncate"}
     # FIVE: a value the sink refused because its column would change it is not a schema change
     # either (a MySQL TINYINT(1) can hold 2 with no DDL), so it too gets its own header and
@@ -2821,16 +3202,22 @@ def _render_cdc_schema_drift_banner(
     from dsql_migrator.ui.cdc_replica_identity_gate import _is_postgres
 
     _is_pg = _is_postgres(session)
+    # SEVEN: a 42P10 (the records' key matches no Aurora DSQL unique key) loses EVERY insert
+    # and update for the table -- certain, ongoing loss, so `error` like 07006 -- but its table
+    # exists, so it is not target-side and never gets the dropped-table notice below.
+    _key_loss = "key-change" in _kinds
     # `error` for certain ongoing loss AND for the target-side kinds generally: a row that
     # may have vanished is not "be aware" either. `warning` is left to a source DDL change,
     # which is recoverable by applying the DDL.
-    _tone = "error" if _target_side else "warning"
+    _tone = "error" if _target_side or _key_loss else "warning"
     if _certain_loss:
         _header = (
             "Rows are being lost — the sink cannot write this table"
             if "unbindable-value" in _kinds
             else "Target table missing — rows are being lost"
         )
+    elif _key_loss:
+        _header = "Rows are being lost — the key no longer matches the Aurora DSQL primary key"
     elif _target_side:
         _header = "Rows may be missing from the target"
     elif _truncate_only:
@@ -2873,27 +3260,56 @@ def _render_cdc_schema_drift_banner(
                     else "Ask AI DBA what DDL to apply and how to backfill the drifted rows.",
                 )
         for group in drift:
-            label, why = _DRIFT_LABELS.get(
-                group.kind, (group.kind, "the source schema changed")
-            )
-            if group.kind == "value-does-not-fit" and _is_pg:
-                why = _VALUE_FIT_WHY_PG
+            label = _DRIFT_LABELS.get(group.kind, (group.kind, ""))[0]
+            # The source schema re-check's own label when an open finding confirms this
+            # group ("column dropped at the source", ...); the why stays record-level.
+            label = _catalog_label(group, migration_state) or label
+            why = _drift_why(group, is_pg=_is_pg)
             noun = "record" if group.count == 1 else "records"
+            # The value-free names the group's reasons give: a value-fit "<column> <type>",
+            # the 23502 column, the 23514 constraint (never a value).
+            _columns = list(getattr(group, "columns", None) or ())
             # 23502 is ALSO what an excluded column produces when the target still
             # requires it (NOT NULL, no DEFAULT): capture drops it from the event, so the
-            # sink sends no value. Say so for a table with saved exclusions, rather than
-            # only blaming a source DDL change that may never have happened.
+            # sink sends no value. When the records name the column not sent, that name
+            # decides (names compare exactly): an excluded one IS the cause, and one the
+            # exclusions do not cover rules them out. With no name (or the names capped),
+            # say so for a table with saved exclusions, rather than only blaming a source
+            # DDL change that may never have happened.
             _excluded = sorted((saved_exclusions or {}).get(group.table) or ())
             if group.kind == "drop-column" and _excluded:
-                why = (
-                    f"{why}; or, since this table has saved column exclusions "
-                    f"({', '.join(_excluded)}), an excluded column the target still "
-                    "requires (NOT NULL, no DEFAULT) — it is not sent, so the same "
-                    "rejection follows"
-                )
-            # A value-fit group names the column(s) and their Aurora DSQL type (never a value).
-            _columns = list(getattr(group, "columns", None) or ())
-            _named = f" ({', '.join(_columns)})" if _columns else ""
+                _hit = [c for c in _columns if c in set(_excluded)]
+                if _hit and len(_hit) == len(_columns):
+                    why = (
+                        "the change records do not carry this column: this table's saved "
+                        "column exclusions keep it out, and the Aurora DSQL table still "
+                        "requires it (NOT NULL, no DEFAULT), so DSQL rejected the rows "
+                        "(SQLSTATE 23502)"
+                    )
+                elif _hit:
+                    why = (
+                        f"{why}; this table's saved column exclusions also keep out "
+                        f"{', '.join(_hit)}"
+                    )
+                elif not _columns or len(_columns) >= _VALUE_FIT_COLUMN_LIMIT:
+                    why = (
+                        f"{why}; or, since this table has saved column exclusions "
+                        f"({', '.join(_excluded)}), an excluded column the target still "
+                        "requires (NOT NULL, no DEFAULT) — it is not sent, so the same "
+                        "rejection follows"
+                    )
+            _joiner = ", "
+            if group.kind == "key-change" and not _columns:
+                # The confirming re-check finding's key facts ("primary key was (id), now
+                # (code)"), so "restore the original key" says which key.
+                from dsql_migrator.ui.cdc_catalog_drift_gate import change_fact
+
+                _columns = [
+                    change_fact(c)
+                    for c in _catalog_confirming_changes(group, migration_state)[:_FIX_NAME_LIMIT]
+                ]
+                _joiner = "; "  # a key fact lists columns with commas itself
+            _named = f" ({_joiner.join(_columns)})" if _columns else ""
             with ui.row().classes("w-full items-center gap-2"):  # type: ignore[attr-defined]
                 ui.label(  # type: ignore[attr-defined]
                     f"{group.table}: {label}{_named} — {why}. {group.count} {noun} "
@@ -2924,55 +3340,34 @@ def _render_cdc_schema_drift_banner(
         # live (_full_load_ui's `not cdc_live_now`). CDC only has no Full Load step at all, so
         # its remedy is a manual delete on the target -- also with CDC stopped, which freezes
         # the target so the delete cannot race a newly replicated insert; the replay after
-        # Start is idempotent (upserts and no-op deletes).
+        # Start is idempotent (upserts and no-op deletes). Mixed with a DDL or target-side kind,
+        # _ddl_runbook appends the same TRUNCATE repair (_truncate_runbook) naming the
+        # truncated tables: no DDL lead removes extra rows.
         # A value-fit refusal has its OWN runbook: a column's type can only change by recreating
         # the table on Aurora DSQL (no ALTER COLUMN ... TYPE), so the generic "apply the matching
         # change (e.g. ALTER TABLE)" line would be impossible advice for it. Alone, it IS the
         # runbook; with only a TRUNCATE it is appended to the TRUNCATE line (no DDL kind, so no
-        # generic line); mixed with a DDL or target-side kind, it is appended to the generic one.
+        # generic line); mixed with a DDL or target-side kind, _ddl_runbook folds its tables
+        # into the one recreate sentence it shares with a type change. Every DDL kind gets a
+        # repair Aurora DSQL supports there (no ALTER COLUMN TYPE, no primary-key change, a
+        # CHECK only NOT VALID), by migration type.
         _value_fit_tables = [
             g.table for g in drift if getattr(g, "kind", "") == "value-does-not-fit"
         ]
         if _value_fit_only:
-            _runbook = _value_fit_runbook(migration_type, _value_fit_tables, is_pg=_is_pg)
-        elif not _no_ddl:
-            _runbook = (
-                "CDC does not replicate DDL. Apply the matching change to the target "
-                "schema (e.g. ALTER TABLE) to stop new rows being set aside — then "
-                "backfill the ones already set aside: re-run Step 1 (Evaluation) so the "
-                "Full Load sees the changed column list, stop CDC, and reload the table "
-                "with 'Drop & reload'. A plain append reload cannot backfill them: it "
-                "only inserts primary keys the target is missing, so a row already there "
-                "keeps its old values. Run Validation (step 4) afterwards to confirm."
+            _runbook = _value_fit_runbook(
+                migration_type, _value_fit_tables, is_pg=_is_pg, remap=_value_fit_remap(drift)
             )
-            if _value_fit_tables:
-                _runbook += " " + _value_fit_runbook(
-                    migration_type, _value_fit_tables, is_pg=_is_pg
-                )
+        elif not _no_ddl:
+            _runbook = _ddl_runbook(
+                drift, migration_type, is_pg=_is_pg, migration_state=migration_state
+            )
         else:
-            from dsql_migrator.ui.data_migration._models import MigrationType
-
-            if migration_type is MigrationType.CDC_ONLY:
-                _runbook = (
-                    "CDC cannot replicate a TRUNCATE (Aurora DSQL has no TRUNCATE statement), "
-                    "and CDC only has no Full Load step to reload from. Stop CDC, delete the "
-                    "rows the source no longer has from the table on Aurora DSQL (at most "
-                    "3,000 rows per transaction), then Start CDC. Run Validation (step 4) "
-                    "afterwards: Cut over stays held for each truncated table until it "
-                    "matches by CHECKSUM."
-                )
-            else:
-                _runbook = (
-                    "CDC cannot replicate a TRUNCATE (Aurora DSQL has no TRUNCATE statement). "
-                    "Stop CDC, reload the table on the Full Load step with 'Drop & reload' "
-                    "(offered only while CDC is stopped; 'Append' only adds missing rows, so "
-                    "it cannot remove the stale ones), then Start CDC. Run Validation (step 4) "
-                    "afterwards: Cut over stays held for each truncated table until it "
-                    "matches by CHECKSUM."
-                )
+            _runbook = _truncate_runbook(migration_type)
             if _value_fit_tables:
                 _runbook += " " + _value_fit_runbook(
-                    migration_type, _value_fit_tables, is_pg=_is_pg
+                    migration_type, _value_fit_tables, is_pg=_is_pg,
+                    remap=_value_fit_remap(drift),
                 )
         ui.label(_runbook).classes("text-xs italic text-gray-600")  # type: ignore[attr-defined]
         if _target_side:

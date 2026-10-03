@@ -472,8 +472,14 @@ class SchemaDriftKind(str, Enum):
     """
 
     ADD_COLUMN = "add-column"      # 42703 undefined_column: source added a column the target lacks
-    DROP_COLUMN = "drop-column"    # 23502 not_null_violation: source dropped a column the target requires
-    TYPE_CHANGE = "type-change"    # 42804 datatype_mismatch: source changed a column's type incompatibly
+    # 23502 not_null_violation: a NOT NULL target column got no value -- the record did not
+    # carry it (a dropped or excluded column, or a PostgreSQL unchanged TOAST value). A 23502
+    # whose record DID send the column (as NULL) is NULLABILITY_CHANGE instead, told apart by
+    # the SQL template in the reason (see :func:`not_null_evidence`).
+    DROP_COLUMN = "drop-column"
+    # 42804 datatype_mismatch / 42883 undefined_function (a DELETE comparing a retyped key
+    # column): the source changed a column's type incompatibly.
+    TYPE_CHANGE = "type-change"
     MISSING_TABLE = "missing-table"  # 42P01 / 3F000: the TARGET table (or schema) is gone
     # 23505 unique_violation. NOT a schema change and not target-schema loss -- a KEY-MODEL
     # conflict, classified because it is the only signal that a row may have VANISHED from
@@ -520,13 +526,38 @@ class SchemaDriftKind(str, Enum):
     # type narrowed in Schema Conversion produces it too -- so the banner must not announce a
     # source schema change for it. Before the guard these values landed changed, with no
     # dead letter; only a CHECKSUM could see them.
+    # Aurora DSQL's own 22001 (string longer than a varchar/char) and 22003 (number outside an
+    # integer/numeric range) share this kind: the same "the column needs a type that holds the
+    # value" cause and the same recreate remedy, and never a claim that the source changed a
+    # type (ordinary data or a narrower Schema Conversion type raises them with no DDL).
     VALUE_DOES_NOT_FIT = "value-does-not-fit"  # sink code VALUE_DOES_NOT_FIT (no SQLSTATE)
+    # 42P10 invalid_column_reference: no primary key or unique index matches the records'
+    # ON CONFLICT key, so EVERY insert and update for the table is dead-lettered (deletes,
+    # keyed by WHERE, still apply). The source primary key changed, or the table was
+    # re-applied with another key than the deployed CDC infrastructure writes by. The value
+    # is the source schema re-check's (G4) "key-change", so the two dedupe.
+    KEY_CHANGE = "key-change"
+    # 23502 where the record SENT the column, as NULL: the source column now allows NULL (or
+    # Debezium could not convert the value). Never a map value -- only record evidence
+    # (classify_schema_drift with the message) yields it. The value is the re-check's
+    # "nullability-change".
+    NULLABILITY_CHANGE = "nullability-change"
+    # 23514 check_violation: a CHECK rejected a value -- usually the CHECK Schema Conversion
+    # gives a MySQL ENUM / PostgreSQL enum column, after the source type gained a value.
+    CHECK_VIOLATION = "check-violation"
 
 
-# SQLSTATE -> drift kind. Only STRUCTURAL rejections (tied to the row's column set
-# or a column's declared type) map to drift; a per-VALUE data exception does NOT (see
-# classify_schema_drift). 42804 (datatype_mismatch) is the type-change signal --
-# deliberately NOT class 22 (22001/22003/…), which ordinary bad data raises.
+# SQLSTATE -> drift kind. Only rejections a source schema change explains map to drift;
+# a per-VALUE data exception with no schema meaning does NOT (see classify_schema_drift).
+# 42804 (datatype_mismatch) and 42883 (undefined_function: a DELETE comparing a retyped key
+# column with the old type) are the type-change signal. 22001/22003 (a value its Aurora DSQL
+# column cannot hold: too long / out of range) are grouped with the sink's own value-fit
+# refusals, NEVER as a type-change claim -- ordinary data or a narrower Schema Conversion type
+# raises them with no DDL at all. The rest of class 22 (22P02 malformed text, 22007/22008
+# datetime, 22021, 22023, ...), 54000 and 23503 stay UNMAPPED: per-value bad data a recreate
+# does not fix. They are still counted by the dead-letter ledger and held at Cut over.
+# 42P10 means the records' ON CONFLICT key matches no unique key (the primary key changed),
+# 23514 a CHECK rejected the value (usually a source ENUM gained a value).
 #
 # 42P01 (undefined_table) / 3F000 (undefined_schema) are the TARGET-side entry: they
 # mean the table the sink writes to no longer exists, which happens when the target
@@ -547,13 +578,70 @@ _DRIFT_BY_SQLSTATE: dict[str, SchemaDriftKind] = {
     "42703": SchemaDriftKind.ADD_COLUMN,
     "23502": SchemaDriftKind.DROP_COLUMN,
     "42804": SchemaDriftKind.TYPE_CHANGE,
+    "42883": SchemaDriftKind.TYPE_CHANGE,
     "42P01": SchemaDriftKind.MISSING_TABLE,
     "3F000": SchemaDriftKind.MISSING_TABLE,
     "23505": SchemaDriftKind.UNIQUE_CONFLICT,
     "07006": SchemaDriftKind.UNBINDABLE_VALUE,
+    "42P10": SchemaDriftKind.KEY_CHANGE,
+    "23514": SchemaDriftKind.CHECK_VIOLATION,
+    "22001": SchemaDriftKind.VALUE_DOES_NOT_FIT,
+    "22003": SchemaDriftKind.VALUE_DOES_NOT_FIT,
     "SOURCE_TRUNCATE": SchemaDriftKind.SOURCE_TRUNCATE,
     "VALUE_DOES_NOT_FIT": SchemaDriftKind.VALUE_DOES_NOT_FIT,
 }
+
+
+# The column a 23502 names, from the server's PRIMARY message (the sink keeps only that):
+# PostgreSQL 13+ ``null value in column "x" of relation "t" violates not-null constraint``,
+# PostgreSQL 12 ``null value in column "x" violates not-null constraint``. The server prints
+# the raw name (an embedded quote is NOT doubled), so the lookahead, not a closing quote,
+# ends it. Unverified on Aurora DSQL (its wording is not documented): an unfamiliar message
+# simply yields no column, and the record keeps the neutral DROP_COLUMN label.
+_NOT_NULL_COLUMN = re.compile(
+    r'null value in column "(?P<column>.+?)"(?= of relation "| violates not-null constraint)'
+)
+# The sink's rendered INSERT head (DsqlDialect.upsertSql): ``INSERT INTO "s"."t" (`` with
+# every identifier double-quoted and an embedded quote doubled.
+_SQL_TEMPLATE_MARK = " | sql: "
+_INSERT_HEAD = re.compile(r'INSERT INTO (?:"(?:[^"]|"")*"\.)*"(?:[^"]|"")*" \(')
+
+
+def not_null_evidence(message: Optional[str]) -> tuple[Optional[str], Optional[bool]]:
+    """What a 23502 dead-letter reason proves: ``(column, sent)``. Pure.
+
+    ``column`` is the NOT NULL column the server named, ``sent`` whether the record's INSERT
+    column list (the sink's SQL template, ``... | sql: INSERT INTO ... (cols) VALUES ...``)
+    carries it: ``True`` -- the record SENT it, as NULL (the source column now allows NULL,
+    or Debezium could not convert the value); ``False`` -- it did not (a dropped or excluded
+    column, or a PostgreSQL TOAST value an update left unchanged). ``(None, None)`` when no
+    column is named (an older sink, a non-PostgreSQL wording), ``(column, None)`` when the
+    template is absent or was cut before ``) VALUES (`` by the 2000-character message bound.
+    Matching is case-exact, like the sink's quoted identifiers. Linear ``str.find`` plus two
+    anchored regexes over at most the bounded message; value-free (identifiers only).
+    """
+    if not message:
+        return None, None
+    named = _NOT_NULL_COLUMN.search(message)
+    if named is None:
+        return None, None
+    column = named.group("column")
+    mark = message.find(_SQL_TEMPLATE_MARK + "INSERT INTO ")
+    if mark < 0:
+        return column, None
+    head = _INSERT_HEAD.match(message, mark + len(_SQL_TEMPLATE_MARK))
+    if head is None:
+        return column, None
+    end = message.find(") VALUES (", head.end() - 1)
+    if end < 0:
+        return column, None
+    columns = message[head.end() - 1 : end + 1]  # "(" + the quoted column list + ")"
+    quoted = '"' + column.replace('"', '""') + '"'
+    sent = any(
+        piece in columns
+        for piece in (f"({quoted},", f"({quoted})", f", {quoted},", f", {quoted})")
+    )
+    return column, sent
 
 
 # How long a cdc-stack DELETE takes, and WHY -- the single source of truth, because the
@@ -630,34 +718,53 @@ def stack_has_seeder_lambda(
     return (seed_mode or "lambda").strip().lower() == "lambda"
 
 
-def classify_schema_drift(error_code: Optional[str]) -> Optional[SchemaDriftKind]:
+def classify_schema_drift(
+    error_code: Optional[str], message: Optional[str] = None
+) -> Optional[SchemaDriftKind]:
     """Map a sink-quarantine SQLSTATE (or synthetic sink code) to a drift kind, else ``None``.
 
-    Pure: the single source of truth for "which code means which drift". The keys are:
-    the STRUCTURAL SQLSTATEs -- rejections determined by the row's COLUMN SET or a
-    column's DECLARED TYPE, which a source DDL change produces: ``42703`` (a column the
-    target lacks -> ADD COLUMN), ``23502`` (a NOT NULL target column got no value -> a
-    dropped source column), ``42804`` (datatype_mismatch -> TYPE CHANGE); ``42P01`` /
-    ``3F000`` (the TARGET table or schema is gone -> MISSING TABLE); ``23505`` (a unique
-    index rejected the row -> UNIQUE CONFLICT); ``07006`` (the sink could not bind a value
-    -> UNBINDABLE VALUE); and the sink's two synthetic, non-SQLSTATE codes for refusals made
-    before anything is sent: ``SOURCE_TRUNCATE`` and ``VALUE_DOES_NOT_FIT``.
+    Pure: the single source of truth for "which code means which drift" -- the banner, the
+    dead-letter ledger, :attr:`CdcConnectorError.drift_kind`, the gate and the AI payload all
+    go through it. The keys of ``_DRIFT_BY_SQLSTATE``:
 
-    A class ``22`` data exception (``22001`` string-too-long / ``22003`` numeric range
-    / ``22007`` bad datetime / ``22P02`` bad text) is deliberately NOT drift: it is a
-    per-VALUE rejection that ordinary bad data raises with no DDL change at all, so
-    mapping it to TYPE_CHANGE fired a false "source changed a column's type" banner on
-    every oversized/out-of-range poison row. Such a code (and any other unknown /
-    ``None`` code) returns ``None`` so it stays an ordinary quarantine, not drift.
-    ``VALUE_DOES_NOT_FIT`` is per-value too, but it IS mapped: Aurora DSQL would have
-    ACCEPTED those values and stored them changed, so there is no server error behind
-    it, and without its own banner (which never calls it a schema change) a row the sink
-    refused for this reason would be one more anonymous poison row.
+    * ``42703`` (a column the target lacks -> ADD COLUMN: added or renamed at the source);
+    * ``23502`` (a NOT NULL target column got no value -> DROP COLUMN), refined below;
+    * ``42804`` datatype_mismatch, and ``42883`` (a DELETE comparing a retyped key column)
+      -> TYPE CHANGE;
+    * ``42P01`` / ``3F000`` (the TARGET table or schema is gone -> MISSING TABLE);
+    * ``23505`` (a unique index rejected the row -> UNIQUE CONFLICT);
+    * ``07006`` (the sink could not bind a value -> UNBINDABLE VALUE);
+    * ``42P10`` (no unique key matches the records' ON CONFLICT key -> KEY CHANGE);
+    * ``23514`` (a CHECK rejected the value -> CHECK VIOLATION);
+    * ``22001`` / ``22003`` (too long / out of range for the Aurora DSQL column) and the
+      sink's synthetic ``VALUE_DOES_NOT_FIT`` -> VALUE DOES NOT FIT;
+    * the synthetic ``SOURCE_TRUNCATE`` -> SOURCE TRUNCATE.
+
+    The 23502 split: with ``message`` (the dead-letter reason) given and
+    :func:`not_null_evidence` proving the record SENT the named column (as NULL), the kind is
+    NULLABILITY_CHANGE; anything less (no message, no column named, the SQL template absent or
+    cut) keeps DROP_COLUMN, whose label is neutral ("a NOT NULL column got no value"). A
+    code-only call is therefore unchanged.
+
+    The class-22 split: 22001/22003 join VALUE_DOES_NOT_FIT -- the column needs a type that
+    holds the value, the same recreate remedy as the sink's own refusals -- and are NEVER a
+    type change (ordinary data raises them with no DDL; mapping them to TYPE_CHANGE once fired
+    a false "source changed a column's type" banner). The rest of class 22 (``22P02``,
+    ``22007``/``22008``, ``22021``, ``22023``, ...), ``54000``, ``23503`` and any other unknown
+    or ``None`` code return ``None``: an ordinary quarantine, still counted by the ledger and
+    held at Cut over.
     """
     if not error_code:
         return None
     code = error_code.strip().upper()
-    return _DRIFT_BY_SQLSTATE.get(code)
+    kind = _DRIFT_BY_SQLSTATE.get(code)
+    if (
+        kind is SchemaDriftKind.DROP_COLUMN
+        and message
+        and not_null_evidence(message)[1] is True
+    ):
+        return SchemaDriftKind.NULLABILITY_CHANGE
+    return kind
 
 
 class CdcConnectorError(BaseModel):
@@ -695,10 +802,11 @@ class CdcConnectorError(BaseModel):
 
     @property
     def drift_kind(self) -> Optional[SchemaDriftKind]:
-        """The source-schema-drift kind this error reveals (from ``error_code``),
-        or ``None`` for an ordinary quarantine. Derived, not stored -- the SQLSTATE
-        is the single source of truth (see :func:`classify_schema_drift`)."""
-        return classify_schema_drift(self.error_code)
+        """The source-schema-drift kind this error reveals (from ``error_code``, and for a
+        23502 the record shape its ``message`` proves), or ``None`` for an ordinary
+        quarantine. Derived, not stored -- :func:`classify_schema_drift` is the single source
+        of truth."""
+        return classify_schema_drift(self.error_code, self.message)
 
 
 # Read-only suppliers of monitoring/error data. Injected so the control plane is
@@ -2655,6 +2763,7 @@ __all__ = [
     "CdcConnectorError",
     "SchemaDriftKind",
     "classify_schema_drift",
+    "not_null_evidence",
     "StatusSource",
     "ErrorSource",
     "CdcPipelineOrchestrator",

@@ -332,3 +332,54 @@ def test_get_cdc_pipeline_diagnostics_names_connector_failure_causes() -> None:
     assert payload["connector_failure_causes"] == {src: diagnosis.headline}
     assert "CREATE USER" not in json.dumps(payload)  # the headline, never the statement
     assert "connector_failure_causes names why a stopped connector stopped" in payload["note"]
+
+
+def test_get_cdc_status_names_every_classified_sqlstate() -> None:
+    """G9: the note grounded 23502 as a "dropped column" only and knew no 42P10 / 23514."""
+    import json
+
+    from dsql_migrator.ui.data_migration._state import DataMigrationState
+
+    execute = build_ai_tool_executor(
+        session_id="s1",
+        session_store=_Store(_Obj(target_config=None, target_verified=False)),
+        evaluation_store=_Store(get_returns=None),
+        schema_conversion_store=_Store(_Obj(generated_node_ids=[], apply_results=[])),
+        validation_store=_Store(_Obj(result=None)),
+        data_migration_store=_Store(DataMigrationState()),
+        job_manager=_Obj(),
+        full_load_rate_eta=lambda *_a, **_k: (None, None),
+    )
+    note = json.loads(execute("get_cdc_status", {}))["note"]
+    for needle in ("42P10", "23514", "22003", "DROP NOT NULL", "NOT VALID"):
+        assert needle in note, needle
+
+
+def test_get_cdc_status_names_a_check_groups_constraint_not_a_column(monkeypatch) -> None:
+    import json
+
+    from dsql_migrator.core.models import SchemaDriftSummary
+    from dsql_migrator.ui.data_migration import _cdc_status
+    from dsql_migrator.ui.data_migration._state import DataMigrationState
+
+    groups = [
+        SchemaDriftSummary(table="app.o", kind="check-violation", count=2,
+                           columns=["o_status_check"], codes=["23514"]),
+        SchemaDriftSummary(table="app.o", kind="nullability-change", count=1,
+                           columns=["note"], codes=["23502"]),
+    ]
+    monkeypatch.setattr(_cdc_status, "cdc_schema_drift_summary", lambda *_a: groups)
+    execute = build_ai_tool_executor(
+        session_id="s1",
+        session_store=_Store(_Obj(target_config=None, target_verified=False)),
+        evaluation_store=_Store(get_returns=None),
+        schema_conversion_store=_Store(_Obj(generated_node_ids=[], apply_results=[])),
+        validation_store=_Store(_Obj(result=None)),
+        data_migration_store=_Store(DataMigrationState()),
+        job_manager=_Obj(),
+        full_load_rate_eta=lambda *_a, **_k: (None, None),
+    )
+    drift = json.loads(execute("get_cdc_status", {}))["schema_drift"]
+    assert drift[0] == {"table": "app.o", "kind": "check-violation", "count": 2,
+                        "constraints": ["o_status_check"], "codes": ["23514"]}
+    assert drift[1]["columns"] == ["note"] and "constraints" not in drift[1]

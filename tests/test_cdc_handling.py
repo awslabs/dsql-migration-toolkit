@@ -32,8 +32,8 @@ def test_a_unique_violation_is_classified_but_not_called_a_source_schema_change(
     # The structural SQLSTATEs keep their existing kinds (no reshuffling).
     assert classify_schema_drift("42703") is SchemaDriftKind.ADD_COLUMN
     assert classify_schema_drift("42P01") is SchemaDriftKind.MISSING_TABLE
-    # A per-value data exception is still not drift.
-    assert classify_schema_drift("22001") is None
+    # A per-value data exception with no schema meaning is still not drift.
+    assert classify_schema_drift("22P02") is None
 
 
 def test_the_teardown_estimate_is_engine_aware_and_single_sourced() -> None:

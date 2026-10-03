@@ -64,7 +64,7 @@ DSQL 타깃 스키마는 **Schema Conversion** 단계에서 고정됩니다. **C
 ### CDC 중 소스 스키마 드리프트 감지·처리
 
 소스 `ALTER`를 직접 눈치챌 필요가 없습니다. 데드레터 레코드가 소스 형태 변경을 시사하면, 도구가
-SQLSTATE로 드리프트를 **분류**(컬럼 추가 또는 이름 변경/삭제/타입 변경)하고 CDC 단계에 **"소스 스키마 변경
+SQLSTATE와 레코드 형태로 드리프트를 **분류**(아래 표)하고 CDC 단계에 **"소스 스키마 변경
 감지"** 배너를 표시합니다. 추가되거나 이름이 바뀐 컬럼에 대해서는 **"Fix target schema…"**를 제공합니다: 양쪽에서
 테이블의 현재 정의를 읽고, 정확한 문을 보여 주며, 승인했을 때만 적용합니다(트랜잭션당 1 DDL). 그러면 그
 테이블의 CDC가 재개됩니다.
@@ -89,11 +89,30 @@ SQLSTATE로 드리프트를 **분류**(컬럼 추가 또는 이름 변경/삭제
   [§13.8](13-excluding-tables-and-columns.md#138-cdc-캡처-목록)을 참고하세요.
 - **생성** 컬럼이나 Aurora DSQL이 담을 수 없는 타입의 컬럼은 추가하지 않으며, 대화 상자가 직접 추가하는 방법을
   알려 줍니다.
+- **ENUM** 컬럼은 `CHECK` 없이 `text`로 추가됩니다(Aurora DSQL의 `ADD COLUMN`은 제약을 받지 않음). 경고에 그
+  `CHECK`를 추가하는 `ADD CONSTRAINT … CHECK (…) NOT VALID` 문이 나옵니다.
 
-컬럼이 없던 동안 밀쳐뒀던 행을 백필하려면 Step 1(Evaluation) 재실행 → Stop CDC → **Drop & reload**로 테이블
-리로드 → Start CDC → Validation에서 재확인(그 테이블은 CHECKSUM이 자동). Aurora DSQL이 거부하는 컬럼 삭제나
-타입 변경은 같은 방식으로 직접 해결하도록 표시만 하고(도구는 타깃 데이터를 자동 삭제하지 않습니다), 조용히
-받아들여지는 경우는 아래의 소스 스키마 재확인이 잡아냅니다.
+소스 변경이 일으키는 그 밖의 모든 거부도 같은 방식으로 분류되며, 직접 해결하도록 표시만 합니다(도구는 타깃
+데이터를 자동으로 삭제하거나 다시 쓰지 않습니다). Aurora DSQL이 조용히 받아들이는 변경은 아래의 소스 스키마
+재확인이 잡아냅니다. Aurora DSQL에는 `ALTER COLUMN … TYPE`과 `SET NOT NULL`이 없고 기본 키를 바꿀 수 없으므로,
+배너의 각 행은 Aurora DSQL이 지원하는 복구 방법을 안내합니다:
+
+| 배너 행 | SQLSTATE | 흔한 원인 | Aurora DSQL에서의 복구 |
+|---|---|---|---|
+| column added or renamed at the source | `42703` | `ADD COLUMN` / `RENAME COLUMN` | **Fix target schema…** |
+| a NOT NULL column got no value (재확인이 확인하면 "column dropped at the source") | `23502`, 컬럼을 보내지 않음 | `DROP COLUMN`, 제외된 컬럼, 또는 PostgreSQL에서 큰(TOAST된) 값을 바꾸지 않은 업데이트 | 삭제된 컬럼이면 **Drop & reload** 전에 `DROP COLUMN`(그 컬럼이 있는 동안 Drop & reload는 거부됨; 기본 키 컬럼은 삭제 불가), 아니면 `ALTER COLUMN … DROP NOT NULL` |
+| a NULL sent for a NOT NULL column (확인되면 "NULL rule changed at the source") | `23502`, NULL을 보냄 | 소스 컬럼이 이제 NULL을 허용 | `ALTER COLUMN … DROP NOT NULL`(값은 유지되며, 다시 NOT NULL로 만들 수 없음) |
+| column type changed at the source | `42804`(삭제 시 `42883`) | 호환되지 않는 타입 변경 | 다시 만들기: **Replace** + **Drop & reload**(CDC only: 컬럼을 직접 추가·복사·삭제·이름 변경하거나 **Start over**) |
+| a value its Aurora DSQL column cannot hold exactly | `22001`, `22003`, 그리고 싱크의 거부 | 넓어진 소스 타입이나 Schema Conversion에서 고른 더 좁은 타입 | 같은 방식으로 다시 만들기 |
+| a CHECK constraint rejected the row | `23514` | MySQL `ENUM`이나 PostgreSQL enum에 추가된 값(둘 다 `text` + `CHECK`로 이식됨) | 사유에 적힌 이름으로 `DROP CONSTRAINT` 후 `ADD CONSTRAINT … CHECK (…) NOT VALID`, 트랜잭션당 한 문 |
+| the change records' key no longer matches the Aurora DSQL primary key (빨간색: 모든 insert와 update가 유실됨) | `42P10` | 소스 기본 키가 바뀌었거나, 테이블을 다른 키로 다시 적용함 | 키를 되돌리거나 다시 만들기(Step 1 재실행, **Replace**, **Drop & reload**; 재키잉된 테이블은 **Delete CDC infrastructure**와 새 배포도 필요); CDC only: 키를 되돌리거나(그 뒤 그동안 밀쳐둔 행은 직접 고침) **Start over** |
+
+이미 밀쳐둔 행을 백필하려면: **Full Load + CDC**에서는 Step 1(Evaluation) 재실행 → Stop CDC → **Drop &
+reload**로 테이블 리로드(Schema Conversion에서 그 DDL을 편집하지 않았다면 새 키·타입·NULL 규칙·ENUM 값으로 다시
+만듦) → Start CDC → Validation에서 재확인(그 테이블은 CHECKSUM이 자동). **CDC only**에서는 Aurora DSQL에서 직접
+고치거나(데드레터 큐 카드에 각 기본 키가 나옴) **Start over**를 사용하세요. 그 밖의 데이터 오류(`22P02`,
+`22007`/`22008`, `22021`, …)는 데드레터 큐 카드에 SQLSTATE만 표시됩니다. 데드레터가 생긴 모든 테이블과
+마찬가지로, Cut over는 그 테이블이 CHECKSUM으로 일치할 때까지 보류됩니다.
 
 **컬럼이 정확히 담을 수 없는 값**(MySQL·PostgreSQL 소스)은 쓰지 않고 거부합니다. 싱크는 쓰기 전에 각 숫자를
 Aurora DSQL 컬럼과 대조하며, 컬럼 타입은 테이블당 한 번(이후 10분마다 다시) 읽습니다. 이 검사가 없으면 다음
@@ -108,7 +127,9 @@ Aurora DSQL 컬럼과 대조하며, 컬럼 타입은 테이블당 한 번(이후
 
 대신 그 행은 데드레터로 가고, CDC 단계에 테이블과 컬럼 이름이 적힌 **"Rows set aside: a value does not fit
 its Aurora DSQL column"** 배너가 표시됩니다. 데드레터 사유에는 컬럼과 그 타입만 적히며 값은 절대 적히지
-않습니다. 맞는 값은 그대로 쓰입니다(`numeric(10,2)`에 `1.2300`을 넣으면 `1.23`이 저장됨). 정밀도 없이 선언된
+않습니다. 맞는 값은 그대로 쓰입니다(`numeric(10,2)`에 `1.2300`을 넣으면 `1.23`이 저장됨). Aurora DSQL 자체도
+`varchar`/`char` 컬럼보다 긴 문자열(`22001`)이나 정수·`numeric` 컬럼의 범위를 벗어난 숫자(`22003`)를 거부하며,
+그런 행도 같은 배너 행과 같은 복구 방법을 받습니다. 정밀도 없이 선언된
 PostgreSQL `numeric`은 Schema Conversion이 경고하듯 Aurora DSQL의 기본값 `numeric(18,6)`으로 저장되며, 계속
 소수 6자리로 반올림됩니다. `numeric` 컬럼에 들어가는 `FLOAT`/`DOUBLE` 값은 검사하지 않으며 계속 반올림됩니다.
 Aurora DSQL은 컬럼 타입을 그 자리에서 바꿀 수 없으므로, 복구 방법은 테이블을 다시 만드는 것입니다:
@@ -268,7 +289,8 @@ DSQL은 **약 1 MiB를 초과하는 단일 값**(`TEXT`/`bytea`)을 거부합니
 초대형 값 외에도, DLQ는 DSQL이 **영구적으로** 거부하는 레코드를 격리합니다 — 타입 불일치, 제약 위반,
 없는 타깃 컬럼(예: 전파 안 된 소스 `ALTER` 이후) — 그리고 Aurora DSQL 컬럼이 값을 바꿔 버리기 때문에 싱크가
 거부하는 값도 격리합니다([§4.2](#cdc-중-소스-스키마-드리프트-감지처리)). 일시적(transient) 실패(OCC `40001`,
-커넥션 끊김)는 **재시도**되며 DLQ로 가지 않습니다.
+커넥션 끊김)는 **재시도**되며 DLQ로 가지 않습니다. 소스 스키마 변경으로 설명되는 거부는 복구 방법과 함께 배너
+행으로 표시되고(§4.2), 스키마와 무관한 값 단위 데이터 오류(예: `22P02`)는 SQLSTATE만 표시됩니다.
 
 ### DLQ가 보이는 곳 — Kafka 토픽이 아니라 CloudWatch
 
@@ -399,9 +421,10 @@ CDC가 재키잉하는 테이블(소스 기본 키 밖의 컬럼을 더한 복�
 
 - **빨간색 — "Source schema changed on N captured table(s)":** 테이블마다 한 줄로 무엇이 바뀌었는지(컬럼 삭제·
   추가·이름 변경, 타입·NULL 규칙·기본 키 변경, 테이블 없음)와 그것이 CDC가 쓰는 행에 미치는 영향을 알려
-  줍니다. Cut over가 보류됩니다. DLQ 배너가 같은 방식으로 이미 보고하는 변경(컬럼 추가·삭제·타입 변경과 그로
-  인해 거부된 행)이 있는 테이블은 그 배너에만 표시되며, 어느 쪽이든 Cut over는 보류됩니다. 소스가 최종 정의를
-  갖춘 뒤 테이블을 다시 맞추려면:
+  줍니다. Cut over가 보류됩니다. DLQ 배너가 같은 방식으로 이미 보고하는 변경(컬럼 추가·삭제·타입 변경, 기본 키
+  변경, 또는 배너가 NULL을 허용하게 된 컬럼을 모두 표시할 때의 NULL 규칙 완화와 그로 인해 거부된 행)이 있는
+  테이블은 그 배너에만 표시되며, 어느 쪽이든 Cut over는 보류됩니다. 소스가 최종 정의를 갖춘 뒤 테이블을
+  다시 맞추려면:
   - **Full Load + CDC:** Step 1(Evaluation)을 다시 실행하세요 — 이후 재확인은 그것과 비교합니다. Aurora DSQL
     테이블도 바뀌어야 한다면: CDC가 따라잡게 둔 뒤(Stream lag: caught up) Stop CDC, 이름이 바뀐 컬럼은 Aurora
     DSQL에서 이름을 바꾸고(**Fix target schema…**가 해 줌) 삭제된 컬럼은 먼저 삭제(Drop & reload는 새 정의에

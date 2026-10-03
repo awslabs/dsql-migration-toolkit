@@ -730,14 +730,26 @@ def issue_notice(gate: CdcDlqGate) -> Optional[tuple[str, str, str]]:
 
 _OVERSIZED_LABEL = "a value over Aurora DSQL's per-value limit"
 # The drift kinds that mean the SOURCE schema changed (the other kinds are a missing target
-# table, a key conflict, an unbindable value or a TRUNCATE -- not a schema change).
-_SCHEMA_CHANGE_KINDS = frozenset({"add-column", "drop-column", "type-change"})
+# table, a key conflict, an unbindable value, a TRUNCATE or a value its column cannot hold --
+# not a schema change). A changed key (42P10), a NULL sent for a NOT NULL column and a CHECK
+# rejection (usually a source ENUM that gained a value) are source schema changes too.
+_SCHEMA_CHANGE_KINDS = frozenset(
+    {
+        "add-column", "drop-column", "type-change",
+        "key-change", "nullability-change", "check-violation",
+    }
+)
+# core.cdc.SchemaDriftKind.KEY_CHANGE: Aurora DSQL cannot change a primary key in place, so the
+# schema-change line names the recreate (or restore) path for it.
+_KEY_CHANGE_KIND = "key-change"
 # core.cdc.SchemaDriftKind.SOURCE_TRUNCATE (kept a literal like the kinds above).
 _SOURCE_TRUNCATE_KIND = "source-truncate"
 # core.cdc.SchemaDriftKind.VALUE_DOES_NOT_FIT: the sink refused a value its Aurora DSQL column
-# would change. Not a schema-change claim (a MySQL TINYINT(1) holds 2 with no DDL), so it is not
-# in _SCHEMA_CHANGE_KINDS; it gets its own "What to do" line, because the remedy is a column
-# type that holds the values, and Aurora DSQL can only give it one by recreating the table.
+# would change, or Aurora DSQL itself rejected one its column cannot hold (22001 too long,
+# 22003 out of range -- the same kind). Not a schema-change claim (a MySQL TINYINT(1) holds 2
+# with no DDL), so it is not in _SCHEMA_CHANGE_KINDS; it gets its own "What to do" line, because
+# the remedy is a column type that holds the values, and Aurora DSQL can only give it one by
+# recreating the table.
 _VALUE_FIT_KIND = "value-does-not-fit"
 
 
@@ -885,10 +897,30 @@ def way_forward_lines(gate: CdcDlqGate) -> list[str]:
         names = ", ".join(i.table for i in drifted[:_NAME_LIMIT]) + (
             f" (+{len(drifted) - _NAME_LIMIT} more)" if len(drifted) > _NAME_LIMIT else ""
         )
-        lines.append(
-            f"Records for {names} show a source schema change: re-run Step 1 (Evaluation) "
-            "and align the Aurora DSQL table before you reload."
-        )
+        rekeyed = any(_KEY_CHANGE_KIND in i.kinds for i in drifted)
+        if _is_type(gate.migration_type, "CDC_ONLY"):
+            line = (
+                f"Records for {names} show a source schema change: align the Aurora DSQL "
+                "table by hand (CDC only has no Full Load step to reload from), then re-run "
+                "Step 1 (Evaluation)."
+            )
+            if rekeyed:
+                line += (
+                    " Aurora DSQL cannot change a primary key in place: for a changed key, "
+                    "restore it on the source, or use Start over."
+                )
+        else:
+            line = (
+                f"Records for {names} show a source schema change: re-run Step 1 (Evaluation) "
+                "and align the Aurora DSQL table before you reload."
+            )
+            if rekeyed:
+                line += (
+                    " Aurora DSQL cannot change a primary key in place: for a changed key, "
+                    "re-apply the table in Schema Conversion with Replace before you reload, "
+                    "or restore the key on the source."
+                )
+        lines.append(line)
     unfit = [i for i in gate.issues if _VALUE_FIT_KIND in i.kinds]
     if unfit:
         names = ", ".join(i.table for i in unfit[:_NAME_LIMIT]) + (

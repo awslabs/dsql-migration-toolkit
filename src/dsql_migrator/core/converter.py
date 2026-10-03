@@ -854,8 +854,9 @@ def map_data_type(data_type: exp.DataType) -> Optional[_Mapping]:
                 "MySQL sorted an ENUM in DECLARATION order, which is not alphabetical, so "
                 "any ORDER BY or range predicate on this column changes — sort on an "
                 "explicit ranking if that order mattered. And adding a value later is "
-                "ALTER TABLE ... DROP/ADD CONSTRAINT rather than ALTER TABLE ... MODIFY "
-                "the ENUM."
+                "ALTER TABLE ... DROP CONSTRAINT, then ADD CONSTRAINT ... CHECK (...) NOT "
+                "VALID (one statement per transaction; Aurora DSQL adds a CHECK only as NOT "
+                "VALID) rather than ALTER TABLE ... MODIFY the ENUM."
             ),
             classification=Classification.MANUAL,
         )
@@ -4605,8 +4606,10 @@ class SchemaConverter:
                                 "above, which is not alphabetical), so any ORDER BY or "
                                 "range predicate on this column changes — sort on an "
                                 "explicit ranking if that order mattered. And adding a "
-                                "value later is ALTER TABLE ... DROP/ADD CONSTRAINT rather "
-                                "than ALTER TYPE ... ADD VALUE."
+                                "value later is ALTER TABLE ... DROP CONSTRAINT, then ADD "
+                                "CONSTRAINT ... CHECK (...) NOT VALID (one statement per "
+                                "transaction; Aurora DSQL adds a CHECK only as NOT VALID) "
+                                "rather than ALTER TYPE ... ADD VALUE."
                             ),
                         )
                     )

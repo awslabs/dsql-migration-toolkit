@@ -40,7 +40,7 @@ DSQL のターゲットスキーマは **Schema Conversion** ステップの実�
 ### CDC 中のソーススキーマドリフトの検出と対処
 
 ソースの `ALTER` を自分で気づく必要はありません。デッドレターされたレコードがソースの形状変更を示すと、
-ツールは SQLSTATE でドリフトを**分類**（列の追加または名前変更/削除/型変更）し、CDC ステップに **「ソース
+ツールは SQLSTATE とレコードの形でドリフトを**分類**（下の表）し、CDC ステップに **「ソース
 スキーマ変更を検出」** バナーを表示します。追加または名前変更された列については **「Fix target schema…」** を
 提供します: 両側でテーブルの現在の定義を読み、正確な文を示し、承認したときだけ適用します（トランザクションごとに
 1 DDL）。その後、そのテーブルの CDC は再開します。
@@ -65,12 +65,31 @@ DSQL のターゲットスキーマは **Schema Conversion** ステップの実�
   ほかの列を追加または名前変更しても、キャプチャリストが変わるまでその行はデッドレターされ続けます。
   [§13.8](13-excluding-tables-and-columns.md#138-cdc-キャプチャリスト) を参照してください。
 - **生成** 列や、Aurora DSQL が保持できない型の列は追加せず、手作業で追加する方法をダイアログが示します。
+- **ENUM** 列は `CHECK` なしの `text` として追加されます（Aurora DSQL の `ADD COLUMN` は制約を受け付けません）。
+  警告に、その `CHECK` を追加する `ADD CONSTRAINT … CHECK (…) NOT VALID` 文が示されます。
 
-列が無かった間に脇へ置かれた行をバックフィルするには、
-Step 1（Evaluation）を再実行 → Stop CDC → **Drop & reload** でテーブルをリロード → Start CDC → Validation で
-再確認します（そのテーブルは CHECKSUM が自動です）。Aurora DSQL が拒否する列削除や型変更は同じように手動対応のために
-表示のみ行い（ツールはターゲットのデータを自動削除しません）、黙って受け入れられるものは下のソーススキーマの再確認が
-捉えます。
+ソースの変更が引き起こすそのほかの拒否もすべて同じように分類され、手動で対応するために表示のみ行います（ツールは
+ターゲットのデータを自動で削除したり書き換えたりしません）。Aurora DSQL が黙って受け入れる変更は下のソーススキーマの
+再確認が捉えます。Aurora DSQL には `ALTER COLUMN … TYPE` も `SET NOT NULL` もなく、主キーも変更できないため、
+バナーの各行は Aurora DSQL がサポートする修復方法を示します:
+
+| バナーの行 | SQLSTATE | よくある原因 | Aurora DSQL での修復 |
+|---|---|---|---|
+| column added or renamed at the source | `42703` | `ADD COLUMN` / `RENAME COLUMN` | **Fix target schema…** |
+| a NOT NULL column got no value（再確認が裏付けると "column dropped at the source"） | `23502`、列が送られていない | `DROP COLUMN`、除外された列、または PostgreSQL で大きな（TOAST された）値を変更しなかった更新 | 削除された列なら **Drop & reload** の前に `DROP COLUMN`（その列がある間 Drop & reload は拒否されます。主キー列は削除できません）、それ以外は `ALTER COLUMN … DROP NOT NULL` |
+| a NULL sent for a NOT NULL column（裏付けられると "NULL rule changed at the source"） | `23502`、NULL が送られた | ソース列が NULL を許容するようになった | `ALTER COLUMN … DROP NOT NULL`（値は保たれます。NOT NULL に戻すことはできません） |
+| column type changed at the source | `42804`（削除では `42883`） | 互換性のない型変更 | 作り直し: **Replace** + **Drop & reload**（CDC only: 列を手作業で追加・コピー・削除・名前変更するか **Start over**） |
+| a value its Aurora DSQL column cannot hold exactly | `22001`、`22003`、および sink の拒否 | 広げられたソースの型、または Schema Conversion で選んだより狭い型 | 同じ作り直し |
+| a CHECK constraint rejected the row | `23514` | MySQL の `ENUM` や PostgreSQL の enum に追加された値（どちらも `text` + `CHECK` に移植されます） | 理由に記された名前で `DROP CONSTRAINT` の後 `ADD CONSTRAINT … CHECK (…) NOT VALID`、トランザクションごとに 1 文 |
+| the change records' key no longer matches the Aurora DSQL primary key（赤: すべての insert と update が失われる） | `42P10` | ソースの主キーが変更された、またはテーブルが別のキーで再適用された | キーを戻すか作り直し（Step 1 を再実行、**Replace**、**Drop & reload**。キーを付け替えるテーブルは **Delete CDC infrastructure** と新しいデプロイも必要）。CDC only: キーを戻す（その後、その間に脇へ置かれた行を手作業で修正する）か **Start over** |
+
+すでに脇へ置かれた行をバックフィルするには: **Full Load + CDC** では Step 1（Evaluation）を再実行 → Stop CDC →
+**Drop & reload** でテーブルをリロード（Schema Conversion でその DDL を編集していなければ、新しいキー・型・NULL
+規則・ENUM の値で作り直されます） → Start CDC → Validation で再確認します（そのテーブルは CHECKSUM が自動です）。
+**CDC only** では Aurora DSQL 上で手作業で修正する（デッドレターキューのカードに各主キーが表示されます）か、
+**Start over** を使います。そのほかのデータエラー（`22P02`、`22007`/`22008`、`22021` など）はデッドレターキューの
+カードに SQLSTATE だけが表示されます。デッドレターが出たすべてのテーブルと同様に、Cut over はそのテーブルが
+CHECKSUM で一致するまで保留されます。
 
 **列が正確に保持できない値**（MySQL・PostgreSQL ソース）は書き込まずに拒否します。sink は書き込む前に各数値を
 Aurora DSQL の列と照合し、列の型はテーブルごとに 1 回（以後 10 分ごとに再度）読み取ります。この確認がないと、
@@ -84,7 +103,9 @@ Aurora DSQL の列と照合し、列の型はテーブルごとに 1 回（以�
 
 代わりにその行はデッドレターになり、CDC ステップにはテーブルと列を示す **「Rows set aside: a value does not fit
 its Aurora DSQL column」** バナーが表示されます。デッドレターの理由には列とその型だけが記され、値は決して記され
-ません。収まる値はそのまま書き込まれます（`numeric(10,2)` に `1.2300` を入れると `1.23` が保存されます）。精度を
+ません。収まる値はそのまま書き込まれます（`numeric(10,2)` に `1.2300` を入れると `1.23` が保存されます）。Aurora
+DSQL 自体も、`varchar`/`char` 列より長い文字列（`22001`）や、整数・`numeric` 列の範囲を超える数値（`22003`）を
+拒否します。そうした行にも同じバナーの行と同じ修復方法が示されます。精度を
 指定せずに宣言された PostgreSQL の `numeric` は、Schema Conversion が警告するとおり Aurora DSQL の既定値
 `numeric(18,6)` で保存され、引き続き小数 6 桁に丸められます。`numeric` 列に入る `FLOAT`/`DOUBLE` の値は確認
 せず、引き続き丸められます。Aurora DSQL は列の型をその場で変更できないため、修復方法はテーブルの作り直しです:
@@ -205,7 +226,7 @@ DSQL は **約 1 MiB を超える単一の値** (`TEXT`/`bytea` 値) を拒否�
 
 ### デッドレター化される対象
 
-特大サイズの値に加えて、DLQ は DSQL が **恒久的に** 拒否するあらゆるレコードを隔離します — 型の不一致、制約違反、ターゲット列の欠落 (たとえば伝播されていないソースの `ALTER` の後) など — また、Aurora DSQL の列が値を変えてしまうために sink が拒否する値も隔離します ([§4.2](#cdc-中のソーススキーマドリフトの検出と対処))。一時的な失敗 (OCC `40001`、接続の切断) は **リトライ** され、デッドレター化はされません。
+特大サイズの値に加えて、DLQ は DSQL が **恒久的に** 拒否するあらゆるレコードを隔離します — 型の不一致、制約違反、ターゲット列の欠落 (たとえば伝播されていないソースの `ALTER` の後) など — また、Aurora DSQL の列が値を変えてしまうために sink が拒否する値も隔離します ([§4.2](#cdc-中のソーススキーマドリフトの検出と対処))。一時的な失敗 (OCC `40001`、接続の切断) は **リトライ** され、デッドレター化はされません。ソースのスキーマ変更で説明できる拒否は修復方法とともにバナーの行として表示され (§4.2)、スキーマと関係のない値単位のデータエラー (たとえば `22P02`) は SQLSTATE だけが表示されます。
 
 ### DLQ が表面化する場所 — 読み取る Kafka トピックではなく CloudWatch
 
@@ -332,8 +353,9 @@ CDC がリキーするテーブル(ソースの主キー外の列を加えた複
 - **赤 — 「Source schema changed on N captured table(s)」:** テーブルごとに 1 行で、何が変わったか(列の削除・
   追加・名前変更、型・NULL ルール・主キーの変更、テーブルが見つからない)と、それが CDC の書き込む行に与える影響を
   示します。Cut over は保留されます。DLQ バナーが同じ種類の変更としてすでに報告しているテーブル(列の追加・削除・型の
-  変更と、それで拒否された行)は、そのバナーにだけ表示されます。どちらの場合も Cut over は保留されます。ソースが
-  最終的な定義になった後でテーブルを揃え直すには:
+  変更、主キーの変更、またはバナーが NULL を許すようになった列をすべて示す場合の NULL ルールの緩和と、それで
+  拒否された行)は、そのバナーにだけ表示されます。どちらの場合も Cut over は保留されます。ソースが最終的な
+  定義になった後でテーブルを揃え直すには:
   - **Full Load + CDC:** Step 1(Evaluation)を再実行します — 以後の再確認はそれと比較します。Aurora DSQL の
     テーブルも変える必要がある場合: CDC を追いつかせてから(Stream lag: caught up) Stop CDC、名前変更された列は
     Aurora DSQL で名前を変更し(**Fix target schema…** が行います)、削除された列は先にそこで削除し(Drop & reload

@@ -380,14 +380,119 @@ def test_classify_schema_drift_maps_a_missing_target_table() -> None:
     assert err.drift_kind is SchemaDriftKind.MISSING_TABLE
 
 
-def test_classify_schema_drift_class_22_is_not_drift() -> None:
-    # Class 22 (data exception): string-too-long / numeric-range / bad-datetime / bad
-    # text are per-VALUE rejections ordinary bad data raises with NO source DDL change,
-    # so they must NOT be surfaced as a "source changed a column's type" drift (which
-    # fired that banner on every oversized/out-of-range poison row). They stay ordinary
-    # quarantines. Only 42804 (datatype_mismatch) is the type-change signal.
-    for code in ("22001", "22003", "22007", "22P02"):
+def test_class_22_never_claims_a_type_change() -> None:
+    # Class 22 (data exception) values are per-VALUE rejections ordinary bad data raises with
+    # NO source DDL change, so none may ever be surfaced as a "source changed a column's type"
+    # drift (which once fired that banner on every oversized/out-of-range poison row).
+    # G9: 22001 (too long) / 22003 (out of range) DO name a real cause -- the Aurora DSQL
+    # column needs a type that holds the value -- so they join the sink's value-fit kind,
+    # whose banner never claims a schema change. The rest (malformed text, bad datetime)
+    # stay ordinary quarantines: a recreate would not fix them.
+    for code in ("22001", "22003"):
+        assert classify_schema_drift(code) is SchemaDriftKind.VALUE_DOES_NOT_FIT
+    for code in ("22007", "22008", "22P02", "22021", "22023"):
         assert classify_schema_drift(code) is None
+    for code in ("22001", "22003", "22007", "22008", "22P02", "22021", "22023", "22012"):
+        assert classify_schema_drift(code) is not SchemaDriftKind.TYPE_CHANGE
+
+
+def test_classify_schema_drift_maps_the_remaining_dsql_rejections() -> None:
+    """G9: every reachable Aurora DSQL rejection a source schema change explains has a kind.
+
+    42P10 (the records' ON CONFLICT key matches no unique key: the primary key changed),
+    23514 (a CHECK -- usually the tool's ENUM port -- rejected a value), 42883 (a DELETE
+    comparing a retyped key column) and 22001/22003 (too long / out of range for the Aurora
+    DSQL column) used to classify to None: no banner, no ledger kind, no activity event. The
+    codes are the PostgreSQL ones (DSQL uses PostgreSQL's parser and type system); their
+    exact DSQL behaviour is still to be confirmed by the approved live check -- synthetic here.
+    """
+    assert classify_schema_drift("42P10") is SchemaDriftKind.KEY_CHANGE
+    assert classify_schema_drift("42p10") is SchemaDriftKind.KEY_CHANGE
+    assert classify_schema_drift("23514") is SchemaDriftKind.CHECK_VIOLATION
+    assert classify_schema_drift("42883") is SchemaDriftKind.TYPE_CHANGE
+    assert classify_schema_drift("22001") is SchemaDriftKind.VALUE_DOES_NOT_FIT
+    assert classify_schema_drift("22003") is SchemaDriftKind.VALUE_DOES_NOT_FIT
+    # Per-value bad data with no schema meaning, and an FK violation (applied at cut over),
+    # stay unclassified -- still counted by the ledger and held at Cut over.
+    for code in ("22P02", "22007", "22008", "22021", "22023", "54000", "23503"):
+        assert classify_schema_drift(code) is None, code
+    # The kind values the re-check (G4) uses for the same meaning, so the two dedupe.
+    assert SchemaDriftKind.KEY_CHANGE.value == "key-change"
+    assert SchemaDriftKind.NULLABILITY_CHANGE.value == "nullability-change"
+    # NULLABILITY_CHANGE comes only from record evidence, never from a code alone.
+    from dsql_migrator.core.cdc import _DRIFT_BY_SQLSTATE
+
+    assert SchemaDriftKind.NULLABILITY_CHANGE not in set(_DRIFT_BY_SQLSTATE.values())
+
+
+# A sink-shaped 23502 reason (DsqlSinkTask.reportOrThrow): sqlstate tag + the server's PRIMARY
+# message + pk + op + the rendered SQL template. Synthetic: the DSQL wording of 23502 is not
+# documented, so the live check must confirm it names the column like PostgreSQL does.
+def _not_null_line(column="note", columns=('"id"', '"note"'), *, pg12=False, table='"shop"."orders"'):
+    relation = "" if pg12 else ' of relation "orders"'
+    cols = ", ".join(columns)
+    marks = ", ".join("?" for _ in columns)
+    return (
+        f'DLQ offset=9: sqlstate=23502 null value in column "{column}"{relation} violates '
+        f"not-null constraint | pk: id=9 | op: u | sql: INSERT INTO {table} ({cols}) "
+        f'VALUES ({marks}) ON CONFLICT ("id") DO UPDATE SET "note" = EXCLUDED."note"'
+    )
+
+
+def test_a_23502_is_classified_by_the_record_shape() -> None:
+    """G9: a 23502 was always "column dropped at the source" -- also when the record SENT the
+    column, as NULL (the source column now allows NULL, scenario 4e). The reason's SQL
+    template tells the two apart, record by record; anything less stays the neutral
+    DROP_COLUMN rather than a confident wrong label."""
+    from dsql_migrator.core.cdc import not_null_evidence
+
+    sent = _not_null_line()
+    assert not_null_evidence(sent) == ("note", True)
+    assert classify_schema_drift("23502", sent) is SchemaDriftKind.NULLABILITY_CHANGE
+    err = CdcConnectorError(table="shop.orders", message=sent, error_code="23502")
+    assert err.drift_kind is SchemaDriftKind.NULLABILITY_CHANGE
+    # The column is NOT in the INSERT list: dropped, excluded or a TOAST value not resent.
+    absent = _not_null_line(columns=('"id"', '"total"'))
+    assert not_null_evidence(absent) == ("note", False)
+    assert classify_schema_drift("23502", absent) is SchemaDriftKind.DROP_COLUMN
+    # The first, the only, and a middle position all count as sent.
+    for columns in (('"note"', '"id"'), ('"note"',), ('"id"', '"note"', '"x"')):
+        assert not_null_evidence(_not_null_line(columns=columns))[1] is True, columns
+    # A name that only CONTAINS the column is not it.
+    assert not_null_evidence(_not_null_line(columns=('"id"', '"note2"')))[1] is False
+    # Doubled quotes in the SQL, the raw name in the server message.
+    quoted = _not_null_line(column='a"b', columns=('"id"', '"a""b"'))
+    assert not_null_evidence(quoted) == ('a"b', True)
+    assert classify_schema_drift("23502", quoted) is SchemaDriftKind.NULLABILITY_CHANGE
+    # Case-exact, like the sink's quoted identifiers.
+    assert classify_schema_drift(
+        "23502", _not_null_line(column="Notes", columns=('"id"', '"notes"'))
+    ) is SchemaDriftKind.DROP_COLUMN
+    # PostgreSQL 12's wording (no "of relation") is parsed too.
+    assert not_null_evidence(_not_null_line(pg12=True)) == ("note", True)
+    # A dotted/quoted table name in the head is fine.
+    assert not_null_evidence(_not_null_line(table='"my.db"."or""ders"')) == ("note", True)
+    # No evidence -> no confident label: a template cut before ") VALUES (" (the 2000-char
+    # bound), no template at all, an older sink's text, a wording with no column.
+    cut = sent[: sent.index(") VALUES (")]
+    no_sql = sent[: sent.index(" | sql: ")]
+    for message in (cut, no_sql, "boom", "null value in column violates not-null constraint"):
+        assert classify_schema_drift("23502", message) is SchemaDriftKind.DROP_COLUMN, message
+    assert not_null_evidence(cut) == ("note", None)
+    assert not_null_evidence(no_sql) == ("note", None)
+    assert not_null_evidence("boom") == (None, None)
+    assert not_null_evidence(None) == (None, None)
+    # An INSERT head the sink never writes (an unquoted table name) is no evidence either
+    # way: never "not carried", never "sent".
+    for head in ("shop.orders", '"shop".orders'):
+        unknown = _not_null_line(table=head)
+        assert not_null_evidence(unknown) == ("note", None), head
+        assert classify_schema_drift("23502", unknown) is SchemaDriftKind.DROP_COLUMN
+        absent = _not_null_line(columns=('"id"', '"total"'), table=head)
+        assert not_null_evidence(absent) == ("note", None), head
+    # A code-only call is unchanged, and the evidence never re-labels another code.
+    assert classify_schema_drift("23502") is SchemaDriftKind.DROP_COLUMN
+    assert classify_schema_drift("42703", sent) is SchemaDriftKind.ADD_COLUMN
 
 
 def test_classify_schema_drift_is_case_and_whitespace_insensitive() -> None:
@@ -678,9 +783,9 @@ def test_07006_is_classified_so_a_total_row_loss_stops_being_invisible() -> None
     from dsql_migrator.core.cdc import SchemaDriftKind, classify_schema_drift
 
     assert classify_schema_drift("07006") is SchemaDriftKind.UNBINDABLE_VALUE
-    # A per-VALUE data exception must still NOT be drift -- that distinction is the reason
-    # the map is a map and not "anything that failed".
-    assert classify_schema_drift("22001") is None
+    # A per-VALUE data exception with no schema meaning must still NOT be drift -- that
+    # distinction is the reason the map is a map and not "anything that failed".
+    assert classify_schema_drift("22P02") is None
 
 
 def test_the_unbindable_value_banner_states_certain_loss_and_the_real_remedy() -> None:

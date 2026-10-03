@@ -1622,6 +1622,8 @@ def test_a_postgres_enum_column_converts_to_text_with_its_values_preserved() -> 
     # The two real consequences must both be stated.
     assert "DECLARATION order" in note.message
     assert "ADD CONSTRAINT" in note.message or "ADD/DROP" in note.message.upper()
+    # G9: Aurora DSQL adds a CHECK only as NOT VALID, so the advice says so.
+    assert "NOT VALID" in note.message
 
 
 def test_a_user_defined_type_message_names_its_KIND_not_a_type_called_enum() -> None:

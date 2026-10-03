@@ -963,6 +963,18 @@ def _cdc_recovery_context(source_engine: str = "MySQL") -> str:
     value_fit_remap = (
         "" if source_engine == "PostgreSQL" else "; for a TINYINT(1), remap the column to smallint"
     )
+    # The tool ports a source ENUM to text + CHECK (... IN ...); its usual 23514 cause.
+    enum_gained = (
+        "a PostgreSQL enum gained a value (ALTER TYPE ... ADD VALUE)"
+        if source_engine == "PostgreSQL"
+        else "a MySQL ENUM gained a value"
+    )
+    not_sent_toast = (
+        ", or an update that left a large (TOASTed) value unchanged, which PostgreSQL does "
+        "not resend"
+        if source_engine == "PostgreSQL"
+        else ""
+    )
     return (
     "How this tool's CDC works and how to recover a dead-lettered / drifted stream:\n"
     f"- CDC is Debezium ({capture}) -> Amazon MSK (Kafka) -> a CUSTOM DSQL Sink "
@@ -970,10 +982,25 @@ def _cdc_recovery_context(source_engine: str = "MySQL") -> str:
     "replicates row DATA only; it does NOT propagate DDL.\n"
     "- A row the sink cannot apply is dead-lettered to a DLQ (the stream keeps "
     "running). The DLQ depth + per-table 'poison' counts + each record's SQLSTATE are "
-    "the evidence. Common SQLSTATEs and what they mean: 22P02 / 22001 = a data/format "
-    "or value-too-long problem; 23505 = duplicate key (often a re-applied row or a "
-    "key collision); 23502 = a NOT NULL violation, usually because a column was added "
-    "or dropped on the source (schema drift).\n"
+    "the evidence. Common SQLSTATEs, what they mean and the repair Aurora DSQL supports: "
+    "42703 = a column the target lacks (added or renamed at the source); 23502 = a NOT "
+    "NULL column got no value (the record did not carry it: a dropped or excluded column"
+    f"{not_sent_toast}) or got NULL (the source column now "
+    "allows NULL) -- the repair is ALTER TABLE ... ALTER COLUMN ... DROP NOT NULL (keeps "
+    "the values; there is no SET NOT NULL), or for a dropped column ALTER TABLE ... DROP "
+    "COLUMN before any 'Drop & reload' (which refuses while the column exists); 42804 / "
+    "42883 = a column's type changed (recreate, see below); 42P10 = the records' key no "
+    "longer matches the Aurora DSQL primary key, so EVERY insert and update for the table "
+    "is lost -- restore the key on the source, or recreate (re-run Step 1, re-apply with "
+    "Replace, 'Drop & reload'; a Composite-key table also needs Delete CDC infrastructure "
+    "and a redeploy); CDC only: restore the key or Start over; 23514 = a CHECK rejected the "
+    f"value, usually the tool's text + CHECK port after {enum_gained} -- replace the CHECK "
+    "one statement per transaction: ALTER TABLE ... DROP CONSTRAINT <the name the reason "
+    "gives>, then ADD CONSTRAINT ... CHECK (...) NOT VALID (Aurora DSQL adds a CHECK only "
+    "as NOT VALID); 22001 / 22003 = a value too long / out of range for its Aurora DSQL "
+    "column -- the same recreate as a type change, NOT a sign the source type changed; "
+    "22P02 = a malformed value; 23505 = duplicate key (often a re-applied row or a key "
+    "collision).\n"
     "- SOURCE SCHEMA DRIFT: because DDL is not replicated, the first row under a "
     "changed source schema is rejected and dead-lettered. The tool classifies the "
     "drift kind from the SQLSTATE; 42703 means the source ADDED or RENAMED a column. The "

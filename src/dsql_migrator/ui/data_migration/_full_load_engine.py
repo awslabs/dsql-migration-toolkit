@@ -1855,8 +1855,9 @@ def _drain_progress_queue(
 # this load sent -- live-reproduced as a PostgreSQL array column read UNCAST into a jsonb
 # target, 'column "ttz_arr" is of type jsonb but expression is of type time with time
 # zone[]' -- where the size wording sent the operator to shrink a value whose size is
-# irrelevant, on a source that is read-only anyway. Same split the CDC side already makes
-# (core.cdc: 42804 => TYPE_CHANGE, class 22 => ordinary bad data).
+# irrelevant, on a source that is read-only anyway. The CDC side splits the same codes
+# (core.cdc._DRIFT_BY_SQLSTATE: 42804/42883 => type-change; 22001/22003 =>
+# value-does-not-fit, never a type-change claim).
 _QUARANTINE_SIZE_SQLSTATES = frozenset({"54000", "22001"})
 
 

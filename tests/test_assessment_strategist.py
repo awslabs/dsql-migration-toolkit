@@ -1199,3 +1199,23 @@ def test_the_cdc_rubric_forbids_alter_column_type_and_explains_value_fit_refusal
     # The TINYINT(1) remap is MySQL advice only (a PostgreSQL rubric never names MySQL).
     assert "smallint" in _cdc_recovery_context("MySQL")
     assert "TINYINT" not in _cdc_recovery_context("PostgreSQL")
+
+
+def test_the_cdc_chat_knows_every_classified_sqlstate_and_its_dsql_repair() -> None:
+    """G9: the grounding said 23502 means a column was "added or dropped" and knew nothing of
+    42P10 / 23514 / 22003. It now gives each SQLSTATE's meaning and a repair Aurora DSQL
+    supports (DROP NOT NULL, a CHECK only NOT VALID, a recreate for a key or a type)."""
+    from dsql_migrator.core.assessment_strategist import (
+        _cdc_recovery_context,
+        build_cdc_error_chat_system,
+    )
+
+    system = build_cdc_error_chat_system("DLQ depth: 3", scope="dlq")
+    for needle in ("42P10", "23514", "22003", "42883", "DROP NOT NULL", "NOT VALID"):
+        assert needle in system, needle
+    assert "usually because a column was added or dropped" not in system
+    assert "NOT a sign the source type changed" in system
+    # Engine-specific wording: a PostgreSQL rubric never talks MySQL, and the reverse.
+    pg, mysql = _cdc_recovery_context("PostgreSQL"), _cdc_recovery_context("MySQL")
+    assert "ALTER TYPE ... ADD VALUE" in pg and "TOASTed" in pg and "MySQL" not in pg
+    assert "MySQL ENUM" in mysql and "TOAST" not in mysql

@@ -177,8 +177,9 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 #    "sqlstate=<state> ". pgjdbc's getMessage() does not carry the SQLSTATE, so the
 #    control plane previously could not tell an ordinary poison row from a
 #    source-schema-drift rejection (42703 = source ADD COLUMN the target lacks,
-#    23502 = source DROP COLUMN of a target NOT NULL column, 42804/22xxx = source
-#    TYPE CHANGE). With the code in the reason, the CloudWatch DLQ parser classifies
+#    23502 = source DROP COLUMN of a target NOT NULL column, 42804 = source TYPE
+#    CHANGE; the current map is core.cdc._DRIFT_BY_SQLSTATE). With the code in the
+#    reason, the CloudWatch DLQ parser classifies
 #    the drift kind and the UI surfaces a "source schema change detected" banner --
 #    no extra probe, no row values (Property 7). Sink-jar change only.
 # v27 rebuilds the offset-seeder Lambda zip so CdcStartPrepResource ALSO pre-creates

@@ -2123,8 +2123,9 @@ def cdc_dlq_records(migration_state, log_key: str) -> list:
     O(records) work repeated 4-5x every tick, growing unbounded exactly during a drift
     storm when the log is largest. Because the log is append-only, an unchanged count
     means an unchanged view, so the expensive copy+filter runs only when a NEW record
-    arrived; a genuine reset drops the count to 0 and invalidates the cache. The
-    returned list is a shared READ-ONLY view (all callers iterate it or ``sorted()`` a
+    arrived; a log reset changes the count, and Start over (``reset_in_place`` re-runs the
+    state's ``__init__``) drops the memo itself -- a CDC-only log key is the same across it.
+    The returned list is a shared READ-ONLY view (all callers iterate it or ``sorted()`` a
     copy -- none mutate it in place).
 
     Best-effort: an unreadable log yields ``[]`` rather than breaking the panel.
@@ -2295,47 +2296,110 @@ def cdc_dlq_summary(migration_state, log_key: str):
 
 
 def cdc_schema_drift_summary(migration_state, log_key: str) -> list:
-    """Group the CDC DLQ records that reveal a source schema change.
+    """Group the CDC DLQ records that a drift kind explains.
 
     Reads the SAME CDC-filtered records as :func:`cdc_dlq_summary` (so the drift
-    banner and the DLQ depth agree), classifies each record's SQLSTATE via
-    :func:`~dsql_migrator.core.cdc.classify_schema_drift`, and returns one
-    :class:`SchemaDriftSummary` per (table, kind) that had at least one drift
-    record. Ordinary poison rows (no drift kind) are skipped, so an empty list
-    means "no source DDL detected". Built from the whole error log (not the
-    per-poll delta) so the count is cumulative and survives a restored session.
+    banner and the DLQ depth agree), classifies each record via
+    :func:`~dsql_migrator.core.cdc.classify_schema_drift` (its code, and for a 23502 the
+    record shape the reason proves), and returns one :class:`SchemaDriftSummary` per
+    (table, kind) that had at least one such record. Ordinary poison rows (no drift kind)
+    are skipped, so an empty list means "nothing classified". Built from the whole error log
+    (not the per-poll delta) so the count is cumulative and survives a restored session.
     Best-effort and pure; never raises into the poller.
 
-    A ``value-does-not-fit`` group also carries the ``"<column> <type>"`` descriptors the
-    sink named (at most :data:`_VALUE_FIT_COLUMN_LIMIT`, first-seen order), so the banner can
-    say which column needs a type that holds the values. Other kinds carry none.
+    Each group also carries its distinct normalized ``codes`` and the value-free names its
+    reasons give (at most :data:`_VALUE_FIT_COLUMN_LIMIT`, first-seen order): a value-fit
+    refusal's ``"<column> <type>"``, the column a NULL-sent 23502 named, the column a 23502
+    proves was not sent, a 23514's constraint. Other kinds carry none.
+
+    INCREMENTAL: the CDC poll and the AI tool call this every few seconds over an uncapped,
+    append-only log, so the fold is memoized on ``migration_state._cdc_drift_summary_cache``
+    by (log key, processed count, identity of the last processed record). An unchanged log
+    returns the stored groups; a longer one parses only the new tail; anything else (a reset,
+    another key, or new record objects under the same key and count) rebuilds from the start,
+    and Start over drops the memo with the state's ``__init__``. No I/O; memory is O(groups).
+    The groups returned are a shared READ-ONLY view.
     """
-    from dsql_migrator.core.cdc import SchemaDriftKind, classify_schema_drift
-    from dsql_migrator.core.cdc_dlq import value_fit_column_from_reason
+    from dsql_migrator.core.cdc import (
+        SchemaDriftKind,
+        classify_schema_drift,
+        not_null_evidence,
+    )
+    from dsql_migrator.core.cdc_dlq import (
+        check_constraint_from_reason,
+        value_fit_column_from_reason,
+    )
     from dsql_migrator.core.models import SchemaDriftSummary
 
+    records = cdc_dlq_records(migration_state, log_key)
+    total = len(records)
+    if total == 0:
+        return []
     counts: dict[tuple[str, str], int] = {}
-    columns: dict[tuple[str, str], list[str]] = {}
-    for record in cdc_dlq_records(migration_state, log_key):
-        kind = classify_schema_drift(getattr(record, "error_code", None))
+    names: dict[tuple[str, str], list[str]] = {}
+    codes: dict[tuple[str, str], set[str]] = {}
+    start = 0
+    cache = getattr(migration_state, "_cdc_drift_summary_cache", None)
+    if (
+        isinstance(cache, tuple)
+        and len(cache) == 7
+        and cache[0] == log_key
+        and 0 < cache[1] <= total
+        and records[cache[1] - 1] is cache[2]
+    ):
+        if cache[1] == total:
+            return list(cache[6])
+        # Copy-then-extend: a reader holding the stored tuple keeps a consistent view.
+        counts = dict(cache[3])
+        names = {key: list(value) for key, value in cache[4].items()}
+        codes = {key: set(value) for key, value in cache[5].items()}
+        start = cache[1]
+    for index in range(start, total):
+        record = records[index]
+        code = getattr(record, "error_code", None)
+        message = getattr(record, "message", None)
+        kind = classify_schema_drift(code, message)
         if kind is None:
             continue
         key = (record.table, kind.value)
         counts[key] = counts.get(key, 0) + 1
+        codes.setdefault(key, set()).add(str(code).strip().upper())
+        seen = names.setdefault(key, [])
+        if len(seen) >= _VALUE_FIT_COLUMN_LIMIT:
+            continue  # the per-group cap is reached: no more parsing for this group
+        name = None
         if kind is SchemaDriftKind.VALUE_DOES_NOT_FIT:
-            seen = columns.setdefault(key, [])
-            column = value_fit_column_from_reason(getattr(record, "message", ""))
-            if column and column not in seen and len(seen) < _VALUE_FIT_COLUMN_LIMIT:
-                seen.append(column)
-    return [
+            name = value_fit_column_from_reason(message)
+        elif kind in (SchemaDriftKind.DROP_COLUMN, SchemaDriftKind.NULLABILITY_CHANGE):
+            column, sent = not_null_evidence(message)
+            # A drop-column group names the column only when the record PROVES it was not
+            # sent; an evidence-free one names none rather than guessing.
+            if kind is SchemaDriftKind.NULLABILITY_CHANGE or sent is False:
+                name = column
+        elif kind is SchemaDriftKind.CHECK_VIOLATION:
+            name = check_constraint_from_reason(message)
+        if name and name not in seen:
+            seen.append(name)
+    result = tuple(
         SchemaDriftSummary(
-            table=table, kind=kind, count=count, columns=columns.get((table, kind), [])
+            table=table,
+            kind=kind,
+            count=count,
+            columns=list(names.get((table, kind), ())),
+            codes=sorted(codes.get((table, kind), ())),
         )
         for (table, kind), count in sorted(counts.items())
-    ]
+    )
+    try:
+        migration_state._cdc_drift_summary_cache = (
+            log_key, total, records[total - 1], counts, names, codes, result
+        )
+    except Exception:  # noqa: BLE001 - caching is best-effort; correctness unaffected
+        pass
+    return list(result)
 
 
-# How many "<column> <type>" descriptors one value-does-not-fit group names.
+# How many value-free names (a "<column> <type>", a column, a constraint) one group names.
 _VALUE_FIT_COLUMN_LIMIT = 6
 
 

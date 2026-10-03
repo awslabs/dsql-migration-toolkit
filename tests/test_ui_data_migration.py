@@ -5498,9 +5498,12 @@ def test_apply_cdc_status_surfaces_schema_drift_from_sqlstate() -> None:
     dlq_errors = [
         CdcConnectorError(table="orders", message="add col", error_code="42703"),
         CdcConnectorError(table="orders", message="add col", error_code="42703"),
-        # A class-22 value error (string too long) is an ordinary poison row, NOT a
-        # source type change -> counts toward DLQ depth but is not grouped as drift.
+        # A string too long for its Aurora DSQL column (22001) is NOT a source type change:
+        # G9 groups it with the value-fit kind (the column needs a type that holds the
+        # value), whose banner never claims a schema change.
         CdcConnectorError(table="line_items", message="bad value", error_code="22001"),
+        # A malformed value (22P02) has no schema meaning: an ordinary poison row.
+        CdcConnectorError(table="payments", message="bad text", error_code="22P02"),
         # An ordinary poison row (oversized value): no SQLSTATE -> not drift.
         CdcConnectorError(table="media", message="too big", error_code=None),
     ]
@@ -5509,13 +5512,15 @@ def test_apply_cdc_status_surfaces_schema_drift_from_sqlstate() -> None:
 
     view = state.cdc_status_view
     assert view is not None
-    # All four count toward DLQ depth, but only the two ADD COLUMN rows are drift; the
-    # 22001 value error and the no-SQLSTATE size rejection are ordinary poison rows.
-    assert view.dlq_depth == 4
+    # All five count toward DLQ depth; the ADD COLUMN rows and the 22001 are classified,
+    # the 22P02 and the no-SQLSTATE size rejection are ordinary poison rows.
+    assert view.dlq_depth == 5
     groups = {(g.table, g.kind): g.count for g in view.schema_drift}
-    assert groups == {("orders", "add-column"): 2}
-    # The non-drift poison rows are absent from the drift groups.
-    assert not any(g.table in {"media", "line_items"} for g in view.schema_drift)
+    assert groups == {("orders", "add-column"): 2, ("line_items", "value-does-not-fit"): 1}
+    # The non-drift poison rows are absent from the drift groups, and a class-22 value is
+    # never a type change.
+    assert not any(g.table in {"media", "payments"} for g in view.schema_drift)
+    assert not any(g.kind == "type-change" for g in view.schema_drift)
 
 
 def test_apply_cdc_status_no_drift_on_clean_stream() -> None:
@@ -31829,11 +31834,11 @@ class _G4DlqCtl(_G1Ctl):
         return [_g1_dlq("app.orders", i, code=self.code) for i in (1, 2, 3)]
 
 
-def _g4_mysql_rows(columns):
-    """Live MySQL catalog rows for app.orders: [(name, type, nullable)], id the key."""
+def _g4_mysql_rows(columns, key=("id",)):
+    """Live MySQL catalog rows for app.orders: [(name, type, nullable)], ``key`` the key."""
     rows = [("c", "app", "orders", n, i + 1, t, "YES" if nl else "NO", "")
             for i, (n, t, nl) in enumerate(columns)]
-    return rows + [("k", "app", "orders", "id", 1, None, None, None)]
+    return rows + [("k", "app", "orders", k, i + 1, None, None, None) for i, k in enumerate(key)]
 
 
 @pytest.mark.parametrize(
@@ -31873,6 +31878,173 @@ def test_a_change_the_dead_letter_banner_reports_is_listed_only_there(
     assert any(t.startswith(banner_row) for t in ui.texts)
     assert _G4_HEADER not in body and "no error and no dead letter" not in body
     assert sum(b.text == "Fix target schema…" for b in ui.buttons) == (code == "42703")
+    gate = catalog_drift_gate_for(state, None, session, cdc_in_use=True, release="clean",
+                                  summary=None, check_probe=False)
+    assert [i.table for i in gate.open] == ["app.orders"] and gate.held
+
+
+@pytest.mark.parametrize("cdc_only", [False, True])
+def test_a_changed_key_is_reported_once_by_the_red_dead_letter_banner(
+    monkeypatch, cdc_only
+) -> None:
+    """G9: a source primary-key change dead-letters every insert and update with 42P10, which
+    classified to nothing -- so the re-check's red row was the only notice and the dead
+    letters had no banner. Now the banner (red: certain loss) names it with the re-check's own
+    label and key facts and carries the recreate remedy, the re-check row is not drawn twice,
+    and the finding still holds Cut over. The hidden row's facts ("primary key was (id), now
+    (code)") and, on CDC only, its "correct the rows ... not replayed" step live on in the
+    banner. Synthetic 42P10: its DSQL behaviour awaits the live check."""
+    from dsql_migrator.core.models import ColumnDef, SourceInventory, TableDef
+    from dsql_migrator.ui.cdc_catalog_drift_gate import catalog_drift_gate_for
+    from dsql_migrator.ui.data_migration import MigrationType
+
+    _g2_fake_nicegui(monkeypatch)
+    _g2_logged(monkeypatch)
+    columns = [("id", "int", False), ("code", "varchar(20)", False)]
+    _g2_factory(monkeypatch, _g4_mysql_rows(columns, key=("code",)))
+    inventory = SourceInventory(tables=[TableDef(
+        name="app.orders",
+        columns=[ColumnDef(name="id", mysql_type="int", nullable=False),
+                 ColumnDef(name="code", mysql_type="varchar(20)", nullable=False)],
+        primary_key=["id"],
+    )])
+    session = _g2_session(
+        pg=False, mtype=MigrationType.CDC_ONLY if cdc_only else None
+    )
+    state = _g4_state(session, inventory=inventory)
+    state.set_cdc_controller(_G4DlqCtl("42P10"))
+    state.job_id = "job-cdc"
+    _ui, (poll,) = _g2_render(state, session)
+    _g2_poll(poll)
+    finding = state.cdc_catalog_drift_findings["app.orders"]
+    assert finding.resolved_at is None and finding.kinds == ["key-change"]
+    ui, _ = _g2_render(state, session)
+    body = "\n".join(ui.texts)
+    assert "Rows are being lost — the key no longer matches the Aurora DSQL primary key" in body
+    assert any(
+        t.startswith(
+            "app.orders: primary key changed at the source (primary key was (id), now (code)) —"
+        )
+        for t in ui.texts
+    )
+    assert "cannot change a primary key in place" in body
+    # The state proves app.orders is not re-keyed: no Composite-key redeploy hedge.
+    assert "A table CDC re-keys" not in body
+    if cdc_only:
+        assert "rows set aside meanwhile are not replayed" in body and "by hand" in body
+        assert "'Drop & reload'" not in body
+    assert _G4_HEADER not in body
+    assert "Stop CDC and reload these tables" not in body
+    assert not any(b.text == "Fix target schema…" for b in ui.buttons)
+    gate = catalog_drift_gate_for(state, None, session, cdc_in_use=True, release="clean",
+                                  summary=None, check_probe=False)
+    assert [i.table for i in gate.open] == ["app.orders"] and gate.held
+    assert state.cdc_dlq_ledger["app.orders"].kinds == ["key-change"]
+
+
+class _G4NullSentCtl(_G1Ctl):
+    """Dead letters whose sink reason proves the NOT NULL column WAS sent, as NULL."""
+
+    def dlq_errors(self, log_group, **kw):
+        from dsql_migrator.core.cdc import CdcConnectorError
+
+        self.kwargs.append(kw)
+        reason = (
+            'sqlstate=23502 null value in column "notes" of relation "orders" violates '
+            'not-null constraint | pk: id={i} | op: u | sql: INSERT INTO "app"."orders" '
+            '("id", "notes") VALUES (?, ?) ON CONFLICT ("id") DO UPDATE SET "notes" = '
+            'EXCLUDED."notes"'
+        )
+        return [
+            CdcConnectorError(
+                table="app.orders", message=f"DLQ offset={i}: " + reason.format(i=i),
+                error_code="23502",
+                occurred_at=datetime(2026, 9, 1, 11, i, tzinfo=timezone.utc),
+            )
+            for i in (1, 2)
+        ]
+
+
+@pytest.mark.parametrize("relaxed", [True, False])
+def test_a_relaxed_null_rule_is_reported_once_and_never_as_a_dropped_column(
+    monkeypatch, relaxed
+) -> None:
+    """G9 (scenario 4e): the source column now allows NULL and the target keeps NOT NULL, so
+    NULL values dead-letter with 23502 -- which was labelled "column dropped at the source"
+    beside the re-check's red "NULL rule changed" row. The record shape proves the NULL was
+    sent: one banner row with the re-check's label and the DROP NOT NULL repair, and the
+    re-check row hidden. A tightening (a different cause) keeps its own row."""
+    from dsql_migrator.core.models import ColumnDef, SourceInventory, TableDef
+
+    _g2_fake_nicegui(monkeypatch)
+    _g2_logged(monkeypatch)
+    live_nullable = relaxed
+    columns = [("id", "int", False), ("notes", "text", live_nullable)]
+    _g2_factory(monkeypatch, _g4_mysql_rows(columns))
+    inventory = SourceInventory(tables=[TableDef(
+        name="app.orders",
+        columns=[ColumnDef(name="id", mysql_type="int", nullable=False),
+                 ColumnDef(name="notes", mysql_type="text", nullable=not live_nullable)],
+        primary_key=["id"],
+    )])
+    session = _g2_session(pg=False)
+    state = _g4_state(session, inventory=inventory)
+    state.set_cdc_controller(_G4NullSentCtl())
+    state.job_id = "job-cdc"
+    _ui, (poll,) = _g2_render(state, session)
+    _g2_poll(poll)
+    assert state.cdc_catalog_drift_findings["app.orders"].kinds == ["nullability-change"]
+    ui, _ = _g2_render(state, session)
+    body = "\n".join(ui.texts)
+    assert "column dropped at the source" not in body
+    assert "DROP NOT NULL" in body
+    if relaxed:
+        assert any(t.startswith("app.orders: NULL rule changed at the source (notes) —")
+                   for t in ui.texts)
+        assert _G4_HEADER not in body
+    else:
+        assert any(t.startswith("app.orders: a NULL sent for a NOT NULL column (notes) —")
+                   for t in ui.texts)
+        assert _G4_HEADER in body
+    assert state.cdc_dlq_ledger["app.orders"].kinds == ["nullability-change"]
+
+
+def test_a_relaxed_null_rule_on_a_column_no_null_reached_yet_keeps_its_re_check_row(
+    monkeypatch,
+) -> None:
+    """One ALTER relaxed notes AND memo; so far only notes dead-lettered a NULL. The banner's
+    row names notes only, so hiding the re-check row (which names memo too) would leave memo
+    nowhere on screen -- and DROP NOT NULL run on notes alone. The row stays; the banner keeps
+    its confirmed "(notes)" row; Cut over is held."""
+    from dsql_migrator.core.models import ColumnDef, SourceInventory, TableDef
+    from dsql_migrator.ui.cdc_catalog_drift_gate import catalog_drift_gate_for
+
+    _g2_fake_nicegui(monkeypatch)
+    _g2_logged(monkeypatch)
+    columns = [("id", "int", False), ("notes", "text", True), ("memo", "text", True)]
+    _g2_factory(monkeypatch, _g4_mysql_rows(columns))
+    inventory = SourceInventory(tables=[TableDef(
+        name="app.orders",
+        columns=[ColumnDef(name="id", mysql_type="int", nullable=False),
+                 ColumnDef(name="notes", mysql_type="text", nullable=False),
+                 ColumnDef(name="memo", mysql_type="text", nullable=False)],
+        primary_key=["id"],
+    )])
+    session = _g2_session(pg=False)
+    state = _g4_state(session, inventory=inventory)
+    state.set_cdc_controller(_G4NullSentCtl())
+    state.job_id = "job-cdc"
+    _ui, (poll,) = _g2_render(state, session)
+    _g2_poll(poll)
+    finding = state.cdc_catalog_drift_findings["app.orders"]
+    assert finding.kinds == ["nullability-change"]
+    assert {c.column for c in finding.changes} == {"notes", "memo"}
+    ui, _ = _g2_render(state, session)
+    body = "\n".join(ui.texts)
+    assert _G4_HEADER in body
+    assert "memo was NOT NULL, now NULL" in body
+    assert any(t.startswith("app.orders: NULL rule changed at the source (notes) —")
+               for t in ui.texts)
     gate = catalog_drift_gate_for(state, None, session, cdc_in_use=True, release="clean",
                                   summary=None, check_probe=False)
     assert [i.table for i in gate.open] == ["app.orders"] and gate.held

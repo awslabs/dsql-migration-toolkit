@@ -98,6 +98,9 @@ _SOURCE_TRUNCATE = re.compile(r"Cannot apply a source TRUNCATE", re.IGNORECASE)
 # SchemaDriftKind.VALUE_DOES_NOT_FIT) because those values used to land changed with no signal
 # at all. Anchored on the sink's exact leading phrase (ValueFit.REASON_PREFIX) and only
 # consulted when no SQLSTATE was reported, so it can never reclassify a real server rejection.
+# Aurora DSQL's own 22001 / 22003 (a value its column REJECTS: too long, out of range) share
+# the kind -- the same cause and recreate remedy -- but keep their real SQLSTATE as the code;
+# ValueFit leaves numeric overflow to DSQL, so one record never carries both.
 VALUE_DOES_NOT_FIT_CODE = "VALUE_DOES_NOT_FIT"
 _VALUE_DOES_NOT_FIT = re.compile(r"Value does not fit target column '", re.IGNORECASE)
 # The column and its Aurora DSQL type, which the reason names (never the value).
@@ -144,6 +147,26 @@ def value_fit_column_from_reason(message: Optional[str]) -> Optional[str]:
     if match is None:
         return None
     return f"{match.group('column')} {match.group('type').strip()}"
+
+
+# The constraint a 23514 names: the sink appends the server's constraint field as
+# " [constraint: <name>]" (DsqlSinkTask.safeCauseMessage); PostgreSQL's primary message also
+# quotes it (``new row for relation "t" violates check constraint "t_status_check"``), the
+# fallback for a reason without the suffix. An identifier, never a value.
+_CONSTRAINT_SUFFIX = re.compile(r"\[constraint: (?P<name>[^\]]+)\]")
+_CHECK_CONSTRAINT = re.compile(r'violates check constraint "(?P<name>[^"]+)"')
+
+
+def check_constraint_from_reason(message: Optional[str]) -> Optional[str]:
+    """The CHECK constraint a 23514 dead-letter reason names, else ``None``. Pure.
+
+    The repair (DROP CONSTRAINT, then ADD CONSTRAINT ... NOT VALID) needs the real name, and
+    an auto-generated one is never guessed: with no name in the reason the banner names none.
+    """
+    if not message:
+        return None
+    match = _CONSTRAINT_SUFFIX.search(message) or _CHECK_CONSTRAINT.search(message)
+    return match.group("name").strip() if match else None
 
 
 def _table_from_topic(topic: str) -> str:
@@ -247,7 +270,8 @@ OVERSIZED_VALUE_KIND = "oversized-value"
 # Bound on the kind labels kept per table, so a pathological table cannot bloat the snapshot.
 # DERIVED from the enum (every SchemaDriftKind value plus "oversized-value"), so it is
 # unreachable from real records and a kind added later can never be silently dropped from the
-# ledger that holds Cut over (a fixed 8 had already fallen behind the enum once).
+# ledger that holds Cut over (a fixed 8 had already fallen behind the enum once). 22001/22003
+# fold into "value-does-not-fit", so they add no label of their own.
 _LEDGER_MAX_KINDS = len(SchemaDriftKind) + 1
 
 
@@ -269,9 +293,12 @@ def fold_dlq_ledger(
     Per dead letter: the table's count grows by one, ``last_at`` becomes the later of the
     stored time and the record's own ``occurred_at`` (``now`` when the record carries none,
     the same stamp the error log uses), and the drift kind :func:`classify_schema_drift`
-    reveals -- or ``"oversized-value"`` for a size-guard quarantine -- joins the table's kind
-    set. The input mapping is never mutated, so a reader holding the previous reference
-    (a worker thread) keeps a consistent view. Memory is O(tables).
+    reveals from the record's code AND message (a 23502 that sent the column as NULL is
+    ``"nullability-change"``, the same record-level kind the banner shows) -- or
+    ``"oversized-value"`` for a size-guard quarantine -- joins the table's kind set. A record
+    with no kind (a 22P02, say) still raises the count, which is what holds Cut over. The
+    input mapping is never mutated, so a reader holding the previous reference (a worker
+    thread) keeps a consistent view. Memory is O(tables).
     """
     out: dict[str, CdcDlqLedgerEntry] = dict(ledger or {})
     for error in errors or ():
@@ -283,7 +310,7 @@ def fold_dlq_ledger(
         last = _aware(previous.last_at) if previous is not None else None
         kinds = set(previous.kinds if previous is not None else ())
         code = getattr(error, "error_code", None)
-        drift = classify_schema_drift(code)
+        drift = classify_schema_drift(code, getattr(error, "message", None))
         if drift is not None:
             kinds.add(drift.value)
         if code == OVERSIZED_VALUE_CODE:

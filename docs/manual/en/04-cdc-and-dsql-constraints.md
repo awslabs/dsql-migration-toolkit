@@ -76,9 +76,9 @@ below.
 ### Detecting and handling source schema drift
 
 You don't have to notice a source `ALTER` yourself. When dead-lettered records
-indicate the source shape changed, the tool **classifies the drift** by SQLSTATE
-(added or renamed column / dropped column / type change) and shows a **"Source schema
-change detected"** banner on the CDC step. For an added or renamed column it offers
+indicate the source shape changed, the tool **classifies the drift** by SQLSTATE and the
+record's shape (table below) and shows a **"Source schema change detected"** banner on the
+CDC step. For an added or renamed column it offers
 **"Fix target schema…"**: it reads the table's live definition on both sides, shows the
 exact statements, and applies them only when you approve them (one DDL per transaction);
 CDC then resumes for that table.
@@ -109,13 +109,34 @@ CDC then resumes for that table.
   [§13.8](13-excluding-tables-and-columns.md#138-the-cdc-capture-list).
 - A **generated** column, or one of a type Aurora DSQL cannot hold, is not added; the
   dialog says how to add it by hand.
+- An **ENUM** column is added as `text` without its `CHECK` (Aurora DSQL's `ADD COLUMN`
+  takes no constraint); the warning gives the `ADD CONSTRAINT … CHECK (…) NOT VALID`
+  statement that adds it.
 
-To backfill the rows that were set aside while the column was missing, re-run Step 1
-(Evaluation), Stop CDC, reload the table with **Drop & reload**, Start CDC, then
-re-check it in Validation (CHECKSUM is automatic for it). A dropped column or a changed
-type that Aurora DSQL rejects is surfaced the same way for you to resolve by hand (the
-tool never drops target data automatically); one it accepts silently is caught by the
-source schema re-check below.
+Every other rejection a source change causes is classified the same way, for you to
+resolve by hand (the tool never drops or rewrites target data automatically); a change
+Aurora DSQL accepts silently is caught by the source schema re-check below. Aurora DSQL
+has no `ALTER COLUMN … TYPE` or `SET NOT NULL` and cannot change a primary key, so each
+banner row gives the repair it does support:
+
+| Banner row | SQLSTATE | Usual cause | Repair on Aurora DSQL |
+|---|---|---|---|
+| column added or renamed at the source | `42703` | `ADD COLUMN` / `RENAME COLUMN` | **Fix target schema…** |
+| a NOT NULL column got no value ("column dropped at the source" once the re-check confirms it) | `23502`, column not sent | `DROP COLUMN`, an excluded column, or on PostgreSQL an update that left a large (TOASTed) value unchanged | `DROP COLUMN` for a dropped column, before **Drop & reload** (which refuses while it exists; a primary-key column cannot be dropped), else `ALTER COLUMN … DROP NOT NULL` |
+| a NULL sent for a NOT NULL column ("NULL rule changed at the source" once confirmed) | `23502`, NULL sent | the source column now allows NULL | `ALTER COLUMN … DROP NOT NULL` (keeps the values; it cannot be made NOT NULL again) |
+| column type changed at the source | `42804` (`42883` on a delete) | an incompatible type change | recreate: **Replace** + **Drop & reload** (CDC only: add, copy, drop and rename a column by hand, or **Start over**) |
+| a value its Aurora DSQL column cannot hold exactly | `22001`, `22003`, plus the sink's refusals | a widened source type or a narrower Schema Conversion type | the same recreate |
+| a CHECK constraint rejected the row | `23514` | a value added to a MySQL `ENUM` or a PostgreSQL enum (both ported to `text` + `CHECK`) | `DROP CONSTRAINT`, then `ADD CONSTRAINT … CHECK (…) NOT VALID` with the name the reason gives, one statement per transaction |
+| the change records' key no longer matches the Aurora DSQL primary key (red: every insert and update is lost) | `42P10` | the source primary key changed, or the table was re-applied with another key | restore the key, or recreate (re-run Step 1, **Replace**, **Drop & reload**; a re-keyed table also needs **Delete CDC infrastructure** and a new deploy); CDC only: restore the key (then correct the rows set aside meanwhile by hand) or **Start over** |
+
+To backfill the rows already set aside: with **Full Load + CDC**, re-run Step 1
+(Evaluation), Stop CDC, reload the table with **Drop & reload** (it recreates the new
+key, type, NULL rule and ENUM values unless you edited its DDL in Schema Conversion),
+Start CDC, then re-check it in Validation (CHECKSUM is automatic for it); with **CDC
+only**, correct them on Aurora DSQL by hand (the dead-letter queue card lists each
+primary key) or use **Start over**. Other data errors (`22P02`, `22007`/`22008`,
+`22021`, …) are listed in the dead-letter queue card with their SQLSTATE only; like
+every dead-lettered table, Cut over holds the table until it matches by CHECKSUM.
 
 **A value its column cannot hold exactly** (MySQL or PostgreSQL source) is refused, not
 written. Before writing, the sink checks each number against its Aurora DSQL column,
@@ -134,7 +155,10 @@ three kinds of value would change with no error:
 The row is dead-lettered instead, and the CDC step shows a **"Rows set aside: a value
 does not fit its Aurora DSQL column"** banner naming the table and column. The
 dead-letter reason names the column and its type, never the value. A value that fits is
-written unchanged (`1.2300` into `numeric(10,2)` stores `1.23`). A PostgreSQL `numeric`
+written unchanged (`1.2300` into `numeric(10,2)` stores `1.23`). Aurora DSQL itself
+rejects a string longer than a `varchar`/`char` column (`22001`) or a number outside an
+integer or `numeric` column's range (`22003`); those rows get the same banner row and the
+same repair. A PostgreSQL `numeric`
 declared without precision is stored at Aurora DSQL's default `numeric(18,6)`, as Schema
 Conversion warns, and is still rounded to 6 decimal places. A `FLOAT`/`DOUBLE` value for
 a `numeric` column is not checked and is still rounded. Aurora DSQL cannot change a
@@ -336,7 +360,9 @@ Beyond oversized values, the DLQ isolates any record DSQL **permanently** reject
 — a type mismatch, a constraint violation, a missing target column (e.g. after an
 un-propagated source `ALTER`) — and any value the sink refuses because its Aurora DSQL
 column would change it ([§4.2](#detecting-and-handling-source-schema-drift)). Transient
-failures (OCC `40001`, connection drops) are **retried**, not dead-lettered.
+failures (OCC `40001`, connection drops) are **retried**, not dead-lettered. A rejection
+a source schema change explains gets a banner row with its repair (§4.2); a per-value data
+error with no schema meaning (for example `22P02`) is listed with its SQLSTATE only.
 
 ### Where the DLQ surfaces — CloudWatch, not a Kafka topic you read
 
@@ -497,9 +523,10 @@ notices, beside the dead-letter queue card rather than in it:
   what changed (a column dropped, added or renamed; a type, NULL rule or primary key
   changed; a table not found) and what that does to the rows CDC writes. Cut over is
   held. A table whose change the dead-letter banner already reports the same way (a
-  column added, dropped or retyped, with the rows it rejected) is listed only in that
-  banner; Cut over is held either way. To realign a table once the source has its final
-  definition:
+  column added, dropped or retyped, a changed primary key, or a relaxed NULL rule when
+  the banner names every relaxed column, with the rows it rejected) is listed only in
+  that banner; Cut over is held either way. To realign a table once the source has its
+  final definition:
   - **Full Load + CDC:** re-run Step 1 (Evaluation) — the check then compares with it.
     Where the Aurora DSQL table must change too: let CDC catch up (Stream lag: caught
     up), Stop CDC, rename a renamed column on Aurora DSQL (**Fix target schema…** does

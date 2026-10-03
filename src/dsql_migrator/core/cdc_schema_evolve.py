@@ -68,6 +68,7 @@ hold the only IO.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Callable, Iterable, Mapping, Optional, Sequence, Union
 
@@ -268,7 +269,26 @@ def _resolve_target_type(
         target_type, warning = map_mysql_type(source_type_str)
     except ValueError as exc:
         return None, None, f"no Aurora DSQL mapping for this type ({exc})"
+    if _ENUM_TYPE.match(source_type_str):
+        # map_mysql_type's note describes Schema Conversion's CREATE TABLE, which adds the
+        # CHECK; this plan's ADD COLUMN cannot (Aurora DSQL's ADD COLUMN takes no constraint),
+        # so it must not promise one.
+        return target_type, _ADDED_ENUM_WARNING, None
     return target_type, (warning.message if warning is not None else None), None
+
+
+_ENUM_TYPE = re.compile(r"\s*enum\s*\(", re.IGNORECASE)
+_ADDED_ENUM_WARNING = (
+    "Added as text without the CHECK that Schema Conversion gives an ENUM column: Aurora "
+    "DSQL's ADD COLUMN takes no constraint, so nothing limits this column to the ENUM's "
+    "values yet. To enforce them, run ALTER TABLE ... ADD CONSTRAINT ... CHECK (... IN (...)) "
+    "NOT VALID as its own statement once the column exists (NOT VALID is the only form "
+    "Aurora DSQL accepts; it still checks every new write). Ordering and comparison are now "
+    "TEXT: MySQL sorted an ENUM in declaration order, so any ORDER BY or range predicate on "
+    "this column changes."
+)
+# Deliberately names no reload: the warning is shown for every migration type, and CDC only
+# has no Full Load step (the dialog's own runbook gives Full Load + CDC its backfill route).
 
 
 def plan_add_columns(
