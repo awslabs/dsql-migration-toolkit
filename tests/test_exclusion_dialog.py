@@ -390,6 +390,39 @@ def test_lob_rows_are_the_open_candidates_and_add_rule_quotes_the_name():
     assert ui.set_values[-1].splitlines()[-1] == 'exclude "my s".t2.c'
 
 
+def test_a_mysql_json_candidate_states_its_ceiling_limit_and_compression():
+    # G13: a MySQL JSON column is listed like LONGTEXT -- its source ceiling (bounded only by
+    # max_allowed_packet), the DSQL json limit, and that the limit applies to the compressed
+    # size. JSON is always utf8mb4, so there is no charset caveat.
+    from dsql_migrator.ui.data_migration._exclusion_dialog import lob_rows
+    from dsql_migrator.ui.data_migration._models import popup_resolution
+
+    inv = SimpleNamespace(tables=[_t("shop.d", meta="json")])
+    state = DataMigrationState()
+    ctx, _calls = _ctx(state)
+    ctx.inventory_fn = lambda: inv
+    inputs = ExclusionInputs(selected=["shop.d"], applied={}, preserve_foreign_keys=True,
+                             migratable=["shop.d"], signature=("s",))
+    resolution = popup_resolution(state, inv, "", inputs=inputs, source_type=SourceType.MYSQL)
+    (row,) = lob_rows(ctx, inv, inputs, resolution)
+    assert (row["column"], row["source"], row["allows"], row["limit"], row["compressed"],
+            row["charset"]) == ("meta", "json", "1 GiB (max_allowed_packet)", "1 MiB", True, None)
+
+
+def test_the_popup_no_longer_calls_mysql_json_unflagged():
+    # G13: MySQL JSON IS highlighted now, so neither the footer nor the outcome-C hint may
+    # name it among the types this tool does not flag (outcome C was already wrong for a
+    # PostgreSQL json column).
+    from dsql_migrator.ui.data_migration import _exclusion_dialog as dialog
+    from dsql_migrator.ui.data_migration._models import QuarantineSuggestion
+
+    assert "JSON" not in dialog.HONESTY_FOOTER
+    assert "MySQL spatial columns" in dialog.HONESTY_FOOTER
+    _tone, text = dialog._route_hint(QuarantineSuggestion("C"), "shop.t", "", True, "x")[:2]
+    assert text.startswith("Every column of shop.t whose type this tool flags")
+    assert "JSON" not in text and "spatial" in text
+
+
 def test_an_include_kept_candidate_offers_go_to_its_line():
     state = DataMigrationState()
     ctx, _calls = _ctx(state)
@@ -916,7 +949,7 @@ def test_outcome_b_filters_the_lob_section_and_c_shows_the_type_a_rule_hint():
     state.restore_exclusion_rules("", ())
     ui = _Ui()
     open_exclusion_route(ui, ctx, "shop.t", "... not supported for jsonb", lob_candidates_for=_CANDS)
-    assert any(t.startswith("The database reported a type, not a column") for t in ui.texts)
+    assert any(t.startswith("The database did not name the column") for t in ui.texts)
     lob = next(el for t, (_h, el) in ui.expansions.items() if t.startswith("Oversized-LOB"))
     assert lob.value is True  # opened, filtered to the table
     assert any(t.startswith("shop.t.") for t in ui.texts) and not any(
@@ -957,10 +990,35 @@ def test_read_only_outcome_b_names_the_open_candidates_not_a_missing_button():
     state.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
     ui = _Ui()
     open_exclusion_route(ui, ctx, "shop.t", "... not supported for jsonb", lob_candidates_for=_CANDS)
-    (hint,) = [t for t in ui.texts if t.startswith("The database reported a type")]
+    (hint,) = [t for t in ui.texts if t.startswith("The database did not name the column")]
     assert "[+ add rule]" not in hint
     assert "Columns of shop.t that can hold it: a (longtext), b (text)." in hint
     assert hint.endswith("After the Delete, pick it in Change & reload.")
+
+
+_RESTORED_REASON = ("the target rejected a value in this row (the reason is no longer in "
+                    "this session's error log)")
+
+
+@pytest.mark.parametrize("reason", ["maximum row size exceeded",
+                                    "maximum column size exceeded", _RESTORED_REASON])
+@pytest.mark.parametrize("editable", [True, False])
+def test_a_typeless_quarantine_reason_is_never_called_a_type(reason, editable):
+    # G13 review: outcome B said "The database reported a type, not a column" for reasons
+    # that name no type at all -- DSQL's 54000 "maximum column size exceeded" (the error
+    # the manual documents for an oversized value of any type), a row-size reason, and the
+    # restored-session fallback. G13 newly offers "Exclude column & reload" on a MySQL
+    # JSON-only table, which is exactly where such a reason lands.
+    from dsql_migrator.ui.data_migration._models import quarantine_rule_suggestion
+
+    cands = (("metadata", "json"),)
+    s = quarantine_rule_suggestion("ecommerce.users", reason, cands,
+                                   open_excluded=set(), saved_excluded=set())
+    assert (s.outcome, s.filter_table) == ("B", True)
+    _tone, text = dlg._route_hint(s, "ecommerce.users", "", editable, "after the Delete",
+                                  cands)[:2]
+    assert text.startswith("The database did not name the column, so no rule was added")
+    assert "reported a type" not in text
 
 
 def test_an_include_kept_quarantine_column_gets_go_to_its_line():
@@ -1313,7 +1371,7 @@ def test_the_row_and_the_title_ignore_an_over_verdict_for_another_limit():
     state._value_size_cache[("shop.t", "a")] = ("over", at, 1024 * 1024)
     row_ui = _Ui()
     render_exclusion_button_row(row_ui, ctx)
-    assert any("holds a value over Aurora DSQL's limit (Check sizes): each such row is "
+    assert any("holds a value over Aurora DSQL's limit (measured): each such row is "
                "quarantined at load." in t for t in row_ui.texts)
     ui = _Ui()
     open_exclusion_dialog(ui, ctx)
@@ -1564,3 +1622,32 @@ def test_the_example_hides_on_focus_and_lets_clicks_through():
 
     assert ".exclusion-editor-wrap:focus-within .exclusion-editor-example{display:none}" in _EDITOR_CSS
     assert "pointer-events:none" in _EDITOR_CSS
+
+
+def test_a_run_checks_size_answer_shows_in_the_popup_and_the_row_credits_no_click():
+    # G13 review: the prerequisite run's SOURCE_VALUE_SIZE answer fills the popup's size
+    # cache (DataMigrationState.set_prereq_report), so a column it measured shows its verdict
+    # in the popup and turns the row line warning -- with Check sizes never clicked. The row
+    # used to credit that result to "(Check sizes)"; it must not name a click never made.
+    from dsql_migrator.core.models import MigrationMode, PrerequisiteReport
+    from dsql_migrator.core.prerequisites import check_source_value_size
+
+    users = _t("shop.users", metadata="json")
+    inv = SimpleNamespace(tables=[users])
+    state = DataMigrationState()
+    ctx, _calls = _ctx(state)
+    ctx.inventory_fn = lambda: inv
+    inputs = ExclusionInputs(selected=["shop.users"], applied={}, preserve_foreign_keys=True,
+                             migratable=["shop.users"], signature=("s",))
+    ctx.inputs_fn = lambda: inputs
+    result = check_source_value_size(users, ["metadata"], {"metadata": True})
+    state.set_prereq_report(MigrationMode.FULL_LOAD,
+                            PrerequisiteReport.build(MigrationMode.FULL_LOAD, [result]))
+    assert not state.size_check_running()
+    row_ui = _Ui()
+    render_exclusion_button_row(row_ui, ctx)
+    (line,) = [t for t in row_ui.texts if "holds a value over" in t]
+    assert "(measured)" in line and "Check sizes" not in line
+    ui = _Ui()
+    open_exclusion_dialog(ui, ctx)
+    assert "Oversized-LOB candidates (1) - 1 over the limit found" in ui.expansions

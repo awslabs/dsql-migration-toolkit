@@ -34,7 +34,8 @@ reads a MySQL TYPE STRING or a structural field:
   separate-PG-variant shape ``converter._pg_generated_column_warning`` already uses.
 * ``OversizedLobRule`` needed BOTH: the 1 MiB cap is a TARGET limit that applies to
   PostgreSQL ``text``/``bytea``/``json``/``jsonb`` just as much, but the rule matches MySQL
-  type NAMES, so registering it here would have found nothing forever.
+  type NAMES, so registering it here found nothing (today it would match only ``json``,
+  the one spelling the engines share, and word it for MySQL).
   :class:`PgOversizedLobRule` keeps the ``OVERSIZED_LOB`` id and reads the shared
   ``assessor.is_pg_oversized_lob_type`` predicate, which Schema Conversion and the UI's
   exclusion offer also use -- one definition, three layers.
@@ -342,12 +343,14 @@ class PgOversizedLobRule(Rule):
     """Flag PostgreSQL columns with no length limit, whose values can exceed 1 MiB.
 
     Shares the rule id with the MySQL ``OversizedLobRule`` but not its type set: that one
-    matches ``mediumtext``/``longblob``, which a PostgreSQL inventory never contains
-    (``column.mysql_type`` holds ``format_type`` output), so REGISTERING the shared rule
-    here would have reported zero findings forever. The 1 MiB cap is a TARGET (DSQL) limit
-    and applies to PostgreSQL ``text``/``bytea``/``json``/``jsonb`` and an unbounded
-    ``varchar`` identically -- the reason the rule was excluded was the MySQL type names,
-    not the risk being MySQL-specific.
+    matches ``mediumtext``/``longblob``/``json``, of which a PostgreSQL inventory can contain
+    only ``json`` (``column.mysql_type`` holds ``format_type`` output), so REGISTERING the
+    shared rule here would miss ``text``/``bytea``/``jsonb`` and word the one ``json`` match
+    for MySQL (before MySQL ``json`` joined that set, it reported zero findings forever).
+    The 1 MiB cap is a TARGET (DSQL) limit and applies to PostgreSQL
+    ``text``/``bytea``/``json``/``jsonb`` and an unbounded ``varchar`` identically -- the
+    reason the rule was excluded was the MySQL type names, not the risk being
+    MySQL-specific.
 
     This matters more than the MySQL case, not less: PostgreSQL ``text``/``bytea`` are
     unbounded by DEFAULT, and this is the one DSQL limit whose breach cannot be undone by
@@ -446,10 +449,20 @@ class PgOversizedLobRule(Rule):
                         object=ObjectKey(KIND_TABLE, table.name),
                         rule_id=self.rule_id,
                         classification=Classification.MANUAL,
+                        # Same CDC caveat as the MySQL rule: a change event over the Kafka
+                        # producer limit (MaxMessageBytes, 4 MiB by default) fails the
+                        # single-task source connector rather than dead-lettering a row.
+                        # No "an UPDATE carries it twice" here: that holds only for a table
+                        # on REPLICA IDENTITY FULL (e.g. a re-keyed one). On the default
+                        # identity the before image is not sent, and an unchanged TOASTed
+                        # value is not re-sent either.
                         risk=(
                             f"Columns ({listed}) {clause}. An oversized value cannot be "
                             "stored: the row is quarantined during Full Load or "
-                            "dead-lettered during CDC, and reloading cannot fix it."
+                            "dead-lettered during CDC, and reloading cannot fix it. A "
+                            "change event larger than the CDC message limit (4 MiB by "
+                            "default) is not dead-lettered: it stops CDC for every table "
+                            "until the column is excluded at capture."
                         ),
                         recommendation=(
                             "Run the Data Migration prerequisite checks: they probe each "

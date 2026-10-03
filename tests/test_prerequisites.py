@@ -3134,6 +3134,38 @@ def test_the_report_fills_the_value_size_cache() -> None:
     sizes = state.value_sizes()
     assert sizes[("shop.docs", "a")][0] == "over" and sizes[("shop.docs", "b")][0] == "ok"
     assert sizes[("shop.docs", "a")][2] == 1048576 and sizes[("shop.docs", "b")][2] == 65535
+    # Its only row is a SOURCE_VALUE_SIZE WARN, which must never close the Start gate.
+    assert report.can_proceed is True
+
+
+def test_a_value_size_row_never_closes_the_start_gate() -> None:
+    """G13 adds a SOURCE_VALUE_SIZE row for every MySQL table with a JSON column: WARN when
+    a value is measured over the limit, INFO ("not determined") when the bounded probe
+    times out on a large table. Neither may block Start; nothing else in the suite pinned
+    it at the report level (a mutant blocking on either left the whole suite green)."""
+    from dsql_migrator.core.models import (
+        ColumnDef,
+        MigrationMode,
+        PrerequisiteReport,
+        PrerequisiteStatus,
+        TableDef,
+    )
+    from dsql_migrator.core.prerequisites import check_source_value_size
+
+    table = TableDef(
+        name="shop.users",
+        primary_key=["id"],
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint"),
+            ColumnDef(name="metadata", mysql_type="json"),
+        ],
+    )
+    over = check_source_value_size(table, ["metadata"], {"metadata": True})
+    timed_out = check_source_value_size(table, ["metadata"], {})
+    assert over.status is PrerequisiteStatus.WARN and over.required is False
+    assert timed_out.status is PrerequisiteStatus.INFO and timed_out.required is False
+    for row in (over, timed_out):
+        assert PrerequisiteReport.build(MigrationMode.FULL_LOAD, [row]).can_proceed is True
 
 
 

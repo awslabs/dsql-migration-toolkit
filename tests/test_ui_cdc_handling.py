@@ -71,6 +71,32 @@ def test_lob_exclusion_candidates_flags_only_oversized_lob_columns() -> None:
     assert candidates[0].columns == ("preferences", "avatar")
 
 
+def test_lob_exclusion_candidates_flags_mysql_json() -> None:
+    """G13: a MySQL JSON column can hold a document over DSQL's 1 MiB json limit, so it is
+    offered for exclusion like LONGTEXT (it used to be missing from the offer, so the only
+    recovery came after rows were quarantined). Plain TEXT and a bounded VARCHAR are not."""
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration._models import LobExclusionCandidate
+
+    inventory = SourceInventory(
+        tables=[
+            TableDef(
+                name="ecommerce.users",
+                columns=[
+                    ColumnDef(name="id", mysql_type="bigint"),
+                    ColumnDef(name="metadata", mysql_type="json"),
+                    ColumnDef(name="bio", mysql_type="text"),
+                    ColumnDef(name="email", mysql_type="varchar(255)"),
+                ],
+                primary_key=["id"],
+            )
+        ]
+    )
+    assert lob_exclusion_candidates(inventory, source_type=SourceType.MYSQL) == [
+        LobExclusionCandidate("ecommerce.users", ("metadata",))
+    ]
+
+
 def test_lob_exclusion_candidates_flags_pg_text_and_bytea() -> None:
     # For a PostgreSQL source, column types are PG names (text/bytea), which the MySQL
     # LOB set never matched -- so a PG source offered NO exclusions and the panel
@@ -92,7 +118,7 @@ def test_lob_exclusion_candidates_flags_pg_text_and_bytea() -> None:
             ),
         ]
     )
-    # MySQL set finds nothing (PG type names don't match).
+    # MySQL set finds nothing (none of these PG types -- text/bytea/varchar -- is in it).
     assert lob_exclusion_candidates(inventory) == []
     # PG set flags text + bytea, not the bounded varchar.
     pg = lob_exclusion_candidates(inventory, source_type=SourceType.POSTGRES)

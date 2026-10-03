@@ -1129,7 +1129,8 @@ def test_mysql_oversized_lob_note_is_unchanged_for_a_mysql_source() -> None:
     )
     conv = SchemaConverter().convert_table(table)
     note = next(w for w in conv.warnings if "1 MiB per-value" in w.message)
-    assert "are MySQL LOB/TEXT types" in note.message
+    assert "are MySQL LOB/TEXT or JSON types" in note.message
+    assert "exclude the column" in note.message
     # And the PG variant does not also fire for a MySQL source.
     assert sum(1 for w in conv.warnings if "1 MiB per-value" in w.message) == 1
 

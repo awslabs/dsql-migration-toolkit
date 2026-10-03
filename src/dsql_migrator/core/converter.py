@@ -3652,7 +3652,7 @@ def _key_size_warning(
 
 
 def _oversized_lob_warning(table: TableDef) -> Optional[ConversionWarning]:
-    """Warn about LOB/TEXT columns whose values can exceed DSQL's 1 MiB per-value cap.
+    """Warn about LOB/TEXT/JSON columns whose values can exceed DSQL's 1 MiB per-value cap.
 
     The DDL converts and applies fine; the failure lands later, per ROW, during Full Load
     or CDC -- which is why it belongs on this screen too. Those rows are quarantined
@@ -3673,13 +3673,17 @@ def _oversized_lob_warning(table: TableDef) -> Optional[ConversionWarning]:
         classification=Classification.MANUAL,
         kind=ConversionNoteKind.RECOMMENDATION,
         message=(
-            f"Columns ({names}) are MySQL LOB/TEXT types that can hold more than Aurora "
-            "DSQL's ~1 MiB per-value limit. The DDL itself is fine — the limit bites per "
-            "ROW during migration: any oversized value is permanently dropped "
+            f"Columns ({names}) are MySQL LOB/TEXT or JSON types that can hold more than "
+            "Aurora DSQL's ~1 MiB per-value limit. The DDL itself is fine — the limit bites "
+            "per ROW during migration: any oversized value is permanently dropped "
             "(quarantined in Full Load, dead-lettered in CDC) and reloading cannot fix "
             "it. The Data Migration prerequisite checks probe each column and report "
             "whether a value already exceeds 1 MiB; if one does, move that content to "
-            "Amazon S3 and store a reference instead."
+            "Amazon S3 and store a reference instead, or exclude the column on the Data "
+            "Migration step. (For a TEXT family or JSON column the limit applies to the "
+            "COMPRESSED size, so a highly compressible value may still fit — treat this as "
+            "a ceiling to check, not a certain failure; a BLOB family column becomes bytea, "
+            "which Aurora DSQL does not compress.)"
         ),
     )
 
@@ -3706,8 +3710,10 @@ def _pg_oversized_lob_warning(table: TableDef) -> Optional[ConversionWarning]:
     names = ", ".join(columns)
     # Graded like the Evaluation rule: a LOSS when any at-risk column is a binary/document
     # type (choosing bytea/json/jsonb IS the intent to store something large, and MySQL's
-    # equivalent is a LOSS), a RECOMMENDATION when they are only unbounded character
-    # columns, which is PostgreSQL's idiomatic spelling for an ordinary short string.
+    # equivalent Evaluation finding is a LOSS -- though the MySQL note on this screen,
+    # _oversized_lob_warning, is still a RECOMMENDATION), a RECOMMENDATION when they are
+    # only unbounded character columns, which is PostgreSQL's idiomatic spelling for an
+    # ordinary short string.
     deliberately_large = any(
         pg_lob_is_deliberately_large(column.mysql_type)
         for column in table.columns

@@ -399,6 +399,10 @@ def test_non_prefix_index_produces_no_prefix_warning() -> None:
 
 
 def test_lossless_columns_produce_no_warnings() -> None:
+    """Lossless conversions produce no LOSS note. The JSON column converts losslessly too,
+    but like LONGTEXT its type can hold a value over DSQL's 1 MiB per-value limit, so the
+    ONE note is the oversized-value RECOMMENDATION -- nothing about the conversion itself.
+    """
     table = TableDef(
         name="clean",
         columns=[
@@ -410,7 +414,11 @@ def test_lossless_columns_produce_no_warnings() -> None:
         primary_key=["id"],
     )
     result = _convert_table(table)
-    assert result.warnings == []
+    assert not [w for w in result.warnings if w.kind is ConversionNoteKind.LOSS]
+    (note,) = result.warnings
+    assert note.kind is ConversionNoteKind.RECOMMENDATION
+    assert note.classification is Classification.MANUAL
+    assert note.message.startswith("Columns (doc) are MySQL LOB/TEXT or JSON types")
     assert "BIGINT" in result.target_ddl.upper()
     assert "TIMESTAMP" in result.target_ddl.upper()
 
@@ -2847,6 +2855,62 @@ def test_both_oversized_lob_notes_point_at_the_check_that_answers_them() -> None
         assert w is not None, label
         assert "prerequisite checks probe each column" in w.message, label
         assert "Check the largest values now" not in w.message, label
+
+
+def test_mysql_json_gets_the_oversized_note_like_longtext() -> None:
+    """G13: a MySQL JSON column used to get no note at all, although a document over DSQL's
+    1 MiB json limit is quarantined (Full Load) or dead-lettered (CDC) and reloading cannot
+    fix it. Same one RECOMMENDATION per table as LONGTEXT; the DDL is unchanged, and plain
+    TEXT / a bounded varchar are still not named."""
+    table = TableDef(
+        name="ecommerce.users",
+        primary_key=["id"],
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint"),
+            ColumnDef(name="metadata", mysql_type="json"),
+            ColumnDef(name="bio", mysql_type="text"),
+            ColumnDef(name="email", mysql_type="varchar(255)"),
+        ],
+    )
+    conv = _convert_table(table)
+    notes = [w for w in conv.warnings if "1 MiB per-value" in w.message]
+    assert len(notes) == 1, conv.warnings
+    (note,) = notes
+    assert note.kind is ConversionNoteKind.RECOMMENDATION
+    assert note.classification is Classification.MANUAL
+    assert note.message.startswith("Columns (metadata) are MySQL LOB/TEXT or JSON types")
+    assert "exclude the column on the Data Migration step" in note.message
+    assert '"metadata" JSON' in conv.target_ddl
+
+
+def test_the_mysql_oversized_note_carries_the_compressed_size_caveat() -> None:
+    """The Step 2 note said a value is "permanently dropped" with no caveat, while the
+    Evaluation recommendation for the same column (and the PostgreSQL Step 2 note) say a
+    TEXT-family or JSON limit applies to the COMPRESSED size. Step 2 must say the same --
+    a ceiling to check, not a certain failure -- and must not promise a BLOB-family column
+    headroom it does not have (it becomes bytea, which DSQL does not compress)."""
+
+    def note_for(column_type: str) -> str:
+        table = TableDef(
+            name="shop.t",
+            primary_key=["id"],
+            columns=[
+                ColumnDef(name="id", mysql_type="bigint"),
+                ColumnDef(name="c", mysql_type=column_type),
+            ],
+        )
+        (note,) = [
+            w for w in _convert_table(table).warnings if "1 MiB per-value" in w.message
+        ]
+        assert note.kind is ConversionNoteKind.RECOMMENDATION  # grade unchanged
+        return note.message
+
+    for compressible in ("json", "longtext", "mediumtext"):
+        message = note_for(compressible)
+        assert "TEXT family or JSON column the limit applies to the COMPRESSED size" in message
+        assert "a ceiling to check, not a certain failure" in message
+    for blob in ("longblob", "mediumblob"):
+        assert "becomes bytea, which Aurora DSQL does not compress" in note_for(blob)
 
 
 def test_the_generated_key_default_is_per_engine_and_per_table() -> None:

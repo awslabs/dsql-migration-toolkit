@@ -33,7 +33,7 @@ Connect → [ 1. Evaluation → 2. Schema Conversion ] → 3. Data Migration →
 | 분류 | 의미 | 예시 |
 |---|---|---|
 | **AUTO** | 자동 변환, 사람 개입 없음. | 매핑 가능한 타입과 PK를 가진 일반 테이블/컬럼; **외래 키**(자동 변환, `RECOMMENDED`로 표시 — 아래 참고). |
-| **MANUAL** | 변환되지만 결정이나 앱 측 변경 필요. | 대소문자 무시 collation, 파티션 테이블, 초대형 LOB 컬럼, `ENUM`/`SET`, 생성 컬럼, `ON UPDATE` 타임스탬프, 공간/geometry 타입, 다중 데이터베이스 소스, CDC가 복제할 수 없는 `CASCADE`/`SET NULL` 동작이 있는 외래 키. |
+| **MANUAL** | 변환되지만 결정이나 앱 측 변경 필요. | 대소문자 무시 collation, 파티션 테이블, 초대형 LOB·JSON 컬럼, `ENUM`/`SET`, 생성 컬럼, `ON UPDATE` 타임스탬프, 공간/geometry 타입, 다중 데이터베이스 소스, CDC가 복제할 수 없는 `CASCADE`/`SET NULL` 동작이 있는 외래 키. |
 | **UNSUPPORTED** | 자동 변환 불가 — 재설계 필요. | 트리거, 저장 프로시저/함수, 스케줄 이벤트, PK 없는 테이블, `DECIMAL` 정밀도 > 38, 테이블당 컬럼 > 255, DB당 테이블 > 1000, FULLTEXT/SPATIAL 인덱스. |
 
 위 예시는 MySQL 소스를 기준으로 한 것입니다. **PostgreSQL 소스**에도 같은 척도가 적용됩니다: 미지원 PG
@@ -173,9 +173,12 @@ AI 어시스트는 **옵트인·기본 꺼짐** 보강 기능으로, **Amazon Be
 
 1. **모든 UNSUPPORTED 항목 해결.** 이 항목들은 깨끗한 마이그레이션을 가로막습니다. PK가 없으면 추가,
    트리거/루틴/이벤트는 애플리케이션(또는 EventBridge/Lambda)으로 이전, 공간 타입은 대체, `DECIMAL`
-   정밀도는 ≤ 38로 축소, 초대형 LOB 컬럼은 제외하거나 분리.
-2. **모든 MANUAL 항목 결정.** 파티셔닝 제거, 기본 collation 수용, 대소문자 무시 collation과 초대형 LOB
-   컬럼 처리, `ENUM`/`SET` 처리 등.
+   정밀도는 ≤ 38로 축소.
+2. **모든 MANUAL 항목 결정.** 파티셔닝 제거, 기본 collation 수용, 대소문자 무시 collation 처리,
+   `ENUM`/`SET` 처리 등. 초대형 LOB·JSON 컬럼(`OVERSIZED_LOB`)은 먼저 Data Migration 사전 점검(또는
+   **Check sizes**, [§13.5](13-excluding-tables-and-columns.md#135-초대형-lob-후보와-check-sizes))을
+   실행하세요. 값이 이미 한도를 넘는 경우에만 그 내용을 외부 스토리지(예: Amazon S3)로 옮기거나 컬럼을
+   제외합니다(제외한 컬럼은 NULL로 마이그레이션됩니다).
 3. **AUTO 항목**은 할 일 없음.
 
 > **PostgreSQL 소스.** 동일한 하향식 분류가 적용됩니다. 변환 전에 미지원 PG 타입을 다시 모델링하세요 —
@@ -392,7 +395,7 @@ CDC 싱크(Java) — 가 동일한 매핑을 따르며, 공유 **write-contract*
 | `TINYBLOB`/`BLOB`/`MEDIUMBLOB`/`LONGBLOB` | `bytea` | `bytea` (raw bytes) | AUTO | 바이너리 페이로드를 바이트 단위로 보존. |
 | `ENUM('a','b',…)` | `text` + `CHECK (col IN ('a','b',…))` | `text` | MANUAL | DSQL에 `ENUM` 없음; 순서 의미 보존 안 됨. |
 | `SET('x','y',…)` | `text` | `text` (comma-joined) | MANUAL | 무손실 매핑 없음; 다중 값 set 의미는 앱에서 처리. |
-| `JSON` | `json` | `json` | AUTO | (CDC는 JSON 텍스트를 `PGobject(type=json)`로 감싸 `json` 컬럼을 타겟팅.) |
+| `JSON` | `json` | `json` | AUTO | 단일 값 **> ~1 MiB**는 DSQL이 거부(`json`은 압축 후 크기에 한도 적용) → 행 단위 격리(Full Load) / DLQ(CDC); Evaluation이 `OVERSIZED_LOB`로 플래그. (CDC는 JSON 텍스트를 `PGobject(type=json)`로 감싸 `json` 컬럼을 타겟팅.) |
 | 공간(`GEOMETRY`/`POINT`/`LINESTRING`/…) | `bytea` | `bytea` (raw WKB bytes) | MANUAL | DSQL에 공간 타입 없음; 데이터는 원시 WKB 바이트로 **보존**(Full Load는 `ST_AsBinary(col)`, CDC는 Debezium geometry의 `.wkb` 추출; **SRID는 드롭**). `geometry` *컬럼 타입* 자체는 MANUAL로 플래그되며(자동으로 `bytea`로 대체, WKB 보존) 값은 손실되지 않음. |
 
 > **DSQL에서 `bytea` 컬럼은 키가 될 수 없습니다.** `bytea`로 매핑되는 컬럼

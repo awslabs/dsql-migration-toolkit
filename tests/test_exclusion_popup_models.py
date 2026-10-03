@@ -68,6 +68,15 @@ def test_json_reason_with_an_open_longtext_is_b_and_not_saved_when_only_unsaved_
     assert (s.outcome, s.filter_table, s.not_saved_lines) == ("B", False, (3,))
 
 
+def test_a_mysql_json_reason_pre_ticks_an_open_json_candidate():
+    # G13: a MySQL JSON column is a candidate and converts to DSQL json, so a reason naming
+    # json is outcome A with the json column's rule pre-inserted -- not B (pick it yourself).
+    s = quarantine_rule_suggestion(
+        "shop.t", "datatype limit greater than 1048576 bytes not supported for json",
+        (("a", "longtext"), ("j", "json")), open_excluded=set(), saved_excluded=set())
+    assert (s.outcome, s.lines) == ("A", ("exclude shop.t.j  # from the Full Load quarantine",))
+
+
 def test_an_unsaved_or_pending_line_gives_not_saved_naming_it():
     s = quarantine_rule_suggestion("shop.t", "... for text", (("a", "longtext"),),
                                    open_excluded={"a"}, saved_excluded=set(),
@@ -197,7 +206,26 @@ def test_the_lob_line_is_info_until_a_measured_offender_is_open():
     assert s.lob_tone == "warning"
     # P3 LIVE 8: the measured offender is named, not only toned.
     assert s.lob_text.startswith("1 column in the selected tables holds a value over Aurora "
-                                 "DSQL's limit (Check sizes)")
+                                 "DSQL's limit (measured)")
+
+
+def test_the_lob_line_stays_info_for_type_based_json_candidates():
+    # G13 severity guard: a MySQL JSON candidate is a type-based ceiling, not a prediction,
+    # so a schema of many small JSON columns reads a calm info line until a size check
+    # (Check sizes or the prerequisite checks) has measured a value over the limit.
+    from dsql_migrator.ui.data_migration._models import lob_exclusion_candidates
+
+    inv = SourceInventory(tables=[TableDef(name="ecommerce.users", primary_key=["id"], columns=[
+        ColumnDef(name="id", mysql_type="bigint"), ColumnDef(name="metadata", mysql_type="json"),
+        ColumnDef(name="bio", mysql_type="text")])])
+    cands = lob_exclusion_candidates(inv, source_type=MY)
+    s = exclusion_row_summary(DataMigrationState(), locked=False, drift=None, block_reason=None,
+                              lob_candidates=cands)
+    assert s.lob_count == 1 and s.lob_tone == "info" and "(type-based)" in s.lob_text
+    s = exclusion_row_summary(DataMigrationState(), locked=False, drift=None, block_reason=None,
+                              lob_candidates=cands,
+                              measured_over={("ecommerce.users", "metadata")})
+    assert s.lob_tone == "warning"
 
 
 # --- review fixes (C05-C11 review) ----------------------------------------------------

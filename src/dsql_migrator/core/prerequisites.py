@@ -557,7 +557,8 @@ _DSQL_VALUE_LIMIT_BY_BASE_TYPE = {
     "char": 4096,
     "bpchar": 4096,
     # MySQL LOB families, whose own source limits are all at or under DSQL's text ceiling
-    # (LONGTEXT/LONGBLOB reach 4 GiB, hence the cap).
+    # (LONGTEXT/LONGBLOB reach 4 GiB, hence the cap). A MySQL JSON column converts to DSQL
+    # json and uses the shared "json" key above.
     "longtext": DSQL_MAX_VALUE_BYTES,
     "mediumtext": DSQL_MAX_VALUE_BYTES,
     "longblob": DSQL_MAX_VALUE_BYTES,
@@ -570,7 +571,8 @@ _DSQL_VALUE_LIMIT_BY_BASE_TYPE = {
 # The types whose 1 MiB ceiling is measured AFTER compression, so an uncompressed
 # measurement over the limit is an upper bound rather than a verdict.
 # Keyed on the TARGET type each source type converts to: a MySQL LONGTEXT becomes DSQL
-# text (compressed), a LONGBLOB becomes bytea (not compressed).
+# text (compressed), a JSON becomes json (compressed), a LONGBLOB becomes bytea (not
+# compressed).
 _DSQL_COMPRESSED_BASE_TYPES = frozenset(
     {
         "text",
@@ -616,10 +618,11 @@ def _format_limit(limit_bytes: int) -> str:
         return "1 MiB"
     return f"{limit_bytes:,} bytes"
 
-# How long the oversized-value probe may run per table before it gives up. The probe
-# stops at the FIRST offending row, so a table that HAS one answers fast; proving the
-# ABSENCE of one is a full pass over the column, which on a very large table is exactly
-# the source scan this project avoids. Timing out yields "not determined", never a pass.
+# How long the oversized-value probe may run per column (one statement each) before it
+# gives up. The probe stops at the FIRST offending row, so a table that HAS one answers
+# fast; proving the ABSENCE of one is a full pass over the column, which on a very large
+# table is exactly the source scan this project avoids. Timing out yields "not
+# determined", never a pass.
 VALUE_SIZE_PROBE_TIMEOUT_SECONDS = 15.0
 
 

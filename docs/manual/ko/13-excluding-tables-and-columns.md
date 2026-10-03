@@ -59,7 +59,7 @@ columns...** 버튼이 있습니다. 그 옆의 상태 줄이 지금 무엇이 �
 | `N saved exclusions no longer apply. Starting is blocked until you review them.` (빨강, **Review** 포함) | 저장된 항목이 거부되었거나, 소스에 더 이상 없는 것을 가리킵니다(§13.4). |
 
 선택한 테이블에 Aurora DSQL의 값 한도를 넘을 수 있는 컬럼이 있으면 두 번째 줄이 나타납니다(§13.5).
-**Check sizes**가 그런 값을 측정하면 이 줄은 경고로 바뀝니다.
+크기 점검(**Check sizes** 또는 사전 점검)이 그런 값을 측정하면 이 줄은 경고로 바뀝니다.
 
 ### 규칙 작성과 점검
 
@@ -314,7 +314,7 @@ Aurora DSQL은 단일 값의 크기를 제한합니다(대부분의 타입에서
 팝업의 접힌 **Oversized-LOB candidates (N)** 섹션은 범위 안의 컬럼 중 **타입**상 한도를 넘는 값을
 담을 수 있는 컬럼을 나열합니다:
 
-- **MySQL:** `mediumtext`, `longtext`, `mediumblob`, `longblob`;
+- **MySQL:** `mediumtext`, `longtext`, `mediumblob`, `longblob`, `json`;
 - **PostgreSQL:** `text`, `bytea`, `json`, `jsonb`, 그리고 길이 없는 `character varying`(또는 단독
   `bpchar`). CHECK가 고정된 리터럴 집합으로 제한하는 컬럼은 나열하지 않습니다.
 
@@ -324,9 +324,10 @@ schema.table.column`을 추가하는 **+ add rule** 버튼을 보여 줍니다. 
 대신 그 사유를 보여 줍니다. `include`가 유지하는 컬럼은 그 include 줄로 가는 버튼(예: **Go to L5**)을
 보여 줍니다.
 
-**팝업은 기본적으로 아무것도 측정하지 않습니다**(사전 점검은 자체 크기 점검을 실행하지만, 그 결과는
-여기에 표시되지 않습니다). 타입은 상한일 뿐이라는 점에 유의하세요: `longtext` 컬럼이 실제로는 몇 KB를
-넘는 값을 한 번도 담지 않을 수도 있습니다. 확실히 알려면 **Check sizes**를 클릭하세요:
+**팝업은 기본적으로 아무것도 측정하지 않습니다**(사전 점검은 자체 크기 점검을 실행하며, 사전 점검이
+측정한 컬럼은 그 결과가 여기에도 표시됩니다). 타입은 상한일 뿐이라는 점에 유의하세요: `longtext`나
+`json` 컬럼이 실제로는 몇 KB를 넘는 값을 한 번도 담지 않을 수도 있습니다. 확실히 알려면
+**Check sizes**를 클릭하세요:
 
 - 현재 페이지의 후보(최대 25개)를 소스에서 컬럼당 범위가 제한된 쿼리 하나로 측정합니다. 각 쿼리는
   한도를 넘는 첫 값에서 멈추고 최대 15초 동안 실행됩니다. 최악의 경우를 포함한 비용이 클릭 전에
@@ -341,7 +342,7 @@ schema.table.column`을 추가하는 **+ add rule** 버튼을 보여 줍니다. 
 바꾼 뒤에는 그 타입의 한도를 씁니다. MySQL에서 `utf8mb4`가 아닌 텍스트 컬럼은 자체 charset으로
 측정되며, 결과에 그 사실이 표시됩니다. Aurora DSQL은 UTF-8로 저장하므로 더 커질 수 있기 때문입니다.
 
-이 섹션은 강조 표시하지 않는 것도 알려 줍니다: MySQL JSON과 공간(spatial) 컬럼, PostgreSQL 배열,
+이 섹션은 강조 표시하지 않는 것도 알려 줍니다: MySQL 공간(spatial) 컬럼, PostgreSQL 배열,
 `xml`, `tsvector`, 기하 타입, 그리고 멀티바이트 텍스트를 담은 큰 `varchar(n)`이나 `char(n)`
 컬럼입니다. 2 MiB를 넘는 행은 점검하지 않습니다. 이들도 규칙으로 얼마든지 제외할 수 있습니다.
 
@@ -568,8 +569,9 @@ Change & reload에서 테이블 줄(`exclude table ...`)을 사용하세요. Sta
 - **Full Load 격리: "Exclude column & reload".** 표시된 컬럼마다 한 줄씩 이미 삽입되었지만 **저장되지
   않은** 상태로 Change & reload를 엽니다(`exclude s.t.c  # from the Full Load quarantine`). 따라서
   재적재에는 여전히 의도적인 두 번의 클릭이 필요합니다: 그 버튼, 그리고 확인. `include`가 그 컬럼을
-  유지하고 있으면 팝업이 그 줄을 가리킵니다(예: **Go to L5**). 데이터베이스가 컬럼이 아니라 타입만
-  보고했다면, LOB 섹션이 그 테이블로 필터된 채 열리므로 **+ add rule**로 컬럼을 고를 수 있습니다. CDC
+  유지하고 있으면 팝업이 그 줄을 가리킵니다(예: **Go to L5**). 사유가 그 테이블의 표시된 컬럼 중
+  하나를 가리키지 않으면(`maximum column size exceeded`처럼 타입을 밝히지 않거나, 어느 컬럼에도 없는
+  타입을 밝히면), LOB 섹션이 그 테이블로 필터된 채 열리므로 **+ add rule**로 컬럼을 고를 수 있습니다. CDC
   스택이 여전히 제외 설정을 쥐고 있으면(또는 이 세션에서 Change & reload가 제공되지 않으면), 읽기 전용
   팝업이 열리고 그 줄들은 보류 중으로 기록됩니다. Change & reload가 제공되지만 아직 실행할 수
   없으면(예: 재시작 후 다시 연결하기 전), 버튼이 사유와 함께 비활성화됩니다.

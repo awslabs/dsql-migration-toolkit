@@ -65,8 +65,8 @@ says what is excluded now:
 | `N saved exclusions no longer apply. Starting is blocked until you review them.` (red, with **Review**) | A saved entry is refused or names something the source no longer has (§13.4). |
 
 A second line appears when the selected tables have columns that can exceed Aurora
-DSQL's value limit (§13.5). It turns into a warning once **Check sizes** has measured
-such a value.
+DSQL's value limit (§13.5). It turns into a warning once a size check (**Check sizes**
+or the prerequisite checks) has measured such a value.
 
 ### Writing and checking rules
 
@@ -338,7 +338,7 @@ the column is NULL.
 The popup's collapsed **Oversized-LOB candidates (N)** section lists the in-scope
 columns whose **type** can hold a value over the limit:
 
-- **MySQL:** `mediumtext`, `longtext`, `mediumblob`, `longblob`;
+- **MySQL:** `mediumtext`, `longtext`, `mediumblob`, `longblob`, `json`;
 - **PostgreSQL:** `text`, `bytea`, `json`, `jsonb`, and `character varying` (or a bare
   `bpchar`) with no length. A column that a CHECK limits to a fixed set of literals is not
   listed.
@@ -350,9 +350,9 @@ editor. A column the eligibility rule refuses shows its reason instead. A column
 an `include` keeps shows a button for that include's line (for example **Go to L5**).
 
 **The popup measures nothing by default** (the prerequisite checks run their own size
-check, whose result is not shown here). Note that a type is only a ceiling: a `longtext`
-column may never hold more than a few kilobytes. To know for sure, click
-**Check sizes**:
+check; a column they measured shows that result here too). Note that a type is only a
+ceiling: a `longtext` or `json` column may never hold more than a few kilobytes. To
+know for sure, click **Check sizes**:
 
 - it measures the candidates on the current page (up to 25) with one bounded query per
   column on the source. Each query stops at the first value over the limit and runs for
@@ -369,7 +369,7 @@ after you change a column to `varchar` in Schema Conversion, that type's limit i
 On MySQL, a text column that is not in `utf8mb4` is measured in its own charset, and
 the result says so, because Aurora DSQL stores UTF-8, which can be larger.
 
-The section also says what it does not highlight: MySQL JSON and spatial columns;
+The section also says what it does not highlight: MySQL spatial columns;
 PostgreSQL arrays, `xml`, `tsvector` and geometric types; and large `varchar(n)` or
 `char(n)` columns holding multi-byte text. A row over 2 MiB is not checked. You can
 still exclude any of these with a rule.
@@ -622,12 +622,14 @@ lead into the same popup:
   one line per flagged column already inserted, but **not saved**
   (`exclude s.t.c  # from the Full Load quarantine`). The reload therefore still takes
   two deliberate clicks: the button, then the confirm. If an `include` keeps the
-  column, the popup points at that line (for example **Go to L5**). If the database
-  reported only a type, not a column, the LOB section opens filtered to the table, so
-  you can pick the column with **+ add rule**. If a CDC stack still holds the exclusions
-  (or Change & reload is not offered in this session), the read-only popup opens and the
-  lines are recorded as pending. If Change & reload is offered but cannot run yet (for
-  example, before you reconnect after a restart), the button is disabled with the reason.
+  column, the popup points at that line (for example **Go to L5**). If the reason does
+  not point to one of the table's flagged columns (it names no type, as with
+  `maximum column size exceeded`, or a type none of them has), the LOB section opens
+  filtered to the table, so you can pick the column with **+ add rule**. If a CDC
+  stack still holds the exclusions (or Change & reload is not offered in this session),
+  the read-only popup opens and the lines are recorded as pending. If Change & reload
+  is offered but cannot run yet (for example, before you reconnect after a restart),
+  the button is disabled with the reason.
 - **CDC dead letters: "Exclude column...".** This button is enabled in every state. It
   records `exclude s.t.c  # from the CDC dead-letter queue` as a pending line, then
   opens the popup in the mode the lock allows. Follow the lock's steps (see the table

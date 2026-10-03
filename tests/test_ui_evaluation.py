@@ -634,6 +634,47 @@ def test_compute_migration_score_mixed_lands_in_a_middle_band() -> None:
     assert score.manual == 1
 
 
+def test_a_mysql_json_table_grades_and_scores_like_a_postgres_json_table() -> None:
+    """G13: an identical document column must not read "Ready" on MySQL while it reads
+    "Moderate effort" on PostgreSQL (the asymmetry v0.1.497 removed for bytea/longblob).
+    MySQL json grades -- and so scores -- exactly like PostgreSQL json and MySQL LONGTEXT.
+    """
+    from dsql_migrator.core.assessor import CompatibilityAssessor
+    from dsql_migrator.ui.evaluation import compute_migration_score
+
+    def inventory(doc_type: str) -> SourceInventory:
+        return SourceInventory(
+            tables=[
+                TableDef(
+                    name=f"app.t{i}",
+                    primary_key=["id"],
+                    columns=[
+                        ColumnDef(name="id", mysql_type="bigint"),
+                        ColumnDef(name="doc", mysql_type=doc_type),
+                    ],
+                )
+                for i in range(10)
+            ]
+        )
+
+    def graded(source_type: SourceType, doc_type: str):
+        report = CompatibilityAssessor(source_type=source_type).assess(inventory(doc_type))
+        per_item = {
+            (i.classification, i.effort, tuple(c.note_kind for c in i.concerns))
+            for i in report.items
+        }
+        score = compute_migration_score(report)
+        return per_item, (score.score, score.band)
+
+    mysql_json = graded(SourceType.MYSQL, "json")
+    assert (
+        mysql_json
+        == graded(SourceType.POSTGRES, "json")
+        == graded(SourceType.MYSQL, "longtext")
+    )
+    assert mysql_json[1] == (57, "Moderate effort")
+
+
 # ---------------------------------------------------------------------------
 # Job-status -> step-status mapping
 # ---------------------------------------------------------------------------

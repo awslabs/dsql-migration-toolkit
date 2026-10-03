@@ -1624,7 +1624,7 @@ def format_watermark(
 # data, mirroring format_watermark / format_error_summary.
 # ---------------------------------------------------------------------------
 
-# Aurora DSQL rejects a single text/bytea value over 1 MiB; a row over the Kafka
+# Aurora DSQL rejects a single text/bytea/json value over 1 MiB; a row over the Kafka
 # client limit kills the source task. The CDC screen reuses the
 # evaluation OVERSIZED_LOB type set (_OVERSIZED_LOB_BASES) and base-type parser
 # (_base_type) imported above, so the exclusion offer stays in lock-step with the
@@ -1636,7 +1636,7 @@ class LobExclusionCandidate:
     """One table's columns that CDC can optionally exclude at capture.
 
     ``columns`` are the column names flagged by the evaluation ``OVERSIZED_LOB``
-    rule (MySQL ``mediumtext/longtext/mediumblob/longblob``) whose values can
+    rule (MySQL ``mediumtext/longtext/mediumblob/longblob/json``) whose values can
     exceed the Aurora DSQL 1 MiB per-value limit. Excluding them (the column then
     migrates as NULL, and Debezium's ``column.exclude.list`` never captures it) is the
     safe handling for values that can also exceed the CDC message size limit --
@@ -1656,9 +1656,10 @@ def lob_exclusion_candidates(
 
     Pure: derived directly from the source inventory's column types, so the CDC
     screen can offer exclusion without re-running evaluation. The classification is
-    chosen by ``source_type`` -- MySQL ``mediumtext/longtext/mediumblob/longblob`` vs
+    chosen by ``source_type`` -- MySQL ``mediumtext/longtext/mediumblob/longblob/json`` vs
     PostgreSQL's ``is_pg_oversized_lob_type`` -- because ``column.mysql_type`` holds the
-    SOURCE engine's type name (matching a MySQL set against PG types found nothing).
+    SOURCE engine's type name (the MySQL set matched against PG types finds at most the
+    shared ``json`` spelling).
     Both come from :mod:`core.assessor`, so this offer, the Evaluation
     ``OVERSIZED_LOB`` rule and the Schema Conversion note can never disagree about which
     columns are at risk. Primary-key columns are never offered (a PK can't be dropped);
@@ -1695,10 +1696,14 @@ def lob_exclusion_candidates(
 
 # Source LOB base types split by the DSQL type they convert to, so a quarantine reason
 # that names the DSQL type can be narrowed back to the source columns that produced it.
-# (MySQL converter: mediumblob/longblob -> bytea, mediumtext/longtext -> text.)
+# (MySQL converter: mediumblob/longblob -> bytea, mediumtext/longtext -> text, json -> json.)
+# Every member of _OVERSIZED_LOB_BASES must sit in exactly one bucket (pinned by a test), or
+# a quarantine naming its type pre-ticks nothing. A ``jsonb`` reason (a json column re-typed
+# jsonb in Schema Conversion) contains ``json`` and so pre-ticks the source json column.
 _LOB_BASES_BY_TARGET_TYPE: "dict[str, frozenset[str]]" = {
     "bytea": frozenset({"mediumblob", "longblob"}),
     "text": frozenset({"mediumtext", "longtext"}),
+    "json": frozenset({"json"}),
 }
 
 # The PostgreSQL map. PG -> DSQL is the IDENTITY for these types, so the source spelling
@@ -1734,15 +1739,17 @@ def preselect_lob_columns_for_reason(
     (``datatype limit greater than 1048576 bytes not supported for bytea``).
 
     That type token is still a real signal, because the source->DSQL mapping is
-    deterministic: for MySQL ``mediumblob``/``longblob`` become ``bytea`` and
-    ``mediumtext``/``longtext`` become ``text``; for PostgreSQL the mapping is the identity.
+    deterministic: for MySQL ``mediumblob``/``longblob`` become ``bytea``,
+    ``mediumtext``/``longtext`` become ``text``, and ``json`` stays ``json``; for PostgreSQL
+    the mapping is the identity.
     So a ``bytea`` reason narrows a table with both a blob and a text LOB column
     (``product_media`` has ``content`` and ``full_description``) down to the blob one.
 
     ``source_type`` picks the mapping. Without it a PostgreSQL source matched PG spellings
-    against MySQL base names and pre-ticked NOTHING -- not a blocker (the dialog's
-    documented else-branch explains the empty selection and the action refuses an empty
-    pick), but one avoidable click on the recovery path.
+    against MySQL base names and pre-ticked NOTHING (today: only a json column, the one
+    spelling the engines share) -- not a blocker (the dialog's documented else-branch
+    explains the empty selection and the action refuses an empty pick), but one
+    avoidable click on the recovery path.
 
     This only PRE-SELECTS; the caller must still show the choice, because excluding the
     wrong column silently NULLs it for the whole table. Returns ``()`` when the reason
@@ -1868,9 +1875,9 @@ def make_lob_candidates_for(inventory, session, migration_state=None):
     ``session`` made hoisting it a two-argument factory.
 
     The picker needs the TYPES, not just the names: the quarantine reason names the DSQL
-    type (``bytea``/``text``) rather than the column, and the source type is what maps back
-    to it. :class:`LobExclusionCandidate` carries names only, so the types come from the
-    inventory here.
+    type (``bytea``/``text``/``json``) rather than the column, and the source type is what
+    maps back to it. :class:`LobExclusionCandidate` carries names only, so the types come
+    from the inventory here.
 
     With ``migration_state`` the lookup also drops every column the exclusion rule refuses
     (a composite target key, a column a preserved foreign key references, a column Aurora
@@ -1887,10 +1894,12 @@ def make_lob_candidates_for(inventory, session, migration_state=None):
         allowed = {
             c.table: set(c.columns)
             # The engine MUST be passed: the parameter defaults to MySQL, whose type names
-            # (mediumtext/longblob/...) never match a PostgreSQL inventory's format_type
-            # spellings (text/bytea), so the set came back empty and the caller's "no
-            # candidates -> do not offer a dead button" early return hid the ONLY
-            # post-quarantine recovery action for every PostgreSQL migration.
+            # (mediumtext/longblob/...) match a PostgreSQL inventory's format_type spellings
+            # only on the shared ``json`` -- never text/bytea/jsonb. Before MySQL json joined
+            # that set the result was empty, and the caller's "no candidates -> do not
+            # offer a dead button" early return hid the ONLY post-quarantine recovery
+            # action for every PostgreSQL migration; without the engine it would still hide
+            # it on a table with no json column, and elsewhere offer only the json column.
             for c in (
                 lob_exclusion_candidates(
                     inventory, source_type=session_source_type(session)
@@ -2811,10 +2820,14 @@ def exclusion_row_summary(
                 + (" (or dead-lettered during CDC)"
                    if mtype is MigrationType.FULL_LOAD_AND_CDC else "")
             )
+            # "(measured)", not "(Check sizes)": the size cache is filled by the popup's
+            # Check sizes AND by the prerequisite run's SOURCE_VALUE_SIZE answers
+            # (DataMigrationState.set_prereq_report), so a user who only ran the checks
+            # was credited with a click they never made.
             lob_text = (
                 f"{found} column{'s' if found != 1 else ''} in the selected tables "
                 f"{'hold' if found != 1 else 'holds'} a value over Aurora DSQL's limit "
-                f"(Check sizes): {consequence}. Review them in Exclude tables & columns."
+                f"(measured): {consequence}. Review them in Exclude tables & columns."
             )
     if block_reason:
         n = blocking_count or 1

@@ -24642,14 +24642,180 @@ def test_lob_exclusion_candidates_cover_json_jsonb_and_unbounded_varchar() -> No
             )
         ]
     )
-    # The MySQL default still finds nothing in a PG inventory (the reason source_type
-    # has to be passed at every call site).
-    assert lob_exclusion_candidates(inventory) == []
+    # The MySQL default matches only the one spelling the engines share (`json`) and still
+    # does not give the PostgreSQL answer -- which is why source_type has to be passed at
+    # every call site.
+    from dsql_migrator.ui.data_migration._models import LobExclusionCandidate
+
+    assert lob_exclusion_candidates(inventory) == [
+        LobExclusionCandidate("public.docs", ("meta",))
+    ]
+    assert lob_exclusion_candidates(inventory) != lob_exclusion_candidates(
+        inventory, source_type=SourceType.POSTGRES
+    )
     candidates = lob_exclusion_candidates(
         inventory, source_type=SourceType.POSTGRES
     )
     assert len(candidates) == 1
     assert candidates[0].columns == ("body", "payload", "doc", "meta", "free")
+
+
+# ---------------------------------------------------------------------------
+# G13: MySQL JSON is an oversized-LOB candidate on every MySQL surface
+# ---------------------------------------------------------------------------
+
+
+def _g13_users_inventory():
+    from dsql_migrator.core.models import ColumnDef, SourceInventory, TableDef
+
+    return SourceInventory(
+        tables=[
+            TableDef(
+                name="ecommerce.users",
+                primary_key=["id"],
+                columns=[
+                    ColumnDef(name="id", mysql_type="bigint"),
+                    ColumnDef(name="metadata", mysql_type="json"),
+                    ColumnDef(name="bio", mysql_type="text"),
+                    ColumnDef(name="email", mysql_type="varchar(255)"),
+                ],
+            )
+        ]
+    )
+
+
+def test_a_mysql_json_only_table_keeps_its_exclude_and_reload_button() -> None:
+    """The post-quarantine "Exclude column & reload" is hidden when the lookup returns
+    nothing, so a MySQL table whose only oversized column is JSON had no recovery button
+    at all. The non-empty lookup is what renders it."""
+    from dsql_migrator.core.models import SourceConnectionConfig, SourceType
+    from dsql_migrator.ui.data_migration._models import make_lob_candidates_for
+
+    class _MySqlSession:
+        source_config = SourceConnectionConfig(
+            source_type=SourceType.MYSQL, host="h", port=3306, username="u"
+        )
+
+    lookup = make_lob_candidates_for(_g13_users_inventory(), _MySqlSession())
+    assert lookup("ecommerce.users") == (("metadata", "json"),)
+
+
+def test_a_mysql_json_quarantine_pre_ticks_the_json_column() -> None:
+    """A MySQL JSON column converts to DSQL json, so a quarantine reason naming json (or
+    jsonb, for a column re-typed in Schema Conversion) narrows back to it -- without the
+    json bucket it pre-ticked nothing. A reason naming no type still makes the user
+    choose."""
+    from dsql_migrator.ui.data_migration._models import preselect_lob_columns_for_reason
+
+    cols = [("content", "longblob"), ("full_description", "longtext"), ("specs", "json")]
+    reason = "datatype limit greater than 1048576 bytes not supported for {}"
+    assert preselect_lob_columns_for_reason(cols, reason.format("json")) == ("specs",)
+    assert preselect_lob_columns_for_reason(cols, reason.format("text")) == (
+        "full_description",
+    )
+    assert preselect_lob_columns_for_reason(cols, reason.format("bytea")) == ("content",)
+    assert preselect_lob_columns_for_reason(cols, reason.format("jsonb")) == ("specs",)
+    assert preselect_lob_columns_for_reason(cols, "maximum column size exceeded") == ()
+
+
+def test_every_mysql_oversized_base_is_wired() -> None:
+    """Every member of the ONE MySQL set must reach every place that keys on a type name:
+    the pre-tick buckets (or a quarantine naming it pre-ticks nothing), the popup's
+    "Type allows up to" ceiling, and a documented DSQL limit."""
+    from dsql_migrator.core.assessor import _OVERSIZED_LOB_BASES
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.core.prerequisites import dsql_value_limit_bytes
+    from dsql_migrator.ui.data_migration._exclusion_dialog import _TYPE_ALLOWS
+    from dsql_migrator.ui.data_migration._models import _LOB_BASES_BY_TARGET_TYPE
+
+    buckets = list(_LOB_BASES_BY_TARGET_TYPE.values())
+    assert frozenset().union(*buckets) == _OVERSIZED_LOB_BASES
+    # ... each in exactly ONE bucket.
+    assert sum(len(b) for b in buckets) == len(_OVERSIZED_LOB_BASES)
+    assert set(_TYPE_ALLOWS[SourceType.MYSQL]) == set(_OVERSIZED_LOB_BASES)
+    assert {dsql_value_limit_bytes(b) for b in _OVERSIZED_LOB_BASES} == {1024 * 1024}
+    assert "json" in _OVERSIZED_LOB_BASES
+
+
+def test_mysql_json_is_one_candidate_on_every_surface() -> None:
+    """Evaluation, the Schema Conversion note, the exclusion offer and the prerequisite
+    size check must agree on WHICH MySQL columns are at risk -- and a JSON value measured
+    over the limit is a non-blocking WARN that never changes whether a migration can
+    proceed."""
+    from tests.test_prerequisites import _FakeSource, _FakeTarget
+
+    from dsql_migrator.core.assessor import OversizedLobRule
+    from dsql_migrator.core.converter import SchemaConverter
+    from dsql_migrator.core.models import (
+        ColumnDef,
+        MigrationMode,
+        PrerequisiteCheckId,
+        PrerequisiteCheckRequest,
+        PrerequisiteStatus,
+        SourceInventory,
+        SourceType,
+        TableDef,
+    )
+    from dsql_migrator.core.prerequisites import PrerequisiteChecker
+    from dsql_migrator.ui.data_migration._models import (
+        LobExclusionCandidate,
+        lob_exclusion_candidates,
+    )
+
+    mib = 1024 * 1024
+    table = TableDef(
+        name="shop.docs",
+        primary_key=["id"],
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint"),
+            ColumnDef(name="meta", mysql_type="json"),
+            ColumnDef(name="body", mysql_type="longtext"),
+            ColumnDef(name="blob", mysql_type="mediumblob"),
+            ColumnDef(name="note", mysql_type="text"),
+            ColumnDef(name="thumb", mysql_type="blob"),
+        ],
+    )
+    inventory = SourceInventory(tables=[table])
+    assert "Columns (meta, body, blob)" in OversizedLobRule().evaluate(inventory)[0].risk
+    note = next(
+        w
+        for w in SchemaConverter().convert_table(table).warnings
+        if "1 MiB per-value" in w.message
+    )
+    assert note.message.startswith("Columns (meta, body, blob)")
+    candidates = lob_exclusion_candidates(inventory, source_type=SourceType.MYSQL)
+    assert candidates == [LobExclusionCandidate("shop.docs", ("meta", "body", "blob"))]
+
+    asked: list = []
+
+    class _Probe(_FakeSource):
+        def oversized_values(
+            self, table_name, columns, *, limit_bytes, timeout_seconds,
+            limits=None, column_types=None,
+        ):
+            asked.append((tuple(columns), dict(column_types or {}), dict(limits or {})))
+            return {"meta": True, "body": False, "blob": False}
+
+    request = PrerequisiteCheckRequest(mode=MigrationMode.FULL_LOAD, tables=[table.name])
+    # The target already holds the table, so every REQUIRED check passes: a default
+    # _FakeTarget() fails TARGET_SCHEMA_READY, which made both reports False and the
+    # "never blocks" comparison below vacuous (a WARN-blocks mutant left it green).
+    report = PrerequisiteChecker(
+        source_probe=_Probe(), target_probe=_FakeTarget(existing={table.name})
+    ).check(request, tables=[table], lob_columns={c.table: c.columns for c in candidates})
+    ((columns, types, limits),) = asked
+    assert columns == ("meta", "body", "blob") and types["meta"] == "json"
+    assert set(limits.values()) == {mib}
+    (row,) = [
+        r for r in report.results if r.check_id is PrerequisiteCheckId.SOURCE_VALUE_SIZE
+    ]
+    assert row.status is PrerequisiteStatus.WARN and row.required is False
+    assert "`meta` (1 MiB)" in row.detail and "For `meta`" in row.remediation
+    baseline = PrerequisiteChecker(
+        source_probe=_FakeSource(), target_probe=_FakeTarget(existing={table.name})
+    ).check(request, tables=[table])
+    assert baseline.can_proceed is True  # otherwise clean, so the next line means something
+    assert report.can_proceed is True  # a JSON value over the limit never closes Start
 
 
 def test_the_renderer_supplies_the_engine_to_the_pretick() -> None:

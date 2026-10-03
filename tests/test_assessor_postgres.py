@@ -43,7 +43,8 @@ _EXPECTED_PG_RULE_IDS = {
     "NUMERIC_PRECISION",
     # Same id, but it needed a PG-worded rule AND a PG type set: the 1 MiB cap is a
     # TARGET limit that applies to PG text/bytea/json/jsonb identically, while the shared
-    # rule matches MySQL type NAMES -- so registering that one would have found nothing.
+    # rule matches MySQL type NAMES -- so registering that one would find only the shared
+    # ``json`` spelling (worded for MySQL) and miss text/bytea/jsonb.
     "OVERSIZED_LOB",
     # PG-only: a non-PK serial/identity column. Schema Conversion warned about it while
     # Evaluation said nothing, the same contradiction the identity-KEY rule closed.
@@ -382,6 +383,11 @@ def test_pg_oversized_lob_rule_covers_what_the_manual_documents() -> None:
         # A LENGTH-BOUNDED varchar cannot exceed 1 MiB, and a plain integer is irrelevant.
         assert "code" not in f.risk
         assert "qty" not in f.risk
+        # Same CDC caveat as the MySQL rule (a change event over the Kafka message limit
+        # stops the source, it is not dead-lettered) -- without MySQL's "an UPDATE carries
+        # the value twice", which the default replica identity does not do.
+        assert "stops CDC for every table" in f.risk
+        assert "UPDATE carries" not in f.risk
     # Deliberately-large types -> LOSS, matching MySQL's mediumblob/longblob grade.
     for named in ("content", "doc", "meta"):
         assert named in loss.risk, named

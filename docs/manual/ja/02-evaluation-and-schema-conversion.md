@@ -34,7 +34,7 @@ Connect → [ 1. Evaluation → 2. Schema Conversion ] → 3. Data Migration →
 | 分類 | 意味 | 例 |
 |---|---|---|
 | **AUTO** | 自動変換され、人手の作業は不要。 | マッピング可能な型と PK を持つ通常のテーブル/カラム。**外部キー**(自動変換され、`RECOMMENDED` としてフラグ付け — 下記参照)。 |
-| **MANUAL** | 変換はされるが、判断またはアプリ側の変更が必要。 | 大文字小文字を区別しない collation、パーティションテーブル、過大な LOB カラム、`ENUM`/`SET`、生成カラム、`ON UPDATE` タイムスタンプ、空間/geometry 型、複数データベースのソース、`CASCADE`/`SET NULL` アクションを持つ外部キー(CDC が複製できません)。 |
+| **MANUAL** | 変換はされるが、判断またはアプリ側の変更が必要。 | 大文字小文字を区別しない collation、パーティションテーブル、過大な LOB/JSON カラム、`ENUM`/`SET`、生成カラム、`ON UPDATE` タイムスタンプ、空間/geometry 型、複数データベースのソース、`CASCADE`/`SET NULL` アクションを持つ外部キー(CDC が複製できません)。 |
 | **UNSUPPORTED** | 自動変換不可 — 再設計が必要。 | トリガー、ストアドプロシージャ/関数、スケジュールイベント、PK のないテーブル、`DECIMAL` 精度 > 38、テーブルあたりカラム > 255、データベースあたりテーブル > 1000、FULLTEXT/SPATIAL インデックス。 |
 
 上記の例は MySQL ソースを基準にしています。**PostgreSQL ソース** でも同じ尺度が適用されます: サポートされ
@@ -183,10 +183,13 @@ AI アシストは **オプトイン・デフォルト無効** の補強機能�
 
 1. **すべての UNSUPPORTED 項目を解決します。** これらはクリーンなマイグレーションを妨げます。PK が
    ない場合は追加し、トリガー/ルーチン/イベントはアプリケーション(または EventBridge/Lambda)へ移し、
-   空間型は置き換え、`DECIMAL` 精度は ≤ 38 に縮小し、過大な LOB カラムは除外するか分割します。
+   空間型は置き換え、`DECIMAL` 精度は ≤ 38 に縮小します。
 2. **すべての MANUAL 項目を判断します。** パーティショニングの削除、デフォルト collation の受け入れ、
    `ENUM`/`SET` の扱い、`ON UPDATE` タイムスタンプの判断、CDC が複製できないカスケードアクションの置き換え
-   などを決めます。
+   などを決めます。過大な LOB/JSON カラム(`OVERSIZED_LOB`)は、まず Data Migration の前提条件チェック
+   (または **Check sizes**、[§13.5](13-excluding-tables-and-columns.md#135-特大-lob-の候補と-check-sizes))
+   を実行します。値がすでに上限を超えている場合にのみ、その内容を外部ストレージ(例: Amazon S3)へ移すか、
+   カラムを除外します(除外したカラムは NULL として移行されます)。
 3. **AUTO 項目** については、あなたが行うことは何もありません。
 
 > **PostgreSQL ソース。** 同じトップダウンのトリアージが適用されます。変換の前に、サポートされない PG 型を
@@ -400,7 +403,7 @@ Schema Conversion の後は、**DSQL ターゲットスキーマが確定** し�
 | `TINYBLOB`/`BLOB`/`MEDIUMBLOB`/`LONGBLOB` | `bytea` | `bytea` (raw bytes) | AUTO | バイナリペイロードをバイト単位で保持します。 |
 | `ENUM('a','b',…)` | `text` + `CHECK (col IN ('a','b',…))` | `text` | MANUAL | DSQL には `ENUM` がありません。順序のセマンティクスは保持されません。 |
 | `SET('x','y',…)` | `text` | `text` (comma-joined) | MANUAL | ロスレスなマッピングはありません。複数値の set セマンティクスはアプリケーションで処理します。 |
-| `JSON` | `json` | `json` | AUTO | (CDC は JSON テキストを `PGobject(type=json)` でラップし、`json` 列をターゲットにします。) |
+| `JSON` | `json` | `json` | AUTO | 単一の値が **> 約 1 MiB** の場合は DSQL に拒否されます(`json` では圧縮後のサイズに上限が適用されます)→ 行単位の隔離 (Full Load) / DLQ (CDC)。Evaluation は `OVERSIZED_LOB` としてフラグ付けします。(CDC は JSON テキストを `PGobject(type=json)` でラップし、`json` 列をターゲットにします。) |
 | 空間型 (`GEOMETRY`/`POINT`/`LINESTRING`/…) | `bytea` | `bytea` (raw WKB bytes) | MANUAL | DSQL には空間型がありません。データは生の WKB バイトとして **保持** されます (Full Load は `ST_AsBinary(col)` を読み取り、CDC は Debezium の geometry の `.wkb` を抽出します。**SRID はドロップ** されます)。`geometry` の *列型* 自体は MANUAL としてフラグ付けされ(自動的に `bytea` へ置換され、WKB は保持)、値は失われません。 |
 
 > **DSQL では `bytea` 列はキーになれません。** `bytea` にマッピングされる列

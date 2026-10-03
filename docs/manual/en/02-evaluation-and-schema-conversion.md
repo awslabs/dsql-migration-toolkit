@@ -36,7 +36,7 @@ a **compatibility assessment report**.
 | Class | Meaning | Examples |
 |---|---|---|
 | **AUTO** | Converts automatically, no human action. | Ordinary tables/columns with mappable types and a PK; **foreign keys** (converted automatically, flagged `RECOMMENDED` — see below). |
-| **MANUAL** | Converts, but needs a decision or an app-side change. | Case-insensitive collation, partitioned tables, oversized LOB columns, `ENUM`/`SET`, generated columns, `ON UPDATE` timestamps, spatial/geometry types, multi-database sources, foreign keys with `CASCADE`/`SET NULL` actions (which CDC can't replicate). |
+| **MANUAL** | Converts, but needs a decision or an app-side change. | Case-insensitive collation, partitioned tables, oversized LOB and JSON columns, `ENUM`/`SET`, generated columns, `ON UPDATE` timestamps, spatial/geometry types, multi-database sources, foreign keys with `CASCADE`/`SET NULL` actions (which CDC can't replicate). |
 | **UNSUPPORTED** | No automatic conversion — redesign needed. | Triggers, stored procedures/functions, scheduled events, tables with no PK, `DECIMAL` precision > 1000, > 255 columns/table, > 1000 tables/database, FULLTEXT/SPATIAL indexes. |
 
 The examples above are drawn from a MySQL source. For a **PostgreSQL source** the same
@@ -199,11 +199,15 @@ Work the list top-down by severity:
 
 1. **Resolve every UNSUPPORTED item.** These block a clean migration. Add a PK
    where missing; move triggers/routines/events into the application (or
-   EventBridge/Lambda); replace spatial types; reduce `DECIMAL` precision to ≤ 1000;
-   exclude or split oversized LOB columns.
+   EventBridge/Lambda); replace spatial types; reduce `DECIMAL` precision to ≤ 1000.
 2. **Decide every MANUAL item.** Drop partitioning, accept the default collation,
    handle `ENUM`/`SET`, decide `ON UPDATE` timestamps, replace a cascade action CDC
-   can't replicate, etc.
+   can't replicate, etc. For an oversized LOB or JSON column (`OVERSIZED_LOB`), run the
+   Data Migration prerequisite checks (or **Check sizes**,
+   [§13.5](13-excluding-tables-and-columns.md#135-oversized-lob-candidates-and-check-sizes))
+   first, and act only if a value already exceeds the limit: move that content to
+   external storage (e.g. Amazon S3), or exclude the column (an excluded column is
+   migrated as NULL).
 3. **AUTO items** need nothing from you.
 
 > **PostgreSQL source.** The same top-down triage applies. Remodel unsupported PG types
@@ -467,7 +471,7 @@ conversion (redesign).
 | `TINYBLOB`/`BLOB`/`MEDIUMBLOB`/`LONGBLOB` | `bytea` | `bytea` (raw bytes) | AUTO | Binary payload preserved byte-for-byte. |
 | `ENUM('a','b',…)` | `text` + `CHECK (col IN ('a','b',…))` | `text` | MANUAL | DSQL has no `ENUM`; ordering semantics not preserved. |
 | `SET('x','y',…)` | `text` | `text` (comma-joined) | MANUAL | No lossless mapping; multi-value set semantics handled in the app. |
-| `JSON` | `json` | `json` | AUTO | (CDC wraps the JSON text in a `PGobject(type=json)` so it targets the `json` column.) |
+| `JSON` | `json` | `json` | AUTO | A single value **> ~1 MiB** is rejected by DSQL (for `json` the limit applies to the compressed size) → per-row quarantine (Full Load) / DLQ (CDC); Evaluation flags the column `OVERSIZED_LOB`. (CDC wraps the JSON text in a `PGobject(type=json)` so it targets the `json` column.) |
 | spatial (`GEOMETRY`/`POINT`/`LINESTRING`/…) | `bytea` | `bytea` (raw WKB bytes) | MANUAL | DSQL has no spatial type; the data is **preserved** as raw WKB bytes (Full Load reads `ST_AsBinary(col)`, CDC extracts Debezium geometry's `.wkb`; **SRID is dropped**). The `geometry` *column type* itself is flagged MANUAL (auto-substituted to `bytea`, WKB preserved), so the values are not lost. |
 
 > **A `bytea` column cannot be a key on DSQL.** Any column that maps to `bytea`

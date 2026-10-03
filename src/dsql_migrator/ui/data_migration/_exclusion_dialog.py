@@ -92,7 +92,7 @@ REVIEW_FILTERS = ("All", "Excluded", "Blocked", "Warning")
 _STATUS = {"unselected": "Unselected", "excluded": "Excluded", "blocked": "Blocked",
            "kept": "Kept"}
 HONESTY_FOOTER = (
-    "Not highlighted, but can still exceed limits: MySQL JSON and spatial columns; "
+    "Not highlighted, but can still exceed limits: MySQL spatial columns; "
     "PostgreSQL arrays, xml, tsvector and geometric types; large varchar(n)/char(n) holding "
     "multi-byte text. A row over 2 MiB is not checked. You can still exclude them with a rule."
 )
@@ -103,7 +103,7 @@ QUARANTINE_CONSEQUENCE = (
 # What the SOURCE type can hold -- always worded as a ceiling, never a measurement.
 _TYPE_ALLOWS = {
     SourceType.MYSQL: {"mediumtext": "16 MiB", "mediumblob": "16 MiB", "longtext": "4 GiB",
-                       "longblob": "4 GiB"},
+                       "longblob": "4 GiB", "json": "1 GiB (max_allowed_packet)"},
     SourceType.POSTGRES: {"text": "about 1 GB", "bytea": "about 1 GB", "json": "about 1 GB",
                           "character varying": "about 1 GB", "varchar": "about 1 GB",
                           "jsonb": "about 256 MiB"},
@@ -1771,13 +1771,16 @@ def _route_hint(outcome, table: str, text: str, editable: bool, when: str,
                 f"({_quote(outcome.not_saved_lines)}); {when}, Save it in Change & reload.")
     if outcome.outcome == "B":
         if editable:
-            text_b = ("The database reported a type, not a column, so no rule was added: pick "
+            # "did not name the column" holds for EVERY B reason: one naming a type that no
+            # open flagged column has, one naming no type at all (DSQL's 54000 "maximum
+            # column size exceeded"), and the restored-session fallback reason.
+            text_b = ("The database did not name the column, so no rule was added: pick "
                       "the column that holds the oversized value with [+ add rule].")
         else:
             # The read-only popup has no candidate list and no [+ add rule]: name them.
             names = ", ".join(f"{c} ({t})" for c, t in still_open[:_SHOWN])
             more = f", and {len(still_open) - _SHOWN} more" if len(still_open) > _SHOWN else ""
-            text_b = ("The database reported a type, not a column, so no rule was added."
+            text_b = ("The database did not name the column, so no rule was added."
                       + (f" Columns of {table} that can hold it: {names}{more}." if names
                          else ""))
         if not outcome.filter_table and outcome.not_saved_lines:
@@ -1790,8 +1793,8 @@ def _route_hint(outcome, table: str, text: str, editable: bool, when: str,
         return ("warning", text_b)
     text_c = (f"Every column of {table} whose type this tool flags as oversized is already "
               "excluded by your saved rules, so the value the database rejected is in another "
-              "column (for example JSON or spatial, which are not flagged). Type a rule for "
-              f"that column: exclude {table}.<column>.")
+              "column (for example a spatial or array column, which this tool does not flag). "
+              f"Type a rule for that column: exclude {table}.<column>.")
     if not editable:
         text_c += f" {when[0].upper()}{when[1:]}, type it in Change & reload."
     return ("warning", text_c)

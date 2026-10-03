@@ -731,6 +731,9 @@ def test_oversized_lob_rule_flags_large_text_blob_manual() -> None:
     assert item.rule_id == "OVERSIZED_LOB"
     assert item.classification is Classification.MANUAL
     assert "body" in item.risk and "blob" in item.risk
+    # The CDC consequence is not always a per-row dead letter: a change event over the
+    # Kafka message limit stops the single-task source connector for every table.
+    assert "stops CDC for every table" in item.risk
 
 
 def test_oversized_lob_rule_ignores_small_text_blob() -> None:
@@ -745,6 +748,36 @@ def test_oversized_lob_rule_ignores_small_text_blob() -> None:
     # TEXT/BLOB (<= 64 KiB) fit within the DSQL 1 MiB limit -> no finding.
     item = _item_for(_assess(SourceInventory(tables=[table])), "notes")
     assert item.classification is Classification.AUTO
+
+
+def test_oversized_lob_rule_flags_mysql_json_like_longtext() -> None:
+    """G13: a MySQL JSON document is bounded only by max_allowed_packet (up to 1 GiB) and
+    converts to DSQL json, whose 1 MiB per-value limit applies to the compressed size. It
+    used to read AUTO here, so an oversized document surfaced only as a quarantined or
+    dead-lettered row. Graded exactly like LONGTEXT and PostgreSQL json/jsonb."""
+    table = _table_with_pk(
+        "shop.t",
+        columns=[
+            ColumnDef(name="id", mysql_type="INT"),
+            ColumnDef(name="metadata", mysql_type="JSON"),
+        ],
+    )
+    item = _item_for(_assess(SourceInventory(tables=[table])), "shop.t")
+    assert item.rule_id == "OVERSIZED_LOB"
+    assert item.classification is Classification.MANUAL
+    assert item.effort is EffortLevel.MEDIUM
+    assert [c.note_kind for c in item.concerns] == [ConversionNoteKind.LOSS]
+    assert "Columns (metadata)" in item.risk and "JSON" in item.risk
+    assert "dead-lettered during CDC" in item.risk
+    # A JSON document can reach 1 GiB, and with binlog_row_image=FULL an UPDATE carries it
+    # in both images: past the CDC message limit (MaxMessageBytes, 4 MiB by default) the
+    # event is never dead-lettered -- the source task fails and CDC stops for every table.
+    assert "stops CDC for every table" in item.risk
+    assert "an UPDATE carries the value twice" in item.risk
+    assert (
+        "TEXT family or JSON column the limit applies to the COMPRESSED size"
+        in item.recommendation
+    )
 
 
 def test_decimal_precision_rule_flags_over_38_unsupported() -> None:

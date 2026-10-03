@@ -165,10 +165,18 @@ _MAX_KEY_COLUMNS = 8
 # PostgreSQL source can reach this at all.
 _MAX_NUMERIC_PRECISION = 1000
 
-# MySQL LOB/TEXT base types whose maximum size exceeds the DSQL text/bytea 1 MiB
-# limit, so a large enough value cannot be stored and must be reviewed.
+# The MySQL base types whose values can exceed Aurora DSQL's 1 MiB per-value limit, so a
+# large enough value cannot be stored and must be reviewed: the MEDIUM*/LONG* TEXT and BLOB
+# families (16 MiB / 4 GiB), and ``json``. A MySQL JSON document is bounded only by
+# max_allowed_packet (at most 1 GiB) and converts to DSQL ``json``, whose 1 MiB limit
+# applies to the COMPRESSED size -- that moves the cap rather than removing it (see
+# ``_PG_OVERSIZED_LOB_BASES`` below: a compression measurement does not overrule a
+# documented quota). Leaving ``json`` out kept Evaluation, the Schema Conversion note, the
+# exclusion offer and the size check silent, so an oversized document surfaced only as a
+# quarantined or dead-lettered row. Plain TEXT/BLOB (64 KiB) stay out. Like the PostgreSQL
+# set, this is a ceiling, not a prediction.
 _OVERSIZED_LOB_BASES = frozenset(
-    {"mediumtext", "longtext", "mediumblob", "longblob"}
+    {"mediumtext", "longtext", "mediumblob", "longblob", "json"}
 )
 
 # The PostgreSQL counterpart. Lives here, beside the MySQL set, because three layers need
@@ -216,17 +224,21 @@ def _is_unbounded_pg_character(mysql_type: str) -> bool:
 #
 # * ``bytea``/``json``/``jsonb`` exist to hold a document or a blob -- choosing one IS the
 #   intent to store something large, so "no length limit" is the risk itself. Graded a LOSS,
-#   the same as MySQL's mediumblob/longblob/mediumtext/longtext, every member of which is
-#   likewise a deliberately-large type. This keeps the two engines in step: a ``bytea``
-#   column holding 1,114,112 bytes must not read "Ready" on PostgreSQL while the identical
-#   ``longblob`` reads "Moderate effort" on MySQL.
+#   the same as Evaluation grades MySQL's mediumblob/longblob/mediumtext/longtext/json, every
+#   member of which is likewise a deliberately-large type. This keeps the two engines in
+#   step: a ``bytea`` column holding 1,114,112 bytes must not read "Ready" on PostgreSQL
+#   while the identical ``longblob`` reads "Moderate effort" on MySQL.
 # * An unbounded ``text``/``varchar`` is PostgreSQL's IDIOMATIC way to spell an ordinary short
 #   string (names, emails, SKUs). Grading those a LOSS put an 18-table schema of perfectly
 #   ordinary columns into per-table manual work -- measured -- which is the noise the v0.1.495
 #   downgrade was for. Graded a RECOMMENDATION: something to check, not work to budget.
 #
 # MySQL has no idiomatic-short member in its set (plain ``text`` is excluded as too small to
-# exceed 1 MiB), which is why it needs no such split.
+# exceed 1 MiB, and ``json`` is a document type like PostgreSQL json/jsonb), which is why it
+# needs no such split -- in EVALUATION a MySQL ``json`` column grades exactly like a
+# PostgreSQL one. Schema Conversion does not: its MySQL note stays a RECOMMENDATION (as it
+# always has been for LONGTEXT/LONGBLOB), while the PostgreSQL note for bytea/json/jsonb
+# is a LOSS (``converter._oversized_lob_warning`` vs ``_pg_oversized_lob_warning``).
 _PG_LOB_DELIBERATELY_LARGE = frozenset({"bytea", "json", "jsonb"})
 
 
@@ -1164,7 +1176,7 @@ class TooManyKeyColumnsRule(Rule):
 
 
 class OversizedLobRule(Rule):
-    """Flag columns whose MySQL LOB/TEXT type can exceed the DSQL 1 MiB limit."""
+    """Flag columns whose MySQL LOB/TEXT or JSON type can exceed the DSQL 1 MiB limit."""
 
     rule_id = "OVERSIZED_LOB"
 
@@ -1183,10 +1195,21 @@ class OversizedLobRule(Rule):
                         object=ObjectKey(KIND_TABLE, table.name),
                         rule_id=self.rule_id,
                         classification=Classification.MANUAL,
+                        # The dead letter is per row only while the change event still
+                        # fits the Kafka producer limit (MaxMessageBytes, 4 MiB by default
+                        # in deploy/cdc-stack). A larger event fails the single-task source
+                        # connector (it sets no errors.tolerance), which stops capture for
+                        # every table. binlog_row_image=FULL (a CDC prerequisite) puts the
+                        # value in both images of an UPDATE, so a ~2 MiB document is enough.
                         risk=(
-                            f"Columns ({names}) use a large MySQL LOB/TEXT type "
-                            "whose values can exceed the Aurora DSQL 1 MiB limit "
-                            "for text/bytea; an oversized value fails to load."
+                            f"Columns ({names}) use a large MySQL LOB/TEXT or JSON type "
+                            "whose values can exceed the Aurora DSQL 1 MiB per-value "
+                            "limit. An oversized value cannot be stored: the row is "
+                            "quarantined during Full Load or dead-lettered during CDC, "
+                            "and reloading cannot fix it. A change event larger than "
+                            "the CDC message limit (4 MiB by default; an UPDATE carries "
+                            "the value twice) is not dead-lettered: it stops CDC for "
+                            "every table until the column is excluded at capture."
                         ),
                         # "Confirm no value exceeds 1 MiB" was homework the tool can now
                         # do: the Data Migration prerequisite checks probe each column
@@ -1198,10 +1221,10 @@ class OversizedLobRule(Rule):
                             "column's limit. If one does, move the content to external "
                             "storage (e.g. Amazon S3) and store a reference instead, or "
                             "exclude the column on the Data Migration step. For a TEXT "
-                            "family column the limit applies to the COMPRESSED size "
-                            "(outside a key), so a highly compressible value may still "
-                            "fit; a BLOB family column becomes bytea, which Aurora DSQL "
-                            "does not compress."
+                            "family or JSON column the limit applies to the COMPRESSED "
+                            "size (outside a key), so a highly compressible value may "
+                            "still fit; a BLOB family column becomes bytea, which Aurora "
+                            "DSQL does not compress."
                         ),
                         effort=EffortLevel.MEDIUM,
                     )

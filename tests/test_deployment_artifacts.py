@@ -2670,3 +2670,113 @@ def test_the_manual_never_names_the_removed_oversized_lob_card() -> None:
                             r"DSQL에서 NULL입니다|除外した列は Aurora DSQL では NULL になります")
     assert [str(p.relative_to(root)) for p in sorted(root.rglob("*.md"))
             if overclaims.search(p.read_text(encoding="utf-8"))] == []
+
+
+def test_the_manual_lists_every_mysql_oversized_lob_type() -> None:
+    """G13: the manual (en/ko/ja) must list every MySQL type the tool flags as an
+    oversized-LOB candidate -- MySQL JSON included -- and no longer tell the reader that
+    MySQL JSON is "not highlighted"."""
+    from pathlib import Path
+
+    from dsql_migrator.core.assessor import _OVERSIZED_LOB_BASES
+
+    root = Path(__file__).resolve().parent.parent / "docs" / "manual"
+    not_highlighted = {"en": "does not highlight", "ko": "강조 표시하지 않는", "ja": "強調表示しない"}
+    for lang, marker in not_highlighted.items():
+        ch13 = (root / lang / "13-excluding-tables-and-columns.md").read_text(encoding="utf-8")
+        (bullet,) = [ln for ln in ch13.splitlines() if ln.startswith("- **MySQL:**")]
+        for base in sorted(_OVERSIZED_LOB_BASES):
+            assert f"`{base}`" in bullet, (lang, base)
+        paragraph = ch13[ch13.index(marker) :].split("\n\n", 1)[0]
+        assert "JSON" not in paragraph, (lang, paragraph)
+        ch06 = (root / lang / "06-limitations.md").read_text(encoding="utf-8")
+        assert "`LONGTEXT`/`JSON`" in ch06, lang
+        ch02 = (root / lang / "02-evaluation-and-schema-conversion.md").read_text(
+            encoding="utf-8"
+        )
+        (row,) = [ln for ln in ch02.splitlines() if ln.startswith("| `JSON` |")]
+        assert "OVERSIZED_LOB" in row and "1 MiB" in row, (lang, row)
+
+
+def test_the_manual_triage_files_oversized_lob_under_manual_not_unsupported() -> None:
+    """G13 review: the assessor grades OVERSIZED_LOB MANUAL and tells the reader to check
+    sizes first, but ch02 "How to use the report" step 1 (UNSUPPORTED: "these block a
+    clean migration") said to "exclude or split oversized LOB columns" -- with MySQL JSON
+    now flagged, that told a reader with ordinary small JSON columns to exclude them (they
+    would migrate as NULL). ch10 §10.2 listed "oversized LOBs" as UNSUPPORTED too. The
+    three languages must file it under MANUAL, with the size check first."""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent / "docs" / "manual"
+    headings = {
+        "en": "### How to use the report",
+        "ko": "### 리포트 활용법",
+        "ja": "### レポートの活用方法",
+    }
+    for lang, heading in headings.items():
+        ch02 = (root / lang / "02-evaluation-and-schema-conversion.md").read_text(
+            encoding="utf-8"
+        )
+        section = ch02[ch02.index(heading) :].split("\n> ", 1)[0]
+        steps = {
+            int(m.group(1)): " ".join(m.group(2).split())
+            for m in re.finditer(r"^(\d)\. (.*?)(?=^\d\. |\Z)", section, re.S | re.M)
+        }
+        assert "UNSUPPORTED" in steps[1] and "MANUAL" in steps[2], (lang, steps)
+        assert "LOB" not in steps[1], (lang, steps[1])
+        assert "LOB" in steps[2] and "OVERSIZED_LOB" in steps[2], (lang, steps[2])
+        assert "Check sizes" in steps[2], (lang, steps[2])
+        ch10 = (root / lang / "10-conclusion.md").read_text(encoding="utf-8")
+        m = re.search(r"\*\*UNSUPPORTED\*\*\s*(?:item|項目|항목)\s*[（(]([^)）]*)[)）]", ch10)
+        assert m, lang
+        assert "LOB" not in m.group(1), (lang, m.group(1))
+        m = re.search(r"\*\*MANUAL\*\*\s*(?:item|項目|항목)\s*[（(]([^)）]*)[)）]", ch10)
+        assert m and "LOB/JSON" in m.group(1).replace("LOB·JSON", "LOB/JSON"), lang
+
+
+def test_the_manual_matches_the_popup_on_size_results_and_typeless_quarantines() -> None:
+    """G13 review, ch13 en/ko/ja. (1) The prerequisite run's SOURCE_VALUE_SIZE answers DO
+    show in the popup (DataMigrationState.set_prereq_report fills its size cache), but the
+    manual said they were "not shown here" and that only Check sizes turns the row line
+    warning. (2) A quarantine reason that names no type (DSQL's 54000 "maximum column size
+    exceeded") also opens the filtered LOB section, but the manual said that happens only
+    when "the database reported only a type"."""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent / "docs" / "manual"
+    expect = {
+        "en": (
+            ("whose result is not shown here", "reported only a type"),
+            (
+                "a column they measured shows that result here too",
+                "once a size check (**Check sizes** or the prerequisite checks)",
+                "it names no type, as with `maximum column size exceeded`",
+            ),
+        ),
+        "ko": (
+            ("그 결과는 여기에 표시되지 않습니다", "타입만 보고"),
+            (
+                "사전 점검이 측정한 컬럼은 그 결과가 여기에도 표시됩니다",
+                "크기 점검(**Check sizes** 또는 사전 점검)이",
+                "`maximum column size exceeded`처럼 타입을 밝히지 않거나",
+            ),
+        ),
+        "ja": (
+            ("その結果はここには表示されません", "型だけを報告"),
+            (
+                "前提条件チェックが測定した列は、その結果がここにも表示されます",
+                "サイズチェック(**Check sizes** または前提条件チェック)が",
+                "`maximum column size exceeded` のように型を示さない",
+            ),
+        ),
+    }
+    for lang, (gone, present) in expect.items():
+        text = (root / lang / "13-excluding-tables-and-columns.md").read_text(encoding="utf-8")
+        # Undo the hard wrap: a line break is a space in en/ko, nothing in ja.
+        flat = re.sub(r"[ \t]*\n[ \t]*", "" if lang == "ja" else " ", text)
+        for phrase in gone:
+            assert phrase not in flat, (lang, phrase)
+        for phrase in present:
+            assert phrase in flat, (lang, phrase)

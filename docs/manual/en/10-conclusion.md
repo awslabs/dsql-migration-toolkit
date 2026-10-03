@@ -37,9 +37,9 @@ replication; otherwise Full Load alone is simpler and cheaper.
 
 1. **Connect** to source (read-only) and target (DSQL, IAM-token).
 2. **Evaluation** — read the compatibility report. Resolve every **UNSUPPORTED**
-   item (PK, triggers, routines, spatial types, precision > 38, oversized LOBs)
-   and decide each **MANUAL** item (cascade FKs that CDC can't replicate,
-   partitioning, `ENUM`/`SET`, etc.).
+   item (PK, triggers, routines, spatial types, precision > 38) and decide each
+   **MANUAL** item (cascade FKs that CDC can't replicate, partitioning,
+   `ENUM`/`SET`, oversized LOB/JSON columns — check their sizes first, etc.).
    *Don't skip this* — it's what turns "the load failed mysteriously" into "I knew
    that object needed changing." It is also where you learn whether CDC is viable
    at all: a source cascade (`ON DELETE/UPDATE CASCADE`) never reaches the binary

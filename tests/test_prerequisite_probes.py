@@ -558,6 +558,70 @@ def test_json_columns_are_measured_by_casting_because_octet_length_has_no_overlo
     assert 'octet_length("notes"::text)' not in joined, joined
 
 
+class _MySqlSizeProbeConn(_SizeProbeConn):
+    """Rejects PostgreSQL ``::`` cast syntax the way MySQL does (error 1064)."""
+
+    def execute(self, statement, params=None):  # noqa: ANN001, ANN201
+        if "::" in str(statement):
+            self.statements.append(" ".join(str(statement).split()))
+            raise RuntimeError(
+                "(1064, 'You have an error in your SQL syntax; check the manual that "
+                "corresponds to your MySQL server version')"
+            )
+        return super().execute(statement, params)
+
+
+def test_a_mysql_json_column_is_measured_without_the_postgres_cast() -> None:
+    """G13: the PostgreSQL json cast (``col::text``) does not parse on MySQL.
+
+    Applied to a MySQL JSON column it failed with 1064, the per-column handler swallowed
+    it, and the column read "not determined" on every run -- invisible to a fake that does
+    not parse SQL. On MySQL ``OCTET_LENGTH(col)`` measures JSON's utf8mb4 serialization
+    directly, with the same bounds as every other column.
+    """
+    from dsql_migrator.core.models import SourceType
+
+    mib = 1024 * 1024
+    conn = _MySqlSizeProbeConn(set())
+    answer = _size_probe(SourceType.MYSQL, conn).oversized_values(
+        "ecommerce.users",
+        ["metadata", "bio"],
+        limit_bytes=mib,
+        timeout_seconds=15.0,
+        column_types={"metadata": "json", "bio": "longtext"},
+    )
+    assert answer == {"metadata": False, "bio": False}, answer
+    joined = " ".join(conn.statements)
+    assert (
+        "SELECT EXISTS (SELECT 1 FROM `ecommerce`.`users` WHERE OCTET_LENGTH(`metadata`) "
+        "> :limit)"
+    ) in joined, joined
+    assert "::" not in joined and "CAST(" not in joined, joined
+    # Still bounded: the cap is re-armed for each column, the limit is BOUND (never
+    # formatted into the SQL), and each column ends its own transaction.
+    assert sum("MAX_EXECUTION_TIME = 15000" in s for s in conn.statements) == 2
+    assert [b.get("limit") for b in conn.bound] == [mib, mib], conn.bound
+    assert "1048576" not in joined, joined
+    assert conn.rollbacks == 1, conn.rollbacks
+
+
+def test_every_mysql_oversized_type_gets_mysql_syntax() -> None:
+    """Whatever joins the MySQL oversized set, its size probe must be MySQL SQL."""
+    from dsql_migrator.core.assessor import _OVERSIZED_LOB_BASES
+    from dsql_migrator.core.models import SourceType
+
+    for base in sorted(_OVERSIZED_LOB_BASES):
+        conn = _SizeProbeConn(set())
+        _size_probe(SourceType.MYSQL, conn).oversized_values(
+            "shop.t", ["c"], limit_bytes=1024 * 1024, timeout_seconds=5.0,
+            column_types={"c": base},
+        )
+        assert all("::" not in s for s in conn.statements), (base, conn.statements)
+        assert any("OCTET_LENGTH(`c`) > :limit" in s for s in conn.statements), (
+            base, conn.statements,
+        )
+
+
 def test_each_column_is_probed_against_its_own_type_limit() -> None:
     """A flat 1 MiB overstated an unbounded varchar's headroom 16-fold."""
     from dsql_migrator.core.models import SourceType

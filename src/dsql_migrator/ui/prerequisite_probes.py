@@ -156,9 +156,12 @@ class SessionSourceProbe:
         never disposed here. ``should_cancel`` is checked before each column: a cancelled
         pass stops after the current column, and the rest are simply not measured.
 
-        ``octet_length`` has no json/jsonb overload (verified: ``function
+        On PostgreSQL ``octet_length`` has no json/jsonb overload (verified: ``function
         octet_length(jsonb) does not exist``), which is exactly how that cascade started, so
-        those are measured as ``octet_length(col::text)``.
+        those are measured as ``octet_length(col::text)``. That cast is PostgreSQL-only: a
+        MySQL JSON column is measured as plain ``OCTET_LENGTH(col)`` (its utf8mb4
+        serialization), because ``::`` does not parse on MySQL and the failure would be
+        swallowed into "not determined" for every JSON column.
 
         Measures the UNCOMPRESSED byte length, which is an upper bound: DSQL's limit
         applies to the compressed size for the character and json types (outside a key), so
@@ -176,7 +179,6 @@ class SessionSourceProbe:
         # Identifiers cannot be bind parameters; the names come from the tool's own
         # introspected inventory (never from user text), and are quoted for the engine.
         is_postgres = self._config.source_type is SourceType.POSTGRES
-        length_fn = "octet_length" if is_postgres else "OCTET_LENGTH"
         if is_postgres:
             schema, _, obj = table_name.partition(".")
             qualified = (
@@ -211,7 +213,9 @@ class SessionSourceProbe:
                     ):
                         break
                     measured = self._measured_expression(
-                        length_fn, quote(name), (column_types or {}).get(name, "")
+                        quote(name),
+                        (column_types or {}).get(name, ""),
+                        is_postgres=is_postgres,
                     )
                     statement = text(
                         "SELECT EXISTS (SELECT 1 FROM "
@@ -255,18 +259,29 @@ class SessionSourceProbe:
         return True
 
     @staticmethod
-    def _measured_expression(length_fn: str, quoted: str, column_type: str) -> str:
+    def _measured_expression(quoted: str, column_type: str, *, is_postgres: bool) -> str:
         """The byte-length expression to measure a column of ``column_type`` with.
 
-        ``octet_length`` accepts text and bytea but has NO json/jsonb overload, so a jsonb
-        column raised ``function octet_length(jsonb) does not exist`` -- the failure that
-        aborted the whole probe transaction. Casting to text measures the document's
-        serialized bytes, which is what the value costs on the target.
+        PostgreSQL: ``octet_length`` accepts text and bytea but has NO json/jsonb overload,
+        so a jsonb column raised ``function octet_length(jsonb) does not exist`` -- the
+        failure that aborted the whole probe transaction. Casting to text measures the
+        document's serialized bytes, which is what the value costs on the target.
+
+        MySQL: plain ``OCTET_LENGTH(col)`` for every type, JSON included. On a JSON column
+        it measures MySQL's utf8mb4 serialization of the document whatever the connection
+        charset -- the spaced form the Full Load reads and writes, and in practice an upper
+        bound for the compact form CDC writes. ``CAST(col AS CHAR)`` is avoided because it
+        follows ``character_set_connection``, and the PostgreSQL ``::text`` cast does not
+        parse on MySQL at all (error 1064), which the per-column handler would swallow into
+        "not determined" forever. The engine is an explicit argument, never inferred from
+        the spelling of a function name.
         """
+        if not is_postgres:
+            return f"OCTET_LENGTH({quoted})"
         base = (column_type or "").strip().lower().split("(", 1)[0].strip()
         if base in {"json", "jsonb"}:
-            return f"{length_fn}({quoted}::text)"
-        return f"{length_fn}({quoted})"
+            return f"octet_length({quoted}::text)"
+        return f"octet_length({quoted})"
 
     @staticmethod
     def _apply_statement_timeout(
