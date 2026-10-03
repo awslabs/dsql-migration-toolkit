@@ -15,8 +15,11 @@ value is as-of one point):
   (MySQL 8.2+/8.4), falling back to ``SHOW MASTER STATUS`` (<= 8.0.x),
 - the GTID set (``@@GLOBAL.gtid_executed``),
 - the source ``@@GLOBAL.server_uuid``,
-- a UTC snapshot timestamp, and
-- per-table row counts.
+- a UTC snapshot timestamp,
+- per-table row counts, and
+- a short per-table start-point fingerprint of the migrated tables' column definitions
+  (:func:`read_start_point_fingerprints`, read just BEFORE the binlog position), which
+  Start CDC compares with the source before a ``snapshot.mode=recovery`` start.
 
 Global consistency is obtained with ``START TRANSACTION WITH CONSISTENT
 SNAPSHOT`` (InnoDB, REPEATABLE READ): a single reader sees all tables at one
@@ -269,6 +272,36 @@ def max_pk_source(
     return out
 
 
+def read_start_point_fingerprints(
+    connection: _Connection, tables: "list[str]"
+) -> "dict[str, str]":
+    """The CDC start-point fingerprint of each qualified MySQL table in ``tables``.
+
+    ONE bounded catalog statement (``information_schema.COLUMNS`` + ``STATISTICS``, the
+    statement the CDC catalog-drift check runs, ``MAX_EXECUTION_TIME`` 8 s) -- never a data
+    scan. No qualified name -> no statement and ``{}``. Graceful degradation: any failure
+    other than :class:`ReadOnlySourceError` returns ``{}`` (Start CDC then warns that it
+    cannot check the tables) and never fails the capture. A table the read does not see
+    gets no entry.
+    """
+    from dsql_migrator.core.cdc_catalog_drift import (
+        read_live_catalog,
+        split_qualified,
+        start_point_fingerprints,
+    )
+
+    names = sorted({str(t) for t in tables or () if t and split_qualified(str(t))})
+    if not names:
+        return {}
+    try:
+        live = read_live_catalog(connection, names, source_type=None)
+    except ReadOnlySourceError:
+        raise
+    except Exception:  # noqa: BLE001 - optional record; degrade to "no fingerprint"
+        return {}
+    return start_point_fingerprints(live)
+
+
 def capture_watermark(
     connection: _Connection,
     tables: list[str],
@@ -281,6 +314,10 @@ def capture_watermark(
     transaction so the binlog/GTID coordinates and the per-table row counts are
     all as-of a single point. The transaction is committed before returning.
 
+    The start-point fingerprints are read immediately BEFORE the binlog position, so a
+    schema change racing the capture can only make Start CDC refuse a start point it
+    could have used -- never pass one whose older rows the tables no longer describe.
+
     ``now`` is injectable to make the snapshot timestamp deterministic in tests;
     it defaults to the current UTC time.
     """
@@ -289,6 +326,7 @@ def capture_watermark(
     connection.execute(text(START_CONSISTENT_SNAPSHOT))
     try:
         snapshot_timestamp = clock()
+        table_fingerprints = read_start_point_fingerprints(connection, tables)
         binlog_file, binlog_position, gtid_from_master = _read_master_status(
             connection
         )
@@ -311,6 +349,7 @@ def capture_watermark(
         snapshot_timestamp=snapshot_timestamp,
         table_row_counts=table_row_counts,
         row_counts_approximate=True,
+        table_fingerprints=table_fingerprints,
     )
 
 
@@ -429,6 +468,7 @@ def binlog_resume_gap_reason(
 __all__ = [
     "WatermarkCapturer",
     "capture_watermark",
+    "read_start_point_fingerprints",
     "count_source_rows",
     "estimate_source_rows",
     "max_pk_source",

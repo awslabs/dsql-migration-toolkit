@@ -975,7 +975,9 @@ def cdc_has_committed_offset(parameters: "Optional[Mapping[str, str]]") -> bool:
     is why "committed" alone does not mean "resumes" (see ``cdc_start_resumes``). A
     watermark is otherwise needed only for the FIRST start, when the offsets topic is
     empty and the connector would begin at the source's current binlog and silently lose
-    everything since the Full Load.
+    everything since the Full Load. On MySQL such a resume runs ``snapshot.mode=
+    schema_only`` (``core.cdc.mysql_snapshot_mode``): the schema-history topic survives the
+    Stop too, so Debezium replays it rather than rebuilding it from the current tables.
 
     The signal is ``DeploySink == "true"`` while the bootstrap is blank, and it is
     unambiguous because of how the two writes differ: the infra create pins
@@ -1007,6 +1009,87 @@ def cdc_deployed_watermark(
     f = str(params.get("WatermarkBinlogFile", "") or "").strip()
     p = str(params.get("WatermarkBinlogPos", "") or "").strip()
     return (f, p) if f and p else None
+
+
+def cdc_live_snapshot_mode(parameters: "Optional[Mapping[str, str]]") -> Optional[str]:
+    """The SnapshotMode of a stack whose connectors EXIST, else None. Pure.
+
+    Connectors exist exactly while ``MskBootstrapServers`` is set (Stop blanks it, which
+    deletes them; the parameter itself is carried forward). Only the two values the
+    template allows count; anything else reads as "unknown" (None).
+    """
+    params = parameters or {}
+    if not str(params.get("MskBootstrapServers", "") or "").strip():
+        return None
+    mode = str(params.get("SnapshotMode", "") or "").strip()
+    return mode if mode in ("recovery", "schema_only") else None
+
+
+def start_resumes_committed_offset(
+    seed, *, has_committed_offset: bool, deployed_watermark, source_type
+) -> bool:
+    """Will a Start RESUME the stack's committed offset rather than seed ``seed``? Pure.
+
+    The truth table behind ``_cdc_ui.cdc_start_resumes``. ``seed`` is what the Start offers
+    the offset seeder (the job watermark, or a Manual binlog point). The seeder moves the
+    committed offset FORWARD to it unless the offset is already at/past it (no-clobber). A
+    stopped stack's offset is at/past the watermark it was last seeded from
+    (``deployed_watermark``), so the seed is skipped -- a resume -- when it is at or before
+    that one, judged by the seeders' own comparison
+    (:func:`~dsql_migrator.core.cdc_kafka_prep.offset_already_at_or_past`: numeric binlog
+    sequence, then position). A newer seed, or one judged against an unknown deployed
+    watermark, is a seeded start. PostgreSQL resumes whenever an offset is committed.
+    """
+    from dsql_migrator.core.cdc_kafka_prep import offset_already_at_or_past
+    from dsql_migrator.core.models import SourceType
+
+    if not has_committed_offset:
+        return False
+    if source_type is SourceType.POSTGRES:
+        return True
+    f = getattr(seed, "binlog_file", None) if seed is not None else None
+    p = getattr(seed, "binlog_position", None) if seed is not None else None
+    if not f or p is None:
+        return True
+    if not deployed_watermark:
+        return False
+    try:
+        return offset_already_at_or_past(
+            {"file": deployed_watermark[0], "pos": deployed_watermark[1]},
+            {"file": f, "pos": p},
+        )
+    except (TypeError, ValueError):  # a malformed deployed parameter: not provably a resume
+        return False
+
+
+def mysql_start_facts_from(
+    seed, *, has_committed_offset: bool, deployed_watermark, live_mode, history_missing
+):
+    """The :class:`~dsql_migrator.core.cdc.MysqlStartFacts` for a MySQL Start of ``seed``. Pure."""
+    from dsql_migrator.core.cdc import MysqlStartFacts
+    from dsql_migrator.core.models import SourceType
+
+    return MysqlStartFacts(
+        resumes=start_resumes_committed_offset(
+            seed,
+            has_committed_offset=bool(has_committed_offset),
+            deployed_watermark=deployed_watermark,
+            source_type=SourceType.MYSQL,
+        ),
+        live_mode=live_mode if live_mode in ("recovery", "schema_only") else None,
+        history_missing=bool(history_missing),
+    )
+
+
+def mysql_start_facts_from_params(seed, parameters, *, history_missing: bool):
+    """:func:`mysql_start_facts_from` over ONE describe's stack parameters. Pure."""
+    return mysql_start_facts_from(
+        seed,
+        has_committed_offset=cdc_has_committed_offset(parameters),
+        deployed_watermark=cdc_deployed_watermark(parameters),
+        live_mode=cdc_live_snapshot_mode(parameters),
+        history_missing=history_missing,
+    )
 
 
 def _probe_cdc_stack_phase(migration_state, session) -> None:
@@ -1063,6 +1146,11 @@ def _probe_cdc_stack_phase(migration_state, session) -> None:
     migration_state.set_cdc_deployed_watermark(
         cdc_deployed_watermark(getattr(discovery, "current_parameters", None))
     )
+    # The live SnapshotMode while connectors exist (MySQL), from the SAME describe: a
+    # Start on such a stack keeps it (core.cdc.mysql_snapshot_mode).
+    _set_mode = getattr(migration_state, "set_cdc_deployed_snapshot_mode", None)
+    if callable(_set_mode):
+        _set_mode(cdc_live_snapshot_mode(getattr(discovery, "current_parameters", None)))
     # Reconcile the replicated table set from the live stack's TableIncludeList
     # (source connector's table.include.list = each table's ``.name``), so an
     # ADOPTED / out-of-band pipeline resolves its tables even when this session
@@ -2764,6 +2852,67 @@ def read_cdc_catalog_drift_once(session, request) -> object:
         )
     except Exception as exc:  # noqa: BLE001 - unreadable is a state, not a crash
         return _failed(PROBE_READ_FAILED, type(exc).__name__[:64])
+
+
+def read_cdc_start_point_once(session, names, recorded) -> object:
+    """ONE bounded read of the captured tables' source definitions, checked against their
+    CDC start-point fingerprints ``recorded`` (BLOCKING; never raises; MySQL).
+
+    Returns a :class:`~dsql_migrator.ui.cdc_start_point_gate.StartPointVerdict`. Nothing is
+    read without fingerprints (``unverified`` / ``no-baseline``) or without a table
+    (``ok``); without a source connection (no config, or no password: it is kept in memory
+    only) it reports ``unreadable`` / ``no-source-connection`` without connecting. The read
+    is the catalog-drift statement (``read_live_catalog``) through the read-only source
+    engine with the same 10 s bound, disposed after it; the comparison runs here and the
+    live rows are dropped with it. A failure keeps only the exception's CLASS name
+    (Property 7).
+    """
+    from dsql_migrator.core.cdc_catalog_drift import (
+        check_start_point,
+        read_live_catalog,
+        start_point_comparable,
+    )
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.cdc_start_point_gate import (
+        PROBLEM_NO_BASELINE,
+        PROBLEM_NO_SOURCE,
+        PROBLEM_READ_FAILED,
+        StartPointVerdict,
+        verdict_from_check,
+    )
+
+    recorded = dict(recorded or {})
+    wanted = sorted({str(n) for n in (names or ()) if n})
+    if not wanted:
+        return StartPointVerdict(kind="ok")
+    if not recorded:
+        return StartPointVerdict(
+            kind="unverified", unverified=tuple(wanted), problem=PROBLEM_NO_BASELINE
+        )
+    if not any(start_point_comparable(recorded.get(name)) for name in wanted):
+        # Nothing to compare (none recorded for the captured tables, or only values of
+        # another fingerprint version): no read, and never a refusal for a check that
+        # cannot run.
+        return StartPointVerdict(kind="unverified", unverified=tuple(wanted))
+    source_config = getattr(session, "source_config", None)
+    password = getattr(session, "source_password", None)
+    if source_config is None or password is None:
+        return StartPointVerdict(kind="unreadable", problem=PROBLEM_NO_SOURCE)
+    try:
+        engine = make_source_engine_factory(
+            password, read_timeout_seconds=_CATALOG_DRIFT_READ_TIMEOUT_SECONDS
+        )(source_config)
+        try:
+            with engine.connect() as connection:
+                live = read_live_catalog(connection, wanted, source_type=SourceType.MYSQL)
+        finally:
+            engine.dispose()
+    except Exception as exc:  # noqa: BLE001 - unreadable is a state, not a crash
+        return StartPointVerdict(
+            kind="unreadable", problem=PROBLEM_READ_FAILED,
+            error_class=type(exc).__name__[:64],
+        )
+    return verdict_from_check(check_start_point(recorded, live, wanted))
 
 
 # Tailwind tone -> (border, background, icon-color, icon) for the health cards.

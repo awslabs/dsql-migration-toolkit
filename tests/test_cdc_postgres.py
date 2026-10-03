@@ -706,3 +706,32 @@ def test_no_reachable_state_produces_initial_snapshot_with_autocreate_disabled()
     # Both legitimate pairs really do occur in that sweep -- otherwise the assertions above
     # could be passing because nothing interesting was exercised.
     assert seen == {("initial", "filtered"), ("never", "disabled")}, seen
+
+
+def test_dispatch_passes_start_facts_to_mysql_only() -> None:
+    # G5: the MySQL snapshot-mode facts flow to the MySQL builder; PostgreSQL ignores them
+    # (its mode comes from pg_snapshot_mode alone) and its params still drop SnapshotMode.
+    from dsql_migrator.core.cdc import MysqlStartFacts
+
+    facts = MysqlStartFacts(resumes=True, live_mode="schema_only")
+    for wm in (_wm(wal_lsn="3/AF012B8", slot_name="dsqlmig_s9"), _wm(wal_lsn="3/AF012B8")):
+        kwargs = dict(database="app", stack_name="mysql-dsql-cdc-stack")
+        plain = dispatch_source_config(SourceType.POSTGRES, _tables(), wm, **kwargs)
+        with_facts = dispatch_source_config(
+            SourceType.POSTGRES, _tables(), wm, start_facts=facts, **kwargs
+        )
+        assert with_facts == plain
+        params = dict(dispatch_cdc_stack_params(
+            with_facts, _sink(), target_endpoint="ep", stack_name="mysql-dsql-cdc-stack",
+        ).filled)
+        assert "SnapshotMode" not in params
+    mysql_wm = Watermark(
+        binlog_file="mysql-bin.000001", binlog_position=4,
+        snapshot_timestamp=datetime.now(timezone.utc),
+    )
+    assert dispatch_source_config(SourceType.MYSQL, _tables(), mysql_wm).snapshot_mode == (
+        "recovery"
+    )
+    assert dispatch_source_config(
+        SourceType.MYSQL, _tables(), mysql_wm, start_facts=MysqlStartFacts(resumes=True)
+    ).snapshot_mode == "schema_only"

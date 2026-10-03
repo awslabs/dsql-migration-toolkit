@@ -30,12 +30,12 @@ cut-over where a short freeze is acceptable, Full Load alone is enough.
   scoped to exactly the migrated tables.
 - **Amazon MSK (Kafka)** is the durable backbone: **one topic per table**, keyed
   by primary key (so all changes for a row stay ordered on one partition), plus a
-  dead-letter (DLQ) topic, a Debezium **schema-history** topic (what `recovery`
-  rebuilds — **MySQL source only**; the PostgreSQL/pgoutput connector has no
-  schema-history topic), and a **heartbeat** topic that keeps the committed source
-  position advancing during idle windows — the binlog offset for MySQL, and for
-  PostgreSQL the slot's confirmed LSN (which also stops WAL accumulating) — so a
-  restart can still resume gaplessly.
+  dead-letter (DLQ) topic, a Debezium **schema-history** topic (built by `recovery`
+  at a new start point and replayed on a restart — **MySQL source only**; the
+  PostgreSQL/pgoutput connector has no schema-history topic), and a **heartbeat**
+  topic that keeps the committed source position advancing during idle windows — the
+  binlog offset for MySQL, and for PostgreSQL the slot's confirmed LSN (which also
+  stops WAL accumulating) — so a restart can still resume gaplessly.
 - **The custom DSQL sink connector** — a Java Kafka Connect plugin this project
   owns — applies the changes to DSQL. Both connectors run on **managed MSK
   Connect**; the tool runs **no sink compute of its own**, it is the control
@@ -179,12 +179,17 @@ the bulk load and the stream.
    > read a second time. See [Chapter 10 §10.1](10-conclusion.md) for choosing between
    > them. On MySQL the binary log retains history with no consumer, so a later CDC
    > start resumes from the watermark with no re-read.
-3. **For a MySQL source**, the source connector runs with
-   **`snapshot.mode=recovery`**: because an offset is already seeded, Debezium
-   rebuilds its internal **schema history** from the **current source tables** (so
-   it can decode binlog events) **without re-reading any row data**, then resumes
-   from the seeded offset. **For a PostgreSQL source**, the Debezium pgoutput
-   connector has no schema-history topic: on the gapless path it runs with
+3. **For a MySQL source**, a Start at a **new start point** — the first Start, a
+   Start after a newer Full Load or Manual point, or the first Start after Delete CDC
+   infrastructure — runs the source connector with **`snapshot.mode=recovery`**:
+   because an offset is already seeded, Debezium rebuilds its internal **schema
+   history** from the **current source tables** (so it can decode binlog events)
+   **without re-reading any row data**, then resumes from the seeded offset. Start
+   CDC first checks that the captured tables have not changed since that start point
+   ([Chapter 6](06-limitations.md)). A **restart after Stop CDC** runs
+   **`snapshot.mode=schema_only`** instead: it replays the recorded schema history
+   and applies any DDL in binlog order. **For a PostgreSQL source**, the Debezium
+   pgoutput connector has no schema-history topic: on the gapless path it runs with
    **`snapshot.mode=never`** (the logical slot already holds the start LSN and the
    rows are loaded), while a stand-alone / manual start uses **`initial`** (snapshot
    then stream). Debezium PostgreSQL can only resume from the slot's own
@@ -210,14 +215,18 @@ retry can't create duplicates.
 > invalidated), gapless resume is broken and you must re-run Full Load to capture a
 > fresh watermark.
 
-> **Why `recovery` and not a plain schema-only start? (MySQL source)** With a
-> seeded offset present, Debezium takes its "resume" path and expects an existing
-> schema-history topic. `recovery` is the mode that rebuilds that history from the
-> live database without re-snapshotting rows — exactly the "I already loaded the
-> data myself, just resume from this offset" situation. **This does not apply to a
-> PostgreSQL source:** PG has no schema-history topic, so Debezium simply resumes
-> from the pre-created logical slot with `snapshot.mode=never` (or does an
-> `initial` snapshot for a stand-alone start).
+> **Why `recovery` at a new start point and `schema_only` on a restart? (MySQL
+> source)** With a seeded offset present, Debezium takes its "resume" path and
+> expects an existing schema-history topic, which a new start point does not have
+> yet. `recovery` builds that history from the live database without re-snapshotting
+> rows — exactly the "I already loaded the data myself, just resume from this offset"
+> situation — provided the tables have not changed since the offset, hence the
+> pre-start check. On a restart the history already exists and is replayed instead: a
+> rebuild would read the older rows with today's definitions. If the history is
+> missing, that Start fails loudly and the next Start (after Stop CDC, if its
+> connectors are still listed) uses `recovery` after the same check. **This does not apply to a PostgreSQL source:** PG has no schema-history
+> topic, so Debezium simply resumes from the pre-created logical slot with
+> `snapshot.mode=never` (or does an `initial` snapshot for a stand-alone start).
 
 ---
 

@@ -831,3 +831,87 @@ def test_a_unique_conflict_no_longer_claims_the_target_table_is_missing() -> Non
     assert "Rows may be missing from the target" in blob
     assert "Target table missing" not in blob
     assert "Source schema change detected" not in blob
+
+
+# ---------------------------------------------------------------------------
+# G5: ONE MySQL snapshot-mode rule (resume -> schema_only; new start point -> recovery)
+# ---------------------------------------------------------------------------
+
+
+def test_build_source_config_resume_of_a_stopped_stack_uses_schema_only() -> None:
+    # A re-Start after Stop resumes the committed offset with the schema history intact:
+    # recovery would rebuild that history from the tables AS THEY ARE NOW and read older
+    # rows with it (12a-12c), schema_only replays the recorded history in binlog order.
+    from dsql_migrator.core.cdc import MysqlStartFacts
+
+    config = CdcPipelineOrchestrator().build_source_config(
+        "src", _tables(), _watermark(), start_facts=MysqlStartFacts(resumes=True)
+    )
+    assert config.snapshot_mode == "schema_only"
+    # Without facts the choice is exactly today's (a seedable watermark -> recovery).
+    assert (
+        CdcPipelineOrchestrator().build_source_config("src", _tables(), _watermark())
+        .snapshot_mode
+        == "recovery"
+    )
+
+
+@pytest.mark.parametrize(
+    "can_seed, facts, expected",
+    [
+        # (a) connectors exist: their mode is kept, whatever else holds.
+        (True, dict(live_mode="schema_only"), "schema_only"),
+        (False, dict(live_mode="recovery"), "recovery"),
+        (True, dict(live_mode="schema_only", resumes=True, history_missing=True), "schema_only"),
+        (False, dict(live_mode="recovery", resumes=True), "recovery"),
+        # (b) a resume with its history -> schema_only.
+        (True, dict(resumes=True), "schema_only"),
+        (False, dict(resumes=True), "schema_only"),
+        # (c) a resume whose history is missing -> recovery, also with nothing to seed.
+        (True, dict(resumes=True, history_missing=True), "recovery"),
+        (False, dict(resumes=True, history_missing=True), "recovery"),
+        # (d) a new seedable start point -> recovery; (e) nothing -> schema_only.
+        (True, dict(), "recovery"),
+        (False, dict(), "schema_only"),
+        # An unknown live value is not a mode to keep.
+        (True, dict(live_mode="initial"), "recovery"),
+        # facts=None is today's rule.
+        (True, None, "recovery"),
+        (False, None, "schema_only"),
+    ],
+)
+def test_mysql_snapshot_mode_truth_table(can_seed, facts, expected) -> None:
+    from dsql_migrator.core.cdc import MysqlStartFacts, mysql_snapshot_mode
+
+    f = None if facts is None else MysqlStartFacts(**facts)
+    assert mysql_snapshot_mode(can_seed, f) == expected
+
+
+def test_start_point_check_due_only_for_recovery_without_live_connectors() -> None:
+    from dsql_migrator.core.cdc import MysqlStartFacts, start_point_check_due
+
+    assert start_point_check_due("recovery", None) is True
+    assert start_point_check_due("recovery", MysqlStartFacts()) is True
+    assert start_point_check_due("recovery", MysqlStartFacts(resumes=True, history_missing=True))
+    assert start_point_check_due("schema_only", MysqlStartFacts()) is False
+    assert start_point_check_due("schema_only", None) is False
+    # Retry CDC / a live re-Start keeps its mode and is not re-checked.
+    assert start_point_check_due("recovery", MysqlStartFacts(live_mode="recovery")) is False
+
+
+def test_cdc_seed_watermark_carries_the_manual_points_fingerprints() -> None:
+    from dsql_migrator.core.cdc import cdc_seed_watermark
+
+    now = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
+    manual = CdcResumePoint(binlog_file="mysql-bin.000042", binlog_position=4)
+    fps = {"app.orders": "1:2:0011aabb:0011223344556677"}
+    seed, origin = cdc_seed_watermark(None, manual, now=now, override_fingerprints=fps)
+    assert origin == "manual" and seed.table_fingerprints == fps
+    # The job-watermark path returns the job watermark unchanged (its OWN fingerprints).
+    job = _watermark().model_copy(update={"table_fingerprints": {"app.x": "v"}})
+    assert cdc_seed_watermark(job, None, now=now, override_fingerprints=fps) == (
+        job, "full_load"
+    )
+    # No fingerprints given -> none on the Manual seed.
+    bare, _ = cdc_seed_watermark(None, manual, now=now)
+    assert bare.table_fingerprints == {}

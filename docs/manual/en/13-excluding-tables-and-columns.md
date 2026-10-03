@@ -510,7 +510,7 @@ the set and offers only the remedies that are true for your situation:
 | Nothing has run yet (no Full Load, no CDC stack) | Not locked: edit the rules and Save. |
 | The CDC infrastructure is being deleted | Wait for the deletion to finish. The popup shows an engine-aware estimate (about 15-25 min on MySQL, 2-5 min on PostgreSQL). |
 | The CDC infrastructure is being created | Wait for the create to finish, then follow the matching "CDC stack exists" row. |
-| A CDC stack exists (deployed, streaming or stopped) and a Full Load ran | 1. Stop CDC if it streams, then **Delete CDC infrastructure** on the CDC step. 2. Use **Change & reload** for the affected tables (CDC only: switch to Full load + CDC first). 3. Deploy again and Start CDC. |
+| A CDC stack exists (deployed, streaming or stopped) and a Full Load ran | 1. Stop CDC if it streams, then **Delete CDC infrastructure** on the CDC step. 2. Use **Change & reload** for the affected tables (CDC only: switch to Full load + CDC first). 3. Deploy again and Start CDC (on MySQL, see "Starting CDC again after a delete" below). |
 | A CDC stack exists, no Full Load ran, CDC only | Stop CDC if it streams, Delete CDC infrastructure, change the rules (once CDC has streamed, only the column rules: changing the table set needs Start over), deploy again and Start CDC. Deleting the stack also deletes the stream position (see below). |
 | A CDC stack exists, and no Full Load has run yet (Full load + CDC) | Stop CDC if it streams, Delete CDC infrastructure, change the rules, deploy again, then Start Full Load. Nothing needs reloading. If CDC already streamed, choose drop and recreate in the Start Full Load dialog. |
 | No CDC stack, and a Full Load ran (Full load only or Full load + CDC) | **Change & reload** (next section). Full load only: the table set can also change (see "Changing the table set after a Full Load" below). |
@@ -526,9 +526,13 @@ More details:
   Full load only, see "Changing the table set after a Full Load" below.
 - **Starting CDC again after a delete.** On MySQL, Start CDC on Automatic re-seeds from
   the Full Load watermark (the binlog since that load must still exist; Start CDC warns
-  if it was purged). On PostgreSQL, deleting the stack drops the replication slot and
-  the publication, so choose **"Re-snapshot every table instead"** in the Start CDC
-  dialog.
+  if it was purged). Change & reload keeps that watermark, so Start CDC also refuses if
+  a captured table's definition changed since that load (for example a column the source
+  added): then Re-run Full Load for all tables with "Drop & reload" for a newer
+  watermark, or choose Manual and Fetch current position (see
+  [Chapter 6](06-limitations.md)). On PostgreSQL, deleting the stack drops the
+  replication slot and the publication, so choose **"Re-snapshot every table instead"**
+  in the Start CDC dialog.
 - **The cost of deleting a CDC-only stack.** On MySQL, the next Start CDC on Automatic
   begins at the source's current position. Changes to the captured tables made after
   the last one Aurora DSQL applied are **not** replicated. To re-copy them, switch to

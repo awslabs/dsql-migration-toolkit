@@ -398,8 +398,13 @@ def dispatch_source_config(
     resume_override: Optional[CdcResumePoint] = None,
     force_initial_snapshot: bool = False,
     message_key_columns: Optional[Mapping[str, Sequence[str]]] = None,
+    start_facts=None,
 ):
     """Build the source connector config for ``source_type`` (MySQL or PostgreSQL).
+
+    ``start_facts`` (a :class:`~dsql_migrator.core.cdc.MysqlStartFacts`) feeds the MySQL
+    ``snapshot.mode`` choice (:func:`~dsql_migrator.core.cdc.mysql_snapshot_mode`);
+    PostgreSQL ignores it -- its mode comes from :func:`pg_snapshot_mode` alone.
 
     PostgreSQL -> :func:`build_pg_source_config`. The connector must resume from the EXACT
     slot/publication the Full Load created, so it uses the names RECORDED on the watermark
@@ -450,6 +455,7 @@ def dispatch_source_config(
         column_exclude_list=column_exclude_list,
         resume_override=resume_override,
         message_key_columns=message_key_columns,
+        start_facts=start_facts,
     )
 
 

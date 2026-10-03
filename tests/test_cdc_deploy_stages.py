@@ -2432,3 +2432,164 @@ def test_a_stack_without_the_legacy_rule_refuses_with_a_remedy_that_works(monkey
     # The only in-app bypass the gate honours is the attestation; name it.
     assert "DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR=172.31.16.0/20" in msg
     assert "start again" not in msg
+
+
+# ---------------------------------------------------------------------------
+# G5: MySQL schema-history replay failures get named (recovery-mode replay)
+# ---------------------------------------------------------------------------
+
+_COLUMN_SIZE_LINE = (
+    "ERROR Error processing UPDATE of row in app.orders because it's different column "
+    "size with internal schema size 4, but UPDATE size 3, restart connector with schema "
+    "recovery mode."
+)
+_RENAME_LINE = (
+    "ERROR Trying to change column note in app.audit table, which does not exist. Query: "
+    "ALTER TABLE audit RENAME COLUMN note TO memo"
+)
+_HISTORY_MISSING_LINE = (
+    "ERROR The db history topic is missing. You may attempt to recover it by reconfiguring "
+    "the connector to recovery."
+)
+_UNKNOWN_SCHEMA_LINE = (
+    "ERROR Encountered change event 'Event{...}' at offset {...} for table app.orders whose "
+    "schema isn't known to this connector. One possible cause is an incomplete database "
+    "schema history topic."
+)
+
+
+def test_each_schema_history_signature_maps_to_its_guidance() -> None:
+    from dsql_migrator.core.cdc_deployer import _diagnose_connector_log
+
+    d1 = _diagnose_connector_log(SRC, _COLUMN_SIZE_LINE)
+    assert d1 is not None and "column count does not match" in d1
+    d2 = _diagnose_connector_log(SRC, _RENAME_LINE)
+    assert d2 is not None and "could not replay a column rename" in d2
+    assert "ANY table of the source server" in d2
+    d3 = _diagnose_connector_log(SRC, _HISTORY_MISSING_LINE)
+    assert d3 is not None and "schema history for this stack is missing" in d3
+    d4 = _diagnose_connector_log(SRC, _UNKNOWN_SCHEMA_LINE)
+    assert d4 is not None and "does not hold" in d4
+    for guidance in (d1, d2):
+        # Debezium's own advice ("restart ... with schema recovery mode") is what replays
+        # the failure: the guidance must route to a new start point, never to a restart.
+        assert "Start CDC again" not in guidance
+        assert "Fetch current position" in guidance
+        assert "Drop & reload" in guidance
+        assert "Retry CDC" in guidance  # named as a dead end, not as a remedy
+
+
+def test_recoverys_own_history_missing_info_line_is_not_a_failure() -> None:
+    from dsql_migrator.core.cdc_deployer import _diagnose_connector_log
+
+    info = (
+        "INFO The db-history topic is missing but we are in recovery snapshot mode. "
+        "Attempting to snapshot the current schema and then begin reading the redo log "
+        "from the last recorded offset."
+    )
+    assert _diagnose_connector_log(SRC, info) is None
+
+
+def test_a_replay_failure_wins_over_a_transient_link_error_in_the_same_tail() -> None:
+    from dsql_migrator.core.cdc_deployer import _diagnose_connector_log
+
+    tail = (
+        "WARN com.mysql.cj.jdbc.exceptions.CommunicationsException: Communications link "
+        f"failure\n{_COLUMN_SIZE_LINE}"
+    )
+    guidance = _diagnose_connector_log(SRC, tail)
+    assert guidance is not None and "column count does not match" in guidance
+
+
+def test_the_connection_test_needle_stays_last_and_the_new_ones_precede_link_failure() -> None:
+    from dsql_migrator.core.cdc_deployer import _CONNECTOR_LOG_DIAGNOSES
+
+    needles = [n for n, _g in _CONNECTOR_LOG_DIAGNOSES]
+    assert needles[-1] == "failed testing connection"
+    link = needles.index("communications link failure")
+    for needle in (
+        "internal schema size",
+        "trying to change column",
+        "db history topic is missing",
+        "isn't known to this connector",
+    ):
+        assert needles.index(needle) < link
+
+
+def test_only_the_two_schema_history_diagnoses_flag_a_missing_history() -> None:
+    from dsql_migrator.core.cdc_deployer import (
+        _diagnose_connector_log,
+        is_schema_history_failure,
+    )
+
+    assert is_schema_history_failure(_diagnose_connector_log(SRC, _HISTORY_MISSING_LINE))
+    assert is_schema_history_failure(_diagnose_connector_log(SRC, _UNKNOWN_SCHEMA_LINE))
+    assert not is_schema_history_failure(_diagnose_connector_log(SRC, _COLUMN_SIZE_LINE))
+    assert not is_schema_history_failure(_diagnose_connector_log(SRC, _RENAME_LINE))
+    assert not is_schema_history_failure("")
+
+
+def test_a_failed_connector_with_a_replay_signature_surfaces_it() -> None:
+    handle = _FakeHandle()
+    deployer = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "FAILED"]},
+        connector_logs={SRC: _COLUMN_SIZE_LINE},
+    )
+    with pytest.raises(CdcDeployError) as excinfo:
+        _run_start(handle, deployer)
+    assert "column count does not match" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("mode", ["recovery", "schema_only"])
+def test_run_cdc_start_logs_the_snapshot_mode_it_sends(mode) -> None:
+    src = DebeziumSourceConfig(
+        name="mysql-source", table_include_list=["cdc_demo.orders"], snapshot_mode=mode
+    )
+    sink = SinkConnectorConfig(
+        name="mysql-sink", topics=["cdc_demo.orders"], dlq_topic="dsql-sink-dlq"
+    )
+    params = build_cdc_stack_params(src, sink, target_endpoint="ep.on.aws")
+    logs: list[str] = []
+    run_cdc_start(
+        _FakeHandle(), stack_name=STACK, params=params, deployer=_FakeDeployer(),
+        on_log=lambda ts, msg: logs.append(msg), sleep=lambda _s: None,
+        connector_timeout_seconds=5.0, poll_interval_seconds=0.0,
+    )
+    assert any(line.startswith(f"Source connector snapshot.mode={mode} (") for line in logs)
+
+
+def test_the_history_diagnoses_say_to_remove_surviving_connectors_first() -> None:
+    # A schema_only resume whose source goes FAILED after the stack settled leaves the
+    # connectors in place, and a Start or Retry on them keeps schema_only: "Start CDC
+    # again" alone looped. Both history diagnoses name the removal first.
+    from dsql_migrator.core.cdc_deployer import _diagnose_connector_log, is_schema_history_failure
+
+    for line in (_HISTORY_MISSING_LINE, _UNKNOWN_SCHEMA_LINE):
+        guidance = _diagnose_connector_log(SRC, line)
+        assert "Stop CDC" in guidance and "Clean up leftover connector" in guidance
+        assert "keeps their snapshot mode and fails the same way" in guidance
+        assert is_schema_history_failure(guidance)  # the flag's marker is kept
+
+
+def test_a_history_failure_after_the_stack_settled_names_the_removal() -> None:
+    handle = _FakeHandle()
+    deployer = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "FAILED"]},
+        connector_logs={SRC: _HISTORY_MISSING_LINE},
+    )
+    with pytest.raises(CdcDeployError) as excinfo:
+        _run_start(handle, deployer)
+    msg = str(excinfo.value)
+    assert "schema history for this stack is missing" in msg
+    assert "Stop CDC" in msg and "Clean up leftover connector" in msg
+
+
+def test_the_manual_route_in_the_replay_diagnoses_says_a_reload_resets_it() -> None:
+    # Their Manual route reloads with "Drop & reload", which resets a Full load + CDC
+    # start point to Automatic -- the watermark the stack already holds, so the next Start
+    # resumes unchecked and replays the same failure unless Manual is chosen again.
+    from dsql_migrator.core.cdc_deployer import _diagnose_connector_log
+
+    for line in (_COLUMN_SIZE_LINE, _RENAME_LINE, _UNKNOWN_SCHEMA_LINE):
+        guidance = _diagnose_connector_log(SRC, line)
+        assert "back to Automatic, so choose Manual again" in guidance

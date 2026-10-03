@@ -123,6 +123,15 @@ class SessionSnapshot(BaseModel):
     cdc_start_gtid: Optional[str] = None
     cdc_start_binlog_file: Optional[str] = None
     cdc_start_binlog_pos: Optional[int] = None
+    # The Manual point's start-point fingerprints (table -> short digest, recorded by Fetch
+    # current position for exactly the coordinates above), and whether a schema_only
+    # resume found the stack's Debezium schema history missing (the next Start rebuilds
+    # it). Additive and left OUT of the payload while empty/False, so a snapshot without
+    # them still loads on an older build (this model is extra="forbid").
+    cdc_start_fingerprints: dict[str, str] = Field(
+        default_factory=dict, exclude_if=lambda v: not v
+    )
+    cdc_history_missing: bool = Field(default=False, exclude_if=lambda v: not v)
     # LOB exclusions flattened to "table:column" strings (stable, sorted).
     cdc_lob_exclusions: list[str] = Field(default_factory=list)
     cdc_connector_names: list[str] = Field(default_factory=list)

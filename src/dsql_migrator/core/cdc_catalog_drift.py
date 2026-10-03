@@ -25,6 +25,13 @@ This module is the engine-side half of the runtime re-check (``ui/cdc_catalog_dr
   compared (a change there does not change a CDC row).
 * :func:`baseline_digest` -- a short digest of the same baseline facts, so a Step 1 re-run
   that silently changes what a table is compared with is noticed too.
+* :func:`start_point_fingerprints` / :func:`check_start_point` (MySQL) -- a separate,
+  ORDER-sensitive per-table digest over EVERY column (excluded and generated included,
+  plus each column's character set), recorded with a CDC start point and compared before
+  a ``snapshot.mode=recovery`` Start: recovery decodes older binlog rows BY POSITION with
+  the table's current definition, so a reorder or a charset change matters there even
+  though it changes nothing :func:`diff_table` compares -- while a CHAR / VARCHAR /
+  VARBINARY length or a DECIMAL precision change, which decodes the same, is left out.
 
 Value-free (Property 7): names, catalog type text and key lists only.
 """
@@ -75,13 +82,15 @@ MYSQL_MAX_EXECUTION_MS = 8000
 
 
 class LiveColumn(NamedTuple):
-    """One live source column: name, catalog type text, NULL rule, generated, 0-based rank."""
+    """One live source column: name, catalog type text, NULL rule, generated, 0-based rank,
+    and (MySQL) its character set -- ``""`` when it has none or it was not read."""
 
     name: str
     type: str
     nullable: bool
     generated: bool
     position: int
+    charset: str = ""
 
 
 class LiveTable(NamedTuple):
@@ -141,7 +150,9 @@ def build_mysql_catalog_statement(names: Sequence[str]) -> tuple[str, dict]:
     primary key. Names are grouped by schema: ``(TABLE_SCHEMA = :s0 AND TABLE_NAME IN
     (:t0_0, ...))``, the groups joined with OR, so a single-schema migration is one top-level
     equality (MySQL 5.7 then opens only that database's definitions). Every value is bound;
-    no name ever appears in the SQL text.
+    no name ever appears in the SQL text. The column rows also carry ``CHARACTER_SET_NAME``
+    (9th column; ``NULL`` on the key rows) for the start-point fingerprint only -- the
+    G4 diff does not compare it.
     """
     groups: dict[str, list[str]] = defaultdict(list)
     for name in sorted({str(n) for n in names or () if n}):
@@ -161,10 +172,11 @@ def build_mysql_catalog_statement(names: Sequence[str]) -> tuple[str, dict]:
     sql = (
         f"SELECT /*+ MAX_EXECUTION_TIME({MYSQL_MAX_EXECUTION_MS}) */ 'c' AS part, "
         "TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, COLUMN_TYPE, IS_NULLABLE, "
-        "EXTRA "
+        "EXTRA, CHARACTER_SET_NAME "
         f"FROM information_schema.COLUMNS WHERE {where} "
         "UNION ALL "
-        "SELECT 'k', TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, SEQ_IN_INDEX, NULL, NULL, NULL "
+        "SELECT 'k', TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, SEQ_IN_INDEX, NULL, NULL, NULL, "
+        "NULL "
         f"FROM information_schema.STATISTICS WHERE INDEX_NAME = 'PRIMARY' AND ({where})"
     )
     return sql, params
@@ -226,13 +238,18 @@ def _map_mysql_rows(rows: Sequence, wanted: Sequence[str]) -> "dict[str, LiveTab
                 # VIRTUAL / STORED GENERATED mark a computed column; DEFAULT_GENERATED (an
                 # expression default) does not -- the introspector's own rule.
                 "virtual generated" in extra or "stored generated" in extra,
+                # CHARACTER_SET_NAME (9th column), read only when present: an 8-column
+                # row (a double, or an older statement) maps with no charset.
+                _text(row[8]) if len(row) > 8 else "",
             )
         )
     return {
         name: LiveTable(
             columns=tuple(
-                LiveColumn(col, typ, nullable, generated, rank)
-                for rank, (_o, col, typ, nullable, generated) in enumerate(sorted(items))
+                LiveColumn(col, typ, nullable, generated, rank, charset)
+                for rank, (_o, col, typ, nullable, generated, charset) in enumerate(
+                    sorted(items)
+                )
             ),
             primary_key=frozenset(keys.get(name, ())),
         )
@@ -512,6 +529,161 @@ def baseline_digest(
     return hashlib.blake2b(payload.encode("utf-8"), digest_size=8).hexdigest()
 
 
+# ---------------------------------------------------------------------------
+# The CDC start-point fingerprint (MySQL; pure)
+# ---------------------------------------------------------------------------
+#
+# Debezium's recovery mode rebuilds its schema history from the tables AS THEY ARE NOW and
+# then reads OLDER binlog rows with it, matching row values to columns BY POSITION. So what
+# matters here is exactly what Debezium's in-memory Table holds: EVERY column in ordinal
+# order (column.exclude.list drops a column only when the event is emitted, after the row
+# was matched), each one's type, NULL rule, character set and generated flag, and the
+# primary key. One short value per table, so a watermark stays O(tables) (it is saved with
+# the job on every update). Defaults, comments, collations and indexes are left out: they
+# do not change how a row is decoded. So are two type details that decode the same in BOTH
+# directions (checked against the shipped Debezium 2.7.4 converters with the cdc-stack's
+# modes): the length of a CHAR / VARCHAR / VARBINARY (each binlog row carries its own
+# length, and the string converter reads only the character set) and the precision of a
+# DECIMAL at the same scale. Every other part stays exact: a BINARY length (values are
+# padded to the CURRENT length), any integer change (unsigned values arrive signed and
+# are re-based on the current type; a narrowing wraps), the scale, signedness and the
+# ENUM / SET literal lists (values are positional indexes). A change that is safe in one
+# direction only (a signed integer widened, an ENUM value appended) still differs: one
+# value per table cannot tell the direction. Version 2 added the two exclusions; a
+# version-1 value is unverified, never compared.
+
+START_POINT_FINGERPRINT_VERSION = 2
+
+REASON_MISSING = "no longer on the source"
+REASON_COUNT = "columns added or dropped: {n} → {m}"
+REASON_NAMES = "columns renamed, replaced or reordered"
+REASON_DEF = (
+    "a column's type, NULL rule, character set or generated flag, or the primary key, "
+    "changed"
+)
+
+_START_POINT_RE = re.compile(r"^(\d+):(\d+):([0-9a-f]{8}):([0-9a-f]{16})$")
+# The type details the start-point fingerprint leaves out (see above). BINARY is not here.
+_MYSQL_STRING_LENGTH = re.compile(r"^(char|varchar|varbinary)\(\d+\)")
+_MYSQL_DECIMAL_PRECISION = re.compile(r"^(decimal|numeric)\(\d+(?:,(\d+))?\)")
+
+
+def _digest(payload: object, size: int) -> str:
+    text_value = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.blake2b(text_value.encode("utf-8"), digest_size=size).hexdigest()
+
+
+def _decode_type(value: str) -> str:
+    """A MySQL catalog type reduced to what changes how a binlog row decodes. Pure.
+
+    :func:`_normalized_type` (integer display width dropped, ``tinyint(1)`` kept), then a
+    CHAR / VARCHAR / VARBINARY length dropped and a DECIMAL precision reduced to its scale
+    (``decimal(10,2)`` -> ``decimal(,2)``); whatever follows (``unsigned``, ``zerofill``)
+    is kept. Used by the start-point fingerprint only -- G4's :func:`same_type` must still
+    see a widening.
+    """
+    text_value = _normalized_type(value, source_type=SourceType.MYSQL)
+    match = _MYSQL_STRING_LENGTH.match(text_value)
+    if match:
+        return match.group(1) + text_value[match.end():]
+    match = _MYSQL_DECIMAL_PRECISION.match(text_value)
+    if match:
+        return f"{match.group(1)}(,{match.group(2) or '0'})" + text_value[match.end():]
+    return text_value
+
+
+def start_point_comparable(value: object) -> bool:
+    """Whether a recorded start-point value can be compared: this format AND this
+    :data:`START_POINT_FINGERPRINT_VERSION` (an older version is never compared). Pure."""
+    match = _START_POINT_RE.match(str(value or ""))
+    return match is not None and int(match.group(1)) == START_POINT_FINGERPRINT_VERSION
+
+
+def start_point_value(live: LiveTable) -> str:
+    """The start-point fingerprint of one live MySQL table: ``2:<ncols>:<names>:<def>``.
+
+    ``<names>`` is a 4-byte digest of the column names in ordinal order (a rename, a
+    replacement or a pure reorder changes it); ``<def>`` an 8-byte digest of each column's
+    decode-relevant type (:func:`_decode_type`: integer display width, CHAR / VARCHAR /
+    VARBINARY length and DECIMAL precision dropped; ``tinyint(1)``, a BINARY length, the
+    scale, ENUM/SET literals and ``unsigned`` kept), NULL rule, generated flag and
+    character set, plus the primary-key set. At most 40 characters. Pure.
+    """
+    columns = sorted(live.columns, key=lambda c: c.position)
+    names = [str(c.name) for c in columns]
+    definition = [
+        [
+            str(c.name),
+            _decode_type(str(c.type)),
+            bool(c.nullable),
+            bool(c.generated),
+            str(getattr(c, "charset", "") or ""),
+        ]
+        for c in columns
+    ]
+    key = sorted(str(n) for n in (live.primary_key or ()))
+    return (
+        f"{START_POINT_FINGERPRINT_VERSION}:{len(columns)}:"
+        f"{_digest(names, 4)}:{_digest([definition, key], 8)}"
+    )
+
+
+def start_point_fingerprints(live_map: "Mapping[str, LiveTable]") -> "dict[str, str]":
+    """``{table: start_point_value}`` for every table read. Pure."""
+    return {str(name): start_point_value(live) for name, live in (live_map or {}).items()}
+
+
+@dataclass(frozen=True)
+class StartPointCheck:
+    """The captured tables' live definitions against their start-point fingerprints.
+
+    ``changed``: ``(table, reason)`` for each table that differs (a ``REASON_*`` text).
+    ``unverified``: captured tables with no usable fingerprint (not recorded, unqualified,
+    another fingerprint version, or malformed) -- they are not compared.
+    """
+
+    changed: tuple = ()
+    unverified: tuple = ()
+
+
+def check_start_point(
+    recorded: "Mapping[str, str]",
+    live: "Mapping[str, LiveTable]",
+    names: Sequence[str],
+) -> StartPointCheck:
+    """Compare each captured table in ``names`` with its recorded fingerprint. Pure.
+
+    A recorded table absent from ``live`` counts as changed (``REASON_MISSING``); otherwise
+    the first difference is named: the column count, then the names in order, then the
+    definitions. Value-free: names and fixed reason texts only.
+    """
+    recorded = dict(recorded or {})
+    live = dict(live or {})
+    changed: list[tuple[str, str]] = []
+    unverified: list[str] = []
+    for name in sorted({str(n) for n in names or () if n}):
+        value = recorded.get(name)
+        if not split_qualified(name) or not start_point_comparable(value):
+            unverified.append(name)
+            continue
+        match = _START_POINT_RE.match(str(value))
+        table = live.get(name)
+        if table is None:
+            changed.append((name, REASON_MISSING))
+            continue
+        now = _START_POINT_RE.match(start_point_value(table))
+        if now is None:  # not reachable: start_point_value writes this format
+            unverified.append(name)
+            continue
+        if now.group(2) != match.group(2):
+            changed.append((name, REASON_COUNT.format(n=match.group(2), m=now.group(2))))
+        elif now.group(3) != match.group(3):
+            changed.append((name, REASON_NAMES))
+        elif now.group(4) != match.group(4):
+            changed.append((name, REASON_DEF))
+    return StartPointCheck(changed=tuple(changed), unverified=tuple(unverified))
+
+
 __all__ = [
     "CHANGE_LIMIT",
     "CatalogDiff",
@@ -528,10 +700,20 @@ __all__ = [
     "LiveTable",
     "MYSQL_MAX_EXECUTION_MS",
     "PG_CATALOG_SQL",
+    "REASON_COUNT",
+    "REASON_DEF",
+    "REASON_MISSING",
+    "REASON_NAMES",
+    "START_POINT_FINGERPRINT_VERSION",
+    "StartPointCheck",
     "baseline_digest",
     "build_mysql_catalog_statement",
+    "check_start_point",
     "diff_table",
     "read_live_catalog",
     "same_type",
     "split_qualified",
+    "start_point_comparable",
+    "start_point_fingerprints",
+    "start_point_value",
 ]

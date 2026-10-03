@@ -94,26 +94,59 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
   `ALTER TABLE … TRUNCATE PARTITION` / `DROP PARTITION`은 변경 이벤트를 전혀 만들지 않으며, 남은 행은
   Validation에서만 보입니다. 이전 버전의 도구에서 업그레이드할 때 이미 스트리밍 중이던 MySQL 파이프라인은
   Stop CDC → Start CDC를 한 번 거친 뒤부터 `TRUNCATE`를 감지합니다.
-- **CDC가 실행 중이 아닐 때 마이그레이션 대상 테이블에 소스 DDL 금지(MySQL).** 시드된 위치(Full Load
-  워터마크 또는 Manual binlog 시작 지점 — 세션에 Full Load 워터마크가 없는 MySQL CDC only의 첫 시작은 이것이
-  필요 — 그리고 그런 실행을
-  Stop 후 다시 Start하는 모든 경우)에서 시작하는 MySQL CDC는 Debezium을 `snapshot.mode=recovery`로
-  실행합니다. 이 모드는 테이블의 **현재** 정의로 스키마 히스토리를 다시 만든 뒤 그 이전 위치부터 binlog를
-  읽습니다. 그 사이에 커밋된 스키마 변경(`ALTER TABLE` 등)이 있으면 이전 행 이벤트가 새 정의로
-  해석됩니다 — Debezium 문서의 `recovery` 경고("마지막 커넥터 종료 후 데이터베이스에 스키마 변경이
-  커밋되었다면 이 모드를 사용하지 말 것")에 해당합니다. 컬럼이 어긋나거나 커넥터가 실패할 수 있습니다.
-  Full Load부터 CDC 스트리밍 시작까지, 그리고 CDC를 멈춘 동안에는 대상 테이블의 DDL을 고정하세요. 변경이
-  끼어들었다면 CDC를 Stop하고, 소스 인벤토리를 새로 읽은 뒤(1단계 Evaluation 재실행) Schema Conversion에서
-  바뀐 테이블을 갱신해 다시 로드가 새 정의로 테이블을 만들고 읽게 한 다음 — DDL을 직접 편집했거나 키 전략을
-  고른 테이블은 그 편집이 유지되므로 다시 하거나 초기화하고, 삭제·이름 변경된 컬럼은 먼저 Aurora DSQL에서
-  삭제하거나 그 테이블을 Replace로 다시 적용해야 합니다(Drop & reload는 새 정의에 없는 대상 컬럼을 지우지
-  않으려고 해당 테이블을 거부합니다) — **"Drop & reload"로 Re-run Full Load**를 실행하세요(기본값
-  *Append*는 기존 행을 유지하므로 스트림이 멈춘 동안의 UPDATE/DELETE가 사라지고, *Reload specific
-  tables*와 *Retry*는 원래 워터마크를 유지합니다). 새 실행의 워터마크는 스트림이 멈춘 위치보다 뒤이므로
-  Start CDC가 오프셋을 그 위치로 앞당깁니다(Start는 되감지는 않지만 앞으로는 이동합니다). CDC only
-  실행에는 다시 돌릴 Full Load가 없으므로, 마이그레이션 유형을 Full load + CDC로 바꿔 같은 방법을 쓰거나,
-  CDC 인프라를 삭제하고 변경 이후의 Manual 시작 지점으로 다시 배포하세요(그 지점 이전에 바뀐 행은 따로
-  맞춰야 합니다).
+- **MySQL: CDC 시작 지점과 그 지점을 쓰는 Start 사이의 스키마 변경.** 새 시작 위치를 시드하는 MySQL
+  Start는 Debezium을 `snapshot.mode=recovery`로 실행합니다: Full Load 워터마크나 Manual binlog 시작
+  지점에서의 첫 Start(세션에 Full Load 워터마크가 없는 MySQL CDC only의 첫 시작은 Manual 지점이 필요),
+  **Re-run Full Load**나 더 새 Manual 지점 이후의 Start, 그리고 **Delete CDC infrastructure** 후 다시
+  배포한 뒤의 첫 Start — 이때는 **원래** 워터마크부터 다시 읽습니다. `recovery`에서 Debezium은 테이블의
+  **현재** 정의로 스키마 히스토리를 다시 만든 뒤 그 이전 위치부터 binlog를 읽고, 각 행의 값을 위치 순서로
+  컬럼에 대응시킵니다. 따라서 그 사이에 캡처 대상 테이블에 커밋된 스키마 변경(`ALTER TABLE` 등)은
+  스트림을 깨뜨립니다: 컬럼 추가·삭제는 Start할 때마다 커넥터를 멈추고, 컬럼 이름 변경도 커넥터를
+  멈추며, 컬럼 수가 그대로인 변경(길이나 DECIMAL 정밀도 이외의 타입 변경, 순서 변경, 삭제한 컬럼을 다른
+  컬럼으로 대체, 문자 집합 변환)은 **아무 오류 없이** 밀리거나 NULL인 값을 씁니다.
+  - **사전 검사.** Full Load 워터마크와 Manual 지점의 **Fetch current position**은 위치를 읽기 직전에
+    캡처 대상 테이블마다 짧은 지문(컬럼 순서, 타입, NULL 규칙, 문자 집합, 기본 키)을 기록합니다. 그런
+    Start 전에 Start CDC는 테이블을 이 지문과 비교하고, 바뀐 테이블을 하나하나 명시하며 **거부**합니다.
+    검사는 소스를 읽으므로 소스 연결이 필요합니다(Connect 단계에서 소스 연결을 다시 테스트할 때까지
+    거부합니다). 시작 지점에 지문이 없으면 — 이전 버전 도구가 기록한 지점, 직접 입력한 위치, 정의를 읽지
+    못했던 지점 — **경고**만 합니다. `CHAR`, `VARCHAR`, `VARBINARY` 컬럼의 길이 변경이나 같은 스케일에서의
+    `DECIMAL` 정밀도 변경은 똑같이 디코딩되므로 거부하지 않습니다. 소스 스키마 재확인
+    ([§4.2](04-cdc-and-dsql-constraints.md#데드레터를-남기지-않는-변경-소스-스키마-재확인))은 여전히
+    이를 알리며, Aurora DSQL 컬럼을 넓혀야 할 수 있습니다. 정수 타입 확장이나 `ENUM` 값 추가는 여전히
+    거부됩니다: 지문으로는 이를 실제로 잘못 디코딩되는 축소나 순서 변경과 구별할 수 없기 때문입니다.
+  - **검사가 볼 수 없는 것.** CDC가 캡처하지 **않는** 테이블의 컬럼 이름 변경(Debezium은 모든 테이블의
+    정의를 추적하므로 그것을 재생하다 실패합니다), 커넥터를 만드는 동안의 변경, 그리고 그 첫 실행이
+    자동 재시작되기 직전의 변경. 이름 변경이나 컬럼 추가·삭제는 커넥터를 멈추고, CDC 단계가 원인을 알려
+    줍니다. 컬럼 수가 그대로인 변경은 커넥터를 멈추지 않습니다: 이전 행이 오류 없이 밀리거나 NULL인 값으로
+    쓰입니다. 소스 스키마 재확인
+    ([§4.2](04-cdc-and-dsql-constraints.md#데드레터를-남기지-않는-변경-소스-스키마-재확인))은 타입 변경과
+    다른 컬럼으로 대체된 컬럼을 알리고 Cut over를 보류합니다. 순서 변경과 문자 집합 변환은 어느 검사도 보지
+    못하므로, 그런 변경 뒤에는 CHECKSUM으로 검증하세요.
+  - **다시 Start, Retry CDC, Debezium의 "recovery mode"는 결코 도움이 되지 않습니다** — 같은 행을 다시
+    재생할 뿐입니다. 시작 지점을 변경 이후로 옮기세요: CDC를 Stop하고, 소스 인벤토리를 새로 읽은 뒤(1단계
+    Evaluation 재실행) Schema Conversion에서 바뀐 테이블을 갱신해 다시 로드가 새 정의로 테이블을 만들고
+    읽게 한 다음 — DDL을 직접 편집했거나 키 전략을 고른 테이블은 그 편집이 유지되므로 다시 하거나
+    초기화하고, 삭제·이름 변경된 컬럼은 먼저 Aurora DSQL에서 삭제하거나 그 테이블을 Replace로 다시
+    적용해야 합니다(Drop & reload는 새 정의에 없는 대상 컬럼을 지우지 않으려고 해당 테이블을 거부합니다) —
+    **"Drop & reload"로 Re-run Full Load**를 실행하세요(기본값 *Append*는 기존 행을 유지하므로 그 사이의
+    UPDATE/DELETE가 사라지고, *Reload specific tables*와 *Retry*는 원래 워터마크를 유지합니다). 새 실행의
+    워터마크는 변경 이후이므로 Start CDC가 오프셋을 그 위치로 앞당깁니다. CDC only 실행에는 다시 돌릴 Full
+    Load가 없으므로, 바뀐 테이블을 Aurora DSQL에서 갱신한 다음 같은 스택에서 **Manual**, **Fetch current
+    position**, **Use this start point**를 선택하세요(Start는 멈춘 스택의 오프셋을 되감지는 않지만 앞으로는
+    이동합니다. 멈춘 스택에서는 시작 지점 카드의 **Manual — start from a later binlog position instead**
+    아래에 있습니다). 그러면 그 지점 이전에 캡처 대상 테이블에 생긴 변경은 복제되지 않습니다: "Drop &
+    reload"로 다시 로드하거나(Full load + CDC) Aurora DSQL에서 바로잡고(CDC only), CHECKSUM으로 검증하세요.
+    다시 로드하면 CDC 시작 지점이 Automatic으로 돌아가므로, Start CDC 전에 Manual을 다시 선택하세요(가져온
+    지점은 유지됩니다).
+  - **Stop CDC 후의 재시작은 다릅니다.** 기록된 위치에서 이어 가며 **기록된 스키마 히스토리를
+    재생**하므로(`snapshot.mode=schema_only`), CDC를 멈춘 동안의 DDL은 스트리밍 중의 변경처럼 순서대로
+    적용되고 같은 후속 조치가 필요합니다
+    ([4장 §4.2](04-cdc-and-dsql-constraints.md#42-cdc는-스키마가-아니라-데이터를-복제--중요)).
+    그 히스토리가 없으면 Start가 그렇다고 알리며 실패합니다. 커넥터가 아직 남아 있으면 Stop CDC(또는
+    **Clean up leftover connector**)로 먼저 제거하세요 — 남아 있는 커넥터에 대한 Start나 Retry CDC는 그
+    스냅샷 모드를 유지하므로 같은 방식으로 실패합니다. 그러면 다음 Start가 같은 검사를 거친 뒤 히스토리를
+    다시 만듭니다(`recovery`). 이 검사는 테이블을 원래 시작 지점과 비교하므로, Stop 전에 한 변경이라도 그
+    Start를 거부합니다.
 - **캐스케이드 FK 동작은 CDC로 복제되지 않음.** 서버 측 `ON DELETE/UPDATE CASCADE`(및 `SET NULL`/
   `SET DEFAULT`) 동작은 소스 엔진 *내부*에서 발생해 변경 스트림에 잡히지 않을 수 있으므로 CDC가 적용할 수
   없습니다 — 소스가 캐스케이드한 자식 행이 타깃에 orphan으로 남습니다(MySQL 소스의 경우 InnoDB가 binlog에

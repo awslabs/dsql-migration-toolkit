@@ -945,6 +945,19 @@ class Watermark(BaseModel):
             "re-count rather than trust these as exact."
         ),
     )
+    # Left OUT of the payload while empty (a PostgreSQL watermark, a failed read, a
+    # watermark from an earlier version), so it still loads on an older build: this model
+    # is extra="forbid". Digest-only and O(tables) -- MigrationJob is saved on every update.
+    table_fingerprints: dict[str, str] = Field(
+        default_factory=dict,
+        exclude_if=lambda v: not v,
+        description=(
+            "Per-table start-point column fingerprints (MySQL; "
+            "<version>:<ncols>:<names>:<definition> digests, read just before the binlog "
+            "position) that Start CDC compares with the source before a recovery-mode "
+            "start. Empty when they could not be read."
+        ),
+    )
 
 
 class MigrationJob(BaseModel):

@@ -267,6 +267,10 @@ class DataMigrationState:
         self._cdc_start_gtid: Optional[str] = None
         self._cdc_start_binlog_file: Optional[str] = None
         self._cdc_start_binlog_pos: Optional[int] = None
+        # The captured tables' start-point fingerprints (core.cdc_catalog_drift) recorded
+        # by "Fetch current position" for exactly the binlog file:position above. Bound to
+        # those coordinates: every set_cdc_start_position call replaces them.
+        self._cdc_start_fingerprints: dict[str, str] = {}
         # Live CDC monitoring (Phase 2). The status view is rebuilt by the CDC
         # poller from the controller's read-only signals; the controller talks to
         # the already-deployed MSK Connect connectors (decision-change 8 -- the UI
@@ -439,6 +443,16 @@ class DataMigrationState:
         # rewinds -- so a later, earlier start point would silently not apply.
         # Transient; cleared when the stack is gone.
         self.cdc_offered_seed: Optional[tuple[str, int]] = None
+        # MySQL: the SnapshotMode of a stack whose connectors EXIST (MskBootstrapServers
+        # set), from the same phase probe; None when stopped / infra-only / no stack. A
+        # Start keeps it (core.cdc.mysql_snapshot_mode) so it never re-creates running
+        # connectors just to change it. Transient.
+        self.cdc_deployed_snapshot_mode: Optional[str] = None
+        # MySQL: a schema_only resume of this stack failed because Debezium's schema
+        # history is missing or incomplete, so the next Start runs recovery (after the
+        # start-point check). Persisted; cleared by a successful Start and when the stack
+        # is gone or another stack is targeted.
+        self.cdc_history_missing: bool = False
         self.cdc_activity: Optional["CdcActivitySummary"] = None
         # Per-table source/target row counts for the migration-status view, fetched
         # on demand (a direct COUNT(*) on each side -- read-only but adds source
@@ -1081,17 +1095,34 @@ class DataMigrationState:
         gtid: Optional[str] = None,
         binlog_file: Optional[str] = None,
         binlog_pos: Optional[int] = None,
+        fingerprints: Optional[Mapping[str, str]] = None,
     ) -> None:
         """Record the manual CDC start-position override (GTID and/or binlog).
 
         Blank/``None`` values clear that field. Stored verbatim; the UI validates
         the strings before calling this (advisory) and :meth:`cdc_start_override`
         assembles a :class:`CdcResumePoint` from whatever is set.
+
+        ``fingerprints`` are the captured tables' start-point fingerprints recorded for
+        exactly this binlog file:position (Fetch current position). They are REPLACED on
+        every call -- cleared when omitted or when there is no binlog file:position -- so
+        they can never describe a different point than the one stored.
         """
+        file_value = (binlog_file or "").strip() or None
         with self._lock:
             self._cdc_start_gtid = (gtid or "").strip() or None
-            self._cdc_start_binlog_file = (binlog_file or "").strip() or None
+            self._cdc_start_binlog_file = file_value
             self._cdc_start_binlog_pos = binlog_pos
+            self._cdc_start_fingerprints = (
+                {str(k): str(v) for k, v in dict(fingerprints or {}).items()}
+                if file_value and binlog_pos is not None
+                else {}
+            )
+
+    def cdc_start_fingerprints(self) -> "dict[str, str]":
+        """A copy of the Manual start point's recorded fingerprints (``{}``: none)."""
+        with self._lock:
+            return dict(self._cdc_start_fingerprints)
 
     def cdc_start_override(self) -> Optional[CdcResumePoint]:
         """Return the manual start position as a CdcResumePoint, or None.
@@ -1275,6 +1306,9 @@ class DataMigrationState:
                 # discovery reads this one's. REPLICA IDENTITY findings are kept: they are
                 # about target tables, whichever stack produced the loss.
                 self.cdc_deployed_message_key_columns = None
+                # The snapshot-mode facts describe the previously-targeted stack too.
+                self.cdc_deployed_snapshot_mode = None
+                self.cdc_history_missing = False
             self.cdc_stack_name = candidate
         return True
 
@@ -1289,6 +1323,9 @@ class DataMigrationState:
             self.cdc_probe_error = None  # a successful probe clears any prior failure
             if phase == "absent":
                 self.cdc_offered_seed = None  # a new stack gets a new offsets topic
+                # ...and a new schema history, and no connectors.
+                self.cdc_deployed_snapshot_mode = None
+                self.cdc_history_missing = False
 
     def set_cdc_probe_error(self, message: Optional[str]) -> None:
         """Record why the read-only CDC-state probe failed (or clear it with None).
@@ -1358,6 +1395,8 @@ class DataMigrationState:
             self.cdc_deployed_column_exclude_list = None
             self.cdc_deployed_watermark = None
             self.cdc_offered_seed = None
+            self.cdc_deployed_snapshot_mode = None
+            self.cdc_history_missing = False
             # Applied-ops + replication-lag metrics are per-stack too; drop them so the
             # adopted stack's poll repopulates rather than showing the prior stack's.
             self.cdc_applied_ops_by_table = {}
@@ -1635,6 +1674,16 @@ class DataMigrationState:
         """Record the binlog (file, pos) the deployed stack was last started from."""
         with self._lock:
             self.cdc_deployed_watermark = tuple(value) if value else None  # type: ignore[assignment]
+
+    def set_cdc_deployed_snapshot_mode(self, value: Optional[str]) -> None:
+        """Record the SnapshotMode of a stack whose connectors exist (``None``: none)."""
+        with self._lock:
+            self.cdc_deployed_snapshot_mode = str(value) if value else None
+
+    def note_cdc_history_missing(self, value: bool) -> None:
+        """Record whether a schema_only resume found this stack's schema history missing."""
+        with self._lock:
+            self.cdc_history_missing = bool(value)
 
     def set_cdc_applied_ops_by_table(
         self, applied_ops: "dict[str, dict[str, int]]"

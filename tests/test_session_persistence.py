@@ -2268,3 +2268,57 @@ def test_the_signature_changes_on_every_source_schema_change_but_not_a_silent_re
         tables={"app.t": fixed}, waived_at=fixed
     )
     assert sig() != added
+
+
+# ---------------------------------------------------------------------------
+# G5: the Manual point's start-point fingerprints and the history-missing flag
+# ---------------------------------------------------------------------------
+
+_FPS = {"app.orders": "1:2:0011aabb:0011223344556677"}
+
+
+def test_the_manual_fingerprints_and_the_history_flag_round_trip() -> None:
+    session, eval_state, conv_state, migration_state = _populated_states()
+    migration_state.set_cdc_start_mode("manual")
+    migration_state.set_cdc_start_position(
+        binlog_file="mysql-bin.000200", binlog_pos=77, fingerprints=_FPS
+    )
+    migration_state.set_cdc_stack_name("dsql-cdc-restored")
+    migration_state.note_cdc_history_missing(True)
+    snapshot = capture_session_snapshot("s1", session, eval_state, conv_state, migration_state)
+    assert snapshot.cdc_start_fingerprints == _FPS and snapshot.cdc_history_missing is True
+    # Through the store's JSON form, as a restart would read it.
+    again = SessionSnapshot.model_validate_json(snapshot.model_dump_json())
+    m2 = DataMigrationState()
+    apply_session_snapshot(again, SessionConnectionState(), EvaluationState(),
+                           SchemaConversionState(), m2)
+    assert m2.cdc_start_fingerprints() == _FPS
+    assert m2.cdc_start_override().binlog_position == 77  # bound to the same point
+    # Restored AFTER the stack name (whose change would clear it).
+    assert m2.cdc_stack_name == "dsql-cdc-restored" and m2.cdc_history_missing is True
+
+
+def test_a_snapshot_without_them_writes_no_keys_and_restores_empty() -> None:
+    session, eval_state, conv_state, migration_state = _populated_states()
+    snapshot = capture_session_snapshot("s1", session, eval_state, conv_state, migration_state)
+    dumped = snapshot.model_dump()
+    # An older build (extra="forbid") can still load it.
+    assert "cdc_start_fingerprints" not in dumped and "cdc_history_missing" not in dumped
+    m2 = DataMigrationState()
+    m2.note_cdc_history_missing(True)
+    apply_session_snapshot(SessionSnapshot.model_validate(dumped), SessionConnectionState(),
+                           EvaluationState(), SchemaConversionState(), m2)
+    assert m2.cdc_start_fingerprints() == {} and m2.cdc_history_missing is False
+
+
+def test_session_signature_changes_on_the_fingerprints_and_the_history_flag() -> None:
+    session, eval_state, conv_state, migration_state = _populated_states()
+    migration_state.set_cdc_start_position(binlog_file="mysql-bin.000200", binlog_pos=77)
+    sig1 = session_signature(session, eval_state, conv_state, migration_state)
+    migration_state.set_cdc_start_position(
+        binlog_file="mysql-bin.000200", binlog_pos=77, fingerprints=_FPS
+    )
+    sig2 = session_signature(session, eval_state, conv_state, migration_state)
+    assert sig2 != sig1
+    migration_state.note_cdc_history_missing(True)
+    assert session_signature(session, eval_state, conv_state, migration_state) != sig2

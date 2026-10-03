@@ -478,7 +478,7 @@ CDC only の Start ダイアログはそれらのテーブル名を示し、各�
 | まだ何も実行していない(Full Load も CDC スタックもない) | ロックされていません: ルールを編集して Save します。 |
 | CDC インフラを削除中 | 削除が完了するまで待ちます。ポップアップはエンジンを考慮した見積もり(MySQL で約 15〜25 分、PostgreSQL で 2〜5 分)を表示します。 |
 | CDC インフラを作成中 | 作成が完了するまで待ち、その後、該当する「CDC スタックが存在する」行に従います。 |
-| CDC スタックが存在し(デプロイ済み、ストリーミング中、または停止中)、Full Load を実行した | 1. ストリーミング中なら Stop CDC を実行し、その後 CDC ステップで **Delete CDC infrastructure** を実行します。2. 影響を受けるテーブルに **Change & reload** を使います(CDC only: 先に Full load + CDC へ切り替えます)。3. 再度デプロイし、Start CDC を実行します。 |
+| CDC スタックが存在し(デプロイ済み、ストリーミング中、または停止中)、Full Load を実行した | 1. ストリーミング中なら Stop CDC を実行し、その後 CDC ステップで **Delete CDC infrastructure** を実行します。2. 影響を受けるテーブルに **Change & reload** を使います(CDC only: 先に Full load + CDC へ切り替えます)。3. 再度デプロイし、Start CDC を実行します(MySQL では下記の「削除後に再び CDC を開始する」を参照)。 |
 | CDC スタックが存在し、Full Load は実行しておらず、CDC only | ストリーミング中なら Stop CDC を実行し、Delete CDC infrastructure を実行してルールを変更し(CDC が一度でもストリーミングしていれば列ルールのみ: テーブル集合の変更には Start over が必要)、再度デプロイして Start CDC を実行します。スタックを削除すると、ストリームの位置も削除されます(下記参照)。 |
 | CDC スタックが存在し、まだ Full Load を実行していない(Full load + CDC) | ストリーミング中なら Stop CDC を実行し、Delete CDC infrastructure を実行してルールを変更し、再度デプロイしてから Start Full Load を実行します。reload が必要なものはありません。CDC が既にストリーミングしていた場合は、Start Full Load ダイアログで drop と再作成を選びます。 |
 | CDC スタックがなく、Full Load を実行した(Full load only または Full load + CDC) | **Change & reload**(次のセクション)。Full load only: テーブル集合も変更できます(下記の「Full Load 後にテーブル集合を変更する」を参照)。 |
@@ -495,8 +495,12 @@ CDC only の Start ダイアログはそれらのテーブル名を示し、各�
   「Full Load 後にテーブル集合を変更する」を参照してください。
 - **削除後に再び CDC を開始する。** MySQL では、Automatic の Start CDC は Full Load のウォーターマークから
   再シードします(そのロード以降の binlog がまだ存在している必要があります。パージされていれば Start CDC が
-  警告します)。PostgreSQL では、スタックを削除するとレプリケーションスロットと publication が削除される
-  ため、Start CDC ダイアログで **「Re-snapshot every table instead」** を選んでください。
+  警告します)。Change & reload はそのウォーターマークを維持するため、そのロード以降にキャプチャ対象テーブルの
+  定義が変わっていれば(たとえばソースで追加された列)、Start CDC は拒否もします: その場合は、より新しい
+  ウォーターマークのために「Drop & reload」ですべてのテーブルを Re-run Full Load するか、Manual を選んで
+  Fetch current position を使ってください([第 6 章](06-limitations.md)を参照)。PostgreSQL では、
+  スタックを削除するとレプリケーションスロットと publication が削除されるため、Start CDC ダイアログで
+  **「Re-snapshot every table instead」** を選んでください。
 - **CDC only のスタックを削除する代償。** MySQL では、次の Automatic の Start CDC はソースの現在位置から
   開始します。Aurora DSQL が最後に適用した変更より後にキャプチャ対象のテーブルに加えられた変更は、複製
   **されません**。それらを再コピーするには、Full load + CDC に切り替えてその Full Load を実行し、行を持つ

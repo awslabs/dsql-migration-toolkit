@@ -135,7 +135,9 @@ Schema Conversion ステップにあります。
 
 - **MySQL** — **binlog ファイル + 位置**、および **GTID セット**(`@@GLOBAL.gtid_executed`)と
   `server_uuid`。これらは `SHOW BINARY LOG STATUS`(MySQL 8.2+/8.4、`SHOW MASTER STATUS` が削除された
-  バージョン)で読み取り、それ以下(≤ 8.0.x)では `SHOW MASTER STATUS` にフォールバックします。
+  バージョン)で読み取り、それ以下(≤ 8.0.x)では `SHOW MASTER STATUS` にフォールバックします。ウォーター
+  マークは位置を読む直前に、移行対象テーブルごとの列定義の短いフィンガープリントも記録するため、Start CDC は
+  それ以降にテーブルが変更されたかを判断できます([第 6 章](06-limitations.md) を参照)。
 - **PostgreSQL** — binlog 座標ではなく **WAL LSN**(`Watermark.wal_lsn`)。一貫性の地点で、ツールは
   **publication**(移行対象テーブルに厳密に対する `FOR TABLE`。`FOR ALL TABLES` は決して使いません)と
   `pgoutput` の**論理レプリケーションスロット**を作成し、スロットが返した一貫 LSN を、スロット名・

@@ -377,15 +377,24 @@ class ConnectorStatus(BaseModel):
 class DebeziumSourceConfig(BaseModel):
     """Tool-generated config for the managed Debezium MySQL source connector.
 
-    The selected tables map to ``table_include_list``; ``snapshot_mode`` defaults
-    to ``recovery`` because the bulk loader (Full Load) already loaded the row
-    data AND the start offset is seeded from the Full Load watermark. With a
-    seeded connect-offset present, Debezium takes the resume path and needs an
-    existing schema-history topic; ``recovery`` rebuilds that history from the
-    current source tables WITHOUT re-reading rows, then resumes from the seeded
-    offset (gapless -- Property 11). ``schema_only`` would die with "db history
-    topic is missing" once the offset seed succeeds. See the cdc-stack template's
-    source connector config for the full rationale.
+    The selected tables map to ``table_include_list``. ``snapshot_mode`` is chosen by
+    :func:`mysql_snapshot_mode` (the bulk loader already loaded the rows, so neither mode
+    re-reads them):
+
+    - ``recovery`` when Start seeds a NEW start offset (the Full Load watermark, a newer
+      Manual point, the first Start after Delete CDC infrastructure). The schema-history
+      topic has never seen the binlog up to that offset, so Debezium rebuilds it from the
+      source tables AS THEY ARE NOW and reads from the offset (gapless -- Property 11).
+      That is correct only while the captured tables are unchanged since the offset, so
+      Start CDC first compares them with the fingerprint recorded at the start point
+      (``Watermark.table_fingerprints``).
+    - ``schema_only`` when Start RESUMES a stopped stack's committed offset: Debezium
+      replays its recorded schema history up to that offset and applies later DDL in
+      binlog order, like a live change. It also starts a connector with nothing seeded.
+      It dies ("The db history topic is missing") only when an offset exists and the
+      history does not; the next Start then uses ``recovery`` (after the same check).
+
+    See the cdc-stack template's source connector config for the full rationale.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1088,6 +1097,68 @@ def estimate_cdc_hourly_cost(
     )
 
 
+class MysqlStartFacts(NamedTuple):
+    """What a MySQL Start CDC knows about the stack it is about to start (pure data).
+
+    ``resumes``: the start continues the stack's COMMITTED offset (the stack streamed,
+    was stopped, and the offered seed is at or before where it was last seeded from), so
+    nothing new is seeded. ``live_mode``: the ``SnapshotMode`` of a stack whose connectors
+    exist (running, or a partial pipeline Retry CDC completes), else ``None``.
+    ``history_missing``: a schema_only resume of this stack already failed because its
+    Debezium schema history is missing.
+    """
+
+    resumes: bool = False
+    live_mode: Optional[str] = None
+    history_missing: bool = False
+
+
+_MYSQL_SNAPSHOT_MODES = ("recovery", "schema_only")
+
+
+def mysql_snapshot_mode(can_seed_offset: bool, facts: Optional[MysqlStartFacts]) -> str:
+    """The Debezium ``snapshot.mode`` a MySQL Start CDC sends. Pure; ONE rule for the
+    connector-config preview, Start CDC and its worker-thread re-check.
+
+    Evaluated in order:
+
+    1. A stack whose connectors exist keeps its live mode: changing ``SnapshotMode`` would
+       make Start re-create RUNNING connectors (``config_changed``), burning MSK partition
+       quota.
+    2. A RESUME of a committed offset with its schema history present -> ``schema_only``:
+       Debezium replays the recorded history to the offset (no schema rebuild) and applies
+       later DDL in binlog order -- so a DDL made while CDC was stopped is decoded like a
+       live one, never as if it had always been there.
+    3. A resume whose history is known to be missing -> ``recovery``: it rebuilds the
+       history from the current tables at the committed offset (the start-point check
+       runs first).
+    4. A seedable start point (binlog file:position) moves the offset FORWARD -> ``recovery``
+       (the history never saw that binlog range), after the start-point check.
+    5. Nothing to seed -> ``schema_only`` (a new connector reads the current schema).
+
+    ``facts=None`` (no stack facts) is today's choice exactly: rules 4 and 5. When it is
+    unclear whether a start resumes, the caller must not claim it does: recovery plus the
+    check is the safe side, ``schema_only`` with a skipped binlog range never is.
+    """
+    if facts is not None:
+        if facts.live_mode in _MYSQL_SNAPSHOT_MODES:
+            return str(facts.live_mode)
+        if facts.resumes:
+            return "recovery" if facts.history_missing else "schema_only"
+    return "recovery" if can_seed_offset else "schema_only"
+
+
+def start_point_check_due(snapshot_mode: str, facts: Optional[MysqlStartFacts]) -> bool:
+    """Must Start CDC compare the captured tables with their start-point fingerprint? Pure.
+
+    Only a ``recovery`` start that creates connectors: recovery rebuilds the schema
+    history from the tables as they are NOW and then reads OLDER binlog rows with it. A
+    stack whose connectors exist (Retry CDC, a live re-Start) keeps its mode and is not
+    re-checked.
+    """
+    return snapshot_mode == "recovery" and (facts is None or facts.live_mode is None)
+
+
 def cdc_expected_connector_names(
     stack_name: str = CDC_DEFAULT_STACK_NAME,
 ) -> tuple[str, str]:
@@ -1135,6 +1206,7 @@ class CdcPipelineOrchestrator:
         column_exclude_list: Optional[Sequence[str]] = None,
         resume_override: Optional[CdcResumePoint] = None,
         message_key_columns: Optional[Mapping[str, Sequence[str]]] = None,
+        start_facts: Optional[MysqlStartFacts] = None,
     ) -> DebeziumSourceConfig:
         """Build the Debezium source config for the selected tables.
 
@@ -1143,27 +1215,32 @@ class CdcPipelineOrchestrator:
         :meth:`CdcResumePoint.from_watermark`, so streaming resumes exactly where
         the snapshot ended (gapless -- Property 11).
 
-        ``snapshot_mode`` is chosen automatically:
+        ``snapshot_mode`` comes from :func:`mysql_snapshot_mode` over whether the resume
+        point can seed an offset and the stack ``start_facts`` (``None`` = no stack facts,
+        today's choice exactly):
 
-        - **Seeded path:** ``recovery`` — Debezium rebuilds its schema-history
-          from the live DB (without re-reading rows) and resumes from the seeded
-          offset. Chosen whenever the resume point — the watermark, or a Manual
-          ``resume_override`` — can actually seed that offset
-          (:meth:`CdcResumePoint.can_seed_offset` — binlog ``file`` + ``pos``
-          present), because ``recovery`` needs a seeded ``connect-offsets`` entry to
-          resume from; the schema-history topic need NOT pre-exist — ``recovery``
-          rebuilds it from the live source (verified in the Seoul E2E: "Snapshot
-          step 6 - Persisting schema history" then "Snapshot step 7 - Skipping
-          snapshotting of data").
-        - **Non-seedable path:** ``schema_only`` — Debezium reads the current
-          source schema from scratch and begins streaming from the current
-          position. Safe for a brand-new connector with no pre-existing
-          schema-history topic. Used when nothing can seed an offset: no
-          coordinates, or a GTID set without a binlog file:position (a GTID-only
-          watermark when ``SHOW MASTER STATUS`` was restricted, or a GTID-only
+        - **A new start offset:** ``recovery`` — chosen whenever the resume point — the
+          watermark, or a Manual ``resume_override`` — can actually seed the offset
+          (:meth:`CdcResumePoint.can_seed_offset` — binlog ``file`` + ``pos`` present)
+          and the start does not resume a committed one. Debezium rebuilds its schema
+          history from the source tables as they are now (without re-reading rows; the
+          topic need not pre-exist -- verified in the Seoul E2E: "Snapshot step 6 -
+          Persisting schema history" then "Snapshot step 7 - Skipping snapshotting of
+          data") and reads from the seeded offset. Start CDC checks first that the
+          captured tables still match their start-point fingerprint.
+        - **A resume of a stopped stack** (``start_facts.resumes``): ``schema_only`` —
+          the recorded history is replayed to the committed offset and later DDL is
+          applied in binlog order. ``recovery`` only when that history is known to be
+          missing (``start_facts.history_missing``).
+        - **Nothing to seed:** ``schema_only`` — Debezium reads the current source schema
+          and begins streaming from the current position. Used when nothing can seed an
+          offset: no coordinates, or a GTID set without a binlog file:position (a
+          GTID-only watermark when ``SHOW MASTER STATUS`` was restricted, or a GTID-only
           Manual entry): choosing ``recovery`` there would leave the connector in
           recovery with no seeded offset — a task-start failure or a silent resume
           from the live binlog.
+        - **Connectors exist** (``start_facts.live_mode``): that mode is kept, so the
+          Start never re-creates running connectors just to change it.
 
         ``column_exclude_list`` (optional) names fully-qualified columns
         (``db.table.column``) to drop at capture via Debezium
@@ -1188,29 +1265,27 @@ class CdcPipelineOrchestrator:
             if resume_override is not None
             else CdcResumePoint.from_watermark(watermark)
         )
-        # recovery: rebuilds schema-history from the live DB and resumes from a
-        # seeded offset. Requires a seeded connect-offsets entry (the resume
-        # position the offset-seeder Lambda writes during the gapless Full-Load
-        # path); it REBUILDS the schema-history topic from the live source, so
-        # that topic need not pre-exist. (schema_only with a seeded offset but no
-        # schema-history dies at task start: "The db history topic is missing".)
-        # schema_only: reads the current source schema from scratch and starts
-        # streaming from the CURRENT binlog position. Safe for a brand-new connector
-        # with no pre-existing schema-history topic (the nothing-to-seed path).
+        # recovery: rebuilds schema-history from the tables AS THEY ARE NOW and reads
+        # from a seeded offset. Requires a seeded connect-offsets entry (the position the
+        # offset seeder writes); it REBUILDS the schema-history topic, so that topic need
+        # not pre-exist -- which is also why it mis-decodes older rows when a captured
+        # table changed after the offset (Start CDC's start-point check refuses that).
+        # schema_only: with a committed offset AND a recorded history, replays the
+        # history to the offset and applies later DDL in binlog order (a resume); with
+        # no offset, reads the current schema and starts from the CURRENT binlog
+        # position (the nothing-to-seed path). With an offset and NO history it dies at
+        # task start: "The db history topic is missing".
         #
-        # Use recovery whenever the resume point can actually SEED an offset -- the
-        # Full Load watermark OR a Manual binlog file:position, both of which Start
-        # CDC offers the seeder (cdc_seed_watermark). The gate MUST match the
-        # seeder's own precondition (can_seed_offset == binlog file+pos present):
-        # the seeder REJECTS a point without binlog coordinates and
-        # build_watermark_params then returns empty, so the seeder is skipped. A
-        # GTID-only point (SHOW MASTER STATUS restricted but @@GLOBAL.gtid_executed
-        # readable, or a GTID-only Manual entry) has no binlog file:pos, so choosing
-        # recovery there yields recovery-with-NO-seeded-offset -- which either fails
-        # the source task at start or silently resumes from the CURRENT binlog.
-        # Falling back to schema_only starts the connector cleanly; the UI refuses
-        # such a Manual entry and discloses such a watermark separately.
-        mode = "recovery" if resume.can_seed_offset() else "schema_only"
+        # A seedable point (can_seed_offset == binlog file+pos present -- the seeder's
+        # own precondition: it REJECTS a point without them and build_watermark_params
+        # then returns empty, so the seeder is skipped) gets recovery unless the start
+        # resumes the committed offset. A GTID-only point (SHOW MASTER STATUS restricted
+        # but @@GLOBAL.gtid_executed readable, or a GTID-only Manual entry) has no
+        # binlog file:pos, so recovery there would be recovery-with-NO-seeded-offset --
+        # a task-start failure or a silent resume from the CURRENT binlog. schema_only
+        # starts the connector cleanly; the UI refuses such a Manual entry and discloses
+        # such a watermark separately.
+        mode = mysql_snapshot_mode(resume.can_seed_offset(), start_facts)
         return DebeziumSourceConfig(
             name=name,
             table_include_list=[table.name for table in tables],
@@ -1997,17 +2072,20 @@ def cdc_seed_watermark(
     override: Optional[CdcResumePoint],
     *,
     now: datetime,
+    override_fingerprints: Optional[Mapping[str, str]] = None,
 ) -> tuple[Optional[Watermark], str]:
     """The ``(watermark, origin)`` a MySQL Start CDC offers the offset seeder. Pure.
 
     - No Manual start point (``override is None``) -> the Full Load job watermark,
-      origin ``"full_load"`` (unchanged; it may itself be ``None``).
+      origin ``"full_load"`` (unchanged; it may itself be ``None``). It carries its own
+      start-point fingerprints (``table_fingerprints``).
     - A Manual point with a binlog ``file:position`` -> that position, origin
       ``"manual"``. It beats the job watermark: it is what the start-point card and
       the connector-config preview already show. Only ``file:position`` is carried
       (``gtid_executed=None``): both seeders key the offset on file+pos and the
       connector runs ``gtid.source.excludes '.*'``. ``now`` stamps the offset's
-      ``ts_sec``.
+      ``ts_sec``; ``override_fingerprints`` (recorded by Fetch current position for
+      exactly this point) become its ``table_fingerprints``.
     - A Manual point without a ``file:position`` (a GTID set alone) -> ``None``,
       origin ``"manual_unseedable"``. Never falls back to the job watermark or to
       "now": the operator chose Manual, so neither is what they asked for.
@@ -2021,6 +2099,7 @@ def cdc_seed_watermark(
                 binlog_position=override.binlog_position,
                 gtid_executed=None,
                 snapshot_timestamp=now,
+                table_fingerprints=dict(override_fingerprints or {}),
             ),
             "manual",
         )
@@ -2076,9 +2155,10 @@ def build_cdc_stack_params(
         ("DsqlClusterEndpoint", target_endpoint),
         ("DsqlDatabaseName", target_database),
         ("DsqlConnectUser", target_username),
-        # Snapshot mode: schema_only for new connectors / CDC-only; recovery on
-        # the gapless path (offset seeded; recovery rebuilds schema-history from
-        # the live source — it does not need the topic pre-populated).
+        # Snapshot mode (mysql_snapshot_mode): recovery when Start seeds a NEW start
+        # offset (the history is rebuilt from the current tables there, after the
+        # start-point check); schema_only to resume a stopped stack's committed offset
+        # (its recorded history is replayed) or when nothing is seeded.
         ("SnapshotMode", source_config.snapshot_mode),
         # Sink connector compute. Set on this path (not just infra create) because
         # the sink connector itself is created by Start CDC, and Capacity is an
@@ -2491,9 +2571,8 @@ def build_cdc_infra_params(
         # Start CDC supplies the real value via build_cdc_stack_params).
         ("MessageKeyColumns",
          format_message_key_columns(source_config.message_key_columns)),
-        # Snapshot mode: schema_only for new connectors / CDC-only; recovery on
-        # the gapless path (offset seeded; recovery rebuilds schema-history from
-        # the live source — it does not need the topic pre-populated).
+        # Snapshot mode: no connector exists yet on the create path; Start CDC sends
+        # the real value via build_cdc_stack_params (mysql_snapshot_mode).
         ("SnapshotMode", source_config.snapshot_mode),
         # Plugin resource-name version suffix (gotcha #5: lets a new artifact get a
         # uniquely-named CustomPlugin instead of colliding on a fixed name).
@@ -2575,6 +2654,9 @@ __all__ = [
     "CdcCostEstimate",
     "estimate_cdc_hourly_cost",
     "cdc_expected_connector_names",
+    "MysqlStartFacts",
+    "mysql_snapshot_mode",
+    "start_point_check_due",
     "CDC_PLACEHOLDER_PREFIX",
     "CdcStackParams",
     "build_cdc_stack_params",

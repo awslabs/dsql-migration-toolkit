@@ -449,3 +449,213 @@ def test_the_baseline_digest_follows_exactly_the_compared_facts() -> None:
         _table(pk=("id", "notes")),
     ):
         assert baseline_digest(changed, source_type=MYSQL) != d
+
+
+# --- G5: the CDC start-point fingerprint (order-sensitive, every column) -----------------
+
+from dsql_migrator.core.cdc_catalog_drift import (  # noqa: E402
+    REASON_COUNT,
+    REASON_DEF,
+    REASON_MISSING,
+    REASON_NAMES,
+    check_start_point,
+    start_point_fingerprints,
+    start_point_value,
+)
+
+
+def _lv(cols, pk=("id",), generated=(), charsets=None):
+    charsets = charsets or {}
+    return LiveTable(
+        columns=tuple(
+            LiveColumn(n, t, nl, n in generated, i, charsets.get(n, ""))
+            for i, (n, t, nl) in enumerate(cols)
+        ),
+        primary_key=frozenset(pk),
+    )
+
+
+_COLS = (("id", "int", False), ("name", "varchar(20)", True), ("qty", "int", True))
+
+
+def _changed(before, after, name="app.orders"):
+    rec = {name: start_point_value(before)}
+    return check_start_point(rec, {name: after}, [name])
+
+
+def test_the_start_point_fingerprint_sees_a_pure_reorder_that_diff_table_ignores() -> None:
+    # Recovery decodes older rows BY POSITION, so a reorder (same names, same types) is a
+    # silent mis-decode (12b) -- yet G4's name-keyed diff reports nothing for it.
+    before = _lv(_COLS)
+    after = _lv((("id", "int", False), ("qty", "int", True), ("name", "varchar(20)", True)))
+    table = _table(cols=_COLS)
+    assert diff_table(table, after, source_type=MYSQL) is None
+    assert _changed(before, after).changed == (("app.orders", REASON_NAMES),)
+
+
+def test_the_fingerprint_counts_excluded_and_generated_columns() -> None:
+    # Debezium's Table holds every column (column.exclude.list drops a value only when the
+    # event is emitted), so an excluded or generated column added still shifts the rows.
+    before = _lv(_COLS)
+    after = _lv(_COLS + (("v", "int", True),), generated=("v",))
+    assert _changed(before, after).changed == (
+        ("app.orders", REASON_COUNT.format(n=3, m=4)),
+    )
+    assert REASON_COUNT.format(n=3, m=4) == "columns added or dropped: 3 → 4"
+    # ...and flipping a column to generated is a definition change.
+    assert _changed(before, _lv(_COLS, generated=("qty",))).changed == (
+        ("app.orders", REASON_DEF),
+    )
+
+
+@pytest.mark.parametrize(
+    "before, after, same",
+    [
+        ("int(11)", "int", True),  # cosmetic display width (8.0.19+ dropped it)
+        ("bigint(20) unsigned", "bigint unsigned", True),
+        ("tinyint(1)", "tinyint(4)", False),  # the boolean convention is kept
+        ("int", "int unsigned", False),
+        ("enum('a','b')", "enum('a','b','c')", False),
+        ("enum('a','b')", "enum('A','b')", False),  # literals are case-sensitive
+    ],
+)
+def test_the_fingerprint_normalizes_types_like_same_type(before, after, same) -> None:
+    b = _lv((("id", "int", False), ("c", before, True)))
+    a = _lv((("id", "int", False), ("c", after, True)))
+    assert (start_point_value(b) == start_point_value(a)) is same
+    if not same:
+        assert _changed(b, a).changed == (("app.orders", REASON_DEF),)
+
+
+@pytest.mark.parametrize(
+    "before, after",
+    [
+        # Decode the same in BOTH directions with the shipped Debezium 2.7.4 converters
+        # (each binlog row carries its own length; the string converter reads only the
+        # charset; a DECIMAL keeps its scale): not refused, unlike G4, which still sees them.
+        ("varchar(255)", "varchar(500)"),
+        ("varchar(500)", "varchar(255)"),
+        ("char(10)", "char(20)"),
+        ("varbinary(16)", "varbinary(32)"),
+        ("decimal(10,2)", "decimal(12,2)"),
+        ("decimal(12,2)", "decimal(6,2)"),
+        ("decimal(10,2) unsigned", "decimal(12,2) unsigned"),
+    ],
+)
+def test_a_length_or_decimal_precision_change_is_not_a_start_point_change(before, after) -> None:
+    b = _lv((("id", "int", False), ("c", before, True)))
+    a = _lv((("id", "int", False), ("c", after, True)))
+    assert _changed(b, a).changed == ()
+    assert not same_type(before, after, source_type=MYSQL)  # G4 still reports it
+
+
+@pytest.mark.parametrize(
+    "before, after",
+    [
+        ("binary(4)", "binary(8)"),  # padded to the CURRENT length
+        ("int unsigned", "bigint unsigned"),  # arrives signed, re-based on the new type
+        ("mediumint unsigned", "int unsigned"),
+        ("bigint", "int"),  # a narrowing wraps
+        ("int", "bigint"),  # safe one way only; one value cannot tell the direction
+        ("decimal(10,2)", "decimal(10,3)"),  # the scale
+        ("decimal(10,2)", "decimal(10,2) unsigned"),
+        ("enum('a','b')", "enum('b','a')"),  # values are positional indexes
+        ("enum('a','b')", "enum('a','b','c')"),
+        ("char(10)", "varchar(10)"),
+        ("varchar(10)", "varbinary(10)"),
+    ],
+)
+def test_changes_that_can_mis_decode_still_differ(before, after) -> None:
+    b = _lv((("id", "int", False), ("c", before, True)))
+    a = _lv((("id", "int", False), ("c", after, True)))
+    assert _changed(b, a).changed == (("app.orders", REASON_DEF),)
+
+
+def test_a_varchar_charset_change_still_differs_with_any_length() -> None:
+    b = _lv((("id", "int", False), ("c", "varchar(20)", True)), charsets={"c": "latin1"})
+    a = _lv((("id", "int", False), ("c", "varchar(80)", True)), charsets={"c": "utf8mb4"})
+    assert _changed(b, a).changed == (("app.orders", REASON_DEF),)
+
+
+def test_a_version_1_value_is_never_compared() -> None:
+    # Version 1 hashed lengths and DECIMAL precision: comparing it with a version-2 value
+    # would refuse every table with a VARCHAR. It is unverified (a warning), not changed.
+    from dsql_migrator.core.cdc_catalog_drift import (
+        START_POINT_FINGERPRINT_VERSION,
+        start_point_comparable,
+    )
+
+    assert START_POINT_FINGERPRINT_VERSION == 2
+    value = start_point_value(_lv(_COLS))
+    old = "1" + value[1:]
+    assert start_point_comparable(value) and not start_point_comparable(old)
+    assert not start_point_comparable("garbage") and not start_point_comparable(None)
+    check = check_start_point({"app.orders": old}, {"app.orders": _lv(_COLS)}, ["app.orders"])
+    assert (check.changed, check.unverified) == ((), ("app.orders",))
+
+
+def test_a_charset_change_changes_the_fingerprint_while_diff_table_returns_none() -> None:
+    # ALTER TABLE ... CONVERT TO CHARACTER SET: older rows would decode with the new
+    # charset. G4 is unchanged: it does not compare character sets.
+    before = _lv(_COLS, charsets={"name": "latin1"})
+    after = _lv(_COLS, charsets={"name": "utf8mb4"})
+    assert diff_table(_table(cols=_COLS), after, source_type=MYSQL) is None
+    assert _changed(before, after).changed == (("app.orders", REASON_DEF),)
+
+
+def test_null_rule_and_primary_key_changes_are_definition_changes() -> None:
+    before = _lv(_COLS)
+    nullable = _lv((("id", "int", False), ("name", "varchar(20)", False), ("qty", "int", True)))
+    assert _changed(before, nullable).changed == (("app.orders", REASON_DEF),)
+    rekeyed = _lv(_COLS, pk=("id", "name"))
+    assert _changed(before, rekeyed).changed == (("app.orders", REASON_DEF),)
+
+
+def test_a_rename_or_a_replacement_changes_the_names_digest() -> None:
+    before = _lv(_COLS)
+    renamed = _lv((("id", "int", False), ("label", "varchar(20)", True), ("qty", "int", True)))
+    assert _changed(before, renamed).changed == (("app.orders", REASON_NAMES),)
+
+
+def test_a_missing_table_and_unverifiable_names() -> None:
+    value = start_point_value(_lv(_COLS))
+    recorded = {
+        "app.orders": value,
+        "app.gone": value,
+        "app.v1": "1" + value[1:],  # another fingerprint version
+        "app.bad": "garbage",
+        "plain": value,  # unqualified: never compared
+    }
+    live = {"app.orders": _lv(_COLS)}
+    check = check_start_point(
+        recorded, live, ["app.orders", "app.gone", "app.v1", "app.bad", "plain", "app.new"]
+    )
+    assert check.changed == (("app.gone", REASON_MISSING),)
+    assert set(check.unverified) == {"app.v1", "app.bad", "plain", "app.new"}
+    assert REASON_MISSING == "no longer on the source"
+
+
+def test_an_unchanged_table_passes_and_the_values_are_short_and_versioned() -> None:
+    live = {"app.orders": _lv(_COLS), "app.items": _lv((("id", "bigint", False),))}
+    fps = start_point_fingerprints(live)
+    assert set(fps) == {"app.orders", "app.items"}
+    for value in fps.values():
+        assert value.startswith("2:") and len(value) <= 40
+    assert check_start_point(fps, live, list(live)).changed == ()
+    assert check_start_point(fps, live, list(live)).unverified == ()
+
+
+def test_the_mysql_statement_selects_the_character_set_and_rows_map_either_width() -> None:
+    sql, _params = build_mysql_catalog_statement(["app.orders"])
+    assert "CHARACTER_SET_NAME" in sql
+    # Both UNION branches have the same width (9 columns).
+    first, second = sql.split("UNION ALL")
+    assert first.count(",") == second.count(",")
+    eight = [("c", "app", "orders", "id", 1, "int", "NO", "")]
+    nine = [("c", "app", "orders", "id", 1, "varchar(9)", "NO", "", "utf8mb4")]
+    assert read_live_catalog(_Conn(eight), ["app.orders"], source_type=MYSQL)[
+        "app.orders"
+    ].columns[0].charset == ""
+    assert read_live_catalog(_Conn(nine), ["app.orders"], source_type=MYSQL)[
+        "app.orders"
+    ].columns[0].charset == "utf8mb4"

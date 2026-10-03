@@ -352,6 +352,91 @@ _CONNECTOR_LOG_DIAGNOSES: tuple[tuple[str, str], ...] = (
         "defect (conflicting bundled SDK jars), not an operational issue -- report it; "
         "redeploying the same plugin will not help.",
     ),
+    # --- MySQL schema-history replay (Debezium 2.7.4) ---------------------------
+    # snapshot.mode=recovery rebuilds the schema history from the source tables AS THEY
+    # ARE NOW and then reads OLDER binlog rows with it, so a DDL committed after the start
+    # offset fails the task on every start. Above "communications link failure": a tail
+    # can also hold transient link errors, and these causes never heal by themselves.
+    # Debezium's own text advises "restart connector with schema recovery mode", which is
+    # exactly what replays the failure, so the guidance contradicts it explicitly.
+    (
+        # BinlogStreamingChangeEventSource.validateChangeEventWithTable: "... different
+        # column size with internal schema size N, but <op> size M ..." (log) and "Error
+        # processing row in <t>, internal schema size N, but row size M ..." (exception).
+        "internal schema size",
+        "{connector} failed: Debezium read a binlog row whose column count does not match "
+        "the definition it rebuilt from the source table as it is now. A captured table "
+        "had a column added or dropped (ALTER TABLE) after the position this connector "
+        "started reading from — before the first Start from that start point, before a "
+        "Start after Delete CDC infrastructure, or shortly before an automatic connector "
+        "restart. Starting again, Retry CDC and the \"schema recovery mode\" the log "
+        "suggests all replay the same rows and fail again. Stop CDC, then give CDC a "
+        "start point after the change: for Full load + CDC, re-run Step 1 (Evaluation), "
+        "update the changed table in Schema Conversion and Re-run Full Load for all "
+        "tables with \"Drop & reload\" (its new watermark is past the change); or choose "
+        "Manual, Fetch current position and Use this start point — changes made before "
+        "that point are then not replicated, so reload those tables with \"Drop & "
+        "reload\" (CDC only: correct them on Aurora DSQL) and validate with CHECKSUM. "
+        "A reload switches the CDC start point back to Automatic, so choose Manual again "
+        "and Use this start point before Start CDC (the fetched point is kept).",
+    ),
+    (
+        # AlterTableParserListener: "Trying to change column <c> in <t> table, which does
+        # not exist. Query: ..." -- replaying a RENAME/CHANGE COLUMN against a definition
+        # rebuilt with the new name. Any table on the server, because
+        # store.only.captured.tables.ddl=false makes Debezium track every table.
+        "trying to change column",
+        "{connector} failed: Debezium could not replay a column rename (ALTER TABLE … "
+        "RENAME COLUMN or CHANGE) from the binary log, because the definition it rebuilt "
+        "from the source table as it is now already has the new name. A column was "
+        "renamed after the position this connector started reading from, on ANY table of "
+        "the source server, not only a captured one: Debezium tracks every table's "
+        "definition (the log line above names the table). Starting again, Retry CDC and "
+        "recovery mode repeat it. Stop CDC, then give CDC a start point after the "
+        "rename: Re-run Full Load for all tables with \"Drop & reload\" (Full load + CDC; "
+        "re-run Step 1 and Schema Conversion first if a captured table changed); or "
+        "choose Manual, Fetch current position and Use this start point, then reload or "
+        "correct the changes made before it and validate with CHECKSUM. "
+        "A reload switches the CDC start point back to Automatic, so choose Manual again "
+        "and Use this start point before Start CDC (the fetched point is kept).",
+    ),
+    (
+        # BaseSourceTask: "The db history topic is missing. You may attempt to recover it
+        # by reconfiguring the connector to recovery." (schema_only with an offset and no
+        # history). With a SPACE: recovery's own INFO line "The db-history topic is missing
+        # but we are in recovery snapshot mode" must not match.
+        "db history topic is missing",
+        "{connector} failed: Debezium's schema history for this stack is missing, so the "
+        "connector could not continue from the stream position it recorded. If the CDC "
+        "step still shows the connectors, remove them first with Stop CDC (or Clean up "
+        "leftover connector on an incomplete pipeline): a Start or Retry CDC on connectors "
+        "that exist keeps their snapshot mode and fails the same way. Then Start CDC: it "
+        "rebuilds that history from the source tables as they are now "
+        "(snapshot.mode=recovery) and continues from the same position, after checking "
+        "that the captured tables still match their definitions at the start point — if "
+        "one changed, it refuses and names the way forward.",
+    ),
+    (
+        # BinlogStreamingChangeEventSource: "Encountered change event ... for table <t>
+        # whose schema isn't known to this connector. One possible cause is an incomplete
+        # database schema history topic." (inconsistent.schema.handling.mode=fail).
+        "isn't known to this connector",
+        "{connector} failed: Debezium met a row change for a table that Debezium's schema "
+        "history for this stack does not hold — the history is incomplete, or a captured "
+        "table was dropped or renamed on the source after the position this connector "
+        "started reading from. If this stack streamed before (a restart after Stop CDC), "
+        "remove the connectors first if the CDC step still shows them — Stop CDC, or "
+        "Clean up leftover connector on an incomplete pipeline (a Start or Retry CDC on "
+        "connectors that exist keeps their snapshot mode and fails the same way) — then "
+        "Start CDC: it rebuilds the history from the source tables as they are now, after "
+        "checking the captured tables against the start point. Otherwise, or if that check "
+        "names a changed or missing table, give CDC a start point after the change: Re-run "
+        "Full Load for all tables with \"Drop & reload\" (Full load + CDC), or choose "
+        "Manual, Fetch current position and Use this start point, then reconcile with "
+        "\"Drop & reload\" and CHECKSUM. "
+        "A reload switches the CDC start point back to Automatic, so choose Manual again "
+        "and Use this start point before Start CDC (the fetched point is kept).",
+    ),
     (
         "communications link failure",
         "{connector} failed: the Debezium worker could not reach the source MySQL "
@@ -478,6 +563,28 @@ def _connector_timeout_message(deployer, stack_name: str, connector: str) -> str
         # FAILED. Keyed on the exact prefix, not on `endswith`, which the excerpt broke.
         return f"{timed_out} {message[len(bare):].lstrip()}"
     return f"{timed_out} {message}"
+
+
+# The deploy-log line run_cdc_start writes for the MySQL source connector's snapshot.mode.
+_SNAPSHOT_MODE_LOG = {
+    "recovery": (
+        "Source connector snapshot.mode=recovery (Debezium rebuilds its schema history "
+        "from the source tables as they are now, then reads from the start offset)."
+    ),
+    "schema_only": (
+        "Source connector snapshot.mode=schema_only (no schema rebuild: Debezium replays "
+        "its recorded schema history, or reads the current schema on a new connector)."
+    ),
+}
+
+# The phrase both schema-history diagnoses above carry, so a Start can tell from the error
+# it raised that a schema_only resume found the stack's history missing or incomplete.
+SCHEMA_HISTORY_MARK = "Debezium's schema history for this stack"
+
+
+def is_schema_history_failure(message: str) -> bool:
+    """True when a Start CDC error is the missing/incomplete schema-history diagnosis. Pure."""
+    return SCHEMA_HISTORY_MARK in str(message or "")
 
 
 def _diagnose_connector_log(connector: str, log_tail: str) -> Optional[str]:
@@ -1359,6 +1466,12 @@ def run_cdc_start(
                 f"{watermark.binlog_position} ({_origin}) to the seeder; not applied if "
                 "the committed offset is already at/past it."
             )
+        # MySQL only (the PostgreSQL params carry no SnapshotMode): say which schema path
+        # the source connector takes, because it decides how a DDL since the start point
+        # is decoded.
+        _snapshot_mode = dict(params.filled).get("SnapshotMode")
+        if _snapshot_mode in _SNAPSHOT_MODE_LOG:
+            driver.log(_SNAPSHOT_MODE_LOG[_snapshot_mode])
 
         # Has the desired connector configuration (notably the table set ->
         # TableIncludeList / SinkTopics) changed vs the currently-deployed stack?
@@ -2079,6 +2192,8 @@ __all__ = [
     "CdcDeployError",
     "CdcStackDiscovery",
     "CdcDeployLog",
+    "SCHEMA_HISTORY_MARK",
+    "is_schema_history_failure",
     "CdcStackDeployer",
     "build_cdc_stack_deployer",
     # stage lists (one per lifecycle operation)

@@ -8,8 +8,10 @@ Why this exists
 ---------------
 The gapless Full Load -> CDC handoff (Property 11) requires the Debezium MySQL
 source connector to begin streaming from *exactly* the binlog/GTID position the
-bulk snapshot ended at (``snapshot.mode=schema_only`` means Debezium does NOT
-take its own snapshot). Debezium reads its start position from the compacted
+bulk snapshot ended at. A first start from a seeded offset runs
+``snapshot.mode=recovery``, which rebuilds only the schema history (from the source
+tables as they are now), never the rows; a restart of a stopped stack runs
+``schema_only`` and replays that history. Debezium reads its start position from the compacted
 ``connect-offsets`` Kafka topic, keyed by ``[connector_name, source_partition]``.
 The cdc-stack itself does not write that record, so without seeding the connector
 starts from the *current* binlog at creation time -- losing every change between

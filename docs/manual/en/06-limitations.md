@@ -113,29 +113,76 @@ fails **loudly** where it can't.
   at all; only Validation shows the extra rows. A MySQL pipeline that was already
   streaming when you upgraded from an earlier version of the tool detects `TRUNCATE`
   only after one Stop CDC → Start CDC.
-- **No source DDL on a migrated table while CDC is not running (MySQL).** A MySQL CDC
-  that starts from a seeded position — the Full Load watermark or a Manual binlog start
-  point (a MySQL CDC-only first start needs one unless the session holds a Full Load
-  watermark), and every re-Start of such a run after Stop — runs Debezium in `snapshot.mode=recovery`: it rebuilds its schema history
-  from the tables' **current** definitions, then reads the binlog from that earlier
-  position. A schema change (`ALTER TABLE`, …) committed in between makes the older row
-  events decode against the newer definition — Debezium's documented `recovery` caveat
-  ("do not use this mode … if schema changes were committed to the database after the
-  last connector shutdown"). Columns can shift or the connector can fail. Keep migrated
-  tables' DDL frozen from the Full Load until CDC streams, and while it is stopped. If a
-  change slipped in: Stop CDC; refresh the source inventory (re-run Step 1 Evaluation)
-  and update the changed tables in Schema Conversion, so the reload both recreates and
-  reads the new definition — a table whose DDL you edited, or whose key strategy you
-  chose, keeps that edit (redo or reset it), and a dropped or renamed column must be
-  dropped on Aurora DSQL first or the table re-applied with Replace (Drop & reload
-  refuses to destroy a target column the new definition no longer has); then
-  **Re-run Full Load with "Drop & reload"** (the default *Append* keeps existing rows, so updates and deletes made while
-  the stream was stopped would be lost; *Reload specific tables* and *Retry* keep the
-  original watermark). The new run's watermark is past where the stream stopped, so
-  Start CDC moves the offset forward to it (Start never rewinds, but it does advance).
-  A CDC-only run has no Full Load to re-run: switch the migration type to Full load +
-  CDC and do the same, or delete the CDC infrastructure and deploy again with a Manual
-  start point after the change (rows changed before that point must be reconciled).
+- **MySQL: a schema change between a CDC start point and the Start that uses it.** A
+  MySQL Start that seeds a new start position runs Debezium in `snapshot.mode=recovery`:
+  the first Start from the Full Load watermark or a Manual binlog start point (a MySQL
+  CDC-only first start needs one unless the session holds a Full Load watermark), a Start
+  after **Re-run Full Load** or a newer Manual point, and the first Start after **Delete
+  CDC infrastructure** and a new deploy — which reads again from the **original**
+  watermark. Under `recovery` Debezium rebuilds its schema history from the tables'
+  **current** definitions, then reads the binlog from that earlier position, matching
+  each row's values to columns by position. A schema change (`ALTER TABLE`, …) to a
+  captured table committed in between therefore breaks the stream: an added or dropped
+  column stops the connector on every Start, a renamed column stops it too, and a change
+  that keeps the column count (a type change other than a length or a DECIMAL precision,
+  a reorder, a dropped column replaced by another, a character-set conversion) writes
+  shifted or NULL values with **no error at all**.
+  - **The check.** The Full Load watermark, and **Fetch current position** for a Manual
+    point, record a short per-table fingerprint of the captured tables (column order,
+    types, NULL rules, character sets and primary key) just before reading the position.
+    Before such a Start, Start CDC compares the tables with it and **refuses**, naming
+    each changed table. The check reads the source, so it needs the source connection
+    (it refuses until you re-test it on the Connect step). It only **warns** when the
+    start point has no fingerprint: one recorded by an earlier version of the tool, a
+    position typed by hand, or one whose definitions could not be read. A new length of
+    a `CHAR`, `VARCHAR` or `VARBINARY` column, or a new `DECIMAL` precision at the same
+    scale, decodes the same and is not refused; the source schema re-check
+    ([§4.2](04-cdc-and-dsql-constraints.md#changes-that-dead-letter-nothing-the-source-schema-re-check))
+    still reports it, and the Aurora DSQL column may need widening. Widening an integer
+    type or appending an `ENUM` value is still refused: the fingerprint cannot tell it
+    from a narrowing or a reorder, which do decode wrongly.
+  - **What it cannot see.** A column rename on a table CDC does **not** capture
+    (Debezium tracks every table's definition, so it fails replaying it), a change made
+    while the connectors are being created, or one made shortly before an automatic
+    restart of that first run. A rename, or an added or dropped column, stops the
+    connector, and the CDC step names the cause. A change that keeps the column count
+    does not: the older rows are written with shifted or NULL values and no error. The
+    source schema re-check
+    ([§4.2](04-cdc-and-dsql-constraints.md#changes-that-dead-letter-nothing-the-source-schema-re-check))
+    reports a retype or a replaced column and holds Cut over. Neither check sees a
+    reorder or a character-set conversion, so validate the table with CHECKSUM after such
+    a change.
+  - **Starting again, Retry CDC and Debezium's "recovery mode" never help** — they replay
+    the same rows. Move the start point past the change: Stop CDC; refresh the source
+    inventory (re-run Step 1 Evaluation) and update the changed tables in Schema
+    Conversion, so the reload both recreates and reads the new definition — a table
+    whose DDL you edited, or whose key strategy you chose, keeps that edit (redo or reset
+    it), and a dropped or renamed column must be dropped on Aurora DSQL first or the
+    table re-applied with Replace (Drop & reload refuses to destroy a target column the
+    new definition no longer has); then **Re-run Full Load with "Drop & reload"** (the
+    default *Append* keeps existing rows, so updates and deletes made in between would
+    be lost; *Reload specific tables* and *Retry* keep the original watermark). The new
+    run's watermark is past the change, so Start CDC moves the offset forward to it. A
+    CDC-only run has no Full Load to re-run: update the changed tables on Aurora DSQL,
+    then choose **Manual**, **Fetch current position** and **Use this start point** on
+    the same stack (Start never rewinds a stopped stack's offset, but it does advance
+    it; on a stopped stack the start-point card offers this under **Manual — start from
+    a later binlog position instead**). Changes to the captured tables made before that
+    point are then not replicated: reload them with "Drop & reload" (Full load + CDC) or
+    correct them on Aurora DSQL (CDC only), and validate with CHECKSUM. A reload
+    switches the CDC start point back to Automatic, so choose Manual again (the fetched
+    point is kept) before Start CDC.
+  - **A restart after Stop CDC is different.** It continues from its recorded position
+    and **replays the recorded schema history** (`snapshot.mode=schema_only`), so a DDL
+    made while CDC was stopped is applied in order, like a change made while it streams,
+    and needs the same follow-up
+    ([Chapter 4 §4.2](04-cdc-and-dsql-constraints.md#42-cdc-replicates-data-not-schema--important)).
+    If that history is missing, the Start fails saying so. Stop CDC (or **Clean up
+    leftover connector**) if the connectors are still listed — a Start or Retry CDC on
+    connectors that exist keeps their snapshot mode and fails the same way — and the
+    next Start rebuilds it (`recovery`) after the same check. That check compares the
+    tables with the original start point, so a change made even before the Stop refuses
+    that Start.
 - **Cascading FK actions don't replicate over CDC.** Server-side `ON DELETE/UPDATE
   CASCADE` (and `SET NULL`/`SET DEFAULT`) actions fire *inside* the source engine
   and may not be captured by the change stream, so CDC can't apply them — the child

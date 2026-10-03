@@ -149,10 +149,11 @@ Parameters:
     Default: schema_only
     AllowedValues: [recovery, schema_only]
     Description: >
-      Debezium snapshot.mode. Use 'recovery' only when the offset-seeder Lambda
-      has pre-populated the schema-history topic (gapless Full-Load path). Use
-      'schema_only' for new connectors, CDC-only flows, or session resets where
-      no schema-history topic exists.
+      Debezium snapshot.mode (MySQL source; set by Start CDC). 'recovery' when Start
+      seeds a NEW start offset - Debezium rebuilds the schema history from the current
+      tables there; the tool first checks that the captured tables are unchanged since
+      that point. 'schema_only' to resume a stopped stack from its committed offset (the
+      recorded history is replayed in order) or when nothing is seeded.
 
   SourceDbServerId:
     Type: Number
@@ -1730,8 +1731,9 @@ Resources:
   # --- Debezium MySQL source connector ----------------------------------------
   # Configuration mirrors CdcPipelineOrchestrator.build_source_config:
   # table.include.list = selected tables, snapshot.mode = Ref: SnapshotMode
-  # (schema_only when no offset is seeded; recovery when a start offset is seeded
-  # — see below). The start offset (the binlog file:position of the Full Load
+  # (recovery when Start seeds a new start offset; schema_only for a resume of a
+  # stopped stack or when nothing is seeded — see below). The start offset (the
+  # binlog file:position of the Full Load
   # watermark, or of the operator's Manual start point) is seeded by the control
   # plane into the connect-offsets topic (gapless from a Full Load, Property 11) —
   # it is not a static connector config key, so it is documented here rather than
@@ -1897,22 +1899,22 @@ Resources:
             - HasTopicGroup4
             - Fn::Sub: "${MaxMessageBytes}"
             - Ref: AWS::NoValue
-        # Full Load already loaded the row data; we only need to resume streaming
-        # from the watermark-seeded connect-offset WITHOUT re-reading any rows.
-        # MUST be `recovery` (NOT schema_only/no_data): the offset seeder seeds the
-        # connect-offsets topic, so Debezium sees a recorded position and takes the
-        # RESUME path -- which requires the schema-history topic to already exist.
-        # It does not (only the offset was seeded), so schema_only/no_data die with
-        # "The db history topic is missing". `recovery` is built for exactly this:
-        # with an existing offset it rebuilds the schema-history topic from the
-        # snapshot.mode is parameterized (SnapshotMode):
-        # - schema_only: fresh connector, CDC-only, or session reset — reads the
-        #   current source schema from scratch and streams from the given offset.
-        # - recovery: gapless Full-Load path where the offset seeder Lambda has
-        #   pre-populated schema-history — rebuilds history from the CURRENT source
-        #   tables without re-reading rows.
-        # store.only.captured.tables.ddl=false (default) lets recovery/schema_only
-        # cover all tables' DDL.
+        # Full Load already loaded the row data, so neither mode re-reads rows.
+        # snapshot.mode is parameterized (SnapshotMode, chosen by Start CDC):
+        # - recovery: Start seeded a NEW start offset (the Full Load watermark, a
+        #   newer Manual point, the first Start after a redeploy). Debezium sees a
+        #   recorded position but the schema-history topic never saw the binlog up
+        #   to it, so it rebuilds the history from the CURRENT source tables and
+        #   reads from the offset. Correct only while the captured tables are
+        #   unchanged since the offset; the tool checks that before such a Start.
+        # - schema_only (= no_data in Debezium 2.7): a resume of a stopped stack —
+        #   the recorded history is replayed to the committed offset and later DDL
+        #   is applied in binlog order; with no offset at all, it reads the current
+        #   schema and streams from the current position. With an offset but no
+        #   history it dies with "The db history topic is missing" (the next Start
+        #   then uses recovery).
+        # store.only.captured.tables.ddl=false (default) keeps every table's DDL in
+        # the history, so a rename on ANY table is replayed too.
         snapshot.mode:
           Ref: SnapshotMode
         # When the source has gtid_mode=OFF or OFF_PERMISSIVE, new transactions

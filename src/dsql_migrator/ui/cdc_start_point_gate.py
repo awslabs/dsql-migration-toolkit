@@ -1,0 +1,357 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""The MySQL CDC start-point check: refuse a ``snapshot.mode=recovery`` Start whose captured
+tables changed since the start point. Pure (verdict + copy); the read lives in
+``data_migration._cdc_status.read_cdc_start_point_once``.
+
+A MySQL Start that seeds a NEW start offset (the first Start from the Full Load watermark or
+a Manual binlog point, a Start after Re-run Full Load or a newer Manual point, the first
+Start after Delete CDC infrastructure) runs Debezium in ``recovery`` mode: it rebuilds its
+schema history from the tables AS THEY ARE NOW and then reads the binlog from that EARLIER
+position, matching row values to columns by position. A column added or dropped since then
+stops the connector on every start, a rename stops it, and a same-count change (a type
+change other than a CHAR / VARCHAR / VARBINARY length or a DECIMAL precision, a reorder, a
+replacement, a character-set conversion) writes shifted or NULL values with no error at
+all. Starting again, Retry CDC and Debezium's own "recovery mode" advice all replay the same
+rows, so the only way forward is a start point after the change.
+
+The start point records a short per-table fingerprint (``core.cdc_catalog_drift``): the
+Full Load watermark does, just before its binlog position, and so does Fetch current
+position for a Manual point. Start CDC compares the captured tables with it -- in the Start
+dialog and again on the job's worker thread (Retry CDC skips the dialog) -- with ONE bounded
+catalog statement. A resume of a stopped stack (``schema_only``: the recorded history is
+replayed in binlog order) is not checked, and neither is a stack whose connectors exist --
+except a resume whose schema history is missing: it rebuilds the history (``recovery``) at
+the committed position, so it is checked against the start point, which that position is
+past, and its copy says so (``resumes``).
+
+Policy: a changed table is an error and blocks; a recorded fingerprint that cannot be
+compared (no source connection, a failed read) blocks too, because the class it guards is
+silent; a start point with no fingerprint (an earlier version of the tool, a typed position,
+a failed capture) only warns, as before this check existed. Value-free (Property 7): table
+names, fixed reason texts and an exception class name only.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+from dsql_migrator.core.activity_log import ActivityStatus
+
+KIND_OK = "ok"
+KIND_CHANGED = "changed"
+KIND_UNREADABLE = "unreadable"
+KIND_UNVERIFIED = "unverified"
+
+PROBLEM_NO_BASELINE = "no-baseline"
+PROBLEM_NO_SOURCE = "no-source-connection"
+PROBLEM_READ_FAILED = "read-failed"
+
+# How many tables a notice names before counting the rest.
+TABLE_LIMIT = 6
+
+ACTION_CHANGED = "start blocked: captured tables changed since the CDC start point"
+ACTION_UNREADABLE = "start blocked: CDC start point not checkable"
+ACTION_UNVERIFIED = "CDC start point not checked"
+
+E1_HEADER = "Captured tables changed since the CDC start point"
+E2_HEADER = "Cannot check the captured tables against the CDC start point"
+W1_HEADER = "The captured tables cannot be checked against this start point"
+
+E1_TOOLTIP = "A captured table changed since the CDC start point — see the notice above."
+E2_TOOLTIP = (
+    "The captured tables could not be checked against the CDC start point — see the "
+    "notice above."
+)
+
+NO_SEED_LABEL = "this stack's recorded stream position"
+# How :func:`point_label` names a Manual point (the no-baseline causes differ by origin).
+_MANUAL_PREFIX = "your Manual start point"
+
+
+@dataclass(frozen=True)
+class StartPointVerdict:
+    """The outcome of one start-point check (value-free).
+
+    ``kind``: ``ok`` / ``changed`` (``changed`` holds ``(table, reason)`` pairs) /
+    ``unreadable`` (``problem`` is ``no-source-connection`` or ``read-failed``, with the
+    exception class) / ``unverified`` (``unverified`` lists the tables with no usable
+    fingerprint; ``problem`` is ``no-baseline`` when the start point has none at all).
+    """
+
+    kind: str
+    changed: tuple = ()
+    unverified: tuple = ()
+    problem: Optional[str] = None
+    error_class: Optional[str] = None
+
+    @property
+    def blocks(self) -> bool:
+        """Whether Start CDC must refuse."""
+        return self.kind in (KIND_CHANGED, KIND_UNREADABLE)
+
+
+def verdict_from_check(check: object) -> StartPointVerdict:
+    """A verdict from ``core.cdc_catalog_drift.check_start_point``'s result. Pure."""
+    changed = tuple(getattr(check, "changed", ()) or ())
+    unverified = tuple(getattr(check, "unverified", ()) or ())
+    if changed:
+        return StartPointVerdict(kind=KIND_CHANGED, changed=changed, unverified=unverified)
+    if unverified:
+        return StartPointVerdict(kind=KIND_UNVERIFIED, unverified=unverified)
+    return StartPointVerdict(kind=KIND_OK)
+
+
+def _coord(seed: object) -> str:
+    f = getattr(seed, "binlog_file", None)
+    p = getattr(seed, "binlog_position", None)
+    return f"binlog {f}:{p}" if f and p is not None else ""
+
+
+def point_coord(seed: object) -> str:
+    """``binlog F:P`` of the start point, or the no-seed label. Pure."""
+    return _coord(seed) or NO_SEED_LABEL
+
+
+def point_label(seed: object, origin: str) -> str:
+    """How the copy names the start point. Pure."""
+    coord = _coord(seed)
+    if not coord:
+        return NO_SEED_LABEL
+    if origin == "manual":
+        return f"{_MANUAL_PREFIX} ({coord})"
+    ts = getattr(seed, "snapshot_timestamp", None)
+    when = ts.strftime("%Y-%m-%d %H:%M UTC") if hasattr(ts, "strftime") else ""
+    return f"the Full Load watermark ({coord}, captured {when})" if when else (
+        f"the Full Load watermark ({coord})"
+    )
+
+
+def _capitalized(text: str) -> str:
+    return text[:1].upper() + text[1:]
+
+
+def _capped(items: "tuple | list") -> str:
+    shown = list(items)[:TABLE_LIMIT]
+    rest = len(items) - len(shown)
+    return "; ".join(shown) + (f" (+{rest} more)" if rest > 0 else "")
+
+
+def _names(items: "tuple | list") -> str:
+    shown = list(items)[:TABLE_LIMIT]
+    rest = len(items) - len(shown)
+    return ", ".join(shown) + (f" (+{rest} more)" if rest > 0 else "")
+
+
+def _cdc_only(migration_type: object) -> bool:
+    value = getattr(migration_type, "value", migration_type)
+    return str(value or "") == "cdc_only"
+
+
+def changed_rows(verdict: StartPointVerdict) -> str:
+    """``db.t (reason); ...`` capped at :data:`TABLE_LIMIT`. Pure."""
+    return _capped([f"{name} ({reason})" for name, reason in verdict.changed])
+
+
+# A reload resets a Full load + CDC Manual point to Automatic (reset_stale_manual_start_point),
+# which offers this start point again: the Manual route must say to re-choose it, or it loops.
+RELOAD_RESETS_MANUAL = (
+    "A reload switches the CDC start point back to Automatic, so choose Manual again and "
+    "Use this start point before Start CDC (the fetched point is kept)."
+)
+
+
+def _ways_after_change(coord: str, migration_type: object) -> str:
+    if _cdc_only(migration_type):
+        return (
+            "To continue, give CDC a start point after the change: update these tables on "
+            "Aurora DSQL to their new definitions (re-run Step 1 and Schema Conversion), "
+            "then choose Manual, then Fetch current position and Use this start point. "
+            f"Changes made between {coord} and the new point are not replicated: correct "
+            "them on Aurora DSQL and validate with CHECKSUM."
+        )
+    return (
+        "To continue, give CDC a start point after the change: re-run Step 1 (Evaluation) "
+        "and update these tables in Schema Conversion, then Re-run Full Load for all tables "
+        "with \"Drop & reload\" — its new watermark is past the change (Reload specific "
+        "tables and Retry keep this one). Or choose Manual, then Fetch current position "
+        "and Use this start point: changes to every captured table between "
+        f"{coord} and that point are then not replicated, so reload them with \"Drop & "
+        f"reload\" and validate with CHECKSUM. {RELOAD_RESETS_MANUAL}"
+    )
+
+
+def _unreadable_reason(verdict: StartPointVerdict) -> tuple[str, str]:
+    if verdict.problem == PROBLEM_NO_SOURCE:
+        return (
+            "this session has no source connection (the source password is kept in memory "
+            "only, so an app restart clears it).",
+            "Test the source connection on the Connect step, then Start CDC again.",
+        )
+    return (
+        f"reading their definitions failed ({verdict.error_class or 'error'}).",
+        "Check that the source database is reachable from the tool, then Start CDC again.",
+    )
+
+
+def _unverified_reason(verdict: StartPointVerdict, point: str) -> str:
+    if verdict.problem == PROBLEM_NO_BASELINE:
+        if point == NO_SEED_LABEL:
+            return f"{_capitalized(point)} has no recorded definitions of the captured tables."
+        # The causes a start point of THIS origin can have: a watermark is never typed.
+        causes = (
+            "typed by hand, fetched by an earlier version of the tool, or the definitions "
+            "could not be read at the time"
+            if point.startswith(_MANUAL_PREFIX)
+            else "captured by an earlier version of the tool, or the definitions could not "
+            "be read at the time"
+        )
+        return (
+            f"{_capitalized(point)} has no recorded definitions of the captured tables "
+            f"({causes})."
+        )
+    return (
+        f"These captured tables were not recorded with {point}: "
+        f"{_names(verdict.unverified)}."
+    )
+
+
+# A checked RESUME is only ever the history-missing one (an ordinary resume runs schema_only
+# and is not checked): it rebuilds the history at the committed position, not at the point.
+_RESUME_LEAD = (
+    "This start continues from this stack's recorded stream position and rebuilds "
+    "Debezium's schema history, which is missing, from the tables' definitions as they "
+    "are now"
+)
+# What W1 calls an alteration that matters (a length or DECIMAL precision change does not).
+_ALTERED = (
+    "a column added, dropped, renamed, reordered, or changed to another type — a new "
+    "length or DECIMAL precision aside"
+)
+
+
+def start_point_notice(
+    verdict: Optional[StartPointVerdict],
+    *,
+    point_label: str,
+    coord: str,
+    migration_type: object,
+    resumes: bool = False,
+) -> Optional[tuple[str, str, str, str]]:
+    """``(tone, icon, header, body)`` for the Start dialog / the job's refusal, or None. Pure.
+
+    ``resumes``: the start resumes the stack's committed offset (a history-missing resume,
+    the only checked one), so the copy says it reads from the recorded stream position --
+    not from ``point_label``, which is only what the tables can be compared with.
+    """
+    if verdict is None or verdict.kind == KIND_OK:
+        return None
+    point = point_label
+    if verdict.kind == KIND_CHANGED:
+        if resumes:
+            lead = (
+                f"{_RESUME_LEAD}. The tool can compare them only with {point}, which that "
+                "position is past. If a table changed while CDC was stopped, row changes "
+                "written before the change would be read with the wrong columns (the "
+                "connector stops, or can write shifted, wrapped or NULL values without any "
+                "error); a change made before Stop CDC would be harmless, but the tool "
+                "cannot tell the two apart."
+            )
+        else:
+            lead = (
+                f"Start CDC would read the binary log from {point} using the tables' "
+                "definitions as they are now, so row changes written before the change "
+                "would be read with the wrong columns: the connector stops on every start "
+                "when a column was added, dropped or renamed, and otherwise can write "
+                "shifted, wrapped or NULL values without any error. Starting again, Retry "
+                "CDC and Debezium's \"recovery mode\" all replay the same way."
+            )
+        body = (
+            f"{lead} Changed since {coord}: {changed_rows(verdict)}. "
+            f"{_ways_after_change(coord, migration_type)} No connectors were changed."
+        )
+        return "error", "schema", E1_HEADER, body
+    if verdict.kind == KIND_UNREADABLE:
+        reason, exit_ = _unreadable_reason(verdict)
+        lead = (
+            f"{_RESUME_LEAD}, so Start CDC first checks the captured tables against {point}"
+            if resumes
+            else f"This start reads the binary log from {point} using the tables' definitions "
+            "as they are now, so Start CDC first checks that no captured table changed since "
+            "then"
+        )
+        body = f"{lead}, and {reason} {exit_} No connectors were changed."
+        return "error", "link_off", E2_HEADER, body
+    way = (
+        "choose Manual, then Fetch current position and Use this start point for a start "
+        "point the tool can check (changes made before it are then not replicated)."
+        if _cdc_only(migration_type)
+        else 're-run the Full Load with "Drop & reload" for a start point the tool can check.'
+    )
+    reads = (
+        f"{_RESUME_LEAD}, so if one of them was altered while CDC was stopped ({_ALTERED})"
+        if resumes
+        else f"CDC reads the binary log from {point} using the tables' definitions as they "
+        f"are now, so if one of them was altered since then ({_ALTERED})"
+    )
+    body = (
+        f"{_unverified_reason(verdict, point)} {reads}, the connector stops or writes wrong "
+        f"values. Start only if none was; otherwise {way}"
+    )
+    return "warning", "help_outline", W1_HEADER, body
+
+
+def start_point_tooltip(verdict: Optional[StartPointVerdict]) -> Optional[str]:
+    """The disabled Start button's tooltip for a blocking verdict, else None. Pure."""
+    if verdict is None:
+        return None
+    if verdict.kind == KIND_CHANGED:
+        return E1_TOOLTIP
+    if verdict.kind == KIND_UNREADABLE:
+        return E2_TOOLTIP
+    return None
+
+
+def start_point_activity(
+    verdict: Optional[StartPointVerdict], *, point_label: str
+) -> Optional[tuple[str, ActivityStatus, str]]:
+    """``(action, status, detail)`` for the activity log, or None. Pure; names and reasons
+    only, never values."""
+    if verdict is None or verdict.kind == KIND_OK:
+        return None
+    if verdict.kind == KIND_CHANGED:
+        return (
+            ACTION_CHANGED, ActivityStatus.FAILURE,
+            f"{E1_HEADER}: {changed_rows(verdict)}",
+        )
+    if verdict.kind == KIND_UNREADABLE:
+        return ACTION_UNREADABLE, ActivityStatus.FAILURE, _unreadable_reason(verdict)[0]
+    return ACTION_UNVERIFIED, ActivityStatus.INFO, _unverified_reason(verdict, point_label)
+
+
+__all__ = [
+    "ACTION_CHANGED",
+    "ACTION_UNREADABLE",
+    "ACTION_UNVERIFIED",
+    "E1_HEADER",
+    "E2_HEADER",
+    "W1_HEADER",
+    "KIND_CHANGED",
+    "KIND_OK",
+    "KIND_UNREADABLE",
+    "KIND_UNVERIFIED",
+    "PROBLEM_NO_BASELINE",
+    "PROBLEM_NO_SOURCE",
+    "PROBLEM_READ_FAILED",
+    "RELOAD_RESETS_MANUAL",
+    "StartPointVerdict",
+    "changed_rows",
+    "point_coord",
+    "point_label",
+    "start_point_activity",
+    "start_point_notice",
+    "start_point_tooltip",
+    "verdict_from_check",
+]

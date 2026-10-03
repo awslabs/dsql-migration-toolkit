@@ -243,6 +243,10 @@ def capture_session_snapshot(
         cdc_start_gtid=migration_state._cdc_start_gtid,  # type: ignore[attr-defined]
         cdc_start_binlog_file=migration_state._cdc_start_binlog_file,  # type: ignore[attr-defined]
         cdc_start_binlog_pos=migration_state._cdc_start_binlog_pos,  # type: ignore[attr-defined]
+        cdc_start_fingerprints=dict(
+            getattr(migration_state, "cdc_start_fingerprints", dict)()
+        ),
+        cdc_history_missing=bool(getattr(migration_state, "cdc_history_missing", False)),
         cdc_lob_exclusions=_flatten_lob_exclusions(
             migration_state.lob_exclusions()  # type: ignore[attr-defined]
         ),
@@ -682,6 +686,9 @@ def apply_session_snapshot(
         gtid=snapshot.cdc_start_gtid,
         binlog_file=snapshot.cdc_start_binlog_file,
         binlog_pos=snapshot.cdc_start_binlog_pos,
+        # Bound to the coordinates restored with them (set_cdc_start_position drops them
+        # when there is no binlog file:position).
+        fingerprints=snapshot.cdc_start_fingerprints,
     )
     migration_state.set_cdc_start_mode(  # type: ignore[attr-defined]
         snapshot.cdc_start_mode or "auto"
@@ -802,6 +809,11 @@ def apply_session_snapshot(
             str(t): [str(c) for c in (cols or ())]
             for t, cols in snapshot.cdc_deployed_message_key_columns.items()
         }
+    # The history-missing flag AFTER the stack name too: a name change clears it, and this
+    # flag is the restored stack's own.
+    _note_history = getattr(migration_state, "note_cdc_history_missing", None)
+    if callable(_note_history):
+        _note_history(bool(getattr(snapshot, "cdc_history_missing", False)))
     if snapshot.cdc_infra_inputs:
         migration_state.set_cdc_infra_inputs(dict(snapshot.cdc_infra_inputs))  # type: ignore[attr-defined]
 
@@ -1005,6 +1017,8 @@ def session_signature(
         migration_state._cdc_start_gtid,  # type: ignore[attr-defined]
         migration_state._cdc_start_binlog_file,  # type: ignore[attr-defined]
         migration_state._cdc_start_binlog_pos,  # type: ignore[attr-defined]
+        tuple(sorted(getattr(migration_state, "cdc_start_fingerprints", dict)().items())),
+        bool(getattr(migration_state, "cdc_history_missing", False)),
         lob_sig,
         _exclusion_semantics_sig(migration_state),
         # Reconnect-relevant fields so a change to any of them triggers a save.

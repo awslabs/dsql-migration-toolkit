@@ -470,7 +470,7 @@ drop하거나 쓰기 전에 모든 테이블을 실패시키고, Start CDC는 �
 | 아직 아무것도 실행하지 않음(Full Load 없음, CDC 스택 없음) | 잠기지 않음: 규칙을 편집하고 Save합니다. |
 | CDC 인프라를 삭제하는 중 | 삭제가 끝나기를 기다립니다. 팝업이 엔진별 예상 시간(MySQL은 약 15-25분, PostgreSQL은 약 2-5분)을 보여 줍니다. |
 | CDC 인프라를 생성하는 중 | 생성이 끝나기를 기다린 뒤, 해당하는 "CDC 스택이 있음" 행을 따릅니다. |
-| CDC 스택이 있음(배포됨, 스트리밍 중 또는 멈춤), 그리고 Full Load가 실행됨 | 1. 스트리밍 중이면 Stop CDC한 뒤, CDC 단계에서 **Delete CDC infrastructure**. 2. 영향받은 테이블에 **Change & reload**를 사용(CDC only라면 먼저 Full load + CDC로 전환). 3. 다시 배포하고 Start CDC. |
+| CDC 스택이 있음(배포됨, 스트리밍 중 또는 멈춤), 그리고 Full Load가 실행됨 | 1. 스트리밍 중이면 Stop CDC한 뒤, CDC 단계에서 **Delete CDC infrastructure**. 2. 영향받은 테이블에 **Change & reload**를 사용(CDC only라면 먼저 Full load + CDC로 전환). 3. 다시 배포하고 Start CDC(MySQL은 아래 "삭제 후 다시 CDC 시작" 참고). |
 | CDC 스택이 있음, Full Load는 실행되지 않음, CDC only | 스트리밍 중이면 Stop CDC, Delete CDC infrastructure, 규칙 변경(CDC가 한 번이라도 스트리밍했다면 컬럼 규칙만 가능: 테이블 집합을 바꾸려면 Start over가 필요), 다시 배포하고 Start CDC. 스택을 삭제하면 스트림 위치도 삭제됩니다(아래 참고). |
 | CDC 스택이 있음, 아직 Full Load가 실행되지 않음(Full load + CDC) | 스트리밍 중이면 Stop CDC, Delete CDC infrastructure, 규칙 변경, 다시 배포한 뒤 Start Full Load. 재적재할 것은 없습니다. CDC가 이미 스트리밍했다면 Start Full Load 다이얼로그에서 drop 후 재생성을 선택하세요. |
 | CDC 스택이 없음, 그리고 Full Load가 실행됨(Full load only 또는 Full load + CDC) | **Change & reload**(다음 절). Full load only: 테이블 집합도 바꿀 수 있습니다(아래 "Full Load 후 테이블 집합 바꾸기" 참고). |
@@ -486,6 +486,10 @@ drop하거나 쓰기 전에 모든 테이블을 실패시키고, Start CDC는 �
   바꾸기"를 참고하세요.
 - **삭제 후 다시 CDC 시작.** MySQL에서는 시작 지점이 Automatic인 Start CDC가 Full Load 워터마크에서
   다시 시드합니다(그 로드 이후의 binlog가 아직 있어야 하며, purge되었다면 Start CDC가 경고합니다).
+  Change & reload는 그 워터마크를 유지하므로, 그 로드 이후 캡처 대상 테이블의 정의가 바뀌었다면(예: 소스에
+  추가된 컬럼) Start CDC가 거부하기도 합니다: 그때는 더 새 워터마크를 위해 "Drop & reload"로 모든 테이블에
+  Re-run Full Load를 실행하거나, Manual을 선택하고 Fetch current position을 사용하세요
+  ([6장](06-limitations.md) 참고).
   PostgreSQL에서는 스택을 삭제하면 복제 슬롯과 publication이 drop되므로, Start CDC 다이얼로그에서
   **"Re-snapshot every table instead"**를 선택하세요.
 - **CDC only 스택을 삭제하는 대가.** MySQL에서는 시작 지점이 Automatic인 다음 Start CDC가 소스의 현재

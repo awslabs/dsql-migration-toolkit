@@ -3758,6 +3758,19 @@ def _run_start_cdc_capture(
     manual_binlog=None,
     manual_gtid=None,
     job_watermark=None,
+    committed=False,
+    deployed=None,
+    live_mode=None,
+    history_missing=False,
+    start_point_read=None,
+    describe_params=None,
+    run_raises=None,
+    state=None,
+    source_password=None,
+    catch=False,
+    inventory=None,
+    selected=None,
+    migration_type=None,
 ):
     """Drive _start_cdc_deploy end to end (running the submitted job body) and capture it.
 
@@ -3765,6 +3778,14 @@ def _run_start_cdc_capture(
     whether a job was submitted, "details": the activity-log details}``. ``start_mode`` /
     ``manual_binlog`` (``(file, pos)``) / ``manual_gtid`` set the CDC start point;
     ``job_watermark`` is the Full Load job's watermark (a DONE job).
+
+    G5 knobs (defaults keep every earlier caller unchanged): ``committed`` / ``deployed`` /
+    ``live_mode`` / ``history_missing`` seed the cached stack facts; ``start_point_read``
+    stubs ``_cdc_status.read_cdc_start_point_once``; ``describe_params`` gives the fake
+    deployer a ``describe_stack_or_none``; ``run_raises`` makes run_cdc_start raise after
+    capturing; ``state`` reuses a DataMigrationState across runs; ``catch`` returns the
+    job's exception as ``"error"`` instead of raising. ``"events"`` holds every
+    ``_log_cdc_event`` call as ``(action, kwargs)``.
     """
     from types import SimpleNamespace
 
@@ -3775,6 +3796,7 @@ def _run_start_cdc_capture(
 
     captured = {}
     details: list = []
+    events: list = []
 
     class _Deployer:
         template_s3_bucket = ""
@@ -3784,15 +3806,28 @@ def _run_start_cdc_capture(
                 get_caller_identity=lambda: {"Account": "111122223333"}
             )
 
+    if describe_params is not None:
+        _Deployer.describe_stack_or_none = (
+            lambda self, _name: SimpleNamespace(current_parameters=dict(describe_params))
+        )
+
     def _run(*_a, **kw):
         captured.update(kw)
+        if run_raises is not None:
+            raise run_raises
+
+    def _log(*a, **k):
+        details.append(k.get("detail"))
+        events.append((a[0] if a else None, k))
 
     monkeypatch.setattr(_dep, "build_cdc_stack_deployer", lambda *a, **k: _Deployer())
     monkeypatch.setattr(_dep, "run_cdc_start", _run)
     monkeypatch.setattr(_cdcui, "_read_cdc_template_body", lambda: "TEMPLATE-BODY")
-    monkeypatch.setattr(
-        _cdcui, "_log_cdc_event", lambda *a, **k: details.append(k.get("detail"))
-    )
+    monkeypatch.setattr(_cdcui, "_log_cdc_event", _log)
+    if start_point_read is not None:
+        import dsql_migrator.ui.data_migration._cdc_status as _status
+
+        monkeypatch.setattr(_status, "read_cdc_start_point_once", start_point_read)
     # The FK precondition is fail-closed and this fake session has no readable target
     # catalog, so stub it "clean" -- these tests are about seed mode / job deferral, and
     # the gate itself is covered by test_cdc_start_*_foreign_key* below.
@@ -3850,12 +3885,23 @@ def _run_start_cdc_capture(
             username="admin",
         ),
         aws_profile=None,
-        source_password=None,
+        source_password=source_password,
         source_config=source_config,
         source_secret_id=None,
     )
-    state = DataMigrationState()
-    state.set_selection(TableSelection(selected_tables=["orders"]))
+    if state is None:
+        state = DataMigrationState()
+        state.set_selection(TableSelection(selected_tables=list(selected or ["orders"])))
+        if migration_type is not None:
+            state.migration_type = migration_type
+        if committed:
+            state.set_cdc_has_committed_offset(True)
+        if deployed is not None:
+            state.set_cdc_deployed_watermark(deployed)
+        if live_mode is not None:
+            state.set_cdc_deployed_snapshot_mode(live_mode)
+        if history_missing:
+            state.note_cdc_history_missing(True)
     if job_watermark is not None:
         state.job_id = "fl-job"
     if start_mode is not None:
@@ -3866,17 +3912,28 @@ def _run_start_cdc_capture(
 
     jm = _SubmitOnlyJM()
     _cdcui._start_cdc_deploy(
-        _Ui(), state, jm, lambda: None, inventory=_inventory(), session=session
+        _Ui(), state, jm, lambda: None,
+        inventory=inventory if inventory is not None else _inventory(), session=session,
     )
     # A refusing pre-flight submits NO job, so the caller distinguishes the two by
     # `submitted` rather than by an assertion buried in this helper.
+    error = None
     if jm.work is not None:
-        jm.work(SimpleNamespace())
+        if catch:
+            try:
+                jm.work(SimpleNamespace())
+            except Exception as exc:  # noqa: BLE001 - returned to the caller
+                error = exc
+        else:
+            jm.work(SimpleNamespace())
     return {
         "kwargs": captured,
         "notices": notices,
         "submitted": jm.work is not None,
         "details": details,
+        "events": events,
+        "error": error,
+        "state": state,
     }
 
 
@@ -4068,6 +4125,442 @@ def test_start_cdc_postgres_keeps_the_job_watermark_under_manual(monkeypatch) ->
     assert run["submitted"]
     assert run["kwargs"]["watermark"] == pg_wm
     assert run["kwargs"]["seed_origin"] == "full_load"
+
+
+# ---------------------------------------------------------------------------
+# G5 (MySQL): resume with schema_only; gate every recovery start on the start point
+# ---------------------------------------------------------------------------
+
+def _g5_live(cols):
+    from dsql_migrator.core.cdc_catalog_drift import LiveColumn, LiveTable
+
+    return LiveTable(
+        columns=tuple(LiveColumn(n, t, nl, False, i) for i, (n, t, nl) in enumerate(cols)),
+        primary_key=frozenset({"id"}),
+    )
+
+
+_G5_OLD = (("id", "int", False), ("qty", "int", True))
+_G5_NEW = _G5_OLD + (("note", "varchar(9)", True),)
+
+
+def _g5_inventory():
+    return SourceInventory(tables=[
+        TableDef(
+            name="app.orders",
+            columns=[
+                ColumnDef(name="id", mysql_type="int", nullable=False),
+                ColumnDef(name="qty", mysql_type="int", nullable=True),
+            ],
+            primary_key=["id"],
+        )
+    ])
+
+
+def _g5_wm(file="mysql-bin.000100", pos=4, fingerprints=True):
+    from dsql_migrator.core.cdc_catalog_drift import start_point_value
+
+    return Watermark(
+        binlog_file=file,
+        binlog_position=pos,
+        snapshot_timestamp=datetime(2026, 10, 1, 9, 30, tzinfo=timezone.utc),
+        table_row_counts={"app.orders": 1},
+        table_fingerprints=(
+            {"app.orders": start_point_value(_g5_live(_G5_OLD))} if fingerprints else {}
+        ),
+    )
+
+
+def _g5_patch_source(monkeypatch, live=None, fail=None):
+    """Patch the start-point READ's engine + catalog statement (the check itself is real)."""
+    from types import SimpleNamespace
+
+    import dsql_migrator.core.cdc_catalog_drift as _drift
+    import dsql_migrator.ui.data_migration._cdc_status as _status
+
+    reads: list = []
+
+    class _Engine:
+        def connect(self):
+            class _Ctx:
+                def __enter__(self):
+                    return SimpleNamespace()
+
+                def __exit__(self, *_a):
+                    return False
+
+            return _Ctx()
+
+        def dispose(self):
+            reads.append("disposed")
+
+    monkeypatch.setattr(
+        _status, "make_source_engine_factory",
+        lambda *_a, **_k: (lambda _cfg: _Engine()),
+    )
+
+    def _read(_conn, names, source_type=None):
+        reads.append(tuple(names))
+        if fail is not None:
+            raise fail
+        return {n: (live or {})[n] for n in names if n in (live or {})}
+
+    monkeypatch.setattr(_drift, "read_live_catalog", _read)
+    return reads
+
+
+def _g5_never(*_a, **_k):
+    raise AssertionError("the start-point check must not run for this start")
+
+
+def _g5_run(monkeypatch, **kw):
+    from dsql_migrator.core.models import SourceType
+
+    kw.setdefault("source_type", SourceType.MYSQL)
+    kw.setdefault("inventory", _g5_inventory())
+    kw.setdefault("selected", ["app.orders"])
+    kw.setdefault("catch", True)
+    return _run_start_cdc_capture(monkeypatch, **kw)
+
+
+def _g5_mode(run):
+    return dict(run["kwargs"]["params"].filled)["SnapshotMode"]
+
+
+def test_start_cdc_resume_of_a_stopped_stack_sends_schema_only_and_skips_the_check(
+    monkeypatch,
+) -> None:
+    # Stopped after streaming from 000100:4; the same watermark is offered again, so the
+    # seeder keeps the committed offset: a RESUME. recovery would rebuild the history from
+    # the tables as they are now and read older rows with it (12a-12c); schema_only replays
+    # the recorded history. A resume is never gated on the original watermark (that would
+    # dead-end the Stop -> Drop & reload -> Start drift runbooks).
+    run = _g5_run(
+        monkeypatch, job_watermark=_g5_wm(), committed=True,
+        deployed=("mysql-bin.000100", "4"), start_point_read=_g5_never,
+    )
+    assert run["error"] is None and run["submitted"]
+    assert _g5_mode(run) == "schema_only"
+    assert "snapshot.mode schema_only" in run["details"][0]
+
+
+def test_start_cdc_refuses_when_a_captured_table_changed_since_the_watermark(
+    monkeypatch,
+) -> None:
+    from dsql_migrator.ui.cdc_start_point_gate import ACTION_CHANGED
+
+    reads = _g5_patch_source(monkeypatch, live={"app.orders": _g5_live(_G5_NEW)})
+    run = _g5_run(monkeypatch, job_watermark=_g5_wm(), source_password="pw")
+    err = run["error"]
+    assert isinstance(err, RuntimeError)
+    msg = str(err)
+    assert msg.startswith(
+        "Start CDC blocked: Captured tables changed since the CDC start point"
+    )
+    assert "app.orders (columns added or dropped: 2 → 3)" in msg
+    assert "Fetch current position" in msg and "Drop & reload" in msg
+    assert "Start CDC again" not in msg
+    assert run["kwargs"] == {}  # run_cdc_start never ran: no connector was touched
+    assert reads[0] == ("app.orders",) and "disposed" in reads
+    failures = [k for a, k in run["events"] if a == ACTION_CHANGED]
+    assert failures and "app.orders" in failures[0]["detail"]
+    assert failures[0]["status"].name == "FAILURE"
+
+
+def test_start_cdc_sends_recovery_when_the_tables_still_match(monkeypatch) -> None:
+    _g5_patch_source(monkeypatch, live={"app.orders": _g5_live(_G5_OLD)})
+    run = _g5_run(monkeypatch, job_watermark=_g5_wm(), source_password="pw")
+    assert run["error"] is None
+    assert _g5_mode(run) == "recovery"
+    assert "snapshot.mode recovery" in run["details"][0]
+
+
+def test_start_cdc_refuses_a_fingerprinted_start_without_a_source_connection(
+    monkeypatch,
+) -> None:
+    # A Secrets-Manager-auth session after a restart passes the connection pre-check but
+    # holds no password: the check cannot run, and the class it guards is silent.
+    reads = _g5_patch_source(monkeypatch, live={"app.orders": _g5_live(_G5_OLD)})
+    run = _g5_run(monkeypatch, job_watermark=_g5_wm(), source_password=None)
+    msg = str(run["error"])
+    assert msg.startswith("Start CDC blocked: Cannot check the captured tables")
+    assert "Test the source connection" in msg
+    assert run["kwargs"] == {} and reads == []
+
+
+def test_start_cdc_refuses_on_a_failed_read_with_the_error_class_only(monkeypatch) -> None:
+    _g5_patch_source(
+        monkeypatch, fail=RuntimeError("Can't connect to secret-host.internal:3306")
+    )
+    run = _g5_run(monkeypatch, job_watermark=_g5_wm(), source_password="pw")
+    msg = str(run["error"])
+    assert "(RuntimeError)" in msg and "secret-host" not in msg
+    assert run["kwargs"] == {}
+    assert all("secret-host" not in str(k.get("detail")) for _a, k in run["events"])
+
+
+def test_start_cdc_without_a_fingerprint_proceeds_and_logs_that_it_was_not_checked(
+    monkeypatch,
+) -> None:
+    from dsql_migrator.ui.cdc_start_point_gate import ACTION_UNVERIFIED
+
+    reads = _g5_patch_source(monkeypatch, live={})
+    run = _g5_run(monkeypatch, job_watermark=_g5_wm(fingerprints=False))
+    assert run["error"] is None and _g5_mode(run) == "recovery"
+    assert reads == []  # nothing to compare with: no connection at all
+    infos = [k for a, k in run["events"] if a == ACTION_UNVERIFIED]
+    assert infos and infos[0]["status"].name == "INFO"
+    assert "no recorded definitions" in infos[0]["detail"]
+
+
+def test_start_cdc_newer_seed_after_stop_runs_recovery_and_the_check(monkeypatch) -> None:
+    # Re-run Full Load after the Stop: its watermark (000100:4) is past the one the stack
+    # was seeded from (000090:4), so the seeder MOVES the offset forward -- recovery, gated
+    # on the NEW watermark.
+    calls: list = []
+
+    def _read(session, names, recorded):
+        from dsql_migrator.ui.cdc_start_point_gate import StartPointVerdict
+
+        calls.append((tuple(names), dict(recorded)))
+        return StartPointVerdict(kind="ok")
+
+    wm = _g5_wm()
+    run = _g5_run(
+        monkeypatch, job_watermark=wm, committed=True,
+        deployed=("mysql-bin.000090", "4"), start_point_read=_read,
+    )
+    assert run["error"] is None and _g5_mode(run) == "recovery"
+    assert calls == [(("app.orders",), wm.table_fingerprints)]
+
+
+def test_start_cdc_keeps_a_live_schema_only_mode_and_skips_the_check(monkeypatch) -> None:
+    # Retry CDC on a partial pipeline: the stack's connectors run schema_only; changing it
+    # would re-create the RUNNING connector (config_changed), so it is kept, unchecked.
+    run = _g5_run(
+        monkeypatch, job_watermark=_g5_wm(), live_mode="schema_only",
+        start_point_read=_g5_never,
+    )
+    assert run["error"] is None and _g5_mode(run) == "schema_only"
+
+
+def test_start_cdc_postgres_never_runs_the_start_point_check(monkeypatch) -> None:
+    from dsql_migrator.core.models import SourceType
+
+    pg_wm = Watermark(
+        wal_lsn="0/16B3748", slot_name="s",
+        snapshot_timestamp=datetime(2026, 1, 2, tzinfo=timezone.utc),
+    )
+    run = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.POSTGRES, job_watermark=pg_wm,
+        start_point_read=_g5_never,
+    )
+    assert run["submitted"] and "SnapshotMode" not in dict(run["kwargs"]["params"].filled)
+    assert "snapshot.mode" not in run["details"][0]
+
+
+def test_start_cdc_worker_refuses_when_the_stack_changed_after_the_click(monkeypatch) -> None:
+    # The page last read "stopped after streaming" (a resume -> schema_only); the fresh
+    # describe on the worker says the stack never streamed (a redeploy), which needs
+    # recovery. Refuse, refresh the cached facts from THAT describe, change nothing.
+    run = _g5_run(
+        monkeypatch, job_watermark=_g5_wm(), committed=True,
+        deployed=("mysql-bin.000100", "4"),
+        describe_params={"DeploySink": "false", "MskBootstrapServers": ""},
+        start_point_read=_g5_never,
+    )
+    msg = str(run["error"])
+    assert msg.startswith("Start CDC blocked: the CDC stack changed after this page last read it")
+    assert run["kwargs"] == {}
+    state = run["state"]
+    assert state.cdc_has_committed_offset is False
+    assert state.cdc_deployed_watermark is None
+    assert any(a == "start blocked: CDC stack changed" for a, _k in run["events"])
+
+
+def test_start_cdc_worker_proceeds_when_the_fresh_describe_agrees(monkeypatch) -> None:
+    run = _g5_run(
+        monkeypatch, job_watermark=_g5_wm(), committed=True,
+        deployed=("mysql-bin.000100", "4"),
+        describe_params={
+            "DeploySink": "true", "MskBootstrapServers": "",
+            "WatermarkBinlogFile": "mysql-bin.000100", "WatermarkBinlogPos": "4",
+        },
+        start_point_read=_g5_never,
+    )
+    assert run["error"] is None and _g5_mode(run) == "schema_only"
+
+
+def test_a_history_missing_failure_sets_the_flag_and_the_next_resume_uses_recovery_and_the_check(
+    monkeypatch,
+) -> None:
+    from dsql_migrator.core.cdc_deployer import CdcDeployError, _diagnose_connector_log
+    from dsql_migrator.ui.cdc_start_point_gate import StartPointVerdict
+
+    d3 = _diagnose_connector_log(
+        "src", "The db history topic is missing. You may attempt to recover it by "
+        "reconfiguring the connector to recovery.",
+    )
+    first = _g5_run(
+        monkeypatch, job_watermark=_g5_wm(), committed=True,
+        deployed=("mysql-bin.000100", "4"), run_raises=CdcDeployError(d3),
+        start_point_read=_g5_never,
+    )
+    assert isinstance(first["error"], CdcDeployError) and str(first["error"]) == d3
+    assert _g5_mode(first) == "schema_only"
+    state = first["state"]
+    assert state.cdc_history_missing is True
+    calls: list = []
+
+    def _ok(session, names, recorded):
+        calls.append(names)
+        return StartPointVerdict(kind="ok")
+
+    second = _g5_run(
+        monkeypatch, job_watermark=_g5_wm(), state=state, start_point_read=_ok,
+    )
+    assert second["error"] is None and _g5_mode(second) == "recovery"
+    assert calls == [["app.orders"]]
+    assert state.cdc_history_missing is False  # a successful Start clears it
+    assert state.cdc_deployed_snapshot_mode == "recovery"
+
+
+def test_a_recovery_start_failing_with_an_incomplete_history_does_not_set_the_flag(
+    monkeypatch,
+) -> None:
+    from dsql_migrator.core.cdc_deployer import CdcDeployError, _diagnose_connector_log
+
+    d4 = _diagnose_connector_log("src", "for table app.orders whose schema isn't known to this connector")
+    run = _g5_run(
+        monkeypatch, job_watermark=_g5_wm(fingerprints=False), run_raises=CdcDeployError(d4),
+    )
+    assert _g5_mode(run) == "recovery" and isinstance(run["error"], CdcDeployError)
+    assert run["state"].cdc_history_missing is False
+
+
+def test_a_non_history_failure_on_a_resume_does_not_set_the_flag(monkeypatch) -> None:
+    # Only the schema-history diagnosis may flag the stack: a transient failure of a
+    # schema_only RESUME (here a lost source connection) must leave the next Start a
+    # resume. Flagging it would switch that Start to recovery plus the start-point check,
+    # which refuses a Stop -> ALTER -> Start resume.
+    from dsql_migrator.core.cdc_deployer import (
+        CdcDeployError,
+        _diagnose_connector_log,
+        is_schema_history_failure,
+    )
+
+    comm = _diagnose_connector_log(
+        "src", "com.mysql.cj.jdbc.exceptions: Communications link failure"
+    )
+    assert comm is not None and not is_schema_history_failure(comm)
+    run = _g5_run(
+        monkeypatch, job_watermark=_g5_wm(), committed=True,
+        deployed=("mysql-bin.000100", "4"), run_raises=CdcDeployError(comm),
+        start_point_read=_g5_never,
+    )
+    assert _g5_mode(run) == "schema_only" and isinstance(run["error"], CdcDeployError)
+    state = run["state"]
+    assert state.cdc_history_missing is False
+    again = _g5_run(
+        monkeypatch, job_watermark=_g5_wm(), state=state, start_point_read=_g5_never,
+    )
+    assert again["error"] is None and _g5_mode(again) == "schema_only"
+
+
+def test_a_history_missing_resume_refusal_says_it_reads_from_the_recorded_position(
+    monkeypatch,
+) -> None:
+    # The flagged resume rebuilds the history at the stack's COMMITTED position, so its
+    # refusal must not claim it would read the binary log from the Full Load watermark.
+    _g5_patch_source(monkeypatch, live={"app.orders": _g5_live(_G5_NEW)})
+    run = _g5_run(
+        monkeypatch, job_watermark=_g5_wm(), committed=True,
+        deployed=("mysql-bin.000100", "4"), history_missing=True, source_password="pw",
+    )
+    msg = str(run["error"])
+    assert msg.startswith("Start CDC blocked: Captured tables changed since the CDC start point")
+    assert "continues from this stack's recorded stream position" in msg
+    assert "would read the binary log from the Full Load watermark" not in msg
+    assert "Start CDC again" not in msg
+    assert run["kwargs"] == {}
+
+
+@pytest.mark.parametrize("gtid_only", [False, True])
+def test_start_cdc_worker_does_not_refuse_a_no_seed_start_against_a_fresh_describe(
+    monkeypatch, gtid_only
+) -> None:
+    # Nothing to seed (no Full Load watermark, or a GTID-only one): the loop sends
+    # schema_only, and the worker's re-check against a fresh never-streamed describe must
+    # agree, not report "the CDC stack changed" and refuse every such Start.
+    wm = None
+    if gtid_only:
+        wm = _g5_wm(file=None, pos=None, fingerprints=False).model_copy(
+            update={"gtid_executed": "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-100"}
+        )
+    run = _g5_run(
+        monkeypatch, job_watermark=wm,
+        describe_params={"DeploySink": "false", "MskBootstrapServers": ""},
+        start_point_read=_g5_never,
+    )
+    assert run["error"] is None, run["error"]
+    assert _g5_mode(run) == "schema_only"
+
+
+def test_start_cdc_worker_skips_the_check_when_the_fresh_describe_shows_running_connectors(
+    monkeypatch,
+) -> None:
+    # The page thought the stack had no connectors; the fresh describe shows them running
+    # in recovery. The mode agrees, and a stack whose connectors exist is not checked.
+    run = _g5_run(
+        monkeypatch, job_watermark=_g5_wm(),
+        describe_params={
+            "DeploySink": "true", "MskBootstrapServers": "b-1.example:9098",
+            "SnapshotMode": "recovery",
+            "WatermarkBinlogFile": "mysql-bin.000100", "WatermarkBinlogPos": "4",
+        },
+        start_point_read=_g5_never,
+    )
+    assert run["error"] is None, run["error"]
+    assert _g5_mode(run) == "recovery"
+
+
+def test_start_cdc_worker_checks_when_the_fresh_describe_shows_the_connectors_gone(
+    monkeypatch,
+) -> None:
+    # The page cached running recovery connectors (no check due); the fresh describe shows
+    # them gone and an older seed, so this Start creates connectors in recovery from the
+    # watermark: the check must run on the FRESH facts (Retry CDC skips the dialog).
+    from dsql_migrator.ui.cdc_start_point_gate import StartPointVerdict
+
+    calls: list = []
+
+    def _read(_session, names, _recorded):
+        calls.append(tuple(names))
+        return StartPointVerdict(kind="changed", changed=(("app.orders", "x"),))
+
+    run = _g5_run(
+        monkeypatch, job_watermark=_g5_wm(), live_mode="recovery",
+        describe_params={
+            "DeploySink": "true", "MskBootstrapServers": "", "SnapshotMode": "recovery",
+            "WatermarkBinlogFile": "mysql-bin.000090", "WatermarkBinlogPos": "4",
+        },
+        start_point_read=_read,
+    )
+    assert calls == [("app.orders",)]
+    assert str(run["error"]).startswith("Start CDC blocked: Captured tables changed")
+    assert run["kwargs"] == {}
+
+
+def test_start_cdc_worker_refusal_refreshes_the_cached_live_mode(monkeypatch) -> None:
+    run = _g5_run(
+        monkeypatch, job_watermark=_g5_wm(), live_mode="schema_only",
+        describe_params={"DeploySink": "false", "MskBootstrapServers": ""},
+        start_point_read=_g5_never,
+    )
+    assert str(run["error"]).startswith(
+        "Start CDC blocked: the CDC stack changed after this page last read it"
+    )
+    assert run["state"].cdc_deployed_snapshot_mode is None
 
 
 def test_cdc_resume_signal_requires_a_seedable_manual_point() -> None:
@@ -16800,9 +17293,11 @@ def test_start_point_card_reports_the_resume_instead_of_demanding_a_watermark() 
     assert "Resuming from the last streamed position" in blob
     assert "Ready" in ui.texts
     assert "Action needed" not in ui.texts
-    # The now-irrelevant choice is not offered at all.
+    # The now-irrelevant Automatic/Manual choice is not offered; only a LATER Manual point,
+    # behind a collapsed disclosure (the route the start-point refusals name).
     assert "needs a Full Load watermark" not in blob
     assert "Manual — enter a GTID or binlog position" not in blob
+    assert "Manual — start from a later binlog position instead" in blob
 
 
 def test_stop_dialog_promises_the_position_survives() -> None:
@@ -16831,6 +17326,10 @@ def test_stop_dialog_promises_the_position_survives() -> None:
     # A MySQL source (the default here) must NOT get the slot paragraph: binlog retention
     # is the source's own policy, not a slot this tool holds.
     assert "replication slot" not in blob
+    # G5: ...but it does get the DDL caveat: a restart RESUMES with schema_only, replaying
+    # the recorded schema history in order, so a DDL made while stopped is a live change.
+    assert "a restart replays Debezium's recorded schema history" in blob
+    assert "the CDC step reports it as schema drift" in blob
 
 
 def test_stop_dialog_warns_a_postgres_source_that_the_slot_keeps_pinning_wal() -> None:
@@ -16858,6 +17357,39 @@ def test_stop_dialog_warns_a_postgres_source_that_the_slot_keeps_pinning_wal() -
     assert "max_slot_wal_keep_size" in blob
     # ...and it names the only action that actually releases it.
     assert "Delete CDC infrastructure, which drops the slot" in blob
+    # The MySQL schema-history caveat does not apply (pgoutput has no schema history).
+    assert "schema history" not in blob
+
+
+def test_the_delete_dialog_says_a_redeploy_rereads_from_the_original_start_point() -> None:
+    # G5: Delete removes the offsets AND the schema history, so the first Start on a new
+    # stack reads from the ORIGINAL watermark again with snapshot.mode=recovery.
+    from dsql_migrator.core.models import SourceConnectionConfig, SourceType
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    class _Session:
+        source_secret_id = None
+
+        def __init__(self, engine):
+            self.source_config = SourceConnectionConfig(
+                host="db", database="app", source_type=engine
+            )
+
+    mysql = _RecordingUi()
+    _cdc_ui._open_cdc_delete_dialog(
+        mysql, DataMigrationState(), lambda: None, session=_Session(SourceType.MYSQL)
+    )
+    blob = " ".join(mysql.texts)
+    assert "deletes the recorded stream position and Debezium's schema history" in blob
+    assert "refuses if a captured table's columns changed since then" in blob
+    # ...but a start point recorded without table definitions only warns: say so.
+    assert "only warns if that start point has no recorded table definitions" in blob
+    assert "earlier version of the tool" in blob
+    pg = _RecordingUi()
+    _cdc_ui._open_cdc_delete_dialog(
+        pg, DataMigrationState(), lambda: None, session=_Session(SourceType.POSTGRES)
+    )
+    assert "schema history" not in " ".join(pg.texts)
 
 
 # ---------------------------------------------------------------------------
@@ -22723,6 +23255,154 @@ def test_a_partial_removal_leaves_start_locked(monkeypatch) -> None:
     tones = [tone for tone, _h in ui.notices]
     assert "success" not in tones and "error" in tones, ui.notices
     assert ui.dialog_closed == 0
+
+
+def _drive_start_dialog_start_point(
+    monkeypatch, *, verdict=None, probe_raises=None, fk_block=False, drop_result=(1, 0)
+):
+    """Open the real Start CDC dialog with a stubbed MySQL start-point verdict (G5)."""
+    import asyncio
+    from types import SimpleNamespace
+
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+
+    ui = _DialogUi()
+    events: list = []
+    monkeypatch.setattr(cdc_ui, "cdc_deploy_connection_blocker", lambda *_a, **_k: None)
+    monkeypatch.setattr(cdc_ui, "_cdc_fk_block_reason", lambda *_a: ("x", "Foreign keys block CDC"))
+    monkeypatch.setattr(cdc_ui, "_cdc_fk_block_body", lambda *_a: "body")
+    monkeypatch.setattr(
+        cdc_ui, "_render_notice",
+        lambda _ui, *, tone="info", icon=None, header="", body="": ui.notices.append(
+            (tone, header)
+        ),
+    )
+    blocked = SimpleNamespace(
+        ours=[("ecommerce.products", "fk_products_category")], foreign=[], unknown=False,
+        blocking=True,
+    )
+    monkeypatch.setattr(
+        cdc_ui, "_probe_cdc_blocking_foreign_keys",
+        lambda *_a, **_k: blocked if fk_block else None,
+    )
+    monkeypatch.setattr(cdc_ui, "_probe_binlog_resume_gap", lambda *_a, **_k: None)
+    monkeypatch.setattr(cdc_ui, "_current_job", lambda *_a, **_k: None)
+    monkeypatch.setattr(cdc_ui, "_pg_objects_gate_block", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        cdc_ui, "_drop_cdc_blocking_foreign_keys", lambda *_a, **_k: drop_result
+    )
+    seed = Watermark(
+        binlog_file="mysql-bin.000100", binlog_position=4,
+        snapshot_timestamp=datetime(2026, 10, 1, 9, 30, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(
+        cdc_ui, "_mysql_start_context",
+        lambda *_a, **_k: (seed, "full_load", None, "recovery", []),
+    )
+
+    def _probe(*_a, **_k):
+        if probe_raises is not None:
+            raise probe_raises
+        return verdict
+
+    monkeypatch.setattr(cdc_ui, "_probe_cdc_start_point", _probe)
+    monkeypatch.setattr(cdc_ui, "_log_cdc_event", lambda *a, **k: events.append((a[0], k)))
+
+    class _Run:
+        @staticmethod
+        async def io_bound(fn, *a, **k):
+            return fn(*a, **k)
+
+    import nicegui
+
+    monkeypatch.setattr(nicegui, "run", _Run, raising=False)
+    state = SimpleNamespace(
+        cdc_stack_name="dsql-cdc-stack", job_id=None,
+        migration_type=MigrationType.FULL_LOAD_AND_CDC,
+    )
+    asyncio.run(
+        cdc_ui._open_cdc_start_dialog(
+            ui, state, lambda: None, session=object(), job_manager=object(),
+            inventory=None, refresh_after_drop=lambda: None,
+        )
+    )
+    return ui, events
+
+
+def test_a_changed_table_since_the_start_point_blocks_the_start_dialog(monkeypatch) -> None:
+    from dsql_migrator.ui.cdc_start_point_gate import E1_HEADER, StartPointVerdict
+
+    verdict = StartPointVerdict(
+        kind="changed", changed=(("app.orders", "columns added or dropped: 2 → 3"),)
+    )
+    ui, _events = _drive_start_dialog_start_point(monkeypatch, verdict=verdict)
+    assert ("error", E1_HEADER) in ui.notices
+    start = ui.buttons["Start CDC"]
+    assert start.enabled is False
+    assert start.tooltip_text.startswith("A captured table changed since the CDC start point")
+
+
+def test_removing_foreign_keys_does_not_unlock_a_start_point_block(monkeypatch) -> None:
+    import asyncio
+
+    from dsql_migrator.ui.cdc_start_point_gate import StartPointVerdict
+
+    verdict = StartPointVerdict(kind="unreadable", problem="no-source-connection")
+    ui, _events = _drive_start_dialog_start_point(
+        monkeypatch, verdict=verdict, fk_block=True
+    )
+    start = ui.buttons["Start CDC"]
+    assert start.enabled is False
+    asyncio.run(ui.buttons["Remove foreign keys"].on_click())
+    assert start.enabled is False, "the start-point refusal still stands without the FKs"
+    # ...so the removal notice must not say "ready to start" over a disabled button.
+    headers = [h for _t, h in ui.notices]
+    assert any(h.startswith("1 foreign key(s) removed") for h in headers), headers
+    assert not any("ready to start" in h for h in headers), headers
+
+
+def test_removing_foreign_keys_under_a_changed_table_block_does_not_claim_ready(
+    monkeypatch,
+) -> None:
+    import asyncio
+
+    from dsql_migrator.ui.cdc_start_point_gate import StartPointVerdict
+
+    verdict = StartPointVerdict(
+        kind="changed", changed=(("app.orders", "columns added or dropped: 2 → 3"),)
+    )
+    ui, _events = _drive_start_dialog_start_point(
+        monkeypatch, verdict=verdict, fk_block=True
+    )
+    asyncio.run(ui.buttons["Remove foreign keys"].on_click())
+    assert ui.buttons["Start CDC"].enabled is False
+    assert ("success", "1 foreign key(s) removed") in ui.notices
+    # Without a start-point block the removal still unlocks Start and says so.
+    ui2, _events = _drive_start_dialog_start_point(monkeypatch, verdict=None, fk_block=True)
+    asyncio.run(ui2.buttons["Remove foreign keys"].on_click())
+    assert ui2.buttons["Start CDC"].enabled is True
+    assert ("success", "1 foreign key(s) removed — ready to start") in ui2.notices
+
+
+def test_an_unverifiable_start_point_only_warns_in_the_start_dialog(monkeypatch) -> None:
+    from dsql_migrator.ui.cdc_start_point_gate import W1_HEADER, StartPointVerdict
+
+    verdict = StartPointVerdict(
+        kind="unverified", unverified=("app.orders",), problem="no-baseline"
+    )
+    ui, _events = _drive_start_dialog_start_point(monkeypatch, verdict=verdict)
+    assert ("warning", W1_HEADER) in ui.notices
+    assert ui.buttons["Start CDC"].enabled is True
+
+
+def test_a_failing_start_point_probe_leaves_start_enabled_and_logs_it(monkeypatch) -> None:
+    ui, events = _drive_start_dialog_start_point(
+        monkeypatch, probe_raises=RuntimeError("boom")
+    )
+    assert ui.buttons["Start CDC"].enabled is True
+    assert [a for a, _k in events] == ["CDC start-point check unknown"]
+    assert events[0][1]["status"].name == "INFO"
+    assert not [n for n in ui.notices if n[0] == "error"]
 
 
 # ---------------------------------------------------------------------------
@@ -31376,3 +32056,43 @@ def test_the_screen_wires_the_source_schema_baseline(monkeypatch) -> None:
     baseline = state.cdc_catalog_baseline()
     assert [t.name for t in baseline.captured] == ["app.t"]
     assert baseline.capture_names == frozenset({"app.t", "app.gone"})
+
+
+def test_a_finished_stop_drops_the_live_snapshot_mode(monkeypatch) -> None:
+    # G5: after Stop no connector runs, so the next Start must not "keep" the stopped
+    # connectors' snapshot mode (which would also skip its start-point check).
+    from types import SimpleNamespace
+
+    import dsql_migrator.core.cdc_deployer as _dep
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+
+    _capture_cdc_events(monkeypatch)
+    monkeypatch.setattr(_dep, "build_cdc_stack_deployer", lambda *a, **k: object())
+    monkeypatch.setattr(_dep, "run_cdc_stop", lambda *a, **k: None)
+
+    class _JM:
+        work = None
+
+        def submit(self, work):
+            _JM.work = work
+            return "job-1"
+
+        def get_status(self, _job_id):
+            from dsql_migrator.core.job_manager import JobNotFoundError
+
+            raise JobNotFoundError(_job_id)
+
+    class _Ui:
+        def notify(self, *_a, **_k):
+            return None
+
+    state = DataMigrationState()
+    state.set_cdc_deployed_snapshot_mode("recovery")
+    session = SimpleNamespace(
+        target_config=SimpleNamespace(region="us-east-1"), aws_profile=None,
+        source_password=None, source_config=None, source_secret_id=None,
+    )
+    cdc_ui._start_cdc_stop(_Ui(), state, _JM(), lambda: None, session=session)
+    assert state.cdc_deployed_snapshot_mode == "recovery"  # nothing ran yet
+    _JM.work(SimpleNamespace(cancelled=False))
+    assert state.cdc_deployed_snapshot_mode is None

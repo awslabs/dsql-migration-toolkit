@@ -127,7 +127,9 @@ PostgreSQL-16 wire(양쪽 모두 psycopg)이므로 DSQL이 지원하는 값은 �
 
 - **MySQL** — **binlog 파일 + 위치**, 그리고 **GTID 셋**(`@@GLOBAL.gtid_executed`)과 `server_uuid`.
   이들은 `SHOW BINARY LOG STATUS`(MySQL 8.2+/8.4, `SHOW MASTER STATUS`가 제거된 버전)로 읽고, 그
-  이하(≤ 8.0.x)에서는 `SHOW MASTER STATUS`로 폴백합니다.
+  이하(≤ 8.0.x)에서는 `SHOW MASTER STATUS`로 폴백합니다. 워터마크는 위치를 읽기 직전에 마이그레이션
+  대상 테이블마다 컬럼 정의의 짧은 지문도 기록하므로, Start CDC가 그 이후 테이블이 바뀌었는지 알 수
+  있습니다([6장](06-limitations.md) 참조).
 - **PostgreSQL** — binlog 좌표가 아니라 **WAL LSN**(`Watermark.wal_lsn`). 일관성 지점에서 도구가
   **publication**(정확히 마이그레이션 대상 테이블에 대한 `FOR TABLE`, 절대 `FOR ALL TABLES` 아님)과
   `pgoutput` **논리 복제 슬롯**을 생성하고, 슬롯이 반환한 일관 LSN을 슬롯·publication 이름과 함께

@@ -29,8 +29,10 @@ from datetime import (
     timezone,
 )
 from typing import (
+    Callable,
     Mapping,
     Optional,
+    Sequence,
 )
 
 from dsql_migrator.core.cdc import (
@@ -45,6 +47,8 @@ from dsql_migrator.core.cdc import (
     build_cdc_stack_name,
     cdc_expected_connector_names,
     cdc_seed_watermark,
+    mysql_snapshot_mode,
+    start_point_check_due,
     composite_cdc_excluded_key_columns,
     split_column_exclude_value,
     cdc_stack_name_suffix,
@@ -301,8 +305,45 @@ def _cdc_start_seed(migration_state, watermark, source_type):
     """
     if source_type is SourceType.POSTGRES:
         return watermark, "full_load"
+    _fps = getattr(migration_state, "cdc_start_fingerprints", None)
     return cdc_seed_watermark(
-        watermark, migration_state.cdc_start_override(), now=datetime.now(timezone.utc)
+        watermark,
+        migration_state.cdc_start_override(),
+        now=datetime.now(timezone.utc),
+        # The Manual point's start-point fingerprints (recorded by Fetch current position
+        # for exactly this point), so Start CDC can check the captured tables against it.
+        override_fingerprints=_fps() if callable(_fps) else None,
+    )
+
+
+def _seed_can_seed(seed) -> bool:
+    """Whether the seed Start offers can seed the offset (binlog file + position). Pure.
+
+    The same test ``build_source_config`` applies to its resume point: the seed IS that
+    point (the Manual override's coordinates, or the job watermark's).
+    """
+    return bool(getattr(seed, "binlog_file", None)) and getattr(
+        seed, "binlog_position", None
+    ) is not None
+
+
+def mysql_start_facts(migration_state, seed, source_type=SourceType.MYSQL):
+    """The cached :class:`~dsql_migrator.core.cdc.MysqlStartFacts` for a Start of ``seed``.
+
+    Read off the phase probe's cache (committed offset, deployed watermark, live
+    SnapshotMode) and the history-missing flag, so the connector-config preview and Start
+    CDC decide ``snapshot.mode`` from the SAME inputs. ``None`` for PostgreSQL. Pure.
+    """
+    if source_type is SourceType.POSTGRES:
+        return None
+    from dsql_migrator.ui.data_migration._cdc_status import mysql_start_facts_from
+
+    return mysql_start_facts_from(
+        seed,
+        has_committed_offset=bool(getattr(migration_state, "cdc_has_committed_offset", False)),
+        deployed_watermark=getattr(migration_state, "cdc_deployed_watermark", None),
+        live_mode=getattr(migration_state, "cdc_deployed_snapshot_mode", None),
+        history_missing=bool(getattr(migration_state, "cdc_history_missing", False)),
     )
 
 
@@ -587,7 +628,7 @@ def _render_cdc_source_config_card(
     # What Start will offer the seeder (a Manual binlog point beats the job watermark).
     seed, _seed_origin = _cdc_start_seed(migration_state, watermark, source_type)
     # A stopped-but-previously-streamed pipeline resumes from its own committed offset, so
-    # there is no start point left to choose. Without this the card contradicted the
+    # no start point needs choosing. Without this the card contradicted the
     # button beneath it: "Action needed" / "needs a Full Load watermark" while Start CDC
     # was enabled and would have worked.
     resumes_from_offset = cdc_start_resumes(migration_state, seed, source_type)
@@ -610,6 +651,11 @@ def _render_cdc_source_config_card(
         resnapshot_reason=pg_resnapshot_reason(
             job, source_type=source_type, start_mode=mode
         ),
+        # Evaluated when Fetch current position is clicked: the tables a Start captures
+        # then, whose definitions are recorded with the fetched position.
+        captured_names=lambda: [
+            t.name for t in _cdc_tables_for_config(migration_state, inventory, watermark)
+        ],
     )
 
     # On a restart the connector config below is not what decides the start position (the
@@ -659,7 +705,8 @@ def _render_cdc_source_config_card(
         return
 
     # MySQL: built from the SEED, the same one Start sends (see _start_cdc_deploy), so
-    # the preview cannot claim a start point the Start would not seed.
+    # the preview cannot claim a start point the Start would not seed -- and from the same
+    # stack facts, so it prints the snapshot.mode Start sends (mysql_start_facts).
     _config_wm = watermark if is_pg else seed
     config = dispatch_source_config(
         _cdc_source_type(session),
@@ -670,6 +717,7 @@ def _render_cdc_source_config_card(
         column_exclude_list=exclude_list,
         resume_override=_resume_override,
         force_initial_snapshot=_force_initial_snapshot,
+        start_facts=mysql_start_facts(migration_state, seed, source_type),
     )
 
     # The sink config (topics, keying, DLQ). DLQ name is the cdc-stack default --
@@ -1004,13 +1052,16 @@ def _render_cdc_start_point_card(
     # the actual cause and its fix (the REPLICATION CLIENT grant) instead of implying the
     # Full Load never ran.
     wm_gtid_only: bool = False,
-    # This stack streamed before, so its resume offset is already committed and there is
-    # no start point left to choose -- the card reports the resume instead of demanding a
-    # coordinate it does not need.
+    # This stack streamed before, so its resume offset is already committed and no start
+    # point needs choosing -- the card reports the resume (offering only a LATER Manual
+    # point, MySQL) instead of demanding a coordinate it does not need.
     resumes_from_offset: bool = False,
     # Why a PostgreSQL start re-snapshots (see :func:`pg_resnapshot_reason`), or None when
     # it does not. Passed in because the cause is only visible on the RAW job.
     resnapshot_reason: Optional[str] = None,
+    # MySQL Manual: the names of the tables a Start would capture, called when Fetch
+    # current position is clicked so their definitions are recorded with the position.
+    captured_names: Optional[Callable[[], Sequence[str]]] = None,
 ) -> None:
     """Render the PRIMARY 'CDC start point' card with an Automatic/Manual choice.
 
@@ -1018,9 +1069,10 @@ def _render_cdc_start_point_card(
     it is a top-level card (not buried in the raw connector config). An AWS
     console-style radio chooses between Automatic (gapless from the Full Load
     watermark) and Manual (an explicit GTID / binlog position); the manual inputs
-    appear only when Manual is selected. A status line confirms the resolved start
-    point. Validation is advisory (orange hint, never blocks): MSK Connect is the
-    final authority at connector start.
+    appear only when Manual is selected -- or, on a MySQL resume (no radio), inside a
+    collapsed "Manual" disclosure for a later start point. A status line confirms the
+    resolved start point. Validation is advisory (orange hint, never blocks): MSK
+    Connect is the final authority at connector start.
 
     ``locked`` (CDC already started) makes the radio + manual inputs read-only:
     the start position is already committed to connect-offsets, so changing it
@@ -1104,24 +1156,49 @@ def _render_cdc_start_point_card(
             else:
                 ui.badge("Action needed", color="warning").props("outline")  # type: ignore[attr-defined]
 
-        # Resuming: there is no choice to present. The position lives in the connector's
-        # offsets topic, not in anything this card can set, so offering Automatic/Manual
-        # here would imply the operator must pick one -- and "Automatic — needs a Full
-        # Load watermark (unavailable)" would be actively wrong, since no watermark is
-        # needed. State the fact and stop.
+        # Resuming: no start point NEEDS choosing. The position lives in the connector's
+        # offsets topic, not in anything this card can set, so the Automatic/Manual radio
+        # would imply the operator must pick one -- and "Automatic — needs a Full Load
+        # watermark (unavailable)" would be actively wrong, since no watermark is needed.
+        # State the fact, plus (MySQL) one collapsed way to move it FORWARD: a start point
+        # after a schema change is the remedy the start-point refusal and the replay
+        # diagnoses name, and the seeder does advance a stopped stack's offset to it.
         if resumes_from_offset and not locked:
-            render_notice(
-                ui,
-                tone="success",
-                icon="restart_alt",
-                header="Resuming from the last streamed position",
-                body=(
-                    "This pipeline has streamed before, so its resume position is already "
-                    "committed on MSK (stopping CDC deleted the connectors, not the "
-                    "position). Streaming continues from there — no start point to "
-                    "choose, no Full Load watermark required, and nothing re-applied."
-                ),
+            # MySQL: the last start found the schema history missing, so this one rebuilds
+            # it (recovery) after the start-point check -- "nothing re-applied, no choice"
+            # would describe a start that is not the one about to run.
+            history_missing = not is_pg and bool(
+                getattr(migration_state, "cdc_history_missing", False)
             )
+            if history_missing:
+                render_notice(
+                    ui,
+                    tone="info",
+                    icon="restart_alt",
+                    header="Resuming from the last streamed position",
+                    body=(
+                        "This pipeline has streamed before, so streaming continues from "
+                        "its committed position on MSK. Its last start found Debezium's "
+                        "schema history missing, so this Start rebuilds it from the source "
+                        "tables as they are now (snapshot.mode=recovery), after the "
+                        "start-point check. If that check names a changed table, choose "
+                        "Manual below and give CDC a start point after the change."
+                    ),
+                )
+            else:
+                render_notice(
+                    ui,
+                    tone="success",
+                    icon="restart_alt",
+                    header="Resuming from the last streamed position",
+                    body=(
+                        "This pipeline has streamed before, so its resume position is "
+                        "already committed on MSK (stopping CDC deleted the connectors, "
+                        "not the position). Streaming continues from there — no start "
+                        "point needed, no Full Load watermark required, and nothing "
+                        "re-applied."
+                    ),
+                )
             # A Manual point is still OFFERED to the seeder, which never rewinds the
             # committed offset -- so one at/before where this stack streamed from is
             # silently not applied. Say so rather than let the entry look honoured.
@@ -1140,6 +1217,24 @@ def _render_cdc_start_point_card(
                 )
             elif manual_point is not None:
                 _render_gtid_only_notice()
+            if not is_pg:
+                # Collapsed (open while the history is missing, when the check may refuse
+                # and name this route): a point applied here selects Manual, and one past
+                # the committed offset turns this card into the regular Manual card.
+                with ui.expansion(  # type: ignore[attr-defined]
+                    "Manual — start from a later binlog position instead",
+                    icon="edit_location_alt",
+                    value=history_missing,
+                ).classes(f"w-full {EXPANSION_PANEL_CLASSES}").props("expand-separator"):
+                    ui.label(  # type: ignore[attr-defined]
+                        "Only a position past where this stack already streamed moves it "
+                        "(Start never rewinds); changes between that position and the new "
+                        "one are not replicated."
+                    ).classes("text-xs text-gray-500")
+                    _render_cdc_manual_inputs(
+                        ui, migration_state, refresh, session=session,
+                        captured_names=captured_names, select_manual=True,
+                    )
             return
 
         if is_pg:
@@ -1282,6 +1377,7 @@ def _render_cdc_start_point_card(
                 _render_manual_vs_watermark_notice(ui, manual_point, wm_resume)
             _render_cdc_manual_inputs(
                 ui, migration_state, refresh, locked=locked, session=session,
+                captured_names=captured_names,
             )
         elif wm_usable and wm_resume is not None:
             if is_pg:
@@ -1344,21 +1440,77 @@ def _render_cdc_start_summary(ui, gtid, binlog_file, binlog_pos) -> None:
                 ui.label(f"{label_text}:").classes("text-xs text-gray-500")  # type: ignore[attr-defined]
                 ui.label(str(value)).classes("text-xs font-mono")  # type: ignore[attr-defined]
 
+def _fetch_start_position(session, names) -> "tuple[Optional[Mapping], Optional[dict]]":
+    """Read the source's current binlog position and the captured tables' start-point
+    fingerprints (BLOCKING; callers run it via ``run.io_bound``; MySQL).
+
+    ONE read-only engine and ONE connection: the catalog statement (``read_live_catalog``,
+    bounded like the CDC catalog-drift read) first, THEN ``SHOW BINARY LOG STATUS`` -- so a
+    schema change racing the fetch can only make Start CDC refuse this point, never pass a
+    position the recorded definitions do not describe. Returns ``(row, fingerprints)``;
+    ``fingerprints`` is ``None`` when the catalog read failed (the position is still
+    returned). A failure of the position read itself raises, as before. The engine is
+    disposed in every case.
+    """
+    from dsql_migrator.core.cdc_catalog_drift import (
+        read_live_catalog,
+        start_point_fingerprints,
+    )
+    from dsql_migrator.core.introspector import ReadOnlySourceError
+    from dsql_migrator.core.watermark import read_binlog_status_row
+    from dsql_migrator.ui.connect import make_source_engine_factory
+    from dsql_migrator.ui.data_migration._cdc_status import (
+        _CATALOG_DRIFT_READ_TIMEOUT_SECONDS,
+    )
+
+    engine = make_source_engine_factory(
+        getattr(session, "source_password", None),
+        read_timeout_seconds=_CATALOG_DRIFT_READ_TIMEOUT_SECONDS,
+    )(getattr(session, "source_config", None))
+    try:
+        with engine.connect() as conn:
+            wanted = sorted({str(n) for n in (names or ()) if n})
+            fingerprints: Optional[dict] = None
+            try:
+                fingerprints = start_point_fingerprints(
+                    read_live_catalog(conn, wanted, source_type=SourceType.MYSQL)
+                ) if wanted else {}
+            except ReadOnlySourceError:
+                raise
+            except Exception:  # noqa: BLE001 - optional record; the position still counts
+                fingerprints = None
+            row = read_binlog_status_row(conn)
+    finally:
+        engine.dispose()
+    return row, fingerprints
+
+
 def _render_cdc_manual_inputs(
     ui, migration_state, refresh, *, locked: bool = False, session: object = None,
+    captured_names: Optional[Callable[[], Sequence[str]]] = None,
+    select_manual: bool = False,
 ) -> None:
     """Render the Manual start-position inputs (GTID / binlog file:pos) + Apply.
 
-    Shown only when the Manual radio is selected. Advisory validation: an
+    Shown when the Manual radio is selected, and (``select_manual``) inside the resume
+    card's "Manual" disclosure, where "Use this start point" also selects Manual so a
+    later point is what Start offers. Advisory validation: an
     unrecognized-but-valid GTID must not be rejected, so a bad-looking value shows
     an orange hint but is still stored; MSK Connect validates at connector start.
     ``locked`` (CDC already started) renders the inputs + button read-only.
 
     When a ``session`` with a live source connection is available, a "Fetch from
     source" button queries ``SHOW MASTER STATUS`` and populates the fields
-    automatically — no manual copy-paste needed.
+    automatically — no manual copy-paste needed. It also records the captured tables'
+    (``captured_names()``) start-point fingerprints with that position; "Use this start
+    point" keeps them only for exactly the fetched file:position (or, re-confirming the
+    stored point unchanged after a re-render or a session restore, the ones already
+    recorded for it), so a typed or edited position never carries definitions read for
+    another one.
     """
     gtid_error = {"msg": None}  # mutable cell so the handler can show a hint
+    # The last fetch: the (file, pos) it returned and the fingerprints read with it.
+    fetched: dict = {"coord": None, "fps": None}
 
     def _apply() -> None:
         gtid_raw = (gtid_input.value or "").strip()
@@ -1373,11 +1525,32 @@ def _render_cdc_manual_inputs(
                 binlog_file, binlog_pos = parsed
             else:
                 binlog_unparsed = True
+        # Fingerprints only for the very position they were read with: this card's fetch,
+        # or -- re-confirming the STORED point unchanged -- the ones already recorded for
+        # it. The card is rebuilt on every refresh ("Use this start point" itself
+        # refreshes) and after a session restore, so the fetch cell is empty then; without
+        # the fallback a second click on the same point wiped them and the start-point
+        # check dropped to a warning. Any other position carries none.
+        _coord = (binlog_file, binlog_pos) if binlog_file is not None else None
+        if _coord is not None and fetched["coord"] == _coord and fetched["fps"] is not None:
+            _bound = fetched["fps"]
+        elif _coord is not None and _coord == (
+            getattr(migration_state, "_cdc_start_binlog_file", None),
+            getattr(migration_state, "_cdc_start_binlog_pos", None),
+        ):
+            _bound = migration_state.cdc_start_fingerprints()
+        else:
+            _bound = None
         migration_state.set_cdc_start_position(
             gtid=gtid_raw or None,
             binlog_file=binlog_file,
             binlog_pos=binlog_pos,
+            fingerprints=_bound,
         )
+        # Inside the resume card's disclosure the radio is not shown: using a seedable
+        # point there IS choosing Manual (a later point than the committed offset).
+        if select_manual and binlog_file is not None:
+            migration_state.set_cdc_start_mode("manual")
         if not gtid_raw and not binlog_raw:
             ui.notify(  # type: ignore[attr-defined]
                 "Enter a binlog file:position first.",
@@ -1412,8 +1585,6 @@ def _render_cdc_manual_inputs(
     async def _fetch_from_source() -> None:
         """Query the source binlog status and fill the input fields."""
         from nicegui import run
-        from dsql_migrator.ui.connect import make_source_engine_factory
-        from dsql_migrator.core.watermark import read_binlog_status_row
 
         source_config = getattr(session, "source_config", None)
         source_password = getattr(session, "source_password", None)
@@ -1426,17 +1597,13 @@ def _render_cdc_manual_inputs(
 
         fetch_btn.disable()
         fetch_btn.set_text("Fetching…")
-
-        def _do_fetch():
-            engine_factory = make_source_engine_factory(source_password)
-            engine = engine_factory(source_config)
-            with engine.connect() as conn:
-                row = read_binlog_status_row(conn)
-            engine.dispose()
-            return row
+        try:
+            _names = list(captured_names() if callable(captured_names) else ())
+        except Exception:  # noqa: BLE001 - no scope: record nothing rather than fail
+            _names = []
 
         try:
-            row = await run.io_bound(_do_fetch)
+            row, fps = await run.io_bound(_fetch_start_position, session, _names)
         except Exception as exc:  # noqa: BLE001
             ui.notify(  # type: ignore[attr-defined]
                 f"Failed to fetch: {exc}",
@@ -1468,6 +1635,24 @@ def _render_cdc_manual_inputs(
 
         gtid_input.set_value(gtid_val)
         binlog_input.set_value(binlog_coord)
+        try:
+            _coord = (
+                (str(binlog_file_val), int(binlog_pos_val)) if binlog_coord else None
+            )
+        except (TypeError, ValueError):
+            _coord = None
+        fetched["coord"] = _coord
+        fetched["fps"] = fps
+        if fps is None:
+            # The point is NOT applied yet: say what to do next, as the success path does.
+            ui.notify(  # type: ignore[attr-defined]
+                "Fetched the current position, but the captured tables' definitions could "
+                "not be recorded with it, so Start CDC cannot check them against this "
+                "start point. Fetch again to record them, or click 'Use this start point' "
+                "to use it without that check.",
+                type="warning", position="top",
+            )
+            return
         ui.notify(  # type: ignore[attr-defined]
             "Fetched current position from source — click 'Use this start point' "
             "to confirm.",
@@ -1617,8 +1802,13 @@ def _cdc_start_detail(
     exclusions: Optional[Mapping[str, object]] = None,
     resumes: bool = False,
     seed_origin: str = "full_load",
+    snapshot_mode: Optional[str] = None,
 ) -> str:
     """The audit detail for a CDC start: where the stream resumes FROM, and how.
+
+    ``snapshot_mode`` (MySQL) is the Debezium ``snapshot.mode`` the Start sends: it decides
+    whether the schema history is rebuilt from the current tables (``recovery``) or the
+    recorded one is replayed (``schema_only``).
 
     ``watermark`` is what the Start offers the seeder and ``seed_origin`` where it came
     from (:func:`_cdc_start_seed`): a ``"manual"`` one is named as the operator's Manual
@@ -1679,6 +1869,8 @@ def _cdc_start_detail(
             "watermark, so any change written before this moment is NOT replicated"
         )
     parts.append(f"mode {mode or 'auto'}")
+    if snapshot_mode and source_type is not SourceType.POSTGRES:
+        parts.append(f"snapshot.mode {snapshot_mode}")
     if force_snapshot:
         parts.append("a FULL initial snapshot is forced for this start")
     excluded = sum(len(cols or ()) for cols in (exclusions or {}).values())
@@ -4174,25 +4366,57 @@ def cdc_start_resumes(migration_state, watermark, source_type) -> bool:
     is skipped -- a resume -- when it is at or before that one, judged by the seeders' own
     comparison (:func:`~dsql_migrator.core.cdc_kafka_prep.offset_already_at_or_past`:
     numeric binlog sequence, then position). A newer seed, or one judged against an unknown
-    deployed watermark, is a seeded start. PostgreSQL is unchanged.
+    deployed watermark, is a seeded start. PostgreSQL is unchanged. The truth table is
+    :func:`~dsql_migrator.ui.data_migration._cdc_status.start_resumes_committed_offset`,
+    shared with the worker thread's re-check against a fresh describe.
     """
-    if not getattr(migration_state, "cdc_has_committed_offset", False):
-        return False
-    if source_type is SourceType.POSTGRES:
-        return True
-    f = getattr(watermark, "binlog_file", None) if watermark is not None else None
-    p = getattr(watermark, "binlog_position", None) if watermark is not None else None
-    if not f or p is None:
-        return True
-    deployed = getattr(migration_state, "cdc_deployed_watermark", None)
-    if not deployed:
-        return False
-    try:
-        return offset_already_at_or_past(
-            {"file": deployed[0], "pos": deployed[1]}, {"file": f, "pos": p}
-        )
-    except (TypeError, ValueError):  # a malformed deployed parameter: not provably a resume
-        return False
+    from dsql_migrator.ui.data_migration._cdc_status import start_resumes_committed_offset
+
+    return start_resumes_committed_offset(
+        watermark,
+        has_committed_offset=bool(getattr(migration_state, "cdc_has_committed_offset", False)),
+        deployed_watermark=getattr(migration_state, "cdc_deployed_watermark", None),
+        source_type=source_type,
+    )
+
+
+def _mysql_start_context(migration_state, job_manager, inventory, session):
+    """``(seed, origin, facts, snapshot_mode, tables)`` of the MySQL Start CDC would submit.
+
+    Computed through the SAME functions Start uses (:func:`_cdc_start_seed`,
+    :func:`mysql_start_facts`, :func:`~dsql_migrator.core.cdc.mysql_snapshot_mode`,
+    :func:`_cdc_tables_for_config`), so the Start dialog checks exactly the start the job
+    would run. Pure (state reads only).
+    """
+    job = _current_job(job_manager, getattr(migration_state, "job_id", None))
+    watermark = _cdc_watermark(job)
+    source_type = _cdc_source_type(session)
+    seed, origin = _cdc_start_seed(migration_state, watermark, source_type)
+    facts = mysql_start_facts(migration_state, seed, source_type)
+    mode = mysql_snapshot_mode(_seed_can_seed(seed), facts)
+    tables = _cdc_tables_for_config(migration_state, inventory, watermark)
+    return seed, origin, facts, mode, tables
+
+
+def _probe_cdc_start_point(migration_state, session, *, seed, mode, facts, tables):
+    """The MySQL start-point check for one Start (BLOCKING; run it via ``run.io_bound``).
+
+    ``None`` when no check is due: PostgreSQL, a ``schema_only`` start (a resume replays
+    the recorded history; nothing seeded reads the current schema), or a stack whose
+    connectors exist (``start_point_check_due``). Otherwise the captured ``tables`` are
+    compared with the seed's recorded fingerprints by ONE bounded catalog read
+    (:func:`~dsql_migrator.ui.data_migration._cdc_status.read_cdc_start_point_once`, which
+    never raises). A history-missing resume with no seed has no fingerprint to compare.
+    """
+    if _cdc_source_type(session) is SourceType.POSTGRES:
+        return None
+    if not start_point_check_due(mode, facts):
+        return None
+    from dsql_migrator.ui.data_migration._cdc_status import read_cdc_start_point_once
+
+    recorded = dict(getattr(seed, "table_fingerprints", None) or {}) if seed is not None else {}
+    names = [getattr(t, "name", str(t)) for t in (tables or ())]
+    return read_cdc_start_point_once(session, names, recorded)
 
 
 def pg_start_resnapshots(watermark, *, source_type, start_mode: str) -> bool:
@@ -4511,6 +4735,9 @@ async def _open_cdc_start_dialog(
     binlog_gap: Optional[str] = None
     fk_block = None
     pg_objects_block: Optional[tuple] = None
+    # The MySQL start-point check (cdc_start_point_gate): its verdict and notice.
+    sp_verdict = None
+    sp_notice: Optional[tuple] = None
     inventory_tables = list(getattr(inventory, "tables", None) or [])
     if job_manager is not None:
         from nicegui import run
@@ -4544,6 +4771,48 @@ async def _open_cdc_start_dialog(
                 )
             if probed is not None and probed.blocking:
                 fk_block = probed
+            # MySQL: a recovery-mode start rebuilds Debezium's schema history from the
+            # tables as they are NOW and reads OLDER binlog rows with it, so a captured
+            # table changed since the start point breaks the stream -- loudly or SILENTLY.
+            # Checked against the start point's fingerprint with one bounded catalog read;
+            # a resume (schema_only) or a stack with connectors is not checked. Blocking
+            # source I/O -> run.io_bound; the job re-checks on its worker thread.
+            if _cdc_source_type(session) is not SourceType.POSTGRES:
+                try:
+                    _sp_seed, _sp_origin, _sp_facts, _sp_mode, _sp_tables = (
+                        _mysql_start_context(migration_state, job_manager, inventory, session)
+                    )
+                    sp_verdict = await run.io_bound(
+                        _probe_cdc_start_point, migration_state, session,
+                        seed=_sp_seed, mode=_sp_mode, facts=_sp_facts, tables=_sp_tables,
+                    )
+                except Exception:  # noqa: BLE001 - unknown here; the job re-checks
+                    sp_verdict = None
+                    _log_cdc_event(
+                        "CDC start-point check unknown",
+                        status=ActivityStatus.INFO,
+                        detail=(
+                            "could not check the captured tables against the CDC start "
+                            "point before Start CDC; the job re-checks before creating any "
+                            "connector"
+                        ),
+                    )
+                if sp_verdict is not None:
+                    from dsql_migrator.ui.cdc_start_point_gate import (
+                        point_coord,
+                        point_label,
+                        start_point_notice,
+                    )
+
+                    sp_notice = start_point_notice(
+                        sp_verdict,
+                        point_label=point_label(_sp_seed, _sp_origin),
+                        coord=point_coord(_sp_seed),
+                        migration_type=getattr(migration_state, "migration_type", None),
+                        # A checked resume (history missing) reads from the stack's own
+                        # position, not from the start point it is compared with.
+                        resumes=bool(getattr(_sp_facts, "resumes", False)),
+                    )
             # CDC only: list the overlay ALTERs Start CDC runs before any connector (one
             # live read). Full load + CDC reads nothing here: after the load they are
             # live, and the job verifies anyway. Never gates Start.
@@ -4593,6 +4862,12 @@ async def _open_cdc_start_dialog(
                 # "start point", not "snapshot": the probed log may be a Manual one.
                 header="The start point's binary log has been purged",
                 body=binlog_gap,
+            )
+        _sp_blocks = bool(getattr(sp_verdict, "blocks", False))
+        if sp_notice is not None:
+            _render_notice(
+                ui, tone=sp_notice[0], icon=sp_notice[1], header=sp_notice[2],
+                body=sp_notice[3],
             )
         _render_cdc_overlay_changes(ui, overlay_changes)
         # The PostgreSQL publication/slot block, with its remedy in the SAME dialog (same
@@ -4725,21 +5000,34 @@ async def _open_cdc_start_dialog(
                         # straight on instead of re-opening the dialog and re-running the
                         # pre-flight checks.
                         _fk_state["cleared"] = True
+                        # A start-point refusal still stands after the FKs are gone, so the
+                        # notice claims "ready" only when Start is really unlocked.
+                        _unlocks = not conn_blocker and not _sp_blocks
                         fk_slot.clear()
                         with fk_slot:
                             _render_notice(
                                 ui,
                                 tone="success",
                                 icon="link_off",
-                                header=f"{dropped} foreign key(s) removed — ready to start",
+                                header=(
+                                    f"{dropped} foreign key(s) removed — ready to start"
+                                    if _unlocks
+                                    else f"{dropped} foreign key(s) removed"
+                                ),
                                 body=(
                                     "The target no longer enforces the foreign keys this "
                                     "migration created, so the stream cannot dead-letter "
                                     "out-of-order child rows. Cut over re-creates them with "
                                     '"Apply foreign keys" once the stream has drained.'
+                                    + (
+                                        ""
+                                        if _unlocks or not _sp_blocks
+                                        else " Start CDC stays blocked by the start-point "
+                                        "notice above."
+                                    )
                                 ),
                             )
-                        if not conn_blocker:
+                        if _unlocks:
                             start_btn.enable()
                             start_btn.props(remove="disable")
                             start_btn.tooltip("")
@@ -4791,6 +5079,13 @@ async def _open_cdc_start_dialog(
                     "blocked while this is unknown — re-test the target connection "
                     "and retry."
                 )
+            elif _sp_blocks:
+                # Hard block: a recovery-mode start against a changed table replays the
+                # same failure on every Start, or writes wrong values silently.
+                from dsql_migrator.ui.cdc_start_point_gate import start_point_tooltip
+
+                start_btn.props("disable")
+                start_btn.tooltip(start_point_tooltip(sp_verdict) or "")
             elif pg_objects_block is not None and not _pg_state["resolved"]:
                 start_btn.props("disable")
                 start_btn.tooltip(pg_objects_block[1])
@@ -4856,6 +5151,18 @@ def _open_cdc_stop_dialog(
                 "for as long as you stay stopped. Restarting drains it; if you are done, "
                 "use Delete CDC infrastructure, which drops the slot."
             )
+        else:
+            # MySQL: a restart RESUMES with snapshot.mode=schema_only, replaying Debezium's
+            # recorded schema history in binlog order -- so a DDL made while stopped is
+            # applied in order like a live one (never as if it had always been there), and
+            # needs the same follow-up as one.
+            body += (
+                " On MySQL a restart replays Debezium's recorded schema history, so a "
+                "schema change (ALTER TABLE) to a captured table while CDC is stopped is "
+                "applied in order when it continues, exactly as if it had kept streaming: "
+                "it needs the same follow-up on Aurora DSQL, and the CDC step reports it as "
+                "schema drift."
+            )
         confirm_label = "Stop CDC"
     with ui.dialog() as dialog, ui.card().classes("gap-2").style("min-width: 460px"):  # type: ignore[attr-defined]
         ui.label(title).classes("text-lg font-semibold")  # type: ignore[attr-defined]
@@ -4882,6 +5189,19 @@ def _open_cdc_delete_dialog(ui, migration_state, on_confirm, *, session=None) ->
             "This deletes the entire cdc-stack — MSK, the VPC wiring, plugins, IAM "
             "role and any connectors. This cannot be undone."
         ).classes("text-sm text-gray-700")
+        if _cdc_source_type(session) is not SourceType.POSTGRES:
+            # The offsets AND the schema-history topics live on MSK, so a redeployed stack
+            # starts again from the original start point with snapshot.mode=recovery --
+            # which the start-point check refuses if a captured table changed since (it
+            # only warns for a start point with no recorded fingerprints).
+            ui.label(  # type: ignore[attr-defined]
+                "On MySQL this also deletes the recorded stream position and Debezium's "
+                "schema history: after you deploy again, Start CDC reads the binary log "
+                "again from the Full Load watermark (or your Manual start point). It "
+                "refuses if a captured table's columns changed since then, but only warns "
+                "if that start point has no recorded table definitions (one recorded by an "
+                "earlier version of the tool or typed by hand)."
+            ).classes("text-xs text-gray-500")
         # Show the exact stack name in a copyable mono box so the operator can see
         # (and copy) precisely what to type -- relying on the input placeholder
         # alone is a trap (it looks pre-filled but is empty).
@@ -5596,10 +5916,12 @@ def _start_cdc_deploy(
                 ),
             )
             return
-    # MySQL: the connector config is built from the SEED, so snapshot.mode (recovery only
-    # when an offset is seeded) and the start coordinate agree with what is seeded by
-    # construction. PostgreSQL: the job watermark exactly as before.
+    # MySQL: the connector config is built from the SEED and the cached stack facts, so
+    # snapshot.mode (mysql_snapshot_mode: recovery for a NEW start offset, schema_only for
+    # a resume) and the start coordinate agree with what is seeded by construction -- and
+    # with the preview. PostgreSQL: the job watermark exactly as before (no facts).
     _config_wm = watermark if _cdc_source_type(session) is SourceType.POSTGRES else seed
+    _start_facts = mysql_start_facts(migration_state, seed, _cdc_source_type(session))
     source_config = dispatch_source_config(
         _cdc_source_type(session),
         tables_for_config,
@@ -5615,7 +5937,9 @@ def _start_cdc_deploy(
         # state that the start-position radio and session restore never set, which is how
         # snapshot.mode=initial + autocreate=disabled -- guaranteed connector death, after
         # both connectors are billed -- became reachable.
+        start_facts=_start_facts,
     )
+    _sent_snapshot_mode = getattr(source_config, "snapshot_mode", None)
     sink_config = CdcPipelineOrchestrator().build_sink_config(
         "mysql-sink", tables_for_config, CDC_DEFAULT_DLQ_TOPIC
     )
@@ -5651,6 +5975,76 @@ def _start_cdc_deploy(
     _overlay_plan = _start_cdc_overlay_plan(
         migration_state, inventory, tables_for_config, session, target
     )
+    _is_pg_start = _cdc_source_type(session) is SourceType.POSTGRES
+
+    def _check_mysql_start_on_worker(pre, pre_params) -> None:
+        """MySQL, on the worker thread before anything changes: the snapshot mode decided
+        on the loop must still be right for the stack as it is NOW, and a recovery start
+        must pass the start-point check (Retry CDC skips the dialog; a dialog verdict can
+        be stale). Raises RuntimeError to refuse; nothing has been changed yet."""
+        from dsql_migrator.ui.cdc_start_point_gate import (
+            point_coord,
+            point_label,
+            start_point_activity,
+            start_point_notice,
+        )
+        from dsql_migrator.ui.data_migration._cdc_status import (
+            cdc_deployed_watermark,
+            cdc_has_committed_offset,
+            cdc_live_snapshot_mode,
+            mysql_start_facts_from_params,
+        )
+
+        facts = _start_facts
+        if pre is not None:
+            fresh = mysql_start_facts_from_params(
+                seed, pre_params,
+                history_missing=bool(getattr(migration_state, "cdc_history_missing", False)),
+            )
+            if mysql_snapshot_mode(_seed_can_seed(seed), fresh) != _sent_snapshot_mode:
+                # The stack changed since this page read it: a Start that just failed and
+                # left its connectors, or another session or the console starting,
+                # stopping or redeploying it. Refresh the cached facts from THIS describe
+                # so the next click decides from the stack as it is, then refuse.
+                migration_state.set_cdc_has_committed_offset(cdc_has_committed_offset(pre_params))
+                migration_state.set_cdc_deployed_watermark(cdc_deployed_watermark(pre_params))
+                _set_mode = getattr(migration_state, "set_cdc_deployed_snapshot_mode", None)
+                if callable(_set_mode):
+                    _set_mode(cdc_live_snapshot_mode(pre_params))
+                _r1 = (
+                    "Start CDC blocked: the CDC stack changed after this page last read it "
+                    "(a Start that just failed, another session or the console started, "
+                    "stopped or redeployed it), so this start would run Debezium in the "
+                    "wrong snapshot mode. Nothing was changed; Start CDC again."
+                )
+                _log_cdc_event(
+                    "start blocked: CDC stack changed", status=ActivityStatus.FAILURE,
+                    detail=_r1,
+                )
+                raise RuntimeError(_r1)
+            facts = fresh
+        verdict = _probe_cdc_start_point(
+            migration_state, session, seed=seed, mode=_sent_snapshot_mode, facts=facts,
+            tables=tables_for_config,
+        )
+        if verdict is None:
+            return
+        _label = point_label(seed, seed_origin)
+        _activity = start_point_activity(verdict, point_label=_label)
+        if verdict.blocks:
+            _notice = start_point_notice(
+                verdict, point_label=_label, coord=point_coord(seed),
+                migration_type=getattr(migration_state, "migration_type", None),
+                resumes=bool(getattr(facts, "resumes", False)),
+            )
+            if _activity is not None:
+                _log_cdc_event(_activity[0], status=_activity[1], detail=_activity[2])
+            raise RuntimeError(
+                "Start CDC blocked: "
+                + (f"{_notice[2]}. {_notice[3]}" if _notice is not None else "")
+            )
+        if _activity is not None:
+            _log_cdc_event(_activity[0], status=_activity[1], detail=_activity[2])
 
     def work(handle) -> None:
         try:
@@ -5729,6 +6123,8 @@ def _start_cdc_deploy(
                 detail=_seen_refusal,
             )
             raise RuntimeError(f"Start CDC blocked: {_seen_refusal}")
+        if not _is_pg_start:
+            _check_mysql_start_on_worker(_pre, _pre_params)
         # The column-exclusion overlay: every captured excluded column nullable with no
         # DEFAULT (recorded first) BEFORE any connector is created or changed, so every row
         # CDC writes holds NULL there. Covers Retry CDC and a re-Start after Stop; a no-op
@@ -5753,37 +6149,63 @@ def _start_cdc_deploy(
         # Recorded BEFORE the Start: if it fails after the seeder wrote this offset, a later
         # Start must not offer an earlier one (seed_refused_by_an_earlier_offer).
         migration_state.note_cdc_offered_seed(seed)
-        run_cdc_start(
-            handle,
-            stack_name=stack_name,
-            params=params,
-            deployer=deployer,
-            on_log=migration_state.append_cdc_deploy_log,
-            # The start offset offered to the seeder (_cdc_start_seed): the Full Load
-            # watermark (gapless, Property 11) or the Manual binlog point. With no
-            # seedable point there is no seed and the source connector starts from the
-            # current binlog (or its committed offset on a restart).
-            watermark=seed,
-            seed_origin=seed_origin,
-            template_body=template_body,
-            seed_mode=seed_mode,
-            # PostgreSQL only: lets the Start repair a publication DEBEZIUM created, which
-            # lands at publish_via_partition_root=false and therefore makes the connector
-            # silently DISCARD every change to a partitioned table. Optional by design --
-            # absent credentials (never persisted, Property 7) downgrade to a warning rather
-            # than blocking a Start that works for every non-partitioned table.
-            pg_source_config=(
-                getattr(session, "source_config", None)
-                if _cdc_source_type(session) is SourceType.POSTGRES
-                else None
-            ),
-            pg_source_password=getattr(session, "source_password", None),
-        )
+        from dsql_migrator.core.cdc_deployer import CdcDeployError, is_schema_history_failure
+
+        try:
+            run_cdc_start(
+                handle,
+                stack_name=stack_name,
+                params=params,
+                deployer=deployer,
+                on_log=migration_state.append_cdc_deploy_log,
+                # The start offset offered to the seeder (_cdc_start_seed): the Full Load
+                # watermark (gapless, Property 11) or the Manual binlog point. With no
+                # seedable point there is no seed and the source connector starts from the
+                # current binlog (or its committed offset on a restart).
+                watermark=seed,
+                seed_origin=seed_origin,
+                template_body=template_body,
+                seed_mode=seed_mode,
+                # PostgreSQL only: lets the Start repair a publication DEBEZIUM created,
+                # which lands at publish_via_partition_root=false and therefore makes the
+                # connector silently DISCARD every change to a partitioned table. Optional
+                # by design -- absent credentials (never persisted, Property 7) downgrade to
+                # a warning rather than blocking a Start that works for every
+                # non-partitioned table.
+                pg_source_config=(
+                    getattr(session, "source_config", None)
+                    if _cdc_source_type(session) is SourceType.POSTGRES
+                    else None
+                ),
+                pg_source_password=getattr(session, "source_password", None),
+            )
+        except CdcDeployError as exc:
+            # A schema_only RESUME that found this stack's schema history missing or
+            # incomplete would fail the same way on every Start: flag it so the next one
+            # rebuilds the history (recovery, after the start-point check).
+            if (
+                not _is_pg_start
+                and _sent_snapshot_mode == "schema_only"
+                and is_schema_history_failure(str(exc))
+            ):
+                _note = getattr(migration_state, "note_cdc_history_missing", None)
+                if callable(_note):
+                    _note(True)
+            raise
         # This Start just sent this value: it IS the stack's value now, so a Retry before
         # the next probe is judged against it (not the pre-Start one it replaced).
         _sent = dict(apply_column_exclude_chooser(params, _pre_params).filled).get("ColumnExcludeList")
         if _sent is not None:
             migration_state.set_cdc_deployed_column_exclude_list(_sent)
+        if not _is_pg_start:
+            # Likewise the snapshot mode the connectors now run with, and the history is
+            # evidently there (or was just rebuilt).
+            _set_mode = getattr(migration_state, "set_cdc_deployed_snapshot_mode", None)
+            if callable(_set_mode):
+                _set_mode(_sent_snapshot_mode)
+            _note = getattr(migration_state, "note_cdc_history_missing", None)
+            if callable(_note):
+                _note(False)
 
     _action = "start CDC connectors"
     # The RESUME POINT is the fact this line exists for: it is what makes the Full
@@ -5802,6 +6224,7 @@ def _start_cdc_deploy(
         # The operator's (effective) exclusions only -- "oversized LOB" in the detail; the
         # generated columns the capture also drops are not the operator's choice.
         exclusions=effective_lob_exclusions(migration_state, inventory),
+        snapshot_mode=_sent_snapshot_mode,
     )
     if _overlay_plan["overlay_by_table"]:
         _mark = getattr(migration_state, "mark_overlay_ledger_in_use", None)
@@ -6251,6 +6674,11 @@ def _start_cdc_stop(
             deployer=deployer,
             on_log=migration_state.append_cdc_deploy_log,
         )
+        # The connectors are gone, so there is no live snapshot mode for the next Start to
+        # keep (core.cdc.mysql_snapshot_mode); the next probe re-reads the rest.
+        _set_mode = getattr(migration_state, "set_cdc_deployed_snapshot_mode", None)
+        if callable(_set_mode):
+            _set_mode(None)
 
     # CLOSE the run's data-path record before the connectors go away. Stop is the last
     # moment the applied-ops metrics mean anything (the connectors, and their CloudWatch

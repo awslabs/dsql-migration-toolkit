@@ -528,3 +528,103 @@ def test_estimate_source_rows_missing_table_is_none() -> None:
 def test_estimate_source_rows_empty_input() -> None:
     conn = _FakeConnection(counts={}, current_db="cdc_demo")
     assert estimate_source_rows(conn, []) == {}
+
+
+# ---------------------------------------------------------------------------
+# G5: the CDC start-point fingerprint, read just before the binlog position
+# ---------------------------------------------------------------------------
+
+
+class _CatalogConnection(_FakeConnection):
+    """Also answers the start-point catalog statement (information_schema.COLUMNS)."""
+
+    def __init__(self, *, catalog_rows=None, catalog_error=None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._catalog_rows = list(catalog_rows or [])
+        self._catalog_error = catalog_error
+
+    def execute(self, statement, _parameters=None):  # noqa: ANN001, ANN201
+        sql = str(statement)
+        if "information_schema.COLUMNS" in sql:
+            self.executed.append(sql)
+            if self._catalog_error is not None:
+                raise self._catalog_error
+            rows = self._catalog_rows
+
+            class _R:
+                def fetchall(self):
+                    return list(rows)
+
+            return _R()
+        return super().execute(statement, _parameters)
+
+
+_ORDERS_ROWS = [
+    ("c", "app", "orders", "id", 1, "int", "NO", "", None),
+    ("c", "app", "orders", "note", 2, "varchar(9)", "YES", "", "utf8mb4"),
+    ("k", "app", "orders", "id", 1, None, None, None, None),
+]
+_STATUS = {"File": "mysql-bin.000007", "Position": 120, "Executed_Gtid_Set": ""}
+
+
+def test_capture_reads_the_fingerprint_before_the_binlog_position() -> None:
+    # Read BEFORE SHOW BINARY LOG STATUS: a DDL racing the capture then lands before the
+    # recorded position, so the fingerprint (old shape) can only cause a false refusal --
+    # never a recovery start that reads post-DDL-shape rows as pre-DDL ones.
+    connection = _CatalogConnection(catalog_rows=_ORDERS_ROWS, master_status=_STATUS)
+    watermark = capture_watermark(connection, ["app.orders"], now=lambda: FIXED_NOW)
+    catalog_at = next(
+        i for i, s in enumerate(connection.executed) if "information_schema.COLUMNS" in s
+    )
+    status_at = next(
+        i for i, s in enumerate(connection.executed) if SHOW_BINARY_LOG_STATUS in s
+    )
+    assert connection.executed[0] == START_CONSISTENT_SNAPSHOT
+    assert 0 < catalog_at < status_at
+    assert set(watermark.table_fingerprints) == {"app.orders"}
+    assert watermark.table_fingerprints["app.orders"].startswith("2:2:")
+    assert all(not is_write_or_ddl(s) for s in connection.executed)
+
+
+def test_a_failed_fingerprint_read_never_fails_the_capture() -> None:
+    connection = _CatalogConnection(
+        catalog_error=RuntimeError("Lost connection to db.internal:3306"),
+        master_status=_STATUS,
+    )
+    watermark = capture_watermark(connection, ["app.orders"], now=lambda: FIXED_NOW)
+    assert watermark.table_fingerprints == {}
+    assert (watermark.binlog_file, watermark.binlog_position) == ("mysql-bin.000007", 120)
+    assert connection.executed[-1] == COMMIT
+
+
+def test_a_read_only_violation_in_the_fingerprint_read_propagates() -> None:
+    import pytest
+
+    from dsql_migrator.core.introspector import ReadOnlySourceError
+
+    connection = _CatalogConnection(
+        catalog_error=ReadOnlySourceError("refused"), master_status=_STATUS
+    )
+    with pytest.raises(ReadOnlySourceError):
+        capture_watermark(connection, ["app.orders"], now=lambda: FIXED_NOW)
+    assert connection.executed[-1] == COMMIT  # the transaction is still closed
+
+
+def test_unqualified_names_issue_no_catalog_statement() -> None:
+    connection = _CatalogConnection(catalog_rows=_ORDERS_ROWS, master_status=_STATUS)
+    watermark = capture_watermark(connection, ["orders"], now=lambda: FIXED_NOW)
+    assert not any("information_schema.COLUMNS" in s for s in connection.executed)
+    assert watermark.table_fingerprints == {}
+
+
+def test_the_fingerprint_field_is_left_out_while_empty_and_round_trips() -> None:
+    bare = Watermark(snapshot_timestamp=FIXED_NOW)
+    assert "table_fingerprints" not in bare.model_dump()
+    assert "table_fingerprints" not in bare.model_dump_json()
+    # A payload written by an earlier version (no key) still loads.
+    old = {"snapshot_timestamp": FIXED_NOW.isoformat(), "binlog_file": "f", "binlog_position": 4}
+    assert Watermark.model_validate(old).table_fingerprints == {}
+    full = Watermark(snapshot_timestamp=FIXED_NOW, table_fingerprints={"app.t": "1:1:x:y"})
+    job = MigrationJob(job_id="j", watermark=full)
+    again = MigrationJob.model_validate_json(job.model_dump_json())
+    assert again.watermark.table_fingerprints == {"app.t": "1:1:x:y"}

@@ -468,3 +468,514 @@ def test_the_start_cdc_fk_gate_only_checks_keys_the_stream_can_reach() -> None:
     src = inspect.getsource(_cdc_ui._probe_cdc_blocking_foreign_keys)
     assert "cdc_foreign_keys_in_stream_scope(preserved, streamed, inventory)" in src
     assert src.index("cdc_foreign_keys_in_stream_scope(") < src.index("table_names = sorted(")
+
+
+# ---------------------------------------------------------------------------
+# G5: the preview and Start send ONE snapshot mode; the stack facts it reads
+# ---------------------------------------------------------------------------
+
+
+def test_the_preview_of_a_resuming_stack_prints_schema_only_and_start_sends_it(monkeypatch):
+    from dsql_migrator.core.models import TableSelection
+    from tests.test_ui_data_migration import _inventory, _run_start_cdc_capture
+
+    state = _state(deployed=("mysql-bin-changelog.000007", "108063011"))
+    state.set_selection(TableSelection(selected_tables=["orders"]))
+    blob = " ".join(_card(state, inventory=_inventory()).texts)
+    assert "snapshot.mode = schema_only" in blob
+    assert "snapshot.mode = recovery" not in blob
+    run = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.MYSQL, job_watermark=_WM, state=state,
+    )
+    assert dict(run["kwargs"]["params"].filled)["SnapshotMode"] == "schema_only"
+    # A first start from the same watermark (never streamed) is still recovery.
+    first = _state(committed=False)
+    first.set_selection(TableSelection(selected_tables=["orders"]))
+    assert "snapshot.mode = recovery" in " ".join(_card(first, inventory=_inventory()).texts)
+
+
+def _probe_with(params):
+    class _D:
+        stack_status = "UPDATE_COMPLETE"
+        is_stable = True
+
+        def __init__(self, p):
+            self.current_parameters = p
+
+    class _Dep:
+        def describe_stack_or_none(self, _n):
+            return _D(params)
+
+        def list_cdc_stacks(self):
+            return []
+
+    import dsql_migrator.core.cdc_deployer as dmod
+
+    st = DataMigrationState()
+    orig = dmod.build_cdc_stack_deployer
+    dmod.build_cdc_stack_deployer = lambda *_a, **_k: _Dep()
+    try:
+        _status._probe_cdc_stack_phase(
+            st, SimpleNamespace(target_config=SimpleNamespace(region="us-east-1"), aws_profile=None)
+        )
+    finally:
+        dmod.build_cdc_stack_deployer = orig
+    return st
+
+
+def test_the_probe_caches_the_live_snapshot_mode_from_the_same_describe():
+    running = _probe_with({"MskBootstrapServers": "b-1:9098", "SnapshotMode": "schema_only"})
+    assert running.cdc_deployed_snapshot_mode == "schema_only"
+    # Stopped: the parameter is carried forward, but no connector runs with it.
+    stopped = _probe_with({"MskBootstrapServers": "", "SnapshotMode": "recovery",
+                           "DeploySink": "true"})
+    assert stopped.cdc_deployed_snapshot_mode is None
+    odd = _probe_with({"MskBootstrapServers": "b-1:9098", "SnapshotMode": "initial"})
+    assert odd.cdc_deployed_snapshot_mode is None
+
+
+def test_the_history_flag_and_live_mode_clear_with_the_stack():
+    def _armed():
+        st = DataMigrationState()
+        st.note_cdc_history_missing(True)
+        st.set_cdc_deployed_snapshot_mode("schema_only")
+        return st
+
+    gone = _armed()
+    gone.set_cdc_stack_phase("absent")
+    assert gone.cdc_history_missing is False and gone.cdc_deployed_snapshot_mode is None
+    stopped = _armed()
+    stopped.set_cdc_stack_phase("infra", status="UPDATE_COMPLETE")
+    assert stopped.cdc_history_missing is True  # the same stack, still missing it
+    adopted = _armed()
+    assert adopted.adopt_cdc_stack("dsql-cdc-other")
+    assert adopted.cdc_history_missing is False and adopted.cdc_deployed_snapshot_mode is None
+    renamed = _armed()
+    assert renamed.set_cdc_stack_name("dsql-cdc-renamed")
+    assert renamed.cdc_history_missing is False and renamed.cdc_deployed_snapshot_mode is None
+    same = _armed()
+    assert same.set_cdc_stack_name(same.cdc_stack_name)
+    assert same.cdc_history_missing is True
+
+
+# ---------------------------------------------------------------------------
+# G5: a Manual point records the captured tables' fingerprints at Fetch current position
+# ---------------------------------------------------------------------------
+
+
+class _FetchConn:
+    def __init__(self, log, *, status_error=None, catalog_error=None):
+        self.log, self.status_error, self.catalog_error = log, status_error, catalog_error
+
+
+def _patch_fetch(monkeypatch, *, status_error=None, catalog_error=None):
+    import dsql_migrator.core.cdc_catalog_drift as drift
+    import dsql_migrator.core.watermark as wm
+    import dsql_migrator.ui.connect as connect
+    from dsql_migrator.core.cdc_catalog_drift import LiveColumn, LiveTable
+
+    log: list = []
+
+    class _Engine:
+        def connect(self):
+            conn = _FetchConn(log, status_error=status_error, catalog_error=catalog_error)
+            log.append(("connect", id(conn)))
+
+            class _Ctx:
+                def __enter__(self):
+                    return conn
+
+                def __exit__(self, *_a):
+                    return False
+
+            return _Ctx()
+
+        def dispose(self):
+            log.append(("dispose",))
+
+    monkeypatch.setattr(
+        connect, "make_source_engine_factory", lambda *_a, **_k: (lambda _cfg: _Engine())
+    )
+
+    def _catalog(conn, names, source_type=None):
+        log.append(("catalog", id(conn), tuple(names)))
+        if conn.catalog_error is not None:
+            raise conn.catalog_error
+        return {
+            n: LiveTable(columns=(LiveColumn("id", "int", False, False, 0),),
+                         primary_key=frozenset({"id"}))
+            for n in names
+        }
+
+    def _status_row(conn):
+        log.append(("status", id(conn)))
+        if conn.status_error is not None:
+            raise conn.status_error
+        return {"File": "mysql-bin.000200", "Position": 77, "Executed_Gtid_Set": ""}
+
+    monkeypatch.setattr(drift, "read_live_catalog", _catalog)
+    monkeypatch.setattr(wm, "read_binlog_status_row", _status_row)
+    return log
+
+
+_SESSION = SimpleNamespace(source_config=SimpleNamespace(), source_password="pw")
+
+
+def test_fetch_reads_the_catalog_before_the_position_on_one_connection(monkeypatch):
+    log = _patch_fetch(monkeypatch)
+    row, fps = _cdc_ui._fetch_start_position(_SESSION, ["app.orders"])
+    assert row["File"] == "mysql-bin.000200"
+    assert set(fps) == {"app.orders"} and fps["app.orders"].startswith("2:1:")
+    kinds = [e[0] for e in log]
+    assert kinds == ["connect", "catalog", "status", "dispose"]
+    assert log[1][1] == log[2][1] == log[0][1]  # ONE connection
+
+
+def test_fetch_disposes_the_engine_and_keeps_the_position_when_the_catalog_fails(monkeypatch):
+    import pytest
+
+    log = _patch_fetch(monkeypatch, catalog_error=RuntimeError("timeout"))
+    row, fps = _cdc_ui._fetch_start_position(_SESSION, ["app.orders"])
+    assert row["Position"] == 77 and fps is None
+    log = _patch_fetch(monkeypatch, status_error=RuntimeError("denied"))
+    with pytest.raises(RuntimeError):
+        _cdc_ui._fetch_start_position(_SESSION, ["app.orders"])
+    assert log[-1] == ("dispose",)
+
+
+class _InputsUi(_RecordingUi):
+    """Inputs with a settable value, and recorded notifications."""
+
+    def __init__(self):
+        super().__init__()
+        self.inputs: dict = {}
+        self.notified: list = []
+
+    class _Input(_RecordingUi._El):
+        def __init__(self, ui, value=""):
+            super().__init__(ui)
+            self.value = value
+
+        def set_value(self, value):
+            self.value = value
+
+    def input(self, label="", *_a, value="", **_k):
+        el = _InputsUi._Input(self, value)
+        self.inputs[str(label)] = el
+        return el
+
+    def notify(self, message="", *_a, **_k):
+        self.notified.append((str(message), _k.get("type")))
+
+
+def _manual_inputs(monkeypatch, fetch_result):
+    import asyncio
+
+    import nicegui
+
+    class _Run:
+        @staticmethod
+        async def io_bound(fn, *a, **k):
+            return fn(*a, **k)
+
+    monkeypatch.setattr(nicegui, "run", _Run, raising=False)
+    calls: list = []
+
+    def _fetch(session, names):
+        calls.append(list(names))
+        return fetch_result
+
+    monkeypatch.setattr(_cdc_ui, "_fetch_start_position", _fetch)
+    state = DataMigrationState()
+    state.set_cdc_start_mode("manual")
+    ui = _InputsUi()
+    _cdc_ui._render_cdc_manual_inputs(
+        ui, state, lambda: None, session=_SESSION, captured_names=lambda: ["app.orders"],
+    )
+    by = {b.text: b for b in ui.buttons}
+    asyncio.run(by["Fetch current position"].on_click())
+    return ui, state, by, calls
+
+
+def test_use_this_start_point_binds_the_fingerprints_only_to_the_fetched_position(monkeypatch):
+    fps = {"app.orders": "1:1:00000000:0000000000000000"}
+    ui, state, by, calls = _manual_inputs(
+        monkeypatch,
+        ({"File": "mysql-bin.000200", "Position": 77, "Executed_Gtid_Set": ""}, fps),
+    )
+    assert calls == [["app.orders"]]
+    assert ui.inputs["Binlog file:position"].value == "mysql-bin.000200:77"
+    by["Use this start point"].on_click()
+    assert state.cdc_start_fingerprints() == fps
+    seed, origin = _cdc_ui._cdc_start_seed(state, None, SourceType.MYSQL)
+    assert origin == "manual" and seed.table_fingerprints == fps
+    # An edited position is not the one the definitions were read with.
+    ui.inputs["Binlog file:position"].set_value("mysql-bin.000200:78")
+    by["Use this start point"].on_click()
+    assert state.cdc_start_fingerprints() == {}
+
+
+def test_a_fetch_whose_definitions_could_not_be_read_warns(monkeypatch):
+    ui, state, by, _calls = _manual_inputs(
+        monkeypatch,
+        ({"File": "mysql-bin.000200", "Position": 77, "Executed_Gtid_Set": ""}, None),
+    )
+    warnings = [m for m, t in ui.notified if t == "warning"]
+    assert warnings and "could not be recorded" in warnings[0]
+    by["Use this start point"].on_click()
+    assert state.cdc_start_fingerprints() == {}
+    assert state.cdc_start_override().binlog_position == 77
+
+
+def test_the_manual_fingerprints_follow_the_coordinates_they_were_recorded_for():
+    from dsql_migrator.ui.data_migration import reset_stale_manual_start_point
+
+    state = DataMigrationState()
+    fps = {"app.orders": "1:1:00000000:0000000000000000"}
+    state.set_cdc_start_position(binlog_file="mysql-bin.000200", binlog_pos=77, fingerprints=fps)
+    assert state.cdc_start_fingerprints() == fps
+    # Without a binlog position there is nothing to bind them to.
+    state.set_cdc_start_position(gtid="u:1-5", fingerprints=fps)
+    assert state.cdc_start_fingerprints() == {}
+    # Any later set without them clears them.
+    state.set_cdc_start_position(binlog_file="mysql-bin.000200", binlog_pos=77, fingerprints=fps)
+    state.set_cdc_start_position(binlog_file="mysql-bin.000200", binlog_pos=77)
+    assert state.cdc_start_fingerprints() == {}
+    # The Full Load's reset to Automatic keeps the coordinates, and so the fingerprints.
+    state.set_cdc_start_position(binlog_file="mysql-bin.000200", binlog_pos=77, fingerprints=fps)
+    state.set_cdc_start_mode("manual")
+    assert reset_stale_manual_start_point(
+        state, MigrationType.FULL_LOAD_AND_CDC, SourceType.MYSQL, log=lambda **_k: None
+    )
+    assert state.cdc_start_fingerprints() == fps
+
+
+def test_a_fetch_whose_definitions_could_not_be_read_says_what_to_do_next(monkeypatch):
+    # The point is not applied yet when the warning shows, so it must name the next step
+    # (the success notice it replaces did: "click 'Use this start point' to confirm").
+    ui, state, by, _calls = _manual_inputs(
+        monkeypatch,
+        ({"File": "mysql-bin.000200", "Position": 77, "Executed_Gtid_Set": ""}, None),
+    )
+    warnings = [m for m, t in ui.notified if t == "warning"]
+    assert state.cdc_start_override() is None  # nothing applied yet
+    assert "Fetch again" in warnings[0] and "Use this start point" in warnings[0]
+
+
+def test_fetch_never_swallows_a_read_only_guard_violation(monkeypatch):
+    import pytest
+
+    from dsql_migrator.core.introspector import ReadOnlySourceError
+
+    log = _patch_fetch(monkeypatch, catalog_error=ReadOnlySourceError("refused"))
+    with pytest.raises(ReadOnlySourceError):
+        _cdc_ui._fetch_start_position(_SESSION, ["app.orders"])
+    assert log[-1] == ("dispose",)
+
+
+_FPS = {"app.orders": "2:1:00000000:0000000000000000"}
+_ROW = {"File": "mysql-bin.000200", "Position": 77, "Executed_Gtid_Set": ""}
+
+
+def _rerender(state):
+    ui = _InputsUi()
+    _cdc_ui._render_cdc_manual_inputs(
+        ui, state, lambda: None, session=_SESSION, captured_names=lambda: ["app.orders"],
+    )
+    return ui, {b.text: b for b in ui.buttons}
+
+
+def test_reconfirming_the_stored_point_after_a_re_render_keeps_its_fingerprints(monkeypatch):
+    # "Use this start point" refreshes the card, so the next click is on a NEW render whose
+    # fetch cell is empty: re-confirming the same point must not wipe the definitions
+    # recorded for it (the check would drop to a warning for an unchanged point).
+    _ui, state, by, _calls = _manual_inputs(monkeypatch, (_ROW, _FPS))
+    by["Use this start point"].on_click()
+    ui2, by2 = _rerender(state)
+    assert ui2.inputs["Binlog file:position"].value == "mysql-bin.000200:77"
+    by2["Use this start point"].on_click()
+    assert state.cdc_start_fingerprints() == _FPS
+    assert _cdc_ui._cdc_start_seed(state, None, SourceType.MYSQL)[0].table_fingerprints == _FPS
+    # Editing only the GTID keeps them too: the seed is the binlog file:position.
+    ui2.inputs["GTID set"].set_value("3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5")
+    by2["Use this start point"].on_click()
+    assert state.cdc_start_fingerprints() == _FPS
+    # Another position never carries them.
+    ui2.inputs["Binlog file:position"].set_value("mysql-bin.000200:78")
+    by2["Use this start point"].on_click()
+    assert state.cdc_start_fingerprints() == {}
+
+
+def test_reconfirming_a_restored_point_keeps_its_fingerprints():
+    # Session restore puts back the point WITH its fingerprints; clicking the prefilled
+    # card must keep them.
+    state = DataMigrationState()
+    state.set_cdc_start_mode("manual")
+    state.set_cdc_start_position(binlog_file="mysql-bin.000200", binlog_pos=77, fingerprints=_FPS)
+    _ui, by = _rerender(state)
+    by["Use this start point"].on_click()
+    seed, origin = _cdc_ui._cdc_start_seed(state, None, SourceType.MYSQL)
+    assert origin == "manual" and seed.table_fingerprints == _FPS
+
+
+# ---------------------------------------------------------------------------
+# G5: the Manual route the refusals and the replay diagnoses name is on the card
+# ---------------------------------------------------------------------------
+
+
+class _CardInputsUi(_InputsUi, _CardUi):
+    """The start-point card with its radio, inputs and notifications."""
+
+
+def _src_session():
+    from dsql_migrator.core.models import SourceConnectionConfig
+
+    return SimpleNamespace(
+        source_config=SourceConnectionConfig(host="db", database="app"),
+        source_password="pw", target_config=None, aws_profile=None,
+    )
+
+
+def _live_card(monkeypatch, state, *, migration_type, job=None):
+    """Render the real source-config card with a source session; Fetch is stubbed and
+    records the table names it was asked to fingerprint."""
+    import nicegui
+
+    from tests.test_ui_data_migration import _g5_inventory
+
+    class _Run:
+        @staticmethod
+        async def io_bound(fn, *a, **k):
+            return fn(*a, **k)
+
+    monkeypatch.setattr(nicegui, "run", _Run, raising=False)
+    calls: list = []
+
+    def _fetch(_session, names):
+        calls.append(list(names))
+        return dict(_ROW), dict(_FPS)
+
+    monkeypatch.setattr(_cdc_ui, "_fetch_start_position", _fetch)
+    ui = _CardInputsUi()
+    _cdc_ui._render_cdc_source_config_card(
+        ui, state, _JM(job or _job(None)), lambda: None, inventory=_g5_inventory(),
+        migration_type=migration_type, session=_src_session(),
+    )
+    return ui, {b.text: b for b in ui.buttons}, calls
+
+
+def _selected(state):
+    from dsql_migrator.core.models import TableSelection
+
+    state.set_selection(TableSelection(selected_tables=["app.orders"]))
+    return state
+
+
+_MANUAL_DISCLOSURE = "Manual — start from a later binlog position instead"
+
+
+def test_a_stopped_cdc_only_stack_offers_the_manual_route_its_refusals_name(monkeypatch):
+    # CDC only, streamed then stopped (e.g. after a replay crash): a plain Start resumes
+    # with schema_only. The diagnosis and the E1 copy name "choose Manual, Fetch current
+    # position and Use this start point" as the way forward, so the resume card must have
+    # it -- it used to return before any Manual control was rendered.
+    import asyncio
+
+    from dsql_migrator.core.cdc_deployer import _diagnose_connector_log
+
+    d1 = _diagnose_connector_log("src", "internal schema size 4, but UPDATE size 3")
+    assert "choose Manual, Fetch current position and Use this start point" in d1
+    state = _selected(_state())  # committed offset; CDC only: no watermark was seeded
+    ui, by, calls = _live_card(monkeypatch, state, migration_type=MigrationType.CDC_ONLY)
+    blob = " ".join(ui.texts)
+    assert "Resuming from the last streamed position" in blob
+    assert _MANUAL_DISCLOSURE in blob
+    assert "Manual — enter a binlog file:position" not in blob  # no radio on a resume
+    assert "Fetch current position" in by and "Use this start point" in by
+    # Following it moves the start point FORWARD on this same stack.
+    asyncio.run(by["Fetch current position"].on_click())
+    assert calls == [["app.orders"]]  # the card hands Fetch the captured tables
+    by["Use this start point"].on_click()
+    assert state.cdc_start_mode() == "manual"
+    seed, origin = _cdc_ui._cdc_start_seed(state, None, SourceType.MYSQL)
+    assert origin == "manual"
+    assert (seed.binlog_file, seed.binlog_position) == ("mysql-bin.000200", 77)
+    assert seed.table_fingerprints == _FPS
+    assert _cdc_ui.cdc_start_resumes(state, seed, SourceType.MYSQL) is False
+    after = " ".join(
+        _live_card(monkeypatch, state, migration_type=MigrationType.CDC_ONLY)[0].texts
+    )
+    assert "Resuming from the last streamed position" not in after
+    assert "Start point set — binlog mysql-bin.000200:77" in after
+
+
+def test_a_history_missing_resume_says_it_rebuilds_and_offers_the_manual_route(monkeypatch):
+    # The flagged next Start runs recovery after the start-point check, which can refuse
+    # with "choose Manual ..."; the card must not claim "nothing re-applied, no choice".
+    from dsql_migrator.core.cdc import mysql_snapshot_mode, start_point_check_due
+
+    state = _selected(_state(deployed=("mysql-bin-changelog.000007", "108063011")))
+    state.note_cdc_history_missing(True)
+    seed, _origin = _cdc_ui._cdc_start_seed(state, _WM, SourceType.MYSQL)
+    facts = _cdc_ui.mysql_start_facts(state, seed)
+    assert facts.resumes and mysql_snapshot_mode(True, facts) == "recovery"
+    assert start_point_check_due("recovery", facts)
+    for mtype in (MigrationType.FULL_LOAD_AND_CDC, MigrationType.CDC_ONLY):
+        ui, by, _calls = _live_card(monkeypatch, state, migration_type=mtype, job=_job())
+        blob = " ".join(ui.texts)
+        assert "Resuming from the last streamed position" in blob
+        assert "(snapshot.mode=recovery)" in blob and "nothing re-applied" not in blob
+        assert _MANUAL_DISCLOSURE in blob
+        assert "Fetch current position" in by and "Use this start point" in by
+    # A plain resume keeps its copy, with the same collapsed route.
+    state.note_cdc_history_missing(False)
+    ui, by, _calls = _live_card(
+        monkeypatch, state, migration_type=MigrationType.FULL_LOAD_AND_CDC, job=_job()
+    )
+    blob = " ".join(ui.texts)
+    assert "nothing re-applied" in blob and _MANUAL_DISCLOSURE in blob
+
+
+def test_a_postgres_resume_offers_no_binlog_route():
+    ui = _CardUi()
+    _cdc_ui._render_cdc_start_point_card(
+        ui, _state(), lambda: None, wm_resume=None, wm_usable=False, effective_resume=None,
+        mode="auto", session=None, source_type=SourceType.POSTGRES, resumes_from_offset=True,
+    )
+    assert _MANUAL_DISCLOSURE not in " ".join(ui.texts)
+
+
+def test_the_regular_manual_card_records_the_captured_tables_at_fetch(monkeypatch):
+    # The card (not only the inputs helper) must hand Fetch the captured table names:
+    # without them the fetch records no fingerprint, no warning shows, and the first
+    # Start of a CDC-only migration silently drops to an unchecked start.
+    import asyncio
+
+    state = _selected(_state(committed=False))
+    state.set_cdc_start_mode("manual")
+    ui, by, calls = _live_card(monkeypatch, state, migration_type=MigrationType.CDC_ONLY)
+    assert _MANUAL_DISCLOSURE not in " ".join(ui.texts)  # the radio offers Manual here
+    asyncio.run(by["Fetch current position"].on_click())
+    assert calls == [["app.orders"]]
+    by["Use this start point"].on_click()
+    assert state.cdc_start_fingerprints() == _FPS
+
+
+def test_after_a_reload_reset_choosing_manual_again_brings_the_fetched_point_back():
+    # E1/D1's Manual route: Fetch + Use, then Drop & reload -- which resets the start point
+    # to Automatic. The copy says to choose Manual again; the point and its fingerprints
+    # are kept, so that start is checked against the fetched point, not the watermark.
+    from dsql_migrator.ui.cdc_start_point_gate import RELOAD_RESETS_MANUAL
+    from dsql_migrator.ui.data_migration import reset_stale_manual_start_point
+
+    assert "back to Automatic" in RELOAD_RESETS_MANUAL
+    state = DataMigrationState()
+    state.set_cdc_start_mode("manual")
+    state.set_cdc_start_position(binlog_file="mysql-bin.000200", binlog_pos=77, fingerprints=_FPS)
+    assert reset_stale_manual_start_point(
+        state, MigrationType.FULL_LOAD_AND_CDC, SourceType.MYSQL, log=lambda **_k: None
+    )
+    assert _cdc_ui._cdc_start_seed(state, _WM, SourceType.MYSQL)[1] == "full_load"
+    state.set_cdc_start_mode("manual")
+    seed, origin = _cdc_ui._cdc_start_seed(state, _WM, SourceType.MYSQL)
+    assert origin == "manual" and seed.table_fingerprints == _FPS
