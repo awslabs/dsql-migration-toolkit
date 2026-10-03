@@ -1676,6 +1676,54 @@ def synthesis_gaps(
     return tuple(gaps)
 
 
+def rule_matched_columns(
+    text: Optional[str],
+    table: str,
+    columns: "Sequence[tuple[str, str]]",
+    primary_key: "Sequence[str]",
+    *,
+    source_type: SourceType,
+) -> "dict[str, Optional[str]]":
+    """``{column: matching rule text or None}``: the columns of ONE table the SAVED rule
+    ``text`` excludes, resolved against its LIVE ``columns`` (``[(name, catalog type)]``).
+
+    For CDC Fix target schema…: the capture list holds concrete names fixed when the rules
+    were saved, so a column the source added later that a wildcard or ``type:`` rule matches
+    is captured, and it must not be added to Aurora DSQL. Resolves the text against one
+    synthetic ``TableDef`` built from the live definition, with this table in scope (and
+    re-ticked, so a table line that would unselect it still reports its column matches).
+    Include wins, as in a Save; errors on lines naming other tables are ignored. The rule
+    text is the first line that excluded the column, stripped. Never read the pending lines:
+    the caller passes only the saved text. ``None`` or empty text matches nothing. Pure;
+    does not catch exceptions (the caller fails closed).
+    """
+    if not text or not text.strip():
+        return {}
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    synthetic = TableDef(
+        name=table,
+        columns=[ColumnDef(name=str(n), mysql_type=str(t)) for n, t in columns],
+        primary_key=[str(k) for k in primary_key],
+    )
+    resolution = resolve_exclusion_rules(
+        text,
+        migratable=[synthetic],
+        source_type=source_type,
+        effective_selection=[table],
+        retick_overrides=[table],
+    )
+    matched = set(resolution.columns.get(table, ())) | {
+        c for t, c in resolution.retick_columns if t == table
+    }
+    out: dict[str, Optional[str]] = {}
+    for column in sorted(matched):
+        lines = resolution.excluded_by.get((table, column), ())
+        rule = resolution.rules.get(lines[0]) if lines else None
+        out[column] = rule.rule_text.strip() if rule is not None else None
+    return out
+
+
 __all__ = [
     "LINE_NO_EFFECT",
     "LINE_ONLY_BLOCKED",
@@ -1698,6 +1746,7 @@ __all__ = [
     "reduce_typed_name",
     "resolve_exclusion_rules",
     "resolve_type_name",
+    "rule_matched_columns",
     "rule_name_writable",
     "rule_type_name",
     "rule_part_token",

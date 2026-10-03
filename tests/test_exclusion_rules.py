@@ -1347,3 +1347,55 @@ def test_a_full_mysql_enum_spelling_with_a_spaced_value_still_matches():
         ColumnDef(name="body", mysql_type="text")])
     res = _resolve('exclude type:"enum(\'rich text editor\',\'markdown\')"', [table], MY)
     assert not res.errors and dict(res.columns) == {"shop.media": frozenset({"fmt"})}
+
+
+# --- rule_matched_columns (G6: Fix target schema… never adds a rule-matched column) ----------
+
+_USERS_LIVE = [("id", "int"), ("pw_hash", "varchar(255)"), ("pw_salt", "varchar(64)"),
+               ("bio", "longtext"), ("nick", "varchar(32)")]
+
+
+def _matched(text, table="shop.users", columns=_USERS_LIVE, pk=("id",), source_type=None):
+    from dsql_migrator.core.exclusion_rules import rule_matched_columns
+    from dsql_migrator.core.models import SourceType
+
+    return rule_matched_columns(
+        text, table, columns, pk, source_type=source_type or SourceType.MYSQL
+    )
+
+
+def test_rule_matched_columns_wildcard_type_and_include_wins() -> None:
+    # Resolved against the LIVE columns: pw_hash/bio may have been added after the Save.
+    text = ("exclude shop.users.pw_*\nexclude type:longtext\nexclude shop.orders.secret\n"
+            "include shop.users.pw_salt")
+    assert _matched(text) == {
+        "pw_hash": "exclude shop.users.pw_*", "bio": "exclude type:longtext",
+    }
+
+
+def test_rule_matched_columns_postgres_type_rule() -> None:
+    from dsql_migrator.core.models import SourceType
+
+    got = _matched("exclude type:jsonb", table="app.t",
+                   columns=[("id", "integer"), ("doc", "jsonb"), ("n", "text")],
+                   source_type=SourceType.POSTGRES)
+    assert got == {"doc": "exclude type:jsonb"}
+
+
+def test_rule_matched_columns_keep_column_matches_under_a_table_rule() -> None:
+    # A table line that would unselect the captured table must not hide its column rules
+    # (the resolver re-ticks the table, and its column matches come back without a line).
+    text = "exclude table shop.users\nexclude shop.users.pw_*"
+    assert not parse_rules(text)[1]  # a valid table rule, not the E1 two-part line
+    assert _matched(text) == {"pw_hash": None, "pw_salt": None}
+
+
+def test_rule_matched_columns_text_is_the_matching_line_without_its_comment() -> None:
+    got = _matched("  exclude shop.users.bio   # free text\n")
+    assert got == {"bio": "exclude shop.users.bio"}
+
+
+def test_rule_matched_columns_none_empty_or_other_tables_match_nothing() -> None:
+    assert _matched(None) == {} and _matched("") == {} and _matched("  \n ") == {}
+    assert _matched("exclude shop.orders.secret") == {}
+    assert _matched("# only a comment") == {}

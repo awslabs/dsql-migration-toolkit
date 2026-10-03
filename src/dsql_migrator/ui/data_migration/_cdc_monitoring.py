@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from collections.abc import Mapping
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from dsql_migrator.core.activity_log import ActivityStatus
 from dsql_migrator.core.models import LoadStatusView, SourceType
@@ -857,8 +857,10 @@ def _listed_in_dlq_banner(finding, banner_kinds) -> bool:
     kinds = set(getattr(finding, "kinds", None) or ())
     if not kinds or not banner_kinds or not kinds <= set(banner_kinds):
         return False
-    # An added column the source computes is invisible to the banner, and only it makes
-    # such a finding unfixable (diff_table): keep that row here.
+    # An unfixable add-column finding keeps its row here: an added column the source
+    # computes is invisible to the banner, and the shared plan also refuses a table whose
+    # CDC key column (message.key.columns) is gone -- the banner's Fix then only shows that
+    # refusal, while this row's runbook says how to handle a key column.
     return "add-column" not in kinds or bool(getattr(finding, "fixable", False))
 
 
@@ -870,11 +872,12 @@ def _render_cdc_catalog_drift_notice(
     ``error`` while a finding is open -- a source DDL change CDC does not carry, which no
     rejected row reveals (a dropped nullable column, a widened type, a missing table, ...):
     one row per table with what changed and why it matters, the runbook for the migration
-    type, "Fix target schema…" for a plain added column (not where the dead-letter banner
-    already offers it), and "Check again". A table whose change the dead-letter banner
+    type, "Fix target schema…" for an added or renamed column (not where the dead-letter
+    banner already offers it), and "Check again". A table whose change the dead-letter banner
     already reports the same way (a column added, dropped or retyped; the banner is drawn
     whenever the queue's depth is known) is listed only there -- never twice, with two
-    severities and two runbooks; the finding still holds Cut over. ``warning`` for a table
+    severities and two runbooks (an unfixable add -- all generated, or a key refusal -- keeps
+    its row here); the finding still holds Cut over. ``warning`` for a table
     whose source matches the baseline again but that no CHECKSUM started after that has
     proven yet. With nothing open, ``info`` when the check cannot run (no source password
     after a restart) and ``warning`` when its last read failed or found none of the tables.
@@ -1360,11 +1363,13 @@ def _render_cdc_live_monitoring(
         _cdc_live.refresh()
 
     def _fix_catalog_drift(table: str):
-        # Fix target schema… for a plain column the source added (from the source-schema
-        # notice): the applied columns are recorded as part of the re-check's baseline.
+        # Fix target schema… for a column the source added or renamed (from the
+        # source-schema notice): the ADDED columns are recorded as part of the re-check's
+        # baseline (a renamed one stays reported until Step 1 is re-run).
         return _open_add_column_dialog(
             ui, session, table, on_refresh=_after_catalog_fix,
             on_applied=getattr(migration_state, "record_cdc_target_added_columns", None),
+            migration_state=migration_state,
         )
 
     _update_lag_chart()  # initial state (hidden until >=2 points)
@@ -1583,9 +1588,9 @@ def _dlq_panel_tone(health, *, sink_stalled: bool = False) -> str:
 # always operator-driven (the tool never auto-alters the target -- Property 6).
 _DRIFT_LABELS: dict[str, tuple[str, str]] = {
     "add-column": (
-        "column added at the source",
-        "the source added a column the target table does not have, so DSQL rejected "
-        "the new-schema rows (SQLSTATE 42703)",
+        "column added or renamed at the source",
+        "the source added or renamed a column, and the target table has no column of that "
+        "name, so DSQL rejected the new-schema rows (SQLSTATE 42703)",
     ),
     "drop-column": (
         "column dropped at the source",
@@ -1668,34 +1673,600 @@ _TARGET_SIDE_DRIFT_KINDS = frozenset(
 _CERTAIN_LOSS_DRIFT_KINDS = frozenset({"missing-table", "unbindable-value"})
 
 
+# How many names one Fix target schema… sentence lists before it tails off with "+N more".
+_FIX_NAME_LIMIT = 6
+
+
+def _fix_names(names, joiner: str = ", ") -> str:
+    """At most :data:`_FIX_NAME_LIMIT` names, then ``(+N more)``."""
+    items = [str(n) for n in names]
+    shown = joiner.join(items[:_FIX_NAME_LIMIT])
+    more = len(items) - _FIX_NAME_LIMIT
+    return shown + (f" (+{more} more)" if more > 0 else "")
+
+
+def _fix_is_cdc_only(migration_type) -> bool:
+    return getattr(migration_type, "name", None) == "CDC_ONLY"
+
+
+def _fix_engine_sentence(*, is_pg: bool, cdc_only: bool) -> str:
+    """What deleting and redeploying the CDC infrastructure costs, by engine and type."""
+    if is_pg:
+        if cdc_only:
+            return (
+                " On PostgreSQL, deleting the stack drops its replication slot, so the next "
+                "Start CDC snapshots the captured tables again."
+            )
+        return (
+            " On PostgreSQL, choose 'Re-snapshot every table instead' in the Start CDC "
+            "dialog: deleting the stack drops its replication slot."
+        )
+    if cdc_only:
+        return (
+            " On MySQL, deleting the CDC infrastructure also deletes the stream position: "
+            "changes made before the new Start are not replicated."
+        )
+    return (
+        " On MySQL, that Start needs a start point newer than this change; the Start CDC "
+        "dialog explains the options."
+    )
+
+
+def _fix_refusal_notice(plan, table: str, *, migration_type, is_pg: bool) -> "tuple[str, str]":
+    """``(header, body)`` of the ``error`` notice for a table whose record key changed."""
+    refusal = plan.refusal
+    facts = [f"{old} was renamed to {new}" for old, new in refusal.renamed]
+    facts += [f"the source no longer has {k}" for k in refusal.gone]
+    facts += [
+        f"{k} is now part of the primary key, and Aurora DSQL does not have it"
+        for k in refusal.missing
+    ]
+    if not facts and (refusal.before or refusal.after):
+
+        def _key(columns) -> str:
+            return f"({', '.join(columns)})" if columns else "none"
+
+        facts.append(f"the primary key was {_key(refusal.before)}, now {_key(refusal.after)}")
+    if len(facts) > _FIX_NAME_LIMIT:
+        facts = facts[:_FIX_NAME_LIMIT] + [f"+{len(facts) - _FIX_NAME_LIMIT} more"]
+    consequence = (
+        "CDC writes and deletes this table's rows by that key, so adding or renaming a "
+        "column here would not repair it: every insert and update would still be rejected, "
+        "and every delete would silently match no row."
+    )
+    if _fix_is_cdc_only(migration_type):
+        remedy = (
+            " Aurora DSQL cannot change a primary key in place or drop a primary-key column, "
+            "and CDC only has no Full Load step to reload from: restore the original key on "
+            "the source, or use Start over to migrate the table with its new key."
+        )
+    else:
+        remedy = (
+            " Aurora DSQL cannot change a primary key in place or drop a primary-key column, "
+            "so recreate the table: let CDC catch up (Stream lag: caught up), Stop CDC, "
+            f"re-run Step 1 (Evaluation), re-apply {table} in Schema Conversion (Step 2) "
+            "choosing Replace when asked (it recreates the table empty, with the new key), "
+            "reload it on the Full Load step with 'Drop & reload', then Start CDC and run "
+            "Validation (step 4). Or restore the original key on the source; the rows set "
+            "aside meanwhile still need 'Drop & reload'."
+        )
+        if refusal.rekeyed:
+            remedy += (
+                f" CDC re-keys this table on {_fix_names(refusal.rekeyed)} (Schema "
+                "Conversion's Composite key), and the deployed CDC infrastructure carries "
+                "that key: choose the Composite key again in Schema Conversion, then Delete "
+                "CDC infrastructure and deploy it again before Start CDC."
+                + _fix_engine_sentence(is_pg=is_pg, cdc_only=False)
+            )
+    return (
+        f"Fix target schema… cannot repair {table}: its key changed on the source",
+        "On the source, " + "; ".join(facts) + ". " + consequence + remedy,
+    )
+
+
+_FIX_RENAME_EVIDENCE = {
+    "inventory": (
+        "The Step 1 (Evaluation) inventory has {old} at this position with the same type."
+    ),
+    "re-check": "The source-schema re-check saw this rename.",
+    "case": (
+        "Aurora DSQL has {old}, which differs from {new} only in letter case, and the source "
+        "no longer has it; CDC writes column names exactly."
+    ),
+}
+
+
+def _fix_rename_notice(step, table: str, *, source_type) -> "tuple[str, str]":
+    """``(header, body)`` of the ``info`` notice explaining one RENAME statement.
+
+    Inventory and re-check evidence pair a gone column with a new one at the same position
+    and type, and a dropped column plus an added one of the same type looks exactly like
+    that when the added column lands where the dropped one was (an added column goes at
+    the end of the table): the notice says "looks renamed" and how to add the column
+    instead. A case-only pair is stated as a rename."""
+    from dsql_migrator.core.cdc_schema_evolve import EVIDENCE_CASE, plan_add_columns
+
+    old, new = step.old, step.column
+    evidence = _FIX_RENAME_EVIDENCE.get(step.evidence, "").format(old=old, new=new)
+    caveat = ""
+    if step.evidence != EVIDENCE_CASE:
+        adds = plan_add_columns(
+            table, [(new, step.source_type)], [], source_type=source_type
+        ).steps
+        manual = adds[0].ddl if adds else "ALTER TABLE … ADD COLUMN, nullable, with no default"
+        caveat = (
+            f" The source catalog cannot tell this from {old} dropped and {new} added with "
+            "the same type (an added column goes at the end of the table, where a dropped "
+            f"last column was). If that is what the source did, Cancel and add {new} by hand "
+            f"instead ({manual}): renaming would show the values of {old} as {new}."
+        )
+    header = (
+        f"{old} was renamed to {new} on the source"
+        if step.evidence == EVIDENCE_CASE
+        else f"{old} looks renamed to {new} on the source"
+    )
+    return (
+        header,
+        evidence
+        + caveat
+        + f" Renaming keeps the values already in the column; adding {new} instead would "
+        f"leave them in {old} and the new column empty. Apply it once Stream lag shows caught "
+        f"up: a change made on the source before the rename still carries {old}, and one "
+        "still queued when this runs is set aside (the backfill below repairs it). Then "
+        "re-run Step 1 (Evaluation) so the source-schema re-check and Validation compare the "
+        "new name (until then the re-check still reports the rename and Cut over stays "
+        "held), and if you edited this table's DDL in Schema Conversion, rename the column "
+        "there too.",
+    )
+
+
+def _fix_held_notices(
+    plan, table: str, *, migration_type, is_pg: bool
+) -> "list[tuple[str, str, Optional[str]]]":
+    """``[(header, body, code)]`` of the ``warning`` notices for the held columns, in plan
+    order. The new rule-matched, the excluded-gone and the rules-unknown columns collapse
+    into one notice each (one remedy covers them all). ``code`` is the statements to run by
+    hand, one per line with its ``;`` (Aurora DSQL runs one DDL per transaction), or
+    ``None``."""
+    from dsql_migrator.core.cdc_schema_evolve import (
+        HELD_EXCLUDED_GONE,
+        HELD_GENERATED,
+        HELD_NAME_TAKEN,
+        HELD_RENAMED_EXCLUDED,
+        HELD_RULE,
+        HELD_RULES_UNKNOWN,
+        _quote_ident,
+        _quote_qualified,
+    )
+
+    cdc_only = _fix_is_cdc_only(migration_type)
+    engine = _fix_engine_sentence(is_pg=is_pg, cdc_only=cdc_only)
+    qt = _quote_qualified(table)
+
+    def _paren(what: str) -> str:
+        """Full load + CDC: what Change & reload does with the column(s)."""
+        return "" if cdc_only else f" (Change & reload: {what})"
+
+    def _drop_first(columns, why: str) -> str:
+        """Full load + CDC: drop the stale target column(s) before Change & reload, which
+        refuses to recreate a table that has a column the refreshed definition lacks."""
+        if cdc_only or not columns:
+            return ""
+        how = (
+            f"ALTER TABLE {qt} DROP COLUMN {_quote_ident(columns[0])}"
+            if len(columns) == 1
+            else f"one ALTER TABLE {qt} DROP COLUMN statement each"
+        )
+        return (
+            f", drop {_fix_names(columns)} on Aurora DSQL by hand ({how}; {why}, and Change "
+            "& reload refuses to destroy a column the refreshed definition no longer has)"
+        )
+
+    out: list[tuple[str, str, Optional[str]]] = []
+    grouped: set[str] = set()
+    for held in plan.held:
+        c, old = held.column, held.old
+        if held.reason == HELD_RULE and not old:
+            if HELD_RULE in grouped:
+                continue
+            grouped.add(HELD_RULE)
+            group = [h for h in plan.held if h.reason == HELD_RULE and not h.old]
+            if len(group) == 1:
+                lead = (
+                    f"Your saved rule '{held.rule}' matches {c}"
+                    if held.rule
+                    else f"A saved exclusion rule matches {c}"
+                )
+                out.append((
+                    f"{c} is not added: your exclusion rules match it",
+                    lead + ", which the source added after the rules were saved. CDC's "
+                    "capture list holds the column names fixed when the rules were saved, so "
+                    f"CDC sends {c}, and every insert and update to {table} that carries it is "
+                    "dead-lettered until the list excludes it. Adding it here would copy the "
+                    "data the rule keeps out. To keep it out: Stop CDC, Delete CDC "
+                    f"infrastructure, re-run Step 1 (Evaluation) so the rule sees {c}, then "
+                    "save the rules again as the Exclude tables & columns popup shows"
+                    + _paren(
+                        f"it creates {c} on Aurora DSQL and leaves it NULL, like every "
+                        "excluded column"
+                    )
+                    + ", deploy CDC again and Start CDC." + engine
+                    + f" To copy {c} after all, change the rule in the same steps so it no "
+                    "longer matches it.",
+                    None,
+                ))
+                continue
+            names = _fix_names([h.column for h in group])
+            rules = sorted({str(h.rule) for h in group if h.rule})
+            quoted = f" ({_fix_names([f"'{r}'" for r in rules])})" if rules else ""
+            out.append((
+                f"Not added: your exclusion rules match {names}",
+                f"Your saved exclusion rules{quoted} match {names}, which the source added "
+                "after the rules were saved. CDC's capture list holds the column names fixed "
+                f"when the rules were saved, so CDC sends them, and every insert and update to "
+                f"{table} that carries one is dead-lettered until the list excludes them. "
+                "Adding them here would copy the data the rules keep out. To keep them out: "
+                "Stop CDC, Delete CDC infrastructure, re-run Step 1 (Evaluation) so the rules "
+                "see them, then save the rules again as the Exclude tables & columns popup "
+                "shows"
+                + _paren(
+                    "it creates them on Aurora DSQL and leaves them NULL, like every excluded "
+                    "column"
+                )
+                + ", deploy CDC again and Start CDC." + engine
+                + " To copy one of them after all, change the rule in the same steps so it no "
+                "longer matches that column.",
+                None,
+            ))
+        elif held.reason == HELD_RULE:
+            lead = (
+                f"Your saved rule '{held.rule}' matches {c}"
+                if held.rule
+                else f"A saved exclusion rule matches {c}"
+            )
+            out.append((
+                f"{old} is not renamed to {c}: your exclusion rules match {c}",
+                lead + f", which the source renamed from {old} after the rules were saved. "
+                "CDC's capture list holds the column names fixed when the rules were saved, so "
+                f"CDC sends {c}, and every insert and update to {table} that carries it is "
+                "dead-lettered until the list excludes it. Adding it here would copy the data "
+                "the rule keeps out. To keep it out: Stop CDC, Delete CDC infrastructure"
+                + _drop_first([old], "the values it holds are the ones the rule keeps out")
+                + f", re-run Step 1 (Evaluation) so the rule sees {c}, then save the rules "
+                "again as the Exclude tables & columns popup shows"
+                + _paren(
+                    f"it creates {c} on Aurora DSQL and leaves it NULL, like every excluded "
+                    "column"
+                )
+                + ", deploy CDC again and Start CDC." + engine
+                + f" To copy {c} after all, change the rule in the same steps so it no longer "
+                "matches it" + ("" if cdc_only else f", and do not drop {old}") + ".",
+                None,
+            ))
+        elif held.reason == HELD_RENAMED_EXCLUDED:
+            out.append((
+                f"{c} is not added: it is the excluded column {old}, renamed on the source",
+                f"You excluded {old}, and the source renamed it to {c}. CDC's capture list "
+                f"names {old}, so CDC now sends {c} with its values, and every insert and "
+                f"update to {table} that carries it is dead-lettered until the list excludes "
+                f"{c}. Adding or renaming the column here would copy the values you excluded "
+                "into Aurora DSQL. To keep it out: Stop CDC, Delete CDC infrastructure"
+                + _drop_first([old], "it holds only NULLs")
+                + f", re-run Step 1 (Evaluation), change the rule that excludes {old} so it "
+                f"matches {c}, save the rules as the Exclude tables & columns popup shows"
+                + _paren(
+                    f"it creates {c} on Aurora DSQL and leaves it NULL, like every excluded "
+                    "column"
+                )
+                + ", deploy CDC again and Start CDC." + engine
+                + " Or rename the column back on the source.",
+                None,
+            ))
+        elif held.reason == HELD_EXCLUDED_GONE:
+            if HELD_EXCLUDED_GONE in grouped:
+                continue
+            grouped.add(HELD_EXCLUDED_GONE)
+            group = [h for h in plan.held if h.reason == HELD_EXCLUDED_GONE]
+            others = list(held.others)
+            one = len(others) == 1
+            header = (
+                f"Not added: the excluded column {others[0]} is no longer on the source"
+                if one
+                else "Not added: the excluded columns "
+                f"{_fix_names(others)} are no longer on the source"
+            )
+            ddls = [h.ddl for h in group if h.ddl]
+            out.append((
+                header,
+                f"If the source renamed {'it' if one else 'one of them'} to "
+                f"{_fix_names([h.column for h in group], ' or ')}, adding that column would "
+                "copy the values you excluded into Aurora DSQL, and the tool cannot tell a "
+                "rename from a drop here. If it was renamed, keep it out: Stop CDC, Delete CDC "
+                "infrastructure"
+                + _drop_first(others, "it holds only NULLs" if one else "they hold only NULLs")
+                + ", re-run Step 1 (Evaluation), change your exclusion rule so it matches the "
+                "new name, save the rules as the Exclude tables & columns popup shows"
+                + _paren("it creates the column on Aurora DSQL and leaves it NULL")
+                + ", deploy CDC again and Start CDC." + engine
+                + (
+                    " If it was dropped, run the statement below on Aurora DSQL yourself."
+                    if len(ddls) == 1
+                    else " If it was dropped, run each statement below on Aurora DSQL "
+                    "yourself, on its own: Aurora DSQL allows one DDL per transaction."
+                ),
+                "\n".join(f"{ddl};" for ddl in ddls) or None,
+            ))
+        elif held.reason == HELD_NAME_TAKEN:
+            qold = _quote_ident(old or "")
+            lead = (
+                f"The source renamed {old} to {c}, and Aurora DSQL has both ({c} may be the "
+                "empty column an earlier Fix target schema… added)."
+            )
+            if cdc_only:
+                body = lead + (
+                    " CDC only has no Full Load step to reload from: copy the values from "
+                    f"{old} into {c} on Aurora DSQL yourself (at most 3,000 rows per "
+                    f"transaction), drop {old}, then re-run Step 1 (Evaluation)."
+                )
+            else:
+                body = lead + (
+                    f" To realign the table: drop {old} on Aurora DSQL by hand (ALTER TABLE "
+                    f"{qt} DROP COLUMN {qold}), re-run Step 1 (Evaluation), Stop CDC, reload "
+                    f"the table with 'Drop & reload' (it copies {c} for every row), then Start "
+                    "CDC."
+                )
+            out.append((f"{old} is not renamed to {c}: Aurora DSQL already has {c}", body, None))
+        elif held.reason == HELD_GENERATED:
+            out.append((
+                f"{c} is not added: the source computes it",
+                "It is a generated column on the source, and CDC may not send its values, so "
+                "a plain column added here could stay empty. If you need it on Aurora DSQL, "
+                "add it by hand (ALTER TABLE … ADD COLUMN, nullable, with no default).",
+                None,
+            ))
+        elif held.reason == HELD_RULES_UNKNOWN:
+            if HELD_RULES_UNKNOWN in grouped:
+                continue
+            grouped.add(HELD_RULES_UNKNOWN)
+            group = [h for h in plan.held if h.reason == HELD_RULES_UNKNOWN]
+            names = _fix_names(
+                [f"{h.column} (renamed from {h.old})" if h.old else h.column for h in group]
+            )
+            backfill = (
+                "correct the rows already set aside on Aurora DSQL by hand (CDC only has no "
+                "Full Load step to reload from)"
+                if cdc_only
+                else "backfill as for any added column: re-run Step 1 (Evaluation), Stop CDC, "
+                "reload the table with 'Drop & reload', Start CDC"
+            )
+            out.append((
+                "Nothing is added or renamed: the exclusion rules could not be checked",
+                "Fix target schema… could not check this migration's saved exclusion rules "
+                f"against {table}, and must not add or rename a column they match, so it "
+                f"holds {names}. Trying again gives the same result (the app log has the "
+                "error). Open Exclude tables & columns and check whether a saved rule matches "
+                "these columns. If none does, change Aurora DSQL by hand, one statement per "
+                "transaction (ALTER TABLE … ADD COLUMN, nullable, with no default; or ALTER "
+                "TABLE … RENAME COLUMN old TO new for a renamed column), then " + backfill
+                + ". If one does, keep it out: Stop CDC, Delete CDC infrastructure, re-run "
+                "Step 1 (Evaluation), save the rules again as the popup shows, deploy CDC "
+                "again and Start CDC." + engine,
+                None,
+            ))
+    return out
+
+
+def _fix_orphan_notice(plan, table: str) -> "Optional[tuple[str, str]]":
+    """``(header, body)`` of the ``warning`` beside an ADD: target columns the source lacks
+    (one may be the old name of a rename the tool could not confirm)."""
+    from dsql_migrator.core.cdc_schema_evolve import (
+        AddColumnStep,
+        _quote_ident,
+        _quote_qualified,
+    )
+
+    adds = [s for s in plan.steps if isinstance(s, AddColumnStep)]
+    orphans = list(plan.orphans)
+    if not orphans or not adds:
+        return None
+    one = len(orphans) == 1
+    header = (
+        f"Aurora DSQL also has {orphans[0]}, which the source table does not have"
+        if one
+        else f"Aurora DSQL also has columns the source table does not have: {_fix_names(orphans)}"
+    )
+    manual = ""
+    if one and len(adds) == 1:
+        manual = (
+            f" (ALTER TABLE {_quote_qualified(table)} RENAME COLUMN "
+            f"{_quote_ident(orphans[0])} TO {_quote_ident(adds[0].column)})"
+        )
+    return (
+        header,
+        f"If the source renamed {'it' if one else 'one of them'} to a column above, do not "
+        "apply this: adding the new name leaves every existing row's value in the old column "
+        "and the new one empty. Rename it on Aurora DSQL by hand instead" + manual + ". The "
+        f"tool could not confirm a rename: the Step 1 (Evaluation) inventory does not have "
+        f"{'it' if one else 'them'} at that position with that type, and the source-schema "
+        f"re-check did not report one. If {'it was' if one else 'they were'} dropped on the "
+        f"source, or {'is' if one else 'are'} meant to exist on Aurora DSQL only, apply as "
+        "shown.",
+    )
+
+
+# The ADD runbook (unchanged since ADD COLUMN-only Fix): measured, a plain per-table Reload
+# repairs NEITHER half of this. Its SELECT list comes from the Step 1 inventory (so the new
+# column is not even read), and it appends with SKIP_EXISTING (so a row already on the
+# target is never rewritten). Same shape as the oversized-value runbook in
+# assessment_strategist.
+_FIX_RESUMES = (
+    "CDC resumes applying new changes for this table on its own, but the "
+    "rows already dead-lettered are NOT replayed"
+)
+_FIX_ADD_STEPS = (
+    ". Backfilling them takes "
+    "four steps, in this order: (1) re-run Step 1 (Evaluation) — the Full "
+    "Load reads the column list captured there, which predates this source "
+    "change, so without a refresh it would not copy the new column at all; "
+    "(2) stop CDC; (3) reload this table on the Full Load step choosing "
+    "'Drop & reload' — a plain append reload only inserts primary keys the "
+    "target is missing, so it cannot fill the new column on rows that are "
+    "already there; (4) start CDC again. Then run Validation (step 4) to "
+    "confirm the table matches."
+)
+_FIX_ADD_RUNBOOK = _FIX_RESUMES + _FIX_ADD_STEPS
+
+
+def _fix_still_sent(plan) -> "list[str]":
+    """The held columns CDC still sends and Aurora DSQL still lacks after this plan: every
+    insert and update that carries one stays dead-lettered whatever the plan applies."""
+    from dsql_migrator.core.cdc_schema_evolve import (
+        HELD_EXCLUDED_GONE,
+        HELD_RENAMED_EXCLUDED,
+        HELD_RULE,
+    )
+
+    sent = (HELD_RULE, HELD_RENAMED_EXCLUDED, HELD_EXCLUDED_GONE)
+    return [h.column for h in plan.held if h.reason in sent]
+
+
+def _fix_runbook(plan, *, migration_type) -> Optional[str]:
+    """The ``info`` backfill runbook for the plan, or ``None`` (a refusal, or held only)."""
+    from dsql_migrator.core.cdc_schema_evolve import AddColumnStep, RenameColumnStep
+
+    if plan.refusal is not None:
+        return None
+    still_sent = _fix_still_sent(plan) if plan.steps else []
+    lead = _FIX_RESUMES
+    if still_sent:
+        lead = (
+            f"Inserts and updates to this table that carry {_fix_names(still_sent)} are still "
+            "set aside after this (the warning above says why and what to do): applying it "
+            "only stops rows failing on the columns it adds or renames. The rows already "
+            "dead-lettered are NOT replayed"
+        )
+    has_rename = any(isinstance(s, RenameColumnStep) for s in plan.steps)
+    if has_rename and _fix_is_cdc_only(migration_type):
+        # Before the ADD branch: CDC only has no Full Load step, whatever else is added.
+        return lead + (
+            ", and CDC only has no Full Load step to reload them from: correct them on "
+            "Aurora DSQL by hand, re-run Step 1 (Evaluation) so Validation compares the new "
+            "name, then run Validation (step 4) to confirm the table matches."
+        )
+    if any(isinstance(s, AddColumnStep) for s in plan.steps) or (
+        not plan.steps and not plan.held
+    ):
+        return lead + _FIX_ADD_STEPS
+    if has_rename:
+        return lead + (
+            ". Backfilling them takes four steps, in this order: (1) re-run Step 1 "
+            "(Evaluation), so the Full Load reads the new column name; (2) stop CDC; (3) "
+            "reload this table on the Full Load step choosing 'Drop & reload' — a plain "
+            "append reload only inserts primary keys the target is missing, so it cannot "
+            "repair rows that are already there; (4) start CDC again. Then run Validation "
+            "(step 4) to confirm the table matches."
+        )
+    return None
+
+
+class _FixInputs(NamedTuple):
+    """What the Fix plan needs from the migration, gathered on the loop (CPU only)."""
+
+    baseline: object = None  # the Step 1 inventory's TableDef, or None
+    excluded: tuple = ()  # effective stored exclusions
+    rules_known: bool = False  # False: hold every add and rename (fail closed)
+    rules_text: Optional[str] = None  # the SAVED rule text (never the pending lines)
+    rekey: tuple = ()  # current + deployed message.key.columns
+    seen_renames: tuple = ()  # ((old, new, old type), ...) the re-check recorded
+    migration_type: object = None
+
+
+def _fix_inputs(migration_state, table: str, session=None) -> _FixInputs:
+    """The Fix plan's inputs for ``table`` from ``migration_state``. CPU only; never raises.
+
+    Without a migration state (or on any error) the rules count as unknown, so the plan
+    adds and renames nothing; the key refusal still runs from the live source and target
+    primary keys."""
+    migration_type = getattr(migration_state, "migration_type", None) or getattr(
+        session, "migration_type", None
+    )
+    if migration_state is None:
+        return _FixInputs(migration_type=migration_type)
+    try:
+        from dsql_migrator.ui.cdc_catalog_drift_gate import _raw_baseline, cdc_rekey_columns
+        from dsql_migrator.ui.data_migration._models import effective_lob_exclusions
+
+        inventory = getattr(_raw_baseline(migration_state), "inventory", None)
+        baseline = next(
+            (t for t in (getattr(inventory, "tables", None) or ()) if t.name == table), None
+        )
+        try:
+            effective = effective_lob_exclusions(migration_state, inventory) or {}
+        except Exception:  # noqa: BLE001 - the stored set (never fewer exclusions)
+            effective = migration_state.lob_exclusions() or {}
+        rules = getattr(migration_state, "exclusion_rules_text", None)
+        finding = (getattr(migration_state, "cdc_catalog_drift_findings", None) or {}).get(table)
+        seen = tuple(
+            (str(c.column), str(c.after), str(c.before or ""))
+            for c in (getattr(finding, "changes", None) or ())
+            if getattr(c, "kind", "") == "rename-column" and c.column and c.after
+        )
+        return _FixInputs(
+            baseline=baseline,
+            excluded=tuple(sorted(str(c) for c in (effective.get(table) or ()))),
+            rules_known=callable(rules),
+            rules_text=rules() if callable(rules) else None,
+            rekey=tuple(sorted(cdc_rekey_columns(migration_state).get(table, ()))),
+            seen_renames=seen,
+            migration_type=migration_type,
+        )
+    except Exception:  # noqa: BLE001 - fail closed: nothing is added or renamed
+        _LOGGER.warning("Fix target schema inputs could not be read", exc_info=True)
+        return _FixInputs(migration_type=migration_type)
+
+
 async def _open_add_column_dialog(
-    ui, session, table: str, on_refresh=None, on_applied=None
+    ui, session, table: str, on_refresh=None, on_applied=None, migration_state=None
 ) -> None:
-    """Offer the operator the exact ADD COLUMN DDL the target is missing.
+    """Offer the operator the exact DDL that realigns the target with a source ADD / RENAME
+    COLUMN -- or explain why it must not be changed here.
 
-    The recovery for the dominant drift kind (source ADD COLUMN), split so nothing
-    mutates the target without consent: this reads the source's and the target's
-    column lists, renders one ``ALTER TABLE ... ADD COLUMN`` per missing column via
-    the converter's own type mapping, shows them verbatim for approval, and only
-    then applies them -- one DDL per transaction, as Aurora DSQL requires.
+    Both entry points (the dead-letter banner's and the source-schema re-check's Fix target
+    schema…) open this, and it uses the ONE plan the re-check's ``fixable`` comes from
+    (``cdc_schema_evolve.plan_target_fix``): it reads the source table's live definition
+    (one bounded read-only catalog statement, then the engine is disposed) and the target's
+    column names and primary key, plans, shows the statements verbatim for approval, and
+    only then applies them -- one DDL per transaction, as Aurora DSQL requires. A table whose
+    record key changed is refused (``error``) with the recreate steps; a column the
+    exclusions keep out, a generated one, or a rename whose new name is taken is held with
+    what to do (``warning``). Without ``migration_state`` the saved rules cannot be checked,
+    so nothing is added or renamed.
 
-    Both reads and the apply are blocking I/O, so each is offloaded with
-    ``run.io_bound``; the render path itself stays I/O-free.
+    The reads and the apply are blocking I/O, so each is offloaded with ``run.io_bound``;
+    the render path itself stays I/O-free.
 
     ``on_applied(table, {column: source catalog type})`` (optional) is told the columns
-    that were APPLIED -- never a failed or skipped one -- before ``on_refresh``, so the
-    source-schema re-check counts them as part of its baseline.
+    that were ADDED -- never a failed, skipped or renamed one (a recorded rename would read
+    as a dropped old column) -- before ``on_refresh``, so the source-schema re-check counts
+    them as part of its baseline.
     """
     from nicegui import run
 
+    from dsql_migrator.core import target_introspector
     from dsql_migrator.core.cdc_schema_evolve import (
+        AddColumnStep,
+        RenameColumnStep,
         apply_add_columns,
-        plan_add_columns,
-        read_source_columns,
+        plan_target_fix,
+        read_source_table,
         read_target_columns,
     )
+    from dsql_migrator.core.exclusion_rules import rule_matched_columns
     from dsql_migrator.core.target_connection import DsqlConnector
     from dsql_migrator.ui.connect import make_source_engine_factory
+    from dsql_migrator.ui.data_migration._cdc_status import (
+        _CATALOG_DRIFT_READ_TIMEOUT_SECONDS,
+    )
 
     source_config = getattr(session, "source_config", None)
     target_config = getattr(session, "target_config", None)
@@ -1708,19 +2279,21 @@ async def _open_add_column_dialog(
     connector = DsqlConnector(
         target_config, aws_profile=getattr(session, "aws_profile", None)
     )
+    inputs = _fix_inputs(migration_state, table, session)
+    source_type = source_config.source_type
+    is_pg = source_type is SourceType.POSTGRES
 
     def _build_plan():
-        engine = make_source_engine_factory(getattr(session, "source_password", None))(
-            source_config
-        )
-        raw = engine.raw_connection()
+        engine = make_source_engine_factory(
+            getattr(session, "source_password", None),
+            read_timeout_seconds=_CATALOG_DRIFT_READ_TIMEOUT_SECONDS,
+        )(source_config)
         try:
-            source_columns = read_source_columns(
-                raw, table, source_type=source_config.source_type
-            )
+            with engine.connect() as connection:
+                live = read_source_table(connection, table, source_type=source_type)
         finally:
-            raw.close()
-        if not source_columns:
+            engine.dispose()
+        if live is None or not live.columns:
             # An empty source read is NOT "the target is already current" -- the
             # drifting table demonstrably exists on the source (it is dead-lettering
             # rows). Reading zero columns means the name did not resolve (renamed /
@@ -1736,9 +2309,35 @@ async def _open_add_column_dialog(
             target_columns = read_target_columns(target, table)
         finally:
             target.close()
-        return plan_add_columns(
-            table, source_columns, target_columns,
-            source_type=source_config.source_type,
+        target_pk = target_introspector.target_primary_key_columns(
+            table, connection_factory=connector.connect
+        )
+        rule_matches = None
+        if inputs.rules_known:
+            try:
+                rule_matches = rule_matched_columns(
+                    inputs.rules_text,
+                    table,
+                    [(c.name, c.type) for c in live.columns],
+                    sorted(live.primary_key),
+                    source_type=source_type,
+                )
+            except Exception:  # noqa: BLE001 - fail closed: hold every add and rename
+                _LOGGER.warning(
+                    "exclusion rules could not be checked for Fix target schema",
+                    exc_info=True,
+                )
+        return plan_target_fix(
+            table,
+            live,
+            target_columns,
+            baseline=inputs.baseline,
+            seen_renames=inputs.seen_renames,
+            record_key=target_pk or (),
+            rekey_columns=inputs.rekey,
+            excluded=inputs.excluded,
+            rule_matches=rule_matches,
+            source_type=source_type,
         )
 
     try:
@@ -1747,7 +2346,7 @@ async def _open_add_column_dialog(
         ui.notify(f"Could not read the schemas: {exc}", type="negative")  # type: ignore[attr-defined]
         return
 
-    if plan.is_empty and not plan.skipped:
+    if not plan.steps and not plan.skipped and not plan.held and plan.refusal is None:
         # The target already matches: the DLQ rows are still set aside, so point at
         # the backfill rather than implying there is nothing left to do.
         ui.notify(  # type: ignore[attr-defined]
@@ -1758,113 +2357,182 @@ async def _open_add_column_dialog(
         )
         return
 
+    migration_type = inputs.migration_type
+    renames = [s for s in plan.steps if isinstance(s, RenameColumnStep)]
+    adds = [s for s in plan.steps if isinstance(s, AddColumnStep)]
+    # "Add missing columns" only when the dialog adds one; a rename, a refusal or a plan
+    # that holds every column is titled after the button that opened it.
+    title = (
+        f"Add missing columns to {table}"
+        if adds and not renames and plan.refusal is None
+        else f"Fix target schema: {table}"
+    )
     with ui.dialog() as dialog, ui.card().classes("gap-2").style("min-width: 560px"):  # type: ignore[attr-defined]
-        section_header(ui, icon="schema", title=f"Add missing columns to {table}")
-        if plan.steps:
-            ui.label(  # type: ignore[attr-defined]
-                "These statements will run on the target, one per transaction. Each "
-                "column is added NULLable with no default: existing rows read NULL "
-                "until you backfill them, and new change events carry the real value."
-            ).classes("text-xs text-gray-700")
-            ui.code(plan.ddl_text, language="sql").classes("w-full text-xs")  # type: ignore[attr-defined]
-            for step in plan.steps:
-                if step.warning:
-                    render_notice(
-                        ui,
-                        tone="warning",
-                        header=f"{step.column} ({step.source_type})",
-                        body=step.warning,
-                    )
-        for skipped in plan.skipped:
-            render_notice(
-                ui,
-                tone="warning",
-                header=f"{skipped.column} is not included",
-                body=(
-                    f"source type {skipped.source_type}: {skipped.reason}. Add this "
-                    "column by hand if you need it."
-                ),
+        section_header(ui, icon="schema", title=title)
+        if plan.refusal is not None:
+            header, body = _fix_refusal_notice(
+                plan, table, migration_type=migration_type, is_pg=is_pg
             )
-        # The ORDERED runbook, not just "reload": measured, a plain per-table Reload
-        # repairs NEITHER half of this. Its SELECT list comes from the Step 1 inventory
-        # (so the new column is not even read), and it appends with SKIP_EXISTING (so a
-        # row already on the target is never rewritten). Same shape as the
-        # oversized-value runbook in assessment_strategist.
-        render_notice(
-            ui,
-            tone="info",
-            header="After applying: how to backfill the rows already set aside",
-            body=(
-                "CDC resumes applying new changes for this table on its own, but the "
-                "rows already dead-lettered are NOT replayed. Backfilling them takes "
-                "four steps, in this order: (1) re-run Step 1 (Evaluation) — the Full "
-                "Load reads the column list captured there, which predates this source "
-                "change, so without a refresh it would not copy the new column at all; "
-                "(2) stop CDC; (3) reload this table on the Full Load step choosing "
-                "'Drop & reload' — a plain append reload only inserts primary keys the "
-                "target is missing, so it cannot fill the new column on rows that are "
-                "already there; (4) start CDC again. Then run Validation (step 4) to "
-                "confirm the table matches."
-            ),
-        )
-
-        async def _apply() -> None:
-            dialog.close()  # type: ignore[attr-defined]
-            try:
-                outcomes = await run.io_bound(
-                    apply_add_columns, plan, connector.connect
-                )
-            except Exception as exc:  # noqa: BLE001
-                ui.notify(f"Apply failed: {exc}", type="negative")  # type: ignore[attr-defined]
-                return
-            applied = [o for o in outcomes if o.applied]
-            failed = [o for o in outcomes if not o.applied]
-            if on_applied is not None and applied:
-                _types = {step.column: step.source_type for step in plan.steps}
-                try:
-                    on_applied(table, {o.column: _types.get(o.column, "") for o in applied})
-                except Exception:  # noqa: BLE001 - recording must never hide the outcome
-                    _LOGGER.warning("could not record the added columns", exc_info=True)
-            from dsql_migrator.core.activity_log import (
-                ActivityCategory,
-                ActivityStatus,
-                log_activity,
-            )
-
-            for outcome in outcomes:
-                log_activity(
-                    ActivityCategory.CDC,
-                    "add column to target (schema drift)",
-                    status=(
-                        ActivityStatus.SUCCESS if outcome.applied
-                        else ActivityStatus.FAILURE
-                    ),
-                    target=f"{table}.{outcome.column}",
-                    detail=outcome.error or outcome.ddl,
-                )
-            if failed:
-                ui.notify(  # type: ignore[attr-defined]
-                    f"Added {len(applied)} column(s); {failed[0].column} failed: "
-                    f"{failed[0].error}",
-                    type="negative",
-                )
-            else:
-                ui.notify(  # type: ignore[attr-defined]
-                    f"Added {len(applied)} column(s) to {table}. New changes apply "
-                    "again; to backfill the rows already set aside, re-run Step 1 "
-                    "(Evaluation), stop CDC, then reload this table choosing "
-                    "'Drop & reload'.",
-                    type="positive",
-                )
-            if on_refresh is not None:
-                on_refresh()
-
-        with ui.row().classes("w-full justify-end gap-2"):  # type: ignore[attr-defined]
-            ui.button("Cancel", on_click=dialog.close).props("flat no-caps")  # type: ignore[attr-defined]
+            render_notice(ui, tone="error", header=header, body=body)
+            # No statement, no runbook, no Apply: only Cancel.
+            with ui.row().classes("w-full justify-end gap-2"):  # type: ignore[attr-defined]
+                ui.button("Cancel", on_click=dialog.close).props("flat no-caps")  # type: ignore[attr-defined]
+        else:
             if plan.steps:
-                ui.button(  # type: ignore[attr-defined]
-                    f"Apply {len(plan.steps)} statement(s)", on_click=_apply
-                ).props("no-caps color=primary")
+                if renames:
+                    intro = (
+                        "These statements will run on the target, one per transaction. A renamed "
+                        "column keeps its values, and new change events write to its new name."
+                    )
+                    if adds:
+                        intro += (
+                            " Each added column is NULLable with no default: existing rows read "
+                            "NULL until you backfill them, and new change events carry the real "
+                            "value."
+                        )
+                else:
+                    intro = (
+                        "These statements will run on the target, one per transaction. Each "
+                        "column is added NULLable with no default: existing rows read NULL "
+                        "until you backfill them, and new change events carry the real value."
+                    )
+                ui.label(intro).classes("text-xs text-gray-700")  # type: ignore[attr-defined]
+                ui.code(plan.ddl_text, language="sql").classes("w-full text-xs")  # type: ignore[attr-defined]
+                for step in adds:
+                    if step.warning:
+                        render_notice(
+                            ui,
+                            tone="warning",
+                            header=f"{step.column} ({step.source_type})",
+                            body=step.warning,
+                        )
+                for step in renames:
+                    header, body = _fix_rename_notice(step, table, source_type=source_type)
+                    render_notice(ui, tone="info", header=header, body=body)
+            for header, body, code in _fix_held_notices(
+                plan, table, migration_type=migration_type, is_pg=is_pg
+            ):
+                render_notice(ui, tone="warning", header=header, body=body)
+                if code:
+                    ui.code(code, language="sql").classes("w-full text-xs")  # type: ignore[attr-defined]
+            for skipped in plan.skipped:
+                render_notice(
+                    ui,
+                    tone="warning",
+                    header=f"{skipped.column} is not included",
+                    body=(
+                        f"source type {skipped.source_type}: {skipped.reason}. Add this "
+                        "column by hand if you need it."
+                    ),
+                )
+            orphan = _fix_orphan_notice(plan, table)
+            if orphan is not None:
+                render_notice(ui, tone="warning", header=orphan[0], body=orphan[1])
+            runbook = _fix_runbook(plan, migration_type=migration_type)
+            if runbook is not None:
+                render_notice(
+                    ui,
+                    tone="info",
+                    header="After applying: how to backfill the rows already set aside",
+                    body=runbook,
+                )
+
+            async def _apply() -> None:
+                dialog.close()  # type: ignore[attr-defined]
+                try:
+                    outcomes = await run.io_bound(
+                        apply_add_columns, plan, connector.connect
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    ui.notify(f"Apply failed: {exc}", type="negative")  # type: ignore[attr-defined]
+                    return
+                applied = [o for o in outcomes if o.applied]
+                failed = [o for o in outcomes if not o.applied]
+                # Only ADDED columns are recorded: a renamed one recorded here would make the
+                # re-check report the old name as a dropped column.
+                add_types = {step.column: step.source_type for step in adds}
+                added = {o.column: add_types[o.column] for o in applied if o.column in add_types}
+                if on_applied is not None and added:
+                    try:
+                        on_applied(table, added)
+                    except Exception:  # noqa: BLE001 - recording must never hide the outcome
+                        _LOGGER.warning("could not record the added columns", exc_info=True)
+                from dsql_migrator.core.activity_log import (
+                    ActivityCategory,
+                    ActivityStatus,
+                    log_activity,
+                )
+
+                renamed_columns = {step.column for step in renames}
+                for outcome in outcomes:
+                    log_activity(
+                        ActivityCategory.CDC,
+                        (
+                            "rename column on target (schema drift)"
+                            if outcome.column in renamed_columns
+                            else "add column to target (schema drift)"
+                        ),
+                        status=(
+                            ActivityStatus.SUCCESS if outcome.applied
+                            else ActivityStatus.FAILURE
+                        ),
+                        target=f"{table}.{outcome.column}",
+                        detail=outcome.error or outcome.ddl,
+                    )
+                # A held column CDC still sends keeps every insert and update that carries it
+                # dead-lettered, whatever was applied: say so, never "New changes apply again".
+                still_sent = _fix_still_sent(plan)
+                resumed, tone = "New changes apply again", "positive"
+                if still_sent:
+                    resumed = (
+                        f"Inserts and updates that carry {_fix_names(still_sent)} are still "
+                        "set aside (Fix target schema… explains why)"
+                    )
+                    tone = "warning"
+                if not renames:
+                    if failed:
+                        ui.notify(  # type: ignore[attr-defined]
+                            f"Added {len(applied)} column(s); {failed[0].column} failed: "
+                            f"{failed[0].error}",
+                            type="negative",
+                        )
+                    else:
+                        ui.notify(  # type: ignore[attr-defined]
+                            f"Added {len(applied)} column(s) to {table}. {resumed}; to "
+                            "backfill the rows already set aside, re-run Step 1 "
+                            "(Evaluation), stop CDC, then reload this table choosing "
+                            "'Drop & reload'.",
+                            type=tone,
+                        )
+                elif failed:
+                    ui.notify(  # type: ignore[attr-defined]
+                        f"Applied {len(applied)} statement(s); {failed[0].column} failed: "
+                        f"{failed[0].error}",
+                        type="negative",
+                    )
+                elif _fix_is_cdc_only(migration_type):
+                    ui.notify(  # type: ignore[attr-defined]
+                        f"Applied {len(applied)} statement(s) to {table}. {resumed}; re-run "
+                        "Step 1 (Evaluation), and correct the rows already set aside on "
+                        "Aurora DSQL by hand: they are not replayed.",
+                        type=tone,
+                    )
+                else:
+                    ui.notify(  # type: ignore[attr-defined]
+                        f"Applied {len(applied)} statement(s) to {table}. {resumed}; re-run "
+                        "Step 1 (Evaluation), then backfill the rows already set aside: stop "
+                        "CDC and reload this table choosing 'Drop & reload'.",
+                        type=tone,
+                    )
+                if on_refresh is not None:
+                    on_refresh()
+
+            with ui.row().classes("w-full justify-end gap-2"):  # type: ignore[attr-defined]
+                ui.button("Cancel", on_click=dialog.close).props("flat no-caps")  # type: ignore[attr-defined]
+                if plan.steps:
+                    ui.button(  # type: ignore[attr-defined]
+                        f"Apply {len(plan.steps)} statement(s)", on_click=_apply
+                    ).props("no-caps color=primary")
     dialog.open()  # type: ignore[attr-defined]
 
 
@@ -1975,6 +2643,7 @@ def _render_cdc_schema_drift_banner(
     saved_exclusions: "Optional[Mapping[str, object]]" = None,
     migration_type=None,
     on_applied=None,
+    migration_state=None,
 ) -> None:
     """Flag source DDL the target has not caught up to (from the classified DLQ).
 
@@ -1986,7 +2655,9 @@ def _render_cdc_schema_drift_banner(
     nothing when no drift was detected (the common case), so it is inert on a healthy
     stream. The truncate-only runbook follows ``migration_type`` (CDC only has no Full
     Load step to reload from). ``on_applied`` is handed to the Fix dialog, which reports
-    the columns it added (the source-schema re-check's baseline records them).
+    the columns it added (the source-schema re-check's baseline records them), and so is
+    ``migration_state`` (the dialog's key, exclusion and rename inputs; without it the dialog
+    adds and renames nothing).
     """
     drift = getattr(status_view, "schema_drift", None) or []
     if not drift:
@@ -2063,19 +2734,20 @@ def _render_cdc_schema_drift_banner(
                 ui.label(  # type: ignore[attr-defined]
                     f"{group.table}: {label} — {why}. {group.count} {noun} dead-lettered."
                 ).classes("text-xs text-gray-800")
-                # ADD COLUMN is the only additive (non-destructive) drift, so it is
-                # the only one we offer to fix. A DROP/type change can rewrite or
-                # destroy target data, so those stay alert-only -- see the runbook
-                # line below. The action still requires an explicit approval of the
-                # rendered DDL (Property 6: never a silent schema mutation), and it
-                # is hidden entirely when no session is wired (e.g. unit tests).
+                # An added or renamed column (42703) is the only drift we offer to fix:
+                # the dialog ADDs a new column or RENAMEs a renamed one, after approval of
+                # the rendered DDL (Property 6: never a silent schema mutation), and
+                # refuses a key change or a column the exclusions keep out with what to
+                # do instead. A DROP/type change can rewrite or destroy target data, so
+                # those stay alert-only -- see the runbook line below. Hidden entirely
+                # when no session is wired (e.g. unit tests).
                 if group.kind == "add-column" and session is not None:
                     ui.button(  # type: ignore[attr-defined]
                         "Fix target schema…",
                         on_click=lambda _e=None, table=group.table: (
                             _open_add_column_dialog(
                                 ui, session, table, on_refresh=on_refresh,
-                                on_applied=on_applied,
+                                on_applied=on_applied, migration_state=migration_state,
                             )
                         ),
                     ).props("flat dense no-caps size=sm color=primary")
@@ -2405,6 +3077,7 @@ def _render_cdc_dlq_panel(
             saved_exclusions=migration_state.lob_exclusions(),
             migration_type=getattr(migration_state, "migration_type", None),
             on_applied=getattr(migration_state, "record_cdc_target_added_columns", None),
+            migration_state=migration_state,
         )
         _render_cdc_dlq_breakdown(ui, status_view)
         # CDC commonly has no Full Load job_id this session, so key the record list /

@@ -126,11 +126,15 @@ class CatalogDriftRequest:
 
     ``inventory`` is held so the token's ``id()`` stays unique while a probe refers to it.
     ``epoch`` is the migration the read was claimed for (Start over replaces it), so a read
-    that lands after Start over is dropped."""
+    that lands after Start over is dropped. ``excluded`` (the effective exclusions, never a
+    generated column) and ``rekey`` (each table's ``message.key.columns``, current and
+    deployed) feed only the Fix target schema… plan behind ``fixable``."""
 
     tables: tuple = ()
     skip: Mapping[str, frozenset] = field(default_factory=dict)
     target_added: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    excluded: Mapping[str, frozenset] = field(default_factory=dict)
+    rekey: Mapping[str, frozenset] = field(default_factory=dict)
     source_type: Any = None
     token: tuple = ()
     not_in_baseline: tuple = ()
@@ -336,6 +340,27 @@ def catalog_drift_probe_due(
     return (_aware(now) - started).total_seconds() > CDC_CATALOG_DRIFT_PROBE_TTL_SECONDS  # type: ignore[operator]
 
 
+def cdc_rekey_columns(migration_state: object) -> "dict[str, frozenset[str]]":
+    """``{table: columns}`` CDC keys each re-keyed table on: the applied Schema Conversion's
+    ``message.key.columns`` (recomputed on each render) united with the DEPLOYED stack's
+    (what Debezium actually uses). CPU only; never raises (``{}`` when unreadable)."""
+    out: dict[str, set] = {}
+    try:
+        current = getattr(migration_state, "cdc_message_key_columns", None)
+        maps = [
+            current() if callable(current) else {},
+            getattr(migration_state, "cdc_deployed_message_key_columns", None) or {},
+        ]
+        for mapping in maps:
+            for table, cols in dict(mapping or {}).items():
+                names = {str(c) for c in (cols or ()) if c}
+                if names:
+                    out.setdefault(str(table), set()).update(names)
+    except Exception:  # noqa: BLE001 - unreadable is "no re-key known"
+        return {}
+    return {t: frozenset(c) for t, c in out.items()}
+
+
 def catalog_drift_request(
     migration_state: object, baseline: CatalogBaseline
 ) -> CatalogDriftRequest:
@@ -355,11 +380,18 @@ def catalog_drift_request(
         except Exception:  # noqa: BLE001
             effective = {}
     skip: dict[str, frozenset] = {}
+    excluded: dict[str, frozenset] = {}
+    rekey_all = cdc_rekey_columns(migration_state)
+    rekey: dict[str, frozenset] = {}
     for name, table in tables.items():
         names = {str(c) for c in (effective.get(name) or ())}
+        if names:
+            excluded[name] = frozenset(names)
         names.update(c.name for c in pg_preserved_generated_columns(table))
         if names:
             skip[name] = frozenset(names)
+        if rekey_all.get(name):
+            rekey[name] = rekey_all[name]
     added_all = getattr(migration_state, "cdc_target_added_columns", None) or {}
     added = {
         str(t): {str(c): str(v) for c, v in dict(cols or {}).items()}
@@ -370,6 +402,8 @@ def catalog_drift_request(
         tables=tuple(tables[n] for n in sorted(tables)),
         skip=skip,
         target_added=added,
+        excluded=excluded,
+        rekey=rekey,
         source_type=baseline.source_type,
         token=catalog_drift_token(migration_state, baseline),
         not_in_baseline=gone,
@@ -413,6 +447,8 @@ def build_catalog_drift_probe(
             skip=skip,
             target_added=request.target_added.get(table.name),
             source_type=request.source_type,
+            excluded=request.excluded.get(table.name, frozenset()),
+            rekey_columns=request.rekey.get(table.name, frozenset()),
         )
         if diff is not None:
             drift[table.name] = diff
@@ -1092,8 +1128,8 @@ _WHYS = {
         "DEFAULT, those rows are dead-lettered instead)"
     ),
     KIND_RENAME_COLUMN: (
-        "CDC now sends the new name, which this Aurora DSQL table does not have, so those "
-        "rows are dead-lettered and the old column is no longer filled"
+        "CDC sends the new name, so those rows are dead-lettered until the Aurora DSQL "
+        "column has it too, and the old column is not filled meanwhile"
     ),
     KIND_NULLABILITY_CHANGE: (
         "Aurora DSQL keeps the old rule: a NULL it rejects is dead-lettered, and a MySQL "
@@ -1112,11 +1148,11 @@ _WHY_ADD_PG_CLAUSE = (
     ", and a column of a type CDC cannot convert (for example interval[] or money[]) never "
     "arrives at all, even once the table has it"
 )
-# Fix target schema adds every column its plan finds and cannot tell a generated one apart,
-# so a table that gained a generated column is never offered it (see diff_table's fixable).
+# Fix target schema…'s plan withholds a generated column (cdc_schema_evolve.plan_target_fix):
+# a plain column added for it could stay empty.
 _WHY_ADD_GENERATED = (
     "the source computes it (a generated column) and CDC may not send its values, so Fix "
-    "target schema… is not offered for this table"
+    "target schema… does not add it"
 )
 
 
@@ -1216,10 +1252,12 @@ def monitor_runbook(migration_type: object) -> str:
         "To realign a table once the source has its final definition: re-run Step 1 "
         "(Evaluation) — this check then compares with it — and where the Aurora DSQL table "
         "must change too, let CDC catch up (Stream lag: caught up), Stop CDC, reload the "
-        "table on the Full Load step with 'Drop & reload', then Start CDC. Drop a removed or "
-        "renamed column on Aurora DSQL first: Drop & reload does not destroy a target column "
-        "the new definition no longer has. Run no other DDL on migrated tables while CDC is "
-        "stopped. Or undo the change on the source."
+        "table on the Full Load step with 'Drop & reload', then Start CDC. Rename a renamed "
+        "column on Aurora DSQL first (Fix target schema… does it) and drop a removed one "
+        "there: Drop & reload does not destroy a target column the new definition no longer "
+        "has. A primary-key column cannot be dropped on Aurora DSQL: re-apply that table in "
+        "Schema Conversion with Replace instead. Run no other DDL on migrated tables while "
+        "CDC is stopped. Or undo the change on the source."
     )
 
 
@@ -1321,9 +1359,37 @@ def monitor_open_notice(
         )
     if KIND_RENAME_COLUMN in kinds:
         sentences.append(
-            "Do not use Fix target schema… for a renamed column: it adds an empty column and "
-            "leaves the old one."
+            "For a renamed column, Fix target schema… renames it on Aurora DSQL so it keeps "
+            "its values (not a primary-key or CDC key column, nor an excluded one); then "
+            "re-run Step 1 (Evaluation) so this check and Validation compare the new name."
         )
+    # A rename finding the shared plan cannot fix, with the source key unchanged, renamed a
+    # CDC key column (the Composite key's message.key.columns): no Fix button, so the
+    # recreate path the dialog's refusal gives is said here.
+    rekey_renames = [
+        t for t, f in opened[:_NAME_LIMIT]
+        if KIND_RENAME_COLUMN in (getattr(f, "kinds", None) or ())
+        and KIND_KEY_CHANGE not in (getattr(f, "kinds", None) or ())
+        and not getattr(f, "fixable", False)
+    ]
+    if rekey_renames:
+        lead = (
+            f"In {', '.join(rekey_renames)}, a renamed column is part of the key CDC writes "
+            "and deletes by (Schema Conversion's Composite key), so neither a rename nor Fix "
+            "target schema… repairs it: "
+        )
+        if _is_cdc_only(migration_type):
+            sentences.append(
+                lead + "rename it back on the source, or use Start over to migrate the table "
+                "with its new key."
+            )
+        else:
+            sentences.append(
+                lead + "let CDC catch up (Stream lag: caught up), Stop CDC, re-run Step 1 "
+                "(Evaluation), re-apply the table in Schema Conversion with Replace and choose "
+                "the Composite key again, reload it with 'Drop & reload', then Delete CDC "
+                "infrastructure and deploy it again before Start CDC."
+            )
     if KIND_KEY_CHANGE in kinds:
         if _is_cdc_only(migration_type):
             sentences.append(
@@ -1334,14 +1400,21 @@ def monitor_open_notice(
             sentences.append(
                 "Aurora DSQL cannot change a primary key in place: restore the original key "
                 "on the source, or re-run Step 1 and reload the table with 'Drop & reload' as "
-                "above, which recreates it with the new key."
+                "above, which recreates it with the new key. If a key column was renamed or "
+                "removed, re-apply the table in Schema Conversion with Replace before that "
+                "reload: Aurora DSQL cannot drop a primary-key column, and Drop & reload "
+                "refuses to destroy one."
             )
-    if set(fix_tables or ()) & {t for t, _f in rows}:
+    added_rows = {
+        t for t, f in opened[:_NAME_LIMIT] if KIND_ADD_COLUMN in (getattr(f, "kinds", None) or ())
+    }
+    if set(fix_tables or ()) & added_rows:
         # Validation's stale-inventory check grades a column the Step 1 inventory lacks as
         # not compared, so the Fix alone never lets a CHECKSUM count.
         sentences.append(
-            "For a plain added column, Fix target schema… adds it to Aurora DSQL now; then "
-            "re-run Step 1 so Validation can compare it."
+            "For an added column, Fix target schema… adds it to Aurora DSQL now, except a "
+            "generated column or one your exclusions keep out (it says why and what to do "
+            "instead); then re-run Step 1 so Validation can compare it."
         )
     sentences.append(MONITOR_HOLD_SENTENCE)
     tail = " ".join(sentences) + _problem_sentence(
@@ -1948,6 +2021,7 @@ __all__ = [
     "catalog_drift_scope",
     "catalog_drift_waived_tables",
     "cdc_catalog_drift_cutover_gate",
+    "cdc_rekey_columns",
     "fold_catalog_drift_probe",
     "log_catalog_drift_transitions",
     "probe_catalog_drift_now",

@@ -1490,9 +1490,9 @@ class CdcCatalogDriftFinding(BaseModel):
     kinds: list[CatalogDriftKind] = Field(min_length=1)
     changes: list[CdcCatalogDriftChange] = Field(default_factory=list, max_length=6)
     more_changes: int = Field(default=0, ge=0)
-    # Every added column is a plain (non-generated) one -- Fix target schema adds every
-    # column its plan finds, so a generated one would arrive as a plain, empty column -- and
-    # nothing makes Fix misleading (a rename, a key change, a missing table).
+    # Fix target schema… has something to apply or explain for this table (the shared
+    # plan's offers_fix): no key change or renamed key column, not only generated adds, and
+    # the table is present on the source.
     fixable: bool = False
     first_seen_at: datetime
     resolved_at: Optional[datetime] = None

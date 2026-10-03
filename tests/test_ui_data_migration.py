@@ -31710,6 +31710,8 @@ def test_fix_is_offered_only_for_a_plain_added_column_not_already_in_the_dlq_ban
         return [b.text for b in ui.buttons]
 
     assert "Fix target schema…" in _buttons(_f(["add-column"], fixable=True))
+    # A renamed (non-key) column: Fix renames it on Aurora DSQL.
+    assert "Fix target schema…" in _buttons(_f(["rename-column"], fixable=True))
     for finding in (
         _f(["add-column"], fixable=False, generated=True),
         _f(["rename-column"], fixable=False),
@@ -31730,12 +31732,12 @@ def test_fix_is_offered_only_for_a_plain_added_column_not_already_in_the_dlq_ban
     assert "Fix target schema…" not in _buttons(_f(["add-column"], fixable=True), on_fix=None)
 
 
-def test_a_table_that_gained_a_plain_and_a_generated_column_is_not_offered_fix(
+def test_a_table_that_gained_a_plain_and_a_generated_column_is_offered_fix_for_the_plain_one(
     monkeypatch,
 ) -> None:
-    """The row said Fix target schema… is not offered for the generated column while the
-    button sat next to it -- and its plan would have added that column as a plain, empty
-    one. A table with any generated added column gets no Fix."""
+    """The Fix plan reads the live generated flag and withholds the generated column, so
+    the table is offered Fix for the plain one -- and the row says Fix does not add the
+    generated one."""
     _g2_fake_nicegui(monkeypatch)
     _g2_logged(monkeypatch)
     rows = _g4_rows(notes=True, extra=[("x", "int")]) + [
@@ -31748,11 +31750,11 @@ def test_a_table_that_gained_a_plain_and_a_generated_column_is_not_offered_fix(
     _ui, (poll,) = _g2_render(state, session)
     _g2_poll(poll)
     finding = state.cdc_catalog_drift_findings["app.orders"]
-    assert finding.kinds == ["add-column"] and not finding.fixable
+    assert finding.kinds == ["add-column"] and finding.fixable
     ui, _ = _g2_render(state, session)
     (row,) = [t for t in ui.texts if t.startswith("app.orders: column added at the source")]
-    assert "Fix target schema… is not offered for this table" in row
-    assert "Fix target schema…" not in [b.text for b in ui.buttons]
+    assert "Fix target schema… does not add it" in row
+    assert "Fix target schema…" in [b.text for b in ui.buttons]
 
 
 class _G4DlqCtl(_G1Ctl):
@@ -31778,7 +31780,7 @@ def _g4_mysql_rows(columns):
     "code,columns,banner_row",
     [
         ("42703", [("id", "int", False), ("notes", "text", True), ("c", "int", True)],
-         "app.orders: column added at the source —"),
+         "app.orders: column added or renamed at the source —"),
         ("23502", [("id", "int", False)], "app.orders: column dropped at the source —"),
         ("42804", [("id", "int", False), ("notes", "int", True)],
          "app.orders: column type changed at the source —"),
@@ -31817,8 +31819,8 @@ def test_a_change_the_dead_letter_banner_reports_is_listed_only_there(
 
 
 def test_a_change_the_dead_letter_banner_cannot_classify_keeps_its_row(monkeypatch) -> None:
-    """A rename reaches the sink as an unknown column (42703, "column added") -- the
-    re-check's row is the accurate one, with its "Do not use Fix" sentence: it stays."""
+    """A rename reaches the sink as an unknown column (42703, "column added or renamed") --
+    the re-check's row is the accurate one, with its rename sentence: it stays."""
     _g2_fake_nicegui(monkeypatch)
     _g2_logged(monkeypatch)
     _g2_factory(monkeypatch, _g4_mysql_rows([("id", "int", False), ("memo", "text", True)]))
@@ -31832,7 +31834,10 @@ def test_a_change_the_dead_letter_banner_cannot_classify_keeps_its_row(monkeypat
     ui, _ = _g2_render(state, session)
     body = "\n".join(ui.texts)
     assert _G4_HEADER in body and "Source schema change detected" in body
-    assert "Do not use Fix target schema… for a renamed column" in body
+    assert "Fix target schema… renames it on Aurora DSQL" in body
+    assert "Do not use Fix" not in body
+    # One button per table: the banner's (the dialog renames there).
+    assert sum(b.text == "Fix target schema…" for b in ui.buttons) == 1
 
 
 def _g4_open_drop(state):
@@ -31880,20 +31885,38 @@ def test_a_clean_schema_read_draws_no_cant_recheck_warning(monkeypatch) -> None:
     assert _G4_HEADER not in " ".join(ui.texts)
 
 
-def _g4_stub_fix_dialog(monkeypatch, *, source_columns, added):
-    """Stub the Fix dialog's I/O: the source/target column reads and the apply."""
+def _g4_stub_fix_dialog(monkeypatch, *, source_columns, added, target_columns=("id",),
+                        source_pk=("id",), target_pk=None, generated=()):
+    """Stub the Fix dialog's I/O: the bounded source read (a LiveTable of
+    ``source_columns`` [(name, type)]), the target column / primary-key reads and the apply.
+    Returns what it saw: the engine's dispose calls, the read timeout and the applied plans."""
     import dsql_migrator.core.cdc_schema_evolve as evolve
     import dsql_migrator.core.target_connection as target_connection
+    import dsql_migrator.core.target_introspector as target_introspector
     import dsql_migrator.ui.connect as connect
+    from dsql_migrator.core.cdc_catalog_drift import LiveColumn, LiveTable
     from dsql_migrator.core.cdc_schema_evolve import AddColumnOutcome
+
+    seen: dict = {"disposed": 0, "connected": 0, "timeouts": [], "plans": []}
 
     class _Raw:
         def close(self):
             return None
 
+    class _Conn:
+        def __enter__(self):
+            seen["connected"] += 1
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
     class _Engine:
-        def raw_connection(self):
-            return _Raw()
+        def connect(self):
+            return _Conn()
+
+        def dispose(self):
+            seen["disposed"] += 1
 
     class _Connector:
         def __init__(self, *_a, **_k):
@@ -31902,19 +31925,32 @@ def _g4_stub_fix_dialog(monkeypatch, *, source_columns, added):
         def connect(self):
             return _Raw()
 
-    monkeypatch.setattr(connect, "make_source_engine_factory",
-                        lambda *_a, **_k: (lambda _config: _Engine()))
-    monkeypatch.setattr(target_connection, "DsqlConnector", _Connector)
-    monkeypatch.setattr(evolve, "read_source_columns", lambda *_a, **_k: list(source_columns))
-    monkeypatch.setattr(evolve, "read_target_columns", lambda *_a, **_k: ["id"])
-    monkeypatch.setattr(
-        evolve, "apply_add_columns",
-        lambda plan, _factory: tuple(
+    def _factory(_password, *, read_timeout_seconds=None):
+        seen["timeouts"].append(read_timeout_seconds)
+        return lambda _config: _Engine()
+
+    live = LiveTable(
+        columns=tuple(LiveColumn(n, t, n not in source_pk, n in generated, i)
+                      for i, (n, t) in enumerate(source_columns)),
+        primary_key=frozenset(source_pk),
+    )
+
+    def _apply(plan, _factory):
+        seen["plans"].append(plan)
+        return tuple(
             AddColumnOutcome(column=s.column, ddl=s.ddl, applied=s.column in added,
                              error=None if s.column in added else "boom")
             for s in plan.steps
-        ),
-    )
+        )
+
+    monkeypatch.setattr(connect, "make_source_engine_factory", _factory)
+    monkeypatch.setattr(target_connection, "DsqlConnector", _Connector)
+    monkeypatch.setattr(evolve, "read_source_table", lambda *_a, **_k: live)
+    monkeypatch.setattr(evolve, "read_target_columns", lambda *_a, **_k: list(target_columns))
+    monkeypatch.setattr(target_introspector, "target_primary_key_columns",
+                        lambda *_a, **_k: list(target_pk) if target_pk is not None else None)
+    monkeypatch.setattr(evolve, "apply_add_columns", _apply)
+    return seen
 
 
 def test_applying_fix_records_the_column_and_resolves_the_finding(monkeypatch) -> None:
@@ -31988,11 +32024,14 @@ def test_the_dead_letter_banners_fix_also_records_the_added_column(monkeypatch) 
     _render_cdc_dlq_panel(_DlqUi(), state, _JobJM(MigrationJob(job_id="job-cdc")), view,
                           on_refresh=None, session=session)
     assert seen["on_applied"] == state.record_cdc_target_added_columns
+    # The dialog's key, exclusion and rename inputs come from the migration state.
+    assert seen["migration_state"] is state
     # Drive that banner's Fix: only the APPLIED column is recorded (y failed).
     _g4_stub_fix_dialog(monkeypatch, source_columns=[("id", "int"), ("x", "int"), ("y", "int")],
                         added={"x"})
     ui = _RecordingUi()
-    real(ui, view, session=session, on_applied=seen["on_applied"])
+    real(ui, view, session=session, on_applied=seen["on_applied"],
+         migration_state=seen["migration_state"])
     (fix,) = [b for b in ui.buttons if b.text == "Fix target schema…"]
 
     async def _scenario():
@@ -32002,6 +32041,706 @@ def test_the_dead_letter_banners_fix_also_records_the_added_column(monkeypatch) 
 
     asyncio.run(_scenario())
     assert state.cdc_target_added_columns == {"app.orders": {"x": "int"}}
+
+
+# --- G6: Fix target schema… -- one plan, one refusal rule, for both entry points ----------
+
+
+class _G6Ui(_RecordingUi):
+    """Records notifications too (text, type)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.notes: list = []
+
+    def notify(self, text="", *_a, type=None, **_k):  # noqa: A002 - NiceGUI's name
+        self.notes.append((str(text), type))
+
+
+def _g6_inventory(columns, pk=("id",)):
+    from dsql_migrator.core.models import ColumnDef, SourceInventory, TableDef
+
+    return SourceInventory(tables=[TableDef(
+        name="app.orders",
+        columns=[ColumnDef(name=n, mysql_type=t, nullable=n not in pk) for n, t in columns],
+        primary_key=list(pk),
+    )])
+
+
+def _g6_setup(monkeypatch, *, mtype=None, inventory=None):
+    """A Full load + CDC (or ``mtype``) session with a target, and its state."""
+    _g2_fake_nicegui(monkeypatch)
+    lines = _g2_logged(monkeypatch)
+    tones = _g2_tones(monkeypatch)
+    session = _g2_session(pg=False, mtype=mtype)
+    session.set_target(_g4_target_config())
+    state = _g4_state(session, inventory=inventory)
+    return session, state, tones, lines
+
+
+def _g6_open(session, state, *, applied=None, missing_state=False):
+    """Open the Fix dialog for app.orders; returns the UI double."""
+    import asyncio
+
+    from dsql_migrator.ui.data_migration._cdc_monitoring import _open_add_column_dialog
+
+    ui = _G6Ui()
+    asyncio.run(_open_add_column_dialog(
+        ui, session, "app.orders",
+        on_applied=(lambda t, cols: applied.append((t, cols))) if applied is not None else None,
+        migration_state=None if missing_state else state,
+    ))
+    return ui
+
+
+def _g6_click(button) -> None:
+    import asyncio
+
+    async def _run():
+        result = button.on_click()
+        if result is not None and hasattr(result, "__await__"):
+            await result
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    asyncio.run(_run())
+
+
+def _g6_applies(ui):
+    return [b for b in ui.buttons if b.text.startswith("Apply ")]
+
+
+def _g6_statements(ui):
+    """The statements block(s) the dialog shows (the ui.code text), one per line."""
+    return [line for t in ui.texts if t.startswith("ALTER TABLE ") for line in t.splitlines()]
+
+
+def test_fix_refuses_a_renamed_primary_key_column_from_the_dead_letter_banner(monkeypatch) -> None:
+    """5k: the banner's Fix offered ADD uid. Applied, every upsert then failed 42P10 and
+    every DELETE WHERE uid = ? matched no row (uid NULL on every old row) -- a loud dead
+    letter turned into silent loss. Now the dialog refuses the table with the recreate path,
+    and never says to drop the key column (Aurora DSQL cannot)."""
+    from dsql_migrator.ui.data_migration._cdc_monitoring import _render_cdc_schema_drift_banner
+
+    session, state, tones, _lines = _g6_setup(monkeypatch)
+    seen = _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("uid", "int"), ("notes", "text")], added={"uid"},
+        target_columns=("id", "notes"), source_pk=("uid",), target_pk=("id",),
+    )
+    applied: list = []
+    ui = _G6Ui()
+    view = _cdc_view_with_drift([("app.orders", "add-column", 3)])
+    _render_cdc_schema_drift_banner(
+        ui, view, session=session, on_applied=lambda t, c: applied.append((t, c)),
+        migration_state=state,
+    )
+    (fix,) = [b for b in ui.buttons if b.text == "Fix target schema…"]
+    _g6_click(fix)
+    (refusal,) = [n for n in tones if n[0] == "error"]
+    assert refusal[1] == "Fix target schema… cannot repair app.orders: its key changed on the source"
+    body = refusal[2]
+    assert body.startswith("On the source, id was renamed to uid.")
+    assert "every delete would silently match no row" in body
+    assert "choosing Replace" in body and "'Drop & reload'" in body
+    assert "DROP COLUMN" not in body
+    assert not _g6_applies(ui) and "Cancel" in [b.text for b in ui.buttons]
+    assert "ADD COLUMN" not in "\n".join(ui.texts)
+    assert seen["plans"] == [] and applied == []
+    # CDC only: no Full Load step -- restore the key or Start over.
+    session2, state2, tones2, _ = _g6_setup(monkeypatch, mtype=MigrationType.CDC_ONLY)
+    _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("uid", "int"), ("notes", "text")], added=set(),
+        target_columns=("id", "notes"), source_pk=("uid",), target_pk=("id",),
+    )
+    _g6_open(session2, state2)
+    (cdc_only,) = [n for n in tones2 if n[0] == "error"]
+    assert "use Start over to migrate the table with its new key" in cdc_only[2]
+    assert "Replace" not in cdc_only[2]
+
+
+def test_fix_refuses_a_renamed_rekey_column_and_says_to_redeploy(monkeypatch) -> None:
+    inventory = _g6_inventory([("id", "int"), ("tenant_id", "int")])
+    session, state, tones, _ = _g6_setup(monkeypatch, inventory=inventory)
+    state.cdc_deployed_message_key_columns = {"app.orders": ["tenant_id", "id"]}
+    _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("id", "int"), ("org_id", "int")], added=set(),
+        target_columns=("id", "tenant_id"), target_pk=("tenant_id", "id"),
+    )
+    ui = _g6_open(session, state)
+    (refusal,) = [n for n in tones if n[0] == "error"]
+    assert "tenant_id was renamed to org_id" in refusal[2]
+    assert "CDC re-keys this table on tenant_id" in refusal[2]
+    assert "Delete CDC infrastructure and deploy it again" in refusal[2]
+    assert "On MySQL, that Start needs a start point newer than this change" in refusal[2]
+    assert not _g6_applies(ui)
+
+
+def test_fix_offers_a_rename_and_records_no_added_column(monkeypatch) -> None:
+    """5: a RENAME COLUMN notes -> memo was offered as ADD memo (notes kept its values, memo
+    empty). Now it is a RENAME, and it is never recorded as an added column (that would make
+    the re-check report notes as dropped)."""
+    session, state, tones, lines = _g6_setup(monkeypatch)
+    seen = _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("id", "int"), ("memo", "text")], added={"memo"},
+        target_columns=("id", "notes"), target_pk=("id",),
+    )
+    applied: list = []
+    ui = _g6_open(session, state, applied=applied)
+    assert "Fix target schema: app.orders" in ui.texts
+    assert 'ALTER TABLE "app"."orders" RENAME COLUMN "notes" TO "memo"' in ui.texts
+    assert _g6_statements(ui) == ['ALTER TABLE "app"."orders" RENAME COLUMN "notes" TO "memo"']
+    (info,) = [n for n in tones if n[1] == "notes looks renamed to memo on the source"]
+    assert info[0] == "info" and "inventory has notes at this position" in info[2]
+    runbook = [n for n in tones if n[1] == "After applying: how to backfill the rows already set aside"]
+    assert runbook and "so the Full Load reads the new column name" in runbook[0][2]
+    (apply,) = _g6_applies(ui)
+    assert apply.text == "Apply 1 statement(s)" and "color=primary" in " ".join(apply.props_seen)
+    _g6_click(apply)
+    assert [type(s).__name__ for s in seen["plans"][0].steps] == ["RenameColumnStep"]
+    # Never reported as added (on_applied is not even called).
+    assert applied == []
+    (line,) = [kw for action, kw in lines if action == "rename column on target (schema drift)"]
+    assert line["target"] == "app.orders.memo" and "RENAME COLUMN" in line["detail"]
+    (note,) = ui.notes
+    assert note[1] == "positive" and note[0].startswith("Applied 1 statement(s) to app.orders.")
+    assert "re-run Step 1 (Evaluation)" in note[0]
+
+
+def test_fix_offers_a_case_only_rename(monkeypatch) -> None:
+    """The case-insensitive diff found nothing to do and notified "the target already has
+    every source column", while every row carrying "Notes" dead-lettered (the sink quotes
+    names exactly)."""
+    inventory = _g6_inventory([("id", "int"), ("Notes", "text")])  # Step 1 already re-run
+    session, state, tones, _ = _g6_setup(monkeypatch, inventory=inventory)
+    _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("id", "int"), ("Notes", "text")], added=set(),
+        target_columns=("id", "notes"), target_pk=("id",),
+    )
+    ui = _g6_open(session, state)
+    assert 'ALTER TABLE "app"."orders" RENAME COLUMN "notes" TO "Notes"' in ui.texts
+    assert not any("already has every source column" in n for n, _t in ui.notes)
+    # A case-only pair is a rename: no drop-plus-add caveat.
+    (info,) = [n for n in tones if n[1] == "notes was renamed to Notes on the source"]
+    assert "cannot tell this from" not in info[2]
+
+
+def test_fix_does_not_add_a_column_a_saved_rule_matches(monkeypatch) -> None:
+    """13a: the capture list holds the names fixed at Save, so a new column a saved wildcard
+    rule matches is captured and dead-letters; adding it would replicate excluded data."""
+    session, state, tones, _ = _g6_setup(monkeypatch)
+    state.restore_exclusion_rules("exclude app.orders.pw_*")
+    _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("id", "int"), ("notes", "text"), ("pw_salt", "text")],
+        added={"pw_salt"}, target_columns=("id", "notes"), target_pk=("id",),
+    )
+    ui = _g6_open(session, state)
+    assert "Fix target schema: app.orders" in ui.texts  # it adds nothing
+    (held,) = [n for n in tones if n[1] == "pw_salt is not added: your exclusion rules match it"]
+    assert held[0] == "warning"
+    assert "Your saved rule 'exclude app.orders.pw_*' matches pw_salt" in held[2]
+    assert "Delete CDC infrastructure" in held[2] and "Change & reload" in held[2]
+    assert not _g6_applies(ui) and "ADD COLUMN" not in "\n".join(ui.texts)
+    # A pending (unsaved) line never counts.
+    session2, state2, _t2, _ = _g6_setup(monkeypatch)
+    state2.add_pending_rule("exclude app.orders.pw_*")
+    _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("id", "int"), ("notes", "text"), ("pw_salt", "text")],
+        added=set(), target_columns=("id", "notes"), target_pk=("id",),
+    )
+    assert [b.text for b in _g6_applies(_g6_open(session2, state2))] == ["Apply 1 statement(s)"]
+
+
+def test_fix_does_not_add_or_rename_a_renamed_excluded_column(monkeypatch) -> None:
+    """13a: an excluded notes renamed to memo slips past the deployed list (it names notes);
+    the target keeps notes (NULL). Neither ADD memo nor RENAME notes -> memo."""
+    session, state, tones, _ = _g6_setup(monkeypatch)
+    state.restore_lob_exclusion("app.orders", "notes")
+    _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("id", "int"), ("memo", "text")], added=set(),
+        target_columns=("id", "notes"), target_pk=("id",),
+    )
+    ui = _g6_open(session, state)
+    assert "Fix target schema: app.orders" in ui.texts  # it adds nothing
+    header = "memo is not added: it is the excluded column notes, renamed on the source"
+    (held,) = [n for n in tones if n[1] == header]
+    assert held[0] == "warning" and "Or rename the column back on the source." in held[2]
+    text = "\n".join(ui.texts)
+    assert "RENAME COLUMN" not in text and "ADD COLUMN" not in text and not _g6_applies(ui)
+    # Full load + CDC: Change & reload refuses while Aurora DSQL still has the old (NULL)
+    # column, so the recipe drops it first -- after CDC is stopped and deleted.
+    drop = 'ALTER TABLE "app"."orders" DROP COLUMN "notes"'
+    assert drop in held[2]
+    assert held[2].index("Delete CDC infrastructure") < held[2].index(drop)
+    assert held[2].index(drop) < held[2].index("Change & reload")
+    # CDC only has no Change & reload: no drop step.
+    session2, state2, tones2, _ = _g6_setup(monkeypatch, mtype=MigrationType.CDC_ONLY)
+    state2.restore_lob_exclusion("app.orders", "notes")
+    _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("id", "int"), ("memo", "text")], added=set(),
+        target_columns=("id", "notes"), target_pk=("id",),
+    )
+    _g6_open(session2, state2)
+    (cdc_only,) = [n for n in tones2 if n[1] == header]
+    assert "DROP COLUMN" not in cdc_only[2] and "Change & reload" not in cdc_only[2]
+
+
+def test_the_g4_notice_offers_fix_for_a_renamed_column(monkeypatch) -> None:
+    session, state, tones, _ = _g6_setup(monkeypatch)
+    _g2_factory(monkeypatch, _g4_mysql_rows([("id", "int", False), ("memo", "text", True)]))
+    _ui, (poll,) = _g2_render(state, session)
+    _g2_poll(poll)
+    finding = state.cdc_catalog_drift_findings["app.orders"]
+    assert finding.kinds == ["rename-column"] and finding.fixable
+    ui, _ = _g2_render(state, session)
+    (fix,) = [b for b in ui.buttons if b.text == "Fix target schema…"]
+    _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("id", "int"), ("memo", "text")], added={"memo"},
+        target_columns=("id", "notes"), target_pk=("id",),
+    )
+    _g6_click(fix)
+    assert 'ALTER TABLE "app"."orders" RENAME COLUMN "notes" TO "memo"' in ui.texts
+
+
+def test_the_plain_add_dialog_is_unchanged(monkeypatch) -> None:
+    """(d): a genuinely new, non-key, non-excluded, non-generated column gets exactly the
+    dialog it always had."""
+    session, state, tones, lines = _g6_setup(monkeypatch)
+    _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("id", "int"), ("notes", "text"), ("x", "int")],
+        added={"x"}, target_columns=("id", "notes"), target_pk=("id",),
+    )
+    applied: list = []
+    ui = _g6_open(session, state, applied=applied)
+    assert "Add missing columns to app.orders" in ui.texts
+    assert (
+        "These statements will run on the target, one per transaction. Each "
+        "column is added NULLable with no default: existing rows read NULL "
+        "until you backfill them, and new change events carry the real value."
+    ) in ui.texts
+    assert 'ALTER TABLE "app"."orders" ADD COLUMN "x" INT' in ui.texts
+    assert [(n[0], n[1]) for n in tones] == [
+        ("info", "After applying: how to backfill the rows already set aside"),
+    ]
+    assert tones[0][2] == (
+        "CDC resumes applying new changes for this table on its own, but the "
+        "rows already dead-lettered are NOT replayed. Backfilling them takes "
+        "four steps, in this order: (1) re-run Step 1 (Evaluation) — the Full "
+        "Load reads the column list captured there, which predates this source "
+        "change, so without a refresh it would not copy the new column at all; "
+        "(2) stop CDC; (3) reload this table on the Full Load step choosing "
+        "'Drop & reload' — a plain append reload only inserts primary keys the "
+        "target is missing, so it cannot fill the new column on rows that are "
+        "already there; (4) start CDC again. Then run Validation (step 4) to "
+        "confirm the table matches."
+    )
+    (apply,) = _g6_applies(ui)
+    assert apply.text == "Apply 1 statement(s)"
+    _g6_click(apply)
+    assert applied == [("app.orders", {"x": "int"})]
+    (line,) = [(a, kw) for a, kw in lines if "column" in a]
+    assert line[0] == "add column to target (schema drift)" and line[1]["target"] == "app.orders.x"
+    assert ui.notes == [(
+        "Added 1 column(s) to app.orders. New changes apply again; to backfill the rows "
+        "already set aside, re-run Step 1 (Evaluation), stop CDC, then reload this table "
+        "choosing 'Drop & reload'.", "positive",
+    )]
+    # The failure notify, unchanged too.
+    _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("id", "int"), ("notes", "text"), ("x", "int")],
+        added=set(), target_columns=("id", "notes"), target_pk=("id",),
+    )
+    failing = _g6_open(session, state, applied=[])
+    _g6_click(_g6_applies(failing)[0])
+    assert failing.notes == [("Added 0 column(s); x failed: boom", "negative")]
+
+
+def test_fix_disposes_the_source_engine(monkeypatch) -> None:
+    session, state, _tones, _ = _g6_setup(monkeypatch)
+    seen = _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("id", "int"), ("notes", "text"), ("x", "int")],
+        added=set(), target_columns=("id", "notes"),
+    )
+    _g6_open(session, state)
+    assert seen["connected"] == 1 and seen["disposed"] == 1
+    assert seen["timeouts"] == [10]  # bounded, like the re-check's read
+
+
+def test_fix_without_migration_state_adds_nothing(monkeypatch) -> None:
+    session, state, tones, _ = _g6_setup(monkeypatch)
+    _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("id", "int"), ("notes", "text"), ("x", "int")],
+        added={"x"}, target_columns=("id", "notes"), target_pk=("id",),
+    )
+    ui = _g6_open(session, state, missing_state=True)
+    assert "Fix target schema: app.orders" in ui.texts  # it adds nothing
+    (held,) = [n for n in tones if n[0] == "warning"]
+    assert held[1] == "Nothing is added or renamed: the exclusion rules could not be checked"
+    # The same inputs fail the same way again: the notice names what it holds and gives a
+    # manual path, never "choose Fix target schema… again".
+    assert "so it holds x." in held[2] and "Trying again gives the same result" in held[2]
+    assert "ALTER TABLE … ADD COLUMN, nullable, with no default" in held[2]
+    assert "Exclude tables & columns" in held[2] and "again from the CDC step" not in held[2]
+    assert not _g6_applies(ui)
+    # The key refusal still runs from the live source and target keys.
+    _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("uid", "int"), ("notes", "text")], added=set(),
+        target_columns=("id", "notes"), source_pk=("uid",), target_pk=("id",),
+    )
+    tones.clear()
+    _g6_open(session, state, missing_state=True)
+    assert [n[0] for n in tones] == ["error"]
+
+
+def test_fix_withholds_a_generated_column_and_adds_the_plain_one(monkeypatch) -> None:
+    session, state, tones, _ = _g6_setup(monkeypatch)
+    _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("id", "int"), ("notes", "text"), ("x", "int"),
+                                     ("g", "int")],
+        added={"x"}, target_columns=("id", "notes"), target_pk=("id",), generated=("g",),
+    )
+    ui = _g6_open(session, state)
+    assert "Add missing columns to app.orders" in ui.texts  # a held column beside an ADD
+    assert 'ALTER TABLE "app"."orders" ADD COLUMN "x" INT' in ui.texts
+    assert not any('"g"' in t for t in ui.texts)
+    (held,) = [n for n in tones if n[1] == "g is not added: the source computes it"]
+    assert held[0] == "warning"
+    assert [b.text for b in _g6_applies(ui)] == ["Apply 1 statement(s)"]
+
+
+@pytest.mark.parametrize("cdc_only", [False, True])
+def test_fix_name_taken_shows_the_manual_path(monkeypatch, cdc_only) -> None:
+    session, state, tones, _ = _g6_setup(
+        monkeypatch, mtype=MigrationType.CDC_ONLY if cdc_only else None
+    )
+    _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("id", "int"), ("memo", "text")], added=set(),
+        target_columns=("id", "notes", "memo"), target_pk=("id",),
+    )
+    ui = _g6_open(session, state)
+    assert "Fix target schema: app.orders" in ui.texts  # it adds nothing
+    (held,) = [n for n in tones if n[1] == "notes is not renamed to memo: Aurora DSQL already has memo"]
+    assert held[0] == "warning" and not _g6_applies(ui)
+    if cdc_only:
+        assert "copy the values from notes into memo" in held[2] and "Drop & reload" not in held[2]
+    else:
+        assert 'ALTER TABLE "app"."orders" DROP COLUMN "notes"' in held[2]
+        assert "'Drop & reload'" in held[2]
+
+
+def test_fix_warns_about_an_orphan_target_column(monkeypatch) -> None:
+    """Step 1 re-run after the rename and no re-check record: no evidence of a rename, so
+    the dialog offers the ADD -- and names the target column the source lacks, with the
+    exact RENAME to run by hand instead."""
+    inventory = _g6_inventory([("id", "int"), ("memo", "text")])
+    session, state, tones, _ = _g6_setup(monkeypatch, inventory=inventory)
+    _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("id", "int"), ("memo", "text")], added=set(),
+        target_columns=("id", "notes"), target_pk=("id",),
+    )
+    ui = _g6_open(session, state)
+    assert 'ALTER TABLE "app"."orders" ADD COLUMN "memo" TEXT' in ui.texts
+    (orphan,) = [n for n in tones if n[1].startswith("Aurora DSQL also has notes")]
+    assert orphan[0] == "warning"
+    assert 'ALTER TABLE "app"."orders" RENAME COLUMN "notes" TO "memo"' in orphan[2]
+
+
+def test_fix_says_a_same_type_drop_plus_add_looks_like_a_rename(monkeypatch) -> None:
+    """DROP legacy_flag then ADD is_active tinyint(1): MySQL appends the new column at the
+    dropped one's rank with the same type, which the catalog cannot tell from a rename. The
+    RENAME stays offered (most such pairs are renames), but never as a stated fact, and the
+    notice gives the exact ADD to run instead."""
+    from dsql_migrator.core.cdc_schema_evolve import plan_add_columns
+
+    inventory = _g6_inventory([("id", "int"), ("notes", "text"), ("legacy_flag", "tinyint(1)")])
+    session, state, tones, _ = _g6_setup(monkeypatch, inventory=inventory)
+    _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("id", "int"), ("notes", "text"), ("is_active", "tinyint(1)")],
+        added=set(), target_columns=("id", "notes", "legacy_flag"), target_pk=("id",),
+    )
+    ui = _g6_open(session, state)
+    assert _g6_statements(ui) == [
+        'ALTER TABLE "app"."orders" RENAME COLUMN "legacy_flag" TO "is_active"'
+    ]
+    (info,) = [n for n in tones if n[1] == "legacy_flag looks renamed to is_active on the source"]
+    assert info[0] == "info"
+    add = plan_add_columns("app.orders", [("is_active", "tinyint(1)")], []).steps[0].ddl
+    assert ("The source catalog cannot tell this from legacy_flag dropped and is_active added "
+            "with the same type") in info[2]
+    assert f"Cancel and add is_active by hand instead ({add})" in info[2]
+    assert "would show the values of legacy_flag as is_active" in info[2]
+
+
+def _g6_held_with_add(monkeypatch, state, kind):
+    """A held column CDC still sends (a rule match or a renamed excluded column) beside a
+    plain ADD of x."""
+    if kind == "rule":
+        state.restore_exclusion_rules("exclude app.orders.pw_*")
+        cols, held = [("id", "int"), ("notes", "text"), ("x", "int"), ("pw_salt", "text")], "pw_salt"
+    else:
+        state.restore_lob_exclusion("app.orders", "notes")
+        cols, held = [("id", "int"), ("memo", "text"), ("x", "int")], "memo"
+    _g4_stub_fix_dialog(monkeypatch, source_columns=cols, added={"x"},
+                        target_columns=("id", "notes"), target_pk=("id",))
+    return held
+
+
+@pytest.mark.parametrize("kind", ["rule", "renamed-excluded"])
+def test_fix_never_says_cdc_resumes_while_a_held_column_keeps_dead_lettering(
+    monkeypatch, kind
+) -> None:
+    """Every row image carries the held column, which Aurora DSQL still lacks: the ADD of x
+    alone resumes no insert or update, so neither the runbook nor the toast may say so."""
+    session, state, tones, _ = _g6_setup(monkeypatch)
+    held = _g6_held_with_add(monkeypatch, state, kind)
+    ui = _g6_open(session, state, applied=[])
+    assert _g6_statements(ui) == ['ALTER TABLE "app"."orders" ADD COLUMN "x" INT']
+    (runbook,) = [n for n in tones if n[1] == "After applying: how to backfill the rows already set aside"]
+    assert not runbook[2].startswith("CDC resumes applying")
+    assert runbook[2].startswith(
+        f"Inserts and updates to this table that carry {held} are still set aside after this"
+    )
+    assert "'Drop & reload'" in runbook[2]  # the backfill steps are kept
+    _g6_click(_g6_applies(ui)[0])
+    (note,) = ui.notes
+    assert note[1] == "warning" and "New changes apply again" not in note[0]
+    assert note[0].startswith(
+        f"Added 1 column(s) to app.orders. Inserts and updates that carry {held} are still set aside"
+    )
+
+
+@pytest.mark.parametrize("cdc_only,with_add", [(False, False), (True, False), (False, True),
+                                               (True, True)])
+def test_fix_rename_runbook_and_toast_follow_the_migration_type(monkeypatch, cdc_only, with_add) -> None:
+    """CDC only has no Full Load step: a rename (also with an added column beside it) gets
+    the by-hand runbook and toast, never 'Drop & reload'. Only the ADDED column is recorded."""
+    session, state, tones, _ = _g6_setup(
+        monkeypatch, mtype=MigrationType.CDC_ONLY if cdc_only else None
+    )
+    cols = [("id", "int"), ("memo", "text")] + ([("extra", "int")] if with_add else [])
+    _g4_stub_fix_dialog(monkeypatch, source_columns=cols, added={"memo", "extra"},
+                        target_columns=("id", "notes"), target_pk=("id",))
+    applied: list = []
+    ui = _g6_open(session, state, applied=applied)
+    rename = 'ALTER TABLE "app"."orders" RENAME COLUMN "notes" TO "memo"'
+    assert _g6_statements(ui) == [rename] + (
+        ['ALTER TABLE "app"."orders" ADD COLUMN "extra" INT'] if with_add else []
+    )
+    (runbook,) = [n for n in tones if n[1] == "After applying: how to backfill the rows already set aside"]
+    _g6_click(_g6_applies(ui)[0])
+    (note,) = ui.notes
+    assert note[1] == "positive"
+    if cdc_only:
+        assert "CDC only has no Full Load step to reload them from" in runbook[2]
+        assert "Drop & reload" not in runbook[2]
+        assert "correct the rows already set aside on Aurora DSQL by hand" in note[0]
+        assert "Drop & reload" not in note[0]
+    else:
+        assert "'Drop & reload'" in runbook[2] and "'Drop & reload'" in note[0]
+    assert applied == ([("app.orders", {"extra": "int"})] if with_add else [])
+
+
+def test_fix_a_failed_rename_is_a_negative_notify(monkeypatch) -> None:
+    session, state, _tones, lines = _g6_setup(monkeypatch)
+    _g4_stub_fix_dialog(monkeypatch, source_columns=[("id", "int"), ("memo", "text")],
+                        added=set(), target_columns=("id", "notes"), target_pk=("id",))
+    applied: list = []
+    ui = _g6_open(session, state, applied=applied)
+    _g6_click(_g6_applies(ui)[0])
+    assert ui.notes == [("Applied 0 statement(s); memo failed: boom", "negative")]
+    assert applied == []
+    (line,) = [kw for action, kw in lines if action == "rename column on target (schema drift)"]
+    assert line["detail"] == "boom"
+
+
+@pytest.mark.parametrize("two", [False, True])
+def test_fix_excluded_gone_hold_lists_the_withheld_statements_one_per_line(monkeypatch, two) -> None:
+    """The excluded legacy is gone from the source: every new column is held (it may be
+    legacy renamed). The statements to run by hand if it was dropped are a code block, one
+    per line, never two DDL joined on one line (one DDL per transaction); the rename branch
+    drops the NULL-only legacy before Change & reload."""
+    inventory = _g6_inventory([("id", "int"), ("notes", "text"), ("legacy", "blob")])
+    session, state, tones, _ = _g6_setup(monkeypatch, inventory=inventory)
+    state.restore_lob_exclusion("app.orders", "legacy")
+    cols = [("id", "int"), ("notes", "text"), ("a", "int")] + ([("b", "int")] if two else [])
+    _g4_stub_fix_dialog(monkeypatch, source_columns=cols, added=set(),
+                        target_columns=("id", "notes", "legacy"), target_pk=("id",))
+    ui = _g6_open(session, state)
+    assert "Fix target schema: app.orders" in ui.texts and not _g6_applies(ui)
+    (held,) = [n for n in tones if n[0] == "warning"]
+    assert held[1] == "Not added: the excluded column legacy is no longer on the source"
+    assert "ADD COLUMN" not in held[2]
+    assert 'drop legacy on Aurora DSQL by hand (ALTER TABLE "app"."orders" DROP COLUMN "legacy"' in held[2]
+    code = 'ALTER TABLE "app"."orders" ADD COLUMN "a" INT;'
+    if two:
+        code += '\nALTER TABLE "app"."orders" ADD COLUMN "b" INT;'
+        assert "run each statement below on Aurora DSQL yourself, on its own" in held[2]
+    else:
+        assert held[2].endswith("If it was dropped, run the statement below on Aurora DSQL yourself.")
+    assert code in ui.texts
+
+
+def test_fix_rule_held_rename_drops_the_old_column_before_change_and_reload(monkeypatch) -> None:
+    session, state, tones, _ = _g6_setup(monkeypatch)
+    state.restore_exclusion_rules("exclude app.orders.pw_*")
+    _g4_stub_fix_dialog(monkeypatch, source_columns=[("id", "int"), ("pw_note", "text")],
+                        added=set(), target_columns=("id", "notes"), target_pk=("id",))
+    ui = _g6_open(session, state)
+    (held,) = [n for n in tones if n[1] == "notes is not renamed to pw_note: your exclusion rules match pw_note"]
+    assert 'ALTER TABLE "app"."orders" DROP COLUMN "notes"' in held[2]
+    assert "the values it holds are the ones the rule keeps out" in held[2]
+    assert held[2].endswith("so it no longer matches it, and do not drop notes.")
+    assert not _g6_applies(ui)
+
+
+def test_fix_merges_the_new_columns_one_rule_holds_into_one_notice(monkeypatch) -> None:
+    """One teardown and redeploy keeps them all out: one notice, not one per column."""
+    session, state, tones, _ = _g6_setup(monkeypatch)
+    state.restore_exclusion_rules("exclude type:longtext")
+    _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("id", "int"), ("notes", "text"), ("a", "longtext"),
+                                     ("b", "longtext"), ("c", "longtext")],
+        added=set(), target_columns=("id", "notes"), target_pk=("id",),
+    )
+    ui = _g6_open(session, state)
+    warnings = [n for n in tones if n[0] == "warning"]
+    assert [n[1] for n in warnings] == ["Not added: your exclusion rules match a, b, c"]
+    body = warnings[0][2]
+    assert body.count("Delete CDC infrastructure") == 1 and "so CDC sends them" in body
+    assert not _g6_applies(ui) and "ADD COLUMN" not in "\n".join(ui.texts)
+    # A rule-held rename keeps its own notice (its header and remedy differ).
+    session2, state2, tones2, _ = _g6_setup(
+        monkeypatch, inventory=_g6_inventory([("id", "int"), ("notes", "longtext")])
+    )
+    state2.restore_exclusion_rules("exclude type:longtext")
+    _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("id", "int"), ("memo", "longtext"), ("a", "longtext"),
+                                     ("b", "longtext")],
+        added=set(), target_columns=("id", "notes"), target_pk=("id",),
+    )
+    _g6_open(session2, state2)
+    assert [n[1] for n in tones2 if n[0] == "warning"] == [
+        "notes is not renamed to memo: your exclusion rules match memo",
+        "Not added: your exclusion rules match a, b",
+    ]
+
+
+def _g6_pw_salt_rule(monkeypatch):
+    session, state, tones, _ = _g6_setup(monkeypatch)
+    state.restore_exclusion_rules("exclude app.orders.pw_*")
+    _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("id", "int"), ("notes", "text"), ("pw_salt", "text")],
+        added={"pw_salt"}, target_columns=("id", "notes"), target_pk=("id",),
+    )
+    return session, state, tones
+
+
+def _g6_assert_rules_unknown(ui, tones):
+    assert [n[1] for n in tones if n[0] == "warning"] == [
+        "Nothing is added or renamed: the exclusion rules could not be checked"
+    ]
+    assert not _g6_applies(ui) and "ADD COLUMN" not in "\n".join(
+        t for t in ui.texts if t.startswith("ALTER TABLE")
+    )
+
+
+def test_fix_adds_nothing_when_the_saved_rules_cannot_be_resolved(monkeypatch) -> None:
+    import dsql_migrator.core.exclusion_rules as exclusion_rules
+
+    session, state, tones = _g6_pw_salt_rule(monkeypatch)
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("resolver broke")
+
+    monkeypatch.setattr(exclusion_rules, "rule_matched_columns", _boom)
+    _g6_assert_rules_unknown(_g6_open(session, state), tones)
+
+
+def test_fix_adds_nothing_when_its_inputs_cannot_be_read(monkeypatch) -> None:
+    session, state, tones = _g6_pw_salt_rule(monkeypatch)
+
+    def _boom():
+        raise RuntimeError("rules read broke")
+
+    state.exclusion_rules_text = _boom  # the saved-rules read fails inside _fix_inputs
+    _g6_assert_rules_unknown(_g6_open(session, state), tones)
+
+
+def test_fix_refuses_when_only_the_live_target_key_names_the_renamed_column(monkeypatch) -> None:
+    """No message-key map and an inventory key of id: only Aurora DSQL's own primary key
+    (tenant_id, id) says tenant_id is a key column. A RENAME of it would be the 5k loss."""
+    inventory = _g6_inventory([("id", "int"), ("tenant_id", "int")])
+    session, state, tones, _ = _g6_setup(monkeypatch, inventory=inventory)
+    seen = _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("id", "int"), ("org_id", "int")], added=set(),
+        target_columns=("id", "tenant_id"), target_pk=("tenant_id", "id"),
+    )
+    ui = _g6_open(session, state)
+    (refusal,) = [n for n in tones if n[0] == "error"]
+    assert "tenant_id was renamed to org_id" in refusal[2]
+    assert not _g6_applies(ui) and seen["plans"] == [] and _g6_statements(ui) == []
+
+
+def test_fix_refuses_a_key_change_alone_with_both_keys(monkeypatch) -> None:
+    inventory = _g6_inventory([("id", "int"), ("tenant_id", "int")])
+    session, state, tones, _ = _g6_setup(monkeypatch, inventory=inventory)
+    _g4_stub_fix_dialog(
+        monkeypatch, source_columns=[("id", "int"), ("tenant_id", "int")], added=set(),
+        target_columns=("id", "tenant_id"), source_pk=("id", "tenant_id"), target_pk=("id",),
+    )
+    ui = _g6_open(session, state)
+    (refusal,) = [n for n in tones if n[0] == "error"]
+    assert refusal[2].startswith("On the source, the primary key was (id), now (id, tenant_id). ")
+    assert not _g6_applies(ui)
+
+
+def test_fix_renames_from_a_recheck_record_after_step1_was_rerun(monkeypatch) -> None:
+    from dsql_migrator.core.models import CdcCatalogDriftChange, CdcCatalogDriftFinding
+
+    inventory = _g6_inventory([("id", "int"), ("memo", "text")])  # Step 1 already re-run
+    session, state, tones, _ = _g6_setup(monkeypatch, inventory=inventory)
+    state.cdc_catalog_drift_findings = {"app.orders": CdcCatalogDriftFinding(
+        kinds=["rename-column"], first_seen_at=datetime.now(timezone.utc),
+        changes=[CdcCatalogDriftChange(kind="rename-column", column="notes", before="text",
+                                       after="memo")],
+    )}
+    _g4_stub_fix_dialog(monkeypatch, source_columns=[("id", "int"), ("memo", "text")],
+                        added=set(), target_columns=("id", "notes"), target_pk=("id",))
+    ui = _g6_open(session, state)
+    assert _g6_statements(ui) == ['ALTER TABLE "app"."orders" RENAME COLUMN "notes" TO "memo"']
+    (info,) = [n for n in tones if n[1] == "notes looks renamed to memo on the source"]
+    assert info[2].startswith("The source-schema re-check saw this rename.")
+
+
+class _G6TwoCodeCtl(_G1Ctl):
+    """Dead letters for app.orders: a missing column (42703) and a NOT NULL one (23502)."""
+
+    def dlq_errors(self, log_group, **kw):
+        self.kwargs.append(kw)
+        return [_g1_dlq("app.orders", 1, code="42703"), _g1_dlq("app.orders", 2, code="23502")]
+
+
+def test_a_dropped_rekey_column_beside_an_add_keeps_its_recheck_row(monkeypatch) -> None:
+    """The shared plan refuses a table whose CDC key column is gone, so this add-column
+    finding is unfixable although none of its adds is generated. Its re-check row (with the
+    key-column runbook) stays beside the dead-letter banner; still one Fix button."""
+    inventory = _g6_inventory([("id", "int"), ("tenant_id", "int")])
+    _g2_fake_nicegui(monkeypatch)
+    _g2_logged(monkeypatch)
+    _g2_factory(monkeypatch, _g4_mysql_rows([("id", "int", False), ("x", "varchar(10)", True)]))
+    session = _g2_session(pg=False)
+    session.set_target(_g4_target_config())
+    state = _g4_state(session, inventory=inventory)
+    state.cdc_deployed_message_key_columns = {"app.orders": ["tenant_id", "id"]}
+    state.set_cdc_controller(_G6TwoCodeCtl())
+    state.job_id = "job-cdc"
+    _ui, (poll,) = _g2_render(state, session)
+    _g2_poll(poll)
+    finding = state.cdc_catalog_drift_findings["app.orders"]
+    assert set(finding.kinds) == {"add-column", "drop-column"} and finding.fixable is False
+    ui, _ = _g2_render(state, session)
+    text = "\n".join(ui.texts)
+    assert "Source schema change detected" in text and _G4_HEADER in text
+    assert sum(b.text == "Fix target schema…" for b in ui.buttons) == 1
 
 
 def test_start_over_keeps_the_baseline_handle_and_clears_the_schema_findings() -> None:

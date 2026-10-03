@@ -77,11 +77,40 @@ below.
 
 You don't have to notice a source `ALTER` yourself. When dead-lettered records
 indicate the source shape changed, the tool **classifies the drift** by SQLSTATE
-(added column / dropped column / type change) and shows a **"Source schema change
-detected"** banner on the CDC step. For the common case — a source **`ADD COLUMN`** —
-it offers a **"Fix target schema…"** action that shows the exact `ALTER TABLE … ADD
-COLUMN` statements and applies them (one DDL per transaction); CDC then resumes. To
-backfill the rows that were set aside while the column was missing, re-run Step 1
+(added or renamed column / dropped column / type change) and shows a **"Source schema
+change detected"** banner on the CDC step. For an added or renamed column it offers
+**"Fix target schema…"**: it reads the table's live definition on both sides, shows the
+exact statements, and applies them only when you approve them (one DDL per transaction);
+CDC then resumes for that table.
+
+- A **new column** is added (`ALTER TABLE … ADD COLUMN`, nullable, no default).
+- A **renamed column** is renamed (`ALTER TABLE … RENAME COLUMN`) and keeps its values
+  when it looks like a rename: the Step 1 inventory has the old name at the same
+  position with the same type, the source schema re-check saw the rename, or the names
+  differ only in letter case. The catalog cannot tell a rename from a dropped column plus
+  an added one of the same type at the same position (an added column goes at the end
+  of the table), so if the source did that, cancel and add the column by hand: the
+  dialog shows the statement. Otherwise it is offered as an added column, with a
+  warning naming the Aurora DSQL column the source does not have; if that is the old
+  name, cancel and rename it by hand.
+- **Nothing changes for a table whose primary-key or CDC key column was renamed, removed
+  or changed.** CDC writes and deletes those rows by that key, so an added column would
+  not repair it: writes would keep failing and deletes would silently match no row.
+  Aurora DSQL cannot change a primary key in place or drop a primary-key column, so the
+  dialog gives the recreate steps instead: Stop CDC, re-run Step 1, re-apply the table in
+  Schema Conversion with **Replace**, reload it with **Drop & reload**, Start CDC (CDC
+  only: restore the key on the source or use **Start over**). A table CDC re-keys
+  (Composite key) also needs **Delete CDC infrastructure** and a new deploy.
+- **A column your exclusions keep out is not added**: a new column a saved exclusion
+  rule matches, an excluded column the source renamed, or any new column while an
+  excluded column is gone from the source. CDC still sends it and its rows keep being
+  dead-lettered until the capture list changes, even when the dialog adds or renames
+  other columns of that table; see
+  [§13.8](13-excluding-tables-and-columns.md#138-the-cdc-capture-list).
+- A **generated** column, or one of a type Aurora DSQL cannot hold, is not added; the
+  dialog says how to add it by hand.
+
+To backfill the rows that were set aside while the column was missing, re-run Step 1
 (Evaluation), Stop CDC, reload the table with **Drop & reload**, Start CDC, then
 re-check it in Validation (CHECKSUM is automatic for it). A dropped column or a changed
 type that Aurora DSQL rejects is surfaced the same way for you to resolve by hand (the
@@ -142,7 +171,9 @@ CDC monitor, Validation or Cut over is open — and compares them with the Step 
 (Evaluation) inventory the migration was built from: whether each table still exists,
 its column names (exactly, case included), types, NULL rules and primary key. Excluded
 columns and generated columns CDC does not capture are left out, and a column you added
-with **Fix target schema…** counts as part of the definition; defaults, comments,
+with **Fix target schema…** counts as part of the definition (a column it renamed does
+not: the check keeps reporting the rename, and holding Cut over, until you re-run Step
+1); defaults, comments,
 collations and indexes are not compared (a change there does not change a CDC row). A
 difference is shown on the CDC step ([§4.6](#the-source-schema-re-check)) and holds Cut
 over for that table until the source matches the Step 1 inventory again and the table
@@ -414,10 +445,12 @@ notices, beside the dead-letter queue card rather than in it:
   definition:
   - **Full Load + CDC:** re-run Step 1 (Evaluation) — the check then compares with it.
     Where the Aurora DSQL table must change too: let CDC catch up (Stream lag: caught
-    up), Stop CDC, drop a removed or renamed column on Aurora DSQL first (Drop & reload
-    does not destroy a target column the new definition no longer has), reload the
-    table on the Full Load step with **Drop & reload**, then Start CDC. Run no other DDL
-    on migrated tables while CDC is stopped.
+    up), Stop CDC, rename a renamed column on Aurora DSQL (**Fix target schema…** does
+    it) and drop a removed one there first (Drop & reload does not destroy a target
+    column the new definition no longer has; a primary-key column cannot be dropped on
+    Aurora DSQL, so re-apply that table in Schema Conversion with **Replace** instead),
+    reload the table on the Full Load step with **Drop & reload**, then Start CDC. Run
+    no other DDL on migrated tables while CDC is stopped.
   - **CDC only:** change the Aurora DSQL table by hand where it must follow the source,
     correct the rows CDC wrote since the change (they are not replayed), then re-run
     Step 1.
@@ -428,13 +461,19 @@ notices, beside the dead-letter queue card rather than in it:
     check, and Cut over asks you to acknowledge it.
   - Aurora DSQL cannot change a **primary key** in place: restore the key on the
     source, or (Full Load + CDC) re-run Step 1 and reload the table with **Drop &
-    reload**, which recreates it with the new key; for CDC only, use **Start over**.
-  - For a plain **added column** the notice offers **Fix target schema…** (unless the
-    dead-letter banner already offers it for that table). It adds the column to Aurora
-    DSQL, and the check counts it as part of the definition from then on. Re-run Step 1
-    too, so Validation compares the new column. It is not offered for a renamed column
-    (it would add an empty column and leave the old one), a key change, or a table where
-    an added column is generated (it would be added as a plain, empty column).
+    reload**, which recreates it with the new key; if a key column was renamed or
+    removed, first re-apply the table in Schema Conversion with **Replace** (Drop &
+    reload refuses to destroy the old key column, and Aurora DSQL cannot drop it); for
+    CDC only, use **Start over**.
+  - For an **added or renamed column** the notice offers **Fix target schema…** (unless
+    the dead-letter banner already offers it for that table). It adds a new column, or
+    renames a renamed one so it keeps its values; an added column counts as part of the
+    definition from then on, while a renamed one stays reported until you re-run Step 1.
+    Re-run Step 1 too, so Validation compares the column. It changes nothing for a key
+    change or a renamed primary-key or CDC key column, and it does not add a generated
+    column or a column your exclusions keep out; the dialog says why and what to do. For
+    a renamed CDC key column (Composite key) the notice offers no Fix and gives the
+    recreate steps itself.
   - Choose **Check again** after a change. If the re-read itself fails, or finds none of
     the captured tables (a reconnect to another database or user), the notice says so.
 - **Amber — "The source schema changed while CDC ran":** the source matches the Step 1

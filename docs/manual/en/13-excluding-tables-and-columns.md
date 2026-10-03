@@ -684,6 +684,25 @@ parameter value is limited to 4,096 bytes.
   Save, and Start Full Load is not held.
 - **A value the stack already carries is never refused.**
 
+**A column the source adds or renames after the rules were saved.** The list holds
+concrete column names, fixed when the rules were saved. A new column that a wildcard or
+`type:` rule matches, or an excluded column the source renames, is therefore captured,
+and every insert and update to that table that carries it is dead-lettered (SQLSTATE
+42703). **Fix target schema…** does not add it, because that would copy the data the
+rule keeps out. To keep it out: Stop CDC, **Delete CDC infrastructure**, then re-run
+Step 1 (Evaluation) so the rules see the column. For a renamed column, change the rule
+that excluded it so it matches the new name: a rule that names the old column now
+reports `No column "…"` and offers the fix when the names are close, while a wildcard
+that still matches other tables reports nothing and would let the column through. In
+Full load + CDC, also drop the old column on Aurora DSQL by hand first
+(`ALTER TABLE … DROP COLUMN …`; the dialog shows the statement): it holds only NULLs, or
+the values the rule keeps out, and Change & reload refuses to destroy a column the
+refreshed definition no longer has. Then save the rules as
+[Why the set locks](#why-the-set-locks) describes (Full load + CDC: **Change & reload**,
+which creates the column on Aurora DSQL as NULL), deploy again and Start CDC (on MySQL,
+see "Starting CDC again after a delete"). To replicate a new column instead, change the
+rule in the same steps so it no longer matches it.
+
 **What you see.**
 
 - In the popup: **CDC capture list (B of 4,096 bytes)**, computed by the same code as

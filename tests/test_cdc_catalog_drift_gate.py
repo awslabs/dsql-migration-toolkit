@@ -14,6 +14,7 @@ from dsql_migrator.core.cdc_catalog_drift import (
     KIND_ADD_COLUMN,
     KIND_DEFINITION_CHANGE,
     KIND_DROP_COLUMN,
+    KIND_RENAME_COLUMN,
     KIND_SOURCE_TABLE_MISSING,
     CatalogDiff,
     LiveColumn,
@@ -457,6 +458,7 @@ def test_every_label_and_why_and_the_engine_specific_ones() -> None:
     gen = _finding(kinds=("add-column",),
                    changes=[CdcCatalogDriftChange(kind="add-column", column="g", generated=True)])
     assert g4.kind_whys(gen, is_pg=True) == [g4._WHY_ADD_GENERATED]
+    assert "Fix target schema… does not add it" in g4._WHY_ADD_GENERATED
     row = g4.finding_row("app.orders", _finding(), is_pg=False)
     assert row.startswith("app.orders: column dropped at the source (dropped notes) — CDC no ")
 
@@ -464,6 +466,10 @@ def test_every_label_and_why_and_the_engine_specific_ones() -> None:
 def test_the_runbook_and_kind_sentences_follow_the_type_and_the_kinds() -> None:
     flc = _open_notice({"app.t": _finding()})
     assert "'Drop & reload'" in flc.runbook and "Run no other DDL" in flc.runbook
+    # A renamed column is renamed (Fix does it), never dropped; a key column is re-applied
+    # with Replace -- Aurora DSQL cannot drop it.
+    assert "Fix target schema… does it" in flc.runbook and "Replace" in flc.runbook
+    assert "Drop a removed or renamed column" not in flc.runbook
     cdc_only = _open_notice({"app.t": _finding()}, mtype=MigrationType.CDC_ONLY)
     assert "by hand" in cdc_only.runbook and "Drop & reload" not in cdc_only.runbook
     assert "renamed column" not in flc.tail and "primary key" not in flc.tail
@@ -476,14 +482,95 @@ def test_the_runbook_and_kind_sentences_follow_the_type_and_the_kinds() -> None:
                           changes=[CdcCatalogDriftChange(kind="add-column", column="x")]),
     }, fix={"app.d"})
     assert "A table not found on the source cannot be realigned here" in mixed.tail
-    assert "Do not use Fix target schema… for a renamed column" in mixed.tail
+    assert "Do not use Fix" not in mixed.tail
+    assert ("For a renamed column, Fix target schema… renames it on Aurora DSQL so it keeps "
+            "its values (not a primary-key or CDC key column, nor an excluded one)") in mixed.tail
     assert "re-run Step 1 and reload the table with 'Drop & reload'" in mixed.tail
-    assert ("For a plain added column, Fix target schema… adds it to Aurora DSQL now; then "
-            "re-run Step 1 so Validation can compare it.") in mixed.tail
+    assert "re-apply the table in Schema Conversion with Replace" in mixed.tail
+    assert ("For an added column, Fix target schema… adds it to Aurora DSQL now, except a "
+            "generated column or one your exclusions keep out (it says why and what to do "
+            "instead); then re-run Step 1 so Validation can compare it.") in mixed.tail
     key_cdc_only = _open_notice({"app.c": _finding(kinds=("key-change",), changes=[])},
                                 mtype=MigrationType.CDC_ONLY)
     assert "use Start over to migrate the table with its new key" in key_cdc_only.tail
+    assert "Replace" not in key_cdc_only.tail
     assert mixed.tail.index(g4.MONITOR_HOLD_SENTENCE) > mixed.tail.index("Fix target schema… adds")
+    # The plain-added sentence needs a fix table whose finding HAS an added column: a rename
+    # finding's Fix renames, so the sentence would describe a button that is not there.
+    rename_only = _open_notice(
+        {"app.b": _finding(kinds=("rename-column",), fixable=True, changes=[])}, fix={"app.b"}
+    )
+    assert "Fix target schema… renames it" in rename_only.tail
+    assert "For an added column" not in rename_only.tail
+    # A fixable rename is no re-key refusal.
+    assert "Composite key" not in rename_only.tail
+
+
+def test_the_probe_passes_the_effective_exclusions_apart_from_skip() -> None:
+    # A PostgreSQL STORED generated `g` (skipped, never excluded) renamed to a Fix-added `x`:
+    # the dialog would show a name-taken hold, so the row is fixable. Were the probe to pass
+    # ``skip`` as the exclusions, g would read as excluded and the hold (and Fix) vanish.
+    name = "app.orders"
+    base = TableDef(name=name, columns=[
+        ColumnDef(name="id", mysql_type="integer", nullable=False),
+        ColumnDef(name="g", mysql_type="integer", nullable=True, generated=True),
+        ColumnDef(name="n", mysql_type="text", nullable=True),
+    ], primary_key=["id"])
+    live = LiveTable(columns=(LiveColumn("id", "integer", False, False, 0),
+                              LiveColumn("x", "integer", True, True, 1),
+                              LiveColumn("n", "text", True, False, 2)),
+                     primary_key=frozenset({"id"}))
+    request = CatalogDriftRequest(tables=(base,), skip={name: frozenset({"g"})},
+                                  target_added={name: {"x": "integer"}},
+                                  source_type=SourceType.POSTGRES)
+    probe = build_catalog_drift_probe(request, {name: live}, started=T0, finished=T0)
+    assert probe.drift[name].kinds == (KIND_ADD_COLUMN,) and probe.drift[name].fixable is True
+
+
+def test_the_open_notice_gives_the_recreate_path_for_a_renamed_rekey_column() -> None:
+    """A rename finding the shared plan refuses with the source key unchanged renamed a CDC
+    key column (Composite key): there is no Fix button, and the runbook's "Fix target
+    schema… does it" would mislead without the recreate path the dialog's refusal gives."""
+    from dsql_migrator.core.cdc_catalog_drift import diff_table
+
+    base = _table(cols=(("id", "int", False), ("tenant_id", "int", True)))
+    live = _live(cols=(("id", "int", False), ("org_id", "int", True)))
+    diff = diff_table(base, live, rekey_columns={"tenant_id", "id"}, source_type=SourceType.MYSQL)
+    assert diff.kinds == ("rename-column",) and not diff.fixable
+    finding = _finding(kinds=diff.kinds, changes=list(diff.changes), fixable=diff.fixable)
+    flc = _open_notice({"app.t": finding})
+    assert ("In app.t, a renamed column is part of the key CDC writes and deletes by (Schema "
+            "Conversion's Composite key), so neither a rename nor Fix target schema… repairs "
+            "it") in flc.tail
+    assert "re-apply the table in Schema Conversion with Replace and choose the Composite key " \
+        "again" in flc.tail
+    assert "Delete CDC infrastructure and deploy it again before Start CDC" in flc.tail
+    cdc_only = _open_notice({"app.t": finding}, mtype=MigrationType.CDC_ONLY)
+    assert "rename it back on the source, or use Start over" in cdc_only.tail
+    assert "Replace" not in cdc_only.tail
+    # A key change already carries its own sentence.
+    keyed = _finding(kinds=("key-change", "rename-column"), changes=[])
+    assert "Composite key" not in _open_notice({"app.t": keyed}).tail
+
+
+def test_the_added_column_sentence_names_the_columns_the_dialog_does_not_add() -> None:
+    """A renamed excluded column reads as an added one to the re-check (it skips excluded
+    columns) and stays fixable so the dialog can explain -- but that dialog adds nothing, so
+    the sentence must not promise a plain add."""
+    from dsql_migrator.core.cdc_catalog_drift import diff_table
+    from dsql_migrator.core.cdc_schema_evolve import plan_target_fix
+
+    base = _table(cols=(("id", "int", False), ("ssn", "text", True)))
+    live = _live(cols=(("id", "int", False), ("ssn2", "text", True)))
+    diff = diff_table(base, live, skip={"ssn"}, source_type=SourceType.MYSQL)
+    assert diff.kinds == ("add-column",) and diff.fixable
+    plan = plan_target_fix("app.t", live, ["id", "ssn"], baseline=base, excluded={"ssn"},
+                           rule_matches={})
+    assert plan.steps == () and plan.held
+    finding = _finding(kinds=diff.kinds, changes=list(diff.changes), fixable=True)
+    tail = _open_notice({"app.t": finding}, fix={"app.t"}).tail
+    assert "except a generated column or one your exclusions keep out" in tail
+    assert "For a plain added column" not in tail
 
 
 def test_the_open_notice_says_why_a_read_cannot_clear_it() -> None:
@@ -749,6 +836,69 @@ def test_the_request_skips_exclusions_and_stored_generated_columns(monkeypatch) 
         started=T0, finished=T0,
     )
     assert probe.drift == {}  # doc / g dropped: not captured; x: added through Fix
+
+
+def test_the_request_carries_effective_exclusions_and_both_message_key_maps(monkeypatch) -> None:
+    def _t(name, cols, generated=()):
+        return TableDef(
+            name=name,
+            columns=[
+                ColumnDef(name=c, mysql_type="integer", nullable=c != "id",
+                          generated=c in generated,
+                          generated_kind="STORED" if c in generated else None,
+                          generated_expression="id * 2" if c in generated else None)
+                for c in cols
+            ],
+            primary_key=["id"],
+        )
+
+    t = _t("app.t", ("id", "tenant_id", "doc", "g"), generated=("g",))
+    u = _t("app.u", ("id", "org"))
+    inv = SourceInventory(tables=[t, u])
+    ms = _state(CatalogBaseline(inventory=inv, captured=(t, u),
+                                capture_names=frozenset({"app.t", "app.u"}),
+                                source_type=SourceType.POSTGRES))
+    import dsql_migrator.ui.data_migration._models as models
+
+    monkeypatch.setattr(models, "effective_lob_exclusions",
+                        lambda _ms, _inv, **_k: {"app.t": frozenset({"doc"})})
+    ms.set_cdc_message_key_columns({"app.t": ["tenant_id", "id"]})
+    ms.cdc_deployed_message_key_columns = {"app.u": ["org", "id"]}
+    assert g4.cdc_rekey_columns(ms) == {
+        "app.t": frozenset({"tenant_id", "id"}), "app.u": frozenset({"org", "id"}),
+    }
+    req = g4.catalog_drift_request(ms, g4.catalog_drift_baseline(ms))
+    assert req.rekey == {"app.t": frozenset({"tenant_id", "id"}),
+                         "app.u": frozenset({"org", "id"})}
+    # The effective exclusions only: a generated column is skipped, never "excluded".
+    assert req.excluded == {"app.t": frozenset({"doc"})}
+    assert req.skip == {"app.t": frozenset({"doc", "g"})}
+
+    def _live_t(second):
+        return LiveTable(
+            columns=(LiveColumn("id", "integer", False, False, 0),
+                     LiveColumn(second, "integer", True, False, 1),
+                     LiveColumn("doc", "integer", True, False, 2),
+                     LiveColumn("g", "integer", True, True, 3)),
+            primary_key=frozenset({"id"}),
+        )
+
+    live = {"app.t": _live_t("org_id"),
+            "app.u": LiveTable(columns=(LiveColumn("id", "integer", False, False, 0),
+                                        LiveColumn("org", "integer", True, False, 1)),
+                               primary_key=frozenset({"id"}))}
+    probe = build_catalog_drift_probe(req, live, started=T0, finished=T0)
+    # tenant_id (a re-key column) renamed to org_id: reported, and Fix is not offered.
+    renamed = probe.drift["app.t"]
+    assert renamed.kinds == (KIND_RENAME_COLUMN,) and renamed.fixable is False
+    # Without the re-key map the same rename is fixable (a plain column).
+    plain = build_catalog_drift_probe(
+        g4.CatalogDriftRequest(**{**req.__dict__, "rekey": {}}), live, started=T0, finished=T0
+    )
+    assert plain.drift["app.t"].fixable is True
+    # Unreadable maps are "no re-key known", never a crash.
+    broken = SimpleNamespace(cdc_message_key_columns=lambda: 1 / 0)
+    assert g4.cdc_rekey_columns(broken) == {}
 
 
 @pytest.mark.parametrize("mtype", [MigrationType.FULL_LOAD_AND_CDC, MigrationType.CDC_ONLY])

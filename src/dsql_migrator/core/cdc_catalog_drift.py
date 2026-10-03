@@ -107,6 +107,8 @@ class CatalogDiff:
     kinds: tuple
     changes: tuple
     more_changes: int = 0
+    # Fix target schema… has something to apply or explain for this table (the shared
+    # cdc_schema_evolve.plan_target_fix's offers_fix): no key change, not only generated adds.
     fixable: bool = False
 
 
@@ -349,6 +351,21 @@ def _cut(value: Optional[str]) -> Optional[str]:
     return text_value if len(text_value) <= _TYPE_TEXT_LIMIT else text_value[:_TYPE_TEXT_LIMIT] + "..."
 
 
+def same_recorded_type(recorded: Optional[str], live_type: str, *, source_type: object) -> bool:
+    """Whether a type text a finding STORED (bounded by :func:`_cut`) names ``live_type``.
+
+    A stored type longer than the limit is matched on its stored prefix (a long ENUM / SET
+    is common): a difference past that prefix cannot be seen from the stored text."""
+    if same_type(str(recorded or ""), live_type, source_type=source_type):
+        return True
+    text_value = str(recorded or "")
+    return (
+        text_value.endswith("...")
+        and len(text_value) == _TYPE_TEXT_LIMIT + 3
+        and _cut(str(live_type or "")) == text_value
+    )
+
+
 class _Base(NamedTuple):
     name: str
     type: str
@@ -365,6 +382,8 @@ def diff_table(
     skip: "frozenset[str] | set[str]" = frozenset(),
     target_added: "Optional[Mapping[str, str]]" = None,
     source_type: object = SourceType.MYSQL,
+    excluded: "Optional[frozenset[str] | set[str]]" = None,
+    rekey_columns: "frozenset[str] | set[str]" = frozenset(),
 ) -> Optional[CatalogDiff]:
     """How ``live`` differs from the baseline ``table_def`` (``None`` when it does not). Pure.
 
@@ -378,6 +397,13 @@ def diff_table(
     A dropped and an added column at the same position with the same type pair as one
     rename (each column at most once), which also catches a case-only rename. The primary
     key is compared as a SET of the source key, never the composite target key.
+
+    ``fixable`` comes from the SAME plan Fix target schema… shows
+    (``cdc_schema_evolve.plan_target_fix``), with the target assumed to hold the baseline
+    names plus ``target_added`` and no rule evaluated (the dialog reads the real target and
+    the saved rules): ``excluded`` are the effective exclusions (``None``: ``skip``) and
+    ``rekey_columns`` the table's ``message.key.columns``, so a renamed key or re-key column
+    is never fixable.
     """
     if live is None:
         return CatalogDiff(kinds=(KIND_SOURCE_TABLE_MISSING,), changes=())
@@ -487,15 +513,27 @@ def diff_table(
     order = {kind: i for i, kind in enumerate(KIND_ORDER)}
     changes.sort(key=lambda ch: (order.get(ch.kind, len(order)), ch.column or ""))
     kinds = tuple(k for k in KIND_ORDER if any(ch.kind == k for ch in changes))
-    # Over the FULL change list, before the cap. Every added column must be plain: Fix
-    # target schema applies its whole plan, which cannot tell a generated column apart, so a
-    # table that also gained a generated column would get it as a plain, empty column.
-    adds = [ch for ch in changes if ch.kind == KIND_ADD_COLUMN]
-    fixable = (
-        bool(adds)
-        and not any(ch.generated for ch in adds)
-        and not ({KIND_RENAME_COLUMN, KIND_KEY_CHANGE, KIND_SOURCE_TABLE_MISSING} & set(kinds))
-    )
+    # Over the FULL definitions, not the capped change list: the one plan Fix target schema…
+    # shows decides (it refuses a key change or a renamed key column, withholds a generated
+    # column and holds an excluded one).
+    fixable = False
+    if KIND_SOURCE_TABLE_MISSING not in kinds and (
+        {KIND_ADD_COLUMN, KIND_RENAME_COLUMN} & set(kinds)
+    ):
+        from dsql_migrator.core.cdc_schema_evolve import plan_target_fix
+
+        names = [c.name for c in (getattr(table_def, "columns", None) or ())]
+        names += [str(n) for n in sorted(target_added or {}) if n not in inventory_names]
+        fixable = plan_target_fix(
+            str(getattr(table_def, "name", "") or ""),
+            live,
+            names,
+            baseline=table_def,
+            rekey_columns=frozenset(rekey_columns or ()),
+            excluded=frozenset(skip if excluded is None else excluded),
+            rule_matches={},
+            source_type=SourceType.POSTGRES if _is_pg(source_type) else SourceType.MYSQL,
+        ).offers_fix
     return CatalogDiff(
         kinds=kinds,
         changes=tuple(changes[:CHANGE_LIMIT]),
@@ -711,6 +749,7 @@ __all__ = [
     "check_start_point",
     "diff_table",
     "read_live_catalog",
+    "same_recorded_type",
     "same_type",
     "split_qualified",
     "start_point_comparable",

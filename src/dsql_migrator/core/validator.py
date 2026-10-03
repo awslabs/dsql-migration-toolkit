@@ -275,7 +275,7 @@ def _source_pk_tokens(
 # precision/scale/unsigned detail the render depends on, the same choice
 # ``introspector.enrich_columns`` makes) and PostgreSQL
 # ``format_type(atttypid, atttypmod)`` (the same expression ``_pg_enrich_columns`` and
-# ``cdc_schema_evolve.read_source_columns`` use). Catalog-only and keyed on
+# ``cdc_catalog_drift.read_live_catalog`` use). Catalog-only and keyed on
 # schema+table: no table scan, no lock, one round trip -- read inside the validation
 # snapshot, so it keeps the source read-only (Property 1).
 _MYSQL_COLUMN_TYPES_SQL = (

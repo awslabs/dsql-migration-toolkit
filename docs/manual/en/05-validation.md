@@ -309,12 +309,12 @@ over use that record:
   the comparison renders each column from the Step 1 inventory, so it can match falsely
   (a `TINYINT(1)` widened to `INT` still compares as true or false).
 - **It clears in two steps.** First the source must match the Step 1 inventory again:
-  re-run Step 1 (Evaluation) so it holds the new definition (for a plain added column,
-  add it to Aurora DSQL with **Fix target schema…** first: Validation cannot compare a
-  column the Step 1 inventory does not have), or undo the change on the source — the
-  tool re-reads by itself, or choose **Check again**. Then the table must match in a
-  CHECKSUM comparison that **started more than a minute after** that; the report offers
-  **Re-check N table(s) with CHECKSUM**. A Step 1 re-run that changes a captured table's
+  re-run Step 1 (Evaluation) so it holds the new definition (for an added or renamed
+  column, add or rename it on Aurora DSQL with **Fix target schema…** first: Validation
+  cannot compare a column the Step 1 inventory does not have), or undo the change on the
+  source — the tool re-reads by itself, or choose **Check again**. Then the table must
+  match in a CHECKSUM comparison that **started more than a minute after** that; the
+  report offers **Re-check N table(s) with CHECKSUM**. A Step 1 re-run that changes a captured table's
   definition is treated the same way: values CDC applied before it may differ, so that
   table also needs a CHECKSUM started after the re-run.
 - **Cut over** makes **one fresh read** of the source definitions after the latest

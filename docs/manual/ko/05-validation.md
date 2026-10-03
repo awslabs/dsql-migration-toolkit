@@ -256,8 +256,8 @@ DDL은 거부되는 행 하나 없이 CDC가 쓰는 값을 바꿉니다 — null
   기준으로 렌더링하므로 잘못 일치할 수 있기 때문입니다(`INT`로 넓어진 `TINYINT(1)`은 여전히 true/false로
   비교됨).
 - **두 단계로 해소됩니다.** 먼저 소스가 다시 Step 1 인벤토리와 일치해야 합니다: Step 1(Evaluation)을 다시
-  실행해 새 정의를 담거나(단순히 추가된 컬럼은 먼저 **Fix target schema…**로 Aurora DSQL에 추가하세요:
-  Validation은 Step 1 인벤토리에 없는 컬럼을 비교할 수 없습니다), 소스의 변경을 되돌리세요 — 도구가 스스로 다시
+  실행해 새 정의를 담거나(추가되거나 이름이 바뀐 컬럼은 먼저 **Fix target schema…**로 Aurora DSQL에서 추가하거나
+  이름을 바꾸세요: Validation은 Step 1 인벤토리에 없는 컬럼을 비교할 수 없습니다), 소스의 변경을 되돌리세요 — 도구가 스스로 다시
   읽으며, **Check again**을 눌러도 됩니다. 그런 다음 그 시각보다 **1분 넘게
   뒤에 시작한** CHECKSUM 비교에서 테이블이 일치해야 합니다. 리포트는 **Re-check N table(s) with CHECKSUM**을
   제공합니다. 캡처 중인 테이블의 정의를 바꾸는 Step 1 재실행도 같이 다룹니다: 그 전에 CDC가 적용한 값이 다를

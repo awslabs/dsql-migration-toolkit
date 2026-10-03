@@ -258,17 +258,16 @@ def test_a_plain_added_column_is_fixable_and_a_generated_one_is_not() -> None:
     assert gen.kinds == (KIND_ADD_COLUMN,) and gen.changes[0].generated and not gen.fixable
 
 
-def test_a_plain_and_a_generated_added_column_together_are_not_fixable() -> None:
-    """Fix target schema applies its whole plan and cannot tell a generated column apart, so
-    offering it here would add the generated column as a plain, empty one -- while the row
-    says Fix is not offered for it."""
+def test_a_plain_and_a_generated_added_column_together_are_fixable_and_the_generated_one_is_withheld() -> None:
+    """The Fix plan reads the live generated flag and withholds the generated column, so the
+    plain one is offered (the row says Fix target schema… does not add the generated one)."""
     mixed = diff_table(
         _table(),
         _live(cols=(("id", "int", False), ("notes", "text", True), ("a", "int", True),
                     ("g", "int", True)), generated=("g",)),
         source_type=MYSQL,
     )
-    assert mixed.kinds == (KIND_ADD_COLUMN,) and not mixed.fixable
+    assert mixed.kinds == (KIND_ADD_COLUMN,) and mixed.fixable
     assert sorted((c.column, c.generated) for c in mixed.changes) == [("a", False), ("g", True)]
 
 
@@ -276,19 +275,89 @@ def test_a_rename_at_the_same_position_and_type_is_one_rename_even_case_only() -
     renamed = diff_table(
         _table(), _live(cols=(("id", "int", False), ("memo", "text", True))), source_type=MYSQL
     )
-    assert renamed.kinds == (KIND_RENAME_COLUMN,) and not renamed.fixable
+    # Fix target schema… renames it now (keeping its values), so the row offers it.
+    assert renamed.kinds == (KIND_RENAME_COLUMN,) and renamed.fixable
     assert (renamed.changes[0].column, renamed.changes[0].after) == ("notes", "memo")
     case = diff_table(
         _table(), _live(cols=(("id", "int", False), ("Notes", "text", True))), source_type=MYSQL
     )
-    assert case.kinds == (KIND_RENAME_COLUMN,)
-    # A rename next to a plain added column: Fix would add an empty column for the rename.
+    assert case.kinds == (KIND_RENAME_COLUMN,) and case.fixable
+    # A rename next to a plain added column: one RENAME and one ADD.
     plus_add = diff_table(
         _table(),
         _live(cols=(("id", "int", False), ("memo", "text", True), ("x", "int", True))),
         source_type=MYSQL,
     )
-    assert plus_add.kinds == (KIND_RENAME_COLUMN, KIND_ADD_COLUMN) and not plus_add.fixable
+    assert plus_add.kinds == (KIND_RENAME_COLUMN, KIND_ADD_COLUMN) and plus_add.fixable
+
+
+def test_a_renamed_primary_key_or_rekey_column_is_not_fixable() -> None:
+    # 5k: adding the new key column would turn the dead letters into silent loss.
+    pk = diff_table(
+        _table(), _live(cols=(("uid", "int", False), ("notes", "text", True)), pk=("uid",)),
+        source_type=MYSQL,
+    )
+    assert KIND_KEY_CHANGE in pk.kinds and not pk.fixable
+    base = _table(cols=(("id", "int", False), ("tenant_id", "int", False)))
+    live = _live(cols=(("id", "int", False), ("org_id", "int", False)))
+    plain = diff_table(base, live, source_type=MYSQL)
+    assert plain.kinds == (KIND_RENAME_COLUMN,) and plain.fixable
+    rekeyed = diff_table(base, live, source_type=MYSQL, rekey_columns={"tenant_id", "id"})
+    assert rekeyed.kinds == (KIND_RENAME_COLUMN,) and not rekeyed.fixable
+
+
+def test_a_renamed_excluded_column_stays_fixable_so_the_dialog_explains() -> None:
+    # The re-check skips the excluded blob, so it sees blob2 as added; the Fix plan pairs
+    # over every column and HOLDS it (never ADD, never RENAME) -- the dialog says why.
+    from dsql_migrator.core.cdc_schema_evolve import HELD_RENAMED_EXCLUDED, plan_target_fix
+
+    base = _table(cols=(("id", "int", False), ("blob", "longblob", True), ("n", "text", True)))
+    live = _live(cols=(("id", "int", False), ("blob2", "longblob", True), ("n", "text", True)))
+    diff = diff_table(base, live, skip={"blob"}, source_type=MYSQL)
+    assert diff.kinds == (KIND_ADD_COLUMN,) and diff.fixable
+    plan = plan_target_fix("app.orders", live, ["id", "blob", "n"], baseline=base,
+                           excluded={"blob"}, rule_matches={})
+    assert plan.steps == () and [h.reason for h in plan.held] == [HELD_RENAMED_EXCLUDED]
+
+
+def test_a_dropped_pg_generated_column_does_not_hold_an_added_one() -> None:
+    # A PostgreSQL STORED generated column is in ``skip`` but is not an exclusion: the
+    # probe passes the effective exclusions apart, so its drop holds no add.
+    from dsql_migrator.core.cdc_schema_evolve import AddColumnStep, plan_target_fix
+
+    base = _table(cols=(("id", "integer", False), ("g", "integer", True), ("n", "text", True)),
+                  generated=("g",))
+    live = _live(cols=(("id", "integer", False), ("n", "text", True), ("x", "integer", True)))
+    diff = diff_table(base, live, skip={"g"}, excluded=frozenset(), source_type=PG)
+    assert diff.kinds == (KIND_ADD_COLUMN,) and diff.fixable
+    plan = plan_target_fix("app.orders", live, ["id", "g", "n"], baseline=base,
+                           excluded=frozenset(), rule_matches={}, source_type=PG)
+    assert [type(s) for s in plan.steps] == [AddColumnStep] and plan.held == ()
+
+
+def test_an_excluded_column_renamed_onto_a_fix_added_name_is_not_fixable() -> None:
+    # `d` excluded, renamed `x` on the source; an earlier Fix added `x`; a generated `g` is
+    # new. The plan holds nothing it can explain (no name-taken for an excluded old name)
+    # and withholds g, so fixable is False -- only because `excluded` reaches the plan.
+    base = _table(cols=(("id", "int", False), ("d", "int", True), ("n", "text", True)))
+    live = _live(cols=(("id", "int", False), ("x", "int", True), ("n", "text", True),
+                       ("g", "int", True)), generated=("g",))
+    diff = diff_table(base, live, skip={"d"}, excluded={"d"}, target_added={"x": "int"},
+                      source_type=MYSQL)
+    assert diff.kinds == (KIND_ADD_COLUMN,) and not diff.fixable
+
+
+def test_same_recorded_type_matches_a_cut_type_on_its_stored_prefix() -> None:
+    from dsql_migrator.core.cdc_catalog_drift import _cut, same_recorded_type
+
+    enum = "enum('pending','processing','shipped','delivered','cancelled')"
+    assert same_recorded_type(enum, enum, source_type=MYSQL)
+    assert same_recorded_type("int(11)", "int", source_type=MYSQL)  # via same_type
+    assert same_recorded_type(_cut(enum), enum, source_type=MYSQL)
+    assert not same_recorded_type(_cut(enum), "varchar(64)", source_type=MYSQL)
+    # A short text that merely ends in "..." is not a cut one.
+    assert not same_recorded_type("enum('a')...", "enum('a','b')", source_type=MYSQL)
+    assert not same_recorded_type(None, "int", source_type=MYSQL)
 
 
 def test_a_drop_and_an_add_of_another_type_or_position_stay_apart() -> None:
