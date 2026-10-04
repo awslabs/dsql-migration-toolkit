@@ -87,4 +87,17 @@ final class DsqlDialect {
     List<String> conditions = pkColumns.stream().map(c -> quoteIdent(c) + " = ?").toList();
     return "DELETE FROM " + quoteQualified(table) + " WHERE " + String.join(" AND ", conditions);
   }
+
+  /**
+   * Build {@code DELETE FROM t WHERE k = ? AND NOT (c1 = ? AND c2 = ?)}: the row matched by
+   * the key, unless it already holds those values (a key column is NOT NULL, so the NOT never
+   * meets a NULL). Placeholders: the key columns, then the spared columns.
+   */
+  static String deleteUnlessSql(String table, List<String> keyColumns, List<String> unless) {
+    if (unless.isEmpty()) {
+      throw new IllegalArgumentException("delete-unless requires at least one spared column");
+    }
+    List<String> spared = unless.stream().map(c -> quoteIdent(c) + " = ?").toList();
+    return deleteSql(table, keyColumns) + " AND NOT (" + String.join(" AND ", spared) + ")";
+  }
 }

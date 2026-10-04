@@ -1367,9 +1367,10 @@ Resources:
   # Since G15 a re-keyed table on a stack with sink plugin v51 or later is keyed on its SOURCE
   # primary key instead (SinkKeyColumns -> the sink's target.key.columns; the table is left out
   # of message.key.columns): its deletes find the row by the source key once Aurora DSQL's
-  # unique index on it is valid. The Start prerequisite that BLOCKS a weak identity and the
-  # app's runtime REPLICA IDENTITY re-check, which holds Cut over, stay: they cover the index
-  # build window, an UPDATE of the leading column, USING INDEX and older infrastructure.
+  # unique index on it is valid, and an UPDATE with no old image then replaces the row holding
+  # that key. The Start prerequisite that BLOCKS a weak identity and the app's runtime
+  # REPLICA IDENTITY re-check, which holds Cut over, stay: they cover the index build window,
+  # an UPDATE missing an unchanged TOASTed value, USING INDEX and older infrastructure.
   #
   # --- Worker configuration: source connector (converters + Secrets Manager provider) ---
   # MSK Connect requires key.converter/value.converter in every WorkerConfiguration

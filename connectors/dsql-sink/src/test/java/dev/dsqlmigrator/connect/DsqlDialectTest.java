@@ -36,6 +36,19 @@ class DsqlDialectTest {
   }
 
   @Test
+  void deleteUnlessSparesARowAlreadyHoldingTheValues() {
+    assertEquals(
+        "DELETE FROM \"app\".\"orders\" WHERE \"id\" = ? AND NOT (\"lead\" = ?)",
+        DsqlDialect.deleteUnlessSql("app.orders", List.of("id"), List.of("lead")));
+    assertEquals(
+        "DELETE FROM \"t\" WHERE \"id\" = ? AND NOT (\"a\" = ? AND \"b\" = ?)",
+        DsqlDialect.deleteUnlessSql("t", List.of("id"), List.of("a", "b")));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> DsqlDialect.deleteUnlessSql("t", List.of("id"), List.of()));
+  }
+
+  @Test
   void quoteIdentEscapesEmbeddedQuotes() {
     assertEquals("\"we\"\"ird\"", DsqlDialect.quoteIdent("we\"ird"));
   }

@@ -439,8 +439,9 @@ CDC가 재키잉하는 테이블(소스 기본 키 밖의 컬럼을 더한 복�
 함께, 또는 **Drop & reload**가 테이블을 다시 만들 때는 로드 후에 `CREATE UNIQUE INDEX ASYNC`로 만들고, Aurora
 DSQL이 백그라운드에서 빌드합니다). 그 전까지는(예: Drop & reload 후 인덱스를 빌드하는 동안), 그리고 레코드를
 복합 키로 키잉하는 이전 버전이 배포한 CDC 인프라에서는 언제나, delete가 오류도 dead letter도 없이 Aurora DSQL에
-행을 남깁니다. 추가된 컬럼만 바꾸는 `UPDATE`는 dead letter로 격리되고(*a unique constraint rejected the row*)
-이전 행이 남습니다. 그래서 모니터가 `REPLICA IDENTITY`를 다시 읽고(그런 테이블 전체에 대해 읽기 전용 카탈로그
+행을 남깁니다. 추가된 컬럼만 바꾸는 `UPDATE`는 이전 이미지 없이 도착합니다: 그 인덱스가 만들어진 뒤에는
+싱크가 그 소스 기본 키를 가진 행을 새 행으로 교체하고, 그 전에는, 그리고 이전 인프라에서는 언제나, dead
+letter로 격리되고(*a unique constraint rejected the row*) 이전 행이 남습니다. 그래서 모니터가 `REPLICA IDENTITY`를 다시 읽고(그런 테이블 전체에 대해 읽기 전용 카탈로그
 쿼리 한 번, 최대 2분에 한 번, MySQL 소스에서는 하지 않음) 다음 알림을 보여 줍니다:
 
 - **빨간색 — "Deletes on re-keyed tables can be lost":** 테이블(또는 그 파티션 중 하나)이 FULL

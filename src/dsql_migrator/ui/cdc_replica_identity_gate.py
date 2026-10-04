@@ -11,11 +11,12 @@ PostgreSQL 17 (2026-10-03): a DELETE keyed on the composite key reached the sink
 ``{lead: 7, id: 2}`` -- 7 the column DEFAULT -- matched 0 rows on Aurora DSQL, and nothing was
 dead-lettered. Since G15, CDC infrastructure with sink plugin v51 or later keys such a table on
 its SOURCE primary key (SinkKeyColumns) and the sink deletes by that key once Aurora DSQL's
-unique index on it is valid, so the delete lands. The hold below stays for what that does not
-cover: the window before that index is valid (it is rebuilt after the load on a Drop & reload),
-an UPDATE of the leading column (dead-lettered 23505, the old row kept), ``USING INDEX`` (a
-placeholder in the source key itself) and infrastructure deployed by an earlier version. A lost
-DELETE is never replayed.
+unique index on it is valid, so the delete lands -- and an UPDATE of the leading column, which
+arrives with no old image, replaces the row holding that key. The hold below stays for what that
+does not cover: the window before that index is valid (it is rebuilt after the load on a Drop &
+reload; such an UPDATE is then dead-lettered 23505, the old row kept), an UPDATE whose new image
+lacks an unchanged TOASTed value, ``USING INDEX`` (a placeholder in the source key itself) and
+infrastructure deployed by an earlier version. A lost DELETE is never replayed.
 
 The Start prerequisite (``REPLICA_IDENTITY_COVERS_KEY``) checks this once. This module keeps
 checking while CDC runs, because ``ALTER TABLE ... REPLICA IDENTITY DEFAULT``, a new
@@ -1133,8 +1134,8 @@ def cutover_weak_notice(gate: ReplicaIdentityGate) -> Optional[tuple[str, str]]:
     body = (
         f"REPLICA IDENTITY on {_labelled(gate.weak)} is below FULL on the source, so their "
         "DELETEs (and UPDATEs that change the source primary key) can miss their rows on Aurora "
-        "DSQL with no error and no dead letter, and an UPDATE of the added key column alone is "
-        "dead-lettered and leaves the old row. Run ALTER TABLE <table> REPLICA IDENTITY FULL on "
+        "DSQL with no error and no dead letter, and an UPDATE of the added key column alone can "
+        "be dead-lettered and leave the old row. Run ALTER TABLE <table> REPLICA IDENTITY FULL on "
         "the source (on each partition of a partitioned table), then choose Check again. Once "
         "the tool reads FULL, each table must match in a CHECKSUM comparison started more "
         "than a minute later; Validation compares them by CHECKSUM automatically."

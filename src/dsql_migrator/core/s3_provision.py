@@ -624,8 +624,10 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 #     one transaction, weighing 2 rows in a chunk; consecutive moves of different rows send
 #     their deletes, then their inserts, as one batch each); a delete is keyed on the exact
 #     composite key of its before-image, or on the source key once SourceKeyIndex reads a
-#     valid unique index on it (one pg_index read per table, cached); its tombstone is
-#     skipped. The table is matched exactly (a case-only twin is another table). The app
+#     valid unique index on it (one pg_index read per table, cached); an UPDATE with no
+#     before-image (REPLICA IDENTITY DEFAULT) is then a move by the source key whose delete
+#     spares a row already at the new composite key -- unless its image lacks an unchanged
+#     TOASTed value -- and until then a plain upsert; its tombstone is skipped. The table is matched exactly (a case-only twin is another table). The app
 #     sends the property only to a stack whose PluginVersion is v51 or later
 #     (core.cdc.choose_rekey_routing); v51 is rebuilt in place to carry it.
 #   * G15 -- re-keyed tables (composite target key = an added leading column + the whole

@@ -70,6 +70,9 @@ class DsqlSinkRekeyTest {
       "DELETE FROM \"app\".\"orders\" WHERE \"lead\" = ? AND \"id\" = ?";
   private static final String DELETE_BY_SOURCE_KEY =
       "DELETE FROM \"app\".\"orders\" WHERE \"id\" = ?";
+  // The delete of an UPDATE whose old key is unknown: spares a row already at the new lead.
+  private static final String DELETE_UNLESS_AT =
+      "DELETE FROM \"app\".\"orders\" WHERE \"id\" = ? AND NOT (\"lead\" = ?)";
   private static final String UPSERT_COMPOSITE =
       "INSERT INTO \"app\".\"orders\" (\"lead\", \"id\", \"v\") VALUES (?, ?, ?) "
           + "ON CONFLICT (\"lead\", \"id\") DO UPDATE SET \"v\" = EXCLUDED.\"v\"";
@@ -241,13 +244,23 @@ class DsqlSinkRekeyTest {
         return; // another table: recorded only
       }
       if (sql.startsWith("DELETE")) {
-        Matcher m = WHERE_COLUMN.matcher(sql.substring(sql.indexOf(" WHERE ")));
+        // WHERE k = ? [AND NOT (c = ? ...)]: the row matched by k, unless it holds every c.
+        String where = sql.substring(sql.indexOf(" WHERE "));
+        int not = where.indexOf(" AND NOT (");
+        Matcher m = WHERE_COLUMN.matcher(not < 0 ? where : where.substring(0, not));
         Map<String, Object> wanted = new LinkedHashMap<>();
         int i = 0;
         while (m.find()) {
           wanted.put(m.group(1), binds.get(i++));
         }
-        working.removeIf(r -> matches(r, wanted));
+        Map<String, Object> spared = new LinkedHashMap<>();
+        if (not >= 0) {
+          Matcher u = WHERE_COLUMN.matcher(where.substring(not));
+          while (u.find()) {
+            spared.put(u.group(1), binds.get(i++));
+          }
+        }
+        working.removeIf(r -> matches(r, wanted) && (spared.isEmpty() || !matches(r, spared)));
         return;
       }
       Matcher cols = INSERT_COLUMNS.matcher(sql);
@@ -737,6 +750,195 @@ class DsqlSinkRekeyTest {
             new Executed(DELETE_EXACT, List.of(9, 3))),
         dsql.executed);
     assertEquals(List.of(List.of(4, 2, "x")), dsql.rows());
+  }
+
+  // --- An UPDATE with no before-image -----------------------------------------------------------
+
+  /** An UPDATE of {@code id} with NO before-image (REPLICA IDENTITY DEFAULT), new image given. */
+  private static SinkRecord blindUpdate(int lead, int id, String v) {
+    return record(ORDERS, sourceKey(id), "u", null, row(lead, id, v));
+  }
+
+  @Test
+  void anUpdateWithoutABeforeImageReplacesTheRowBySourceKeyOnceTheIndexIsValid() throws Exception {
+    // The live REPLICA IDENTITY DEFAULT failure: UPDATE lead 9 -> 11 of id 3 arrives with no
+    // before-image, so a plain upsert of (11, 3) hits the unique index on id beside (9, 3) --
+    // 23505, dead-lettered, the old row kept. Once that index is valid the row holding id 3 is
+    // deleted and the new image inserted, in one transaction. An UPDATE that left lead alone
+    // (id 4) cannot be told apart in the record, so the delete spares a row already at the new
+    // lead and the upsert updates it in place.
+    FakeDsql dsql = new FakeDsql();
+    dsql.seed(9, 3, "r3");
+    dsql.seed(9, 4, "r4");
+    RecordingReporter dlq = new RecordingReporter();
+    RekeyTask task = task(dsql, dlq, TARGET_KEYS).index(true);
+
+    task.put(List.of(blindUpdate(11, 3, "r3"), blindUpdate(9, 4, "r4b")));
+
+    assertEquals(
+        List.of(
+            new Executed(DELETE_UNLESS_AT, List.of(3, 11)),
+            new Executed(DELETE_UNLESS_AT, List.of(4, 9)),
+            new Executed(UPSERT_COMPOSITE, List.of(11, 3, "r3")),
+            new Executed(UPSERT_COMPOSITE, List.of(9, 4, "r4b"))),
+        dsql.executed);
+    assertEquals(List.of("prepare", "batch", "prepare", "batch", "commit"), dsql.calls);
+    assertEquals(List.of(List.of(9, 4, "r4b"), List.of(11, 3, "r3")), dsql.rows());
+    assertTrue(dlq.records.isEmpty());
+    // Each replicates one source UPDATE.
+    assertEquals(2L, applied(task, "updatesByTable", ORDERS));
+    assertEquals(0L, applied(task, "deletesByTable", ORDERS));
+    assertEquals(0L, applied(task, "insertsByTable", ORDERS));
+    assertEquals(1, task.indexLoads);
+  }
+
+  @Test
+  void anUpdateWithoutABeforeImageStaysAPlainUpsertUntilTheIndexIsValid() throws Exception {
+    // Without a valid unique index on id a delete by it would be a full scan: the UPDATE is
+    // the plain upsert it always was (right whenever lead did not change).
+    FakeDsql dsql = new FakeDsql();
+    dsql.seed(9, 4, "r4");
+    RekeyTask task = task(dsql, new RecordingReporter(), TARGET_KEYS).index(false);
+
+    task.put(List.of(blindUpdate(9, 4, "r4b")));
+
+    assertEquals(List.of(new Executed(UPSERT_COMPOSITE, List.of(9, 4, "r4b"))), dsql.executed);
+    assertEquals(List.of(List.of(9, 4, "r4b")), dsql.rows());
+    assertEquals(1, task.indexLoads);
+  }
+
+  @Test
+  void anUpdateWithoutABeforeImageWeighsTwoRowsOnlyOnceItIsAMove() throws Exception {
+    // batch.size 2: two replaced UPDATEs modify four rows, so they commit one per chunk; as
+    // plain upserts (index not valid) they are two rows, one chunk.
+    for (boolean indexValid : new boolean[] {false, true}) {
+      FakeDsql dsql = new FakeDsql();
+      dsql.seed(9, 3, "a");
+      dsql.seed(9, 4, "b");
+      RekeyTask task = task(dsql, new RecordingReporter(), TARGET_KEYS, 2).index(indexValid);
+
+      task.put(List.of(blindUpdate(9, 3, "c"), blindUpdate(9, 4, "d")));
+
+      assertEquals(indexValid ? 2 : 1, dsql.count("commit"), "indexValid=" + indexValid);
+      assertEquals(List.of(List.of(9, 3, "c"), List.of(9, 4, "d")), dsql.rows());
+    }
+  }
+
+  @Test
+  void anUpdateMissingAnUnchangedToastValueIsNeverReplaced() throws Exception {
+    // v is an unchanged TOASTed value the reselector could not fill: Debezium's placeholder,
+    // omitted from the image. A delete + re-insert would lose v; the partial upsert keeps it.
+    FakeDsql dsql = new FakeDsql();
+    dsql.seed(9, 3, "big");
+    RekeyTask task = task(dsql, new RecordingReporter(), TARGET_KEYS).index(true);
+
+    task.put(List.of(blindUpdate(9, 3, DebeziumEvents.TOAST_UNAVAILABLE_PLACEHOLDER)));
+
+    assertEquals(
+        List.of(
+            new Executed(
+                "INSERT INTO \"app\".\"orders\" (\"lead\", \"id\") VALUES (?, ?) "
+                    + "ON CONFLICT (\"lead\", \"id\") DO NOTHING",
+                List.of(9, 3))),
+        dsql.executed);
+    assertEquals(List.of(List.of(9, 3, "big")), dsql.rows());
+    assertEquals(0, task.indexLoads); // not a candidate: the index is never read for it
+  }
+
+  @Test
+  void aReplaceKeepsAColumnTheImageDoesNotCarryUnlessTheRowMoves() throws Exception {
+    // v is left out of capture (column.exclude.list drops it from the record), yet a row
+    // already on Aurora DSQL holds a value there. An UPDATE that keeps lead must not delete
+    // and re-insert that row -- it would lose v: the delete spares it and the upsert updates it
+    // in place. A row that really moves is re-inserted, as every move is, without v.
+    Schema narrow =
+        SchemaBuilder.struct()
+            .name("app.orders.Value")
+            .field("lead", Schema.INT32_SCHEMA)
+            .field("id", Schema.INT32_SCHEMA)
+            .optional()
+            .build();
+    Schema envelope =
+        SchemaBuilder.struct()
+            .name("Envelope")
+            .field("op", Schema.STRING_SCHEMA)
+            .field("before", narrow)
+            .field("after", narrow)
+            .field("source", SOURCE)
+            .build();
+    java.util.function.BiFunction<Integer, Integer, SinkRecord> narrowUpdate =
+        (lead, id) -> {
+          Struct value =
+              new Struct(envelope)
+                  .put("op", "u")
+                  .put("after", new Struct(narrow).put("lead", lead).put("id", id))
+                  .put(
+                      "source",
+                      new Struct(SOURCE)
+                          .put("connector", "postgresql")
+                          .put("schema", "app")
+                          .put("table", "orders"));
+          Struct key = sourceKey(id);
+          return new SinkRecord(
+              "dsqlcdc." + ORDERS, 0, key.schema(), key, envelope, value, offset++);
+        };
+    FakeDsql dsql = new FakeDsql();
+    dsql.seed(9, 3, "kept");
+    dsql.seed(9, 4, "moved");
+    RekeyTask task = task(dsql, new RecordingReporter(), TARGET_KEYS).index(true);
+
+    task.put(List.of(narrowUpdate.apply(9, 3), narrowUpdate.apply(11, 4)));
+
+    assertEquals(
+        java.util.Arrays.asList(
+            List.of(9, 3, "kept"), java.util.Arrays.asList(11, 4, null)),
+        dsql.rows());
+  }
+
+  @Test
+  void theSameRowUpdatedTwiceWithoutABeforeImageKeepsItsOrder() throws Exception {
+    // id 3: lead 9 -> 11 -> 12 in one put. The second UPDATE of the row starts a new group, so
+    // its delete runs after the first insert -- else, with no unique index on id enforced
+    // here to reject it, (11, 3) would survive beside (12, 3).
+    FakeDsql dsql = new FakeDsql();
+    dsql.uniqueSourceKey = false;
+    dsql.seed(9, 3, "a");
+    RekeyTask task = task(dsql, new RecordingReporter(), TARGET_KEYS).index(true);
+
+    task.put(List.of(blindUpdate(11, 3, "b"), blindUpdate(12, 3, "c")));
+
+    assertEquals(
+        List.of(
+            new Executed(DELETE_UNLESS_AT, List.of(3, 11)),
+            new Executed(UPSERT_COMPOSITE, List.of(11, 3, "b")),
+            new Executed(DELETE_UNLESS_AT, List.of(3, 12)),
+            new Executed(UPSERT_COMPOSITE, List.of(12, 3, "c"))),
+        dsql.executed);
+    assertEquals(List.of(List.of(12, 3, "c")), dsql.rows());
+  }
+
+  @Test
+  void aReplacedUpdateKeepsBothHalvesOnTheRowByRowReplay() throws Exception {
+    // A poison row sends the chunk to the one-row-per-transaction replay: the replaced UPDATE
+    // runs its delete and its insert in one transaction there too.
+    FakeDsql dsql = new FakeDsql();
+    dsql.seed(9, 3, "a");
+    dsql.failure =
+        (sql, binds) ->
+            sql.contains("\"items\"") ? new SQLException("check violation", "23514") : null;
+    RecordingReporter dlq = new RecordingReporter();
+    RekeyTask task = task(dsql, dlq, TARGET_KEYS).index(true);
+    Schema itemKey = SchemaBuilder.struct().field("id", Schema.INT32_SCHEMA).build();
+    SinkRecord poison = record(ITEMS, new Struct(itemKey).put("id", 1), "c", null, row(0, 1, "x"));
+
+    task.put(List.of(poison, blindUpdate(11, 3, "b")));
+
+    assertEquals(List.of(List.of(11, 3, "b")), dsql.rows());
+    assertEquals(1, dlq.records.size());
+    assertSame(poison, dlq.records.get(0));
+    List<String> tail = dsql.calls.subList(dsql.calls.size() - 5, dsql.calls.size());
+    assertEquals(List.of("prepare", "update", "prepare", "update", "commit"), tail);
+    assertEquals(1L, applied(task, "updatesByTable", ORDERS));
   }
 
   /** A move of {@code table} keyed {column: key} (any value, null included), lead 5 -> 9. */
@@ -1265,12 +1467,15 @@ class DsqlSinkRekeyTest {
   // --- Below REPLICA IDENTITY FULL ------------------------------------------------------------
 
   @Test
-  void aLeadingColumnUpdateWithoutABeforeImageIsDeadLetteredAndKeepsTheOldRow() throws Exception {
+  void aLeadingColumnUpdateWithoutABeforeImageIsDeadLetteredUntilTheIndexIsValid()
+      throws Exception {
     // PostgreSQL below FULL sends no old tuple for an UPDATE that leaves the source key alone,
-    // so an UPDATE of `lead` alone arrives as a plain upsert of the new composite key, which the
-    // unique index on id rejects (23505) while the old row exists: dead-lettered, the old row
-    // kept -- not a silent miss. The same on the composite-keyed path of CDC infrastructure
-    // deployed by an earlier version (Debezium keys it on the new composite key).
+    // so an UPDATE of `lead` alone arrives as an upsert of the new composite key. Until the
+    // unique index on id is valid it stays one, which that index rejects (23505) while the old
+    // row exists: dead-lettered, the old row kept -- not a silent miss. Once valid, the row
+    // holding id 4 is replaced (anUpdateWithoutABeforeImageReplacesTheRowBySourceKey...). The
+    // composite-keyed path of CDC infrastructure deployed by an earlier version (Debezium keys
+    // it on the new composite key) is dead-lettered the same way.
     for (boolean indexValid : new boolean[] {false, true}) {
       FakeDsql dsql = new FakeDsql();
       dsql.seed(5, 4, "a");
@@ -1278,9 +1483,14 @@ class DsqlSinkRekeyTest {
       task(dsql, dlq, TARGET_KEYS)
           .index(indexValid)
           .put(List.of(record(ORDERS, sourceKey(4), "u", null, row(9, 4, "b"))));
-      assertEquals(1, dlq.records.size());
-      assertEquals("23505", ((SQLException) dlq.causes.get(0)).getSQLState());
-      assertEquals(List.of(List.of(5, 4, "a")), dsql.rows());
+      if (indexValid) {
+        assertTrue(dlq.records.isEmpty(), () -> String.valueOf(dlq.causes));
+        assertEquals(List.of(List.of(9, 4, "b")), dsql.rows());
+      } else {
+        assertEquals(1, dlq.records.size());
+        assertEquals("23505", ((SQLException) dlq.causes.get(0)).getSQLState());
+        assertEquals(List.of(List.of(5, 4, "a")), dsql.rows());
+      }
     }
     FakeDsql legacy = new FakeDsql();
     legacy.seed(5, 4, "a");

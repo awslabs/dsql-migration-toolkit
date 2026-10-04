@@ -48,9 +48,12 @@ import org.apache.kafka.connect.sink.SinkRecord;
  * -- no primary-key column is ever updated in place); a delete is keyed on the EXACT composite
  * key of its before-image. Each carries the record key as its source key, which the task uses
  * instead once Aurora DSQL's unique index on those columns is valid (a REPLICA IDENTITY
- * DEFAULT before-image holds a placeholder in the added column, never its real value). Any
- * other record -- an unlisted table, a record still keyed on the composite key, a key that is
- * not a strict subset -- parses exactly as before.
+ * DEFAULT before-image holds a placeholder in the added column, never its real value). An
+ * UPDATE with no before-image (REPLICA IDENTITY DEFAULT sends none when the source key is
+ * unchanged) cannot tell whether the composite key moved: it is marked so the task replaces
+ * the row holding its source key once that index is valid ({@link ChangeEvent#oldKeyUnknown}).
+ * Any other record -- an unlisted table, a record still keyed on the composite key, a key that
+ * is not a strict subset -- parses exactly as before.
  */
 final class DebeziumEvents {
 
@@ -212,7 +215,7 @@ final class DebeziumEvents {
     }
     List<String> columns = new ArrayList<>();
     List<Object> values = new ArrayList<>();
-    extractAfterImage(after, columns, values, pgSource);
+    boolean complete = extractAfterImage(after, columns, values, pgSource);
     List<Object> pk = new ArrayList<>(composite.size());
     for (String column : composite) {
       int i = columns.indexOf(column);
@@ -239,10 +242,14 @@ final class DebeziumEvents {
     // (the source primary key) did not change, and its before-image holds the old value. A
     // primary-key column is never updated in place: the old row is deleted and the new image
     // inserted, in one transaction. No before-image (REPLICA IDENTITY DEFAULT on PostgreSQL
-    // sends none for an UPDATE that leaves the source key alone) -> a plain upsert.
+    // sends none for an UPDATE that leaves the source key alone): whether the composite key
+    // moved is unknown, so the task replaces the row holding the source key once Aurora DSQL's
+    // unique index on it is valid -- only for an after-image with every column, since the
+    // re-insert would drop an unchanged TOASTed value the partial upsert keeps. Else (and
+    // until then) a plain upsert.
     Struct before = optStruct(envelope, "before");
     if (before == null) {
-      return event;
+      return complete ? event.withOldKeyUnknown() : event;
     }
     List<Object> old = project(before, composite, pgSource);
     if (sameKey(old, pk)) {
@@ -568,20 +575,25 @@ final class DebeziumEvents {
    * large values" are text/blob, which ARE handled). The robust fix is Debezium's
    * {@code ReselectColumnsPostProcessor} (re-query the unavailable column from the source by
    * PK), to be enabled on the source connector and validated live in Phase F.
+   *
+   * @return false when a placeholder column was omitted (the image is partial), else true
    */
-  private static void extractAfterImage(
+  private static boolean extractAfterImage(
       Object after, List<String> names, List<Object> values, boolean dropToastPlaceholder) {
     if (!(after instanceof Struct struct)) {
-      return;
+      return true;
     }
+    boolean complete = true;
     for (Field field : struct.schema().fields()) {
       Object raw = rawFieldValue(struct, field);
       if (dropToastPlaceholder && isToastPlaceholder(raw)) {
+        complete = false;
         continue; // unchanged TOAST value: omit so the existing target value is kept
       }
       names.add(field.name());
       values.add(convertField(field, raw, dropToastPlaceholder));
     }
+    return complete;
   }
 
   /**

@@ -106,9 +106,11 @@ import software.amazon.awssdk.services.cloudwatch.model.StandardUnit;
  * deleted and the new image inserted in ONE transaction (it weighs 2 rows in a chunk); a delete
  * is keyed on the exact composite key of its before-image, or on the source key once Aurora
  * DSQL's unique index on it is valid ({@link SourceKeyIndex}: one catalog read per table, read
- * only when such a delete or move arrives, so a delete is never a full scan); and its
- * tombstone, which follows that delete on the same partition, is skipped. Every other table,
- * and an empty {@code target.key.columns}, takes exactly the path described above.
+ * only when such a delete or move arrives, so a delete is never a full scan); an UPDATE with no
+ * before-image (its old composite key unknown) is, once that index is valid, a move that
+ * replaces the row holding its source key, and until then a plain upsert; and its tombstone,
+ * which follows that delete on the same partition, is skipped. Every other table, and an empty
+ * {@code target.key.columns}, takes exactly the path described above.
  */
 public class DsqlSinkTask extends SinkTask {
 
@@ -400,8 +402,11 @@ public class DsqlSinkTask extends SinkTask {
       // A source-keyed delete or move (G15): key its delete on the SOURCE key once Aurora
       // DSQL's unique index on exactly those columns is valid -- a REPLICA IDENTITY DEFAULT
       // before-image carries a placeholder in the added column, so the exact composite key
-      // would match nothing -- else keep the exact composite key (never a full scan).
-      if (event.hasSourceKey() && (event.isDelete() || event.isMove())) {
+      // would match nothing -- else keep the exact composite key (never a full scan). An
+      // UPDATE whose old composite key is unknown (no before-image) becomes a move by the
+      // source key the same way, else stays a plain upsert.
+      if (event.hasSourceKey()
+          && (event.isDelete() || event.isMove() || event.oldKeyUnknown())) {
         event = sourceKeySwitch(event, now);
       }
       batch.add(new Applicable(record, event));
@@ -426,9 +431,10 @@ public class DsqlSinkTask extends SinkTask {
   }
 
   /**
-   * {@code event} (a source-keyed delete or move) with its delete keyed on the SOURCE key when
-   * the table's unique index on exactly those columns is valid, else unchanged. Never a source
-   * key with a NULL component (a {@code col = NULL} predicate matches nothing).
+   * {@code event} (a source-keyed delete, move, or UPDATE whose old composite key is unknown)
+   * with its delete keyed on the SOURCE key when the table's unique index on exactly those
+   * columns is valid, else unchanged. Never a source key with a NULL component (a
+   * {@code col = NULL} predicate matches nothing).
    */
   private ChangeEvent sourceKeySwitch(ChangeEvent event, long nowNanos) {
     List<Object> key = event.sourceKeyValues();
@@ -463,8 +469,8 @@ public class DsqlSinkTask extends SinkTask {
       total += estimateValueBytes(v);
     }
     if (event.isMove()) {
-      // A move also deletes its old row (G15): count the old key it matches on.
-      for (Object v : event.movedFromPkValues()) {
+      // A move also deletes its old row (G15): count the key that delete matches on.
+      for (Object v : event.moveDelete().pkValues()) {
         total += estimateValueBytes(v);
       }
     }
@@ -1148,6 +1154,9 @@ public class DsqlSinkTask extends SinkTask {
 
   /** Render the upsert/delete SQL for a change event (its batching group key). */
   static String renderSql(ChangeEvent event) {
+    if (event.isDelete() && event.unlessColumns() != null) {
+      return DsqlDialect.deleteUnlessSql(event.table(), event.pkColumns(), event.unlessColumns());
+    }
     return event.isDelete()
         ? DsqlDialect.deleteSql(event.table(), event.pkColumns())
         : DsqlDialect.upsertSql(event.table(), event.columns(), event.pkColumns());
@@ -1555,7 +1564,7 @@ public class DsqlSinkTask extends SinkTask {
   private static void bind(
       PreparedStatement ps, ChangeEvent event, java.sql.ParameterMetaData meta)
       throws SQLException {
-    List<Object> binds = event.isDelete() ? event.pkValues() : event.values();
+    List<Object> binds = event.isDelete() ? event.deleteBindValues() : event.values();
     for (int i = 0; i < binds.size(); i++) {
       Object value = binds.get(i);
       // The metadata is consulted only for a Number (boolean target?) or a Boolean (integer

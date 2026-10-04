@@ -630,10 +630,11 @@ def check_replica_identity_covers_key(
     (2026-10-03): the DELETE reached the sink keyed ``{lead: 7, id: 2}`` -- 7 the column
     DEFAULT, for a row whose lead was 5 -- matched 0 rows, and nothing was dead-lettered.
     Since G15, CDC infrastructure with sink plugin v51 or later keys such a table on its SOURCE
-    primary key and deletes by it once Aurora DSQL's unique index on it is valid. FULL is still
-    required: until that index is valid, on infrastructure deployed by an earlier version, and
-    for an UPDATE that changes only the added column (dead-lettered, the old row kept), a weak
-    identity still loses the change. INSERTs and other UPDATEs are not affected -- their
+    primary key and deletes by it once Aurora DSQL's unique index on it is valid; an UPDATE that
+    changes only the added column (it arrives with no old image) then replaces the row holding
+    that key. FULL is still required: until that index is valid and on infrastructure deployed
+    by an earlier version a weak identity still loses the change (such an UPDATE is
+    dead-lettered, the old row kept). INSERTs and other UPDATEs are not affected -- their
     after-image carries every column.
 
     The tool DOES widen the identity itself (``cdc_pg_slot.set_replica_identity_full``), but
@@ -769,9 +770,9 @@ def replica_identity_covers_key_result(
         f"key ({', '.join(table.primary_key or ()) or 'none'}). {_reason}, so a DELETE, or "
         f"an UPDATE that changes the source primary key, does not carry {missing} and can miss "
         "its row on Aurora DSQL with no error and no dead letter; an UPDATE of "
-        f"{missing} alone is dead-lettered (a unique constraint rejected the row) and leaves "
-        "the old row. INSERTs and other UPDATEs are not affected (their after-image carries "
-        "every column).",
+        f"{missing} alone can be dead-lettered (a unique constraint rejected the row) and "
+        "leave the old row. INSERTs and other UPDATEs are not affected (their after-image "
+        "carries every column).",
         f"Run ALTER TABLE {table.name} REPLICA IDENTITY FULL on the source, then re-run "
         "these checks. DEFAULT is not enough for a re-keyed table. The alternative is to "
         f"set {table.name} back to \"Keep source PK\" in Schema Conversion, which removes "

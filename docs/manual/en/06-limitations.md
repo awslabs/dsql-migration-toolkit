@@ -76,11 +76,11 @@ fails **loudly** where it can't.
     starts at `DEFAULT`). Below FULL, a `DELETE` on that table can leave its row on
     Aurora DSQL with no error and no dead letter — until Aurora DSQL has built the
     table's unique index on the source primary key, and always on CDC infrastructure
-    deployed by an earlier version — and an `UPDATE` that changes the added key column
-    is dead-lettered and leaves the old row. The prerequisites block Start. While the
-    Data Migration, Validation or Cut over step is open, the tool re-reads it at most
-    every 2 minutes: a red notice appears in the CDC monitor, and Cut over is held
-    until it is FULL again and the table matches by CHECKSUM
+    deployed by an earlier version — and in the same cases an `UPDATE` that changes the
+    added key column is dead-lettered and leaves the old row. The prerequisites block
+    Start. While the Data Migration, Validation or Cut over step is open, the tool
+    re-reads it at most every 2 minutes: a red notice appears in the CDC monitor, and Cut
+    over is held until it is FULL again and the table matches by CHECKSUM
     (see [§5.6](05-validation.md#56-re-keyed-postgresql-tables-and-cut-over)). After an
     app restart the re-check needs the source password again (reconnect on the Connect
     step). A drop and its reversal between two re-checks are not seen, so keep FULL in

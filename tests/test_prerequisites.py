@@ -2515,7 +2515,7 @@ def test_a_rekeyed_table_on_replica_identity_default_blocks_cdc() -> None:
     # It must name the missing column, the consequence, and which writes are affected --
     # otherwise the operator cannot tell this from the generic identity check above. An
     # UPDATE that changes the source primary key is affected too (its old key is the
-    # before-image); an UPDATE of the added column alone is dead-lettered instead.
+    # before-image); an UPDATE of the added column alone can be dead-lettered instead.
     assert "user_id" in blocked.detail
     assert blocked.title == "Re-keyed table's before-image carries its composite key"
     assert blocked.detail == (
@@ -2524,14 +2524,14 @@ def test_a_rekeyed_table_on_replica_identity_default_blocks_cdc() -> None:
         "(id). REPLICA IDENTITY is DEFAULT, so the UPDATE/DELETE before-image carries only "
         "the source primary key, so a DELETE, or an UPDATE that changes the source primary "
         "key, does not carry user_id and can miss its row on Aurora DSQL with no error and no "
-        "dead letter; an UPDATE of user_id alone is dead-lettered (a unique constraint "
-        "rejected the row) and leaves the old row. INSERTs and other UPDATEs are not affected "
+        "dead letter; an UPDATE of user_id alone can be dead-lettered (a unique constraint "
+        "rejected the row) and leave the old row. INSERTs and other UPDATEs are not affected "
         "(their after-image carries every column)."
     )
     # The two UPDATE cases are told apart: only a DELETE or a source-primary-key UPDATE is
-    # silent; an UPDATE of the added column alone is dead-lettered (23505).
+    # silent; an UPDATE of the added column alone can be dead-lettered (23505).
     assert "an UPDATE that changes a key column, does not carry" not in blocked.detail
-    assert "is dead-lettered" in blocked.detail and "leaves the old row" in blocked.detail
+    assert "can be dead-lettered" in blocked.detail and "leave the old row" in blocked.detail
     assert "SILENTLY LOST" not in blocked.detail
     assert "UPDATE are unaffected" not in blocked.detail
     # The mechanism is not claimed to be a NULL key (it is a placeholder, offline-proven).

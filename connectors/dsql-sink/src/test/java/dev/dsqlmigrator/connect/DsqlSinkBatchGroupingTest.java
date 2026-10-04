@@ -193,6 +193,21 @@ class DsqlSinkBatchGroupingTest {
         DsqlSinkTask.estimateModifiedBytes(afterImage)
             + DsqlSinkTask.estimateModifiedBytes(moved.moveDelete()),
         DsqlSinkTask.estimateModifiedBytes(moved));
+    // An UPDATE whose old key was unknown, replaced by its source key: the same, by that key.
+    ChangeEvent replaced =
+        afterImage
+            .withSourceKey(List.of("id"), List.of(1))
+            .withOldKeyUnknown()
+            .withMoveDeleteBySourceKey();
+    assertEquals(
+        DsqlSinkTask.estimateModifiedBytes(afterImage)
+            + DsqlSinkTask.estimateModifiedBytes(replaced.moveDelete()),
+        DsqlSinkTask.estimateModifiedBytes(replaced));
+    // Still an unknown old key (the index not yet valid): a plain upsert, its image only.
+    assertEquals(
+        DsqlSinkTask.estimateModifiedBytes(afterImage),
+        DsqlSinkTask.estimateModifiedBytes(
+            afterImage.withSourceKey(List.of("id"), List.of(1)).withOldKeyUnknown()));
   }
 
   @Test

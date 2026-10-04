@@ -549,7 +549,9 @@ the load when **Drop & reload** recreates the table; Aurora DSQL builds it in th
 background). Until then (for example while it builds after a Drop & reload), and always on
 CDC infrastructure deployed by an earlier version, which keys the records on the composite
 key, the delete leaves its row on Aurora DSQL with no error and no dead letter. An `UPDATE`
-that changes only the added column is dead-lettered (*a unique constraint rejected the row*)
+that changes only the added column arrives with no old image: once that index is built the
+sink replaces the row holding its source primary key with the new one; before then, and
+always on earlier infrastructure, it is dead-lettered (*a unique constraint rejected the row*)
 and leaves the old row. So the monitor re-reads `REPLICA IDENTITY` (one read-only catalog
 query for all such tables, at most every 2 minutes, never on a MySQL source) and shows these
 notices:

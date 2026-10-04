@@ -6002,7 +6002,7 @@ def _start_cdc_deploy(
                     + ", ".join(_rekeyed_full) + ". A DELETE, or an UPDATE that changes the "
                     "source primary key, must carry the added leading key column, or it can "
                     "miss its row on Aurora DSQL with no error; an UPDATE of the leading "
-                    "column alone is dead-lettered and leaves the old row. The tool sets "
+                    "column alone can be dead-lettered and leave the old row. The tool sets "
                     "REPLICA IDENTITY FULL during Full Load ONLY when that run also "
                     "provisions the replication slot — a Full-load-only run does not, and "
                     "neither does a CDC-only start. Run the CDC prerequisite checks: they "

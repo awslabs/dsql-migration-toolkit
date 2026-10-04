@@ -6,6 +6,7 @@
  */
 package dev.dsqlmigrator.connect;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -24,8 +25,9 @@ import java.util.List;
  * before-image) is deleted before the new image is upserted, in one transaction
  * ({@link #moveDelete()}). Once the target's unique index on the source key is valid, a
  * delete (or a move's delete) is keyed on the source key instead ({@link #keyedBySourceKey()},
- * {@link #withMoveDeleteBySourceKey()}). Every other event carries none of this and is
- * unchanged.
+ * {@link #withMoveDeleteBySourceKey()}), and an UPDATE whose old composite key is unknown
+ * ({@link #oldKeyUnknown()}) becomes a move that replaces the row holding its source key. Every
+ * other event carries none of this and is unchanged.
  */
 final class ChangeEvent {
 
@@ -65,6 +67,13 @@ final class ChangeEvent {
   private final List<Object> movedFromPkValues;
   // A move only: delete the old row by the source key (the unique index on it is valid).
   private final boolean moveBySourceKey;
+  // A source-keyed UPDATE with no before-image and a complete after-image (see
+  // withOldKeyUnknown); false for every other event, a move included.
+  private final boolean oldKeyUnknown;
+  // A delete only (the delete of a move whose old key was unknown, see moveDelete): the row
+  // matched by the key is spared when these columns already hold these values. Null otherwise.
+  private final List<String> unlessColumns;
+  private final List<Object> unlessValues;
 
   private ChangeEvent(
       String table,
@@ -78,7 +87,7 @@ final class ChangeEvent {
       long sourceTsMs) {
     this(
         table, delete, tombstone, netRowDelta, columns, values, pkColumns, pkValues, sourceTsMs,
-        null, null, null, false);
+        null, null, null, false, false, null, null);
   }
 
   private ChangeEvent(
@@ -94,7 +103,10 @@ final class ChangeEvent {
       List<String> sourceKeyColumns,
       List<Object> sourceKeyValues,
       List<Object> movedFromPkValues,
-      boolean moveBySourceKey) {
+      boolean moveBySourceKey,
+      boolean oldKeyUnknown,
+      List<String> unlessColumns,
+      List<Object> unlessValues) {
     this.table = table;
     this.delete = delete;
     this.tombstone = tombstone;
@@ -108,6 +120,9 @@ final class ChangeEvent {
     this.sourceKeyValues = sourceKeyValues;
     this.movedFromPkValues = movedFromPkValues;
     this.moveBySourceKey = moveBySourceKey;
+    this.oldKeyUnknown = oldKeyUnknown;
+    this.unlessColumns = unlessColumns;
+    this.unlessValues = unlessValues;
   }
 
   /** An UPDATE (op u): applied as an idempotent upsert; net row delta 0. */
@@ -217,7 +232,8 @@ final class ChangeEvent {
   ChangeEvent withSourceKey(List<String> columns, List<Object> values) {
     return new ChangeEvent(
         table, delete, tombstone, netRowDelta, this.columns, this.values, pkColumns, pkValues,
-        sourceTsMs, List.copyOf(columns), values, movedFromPkValues, moveBySourceKey);
+        sourceTsMs, List.copyOf(columns), values, movedFromPkValues, moveBySourceKey,
+        oldKeyUnknown, null, null);
   }
 
   /** This upsert as a move from the old composite key {@code oldPkValues}. */
@@ -227,7 +243,30 @@ final class ChangeEvent {
     }
     return new ChangeEvent(
         table, delete, tombstone, netRowDelta, columns, values, pkColumns, pkValues, sourceTsMs,
-        sourceKeyColumns, sourceKeyValues, oldPkValues, moveBySourceKey);
+        sourceKeyColumns, sourceKeyValues, oldPkValues, moveBySourceKey, false, null, null);
+  }
+
+  /**
+   * This source-keyed UPDATE, its old composite key unknown: the change record has no
+   * before-image (PostgreSQL REPLICA IDENTITY DEFAULT sends none for an UPDATE that leaves the
+   * source key alone), so whether a composite-key column changed cannot be told. Set only for an
+   * after-image that carries every column -- a re-insert of one missing an unchanged TOASTed
+   * value would lose it. DsqlSinkTask makes it a move by the source key once Aurora DSQL's unique
+   * index on it is valid ({@link #withMoveDeleteBySourceKey()}); until then it stays the plain
+   * upsert it is.
+   */
+  ChangeEvent withOldKeyUnknown() {
+    if (delete || isInsert() || movedFromPkValues != null || !hasSourceKey()) {
+      throw new IllegalStateException("only a source-keyed update can have an unknown old key");
+    }
+    return new ChangeEvent(
+        table, delete, tombstone, netRowDelta, columns, values, pkColumns, pkValues, sourceTsMs,
+        sourceKeyColumns, sourceKeyValues, null, moveBySourceKey, true, null, null);
+  }
+
+  /** True for a source-keyed UPDATE whose old composite key is unknown (see above). */
+  boolean oldKeyUnknown() {
+    return oldKeyUnknown;
   }
 
   /** True when the record was keyed on the source primary key (a source-keyed record). */
@@ -245,12 +284,18 @@ final class ChangeEvent {
     return sourceKeyValues;
   }
 
-  /** True for an UPDATE that changed a composite-key column: delete old, then upsert new. */
+  /**
+   * True for an UPDATE that changed a composite-key column -- or, once its delete is keyed on
+   * the source key, one whose old composite key is unknown: delete old, then upsert new.
+   */
   boolean isMove() {
-    return !delete && movedFromPkValues != null;
+    return !delete && (movedFromPkValues != null || moveBySourceKey);
   }
 
-  /** A move's OLD composite key (from the before-image); null unless {@link #isMove()}. */
+  /**
+   * A move's OLD composite key (from the before-image); null unless {@link #isMove()}, and for
+   * a move whose old key was unknown.
+   */
   List<Object> movedFromPkValues() {
     return movedFromPkValues;
   }
@@ -270,29 +315,80 @@ final class ChangeEvent {
     }
     return new ChangeEvent(
         table, true, tombstone, netRowDelta, List.of(), List.of(), sourceKeyColumns,
-        sourceKeyValues, sourceTsMs, sourceKeyColumns, sourceKeyValues, null, false);
+        sourceKeyValues, sourceTsMs, sourceKeyColumns, sourceKeyValues, null, false, false, null,
+        null);
   }
 
-  /** This move, its delete keyed on the SOURCE key (see {@link #keyedBySourceKey()}). */
+  /**
+   * This move -- or this UPDATE whose old composite key is unknown, which becomes one: the row
+   * holding its source key is replaced by the new image -- its delete keyed on the SOURCE key
+   * (see {@link #keyedBySourceKey()}).
+   */
   ChangeEvent withMoveDeleteBySourceKey() {
-    if (!isMove() || !hasSourceKey()) {
+    if (!(isMove() || oldKeyUnknown) || !hasSourceKey()) {
       throw new IllegalStateException("only a source-keyed move can delete by its source key");
     }
     return new ChangeEvent(
         table, delete, tombstone, netRowDelta, columns, values, pkColumns, pkValues, sourceTsMs,
-        sourceKeyColumns, sourceKeyValues, movedFromPkValues, true);
+        sourceKeyColumns, sourceKeyValues, movedFromPkValues, true, false, null, null);
   }
 
   /**
    * The DELETE a move runs before its upsert, in the same transaction: by the source key when
-   * {@link #movesBySourceKey()}, else by the exact OLD composite key.
+   * {@link #movesBySourceKey()}, else by the exact OLD composite key. For a move whose old key
+   * was unknown, the delete by the source key spares a row that already holds the NEW composite
+   * key ({@link #unlessColumns()}), so the upsert then updates it in place and keeps every column
+   * the image does not carry -- an excluded column, an unchanged TOASTed value.
    */
   ChangeEvent moveDelete() {
     if (!isMove()) {
       throw new IllegalStateException("not a move");
     }
-    return moveBySourceKey
-        ? ChangeEvent.delete(table, sourceKeyColumns, sourceKeyValues, sourceTsMs)
-        : ChangeEvent.delete(table, pkColumns, movedFromPkValues, sourceTsMs);
+    if (!moveBySourceKey) {
+      return ChangeEvent.delete(table, pkColumns, movedFromPkValues, sourceTsMs);
+    }
+    ChangeEvent bySourceKey =
+        ChangeEvent.delete(table, sourceKeyColumns, sourceKeyValues, sourceTsMs);
+    if (movedFromPkValues != null) {
+      return bySourceKey;
+    }
+    List<String> columns = new ArrayList<>();
+    List<Object> values = new ArrayList<>();
+    for (int i = 0; i < pkColumns.size(); i++) {
+      if (!sourceKeyColumns.contains(pkColumns.get(i))) {
+        columns.add(pkColumns.get(i));
+        values.add(pkValues.get(i));
+      }
+    }
+    if (columns.isEmpty()) {
+      return bySourceKey; // no column outside the source key: nothing to compare
+    }
+    return new ChangeEvent(
+        table, true, false, -1, List.of(), List.of(), bySourceKey.pkColumns, sourceKeyValues,
+        sourceTsMs, null, null, null, false, false, List.copyOf(columns), values);
+  }
+
+  /**
+   * A delete's spared columns: the row matched by its key is kept when these columns already
+   * hold {@link #unlessValues()} ({@link #moveDelete()}); null for every other event.
+   */
+  List<String> unlessColumns() {
+    return unlessColumns;
+  }
+
+  /** The values {@link #unlessColumns()} are compared with; null for every other event. */
+  List<Object> unlessValues() {
+    return unlessValues;
+  }
+
+  /** The values a delete binds, in placeholder order: its key, then any spared columns. */
+  List<Object> deleteBindValues() {
+    if (unlessValues == null) {
+      return pkValues;
+    }
+    List<Object> out = new ArrayList<>(pkValues.size() + unlessValues.size());
+    out.addAll(pkValues);
+    out.addAll(unlessValues);
+    return out;
   }
 }

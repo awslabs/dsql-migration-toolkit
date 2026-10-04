@@ -157,9 +157,9 @@ def rekeyed_tables_needing_full_identity(
     fills it with a placeholder (live-confirmed on PostgreSQL 17: the column DEFAULT). A
     DELETE keyed on the composite key then misses its row on Aurora DSQL SILENTLY -- no error,
     no dead letter. Since G15 a sink with plugin v51 or later keys such a table on the source
-    primary key and deletes by it once the unique index on it is valid; until then, on older
-    infrastructure, and for an UPDATE of the leading column, the weak identity still loses the
-    change. Such a table
+    primary key and deletes by it once the unique index on it is valid (an UPDATE of the leading
+    column, which then has no old image, replaces the row holding that key); until then and on
+    older infrastructure the weak identity still loses the change. Such a table
     needs ``REPLICA IDENTITY FULL`` (the before-image then carries every column). A re-key
     that only REORDERS existing PK columns adds nothing outside the PK, so DEFAULT identity
     already covers it and it is NOT returned. (MySQL is immune -- its binlog before-image is

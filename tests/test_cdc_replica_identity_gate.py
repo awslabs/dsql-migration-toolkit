@@ -636,10 +636,11 @@ def test_g15_copy_says_a_change_can_be_lost_on_any_infrastructure():
         "REPLICA IDENTITY on app.t (REPLICA IDENTITY DEFAULT) is below FULL on the source, so "
         "their DELETEs (and UPDATEs that change the source primary key) can miss their rows on "
         "Aurora DSQL with no error and no dead letter, and an UPDATE of the added key column "
-        "alone is dead-lettered and leaves the old row."
+        "alone can be dead-lettered and leave the old row."
     ), body
-    # An UPDATE of the added key column alone IS dead-lettered (23505 on the unique index over
-    # the source key): it must not be lumped in with the silent "no dead letter" case.
+    # An UPDATE of the added key column alone CAN be dead-lettered (23505 on the unique index
+    # over the source key, until it is valid): it must not be lumped in with the silent "no
+    # dead letter" case.
     assert "(and UPDATEs that change a key column) can miss" not in body
     assert "REPLICA IDENTITY FULL" in body and "Check again" in body
     status, action, detail = _transition_line(

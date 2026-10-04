@@ -2614,6 +2614,13 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
         # sink writes them by the composite target key read from target.key.columns, so a
         # leading-column change is one ordered move and a DELETE never misses its row.
         "source-keyed composite writes": b"target.key.columns",
+        # v51 (G15, live follow-up): an UPDATE with no before-image (REPLICA IDENTITY DEFAULT)
+        # replaces the row holding its source key once the unique index on it is valid,
+        # instead of an upsert the index rejects (23505, the old row kept).
+        "unknown old key replace": b"can have an unknown old key",
+        # ...and its delete spares a row already at the new composite key, so an UPDATE that
+        # kept the key is updated in place (an excluded column keeps its value).
+        "replace spares an unmoved row": b" AND NOT (",
         # v51 (G8): a value its Aurora DSQL column cannot hold exactly is REFUSED pre-write
         # with a value-free reason -- not stored as true (boolean) or rounded (numeric/int).
         "value-fit refusal": b"Value does not fit target column '",

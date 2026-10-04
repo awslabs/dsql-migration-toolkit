@@ -893,14 +893,65 @@ class DebeziumEventsTest {
   }
 
   @Test
-  void updateWithoutABeforeImageIsAPlainUpsert() {
+  void updateWithoutABeforeImageHasAnUnknownOldKey() {
     // PostgreSQL REPLICA IDENTITY DEFAULT sends no old tuple for an UPDATE that leaves the
-    // source key alone: nothing to compare, so a plain upsert by the after-image's key.
+    // source key alone: whether lead changed cannot be told. It stays an upsert by the
+    // after-image's key -- not a move -- until the task keys its delete on the source key.
     ChangeEvent event =
         DebeziumEvents.parse(leadRecord("u", null, leadRow(9L, 2L, "b")), REKEYED);
     assertTrue(event.isUpdate());
     assertFalse(event.isMove());
+    assertTrue(event.oldKeyUnknown());
     assertEquals(List.of(9L, 2L), event.pkValues());
+    assertEquals(List.of(2L), event.sourceKeyValues());
+
+    // Once the unique index on the source key is valid: a move that replaces the row holding
+    // id 2 by the new image -- its delete spares a row that already holds lead 9, which the
+    // upsert then updates in place.
+    ChangeEvent replace = event.withMoveDeleteBySourceKey();
+    assertTrue(replace.isMove());
+    assertTrue(replace.isUpdate());
+    assertFalse(replace.oldKeyUnknown());
+    assertNull(replace.movedFromPkValues());
+    assertEquals(List.of(9L, 2L), replace.pkValues());
+    ChangeEvent delete = replace.moveDelete();
+    assertTrue(delete.isDelete());
+    assertEquals(List.of("id"), delete.pkColumns());
+    assertEquals(List.of(2L), delete.pkValues());
+    assertEquals(List.of("lead"), delete.unlessColumns());
+    assertEquals(List.of(9L), delete.unlessValues());
+    assertEquals(List.of(2L, 9L), delete.deleteBindValues());
+    assertEquals(
+        "DELETE FROM \"app\".\"orders\" WHERE \"id\" = ? AND NOT (\"lead\" = ?)",
+        DsqlSinkTask.renderSql(delete));
+    // A move from a KNOWN old key deletes unconditionally (old != new by construction).
+    ChangeEvent known =
+        DebeziumEvents.parse(
+                leadRecord("u", leadRow(5L, 2L, "a"), leadRow(9L, 2L, "b")), REKEYED)
+            .withMoveDeleteBySourceKey()
+            .moveDelete();
+    assertNull(known.unlessColumns());
+    assertEquals(List.of(2L), known.deleteBindValues());
+
+    // Only an UPDATE of a source-keyed table: an insert, an UPDATE with a before-image (moved
+    // or not) and an UPDATE of a table that is not re-keyed never have an unknown old key.
+    assertFalse(
+        DebeziumEvents.parse(leadRecord("c", null, leadRow(9L, 2L, "b")), REKEYED)
+            .oldKeyUnknown());
+    assertFalse(
+        DebeziumEvents.parse(
+                leadRecord("u", leadRow(5L, 2L, "a"), leadRow(9L, 2L, "b")), REKEYED)
+            .oldKeyUnknown());
+    assertFalse(
+        DebeziumEvents.parse(
+                leadRecord("u", leadRow(9L, 2L, "a"), leadRow(9L, 2L, "b")), REKEYED)
+            .oldKeyUnknown());
+    assertFalse(DebeziumEvents.parse(leadRecord("u", null, leadRow(9L, 2L, "b"))).oldKeyUnknown());
+    assertThrows(
+        IllegalStateException.class,
+        () ->
+            DebeziumEvents.parse(leadRecord("u", null, leadRow(9L, 2L, "b")))
+                .withMoveDeleteBySourceKey());
   }
 
   @Test

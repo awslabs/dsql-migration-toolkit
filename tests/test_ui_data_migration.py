@@ -31575,7 +31575,7 @@ def test_the_postgres_start_warning_says_a_rekeyed_change_can_miss_its_row(monke
         "These tables have a composite (re-keyed) primary key: app.orders. A DELETE, or an "
         "UPDATE that changes the source primary key, must carry the added leading key column, "
         "or it can miss its row on Aurora DSQL with no error; an UPDATE of the leading column "
-        "alone is dead-lettered and leaves the old row. The tool sets REPLICA IDENTITY FULL "
+        "alone can be dead-lettered and leave the old row. The tool sets REPLICA IDENTITY FULL "
         "during Full Load ONLY when"
     ), warning["body"]
     assert "an UPDATE that changes a key column, must carry" not in warning["body"]

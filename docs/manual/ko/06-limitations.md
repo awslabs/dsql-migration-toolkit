@@ -65,8 +65,8 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
     **CDC 실행 내내 테이블과 모든 파티션에 `REPLICA IDENTITY FULL`**이 필요합니다(나중에 만든 파티션은
     `DEFAULT`로 시작). FULL 미만이면 그 테이블의 `DELETE`가 오류도 dead letter도 없이 Aurora DSQL에 행을
     남길 수 있습니다 — Aurora DSQL이 소스 기본 키에 대한 테이블의 고유 인덱스를 다 만들기 전까지, 그리고 이전
-    버전이 배포한 CDC 인프라에서는 언제나 — 그리고 추가된 키 컬럼을 바꾸는 `UPDATE`는 dead letter로 격리되고
-    이전 행이 남습니다. 사전 점검이 Start를
+    버전이 배포한 CDC 인프라에서는 언제나 — 그리고 같은 경우에 추가된 키 컬럼을 바꾸는 `UPDATE`는 dead letter로
+    격리되고 이전 행이 남습니다. 사전 점검이 Start를
     차단합니다. Data Migration, Validation 또는 Cut over 단계가 열려 있는 동안 도구는 최대 2분마다 이를
     다시 읽습니다: CDC 모니터에 빨간 알림이 나타나고, 다시 FULL이 되고 테이블이 CHECKSUM으로 일치할 때까지
     Cut over가 보류됩니다([§5.6](05-validation.md#56-재키잉된-postgresql-테이블과-컷오버) 참고). 앱 재시작
