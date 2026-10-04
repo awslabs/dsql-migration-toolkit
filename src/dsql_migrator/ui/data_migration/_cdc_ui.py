@@ -5877,7 +5877,8 @@ def _start_cdc_deploy(
         return
     # Composite-PK re-key: scope the stored key map to the tables actually being
     # replicated, then gate the ONE precondition -- a composite key column must not
-    # be dropped at capture (column.exclude.list), or Debezium can't build the key.
+    # be dropped at capture (column.exclude.list), or CDC can't build the composite key
+    # (Debezium's record key, or the sink's from the row image on a v51+ stack).
     selected_names = {t.name for t in tables_for_config}
     message_key_columns = {
         table: cols
@@ -5941,7 +5942,7 @@ def _start_cdc_deploy(
             header="Composite key column is excluded from capture",
             body=(
                 "These composite primary-key columns are in the column exclude list, "
-                "so Debezium cannot read them to build the record key: "
+                "so CDC cannot build the composite primary key of their changes: "
                 + ", ".join(bad_key_cols)
                 + ". Remove them from the LOB-exclusion selection before starting CDC "
                 "(a key column is small and safe to capture)."
@@ -5949,10 +5950,13 @@ def _start_cdc_deploy(
         )
         return
     # FIX 1 (PostgreSQL): a COMPOSITE_KEY re-key prepends a non-PK "leading" column to the
-    # CDC record key. Under REPLICA IDENTITY DEFAULT the UPDATE/DELETE before-image carries
-    # only the source PK, so the DELETE does not carry the leading column and does not
-    # remove its row on Aurora DSQL -- silently (Debezium fills the absent NOT NULL column
-    # with a placeholder, offline-proven, so the sink's NULL-key guard cannot fire). The
+    # target primary key. Under REPLICA IDENTITY DEFAULT the UPDATE/DELETE before-image
+    # carries only the source PK, so the DELETE does not carry the leading column: Debezium
+    # fills it with a placeholder (live-confirmed on PostgreSQL 17: the column DEFAULT), so
+    # the sink's NULL-key guard cannot fire and a delete keyed on the composite key misses
+    # its row silently. Since G15 a v51+ sink deletes by the source key once the unique index
+    # on it is valid, but not before, not on older infrastructure, and not for an UPDATE of
+    # the leading column -- so FULL stays required. The
     # tool sets REPLICA IDENTITY FULL on exactly those tables during Full Load provisioning
     # (cdc_pg_slot); surface the requirement here so a CDC-only start (no Full Load in this
     # session) knows it must be set on the source first, and that it must STAY FULL: while
@@ -5994,10 +5998,11 @@ def _start_cdc_deploy(
                 tone="warning",
                 header="Re-keyed tables need REPLICA IDENTITY FULL on the source",
                 body=(
-                    "These tables are keyed on a composite (re-keyed) primary key, so a "
-                    "DELETE must carry the added leading key column or it does not remove "
-                    "the row on Aurora DSQL and is silently lost: "
-                    + ", ".join(_rekeyed_full) + ". The tool sets "
+                    "These tables have a composite (re-keyed) primary key: "
+                    + ", ".join(_rekeyed_full) + ". A DELETE, or an UPDATE that changes the "
+                    "source primary key, must carry the added leading key column, or it can "
+                    "miss its row on Aurora DSQL with no error; an UPDATE of the leading "
+                    "column alone is dead-lettered and leaves the old row. The tool sets "
                     "REPLICA IDENTITY FULL during Full Load ONLY when that run also "
                     "provisions the replication slot — a Full-load-only run does not, and "
                     "neither does a CDC-only start. Run the CDC prerequisite checks: they "

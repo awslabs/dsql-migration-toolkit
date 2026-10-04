@@ -86,10 +86,14 @@ single rightmost partition. Key points:
   and upserts must use the new composite key, and the leading column must be
   immutable** (DSQL primary keys cannot be updated in place).
 - **Full Load and CDC both handle it.** Full Load's idempotent
-  `INSERT ... ON CONFLICT` keys on the target composite key; CDC needs **no
-  connector or plugin change** — the Debezium source is re-keyed (via
-  `message.key.columns`) so each change record's key matches the target composite
-  key, and the sink's upsert/delete apply against it unchanged. On a **PostgreSQL**
+  `INSERT ... ON CONFLICT` keys on the target composite key. CDC keys each change
+  record on the **source** primary key, so every change to a row — including one that
+  moves it to another leading value — stays in order on one Kafka partition; the sink
+  writes it by the composite key, and an `UPDATE` of the leading column becomes a
+  delete of the old row and an insert of the new one in one transaction. This needs
+  CDC infrastructure deployed by this version (sink plugin v51 or later); older
+  infrastructure keeps the records keyed on the composite key
+  ([Chapter 6](06-limitations.md)). Both engines. On a **PostgreSQL**
   source this holds only with **`REPLICA IDENTITY FULL` on the table and every
   partition for the whole run** — a `DELETE` otherwise does not carry the added key
   column. The prerequisites block Start without it, and the CDC monitor re-checks it

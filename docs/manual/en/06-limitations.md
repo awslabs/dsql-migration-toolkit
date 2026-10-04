@@ -73,9 +73,11 @@ fails **loudly** where it can't.
     Conversion's **Composite key**, or an edited target key that adds a column outside
     the source primary key — needs **`REPLICA IDENTITY FULL` on the table and on every
     partition, for the whole CDC run**, not only at Start (a partition created later
-    starts at `DEFAULT`). Below FULL, a `DELETE` on that table does not remove its row
-    on Aurora DSQL — silently, with no error and no dead letter — and an `UPDATE` that
-    changes a key column is affected too. The prerequisites block Start. While the
+    starts at `DEFAULT`). Below FULL, a `DELETE` on that table can leave its row on
+    Aurora DSQL with no error and no dead letter — until Aurora DSQL has built the
+    table's unique index on the source primary key, and always on CDC infrastructure
+    deployed by an earlier version — and an `UPDATE` that changes the added key column
+    is dead-lettered and leaves the old row. The prerequisites block Start. While the
     Data Migration, Validation or Cut over step is open, the tool re-reads it at most
     every 2 minutes: a red notice appears in the CDC monitor, and Cut over is held
     until it is FULL again and the table matches by CHECKSUM
@@ -83,6 +85,23 @@ fails **loudly** where it can't.
     app restart the re-check needs the source password again (reconnect on the Connect
     step). A drop and its reversal between two re-checks are not seen, so keep FULL in
     place.
+- **Re-keyed tables on CDC infrastructure deployed by an earlier version** keep their
+  change records keyed on the composite key (the Start CDC log says so). An `UPDATE` of
+  the leading key column — or a delete and re-insert of a row with another leading
+  value — is then replicated as a delete of the old key plus an insert of the new one,
+  which can apply in either order when a topic has more than one partition (fewer than
+  8 captured tables, or a large table given 2 or 4). If the insert comes first it is
+  dead-lettered (*a unique constraint rejected the row*) and the delete removes the row,
+  so it is missing until the table is reloaded; Cut over holds the table until it
+  matches by CHECKSUM. Delete CDC infrastructure and deploy it again to key these tables
+  on the source primary key. That also deletes the stream position: on MySQL, Start CDC
+  then re-reads the binlog from the Full Load watermark (CDC only: it begins at the
+  source's current position, so changes made after the last one Aurora DSQL applied are
+  not replicated); on PostgreSQL it drops the replication slot, so the next Start reads
+  every table again (Full load + CDC: choose **"Re-snapshot every table instead"**) and a
+  row the source deleted meanwhile stays on Aurora DSQL. See "Starting CDC again after a
+  delete" and "The cost of deleting a CDC-only stack" in
+  [Chapter 13](13-excluding-tables-and-columns.md#why-the-set-locks). Both engines.
 - **CDC replicates data, not DDL.** Schema changes on the source during CDC are
   **not** propagated to DSQL — you make the matching change on Aurora DSQL yourself:
   **Fix target schema…** for an added or renamed column, an `ALTER … DROP NOT NULL`

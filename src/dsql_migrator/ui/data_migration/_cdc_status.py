@@ -1182,19 +1182,17 @@ def _probe_cdc_stack_phase(migration_state, session) -> None:
         if _deployed_params and "ColumnExcludeList" in _deployed_params
         else None
     )
-    # The DEPLOYED re-key map (MessageKeyColumns), from the SAME describe: the tables
-    # Debezium actually re-keys, which the runtime REPLICA IDENTITY re-check scopes to
-    # (ui/cdc_replica_identity_gate.py). '' is a real value -- no re-key -- and None means no
-    # stack or no such parameter.
+    # The DEPLOYED re-key map, from the SAME describe: every table CDC re-keys, whether its
+    # records are keyed on the composite key (MessageKeyColumns) or on the source primary key
+    # with the sink writing the composite key (SinkKeyColumns, G15) -- the runtime REPLICA
+    # IDENTITY re-check (ui/cdc_replica_identity_gate.py), the source schema re-check and the
+    # cut-over gates scope to it. '' is a real value -- no re-key -- and None means no stack or
+    # neither parameter.
     _set_keys = getattr(migration_state, "set_cdc_deployed_message_key_columns", None)
     if callable(_set_keys):
-        from dsql_migrator.core.cdc import _parse_message_key_columns
+        from dsql_migrator.core.cdc import deployed_rekey_map
 
-        _set_keys(
-            _parse_message_key_columns(str(_deployed_params.get("MessageKeyColumns") or ""))
-            if _deployed_params and "MessageKeyColumns" in _deployed_params
-            else None
-        )
+        _set_keys(deployed_rekey_map(_deployed_params) if _deployed_params else None)
     # Also read each ATTACH CANDIDATE's replicated table set, so the attach offer can be
     # withheld when the pipeline does not cover what this session loaded. ``list_stacks``
     # returns no parameters, so this needs one describe per candidate -- bounded by the

@@ -6,6 +6,10 @@
  */
 package dev.dsqlmigrator.connect;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import org.apache.kafka.common.config.AbstractConfig;
 import org.apache.kafka.common.config.ConfigDef;
@@ -19,7 +23,10 @@ import org.apache.kafka.common.config.ConfigDef.Type;
  * produces these values, and the {@code deploy/cdc-stack/cdc-stack.yaml}
  * connector configuration sets the same keys. Primary keys are taken from the
  * Debezium record key ({@code pk.mode=record_key}), so there is no per-table
- * {@code pk.fields} setting. The DLQ is handled by the Kafka Connect framework
+ * {@code pk.fields} setting -- EXCEPT for a re-keyed table listed in
+ * {@link #TARGET_KEY_COLUMNS}: its change records are keyed on the SOURCE primary key, and
+ * the sink writes it by the Aurora DSQL composite primary key listed there (see
+ * {@link DebeziumEvents}). The DLQ is handled by the Kafka Connect framework
  * ({@code errors.deadletterqueue.topic.name}) and is not read here.
  */
 public class DsqlSinkConnectorConfig extends AbstractConfig {
@@ -37,6 +44,11 @@ public class DsqlSinkConnectorConfig extends AbstractConfig {
   // never affects replication.
   public static final String METRICS_ENABLED = "metrics.enabled";
   public static final String METRICS_STACK = "metrics.stack";
+  // Re-keyed tables (Schema Conversion's Composite key) whose change records are keyed on the
+  // SOURCE primary key, with the Aurora DSQL composite primary key the sink writes each one by.
+  // The cdc-stack SinkKeyColumns parameter, which Start CDC fills only for a stack whose sink
+  // plugin reads it; absent or empty = no table (every record keyed as before).
+  public static final String TARGET_KEY_COLUMNS = "target.key.columns";
 
   // DSQL hard limit: a transaction may modify at most 3,000 rows.
   public static final int DSQL_MAX_ROWS_PER_TXN = 3000;
@@ -84,7 +96,15 @@ public class DsqlSinkConnectorConfig extends AbstractConfig {
               Type.STRING,
               "",
               Importance.LOW,
-              "Value of the metric's Stack dimension (the cdc-stack name); blank disables emission.");
+              "Value of the metric's Stack dimension (the cdc-stack name); blank disables emission.")
+          .define(
+              TARGET_KEY_COLUMNS,
+              Type.STRING,
+              "",
+              Importance.LOW,
+              "Re-keyed tables whose change records are keyed on the SOURCE primary key, and the "
+                  + "Aurora DSQL composite primary key the sink writes each one by, in Debezium "
+                  + "message.key.columns syntax: \"db\\.table:leading,pk;...\". Empty = none.");
 
   public DsqlSinkConnectorConfig(Map<String, String> props) {
     super(CONFIG_DEF, props);
@@ -132,5 +152,46 @@ public class DsqlSinkConnectorConfig extends AbstractConfig {
 
   public String metricsStack() {
     return getString(METRICS_STACK);
+  }
+
+  /**
+   * {@link #TARGET_KEY_COLUMNS} as {@code {schema.table: [composite primary-key columns]}}, in
+   * the order the value lists them. Empty (never null) when the key is absent or empty.
+   */
+  public Map<String, List<String>> targetKeyColumns() {
+    return parseTargetKeyColumns(getString(TARGET_KEY_COLUMNS));
+  }
+
+  /**
+   * Parse {@code "db\.t:c1,c2;db\.u:c3,c4"} -- the inverse of the control plane's
+   * {@code core/cdc.format_message_key_columns}: entries split on {@code ';'}, the FIRST
+   * {@code ':'} separates the table from its columns, {@code '\.'} in the table is a literal
+   * dot, and columns split on {@code ','} with empty ones dropped. A malformed entry (no
+   * {@code ':'}, no table, or no column) is ignored rather than guessed at; a table listed twice
+   * keeps its last entry. Pure; package-private for tests.
+   */
+  static Map<String, List<String>> parseTargetKeyColumns(String value) {
+    if (value == null || value.isEmpty()) {
+      return Map.of();
+    }
+    Map<String, List<String>> out = new LinkedHashMap<>();
+    for (String item : value.split(";")) {
+      int sep = item.indexOf(':');
+      if (sep <= 0) {
+        continue;
+      }
+      String table = item.substring(0, sep).replace("\\.", ".");
+      List<String> columns = new ArrayList<>();
+      for (String column : item.substring(sep + 1).split(",")) {
+        if (!column.isEmpty()) {
+          columns.add(column);
+        }
+      }
+      if (table.isEmpty() || columns.isEmpty()) {
+        continue;
+      }
+      out.put(table, List.copyOf(columns));
+    }
+    return Collections.unmodifiableMap(out);
   }
 }

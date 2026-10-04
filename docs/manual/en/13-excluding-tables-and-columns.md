@@ -253,7 +253,7 @@ Save; the column simply migrates.
 | Column | Shown as | Why |
 |---|---|---|
 | A source primary-key column | primary key | The tool needs it to read, de-duplicate and replicate rows. |
-| A target primary-key column chosen in Schema Conversion: the leading column of a composite key, a column of a named `CONSTRAINT ... PRIMARY KEY` in an edited DDL, or a CDC re-key column (`message.key.columns`) | target key | The loader reads every target-key column of every row, and CDC builds the record key from it. |
+| A target primary-key column chosen in Schema Conversion: the leading column of a composite key, a column of a named `CONSTRAINT ... PRIMARY KEY` in an edited DDL, or a CDC re-key column (`message.key.columns`) | target key | The loader reads every target-key column of every row, and CDC needs it to write and delete each row by that key. |
 | A column that a preserved foreign key of a selected table references (only while foreign keys are preserved) | referenced by a foreign key | Every child row would become an orphan, and the foreign key could not be added. |
 | A column Aurora DSQL computes: a preserved `GENERATED ... STORED` column, or an identity column outside the primary key | computed | Aurora DSQL computes it and the tool never writes it. Dropping a DEFAULT cannot make an identity column NULL. |
 

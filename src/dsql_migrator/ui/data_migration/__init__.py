@@ -972,10 +972,11 @@ def build_data_migration_screen(
         migration_state.set_exclusion_inputs_resolver(_exclusion_resolver)
 
         # Composite-PK CDC re-key: when a table's applied Schema Conversion gave it
-        # a composite target key, Debezium must key its change record on those same
+        # a composite target key, Debezium keys its change record on those same
         # columns (message.key.columns) so the sink's record-key ON CONFLICT/DELETE
-        # match the target -- no sink change. Recompute from the applied conversion
-        # each render and store it on the state for the CDC start path to read.
+        # match the target -- or, on infrastructure whose sink plugin reads SinkKeyColumns,
+        # on the source PK with the sink writing the composite key (G15). Recompute from the
+        # applied conversion each render and store it on the state for the CDC start path.
         if inventory is not None and inventory.tables:
             # session_source_type, NOT a source_config read with a MySQL fallback: a
             # RESTORED session (reconnect / task replacement) records the engine WITHOUT a
@@ -1164,7 +1165,8 @@ def build_data_migration_screen(
                 # The re-key map the connector will actually be configured with (already
                 # recomputed onto state on every render from the APPLIED target DDL). A
                 # re-keyed table whose source REPLICA IDENTITY cannot supply the added key
-                # column loses every DELETE silently, and only the source catalog can say
+                # column can lose DELETEs silently (on older infrastructure, and on v51+ until
+                # the source-key unique index is valid), and only the source catalog can say
                 # whether it can -- so the check needs this map, not a re-derivation.
                 message_key_columns={
                     table: list(cols)

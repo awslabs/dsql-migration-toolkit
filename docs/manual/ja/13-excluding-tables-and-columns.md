@@ -238,7 +238,7 @@ include public.settings.preferences
 | 列 | 表示 | 理由 |
 |---|---|---|
 | ソースの主キー列 | primary key | ツールは行の読み取り、重複排除、複製にこの列を必要とします。 |
-| Schema Conversion で選んだターゲットの主キー列: 複合キーの先頭列、編集した DDL 内の名前付き `CONSTRAINT ... PRIMARY KEY` の列、または CDC の再キー化の列(`message.key.columns`) | target key | ローダーはすべての行のすべてのターゲットキー列を読み、CDC はそこからレコードキーを構築します。 |
+| Schema Conversion で選んだターゲットの主キー列: 複合キーの先頭列、編集した DDL 内の名前付き `CONSTRAINT ... PRIMARY KEY` の列、または CDC の再キー化の列(`message.key.columns`) | target key | ローダーはすべての行のすべてのターゲットキー列を読み、CDC は各行をそのキーで書き込み・削除するため、この列を必要とします。 |
 | 選択されたテーブルの保持される外部キーが参照する列(外部キーを保持している間のみ) | referenced by a foreign key | すべての子行が孤立し、外部キーを追加できなくなります。 |
 | Aurora DSQL が計算する列: 保持される `GENERATED ... STORED` 列、または主キー外の identity 列 | computed | Aurora DSQL がその値を計算し、ツールが書き込むことは決してありません。DEFAULT を削除しても identity 列を NULL にはできません。 |
 

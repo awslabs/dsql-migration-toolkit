@@ -4781,14 +4781,16 @@ def test_the_composite_key_picker_states_the_immutability_requirement_and_its_co
     """The requirement was buried as a DSQL property, so its real cost was invisible.
 
     The old wording was "'<col>' must be immutable (DSQL keys cannot change after
-    creation)" -- which reads as a target-side rule about ALTER. The actual cost is on the
-    SOURCE: Debezium replicates a change to a key column as a DELETE of the old key plus an
-    INSERT of the new one. Those two records carry different keys, so they land on different
-    topic partitions and different sink tasks with no ordering between them, and while both
-    key forms coexist the UNIQUE index over the original primary key rejects the insert
-    (23505). The sink treats that as permanent, dead-letters the insert with its offset
-    committed, and if the delete lands afterwards the ROW IS GONE. REPLICA IDENTITY FULL does
-    not help and this is not PostgreSQL-specific.
+    creation)" -- which reads as a target-side rule about ALTER. The cost depends on the CDC
+    infrastructure (G15). One deployed by this version keys the table's change records on the
+    SOURCE primary key, so a source UPDATE of the leading column is ONE record the sink
+    applies as delete-old + insert-new in one transaction (on PostgreSQL under REPLICA
+    IDENTITY FULL, which Start checks). One deployed by an earlier version keys them on the
+    composite key, so Debezium replicates the UPDATE as a DELETE of the old key plus an INSERT
+    of the new one: different keys, different partitions, no ordering between them, and an
+    insert that lands first is rejected by the UNIQUE index over the original primary key
+    (23505), dead-lettered, and the delete then removes the row -- on both engines. The notice
+    must say which is which, never the old race as unconditional.
     """
     ui = _PickerUi()
     state = SchemaConversionState()
@@ -4811,11 +4813,15 @@ def test_the_composite_key_picker_states_the_immutability_requirement_and_its_co
     assert "delete of the old key" in body
     assert "disappear from the target" in body
     assert "dead-lettered" in body
-    # Engine-agnostic, and no source setting saves you: both are load-bearing, because an
-    # operator who just read the REPLICA IDENTITY guidance would otherwise assume FULL fixes
-    # this too.
+    # The race is scoped to infrastructure deployed by an earlier version (on both engines);
+    # this version's applies the UPDATE in order. Neither the old keying nor the old
+    # "nothing prevents it" may be stated unconditionally (G15).
     assert "both source engines" in body
-    assert "no source setting prevents it" in body
+    assert "earlier version" in body
+    assert "in one transaction" in body
+    assert "no source setting prevents it" not in body
+    assert "keyed on the composite key" not in body
+    assert "the two go to different partitions" not in body
     # It must offer what a good column looks like, not only a prohibition.
     assert "tenant" in body or "customer id" in body
     # The surviving composite guidance is unchanged (queries must use the new key).

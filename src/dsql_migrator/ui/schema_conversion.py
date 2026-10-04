@@ -3917,23 +3917,24 @@ def _render_pk_strategy_picker(
                     f"composite key. A UNIQUE index on the original key "
                     f"({', '.join(table.primary_key)}) is created for you, so its "
                     "uniqueness is preserved. And if you replicate this table with CDC, "
-                    "keep every key column in capture: change records are keyed on the "
-                    "composite key, so excluding one of its columns stops replication for "
-                    "this table."
+                    "keep every key column in capture: CDC builds the composite key from "
+                    "each row's values, so excluding one of its columns stops replication "
+                    "for this table."
                 ),
             )
-            # Its own notice, because the consequence is data loss and the previous wording
-            # buried it as a DSQL property ("keys cannot change after creation") -- which
-            # reads as a target-side rule about ALTER, not as a requirement on the SOURCE
-            # with a measured cost. What actually happens: Debezium replicates a change to a
-            # key column as a DELETE of the old key plus an INSERT of the new one. Those two
-            # records carry different keys, so they land on different topic partitions and
-            # different sink tasks with no ordering between them, and while both key forms
-            # coexist the UNIQUE index over the original primary key rejects the insert
-            # (SQLSTATE 23505). The sink treats that as permanent: the insert is
-            # dead-lettered with its offset committed, and if the delete lands afterwards the
-            # row is GONE from the target. REPLICA IDENTITY FULL does not help, and this one
-            # is not PostgreSQL-specific -- MySQL behaves the same way.
+            # Its own notice: the leading column must be immutable, and the tool cannot check
+            # it. How a source UPDATE of it replicates depends on the CDC infrastructure. One
+            # deployed by this version (sink plugin v51 or later) keys the table's change
+            # records on the SOURCE primary key (core.cdc.choose_rekey_routing), so Debezium
+            # sends the UPDATE as ONE record and the sink applies it as delete-old +
+            # insert-new in one transaction -- on PostgreSQL only under REPLICA IDENTITY FULL,
+            # which the REPLICA_IDENTITY_COVERS_KEY prerequisite blocks Start on. One deployed
+            # by an earlier version keys the records on the composite key, so the UPDATE is a
+            # DELETE of the old key plus an INSERT of the new one: different keys, so
+            # different topic partitions with no ordering between them. An insert that lands
+            # first is rejected by the UNIQUE index over the original key (SQLSTATE 23505)
+            # and dead-lettered, and the delete then removes the row -- on both engines (see
+            # core.cdc.SchemaDriftKind.UNIQUE_CONFLICT).
             render_notice(
                 ui,
                 tone="warning",
@@ -3944,20 +3945,20 @@ def _render_pk_strategy_picker(
                 body=(
                     # Amber is deliberate even though this is an opt-in choice: unlike the
                     # note above, this is a PRECONDITION the tool cannot check, and
-                    # violating it loses rows silently and irreversibly. The wording asks
-                    # for a confirmation rather than reporting a fault.
-                    "The tool cannot verify this, and getting it wrong loses rows, so it "
-                    "is worth checking before you apply. Pick a column whose value is "
-                    "fixed for the life of the row (a tenant or customer id, a "
-                    "creation-date bucket). If the source ever UPDATEs "
-                    f"'{current_leading}', CDC replicates that as a delete of the old key "
-                    "plus an insert of the new one; the two go to different partitions with "
-                    "no ordering between them, and the unique index over the original key "
-                    "rejects the insert while both still exist. That insert is "
-                    "dead-lettered permanently, so the row can disappear from the target. "
-                    "It applies to both source engines, and no source setting prevents it — "
-                    "only choosing an immutable column does. Aurora DSQL also cannot change "
-                    "a key value after the row is created."
+                    # violating it can lose rows on older CDC infrastructure. The wording
+                    # asks for a confirmation rather than reporting a fault.
+                    "The tool cannot verify this, so it is worth checking before you "
+                    "apply. Pick a column whose value is fixed for the life of the row (a "
+                    "tenant or customer id, a creation-date bucket). If the source UPDATEs "
+                    f"'{current_leading}' while CDC runs, CDC infrastructure deployed by "
+                    "this version replicates it in order: the old row is deleted and the new "
+                    "one inserted in one transaction (a PostgreSQL source needs REPLICA "
+                    "IDENTITY FULL for that, which Start checks). On CDC infrastructure "
+                    "deployed by an earlier version it is a delete of the old key plus an "
+                    "insert of the new one that can apply in either order, on both source "
+                    "engines: an insert that lands first is dead-lettered, and the row can "
+                    "disappear from the target. Aurora DSQL also cannot change a key value "
+                    "after the row is created."
                 ),
             )
         elif is_identity:

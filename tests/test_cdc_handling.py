@@ -26,7 +26,10 @@ def test_a_unique_violation_is_classified_but_not_called_a_source_schema_change(
     # may be MISSING, and what to do about it.
     assert "re-key" not in label.lower()
     assert "23505" in body
-    assert "MISSING" in body
+    # G15: an UPDATE of the leading column can leave the row missing (composite-key routing on
+    # older infrastructure) or stale (no old value below FULL): both are named.
+    assert "missing or stale" in body
+    assert "earlier version of this tool" in body and "REPLICA IDENTITY below FULL" in body
     assert "immutable" in body or "never updates" in body
 
     # The structural SQLSTATEs keep their existing kinds (no reshuffling).

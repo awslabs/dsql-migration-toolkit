@@ -578,9 +578,21 @@ Parameters:
       "db.table:leading,pk;db2.table2:leading2,pk2" (";" between tables, ":" before
       the column list, "," between columns; the table part is a regex). Debezium
       then keys the change record on those columns so the sink's record-key
-      ON CONFLICT / DELETE match the target key -- no sink change needed. A listed
-      column must NOT be in ColumnExcludeList (it is read from the row/before-image
-      to build the key). Empty = key on the source primary key (default behavior).
+      ON CONFLICT / DELETE match the target key. A table listed in SinkKeyColumns is
+      left out of this value (its records stay keyed on the source primary key). A
+      listed column must NOT be in ColumnExcludeList (it is read from the
+      row/before-image to build the key). Empty = key on the source primary key
+      (default behavior).
+
+  SinkKeyColumns:
+    Type: String
+    Default: ""
+    Description: >-
+      Composite Aurora DSQL primary keys the DSQL sink writes re-keyed tables by, in
+      MessageKeyColumns syntax (db\.table:leading,pk;...). A table listed here is left
+      out of MessageKeyColumns, so Debezium keys its change records on the SOURCE
+      primary key and every change to one row stays on one partition, in source order.
+      Start CDC sends it only to a stack running sink plugin v51 or later. Empty = none.
 
   DeploySink:
     Type: String
@@ -689,6 +701,14 @@ Conditions:
   HasMessageKeyColumns:
     Fn::Not:
       - Fn::Equals: [Ref: MessageKeyColumns, ""]
+
+  # Re-keyed tables keyed on the SOURCE primary key in the change stream (G15): the sink is
+  # told their composite target key (target.key.columns). Omitted (AWS::NoValue) when empty,
+  # so a stack with no such table -- every MySQL or PostgreSQL stack without a re-keyed table,
+  # and every stack whose sink plugin predates v51 -- keeps a byte-identical sink config.
+  HasSinkKeyColumns:
+    Fn::Not:
+      - Fn::Equals: [Ref: SinkKeyColumns, ""]
 
   # Size-proportional topic.creation groups (skewed-workload fix). Each group is
   # emitted only when the tool supplies a non-empty include list for it, and the
@@ -1340,12 +1360,16 @@ Resources:
   # FABRICATED non-NULL key component instead of the null it really is. With the pin a NULL
   # survives for a NULLABLE key column only. For a NOT NULL one (a composite key's leading
   # column always is) Debezium's key generator itself converts the absent value with no null
-  # check and yields a placeholder (0, '' or its DEFAULT) before any converter runs -- offline-
-  # proven against the shipped 2.7.4 jar -- so the sink's null-key guard cannot fire. The v50
-  # live run on a re-keyed table switched to REPLICA IDENTITY DEFAULT saw no DELETE reach the
-  # sink at all; either way the delete is lost silently, and which account holds is pending a
-  # live check. The protection is the Start prerequisite that BLOCKS that configuration plus
-  # the app's runtime REPLICA IDENTITY re-check, which holds Cut over while it lasts.
+  # check and yields a placeholder (0, '' or its DEFAULT) before any converter runs, so the
+  # sink's null-key guard cannot fire. Live-confirmed on PostgreSQL 17 (2026-10-03): after
+  # REPLICA IDENTITY DEFAULT, a DELETE of id=2 (row lead=5) reached the sink keyed
+  # {lead: 7, id: 2} -- 7 the column DEFAULT -- matched 0 rows, and nothing was dead-lettered.
+  # Since G15 a re-keyed table on a stack with sink plugin v51 or later is keyed on its SOURCE
+  # primary key instead (SinkKeyColumns -> the sink's target.key.columns; the table is left out
+  # of message.key.columns): its deletes find the row by the source key once Aurora DSQL's
+  # unique index on it is valid. The Start prerequisite that BLOCKS a weak identity and the
+  # app's runtime REPLICA IDENTITY re-check, which holds Cut over, stay: they cover the index
+  # build window, an UPDATE of the leading column, USING INDEX and older infrastructure.
   #
   # --- Worker configuration: source connector (converters + Secrets Manager provider) ---
   # MSK Connect requires key.converter/value.converter in every WorkerConfiguration
@@ -2327,11 +2351,16 @@ Resources:
         topics:
           Ref: SinkTopics
         # Idempotent apply: this custom connector always derives the PK from the
-        # Debezium record key and applies INSERT ... ON CONFLICT upsert
-        # (build_sink_config: pk_mode=record_key, insert_mode=upsert), so pk.mode/
-        # insert.mode are implicit and not set here. delete.enabled toggles
-        # DELETE/tombstone apply. Keys below match DsqlSinkConnectorConfig.
+        # Debezium record key -- except a table listed in target.key.columns -- and
+        # applies INSERT ... ON CONFLICT upsert (build_sink_config: pk_mode=record_key,
+        # insert_mode=upsert), so pk.mode/insert.mode are implicit and not set here.
+        # delete.enabled toggles DELETE/tombstone apply. Keys below match
+        # DsqlSinkConnectorConfig.
         delete.enabled: "true"
+        # Re-keyed tables keyed on the SOURCE primary key in the change stream (G15): the
+        # composite Aurora DSQL primary key the sink writes each one by. Omitted when empty.
+        target.key.columns:
+          Fn::If: [HasSinkKeyColumns, Ref: SinkKeyColumns, Ref: AWS::NoValue]
         # DSQL connection: IAM token auth (no password). The connector generates
         # the token and refreshes it before the 1-hour timeout (Task 23.2).
         dsql.cluster.endpoint:
@@ -2463,11 +2492,16 @@ Resources:
         topics:
           Ref: SinkTopics
         # Idempotent apply: this custom connector always derives the PK from the
-        # Debezium record key and applies INSERT ... ON CONFLICT upsert
-        # (build_sink_config: pk_mode=record_key, insert_mode=upsert), so pk.mode/
-        # insert.mode are implicit and not set here. delete.enabled toggles
-        # DELETE/tombstone apply. Keys below match DsqlSinkConnectorConfig.
+        # Debezium record key -- except a table listed in target.key.columns -- and
+        # applies INSERT ... ON CONFLICT upsert (build_sink_config: pk_mode=record_key,
+        # insert_mode=upsert), so pk.mode/insert.mode are implicit and not set here.
+        # delete.enabled toggles DELETE/tombstone apply. Keys below match
+        # DsqlSinkConnectorConfig.
         delete.enabled: "true"
+        # Re-keyed tables keyed on the SOURCE primary key in the change stream (G15): the
+        # composite Aurora DSQL primary key the sink writes each one by. Omitted when empty.
+        target.key.columns:
+          Fn::If: [HasSinkKeyColumns, Ref: SinkKeyColumns, Ref: AWS::NoValue]
         # DSQL connection: IAM token auth (no password). The connector generates
         # the token and refreshes it before the 1-hour timeout (Task 23.2).
         dsql.cluster.endpoint:

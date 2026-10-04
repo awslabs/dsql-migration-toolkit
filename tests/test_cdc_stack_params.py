@@ -1292,3 +1292,319 @@ def test_the_seed_admission_note_is_one_actionable_line() -> None:
     assert len(ok.note) < 160, len(ok.note)
     for rationale in ("kafka-cluster IAM", "task is replaced", "still gated"):
         assert rationale not in ok.note, rationale
+
+
+# ---------------------------------------------------------------------------
+# G15: re-keyed tables keyed on the SOURCE primary key in the change stream
+# ---------------------------------------------------------------------------
+
+
+def _rekey_tables():
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    def _t(name, pk, cols):
+        return TableDef(
+            name=name,
+            primary_key=list(pk),
+            columns=[ColumnDef(name=c, mysql_type="int") for c in cols],
+        )
+
+    return [
+        _t("app.orders", ["id"], ["lead", "id", "v"]),  # Composite key: [lead] + PK
+        _t("app.items", ["id"], ["id", "v"]),  # not re-keyed
+    ]
+
+
+def _rekey_params(source_type, plugin=None, *, keys=None, tables=None):
+    from dsql_migrator.core.cdc import CdcPipelineOrchestrator
+    from dsql_migrator.core.cdc_postgres import dispatch_cdc_stack_params, dispatch_source_config
+    from dsql_migrator.core.models import Watermark
+
+    tables = tables if tables is not None else _rekey_tables()
+    source = dispatch_source_config(
+        source_type,
+        tables,
+        Watermark(snapshot_timestamp=datetime(2026, 10, 4, tzinfo=timezone.utc)),
+        database="app",
+        stack_name="dsql-cdc-stack",
+        message_key_columns=keys if keys is not None else {"app.orders": ["lead", "id"]},
+    )
+    sink = CdcPipelineOrchestrator().build_sink_config(
+        "sink", tables, "dsql-sink-dlq"
+    )
+    return dispatch_cdc_stack_params(source, sink, target_endpoint="ep.on.aws")
+
+
+def test_a_v51_stack_keys_rekeyed_tables_on_the_source_primary_key() -> None:
+    # FAILS WITHOUT G15: there was no SinkKeyColumns, so the re-keyed table stayed in
+    # MessageKeyColumns and Debezium keyed it on (lead, id) -- an UPDATE of `lead` became a
+    # delete + insert on different partitions, applied in any order.
+    from dsql_migrator.core.cdc import choose_rekey_routing
+    from dsql_migrator.core.models import SourceType
+
+    for engine in (SourceType.MYSQL, SourceType.POSTGRES):
+        params = _rekey_params(engine)
+        routed = choose_rekey_routing(params, "v51")
+        filled = dict(routed.filled)
+        assert filled["MessageKeyColumns"] == "", engine
+        assert filled["SinkKeyColumns"] == r"app\.orders:lead,id", engine
+        # SinkKeyColumns sits right after MessageKeyColumns; nothing else moved.
+        keys = [k for k, _ in routed.filled]
+        assert keys.index("SinkKeyColumns") == keys.index("MessageKeyColumns") + 1
+        moved = {"MessageKeyColumns", "SinkKeyColumns"}
+        assert [kv for kv in routed.filled if kv[0] not in moved] == [
+            kv for kv in params.filled if kv[0] not in moved
+        ]
+        # Idempotent: a second pass moves nothing and returns the very same params.
+        assert choose_rekey_routing(routed, "v51") is routed
+        assert choose_rekey_routing(params, "v52").filled == routed.filled
+
+
+def test_stack_params_default_to_composite_key_routing() -> None:
+    # The builder's output routes exactly as before: every path that never reaches the
+    # chooser (the manual CLI parameter set, an older plugin) keeps today's keying.
+    from dsql_migrator.core.models import SourceType
+
+    for engine in (SourceType.MYSQL, SourceType.POSTGRES):
+        params = _rekey_params(engine)
+        filled = dict(params.filled)
+        assert filled["MessageKeyColumns"] == r"app\.orders:lead,id", engine
+        assert filled["SinkKeyColumns"] == "", engine
+        assert params.sink_keyable == {"app.orders": ["lead", "id"]}, engine
+
+
+def test_an_older_or_unknown_plugin_keeps_composite_key_routing() -> None:
+    from dsql_migrator.core.cdc import choose_rekey_routing, plugin_supports_sink_keys
+    from dsql_migrator.core.models import SourceType
+
+    params = _rekey_params(SourceType.POSTGRES)
+    for plugin in ("v50", "v1", None, "", "v51a", "51", "V51", "latest"):
+        assert plugin_supports_sink_keys(plugin) is False, plugin
+        assert choose_rekey_routing(params, plugin) is params, plugin
+    for plugin in ("v51", " v51 ", "v52", "v100"):
+        assert plugin_supports_sink_keys(plugin) is True, plugin
+
+
+def test_ineligible_rekeys_stay_in_message_key_columns() -> None:
+    from dsql_migrator.core.cdc import choose_rekey_routing
+    from dsql_migrator.core.models import ColumnDef, SourceType, TableDef
+
+    def _t(name, pk, cols):
+        return TableDef(name=name, primary_key=list(pk),
+                        columns=[ColumnDef(name=c, mysql_type="int") for c in cols])
+
+    tables = [
+        _t("app.orders", ["id"], ["lead", "id"]),  # eligible: [lead] + PK
+        _t("app.pairs", ["a", "b"], ["a", "b"]),  # a pure reorder of the PK
+        _t("app.edited", ["a", "b"], ["t", "a", "b"]),  # edited key omits PK column b
+    ]
+    keys = {
+        "app.orders": ["lead", "id"],
+        "app.pairs": ["b", "a"],
+        "app.edited": ["t", "a"],
+    }
+    params = _rekey_params(SourceType.POSTGRES, tables=tables, keys=keys)
+    assert params.sink_keyable == {"app.orders": ["lead", "id"]}
+    filled = dict(choose_rekey_routing(params, "v51").filled)
+    assert filled["SinkKeyColumns"] == r"app\.orders:lead,id"
+    assert filled["MessageKeyColumns"] == r"app\.edited:t,a;app\.pairs:b,a"
+
+
+def test_sink_keyable_rekeys_takes_only_keys_that_extend_the_whole_source_pk() -> None:
+    from dsql_migrator.core.cdc import sink_keyable_rekeys
+
+    pks = {"s.a": ["id"], "s.b": ["x", "y"], "s.c": ["id"], "s.d": ["id"], "s.e": [],
+           "s.f": ["id"], "s.g": ["x", "y"]}
+    keys = {
+        "s.a": ["lead", "id"],  # [leading] + PK
+        "s.b": ["t", "y", "x"],  # PK set plus one, in another order
+        "s.c": ["id"],  # the PK itself: adds nothing
+        "s.d": ["lead", "lead", "id"],  # a repeated column
+        "s.e": ["lead", "id"],  # unknown source PK
+        "s.f": ["lead", "other"],  # omits the PK
+        "s.g": ["t", "x"],  # omits part of the PK
+        "s.h": ["lead", "id"],  # table not in the PK map
+    }
+    assert sink_keyable_rekeys(keys, pks) == {"s.a": ["lead", "id"], "s.b": ["t", "y", "x"]}
+    assert sink_keyable_rekeys({}, pks) == {}
+
+
+def test_pg_stack_params_carry_sink_keyable() -> None:
+    # Without base.sink_keyable the PostgreSQL builder returned a CdcStackParams with none, and
+    # a PostgreSQL stack would have stayed on the composite-key routing silently.
+    from dsql_migrator.core.cdc_postgres import PostgresSourceConfig, build_pg_cdc_stack_params
+
+    source = PostgresSourceConfig(
+        name="postgres-source",
+        table_include_list=["app.orders"],
+        database_name="app",
+        slot_name="s",
+        publication_name="p",
+        message_key_columns={"app.orders": ["lead", "id"]},
+        sink_keyable={"app.orders": ["lead", "id"]},
+    )
+    params = build_pg_cdc_stack_params(source, _sink(["app.orders"]), target_endpoint="ep")
+    assert params.sink_keyable == {"app.orders": ["lead", "id"]}
+    assert source.as_neutral_source().sink_keyable == {"app.orders": ["lead", "id"]}
+    assert dict(params.filled)["SinkKeyColumns"] == ""
+
+
+def test_bundled_plugin_supports_sink_keys() -> None:
+    # The sink plugin this build ships must be one the chooser routes for -- a PLUGIN_VERSION
+    # bump that forgot SINK_KEYS_MIN_PLUGIN_VERSION (or the reverse) is caught here.
+    from dsql_migrator.core import s3_provision
+    from dsql_migrator.core.cdc import plugin_supports_sink_keys
+
+    assert plugin_supports_sink_keys(s3_provision.PLUGIN_VERSION)
+
+
+def test_rekey_parameter_size_refusal() -> None:
+    from dsql_migrator.core.cdc import CdcStackParams, rekey_parameter_size_refusal
+
+    def _p(mkc="", skc=""):
+        return CdcStackParams(
+            filled=[("MessageKeyColumns", mkc), ("SinkKeyColumns", skc)],
+            placeholders=[], stack_name="s", topic_prefix="p",
+        )
+
+    assert rekey_parameter_size_refusal(_p()) is None
+    assert rekey_parameter_size_refusal(_p("x" * 4096, "y" * 4096)) is None
+    refusal = rekey_parameter_size_refusal(_p(skc="y" * 4097))
+    assert refusal == (
+        "The composite primary keys of the re-keyed tables need 4,097 bytes in the CDC "
+        "configuration (SinkKeyColumns), over CloudFormation's 4,096-byte limit for one "
+        "parameter. No connectors were changed. Set some of these tables back to \"Keep "
+        "source PK\" in Schema Conversion (their Aurora DSQL tables must then be recreated "
+        "with that key), then Start CDC."
+    )
+    # Bytes, not characters; MessageKeyColumns is guarded too (it had no guard before).
+    assert "(MessageKeyColumns)" in rekey_parameter_size_refusal(_p(mkc="é" * 2049))
+
+
+def test_deployed_rekey_map_unions_both_parameters() -> None:
+    from dsql_migrator.core.cdc import deployed_rekey_map
+
+    assert deployed_rekey_map(None) is None
+    assert deployed_rekey_map({}) is None
+    assert deployed_rekey_map({"TableIncludeList": "app.t"}) is None  # an older stack
+    assert deployed_rekey_map({"MessageKeyColumns": ""}) == {}  # '' is a real value
+    assert deployed_rekey_map({"SinkKeyColumns": ""}) == {}
+    assert deployed_rekey_map(
+        {"MessageKeyColumns": r"app\.a:t,id", "SinkKeyColumns": r"app\.b:lead,id"}
+    ) == {"app.a": ["t", "id"], "app.b": ["lead", "id"]}
+    # SinkKeyColumns wins on overlap (it is what the sink writes by).
+    assert deployed_rekey_map(
+        {"MessageKeyColumns": r"app\.a:t,id", "SinkKeyColumns": r"app\.a:lead,id"}
+    ) == {"app.a": ["lead", "id"]}
+
+
+def test_legacy_column_exclude_key_conflicts_sees_sink_keyed_tables() -> None:
+    # A routed table's leading column must still be captured (the sink builds the composite
+    # key from the row image), so a kept 0.1.561 capture list that excludes it is refused.
+    from dsql_migrator.core.cdc import CdcStackParams, legacy_column_exclude_key_conflicts
+
+    params = CdcStackParams(
+        filled=[
+            ("ColumnExcludeList", "app.orders.lead,app.orders.blob"),
+            ("MessageKeyColumns", ""),
+            ("SinkKeyColumns", r"app\.orders:lead,id"),
+        ],
+        placeholders=[], stack_name="s", topic_prefix="p",
+        column_exclude_legacy="app.orders.lead,app.orders.blob",
+    )
+    assert legacy_column_exclude_key_conflicts(params) == ["app.orders.lead"]
+
+
+def test_mysql_stack_without_rekeyed_tables_is_unchanged() -> None:
+    from dsql_migrator.core.cdc import choose_rekey_routing, rekey_routing_log_lines
+    from dsql_migrator.core.models import SourceType
+
+    for engine in (SourceType.MYSQL, SourceType.POSTGRES):
+        params = _rekey_params(engine, keys={})
+        filled = dict(params.filled)
+        assert filled["SinkKeyColumns"] == "" and filled["MessageKeyColumns"] == ""
+        assert params.sink_keyable == {}
+        for plugin in ("v51", "v50", None):
+            assert choose_rekey_routing(params, plugin) is params
+            assert rekey_routing_log_lines(params, params, plugin) == []
+
+
+def test_rekey_routing_log_lines() -> None:
+    from dsql_migrator.core.cdc import choose_rekey_routing, rekey_routing_log_lines
+    from dsql_migrator.core.models import SourceType
+
+    params = _rekey_params(SourceType.POSTGRES)
+    routed = choose_rekey_routing(params, "v51")
+    assert rekey_routing_log_lines(params, routed, "v51") == [
+        "Re-keyed tables are keyed on their source primary key in the change stream, so every "
+        "change to a row stays in order, and are written to Aurora DSQL by their composite "
+        "primary key: app.orders."
+    ]
+    pg_cost = (
+        "On PostgreSQL the delete also drops the replication slot, so the next Start CDC reads "
+        "every table again (Full load + CDC: choose 'Re-snapshot every table instead'), and a "
+        "row the source deleted meanwhile stays on Aurora DSQL."
+    )
+    assert rekey_routing_log_lines(params, params, "v50") == [
+        "Re-keyed tables (app.orders) stay keyed on their composite primary key in the change "
+        "stream, because this CDC infrastructure runs sink plugin v50 and keying them on the "
+        "source primary key needs v51 or later. To get it, Delete CDC infrastructure and "
+        "deploy it again. " + pg_cost
+    ]
+    for unknown in (None, "", "garbage"):
+        assert rekey_routing_log_lines(params, params, unknown) == [
+            "Re-keyed tables (app.orders) stay keyed on their composite primary key in the "
+            "change stream, because the sink plugin version of this CDC infrastructure is "
+            "unknown, and keying them on the source primary key needs v51 or later. To get it, "
+            "Delete CDC infrastructure and deploy it again. " + pg_cost
+        ]
+
+
+def test_the_older_plugin_line_names_the_tables_and_what_the_redeploy_costs() -> None:
+    # The remedy deletes the stream position, which an operator must weigh before acting on
+    # it (a MySQL CDC-only run would lose the changes in between), and the tables come right
+    # after the subject -- never after "deploy it again:", where they read as what to deploy.
+    from dsql_migrator.core.cdc import rekey_routing_log_lines
+    from dsql_migrator.core.models import SourceType
+
+    mysql = _rekey_params(SourceType.MYSQL)
+    (line,) = rekey_routing_log_lines(mysql, mysql, "v50")
+    assert line.startswith("Re-keyed tables (app.orders) stay keyed"), line
+    assert line.index("app.orders") < line.index("Delete CDC infrastructure")
+    assert not line.rstrip(".").endswith("app.orders"), line
+    assert line.endswith(
+        "On MySQL the delete also deletes the stream position: the next Start CDC re-reads the "
+        "binlog from the Full Load watermark, or, with CDC only, begins at the source's current "
+        "position, so changes made after the last one Aurora DSQL applied are not replicated."
+    ), line
+    pg = _rekey_params(SourceType.POSTGRES)
+    (pg_line,) = rekey_routing_log_lines(pg, pg, None)
+    assert "drops the replication slot" in pg_line and "Re-snapshot every table" in pg_line
+    assert "stream position" not in pg_line
+
+
+def test_rekey_routing_log_lines_bound_the_names() -> None:
+    from dsql_migrator.core.cdc import _bounded_names
+
+    assert _bounded_names(["s.b", "s.a"]) == "s.a, s.b"
+    assert _bounded_names([f"s.t{i}" for i in range(7)]) == (
+        "s.t0, s.t1, s.t2, s.t3, s.t4 and 2 more"
+    )
+
+
+def test_the_pg_harness_hands_the_rekey_map_to_the_source_config_builder() -> None:
+    # The live check goes through scripts/run_pg_cdc_e2e.py: it must build the source config
+    # the way the UI does -- message_key_columns= into dispatch_source_config -- so the
+    # sink_keyable set exists and run_cdc_start routes the re-keyed table. A model_copy of
+    # message_key_columns afterwards set MessageKeyColumns but left sink_keyable empty, so the
+    # live check would silently have exercised the composite-key routing.
+    import pathlib
+    import re
+
+    text = (
+        pathlib.Path(__file__).resolve().parents[1] / "scripts" / "run_pg_cdc_e2e.py"
+    ).read_text(encoding="utf-8")
+    call = text[text.index("source_config = dispatch_source_config("):]
+    call = call[: call.index("\n    )\n")]
+    assert "message_key_columns=rekey" in call
+    assert not re.search(r"model_copy\(update=\{\s*\"message_key_columns\"", text)

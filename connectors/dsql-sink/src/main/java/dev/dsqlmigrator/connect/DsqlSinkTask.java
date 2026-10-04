@@ -98,6 +98,17 @@ import software.amazon.awssdk.services.cloudwatch.model.StandardUnit;
  * cool-down only chooses the PATH (batched or one row per transaction), never a row's fate --
  * every row is still executed against DSQL and is dead-lettered only when its own statement
  * fails, with the same reason text as before. Nothing is refused pre-emptively.
+ *
+ * <p><b>Re-keyed tables (G15).</b> A table listed in {@code target.key.columns} has its change
+ * records keyed on the SOURCE primary key, so every change to one source row arrives on one
+ * partition, in source order. The sink writes it by the Aurora DSQL composite primary key
+ * ({@link DebeziumEvents}): an UPDATE of a composite-key column is a MOVE -- the old row is
+ * deleted and the new image inserted in ONE transaction (it weighs 2 rows in a chunk); a delete
+ * is keyed on the exact composite key of its before-image, or on the source key once Aurora
+ * DSQL's unique index on it is valid ({@link SourceKeyIndex}: one catalog read per table, read
+ * only when such a delete or move arrives, so a delete is never a full scan); and its
+ * tombstone, which follows that delete on the same partition, is skipped. Every other table,
+ * and an empty {@code target.key.columns}, takes exactly the path described above.
  */
 public class DsqlSinkTask extends SinkTask {
 
@@ -159,6 +170,26 @@ public class DsqlSinkTask extends SinkTask {
       new ValueFit.TargetTypeCache(this::readTargetTypes);
   // Tables whose unreadable column types were already WARNed about on this task (once each).
   private final Set<String> catalogWarned = new HashSet<>();
+
+  // Re-keyed tables whose records are keyed on the SOURCE primary key (target.key.columns):
+  // {schema.table: the Aurora DSQL composite primary-key columns}. Empty = every record is
+  // parsed exactly as before (G15).
+  private Map<String, List<String>> targetKeys = Map.of();
+  // Whether a source-keyed table's unique index on its source key is valid, so a delete (or a
+  // move's delete) can be keyed on it: one catalog read per table, cached (SourceKeyIndex),
+  // dropped on 42703/42P01/3F000 like targetTypes. In memory, per task.
+  private final SourceKeyIndex sourceKeyIndex = new SourceKeyIndex(this::readSourceKeyIndex);
+  // Tables whose unreadable unique indexes were already WARNed about on this task (once each).
+  private final Set<String> sourceKeyWarned = new HashSet<>();
+
+  /**
+   * The WARN when a source-keyed table's unique indexes cannot be read (permanent error). Table
+   * name and SQLSTATE only, never a value (Property 7). Package-private for tests.
+   */
+  static final String SOURCE_KEY_INDEX_WARN =
+      "Source-key deletes are off for table {}: its Aurora DSQL unique indexes could not be read "
+          + "(sqlstate={}); its deletes use the composite primary key and the read is retried "
+          + "every 60 s";
 
   /**
    * How long a table stays on the one-row-per-transaction path after its LAST structural
@@ -240,6 +271,7 @@ public class DsqlSinkTask extends SinkTask {
    */
   void startMetrics(Map<String, String> props) {
     this.config = new DsqlSinkConnectorConfig(props);
+    this.targetKeys = config.targetKeyColumns();
     // Net-rows metric is on only when a Stack dimension was supplied (the cdc-stack
     // connector config sets it); otherwise stay silent (e.g. local/unit runs).
     this.metricsStack = config.metricsStack();
@@ -319,9 +351,16 @@ public class DsqlSinkTask extends SinkTask {
     long now = nanoTime(); // one clock read per put(): the value-fit cache + drift cool-down
     putNanos = now;
     for (SinkRecord record : records) {
+      // A source-keyed table's TOMBSTONE: Debezium emits it right after the op=d with the same
+      // key, so on the same partition, and that delete is already applied (G15).
+      if (!targetKeys.isEmpty()
+          && record.value() == null
+          && DebeziumEvents.isSourceKeyedTombstone(record, targetKeys)) {
+        continue;
+      }
       ChangeEvent event;
       try {
-        event = DebeziumEvents.parse(record);
+        event = DebeziumEvents.parse(record, targetKeys);
       } catch (DataException e) {
         // Unparseable/poison envelope: quarantine the record, keep going.
         reportOrThrow(record, e);
@@ -358,6 +397,13 @@ public class DsqlSinkTask extends SinkTask {
         reportOrThrow(record, event, new DataException(unfit));
         continue;
       }
+      // A source-keyed delete or move (G15): key its delete on the SOURCE key once Aurora
+      // DSQL's unique index on exactly those columns is valid -- a REPLICA IDENTITY DEFAULT
+      // before-image carries a placeholder in the added column, so the exact composite key
+      // would match nothing -- else keep the exact composite key (never a full scan).
+      if (event.hasSourceKey() && (event.isDelete() || event.isMove())) {
+        event = sourceKeySwitch(event, now);
+      }
       batch.add(new Applicable(record, event));
     }
     if (batch.isEmpty()) {
@@ -366,15 +412,38 @@ public class DsqlSinkTask extends SinkTask {
     // Chunk on BOTH DSQL transaction limits: <= batchSize rows AND <= MAX_BATCH_BYTES of
     // modified data (headroom under the 10 MiB/txn cap). Byte-bounding is estimated on the
     // pre-dedupe event set, so it is a safe over-estimate -- applyChunkBatched's per-PK
-    // dedupe can only shrink a chunk's real modified bytes, never grow them.
+    // dedupe can only shrink a chunk's real modified bytes, never grow them. A move (G15)
+    // modifies two rows (its delete and its insert), so it weighs 2 against batchSize.
     for (List<Applicable> chunk :
         Batches.partition(
             batch,
             config.batchSize(),
             MAX_BATCH_BYTES,
-            a -> estimateModifiedBytes(a.event()))) {
+            a -> estimateModifiedBytes(a.event()),
+            a -> a.event().isMove() ? 2 : 1)) {
       applyBatch(chunk);
     }
+  }
+
+  /**
+   * {@code event} (a source-keyed delete or move) with its delete keyed on the SOURCE key when
+   * the table's unique index on exactly those columns is valid, else unchanged. Never a source
+   * key with a NULL component (a {@code col = NULL} predicate matches nothing).
+   */
+  private ChangeEvent sourceKeySwitch(ChangeEvent event, long nowNanos) {
+    List<Object> key = event.sourceKeyValues();
+    if (key == null) {
+      return event;
+    }
+    for (Object component : key) {
+      if (component == null) {
+        return event;
+      }
+    }
+    if (!sourceKeyIndex.valid(event.table(), event.sourceKeyColumns(), nowNanos)) {
+      return event;
+    }
+    return event.isDelete() ? event.keyedBySourceKey() : event.withMoveDeleteBySourceKey();
   }
 
   /**
@@ -392,6 +461,12 @@ public class DsqlSinkTask extends SinkTask {
     long total = 0L;
     for (Object v : values) {
       total += estimateValueBytes(v);
+    }
+    if (event.isMove()) {
+      // A move also deletes its old row (G15): count the old key it matches on.
+      for (Object v : event.movedFromPkValues()) {
+        total += estimateValueBytes(v);
+      }
     }
     return total;
   }
@@ -753,6 +828,79 @@ public class DsqlSinkTask extends SinkTask {
   }
 
   /**
+   * The {@link SourceKeyIndex} loader: whether a {@code schema.table} target has a VALID unique
+   * index on exactly {@code columns} ({@code null} when unknown). Same failure semantics as
+   * {@link #readTargetTypes}: a 40001 is retried; a transient failure discards the connection
+   * and throws a {@link RetriableException} so Connect redelivers the batch; any other failure
+   * counts as not valid -- the table's deletes keep the exact composite key -- with one WARN per
+   * table per task, and the read is retried after {@link SourceKeyIndex#NOT_VALID_TTL_NANOS}.
+   */
+  Boolean readSourceKeyIndex(String table, List<String> columns) {
+    String[] key = ValueFit.catalogKey(table);
+    if (key == null) {
+      return null;
+    }
+    try {
+      return OccRetry.withRetry(
+          () -> loadSourceKeyIndex(key[0], key[1], columns),
+          config.maxRetries(),
+          config.retryBackoffMs());
+    } catch (SQLException e) {
+      rollbackQuietly();
+      if (isTransient(e)) {
+        discardConnection();
+        throw transientRetryException(e);
+      }
+      if (sourceKeyWarned.add(table)) {
+        // Table name and SQLSTATE only: the driver message is not logged (Property 7).
+        log.warn(SOURCE_KEY_INDEX_WARN, table, e.getSQLState());
+      } else {
+        log.debug(
+            "Source-key deletes still off for table {} (sqlstate={})", table, e.getSQLState());
+      }
+      return null;
+    }
+  }
+
+  /**
+   * One bounded {@code pg_index} read for one table ({@link SourceKeyIndex#CATALOG_SQL}),
+   * committed before any chunk transaction starts: true when some unique index is valid with
+   * exactly the column SET {@code columns}. Package-private and overridable: the offline test
+   * seam.
+   */
+  boolean loadSourceKeyIndex(String schema, String table, List<String> columns)
+      throws SQLException {
+    try {
+      Connection conn = connection();
+      Set<String> wanted = Set.copyOf(columns);
+      boolean valid = false;
+      try (PreparedStatement ps = conn.prepareStatement(SourceKeyIndex.CATALOG_SQL)) {
+        ps.setString(1, schema);
+        ps.setString(2, table);
+        try (ResultSet rs = ps.executeQuery()) {
+          while (rs.next()) {
+            java.sql.Array names = rs.getArray(3);
+            if (SourceKeyIndex.validOn(
+                rs.getBoolean(2), names == null ? null : (Object[]) names.getArray(), wanted)) {
+              valid = true;
+            }
+          }
+        }
+      }
+      conn.commit(); // end the read transaction before any chunk transaction
+      return valid;
+    } catch (SQLException e) {
+      rollbackQuietly();
+      throw e;
+    }
+  }
+
+  /** Package-private view for tests: the tables whose unique indexes could not be read. */
+  Set<String> sourceKeyWarnedTables() {
+    return java.util.Collections.unmodifiableSet(sourceKeyWarned);
+  }
+
+  /**
    * True when {@code column} of the record's after-image is a Debezium
    * {@code VariableScaleDecimal} -- an UNCONSTRAINED PostgreSQL {@code numeric} -- whose
    * rounding into Aurora DSQL's default {@code numeric(18,6)} is by design (see
@@ -786,10 +934,11 @@ public class DsqlSinkTask extends SinkTask {
    *
    * <p><b>Ordering is preserved.</b> Only <em>contiguous</em> same-SQL events are
    * grouped, so a delete that follows an upsert on the same PK (or vice-versa)
-   * still executes in arrival order — batching never reorders apply. A run breaks
-   * whenever the rendered SQL changes (different table, column set, or
+   * still executes in arrival order — batching never reorders the writes to one row.
+   * A run breaks whenever the rendered SQL changes (different table, column set, or
    * upsert↔delete), so mixed streams degrade gracefully to smaller batches, never
-   * to incorrect order.
+   * to incorrect order. (Consecutive moves of DIFFERENT rows run their deletes before
+   * their upserts; see {@link #withMoveDeletes}.)
    *
    * <p><b>Why {@code executeBatch}, not multi-row {@code VALUES}.</b> A rewritten
    * multi-row {@code INSERT ... ON CONFLICT} would reject a chunk that carries the
@@ -798,17 +947,22 @@ public class DsqlSinkTask extends SinkTask {
    * intra-chunk duplicate PKs stay safe while still pipelining the round-trips.
    */
   private void applyChunkBatched(Connection conn, List<Applicable> chunk) throws SQLException {
+    // A move (G15) runs its delete before its upsert, in this same transaction; consecutive
+    // moves of different rows run all their deletes, then all their upserts, so each half is
+    // one batch (withMoveDeletes). A delete renders different SQL from an upsert, so the
+    // dedupe below never folds a move's delete into an insert.
+    List<Applicable> statements = withMoveDeletes(chunk);
     int i = 0;
-    while (i < chunk.size()) {
-      String sql = renderSql(chunk.get(i).event());
-      int end = runEnd(chunk, i); // exclusive end of the maximal same-SQL run
+    while (i < statements.size()) {
+      String sql = renderSql(statements.get(i).event());
+      int end = runEnd(statements, i); // exclusive end of the maximal same-SQL run
       // Dedupe the run to the LAST event per PK. Within one same-SQL run every
       // event is the same kind (all upsert or all delete) on the same table, so
       // collapsing repeated PKs to their final image is apply-equivalent (the
       // last write wins under ON CONFLICT / PK delete) AND order-preserving. This
       // is what makes reWriteBatchedInserts safe: the rewritten multi-row upsert
       // can never carry a duplicate conflict key.
-      List<Applicable> run = dedupeRunByPk(chunk, i, end);
+      List<Applicable> run = dedupeRunByPk(statements, i, end);
       try (PreparedStatement ps = conn.prepareStatement(sql)) {
         java.sql.ParameterMetaData meta = paramMetaOrNull(ps); // once per statement
         for (Applicable a : run) {
@@ -823,6 +977,132 @@ public class DsqlSinkTask extends SinkTask {
       }
       i = end;
     }
+  }
+
+  /**
+   * {@code chunk} with each move's delete (G15, {@link ChangeEvent#moveDelete()}) placed before
+   * the move, paired with the same {@link SinkRecord}; {@code chunk} itself when it holds no
+   * move (every table but a re-keyed one). Pure and package-private for tests.
+   *
+   * <p>A group of consecutive moves of different rows ({@link #moveGroupEnd}) runs all its
+   * deletes, then all its upserts: each half is then ONE same-SQL run, sent as one batch,
+   * instead of two single-row round trips per move (a bulk UPDATE of the leading column). The
+   * reorder is apply-equivalent because the composite key contains the source key (a
+   * source-keyed record's key is a strict subset of it): a move's delete -- by its old
+   * composite key or by its source key -- never matches another source key's row, and its
+   * upsert never conflicts with one. The same row moved twice starts a new group, so its moves
+   * keep their order.
+   */
+  static List<Applicable> withMoveDeletes(List<Applicable> chunk) {
+    boolean anyMove = false;
+    for (Applicable a : chunk) {
+      if (a.event().isMove()) {
+        anyMove = true;
+        break;
+      }
+    }
+    if (!anyMove) {
+      return chunk;
+    }
+    List<Applicable> out = new ArrayList<>(chunk.size() * 2);
+    int i = 0;
+    while (i < chunk.size()) {
+      int end = moveGroupEnd(chunk, i);
+      if (end == i) {
+        out.add(chunk.get(i++)); // not a move
+        continue;
+      }
+      for (int j = i; j < end; j++) {
+        out.add(new Applicable(chunk.get(j).record(), chunk.get(j).event().moveDelete()));
+      }
+      out.addAll(chunk.subList(i, end));
+      i = end;
+    }
+    return out;
+  }
+
+  /**
+   * Exclusive end of the group of consecutive moves that starts at {@code start}, or
+   * {@code start} itself when that event is not a move: moves of one table, keyed on the same
+   * source-key columns, whose source keys are different rows by {@link #rowIdentity}. Anything
+   * that could be the same row ends the group -- a repeated key, a key of another kind (the
+   * key column's type changed), a null component -- which costs only batching, never order.
+   */
+  private static int moveGroupEnd(List<Applicable> chunk, int start) {
+    ChangeEvent first = chunk.get(start).event();
+    if (!first.isMove()) {
+      return start;
+    }
+    List<Object> firstRow = rowIdentity(first.sourceKeyValues());
+    if (firstRow == null) {
+      return start + 1; // no comparable key: this move on its own
+    }
+    Set<List<Object>> rows = new HashSet<>();
+    rows.add(firstRow);
+    int end = start + 1;
+    while (end < chunk.size()) {
+      ChangeEvent e = chunk.get(end).event();
+      List<Object> row =
+          e.isMove()
+                  && e.table().equals(first.table())
+                  && java.util.Objects.equals(first.sourceKeyColumns(), e.sourceKeyColumns())
+              ? rowIdentity(e.sourceKeyValues())
+              : null;
+      if (row == null || !sameKinds(row, firstRow) || !rows.add(row)) {
+        break;
+      }
+      end++;
+    }
+    return end;
+  }
+
+  /**
+   * A source key as values that are equal whenever Aurora DSQL could compare the keys equal:
+   * numbers by value (an INT widened to BIGINT, a NUMERIC scale), bytes by content, text
+   * without trailing spaces (CHAR padding); anything else as itself. {@code null} for a missing
+   * or empty key, or one with a null component.
+   */
+  private static List<Object> rowIdentity(List<Object> key) {
+    if (key == null || key.isEmpty()) {
+      return null;
+    }
+    List<Object> out = new ArrayList<>(key.size());
+    for (Object v : key) {
+      if (v == null) {
+        return null;
+      }
+      if (v instanceof Number n) {
+        out.add(canonicalNumber(n));
+      } else if (v instanceof byte[] b) {
+        out.add(java.nio.ByteBuffer.wrap(b.clone()));
+      } else if (v instanceof String s) {
+        out.add(s.stripTrailing());
+      } else {
+        out.add(v);
+      }
+    }
+    return out;
+  }
+
+  private static Object canonicalNumber(Number n) {
+    try {
+      return (n instanceof BigDecimal d ? d : new BigDecimal(n.toString())).stripTrailingZeros();
+    } catch (NumberFormatException e) {
+      return n.toString(); // NaN or an infinity
+    }
+  }
+
+  /** True when two identities hold the same kind of value in each component. */
+  private static boolean sameKinds(List<Object> a, List<Object> b) {
+    if (a.size() != b.size()) {
+      return false;
+    }
+    for (int i = 0; i < a.size(); i++) {
+      if (a.get(i).getClass() != b.get(i).getClass()) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /**
@@ -873,8 +1153,19 @@ public class DsqlSinkTask extends SinkTask {
         : DsqlDialect.upsertSql(event.table(), event.columns(), event.pkColumns());
   }
 
-  /** Execute one change event (upsert or delete) on the open connection. */
+  /**
+   * Execute one change event (upsert or delete) on the open connection. A move (G15) runs its
+   * delete first, on the same connection and so in the same transaction: the caller commits or
+   * rolls back both together.
+   */
   private void executeOne(Connection conn, ChangeEvent event) throws SQLException {
+    if (event.isMove()) {
+      executeStatement(conn, event.moveDelete());
+    }
+    executeStatement(conn, event);
+  }
+
+  private void executeStatement(Connection conn, ChangeEvent event) throws SQLException {
     try (PreparedStatement ps = conn.prepareStatement(renderSql(event))) {
       bind(ps, event, paramMetaOrNull(ps));
       ps.executeUpdate();
@@ -1037,10 +1328,12 @@ public class DsqlSinkTask extends SinkTask {
    * structural one ({@link #isStructuralDrift}) puts the table on the drift cool-down.
    */
   private void reportOrThrow(SinkRecord record, ChangeEvent event, SQLException cause) {
-    // A missing column / table / schema means the table's cached column types may be stale
-    // (the target was recreated or altered): read them again on the next put().
+    // A missing column / table / schema means the table's cached column types -- and its
+    // source-key index state -- may be stale (the target was recreated or altered): read them
+    // again on the next put().
     if (ValueFit.invalidatesTargetTypes(cause.getSQLState())) {
       targetTypes.invalidate(event.table());
+      sourceKeyIndex.invalidate(event.table());
     }
     // A structural rejection: apply this table's later rows one per transaction for a while,
     // instead of failing and replaying every chunk that holds one (see applyBatch).

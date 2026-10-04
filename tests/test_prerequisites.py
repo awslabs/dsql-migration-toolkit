@@ -2489,9 +2489,9 @@ def test_a_rekeyed_table_on_replica_identity_default_blocks_cdc() -> None:
     (`message.key.columns=ecommerce\\.orders:user_id,id`, the target PK chosen in Schema
     Conversion), and under REPLICA IDENTITY DEFAULT PostgreSQL limits a DELETE's before-image
     to the SOURCE primary key `(id)` -- so the DELETE does not carry `user_id` and removes
-    nothing on the target. (Not a NULL key: offline-proven against the shipped Debezium 2.7.4
-    jar, the key generator fills the absent NOT NULL column with a placeholder such as 0, so
-    the sink's NULL-key guard cannot fire; the v50 live run saw no DELETE at the sink at all.)
+    nothing on the target. (Not a NULL key: Debezium's key generator fills the absent NOT NULL
+    column with a placeholder -- live-confirmed on PostgreSQL 17, the column's DEFAULT -- so
+    the sink's NULL-key guard cannot fire; the DELETE reaches the sink and matches 0 rows.)
 
     The existing REPLICA_IDENTITY check graded this table PASS ("REPLICA IDENTITY is set for
     change replication"), because it asks a different question and accepts 'd'.
@@ -2514,11 +2514,25 @@ def test_a_rekeyed_table_on_replica_identity_default_blocks_cdc() -> None:
     assert blocked.target == "ecommerce.orders"
     # It must name the missing column, the consequence, and which writes are affected --
     # otherwise the operator cannot tell this from the generic identity check above. An
-    # UPDATE that changes a key column is affected too (its old key is the before-image).
+    # UPDATE that changes the source primary key is affected too (its old key is the
+    # before-image); an UPDATE of the added column alone is dead-lettered instead.
     assert "user_id" in blocked.detail
-    assert "SILENTLY LOST" in blocked.detail
-    assert "An UPDATE that changes a key column is affected too" in blocked.detail
-    assert "INSERTs and other UPDATEs are not" in blocked.detail
+    assert blocked.title == "Re-keyed table's before-image carries its composite key"
+    assert blocked.detail == (
+        "The Aurora DSQL primary key of ecommerce.orders is (user_id, id) -- the composite "
+        "key chosen in Schema Conversion -- which adds user_id beyond the source primary key "
+        "(id). REPLICA IDENTITY is DEFAULT, so the UPDATE/DELETE before-image carries only "
+        "the source primary key, so a DELETE, or an UPDATE that changes the source primary "
+        "key, does not carry user_id and can miss its row on Aurora DSQL with no error and no "
+        "dead letter; an UPDATE of user_id alone is dead-lettered (a unique constraint "
+        "rejected the row) and leaves the old row. INSERTs and other UPDATEs are not affected "
+        "(their after-image carries every column)."
+    )
+    # The two UPDATE cases are told apart: only a DELETE or a source-primary-key UPDATE is
+    # silent; an UPDATE of the added column alone is dead-lettered (23505).
+    assert "an UPDATE that changes a key column, does not carry" not in blocked.detail
+    assert "is dead-lettered" in blocked.detail and "leaves the old row" in blocked.detail
+    assert "SILENTLY LOST" not in blocked.detail
     assert "UPDATE are unaffected" not in blocked.detail
     # The mechanism is not claimed to be a NULL key (it is a placeholder, offline-proven).
     assert "would be NULL" not in blocked.detail
@@ -2545,6 +2559,11 @@ def test_replica_identity_full_satisfies_a_rekeyed_table() -> None:
     )
     assert ok is not None and ok.status is PrerequisiteStatus.PASS
     assert "user_id" in ok.detail
+    assert ok.title == "Re-keyed table's before-image carries its composite key"
+    assert ok.detail == (
+        "REPLICA IDENTITY FULL, so a DELETE carries user_id and the composite key "
+        "(user_id, id) locates the target row."
+    )
 
 
 def test_the_key_coverage_check_stays_silent_when_there_is_nothing_to_grade() -> None:
@@ -2653,7 +2672,8 @@ def test_the_shared_rule_names_five_partitions_of_a_server_side_count() -> None:
     assert r is not None and r.status is PrerequisiteStatus.FAIL
     assert "37 partition(s) are not REPLICA IDENTITY FULL" in r.detail
     assert ", ".join(names) + " (and 32 more)" in r.detail
-    assert "would not remove its row on Aurora DSQL" in r.detail
+    assert "can miss its row on Aurora DSQL with no error" in r.detail
+    assert r.detail.startswith("The Aurora DSQL primary key of ")
     # Exactly five shown, no tail.
     five = replica_identity_covers_key_result(
         table, ["tenant_id", "id"], identity="f",

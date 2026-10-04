@@ -208,14 +208,16 @@ CHECKSUM은 값 비교할 수 없는 컬럼을 명시합니다(5.1). dead-letter
 이 절은 **PostgreSQL** 소스에만, 그리고 CDC가 **재키잉**하는 테이블 — 소스 기본 키 밖의 컬럼을 더한 복합
 타깃 키(Schema Conversion의 Composite key, 또는 편집한 키) — 에만 해당합니다. 그런 테이블의 `DELETE`는 소스의
 `REPLICA IDENTITY`가 테이블과 모든 파티션에서 **FULL**인 동안에만 그 컬럼을 싣습니다. CDC 실행 중 FULL
-미만으로 내려가면(`ALTER TABLE … REPLICA IDENTITY DEFAULT`, 새 파티션, `USING INDEX`) 각 delete가 오류도 dead
-letter도 없이 Aurora DSQL에 행을 남깁니다. CDC 모니터가 이를 다시 읽고 내려갈 때마다 기록하며
+미만으로 내려가면(`ALTER TABLE … REPLICA IDENTITY DEFAULT`, 새 파티션, `USING INDEX`) delete가 오류도 dead
+letter도 없이 Aurora DSQL에 행을 남길 수 있습니다(언제 그런지는
+[§4.6](04-cdc-and-dsql-constraints.md#재키잉된-postgresql-테이블-replica-identity-재확인)에 있습니다). CDC
+모니터가 이를 다시 읽고 내려갈 때마다 기록하며
 ([§4.6](04-cdc-and-dsql-constraints.md#재키잉된-postgresql-테이블-replica-identity-재확인)), Validation과
 Cut over가 그 기록을 사용합니다:
 
 - **Validation은 그 테이블들을 자동으로 CHECKSUM으로 비교하며**, 실행 전에 Options에 이름을 보여 줍니다.
   테이블이 아직 FULL 미만이면 리포트는 *"Tables match — cut over is held: REPLICA IDENTITY on N re-keyed
-  table(s) is below FULL"* 로 표시합니다: delete가 계속 유실되므로 어떤 CHECKSUM도 이를 풀지 못합니다.
+  table(s) is below FULL"* 로 표시합니다: 변경이 계속 유실될 수 있으므로 어떤 CHECKSUM도 이를 풀지 못합니다.
   다시 FULL이 되면 수정 전에 시작한 일치로는 부족합니다: 리포트는 *"cut over waits for a CHECKSUM
   re-check"* 로 표시하고 **Re-check N table(s) with CHECKSUM**을 제공합니다.
 - **Cut over는** 그런 테이블이 모두 다시 FULL이고 **그리고** 도구가 FULL을 읽은 시각보다 **1분 넘게 뒤에

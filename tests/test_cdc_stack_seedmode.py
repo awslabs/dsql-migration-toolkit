@@ -204,3 +204,36 @@ def test_host_cidr_equal_to_a_default_subnet_does_not_duplicate_an_ingress_rule(
     rules = _ingress_rules(_load_template()["Resources"], host_cidr="172.31.0.0/20")
     assert len(rules) == len(set(rules)), rules
     assert ("tcp", 9098, 9098, "172.31.0.0/20") in rules
+
+
+def test_the_sink_reads_target_key_columns() -> None:
+    # G15: the re-keyed tables the sink writes by their composite key, from records keyed on
+    # the source primary key. Omitted (AWS::NoValue) when SinkKeyColumns is empty, so every
+    # stack without such a table keeps a byte-identical sink configuration.
+    import re
+
+    doc = _load_template()
+    param = doc["Parameters"]["SinkKeyColumns"]
+    assert param["Type"] == "String" and param["Default"] == ""
+    assert doc["Conditions"]["HasSinkKeyColumns"] == {
+        "Fn::Not": [{"Fn::Equals": [{"Ref": "SinkKeyColumns"}, ""]}]
+    }
+    expected = {
+        "Fn::If": ["HasSinkKeyColumns", {"Ref": "SinkKeyColumns"}, {"Ref": "AWS::NoValue"}]
+    }
+    res = doc["Resources"]
+    for name in ("DsqlSinkConnector", "DsqlSinkConnectorExternal"):
+        config = res[name]["Properties"]["ConnectorConfiguration"]
+        assert config["target.key.columns"] == expected, name
+    # The key is exactly the one the sink plugin reads.
+    java = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "connectors" / "dsql-sink" / "src" / "main" / "java" / "dev" / "dsqlmigrator"
+        / "connect" / "DsqlSinkConnectorConfig.java"
+    ).read_text(encoding="utf-8")
+    assert re.search(r'TARGET_KEY_COLUMNS = "target\.key\.columns";', java)
+    # Neither SOURCE connector is touched: Debezium keys a routed table on its source key
+    # because the table is left out of MessageKeyColumns, not by a new source property.
+    for name in ("DebeziumSourceConnector", "PostgresSourceConnector"):
+        assert "SinkKeyColumns" not in repr(res[name]), name
+        assert "target.key.columns" not in repr(res[name]), name

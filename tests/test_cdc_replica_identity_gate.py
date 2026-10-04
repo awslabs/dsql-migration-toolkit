@@ -4,9 +4,10 @@
 """G2: the runtime REPLICA IDENTITY re-check for re-keyed PostgreSQL tables.
 
 A re-keyed table's DELETE carries the key's added column only under REPLICA IDENTITY FULL;
-below it the delete is silently lost. These tests pin the fold (finding transitions), the
-scope and throttle of the background read, the cut-over gate's hold and release rules, and
-the copy. Offline: every source read is a double.
+below it the delete can be silently lost (on infrastructure deployed by an earlier version, or
+before the source-key unique index is valid -- G15). These tests pin the fold (finding
+transitions), the scope and throttle of the background read, the cut-over gate's hold and
+release rules, and the copy. Offline: every source read is a double.
 """
 
 from __future__ import annotations
@@ -260,6 +261,28 @@ def test_the_deployed_map_wins_and_the_session_map_is_limited_to_the_selection()
     assert replica_identity_scope(state, s) == {}
 
 
+def test_a_sink_keyed_table_stays_in_the_replica_identity_scope(logged):
+    """G15: a stack that keys a re-keyed table on its SOURCE primary key lists it in
+    SinkKeyColumns, not MessageKeyColumns. It is still re-keyed -- its deletes can still miss
+    while the source-key unique index builds -- so the re-check keeps it in scope and an open
+    finding is not closed as "not-rekeyed"."""
+    from dsql_migrator.core.cdc import deployed_rekey_map
+    from dsql_migrator.ui.cdc_replica_identity_gate import replica_identity_scope
+
+    s = _session()
+    state = _state(session_keys={}, findings={"app.t": _finding()})
+    deployed = deployed_rekey_map(
+        {"MessageKeyColumns": "", "SinkKeyColumns": r"app\.t:tenant_id,id"}
+    )
+    state.set_cdc_deployed_message_key_columns(deployed, now=T_FIX)
+    assert state.cdc_replica_identity_findings["app.t"].restored_at is None
+    assert replica_identity_scope(state, s) == {"app.t": list(KEY)}
+    assert logged == []  # nothing closed, nothing logged
+    # Restored FULL later, the routed table stays in scope (it is not a "not re-keyed" table).
+    state.cdc_replica_identity_findings = {}
+    assert replica_identity_scope(state, s) == {"app.t": list(KEY)}
+
+
 def test_an_open_finding_stays_in_scope_and_a_restored_one_does_not():
     from dsql_migrator.ui.cdc_replica_identity_gate import replica_identity_scope
 
@@ -377,7 +400,7 @@ def test_the_poll_starts_one_read_per_ttl_and_force_bypasses_it(monkeypatch, fak
     assert len(reads) == 2 and fake_run.calls == 2
     assert "app.t" in state.cdc_replica_identity_findings
     assert [line["action"] for line in logged].count(
-        "re-keyed table's REPLICA IDENTITY is below FULL: its deletes are being lost"
+        "re-keyed table's REPLICA IDENTITY is below FULL: its deletes can be lost"
     ) == 1  # one line per transition, not per read
     assert state.cdc_replica_identity_probe_running is False
 
@@ -465,7 +488,7 @@ def _gate(*, findings=_D, scope=_D, report=_D, run_start=T_FIX + timedelta(minut
 
 
 def test_weak_finding_holds_even_with_a_value_verified_checksum():
-    """The gap itself: deletes keep being lost, so no CHECKSUM can release it."""
+    """The gap itself: deletes can keep being lost, so no CHECKSUM can release it."""
     gate = _gate(findings={"app.t": _finding()}, scope={"app.t": KEY},
                  last_probe=_probe({"app.t": _read("d")}, started=T_FIX + timedelta(minutes=10)),
                  run_start=T_WEAK + timedelta(hours=2))
@@ -570,7 +593,18 @@ def test_the_weak_notice_names_the_table_the_fix_and_each_partition():
     from dsql_migrator.ui.cdc_replica_identity_gate import monitor_weak_notice
 
     header, body = monitor_weak_notice({"app.t": _finding()}, has_password=True)
-    assert header.startswith("Deletes on re-keyed tables are being lost")
+    assert header == (
+        "Deletes on re-keyed tables can be lost — REPLICA IDENTITY is not FULL on the source"
+    )
+    # G15: true on new and older CDC infrastructure alike -- a delete CAN miss (the sink
+    # deletes by the source key once its unique index is valid), never "are being lost".
+    assert (
+        "These tables have the composite primary key chosen in Schema Conversion, and a "
+        "DELETE carries that key's added column only under REPLICA IDENTITY FULL. While it is "
+        "below FULL, a DELETE can leave its row on Aurora DSQL with no error and no dead "
+        "letter, and an UPDATE that changes a key column can be lost too."
+    ) in body
+    assert "CDC keys these tables" not in body and "are being lost" not in body
     assert "app.t (REPLICA IDENTITY DEFAULT)" in body
     assert "ALTER TABLE <table> REPLICA IDENTITY FULL" in body and "each partition" in body
     assert "found at 2026-09-01 11:00 UTC" in body and "Check again" in body
@@ -579,6 +613,77 @@ def test_the_weak_notice_names_the_table_the_fix_and_each_partition():
     assert "reconnect the source on the Connect step" in nopw
     assert monitor_weak_notice({"app.t": _finding(restored=T_FIX, by="full")},
                                has_password=True) is None
+
+
+def test_g15_copy_says_a_change_can_be_lost_on_any_infrastructure():
+    """G15: on CDC infrastructure with sink plugin v51+ a re-keyed table is keyed on its source
+    primary key and its deletes land once the unique index on it is valid; on older
+    infrastructure (and before that) they still miss. Every G2 string must be true on both --
+    "can be lost", never "are being lost" -- and keep the fix and the Check again action."""
+    from dsql_migrator.ui.cdc_replica_identity_gate import (
+        ReplicaIdentityTransition,
+        _transition_line,
+        cutover_unchecked_notice,
+        cutover_weak_notice,
+        monitor_restored_notice,
+        monitor_unchecked_notice,
+        replica_identity_verdict_hold,
+    )
+
+    header, body = cutover_weak_notice(_gate(findings={"app.t": _finding()}, scope={"app.t": KEY}))
+    assert header == "Cut over is held: deletes on 1 re-keyed table(s) can be lost"
+    assert body.startswith(
+        "REPLICA IDENTITY on app.t (REPLICA IDENTITY DEFAULT) is below FULL on the source, so "
+        "their DELETEs (and UPDATEs that change the source primary key) can miss their rows on "
+        "Aurora DSQL with no error and no dead letter, and an UPDATE of the added key column "
+        "alone is dead-lettered and leaves the old row."
+    ), body
+    # An UPDATE of the added key column alone IS dead-lettered (23505 on the unique index over
+    # the source key): it must not be lumped in with the silent "no dead letter" case.
+    assert "(and UPDATEs that change a key column) can miss" not in body
+    assert "REPLICA IDENTITY FULL" in body and "Check again" in body
+    status, action, detail = _transition_line(
+        ReplicaIdentityTransition(kind="opened", table="app.t", finding=_finding())
+    )
+    assert status == "FAILURE"
+    assert action == "re-keyed table's REPLICA IDENTITY is below FULL: its deletes can be lost"
+    assert detail == (
+        "REPLICA IDENTITY DEFAULT; the composite key (tenant_id, id) adds tenant_id, which a "
+        "DELETE carries only under REPLICA IDENTITY FULL, so deletes on app.t can miss Aurora "
+        "DSQL with no error and no dead letter. Fix: ALTER TABLE app.t REPLICA IDENTITY FULL "
+        "on the source (each partition too). Cut over is held."
+    )
+    _tone, _h, info = monitor_unchecked_notice({"app.t": KEY}, None, has_password=False)
+    assert "because a DELETE on them can be lost silently if it drops below FULL" in info
+    unchecked = cutover_unchecked_notice(
+        _gate(findings={}, scope={"app.t": KEY}, has_source=False)
+    )
+    assert unchecked is not None
+    assert "because a DELETE on them can be lost silently while it is below FULL" in unchecked[1]
+    # The CDC monitor's restored notice and Validation's verdict while still below FULL: a
+    # delete made then may or may not have landed (G15), so neither says it certainly missed.
+    restored_h, restored_b = monitor_restored_notice(
+        {"app.t": _finding(restored=T_FIX, by="full")}, set(), None
+    )
+    assert restored_h == (
+        "REPLICA IDENTITY is FULL again — deletes made before the fix may be missing"
+    )
+    assert (
+        "Deletes made in that time may not have removed their rows on Aurora DSQL, and nothing "
+        "replays them."
+    ) in restored_b, restored_b
+    verdict = _gate(findings={"app.t": _finding()}, scope={"app.t": KEY},
+                    last_probe=_probe({"app.t": _read("d")}, started=T_FIX + timedelta(minutes=10)),
+                    check_probe=False)
+    tone, verdict_h, verdict_b = replica_identity_verdict_hold(verdict, total=2, as_of="now")
+    assert tone == "error"  # the hold and its severity are unchanged
+    assert "so their DELETEs can miss Aurora DSQL and this match may not last" in verdict_b
+    for text in (header, body, action, detail, info, unchecked[1], restored_h, restored_b,
+                 verdict_h, verdict_b):
+        assert "are being lost" not in text and "do not reach Aurora DSQL" not in text
+        assert "is lost silently" not in text
+        assert "did not remove" not in text and "keep missing" not in text
+        assert "will not last" not in text
 
 
 def test_the_repair_line_follows_the_migration_type():

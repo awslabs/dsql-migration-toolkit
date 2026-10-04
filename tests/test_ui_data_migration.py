@@ -2226,6 +2226,10 @@ def test_empty_target_already_carrying_the_new_key_is_not_recreated() -> None:
     # An existing (empty) table CAN conflict on a retry, so the append keeps ON CONFLICT
     # -- unlike the recreate path, which uses a plain INSERT into a fresh table.
     assert importer.on_conflict_by_table["orders"] is not OnConflictMode.NONE
+    # No post-load index pass: Apply all created the secondary indexes WITH the table --
+    # Composite key's unique index on the source key included, which is why the manual
+    # (4.6) says that index is built after the load only on a Drop & reload.
+    assert importer.index_ddls_by_table["orders"] is None
 
 
 def test_cdc_coexisting_empty_target_appends_when_the_key_already_matches() -> None:
@@ -28290,7 +28294,7 @@ def test_the_block_reason_names_the_failing_check_and_its_remedy() -> None:
         ),
         PrerequisiteResult(
             check_id=PrerequisiteCheckId.REPLICA_IDENTITY_COVERS_KEY,
-            title="Re-keyed table's before-image carries the record key",
+            title="Re-keyed table's before-image carries its composite key",
             status=PrerequisiteStatus.FAIL,
             required=True,
             target="ecommerce.orders",
@@ -31299,13 +31303,13 @@ def _g2_logged(monkeypatch):
 
 
 _G2_HEADER = (
-    "Deletes on re-keyed tables are being lost — REPLICA IDENTITY is not FULL on the source"
+    "Deletes on re-keyed tables can be lost — REPLICA IDENTITY is not FULL on the source"
 )
 
 
 def test_cdc_poll_probes_rekeyed_replica_identity_and_shows_error_banner(monkeypatch) -> None:
-    """The gap: a re-keyed table switched to REPLICA IDENTITY DEFAULT after Start loses every
-    DELETE silently. The poll's throttled re-read now finds it, logs it once, and the next
+    """The gap: a re-keyed table switched to REPLICA IDENTITY DEFAULT after Start can lose
+    DELETEs silently. The poll's throttled re-read now finds it, logs it once, and the next
     render shows the red banner with the fix."""
     from dsql_migrator.core.activity_log import ActivityStatus
 
@@ -31483,6 +31487,100 @@ def test_discovery_records_the_deployed_message_key_columns(monkeypatch) -> None
     params["absent"] = True
     _probe_cdc_stack_phase(state, session)
     assert state.cdc_deployed_message_key_columns is None
+
+
+def test_discovery_records_sink_keyed_tables_as_rekeyed(monkeypatch) -> None:
+    """G15: a table keyed on the SOURCE primary key (SinkKeyColumns) is still re-keyed.
+
+    FAILS WITHOUT THE UNION: reading MessageKeyColumns alone gave {} for a routed stack, so
+    an open REPLICA IDENTITY finding closed as "not-rekeyed" and the runtime re-check, the
+    source schema re-check and the cut-over hold all lost the table."""
+    from types import SimpleNamespace
+
+    import dsql_migrator.core.cdc_deployer as deployer_mod
+    from dsql_migrator.core.models import CdcReplicaIdentityFinding
+    from dsql_migrator.ui.data_migration._cdc_status import _probe_cdc_stack_phase
+
+    params: dict = {}
+
+    class _Deployer:
+        def describe_stack_or_none(self, _name):
+            return SimpleNamespace(stack_status="UPDATE_COMPLETE", is_stable=True,
+                                   current_parameters=dict(params["p"]), outputs={})
+
+        def list_cdc_stacks(self):
+            return []
+
+    _g2_logged(monkeypatch)
+    monkeypatch.setattr(deployer_mod, "build_cdc_stack_deployer", lambda *a, **k: _Deployer())
+    session = SimpleNamespace(target_config=SimpleNamespace(region="us-east-1"), aws_profile=None)
+    state = DataMigrationState()
+    state.cdc_replica_identity_findings = {
+        "s.t": CdcReplicaIdentityFinding(
+            key_columns=["lead", "id"], primary_key=["id"], identity="d",
+            first_weak_at=datetime(2026, 10, 3, 11, tzinfo=timezone.utc),
+        ),
+    }
+    params["p"] = {"MessageKeyColumns": "", "SinkKeyColumns": r"s\.t:lead,id"}
+    _probe_cdc_stack_phase(state, session)
+    assert state.cdc_deployed_message_key_columns == {"s.t": ["lead", "id"]}
+    assert state.cdc_replica_identity_findings["s.t"].restored_at is None  # still open
+    params["p"] = {"SinkKeyColumns": r"s\.t:lead,id", "MessageKeyColumns": r"s\.u:k,id"}
+    _probe_cdc_stack_phase(state, session)
+    assert state.cdc_deployed_message_key_columns == {
+        "s.t": ["lead", "id"], "s.u": ["k", "id"]
+    }
+
+
+def test_the_postgres_start_warning_says_a_rekeyed_change_can_miss_its_row(monkeypatch) -> None:
+    """G15: true on old and new CDC infrastructure -- a DELETE (or a key-changing UPDATE) below
+    FULL CAN miss its row, never "is silently lost"; the warning still names the tables and the
+    prerequisite that blocks the start."""
+    from types import SimpleNamespace
+
+    import dsql_migrator.ui.data_migration._cdc_ui as cdcui
+    from dsql_migrator.core.models import ColumnDef, SourceInventory, SourceType, TableDef
+    from dsql_migrator.core.table_selection import TableSelection
+
+    orders = TableDef(
+        name="app.orders", primary_key=["id"],
+        columns=[ColumnDef(name="lead", mysql_type="int"), ColumnDef(name="id", mysql_type="int")],
+    )
+    state = DataMigrationState()
+    state.set_selection(TableSelection(selected_tables=["app.orders"]))
+    state.set_cdc_message_key_columns({"app.orders": ["lead", "id"]})
+    notices: list = []
+    monkeypatch.setattr(cdcui, "render_notice", lambda ui, **kw: notices.append(kw))
+
+    class _JM:
+        def get_status(self, _job_id):
+            raise KeyError(_job_id)
+
+        def submit(self, _work):
+            raise AssertionError("nothing may be submitted without a target")
+
+    session = SimpleNamespace(
+        source_config=SimpleNamespace(source_type=SourceType.POSTGRES, database="app"),
+        target_config=None, aws_profile=None, restored_source_type=None, source_password=None,
+    )
+    cdcui._start_cdc_deploy(SimpleNamespace(notify=lambda *a, **k: None), state, _JM(),
+                            lambda: None, inventory=SourceInventory(tables=[orders]),
+                            session=session)
+    (warning,) = [
+        n for n in notices
+        if n.get("header") == "Re-keyed tables need REPLICA IDENTITY FULL on the source"
+    ]
+    assert warning["tone"] == "warning"
+    assert warning["body"].startswith(
+        "These tables have a composite (re-keyed) primary key: app.orders. A DELETE, or an "
+        "UPDATE that changes the source primary key, must carry the added leading key column, "
+        "or it can miss its row on Aurora DSQL with no error; an UPDATE of the leading column "
+        "alone is dead-lettered and leaves the old row. The tool sets REPLICA IDENTITY FULL "
+        "during Full Load ONLY when"
+    ), warning["body"]
+    assert "an UPDATE that changes a key column, must carry" not in warning["body"]
+    assert "silently lost" not in warning["body"]
+    assert "Run the CDC prerequisite checks" in warning["body"]
 
 
 def test_a_deployed_map_without_the_table_closes_its_open_finding_once(monkeypatch) -> None:

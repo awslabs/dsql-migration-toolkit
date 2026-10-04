@@ -235,7 +235,7 @@ include public.settings.preferences
 | 컬럼 | 표시 | 이유 |
 |---|---|---|
 | 소스 기본 키 컬럼 | primary key | 도구가 행을 읽고, 중복을 제거하고, 복제하는 데 필요합니다. |
-| Schema Conversion에서 고른 타깃 기본 키 컬럼: 복합 키의 선두 컬럼, 편집한 DDL의 이름 붙은 `CONSTRAINT ... PRIMARY KEY`의 컬럼, 또는 CDC 재키(re-key) 컬럼(`message.key.columns`) | target key | 로더는 모든 행의 모든 타깃 키 컬럼을 읽으며, CDC는 그것으로 레코드 키를 만듭니다. |
+| Schema Conversion에서 고른 타깃 기본 키 컬럼: 복합 키의 선두 컬럼, 편집한 DDL의 이름 붙은 `CONSTRAINT ... PRIMARY KEY`의 컬럼, 또는 CDC 재키(re-key) 컬럼(`message.key.columns`) | target key | 로더는 모든 행의 모든 타깃 키 컬럼을 읽으며, CDC는 각 행을 그 키로 쓰고 삭제하므로 이 컬럼이 필요합니다. |
 | 선택된 테이블의 보존된 외래 키가 참조하는 컬럼(외래 키를 보존하는 동안만) | referenced by a foreign key | 모든 자식 행이 고아가 되고, 외래 키를 추가할 수 없게 됩니다. |
 | Aurora DSQL이 계산하는 컬럼: 보존된 `GENERATED ... STORED` 컬럼, 또는 기본 키 밖의 identity 컬럼 | computed | Aurora DSQL이 계산하며, 도구는 절대 쓰지 않습니다. DEFAULT를 제거해도 identity 컬럼을 NULL로 만들 수 없습니다. |
 

@@ -6,6 +6,7 @@ package dev.dsqlmigrator.connect;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -479,19 +480,20 @@ class DebeziumEventsTest {
 
   @Test
   void aRequiredRekeyColumnHoldingDebeziumsPlaceholderIsNotDetectedBySink() {
-    // CHARACTERIZATION (G2), pinning what the sink CANNOT see. The real shape of a re-keyed
-    // table's DELETE under PostgreSQL REPLICA IDENTITY DEFAULT: the composite key's leading
-    // column is NOT NULL on the source, so its key field is REQUIRED, and Debezium's
-    // TableSchemaBuilder key generator converts the absent before-image value with no null
-    // check -- JdbcValueConverters yields the type's placeholder (0 here; '' for text, or the
-    // column's DEFAULT). Offline-proven against the shipped debezium-core 2.7.4 jar. The key is
-    // therefore non-null, requireNoNullKeyComponent cannot fire, and the sink builds
-    // DELETE ... WHERE user_id = 0 AND id = 510, which removes nothing -- silently (a different
-    // row can match only when the key omits part of the source primary key; this one keeps
-    // id, the whole source key). The protection is upstream, in the control plane:
-    // the Start prerequisite blocks this configuration and the runtime REPLICA IDENTITY
-    // re-check holds cut over while it lasts. If this test ever starts failing because the
-    // sink learned to detect it, update that design (and the docs) deliberately.
+    // CHARACTERIZATION (G2), pinning what the sink CANNOT see on a record keyed on the
+    // COMPOSITE key -- infrastructure deployed before sink plugin v51, or an in-flight record
+    // of it. The real shape of such a table's DELETE under PostgreSQL REPLICA IDENTITY DEFAULT,
+    // live-confirmed on PostgreSQL 17 (2026-10-03): the composite key's leading column is NOT
+    // NULL on the source, so its key field is REQUIRED, and Debezium's key generator converts
+    // the absent before-image value with no null check -- the type's placeholder (0 here; ''
+    // for text) or the column's DEFAULT (the live run carried 7, its DEFAULT, for a row whose
+    // lead was 5). The key is therefore non-null, requireNoNullKeyComponent cannot fire, and
+    // the sink builds DELETE ... WHERE user_id = 0 AND id = 510, which removes nothing --
+    // silently, nothing dead-lettered. This legacy parse is unchanged on purpose: since G15 a
+    // table listed in target.key.columns is keyed on the SOURCE primary key instead (see the
+    // source-keyed tests below), and the control plane's Start prerequisite and runtime
+    // REPLICA IDENTITY re-check still guard both shapes. If this test ever starts failing
+    // because the legacy path changed, update that design (and the docs) deliberately.
     Schema requiredKey =
         SchemaBuilder.struct()
             .name("Key")
@@ -758,4 +760,401 @@ class DebeziumEventsTest {
     assertTrue(DebeziumEvents.parse(record(key(1L), null, "dsqlcdc.app.users")).isTombstone());
   }
 
+  // --- Source-keyed re-keyed tables (G15) -----------------------------------------------
+
+  private static final java.util.Map<String, List<String>> REKEYED =
+      java.util.Map.of("app.orders", List.of("lead", "id"));
+
+  private static final Schema SRC_KEY =
+      SchemaBuilder.struct().name("Key").field("id", Schema.INT64_SCHEMA).build();
+
+  private static final Schema LEAD_ROW =
+      SchemaBuilder.struct()
+          .name("Row")
+          .field("lead", Schema.INT64_SCHEMA)
+          .field("id", Schema.INT64_SCHEMA)
+          .field("name", Schema.OPTIONAL_STRING_SCHEMA)
+          .optional()
+          .build();
+
+  private static final Schema LEAD_ENVELOPE =
+      SchemaBuilder.struct()
+          .name("Envelope")
+          .field("op", Schema.STRING_SCHEMA)
+          .field("before", LEAD_ROW)
+          .field("after", LEAD_ROW)
+          .field("source", SOURCE)
+          .build();
+
+  private static Struct leadRow(long lead, long id, String name) {
+    return new Struct(LEAD_ROW).put("lead", lead).put("id", id).put("name", name);
+  }
+
+  private static SinkRecord leadRecord(String op, Struct before, Struct after) {
+    Struct env = new Struct(LEAD_ENVELOPE).put("op", op).put("source", source("orders"));
+    if (before != null) {
+      env.put("before", before);
+    }
+    if (after != null) {
+      env.put("after", after);
+    }
+    return record(new Struct(SRC_KEY).put("id", 2L), env, "dsqlcdc.app.orders");
+  }
+
+  @Test
+  void sourceKeyedInsertConflictsOnTheCompositeKey() {
+    ChangeEvent event =
+        DebeziumEvents.parse(leadRecord("c", null, leadRow(5L, 2L, "a")), REKEYED);
+    assertTrue(event.isInsert());
+    assertEquals(List.of("lead", "id"), event.pkColumns());
+    assertEquals(List.of(5L, 2L), event.pkValues());
+    assertEquals(List.of("lead", "id", "name"), event.columns());
+    assertEquals(List.of("id"), event.sourceKeyColumns());
+    assertEquals(List.of(2L), event.sourceKeyValues());
+    assertFalse(event.isMove());
+    assertEquals(
+        "INSERT INTO \"app\".\"orders\" (\"lead\", \"id\", \"name\") VALUES (?, ?, ?) "
+            + "ON CONFLICT (\"lead\", \"id\") DO UPDATE SET \"name\" = EXCLUDED.\"name\"",
+        DsqlSinkTask.renderSql(event));
+    // A snapshot read (op r) is an insert the same way.
+    assertTrue(
+        DebeziumEvents.parse(leadRecord("r", null, leadRow(5L, 2L, "a")), REKEYED).isInsert());
+  }
+
+  @Test
+  void leadingColumnUpdateBecomesAMove() {
+    ChangeEvent event =
+        DebeziumEvents.parse(
+            leadRecord("u", leadRow(5L, 2L, "a"), leadRow(9L, 2L, "b")), REKEYED);
+    assertTrue(event.isUpdate());
+    assertTrue(event.isMove());
+    assertEquals(List.of(9L, 2L), event.pkValues());
+    assertEquals(List.of(5L, 2L), event.movedFromPkValues());
+    ChangeEvent delete = event.moveDelete();
+    assertTrue(delete.isDelete());
+    assertEquals(List.of("lead", "id"), delete.pkColumns());
+    assertEquals(List.of(5L, 2L), delete.pkValues());
+    // Keyed on the source key once the unique index on it is valid.
+    ChangeEvent bySourceKey = event.withMoveDeleteBySourceKey().moveDelete();
+    assertEquals(List.of("id"), bySourceKey.pkColumns());
+    assertEquals(List.of(2L), bySourceKey.pkValues());
+    assertEquals(
+        "DELETE FROM \"app\".\"orders\" WHERE \"id\" = ?", DsqlSinkTask.renderSql(bySourceKey));
+  }
+
+  @Test
+  void unchangedKeyUpdateIsAPlainUpsert() {
+    ChangeEvent event =
+        DebeziumEvents.parse(
+            leadRecord("u", leadRow(5L, 2L, "a"), leadRow(5L, 2L, "b")), REKEYED);
+    assertTrue(event.isUpdate());
+    assertFalse(event.isMove());
+    assertEquals(List.of(5L, 2L), event.pkValues());
+
+    // Numbers are compared by value: a NUMERIC lead of 5.0 before and 5.00 after is the same
+    // key, so it is never turned into a delete + insert.
+    Schema decimalRow =
+        SchemaBuilder.struct()
+            .name("Row")
+            .field("lead", org.apache.kafka.connect.data.Decimal.schema(2))
+            .field("id", Schema.INT64_SCHEMA)
+            .optional()
+            .build();
+    Schema env =
+        SchemaBuilder.struct()
+            .name("Envelope")
+            .field("op", Schema.STRING_SCHEMA)
+            .field("before", decimalRow)
+            .field("after", decimalRow)
+            .field("source", SOURCE)
+            .build();
+    Struct value =
+        new Struct(env)
+            .put("op", "u")
+            .put(
+                "before",
+                new Struct(decimalRow).put("lead", new java.math.BigDecimal("5.0")).put("id", 2L))
+            .put(
+                "after",
+                new Struct(decimalRow).put("lead", new java.math.BigDecimal("5.00")).put("id", 2L))
+            .put("source", source("orders"));
+    ChangeEvent numeric =
+        DebeziumEvents.parse(
+            record(new Struct(SRC_KEY).put("id", 2L), value, "dsqlcdc.app.orders"), REKEYED);
+    assertFalse(numeric.isMove());
+    assertTrue(
+        DebeziumEvents.sameKey(
+            List.of(new java.math.BigDecimal("5.0"), 2L),
+            List.of(new java.math.BigDecimal("5.00"), 2L)));
+    assertTrue(
+        DebeziumEvents.sameKey(
+            List.of((Object) new byte[] {1, 2}), List.of((Object) new byte[] {1, 2})));
+    assertFalse(DebeziumEvents.sameKey(List.of(5L, 2L), List.of(9L, 2L)));
+  }
+
+  @Test
+  void updateWithoutABeforeImageIsAPlainUpsert() {
+    // PostgreSQL REPLICA IDENTITY DEFAULT sends no old tuple for an UPDATE that leaves the
+    // source key alone: nothing to compare, so a plain upsert by the after-image's key.
+    ChangeEvent event =
+        DebeziumEvents.parse(leadRecord("u", null, leadRow(9L, 2L, "b")), REKEYED);
+    assertTrue(event.isUpdate());
+    assertFalse(event.isMove());
+    assertEquals(List.of(9L, 2L), event.pkValues());
+  }
+
+  @Test
+  void placeholderDeleteCarriesTheSourceKey() {
+    // The live REPLICA IDENTITY DEFAULT shape: the before-image's lead holds the column
+    // DEFAULT (7). The delete is keyed on that exact composite (which matches nothing) and
+    // carries the source key the task switches to once the unique index on it is valid.
+    ChangeEvent event = DebeziumEvents.parse(leadRecord("d", leadRow(7L, 2L, null), null), REKEYED);
+    assertTrue(event.isDelete());
+    assertFalse(event.isTombstone());
+    assertEquals(List.of("lead", "id"), event.pkColumns());
+    assertEquals(List.of(7L, 2L), event.pkValues());
+    assertEquals(List.of("id"), event.sourceKeyColumns());
+    assertEquals(List.of(2L), event.sourceKeyValues());
+    ChangeEvent bySourceKey = event.keyedBySourceKey();
+    assertTrue(bySourceKey.isDelete());
+    assertEquals(List.of("id"), bySourceKey.pkColumns());
+    assertEquals(List.of(2L), bySourceKey.pkValues());
+  }
+
+  @Test
+  void sourceKeyedDeleteWithoutABeforeImageIsRejected() {
+    DataException thrown =
+        assertThrows(
+            DataException.class, () -> DebeziumEvents.parse(leadRecord("d", null, null), REKEYED));
+    assertEquals(
+        "Cannot build DELETE for table app.orders: the change record has no before-image, so the"
+            + " row of its composite primary key (lead, id) cannot be located",
+        thrown.getMessage());
+  }
+
+  @Test
+  void afterImageMissingACompositeKeyColumnIsRejected() {
+    Schema noLead =
+        SchemaBuilder.struct()
+            .name("Row")
+            .field("id", Schema.INT64_SCHEMA)
+            .field("name", Schema.OPTIONAL_STRING_SCHEMA)
+            .optional()
+            .build();
+    Schema env =
+        SchemaBuilder.struct()
+            .name("Envelope")
+            .field("op", Schema.STRING_SCHEMA)
+            .field("after", noLead)
+            .field("source", SOURCE)
+            .build();
+    Struct value =
+        new Struct(env)
+            .put("op", "c")
+            .put("after", new Struct(noLead).put("id", 2L).put("name", "a"))
+            .put("source", source("orders"));
+    DataException thrown =
+        assertThrows(
+            DataException.class,
+            () ->
+                DebeziumEvents.parse(
+                    record(new Struct(SRC_KEY).put("id", 2L), value, "dsqlcdc.app.orders"),
+                    REKEYED));
+    assertEquals(
+        "Cannot build upsert for table app.orders: the after-image has no value for composite"
+            + " primary-key column 'lead'",
+        thrown.getMessage());
+  }
+
+  // A NULLABLE leading column: only reachable after a source DDL relaxed it (Schema Conversion
+  // only accepts a NOT NULL leading column), or -- with no lead field at all -- after the column
+  // was dropped, since project() maps an absent field to null.
+  private static final Schema NULLABLE_LEAD_ROW =
+      SchemaBuilder.struct()
+          .name("Row")
+          .field("lead", Schema.OPTIONAL_INT64_SCHEMA)
+          .field("id", Schema.INT64_SCHEMA)
+          .field("name", Schema.OPTIONAL_STRING_SCHEMA)
+          .optional()
+          .build();
+
+  private static SinkRecord nullableLeadRecord(String op, Struct before, Struct after) {
+    Schema envelope =
+        SchemaBuilder.struct()
+            .name("Envelope")
+            .field("op", Schema.STRING_SCHEMA)
+            .field("before", before != null ? before.schema() : NULLABLE_LEAD_ROW)
+            .field("after", NULLABLE_LEAD_ROW)
+            .field("source", SOURCE)
+            .build();
+    Struct env = new Struct(envelope).put("op", op).put("source", source("orders"));
+    if (before != null) {
+      env.put("before", before);
+    }
+    if (after != null) {
+      env.put("after", after);
+    }
+    return record(new Struct(SRC_KEY).put("id", 2L), env, "dsqlcdc.app.orders");
+  }
+
+  @Test
+  void sourceKeyedDeleteWithANullCompositeComponentIsRejected() {
+    // Its exact composite DELETE would render "lead" = NULL and remove nothing, with no error:
+    // it must be dead-lettered instead. Both shapes: a null lead, and no lead field at all.
+    Struct nullLead =
+        new Struct(NULLABLE_LEAD_ROW).put("lead", null).put("id", 2L).put("name", "a");
+    Schema noLeadRow =
+        SchemaBuilder.struct().name("Row").field("id", Schema.INT64_SCHEMA).optional().build();
+    for (Struct before : List.of(nullLead, new Struct(noLeadRow).put("id", 2L))) {
+      DataException thrown =
+          assertThrows(
+              DataException.class,
+              () -> DebeziumEvents.parse(nullableLeadRecord("d", before, null), REKEYED));
+      assertTrue(
+          thrown.getMessage().startsWith(
+              "Cannot build DELETE for table app.orders: key column 'lead' is null"),
+          thrown.getMessage());
+    }
+  }
+
+  @Test
+  void aMoveFromANullCompositeComponentIsRejected() {
+    // The move's delete half would be keyed "lead" = NULL: the old row would survive the move.
+    Struct before =
+        new Struct(NULLABLE_LEAD_ROW).put("lead", null).put("id", 2L).put("name", "a");
+    Struct after =
+        new Struct(NULLABLE_LEAD_ROW).put("lead", 9L).put("id", 2L).put("name", "b");
+    DataException thrown =
+        assertThrows(
+            DataException.class,
+            () -> DebeziumEvents.parse(nullableLeadRecord("u", before, after), REKEYED));
+    assertTrue(
+        thrown.getMessage().startsWith(
+            "Cannot build UPDATE for table app.orders: key column 'lead' is null"),
+        thrown.getMessage());
+  }
+
+  @Test
+  void sourceKeyedTombstoneIsRecognisedAndALegacyKeyedOneIsNot() {
+    SinkRecord sourceKeyed = record(new Struct(SRC_KEY).put("id", 2L), null, "dsqlcdc.app.orders");
+    assertTrue(DebeziumEvents.isSourceKeyedTombstone(sourceKeyed, REKEYED));
+    Schema compositeKey =
+        SchemaBuilder.struct()
+            .name("Key")
+            .field("lead", Schema.INT64_SCHEMA)
+            .field("id", Schema.INT64_SCHEMA)
+            .build();
+    SinkRecord legacy =
+        record(new Struct(compositeKey).put("lead", 5L).put("id", 2L), null, "dsqlcdc.app.orders");
+    assertFalse(DebeziumEvents.isSourceKeyedTombstone(legacy, REKEYED));
+    // ...which still parses as today's tombstone delete.
+    assertTrue(DebeziumEvents.parse(legacy, REKEYED).isTombstone());
+    // Not a tombstone, an unlisted table, an empty map: never.
+    assertFalse(
+        DebeziumEvents.isSourceKeyedTombstone(
+            leadRecord("d", leadRow(5L, 2L, "a"), null), REKEYED));
+    assertFalse(
+        DebeziumEvents.isSourceKeyedTombstone(
+            record(new Struct(SRC_KEY).put("id", 2L), null, "dsqlcdc.app.items"), REKEYED));
+    assertFalse(DebeziumEvents.isSourceKeyedTombstone(sourceKeyed, java.util.Map.of()));
+  }
+
+  @Test
+  void aKeyThatIsNotAStrictSubsetIsNotSourceKeyed() {
+    // The whole composite key in either order (an older pipeline's record), and a key with a
+    // column outside the composite, all parse as today: keyed by the record key.
+    assertNull(DebeziumEvents.sourceKeyedComposite(REKEYED, "app.orders", List.of("lead", "id")));
+    assertNull(DebeziumEvents.sourceKeyedComposite(REKEYED, "app.orders", List.of("id", "lead")));
+    assertNull(DebeziumEvents.sourceKeyedComposite(REKEYED, "app.orders", List.of("other")));
+    assertNull(DebeziumEvents.sourceKeyedComposite(REKEYED, "app.orders", List.of("id", "x")));
+    assertEquals(
+        List.of("lead", "id"),
+        DebeziumEvents.sourceKeyedComposite(REKEYED, "app.orders", List.of("id")));
+    Schema otherKey =
+        SchemaBuilder.struct().name("Key").field("other", Schema.INT64_SCHEMA).build();
+    Struct env =
+        new Struct(LEAD_ENVELOPE).put("op", "c").put("after", leadRow(5L, 2L, "a"))
+            .put("source", source("orders"));
+    ChangeEvent event =
+        DebeziumEvents.parse(
+            record(new Struct(otherKey).put("other", 1L), env, "dsqlcdc.app.orders"), REKEYED);
+    assertEquals(List.of("other"), event.pkColumns());
+    assertFalse(event.hasSourceKey());
+  }
+
+  @Test
+  void emptyRecordKeyIsNotSourceKeyed() {
+    assertNull(DebeziumEvents.sourceKeyedComposite(REKEYED, "app.orders", List.of()));
+    // No key at all: today's path (a delete falls back to the before-image for its key).
+    Struct env =
+        new Struct(LEAD_ENVELOPE).put("op", "d").put("before", leadRow(5L, 2L, "a"))
+            .put("source", source("orders"));
+    ChangeEvent event = DebeziumEvents.parse(record(null, env, "dsqlcdc.app.orders"), REKEYED);
+    assertTrue(event.isDelete());
+    assertEquals(List.of("lead", "id", "name"), event.pkColumns());
+    assertFalse(event.hasSourceKey());
+  }
+
+  @Test
+  void unlistedTableParsesIdentically() {
+    Struct env =
+        new Struct(ENVELOPE).put("op", "u").put("before", row(1L, "A")).put("after", row(1L, "B"))
+            .put("source", source("users"));
+    SinkRecord rec = record(key(1L), env, "dsqlcdc.app.users");
+    ChangeEvent plain = DebeziumEvents.parse(rec);
+    ChangeEvent listed = DebeziumEvents.parse(rec, REKEYED);
+    assertEquals(plain.pkColumns(), listed.pkColumns());
+    assertEquals(plain.pkValues(), listed.pkValues());
+    assertEquals(plain.columns(), listed.columns());
+    assertEquals(plain.values(), listed.values());
+    assertEquals(DsqlSinkTask.renderSql(plain), DsqlSinkTask.renderSql(listed));
+    assertFalse(listed.hasSourceKey());
+    assertFalse(listed.isMove());
+  }
+
+  @Test
+  void tableLookupIsExact() {
+    // A name that differs only in case is a DIFFERENT table (PostgreSQL; MySQL with
+    // lower_case_table_names=0), never the listed one.
+    java.util.Map<String, List<String>> keys = new java.util.LinkedHashMap<>();
+    keys.put("app.orders", List.of("lead", "id"));
+    assertEquals(
+        List.of("lead", "id"),
+        DebeziumEvents.sourceKeyedComposite(keys, "app.orders", List.of("id")));
+    assertNull(DebeziumEvents.sourceKeyedComposite(keys, "app.Orders", List.of("id")));
+    assertNull(DebeziumEvents.sourceKeyedComposite(keys, "APP.ORDERS", List.of("id")));
+    // Both twins listed: each is matched to its own entry.
+    keys.put("app.Orders", List.of("tenant", "id"));
+    assertEquals(
+        List.of("tenant", "id"),
+        DebeziumEvents.sourceKeyedComposite(keys, "app.Orders", List.of("id")));
+    assertEquals(
+        List.of("lead", "id"),
+        DebeziumEvents.sourceKeyedComposite(keys, "app.orders", List.of("id")));
+    assertNull(DebeziumEvents.sourceKeyedComposite(keys, "app.orders2", List.of("id")));
+  }
+
+  @Test
+  void anUnlistedCaseTwinOfAListedTableParsesIdentically() {
+    // app.Orders (PK (id), no `lead`) next to the listed app.orders: keyed {id} as before G15,
+    // so it must parse exactly as with no target.key.columns -- not by app.orders' key.
+    for (SinkRecord rec :
+        List.of(
+            record(key(1L), new Struct(ENVELOPE).put("op", "c").put("after", row(1L, "a"))
+                .put("source", source("Orders")), "dsqlcdc.app.Orders"),
+            record(key(1L), new Struct(ENVELOPE).put("op", "u").put("before", row(1L, "a"))
+                .put("after", row(1L, "b")).put("source", source("Orders")), "dsqlcdc.app.Orders"),
+            record(key(1L), new Struct(ENVELOPE).put("op", "d").put("before", row(1L, "b"))
+                .put("source", source("Orders")), "dsqlcdc.app.Orders"),
+            record(key(1L), null, "dsqlcdc.app.Orders"))) {
+      ChangeEvent plain = DebeziumEvents.parse(rec);
+      ChangeEvent listed = DebeziumEvents.parse(rec, REKEYED);
+      assertEquals(plain.pkColumns(), listed.pkColumns());
+      assertEquals(plain.pkValues(), listed.pkValues());
+      assertEquals(DsqlSinkTask.renderSql(plain), DsqlSinkTask.renderSql(listed));
+      assertFalse(listed.hasSourceKey());
+      assertFalse(listed.isMove());
+      assertFalse(DebeziumEvents.isSourceKeyedTombstone(rec, REKEYED));
+    }
+  }
 }

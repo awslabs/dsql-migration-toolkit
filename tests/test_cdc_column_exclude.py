@@ -338,8 +338,12 @@ def test_start_blocks_a_generated_rekey_column_even_with_a_regex_character(monke
                             lambda: None, inventory=inv, session=session)
     headers = [n.get("header") for n in notices]
     assert "Composite key column is excluded from capture" in headers, headers
-    assert "shop.docs.bucket$1" in next(
+    body = next(
         n["body"] for n in notices if n.get("header") == "Composite key column is excluded from capture")
+    assert "shop.docs.bucket$1" in body
+    # True for both routings (G15): on a v51+ stack the record key is the SOURCE primary key and
+    # it is the sink that cannot build the composite key without the column.
+    assert "record key" not in body and "composite primary key" in body, body
     assert not _JM.submitted
 
 

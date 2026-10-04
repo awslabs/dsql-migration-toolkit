@@ -63,13 +63,28 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
   - **PostgreSQL 소스, 재키잉(re-keyed) 테이블:** CDC가 재키잉하는 테이블 — Schema Conversion의
     **Composite key**, 또는 소스 기본 키 밖의 컬럼을 더하도록 편집한 타깃 키 — 은 Start 시점만이 아니라
     **CDC 실행 내내 테이블과 모든 파티션에 `REPLICA IDENTITY FULL`**이 필요합니다(나중에 만든 파티션은
-    `DEFAULT`로 시작). FULL 미만이면 그 테이블의 `DELETE`가 Aurora DSQL에서 행을 지우지 못합니다 — 오류도
-    dead letter도 없이 조용히 — 그리고 키 컬럼을 바꾸는 `UPDATE`도 영향을 받습니다. 사전 점검이 Start를
+    `DEFAULT`로 시작). FULL 미만이면 그 테이블의 `DELETE`가 오류도 dead letter도 없이 Aurora DSQL에 행을
+    남길 수 있습니다 — Aurora DSQL이 소스 기본 키에 대한 테이블의 고유 인덱스를 다 만들기 전까지, 그리고 이전
+    버전이 배포한 CDC 인프라에서는 언제나 — 그리고 추가된 키 컬럼을 바꾸는 `UPDATE`는 dead letter로 격리되고
+    이전 행이 남습니다. 사전 점검이 Start를
     차단합니다. Data Migration, Validation 또는 Cut over 단계가 열려 있는 동안 도구는 최대 2분마다 이를
     다시 읽습니다: CDC 모니터에 빨간 알림이 나타나고, 다시 FULL이 되고 테이블이 CHECKSUM으로 일치할 때까지
     Cut over가 보류됩니다([§5.6](05-validation.md#56-재키잉된-postgresql-테이블과-컷오버) 참고). 앱 재시작
     후에는 재확인에 소스 비밀번호가 다시 필요합니다(Connect 단계에서 다시 연결). 두 번의 재확인 사이에
     내려갔다가 되돌아온 경우는 보이지 않으므로 FULL을 계속 유지하세요.
+- **이전 버전이 배포한 CDC 인프라의 재키잉 테이블**은 변경 레코드를 계속 복합 키로 키잉합니다(Start CDC
+  로그가 그렇다고 알려 줍니다). 그러면 선행 키 컬럼의 `UPDATE` — 또는 행을 다른 선행 값으로 delete한 뒤 다시
+  insert하는 것 — 는 이전 키의 delete와 새 키의 insert로 복제되며, 토픽의 파티션이 둘 이상이면(캡처 테이블이
+  8개 미만이거나, 큰 테이블에 2개 또는 4개가 주어진 경우) 어느 순서로든 적용될 수 있습니다. insert가 먼저
+  오면 dead letter로 격리되고(*a unique constraint rejected the row*) delete가 행을 지우므로, 테이블을 리로드할
+  때까지 그 행이 빠집니다. Cut over는 그 테이블이 CHECKSUM으로 일치할 때까지 보류합니다. 이 테이블들을 소스
+  기본 키로 키잉하려면 CDC 인프라를 삭제(Delete CDC infrastructure)하고 다시 배포하세요. 이 작업은 스트림
+  위치도 삭제합니다: MySQL에서는 Start CDC가 Full Load 워터마크부터 binlog를 다시 읽고(CDC only: 소스의 현재
+  위치에서 시작하므로 Aurora DSQL이 마지막으로 적용한 변경 이후의 변경은 복제되지 않음), PostgreSQL에서는 복제
+  슬롯이 drop되므로 다음 Start가 모든 테이블을 다시 읽으며(Full load + CDC:
+  **"Re-snapshot every table instead"**를 선택) 그 사이 소스에서 삭제된 행은 Aurora DSQL에 남습니다.
+  [13장](13-excluding-tables-and-columns.md#집합이-잠기는-이유)의 "삭제 후 다시 CDC 시작"과 "CDC only 스택을
+  삭제하는 대가"를 참고하세요. 두 엔진 모두 해당합니다.
 - **CDC는 데이터를 복제할 뿐 DDL은 복제하지 않음.** CDC 도중 소스에서 발생한 스키마 변경은 DSQL로
   **전파되지 않으므로** Aurora DSQL에 대응하는 변경을 직접 해야 합니다: 추가되거나 이름이 바뀐 컬럼은
   **Fix target schema…**, 이제 NULL을 허용하는 컬럼은 `ALTER … DROP NOT NULL`, 타입·키 변경은 CDC를 중지한

@@ -537,13 +537,24 @@ over checks ([§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over)).
 ### Re-keyed PostgreSQL tables: the REPLICA IDENTITY re-check
 
 A table CDC re-keys (a composite target key that adds a column outside the source
-primary key) carries that column in a `DELETE` only while its source `REPLICA IDENTITY`
-is **FULL** on the table and every partition. Below FULL the delete does not remove its
-row on Aurora DSQL, and nothing dead-letters it — so the monitor re-reads it (one
-read-only catalog query for all such tables, at most every 2 minutes, never on a
-MySQL source) and shows these notices:
+primary key) needs its source `REPLICA IDENTITY` to be **FULL** on the table and every
+partition. CDC infrastructure deployed by this version keys such a table's change records
+on the **source** primary key, so every change to a row stays in order, and the sink writes
+them by the composite key (an `UPDATE` of the added column becomes a delete of the old row
+and an insert of the new one, in one transaction). Below FULL a `DELETE` does not carry the
+added column: the sink then removes the row by its source primary key, but only once Aurora
+DSQL has built the table's unique index on that key (Composite key creates it with
+`CREATE UNIQUE INDEX ASYNC` together with the table at Schema Conversion's Apply, or after
+the load when **Drop & reload** recreates the table; Aurora DSQL builds it in the
+background). Until then (for example while it builds after a Drop & reload), and always on
+CDC infrastructure deployed by an earlier version, which keys the records on the composite
+key, the delete leaves its row on Aurora DSQL with no error and no dead letter. An `UPDATE`
+that changes only the added column is dead-lettered (*a unique constraint rejected the row*)
+and leaves the old row. So the monitor re-reads `REPLICA IDENTITY` (one read-only catalog
+query for all such tables, at most every 2 minutes, never on a MySQL source) and shows these
+notices:
 
-- **Red — "Deletes on re-keyed tables are being lost":** a table (or one of its
+- **Red — "Deletes on re-keyed tables can be lost":** a table (or one of its
   partitions) is below FULL. Run `ALTER TABLE <table> REPLICA IDENTITY FULL` on the
   source — on each partition too, since the parent does not propagate and a new
   partition starts at `DEFAULT` — then choose **Check again**. Cut over is held.
@@ -558,9 +569,10 @@ MySQL source) and shows these notices:
   Stop CDC, reload it on the Full Load step with **Drop & reload**, Start CDC, and
   re-check it. CDC only has no Full Load step: delete the extra rows on Aurora DSQL by
   hand instead. The same notice, headed "REPLICA IDENTITY was below FULL on re-keyed
-  tables", appears when CDC stops re-keying a table that was below FULL (redeployed with
-  the source primary key, or the source primary key now covers the record key): deletes
-  lost before then still need the CHECKSUM.
+  tables", appears when CDC stops re-keying a table that was below FULL (the table was set
+  back to **Keep source PK** in Schema Conversion and CDC redeployed, or the source primary
+  key now covers the composite key — keying its change records on the source primary key
+  does not count): deletes lost before then still need the CHECKSUM.
 - **Info — "Can't re-check REPLICA IDENTITY on the source":** the source password is
   kept in memory only, so after an app restart the tool cannot connect until you
   reconnect on the Connect step. Keep these tables at FULL meanwhile.

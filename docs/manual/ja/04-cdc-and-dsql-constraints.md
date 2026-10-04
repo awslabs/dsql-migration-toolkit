@@ -347,13 +347,22 @@ Reason** で一覧します — ページング・フィルタ対応、テーブ
 
 ### リキーされた PostgreSQL テーブル: REPLICA IDENTITY の再確認
 
-CDC がリキーするテーブル(ソースの主キー外の列を加えた複合ターゲットキー)は、ソースの `REPLICA IDENTITY`
-がテーブルとすべてのパーティションで **FULL** の間だけ、`DELETE` にその列を載せます。FULL 未満では delete
-が Aurora DSQL 上の行を削除せず、デッドレターにもなりません — そのためモニターがこれを読み直し(該当する
-テーブル全体に対して読み取り専用のカタログクエリを 1 回、最大 2 分に 1 回。MySQL ソースでは行いません)、
-次の通知を表示します:
+CDC がリキーするテーブル(ソースの主キー外の列を加えた複合ターゲットキー)では、ソースの `REPLICA IDENTITY`
+がテーブルとすべてのパーティションで **FULL** である必要があります。このバージョンがデプロイした CDC
+インフラは、そのようなテーブルの変更レコードを **ソース** の主キーでキー付けするため、1 行への変更はすべて
+順序どおりに保たれ、シンクはそれを複合キーで書き込みます(追加された列の `UPDATE` は、1 つのトランザクション
+の中で古い行の delete と新しい行の insert になります)。FULL 未満では `DELETE` が追加された列を載せません:
+このときシンクはソースの主キーで行を削除しますが、それは Aurora DSQL がそのキーに対するテーブルの一意
+インデックスを構築し終えた後に限られます(Composite key はこのインデックスを、Schema Conversion の Apply で
+テーブルと一緒に、または **Drop & reload** がテーブルを作り直すときはロード後に `CREATE UNIQUE INDEX ASYNC` で
+作成し、Aurora DSQL がバックグラウンドで構築します)。それまでは(たとえば Drop & reload の後にインデックスを
+構築している間)、そしてレコードを複合キーでキー付けする、以前のバージョンがデプロイした CDC インフラでは常に、
+delete はエラーもデッドレターもなく Aurora DSQL に行を残します。追加された列だけを変更する `UPDATE` は
+デッドレターになり(*a unique constraint rejected the row*)、古い行が残ります。そのためモニターが
+`REPLICA IDENTITY` を読み直し(該当するテーブル全体に対して読み取り専用のカタログクエリを 1 回、最大 2 分に
+1 回。MySQL ソースでは行いません)、次の通知を表示します:
 
-- **赤 — 「Deletes on re-keyed tables are being lost」:** テーブル(またはそのパーティションのいずれか)が
+- **赤 — 「Deletes on re-keyed tables can be lost」:** テーブル(またはそのパーティションのいずれか)が
   FULL 未満です。ソースで `ALTER TABLE <table> REPLICA IDENTITY FULL` を実行してください — 親は伝播せず、
   新しいパーティションは `DEFAULT` で始まるため、各パーティションにも — そのうえで **Check again** を
   押します。Cut over は保留されます。修正前に行われた delete は再生されません。読み直し自体が失敗した
@@ -365,8 +374,9 @@ CDC がリキーするテーブル(ソースの主キー外の列を加えた複
   ただし、そこで **Continue without this check** を選んだ場合は待ちません。テーブルが異なる場合: CDC を
   追いつかせてから Stop CDC、Full Load ステップで **Drop & reload** でリロード、Start CDC、再確認。CDC
   only には Full Load ステップがないため、代わりに Aurora DSQL 上の余分な行を手作業で削除してください。
-  FULL 未満だったテーブルを CDC がリキーしなくなった場合(ソースの主キーで再デプロイした、またはソースの
-  主キーがレコードキーを含むようになった)も、同じ通知が「REPLICA IDENTITY was below FULL on re-keyed
+  FULL 未満だったテーブルを CDC がリキーしなくなった場合(Schema Conversion でテーブルを **Keep source PK**
+  に戻して CDC を再デプロイした、またはソースの主キーが複合キーを含むようになった — 変更レコードをソースの
+  主キーでキー付けすることはこれに当たりません)も、同じ通知が「REPLICA IDENTITY was below FULL on re-keyed
   tables」という見出しで表示されます: それ以前に失われた delete には引き続き CHECKSUM が必要です。
 - **情報 — 「Can't re-check REPLICA IDENTITY on the source」:** ソースのパスワードはメモリ上にしかない
   ため、アプリの再起動後は Connect ステップで再接続するまでツールは接続できません。その間、これらの

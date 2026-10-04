@@ -206,8 +206,8 @@ class SessionSnapshot(BaseModel):
     cdc_replica_identity_findings: dict[str, CdcReplicaIdentityFinding] = Field(
         default_factory=dict
     )
-    # The DEPLOYED stack's MessageKeyColumns (table -> record-key columns), read on CDC
-    # discovery: which tables Debezium actually re-keys, so Validation and Cut over can scope
+    # The DEPLOYED stack's re-keyed tables (table -> composite key columns: MessageKeyColumns
+    # united with SinkKeyColumns), read on CDC discovery, so Validation and Cut over can scope
     # the re-check after a restore before Data Migration renders. None = unknown / no stack.
     cdc_deployed_message_key_columns: Optional[dict[str, list[str]]] = None
     # Captured tables whose SOURCE definition stopped matching the Step 1 inventory while CDC

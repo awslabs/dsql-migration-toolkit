@@ -251,15 +251,16 @@ composite target key (Schema Conversion's Composite key, or an edited key) that 
 column outside the source primary key. A `DELETE` on such a table carries that column
 only while the source's `REPLICA IDENTITY` is **FULL** on the table and every partition.
 If it drops below FULL while CDC runs (`ALTER TABLE … REPLICA IDENTITY DEFAULT`, a new
-partition, `USING INDEX`), each delete leaves its row on Aurora DSQL with no error and no
-dead letter. The CDC monitor re-reads it and records each drop
+partition, `USING INDEX`), a delete can leave its row on Aurora DSQL with no error and no
+dead letter ([§4.6](04-cdc-and-dsql-constraints.md#re-keyed-postgresql-tables-the-replica-identity-re-check)
+says when). The CDC monitor re-reads it and records each drop
 ([§4.6](04-cdc-and-dsql-constraints.md#re-keyed-postgresql-tables-the-replica-identity-re-check));
 Validation and Cut over use that record:
 
 - **Validation compares those tables by CHECKSUM automatically**, named in the Options
   before you run. While a table is still below FULL the report says *"Tables match —
   cut over is held: REPLICA IDENTITY on N re-keyed table(s) is below FULL"*: no CHECKSUM
-  releases it, because deletes keep being lost. Once it is FULL again, a match started
+  releases it, because changes can keep being lost. Once it is FULL again, a match started
   before the fix is not enough: the report says *"cut over waits for a CHECKSUM re-check"*
   and offers **Re-check N table(s) with CHECKSUM**.
 - **Cut over opens only when** every such table is FULL again **and** matched in a

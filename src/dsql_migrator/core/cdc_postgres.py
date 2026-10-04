@@ -49,6 +49,7 @@ from dsql_migrator.core.cdc import (
     SinkConnectorConfig,
     build_cdc_infra_params,
     build_cdc_stack_params,
+    sink_keyable_rekeys,
 )
 from dsql_migrator.core.models import SourceType, TableDef, Watermark
 
@@ -75,7 +76,7 @@ class PostgresSourceConfig(BaseModel):
     ``server.id`` / binlog coordinates. ``snapshot_mode`` is ``never`` on the gapless
     handoff (the slot holds the start LSN) and ``initial`` for a stand-alone CDC.
     The neutral ``table_include_list`` / ``column_exclude_list`` /
-    ``message_key_columns`` mean the same as on the MySQL config.
+    ``message_key_columns`` / ``sink_keyable`` mean the same as on the MySQL config.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -93,6 +94,7 @@ class PostgresSourceConfig(BaseModel):
     snapshot_mode: Literal["never", "initial", "no_data"] = "never"
     column_exclude_list: list[str] = Field(default_factory=list)
     message_key_columns: dict[str, list[str]] = Field(default_factory=dict)
+    sink_keyable: dict[str, list[str]] = Field(default_factory=dict)
 
     def as_neutral_source(self) -> DebeziumSourceConfig:
         """Adapt to a :class:`DebeziumSourceConfig` carrying only the neutral fields.
@@ -110,6 +112,7 @@ class PostgresSourceConfig(BaseModel):
             message_key_columns={
                 table: list(cols) for table, cols in self.message_key_columns.items()
             },
+            sink_keyable={table: list(cols) for table, cols in self.sink_keyable.items()},
         )
 
 
@@ -176,6 +179,9 @@ def build_pg_source_config(
         message_key_columns={
             table: list(cols) for table, cols in (message_key_columns or {}).items()
         },
+        sink_keyable=sink_keyable_rekeys(
+            message_key_columns or {}, {table.name: list(table.primary_key) for table in tables}
+        ),
     )
 
 
@@ -373,6 +379,9 @@ def build_pg_cdc_stack_params(
         placeholders=placeholders,
         stack_name=base.stack_name,
         topic_prefix=base.topic_prefix,
+        # The re-keyed tables Start CDC may key on the source primary key (G15). Without it a
+        # PostgreSQL stack would silently keep the composite-key routing.
+        sink_keyable=base.sink_keyable,
     )
 
 

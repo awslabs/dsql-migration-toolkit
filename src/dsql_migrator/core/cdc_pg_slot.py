@@ -150,14 +150,16 @@ def rekeyed_tables_needing_full_identity(
 ) -> list[str]:
     """Captured tables whose CDC re-key adds a column OUTSIDE the source PK -> need FULL identity.
 
-    A ``COMPOSITE_KEY`` schema conversion re-keys the change record on
+    A ``COMPOSITE_KEY`` schema conversion gives the target the primary key
     ``(leading, *source_pk)`` (:func:`~dsql_migrator.core.cdc.composite_key_columns_for_cdc`).
     Under PostgreSQL ``REPLICA IDENTITY DEFAULT`` the UPDATE/DELETE before-image carries ONLY
-    the source PRIMARY-KEY columns, so the prepended ``leading`` column is ABSENT -- the
-    DELETE does not carry it, so it does not remove its row on Aurora DSQL, and the loss is
-    SILENT (Debezium fills the absent NOT NULL column with a placeholder rather than NULL,
-    offline-proven; the v50 live run saw no DELETE reach the sink at all -- either way no
-    error and no dead letter). Such a table
+    the source PRIMARY-KEY columns, so the prepended ``leading`` column is ABSENT and Debezium
+    fills it with a placeholder (live-confirmed on PostgreSQL 17: the column DEFAULT). A
+    DELETE keyed on the composite key then misses its row on Aurora DSQL SILENTLY -- no error,
+    no dead letter. Since G15 a sink with plugin v51 or later keys such a table on the source
+    primary key and deletes by it once the unique index on it is valid; until then, on older
+    infrastructure, and for an UPDATE of the leading column, the weak identity still loses the
+    change. Such a table
     needs ``REPLICA IDENTITY FULL`` (the before-image then carries every column). A re-key
     that only REORDERS existing PK columns adds nothing outside the PK, so DEFAULT identity
     already covers it and it is NOT returned. (MySQL is immune -- its binlog before-image is
@@ -264,7 +266,7 @@ def grade_rekeyed_replica_identity(
 ) -> Optional[str]:
     """Grade one re-keyed table's live identity with the Start prerequisite's OWN rule. Pure.
 
-    ``"weak"`` (the prerequisite would FAIL: deletes are being lost), ``"full"`` (it would
+    ``"weak"`` (the prerequisite would FAIL: deletes can be lost), ``"full"`` (it would
     PASS), ``"unknown"`` (INFO, or no row was read), or ``None`` when the key adds nothing
     beyond the LIVE primary key (not re-keyed in the sense that matters). A missing ``read``
     is always ``"unknown"`` -- never graded as not-re-keyed, which would close a finding on
@@ -888,9 +890,9 @@ def set_replica_identity_full(
     """``ALTER TABLE <t> REPLICA IDENTITY FULL`` for each of ``tables`` (allowlisted write).
 
     Required for a ``COMPOSITE_KEY``-re-keyed table so its UPDATE/DELETE before-image carries
-    the prepended leading column the sink keys the re-keyed DELETE on -- see
+    the prepended leading column a DELETE keyed on the composite key needs -- see
     :func:`rekeyed_tables_needing_full_identity`. Without it the leading column is absent
-    from the DEFAULT before-image and the re-keyed DELETE is silently lost. This is a source
+    from the DEFAULT before-image and the re-keyed DELETE can be silently lost. This is a source
     write, so it lives on this audited path; it is idempotent (re-applying FULL is a no-op)
     and RAISES loudly if the ALTER is refused (e.g. the source role does not own the table),
     letting the caller surface an actionable message instead of losing deletes. ``tables``

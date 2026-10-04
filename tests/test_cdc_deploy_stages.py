@@ -3093,3 +3093,113 @@ def test_history_missing_after_failure_rule() -> None:
     assert history_missing_after_failure("schema_only", snapshot) is False
     for message in (history, unknown, snapshot, streaming, ""):
         assert history_missing_after_failure(None, message) is False
+
+
+# ---------------------------------------------------------------------------
+# run_cdc_start — G15: re-keyed tables routed by the DEPLOYED sink plugin version
+# ---------------------------------------------------------------------------
+
+
+def _rekey_start_params():
+    src = DebeziumSourceConfig(
+        name="mysql-source",
+        table_include_list=["cdc_demo.orders"],
+        message_key_columns={"cdc_demo.orders": ["lead", "id"]},
+        sink_keyable={"cdc_demo.orders": ["lead", "id"]},
+    )
+    sink = SinkConnectorConfig(
+        name="mysql-sink", topics=["cdc_demo.orders"], dlq_topic="dsql-sink-dlq"
+    )
+    return build_cdc_stack_params(src, sink, target_endpoint="ep.on.aws")
+
+
+def _start_with(params, deployer):
+    logs: list[str] = []
+    run_cdc_start(
+        _FakeHandle(), stack_name=STACK, params=params, deployer=deployer,
+        on_log=lambda ts, msg: logs.append(msg), sleep=lambda _s: None,
+        connector_timeout_seconds=5.0, poll_interval_seconds=0.0,
+    )
+    return logs
+
+
+def test_start_routes_rekeyed_tables_by_the_deployed_plugin_version() -> None:
+    # v51+: keyed on the source primary key, the composite key goes to the sink.
+    deployer = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]},
+        discovery_params={"PluginVersion": "v51"},
+    )
+    logs = _start_with(_rekey_start_params(), deployer)
+    sent = dict(deployer.updates[0])
+    assert sent["MessageKeyColumns"] == ""
+    assert sent["SinkKeyColumns"] == r"cdc_demo\.orders:lead,id"
+    assert any(
+        m.startswith("Re-keyed tables are keyed on their source primary key in the change "
+                     "stream") and m.endswith(": cdc_demo.orders.")
+        for m in logs
+    ), logs
+
+    # An older plugin would ignore the sink key: today's routing, and the log says why.
+    old = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]},
+        discovery_params={"PluginVersion": "v50"},
+    )
+    logs = _start_with(_rekey_start_params(), old)
+    sent = dict(old.updates[0])
+    assert sent["MessageKeyColumns"] == r"cdc_demo\.orders:lead,id"
+    assert sent["SinkKeyColumns"] == ""
+    assert any("runs sink plugin v50 and keying them on the source primary key needs v51"
+               in m for m in logs), logs
+    # ...naming the table first, and what the redeploy it advises costs on this engine.
+    assert any(m.startswith("Re-keyed tables (cdc_demo.orders) stay keyed")
+               and "On MySQL the delete also deletes the stream position" in m
+               for m in logs), logs
+
+    # No PluginVersion read: unknown, so the same safe routing with the 'unknown' wording.
+    unknown = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]},
+    )
+    logs = _start_with(_rekey_start_params(), unknown)
+    assert dict(unknown.updates[0])["MessageKeyColumns"] == r"cdc_demo\.orders:lead,id"
+    assert any("the sink plugin version of this CDC infrastructure is unknown" in m
+               for m in logs), logs
+
+
+def test_an_older_running_stack_keeps_its_fast_path() -> None:
+    # A stack deployed before SinkKeyColumns existed has no such parameter: its value reads
+    # as "", the same as what Start sends for it, so an unchanged RUNNING pipeline is not
+    # updated (config_changed stays False).
+    deployed = {
+        k: v for k, v in _connector_overrides().items() if k != "SinkKeyColumns"
+    }
+    assert "SinkKeyColumns" not in deployed
+    deployer = _FakeDeployer(
+        connector_states={SRC: ["RUNNING"], SINK: ["RUNNING"]},
+        discovery_params=deployed,
+    )
+    logs = _run_start(_FakeHandle(), deployer)
+    assert deployer.updates == []
+    assert any("already RUNNING with the requested configuration" in m for m in logs)
+
+
+def test_start_refuses_an_oversized_rekey_parameter_before_any_update() -> None:
+    src = DebeziumSourceConfig(
+        name="mysql-source",
+        table_include_list=["cdc_demo.orders"],
+        message_key_columns={
+            f"cdc_demo.table_with_a_long_name_{i:04d}": ["tenant_identifier", "id"]
+            for i in range(120)
+        },
+    )
+    sink = SinkConnectorConfig(
+        name="mysql-sink", topics=["cdc_demo.orders"], dlq_topic="dsql-sink-dlq"
+    )
+    params = build_cdc_stack_params(src, sink, target_endpoint="ep.on.aws")
+    assert len(dict(params.filled)["MessageKeyColumns"].encode()) > 4096
+    deployer = _FakeDeployer()
+    with pytest.raises(CdcDeployError) as exc:
+        _start_with(params, deployer)
+    assert "(MessageKeyColumns), over CloudFormation's 4,096-byte limit" in str(exc.value)
+    assert "No connectors were changed" in str(exc.value)
+    assert deployer.updates == []
+    assert "submit_update" not in deployer.calls

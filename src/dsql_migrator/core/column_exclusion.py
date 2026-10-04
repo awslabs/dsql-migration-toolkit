@@ -19,7 +19,7 @@ BLOCKED columns (never excludable; the reason is always shown):
 * **B2** a TARGET primary-key column that is not a source PK -- a Schema Conversion
   composite key's leading column, and every Debezium ``message.key.columns`` column. The
   Full Load importer reads each target-key column out of every row, so an excluded one
-  fails the load, and CDC cannot build the record key without it.
+  fails the load, and CDC cannot build the composite key without it.
 * **B3** a column that another SELECTED table's preserved foreign key references (only
   while foreign keys are preserved): every child row would become an orphan and the
   constraint could not be added.

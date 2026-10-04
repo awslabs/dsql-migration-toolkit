@@ -9,10 +9,15 @@
  */
 package dev.dsqlmigrator.connect;
 
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
@@ -30,6 +35,22 @@ import org.apache.kafka.connect.sink.SinkRecord;
  * (falling back to the before-image when the message has no key); {@code t} (a source
  * TRUNCATE) has no correct apply on Aurora DSQL and is dead-lettered by name (see
  * {@link #truncateNotApplicable}).
+ *
+ * <p><b>Source-keyed re-keyed tables (G15).</b> A table Schema Conversion re-keyed (its
+ * Aurora DSQL primary key is the whole source primary key plus an added leading column) and
+ * listed in {@code target.key.columns} has its change records keyed on the SOURCE primary key,
+ * so Kafka keeps every change to one source row on one partition, in source order -- the
+ * create, each update, the delete and its tombstone. A record of such a table whose key
+ * columns are a STRICT subset of the listed composite columns is parsed by the composite key
+ * instead of the record key: an upsert conflicts on the composite key projected from the
+ * after-image; an UPDATE that changes a composite-key column becomes a MOVE (its old composite
+ * key, from the before-image, is deleted before the new image is upserted, in one transaction
+ * -- no primary-key column is ever updated in place); a delete is keyed on the EXACT composite
+ * key of its before-image. Each carries the record key as its source key, which the task uses
+ * instead once Aurora DSQL's unique index on those columns is valid (a REPLICA IDENTITY
+ * DEFAULT before-image holds a placeholder in the added column, never its real value). Any
+ * other record -- an unlisted table, a record still keyed on the composite key, a key that is
+ * not a strict subset -- parses exactly as before.
  */
 final class DebeziumEvents {
 
@@ -54,6 +75,15 @@ final class DebeziumEvents {
   private DebeziumEvents() {}
 
   static ChangeEvent parse(SinkRecord record) {
+    return parse(record, Map.of());
+  }
+
+  /**
+   * Parse with the re-keyed tables of {@code target.key.columns} ({@code {schema.table:
+   * [composite columns]}}). An empty map is exactly {@link #parse(SinkRecord)}; a non-empty one
+   * changes only the records {@link #sourceKeyedComposite} recognises (see the class javadoc).
+   */
+  static ChangeEvent parse(SinkRecord record, Map<String, List<String>> targetKeys) {
     Object value = record.value();
     Struct envelope = (value instanceof Struct) ? (Struct) value : null;
     Struct source = envelope != null ? optStruct(envelope, "source") : null;
@@ -112,6 +142,13 @@ final class DebeziumEvents {
       throw truncateNotApplicable(table);
     }
 
+    List<String> composite =
+        targetKeys.isEmpty() ? null : sourceKeyedComposite(targetKeys, table, pkColumns);
+    if (composite != null) {
+      return parseSourceKeyed(
+          envelope, op, table, after, composite, pkColumns, pkValues, sourceTsMs, pgSource);
+    }
+
     if ("d".equals(op) || after == null) {
       if (pkColumns.isEmpty()) {
         // No message key: fall back to the before-image for the PK.
@@ -137,6 +174,179 @@ final class DebeziumEvents {
     return isInsert
         ? ChangeEvent.insert(table, columns, values, pkColumns, pkValues, sourceTsMs)
         : ChangeEvent.upsert(table, columns, values, pkColumns, pkValues, sourceTsMs);
+  }
+
+  /**
+   * A source-keyed record of a re-keyed table (see the class javadoc), parsed by its composite
+   * key. {@code keyColumns}/{@code keyValues} are the record key (the source primary key).
+   */
+  private static ChangeEvent parseSourceKeyed(
+      Struct envelope,
+      String op,
+      String table,
+      Struct after,
+      List<String> composite,
+      List<String> keyColumns,
+      List<Object> keyValues,
+      long sourceTsMs,
+      boolean pgSource) {
+    if ("d".equals(op) || after == null) {
+      Struct before = optStruct(envelope, "before");
+      if (before == null) {
+        throw new DataException(
+            "Cannot build DELETE for table "
+                + table
+                + ": the change record has no before-image, so the row of its composite primary"
+                + " key ("
+                + String.join(", ", composite)
+                + ") cannot be located");
+      }
+      // The EXACT composite key of the row being deleted. Under REPLICA IDENTITY FULL (and
+      // MySQL's FULL row image) the before-image carries the real leading value; below FULL
+      // Debezium puts a placeholder there, which matches nothing -- DsqlSinkTask then deletes
+      // by the source key once Aurora DSQL's unique index on it is valid.
+      List<Object> exact = project(before, composite, pgSource);
+      requireNoNullKeyComponent(table, composite, exact, "DELETE");
+      return ChangeEvent.delete(table, composite, exact, sourceTsMs)
+          .withSourceKey(keyColumns, keyValues);
+    }
+    List<String> columns = new ArrayList<>();
+    List<Object> values = new ArrayList<>();
+    extractAfterImage(after, columns, values, pgSource);
+    List<Object> pk = new ArrayList<>(composite.size());
+    for (String column : composite) {
+      int i = columns.indexOf(column);
+      if (i < 0) {
+        throw new DataException(
+            "Cannot build upsert for table "
+                + table
+                + ": the after-image has no value for composite primary-key column '"
+                + column
+                + "'");
+      }
+      pk.add(values.get(i));
+    }
+    boolean isInsert = "c".equals(op) || "r".equals(op);
+    ChangeEvent event =
+        (isInsert
+                ? ChangeEvent.insert(table, columns, values, composite, pk, sourceTsMs)
+                : ChangeEvent.upsert(table, columns, values, composite, pk, sourceTsMs))
+            .withSourceKey(keyColumns, keyValues);
+    if (isInsert) {
+      return event;
+    }
+    // An UPDATE of a composite-key column: Debezium keeps it ONE op=u because the record key
+    // (the source primary key) did not change, and its before-image holds the old value. A
+    // primary-key column is never updated in place: the old row is deleted and the new image
+    // inserted, in one transaction. No before-image (REPLICA IDENTITY DEFAULT on PostgreSQL
+    // sends none for an UPDATE that leaves the source key alone) -> a plain upsert.
+    Struct before = optStruct(envelope, "before");
+    if (before == null) {
+      return event;
+    }
+    List<Object> old = project(before, composite, pgSource);
+    if (sameKey(old, pk)) {
+      return event;
+    }
+    requireNoNullKeyComponent(table, composite, old, "UPDATE");
+    return event.withMovedFrom(old);
+  }
+
+  /**
+   * The composite columns {@code targetKeys} lists for {@code table} when {@code keyColumns}
+   * (the record key) are a STRICT subset of them -- a record keyed on the source primary key
+   * -- else {@code null}: an unlisted table, a record keyed on the composite key itself (an
+   * older pipeline's in-flight record), an unrelated or empty key. The table is matched
+   * exactly (see {@link #compositeFor}).
+   */
+  static List<String> sourceKeyedComposite(
+      Map<String, List<String>> targetKeys, String table, List<String> keyColumns) {
+    if (keyColumns.isEmpty()) {
+      return null;
+    }
+    List<String> composite = compositeFor(targetKeys, table);
+    if (composite == null) {
+      return null;
+    }
+    Set<String> key = new HashSet<>(keyColumns);
+    if (key.size() != keyColumns.size()) {
+      return null;
+    }
+    Set<String> all = new HashSet<>(composite);
+    return all.size() > key.size() && all.containsAll(key) ? composite : null;
+  }
+
+  /**
+   * True for a TOMBSTONE of a source-keyed table. {@code DsqlSinkTask} skips it before parsing:
+   * Debezium emits it right after the op=d with the same key, so on the same partition, and
+   * that delete has already been applied -- applying it as well would only add a second delete
+   * by the source key (a full scan while the unique index on it is still building). The table
+   * comes from the topic, as for any tombstone.
+   */
+  static boolean isSourceKeyedTombstone(
+      SinkRecord record, Map<String, List<String>> targetKeys) {
+    if (record.value() != null || targetKeys.isEmpty() || !(record.key() instanceof Struct key)) {
+      return false;
+    }
+    String topic = record.topic();
+    if (topic == null || topic.isEmpty()) {
+      return false;
+    }
+    List<String> keyColumns = new ArrayList<>();
+    for (Field field : key.schema().fields()) {
+      keyColumns.add(field.name());
+    }
+    return sourceKeyedComposite(targetKeys, tableFromTopic(topic), keyColumns) != null;
+  }
+
+  /**
+   * {@code targetKeys}' entry for {@code table}, matched EXACTLY, or null. Both sides spell the
+   * name from the same source catalog (the control plane's table name; Debezium's source
+   * db/schema + table, or the topic), so a table whose name differs only in case is a different
+   * table -- one that is not listed keeps its own record key.
+   */
+  private static List<String> compositeFor(Map<String, List<String>> targetKeys, String table) {
+    return table == null ? null : targetKeys.get(table);
+  }
+
+  /**
+   * {@code struct}'s values of {@code columns}, by name, converted as any value is; a column the
+   * struct does not have projects to {@code null} (so the null-key guard names it).
+   */
+  private static List<Object> project(Struct struct, List<String> columns, boolean pgSource) {
+    List<Object> out = new ArrayList<>(columns.size());
+    for (String column : columns) {
+      Field field = struct.schema().field(column);
+      out.add(field == null ? null : convertField(field, rawFieldValue(struct, field), pgSource));
+    }
+    return out;
+  }
+
+  /**
+   * Whether two projected keys address the same row: numbers by value ({@code 5.0} equals
+   * {@code 5.00}), bytes by content, anything else by {@code equals}. Never treats an
+   * unchanged key as a move.
+   */
+  static boolean sameKey(List<Object> a, List<Object> b) {
+    if (a.size() != b.size()) {
+      return false;
+    }
+    for (int i = 0; i < a.size(); i++) {
+      Object x = a.get(i);
+      Object y = b.get(i);
+      boolean same;
+      if (x instanceof BigDecimal bx && y instanceof BigDecimal by) {
+        same = bx.compareTo(by) == 0;
+      } else if (x instanceof byte[] bx && y instanceof byte[] by) {
+        same = Arrays.equals(bx, by);
+      } else {
+        same = Objects.equals(x, y);
+      }
+      if (!same) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /**
@@ -193,18 +403,22 @@ final class DebeziumEvents {
    *
    * <p>It fires only for a Java {@code null} component, i.e. a NULLABLE key column the record
    * genuinely carries as null. It does NOT catch the case it was first written for -- a table
-   * re-keyed onto the target primary key whose source {@code REPLICA IDENTITY} is DEFAULT, so
-   * the added key column is absent from the DELETE before-image: offline-proven against the
-   * shipped Debezium 2.7.4 jar, {@code TableSchemaBuilder}'s key generator converts the
-   * absent value with no null check, and for a NOT NULL column (a composite key's leading
-   * column always is) the converter yields a placeholder -- 0, {@code ""} or the column's
-   * DEFAULT -- so the key arrives non-null and addresses a row that is not there. (The v50
-   * live run saw no such DELETE reach the sink at all; either way it is lost silently.) The
-   * protections for that case are upstream: the control plane's Start prerequisite blocks the
-   * configuration, and its runtime REPLICA IDENTITY re-check holds cut over if the identity
-   * drops while CDC runs. This guard stays for the case it does see: a key the sink cannot
-   * use must be LOUD (dead-lettered, like any other unusable record) rather than silently
-   * dropped, because a silent drop is indistinguishable from success.
+   * whose record key is the target's composite key (a leading column added to the source
+   * primary key) under source {@code REPLICA IDENTITY} DEFAULT, so the added column is absent
+   * from the DELETE before-image. Debezium's key generator converts the absent value with no
+   * null check, and for a NOT NULL column (a composite key's leading column always is) yields
+   * a placeholder -- 0, {@code ""} or the column's DEFAULT -- so the key arrives non-null and
+   * addresses a row that is not there. Live-confirmed on PostgreSQL 17 (2026-10-03): a DELETE
+   * of {@code id=2} (row {@code lead=5}) reached this sink keyed {@code {lead: 7, id: 2}} -- 7
+   * the column's DEFAULT -- matched 0 rows, and nothing was dead-lettered. On infrastructure
+   * deployed with sink plugin v51 or later such a table is SOURCE-keyed instead (see the class
+   * javadoc): its deletes are keyed on the source primary key once Aurora DSQL's unique index
+   * on it is valid ({@code SourceKeyIndex}). The control plane's Start prerequisite still
+   * blocks a weak identity and its runtime REPLICA IDENTITY re-check still holds cut over,
+   * because the composite-keyed path below remains for older infrastructure and for the index
+   * build window. This guard stays for the case it does see: a key the sink cannot use must be
+   * LOUD (dead-lettered, like any other unusable record) rather than silently dropped, because
+   * a silent drop is indistinguishable from success.
    */
   private static void requireNoNullKeyComponent(
       String table, List<String> pkColumns, List<Object> pkValues, String opName) {
@@ -265,9 +479,9 @@ final class DebeziumEvents {
    * {@link #requireNoNullKeyComponent} fires and dead-letters with its actionable message. It
    * cannot help a NOT NULL key column (a composite key's leading column): Debezium's key
    * generator already put a placeholder (0, {@code ""} or the column's DEFAULT) in the slot
-   * when the before-image did not carry the column (offline-proven against the shipped
-   * 2.7.4 jar), so there is no NULL to restore and the guard cannot see it -- see
-   * {@link #requireNoNullKeyComponent} for where that case is caught instead.
+   * when the before-image did not carry the column (live-confirmed on PostgreSQL 17: key
+   * {@code {lead: 7, id: 2}}, 7 the DEFAULT), so there is no NULL to restore -- see
+   * {@link #requireNoNullKeyComponent} for what handles that case instead.
    */
   private static Object rawFieldValue(Struct struct, Field field) {
     return struct.getWithoutDefault(field.name());

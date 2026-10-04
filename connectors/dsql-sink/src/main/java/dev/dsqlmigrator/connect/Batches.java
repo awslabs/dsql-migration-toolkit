@@ -8,6 +8,7 @@ package dev.dsqlmigrator.connect;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.ToIntFunction;
 import java.util.function.ToLongFunction;
 
 /**
@@ -51,6 +52,25 @@ final class Batches {
    */
   static <T> List<List<T>> partition(
       List<T> items, int size, long maxBytes, ToLongFunction<T> sizer) {
+    return partition(items, size, maxBytes, sizer, item -> 1);
+  }
+
+  /**
+   * {@link #partition(List, int, long, ToLongFunction)} where an item may modify more than one
+   * row: {@code size} bounds the chunk's summed {@code rowWeight}, not its item count. A move on
+   * a re-keyed table (G15) is a delete of the old row plus an insert of the new one in the same
+   * transaction, so it weighs 2 -- a chunk of 3,000 weighted rows never exceeds DSQL's 3,000
+   * rows per transaction. A chunk is flushed BEFORE an item whose weight would push it past
+   * {@code size}, and AFTER one that brings it to {@code size}; a non-empty chunk always keeps
+   * at least one item, so a lone heavy item forms its own chunk. With every weight 1 this is
+   * exactly the unweighted overload.
+   */
+  static <T> List<List<T>> partition(
+      List<T> items,
+      int size,
+      long maxBytes,
+      ToLongFunction<T> sizer,
+      ToIntFunction<T> rowWeight) {
     if (size < 1) {
       throw new IllegalArgumentException("size must be at least 1");
     }
@@ -60,21 +80,27 @@ final class Batches {
     List<List<T>> chunks = new ArrayList<>();
     List<T> chunk = new ArrayList<>();
     long chunkBytes = 0;
+    long chunkWeight = 0;
     for (T item : items) {
       long itemBytes = sizer.applyAsLong(item);
+      int weight = Math.max(rowWeight.applyAsInt(item), 1);
       // Flush BEFORE appending when this item would push a non-empty chunk over the byte
-      // budget (a single oversized item still forms its own chunk -- it cannot be split).
-      if (!chunk.isEmpty() && chunkBytes + itemBytes > maxBytes) {
+      // budget or the row limit (a single oversized item still forms its own chunk -- it
+      // cannot be split).
+      if (!chunk.isEmpty() && (chunkBytes + itemBytes > maxBytes || chunkWeight + weight > size)) {
         chunks.add(chunk);
         chunk = new ArrayList<>();
         chunkBytes = 0;
+        chunkWeight = 0;
       }
       chunk.add(item);
       chunkBytes += itemBytes;
-      if (chunk.size() >= size) {
+      chunkWeight += weight;
+      if (chunkWeight >= size) {
         chunks.add(chunk);
         chunk = new ArrayList<>();
         chunkBytes = 0;
+        chunkWeight = 0;
       }
     }
     if (!chunk.isEmpty()) {

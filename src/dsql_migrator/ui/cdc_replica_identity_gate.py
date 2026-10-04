@@ -3,13 +3,19 @@
 
 """The runtime REPLICA IDENTITY re-check for re-keyed PostgreSQL tables, and its cut-over gate.
 
-A table CDC RE-KEYS (Schema Conversion's composite key, sent to Debezium as
-``message.key.columns``) has a record key that adds a column outside the source primary key.
-A DELETE carries that column only under ``REPLICA IDENTITY FULL`` -- on the table AND on every
-partition. Below FULL the DELETE does not remove its row on Aurora DSQL, with no error and no
-dead letter: offline-proven, Debezium fills the absent NOT NULL key column with a placeholder
-(0, '' or its DEFAULT) so the sink's NULL-key guard cannot fire; the v50 live run saw no
-DELETE reach the sink at all. Either way the loss is silent, and nothing replays it.
+A table CDC RE-KEYS (Schema Conversion's composite key) has an Aurora DSQL primary key that
+adds a column outside the source primary key. A DELETE carries that column only under
+``REPLICA IDENTITY FULL`` -- on the table AND on every partition. Below FULL, Debezium fills the
+absent NOT NULL key column with a placeholder (0, '' or its DEFAULT). Live-confirmed on
+PostgreSQL 17 (2026-10-03): a DELETE keyed on the composite key reached the sink as
+``{lead: 7, id: 2}`` -- 7 the column DEFAULT -- matched 0 rows on Aurora DSQL, and nothing was
+dead-lettered. Since G15, CDC infrastructure with sink plugin v51 or later keys such a table on
+its SOURCE primary key (SinkKeyColumns) and the sink deletes by that key once Aurora DSQL's
+unique index on it is valid, so the delete lands. The hold below stays for what that does not
+cover: the window before that index is valid (it is rebuilt after the load on a Drop & reload),
+an UPDATE of the leading column (dead-lettered 23505, the old row kept), ``USING INDEX`` (a
+placeholder in the source key itself) and infrastructure deployed by an earlier version. A lost
+DELETE is never replayed.
 
 The Start prerequisite (``REPLICA_IDENTITY_COVERS_KEY``) checks this once. This module keeps
 checking while CDC runs, because ``ALTER TABLE ... REPLICA IDENTITY DEFAULT``, a new
@@ -25,7 +31,7 @@ partition (it starts at DEFAULT) or ``USING INDEX`` can drop it at any time:
   opened when a table is read below FULL; restored when it is read FULL again (or CDC stops
   re-keying it). One activity line per transition, never per poll.
 * **The gate.** While a finding is open Cut over is held outright -- no CHECKSUM releases it,
-  because deletes keep being lost. Once restored, the table must match in a value-verified
+  because deletes can keep being lost. Once restored, the table must match in a value-verified
   CHECKSUM that started more than a minute after the restore (G1's per-table rule,
   ``cdc_dlq_gate.table_proof_reason``). A table Validation cannot prove (left out, or in an
   accepted gap) can be waived, recorded. Cut over also waits for one fresh read after the
@@ -76,7 +82,7 @@ def _now() -> datetime:
 class CdcReplicaIdentityProbe:
     """One runtime read of the re-keyed tables' REPLICA IDENTITY (value-free).
 
-    ``scope`` is what was asked ({table: record-key columns}); ``reads`` what the source
+    ``scope`` is what was asked ({table: composite key columns}); ``reads`` what the source
     returned ({table: cdc_pg_slot.RekeyedIdentityRead}) -- a scoped table absent from it was
     not found. A failed read has ``ok`` False, a ``problem`` and only the exception's CLASS
     name (never its message, which can carry a host or a value).
@@ -202,14 +208,14 @@ def _scope(migration_state: object, session: object, *, prune: bool) -> "dict[st
 
 
 def replica_identity_scope(migration_state: object, session: object) -> "dict[str, list[str]]":
-    """The re-keyed tables the re-check is ABOUT: ``{table: record-key columns}``. No I/O.
+    """The re-keyed tables the re-check is ABOUT: ``{table: composite key columns}``. No I/O.
 
-    PostgreSQL only. The DEPLOYED stack's MessageKeyColumns when known (what Debezium really
-    re-keys), else this session's re-key map limited to the selection. A table the last
-    successful read graded "not re-keyed" (its live primary key covers the key: a pure
-    reorder) under the same key is left out. Every OPEN finding's table stays in scope (so it
-    can be seen FULL again); a restored one is never re-added, so a de-scoped table cannot
-    re-open. What the notices name and the gate grades.
+    PostgreSQL only. The DEPLOYED stack's re-keyed tables when known (MessageKeyColumns and
+    SinkKeyColumns, however each is routed), else this session's re-key map limited to the
+    selection. A table the last successful read graded "not re-keyed" (its live primary key
+    covers the key: a pure reorder) under the same key is left out. Every OPEN finding's table
+    stays in scope (so it can be seen FULL again); a restored one is never re-added, so a
+    de-scoped table cannot re-open. What the notices name and the gate grades.
     """
     return _scope(migration_state, session, prune=True)
 
@@ -613,7 +619,7 @@ class ReplicaIdentityGate:
 
     @property
     def recheckable(self) -> tuple[str, ...]:
-        """Tables a CHECKSUM re-check can clear. Weak tables never: deletes keep being lost."""
+        """Tables a CHECKSUM re-check can clear. Weak tables never: deletes can keep being lost."""
         return tuple(i.table for i in self.must_recheck)
 
     @property
@@ -949,11 +955,11 @@ def monitor_weak_notice(
         key=lambda d: d or _now(),
     )
     body = (
-        f"{_labelled(weak)}, found at {_fmt_hm(found)}. CDC keys these tables on the "
-        "composite primary key chosen in Schema Conversion, and a DELETE carries that key's "
-        "added column only under REPLICA IDENTITY FULL. While it is below FULL, each DELETE "
-        "leaves its row on Aurora DSQL — no error and no dead letter — and an UPDATE that "
-        "changes a key column is affected too. Run ALTER TABLE <table> REPLICA IDENTITY FULL "
+        f"{_labelled(weak)}, found at {_fmt_hm(found)}. These tables have the composite "
+        "primary key chosen in Schema Conversion, and a DELETE carries that key's added "
+        "column only under REPLICA IDENTITY FULL. While it is below FULL, a DELETE can leave "
+        "its row on Aurora DSQL with no error and no dead letter, and an UPDATE that changes "
+        "a key column can be lost too. Run ALTER TABLE <table> REPLICA IDENTITY FULL "
         "on the source now; for a partitioned table, run it on each partition too (the "
         "parent does not propagate, and a new partition starts at DEFAULT). Then choose "
         "Check again. Deletes made before the fix are not replayed, so Cut over is held "
@@ -966,7 +972,7 @@ def monitor_weak_notice(
     else:
         body += _failed_read_sentence(last_probe)
     return (
-        "Deletes on re-keyed tables are being lost — REPLICA IDENTITY is not FULL on the "
+        "Deletes on re-keyed tables can be lost — REPLICA IDENTITY is not FULL on the "
         "source",
         body,
     )
@@ -1063,9 +1069,9 @@ def monitor_restored_notice(
     else:
         header = "REPLICA IDENTITY is FULL again — deletes made before the fix may be missing"
     body = (
-        f"{_restored_list(restored)}. Deletes made in that time did not remove their rows on "
-        "Aurora DSQL, and nothing replays them. Validation compares these tables by CHECKSUM "
-        "automatically."
+        f"{_restored_list(restored)}. Deletes made in that time may not have removed their "
+        "rows on Aurora DSQL, and nothing replays them. Validation compares these tables by "
+        "CHECKSUM automatically."
     )
     if waiting:
         latest = _latest_restore(waiting)
@@ -1103,7 +1109,7 @@ def monitor_unchecked_notice(
             "info",
             "Can't re-check REPLICA IDENTITY on the source",
             "While CDC runs, the tool re-reads REPLICA IDENTITY on the re-keyed tables "
-            f"({names}) every 2 minutes, because a DELETE on them is lost silently if it "
+            f"({names}) every 2 minutes, because a DELETE on them can be lost silently if it "
             "drops below FULL. The source password is kept in memory only, so after an app "
             "restart the tool cannot connect: reconnect the source on the Connect step to "
             "resume the check.",
@@ -1126,9 +1132,10 @@ def cutover_weak_notice(gate: ReplicaIdentityGate) -> Optional[tuple[str, str]]:
         return None
     body = (
         f"REPLICA IDENTITY on {_labelled(gate.weak)} is below FULL on the source, so their "
-        "DELETEs (and UPDATEs that change a key column) do not reach Aurora DSQL, with no "
-        "error and no dead letter. Run ALTER TABLE <table> REPLICA IDENTITY FULL on the "
-        "source (on each partition of a partitioned table), then choose Check again. Once "
+        "DELETEs (and UPDATEs that change the source primary key) can miss their rows on Aurora "
+        "DSQL with no error and no dead letter, and an UPDATE of the added key column alone is "
+        "dead-lettered and leaves the old row. Run ALTER TABLE <table> REPLICA IDENTITY FULL on "
+        "the source (on each partition of a partitioned table), then choose Check again. Once "
         "the tool reads FULL, each table must match in a CHECKSUM comparison started more "
         "than a minute later; Validation compares them by CHECKSUM automatically."
     )
@@ -1138,7 +1145,7 @@ def cutover_weak_notice(gate: ReplicaIdentityGate) -> Optional[tuple[str, str]]:
         body += _failed_read_sentence(gate.last_probe)
     body += wrong_row_sentence(gate.weak)
     return (
-        f"Cut over is held: deletes on {len(gate.weak)} re-keyed table(s) are being lost",
+        f"Cut over is held: deletes on {len(gate.weak)} re-keyed table(s) can be lost",
         body,
     )
 
@@ -1255,7 +1262,7 @@ def cutover_unchecked_notice(gate: ReplicaIdentityGate) -> Optional[tuple[str, s
     if gate.probe_state == PROBE_STATE_UNAVAILABLE:
         parts.append(
             f"The tool re-reads REPLICA IDENTITY on the re-keyed tables ({names}) before cut "
-            "over, because a DELETE on them is lost silently while it is below FULL. The "
+            "over, because a DELETE on them can be lost silently while it is below FULL. The "
             "source password is kept in memory only and this session has none: reconnect "
             "the source on the Connect step to run the check."
         )
@@ -1307,7 +1314,7 @@ def replica_identity_verdict_hold(
         body = (
             f"All {total} table(s) match as-of {as_of}, but REPLICA IDENTITY on "
             f"{_bounded([i.table for i in gate.weak])} is below FULL on the source, so their "
-            "DELETEs keep missing Aurora DSQL and this match will not last. Run ALTER TABLE … "
+            "DELETEs can miss Aurora DSQL and this match may not last. Run ALTER TABLE … "
             "REPLICA IDENTITY FULL on the source (on each partition too); the tool re-reads "
             "it, and Cut over then needs a CHECKSUM match started after the fix."
         )
@@ -1451,10 +1458,10 @@ def _transition_line(transition: ReplicaIdentityTransition) -> tuple[str, str, s
         missing = ", ".join(getattr(finding, "missing", None) or []) or "a column"
         return (
             "FAILURE",
-            "re-keyed table's REPLICA IDENTITY is below FULL: its deletes are being lost",
-            f"{identity_label(finding)}; the CDC record key ({key}) adds {missing}, which a "
+            "re-keyed table's REPLICA IDENTITY is below FULL: its deletes can be lost",
+            f"{identity_label(finding)}; the composite key ({key}) adds {missing}, which a "
             "DELETE carries only under REPLICA IDENTITY FULL, so deletes on "
-            f"{table} miss Aurora DSQL with no error and no dead letter. Fix: ALTER TABLE "
+            f"{table} can miss Aurora DSQL with no error and no dead letter. Fix: ALTER TABLE "
             f"{table} REPLICA IDENTITY FULL on the source (each partition too). Cut over is "
             "held.",
         )

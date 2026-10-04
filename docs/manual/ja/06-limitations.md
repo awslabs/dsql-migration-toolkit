@@ -72,13 +72,29 @@ _言語: [English](../en/06-limitations.md) | [한국어](../ko/06-limitations.m
     **Composite key**、またはソースの主キー外の列を加えるように編集したターゲットキー — には、Start 時点
     だけでなく **CDC の実行中ずっと、テーブルとすべてのパーティションに `REPLICA IDENTITY FULL`** が必要
     です(後から作成したパーティションは `DEFAULT` で始まります)。FULL 未満では、そのテーブルの `DELETE`
-    が Aurora DSQL 上の行を削除しません — エラーもデッドレターもなく、静かに — そしてキー列を変更する
-    `UPDATE` も影響を受けます。前提条件チェックが Start をブロックします。Data Migration、Validation
+    がエラーもデッドレターもなく Aurora DSQL に行を残すことがあります — Aurora DSQL がソースの主キーに対する
+    テーブルの一意インデックスを構築し終えるまで、そして以前のバージョンがデプロイした CDC インフラでは常に —
+    そして追加されたキー列を変更する `UPDATE` はデッドレターになり、古い行が残ります。前提条件チェックが
+    Start をブロックします。Data Migration、Validation
     または Cut over ステップが開いている間、ツールは最大 2 分ごとにこれを読み直します: CDC モニターに赤い
     通知が表示され、再び FULL になりテーブルが CHECKSUM で一致するまで Cut over は保留されます
     ([§5.6](05-validation.md#56-リキーされた-postgresql-テーブルとカットオーバー) を参照)。アプリの再起動後
     は、再確認にソースのパスワードが再び必要です(Connect ステップで再接続)。2 回の再確認の間に下がって元に
     戻った場合は検出されないため、FULL を維持し続けてください。
+- **以前のバージョンがデプロイした CDC インフラ上のリキーされたテーブル** は、変更レコードを引き続き複合キーで
+  キー付けします(Start CDC のログがそう伝えます)。その場合、先頭キー列の `UPDATE` — または行を別の先頭値で
+  delete してから再 insert すること — は古いキーの delete と新しいキーの insert として複製され、トピックの
+  パーティションが 2 つ以上あると(キャプチャ対象テーブルが 8 個未満の場合や、大きなテーブルに 2 または 4 が
+  割り当てられた場合)どちらの順序でも適用され得ます。insert が先に来るとデッドレターになり(*a unique
+  constraint rejected the row*)、delete が行を削除するため、テーブルをリロードするまでその行は欠けます。Cut
+  over はそのテーブルが CHECKSUM で一致するまで保留します。これらのテーブルをソースの主キーでキー付けするには、
+  CDC インフラを削除(Delete CDC infrastructure)して再デプロイしてください。これによりストリームの位置も
+  削除されます: MySQL では Start CDC が Full Load のウォーターマークから binlog を読み直し(CDC only: ソースの
+  現在位置から開始するため、Aurora DSQL が最後に適用した変更より後の変更は複製されません)、PostgreSQL では
+  レプリケーションスロットが削除されるため次の Start がすべてのテーブルを再度読み込み(Full load + CDC:
+  **「Re-snapshot every table instead」** を選択)、その間にソースが削除した行は Aurora DSQL に残ります。
+  [第 13 章](13-excluding-tables-and-columns.md#集合がロックされる理由)の「削除後に再び CDC を開始する」と
+  「CDC only のスタックを削除する代償」を参照してください。両方のエンジンが対象です。
 - **CDC が複製するのはデータであり、DDL ではありません。** CDC 中にソースで発生した
   スキーマ変更は DSQL に**伝播されません** — 対応する変更を Aurora DSQL に自分で行う必要があります:
   追加または名前変更された列は **Fix target schema…**、NULL を許可するようになった列は `ALTER … DROP NOT NULL`、

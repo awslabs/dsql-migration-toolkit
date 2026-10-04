@@ -543,14 +543,15 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 #
 # The SAME substitution fabricated a non-NULL KEY component on a re-keyed table, because a
 # re-keyed table's KEY schema carries the source default too. Reading the slot verbatim makes
-# the key faithful -- for a NULLABLE key column only. Live follow-up (v50) narrowed what that
-# buys: on a re-keyed table switched to REPLICA IDENTITY DEFAULT the DELETE never reached the
-# sink at all (no log line). Later offline work (G2, against the shipped 2.7.4 jar) found that
-# Debezium's key generator itself fills an absent NOT NULL key column with a placeholder (0,
-# '' or its DEFAULT) before any converter runs, so for a composite key's NOT NULL leading
-# column ``requireNoNullKeyComponent`` cannot fire either way; which account holds is pending
-# a live check. The protection is the Start prerequisite that BLOCKS the configuration plus
-# the app's runtime REPLICA IDENTITY re-check that holds Cut over (no plugin change).
+# the key faithful -- for a NULLABLE key column only. A follow-up live run on plugin v50
+# concluded that on a re-keyed table switched to REPLICA IDENTITY DEFAULT the DELETE was never
+# delivered to the sink -- REFUTED 2026-10-03: it did reach the sink, with the column's DEFAULT
+# as a placeholder in its key ({lead: 7, id: 2} for a row whose lead was 5), matched 0 rows,
+# and nothing was dead-lettered. Debezium's key generator fills an absent NOT NULL key column
+# with a placeholder (0, '' or its DEFAULT) before any converter runs, so for a composite key's
+# NOT NULL leading column ``requireNoNullKeyComponent`` cannot fire. The protection then was
+# the Start prerequisite that BLOCKS the configuration plus the app's runtime REPLICA IDENTITY
+# re-check that holds Cut over; v51 (G15, below) adds the sink-side fix.
 #
 # Both are fixed by reading the slot VERBATIM (``getWithoutDefault``) at the two
 # value-reading call sites, via ``DebeziumEvents.rawFieldValue``. That is the correct
@@ -616,9 +617,29 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 #   * G10 -- a per-table drift COOL-DOWN: after a structural rejection (42703, 42P01/3F000,
 #     42P10, 42804/42883, 23502) that table's rows go one per transaction for up to 60 s
 #     while other tables keep batching. It only chooses the path, never a row's fate.
+#   * G15 -- re-keyed tables keyed on the SOURCE primary key in the change stream: a table
+#     listed in the new `target.key.columns` sink property (the cdc-stack SinkKeyColumns
+#     parameter) is written by its composite Aurora DSQL key from records keyed on the
+#     source key; an UPDATE of a composite-key column is a MOVE (delete old + insert new in
+#     one transaction, weighing 2 rows in a chunk; consecutive moves of different rows send
+#     their deletes, then their inserts, as one batch each); a delete is keyed on the exact
+#     composite key of its before-image, or on the source key once SourceKeyIndex reads a
+#     valid unique index on it (one pg_index read per table, cached); its tombstone is
+#     skipped. The table is matched exactly (a case-only twin is another table). The app
+#     sends the property only to a stack whose PluginVersion is v51 or later
+#     (core.cdc.choose_rekey_routing); v51 is rebuilt in place to carry it.
+#   * G15 -- re-keyed tables (composite target key = an added leading column + the whole
+#     source PK) are keyed on the SOURCE primary key in the change stream; the sink reads
+#     their composite key from target.key.columns (the SinkKeyColumns stack parameter),
+#     applies a leading-column change as one ordered delete + insert in a single
+#     transaction, and deletes by the source key once the unique index on it is valid --
+#     so a DELETE under REPLICA IDENTITY DEFAULT no longer misses its row (live-confirmed
+#     2026-10-03: the old key carried the column DEFAULT as a placeholder) and the
+#     cross-partition delete/create race of a key-changing UPDATE is gone.
 #   Comment-only Java changes from G2/G3/G9 ride along. The worker configuration and the
 #   connector properties are unchanged apart from the template edits shipped with them
-#   (G3 `skipped.operations: none` on the MySQL source, applied by the next Start CDC).
+#   (G3 `skipped.operations: none` on the MySQL source, applied by the next Start CDC; G15
+#   `target.key.columns` on both sink bodies, omitted while SinkKeyColumns is empty).
 #   Bumped because the ZIP changed; a live cdc-stack needs Delete + Deploy infra to pick
 #   up v51 (Start CDC alone does not re-register the plugin).
 PLUGIN_VERSION = "v51"

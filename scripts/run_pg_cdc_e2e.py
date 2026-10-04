@@ -526,6 +526,18 @@ def _build_pg_configs(allow_empty_sink, excluded=None, args=None):
     watermark = _load_watermark()
     from _exclusion_harness import cdc_column_exclude_list
 
+    # Composite-PK re-key: derive {db.table: [target key cols]} from the APPLIED target
+    # DDL exactly as the UI does, and hand it to the source-config builder the way the UI
+    # does -- so build_cdc_stack_params gets MessageKeyColumns AND the sink_keyable set that
+    # Start CDC (run_cdc_start -> choose_rekey_routing) moves to SinkKeyColumns on a v51+
+    # stack (G15: the records are then keyed on the source PK and the sink writes the
+    # composite key). Without this the target is re-keyed on (leading, id) while nothing
+    # tells Debezium or the sink, so the sink's ON CONFLICT / DELETE key does not match it.
+    from dsql_migrator.core.cdc import composite_key_columns_for_cdc
+
+    rekey = composite_key_columns_for_cdc(tables, _table_conversions(tables))
+    if rekey:
+        log(f"  [re-key] composite target keys: {rekey}")
     source_config = dispatch_source_config(
         SourceType.POSTGRES,
         tables,
@@ -533,18 +545,8 @@ def _build_pg_configs(allow_empty_sink, excluded=None, args=None):
         database=cfg("DB_NAME", "postgres"),
         stack_name=STACK_NAME,
         column_exclude_list=cdc_column_exclude_list(excluded or {}, tables),
+        message_key_columns=rekey,
     )
-    # Composite-PK re-key: derive {db.table: [target key cols]} from the APPLIED target
-    # DDL exactly as the UI does, and put it on the SOURCE config -- build_cdc_stack_params
-    # reads source_config.message_key_columns for the MessageKeyColumns stack param. Without
-    # this the target is re-keyed on (leading, id) while Debezium keeps keying the record on
-    # the source PK, so the sink's ON CONFLICT / DELETE key does not match the target key.
-    from dsql_migrator.core.cdc import composite_key_columns_for_cdc
-
-    rekey = composite_key_columns_for_cdc(tables, _table_conversions(tables))
-    if rekey:
-        source_config = source_config.model_copy(update={"message_key_columns": rekey})
-        log(f"  [re-key] message.key.columns: {rekey}")
     sink_config = CdcPipelineOrchestrator().build_sink_config(
         "postgres-sink", tables, CDC_DEFAULT_DLQ_TOPIC, allow_empty=allow_empty_sink,
     )

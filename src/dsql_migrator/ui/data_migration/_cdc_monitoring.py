@@ -787,7 +787,7 @@ def _render_cdc_replica_identity_notice(
 ) -> None:
     """The runtime REPLICA IDENTITY re-check for re-keyed PostgreSQL tables (render only).
 
-    ``error`` while a finding is open (deletes are being lost; Cut over is held), with
+    ``error`` while a finding is open (deletes can be lost; Cut over is held), with
     "Check again" -- and, when the re-read cannot clear it, why (no source password, or the
     last read failed); ``warning`` for a table whose identity is FULL again (or that CDC no
     longer re-keys) but that no CHECKSUM started after the fix has proven yet; with nothing
@@ -1288,8 +1288,8 @@ def _render_cdc_live_monitoring(
             # PostgreSQL CDC: warn about source WAL pressure (the logical slot pinning
             # WAL) before the source disk fills. No-op for a MySQL source (no slot).
             _render_cdc_slot_health(ui, migration_state)
-            # PostgreSQL re-keyed tables: a REPLICA IDENTITY dropped below FULL loses every
-            # DELETE silently (no dead letter), so it is flagged here from the throttled
+            # PostgreSQL re-keyed tables: a REPLICA IDENTITY dropped below FULL can lose
+            # DELETEs silently (no dead letter), so it is flagged here from the throttled
             # background re-check, never read on this render.
             _render_cdc_replica_identity_notice(
                 ui, migration_state, session, on_check_again=_check_identity_again
@@ -1704,13 +1704,12 @@ _DRIFT_LABELS: dict[str, tuple[str, str]] = {
     "unique-conflict": (
         "a unique constraint rejected the row",
         "Aurora DSQL refused the row because a unique index already holds its values "
-        "(SQLSTATE 23505). On a table whose CDC key was re-keyed (Schema Conversion's "
-        "Composite key), this is what an UPDATE to the leading key column produces: it is "
-        "replicated as a delete of the old key plus an insert of the new one, and while "
-        "both exist the uniqueness index over the original primary key rejects the insert "
-        "— so that row can end up MISSING from the target. Validate the table and reload "
-        "it if a row is short; the leading key column must be one the application never "
-        "updates",
+        "(SQLSTATE 23505). On a table with a composite key (Schema Conversion's Composite "
+        "key), an UPDATE to the leading key column produces it when the change does not "
+        "carry the old value (REPLICA IDENTITY below FULL on a PostgreSQL source) or when "
+        "the CDC infrastructure was deployed by an earlier version of this tool — so that "
+        "row can end up missing or stale on the target. Validate the table and reload it if "
+        "it differs; the leading key column must be one the application never updates",
     ),
     # Neither a schema change nor a key-model conflict: the sink cannot BIND the value, so
     # EVERY insert and update for the table dead-letters. Names the array cause because it is

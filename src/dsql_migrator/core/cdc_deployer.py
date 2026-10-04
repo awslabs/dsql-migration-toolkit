@@ -66,10 +66,13 @@ from dsql_migrator.core.cdc import (
     CdcInfraParams,
     CdcStackParams,
     apply_column_exclude_chooser,
+    choose_rekey_routing,
     column_exclude_seen_refusal,
     build_watermark_params,
     legacy_column_exclude_key_conflicts,
     cdc_expected_connector_names,
+    rekey_parameter_size_refusal,
+    rekey_routing_log_lines,
 )
 from dsql_migrator.core.models import (
     ChunkState,
@@ -1757,6 +1760,16 @@ def run_cdc_start(
         # A stack deployed with the 0.1.561 ColumnExcludeList keeps it byte-for-byte, so
         # a running pipeline is not updated by this release; judged against THIS describe.
         params = apply_column_exclude_chooser(params, discovery.current_parameters)
+        # Re-keyed tables (G15): keyed on the SOURCE primary key in the change stream -- so
+        # every change to a row stays in order -- only when the DEPLOYED sink plugin reads
+        # SinkKeyColumns. PluginVersion changes only on Deploy infra (a Start carries it
+        # forward), so it is judged against THIS describe; an older or unknown plugin keeps
+        # the composite-key routing every plugin applies, and the log says why.
+        _plugin = (discovery.current_parameters or {}).get("PluginVersion")
+        _routed = choose_rekey_routing(params, _plugin)
+        for _line in rekey_routing_log_lines(params, _routed, _plugin):
+            driver.log(_line)
+        params = _routed
         driver.stage("discover_stack", "DONE")
 
         # 2. validate connector params
@@ -1764,6 +1777,11 @@ def run_cdc_start(
         bad = [k for k, v in params.filled if str(v).startswith(CDC_PLACEHOLDER_PREFIX)]
         if bad:
             raise CdcDeployError(f"Unfilled values in connector parameters: {bad}")
+        # CloudFormation refuses a parameter value over 4,096 bytes, which would fail the
+        # update mid-Start: refuse an oversized re-key value before anything is changed.
+        _rekey_refusal = rekey_parameter_size_refusal(params)
+        if _rekey_refusal:
+            raise CdcDeployError(_rekey_refusal)
         # Backstop for the chooser: a KEPT 0.1.561 ColumnExcludeList may still exclude a
         # composite key column, which 0.1.561 refused to start with (Debezium cannot build
         # the record key). Covers Retry CDC and a UI that judged a stale deployed value.

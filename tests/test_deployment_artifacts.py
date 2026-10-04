@@ -2610,6 +2610,10 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
     # One marker per behaviour the ZIP must carry. Each is a literal this repo's Java source
     # owns, so it can only be present if that source was compiled into the committed ZIP.
     markers = {
+        # v51 (G15): a re-keyed table's records are keyed on the SOURCE primary key and the
+        # sink writes them by the composite target key read from target.key.columns, so a
+        # leading-column change is one ordered move and a DELETE never misses its row.
+        "source-keyed composite writes": b"target.key.columns",
         # v51 (G8): a value its Aurora DSQL column cannot hold exactly is REFUSED pre-write
         # with a value-free reason -- not stored as true (boolean) or rounded (numeric/int).
         "value-fit refusal": b"Value does not fit target column '",
@@ -2786,3 +2790,125 @@ def test_the_manual_matches_the_popup_on_size_results_and_typeless_quarantines()
             assert phrase not in flat, (lang, phrase)
         for phrase in present:
             assert phrase in flat, (lang, phrase)
+
+
+# ---------------------------------------------------------------------------
+# G15 review: re-keyed tables are keyed on the SOURCE primary key by CDC infrastructure
+# deployed by this version. The manual must say what this version does, and what CDC
+# infrastructure deployed by an earlier version still does, in every language.
+# ---------------------------------------------------------------------------
+
+_G15_SECTION_4_6 = {
+    "en": "### Re-keyed PostgreSQL tables",
+    "ko": "### 재키잉된 PostgreSQL 테이블",
+    "ja": "### リキーされた PostgreSQL テーブル",
+}
+
+
+def _flat_manual_slice(lang: str, page: str, head: str, end: str) -> str:
+    """``head`` up to the next ``end`` on one manual page, with the hard wrap undone (a line
+    break is a space in en/ko, nothing in ja)."""
+    import pathlib
+    import re
+
+    manual = pathlib.Path(__file__).resolve().parents[1] / "docs" / "manual"
+    text = (manual / lang / page).read_text(encoding="utf-8")
+    start = text.index(head)
+    piece = text[start : text.index(end, start + len(head))]
+    return re.sub(r"[ \t]*\n[ \t]*", "" if lang == "ja" else " ", piece)
+
+
+def test_manual_4_6_does_not_close_a_finding_for_keying_on_the_source_primary_key() -> None:
+    # The amber bullet said a finding closes when CDC is "redeployed with the source primary
+    # key" or the source primary key "covers the record key". This version keys a re-keyed
+    # table's change records on the source primary key -- which trivially "covers" it -- yet
+    # the finding stays open (deployed_rekey_map unions SinkKeyColumns): only Keep source PK,
+    # or a source primary key that covers the COMPOSITE key, closes it.
+    stale = {"en": "covers the record key", "ko": "레코드 키를 포함", "ja": "レコードキーを含む"}
+    new = {"en": "covers the composite key", "ko": "복합 키를 포함", "ja": "複合キーを含む"}
+    for lang, head in _G15_SECTION_4_6.items():
+        section = _flat_manual_slice(lang, "04-cdc-and-dsql-constraints.md", head, "\n### ")
+        assert stale[lang] not in section, lang
+        assert new[lang] in section, lang
+        assert "**Keep source PK**" in section, lang
+
+
+def test_manual_4_6_places_the_source_key_index_build_where_it_happens() -> None:
+    # The intro said Composite key's unique index on the source key is "built in the
+    # background after the load". Schema Conversion's Apply creates it WITH the table, so in
+    # the default flow it is valid before CDC starts; only Drop & reload builds it after the
+    # load. And "the monitor re-reads it" followed the UPDATE sentence, so "it" read as the
+    # old row: the monitor re-reads REPLICA IDENTITY.
+    stale = {
+        "en": ("built in the background after the load)", "So the monitor re-reads it ("),
+        "ko": ("로드 후 백그라운드에서 빌드됩니다)", "그래서 모니터가 이를 다시 읽고"),
+        "ja": ("ロード後にバックグラウンドで構築されます)", "そのためモニターがこれを読み直し"),
+    }
+    new = {
+        "en": ("Schema Conversion's Apply", "re-reads `REPLICA IDENTITY`"),
+        "ko": ("Schema Conversion의 Apply", "`REPLICA IDENTITY`를 다시 읽고"),
+        "ja": ("Schema Conversion の Apply", "`REPLICA IDENTITY` を読み直し"),
+    }
+    for lang, head in _G15_SECTION_4_6.items():
+        intro = _flat_manual_slice(lang, "04-cdc-and-dsql-constraints.md", head, "\n- ")
+        for phrase in stale[lang]:
+            assert phrase not in intro, (lang, phrase)
+        for phrase in new[lang]:
+            assert phrase in intro, (lang, phrase)
+        assert "**Drop & reload**" in intro, lang
+
+
+def test_manual_06_says_what_redeploying_older_cdc_infrastructure_costs() -> None:
+    # The older-infrastructure bullet advised Delete CDC infrastructure and a new deploy with a
+    # PostgreSQL cost only, then said "Both engines", so MySQL read as free. The delete also
+    # deletes the stream position on MySQL: the bullet must say what the next Start costs on
+    # each engine and point at the chapter 13 bullets that explain it.
+    heads = {
+        "en": "**Re-keyed tables on CDC infrastructure deployed by an earlier version**",
+        "ko": "**이전 버전이 배포한 CDC 인프라의 재키잉 테이블**",
+        "ja": "**以前のバージョンがデプロイした CDC インフラ上のリキーされたテーブル**",
+    }
+    stale = {
+        "en": "(on PostgreSQL that removes the replication slot, so the tables are read again)",
+        "ko": "(PostgreSQL에서는 이 작업이 복제 슬롯을 제거하므로 테이블을 다시 읽습니다)",
+        "ja": "(PostgreSQL ではこれによりレプリケーションスロットが削除されるため、テーブルが"
+        "再度読み込まれます)",
+    }
+    must = {
+        "en": ("deletes the stream position", "Full Load watermark", "CDC only",
+               '**"Re-snapshot every table instead"**',
+               "(13-excluding-tables-and-columns.md#why-the-set-locks)"),
+        "ko": ("스트림 위치도 삭제", "Full Load 워터마크", "CDC only",
+               '**"Re-snapshot every table instead"**',
+               "(13-excluding-tables-and-columns.md#집합이-잠기는-이유)"),
+        "ja": ("ストリームの位置も削除", "Full Load のウォーターマーク", "CDC only",
+               "**「Re-snapshot every table instead」**",
+               "(13-excluding-tables-and-columns.md#集合がロックされる理由)"),
+    }
+    for lang, head in heads.items():
+        bullet = _flat_manual_slice(lang, "06-limitations.md", head, "\n- ")
+        assert stale[lang] not in bullet, lang
+        for phrase in must[lang]:
+            assert phrase in bullet, (lang, phrase)
+
+
+def test_manual_13_gives_a_target_key_reason_true_for_both_cdc_routings() -> None:
+    # "CDC builds the record key from it" is false for a re-keyed table on infrastructure
+    # deployed by this version (its record key is the source primary key). The column is still
+    # needed: CDC writes and deletes each row by the composite key.
+    stale = {
+        "en": "CDC builds the record key from it",
+        "ko": "CDC는 그것으로 레코드 키를 만듭니다",
+        "ja": "CDC はそこからレコードキーを構築します",
+    }
+    new = {
+        "en": "CDC needs it to write and delete each row by that key",
+        "ko": "CDC는 각 행을 그 키로 쓰고 삭제하므로",
+        "ja": "CDC は各行をそのキーで書き込み・削除するため",
+    }
+    for lang in stale:
+        row = _flat_manual_slice(
+            lang, "13-excluding-tables-and-columns.md", "| target key |", "\n"
+        )
+        assert stale[lang] not in row, lang
+        assert new[lang] in row, lang

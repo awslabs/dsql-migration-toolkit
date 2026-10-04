@@ -431,11 +431,19 @@ Stop CDC 후에도 원인은 다음 Start까지 Start CDC 카드에 남습니다
 ### 재키잉된 PostgreSQL 테이블: REPLICA IDENTITY 재확인
 
 CDC가 재키잉하는 테이블(소스 기본 키 밖의 컬럼을 더한 복합 타깃 키)은 소스의 `REPLICA IDENTITY`가 테이블과
-모든 파티션에서 **FULL**일 때만 `DELETE`에 그 컬럼을 싣습니다. FULL 미만이면 delete가 Aurora DSQL에서 행을
-지우지 못하고, dead letter도 남지 않습니다 — 그래서 모니터가 이를 다시 읽고(그런 테이블 전체에 대해 읽기 전용
-카탈로그 쿼리 한 번, 최대 2분에 한 번, MySQL 소스에서는 하지 않음) 다음 알림을 보여 줍니다:
+모든 파티션에서 **FULL**이어야 합니다. 이 버전이 배포한 CDC 인프라는 그런 테이블의 변경 레코드를 **소스** 기본
+키로 키잉하므로 한 행의 모든 변경이 순서대로 유지되고, 싱크는 그 레코드를 복합 키로 씁니다(추가된 컬럼의
+`UPDATE`는 한 트랜잭션 안에서 이전 행의 delete와 새 행의 insert가 됩니다). FULL 미만이면 `DELETE`가 추가된
+컬럼을 싣지 않습니다: 이때 싱크는 소스 기본 키로 행을 지우지만, Aurora DSQL이 그 키에 대한 테이블의 고유
+인덱스를 다 만든 뒤에만 그렇게 합니다(Composite key는 이 인덱스를 Schema Conversion의 Apply 때 테이블과
+함께, 또는 **Drop & reload**가 테이블을 다시 만들 때는 로드 후에 `CREATE UNIQUE INDEX ASYNC`로 만들고, Aurora
+DSQL이 백그라운드에서 빌드합니다). 그 전까지는(예: Drop & reload 후 인덱스를 빌드하는 동안), 그리고 레코드를
+복합 키로 키잉하는 이전 버전이 배포한 CDC 인프라에서는 언제나, delete가 오류도 dead letter도 없이 Aurora DSQL에
+행을 남깁니다. 추가된 컬럼만 바꾸는 `UPDATE`는 dead letter로 격리되고(*a unique constraint rejected the row*)
+이전 행이 남습니다. 그래서 모니터가 `REPLICA IDENTITY`를 다시 읽고(그런 테이블 전체에 대해 읽기 전용 카탈로그
+쿼리 한 번, 최대 2분에 한 번, MySQL 소스에서는 하지 않음) 다음 알림을 보여 줍니다:
 
-- **빨간색 — "Deletes on re-keyed tables are being lost":** 테이블(또는 그 파티션 중 하나)이 FULL
+- **빨간색 — "Deletes on re-keyed tables can be lost":** 테이블(또는 그 파티션 중 하나)이 FULL
   미만입니다. 소스에서 `ALTER TABLE <table> REPLICA IDENTITY FULL`을 실행하세요 — 부모는 전파되지 않고
   새 파티션은 `DEFAULT`로 시작하므로 각 파티션에도 — 그런 다음 **Check again**을 누르세요. Cut over가
   보류됩니다. 수정 전에 일어난 delete는 다시 재생되지 않습니다. 다시 읽기 자체가 실패하면 알림이 그렇게
@@ -446,9 +454,10 @@ CDC가 재키잉하는 테이블(소스 기본 키 밖의 컬럼을 더한 복�
   **Continue without this check**를 선택했다면 기다리지 않습니다. 테이블이 다르면: CDC가 따라잡게 둔 뒤
   Stop CDC, Full Load 단계에서 **Drop & reload**로 리로드, Start CDC, 재확인. CDC only에는 Full Load 단계가
   없으므로 대신 Aurora DSQL에서 잉여 행을 직접 삭제하세요. FULL 미만이던 테이블을 CDC가 더 이상 재키잉하지
-  않게 되면(소스 기본 키로 다시 배포했거나, 소스 기본 키가 이제 레코드 키를 포함함) 같은 알림이 "REPLICA
-  IDENTITY was below FULL on re-keyed tables"라는 제목으로 나타납니다: 그 전에 유실된 delete에는 여전히
-  CHECKSUM이 필요합니다.
+  않게 되면(Schema Conversion에서 테이블을 **Keep source PK**로 되돌리고 CDC를 다시 배포했거나, 소스 기본
+  키가 이제 복합 키를 포함함 — 변경 레코드를 소스 기본 키로 키잉하는 것은 해당하지 않음) 같은 알림이
+  "REPLICA IDENTITY was below FULL on re-keyed tables"라는 제목으로 나타납니다: 그 전에 유실된 delete에는
+  여전히 CHECKSUM이 필요합니다.
 - **정보 — "Can't re-check REPLICA IDENTITY on the source":** 소스 비밀번호는 메모리에만 있으므로 앱
   재시작 후에는 Connect 단계에서 다시 연결할 때까지 도구가 접속할 수 없습니다. 그동안 이 테이블들을 FULL로
   유지하세요.

@@ -176,6 +176,26 @@ class DsqlSinkBatchGroupingTest {
   }
 
   @Test
+  void estimateModifiedBytesCountsAMovesAfterImageAndOldKey() {
+    // A move (G15) upserts its after-image AND deletes its old row in one transaction: it
+    // counts both, never only its keys like a delete.
+    ChangeEvent afterImage =
+        ChangeEvent.upsert(
+            "docs",
+            List.of("lead", "id", "body"),
+            List.of(9, 1, "x".repeat(100)),
+            List.of("lead", "id"),
+            List.of(9, 1),
+            0L);
+    ChangeEvent moved =
+        afterImage.withSourceKey(List.of("id"), List.of(1)).withMovedFrom(List.of(5, 1));
+    assertEquals(
+        DsqlSinkTask.estimateModifiedBytes(afterImage)
+            + DsqlSinkTask.estimateModifiedBytes(moved.moveDelete()),
+        DsqlSinkTask.estimateModifiedBytes(moved));
+  }
+
+  @Test
   void wideRowsSplitIntoMultipleChunksBelowByteBudget() {
     // Six rows of ~1 MiB each with a 3 MiB budget and a high row cap: byte-bounding must
     // split them into several chunks (never one 6 MiB transaction that DSQL would reject).

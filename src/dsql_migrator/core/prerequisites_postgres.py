@@ -614,22 +614,27 @@ def check_replica_identity_covers_key(
 
     **The failure it exists to stop is silent.** When Schema Conversion's per-table
     "Composite key" option prepends a high-cardinality column to the target primary key (a
-    DSQL hot-partition remedy), the connector is told ``message.key.columns`` = that target
-    key. Under ``REPLICA IDENTITY DEFAULT`` PostgreSQL limits the UPDATE/DELETE before-image
-    to the SOURCE primary key, so the prepended column is ABSENT from a DELETE, and the
-    delete does not remove its row on Aurora DSQL -- no error, no dead-letter, no log.
-    Live-observed on Aurora PostgreSQL 17.7: one deleted order stayed on the target while
-    its child rows (no re-key, so keyed on the source PK) deleted correctly.
+    DSQL hot-partition remedy), a DELETE must carry that column to find its row. Under
+    ``REPLICA IDENTITY DEFAULT`` PostgreSQL limits the UPDATE/DELETE before-image to the
+    SOURCE primary key, so the prepended column is ABSENT from a DELETE, and on a record keyed
+    on the composite key (``message.key.columns``) the delete does not remove its row on
+    Aurora DSQL -- no error, no dead-letter, no log. Live-observed on Aurora PostgreSQL 17.7:
+    one deleted order stayed on the target while its child rows (no re-key, so keyed on the
+    source PK) deleted correctly.
 
-    How it is lost is not the sink's NULL-key guard: offline-proven against the shipped
-    Debezium 2.7.4 jar, the key generator converts the absent column with no null check, and
-    for a NOT NULL column (a composite key's leading column always is) the converter yields a
-    placeholder -- 0, '' or the column's DEFAULT -- so the record key is non-NULL and
-    addresses a row that is not there (or, when the key omits part of the source primary
-    key, possibly a different row). The v50 live run saw no DELETE reach the sink at all.
-    Either way the delete is silently lost; which account holds is pending a live check.
-    An UPDATE that changes a key column is affected too (its old key is the before-image);
-    INSERTs and other UPDATEs are not -- their after-image carries every column.
+    How it is lost is not the sink's NULL-key guard: Debezium's key generator converts the
+    absent column with no null check, and for a NOT NULL column (a composite key's leading
+    column always is) yields a placeholder -- 0, '' or the column's DEFAULT -- so the record
+    key is non-NULL and addresses a row that is not there (or, when the key omits part of the
+    source primary key, possibly a different row). Live-confirmed on PostgreSQL 17
+    (2026-10-03): the DELETE reached the sink keyed ``{lead: 7, id: 2}`` -- 7 the column
+    DEFAULT, for a row whose lead was 5 -- matched 0 rows, and nothing was dead-lettered.
+    Since G15, CDC infrastructure with sink plugin v51 or later keys such a table on its SOURCE
+    primary key and deletes by it once Aurora DSQL's unique index on it is valid. FULL is still
+    required: until that index is valid, on infrastructure deployed by an earlier version, and
+    for an UPDATE that changes only the added column (dead-lettered, the old row kept), a weak
+    identity still loses the change. INSERTs and other UPDATEs are not affected -- their
+    after-image carries every column.
 
     The tool DOES widen the identity itself (``cdc_pg_slot.set_replica_identity_full``), but
     only on the path where the Full Load provisions the replication slot. A Full-load-only
@@ -679,7 +684,7 @@ def replica_identity_covers_key_result(
     extra = [c for c in (key_columns or []) if c not in set(table.primary_key or ())]
     if not extra:
         return None
-    title = "Re-keyed table's before-image carries the record key"
+    title = "Re-keyed table's before-image carries its composite key"
     key_desc = ", ".join(key_columns)
     missing = ", ".join(extra)
     if identity is None:
@@ -716,11 +721,11 @@ def replica_identity_covers_key_result(
         shown = ", ".join(names)
         more = f" (and {count - len(names)} more)" if count > len(names) else ""
         return _fail(
-            f"The CDC record key for {table.name} is ({key_desc}), which adds {missing} "
-            f"beyond the source primary key, but {count} partition(s) are not "
+            f"The Aurora DSQL primary key of {table.name} is ({key_desc}), which adds "
+            f"{missing} beyond the source primary key, but {count} partition(s) are not "
             f"REPLICA IDENTITY FULL: {shown}{more}. PostgreSQL logs the PARTITION's "
-            f"identity, so a DELETE would not carry {missing} and would not remove its row "
-            "on Aurora DSQL — silently lost.",
+            f"identity, so a DELETE would not carry {missing} and can miss its row on "
+            "Aurora DSQL with no error.",
             "Run ALTER TABLE <partition> REPLICA IDENTITY FULL on each PARTITION (the "
             "parent does not propagate to existing partitions), and set it on new "
             "partitions as they are created. Keep them FULL for the whole run: while CDC "
@@ -735,8 +740,8 @@ def replica_identity_covers_key_result(
             required=True,
             target=table.name,
             detail=(
-                f"REPLICA IDENTITY FULL, so a DELETE carries {missing} and the re-keyed "
-                f"record key ({key_desc}) can locate the target row."
+                f"REPLICA IDENTITY FULL, so a DELETE carries {missing} and the composite key "
+                f"({key_desc}) locates the target row."
             ),
         )
 
@@ -759,13 +764,14 @@ def replica_identity_covers_key_result(
         "columns",
     )
     return _fail(
-        f"The CDC record key for {table.name} is ({key_desc}) -- the target primary key "
+        f"The Aurora DSQL primary key of {table.name} is ({key_desc}) -- the composite key "
         f"chosen in Schema Conversion -- which adds {missing} beyond the source primary "
-        f"key ({', '.join(table.primary_key or ()) or 'none'}). {_reason}, so a DELETE does "
-        f"not carry {missing} and does not remove its row on Aurora DSQL: it is SILENTLY "
-        "LOST, with no error and no dead-letter. An UPDATE that changes a key column is "
-        "affected too; INSERTs and other UPDATEs are not (their after-image carries every "
-        "column).",
+        f"key ({', '.join(table.primary_key or ()) or 'none'}). {_reason}, so a DELETE, or "
+        f"an UPDATE that changes the source primary key, does not carry {missing} and can miss "
+        "its row on Aurora DSQL with no error and no dead letter; an UPDATE of "
+        f"{missing} alone is dead-lettered (a unique constraint rejected the row) and leaves "
+        "the old row. INSERTs and other UPDATEs are not affected (their after-image carries "
+        "every column).",
         f"Run ALTER TABLE {table.name} REPLICA IDENTITY FULL on the source, then re-run "
         "these checks. DEFAULT is not enough for a re-keyed table. The alternative is to "
         f"set {table.name} back to \"Keep source PK\" in Schema Conversion, which removes "

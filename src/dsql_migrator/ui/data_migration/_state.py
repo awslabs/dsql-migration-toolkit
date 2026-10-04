@@ -230,8 +230,10 @@ class DataMigrationState:
         # Composite-PK record-key override for CDC, keyed by db.table -> target key
         # columns [leading, pk...]. Set from the applied Schema Conversion when a
         # table's DSQL target has a composite key, so Debezium re-keys the change
-        # record (message.key.columns) to match the target's ON CONFLICT/DELETE key
-        # -- no sink change needed. Empty => every table keys on its source PK.
+        # record (message.key.columns) to match the target's ON CONFLICT/DELETE key --
+        # or, on CDC infrastructure whose sink plugin reads SinkKeyColumns, keeps it keyed
+        # on the source PK and the sink writes it by this key (G15, choose_rekey_routing).
+        # Empty => every table keys on its source PK.
         self._cdc_message_key_columns: dict[str, list[str]] = {}
         self._cdc_preserved_foreign_keys: dict[str, list[str]] = {}
         # The APPLIED Schema Conversion (table -> TableConversion, user edits honoured) and
@@ -340,10 +342,11 @@ class DataMigrationState:
         # session snapshot and cleared only by Start over -- never by an attach or a stack
         # rename (the loss is about TARGET tables). Copy-on-write: replaced, never mutated.
         self.cdc_replica_identity_findings: dict = {}
-        # The DEPLOYED stack's MessageKeyColumns ({table: key columns}), from the same
-        # discovery describe as cdc_deployed_slot_name: which tables Debezium actually
-        # re-keys. ``None`` = unknown / no stack; ``{}`` = deployed with no re-key. Persisted
-        # so Validation and Cut over can scope the re-check after a restore.
+        # The DEPLOYED stack's re-keyed tables ({table: composite key columns}), from the same
+        # discovery describe as cdc_deployed_slot_name: MessageKeyColumns united with
+        # SinkKeyColumns (core.cdc.deployed_rekey_map), however each is routed. ``None`` =
+        # unknown / no stack; ``{}`` = deployed with no re-key. Persisted so Validation and
+        # Cut over can scope the re-check after a restore.
         self.cdc_deployed_message_key_columns: Optional[dict[str, list[str]]] = None
         # The last runtime REPLICA IDENTITY read (a CdcReplicaIdentityProbe). Transient: a
         # restarted session must read again (and needs the source password to).
@@ -1514,7 +1517,7 @@ class DataMigrationState:
         value: "Optional[Mapping[str, Sequence[str]]]",
         now: Optional[datetime] = None,
     ) -> None:
-        """Record the DEPLOYED stack's MessageKeyColumns (``None``: no stack / no parameter).
+        """Record the DEPLOYED stack's re-key map (``None``: no stack / neither parameter).
 
         When the map is known, an OPEN REPLICA IDENTITY finding whose table CDC no longer
         re-keys (absent from the map, or keyed within its source primary key) is closed as

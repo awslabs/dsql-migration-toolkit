@@ -5338,12 +5338,13 @@ class BatchedTableMigrator:
         slot = cdc_pg_slot.pg_slot_name(stack_name)
         publication = cdc_pg_slot.pg_publication_name(stack_name)
 
-        # A COMPOSITE_KEY-re-keyed table's CDC record key prepends a non-PK "leading"
+        # A COMPOSITE_KEY-re-keyed table's target primary key prepends a non-PK "leading"
         # column. Under PostgreSQL REPLICA IDENTITY DEFAULT the UPDATE/DELETE before-image
-        # carries only the source PK, so the DELETE does not carry that leading column and
-        # does not remove its row on Aurora DSQL -- silently (offline-proven: Debezium fills
-        # the absent NOT NULL column with a placeholder, so the sink's NULL-key guard cannot
-        # fire; the v50 live run saw no DELETE reach the sink at all). Set REPLICA IDENTITY
+        # carries only the source PK, so the DELETE does not carry that leading column:
+        # Debezium fills it with a placeholder (live-confirmed: the column DEFAULT), so a
+        # delete keyed on the composite key misses its row on Aurora DSQL silently. A v51+
+        # sink deletes by the source key once its unique index is valid (G15), but not before
+        # and not on older infrastructure, so FULL is still required. Set REPLICA IDENTITY
         # FULL on exactly those tables at provision (before the slot's LSN) so the
         # before-image carries the leading column. Scoped to the tables actually being
         # captured. Only the parent is widened here (existing partitions are not); the Start

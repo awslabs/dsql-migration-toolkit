@@ -7664,7 +7664,10 @@ def test_the_extra_rows_notice_no_longer_claims_a_null_key() -> None:
     body = ui.body()
     assert "a delete never landed" in body
     assert "arrives NULL" not in body
-    assert "does not carry the added key column and removes nothing" in body
+    # G15: on CDC infrastructure with sink plugin v51+ such a delete lands once the source-key
+    # unique index is valid, so it CAN remove nothing (it is not certain to).
+    assert "does not carry the added key column and can remove nothing" in body
+    assert "a table with a composite key (Schema Conversion's Composite key)" in body
     assert "Check that table's REPLICA IDENTITY on the source" in body
 
 

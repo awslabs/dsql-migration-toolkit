@@ -1103,8 +1103,8 @@ class PrerequisiteCheckId(str, Enum):
     REPLICA_IDENTITY = "REPLICA_IDENTITY"
     # A DIFFERENT question from REPLICA_IDENTITY, with a different remedy: that one asks
     # whether an identity is set at all and accepts DEFAULT; this one asks whether DEFAULT is
-    # ENOUGH, which it is not for a table whose CDC record key was re-keyed to the target
-    # primary key. Kept separate so the remediation can say "DEFAULT is not enough -- FULL".
+    # ENOUGH, which it is not for a table re-keyed to a composite target primary key. Kept
+    # separate so the remediation can say "DEFAULT is not enough -- FULL".
     REPLICA_IDENTITY_COVERS_KEY = "REPLICA_IDENTITY_COVERS_KEY"
     # The PostgreSQL analog of BINLOG_RETENTION: whether the source may discard the WAL
     # the Full-Load-time slot still needs, which would leave the same silent data gap at
@@ -1221,11 +1221,11 @@ class PrerequisiteCheckRequest(BaseModel):
     provisions_replication: bool = True
     cdc_stack_name: str = ""
     cdc_start_resnapshots: bool = False
-    # The connector's re-key map: qualified table -> the TARGET primary key the change
-    # record is keyed on (``message.key.columns``). Needed because a re-keyed table's
-    # DELETE is silently lost unless the source's REPLICA IDENTITY can supply every key
-    # column, and the checker cannot derive this map -- it comes from the APPLIED target
-    # DDL. Empty means no table was re-keyed.
+    # The connector's re-key map: qualified table -> the composite Aurora DSQL primary key
+    # (sent as message.key.columns, or as SinkKeyColumns on a v51+ stack). Needed because a
+    # re-keyed table's DELETE can be silently lost unless the source's REPLICA IDENTITY can
+    # supply every key column, and the checker cannot derive this map -- it comes from the
+    # APPLIED target DDL. Empty means no table was re-keyed.
     message_key_columns: dict[str, list[str]] = Field(default_factory=dict)
 
 
@@ -1398,9 +1398,10 @@ class CdcDlqWaiver(BaseModel):
 class CdcReplicaIdentityFinding(BaseModel):
     """A re-keyed PostgreSQL table whose REPLICA IDENTITY was read below FULL while CDC ran.
 
-    A table CDC re-keys (its record key adds a column outside the source primary key) needs
-    REPLICA IDENTITY FULL on the table and every partition, or a DELETE does not carry that
-    column and does not remove its row on Aurora DSQL -- silently, with no dead letter. The
+    A table CDC re-keys (its composite key adds a column outside the source primary key)
+    needs REPLICA IDENTITY FULL on the table and every partition, or a DELETE does not carry
+    that column and can fail to remove its row on Aurora DSQL -- silently, with no dead letter
+    (on older CDC infrastructure, and on v51+ until the source-key unique index is valid). The
     Start prerequisite checks it once; the runtime re-check (``ui/cdc_replica_identity_gate``)
     re-reads it while CDC runs and records each drop here, kept across restarts. OPEN
     (``restored_at`` None) holds Cut over outright; once restored (``restored_by`` "full",
@@ -1423,7 +1424,7 @@ class CdcReplicaIdentityFinding(BaseModel):
 
     @property
     def missing(self) -> list[str]:
-        """The record-key columns outside the source primary key (what a DELETE lacks)."""
+        """The composite-key columns outside the source primary key (what a DELETE lacks)."""
         pk = set(self.primary_key)
         return [c for c in self.key_columns if c not in pk]
 

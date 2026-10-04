@@ -422,8 +422,20 @@ class DebeziumSourceConfig(BaseModel):
             "prepended), Debezium must key the change record on the SAME composite "
             "columns so the sink's ON CONFLICT / DELETE match the target key. Maps "
             "to Debezium message.key.columns; empty = key on the source PK "
-            "(unchanged behavior). The leading column is read from the source "
+            "(unchanged behavior). Start CDC moves the sink_keyable tables to "
+            "SinkKeyColumns instead on infrastructure whose sink plugin reads it "
+            "(choose_rekey_routing). The leading column is read from the source "
             "row/before-image, so it must NOT be in column_exclude_list."
+        ),
+    )
+    sink_keyable: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description=(
+            "The message_key_columns tables whose composite key is the WHOLE source "
+            "primary key plus at least one added column (sink_keyable_rekeys). On a stack "
+            "whose sink plugin reads SinkKeyColumns, Start CDC keys their change records on "
+            "the SOURCE primary key and has the sink write them by this composite key "
+            "(choose_rekey_routing). Not a stack parameter itself."
         ),
     )
 
@@ -483,13 +495,18 @@ class SchemaDriftKind(str, Enum):
     MISSING_TABLE = "missing-table"  # 42P01 / 3F000: the TARGET table (or schema) is gone
     # 23505 unique_violation. NOT a schema change and not target-schema loss -- a KEY-MODEL
     # conflict, classified because it is the only signal that a row may have VANISHED from
-    # the target. It is what an UPDATE to a re-keyed table's leading key column produces:
-    # Debezium splits that into delete(old key) + create(new key), the two carry different
-    # keys so they land on different partitions and tasks with no ordering between them, and
-    # while both key forms coexist the composite uniqueness index over the ORIGINAL primary
-    # key rejects the insert. The sink classifies 23505 as permanent, so the insert is
-    # dead-lettered with its offset committed; if the delete then lands, the row is gone from
-    # the target with only an unclassified poison row to show for it.
+    # the target (or kept a stale image). It is what an UPDATE to a re-keyed table's leading
+    # key column can produce. Where the change records are keyed on the COMPOSITE key (CDC
+    # infrastructure deployed by an earlier version), Debezium splits that UPDATE into
+    # delete(old key) + create(new key), the two carry different keys so they land on
+    # different partitions and tasks with no ordering between them, and while both key forms
+    # coexist the uniqueness index over the ORIGINAL primary key rejects the insert. The sink
+    # classifies 23505 as permanent, so the insert is dead-lettered with its offset committed;
+    # if the delete then lands, the row is gone from the target with only this poison row to
+    # show for it. Where they are keyed on the SOURCE primary key (G15, sink plugin v51+) the
+    # UPDATE is one ordered record applied as delete-old + insert-new in one transaction, so it
+    # arises only when the change does not carry the old value (PostgreSQL REPLICA IDENTITY
+    # below FULL): the insert is dead-lettered and the old row stays.
     UNIQUE_CONFLICT = "unique-conflict"  # 23505 unique_violation
     # 07006 invalid_parameter_type. Also not a schema change: the sink CANNOT BIND the value
     # at all, so EVERY insert and update for the table dead-letters -- certain, ongoing,
@@ -1383,7 +1400,11 @@ class CdcPipelineOrchestrator:
         ``message_key_columns`` (optional) maps ``{db.table: [target key cols]}``
         for tables whose DSQL target has a composite primary key; Debezium then
         keys the change record on those columns so the sink's record-key apply
-        matches the target key. Empty/omitted = key on the source PK (default).
+        matches the target key. Empty/omitted = key on the source PK (default). Its
+        tables whose key is the whole source primary key plus an added column are
+        also recorded as ``sink_keyable`` (:func:`sink_keyable_rekeys`): Start CDC
+        keys those on the source primary key instead when the deployed sink plugin
+        supports it (:func:`choose_rekey_routing`).
         """
         resume = (
             resume_override
@@ -1426,6 +1447,10 @@ class CdcPipelineOrchestrator:
                 table: list(cols)
                 for table, cols in (message_key_columns or {}).items()
             },
+            sink_keyable=sink_keyable_rekeys(
+                message_key_columns or {},
+                {table.name: list(table.primary_key) for table in tables},
+            ),
         )
 
     def build_sink_config(
@@ -1517,7 +1542,10 @@ def composite_key_columns_for_cdc(
     source PK (a composite ``(leading, id)`` key chosen in Schema Conversion),
     return the target key columns. Debezium is then told to key the change record
     on exactly those columns (``message.key.columns``) so the sink's record-key
-    ON CONFLICT / DELETE match the target key -- no sink change needed.
+    ON CONFLICT / DELETE match the target key -- except the tables
+    :func:`sink_keyable_rekeys` accepts, which Start CDC keys on the source primary key
+    and lists for the sink instead (``SinkKeyColumns``, :func:`choose_rekey_routing`) when
+    the deployed sink plugin supports it.
 
     Pure: reads each applied :class:`TableConversion`'s ``target_ddl`` and compares
     its parsed primary key to ``table.primary_key``. A table with no applied
@@ -1557,6 +1585,35 @@ def format_message_key_columns(message_key_columns: "Mapping[str, Sequence[str]]
         pattern = table.replace(".", r"\.")
         entries.append(f"{pattern}:{','.join(cols)}")
     return ";".join(entries)
+
+
+def sink_keyable_rekeys(
+    message_key_columns: "Mapping[str, Sequence[str]]",
+    table_primary_keys: "Mapping[str, Sequence[str]]",
+) -> dict[str, list[str]]:
+    """The re-keys the sink can write by their composite key from SOURCE-keyed records. Pure.
+
+    A table qualifies when its composite key holds EVERY source primary-key column plus at
+    least one more (Schema Conversion's Composite key is ``[leading] + source PK``): a record
+    keyed on the source primary key then identifies the row, and the sink builds the composite
+    key from the row image. Debezium keys such a table on the source primary key once it is
+    left out of ``message.key.columns`` -- so every change to one row, including an UPDATE of
+    the leading column, stays on one Kafka partition, in source order (G15).
+
+    Not eligible, and kept on today's ``message.key.columns`` path: a pure REORDER of the
+    source primary key (it adds nothing), a key that omits a source primary-key column (an
+    edited DDL: the source key would not identify the target row), a key with a repeated
+    column, and a table whose source primary key is unknown. ``{table: key columns}``.
+    """
+    eligible: dict[str, list[str]] = {}
+    for table, key in message_key_columns.items():
+        cols = [str(c) for c in (key or ())]
+        primary_key = {str(c) for c in (table_primary_keys.get(table) or ())}
+        if not primary_key or len(set(cols)) != len(cols):
+            continue
+        if primary_key < set(cols):
+            eligible[str(table)] = cols
+    return eligible
 
 
 def composite_cdc_excluded_key_columns(
@@ -1752,6 +1809,11 @@ class CdcStackParams(BaseModel):
     # it could NOT read the stack's value, and a started stack is refused fail-closed).
     # Library callers that do not judge leave it False.
     column_exclude_judged: bool = False
+    # The re-keyed tables Start CDC may key on the SOURCE primary key ({table: composite key},
+    # :func:`sink_keyable_rekeys`). ``filled`` always carries them in MessageKeyColumns -- today's
+    # routing -- and :func:`choose_rekey_routing` moves them to SinkKeyColumns only for a stack
+    # whose sink plugin reads it. Empty: nothing to move.
+    sink_keyable: dict[str, list[str]] = Field(default_factory=dict)
 
 
 # CloudFormation caps one parameter VALUE at 4,096 bytes, and ColumnExcludeList is one
@@ -2027,7 +2089,12 @@ def legacy_column_exclude_key_conflicts(params: "CdcStackParams") -> list[str]:
     if params.column_exclude_legacy is None or value != params.column_exclude_legacy:
         return []
     entries = {e for e in value.split(",") if e}
-    keys = _parse_message_key_columns(filled.get("MessageKeyColumns", ""))
+    # A table keyed on the source primary key (SinkKeyColumns) still needs its leading column
+    # captured: the sink builds the composite key from the row image.
+    keys = {
+        **_parse_message_key_columns(filled.get("MessageKeyColumns", "")),
+        **_parse_message_key_columns(filled.get("SinkKeyColumns", "")),
+    }
     return sorted(
         f"{table}.{col}" for table, cols in keys.items() for col in cols
         if f"{table}.{col}" in entries
@@ -2158,6 +2225,192 @@ def apply_column_exclude_chooser(
     )
 
 
+# The sink plugin version that reads ``target.key.columns`` (SinkKeyColumns): the oldest
+# deployed plugin Start CDC keys re-keyed tables on the source primary key for (G15).
+SINK_KEYS_MIN_PLUGIN_VERSION = "v51"
+
+_PLUGIN_VERSION_RE = re.compile(r"v(\d+)")
+
+
+def plugin_supports_sink_keys(plugin_version: object) -> bool:
+    """Does a stack whose ``PluginVersion`` parameter is ``plugin_version`` read SinkKeyColumns?
+
+    ``v<N>`` with N at least :data:`SINK_KEYS_MIN_PLUGIN_VERSION`'s. ``None``, ``""`` and any
+    other shape are ``False``: an unknown plugin keeps today's composite-key routing, which
+    every plugin applies correctly. Pure.
+    """
+    if plugin_version is None:
+        return False
+    match = _PLUGIN_VERSION_RE.fullmatch(str(plugin_version).strip())
+    return bool(match) and int(match.group(1)) >= int(SINK_KEYS_MIN_PLUGIN_VERSION[1:])
+
+
+def _replace_filled(
+    filled: "Sequence[tuple[str, str]]", values: "Mapping[str, str]", after: str
+) -> list[tuple[str, str]]:
+    """``filled`` with ``values`` set in place; a key ``filled`` lacks goes right after
+    ``after`` (which ``filled`` must hold). Order is otherwise kept."""
+    present = {key for key, _ in filled}
+    out: list[tuple[str, str]] = []
+    for key, value in filled:
+        out.append((key, values.get(key, value)))
+        if key == after:
+            out.extend((k, v) for k, v in values.items() if k not in present)
+    return out
+
+
+def choose_rekey_routing(
+    params: "CdcStackParams", plugin_version: object
+) -> "CdcStackParams":
+    """``params`` with each eligible re-keyed table moved from MessageKeyColumns to
+    SinkKeyColumns -- ONLY when the deployed stack's sink plugin reads SinkKeyColumns.
+
+    Debezium then keys those tables' change records on the SOURCE primary key (they are no
+    longer in ``message.key.columns``), so every change to one row stays on one partition in
+    source order, and the sink writes them by the composite key (G15). A table moves only when
+    its MessageKeyColumns entry equals its ``params.sink_keyable`` key. ``plugin_version`` is
+    the DEPLOYED stack's ``PluginVersion`` (it changes only on Deploy infra; a Start carries it
+    forward), so an older plugin -- which would ignore the sink key -- is never sent a routing
+    it cannot apply. Idempotent; returns ``params`` itself when nothing moves. Pure.
+    """
+    if not params.sink_keyable or not plugin_supports_sink_keys(plugin_version):
+        return params
+    filled = dict(params.filled)
+    if "MessageKeyColumns" not in filled:
+        return params
+    message_keys = _parse_message_key_columns(filled.get("MessageKeyColumns", ""))
+    moved = {
+        table: cols
+        for table, cols in message_keys.items()
+        if params.sink_keyable.get(table) == cols
+    }
+    if not moved:
+        return params
+    sink_keys = _parse_message_key_columns(filled.get("SinkKeyColumns", ""))
+    for table, cols in moved.items():
+        del message_keys[table]
+        sink_keys[table] = cols
+    return params.model_copy(
+        update={
+            "filled": _replace_filled(
+                params.filled,
+                {
+                    "MessageKeyColumns": format_message_key_columns(message_keys),
+                    "SinkKeyColumns": format_message_key_columns(sink_keys),
+                },
+                after="MessageKeyColumns",
+            )
+        }
+    )
+
+
+def _bounded_names(names: "Sequence[str]") -> str:
+    shown = sorted(names)[:5]
+    more = len(names) - len(shown)
+    return ", ".join(shown) + (f" and {more} more" if more > 0 else "")
+
+
+def rekey_routing_log_lines(
+    before: "CdcStackParams", after: "CdcStackParams", plugin_version: object
+) -> list[str]:
+    """The Start CDC deploy-log line(s) for how re-keyed tables are routed. Pure.
+
+    One line naming the tables keyed on the source primary key (``after``'s SinkKeyColumns),
+    or -- when the deployed sink plugin cannot read it -- one line naming the eligible tables
+    kept on the composite key, the redeploy that changes it, and what that redeploy costs on
+    this engine (the delete also deletes the stream position; ``EngineType`` is only set on a
+    PostgreSQL stack). No line when no table is eligible (every MySQL or PostgreSQL stack
+    without a re-keyed table).
+    """
+    lines: list[str] = []
+    routed = sorted(_parse_message_key_columns(dict(after.filled).get("SinkKeyColumns", "")))
+    if routed:
+        lines.append(
+            "Re-keyed tables are keyed on their source primary key in the change stream, so "
+            "every change to a row stays in order, and are written to Aurora DSQL by their "
+            f"composite primary key: {_bounded_names(routed)}."
+        )
+    if plugin_supports_sink_keys(plugin_version):
+        return lines
+    message_keys = _parse_message_key_columns(dict(after.filled).get("MessageKeyColumns", ""))
+    kept = sorted(
+        table
+        for table, cols in before.sink_keyable.items()
+        if message_keys.get(table) == cols
+    )
+    if not kept:
+        return lines
+    version = str(plugin_version).strip() if plugin_version is not None else ""
+    if _PLUGIN_VERSION_RE.fullmatch(version):
+        because = f"because this CDC infrastructure runs sink plugin {version} and"
+    else:
+        because = "because the sink plugin version of this CDC infrastructure is unknown, and"
+    if dict(after.filled).get("EngineType") == "postgres":
+        cost = (
+            "On PostgreSQL the delete also drops the replication slot, so the next Start CDC "
+            "reads every table again (Full load + CDC: choose 'Re-snapshot every table "
+            "instead'), and a row the source deleted meanwhile stays on Aurora DSQL."
+        )
+    else:
+        cost = (
+            "On MySQL the delete also deletes the stream position: the next Start CDC re-reads "
+            "the binlog from the Full Load watermark, or, with CDC only, begins at the source's "
+            "current position, so changes made after the last one Aurora DSQL applied are not "
+            "replicated."
+        )
+    lines.append(
+        f"Re-keyed tables ({_bounded_names(kept)}) stay keyed on their composite primary key "
+        f"in the change stream, {because} keying them on the source primary key needs "
+        f"{SINK_KEYS_MIN_PLUGIN_VERSION} or later. To get it, Delete CDC infrastructure and "
+        f"deploy it again. {cost}"
+    )
+    return lines
+
+
+def rekey_parameter_size_refusal(params: "CdcStackParams") -> "Optional[str]":
+    """Why Start CDC must not send these re-key parameters, or ``None``. Pure.
+
+    CloudFormation caps one parameter value at :data:`CDC_PARAMETER_BYTE_LIMIT` bytes, and
+    MessageKeyColumns / SinkKeyColumns each carry a ``table:columns`` entry per re-keyed
+    table. An oversized value would fail the stack update mid-Start; this refuses it before
+    anything is changed, with the remedy.
+    """
+    filled = dict(params.filled)
+    for key in ("MessageKeyColumns", "SinkKeyColumns"):
+        size = len(str(filled.get(key, "") or "").encode("utf-8"))
+        if size > CDC_PARAMETER_BYTE_LIMIT:
+            return (
+                f"The composite primary keys of the re-keyed tables need {size:,} bytes in "
+                f"the CDC configuration ({key}), over CloudFormation's "
+                f"{CDC_PARAMETER_BYTE_LIMIT:,}-byte limit for one parameter. No connectors "
+                "were changed. Set some of these tables back to "
+                "\"Keep source PK\" in Schema Conversion (their Aurora DSQL tables must then "
+                "be recreated with that key), then Start CDC."
+            )
+    return None
+
+
+def deployed_rekey_map(
+    current_parameters: "Optional[Mapping[str, object]]",
+) -> "Optional[dict[str, list[str]]]":
+    """The DEPLOYED stack's re-keyed tables, ``{table: composite key}``, from BOTH parameters.
+
+    MessageKeyColumns (keyed on the composite key) united with SinkKeyColumns (keyed on the
+    source primary key, written by the composite key); SinkKeyColumns wins on overlap. Every
+    re-keyed table is in one of them, so the runtime REPLICA IDENTITY re-check, the source
+    schema re-check and the cut-over gates keep seeing it however it is routed. ``None`` when
+    the stack has neither parameter (no stack, or one deployed before MessageKeyColumns);
+    ``""`` is a real value: no re-key. Pure.
+    """
+    params = current_parameters or {}
+    if "MessageKeyColumns" not in params and "SinkKeyColumns" not in params:
+        return None
+    return {
+        **_parse_message_key_columns(str(params.get("MessageKeyColumns") or "")),
+        **_parse_message_key_columns(str(params.get("SinkKeyColumns") or "")),
+    }
+
+
 # The cdc-stack watermark parameter keys, in template order. Exposed so the UI /
 # E2E / deployer build them consistently; values are always strings (CFN params).
 CDC_WATERMARK_PARAM_KEYS: tuple[str, ...] = (
@@ -2277,6 +2530,11 @@ def build_cdc_stack_params(
         # Empty (the common case) leaves the record keyed on the source PK.
         ("MessageKeyColumns",
          format_message_key_columns(source_config.message_key_columns)),
+        # The re-keyed tables the SINK writes by their composite key from records keyed on
+        # the source PK (G15). Always empty here, so these params route exactly as before;
+        # Start CDC fills it from MessageKeyColumns for a stack whose sink plugin reads it
+        # (choose_rekey_routing, against the deployed PluginVersion).
+        ("SinkKeyColumns", ""),
         ("DsqlClusterEndpoint", target_endpoint),
         ("DsqlDatabaseName", target_database),
         ("DsqlConnectUser", target_username),
@@ -2304,6 +2562,9 @@ def build_cdc_stack_params(
         placeholders=placeholders,
         stack_name=stack_name,
         topic_prefix=topic_prefix,
+        sink_keyable={
+            table: list(cols) for table, cols in source_config.sink_keyable.items()
+        },
     )
 
 

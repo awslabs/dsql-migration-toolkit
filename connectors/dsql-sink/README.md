@@ -48,12 +48,13 @@ errors — it does **not** run this connector in-process. This connector is the
 |---|---|
 | `pom.xml` | Maven build; Kafka Connect (provided) + PostgreSQL JDBC + AWS SDK v2 `dsql` + JUnit 5; shaded uber-jar for the MSK Connect custom plugin |
 | `DsqlSinkConnector.java` | `SinkConnector` entrypoint; distributes config to tasks |
-| `DsqlSinkConnectorConfig.java` | Connector config: `dsql.cluster.endpoint`/`dsql.region`/`dsql.database`/`dsql.username`/`delete.enabled`/`batch.size`/`occ.*` |
+| `DsqlSinkConnectorConfig.java` | Connector config: `dsql.cluster.endpoint`/`dsql.region`/`dsql.database`/`dsql.username`/`delete.enabled`/`batch.size`/`occ.*`/`metrics.*`/`target.key.columns` (re-keyed tables keyed on the source primary key, with the composite key the sink writes each by — the cdc-stack `SinkKeyColumns` parameter; absent = none) |
 | `DsqlSinkTask.java` | `SinkTask`: parse → batch (≤3,000) → OCC-retried upsert/delete → commit; IAM-token reconnect; failures re-thrown for the Connect DLQ |
-| `DebeziumEvents.java` | Maps a Debezium envelope `SinkRecord` to a `ChangeEvent` (record key = PK; `c/r/u`→upsert, `d`/tombstone→delete) |
+| `DebeziumEvents.java` | Maps a Debezium envelope `SinkRecord` to a `ChangeEvent` (record key = PK; `c/r/u`→upsert, `d`/tombstone→delete). A table listed in `target.key.columns` whose record is keyed on the SOURCE primary key is written by its composite key instead: an `UPDATE` of a composite-key column becomes delete-old + insert-new in one transaction, a delete uses the exact composite key of its before-image (or the source key once its unique index is valid), and its tombstone is skipped |
 | `ChangeEvent.java` | Parsed change event (table, delete flag, columns/values, pk columns/values) |
 | `DsqlDialect.java` | Pure DSQL SQL builders: identifier quoting, `INSERT ... ON CONFLICT` upsert, `DELETE` |
-| `Batches.java` | Partitions events into ≤`batch.size` chunks |
+| `Batches.java` | Partitions events into ≤`batch.size` chunks (rows weighted: a move counts 2) |
+| `SourceKeyIndex.java` | Per-task cache of whether a re-keyed table's unique index on its source key is valid (one `pg_index` read per table; 10 min when valid, 60 s otherwise), so a delete is keyed on the source key only when that is a single-row lookup |
 | `OccRetry.java` | Statement-level `40001` retry with backoff + jitter (mirrors `core/occ.py`); injectable sleeper/jitter for tests |
 | `DsqlIamTokenProvider.java` | DSQL IAM token cache + refresh policy (mirrors `core/target_connection.py`); injectable token source + clock for tests |
 | `AwsDsqlTokenSource.java` | The only class touching the AWS SDK: `DsqlUtilities` admin/non-admin token generation |
