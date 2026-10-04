@@ -32,7 +32,7 @@ CDC とソースのスキーマ変更 (DDL) の扱いを全体にわたって強
 
 - sink プラグインは **v51** になり、offset-seeder Lambda も修正しました。デプロイ済みの cdc-stack は、**Delete CDC infrastructure の後に再度 Deploy** するまで v50 と以前の seeder のまま動作します (MySQL で Stop の後の Start が引き続き失敗することがあります)。TRUNCATE のキャプチャと新しい開始モードは次の Start CDC から適用されます。
 - 新たに保留されることがあります: デッドレターやドリフトのあったテーブルでは Cut over が CHECKSUM を待つことがあり、Full Load は以前丸めていた値を隔離することがあります。MySQL の JSON 列は Evaluation で MANUAL として数えられます (スコアが下がることがありますが、新たにブロックされるものはありません)。
-- まだ実環境で検証していないもの: 新しい種別の正確な DSQL SQLSTATE、PostgreSQL のカタログ再確認、実際のストリームでの v51 sink の動作。
+- Aurora MySQL と Aurora PostgreSQL (ソウル) の実環境で検証しました: 新しいデッドレター種別と Aurora DSQL の実際の SQLSTATE、カタログと REPLICA IDENTITY の再確認、再キー化テーブルの DELETE と先頭列の UPDATE (REPLICA IDENTITY FULL・DEFAULT)、MySQL の開始点チェックとスキーマ履歴からの再開、Stop 後の Start、DDL による停止の診断。
 
 ## v0.1.563
 

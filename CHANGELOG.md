@@ -32,7 +32,7 @@ CDC and source schema changes (DDL), hardened end to end: a change that CDC cann
 
 - The sink plugin is now **v51**, and the offset-seeder Lambda is fixed. A deployed cdc-stack keeps running v50 and the old seeder (so Start after Stop can still fail on MySQL) until you **Delete CDC infrastructure and Deploy it again**; the TRUNCATE capture and the new start modes apply at the next Start CDC.
 - Expect new holds: Cut over may now wait for a CHECKSUM on tables that dead-lettered or drifted, and a Full Load may quarantine a value it used to round. MySQL JSON columns now count as MANUAL in Evaluation (the score may drop; nothing new is blocked).
-- Not exercised live yet: the exact DSQL SQLSTATEs for the new kinds, the PostgreSQL catalog re-check, and the v51 sink behaviours on a real stream.
+- Verified live on Aurora MySQL and Aurora PostgreSQL (Seoul): the new dead-letter kinds with Aurora DSQL's real SQLSTATEs, the catalog and REPLICA IDENTITY re-checks, re-keyed deletes and leading-column updates (REPLICA IDENTITY FULL and DEFAULT), the MySQL start-point check and schema-history resume, Start after Stop, and the DDL-stop diagnosis.
 
 ## v0.1.563
 
