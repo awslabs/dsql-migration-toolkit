@@ -38,8 +38,13 @@ The source is read **read-only** inside a consistent snapshot; the loader never
 modifies it. A MySQL source — and a PostgreSQL Full-Load-only migration — is never
 written. The single exception is **PostgreSQL CDC**: at the watermark point (§3.5)
 the tool creates, and at teardown drops, a logical replication slot and a
-publication scoped to exactly the migrated tables (autocommit, restricted to a small
-allowlist, audited). These are the only writes the tool ever makes to any source.
+publication scoped to exactly the migrated tables. It also sets `REPLICA IDENTITY
+FULL` on a re-keyed table, repairs the publication's `publish_via_partition_root`,
+and, for a table selected after the Full Load (Full load + CDC, before CDC starts),
+adds that table to the publication just before copying it, then takes one
+transaction ID to wait for the transactions open at that moment. All of these are
+autocommit, restricted to a small allowlist, and audited. They are the only writes
+the tool ever makes to any source.
 
 ---
 
@@ -245,6 +250,8 @@ set: the migration type stays on Full load only until Re-run Full Load takes a f
 watermark over the current set (or you untick the tables selected since).
 
 Unticking tables does not lock the type unless CDC has already started for this migration: CDC captures the loaded tables still selected. In Full load + CDC you can untick tables after the load until CDC starts. They are left as is on Aurora DSQL, CDC does not capture them, the watermark still covers every captured table (the handoff stays gapless), and a failure only in unticked tables no longer holds the step.
+
+In Full load + CDC you can also tick a table after the load, until CDC starts. Retry unfinished tables loads it under the original watermark, after the checks in [13.7](13-excluding-tables-and-columns.md) (CDC never started, the Aurora DSQL table is empty or dropped and reloaded, and CDC can capture the table with no gap: on MySQL its definition is unchanged since the watermark; on PostgreSQL it has a usable replica identity and joins CDC's publication before its copy). The watermark then covers it, CDC captures it from that watermark with the other tables, and the handoff stays gapless for it too. On MySQL, a table the Full Load recorded no start-point definition for (a Full Load from an earlier version, or a table converted after the load) is loaded by Re-run all tables instead. Full load only is unchanged: a load there never extends the watermark.
 
 > **Run Full Load from the command line (optional).** The same bulk loader is
 > available as a CLI script — `scripts/run_full_load.py` (plan first, then `--yes`;

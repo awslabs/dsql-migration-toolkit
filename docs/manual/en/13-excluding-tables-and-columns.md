@@ -41,7 +41,7 @@ Some points to understand early:
 - **Some columns can never be excluded.** Key columns, columns that a preserved foreign
   key references, and columns Aurora DSQL computes are refused, and the reason is always
   shown (§13.4).
-- **The set becomes fixed once data has moved.** After a Full Load, or once a CDC stack is deployed, the exclusions are locked. They can still be changed, but only through the routes in §13.7. In Full load only, which tables migrate can still change after a Full Load; in Full load + CDC, tables can still be dropped (not added) until CDC starts (§13.7).
+- **The set becomes fixed once data has moved.** After a Full Load, or once a CDC stack is deployed, the exclusions are locked. They can still be changed, but only through the routes in §13.7. In Full load only, which tables migrate can still change after a Full Load; in Full load + CDC, tables can still be dropped or added until CDC starts, and a table you add is loaded on the Full Load step first, normally by Retry unfinished tables under the Full Load's start point (§13.7).
 
 ---
 
@@ -93,7 +93,6 @@ live preview under it. About 300 ms after you stop typing, the preview updates:
   - while CDC streams or a stack holds the set;
   - in Full load only and Full load + CDC while a Full Load, a foreign-key pass or a cut-over DEFAULT restore runs, until it finishes;
   - in Full load + CDC also while the CDC infrastructure is created or deleted, while a failed create is in the account, or while the CDC state is read;
-- in Full load + CDC after a Full Load, a table rule that would select a table the last Full Load's snapshot does not hold;
 - a column rule that matches a column of a table whose name contains `:` (§13.11);
 - a source column that is missing from the Aurora DSQL table and is not excluded, so
   the load would certainly fail with 42703 (§13.4). The fix appends the `exclude` line
@@ -510,10 +509,10 @@ the set and offers only the remedies that are true for your situation:
 | Nothing has run yet (no Full Load, no CDC stack) | Not locked: edit the rules and Save. |
 | The CDC infrastructure is being deleted | Wait for the deletion to finish. The popup shows an engine-aware estimate (about 15-25 min on MySQL, 2-5 min on PostgreSQL). |
 | The CDC infrastructure is being created | Wait for the create to finish, then follow the matching "CDC stack exists" row. |
-| A CDC stack exists (deployed, streaming or stopped) and a Full Load ran | 1. Stop CDC if it streams, then **Delete CDC infrastructure** on the CDC step. 2. Use **Change & reload** for the affected tables (CDC only: switch to Full load + CDC first). 3. Deploy again and Start CDC (on MySQL, see "Starting CDC again after a delete" below). In Full load + CDC, while CDC has never been started for this migration (no Start CDC was submitted), you can still untick tables in the table list (see "Dropping tables after a Full Load (Full load + CDC)"). |
+| A CDC stack exists (deployed, streaming or stopped) and a Full Load ran | 1. Stop CDC if it streams, then **Delete CDC infrastructure** on the CDC step. 2. Use **Change & reload** for the affected tables (CDC only: switch to Full load + CDC first). 3. Deploy again and Start CDC (on MySQL, see "Starting CDC again after a delete" below). In Full load + CDC, while CDC has never been started for this migration (no Start CDC was submitted), you can still untick or tick tables in the table list (see "Changing the table set after a Full Load (Full load + CDC)"). |
 | A CDC stack exists, no Full Load ran, CDC only | Stop CDC if it streams, Delete CDC infrastructure, change the rules (once CDC has streamed, only the column rules: changing the table set needs Start over), deploy again and Start CDC. Deleting the stack also deletes the stream position (see below). |
 | A CDC stack exists, and no Full Load has run yet (Full load + CDC) | Stop CDC if it streams, Delete CDC infrastructure, change the rules, deploy again, then Start Full Load. Nothing needs reloading. If CDC already streamed, choose drop and recreate in the Start Full Load dialog. |
-| No CDC stack, and a Full Load ran (Full load only or Full load + CDC) | **Change & reload** (next section). Full load only: the table set can also change; Full load + CDC: tables can be dropped until CDC starts (see the two subsections below). |
+| No CDC stack, and a Full Load ran (Full load only or Full load + CDC) | **Change & reload** (next section). Full load only: the table set can also change; Full load + CDC: tables can be dropped or added until CDC starts (see the two subsections below). |
 | No CDC stack, and a Full Load ran before the type was switched to CDC only | Switch the type to Full load + CDC, use Change & reload there, then continue with CDC. |
 | A Full Load ran, but its job record is no longer available | Delete the CDC stack first if one exists, then **Start over**. |
 
@@ -521,7 +520,7 @@ More details:
 
 - **Full load only with a stack.** If a stack exists while the type is Full load only,
   switch to Full load + CDC to delete it, because Full load only has no CDC step.
-- **The table set.** In CDC only, it is fixed after a Full Load; switch to Full load + CDC to drop tables before CDC starts. In Full load + CDC, tables can be dropped, not added, until CDC starts (see "Dropping tables after a Full Load (Full load + CDC)" below); after that, and to add a table, use Start over. In Full load only, see "Changing the table set after a Full Load" below.
+- **The table set.** In CDC only, it is fixed after a Full Load; switch to Full load + CDC to change it before CDC starts. In Full load + CDC, tables can be dropped and added until CDC starts (see "Changing the table set after a Full Load (Full load + CDC)" below); after that, use Start over. In Full load only, see "Changing the table set after a Full Load (Full load only)" below.
 - **Starting CDC again after a delete.** On MySQL, Start CDC on Automatic re-seeds from
   the Full Load watermark (the binlog since that load must still exist; Start CDC warns
   if it was purged). Change & reload keeps that watermark, so Start CDC also refuses if
@@ -549,7 +548,7 @@ read-only popup offers **Change & reload**. It opens **Change exclusions & reloa
   selects that is not loaded yet is loaded by Retry unfinished tables; a table it selects
   that the last Full Load already loaded is kept as is, unless a column rule now excludes
   columns in it, in which case it is listed for **Drop & reload** like any other table
-  whose excluded columns change. In Full load + CDC, until CDC starts, a table line can unselect tables (left as is on Aurora DSQL, not captured by CDC) and re-select only a table the last Full Load's snapshot holds; a line that would select any other table is an error, and once CDC has started so is any line that would change the selection. With a CDC stack the popup is read-only: untick tables in the table list instead.
+  whose excluded columns change. In Full load + CDC, until CDC starts, a table line can unselect tables (left as is on Aurora DSQL, not captured by CDC) and select any migratable table: one the last Full Load did not load is listed under Retry unfinished tables on the Full Load step, and CDC captures it once it is loaded. A column rule on a table CDC does not capture yet drops nothing here: its load on the Full Load step applies it. Once CDC has started, any line that would change the selection is an error. With a CDC stack the popup is read-only: use the table list instead.
 - **Before anything is dropped, it shows exactly what will happen:** each table it will
   drop and reload, with the column diff (`+ c (NULL)`, `- c`) and a row estimate ("N
   rows re-read"), plus the warnings and the ALTERs those tables will get. "Their rows on
@@ -605,26 +604,34 @@ No Start over is needed.
   holds until the result covers every table selected since the Full Load (or you turn
   its chip off under Objects to validate). While such a table is not loaded yet, Cut over
   points you back to the Data Migration step.
-- **Switching to a CDC type.** Unticking tables does not lock it unless CDC has already started for this migration (then any change to the set does, until you restore the set or Re-run Full Load), and a CDC type captures the loaded tables still selected. A table ticked since the Full Load keeps the type selector locked until **Re-run Full Load** takes a fresh watermark over the current set, or you untick it again.
+- **Switching to a CDC type.** Unticking tables does not lock it unless CDC has already started for this migration (then any change to the set does, until you restore the set or Re-run Full Load), and a CDC type captures the loaded tables still selected. A table ticked since the Full Load keeps the type selector locked until **Re-run Full Load** takes a fresh watermark over the current set, or you untick it again: a table loaded only in Full load only is not covered by the watermark, while one added by a guarded load in Full load + CDC is (see the next section).
 - **Refresh objects stays hidden** after a load, as before.
 
-### Dropping tables after a Full Load (Full load + CDC)
+### Changing the table set after a Full Load (Full load + CDC)
 
-In Full load + CDC, the table set can shrink after a Full Load while CDC has never started for this migration: no Start CDC was submitted, no connectors exist, and any CDC infrastructure has never streamed. Untick tables in the table list, or use an `exclude table ...` line in Change & reload. It works the same in a restored session. No Start over is needed.
+In Full load + CDC, the table set can change after a Full Load while CDC has never started for this migration: no Start CDC was submitted, no connectors exist, and any CDC infrastructure has never streamed. Untick or tick tables in the table list, or use a table line in Change & reload. It works the same in a restored session. No Start over is needed.
 
 - **An unticked table is left as is on Aurora DSQL (not dropped).** CDC does not capture it, and this migration no longer loads or validates it; the cut-over DEFAULT restore lists it under **Needs your decision** instead of restoring it. When a table rule unselects it, its excluded-column entries are not kept.
-- **Only tables in the Full Load's snapshot can be ticked again.** A lock icon marks the others, with the reason. Adding a table needs Start over: CDC has no gapless start point for a table the snapshot does not hold.
+- **A table you tick that the Full Load did not load** is loaded under the Full Load's start point first, and only then captured by CDC:
+  - Re-run the prerequisite checks when the tool asks (the table was never checked). Until it is loaded, the Full Load step lists it as "Not loaded under the Full Load's start point yet" and reads Failed, and Start CDC, Validation and Cut over wait.
+  - **Retry unfinished tables** loads it under the original watermark and keeps every loaded table. Its load first checks that CDC can capture it with no gap since the Full Load. If a check fails, the table is not loaded, and its row says why and what to do.
+  - It loads only into an **empty** Aurora DSQL table. If the table already holds rows, the dialog drops and reloads it: the tool cannot tell whether they predate the changes CDC captures for it (on MySQL, those since the Full Load's start point; on PostgreSQL, those since the table joined CDC's publication), and an append keeps every row already there.
+  - **MySQL:** a Full Load records the start-point definition of the migratable tables it does not load, and the load compares it with the table's definition now. A Full Load from an earlier version, or a table converted after the load, has no such record: use **Re-run all tables**, or untick it. A definition changed since the start point also needs Re-run all tables.
+  - **PostgreSQL:** the tool adds the table to CDC's publication on the source and waits (up to 10 minutes) for the transactions already open to finish before it copies the table. The table, and each of its partitions, must have a usable `REPLICA IDENTITY` on the source at that moment: a primary key, a valid identity index, or `FULL` (a re-keyed table must already be `REPLICA IDENTITY FULL`). Otherwise every UPDATE and DELETE on it would fail on the source once it is in the publication, so its load refuses it before adding it (and also when the identity cannot be read). The source user must own the table and the publication. A table added for a load that then fails stays in the publication until **Delete CDC infrastructure** (CDC's table list filters it out), so until then its UPDATE and DELETE keep needing that replica identity. After **Delete CDC infrastructure** (which drops the slot and the publication), adding a table needs Re-run all tables.
+  - CDC captures it only after a load with **no quarantined row**.
+  - **Change & reload never drops and reloads a table CDC does not capture yet** (selected after the Full Load, or loaded with quarantined rows): Save stores its column rules, and its load on the Full Load step applies them.
+  - **The cost:** on MySQL, CDC replays every change made to the table since the Full Load's start point over the newer copy; on PostgreSQL, it streams every change made to the table since it joined CDC's publication (just before its copy) over that copy. Either way it converges. A change that briefly conflicts on a unique index with a row already copied can be dead-lettered; Cut over then waits for a CHECKSUM validation. On MySQL, the binary log must still hold every change since the Full Load. If the CDC infrastructure was deployed before the table was loaded, its Kafka topic gets the infrastructure's default partition count.
 - **A table you tick again after the CDC infrastructure is deployed without it** is captured when CDC starts: its Kafka topic gets the infrastructure's default partition count, which was planned for the tables it was deployed with.
-- **A table an exclude table rule unselected** comes back only by deleting that rule in Change & reload, which applies its column rules again (ticking it in the table list is refused: CDC would stream values for columns its loaded rows hold as NULL).
+- **A table an exclude table rule unselected** comes back only by deleting that rule in Change & reload, which applies its column rules (ticking it in the table list is refused: its column rules would not apply). A lock icon marks it, with the reason.
 - **With CDC infrastructure deployed, the popup is read-only:** use the table list.
 - **A failure only in unticked tables no longer holds the step.** It reads Done, Continue to CDC unlocks, and on PostgreSQL CDC still resumes from the load's slot. Retry unfinished tables never reloads an unticked table.
 - **It waits, never Start over,** while a Full Load, a foreign-key pass or a cut-over DEFAULT restore runs; while the CDC infrastructure is created or deleted; while a failed create is still in the account (delete it on the CDC step); and for a few seconds after the page opens while the CDC state is read. If the CDC state cannot be read, the CDC step says why: fix the AWS access and use **Re-check CDC state**.
 - **Unselect all is allowed**, but Deploy CDC infrastructure and Start CDC need at least one selected table.
-- **Re-run Full Load over the smaller set** takes a fresh watermark that no longer holds the unticked tables; on PostgreSQL it reuses the existing publication.
-- **On PostgreSQL, when CDC resumes from the Full Load's slot, the publication still lists the unticked tables** (the tool does not change it on the source); the connector discards their changes. A Start that re-snapshots instead (a captured table did not finish loading, **Re-snapshot every table instead**, or a Start after the CDC infrastructure was deleted) lets the connector set the publication to the captured tables.
+- **Re-run Full Load over the current set** takes a fresh watermark over every selected table; on PostgreSQL it reuses the existing publication and adds any selected table it lacks (only with a usable `REPLICA IDENTITY`, as above: otherwise the run stops before any table loads and says which).
+- **On PostgreSQL, when CDC resumes from the Full Load's slot, the publication still lists the unticked tables** (the tool does not remove them on the source); the connector discards their changes. A Start that re-snapshots instead (a captured table did not finish loading, **Re-snapshot every table instead**, or a Start after the CDC infrastructure was deleted) lets the connector set the publication to the captured tables.
 - **Foreign keys.** A selected table keeps its foreign keys to an unticked table: at Cut over, the orphan check reports a key whose parent rows were not replicated.
 - **Once CDC has started, even if stopped since, the set is fixed again.**
-- **CDC only:** switch to Full load + CDC to drop tables before CDC starts.
+- **CDC only:** switch to Full load + CDC to change the set before CDC starts. Start CDC refuses while a selected table is not loaded under the Full Load's start point.
 
 ### From a quarantine or a dead letter
 
@@ -634,7 +641,9 @@ lead into the same popup:
 - **Full Load quarantine: "Exclude column & reload".** This opens Change & reload with
   one line per flagged column already inserted, but **not saved**
   (`exclude s.t.c  # from the Full Load quarantine`). The reload therefore still takes
-  two deliberate clicks: the button, then the confirm. If an `include` keeps the
+  two deliberate clicks: the button, then the confirm. (In Full load + CDC, for a table
+  CDC does not capture yet, the confirm is a plain Save: the table's load on the Full Load
+  step, listed under Retry unfinished tables, applies the rule; see §13.7.) If an `include` keeps the
   column, the popup points at that line (for example **Go to L5**). If the reason does
   not point to one of the table's flagged columns (it names no type, as with
   `maximum column size exceeded`, or a type none of them has), the LOB section opens
@@ -938,7 +947,7 @@ session-state SQLite file. The ledger is left in place, keyed by the target.
 - A restored DEFAULT applies to **new rows only**; the migrated rows stay NULL.
 - A hand-written `CHECK` constraint that rejects NULL is not detected in advance (the
   table fails with 23514).
-- In CDC only, the **table set** changes after a Full Load only through Start over (or switch to Full load + CDC to drop tables before CDC starts). In Full load + CDC, tables can be dropped, never added, until CDC starts; after that, Start over. For Full load only, see "Changing the table set after a Full Load" in §13.7. Once a CDC stack is deployed, its exclusions change only after Delete CDC infrastructure.
+- In CDC only, the **table set** changes after a Full Load only through Start over (or switch to Full load + CDC to change it before CDC starts). In Full load + CDC, tables can be dropped or added (§13.7) until CDC starts; after that, Start over. For Full load only, see "Changing the table set after a Full Load" in §13.7. Once a CDC stack is deployed, its exclusions change only after Delete CDC infrastructure.
 - Rows already on Aurora DSQL **before CDC started** keep their values in an excluded
   column.
 - The capture list must fit 4,096 bytes (§13.8). Two names that join to the same

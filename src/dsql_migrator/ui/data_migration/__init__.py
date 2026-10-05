@@ -221,10 +221,18 @@ from dsql_migrator.ui.data_migration._models import (
     whole_record_selected,
     untick_can_settle,
     cdc_capture_names,
+    cdc_covered_names,
+    cdc_addition_has_start_point,
+    cdc_not_addable_refusal,
+    SCOPE_ADDED_REASON_FL_CDC,
+    SCOPE_ADDED_REASON_PG_SUFFIX,
+    SCOPE_ADDED_QUARANTINED_REASON,
+    CDC_NOT_ADDABLE_REASON,
     keep_unlisted_covered,
     narrowed_record_names,
     capture_load_complete,
     scope_full_load_job,
+    scoped_full_load_view,
     scope_change,
     watermark_coverage_gap,
     coverage_lock_reason,
@@ -559,9 +567,11 @@ def build_data_migration_screen(
 
     def _exclusion_capture_tables(selected):
         """The tables CDC would capture after a popup Save: once a load ran, the Full Load
-        watermark's tables still selected after it (a Save can only drop covered tables in
-        Full load + CDC before CDC starts, G16 -- the stored names the popup cannot list are
-        kept, as the Save keeps them), else the selection after the Save."""
+        watermark's covered tables (its guarded additions included, G17) still selected
+        after it -- a table the Save selects that the watermark does not cover is captured
+        only once Retry unfinished tables has loaded it, and the stored names the popup
+        cannot list are kept, as the Save keeps them (G16) -- else the selection after the
+        Save."""
         inventory = _inventory()
         if inventory is None:
             return []
@@ -573,7 +583,7 @@ def build_data_migration_screen(
                 # The Save leaves the selection as it is: the capture as it is now.
                 names = cdc_capture_names(migration_state, watermark) or frozenset()
             else:
-                covered = set(watermark.table_row_counts)
+                covered = set(cdc_covered_names(watermark) or ())
                 names = covered & (set(selected) | set(keep_unlisted_covered(
                     migration_state.selection.selected_tables,
                     list(getattr(inputs_now, "migratable", None) or ()),
@@ -604,8 +614,8 @@ def build_data_migration_screen(
             status=get_status(session.workflow, WorkflowStep.FULL_LOAD),
             job_manager=job_manager,
         ),
-        # Full load + CDC after its Full Load, before CDC starts (G16): which tables a table
-        # line may select again -- the tree's own per-table add-lock.
+        # Full load + CDC after its Full Load, before CDC starts (G16, G17): which tables a
+        # table line may select -- the tree's own per-table add-lock.
         add_lock_fn=lambda: table_set_add_lock(migration_state, job_manager),
     )
     _exclusion_row: dict = {}
@@ -623,15 +633,16 @@ def build_data_migration_screen(
         status it wrote, else ``None``. ``status_now`` is the caller's current step (read
         from the workflow when omitted).
 
-        Only in Full load only, or Full load + CDC before CDC starts (G16: removals only),
-        while the set may change after a load (:func:`table_set_editable_after_load`), with
-        a terminal job, a DONE/FAILED step and a touched selection. Writes only on a
-        difference, so a steady render writes nothing: a newly selected (unloaded) table
-        makes the step FAILED -- Validation locks until it is loaded -- and unselecting the
-        only failed tables makes it DONE (in Full load + CDC that also enables Continue to
-        CDC); ticking them back makes it FAILED again, the job's error restored (Full load +
-        CDC then judges the record itself, :func:`whole_record_selected`). No I/O on the
-        render thread; a failed or cancelled run turning DONE submits the background
+        Only in Full load only, or Full load + CDC before CDC starts (G16, G17), while the
+        set may change after a load (:func:`table_set_editable_after_load`), with a terminal
+        job, a DONE/FAILED step and a touched selection. Writes only on a difference, so a
+        steady render writes nothing: a newly selected (unloaded) table -- in Full load +
+        CDC, one the watermark does not cover yet, even with a DONE chunk -- makes the step
+        FAILED (Validation and Start CDC wait until it is loaded), and unselecting the only
+        failed tables makes it DONE (in Full load + CDC that also enables Continue to CDC);
+        ticking them back makes it FAILED again, the job's error restored (Full load + CDC
+        then judges the record itself, :func:`whole_record_selected`). No I/O on the render
+        thread; a failed or cancelled run turning DONE submits the background
         identity-sequence sync its finalize skipped (:func:`submit_scope_identity_sync`).
         """
         if migration_state.migration_type not in (
@@ -651,16 +662,18 @@ def build_data_migration_screen(
         inventory_now = _inventory()
         if inventory_now is None:
             return None
+        _selected_now = resolve_migration_selection(
+            inventory_now, conv_state, migration_state, _target_inventory()
+        )
+        # G17: the tables the watermark does not cover yet are unfinished in the view.
+        _pending = fl_cdc_pending_additions(
+            migration_state, job_manager, _selected_now, job=record
+        )
         names = full_load_scope_names(
-            migration_state,
-            job_manager,
-            resolve_migration_selection(
-                inventory_now, conv_state, migration_state, _target_inventory()
-            ),
-            job=record,
+            migration_state, job_manager, _selected_now, job=record, pending=_pending,
         )
         if names is not None:
-            view = scope_full_load_job(record, names)
+            view = scope_full_load_job(record, names, unfinished=_pending)
         elif whole_record_selected(migration_state, record):
             # G16: a Full load + CDC set ticked back to every table of its record after a
             # narrowing is the record itself again -- re-derived from it, as G12 does for an
@@ -867,6 +880,16 @@ def build_data_migration_screen(
             migration_state.pending_full_load_confirm = True
             return
         inputs = dataclasses.replace(inputs, **_overlay_fields)
+        if source_config.source_type is SourceType.MYSQL:
+            # G17: the start-point definition of every migratable table this run does not
+            # load, recorded with its watermark -- the only proof that one of them, ticked
+            # after a Full load + CDC load, has not changed since this start point. Both run
+            # types: a Full load only set can be switched to Full load + CDC unchanged.
+            _run_set = set(names)
+            inputs = dataclasses.replace(
+                inputs,
+                cdc_baseline_tables=tuple(n for n in generated if n not in _run_set),
+            )
         tables = TableSelector().resolve(
             inventory, TableSelection(selected_tables=names)
         )
@@ -998,9 +1021,10 @@ def build_data_migration_screen(
             )
             status = promoted
         # After a table-set change following the load (Full load only, G12; Full load + CDC
-        # before CDC first starts, removals only, G16): the step follows the CURRENT set (a
-        # selected table not loaded yet -> FAILED; only unselected tables unfinished ->
-        # DONE). A no-op whenever nothing changed.
+        # before CDC first starts, G16/G17): the step follows the CURRENT set (a selected
+        # table not loaded yet -- in Full load + CDC one its watermark does not cover yet --
+        # -> FAILED; only unselected tables unfinished -> DONE). A no-op whenever nothing
+        # changed.
         status = _sync_scope_step(status) or status
         # The Full Load PHASE (what the Full Load surfaces show), apart from the shared
         # step a streaming CDC-only run promoted; ``status`` keeps gating and writes.
@@ -1146,10 +1170,10 @@ def build_data_migration_screen(
             )
             # The watermark decides whether the CONSISTENCY POINT has already been passed,
             # and it is needed twice below, so resolve it once.
-            _wm_for_gate = _cdc_watermark(
-                _current_job(job_manager, getattr(migration_state, "job_id", None)),
-                migration_state,
+            _record_for_gate = _current_job(
+                job_manager, getattr(migration_state, "job_id", None)
             )
+            _wm_for_gate = _cdc_watermark(_record_for_gate, migration_state)
             request = PrerequisiteCheckRequest(
                 mode=mode,
                 tables=[table.name for table in tables],
@@ -1215,6 +1239,18 @@ def build_data_migration_screen(
                     ).items()
                     if table in set(names)
                 },
+                # G17 (PostgreSQL, Full load + CDC after its Full Load, before CDC starts): the
+                # selected tables the watermark does not cover yet. Their guarded load adds
+                # each to CDC's publication before its copy, so the existence check must not
+                # count them missing from it -- that FAIL would hold the very Retry that adds
+                # them (and Deploy and Start with it).
+                cdc_pending_tables=(
+                    fl_cdc_pending_additions(
+                        migration_state, job_manager, names, job=_record_for_gate
+                    )
+                    if source_config.source_type is SourceType.POSTGRES
+                    else []
+                ),
             )
             from nicegui import run
 
@@ -1643,9 +1679,9 @@ def build_data_migration_screen(
                     ),
                     # Refresh objects stays hidden once a Full Load job exists, as it
                     # always was: Full load only can now change the set after a load
-                    # (G12) and Full load + CDC can drop tables until CDC starts (G16),
-                    # but re-introspecting would change the inventory every loaded
-                    # table, Validation and the exclusions are judged against.
+                    # (G12) and Full load + CDC can until CDC starts (G16, G17), but
+                    # re-introspecting would change the inventory every loaded table,
+                    # Validation and the exclusions are judged against.
                     on_refresh=refresh_browser if job is None else None,
                     locked=selection_locked,
                     lock_reason=selection_lock,
@@ -1696,10 +1732,10 @@ def build_data_migration_screen(
             # behavior). The exclusion is baked only once a Full Load has run, CDC is
             # streaming, or the CDC stack (with its column.exclude.list) is deployed
             # -- exactly ``selection_locked``, with one exception: after a load the TABLE
-            # set stays editable in Full load only (G12, both directions) and, removals
-            # only, in Full load + CDC until CDC first starts (G16, even with its CDC
-            # infrastructure deployed), while the column exclusions stay locked
-            # (``exclusion_lock_state``). A change made after the checks ran but
+            # set stays editable in Full load only (G12, both directions) and in Full load +
+            # CDC until CDC first starts (G16, G17: an added table loads under the guards
+            # first; even with its CDC infrastructure deployed), while the column exclusions
+            # stay locked (``exclusion_lock_state``). A change made after the checks ran but
             # before the load is caught at the Run button (see
             # ``full_load_run_guard_reason``), so a stale PASS never starts a load
             # against an unchecked column set. The lock is silent: the greyed picker
@@ -1742,19 +1778,24 @@ def build_data_migration_screen(
                 migration_state, job_manager, session, inventory,
                 capture=_pre_load_capture_now,
             )
-            # Full load only after a set change (G12): the tables selected since the load
-            # are not vouched for by its prerequisite pass.
-            _scope_added = (
-                scope_change(
+            # After a set change (Full load only, G12): the tables selected since the load are
+            # not vouched for by its prerequisite pass. Full load + CDC (G17): the tables its
+            # watermark does not cover yet, whatever the record holds for them -- the same
+            # guard, they never passed the checks either.
+            if migration_type is MigrationType.FULL_LOAD_ONLY:
+                _scope_added = scope_change(
                     job,
                     scope_full_load_job(
                         job,
                         full_load_scope_names(migration_state, job_manager, selected_names),
                     ),
                 )[0]
-                if migration_type is MigrationType.FULL_LOAD_ONLY
-                else []
-            )
+            elif migration_type is MigrationType.FULL_LOAD_AND_CDC and job is not None:
+                _scope_added = fl_cdc_pending_additions(
+                    migration_state, job_manager, selected_names, job=job
+                )
+            else:
+                _scope_added = []
             guard_reason = full_load_run_guard_reason(
                 migration_state,
                 inventory,
@@ -1895,8 +1936,10 @@ def build_data_migration_screen(
                 # G12: after a Full load only set change the retry follows the CURRENT
                 # selection -- a table no longer selected is left as is (never reloaded or
                 # dropped), and a table selected since needs its prerequisite checks. G16:
-                # Full load + CDC follows the record's tables still selected (removal only).
-                # An unchanged set (and CDC only) is the record itself: today's path.
+                # Full load + CDC follows the record's tables still selected; G17: plus, until
+                # CDC starts, the tables its watermark does not cover yet -- each loaded under
+                # the guards and then captured from the Full Load's start point. An unchanged
+                # set (and CDC only) is the record itself: today's path.
                 _selected_now = resolve_migration_selection(
                     inventory, conv_state, migration_state, _target_inventory()
                 )
@@ -1918,17 +1961,36 @@ def build_data_migration_screen(
                         position="top",
                     )
                     return
-                _scoped_view = scope_full_load_job(
-                    current,
-                    full_load_scope_names(migration_state, job_manager, _selected_now),
+                _scoped_view = scoped_full_load_view(
+                    migration_state, job_manager, _selected_now, job=current
                 )
                 _run_table_names: Optional[list[str]] = None
-                if _scoped_view is not current:
+                # G17: in Full load + CDC "new" is keyed by COVERAGE, not by the record: a
+                # table the watermark does not cover is guarded again on every attempt (a
+                # second try, a Reload, a Change & reload), whatever chunk the record has.
+                _fl_cdc = migration_state.migration_type is MigrationType.FULL_LOAD_AND_CDC
+                _covered_now = (
+                    cdc_covered_names(getattr(current, "watermark", None)) if _fl_cdc else None
+                )
+                _cdc_additions: tuple = ()
+                if _scoped_view is not current or (
+                    _covered_now is not None and any(n not in _covered_now for n in names)
+                ):
                     _decision = retry_scope_block_reason(
                         names,
                         [c.chunk_id for c in _scoped_view.chunks],
-                        [c.chunk_id for c in current.chunks],
-                        lambda new: retry_added_tables_guard(
+                        (
+                            list(_covered_now)
+                            if _covered_now is not None
+                            else [c.chunk_id for c in current.chunks]
+                        ),
+                        lambda new: (
+                            _cdc_addition_guard(
+                                migration_state, job_manager, current, new, session
+                            )
+                            if _covered_now is not None
+                            else None
+                        ) or retry_added_tables_guard(
                             migration_state, job_manager, session, inventory, new
                         ),
                     )
@@ -1947,6 +2009,8 @@ def build_data_migration_screen(
                     if not names:
                         return
                     _run_table_names = [c.chunk_id for c in _scoped_view.chunks]
+                    if _covered_now is not None:
+                        _cdc_additions = tuple(_decision.new)
                 if not session.has_source() or not session.has_target():
                     migration_state.set_error(
                         "Configure and test the source and target connections "
@@ -2082,6 +2146,16 @@ def build_data_migration_screen(
                         prior_recreated_tables=prior_recreated,
                         inputs=retry_inputs,
                         run_table_names=_run_table_names,
+                        # G17: the tables this retry adds to CDC's capture, and the durable
+                        # "CDC never started" rule the engine re-checks on its own thread
+                        # before any source write and at the coverage write.
+                        cdc_additions=_cdc_additions,
+                        cdc_coverage_open=(
+                            (lambda: not _cdc_started_for_migration(
+                                migration_state, job_manager))
+                            if _cdc_additions
+                            else None
+                        ),
                     )
 
                 reset_stale_manual_start_point(
@@ -2109,16 +2183,15 @@ def build_data_migration_screen(
                 if current is None:
                     return
                 # The CURRENT set's unfinished tables (G12): a table no longer selected is
-                # not retried; one selected since the load is (scope_full_load_job).
-                _run_retry_for(unsettled_table_names(scope_full_load_job(
-                    current,
-                    full_load_scope_names(
-                        migration_state,
-                        job_manager,
-                        resolve_migration_selection(
-                            inventory, conv_state, migration_state, _target_inventory()
-                        ),
+                # not retried; one selected since the load is -- in Full load + CDC, every one
+                # its watermark does not cover yet (G17, scoped_full_load_view).
+                _run_retry_for(unsettled_table_names(scoped_full_load_view(
+                    migration_state,
+                    job_manager,
+                    resolve_migration_selection(
+                        inventory, conv_state, migration_state, _target_inventory()
                     ),
+                    job=current,
                 )))
 
             def reload_table(table_name: str) -> None:
@@ -2400,16 +2473,15 @@ def build_data_migration_screen(
                 # the flag so any later re-run also completes.
                 record = _current_job(job_manager, migration_state.job_id)
                 # Judged and counted over the CURRENT set (G12): a table no longer selected
-                # neither blocks the acceptance nor adds to the gap accepted.
-                current = scope_full_load_job(
-                    record,
-                    full_load_scope_names(
-                        migration_state,
-                        job_manager,
-                        resolve_migration_selection(
-                            inventory, conv_state, migration_state, _target_inventory()
-                        ),
+                # neither blocks the acceptance nor adds to the gap accepted (and a Full load
+                # + CDC table its watermark does not cover yet is unfinished, G17).
+                current = scoped_full_load_view(
+                    migration_state,
+                    job_manager,
+                    resolve_migration_selection(
+                        inventory, conv_state, migration_state, _target_inventory()
                     ),
+                    job=record,
                 )
                 _accept_tables = _view_tables(record, current)
                 if current is None or not _incomplete_is_quarantine_only(
@@ -2909,18 +2981,17 @@ def build_data_migration_screen(
                                                 CONTINUE_HINT_FL_CDC
                                                 if migration_type
                                                 is MigrationType.FULL_LOAD_AND_CDC
-                                                and table_set_lock_reason(
-                                                    migration_state, job_manager, session
-                                                )
-                                                is None
+                                                # This render's table-picker lock (each
+                                                # re-read copies the Full Load record).
+                                                and selection_lock is None
                                                 and untick_can_settle(
-                                                    job,
-                                                    full_load_scope_names(
+                                                    scoped_full_load_view(
                                                         migration_state,
                                                         job_manager,
                                                         selected_names,
                                                         job=job,
                                                     ),
+                                                    None,
                                                 )
                                                 else ""
                                             ),
@@ -3292,8 +3363,10 @@ def _table_tree_hint(
 ) -> Optional[str]:
     """The neutral line under the table picker after a Full Load, while the set can still
     change (:func:`table_set_editable_after_load`), else ``None``: Full load only says what
-    a tick or an untick does (G12); Full load + CDC that an untick drops a table and only
-    covered tables can be ticked again (G16)."""
+    a tick or an untick does (G12); Full load + CDC that an untick drops a table, a tick of
+    a table the Full Load did not load has it loaded on the Full Load step (by Retry, or by
+    Re-run all tables where Retry cannot add it) before CDC captures it, and a lock marks a
+    rule-held table (G16, G17)."""
     if job is None or locked or not table_set_editable_after_load(migration_state, job_manager):
         return None
     if migration_type is MigrationType.FULL_LOAD_AND_CDC:
@@ -3644,12 +3717,34 @@ def full_load_run_guard_reason(
     return prerequisite_block_reason(report, mode=prereq_mode)
 
 
+def _cdc_addition_guard(
+    migration_state, job_manager, record, added: Sequence[str], session
+) -> Optional[str]:
+    """The Full load + CDC half of the Retry guard for tables the watermark does not cover
+    yet (G17), at the click, before the prerequisite guard: CDC must still be known never to
+    have started (:func:`cdc_addition_block_reason`), and on MySQL each table needs a
+    start-point definition recorded with the watermark (:func:`cdc_addition_has_start_point`).
+    ``None`` = they may load (the engine runs the source-side guards). No I/O."""
+    reason = cdc_addition_block_reason(migration_state, job_manager, added, job=record)
+    if reason:
+        return reason
+    watermark = getattr(record, "watermark", None)
+    engine = session_source_type(session)
+    not_addable = [
+        n for n in added if not cdc_addition_has_start_point(watermark, n, engine)
+    ]
+    if not_addable:
+        return cdc_not_addable_refusal(not_addable)
+    return None
+
+
 def retry_added_tables_guard(
     migration_state, job_manager, session, inventory, added: Sequence[str]
 ) -> Optional[str]:
-    """The run guard for tables a Full load only retry would load for the FIRST time
-    (selected after the load, G12), evaluated at the click: they never passed the
-    prerequisite checks the load's own pass vouches for. ``None`` = they may load."""
+    """The run guard for tables a retry would load for the FIRST time (selected after the
+    load: Full load only, G12; in Full load + CDC the tables its watermark does not cover,
+    G17), evaluated at the click: they never passed the prerequisite checks the load's own
+    pass vouches for. ``None`` = they may load."""
     return full_load_run_guard_reason(
         migration_state,
         inventory,
@@ -3923,9 +4018,10 @@ def _type_switch_coverage_gap(migration_state, job_manager):
     behind, else ``None``. While CDC never started for this migration only a table selected
     since is a gap -- a removal alone is none (G16: CDC captures the covered tables still
     selected); once it has started (:func:`_cdc_started_for_migration`: even if stopped and
-    deleted since), a removal is one too, as before G16. Touched selections only (an
-    untouched default that drifted is no decision); the live exclusion inputs, else the last
-    render's selection."""
+    deleted since), a removal is one too, as before G16. "Covered" includes a table a guarded
+    Full load + CDC load added (G17, :func:`watermark_coverage_gap`); one loaded only by a
+    Full load only retry never is. Touched selections only (an untouched default that
+    drifted is no decision); the live exclusion inputs, else the last render's selection."""
     if job_manager is None:
         return None
     if getattr(migration_state, "migration_type", None) is not MigrationType.FULL_LOAD_ONLY:
@@ -3985,15 +4081,17 @@ def selection_lock_reason(
       foreign-key pass or a cut-over DEFAULT restore runs (:func:`table_set_wait_reason`).
       Nothing feeds a CDC capture list there; the migration-type lock keeps a CDC type off
       while a table selected since the load is not covered by a fresh watermark. A pruned
-      record or CDC evidence keeps the lock as before. Full load + CDC lifts it too, for
-      REMOVALS, until CDC first starts for this migration (G16, the same predicate): a
-      table can then be unselected (left as is on Aurora DSQL, and CDC no longer captures
-      it), and only a table the Full Load covered can be selected again
-      (:func:`table_set_add_lock`). It also WAITS while the CDC infrastructure is created
-      or deleted, a failed create is still in the account, or the CDC state has not been
-      read yet. Once CDC has started -- even if stopped since -- this clause's text below
-      applies again, unchanged. CDC only keeps the lock; while Full load + CDC could still
-      drop tables (and the type may change), its text names that route too.
+      record or CDC evidence keeps the lock as before. Full load + CDC lifts it too, until
+      CDC first starts for this migration (G16, G17, the same predicate): a table can then
+      be unselected (left as is on Aurora DSQL, and CDC no longer captures it), and any
+      migratable table selected but one an exclude table rule holds
+      (:func:`table_set_add_lock`) -- one the Full Load did not load is loaded by Retry
+      unfinished tables under its guards, and only then captured. It also WAITS while the
+      CDC infrastructure is created or deleted, a failed create is still in the account, or
+      the CDC state has not been read yet. Once CDC has started -- even if stopped since --
+      this clause's text below applies again, unchanged. CDC only keeps the lock; while Full
+      load + CDC could still change the set (and the type may change), its text names that
+      route too.
     * **CDC is streaming** -- the running source connector's table list is fixed;
       ticking the picker cannot add or remove a streamed table.
     * **CDC infrastructure is deployed or deploying** -- the subtle one. The immutable
@@ -4004,12 +4102,12 @@ def selection_lock_reason(
       ``kind="infra"`` job (counting it once froze this picker for 20 minutes), so
       without this clause that whole window would be unguarded. Scoped to CDC-bearing
       types so a Full-load-only run is not frozen by a CDC stack that merely exists in
-      the account. The G16 narrowing above does not reach this clause: it never adds a
-      table the Full Load did not load, and a never-started stack has no topics yet --
-      Start CDC re-sends the table list and creates each captured table's topic from the
-      partition plan the stack was deployed with: a covered table ticked back before CDC
-      first starts gets the plan's default count, as every table the plan does not single
-      out does.
+      the account. The G16/G17 clause above takes precedence after a Full load + CDC load:
+      a never-started stack has no topics yet -- Start CDC re-sends the table list and
+      creates each captured table's topic from the partition plan the stack was deployed
+      with, so a table ticked before CDC first starts (one ticked back, or one added and
+      loaded under the guards) gets the plan's default count, as every table the plan does
+      not single out does.
 
     Pure: reads ``status`` plus already-populated state (``job_manager`` is only used for
     the job-id lookups the CDC helpers already do) -- no AWS I/O, so it is safe during
@@ -4017,10 +4115,10 @@ def selection_lock_reason(
     """
     if has_job or status is StepStatus.DONE:
         # G12: Full load only, record found, no CDC stack -- the set may change after the
-        # load; only a running load / FK pass / DEFAULT restore holds it (a wait). G16: Full
-        # load + CDC, record found, CDC never started for this migration -- tables may be
-        # dropped; the CDC infrastructure being created or deleted, a failed create and an
-        # unread CDC state are waits too.
+        # load; only a running load / FK pass / DEFAULT restore holds it (a wait). G16/G17:
+        # Full load + CDC, record found, CDC never started for this migration -- tables may
+        # be dropped or added; the CDC infrastructure being created or deleted, a failed
+        # create and an unread CDC state are waits too.
         if migration_type in (
             MigrationType.FULL_LOAD_ONLY,
             MigrationType.FULL_LOAD_AND_CDC,
@@ -4044,8 +4142,8 @@ def selection_lock_reason(
             "Locked — a Full Load has already run for this table set. Use 'Start over' "
             "to migrate a different set of tables."
         )
-        # CDC only after a recorded Full Load (G16): while Full load + CDC could still drop
-        # tables -- the CDC state read, CDC never started for this migration, and the type
+        # CDC only after a recorded Full Load (G16): while Full load + CDC could still change
+        # the set -- the CDC state read, CDC never started for this migration, and the type
         # free to change -- name that non-destructive route beside Start over.
         if (
             migration_type is MigrationType.CDC_ONLY
@@ -4593,9 +4691,10 @@ def build_migration_table_tree(
 
 
 def _header_table_slot_with_locks() -> str:
-    """The table leaf slot with the G16 lock icons (Full load + CDC after its Full Load): a
-    grey lock per leaf that cannot be ticked now, its reason on hover. Static text, so the
-    whole slot stays a client-side template (no per-node Python work)."""
+    """The table leaf slot with the G16 lock icon (Full load + CDC after its Full Load): a
+    grey lock on a leaf an exclude table rule holds (the only per-table reason since G17),
+    its reason on hover. Static text, so the whole slot stays a client-side template (no
+    per-node Python work)."""
     return (
         r"""
             <div class="row items-center no-wrap">
@@ -4607,13 +4706,7 @@ def _header_table_slot_with_locks() -> str:
               <q-icon v-else name="warning" color="amber-7" size="16px" class="q-ml-xs">
                 <q-tooltip>No primary key — required to migrate to Aurora DSQL</q-tooltip>
               </q-icon>
-              <q-icon v-if="props.node.add_locked === 'not_loaded'" name="lock"
-                      color="grey-6" size="16px" class="q-ml-xs">
-                <q-tooltip>"""
-        + LOCK_TIP_NOT_LOADED
-        + r"""</q-tooltip>
-              </q-icon>
-              <q-icon v-else-if="props.node.add_locked === 'rule'" name="lock"
+              <q-icon v-if="props.node.add_locked === 'rule'" name="lock"
                       color="grey-6" size="16px" class="q-ml-xs">
                 <q-tooltip>"""
         + LOCK_TIP_RULE
@@ -4676,12 +4769,13 @@ def _render_table_selection(
 
     ``add_lock_fn`` (Full load + CDC after its Full Load, before CDC starts, G16) returns
     the per-table add-lock (:func:`table_set_add_lock`) or ``None``. With a lock, each
-    untickable leaf shows a lock icon with its reason (client-side), a tick that would ADD
-    a locked table is refused whole at the click (warned, nothing stored, ``on_locked``),
-    Select all selects only the tables that may be selected, and every write keeps the
-    stored covered tables the tree cannot list (:func:`keep_unlisted_covered`). The lock is
-    read at render (the icons) and again at every click (the current type decides there).
-    ``None``, or a function returning ``None``, renders exactly today's picker.
+    untickable leaf (since G17: one an exclude table rule holds) shows a lock icon with its
+    reason (client-side), a tick that would ADD a locked table is refused whole at the
+    click (warned, nothing stored, ``on_locked``), Select all selects only the tables that
+    may be selected, and every write keeps the stored covered tables the tree cannot list
+    (:func:`keep_unlisted_covered`). The lock is read at render (the icons) and again at
+    every click (the current type decides there). ``None``, or a function returning
+    ``None``, renders exactly today's picker.
     """
     with ui.row().classes("items-center gap-1"):
         ui.label("Tables to migrate").classes("text-sm font-semibold")
@@ -5887,7 +5981,9 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     table_set_delete_wait,
     TableSetAddLock,
     table_set_add_lock,
-    LOCK_TIP_NOT_LOADED,
+    cdc_uncovered_selection,
+    fl_cdc_pending_additions,
+    cdc_addition_block_reason,
     LOCK_TIP_RULE,
     TREE_HINT_FL_CDC,
     CDC_ONLY_NARROWING_SENTENCE,

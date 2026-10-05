@@ -37,7 +37,7 @@ _언어: [English](../en/13-excluding-tables-and-columns.md) | **한국어** | [
   Change & reload가 실행될 때만 일어나며, 각 동작은 그 변경을 먼저 보여 줍니다.
 - **절대 제외할 수 없는 컬럼이 있습니다.** 키 컬럼, 보존된 외래 키가 참조하는 컬럼, Aurora DSQL이
   계산하는 컬럼은 거부되며, 사유가 항상 표시됩니다(§13.4).
-- **데이터가 이동하면 집합이 고정됩니다.** Full Load 후, 또는 CDC 스택이 배포되면 제외 설정이 잠깁니다. 그래도 바꿀 수는 있지만, §13.7의 경로를 통해서만 가능합니다. Full load only에서는 Full Load 후에도 이관할 테이블을 바꿀 수 있고, Full load + CDC에서는 CDC를 시작하기 전까지 테이블을 뺄 수 있습니다(추가는 불가, §13.7).
+- **데이터가 이동하면 집합이 고정됩니다.** Full Load 후, 또는 CDC 스택이 배포되면 제외 설정이 잠깁니다. 그래도 바꿀 수는 있지만, §13.7의 경로를 통해서만 가능합니다. Full load only에서는 Full Load 후에도 이관할 테이블을 바꿀 수 있고, Full load + CDC에서는 CDC를 시작하기 전까지 테이블을 빼거나 추가할 수 있으며, 추가한 테이블은 먼저 Full Load 단계에서 로드되는데, 보통 Retry unfinished tables가 Full Load의 시작 지점 아래에서 로드합니다(§13.7).
 
 ---
 
@@ -86,7 +86,6 @@ columns...** 버튼이 있습니다. 그 옆의 상태 줄이 지금 무엇이 �
   - CDC가 스트리밍 중이거나 스택이 집합을 보유할 때;
   - Full load only와 Full load + CDC에서 Full Load, 외래 키 적용, 컷오버 DEFAULT 복원이 실행되는 동안(끝나면 풀림);
   - Full load + CDC에서는 CDC 인프라를 생성하거나 삭제하는 동안, 실패한 생성이 계정에 남아 있는 동안, CDC 상태를 읽는 동안에도;
-- Full load + CDC에서 Full Load 후, 직전 Full Load의 스냅샷에 없는 테이블을 선택하게 되는 테이블 규칙;
 - 이름에 `:`가 들어간 테이블의 컬럼에 매칭되는 컬럼 규칙(§13.11);
 - Aurora DSQL 테이블에 없고 제외되지도 않은 소스 컬럼. 로드가 42703으로 확실히 실패하기
   때문입니다(§13.4). 수정은 그 컬럼에 대한 `exclude` 줄을 덧붙이지만, 직접 클릭해야 합니다: 컬럼은
@@ -473,10 +472,10 @@ drop하거나 쓰기 전에 모든 테이블을 실패시키고, Start CDC는 �
 | 아직 아무것도 실행하지 않음(Full Load 없음, CDC 스택 없음) | 잠기지 않음: 규칙을 편집하고 Save합니다. |
 | CDC 인프라를 삭제하는 중 | 삭제가 끝나기를 기다립니다. 팝업이 엔진별 예상 시간(MySQL은 약 15-25분, PostgreSQL은 약 2-5분)을 보여 줍니다. |
 | CDC 인프라를 생성하는 중 | 생성이 끝나기를 기다린 뒤, 해당하는 "CDC 스택이 있음" 행을 따릅니다. |
-| CDC 스택이 있음(배포됨, 스트리밍 중 또는 멈춤), 그리고 Full Load가 실행됨 | 1. 스트리밍 중이면 Stop CDC한 뒤, CDC 단계에서 **Delete CDC infrastructure**. 2. 영향받은 테이블에 **Change & reload**를 사용(CDC only라면 먼저 Full load + CDC로 전환). 3. 다시 배포하고 Start CDC(MySQL은 아래 "삭제 후 다시 CDC 시작" 참고). Full load + CDC에서 이 마이그레이션에서 CDC를 한 번도 시작하지 않았다면(Start CDC를 제출한 적이 없음), 테이블 목록에서 테이블의 체크를 해제할 수는 있습니다(아래 "Full Load 후 테이블 빼기 (Full load + CDC)" 참고). |
+| CDC 스택이 있음(배포됨, 스트리밍 중 또는 멈춤), 그리고 Full Load가 실행됨 | 1. 스트리밍 중이면 Stop CDC한 뒤, CDC 단계에서 **Delete CDC infrastructure**. 2. 영향받은 테이블에 **Change & reload**를 사용(CDC only라면 먼저 Full load + CDC로 전환). 3. 다시 배포하고 Start CDC(MySQL은 아래 "삭제 후 다시 CDC 시작" 참고). Full load + CDC에서 이 마이그레이션에서 CDC를 한 번도 시작하지 않았다면(Start CDC를 제출한 적이 없음), 테이블 목록에서 테이블을 체크하거나 해제할 수는 있습니다(아래 "Full Load 후 테이블 집합 바꾸기 (Full load + CDC)" 참고). |
 | CDC 스택이 있음, Full Load는 실행되지 않음, CDC only | 스트리밍 중이면 Stop CDC, Delete CDC infrastructure, 규칙 변경(CDC가 한 번이라도 스트리밍했다면 컬럼 규칙만 가능: 테이블 집합을 바꾸려면 Start over가 필요), 다시 배포하고 Start CDC. 스택을 삭제하면 스트림 위치도 삭제됩니다(아래 참고). |
 | CDC 스택이 있음, 아직 Full Load가 실행되지 않음(Full load + CDC) | 스트리밍 중이면 Stop CDC, Delete CDC infrastructure, 규칙 변경, 다시 배포한 뒤 Start Full Load. 재적재할 것은 없습니다. CDC가 이미 스트리밍했다면 Start Full Load 다이얼로그에서 drop 후 재생성을 선택하세요. |
-| CDC 스택이 없음, 그리고 Full Load가 실행됨(Full load only 또는 Full load + CDC) | **Change & reload**(다음 절). Full load only: 테이블 집합도 바꿀 수 있습니다. Full load + CDC: CDC를 시작하기 전까지 테이블을 뺄 수 있습니다(아래 두 절 참고). |
+| CDC 스택이 없음, 그리고 Full Load가 실행됨(Full load only 또는 Full load + CDC) | **Change & reload**(다음 절). Full load only: 테이블 집합도 바꿀 수 있습니다. Full load + CDC: CDC를 시작하기 전까지 테이블을 빼거나 추가할 수 있습니다(아래 두 절 참고). |
 | CDC 스택이 없음, 그리고 유형을 CDC only로 전환하기 전에 Full Load가 실행됨 | 유형을 Full load + CDC로 전환하고, 거기서 Change & reload를 사용한 뒤, CDC로 계속합니다. |
 | Full Load가 실행되었지만 그 job 기록을 더 이상 사용할 수 없음 | CDC 스택이 있으면 먼저 삭제한 뒤 **Start over**. |
 
@@ -484,7 +483,7 @@ drop하거나 쓰기 전에 모든 테이블을 실패시키고, Start CDC는 �
 
 - **스택이 있는 Full load only.** 유형이 Full load only인데 스택이 있다면, 스택을 삭제하려면 Full
   load + CDC로 전환하세요. Full load only에는 CDC 단계가 없기 때문입니다.
-- **테이블 집합.** CDC only에서는 Full Load 후 고정됩니다. CDC를 시작하기 전에 테이블을 빼려면 Full load + CDC로 전환하세요. Full load + CDC에서는 CDC를 시작하기 전까지 테이블을 뺄 수 있지만 추가할 수는 없습니다(아래 "Full Load 후 테이블 빼기 (Full load + CDC)" 참고). 그 이후에, 그리고 테이블을 추가하려면 Start over를 사용하세요. Full load only는 아래 "Full Load 후 테이블 집합 바꾸기"를 참고하세요.
+- **테이블 집합.** CDC only에서는 Full Load 후 고정됩니다. CDC를 시작하기 전에 집합을 바꾸려면 Full load + CDC로 전환하세요. Full load + CDC에서는 CDC를 시작하기 전까지 테이블을 빼거나 추가할 수 있습니다(아래 "Full Load 후 테이블 집합 바꾸기 (Full load + CDC)" 참고). 그 이후에는 Start over를 사용하세요. Full load only는 아래 "Full Load 후 테이블 집합 바꾸기 (Full load only)"를 참고하세요.
 - **삭제 후 다시 CDC 시작.** MySQL에서는 시작 지점이 Automatic인 Start CDC가 Full Load 워터마크에서
   다시 시드합니다(그 로드 이후의 binlog가 아직 있어야 하며, purge되었다면 Start CDC가 경고합니다).
   Change & reload는 그 워터마크를 유지하므로, 그 로드 이후 캡처 대상 테이블의 정의가 바뀌었다면(예: 소스에
@@ -508,7 +507,7 @@ Full Load가 포함된 마이그레이션 유형에서 그 실행이 기록되�
 - **컬럼 규칙은 편집할 수 있습니다.** Full load only에서는 테이블 줄이 선택을 바꿉니다(다음 절 참고): 선택에서 빠진 테이블은 Aurora DSQL에 그대로
   남습니다(drop되지 않음). 선택된 테이블 중 아직 로드되지 않은 테이블은 Retry unfinished tables가
   로드합니다. 직전 Full Load가 이미 로드한 테이블은 그대로 유지되지만, 컬럼 규칙이 그 테이블의 컬럼을 새로
-  제외하면 제외 컬럼이 바뀌는 다른 테이블과 마찬가지로 **Drop & reload** 대상으로 표시됩니다. Full load + CDC에서는 CDC를 시작하기 전까지 테이블 줄로 테이블의 선택을 해제할 수 있고(Aurora DSQL에 그대로 남으며 CDC가 캡처하지 않음), 직전 Full Load의 스냅샷에 있는 테이블만 다시 선택할 수 있습니다. 다른 테이블을 선택하게 되는 줄은 오류이며, CDC를 시작한 뒤에는 선택을 바꾸게 되는 모든 줄이 오류입니다. CDC 스택이 있으면 팝업은 읽기 전용이므로, 대신 테이블 목록에서 체크를 해제하세요.
+  제외하면 제외 컬럼이 바뀌는 다른 테이블과 마찬가지로 **Drop & reload** 대상으로 표시됩니다. Full load + CDC에서는 CDC를 시작하기 전까지 테이블 줄로 테이블의 선택을 해제하거나(Aurora DSQL에 그대로 남으며 CDC가 캡처하지 않음) 이관 가능한 어느 테이블이든 선택할 수 있습니다: 직전 Full Load가 로드하지 않은 테이블은 Full Load 단계의 Retry unfinished tables 아래에 표시되고, 로드되면 CDC가 캡처합니다. CDC가 아직 캡처하지 않는 테이블의 컬럼 규칙은 여기서 아무것도 drop하지 않습니다: Full Load 단계에서의 그 테이블의 로드가 그 규칙을 적용합니다. CDC를 시작한 뒤에는 선택을 바꾸게 되는 모든 줄이 오류입니다. CDC 스택이 있으면 팝업은 읽기 전용이므로, 대신 테이블 목록을 사용하세요.
 - **무엇이든 drop하기 전에 무슨 일이 일어날지 정확히 보여 줍니다:** drop 후 재적재할 각 테이블과 그
   컬럼 diff(`+ c (NULL)`, `- c`)와 행 추정치("N rows re-read"), 그리고 그 테이블들이 받을 경고와
   ALTER. "Their rows on Aurora DSQL are permanently deleted; each table is recreated from your
@@ -555,26 +554,34 @@ Change & reload에서 테이블 줄(`exclude table ...`)을 사용하세요. Sta
 - **Validation.** 새로 선택한 테이블이 로드되면 Validation을 다시 실행하세요: 결과가 Full Load 이후 선택한
   모든 테이블을 다룰 때까지(또는 Objects to validate에서 그 칩을 끌 때까지) Cut over는 보류됩니다. 그런
   테이블이 아직 로드되지 않은 동안에는 Cut over가 Data Migration 단계로 돌아가도록 안내합니다.
-- **CDC 유형으로 전환하기.** 이 마이그레이션에서 CDC를 이미 시작한 경우가 아니라면 테이블의 체크를 해제하는 것만으로는 유형이 잠기지 않으며(이미 시작했다면, 집합을 되돌리거나 Re-run Full Load를 실행할 때까지 집합을 바꾸는 모든 변경이 유형을 잠급니다), CDC 유형은 로드된 테이블 중 아직 선택된 테이블을 캡처합니다. Full Load 이후 체크한 테이블이 있으면, **Re-run Full Load**가 현재 집합에 대한 새 워터마크를 잡거나 그 테이블의 체크를 다시 해제할 때까지 유형 선택기는 잠깁니다.
+- **CDC 유형으로 전환하기.** 이 마이그레이션에서 CDC를 이미 시작한 경우가 아니라면 테이블의 체크를 해제하는 것만으로는 유형이 잠기지 않으며(이미 시작했다면, 집합을 되돌리거나 Re-run Full Load를 실행할 때까지 집합을 바꾸는 모든 변경이 유형을 잠급니다), CDC 유형은 로드된 테이블 중 아직 선택된 테이블을 캡처합니다. Full Load 이후 체크한 테이블이 있으면, **Re-run Full Load**가 현재 집합에 대한 새 워터마크를 잡거나 그 테이블의 체크를 다시 해제할 때까지 유형 선택기는 잠깁니다: Full load only에서만 로드한 테이블은 워터마크에 포함되지 않지만, Full load + CDC에서 보호된 로드로 추가한 테이블은 포함됩니다(다음 절 참고).
 - **Refresh objects는** 로드 후에는 이전과 같이 숨겨집니다.
 
-### Full Load 후 테이블 빼기 (Full load + CDC)
+### Full Load 후 테이블 집합 바꾸기 (Full load + CDC)
 
-Full load + CDC에서는 이 마이그레이션에서 CDC를 한 번도 시작하지 않은 동안, 즉 Start CDC를 제출한 적이 없고, 커넥터가 없으며, CDC 인프라가 한 번도 스트리밍하지 않은 동안에는 Full Load 후에도 테이블 집합을 줄일 수 있습니다. 테이블 목록에서 테이블의 체크를 해제하거나, Change & reload에서 `exclude table ...` 줄을 사용하세요. 복원된 세션에서도 똑같이 동작합니다. Start over가 필요 없습니다.
+Full load + CDC에서는 이 마이그레이션에서 CDC를 한 번도 시작하지 않은 동안, 즉 Start CDC를 제출한 적이 없고, 커넥터가 없으며, CDC 인프라가 한 번도 스트리밍하지 않은 동안에는 Full Load 후에도 테이블 집합을 바꿀 수 있습니다. 테이블 목록에서 테이블을 체크하거나 해제하거나, Change & reload에서 테이블 줄을 사용하세요. 복원된 세션에서도 똑같이 동작합니다. Start over가 필요 없습니다.
 
 - **체크를 해제한 테이블은 Aurora DSQL에 그대로 남습니다(drop되지 않음).** CDC는 그 테이블을 캡처하지 않고, 이 마이그레이션은 더 이상 그 테이블을 로드하거나 검증하지 않습니다. 컷오버 DEFAULT 복원은 그 테이블을 복원하지 않고 **Needs your decision** 아래에 나열합니다. 테이블 규칙으로 선택을 해제하면 그 테이블의 제외 컬럼 항목은 유지되지 않습니다.
-- **Full Load의 스냅샷에 있는 테이블만 다시 체크할 수 있습니다.** 나머지 테이블에는 잠금 아이콘과 그 사유가 표시됩니다. 테이블을 추가하려면 Start over가 필요합니다: 스냅샷에 없는 테이블에는 CDC의 gapless 시작 지점이 없기 때문입니다.
+- **Full Load가 로드하지 않은 테이블을 체크하면**, 그 테이블은 먼저 Full Load의 시작 지점 아래에서 로드되고, 그 뒤에야 CDC가 캡처합니다:
+  - 도구가 요청하면 사전 점검을 다시 실행하세요(그 테이블은 한 번도 점검되지 않았습니다). 로드될 때까지 Full Load 단계는 그 테이블을 "Not loaded under the Full Load's start point yet"로 표시하고 Failed로 표시되며, Start CDC, Validation, Cut over는 기다립니다.
+  - **Retry unfinished tables**가 원래 워터마크 아래에서 그 테이블을 로드하며, 로드된 테이블은 모두 유지합니다. 그 로드는 먼저 CDC가 Full Load 이후 그 테이블을 공백 없이 캡처할 수 있는지 점검합니다. 점검이 실패하면 테이블은 로드되지 않으며, 그 행에 이유와 해야 할 일이 표시됩니다.
+  - **비어 있는** Aurora DSQL 테이블에만 로드합니다. 테이블에 이미 행이 있으면 다이얼로그가 그 테이블을 drop 후 재적재합니다: 그 행들이 CDC가 그 테이블에 대해 캡처하는 변경(MySQL에서는 Full Load의 시작 지점 이후의 변경, PostgreSQL에서는 그 테이블이 CDC의 publication에 들어간 이후의 변경)보다 오래된 것인지 도구가 알 수 없고, append는 이미 있는 행을 모두 그대로 두기 때문입니다.
+  - **MySQL:** Full Load는 자신이 로드하지 않는 이관 가능한 테이블의 시작 지점 정의를 기록하고, 로드는 그 정의를 테이블의 현재 정의와 비교합니다. 이전 버전의 Full Load나, 로드 후에 변환된 테이블에는 그런 기록이 없습니다: **Re-run all tables**를 사용하거나 체크를 해제하세요. 시작 지점 이후 정의가 바뀐 경우에도 Re-run all tables가 필요합니다.
+  - **PostgreSQL:** 도구는 소스에서 그 테이블을 CDC의 publication에 추가하고, 테이블을 복사하기 전에 이미 열려 있던 트랜잭션이 끝나기를 (최대 10분) 기다립니다. 그 시점에 테이블과 그 모든 파티션에는 소스에서 사용할 수 있는 `REPLICA IDENTITY`가 있어야 합니다: 기본 키, 유효한 identity 인덱스, 또는 `FULL`(재키잉된 테이블은 이미 `REPLICA IDENTITY FULL`이어야 합니다). 그렇지 않으면 publication에 들어간 뒤 그 테이블의 모든 UPDATE와 DELETE가 소스에서 실패하므로, 그 로드는 테이블을 추가하기 전에 거부합니다(identity를 읽을 수 없을 때도 거부합니다). 소스 사용자는 그 테이블과 publication의 소유자여야 합니다. 로드를 위해 추가했는데 그 로드가 실패한 테이블은 **Delete CDC infrastructure** 전까지 publication에 남으므로(CDC의 테이블 목록이 걸러 냅니다), 그때까지 그 테이블의 UPDATE와 DELETE에는 계속 그 replica identity가 필요합니다. **Delete CDC infrastructure**(슬롯과 publication을 drop함) 후에는 테이블을 추가하려면 Re-run all tables가 필요합니다.
+  - CDC는 **격리된 행이 없는** 로드 후에만 그 테이블을 캡처합니다.
+  - **Change & reload는 CDC가 아직 캡처하지 않는 테이블을 drop 후 재적재하지 않습니다**(Full Load 후에 선택했거나, 격리된 행과 함께 로드된 테이블): Save가 그 테이블의 컬럼 규칙을 저장하고, Full Load 단계에서의 그 테이블의 로드가 규칙을 적용합니다.
+  - **대가:** MySQL에서는 CDC가 Full Load의 시작 지점 이후 그 테이블에 일어난 모든 변경을 더 새로운 복사본 위에 재생하고, PostgreSQL에서는 그 테이블이 CDC의 publication에 들어간 이후(복사 직전)의 모든 변경을 그 복사본 위에 스트리밍합니다. 어느 쪽이든 결과는 수렴합니다. 이미 복사된 행과 고유 인덱스에서 잠깐 충돌하는 변경은 데드레터가 될 수 있으며, 그러면 Cut over는 CHECKSUM 검증을 기다립니다. MySQL에서는 Full Load 이후의 모든 변경을 binary log가 아직 보유하고 있어야 합니다. 그 테이블을 로드하기 전에 CDC 인프라를 배포했다면, 그 테이블의 Kafka 토픽은 인프라의 기본 파티션 수를 받습니다.
 - **CDC 인프라가 그 테이블 없이 배포된 뒤 다시 체크한 테이블은** CDC를 시작할 때 캡처됩니다: 그 테이블의 Kafka 토픽은 인프라의 기본 파티션 수를 받으며, 이 수는 인프라를 배포할 때의 테이블들을 기준으로 정해졌습니다.
-- **exclude table 규칙이 선택을 해제한 테이블은** Change & reload에서 그 규칙을 삭제해야만 돌아옵니다. 이때 그 테이블의 컬럼 규칙이 다시 적용됩니다(테이블 목록에서 체크하는 것은 거부됩니다: CDC가, 로드된 행에서는 NULL인 컬럼의 값을 스트리밍하게 되기 때문입니다).
+- **exclude table 규칙이 선택을 해제한 테이블은** Change & reload에서 그 규칙을 삭제해야만 돌아오며, 이때 그 테이블의 컬럼 규칙이 적용됩니다(테이블 목록에서 체크하는 것은 거부됩니다: 그 컬럼 규칙이 적용되지 않기 때문입니다). 잠금 아이콘과 그 사유가 표시됩니다.
 - **CDC 인프라가 배포되어 있으면 팝업은 읽기 전용입니다:** 테이블 목록을 사용하세요.
 - **체크를 해제한 테이블에서만 생긴 실패는 더 이상 단계를 붙잡지 않습니다.** 단계는 Done으로 표시되고, Continue to CDC가 열리며, PostgreSQL에서는 CDC가 여전히 로드 때 만든 슬롯에서 재개합니다. Retry unfinished tables는 체크를 해제한 테이블을 다시 로드하지 않습니다.
 - **기다려야 할 때는 기다림으로 안내하며, Start over를 요구하지 않습니다:** Full Load, 외래 키 적용, 컷오버 DEFAULT 복원이 실행되는 동안, CDC 인프라를 생성하거나 삭제하는 동안, 실패한 생성이 계정에 남아 있는 동안(CDC 단계에서 삭제하세요), 그리고 페이지를 연 뒤 CDC 상태를 읽는 몇 초 동안입니다. CDC 상태를 읽을 수 없으면 CDC 단계가 그 이유를 보여 줍니다: AWS 접근을 고친 뒤 **Re-check CDC state**를 사용하세요.
 - **Unselect all은 허용됩니다**. 다만 Deploy CDC infrastructure와 Start CDC에는 선택된 테이블이 하나 이상 필요합니다.
-- **줄어든 집합으로 Re-run Full Load를 실행하면** 체크를 해제한 테이블을 더 이상 포함하지 않는 새 워터마크를 잡습니다. PostgreSQL에서는 기존 publication을 재사용합니다.
-- **PostgreSQL에서 CDC가 Full Load의 슬롯에서 재개하면, publication에 체크를 해제한 테이블이 계속 남아 있습니다**(도구는 소스에서 publication을 바꾸지 않습니다). 커넥터가 그 테이블의 변경을 버립니다. 대신 다시 스냅샷하는 Start(캡처 대상 테이블의 로드가 끝나지 않았거나, **Re-snapshot every table instead**를 고르거나, CDC 인프라를 삭제한 뒤의 Start)에서는 커넥터가 publication을 캡처 대상 테이블로 맞춥니다.
+- **현재 집합으로 Re-run Full Load를 실행하면** 선택된 모든 테이블에 대한 새 워터마크를 잡습니다. PostgreSQL에서는 기존 publication을 재사용하고, 거기에 없는 선택된 테이블을 추가합니다(위와 같이 사용할 수 있는 `REPLICA IDENTITY`가 있을 때만: 그렇지 않으면 실행은 어떤 테이블도 로드하기 전에 멈추고 어느 테이블인지 알려 줍니다).
+- **PostgreSQL에서 CDC가 Full Load의 슬롯에서 재개하면, publication에 체크를 해제한 테이블이 계속 남아 있습니다**(도구는 소스에서 그 테이블을 빼지 않습니다). 커넥터가 그 테이블의 변경을 버립니다. 대신 다시 스냅샷하는 Start(캡처 대상 테이블의 로드가 끝나지 않았거나, **Re-snapshot every table instead**를 고르거나, CDC 인프라를 삭제한 뒤의 Start)에서는 커넥터가 publication을 캡처 대상 테이블로 맞춥니다.
 - **외래 키.** 선택된 테이블은 체크를 해제한 테이블을 가리키는 외래 키를 유지합니다: Cut over에서 orphan 점검이, 부모 행이 복제되지 않은 키를 보고합니다.
 - **CDC를 한 번 시작하면, 그 뒤 멈췄더라도 집합은 다시 고정됩니다.**
-- **CDC only:** CDC를 시작하기 전에 테이블을 빼려면 Full load + CDC로 전환하세요.
+- **CDC only:** CDC를 시작하기 전에 집합을 바꾸려면 Full load + CDC로 전환하세요. 선택된 테이블이 Full Load의 시작 지점 아래에서 로드되지 않은 동안 Start CDC는 거부됩니다.
 
 ### 격리 또는 데드레터에서
 
@@ -583,7 +590,9 @@ Full load + CDC에서는 이 마이그레이션에서 CDC를 한 번도 시작�
 
 - **Full Load 격리: "Exclude column & reload".** 표시된 컬럼마다 한 줄씩 이미 삽입되었지만 **저장되지
   않은** 상태로 Change & reload를 엽니다(`exclude s.t.c  # from the Full Load quarantine`). 따라서
-  재적재에는 여전히 의도적인 두 번의 클릭이 필요합니다: 그 버튼, 그리고 확인. `include`가 그 컬럼을
+  재적재에는 여전히 의도적인 두 번의 클릭이 필요합니다: 그 버튼, 그리고 확인. (Full load + CDC에서
+  CDC가 아직 캡처하지 않는 테이블이면 확인은 일반 Save입니다: Retry unfinished tables 아래에 표시되는
+  Full Load 단계에서의 그 테이블의 로드가 규칙을 적용합니다. §13.7 참고.) `include`가 그 컬럼을
   유지하고 있으면 팝업이 그 줄을 가리킵니다(예: **Go to L5**). 사유가 그 테이블의 표시된 컬럼 중
   하나를 가리키지 않으면(`maximum column size exceeded`처럼 타입을 밝히지 않거나, 어느 컬럼에도 없는
   타입을 밝히면), LOB 섹션이 그 테이블로 필터된 채 열리므로 **+ add rule**로 컬럼을 고를 수 있습니다. CDC
@@ -847,7 +856,7 @@ ALTER TABLE <table> ALTER COLUMN <column> SET DEFAULT (<original_default>)
   재생성해야만 복원됩니다.
 - 복원된 DEFAULT는 **새 행에만** 적용되며, 이관된 행은 NULL로 남습니다.
 - NULL을 거부하는, 직접 작성한 `CHECK` 제약은 미리 감지되지 않습니다(테이블이 23514로 실패).
-- CDC only에서는 Full Load 후 **테이블 집합**을 Start over로만 바꿀 수 있습니다(또는 CDC를 시작하기 전에 테이블을 빼려면 Full load + CDC로 전환). Full load + CDC에서는 CDC를 시작하기 전까지 테이블을 뺄 수 있지만 추가할 수는 없으며, 그 이후에는 Start over가 필요합니다. Full load only는 §13.7의 "Full Load 후 테이블 집합 바꾸기"를 참고하세요. CDC 스택이 배포되면, 그 제외 설정은 Delete CDC infrastructure 후에만 바뀝니다.
+- CDC only에서는 Full Load 후 **테이블 집합**을 Start over로만 바꿀 수 있습니다(또는 CDC를 시작하기 전에 집합을 바꾸려면 Full load + CDC로 전환). Full load + CDC에서는 CDC를 시작하기 전까지 테이블을 빼거나 추가할 수 있으며(§13.7), 그 이후에는 Start over가 필요합니다. Full load only는 §13.7의 "Full Load 후 테이블 집합 바꾸기"를 참고하세요. CDC 스택이 배포되면, 그 제외 설정은 Delete CDC infrastructure 후에만 바뀝니다.
 - **CDC 시작 전에** 이미 Aurora DSQL에 있던 행은 제외 컬럼의 값을 유지합니다.
 - 캡처 목록은 4,096바이트에 들어가야 합니다(§13.8). 이어 붙였을 때 같은 `db.table.column` 문자열이
   되는 두 이름은 캡처 단계에서 구분할 수 없습니다.

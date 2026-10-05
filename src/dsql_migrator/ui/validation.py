@@ -1604,27 +1604,35 @@ def validation_scope_gap(
 ) -> "tuple[list[str], list[str]]":
     """``(missing, extra)`` between a report and the CURRENT validation scope. Pure.
 
-    ``missing``: tables the scope covers that the report has no row for -- a Full load only
-    table set can grow after a Full Load (G12), and a report from before must not release
-    cut over for a table it never compared. ``extra``: report rows for tables no longer
-    selected (left as is on Aurora DSQL). Both empty unless the migration is Full load only
-    with a recorded Full Load and an explicit selection -- the only place the set can GROW
-    after a load; a CDC type keeps every existing release gate untouched (Full load + CDC
-    can only drop tables after its Full Load, before CDC starts, G16: nothing selected can
-    be missing from a report over the loaded set, and Validation compares the tables still
-    selected).
+    ``missing``: tables the scope covers that the report has no row for -- a table set can
+    grow after a Full Load (Full load only, G12; Full load + CDC before CDC starts, G17), and
+    a report from before must not release cut over for a table it never compared.
+    ``extra``: report rows for tables no longer selected (left as is on Aurora DSQL), Full
+    load only alone. Both empty unless the migration has a recorded Full Load and an
+    explicit selection.
 
-    ``covered`` (the Full Load watermark's tables -- the set that load started with, never
-    extended) narrows ``missing`` to the tables selected SINCE that load: a table the load
-    covered and the report lacks was left out by a chip (chips are not kept across a
-    restart, so it would otherwise hold a restored, unchanged session). ``None`` (no
-    record or no per-table counts) holds on every missing table -- the safe side.
+    ``covered`` (the Full Load watermark's ORIGINAL tables -- the set that load started
+    with, never a later addition, even one CDC captures) narrows ``missing`` to the tables
+    selected SINCE that load: a table the load covered and the report lacks was left out by
+    a chip (chips are not kept across a restart, so it would otherwise hold a restored,
+    unchanged session). In Full load only, ``None`` (no record or no per-table counts) holds
+    on every missing table -- the safe side; in a CDC type it changes nothing, as before
+    (nothing can have been added there without a recorded Full Load). ``extra`` stays empty
+    in a CDC type: the report simply covers the tables still selected (G16).
     """
     from dsql_migrator.ui.data_migration._models import MigrationType
 
     if report is None or inventory is None or migration_state is None:
         return [], []
-    if getattr(migration_state, "migration_type", None) is not MigrationType.FULL_LOAD_ONLY:
+    mtype = getattr(migration_state, "migration_type", None)
+    if mtype not in (
+        MigrationType.FULL_LOAD_ONLY,
+        MigrationType.FULL_LOAD_AND_CDC,
+        MigrationType.CDC_ONLY,
+    ):
+        return [], []
+    cdc = mtype is not MigrationType.FULL_LOAD_ONLY
+    if cdc and not covered:
         return [], []
     if getattr(migration_state, "job_id", None) is None:
         return [], []
@@ -1638,6 +1646,8 @@ def validation_scope_gap(
         n for n in validation_scope_names(inventory, selection, table_exclude)
         if n not in compared_set and n not in loaded
     ]
+    if cdc:
+        return missing, []
     in_scope = {t.name for t in resolve_validation_tables(inventory, selection).tables}
     extra = [t for t in dict.fromkeys(compared) if t not in in_scope]
     return missing, extra
@@ -1651,16 +1661,20 @@ def _scope_missing_names(missing: "Sequence[str]") -> "tuple[str, bool]":
 def full_load_covered_tables(
     migration_state: object, job_manager: object
 ) -> "Optional[frozenset[str]]":
-    """The tables the recorded Full Load's watermark covers -- the set that load started
-    with (G12 never extends it) -- for :func:`validation_scope_gap`'s ``covered``; ``None``
-    without a record or per-table counts, and outside Full load only (where the gap is
-    empty anyway: no job read there). One job read, no other I/O."""
+    """The tables the recorded Full Load's watermark covered when that load started -- its
+    ORIGINAL per-table count keys, never a Full load + CDC addition recorded since (G17) --
+    for :func:`validation_scope_gap`'s ``covered``; ``None`` without a record or per-table
+    counts. One job read, no other I/O."""
     from dsql_migrator.ui.data_migration._cdc_status import _current_job
     from dsql_migrator.ui.data_migration._models import MigrationType
 
     if migration_state is None or job_manager is None:
         return None
-    if getattr(migration_state, "migration_type", None) is not MigrationType.FULL_LOAD_ONLY:
+    if getattr(migration_state, "migration_type", None) not in (
+        MigrationType.FULL_LOAD_ONLY,
+        MigrationType.FULL_LOAD_AND_CDC,
+        MigrationType.CDC_ONLY,
+    ):
         return None
 
     job = _current_job(job_manager, getattr(migration_state, "job_id", None))
@@ -4007,8 +4021,8 @@ def build_validation_screen(
                     _recheck(tables)
                     refresh()
 
-                # Full load only after a table-set change (G12): a report from before the
-                # change does not cover the tables selected since.
+                # After a table-set change (Full load only, G12; Full load + CDC, G17): a
+                # report from before the change does not cover the tables selected since.
                 _scope_missing, _scope_extra = validation_scope_gap(
                     result, inventory, migration_state, validation_state.table_exclude,
                     covered=full_load_covered_tables(migration_state, job_manager),
@@ -4965,8 +4979,9 @@ def build_cutover_screen(
         )
 
     def _cutover_scope_missing() -> list[str]:
-        """Tables the migration now includes that the last validation never compared (Full
-        load only after a table-set change, G12; empty otherwise). No I/O."""
+        """Tables the migration now includes that the last validation never compared (after
+        a table-set change: Full load only, G12; a Full load + CDC addition, G17; empty
+        otherwise). No I/O."""
         eval_result = (
             eval_store.get_or_create(session_id).result if eval_store is not None else None
         )
@@ -5233,9 +5248,10 @@ def build_cutover_screen(
             )
             return
 
-        # Full load only after a table-set change (G12): a result that has no row for a
-        # table the migration now includes cannot release cut over, whatever it says about
-        # the tables it did compare. An extra hold -- every release gate below is unchanged.
+        # After a table-set change (Full load only, G12; a Full load + CDC addition, G17): a
+        # result that has no row for a table the migration now includes cannot release cut
+        # over, whatever it says about the tables it did compare. An extra hold -- every
+        # release gate below is unchanged.
         _scope_missing = _cutover_scope_missing()
         if _scope_missing:
             _listed = bounded_table_names(list(_scope_missing))
@@ -6638,11 +6654,11 @@ def _render_result(
 ) -> None:
     """Render the cut-over readiness report: verdict, checks, then the details.
 
-    ``scope_missing`` / ``scope_extra`` (:func:`validation_scope_gap`, Full load only after
-    a table-set change): tables the migration now includes that this report has no row for
-    (the verdict is held, and Cut over waits), and rows for tables no longer selected. (A
-    Full load + CDC set can only DROP tables after its Full Load, G16, so nothing can be
-    missing there; its report simply covers the tables still selected.)
+    ``scope_missing`` / ``scope_extra`` (:func:`validation_scope_gap`, after a table-set
+    change): tables the migration now includes that this report has no row for (the
+    verdict is held, and Cut over waits -- a Full load only addition, G12, or a Full load +
+    CDC one, G17), and rows for tables no longer selected (Full load only; a CDC type's
+    report simply covers the tables still selected, G16).
 
     ``diagnose_provider`` (when given -- AI Assist on) opens the AI chat drawer
     for a mismatch; it is threaded to the verdict (run-level "Diagnose with AI"),
@@ -6941,8 +6957,9 @@ def _render_verdict(
     green "Ready for cut-over"; once every dead-lettered table is resolved, the green body
     says so. ``None`` (or an inert gate) renders exactly as before.
 
-    ``scope_missing`` (Full load only after a table-set change): a matching report that has
-    no row for a table the migration now includes is not "Ready" -- Cut over holds on it.
+    ``scope_missing`` (:func:`validation_scope_gap`, after a table-set change: Full load
+    only, G12; a Full load + CDC addition, G17): a matching report that has no row for a
+    table the migration now includes is not "Ready" -- Cut over holds on it.
 
     ``replica_identity_gate`` (Validation's view of the REPLICA IDENTITY gate for re-keyed
     PostgreSQL tables) holds the same way: an error while a table is still below FULL, a

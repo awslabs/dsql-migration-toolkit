@@ -955,7 +955,28 @@ class Watermark(BaseModel):
             "Per-table start-point column fingerprints (MySQL; "
             "<version>:<ncols>:<names>:<definition> digests, read just before the binlog "
             "position) that Start CDC compares with the source before a recovery-mode "
-            "start. Empty when they could not be read."
+            "start. Empty when they could not be read. Also holds BASELINES for the "
+            "migratable tables the run did not load, read in the same snapshot before the "
+            "binlog position in a separate statement: inert until such a table is captured "
+            "(a guarded Full load + CDC load adds it, cdc_added_tables), when the load "
+            "and Start CDC compare it with the source."
+        ),
+    )
+    # G17: tables a GUARDED Full load + CDC load added after this watermark (its guards
+    # passed before the table's copy began, and the copy completed with no quarantined row,
+    # before CDC ever started for the migration), with the rows that load wrote -- a size
+    # signal for the partition plan only, never a snapshot count. CDC captures them from
+    # this watermark's start point with the run's tables. Never set by Full load only, and
+    # ``table_row_counts`` keys stay the run's ORIGINAL set (Validation's scope gap reads
+    # them). Left OUT of the payload while empty, like the fields above (extra="forbid").
+    cdc_added_tables: dict[str, int] = Field(
+        default_factory=dict,
+        exclude_if=lambda v: not v,
+        description=(
+            "Tables a guarded Full load + CDC load added after this watermark, before CDC "
+            "started, with the rows that load wrote (a size signal only). CDC captures them "
+            "from this start point with the run's tables; table_row_counts keys stay the "
+            "run's original set. Never set by Full load only."
         ),
     )
 
@@ -1227,6 +1248,11 @@ class PrerequisiteCheckRequest(BaseModel):
     # supply every key column, and the checker cannot derive this map -- it comes from the
     # APPLIED target DDL. Empty means no table was re-keyed.
     message_key_columns: dict[str, list[str]] = Field(default_factory=dict)
+    # G17 (PostgreSQL, Full load + CDC after its Full Load, before CDC starts): selected
+    # tables the Full Load did not load and CDC does not capture yet. Their guarded load
+    # (Retry unfinished tables) adds them to CDC's publication before their copy starts, so
+    # the existence check does not count them as missing from it.
+    cdc_pending_tables: list[str] = Field(default_factory=list)
 
 
 class PrerequisiteReport(BaseModel):

@@ -1059,12 +1059,14 @@ def resolve_exclusion_rules(
     would leave no table selected is the global error E5.
 
     ``reselect_lock(names)`` -- consulted ONLY while ``selection_lock_reason`` is ``None``
-    (the set may change, but not every table may be selected again: Full load + CDC after
-    its Full Load drops tables and never adds one) -- returns ``(blocked, reason)`` for the
-    re-selected ``names`` it refuses, else ``None``. An include table line re-selecting a
-    blocked table is a line E3, and a blocked re-selection no line causes (a deleted rule)
-    is a global E3, both carrying ``reason``; unselecting stays free. ``None`` (the default)
-    changes nothing.
+    (the set may change, but not every table may be selected: Full load + CDC after its Full
+    Load refuses only a table an exclude table rule holds, and only in the tree, so a table
+    line there may select any migratable table -- one the Full Load did not load is loaded
+    by Retry unfinished tables before CDC captures it, G17) -- returns ``(blocked, reason)``
+    for the re-selected ``names`` it refuses, else ``None``. An include table line
+    re-selecting a blocked table is a line E3, and a blocked re-selection no line causes (a
+    deleted rule) is a global E3, both carrying ``reason``; unselecting stays free. ``None``
+    (the default) changes nothing.
 
     Eligibility: ``context_factory(selected', candidate tables)`` builds the ONE context
     (called once, so B3 is judged against the selection AFTER this Save); a BLOCKED

@@ -48,29 +48,77 @@ class _FakeConn:
 
     ``pubs`` maps an existing publication name -> its member tables (for the reconcile
     read); ``replident`` maps a qualified table -> its pg_class.relreplident code (default
-    'd', usable). ``slots`` are pre-existing slot names.
+    'd', usable). ``slots`` are pre-existing slot names. G17: ``all_tables`` names FOR ALL
+    TABLES publications; an ``ADD TABLE`` joins the table to ``pubs`` (or raises
+    ``add_errors[table]``); ``xid`` answers ``pg_current_xact_id()`` and ``xmin_ready`` the
+    polls of :func:`wait_for_transactions_before`, one per poll (the last one repeats).
+    The one-table ADD's identity read (:func:`read_replica_identity_usability`) answers
+    ``usability[table]`` -- ``(relkind, relreplident, usable, unusable partitions, sample)``
+    -- else a plain table usable unless its ``replident`` is 'n'; ``usability_error`` makes
+    that read raise.
     """
 
     def __init__(
         self, *, pubs=None, slots=(), lsn="3/AF012B8", replident=None,
-        fail_slot_create=False,
+        fail_slot_create=False, all_tables=(), add_errors=None, xid="7001",
+        xmin_ready=(True,), poll_error=None, usability=None, usability_error=None,
     ):
         self.statements: list[tuple[str, dict]] = []
-        self._pubs = dict(pubs or {})
+        self._pubs = {k: list(v) for k, v in dict(pubs or {}).items()}
         self._slots = set(slots)
         self._lsn = lsn
         self._replident = dict(replident or {})
         self._fail_slot_create = fail_slot_create
+        self._all_tables = set(all_tables)
+        self._add_errors = dict(add_errors or {})
+        self._xid = xid
+        self._xmin_ready = list(xmin_ready)
+        self._poll_error = poll_error
+        self._usability = dict(usability or {})
+        self._usability_error = usability_error
+        self.polls = 0
 
     def execute(self, statement, params=None):
+        import re
+
         sql = str(statement)
         params = params or {}
         self.statements.append((sql, params))
         up = " ".join(sql.upper().split())
+        if "AS IDENTITY_USABLE" in up:  # the one-table ADD's fail-closed identity read
+            if self._usability_error is not None:
+                raise self._usability_error
+            rows = []
+            for name in params.get("names") or []:
+                if name in self._usability:
+                    rows.append((name, *self._usability[name]))
+                else:
+                    code = self._replident.get(name, "d")
+                    rows.append((name, "r", code, code != "n", 0, []))
+            return _Result(rows)
+        if "PG_SNAPSHOT_XMIN" in up:
+            self.polls += 1
+            if self._poll_error is not None:
+                raise self._poll_error
+            ready = self._xmin_ready[min(self.polls - 1, len(self._xmin_ready) - 1)]
+            return _Result([(ready,)])
+        if up.startswith("SELECT PG_CURRENT_XACT_ID"):
+            return _Result([(self._xid,)])
+        if up.startswith("ALTER PUBLICATION") and " ADD TABLE " in up:
+            name = re.search(r'ALTER PUBLICATION "([^"]+)"', sql).group(1)
+            schema, table = re.search(r'ADD TABLE "([^"]+)"\."([^"]+)"', sql).groups()
+            qualified = f"{schema}.{table}"
+            if qualified in self._add_errors:
+                raise self._add_errors[qualified]
+            self._pubs.setdefault(name, []).append(qualified)
+            return _Result([])
         # PG_PUBLICATION_TABLES must be checked before PG_PUBLICATION (substring).
         if "FROM PG_PUBLICATION_TABLES" in up:
             tables = self._pubs.get(params.get("name"), [])
             return _Result([(t,) for t in tables])
+        if "PUBALLTABLES" in up:
+            name = params.get("name")
+            return _Result([(name in self._all_tables, True)] if name in self._pubs else [])
         if "FROM PG_PUBLICATION" in up:
             return _Result([(1,)] if params.get("name") in self._pubs else [])
         if "FROM PG_CLASS" in up:  # _verify_tables_replicable relreplident read
@@ -93,7 +141,8 @@ class _FakeConn:
         out = []
         for sql, _ in self.statements:
             up = " ".join(sql.upper().split())
-            if up.startswith(("CREATE PUBLICATION", "DROP PUBLICATION")) or (
+            if up.startswith(("CREATE PUBLICATION", "DROP PUBLICATION", "ALTER PUBLICATION",
+                              "SELECT PG_CURRENT_XACT_ID")) or (
                 up.startswith("SELECT")
                 and ("PG_CREATE_LOGICAL_REPLICATION_SLOT" in up
                      or up.startswith("SELECT PG_DROP_REPLICATION_SLOT"))
@@ -157,32 +206,63 @@ def test_allowlist_permits_replica_identity_full_only_for_alter_table() -> None:
         _assert_allowed('ALTER TABLE "app"."orders" REPLICA IDENTITY NOTHING')
 
 
-def test_allowlist_permits_only_the_partition_root_flip_for_alter_publication() -> None:
-    """The publication repair widens the un-guarded write surface by ONE statement shape.
+def test_allowlist_permits_only_two_exact_alter_publication_shapes() -> None:
+    """The un-guarded write surface gains exactly two ALTER PUBLICATION shapes.
 
-    It has to exist: a publication DEBEZIUM created (publication.autocreate.mode=filtered,
-    which is derived from snapshot.mode=initial) lands at PostgreSQL's default
-    publish_via_partition_root=false, and the connector offers no property to change it --
-    under which pgoutput names changes after the LEAF partition while table.include.list
-    names the collapsed PARENT, so the connector silently discards them.
+    The partition-root repair has to exist: a publication DEBEZIUM created
+    (publication.autocreate.mode=filtered, which is derived from snapshot.mode=initial) lands
+    at PostgreSQL's default publish_via_partition_root=false, and the connector offers no
+    property to change it -- under which pgoutput names changes after the LEAF partition
+    while table.include.list names the collapsed PARENT, so the connector silently discards
+    them. G17 deliberately adds ONE more: ``ADD TABLE`` of exactly one double-quoted
+    ``schema.table`` (a table selected after a Full load + CDC Full Load joins the run's
+    publication before its copy).
 
-    Constrained the same way ALTER TABLE is: the tail is pinned, so it can never unpublish a
-    table, hand the publication to another owner, or rename it.
+    Constrained the same way ALTER TABLE is: both shapes are pinned, so the prefix can never
+    unpublish a table, add an unquoted / several tables, hand the publication to another
+    owner, or rename it.
     """
     _assert_allowed('ALTER PUBLICATION "p" SET (publish_via_partition_root = true)')
     # Case-insensitive and run-of-whitespace tolerant (the check normalizes both), which is
     # all the latitude the module needs since it composes the statement itself...
     _assert_allowed('alter publication "p"   SET (publish_via_partition_root = TRUE)')
-    # ...and the tail is otherwise EXACT, deliberately: a looser match is what would let
+    _assert_allowed('ALTER PUBLICATION "dsqlmig_pub_x" ADD TABLE "app"."orders"')
+    # A quoted name may carry a comma or a doubled quote: it is still ONE identifier.
+    _assert_allowed('ALTER PUBLICATION "p" ADD TABLE "app"."a,b"')
+    _assert_allowed('ALTER PUBLICATION "p" ADD TABLE "app"."a""b"')
+    # ...and both shapes are otherwise EXACT, deliberately: a looser match is what would let
     # this prefix drift into an arbitrary-DDL surface. Anything else is refused.
     for refused in (
         'ALTER PUBLICATION "p" SET TABLE app.orders',
         'ALTER PUBLICATION "p" DROP TABLE app.orders',
+        'ALTER PUBLICATION "p" DROP TABLE "app"."orders"',
         'ALTER PUBLICATION "p" ADD TABLE app.orders',
+        'ALTER PUBLICATION "p" ADD TABLE ONLY "app"."orders"',
+        'ALTER PUBLICATION "p" ADD TABLE "app"."orders" *',
+        'ALTER PUBLICATION "p" ADD TABLE "app"."orders", "app"."items"',
+        'ALTER PUBLICATION "p" ADD TABLE "app"."orders" (id)',
+        'ALTER PUBLICATION "p" ADD TABLE "app"."orders" WHERE (id > 1)',
+        'ALTER PUBLICATION "p" ADD TABLES IN SCHEMA "app"',
+        'ALTER PUBLICATION "p" ADD TABLE "app"."orders"; DROP TABLE "app"."x"',
+        'ALTER PUBLICATION "p-1" ADD TABLE "app"."orders"',
         'ALTER PUBLICATION "p" OWNER TO bob',
         'ALTER PUBLICATION "p" RENAME TO q',
         'ALTER PUBLICATION "p" SET (publish = \'insert\')',
         'ALTER PUBLICATION "p" SET (publish_via_partition_root = false)',
+    ):
+        with pytest.raises(PgReplicationError):
+            _assert_allowed(refused)
+
+
+def test_allowlist_permits_only_the_exact_transaction_id_read() -> None:
+    # G17: taking a transaction ID assigns one (a write in PostgreSQL's terms), so it rides
+    # the allowlisted path -- in exactly one form.
+    _assert_allowed("SELECT pg_current_xact_id()::text")
+    for refused in (
+        "SELECT pg_current_xact_id()",
+        "SELECT pg_current_xact_id()::text, 1",
+        "SELECT pg_current_xact_id()::text; DROP TABLE x",
+        "SELECT pg_current_xact_id_if_assigned()::text",
     ):
         with pytest.raises(PgReplicationError):
             _assert_allowed(refused)
@@ -298,13 +378,32 @@ def test_create_publication_reuses_when_it_exists_with_the_same_tables() -> None
     assert any("reusing" in m for m in logs)
 
 
-def test_create_publication_refuses_reuse_when_the_table_set_differs() -> None:
+def test_create_publication_adds_a_requested_table_the_reused_one_lacks() -> None:
     # A re-run that added a table must NOT silently reuse the stale, narrower publication
     # (pgoutput only streams a publication's members -> the new table would be unreplicated).
+    # G17 (deliberately changed from a refusal, which made "Re-run all tables" fail before
+    # any table loaded on a grown set): the missing table is ADDED -- one audited ADD TABLE,
+    # no CREATE, no DROP -- and the publication counts as reused.
     conn = _FakeConn(pubs={"dsqlmig_pub_s": ["app.orders"]})
-    with pytest.raises(PgReplicationError) as ei:
-        create_publication(conn, name="dsqlmig_pub_s", tables=["app.orders", "app.customers"])
-    assert "app.customers" in str(ei.value) or "covers" in str(ei.value)
+    logs: list[str] = []
+    created = create_publication(
+        conn, name="dsqlmig_pub_s", tables=["app.orders", "app.customers"], on_log=logs.append
+    )
+    assert created is False
+    assert conn.writes() == ['ALTER PUBLICATION "dsqlmig_pub_s" ADD TABLE "app"."customers"']
+    assert any('added app.customers to publication "dsqlmig_pub_s"' in m for m in logs)
+    # ...and provisioning over it adds the table, then creates the fresh slot.
+    prov = _FakeConn(pubs={"dsqlmig_pub_s": ["app.orders"]}, lsn="8/2")
+    handles = provision_pg_replication(
+        prov, slot_name="dsqlmig_s", publication_name="dsqlmig_pub_s",
+        tables=["app.orders", "app.customers"],
+    )
+    assert handles.consistent_lsn == "8/2"
+    writes = [" ".join(w.upper().split()) for w in prov.writes()]
+    assert not any(w.startswith(("CREATE PUBLICATION", "DROP PUBLICATION")) for w in writes)
+    add = next(i for i, w in enumerate(writes) if w.startswith("ALTER PUBLICATION"))
+    slot = next(i for i, w in enumerate(writes) if "PG_CREATE_LOGICAL_REPLICATION_SLOT" in w)
+    assert add < slot  # the slot's consistent point decodes the added table's changes
 
 
 def test_create_publication_reuses_a_publication_that_covers_the_set() -> None:
@@ -332,10 +431,12 @@ def test_create_publication_reuses_a_publication_that_covers_the_set() -> None:
     writes = [w.upper() for w in prov.writes()]
     assert not any(w.startswith("CREATE PUBLICATION") for w in writes)
     assert any("PG_CREATE_LOGICAL_REPLICATION_SLOT" in w for w in writes)
-    # A publication MISSING a requested table is still refused (the reconcile's purpose).
-    with pytest.raises(PgReplicationError):
-        create_publication(_FakeConn(pubs={"dsqlmig_pub_s": ["app.orders"]}),
-                           name="dsqlmig_pub_s", tables=["app.customers"])
+    # A publication MISSING a requested table gets it ADDED (G17, deliberately changed from a
+    # refusal): never left unreplicated, never by dropping the publication.
+    missing = _FakeConn(pubs={"dsqlmig_pub_s": ["app.orders"]})
+    assert create_publication(missing, name="dsqlmig_pub_s", tables=["app.customers"]) is False
+    assert missing.writes() == [
+        'ALTER PUBLICATION "dsqlmig_pub_s" ADD TABLE "app"."customers"']
 
 
 def test_create_publication_rejects_zero_tables() -> None:

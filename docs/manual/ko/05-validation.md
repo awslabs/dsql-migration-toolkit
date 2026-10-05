@@ -126,6 +126,7 @@ dead-letter 확인까지 해소되면 — 마지막 워크플로 단계인 **Cut
 DSQL로 전환하는 런북을 제공합니다. Full load only에서는 Cut over에 보고서가 Full Load 이후 선택한 모든
 테이블을 다루는 것도 필요합니다: 그런 테이블 중 보고서에 행이 없는 테이블이 있으면, 그 테이블을 로드하고
 Validation을 다시 실행할 때까지(또는 **Objects to validate**에서 그 칩을 끌 때까지) Cut over가 보류됩니다.
+Full load + CDC(및 CDC only)에서도 Full Load 이후 선택해 그 시작 지점 아래에서 로드한 테이블에 대해 마찬가지입니다: 보고서에 그 테이블의 행이 없으면 Validation을 다시 실행할 때까지 Cut over가 보류됩니다.
 Full load + CDC에서 Full Load 후(CDC를 시작하기 전) 체크를 해제한 테이블은 검증하지 않습니다: Validation은 아직 선택된 테이블을 비교합니다. 마지막 보고서가 그 변경 이전의 것이라면 Validation을 다시 실행하세요.
 전환 순서(CDC drain vs Full Load freeze)와 롤백 앵커는 [결론](10-conclusion.md)의 권장 end-to-end 흐름을
 참고하세요.

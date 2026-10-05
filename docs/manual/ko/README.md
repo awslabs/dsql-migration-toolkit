@@ -28,8 +28,9 @@ PostgreSQL 방언 → DSQL 제약을 거치고, **PostgreSQL 소스**는 방언 
 타입만 반영)를 거칩니다. **MySQL 소스(및 PostgreSQL을 Full Load 전용으로만 쓰는 마이그레이션)에는
 절대 쓰기를 하지 않습니다.** 유일한 예외는 **PostgreSQL CDC**로, Full Load 일관성 지점에서 도구가
 정확히 마이그레이션 대상 테이블로 한정된 pgoutput 논리 복제 슬롯과 publication을 생성했다가 정리
-(teardown) 시 삭제합니다(autocommit, 허용 목록 한정, 감사 기록). 이것이 도구가 소스에 하는 유일한
-쓰기입니다. 마이그레이션은 **Connect**를 사전 단계로 두는 5단계 안내 흐름입니다:
+(teardown) 시 삭제하고, 재키잉된 테이블에 `REPLICA IDENTITY FULL`을 설정하며, Full Load 이후 선택한
+테이블을 그 publication에 추가합니다(Full load + CDC, CDC를 시작하기 전. autocommit, 허용 목록 한정,
+감사 기록). 이것이 도구가 소스에 하는 유일한 쓰기입니다. 마이그레이션은 **Connect**를 사전 단계로 두는 5단계 안내 흐름입니다:
 
 ```
 Connect → 1. Evaluation → 2. Schema Conversion → 3. Data Migration → 4. Validation → 5. Cut over

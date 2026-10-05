@@ -3,14 +3,16 @@
 
 """G16: Full load + CDC can drop tables after its Full Load, until CDC first starts.
 
-The table-set lock lifts through the SAME predicate as G12 (``table_set_editable_after_load``)
-for REMOVALS only: an unticked table is left as is on Aurora DSQL and is never captured,
-deployed, gated, monitored or validated as CDC (ONE capture formula, ``cdc_capture_names``:
-the watermark's covered tables still selected). A table the Full Load did not load stays
-locked per table (``table_set_add_lock``), with its reason and remedy. Once CDC has started
-for the migration -- even if stopped since -- the lock is exactly today's. A restored session
-behaves like a live one (the user's report, 2026-10-05). Doubles only: no AWS, no source, no
-Aurora DSQL.
+The table-set lock lifts through the SAME predicate as G12 (``table_set_editable_after_load``):
+an unticked table is left as is on Aurora DSQL and is never captured, deployed, gated,
+monitored or validated as CDC (ONE capture formula, ``cdc_capture_names``: the watermark's
+covered tables still selected). Since G17 (tests/test_g17_full_load_and_cdc_additions.py) a
+table the Full Load did not load may be ticked too -- it is loaded by a guarded Retry before
+CDC captures it -- so the per-table add-lock (``table_set_add_lock``) refuses only a table an
+exclude table rule holds; the tests below that pinned the older "not_loaded" refusal were
+changed deliberately. Once CDC has started for the migration -- even if stopped since -- the
+lock is exactly today's. A restored session behaves like a live one (the user's report,
+2026-10-05). Doubles only: no AWS, no source, no Aurora DSQL.
 """
 
 from __future__ import annotations
@@ -410,15 +412,14 @@ def test_the_add_lock_codes_and_refusals() -> None:
     jobs = _Jobs({"job-1": _loaded()})  # covers app.a, app.b
     lock = table_set_add_lock(_fc(["app.a"]), jobs)
     assert lock.code("app.b", tree=True) is None
-    assert lock.code("app.c", tree=True) == "not_loaded"
-    assert lock.refusal(["app.c"], tree=True) == (
-        "app.c was not part of the last Full Load's snapshot, so CDC has no gapless start "
-        "point for it: after its Full Load, Full load + CDC can drop tables but not add them. "
-        "To migrate it too, use Start over.")
-    assert lock.refusal(["app.d", "app.c"], tree=False).startswith(
-        "app.d, app.c were not part of the last Full Load's snapshot, so CDC has no gapless "
-        "start point for them:")
+    # G17 (deliberately changed): a table the Full Load did not load may be ticked -- its
+    # guarded load decides whether CDC can capture it.
+    assert lock.code("app.c", tree=True) is None
+    assert lock.code("app.c", tree=False) is None
+    assert lock.refusal(["app.c"], tree=True) is None
+    assert lock.refusal(["app.d", "app.c"], tree=False) is None
     assert lock.refusal(["app.b"], tree=True) is None
+    assert lock.covered == frozenset({"app.a", "app.b"})
     # A never-started stack deployed without app.b: a covered table may still be ticked
     # again -- Start CDC creates its topic from the deployed partition plan (below).
     infra = _fc(["app.a"], phase="infra", status="CREATE_COMPLETE")
@@ -435,9 +436,13 @@ def test_the_add_lock_codes_and_refusals() -> None:
         "entries: ticked here, CDC would stream values for columns its loaded rows hold as "
         "NULL. To select it again, delete that rule in Exclude tables & columns (Change & "
         "reload), which applies its column rules again.")
-    # The refusal names the codes in order, the tables in input order.
-    both = rule_lock.refusal(["app.b", "app.c"], tree=True)
-    assert both.index("app.c was not part") < both.index("An exclude table rule")
+    # G17: a rule-held table the Full Load did not load gets the truthful variant (it has
+    # no loaded rows holding NULL), covered ones first, the tables in input order.
+    ruled.restore_exclusion_rules("exclude table app.b\nexclude table app.c",
+                                  ["app.b", "app.c"])
+    both = table_set_add_lock(ruled, jobs).refusal(["app.c", "app.b"], tree=True)
+    assert both.index("unselected app.b, and") < both.index("unselected app.c, and")
+    assert "loaded rows hold as NULL" not in both.split("unselected app.c")[1]
     # Full load only, or CDC evidence: no add-lock.
     assert table_set_add_lock(_flo(), jobs) is None
     started = _fc()
@@ -449,13 +454,17 @@ def test_the_add_lock_order_is_deterministic() -> None:
     from dsql_migrator.ui.data_migration import TableSetAddLock
 
     lock = TableSetAddLock(covered=frozenset({"app.b", "app.a"}),
-                           rule_held=frozenset({"app.a"}))
+                           rule_held=frozenset({"app.a", "app.y"}))
     names = ["app.z", "app.b", "app.y", "app.a", "app.b"]
-    assert lock.blocked(names, tree=True) == ["app.z", "app.y", "app.a"]
-    assert lock.node_flags(names, ["app.y"]) == {"app.z": "not_loaded", "app.a": "rule"}
-    assert lock.refusal(names, tree=False).startswith("app.z, app.y were not part")
+    # G17 (deliberately changed): only rule-held tables, and only in the tree.
+    assert lock.blocked(names, tree=True) == ["app.y", "app.a"]
+    assert lock.blocked(names, tree=False) == []
+    assert lock.node_flags(names, ["app.y"]) == {"app.a": "rule"}
+    assert lock.refusal(names, tree=False) is None
+    assert lock.refusal(names, tree=True).startswith(
+        "An exclude table rule unselected app.a, and")
     assert hash(lock) == hash(TableSetAddLock(
-        covered=frozenset({"app.a", "app.b"}), rule_held=frozenset({"app.a"})))
+        covered=frozenset({"app.a", "app.b"}), rule_held=frozenset({"app.y", "app.a"})))
 
 
 # ---------------------------------------------------------------------------
@@ -464,8 +473,8 @@ def test_the_add_lock_order_is_deterministic() -> None:
 
 
 def test_locked_leaves_are_not_tickable_and_carry_a_lock_code() -> None:
+    import dsql_migrator.ui.data_migration as dm
     from dsql_migrator.ui.data_migration import (
-        LOCK_TIP_NOT_LOADED,
         LOCK_TIP_RULE,
         TableSetAddLock,
         _header_table_slot_with_locks,
@@ -476,19 +485,21 @@ def test_locked_leaves_are_not_tickable_and_carry_a_lock_code() -> None:
     listed = ["app.a", "app.b", "app.c"]
     plain = build_migration_table_tree(inv, listed)
     assert build_migration_table_tree(inv, listed, add_locked=None) == plain
-    flagged = build_migration_table_tree(inv, listed, add_locked={"app.c": "not_loaded"})
+    flagged = build_migration_table_tree(inv, listed, add_locked={"app.c": "rule"})
     leaves = {leaf["id"]: leaf for leaf in flagged[0]["children"][0]["children"]}
     assert leaves["table:app.c"]["tickable"] is False
-    assert leaves["table:app.c"]["add_locked"] == "not_loaded"
+    assert leaves["table:app.c"]["add_locked"] == "rule"
     assert "disabled" not in leaves["table:app.c"]  # disabled would kill the tooltip
     assert "tickable" not in leaves["table:app.a"] and "add_locked" not in leaves["table:app.a"]
-    lock = TableSetAddLock(covered=frozenset({"app.a", "app.b"}))
+    lock = TableSetAddLock(covered=frozenset({"app.a", "app.b"}), rule_held=frozenset({"app.c"}))
     assert lock.node_flags(listed, ["app.a", "app.c"]) == {}  # a ticked leaf: always untickable
-    assert lock.node_flags(listed, ["app.a"]) == {"app.c": "not_loaded"}
+    assert lock.node_flags(listed, ["app.a"]) == {"app.c": "rule"}
+    # G17 (deliberately changed): an uncovered table is no longer flagged at all.
+    assert TableSetAddLock(covered=frozenset({"app.a"})).node_flags(listed, ["app.a"]) == {}
     slot = _header_table_slot_with_locks()
-    assert "props.node.add_locked === 'not_loaded'" in slot
-    for tip in (LOCK_TIP_NOT_LOADED, LOCK_TIP_RULE):
-        assert f"<q-tooltip>{tip}</q-tooltip>" in slot
+    assert "props.node.add_locked === 'rule'" in slot
+    assert f"<q-tooltip>{LOCK_TIP_RULE}</q-tooltip>" in slot
+    assert "not_loaded" not in slot and not hasattr(dm, "LOCK_TIP_NOT_LOADED")
     assert "not_deployed" not in slot
 
 
@@ -555,39 +566,47 @@ def _render_tree(state, jobs, listed, *, with_lock=True):
     return ui, changes, refreshed
 
 
-def test_the_tree_unticks_and_refuses_an_uncovered_tick_whole() -> None:
-    # FAILS WITHOUT THE FIX: there was no add_lock_fn (and the tree was locked).
+def test_the_tree_unticks_and_refuses_a_rule_held_tick_whole() -> None:
+    # FAILS WITHOUT THE FIX: there was no add_lock_fn (and the tree was locked). G17
+    # (deliberately changed): an uncovered table ticks and is stored (pending its guarded
+    # load); only a rule-held one refuses the whole tick.
     state = _fc(["app.a", "app.b"])
+    state.restore_exclusion_rules("exclude table app.d", ["app.d"])
     jobs = _Jobs({"job-1": _loaded()})
-    ui, changes, refreshed = _render_tree(state, jobs, ["app.a", "app.b", "app.c"])
+    ui, changes, refreshed = _render_tree(state, jobs, ["app.a", "app.b", "app.c", "app.d"])
     (on_tick,) = ui.trees
     leaves = {leaf["id"]: leaf for leaf in ui.nodes[0][0]["children"][0]["children"]}
-    assert leaves["table:app.c"]["add_locked"] == "not_loaded"
+    assert "add_locked" not in leaves["table:app.c"]
+    assert leaves["table:app.d"]["add_locked"] == "rule"
     (template,) = [t for name, t in ui.slots if name == "header-table"]
     assert "props.node.add_locked" in template
     on_tick(SimpleNamespace(value=["table:app.a"]))  # untick app.b
     assert state.selection.selected_tables == ["app.a"] and changes == [["app.a"]]
-    on_tick(SimpleNamespace(value=["table:app.a", "table:app.c", "table:app.b"]))
+    on_tick(SimpleNamespace(value=["table:app.a", "table:app.d", "table:app.b"]))
     (note, tone), = ui.notes
-    assert tone == "warning" and note == (
-        "app.c was not part of the last Full Load's snapshot, so CDC has no gapless start "
-        "point for it: after its Full Load, Full load + CDC can drop tables but not add them. "
-        "To migrate it too, use Start over. This change was not applied.")
+    assert tone == "warning" and note.startswith(
+        "An exclude table rule unselected app.d, and that Save dropped its excluded-column "
+        "entries: ticked here, it would load and stream every column")
+    assert note.endswith("This change was not applied.")
     assert refreshed == [1]
     assert state.selection.selected_tables == ["app.a"]  # all or nothing: app.b not added
-    on_tick(SimpleNamespace(value=["table:app.a", "table:app.b"]))  # a covered re-tick
-    assert state.selection.selected_tables == ["app.a", "app.b"]
+    on_tick(SimpleNamespace(value=["table:app.a", "table:app.c", "table:app.b"]))
+    assert state.selection.selected_tables == ["app.a", "app.b", "app.c"]  # stored, pending
+    assert len(ui.notes) == 1
 
 
 def test_select_all_selects_only_addable_tables_and_reports_the_skip() -> None:
-    # FAILS WITHOUT THE FIX: Select all ticked (and stored) app.c, which CDC cannot start.
+    # G17 (deliberately changed): Select all ticks the tables the Full Load did not load too
+    # (each pending its guarded load) and skips only a rule-held one.
     state = _fc(["app.a"])
+    state.restore_exclusion_rules("exclude table app.d", ["app.d"])
     jobs = _Jobs({"job-1": _loaded()})
-    ui, changes, _refreshed = _render_tree(state, jobs, ["app.a", "app.b", "app.c"])
+    ui, changes, _refreshed = _render_tree(state, jobs, ["app.a", "app.b", "app.c", "app.d"])
     ui.clicks["Select all"]()
-    assert ui.ticks[-1] == ["table:app.a", "table:app.b"]  # explicit ids, never tick() all
-    assert state.selection.selected_tables == ["app.a", "app.b"]
-    assert changes == [["app.a", "app.b"]]
+    # Explicit ids, never tick() all.
+    assert ui.ticks[-1] == ["table:app.a", "table:app.b", "table:app.c"]
+    assert state.selection.selected_tables == ["app.a", "app.b", "app.c"]
+    assert changes == [["app.a", "app.b", "app.c"]]
     assert ui.notes == [("1 table cannot be selected now and stays unselected (a lock marks "
                          "it in the list).", "info")]
     # Without an add-lock: today's Select all.
@@ -702,10 +721,11 @@ def test_change_and_reload_unselects_a_table_in_full_load_and_cdc(monkeypatch) -
     assert FL_CDC_RELOAD_LABEL in ui.texts
 
 
-def test_change_and_reload_refuses_reselecting_an_uncovered_table_per_table(
-        monkeypatch) -> None:
+def test_change_and_reload_selects_an_uncovered_table_for_retry(monkeypatch) -> None:
     # A loaded table a rule unselected after the load may be selected again (the popup
-    # applies its column rules again); app.c (not in the snapshot) may not -- per line.
+    # applies its column rules again) and is kept as is. G17 (deliberately changed from a
+    # per-line E3): app.c (not in the snapshot) may be selected too -- listed under Retry
+    # unfinished tables, and captured once loaded.
     s = _reload_screen(monkeypatch, record=("app.a", "app.b"),
                        rules="exclude table app.b\nexclude table app.c",
                        rule_excluded=("app.b", "app.c"), selection=("app.a",), mtype=FLC)
@@ -716,12 +736,13 @@ def test_change_and_reload_refuses_reselecting_an_uncovered_table_per_table(
     assert any("Selects app.b again: already loaded by the last Full Load, kept as is" in t
                for t in ui.texts)
     ui.type_text("exclude table app.b\nexclude table app.c\ninclude table app.c")
-    assert any(t.startswith("This rule would select app.c again. app.c was not part of the "
-                            "last Full Load's snapshot") or
-               "This rule would select app.c again. app.c was not part of the last Full "
-               "Load's snapshot" in t for t in ui.texts)
-    assert not _action(ui).enabled
-    assert not any("Selects app.c" in t for t in ui.texts)
+    assert not any("This rule would select app.c again" in t for t in ui.texts)
+    assert _action(ui).enabled
+    # G17 review (deliberately changed): this watermark records no MySQL start point for
+    # app.c, so Retry cannot add it -- the line names Re-run all tables too.
+    assert any("Selects app.c: listed under Retry unfinished tables on the Full Load step "
+               "until loaded (Re-run all tables loads it where that step says Retry cannot "
+               "add it); CDC then captures it with the other tables." in t for t in ui.texts)
 
 
 def test_an_unprobed_change_and_reload_waits(monkeypatch) -> None:
@@ -740,8 +761,10 @@ def test_an_unprobed_change_and_reload_waits(monkeypatch) -> None:
 
 def test_the_popup_memo_follows_the_add_lock(monkeypatch) -> None:
     # The memo key carries the add-lock: a Re-run Full Load over the smaller set meanwhile
-    # (its fresh watermark no longer covers app.b) must re-resolve a cached "re-select
-    # app.b is fine" into an E3.
+    # changes the lock (its fresh watermark no longer covers app.b), so a cached resolution
+    # is not served for it. G17 (deliberately changed): re-selecting app.b is no E3 any more
+    # -- it is a pending addition -- and once CDC has started the popup's table set is fixed
+    # again (today's E3 with today's lock text).
     from dsql_migrator.ui.data_migration._exclusion_dialog import _resolve
 
     s = _reload_screen(monkeypatch, record=("app.a", "app.b"), rules="exclude table app.b",
@@ -750,13 +773,18 @@ def test_the_popup_memo_follows_the_add_lock(monkeypatch) -> None:
     inventory, inputs = s.ctx.inventory_fn(), s.ctx.inputs_fn()
     first = _resolve(s.ctx, inventory, inputs, "", slot="editor")
     assert first.can_save and first.tables_to_reselect == ("app.b",)
+    lock_before = s.ctx.add_lock_fn()
     s.jobs.jobs["job-2"] = _job("DONE", [_c("app.a")], counts={"app.a": 1}, job_id="job-2")
     s.state.job_id = "job-2"
+    assert s.ctx.add_lock_fn() != lock_before  # a different memo key
     second = _resolve(s.ctx, inventory, inputs, "", slot="editor")
-    assert not second.can_save
-    (e3,) = second.global_errors
-    assert e3.code == "E3" and "app.b was not part of the last Full Load's snapshot" in (
-        e3.message)
+    assert second is not first
+    assert second.can_save and second.tables_to_reselect == ("app.b",)
+    s.state.set_cdc_ops_window_start(_TS)
+    third = _resolve(s.ctx, inventory, inputs, "", slot="editor")
+    assert not third.can_save
+    (e3,) = third.global_errors
+    assert e3.code == "E3" and TODAY in e3.message
 
 
 def test_r4_and_r1_name_the_narrowing() -> None:
@@ -789,7 +817,7 @@ def test_r4_and_r1_name_the_narrowing() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_full_load_scope_names_in_full_load_and_cdc_is_removal_only_and_outlives_the_start(
+def test_full_load_scope_names_in_full_load_and_cdc_narrows_and_outlives_the_start(
 ) -> None:
     # FAILS WITHOUT THE FIX: Full load + CDC never had a scoped view.
     from dsql_migrator.ui.data_migration._models import (
@@ -799,10 +827,17 @@ def test_full_load_scope_names_in_full_load_and_cdc_is_removal_only_and_outlives
 
     jobs = _Jobs({"job-1": _loaded()})
     assert full_load_scope_names(_fc(["app.a"]), jobs, ["ignored"]) == ["app.a"]
+    # G17 (deliberately changed): while CDC never started, a selected table the watermark
+    # does not cover is in the view, PENDING until its guarded load.
     with_new = full_load_scope_names(_fc(["app.a", "app.c"]), jobs, ["app.a", "app.c"])
-    assert with_new == ["app.a"]
+    assert with_new == ["app.a", "app.c"]
     view = scope_full_load_job(jobs.jobs["job-1"], with_new)
-    assert [c.chunk_id for c in view.chunks] == ["app.a"]  # never a PENDING app.c
+    assert [(c.chunk_id, c.status) for c in view.chunks] == [
+        ("app.a", "DONE"), ("app.c", "PENDING")]
+    # ...and once CDC has started, the view is removal-only again.
+    started_new = _fc(["app.a", "app.c"])
+    started_new.set_cdc_ops_window_start(_TS)
+    assert full_load_scope_names(started_new, jobs, ["app.a", "app.c"]) == ["app.a"]
     started = _fc(["app.a"])
     started.set_cdc_ops_window_start(_TS)
     started.set_cdc_stack_phase("running", status="UPDATE_COMPLETE")
@@ -1141,7 +1176,13 @@ def test_the_start_tooltip_names_the_narrowing_until_cdc_starts(engine) -> None:
 
     narrowing = hover(started=False)
     assert narrowing.startswith(START_TOOLTIP_NARROWING)
-    assert "This set is fixed" not in narrowing and "Start over" in narrowing
+    # G17 (deliberately changed): no Start over while the set can still change -- a table
+    # the snapshot does not hold is loaded on the Full Load step first.
+    assert "This set is fixed" not in narrowing and "Start over" not in narrowing
+    # G17 review (deliberately changed): not "by Retry unfinished tables" -- a MySQL table
+    # the Full Load recorded no start point for is loaded by Re-run all tables instead.
+    assert "a table you tick is loaded on the Full Load step first" in narrowing
+    assert "the tables loaded under its start point since" in narrowing
     assert ("which is what makes the handoff gapless" in narrowing) is (
         engine is SourceType.MYSQL)
     fixed = hover(started=True)
@@ -1175,10 +1216,12 @@ def test_the_g16_helpers_stay_linear() -> None:
     assert narrowed_record_names(state, job) == names[:-1]
     assert capture_load_complete(job, captured) is True
     assert keep_unlisted_covered(names, names[:10000], set(names)) == names[10000:]
-    lock = TableSetAddLock(covered=frozenset(names[:10000]))
+    # G17 (deliberately changed): the flags come from the rule-held tables.
+    lock = TableSetAddLock(covered=frozenset(names[:10000]), rule_held=frozenset(names[10000:]))
     flags = lock.node_flags(names, names[:5000])
     assert len(flags) == 10000
-    assert lock.refusal(names[10000:], tree=True).startswith("app.t10000, app.t10001")
+    assert lock.refusal(names[10000:], tree=True).startswith(
+        "An exclude table rule unselected app.t10000, app.t10001")
     nodes = build_migration_table_tree(inventory, names, add_locked=flags)
     assert sum(1 for leaf in nodes[0]["children"][0]["children"] if "add_locked" in leaf) == (
         10000)
@@ -1261,7 +1304,10 @@ def test_ticking_a_failed_table_again_makes_the_step_failed_again(monkeypatch, h
     else:  # what a Change & reload Save that selects app.b again ends with
         s.state.set_selection(TableSelection(selected_tables=["app.a", "app.b"]))
         s.captured["ctx"].refresh()
-    assert s.state.selection.selected_tables == ["app.a", "app.b"]
+    # G17 (deliberately changed): Select all also ticks app.c, which the Full Load did not
+    # load -- pending its guarded load (the step is Failed for it too).
+    assert s.state.selection.selected_tables == (
+        ["app.a", "app.b", "app.c"] if how == "select_all" else ["app.a", "app.b"])
     assert _step(s) is StepStatus.FAILED and s.state.error == "load failed for app.b"
     _rerender(s)
     assert _step(s) is StepStatus.FAILED and not _continue_enabled(s)
@@ -1371,11 +1417,12 @@ def test_a_restored_session_that_started_cdc_keeps_the_detour_locked() -> None:
     assert "CDC has already started for this migration" in reason
 
 
-def test_a_stale_full_load_only_tab_cannot_add_a_table_the_load_did_not_have(
-        monkeypatch) -> None:
+def test_a_stale_full_load_only_tab_reads_the_lock_of_the_current_type(monkeypatch) -> None:
     # FAILS WITHOUT THE FIX: the add-lock was wired only into a tree RENDERED as Full load +
-    # CDC, so a tab rendered as Full load only stored app.c (never loaded) after another tab
-    # switched the session to Full load + CDC.
+    # CDC, so a tab rendered as Full load only skipped the Full load + CDC rules after
+    # another tab switched the session. G17 (deliberately changed): there, app.c (never
+    # loaded) is stored as a pending addition; once CDC has started in the other tab, the
+    # stale tab's tick is refused with today's lock.
     s = _screen(monkeypatch, job=_loaded(), selected=["app.a", "app.b"])
     s.state.set_cdc_stack_phase("absent")
     held = _wire_tree(s)
@@ -1385,11 +1432,16 @@ def test_a_stale_full_load_only_tab_cannot_add_a_table_the_load_did_not_have(
     s.session.set_migration_type(FLC)  # another tab
     s.ui.notified.clear()
     held["on_tick"](SimpleNamespace(value=["table:app.a", "table:app.b", "table:app.c"]))
+    assert s.state.selection.selected_tables == ["app.a", "app.b", "app.c"]
+    assert s.ui.notified == []
+    held["on_tick"](SimpleNamespace(value=["table:app.a", "table:app.b"]))
+    assert s.state.selection.selected_tables == ["app.a", "app.b"]
+    s.state.set_cdc_ops_window_start(_TS)  # the other tab started CDC
+    held["on_tick"](SimpleNamespace(value=["table:app.a", "table:app.b", "table:app.c"]))
     assert s.state.selection.selected_tables == ["app.a", "app.b"]
     ((note, kw),) = s.ui.notified
     assert kw.get("type") == "warning"
-    assert note.startswith("app.c was not part of the last Full Load's snapshot")
-    assert note.endswith("This change was not applied.")
+    assert note == f"{TODAY} This change was not applied."
     select_all.on_click()
     assert s.state.selection.selected_tables == ["app.a", "app.b"]
 

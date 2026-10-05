@@ -694,6 +694,24 @@ def _render_cdc_source_config_card(
     # HTTP 400). Surface that here as a calm, actionable notice instead of building
     # a config preview from an empty selection (build_sink_config would raise).
     if not tables_for_config:
+        # G17: only tables still to load under the Full Load's start point are selected --
+        # the remedy is their load (or an untick). Said once, here: the Start card below
+        # stays silent on an empty capture (its Will stream line and disabled Start say it).
+        _pending_cfg = (
+            cdc_start_uncovered(migration_state, job_manager, job)
+            if cdc_capture_names(migration_state, watermark) == frozenset()
+            else []
+        )
+        if _pending_cfg:
+            render_notice(
+                ui,
+                tone="warning",
+                header=START_UNCOVERED_HEADER,
+                body=start_uncovered_body(
+                    _pending_cfg, getattr(migration_state, "migration_type", None)
+                ),
+            )
+            return
         render_notice(
             ui,
             tone="warning",
@@ -937,9 +955,10 @@ def _cdc_tables_for_config(
     THE capture set of every CDC surface (infra deploy params and partition plan, Start
     CDC, its dialog's checks, the PostgreSQL objects gate, the FK probe, "Will stream", the
     config preview, the monitor's streamed set). Prefers the watermark's covered tables
-    still selected (:func:`cdc_capture_names`: the snapshot's set, narrowed by a Full load
-    + CDC untick after its Full Load -- G16 -- and never widened, since only covered tables
-    have a gapless start) when both inventory and watermark are present, in inventory
+    still selected (:func:`cdc_capture_names`: the snapshot's set plus the tables a guarded
+    Full load + CDC load added since -- G17 --, narrowed by a Full load + CDC untick after
+    its Full Load -- G16 -- and never widened by the selection alone, since only covered
+    tables have a gapless start) when both inventory and watermark are present, in inventory
     order; otherwise falls back to the user's confirmed table selection (the manual-seed
     case where no Full Load ran); and finally, for an ADOPTED / out-of-band pipeline (this
     session ran neither Full Load nor Start CDC -- e.g. after a reset + "Attach to
@@ -972,13 +991,17 @@ def _cdc_row_counts_from_watermark(watermark, tables_for_config):
     Returns ``{table_name: rows}`` (positive counts only) for the tables actually
     being captured, or ``None`` when the watermark carries no counts. These are the
     scan-free ``information_schema`` estimates captured at snapshot time -- exactly
-    the RELATIVE size signal the partition planner needs. Pure.
+    the RELATIVE size signal the partition planner needs -- plus, for a table a guarded
+    Full load + CDC load added after it (G17), the rows that load wrote. Pure.
     """
     counts = getattr(watermark, "table_row_counts", None) if watermark else None
     if not counts:
         return None
     names = {t.name for t in tables_for_config}
     scoped = {n: int(c) for n, c in counts.items() if n in names and c}
+    for name, rows in (getattr(watermark, "cdc_added_tables", None) or {}).items():
+        if name in names and rows and name not in scoped:
+            scoped[name] = int(rows)
     return scoped or None
 
 
@@ -2511,14 +2534,152 @@ def _render_cdc_partial_actions(
             "connector is kept. Buffered changes let the new sink catch up — no gap."
         )
 
-# G16 (Full load + CDC after its Full Load, before CDC first starts): the CDC step's copy
-# while the table list can still drop tables.
+# G16/G17 (Full load + CDC after its Full Load, before CDC first starts): the CDC step's
+# copy while the table list can still change the set.
 START_TOOLTIP_NARROWING = (
-    "Until you start CDC, you can still untick tables in the table list: CDC then does not "
-    "capture them, and they are left as is on Aurora DSQL. Once CDC starts this set is "
-    "fixed: each table's Kafka topic partitions were sized when the infrastructure was "
-    "created and cannot be changed, and MSK does not reclaim that capacity.\n\n"
+    "Until you start CDC, you can still change the table list: CDC does not capture a table "
+    "you untick (it is left as is on Aurora DSQL), and a table you tick is loaded on the "
+    "Full Load step first. Once CDC starts this set is fixed: each table's Kafka topic "
+    "partitions were sized when the infrastructure was created and cannot be changed, and "
+    "MSK does not reclaim that capacity.\n\n"
 )
+START_TOOLTIP_NARROWING_TAIL = (
+    "It is drawn from the Full Load snapshot and the tables loaded under its start point "
+    "since, which is what makes the handoff gapless."
+)
+START_TOOLTIP_NARROWING_TAIL_RESNAPSHOT = (
+    "It is drawn from the Full Load snapshot and the tables loaded under its start point "
+    "since."
+)
+START_UNCOVERED_HEADER = "Load the tables selected after the Full Load first"
+DEPLOY_PENDING_EMPTY = (
+    "Load the tables selected after the Full Load before deploying the CDC infrastructure: "
+    "none of the selected tables is loaded under the Full Load's start point yet, and the "
+    "infrastructure is sized for the tables CDC captures when it is created."
+)
+
+
+def _them(names) -> "tuple[str, bool]":
+    """``(bounded names, one)`` for the G17 copy."""
+    from dsql_migrator.ui.cdc_dlq_gate import bounded_table_names
+
+    return bounded_table_names(list(names)), len(names) == 1
+
+
+def start_uncovered_body(names, migration_type) -> str:
+    """C-START: why Start CDC waits while selected tables are not covered yet (G17)."""
+    listed, one = _them(names)
+    it = "it" if one else "them"
+    if migration_type is MigrationType.CDC_ONLY:
+        return (
+            f"{listed} {'is' if one else 'are'} selected but {'was' if one else 'were'} not "
+            f"loaded by this migration's Full Load, so CDC would not capture {it}. Switch the "
+            f"migration type to Full load + CDC and load {it} there, or untick {it} in its "
+            "table list."
+        )
+    return (
+        f"{listed} {'is' if one else 'are'} selected but not loaded under the Full Load's "
+        f"start point yet, so CDC would not capture {it}. Load {it} on the Full Load step "
+        f"(Retry unfinished tables, or Re-run all tables where that step says Retry cannot "
+        f"add {it}), or untick {it} in the table list, then start CDC."
+    )
+
+
+def will_stream_pending(names, migration_type) -> str:
+    """C-WILL: the capture is empty because the selected tables are still to load (G17).
+
+    CDC only has no Full Load step, so it names the route :func:`start_uncovered_body`
+    names: the type switch. Neither promises Retry unfinished tables, which cannot add a
+    MySQL table the Full Load recorded no start-point definition for."""
+    listed, one = _them(names)
+    it = "it" if one else "them"
+    if migration_type is MigrationType.CDC_ONLY:
+        return (
+            f"Will stream no tables yet: {listed} {'was' if one else 'were'} not loaded by "
+            "this migration's Full Load (switch the migration type to Full load + CDC and "
+            f"load {it} there)."
+        )
+    return (
+        f"Will stream no tables yet: {listed} {'is' if one else 'are'} not loaded under the "
+        f"Full Load's start point yet (load {it} on the Full Load step: Retry unfinished "
+        f"tables, or Re-run all tables where that step says Retry cannot add {it})."
+    )
+
+
+def cdc_added_notice_body(names, *, mysql: bool) -> str:
+    """C-ADDED: what capturing a table added after the Full Load costs (G17; info).
+
+    MySQL replays the table's binary log from the Full Load's start point; PostgreSQL's
+    slot decodes the table only from when it joined CDC's publication (just before its
+    copy) -- the copy covers the time before that. Either way the newer copy converges."""
+    listed, one = _them(names)
+    it = "it" if one else "them"
+    captured = (
+        f"{'is' if one else 'are'} captured from its start point like the other tables: CDC "
+        f"replays every change made to {it} since then over the newer copy, which converges."
+        if mysql
+        else f"{'is' if one else 'are'} captured from the same replication slot as the "
+        f"other tables: CDC streams every change made to {it} since "
+        f"{'it' if one else 'they'} joined CDC's publication (at the latest just before "
+        f"{'its' if one else 'their'} copy) over that copy, which converges."
+    )
+    return (
+        f"{listed} {'was' if one else 'were'} loaded after the Full Load and {captured} "
+        "A change that briefly conflicts on a unique index with a row already "
+        "copied can be dead-lettered; Cut over then waits for a CHECKSUM validation. If the "
+        f"CDC infrastructure was deployed before {'it was' if one else 'they were'} loaded, "
+        f"{'its Kafka topic gets' if one else 'their Kafka topics get'} the infrastructure's "
+        "default partition count."
+        + (
+            " The binary log must still hold every change since the Full Load's start point."
+            if mysql
+            else ""
+        )
+    )
+
+
+def deploy_pending_hint(names) -> str:
+    """C-DEPLOY: a deploy now does not size the tables still to load (G17; info)."""
+    listed, one = _them(names)
+    it = "it" if one else "them"
+    return (
+        f"{listed} {'is' if one else 'are'} not loaded yet, so this deploy does not size "
+        f"{'its Kafka topic' if one else 'their Kafka topics'}: Start CDC creates {it} later "
+        f"with the infrastructure's default partition count. Load {it} on the Full Load step "
+        f"first (Retry unfinished tables, or Re-run all tables where that step says Retry "
+        f"cannot add {it}) to size {it} too."
+    )
+
+
+def _gate_selection(migration_state) -> "list[str]":
+    """The resolved table selection (stored and migratable), else the stored one."""
+    getter = getattr(migration_state, "resolved_selection", None)
+    selected = getter() if callable(getter) else None
+    if selected is None:
+        selected = list(
+            getattr(getattr(migration_state, "selection", None), "selected_tables", None) or ()
+        )
+    return list(selected)
+
+
+def cdc_start_uncovered(migration_state, job_manager, job) -> "list[str]":
+    """The selected tables Start CDC waits for (G17, :func:`cdc_uncovered_selection` over
+    the resolved selection -- else the stored one -- and the record ``job`` in hand)."""
+    from dsql_migrator.ui.data_migration._cdc_monitoring import cdc_uncovered_selection
+
+    return cdc_uncovered_selection(
+        migration_state, job_manager, _gate_selection(migration_state), job=job
+    )
+
+
+def cdc_deploy_pending(migration_state, job_manager, job) -> "list[str]":
+    """The Full load + CDC tables a Deploy now would not size (G17: still to load under the
+    Full Load's start point, :func:`fl_cdc_pending_additions`)."""
+    from dsql_migrator.ui.data_migration._cdc_monitoring import fl_cdc_pending_additions
+
+    return fl_cdc_pending_additions(
+        migration_state, job_manager, _gate_selection(migration_state), job=job
+    )
 WILL_STREAM_NONE = (
     "Will stream no tables: none of the tables in the Full Load's snapshot is selected. "
     "Tick at least one in the table list."
@@ -2529,8 +2690,8 @@ WILL_STREAM_NONE = (
 WILL_STREAM_NONE_LOCKED_LIST = (
     "Will stream no tables: none of the tables in the Full Load's snapshot is selected, and "
     "CDC only cannot change the table set. To pick them again, switch the migration type to "
-    "Full load + CDC and tick them in the table list there (only tables that Full Load "
-    "loaded can be ticked back), then switch back here or stay in Full load + CDC."
+    "Full load + CDC and tick them in the table list there (a table the Full Load did not "
+    "load is loaded there first), then switch back here or stay in Full load + CDC."
 )
 
 
@@ -2644,13 +2805,30 @@ def _render_cdc_start_button(
     # G16: every table of the Full Load's snapshot unticked -- nothing would stream, so no
     # "Ready to ..." claim: the WILL_STREAM_NONE line below and the disabled Start say so.
     _empty_capture = cdc_capture_names(migration_state, watermark) == frozenset()
+    # G17: a selected table the watermark does not cover yet (selected after the Full Load,
+    # not loaded under its start point): Start waits for it -- CDC would not capture it, and
+    # once CDC starts the set is fixed.
+    _uncovered = cdc_start_uncovered(migration_state, job_manager, job)
+    _migration_type = getattr(migration_state, "migration_type", None)
     # A restart is a materially different operation from a first start -- it resumes an
     # existing position rather than establishing one -- so it must not be described with
     # the first-start copy. Saying only "begins streaming" left the operator to guess
     # whether stopping had cost them their place (and the answer, "no", is the one thing
     # they need before pressing this).
     if _empty_capture:
+        # Nothing would stream (G16; G17: or only tables still to load are selected): the
+        # source config card above says why, once -- the Will stream line below and the
+        # disabled Start say it here.
         pass
+    elif _uncovered:
+        # A captured table beside one still to load: this card is the only place that says
+        # Start waits for it.
+        render_notice(
+            ui,
+            tone="warning",
+            header=START_UNCOVERED_HEADER,
+            body=start_uncovered_body(_uncovered, _migration_type),
+        )
     elif resumes_from_offset:
         render_notice(
             ui,
@@ -2702,6 +2880,25 @@ def _render_cdc_start_button(
     # advice is verifiable at a glance instead of asking the user to scroll up.
     cdc_tables = _cdc_tables_for_config(migration_state, inventory, watermark)
     table_names = [t.name for t in cdc_tables]
+    # G17: captured tables a guarded load added after the Full Load, before CDC ever started
+    # -- what capturing them from the original start point costs, said once (info).
+    _added_after = set(getattr(watermark, "cdc_added_tables", None) or ())
+    _added_captured = [n for n in table_names if n in _added_after]
+    # Not on a start that re-snapshots every table (said in "Ready to start CDC" above):
+    # nothing is replayed over a copy there, which is what this notice is about.
+    if _added_captured and not _resnapshots:
+        from dsql_migrator.ui.data_migration._cdc_monitoring import _cdc_started_for_migration
+
+        if not _cdc_started_for_migration(migration_state, job_manager):
+            render_notice(
+                ui,
+                tone="info",
+                header="Tables added after the Full Load",
+                body=cdc_added_notice_body(
+                    _added_captured,
+                    mysql=_cdc_source_type(session) is not SourceType.POSTGRES,
+                ),
+            )
     if table_names:
         preview = ", ".join(table_names[:6]) + (
             f" +{len(table_names) - 6} more" if len(table_names) > 6 else ""
@@ -2709,8 +2906,13 @@ def _render_cdc_start_button(
         noun = "table" if len(table_names) == 1 else "tables"
         selection_line = f"Will stream {len(table_names)} {noun}: {preview}"
     elif _empty_capture:
-        # G16: every table of the Full Load's snapshot was unticked -- nothing streams.
-        selection_line = will_stream_none(migration_state, job_manager)
+        # G16: every table of the Full Load's snapshot was unticked -- nothing streams (G17:
+        # or only tables still to load under its start point are selected).
+        selection_line = (
+            will_stream_pending(_uncovered, _migration_type)
+            if _uncovered
+            else will_stream_none(migration_state, job_manager)
+        )
     else:
         selection_line = (
             "Will stream all tables covered by the Full Load snapshot / your "
@@ -2725,23 +2927,23 @@ def _render_cdc_start_button(
     # on (the CDC-bearing types are the only ones with a "cdc" sub-step). Telling the
     # operator to choose everything up front was advice they could not act on -- the
     # checkboxes were disabled while the tip pointed at them. The one exception is Full
-    # load + CDC after its Full Load, before CDC first starts (G16): the picker can still
-    # DROP tables there (and tick back a table the Full Load loaded), so the tooltip says
-    # so.
+    # load + CDC after its Full Load, before CDC first starts (G16, G17): the picker can still
+    # change the set there (a ticked table the Full Load did not load is loaded under its
+    # start point first), so the tooltip says so.
     #
     # The remedy depends on WHICH lock applies, and the two are not interchangeable:
     #   * Full Load already ran -> its clause wins and is NOT released by deleting the
-    #     CDC stack (the export ran against this set; that fact is permanent). Only
-    #     Start over clears it for an added table. Saying "delete the CDC infrastructure
-    #     to re-scope" here would send the operator through a ~45 min teardown that leaves
-    #     the picker exactly as locked as before.
+    #     CDC stack (the export ran against this set; that fact is permanent). Once CDC has
+    #     started, only Start over clears it for an added table. Saying "delete the CDC
+    #     infrastructure to re-scope" here would send the operator through a ~45 min
+    #     teardown that leaves the picker exactly as locked as before.
     #   * CDC-only (no Full Load) -> the CDC clause is the only one, and deleting the
     #     infrastructure genuinely does release it.
     # So mirror selection_lock_reason's own precedence rather than assuming one exit.
     # (Full load only lifts the Full Load clause when no CDC stack exists, G12 -- but it
     # has no CDC sub-step, so this card never renders for it.)
     full_load_ran = _full_load_committed(job, migration_state)
-    # G16: a Full load + CDC set that may still drop tables (CDC never started for it).
+    # G16/G17: a Full load + CDC set that may still change (CDC never started for it).
     narrowing = (
         getattr(migration_state, "migration_type", None) is MigrationType.FULL_LOAD_AND_CDC
         and table_set_editable_after_load(migration_state, job_manager)
@@ -2782,13 +2984,9 @@ def _render_cdc_start_button(
                 (
                     START_TOOLTIP_NARROWING
                     + (
-                        "It is drawn from the Full Load snapshot, which is what makes the "
-                        "handoff gapless — adding a table the snapshot does not hold means "
-                        "a fresh migration, via 'Start over' (top right)."
+                        START_TOOLTIP_NARROWING_TAIL
                         if not _resnapshots
-                        else "It is drawn from the Full Load snapshot — adding a table the "
-                        "snapshot does not hold means a fresh migration, via 'Start over' "
-                        "(top right)."
+                        else START_TOOLTIP_NARROWING_TAIL_RESNAPSHOT
                     )
                 )
                 if narrowing
@@ -2919,6 +3117,10 @@ def _render_cdc_start_button(
     elif _missing:
         start_btn.props("disable")
         start_btn.tooltip(_missing)
+    elif _uncovered:
+        # G17: a selected table not loaded under the Full Load's start point yet.
+        start_btn.props("disable")
+        start_btn.tooltip(start_uncovered_body(_uncovered, _migration_type))
     elif _empty_capture:
         # Said before the click: Start would refuse an empty capture only after the dialog's
         # probes, in a notice the closing dialog takes with it.
@@ -3435,18 +3637,22 @@ def _render_cdc_infra_deploy_action(
         return
     # G16: every table of the Full Load's snapshot unticked -- an infrastructure sized for
     # no table. Said before the click (the click-time guard in _start_cdc_infra_deploy stays
-    # the backstop); returning before the VPC gate keeps _sync_gate from enabling it.
+    # the backstop); returning before the VPC gate keeps _sync_gate from enabling it. G17:
+    # or only tables still to load under its start point are selected -- load them first.
+    _deploy_job = _current_job(job_manager, getattr(migration_state, "job_id", None))
+    _deploy_pending = cdc_deploy_pending(migration_state, job_manager, _deploy_job)
     if cdc_capture_names(
-        migration_state,
-        _cdc_watermark(
-            _current_job(job_manager, getattr(migration_state, "job_id", None)),
-            migration_state,
-        ),
+        migration_state, _cdc_watermark(_deploy_job, migration_state)
     ) == frozenset():
+        _empty_text = DEPLOY_PENDING_EMPTY if _deploy_pending else DEPLOY_EMPTY_CAPTURE
         deploy_btn.props("disable")
-        deploy_btn.tooltip(DEPLOY_EMPTY_CAPTURE)
-        inline_hint(ui, DEPLOY_EMPTY_CAPTURE, tone="warning")
+        deploy_btn.tooltip(_empty_text)
+        inline_hint(ui, _empty_text, tone="warning")
         return
+    if _deploy_pending:
+        # Not blocking: the deploy sizes the tables CDC captures; these are captured once
+        # loaded, on the default partition count.
+        inline_hint(ui, deploy_pending_hint(_deploy_pending), tone="info")
     # Not blocking: excluded names Debezium cannot tell apart from another column.
     _ambiguity = capture_ambiguity_warning(_deploy_capture_now)
     if _ambiguity:
@@ -4973,7 +5179,17 @@ async def _open_cdc_start_dialog(
     sp_verdict = None
     sp_notice: Optional[tuple] = None
     inventory_tables = list(getattr(inventory, "tables", None) or [])
-    if job_manager is not None:
+    # G17: a selected table not loaded under the Full Load's start point yet holds Start
+    # (re-read here: another tab may have ticked one since the card rendered). No I/O; the
+    # probes below are skipped then -- this Start cannot run anyway.
+    _uncovered = (
+        cdc_start_uncovered(
+            migration_state, job_manager, _current_job(job_manager, migration_state.job_id)
+        )
+        if job_manager is not None
+        else []
+    )
+    if job_manager is not None and not _uncovered:
         from nicegui import run
 
         try:
@@ -5087,6 +5303,15 @@ async def _open_cdc_start_dialog(
                 icon="link_off",
                 header="Reconnect before starting CDC",
                 body=conn_blocker,
+            )
+        if _uncovered:
+            _render_notice(
+                ui,
+                tone="warning",
+                header=START_UNCOVERED_HEADER,
+                body=start_uncovered_body(
+                    _uncovered, getattr(migration_state, "migration_type", None)
+                ),
             )
         if binlog_gap:
             _render_notice(
@@ -5301,6 +5526,10 @@ async def _open_cdc_start_dialog(
             if conn_blocker:
                 start_btn.props("disable")
                 start_btn.tooltip(conn_blocker)
+            elif _uncovered:
+                start_btn.props("disable")
+                start_btn.tooltip(start_uncovered_body(
+                    _uncovered, getattr(migration_state, "migration_type", None)))
             elif fk_block is not None:
                 # Hard block: an enforced FK makes the stream discard child rows
                 # silently, so Start stays unavailable until the FKs are gone.
@@ -5537,8 +5766,10 @@ def _full_load_committed(job, migration_state) -> bool:
 
     Full load only lifts that clause when no CDC stack exists (G12), but it has no CDC
     sub-step, so none of the notices this feeds ever renders for it. Full load + CDC lifts
-    it for REMOVALS until CDC first starts (G16); adding a table stays a Start over, so the
-    remedy this chooses still holds there.
+    it until CDC first starts (G16, G17: a table may be dropped, or added and loaded under
+    the Full Load's start point); the notices that read this say so while that holds, and
+    once CDC has started adding a table is a Start over again, so the remedy this chooses
+    still holds there.
     """
     from dsql_migrator.ui.data_migration._models import substeps_for_type
 
@@ -5955,6 +6186,21 @@ def _start_cdc_deploy(
     # Settle a restored pre-overlay session's exclusions before any set is read.
     classify_restored_exclusions(migration_state, job_manager)
     job = _current_job(job_manager, migration_state.job_id)
+    # G17 backstop (the Start button and its dialog say it first; Retry CDC comes here
+    # directly): a selected table not loaded under the Full Load's start point yet. Refused
+    # before any parameter is built or job submitted -- CDC would not capture it, and once
+    # CDC starts the set is fixed.
+    _uncovered = cdc_start_uncovered(migration_state, job_manager, job)
+    if _uncovered:
+        render_notice(
+            ui,
+            tone="error",
+            header=START_UNCOVERED_HEADER,
+            body=start_uncovered_body(
+                _uncovered, getattr(migration_state, "migration_type", None)
+            ),
+        )
+        return
     # The JOB watermark: it decides the table set, the FK probe, the PostgreSQL gates and
     # the ops window. What the seeder is OFFERED is the seed below (MySQL: a Manual binlog
     # point beats it -- the card and the preview already show that point as the start).
@@ -6610,15 +6856,19 @@ async def _start_cdc_infra_deploy(
 
     # G16: every table of the Full Load's snapshot unticked -- an infrastructure sized for
     # no table. Refused before any AWS call (a watermark with counts and nothing captured;
-    # the pre-load deploy with no watermark is unchanged).
+    # the pre-load deploy with no watermark is unchanged). G17: the same when only tables
+    # still to load under the Full Load's start point are selected.
+    _deploy_job = _current_job(job_manager, getattr(migration_state, "job_id", None))
     if cdc_capture_names(
-        migration_state,
-        _cdc_watermark(
-            _current_job(job_manager, getattr(migration_state, "job_id", None)),
-            migration_state,
-        ),
+        migration_state, _cdc_watermark(_deploy_job, migration_state)
     ) == frozenset():
-        ui.notify(DEPLOY_EMPTY_CAPTURE, type="warning", position="top")  # type: ignore[attr-defined]
+        ui.notify(  # type: ignore[attr-defined]
+            DEPLOY_PENDING_EMPTY
+            if cdc_deploy_pending(migration_state, job_manager, _deploy_job)
+            else DEPLOY_EMPTY_CAPTURE,
+            type="warning",
+            position="top",
+        )
         return
 
     target, region = _cdc_target_region(ui, session)
@@ -7380,7 +7630,9 @@ from dsql_migrator.ui.data_migration._cdc_monitoring import (  # noqa: E402,F401
     table_set_delete_wait,
     TableSetAddLock,
     table_set_add_lock,
-    LOCK_TIP_NOT_LOADED,
+    cdc_uncovered_selection,
+    fl_cdc_pending_additions,
+    cdc_addition_block_reason,
     LOCK_TIP_RULE,
     TREE_HINT_FL_CDC,
     CDC_ONLY_NARROWING_SENTENCE,

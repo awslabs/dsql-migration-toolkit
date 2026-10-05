@@ -25,8 +25,9 @@ Amazon **RDS / Aurora MySQL 또는 PostgreSQL → Amazon Aurora DSQL**, 단방�
 
 **소스는 전 과정 내내 읽기 전용**입니다. 도구가 어떤 소스에든 쓰는 유일한 예외는 **CDC를 쓰는 PostgreSQL
 소스**의 경우로, Full Load 일관성 지점에서 정확히 마이그레이션 대상 테이블로만 범위를 한정한 논리 복제
-슬롯과 publication을 생성(그리고 teardown 시 삭제)합니다 — autocommit, allowlist 제한, 감사(audit)되는
-작업입니다. MySQL 소스(및 Full Load만 하는 PostgreSQL 마이그레이션)에는 절대 쓰지 않습니다.
+슬롯과 publication을 생성(그리고 teardown 시 삭제)하고, 재키잉된 테이블에 `REPLICA IDENTITY FULL`을
+설정하며, Full Load 이후 선택한 테이블을 그 publication에 추가합니다(Full load + CDC, CDC를 시작하기 전) —
+각각 autocommit, allowlist 제한, 감사(audit)되는 작업입니다. MySQL 소스(및 Full Load만 하는 PostgreSQL 마이그레이션)에는 절대 쓰지 않습니다.
 
 
 **Q2. Aurora DSQL을 내 소스 엔진(Aurora MySQL / PostgreSQL)의 드롭인 대체로 그대로 쓸 수 있나요?**

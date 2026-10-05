@@ -47,9 +47,16 @@ from dsql_migrator.ui.data_migration._models import (
     MigrationType,
     session_source_type,
     SCOPE_ADDED_REASON,
+    SCOPE_ADDED_REASON_FL_CDC,
+    SCOPE_ADDED_REASON_PG_SUFFIX,
+    SCOPE_ADDED_QUARANTINED_REASON,
+    CDC_NOT_ADDABLE_REASON,
+    cdc_addition_has_start_point,
+    cdc_not_addable_refusal,
     full_load_scope_names,
     scope_change,
     scope_full_load_job,
+    scoped_full_load_view,
     scope_notice,
     FullLoadCompleteness,
     FullLoadTableRow,
@@ -79,6 +86,17 @@ _LOGGER = logging.getLogger(__name__)
 
 # How often the live Full Load progress region polls the background job (seconds).
 _POLL_INTERVAL_SECONDS = 1.5
+
+# G17: why a Full load + CDC table selected after its Full Load is forced to Drop & reload
+# (rendered as "{table}: {reason}."). True on both engines: the tool cannot tell how old the
+# rows are -- older than the Full Load's start point (MySQL replays only the changes since
+# then) or than the table's publication join (PostgreSQL streams only the changes since
+# then) -- and an append keeps every row already there.
+_ADDITION_FORCED_REASON = (
+    "selected after the Full Load, and Aurora DSQL already holds rows in it that may predate "
+    "the changes CDC captures for it (an append keeps every row already there), so it is "
+    "dropped and reloaded"
+)
 
 
 def _call_or(provider, default):
@@ -311,7 +329,8 @@ def _render_overlay_blocks(
     the unreadable-record error with [Retry], the could-not-read-the-target warning, and --
     re-rendered with the reload choice and, in a checklist, with the ticked tables -- the
     NULL line, the exact ALTERs and the forced tables with their reasons; then the CDC-live
-    append warnings."""
+    append warnings. With no overlay (``ov`` empty) only a G17 addition can be forced, so
+    only that notice is drawn."""
     view = ov.get("view")
     outcome = ov.get("outcome")
     facts = ov.get("facts")
@@ -499,11 +518,12 @@ def _render_full_load_step(
     and the applied conversions, which the caller owns; the confirm dialog discloses
     whichever of them the current action covers.
     """
-    # G12: in Full load only the table set can change after the load (G16: in Full load +
-    # CDC it can drop tables until CDC starts, and the view stays removal-only after that).
-    # Every chunk-driven read below follows the CURRENT selection through a scoped view of
-    # the record (the record itself whenever nothing changed); the watermark and the
-    # error-log download keep the real record.
+    # G12: in Full load only the table set can change after the load (G16/G17: in Full load
+    # + CDC it can drop and add tables until CDC starts -- an added one stays unfinished
+    # until its guarded load extends the watermark's coverage -- and the view is
+    # removal-only after that). Every chunk-driven read below follows the CURRENT selection
+    # through a scoped view of the record (the record itself whenever nothing changed); the
+    # watermark and the error-log download keep the real record.
     _record_job = job
 
     def _scoped(record):
@@ -511,13 +531,37 @@ def _render_full_load_step(
             # Never scoped (scope_full_load_job returns it as is): skip the predicate's job
             # read, which every running-poll tick would otherwise pay for nothing.
             return record
-        return scope_full_load_job(
-            record,
-            full_load_scope_names(migration_state, job_manager, selected_names, job=record),
-        )
+        return scoped_full_load_view(migration_state, job_manager, selected_names, job=record)
 
     job = _scoped(job)
     _added, _removed = scope_change(_record_job, job)
+    # G17: the Full load + CDC tables the watermark does not cover yet (the "added" half
+    # there, whatever the record holds for them), the ones a guarded Retry cannot add
+    # (MySQL, no start-point definition recorded), and whether their load first joins
+    # them to CDC's publication (PostgreSQL with the load's slot).
+    _engine = session_source_type(session)
+    _pending: "list[str]" = []
+    _not_addable: "list[str]" = []
+    _pg_publication = False
+    if (
+        getattr(migration_state, "migration_type", None) is MigrationType.FULL_LOAD_AND_CDC
+        and _record_job is not None
+        and getattr(_record_job, "status", None) not in ("PENDING", "RUNNING")
+    ):
+        from dsql_migrator.ui.data_migration._cdc_monitoring import fl_cdc_pending_additions
+
+        _pending = fl_cdc_pending_additions(
+            migration_state, job_manager, selected_names, job=_record_job
+        )
+        _added = list(_pending)
+        _record_wm = getattr(_record_job, "watermark", None)
+        _not_addable = [
+            n for n in _pending
+            if not cdc_addition_has_start_point(_record_wm, n, _engine)
+        ]
+        _pg_publication = _engine is SourceType.POSTGRES and bool(
+            getattr(_record_wm, "slot_name", None)
+        )
     ui.label("Workloads to migrate").classes("text-sm font-semibold")
     ui.label(format_selected_workloads(selected_names)).classes(
         "text-sm text-gray-600"
@@ -544,6 +588,7 @@ def _render_full_load_step(
     def _open_confirm_dialog_now(
         *, action_tables, on_confirm, title, table_reasons=None,
         preselect=True, checklist_hint=None, overlay=None, on_retry=None,
+        addition_forced=None,
     ) -> None:
         """Build + open the Full-Load confirm dialog in the TOP-LEVEL client.
 
@@ -568,6 +613,12 @@ def _render_full_load_step(
         set is every loaded table and pre-checking all of them would offer a
         full re-load behind a button that says the opposite. ``checklist_hint``
         replaces the retry-specific instruction line for that case.
+
+        ``addition_forced`` (G17: ``{table: reason}``) names the Full load + CDC tables
+        selected after the Full Load that the probe found holding rows: they are dropped and
+        reloaded whatever the Append / Drop choice says (the rows may predate the changes
+        CDC captures for the table, and an append keeps them), exactly like the overlay's
+        forced tables.
         """
         from nicegui import context as _ctx
 
@@ -607,6 +658,8 @@ def _render_full_load_step(
         _ov = overlay or {}
         _outcome = _ov.get("outcome")
         forced = dict(getattr(_outcome, "forced", {}) or {}) if not cdc_live_now else {}
+        _addition_forced = dict(addition_forced or {}) if not cdc_live_now else {}
+        forced.update(_addition_forced)
         ledger_error = bool(_ov.get("ledger_error"))
         # The populated tables the operator still CHOOSES for (the forced ones are not a
         # choice: the NULL contract needs them dropped and reloaded).
@@ -716,7 +769,10 @@ def _render_full_load_step(
 
                 for _tone, _note in start_dialog_exclusion_notes(migration_state):
                     inline_hint(ui, _note, tone=_tone)
-                if overlay is not None:
+                # Without an overlay too when a G17 addition is forced: the overlay blocks then
+                # draw only the forced-table notice -- the same one, re-rendered with the
+                # checklist ticks, so an unticked table is never announced as dropped.
+                if overlay is not None or _addition_forced:
                     _render_overlay_blocks(
                         ui, _ov, action_tables=action_tables, forced=forced,
                         recreate_now=recreate_now, radio_tables=radio_tables,
@@ -948,6 +1004,7 @@ def _render_full_load_step(
         table_reasons=None,
         preselect=True,
         checklist_hint=None,
+        cdc_additions=frozenset(),
     ) -> None:
         """Probe which target tables hold data, then open the confirm dialog.
 
@@ -961,6 +1018,9 @@ def _render_full_load_step(
         (Retry-failed / scoped Reload) turns the dialog into a per-table checklist and
         makes ``on_confirm`` receive the checked subset; ``preselect=False`` starts that
         checklist empty and ``checklist_hint`` replaces its instruction line.
+        ``cdc_additions`` (G17: the Full load + CDC tables the watermark does not cover yet,
+        as the step rendered them) -- each the probe finds holding rows is forced to Drop &
+        reload (an empty one appends).
         """
         if _confirm_busy["value"]:
             return  # a probe is already in flight -> ignore the extra click
@@ -1107,6 +1167,16 @@ def _render_full_load_step(
             if view is not None:
                 # The overlay this dialog discloses; the run refuses to start with another.
                 migration_state.set_overlay_disclosed(view.overlay_by_table)
+            # G17: a table selected after a Full load + CDC Full Load loads only into an
+            # EMPTY table: rows already there may predate the changes CDC captures for it
+            # (the load inserts ON CONFLICT DO NOTHING, so they would stay), so it is
+            # dropped and reloaded. An empty one appends (no needless DROP); the engine
+            # re-checks before loading.
+            addition_forced = {
+                t: _ADDITION_FORCED_REASON
+                for t in action_tables
+                if t in (cdc_additions or ()) and t in migration_state.tables_with_data
+            }
             if overlay_active:
                 outcome = None
                 if not ledger_error:
@@ -1124,17 +1194,21 @@ def _render_full_load_step(
                         recreated_unfinished=view.recreated_unfinished,
                         index_ddls_for=view.index_ddls_for,
                     )
-                    migration_state.set_exclusion_forced_replace(outcome.forced)
+                    migration_state.set_exclusion_forced_replace(
+                        {**dict(outcome.forced), **addition_forced}
+                    )
                 overlay_info = {
                     "outcome": outcome, "ledger_error": ledger_error,
                     "probe_failed": probe_failed, "facts": facts, "view": view,
                 }
+            elif addition_forced:
+                migration_state.set_exclusion_forced_replace(addition_forced)
 
             async def _retry() -> None:
                 await _open_full_load_confirm(
                     None, probe_tables=action_tables, on_confirm=confirm_action,
                     title=title, table_reasons=table_reasons, preselect=preselect,
-                    checklist_hint=checklist_hint,
+                    checklist_hint=checklist_hint, cdc_additions=cdc_additions,
                 )
 
             _open_confirm_dialog_now(
@@ -1146,6 +1220,7 @@ def _render_full_load_step(
                 checklist_hint=checklist_hint,
                 overlay=overlay_info,
                 on_retry=_retry,
+                addition_forced=addition_forced,
             )
         finally:
             _confirm_busy["value"] = False
@@ -1182,6 +1257,7 @@ def _render_full_load_step(
             probe_tables=[table_name],
             on_confirm=lambda n=table_name: reload_table(n),
             title=f"Reload {table_name}?",
+            cdc_additions=frozenset(_pending),
         )
 
     # The watermark, object browser, prerequisites, and buttons are STATIC: they
@@ -1234,6 +1310,7 @@ def _render_full_load_step(
             lob_candidates_for=lob_candidates_for,
             exclusion_route=exclusion_route,
             exclusion_route_block=exclusion_route_block,
+            cdc_uncaptured=frozenset(_pending),
             source_type=session_source_type(session),
             # Reload/Retry need a LIVE source+target (the source password is not restored
             # after a session restore, Property 7). connection_ready() reflects "verified
@@ -1317,9 +1394,10 @@ def _render_full_load_step(
 
     def _poll_scoped(current) -> bool:
         """The terminal poll for a set changed after the load (Full load only, G12; Full
-        load + CDC narrowed, G16): the CURRENT set decides (:func:`full_load_step_for_scope`),
-        e.g. a DONE retry with a selected table still not loaded is not a DONE step, and a
-        failed retry whose failures lie only in unticked tables is. Writes the step,
+        load + CDC narrowed or grown before CDC starts, G16/G17): the CURRENT set decides
+        (:func:`full_load_step_for_scope`), e.g. a DONE retry with a selected table still
+        not loaded is not a DONE step, and a failed retry whose failures lie only in
+        unticked tables is. Writes the step,
         refreshes and returns True; False (an unchanged set) leaves the poll's own mapping
         to run."""
         view = _scoped(current)
@@ -1446,6 +1524,9 @@ def _render_full_load_step(
         blocked_by=guard_reason if _added else None,
         cdc=getattr(migration_state, "migration_type", None)
         is MigrationType.FULL_LOAD_AND_CDC,
+        pending=_pending if _pending else None,
+        not_addable=_not_addable,
+        pg=_pg_publication,
     )
     if _notice is not None and status is not StepStatus.IN_PROGRESS:
         render_notice(ui, tone=_notice[0], header=_notice[1], body=_notice[2])
@@ -1670,17 +1751,35 @@ def _render_full_load_step(
                         c.chunk_id for c in job.chunks if c.status == "PENDING"
                     }
 
+                    _view_chunks = {c.chunk_id: c for c in job.chunks}
+                    # Sets built once: _reason_for runs for every unfinished table, and a
+                    # list scan per name was quadratic at a large table count.
+                    _not_addable_set = set(_not_addable)
+                    _pending_set = set(_pending)
+                    _added_set = set(_added)
+
                     def _reason_for(name: str) -> str:
+                        # G17: a Full load + CDC table the watermark does not cover yet --
+                        # one Retry cannot add, or one whose load quarantined rows, says so
+                        # before any older failure message.
+                        if name in _not_addable_set:
+                            return CDC_NOT_ADDABLE_REASON
+                        if name in _pending_set and (
+                            getattr(_view_chunks.get(name), "rows_quarantined", 0) or 0
+                        ):
+                            return SCOPE_ADDED_QUARANTINED_REASON
                         msg = _failure_reasons.get(name, "")
                         if msg:
                             return msg
-                        if name in _added:
-                            # With a run guard the Confirm refuses it: say so on its row.
-                            return (
-                                f"{SCOPE_ADDED_REASON} {guard_reason}"
-                                if guard_reason
+                        if name in _added_set:
+                            base = (
+                                SCOPE_ADDED_REASON_FL_CDC
+                                + (SCOPE_ADDED_REASON_PG_SUFFIX if _pg_publication else "")
+                                if name in _pending_set
                                 else SCOPE_ADDED_REASON
                             )
+                            # With a run guard the Confirm refuses it: say so on its row.
+                            return f"{base} {guard_reason}" if guard_reason else base
                         if name in _pending_names:
                             return "Not loaded yet — the previous run ended first."
                         return ""
@@ -1698,6 +1797,7 @@ def _render_full_load_step(
                             on_confirm=retry_fn,
                             title=f"Retry {len(failed)} unfinished table(s)?",
                             table_reasons={n: _reason_for(n) for n in failed},
+                            cdc_additions=frozenset(_pending),
                         )
 
                     retry_btn = ui.button(
@@ -1707,11 +1807,16 @@ def _render_full_load_step(
                     ).props("color=primary")
                     # Every unfinished table selected after the load: with a run guard the
                     # click is CERTAIN to be refused (the same guard runs at the click), so
-                    # the button is disabled with it, as Re-run all tables is.
+                    # the button is disabled with it, as Re-run all tables is. The same for
+                    # Full load + CDC tables a guarded Retry cannot add (G17): only Re-run
+                    # all tables (a fresh start point) loads them.
                     _only_added = bool(_added) and set(failed) <= set(_added)
                     if connections_missing:
                         retry_btn.disable()
                         retry_btn.tooltip(reconnect_tip)
+                    elif _not_addable and set(failed) <= set(_not_addable):
+                        retry_btn.disable()
+                        retry_btn.tooltip(cdc_not_addable_refusal(_not_addable))
                     elif _only_added and guard_reason:
                         retry_btn.disable()
                         retry_btn.tooltip(guard_reason)
@@ -1740,8 +1845,8 @@ def _render_full_load_step(
                 # case after re-applying ONE table's schema on the Schema Conversion
                 # step, which drops and recreates it EMPTY -- had no control. The table
                 # picker is locked once a load has run (Full load only excepted, and Full
-                # load + CDC until CDC first starts, removals only, G16: there the set can
-                # change, but re-ticking a loaded table does not reload it), so
+                # load + CDC until CDC first starts, G16/G17: there the set can change,
+                # but re-ticking a loaded table does not reload it), so
                 # the only escape was a full
                 # "Re-run Full Load" over every table (a whole-source re-read) or Start
                 # over (discarding Evaluation, the conversion edits and the CDC inputs).
@@ -1915,13 +2020,15 @@ def _view_tables(job, view) -> "Optional[list[str]]":
 def full_load_step_for_scope(
     job, scoped, *, accepted: bool, error_log
 ) -> "Optional[StepStatus]":
-    """The Data Migration step status the CURRENT table set earns (G12, G16). Pure.
+    """The Data Migration step status the CURRENT table set earns (G12, G16, G17). Pure.
 
     For an unchanged set (``scoped is job``) this is exactly the live poll's mapping: the
     job's status, with an accepted quarantine-only gap counting as DONE. After a set
-    change in Full load only (or a Full load + CDC set narrowed after its load, G16 -- a
-    removal-only view), the view decides instead: a selected table not loaded
-    (unsettled) or an unaccepted quarantine in it is FAILED; a DONE job is DONE; a failed
+    change in Full load only (or a Full load + CDC set changed after its load before CDC
+    starts: tables dropped, G16, or added, G17 -- an added table the watermark does not
+    cover yet is presented PENDING until its guarded load extends the coverage), the view
+    decides instead: a selected table not loaded (unsettled) or an unaccepted quarantine in
+    it is FAILED; a DONE job is DONE; a failed
     or cancelled job is DONE only when its unfinished work lies entirely in tables no
     longer selected -- a run-level failure or a cancel with every chunk loaded stays
     FAILED. ``None`` while the job runs.
@@ -2273,6 +2380,10 @@ def _render_full_load_progress(
     lob_candidates_for: Optional[Callable[[str], Sequence[tuple[str, str]]]] = None,
     exclusion_route: Optional[Callable[[str, str], None]] = None,
     exclusion_route_block: Optional[str] = None,
+    # Full load + CDC (G17): the tables CDC does not capture yet (selected after the Full
+    # Load). Change & reload never drops one -- its next load on this step applies the rule
+    # -- so their "Exclude column & reload" tooltip says that instead.
+    cdc_uncaptured: "frozenset[str]" = frozenset(),
     # The source engine, used ONLY to pre-tick the right column in the exclude dialog
     # (PG -> DSQL is the identity for these types, MySQL is not). Optional so a caller
     # without a session keeps the MySQL default.
@@ -2598,9 +2709,14 @@ def _render_full_load_progress(
                 label,
                 on_click=lambda _e=None, n=table_name, r=reason_text: exclusion_route(n, r),
             ).props(props).tooltip(
-                "Open Exclude tables & columns with a rule for the column that cannot fit; "
-                "its Change & reload drops and reloads this table so no row keeps a value "
-                "loaded under the old column set."
+                "Open Exclude tables & columns with a rule for the column that cannot fit. "
+                "CDC does not capture this table yet, so its Change & reload does not drop "
+                "it: Save stores the rule, and the table's next load on this step (Retry "
+                "unfinished tables) applies it."
+                if table_name in cdc_uncaptured
+                else "Open Exclude tables & columns with a rule for the column that cannot "
+                "fit; its Change & reload drops and reloads this table so no row keeps a "
+                "value loaded under the old column set."
             )
 
         return _btn

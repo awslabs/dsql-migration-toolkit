@@ -32,8 +32,10 @@ plus a pointer to the chapter that covers it in depth.
       a read-capable user is enough. The single exception is **PostgreSQL CDC**: at
       the Full Load consistency point the tool creates — and at teardown drops — a
       logical replication slot and a publication scoped to exactly the migrated
-      tables (auto-committed, restricted to a small allowlist, audited). These are
-      the only writes the tool ever makes to any source.
+      tables. It also sets `REPLICA IDENTITY FULL` on a re-keyed table and, in Full
+      load + CDC before CDC starts, adds a table selected after the Full Load to that
+      publication (auto-committed, restricted to a small allowlist, audited). These
+      are the only writes the tool ever makes to any source.
       → [§1.1](01-setup.md#11-prerequisites)
 
 - [ ] **Two source engines are supported.** **RDS for MySQL** and **Aurora

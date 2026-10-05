@@ -12,8 +12,13 @@ Load to CDC gaplessly the tool must, ON THE SOURCE,
   2. create a **logical replication slot** (``pgoutput``) at the Full Load consistency
      point -- the slot pins the source WAL from its returned LSN until CDC consumes it,
 
-and DROP both on teardown. These are the only writes the tool ever issues to a source,
-so they are confined to this module, which:
+and DROP both on teardown. Around them it also sets ``REPLICA IDENTITY FULL`` on a
+re-keyed table (its before-image must carry the leading key column), repairs a
+publication's ``publish_via_partition_root``, and -- for a table selected after a Full
+load + CDC Full Load, before CDC starts (G17) -- adds that ONE table to the run's
+publication just before its copy, then takes one transaction ID to wait out the
+transactions open at that moment (:func:`take_xid_after_change`). These are the only
+writes the tool ever issues to a source, so they are confined to this module, which:
 
 - builds its OWN engine that deliberately does NOT install the read-only guard and runs
   in **AUTOCOMMIT** (``pg_create_logical_replication_slot`` cannot run inside a wrapping
@@ -31,13 +36,16 @@ so they are confined to this module, which:
 
 Slot/publication CREATION is wired at the Full Load consistency point
 (``_capture_postgres_watermark``); DROP is wired into CDC teardown BEFORE the source
-secret is deleted (a slot left behind pins WAL and can fill the source disk). Both are
-subsequent Phase-C wiring; this module is the primitive they call.
+secret is deleted (a slot left behind pins WAL and can fill the source disk); the one-table
+ADD and the wait are wired into a guarded Full load + CDC Retry
+(``BatchedTableMigrator.guard_cdc_additions``), before any snapshot of the retry opens.
+This module is the primitive they call.
 """
 
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from typing import Callable, Mapping, NamedTuple, Optional, Sequence
 
@@ -58,29 +66,62 @@ _MAX_SLOT_NAME = 63
 
 # The COMPLETE set of statement shapes this module may execute against the source. Every
 # write is asserted against this before running, so the un-guarded engine can only ever
-# perform these intended operations (create/drop slot, create/drop publication, and set a
-# re-keyed table's REPLICA IDENTITY FULL) plus the read-only existence checks. The ALTER
-# TABLE prefix is additionally constrained in ``_assert_allowed`` to the exact
-# ``... REPLICA IDENTITY FULL`` tail, so it can never DROP/rename a column.
+# perform these intended operations (create/drop slot, create/drop publication, add ONE
+# table to a publication, take a transaction ID, and set a re-keyed table's REPLICA
+# IDENTITY FULL) plus the read-only existence checks. The ALTER TABLE prefix is
+# additionally constrained in ``_assert_allowed`` to the exact ``... REPLICA IDENTITY FULL``
+# tail, so it can never DROP/rename a column; ALTER PUBLICATION and the xid read are pinned
+# to their exact shapes there too.
 _ALLOWED_WRITE_PREFIXES: tuple[str, ...] = (
     "CREATE PUBLICATION ",
     "DROP PUBLICATION ",
-    # Tail-constrained in ``_assert_allowed`` to the partition-root property flip, so it can
-    # never become SET TABLE / DROP TABLE / OWNER TO / RENAME. Needed because a publication
-    # DEBEZIUM created (publication.autocreate.mode=filtered) lands at PostgreSQL's default
-    # publish_via_partition_root=false, and there is no connector property to set it.
+    # Constrained in ``_assert_allowed`` to two shapes: the partition-root property flip
+    # (needed because a publication DEBEZIUM created -- publication.autocreate.mode=filtered
+    # -- lands at PostgreSQL's default publish_via_partition_root=false, and there is no
+    # connector property to set it) and ONE quoted table added (G17). Never SET TABLE /
+    # DROP TABLE / OWNER TO / RENAME / several tables / a column list / a row filter.
     "ALTER PUBLICATION ",
     "SELECT LSN FROM PG_CREATE_LOGICAL_REPLICATION_SLOT",
     "SELECT PG_DROP_REPLICATION_SLOT",
+    # Pinned to the exact statement (``_XID_STATEMENT``): it assigns this autocommit
+    # transaction an ID -- a write in PostgreSQL's terms, so a read-only engine refuses it.
+    "SELECT PG_CURRENT_XACT_ID",
     "ALTER TABLE ",
 )
 
-# The ONLY ALTER PUBLICATION this module may run.
+# The ONLY ALTER PUBLICATION ... SET this module may run.
 _PUBLICATION_VIA_ROOT_TAIL = " SET (PUBLISH_VIA_PARTITION_ROOT = TRUE)"
+# The ONLY ALTER PUBLICATION ... ADD TABLE: one sanitized publication name and ONE
+# double-quoted schema.table (a doubled quote is the escape), matched on the normalized
+# text. ONLY / * / a column list / WHERE / TABLES IN SCHEMA / a second table / a trailing
+# statement all fail the anchored match.
+_PUBLICATION_ADD_TABLE_RE = re.compile(
+    r'^ALTER PUBLICATION "[A-Z0-9_]+" ADD TABLE "(?:[^"]|"")+"\."(?:[^"]|"")+"$'
+)
+# The ONLY transaction-ID statement (normalized form).
+_XID_STATEMENT = "SELECT PG_CURRENT_XACT_ID()::TEXT"
 
 
 class PgReplicationError(RuntimeError):
     """A replication slot / publication create or drop failed on the source."""
+
+
+class PgPublicationMissingError(PgReplicationError):
+    """The publication a one-table add targets does not exist on the source (G17)."""
+
+
+class PgReplicaIdentityError(PgReplicationError):
+    """A one-table add was refused BEFORE any write (G17): the table has no replica identity
+    PostgreSQL accepts for UPDATE/DELETE once it is published (``cause``, the value-free
+    phrase of :func:`replica_identity_problem`), or whether it has one could not be read
+    (``unreadable``, ``cause`` None) -- fail closed, never "usable"."""
+
+    def __init__(
+        self, message: str, *, cause: Optional[str] = None, unreadable: bool = False
+    ) -> None:
+        super().__init__(message)
+        self.cause = cause
+        self.unreadable = unreadable
 
 
 @dataclass(frozen=True)
@@ -254,6 +295,134 @@ def read_rekeyed_replica_identity(
     return out
 
 
+class ReplicaIdentityUsability(NamedTuple):
+    """One table's live facts for "would publishing it make its UPDATE/DELETE fail?" (G17).
+
+    ``kind`` is ``pg_class.relkind`` ('r' a plain table, 'p' a partitioned one); ``identity``
+    its own ``relreplident``; ``usable`` whether PostgreSQL has a replica identity for its
+    UPDATE/DELETE once published (graded server-side by :func:`_identity_usable_sql`); and,
+    for a partitioned table, ``unusable_partitions`` how many LEAF partitions have none, at
+    most five of them named (sorted) in ``unusable_partition_names``. Value-free: names and
+    codes only.
+    """
+
+    kind: str
+    identity: str
+    usable: bool
+    unusable_partitions: int
+    unusable_partition_names: tuple
+
+
+def _identity_usable_sql(alias: str) -> str:
+    """Does relation ``alias`` keep a replica identity PostgreSQL accepts for UPDATE/DELETE
+    once published? The relcache's own rule (``RelationGetIndexList`` /
+    ``CheckCmdReplicaIdentity``): FULL; DEFAULT backed by a valid, immediate (not deferrable)
+    primary key; or USING INDEX backed by a valid, unique, immediate, non-partial identity
+    index. PostgreSQL does NOT reset ``relreplident`` when that key or index is dropped, so
+    the code alone proves nothing. Catalog only."""
+    return (
+        f"({alias}.relreplident = 'f' "
+        f"OR ({alias}.relreplident = 'd' AND EXISTS (SELECT 1 FROM pg_catalog.pg_index i "
+        f"WHERE i.indrelid = {alias}.oid AND i.indisprimary AND i.indisvalid "
+        f"AND i.indimmediate)) "
+        f"OR ({alias}.relreplident = 'i' AND EXISTS (SELECT 1 FROM pg_catalog.pg_index i "
+        f"WHERE i.indrelid = {alias}.oid AND i.indisreplident AND i.indisvalid "
+        f"AND i.indisunique AND i.indimmediate AND i.indpred IS NULL)))"
+    )
+
+
+# ONE catalog round trip for every named table, like the re-keyed read above: the leaves of a
+# partitioned table are graded and aggregated SERVER-side (a count plus at most five names).
+# PostgreSQL skips the check for a partitioned parent itself (the UPDATE/DELETE runs on the
+# leaf), so a parent is graded by its leaves -- plus its own NOTHING, which the prerequisite
+# also refuses. Catalog only: no table scan, no lock.
+_REPLICA_IDENTITY_USABLE_SQL = (
+    "SELECT n.nspname || '.' || c.relname AS qname, "
+    "       c.relkind::text AS kind, "
+    "       c.relreplident::text AS replident, "
+    f"      {_identity_usable_sql('c')} AS identity_usable, "
+    "       CASE WHEN c.relkind = 'p' THEN "
+    "         (SELECT count(*) "
+    "          FROM pg_catalog.pg_partition_tree(c.oid) t "
+    "          JOIN pg_catalog.pg_class l ON l.oid = t.relid "
+    f"         WHERE t.isleaf AND NOT {_identity_usable_sql('l')}) "
+    "       ELSE 0 END AS unusable_partitions, "
+    "       CASE WHEN c.relkind = 'p' THEN "
+    "         ARRAY(SELECT ln.nspname || '.' || l.relname "
+    "               FROM pg_catalog.pg_partition_tree(c.oid) t "
+    "               JOIN pg_catalog.pg_class l ON l.oid = t.relid "
+    "               JOIN pg_catalog.pg_namespace ln ON ln.oid = l.relnamespace "
+    f"              WHERE t.isleaf AND NOT {_identity_usable_sql('l')} "
+    "               ORDER BY 1 LIMIT 5) "
+    "       ELSE ARRAY[]::text[] END AS unusable_sample "
+    "FROM pg_catalog.pg_class c "
+    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "WHERE c.relkind IN ('r','p') "
+    "  AND n.nspname || '.' || c.relname = ANY(:names)"
+)
+
+
+def read_replica_identity_usability(
+    connection: object, names: Sequence[str]
+) -> "dict[str, ReplicaIdentityUsability]":
+    """Read whether each of ``names`` keeps a usable replica identity once published (G17).
+
+    One read-only catalog statement. Returns ``{qualified name: ReplicaIdentityUsability}``
+    for each plain or partitioned table found; a name absent from the result was not found
+    (the caller refuses it -- never graded usable). RAISES on failure, like
+    :func:`read_rekeyed_replica_identity`: unreadable is not evidence of anything.
+    """
+    wanted = sorted({str(n) for n in names or () if n})
+    if not wanted:
+        return {}
+    rows = connection.execute(  # type: ignore[attr-defined]
+        text(_REPLICA_IDENTITY_USABLE_SQL), {"names": wanted}
+    ).fetchall()
+    out: dict[str, ReplicaIdentityUsability] = {}
+    for row in rows:
+        out[str(row[0])] = ReplicaIdentityUsability(
+            kind=str(row[1]) if row[1] is not None else "",
+            identity=str(row[2]) if row[2] is not None else "",
+            usable=bool(row[3]),
+            unusable_partitions=max(int(row[4] or 0), 0),
+            unusable_partition_names=tuple(
+                str(v) for v in (row[5] or ()) if v is not None
+            )[:5],
+        )
+    return out
+
+
+def replica_identity_problem(read: ReplicaIdentityUsability) -> Optional[str]:
+    """Why publishing the table would make its UPDATE/DELETE fail on the source -- a short,
+    value-free phrase -- or ``None`` when it would not (G17). Pure.
+
+    A partitioned table is graded by its leaves (PostgreSQL enforces the LEAF's identity:
+    ``ALTER TABLE <parent>`` does not reach existing partitions) and by its own NOTHING.
+    """
+    if read.kind == "p":
+        if read.identity == "n":
+            return "REPLICA IDENTITY NOTHING"
+        count = read.unusable_partitions
+        if count <= 0:
+            return None
+        shown = ", ".join(read.unusable_partition_names)
+        more = (
+            f" and {count - len(read.unusable_partition_names)} more"
+            if count > len(read.unusable_partition_names)
+            else ""
+        )
+        return f"{count} of its partitions {'has' if count == 1 else 'have'} none: {shown}{more}"
+    if read.usable:
+        return None
+    if read.identity == "n":
+        return "REPLICA IDENTITY NOTHING"
+    if read.identity == "d":
+        return "REPLICA IDENTITY DEFAULT, but no valid primary key"
+    if read.identity == "i":
+        return "REPLICA IDENTITY USING INDEX, but that index is gone or not valid"
+    return "a REPLICA IDENTITY that PostgreSQL cannot use"
+
+
 REPLICA_IDENTITY_WEAK = "weak"
 REPLICA_IDENTITY_FULL = "full"
 REPLICA_IDENTITY_UNKNOWN = "unknown"
@@ -296,7 +465,10 @@ def grade_rekeyed_replica_identity(
 
 
 def build_pg_source_write_engine(
-    source_config: SourceConnectionConfig, password: Optional[SecretValue]
+    source_config: SourceConnectionConfig,
+    password: Optional[SecretValue],
+    *,
+    read_timeout_seconds: Optional[int] = None,
 ) -> Engine:
     """Build the dedicated, NON-read-only-guarded, AUTOCOMMIT PostgreSQL source engine.
 
@@ -305,7 +477,9 @@ def build_pg_source_write_engine(
     AUTOCOMMIT is required because ``pg_create_logical_replication_slot`` must not run
     inside a wrapping transaction. Refuses a non-PostgreSQL source (MySQL never writes
     the source). The password is revealed only here (Property 7), mirroring
-    ``make_source_engine_factory`` but WITHOUT the guard.
+    ``make_source_engine_factory`` but WITHOUT the guard. ``read_timeout_seconds`` sets the
+    dialect's ``statement_timeout`` (and keepalives), so a write that waits on a lock -- a
+    one-table ADD behind a VACUUM or an index build (G17) -- fails instead of hanging.
     """
     if source_config.source_type is not SourceType.POSTGRES:
         raise PgReplicationError(
@@ -326,9 +500,9 @@ def build_pg_source_write_engine(
     )
     # NB: deliberately NO install_read_only_guard here -- this is the sanctioned write
     # path. AUTOCOMMIT so pg_create_logical_replication_slot is not wrapped in a txn.
-    return create_engine(url, **dialect.engine_kwargs()).execution_options(
-        isolation_level="AUTOCOMMIT"
-    )
+    return create_engine(
+        url, **dialect.engine_kwargs(read_timeout_seconds=read_timeout_seconds)
+    ).execution_options(isolation_level="AUTOCOMMIT")
 
 
 def _assert_allowed(statement: str) -> None:
@@ -350,12 +524,18 @@ def _assert_allowed(statement: str) -> None:
             f"refused non-allowlisted ALTER TABLE (only REPLICA IDENTITY FULL): "
             f"{normalized[:60]!r}"
         )
-    if normalized.startswith("ALTER PUBLICATION ") and not normalized.endswith(
-        _PUBLICATION_VIA_ROOT_TAIL
+    if normalized.startswith("ALTER PUBLICATION ") and not (
+        normalized.endswith(_PUBLICATION_VIA_ROOT_TAIL)
+        or _PUBLICATION_ADD_TABLE_RE.match(normalized)
     ):
         raise PgReplicationError(
             "refused non-allowlisted ALTER PUBLICATION (only SET "
-            f"(publish_via_partition_root = true)): {normalized[:60]!r}"
+            "(publish_via_partition_root = true), or ADD TABLE of one quoted table): "
+            f"{normalized[:60]!r}"
+        )
+    if normalized.startswith("SELECT PG_CURRENT_XACT_ID") and normalized != _XID_STATEMENT:
+        raise PgReplicationError(
+            f"refused non-allowlisted transaction-ID read: {normalized[:60]!r}"
         )
 
 
@@ -728,6 +908,13 @@ def _verify_tables_replicable(connection: object, tables: Sequence[str]) -> None
     the publisher. relreplident 'n' (nothing) is refused; 'd'/'f'/'i' are usable ('d'
     relies on the primary key, which the prerequisite gate separately requires). Best-effort
     read: if relreplident is unreadable the table is not blocked here (the prereq owns that).
+
+    Only the Full Load's own ``CREATE PUBLICATION`` (:func:`provision_pg_replication`) uses
+    this lenient check, whose prerequisite run precedes the load. A one-table ADD after a Full
+    Load (:func:`add_table_to_publication`, G17 -- including the ADDs a reused publication
+    gets in :func:`create_publication`) cannot lean on that: the primary key the prerequisite
+    reads is the Step 1 inventory's, which can predate a dropped key. It runs the strict,
+    fail-closed :func:`_verify_table_publishable` instead.
     """
     names = list(tables)
     if not names:
@@ -752,6 +939,210 @@ def _verify_tables_replicable(connection: object, tables: Sequence[str]) -> None
         )
 
 
+def _verify_table_publishable(connection: object, table: str, *, publication: str) -> None:
+    """Raise :class:`PgReplicaIdentityError` unless ``table`` keeps a replica identity
+    PostgreSQL accepts for UPDATE/DELETE once published (G17) -- FAIL CLOSED.
+
+    The last line before a one-table ADD to a publication that publishes UPDATE and DELETE:
+    without a usable identity every UPDATE/DELETE on the table then fails on the source, and
+    nothing removes the member afterwards. One catalog read
+    (:func:`read_replica_identity_usability`, the relcache's rule: a valid primary key behind
+    DEFAULT, a valid identity index behind USING INDEX, FULL, and every leaf of a partitioned
+    table). An unreadable answer, or a table not found, refuses too: unreadable is not
+    usable.
+    """
+    try:
+        reads = read_replica_identity_usability(connection, [table])
+    except Exception as exc:  # noqa: BLE001 - unreadable is not usable
+        raise PgReplicaIdentityError(
+            f'cannot add {table} to publication "{publication}": whether it has a usable '
+            f"REPLICA IDENTITY could not be read ({type(exc).__name__}); it was not added",
+            unreadable=True,
+        ) from exc
+    read = reads.get(table)
+    if read is None:
+        raise PgReplicaIdentityError(
+            f'cannot add {table} to publication "{publication}": it was not found on the '
+            "source as a table, so its REPLICA IDENTITY could not be checked; it was not "
+            "added",
+            unreadable=True,
+        )
+    problem = replica_identity_problem(read)
+    if problem:
+        raise PgReplicaIdentityError(
+            f'cannot add {table} to publication "{publication}": it has no usable REPLICA '
+            f"IDENTITY ({problem}), so every UPDATE and DELETE on it would fail on the "
+            "source once published. Give it a primary key, or set REPLICA IDENTITY FULL "
+            "(on each partition of a partitioned table), then retry.",
+            cause=problem,
+        )
+
+
+def pg_sqlstate(exc: BaseException) -> Optional[str]:
+    """The SQLSTATE a PostgreSQL error carries, or ``None``. Looks at the exception, the
+    driver error SQLAlchemy wraps (``.orig``) and the cause (psycopg 3 ``sqlstate``, psycopg 2
+    ``pgcode``). Pure."""
+    for candidate in (exc, getattr(exc, "orig", None), getattr(exc, "__cause__", None)):
+        if candidate is None:
+            continue
+        code = getattr(candidate, "sqlstate", None) or getattr(candidate, "pgcode", None)
+        if code:
+            return str(code)
+    return None
+
+
+def _publication_membership(connection: object, name: str) -> "Optional[tuple[bool, set]]":
+    """``(for_all_tables, members)`` of publication ``name`` (read-only), or ``None`` when it
+    does not exist. ``members`` is the EFFECTIVE membership rolled up to each partition root
+    when ``publish_via_partition_root`` is false (the same roll-up
+    :func:`read_pg_replication_objects` applies), so a registered partitioned parent reads
+    as a member either way."""
+    row = connection.execute(  # type: ignore[attr-defined]
+        text("SELECT puballtables, pubviaroot FROM pg_publication WHERE pubname = :name"),
+        {"name": name},
+    ).first()
+    if row is None:
+        return None
+    members = publication_tables(connection, name)
+    if row[1] is False and members:
+        roots = _partition_roots(connection)
+        members = {roots.get(member, member) for member in members}
+    return bool(row[0]), members
+
+
+def add_table_to_publication(
+    connection: object,
+    *,
+    name: str,
+    table: str,
+    on_log: Optional[Callable[[str], None]] = None,
+) -> bool:
+    """Add ONE table to publication ``name``; return whether this call added it (G17).
+
+    ``ALTER PUBLICATION "<name>" ADD TABLE <one quoted table>`` -- the one shape the
+    allowlist accepts. Idempotent: a member (read first, rolled up to the partition root),
+    a ``FOR ALL TABLES`` publication, or a concurrent add that lost the race (SQLSTATE
+    42710, already a member) issues no further write and returns False. A table with no
+    replica identity PostgreSQL accepts for UPDATE/DELETE -- NOTHING, DEFAULT with no valid
+    primary key, USING INDEX whose index is gone, or such a leaf partition -- is refused
+    BEFORE any write with :class:`PgReplicaIdentityError` (:func:`_verify_table_publishable`:
+    publishing it would make its UPDATE/DELETE fail on the source), and so is one whose
+    identity cannot be read (fail closed). An absent publication raises
+    :class:`PgPublicationMissingError`; any other failure propagates (the caller grades it by
+    SQLSTATE). The audit line is written after the ADD commits (AUTOCOMMIT).
+
+    pgoutput decodes a table's changes only from when it is a publication member, so a
+    table added for a load must be added BEFORE its copy starts, and its copy may start only
+    once every transaction open at the add has ended (:func:`take_xid_after_change`,
+    :func:`wait_for_transactions_before`).
+    """
+    membership = _publication_membership(connection, name)
+    if membership is None:
+        raise PgPublicationMissingError(f"publication {name} does not exist on the source")
+    for_all, members = membership
+    if for_all or table in members:
+        if on_log is not None:
+            on_log(f'{table} is already in publication "{name}"; not added again')
+        return False
+    _verify_table_publishable(connection, table, publication=name)
+    dialect = dialect_for(SourceType.POSTGRES)
+    ident = _sanitize(name)
+    try:
+        _run_write(
+            connection,
+            f'ALTER PUBLICATION "{ident}" ADD TABLE {dialect.quote_table(table)}',
+            action=(
+                f'added {table} to publication "{ident}" (selected after the Full Load; '
+                "its changes stream from now on)"
+            ),
+            on_log=on_log,
+        )
+    except Exception as exc:
+        if pg_sqlstate(exc) == "42710":  # duplicate_object: already a member
+            if on_log is not None:
+                on_log(f'{table} is already in publication "{name}"; not added again')
+            return False
+        raise
+    return True
+
+
+def take_xid_after_change(
+    connection: object, *, on_log: Optional[Callable[[str], None]] = None
+) -> str:
+    """Take one transaction ID right after a publication change and return it (G17).
+
+    ``SELECT pg_current_xact_id()::text`` (PostgreSQL 13+) in its own AUTOCOMMIT
+    transaction: the ID is assigned after the change committed, so it is greater than the ID
+    of every transaction that could have written before it -- what
+    :func:`wait_for_transactions_before` waits out. It assigns an ID, so it goes through the
+    allowlisted write path and is audited like one.
+    """
+    result = _run_write(
+        connection,
+        "SELECT pg_current_xact_id()::text",
+        action=(
+            "took a transaction id after the publication change, to wait for the "
+            "transactions open then"
+        ),
+        on_log=on_log,
+    )
+    row = result.first()
+    if row is None or row[0] is None:
+        raise PgReplicationError("pg_current_xact_id() returned no transaction id")
+    value = str(row[0]).strip()
+    if not value.isdigit():
+        raise PgReplicationError("pg_current_xact_id() returned an unexpected value")
+    return value
+
+
+# The wait's outcomes (:func:`wait_for_transactions_before`).
+WAIT_DONE = "done"
+WAIT_CANCELLED = "cancelled"
+WAIT_TIMEOUT = "timeout"
+
+
+def wait_for_transactions_before(
+    connection: object,
+    xid: str,
+    *,
+    timeout_seconds: float = 600.0,
+    poll_seconds: float = 5.0,
+    heartbeat: Optional[Callable[[], None]] = None,
+    cancelled: Optional[Callable[[], bool]] = None,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> "tuple[str, float]":
+    """Wait until every transaction with an ID below ``xid`` has ended (G17).
+
+    Polls ``pg_snapshot_xmin(pg_current_snapshot()) >= xid`` -- the OLDEST transaction
+    still running, so a long-running one keeps the wait going -- every ``poll_seconds``,
+    heartbeating each time, for at most ``timeout_seconds``. (Not ``pg_snapshot_xmax``: a
+    transaction still running can have an ID at or above it.) Returns ``(outcome,
+    seconds)``: :data:`WAIT_DONE`, :data:`WAIT_CANCELLED` (``cancelled()`` turned True) or
+    :data:`WAIT_TIMEOUT` (an idle-in-transaction session, a long batch, or an uncommitted
+    prepared transaction). Reads only -- never the write path. RAISES
+    :class:`PgReplicationError` when the read fails: unreadable is not "finished".
+    """
+    started = clock()
+    statement = text("SELECT pg_snapshot_xmin(pg_current_snapshot()) >= CAST(:xid AS xid8)")
+    while True:
+        try:
+            row = connection.execute(statement, {"xid": str(xid)}).first()  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001 - re-raised as the module's error
+            raise PgReplicationError(
+                f"could not read the source's running transactions ({type(exc).__name__})"
+            ) from exc
+        if heartbeat is not None:
+            heartbeat()
+        if row is not None and bool(row[0]):
+            return WAIT_DONE, clock() - started
+        if cancelled is not None and cancelled():
+            return WAIT_CANCELLED, clock() - started
+        if clock() - started >= timeout_seconds:
+            return WAIT_TIMEOUT, clock() - started
+        sleep(poll_seconds)
+
+
 def create_publication(
     connection: object,
     *,
@@ -766,13 +1157,18 @@ def create_publication(
     write outage). ``tables`` are qualified ``schema.table`` names, quoted via the PG
     dialect. PostgreSQL has no ``CREATE PUBLICATION IF NOT EXISTS``, so existence is checked
     first. On reuse the existing publication's table set is RECONCILED against ``tables``:
-    a publication MISSING a requested table (e.g. a table added on a re-run) is refused
-    loudly rather than silently leaving the new table unreplicated -- pgoutput only streams
-    a publication's members. One that COVERS every requested table and lists more (a Full
-    load + CDC re-run over a set narrowed after its first load, G16) is reused as is, with
-    no write: the connector's ``table.include.list`` -- not the publication -- defines what
-    CDC captures, so the extra members are decoded and filtered out. Changing it would be a
-    source write the tool does not need.
+    a requested table it does not list (e.g. a table added before a Re-run over a grown set,
+    G17) is ADDED, one audited ``ADD TABLE`` each (:func:`add_table_to_publication`, which
+    first refuses -- raises -- a table whose UPDATE/DELETE publishing would break) --
+    never left unreplicated (pgoutput only streams a publication's members), and never by
+    dropping the publication. :func:`provision_pg_replication` then creates the new slot,
+    whose creation waits out the transactions open at that moment, so its consistent point
+    decodes every change after it. One that COVERS every requested table and lists more (a
+    Full load + CDC re-run over a set narrowed after its first load, G16) is reused as is,
+    with no write: the connector's ``table.include.list`` -- not the publication -- defines
+    what CDC captures, so the extra members are decoded and filtered out. A reused
+    publication returns False (the compensation in :func:`provision_pg_replication` never
+    drops it).
 
     Created ``WITH (publish_via_partition_root = true)``, which is REQUIRED for a
     partitioned source table and harmless otherwise. PostgreSQL's default is ``false``:
@@ -791,14 +1187,10 @@ def create_publication(
     if publication_exists(connection, name):
         existing = _publication_tables(connection, name)
         requested = {str(t) for t in tables}
-        if not requested <= existing:
-            raise PgReplicationError(
-                f"publication {name} already exists but covers {sorted(existing)}, not "
-                f"the requested {sorted(requested)}. pgoutput only streams a publication's "
-                "member tables, so reusing it would silently skip the difference. Drop it "
-                f'(DROP PUBLICATION IF EXISTS "{_sanitize(name)}") and re-run, or align the '
-                "table selection."
-            )
+        for table in sorted(requested - existing):
+            # A requested table the publication does not list yet: added, never skipped
+            # (pgoutput would stream nothing for it) and never by dropping the publication.
+            add_table_to_publication(connection, name=name, table=table, on_log=on_log)
         if on_log is not None:
             extra = sorted(existing - requested)
             on_log(
@@ -936,7 +1328,8 @@ def provision_pg_replication(
     Ordering: set REPLICA IDENTITY FULL on the re-keyed tables FIRST (so every change WAL
     from the slot's LSN onward carries the full before-image the re-keyed DELETE needs),
     then the publication (what pgoutput may decode -- the connector's table.include.list
-    defines the capture within it, so a reused publication that lists more is fine, G16),
+    defines the capture within it, so a reused publication that lists more is fine, G16,
+    and a reused one missing a requested table gets it added, one ``ADD TABLE`` each, G17),
     then the slot (whose returned consistent-point LSN pins WAL from here). A stale slot
     from a prior run is dropped first so the new slot's LSN matches THIS Full Load's
     snapshot -- safe because slot creation runs at Full Load time, before any CDC connector
@@ -1013,6 +1406,8 @@ def deprovision_pg_replication(
 
 __all__ = [
     "PgReplicationError",
+    "PgPublicationMissingError",
+    "PgReplicaIdentityError",
     "PgReplicationHandles",
     "pg_slot_name",
     "pg_publication_name",
@@ -1020,6 +1415,9 @@ __all__ = [
     "RekeyedIdentityRead",
     "read_rekeyed_replica_identity",
     "grade_rekeyed_replica_identity",
+    "ReplicaIdentityUsability",
+    "read_replica_identity_usability",
+    "replica_identity_problem",
     "REPLICA_IDENTITY_WEAK",
     "REPLICA_IDENTITY_FULL",
     "REPLICA_IDENTITY_UNKNOWN",
@@ -1034,6 +1432,13 @@ __all__ = [
     "read_pg_replication_objects",
     "pg_replication_objects_blocker",
     "create_publication",
+    "pg_sqlstate",
+    "add_table_to_publication",
+    "take_xid_after_change",
+    "wait_for_transactions_before",
+    "WAIT_DONE",
+    "WAIT_CANCELLED",
+    "WAIT_TIMEOUT",
     "create_replication_slot",
     "drop_replication_slot",
     "drop_publication",

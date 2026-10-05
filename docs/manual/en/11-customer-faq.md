@@ -26,10 +26,12 @@ the path is **MySQL → PostgreSQL dialect → DSQL constraints**, and from Post
 is a **near-identity PG → DSQL** path (both are PostgreSQL-16-wire). DSQL is
 PostgreSQL-wire-compatible, distributed, serverless, and IAM-authenticated.
 
-The **source is read-only the entire time.** The only write the tool ever makes to
-any source is, for a **PostgreSQL source using CDC**, creating (and at teardown
+The **source is read-only the entire time.** The only writes the tool ever makes to
+any source are, for a **PostgreSQL source using CDC**, creating (and at teardown
 dropping) a logical replication slot and a publication scoped to exactly the migrated
-tables — an autocommit, allowlisted, audited operation. A MySQL source (and a
+tables, setting `REPLICA IDENTITY FULL` on a re-keyed table, and adding a table
+selected after the Full Load to that publication (Full load + CDC, before CDC
+starts) — each an autocommit, allowlisted, audited operation. A MySQL source (and a
 PostgreSQL Full-Load-only migration) is never written.
 
 

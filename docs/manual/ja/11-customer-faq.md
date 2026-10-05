@@ -26,8 +26,9 @@ Amazon **RDS / Aurora MySQL または PostgreSQL → Amazon Aurora DSQL**、単�
 
 **ソースは全工程を通じて読み取り専用** です。本ツールがいずれかのソースに書き込む唯一の例外は、**CDC を使う
 PostgreSQL ソース** の場合で、Full Load の一貫性地点で、移行対象のテーブルに正確にスコープした論理
-レプリケーションスロットと publication を作成（そして teardown 時に削除）します — autocommit で、allowlist に
-限定され、監査される操作です。MySQL ソース（および Full Load のみの PostgreSQL 移行）には一切書き込みません。
+レプリケーションスロットと publication を作成（そして teardown 時に削除）し、再キー化したテーブルに
+`REPLICA IDENTITY FULL` を設定し、Full Load の後に選択したテーブルをその publication に追加します（Full
+load + CDC、CDC を開始する前）— いずれも autocommit で、allowlist に限定され、監査される操作です。MySQL ソース（および Full Load のみの PostgreSQL 移行）には一切書き込みません。
 
 
 **Q2. Aurora DSQL は私のソースエンジン（Aurora MySQL / PostgreSQL）のドロップイン代替になりますか？**

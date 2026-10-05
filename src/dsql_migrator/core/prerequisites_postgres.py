@@ -1142,6 +1142,8 @@ def check_cdc_replication_objects(
     *,
     provisions_replication: bool,
     cdc_start_resnapshots: bool = False,
+    pending_tables: Sequence[str] = (),
+    _scope: str = "selected tables",
 ) -> PrerequisiteResult:
     """Do CDC's publication + replication slot EXIST? Distinct from the PRIVILEGE check.
 
@@ -1175,6 +1177,18 @@ def check_cdc_replication_objects(
     final PASS: present objects mean nothing is MISSING, NOT that this start resumes from the
     slot. ``pg_snapshot_mode`` keys ``never`` on the slot RECORDED on this run's watermark,
     never on the slot found on the source, so only that branch may promise a resume.
+
+    ``pending_tables`` (G17: selected tables a Full load + CDC Full Load did not load, whose
+    guarded load -- Retry unfinished tables -- adds each to this publication before its copy
+    starts) are not counted as missing from it, so this row cannot hold the very Retry that
+    adds them; the passing detail says so. A CAPTURED table missing from the publication
+    still FAILs, and the ownership and REPLICA IDENTITY rows keep grading the pending ones.
+    The rest of the selection is graded as "the selected tables CDC captures now"
+    (``_scope``, private), so its count never reads as the whole selection's, and with no
+    such table left the row says the publication "exists" instead of "covers all 0". The
+    pending sentence is added only where their guarded load CAN add them -- a usable slot
+    and a publication that publishes every change type; otherwise the row already blocks or
+    warns, and their load would refuse them.
     """
     title = "CDC's publication and replication slot exist on the source"
     if provisions_replication:
@@ -1284,8 +1298,32 @@ def check_cdc_replication_objects(
                 "both connectors are billed from creation. " + gapless_note + resnapshot_note
             ),
         )
+    published = set(facts.publication_tables or ())
+    _names = {t.name for t in tables}
+    pending = [
+        n for n in dict.fromkeys(str(t) for t in pending_tables or ())
+        if n in _names and n not in published
+    ]
+    if pending:
+        # Graded over the other selected tables -- the ones CDC captures now -- then the
+        # pending ones named (G17), where their load can add them.
+        pending_set = set(pending)
+        result = check_cdc_replication_objects(
+            facts,
+            [t for t in tables if t.name not in pending_set],
+            provisions_replication=provisions_replication,
+            cdc_start_resnapshots=cdc_start_resnapshots,
+            _scope="selected tables CDC captures now",
+        )
+        if not facts.slot_usable or facts.publication_publishes_all_dml is False:
+            return result
+        return result.model_copy(
+            update={"detail": f"{result.detail}{_pending_publication_sentence(pending)}"}
+        )
     selected = [t.name for t in tables]
-    missing = sorted(set(selected) - set(facts.publication_tables or ()))
+    # The graded set, worded for what it is (``_scope``); none left: the publication exists.
+    covers = f"covers all {len(selected)} {_scope}" if selected else "exists"
+    missing = sorted(set(selected) - published)
     if missing:
         shown = ", ".join(missing[:5]) + (" …" if len(missing) > 5 else "")
         return PrerequisiteResult(
@@ -1295,7 +1333,7 @@ def check_cdc_replication_objects(
             required=True,
             detail=(
                 f'Publication "{pub}" exists but does not include {len(missing)} of the '
-                f"{len(selected)} selected tables: {shown}."
+                f"{len(selected)} {_scope}: {shown}."
             ),
             remediation=(
                 "Those tables would replicate NOTHING while the connector reported "
@@ -1338,7 +1376,7 @@ def check_cdc_replication_objects(
                 status=PrerequisiteStatus.FAIL,
                 required=True,
                 detail=(
-                    f'Publication "{pub}" covers all {len(selected)} selected tables, but '
+                    f'Publication "{pub}" {covers}, but '
                     f'replication slot "{slot}" -- the one this run\'s Full Load recorded -- '
                     "is no longer on this database, so there is no WAL position to resume "
                     "from. This start is configured snapshot.mode=never and would NOT "
@@ -1360,7 +1398,7 @@ def check_cdc_replication_objects(
             status=PrerequisiteStatus.WARN,
             required=False,
             detail=(
-                f'Publication "{pub}" covers all {len(selected)} selected tables, but '
+                f'Publication "{pub}" {covers}, but '
                 "there is no logical pgoutput replication slot named "
                 f'"{slot}" on this database.'
             ),
@@ -1387,7 +1425,7 @@ def check_cdc_replication_objects(
             status=PrerequisiteStatus.PASS,
             required=True,
             detail=(
-                f'Publication "{pub}" covers all {len(selected)} selected tables and '
+                f'Publication "{pub}" {covers} and '
                 f'replication slot "{slot}" is present, so nothing this start needs is '
                 "missing from the source. It is still configured snapshot.mode=initial "
                 "rather than to resume from that slot: if this pipeline has already "
@@ -1404,11 +1442,23 @@ def check_cdc_replication_objects(
         status=PrerequisiteStatus.PASS,
         required=True,
         detail=(
-            f'Publication "{pub}" covers all {len(selected)} selected tables and '
+            f'Publication "{pub}" {covers} and '
             f'replication slot "{slot}" is present, and this start is configured '
             "snapshot.mode=never, so CDC resumes from that slot without re-reading any "
             "table."
         ),
+    )
+
+
+def _pending_publication_sentence(pending: Sequence[str]) -> str:
+    """C-PREREQ: the pending tables a guarded load adds to the publication (G17)."""
+    names = list(pending)
+    shown = ", ".join(names[:6]) + (f" (+{len(names) - 6} more)" if len(names) > 6 else "")
+    one = len(names) == 1
+    return (
+        f" {shown} {'is' if one else 'are'} not in it yet: "
+        f"{'its' if one else 'their'} load (Retry unfinished tables) adds "
+        f"{'it' if one else 'them'} before {'its' if one else 'their'} copy starts."
     )
 
 
@@ -1420,12 +1470,14 @@ def check_postgres_cdc_prerequisites(
     cdc_start_resnapshots: bool = False,
     message_key_columns: Optional[Mapping[str, Sequence[str]]] = None,
     excluded_columns: "Optional[Mapping[str, Iterable[str]]]" = None,
+    pending_tables: Sequence[str] = (),
 ) -> list[PrerequisiteResult]:
     """Run all PostgreSQL CDC readiness checks (global + per-table REPLICA IDENTITY).
 
     ``provisions_replication`` defaults True -- "this run creates the objects itself" --
     so every existing caller and the whole Full-load-+-CDC path is unchanged and the
-    existence check can never block them.
+    existence check can never block them. ``pending_tables`` -- see
+    :func:`check_cdc_replication_objects` (G17).
 
     ``message_key_columns`` is the connector's re-key map (qualified table -> the target
     primary key the change record is keyed on). Only tables in it can fail
@@ -1441,6 +1493,7 @@ def check_postgres_cdc_prerequisites(
             tables,
             provisions_replication=provisions_replication,
             cdc_start_resnapshots=cdc_start_resnapshots,
+            pending_tables=pending_tables,
         ),
         check_replication_slot_headroom(facts),
         check_slot_wal_retention(facts),

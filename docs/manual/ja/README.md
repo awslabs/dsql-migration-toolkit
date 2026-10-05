@@ -38,7 +38,9 @@ PostgreSQL-16 ワイヤを話すため）**ほぼ同一（near-identity）** の
 ソース（および PostgreSQL を Full Load 専用でのみ使う移行）には決して書き込みを行いません。**
 唯一の例外は **PostgreSQL CDC** で、Full Load の整合性ポイントにおいて、ツールが移行対象テーブル
 だけに限定した pgoutput 論理レプリケーションスロットと publication を作成し、後片付け（teardown）
-時に削除します（autocommit、許可リストに限定、監査記録あり）。これがツールがソースに対して行う
+時に削除します。また、再キー化したテーブルに `REPLICA IDENTITY FULL` を設定し、Full Load の後に
+選択したテーブルをその publication に追加します（Full load + CDC、CDC を開始する前。autocommit、
+許可リストに限定、監査記録あり）。これがツールがソースに対して行う
 唯一の書き込みです。移行は **Connect** を事前ステップとする 5 ステップのガイド付きフローです。
 
 ```

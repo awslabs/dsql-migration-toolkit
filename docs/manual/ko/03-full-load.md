@@ -36,8 +36,11 @@ Source (MySQL / PostgreSQL)          Aurora DSQL
 소스는 일관된 스냅샷 안에서 **읽기 전용**으로 읽히며, 로더는 절대 수정하지 않습니다. MySQL 소스는 —
 그리고 PostgreSQL의 Full Load 전용 마이그레이션도 — 절대 쓰이지 않습니다. 유일한 예외는 **PostgreSQL
 CDC**입니다: 워터마크 시점(§3.5)에 도구가 논리 복제 슬롯과, 정확히 마이그레이션 대상 테이블로만 한정된
-publication을 생성하고 teardown 시 삭제합니다(autocommit, 소규모 allowlist로 제한, 감사됨). 이것이 도구가
-어떤 소스에든 수행하는 유일한 쓰기입니다.
+publication을 생성하고 teardown 시 삭제합니다. 또한 재키잉된 테이블에 `REPLICA IDENTITY FULL`을 설정하고,
+publication의 `publish_via_partition_root`를 바로잡으며, Full Load 이후 선택한 테이블(Full load + CDC,
+CDC를 시작하기 전)을 복사하기 직전에 그 publication에 추가한 뒤, 그 시점에 열려 있던 트랜잭션을 기다리기
+위해 트랜잭션 ID를 하나 받습니다. 모두 autocommit이고, 소규모 allowlist로 제한되며, 감사됩니다. 이것이
+도구가 어떤 소스에든 수행하는 유일한 쓰기입니다.
 
 ---
 
@@ -207,6 +210,8 @@ MySQL에서는 바이너리 로깅이 꺼져 있거나 권한이 제한된 경�
 워터마크를 잡을 때까지(또는 그 이후 선택한 테이블의 체크를 해제할 때까지) 마이그레이션 유형은 Full load only에 머뭅니다.
 
 이 마이그레이션에서 CDC를 이미 시작한 경우가 아니라면, 테이블의 체크를 해제하는 것만으로는 유형이 잠기지 않습니다: CDC는 로드된 테이블 중 아직 선택된 테이블을 캡처합니다. Full load + CDC에서는 로드 후 CDC를 시작하기 전까지 테이블의 체크를 해제할 수 있습니다. 그 테이블은 Aurora DSQL에 그대로 남고, CDC가 캡처하지 않으며, 워터마크는 캡처되는 모든 테이블을 여전히 포함하고(핸드오프는 계속 gapless), 체크를 해제한 테이블에서만 생긴 실패는 더 이상 단계를 붙잡지 않습니다.
+
+Full load + CDC에서는 CDC를 시작하기 전까지 로드 후에 테이블을 체크할 수도 있습니다. Retry unfinished tables가 [13.7](13-excluding-tables-and-columns.md)의 점검(CDC를 시작한 적이 없음, Aurora DSQL 테이블이 비어 있거나 drop 후 재적재됨, CDC가 그 테이블을 공백 없이 캡처할 수 있음: MySQL에서는 워터마크 이후 그 테이블의 정의가 바뀌지 않았고, PostgreSQL에서는 사용할 수 있는 replica identity가 있으며 복사 전에 CDC의 publication에 들어감)을 거친 뒤 원래 워터마크 아래에서 그 테이블을 로드합니다. 그러면 워터마크가 그 테이블을 포함하게 되고, CDC는 다른 테이블과 함께 그 워터마크에서 그 테이블을 캡처하므로, 그 테이블의 핸드오프도 gapless입니다. MySQL에서 Full Load가 시작 지점 정의를 기록하지 않은 테이블(이전 버전의 Full Load, 또는 로드 후에 변환된 테이블)은 대신 Re-run all tables가 로드합니다. Full load only는 바뀌지 않습니다: 거기서의 로드는 워터마크를 절대 확장하지 않습니다.
 
 > **명령줄에서 Full Load 실행 (선택).** 동일한 벌크 로더를 CLI 스크립트로도 쓸 수 있습니다 —
 > `scripts/run_full_load.py`(먼저 계획 출력, 그다음 `--yes`; 선택적으로 `--clean`,

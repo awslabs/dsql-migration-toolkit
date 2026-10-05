@@ -32,8 +32,10 @@ path (value pass-through, same wire, reduced only to DSQL's constraints and
 unsupported types). A **MySQL source (and a PostgreSQL Full-Load-only migration)
 is never written**; the single exception is **PostgreSQL CDC**, where at the Full
 Load consistency point the tool creates — and at teardown drops — a pgoutput
-logical replication slot and a publication scoped to exactly the migrated tables
-(autocommit, allowlisted, audited). These are the only writes the tool ever makes
+logical replication slot and a publication scoped to exactly the migrated tables;
+it also sets `REPLICA IDENTITY FULL` on a re-keyed table and adds a table selected
+after the Full Load to that publication (Full load + CDC, before CDC starts) —
+autocommit, allowlisted, audited. These are the only writes the tool ever makes
 to any source. The migration is a five-step guided flow, with **Connect** as the
 preliminary step:
 

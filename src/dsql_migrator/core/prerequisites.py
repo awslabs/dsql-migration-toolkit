@@ -1353,6 +1353,7 @@ class PrerequisiteChecker:
                             provisions_replication=request.provisions_replication,
                             cdc_start_resnapshots=request.cdc_start_resnapshots,
                             message_key_columns=request.message_key_columns,
+                            pending_tables=request.cdc_pending_tables,
                             excluded_columns=exclusions,
                         )
                     )

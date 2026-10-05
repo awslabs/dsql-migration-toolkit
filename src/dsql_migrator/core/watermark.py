@@ -19,7 +19,10 @@ value is as-of one point):
 - per-table row counts, and
 - a short per-table start-point fingerprint of the migrated tables' column definitions
   (:func:`read_start_point_fingerprints`, read just BEFORE the binlog position), which
-  Start CDC compares with the source before a ``snapshot.mode=recovery`` start.
+  Start CDC compares with the source before a ``snapshot.mode=recovery`` start -- plus,
+  in a separate statement, the same fingerprint of the migratable tables the run does
+  NOT load (``baseline_tables``): the only proof of their definition at this start point,
+  which a Full load + CDC table added after the load is compared with (G17).
 
 Global consistency is obtained with ``START TRANSACTION WITH CONSISTENT
 SNAPSHOT`` (InnoDB, REPEATABLE READ): a single reader sees all tables at one
@@ -54,7 +57,7 @@ produces the watermark and exposes it for persistence.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Callable, Optional, Protocol
+from typing import Callable, Optional, Protocol, Sequence
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -306,6 +309,7 @@ def capture_watermark(
     connection: _Connection,
     tables: list[str],
     *,
+    baseline_tables: "Sequence[str]" = (),
     now: Optional[Callable[[], datetime]] = None,
 ) -> Watermark:
     """Capture a :class:`Watermark` on an open connection (read-only).
@@ -318,15 +322,31 @@ def capture_watermark(
     schema change racing the capture can only make Start CDC refuse a start point it
     could have used -- never pass one whose older rows the tables no longer describe.
 
+    ``baseline_tables`` (G17, MySQL: the migratable tables this run does NOT load) get the
+    same fingerprint in a SECOND, separate bounded statement, also before the binlog
+    position: a failure there leaves those baselines out and never drops a run table's
+    fingerprint. Merged under the run's own entries (a run table always wins). They are
+    inert until a Full load + CDC table added after the load is captured: its guarded load
+    and Start CDC compare its live definition with this baseline.
+
     ``now`` is injectable to make the snapshot timestamp deterministic in tests;
     it defaults to the current UTC time.
     """
     clock = now or _utc_now
+    run_set = {str(t) for t in tables or ()}
+    baseline_names = sorted({str(t) for t in baseline_tables or () if t} - run_set)
 
     connection.execute(text(START_CONSISTENT_SNAPSHOT))
     try:
         snapshot_timestamp = clock()
         table_fingerprints = read_start_point_fingerprints(connection, tables)
+        baselines = (
+            read_start_point_fingerprints(connection, baseline_names)
+            if baseline_names
+            else {}
+        )
+        if baselines:
+            table_fingerprints = {**baselines, **table_fingerprints}
         binlog_file, binlog_position, gtid_from_master = _read_master_status(
             connection
         )
@@ -372,14 +392,19 @@ class WatermarkCapturer:
         self._now = now or _utc_now
 
     def capture(
-        self, conn: SourceConnectionConfig, tables: list[str]
+        self,
+        conn: SourceConnectionConfig,
+        tables: list[str],
+        *,
+        baseline_tables: "Sequence[str]" = (),
     ) -> Watermark:
         """Connect to the source and capture a watermark for ``tables``.
 
         Implements Requirements 5.7, 5.8 / Property 11. The connection runs in
         autocommit mode so the explicit ``START TRANSACTION WITH CONSISTENT
         SNAPSHOT`` / ``COMMIT`` statements control the snapshot transaction
-        directly. All access is read-only (Property 1).
+        directly. All access is read-only (Property 1). ``baseline_tables`` -- see
+        :func:`capture_watermark` (G17).
         """
         engine = self._engine_factory(conn)
         try:
@@ -388,7 +413,8 @@ class WatermarkCapturer:
                     isolation_level="AUTOCOMMIT"
                 )
                 return capture_watermark(
-                    snapshot_connection, tables, now=self._now
+                    snapshot_connection, tables, baseline_tables=baseline_tables,
+                    now=self._now,
                 )
         finally:
             engine.dispose()

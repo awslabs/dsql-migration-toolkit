@@ -118,8 +118,8 @@ class ExclusionDialogContext:
     the table picker's lock reason (E3); ``capture_tables_fn(selected')`` the tables CDC
     would capture (CDC types only, else ``None``); ``refresh`` the page refresh (it also
     persists the session); ``add_lock_fn`` the table picker's per-table add-lock (Full load
-    + CDC after its Full Load, before CDC starts, G16: a table line may drop tables but
-    select again only one it allows), else ``None``.
+    + CDC after its Full Load, before CDC starts, G16, G17: a table line may drop or select
+    tables; its covered set decides what a Save may drop and reload), else ``None``.
     """
 
     migration_state: object
@@ -1389,17 +1389,48 @@ def _record_chunks(ctx: ExclusionDialogContext) -> "Optional[dict]":
 
 def _drop_reload_tables(ctx: ExclusionDialogContext, resolution, migratable, convert) -> list:
     """:func:`reload_tables` minus the tables the Full Load record lacks (Full load only,
-    selected after the load, G12; Full load + CDC never has one, G16): nothing of theirs is
-    on Aurora DSQL to drop, and Retry unfinished tables loads them with their column rules
-    (the overlay applies as on a first load). Kept in the set, the retry's prerequisite
-    guard for a never-checked table would refuse the WHOLE reload after the rules were
-    stored. The preview and the Save share it, so the confirm still acts only on what it
-    showed."""
+    selected after the load, G12) -- and in Full load + CDC minus every table its watermark
+    does not cover (G17: selected after the load, whatever chunk the record holds for it --
+    a failed, quarantined or Full load only load): nothing of theirs may be dropped and
+    reloaded here, and Retry unfinished tables loads them with their column rules (the
+    overlay applies as on a first load, and a Full load + CDC table only under its guards).
+    Kept in the set, the retry's guard for such a table would refuse the WHOLE reload after
+    the rules were stored. The preview and the Save share it, so the confirm still acts only
+    on what it showed."""
     tables = reload_tables(resolution, migratable, convert)
-    record = _record_chunks(ctx) if tables else None
+    if not tables:
+        return tables
+    lock = _add_lock(ctx)
+    if lock is not None:
+        return [t for t in tables if t in lock.covered]
+    record = _record_chunks(ctx)
     if record is None:
         return tables
     return [t for t in tables if t in record]
+
+
+def _deferred_reload_tables(ctx: ExclusionDialogContext, resolution, inputs, convert,
+                            dropped: Sequence[str]) -> list:
+    """Full load + CDC before CDC starts (G17): the SELECTED tables whose excluded columns
+    this Save changes but that CDC does not capture yet -- never dropped and reloaded here
+    (:func:`_drop_reload_tables`, whose result is ``dropped``), so the preview says their
+    load on the Full Load step applies the saved rules instead of "no excluded columns
+    change". Tables this same Save newly selects are left to
+    :func:`_selection_change_sentence`. Tree order; set operations only, and the add-lock
+    (one job read) is asked only when such a table may exist -- this runs on every debounced
+    preview."""
+    selected = set(getattr(inputs, "selected", None) or ())
+    dropped_set = set(dropped)
+    candidates = [
+        t for t in reload_tables(resolution, inputs.migratable, convert)
+        if t in selected and t not in dropped_set
+    ]
+    if not candidates:
+        return []
+    lock = _add_lock(ctx)
+    if lock is None:
+        return []
+    return [t for t in candidates if t not in lock.covered]
 
 
 def _row_estimate(ctx: ExclusionDialogContext, table: str) -> Optional[int]:
@@ -1410,13 +1441,16 @@ def _row_estimate(ctx: ExclusionDialogContext, table: str) -> Optional[int]:
     return counts.get(table)
 
 
-# Change & reload's line in Full load + CDC after its Full Load, before CDC starts (G16).
+# Change & reload's line in Full load + CDC after its Full Load, before CDC starts (G16,
+# G17).
 FL_CDC_RELOAD_LABEL = (
-    "Column and table rules are editable. A column change drops and reloads that table; a "
-    "table you unselect is left as is on Aurora DSQL (not dropped) and CDC does not capture "
-    "it. Until CDC starts, a table line can drop tables but not add them: only a table in "
-    "the last Full Load's snapshot can be selected again (it is kept as is, unless it is "
-    "listed below for Drop & reload)."
+    "Column and table rules are editable. A column change drops and reloads a table CDC "
+    "captures; a table you unselect is left as is on Aurora DSQL (not dropped) and CDC does "
+    "not capture it; a selected table CDC does not capture yet (one the last Full Load did "
+    "not load) is loaded on the Full Load step with the rules you save (Retry unfinished "
+    "tables, or Re-run all tables where that step says Retry cannot add it), and CDC "
+    "captures it once loaded. A table already captured is kept as is, unless it is listed "
+    "below for Drop & reload."
 )
 
 
@@ -1455,12 +1489,12 @@ def _build_reload_dialog(ui, ctx: ExclusionDialogContext, *, insert_lines=(), hi
     """CHANGE & RELOAD (R4): column rules editable, table lines E3 while the table set is
     fixed after a Full Load (``ctx.lock_reason_fn()`` set; in Full load only it is None and
     a table line changes the selection, G12; in Full load + CDC before CDC starts it is
-    None too, and a table line may drop tables but select again only one the add-lock
-    allows -- any other is a per-table E3, G16), and a negative confirm naming every
-    table it DROPS and reloads -- acting only on what it showed. A table the Full Load record
-    lacks (selected after the load) is never in that set (:func:`_drop_reload_tables`): Retry
-    unfinished tables loads it. A change that drops nothing saves the rules (and any table
-    selection) and nothing else."""
+    None too, and a table line may drop or select tables -- G16, G17), and a negative
+    confirm naming every table it DROPS and reloads -- acting only on what it showed. A
+    table the Full Load record lacks (selected after the load), and in Full load + CDC any
+    table its watermark does not cover, is never in that set (:func:`_drop_reload_tables`):
+    Retry unfinished tables loads it. A change that drops nothing saves the rules (and any
+    table selection) and nothing else."""
     from dsql_migrator.core.activity_log import ActivityCategory, ActivityStatus, log_activity
 
     state = ctx.migration_state
@@ -1524,7 +1558,11 @@ def _build_reload_dialog(ui, ctx: ExclusionDialogContext, *, insert_lines=(), hi
                          if convert else resolution)
                 _render_result(ui, shown, tables)
                 _render_target_changes(ui, ctx, shown, view, _run_preview_now, tables)
-            _render_drop_card(ui, ctx, resolution, tables, lock_reason=lock_reason)
+            _render_drop_card(
+                ui, ctx, resolution, tables, lock_reason=lock_reason,
+                deferred=_deferred_reload_tables(ctx, resolution, inputs, sorted(convert),
+                                                 tables),
+            )
             label = (f"Drop & reload {tables[0]}" if len(tables) == 1
                      else f"Drop & reload {len(tables)} tables" if tables else "Save")
             with ui.row().classes("w-full justify-end gap-2"):
@@ -1652,10 +1690,12 @@ def _render_legacy_conversion(ui, resolution, convert: set, rerun) -> None:
 def _selection_change_sentence(ctx: ExclusionDialogContext, resolution, tables, *,
                                lock_reason: "Optional[str]" = None) -> str:
     """What a Save does to the table SELECTION (Full load only after a load, G12; Full load
-    + CDC before CDC starts, G16), or "" when it leaves the selection as it is -- and "" while
-    Full load + CDC's narrowing waits (G16, ``lock_reason`` -- the preview's table-set lock
-    -- set although the add-lock is open: every selection change is then an E3 that names its
-    tables and disables Save, so nothing here may say what that Save stores)."""
+    + CDC before CDC starts, G16, G17 -- a table its watermark does not cover is listed
+    under Retry unfinished tables and captured once loaded), or "" when it leaves the
+    selection as it is -- and "" while Full load + CDC's narrowing waits (G16,
+    ``lock_reason`` -- the preview's table-set lock -- set although the add-lock is open:
+    every selection change is then an E3 that names its tables and disables Save, so nothing
+    here may say what that Save stores)."""
     after = getattr(resolution, "selected_after", None)
     if after is None:
         return ""
@@ -1673,6 +1713,15 @@ def _selection_change_sentence(ctx: ExclusionDialogContext, resolution, tables, 
     if add_lock is not None and selects:
         refused = set(add_lock.blocked(selects, tree=False))
         selects = [t for t in selects if t not in refused]
+    # G17: in Full load + CDC a table its watermark does not cover is loaded by Retry
+    # unfinished tables and only then captured -- never "kept as is", whatever the record
+    # holds for it.
+    uncovered = (
+        [t for t in selects if t not in add_lock.covered] if add_lock is not None else []
+    )
+    if uncovered:
+        uncovered_set = set(uncovered)
+        selects = [t for t in selects if t not in uncovered_set]
     # A table the last Full Load already loaded is kept as is, not retried: only the
     # rest (not in the record, or unfinished in it) is listed under Retry unfinished tables.
     record = _record_chunks(ctx) if selects else None
@@ -1694,6 +1743,12 @@ def _selection_change_sentence(ctx: ExclusionDialogContext, resolution, tables, 
     if selects:
         parts.append(f"Selects {_names(selects)}: listed under Retry unfinished tables on "
                      "the Full Load step until loaded.")
+    if uncovered:
+        it = "it" if len(uncovered) == 1 else "them"
+        parts.append(f"Selects {_names(uncovered)}: listed under Retry unfinished tables on "
+                     f"the Full Load step until loaded (Re-run all tables loads {it} where "
+                     f"that step says Retry cannot add {it}); CDC then captures {it} with "
+                     "the other tables.")
     if loaded:
         one = len(loaded) == 1
         parts.append(f"Selects {_names(loaded)} again: already loaded by the last Full Load, "
@@ -1702,15 +1757,43 @@ def _selection_change_sentence(ctx: ExclusionDialogContext, resolution, tables, 
     return " ".join(parts)
 
 
+def _deferred_sentence(deferred: Sequence[str], *, also: bool = False) -> str:
+    """What a Save does for the selected tables CDC does not capture yet whose excluded
+    columns change (Full load + CDC, G17): nothing here -- their load applies the rules."""
+    one = len(deferred) == 1
+    it = "it" if one else "them"
+    return (
+        f"The excluded columns of {_names(deferred)} change{' too' if also else ''}, but "
+        f"CDC does not capture {it} yet, so {'it is' if one else 'they are'} not dropped "
+        f"here: {'its' if one else 'their'} load on the Full Load step applies the saved "
+        f"rules ({'it is' if one else 'they are'} listed under Retry unfinished tables "
+        "there)."
+    )
+
+
 def _render_drop_card(ui, ctx: ExclusionDialogContext, resolution, tables, *,
-                      lock_reason: "Optional[str]" = None) -> None:
+                      lock_reason: "Optional[str]" = None,
+                      deferred: Sequence[str] = ()) -> None:
+    """The Save's consequence, under the rules: the tables it DROPS and reloads (amber), or
+    why it drops none. ``deferred`` (Full load + CDC, G17: :func:`_deferred_reload_tables`)
+    are named either way -- their columns change, but their load applies it."""
     selection_change = _selection_change_sentence(
         ctx, resolution, tables, lock_reason=lock_reason)
     if not tables:
+        if deferred:
+            # Not "no excluded columns change": they do -- on a table this Save cannot drop
+            # (CDC does not capture it yet), whose load on the Full Load step applies them.
+            inline_hint(
+                ui,
+                "Nothing is dropped and reloaded now: Save stores the rules. "
+                + _deferred_sentence(deferred)
+                + (" " + selection_change if selection_change else ""),
+            )
+            return
         if selection_change:
             # Not "no excluded columns change": a table selected since the load may get
-            # column rules -- it has nothing on Aurora DSQL to drop (its first load applies
-            # them).
+            # column rules -- it is not loaded here (Retry unfinished tables loads it,
+            # applying them).
             inline_hint(ui, "Nothing to drop and reload: Save stores the rules and the "
                         "table selection. " + selection_change)
             return
@@ -1740,6 +1823,9 @@ def _render_drop_card(ui, ctx: ExclusionDialogContext, resolution, tables, *,
             "your Schema Conversion DDL, made nullable where needed, and reloaded. Other "
             "tables are not touched."
         ).classes("text-xs text-amber-800")
+        if deferred:
+            ui.label(_deferred_sentence(deferred, also=True)).classes(
+                "text-xs text-amber-800")
         if selection_change:
             ui.label(selection_change).classes("text-xs text-amber-800")
 

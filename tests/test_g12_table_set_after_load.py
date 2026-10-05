@@ -1086,7 +1086,10 @@ def test_validation_scope_gap_holds_only_tables_selected_since_the_load() -> Non
     assert full_load_covered_tables(state, jobs) == frozenset({"a", "b"})
     assert full_load_covered_tables(state, _Jobs({})) is None
     assert full_load_covered_tables(state, None) is None
-    assert full_load_covered_tables(_flo(mtype=MigrationType.FULL_LOAD_AND_CDC), jobs) is None
+    # G17 (deliberately changed): a CDC type reads the run's ORIGINAL tables too (a table a
+    # guarded Full load + CDC load added since is not "covered" for Validation).
+    assert full_load_covered_tables(
+        _flo(mtype=MigrationType.FULL_LOAD_AND_CDC), jobs) == frozenset({"a", "b"})
 
 
 # ---------------------------------------------------------------------------
@@ -1565,9 +1568,11 @@ def test_a_new_tables_column_rule_alone_drops_nothing(monkeypatch) -> None:
     assert {t: set(c) for t, c in s.state.lob_exclusions().items()} == {"app.c": {"note"}}
 
 
-def test_full_load_and_cdc_change_and_reload_keeps_table_lines_e3(monkeypatch) -> None:
-    # G16: Full load + CDC before CDC starts may DROP tables, but re-selecting app.c (not
-    # in the Full Load's snapshot) stays an E3 -- now per table, with its reason.
+def test_full_load_and_cdc_change_and_reload_selects_an_uncovered_table(monkeypatch) -> None:
+    # G16 let Full load + CDC before CDC starts DROP tables but kept re-selecting app.c (not in
+    # the Full Load's snapshot) an E3. G17 (deliberately changed): the Save selects it -- it
+    # is listed under Retry unfinished tables and CDC captures it once loaded -- and nothing
+    # is dropped or reloaded for it here.
     from dsql_migrator.ui.data_migration._exclusion_dialog import open_exclusion_dialog
 
     from tests.test_exclusion_dialog import _Ui
@@ -1578,13 +1583,20 @@ def test_full_load_and_cdc_change_and_reload_keeps_table_lines_e3(monkeypatch) -
     open_exclusion_dialog(ui, s.ctx)
     ui.click("Change & reload")
     ui.type_text("exclude app.*.note")
-    assert any("Save would re-select app.c" in t
-               and "not part of the last Full Load's snapshot" in t
-               and "use Start over" in t for t in ui.texts)
-    assert not any("Selects app.c" in t for t in ui.texts)
+    assert not any("Save would re-select app.c" in t for t in ui.texts)
+    # G17 review (deliberately changed): this watermark records no MySQL start point for
+    # app.c, so Retry cannot add it -- the line names Re-run all tables too.
+    assert any("Selects app.c: listed under Retry unfinished tables on the Full Load step "
+               "until loaded (Re-run all tables loads it where that step says Retry cannot "
+               "add it); CDC then captures it with the other tables." in t for t in ui.texts)
     action = [b for b in ui.elements if b.kind == "button"
               and (b.text == "Save" or str(b.text).startswith("Drop & reload"))][-1]
-    assert action.enabled is False
+    assert action.enabled is True and action.text == "Drop & reload 2 tables"
+    ui.click("Save")
+    # Only the loaded tables are dropped and reloaded (their excluded column changed); app.c
+    # is selected and left to Retry unfinished tables (its guarded load).
+    assert s.calls == [["app.a", "app.b"]]
+    assert s.state.selection.selected_tables == ["app.a", "app.b", "app.c"]
 
 
 def test_the_selection_sentence_keeps_a_reselected_loaded_table_as_is() -> None:

@@ -17091,8 +17091,11 @@ def test_start_cdc_shows_the_table_set_plainly_with_the_why_on_hover() -> None:
     assert "gapless" in hover
     assert "delete the CDC infrastructure" not in hover
 
-    # --- Full Load + CDC, load finished, CDC never started (G16): the set can still DROP
-    # tables until Start, so the tooltip says so instead of "This set is fixed" ---
+    # --- Full Load + CDC, load finished, CDC never started (G16, G17): the set can still
+    # change until Start, so the tooltip says so instead of "This set is fixed" -- and,
+    # deliberately changed by G17, it no longer sends an added table to Start over (it is
+    # loaded on the Full Load step first: by Retry unfinished tables, or by Re-run all
+    # tables for a MySQL table the Full Load recorded no start point for) ---
     narrowing = _render(
         job=_LoadedJob(), mtype=MigrationType.FULL_LOAD_AND_CDC, inventory=inventory
     )
@@ -17100,10 +17103,11 @@ def test_start_cdc_shows_the_table_set_plainly_with_the_why_on_hover() -> None:
     n_hover = " ".join(narrowing.tooltips)
     assert "Ready to start CDC" in n_visible and "Will stream 8 tables" in n_visible
     assert "Will stream" not in n_hover
-    assert "Until you start CDC, you can still untick tables in the table list" in n_hover
+    assert "Until you start CDC, you can still change the table list" in n_hover
+    assert "a table you tick is loaded on the Full Load step first" in n_hover
     assert "Once CDC starts this set is fixed" in n_hover and "partitions" in n_hover
     assert "This set is fixed" not in n_hover
-    assert "Start over" in n_hover and "gapless" in n_hover
+    assert "Start over" not in n_hover and "gapless" in n_hover
     assert "delete the CDC infrastructure" not in n_hover
 
     # --- CDC-only, no Full Load -> delete + redeploy genuinely re-scopes ---

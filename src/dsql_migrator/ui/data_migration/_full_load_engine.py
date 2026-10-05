@@ -229,6 +229,12 @@ class DataMigrationInputs:
     # consults the ledger from then on (and the page-header Run opens the dialog);
     # parent-only.
     on_overlay_ledger_used: Optional[Callable[[], None]] = None
+    # G17 (MySQL): the migratable tables this run does NOT load, whose start-point
+    # definition the watermark capture records as a BASELINE (one separate bounded catalog
+    # statement, before the binlog position). A Full load + CDC table selected after the
+    # load is compared with it before CDC may capture it from this start point. Parent-only
+    # (dropped from worker inputs: it can name every converted table).
+    cdc_baseline_tables: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -306,6 +312,16 @@ class DataMigrator(Protocol):
         reported incomplete by raising :class:`_FullLoadStopped` so the caller can
         leave it for retry (the re-load is idempotent).
         """
+
+    # Optional (G17), duck-typed by :func:`run_full_load_retry`:
+    # ``guard_cdc_additions(names, *, watermark, replace_tables, heartbeat, cancelled) ->
+    # dict[str, Optional[str]]`` -- run BEFORE any snapshot of a Full load + CDC retry
+    # opens, for the tables selected after its Full Load: ``None`` when CDC can capture a
+    # table with no gap from the watermark (MySQL: its live definition equals the baseline
+    # recorded at the watermark, so its binary log replays from the start point;
+    # PostgreSQL: it keeps a usable replica identity, it is in CDC's publication and every
+    # transaction open at that moment has ended), else a fixed refusal text, or
+    # :data:`CDC_GUARD_STOPPED` after a Stop. A migrator without it refuses every addition.
 
 
 # Builds a :class:`DataMigrator` bound to the run's inputs.
@@ -883,6 +899,7 @@ def _slim_worker_inputs(
         overlay_ledger_status=None,
         on_table_recreated=None,
         on_overlay_ledger_used=None,
+        cdc_baseline_tables=(),
     )
 
 
@@ -4291,6 +4308,328 @@ def _count_quarantined_rows(error_log, job_id: str, owners: Optional[dict] = Non
     return total
 
 
+# ---------------------------------------------------------------------------
+# G17: a Full load + CDC table added after its Full Load, loaded by a GUARDED retry
+# ---------------------------------------------------------------------------
+#
+# A table selected after a Full load + CDC Full Load, before CDC ever started for the
+# migration, is loaded by Retry unfinished tables under the ORIGINAL watermark and -- only
+# once its guards passed BEFORE its copy began and the copy completed with no quarantined
+# row -- recorded on the watermark (``Watermark.cdc_added_tables``), so CDC captures it from
+# that start point with the run's tables. Every text below is fixed and value-free (a class
+# name or SQLSTATE at most): it is the table's error-log record and its activity line.
+
+# The hook's "a Stop came first" answer: the table stays PENDING, nothing is recorded.
+CDC_GUARD_STOPPED = "\x00stopped"
+
+CDC_STARTED = (
+    "Not loaded: CDC was started for this migration before this table's load began, so "
+    "CDC cannot capture it from the Full Load's start point. Use Start over to migrate it "
+    "with CDC."
+)
+CDC_STATE_UNCONFIRMED = (
+    "Not loaded: this load could not confirm that CDC never started for this migration. "
+    "Use Retry unfinished tables again."
+)
+NO_GUARD = (
+    "Not loaded: this load cannot check that CDC can capture the table with no gap since "
+    "the Full Load."
+)
+CDC_GUARD_FAILED = (
+    "Not loaded: the check that CDC can capture the table with no gap since the Full Load "
+    "failed ({cls}). Use Retry unfinished tables again."
+)
+NO_START_POINT = (
+    "Not loaded: the Full Load recorded no start-point definition for this table, so CDC "
+    "could not decode its binary-log changes since then. Re-run all tables (a fresh start "
+    "point), or untick it."
+)
+MYSQL_CHANGED = (
+    "Not loaded: the table's source definition changed since the Full Load's start point "
+    "({reason}), so CDC would decode its older binary-log rows with the new definition. "
+    "Re-run all tables (a fresh start point), or untick it."
+)
+MYSQL_UNREADABLE = (
+    "Not loaded: the table's source definition could not be read ({cls}) to compare it "
+    "with the Full Load's start point. Nothing was written; use Retry unfinished tables "
+    "again."
+)
+TARGET_HAS_ROWS = (
+    "Not loaded: Aurora DSQL already holds rows in it that this load did not write. They "
+    "may predate the changes CDC captures for it, and an append keeps them, so a row "
+    "changed or deleted on the source before then could stay wrong. Retry it (its rows on "
+    "Aurora DSQL are then dropped and reloaded), or untick it."
+)
+TARGET_MISSING = (
+    "Not loaded: the table does not exist on Aurora DSQL. Apply its converted DDL in "
+    "Schema Conversion, then retry it."
+)
+TARGET_UNKNOWN = (
+    "Not loaded: whether Aurora DSQL already holds rows in it could not be read. Check "
+    "the target connection, then retry it."
+)
+PG_OBJECTS_GONE = (
+    "Not loaded: CDC's replication slot \"{slot}\" or publication \"{pub}\" from the Full "
+    "Load is no longer usable on the source (Delete CDC infrastructure drops both), so a "
+    "table added now has no start point CDC can replay. Re-run all tables (it creates a "
+    "fresh slot and publication), or untick it."
+)
+PG_OBJECTS_UNREADABLE = (
+    "Not loaded: CDC's publication and replication slot could not be read on the source "
+    "({cls}). Nothing was written; use Retry unfinished tables again."
+)
+PG_DML = (
+    "Not loaded: publication \"{pub}\" does not publish every change type (INSERT, UPDATE "
+    "and DELETE). Re-run all tables, or untick it."
+)
+PG_IDENTITY_NOT_FULL = (
+    "Not loaded: this re-keyed table (or one of its partitions) is not REPLICA IDENTITY "
+    "FULL on the source, so CDC deletes keyed on its composite key could be lost. Set "
+    "REPLICA IDENTITY FULL on the source, re-run the prerequisite checks, then retry it."
+)
+PG_IDENTITY_UNKNOWN = (
+    "Not loaded: whether this re-keyed table is REPLICA IDENTITY FULL on the source could "
+    "not be read. Retry it."
+)
+PG_IDENTITY_UNUSABLE = (
+    "Not loaded: the table has no usable REPLICA IDENTITY on the source ({cause}), so once "
+    "in CDC's publication every UPDATE and DELETE on it would fail there; it was not added. "
+    "Give it a primary key, or set REPLICA IDENTITY FULL (on each partition of a "
+    "partitioned table), re-run the prerequisite checks, then retry it."
+)
+PG_IDENTITY_UNREADABLE = (
+    "Not loaded: whether the table (and each of its partitions) has a usable REPLICA "
+    "IDENTITY on the source could not be read, so it was not added to CDC's publication. "
+    "Retry it."
+)
+PG_ADD_OWNER = (
+    "Not loaded: the source user cannot add the table to publication \"{pub}\": it must "
+    "own the table and the publication (SQLSTATE 42501). Grant that, re-run the "
+    "prerequisite checks, then retry it."
+)
+PG_ADD_LOCK = (
+    "Not loaded: adding the table to publication \"{pub}\" waited too long for a lock on "
+    "it (a VACUUM, an index build or DDL holds one). Retry it once that finishes."
+)
+PG_ADD_OTHER = (
+    "Not loaded: adding the table to publication \"{pub}\" failed ({cls}, SQLSTATE "
+    "{code}). Retry it, or untick it."
+)
+PG_CONNECT = (
+    "Not loaded: the source could not be reached to add the table to publication "
+    "\"{pub}\" ({cls}). Retry it."
+)
+PG_WAIT_TIMEOUT = (
+    "Not loaded: transactions already open on the source when the table joined "
+    "publication \"{pub}\" were still running after 10 minutes (a session idle in "
+    "transaction, a long batch, or an uncommitted prepared transaction — see "
+    "pg_prepared_xacts). Its copy may start only after they end, or their changes to it "
+    "would be in neither the copy nor CDC's stream. It stays in the publication until "
+    "Delete CDC infrastructure: CDC's table list filters it out, but its UPDATE and DELETE "
+    "keep needing the REPLICA IDENTITY checked before it was added. Let those transactions "
+    "finish, then retry it."
+)
+PG_WAIT_UNREADABLE = (
+    "Not loaded: the tool could not confirm that the transactions open on the source when "
+    "the table joined publication \"{pub}\" have finished ({cls}). Retry it."
+)
+CDC_STARTED_AFTER_LOAD = (
+    "Loaded, but CDC was started for this migration while it loaded, so CDC does not "
+    "capture it and its rows on Aurora DSQL will not be kept up to date. Use Start over to "
+    "migrate it with CDC."
+)
+CDC_STATE_UNCONFIRMED_AFTER_LOAD = (
+    "Loaded, but this load could not confirm that CDC never started for this migration, "
+    "so CDC does not capture it yet. Use Retry unfinished tables again."
+)
+# The bounded wait for the transactions open when a table joined the publication (it
+# heartbeats every poll, well under the job manager's 900 s stall watchdog), the
+# statement_timeout of the source writes (bounds the ADD's lock wait), and the bound of the
+# guard's catalog reads (the CDC catalog-drift check's).
+CDC_ADDITION_WAIT_SECONDS = 600.0
+CDC_ADDITION_WAIT_POLL_SECONDS = 5.0
+CDC_ADDITION_WRITE_TIMEOUT_SECONDS = 60
+CDC_ADDITION_CATALOG_READ_SECONDS = 10
+
+
+def _pg_connection_lost(exc: BaseException) -> bool:
+    """Did a PostgreSQL write fail because the connection is gone (every later table on it
+    is refused too)? A SQLSTATE decides when there is one (class 08); otherwise a driver
+    OperationalError / InterfaceError, or SQLAlchemy's invalidated connection."""
+    from dsql_migrator.core.cdc_pg_slot import pg_sqlstate
+
+    if getattr(exc, "connection_invalidated", False):
+        return True
+    code = pg_sqlstate(exc)
+    if code:
+        return code.startswith("08")
+    kinds = {
+        type(candidate).__name__
+        for candidate in (exc, getattr(exc, "orig", None))
+        if candidate is not None
+    }
+    return bool(kinds & {"OperationalError", "InterfaceError"})
+
+
+def _covered_by(watermark) -> "set[str]":
+    """The tables ``watermark`` lets CDC capture: its run's tables plus the guarded
+    additions recorded on it (G17)."""
+    return set(getattr(watermark, "table_row_counts", None) or ()) | set(
+        getattr(watermark, "cdc_added_tables", None) or ()
+    )
+
+
+def _guard_cdc_additions(
+    handle: JobHandle,
+    job_id: str,
+    error_log: ErrorLogStore,
+    migrator: "DataMigrator",
+    additions: "Sequence[str]",
+    *,
+    watermark,
+    cdc_coverage_open: "Optional[Callable[[], bool]]",
+) -> "tuple[set[str], set[str], set[str]]":
+    """Run the G17 guards for ``additions`` BEFORE any snapshot of the retry opens.
+
+    Returns ``(passed, refused, stopped)``. A table already covered by the watermark is not
+    an addition (it is dropped here). An addition an unreadable overlay ledger keeps from
+    being touched is not guarded and fails closed in its load as today (never covered). With
+    no confirmation that CDC never started (``cdc_coverage_open`` absent or False) every
+    addition is refused before any source access. Each refusal is recorded exactly as a
+    pre-pass failure (an error-log record, one 'load table' FAILURE line, the chunk FAILED);
+    a table the guard's Stop reached stays PENDING. Never raises.
+    """
+    covered = _covered_by(watermark)
+    names = [n for n in dict.fromkeys(additions or ()) if n and n not in covered]
+    if not names:
+        return set(), set(), set()
+    inputs = getattr(migrator, "_inputs", None)
+    if isinstance(inputs, DataMigrationInputs):
+        names = [n for n in names if not _blocked_by_unreadable_ledger(inputs, n)]
+    if not names:
+        return set(), set(), set()
+    verdicts: "dict[str, Optional[str]]"
+    if cdc_coverage_open is None:
+        verdicts = {n: CDC_STATE_UNCONFIRMED for n in names}
+    else:
+        try:
+            still_open = bool(cdc_coverage_open())
+        except Exception:  # noqa: BLE001 - unconfirmed is not "never started"
+            still_open = None
+        if still_open is None:
+            verdicts = {n: CDC_STATE_UNCONFIRMED for n in names}
+        elif not still_open:
+            verdicts = {n: CDC_STARTED for n in names}
+        else:
+            hook = getattr(migrator, "guard_cdc_additions", None)
+            if not callable(hook):
+                verdicts = {n: NO_GUARD for n in names}
+            else:
+                replace_set = (
+                    frozenset(inputs.replace_tables)
+                    if isinstance(inputs, DataMigrationInputs)
+                    else frozenset()
+                )
+                try:
+                    answered = hook(
+                        sorted(names),
+                        watermark=watermark,
+                        replace_tables=replace_set,
+                        heartbeat=handle.heartbeat,
+                        cancelled=lambda: handle.cancelled,
+                    ) or {}
+                    # A table the hook did not answer is refused (fail closed).
+                    verdicts = {n: answered.get(n, NO_GUARD) for n in names}
+                except Exception as exc:  # noqa: BLE001 - every addition refused
+                    verdicts = {
+                        n: CDC_GUARD_FAILED.format(cls=type(exc).__name__[:64])
+                        for n in names
+                    }
+    passed: set[str] = set()
+    refused: set[str] = set()
+    stopped: set[str] = set()
+    for name in names:
+        verdict = verdicts.get(name)
+        if verdict is None:
+            passed.add(name)
+        elif verdict == CDC_GUARD_STOPPED:
+            stopped.add(name)
+        else:
+            _record_prepass_failure(
+                handle, job_id, error_log, migrator, name, reason=str(verdict), exc=None
+            )
+            refused.add(name)
+    return passed, refused, stopped
+
+
+def _extend_cdc_coverage(
+    handle: JobHandle,
+    job_id: str,
+    error_log: ErrorLogStore,
+    migrator: "DataMigrator",
+    guarded: "set[str]",
+    *,
+    cdc_coverage_open: "Optional[Callable[[], bool]]",
+) -> int:
+    """Record the guarded additions that loaded completely on the watermark (G17).
+
+    Candidates: the ``guarded`` additions whose chunk is DONE with no quarantined row (an
+    accepted quarantine never qualifies: a table added after the load is captured only
+    after a clean load). ``cdc_coverage_open`` is evaluated ONCE: still open -> one
+    ``handle.update`` adds them to ``Watermark.cdc_added_tables`` (with the rows each load
+    wrote, a partition-size signal) before the run's terminal transition, so the save that
+    carries the terminal status carries it too; closed (CDC was started meanwhile) or
+    unconfirmed -> each is recorded FAILED with its reason instead. Applies whatever the
+    other tables did. Returns how many were recorded FAILED (counted as real failures).
+    """
+    if not guarded:
+        return 0
+    job = handle.snapshot()
+    chunks = {c.chunk_id: c for c in getattr(job, "chunks", None) or ()}
+    candidates = sorted(
+        n for n in guarded
+        if n in chunks
+        and chunks[n].status == "DONE"
+        and not (getattr(chunks[n], "rows_quarantined", 0) or 0)
+    )
+    if not candidates or getattr(job, "watermark", None) is None:
+        return 0
+    try:
+        still_open = bool(cdc_coverage_open()) if cdc_coverage_open is not None else None
+    except Exception:  # noqa: BLE001 - unconfirmed is not "never started"
+        still_open = None
+    if not still_open:
+        reason = CDC_STARTED_AFTER_LOAD if still_open is False else (
+            CDC_STATE_UNCONFIRMED_AFTER_LOAD)
+        for name in candidates:
+            _record_prepass_failure(
+                handle, job_id, error_log, migrator, name, reason=reason, exc=None
+            )
+        return len(candidates)
+    rows = {n: int(chunks[n].rows_loaded or 0) for n in candidates}
+
+    def _extend(live) -> None:
+        if live.watermark is None:
+            return
+        added = dict(getattr(live.watermark, "cdc_added_tables", None) or {})
+        added.update(rows)
+        live.watermark = live.watermark.model_copy(update={"cdc_added_tables": added})
+
+    handle.update(_extend)
+    log_activity(
+        ActivityCategory.FULL_LOAD,
+        "CDC capture extended",
+        status=ActivityStatus.INFO,
+        target=", ".join(candidates),
+        detail=(
+            f"{', '.join(candidates)}: loaded under this Full Load's start point; CDC "
+            f"captures {'it' if len(candidates) == 1 else 'them'} from it with the other "
+            "tables"
+        ),
+    )
+    return 0
+
+
 def run_full_load_retry(
     handle: JobHandle,
     prior_chunks: Sequence[ChunkState],
@@ -4317,6 +4656,12 @@ def run_full_load_retry(
     # finalize skipped it (the run was incomplete), so without this the sequence stays
     # unsynced on every recovered run.
     inputs: "Optional[DataMigrationInputs]" = None,
+    # G17 (Full load + CDC only): retry tables the watermark does not cover yet -- selected
+    # after the Full Load -- and the predicate "CDC never started for this migration",
+    # re-checked on this thread before any source write and again at the coverage write.
+    # Defaulted: every other caller (Full load only, CDC only) passes none.
+    cdc_additions: "Sequence[str]" = (),
+    cdc_coverage_open: "Optional[Callable[[], bool]]" = None,
 ) -> None:
     """Re-run Full Load for only the previously failed ``tables_to_retry``.
 
@@ -4328,11 +4673,19 @@ def run_full_load_retry(
     continue, exactly like :func:`run_full_load`.
 
     A retry table the prior run never had (selected after the load) is seeded as a new
-    PENDING chunk and loaded under the same original watermark -- which is NOT extended:
-    its ``table_row_counts`` keys stay the run's original set, the signal that a CDC
-    type has no gapless start for the added table. ``run_table_names`` scopes the
-    identity sync and the foreign-key count to the current set (a table left as is on
-    Aurora DSQL is never written to).
+    PENDING chunk and loaded under the same original watermark, whose ``table_row_counts``
+    keys stay the run's original set. The watermark is extended ONLY for a Full load + CDC
+    addition (``cdc_additions``, G17) whose guards passed BEFORE any snapshot of this retry
+    opened (:func:`_guard_cdc_additions`: CDC never started, the target table exists and is
+    empty or replaced, and CDC can capture it with no gap -- MySQL replays its binary log
+    from the watermark's start point; PostgreSQL streams it from its publication join, just
+    before its copy) and whose copy completed with no quarantined row: it joins
+    ``Watermark.cdc_added_tables`` (:func:`_extend_cdc_coverage`). A Full load only retry
+    never extends it -- the signal that a CDC type has no gapless start for a table added
+    there. A refused addition is
+    recorded FAILED (never dropped, never loaded) and makes the run incomplete; the other
+    tables still load. ``run_table_names`` scopes the identity sync and the foreign-key
+    count to the current set (a table left as is on Aurora DSQL is never written to).
     """
     job_id = handle.job_id
     retry_names = {table.name for table in tables_to_retry}
@@ -4377,10 +4730,31 @@ def run_full_load_retry(
 
     # Bracketed like run_full_load's pre-loop, so a retry that ends here still leaves a
     # terminal line in the audit trail (not a dangling "retry started").
+    guarded: set[str] = set()
+    excluded: set[str] = set()
+    refused_count = 0
     try:
         # Step 0, as in run_full_load: the one ledger read, before the pre-drops.
         _require_overlay_ledger(migrator, tables_to_retry)
         _open_run_ledger_view(migrator, tables_to_retry, handle=handle)
+        # G17: the guards of the tables a Full load + CDC retry adds to CDC's capture run
+        # HERE -- after the ledger read, before the pre-drops and before any snapshot
+        # (every reader's, and the shared PostgreSQL anchor's, open inside
+        # _migrate_tables_in_parallel). A refused table is recorded FAILED and leaves the
+        # run: never dropped (out of replace_tables), never loaded.
+        retry_set = set(retry_names)
+        if cdc_additions:
+            guarded, refused, stopped = _guard_cdc_additions(
+                handle, job_id, error_log, migrator,
+                [n for n in cdc_additions if n in retry_set],
+                watermark=watermark, cdc_coverage_open=cdc_coverage_open,
+            )
+            refused_count = len(refused)
+            excluded = refused | stopped
+            base = getattr(migrator, "_inputs", None)
+            bind = getattr(migrator, "bind_run_inputs", None)
+            if refused and isinstance(base, DataMigrationInputs) and callable(bind):
+                bind(replace(base, replace_tables=frozenset(base.replace_tables - refused)))
         # Same run-level view pre-drop / recreate as run_full_load, so a retry that
         # DROP+recreates a table whose view dependency blocked the first attempt now
         # succeeds instead of silently skip-loading over stale rows.
@@ -4400,9 +4774,19 @@ def run_full_load_retry(
         )
         raise
     counts = _migrate_tables_in_parallel(
-        handle, job_id, tables_to_retry, migrator, error_log
+        handle, job_id,
+        [t for t in tables_to_retry if t.name not in excluded] if excluded
+        else tables_to_retry,
+        migrator, error_log,
     )
     _recreate_dependent_views(migrator)
+    # G17: the guarded additions that loaded completely join the watermark's coverage --
+    # BEFORE _finalize_run, so the save carrying the run's terminal status carries it too.
+    late_failed = _extend_cdc_coverage(
+        handle, job_id, error_log, migrator, guarded, cdc_coverage_open=cdc_coverage_open
+    )
+    if refused_count or late_failed:
+        counts = counts._replace(real_failed=counts.real_failed + refused_count + late_failed)
     # The whole run's tables (a retry completes the run): the identity sync and the FK
     # count both cover what the run loaded, not just the retried subset.
     _run_tables = [chunk.chunk_id for chunk in prior_chunks] or list(retry_names)
@@ -5251,6 +5635,14 @@ class BatchedTableMigrator:
             # coordinate (PostgreSQL: the WAL LSN, via the dialect) plus the scan-free
             # row-count baseline (dialect-dispatched: pg_class.reltuples for PG).
             return self._capture_postgres_watermark(source, table_names)
+        # G17: the start-point baselines of the migratable tables this run does not load.
+        # Passed only when there are some, so a capturer with the older signature (a test
+        # double) is called exactly as before.
+        baseline = tuple(getattr(self._inputs, "cdc_baseline_tables", None) or ())
+        if baseline:
+            return self._watermark_capturer.capture(
+                source, table_names, baseline_tables=baseline
+            )
         return self._watermark_capturer.capture(source, table_names)
 
     def _capture_postgres_watermark(
@@ -5387,6 +5779,369 @@ class BatchedTableMigrator:
                 )
         finally:
             engine.dispose()
+
+    def guard_cdc_additions(
+        self,
+        names: Sequence[str],
+        *,
+        watermark,
+        replace_tables: "frozenset[str] | set[str]" = frozenset(),
+        heartbeat: Optional[Callable[[], None]] = None,
+        cancelled: Optional[Callable[[], bool]] = None,
+    ) -> "dict[str, Optional[str]]":
+        """May CDC capture each of ``names`` -- tables selected after a Full load + CDC Full
+        Load -- from ``watermark``'s start point once this retry loads it? (G17)
+
+        ``{name: None}`` when it may, else a fixed refusal text (or
+        :data:`CDC_GUARD_STOPPED` after a Stop). Runs on the job's worker thread, BEFORE any
+        snapshot of the retry opens, never on the UI loop:
+
+        1. the target (both engines): a table this retry appends to (not in
+           ``replace_tables``) must exist and be EMPTY on Aurora DSQL -- one catalog read and
+           a ``SELECT 1 ... LIMIT 1``, never a count. Rows already there may predate the
+           changes CDC captures for it -- the Full Load's start point (MySQL) or its
+           publication join (PostgreSQL) -- and the load inserts ON CONFLICT DO NOTHING, so
+           they would keep values CDC never corrects.
+        2. MySQL: its live definition must equal the start-point BASELINE recorded with
+           the watermark (``table_fingerprints``) -- one bounded catalog read through the
+           read-only engine, no write. Debezium decodes its binary log from the original
+           position with today's definition.
+        3. PostgreSQL with the load's slot recorded: every table must keep a replica
+           identity PostgreSQL accepts for UPDATE/DELETE once published (live catalog, read
+           only: a valid primary key behind DEFAULT, a valid identity index, or FULL, on
+           every leaf of a partitioned table -- else publishing it would make each
+           UPDATE/DELETE on it fail on the source; unreadable refuses), and a re-keyed one
+           must already be REPLICA IDENTITY FULL (read, never set); the slot and publication
+           must be usable and publish every change type; then each table joins the
+           publication (one audited ADD each, isolated, which re-checks the identity right
+           before it), one transaction ID is taken and every transaction open at that moment
+           must end (bounded, heartbeating) -- only then may its copy start, or changes
+           those transactions made to it would be in neither the copy nor CDC's stream.
+           With no slot recorded, Start CDC re-snapshots every captured table, so nothing is
+           added or waited for.
+        """
+        beat = heartbeat or (lambda: None)
+        is_cancelled = cancelled or (lambda: False)
+        wanted = [n for n in dict.fromkeys(names or ()) if n]
+        out: dict[str, Optional[str]] = {}
+        if not wanted:
+            return out
+        if is_cancelled():
+            return {n: CDC_GUARD_STOPPED for n in wanted}
+        replaced = set(replace_tables or ())
+        appended = [n for n in wanted if n not in replaced]
+        if appended:
+            try:
+                facts = self.overlay_facts(appended, {}, probe_rows=True) or {}
+            except Exception:  # noqa: BLE001 - unknown is not "empty"
+                facts = {}
+            for name in appended:
+                table_facts = facts.get(name)
+                if table_facts is None or (
+                    table_facts.exists and getattr(table_facts, "has_rows", None) is None
+                ):
+                    out[name] = TARGET_UNKNOWN
+                elif not table_facts.exists:
+                    out[name] = TARGET_MISSING
+                elif table_facts.has_rows:
+                    out[name] = TARGET_HAS_ROWS
+            beat()
+        remaining = [n for n in wanted if n not in out]
+        if not remaining:
+            return out
+        if self.source_type is SourceType.POSTGRES:
+            out.update(self._guard_pg_additions(remaining, watermark, beat, is_cancelled))
+        else:
+            out.update(self._guard_mysql_additions(remaining, watermark))
+        return out
+
+    def _guard_mysql_additions(self, names: Sequence[str], watermark) -> "dict[str, Optional[str]]":
+        """The MySQL half of :meth:`guard_cdc_additions`: each table's live definition
+        against its start-point baseline. Read-only; a table with no comparable baseline is
+        refused without a read."""
+        from dsql_migrator.core.cdc_catalog_drift import (
+            check_start_point,
+            read_live_catalog,
+            start_point_comparable,
+        )
+
+        recorded = dict(getattr(watermark, "table_fingerprints", None) or {})
+        out: dict[str, Optional[str]] = {}
+        comparable = [n for n in names if start_point_comparable(recorded.get(n))]
+        for name in names:
+            if name not in comparable:
+                out[name] = NO_START_POINT
+        if not comparable:
+            return out
+        try:
+            engine = make_source_engine_factory(
+                self._inputs.source_password,
+                read_timeout_seconds=CDC_ADDITION_CATALOG_READ_SECONDS,
+            )(self._inputs.source_config)
+            try:
+                with engine.connect() as connection:
+                    live = read_live_catalog(
+                        connection, comparable, source_type=SourceType.MYSQL
+                    )
+            finally:
+                engine.dispose()
+        except Exception as exc:  # noqa: BLE001 - unreadable is not unchanged
+            cls = type(exc).__name__[:64]
+            out.update({n: MYSQL_UNREADABLE.format(cls=cls) for n in comparable})
+            return out
+        check = check_start_point(recorded, live, comparable)
+        changed = dict(check.changed)
+        unverified = set(check.unverified)
+        for name in comparable:
+            if name in changed:
+                out[name] = MYSQL_CHANGED.format(reason=changed[name])
+            elif name in unverified:
+                out[name] = NO_START_POINT
+            else:
+                out[name] = None
+        return out
+
+    def _guard_pg_additions(
+        self, names: Sequence[str], watermark, beat, is_cancelled
+    ) -> "dict[str, Optional[str]]":
+        """The PostgreSQL half of :meth:`guard_cdc_additions` (see there). Writes only
+        through :mod:`dsql_migrator.core.cdc_pg_slot`; both engines are disposed here."""
+        from dsql_migrator.core import cdc_pg_slot
+        from dsql_migrator.core.cdc import composite_key_columns_for_cdc
+
+        slot = getattr(watermark, "slot_name", None)
+        if not slot:
+            return {n: None for n in names}
+        pub = getattr(watermark, "publication_name", None) or ""
+        source = self._inputs.source_config
+        password = self._inputs.source_password
+        out: dict[str, Optional[str]] = {}
+        wanted = set(names)
+        # (a) Before any write, read only: every addition must keep a replica identity
+        # PostgreSQL accepts for UPDATE/DELETE once published (a valid primary key behind
+        # DEFAULT, a valid identity index, or FULL -- on every leaf of a partitioned table),
+        # or joining the publication would make each UPDATE/DELETE on it fail on the source,
+        # and nothing removes the member afterwards. The prerequisite reads the primary key
+        # from the Step 1 inventory, which can predate a dropped key, so the live catalog
+        # decides here -- unreadable or not found refuses (fail closed). A re-keyed table
+        # must also already be REPLICA IDENTITY FULL (the prerequisite requires it; the
+        # guard never takes the ALTER TABLE lock to set it).
+        rekey = {
+            t: cols
+            for t, cols in composite_key_columns_for_cdc(
+                self._inputs.inventory.tables, self._inputs.table_conversions
+            ).items()
+            if t in wanted
+        }
+        usability: "Optional[dict]" = None
+        reads: "Optional[dict]" = None
+        try:
+            engine = make_source_engine_factory(
+                password, read_timeout_seconds=CDC_ADDITION_CATALOG_READ_SECONDS
+            )(source)
+            try:
+                with engine.connect() as connection:
+                    usability = cdc_pg_slot.read_replica_identity_usability(
+                        connection, list(names)
+                    )
+                    if rekey:
+                        try:
+                            reads = cdc_pg_slot.read_rekeyed_replica_identity(
+                                connection, list(rekey)
+                            )
+                        except Exception:  # noqa: BLE001 - unknown, never FULL
+                            reads = None
+            finally:
+                engine.dispose()
+        except Exception:  # noqa: BLE001 - unreadable is not usable
+            usability = None
+        for table in names:
+            read = usability.get(table) if usability is not None else None
+            if read is None:
+                out[table] = PG_IDENTITY_UNREADABLE
+                continue
+            problem = cdc_pg_slot.replica_identity_problem(read)
+            if problem:
+                out[table] = PG_IDENTITY_UNUSABLE.format(cause=problem)
+        for table, columns in rekey.items():
+            if table in out:
+                continue
+            grade = (
+                cdc_pg_slot.REPLICA_IDENTITY_UNKNOWN
+                if reads is None
+                else cdc_pg_slot.grade_rekeyed_replica_identity(
+                    table, columns, reads.get(table)
+                )
+            )
+            if grade == cdc_pg_slot.REPLICA_IDENTITY_WEAK:
+                out[table] = PG_IDENTITY_NOT_FULL
+            elif grade == cdc_pg_slot.REPLICA_IDENTITY_UNKNOWN:
+                out[table] = PG_IDENTITY_UNKNOWN
+        beat()
+        remaining = sorted(n for n in names if n not in out)
+        if not remaining:
+            return out
+        if not pub:
+            out.update({n: PG_OBJECTS_GONE.format(slot=slot, pub="") for n in remaining})
+            return out
+        if is_cancelled():
+            out.update({n: CDC_GUARD_STOPPED for n in remaining})
+            return out
+
+        def _audit(message: str) -> None:
+            log_activity(
+                ActivityCategory.FULL_LOAD,
+                "CDC replication slot",
+                status=ActivityStatus.INFO,
+                detail=f"source: {message}",
+            )
+
+        def _write_refusal(exc: BaseException) -> str:
+            code = cdc_pg_slot.pg_sqlstate(exc)
+            if code == "42501":
+                return PG_ADD_OWNER.format(pub=pub)
+            if code in ("57014", "55P03"):
+                return PG_ADD_LOCK.format(pub=pub)
+            return PG_ADD_OTHER.format(
+                pub=pub, cls=type(exc).__name__[:64], code=code or "unknown"
+            )
+
+        try:
+            engine = cdc_pg_slot.build_pg_source_write_engine(
+                source, password, read_timeout_seconds=CDC_ADDITION_WRITE_TIMEOUT_SECONDS
+            )
+        except Exception as exc:  # noqa: BLE001 - nothing was written
+            cls = type(exc).__name__[:64]
+            out.update({n: PG_OBJECTS_UNREADABLE.format(cls=cls) for n in remaining})
+            return out
+        progress = {"wrote": False}
+
+        def _on_write(message: str) -> None:
+            # Every audit line but a failure or a no-op names a write that landed.
+            if not message.startswith("FAILED") and "not added again" not in message:
+                progress["wrote"] = True
+            _audit(message)
+
+        try:
+            with engine.connect() as connection:
+                self._guard_pg_on_source(
+                    connection, remaining, out, slot=slot, pub=pub, beat=beat,
+                    is_cancelled=is_cancelled, audit=_on_write,
+                    write_refusal=_write_refusal,
+                )
+        except Exception as exc:  # noqa: BLE001 - the connect, or an unexpected failure
+            cls = type(exc).__name__[:64]
+            refusal = (
+                CDC_GUARD_FAILED.format(cls=cls)
+                if progress["wrote"]
+                else PG_OBJECTS_UNREADABLE.format(cls=cls)
+            )
+            out.update({n: refusal for n in remaining if n not in out})
+        finally:
+            engine.dispose()
+        return out
+
+    def _guard_pg_on_source(
+        self, connection, remaining, out, *, slot, pub, beat, is_cancelled, audit,
+        write_refusal,
+    ) -> None:
+        """Steps (b)-(d) of the PostgreSQL guard over ONE write-engine connection; fills
+        ``out`` for every table in ``remaining``."""
+        from dsql_migrator.core import cdc_pg_slot
+
+        # (b) The load's slot and publication, as the source has them now.
+        try:
+            objects = cdc_pg_slot.read_pg_replication_objects(
+                connection, publication_name=pub, slot_name=slot
+            )
+        except Exception as exc:  # noqa: BLE001 - nothing was written
+            cls = type(exc).__name__[:64]
+            out.update({n: PG_OBJECTS_UNREADABLE.format(cls=cls) for n in remaining})
+            return
+        if not objects.publication_present or not objects.slot_usable:
+            out.update({n: PG_OBJECTS_GONE.format(slot=slot, pub=pub) for n in remaining})
+            return
+        if objects.publication_publishes_all_dml is False:
+            out.update({n: PG_DML.format(pub=pub) for n in remaining})
+            return
+        if objects.publication_via_partition_root is False:
+            try:
+                cdc_pg_slot.ensure_publication_via_partition_root(
+                    connection, name=pub, on_log=audit
+                )
+            except Exception as exc:  # noqa: BLE001 - every table refused
+                refusal = (
+                    PG_CONNECT.format(pub=pub, cls=type(exc).__name__[:64])
+                    if _pg_connection_lost(exc)
+                    else write_refusal(exc)
+                )
+                out.update({n: refusal for n in remaining})
+                return
+        # (c) Each table joins the publication, isolated: one refusal never stops the
+        # others, except a lost connection (every table not added yet).
+        passed: list[str] = []
+        for index, table in enumerate(remaining):
+            if is_cancelled():
+                out.update({n: CDC_GUARD_STOPPED for n in remaining[index:]})
+                break
+            try:
+                cdc_pg_slot.add_table_to_publication(
+                    connection, name=pub, table=table, on_log=audit
+                )
+            except cdc_pg_slot.PgPublicationMissingError:
+                out[table] = PG_OBJECTS_GONE.format(slot=slot, pub=pub)
+            except cdc_pg_slot.PgReplicaIdentityError as exc:
+                # The write layer's own fail-closed identity check, refused before its ADD
+                # (the identity changed since step (a), or could not be read).
+                out[table] = (
+                    PG_IDENTITY_UNREADABLE
+                    if exc.unreadable
+                    else PG_IDENTITY_UNUSABLE.format(cause=exc.cause)
+                )
+            except cdc_pg_slot.PgReplicationError as exc:
+                # Any other refusal of the write path, before its write.
+                out[table] = f"Not loaded: {str(exc).splitlines()[0][:300]}"
+            except Exception as exc:  # noqa: BLE001 - graded by SQLSTATE
+                if _pg_connection_lost(exc):
+                    cls = type(exc).__name__[:64]
+                    out.update({
+                        n: PG_CONNECT.format(pub=pub, cls=cls) for n in remaining[index:]
+                    })
+                    break
+                out[table] = write_refusal(exc)
+            else:
+                passed.append(table)
+            finally:
+                beat()
+        if not passed:
+            return
+        # (d) Every transaction open when they joined must end before any copy starts --
+        # also for a table that already was a member: the wait is relative to NOW, the
+        # moment its copy is about to begin.
+        try:
+            xid = cdc_pg_slot.take_xid_after_change(connection, on_log=audit)
+            outcome, seconds = cdc_pg_slot.wait_for_transactions_before(
+                connection,
+                xid,
+                timeout_seconds=CDC_ADDITION_WAIT_SECONDS,
+                poll_seconds=CDC_ADDITION_WAIT_POLL_SECONDS,
+                heartbeat=beat,
+                cancelled=is_cancelled,
+            )
+        except Exception as exc:  # noqa: BLE001 - unconfirmed is not finished
+            cls = type(getattr(exc, "__cause__", None) or exc).__name__[:64]
+            out.update({n: PG_WAIT_UNREADABLE.format(pub=pub, cls=cls) for n in passed})
+            return
+        if outcome == cdc_pg_slot.WAIT_DONE:
+            audit(
+                f"waited {round(seconds)} s for the transactions open when "
+                f"{', '.join(passed)} joined publication \"{pub}\" to finish"
+            )
+            out.update({n: None for n in passed})
+        elif outcome == cdc_pg_slot.WAIT_CANCELLED:
+            out.update({n: CDC_GUARD_STOPPED for n in passed})
+        else:
+            out.update({n: PG_WAIT_TIMEOUT.format(pub=pub) for n in passed})
 
     def migrate_table(
         self,
