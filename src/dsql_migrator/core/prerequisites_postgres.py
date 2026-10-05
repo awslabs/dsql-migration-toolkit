@@ -1154,7 +1154,7 @@ def check_cdc_replication_objects(
     under the combined tile with NO Full Load at all (nothing gates on the load), so a detail
     asserting "the Full Load creates them for this run" is false for that session -- and "they
     must not exist beforehand" was false even on the happy path, since ``create_publication``
-    REUSES a publication whose table set matches and ``provision_pg_replication`` DROPS a
+    REUSES a publication that covers the table set and ``provision_pg_replication`` DROPS a
     same-named stale slot. Gating instead of re-wording is NOT available: with no watermark the
     tool cannot tell "the load is still coming" from "there will never be one", and guessing
     would re-block the deploy-the-infra-DURING-the-load flow the tool itself recommends

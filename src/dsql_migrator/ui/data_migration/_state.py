@@ -736,6 +736,7 @@ class DataMigrationState:
         token: "Optional[tuple]" = None,
         lock_check: "Optional[Callable[[], Optional[str]]]" = None,
         convert_legacy: "Iterable[str]" = (),
+        keep_selected: "Iterable[str]" = (),
     ) -> Optional[str]:
         """Store a popup Save: ``resolution`` (``core.exclusion_rules.RuleResolution``) is
         the ONLY input -- this is the rules' setter; ``set_lob_exclusion`` stays the raw
@@ -752,7 +753,10 @@ class DataMigrationState:
         rule text are stored; exactly ``opened_with`` leaves the pending lines (a line
         another tab added meanwhile stays). ``convert_legacy`` names tables a Change &
         reload drops and reloads so their omit-only entries become overlay entries (NULL).
-        Never marks the overlay ledger in use: a run that overlays does.
+        ``keep_selected`` names stored tables the popup cannot list (G16: loaded tables a
+        stale target catalog hides, :func:`keep_unlisted_covered`): a selection the Save
+        changes keeps them, so CDC does not silently stop capturing them. Never marks the
+        overlay ledger in use: a run that overlays does.
         """
         if not resolution.can_save:
             return "The rules have errors: fix them before saving."
@@ -783,9 +787,12 @@ class DataMigrationState:
                     (t, c) for t, c in facts.entries
                     if c in new.get(t, ()) and t not in converted))
             if resolution.selected_after is not None:
-                self.selection = TableSelection(selected_tables=list(resolution.selected_after))
+                after = list(resolution.selected_after)
+                listed = set(after)
+                after += [n for n in dict.fromkeys(keep_selected or ()) if n not in listed]
+                self.selection = TableSelection(selected_tables=after)
                 self.selection_touched = True
-                self._clear_fk_result_on_scope_change(before, resolution.selected_after)
+                self._clear_fk_result_on_scope_change(before, after)
             self._rule_excluded_tables = set(resolution.rule_excluded_after)
             self._rule_reticked_tables = set()
             self._exclusion_rules_text = text
@@ -2210,9 +2217,22 @@ class DataMigrationState:
         what it was when the run started (``expected``, from :meth:`selection_snapshot`).
         A Save of table rules or a tree tick during the run already left an explicit
         selection; pinning the click-time set over it would undo that change (a
-        rule-unselected table loaded again). Atomic under the lock."""
+        rule-unselected table loaded again). Atomic under the lock.
+
+        Never after a Full Load in a CDC type with an explicit (touched) selection (G16):
+        CDC captures the loaded tables still STORED, and ``names`` is filtered to the
+        tables migratable now -- pinning it could silently drop a loaded table (a stale
+        target catalog) from CDC, even from a started pipeline at its next Start or Retry.
+        Only the operator narrows a CDC set; Full load only and pre-load pins are as
+        before."""
         with self._lock:
             if (tuple(self.selection.selected_tables), bool(self.selection_touched)) != expected:
+                return False
+            if (
+                getattr(self, "job_id", None) is not None
+                and self.migration_type is not MigrationType.FULL_LOAD_ONLY
+                and self.selection_touched
+            ):
                 return False
             self.selection = TableSelection(selected_tables=list(names))
             self.selection_touched = True

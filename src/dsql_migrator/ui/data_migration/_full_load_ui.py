@@ -44,6 +44,7 @@ from dsql_migrator.ui.data_migration._full_load_engine import (
     sync_identity_sequences_for_tables,
 )
 from dsql_migrator.ui.data_migration._models import (
+    MigrationType,
     session_source_type,
     SCOPE_ADDED_REASON,
     full_load_scope_names,
@@ -498,10 +499,11 @@ def _render_full_load_step(
     and the applied conversions, which the caller owns; the confirm dialog discloses
     whichever of them the current action covers.
     """
-    # G12: in Full load only the table set can change after the load. Every chunk-driven
-    # read below follows the CURRENT selection through a scoped view of the record (the
-    # record itself whenever nothing changed); the watermark and the error-log download
-    # keep the real record.
+    # G12: in Full load only the table set can change after the load (G16: in Full load +
+    # CDC it can drop tables until CDC starts, and the view stays removal-only after that).
+    # Every chunk-driven read below follows the CURRENT selection through a scoped view of
+    # the record (the record itself whenever nothing changed); the watermark and the
+    # error-log download keep the real record.
     _record_job = job
 
     def _scoped(record):
@@ -510,7 +512,8 @@ def _render_full_load_step(
             # read, which every running-poll tick would otherwise pay for nothing.
             return record
         return scope_full_load_job(
-            record, full_load_scope_names(migration_state, job_manager, selected_names)
+            record,
+            full_load_scope_names(migration_state, job_manager, selected_names, job=record),
         )
 
     job = _scoped(job)
@@ -1313,10 +1316,12 @@ def _render_full_load_step(
             ui.timer(_POLL_INTERVAL_SECONDS, _poll_live, once=True)
 
     def _poll_scoped(current) -> bool:
-        """The terminal poll for a Full load only set changed after the load (G12): the
-        CURRENT set decides (:func:`full_load_step_for_scope`), e.g. a DONE retry with a
-        selected table still not loaded is not a DONE step. Writes the step, refreshes and
-        returns True; False (an unchanged set) leaves the poll's own mapping to run."""
+        """The terminal poll for a set changed after the load (Full load only, G12; Full
+        load + CDC narrowed, G16): the CURRENT set decides (:func:`full_load_step_for_scope`),
+        e.g. a DONE retry with a selected table still not loaded is not a DONE step, and a
+        failed retry whose failures lie only in unticked tables is. Writes the step,
+        refreshes and returns True; False (an unchanged set) leaves the poll's own mapping
+        to run."""
         view = _scoped(current)
         if view is current:
             return False
@@ -1401,7 +1406,9 @@ def _render_full_load_step(
         # drops the same rows again. Honour the decision here, exactly as the finaliser and
         # the panel already do. Still gated on quarantine-ONLY, so a real retryable failure
         # is never waved through by a stale flag.
-        if _poll_scoped(current):  # G12: a changed Full load only set decides itself
+        # G12/G16: a changed Full load only set, or a narrowed Full load + CDC set,
+        # decides itself.
+        if _poll_scoped(current):
             return
         if (
             mapped is StepStatus.FAILED
@@ -1433,7 +1440,13 @@ def _render_full_load_step(
     # recovery actions: which selected tables are not loaded yet, which are left as is.
     # A run guard (the prerequisite checks a newly selected table never had) is named first:
     # Retry unfinished tables refuses the newly selected tables until it clears.
-    _notice = scope_notice(_record_job, job, blocked_by=guard_reason if _added else None)
+    _notice = scope_notice(
+        _record_job,
+        job,
+        blocked_by=guard_reason if _added else None,
+        cdc=getattr(migration_state, "migration_type", None)
+        is MigrationType.FULL_LOAD_AND_CDC,
+    )
     if _notice is not None and status is not StepStatus.IN_PROGRESS:
         render_notice(ui, tone=_notice[0], header=_notice[1], body=_notice[2])
 
@@ -1556,8 +1569,9 @@ def _render_full_load_step(
             _quarantine_only_error = _incomplete_is_quarantine_only(
                 job, migration_state.error_log, _view_tables(_record_job, job)
             )
-            # After a Full load only set change (G12) the job's error can belong to a
-            # table no longer selected: when the current set is complete, no red box.
+            # After a Full load only set change (G12) or a Full load + CDC narrowing (G16)
+            # the job's error can belong to a table no longer selected: when the current
+            # set is complete, no red box.
             _scope_clears_error = job is not _record_job and full_load_step_for_scope(
                 _record_job,
                 job,
@@ -1725,8 +1739,9 @@ def _render_full_load_step(
                 # so a table that loaded CLEANLY but has to be re-loaded -- the normal
                 # case after re-applying ONE table's schema on the Schema Conversion
                 # step, which drops and recreates it EMPTY -- had no control. The table
-                # picker is locked once a load has run (Full load only excepted: there the
-                # set can change, but re-ticking a loaded table does not reload it), so
+                # picker is locked once a load has run (Full load only excepted, and Full
+                # load + CDC until CDC first starts, removals only, G16: there the set can
+                # change, but re-ticking a loaded table does not reload it), so
                 # the only escape was a full
                 # "Re-run Full Load" over every table (a whole-source re-read) or Start
                 # over (discarding Evaluation, the conversion edits and the CDC inputs).
@@ -1868,7 +1883,8 @@ def _incomplete_is_quarantine_only(
 def submit_scope_identity_sync(job_manager, session, view) -> bool:
     """Submit the identity-sequence sync a failed or cancelled run skipped, once its step
     turns DONE because its unfinished work lies only in tables no longer selected (Full load
-    only, G12). Returns True when a job was submitted.
+    only, G12; Full load + CDC before CDC starts, G16). Returns True when a job was
+    submitted.
 
     ``_finalize_run`` syncs only a complete run, so -- exactly as for an accepted
     quarantine gap -- a GENERATED BY DEFAULT identity key would stay at its start value
@@ -1899,11 +1915,12 @@ def _view_tables(job, view) -> "Optional[list[str]]":
 def full_load_step_for_scope(
     job, scoped, *, accepted: bool, error_log
 ) -> "Optional[StepStatus]":
-    """The Data Migration step status the CURRENT table set earns (G12). Pure.
+    """The Data Migration step status the CURRENT table set earns (G12, G16). Pure.
 
     For an unchanged set (``scoped is job``) this is exactly the live poll's mapping: the
     job's status, with an accepted quarantine-only gap counting as DONE. After a set
-    change in Full load only, the view decides instead: a selected table not loaded
+    change in Full load only (or a Full load + CDC set narrowed after its load, G16 -- a
+    removal-only view), the view decides instead: a selected table not loaded
     (unsettled) or an unaccepted quarantine in it is FAILED; a DONE job is DONE; a failed
     or cancelled job is DONE only when its unfinished work lies entirely in tables no
     longer selected -- a run-level failure or a cancel with every chunk loaded stays

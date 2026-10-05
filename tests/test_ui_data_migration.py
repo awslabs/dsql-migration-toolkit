@@ -17031,12 +17031,16 @@ def test_start_cdc_shows_the_table_set_plainly_with_the_why_on_hover() -> None:
         def __init__(self, tables):
             self.tables = tables
 
-    def _render(*, job, mtype, inventory=None):
+    def _render(*, job, mtype, inventory=None, started_before=False):
         ui = _RecordingUi()
         state = DataMigrationState()
         state.migration_type = mtype
         state.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
         state.job_id = "job-1" if job is not None else None
+        if started_before:
+            # A Start CDC was submitted earlier (the durable marker survives a Stop), so a
+            # Full load + CDC set can no longer drop tables (G16).
+            state.set_cdc_ops_window_start(datetime(2026, 8, 2, tzinfo=timezone.utc))
         jm = _StubJobManager({"job-1": job} if job is not None else {})
         _cdc_ui._render_cdc_start_button(
             ui, state, jm, lambda: None, inventory=inventory, session=None
@@ -17062,9 +17066,11 @@ def test_start_cdc_shows_the_table_set_plainly_with_the_why_on_hover() -> None:
             table_row_counts={f"ecommerce.t{i}": 100 for i in range(8)},
         )
 
-    # --- Full Load + CDC, load finished -> Start over is the only real exit ---
+    # --- Full Load + CDC, load finished, CDC started before -> Start over is the only
+    # real exit (G16 lifts nothing once CDC has started) ---
     after = _render(
-        job=_LoadedJob(), mtype=MigrationType.FULL_LOAD_AND_CDC, inventory=inventory
+        job=_LoadedJob(), mtype=MigrationType.FULL_LOAD_AND_CDC, inventory=inventory,
+        started_before=True,
     )
     visible = " ".join(after.texts)
     hover = " ".join(after.tooltips)
@@ -17085,14 +17091,29 @@ def test_start_cdc_shows_the_table_set_plainly_with_the_why_on_hover() -> None:
     assert "gapless" in hover
     assert "delete the CDC infrastructure" not in hover
 
+    # --- Full Load + CDC, load finished, CDC never started (G16): the set can still DROP
+    # tables until Start, so the tooltip says so instead of "This set is fixed" ---
+    narrowing = _render(
+        job=_LoadedJob(), mtype=MigrationType.FULL_LOAD_AND_CDC, inventory=inventory
+    )
+    n_visible = " ".join(narrowing.texts)
+    n_hover = " ".join(narrowing.tooltips)
+    assert "Ready to start CDC" in n_visible and "Will stream 8 tables" in n_visible
+    assert "Will stream" not in n_hover
+    assert "Until you start CDC, you can still untick tables in the table list" in n_hover
+    assert "Once CDC starts this set is fixed" in n_hover and "partitions" in n_hover
+    assert "This set is fixed" not in n_hover
+    assert "Start over" in n_hover and "gapless" in n_hover
+    assert "delete the CDC infrastructure" not in n_hover
+
     # --- CDC-only, no Full Load -> delete + redeploy genuinely re-scopes ---
     cdc_only = _render(job=None, mtype=MigrationType.CDC_ONLY)
     cdc_hover = " ".join(cdc_only.tooltips)
     assert "delete the CDC infrastructure" in cdc_hover
     assert "Start over" not in cdc_hover
 
-    # Neither variant tells the operator to go pick tables (the picker is locked).
-    for blob in (visible, hover, " ".join(cdc_only.texts), cdc_hover):
+    # No variant tells the operator to go pick tables (the picker is locked for adds).
+    for blob in (visible, hover, n_visible, n_hover, " ".join(cdc_only.texts), cdc_hover):
         assert "Pick all your tables" not in blob
         assert "up front" not in blob
 

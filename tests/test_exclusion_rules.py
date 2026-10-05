@@ -533,6 +533,57 @@ def test_e3_only_when_a_locked_selection_would_change():
     assert "shop.audit_keep" in removed.global_errors[0].message and not removed.can_save
 
 
+def test_reselect_lock_raises_per_table_e3():
+    # G16 (FAILS WITHOUT THE FIX: no such parameter): with NO selection lock (Full load +
+    # CDC before CDC starts), only the re-selections the per-table lock refuses are E3.
+    applied = [n for n in ALL if n not in ("shop.audit_2023", "shop.audit_2024", "shop.audit_keep")]
+    prov = {"shop.audit_2023", "shop.audit_2024", "shop.audit_keep"}
+    asked: list = []
+
+    def lock(names):
+        asked.append(list(names))
+        # shop.users too: the unselect below must never be judged by this lock.
+        blocked = [n for n in names if n in ("shop.audit_keep", "shop.users")]
+        return (blocked, "Not in the snapshot.") if blocked else None
+
+    def res(text, reselect_lock=lock):
+        return resolve_exclusion_rules(
+            text, migratable=TABLES, source_type=MY, effective_selection=applied,
+            rule_excluded_prev=prov, reselect_lock=reselect_lock)
+
+    # A deleted rule re-selects all three: only the refused one is a global E3.
+    deleted = res("exclude shop.users.notes")
+    assert not deleted.errors and not deleted.can_save
+    (e3,) = deleted.global_errors
+    assert e3.code == "E3" and e3.message == (
+        "Save would re-select shop.audit_keep: no table rule unselects it any more. "
+        "Not in the snapshot.")
+    # An include line re-selecting it is a line E3 (the global check sees it explained).
+    inc = res("exclude table shop.audit_*\ninclude table shop.audit_keep")
+    assert [e.code for e in inc.errors[2]] == ["E3"] and not inc.global_errors
+    assert inc.errors[2][0].message == (
+        "This rule would select shop.audit_keep again. Not in the snapshot.")
+    # Re-selecting an allowed table, or unselecting one, is never refused.
+    ok = res("exclude table shop.audit_*\ninclude table shop.audit_2024")
+    assert ok.can_save and ok.tables_to_reselect == ("shop.audit_2024",)
+    unsel = res("exclude table shop.audit_*\nexclude table shop.users")
+    assert unsel.can_save and unsel.tables_to_unselect == ("shop.users",)
+    # The binary lock wins over it (the lock is not even asked), and None is today's path.
+    asked.clear()
+    locked = resolve_exclusion_rules(
+        "exclude shop.users.notes", migratable=TABLES, source_type=MY,
+        effective_selection=applied, rule_excluded_prev=prov,
+        selection_lock_reason="Locked.", reselect_lock=lock)
+    assert asked == [] and "Locked." in locked.global_errors[0].message
+    for text in ("exclude shop.users.notes",
+                 "exclude table shop.audit_*\ninclude table shop.audit_keep"):
+        plain = res(text, reselect_lock=None)
+        today = resolve_exclusion_rules(
+            text, migratable=TABLES, source_type=MY, effective_selection=applied,
+            rule_excluded_prev=prov)
+        assert plain == today and plain.can_save
+
+
 def test_an_empty_result_is_refused():
     res = _res("exclude table *.*")
     assert [e.code for e in res.global_errors] == ["E5"] and not res.can_save

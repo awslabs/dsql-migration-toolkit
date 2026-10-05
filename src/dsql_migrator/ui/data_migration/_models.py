@@ -324,6 +324,21 @@ def unsettled_table_names(job: MigrationJob) -> list[str]:
     return [chunk.chunk_id for chunk in job.chunks if chunk.status != "DONE"]
 
 
+def untick_can_settle(job, names: "Optional[Sequence[str]]") -> bool:
+    """Could unticking a selected table settle a FAILED Full Load step (G16)? True when a
+    table of the current view (``names``; ``None`` = the whole record) did not finish or
+    dropped rows. A run-level failure with every one of them loaded -- a post-load pass
+    raised, an app restart or a Stop after the last table -- stays Failed whatever is
+    unticked (:func:`~dsql_migrator.ui.data_migration._full_load_ui.full_load_step_for_scope`),
+    so offering the untick there would be a dead end. Pure, O(tables)."""
+    wanted = None if names is None else set(names)
+    return any(
+        chunk.status != "DONE" or (getattr(chunk, "rows_quarantined", 0) or 0) > 0
+        for chunk in getattr(job, "chunks", None) or ()
+        if wanted is None or chunk.chunk_id in wanted
+    )
+
+
 def recreated_unfinished(job: MigrationJob) -> list[str]:
     """Tables the tool DROP+recreated in this job lineage that did not finish.
 
@@ -341,11 +356,12 @@ def recreated_unfinished(job: MigrationJob) -> list[str]:
 
 # ---------------------------------------------------------------------------
 # G12: a Full load only table set that changed after the Full Load (NiceGUI-agnostic)
+# G16: a Full load + CDC table set narrowed after its Full Load, before CDC starts
 # ---------------------------------------------------------------------------
 #
 # The job record keeps its whole history (and its watermark is never touched); every
 # surface that reads chunks reads a SCOPED VIEW of it instead -- the identical object
-# whenever nothing changed, so a CDC type, an untouched selection or an unchanged set
+# whenever nothing changed, so CDC only, an untouched selection or an unchanged set
 # render exactly as before.
 
 SCOPE_NOTICE_HEADER = "Table set changed after the last Full Load"
@@ -358,15 +374,143 @@ def _names_text(names: "Sequence[str]") -> str:
     return bounded_table_names(list(names))
 
 
-def full_load_scope_names(migration_state, job_manager, selected) -> "Optional[list[str]]":
+def _watermark_covered(watermark) -> "Optional[frozenset[str]]":
+    """The tables a Full Load watermark covers (its per-table count keys), or ``None``."""
+    counts = getattr(watermark, "table_row_counts", None) if watermark is not None else None
+    return frozenset(counts) if counts else None
+
+
+def _stored_selection(migration_state) -> "list[str]":
+    selection = getattr(migration_state, "selection", None)
+    return list(getattr(selection, "selected_tables", None) or ())
+
+
+def cdc_capture_names(migration_state, watermark) -> "Optional[frozenset[str]]":
+    """The tables CDC captures from a Full Load ``watermark`` (G16), or ``None`` when it
+    carries no per-table counts (the selection / deployed-list fallbacks then apply).
+
+    The watermark's covered tables -- the set that run started with, its only gapless
+    start point -- narrowed to the STORED selection when that is touched: a table unticked
+    after the load (Full load + CDC before CDC starts, or a Full load only set switched to
+    a CDC type) is never captured, and a table selected since is never added. An untouched
+    selection is the covered set (a default that drifted is no decision); a touched, EMPTY
+    one captures nothing. Never resolves through ``TableSelector``, so it cannot raise.
+    When nothing was narrowed (the selection holds every covered table) this is exactly
+    the covered set, as before. Pure, O(tables).
+    """
+    covered = _watermark_covered(watermark)
+    if covered is None:
+        return None
+    if not getattr(migration_state, "selection_touched", False):
+        return covered
+    return covered & frozenset(_stored_selection(migration_state))
+
+
+def keep_unlisted_covered(
+    stored: "Sequence[str]", listed: "Sequence[str]", covered: "Iterable[str]"
+) -> "list[str]":
+    """The stored names a tree or popup write keeps although it cannot list them (G16):
+    covered by the Full Load watermark but not in ``listed`` (the migratable universe the
+    tree and the rules see -- e.g. a loaded table a stale target catalog no longer counts).
+    A write stores ``(listed AND ticked)``, which would silently drop such a table, and CDC
+    captures the covered tables still STORED. Stored order. Pure."""
+    listed_set = set(listed or ())
+    covered_set = set(covered or ())
+    return [n for n in dict.fromkeys(stored or ()) if n in covered_set and n not in listed_set]
+
+
+def narrowed_record_names(migration_state, job) -> "Optional[list[str]]":
+    """The Full Load record's tables still selected, when a Full load + CDC set was narrowed
+    after its load (G16); ``None`` when the views read the record as is.
+
+    ``None`` unless the selection is touched, the record carries per-table watermark counts,
+    and the STORED selection keeps some but not all of the record's tables (an emptied
+    selection reads the record as is: nothing can be retried or captured then anyway). Names
+    only record tables, in record order, so the scoped view can never gain a PENDING chunk:
+    Full load + CDC drops tables after its load, it never adds one. A selection ticked back
+    to every record table is ``None`` again (:func:`whole_record_selected`: the step is then
+    judged on the record itself). Pure, O(tables)."""
+    if job is None or not getattr(migration_state, "selection_touched", False):
+        return None
+    if _watermark_covered(getattr(job, "watermark", None)) is None:
+        return None
+    stored = set(_stored_selection(migration_state))
+    record = [c.chunk_id for c in getattr(job, "chunks", None) or ()]
+    kept = [n for n in record if n in stored]
+    if not kept or len(kept) == len(record):
+        return None
+    return kept
+
+
+def whole_record_selected(migration_state, job) -> bool:
+    """Does a touched Full load + CDC selection hold every table of the Full Load record
+    (G16)? Nothing is narrowed then (:func:`narrowed_record_names` is ``None``), and a step
+    an untick turned DONE must be judged on the record itself again -- a table ticked back
+    whose load failed makes it Failed, as in Full load only (G12). Pure, O(tables)."""
+    if getattr(migration_state, "migration_type", None) is not MigrationType.FULL_LOAD_AND_CDC:
+        return False
+    if job is None or not getattr(migration_state, "selection_touched", False):
+        return False
+    record = [c.chunk_id for c in getattr(job, "chunks", None) or ()]
+    if not record:
+        return False
+    stored = set(_stored_selection(migration_state))
+    return all(n in stored for n in record)
+
+
+def capture_load_complete(job, captured: "Iterable[str]") -> bool:
+    """Did every CAPTURED table load completely although the run as a whole did not? Pure.
+
+    True only for a FAILED or CANCELLED record whose unfinished work lies entirely in tables
+    CDC no longer captures (G16): every captured table has a DONE chunk with no quarantined
+    row, and some chunk outside the capture is not DONE or quarantined rows. A run-level
+    failure (every chunk DONE), any gap in a captured table, or an empty capture stays False
+    -- the PostgreSQL slot is then still suppressed (a lossless re-snapshot, the safe side).
+    """
+    if job is None or getattr(job, "status", None) not in ("FAILED", "CANCELLED"):
+        return False
+    names = set(captured or ())
+    if not names:
+        return False
+    by_name = {c.chunk_id: c for c in getattr(job, "chunks", None) or ()}
+
+    def _complete(chunk) -> bool:
+        return chunk.status == "DONE" and not (getattr(chunk, "rows_quarantined", 0) or 0)
+
+    if any(n not in by_name or not _complete(by_name[n]) for n in names):
+        return False
+    return any(not _complete(c) for n, c in by_name.items() if n not in names)
+
+
+def full_load_scope_names(
+    migration_state, job_manager, selected, *, job=None
+) -> "Optional[list[str]]":
     """The selection the Full Load views follow, or ``None`` (they read the record as is).
 
-    A list only in Full load only, with a TOUCHED, non-empty selection, while
+    Full load only (G12): a list only with a TOUCHED, non-empty selection, while
     :func:`table_set_editable_after_load` holds. The touched rule keeps an untouched
     Schema Conversion default that drifted from being read as a change: the prerequisite
     run pins a touched set before any load, so a real migration always has one.
+
+    Full load + CDC (G16): the record's tables still in the STORED selection
+    (:func:`narrowed_record_names`; ``selected`` is not read) -- removal only, and NOT tied
+    to the predicate, so once CDC starts (the set is then locked again) a table unticked
+    before it never comes back as a red error or a Retry / Reload row. ``job`` is the Full
+    Load record when the caller already holds it (a read is a deep copy of the record);
+    ``None`` reads it here, and only for a touched selection.
     """
-    if getattr(migration_state, "migration_type", None) is not MigrationType.FULL_LOAD_ONLY:
+    mtype = getattr(migration_state, "migration_type", None)
+    if mtype is MigrationType.FULL_LOAD_AND_CDC:
+        if not getattr(migration_state, "selection_touched", False):
+            return None
+        if job is None:
+            if job_manager is None:
+                return None
+            from dsql_migrator.ui.data_migration._cdc_status import _current_job
+
+            job = _current_job(job_manager, getattr(migration_state, "job_id", None))
+        return narrowed_record_names(migration_state, job)
+    if mtype is not MigrationType.FULL_LOAD_ONLY:
         return None
     if not getattr(migration_state, "selection_touched", False):
         return None
@@ -430,8 +574,10 @@ def watermark_coverage_gap(
 
     ``None`` without a job or per-table watermark counts (nothing to compare). The
     watermark's keys are the run's table set -- every run table gets one -- and CDC
-    streams exactly them (``_cdc_tables_for_config``), so a difference means a CDC type
-    would capture the wrong tables. A covered table that is no longer migratable (left
+    captures the covered tables still selected (:func:`cdc_capture_names`, G16): a table
+    selected since has no gapless start point there, while one unselected since is simply
+    not captured (the type-switch lock counts it only once CDC has started for the
+    migration, whose set is fixed then). A covered table that is no longer migratable (left
     the target) is not "unselected since". Pure.
     """
     watermark = getattr(job, "watermark", None) if job is not None else None
@@ -444,28 +590,55 @@ def watermark_coverage_gap(
     return sorted(chosen - covered), sorted((covered & universe) - chosen)
 
 
-def coverage_lock_reason(gap: "tuple[Sequence[str], Sequence[str]]") -> str:
-    """The migration-type lock text for a table set that left its watermark behind."""
-    added, removed = gap
-    parts = []
-    if added:
-        parts.append(f"selected since: {_names_text(added)}")
-    if removed:
-        parts.append(f"unselected since: {_names_text(removed)}")
+def coverage_lock_reason(
+    gap: "tuple[Sequence[str], Sequence[str]]", *, started: bool = False
+) -> str:
+    """The migration-type lock text for a table set changed after the Full Load.
+
+    Before CDC has started for the migration only tables selected since lock (the gap's
+    ``selected since`` half): the watermark gives them no gapless start point, while a
+    removal alone never locks (CDC captures the loaded tables still selected, G16). Once CDC
+    has started (``started``) -- even if stopped and deleted since -- any change locks, both
+    halves are named: a detour through Full load only must not change the set a started CDC
+    captured."""
+    if started:
+        added, removed = gap
+        parts = []
+        if added:
+            parts.append(f"selected since: {_names_text(added)}")
+        if removed:
+            parts.append(f"unselected since: {_names_text(removed)}")
+        return (
+            f"Locked — the table set changed after this Full Load ({'; '.join(parts)}), and "
+            "CDC has already started for this migration: a CDC type cannot continue a set "
+            "that differs from the one that run started with. To add CDC, re-run Full Load "
+            "over the current set (it takes a fresh watermark), or restore the original "
+            "table set."
+        )
+    added = list(gap[0])
+    one = len(added) == 1
     return (
-        f"Locked — the table set changed after this Full Load ({'; '.join(parts)}), and "
-        "its watermark covers only the tables that run started with. A CDC type would "
-        "stream that original set: a table selected since would not be captured, and a "
-        "table unselected since would keep streaming. To add CDC, re-run Full Load over "
-        "the current set (it takes a fresh watermark), or restore the original table set."
+        f"Locked — the table set changed after this Full Load (selected since: "
+        f"{_names_text(added)}), and its watermark covers only the tables that run started "
+        f"with, so a CDC type has no gapless start point for {'it' if one else 'them'}. "
+        "Unticking tables does not lock the type: CDC captures the loaded tables still "
+        "selected. To add CDC, re-run Full Load over the current set (it takes a fresh "
+        f"watermark), or untick {'it' if one else 'them'} again."
     )
 
 
 COVERAGE_GAP_NOTICE_BODY = (
-    "The table set changed after this Full Load, so its watermark does not cover the "
-    "current set and CDC cannot continue from it. To add CDC, re-run Full Load over the "
-    "current set first (it takes a fresh watermark), or restore the original table set; "
-    "the migration type unlocks then."
+    "Tables were selected after this Full Load, so its watermark does not cover them and "
+    "CDC cannot continue them from it. To add CDC, re-run Full Load over the current set "
+    "first (it takes a fresh watermark), or untick them again; the migration type unlocks "
+    "then."
+)
+# The same notice once CDC has started for the migration (any change to the set locks).
+COVERAGE_GAP_NOTICE_BODY_STARTED = (
+    "The table set changed after this Full Load, and CDC has already started for this "
+    "migration: CDC cannot continue a set that differs from the one this run started with. "
+    "To add CDC, re-run Full Load over the current set first (it takes a fresh watermark), "
+    "or restore the original table set; the migration type unlocks then."
 )
 COVERAGE_GAP_NOTICE_PG_SUFFIX = (
     " On PostgreSQL, CDC then re-reads the tables either way (a Full load only run "
@@ -486,14 +659,15 @@ def added_since_run_reason(added: "Sequence[str]", since: str = "the last Full L
 
 
 def scope_notice(
-    job, scoped, *, blocked_by: "Optional[str]" = None
+    job, scoped, *, blocked_by: "Optional[str]" = None, cdc: bool = False
 ) -> "Optional[tuple[str, str, str]]":
     """``(tone, header, body)`` of the Full Load card's scope notice, or ``None`` when the
     view is the record. Warning while a selected table is not loaded yet -- the step then
     reads Failed, which the notice says, since nothing failed; info for a removal alone (a
     left-as-is table is expected, not a problem). ``blocked_by`` (the run guard, e.g. the
     prerequisite checks a newly selected table never had) is named FIRST: until it clears,
-    Retry unfinished tables refuses the newly selected tables."""
+    Retry unfinished tables refuses the newly selected tables. ``cdc`` (Full load + CDC,
+    G16): the removal sentence also says CDC does not capture the unselected tables."""
     added, removed = scope_change(job, scoped)
     if not added and not removed:
         return None
@@ -512,6 +686,11 @@ def scope_notice(
         one = len(removed) == 1
         sentences.append(
             f"{len(removed)} table{'' if one else 's'} no longer selected "
+            f"({_names_text(removed)}) {'is' if one else 'are'} left as is on Aurora DSQL "
+            f"(not dropped): CDC does not capture {'it' if one else 'them'}, and this "
+            f"migration no longer loads or validates {'it' if one else 'them'}."
+            if cdc
+            else f"{len(removed)} table{'' if one else 's'} no longer selected "
             f"({_names_text(removed)}) {'is' if one else 'are'} left as is on Aurora DSQL "
             f"(not dropped); this migration no longer loads or validates "
             f"{'it' if one else 'them'}."
@@ -2444,12 +2623,18 @@ def popup_resolution(
     capture_tables: "Optional[Callable[[Sequence[str]], Sequence[object]]]" = None,
     memo_slot: str = "editor",
     convert_legacy: "Iterable[str]" = (),
+    add_lock=None,
 ):
     """:func:`~dsql_migrator.core.exclusion_rules.resolve_exclusion_rules` over this
     session's live inputs: the ONE context (selected' + focus, warnings on), the resolved
     selection, the provenance and re-ticks, the legacy (omit-only) entries, the stored set
     for the diff, the applied DDL and live columns for 42703 and the target changes, and --
     when ``capture_tables(selected')`` is given (CDC types) -- the capture preview.
+
+    ``add_lock`` (Full load + CDC after its Full Load, before CDC starts, G16: the table
+    picker's per-table add-lock, ``_cdc_monitoring.TableSetAddLock``) turns a table line
+    that would select a table the lock refuses into a per-table E3; ``None`` changes
+    nothing.
 
     Memoized on the state (transient) by the text's digest and every input, the inventory,
     applied set and live columns held by IDENTITY (a reused ``id`` never serves a stale
@@ -2484,6 +2669,7 @@ def popup_resolution(
         deployed if capture_tables is not None else None,
         capture_tables is not None,
         source_type,
+        add_lock,
     )
     held = (inventory, inputs.applied, inputs.live_columns, inputs.view_ddls)
     memos = getattr(migration_state, "_exclusion_resolution_memo", None)
@@ -2509,6 +2695,12 @@ def popup_resolution(
             return capture_exclusions_for(
                 columns, columns, inventory, list(capture_tables(selected)), deployed)
 
+    reselect_lock = None
+    if add_lock is not None:
+        def reselect_lock(names):
+            blocked = add_lock.blocked(names, tree=False)
+            return (blocked, add_lock.refusal(blocked, tree=False)) if blocked else None
+
     resolution = resolve_exclusion_rules(
         text,
         migratable=migratable,
@@ -2523,6 +2715,7 @@ def popup_resolution(
         legacy=legacy,
         stored_columns=stored,
         capture=capture,
+        reselect_lock=reselect_lock,
     )
     memos[memo_slot] = (key, held, resolution)
     return resolution

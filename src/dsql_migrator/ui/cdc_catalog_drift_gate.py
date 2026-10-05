@@ -111,9 +111,10 @@ class CatalogBaseline:
     """What the migration was built from, as the builder-registered handle reports it.
 
     ``inventory`` is the Step 1 ``SourceInventory``; ``captured`` the inventory tables CDC
-    captures (watermark, else selection, else the deployed TableIncludeList -- Start CDC's
-    own chain); ``capture_names`` the raw names that chain matched (a captured table that has
-    since left the inventory is still named there).
+    captures (the watermark's covered tables still selected -- a Full load + CDC table
+    unticked before CDC started is not captured, G16 -- else the selection, else the
+    deployed TableIncludeList: Start CDC's own chain); ``capture_names`` the raw names that
+    chain matched (a captured table that has since left the inventory is still named there).
     """
 
     inventory: Any

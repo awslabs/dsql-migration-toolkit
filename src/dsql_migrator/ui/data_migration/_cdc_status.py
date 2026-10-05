@@ -276,17 +276,22 @@ def _migration_status_tables(migration_state, job_manager) -> list[str]:
     """The table names to show in the per-table migration-status view.
 
     Prefers the Full Load job's chunk ids (the tables actually migrated) -- the
-    authoritative set across Full Load + CDC. But CDC commonly runs WITHOUT a Full
-    Load job in this session (reconnected to an already-running pipeline, or a
-    CDC-only run), so fall back to the tables reconciled from the live stack's config.
-    Without this fallback the per-table view -- and its scan-free CDC metrics (net
-    rows, stream lag, and the live lag chart, all scoped to this set) -- would be
-    empty even while the pipeline is actively streaming. ``[]`` only when neither the
-    job nor a reconciled set is known.
+    authoritative set across Full Load + CDC -- narrowed to the ones still selected when a
+    Full load + CDC set dropped tables after its load (G16: those are neither captured nor
+    counted, so their exact target COUNT(*) and CDC metric reads are skipped too). But CDC
+    commonly runs WITHOUT a Full Load job in this session (reconnected to an
+    already-running pipeline, or a CDC-only run), so fall back to the tables reconciled
+    from the live stack's config. Without this fallback the per-table view -- and its
+    scan-free CDC metrics (net rows, stream lag, and the live lag chart, all scoped to this
+    set) -- would be empty even while the pipeline is actively streaming. ``[]`` only when
+    neither the job nor a reconciled set is known.
     """
+    from dsql_migrator.ui.data_migration._models import narrowed_record_names
+
     job = _current_job(job_manager, migration_state.job_id)
     if job is not None:
-        return [c.chunk_id for c in job.chunks]
+        narrowed = narrowed_record_names(migration_state, job)
+        return narrowed if narrowed is not None else [c.chunk_id for c in job.chunks]
     return list(getattr(migration_state, "cdc_reconciled_table_names", []) or [])
 
 

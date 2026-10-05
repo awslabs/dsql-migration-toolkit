@@ -242,7 +242,9 @@ A table selected after the load (Full load only lets the table set change; see
 [13.7](13-excluding-tables-and-columns.md)) is loaded by the same retry, but the
 original watermark does not cover it, so the CDC handoff holds only for the original
 set: the migration type stays on Full load only until Re-run Full Load takes a fresh
-watermark over the current set (or you restore the original set).
+watermark over the current set (or you untick the tables selected since).
+
+Unticking tables does not lock the type unless CDC has already started for this migration: CDC captures the loaded tables still selected. In Full load + CDC you can untick tables after the load until CDC starts. They are left as is on Aurora DSQL, CDC does not capture them, the watermark still covers every captured table (the handoff stays gapless), and a failure only in unticked tables no longer holds the step.
 
 > **Run Full Load from the command line (optional).** The same bulk loader is
 > available as a CLI script — `scripts/run_full_load.py` (plan first, then `--yes`;

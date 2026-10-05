@@ -249,7 +249,7 @@ over를 보류합니다). 기본값·주석·콜레이션·인덱스는 비교�
 2. CDC를 시작하면 도구가 바로 그 워터마크에 재개 지점을 확립합니다. **MySQL 소스**에서는 커넥터의
    **시작 오프셋을 시드**합니다(소스 커넥터가 시작하기 전에 in-VPC Lambda가 오프셋 레코드를 기록).
    **PostgreSQL 소스**에서는 오프셋 시더 Lambda가 없습니다. 대신 Full Load 정합성 지점에서 도구가 논리 복제
-   슬롯(과 마이그레이션 대상 테이블에만 한정된 publication)을 생성하며, 슬롯이 반환한 정합 WAL LSN이 곧
+   슬롯(과 Full Load가 로드한 테이블에 대한 publication)을 생성하며, 슬롯이 반환한 정합 WAL LSN이 곧
    워터마크가 됩니다 — CDC는 그 미리 생성된 슬롯에서 바로 재개하므로 Kafka의 connect-offsets에는 아무것도
    기록되지 않습니다. 어느 경우든 Debezium은 **스냅샷 이후 첫 변경**부터 스트리밍을 시작합니다 —
    "지금"부터가 아니며, 데이터를 다시 읽지도 않습니다.
@@ -260,6 +260,8 @@ over를 보류합니다). 기본값·주석·콜레이션·인덱스는 비교�
    > **선택된 모든 테이블을 먼저 재스냅샷**합니다 — 데이터를 한 번 더 읽습니다. 선택 기준은
    > [10장 §10.1](10-conclusion.md)을 참고하세요. MySQL은 소비자가 없어도 바이너리 로그가 히스토리를
    > 보관하므로, 나중에 CDC를 시작해도 재읽기 없이 워터마크부터 재개합니다.
+
+   Full Load 후 테이블의 체크를 해제하면(Full load + CDC, CDC를 시작하기 전; [§13.7](13-excluding-tables-and-columns.md)), CDC는 아직 선택된 테이블만 캡처하고 같은 워터마크 또는 슬롯에서 재개하므로, 그 테이블들의 핸드오프는 계속 gapless입니다. PostgreSQL에서 CDC가 그 슬롯에서 재개하면 publication에 체크를 해제한 테이블이 계속 남아 있고(도구는 소스에서 publication을 바꾸지 않습니다) 커넥터가 그 테이블의 변경을 버립니다. 대신 다시 스냅샷하는 Start에서는 커넥터가 publication을 캡처 대상 테이블로 맞춥니다. 줄어든 집합으로 Re-run Full Load를 실행하면 기존 publication을 재사용합니다.
 3. **MySQL 소스**에서는 **새 시작 지점**에서의 Start — 첫 Start, 더 새 Full Load나 Manual 지점 이후의
    Start, Delete CDC infrastructure 후의 첫 Start — 가 소스 커넥터를 **`snapshot.mode=recovery`**로
    실행합니다: 오프셋이 이미 시드돼 있으므로 Debezium은 내부 **스키마 히스토리**를 **현재 소스 테이블**로부터

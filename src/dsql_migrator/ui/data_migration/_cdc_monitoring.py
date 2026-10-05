@@ -55,6 +55,7 @@ from dsql_migrator.ui.data_migration._cdc_status import (
     cdc_dlq_summary,
     cdc_error_log_key,
     is_cdc_error_record,
+    is_infra_create_stack_status,
     is_stack_teardown_status,
 )
 from dsql_migrator.ui.data_migration._full_load_ui import _quarantine_detail_row
@@ -4182,16 +4183,7 @@ def exclusion_lock_state(migration_state, job_manager) -> ExclusionLockState:
     engine = session_source_type(session) if session is not None else None
     # Change & reload re-runs the recorded Full Load for the changed tables, so it is named
     # only while that job record exists (a pruned record leaves Start over alone).
-    if engine is SourceType.POSTGRES:
-        reseed = (" PostgreSQL: deleting the stack drops the replication slot and the "
-                  "publication, so Start CDC cannot resume from the load's slot: choose "
-                  "\"Re-snapshot every table instead\" in its dialog (it reads every "
-                  "captured table again).")
-    elif engine is SourceType.MYSQL:
-        reseed = (" MySQL: Start CDC on Automatic re-seeds from the Full Load watermark (it "
-                  "needs the binlog kept since that load; Start CDC warns if it was purged).")
-    else:
-        reseed = ""
+    reseed = _delete_reseed_note(engine)
     if stack:
         held = (
             "Locked — CDC is being stopped, and its source connector was started with "
@@ -4237,10 +4229,19 @@ def exclusion_lock_state(migration_state, job_manager) -> ExclusionLockState:
             else:
                 reload = "use Change & reload for the affected tables"
                 then = "deploy it again and Start CDC"
+            # G16: a Full load + CDC stack that never streamed still lets the table list drop
+            # tables (the popup is read-only here, so the list is the way to do it).
+            narrowing = (
+                R1_FL_CDC_SENTENCE
+                if migration_type is MigrationType.FULL_LOAD_AND_CDC
+                and getattr(migration_state, "cdc_stack_phase", None) == "infra"
+                and table_set_editable_after_load(migration_state, job_manager)
+                else ""
+            )
             return ExclusionLockState(
                 2,
                 f"{held} A Full Load also loaded data with them. To change them: 1 {delete}, "
-                f"2 {reload}, 3 {then}.{reseed}",
+                f"2 {reload}, 3 {then}.{reseed}{narrowing}",
                 cell="R1",
                 offers_change_type=full_load_only,
             )
@@ -4328,11 +4329,20 @@ def exclusion_lock_state(migration_state, job_manager) -> ExclusionLockState:
                 cell="R4",
                 offers_change_type=True,
             )
+        if migration_type is MigrationType.FULL_LOAD_AND_CDC and table_set_editable_after_load(
+            migration_state, job_manager
+        ):
+            # G16: Full load + CDC, before CDC first starts, can still drop tables (never add
+            # one); the column set stays fixed (Change & reload). Once CDC has started, the
+            # Start over text at the end applies again.
+            return ExclusionLockState(
+                3, R4_FL_CDC_NARROWING, cell="R4", offers_change_and_reload=True
+            )
         if migration_type is MigrationType.FULL_LOAD_ONLY and table_set_editable_after_load(
             migration_state, job_manager
         ):
             # G12: Full load only keeps the column set fixed (Change & reload) but lets the
-            # TABLE set change; the Full load + CDC text below stays as it was.
+            # TABLE set change in both directions.
             return ExclusionLockState(
                 3,
                 "Locked — a Full Load has already loaded data using this exclusion set. To "
@@ -4377,8 +4387,9 @@ RECONNECT_REASON = (
     "are not restored after a restart)."
 )
 
-# Full load only lifts the table-set lock after a Full Load (G12), but never while one of
-# these runs: each is a WAIT (it ends by itself), so none of them says "Start over".
+# Full load only lifts the table-set lock after a Full Load (G12), and Full load + CDC lets it
+# drop tables until CDC first starts (G16) -- but never while one of these runs: each is a
+# WAIT (it ends by itself), so none of them says "Start over".
 TABLE_SET_WAIT_LOAD = (
     "Locked while a Full Load runs — wait for it to finish (or stop it), then change the "
     "table set."
@@ -4391,27 +4402,143 @@ TABLE_SET_WAIT_RESTORE = (
     "Locked while Cut over restores the excluded columns' DEFAULTs — wait for it to "
     "finish, then change the table set."
 )
+# Full load + CDC only (G16): the CDC side of the same waits.
+TABLE_SET_WAIT_INFRA = (
+    "Locked while the CDC infrastructure is being created — wait for it to finish (its "
+    "progress is on the CDC step), then change the table set."
+)
+TABLE_SET_WAIT_CDC_CHECK = (
+    "Locked until the CDC state is read — Full load + CDC can drop tables only while CDC "
+    "has not started for this migration, and this session has not confirmed that yet. This "
+    "usually clears within seconds; if it does not, open the CDC step and use Re-check CDC "
+    "state."
+)
+TABLE_SET_WAIT_CDC_UNREAD = (
+    "Locked — the CDC state could not be read, so the tool cannot confirm that CDC never "
+    "started for this migration. The CDC step shows the error: fix the AWS access, use "
+    "Re-check CDC state there, then change the table set."
+)
+
+# A cdc-stack whose CREATE failed (or is rolling back) never streamed: no connector, no
+# committed offset, no started table list. Kept apart from the other non-stable statuses
+# (an UPDATE_* or DELETE_FAILED stack may carry a started set).
+_FAILED_CREATE_STATUSES = frozenset(
+    {"CREATE_FAILED", "ROLLBACK_IN_PROGRESS", "ROLLBACK_COMPLETE", "ROLLBACK_FAILED"}
+)
+
+
+def table_set_failed_create_wait(status) -> str:
+    """The table-set wait while a failed CDC infrastructure create is still in the account."""
+    return (
+        f"Locked — the CDC infrastructure's create failed ({status}), so it never streamed. "
+        "Delete it on the CDC step (once any rollback has finished), then change the table "
+        "set."
+    )
+
+
+def table_set_delete_wait(migration_state) -> str:
+    """The table-set wait while the CDC infrastructure is being deleted (an expected wait,
+    never a remedy): the same text the streaming clause of ``selection_lock_reason`` gives."""
+    estimate, _why = cdc_delete_eta(migration_state)
+    return (
+        f"Locked while the CDC infrastructure is being deleted (a cdc-stack delete takes "
+        f"{estimate}). Wait for the deletion to finish before changing the table set."
+    )
+
+
+def _cdc_started_for_migration(migration_state, job_manager) -> bool:
+    """Has CDC started for this migration -- now or at any time before (G16)?
+
+    Any of: a Start CDC was submitted (``cdc_ops_window_start``: set at every submission,
+    restored with the session and never cleared by Stop or Delete -- the durable marker);
+    connectors are recorded; the probed stack has a committed offset (it streamed, then
+    stopped); or a connector-level lifecycle job (start / stop) is in flight or the pipeline
+    is live. A Delete in flight alone is not evidence (it removes CDC). Conservative: a
+    Start the worker refused still counts. Pure apart from job reads.
+    """
+    if getattr(migration_state, "cdc_ops_window_start", None) is not None:
+        return True
+    if getattr(migration_state, "cdc_connector_names", None):
+        return True
+    if getattr(migration_state, "cdc_has_committed_offset", False):
+        return True
+    return cdc_streaming_started(migration_state, job_manager) and not cdc_stack_being_deleted(
+        migration_state, job_manager
+    )
+
+
+def _fl_cdc_narrowing_job(migration_state, job_manager):
+    """The Full Load record while Full load + CDC's narrowing is open (G16), else ``None``.
+
+    Open when CDC never started for this migration (:func:`_cdc_started_for_migration`), the
+    probed stack is absent, never-started infra, or a create / delete / failed create (each
+    a wait) -- never one that carries a started set (running, unstable UPDATE_*,
+    DELETE_FAILED, ...) -- and the record is found and either still runs (the load wait) or
+    carries per-table watermark counts (the covered set the narrowing and the per-table
+    add-lock are judged against). An unprobed stack (phase ``None``) is open here and
+    reported as a wait by :func:`table_set_wait_reason`. The CDC state is checked before
+    the record is read: a read is a deep copy of the whole record, and a started migration
+    (every render once CDC runs) needs none.
+    """
+    if _cdc_started_for_migration(migration_state, job_manager):
+        return None
+    phase = getattr(migration_state, "cdc_stack_phase", None)
+    if phase not in (None, "absent", "infra"):
+        if phase != "unstable":
+            return None
+        status = str(getattr(migration_state, "cdc_stack_phase_status", None) or "").upper()
+        if not (
+            cdc_infra_deploy_in_flight(migration_state, job_manager)
+            or is_infra_create_stack_status(status)
+            or cdc_stack_being_deleted(migration_state, job_manager)
+            or status in _FAILED_CREATE_STATUSES
+        ):
+            return None
+    job = _current_job(job_manager, getattr(migration_state, "job_id", None))
+    if job is None:
+        return None
+    if getattr(job, "status", None) in ("PENDING", "RUNNING"):
+        return job
+    if not getattr(getattr(job, "watermark", None), "table_row_counts", None):
+        return None
+    return job
+
+
+def _fl_cdc_narrowing_open(migration_state, job_manager) -> bool:
+    """Full load + CDC's half of :func:`table_set_editable_after_load` (G16): see
+    :func:`_fl_cdc_narrowing_job`."""
+    return _fl_cdc_narrowing_job(migration_state, job_manager) is not None
 
 
 def table_set_editable_after_load(migration_state, job_manager) -> bool:
-    """Can the table set still change although a Full Load has run? (Full load only.)
+    """Can the table set still change although a Full Load has run?
 
     The ONE predicate behind the tree, the popup's E3 and the R4 text, so they cannot
-    disagree. True only when ALL hold:
+    disagree. Per migration type:
 
-    * the migration type is Full load only -- a CDC type keeps its lock: the watermark,
-      the capture list and the topic partitions all describe the loaded set;
-    * the Full Load's job record is found -- a pruned record cannot be reconciled with a
-      changed set (its chunk list is what Retry / Reload / the step verdict read);
-    * no CDC evidence: nothing streaming, starting, being created or deleted, no stack
-      phase that carries the set, and no connector recorded for this migration.
+    * **Full load only** (G12, both directions) -- True when the Full Load's job record is
+      found (a pruned record cannot be reconciled with a changed set: its chunk list is
+      what Retry / Reload / the step verdict read) and there is no CDC evidence: nothing
+      streaming, starting, being created or deleted, no stack phase that carries the set,
+      and no connector recorded for this migration.
+    * **Full load + CDC** (G16, removals only) -- True until CDC first starts for this
+      migration (:func:`_fl_cdc_narrowing_open`): tables can then be dropped, and only a
+      table the Full Load covered can be ticked again (:func:`table_set_add_lock`). Once
+      CDC has started, even if stopped since, the set is fixed again.
+    * **CDC only** -- always False: it has no Full Load step to scope; switching to Full
+      load + CDC is the way to drop tables there.
 
-    A running load, foreign-key pass or DEFAULT restore does NOT make this False: those
-    are waits, reported by :func:`table_set_wait_reason`. Pure apart from job reads.
+    A running load, foreign-key pass or DEFAULT restore -- and in Full load + CDC an infra
+    create or delete, a failed create, or a CDC state not read yet -- does NOT make this
+    False: those are waits, reported by :func:`table_set_wait_reason`. Pure apart from job
+    reads.
     """
     from dsql_migrator.ui.data_migration._models import MigrationType
 
-    if getattr(migration_state, "migration_type", None) is not MigrationType.FULL_LOAD_ONLY:
+    migration_type = getattr(migration_state, "migration_type", None)
+    if migration_type is MigrationType.FULL_LOAD_AND_CDC:
+        return _fl_cdc_narrowing_open(migration_state, job_manager)
+    if migration_type is not MigrationType.FULL_LOAD_ONLY:
         return False
     if _current_job(job_manager, getattr(migration_state, "job_id", None)) is None:
         return False
@@ -4430,10 +4557,16 @@ def table_set_wait_reason(migration_state, job_manager, *, status) -> "Optional[
     """While :func:`table_set_editable_after_load` holds, why the set must wait, or None.
 
     First match: a Full Load (or retry / reload) running, the foreign-key pass running,
-    cut over restoring the excluded columns' DEFAULTs.
+    cut over restoring the excluded columns' DEFAULTs. Then, in Full load + CDC only (G16):
+    the CDC infrastructure being deleted, being created, or left behind by a failed create,
+    and -- until the probe reports -- the CDC state not read yet (the committed offset and
+    the deployed table list are only known then), or unreadable.
     """
     from dsql_migrator.core.models import StepStatus
-    from dsql_migrator.ui.data_migration._models import cutover_restore_block_reason
+    from dsql_migrator.ui.data_migration._models import (
+        MigrationType,
+        cutover_restore_block_reason,
+    )
 
     job = _current_job(job_manager, getattr(migration_state, "job_id", None))
     if status is StepStatus.IN_PROGRESS or (
@@ -4444,7 +4577,199 @@ def table_set_wait_reason(migration_state, job_manager, *, status) -> "Optional[
         return TABLE_SET_WAIT_FK
     if cutover_restore_block_reason(migration_state):
         return TABLE_SET_WAIT_RESTORE
+    if getattr(migration_state, "migration_type", None) is not MigrationType.FULL_LOAD_AND_CDC:
+        return None
+    if cdc_stack_being_deleted(migration_state, job_manager):
+        return table_set_delete_wait(migration_state)
+    phase_status = getattr(migration_state, "cdc_stack_phase_status", None)
+    if cdc_infra_deploy_in_flight(migration_state, job_manager) or is_infra_create_stack_status(
+        phase_status
+    ):
+        return TABLE_SET_WAIT_INFRA
+    if (
+        getattr(migration_state, "cdc_stack_phase", None) == "unstable"
+        and str(phase_status or "").upper() in _FAILED_CREATE_STATUSES
+    ):
+        return table_set_failed_create_wait(phase_status)
+    if not getattr(migration_state, "cdc_stack_phase_checked", False):
+        return (
+            TABLE_SET_WAIT_CDC_UNREAD
+            if getattr(migration_state, "cdc_probe_error", None)
+            else TABLE_SET_WAIT_CDC_CHECK
+        )
     return None
+
+
+# --- G16: the per-table add-lock of a Full load + CDC set narrowed after its Full Load ----
+
+# Lock-icon tooltips on a tree leaf that cannot be ticked now (static: a client-side slot).
+LOCK_TIP_NOT_LOADED = (
+    "Not part of the last Full Load's snapshot — Full load + CDC cannot add it (use Start "
+    "over)."
+)
+LOCK_TIP_RULE = (
+    "Unselected by an exclude table rule — delete the rule in Change & reload to select it "
+    "again."
+)
+TREE_HINT_FL_CDC = (
+    "A Full Load has run. Until CDC starts, a table you untick is left as is on Aurora DSQL "
+    "(not dropped) and CDC does not capture it. Only tables in this Full Load's snapshot can "
+    "be ticked again; a lock marks the others."
+)
+# Appended to CDC only's table-set lock while Full load + CDC could still drop tables (CDC
+# never started for this migration and the type may change): the non-destructive route.
+CDC_ONLY_NARROWING_SENTENCE = (
+    " To drop tables before CDC starts, switch the migration type to Full load + CDC and "
+    "untick them there."
+)
+# The Exclude tables & columns texts of the same state.
+R4_FL_CDC_NARROWING = (
+    "Locked — a Full Load has already loaded data using this exclusion set. To change the "
+    "excluded columns, use Change & reload: it drops and reloads exactly the tables whose "
+    "excluded columns change, so no row keeps a value loaded under the previous set. In Full "
+    "load + CDC, until CDC starts, tables can still be dropped from this migration (not "
+    "added): untick them in the table list, or use a table line in Change & reload. A table "
+    "you unselect is left as is on Aurora DSQL (not dropped) and CDC does not capture it; "
+    "adding a table the Full Load did not load needs Start over."
+)
+R1_FL_CDC_SENTENCE = (
+    " Until CDC starts, tables can still be dropped from this migration: untick them in the "
+    "table list (CDC does not capture them, and they are left as is on Aurora DSQL)."
+)
+# Appended to the Full Load step's "Retry the failed tables before starting CDC" hint.
+CONTINUE_HINT_FL_CDC = (
+    " Or untick them in the table list: a table you untick is left as is on Aurora DSQL "
+    "(not dropped) and CDC does not capture it."
+)
+
+
+def _delete_reseed_note(engine) -> str:
+    """What deleting the CDC infrastructure costs the next Start, per engine ("" unknown)."""
+    if engine is SourceType.POSTGRES:
+        return (" PostgreSQL: deleting the stack drops the replication slot and the "
+                "publication, so Start CDC cannot resume from the load's slot: choose "
+                "\"Re-snapshot every table instead\" in its dialog (it reads every "
+                "captured table again).")
+    if engine is SourceType.MYSQL:
+        return (" MySQL: Start CDC on Automatic re-seeds from the Full Load watermark (it "
+                "needs the binlog kept since that load; Start CDC warns if it was purged).")
+    return ""
+
+
+def _refuse_not_loaded(names: "list[str]") -> str:
+    one = len(names) == 1
+    them = "it" if one else "them"
+    return (
+        f"{_bounded_names(names)} {'was' if one else 'were'} not part of the last Full "
+        f"Load's snapshot, so CDC has no gapless start point for {them}: after its Full "
+        "Load, Full load + CDC can drop tables but not add them. To migrate "
+        f"{them} too, use Start over."
+    )
+
+
+def _refuse_rule(names: "list[str]") -> str:
+    one = len(names) == 1
+    its = "its" if one else "their"
+    them = "it" if one else "them"
+    return (
+        f"An exclude table rule unselected {_bounded_names(names)}, and that Save dropped "
+        f"{its} excluded-column entries: ticked here, CDC would stream values for columns "
+        f"{its} loaded rows hold as NULL. To select {them} again, delete that rule in "
+        f"Exclude tables & columns (Change & reload), which applies {its} column rules "
+        "again."
+    )
+
+
+def _bounded_names(names: "list[str]") -> str:
+    from dsql_migrator.ui.cdc_dlq_gate import bounded_table_names
+
+    return bounded_table_names(names)
+
+
+# In this order: the first code that applies is a table's reason, and a refusal names the
+# codes in this order.
+_ADD_LOCK_REFUSALS = (
+    ("not_loaded", _refuse_not_loaded),
+    ("rule", _refuse_rule),
+)
+
+
+@dataclass(frozen=True)
+class TableSetAddLock:
+    """Which tables a Full load + CDC set narrowed after its Full Load may be ticked again
+    (G16) -- ONE helper for the tree (lock icons, a tick, Select all), the popup's E3 and
+    the Save, so they cannot disagree.
+
+    ``covered`` -- the watermark's tables (the snapshot): only these have a gapless start
+    point. A covered table may be ticked again even once a never-started CDC stack is
+    deployed without it: the stack has no topics yet, and Start CDC re-sends the table list
+    and creates each captured table's topic with the partition count the stack was deployed
+    with. ``rule_held`` -- tables an exclude table rule unselected: that Save dropped their
+    excluded-column entries, so a TREE re-tick would let CDC stream columns their loaded
+    rows hold as NULL (deleting the rule in Change & reload applies the column rules again,
+    so the popup is not refused for it). Hashable (a popup memo key).
+    """
+
+    covered: frozenset
+    rule_held: frozenset = frozenset()
+
+    def code(self, name: str, *, tree: bool) -> "Optional[str]":
+        """Why ``name`` cannot be ticked again now -- ``"not_loaded"`` / ``"rule"`` (tree
+        only) -- or ``None`` when it can."""
+        if name not in self.covered:
+            return "not_loaded"
+        if tree and name in self.rule_held:
+            return "rule"
+        return None
+
+    def blocked(self, names: "Iterable[str]", *, tree: bool) -> "list[str]":
+        """The ``names`` this lock refuses, in input order (once each)."""
+        return [n for n in dict.fromkeys(names or ()) if self.code(n, tree=tree) is not None]
+
+    def refusal(self, names: "Iterable[str]", *, tree: bool) -> "Optional[str]":
+        """The per-reason refusal for the refused ``names`` (their names bounded), or
+        ``None`` when none is refused."""
+        by_code: "dict[str, list[str]]" = {}
+        for name in dict.fromkeys(names or ()):
+            code = self.code(name, tree=tree)
+            if code is not None:
+                by_code.setdefault(code, []).append(name)
+        if not by_code:
+            return None
+        return " ".join(
+            build(by_code[code]) for code, build in _ADD_LOCK_REFUSALS if code in by_code
+        )
+
+    def node_flags(self, listed: "Iterable[str]", ticked: "Iterable[str]") -> "dict[str, str]":
+        """``{table: code}`` for the UNTICKED ``listed`` tables that cannot be ticked now --
+        a ticked table is never flagged, so an untick is always possible."""
+        ticked_set = set(ticked or ())
+        flags: "dict[str, str]" = {}
+        for name in listed or ():
+            if name in ticked_set:
+                continue
+            code = self.code(name, tree=True)
+            if code is not None:
+                flags[name] = code
+        return flags
+
+
+def table_set_add_lock(migration_state, job_manager) -> "Optional[TableSetAddLock]":
+    """The per-table add-lock while a Full load + CDC set may be narrowed after its Full
+    Load (G16), or ``None`` (every other type and state: Full load only adds freely, and a
+    locked set needs no per-table answer). Requires per-table watermark counts -- the
+    covered set the lock is judged against. Pure apart from one job read; no AWS I/O."""
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    if getattr(migration_state, "migration_type", None) is not MigrationType.FULL_LOAD_AND_CDC:
+        return None
+    job = _fl_cdc_narrowing_job(migration_state, job_manager)
+    counts = getattr(getattr(job, "watermark", None), "table_row_counts", None)
+    if not counts:
+        return None
+    getter = getattr(migration_state, "rule_excluded_tables", None)
+    rule_held = frozenset(getter()) if callable(getter) else frozenset()
+    return TableSetAddLock(covered=frozenset(counts), rule_held=rule_held)
 
 
 def change_and_reload_block_reason(

@@ -766,8 +766,13 @@ def create_publication(
     write outage). ``tables`` are qualified ``schema.table`` names, quoted via the PG
     dialect. PostgreSQL has no ``CREATE PUBLICATION IF NOT EXISTS``, so existence is checked
     first. On reuse the existing publication's table set is RECONCILED against ``tables``:
-    a mismatch (e.g. a table added on a re-run) is refused loudly rather than silently
-    leaving the new table unreplicated -- pgoutput only streams a publication's members.
+    a publication MISSING a requested table (e.g. a table added on a re-run) is refused
+    loudly rather than silently leaving the new table unreplicated -- pgoutput only streams
+    a publication's members. One that COVERS every requested table and lists more (a Full
+    load + CDC re-run over a set narrowed after its first load, G16) is reused as is, with
+    no write: the connector's ``table.include.list`` -- not the publication -- defines what
+    CDC captures, so the extra members are decoded and filtered out. Changing it would be a
+    source write the tool does not need.
 
     Created ``WITH (publish_via_partition_root = true)``, which is REQUIRED for a
     partitioned source table and harmless otherwise. PostgreSQL's default is ``false``:
@@ -786,7 +791,7 @@ def create_publication(
     if publication_exists(connection, name):
         existing = _publication_tables(connection, name)
         requested = {str(t) for t in tables}
-        if existing != requested:
+        if not requested <= existing:
             raise PgReplicationError(
                 f"publication {name} already exists but covers {sorted(existing)}, not "
                 f"the requested {sorted(requested)}. pgoutput only streams a publication's "
@@ -795,7 +800,14 @@ def create_publication(
                 "table selection."
             )
         if on_log is not None:
-            on_log(f"publication {name} already exists with the same tables; reusing")
+            extra = sorted(existing - requested)
+            on_log(
+                f"publication {name} already exists and covers every requested table; "
+                f"reusing it (it also lists {', '.join(extra)}, which this run does not "
+                "load: CDC's table.include.list filters them out)"
+                if extra
+                else f"publication {name} already exists with the same tables; reusing"
+            )
         return False
     dialect = dialect_for(SourceType.POSTGRES)
     quoted = ", ".join(dialect.quote_table(t) for t in tables)
@@ -923,10 +935,12 @@ def provision_pg_replication(
 
     Ordering: set REPLICA IDENTITY FULL on the re-keyed tables FIRST (so every change WAL
     from the slot's LSN onward carries the full before-image the re-keyed DELETE needs),
-    then the publication (defines the capture set), then the slot (whose returned
-    consistent-point LSN pins WAL from here). A stale slot from a prior run is dropped
-    first so the new slot's LSN matches THIS Full Load's snapshot -- safe because slot
-    creation runs at Full Load time, before any CDC connector exists to hold it active.
+    then the publication (what pgoutput may decode -- the connector's table.include.list
+    defines the capture within it, so a reused publication that lists more is fine, G16),
+    then the slot (whose returned consistent-point LSN pins WAL from here). A stale slot
+    from a prior run is dropped first so the new slot's LSN matches THIS Full Load's
+    snapshot -- safe because slot creation runs at Full Load time, before any CDC connector
+    exists to hold it active.
     Returns the handles (incl. the resume LSN) to record on the watermark. Callers pass a
     connection from :func:`build_pg_source_write_engine` (the un-guarded AUTOCOMMIT path).
 

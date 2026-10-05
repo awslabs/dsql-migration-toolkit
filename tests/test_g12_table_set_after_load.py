@@ -5,8 +5,12 @@
 
 The lock lifts through ONE predicate (``table_set_editable_after_load``); every load,
 Validation and Cut over surface then follows the CURRENT selection through a scoped view of
-the job record, and a CDC type stays locked until a fresh watermark covers the set. The CDC
-types keep today's lock byte for byte.
+the job record, and a switch to a CDC type stays locked while a table selected since the
+load has no fresh watermark (a removal alone never locks it while CDC never started for the
+migration: CDC captures the loaded tables still selected). CDC only keeps today's lock (its
+text also names Full load + CDC while that could still drop tables); Full load + CDC narrows
+until CDC starts (G16, tests/test_g16_full_load_and_cdc_narrowing.py) and keeps today's lock
+without per-table watermark counts or once CDC has started.
 """
 
 from __future__ import annotations
@@ -454,10 +458,16 @@ def test_the_type_switch_waits_for_a_watermark_over_the_current_set() -> None:
     def lock(state, mgr=jobs):
         return migration_type_lock_reason(state, status=StepStatus.DONE, job_manager=mgr)
 
-    shrunk = lock(_coverage_state(["a"]))
-    assert "(unselected since: b)" in shrunk and "(selected since:" not in shrunk
-    assert "re-run Full Load over the current set" in shrunk
-    assert "selected since: c" in lock(_coverage_state(["a", "b", "c"]))
+    # G16 (spec 6): a removal alone never locks the type -- CDC captures the loaded tables
+    # still selected (the unticked b is simply not captured).
+    assert lock(_coverage_state(["a"])) is None
+    grown = lock(_coverage_state(["a", "b", "c"]))
+    assert "(selected since: c)" in grown and "unselected since" not in grown
+    assert "re-run Full Load over the current set" in grown
+    assert "no gapless start point for it" in grown and "or untick it again" in grown
+    # A swap still locks, on the added table only.
+    swapped = lock(_coverage_state(["a", "c"]))
+    assert "(selected since: c)" in swapped and "unselected since" not in swapped
     assert lock(_coverage_state(["a", "b"])) is None
     assert lock(_coverage_state(["a"], touched=False)) is None
     assert lock(_coverage_state(["a"], migratable=("a",))) is None  # b left the target
@@ -807,15 +817,40 @@ def test_the_tree_is_editable_with_the_hint_and_no_refresh_button(monkeypatch) -
     assert "Refresh source/target objects" not in s.ui.tooltips
 
 
+def _grown_and_loaded():
+    """app.c ticked after the load and loaded by Retry, under the ORIGINAL watermark (G12
+    never extends it): the step is DONE, but the watermark does not cover app.c."""
+    return _job("DONE", [_c("app.a"), _c("app.b"), _c("app.c")],
+                counts={"app.a": 1, "app.b": 1})
+
+
 @pytest.mark.parametrize("pg", [False, True])
 def test_the_completion_notice_stops_recommending_cdc_from_this_watermark(
         monkeypatch, pg) -> None:
-    s = _screen(monkeypatch, job=_loaded(), selected=["app.a"], pg=pg)
+    s = _screen(monkeypatch, job=_grown_and_loaded(), selected=["app.a", "app.b", "app.c"],
+                pg=pg)
     s.content(lambda: None)
+    assert get_status(s.session.workflow, WorkflowStep.FULL_LOAD) is StepStatus.DONE
     texts = " ".join(s.ui.texts)
+    assert "Tables were selected after this Full Load" in texts
     assert "re-run Full Load over the current set first" in texts
     assert "streams from this Full Load's watermark" not in texts
     assert ("creates no replication slot" in texts) is pg
+
+
+@pytest.mark.parametrize("pg", [False, True])
+def test_a_removal_keeps_todays_completion_notice(monkeypatch, pg) -> None:
+    # G16 (spec 6): unticking a loaded table never locks the type, so the notice keeps
+    # recommending CDC from this watermark (it captures the loaded tables still selected).
+    s = _screen(monkeypatch, job=_loaded(), selected=["app.a"], pg=pg)
+    s.content(lambda: None)
+    texts = " ".join(s.ui.texts)
+    assert "re-run Full Load over the current set first" not in texts
+    assert "Tables were selected after this Full Load" not in texts
+    if pg:
+        assert "This run created no replication slot" in texts
+    else:
+        assert "streams from this Full Load's watermark" in texts
 
 
 def test_an_unchanged_set_keeps_todays_completion_notice(monkeypatch) -> None:
@@ -1297,16 +1332,32 @@ def test_a_tree_tick_after_a_load_syncs_the_step_and_refreshes_the_page_once(
     captured["on_selection_change"](["app.a", "app.b", "app.c"])
     assert get_status(s.session.workflow, WorkflowStep.FULL_LOAD) is StepStatus.FAILED
     assert sorted(timers) == [0.3, 0.8]  # the row refresh + ONE coalesced page refresh
-    # A CDC type: today's handler (the row refresh only, no step write).
+    # Full load + CDC before CDC starts (G16, probed: no stack): the same step sync and
+    # ONE coalesced page refresh (the CDC step's "Will stream" follows the tick).
     cdc = _screen(monkeypatch, job=_loaded(), selected=["app.a", "app.b"])
     cdc.session.set_migration_type(MigrationType.FULL_LOAD_AND_CDC)
+    cdc.state.set_cdc_stack_phase("absent", status=None)
     cdc_timers: list = []
     cdc.ui.timer = lambda interval, callback=None, *a, **k: (
         cdc_timers.append(interval) or cdc.ui._El(cdc.ui))
     cdc.content(lambda: None)
     cdc_timers.clear()
+    cdc.state.set_selection(TableSelection(selected_tables=["app.a"]))
     captured["on_selection_change"](["app.a"])
-    assert cdc_timers == [0.3]
+    assert sorted(cdc_timers) == [0.3, 0.8]
+    # ...and once CDC was ever started (the ops window survives a Stop): today's handler,
+    # the row refresh only, no step write.
+    started = _screen(monkeypatch, job=_loaded(), selected=["app.a", "app.b"])
+    started.session.set_migration_type(MigrationType.FULL_LOAD_AND_CDC)
+    started.state.set_cdc_stack_phase("infra", status="UPDATE_COMPLETE")
+    started.state.set_cdc_ops_window_start(datetime(2026, 10, 1, tzinfo=timezone.utc))
+    started_timers: list = []
+    started.ui.timer = lambda interval, callback=None, *a, **k: (
+        started_timers.append(interval) or started.ui._El(started.ui))
+    started.content(lambda: None)
+    started_timers.clear()
+    captured["on_selection_change"](["app.a"])
+    assert started_timers == [0.3]
 
 
 def test_the_live_poll_maps_a_done_retry_with_an_unloaded_added_table_to_failed() -> None:
@@ -1374,9 +1425,10 @@ def test_the_live_poll_maps_a_done_retry_with_an_unloaded_added_table_to_failed(
 
 def _reload_screen(monkeypatch, *, record=("app.a", "app.b"), rules="exclude table app.c",
                    rule_excluded=("app.c",), selection=("app.a", "app.b"), stored=(),
-                   mtype=MigrationType.FULL_LOAD_ONLY):
+                   mtype=MigrationType.FULL_LOAD_ONLY, unlisted=()):
     """A Data Migration screen after a Full Load over ``record`` (tables with a nullable
-    ``note`` column), the popup's context captured and the retry engine recorded."""
+    ``note`` column), the popup's context captured and the retry engine recorded.
+    ``unlisted`` names extra source tables with no generated DDL (not migratable)."""
     import sys
     import types
 
@@ -1439,6 +1491,7 @@ def _reload_screen(monkeypatch, *, record=("app.a", "app.b"), rules="exclude tab
     cols = [ColumnDef(name="id", mysql_type="int", nullable=False),
             ColumnDef(name="note", mysql_type="text", nullable=True)]
     tables = [TableDef(name=f"app.{n}", columns=cols, primary_key=["id"]) for n in "abc"]
+    tables += [TableDef(name=n, columns=cols, primary_key=["id"]) for n in unlisted]
     evals = EvaluationStore()
     evals.get_or_create("s1").set_result(EvaluationResult(
         inventory=SourceInventory(tables=tables), assessment=AssessmentReport.from_items([]),
@@ -1513,17 +1566,25 @@ def test_a_new_tables_column_rule_alone_drops_nothing(monkeypatch) -> None:
 
 
 def test_full_load_and_cdc_change_and_reload_keeps_table_lines_e3(monkeypatch) -> None:
+    # G16: Full load + CDC before CDC starts may DROP tables, but re-selecting app.c (not
+    # in the Full Load's snapshot) stays an E3 -- now per table, with its reason.
     from dsql_migrator.ui.data_migration._exclusion_dialog import open_exclusion_dialog
 
     from tests.test_exclusion_dialog import _Ui
 
     s = _reload_screen(monkeypatch, mtype=MigrationType.FULL_LOAD_AND_CDC)
+    s.state.set_cdc_stack_phase("absent", status=None)
     ui = _Ui()
     open_exclusion_dialog(ui, s.ctx)
     ui.click("Change & reload")
     ui.type_text("exclude app.*.note")
-    assert any("Start over" in t for t in ui.texts)
+    assert any("Save would re-select app.c" in t
+               and "not part of the last Full Load's snapshot" in t
+               and "use Start over" in t for t in ui.texts)
     assert not any("Selects app.c" in t for t in ui.texts)
+    action = [b for b in ui.elements if b.kind == "button"
+              and (b.text == "Save" or str(b.text).startswith("Drop & reload"))][-1]
+    assert action.enabled is False
 
 
 def test_the_selection_sentence_keeps_a_reselected_loaded_table_as_is() -> None:

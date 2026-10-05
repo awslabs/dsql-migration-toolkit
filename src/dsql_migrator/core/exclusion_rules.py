@@ -1034,6 +1034,7 @@ def resolve_exclusion_rules(
     legacy: "Optional[Mapping[str, Collection[str]]]" = None,
     stored_columns: "Optional[Mapping[str, Collection[str]]]" = None,
     capture: "Optional[Callable[[Mapping[str, frozenset[str]], Sequence[str]], object]]" = None,
+    reselect_lock: "Optional[Callable[[Sequence[str]], Optional[tuple[Sequence[str], str]]]]" = None,
 ) -> RuleResolution:
     """Resolve rule ``text`` against the ``migratable`` tables (the tree's universe, in its
     order). Include wins and line order never matters: per domain (tables; columns),
@@ -1056,6 +1057,14 @@ def resolve_exclusion_rules(
     While ``selection_lock_reason`` holds, a table line that would change the selection is
     E3, and a re-selection no line causes (a deleted rule) is a global E3. A result that
     would leave no table selected is the global error E5.
+
+    ``reselect_lock(names)`` -- consulted ONLY while ``selection_lock_reason`` is ``None``
+    (the set may change, but not every table may be selected again: Full load + CDC after
+    its Full Load drops tables and never adds one) -- returns ``(blocked, reason)`` for the
+    re-selected ``names`` it refuses, else ``None``. An include table line re-selecting a
+    blocked table is a line E3, and a blocked re-selection no line causes (a deleted rule)
+    is a global E3, both carrying ``reason``; unselecting stays free. ``None`` (the default)
+    changes nothing.
 
     Eligibility: ``context_factory(selected', candidate tables)`` builds the ONE context
     (called once, so B3 is judged against the selection AFTER this Save); a BLOCKED
@@ -1297,6 +1306,14 @@ def resolve_exclusion_rules(
                     ))
                 else:
                     notes.append("No effect while the table set is locked.")
+            elif reselect_lock is not None and rule.action == "include" and touched:
+                refused = reselect_lock(touched)
+                if refused:
+                    errors.setdefault(line, []).append(RuleError(
+                        "E3", line,
+                        f"This rule would select {_names(list(refused[0]))} again. "
+                        f"{refused[1]}",
+                    ))
         else:
             hits_c = column_hits[line]
             in_scope = [i for i in hits_c if i[0] in after_set]
@@ -1357,6 +1374,17 @@ def resolve_exclusion_rules(
                 f"Save would re-select {_names(unexplained)}: no table rule unselects "
                 f"{'it' if len(unexplained) == 1 else 'them'} any more. "
                 f"{selection_lock_reason}",
+            ))
+    elif reselect_lock is not None:
+        cancelled = {n for n in incl_t if n in excl_t}
+        unexplained = [n for n in reselect if n not in cancelled]
+        refused = reselect_lock(unexplained) if unexplained else None
+        if refused:
+            blocked_names = list(refused[0])
+            global_errors.append(RuleError(
+                "E3", 0,
+                f"Save would re-select {_names(blocked_names)}: no table rule unselects "
+                f"{'it' if len(blocked_names) == 1 else 'them'} any more. {refused[1]}",
             ))
     if not after and selected:
         global_errors.append(RuleError(

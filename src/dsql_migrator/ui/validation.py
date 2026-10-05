@@ -1608,8 +1608,11 @@ def validation_scope_gap(
     table set can grow after a Full Load (G12), and a report from before must not release
     cut over for a table it never compared. ``extra``: report rows for tables no longer
     selected (left as is on Aurora DSQL). Both empty unless the migration is Full load only
-    with a recorded Full Load and an explicit selection -- the only place the set changes
-    after a load; a CDC type keeps every existing release gate untouched.
+    with a recorded Full Load and an explicit selection -- the only place the set can GROW
+    after a load; a CDC type keeps every existing release gate untouched (Full load + CDC
+    can only drop tables after its Full Load, before CDC starts, G16: nothing selected can
+    be missing from a report over the loaded set, and Validation compares the tables still
+    selected).
 
     ``covered`` (the Full Load watermark's tables -- the set that load started with, never
     extended) narrows ``missing`` to the tables selected SINCE that load: a table the load
@@ -4267,7 +4270,8 @@ def _fill_cutover_defaults(
         )[1],
         on_record_found=mark if callable(mark) else None,
         # A ledger table no longer selected (Full load only can unselect a loaded table,
-        # G12) is the operator's decision, never an automatic restore.
+        # G12; Full load + CDC too, before CDC starts, G16) is the operator's decision,
+        # never an automatic restore.
         selected_tables=lambda: _migrated_tables(migration_state),
         fill_key=fill_key,
         generation=generation,
@@ -6636,7 +6640,9 @@ def _render_result(
 
     ``scope_missing`` / ``scope_extra`` (:func:`validation_scope_gap`, Full load only after
     a table-set change): tables the migration now includes that this report has no row for
-    (the verdict is held, and Cut over waits), and rows for tables no longer selected.
+    (the verdict is held, and Cut over waits), and rows for tables no longer selected. (A
+    Full load + CDC set can only DROP tables after its Full Load, G16, so nothing can be
+    missing there; its report simply covers the tables still selected.)
 
     ``diagnose_provider`` (when given -- AI Assist on) opens the AI chat drawer
     for a mismatch; it is threaded to the verdict (run-level "Diagnose with AI"),

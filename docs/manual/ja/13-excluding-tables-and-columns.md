@@ -37,9 +37,7 @@ _言語: [English](../en/13-excluding-tables-and-columns.md) | [한국어](../ko
   Change & reload が実行されたときにだけ行われ、そのいずれも事前に変更内容を示します。
 - **決して除外できない列があります。** キー列、保持される外部キーが参照する列、Aurora DSQL が計算する列は
   拒否され、その理由は常に表示されます(§13.4)。
-- **データが移動すると集合は固定されます。** Full Load の後、または CDC スタックがデプロイされた後は、
-  除外設定はロックされます。それでも変更はできますが、§13.7 の経路を通じてのみです。Full load only では、
-  Full Load の後も移行するテーブルを変更できます(§13.7 の「Full Load 後にテーブル集合を変更する」)。
+- **データが移動すると集合は固定されます。** Full Load の後、または CDC スタックがデプロイされた後は、除外設定はロックされます。それでも変更はできますが、§13.7 の経路を通じてのみです。Full load only では、Full Load の後も移行するテーブルを変更できます。Full load + CDC では、CDC を開始するまでテーブルを外せます(追加はできません。§13.7)。
 
 ---
 
@@ -82,10 +80,13 @@ _言語: [English](../en/13-excluding-tables-and-columns.md) | [한국어](../ko
 - 構文エラー。
 - 何にも一致しない名前。提案は、最初に失敗した階層(スキーマ、テーブル、列の順)から出されます。まず
   大文字小文字だけが異なる名前を、それがなければ最大 3 つの近い候補を示します。
-- ロック中(Full load + CDC または CDC only で Full Load の後、CDC のストリーミング中やスタックが集合を
-  保持している間、または Full load only で Full Load、外部キーの適用、カットオーバーの DEFAULT 復元が
-  実行されている間(終わると解除))にテーブル集合を変えることになるテーブルルール、または削除された
-  テーブルルール。
+- ロック中にテーブル集合を変えることになるテーブルルール、または削除されたテーブルルール。ロックされるのは次の場合です。
+  - CDC only で Full Load の後。
+  - Full load + CDC で CDC を開始した後。
+  - CDC のストリーミング中や、スタックが集合を保持している間。
+  - Full load only と Full load + CDC で、Full Load、外部キーの適用、カットオーバーの DEFAULT 復元が実行されている間(終わると解除)。
+  - Full load + CDC ではさらに、CDC インフラの作成中または削除中、失敗した作成がアカウントに残っている間、CDC の状態を読み取っている間。
+- Full load + CDC で Full Load の後、前回の Full Load のスナップショットにないテーブルを選択することになるテーブルルール。
 - 名前に `:` を含むテーブルの列に一致する列ルール(§13.11)。
 - Aurora DSQL のテーブルに存在せず、除外もされていないソース列。この場合、ロードは確実に 42703 で失敗します
   (§13.4)。修正はその列の `exclude` 行を追記しますが、クリックするのはあなたです。列が移行から自動的に
@@ -479,10 +480,10 @@ CDC only の Start ダイアログはそれらのテーブル名を示し、各�
 | まだ何も実行していない(Full Load も CDC スタックもない) | ロックされていません: ルールを編集して Save します。 |
 | CDC インフラを削除中 | 削除が完了するまで待ちます。ポップアップはエンジンを考慮した見積もり(MySQL で約 15〜25 分、PostgreSQL で 2〜5 分)を表示します。 |
 | CDC インフラを作成中 | 作成が完了するまで待ち、その後、該当する「CDC スタックが存在する」行に従います。 |
-| CDC スタックが存在し(デプロイ済み、ストリーミング中、または停止中)、Full Load を実行した | 1. ストリーミング中なら Stop CDC を実行し、その後 CDC ステップで **Delete CDC infrastructure** を実行します。2. 影響を受けるテーブルに **Change & reload** を使います(CDC only: 先に Full load + CDC へ切り替えます)。3. 再度デプロイし、Start CDC を実行します(MySQL では下記の「削除後に再び CDC を開始する」を参照)。 |
+| CDC スタックが存在し(デプロイ済み、ストリーミング中、または停止中)、Full Load を実行した | 1. ストリーミング中なら Stop CDC を実行し、その後 CDC ステップで **Delete CDC infrastructure** を実行します。2. 影響を受けるテーブルに **Change & reload** を使います(CDC only: 先に Full load + CDC へ切り替えます)。3. 再度デプロイし、Start CDC を実行します(MySQL では下記の「削除後に再び CDC を開始する」を参照)。Full load + CDC でこの移行で CDC を一度も開始していなければ(Start CDC を送信したことがない)、テーブル一覧でテーブルのチェックを外すことはできます(下記の「Full Load 後にテーブルを外す (Full load + CDC)」を参照)。 |
 | CDC スタックが存在し、Full Load は実行しておらず、CDC only | ストリーミング中なら Stop CDC を実行し、Delete CDC infrastructure を実行してルールを変更し(CDC が一度でもストリーミングしていれば列ルールのみ: テーブル集合の変更には Start over が必要)、再度デプロイして Start CDC を実行します。スタックを削除すると、ストリームの位置も削除されます(下記参照)。 |
 | CDC スタックが存在し、まだ Full Load を実行していない(Full load + CDC) | ストリーミング中なら Stop CDC を実行し、Delete CDC infrastructure を実行してルールを変更し、再度デプロイしてから Start Full Load を実行します。reload が必要なものはありません。CDC が既にストリーミングしていた場合は、Start Full Load ダイアログで drop と再作成を選びます。 |
-| CDC スタックがなく、Full Load を実行した(Full load only または Full load + CDC) | **Change & reload**(次のセクション)。Full load only: テーブル集合も変更できます(下記の「Full Load 後にテーブル集合を変更する」を参照)。 |
+| CDC スタックがなく、Full Load を実行した(Full load only または Full load + CDC) | **Change & reload**(次のセクション)。Full load only: テーブル集合も変更できます。Full load + CDC: CDC を開始するまでテーブルを外せます(下記の 2 つのセクションを参照)。 |
 | CDC スタックがなく、タイプを CDC only に切り替える前に Full Load を実行した | タイプを Full load + CDC に切り替え、そこで Change & reload を使い、その後 CDC を続けます。 |
 | Full Load を実行したが、そのジョブレコードがもう利用できない | CDC スタックがあれば先に削除し、その後 **Start over** します。 |
 
@@ -491,9 +492,7 @@ CDC only の Start ダイアログはそれらのテーブル名を示し、各�
 - **スタックがある状態での Full load only。** 移行タイプが Full load only のときにスタックが存在する場合は、
   それを削除するために Full load + CDC に切り替えてください。Full load only には CDC ステップがないため
   です。
-- **テーブル集合。** Full load + CDC と CDC only では、Full Load の後は固定されます。Change & reload が
-  変更するのは列だけで、テーブルを変更するには Start over が必要です。Full load only については、下記の
-  「Full Load 後にテーブル集合を変更する」を参照してください。
+- **テーブル集合。** CDC only では、Full Load の後は固定されます。CDC を開始する前にテーブルを外すには Full load + CDC に切り替えてください。Full load + CDC では、CDC を開始するまでテーブルを外せますが、追加はできません(下記の「Full Load 後にテーブルを外す (Full load + CDC)」を参照)。それ以降、またはテーブルを追加するには Start over を使います。Full load only については、下記の「Full Load 後にテーブル集合を変更する」を参照してください。
 - **削除後に再び CDC を開始する。** MySQL では、Automatic の Start CDC は Full Load のウォーターマークから
   再シードします(そのロード以降の binlog がまだ存在している必要があります。パージされていれば Start CDC が
   警告します)。Change & reload はそのウォーターマークを維持するため、そのロード以降にキャプチャ対象テーブルの
@@ -514,12 +513,11 @@ CDC only の Start ダイアログはそれらのテーブル名を示し、各�
 Full Load を含む移行タイプで、実行が記録されており、CDC スタックがない場合、読み取り専用のポップアップが
 **Change & reload** を提示します。これは **Change exclusions & reload** を開きます。
 
-- **列ルールは編集できます。** Full load + CDC では、選択を変えることになるテーブル行はエラーになります。
-  Full load only では、選択を変更します(次のセクションを参照)。選択から外したテーブルは Aurora DSQL 上に
+- **列ルールは編集できます。** Full load only では、テーブル行が選択を変更します(次のセクションを参照)。選択から外したテーブルは Aurora DSQL 上に
   そのまま残されます(削除されません)。選択したテーブルのうち、まだロードされていないものは Retry
   unfinished tables がロードします。前回の Full Load がすでにロードしたものはそのまま保持されますが、列
   ルールがそのテーブルの列を新たに除外する場合は、除外列が変わる他のテーブルと同様に **Drop & reload** の
-  対象として表示されます。
+  対象として表示されます。Full load + CDC では、CDC を開始するまで、テーブル行でテーブルの選択を外せます(Aurora DSQL 上にそのまま残され、CDC はキャプチャしません)。再び選択できるのは、前回の Full Load のスナップショットにあるテーブルだけです。それ以外のテーブルを選択することになる行はエラーになり、CDC を開始した後は選択を変えることになる行はすべてエラーになります。CDC スタックがある場合、ポップアップは読み取り専用なので、代わりにテーブル一覧でチェックを外してください。
 - **何かを削除する前に、何が起きるかを正確に示します:** drop して reload する各テーブルを、列の差分
   (`+ c (NULL)`、`- c`)と行数の見積もり(「N rows re-read」)とともに示し、さらにそれらのテーブルに対する
   警告と ALTER も示します。「Their rows on Aurora DSQL are permanently deleted; each table is recreated
@@ -529,7 +527,7 @@ Full Load を含む移行タイプで、実行が記録されており、CDC ス
   **Drop & reload N tables** と表示されます。プレビューに示したテーブルにのみ作用します。Start ダイアログは
   続かず、reload はすぐに開始します。
 - **テキストだけの変更では何も削除されません。** どのテーブルの除外列も変わらない場合(たとえば、コメントを
-  追加しただけの場合)、ボタンは **Save** と表示され、ルールだけを保存します(Full load only では、
+  追加しただけの場合)、ボタンは **Save** と表示され、ルールだけを保存します(Full load only と Full load + CDC では、
   テーブル行が変更するテーブルの選択も保存します)。
 - **omit-only の変換。** omit-only のエントリ(v0.1.562 より前に除外されたもの、またはスタックから omit-only
   として採用されたもの。§13.10 を参照)を持つテーブルごとに、チェックの入っていないチェックボックス「Reload *table* so
@@ -572,10 +570,26 @@ Start over は不要です。
   Load 以降に選択したすべてのテーブルを対象にするまで(または Objects to validate でそのチップをオフに
   するまで)、Cut over は保留されます。そのようなテーブルがまだロードされていない間、Cut over は Data
   Migration ステップへ戻るよう案内します。
-- **移行タイプは Full load only のままです。** CDC は Full Load の開始時の集合をストリーミングするため、
-  **Re-run Full Load** が現在の集合に対して新しいウォーターマークを取得するか、元の集合に戻すまで、
-  タイプセレクターはロックされます。
+- **CDC タイプへの切り替え。** この移行で CDC を既に開始している場合を除き、テーブルのチェックを外すだけでは移行タイプはロックされず(既に開始している場合は、集合を元に戻すか Re-run Full Load を実行するまで、集合を変えるどの変更もタイプをロックします)、CDC タイプはロード済みのテーブルのうち、まだ選択されているものをキャプチャします。Full Load の後にチェックを入れたテーブルがある場合は、**Re-run Full Load** が現在の集合に対して新しいウォーターマークを取得するか、そのテーブルのチェックを再び外すまで、タイプセレクターはロックされます。
 - **Refresh objects は**、これまでどおりロード後は表示されません。
+
+### Full Load 後にテーブルを外す (Full load + CDC)
+
+Full load + CDC では、この移行で CDC を一度も開始していない間、つまり Start CDC を送信したことがなく、コネクタが存在せず、CDC インフラが一度もストリーミングしていない間は、Full Load の後でもテーブル集合を縮小できます。テーブル一覧でテーブルのチェックを外すか、Change & reload で `exclude table ...` 行を使います。復元されたセッションでも同じように動作します。Start over は不要です。
+
+- **チェックを外したテーブルは Aurora DSQL 上にそのまま残されます(削除されません)。** CDC はそのテーブルをキャプチャせず、この移行はそのテーブルをもうロードも検証もしません。カットオーバーの DEFAULT 復元は、そのテーブルを復元せずに **Needs your decision** の下に表示します。テーブルルールで選択を外した場合、そのテーブルの除外列のエントリは保持されません。
+- **再びチェックを入れられるのは、Full Load のスナップショットにあるテーブルだけです。** それ以外のテーブルにはロックのアイコンとその理由が表示されます。テーブルを追加するには Start over が必要です。スナップショットにないテーブルには、CDC のギャップのない開始点がないためです。
+- **CDC インフラがそのテーブルを含めずにデプロイされた後で再びチェックを入れたテーブルは**、CDC を開始するときにキャプチャされます。そのテーブルの Kafka トピックにはインフラの既定のパーティション数が使われ、この数はインフラのデプロイ時のテーブルに合わせて決められています。
+- **exclude table ルールが選択を外したテーブルは**、Change & reload でそのルールを削除した場合にだけ戻ります。そのときテーブルの列ルールが再び適用されます(テーブル一覧でチェックを入れることは拒否されます。ロード済みの行では NULL の列の値を、CDC がストリーミングすることになるためです)。
+- **CDC インフラがデプロイされている場合、ポップアップは読み取り専用です:** テーブル一覧を使ってください。
+- **チェックを外したテーブルだけで起きた失敗は、もうステップを止めません。** ステップは Done と表示され、Continue to CDC が使えるようになり、PostgreSQL では CDC はロード時のスロットから再開します。Retry unfinished tables がチェックを外したテーブルを再ロードすることはありません。
+- **待つべきときは待機として案内し、Start over は求めません:** Full Load、外部キーの適用、カットオーバーの DEFAULT 復元が実行されている間、CDC インフラの作成中または削除中、失敗した作成がアカウントに残っている間(CDC ステップで削除してください)、そしてページを開いた後に CDC の状態を読み取る数秒の間です。CDC の状態を読み取れない場合は、CDC ステップがその理由を示します。AWS へのアクセスを修正し、**Re-check CDC state** を使ってください。
+- **Unselect all は使えます**。ただし、Deploy CDC infrastructure と Start CDC には、選択されたテーブルが 1 つ以上必要です。
+- **縮小した集合で Re-run Full Load を実行すると**、チェックを外したテーブルを含まない新しいウォーターマークを取得します。PostgreSQL では既存の publication を再利用します。
+- **PostgreSQL で CDC が Full Load のスロットから再開する場合、publication にチェックを外したテーブルが残ります**(ツールはソース上の publication を変更しません)。そのテーブルの変更はコネクタが破棄します。代わりにスナップショットを取り直す Start(キャプチャ対象のテーブルのロードが完了していない、**Re-snapshot every table instead** を選んだ、または CDC インフラを削除した後の Start)では、コネクタが publication をキャプチャ対象のテーブルに合わせます。
+- **外部キー。** 選択されたテーブルは、チェックを外したテーブルを参照する外部キーを保持します。Cut over では、親の行が複製されていないキーを orphan チェックが報告します。
+- **CDC を一度開始すると、その後停止していても、集合は再び固定されます。**
+- **CDC only:** CDC を開始する前にテーブルを外すには、Full load + CDC に切り替えてください。
 
 ### 隔離またはデッドレターから
 
@@ -731,7 +745,7 @@ ALTER TABLE "shop"."users" ALTER COLUMN "status" SET DEFAULT ('active'::text)
 - **DEFAULT の復元が残ったままでもカットオーバーはブロックされません。** 「I've cut over to DSQL」の上の
   警告に専用の **Restore DEFAULTs** ボタンがあり、確認操作は `cut over with N DEFAULTs not restored` を
   ログに記録します。
-- **選択されなくなったテーブル。** テーブルがもう移行に選択されていない列(Full load only はロード済みの
+- **選択されなくなったテーブル。** テーブルがもう移行に選択されていない列(Full load only と、CDC を開始する前の Full load + CDC はロード済みの
   テーブルの選択を外せます)は自動では復元されず、**Needs your decision** の下に表示されます。
 
 台帳を読めない場合、ブロックはその旨を示し(「The record of dropped DEFAULTs could not be read ...」)、
@@ -854,9 +868,7 @@ ALTER TABLE <table> ALTER COLUMN <column> SET DEFAULT (<original_default>)
   Conversion の DDL からテーブルを再作成します)だけです。
 - 復元された DEFAULT は**新しい行にのみ**適用され、移行済みの行は NULL のままです。
 - NULL を拒否する手書きの `CHECK` 制約は事前に検出されません(そのテーブルは 23514 で失敗します)。
-- Full load + CDC と CDC only では、Full Load の後、**テーブル集合**は Start over によってのみ変更できます
-  (Full load only は §13.7 の「Full Load 後にテーブル集合を変更する」を参照)。CDC スタックがデプロイされると、
-  その除外設定は Delete CDC infrastructure の後でのみ変更できます。
+- CDC only では、Full Load の後、**テーブル集合**は Start over によってのみ変更できます(または、CDC を開始する前にテーブルを外すには Full load + CDC に切り替えます)。Full load + CDC では、CDC を開始するまでテーブルを外せますが、追加することはできず、それ以降は Start over が必要です。Full load only は §13.7 の「Full Load 後にテーブル集合を変更する」を参照してください。CDC スタックがデプロイされると、その除外設定は Delete CDC infrastructure の後でのみ変更できます。
 - **CDC の開始前から** Aurora DSQL にある行は、除外列の値を保持します。
 - キャプチャリストは 4,096 バイトに収まる必要があります(§13.8)。連結すると同じ `db.table.column` 文字列に
   なる 2 つの名前は、キャプチャ時に区別できません。

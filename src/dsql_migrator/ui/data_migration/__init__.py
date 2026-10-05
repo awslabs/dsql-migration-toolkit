@@ -218,11 +218,18 @@ from dsql_migrator.ui.data_migration._models import (
     recreated_unfinished,
     unsettled_table_names,
     full_load_scope_names,
+    whole_record_selected,
+    untick_can_settle,
+    cdc_capture_names,
+    keep_unlisted_covered,
+    narrowed_record_names,
+    capture_load_complete,
     scope_full_load_job,
     scope_change,
     watermark_coverage_gap,
     coverage_lock_reason,
     COVERAGE_GAP_NOTICE_BODY,
+    COVERAGE_GAP_NOTICE_BODY_STARTED,
     COVERAGE_GAP_NOTICE_PG_SUFFIX,
     added_since_run_reason,
     retry_scope_block_reason,
@@ -480,9 +487,10 @@ def build_data_migration_screen(
     def _catalog_baseline():
         # What the source-schema re-check (ui/cdc_catalog_drift_gate.py) compares the live
         # source with: the Step 1 inventory and the tables CDC captures, resolved by Start
-        # CDC's own chain (watermark, else selection, else the deployed TableIncludeList).
-        # None without an inventory (Step 1 running, or its last run failed) -- "cannot
-        # check", never clean. CPU only (no I/O): called by the poll and on render.
+        # CDC's own chain (the watermark's covered tables still selected -- G16 --, else
+        # the selection, else the deployed TableIncludeList). None without an inventory
+        # (Step 1 running, or its last run failed) -- "cannot check", never clean. CPU only
+        # (no I/O): called by the poll and on render.
         from dsql_migrator.ui.cdc_catalog_drift_gate import CatalogBaseline
 
         inventory = _inventory()
@@ -490,8 +498,9 @@ def build_data_migration_screen(
             return None
         job = _current_job(job_manager, getattr(migration_state, "job_id", None))
         watermark = getattr(job, "watermark", None) if job is not None else None
-        if watermark is not None and getattr(watermark, "table_row_counts", None):
-            names = set(watermark.table_row_counts)
+        _captured_names = cdc_capture_names(migration_state, watermark)
+        if _captured_names is not None:
+            names = set(_captured_names)
         else:
             selection = migration_state.selection
             if selection is not None and selection.selected_tables:
@@ -549,16 +558,28 @@ def build_data_migration_screen(
     migration_state.set_exclusion_inputs_resolver(_exclusion_resolver)
 
     def _exclusion_capture_tables(selected):
-        """The tables CDC would capture after a popup Save: the Full Load watermark's set
-        once a load ran (the table set is then fixed), else the selection after the Save."""
+        """The tables CDC would capture after a popup Save: once a load ran, the Full Load
+        watermark's tables still selected after it (a Save can only drop covered tables in
+        Full load + CDC before CDC starts, G16 -- the stored names the popup cannot list are
+        kept, as the Save keeps them), else the selection after the Save."""
         inventory = _inventory()
         if inventory is None:
             return []
         job = _current_job(job_manager, getattr(migration_state, "job_id", None))
         watermark = getattr(job, "watermark", None) if job is not None else None
         if watermark is not None and getattr(watermark, "table_row_counts", None):
-            covered = set(watermark.table_row_counts)
-            return [t for t in inventory.tables if t.name in covered]
+            inputs_now = _exclusion_resolver()
+            if inputs_now is not None and set(selected) == set(inputs_now.selected):
+                # The Save leaves the selection as it is: the capture as it is now.
+                names = cdc_capture_names(migration_state, watermark) or frozenset()
+            else:
+                covered = set(watermark.table_row_counts)
+                names = covered & (set(selected) | set(keep_unlisted_covered(
+                    migration_state.selection.selected_tables,
+                    list(getattr(inputs_now, "migratable", None) or ()),
+                    covered,
+                )))
+            return [t for t in inventory.tables if t.name in names]
         wanted = set(selected)
         return [t for t in inventory.tables if t.name in wanted]
 
@@ -583,6 +604,9 @@ def build_data_migration_screen(
             status=get_status(session.workflow, WorkflowStep.FULL_LOAD),
             job_manager=job_manager,
         ),
+        # Full load + CDC after its Full Load, before CDC starts (G16): which tables a table
+        # line may select again -- the tree's own per-table add-lock.
+        add_lock_fn=lambda: table_set_add_lock(migration_state, job_manager),
     )
     _exclusion_row: dict = {}
     # The tree's filter text, kept across a page refresh (a Full load only tick after a
@@ -599,16 +623,21 @@ def build_data_migration_screen(
         status it wrote, else ``None``. ``status_now`` is the caller's current step (read
         from the workflow when omitted).
 
-        Only in Full load only, while the set may change after a load
-        (:func:`table_set_editable_after_load`), with a terminal job, a DONE/FAILED step and
-        a touched selection. Writes only on a difference, so a steady render writes
-        nothing: a newly selected (unloaded) table makes the step FAILED -- Validation
-        locks until it is loaded -- and unselecting the only failed tables makes it DONE.
-        No I/O on the render thread; a failed or cancelled run turning DONE submits the
-        background identity-sequence sync its finalize skipped
-        (:func:`submit_scope_identity_sync`).
+        Only in Full load only, or Full load + CDC before CDC starts (G16: removals only),
+        while the set may change after a load (:func:`table_set_editable_after_load`), with
+        a terminal job, a DONE/FAILED step and a touched selection. Writes only on a
+        difference, so a steady render writes nothing: a newly selected (unloaded) table
+        makes the step FAILED -- Validation locks until it is loaded -- and unselecting the
+        only failed tables makes it DONE (in Full load + CDC that also enables Continue to
+        CDC); ticking them back makes it FAILED again, the job's error restored (Full load +
+        CDC then judges the record itself, :func:`whole_record_selected`). No I/O on the
+        render thread; a failed or cancelled run turning DONE submits the background
+        identity-sequence sync its finalize skipped (:func:`submit_scope_identity_sync`).
         """
-        if migration_state.migration_type is not MigrationType.FULL_LOAD_ONLY:
+        if migration_state.migration_type not in (
+            MigrationType.FULL_LOAD_ONLY,
+            MigrationType.FULL_LOAD_AND_CDC,
+        ):
             return None
         if not table_set_editable_after_load(migration_state, job_manager):
             return None
@@ -628,10 +657,18 @@ def build_data_migration_screen(
             resolve_migration_selection(
                 inventory_now, conv_state, migration_state, _target_inventory()
             ),
+            job=record,
         )
-        if names is None:
+        if names is not None:
+            view = scope_full_load_job(record, names)
+        elif whole_record_selected(migration_state, record):
+            # G16: a Full load + CDC set ticked back to every table of its record after a
+            # narrowing is the record itself again -- re-derived from it, as G12 does for an
+            # unchanged Full load only set, so a failed table makes the step Failed again
+            # (its error back) instead of keeping the DONE its untick earned.
+            view = record
+        else:
             return None
-        view = scope_full_load_job(record, names)
         derived = full_load_step_for_scope(
             record,
             view,
@@ -672,8 +709,9 @@ def build_data_migration_screen(
         if not table_set_editable_after_load(migration_state, job_manager):
             return
         # G12: after a Full load only load, a tick changes what the Full Load card, the
-        # nav badge and the type tiles show: sync the step now and refresh the page once
-        # the ticks settle (coalesced: a burst costs one render).
+        # nav badge and the type tiles show (G16: in Full load + CDC, the CDC step's "Will
+        # stream" too): sync the step now and refresh the page once the ticks settle
+        # (coalesced: a burst costs one render).
         _sync_scope_step()
         page_timer = _exclusion_row.get("page_timer")
         if page_timer is not None:
@@ -959,9 +997,10 @@ def build_data_migration_screen(
                 with_status(session.workflow, WorkflowStep.FULL_LOAD, promoted)
             )
             status = promoted
-        # Full load only after a table-set change (G12): the step follows the CURRENT set
-        # (a newly selected table not loaded yet -> FAILED; only unselected tables
-        # unfinished -> DONE). A no-op whenever nothing changed.
+        # After a table-set change following the load (Full load only, G12; Full load + CDC
+        # before CDC first starts, removals only, G16): the step follows the CURRENT set (a
+        # selected table not loaded yet -> FAILED; only unselected tables unfinished ->
+        # DONE). A no-op whenever nothing changed.
         status = _sync_scope_step(status) or status
         # The Full Load PHASE (what the Full Load surfaces show), apart from the shared
         # step a streaming CDC-only run promoted; ``status`` keeps gating and writes.
@@ -1108,7 +1147,8 @@ def build_data_migration_screen(
             # The watermark decides whether the CONSISTENCY POINT has already been passed,
             # and it is needed twice below, so resolve it once.
             _wm_for_gate = _cdc_watermark(
-                _current_job(job_manager, getattr(migration_state, "job_id", None))
+                _current_job(job_manager, getattr(migration_state, "job_id", None)),
+                migration_state,
             )
             request = PrerequisiteCheckRequest(
                 mode=mode,
@@ -1603,8 +1643,9 @@ def build_data_migration_screen(
                     ),
                     # Refresh objects stays hidden once a Full Load job exists, as it
                     # always was: Full load only can now change the set after a load
-                    # (G12), but re-introspecting would change the inventory every
-                    # loaded table, Validation and the exclusions are judged against.
+                    # (G12) and Full load + CDC can drop tables until CDC starts (G16),
+                    # but re-introspecting would change the inventory every loaded
+                    # table, Validation and the exclusions are judged against.
                     on_refresh=refresh_browser if job is None else None,
                     locked=selection_locked,
                     lock_reason=selection_lock,
@@ -1618,17 +1659,23 @@ def build_data_migration_screen(
                         else None
                     ),
                     on_locked=refresh,
-                    hint=(
-                        "A Full Load has run. A table you untick is left as is on Aurora "
-                        "DSQL (not dropped); a table you tick that is not loaded yet is "
-                        "loaded with Retry unfinished tables on the Full Load step (one "
-                        "already loaded is kept as is)."
-                        if job is not None
-                        and not selection_locked
-                        and table_set_editable_after_load(migration_state, job_manager)
-                        else None
+                    hint=_table_tree_hint(
+                        migration_state,
+                        job_manager,
+                        job=job,
+                        locked=selection_locked,
+                        migration_type=migration_type,
                     ),
                     filter_state=_tree_filter_state,
+                    # Full load + CDC after its Full Load, before CDC starts (G16): which
+                    # leaves may be ticked (lock icons), re-read at the click whatever type
+                    # this tree rendered under (another tab may have switched it). Every
+                    # other type gets no lock, so it renders exactly today's tree.
+                    add_lock_fn=(
+                        (lambda: table_set_add_lock(migration_state, job_manager))
+                        if job is not None
+                        else None
+                    ),
                 )
                 # Exclude tables & columns: the one home for every migration type, right
                 # under the tree it edits (a local refreshable the tree ticks refresh).
@@ -1648,9 +1695,11 @@ def build_data_migration_screen(
             # picker was explicitly changed away from that "too early and a dead end"
             # behavior). The exclusion is baked only once a Full Load has run, CDC is
             # streaming, or the CDC stack (with its column.exclude.list) is deployed
-            # -- exactly ``selection_locked``, with one exception: in Full load only the
-            # TABLE set stays editable after a load (G12) while the column exclusions stay
-            # locked (``exclusion_lock_state``). A change made after the checks ran but
+            # -- exactly ``selection_locked``, with one exception: after a load the TABLE
+            # set stays editable in Full load only (G12, both directions) and, removals
+            # only, in Full load + CDC until CDC first starts (G16, even with its CDC
+            # infrastructure deployed), while the column exclusions stay locked
+            # (``exclusion_lock_state``). A change made after the checks ran but
             # before the load is caught at the Run button (see
             # ``full_load_run_guard_reason``), so a stale PASS never starts a load
             # against an unchecked column set. The lock is silent: the greyed picker
@@ -1845,14 +1894,18 @@ def build_data_migration_screen(
                     return
                 # G12: after a Full load only set change the retry follows the CURRENT
                 # selection -- a table no longer selected is left as is (never reloaded or
-                # dropped), and a table selected since needs its prerequisite checks. An
-                # unchanged set (and every CDC type) is the record itself: today's path.
+                # dropped), and a table selected since needs its prerequisite checks. G16:
+                # Full load + CDC follows the record's tables still selected (removal only).
+                # An unchanged set (and CDC only) is the record itself: today's path.
                 _selected_now = resolve_migration_selection(
                     inventory, conv_state, migration_state, _target_inventory()
                 )
                 if (
                     not _selected_now
-                    and migration_state.migration_type is MigrationType.FULL_LOAD_ONLY
+                    and migration_state.migration_type in (
+                        MigrationType.FULL_LOAD_ONLY,
+                        MigrationType.FULL_LOAD_AND_CDC,
+                    )
                     and migration_state.selection_touched
                     and table_set_editable_after_load(migration_state, job_manager)
                 ):
@@ -2847,7 +2900,30 @@ def build_data_migration_screen(
                                             "Retry the failed tables before starting "
                                             "CDC -- streaming resumes from the "
                                             "snapshot, so it must not start on "
-                                            "partial data.",
+                                            "partial data."
+                                            # G16: until CDC starts, a failed table can
+                                            # also leave the migration instead -- unless
+                                            # every selected table loaded (a run-level
+                                            # failure stays Failed whatever is unticked).
+                                            + (
+                                                CONTINUE_HINT_FL_CDC
+                                                if migration_type
+                                                is MigrationType.FULL_LOAD_AND_CDC
+                                                and table_set_lock_reason(
+                                                    migration_state, job_manager, session
+                                                )
+                                                is None
+                                                and untick_can_settle(
+                                                    job,
+                                                    full_load_scope_names(
+                                                        migration_state,
+                                                        job_manager,
+                                                        selected_names,
+                                                        job=job,
+                                                    ),
+                                                )
+                                                else ""
+                                            ),
                                             tone="warning",
                                         )
                                         ui.button(
@@ -2882,10 +2958,13 @@ def build_data_migration_screen(
                                     )
                                     is SourceType.POSTGRES
                                 )
-                                # G12: the table set changed after this load, so its
-                                # watermark no longer covers it and the type selector is
+                                # G12: a table was selected after this load, so its
+                                # watermark does not cover it and the type selector is
                                 # locked (migration_type_lock_reason): say how to add CDC
-                                # instead of pointing at a selector that will not move.
+                                # instead of pointing at a selector that will not move. (A
+                                # removal alone keeps the notice below while CDC never
+                                # started: CDC captures the loaded tables still selected,
+                                # G16. Once it has started, a removal locks too.)
                                 _coverage_gap = _type_switch_coverage_gap(
                                     migration_state, job_manager
                                 )
@@ -2900,9 +2979,13 @@ def build_data_migration_screen(
                                 # dead start. (The app already says as much 1100 lines
                                 # away in _cdc_ui's start-point card.)
                                 if _coverage_gap is not None:
-                                    body = COVERAGE_GAP_NOTICE_BODY + (
-                                        COVERAGE_GAP_NOTICE_PG_SUFFIX if _is_pg else ""
-                                    )
+                                    body = (
+                                        COVERAGE_GAP_NOTICE_BODY_STARTED
+                                        if _cdc_started_for_migration(
+                                            migration_state, job_manager
+                                        )
+                                        else COVERAGE_GAP_NOTICE_BODY
+                                    ) + (COVERAGE_GAP_NOTICE_PG_SUFFIX if _is_pg else "")
                                 elif _is_pg:
                                     body = (
                                         "This run created no replication slot, so there "
@@ -3202,6 +3285,25 @@ def exclusion_card_locked(migration_state, job_manager, session=None) -> bool:
     symmetry and unused.
     """
     return exclusion_lock_state(migration_state, job_manager).locked
+
+
+def _table_tree_hint(
+    migration_state, job_manager, *, job, locked: bool, migration_type
+) -> Optional[str]:
+    """The neutral line under the table picker after a Full Load, while the set can still
+    change (:func:`table_set_editable_after_load`), else ``None``: Full load only says what
+    a tick or an untick does (G12); Full load + CDC that an untick drops a table and only
+    covered tables can be ticked again (G16)."""
+    if job is None or locked or not table_set_editable_after_load(migration_state, job_manager):
+        return None
+    if migration_type is MigrationType.FULL_LOAD_AND_CDC:
+        return TREE_HINT_FL_CDC
+    return (
+        "A Full Load has run. A table you untick is left as is on Aurora "
+        "DSQL (not dropped); a table you tick that is not loaded yet is "
+        "loaded with Retry unfinished tables on the Full Load step (one "
+        "already loaded is kept as is)."
+    )
 
 
 def table_set_lock_reason(migration_state, job_manager, session) -> Optional[str]:
@@ -3760,10 +3862,13 @@ def migration_type_lock_reason(
       exclusions are a CDC-only setting, so freezing them while leaving the type itself
       switchable was internally inconsistent.
 
-    * **Coverage** (Full load only, last) -- the table set changed after the Full Load, so
-      its watermark no longer covers it, and a CDC type would stream the original set. The
+    * **Coverage** (Full load only, last) -- a table was selected after the Full Load, so
+      its watermark does not cover it and a CDC type has no gapless start point for it. The
       remedy is in Full load only: Re-run Full Load (a fresh watermark over the current
-      set) or restore the original set.
+      set) or untick it again. A removal alone does not lock while CDC never started for
+      this migration: CDC captures the loaded tables still selected (``cdc_capture_names``,
+      G16). Once CDC has started -- even if stopped and deleted since -- a removal locks
+      too, so a detour through Full load only cannot narrow the set a started CDC captured.
 
     Each legitimately freezes the choice, but the reason (and the remedy) differ.
     Reads ``status`` and already-populated state; ``job_manager`` (optional) is only
@@ -3799,21 +3904,28 @@ def migration_type_lock_reason(
             "CDC infrastructure' control live on the CDC step. Wait for it to finish "
             "(or delete it there) to change the type."
         )
-    # Full load only after a table-set change (G12): CDC streams exactly the watermark's
-    # tables (_cdc_tables_for_config, for Start CDC and the infra deploy), so a CDC type
-    # would capture the ORIGINAL set -- a table selected since without a gapless start, one
-    # unselected since still streaming. Both remedies exist in Full load only, and this
-    # covers the Full load + CDC -> Full load only -> change -> back path as well.
+    # Full load only after a table-set change (G12): CDC captures the watermark's tables
+    # still selected (cdc_capture_names via _cdc_tables_for_config, for Start CDC and the
+    # infra deploy, G16), so a table selected since would have no gapless start point -- a
+    # table unselected since is simply not captured, which locks only once CDC has started
+    # for this migration (its set is fixed then). Both remedies exist in Full load only, and
+    # this covers the Full load + CDC -> Full load only -> change -> back path as well.
     gap = _type_switch_coverage_gap(migration_state, job_manager)
     if gap is not None:
-        return coverage_lock_reason(gap)
+        return coverage_lock_reason(
+            gap, started=_cdc_started_for_migration(migration_state, job_manager)
+        )
     return None
 
 
 def _type_switch_coverage_gap(migration_state, job_manager):
     """``(selected since, unselected since)`` when a Full load only set left its watermark
-    behind, else ``None``. Touched selections only (an untouched default that drifted is
-    no decision); the live exclusion inputs, else the last render's selection."""
+    behind, else ``None``. While CDC never started for this migration only a table selected
+    since is a gap -- a removal alone is none (G16: CDC captures the covered tables still
+    selected); once it has started (:func:`_cdc_started_for_migration`: even if stopped and
+    deleted since), a removal is one too, as before G16. Touched selections only (an
+    untouched default that drifted is no decision); the live exclusion inputs, else the last
+    render's selection."""
     if job_manager is None:
         return None
     if getattr(migration_state, "migration_type", None) is not MigrationType.FULL_LOAD_ONLY:
@@ -3835,6 +3947,8 @@ def _type_switch_coverage_gap(migration_state, job_manager):
         migratable = []
     gap = watermark_coverage_gap(job, selected, migratable)
     if gap is None or not (gap[0] or gap[1]):
+        return None
+    if not gap[0] and not _cdc_started_for_migration(migration_state, job_manager):
         return None
     return gap
 
@@ -3870,8 +3984,16 @@ def selection_lock_reason(
       selected (loaded by Retry unfinished tables), and the lock only WAITS while a load, a
       foreign-key pass or a cut-over DEFAULT restore runs (:func:`table_set_wait_reason`).
       Nothing feeds a CDC capture list there; the migration-type lock keeps a CDC type off
-      until a fresh watermark covers the set. A pruned record or CDC evidence keeps the
-      lock as before.
+      while a table selected since the load is not covered by a fresh watermark. A pruned
+      record or CDC evidence keeps the lock as before. Full load + CDC lifts it too, for
+      REMOVALS, until CDC first starts for this migration (G16, the same predicate): a
+      table can then be unselected (left as is on Aurora DSQL, and CDC no longer captures
+      it), and only a table the Full Load covered can be selected again
+      (:func:`table_set_add_lock`). It also WAITS while the CDC infrastructure is created
+      or deleted, a failed create is still in the account, or the CDC state has not been
+      read yet. Once CDC has started -- even if stopped since -- this clause's text below
+      applies again, unchanged. CDC only keeps the lock; while Full load + CDC could still
+      drop tables (and the type may change), its text names that route too.
     * **CDC is streaming** -- the running source connector's table list is fixed;
       ticking the picker cannot add or remove a streamed table.
     * **CDC infrastructure is deployed or deploying** -- the subtle one. The immutable
@@ -3882,7 +4004,12 @@ def selection_lock_reason(
       ``kind="infra"`` job (counting it once froze this picker for 20 minutes), so
       without this clause that whole window would be unguarded. Scoped to CDC-bearing
       types so a Full-load-only run is not frozen by a CDC stack that merely exists in
-      the account.
+      the account. The G16 narrowing above does not reach this clause: it never adds a
+      table the Full Load did not load, and a never-started stack has no topics yet --
+      Start CDC re-sends the table list and creates each captured table's topic from the
+      partition plan the stack was deployed with: a covered table ticked back before CDC
+      first starts gets the plan's default count, as every table the plan does not single
+      out does.
 
     Pure: reads ``status`` plus already-populated state (``job_manager`` is only used for
     the job-id lookups the CDC helpers already do) -- no AWS I/O, so it is safe during
@@ -3890,10 +4017,14 @@ def selection_lock_reason(
     """
     if has_job or status is StepStatus.DONE:
         # G12: Full load only, record found, no CDC stack -- the set may change after the
-        # load; only a running load / FK pass / DEFAULT restore holds it (a wait).
-        if migration_type is MigrationType.FULL_LOAD_ONLY and table_set_editable_after_load(
-            migration_state, job_manager
-        ):
+        # load; only a running load / FK pass / DEFAULT restore holds it (a wait). G16: Full
+        # load + CDC, record found, CDC never started for this migration -- tables may be
+        # dropped; the CDC infrastructure being created or deleted, a failed create and an
+        # unread CDC state are waits too.
+        if migration_type in (
+            MigrationType.FULL_LOAD_ONLY,
+            MigrationType.FULL_LOAD_AND_CDC,
+        ) and table_set_editable_after_load(migration_state, job_manager):
             return table_set_wait_reason(migration_state, job_manager, status=status)
         # The FULL_LOAD step is ALSO promoted to DONE by CDC alone once it streams
         # (data_migration_step_after_cdc). The lock is right either way -- the set was
@@ -3909,21 +4040,31 @@ def selection_lock_reason(
                 "Locked — CDC has already streamed this table set. Use 'Start over' "
                 "to migrate a different set of tables."
             )
-        return (
+        full_load_ran = (
             "Locked — a Full Load has already run for this table set. Use 'Start over' "
             "to migrate a different set of tables."
         )
+        # CDC only after a recorded Full Load (G16): while Full load + CDC could still drop
+        # tables -- the CDC state read, CDC never started for this migration, and the type
+        # free to change -- name that non-destructive route beside Start over.
+        if (
+            migration_type is MigrationType.CDC_ONLY
+            and job_manager is not None
+            and getattr(migration_state, "cdc_stack_phase_checked", False)
+            and _fl_cdc_narrowing_open(migration_state, job_manager)
+            and migration_type_lock_reason(
+                migration_state, status=status, job_manager=job_manager
+            )
+            is None
+        ):
+            return full_load_ran + CDC_ONLY_NARROWING_SENTENCE
+        return full_load_ran
     if cdc_streaming_started(migration_state, job_manager):
         # A running Delete makes cdc_streaming_started True too: say it is a wait, not
         # "stop CDC". Nested HERE (not above the clause) so a restored DELETE_IN_PROGRESS
         # with no live connectors still reaches the infra clause below, which unlocks.
         if cdc_stack_being_deleted(migration_state, job_manager):
-            estimate, _why = cdc_delete_eta(migration_state)
-            return (
-                f"Locked while the CDC infrastructure is being deleted (a cdc-stack delete "
-                f"takes {estimate}). Wait for the deletion to finish before changing the "
-                "table set."
-            )
+            return table_set_delete_wait(migration_state)
         return (
             "Locked — CDC is running and its source connector streams a fixed table "
             "set. To change it, stop CDC, then delete the CDC infrastructure on the CDC "
@@ -3939,19 +4080,27 @@ def selection_lock_reason(
     #
     # Narrowed to the DELETE_IN_PROGRESS literal, not generalised to "any teardown": Stop
     # CDC is an UPDATE that leaves MSK, the topics and that partition plan in place, so
-    # unlocking there would let a table be added and then streamed forever on one
-    # partition -- the exact harm this lock prevents.
+    # unlocking there would let a table be added and then streamed on the plan's lowest
+    # partition count forever -- the exact harm this lock prevents.
     if (
         "cdc" in substeps_for_type(migration_type)
         and cdc_infra_prep_state(migration_state, job_manager)
         in ("ready", "deploying")
         and not cdc_stack_being_deleted(migration_state, job_manager)
     ):
+        # G16 found the old sentence ("A table added now would stream on a single
+        # partition") false for the common UNIFORM plan: a topic absent from
+        # SinkTopicPartitions takes TopicDefaultPartitions, which there is every table's
+        # count, not 1. It is only the lowest count when the plan gave some tables more
+        # (compute_cdc_partition_plan). Both counts, and the sink's total task budget, were
+        # sized for the tables selected at create (compute_cdc_scaling_defaults) -- which is
+        # what the lock really rests on, so say that instead of a partition number.
         return (
             "Locked — CDC infrastructure is deployed for this table set, and each "
-            "table's Kafka topic partitions are fixed when it is created. A table "
-            "added now would stream on a single partition. To change the set, delete "
-            "the CDC infrastructure on the CDC step first."
+            "table's Kafka topic partitions are fixed when it is created (so is the "
+            "sink's task budget), sized for the tables selected then. A table added now "
+            "would stream on the plan's lowest partition count. To change the set, "
+            "delete the CDC infrastructure on the CDC step first."
         )
     return None
 
@@ -4367,7 +4516,10 @@ def effective_migration_selection(
 
 
 def build_migration_table_tree(
-    inventory: SourceInventory, migratable: Sequence[str]
+    inventory: SourceInventory,
+    migratable: Sequence[str],
+    *,
+    add_locked: Optional[Mapping[str, str]] = None,
 ) -> list[dict]:
     """Assemble the hierarchical table picker for ``ui.tree`` (Schema/Tables).
 
@@ -4385,8 +4537,15 @@ def build_migration_table_tree(
     and ``header: "table"`` so the renderer's ``header-table`` Quasar slot can
     show a small PK indicator beside the leaf label -- Aurora DSQL requires a
     primary key, so a missing one is worth flagging in the picker.
+
+    ``add_locked`` (``{table: code}``, Full load + CDC after its Full Load, G16 --
+    :meth:`TableSetAddLock.node_flags`) marks the leaves that cannot be ticked now:
+    ``tickable: False`` (its checkbox disabled; NOT ``disabled``, which would also kill the
+    lock icon's tooltip) and ``add_locked`` (the code the slot shows a lock icon for).
+    ``None`` builds exactly today's nodes.
     """
     migratable_set = set(migratable)
+    locked_codes = add_locked or {}
     order: list[str] = []
     by_schema: dict[str, list[dict]] = {}
 
@@ -4403,14 +4562,17 @@ def build_migration_table_tree(
         if schema not in by_schema:
             by_schema[schema] = []
             order.append(schema)
-        by_schema[schema].append(
-            {
-                "id": f"{TABLE_PREFIX}{table.name}",
-                "label": obj,
-                "has_pk": bool(table.primary_key),
-                "header": "table",  # -> the "header-table" leaf slot (PK badge)
-            }
-        )
+        leaf = {
+            "id": f"{TABLE_PREFIX}{table.name}",
+            "label": obj,
+            "has_pk": bool(table.primary_key),
+            "header": "table",  # -> the "header-table" leaf slot (PK badge)
+        }
+        code = locked_codes.get(table.name)
+        if code is not None:
+            leaf["tickable"] = False
+            leaf["add_locked"] = code
+        by_schema[schema].append(leaf)
 
     schema_nodes: list[dict] = []
     for schema in order:
@@ -4430,6 +4592,38 @@ def build_migration_table_tree(
     return schema_nodes
 
 
+def _header_table_slot_with_locks() -> str:
+    """The table leaf slot with the G16 lock icons (Full load + CDC after its Full Load): a
+    grey lock per leaf that cannot be ticked now, its reason on hover. Static text, so the
+    whole slot stays a client-side template (no per-node Python work)."""
+    return (
+        r"""
+            <div class="row items-center no-wrap">
+              <span class="text-body2">{{ props.node.label }}</span>
+              <q-icon v-if="props.node.has_pk" name="check_circle"
+                      color="green-6" size="16px" class="q-ml-xs">
+                <q-tooltip>Has a primary key</q-tooltip>
+              </q-icon>
+              <q-icon v-else name="warning" color="amber-7" size="16px" class="q-ml-xs">
+                <q-tooltip>No primary key — required to migrate to Aurora DSQL</q-tooltip>
+              </q-icon>
+              <q-icon v-if="props.node.add_locked === 'not_loaded'" name="lock"
+                      color="grey-6" size="16px" class="q-ml-xs">
+                <q-tooltip>"""
+        + LOCK_TIP_NOT_LOADED
+        + r"""</q-tooltip>
+              </q-icon>
+              <q-icon v-else-if="props.node.add_locked === 'rule'" name="lock"
+                      color="grey-6" size="16px" class="q-ml-xs">
+                <q-tooltip>"""
+        + LOCK_TIP_RULE
+        + r"""</q-tooltip>
+              </q-icon>
+            </div>
+            """
+    )
+
+
 def _render_table_selection(
     ui,
     inventory: SourceInventory,
@@ -4447,6 +4641,7 @@ def _render_table_selection(
     on_locked: Optional[Callable[[], None]] = None,
     hint: Optional[str] = None,
     filter_state: Optional[dict] = None,
+    add_lock_fn: Optional[Callable[[], object]] = None,
 ) -> None:
     """Render the hierarchical table picker scoped to migratable tables (Req 5.9).
 
@@ -4476,8 +4671,17 @@ def _render_table_selection(
     ``lock_check`` re-asks the lock at CLICK time (a tick, Select all, Unselect all): a
     reason there (another tab started a load) applies nothing, warns, and calls
     ``on_locked`` (a page refresh that re-ticks the stored set). ``hint`` is a neutral
-    line under the title (Full load only after a load: what a tick or an untick does).
+    line under the title (after a load: what a tick or an untick does).
     ``filter_state`` is a caller-held dict keeping the filter text across a refresh.
+
+    ``add_lock_fn`` (Full load + CDC after its Full Load, before CDC starts, G16) returns
+    the per-table add-lock (:func:`table_set_add_lock`) or ``None``. With a lock, each
+    untickable leaf shows a lock icon with its reason (client-side), a tick that would ADD
+    a locked table is refused whole at the click (warned, nothing stored, ``on_locked``),
+    Select all selects only the tables that may be selected, and every write keeps the
+    stored covered tables the tree cannot list (:func:`keep_unlisted_covered`). The lock is
+    read at render (the icons) and again at every click (the current type decides there).
+    ``None``, or a function returning ``None``, renders exactly today's picker.
     """
     with ui.row().classes("items-center gap-1"):
         ui.label("Tables to migrate").classes("text-sm font-semibold")
@@ -4562,15 +4766,42 @@ def _render_table_selection(
             touched=migration_state.selection_touched,
             default=list(default_set),
         )
+    # G16: which unticked leaves cannot be ticked now (Full load + CDC after its load).
+    render_lock = add_lock_fn() if add_lock_fn is not None and not locked else None
     # Object-browser tree (schema -> Tables -> leaf, leaf checkboxes), styled to
     # match the app's AWS/Cloudscape look: a live name filter + selection counter
     # above a white, bordered scroll panel. Each leaf shows a small PK indicator
     # via the "header-table" Quasar slot (Aurora DSQL requires a primary key, so a
     # missing one is worth flagging). The slot is a client-side Vue template, so
     # it adds no per-node Python work.
-    nodes = build_migration_table_tree(inventory, migratable_order)
+    nodes = build_migration_table_tree(
+        inventory,
+        migratable_order,
+        add_locked=(
+            render_lock.node_flags(migratable_order, effective)
+            if render_lock is not None
+            else None
+        ),
+    )
     effective_set = set(effective)
     total_leaves = sum(len(n["children"][0]["children"]) for n in nodes)
+
+    def _current_effective() -> set:
+        """The selection the tree shows NOW (the same resolution as ``effective``)."""
+        return set(effective_migration_selection(
+            migratable_order,
+            migration_state.selection,
+            touched=migration_state.selection_touched,
+            default=list(default_set),
+        ))
+
+    def _kept(lock) -> list:
+        """The stored covered names a write keeps although the tree cannot list them."""
+        if lock is None:
+            return []
+        return keep_unlisted_covered(
+            migration_state.selection.selected_tables, migratable_order, lock.covered
+        )
 
     def _refused() -> bool:
         """The lock re-asked at the click: a reason applies nothing (see the docstring)."""
@@ -4588,7 +4819,24 @@ def _render_table_selection(
         value = getattr(event, "value", None) or []
         names = selected_object_names(value)
         chosen = [name for name in migratable_order if name in names]
-        migration_state.set_selection(TableSelection(selected_tables=chosen))
+        # G16: the add-lock is read at the CLICK; a tick that would add a table it refuses
+        # applies nothing (all or nothing, like the lock above).
+        lock = add_lock_fn() if add_lock_fn is not None else None
+        if lock is not None:
+            current = _current_effective()
+            blocked = lock.blocked([n for n in chosen if n not in current], tree=True)
+            if blocked:
+                ui.notify(
+                    f"{lock.refusal(blocked, tree=True)} This change was not applied.",
+                    type="warning",
+                    multi_line=True,
+                )
+                if on_locked is not None:
+                    on_locked()
+                return
+        migration_state.set_selection(
+            TableSelection(selected_tables=chosen + _kept(lock))
+        )
         count_label.text = f"{len(chosen)} of {total_leaves} selected"
         if on_selection_change is not None:
             on_selection_change(chosen)
@@ -4616,19 +4864,46 @@ def _render_table_selection(
             def _dm_select_all() -> None:
                 if _refused():
                     return
-                tree.tick()
+                lock = add_lock_fn() if add_lock_fn is not None else None
+                if lock is None:
+                    tree.tick()
+                    migration_state.set_selection(
+                        TableSelection(selected_tables=list(migratable_order))
+                    )
+                    count_label.text = f"{len(migratable_order)} of {total_leaves} selected"
+                    if on_selection_change is not None:
+                        on_selection_change(list(migratable_order))
+                    return
+                # G16: only the tables that may be selected now. Explicit ids: tick() with
+                # none ticks EVERY node, locked leaves included.
+                current = _current_effective()
+                ids = [
+                    n for n in migratable_order
+                    if n in current or lock.code(n, tree=True) is None
+                ]
+                tree.tick([f"{TABLE_PREFIX}{n}" for n in ids])
                 migration_state.set_selection(
-                    TableSelection(selected_tables=list(migratable_order))
+                    TableSelection(selected_tables=ids + _kept(lock))
                 )
-                count_label.text = f"{len(migratable_order)} of {total_leaves} selected"
+                count_label.text = f"{len(ids)} of {total_leaves} selected"
+                skipped = len(migratable_order) - len(ids)
+                if skipped:
+                    one = skipped == 1
+                    ui.notify(
+                        f"{skipped} table{'' if one else 's'} cannot be selected now and "
+                        f"{'stays' if one else 'stay'} unselected (a lock marks "
+                        f"{'it' if one else 'them'} in the list).",
+                        type="info",
+                    )
                 if on_selection_change is not None:
-                    on_selection_change(list(migratable_order))
+                    on_selection_change(list(ids))
 
             def _dm_unselect_all() -> None:
                 if _refused():
                     return
+                lock = add_lock_fn() if add_lock_fn is not None else None
                 tree.untick()
-                migration_state.set_selection(TableSelection(selected_tables=[]))
+                migration_state.set_selection(TableSelection(selected_tables=_kept(lock)))
                 count_label.text = f"0 of {total_leaves} selected"
                 if on_selection_change is not None:
                     on_selection_change([])
@@ -4688,7 +4963,9 @@ def _render_table_selection(
                 <q-tooltip>No primary key — required to migrate to Aurora DSQL</q-tooltip>
               </q-icon>
             </div>
-            """,
+            """
+            if render_lock is None
+            else _header_table_slot_with_locks(),
         )
         # Load fully expanded so every schema's tables are visible without manual
         # drilling (the migratable-only tree keeps this bounded).
@@ -5603,6 +5880,25 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     TABLE_SET_WAIT_LOAD,
     TABLE_SET_WAIT_FK,
     TABLE_SET_WAIT_RESTORE,
+    TABLE_SET_WAIT_INFRA,
+    TABLE_SET_WAIT_CDC_CHECK,
+    TABLE_SET_WAIT_CDC_UNREAD,
+    table_set_failed_create_wait,
+    table_set_delete_wait,
+    TableSetAddLock,
+    table_set_add_lock,
+    LOCK_TIP_NOT_LOADED,
+    LOCK_TIP_RULE,
+    TREE_HINT_FL_CDC,
+    CDC_ONLY_NARROWING_SENTENCE,
+    R4_FL_CDC_NARROWING,
+    R1_FL_CDC_SENTENCE,
+    CONTINUE_HINT_FL_CDC,
+    START_TOOLTIP_NARROWING,
+    WILL_STREAM_NONE,
+    WILL_STREAM_NONE_LOCKED_LIST,
+    DEPLOY_EMPTY_CAPTURE,
+    will_stream_none,
     capture_error_with_remedy,
     cdc_stack_being_deleted,
     cdc_delete_eta,
@@ -5638,6 +5934,11 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     cdc_streaming_started,
     cdc_unstable_message,
     classify_cdc_card_phase,
+)
+# G16's CDC-evidence reads, shared with the type-switch lock and CDC only's lock text.
+from dsql_migrator.ui.data_migration._cdc_monitoring import (  # noqa: E402
+    _cdc_started_for_migration,
+    _fl_cdc_narrowing_open,
 )
 
 

@@ -316,7 +316,7 @@ the bulk load and the stream.
    in-VPC Lambda writes the offset record before the source connector starts).
    **For a PostgreSQL source** there is no offset-seeder Lambda; instead, at the
    Full Load consistency point the tool creates the logical replication slot (and a
-   publication scoped to exactly the migrated tables), and the slot's returned
+   publication for the tables the Full Load loaded), and the slot's returned
    consistent WAL LSN *is* the watermark — CDC resumes directly from that
    pre-created slot, so nothing is written to Kafka's connect-offsets. Either way
    Debezium begins streaming the **first change after the snapshot** — not from
@@ -330,6 +330,8 @@ the bulk load and the stream.
    > read a second time. See [Chapter 10 §10.1](10-conclusion.md) for choosing between
    > them. On MySQL the binary log retains history with no consumer, so a later CDC
    > start resumes from the watermark with no re-read.
+
+   If you untick tables after the Full Load (Full load + CDC, before CDC starts; [§13.7](13-excluding-tables-and-columns.md)), CDC captures only the tables still selected and resumes from the same watermark or slot, so the handoff stays gapless for them. On PostgreSQL, when CDC resumes from that slot, the publication still lists the unticked tables (the tool does not change it on the source) and the connector discards their changes; a Start that re-snapshots instead lets the connector set the publication to the captured tables. A Re-run Full Load over the smaller set reuses the existing publication.
 3. **For a MySQL source**, a Start at a **new start point** — the first Start, a
    Start after a newer Full Load or Manual point, or the first Start after Delete CDC
    infrastructure — runs the source connector with **`snapshot.mode=recovery`**:

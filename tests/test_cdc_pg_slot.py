@@ -307,6 +307,37 @@ def test_create_publication_refuses_reuse_when_the_table_set_differs() -> None:
     assert "app.customers" in str(ei.value) or "covers" in str(ei.value)
 
 
+def test_create_publication_reuses_a_publication_that_covers_the_set() -> None:
+    # G16 (FAILS WITHOUT THE FIX: the reconcile refused any difference): a Full load + CDC
+    # re-run over a set NARROWED after its first load requests fewer tables than the
+    # publication that load created. Reused as is -- no write on the source -- because the
+    # connector's table.include.list, not the publication, defines what CDC captures.
+    conn = _FakeConn(pubs={"dsqlmig_pub_s": ["app.orders", "app.customers"]})
+    logs: list[str] = []
+    created = create_publication(
+        conn, name="dsqlmig_pub_s", tables=["app.orders"], on_log=logs.append
+    )
+    assert created is False and conn.writes() == []
+    assert logs == [
+        "publication dsqlmig_pub_s already exists and covers every requested table; reusing "
+        "it (it also lists app.customers, which this run does not load: CDC's "
+        "table.include.list filters them out)"
+    ]
+    # ...and provisioning over it creates the fresh slot, with no CREATE PUBLICATION.
+    prov = _FakeConn(pubs={"dsqlmig_pub_s": ["app.orders", "app.customers"]}, lsn="7/1")
+    handles = provision_pg_replication(
+        prov, slot_name="dsqlmig_s", publication_name="dsqlmig_pub_s", tables=["app.orders"],
+    )
+    assert handles.consistent_lsn == "7/1"
+    writes = [w.upper() for w in prov.writes()]
+    assert not any(w.startswith("CREATE PUBLICATION") for w in writes)
+    assert any("PG_CREATE_LOGICAL_REPLICATION_SLOT" in w for w in writes)
+    # A publication MISSING a requested table is still refused (the reconcile's purpose).
+    with pytest.raises(PgReplicationError):
+        create_publication(_FakeConn(pubs={"dsqlmig_pub_s": ["app.orders"]}),
+                           name="dsqlmig_pub_s", tables=["app.customers"])
+
+
 def test_create_publication_rejects_zero_tables() -> None:
     with pytest.raises(PgReplicationError):
         create_publication(_FakeConn(), name="p", tables=[])

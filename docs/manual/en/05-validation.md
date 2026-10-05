@@ -152,7 +152,7 @@ switching your application from the source database (RDS/Aurora MySQL or Postgre
 to DSQL. In Full load only, Cut over also needs the report to cover every table
 selected after the Full Load: such a table that the report has no row for holds Cut over
 until you load it and re-run Validation (or turn its chip off under **Objects to
-validate**). See the recommended end-to-end flow
+validate**). In Full load + CDC, a table unticked after the Full Load (before CDC starts) is not validated: Validation compares the tables still selected. Re-run Validation if your last report predates the change. See the recommended end-to-end flow
 in the [Conclusion](10-conclusion.md) for the cut-over sequence (CDC-drain vs
 Full-Load freeze) and the rollback anchor.
 
