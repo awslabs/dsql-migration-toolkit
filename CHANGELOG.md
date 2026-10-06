@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.565
+
+Full load + CDC can change its table set after a Full Load, until CDC first starts — no Start over and no full reload. Details: [Changing the table set after a Full Load (Full load + CDC)](docs/manual/en/13-excluding-tables-and-columns.md).
+
+### Changed
+
+- **Untick tables after the Full Load.** An unticked table is left as is on Aurora DSQL and is no longer captured, loaded or validated. CDC now captures the Full Load's tables that are still selected (it used to capture every table the Full Load loaded, whatever the selection). A failure only in unticked tables no longer holds the step.
+- **Tick a table the Full Load did not load.** Retry unfinished tables loads it, and CDC captures it from the Full Load's start point, together with the other tables. The load refuses the table, with the reason and the remedy, when CDC could not capture it with no gap:
+  - **PostgreSQL:** the tool adds the table to CDC's publication on the source, then waits for the transactions already open to finish before it copies the table. It refuses the table first if publishing it would make its UPDATE or DELETE fail on the source, that is when it has no usable REPLICA IDENTITY (a re-keyed table must already be REPLICA IDENTITY FULL; the tool never sets it).
+  - **MySQL:** the table's definition must still match the one the Full Load recorded at its start point.
+- Once CDC has started for the migration, even if stopped since, the table set stays fixed as before. Full load only is unchanged.
+- Two misleading lock texts are corrected. The deployed-infrastructure lock said an added table would stream on a single partition. An empty capture in CDC only pointed to a table list that is locked there.
+
+### Upgrade notes
+
+- **MySQL:** adding a table needs a Full Load run on this version, because it now records the start-point definitions of the tables it does not load. After an earlier Full Load, the Retry refuses the table and offers Re-run all tables.
+- **PostgreSQL:** adding a table is a new write to the source, an `ALTER PUBLICATION ... ADD TABLE` on the tool's own publication. The source user must own the table and the publication.
+- The sink plugin is still v51: no CDC infrastructure redeploy is needed.
+
 ## v0.1.564
 
 CDC and source schema changes (DDL), hardened end to end: a change that CDC cannot apply is now detected, explained and held at Cut over instead of passing silently. Details: [CDC replicates data, not schema](docs/manual/en/04-cdc-and-dsql-constraints.md#42-cdc-replicates-data-not-schema--important) and [CDC dead letters and cut over](docs/manual/en/05-validation.md#55-cdc-dead-letters-and-cut-over).

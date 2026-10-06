@@ -5,6 +5,25 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.565
+
+Full load + CDC で Full Load の後、CDC を初めて開始するまでテーブルの集合を変更できるようになりました。Start over も全体の再ロードも不要です。詳細: [Full Load 後のテーブル集合の変更 (Full load + CDC)](docs/manual/ja/13-excluding-tables-and-columns.md)。
+
+### 変更
+
+- **Full Load 後のテーブルの選択解除。** 選択を外したテーブルは Aurora DSQL にそのまま残り、キャプチャ・ロード・検証の対象から外れます。CDC は Full Load のテーブルのうち、まだ選択されているものだけをキャプチャするようになりました (以前は選択に関係なく、Full Load がロードしたすべてのテーブルをキャプチャしていました)。選択を外したテーブルだけの失敗は、もうステップを止めません。
+- **Full Load になかったテーブルの選択。** Retry unfinished tables がそのテーブルをロードし、CDC は Full Load の開始点から他のテーブルと一緒にキャプチャします。CDC が隙間なくキャプチャできない場合、ロードは理由と対処法を示して拒否します。
+  - **PostgreSQL:** ソースの CDC の publication にテーブルを追加し、すでに開いていたトランザクションの終了を待ってからコピーします。publication に入れるとソースでそのテーブルの UPDATE/DELETE が失敗する場合、つまり使える REPLICA IDENTITY がない場合は先に拒否します (再キー化テーブルはすでに REPLICA IDENTITY FULL である必要があり、ツールは設定しません)。
+  - **MySQL:** テーブル定義が、Full Load が開始点で記録した定義と一致している必要があります。
+- CDC を一度でも開始していれば (その後停止していても)、テーブル集合はこれまでどおり固定されます。Full load only は変わりません。
+- 誤解を招く 2 つのロック文言を修正しました。インフラ配備中のロックは、追加したテーブルが 1 パーティションでストリーミングされると述べていました。CDC only の空のキャプチャの案内は、そこではロックされているテーブル一覧を指していました。
+
+### アップグレードの注意
+
+- **MySQL:** テーブルを追加するには、このバージョンで Full Load を実行する必要があります。Full Load がロードしないテーブルの開始点の定義も記録するようになったためです。以前のバージョンの Full Load の後では、Retry がそのテーブルを拒否し、Re-run all tables を案内します。
+- **PostgreSQL:** テーブルの追加はソースへの新しい書き込みです (ツール自身の publication への `ALTER PUBLICATION ... ADD TABLE`)。ソースのユーザーがそのテーブルと publication を所有している必要があります。
+- sink プラグインは v51 のままです。CDC インフラの再デプロイは不要です。
+
 ## v0.1.564
 
 CDC とソースのスキーマ変更 (DDL) の扱いを全体にわたって強化しました。CDC が適用できない変更は、黙って通過せず、検出・説明され、Cut over が保留されるようになりました。詳細: [CDC はスキーマではなくデータを複製する](docs/manual/ja/04-cdc-and-dsql-constraints.md)、[CDC のデッドレターと cut over](docs/manual/ja/05-validation.md)。

@@ -5,6 +5,25 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.565
+
+Full load + CDC에서 Full Load 후, CDC를 처음 시작하기 전까지 테이블 집합을 바꿀 수 있습니다. Start over나 전체 재로드가 필요 없습니다. 자세한 내용: [Full Load 후 테이블 집합 바꾸기 (Full load + CDC)](docs/manual/ko/13-excluding-tables-and-columns.md).
+
+### 변경
+
+- **Full Load 후 테이블 해제.** 해제한 테이블은 Aurora DSQL에 그대로 남고, 더 이상 캡처·로드·검증하지 않습니다. CDC는 이제 Full Load의 테이블 중 아직 선택된 것만 캡처합니다(예전에는 선택과 관계없이 Full Load가 로드한 모든 테이블을 캡처했습니다). 해제한 테이블에서만 난 실패는 더 이상 단계를 막지 않습니다.
+- **Full Load에 없던 테이블 체크.** Retry unfinished tables가 그 테이블을 로드하고, CDC는 Full Load의 시작점부터 다른 테이블과 함께 캡처합니다. CDC가 빈틈없이 캡처할 수 없으면 로드가 사유와 해결 방법을 보여 주며 거부합니다.
+  - **PostgreSQL:** 소스의 CDC publication에 테이블을 추가한 뒤, 이미 열려 있던 트랜잭션이 끝나기를 기다렸다가 복사합니다. publication에 넣으면 소스에서 그 테이블의 UPDATE/DELETE가 실패하는 경우, 즉 쓸 수 있는 REPLICA IDENTITY가 없으면 먼저 거부합니다(재키 테이블은 이미 REPLICA IDENTITY FULL이어야 하며, 도구가 직접 설정하지 않습니다).
+  - **MySQL:** 테이블 정의가 Full Load가 시작점에 기록한 정의와 같아야 합니다.
+- CDC를 한 번이라도 시작했다면(이후 중지했더라도) 테이블 집합은 예전처럼 고정됩니다. Full load only는 그대로입니다.
+- 오해를 부르던 잠금 문구 두 개를 고쳤습니다. 인프라 배포 잠금이 추가한 테이블은 파티션 1개로 스트리밍된다고 했고, CDC only의 빈 캡처 안내가 거기서 잠겨 있는 테이블 목록을 가리켰습니다.
+
+### 업그레이드 참고
+
+- **MySQL:** 테이블을 추가하려면 이 버전에서 Full Load를 돌려야 합니다. 이제 Full Load가 로드하지 않는 테이블의 시작점 정의도 기록하기 때문입니다. 이전 버전의 Full Load 뒤에는 Retry가 그 테이블을 거부하고 Re-run all tables를 안내합니다.
+- **PostgreSQL:** 테이블 추가는 소스에 대한 새로운 쓰기입니다(도구 자신의 publication에 `ALTER PUBLICATION ... ADD TABLE`). 소스 사용자가 그 테이블과 publication을 소유해야 합니다.
+- sink 플러그인은 그대로 v51입니다. CDC 인프라를 다시 배포할 필요가 없습니다.
+
 ## v0.1.564
 
 CDC와 소스 스키마 변경(DDL) 처리를 전 구간에서 보강했습니다. CDC가 적용하지 못하는 변경은 이제 그냥 지나가지 않고, 감지되어 원인과 해결 방법이 표시되며 Cut over가 보류됩니다. 자세한 내용: [CDC는 스키마가 아니라 데이터를 복제합니다](docs/manual/ko/04-cdc-and-dsql-constraints.md), [CDC dead letter와 cut over](docs/manual/ko/05-validation.md).
