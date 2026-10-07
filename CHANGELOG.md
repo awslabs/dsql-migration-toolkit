@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.566
+
+### Fixed
+
+- **CDC on a GTID-enabled MySQL source starts at its start point.** On a source with `gtid_mode=ON`, the CDC template's catch-all GTID exclude made Debezium stream the source's whole retained binary log on every Start and every restart, instead of starting at the Full Load's point. Old changes were applied again, and one unparseable DDL anywhere in that history failed every Start (found live). Debezium now starts after the start point's GTID set. Start CDC refuses, with the remedy, a start point it cannot honour: a start point without a GTID set on `gtid_mode=ON`, a `gtid_mode` changed since the start point, a GTID set that does not cover the purged binary logs, or a malformed Manual set. Sources without GTIDs still position by binlog file:position.
+- **A failed Start CDC names its cause** from the failed connector's log (for example, a DDL statement in the binary log that could not be parsed), instead of only the CloudFormation error.
+- **An Amazon Bedrock model-agreement denial is reported as such.** In a new AWS account, a third-party model's first calls can succeed while its AWS Marketplace subscription is still being set up, and later calls can then be denied. Verify AI access no longer promises more than the call it made. A denial that names AWS Marketplace now says to accept the model's agreement once for the account, and that no IAM change to this tool is needed. Connect shows a denial recorded on another screen.
+- **Prerequisites stay open on their results after a re-run in a restored session** (every migration type). Full load + CDC with a finished Full Load continues straight to CDC.
+- **The Deploy CDC infrastructure dialog no longer asks you to remove foreign keys before you deploy.** The Remove foreign keys action is in the Start CDC dialog, which appears after the deploy.
+
+### Upgrade notes
+
+- No CDC infrastructure redeploy is needed: Start CDC sends the corrected template, and the sink plugin is unchanged (v51).
+- A Manual CDC start point saved by 0.1.565 or earlier loses its GTID set when the session is restored. On a `gtid_mode=ON` source, enter the point again with **Fetch current position**.
+- The Bedrock model-agreement fix is in 0.1.566 and later (workshops pinned to an earlier image can move to it).
+
 ## v0.1.565
 
 Full load + CDC can change its table set after a Full Load, until CDC first starts — no Start over and no full reload. Details: [Changing the table set after a Full Load (Full load + CDC)](docs/manual/en/13-excluding-tables-and-columns.md).

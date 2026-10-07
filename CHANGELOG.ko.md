@@ -5,6 +5,22 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.566
+
+### 수정
+
+- **GTID가 켜진 MySQL 소스의 CDC가 시작점에서 시작합니다.** `gtid_mode=ON` 소스에서, CDC 템플릿의 GTID 전체 제외 설정 때문에 Debezium이 Start와 재시작 때마다 Full Load 시점이 아니라 소스가 보관한 binlog 전체를 처음부터 읽었습니다. 그래서 오래된 변경이 다시 적용됐고, 그 이력 어딘가에 해석할 수 없는 DDL이 하나라도 있으면 모든 Start가 실패했습니다(라이브에서 발견). 이제 Debezium은 시작점의 GTID 집합 다음부터 시작합니다. 지킬 수 없는 시작점은 Start CDC가 해결 방법과 함께 거부합니다: `gtid_mode=ON`인데 GTID 집합이 없는 시작점, 시작점 이후 `gtid_mode`가 바뀐 경우, 정리된(purged) binlog를 덮지 못하는 GTID 집합, 형식이 잘못된 Manual 집합. GTID가 없는 소스는 지금처럼 binlog file:position으로 위치를 잡습니다.
+- **Start CDC가 실패하면 원인을 보여 줍니다.** CloudFormation 오류만 보여 주는 대신, 실패한 커넥터의 로그에서 원인을 찾아 보여 줍니다(예: binlog에 해석할 수 없는 DDL이 있음).
+- **Amazon Bedrock 모델 동의 거부를 그대로 알려 줍니다.** 새 AWS 계정에서는 서드파티 모델의 첫 호출이 AWS Marketplace 구독이 준비되는 동안 성공했다가, 나중에 거부될 수 있습니다. Verify AI access는 이제 실제로 한 호출 이상을 장담하지 않습니다. AWS Marketplace를 언급하는 거부는 계정에서 모델 동의를 한 번 수락하라고 안내하고, 이 도구의 IAM은 바꿀 필요가 없다고 알려 줍니다. 다른 화면에서 기록된 거부도 Connect에 표시됩니다.
+- **복구된 세션에서 Prerequisites를 다시 실행하면 결과가 접히지 않고 그대로 보입니다**(모든 마이그레이션 유형). Full Load가 끝난 Full load + CDC는 바로 CDC로 넘어갑니다.
+- **Deploy CDC infrastructure 다이얼로그가 더 이상 배포 전에 외래 키를 제거하라고 하지 않습니다.** Remove foreign keys는 배포 후에 나오는 Start CDC 다이얼로그에 있습니다.
+
+### 업그레이드 참고
+
+- CDC 인프라를 다시 배포할 필요가 없습니다: Start CDC가 고쳐진 템플릿을 보내고, sink 플러그인은 그대로(v51)입니다.
+- 0.1.565 이하에서 저장한 Manual CDC 시작점은 세션을 복구하면 GTID 집합이 빠집니다. `gtid_mode=ON` 소스라면 **Fetch current position**으로 시작점을 다시 입력하세요.
+- Bedrock 모델 동의 수정은 0.1.566부터 들어 있습니다(이전 이미지에 고정된 워크숍은 이 버전으로 올리면 됩니다).
+
 ## v0.1.565
 
 Full load + CDC에서 Full Load 후, CDC를 처음 시작하기 전까지 테이블 집합을 바꿀 수 있습니다. Start over나 전체 재로드가 필요 없습니다. 자세한 내용: [Full Load 후 테이블 집합 바꾸기 (Full load + CDC)](docs/manual/ko/13-excluding-tables-and-columns.md).
