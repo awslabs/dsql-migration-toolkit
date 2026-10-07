@@ -19902,6 +19902,51 @@ def test_cdc_fk_block_copy_distinguishes_found_from_unreadable() -> None:
     assert "Re-test the target connection" in body
 
 
+def test_the_deploy_dialog_fk_todo_names_the_next_step_not_a_dead_end() -> None:
+    """The Deploy dialog's foreign-key to-do must be doable from where it is shown.
+
+    It said "Reopen Start CDC and use 'Remove foreign keys' ... so clear them before you
+    deploy". The Remove control lives only in the Start CDC dialog, and the Start CDC button
+    exists only once the infrastructure is deployed -- so neither instruction could be
+    followed from the Deploy dialog (and nothing had been opened to be re-opened).
+    """
+    import inspect
+
+    import dsql_migrator.ui.data_migration._cdc_ui as _cdcui
+    from dsql_migrator.core.cdc import CdcBlockingForeignKeys
+
+    ours = CdcBlockingForeignKeys(
+        ours=[("ecommerce.orders", "fk_orders_users")], foreign=[], unknown_tables=[]
+    )
+    body = _cdcui._cdc_fk_deploy_body(ours)
+    assert "ecommerce.orders.fk_orders_users" in body
+    assert (
+        "after this deployment, use 'Remove foreign keys' in the Start CDC dialog" in body
+    )
+    assert "Start CDC will not stream until they are gone" in body
+    assert "cut over re-creates them once the stream has drained" in body
+    assert "Reopen" not in body
+    assert "before you deploy" not in body
+    assert "MSK Serverless" not in body
+
+    # A key the tool did not create is the operator's to drop -- which CAN be done before
+    # the deployment, so only it keeps the billing advice.
+    foreign = CdcBlockingForeignKeys(
+        ours=[], foreign=[("ecommerce.orders", "fk_legacy")], unknown_tables=[]
+    )
+    body = _cdcui._cdc_fk_deploy_body(foreign)
+    assert "Drop them yourself" in body
+    assert "so drop them before you deploy" in body
+    assert "Remove foreign keys" not in body
+
+    # The job error and the activity log (after a refused Start) keep "Reopen Start CDC".
+    assert "Reopen Start CDC" in _cdcui._cdc_fk_block_body(ours, can_remove_here=False)
+    # And the dialog uses the deploy wording.
+    src = inspect.getsource(_cdcui._open_cdc_infra_dialog)
+    assert "_cdc_fk_deploy_body(fk_preview)" in src
+    assert "so clear them before you deploy" not in src
+
+
 def test_fk_ownership_is_independent_of_the_preserve_foreign_keys_toggle() -> None:
     """Ownership must survive unticking "Preserve foreign keys" — else CDC dead-ends.
 

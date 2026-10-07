@@ -4307,12 +4307,7 @@ async def _open_cdc_infra_dialog(
         # explains WHY rather than what to do; the instruction and the consequence stay.
         _todo: list[tuple[str, str]] = []
         if fk_preview is not None:
-            _todo.append((
-                "Foreign keys on the target",
-                _cdc_fk_block_body(fk_preview, can_remove_here=False, why=False)
-                + " Start CDC will not stream until they are gone, and MSK Serverless "
-                "bills from creation — so clear them before you deploy.",
-            ))
+            _todo.append(("Foreign keys on the target", _cdc_fk_deploy_body(fk_preview)))
         if source_inbound_hint:
             _todo.append(("Source database inbound rule", source_inbound_hint))
         if _todo:
@@ -6108,13 +6103,36 @@ def _cdc_fk_block_reason(blocking) -> tuple[str, str]:
     )
 
 
+def _cdc_fk_deploy_body(blocking) -> str:
+    """The Deploy CDC infrastructure dialog's foreign-key to-do. Pure.
+
+    The dialog comes BEFORE the Start CDC dialog, where the only Remove control lives, and
+    the Start CDC button exists only once the infrastructure is deployed. So for this
+    migration's own keys it names that control as the next step. It used to say "Reopen
+    Start CDC ... so clear them before you deploy", which the tool cannot do: there is no
+    Start CDC dialog before the deployment, and the one-click Remove right after it leaves
+    MSK idle for no meaningful time. Keys the tool did not create are the operator's to drop,
+    and that can be done before the deployment, so only they keep the billing advice.
+    """
+    body = _cdc_fk_block_body(blocking, can_remove_here=False, why=False, before_start=True)
+    if blocking.foreign:
+        body += (
+            " Start CDC will not stream while they exist, and MSK Serverless bills from "
+            "creation, so drop them before you deploy."
+        )
+    return body
+
+
 def _cdc_fk_block_body(
-    blocking, *, can_remove_here: bool = True, why: bool = True
+    blocking, *, can_remove_here: bool = True, why: bool = True, before_start: bool = False
 ) -> str:
     """Compose the CDC-start FK precondition message. Pure.
 
     ``can_remove_here`` is False for the consumers that render no Remove control (the job
     error and the activity log), so the copy does not point at a button that is not there.
+    ``before_start`` (with ``can_remove_here=False``) is the Deploy dialog, which comes
+    BEFORE the Start CDC dialog that holds the control: it names that control as the next
+    step instead of "Reopen Start CDC" (see :func:`_cdc_fk_deploy_body`).
 
     ``why=False`` drops the closing mechanism paragraph (out-of-order child rows,
     SQLSTATE 23503, silent dead-lettering). It is the right explanation at the point CDC is
@@ -6124,11 +6142,15 @@ def _cdc_fk_block_body(
     """
     parts: list[str] = []
     if blocking.ours:
-        removal = (
-            "Remove them below"
-            if can_remove_here
-            else "Reopen Start CDC and use 'Remove foreign keys'"
-        )
+        if can_remove_here:
+            removal = "Remove them below"
+        elif before_start:
+            removal = (
+                "Start CDC will not stream until they are gone: after this deployment, use "
+                "'Remove foreign keys' in the Start CDC dialog (it drops exactly these)"
+            )
+        else:
+            removal = "Reopen Start CDC and use 'Remove foreign keys'"
         parts.append(
             "These foreign keys are enforced on the target and were created by this "
             "migration: "
