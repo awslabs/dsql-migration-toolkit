@@ -30610,6 +30610,8 @@ def _render_prereq_screen(
         migration_store=migrations, conv_store=convs,
     )
     content(lambda: None)
+    captured["content"] = content
+    captured["session"] = session
     return ui, captured, built, migrations.get_or_create("s1")
 
 
@@ -30697,6 +30699,125 @@ def test_a_failing_earlier_report_keeps_its_guard_while_unverified(monkeypatch) 
     )])
     ui, *_ = _render_prereq_screen(monkeypatch, verified=False, report=report)
     assert "Resolve the failed prerequisite(s)" in " ".join(ui.texts)
+
+
+def _prereq_expansions(monkeypatch, captured) -> list:
+    """Re-render the screen, recording every Prerequisites expansion decision."""
+    from dsql_migrator.ui import data_migration as dm
+
+    seen: list = []
+    real = dm.prerequisites_section_expanded
+
+    def _spy(**kwargs):
+        result = real(**kwargs)
+        seen.append(result)
+        return result
+
+    monkeypatch.setattr(dm, "prerequisites_section_expanded", _spy)
+    captured["content"](lambda: None)
+    return seen
+
+
+@pytest.mark.parametrize(
+    "migration_type, persisted, pin_cdc",
+    [
+        ("FULL_LOAD_ONLY", "full_load", False),
+        ("FULL_LOAD_AND_CDC", "cdc", False),
+        ("CDC_ONLY", "cdc", False),
+        # CDC only with its infrastructure ready re-pins CDC on every render.
+        ("CDC_ONLY", "cdc", True),
+    ],
+)
+def test_a_restored_session_keeps_prerequisites_open_after_its_checks(
+    monkeypatch, migration_type, persisted, pin_cdc
+) -> None:
+    """User report (2026-10-07): re-running the checks in a restored session collapsed
+    Prerequisites the moment they passed and showed the persisted later step, so the
+    results could not be read. Every migration type had it (the persisted sub-step is a
+    later one in each); CDC only with its infrastructure ready also re-pins CDC."""
+    import asyncio
+
+    from dsql_migrator.ui.data_migration import MigrationType, prereq_mode_for_type
+
+    mtype = MigrationType[migration_type]
+    ui, captured, built, state = _render_prereq_screen(
+        monkeypatch, verified=True, migration_type=mtype
+    )
+    state.set_active_substep(persisted)  # what the restore brought back
+    if pin_cdc:
+        state.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
+    mode = prereq_mode_for_type(mtype)
+    # Before: a passing report and the persisted later step keep it closed.
+    asyncio.run(captured["run_checks"](mode))
+    assert len(built) == 1
+    assert state.get_prereq_report(mode) is not None
+    assert state.prereq_review_open
+    seen = _prereq_expansions(monkeypatch, captured)
+    assert seen and seen[-1] is True, "Prerequisites must stay open on its results"
+    if not pin_cdc:
+        assert state.active_substep == "prerequisites"
+
+
+def test_moving_on_closes_the_prerequisite_review(monkeypatch) -> None:
+    import asyncio
+
+    from dsql_migrator.ui.data_migration import MigrationType
+
+    ui, captured, built, state = _render_prereq_screen(
+        monkeypatch, verified=True, migration_type=MigrationType.FULL_LOAD_ONLY
+    )
+    asyncio.run(captured["run_checks"](MigrationMode.FULL_LOAD))
+    assert state.prereq_review_open
+    ui.buttons.clear() if hasattr(ui.buttons, "clear") else None
+    captured["content"](lambda: None)
+    cont = [b for b in ui.buttons if getattr(b, "text", None) == "Continue to Full Load"]
+    assert cont, "the passing run offers the step's own Continue"
+    cont[-1].on_click()
+    assert not state.prereq_review_open
+    assert state.active_substep == "full_load"
+    # A migration-type change ends the review too (its sub-steps differ).
+    state.open_prereq_review()
+    state.set_migration_type(MigrationType.FULL_LOAD_AND_CDC)
+    assert not state.prereq_review_open
+
+
+def test_prerequisites_section_expanded_keeps_a_review_open() -> None:
+    from dsql_migrator.ui.data_migration import prerequisites_section_expanded
+
+    assert prerequisites_section_expanded(
+        active_substep="cdc", running=False, done=True, reviewing=True
+    )
+    assert not prerequisites_section_expanded(
+        active_substep="cdc", running=False, done=True, reviewing=False
+    )
+
+
+def test_continue_from_prerequisites_goes_to_cdc_once_the_full_load_is_done(
+    monkeypatch,
+) -> None:
+    """Full load + CDC re-running its checks after the Full Load: the next step is CDC,
+    not the finished load ("Continue to Full Load (then CDC)" sent it back there)."""
+    import asyncio
+
+    from dsql_migrator.core.models import StepStatus as WStatus
+    from dsql_migrator.ui.data_migration import MigrationType
+    from dsql_migrator.ui.workflow import WorkflowStep, with_status
+
+    ui, captured, built, state = _render_prereq_screen(
+        monkeypatch, verified=True, migration_type=MigrationType.FULL_LOAD_AND_CDC
+    )
+    session = captured["session"]
+    session.workflow = with_status(session.workflow, WorkflowStep.FULL_LOAD, WStatus.DONE)
+    state.job_id = "job-done"
+    asyncio.run(captured["run_checks"](MigrationMode.CDC))
+    captured["content"](lambda: None)
+    labels = [getattr(b, "text", None) for b in ui.buttons]
+    assert "Continue to Full Load (then CDC)" not in labels[-12:]
+    cont = [b for b in ui.buttons if getattr(b, "text", None) == "Continue to CDC"]
+    assert cont, labels[-12:]
+    cont[-1].on_click()
+    assert state.active_substep == "cdc"
+    assert not state.prereq_review_open
 
 
 def test_run_checks_refuses_before_building_anything_or_awaiting() -> None:

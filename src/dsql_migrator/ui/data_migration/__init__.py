@@ -1259,6 +1259,15 @@ def build_data_migration_screen(
             # right below the button before the (slow) read-only checks start.
             migration_state.clear_outputs()
             migration_state.set_prereq_running(mode)
+            # The operator is working on Prerequisites, so make it the active sub-step: its
+            # results must stay open when the run ends. A restored session keeps its
+            # persisted later sub-step (Full load only lands on Full Load, Full load + CDC
+            # and CDC only on CDC), and Prerequisites stayed open only while the checks ran
+            # or still blocked (prerequisites_section_expanded) -- so a PASSING run
+            # collapsed it the moment it finished and showed that later step, before a WARN
+            # could be read. The panel's own Continue button moves on (the route choice's
+            # "Start over" sets Full Load itself after a passing re-run).
+            migration_state.set_active_substep("prerequisites")
             refresh()
             try:
                 # Feed the migration-wide exclusion into the gate so a column excluded
@@ -1314,6 +1323,7 @@ def build_data_migration_screen(
                 )
             except Exception as exc:  # noqa: BLE001 - surface as inline feedback
                 migration_state.clear_prereq_running(mode)
+                migration_state.open_prereq_review()
                 migration_state.set_error(
                     f"Prerequisite checks could not complete: {exc}"
                 )
@@ -1321,6 +1331,11 @@ def build_data_migration_screen(
                 return
             migration_state.clear_prereq_running(mode)
             migration_state.set_prereq_report(mode, report)
+            # Keep the results open until the operator moves on -- also where a later
+            # sub-step is pinned active (CDC only with its infrastructure ready, or an
+            # infrastructure create / delete in flight), which the active sub-step set at
+            # the click cannot hold against.
+            migration_state.open_prereq_review()
             # Pin the exact table set the checks covered. The picker locks the moment
             # a report exists (``selection_locked`` below), so from here on this set
             # IS the migration scope -- but until now it was only implied by the
@@ -1877,10 +1892,12 @@ def build_data_migration_screen(
             cdc_started = cdc_streaming_started(migration_state, job_manager)
 
             def go(substep: str) -> None:
+                migration_state.close_prereq_review()
                 migration_state.set_active_substep(substep)
                 refresh()
 
             def start_full_load() -> None:
+                migration_state.close_prereq_review()
                 migration_state.set_active_substep("full_load")
                 runner()
                 refresh()
@@ -2541,7 +2558,12 @@ def build_data_migration_screen(
             # flow starts here (CDC opens automatically once the snapshot finishes),
             # not just a stand-alone Full Load.
             first_phase = "full_load" if has_full_load else "cdc"
-            if has_full_load and has_cdc:
+            if has_full_load and has_cdc and full_load_done:
+                # The Full Load is already done (a restored session re-running its checks
+                # before CDC): the next step is CDC itself, not the finished load.
+                first_phase = "cdc"
+                first_phase_label = "Continue to CDC"
+            elif has_full_load and has_cdc:
                 first_phase_label = "Continue to Full Load (then CDC)"
             elif has_full_load:
                 first_phase_label = "Continue to Full Load"
@@ -2657,7 +2679,8 @@ def build_data_migration_screen(
                 # open when it is the active sub-step. Returns nothing; the body is
                 # built by ``render_body`` inside the expansion.
                 def _substep(
-                    name, title, *, state, render_body, first=False, expanded=None
+                    name, title, *, state, render_body, first=False, expanded=None,
+                    on_collapse=None,
                 ):
                     icon, color = {
                         "done": ("check_circle", "positive"),
@@ -2680,6 +2703,13 @@ def build_data_migration_screen(
                     exp = ui.expansion(value=open_now).classes(
                         "w-full border border-gray-200 rounded-md"
                     )
+                    if on_collapse is not None:
+                        # The header toggles the section in the browser; tell the state
+                        # when the operator closes it, so a later re-render (a progress
+                        # poll) does not open it again.
+                        exp.on_value_change(
+                            lambda e: None if getattr(e, "value", True) else on_collapse()
+                        )
                     with exp.add_slot("header"):
                         with ui.row().classes("items-center gap-2 no-wrap w-full"):
                             ui.icon(icon, color=color).classes("text-lg")
@@ -2837,6 +2867,7 @@ def build_data_migration_screen(
                     active_substep=active,
                     running=migration_state.is_prereq_running(prereq_mode),
                     done=prereq_done,
+                    reviewing=bool(getattr(migration_state, "prereq_review_open", False)),
                 )
                 _substep(
                     "prerequisites",
@@ -2849,6 +2880,7 @@ def build_data_migration_screen(
                     render_body=_prereq_body,
                     first=True,
                     expanded=prereq_expanded,
+                    on_collapse=migration_state.close_prereq_review,
                 )
 
                 # --- Full Load -------------------------------------------------
@@ -3232,7 +3264,7 @@ def full_load_error_migration_context(
 
 
 def prerequisites_section_expanded(
-    *, active_substep: Optional[str], running: bool, done: bool
+    *, active_substep: Optional[str], running: bool, done: bool, reviewing: bool = False
 ) -> bool:
     """Whether the Prerequisites sub-step section should render expanded.
 
@@ -3242,9 +3274,13 @@ def prerequisites_section_expanded(
     blocks). This is what keeps it expanded through the "Check" button's
     re-render in a reconnected session, whose persisted ``active_substep`` may be
     a later step (e.g. ``"full_load"``): without it, clicking Check would collapse
-    the section and hide the running spinner / results. NiceGUI-agnostic for tests.
+    the section and hide the running spinner / results. ``reviewing`` keeps it open on
+    the results of a run that just ended until the operator moves on: a PASSING run is
+    ``done`` and no longer ``running``, so without it the section collapsed the moment the
+    run finished wherever a later sub-step is active (a restored session, or a pinned
+    CDC step). NiceGUI-agnostic for tests.
     """
-    return active_substep == "prerequisites" or running or not done
+    return active_substep == "prerequisites" or running or not done or reviewing
 
 
 def resolve_migration_selection(
@@ -5548,6 +5584,7 @@ def _render_gapless_choice(
         # panel they were moved off.
         _report = migration_state.get_prereq_report(_mode)
         if _report is not None and getattr(_report, "can_proceed", False):
+            migration_state.close_prereq_review()
             migration_state.set_active_substep("full_load")
             if refresh is not None:
                 refresh()

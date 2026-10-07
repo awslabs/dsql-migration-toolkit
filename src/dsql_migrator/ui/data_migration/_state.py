@@ -94,6 +94,12 @@ class DataMigrationState:
         # here so it survives the content re-render driven by the progress poller
         # (None => derive a sensible default from the current job/prereq state).
         self.active_substep: Optional[str] = None
+        # Transient, never persisted: the operator ran the prerequisite checks and has not
+        # moved on yet, so Prerequisites stays open on their results even when a later
+        # sub-step is pinned active (prerequisites_section_expanded). Set when a run ends;
+        # cleared by the step's own navigation (Continue / Start Full Load), by collapsing
+        # the section, and by a migration-type change.
+        self.prereq_review_open: bool = False
         # Last sub-step the screen actually rendered as "active". Used only to
         # detect a real sub-step transition (e.g. Full Load finishing -> CDC
         # opens) so the screen can bring the stepper back into view exactly once
@@ -2296,6 +2302,16 @@ class DataMigrationState:
     def set_migration_type(self, migration_type: "MigrationType") -> None:
         """Record the user's Data Migration type selection (UI thread)."""
         self.migration_type = migration_type  # routes through the property setter
+        # Its sub-steps differ, so a review of the previous type's checks is over.
+        self.prereq_review_open = False
+
+    def open_prereq_review(self) -> None:
+        """A prerequisite run just ended: keep its results open (UI thread)."""
+        self.prereq_review_open = True
+
+    def close_prereq_review(self) -> None:
+        """The operator moved on from the prerequisite results (UI thread)."""
+        self.prereq_review_open = False
 
     def set_prereq_report(
         self, mode: MigrationMode, report: PrerequisiteReport
