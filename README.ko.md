@@ -345,8 +345,12 @@ Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입
 | `BEDROCK_MODEL_ID` | `global.anthropic.claude-sonnet-5` | AI 보조용 Bedrock 모델 / 추론 프로파일 id. 항상 `global.*` 프로파일 — 모든 상용 리전에서 호출 가능하며, `us.*`는 us-east-1/us-east-2/us-west-2에서만 해석됩니다. |
 | `BEDROCK_REGION` | _(미설정)_ | Amazon Bedrock 호출용 리전. |
 
-AI 보조는 기본 off이며 UI에서 켭니다. UI는 Bedrock 도달 가능 여부를 확인하고 조치 가능한 실패
-이유를 보고하는 **Verify AI access** 사전 점검도 제공합니다. 튜닝 노브의 배경은 매뉴얼
+AI 보조는 기본 off이며 UI에서 켭니다. UI는 설정된 모델에 최소한의 호출을 보내고(Bedrock이 그 모델을
+사용할 수 없다고 하거나 모델 약관 외의 이유로 거부하면 대체(fallback) 모델도 시도하며, 대체 모델이
+응답하면 Connect가 경고와 함께 그 모델을 선택합니다) 조치 가능한 실패 이유를 보고하는 **Verify AI
+access** 사전 점검도 제공합니다. 각 모델은 AWS 계정에서 한 번
+활성화되어 있어야 합니다 — AWS Marketplace 권한이 있는 사람이 모델 약관(agreement)을 수락합니다(매뉴얼
+[2장](docs/manual/ko/02-evaluation-and-schema-conversion.md)). 튜닝 노브의 배경은 매뉴얼
 [성능과 튜닝](docs/manual/ko/07-performance-and-tuning.md).
 
 > **참고** — CDC 스케일링은 여기서 설정하지 않고 추론됩니다. 커넥터 노브(테이블별 토픽 파티션 수, 싱크

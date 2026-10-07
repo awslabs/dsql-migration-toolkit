@@ -836,18 +836,24 @@ def build_query_playground_screen(
                         ai_post_event(text="Target test skipped", status="info")
                 render_results.refresh()
 
-            def _query_streamer(strategist, system):
+            def _query_streamer(strategist_now, system):
                 # One streamer for both query chats. With the shared read-only tools,
                 # the chat can check the statement against the real converted/target
                 # schema (does this table/column exist on the target yet?); without
                 # them it stays a plain grounded chat.
+                #
+                # ``strategist_now`` is a FACTORY called on every send, not a strategist:
+                # the app-wide panel keeps this streamer while the scope stays open, so a
+                # strategist built when the chat opened would keep answering -- and
+                # latching denials -- with the Bedrock model / region / AWS profile of
+                # that moment after the operator switched to a verified one.
                 def _stream(messages, on_delta):
                     if ai_tools is not None and ai_tool_execute is not None:
-                        return strategist.tool_chat(
+                        return strategist_now().tool_chat(
                             system, messages, on_delta,
                             tools=ai_tools, execute=ai_tool_execute,
                         )
-                    return strategist.stream_chat(system, messages, on_delta)
+                    return strategist_now().stream_chat(system, messages, on_delta)
 
                 return _stream
 
@@ -884,11 +890,15 @@ def build_query_playground_screen(
                     ],
                     source_engine=engine,
                 )
-                strategist = AssessmentStrategist(
-                    session.ai_assist,
-                    aws_profile=getattr(session, "aws_profile", None),
-                    source_engine=engine,
-                )
+
+                def strategist_now() -> AssessmentStrategist:
+                    # Per SEND (see _query_streamer).
+                    return AssessmentStrategist(
+                        session.ai_assist,
+                        aws_profile=getattr(session, "aws_profile", None),
+                        source_engine=engine,
+                    )
+
                 first_question = (
                     "This converted query was rejected by Aurora DSQL. Why, and how "
                     "do I fix it so it runs?"
@@ -902,7 +912,7 @@ def build_query_playground_screen(
                     subtitle="Query Converter",
                     chip="Query Converter",
                     seed_question=first_question,
-                    streamer=_query_streamer(strategist, system),
+                    streamer=_query_streamer(strategist_now, system),
                 )
 
             def on_optimize_ai() -> None:
@@ -938,11 +948,15 @@ def build_query_playground_screen(
                     analyzed=probe.analyzed if probe is not None else False,
                     source_engine=engine,
                 )
-                strategist = AssessmentStrategist(
-                    session.ai_assist,
-                    aws_profile=getattr(session, "aws_profile", None),
-                    source_engine=engine,
-                )
+
+                def strategist_now() -> AssessmentStrategist:
+                    # Per SEND (see _query_streamer).
+                    return AssessmentStrategist(
+                        session.ai_assist,
+                        aws_profile=getattr(session, "aws_profile", None),
+                        source_engine=engine,
+                    )
+
                 # send_turn (returned by open_chat) lets us drive a follow-up turn
                 # so the re-test result is delivered BY THE AI, not as a raw panel.
                 sender: dict[str, object] = {"send": None}
@@ -1007,7 +1021,7 @@ def build_query_playground_screen(
                     "is cheaper on DSQL (scan type / filter layer / fewer bytes "
                     "and DPU) — and keep the results identical."
                 )
-                tuning_streamer = _query_streamer(strategist, system)
+                tuning_streamer = _query_streamer(strategist_now, system)
                 # Only offer the re-test when the reply actually contains a runnable
                 # rewritten query — a reply that just concludes "already efficient"
                 # (no ```sql SELECT) gets no button.

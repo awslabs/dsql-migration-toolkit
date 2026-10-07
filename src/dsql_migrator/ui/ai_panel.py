@@ -42,7 +42,12 @@ from typing import Callable, Optional
 
 from dsql_migrator.core.assessment_strategist import ObjectGuidanceOutcome
 from dsql_migrator.core.models import AiScope, MigrationContext
-from dsql_migrator.ui.ai_assist import AI_UNAVAILABLE, ai_availability, ai_unavailable_hint
+from dsql_migrator.ui.ai_assist import (
+    AI_LATCHING_REASONS,
+    AI_UNAVAILABLE,
+    ai_availability,
+    ai_unavailable_hint,
+)
 from dsql_migrator.ui.ai_chat_drawer import (
     MAX_CHAT_INPUT_CHARS,
     ChatStreamer,
@@ -172,9 +177,11 @@ def build_ai_panel(
     source of truth (so the transcript + open/closed state survive close/reopen,
     navigation, and refresh) and gates itself on ``state.ai_assist.enabled``. The panel
     deliberately opens on the PREFERENCE alone (not on ``ai_is_usable``) so a user whose
-    Bedrock access is denied can still open it and READ why; a real ACCESS_DENIED reply
-    is recorded via ``state.set_ai_verified(False, ...)`` so the journey header and the
-    per-step affordances stop claiming AI works.
+    Bedrock access is denied can still open it and READ why; an authorization-failure
+    reply (``AI_LATCHING_REASONS``: ACCESS_DENIED, or MODEL_AGREEMENT_REQUIRED when the
+    model's AWS Marketplace agreement is missing) is recorded via
+    ``state.set_ai_verified(False, ...)`` so the journey header and the per-step
+    affordances stop claiming AI works.
     ``get_context`` (optional) returns the current :class:`MigrationContext` for the
     baseline context chip shown when no object scope is active.
     """
@@ -518,7 +525,8 @@ def build_ai_panel(
                 # AI is ON but Bedrock refused: say WHY and what to do. Telling this user
                 # to "enable AI Assist" (it is already on) or leaving the hint blank sent
                 # them to a dead end. The composer stays usable on purpose -- retrying
-                # after re-authenticating is how the denial gets cleared.
+                # after the fix (re-authenticating, granting the permission, or accepting
+                # the model's agreement) is how the denial gets cleared.
                 composer_hint.set_text(  # type: ignore[attr-defined]
                     ai_unavailable_hint(state)
                 )
@@ -1122,10 +1130,13 @@ def build_ai_panel(
                 # This is the ONE moment the app learns AI is actually dead. Record an
                 # AUTHORIZATION failure on the session so the journey-header chip and
                 # every per-step AI affordance stop asserting "AI assist: On" (they read
-                # ai_availability(), not the persisted preference). Only ACCESS_DENIED
-                # latches: a throttle or network blip is transient and must not disable
-                # AI for the rest of the session.
-                if getattr(outcome, "reason", None) == "ACCESS_DENIED":
+                # ai_availability(), not the persisted preference). Only the
+                # authorization failures in AI_LATCHING_REASONS latch (ACCESS_DENIED, and
+                # MODEL_AGREEMENT_REQUIRED -- the model's AWS Marketplace agreement is
+                # missing, so every call fails the same way until it is accepted): a
+                # throttle or network blip is transient and must not disable AI for the
+                # rest of the session.
+                if getattr(outcome, "reason", None) in AI_LATCHING_REASONS:
                     setter = getattr(state, "set_ai_verified", None)
                     if callable(setter):
                         setter(False, outcome.detail)
@@ -1142,9 +1153,10 @@ def build_ai_panel(
                     msgs.pop()
             elif isinstance(outcome, ObjectGuidanceOutcome) and outcome.available:
                 # Live evidence the other way: a reply just SUCCEEDED, so clear any stale
-                # ACCESS_DENIED latch (the grant was added, or expired credentials were
-                # renewed -- note the denied bucket also covers ExpiredToken, which is
-                # recoverable). Without this the "unavailable" state would be absorbing.
+                # latch (the grant was added, expired credentials were renewed -- note the
+                # denied bucket also covers ExpiredToken, which is recoverable -- or the
+                # model's agreement was accepted). Without this the "unavailable" state
+                # would be absorbing.
                 # Only CLEAR to unverified; green stays something a preflight earns.
                 if getattr(state, "ai_verified", None) is False:
                     setter = getattr(state, "set_ai_verified", None)
@@ -1309,6 +1321,12 @@ def build_ai_panel(
         ``seed_question`` is given -- that question is asked automatically. Re-opening
         the SAME scope just re-focuses the panel without re-asking. Returns a
         ``send(text)`` callable to drive a follow-up programmatically.
+
+        The panel keeps ``streamer`` for as long as the scope stays open (across
+        navigation and the header toggle), so a screen's streamer must resolve the
+        session's Bedrock config / AWS profile per SEND, never when the scope opens --
+        or a follow-up after a model / profile switch answers (and latches a denial)
+        with the old settings.
         """
         conv["streamer"] = streamer
         conv["footer_label"] = footer_label

@@ -618,8 +618,8 @@ _DSQL_SVG = (
 
 # The AI chip per availability state (see ai_availability). Green is an affirmative
 # health claim, so only a passed preflight earns it; a denied session is amber, matching
-# _connection_badge's "reconnect" semantic (recoverable by re-authenticating, not a
-# blocking error).
+# _connection_badge's "reconnect" semantic (recoverable -- by re-authenticating, granting
+# the permission, or accepting the model's agreement -- not a blocking error).
 _AI_CHIP: dict[str, tuple[str, str]] = {
     AI_OFF: ("AI assist: Off", "neutral"),
     AI_UNVERIFIED: ("AI assist: On (unverified)", "neutral"),

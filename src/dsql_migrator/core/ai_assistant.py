@@ -307,12 +307,34 @@ def validate_suggested_sql(text: str) -> SqlValidation:
 # available; the others mean the deterministic result and its MANUAL/UNSUPPORTED
 # flag must be kept while the workflow continues (Requirement 11.10).
 UnavailableReason = Literal[
-    "ACCESS_DENIED", "THROTTLED", "NETWORK", "UNAVAILABLE", "INVALID_OUTPUT"
+    "ACCESS_DENIED",
+    "MODEL_AGREEMENT_REQUIRED",
+    "THROTTLED",
+    "NETWORK",
+    "UNAVAILABLE",
+    "INVALID_OUTPUT",
 ]
+
+# The one-time remedy for MODEL_AGREEMENT_REQUIRED, shared by the chat/suggestion copy
+# and the preflight copy so the two cannot drift. Fixed text only (Property 7): the
+# denial's own message is never echoed. ``--model-id`` takes the FOUNDATION-model id,
+# not the ``global.`` inference-profile id this tool is configured with, hence the
+# placeholder rather than an interpolated id; an agreement is per account, so no region
+# is claimed. The caller appends how to retry.
+_MODEL_AGREEMENT_REMEDY = (
+    "Someone with AWS Marketplace permissions must accept the model's agreement once "
+    "for the account: in the Amazon Bedrock console, or with aws bedrock "
+    "list-foundation-model-agreement-offers --model-id <foundation-model-id> and then "
+    "aws bedrock create-foundation-model-agreement --model-id <foundation-model-id> "
+    "--offer-token <offer-token> (<foundation-model-id> is the configured model id "
+    "without its global. prefix). Anthropic models may also need the one-time "
+    "first-time use form, and the account needs a valid payment method. No IAM change "
+    "to this tool's role is needed. Wait about 2 minutes, then "
+)
 
 # Fixed, credential-free, actionable messages. They never echo the raw boto/
 # Bedrock exception text so no credential or endpoint detail can leak (Property
-# 7), and each one states that the deterministic result/flag is retained.
+# 7), and each one states that the deterministic path is kept.
 _UNAVAILABLE_DETAILS: dict[str, str] = {
     "ACCESS_DENIED": (
         "AI assist is unavailable: access to Amazon Bedrock InvokeModel was "
@@ -320,6 +342,19 @@ _UNAVAILABLE_DETAILS: dict[str, str] = {
         "flag are kept. Grant a scoped bedrock:InvokeModel permission to enable "
         "AI suggestions -- or, if your AWS credentials or session have expired, "
         "re-authenticate and retry."
+    ),
+    # Also shown outside the suggestion path (the AI panel bubble, the composer hint,
+    # the Connect AI status notice after a panel latch), so it names no MANUAL/UNSUPPORTED
+    # flag -- only that the deterministic workflow is unaffected. "the configured model
+    # is not enabled for this AWS account yet" is word for word the preflight copy's
+    # phrase and the one the docs quote, so the panel's sentence can be matched to the
+    # manual and the troubleshooting table.
+    "MODEL_AGREEMENT_REQUIRED": (
+        "AI assist is unavailable: the configured model is not enabled for this AWS "
+        "account yet (its AWS Marketplace subscription is missing or did not "
+        "complete). The deterministic workflow is unaffected. "
+        + _MODEL_AGREEMENT_REMEDY
+        + "retry, or run Verify AI access on the Connect screen."
     ),
     "THROTTLED": (
         "AI assist is temporarily unavailable: Amazon Bedrock throttled the "
@@ -381,7 +416,15 @@ class AiSuggestionOutcome:
     """
 
     available: bool
-    reason: Literal["OK", "ACCESS_DENIED", "THROTTLED", "NETWORK", "UNAVAILABLE", "INVALID_OUTPUT"]
+    reason: Literal[
+        "OK",
+        "ACCESS_DENIED",
+        "MODEL_AGREEMENT_REQUIRED",
+        "THROTTLED",
+        "NETWORK",
+        "UNAVAILABLE",
+        "INVALID_OUTPUT",
+    ]
     detail: str
     suggestion: Optional[AiConversionSuggestion] = None
 
@@ -400,6 +443,9 @@ class AiSuggestionOutcome:
 # have expired or are otherwise invalid. Both map to ACCESS_DENIED -- the
 # actionable message covers granting the permission AND re-authenticating -- so
 # an expired-token error no longer degrades to a vague generic "unavailable".
+# The one exception is a denial in _MODEL_ACCESS_DENIED_CODES whose message carries
+# the fixed AWS Marketplace marker (see _has_model_agreement_marker): that is
+# MODEL_AGREEMENT_REQUIRED, which needs a different remedy.
 _ACCESS_DENIED_CODES = frozenset(
     {
         "AccessDeniedException",
@@ -417,21 +463,85 @@ _ACCESS_DENIED_CODES = frozenset(
     }
 )
 
+# The authorization-AMBIGUOUS subset of _ACCESS_DENIED_CODES: a denial that may be about
+# this model rather than about the caller's identity. Both classifiers apply the
+# model-agreement marker test to these codes only, and the preflight's fallback chain is
+# reachable from them. Bedrock reports "this model is not available for this account" as
+# AccessDeniedException -- NOT ValidationException -- so keying the fallback on
+# _MODEL_NOT_ENABLED_CODES alone made it unreachable in exactly the case it was written
+# for (measured: a global. inference profile denied for the account while a different
+# model answered on the same credentials).
+#
+# The credential-identity codes in _ACCESS_DENIED_CODES (ExpiredToken*, RequestExpired,
+# InvalidSignature*, SignatureDoesNotMatch, InvalidClientTokenId, InvalidAccessKeyId,
+# UnrecognizedClientException, AuthFailure) are deliberately NOT here: another modelId
+# provably cannot fix a bad or expired credential, so probing one would only add a round
+# trip and delay the real cause, and they keep their code-only ACCESS_DENIED whatever
+# their message says. The split is by error code; the only thing ever read from a
+# message is the one fixed-marker presence test, whose text is never returned, stored,
+# logged, shown or sent (Requirement 11.15 / Property 7).
+_MODEL_ACCESS_DENIED_CODES = frozenset(
+    {
+        "AccessDeniedException",
+        "AccessDenied",
+        "UnauthorizedException",
+    }
+)
+
+
+def _client_error_field(exc: BaseException, key: str) -> object:
+    """Return ``exc.response['Error'][key]`` from a botocore ``ClientError``, else ``None``.
+
+    Total on purpose: both classifiers run inside ``except`` blocks, where any exception
+    raised here would chain the ORIGINAL error -- and its message -- into a log.
+    """
+    try:
+        response = getattr(exc, "response", None)
+        if isinstance(response, Mapping):
+            error = response.get("Error")
+            if isinstance(error, Mapping):
+                return error.get(key)
+    except Exception:  # noqa: BLE001 - classification must never raise
+        pass
+    return None
+
 
 def _error_code(exc: BaseException) -> str:
     """Return a botocore ``ClientError``'s ``response['Error']['Code']``, or ``""``.
 
-    The ONLY thing read off an exception anywhere in this module's classification: never
-    the message, endpoint or any credential (Requirement 11.15 / Property 7). Shared by
-    both classifiers and by the preflight's fallback decision so there is one definition
-    of "which code was this".
+    Together with :func:`_has_model_agreement_marker` (one fixed-marker presence test on
+    the structured message), this is all that is read off an exception anywhere in this
+    module's classification: never ``str(exc)``, the endpoint or any credential, and no
+    message text is ever returned, stored, logged, shown or sent (Requirement 11.15 /
+    Property 7). Shared by both classifiers and by the preflight's fallback decision so
+    there is one definition of "which code was this". Never raises.
     """
-    response = getattr(exc, "response", None)
-    if isinstance(response, Mapping):
-        error = response.get("Error")
-        if isinstance(error, Mapping):
-            return str(error.get("Code") or "")
-    return ""
+    return str(_client_error_field(exc, "Code") or "")
+
+
+# The ONE fixed marker a classifier may look for in a denial's message. Bedrock denies a
+# third-party model whose AWS Marketplace subscription is missing or failed with the SAME
+# code as a missing IAM grant (AccessDeniedException); only the message tells them apart
+# ("... not authorized to perform the required AWS Marketplace actions ..."). It is
+# "aws marketplace" WITH its space: no ARN, role/session name, model id or resource id can
+# contain a space, so a plain IAM denial naming e.g. a role "MarketplaceOps" never matches.
+_MODEL_AGREEMENT_MARKER = "aws marketplace"
+
+
+def _has_model_agreement_marker(exc: BaseException) -> bool:
+    """Return whether a denial's ``response['Error']['Message']`` names AWS Marketplace.
+
+    PRESENCE TEST ONLY (Requirement 11.15 / Property 7): the message is
+    whitespace-collapsed and case-folded in a local, tested for the fixed
+    :data:`_MODEL_AGREEMENT_MARKER`, and dropped. It is never returned, stored, logged,
+    formatted or sent anywhere -- the caller gets a bool and maps it to a fixed reason
+    with fixed copy. Total: every failure (no response, non-Mapping shapes, a missing or
+    non-str message, an accessor that raises) reads as ``False``.
+    """
+    message = _client_error_field(exc, "Message")
+    if not isinstance(message, str):
+        return False
+    return _MODEL_AGREEMENT_MARKER in " ".join(message.split()).casefold()
 
 
 def _classify_bedrock_error(exc: BaseException) -> UnavailableReason:
@@ -440,12 +550,20 @@ def _classify_bedrock_error(exc: BaseException) -> UnavailableReason:
     Classifies by the structured error code (``response['Error']['Code']`` on a
     botocore ``ClientError``) and by exception class name for connectivity
     errors, without importing botocore. Anything unrecognized degrades to
-    ``UNAVAILABLE`` so a failure never escapes as a raw exception. The raw
-    exception text is intentionally not used, so no credential/endpoint detail
-    can leak (Property 7).
+    ``UNAVAILABLE`` so a failure never escapes as a raw exception. The one read of
+    the structured message is the fixed-marker presence test that tells a model
+    agreement / AWS Marketplace denial (``MODEL_AGREEMENT_REQUIRED``) from a missing
+    IAM grant; the message text itself is never returned, stored, logged or shown,
+    and ``str(exc)`` is never used, so no credential/endpoint detail can leak
+    (Property 7).
     """
     code = _error_code(exc)
 
+    # Only the authorization-ambiguous codes, and BEFORE the generic denial bucket: a
+    # credential-identity failure keeps its code-only ACCESS_DENIED even if its message
+    # happened to contain the marker.
+    if code in _MODEL_ACCESS_DENIED_CODES and _has_model_agreement_marker(exc):
+        return "MODEL_AGREEMENT_REQUIRED"
     if code in _ACCESS_DENIED_CODES:
         return "ACCESS_DENIED"
     if code in {
@@ -483,9 +601,16 @@ def _classify_bedrock_error(exc: BaseException) -> UnavailableReason:
 # MODEL_NOT_ENABLED (model not enabled / not available in the region) and a
 # single catch-all UNKNOWN (network/other) instead of the suggestion path's
 # NETWORK/UNAVAILABLE/INVALID_OUTPUT. The two classifications are kept separate
-# on purpose and neither changes the other's behavior.
+# on purpose and neither changes the other's behavior. MODEL_AGREEMENT_REQUIRED (the
+# model's AWS Marketplace subscription / agreement is missing or failed) is the one
+# reason both taxonomies share, produced by the same rule in both classifiers.
 AccessCheckReason = Literal[
-    "OK", "ACCESS_DENIED", "MODEL_NOT_ENABLED", "THROTTLED", "UNKNOWN"
+    "OK",
+    "ACCESS_DENIED",
+    "MODEL_AGREEMENT_REQUIRED",
+    "MODEL_NOT_ENABLED",
+    "THROTTLED",
+    "UNKNOWN",
 ]
 
 # A tiny, least-cost preflight request: a one-character prompt capped at a
@@ -495,19 +620,43 @@ AccessCheckReason = Literal[
 _ACCESS_CHECK_PROMPT = "ping"
 _ACCESS_CHECK_MAX_TOKENS = 1
 
+# Appended to EVERY passing preflight (configured model or fallback). In a new account a
+# third-party model's first calls can succeed while its AWS Marketplace subscription is
+# still being set up in the background; if that subscription then fails, later calls are
+# denied. That cannot be detected without IAM actions this tool deliberately lacks, so a
+# pass is described as what it is -- the model answered just now -- plus this calm,
+# info-level note (no action is needed for a normal pass). It promises nothing about the
+# wording of a later denial: only one whose message names AWS Marketplace becomes
+# MODEL_AGREEMENT_REQUIRED (with the remedy spelled out); another subscription failure,
+# e.g. a missing first-time use form, may surface under a different reason.
+_FIRST_CALL_CAVEAT = (
+    "In a new AWS account a model's first calls can succeed for up to about 15 "
+    "minutes while its AWS Marketplace subscription is still being set up in the "
+    "background; if AI replies are denied after that, the model's agreement must be "
+    "accepted once for the account."
+)
+
 # Fixed, credential-free, actionable messages. They never echo the raw boto/
 # Bedrock exception text, so no credential or endpoint detail can leak
 # (Requirement 11.15 / Property 7), and each failure states the next step.
 _ACCESS_CHECK_DETAILS: dict[str, str] = {
     "OK": (
-        "Amazon Bedrock access verified: the configured model is reachable in "
-        "the configured region."
+        "Amazon Bedrock access verified: the configured model answered just now in "
+        "the configured region. " + _FIRST_CALL_CAVEAT
     ),
     "ACCESS_DENIED": (
         "Access to Amazon Bedrock InvokeModel was denied. Add a scoped "
         "bedrock:InvokeModel permission for the configured model and region, "
         "then retry. If your AWS credentials or session have expired, "
         "re-authenticate first."
+    ),
+    # A Verify latch also shows this OFF the Connect screen (the AI DBA composer hint,
+    # the "What's next?" toast), so it says where the button is.
+    "MODEL_AGREEMENT_REQUIRED": (
+        "The configured model is not enabled for this AWS account yet: its AWS "
+        "Marketplace subscription is missing or did not complete. "
+        + _MODEL_AGREEMENT_REMEDY
+        + "run Verify AI access on the Connect screen again."
     ),
     "MODEL_NOT_ENABLED": (
         "The configured model is not enabled or not available in the configured "
@@ -535,27 +684,6 @@ _MODEL_NOT_ENABLED_CODES = frozenset(
     }
 )
 
-# Denial codes a DIFFERENT model can plausibly fix, so the preflight's fallback chain
-# must be reachable from them. Bedrock reports "this model is not available for this
-# account" as AccessDeniedException -- NOT ValidationException -- so keying the fallback
-# on _MODEL_NOT_ENABLED_CODES alone made it unreachable in exactly the case it was
-# written for (measured: a global. inference profile denied for the account while a
-# different model answered on the same credentials).
-#
-# The credential-identity codes in _ACCESS_DENIED_CODES (ExpiredToken*, RequestExpired,
-# InvalidSignature*, SignatureDoesNotMatch, InvalidClientTokenId, InvalidAccessKeyId,
-# UnrecognizedClientException, AuthFailure) are deliberately NOT here: another modelId
-# provably cannot fix a bad or expired credential, so probing one would only add a round
-# trip and delay the real cause. This split is by error CODE only -- no message body is
-# ever read (Requirement 11.15 / Property 7).
-_MODEL_ACCESS_DENIED_CODES = frozenset(
-    {
-        "AccessDeniedException",
-        "AccessDenied",
-        "UnauthorizedException",
-    }
-)
-
 
 def _fallback_ok_detail(
     *, configured: str, used: str, denied: bool = False
@@ -574,6 +702,11 @@ def _fallback_ok_detail(
     ``bedrock:InvokeModel`` scope excludes the model). The phrase "not enabled" is kept
     out of the denial variant so the two paths stay distinguishable.
 
+    A model-agreement denial (``MODEL_AGREEMENT_REQUIRED``) never reaches this: the
+    preflight stops on it rather than probing a fallback (see ``verify_access``). Both
+    variants end with :data:`_FIRST_CALL_CAVEAT`, because the fallback's pass is as
+    point-in-time as any other.
+
     Contains only the two model ids and fixed prose -- no exception text, endpoint,
     or credential (Requirement 11.15 / Property 7).
     """
@@ -585,14 +718,14 @@ def _fallback_ok_detail(
             f"fallback model. To use {configured}, either grant its model access in the "
             "Amazon Bedrock console for this account and region, or widen this "
             "deployment's bedrock:InvokeModel scope (BedrockModelArns) to cover it, "
-            "then verify again."
+            "then verify again. " + _FIRST_CALL_CAVEAT
         )
     return (
         f"Amazon Bedrock access verified, but using {used} instead of the "
         f"configured {configured}, which is not enabled for this account in this "
         "region. AI assist works and suggestions will come from the fallback model. "
         f"To use {configured}, enable its model access in the Amazon Bedrock console "
-        "for this account and region, then verify again."
+        "for this account and region, then verify again. " + _FIRST_CALL_CAVEAT
     )
 
 
@@ -601,16 +734,23 @@ def _classify_access_check_error(exc: BaseException) -> AccessCheckReason:
 
     This is the preflight's own mapping (Task 17.3), kept separate from
     :func:`_classify_bedrock_error` (the suggestion path, 16.3): an
-    ``AccessDeniedException`` becomes ``ACCESS_DENIED``; a ``ValidationException``
-    or a model-not-enabled / not-found style error becomes ``MODEL_NOT_ENABLED``;
-    a ``ThrottlingException`` becomes ``THROTTLED``; and everything else
-    (network errors, anything unrecognized) degrades to ``UNKNOWN``. It
-    classifies by the structured ``response['Error']['Code']`` and never reads
-    the raw exception text, so no credential/endpoint detail can leak
-    (Requirement 11.15 / Property 7).
+    authorization-ambiguous denial (:data:`_MODEL_ACCESS_DENIED_CODES`) whose message
+    names AWS Marketplace becomes ``MODEL_AGREEMENT_REQUIRED`` (the same rule as the
+    suggestion path); any other ``AccessDeniedException`` or credential failure
+    becomes ``ACCESS_DENIED``; a ``ValidationException`` or a model-not-enabled /
+    not-found style error becomes ``MODEL_NOT_ENABLED``; a ``ThrottlingException``
+    becomes ``THROTTLED``; and everything else (network errors, anything
+    unrecognized) degrades to ``UNKNOWN``. It classifies by the structured
+    ``response['Error']['Code']`` plus that one fixed-marker presence test on
+    ``response['Error']['Message']``; the message text is never returned, stored,
+    logged or shown and ``str(exc)`` is never read, so no credential/endpoint detail
+    can leak (Requirement 11.15 / Property 7).
     """
     code = _error_code(exc)
 
+    # Same rule, same order as _classify_bedrock_error (see there).
+    if code in _MODEL_ACCESS_DENIED_CODES and _has_model_agreement_marker(exc):
+        return "MODEL_AGREEMENT_REQUIRED"
     if code in _ACCESS_DENIED_CODES:
         return "ACCESS_DENIED"
     if code in _MODEL_NOT_ENABLED_CODES:
@@ -888,14 +1028,17 @@ class AiConversionAssistant:
     def verify_access(self) -> AiAccessCheckResult:
         """Run a lightweight, non-blocking Bedrock access preflight (Req 11.13-11.16).
 
-        Performs a single least-cost ``InvokeModel`` against the configured
-        ``model_id`` / ``region`` through the same injected/lazy client, so it
-        uses the shared ``boto3.Session`` and optional global AWS profile (Task
-        17.2) -- there is no Bedrock-only credential context. On success it
-        returns ``ok=True`` / ``reason="OK"``; on any failure it maps the
-        exception with :func:`_classify_access_check_error` to one of
-        ``ACCESS_DENIED`` / ``MODEL_NOT_ENABLED`` / ``THROTTLED`` / ``UNKNOWN``
-        and a fixed, credential-free, actionable ``detail``.
+        Performs one least-cost ``InvokeModel`` per candidate -- the configured
+        ``model_id`` first, then (only after a failure a different model can fix)
+        the fallback chain -- in the configured ``region``, through the same
+        injected/lazy client, so it uses the shared ``boto3.Session`` and optional
+        global AWS profile (Task 17.2) -- there is no Bedrock-only credential
+        context. On success it returns ``ok=True`` / ``reason="OK"``, whose detail
+        says the model answered just now plus :data:`_FIRST_CALL_CAVEAT` (a pass
+        in a new account can be temporary); on any failure it maps the exception
+        with :func:`_classify_access_check_error` to one of ``ACCESS_DENIED`` /
+        ``MODEL_AGREEMENT_REQUIRED`` / ``MODEL_NOT_ENABLED`` / ``THROTTLED`` /
+        ``UNKNOWN`` and a fixed, credential-free, actionable ``detail``.
 
         It never raises into the workflow (every exception is caught) and never
         echoes raw exception text or credentials (Requirement 11.15 / Property
@@ -914,7 +1057,17 @@ class AiConversionAssistant:
         # A credential-identity denial (expired token, bad signature) and THROTTLED /
         # UNKNOWN (network) are properties of the caller or the network, so they still
         # return immediately -- retrying another model would only add latency and bury the
-        # real cause. Classification stays code-only; no message body is read.
+        # real cause.
+        #
+        # MODEL_AGREEMENT_REQUIRED (the configured model's AWS Marketplace subscription is
+        # missing or failed) also returns immediately, for the configured model: its
+        # prerequisites -- the caller's aws-marketplace:* permissions, Anthropic's
+        # first-time use form, a valid payment method -- are caller- or account-wide, so a
+        # fallback that "answers" in a new account is most likely inside its OWN
+        # background-subscription window: a second false pass, which the Connect screen
+        # would then adopt as the configured model. Probing it would also start a
+        # subscription attempt for a model the operator never chose. Classification is by
+        # error code plus the one fixed-marker presence test; no message text is kept.
         first_reason: Optional[AccessCheckReason] = None
         for candidate in self._access_check_candidates():
             try:

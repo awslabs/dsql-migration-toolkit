@@ -2581,10 +2581,18 @@ def build_schema_conversion_screen(
                 engine = source_engine_word(
                     getattr(session.source_config, "source_type", None)
                 )
-                strategist = AssessmentStrategist(
-                    session.ai_assist, aws_profile=session.aws_profile,
-                    source_engine=engine,
-                )
+
+                def strategist_now() -> AssessmentStrategist:
+                    # Resolved per SEND, not when the scope opens: the app-wide panel
+                    # keeps this streamer while the scope stays open, so a strategist
+                    # built here would keep answering -- and latching denials -- with the
+                    # Bedrock model / region / AWS profile of THIS moment after the
+                    # operator switched to a verified one.
+                    return AssessmentStrategist(
+                        session.ai_assist, aws_profile=session.aws_profile,
+                        source_engine=engine,
+                    )
+
                 system = build_conversion_chat_system(
                     object_name, source_ddl, deterministic, source_engine=engine
                 )
@@ -2594,11 +2602,11 @@ def build_schema_conversion_screen(
                     # source structure / converted DDL / target schema and answer
                     # wider-migration questions; without them it stays a plain chat.
                     if ai_tools is not None and ai_tool_execute is not None:
-                        return strategist.tool_chat(
+                        return strategist_now().tool_chat(
                             system, messages, on_delta,
                             tools=ai_tools, execute=ai_tool_execute,
                         )
-                    return strategist.stream_chat(system, messages, on_delta)
+                    return strategist_now().stream_chat(system, messages, on_delta)
 
                 # A per-NOTE icon passes its warning -> a distinct scope + a question
                 # about THAT specific issue (mirrors Evaluation's per-finding chat); the
@@ -2669,19 +2677,23 @@ def build_schema_conversion_screen(
                 engine = source_engine_word(
                     getattr(session.source_config, "source_type", None)
                 )
-                strategist = AssessmentStrategist(
-                    session.ai_assist, aws_profile=session.aws_profile,
-                    source_engine=engine,
-                )
+
+                def strategist_now() -> AssessmentStrategist:
+                    # Per SEND, like open_conversion_chat's (see there).
+                    return AssessmentStrategist(
+                        session.ai_assist, aws_profile=session.aws_profile,
+                        source_engine=engine,
+                    )
+
                 system = build_reimplementation_chat_system(source_engine=engine)
 
                 def _reimpl_streamer(messages, on_delta):
                     if ai_tools is not None and ai_tool_execute is not None:
-                        return strategist.tool_chat(
+                        return strategist_now().tool_chat(
                             system, messages, on_delta,
                             tools=ai_tools, execute=ai_tool_execute,
                         )
-                    return strategist.stream_chat(system, messages, on_delta)
+                    return strategist_now().stream_chat(system, messages, on_delta)
 
                 open_ai_scope(
                     scope_id="schema_conversion:reimplement",

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+import pytest
+
 from dsql_migrator.core.models import Classification
 from dsql_migrator.core.query_converter import (
     QueryConversionResult,
@@ -959,3 +961,92 @@ def test_resize_grip_is_pulled_out_to_the_field_corner() -> None:
     # Small clearance: enough to un-clip the grip without making it look detached.
     assert "padding-right: 2px" in src
     assert "padding-bottom: 2px" in src
+
+
+# ---------------------------------------------------------------------------
+# The AI DBA chats answer with the CURRENT Bedrock settings (G18 review)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("button", "scope_id"),
+    [
+        ("Review with AI DBA", "query-converter:review"),
+        ("Tune with AI DBA", "query-converter:tune"),
+    ],
+)
+def test_query_converter_ai_dba_answers_with_the_current_settings(
+    button: str, scope_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reviewer's path: the Query Converter's AI DBA chat resolves its strategist
+    per SEND.
+
+    The app-wide AI panel keeps the chat's streamer while the scope stays open, so a
+    strategist built when the button was clicked kept answering -- and latching
+    denials -- with the Bedrock model / AWS profile of that moment after the operator
+    switched to settings Verify AI access had just passed on Connect.
+    """
+    import sys
+    import types
+
+    import dsql_migrator.core.assessment_strategist as strategist_mod
+    from dsql_migrator.ui import query_playground as qp
+    from dsql_migrator.ui.ai_assist import build_ai_assist_config
+    from dsql_migrator.ui.session import SessionStore
+    from tests.test_ui_connect_ai_status import _io_bound, _Ui
+
+    built: list[tuple[str, Optional[str]]] = []  # (model_id, aws_profile) per strategist
+
+    class _RecordingStrategist:
+        def __init__(self, config: Any, *, aws_profile: Any = None, **_k: Any) -> None:
+            built.append((config.model_id, aws_profile))
+
+        def stream_chat(self, *_a: Any, **_k: Any) -> str:
+            return "reply"
+
+        tool_chat = stream_chat
+
+    monkeypatch.setattr(strategist_mod, "AssessmentStrategist", _RecordingStrategist)
+
+    store = SessionStore()
+    session = store.get_or_create("s")
+    session.set_ai_assist(build_ai_assist_config(enabled=True, model_id="model-a"))
+    playground = PlaygroundStore()
+    state = playground.get_or_create("s")
+    state.result = QueryConversionResult(
+        original_sql="SELECT 1",
+        converted_sql="SELECT 1",
+        classification=Classification.AUTO,
+        statement_kind=StatementKind.SELECT,
+    )
+    # A passed Test on target unlocks "Tune with AI DBA".
+    state.set_probe(ExecutionProbe(outcome=ProbeOutcome.PASSED, mode=ProbeMode.EXPLAIN))
+
+    ui = _Ui()
+    fake = types.ModuleType("nicegui")
+    fake.ui = ui  # type: ignore[attr-defined]
+    fake.run = types.SimpleNamespace(io_bound=_io_bound, cpu_bound=_io_bound)  # type: ignore[attr-defined]
+    opened: list[dict] = []
+    saved = sys.modules.get("nicegui")
+    sys.modules["nicegui"] = fake
+    try:
+        content = qp.build_query_playground_screen(
+            store, "s", playground_store=playground,
+            open_ai_scope=lambda **kwargs: opened.append(kwargs),
+        )
+        content(lambda: None)
+    finally:
+        if saved is None:
+            sys.modules.pop("nicegui", None)
+        else:
+            sys.modules["nicegui"] = saved
+
+    ui.find_button(button).click()
+    assert [kw["scope_id"] for kw in opened] == [scope_id]
+
+    # On Connect, the operator switches model and profile (and Verify passes) while the
+    # chat stays open in the panel; the next send must use them.
+    session.set_ai_assist(build_ai_assist_config(enabled=True, model_id="model-b"))
+    session.set_aws_profile("dev")
+    opened[-1]["streamer"]([{"role": "user", "text": "And now?"}], lambda _d: None)
+    assert built[-1] == ("model-b", "dev")

@@ -449,11 +449,12 @@ aws cloudformation deploy \
 > [!TIP]
 > **AI 어시스트(권장).** `EnableAiAssist=true` + `BedrockRegion`으로 Schema
 > Conversion과 Query Converter의 AI DBA를 켭니다 — 옵트인·자문 전용 기능이며,
-> 선택한 모델에 대한 `bedrock:InvokeModel`로만 범위가 제한됩니다. `BedrockModelId`
-> (기본 `global.anthropic.claude-sonnet-5`)에 대해 해당 리전 Bedrock 콘솔에서 **모델
-> 액세스를 활성화**해야 하고, 태스크가 Bedrock 엔드포인트로 egress할 수 있어야 합니다.
-> 둘 다 생략하면 AI 없이 배포됩니다(결정론적 경로는 그대로). 자세한 내용·모델 선택은
-> §8을 보세요.
+> 선택한 모델에 대한 `bedrock:InvokeModel`로만 범위가 제한됩니다. 모델(`BedrockModelId`,
+> 기본 `global.anthropic.claude-sonnet-5`)도 **AWS 계정에서 한 번 활성화**되어 있어야
+> 합니다 — AWS Marketplace 권한이 있는 사람이 모델 약관(agreement)을 수락해야 하는데,
+> 태스크 역할에는 그 권한이 의도적으로 없기 때문입니다(§8). 또한 태스크가 Bedrock
+> 엔드포인트로 egress할 수 있어야 합니다. 둘 다 생략하면 AI 없이 배포됩니다(결정론적
+> 경로는 그대로). 자세한 내용·모델 선택은 §8을 보세요.
 
 외부 접속 + Cognito 로그인을 쓰려면 `--parameter-overrides`에 다음을 추가하세요:
 
@@ -727,11 +728,30 @@ aws cloudformation deploy ... \
 `BedrockModelId`는 위 `global.` cross-region inference profile들의 **드롭다운**이고(모든
 상용 리전에서 해석되므로 하나의 목록으로 어떤 배포든 커버), 태스크 역할의 `bedrock:InvokeModel`
 스코프는 여기서 **자동 도출**됩니다 — 따라서 `BedrockModelArns`는
-**설정할 필요가 없습니다**(다른 모델/ARN으로 바꿀 때만 override로 사용). 단, 선택한 모델의
-**모델 액세스는 `BedrockRegion`의 Bedrock 콘솔에서 직접 활성화**해야 합니다.
+**설정할 필요가 없습니다**(다른 모델/ARN으로 바꿀 때만 override로 사용).
+
+**모델 액세스는 스택이 대신 해 주지 않는, 계정당 한 번의 단계입니다.** Anthropic 모델은 AWS
+Marketplace를 통해 제공되는데, 태스크 역할은 모델을 호출만 할 수 있습니다. 의도적으로
+`aws-marketplace:*` 권한이 **전혀 없으므로**, 태스크의 첫 호출로는 계정을 구독시킬 수 없습니다.
+`aws-marketplace:Subscribe` / `aws-marketplace:Unsubscribe` / `aws-marketplace:ViewSubscriptions`
+권한이 있는 사람이 Amazon Bedrock 콘솔에서 또는 다음 명령으로 모델 약관을 한 번 수락하게 하세요:
+
+```bash
+aws bedrock list-foundation-model-agreement-offers --model-id <foundation-model-id>
+aws bedrock create-foundation-model-agreement --model-id <foundation-model-id> --offer-token <offer-token>
+```
+
+`<foundation-model-id>`는 `BedrockModelId`에서 `global.` 접두사를 뺀 값이고
+(`aws bedrock list-foundation-models --by-provider anthropic`으로 목록 확인), `<offer-token>`은 첫 번째
+명령에서 얻습니다. Anthropic 모델은 1회성 최초 사용(first-time use) 양식(`PutUseCaseForModelAccess`, 계정 또는
+AWS Organization당 한 번)도 필요할 수 있고, 계정에 유효한 결제 수단이 있어야 합니다. 약 2분 기다리세요.
+스택이나 태스크 역할은 바꿀 필요가 없습니다.
 
 태스크 egress가 Bedrock runtime 엔드포인트에 도달할 수 있는지 확인(NAT 또는 Bedrock VPC 엔드포인트).
-UI에서 AI를 켜고, **Verify AI access** 사전 점검으로 도달성을 확인하세요.
+UI에서 AI를 켜고 **Verify AI access**를 실행하세요. 모델이 지금 응답하는지 확인합니다. 새 계정에서는
+통과가 일시적일 수 있으므로(Marketplace 구독을 시도하는 동안 최대 약 15분은 호출이 성공할 수 있음),
+이후 AI 응답이 *the configured model is not enabled for this AWS account yet* 로 거부되면 위와 같이
+약관을 수락하고 다시 점검하세요.
 
 </details>
 
@@ -785,7 +805,8 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
 | Cognito 리디렉션 루프 / 401 | `AppDomainName`이 인증서와 Cognito 콜백 `https://AppDomainName/oauth2/idpresponse`와 일치해야 함; 사용자 미생성/미확인. |
 | 앱이 소스 DB에 도달 못 함 | 소스 DB SG가 태스크 SG로부터 `SourceDbPort` 인바운드를 허용해야 함; `SourceDbSecurityGroupId`/`SourceDbCidr` 확인. |
 | DSQL 인증 에러 | `DsqlClusterArn` 범위, 리전(`DSQL_MIGRATOR_AWS_REGION`), task-role `dsql:DbConnect`. |
-| AI 켰을 때 Bedrock 에러 | `BedrockModelArns` 범위, `BedrockRegion`에서 모델 활성화, Bedrock 엔드포인트 egress. |
+| AI 켰을 때 Bedrock 에러 | `BedrockModelArns` 범위, 계정에서 모델 활성화(약관 수락, §8), Bedrock 엔드포인트 egress. |
+| AI 응답이 *the configured model is not enabled for this AWS account yet* 로 거부됨 (처음에는 Verify AI access가 통과했을 수 있음) | 모델의 1회성 AWS Marketplace 약관이 수락되지 않았습니다. 백그라운드 구독을 시도하는 동안 첫 호출들은 통과했지만, 태스크 역할이 (의도적으로) 구독할 수 없어 구독이 실패했습니다. AWS Marketplace 권한이 있는 사람이 약관을 수락하고(Bedrock 콘솔, 또는 `list-foundation-model-agreement-offers` + `create-foundation-model-agreement`, §8) 약 2분 기다린 뒤 Verify AI access를 다시 실행하세요. 태스크 역할은 바꿀 필요가 없습니다. |
 | 실패 진단에 더 상세히 필요 | **Settings → Diagnostics**(사이드바 푸터의 톱니)에서 로그 레벨을 `DEBUG`로 설정해 활동 로그 실패 이벤트에 Python 스택트레이스 추가; "Send to CloudWatch (stdout)"를 토글해 내구성 사본. 재배포 불필요. |
 
 ### 보안 노트

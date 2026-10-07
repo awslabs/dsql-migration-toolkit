@@ -369,7 +369,12 @@ parallelism knobs can also be retuned **at runtime** from the sidebar's
 | `BEDROCK_REGION` | _(unset)_ | Region for Amazon Bedrock calls. |
 
 AI assist is off by default and enabled in the UI, which also offers a **Verify AI
-access** preflight (checks Bedrock reachability, reports actionable failures).
+access** preflight (a minimal call to the configured model — and, if Bedrock rejects
+that model as unavailable or denies it for a reason other than its model agreement, to
+a fallback model, which Connect then selects with a warning; reports actionable
+failures). Each model must also be enabled once for your AWS account — its agreement
+accepted by someone with AWS Marketplace permissions (manual
+[Chapter 2](docs/manual/en/02-evaluation-and-schema-conversion.md)).
 Full background on the tuning knobs: manual
 [Performance and tuning](docs/manual/en/07-performance-and-tuning.md).
 

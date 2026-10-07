@@ -143,8 +143,8 @@ AI 어시스트는 **옵트인·기본 꺼짐** 보강 기능으로, **Amazon Be
 - AI 어시스트는 **`bedrock:InvokeModel`** 권한 하나로만 Bedrock을 호출합니다 — 그 외엔 없습니다.
   **도구의 나머지와 동일한 자격증명**(Connect에서 선택한 AWS 프로필, 또는 환경/역할 자격증명 체인)을
   사용합니다.
-- **로컬 실행:** 자격증명 체인이 선택 모델에 대해 `bedrock:InvokeModel`을 허용해야 하고, 해당 리전
-  Bedrock 콘솔에서 그 **모델을 활성화**해 두어야 합니다.
+- **로컬 실행:** 자격증명 체인이 선택 모델에 대해 `bedrock:InvokeModel`을 허용해야 하고, 그 모델이
+  **AWS 계정에서 활성화**되어 있어야 합니다(아래 *모델 액세스* 참조).
 - **Fargate 배포:** AI 어시스트는 **`EnableAiAssist=true`로 배포하지 않으면 꺼져 있습니다.** 이 값을
   켜면 태스크 역할에 **범위가 제한된** `bedrock:InvokeModel`이 부여됩니다(최소 권한 — 범위에 든 모델만
   호출 가능). 기본적으로 `BedrockModelArns`는 비어 있고 그 범위는 **`BedrockModelId`에서 자동으로
@@ -154,14 +154,44 @@ AI 어시스트는 **옵트인·기본 꺼짐** 보강 기능으로, **Amazon Be
   [`deploy/DEPLOYMENT.md`: "Enable AI-assisted conversion (optional)"](../../../deploy/DEPLOYMENT.md) 참조.
 - **모델:** 기본은 `global.anthropic.claude-sonnet-5`(범용·비용 효율 선택). `BedrockModelId`(배포) 또는
   Connect 화면의 Bedrock 설정에서 변경.
+- **모델 액세스(AWS 계정당 한 번):** Bedrock의 Anthropic 모델은 계정별로 AWS Marketplace 구독 — 즉
+  모델의 *약관(agreement)* — 을 통해 활성화됩니다. 계정에서 모델을 처음 호출하면 그 구독이
+  백그라운드에서 시작되며, 구독이 결국 실패하더라도 최대 약 15분 동안은 호출이 성공할 수 있습니다.
+  호출자에게 `aws-marketplace:Subscribe` / `aws-marketplace:Unsubscribe` /
+  `aws-marketplace:ViewSubscriptions` 권한이 없거나, 계정(또는 그 AWS Organization)에 대해 Anthropic의
+  1회성 최초 사용(first-time use) 양식이 제출되지 않았거나, 계정에 유효한 결제 수단이 없으면 구독이
+  실패합니다. Bedrock의 거부가 모델의 AWS Marketplace 구독에 관한 것이면 도구는 *the configured model
+  is not enabled for this AWS account yet* 이라고 알리고 아래 해결 방법을 안내합니다. 최초 사용 양식이
+  제출되지 않은 경우에는 대신 Verify AI access가 모델을 *not enabled or not available* 로 보고할 수
+  있습니다. 이때는 Amazon Bedrock 콘솔에서 양식을 한 번 제출한 뒤 다시 점검하세요. 도구가 사용하는
+  자격증명이 구독할 수 없다면(Fargate 태스크 역할은 의도적으로 구독할 수 없습니다), 구독할 수 있는
+  사람이 Amazon Bedrock 콘솔에서 또는 다음 명령으로 모델 약관을 **한 번** 수락합니다:
+
+  ```bash
+  aws bedrock list-foundation-model-agreement-offers --model-id <foundation-model-id>
+  aws bedrock create-foundation-model-agreement --model-id <foundation-model-id> --offer-token <offer-token>
+  ```
+
+  `<foundation-model-id>`는 모델 id에서 `global.` 접두사를 뺀 값이고
+  (`aws bedrock list-foundation-models --by-provider anthropic`으로 목록 확인), `<offer-token>`은 첫 번째
+  명령의 출력에서 얻습니다. 약 2분 기다린 뒤 **Verify AI access**를 다시 실행하세요. 그 뒤로는 어떤
+  호출자도 AWS Marketplace 권한이 필요 없고, 도구의 IAM을 바꿀 필요도 없습니다.
 
 **켜는 방법:**
 
 1. **Connect** 화면에서 **AI Assist**를 펼치고 **Enable AI Assist**를 토글(선택적으로 *Bedrock
    settings*에서 모델 id / 리전 설정).
-2. **Verify AI access** 사전 점검(preflight)을 사용하세요. 자격증명이 실제로 Bedrock에 도달하는지
-   확인하는 비차단 점검입니다(유효한 AWS 프로필만으로는 `bedrock:InvokeModel`이 **보장되지 않음**).
-   권한 공백을 실행 도중이 아니라 지금 발견할 수 있습니다.
+2. **Verify AI access** 사전 점검(preflight)을 사용하세요. 이 자격증명으로 설정된 모델에 최소한의 호출을
+   보내는 비차단 점검입니다(유효한 AWS 프로필만으로는 `bedrock:InvokeModel`이 **보장되지 않음**).
+   권한 공백을 실행 도중이 아니라 지금 발견할 수 있습니다. Bedrock이 그 모델을 사용할 수 없다고 하거나
+   모델 약관 외의 이유로 거부하면 점검은 대체(fallback) 모델도 시도하고, 대체 모델이 응답하면 Model ID가
+   그 모델로 바뀌며 결과는 깨끗한 통과가 아니라 두 모델을 모두 밝히는 경고입니다(원래 모델로 돌아가려면
+   그 모델이 활성화된 뒤 다시 선택하고 점검하세요). 모델 약관(AWS Marketplace) 거부, 만료되었거나 잘못된
+   자격증명, 스로틀링, 네트워크 오류는 첫 호출에서 멈춥니다. 통과는 설정된 모델이 **방금 응답했다**는
+   뜻입니다. 새 AWS 계정에서는 통과가 일시적일 수 있습니다(위 *모델 액세스* 참조). 이후 AI 응답이
+   거부되면 AI DBA 패널과 Connect 화면의 AI Assist 상태가 *the configured model is not enabled for this
+   AWS account yet* 이라고 알리고 해결 방법 — 모델 약관을 한 번 수락하고 약 2분 기다린 뒤 다시 점검 —
+   을 안내합니다.
 
 > **비용·지연:** AI를 켜면 Bedrock을 호출하므로 **비용과 약간의 지연**이 추가됩니다. `MANUAL`/
 > `UNSUPPORTED` 잔여 항목을 위한 편의일 뿐 필수가 아닙니다 — 결정론적 경로가 가능한 모든 것을 스스로

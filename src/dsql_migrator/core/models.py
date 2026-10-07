@@ -1818,18 +1818,29 @@ class AiAccessCheckResult(BaseModel):
     A lightweight, non-blocking check of whether the configured model
     (``BEDROCK_MODEL_ID``) and region (``BEDROCK_REGION``) can be reached via
     Amazon Bedrock ``InvokeModel``. ``ok`` is ``True`` only when the preflight
-    succeeded; otherwise ``reason`` names the specific failure
-    (``ACCESS_DENIED`` / ``MODEL_NOT_ENABLED`` / ``THROTTLED`` / ``UNKNOWN``) and
-    ``detail`` is a credential-free, actionable next-step message (Requirement
-    11.15 / Property 7). ``model_id`` and ``region`` echo the configuration the
-    check ran against. This only reports connectivity/permission; it does not
-    alter the AI suggestion review gate (Property 13).
+    succeeded (the model answered just now -- in a new account that can still be
+    temporary, see the ``OK`` detail); otherwise ``reason`` names the specific
+    failure (``ACCESS_DENIED`` / ``MODEL_AGREEMENT_REQUIRED`` /
+    ``MODEL_NOT_ENABLED`` / ``THROTTLED`` / ``UNKNOWN``) and ``detail`` is a
+    credential-free, actionable next-step message (Requirement 11.15 / Property
+    7). ``MODEL_AGREEMENT_REQUIRED`` means the model's AWS Marketplace
+    subscription (its agreement) is missing or failed for the account.
+    ``model_id`` and ``region`` echo the configuration the check ran against.
+    This only reports connectivity/permission; it does not alter the AI
+    suggestion review gate (Property 13).
     """
 
     model_config = ConfigDict(extra="forbid")
 
     ok: bool
-    reason: Literal["OK", "ACCESS_DENIED", "MODEL_NOT_ENABLED", "THROTTLED", "UNKNOWN"]
+    reason: Literal[
+        "OK",
+        "ACCESS_DENIED",
+        "MODEL_AGREEMENT_REQUIRED",
+        "MODEL_NOT_ENABLED",
+        "THROTTLED",
+        "UNKNOWN",
+    ]
     detail: str = ""
     model_id: str = Field(min_length=1)
     region: Optional[str] = None

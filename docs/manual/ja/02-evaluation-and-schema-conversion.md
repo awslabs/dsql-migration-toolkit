@@ -153,7 +153,8 @@ AI アシストは **オプトイン・デフォルト無効** の補強機能�
   **ツールの他の部分と同じ認証情報**(Connect で選択した AWS プロファイル、または環境/ロールの認証情報
   チェーン)を使用します。
 - **ローカルで実行する場合:** 認証情報チェーンが選択したモデルに対して `bedrock:InvokeModel` を許可して
-  いる必要があり、対象リージョンの Bedrock コンソールでその **モデルを有効化** しておく必要があります。
+  いる必要があり、そのモデルが **AWS アカウントで有効化** されている必要があります(下記の *モデルアクセス*
+  を参照)。
 - **Fargate にデプロイする場合:** AI アシストは **`EnableAiAssist=true` でデプロイしない限り無効です。**
   この値を有効にすると、タスクロールに **スコープを限定した** `bedrock:InvokeModel` が付与されます
   (最小権限 — スコープ内のモデルのみ呼び出し可能)。デフォルトでは `BedrockModelArns` は空で、その
@@ -164,14 +165,46 @@ AI アシストは **オプトイン・デフォルト無効** の補強機能�
   [`deploy/DEPLOYMENT.md`: 「AI 支援変換の有効化 (オプション)」](../../../deploy/DEPLOYMENT.ja.md) を参照してください。
 - **モデル:** デフォルトは `global.anthropic.claude-sonnet-5`(汎用的でコスト効率の良い選択)です。
   `BedrockModelId`(デプロイ時)または Connect 画面の Bedrock 設定で変更します。
+- **モデルアクセス(AWS アカウントごとに 1 回):** Bedrock の Anthropic モデルは、アカウントごとに AWS
+  Marketplace サブスクリプション — つまりモデルの *契約(agreement)* — を通じて有効化されます。アカウントで
+  モデルを初めて呼び出すと、そのサブスクリプションがバックグラウンドで開始され、最終的に失敗する場合でも
+  最大約 15 分間は呼び出しが成功することがあります。呼び出し元に `aws-marketplace:Subscribe` /
+  `aws-marketplace:Unsubscribe` / `aws-marketplace:ViewSubscriptions` の権限がない場合、アカウント
+  (またはその AWS Organization)で Anthropic の 1 回限りの初回利用(first-time use)フォームが提出されて
+  いない場合、またはアカウントに有効な支払い方法がない場合、サブスクリプションは失敗します。Bedrock の
+  拒否がモデルの AWS Marketplace サブスクリプションに関するものである場合、ツールは *the configured model
+  is not enabled for this AWS account yet* と表示し、以下の対処方法を示します。初回利用フォームが未提出の
+  場合は、代わりに Verify AI access がモデルを *not enabled or not available* と報告することがあります。
+  その場合は Amazon Bedrock コンソールでフォームを 1 回提出してから、再度チェックしてください。
+  ツールが使用する ID がサブスクライブできない場合(Fargate のタスクロールは意図的にできません)、それが
+  できる人が Amazon Bedrock コンソールで、または次のコマンドで、モデルの契約を **1 回** 承諾します:
+
+  ```bash
+  aws bedrock list-foundation-model-agreement-offers --model-id <foundation-model-id>
+  aws bedrock create-foundation-model-agreement --model-id <foundation-model-id> --offer-token <offer-token>
+  ```
+
+  `<foundation-model-id>` はモデル id から `global.` プレフィックスを除いた値で
+  (`aws bedrock list-foundation-models --by-provider anthropic` で一覧表示できます)、`<offer-token>` は
+  1 つ目のコマンドの出力から取得します。約 2 分待ってから **Verify AI access** を再実行してください。
+  それ以降、どの呼び出し元にも AWS Marketplace の権限は不要で、ツールの IAM を変更する必要もありません。
 
 **有効化する方法:**
 
 1. **Connect** 画面で **AI Assist** を展開し、**Enable AI Assist** をトグルします(必要に応じて
    *Bedrock settings* でモデル id / リージョンを設定します)。
-2. **Verify AI access** のプリフライトを使用してください。これは認証情報が実際に Bedrock に到達できるかを
-   確認する非ブロッキングのチェックです(有効な AWS プロファイルだけでは `bedrock:InvokeModel` は
-   **保証されません**)。権限の不足を実行の途中ではなく、今のうちに見つけられます。
+2. **Verify AI access** のプリフライトを使用してください。これはこの認証情報で設定済みのモデルに最小限の
+   呼び出しを行う非ブロッキングのチェックです(有効な AWS プロファイルだけでは `bedrock:InvokeModel` は
+   **保証されません**)。権限の不足を実行の途中ではなく、今のうちに見つけられます。Bedrock がそのモデルを
+   利用不可として拒否した場合、またはモデルの契約以外の理由で拒否した場合、チェックはフォールバックモデル
+   も試します。フォールバックモデルが応答すると Model ID がそのモデルに切り替わり、結果は問題のない合格では
+   なく両方のモデルを示す警告になります(元のモデルに戻すには、そのモデルが有効化された後に再度選択して
+   からチェックしてください)。モデルの契約(AWS Marketplace)による拒否、期限切れまたは無効な認証情報、
+   スロットリング、ネットワークエラーでは最初の呼び出しで止まります。合格は、設定済みのモデルが
+   **たった今応答した** ことを意味します。新しい AWS アカウントでは合格が一時的な場合があります(上記の
+   *モデルアクセス* を参照)。その後 AI の応答が拒否されると、AI DBA パネルと Connect 画面の AI Assist の
+   ステータスが *the configured model is not enabled for this AWS account yet* と表示し、対処方法 — モデルの
+   契約を 1 回承諾し、約 2 分待ってから再度チェックする — を示します。
 
 > **コストとレイテンシー:** AI を有効にすると Bedrock を呼び出すため、**コストと若干のレイテンシー** が
 > 追加されます。これは `MANUAL`/`UNSUPPORTED` のロングテールのための利便性であって、必須ではありません

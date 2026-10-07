@@ -204,7 +204,13 @@ class AiAssessmentOutcome:
 
     available: bool
     reason: Literal[
-        "OK", "ACCESS_DENIED", "THROTTLED", "NETWORK", "UNAVAILABLE", "INVALID_OUTPUT"
+        "OK",
+        "ACCESS_DENIED",
+        "MODEL_AGREEMENT_REQUIRED",
+        "THROTTLED",
+        "NETWORK",
+        "UNAVAILABLE",
+        "INVALID_OUTPUT",
     ]
     detail: str
     report: Optional[AiAssessmentReport] = None
@@ -2022,7 +2028,13 @@ class ObjectGuidanceOutcome:
 
     available: bool
     reason: Literal[
-        "OK", "ACCESS_DENIED", "THROTTLED", "NETWORK", "UNAVAILABLE", "INVALID_OUTPUT"
+        "OK",
+        "ACCESS_DENIED",
+        "MODEL_AGREEMENT_REQUIRED",
+        "THROTTLED",
+        "NETWORK",
+        "UNAVAILABLE",
+        "INVALID_OUTPUT",
     ]
     detail: str
     markdown: str = ""

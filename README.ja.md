@@ -366,8 +366,13 @@ MSK Connect *上で*動作するオープンソースソフトウェアです。
 | `BEDROCK_MODEL_ID` | `global.anthropic.claude-sonnet-5` | AI アシスト用の Bedrock モデル / 推論プロファイル ID。常に `global.*` プロファイル — 全ての商用リージョンから呼び出せます（`us.*` は us-east-1/us-east-2/us-west-2 でのみ解決）。 |
 | `BEDROCK_REGION` | _(未設定)_ | Amazon Bedrock 呼び出し用のリージョン。 |
 
-AI アシストは既定でオフです。UI からオンにできます。UI には Bedrock への到達性を確認し、
-失敗時に原因を表示する **Verify AI access** プリフライトチェックもあります。
+AI アシストは既定でオフです。UI からオンにできます。UI には設定済みのモデルに最小限の呼び出しを
+行い（Bedrock がそのモデルを利用不可として拒否した場合、またはモデルの契約以外の理由で拒否した場合は
+フォールバックモデルも試し、応答すると Connect が警告付きでそのモデルを選択します）、失敗時に対処
+可能な原因を表示する **Verify AI access** プリフライトチェックもあります。
+各モデルは AWS アカウントで 1 回有効化されている必要があります — AWS Marketplace の権限を持つ人が
+モデルの契約（agreement）を承諾します（マニュアル
+[第 2 章](docs/manual/ja/02-evaluation-and-schema-conversion.md)）。
 チューニングの詳細はマニュアル
 [パフォーマンスとチューニング](docs/manual/ja/07-performance-and-tuning.md) を参照。
 

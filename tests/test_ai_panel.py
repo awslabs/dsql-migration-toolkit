@@ -13,6 +13,8 @@ from __future__ import annotations
 import time
 from typing import Optional
 
+import pytest
+
 from dsql_migrator.core.assessment_strategist import ObjectGuidanceOutcome
 from dsql_migrator.core.models import AiScope
 from dsql_migrator.ui.ai_panel import build_ai_panel
@@ -1009,6 +1011,116 @@ def test_successful_reply_clears_a_latched_denial_in_the_panel() -> None:
     # something an explicit preflight earns.
     assert state.ai_verified is None
     assert ai_is_usable(state) is True
+
+
+def test_model_agreement_reply_latches_like_access_denied() -> None:
+    # G18: Bedrock denies a model whose AWS Marketplace agreement is missing with the
+    # same code as a missing IAM grant. It is just as much an authorization failure --
+    # every later call fails the same way until the agreement is accepted -- so it must
+    # latch the session "unavailable" exactly like ACCESS_DENIED.
+    from dsql_migrator.core.ai_assistant import _UNAVAILABLE_DETAILS
+    from dsql_migrator.ui.ai_assist import (
+        AI_UNAVAILABLE,
+        ai_availability,
+        ai_is_usable,
+    )
+
+    state = _enabled_state()
+    ui = _Ui()
+    detail = _UNAVAILABLE_DETAILS["MODEL_AGREEMENT_REQUIRED"]
+
+    def denying_streamer(messages, on_delta):  # noqa: ANN001
+        return ObjectGuidanceOutcome(
+            available=False, reason="MODEL_AGREEMENT_REQUIRED", detail=detail,
+            markdown="", model_id=None,
+        )
+
+    panel = build_ai_panel(ui, state=state)
+    panel.open_scope(
+        scope_id="general", title="general",
+        streamer=denying_streamer, seed_question="Review this conversion",
+    )
+    _pump(ui)
+
+    assert state.ai_verified is False
+    assert state.ai_unavailable_detail == detail
+    assert ai_availability(state) == AI_UNAVAILABLE
+    assert ai_is_usable(state) is False
+
+
+@pytest.mark.parametrize("kind", ["stream_chat", "tool_chat"])
+def test_model_agreement_denial_from_a_real_chat_latches_with_the_fixed_copy(
+    kind: str, caplog  # noqa: ANN001
+) -> None:
+    # End to end through the REAL strategist (stream_chat -- the Query Converter's AI DBA
+    # path -- and tool_chat -- the general / "What's next?" path) over a fake client that
+    # raises the denial the Workshop Studio reviewer saw: the panel latches the fixed
+    # copy, and the denial's message (a credential-shaped ARN here) never reaches the
+    # session, any rendered label, or a log.
+    import logging
+
+    from botocore.exceptions import ClientError
+
+    from dsql_migrator.core.ai_assistant import _UNAVAILABLE_DETAILS
+    from dsql_migrator.core.assessment_strategist import AssessmentStrategist
+
+    caplog.set_level(logging.DEBUG)
+    sentinel = "arn:aws:sts::123456789012:assumed-role/WSParticipantRole/g18-SENTINEL"
+    account = "123456789012"  # survives a truncation that cuts the ARN short
+    denial = ClientError(
+        {
+            "Error": {
+                "Code": "AccessDeniedException",
+                # The sentinel at BOTH ends: a truncated leak still carries it.
+                "Message": (
+                    sentinel
+                    + " Model access is denied due to IAM user or service role is not "
+                    "authorized to perform the required AWS Marketplace actions "
+                    "(aws-marketplace:Subscribe) to enable access to this model. "
+                    + sentinel
+                ),
+            }
+        },
+        "InvokeModelWithResponseStream",
+    )
+
+    class _DenyingClient:
+        def invoke_model(self, **_kwargs):  # noqa: ANN003, ANN202
+            raise denial
+
+        def invoke_model_with_response_stream(self, **_kwargs):  # noqa: ANN003, ANN202
+            raise denial
+
+    state = _enabled_state()
+    strategist = AssessmentStrategist(state.ai_assist, client=_DenyingClient())
+
+    def streamer(messages, on_delta):  # noqa: ANN001, ANN202
+        if kind == "stream_chat":
+            return strategist.stream_chat("SYS", messages, on_delta)
+        return strategist.tool_chat(
+            "SYS", messages, on_delta, tools=[], execute=lambda _n, _i: "{}"
+        )
+
+    ui = _Ui()
+    panel = build_ai_panel(ui, state=state)
+    build_time_labels = list(ui.labels)  # includes the composer hint
+    panel.open_scope(
+        scope_id="query-converter:review", title="AI DBA",
+        streamer=streamer, seed_question="Review this conversion",
+    )
+    _pump(ui)
+
+    # No slice of the denial reaches a log, however truncated or redacted.
+    for needle in (account, "Model access is denied"):
+        assert needle not in caplog.text, "the denial message reached a log"
+    assert state.ai_verified is False
+    assert state.ai_unavailable_detail == _UNAVAILABLE_DETAILS["MODEL_AGREEMENT_REQUIRED"]
+    assert not any(account in (el.text or "") for el in ui.labels)
+    # The composer hint now names the real remedy instead of "grant bedrock:...".
+    assert any(
+        "create-foundation-model-agreement" in (el.text or "")
+        for el in build_time_labels
+    )
 
 
 def test_composer_hint_explains_a_denial_instead_of_saying_enable_ai() -> None:

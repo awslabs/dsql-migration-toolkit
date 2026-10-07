@@ -478,11 +478,12 @@ aws cloudformation deploy \
 > [!TIP]
 > **AI assist (recommended).** `EnableAiAssist=true` + `BedrockRegion` turns on the
 > AI DBA for Schema Conversion and the Query Converter — an opt-in, advisory-only
-> feature scoped to `bedrock:InvokeModel` for the selected model. You **must still
-> enable model access** for `BedrockModelId` (default
-> `global.anthropic.claude-sonnet-5`) in the Bedrock console for that region, and the
-> task needs egress to the Bedrock endpoint. Omit both to deploy without AI (the
-> deterministic path is unchanged). Full details + model choices in §8.
+> feature scoped to `bedrock:InvokeModel` for the selected model. The model
+> (`BedrockModelId`, default `global.anthropic.claude-sonnet-5`) must also be
+> **enabled once for your AWS account** — its AWS Marketplace agreement accepted by
+> someone with AWS Marketplace permissions, because the task role deliberately has
+> none (§8) — and the task needs egress to the Bedrock endpoint. Omit both to deploy
+> without AI (the deterministic path is unchanged). Full details + model choices in §8.
 
 For external access with Cognito sign-in, add these to
 `--parameter-overrides`:
@@ -779,12 +780,33 @@ credentials. Set the model with `BedrockModelId` (default
 (they resolve from every commercial region, so one list serves any deploy),
 and the task role's `bedrock:InvokeModel` scope is **derived from it
 automatically** — so you do **not** set `BedrockModelArns` (use it only to
-override with a different model/ARNs). You **must still enable model access** for
-the chosen model in the Bedrock console for `BedrockRegion`.
+override with a different model/ARNs).
+
+**Model access is a one-time, per-account step the stack does not do for you.**
+Anthropic models are provided through AWS Marketplace, and the task role can only
+invoke models: it deliberately has **no** `aws-marketplace:*` permissions, so its
+first call cannot subscribe the account. Have someone with `aws-marketplace:Subscribe`
+/ `aws-marketplace:Unsubscribe` / `aws-marketplace:ViewSubscriptions` accept the
+model's agreement once, in the Amazon Bedrock console or with:
+
+```bash
+aws bedrock list-foundation-model-agreement-offers --model-id <foundation-model-id>
+aws bedrock create-foundation-model-agreement --model-id <foundation-model-id> --offer-token <offer-token>
+```
+
+`<foundation-model-id>` is `BedrockModelId` without its `global.` prefix
+(`aws bedrock list-foundation-models --by-provider anthropic` lists them);
+`<offer-token>` comes from the first command. Anthropic models may also need the
+one-time first-time use form (`PutUseCaseForModelAccess`, once per account or AWS
+Organization), and the account needs a valid payment method. Allow about 2 minutes.
+No change to the stack or the task role is needed.
 
 Ensure task egress can reach the Bedrock runtime endpoint (NAT or a Bedrock VPC
-endpoint). Enable AI in the UI; use the **Verify AI access** preflight to
-confirm reachability.
+endpoint). Enable AI in the UI and run **Verify AI access**: it confirms the model
+answers right now. In a new account a pass can be temporary (calls can succeed for
+up to about 15 minutes while the Marketplace subscription is attempted), so if AI
+replies are later denied with *the configured model is not enabled for this AWS
+account yet*, accept the agreement as above and verify again.
 
 </details>
 
@@ -843,7 +865,8 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
 | Cognito redirect loop / 401 | `AppDomainName` must match the cert and the Cognito callback `https://AppDomainName/oauth2/idpresponse`; user not created/confirmed. |
 | App cannot reach the source DB | Source DB SG must allow inbound on `SourceDbPort` from the task SG; verify `SourceDbSecurityGroupId`/`SourceDbCidr`. |
 | DSQL auth errors | `DsqlClusterArn` scope, region (`DSQL_MIGRATOR_AWS_REGION`), and task-role `dsql:DbConnect`. |
-| Bedrock errors when AI on | `BedrockModelArns` scope, model enabled in `BedrockRegion`, and egress to the Bedrock endpoint. |
+| Bedrock errors when AI on | `BedrockModelArns` scope, the model enabled for the account (its agreement accepted, §8), and egress to the Bedrock endpoint. |
+| AI replies denied with *the configured model is not enabled for this AWS account yet* (Verify AI access may have passed at first) | The model's one-time AWS Marketplace agreement is not in place: the first calls passed while the background subscription was attempted, and it failed because the task role (by design) cannot subscribe. Someone with AWS Marketplace permissions accepts it (Bedrock console, or `list-foundation-model-agreement-offers` + `create-foundation-model-agreement`, §8); wait about 2 minutes, then run Verify AI access again. No task-role change. |
 | Need more detail when diagnosing a failure | Set log level to `DEBUG` under **Settings → Diagnostics** (the gear in the sidebar footer) to add Python stacktraces to activity-log failure events; toggle "Send to CloudWatch (stdout)" for a durable copy. No redeploy. |
 
 ### Security notes

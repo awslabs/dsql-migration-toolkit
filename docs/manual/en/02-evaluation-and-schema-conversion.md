@@ -167,8 +167,8 @@ never touches.
   nothing else. It uses the **same credentials as the rest of the tool** (the AWS
   profile you selected on Connect, or the environment/role credential chain).
 - **Running locally:** your credential chain must allow `bedrock:InvokeModel` for
-  the chosen model, and you must have **enabled that model** in the Bedrock console
-  for your region.
+  the chosen model, and the model must be **enabled for your AWS account** (see
+  *Model access* below).
 - **Deployed on Fargate:** AI assist is **off unless you deploy with
   `EnableAiAssist=true`**, which grants the task role a **scoped**
   `bedrock:InvokeModel` (least privilege — it can invoke only the model(s) in scope).
@@ -180,14 +180,51 @@ never touches.
 - **Model:** the default is `global.anthropic.claude-sonnet-5` (a general,
   cost-effective choice); override it with `BedrockModelId` (deploy) or in the
   Connect screen's Bedrock settings.
+- **Model access (once per AWS account):** Anthropic models on Bedrock are enabled
+  per account through an AWS Marketplace subscription — the model's *agreement*. The
+  first call to a model in an account starts that subscription in the background, and
+  calls can succeed for up to about 15 minutes even if it is going to fail. It fails
+  when the caller lacks `aws-marketplace:Subscribe` / `aws-marketplace:Unsubscribe` /
+  `aws-marketplace:ViewSubscriptions`, when Anthropic's one-time first-time use form
+  has not been submitted for the account (or its AWS Organization), or when the
+  account has no valid payment method. When Bedrock's denial is about the model's AWS
+  Marketplace subscription, the tool says *the configured model is not enabled for
+  this AWS account yet* and names the fix below. A missing first-time use form can
+  instead show up as Verify AI access reporting the model
+  *not enabled or not available*: submit the form once in the Amazon Bedrock console,
+  then verify again. If the identity the tool uses can't subscribe (the Fargate task
+  role deliberately can't), someone who can accepts the model's agreement **once** —
+  in the Amazon Bedrock console, or with:
+
+  ```bash
+  aws bedrock list-foundation-model-agreement-offers --model-id <foundation-model-id>
+  aws bedrock create-foundation-model-agreement --model-id <foundation-model-id> --offer-token <offer-token>
+  ```
+
+  `<foundation-model-id>` is the model id without its `global.` prefix
+  (`aws bedrock list-foundation-models --by-provider anthropic` lists them), and
+  `<offer-token>` comes from the first command's output. Allow about 2 minutes, then
+  run **Verify AI access** again. After that no caller needs AWS Marketplace
+  permissions, and no IAM change to the tool is needed.
 
 **How to turn it on:**
 
 1. On the **Connect** screen, expand **AI Assist** and toggle **Enable AI Assist**
    (optionally set the model id / region under *Bedrock settings*).
-2. Use the **Verify AI access** preflight — a non-blocking check that confirms the
-   credentials can actually reach Bedrock (a valid AWS profile alone does **not**
-   guarantee `bedrock:InvokeModel`), so you find a permission gap now, not mid-run.
+2. Use the **Verify AI access** preflight — a non-blocking check that makes a
+   minimal call to the configured model with these credentials (a valid AWS profile
+   alone does **not** guarantee `bedrock:InvokeModel`), so you find a permission gap
+   now, not mid-run. If Bedrock rejects that model as unavailable, or denies it for a
+   reason other than its model agreement, the check also tries a fallback model; if
+   the fallback answers, the Model ID switches to it and the result is a warning that
+   names both models rather than a clean pass (to go back, select your model again
+   once it is enabled, then verify). A model-agreement (AWS Marketplace) denial,
+   expired or invalid credentials, throttling and network errors stop at the first
+   call. A pass means the configured model **answered just now**. In a new AWS
+   account a pass can be temporary (see *Model access* above): if AI replies are later
+   denied, the AI DBA panel and the AI Assist status on the Connect screen say *the
+   configured model is not enabled for this AWS account yet* and name the fix —
+   accept the model's agreement once, wait about 2 minutes, then verify again.
 
 > **Cost & latency:** enabling AI calls Bedrock, which **adds cost and some
 > latency**. It's a convenience for the `MANUAL`/`UNSUPPORTED` long tail, not a

@@ -65,6 +65,11 @@ DEFAULT_BEDROCK_MODEL_ID = "global.anthropic.claude-sonnet-5"
 # trip, so a long chain turns a quick preflight into a slow one -- and a chain
 # that silently walks several tiers hides from the operator which model their
 # suggestions actually came from.
+#
+# A model-agreement denial (MODEL_AGREEMENT_REQUIRED: the configured model's AWS
+# Marketplace subscription is missing or failed) deliberately does NOT retry this
+# fallback: its prerequisites are caller- or account-wide, so in a new account the
+# fallback would most likely "pass" only inside its own background-subscription window.
 BEDROCK_MODEL_FALLBACKS: tuple[str, ...] = ("global.anthropic.claude-sonnet-4-6",)
 
 # The curated set the Connect "Model ID" dropdown offers. GLOBAL cross-region Anthropic
@@ -140,7 +145,9 @@ def ai_availability(state: object) -> str:
       call may well work; a preflight is optional), but no affirmative "it works"
       claim is made.
     * ``available``    -- a clean preflight passed.
-    * ``unavailable``  -- a real ACCESS_DENIED was observed. Affordances go
+    * ``unavailable``  -- an authorization failure in :data:`AI_LATCHING_REASONS`
+      was observed (ACCESS_DENIED or MODEL_AGREEMENT_REQUIRED from a live reply or
+      the preflight, or the preflight's MODEL_NOT_ENABLED). Affordances go
       disabled-with-a-reason instead of failing on every click.
     """
     enabled = bool(getattr(getattr(state, "ai_assist", None), "enabled", False))
@@ -152,6 +159,18 @@ def ai_availability(state: object) -> str:
     if verified is True:
         return AI_AVAILABLE
     return AI_UNVERIFIED
+
+
+# The failure reasons that latch the session "unavailable" (``set_ai_verified(False,
+# detail)``), shared by both writers: the AI panel (a live reply) and the Connect screen's
+# Verify AI access. Each means EVERY call with the current config/credentials fails the
+# same way until the operator acts (grants the permission or re-authenticates, accepts the
+# model's agreement, or enables / changes the model). MODEL_NOT_ENABLED comes from the
+# preflight only. THROTTLED / NETWORK / UNAVAILABLE / INVALID_OUTPUT / UNKNOWN are transient
+# and never latch. Use it for membership tests only -- never iterate it into text.
+AI_LATCHING_REASONS: frozenset[str] = frozenset(
+    {"ACCESS_DENIED", "MODEL_AGREEMENT_REQUIRED", "MODEL_NOT_ENABLED"}
+)
 
 
 def ai_is_usable(state: object) -> bool:
@@ -292,11 +311,12 @@ class AiAccessDisplay(NamedTuple):
 
 
 # Notification severity per preflight reason: success is positive; permission /
-# model-not-enabled failures are hard errors (negative); throttling and unknown
-# (e.g. transient network) are warnings the user can retry.
+# model-agreement / model-not-enabled failures are hard errors (negative); throttling
+# and unknown (e.g. transient network) are warnings the user can retry.
 ACCESS_CHECK_NOTIFY_TYPES: dict[str, str] = {
     "OK": "positive",
     "ACCESS_DENIED": "negative",
+    "MODEL_AGREEMENT_REQUIRED": "negative",
     "MODEL_NOT_ENABLED": "negative",
     "THROTTLED": "warning",
     "UNKNOWN": "warning",
@@ -435,6 +455,7 @@ __all__ = [
     "AI_AVAILABLE",
     "AI_UNAVAILABLE",
     "ai_availability",
+    "AI_LATCHING_REASONS",
     "ai_is_usable",
     "ai_unavailable_hint",
     "AiConversionAssistant",

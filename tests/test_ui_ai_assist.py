@@ -469,10 +469,39 @@ def test_access_check_notify_types_cover_every_reason() -> None:
     assert set(ACCESS_CHECK_NOTIFY_TYPES) == {
         "OK",
         "ACCESS_DENIED",
+        "MODEL_AGREEMENT_REQUIRED",
         "MODEL_NOT_ENABLED",
         "THROTTLED",
         "UNKNOWN",
     }
+
+
+def test_map_access_check_display_model_agreement_required_is_negative() -> None:
+    # G18: the model's AWS Marketplace agreement is missing -- a blocking failure for
+    # this config, so it must read as an error (red), not fall back to the default
+    # "warning" tone an unrecognized reason gets.
+    result = _access_result(
+        ok=False, reason="MODEL_AGREEMENT_REQUIRED", detail="Accept the agreement."
+    )
+    display = map_access_check_display(result, configured_model_id=result.model_id)
+    assert display.notify_type == "negative"
+    assert display.message == "Accept the agreement."
+
+
+def test_ai_latching_reasons_are_the_authorization_failures_only() -> None:
+    # One definition shared by the AI panel and Connect's Verify AI access. An
+    # authorization failure latches the session "unavailable"; a transient failure
+    # (throttle / network / bad output / unknown) must never latch.
+    from dsql_migrator.ui.ai_assist import AI_LATCHING_REASONS
+
+    assert AI_LATCHING_REASONS == {
+        "ACCESS_DENIED",
+        "MODEL_AGREEMENT_REQUIRED",
+        "MODEL_NOT_ENABLED",
+    }
+    assert AI_LATCHING_REASONS.isdisjoint(
+        {"OK", "THROTTLED", "NETWORK", "UNAVAILABLE", "INVALID_OUTPUT", "UNKNOWN"}
+    )
 
 
 def test_map_access_check_display_message_never_exposes_credentials() -> None:
@@ -844,3 +873,104 @@ def test_no_ui_gate_reads_the_raw_ai_preference_instead_of_availability() -> Non
         "Bedrock denial), not on the raw ai_assist.enabled preference:\n  "
         + "\n  ".join(offenders)
     )
+
+
+def test_no_ai_chat_freezes_its_strategist_when_its_scope_opens() -> None:
+    """Structural invariant: every AI chat resolves its strategist per SEND (G18 review).
+
+    The app-wide AI panel keeps a scope's streamer for as long as the scope stays open
+    (across navigation and the header toggle). A strategist built when the scope OPENED
+    -- or when a result rendered -- kept the Bedrock model / region / AWS profile of that
+    moment: after the operator switched to a model (or profile) that Verify AI access
+    had just passed, a follow-up still went to the old one, and its denial latched the
+    just-verified settings "unavailable". Only the Connect site is cheap to drive end to
+    end (tests/test_ui_connect_ai_status.py), so -- like the ``ai_assist.enabled`` sweep
+    above -- this sweeps the whole UI package: every strategist construction must sit in
+    a per-send resolver named ``strategist_now`` (or be an allowlisted factory / the
+    general chat's per-send ``_stream``), and no resolver may be CALLED by the function
+    that defines it, which would build the strategist at open time again.
+    """
+    import ast
+    import pathlib
+
+    ui_dir = pathlib.Path(__file__).resolve().parents[1] / "src" / "dsql_migrator" / "ui"
+    assert ui_dir.is_dir(), ui_dir
+    builders = {"AssessmentStrategist", "strategist_factory"}
+    hosts = {
+        "strategist_now",  # the per-send resolver of every per-object chat
+        "_default_strategist_factory",  # evaluation / validation: the factory itself
+        "_stream",  # app.py's general chat streamer (per send since v0.1.498)
+    }
+
+    def callee(call: ast.Call) -> str:
+        if isinstance(call.func, ast.Name):
+            return call.func.id
+        if isinstance(call.func, ast.Attribute):
+            return call.func.attr
+        return ""
+
+    def defines_resolver(fn: ast.AST) -> bool:
+        # A ``def strategist_now`` in fn's own body (not inside a nested function).
+        todo = list(ast.iter_child_nodes(fn))
+        while todo:
+            node = todo.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name == "strategist_now":
+                    return True
+                continue
+            if isinstance(node, (ast.Lambda, ast.ClassDef)):
+                continue
+            todo.extend(ast.iter_child_nodes(node))
+        return False
+
+    offenders: list[str] = []
+    resolver_modules: set[str] = set()
+
+    for path in sorted(ui_dir.rglob("*.py")):
+        rel = str(path.relative_to(ui_dir.parent))
+
+        def visit(node: ast.AST, scopes: tuple, rel: str = rel) -> None:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                # Defaults and decorators are evaluated in the ENCLOSING scope (a
+                # ``_s=strategist_now()`` default would freeze it), the body in its own.
+                outer = [*node.args.defaults, *(d for d in node.args.kw_defaults if d)]
+                if not isinstance(node, ast.Lambda):
+                    outer.extend(node.decorator_list)
+                    if node.name == "strategist_now":
+                        resolver_modules.add(rel)
+                for child in outer:
+                    visit(child, scopes)
+                body = [node.body] if isinstance(node, ast.Lambda) else node.body
+                for child in body:
+                    visit(child, (*scopes, node))
+                return
+            if isinstance(node, ast.Call):
+                name = callee(node)
+                fn = scopes[-1] if scopes else None
+                where = getattr(fn, "name", "<lambda>") if fn is not None else "<module>"
+                if name in builders and where not in hosts:
+                    offenders.append(f"{rel}:{node.lineno}: {name}(...) in {where}")
+                if name == "strategist_now" and fn is not None and defines_resolver(fn):
+                    offenders.append(
+                        f"{rel}:{node.lineno}: strategist_now() called by {where}, "
+                        "which defines it"
+                    )
+            for child in ast.iter_child_nodes(node):
+                visit(child, scopes)
+
+        visit(ast.parse(path.read_text(encoding="utf-8")), ())
+
+    assert not offenders, (
+        "An AI chat must resolve its strategist per send (a ``strategist_now()`` called "
+        "from inside the streamer), never when its scope opens or a result renders:\n  "
+        + "\n  ".join(offenders)
+    )
+    # Not vacuous: the per-object chats of every screen that opens one are covered.
+    assert resolver_modules == {
+        "ui/connect.py",
+        "ui/data_migration/__init__.py",
+        "ui/evaluation.py",
+        "ui/query_playground.py",
+        "ui/schema_conversion.py",
+        "ui/validation.py",
+    }, resolver_modules

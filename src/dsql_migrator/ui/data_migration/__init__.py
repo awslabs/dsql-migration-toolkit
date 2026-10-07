@@ -2246,8 +2246,8 @@ def build_data_migration_screen(
                 _run_retry_for(list(names))
 
             # On-demand AI diagnosis of a FAILED Full Load table (opt-in: AI Assist
-            # on). Reuses the shared chat drawer + a strategist bound to the Full
-            # Load error grounding, so a reply explains the specific failure
+            # on). Reuses the shared chat drawer + a strategist (resolved per send) bound
+            # to the Full Load error grounding, so a reply explains the specific failure
             # (schema/DDL vs data vs transient) and the recovery step. Built lazily
             # and ONCE (the drawer is a top-level dialog; the per-poll progress
             # re-render must not create a new drawer each time). ``None`` when AI is
@@ -2271,12 +2271,19 @@ def build_data_migration_screen(
                         source_engine_word,
                     )
 
-                    strategist = AssessmentStrategist(
-                        session.ai_assist, aws_profile=session.aws_profile,
-                        source_engine=source_engine_word(
-                            getattr(session.source_config, "source_type", None)
-                        ),
-                    )
+                    def strategist_now() -> AssessmentStrategist:
+                        # Resolved per SEND, not when the scope opens: the app-wide panel
+                        # keeps this streamer while the scope stays open, so a strategist
+                        # built here would keep answering -- and latching denials -- with
+                        # the Bedrock model / region / AWS profile of THIS moment after
+                        # the operator switched to a verified one.
+                        return AssessmentStrategist(
+                            session.ai_assist, aws_profile=session.aws_profile,
+                            source_engine=source_engine_word(
+                                getattr(session.source_config, "source_type", None)
+                            ),
+                        )
+
                     # Ground the reply in THIS migration's situation (type, CDC
                     # status, DROP+recreate) so it isn't generic.
                     migration_context = full_load_error_migration_context(
@@ -2295,7 +2302,7 @@ def build_data_migration_screen(
                             or f"Why did loading {table_name} fail, and how do I fix it?"
                         ),
                         streamer=lambda messages, on_delta: (
-                            strategist.stream_full_load_error_chat(
+                            strategist_now().stream_full_load_error_chat(
                                 table_name,
                                 error_message,
                                 messages,
@@ -2321,12 +2328,15 @@ def build_data_migration_screen(
                         source_engine_word,
                     )
 
-                    strategist = AssessmentStrategist(
-                        session.ai_assist, aws_profile=session.aws_profile,
-                        source_engine=source_engine_word(
-                            getattr(session.source_config, "source_type", None)
-                        ),
-                    )
+                    def strategist_now() -> AssessmentStrategist:
+                        # Per SEND, like ai_error_opener's (see there).
+                        return AssessmentStrategist(
+                            session.ai_assist, aws_profile=session.aws_profile,
+                            source_engine=source_engine_word(
+                                getattr(session.source_config, "source_type", None)
+                            ),
+                        )
+
                     open_ai_scope(
                         scope_id=f"cdc:{scope}",
                         title="AI DBA",
@@ -2338,7 +2348,7 @@ def build_data_migration_screen(
                         chip="CDC · monitoring",
                         seed_question=seed,
                         streamer=lambda messages, on_delta: (
-                            strategist.stream_cdc_chat(
+                            strategist_now().stream_cdc_chat(
                                 facts, messages, on_delta, scope=scope,
                                 # Shared read-only tools: look up the affected table's
                                 # converted DDL / target schema to root-cause the drift.

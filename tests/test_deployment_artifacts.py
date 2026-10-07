@@ -1617,6 +1617,124 @@ def test_bedrock_invoke_is_opt_in_and_scoped(template: dict) -> None:
     assert "inference-profile/*\"" not in str(derived)  # not a bare inference-profile/*
 
 
+def test_ai_role_never_needs_aws_marketplace_permissions(template: dict) -> None:
+    """The task role can only INVOKE Bedrock models -- by design (G18).
+
+    A third-party model's one-time AWS Marketplace agreement is accepted once per
+    account by someone who has AWS Marketplace permissions; the tool tells the operator
+    so (MODEL_AGREEMENT_REQUIRED) instead of the app widening its own role. The docs
+    state this, so neither deployment template may grow an ``aws-marketplace:`` action
+    or a GetFoundationModelAvailability check (which needs one more IAM action and was
+    seen reporting AVAILABLE for a model that was still denied).
+
+    An AWS managed policy (e.g. AWSMarketplaceManageSubscriptions, or the usual "quick
+    fix" for a Bedrock denial, AmazonBedrockFullAccess) grants such actions without
+    naming them in the template, so the managed policies of the role the app's Bedrock
+    calls run as are pinned too: none on the Fargate TaskRole, and only the SSM agent's
+    on the EC2 HostRole.
+    """
+    for template_path in (CFN_TEMPLATE, DEPLOY_DIR / "cloudformation-ec2.yaml"):
+        text = template_path.read_text(encoding="utf-8")
+        assert "aws-marketplace:" not in text, template_path.name
+        assert "GetFoundationModelAvailability" not in text, template_path.name
+    assert "ManagedPolicyArns" not in template["Resources"]["TaskRole"]["Properties"]
+    ec2 = yaml.safe_load(
+        (DEPLOY_DIR / "cloudformation-ec2.yaml").read_text(encoding="utf-8")
+    )
+    assert ec2["Resources"]["HostRole"]["Properties"]["ManagedPolicyArns"] == [
+        {"Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"}
+    ]
+
+
+_REPO_ROOT = DEPLOY_DIR.parent
+_MANUAL_02 = {
+    lang: _REPO_ROOT / "docs" / "manual" / lang / "02-evaluation-and-schema-conversion.md"
+    for lang in ("en", "ko", "ja")
+}
+
+
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _block_with(text: str, needle: str) -> str:
+    """The blank-line-delimited block containing ``needle``, whitespace-collapsed."""
+    for block in text.split("\n\n"):
+        if needle in _flat(block):
+            return _flat(block)
+    raise AssertionError(f"no block contains {needle!r}")
+
+
+def test_g18_docs_quote_the_ui_copy_of_a_model_access_failure_word_for_word() -> None:
+    """A quoted UI message must be findable in the UI, and vice versa (G18).
+
+    The docs quote one sentence for the model-agreement (AWS Marketplace) denial -- as
+    what the AI DBA panel and the Connect status say, and as a troubleshooting symptom
+    -- so it must be word for word in BOTH fixed copies (the panel shows the chat copy,
+    Verify AI access the preflight copy). And the manual must not promise that sentence
+    for every subscription failure: only a denial that names AWS Marketplace produces
+    it; a missing first-time use form can instead surface as Verify AI access's
+    *not enabled or not available*, which the manual now says, quoting that copy.
+    """
+    from dsql_migrator.core.ai_assistant import _ACCESS_CHECK_DETAILS, _UNAVAILABLE_DETAILS
+
+    phrase = "the configured model is not enabled for this AWS account yet"
+    for copy in (
+        _UNAVAILABLE_DETAILS["MODEL_AGREEMENT_REQUIRED"],
+        _ACCESS_CHECK_DETAILS["MODEL_AGREEMENT_REQUIRED"],
+    ):
+        assert phrase.casefold() in _flat(copy).casefold(), copy
+    docs = [*_MANUAL_02.values()] + [
+        DEPLOY_DIR / name for name in ("DEPLOYMENT.md", "DEPLOYMENT.ko.md", "DEPLOYMENT.ja.md")
+    ]
+    for path in docs:
+        assert f"*{phrase}*" in _flat(path.read_text(encoding="utf-8")), path.name
+
+    form_case = "not enabled or not available"
+    assert form_case in _flat(_ACCESS_CHECK_DETAILS["MODEL_NOT_ENABLED"])
+    for lang, path in _MANUAL_02.items():
+        assert f"*{form_case}*" in _flat(path.read_text(encoding="utf-8")), lang
+    en = _flat(_MANUAL_02["en"].read_text(encoding="utf-8"))
+    assert "Bedrock then denies the model and the tool says" not in en
+
+
+def test_g18_docs_describe_the_verify_fallback_instead_of_a_single_call() -> None:
+    """Verify AI access is not always "one minimal call to the configured model" (G18).
+
+    When Bedrock rejects the configured model as unavailable, or denies it for a reason
+    other than its model agreement, the preflight also tries a fallback model, and
+    Connect switches the Model ID to it when it answers. Every README and manual chapter
+    2 that describes the preflight must say so, in every language, and none may claim a
+    single call.
+    """
+    described = {
+        # path: (the block's anchor, the word for the fallback, the single-call claim
+        # with all whitespace removed)
+        _REPO_ROOT / "README.md": (
+            "**Verify AI access** preflight", "fallback", "oneminimalcall"
+        ),
+        _REPO_ROOT / "README.ko.md": (
+            "**Verify AI access** 사전 점검", "fallback", "호출을한번보내"
+        ),
+        _REPO_ROOT / "README.ja.md": (
+            "**Verify AI access** プリフライト", "フォールバック", "呼び出しを1回行"
+        ),
+        _MANUAL_02["en"]: (
+            "2. Use the **Verify AI access** preflight", "fallback", "oneminimalcall"
+        ),
+        _MANUAL_02["ko"]: (
+            "2. **Verify AI access** 사전 점검", "fallback", "호출을한번보내"
+        ),
+        _MANUAL_02["ja"]: (
+            "2. **Verify AI access** のプリフライト", "フォールバック", "呼び出しを1回行"
+        ),
+    }
+    for path, (anchor, fallback, single_call) in described.items():
+        block = _block_with(path.read_text(encoding="utf-8"), anchor)
+        assert fallback in block, (path.name, block)
+        assert single_call not in "".join(block.split()), (path.name, block)
+
+
 def test_bedrock_model_id_is_curated_dropdown_with_auto_scope(template: dict) -> None:
     """BedrockModelId is a curated Anthropic picker for the app's DEFAULT model; the
     IAM scope is provider-wide (any Anthropic), not derived from this value, and

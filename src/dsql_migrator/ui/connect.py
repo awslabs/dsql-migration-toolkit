@@ -68,9 +68,14 @@ from dsql_migrator.ui.design import (
     section_header,
 )
 from dsql_migrator.ui.ai_assist import (
+    AI_LATCHING_REASONS,
+    AI_UNAVAILABLE,
+    AI_UNVERIFIED,
     DEFAULT_BEDROCK_MODEL_ID,
     SUPPORTED_BEDROCK_MODELS,
+    ai_availability,
     ai_is_usable,
+    ai_unavailable_hint,
     build_ai_assist_config,
     map_access_check_display,
     run_verify_ai_access,
@@ -516,10 +521,17 @@ def build_connect_page(
             side=side, coordinates=coordinates, error_message=detail,
             source_engine=engine,
         )
-        strategist = AssessmentStrategist(
-            state.ai_assist, aws_profile=getattr(state, "aws_profile", None),
-            source_engine=engine,
-        )
+
+        def strategist_now() -> "AssessmentStrategist":
+            # Resolved per SEND, not when the scope opens: the app-wide panel keeps this
+            # streamer while the scope stays open, so a strategist built here would keep
+            # answering -- and latching denials -- with the Bedrock model / region / AWS
+            # profile of THIS moment after the operator switched to a verified one.
+            return AssessmentStrategist(
+                state.ai_assist, aws_profile=getattr(state, "aws_profile", None),
+                source_engine=engine,
+            )
+
         open_ai_scope(
             scope_id=f"connect:{side}",
             title="AI DBA",
@@ -529,7 +541,7 @@ def build_connect_page(
                 f"The {label} connection test failed with the error shown. Why did it "
                 "fail, and how do I fix it?"
             ),
-            streamer=lambda messages, on_delta: strategist.stream_chat(
+            streamer=lambda messages, on_delta: strategist_now().stream_chat(
                 system, messages, on_delta
             ),
         )
@@ -795,7 +807,7 @@ def build_connect_page(
                         # rebuild while the session is still "fresh" re-applies the
                         # snapshot's profile and would silently revert this switch (the
                         # same lost-change hazard the AI toggle has below).
-                        refresh_ai_badge()  # the switch just invalidated any verdict
+                        refresh_ai_status()  # the switch just invalidated any verdict
                         if on_state_change is not None:
                             on_state_change()
 
@@ -1480,8 +1492,8 @@ def build_connect_page(
                     label="Model ID (BEDROCK_MODEL_ID)",
                     value=state.ai_assist.model_id or DEFAULT_BEDROCK_MODEL_ID,
                 ).props(
-                    "hint=\"Bedrock model for AI Assist. Must be access-enabled in "
-                    "your account and region.\""
+                    "hint=\"Bedrock model for AI Assist. It must be enabled once for "
+                    "your AWS account (its agreement accepted).\""
                 ).classes("w-full")
                 ai_region = ui.input(
                     "Region (BEDROCK_REGION, optional)",
@@ -1497,7 +1509,66 @@ def build_connect_page(
                     new_tab=True,
                 ).classes("text-xs")
 
-            ai_status = ui.label().classes("text-sm")
+            # The AI status area: one short inline line for the transient / affirmative
+            # states (verifying, a pass, a fallback or throttle note), and a Cloudscape
+            # notice for a latched "unavailable" verdict -- a long, multi-step remedy that
+            # does not block the migration, so it is amber like the badge above it, the
+            # journey chip and the AI DBA panel's reply notice (never loose red text).
+            ai_status = ui.column().classes("w-full gap-1")
+            # The session verdict the badge + status area were last drawn for. It can
+            # change while this view stays open without anything on it being clicked (the
+            # header AI DBA, "What's next?", "Ask AI to help fix this", or a reply still
+            # streaming from the previous screen latches a denial; a later success clears
+            # it), so a light timer redraws both when -- and only when -- it changes.
+            _ai_shown: dict[str, object] = {"verdict": None}
+
+            def _ai_verdict() -> tuple[str, Optional[str]]:
+                return (ai_availability(state), state.ai_unavailable_detail)
+
+            def show_ai_status(text: str, tone: str, *, header: str = "") -> None:
+                """Draw the status area + badge and record the verdict they show.
+
+                With ``header`` the text is drawn as a notice box (``render_notice``);
+                without, as one inline hint line -- or nothing at all for empty text.
+                """
+                ai_status.clear()
+                with ai_status:
+                    if header:
+                        render_notice(ui, tone=tone, header=header, body=text)
+                    elif text:
+                        inline_hint(ui, text, tone=tone, classes="text-sm")
+                refresh_ai_badge()
+                _ai_shown["verdict"] = _ai_verdict()
+
+            def refresh_ai_status() -> None:
+                # From the SESSION alone only a latched denial has something to say: its
+                # fixed, credential-free reason (Property 7), as an amber notice.
+                # Otherwise the badge carries the state and the area is empty. OFF always
+                # wins (ai_availability), so a reply that finished after AI was switched
+                # off never paints a denial here.
+                if ai_availability(state) == AI_UNAVAILABLE:
+                    show_ai_status(
+                        ai_unavailable_hint(state),
+                        "warning",
+                        header="AI Assist unavailable",
+                    )
+                else:
+                    show_ai_status("", "neutral")
+
+            def resync_ai_status() -> None:
+                # Timer path: redraw only on a real change of the session verdict, so a
+                # Verify's own message (a fallback-pass warning, a throttle note) is not
+                # overwritten while the verdict it was drawn for still holds.
+                if _ai_verdict() != _ai_shown["verdict"]:
+                    refresh_ai_status()
+
+            # Reflect the session verdict on every (re)build: a denial latched elsewhere
+            # (e.g. by an AI DBA reply) used to show the amber "Unavailable" badge here
+            # with an empty status line -- no reason, no next step.
+            refresh_ai_status()
+            # A child of this card, so it is deleted -- and stops -- with the card when the
+            # view is rebuilt on navigation. Each tick only compares two in-memory fields.
+            ui.timer(1.0, resync_ai_status)
 
             def persist_ai_settings(_event: object = None, *, save: bool = False) -> None:
                 """Persist AI settings on every change (no explicit Save).
@@ -1526,7 +1597,10 @@ def build_connect_page(
                         region=ai_region.value,
                     )
                 )
-                refresh_ai_badge()
+                # FORCED redraw (not the timer's change test): any settings edit makes the
+                # old status line stale, including a throttle / unknown / fallback note
+                # drawn for a verdict that was already "unverified".
+                refresh_ai_status()
                 # Persist NOW. The snapshot signature already tracks the AI preference,
                 # but nothing on this screen used to invoke the save hook, so turning the
                 # switch OFF and reloading before navigating re-applied the stale AI-ON
@@ -1555,13 +1629,13 @@ def build_connect_page(
                 state.set_ai_assist(config)
                 ai_model.set_value(config.model_id)
 
-                ai_status.classes(replace=f"text-sm {INLINE_HINT_TEXT['neutral']}")
-                ai_status.set_text("Verifying AI access...")
+                show_ai_status("Verifying AI access...", "neutral")
+                # The credentials the check runs with, captured beside ``config`` so the
+                # result can be matched to both once it arrives (see below).
+                profile = state.aws_profile
                 # verify_access is non-blocking (never raises); run it off the
                 # event loop like the connection tests.
-                result = await run.io_bound(
-                    verify_runner, config, state.aws_profile
-                )
+                result = await run.io_bound(verify_runner, config, profile)
                 # Pass the configured model so a pass that landed on a fallback is
                 # shown as a warning, not as a clean green success.
                 display = map_access_check_display(
@@ -1570,6 +1644,24 @@ def build_connect_page(
                 # Skip UI updates if the page was rebuilt while awaiting
                 # (NiceGUI #3028): the element/slot may have been deleted.
                 if ai_status.is_deleted:
+                    return
+                # Only the Verify button is disabled while the check runs: the model,
+                # region and AWS profile inputs and the switch stay live (so does a second
+                # tab on the same session), and each change already reset the verdict.
+                # This result is then about settings that are no longer selected --
+                # recording it would paint "Verified" (or latch a denial) on a config that
+                # was never checked -- so it is dropped: no toast, no fallback adoption, no
+                # verdict. A change that was undone (A -> B -> A) compares equal and keeps
+                # the result.
+                if state.ai_assist != config or state.aws_profile != profile:
+                    if ai_availability(state) == AI_UNVERIFIED:
+                        show_ai_status(
+                            "AI settings changed during the check. Click Verify AI "
+                            "access to check the current settings.",
+                            "neutral",
+                        )
+                    else:
+                        refresh_ai_status()  # switched off (or a denial latched since)
                     return
                 # Carry the verdict severity into the persistent status line (not
                 # only the transient toast): route the notify type through the
@@ -1580,8 +1672,6 @@ def build_connect_page(
                     "negative": "error",
                     "warning": "warning",
                 }.get(display.notify_type, "neutral")
-                ai_status.classes(replace=f"text-sm {INLINE_HINT_TEXT[tone]}")
-                ai_status.set_text(display.message)
                 ui.notify(display.message, type=display.notify_type)
                 # Adopt the model that actually ANSWERED. Without this, a preflight that
                 # passed on a fallback left the denied/not-enabled model configured, so
@@ -1604,21 +1694,28 @@ def build_connect_page(
                 # reported as a warning, not success, so it must not read as Verified).
                 # Record the verdict on the SESSION so the journey header and every
                 # step's AI affordance agree with what the preflight just found. An
-                # explicit ACCESS_DENIED latches "unavailable" (the affordances go
-                # disabled-with-a-reason); a throttle / unknown failure only leaves it
-                # unverified, since those are transient and AI may still work.
+                # authorization failure (AI_LATCHING_REASONS) latches "unavailable" (the
+                # affordances go disabled-with-a-reason); a throttle / unknown failure
+                # only leaves it unverified, since those are transient and AI may still
+                # work.
                 if display.notify_type == "positive":
                     state.set_ai_verified(True)
-                elif getattr(result, "reason", None) in (
-                    "ACCESS_DENIED", "MODEL_NOT_ENABLED"
-                ):
-                    # Both are hard negatives for THIS config: every call would fail the
+                elif getattr(result, "reason", None) in AI_LATCHING_REASONS:
+                    # These are hard negatives for THIS config: every call would fail the
                     # same way, so the affordances go disabled-with-a-reason. (display
                     # .message is the fixed, credential-free, actionable copy.)
                     state.set_ai_verified(False, display.message)
                 else:
                     state.set_ai_verified(None)
-                refresh_ai_badge()
+                # Drawn LAST -- after the fallback adoption above (whose set_value fires
+                # persist_ai_settings and its forced redraw) and after the latch -- and
+                # recorded, so the resync timer leaves this verdict's message alone. A
+                # latch is drawn as the "unavailable" notice (its detail IS this message),
+                # exactly as a later rebuild of this view draws it.
+                if ai_availability(state) == AI_UNAVAILABLE:
+                    refresh_ai_status()
+                else:
+                    show_ai_status(display.message, tone)
 
             # Verify button + the "auto-saved" reassurance on one row, so the
             # action and its caption sit together at the foot of the card.

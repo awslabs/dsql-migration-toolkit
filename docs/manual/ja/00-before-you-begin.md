@@ -112,9 +112,11 @@ _言語: [English](../en/00-before-you-begin.md) | [한국어](../ko/00-before-y
 
 - [ ] **AI アシストはオプションで、Amazon Bedrock 専用です。** AI は**デフォルトでオフ**です。有効に
       すると、AWS 認証情報（`bedrock:InvokeModel` 権限）を使って**もっぱら Amazon Bedrock を通じてのみ**
-      動作します。**直接 API キーを入力する手段はありません**（Anthropic/OpenAI のキー入力欄はありません）
-      — AI を使う唯一の方法は Bedrock です。すべての提案は**レビュー専用**であり、AI がデータ経路に
-      入ることは決してありません。同じアシスタントが **すべてのステップ** で **AI DBA** パネルとして
+      動作し、選択したモデルは AWS アカウントで 1 回有効化されている必要があります（モデルの AWS
+      Marketplace の契約（agreement）を承諾 — 第 2 章）。**直接 API キーを入力する手段はありません**
+      （Anthropic/OpenAI のキー入力欄はありません）— AI を使う唯一の方法は Bedrock です。すべての提案は
+      **レビュー専用**であり、AI がデータ経路に入ることは決してありません。同じアシスタントが
+      **すべてのステップ** で **AI DBA** パネルとして
       利用できます — Full Load / CDC の失敗診断、DLQ のトリアージ、前提条件チェックを行う読み取り専用の
       ヘルパーです。 → [第 2 章](02-evaluation-and-schema-conversion.md), [第 9 章](09-query-validation.md)
 

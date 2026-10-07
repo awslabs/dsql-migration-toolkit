@@ -477,10 +477,12 @@ aws cloudformation deploy \
 > **AI アシスト（推奨）。** `EnableAiAssist=true` + `BedrockRegion` で Schema
 > Conversion と Query Converter の AI DBA を有効にします — オプトインかつ助言専用の
 > 機能で、選択したモデルに対する `bedrock:InvokeModel` のみにスコープされます。
-> `BedrockModelId`（デフォルト `global.anthropic.claude-sonnet-5`）について、その
-> リージョンの Bedrock コンソールで**モデルアクセスを有効化**する必要があり、タスクが
-> Bedrock エンドポイントへ egress できる必要があります。両方省略すれば AI なしで
-> デプロイされます（決定論的パスは変わりません）。詳細とモデル選択は §8 を参照。
+> モデル（`BedrockModelId`、デフォルト `global.anthropic.claude-sonnet-5`）も **AWS
+> アカウントで 1 回有効化** されている必要があります — AWS Marketplace の権限を持つ人が
+> モデルの契約（agreement）を承諾する必要があり、タスクロールにはその権限が意図的に
+> ないためです（§8）。また、タスクが Bedrock エンドポイントへ egress できる必要があります。
+> 両方省略すれば AI なしでデプロイされます（決定論的パスは変わりません）。詳細とモデル
+> 選択は §8 を参照。
 
 外部アクセス + Cognito ログインを使う場合は、`--parameter-overrides` に
 次を追加してください:
@@ -775,12 +777,33 @@ aws cloudformation deploy ... \
 であり（すべての商用リージョンから解決できるため、1 つのリストでどのデプロイにも対応します）、
 タスクロールの `bedrock:InvokeModel` スコープはそこから**自動的に導出**されます
 — したがって `BedrockModelArns` は**設定する必要はありません**（別のモデル/ARN で
-オーバーライドする場合にのみ使用）。ただし、選択したモデルについて `BedrockRegion` の
-Bedrock コンソールで**モデルアクセスを有効化する必要は依然としてあります**。
+オーバーライドする場合にのみ使用）。
+
+**モデルアクセスは、スタックが代わりに行わない、アカウントごとに 1 回の手順です。**
+Anthropic のモデルは AWS Marketplace を通じて提供されますが、タスクロールはモデルを呼び出す
+ことしかできません。意図的に `aws-marketplace:*` の権限を**一切持たない**ため、タスクの最初の
+呼び出しではアカウントをサブスクライブできません。`aws-marketplace:Subscribe` /
+`aws-marketplace:Unsubscribe` / `aws-marketplace:ViewSubscriptions` の権限を持つ人に、Amazon
+Bedrock コンソールで、または次のコマンドで、モデルの契約を 1 回承諾してもらってください:
+
+```bash
+aws bedrock list-foundation-model-agreement-offers --model-id <foundation-model-id>
+aws bedrock create-foundation-model-agreement --model-id <foundation-model-id> --offer-token <offer-token>
+```
+
+`<foundation-model-id>` は `BedrockModelId` から `global.` プレフィックスを除いた値で
+（`aws bedrock list-foundation-models --by-provider anthropic` で一覧表示できます）、
+`<offer-token>` は 1 つ目のコマンドから取得します。Anthropic のモデルでは 1 回限りの初回利用
+（first-time use）フォーム（`PutUseCaseForModelAccess`、アカウントまたは AWS Organization ごとに
+1 回）も必要な場合があり、アカウントには有効な支払い方法が必要です。約 2 分待ってください。
+スタックやタスクロールを変更する必要はありません。
 
 タスクの egress が Bedrock ランタイムエンドポイントに到達できることを確認してください
-（NAT または Bedrock VPC エンドポイント）。UI で AI を有効化し、**Verify AI access** の
-事前チェックで到達性を確認してください。
+（NAT または Bedrock VPC エンドポイント）。UI で AI を有効化し、**Verify AI access** を実行
+してください。モデルが今応答するかを確認します。新しいアカウントでは合格が一時的な場合が
+あるため（Marketplace サブスクリプションを試行している間、最大約 15 分は呼び出しが成功する
+ことがあります）、その後 AI の応答が *the configured model is not enabled for this AWS account
+yet* で拒否された場合は、上記のとおり契約を承諾してから再度チェックしてください。
 
 </details>
 
@@ -838,7 +861,8 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
 | Cognito リダイレクトループ / 401 | `AppDomainName` は証明書および Cognito コールバック `https://AppDomainName/oauth2/idpresponse` と一致する必要がある。ユーザーが未作成/未確認。 |
 | アプリがソース DB に到達できない | ソース DB の SG がタスク SG から `SourceDbPort` のインバウンドを許可する必要がある。`SourceDbSecurityGroupId`/`SourceDbCidr` を確認。 |
 | DSQL 認証エラー | `DsqlClusterArn` のスコープ、リージョン（`DSQL_MIGRATOR_AWS_REGION`）、タスクロールの `dsql:DbConnect`。 |
-| AI オン時の Bedrock エラー | `BedrockModelArns` のスコープ、`BedrockRegion` でのモデル有効化、Bedrock エンドポイントへの egress。 |
+| AI オン時の Bedrock エラー | `BedrockModelArns` のスコープ、アカウントでのモデル有効化（契約の承諾、§8）、Bedrock エンドポイントへの egress。 |
+| AI の応答が *the configured model is not enabled for this AWS account yet* で拒否される（最初は Verify AI access が合格していた場合がある） | モデルの 1 回限りの AWS Marketplace の契約が承諾されていません。バックグラウンドのサブスクリプションを試行している間は最初の呼び出しが成功しましたが、タスクロールが（設計上）サブスクライブできないため失敗しました。AWS Marketplace の権限を持つ人が契約を承諾し（Bedrock コンソール、または `list-foundation-model-agreement-offers` + `create-foundation-model-agreement`、§8）、約 2 分待ってから Verify AI access を再実行してください。タスクロールの変更は不要です。 |
 | 失敗の診断にさらに詳細が必要 | **Settings → Diagnostics**（サイドバーのフッターの歯車）でログレベルを `DEBUG` に設定して、アクティビティログの失敗イベントに Python スタックトレースを追加。「Send to CloudWatch (stdout)」をトグルして耐久性のあるコピーを取得。再デプロイ不要。 |
 
 ### セキュリティに関する注記

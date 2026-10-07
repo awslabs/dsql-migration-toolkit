@@ -119,13 +119,16 @@ class SessionConnectionState:
         # asserting "AI assist: On" for a session whose InvokeModel is denied.
         #   None  -- not checked yet (enabled but unverified)
         #   True  -- a clean preflight passed
-        #   False -- a real ACCESS_DENIED was observed (preflight or a live reply)
+        #   False -- an authorization failure was observed (ACCESS_DENIED or
+        #            MODEL_AGREEMENT_REQUIRED from the preflight or a live reply, or the
+        #            preflight's MODEL_NOT_ENABLED -- ui.ai_assist.AI_LATCHING_REASONS)
         # Deliberately NOT persisted: authorization is a point-in-time fact about the
         # current credentials, exactly like source_verified / target_verified, so a
         # restored session comes back "unverified" rather than falsely green.
         self.ai_verified: Optional[bool] = None
         # The actionable, credential-free explanation for a False above (Property 7:
-        # this is the fixed _UNAVAILABLE_DETAILS copy, never raw boto/exception text).
+        # this is the fixed _UNAVAILABLE_DETAILS / _ACCESS_CHECK_DETAILS copy, never raw
+        # boto/exception text).
         self.ai_unavailable_detail: Optional[str] = None
         # Persistent AI-assistant transcript + panel state for this session. The
         # panel renders FROM this object, so the conversation survives closing/
@@ -400,10 +403,13 @@ class SessionConnectionState:
         """Record what Bedrock has actually been shown to do (see ``ai_verified``).
 
         ``ok=True`` after a clean preflight, ``ok=False`` with the fixed actionable
-        ``detail`` when a real ACCESS_DENIED is observed (so every AI affordance can go
-        honest instead of the app discarding the one moment it learns AI is dead), and
-        ``ok=None`` to reset to "unverified". Only latch ``False`` for an authorization
-        failure -- a transient throttle or network blip must NOT mark AI unavailable.
+        ``detail`` (the fixed ``_UNAVAILABLE_DETAILS`` / ``_ACCESS_CHECK_DETAILS`` copy)
+        when an authorization failure is observed -- ACCESS_DENIED or
+        MODEL_AGREEMENT_REQUIRED, or the preflight's MODEL_NOT_ENABLED -- so every AI
+        affordance can go honest instead of the app discarding the one moment it learns
+        AI is dead, and ``ok=None`` to reset to "unverified". Only latch ``False`` for an
+        authorization failure -- a transient throttle or network blip must NOT mark AI
+        unavailable.
         """
         self.ai_verified = ok
         self.ai_unavailable_detail = detail if ok is False else None

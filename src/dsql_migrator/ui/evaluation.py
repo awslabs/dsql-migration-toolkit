@@ -1294,40 +1294,55 @@ def build_evaluation_screen(
             result = eval_state.result
             if result is not None:
                 # On-demand per-object AI guidance is offered only when AI assist
-                # is enabled for this session (opt-in). The strategist is built
-                # here (no network until invoked) and its graceful per-object
+                # is enabled for this session (opt-in). The strategist is built per
+                # send (no network until invoked) and its graceful per-object
                 # guidance call is handed to the result renderer; when AI is off
                 # the provider is None and the renderer shows a disabled, clearly
                 # labeled affordance instead (discoverable, never silently gone).
                 guidance_provider = None
                 if ai_is_usable(session):
-                    strategist = strategist_factory(
-                        session.ai_assist, session.aws_profile
-                    )
-                    # Ground the AI DBA on THIS migration's source engine (MySQL vs
-                    # PostgreSQL); the factory builds the strategist before the source
-                    # type is in scope, so pin it here (best-effort — a bare fake in
-                    # tests may not expose the setter).
-                    try:
-                        strategist.source_engine = source_engine_word(
-                            getattr(session.source_config, "source_type", None)
+
+                    def strategist_now():  # noqa: ANN202
+                        # Resolved per SEND, not at result render: the app-wide panel
+                        # keeps a guidance streamer while its scope stays open, so a
+                        # strategist built here would keep answering -- and latching
+                        # denials -- with the Bedrock model / region / AWS profile of THIS
+                        # render after the operator switched to a verified one.
+                        strategist = strategist_factory(
+                            session.ai_assist, session.aws_profile
                         )
-                    except AttributeError:
-                        pass
+                        # Ground the AI DBA on THIS migration's source engine (MySQL vs
+                        # PostgreSQL); the factory builds the strategist before the
+                        # source type is in scope, so pin it here (best-effort — a bare
+                        # fake in tests may not expose the setter).
+                        try:
+                            strategist.source_engine = source_engine_word(
+                                getattr(session.source_config, "source_type", None)
+                            )
+                        except AttributeError:
+                            pass
+                        return strategist
+
                     if ai_tool_execute is not None:
                         # Give the per-object/finding chat the SAME read-only tools the
                         # general chat has, so a chat started on ONE object can still
                         # answer WIDER-migration questions (e.g. "list all unsupported
                         # objects") by looking up the real data instead of refusing.
                         def guidance_provider(  # noqa: ANN001
-                            item, messages, on_delta, _s=strategist
+                            item, messages, on_delta
                         ):
-                            return _s.stream_object_chat(
+                            return strategist_now().stream_object_chat(
                                 item, messages, on_delta,
                                 tools=ai_tools or [], execute=ai_tool_execute,
                             )
                     else:
-                        guidance_provider = strategist.stream_object_chat
+
+                        def guidance_provider(  # noqa: ANN001
+                            item, messages, on_delta
+                        ):
+                            return strategist_now().stream_object_chat(
+                                item, messages, on_delta
+                            )
                 _render_result(
                     ui,
                     result,

@@ -3963,15 +3963,25 @@ def build_validation_screen(
                 # omits the AI buttons (the deterministic report stands on its own).
                 diagnose_provider = None
                 if ai_is_usable(session):
-                    strategist = strategist_factory(
-                        session.ai_assist, session.aws_profile
-                    )
-                    # Ground the mismatch chat on THIS migration's source engine; the
-                    # factory builds the strategist before the source type is in scope.
-                    try:
-                        strategist.source_engine = _source_engine_word(session)
-                    except AttributeError:
-                        pass
+
+                    def strategist_now():  # noqa: ANN202
+                        # Resolved per SEND, not at result render: the app-wide panel
+                        # keeps a diagnosis streamer while its scope stays open, so a
+                        # strategist built here would keep answering -- and latching
+                        # denials -- with the Bedrock model / region / AWS profile of THIS
+                        # render after the operator switched to a verified one.
+                        strategist = strategist_factory(
+                            session.ai_assist, session.aws_profile
+                        )
+                        # Ground the mismatch chat on THIS migration's source engine; the
+                        # factory builds the strategist before the source type is in
+                        # scope.
+                        try:
+                            strategist.source_engine = _source_engine_word(session)
+                        except AttributeError:
+                            pass
+                        return strategist
+
                     # Per-run / per-table mismatch diagnosis deep-links into the
                     # persistent app-wide AI panel; no-op when it is not wired (tests).
                     def diagnose_provider(  # noqa: E731 - small bound opener
@@ -3987,7 +3997,7 @@ def build_validation_screen(
                             chip=chip,
                             seed_question=first_question,
                             streamer=lambda messages, on_delta: (
-                                strategist.stream_validation_chat(
+                                strategist_now().stream_validation_chat(
                                     facts, messages, on_delta, scope=scope,
                                     # NAMES the subject for a per-table chat. Required,
                                     # not cosmetic: the tools below are run-wide and take
